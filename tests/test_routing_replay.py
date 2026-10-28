@@ -1,0 +1,791 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""MoE routing replay (UNSLOTH_GRPO_ROUTING_REPLAY): forcing the rollout's expert ids. CPU only."""
+
+import inspect
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+import torch.nn.functional as F
+
+transformers = pytest.importorskip("transformers")
+try:
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeTopKRouter  # noqa: F401
+except Exception:
+    pytest.skip("needs transformers >= 5 router modules", allow_module_level = True)
+
+import unsloth_zoo.routing_replay as rr
+
+PAD = 0
+NUM_LAYERS = 2
+NUM_EXPERTS = 8
+TOP_K = 2
+
+
+def _model(seed = 0):
+    from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    torch.manual_seed(seed)
+    config = Qwen3MoeConfig(
+        vocab_size = 64,
+        hidden_size = 32,
+        intermediate_size = 64,
+        moe_intermediate_size = 16,
+        num_hidden_layers = NUM_LAYERS,
+        num_attention_heads = 4,
+        num_key_value_heads = 2,
+        head_dim = 8,
+        num_experts = NUM_EXPERTS,
+        num_experts_per_tok = TOP_K,
+        norm_topk_prob = True,
+        pad_token_id = PAD,
+    )
+    model = Qwen3MoeForCausalLM(config).float().eval()
+    # Spread the router logits so forcing other experts visibly changes the output.
+    for layer in model.model.layers:
+        layer.mlp.gate.weight.data.normal_(0, 0.5)
+    return model
+
+
+def _natural_ids(model, ids):
+    captured = {}
+    handles = []
+    for i, layer in enumerate(model.model.layers):
+        handles.append(layer.mlp.gate.register_forward_hook(
+            lambda m, a, out, i = i: captured.__setitem__(i, out[2].detach().clone())
+        ))
+    with torch.no_grad():
+        model(input_ids = torch.tensor([ids]))
+    for h in handles:
+        h.remove()
+    return torch.stack([captured[i] for i in range(NUM_LAYERS)], dim = 1)  # [T, L, k]
+
+
+def _request(prompt, completion, routed):
+    # vLLM returns routing for every forwarded token: all but the last sampled one.
+    return SimpleNamespace(
+        prompt_token_ids = list(prompt),
+        outputs = [SimpleNamespace(token_ids = list(completion), routed_experts = np.asarray(routed, dtype = np.uint8)[:-1])],
+    )
+
+
+def _qwen35_model(monkeypatch):
+    pytest.importorskip("transformers", minversion = "5.17.0")
+    from transformers import Qwen3_5MoeConfig
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen35
+
+    # Run the native hybrid model on CPU, even when CUDA-only kernels are installed.
+    for name in ("causal_conv1d_fn", "torch_chunk_gated_delta_rule"):
+        monkeypatch.setattr(qwen35, name, inspect.unwrap(getattr(qwen35, name)))
+    config = Qwen3_5MoeConfig(
+        text_config = dict(
+            vocab_size = 64, hidden_size = 32, num_hidden_layers = 4,
+            num_attention_heads = 4, num_key_value_heads = 2, head_dim = 8,
+            linear_num_key_heads = 2, linear_num_value_heads = 4,
+            linear_key_head_dim = 8, linear_value_head_dim = 8,
+            moe_intermediate_size = 16, shared_expert_intermediate_size = 16,
+            num_experts = NUM_EXPERTS, num_experts_per_tok = TOP_K,
+            pad_token_id = PAD, use_cache = False,
+            rope_parameters = {"rope_type": "default", "rope_theta": 10000.0,
+                               "partial_rotary_factor": 1.0, "mrope_section": [1, 1, 2]},
+        ),
+        vision_config = dict(depth = 1, hidden_size = 32, intermediate_size = 64,
+                             num_heads = 4, out_hidden_size = 32, num_position_embeddings = 64),
+        image_token_id = 3, vision_start_token_id = 2,
+    )
+    torch.manual_seed(31)
+    return qwen35.Qwen3_5MoeForConditionalGeneration(config).float().eval()
+
+
+def test_qwen35_wrapper_replays_captured_routes(replay, monkeypatch):
+    model = _qwen35_model(monkeypatch)
+    decoder = model.model.language_model
+    assert decoder.config.layer_types == ["linear_attention"] * 3 + ["full_attention"]
+    captured, handles = [], []
+    for layer in decoder.layers:
+        layer.mlp.gate.weight.data.normal_(0, 0.5)
+        handles.append(layer.mlp.gate.register_forward_hook(
+            lambda m, a, out: captured.append(out[2].detach())
+        ))
+    ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11]])
+    with torch.no_grad():
+        expected = model(input_ids = ids).logits
+    for handle in handles:
+        handle.remove()
+    natural = torch.stack(captured, dim = 1)
+
+    assert rr.install_routing_replay(model, tokenizer = SimpleNamespace(pad_token_id = PAD)) == 4
+    rr.record_routed_experts([_request(ids[0, :3].tolist(), ids[0, 3:].tolist(), natural.numpy())])
+    with torch.no_grad():
+        actual = model(input_ids = ids).logits
+    stats = rr.routing_replay_stats()
+    assert stats["router_calls_replayed"] == 4
+    assert stats["router_calls_natural"] == 0
+    assert stats["forwards"] == 1
+    torch.testing.assert_close(actual, expected, rtol = 1e-5, atol = 1e-6)
+    # A later embedding-only call must not inherit the previous parent's token IDs.
+    with torch.no_grad():
+        decoder(inputs_embeds = decoder.embed_tokens(ids))
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 4
+    assert rr.routing_replay_stats()["router_calls_natural"] == 4
+
+
+
+def test_qwen35_image_forward_keeps_natural_routing(replay, monkeypatch):
+    # Routes are keyed by token ids alone: an image behind the same tokens must not take them.
+    model = _qwen35_model(monkeypatch)
+    for layer in model.model.language_model.layers:
+        layer.mlp.gate.weight.data.normal_(0, 0.5)
+    ids = torch.tensor([[5, 2, 3, 6, 7, 8, 9]])
+    image = dict(pixel_values = torch.randn(4, 3 * 2 * 16 * 16), image_grid_thw = torch.tensor([[1, 2, 2]]),
+                 mm_token_type_ids = (ids == 3).long())
+    with torch.no_grad():
+        expected = model(input_ids = ids, **image).logits
+    routes = np.random.default_rng(0).integers(0, NUM_EXPERTS, (ids.shape[1], 4, TOP_K))
+    routes[..., 1] = (routes[..., 0] + 1) % NUM_EXPERTS
+
+    assert rr.install_routing_replay(model, tokenizer = SimpleNamespace(pad_token_id = PAD)) == 4
+    rr.record_routed_experts([_request(ids[0, :3].tolist(), ids[0, 3:].tolist(), routes)])
+    with torch.no_grad():
+        actual = model(input_ids = ids, **image).logits
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 0
+    torch.testing.assert_close(actual, expected, rtol = 1e-5, atol = 1e-6)
+    with torch.no_grad():
+        model(input_ids = ids)
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 4
+
+@pytest.fixture
+def replay(monkeypatch):
+    monkeypatch.setenv(rr.ROUTING_REPLAY_ENV, "1")
+    rr.reset_routing_replay()
+    yield rr
+    rr.reset_routing_replay()
+
+
+def _install(model):
+    tokenizer = SimpleNamespace(pad_token_id = PAD)
+    assert rr.install_routing_replay(model, None, tokenizer) == NUM_LAYERS
+
+
+def test_off_by_default(monkeypatch):
+    monkeypatch.delenv(rr.ROUTING_REPLAY_ENV, raising = False)
+    model = _model()
+    assert rr.install_routing_replay(model, None, SimpleNamespace(pad_token_id = PAD)) == 0
+    assert not model.model.layers[0].mlp.gate._forward_hooks
+    assert rr.routing_replay_engine_args(model.config) == {}
+
+
+def test_engine_args_need_moe(replay, monkeypatch):
+    monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts"})
+    assert rr.routing_replay_engine_args(_model().config) == {"enable_return_routed_experts": True}
+    assert rr.routing_replay_engine_args(SimpleNamespace(num_experts = None)) == {}
+
+
+def test_engine_args_pin_a_capturing_moe_backend(replay, monkeypatch):
+    # Fused FlashInfer MoE (auto on Blackwell) leaves the capture all zeros: vllm-project/vllm#44116.
+    monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts", "moe_backend"})
+    assert rr.routing_replay_engine_args(_model().config) == {
+        "enable_return_routed_experts": True, "moe_backend": "triton",
+    }
+
+
+def test_repeated_expert_ids_are_not_replayed(replay):
+    rr._STATE.pad_token_id = PAD
+    routed = np.arange(4 * NUM_LAYERS * TOP_K).reshape(4, NUM_LAYERS, TOP_K) % NUM_EXPERTS
+    routed[1] = 0  # an all-zero capture for one token
+    rr.record_routed_experts([_request([3, 4], [5, 6, 7], routed)])
+    rows = rr._lookup((3, 4, 5, 6, 7)).long()
+    assert torch.equal(rows[0], torch.as_tensor(routed[0]).long())
+    assert bool((rows[1] == -1).all())
+    assert rr.routing_replay_stats()["invalid_rows"] == NUM_LAYERS
+
+
+def test_matching_ids_reproduce_natural_forward_and_grad(replay):
+    model = _model()
+    prompt, completion = [5, 6, 7, 8], [9, 10, 11, 12, 13]
+    ids = prompt + completion
+    natural = _natural_ids(model, ids)
+
+    model.zero_grad()
+    ref = model(input_ids = torch.tensor([ids])).logits
+    ref.sum().backward()
+    ref_grad = model.model.layers[0].mlp.gate.weight.grad.clone()
+
+    _install(model)
+    rr.record_routed_experts([_request(prompt, completion, natural.numpy())])
+    model.zero_grad()
+    out = model(input_ids = torch.tensor([ids])).logits
+    out.sum().backward()
+
+    torch.testing.assert_close(out, ref, rtol = 1e-5, atol = 1e-6)
+    torch.testing.assert_close(model.model.layers[0].mlp.gate.weight.grad, ref_grad, rtol = 1e-4, atol = 1e-6)
+    stats = rr.routing_replay_stats()
+    assert stats["replayed_tokens"] == len(ids)
+    assert stats["router_calls_replayed"] == NUM_LAYERS
+    assert stats["changed_selections"] == 0
+
+
+def _reference_forced_forward(model, ids, forced):
+    """Independent reference: each router takes `forced` ids and softmax-renorm weights over them."""
+    originals = []
+    for li, layer in enumerate(model.model.layers):
+        gate = layer.mlp.gate
+        originals.append(gate.forward)
+
+        def forward(hidden_states, gate = gate, li = li):
+            hidden_states = hidden_states.reshape(-1, gate.hidden_dim)
+            logits = F.linear(hidden_states, gate.weight)
+            probs = F.softmax(logits, dtype = torch.float, dim = -1)
+            idx = forced[:, li, :].long().contiguous()
+            w = probs.gather(-1, idx)
+            w = w / w.sum(-1, keepdim = True)
+            return logits, w.to(logits.dtype), idx
+
+        gate.forward = forward
+    try:
+        return model(input_ids = torch.tensor([ids])).logits
+    finally:
+        for layer, original in zip(model.model.layers, originals):
+            layer.mlp.gate.forward = original
+
+
+def test_probability_router_outputs_are_not_softmaxed_again(replay):
+    # transformers 5.2 - 5.7 Qwen MoE routers return softmax probabilities in the logits slot.
+    model = _model()
+    for layer in model.model.layers:
+        gate = layer.mlp.gate
+
+        def forward(hidden_states, gate = gate):
+            probs = F.softmax(F.linear(hidden_states.reshape(-1, gate.hidden_dim), gate.weight), dtype = torch.float, dim = -1)
+            top, idx = torch.topk(probs, TOP_K, dim = -1)
+            return probs, (top / top.sum(-1, keepdim = True)).to(probs.dtype), idx
+
+        gate.forward = forward
+    prompt, completion = [5, 6, 7], [20, 21, 22, 23]
+    ids = prompt + completion
+    natural = _natural_ids(model, ids)
+    forced = natural.clone()
+    forced[2:5] = (forced[2:5] + 3) % NUM_EXPERTS
+    forced[-1] = natural[-1]
+    model.zero_grad()
+    expected = _reference_forced_forward(model, ids, forced)
+    expected.sum().backward()
+    ref_grad = model.model.layers[0].mlp.gate.weight.grad.clone()
+
+    _install(model)
+    rr.record_routed_experts([_request(prompt, completion, forced.numpy())])
+    model.zero_grad()
+    out = model(input_ids = torch.tensor([ids])).logits
+    out.sum().backward()
+
+    torch.testing.assert_close(out, expected, rtol = 1e-5, atol = 1e-6)
+    torch.testing.assert_close(model.model.layers[0].mlp.gate.weight.grad, ref_grad, rtol = 1e-4, atol = 1e-6)
+    assert {layer.mlp.gate._unsloth_replay_formula for layer in model.model.layers} == {"probs_renorm"}
+    assert rr.routing_replay_stats()["changed_selections"] == 3 * NUM_LAYERS
+
+
+def test_different_ids_change_output_only_through_ids(replay):
+    model = _model()
+    prompt, completion = [5, 6, 7], [20, 21, 22, 23]
+    ids = prompt + completion
+    natural = _natural_ids(model, ids)
+    forced = natural.clone()
+    forced[2:5] = (forced[2:5] + 3) % NUM_EXPERTS  # new expert sets on three tokens, all layers
+    forced[-1] = natural[-1]  # vLLM has no routing for the last token, so it stays natural
+
+    with torch.no_grad():
+        natural_logits = model(input_ids = torch.tensor([ids])).logits
+        expected = _reference_forced_forward(model, ids, forced)
+
+    _install(model)
+    rr.record_routed_experts([_request(prompt, completion, forced.numpy())])
+    with torch.no_grad():
+        out = model(input_ids = torch.tensor([ids])).logits
+
+    torch.testing.assert_close(out, expected, rtol = 1e-5, atol = 1e-6)
+    assert not torch.allclose(out, natural_logits, atol = 1e-4)
+    # Causal: tokens before the first forced change are untouched.
+    torch.testing.assert_close(out[:, :2], natural_logits[:, :2], rtol = 1e-5, atol = 1e-6)
+    assert rr.routing_replay_stats()["changed_selections"] == 3 * NUM_LAYERS
+
+
+def _forced_rows(model, sequences, shift):
+    rows = []
+    for prompt, completion in sequences:
+        natural = _natural_ids(model, prompt + completion)
+        row = (natural + shift) % NUM_EXPERTS
+        row[-1] = natural[-1]
+        rows.append(row)
+    return rows
+
+
+def test_padded_packed_and_reordered_layouts_find_their_rollout(replay):
+    model = _model()
+    sequences = [([5, 6, 7], [30, 31, 32, 33]), ([8, 9], [40, 41, 42])]
+    forced = _forced_rows(model, sequences, shift = 1)
+    singles = [
+        _reference_forced_forward(model, p + c, f).detach() for (p, c), f in zip(sequences, forced)
+    ]
+
+    _install(model)
+    rr.record_routed_experts([_request(p, c, f.numpy()) for (p, c), f in zip(sequences, forced)])
+
+    # Padded, reversed order: left pad on the prompt, right pad after the completion.
+    a = sequences[0][0] + sequences[0][1]
+    b = sequences[1][0] + sequences[1][1]
+    padded = torch.tensor([[PAD] + b + [PAD], a])
+    mask = (padded != PAD).long()
+    position_ids = (mask.cumsum(-1) - 1).clamp(min = 0)
+    with torch.no_grad():
+        out = model(input_ids = padded, attention_mask = mask, position_ids = position_ids).logits
+    torch.testing.assert_close(out[0, 1:1 + len(b)], singles[1][0], rtol = 1e-4, atol = 1e-5)
+    torch.testing.assert_close(out[1], singles[0][0], rtol = 1e-4, atol = 1e-5)
+
+    # Packed [1, sum L] with per-segment positions, as the GRPO sequence packing path feeds it.
+    packed = torch.tensor([a + b])
+    position_ids = torch.tensor([list(range(len(a))) + list(range(len(b)))])
+    replayed = rr._build_replay(packed, position_ids)
+    expected = torch.cat([forced[0], forced[1]]).long()
+    expected[len(a) - 1] = -1
+    expected[-1] = -1
+    assert torch.equal(replayed, expected)
+
+
+def test_unmatched_rows_keep_natural_routing(replay):
+    model = _model()
+    _install(model)
+    rr.record_routed_experts([_request([5, 6], [7, 8], np.zeros((4, NUM_LAYERS, TOP_K)))])
+    ids = [11, 12, 13, 14]
+    with torch.no_grad():
+        out = model(input_ids = torch.tensor([ids])).logits
+    rr.reset_routing_replay()
+    with torch.no_grad():
+        ref = model(input_ids = torch.tensor([ids])).logits
+    torch.testing.assert_close(out, ref)
+
+
+def test_gradient_checkpointing_recompute_uses_replay(replay):
+    sequences = [([5, 6, 7], [30, 31, 32, 33])]
+    model = _model()
+    forced = _forced_rows(model, sequences, shift = 2)
+    ids = sequences[0][0] + sequences[0][1]
+
+    def run(checkpointing):
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        m.model.embed_tokens.weight.requires_grad_(True)
+        rr.reset_routing_replay()
+        _install(m)
+        rr.record_routed_experts([_request(*sequences[0], forced[0].numpy())])
+        logits = m(input_ids = torch.tensor([ids])).logits
+        logits.float().pow(2).mean().backward()
+        return logits.detach(), m.model.layers[1].mlp.gate.weight.grad.clone()
+
+    logits_plain, grad_plain = run(False)
+    logits_gc, grad_gc = run(True)
+    torch.testing.assert_close(logits_gc, logits_plain, rtol = 1e-5, atol = 1e-6)
+    torch.testing.assert_close(grad_gc, grad_plain, rtol = 1e-4, atol = 1e-6)
+
+
+def test_recompute_replays_each_forward_of_a_chunked_loss(replay):
+    # Two equal-shape forwards before one backward, as the padded GRPO chunk loop does: each
+    # checkpoint recompute must replay its own forward's routes, not the last forward's.
+    sequences = [([5, 6, 7], [30, 31, 32, 33]), ([8, 9, 10], [40, 41, 42, 43])]
+    model = _model()
+    forced = _forced_rows(model, sequences, shift = 2)
+
+    def run(checkpointing):
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        m.model.embed_tokens.weight.requires_grad_(True)
+        rr.reset_routing_replay()
+        _install(m)
+        rr.record_routed_experts([_request(p, c, f.numpy()) for (p, c), f in zip(sequences, forced)])
+        losses = [m(input_ids = torch.tensor([p + c])).logits.float().pow(2).mean() for p, c in sequences]
+        sum(losses).backward()
+        return torch.stack([l.detach() for l in losses]), [l.mlp.gate.weight.grad.clone() for l in m.model.layers]
+
+    losses_plain, grads_plain = run(False)
+    losses_gc, grads_gc = run(True)
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 4 * NUM_LAYERS
+    torch.testing.assert_close(losses_gc, losses_plain, rtol = 1e-5, atol = 1e-6)
+    for got, want in zip(grads_gc, grads_plain):
+        torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
+
+
+def _old_weighted_sum_hash(ids):
+    # The position-weighted int64 sum the recompute used to match forwards by.
+    ids = ids.long().sort(-1).values
+    weights = torch.arange(1, ids.numel() + 1, dtype = torch.long).view(ids.shape)
+    return int(((ids + 1) * (weights * 2654435761)).sum())
+
+
+def test_recompute_tells_apart_forwards_whose_routes_hash_alike(replay):
+    # Two different sequences whose first layer natural routes collide under a weighted sum
+    # hash: each checkpoint recompute must still replay its own forward's routes.
+    model = _model()
+    batch = torch.randint(1, 64, (256, 7), generator = torch.Generator().manual_seed(749))
+    captured = {}
+    handle = model.model.layers[0].mlp.gate.register_forward_hook(
+        lambda m, a, out: captured.__setitem__("ids", out[2].detach().clone())
+    )
+    with torch.no_grad():
+        model(input_ids = batch)
+    handle.remove()
+    routes = captured["ids"].reshape(256, 7, TOP_K)
+    seen, pair = {}, None
+    for i, ids in enumerate(routes):
+        key = _old_weighted_sum_hash(ids)
+        if key in seen and not torch.equal(ids, routes[seen[key]]):
+            pair = (seen[key], i)
+            break
+        seen[key] = i
+    assert pair is not None
+    sequences = [batch[i].tolist() for i in pair]
+    forced = [(_natural_ids(model, seq) + 2) % NUM_EXPERTS for seq in sequences]
+
+    def run(checkpointing):
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        rr.reset_routing_replay()
+        _install(m)
+        rr.record_routed_experts([_request(seq[:3], seq[3:], f.numpy()) for seq, f in zip(sequences, forced)])
+        losses = [m(input_ids = torch.tensor([seq])).logits.float().square().mean() for seq in sequences]
+        sum(losses).backward()
+        return torch.stack([l.detach() for l in losses]), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    losses_plain, grads_plain = run(False)
+    losses_gc, grads_gc = run(True)
+    torch.testing.assert_close(losses_gc, losses_plain, rtol = 1e-5, atol = 1e-6)
+    assert grads_gc.keys() == grads_plain.keys()
+    for name in grads_plain:
+        torch.testing.assert_close(grads_gc[name], grads_plain[name], rtol = 1e-4, atol = 1e-6, msg = name)
+
+
+def test_recompute_keeps_natural_routing_when_forwards_are_ambiguous(replay):
+    # Same natural routing, different replays: no way to tell which forward a recompute is.
+    ids2 = torch.tensor([[1, 0], [3, 2]])
+    fp = rr._fingerprint(ids2)
+    valid = torch.ones((2, 1), dtype = torch.bool)
+    rr._STATE.pending = [
+        {0: (fp, torch.tensor([[4, 5], [6, 7]]), valid)},
+        {0: (fp, torch.tensor([[5, 6], [7, 4]]), valid)},
+    ]
+    forced, ok = rr._recomputed_routes(0, ids2)
+    assert not bool(ok.any())
+    rr._STATE.pending = [
+        {0: (fp, torch.tensor([[4, 5], [6, 7]]), valid)},
+        {0: (rr._fingerprint(torch.tensor([[2, 0], [3, 1]])), torch.tensor([[5, 6], [7, 4]]), valid)},
+    ]
+    forced, ok = rr._recomputed_routes(0, ids2)
+    assert bool(ok.all()) and forced.tolist() == [[4, 5], [6, 7]]
+
+
+def test_recompute_accepts_the_same_expert_set_in_another_order(replay):
+    # Two forwards with identical natural routing whose replays hold the same experts in a
+    # different order: the recompute must still replay them, not fall back to natural routing.
+    model = _model()
+    batch = torch.randint(1, 64, (1024, 2), generator = torch.Generator().manual_seed(749))
+    captured = {}
+    handle = model.model.layers[0].mlp.gate.register_forward_hook(
+        lambda m, a, out: captured.__setitem__("ids", out[2].detach().clone())
+    )
+    with torch.no_grad():
+        model(input_ids = batch)
+    handle.remove()
+    routes = captured["ids"].reshape(1024, 2, TOP_K)
+    seen, pair = {}, None
+    for i, route in enumerate(routes):
+        key = tuple(route.sort(-1).values.flatten().tolist())
+        if key in seen and not torch.equal(batch[i], batch[seen[key]]):
+            pair = (seen[key], i)
+            break
+        seen[key] = i
+    assert pair is not None
+    sequences = [batch[i].tolist() for i in pair]
+    forced = torch.tensor([[[4, 5], [4, 5]], [[4, 5], [4, 5]]])  # tokens, layers, top-k
+    forced_rows = [forced, forced.flip(-1)]
+
+    def run(checkpointing):
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        rr.reset_routing_replay()
+        _install(m)
+        rr.record_routed_experts([_request(seq[:1], seq[1:], f.numpy()) for seq, f in zip(sequences, forced_rows)])
+        losses = [m(input_ids = torch.tensor([seq])).logits.float().square().mean() for seq in sequences]
+        if checkpointing:
+            a, b = rr._STATE.pending
+            assert torch.equal(a[0][0], b[0][0]) and not torch.equal(a[0][1], b[0][1])
+        sum(losses).backward()
+        return torch.stack([l.detach() for l in losses]), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    losses_plain, grads_plain = run(False)
+    losses_gc, grads_gc = run(True)
+    torch.testing.assert_close(losses_gc, losses_plain, rtol = 1e-5, atol = 1e-6)
+    for name in grads_plain:
+        torch.testing.assert_close(grads_gc[name], grads_plain[name], rtol = 1e-4, atol = 1e-6, msg = name)
+
+
+@pytest.mark.parametrize("version, expected", [("0.18.0", False), ("0.20.2", False), ("0.21.0", True), ("0.22.0", True), ("0.31.0", True)])
+def test_engine_args_need_vllm_021_for_hybrid_attention(replay, monkeypatch, version, expected):
+    # vLLM 0.14 to 0.20 index the shared routed experts buffer by slot in a buffer sized for one
+    # KV cache group, so hybrid attention models crash in generate; 0.21 indexes per request.
+    import importlib.metadata
+    monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts"})
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: version)
+    hybrid = SimpleNamespace(num_experts = 8, layer_types = ["sliding_attention", "full_attention"])
+    nested = SimpleNamespace(text_config = SimpleNamespace(num_local_experts = 8, hybrid_override_pattern = "M-M*-"))
+    full = SimpleNamespace(num_experts = 8, layer_types = ["full_attention", "full_attention"])
+    want = {"enable_return_routed_experts": True}
+    for config in (hybrid, nested):
+        if expected:
+            assert rr.routing_replay_engine_args(config) == want
+        else:
+            with pytest.warns(UserWarning, match = "hybrid attention"):
+                assert rr.routing_replay_engine_args(config) == {}
+    assert rr.routing_replay_engine_args(full) == want
+
+
+def test_topk_softmax_router_is_covered_by_softmax_renorm(replay):
+    class GptOssLikeRouter(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(NUM_EXPERTS, 16))
+
+        def forward(self, hidden_states):
+            logits = F.linear(hidden_states, self.weight)
+            top, idx = torch.topk(logits, TOP_K, dim = -1)
+            return logits, F.softmax(top, dim = 1, dtype = top.dtype), idx
+
+    router = GptOssLikeRouter()
+    hidden = torch.randn(5, 16)
+    forced = torch.tensor([[0, 1]] * 5)
+    rr._STATE.current = forced[:, None, :].expand(5, 1, TOP_K).clone()
+    logits, weights, ids = rr._router_hook(0)(router, (hidden,), router(hidden))
+    assert router._unsloth_replay_formula == "softmax_renorm"
+    assert torch.equal(ids, forced)
+    torch.testing.assert_close(weights, F.softmax(logits.gather(-1, forced), dim = -1))
+
+
+def test_dense_score_router_is_replayed(replay):
+    # Unsloth's GPT-OSS router: (logits, dense [tokens, experts] scores, indices).
+    class DenseScoreRouter(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(NUM_EXPERTS, 16))
+
+        def forward(self, hidden_states):
+            logits = F.linear(hidden_states, self.weight)
+            top, idx = torch.topk(logits, TOP_K, dim = -1)
+            top = F.softmax(top, dim = 1, dtype = top.dtype)
+            return logits, torch.zeros_like(logits).scatter_(1, idx, top), idx
+
+    router = DenseScoreRouter()
+    hidden = torch.randn(5, 16)
+    forced = torch.tensor([[0, 1]] * 4 + [[-1, -1]])
+    rr._STATE.current = forced[:, None, :].clone()
+    natural = router(hidden)
+    logits, scores, ids = rr._router_hook(0)(router, (hidden,), natural)
+    assert router._unsloth_replay_formula == "softmax_renorm"
+    assert torch.equal(ids[:4], forced[:4]) and torch.equal(ids[4], natural[2][4])
+    expected = torch.zeros_like(logits[:4]).scatter(1, forced[:4], F.softmax(logits[:4, :2], dim = -1))
+    torch.testing.assert_close(scores[:4], expected)
+    torch.testing.assert_close(scores[4], natural[1][4])
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 1
+
+
+def test_record_drops_pad_and_marks_last_token(replay):
+    rr._STATE.pad_token_id = PAD
+    routed = np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS
+    # pad == eos style: the final sampled token is the pad id, so the key drops it.
+    rr.record_routed_experts([_request([3, 4], [5, 6, 7, PAD], routed)])
+    rows = rr._lookup((3, 4, 5, 6, 7))
+    assert rows.shape == (5, NUM_LAYERS, TOP_K)
+    assert torch.equal(rows.long(), torch.as_tensor(routed[:5]).long())
+
+
+def test_wrap_vllm_generate_records_and_is_idempotent(replay):
+    natural = np.zeros((3, NUM_LAYERS, TOP_K))
+    llm = SimpleNamespace(generate = lambda *a, **k: [_request([1, 2], [3], natural)])
+    rr.wrap_vllm_generate(llm)
+    first = llm.generate
+    rr.wrap_vllm_generate(llm)
+    assert llm.generate is first
+    llm.generate([])
+    assert rr.routing_replay_stats()["recorded"] == 1
+
+
+def test_prompt_start_accepts_any_sampling_params_sequence(replay):
+    from collections import UserList
+    routed = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
+    request = SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = routed[2:])])
+    llm = rr.wrap_vllm_generate(SimpleNamespace(generate = lambda prompts, sampling_params = None: [request]))
+    llm.generate([], UserList([SimpleNamespace(routed_experts_prompt_start = 2)]))
+    rows = rr._lookup((3, 4, 5, 6, 7, 8))
+    assert torch.equal(rows[:2].long(), torch.full((2, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[2:5].long(), torch.as_tensor(routed[2:5]).long())
+
+
+@pytest.mark.parametrize("start", [5, 6])
+def test_prompt_start_reuses_routes_of_an_earlier_turn(replay, start):
+    # Multi-turn: turn 2 skips the rows turn 1 already returned (5 rows of its 6 tokens, or all 6).
+    turn1 = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
+    prompt2 = [3, 4, 5, 6, 7, 8, 9, 10]
+    turn2 = (np.arange((10 - 1 - start) * NUM_LAYERS * TOP_K).reshape(-1, NUM_LAYERS, TOP_K) + 3) % NUM_EXPERTS
+    rr.record_routed_experts([SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = turn1)])])
+    def second(ids):
+        return SimpleNamespace(prompt_token_ids = ids, outputs = [SimpleNamespace(token_ids = [11, 12], routed_experts = turn2)])
+
+    # A same-call sibling with an unrouted prefix must not mask turn 1's rows.
+    rr.record_routed_experts([second(prompt2), second(prompt2)], prompt_starts = [start, start])
+    rows = rr._lookup(tuple(prompt2 + [11, 12]))
+    assert torch.equal(rows[:5].long(), torch.as_tensor(turn1).long())
+    if start == 6:
+        # Turn 1 never forwarded its last sampled token and turn 2 skipped it: natural routing.
+        assert torch.equal(rows[5].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[start:9].long(), torch.as_tensor(turn2).long())
+    assert torch.equal(rows[9].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    rr.record_routed_experts([second([1, 2, 3, 4, 5, 6, 7, 8])], prompt_starts = [start])
+    rows = rr._lookup((1, 2, 3, 4, 5, 6, 7, 8, 11, 12))
+    assert torch.equal(rows[:start].long(), torch.full((start, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[start:9].long(), torch.as_tensor(turn2).long())
+
+
+def test_prompt_start_prefix_keeps_conflicts_natural_and_ignores_older_rollouts(replay):
+    def capture(prompt, completion, routed):
+        return SimpleNamespace(prompt_token_ids = prompt, outputs = [SimpleNamespace(token_ids = completion, routed_experts = routed)])
+
+    def rows_of(value, n):
+        return np.stack([np.stack([np.arange(TOP_K) + value] * NUM_LAYERS)] * n) % NUM_EXPERTS
+
+    tail = rows_of(5, 2)
+    # Captures disagreeing on token 1 leave it natural, like _lookup.
+    rr.record_routed_experts([capture([1, 2], [3, 4], np.concatenate([rows_of(0, 1), rows_of(1, 1), rows_of(2, 1)]))])
+    rr.record_routed_experts([capture([1, 2], [3, 4], np.concatenate([rows_of(0, 1), rows_of(3, 1), rows_of(2, 1)]))])
+    rr.record_routed_experts([capture([1, 2, 3, 4, 9], [10], tail)], prompt_starts = [3])
+    rows = rr._lookup((1, 2, 3, 4, 9, 10))
+    assert torch.equal(rows[0].long(), torch.as_tensor(rows_of(0, 1)[0]).long())
+    assert torch.equal(rows[1].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[2].long(), torch.as_tensor(rows_of(2, 1)[0]).long())
+    # After a training forward the policy changed: an older rollout's routes are not reused.
+    rr._STATE.forwarded_since_record = True
+    rr.record_routed_experts([capture([1, 2, 3, 4, 9], [11], tail)], prompt_starts = [3])
+    rows = rr._lookup((1, 2, 3, 4, 9, 11))
+    assert torch.equal(rows[:3].long(), torch.full((3, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[3:5].long(), torch.as_tensor(tail).long())
+
+
+def test_rollout_split_into_many_generate_calls_is_kept_whole(replay):
+    # generate_batches splits one rollout into several llm.generate calls before any training forward.
+    model = _model()
+    sequences = [([5, 6, 7], [30, 31, 32]), ([8, 9], [40, 41, 42]), ([10, 11], [50, 51]), ([12], [60, 61, 62])]
+    forced = _forced_rows(model, sequences, shift = 1)
+    _install(model)
+    llm = SimpleNamespace(calls = iter([[_request(p, c, f.numpy())] for (p, c), f in zip(sequences, forced)]))
+    llm.generate = lambda *a, **k: next(llm.calls)
+    rr.wrap_vllm_generate(llm)
+    for _ in sequences:
+        llm.generate([])
+    for (p, c), f in zip(sequences, forced):
+        with torch.no_grad():
+            out = model(input_ids = torch.tensor([p + c])).logits
+            expected = _reference_forced_forward(model, p + c, f)
+        torch.testing.assert_close(out, expected, rtol = 1e-5, atol = 1e-6)
+    assert rr.routing_replay_stats()["unmatched_tokens"] == 0
+
+    # The next rollout opens after the training forwards; the one before it is still kept.
+    rr.record_routed_experts([_request([13], [14, 15], np.zeros((3, NUM_LAYERS, TOP_K)))])
+    rr.record_routed_experts([_request([16], [17, 18], np.zeros((3, NUM_LAYERS, TOP_K)))])
+    assert len(rr._STATE.generations) == 2
+    assert rr._lookup(tuple(sequences[0][0] + sequences[0][1])) is not None
+    rr._decoder_pre_hook(None, (), {})
+    rr.record_routed_experts([_request([19], [20, 21], np.zeros((3, NUM_LAYERS, TOP_K)))])
+    assert rr._lookup(tuple(sequences[0][0] + sequences[0][1])) is None
+    assert rr._lookup((13, 14, 15)) is not None
+
+
+def test_real_pad_id_token_keeps_replay_under_attention_mask(replay):
+    # pad == eos: a chat separator inside the prompt carries the pad id but is attended.
+    model = _model()
+    prompt, completion = [5, PAD, 6, 7], [30, 31, 32, PAD]
+    ids = prompt + completion
+    forced = _forced_rows(model, [(prompt, completion)], shift = 2)[0]
+    with torch.no_grad():
+        expected = _reference_forced_forward(model, ids, forced)
+
+    _install(model)
+    rr.record_routed_experts([_request(prompt, completion, forced.numpy())])
+    # Left padded, the trailing eos attended, as the GRPO completion mask keeps it.
+    padded = torch.tensor([[PAD, PAD] + ids])
+    mask = torch.tensor([[0, 0] + [1] * len(ids)])
+    position_ids = (mask.cumsum(-1) - 1).clamp(min = 0)
+    with torch.no_grad():
+        out = model(input_ids = padded, attention_mask = mask, position_ids = position_ids).logits
+    torch.testing.assert_close(out[0, 2:], expected[0], rtol = 1e-4, atol = 1e-5)
+    stats = rr.routing_replay_stats()
+    assert stats["replayed_tokens"] == len(ids)
+    assert stats["unmatched_tokens"] == 0
+
+
+def test_router_returning_only_logits_warns_and_stays_natural(replay):
+    # Sigmoid-scored families (DeepSeek-V3, GLM-4 MoE) pick experts in the block, not the router.
+    class LogitsOnlyRouter(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states @ torch.ones(16, NUM_EXPERTS)
+
+    router = LogitsOnlyRouter()
+    hook = rr._router_hook(0)
+    with pytest.warns(UserWarning, match = "routes inside the MoE block"):
+        assert hook(router, (torch.randn(3, 16),), router(torch.randn(3, 16))) is None
+    assert rr.routing_replay_stats()["router_calls_natural"] == 1
+
+
+def test_generate_without_training_keeps_bounded_routes(replay, monkeypatch):
+    monkeypatch.setattr(rr, "_MAX_CALLS_PER_ROLLOUT", 3)
+    for i in range(10):
+        rr.record_routed_experts([_request([20 + i], [30 + i, 40 + i], np.zeros((3, NUM_LAYERS, TOP_K)))])
+    assert len(rr._STATE.generations) == 1
+    assert len(next(iter(rr._STATE.generations.values()))) == 3
+    assert rr._lookup((29, 39, 49)) is not None and rr._lookup((20, 30, 40)) is None
+
+
+def test_recompute_with_several_same_shape_forwards_keeps_candidate_shapes():
+    # Three recorded forwards of one shape, each routing 5 tokens to 2 experts: the per-candidate
+    # agreement must reduce to one flag per candidate before it meets the per-candidate match.
+    ids2 = torch.randint(0, 8, (5, 2))
+    fp = rr._fingerprint(ids2)
+    replay = torch.randint(0, 8, (5, 2))
+    saved = rr._STATE.pending, rr._STATE.recomputed
+    try:
+        rr._STATE.pending = [
+            {0: (fp, replay[:, torch.randperm(2)], torch.ones((5, 1), dtype = torch.bool))} for _ in range(3)
+        ]
+        forced, valid = rr._recomputed_routes(0, ids2)
+    finally:
+        rr._STATE.pending, rr._STATE.recomputed = saved
+    assert forced.shape == (5, 2)
+    assert bool(valid.all())

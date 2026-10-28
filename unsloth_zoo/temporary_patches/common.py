@@ -29,7 +29,11 @@ __all__ = [
     "unwrap_already_compiled",
     "flatten_for_elementwise_norm",
     "unwrap_norm_weight",
+    "CHUNK_ALIGN_ROWS",
+    "chunk_row_bounds",
     "publish_to_modeling_module",
+    "RESCOPE_PATCH_FLAG",
+    "WRAPPER_INNER_ATTR",
 ]
 
 import os
@@ -42,10 +46,30 @@ UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1"
 # "partial" keeps the source rewrites but turns torch.compile off, like compiler.py does.
 UNSLOTH_COMPILE_DISABLE_PARTIAL = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
 
+# Marks this package's wrapper on `transformers.conversion_mapping.get_model_conversion_mapping`.
+# Lives here rather than in the module that installs it because two modules read it:
+# `conversion_mapping_rescope.py` sets it, and `bitsandbytes.py` asks whether the repair is live
+# before its error message blames the transformers version for a load the repair already fixed.
+RESCOPE_PATCH_FLAG = "_unsloth_zoo_patched_composite_prefix_renaming"
+
+# Links a wrapper on that same function to the callable it wraps, for readers that need to walk
+# the chain. Deliberately NOT `__wrapped__`: the rescope unwraps `__wrapped__` to find the
+# function to wrap, so publishing one on a wrapper that must survive would make the rescope
+# replace it instead of sitting on top of it, silently dropping that wrapper's behaviour.
+WRAPPER_INNER_ATTR = "_unsloth_wrapper_inner"
+
 # Get only allowed options
 import inspect
 import torch
 inductor_config_source = inspect.getsource(torch._inductor.config)
+
+def _persistent_tma_matmul_ok():
+    # torch 2.12+ guards every GEMM size when Inductor considers its TMA templates
+    # (pytorch/pytorch#172925), so a compiled torch._scaled_mm recompiles for each new token count.
+    import re
+    found = re.match(r"(\d+)\.(\d+)", torch.__version__)
+    return found is not None and (int(found.group(1)), int(found.group(2))) < (2, 12)
+pass
 
 @functools.lru_cache(1)
 def determine_compile_threads():
@@ -83,6 +107,35 @@ def is_transformers_v5_moe_quantization_available():
         )
     )
 
+def allow_inductor_pool_aliasing():
+    """
+    torch >= 2.11 checks custom op outputs for aliasing on a compiled function's first call
+    (torch/_functorch/_aot_autograd/runtime_wrappers.py, _AnalyzeCustomOpInputOutputMode). Under
+    inference_mode it also sees Inductor's own memory_planning op inductor::_alloc_from_pool, which
+    returns a view of its pool by design but declares no alias in its schema. That is a UserWarning,
+    and a RuntimeError when the CI env var is set (error_on_custom_op_aliasing = bool(CI)), so every
+    memory_planning=True graph under inference_mode fails in CI. Skip only that op; every other
+    custom op is still checked.
+    """
+    try:
+        # torch._dynamo first: importing runtime_wrappers on its own is a circular import that leaves
+        # torch._dynamo half initialised (torch.compile then fails for the whole process).
+        import torch._dynamo
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+    except Exception:
+        return
+    check = getattr(runtime_wrappers, "_check_custom_op_aliasing", None)
+    if check is None or getattr(check, "_unsloth_skips_alloc_from_pool", False):
+        return
+
+    def _check_custom_op_aliasing(name, *args, **kwargs):
+        if name == "inductor::_alloc_from_pool":
+            return None
+        return check(name, *args, **kwargs)
+    _check_custom_op_aliasing._unsloth_skips_alloc_from_pool = True
+    runtime_wrappers._check_custom_op_aliasing = _check_custom_op_aliasing
+pass
+
 def get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False,
@@ -105,6 +158,7 @@ def get_torch_compile_options(
     # https://github.com/pytorch/pytorch/blob/c665594c1edca9a507b0ec8b18ab74a0ecb65bc3/torch/_inductor/config.py#L1283
     # Needs integer
     multi_kernel = 1 if multi_kernel else 0
+    if memory_planning: allow_inductor_pool_aliasing()
 
     # Relabel Inductor's compile progress bar
     try:
@@ -136,7 +190,7 @@ def get_torch_compile_options(
 
         "triton.multi_kernel"       : multi_kernel, # RuntimeError: name 'multi_kernel_0' is not defined
         "triton.use_block_ptr"      : use_block_ptr,
-        "triton.enable_persistent_tma_matmul" : True,
+        "triton.enable_persistent_tma_matmul" : _persistent_tma_matmul_ok(),
         "triton.autotune_at_compile_time"     : False,
         "triton.cooperative_reductions"       : False,
         # "reorder_for_compute_comm_overlap"  : True, # Fails for single GPU
@@ -278,7 +332,8 @@ def _compile_or_fall_back(*args, **kwargs):
         _compile = torch_compile_with_fallback(**kwargs)
     else:
         def _compile(function):
-            return torch.compile(function, **kwargs)
+            from .utils import eager_under_zero3
+            return eager_under_zero3(function, torch.compile(function, **kwargs))
 
     def decorate(function):
         function = unwrap_already_compiled(function)
@@ -331,6 +386,23 @@ def flatten_for_elementwise_norm(hidden_states):
     """
     shape = hidden_states.shape
     return hidden_states.reshape(-1, shape[-1]), shape
+pass
+
+
+# Opt-in: aligned boundaries reorder the float32 per-chunk sums.
+CHUNK_ALIGN_ROWS = 128 if os.environ.get("UNSLOTH_CE_CHUNK_ALIGN", "0").strip() == "1" else 0
+
+def chunk_row_bounds(n_rows, chunks, align = CHUNK_ALIGN_ROWS):
+    """``align``-multiple row ranges no larger than ``ceil(n_rows / chunks)`` (may add ranges).
+    None means keep torch.chunk."""
+    if align <= 1 or chunks <= 1:
+        return None
+    cap = -(-n_rows // chunks)
+    size = (cap // align) * align
+    # A 1-row tail hits the K=1 head-gradient matmul bug (see test_chunked_log_softmax_one_row_chunk).
+    if size == 0 or 4 * size < 3 * cap or n_rows % size == 1:
+        return None
+    return list(range(0, n_rows, size)) + [n_rows]
 pass
 
 

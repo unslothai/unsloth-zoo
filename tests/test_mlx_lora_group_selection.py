@@ -109,6 +109,8 @@ _ROLE_CASES = {
     "linear_attn.in_proj_qkv": "attention", "per_layer_input_gate": "gate",
     "block_sparse_moe.switch_mlp.gate_up_proj": "mlp",
     "mlp.zaya_block.router.down_proj": "gate",
+    "blocks.0.mlp.mlp_gate": "mlp", "ffn_gate": "mlp", "ffn_gate_inp": "gate", "moe_gate": "gate",
+    "mlp.router_mlp.0": "gate",
 }
 
 
@@ -620,6 +622,42 @@ def test_a_layer_listed_twice_keeps_every_entry_s_targets():
     assert attached == 2
     assert isinstance(block.q_proj, LoRALinear)
     assert isinstance(block.v_proj, LoRALinear)
+
+
+_PACKED_PROJECTIONS = ["model.layers.0.mlp.down_proj", "model.layers.0.mlp.gate_proj",
+                       "model.layers.0.self_attn.o_proj", "model.layers.0.self_attn.q_proj"]
+
+
+# Ternary Bonsai 2 packs, from mlx-vlm and (0.32+) mlx-lm.
+_HADAMARD_PACKS = pytest.mark.parametrize("pack_module", [
+    "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35", "mlx_lm.models.prism_hadamard_qwen35",
+], ids=["mlx_vlm", "mlx_lm"])
+
+
+@pytest.mark.parametrize("kwargs, expected", [
+    ({}, _PACKED_PROJECTIONS),
+    ({"target_modules": "all-linear"}, _PACKED_PROJECTIONS),
+    ({"target_modules": ["q_proj", "down_proj", "lm_head"]},
+     ["lm_head", "model.layers.0.mlp.down_proj", "model.layers.0.self_attn.q_proj"]),
+], ids=["default", "all-linear", "named-with-head"])
+@_HADAMARD_PACKS
+def test_hadamard_packed_projections_are_adapted_but_not_the_embedding(kwargs, expected, pack_module):
+    # Ternary Bonsai 2 packs every decoder projection, the head and the embedding.
+    pack = pytest.importorskip(pack_module)
+    from unsloth_zoo.mlx.utils import LoRAHadamardLinear
+    packed = lambda i, o: lambda: pack.HadamardQuantizedLinear(i, o, 512)
+    block = {"self_attn": {"q_proj": packed(512, 512), "o_proj": packed(512, 512)},
+             "mlp": {"gate_proj": packed(512, 1024), "down_proj": packed(1024, 512)}}
+    model = _build({"model": {"embed_tokens": lambda: pack.HadamardQuantizedEmbedding(
+                        512, VOCAB, 512), "layers": [block]},
+                    "lm_head": packed(512, VOCAB)})
+    model.config = type("C", (), {})()
+    _peft(model, **kwargs)
+    layer = model.model.layers[0]
+    assert _adapters(model) == expected
+    assert type(layer.mlp.down_proj) is LoRAHadamardLinear
+    assert layer.mlp.down_proj.lora_a.shape == (1024, 4)
+    assert layer.self_attn.q_proj.lora_b.shape == (4, 512)
 
 
 @pytest.mark.parametrize("pixel_key", ["images", "pixel_values"])

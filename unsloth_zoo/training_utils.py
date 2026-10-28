@@ -26,6 +26,7 @@ import time
 from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
+from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
@@ -264,23 +265,44 @@ def _iter_configs(config):
                 stack.append(sub)
 
 
+# Marks a config that never had use_cache, as distinct from one holding None.
+# A class, not object(): deepcopy and pickle preserve a class's identity but not
+# an instance's, which broke the `is` check below and wrote this unserializable
+# object into cfg.use_cache (TRL deepcopies a prepared model for its ref model).
+class _ABSENT:
+    """Marker type; never instantiated."""
+
+
 def disable_use_cache(model):
     """Set use_cache = False on every config of the model. KV cache is unused
     under gradient checkpointing. Original values are remembered on the model
-    the first time so restore_use_cache can undo this for inference."""
+    so restore_use_cache can undo this for inference."""
     config = getattr(model, "config", None)
+    # DeepSpeedEngine.config is its own dict; the transformers config is on .module.
+    if isinstance(config, dict) and hasattr(model, "module"):
+        model = model.module
+        config = getattr(model, "config", None)
     if config is None:
         return
     originals = getattr(model, "_unsloth_use_cache_originals", None)
-    record = originals is None
-    if record:
+    if originals is None:
         originals = []
+    # Record by identity, not only on the first call: a config first reached
+    # later was disabled but never recorded, so restore could not undo it.
+    recorded = {id(cfg) for cfg, _ in originals}
     for cfg in _iter_configs(config):
-        if getattr(cfg, "use_cache", None):
-            if record:
-                originals.append((cfg, cfg.use_cache))
-            cfg.use_cache = False
-    if record and originals:
+        has_use_cache = hasattr(cfg, "use_cache")
+        if has_use_cache and not cfg.use_cache:
+            continue                      # already disabled, nothing to record
+        if id(cfg) not in recorded:
+            # first baseline wins; _ABSENT so restore deletes rather than invents
+            originals.append((cfg, cfg.use_cache if has_use_cache else _ABSENT))
+            recorded.add(id(cfg))
+        # Set it even when absent: transformers 5 sub-configs inherit no default,
+        # so a forward reading self.config.use_cache raises AttributeError
+        # instead (stepfun-ai/Step-3.7-Flash ships exactly such a text config).
+        cfg.use_cache = False
+    if originals:
         try:
             model._unsloth_use_cache_originals = originals
         except Exception:
@@ -293,7 +315,42 @@ def restore_use_cache(model):
     disabled. The record is kept so disable_use_cache can re-disable
     without re-recording when training resumes."""
     for cfg, value in getattr(model, "_unsloth_use_cache_originals", None) or ():
-        cfg.use_cache = value
+        if value is _ABSENT:
+            try:
+                delattr(cfg, "use_cache")
+            except Exception:
+                pass
+        else:
+            cfg.use_cache = value
+
+
+_FP8_PARAM_DTYPES = tuple(
+    getattr(torch, n)
+    for n in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu")
+    if hasattr(torch, n)
+)
+
+
+def _refuse_scaled_fp8_cast(model, name, param):
+    """Casting a scaled FP8 weight drops its scale; the loader must dequantize it first."""
+    if param.dtype not in _FP8_PARAM_DTYPES:
+        return
+    prefix, _, leaf = name.rpartition(".")
+    try:
+        module = model.get_submodule(prefix) if prefix else model
+    except Exception:
+        return
+    scale_names = (leaf + "_scale_inv", leaf + "_scale")
+    if not any(getattr(module, n, None) is not None for n in scale_names):
+        return
+    raise RuntimeError(
+        f"Unsloth: `{name}` is a scaled {param.dtype} weight, and casting it to the training dtype "
+        "would drop its scale and train wrong weights. Full finetuning needs it dequantized on load: "
+        "for an `fp8` checkpoint pass `quantization_config = FineGrainedFP8Config(dequantize = True)` "
+        "(transformers 5.x; 4.x has no `dequantize`), "
+        "for `compressed-tensors` pass `CompressedTensorsConfig(run_compressed = False)`, "
+        "or use the BF16 version of the model, or train LoRA instead."
+    )
 
 
 @torch.no_grad
@@ -380,7 +437,12 @@ def prepare_model_for_training(
         _keep_param_dtype = False
         _is_norm = _is_norm_parameter(original_name, param)
         if not full_finetuning:
-            if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
+            # nn.Embedding LoRA is lora_embedding_A/B; omitting it silently freezes it.
+            if (".lora_A." in name
+                    or ".lora_B." in name
+                    or ".lora_embedding_A." in name
+                    or ".lora_embedding_B." in name
+                    or ".lora_magnitude_vector" in name):
                 upcast = True
                 requires_grad = True
             elif (_is_peft_model and "bias" in name and param.requires_grad
@@ -419,6 +481,7 @@ def prepare_model_for_training(
                 and id(param) not in _externally_managed_param_ids):
             dtype = torch.float32 if upcast else mixed_precision_dtype
             if param.dtype != dtype:
+                _refuse_scaled_fp8_cast(model, name, param)
                 param.data = param.data.to(dtype)
         pass
 
@@ -629,7 +692,8 @@ def unsloth_train(trainer):
         optimizer = optimizer,
         num_warmup_steps = training_args.get_warmup_steps(max_steps),
         num_training_steps = max_steps,
-        **getattr(training_args, "lr_scheduler_kwargs", {}),
+        # get_scheduler takes options only here, as Trainer.create_scheduler passes them.
+        scheduler_specific_kwargs = getattr(training_args, "lr_scheduler_kwargs", None) or None,
     )
 
     # Gradient accumulation and grad norm clipping
@@ -643,6 +707,7 @@ def unsloth_train(trainer):
     #     .to(device = "cuda:0", non_blocking = True)[0]
 
     # Mixed precision scaling
+    _amp_device = DEVICE_TYPE_TORCH if DEVICE_TYPE in ("xpu", "npu") else "cuda"
     torch_version = torch.__version__
     config_dtype = dtype_from_config(model.config)
     if config_dtype == torch.float16:
@@ -652,7 +717,7 @@ def unsloth_train(trainer):
         if Version(torch_version) < Version("2.4.0"):
             float16_scaler = torch.cuda.amp.GradScaler()
         else:
-            float16_scaler = torch.amp.GradScaler("cuda")
+            float16_scaler = torch.amp.GradScaler(_amp_device)
     else:
         mixed_precision = "bf16"
         mixed_dtype = torch.bfloat16
@@ -670,14 +735,26 @@ def unsloth_train(trainer):
         )
     else:
         autocast_context_manager = torch.amp.autocast(
-            device_type = "cuda",
+            device_type = _amp_device,
             dtype = mixed_dtype,
             cache_enabled = False,
         )
     pass
 
+    # Batches go where the inputs run (an offloaded embedding is meta: use its hook's execution device).
+    from .device_map_planner import _first_execution_device
+    try:
+        train_device = _first_execution_device(model.get_input_embeddings())
+    except Exception:
+        train_device = None
+    if train_device is None:
+        train_device = next(
+            (p.device for p in model.parameters() if p.device.type != "meta"),
+            torch.device(f"{DEVICE_TYPE_TORCH}:0"),
+        )
+    train_device = torch.device(train_device)
     step = 0
-    accumulated_loss = torch.zeros(1, device = "cuda:0", dtype = torch.float32)[0]
+    accumulated_loss = torch.zeros(1, device = train_device, dtype = torch.float32)[0]
     debug_info = \
         f'==((====))==  Unsloth - 2x faster free finetuning | Num GPUs = {training_args.world_size}\n'\
         f'    \\   /|    Num examples = {n_training_samples:,} | Num Epochs = {num_train_epochs:,}\n'\
@@ -723,13 +800,18 @@ def unsloth_train(trainer):
 
                 # Gradient accumulation
                 for batch in batches:
-                    input_ids = batch["input_ids"].pin_memory().to(device = "cuda:0", non_blocking = True)
-                    labels    = batch["labels"]   .pin_memory().to(device = "cuda:0", non_blocking = True)
+                    input_ids = batch["input_ids"]
+                    labels    = batch["labels"]
+                    if train_device.type != "cpu":
+                        input_ids = input_ids.pin_memory()
+                        labels    = labels   .pin_memory()
+                    input_ids = input_ids.to(device = train_device, non_blocking = True)
+                    labels    = labels   .to(device = train_device, non_blocking = True)
 
                     with autocast_context_manager:
                         loss = model(input_ids = input_ids, labels = labels, n_items = n_items).loss
                         # loss = loss * inverse_gradient_accumulation_steps
-                        accumulated_loss += loss.detach()
+                        accumulated_loss += loss.detach().to(train_device)
                     pass
 
                     if float16_scaler is None:  loss.backward()
@@ -737,11 +819,13 @@ def unsloth_train(trainer):
                 pass
 
                 if float16_scaler is None:
-                    clip_grad_norm_(trainable_parameters, max_grad_norm)
+                    if max_grad_norm is not None and max_grad_norm > 0:
+                        clip_grad_norm_(trainable_parameters, max_grad_norm)
                     optimizer.step()
                 else:
                     float16_scaler.unscale_(optimizer)
-                    clip_grad_norm_(trainable_parameters, max_grad_norm)
+                    if max_grad_norm is not None and max_grad_norm > 0:
+                        clip_grad_norm_(trainable_parameters, max_grad_norm)
                     float16_scaler.step(optimizer)
                     float16_scaler.update()
                 lr_scheduler.step()
@@ -754,8 +838,9 @@ def unsloth_train(trainer):
                 progress_bar.update(1)
 
                 step += 1
-                if step == max_steps: break
+                if step >= max_steps: break
             pass
+            if step >= max_steps: break
         pass
     pass
     unset_training(model)

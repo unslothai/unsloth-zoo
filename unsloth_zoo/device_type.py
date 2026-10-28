@@ -14,6 +14,7 @@
 
 __all__ = [
     "is_hip",
+    "npu_is_available",
     "get_amd_attention_implementation",
     "get_amd_flash_attn_func",
     "get_device_type",
@@ -36,7 +37,9 @@ import inspect
 import os
 import re
 import shutil
+import sys
 import subprocess
+import warnings
 import urllib.request
 
 _IS_MLX = is_mlx_available()
@@ -210,6 +213,29 @@ def _amd_installation_hint():
 pass
 
 @functools.cache
+def npu_is_available():
+    """torch.npu present AND usable; guarded since importing torch_npu without a driver raises."""
+    if _IS_MLX:
+        return False
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        import importlib.util
+        if importlib.util.find_spec("torch_npu") is None:
+            return False
+        try:
+            import torch_npu  # noqa: F401
+        except Exception:
+            return False
+        npu = getattr(torch, "npu", None)
+        if npu is None:
+            return False
+    try:
+        return bool(npu.is_available())
+    except Exception:
+        return False
+pass
+
+@functools.cache
 def is_hip():
     if _IS_MLX:
         return False
@@ -217,20 +243,117 @@ def is_hip():
 pass
 
 
-@functools.cache
-def _detect_gfx_arch():
+def _visible_cuda_capabilities():
+    """(major, minor) of every visible CUDA device, so a gate holds for the weakest card
+    a device_map can use, not just device 0. An unreadable card is skipped; the readable ones
+    include the current device, so a gate is never less strict than before. Matches core's
+    cuda_gate_capabilities, so both pick the same dtype."""
+    capabilities = []
+    try:
+        for index in range(torch.cuda.device_count()):
+            try:
+                capabilities.append(tuple(torch.cuda.get_device_capability(index)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return capabilities or [tuple(torch.cuda.get_device_capability())]
+pass
+
+
+def _current_hip_device_index():
+    """Current HIP device index, or None off ROCm (never touches CUDA on NVIDIA) or when
+    the runtime cannot answer, so the cached probes keep their own fallbacks. No try/except
+    while compiling: get_amd_flash_attn_func runs inside compiled forwards."""
+    if not (is_hip() and torch.cuda.is_available()):
+        return None
+    if torch.compiler.is_compiling():
+        return torch.cuda.current_device()
+    try:
+        return torch.cuda.current_device()
+    except Exception:
+        return None
+pass
+
+
+def _per_device_cache(function, multi_device = False):
+    """functools.cache keyed by device index; the no-argument call means the current
+    device, so torch.cuda.set_device(1) no longer reuses device 0's answer. Off ROCm or
+    with one visible device the plain C-level cache is exact, so that is the default and
+    _use_per_device_caches swaps the wrapper in once DEVICE_COUNT is known."""
+    cached = functools.cache(function)
+    if not multi_device:
+        return cached
+    @functools.wraps(function)
+    def wrapper(device = None):
+        if device is not None and not isinstance(device, int):
+            device = torch.device(device).index
+        if device is None:
+            device = _current_hip_device_index()
+        return cached(device)
+    wrapper.cache_clear = cached.cache_clear
+    wrapper.cache_info = cached.cache_info
+    return wrapper
+pass
+
+
+def _visible_gfx_targets(out):
+    """gfx targets in rocminfo / hipconfig output, one per GPU agent (Studio's
+    _list_rocm_gfx_targets): split on agent headers so two same-arch cards stay two."""
+    sections = re.split(r"(?mi)^\s*\*+\s*$\s*agent\s+\d+\s*$|\bdevice\s*#\s*\d+\b", out)
+    if len(sections) > 1:
+        tokens = []
+        for section in sections[1:]:
+            m = re.search(r"gfx[1-9][0-9a-z]{2,3}", section.lower())
+            if m: tokens.append(m.group(0))
+        return tokens
+    return list(dict.fromkeys(re.findall(r"gfx[0-9a-f]+", out.lower())))
+pass
+
+
+def _pick_gfx_target(out, index = None):
+    """The gfx of HIP device ``index`` (default 0) from subprocess output. rocminfo is
+    already ROCR-filtered, so only HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES remap it,
+    as in Studio's _pick_rocm_gfx_target; an unresolvable mask keeps the first GPU."""
+    tokens = _visible_gfx_targets(out)
+    if not tokens:
+        return None
+    index = index or 0
+    for env in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        mask = os.environ.get(env)
+        if mask is None:
+            continue
+        mask = [x.strip() for x in mask.split(",") if x.strip()]
+        if not mask or mask[0] == "-1":
+            return None
+        try:
+            physical = int(mask[index] if index < len(mask) else mask[0])
+            if 0 <= physical < len(tokens):
+                return tokens[physical]
+        except ValueError:
+            pass
+        return tokens[0]
+    return tokens[index] if index < len(tokens) else tokens[0]
+pass
+
+
+@_per_device_cache
+def _detect_gfx_arch(device = None):
     """Return the GPU architecture string (e.g. 'gfx942') or None if undetectable.
 
-    Uses the PyTorch-active device first so that HIP_VISIBLE_DEVICES and multi-arch
-    hosts are handled correctly. Subprocess probes (rocminfo, hipconfig) scan
-    system-wide output and may return a different arch than the active device.
+    ``device`` is a HIP device index; None means the current device (cached per index).
+    Uses the PyTorch device first so that HIP_VISIBLE_DEVICES and multi-arch
+    hosts are handled correctly. Subprocess probes (rocminfo, hipconfig) are
+    mask-mapped to the same device but may still differ on unusual setups.
     """
     import re as _re
-    # Active device first: right arch for the GPU torch is using, and it
+    if device is not None and not isinstance(device, int):
+        device = torch.device(device).index
+    # PyTorch device first: right arch for the GPU torch is using, and it
     # respects HIP_VISIBLE_DEVICES.
     try:
         if torch.cuda.is_available():
-            dev = torch.cuda.current_device()
+            dev = torch.cuda.current_device() if device is None else device
             arch = torch.cuda.get_device_properties(dev).gcnArchName
             # gcnArchName may include suffixes e.g. "gfx942:sramecc+:xnack-"
             m = _re.match(r"gfx[0-9a-f]+", arch)
@@ -240,26 +363,20 @@ def _detect_gfx_arch():
         pass
     # Subprocess fallbacks for unusual builds where PyTorch cannot query the device.
     import subprocess
-    try:
-        r = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
-        m = _re.search(r"gfx[0-9a-f]+", r.stdout)
-        if m:
-            return m.group(0)
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(["hipconfig", "--full"], capture_output=True, text=True, timeout=10)
-        m = _re.search(r"gfx[0-9a-f]+", r.stdout)
-        if m:
-            return m.group(0)
-    except Exception:
-        pass
+    for command in (["rocminfo"], ["hipconfig", "--full"]):
+        try:
+            r = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            gfx = _pick_gfx_target(r.stdout, device)
+            if gfx:
+                return gfx
+        except Exception:
+            pass
     return None
 pass
 
 
-@functools.cache
-def get_amd_attention_implementation():
+@_per_device_cache
+def get_amd_attention_implementation(device = None):
     """
     Return the best available attention implementation for AMD ROCm.
 
@@ -293,7 +410,7 @@ def get_amd_attention_implementation():
     # aiter's CK/ASM kernels are CDNA-only: gfx942 (MI300X/MI325X) and gfx950
     # (MI355X). flash_attn_func imports on all archs but only runs on these two.
     try:
-        _gfx = _detect_gfx_arch()
+        _gfx = _detect_gfx_arch(device)
         _AITER_SUPPORTED_ARCHS = ("gfx942", "gfx950")  # CDNA3, CDNA4
         if _gfx not in _AITER_SUPPORTED_ARCHS:
             return "sdpa"
@@ -316,8 +433,8 @@ def get_amd_attention_implementation():
     return "sdpa"
 
 
-@functools.cache
-def get_amd_flash_attn_func():
+@_per_device_cache
+def get_amd_flash_attn_func(device = None):
     """
     Return the amd-aiter flash attention function, or None if unavailable.
 
@@ -329,7 +446,10 @@ def get_amd_flash_attn_func():
     Shapes: q/k/v = (batch, seqlen, nheads, headdim), float16 or bfloat16
     Returns: output tensor, same shape as q
     """
-    if get_amd_attention_implementation() != "amd_aiter":
+    # No-argument call when device is None: the plain single-device cache keys () and (None,)
+    # apart, so forwarding None would miss the entry the setup gates filled.
+    impl = get_amd_attention_implementation() if device is None else get_amd_attention_implementation(device)
+    if impl != "amd_aiter":
         return None
     try:
         import aiter as _aiter
@@ -357,7 +477,70 @@ def _cpu_fallback():
         return "cuda"
     if os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1":
         return "cpu"
+    if cpu_backend_allowed():
+        return "cpu"
     return None
+
+
+def _hidden_by(*keys):
+    """An empty / -1 visibility mask among keys: those devices were hidden on purpose."""
+    for key in keys:
+        mask = os.environ.get(key)
+        if mask is not None and "".join(mask.split()) in ("", "-1"):
+            return True
+    return False
+
+
+def cpu_backend_allowed():
+    """Only reached once torch sees no accelerator at all. CPU training is the fallback unless
+    disabled, or a GPU exists that this torch build cannot drive (wrong wheel, missing ROCm torch):
+    those keep their install errors instead of silently training on CPU."""
+    if os.environ.get("UNSLOTH_DISABLE_CPU_FALLBACK", "0") == "1":
+        return False
+    # Each mask only hides the runtime that honours it (HIP also reads CUDA_VISIBLE_DEVICES).
+    amd_masks = ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
+    if not _hidden_by(*amd_masks) and _detect_amd_rocm_runtime():
+        return False
+    # Linux: the loaded kernel driver, not a stray nvidia-smi in a CPU container image.
+    # WSL2 exposes the Windows NVIDIA driver through /usr/lib/wsl/lib instead of /proc/driver/nvidia.
+    if not _hidden_by("CUDA_VISIBLE_DEVICES") and (
+        os.path.exists("/proc/driver/nvidia/version") or os.path.exists("/usr/lib/wsl/lib/nvidia-smi") or (
+            not sys.platform.startswith("linux") and shutil.which("nvidia-smi") is not None
+        )
+    ):
+        return False
+    # Ascend NPU driver without torch_npu: keep the install error too.
+    if not _hidden_by("ASCEND_RT_VISIBLE_DEVICES") and (
+        os.path.exists("/dev/davinci0") or shutil.which("npu-smi") is not None
+    ):
+        return False
+    if _intel_gpu_present():
+        # Not refused: every Intel laptop has one, and most (Iris Xe / UHD) cannot train through XPU.
+        warnings.warn(
+            "Unsloth: found an Intel GPU, but this torch build has no XPU support, so training runs on the CPU. "
+            "Intel Arc and Core Ultra GPUs can train with the XPU build of torch: "
+            "pip install torch --index-url https://download.pytorch.org/whl/xpu",
+            stacklevel = 2,
+        )
+    return True
+
+
+def _intel_gpu_present():
+    """An Intel display / compute device under /sys/class/drm (Linux only)."""
+    try:
+        import glob
+        for path in glob.glob("/sys/class/drm/card*/device/vendor"):
+            with open(path, "r", encoding = "utf-8") as f:
+                if f.read().strip().lower() == "0x8086":
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def cpu_backend_forced():
+    # UNSLOTH_ALLOW_CPU (the CUDA-shaped test spoof) keeps its meaning when both are set.
+    return os.environ.get("UNSLOTH_FORCE_CPU", "0") == "1" and os.environ.get("UNSLOTH_ALLOW_CPU", "0") != "1"
 
 
 _GPU_INIT_SKIPPED = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
@@ -371,12 +554,17 @@ def get_device_type():
         # BEFORE the hardware probes: `__init__.py` publishes "cpu" unconditionally, so
         # checking only in the no-accelerator fallback left a CUDA host with both.
         return "cpu"
+    if cpu_backend_forced():
+        return "cpu"
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if is_hip():
             return "hip"
         return "cuda"
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return "xpu"
+    # After xpu so a host with both keeps xpu.
+    elif npu_is_available():
+        return "npu"
     if hasattr(torch, "accelerator"):
         if not torch.accelerator.is_available():
             # Test-only CPU fallback; get_device_type is @functools.cache'd.
@@ -388,13 +576,20 @@ def get_device_type():
                 raise NotImplementedError(amd_hint)
             raise NotImplementedError("Unsloth cannot find any torch accelerator? You need a GPU.")
         accelerator = str(torch.accelerator.current_accelerator())
-        if accelerator in ("cuda", "xpu", "hip"):
+        if accelerator in ("cuda", "xpu", "hip", "npu"):
             raise RuntimeError(
-                f"Unsloth: Weirdly `torch.cuda.is_available()`, `torch.xpu.is_available()` and `is_hip` all failed.\n"\
+                f"Unsloth: Weirdly `torch.cuda.is_available()`, `torch.xpu.is_available()`, `torch.npu.is_available()` and `is_hip` all failed.\n"\
                 f"But `torch.accelerator.current_accelerator()` works with it being = `{accelerator}`\n"\
                 f"Please reinstall torch - it's most likely broken :("
             )
     fallback = _cpu_fallback()
+    other = None
+    if hasattr(torch, "accelerator") and torch.accelerator.is_available():
+        other = str(torch.accelerator.current_accelerator())
+    # An active accelerator Unsloth does not drive (hpu, mtia, ...) keeps this error instead of silently
+    # training on CPU. A Mac without MLX ("mps") is the exception: its CPU is the supported path there.
+    if fallback == "cpu" and other not in (None, "mps"):
+        fallback = None
     if fallback is not None:
         return fallback
     amd_hint = _amd_installation_hint()
@@ -410,24 +605,44 @@ elif DEVICE_TYPE_TORCH == "mlx": DEVICE_TYPE_TORCH = "mps"
 
 @functools.cache
 def get_device_count():
-    if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
+    if DEVICE_TYPE == "cpu":
         # The getter too, not only the constant below: they were handed 1 and 0.
         return 0
     if DEVICE_TYPE in ("cuda", "hip"):
         return torch.cuda.device_count()
     elif DEVICE_TYPE == "xpu":
         return torch.xpu.device_count()
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.device_count()
     else:
         return 1
 pass
 
 DEVICE_COUNT : int = get_device_count()
 
+_PER_DEVICE_CACHED = ("_detect_gfx_arch", "get_amd_attention_implementation", "get_amd_flash_attn_func")
+# False: callers use the no-argument getters, the cache entry the setup gates already filled.
+AMD_PER_DEVICE_CACHES = False
+
+
+def _use_per_device_caches(device_type, device_count):
+    """Per-device AMD caches only with two or more HIP devices; reuses DEVICE_COUNT, so no
+    extra device probe (UNSLOTH_ZOO_DISABLE_GPU_INIT stays GPU-free)."""
+    if device_type != "hip" or device_count < 2:
+        return False
+    for name in _PER_DEVICE_CACHED:
+        globals()[name] = _per_device_cache(globals()[name].__wrapped__, multi_device = True)
+    globals()["AMD_PER_DEVICE_CACHES"] = True
+    return True
+pass
+_use_per_device_caches(DEVICE_TYPE, DEVICE_COUNT)
+
 # Check blocksize for 4bit -> 64 for CUDA, 128 for AMD
 # If AMD, we cannot load pre-quantized models for now :(
 ALLOW_PREQUANTIZED_MODELS : bool = True
-if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
-    # As with DEVICE_COUNT: the two import paths must not disagree.
+if DEVICE_TYPE == "cpu":
+    # As with DEVICE_COUNT: the two import paths must not disagree. The CPU backend
+    # (unsloth_zoo.cpu) decides bnb-4bit support itself with a real probe.
     ALLOW_PREQUANTIZED_MODELS = False
 # HSA_STATUS_ERROR_EXCEPTION checks - sometimes AMD fails for BnB
 ALLOW_BITSANDBYTES : bool = True
@@ -443,7 +658,7 @@ if DEVICE_TYPE == "hip":
 pass
 
 def device_synchronize():
-    """Cross-platform torch.cuda.synchronize() (CUDA, XPU, or HIP)."""
+    """Cross-platform torch.cuda.synchronize() (CUDA, XPU, HIP or NPU)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -451,10 +666,13 @@ def device_synchronize():
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "synchronize"):
                 torch.xpu.synchronize()
+    elif DEVICE_TYPE == "npu":
+        if npu_is_available() and hasattr(torch.npu, "synchronize"):
+            torch.npu.synchronize()
 pass
 
 def device_empty_cache():
-    """Cross-platform torch.cuda.empty_cache() (CUDA, XPU, or HIP)."""
+    """Cross-platform torch.cuda.empty_cache() (CUDA, XPU, HIP or NPU)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -462,17 +680,149 @@ def device_empty_cache():
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "empty_cache"):
                 torch.xpu.empty_cache()
+    elif DEVICE_TYPE == "npu":
+        if npu_is_available() and hasattr(torch.npu, "empty_cache"):
+            torch.npu.empty_cache()
+pass
+
+# unsloth reads this: an explicit bf16 load on XPU stays bf16 only where vLLM keeps it too.
+XPU_KEEPS_EXPLICIT_BF16 = True
+
+
+def _xpu_keeps_explicit_bf16():
+    """An explicit bf16 request on XPU stays bf16 (emulated if need be), unless an older unsloth
+    loading the same model downgrades it to fp16: then vLLM must too, or the shared weights split."""
+    unsloth_device_type = sys.modules.get("unsloth.device_type")
+    return unsloth_device_type is None or hasattr(unsloth_device_type, "xpu_keeps_explicit_bf16")
+pass
+
+def _xpu_vllm_refuses_bf16():
+    """True when the installed vLLM's own platform check refuses bf16 on this XPU (Arc A770, for a
+    known accuracy issue). Older vLLM without the hook, or any other failure, refuses nothing."""
+    try:
+        from vllm.platforms import current_platform
+        check = getattr(current_platform, "check_if_supports_dtype", None)
+        if check is None:
+            return False
+        check(torch.bfloat16)
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+pass
+
+def _xpu_launch_indices():
+    """Under torchrun / accelerate, the XPUs this node's ranks use (LOCAL_WORLD_SIZE of them, clipped
+    to the visible count), else None. Unsloth is imported before a rank selects its XPU, so the
+    current device then reads XPU 0 on every rank; judging the ranks' devices together keeps every
+    rank on one dtype and is never narrower than the all-visible rule."""
+    def _env_int(name):
+        try:
+            return int(os.environ.get(name, ""))
+        except ValueError:
+            return None
+    local_world = _env_int("LOCAL_WORLD_SIZE")
+    world = _env_int("WORLD_SIZE")
+    if (local_world or 1) <= 1 and (world or 1) <= 1:
+        return None
+    try:
+        count = int(torch.xpu.device_count())
+    except Exception:
+        return None
+    if count <= 0:
+        return None
+    return list(range(min(local_world, count) if local_world and local_world > 0 else count))
+
+pass
+
+def _xpu_selected_indices(device = None):
+    """XPU indices to judge: `device` (an index, "xpu:N", a torch.device or several of them), else
+    the XPUs of a distributed launch (_xpu_launch_indices), else the current device, which
+    torch.xpu.is_bf16_supported() also asks. None when unreadable."""
+    items = device if isinstance(device, (list, tuple, set, frozenset)) else [device]
+    indices = []
+    for item in items:
+        try:
+            if item is None:
+                launch = _xpu_launch_indices()
+                if launch is not None:
+                    indices.extend(i for i in launch if i not in indices)
+                    continue
+                index = torch.xpu.current_device()
+            elif isinstance(item, int) and not isinstance(item, bool):
+                index = item
+            else:
+                item = torch.device(item)
+                if item.type != "xpu":
+                    continue
+                index = torch.xpu.current_device() if item.index is None else item.index
+        except Exception:
+            return None
+        if index not in indices:
+            indices.append(int(index))
+    return indices
+pass
+
+def _xpu_device_lacks_native_bf16(index):
+    """True only when this device is proven to emulate bf16. Its own aspects decide whether the probe
+    can be trusted: without libocloc (absent in torch-xpu wheels) every SYCL aspect reads False."""
+    aspects = (
+        "has_bfloat16_conversions",
+        "has_subgroup_matrix_multiply_accumulate",
+        "has_subgroup_matrix_multiply_accumulate_tensor_float32",
+        "has_subgroup_2d_block_io",
+    )
+    try:
+        props = torch.xpu.get_device_properties(index)
+    except Exception:
+        return False
+    lacks_bf16 = getattr(props, "has_bfloat16_conversions", True) is False
+    return lacks_bf16 and any(getattr(props, name, False) is True for name in aspects)
+pass
+
+def _xpu_bf16_supported(device = None):
+    """is_bf16_supported() counts emulation. Native bf16 on the device(s) in use: `device`, else the
+    current XPU (torch.xpu.is_bf16_supported() asks the same one). An unused sibling never narrows
+    it, and emulated bf16 still runs on any XPU a split model reaches. Unknown means True."""
+    # Beside an older unsloth without the native probe, keep its answer: it still says bf16 on XPU.
+    unsloth_device_type = sys.modules.get("unsloth.device_type")
+    if unsloth_device_type is not None and getattr(unsloth_device_type, "xpu_supports_native_bf16", None) is None:
+        return True
+    indices = _xpu_selected_indices(device)
+    if indices is None:
+        return True
+    return not any(_xpu_device_lacks_native_bf16(index) for index in indices)
+pass
+
+def _apple_bf16_supported():
+    """M1 (g13) and M2 (g14) lack native bf16. Matches unsloth's MLX answer."""
+    try:
+        import mlx.core as mx
+        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        match = re.fullmatch(r"applegpu_g(\d+)[a-z]", str(info.get("architecture", "")))
+        if match:
+            return int(match.group(1)) >= 15
+        name = info.get("device_name", "") or ""
+        return not name.startswith(("Apple M1", "Apple M2"))
+    except Exception:
+        return True
 pass
 
 def device_is_bf16_supported():
-    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, or HIP)."""
+    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, HIP, NPU or Apple MLX)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             return torch.cuda.is_bf16_supported()
     elif DEVICE_TYPE == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "is_bf16_supported"):
-                return torch.xpu.is_bf16_supported()
+                return torch.xpu.is_bf16_supported() and _xpu_bf16_supported()
+    elif DEVICE_TYPE == "npu":
+        if npu_is_available() and hasattr(torch.npu, "is_bf16_supported"):
+            return torch.npu.is_bf16_supported()
+    elif DEVICE_TYPE == "mlx":
+        return _apple_bf16_supported()
     return False
 pass
 

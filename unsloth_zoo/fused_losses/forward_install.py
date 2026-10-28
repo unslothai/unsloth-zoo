@@ -48,8 +48,10 @@ import threading
 import warnings
 from typing import Any
 
-from .ast_rewriter import rewrite_forward_source
+from .ast_rewriter import rewrite_count_aware_ce_spliced, rewrite_forward_source
+from .cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
 from .forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
+from .aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms, unsloth_ga_scale_aux_loss
 
 
 logger = logging.getLogger("unsloth_zoo.fused_forward")
@@ -179,6 +181,35 @@ def _is_eligible_class(cls) -> bool:
     return True
 
 
+def _head_built_as_linear(cls, head_attr) -> bool:
+    """False if __init__ builds the head from a non-Linear class (RobertaLMHead has no .weight)."""
+    for klass in cls.__mro__:
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+        try:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(init)))
+        except (OSError, TypeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                    and any(ast.unparse(t) == f"self.{head_attr}" for t in node.targets)):
+                return "Linear" in ast.unparse(node.value.func).rsplit(".", 1)[-1]
+    return True
+
+
+# Pinned at import: a later rebinding of the module symbol must not pass as stock.
+try:
+    from transformers.loss.loss_utils import ForCausalLMLoss as _STOCK_CAUSAL_LM_LOSS
+except ImportError:
+    _STOCK_CAUSAL_LM_LOSS = None
+
+
+def _can_fuse_loss(loss_function):
+    # A self-reference, not a bool: functools.wraps copies attributes onto custom wrappers.
+    return loss_function is not None and getattr(loss_function, "_unsloth_fused_loss", _STOCK_CAUSAL_LM_LOSS) is loss_function
+
+
 def install_for_class(cls) -> bool:
     """Try to install the fused forward on `cls`. Returns True on success."""
     if not is_enabled():
@@ -223,13 +254,27 @@ def install_for_class(cls) -> bool:
         return False
 
     new_src, cap = rewrite_forward_source(src)
+    tier = "2-ast-triplet"
+    unshifted = False
+    if new_src is None and ".deprecated." in getattr(cls, "__module__", ""):
+        new_src, shifted = rewrite_count_aware_ce_spliced(src)
+        if new_src is not None:
+            tier, unshifted = "3-count-aware-ce", not shifted
     if new_src is None:
         with _REGISTRY_LOCK:
             _UNMATCHED[qn] = "no-canonical-triplet"
         return False
+    new_src = rewrite_aux_loss_ga(new_src)
+    if tier == "3-count-aware-ce" and unscaled_extra_loss_terms(new_src):
+        # A count-aware CE beside a term still added in full would give that term G times its weight.
+        with _REGISTRY_LOCK:
+            _UNMATCHED[qn] = "unscaled-extra-loss-term"
+        return False
     # Composite heads (e.g. BigBird's BigBirdOnlyMLMHead via self.cls) lack
     # .weight/.bias and would crash inside the adapter.
-    if cap.head_attr not in _LINEAR_HEAD_ATTRS:
+    if cap is not None and (
+        cap.head_attr not in _LINEAR_HEAD_ATTRS or not _head_built_as_linear(cls, cap.head_attr)
+    ):
         with _REGISTRY_LOCK:
             _UNMATCHED[qn] = f"non-linear-head: {cap.head_attr}"
         return False
@@ -243,8 +288,14 @@ def install_for_class(cls) -> bool:
     if _base_forward is not forward:
         for _name, _value in (getattr(forward, "__globals__", {}) or {}).items():
             ns.setdefault(_name, _value)
+    # Dynamo < 2.14 resolves globals with __name__ on sys.modules[__name__], which lacks the names added here.
+    ns.pop("__name__", None)
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
+    ns["_can_fuse_loss"] = _can_fuse_loss
+    ns["unsloth_count_aware_cross_entropy"] = unsloth_count_aware_cross_entropy
+    ns["unsloth_loss_count_kwargs"] = unsloth_loss_count_kwargs
     ns["EMPTY_LOGITS"] = EMPTY_LOGITS
+    ns["unsloth_ga_scale_aux_loss"] = unsloth_ga_scale_aux_loss
     # The rewritten body reads UNSLOTH_RETURN_LOGITS via os.environ.get.
     ns.setdefault("os", os)
     try:
@@ -287,6 +338,10 @@ def install_for_class(cls) -> bool:
         new_forward.__qualname__ = forward.__qualname__
         new_forward.__module__ = forward.__module__
         new_forward.__doc__ = forward.__doc__
+        # The exec namespace has no __name__, so decorated bodies start with __module__ None.
+        inner = inspect.unwrap(new_forward)
+        if inner is not new_forward:
+            inner.__module__ = forward.__module__
     except Exception:
         pass
 
@@ -303,13 +358,15 @@ def install_for_class(cls) -> bool:
         return False
 
     cls.forward = new_forward
+    if unshifted:
+        cls._unsloth_counts_unshifted_labels = True
     with _REGISTRY_LOCK:
         _PATCHED[qn] = {
-            "tier": "2-ast-triplet",
+            "tier": tier,
             "kind": cls.__name__,
             "hash": fhash,
             "module": getattr(cls, "__module__", ""),
-            "head_attr": cap.head_attr,
+            "head_attr": cap.head_attr if cap is not None else None,
         }
     return True
 

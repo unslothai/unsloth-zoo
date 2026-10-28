@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.9.6"
+__version__ = "2026.10.9"
 
 import os
 import platform
@@ -67,11 +67,28 @@ def _detect_windows_on_arm() -> bool:
 
 _windows_on_arm = _detect_windows_on_arm()
 
+# Only when hf_transfer is importable: huggingface_hub < 1.0 honours the flag and refuses every
+# download ("'hf_transfer' package is not available") when it is not, as after a --no-deps install.
+import importlib.util as _importlib_util
+
+
+def _hf_transfer_importable() -> bool:
+    try:
+        return _importlib_util.find_spec("hf_transfer") is not None
+    except (ImportError, ValueError):
+        # A stub placed in sys.modules without a __spec__ makes find_spec raise; importing
+        # unsloth_zoo must not fail on it, and a stub is not the real downloader.
+        return False
+
+
+_hf_transfer_installed = _hf_transfer_importable()
+
 # Hugging Face Hub faster downloads (skipped when offline mode is requested).
 if (
     "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
     and not _offline_env
     and not _windows_on_arm
+    and _hf_transfer_installed
 ):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
@@ -186,6 +203,8 @@ else:
         DEVICE_COUNT = 0
         ALLOW_PREQUANTIZED_MODELS = False
 
+_IS_CPU_BACKEND = False
+
 # Stub the CUDA-only imports whenever GPU init is skipped (MLX host or the opt-in
 # download child), so they resolve to a loud no-op instead of a hard ImportError. On a
 # normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
@@ -279,7 +298,17 @@ if not _SKIP_GPU_INIT:
     IS_TORCH_2_10_OR_NEWER = (major_torch > 2) or (major_torch == 2 and minor_torch >= 10)
     IS_TORCH_ROCM_BUILD = "+rocm" in torch_version_raw.lower()
     # expandable_segments is unsupported on Windows/WSL.
-    IS_WSL_OR_WINDOWS = bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")) or os.name == "nt"
+    def _is_wsl():
+        if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+            return True
+        # Docker on WSL2 has no WSL_* variables but shares the *-microsoft-standard-WSL2 kernel,
+        # where expandable_segments dies with `CUDA driver error: unknown error` (unslothai/unsloth#3511).
+        try:
+            return "microsoft" in os.uname().release.lower()
+        except Exception:
+            return False
+    IS_WSL_OR_WINDOWS = os.name == "nt" or _is_wsl()
+    del _is_wsl
 
     # Nor on an NVIDIA Tegra board, where the CUDA VMM calls it is built on fail: a 1MiB
     # buffer dies with `RuntimeError: CUDA driver error: out of memory` on a board with 50GB
@@ -404,6 +433,8 @@ if not _SKIP_GPU_INIT:
         ALLOW_PREQUANTIZED_MODELS,
     )
     IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
+    # No accelerator: unsloth_zoo.cpu trains with stock torch, so none of the GPU patches below load.
+    _IS_CPU_BACKEND = DEVICE_TYPE == "cpu"
 
     # Torch >= 2.10 reads PYTORCH_ALLOC_CONF and treats legacy per-backend vars as deprecated.
     if IS_TORCH_2_10_OR_NEWER:
@@ -528,14 +559,16 @@ if not _SKIP_GPU_INIT:
     if not ("UNSLOTH_IS_PRESENT" in os.environ):
         raise ImportError("Please install Unsloth via `pip install unsloth`!")
 
-    try:
-        print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-    except:
-        print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
+    if not _IS_CPU_BACKEND:
+        try:
+            print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
+        except:
+            print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
 
     # Log Unsloth-Zoo Utilities
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 
+if not _SKIP_GPU_INIT and not _IS_CPU_BACKEND:
     from unsloth_zoo.temporary_patches import (
         encode_conversations_with_harmony,
     )
@@ -568,7 +601,18 @@ if not _SKIP_GPU_INIT:
         del UnsupportedFieldAttributeWarning
     except:
         pass
+elif not _SKIP_GPU_INIT and _IS_CPU_BACKEND:
+    # Device-independent (stdlib + numpy): keep the root exports on the CPU backend too.
+    from .rl_environments import (
+        check_python_modules,
+        create_locked_down_function,
+        execute_with_time_limit,
+        Benchmarker,
+        is_port_open,
+        launch_openenv,
+    )
 
+if not _SKIP_GPU_INIT:
     del os, warnings, re
 
 

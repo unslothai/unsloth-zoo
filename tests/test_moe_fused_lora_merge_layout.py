@@ -881,6 +881,10 @@ def test_merge_matches_the_adapter_forward_on_a_tiny_fused_moe(
     saved = (ParamWrapper.forward, ParamWrapper.get_delta_weight, PeftModel.save_pretrained)
     saved_experts_forward = experts_cls.forward
     was_patched = hasattr(experts_cls, "_unsloth_lora_patched")
+    # The MoE backend is chosen once per process and cached: start from no choice, so one an
+    # earlier test made for other hardware (grouped_mm on spoofed CUDA cards) is not used here.
+    import unsloth_zoo.temporary_patches.moe_utils as moe_utils
+    monkeypatch.setattr(moe_utils, "_SELECTED_MOE_BACKEND", None, raising=False)
     try:
         patch_gpt_oss_moe_for_lora()
         if ParamWrapper.forward.__name__ != "_patched_param_wrapper_forward":

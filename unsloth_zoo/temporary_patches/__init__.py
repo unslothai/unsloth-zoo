@@ -17,8 +17,12 @@
 
 from .common import *
 from .fla_vendor import *
+from .hub_kernel_export_check import *
+from .gdn_causal_conv1d import *
 from .gemma import *
 from .misc import *
+from .t5 import *
+from .granitemoehybrid import *
 from .gemma3n import *
 from .gemma4 import *
 from .gemma4_float32 import *
@@ -31,21 +35,39 @@ from .qwen3_moe_float32 import *
 from .qwen3_vl_moe import *
 from .qwen3_next_moe import *
 from .qwen3_5_moe import *
+from .qwen4_exp import *
 from .glm4_moe import *
 from .deepseek_v3_moe import *
+from .deepseek_v4 import *
+from .sparse_attention import *
+from .deepseek_v4_sparse_flex import *
+from .sparse_attention_flex import *
 from .gemma4_moe import *
 from .lfm2_moe import *
+from .step3p7_moe import *
 from .mixtral_moe import *
+from .llama4_moe import *
+from .inkling import *
+from .compiled_model_identity import *
+from .bitsandbytes_large_tensors import *
+from .remote_mamba2 import *
 from .ernie4_5_moe import *
 from .pixtral import *
 from .ministral import *
 from .amd_aiter import *
 from .mxfp4 import *
+from .conversion_mapping_rescope import *
 from .bitsandbytes import *
+from .bitsandbytes_optimizer_sync import *
 from .moe_utils_bnb4bit import *
+from .moe_experts_interface import *
+from .moe_router_triton import *
 from .moe_grouped_modulelist import *
 from .moe_utils_fp8 import *
+from .fp8_uncontained_weights import *
 from .flex_attention_bwd import *
+from .inductor_stride_guard import *
+from .remote_code_vlm import *
 # The eager-fallback recovery hook unsloth calls when a backward dies inside
 # activation checkpointing. Named rather than star-imported: `utils` also
 # exports names this package has never re-exported.
@@ -54,3 +76,4 @@ from .utils import (
     force_eager_fallback,
     apply_pending_eager_fallbacks,
 )
+from .datasets_folder_metadata import *

@@ -34,9 +34,15 @@ import importlib
 import types
 import __future__
 import builtins as _py_builtins
+import unicodedata
 import os, gc, time, statistics
+import collections
+import io
+import pickle
+import itertools
 import numpy as np
 import signal
+import contextlib
 from contextlib import contextmanager
 from functools import wraps
 import threading
@@ -489,8 +495,7 @@ pass
 # whose whole module has to go:
 #   string -- Formatter.get_field resolves a dotted runtime string and returns
 #     the object, reaching the real builtins with nothing in the source to
-#     match. str.format resolves the same way but only returns text, never the
-#     object, so it is not an execution path and stays.
+#     match. str.format fields are checked in _reject_dunder_access instead.
 #   dataclasses -- resolves annotations via sys.modules[cls.__module__], which
 #     cannot work for synthetic globals.
 _SAFE_IMPORT_MODULES = frozenset({
@@ -511,17 +516,29 @@ _SAFE_IMPORT_MODULES = frozenset({
 #     3.14. Denied on every version; 3.13 reaches it only via private
 #     _evaluate, which the private-attribute rule already covers.
 #   mutators -- time.clock_settime(_ns) sets the host clock given the
-#     privilege a root container has. Read-only clocks stay.
+#     privilege a root container has. Read-only clocks stay. enum.global_enum
+#     copies members into sys.modules[cls.__module__], which the functional
+#     API lets the caller name (module="builtins").
 _DENIED_MODULE_ATTRS = frozenset({
     "functools.update_wrapper",
     "functools.wraps",
     "time.clock_settime",
     "time.clock_settime_ns",
+    "enum.global_enum",
     "operator.attrgetter",
     "operator.methodcaller",
     "typing.ForwardRef",
     "typing.evaluate_forward_ref",
     "typing.get_type_hints",
+    # register() runs get_type_hints on string annotations.
+    "functools.singledispatch",
+    "functools.singledispatchmethod",
+})
+
+# `case int(x)` binds the subject; other positional patterns getattr __match_args__ names.
+_SELF_MATCHING_TYPES = frozenset({
+    "bool", "bytearray", "bytes", "dict", "float", "frozenset", "int", "list",
+    "set", "str", "tuple",
 })
 
 # Attributes that walk the interpreter's own object graph. None of these start
@@ -539,6 +556,9 @@ _DENIED_ATTR_NAMES = frozenset({
     "gi_code", "gi_frame", "gi_running", "gi_yieldfrom",
     "tb_frame", "tb_lasti", "tb_lineno", "tb_next",
 })
+# 3.14 ForwardRef.evaluate runs its string with the real builtins; denied only where it exists.
+if sys.version_info >= (3, 14):
+    _DENIED_ATTR_NAMES = _DENIED_ATTR_NAMES | {"evaluate"}
 
 # Dunder methods a generated helper class may define. A method name is
 # FunctionDef.name, not a Name or Attribute node, so the walk below cannot see
@@ -656,6 +676,136 @@ def _allowlist_builtins():
 pass
 
 
+# ast.Match* is 3.10+, this module imports on 3.9; an empty tuple makes the
+# isinstance below false.
+_MATCH_CLASS_NODES = tuple(
+    node for node in (getattr(ast, "MatchClass", None),) if node is not None
+)
+
+
+def _annotation_nodes(node):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        arguments = node.args
+        params = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                  arguments.vararg, arguments.kwarg]
+        yield from (p.annotation for p in params if p is not None and p.annotation is not None)
+        if node.returns is not None:
+            yield node.returns
+    elif isinstance(node, ast.AnnAssign):
+        yield node.annotation
+
+
+_TYPING_MODULES = frozenset({"typing", "typing_extensions"})
+
+
+# Missing on older Pythons (match 3.10+, PEP 695 3.12+): an empty tuple matches nothing.
+def _ast_nodes(*names):
+    return tuple(node for node in (getattr(ast, name, None) for name in names) if node is not None)
+
+
+_NAMED_BINDING_NODES = _ast_nodes("MatchAs", "MatchStar", "TypeVar", "ParamSpec", "TypeVarTuple")
+_MATCH_MAPPING_NODES = _ast_nodes("MatchMapping")
+
+
+def _bound_names(tree):
+    # Bound names, plus the Literal / typing names only real typing imports bind.
+    bound, literal_names, typing_names = set(), {"Literal"}, set(_TYPING_MODULES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) or (
+            _NAMED_BINDING_NODES and isinstance(node, _NAMED_BINDING_NODES)
+        ):
+            if node.name:
+                bound.add(node.name)
+        elif _MATCH_MAPPING_NODES and isinstance(node, _MATCH_MAPPING_NODES):
+            if node.rest:
+                bound.add(node.rest)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _TYPING_MODULES:
+                    typing_names.add(alias.asname or alias.name)
+                else:
+                    bound.add(alias.asname or alias.name.partition(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if node.module in _TYPING_MODULES and alias.name == "Literal":
+                    literal_names.add(alias.asname or alias.name)
+                else:
+                    bound.add(alias.asname or alias.name)
+    return bound, literal_names - bound, typing_names - bound
+
+
+# Quoted names that resolve to a real builtin or module the code could not name itself.
+_UNSAFE_FORWARD_REFS = frozenset(dir(_py_builtins)) | frozenset(
+    getattr(sys, "stdlib_module_names", ())
+) | frozenset(sys.builtin_module_names) | frozenset(
+    name.partition(".")[0] for name in list(sys.modules)
+)
+
+
+def _is_plain_forward_ref(value):
+    # One name lookup, never code; NFKC first, as the compiler folds "ｅｖａｌ" to "eval".
+    value = unicodedata.normalize("NFKC", value)
+    return (
+        value.isidentifier() and not value.startswith("_")
+        and value not in _UNSAFE_FORWARD_REFS
+    )
+
+
+def _annotation_strings(annotation, literal_names, typing_names):
+    # Literal["W"] values and plain forward refs ("Matrix") are never run as code.
+    stack = [annotation]
+    while stack:
+        sub = stack.pop()
+        if isinstance(sub, ast.Subscript) and (
+            (isinstance(sub.value, ast.Name) and sub.value.id in literal_names)
+            or (isinstance(sub.value, ast.Attribute) and sub.value.attr == "Literal"
+                and isinstance(sub.value.value, ast.Name)
+                and sub.value.value.id in typing_names)
+        ):
+            # Only the Literal's own string values are exempt; anything nested is still scanned.
+            values = sub.slice.elts if isinstance(sub.slice, ast.Tuple) else [sub.slice]
+            stack.extend(
+                v for v in values if not (isinstance(v, ast.Constant) and isinstance(v.value, str))
+            )
+            continue
+        if (
+            isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+            and not _is_plain_forward_ref(sub.value)
+        ):
+            yield sub
+        stack.extend(ast.iter_child_nodes(sub))
+
+
+_FORMAT_METHODS = frozenset({"format", "format_map"})
+
+
+def _format_fields_are_safe(text, depth = 0):
+    # str.format resolves `.name` / `[key]` fields via getattr / getitem, unseen by the Attribute check.
+    import _string
+    if depth > 2:
+        return False
+    try:
+        for _, field, spec, _ in _string.formatter_parser(text):
+            if field is not None:
+                _, rest = _string.formatter_field_name_split(field)
+                for _, name in rest:
+                    if isinstance(name, str) and (
+                        name.startswith("_") or name in _DENIED_ATTR_NAMES
+                    ):
+                        return False
+            if spec and not _format_fields_are_safe(spec, depth + 1):
+                return False
+    except ValueError:
+        return False
+    return True
+
+
 def _reject_dunder_access(tree):
     """
     Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
@@ -663,6 +813,7 @@ def _reject_dunder_access(tree):
     included) using only attribute access. Generated code has no reason to touch
     dunders, so refuse them outright.
     """
+    bindings = None
     for node in ast.walk(tree):
         # Definition names are strings on the node, invisible to the Name and
         # Attribute checks below, so they get their own fail-closed rule.
@@ -681,12 +832,50 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )
+        # Only a literal template can be checked; refuse `.format` on anything else.
+        if isinstance(node, ast.Attribute) and node.attr in _FORMAT_METHODS:
+            template = node.value
+            if not (
+                isinstance(template, ast.Constant) and isinstance(template.value, str)
+                and _format_fields_are_safe(template.value)
+            ):
+                raise RuntimeError(
+                    f"'.{node.attr}' is only allowed on a string literal without "
+                    "private or dunder fields in generated code."
+                )
+        # Annotations are strings here; anything evaluating them runs text the walk saw as a literal.
+        for annotation in _annotation_nodes(node):
+            if bindings is None:
+                bindings = _bound_names(tree)
+            for _ in _annotation_strings(annotation, *bindings[1:]):
+                raise RuntimeError(
+                    "String annotations are not allowed in generated code."
+                )
         # Two for names: a bare `_` or `_total` local is ordinary and reaches
         # nothing on its own.
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             raise RuntimeError(
                 f"Name '{node.id}' is not allowed in generated code."
             )
+        # `case object(__class__=x)` is a getattr with no Attribute node anywhere.
+        # kwd_attrs is the only identifier-as-string field that READS an attribute;
+        # every other one merely binds, and the Name rule above refuses the read.
+        if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
+            if node.patterns and bindings is None:
+                bindings = _bound_names(tree)
+            # A rebound `int = K` is no longer the builtin, so it gets no exemption.
+            if node.patterns and not (
+                isinstance(node.cls, ast.Name) and node.cls.id in _SELF_MATCHING_TYPES
+                and node.cls.id not in bindings[0]
+            ):
+                raise RuntimeError(
+                    "Positional class patterns are only allowed on builtin types in generated code."
+                )
+            for attr in (node.kwd_attrs or []):
+                if attr.startswith("_") or attr in _DENIED_ATTR_NAMES or attr in _FORMAT_METHODS:
+                    raise RuntimeError(
+                        f"Attribute '{attr}' is not allowed in generated code."
+                    )
 pass
 
 
@@ -772,6 +961,10 @@ def create_locked_down_function(function, *, builtins_policy: str = "allowlist")
     # parameter recently, but the attribute is writable on every version we
     # support. Without it `def f(x, *, k = 1)` loses k and raises TypeError.
     locked.__kwdefaults__ = f.__kwdefaults__
+    # Full builtins can reach signal itself, so only a separate process bounds them.
+    if builtins_policy == "full" or _catches_everything(ast.parse(function)):
+        # The id keeps each instance's globals separate in the helper, as they are in-process.
+        locked._unsloth_catch_all = (function, builtins_policy, next(_catch_all_ids))
     return locked
 pass
 
@@ -785,6 +978,31 @@ def _retry_eintr(func, *args):
                 continue
             raise
 pass
+
+# Raising in these frames would skip time_limit's teardown.
+_CONTEXTMANAGER_FRAMES = frozenset((
+    contextlib._GeneratorContextManager.__enter__.__code__,
+    contextlib._GeneratorContextManager.__exit__.__code__,
+))
+# After the deadline SIGALRM re-fires at this period until the body unwinds.
+_TIME_LIMIT_REFIRE_S = 0.01
+# Cleanup still unwinding the first timeout gets this long before re-fires raise.
+_TIME_LIMIT_CLEANUP_GRACE_S = 1.0
+
+class _TimeLimitExceeded(BaseException):
+    # Re-fires raise this so `except Exception` cannot catch it; time_limit converts it.
+    pass
+
+def _timeout_unwinding():
+    # A timeout still unwinding through finally / except / __exit__: let that cleanup run.
+    exc = sys.exc_info()[1]
+    for _ in range(32):
+        if exc is None:
+            return False
+        if isinstance(exc, (TimeoutError, _TimeLimitExceeded)):
+            return True
+        exc = exc.__context__
+    return False
 
 @contextmanager
 def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
@@ -814,10 +1032,23 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
     deadline = seconds if prev_remaining <= 0.0 else min(seconds, prev_remaining)
 
     fired = False  # set by our handler
+    fired_at = 0.0
+    stopping = False
 
     def _handler(signum, frame):
-        nonlocal fired
+        nonlocal fired, fired_at
+        if stopping:
+            return
+        # Re-fire until the body unwinds: a one-shot alarm is lost once generated code swallows it.
+        signal.setitimer(signal.ITIMER_REAL, _TIME_LIMIT_REFIRE_S)
+        if frame is not None and frame.f_code in _CONTEXTMANAGER_FRAMES:
+            return
+        if fired:
+            if _timeout_unwinding() and time.monotonic() - fired_at < _TIME_LIMIT_CLEANUP_GRACE_S:
+                return
+            raise _TimeLimitExceeded()
         fired = True
+        fired_at = time.monotonic()
         # include the intended arming deadline for debugging
         raise TimeoutError(f"Timed out after {deadline:g}s")
 
@@ -833,7 +1064,10 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
 
         _retry_eintr(signal.setitimer, signal.ITIMER_REAL, deadline)
         yield
+    except _TimeLimitExceeded:
+        raise TimeoutError(f"Timed out after {deadline:g}s") from None
     finally:
+        stopping = True
         # Make teardown atomic wrt SIGINT and robust to EINTR
         old_sigint = signal.getsignal(signal.SIGINT)
         try:
@@ -930,6 +1164,183 @@ pass
 
 _VALID_START_METHODS = frozenset({"fork", "spawn", "forkserver"})
 
+# Handler names that provably cannot catch the re-fires' BaseException subclass.
+_NARROW_EXCEPTIONS = frozenset(
+    name for name, value in vars(_py_builtins).items()
+    if isinstance(value, type) and issubclass(value, Exception)
+)
+
+def _catches_everything(tree):
+    bound = _bound_names(tree)[0]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler):
+            names = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
+            if not all(isinstance(n, ast.Name) and n.id in _NARROW_EXCEPTIONS and n.id not in bound for n in names):
+                return True
+        elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
+            if node.finalbody:  # can return / continue, or raise something an outer handler eats
+                return True
+        elif isinstance(node, (ast.With, ast.AsyncWith)):  # __exit__ can return True, even one built by type()
+            return True
+    return False
+pass
+
+# A fresh interpreter, not a fork: forking a process holding a model costs ~100 ms each way and pins its pages.
+_CATCH_ALL_HELPER = """
+import importlib.util, sys
+from multiprocessing.connection import Connection
+spec = importlib.util.spec_from_file_location("_unsloth_rl_sandbox", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._catch_all_helper_main(Connection(int(sys.argv[2]), writable = False), Connection(int(sys.argv[3]), readable = False))
+"""
+
+_catch_all_ids = itertools.count()
+_DEFERRED_BODY = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
+
+def _runs_in_helper(value):
+    # Async and generator functions return an object without running their body, so they stay in-process.
+    return (
+        getattr(value, "_unsloth_catch_all", None) is not None
+        and not (value.__code__.co_flags & _DEFERRED_BODY)
+    )
+pass
+
+# (process, request conn, reply conn, owner pid); replaced only after a timeout kills it.
+_catch_all_helper = None
+
+# The helper can write any bytes to the reply pipe: rebuild only plain data (pickle's "Restricting Globals").
+_INERT_GLOBALS = _NARROW_EXCEPTIONS | {"complex", "set", "frozenset", "bytearray", "range", "slice"}
+
+class _InertUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "builtins" and name in _INERT_GLOBALS:
+            return getattr(_py_builtins, name)
+        raise pickle.UnpicklingError(f"Unsloth: strategy helper replied with {module}.{name}")
+pass
+
+def _inert_loads(data):
+    return _InertUnpickler(io.BytesIO(data)).load()
+pass
+
+def _send_inert(conn, reply):
+    try:
+        data = pickle.dumps(reply)
+        _inert_loads(data)
+    except Exception as e:
+        data = pickle.dumps((False, RuntimeError(
+            f"Unsloth: a strategy may only return or raise plain data and builtin exceptions: {e!r}"
+        )))
+    conn.send_bytes(data)
+pass
+
+def _catch_all_helper_main(requests_conn, replies_conn):
+    _send_inert(replies_conn, None)  # ready: imports done, so the first call is not charged for them
+    compiled = collections.OrderedDict()
+    while True:
+        try:
+            (source, policy, key), args, kwargs = requests_conn.recv()
+        except (EOFError, OSError):
+            return
+        try:
+            fn = compiled.get(key)
+            if fn is None:
+                if len(compiled) >= 256:
+                    compiled.popitem(last = False)
+                fn = compiled[key] = create_locked_down_function(source, builtins_policy = policy)
+            else:
+                compiled.move_to_end(key)
+            reply = (True, fn(*args, **kwargs))
+        except BaseException as e:
+            reply = (False, e)
+        _send_inert(replies_conn, reply)
+pass
+
+def _stop_catch_all_helper():
+    global _catch_all_helper
+    helper, _catch_all_helper = _catch_all_helper, None
+    if helper is None or helper[3] != os.getpid():
+        return
+    process, requests_conn, replies_conn, _ = helper
+    process.kill()
+    process.wait()
+    requests_conn.close()
+    replies_conn.close()
+pass
+
+def _ensure_catch_all_helper():
+    global _catch_all_helper
+    helper = _catch_all_helper
+    if helper is not None and helper[3] == os.getpid() and helper[0].poll() is None:
+        return True
+    _stop_catch_all_helper()
+    from multiprocessing.connection import Connection
+    request_r, request_w = os.pipe()
+    reply_r, reply_w = os.pipe()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _CATCH_ALL_HELPER, os.path.abspath(__file__), str(request_r), str(reply_w)],
+            pass_fds = (request_r, reply_w), stdin = subprocess.DEVNULL,
+        )
+    except (OSError, ValueError):  # ValueError: pass_fds on Windows
+        for fd in (request_r, request_w, reply_r, reply_w):
+            os.close(fd)
+        return False
+    os.close(request_r)
+    os.close(reply_w)
+    _catch_all_helper = (process, Connection(request_w, readable = False), Connection(reply_r, writable = False), os.getpid())
+    try:
+        if _catch_all_helper[2].poll(60):
+            _inert_loads(_catch_all_helper[2].recv_bytes())
+            return True
+    except (EOFError, OSError, pickle.UnpicklingError):
+        pass
+    _stop_catch_all_helper()
+    return False
+pass
+
+def _call_in_catch_all_helper(fn, deadline, seconds, args, kwargs):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"Timed out after {seconds:g}s")
+    try:
+        if not _ensure_catch_all_helper():
+            raise RuntimeError("Unsloth: could not restart the strategy helper process")
+        _, requests_conn, replies_conn, _ = _catch_all_helper
+        requests_conn.send((fn._unsloth_catch_all, args, kwargs))
+        if not replies_conn.poll(max(deadline - time.monotonic(), 0.0)):
+            raise TimeoutError(f"Timed out after {seconds:g}s")
+        ok, value = _inert_loads(replies_conn.recv_bytes())
+    except BaseException:
+        # Interrupted mid-call, its next reply would answer the wrong request.
+        _stop_catch_all_helper()
+        raise
+    if not ok:
+        raise value
+    return value
+pass
+
+def _stop_generated_code_at_deadline(value, deadline, seconds):
+    # Generated code can swallow the TimeoutError raised inside it; re-raise it in the caller.
+    if not (isinstance(value, types.FunctionType) and value.__code__.co_filename == "<user_code>"):
+        return value
+    # Code that may absorb any exception runs in the killable helper (in-process if none started).
+    if _runs_in_helper(value) and _catch_all_helper is not None:
+        @wraps(value)
+        def in_helper(*args, **kwargs):
+            return _call_in_catch_all_helper(value, deadline, seconds, args, kwargs)
+        return in_helper
+
+    @wraps(value)
+    def guarded(*args, **kwargs):
+        if time.monotonic() < deadline:
+            result = value(*args, **kwargs)
+            if time.monotonic() < deadline:
+                return result
+        raise TimeoutError(f"Timed out after {seconds:g}s")
+    return guarded
+pass
+
 def execute_with_time_limit(
     seconds: float,
     *,
@@ -980,6 +1391,11 @@ def execute_with_time_limit(
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
             if effective_backend == "signal":
+                if any(_runs_in_helper(v) for v in (*args, *kwargs.values())):
+                    _ensure_catch_all_helper()  # started before the clock, not on the strategy's time
+                deadline = time.monotonic() + seconds
+                args = tuple(_stop_generated_code_at_deadline(a, deadline, seconds) for a in args)
+                kwargs = {k: _stop_generated_code_at_deadline(v, deadline, seconds) for k, v in kwargs.items()}
                 with time_limit(seconds):
                     return func(*args, **kwargs)
             elif effective_backend == "process":
@@ -1046,20 +1462,32 @@ import random
 import subprocess
 
 def is_port_open(host, port):
-    """ Check if the port like localhost:8000 is open or closed """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    """ Check if the port like localhost:8000 is open or closed
+
+    Family comes from getaddrinfo, not AF_INET, and every candidate is tried: an
+    IPv6 host is unreachable over AF_INET, and a dual-stack `localhost` resolves
+    to both families with the listener on only one.
+    """
     try:
-        sock.settimeout(1)  # Set a timeout for the connection attempt
-        result = sock.connect_ex((host, port))
-        if result == 0:
-            return True  # Port is open
-        else:
-            return False # Port is closed or connection failed
+        candidates = socket.getaddrinfo(host, port, type = socket.SOCK_STREAM)
     except socket.error as e:
         print(f"Socket error: {e}")
         return False
-    finally:
-        sock.close()
+    for family, socktype, proto, _, sockaddr in candidates:
+        # In the try: AF_INET6 without IPv6 raises EAFNOSUPPORT, and raising would
+        # skip a reachable candidate behind it.
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(1)  # Set a timeout for the connection attempt
+            # Unmodified: rebuilding (host, port) would drop an AF_INET6 scope_id.
+            if sock.connect_ex(sockaddr) == 0:
+                return True  # Port is open
+        except socket.error as e:
+            print(f"Socket error: {e}")
+        finally:
+            if sock is not None: sock.close()
+    return False # Port is closed or connection failed
 pass
 
 
@@ -1086,6 +1514,240 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
         return f"{working_directory}{os.pathsep}{src_path}"
 
 
+# Endpoint -> the Popen we spawned on it. /health says "something is listening",
+# never "mine is". Keyed on (host, port): two children can hold one port on
+# different addresses.
+_OPENENV_CHILDREN = {}
+
+# Held for every registry access: poll() calls waitpid, which releases the GIL, so
+# iteration can be resized under us and get-poll-pop is check-then-mutate
+# (python/cpython#87664). WNOHANG does not block, so holding it across poll() is cheap.
+_OPENENV_CHILDREN_LOCK = threading.Lock()
+
+# Endpoints claimed but not yet spawned onto. The lock makes each operation atomic,
+# not check-then-spawn-then-register: without a claim two launches both find a port
+# closed, both spawn, and the later registration orphans the earlier child.
+_OPENENV_RESERVED = set()
+
+
+def _reinit_openenv_lock_after_fork():
+    """ Replace the registry lock in a forked child.
+
+    fork copies the lock but not the thread owning it, so one held at fork time is
+    inherited locked forever and the child's first registry call blocks (CPython
+    bpo-6721). The notebook path forks per move, so this is reachable.
+    """
+    global _OPENENV_CHILDREN_LOCK
+    _OPENENV_CHILDREN_LOCK = threading.Lock()
+pass
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child = _reinit_openenv_lock_after_fork)
+pass
+
+
+def _reserve_openenv_endpoint(client_host, port):
+    """ Claim this endpoint for the caller, or report that someone already has. """
+    with _OPENENV_CHILDREN_LOCK:
+        key = (client_host, port)
+        if key in _OPENENV_RESERVED or key in _OPENENV_CHILDREN:
+            return False
+        _OPENENV_RESERVED.add(key)
+        return True
+pass
+
+
+def _register_openenv_child(client_host, port, child):
+    """ Hand the endpoint over from the reservation to the child now holding it.
+
+    The spawning pid is recorded because poll() only means anything in the process
+    that started the child; see _openenv_child_alive.
+    """
+    with _OPENENV_CHILDREN_LOCK:
+        _OPENENV_CHILDREN[(client_host, port)] = (child, os.getpid())
+        _OPENENV_RESERVED.discard((client_host, port))
+pass
+
+
+def _openenv_pid_is_alive(pid):
+    """ Does this pid still exist, without signalling or reaping it?
+
+    Windows needs the Win32 API instead: CPython maps every signal except
+    CTRL_C_EVENT and CTRL_BREAK_EVENT onto TerminateProcess(handle, sig), so
+    os.kill(pid, 0) there kills the server it was asked about.
+    """
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_INVALID_PARAMETER = 87
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # 87 alone means no such pid; access denied and friends mean it exists.
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0) # Signal 0 asks without delivering or reaping
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, just not ours to signal
+    except OSError:
+        return True          # unanswerable, so do not call a live server dead
+    return not _openenv_pid_is_zombie(pid)
+pass
+
+
+def _openenv_pid_is_zombie(pid):
+    """ Has this pid exited without being reaped?
+
+    A zombie still answers os.kill(pid, 0) while its listening socket is long
+    gone, so pid existence alone re-opens the squatter hole a port away.
+    Windows has no such state, and would pay a `ps` process to learn that.
+    """
+    if os.name == "nt": return False
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as file:
+            # comm sits in parentheses and may contain spaces, so split after the last ')'.
+            return file.read().rsplit(b")", 1)[-1].split()[:1] == [b"Z"]
+    except OSError:
+        pass # No procfs: macOS and the BSDs answer through ps instead
+    try:
+        state = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output = True, text = True, timeout = 10,
+        ).stdout.strip()
+    except Exception:
+        return False         # unanswerable, so do not call a live server dead
+    return state[:1] == "Z"  # multi-letter on BSD ('Z+'), so read the first only
+pass
+
+
+def _release_openenv_endpoint(client_host, port, child = None):
+    """ Give the endpoint up, removing the child record only if it is still `child`.
+
+    Compare-and-delete: an unconditional pop removes whatever is stored, which
+    after a lost spawn race is another launch's live child.
+    """
+    with _OPENENV_CHILDREN_LOCK:
+        key = (client_host, port)
+        _OPENENV_RESERVED.discard(key)
+        entry = _OPENENV_CHILDREN.get(key, None)
+        if child is not None and entry is not None and entry[0] is child:
+            _OPENENV_CHILDREN.pop(key, None)
+pass
+
+
+# An open port plus a live child is not proof the child opened it: a process taking
+# the endpoint before uvicorn binds satisfies both, and uvicorn does not exit the
+# instant it loses a bind. The child's own announcement is the proof.
+_UVICORN_BOUND = ("Uvicorn running on",)
+_UVICORN_BIND_FAILED = ("address already in use", "error while attempting to bind")
+# Trials to wait for that announcement on an already-open port before falling back.
+# Only a reworded startup log gets here, and failing a legitimate launch to close a
+# race is the worse trade.
+_UVICORN_BOUND_GRACE_TRIALS = 300
+
+
+def _watch_openenv_child_output(child):
+    """ Collect the child's stderr in a thread, returning the growing line list.
+
+    Draining matters on its own: stderr is a pipe nobody reads, so a chatty
+    uvicorn would eventually block on a full one.
+    """
+    return _OpenEnvChildOutput(child)
+
+
+class _OpenEnvChildOutput:
+    """ Drain the child's stderr for its whole life, keeping only a bounded tail.
+
+    Draining stops a chatty uvicorn blocking on a full pipe, but the reader
+    outlives launch_openenv, so retaining every line would trade that bounded
+    backpressure for an OOM. The verdict is latched as each line arrives rather
+    than re-scanned, so a flood cannot evict the announcement before it is read.
+    """
+    def __init__(self, child, keep_lines = 50):
+        self.bound = False
+        self.bind_failed = False
+        self.tail = collections.deque(maxlen = keep_lines)
+        thread = threading.Thread(target = self._read, args = (child,), daemon = True)
+        thread.start()
+
+    def _read(self, child):
+        # A child with no stderr pipe is not an error; a raise here would be unhandled.
+        stream = getattr(child, "stderr", None)
+        if stream is None: return
+        try:
+            for line in stream:
+                self.tail.append(line)
+                if not self.bound and any(m in line for m in _UVICORN_BOUND):
+                    self.bound = True
+                if not self.bind_failed:
+                    lowered = line.lower()
+                    if any(m in lowered for m in _UVICORN_BIND_FAILED):
+                        self.bind_failed = True
+        except Exception:
+            pass
+pass
+
+
+def _reap_exited_openenv_children():
+    """ Drop and reap every registered child that has already exited.
+
+    poll() is what reaps, and an entry is otherwise only polled if its own
+    endpoint comes up again, which usually never happens. Holding the Popen also
+    suppresses the interpreter's own reaping, so an unswept registry leaves zombies.
+    """
+    with _OPENENV_CHILDREN_LOCK:
+        for key, (child, owner_pid) in list(_OPENENV_CHILDREN.items()):
+            # Only the spawning process can poll, and so only it can reap.
+            if owner_pid != os.getpid(): continue
+            if child.poll() is not None:
+                _OPENENV_CHILDREN.pop(key, None)
+pass
+
+
+def _openenv_url(client_host, port):
+    """ http://host:port, bracketing an IPv6 literal as RFC 3986 3.2.2 requires
+
+    Unbracketed, `http://::1:9000` reads as host `` with the rest as the port.
+    A colon cannot appear in a DNS name, so it identifies the literal.
+    """
+    if ":" in client_host: client_host = f"[{client_host}]"
+    return f"http://{client_host}:{port}"
+pass
+
+
+def _openenv_child_alive(client_host, port):
+    """ Is the child we spawned on this endpoint still the process holding it?
+
+    A forked worker inherits this registry but is not the parent of anything in
+    it, so poll() there calls waitpid on a process that is not its child, gets
+    ECHILD, and CPython caches returncode 0 -- reporting a live server as dead.
+    The RL notebooks reach this on every move, because execute_with_time_limit
+    falls back to a forked process for a strategy with a bare except in a loop.
+    So off-process the question is put to the OS instead, and nothing is reaped
+    or removed, since neither is this process's to do.
+    """
+    with _OPENENV_CHILDREN_LOCK:
+        entry = _OPENENV_CHILDREN.get((client_host, port), None)
+        if entry is None: return False
+        child, owner_pid = entry
+        if owner_pid != os.getpid():
+            return _openenv_pid_is_alive(child.pid)
+        if child.poll() is not None:
+            _OPENENV_CHILDREN.pop((client_host, port), None)
+            return False
+        return True
+pass
+
+
 def launch_openenv(
     port : int = 8111,
     openenv_process = None,
@@ -1093,14 +1755,27 @@ def launch_openenv(
     server : str = "envs.openspiel_env.server.app:app",
     environment = {},
     openenv_class = None,
+    host : str = "127.0.0.1",
 ):
-    """ Finds a new port or checks if the old open port actually works """
+    """ Finds a new port or checks if the old open port actually works
+
+    `host` is the interface the server binds, defaulting to loopback because the
+    OpenEnv app authenticates nobody, so a wider bind publishes the training run's
+    environment to every network the host is on. Pass it if a remote worker must
+    reach the server.
+
+    `openenv_process` is reused ONLY when this process spawned the child holding
+    `port`. An externally managed server is therefore not adopted even when it is
+    healthy and yours: a second uvicorn is spawned and the passed client dropped.
+    /health cannot distinguish it from a process that took the port.
+    """
     # Check if OpenEnv is working first
     assert type(environment) is dict
     assert type(port) is int and port >= 0 and port <= (65535-1)
     assert type(working_directory) is str
     assert openenv_class is not None
     assert type(server) is str
+    assert type(host) is str and host != ""
 
     # Auto-fix PYTHONPATH for OpenEnv compatibility
     correct_pythonpath = _get_openenv_pythonpath(working_directory)
@@ -1108,10 +1783,21 @@ def launch_openenv(
         environment = dict(environment)  # Don't mutate original
         environment["PYTHONPATH"] = correct_pythonpath
 
-    localhost = f"http://localhost:{port}"
+    # Same family, and never `localhost`: asyncio's create_server sets IPV6_V6ONLY
+    # unconditionally, so a `::` server answers on ::1 and not 127.0.0.1 even on a
+    # dual stack host, and which family `localhost` resolves to is not ours to pick.
+    client_host = {"0.0.0.0" : "127.0.0.1", "::" : "::1"}.get(host, host)
+    localhost = _openenv_url(client_host, port)
+    _reap_exited_openenv_children()
 
     def check_openenv_works(process):
         if process is not None:
+            # Adopting a stranger hands it the training loop's rewards.
+            if not _openenv_child_alive(client_host, port):
+                if hasattr(process, "close"):
+                    try: process.close()
+                    except: pass
+                return None
             try:
                 request = requests.get(f"{localhost}/health", timeout = 0.1).content
                 if b"healthy" not in request and hasattr(process, "close"):
@@ -1131,19 +1817,45 @@ def launch_openenv(
     while openenv_process is None:
         # Port ID must be less than uint16_MAX
         port = random.randint(9000, 65535-1)
-        localhost = f"http://localhost:{port}"
+        localhost = _openenv_url(client_host, port)
+        # Held already: uvicorn could not bind and we would talk to the holder.
+        if is_port_open(client_host, port):
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
+        # A closed port says nothing about another launch of ours heading there.
+        if not _reserve_openenv_endpoint(client_host, port):
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
         print(f"Unsloth: Creating new OpenEnv process at port = {port}", end = "")
-        openenv_process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", server, "--host", "0.0.0.0", "--port", str(port)],
-            env = environment,
-            stdout = subprocess.PIPE,
-            stderr = subprocess.PIPE,
-            text = True,
-            cwd = working_directory,
-        )
-        # Wait until port is open
+        try:
+            openenv_child = subprocess.Popen(
+                [sys.executable, "-m", "uvicorn", server, "--host", host, "--port", str(port)],
+                env = environment,
+                stdout = subprocess.PIPE,
+                stderr = subprocess.PIPE,
+                text = True,
+                cwd = working_directory,
+            )
+        except BaseException:
+            # Else the claim outlives the call and blocks the endpoint forever.
+            _release_openenv_endpoint(client_host, port)
+            raise
+        _register_openenv_child(client_host, port, openenv_child)
+        child_output = _watch_openenv_child_output(openenv_child)
         wait_trials = 0
-        while not is_port_open("localhost", port):
+        while True:
+            if child_output.bound: break
+            # A dead child, or one that reported losing the bind, never will.
+            if child_output.bind_failed or openenv_child.poll() is not None:
+                _release_openenv_endpoint(client_host, port, openenv_child)
+                break
+            if is_port_open(client_host, port) and wait_trials >= _UVICORN_BOUND_GRACE_TRIALS:
+                # Unrecognised startup log: accept the open port as before.
+                break
             time.sleep(0.01)
             if wait_trials % 10 == 0:
                 print(".", end = "")
@@ -1151,6 +1863,14 @@ def launch_openenv(
             if wait_trials == 6000:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 60 seconds, but we still failed :(")
         print()
+        with _OPENENV_CHILDREN_LOCK:
+            entry = _OPENENV_CHILDREN.get((client_host, port), None)
+            ours = entry is not None and entry[0] is openenv_child
+        if not ours:
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
         openenv_process = openenv_class(base_url = localhost)
         openenv_process = check_openenv_works(openenv_process)
         if openenv_process is not None: break

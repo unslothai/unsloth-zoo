@@ -48,10 +48,10 @@ _RUNNER = textwrap.dedent(
     import torch
     from safetensors.torch import save_file, safe_open
 
-    mode, outfile = sys.argv[1], sys.argv[2]
+    mode, outfile, B = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
     torch.manual_seed(0)
-    E, D, G, B = 2, 6, 4, 8            # dequant last dim = G*B*2 = 64
+    E, D, G = 2, 6, 4                  # dequant last dim = G*B*2
     blocks = torch.randint(0, 256, (E, D, G, B), dtype=torch.uint8)
     scales = torch.randint(120, 135, (E, D, G), dtype=torch.uint8)
 
@@ -81,17 +81,19 @@ _RUNNER = textwrap.dedent(
 )
 
 
-def _run(mode, outfile):
+def _run(mode, outfile, B):
     env = dict(os.environ)
     r = subprocess.run(
-        [sys.executable, "-c", _RUNNER, mode, outfile],
+        [sys.executable, "-c", _RUNNER, mode, outfile, str(B)],
         capture_output=True, text=True, env=env,
     )
     assert r.returncode == 0, f"mode={mode} failed:\nstdout={r.stdout}\nstderr={r.stderr}"
     return r.stdout
 
 
-def test_mxfp4_export_layout_matches_with_and_without_cpu_variant():
+# B = 16 is the real MXFP4 block (the GPU fast path); B = 8 takes the generic loop.
+@pytest.mark.parametrize("B", [8, 16])
+def test_mxfp4_export_layout_matches_with_and_without_cpu_variant(B):
     # transformers.integrations.mxfp4 only exists from ~4.55 (GPT-OSS); on the older
     # transformers unsloth_zoo still supports (pin floor 4.51.3) the subprocess converter
     # below cannot run, so skip cleanly rather than error.
@@ -100,13 +102,13 @@ def test_mxfp4_export_layout_matches_with_and_without_cpu_variant():
     with tempfile.TemporaryDirectory() as d:
         stock = os.path.join(d, "stock.pt")
         patched = os.path.join(d, "patched.pt")
-        out_stock = _run("stock", stock)      # _cpu absent -> stock self-transposing base
-        out_patched = _run("patched", patched)  # _cpu present -> Unsloth no-self-transpose base
+        out_stock = _run("stock", stock, B)      # _cpu absent -> stock self-transposing base
+        out_patched = _run("patched", patched, B)  # _cpu present -> Unsloth no-self-transpose base
         Ws = torch.load(stock)
         Wp = torch.load(patched)
-        # The correct GPT-OSS layout is [E, G*B*2, D] == (2, 64, 6).
-        assert tuple(Wp.shape) == (2, 64, 6), (out_patched, Wp.shape)
-        assert tuple(Ws.shape) == (2, 64, 6), (
+        # The correct GPT-OSS layout is [E, G*B*2, D].
+        assert tuple(Wp.shape) == (2, 8 * B, 6), (out_patched, Wp.shape)
+        assert tuple(Ws.shape) == (2, 8 * B, 6), (
             "missing-_cpu export is double-transposed (wrong layout)", out_stock, Ws.shape,
         )
         assert torch.equal(Ws, Wp), "missing-_cpu export does not match the patched export"

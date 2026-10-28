@@ -5,8 +5,8 @@ torch._grouped_mm forward replaces the per-expert loop. It must be:
 
   * ON by default,
   * OFF when UNSLOTH_GPTOSS_GROUPED=0 (explicit opt-out of the grouped path),
-  * OFF when UNSLOTH_COMPILE_DISABLE=1 (the grouped stacks are meant to run under
-    the compiled cache; disabling compilation opts into the plain eager loop).
+  * still ON when UNSLOTH_COMPILE_DISABLE=1 / partial (that switch only skips
+    torch.compile; grouped_qlora_forward is torch.compiler.disable'd anyway).
 
 The probe is self-contained (local imports, reads os.environ directly) so the
 compiler can copy its source into the standalone compiled cache. These are the
@@ -32,6 +32,14 @@ try:
 except Exception as e:  # pragma: no cover - unsloth_zoo import needs an accelerator
     pytest.skip(f"cannot import unsloth_zoo gpt_oss patches: {e}", allow_module_level=True)
 
+from unsloth_zoo.stubs.bitsandbytes_stub import real_bitsandbytes_available
+
+if not real_bitsandbytes_available():
+    pytest.skip("bitsandbytes is the unsloth_zoo stub on this host", allow_module_level=True)
+
+
+_NF4_CODE = torch.linspace(-1, 1, 16)
+
 
 def _fake_expert_linear():
     """A LoRA-free bnb Linear4bit-like expert whose readiness checks all pass.
@@ -44,7 +52,16 @@ def _fake_expert_linear():
         requires_grad=False,
         quant_type="nf4",
     )
-    w.quant_state = SimpleNamespace(blocksize=64, shape=torch.Size([4, 32, 64]))
+    # Every field a real QuantState carries that the readiness format check reads.
+    w.quant_state = SimpleNamespace(
+        blocksize=64,
+        shape=torch.Size([4, 32, 64]),
+        quant_type="nf4",
+        dtype=torch.bfloat16,
+        nested=False,
+        code=_NF4_CODE,
+        absmax=torch.ones(4 * 32, dtype=torch.float32),
+    )
     return SimpleNamespace(weight=w, bias=torch.zeros(4, dtype=torch.bfloat16))
 
 
@@ -76,10 +93,11 @@ def test_grouped_disabled_by_gptoss_grouped_zero(experts, monkeypatch):
     assert _ready(experts) is False
 
 
-def test_grouped_disabled_by_compile_disable(experts, monkeypatch):
+@pytest.mark.parametrize("value", ["1", "partial"])
+def test_compile_disable_keeps_grouped_on(experts, monkeypatch, value):
     monkeypatch.delenv("UNSLOTH_GPTOSS_GROUPED", raising=False)
-    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
-    assert _ready(experts) is False
+    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", value)
+    assert _ready(experts) is True
 
 
 def test_compile_disable_zero_keeps_grouped_on(experts, monkeypatch):

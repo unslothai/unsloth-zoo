@@ -183,8 +183,25 @@ def _publish_boundary_helpers(modeling_module):
 pass
 
 
+def _gemma3_causal_window_mask(q_len, kv_len, sliding_window, device):
+    q_positions = torch.arange(q_len, device=device)[:, None] + (kv_len - q_len)
+    k_positions = torch.arange(kv_len, device=device)[None, :]
+    causal_mask = k_positions <= q_positions
+    if sliding_window is not None:
+        causal_mask &= k_positions > (q_positions - sliding_window)
+    return causal_mask[None, None, :, :]
+
+
 def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states, sliding_window=None):
-    if attention_mask is None or attention_mask.dim() != 2:
+    if attention_mask is None:
+        if sliding_window is None: return None
+        q_len, kv_len = query_states.shape[2], key_states.shape[2]
+        # FA2 leaves the window (and cached-chunk offset) to its kernel; SDPA needs them explicit.
+        # Batch-invariant [1, 1, q, kv]: no larger than transformers' own sdpa sliding mask.
+        if kv_len > sliding_window or (1 < q_len < kv_len):
+            return _gemma3_causal_window_mask(q_len, kv_len, sliding_window, query_states.device)
+        return None
+    if attention_mask.dim() != 2:
         return attention_mask
 
     q_len = query_states.shape[2]
@@ -201,16 +218,9 @@ def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states
         attention_mask = attention_mask[:, -kv_len:]
 
     padding_mask = attention_mask[:, None, None, :].to(query_states.device) != 0
-    if q_len == 1:
+    if q_len == 1 and (sliding_window is None or kv_len <= sliding_window):
         return padding_mask
-
-    q_positions = torch.arange(q_len, device=query_states.device)[:, None]
-    k_positions = torch.arange(kv_len, device=query_states.device)[None, :]
-    cache_offset = kv_len - q_len
-    causal_mask = k_positions <= (q_positions + cache_offset)
-    if sliding_window is not None:
-        causal_mask = causal_mask & (k_positions > (q_positions + cache_offset - sliding_window))
-    return padding_mask & causal_mask[None, None, :, :]
+    return padding_mask & _gemma3_causal_window_mask(q_len, kv_len, sliding_window, query_states.device)
 
 
 def _gemma3_rms_norm(x, weight, eps, out_dtype):
@@ -421,9 +431,12 @@ def patch_Gemma3Processor():
         # ignore the tokenizer's uninitialised model_max_length sentinel (~1e30) for "max_length" padding
         _mml = getattr(self.tokenizer, "model_max_length", None)
         if not (isinstance(_mml, int) and 0 < _mml < int(1e15)): _mml = None
+        # transformers >= 5.15 sets processor.image_token_id to the BOI token; token_type_ids must mark the soft tokens.
+        image_token_id = getattr(self.tokenizer, "image_token_id", None)
+        if image_token_id is None: image_token_id = self.image_token_id
         text_inputs = _fix_double_bos_and_pad(
             text_inputs, self.tokenizer.bos_token_id, self.tokenizer.pad_token_id,
-            self.image_token_id, return_mm_token_type_ids, padding, padding_side, return_tensors,
+            image_token_id, return_mm_token_type_ids, padding, padding_side, return_tensors,
             max_length = max_length,
             pad_to_multiple_of = output_kwargs["text_kwargs"].get("pad_to_multiple_of", None),
             model_max_length = _mml,
@@ -654,6 +667,43 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
+def patch_Gemma3MultiModalProjector():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector
+    except Exception as e:
+        return raise_error("Gemma3MultiModalProjector.forward", e)
+
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
+
+    def forward(self, vision_outputs: torch.Tensor):
+        batch_size, _, hidden_size = vision_outputs.shape
+
+        reshaped_vision_outputs = vision_outputs.transpose(1, 2)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            batch_size, hidden_size, self.patches_per_image, self.patches_per_image
+        )
+        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
+
+        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
+        pooled_vision_outputs = pooled_vision_outputs.flatten(2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
+
+        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+        # mm_soft_emb_norm emits fp16; full finetuning has an fp32 weight and no autocast,
+        # so torch.matmul would see Half against float.
+        normed_vision_outputs = _to_boundary_dtype(
+            normed_vision_outputs, _linear_boundary_dtype(self, "mm_input_projection_weight")
+        )
+        projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
+        return projected_vision_outputs.type_as(vision_outputs)
+    pass
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector, "forward", forward)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3MultiModalProjector)
+
+
 def patch_Gemma3Attention():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
@@ -667,6 +717,8 @@ def patch_Gemma3Attention():
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
+    from .sdpa_gqa import make_gqa_sdpa
+    gqa_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
 
     def prepare(
         hidden_states,
@@ -838,15 +890,15 @@ def patch_Gemma3Attention():
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # During jit tracing shapes are tensors, so is_causal may be a tensor; SDPA needs a bool.
             if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-            attn_output_fp32 = scaled_dot_product_attention(
+            attn_output_fp32 = gqa_sdpa(
                 query_states_fp32.contiguous(),
                 key_states_fp32.contiguous(),
                 value_states_fp32.contiguous(),
-                attn_mask = attn_mask_for_sdpa,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = is_causal,
-                scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                attn_mask_for_sdpa,
+                self.attention_dropout if self.training else 0.0,
+                is_causal,
+                getattr(self, "scaling", None),
+                getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_weights = None # Defaulting to None
 
@@ -918,6 +970,8 @@ def patch_Gemma3Attention_generic():
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
+    from .sdpa_gqa import make_gqa_sdpa
+    gqa_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
 
     def prepare(
         hidden_states,
@@ -1088,15 +1142,15 @@ def patch_Gemma3Attention_generic():
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # During jit tracing shapes are tensors, so is_causal may be a tensor; SDPA needs a bool.
             if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-            attn_output_fp32 = scaled_dot_product_attention(
+            attn_output_fp32 = gqa_sdpa(
                 query_states_fp32.contiguous(),
                 key_states_fp32.contiguous(),
                 value_states_fp32.contiguous(),
-                attn_mask = attn_mask_for_sdpa,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = is_causal,
-                scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                attn_mask_for_sdpa,
+                self.attention_dropout if self.training else 0.0,
+                is_causal,
+                getattr(self, "scaling", None),
+                getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_weights = None # Defaulting to None
 

@@ -298,3 +298,37 @@ def test_forward_native_moe_loop_gpt_oss_matches_naive():
             ref[t] += top_k_weights[t, k] * (
                 inter @ experts.down_proj[e] + experts.down_proj_bias[e])
     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
+
+
+class _InterleavedExperts(nn.Module):
+
+    is_concatenated = False
+
+    def __init__(self, num_experts, hidden, intermediate):
+        super().__init__()
+        self.num_experts = num_experts
+        self.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * intermediate, hidden))
+        self.gate_up_proj_bias = nn.Parameter(torch.randn(num_experts, 2 * intermediate))
+        self.down_proj = nn.Parameter(torch.randn(num_experts, hidden, intermediate))
+        self.down_proj_bias = nn.Parameter(torch.randn(num_experts, hidden))
+        self.act_fn = F.silu
+
+
+def test_interleaved_non_gpt_oss_keeps_its_own_activation():
+    torch.manual_seed(0)
+    E, H, I, T, K = 4, 16, 8, 6, 2
+    experts = _InterleavedExperts(E, H, I)
+    x = torch.randn(T, H) * 4
+    top_k_index = torch.stack([torch.randperm(E)[:K] for _ in range(T)])
+    top_k_weights = torch.rand(T, K)
+    with torch.no_grad():
+        out = forward_native_moe_loop(experts, x, top_k_index, top_k_weights)
+        ref = torch.zeros_like(x)
+        for t in range(T):
+            for k in range(K):
+                e = int(top_k_index[t, k])
+                gate_up = F.linear(x[t], experts.gate_up_proj[e], experts.gate_up_proj_bias[e])
+                gate, up = gate_up[::2], gate_up[1::2]
+                y = F.linear(F.silu(gate) * up, experts.down_proj[e], experts.down_proj_bias[e])
+                ref[t] += y * top_k_weights[t, k]
+    assert torch.allclose(out, ref, atol = 1e-4, rtol = 1e-4), (out - ref).abs().max()

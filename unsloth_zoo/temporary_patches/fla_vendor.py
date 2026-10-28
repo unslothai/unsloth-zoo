@@ -14,32 +14,15 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Make the bundled ``flash-linear-attention`` (fla) kernels importable as
-top-level ``fla`` so users do not need ``pip install flash-linear-attention``.
+"""Register the bundled fla (flash-linear-attention) snapshot as top-level ``fla``.
 
-Qwen3.5 / Qwen3.6 / Qwen3-Next gated-deltanet models use fla's Triton kernels
-when ``is_flash_linear_attention_available()`` is true, else a several-times
-slower pure-PyTorch path. This registers the pruned ``unsloth_zoo/_vendored/fla``
-snapshot into ``sys.modules`` as a real, walkable ``fla`` and reports availability.
-
-Precedence / escape hatches:
-  * ``UNSLOTH_DISABLE_VENDORED_FLA=1`` -> never inject the vendored copy. With no
-    other fla present this keeps the pure-torch path; a separately installed fla is
-    left untouched and still used (the flag scopes to the vendored injection only).
-  * Version-aware auto-detection: a user-installed ``fla`` that is strictly newer
-    than the vendored snapshot is used instead (a newer upstream supersedes ours);
-    an equal or older install is shadowed by the vendored kernels, which carry
-    post-0.5.1 backports. ``UNSLOTH_FORCE_VENDORED_FLA=1`` forces the vendored copy
-    even over a newer install (rarely needed now that selection is automatic).
-  * Only injects when torch >= 2.7, triton >= 3.3 and CUDA are available (the
-    requirements of the vendored fla-core 0.5.1 kernels); otherwise the
-    pure-torch fallback is left untouched.
-  * ``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` -> on Hopper with Triton in
-    [3.4.0, 3.7.1), disable fla entirely (vendored *and* installed) and force the
-    pure-torch gated-delta path. This is a correctness switch, not a source
-    preference, so it is checked before the two flags above. The vendored
-    chunk_bwd_dqkwg already steps around the miscompiled BK=64 tile (fla #640), so
-    this is only for users who want the belt-and-braces fallback.
+Env: ``UNSLOTH_DISABLE_VENDORED_FLA=1`` never injects (an installed fla is untouched);
+an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VENDORED_FLA=1``;
+``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640);
+``UNSLOTH_GDN_BACKEND=flashqla`` sends supported chunk_gated_delta_rule calls to FlashQLA (``pip install flash-qla``);
+on SM120 only with ``UNSLOTH_FLASHQLA_ALLOW_SM120=1`` (QwenLM/FlashQLA#35);
+``UNSLOTH_KDA_SAFE_GATE=0`` keeps GLM-5.3-Flash's bounded KDA gates off fla's safe_gate path.
+Injects only with torch >= 2.7, triton >= 3.3 and CUDA.
 """
 
 __all__ = [
@@ -61,42 +44,26 @@ from .common import (
     logger,
 )
 
-# Marker set on the vendored top-level module so we can tell our own injection
-# apart from a user-installed fla.
 _VENDORED_MARK = "_UNSLOTH_VENDORED_FLA"
 
-# Eagerly registered so compile_fla_no_autotune's walk_packages and transformers'
-# `from fla... import ...` resolve to the vendored tree. Importing gated_delta_rule
-# transitively pulls fla.ops.common/cp/utils and fla.utils.
 _EXPORT_SUBMODULES = ("fla.modules", "fla.ops", "fla.ops.gated_delta_rule")
 
-# Gated-deltanet modeling modules that bind the fla symbols as module globals at
-# import time (and set them to None when fla was unavailable).
-_REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
+# Modeling modules binding fla symbols as globals at import (None when unavailable).
+_REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next", "qwen4_exp")
 
-# Models whose fla imports are fully covered by the vendored exports. olmo_hybrid
-# also imports ShortConvolution, which is not vendored, so its probe must answer
-# False (keep the pure-torch path) or its modeling module crashes on import.
-_VENDOR_COVERED_MODELS = frozenset(_REPAIR_MODELING)
+# Kimi delta attention consumers; they reach fla only through kernel-hub wrappers.
+_KDA_MODELING = ("glm5_next", "kimi_linear")
 
-# Every gated-deltanet consumer, not just the vendor-covered ones. Used by the
-# UNSLOTH_DISABLE_HOPPER_FLA_BWD path and the purge path below: the extra models
-# never bind the *vendored* kernels, but they do bind a user-installed fla's, which
-# carries the same #640 miscompile, so they must be unbound too.
-#
-# olmo_hybrid (transformers >= 5.3) is the only one: it imports
-# chunk_gated_delta_rule alongside ShortConvolution. Kimi Linear deliberately is
-# NOT here -- transformers ships no `kimi_linear` model (only `kimi_k25`), the
-# weights run through trust_remote_code as `transformers_modules...modeling_kimi`,
-# and that code calls fla's KDA ops (chunk_kda / fused_recurrent_kda), which have
-# their own kernels and never reach chunk_bwd_dqkwg. Listing it would be a name
-# that can never resolve.
+# Modules whose kernel-hub wrappers are re-resolved against the live fla.
+_HUB_REPAIR_MODELING = _REPAIR_MODELING + _KDA_MODELING
+
+# olmo_hybrid is not covered: it has not been validated on the vendored tree.
+_VENDOR_COVERED_MODELS = frozenset(_HUB_REPAIR_MODELING)
+
+# All gated-delta consumers; olmo_hybrid can bind an installed fla's #640 kernel.
+# Kimi Linear absent: remote code on KDA ops, never reaches chunk_bwd_dqkwg.
 _GATED_DELTA_MODELING = _REPAIR_MODELING + ("olmo_hybrid",)
 
-# The gated-deltanet consumers the vendored snapshot cannot serve, so
-# _repair_already_imported_modeling can never rebind them onto the fixed kernels.
-# If one of them was imported while a user-installed fla was live and we then purge
-# that install, its module global still points at the unpatched kernel.
 _UNCOVERED_GATED_DELTA = tuple(
     pkg for pkg in _GATED_DELTA_MODELING if pkg not in _VENDOR_COVERED_MODELS
 )
@@ -104,11 +71,7 @@ _UNCOVERED_GATED_DELTA = tuple(
 # Minimum versions declared by fla-core 0.5.1.
 _MIN_TORCH = "2.7"
 _MIN_TRITON = "3.3"
-# The version of the bundled fla-core snapshot. A user-installed fla is used
-# instead of the vendored one only when it is strictly newer than this; an equal
-# or older install is shadowed by the vendored kernels, which carry post-0.5.1
-# correctness backports (Blackwell / Hopper). Kept in sync with
-# unsloth_zoo/_vendored/fla/__init__.py (guarded by test_vendored_tree_layout).
+# Kept in sync with _vendored/fla/__init__.py (test_vendored_tree_layout).
 _VENDORED_FLA_VERSION = "0.5.1"
 
 
@@ -117,7 +80,6 @@ def _flag(name):
 
 
 def _restore_env(name, previous):
-    """Restore an env var to a snapshotted value (``None`` means it was unset)."""
     if previous is None:
         os.environ.pop(name, None)
     else:
@@ -125,7 +87,6 @@ def _restore_env(name, previous):
 
 
 def _vendored_fla_dir():
-    # This file lives at unsloth_zoo/temporary_patches/fla_vendor.py
     here = os.path.dirname(os.path.abspath(__file__))
     pkg_root = os.path.dirname(here)
     return os.path.join(pkg_root, "_vendored", "fla")
@@ -134,9 +95,7 @@ def _vendored_fla_dir():
 def _version_at_least(value, minimum):
     try:
         from packaging import version
-        # Compare base versions so dev/nightly/pre-release builds still satisfy
-        # the minimum: version.parse orders 2.7.0.dev... / 3.3.0a0 *below* the
-        # release, which would wrongly reject a valid 2.7 nightly.
+        # base_version: 2.7 nightlies / pre-releases must satisfy the minimum.
         parsed = version.parse(str(value).split("+")[0])
         return version.parse(parsed.base_version) >= version.parse(minimum)
     except Exception:
@@ -144,9 +103,7 @@ def _version_at_least(value, minimum):
 
 
 def _version_strictly_after(value, threshold):
-    """True if ``value`` parses to a release strictly greater than ``threshold``.
-    Base-version comparison, so a dev/nightly of the same release (e.g. 0.5.1.devN)
-    is not counted as newer than 0.5.1."""
+    """``value`` > ``threshold`` by base version (0.5.1.devN is not newer)."""
     try:
         from packaging import version
         parsed = version.parse(str(value).split("+")[0])
@@ -156,31 +113,14 @@ def _version_strictly_after(value, threshold):
 
 
 def _hopper_dqkwg_suspect(torch_mod, triton_mod):
-    """True on Hopper with triton in [3.4.0, 3.7.1), the range in which fla's gated
-    ``chunk_bwd_dqkwg`` is miscompiled (fla #640).
-
-    This no longer gates injection. The vendored kernel steps the block width away
-    from the miscompiled BK=64 tile (see ops/common/chunk_o.py), so the vendored
-    tree is safe to use on these hosts and does so by default. The predicate now
-    answers two narrower questions: whether to prefer the vendored copy over a
-    user-installed fla (only ours carries the tile fix), and whether
-    ``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` should force the pure-torch path.
-    Mirrors upstream's exact constants (full version parse, not base_version).
-
-    Every visible CUDA device is probed, not just device 0: on a mixed host a
-    model can be placed on a nonzero Hopper card (e.g. cuda:0 Ada, cuda:1 H100),
-    and a device-0-only check would report that setup as safe. If any visible GPU
-    would hit the bug we answer True for the whole process.
-    """
+    """Any visible GPU is Hopper with triton in [3.4.0, 3.7.1) (fla #640 miscompile).
+    Probes every device: a mixed host may run the model on a nonzero Hopper card."""
     try:
         from packaging import version
         v = version.parse(str(triton_mod.__version__).split("+")[0])
         if not (version.parse("3.4.0") <= v < version.parse("3.7.1")):
             return False
-        # The Hopper miscompile is NVIDIA-specific. On a ROCm build a card can
-        # report capability major 9 (e.g. AMD Instinct) without being Hopper, so
-        # only the bare major==9 signal is gated on a CUDA (non-HIP) build; a name
-        # that literally says "NVIDIA H" is unambiguous either way.
+        # ROCm Instinct also reports major 9: trust bare major==9 only on CUDA.
         is_nvidia = getattr(getattr(torch_mod, "version", None), "hip", None) is None
         try:
             count = int(torch_mod.cuda.device_count())
@@ -204,9 +144,7 @@ def _hopper_dqkwg_suspect(torch_mod, triton_mod):
 
 def _torch_triton_cuda_supported():
     """The vendored fla-core 0.5.1 kernels need torch >= 2.7, triton >= 3.3, CUDA."""
-    # The snapshot uses runtime-evaluated PEP 604 annotations (e.g. `int | None`
-    # in fla/utils/_device.py), which raise at import on Python 3.9; skip the
-    # injection outright instead of importing, failing and rolling back.
+    # The snapshot uses runtime PEP 604 annotations, which fail on Python 3.9.
     if sys.version_info < (3, 10):
         return False
     try:
@@ -223,19 +161,105 @@ def _torch_triton_cuda_supported():
             return False
     except Exception:
         return False
-    # Hopper with triton in [3.4.0, 3.7.1) used to be excluded here, because fla's
-    # gated chunk_bwd_dqkwg raised outright on that combination (fla #640) and the
-    # whole model had to fall back to transformers' pure-torch gated-delta path.
-    # The vendored kernel now avoids the miscompiled BK=64 tile instead of refusing
-    # to run, so those hosts keep the Triton fast path. Users who want the old
-    # conservative behaviour set UNSLOTH_DISABLE_HOPPER_FLA_BWD=1, which is handled
-    # in patch_vendor_fla (it must also disable a user-installed fla, which this
-    # boolean cannot express).
+    # Hopper + #640 Triton is not excluded: the vendored kernel avoids the BK=64 tile.
     return True
 
 
+# RDNA1 without dot instructions: Triton still emits v_dot2, LLVM aborts (FDOT2).
+_NO_DOT_INSTRUCTION_GFX = ("gfx1010", "gfx1013")
+
+
+def _gpu_lacks_dot_instructions(torch_mod=None):
+    """ROCm and any visible GPU is RDNA1 without dot instructions; unreadable -> False."""
+    try:
+        if torch_mod is None:
+            import torch as torch_mod
+        if getattr(getattr(torch_mod, "version", None), "hip", None) is None:
+            return False
+        if not torch_mod.cuda.is_available():
+            return False
+        for i in range(int(torch_mod.cuda.device_count())):
+            props = torch_mod.cuda.get_device_properties(i)
+            arch = str(getattr(props, "gcnArchName", "") or "").split(":", 1)[0].strip().lower()
+            if arch in _NO_DOT_INSTRUCTION_GFX:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _mark_fla_disabled_no_dot_instructions():
+    global _FLA_DISABLED_REASON
+    if _FLA_DISABLED_REASON is not None:
+        return
+    _FLA_DISABLED_REASON = (
+        "Unsloth: gated-deltanet (linear attention) fast kernels are DISABLED on this GPU.\n"
+        "RDNA1 (gfx1010 / gfx1013, e.g. RX 5700 XT) has no dot instructions, and Triton\n"
+        "compiles flash-linear-attention's kernels to them anyway, so the process would\n"
+        "abort inside LLVM (\"Cannot select: AMDGPUISD::FDOT2\"). Training uses the slower\n"
+        "pure-PyTorch gated-delta path instead."
+    )
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.warning(_FLA_DISABLED_REASON)
+
+
+# transformers' pure-torch l2norm reduces in the input dtype; in fp16 it overflows to
+# inf and gives NaN grads in eager mode (RX 5700 XT). fla reduces in float32. Up to at least
+# transformers 5.5 torch_chunk_gated_delta_rule calls it before casting to float32, so any host
+# that takes the pure-torch path in float16 (no Triton/CUDA, the Hopper opt-out, RDNA1) needs it;
+# later releases cast first, where this is a no-op in effect.
+_L2NORM_FP32_MARK = "_unsloth_fp32_l2norm"
+
+
+def _fp32_l2norm(x, dim = -1, eps = 1e-6):
+    """``l2norm`` with the reduction in at least float32, result in the input dtype: what fla's kernel does."""
+    import torch
+
+    xf = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+    inv_norm = torch.rsqrt((xf * xf).sum(dim = dim, keepdim = True) + eps)
+    return (xf * inv_norm).to(x.dtype)
+
+
+setattr(_fp32_l2norm, _L2NORM_FP32_MARK, True)
+
+
+# unsloth's compiler copies l2norm into unsloth_compiled_module_*, which is what runs.
+_UNSLOTH_COMPILED_MODULE_PREFIX = "unsloth_compiled_module"
+
+
+def _l2norm_modules(packages = None):
+    """transformers' gated-delta modeling modules plus unsloth's compiled copies."""
+    if packages is None:
+        packages = _GATED_DELTA_MODELING
+    names = [f"transformers.models.{pkg}.modeling_{pkg}" for pkg in packages]
+    names += sorted(
+        name for name in list(sys.modules)
+        if name.startswith(_UNSLOTH_COMPILED_MODULE_PREFIX) and name not in names
+    )
+    return names
+
+
+def _patch_l2norm_fp32_on_torch_path(packages = None):
+    """Rebind ``l2norm`` to the float32 version on imported gated-delta modules. Idempotent."""
+    patched = []
+    for modname in _l2norm_modules(packages):
+        mod = sys.modules.get(modname)
+        if mod is None:
+            continue
+        current = getattr(mod, "l2norm", None)
+        if current is None or getattr(current, _L2NORM_FP32_MARK, False):
+            continue
+        try:
+            setattr(mod, "l2norm", _fp32_l2norm)
+        except Exception:
+            continue
+        patched.append(modname)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: {modname}.l2norm now reduces in float32 (pure-torch gated delta, float16 safe).")
+    return patched
+
+
 def _hopper_dqkwg_suspect_here():
-    """``_hopper_dqkwg_suspect`` for the live interpreter, or False if unknowable."""
     try:
         import torch
         import triton
@@ -246,18 +270,7 @@ def _hopper_dqkwg_suspect_here():
 
 @functools.lru_cache(maxsize=None)
 def _device_index_is_hopper(index):
-    """Whether one CUDA device index is an NVIDIA Hopper (SM90).
-
-    ``_hopper_dqkwg_suspect_here`` deliberately answers for the whole process (any
-    visible Hopper counts), which is right for deciding *whether to install* the
-    workaround. Deciding whether a given call needs it is a per-tensor question:
-    fla #640 is Hopper-only, so narrowing the tile for a tensor on an Ada or
-    Blackwell card in the same box would cost speed for nothing. HIP excluded, as
-    an AMD Instinct reports capability major 9 without being Hopper.
-
-    Returns None when the device cannot be inspected, so callers can fall back to
-    the process-wide answer rather than fail open into the miscompile.
-    """
+    """Whether a CUDA device is NVIDIA Hopper; None if unknown. HIP -> False."""
     try:
         import torch
         if getattr(getattr(torch, "version", None), "hip", None) is not None:
@@ -272,13 +285,7 @@ def _device_index_is_hopper(index):
 
 
 def _tensor_on_hopper(x):
-    """Whether a call on this tensor needs the #640 workaround.
-
-    Unknown devices fall back to True: the wrapper is only installed at all when
-    ``_hopper_dqkwg_suspect_here()`` already said some visible GPU is Hopper, so on
-    a host we cannot inspect the safe answer is to keep the narrower tile. Being
-    wrong that way costs speed; being wrong the other way corrupts gradients.
-    """
+    """Whether a call on ``x`` needs the #640 tile; unknown -> True (slower, never corrupt)."""
     try:
         if x is None or not x.is_cuda:
             return True
@@ -288,9 +295,7 @@ def _tensor_on_hopper(x):
         return True
 
 
-# Set once when UNSLOTH_DISABLE_HOPPER_FLA_BWD turns the fast kernels off, so
-# unsloth's loader can explain *why* the slow path was chosen instead of blaming
-# "no CUDA / torch < 2.7 / triton < 3.3", none of which is true on an H100.
+# Why fla was disabled, for unsloth's loader message.
 _FLA_DISABLED_REASON = None
 
 
@@ -301,14 +306,7 @@ def fla_unavailable_reason():
 
 
 def _vendored_injection_supported():
-    """Whether ``patch_vendor_fla`` would actually inject the vendored kernels.
-
-    Exposed so tests can gate their subprocess assertions on the exact same
-    production support check (Python >= 3.10, torch/triton minimums, CUDA)
-    instead of a looser mirror that would fail rather than skip on unsupported
-    hosts. Hopper in the fla #640 Triton range is no longer excluded: the vendored
-    chunk_bwd_dqkwg steps around the miscompiled tile, so it injects there too.
-    """
+    """The exact production support gate, so tests skip on unsupported hosts."""
     return _torch_triton_cuda_supported()
 
 
@@ -318,19 +316,11 @@ def _vendored_already_injected():
 
 
 def _should_defer_to_installed_fla():
-    """True if a user-installed (non-vendored) fla should be used instead of the
-    vendored snapshot.
-
-    We defer only when the installed fla is *strictly newer* than the vendored
-    version: a newer upstream supersedes our copy, while an equal or older install
-    is shadowed by the vendored kernels (which carry post-0.5.1 backports). A
-    deliberate install whose version cannot be read is respected rather than
-    shadowed. ``UNSLOTH_FORCE_VENDORED_FLA`` overrides this to force the vendored
-    copy even over a newer install."""
+    """Use an installed fla only if strictly newer than the vendored one, or unversioned."""
     mod = sys.modules.get("fla")
     if mod is not None:
         if getattr(mod, _VENDORED_MARK, False) is True:
-            return False  # our own vendored copy, not a user install
+            return False
         ver = getattr(mod, "__version__", None)
     else:
         try:
@@ -351,28 +341,13 @@ def _should_defer_to_installed_fla():
         except Exception:
             ver = None
     if ver is None:
-        # Importable but version unknown: respect the user's deliberate install
-        # rather than shadowing something we cannot assess.
         return True
     return _version_strictly_after(ver, _VENDORED_FLA_VERSION)
 
 
 def _neutralize_tilelang_backend_probe():
-    """Permanently make the pruned TileLang backend unavailable without importing
-    the external ``tilelang``.
-
-    The vendored ``TileLangBackend`` overrides ``is_available()`` to ``import
-    tilelang`` (catching only ``ImportError``), and both backend registration
-    (``can_use``) and the dispatch loop evaluate ``is_available()`` *before* the
-    ``FLA_TILELANG=0`` ``is_enabled()`` gate. A broken/ABI-incompatible installed
-    tilelang that raises a non-``ImportError`` on import would therefore abort the
-    injection (during registration) and every later gated-delta dispatch. The
-    pruned snapshot dropped the tilelang kernels, so the backend can never serve a
-    call anyway; override the probe to a plain ``False``.
-
-    Must be called while ``import tilelang`` is shadowed (see ``_inject_vendored_fla``)
-    so importing the backend module here cannot raise. Best effort.
-    """
+    """Force the pruned TileLang backend unavailable; a broken tilelang can raise a
+    non-ImportError in its probe. Call while ``tilelang`` is shadowed."""
     try:
         from fla.ops.common.backends.tilelang import TileLangBackend
         TileLangBackend.is_available = classmethod(lambda cls: False)
@@ -387,16 +362,7 @@ def _neutralize_tilelang_backend_probe():
 
 
 def _neutralize_intracard_backend_probe():
-    """Permanently make the pruned IntraCard CP backend unavailable.
-
-    The vendored snapshot drops ``fla.ops.common.intracard_cp``, but
-    ``IntraCardCPBackend.is_available()`` still returns ``True`` unconditionally.
-    Dispatch checks ``is_available() and is_enabled()`` per call, so a user who
-    flips ``FLA_INTRACARD_CP=1`` after import would route varlen inference into
-    ``chunk_gated_delta_rule_fwd_h`` and hit ``ModuleNotFoundError`` on the pruned
-    module. Forcing the env flag off is not enough (it is user-flippable), so
-    override the probe to ``False`` like the TileLang backend. Best effort.
-    """
+    """Force the pruned IntraCard CP backend unavailable (FLA_INTRACARD_CP is user-flippable)."""
     try:
         from fla.ops.common.backends.intracard import IntraCardCPBackend
         IntraCardCPBackend.is_available = classmethod(lambda cls: False)
@@ -409,24 +375,28 @@ def _neutralize_intracard_backend_probe():
             logger.info(f"Unsloth: could not neutralize vendored intracard backend: {e}")
 
 
-def _blackwell_import_device(torch_mod):
-    """A Blackwell CUDA device index to make current during the vendored import,
-    or ``None`` when no switch is needed.
+def _withhold_kda_on_rocm():
+    """ROCm: Triton's AMD pipeline pass fails compiling the KDA kernels (gfx1151, triton 3.6), so
+    fla.ops.kda stays unimportable and the kernel-hub wrappers keep the torch fallback."""
+    try:
+        import torch
+        if getattr(torch.version, "hip", None) is None:
+            return False
+    except Exception:
+        return False
+    sys.modules["fla.ops.kda"] = None
+    return True
 
-    The vendored ``fla.utils`` freezes ``IS_NVIDIA_BLACKWELL`` (and the Blackwell
-    autotune configs / tl.dot workaround derived from it) at import time from the
-    *current* device's capability. On a mixed host (e.g. cuda:0 Ada, cuda:1 B200)
-    importing while cuda:0 is current wrongly disables the Blackwell-pinned configs
-    for kernels that later launch on the B200, reintroducing the corruption the
-    backports guard against. If any visible device is Blackwell (capability major
-    10/12) but the current one is not, point the import at the Blackwell device.
-    """
+
+def _blackwell_import_device(torch_mod):
+    """Blackwell device to make current during import, else None: fla.utils freezes
+    IS_NVIDIA_BLACKWELL from the current device at import."""
     try:
         if not torch_mod.cuda.is_available():
             return None
         current = torch_mod.cuda.current_device()
         if torch_mod.cuda.get_device_capability(current)[0] in (10, 12):
-            return None  # already Blackwell-current
+            return None
         for index in range(torch_mod.cuda.device_count()):
             if torch_mod.cuda.get_device_capability(index)[0] in (10, 12):
                 return index
@@ -436,20 +406,8 @@ def _blackwell_import_device(torch_mod):
 
 
 def _inject_vendored_fla():
-    """Register the vendored fla tree into sys.modules under the name ``fla``.
-
-    Bootstraps ``fla`` as a real package whose ``__path__`` points at the
-    vendored directory, then eagerly imports the exported subpackages so the
-    whole tree (fla.ops.gated_delta_rule, fla.ops.common(.*), fla.ops.cp(.*),
-    fla.ops.utils, fla.modules, fla.utils) is registered. Python's normal
-    FileFinder resolves every submodule and the internal ``from fla...`` absolute
-    imports against this ``__path__``.
-
-    Returns ``(injected, replaced_real)``. ``replaced_real`` is True when a real
-    (non-vendored) fla was purged to make room for the vendored tree (only under
-    ``UNSLOTH_FORCE_VENDORED_FLA``); callers use it to rebind already-imported
-    modeling modules whose kernel globals still point at the old install.
-    """
+    """Register the vendored tree as ``fla``. Returns ``(injected, replaced_real)``;
+    ``replaced_real`` means a real fla was purged."""
     vendored_dir = _vendored_fla_dir()
     init_path = os.path.join(vendored_dir, "__init__.py")
     if not os.path.isfile(init_path):
@@ -457,22 +415,12 @@ def _inject_vendored_fla():
             logger.warning(f"Unsloth: vendored fla missing at {init_path}; keeping pure-torch path.")
         return False, False
 
-    # The pruned snapshot drops the TileLang kernels (backends/tilelang/chunk_bwd
-    # and parallel_attn_*) and the IntraCard CP impl (ops/common/intracard_cp), so
-    # force their backend flags off. Otherwise the 'common' dispatch would route a
-    # gated chunk_bwd_dqkwg to TileLang (on by default whenever an external
-    # tilelang is installed) and hit ModuleNotFoundError. Set only for our injected
-    # tree; a deferred-to real fla install never reaches here. Snapshot the prior
-    # values so a failed injection does not leave a user's real fla with these
-    # backends disabled for the rest of the process (restored in the rollback).
+    # Pruned snapshot lacks TileLang / IntraCard CP; disable them (restored on rollback).
     prev_tilelang = os.environ.get("FLA_TILELANG")
     prev_intracard = os.environ.get("FLA_INTRACARD_CP")
     os.environ["FLA_TILELANG"] = "0"
     os.environ["FLA_INTRACARD_CP"] = "0"
 
-    # Snapshot then purge any pre-existing fla* modules (e.g. a real install we
-    # are shadowing under UNSLOTH_FORCE_VENDORED_FLA) so imports resolve to the
-    # vendored tree rather than stale cached modules.
     saved = {
         k: sys.modules[k]
         for k in list(sys.modules)
@@ -491,21 +439,11 @@ def _inject_vendored_fla():
     setattr(fla_mod, _VENDORED_MARK, True)
     sys.modules["fla"] = fla_mod
 
-    # Importing fla.ops.gated_delta_rule transitively registers the common
-    # backends, whose TileLangBackend.is_available() does `import tilelang`
-    # (catching only ImportError) and is probed before the FLA_TILELANG=0 gate. A
-    # broken/incompatible installed tilelang that raises a non-ImportError would
-    # abort this injection during registration (and every later dispatch). Shadow
-    # the external tilelang with None (a clean ImportError) across the import so
-    # registration cannot raise, permanently neutralize the probe, then restore
-    # tilelang so a real, working install stays importable for any non-fla use.
+    # Shadow tilelang during import so a broken install cannot abort registration.
     _tl_sentinel = object()
     _tl_prev = sys.modules.get("tilelang", _tl_sentinel)
     _tl_shadow = _tl_prev is _tl_sentinel or _tl_prev is None
 
-    # Make a Blackwell device current for the import so fla.utils freezes
-    # IS_NVIDIA_BLACKWELL (and its pinned autotune configs) correctly on a mixed
-    # host where cuda:0 is not the Blackwell card the model runs on.
     _bw_dev = _bw_prev = None
     try:
         import torch as _torch_bw
@@ -524,6 +462,7 @@ def _inject_vendored_fla():
                 importlib.import_module(sub)
             _neutralize_tilelang_backend_probe()
             _neutralize_intracard_backend_probe()
+            _withhold_kda_on_rocm()
         finally:
             if _bw_prev is not None:
                 try:
@@ -536,9 +475,6 @@ def _inject_vendored_fla():
                 else:
                     sys.modules["tilelang"] = _tl_prev
     except Exception as e:
-        # Roll back a partial injection and restore whatever we purged, including
-        # the backend env flags so a shadowed real fla is left exactly as we
-        # found it.
         for k in list(sys.modules):
             if k == "fla" or k.startswith("fla."):
                 sys.modules.pop(k, None)
@@ -552,13 +488,7 @@ def _inject_vendored_fla():
 
 
 def _vendored_availability_probe():
-    """Availability answer while the vendored (pruned) fla is the active one.
-
-    Modeling modules call this once at import time and then ``from fla import``
-    the kernels, so answer True only for callers the pruned exports fully cover;
-    an uncovered model (olmo_hybrid needs ShortConvolution) keeps its pure-torch
-    fallback instead of crashing on the import. Non-modeling callers get True.
-    """
+    """True only for callers the vendored tree covers (olmo_hybrid is not validated on it)."""
     try:
         caller = sys._getframe(1).f_globals.get("__name__", "")
     except Exception:
@@ -570,25 +500,12 @@ def _vendored_availability_probe():
 
 
 def _unavailable_probe():
-    """Availability answer when fla must not be used on this host at all.
-
-    Unlike ``_vendored_availability_probe`` this is deliberately not caller-aware:
-    the #640 miscompile hits every gated-deltanet model, so every caller has to see
-    False and take its pure-torch fallback.
-    """
+    """Not caller-aware: every gated-delta model must take the fallback."""
     return False
 
 
 def _patch_is_available(probe=None):
-    """Replace transformers' cached availability probe.
-
-    The probe is @lru_cache and keys on dist metadata that a vendored package
-    lacks, so we clear the cache and replace the callable outright. Modeling
-    modules bind the name lazily (after this runs), so replacement is enough.
-
-    ``probe`` defaults to the vendored answer; the Hopper opt-out passes
-    ``_unavailable_probe`` to force the pure-torch path instead.
-    """
+    """Replace transformers' lru_cached fla probe (the vendored copy lacks dist metadata)."""
     if probe is None:
         probe = _vendored_availability_probe
     try:
@@ -601,19 +518,14 @@ def _patch_is_available(probe=None):
     except Exception:
         pass
     iu.is_flash_linear_attention_available = probe
-    # Re-exporting namespaces (e.g. ``transformers.utils`` on versions that alias
-    # it, or any transformers.* module that did ``from ...import_utils import
-    # is_flash_linear_attention_available`` before this ran) still hold the
-    # original cached callable, so public callers there would keep seeing False.
-    # Rebind every transformers.* namespace that points at that exact object.
+    # Rebind re-exports still holding the original cached probe.
     if original is not None:
         for name, mod in list(sys.modules.items()):
             if mod is None or name == "transformers.utils.import_utils":
                 continue
             if not (name == "transformers" or name.startswith("transformers.")):
                 continue
-            # Read via __dict__, not getattr: getattr fires transformers' lazy
-            # __getattr__, which imports optional deps like torchvision and crashes.
+            # __dict__, not getattr: lazy __getattr__ imports optional deps and crashes.
             mod_dict = getattr(mod, "__dict__", None)
             if not isinstance(mod_dict, dict):
                 continue
@@ -627,16 +539,7 @@ def _patch_is_available(probe=None):
 
 def _repair_already_imported_modeling(force_rebind=False):
     """Rebind fla globals on modeling modules imported before injection.
-
-    If a gated-deltanet modeling module was imported while fla was unavailable it
-    holds ``chunk_gated_delta_rule = fused_recurrent_gated_delta_rule =
-    FusedRMSNormGated = None``. Rebind those to the vendored kernels.
-
-    When ``force_rebind`` is set (``UNSLOTH_FORCE_VENDORED_FLA`` just replaced a
-    real fla install), those globals are non-``None`` but still point at the old
-    user kernels, so the None-only check misses them; rebind by module identity
-    (anything not already the vendored callable) so the escape hatch takes hold.
-    """
+    ``force_rebind`` also replaces non-None globals pointing at a purged real fla."""
     fused_rms = chunk_fn = fused_recurrent_fn = None
     loaded = False
     for pkg in _REPAIR_MODELING:
@@ -666,7 +569,6 @@ def _repair_already_imported_modeling(force_rebind=False):
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.warning(f"Unsloth: could not load vendored fla symbols for repair: {e}")
                 return
-        # Already bound to the vendored kernels (e.g. an idempotent re-run): skip.
         if (
             getattr(mod, "chunk_gated_delta_rule", None) is chunk_fn
             and getattr(mod, "fused_recurrent_gated_delta_rule", None) is fused_recurrent_fn
@@ -681,20 +583,8 @@ def _repair_already_imported_modeling(force_rebind=False):
 
 
 def _disable_already_imported_gated_delta(packages=_GATED_DELTA_MODELING, why="UNSLOTH_DISABLE_HOPPER_FLA_BWD"):
-    """Unbind the miscompiled chunk kernel on gated-delta modeling modules that were
-    imported before this ran.
-
-    Mirror image of ``_repair_already_imported_modeling``. A modeling module
-    imported while some fla was available holds a live ``chunk_gated_delta_rule``,
-    and ``Qwen3NextGatedDeltaNet.__init__`` reads it as ``chunk_gated_delta_rule or
-    torch_chunk_gated_delta_rule``, so forcing the availability probe False is not
-    enough on its own. Setting the global to ``None`` makes every layer built after
-    this point pick the pure-torch path.
-
-    Deliberately narrow: only ``chunk_gated_delta_rule`` is unbound. fla #640 is a
-    backward-pass bug in the chunked kernel; ``fused_recurrent_gated_delta_rule``
-    (decode) and ``FusedRMSNormGated`` are unaffected and stay fast.
-    """
+    """Unbind ``chunk_gated_delta_rule`` on imported gated-delta modules; layers read
+    ``chunk or torch_chunk``. Only chunk: #640 is backward-only."""
     for pkg in packages:
         modname = f"transformers.models.{pkg}.modeling_{pkg}"
         mod = sys.modules.get(modname)
@@ -714,20 +604,8 @@ def _disable_already_imported_gated_delta(packages=_GATED_DELTA_MODELING, why="U
 
 _INSTALLED_FLA_PATCH_MARK = "_unsloth_hopper_dqkwg_patched"
 
-# Per-thread override for the installed-fla patch below. NOT a module global that
-# gets saved/mutated/restored around the call: torch's autograd engine runs one
-# worker thread per device ("The engine operates by having a single worker thread
-# per work queue, and every work queue is pinned to a specific device",
-# torch/csrc/autograd/engine.cpp), so a single ``.backward()`` over a model sharded
-# across two GPUs already executes two Python backward bodies concurrently, and
-# every ATen op / Triton launch inside them drops the GIL
-# (``pybind11::gil_scoped_release`` in the generated bindings,
-# ``Py_BEGIN_ALLOW_THREADS`` in Triton's launcher). A save/restore of a module
-# global therefore genuinely interleaves: one call restores the guard flag to True
-# while the other is still inside, which resurrects the RuntimeError mid-backward,
-# or leaves the tile override stuck on for the rest of the process. A
-# threading.local carries the override on the calling thread only, so no lock is
-# needed and multi-GPU backward stays parallel.
+# threading.local, not a saved/restored global: autograd runs one backward thread per
+# device and drops the GIL, so a global save/restore interleaves across GPUs.
 _installed_fla_tls = threading.local()
 
 
@@ -736,41 +614,11 @@ def _installed_fla_forcing_small_tile():
 
 
 def _patch_installed_fla_dqkwg():
-    """Apply the BK=64 workaround to a *user-installed* fla, in place.
+    """Apply the #640 BK=64 workaround to a user-installed fla in place.
 
-    When a deliberate fla-core install is present on an affected Hopper host we
-    would otherwise have to shadow it with the vendored snapshot to get the tile
-    fix, silently downgrading whatever newer upstream the user chose. Patching
-    their copy instead keeps their kernels and fixes only the miscompiled tile.
-
-    Mechanism, chosen so it does not depend on the installed fla's source layout
-    (which differs across versions): wrap ``chunk_bwd_dqkwg`` and steer the two
-    module globals it reads. Both are plain ``LOAD_GLOBAL`` reads out of
-    ``fla.ops.common.chunk_o.__dict__`` on every call, so rebinding the module
-    attribute is enough.
-
-      * ``IS_NVIDIA_HOPPER`` is set to False *once and permanently*. Inside
-        ``chunk_bwd_dqkwg`` that global is read only by the blanket guard; the
-        Hopper autotune restriction (``NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER
-        else ...``) is a module constant frozen into the kernel's config list at
-        import, so a later rebind cannot move it. Setting it permanently rather
-        than per call is what makes this wrapper thread safe (see
-        ``_installed_fla_tls``).
-      * ``check_shared_mem`` is replaced *once and permanently* by a shim that
-        answers False while the calling thread has the small-tile override set,
-        and delegates to fla's real (``@cache``d) implementation otherwise. That
-        makes the function's own arithmetic pick ``CONST_TILING = 32``, hence
-        ``BK = 32``, only for the calls that would otherwise land on 64.
-
-    ``BV`` drops to 32 alongside ``BK`` on that path, because both derive from the
-    same ``CONST_TILING``. That costs some speed for head dims 33..64 only, and
-    the vendored copy (which edits the source directly) keeps the wider ``BV``.
-
-    Returns True if the installed fla is patched, including when a previous call
-    already patched it: this runs once at import and again from TEMPORARY_PATCHES,
-    and reporting idempotence as failure would make the second call shadow the
-    user's fla with the vendored snapshot. Best effort: any real failure leaves the
-    installed fla untouched and the caller falls back to shadowing it.
+    Sets ``IS_NVIDIA_HOPPER`` False permanently (only the guard reads it) and shims
+    ``check_shared_mem`` to answer False under the thread-local override, giving BK=32.
+    Returns True if patched (idempotent); False leaves fla untouched.
     """
     try:
         import triton
@@ -782,16 +630,13 @@ def _patch_installed_fla_dqkwg():
     if fn is None:
         return False
     if getattr(fn, _INSTALLED_FLA_PATCH_MARK, False):
-        return True  # already patched by an earlier call; idempotent success
+        return True
     if not all(hasattr(chunk_o, a) for a in ("IS_NVIDIA_HOPPER", "check_shared_mem")):
         return False  # unrecognised layout; do not guess
 
     original = fn
 
-    # Every in-tree fla caller passes `g=` / `k=` by keyword, but the signature is
-    # (q, k, v, do, h, dh, w=None, g=None, ...), so a positional caller is possible.
-    # Resolve the positions once; if the signature cannot be read, treat every call
-    # as potentially gated and take the safe tile (costs speed, never correctness).
+    # g/k may be positional; an unreadable signature always takes the safe tile.
     try:
         _params = list(inspect.signature(original).parameters)
         _k_pos, _g_pos = _params.index("k"), _params.index("g")
@@ -822,8 +667,6 @@ def _patch_installed_fla_dqkwg():
             real_check_shared_mem, "__wrapped__", real_check_shared_mem,
         )
 
-    # Permanent: the guard is the only runtime reader of this global inside
-    # chunk_bwd_dqkwg, and on this host it would only ever refuse to run.
     chunk_o.IS_NVIDIA_HOPPER = False
 
     @functools.wraps(original)
@@ -831,12 +674,9 @@ def _patch_installed_fla_dqkwg():
         g = _arg("g", _g_pos, args, kwargs, _MISSING)
         k = _arg("k", _k_pos, args, kwargs, _MISSING)
         if g is None:
-            return original(*args, **kwargs)  # ungated: the miscompile cannot fire
+            return original(*args, **kwargs)
         if not _tensor_on_hopper(k):
-            # The wrapper is installed process-wide because *some* visible GPU is
-            # Hopper, but #640 is Hopper-only. A call on an Ada / Ampere / Blackwell
-            # card in the same box must keep its normal tiling, or K=33..64 would
-            # narrow both BK and BV on every backward for no reason.
+            # #640 is Hopper-only; keep normal tiling on other cards.
             return original(*args, **kwargs)
         try:
             idx = k.device.index
@@ -848,7 +688,7 @@ def _patch_installed_fla_dqkwg():
                 const_tiling = 32
             bad_tile = min(max(triton.next_power_of_2(k.shape[-1]), 16), const_tiling) == 64
         except Exception:
-            bad_tile = True  # unknown shape/args: take the safe tile
+            bad_tile = True
         previous = _installed_fla_forcing_small_tile()
         _installed_fla_tls.force_small_tile = bad_tile or previous
         try:
@@ -859,10 +699,7 @@ def _patch_installed_fla_dqkwg():
     setattr(_patched, _INSTALLED_FLA_PATCH_MARK, True)
     chunk_o.chunk_bwd_dqkwg = _patched
 
-    # fla/ops/gated_delta_rule/chunk.py does `from fla.ops.common.chunk_o import
-    # chunk_bwd_dqkwg` at import, so that module global still holds the original.
-    # Rebind every fla module pointing at it, the same way _patch_is_available
-    # rebinds transformers' probe.
+    # gated_delta_rule/chunk.py imported the original by name; rebind it.
     for name, mod in list(sys.modules.items()):
         if mod is None or not (name == "fla" or name.startswith("fla.")):
             continue
@@ -906,55 +743,17 @@ def _mark_fla_disabled_hopper():
 
 
 def _transformers_uses_availability_probe():
-    """Whether this Transformers still selects gated-delta kernels via the
-    ``is_flash_linear_attention_available()`` probe + module globals.
-
-    Transformers PR #47630 ("[Kernels] Refactor all linear attn models & native
-    kernels fallback", merged after v5.14.1) stops using that probe: the modeling
-    files now carry
-    ``@use_kernel_func_from_hub_with_fallback("chunk_gated_delta_rule", "fla")``,
-    which resolves the implementation with ``importlib.import_module`` at
-    decoration time and freezes it into a closure. There is then no probe to answer
-    False and no module global to unbind.
-
-    Detected by the *presence of the new mechanism*, not the absence of the old
-    name. Two traps make the obvious check wrong:
-
-      * ``is_flash_linear_attention_available`` still exists in
-        ``transformers/utils/import_utils.py`` after #47630 (it is merely unused by
-        the modeling files), so ``hasattr`` on it is True in both layouts.
-      * ``_patch_is_available`` assigns the attribute unconditionally, so once it
-        has run the old name is present even on a Transformers that never had it.
-        Any caller must therefore evaluate this BEFORE ``_patch_is_available``.
-    """
+    """Whether transformers still selects kernels via the availability probe (pre-#47630).
+    Must run before ``_patch_is_available``, which creates that attribute."""
     try:
         from transformers.integrations import hub_kernels
     except Exception:
-        return True  # cannot tell; assume the old layout and stay quiet
+        return True
     return not hasattr(hub_kernels, "use_kernel_func_from_hub_with_fallback")
 
 
 def _warn_hopper_optout_degraded():
-    """Say so loudly when UNSLOTH_DISABLE_HOPPER_FLA_BWD cannot force pure torch.
-
-    Silence would be the dangerous outcome: the user set a *correctness* switch and
-    would reasonably believe gated-delta training had moved off the miscompiled
-    kernel. On a post-#47630 Transformers neither lever we pull steers kernel
-    selection, so the switch cannot do what it says.
-
-    Deliberately makes no claim about the resulting gradients. The caller falls
-    through to the normal path, which patches or shadows fla so the kernel the
-    decorator resolves carries the tile fix, but whether that succeeds depends on
-    the install it finds -- and asserting "your gradients are correct" here would
-    be exactly the wrong thing to say if it did not.
-
-    Note it must not advertise ``triton>=3.7.1`` as a way to reach the pure-PyTorch
-    path either. Upgrading Triton makes ``_hopper_dqkwg_suspect_here()`` False, so
-    this whole block is skipped and the fast kernels are used -- correct gradients,
-    but still not the fallback the user asked for. On this layout there is no lever
-    on our side that forces pure torch; only the absence of an importable ``fla``
-    does that, since the decorator falls back when its import fails.
-    """
+    """Warn that UNSLOTH_DISABLE_HOPPER_FLA_BWD cannot force pure torch post-#47630."""
     logger.warning(
         "Unsloth: UNSLOTH_DISABLE_HOPPER_FLA_BWD=1 could not force the pure-PyTorch\n"
         "path. This Transformers selects gated-deltanet kernels through the\n"
@@ -971,33 +770,15 @@ def _warn_hopper_optout_degraded():
     )
 
 
-# Names Transformers resolves out of fla that fla does not actually export.
-#
-# Since huggingface/transformers#47630 the gated-delta kernels come from
-# ``use_kernel_func_from_hub_with_fallback(func, "fla")``, which resolves
-# ``fla.ops.gated_delta_rule.<func>`` at decoration time and silently keeps the
-# pure-PyTorch fallback when the lookup returns None. For decode it asks for
-# ``recurrent_gated_delta_rule``, which no fla has ever exported -- upstream
-# calls it ``fused_recurrent_gated_delta_rule``.
-#
-# So every cached decode step of every gated-deltanet model runs a float32 Python
-# loop instead of Triton, and nothing reports it: availability still answers True
-# and prefill/training are unaffected, so it only looks like slow generation.
-# Measured on Qwen3.8-27B (48 layers, greedy, 64 new tokens): fla is entered 48
-# times without the alias (prefill only), 48 + 3024 with it.
+# transformers#47630 asks fla for recurrent_gated_delta_rule, which fla never exported
+# (it is fused_recurrent_...), so decode silently ran the torch fallback.
 _MISSING_GATED_DELTA_ALIASES = {
     "recurrent_gated_delta_rule": "fused_recurrent_gated_delta_rule",
 }
 
 
 def _alias_missing_gated_delta_names():
-    """Additively supply the gated-delta names Transformers looks up.
-
-    Applied to whichever fla is live, vendored or a user install we deferred to,
-    since the decode path is equally dead on both. A name that already resolves is
-    never replaced, so a future fla that exports it upstream wins. Returns the
-    names added, for logging and tests.
-    """
+    """Add missing gated-delta names to the live fla; never replaces existing ones."""
     module = sys.modules.get("fla.ops.gated_delta_rule")
     if module is None:
         try:
@@ -1011,8 +792,6 @@ def _alias_missing_gated_delta_names():
             continue
         implementation = getattr(module, source, None)
         if implementation is None:
-            # A pruned or partial fla; leave the pure-torch fallback alone rather
-            # than binding a name to nothing.
             continue
         setattr(module, wanted, implementation)
         exported = getattr(module, "__all__", None)
@@ -1028,13 +807,145 @@ def _alias_missing_gated_delta_names():
     return tuple(added)
 
 
-# The fla kernels Transformers pulls in through the kernel-hub decorator, keyed by
-# the module attribute holding the decorated wrapper. Identical across every model in
-# _REPAIR_MODELING. The causal_conv1d decorators in the same modules are deliberately
-# absent: we do not vendor that package, so there is nothing to re-resolve them to.
+# GLM-5.3-Flash (glm5_next) bounds its KDA forget gate: Glm5NextTextForgetGate returns
+# config.linear_lower_bound * sigmoid(.), in [linear_lower_bound, 0] (-5 in the released config).
+# For such gates fla's chunk_kda(safe_gate=True) computes the 16x16 intra-chunk diagonal blocks on
+# tensor cores instead of token by token (1.2x KDA fwd + bwd on A100 at 64 heads, T = 8192).
+# Kimi-Linear's gate is unbounded (-exp(A_log) * softplus(.)), so only glm5_next is patched: each
+# Glm5NextTextLinearAttention records config.linear_lower_bound at __init__, and while every
+# glm5_next layer built so far shares one bound in fla's accepted [-5, 0), the fla kernel behind
+# glm5_next's kernel-hub chunk_kimi_delta_attention becomes functools.partial(chunk_kda,
+# safe_gate = True, lower_bound = bound). The call path keeps its frames (no new graph breaks).
+# Only on the vendored tree (it carries fla #1242 and #1554, without which the safe_gate dg error
+# is 5e-2 to 2.6e-1), Triton >= 3.6 (bf16x3 backward dots) and SM80+ (T4 is slower with it).
+# UNSLOTH_KDA_SAFE_GATE=0 disables (read when a layer is built).
+_GLM5_NEXT_MODULE = "transformers.models.glm5_next.modeling_glm5_next"
+_KDA_SAFE_GATE_MARK = "_unsloth_kda_safe_gate"
+_KDA_SAFE_GATE_INNER = "_unsloth_kda_inner"
+_KDA_SAFE_GATE_RANGE = (-5.0, 0.0)  # fla chunk_kda only accepts lower_bound in [-5, 0)
+# bound: the engaged lower bound or None; bounds: every glm5_next layer's; layers: engaged builds.
+_kda_safe_gate_state = {"bound": None, "bounds": set(), "layers": 0}
+
+
+def _kda_safe_gate_hardware_ok():
+    """Vendored fla live, Triton >= 3.6, CUDA (not ROCm) and every visible GPU SM80+."""
+    if not _vendored_already_injected():
+        return False
+    try:
+        import torch
+        from fla.utils import TRITON_ABOVE_3_6_0
+        if not TRITON_ABOVE_3_6_0 or getattr(torch.version, "hip", None) is not None:
+            return False
+        n = torch.cuda.device_count()
+        return n > 0 and all(torch.cuda.get_device_capability(i) >= (8, 0) for i in range(n))
+    except Exception:
+        return False
+
+
+def _hub_implementation_cell(wrapper):
+    """The ``implementation`` closure cell of a kernel-hub fallback wrapper, or None."""
+    code = getattr(wrapper, "__code__", None)
+    for name, cell in zip(getattr(code, "co_freevars", ()), getattr(wrapper, "__closure__", None) or ()):
+        if name == "implementation":
+            return cell
+    return None
+
+
+def _glm5_modules():
+    names = [_GLM5_NEXT_MODULE] + sorted(
+        name for name in list(sys.modules)
+        if name.startswith(_UNSLOTH_COMPILED_MODULE_PREFIX) and "glm5_next" in name
+    )
+    return [sys.modules[n] for n in names if sys.modules.get(n) is not None]
+
+
+def _apply_glm5_kda_safe_gate(bound):
+    """Point glm5_next's chunk_kimi_delta_attention at chunk_kda with (bound) or without (None) safe_gate."""
+    applied = 0
+    for module in _glm5_modules():
+        wrapper = getattr(module, "chunk_kimi_delta_attention", None)
+        cell = _hub_implementation_cell(wrapper)
+        if cell is None:
+            continue
+        try:
+            current = cell.cell_contents
+        except ValueError:
+            continue
+        base = getattr(current, _KDA_SAFE_GATE_INNER, current)
+        # Only the fla kernel: the torch fallback (wrapper.__wrapped__) has no safe_gate.
+        if base is getattr(wrapper, "__wrapped__", None) or "safe_gate" not in inspect.signature(base).parameters:
+            continue
+        if bound is None:
+            new = base
+        elif getattr(current, _KDA_SAFE_GATE_MARK, None) == bound:
+            new = current
+        else:
+            new = functools.partial(base, safe_gate = True, lower_bound = bound)
+            setattr(new, _KDA_SAFE_GATE_MARK, bound)
+            setattr(new, _KDA_SAFE_GATE_INNER, base)
+        if new is not current:
+            cell.cell_contents = new
+        applied += 1
+    return applied
+
+
+def _glm5_record_kda_bound(bound):
+    """Called from Glm5NextTextLinearAttention.__init__ with config.linear_lower_bound."""
+    state = _kda_safe_gate_state
+    valid = not isinstance(bound, bool) and isinstance(bound, (int, float))
+    low, high = _KDA_SAFE_GATE_RANGE
+    state["bounds"].add(float(bound) if valid else None)
+    (only,) = state["bounds"] if len(state["bounds"]) == 1 else (None,)
+    enabled = (
+        only is not None and low <= only < high
+        and os.environ.get("UNSLOTH_KDA_SAFE_GATE", "1") != "0"
+        and _kda_safe_gate_hardware_ok()
+    )
+    state["bound"] = only if enabled else None
+    if _apply_glm5_kda_safe_gate(state["bound"]) and enabled:
+        state["layers"] += 1
+        if UNSLOTH_ENABLE_LOGGING and state["layers"] == 1:
+            logger.info(f"Unsloth: GLM-5.3-Flash KDA gates are bounded below by {only}; using fla safe_gate.")
+
+
+def _install_glm5_kda_safe_gate():
+    """Make Glm5NextTextLinearAttention.__init__ record its bound. The modeling module is imported
+    here (~0.1 s) once transformers' modeling_utils is loaded, so the patch never depends on
+    whether the model class was imported before or after this runs."""
+    module = sys.modules.get(_GLM5_NEXT_MODULE)
+    if module is None:
+        if "transformers.modeling_utils" not in sys.modules:
+            return False
+        try:
+            if importlib.util.find_spec("transformers.models.glm5_next") is None:
+                return False
+            module = importlib.import_module(_GLM5_NEXT_MODULE)
+        except Exception:
+            return False
+    cls = getattr(module, "Glm5NextTextLinearAttention", None)
+    if cls is None:
+        return False
+    if not getattr(cls.__init__, _KDA_SAFE_GATE_MARK, False):
+        original_init = cls.__init__
+
+        @functools.wraps(original_init)
+        def __init__(self, config, *args, **kwargs):
+            original_init(self, config, *args, **kwargs)
+            _glm5_record_kda_bound(getattr(config, "linear_lower_bound", None))
+
+        setattr(__init__, _KDA_SAFE_GATE_MARK, True)
+        cls.__init__ = __init__
+    # A repair may have rebuilt the wrapper: re-apply the current choice to it.
+    _apply_glm5_kda_safe_gate(_kda_safe_gate_state["bound"])
+    return True
+
+
+# Kernel-hub decorated wrapper -> (fla module, kernel). causal_conv1d is not vendored.
 _KERNEL_HUB_DECORATED = {
-    "torch_chunk_gated_delta_rule": "chunk_gated_delta_rule",
-    "torch_recurrent_gated_delta_rule": "recurrent_gated_delta_rule",
+    "torch_chunk_gated_delta_rule": ("fla.ops.gated_delta_rule", "chunk_gated_delta_rule"),
+    "torch_recurrent_gated_delta_rule": ("fla.ops.gated_delta_rule", "recurrent_gated_delta_rule"),
+    "chunk_kimi_delta_attention": ("fla.ops.kda", "chunk_kda"),
+    "recurrent_kimi_delta_attention": ("fla.ops.kda", "fused_recurrent_kda"),
 }
 
 
@@ -1043,74 +954,69 @@ def _resolved_implementation(wrapper):
     for cell in getattr(wrapper, "__closure__", None) or ():
         try:
             value = cell.cell_contents
-        except ValueError:      # empty cell
+        except ValueError:
             continue
         if callable(value):
-            return value
+            # glm5_next's safe_gate partial: report the fla kernel it wraps.
+            return getattr(value, _KDA_SAFE_GATE_INNER, value)
     return None
 
 
-def _live_gated_delta_kernel(name):
+def _decorated_kernel_name(wrapper, default):
+    code = getattr(wrapper, "__code__", None)
+    closure = getattr(wrapper, "__closure__", None) or ()
+    if code is None:
+        return default
+    for name, cell in zip(code.co_freevars, closure):
+        if name != "func_name":
+            continue
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            return default
+        return value if isinstance(value, str) and value else default
+    return default
+
+
+def _live_fla_kernel(module_name, name):
     """The kernel ``name`` currently resolves to on the live fla, or None."""
-    module = sys.modules.get("fla.ops.gated_delta_rule")
+    module = sys.modules.get(module_name)
     return getattr(module, name, None) if module is not None else None
 
 
-def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
-    """Re-resolve the kernel-hub decorators on modeling modules imported before us.
-
-    Since huggingface/transformers#47630 the gated-delta kernels are bound by
-    ``use_kernel_func_from_hub_with_fallback``, which resolves the implementation at
-    *decoration time* and closes over it. A modeling module imported before we ran
-    therefore froze whatever was live then, and no amount of fixing ``fla`` afterwards
-    can reach it: ``_repair_already_imported_modeling`` only rebinds module globals,
-    which these modules no longer have.
-
-    Two things get frozen. The pure-PyTorch fallback, when no fla was importable yet.
-    Or a real user install's kernel, when one was live and ``UNSLOTH_FORCE_VENDORED_FLA``
-    (or the Hopper #640 switch) has since purged it -- the case ``replaced_real``
-    exists for, and the one that matters most, since that kernel is exactly the
-    miscompiled backward we replaced it to avoid. So the test is against the fla that
-    is live *now*, not against the fallback: anything else is stale.
-
-    Re-applying the decorator rather than poking ``cell_contents`` is what makes this
-    correct. The wrapper also closes over the implementation's parameter names, and
-    those differ between the fallback and the kernel (10 against 16 for chunk), so
-    patching the implementation alone would filter out arguments the kernel needs.
-
-    Scoped to ``_REPAIR_MODELING``: olmo_hybrid is deliberately not vendor-covered,
-    and ``_disable_already_imported_gated_delta`` handles it instead.
-    """
+def _repair_kernel_hub_closures(packages=_HUB_REPAIR_MODELING):
+    """Re-apply kernel-hub decorators frozen before the live fla existed (post-#47630).
+    Re-decorate rather than patch cell_contents: the wrapper also closes over param names."""
     try:
         from transformers.integrations.hub_kernels import (
             use_kernel_func_from_hub_with_fallback,
         )
     except Exception:
-        return ()               # transformers predates the decorator
+        return ()
 
     repaired = []
     for package in packages:
         module = sys.modules.get(f"transformers.models.{package}.modeling_{package}")
         if module is None:
             continue
-        for attribute, kernel in _KERNEL_HUB_DECORATED.items():
+        for attribute, (kernel_module, kernel) in _KERNEL_HUB_DECORATED.items():
             wrapper = getattr(module, attribute, None)
             original = getattr(wrapper, "__wrapped__", None)
             if original is None:
-                continue        # not decorated on this transformers
+                continue
+            # Keep the model's own name (qwen4_exp uses "fused_recurrent_gated_delta_rule").
+            kernel = _decorated_kernel_name(wrapper, kernel)
             current = _resolved_implementation(wrapper)
-            live = _live_gated_delta_kernel(kernel)
+            live = _live_fla_kernel(kernel_module, kernel)
             if live is not None and current is live:
-                continue        # already dispatching to the fla that is live now
+                continue
             try:
                 rebuilt = use_kernel_func_from_hub_with_fallback(kernel, "fla")(original)
             except Exception:
                 continue
             if _resolved_implementation(rebuilt) is current:
-                continue        # nothing would change
-            # Reached with a stale kernel and no live replacement too, where the
-            # rebuild resolves to the fallback. Taking it is the point: pure torch
-            # beats calling into an install that has been purged.
+                continue
+            # Stale kernel, no live replacement: the fallback beats a purged install.
             setattr(module, attribute, rebuilt)
             repaired.append(f"{package}.{attribute}")
 
@@ -1122,6 +1028,290 @@ def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
     return tuple(repaired)
 
 
+_GDN_BACKEND_MARK = "_unsloth_gdn_backend"
+_FLASHQLA_ARCHES = ((9, 0), (10, 0), (10, 3), (12, 0), (12, 1))
+_flashqla_state = {"module": None, "capability": None, "failed": False, "calls": 0, "skipped": set()}
+
+
+def _gdn_backend():
+    return os.environ.get("UNSLOTH_GDN_BACKEND", "").strip().lower()
+
+
+def _flashqla_version(flash_qla):
+    """Version of the imported flash_qla: the distribution's only if it owns the imported file
+    (a checkout earlier on sys.path can shadow an installed flash-qla)."""
+    version = getattr(flash_qla, "__version__", None)
+    if version:
+        return version
+    try:
+        import importlib.metadata as _md
+        dist = _md.distribution("flash-qla")
+        origin = os.path.realpath(flash_qla.__file__)
+        if any(os.path.realpath(dist.locate_file(f)) == origin for f in dist.files or ()):
+            return dist.version
+    except Exception:
+        pass
+    return None
+
+
+def _load_flashqla():
+    """flash_qla, or None. Its import picks kernels for the current device and raises on others."""
+    if _flashqla_state["module"] is not None:
+        return _flashqla_state["module"]
+    if _flashqla_state["failed"]:
+        return None
+    try:
+        import torch
+        if getattr(torch.version, "hip", None) is not None or not torch.cuda.is_available():
+            raise RuntimeError("FlashQLA needs an NVIDIA GPU")
+        capability = tuple(torch.cuda.get_device_capability())
+        if capability not in _FLASHQLA_ARCHES:
+            raise RuntimeError(f"FlashQLA does not support compute capability {capability}")
+        # Its SM120 forward can return garbage (errors ~1e17) on some drivers with grouped value
+        # heads, varlen and padded alike, unfixed upstream (QwenLM/FlashQLA#35).
+        if capability[0] == 12 and os.environ.get("UNSLOTH_FLASHQLA_ALLOW_SM120", "0") != "1":
+            raise RuntimeError(
+                "its SM120 forward can return wrong outputs on some drivers (QwenLM/FlashQLA#35); "
+                "set UNSLOTH_FLASHQLA_ALLOW_SM120=1 to use it anyway"
+            )
+        import flash_qla
+        # 0.1.1's id()-keyed tensor cache can reuse stale chunk indices for packed batches (fixed
+        # in 0.1.2); 0.1.0 lacks state_v_first. An unversioned build cannot be told apart.
+        installed = _flashqla_version(flash_qla)
+        if installed is None or not _version_at_least(installed, "0.1.2"):
+            raise RuntimeError(f"flash-qla >= 0.1.2 is required (found {installed or 'an unversioned build'})")
+    except Exception as e:
+        _flashqla_state["failed"] = True
+        logger.warning(
+            f"Unsloth: UNSLOTH_GDN_BACKEND=flashqla is set but FlashQLA is unavailable ({e}); "
+            f"using the fla Triton kernels. Install it with `pip install flash-qla`."
+        )
+        return None
+    _flashqla_state["module"] = flash_qla
+    _flashqla_state["capability"] = capability
+    return flash_qla
+
+
+def _flashqla_unsupported(q, k, v, g, beta, initial_state, cu_seqlens, cp_context, extra):
+    """Why FlashQLA cannot serve this call, or None. Mirrors fla's own FlashQLA backend
+    verifier (fla/ops/gated_delta_rule/backends/flash_qla.py)."""
+    import torch
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        return "not CUDA"
+    capability = tuple(torch.cuda.get_device_capability(q.device))
+    if capability != _flashqla_state["capability"]:
+        return f"compute capability {capability} differs from the one FlashQLA was loaded for"
+    if q.dtype not in (torch.float16, torch.bfloat16) or not (q.dtype == k.dtype == v.dtype):
+        return "dtype"
+    if q.shape[-1] != 128 or v.shape[-1] != 128:
+        return "head dim is not 128"
+    if v.shape[2] % k.shape[2] != 0:
+        return "value heads not a multiple of key heads"
+    if cu_seqlens is not None and q.shape[0] != 1:
+        return "cu_seqlens with batch > 1"
+    if cp_context is not None:
+        return "context parallel"
+    if extra.get("use_gate_in_kernel") or extra.get("use_beta_sigmoid_in_kernel") or extra.get("allow_neg_eigval"):
+        return "in-kernel gate / beta sigmoid / negative eigenvalues"
+    if "transpose_state_layout" in extra or extra.get("head_first"):
+        return "deprecated layout argument"
+    if capability[0] == 12:
+        if q.dtype == torch.float16:
+            return "float16 on SM120"
+        needs_backward = torch.is_grad_enabled() and any(
+            t is not None and t.requires_grad for t in (q, k, v, g, beta, initial_state)
+        )
+        if needs_backward:
+            # FlashQLA < 0.1.3 has no SM120 backward kernel.
+            try:
+                from flash_qla.ops.gated_delta_rule import chunk as _chunk
+                if getattr(_chunk, "fused_gdr_bwd", None) is None:
+                    return "no backward kernel on SM120"
+            except Exception:
+                return "no backward kernel on SM120"
+    return None
+
+
+def _make_flashqla_chunk_gated_delta_rule(original):
+    """Dispatch eligible calls to FlashQLA, everything else to ``original``. functools.wraps
+    keeps ``inspect.signature`` on the original: transformers' kernel-hub wrapper filters
+    kwargs by it."""
+    signature = inspect.signature(original)
+
+    @functools.wraps(original)
+    def chunk_gated_delta_rule(*args, **kwargs):
+        flash_qla = _flashqla_state["module"]
+        if flash_qla is None:
+            return original(*args, **kwargs)
+        try:
+            bound = signature.bind(*args, **kwargs)
+        except TypeError:
+            return original(*args, **kwargs)
+        a = bound.arguments
+        extra = dict(a.get("kwargs", {}))
+        # Named parameters of the original land in `a`, not in its **kwargs: the verifier sees both.
+        for name in (
+            "use_gate_in_kernel", "use_beta_sigmoid_in_kernel", "allow_neg_eigval",
+            "head_first", "transpose_state_layout",
+        ):
+            if name in a:
+                extra[name] = a[name]
+        q, k, v, g, beta = (a.get(name) for name in ("q", "k", "v", "g", "beta"))
+        initial_state = a.get("initial_state")
+        cu_seqlens = a.get("cu_seqlens")
+        reason = _flashqla_unsupported(
+            q, k, v, g, beta, initial_state, cu_seqlens, a.get("cp_context"), extra,
+        )
+        if reason is not None:
+            if UNSLOTH_ENABLE_LOGGING and reason not in _flashqla_state["skipped"]:
+                _flashqla_state["skipped"].add(reason)
+                logger.info(f"Unsloth: FlashQLA skipped ({reason}); using fla.")
+            return original(*args, **kwargs)
+        # A toolchain can accept a call and still fail to build its kernel (fp16 on SM100 with
+        # TileLang 0.1.12 and nvcc 13.1): fall back to fla, and stop retrying that dtype.
+        dtype = getattr(q, "dtype", None)
+        failed_key = (_flashqla_state["capability"], dtype)
+        failed_calls = _flashqla_state.setdefault("failed_calls", set())
+        if failed_key in failed_calls:
+            return original(*args, **kwargs)
+        _flashqla_state["calls"] += 1
+        try:
+            return flash_qla.chunk_gated_delta_rule(
+                q = q,
+                k = k,
+                v = v,
+                g = g,
+                beta = beta,
+                scale = a.get("scale"),
+                initial_state = initial_state,
+                output_final_state = a.get("output_final_state", False),
+                use_qk_l2norm_in_kernel = a.get("use_qk_l2norm_in_kernel", False),
+                cu_seqlens = cu_seqlens,
+                state_v_first = a.get("state_v_first", False),
+            )
+        except Exception as e:
+            import torch
+            if isinstance(e, getattr(torch.cuda, "OutOfMemoryError", ())):
+                raise
+            failed_calls.add(failed_key)
+            # A build failure dumps the generated source: report its first compiler error.
+            lines = [line.strip() for line in str(e).splitlines() if line.strip()]
+            message = next((line for line in lines if ": error:" in line), lines[0] if lines else "")
+            logger.warning(
+                f"Unsloth: FlashQLA failed on {dtype} ({type(e).__name__}: {message[:200]}); "
+                f"using the fla Triton kernels for {dtype}."
+            )
+        # Outside the handler: the traceback, and the failed FlashQLA buffers its frames
+        # hold, are released before fla allocates its own.
+        return original(*args, **kwargs)
+
+    setattr(chunk_gated_delta_rule, _GDN_BACKEND_MARK, "flashqla")
+    return chunk_gated_delta_rule
+
+
+def _install_gdn_backend():
+    """``UNSLOTH_GDN_BACKEND=flashqla``: route the live fla's chunk_gated_delta_rule through
+    FlashQLA where it applies. Unset: nothing is touched. Idempotent."""
+    if _gdn_backend() != "flashqla":
+        return False
+    module = sys.modules.get("fla.ops.gated_delta_rule")
+    original = getattr(module, "chunk_gated_delta_rule", None) if module is not None else None
+    if original is None:
+        return False
+    if getattr(original, _GDN_BACKEND_MARK, None) is not None:
+        return True
+    if _load_flashqla() is None:
+        return False
+    try:
+        import torch
+        wrapped = torch.compiler.disable(_make_flashqla_chunk_gated_delta_rule(original))
+    except Exception:
+        wrapped = _make_flashqla_chunk_gated_delta_rule(original)
+    setattr(wrapped, _GDN_BACKEND_MARK, "flashqla")
+    module.chunk_gated_delta_rule = wrapped
+    # Pre-#47630 modeling modules bound the original as a global at import.
+    for modname in _l2norm_modules(_GATED_DELTA_MODELING):
+        mod = sys.modules.get(modname)
+        if mod is not None and getattr(mod, "chunk_gated_delta_rule", None) is original:
+            setattr(mod, "chunk_gated_delta_rule", wrapped)
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: gated-delta chunk kernel routed through FlashQLA (UNSLOTH_GDN_BACKEND=flashqla).")
+    return True
+
+
+_NO_FLA_HUB_MARK = "_unsloth_rdna1_no_fla"
+
+
+def _block_fla_hub_decorator(packages=_GATED_DELTA_MODELING + _KDA_MODELING):
+    """RDNA1: later kernel-hub decorations bind the torch function; the decorator resolves fla when applied, and unsloth's compiler re-applies it after the last patch phase."""
+    try:
+        from transformers.integrations import hub_kernels
+    except Exception:
+        return False
+    original = getattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", None)
+    if original is None:
+        return False
+    if getattr(original, _NO_FLA_HUB_MARK, False):
+        patched = original
+    else:
+        @functools.wraps(original)
+        def patched(func_name, package, *args, **kwargs):
+            if package == "fla":
+                return lambda torch_function: torch_function
+            return original(func_name, package, *args, **kwargs)
+        setattr(patched, _NO_FLA_HUB_MARK, True)
+        hub_kernels.use_kernel_func_from_hub_with_fallback = patched
+    holders = ["transformers.integrations"] + _l2norm_modules(packages)
+    for modname in holders:
+        module = sys.modules.get(modname)
+        if module is None or modname != "transformers.integrations" and (
+            "use_kernel_func_from_hub_with_fallback" not in vars(module)
+        ):
+            continue
+        try:
+            module.use_kernel_func_from_hub_with_fallback = patched
+        except Exception:
+            continue
+    return True
+
+
+def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING + _KDA_MODELING):
+    """RDNA1: bind kernel-hub wrappers (incl. compiled copies) to their torch fallback."""
+    try:
+        from transformers.integrations.hub_kernels import (  # noqa: F401
+            use_kernel_func_from_hub_with_fallback,
+        )
+    except Exception:
+        return ()
+
+    forced = []
+    names = [f"transformers.models.{package}.modeling_{package}" for package in packages]
+    names += sorted(
+        name for name in list(sys.modules)
+        if name.startswith(_UNSLOTH_COMPILED_MODULE_PREFIX) and name not in names
+    )
+    for modname in names:
+        module = sys.modules.get(modname)
+        if module is None:
+            continue
+        for attribute in _KERNEL_HUB_DECORATED:
+            wrapper = getattr(module, attribute, None)
+            original = getattr(wrapper, "__wrapped__", None)
+            if original is None:
+                continue
+            if wrapper is original:
+                continue
+            setattr(module, attribute, original)
+            forced.append(f"{modname}.{attribute}")
+
+    if forced and UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            f"Unsloth: forced the fla kernels on {', '.join(forced)} to the pure-torch "
+            f"fallback (no dot instructions on this GPU)."
+        )
+    return tuple(forced)
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
@@ -1130,101 +1320,94 @@ def patch_vendor_fla(phase=None):
     try:
         return _patch_vendor_fla(phase)
     finally:
-        # Every early return in _patch_vendor_fla leaves some fla live, and all of
-        # them are missing the decode name, so the alias goes on the way out rather
-        # than at each return, where the next one added would quietly skip it.
-        # The closure repair follows the alias, since it resolves through it.
+        # Whichever way the kernels were resolved, the pure-torch fallback is what runs when
+        # they are not, and it must not overflow in float16. Only that fallback calls l2norm.
         try:
-            _alias_missing_gated_delta_names()
+            _patch_l2norm_fp32_on_torch_path()
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
-                logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
-        try:
-            _repair_kernel_hub_closures()
-        except Exception as e:
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
+                logger.warning(f"Unsloth: could not make the pure-torch l2norm reduce in float32: {e}")
+        if _gpu_lacks_dot_instructions():
+            # RDNA1: never make fla reachable; force the torch fallback, no alias/repair.
+            try:
+                _block_fla_hub_decorator()
+                _force_kernel_hub_fallback()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(
+                        f"Unsloth: could not force fla kernel closures to the pure-torch fallback: {e}"
+                    )
+        else:
+            # In finally so every early return gets the alias; repair resolves through it.
+            try:
+                _alias_missing_gated_delta_names()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
+            try:
+                _install_gdn_backend()
+            except Exception as e:
+                logger.warning(f"Unsloth: could not enable UNSLOTH_GDN_BACKEND: {e}")
+            try:
+                _repair_kernel_hub_closures()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
+            # After the repair, which may rebuild glm5_next's chunk_kimi_delta_attention.
+            try:
+                _install_glm5_kda_safe_gate()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: could not route GLM-5.3-Flash KDA to fla safe_gate: {e}")
 
 
 def _patch_vendor_fla(phase=None):
-    # Correctness switch, checked before the source-preference flags below. On
-    # Hopper + Triton [3.4.0, 3.7.1) *every* fla on the host has the #640 backward
-    # miscompile except our vendored copy, which steps around it. A user who does
-    # not want to rely on that opts out here and gets transformers' pure-torch
-    # gated-delta path. Bailing out of injection is not enough on its own: an
-    # installed fla stays importable, so transformers' own availability probe would
-    # answer True and bind the unpatched kernels (unslothai/unsloth#5276).
+    # Hopper opt-out must also block an installed fla via the probe (unslothai/unsloth#5276).
     optout_degraded = False
+    # RDNA1: any reachable fla aborts in LLVM, so never inject, on either layout.
+    if _gpu_lacks_dot_instructions():
+        _mark_fla_disabled_no_dot_instructions()
+        # Sample layout before _patch_is_available creates the probe attribute.
+        if _transformers_uses_availability_probe():
+            _patch_is_available(_unavailable_probe)
+        # post-#47630: _force_kernel_hub_fallback in the finally handles decorators.
+        _disable_already_imported_gated_delta(why="no dot instructions on this GPU (RDNA1)")
+        # The fp16 torch path needs a float32 l2norm.
+        _patch_l2norm_fp32_on_torch_path()
+        return
     if _flag("UNSLOTH_DISABLE_HOPPER_FLA_BWD") and _hopper_dqkwg_suspect_here():
-        # Sample the layout BEFORE _patch_is_available, which assigns the probe
-        # attribute unconditionally and would otherwise make every Transformers
-        # look like the old one.
+        # Sample layout before _patch_is_available creates the probe attribute.
         if _transformers_uses_availability_probe():
             _mark_fla_disabled_hopper()
             _patch_is_available(_unavailable_probe)
             _disable_already_imported_gated_delta()
             return
-        # Post-#47630 Transformers: the kernel-hub decorator resolves fla with
-        # importlib at decoration time, so neither the availability probe nor the
-        # module globals steer kernel selection and the opt-out cannot reach the
-        # pure-PyTorch path. Do NOT return here. Returning would leave whatever fla
-        # the decorator resolves -- a user's unpatched install -- serving the BK=64
-        # backward, making the safety switch worse than not setting it. Fall
-        # through to the normal path instead: it patches an installed fla in place
-        # and otherwise injects the vendored snapshot, either of which guarantees
-        # the fla the decorator resolves carries the tile fix. Deliberately no
-        # _mark_fla_disabled_hopper() -- fla is not disabled on this path, and
-        # claiming otherwise would mislead unsloth's loader message.
+        # Post-#47630 pure torch is unreachable; fall through so the resolved fla is
+        # patched or vendored, never an unpatched BK=64 install.
         _warn_hopper_optout_degraded()
         optout_degraded = True
 
     if _flag("UNSLOTH_DISABLE_VENDORED_FLA") and not optout_degraded:
-        # Scope is the vendored injection only: a user's own fla install is left as
-        # found so Transformers' native availability probe still governs it.
-        #
-        # Skipped when the Hopper opt-out landed in its degraded mode: that flag is
-        # a source *preference* ("prefer your fla over ours"), while
-        # UNSLOTH_DISABLE_HOPPER_FLA_BWD is a *correctness* switch, and returning
-        # here would leave the kernel-hub decorator resolving an unpatched BK=64
-        # install. Correctness outranks the preference, so the protection path runs.
+        # Correctness (the Hopper opt-out) outranks this source preference.
         return
 
     replaced_real = False
     if not _vendored_already_injected():
         force = _flag("UNSLOTH_FORCE_VENDORED_FLA")
         if not force and _should_defer_to_installed_fla():
-            # A newer (or unversioned deliberate) user install is present; use it.
-            # On an affected Hopper host it carries the #640 miscompile, which is
-            # what left a pip-installed fla-core raising mid-backward
-            # (unslothai/unsloth#5276). Patch their copy in place rather than
-            # shadowing it, so they keep the upstream they deliberately chose. If
-            # the patch cannot be applied, fall through to the vendored snapshot,
-            # which has the fix compiled in.
+            # Newer user fla: patch it in place on #640 hosts (unslothai/unsloth#5276).
             if not _hopper_dqkwg_suspect_here():
                 return
             if _patch_installed_fla_dqkwg():
-                # Deliberately no _patch_is_available() here: their fla is a real
-                # install, so transformers' native probe already finds it, and our
-                # vendored probe would wrongly narrow it to the vendor-covered
-                # models. Rebinding chunk_bwd_dqkwg on the fla modules is enough,
-                # because chunk_gated_delta_rule looks it up as a module global at
-                # call time, so modeling modules imported earlier pick it up too.
+                # No _patch_is_available: the native probe finds a real install.
                 return
         if not _torch_triton_cuda_supported():
-            # Cannot run the Triton kernels here; leave the pure-torch fallback.
             return
         injected, replaced_real = _inject_vendored_fla()
         if not injected:
             return
         if replaced_real and _hopper_dqkwg_suspect_here():
-            # A real fla install was just purged on a host where its
-            # chunk_bwd_dqkwg carries the #640 miscompile.
-            # _repair_already_imported_modeling rebinds the vendor-covered Qwen
-            # packages onto the fixed vendored kernels, but the snapshot cannot
-            # serve olmo_hybrid (it prunes ShortConvolution), so a
-            # module of theirs imported before this ran would keep calling the
-            # purged install's unpatched kernel and silently corrupt dk/dg. Unbind
-            # it and let them take transformers' pure-torch gated-delta path.
+            # Purged real fla on a #640 host: vendor cannot serve olmo_hybrid, unbind it.
             _disable_already_imported_gated_delta(
                 packages=_UNCOVERED_GATED_DELTA, why="fla #640; vendored tree cannot serve this model",
             )
@@ -1235,14 +1418,7 @@ def _patch_vendor_fla(phase=None):
 
 TEMPORARY_PATCHES.append(patch_vendor_fla)
 
-# Run once at import so the vendored fla is registered as early as possible
-# (before any gated-deltanet modeling module is imported). Re-run later via
-# TEMPORARY_PATCHES once transformers is fully initialised.
-#
-# Setting UNSLOTH_VENDORED_FLA_NO_AUTORUN=1 suppresses only this import-time run,
-# not the TEMPORARY_PATCHES pass or an explicit patch_vendor_fla() call. Tests
-# import this module purely to read the support gate; without the guard that
-# import would inject fla into their own interpreter as a side effect.
+# Early import-time run; UNSLOTH_VENDORED_FLA_NO_AUTORUN=1 skips only this one.
 if not _flag("UNSLOTH_VENDORED_FLA_NO_AUTORUN"):
     try:
         patch_vendor_fla()

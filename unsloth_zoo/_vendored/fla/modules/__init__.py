@@ -9,10 +9,20 @@
 # imported the full module zoo (convolutions, bitlinear, cross-entropy, MLP,
 # rotary, ...). This vendored copy exposes only FusedRMSNormGated, which the
 # transformers gated-deltanet models import via `from fla.modules import
-# FusedRMSNormGated`. Original MIT header preserved above.
+# FusedRMSNormGated`, and ShortConvolution, which the Ling 3.0 remote code
+# imports alongside it. ShortConvolution resolves lazily: its module needs
+# einops, which the gated-deltanet path does not. Original MIT header preserved
+# above.
 
 from fla.modules.fused_norm_gate import FusedRMSNormGated
 
 __all__ = [
     "FusedRMSNormGated",
 ]
+
+
+def __getattr__(name):
+    if name == "ShortConvolution":
+        from fla.modules.conv.short_conv import ShortConvolution
+        return ShortConvolution
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

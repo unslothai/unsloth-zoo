@@ -31,10 +31,12 @@ Protocol (matches diffusion-gemma-visual-server.cpp):
   'QUIT' exits.
 """
 import ctypes
+import io
 import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 
@@ -160,16 +162,30 @@ def _resolve_ngl(ngl = None, base_env = None):
     return DEFAULT_NGL
 
 
-def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, ngl = None, base_env = None, os_name = None):
+def _first_visible_gpu(mask):
+    """One card from an inherited mask: its first entry, so ``0,1`` still means GPU 0 alone and
+    ``2,1`` never reaches a hidden GPU 0; an all-hiding mask is kept; no mask means GPU 0."""
+    if mask is None:
+        return "0"
+    # CUDA stops at the first invalid entry, so a leading empty entry (",2") hides every GPU.
+    first = mask.split(",")[0].strip()
+    if first in ("", "-1"):
+        return mask
+    return first
+
+
+def _build_subprocess_env(server_bin, gpu = None, maxtok = 0, ngl = None, base_env = None, os_name = None):
     """Build the visual-server child env so it loads the CUDA backend, not CPU.
 
     Binary dir first, then bundled CUDA runtime, then the inherited path. Windows: torch/lib
     (``cudart64_*.dll``) is prepended to ``PATH`` (#6273). Linux/WSL: the bundled ``nvidia-*`` dirs
     are prepended to ``LD_LIBRARY_PATH`` ahead of any inherited system CUDA (#6303). macOS / no GPU
-    wheels: only the binary dir is added (unchanged). Pure/injectable for cross-platform tests."""
+    wheels: only the binary dir is added (unchanged). Pure/injectable for cross-platform tests.
+    ``gpu=None`` keeps one GPU, as before: the first entry of an inherited ``CUDA_VISIBLE_DEVICES``
+    (``""`` / ``-1`` stay hidden), else GPU 0. Any other value, including ``""`` (CPU only), replaces it."""
     name = os.name if os_name is None else os_name
     env = dict(os.environ if base_env is None else base_env)
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else _first_visible_gpu(env.get("CUDA_VISIBLE_DEVICES"))
     env["NGL"] = str(_resolve_ngl(ngl, base_env))
     env["MAXTOK"] = str(maxtok)
 
@@ -199,19 +215,58 @@ def _canvas_maxtok(maxtok):
     return maxtok if 0 < maxtok <= 8192 else 0
 
 
+def _replace_request_file(req_path, req):
+    """Land the request by replacing the name: mkstemp then os.replace, so a link
+    planted at `req_path` is replaced rather than written through. Local rather than
+    imported from unsloth_zoo.compiler, which would pull torch into this path."""
+    directory = os.path.dirname(req_path) or "."
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix = f".{os.path.basename(req_path)}.", suffix = ".tmp", dir = directory,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+            descriptor = None
+            json.dump(req, f, ensure_ascii = False)
+        os.replace(temporary_path, req_path)
+    except BaseException:
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+        try: os.remove(temporary_path)
+        except OSError: pass
+        raise
+
+
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
-    def __init__(self, gguf, gpu="0", maxtok=0, server_bin=None, req_path=None, ngl=None):
+    def __init__(self, gguf, gpu=None, maxtok=0, server_bin=None, req_path=None, ngl=None):
         self.gguf = gguf
         self.server_bin = _resolve_bin(server_bin)
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-        self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
-        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok), ngl=ngl)
-        self.ngl = int(self.env["NGL"])
-        self.p = None
-        self._spawn()
+        # /dev/shm and /tmp are 1777 and PIDs are enumerable, so a PID-derived name
+        # there is world readable and can be pre-empted. Give each server its own
+        # 0700 directory with an unpredictable name instead.
+        self._req_dir = None
+        if req_path:
+            self.req = req_path
+        else:
+            self._req_dir = tempfile.mkdtemp(prefix = "dg_visual_", dir = req_dir)
+            self.req = os.path.join(self._req_dir, "request.json")
+        try:
+            self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok), ngl=ngl)
+            self.ngl = int(self.env["NGL"])
+            self.p = None
+            self._spawn()
+        except BaseException:
+            # Nobody can call close() on an object __init__ never returned, so a
+            # server that fails to come up would leave its directory behind, once per
+            # supervisor retry.
+            if self._req_dir is not None:
+                shutil.rmtree(self._req_dir, ignore_errors = True)
+                self._req_dir = None
+            raise
 
     def _spawn(self):
         """Launch the subprocess and finish the READY handshake. Used at startup and by restart()
@@ -219,6 +274,8 @@ class VisualServer:
         self.p = subprocess.Popen([self.server_bin, self.gguf], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   env=self.env, bufsize=1, text=True,
                                   preexec_fn=_set_pdeathsig if os.name == "posix" else None)
+        # Only stdout is UTF-8: the server fopen()s the stdin request path, which is ANSI on Windows.
+        self.p.stdout = io.TextIOWrapper(self.p.stdout.detach(), encoding="utf-8")
         line = self.p.stdout.readline().strip()
         if not line.startswith("READY"):
             raise RuntimeError(f"visual server failed to start: {line!r}")
@@ -249,8 +306,27 @@ class VisualServer:
         # for schema-correct <|tool_call> args.
         if tools:
             req["tools"] = tools
-        with open(self.req, "w", encoding="utf-8") as f:
-            json.dump(req, f, ensure_ascii=False)
+        # The request body carries the whole conversation: no link, not world
+        # readable, and no FIFO. O_NONBLOCK refuses one with no reader; one whose read
+        # end is already held open opens fine, so the fstat is what refuses that.
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            # No atomic no-follow open here, and an lstat first is only a time of check.
+            _replace_request_file(self.req, req)
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            flags |= no_follow
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            descriptor = os.open(self.req, flags, 0o600)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise OSError(f"Unsloth: refusing to write the request at `{self.req}`: not a regular file.")
+                with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+                    descriptor = None
+                    json.dump(req, f, ensure_ascii=False)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
         try:
             self.p.stdin.write(self.req + "\n")
             self.p.stdin.flush()
@@ -267,6 +343,11 @@ class VisualServer:
             self.p.wait(timeout=10)
         except Exception:
             self.p.kill()
+        finally:
+            # The request file used to outlive the process, in a shared directory.
+            if self._req_dir is not None:
+                shutil.rmtree(self._req_dir, ignore_errors = True)
+                self._req_dir = None
 
 
 def _parse_stats(line):
@@ -362,7 +443,7 @@ if __name__ == "__main__":
     gguf = sys.argv[1] if len(sys.argv) > 1 else "diffusion-gemma-Q8_0.gguf"
     prompt = sys.argv[2] if len(sys.argv) > 2 else "In one sentence, what is a transformer in ML?"
     blocks = int(sys.argv[3]) if len(sys.argv) > 3 else 2
-    srv = VisualServer(gguf, gpu=os.environ.get("DG_GPU", "0"))
+    srv = VisualServer(gguf, gpu=os.environ.get("DG_GPU"))
     print("visual server ready, n_vocab=", srv.n_vocab, flush=True)
     n_frames = [0]
 

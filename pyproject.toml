@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools==80.9.0", "setuptools-scm==9.2.0"]
+requires = [
+    # setuptools 83+ needs Python 3.10, and we still support 3.9 source installs.
+    "setuptools==84.0.0; python_version >= '3.10'",
+    "setuptools==80.9.0; python_version < '3.10'",
+    "setuptools-scm==10.3.4",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -23,30 +28,30 @@ classifiers = [
 ]
 dependencies = [
     # --- GPU-only deps (skipped on macOS arm64) ---
-    "torch>=2.4.0,<2.13.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "torch>=2.4.0,<2.15.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "torchao>=0.13.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "triton>=3.0.0 ; ('linux' in sys_platform)",
-    "tyro ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "accelerate>=0.34.1 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
-    "trl>=0.18.2,!=0.19.0,<=1.13.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "trl>=0.18.2,!=0.19.0,<=1.15.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "peft>=0.18.0,!=0.11.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "cut_cross_entropy ; python_version >= '3.10' and (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    # Imported by the vendored fla ShortConvolution, and at module level by remote code that uses
+    # it (Ling 3.0). fla-core brought it in before fla was vendored.
+    "einops ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     # --- MLX-only deps (macOS arm64) ---
-    # Pin MLX: patch releases can break APIs such as mx.random.state (#1078,
-    # #1081; unslothai/unsloth#9478). Validate Apple Silicon before bumping.
-    "mlx==0.32.2 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    # Batched generation needs GenerationBatch.Response and next_generated (0.31.2+).
-    "mlx-lm==0.31.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    # Keep a range: the transformers cap resolves 0.6.4, while Studio's override
-    # permits 0.7.x with the Unicode fix from 0.6.9 (unslothai/unsloth#9466).
-    # The 0.7.1 ceiling matches supported gated-delta/MoE APIs; Studio honors it.
-    "mlx-vlm>=0.4.4,<=0.7.1 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # Pin MLX: patch releases broke mx.random.state (#1078, #1081; unslothai/unsloth#9478).
+    # Validate Apple Silicon before bumping.
+    "mlx==0.32.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # Batched APIs need mlx-lm 0.31.2+; allow 0.31.3 on Python 3.10 (0.32 needs Python 3.11).
+    "mlx-lm>=0.31.3,<=0.32.2 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # Keep older transformers resolvable: mlx-vlm 0.6.5+ needs >=5.14; 0.6.9 fixes unsloth#9466.
+    "mlx-vlm>=0.4.4,<=0.7.9 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
-    # peft 0.18.0 needs transformers.modeling_layers (4.52.0+). Use 4.52.4:
-    # 4.52.0 through 4.52.3 were already excluded.
-    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
+    # peft 0.18.0 needs transformers.modeling_layers (4.52.0+); 4.52.0-4.52.3 were rejected.
+    # Ceiling tracks CUDA/Apple Silicon validation in consolidated-tests-ci.yml; exclusions are tested failures.
+    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0",
+    "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
@@ -60,6 +65,12 @@ dependencies = [
     "msgspec",
     "typing_extensions",
     "filelock",
+    # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
+    # through datasets, which dropped it in 5.x.
+    "requests",
+    # requests and huggingface_hub verify TLS against certifi; 2026.10.19 drops the compromised
+    # eMudhra/emSign root, and an older bundle already installed would otherwise be kept.
+    "certifi>=2026.10.19",
 ]
 
 [tool.setuptools.dynamic]
@@ -72,31 +83,28 @@ include-package-data = false
 unsloth_zoo = ["diffusion_studio/*.html"]
 
 [tool.setuptools.packages.find]
-# Include only unsloth_zoo and its subpackages, not tests/scripts or siblings
-# such as unsloth_zoo_cache that an "unsloth_zoo*" glob would also ship.
-include = ["unsloth_zoo", "unsloth_zoo.*"]
+# Dotted globs exclude unrelated siblings (e.g. unsloth_zoo_cache) and top-level tests/scripts.
+include = ["unsloth_zoo", "unsloth_zoo.*", "unsloth_zoo_downloads", "unsloth_zoo_downloads.*"]
 exclude = ["images*", "tests*", "scripts*"]
 
 [project.optional-dependencies]
 mlx = [
     # Keep these constraints in sync with the MLX-only dependencies above.
-    "mlx==0.32.2",
-    "mlx-lm==0.31.3",
-    "mlx-vlm>=0.4.4,<=0.7.1",
+    "mlx==0.32.4",
+    "mlx-lm>=0.31.3,<=0.32.2",
+    "mlx-vlm>=0.4.4,<=0.7.9",
 ]
 core = [
     "packaging>=24.1",
-    "tyro",
-    # Floor rationale as above: peft 0.18.0 needs transformers.modeling_layers, 4.52.0+.
-    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
+    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0",
+    "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
     "wheel>=0.42.0",
     "numpy",
     "accelerate>=0.34.1",
-    "trl>=0.18.2,!=0.19.0,<=1.13.0",
+    "trl>=0.18.2,!=0.19.0,<=1.15.0",
     "peft>=0.18.0,!=0.11.0",
     "protobuf",
     "huggingface_hub>=0.34.0",
@@ -107,6 +115,12 @@ core = [
     "msgspec",
     "typing_extensions",
     "filelock",
+    # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
+    # through datasets, which dropped it in 5.x.
+    "requests",
+    # requests and huggingface_hub verify TLS against certifi; 2026.10.19 drops the compromised
+    # eMudhra/emSign root, and an older bundle already installed would otherwise be kept.
+    "certifi>=2026.10.19",
 ]
 huggingface = [
     "unsloth_zoo[core]",

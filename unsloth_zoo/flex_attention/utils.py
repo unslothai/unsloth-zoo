@@ -19,9 +19,12 @@ __all__ = [
     "FLEX_ATTENTION_BLOCK_SIZE",
     "_flex_attention",
     "flex_attention",
+    "PREFILL_KERNEL_OPTIONS",
     "create_block_mask_cached",
     "create_block_mask",
     "compiled_create_block_mask",
+    "reused_compiled_create_block_mask",
+    "clear_block_mask_cache",
     "FlexAttentionCache",
 
     "causal_mask",
@@ -33,6 +36,7 @@ __all__ = [
     "generate_decoding_sliding_window_mask_with_padding",
 ]
 
+import os
 import torch
 import functools
 from unsloth_zoo.temporary_patches.common import torch_compile, _torch_compile
@@ -84,6 +88,21 @@ try:
         _flex_attention = functools.partial(_flex_attention, kernel_options = kernel_options)
     pass
     flex_attention = _torch_compile(_flex_attention)
+    # Prefill / training: AUTO sends queries under 128 rows to flex_decoding, which has no valid config once
+    # q_len * GQA group > 128; Dynamo then runs flex eagerly and checkpoint recompute raises CheckpointError.
+    PREFILL_KERNEL_OPTIONS = {**(kernel_options or {}), "FORCE_USE_FLEX_ATTENTION": True}
+
+    # torch >= 2.9: return_lse's deprecation warning is a graph break on 2.10; use AuxRequest.
+    try:
+        from torch.nn.attention.flex_attention import AuxRequest as _AuxRequest
+        FLEX_LSE_KWARGS = {"return_aux": _AuxRequest(lse = True)}
+    except Exception:
+        FLEX_LSE_KWARGS = {"return_lse": True}
+
+    def flex_output_and_lse(output):
+        """(attention output, logsumexp) from a flex_attention call made with FLEX_LSE_KWARGS."""
+        out, aux = output
+        return out, (aux.lse if "return_aux" in FLEX_LSE_KWARGS else aux)
 
     @functools.lru_cache
     def create_block_mask_cached(mask_mod, M, N, device = "cuda"):
@@ -95,16 +114,72 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
 
+    # Largest dense mask (bool elements) built eagerly; above it the compiled builder keeps memory O(blocks).
+    _EAGER_BLOCK_MASK_MAX_ELEMENTS = 1 << 27
+
+    # Fixed in 2.13 / 2.14; 2.11 / 2.12 untested, so they keep the workaround.
+    _ONE_BLOCK_MISCOMPILE = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 13)
+
+    def _compile_block_mask(bsz, head, M, N):
+        # torch 2.10's dynamic create_block_mask graph miscompiles one-block lengths: its block
+        # counts come out 2 instead of 1 and read past the buffer (illegal memory access).
+        blk = FLEX_ATTENTION_BLOCK_SIZE
+        if not _ONE_BLOCK_MISCOMPILE or (M > blk and N > blk):
+            return True
+        # The eager builder pads both lengths to whole blocks before reducing the dense mask.
+        padded = -(-M // blk) * blk * (-(-N // blk) * blk)
+        return (bsz or 1) * (head or 1) * padded > _EAGER_BLOCK_MASK_MAX_ELEMENTS
+
+    # Keep the eager build out of an enclosing torch.compile graph, which would hit the same miscompile.
+    @torch.compiler.disable
+    def _eager_create_block_mask(mask_mod, bsz, head, M, N, device):
+        return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = False)
+
+    def _build_block_mask(mask_mod, bsz, head, M, N, device):
+        if _compile_block_mask(bsz, head, M, N):
+            # See https://github.com/meta-pytorch/attention-gym/issues/15#issuecomment-2284148665
+            # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
+            return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = True)
+        return _eager_create_block_mask(mask_mod, bsz, head, M, N, device)
+
     def compiled_create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
-        # See https://github.com/meta-pytorch/attention-gym/issues/15#issuecomment-2284148665
-        # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
-        return _create_block_mask(mask_mod, None, None, M, N, device = device, _compile = True)
+        return _build_block_mask(mask_mod, None, None, M, N, device)
 
     def compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
-        # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
-        return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = True)
+        return _build_block_mask(mask_mod, bsz, head, M, N, device)
+
+    # Block masks for stateless mask_mods (causal / sliding window) only depend on the
+    # mask_mod and shapes, so every layer, pass and checkpoint replay can share one.
+    # Never pass mask_mods closing over per batch tensors (padding, document ids).
+    _BLOCK_MASK_CACHE = {}
+    _BLOCK_MASK_CACHE_SIZE = 32
+
+    def clear_block_mask_cache():
+        _BLOCK_MASK_CACHE.clear()
+
+    def reused_compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
+        """compiled_create_block_mask cached for stateless mask_mods. UNSLOTH_FLEX_MASK_REUSE=0 disables"""
+        if os.environ.get("UNSLOTH_FLEX_MASK_REUSE", "1") == "0":
+            _BLOCK_MASK_CACHE.clear()   # turning reuse off also frees the retained masks
+            return compiled_create_block_mask(mask_mod, bsz, head, M, N, device = device)
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:   # "cuda" means the current device
+            dev = torch.device("cuda", torch.cuda.current_device())
+        # Inference tensors cannot be saved for backward, so keep inference mode masks apart
+        key = (mask_mod, bsz, head, M, N, dev, torch.is_inference_mode_enabled())
+        block_mask = _BLOCK_MASK_CACHE.get(key)
+        if block_mask is None:
+            # Masks grow ~quadratically with length: keep only the current shape's masks (one per
+            # mask_mod in the current inference mode, shared by all layers of one forward), freed first.
+            for k in [k for k in _BLOCK_MASK_CACHE if k[1:] != key[1:]]:
+                del _BLOCK_MASK_CACHE[k]
+            if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_SIZE:
+                _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
+            block_mask = compiled_create_block_mask(mask_mod, bsz, head, M, N, device = dev)
+            _BLOCK_MASK_CACHE[key] = block_mask
+        return block_mask
 
     def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
         """Causal mask for Flex Attention"""
@@ -358,8 +433,13 @@ except:
     HAS_FLEX_ATTENTION = False
     FLEX_ATTENTION_BLOCK_SIZE = None
     flex_attention = None
+    PREFILL_KERNEL_OPTIONS = None
     create_block_mask_cached = None
     causal_mask = None
     generate_sliding_window_mask = None
     FlexAttentionCache = None
+    reused_compiled_create_block_mask = None
+    clear_block_mask_cache = None
+    FLEX_LSE_KWARGS = {"return_lse": True}
+    flex_output_and_lse = None
 pass

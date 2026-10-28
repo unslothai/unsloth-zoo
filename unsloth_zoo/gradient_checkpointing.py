@@ -23,8 +23,11 @@ import functools
 import inspect
 import warnings
 import gc
+import collections
+import heapq
 import threading
-from .utils import _get_dtype, Version
+import weakref
+from .utils import _get_dtype, Version, is_distributed
 # Re-exported under its old name: it lives in integrated_device.py so the import-time
 # allocator block can share the topic without importing torch.
 from .integrated_device import _any_device_integrated
@@ -53,6 +56,8 @@ __all__ = [
     "patch_unsloth_smart_gradient_checkpointing",
     "unpatch_unsloth_smart_gradient_checkpointing",
     "reset_unsloth_gradient_checkpointing_buffers",
+    "NonReentrantActivationOffloader",
+    "non_reentrant_offload_hooks",
 ]
 
 # Initial buffer sizes for gradient checkpointing
@@ -134,11 +139,13 @@ def _mark_host_buffer(buffer):
 
 
 def _new_host_buffer(numel, dtype):
-    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled()):
+    nbytes = numel * dtype.itemsize
+    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled() and _reserve_pinned(nbytes)):
         return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
     try:
         return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True))
     except RuntimeError as e:
+        _release_pinned(nbytes)
         if not _is_host_alloc_oom(e): raise
         _warn_pinned_unavailable(e)
         return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
@@ -147,14 +154,274 @@ def _new_host_buffer(numel, dtype):
 def _grow_host_buffer(buffer, new_size):
     """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
     if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
-    try:
+    old_bytes = _storage_bytes(buffer)
+    if new_size * buffer.element_size() <= old_bytes:
+        # A shrunk buffer keeps its storage, so this resize_ allocates nothing.
         buffer.resize_(new_size)
         return _mark_host_buffer(buffer)
+    new_bytes = max(old_bytes, new_size * buffer.element_size())
+    pinned = getattr(buffer, HOST_PINNED_ATTR, False)
+    if not pinned:
+        # Contents are rewritten before every read, so a pageable slot can take a fresh block:
+        # pinned again once RAM allows, instead of staying pageable after one low-RAM moment.
+        return _new_host_buffer(new_size, buffer.dtype)
+    # resize_ takes a new pinned block and hands the old one back to the host cache.
+    if pinned and not _reserve_pinned(new_bytes):
+        _release_pinned(old_bytes)
+        replacement = _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+        if GC_PINNED_CAP == _PIN_PER_BLOCK:
+            # Host RAM is short and the flush inside _reserve_pinned ran while this slot still held
+            # its old block. The caller replaces the slot (its contents are rewritten before every
+            # read), so free the old block now instead of leaving it cached beside the pageable copy.
+            try:
+                buffer.resize_(0)
+                buffer.untyped_storage().resize_(0)  # Tensor.resize_ alone never shrinks a storage
+            except Exception: pass
+            else: _empty_host_cache()
+        return replacement
+    try:
+        buffer.resize_(new_size)
+        if pinned: _release_pinned(old_bytes)
+        return _mark_host_buffer(buffer)
     except RuntimeError as e:
+        if pinned: _release_pinned(new_bytes)
         if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
+        _release_pinned(old_bytes)
         _warn_pinned_unavailable(e)
         # Pinning is gone for this slot, so the cached flag has to flip with it.
         return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+
+
+# Pinned pages cannot be swapped and every local rank pins its own pool (Arctic ALST), so
+# past block_swap's per-rank budget new offload buffers stay pageable.
+# torch's CachingHostAllocator rounds each pinned block up to a power of two and keeps
+# freed blocks page-locked in per-size free lists until empty_host_cache (aten/src/ATen/
+# core/CachingHostAllocator.h: PowerOf2Ceil in allocate, free_list_ in free, torch 2.6
+# through 2.13). So GC_PINNED_BYTES charges rounded blocks, a release only moves a block
+# into _PINNED_CACHED (reusable by the next reservation of that size), and it drops only
+# when torch.cuda.host_memory_stats() shows the allocator holding less.
+# A single local rank has no other ranks to leave RAM for, and a refused pin still stores the
+# same bytes pageable, so it only refuses a block that would not fit in the RAM available now.
+GC_PINNED_BYTES = 0
+GC_PINNED_CAP = None        # None = not computed yet, -1 = uncapped, -2 = per block (one rank)
+_PIN_PER_BLOCK = -2
+_PIN_HEADROOM_BYTES = 1 << 30
+_WARNED_ABOUT_PINNED_CAP = False
+_PINNED_CACHED = {}         # rounded block bytes -> count released but still cached
+_HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
+
+
+def _pinned_block_bytes(nbytes):
+    if nbytes <= 0: return 0
+    return 1 << (int(nbytes) - 1).bit_length()
+
+
+def _host_allocator_held_bytes():
+    """Pinned bytes the caching host allocator holds (live + cached), None if unknown."""
+    if DEVICE_TYPE not in ("cuda", "hip"): return None
+    try: return int(torch.cuda.host_memory_stats()["allocated_bytes.current"])
+    except Exception: return None  # torch < 2.7 has no host_memory_stats
+
+
+def _host_allocator_free_bytes():
+    """Pinned bytes cached free in the host allocator (any user's), None if unknown."""
+    if DEVICE_TYPE not in ("cuda", "hip"): return None
+    try:
+        stats = torch.cuda.host_memory_stats()
+        return int(stats["allocated_bytes.current"]) - int(stats["active_bytes.current"])
+    except Exception: return None
+
+
+def _host_cache_reuses_block(block):
+    """A pinned block freed after a non_blocking copy waits in torch's event queue, which only an
+    allocation drains (host_memory_stats does not), so it reads as not free. Allocate and drop a
+    block of that size to drain it: True if the allocator reused a cached block, False if it had
+    to pin a new one, which is released again so the probe never holds pinned memory past the cap."""
+    held = _host_allocator_held_bytes()
+    if held is None: return False
+    try:
+        probe = torch.empty(block, dtype = torch.uint8, device = "cpu", pin_memory = True)
+    except Exception as exception:
+        if not _is_host_alloc_oom(exception): raise
+        return False
+    after = _host_allocator_held_bytes()
+    del probe
+    if after is not None and after <= held: return True
+    _empty_host_cache()
+    return False
+
+
+def _compute_pinned_cap():
+    env = os.environ.get("UNSLOTH_GC_PINNED_MAX_GB")
+    if env:
+        try: return max(0, int(float(env) * (1 << 30)))
+        except ValueError: pass
+    try:
+        import psutil
+        from .block_swap import _PIN_RESERVE_MIN_BYTES, _PIN_RESERVE_FRACTION, _local_world_size
+        vm = psutil.virtual_memory()
+    except Exception:
+        return -1  # unmeasurable: keep the old uncapped behaviour
+    if _local_world_size() == 1: return _PIN_PER_BLOCK
+    reserve = max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+    # Bytes this process already pinned are missing from `available`, so add them back.
+    return max(0, vm.available - reserve) // _local_world_size() + GC_PINNED_BYTES
+
+
+def _block_fits_host_ram(block):
+    """One local rank: pin unless the block would leave under min(1 GiB, 10% of RAM) available."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+    except Exception:
+        return True
+    return block + min(_PIN_HEADROOM_BYTES, vm.total // 10) <= vm.available
+
+
+def _synchronize_used_devices():
+    """Wait for this process's work on every device it already uses (a split model offloads on
+    devices other than the current one). Devices it never touched are skipped, so no context is
+    created on them. A failure here is a real device error and is raised."""
+    if not torch.cuda.is_available(): return
+    for index in range(torch.cuda.device_count()):
+        if torch.cuda.memory_reserved(index) > 0:
+            torch.cuda.synchronize(index)
+pass
+
+
+def _empty_host_cache():
+    """Return cached free pinned blocks to the OS. A pinned buffer that grows leaves its old block
+    in torch's host cache, and once growth goes pageable nothing reuses it. True if any were freed."""
+    global GC_PINNED_BYTES
+    if DEVICE_TYPE not in ("cuda", "hip"): return False
+    ours = sum(k * v for k, v in _PINNED_CACHED.items())
+    free = _host_allocator_free_bytes()
+    # host_memory_stats() does not process pending copy events, so a dead block whose last use was a
+    # non_blocking copy (every pinned offload slot) still reads as active there: our own released
+    # blocks are reason enough to flush, and _host_emptyCache processes those events first.
+    if not (ours or free): return False
+    if ours:
+        # _host_emptyCache only frees blocks whose copy events completed: wait for our released
+        # blocks' last non_blocking copies, or the bookkeeping below drops blocks still held.
+        _synchronize_used_devices()
+    try: torch._C._host_emptyCache()
+    except Exception: return False
+    GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - ours)
+    _PINNED_CACHED.clear()
+    return True
+
+
+def _storage_bytes(buffer):
+    # resize_ never shrinks a storage, so numel can understate what stays pinned.
+    try: return buffer.untyped_storage().nbytes()
+    except Exception: return buffer.numel() * buffer.element_size()
+
+
+def _release_pool_pinned(start = 0):
+    """Release every pinned CPU_BUFFERS slot from `start` on; call before freeing them."""
+    if not CPU_BUFFERS: return
+    for x in CPU_BUFFERS[start:]:
+        if x is not None and getattr(x, HOST_PINNED_ATTR, False):
+            _release_pinned(_storage_bytes(x))
+
+
+def _reset_pinned_cap():
+    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP
+    GC_PINNED_CAP = None
+    _WARNED_ABOUT_PINNED_CAP = False
+
+
+def _reserve_pinned(nbytes):
+    """Count `nbytes` against the pinned cap; False means allocate pageable instead."""
+    global GC_PINNED_BYTES, GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _HOST_HELD_BASELINE
+    block = _pinned_block_bytes(nbytes)
+    if _PINNED_CACHED.get(block, 0) > 0:
+        _PINNED_CACHED[block] -= 1
+        free = _host_allocator_free_bytes()
+        # Under a fixed cap a refusal here is sticky (pageable copies never drain the queue), so
+        # check the event queue; the per block mode re-checks host RAM below instead.
+        if free is None or free >= block or (
+            GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0 and _host_cache_reuses_block(block)
+        ):
+            return True  # the allocator hands back the cached block, already charged
+        # Another pinned user took the block: it is no longer ours, and this request is new.
+        GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
+    held = _host_allocator_held_bytes()
+    if GC_PINNED_CAP is None:
+        GC_PINNED_CAP = _compute_pinned_cap()
+        _HOST_HELD_BASELINE = None if held is None else max(0, held - GC_PINNED_BYTES)
+    elif _HOST_HELD_BASELINE is None and held is not None:
+        # host_memory_stats() is empty before CUDA initialises, so a cap computed first has no
+        # baseline yet: take it at the first reading instead of never.
+        _HOST_HELD_BASELINE = max(0, held - GC_PINNED_BYTES)
+    used = GC_PINNED_BYTES
+    if held is not None:
+        if held < GC_PINNED_BYTES:
+            # The host cache was emptied: whatever we released is gone.
+            live = GC_PINNED_BYTES - sum(k * v for k, v in _PINNED_CACHED.items())
+            _PINNED_CACHED.clear()
+            GC_PINNED_BYTES = used = max(live, held)
+        if _HOST_HELD_BASELINE is not None:
+            # A cached block taken by another pinned user makes our next request a new one.
+            used = max(used, held - _HOST_HELD_BASELINE)
+    if GC_PINNED_CAP == _PIN_PER_BLOCK:
+        if not _block_fits_host_ram(block) and not (_empty_host_cache() and _block_fits_host_ram(block)):
+            if not _WARNED_ABOUT_PINNED_CAP:
+                _WARNED_ABOUT_PINNED_CAP = True
+                print(
+                    "Unsloth: Host RAM is nearly full, so gradient checkpointing offload buffers that "
+                    "do not fit use pageable memory. Training continues; "
+                    "set UNSLOTH_GC_PINNED_MAX_GB to set a fixed pinned cap instead."
+                )
+            return False
+    elif GC_PINNED_CAP >= 0 and used + block > GC_PINNED_CAP and not (
+        # Our released blocks (old blocks of grown slots) still count against the cap: return
+        # them to the OS once and retry before going pageable for good. Only when some exist,
+        # so a full cap with nothing of ours cached costs no device sync.
+        _PINNED_CACHED and any(_PINNED_CACHED.values()) and _flushed_cached_fits(block, used)
+    ):
+        if not _WARNED_ABOUT_PINNED_CAP:
+            _WARNED_ABOUT_PINNED_CAP = True
+            print(
+                f"Unsloth: Gradient checkpointing pinned host memory reached its cap of "
+                f"{GC_PINNED_CAP / (1 << 30):.1f}GB (free host RAM split across local ranks), "
+                "so further offload buffers use pageable memory. Training continues; "
+                "set UNSLOTH_GC_PINNED_MAX_GB to change the cap."
+            )
+        return False
+    GC_PINNED_BYTES += block
+    return True
+
+
+def _flushed_cached_fits(block, used):
+    """Cap mode: flush our cached released blocks; True if `block` then fits under the cap."""
+    ours = sum(k * v for k, v in _PINNED_CACHED.items())
+    if not _empty_host_cache(): return False
+    held = _host_allocator_held_bytes()
+    if held is None or _HOST_HELD_BASELINE is None:
+        return max(0, used - ours) + block <= GC_PINNED_CAP
+    # Re-read the allocator: a released block another pinned user took is still held after the
+    # flush, so only what was really returned to the OS makes room under the cap.
+    return max(GC_PINNED_BYTES, held - _HOST_HELD_BASELINE) + block <= GC_PINNED_CAP
+
+
+def _release_pinned(nbytes):
+    """The block stays pinned in torch's host cache, so it stays charged until reused."""
+    block = _pinned_block_bytes(nbytes)
+    if block: _PINNED_CACHED[block] = _PINNED_CACHED.get(block, 0) + 1
+
+
+def _view_bytes_as(buffer, nbytes, dtype, shape):
+    """Reinterpret raw buffer bytes, never cast: the init dtype can differ from the activation's."""
+    if buffer.dtype == dtype: return buffer[:nbytes // dtype.itemsize].view(shape)
+    return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
+
+
+# float32 activations (FORCE_FLOAT32 residuals) offload as bfloat16, the same bytes as before, and are
+# cast back to float32 for the recompute. float16 overflows gemma3 residuals (~3e5) and per-row scaled
+# float16 spiked grad norms 20x on a T4 (outlier rows leave small entries subnormal). The dtype restore,
+# not the storage, is what the recompute needs. UNSLOTH_OFFLOAD_FP32=exact keeps the exact float32 bytes.
+FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
 
 
 @contextmanager
@@ -173,8 +440,9 @@ if Version(torch_version) < Version("2.4.0"):
     torch_amp_custom_fwd = torch.cuda.amp.custom_fwd
     torch_amp_custom_bwd = torch.cuda.amp.custom_bwd
 else:
-    torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = "cuda")
-    torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = "cuda")
+    _amp_device_type = DEVICE_TYPE_TORCH if DEVICE_TYPE in ("xpu", "npu") else "cuda"
+    torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = _amp_device_type)
+    torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = _amp_device_type)
 pass
 
 
@@ -584,8 +852,7 @@ def patch_unsloth_gradient_checkpointing():
     _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_offloaded_gradient_checkpoint
-    import transformers.modeling_utils
-    transformers.modeling_utils.checkpoint = unsloth_offloaded_gradient_checkpoint
+    _bind_transformers_checkpoint(unsloth_offloaded_gradient_checkpoint)
     os.environ["UNSLOTH_PATCHED"] = "1"
 pass
 
@@ -597,9 +864,34 @@ def patch_gradient_checkpointing():
     _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_gradient_checkpoint
-    import transformers.modeling_utils
-    transformers.modeling_utils.checkpoint = unsloth_gradient_checkpoint
+    _bind_transformers_checkpoint(unsloth_gradient_checkpoint)
     os.environ["UNSLOTH_PATCHED"] = "1"
+pass
+
+
+def _bind_transformers_checkpoint(shim):
+    # Remember the binding transformers had immediately before, which need not be torch's
+    # function (a caller's own wrapper) and may be another Unsloth shim when patches stack.
+    # One slot, like torch.utils.checkpoint._old_checkpoint, so the two stay in step on unpatch.
+    import transformers.modeling_utils
+    current = getattr(transformers.modeling_utils, "checkpoint", None)
+    if current is not shim:
+        transformers.modeling_utils._unsloth_old_checkpoint = current
+    transformers.modeling_utils.checkpoint = shim
+pass
+
+
+def _restore_transformers_checkpoint(shim):
+    # The patch points transformers.modeling_utils.checkpoint at the shim as well, and that is
+    # the one gradient_checkpointing_enable() wraps. Left behind, a model set up for vanilla
+    # gradient checkpointing later in the process still runs the shim, including the offloaded
+    # one that allocates pinned host buffers.
+    import transformers.modeling_utils
+    if getattr(transformers.modeling_utils, "checkpoint", None) is not shim: return
+    previous = transformers.modeling_utils.__dict__.pop("_unsloth_old_checkpoint", None)
+    transformers.modeling_utils.checkpoint = (
+        previous if previous is not None else torch.utils.checkpoint.checkpoint
+    )
 pass
 
 
@@ -609,6 +901,7 @@ def unpatch_unsloth_gradient_checkpointing():
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
         del torch.utils.checkpoint._old_checkpoint
     pass
+    _restore_transformers_checkpoint(unsloth_offloaded_gradient_checkpoint)
 pass
 
 
@@ -618,6 +911,7 @@ def unpatch_gradient_checkpointing():
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
         del torch.utils.checkpoint._old_checkpoint
     pass
+    _restore_transformers_checkpoint(unsloth_gradient_checkpoint)
 pass
 
 
@@ -644,8 +938,19 @@ def set_device_states(devices, states, *, device_type=None) -> None:
         return
     device_module = _get_device_module(device_type)
     for device, state in zip(devices, states):
-        with device_module.device(device):
-            device_module.set_rng_state(state)
+        device_module.set_rng_state(state, device)
+pass
+
+
+def _cuda_tensor_arg_devices(args):
+    """Device ids of args that are all plain CUDA tensors (transformers passes just hidden_states), else None.
+    Matches _infer_device_type + get_device_states for that case without their per-layer pytree walks."""
+    device_ids = []
+    for arg in args:
+        if (type(arg) is not torch.Tensor and type(arg) is not torch.nn.Parameter) or arg.device.type != "cuda":
+            return None
+        device_ids.append(arg.get_device())
+    return device_ids or None
 pass
 
 global CPU_BUFFERS
@@ -669,12 +974,308 @@ if DEVICE_TYPE in ("cuda", "hip"):
     torch_gpu_stream = torch.cuda.stream
 elif DEVICE_TYPE == "xpu":
     torch_gpu_stream = torch.xpu.stream
+elif DEVICE_TYPE == "npu":
+    torch_gpu_stream = torch.npu.stream
+
+
+def _compute_stream(device_index):
+    """Current compute stream; never cache it at init (callers may train under `torch.cuda.stream(s)`)."""
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.current_stream(device_index)
+    elif DEVICE_TYPE == "xpu":
+        return torch.xpu.current_stream(device_index)
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.current_stream(device_index)
+    raise RuntimeError(f"Unsloth: no compute stream for device type {DEVICE_TYPE}")
+pass
+
+
+def _new_device_event():
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.Event()
+    elif DEVICE_TYPE == "xpu":
+        return torch.xpu.Event()
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.Event()
+    raise RuntimeError(f"Unsloth: no device events for device type {DEVICE_TYPE}")
+pass
+
+
+# UNSLOTH_GC_PREFETCH=1: during checkpoint k's backward, reload k-1 into the other slot.
+# Only along a verified sequential chain; otherwise falls back to on-demand reload.
+GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
+GC_PREFETCH_STATS = {"issued": 0, "consumed": 0, "dropped": 0}
+OFFLOAD_GENERATION = 0      # bumped at the first offload of every forward
+OFFLOAD_SLOT_META = []      # per CPU_INDEX: (generation, device_index, buffer_slot, new_size, shape, store_dtype)
+PREFETCHED = {}             # device_index -> (generation, cpu_index, buffer_slot)
+LAST_BACKWARD_INDEX = {}    # "last" -> (generation, cpu_index) of the last offloaded backward, any device
+COPY_EVENTS = {}            # (device_index, buffer_slot) -> event recorded after that slot's reload
+
+
+def _reset_gc_prefetch_state():
+    PREFETCHED.clear()
+    LAST_BACKWARD_INDEX.clear()
+    del OFFLOAD_SLOT_META[:]
+pass
+
+
+def _copy_event(device_index, buffer_slot):
+    key = (device_index, buffer_slot)
+    event = COPY_EVENTS.get(key)
+    if event is None:
+        event = COPY_EVENTS[key] = _new_device_event()
+    return event
+pass
+
+
+def _prefetch_offloaded_input(cpu_index, device_index, generation, current_slot):
+    """Queue reload of `cpu_index` into its slot; any doubt returns False (on-demand reload)."""
+    if not GC_PREFETCH or not USE_DOUBLE_BUFFER or GPU_BUFFERS_B is None: return False
+    if cpu_index < 0 or cpu_index >= len(OFFLOAD_SLOT_META): return False
+    meta = OFFLOAD_SLOT_META[cpu_index]
+    if meta is None: return False
+    meta_generation, meta_device, buffer_slot, new_size, shape, store_dtype = meta
+    if meta_generation != generation or meta_device != device_index: return False
+    # The other slot only: the current one is about to be read by this recompute.
+    if buffer_slot == current_slot: return False
+    if PREFETCHED.get(device_index) == (generation, cpu_index, buffer_slot): return False
+    host_buffer = CPU_BUFFERS[cpu_index] if cpu_index < len(CPU_BUFFERS) else None
+    if host_buffer is None or not getattr(host_buffer, HOST_PINNED_ATTR, False): return False
+    gpu_staging = GPU_BUFFERS_B[device_index] if buffer_slot == 1 else GPU_BUFFERS[device_index]
+    if gpu_staging.numel() * gpu_staging.element_size() < new_size: return False
+    if host_buffer.numel() * host_buffer.element_size() < new_size: return False
+    PREFETCHED.pop(device_index, None)
+    try:
+        buffer = _view_bytes_as(gpu_staging, new_size, store_dtype, shape)
+        x = _view_bytes_as(host_buffer, new_size, store_dtype, shape)
+        EXTRA_STREAM = EXTRA_STREAMS[device_index]
+        event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
+        EXTRA_STREAM.wait_event(event_buffer[device_index])
+        with torch_gpu_stream(EXTRA_STREAM):
+            buffer.copy_(x, non_blocking = True)
+            _copy_event(device_index, buffer_slot).record(EXTRA_STREAM)
+    except RuntimeError:
+        GC_PREFETCH_STATS["dropped"] += 1
+        return False
+    PREFETCHED[device_index] = (generation, cpu_index, buffer_slot)
+    GC_PREFETCH_STATS["issued"] += 1
+    return True
+pass
+
+
+def _take_prefetched(device_index, generation, cpu_index, buffer_slot):
+    """Consume a matching prefetch once; a stale or mismatched one is dropped."""
+    entry = PREFETCHED.pop(device_index, None)
+    if entry is None: return False
+    if entry == (generation, cpu_index, buffer_slot):
+        GC_PREFETCH_STATS["consumed"] += 1
+        return True
+    GC_PREFETCH_STATS["dropped"] += 1
+    return False
+pass
+
+class _PerDeviceSlots(list):
+    """One slot per visible device, created on first access to that device.
+
+    Eager allocation on every GPU made each torchrun rank open a context on every card.
+    Iteration yields None for untouched devices and never allocates.
+    """
+    def __init__(self, n, factory):
+        super().__init__([None] * n)
+        self._factory = factory
+
+    def __getitem__(self, index):
+        value = list.__getitem__(self, index)
+        if value is None and isinstance(index, int):
+            value = self._factory(index)
+            list.__setitem__(self, index, value)
+        return value
+pass
+
+
+def _allocated_slots(slots):
+    """Slots already created, without creating the rest."""
+    if slots is None: return []
+    return [x for x in slots if x is not None]
+pass
+
+
+def _free_gpu_buffers_b():
+    """Release buffer B on every device that has one and turn double buffering off."""
+    global GPU_BUFFERS_B
+    global USE_DOUBLE_BUFFER
+    for buffer in _allocated_slots(GPU_BUFFERS_B):
+        if hasattr(buffer, "resize_"): buffer.resize_(0)
+    GPU_BUFFERS_B = None
+    USE_DOUBLE_BUFFER = False
+pass
+
+
+def _new_gpu_buffer(device_index):
+    with _no_inference_mode():
+        return torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = GPU_BUFFER_DTYPE, device = f"{DEVICE_TYPE_TORCH}:{device_index}")
+pass
+
+
+def _new_extra_stream(device_index):
+    # A bare Stream() lands on the current device, so create each card's side stream on that card
+    if DEVICE_TYPE == "npu":
+        return torch.npu.Stream(device = device_index)
+    elif DEVICE_TYPE_TORCH == "cuda":
+        return torch.cuda.Stream(device = torch.device(f"cuda:{device_index}"))
+    return torch.xpu.Stream(device = torch.device(f"xpu:{device_index}"))
+pass
+
+
+def _main_stream(device_index):
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.default_stream(torch.device(f"cuda:{device_index}"))
+    elif DEVICE_TYPE == "xpu":
+        return torch.xpu.current_stream(torch.device(f"xpu:{device_index}"))
+    return torch.npu.default_stream(device_index)
+pass
+
+
+def _ensure_device_buffers(device_index):
+    """Create this device's staging buffer(s) and side stream before the offload uses them."""
+    try:
+        GPU_BUFFERS[device_index]
+    except Exception as e:
+        if "out of memory" not in str(e).lower():
+            print("="*10 + "\n")
+            print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
+            print("Please set `import os; os.environ['PYTORCH_CUDA_ALLOC_CONF'] = '';`\n")
+            print("Then re-run Unsloth from the start.")
+            print("="*10 + "\n")
+        raise
+    EXTRA_STREAMS[device_index]
+    if GPU_BUFFERS_B is not None:
+        try:
+            GPU_BUFFERS_B[device_index]
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            _free_gpu_buffers_b()
+pass
+
+
+def _visible_device_count():
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.device_count()
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.device_count()
+    return torch.xpu.device_count()
+pass
+
+
+def _double_buffer_event_ctor():
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.Event
+    elif DEVICE_TYPE == "xpu":
+        return torch.xpu.Event
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.Event
+    raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
+pass
+
 
 CPU_BUFFERS = []
 CPU_INDEX = None
+GPU_BUFFER_DTYPE = None
+
+# CPU_BUFFERS slots are leased per checkpoint until its backward, so 1F1B schedules (two forwards
+# then two backwards) never reuse a pending slot. Lowest free slot first keeps 1F1B-free runs unchanged.
+_FREE_CPU_SLOTS = []    # min-heap of returned slot indices
+_CPU_SLOT_TOP = 0       # slots [0, _CPU_SLOT_TOP) have been handed out at least once
+_CPU_SLOT_EPOCH = 0     # bumped by every pool reset; a lease from an older epoch is ignored
+# A slot released on one device's side stream and leased on another waits on the release event.
+_SLOT_FENCES = {}       # slot index -> (device index, event recorded at release)
+# A retain_graph=True graph re-reads its slot on the next backward: hold it until the graph is freed.
+_SLOT_HOLDERS = {}      # slot index -> weakref to the autograd ctx whose backward returned it
+_RETAINED_SLOTS = {}    # slot index -> weakref to a ctx whose graph is still retained
+
+
+def _reset_cpu_slots():
+    global _CPU_SLOT_TOP, _CPU_SLOT_EPOCH
+    del _FREE_CPU_SLOTS[:]
+    _CPU_SLOT_TOP = 0
+    _CPU_SLOT_EPOCH += 1
+    _SLOT_FENCES.clear()
+    _SLOT_HOLDERS.clear()
+    _RETAINED_SLOTS.clear()
+pass
+
+
+def _graph_retained(ctx_ref):
+    ctx = ctx_ref()
+    if ctx is None: return False
+    try:
+        ctx._raw_saved_tensors
+    except (RuntimeError, AttributeError):
+        return False
+    return True
+pass
+
+
+def _reclaim_retained_slots():
+    for index, ctx_ref in list(_RETAINED_SLOTS.items()):
+        if not _graph_retained(ctx_ref):
+            del _RETAINED_SLOTS[index]
+            heapq.heappush(_FREE_CPU_SLOTS, index)
+pass
+
+
+class _CpuSlotLease:
+    """One CPU_BUFFERS slot held by an offloaded checkpoint until its backward has read it."""
+    __slots__ = ("index", "epoch", "device", "stream")
+
+    def __init__(self, device = None, stream = None):
+        global _CPU_SLOT_TOP
+        if _RETAINED_SLOTS: _reclaim_retained_slots()
+        self.index = None
+        while _FREE_CPU_SLOTS:
+            index = heapq.heappop(_FREE_CPU_SLOTS)
+            holder = _SLOT_HOLDERS.pop(index, None)
+            if holder is not None and _graph_retained(holder):
+                _RETAINED_SLOTS[index] = holder
+                continue
+            self.index = index
+            break
+        if self.index is None:
+            self.index = _CPU_SLOT_TOP
+            _CPU_SLOT_TOP += 1
+        self.epoch = _CPU_SLOT_EPOCH
+        self.device, self.stream = device, stream
+        fence = _SLOT_FENCES.pop(self.index, None)
+        if fence is not None and fence[0] != device and stream is not None:
+            stream.wait_event(fence[1])
+
+    def release(self, ctx = None):
+        index, self.index = self.index, None
+        if index is not None and self.epoch == _CPU_SLOT_EPOCH:
+            if self.stream is not None:
+                _SLOT_FENCES[index] = (self.device, self.stream.record_event())
+            if ctx is not None:
+                try:
+                    _SLOT_HOLDERS[index] = weakref.ref(ctx)
+                except TypeError:
+                    pass
+            heapq.heappush(_FREE_CPU_SLOTS, index)
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass  # interpreter shutdown
+pass
 
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
+    global FP32_OFFLOAD_EXACT
+    FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
+    global GC_PREFETCH
+    GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
+    _reset_gc_prefetch_state()
     global CPU_BUFFERS
     global CPU_INDEX
     global GPU_BUFFERS
@@ -691,13 +1292,18 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global BUFFER_EVENTS_A
     global BUFFER_EVENTS_B
     global NEXT_BUFFER_SLOT
+    _release_pool_pinned()
+    _reset_pinned_cap()
     CPU_BUFFERS = []
     CPU_INDEX = 0
+    _reset_cpu_slots()
 
     if dtype is None:
         if DEVICE_TYPE == "cuda":
-            major_version, minor_version = torch.cuda.get_device_capability()
-            SUPPORTS_BFLOAT16 = (major_version >= 8)
+            # Every visible device, as the HIP probe does: a device_map can put layers
+            # on a pre-Ampere card next to an Ampere device 0.
+            from .device_type import _visible_cuda_capabilities
+            SUPPORTS_BFLOAT16 = all(major >= 8 for major, _ in _visible_cuda_capabilities())
         elif DEVICE_TYPE == "hip":
             # Ask rather than assume: RDNA 1/2 (gfx101x, gfx103x) have no native bf16,
             # so Triton picks a dot intrinsic LLVM cannot lower and the process dies
@@ -705,7 +1311,15 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             # still answers True here, so this is inert until unsloth patches the probe.
             SUPPORTS_BFLOAT16 = torch.cuda.is_bf16_supported()
         elif DEVICE_TYPE == "xpu":
-            SUPPORTS_BFLOAT16 = True
+            # One buffer dtype for the pool below, which covers every visible XPU.
+            from .device_type import _xpu_bf16_supported
+            try:
+                _xpu_indices = list(range(torch.xpu.device_count()))
+            except Exception:
+                _xpu_indices = None
+            SUPPORTS_BFLOAT16 = _xpu_bf16_supported(_xpu_indices or None)
+        elif DEVICE_TYPE == "npu":
+            SUPPORTS_BFLOAT16 = torch.npu.is_bf16_supported()
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
@@ -721,58 +1335,32 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             CPU_BUFFERS.append(x)
     pass
 
-    # Allocate one buffer per GPU
-    n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
+    global GPU_BUFFER_DTYPE
+    GPU_BUFFER_DTYPE = dtype
+    n_gpus = _visible_device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
-    try:
-        with _no_inference_mode():
-            GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-        # Double buffering: try to allocate buffer B (auto-off on unified memory, or via env var)
-        if _double_buffer_disabled():
-            GPU_BUFFERS_B = None
-            USE_DOUBLE_BUFFER = False
-            BUFFER_EVENTS_A = None
-            BUFFER_EVENTS_B = None
-        else:
-            try:
-                with _no_inference_mode():
-                    GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-                USE_DOUBLE_BUFFER = False # enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
-                # Per-buffer events prevent double-buffering races; each tracks
-                # when compute on that buffer finishes
-                if DEVICE_TYPE in ("cuda", "hip"):
-                    event_ctor = torch.cuda.Event
-                elif DEVICE_TYPE == "xpu":
-                    event_ctor = torch.xpu.Event
-                else:
-                    raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
-                BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
-                BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
-            except RuntimeError as e:
-                if "out of memory" not in str(e).lower():
-                    raise
-                GPU_BUFFERS_B = None
-                USE_DOUBLE_BUFFER = False
-                BUFFER_EVENTS_A = None
-                BUFFER_EVENTS_B = None
-    except Exception as e:
-        print("="*10 + "\n")
-        print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
-        print("Please set `import os; os.environ['PYTORCH_CUDA_ALLOC_CONF'] = '';`\n")
-        print("Then re-run Unsloth from the start.")
-        print("="*10 + "\n")
-        raise
+    GPU_BUFFERS = _PerDeviceSlots(n_gpus, _new_gpu_buffer)
+    # Double buffering: auto-off on unified memory, or via env var
+    if _double_buffer_disabled():
+        GPU_BUFFERS_B = None
+        USE_DOUBLE_BUFFER = False
+        BUFFER_EVENTS_A = None
+        BUFFER_EVENTS_B = None
+    else:
+        GPU_BUFFERS_B = _PerDeviceSlots(n_gpus, _new_gpu_buffer)
+        USE_DOUBLE_BUFFER = False # enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
+        # Per-buffer events prevent double-buffering races; each tracks
+        # when compute on that buffer finishes. Bound to a device on first record.
+        event_ctor = _double_buffer_event_ctor()
+        BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
+        BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
 
     BACKWARD_PASS = True
-    EXTRA_STREAMS = tuple([torch.cuda.Stream() if DEVICE_TYPE_TORCH == "cuda" else torch.xpu.Stream() for i in range(n_gpus)])
-    if DEVICE_TYPE in ("cuda", "hip"):
-        MAIN_STREAMS  = tuple([torch.cuda.default_stream(torch.device(f"cuda:{i}")) for i in range(n_gpus)])
-    elif DEVICE_TYPE == "xpu":
-        MAIN_STREAMS  = tuple([torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)])
+    EXTRA_STREAMS = _PerDeviceSlots(n_gpus, _new_extra_stream)
+    MAIN_STREAMS  = _PerDeviceSlots(n_gpus, _main_stream)
 
-    # Minimum size to enable Unsloth GC is 2MB -> 32 layers = 64MB
-    n_bytes = torch.finfo(dtype).bits // 8
-    MINIMUM_SIZE = 2 * 1024 * 1024 // n_bytes
+    # Minimum size to enable Unsloth GC is 2MB (in bytes) -> 32 layers = 64MB
+    MINIMUM_SIZE = 2 * 1024 * 1024
     USE_UNSLOTH_GC = True
 
     # Don't offload the last layer - uses more VRAM and is slower
@@ -791,7 +1379,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
         # Handle autocast enabled for cpu AND gpu.
-        ctx.device_type = _infer_device_type(*args)
+        cuda_devices = _cuda_tensor_arg_devices(args)
+        ctx.device_type = "cuda" if cuda_devices is not None else _infer_device_type(*args)
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
             ctx.device_type
         )
@@ -803,7 +1392,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             device_module = _get_device_module(ctx.device_type)
             if getattr(device_module, "_initialized", False):
                 ctx.had_device_in_fwd = True
-                ctx.fwd_devices, ctx.fwd_device_states = get_device_states(*args)
+                if cuda_devices is not None:
+                    ctx.fwd_devices = cuda_devices
+                    ctx.fwd_device_states = [torch.cuda.get_rng_state(device) for device in cuda_devices]
+                else:
+                    ctx.fwd_devices, ctx.fwd_device_states = get_device_states(*args)
 
         # Save non-tensor inputs in ctx, keep a placeholder None for tensors
         # to be filled out during the backward.
@@ -843,7 +1436,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global CURRENT_GC_INDEX
                     CURRENT_GC_INDEX += 1
 
-                    new_size = arg.numel()
+                    # The cutoff counts stored bytes, so bf16-stored float32 offloads exactly where it always did.
+                    store_dtype = torch.bfloat16 if (arg.dtype == torch.float32 and not FP32_OFFLOAD_EXACT) else arg.dtype
+                    new_size = arg.numel() * store_dtype.itemsize
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
@@ -858,20 +1453,26 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         global MAIN_STREAMS
                         device = arg.device
                         device_index = device.index
+                        _ensure_device_buffers(device_index)
                         GPU_BUFFER   = GPU_BUFFERS  [device_index]
-                        MAIN_STREAM  = MAIN_STREAMS [device_index]
+                        MAIN_STREAM  = _compute_stream(device_index)
                         EXTRA_STREAM = EXTRA_STREAMS[device_index]
 
-                        # Handle interrupted training runs
+                        # New graph. Host slots are not rewound: pending graphs keep theirs.
                         if BACKWARD_PASS:
                             BACKWARD_PASS = False
-                            CPU_INDEX = 0
+                            # A new graph: earlier prefetch descriptors and slot records are stale.
+                            global OFFLOAD_GENERATION
+                            OFFLOAD_GENERATION += 1
+                            _reset_gc_prefetch_state()
                             if not FIRST_PASS and not USE_DOUBLE_BUFFER and GPU_BUFFERS_B is not None:
                                 try:
                                     if DEVICE_TYPE in ("cuda", "hip"):
                                         free_mem, _ = torch.cuda.mem_get_info(device_index)
                                     elif DEVICE_TYPE == "xpu":
                                         free_mem, _ = torch.xpu.mem_get_info(device_index)
+                                    elif DEVICE_TYPE == "npu":
+                                        free_mem, _ = torch.npu.mem_get_info(device_index)
                                     else:
                                         free_mem = 0
                                 except Exception as e:
@@ -880,63 +1481,62 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     USE_DOUBLE_BUFFER = True
                                     print(f"Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
                                 else:
-                                    for j in range(len(GPU_BUFFERS_B)):
-                                        GPU_BUFFERS_B[j].resize_(0)
-                                    GPU_BUFFERS_B = None
+                                    _free_gpu_buffers_b()
                         pass
 
+                        lease = _CpuSlotLease(device_index, EXTRA_STREAM)
+                        CPU_INDEX = lease.index
                         # Extend buffer size
-                        if CPU_INDEX >= len(CPU_BUFFERS):
+                        while CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
-                                x = _new_host_buffer(new_size, arg.dtype)
+                                x = _new_host_buffer(-(-new_size // GPU_BUFFER.element_size()), GPU_BUFFER.dtype)
                             CPU_BUFFERS.append(x)
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
                         shape = arg.shape
-                        if new_size > x.numel():
+                        # Elements of each buffer's own dtype needed for new_size bytes, rounded up.
+                        host_numel = -(-new_size // x.element_size())
+                        if host_numel > x.numel():
                             with _no_inference_mode():
-                                x = _grow_host_buffer(x, new_size)
+                                x = _grow_host_buffer(x, host_numel)
                             # Backward reads this slot by index, so store the replacement back.
                             CPU_BUFFERS[CPU_INDEX] = x
-                        if new_size > GPU_BUFFER.numel():
+                        gpu_numel = -(-new_size // GPU_BUFFER.element_size())
+                        if gpu_numel > GPU_BUFFER.numel():
                             try:
-                                GPU_BUFFER.resize_(new_size)
+                                GPU_BUFFER.resize_(gpu_numel)
                             except RuntimeError as e:
                                 if "out of memory" not in str(e).lower():
                                     raise
                                 # Clear buffer B and resize the single buffer
                                 if GPU_BUFFERS_B is not None:
-                                    USE_DOUBLE_BUFFER = False
-                                    for j in range(len(GPU_BUFFERS_B)):
-                                        GPU_BUFFERS_B[j].resize_(0)
-                                    GPU_BUFFERS_B = None
+                                    _free_gpu_buffers_b()
                                     print("Unsloth: Disabled double buffering due to insufficient VRAM.")
-                                    GPU_BUFFER.resize_(new_size)
+                                    GPU_BUFFER.resize_(gpu_numel)
                                 else:
                                     raise
                         # Resize buffer B when double buffering; disable + free B on OOM
                         if USE_DOUBLE_BUFFER:
                             GPU_BUFFER_B = GPU_BUFFERS_B[device_index]
-                            if new_size > GPU_BUFFER_B.numel():
+                            gpu_b_numel = -(-new_size // GPU_BUFFER_B.element_size())
+                            if gpu_b_numel > GPU_BUFFER_B.numel():
                                 try:
-                                    GPU_BUFFER_B.resize_(new_size)
+                                    GPU_BUFFER_B.resize_(gpu_b_numel)
                                 except RuntimeError as e:
                                     if "out of memory" not in str(e).lower():
                                         raise
-                                    USE_DOUBLE_BUFFER = False
-                                    for j in range(len(GPU_BUFFERS_B)):
-                                        GPU_BUFFERS_B[j].resize_(0)
-                                    GPU_BUFFERS_B = None
+                                    _free_gpu_buffers_b()
                                     print("Unsloth: Disabled double buffering due to insufficient VRAM.")
 
                         # Read the cached flag off the slot itself, before the view is
                         # taken: a view is a fresh object and does not carry the attribute.
                         host_is_pinned = getattr(x, HOST_PINNED_ATTR, False)
-                        x = x[:new_size].view(shape)
-
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
+                        # Casting to the buffer dtype on reload made the recompute see it (LLVM abort on ROCm gfx10),
+                        # so the bytes are viewed as store_dtype here and cast back to arg.dtype in backward.
+                        x = _view_bytes_as(x, new_size, store_dtype, shape)
                         # x is a normal (non-inference) buffer, so copy_ is safe (unsloth#3828).
                         with torch_gpu_stream(EXTRA_STREAM):
                             # Only a pinned destination gives a genuinely async copy.
@@ -946,6 +1546,14 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         buffer_slot = NEXT_BUFFER_SLOT[device_index]
                         NEXT_BUFFER_SLOT[device_index] ^= 1
                         ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM, buffer_slot,)
+                        ctx._saved_dtype = arg.dtype
+                        ctx._store_dtype = store_dtype
+                        # Prefetch only follows records made by a top level forward of this graph.
+                        ctx._offload_generation = None if in_gradient_checkpoint_recompute() else OFFLOAD_GENERATION
+                        while len(OFFLOAD_SLOT_META) <= CPU_INDEX: OFFLOAD_SLOT_META.append(None)
+                        OFFLOAD_SLOT_META[CPU_INDEX] = None if ctx._offload_generation is None else \
+                            (OFFLOAD_GENERATION, device_index, buffer_slot, new_size, shape, store_dtype)
+                        ctx._cpu_slot = lease
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -1002,27 +1610,47 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             global BUFFER_EVENTS_A
             global BUFFER_EVENTS_B
             # Select buffer from per-device buffer_slot
-            if USE_DOUBLE_BUFFER and buffer_slot == 1:
-                buffer = GPU_BUFFERS_B[device_index][:new_size].view(shape)
-            else:
-                buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
-
+            saved_dtype = ctx._saved_dtype
+            store_dtype = getattr(ctx, "_store_dtype", saved_dtype)
+            gpu_staging = GPU_BUFFERS_B[device_index] if (USE_DOUBLE_BUFFER and buffer_slot == 1) else GPU_BUFFERS[device_index]
+            buffer = _view_bytes_as(gpu_staging, new_size, store_dtype, shape)
             host_buffer = CPU_BUFFERS[CPU_INDEX]
             host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
-            x = host_buffer[:new_size].view(shape)
+            x = _view_bytes_as(host_buffer, new_size, store_dtype, shape)
 
-            # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
-            if USE_DOUBLE_BUFFER:
-                # Wait for the last compute on THIS buffer to finish
-                event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
-                EXTRA_STREAM.wait_event(event_buffer[device_index])
-            else:
-                # Single buffer mode: wait for MAIN_STREAM
-                EXTRA_STREAM.wait_stream(MAIN_STREAM)
+            MAIN_STREAM = _compute_stream(device_index)
+            generation = getattr(ctx, "_offload_generation", None)
+            use_prefetch = GC_PREFETCH and USE_DOUBLE_BUFFER and generation is not None \
+                and not in_gradient_checkpoint_recompute()
+            prefetched = use_prefetch and _take_prefetched(device_index, generation, CPU_INDEX, buffer_slot)
+            if not prefetched:
+                # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
+                if USE_DOUBLE_BUFFER:
+                    # Wait for the last compute on THIS buffer to finish
+                    event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
+                    EXTRA_STREAM.wait_event(event_buffer[device_index])
+                else:
+                    # Single buffer mode: wait for the compute stream
+                    EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
-            # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
-            with torch_gpu_stream(EXTRA_STREAM):
-                buffer.copy_(x, non_blocking = host_is_pinned)
+                # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
+                with torch_gpu_stream(EXTRA_STREAM):
+                    buffer.copy_(x, non_blocking = host_is_pinned)
+                    if use_prefetch: _copy_event(device_index, buffer_slot).record(EXTRA_STREAM)
+            pass
+            if use_prefetch:
+                # Sequential chain only: this backward follows CPU_INDEX + 1, or is the top of the graph.
+                last = LAST_BACKWARD_INDEX.get("last")
+                in_chain = (last == (generation, CPU_INDEX + 1)) or \
+                    ((last is None or last[0] != generation) and CPU_INDEX == len(OFFLOAD_SLOT_META) - 1)
+                LAST_BACKWARD_INDEX["last"] = (generation, CPU_INDEX)
+                if in_chain:
+                    _prefetch_offloaded_input(CPU_INDEX - 1, device_index, generation, buffer_slot)
+            pass
+            # Reload is queued on EXTRA_STREAM, as is the next offload into it: safe to reuse now
+            # unless the graph is retained (checked at lease time).
+            lease = getattr(ctx, "_cpu_slot", None)
+            if lease is not None: lease.release(ctx)
         else:
             # No GPU buffer seen
             if len(tensor_indices) != 0:
@@ -1071,8 +1699,12 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # Wait for GPU buffer to finish
             if CPU_INDEX is not None:
-                MAIN_STREAM.wait_stream(EXTRA_STREAM)
-                x = buffer.detach()
+                if use_prefetch:
+                    # Only this slot's copy: a prefetch queued behind it must not stall the recompute.
+                    MAIN_STREAM.wait_event(_copy_event(device_index, buffer_slot))
+                else:
+                    MAIN_STREAM.wait_stream(EXTRA_STREAM)
+                x = buffer.detach() if store_dtype == saved_dtype else buffer.to(saved_dtype)
                 x.requires_grad_(True)
                 detached_inputs[0] = x
             pass
@@ -1121,6 +1753,274 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
         return (None, None) + grads
     pass
+pass
+
+
+def _is_compiling():
+    try: return torch.compiler.is_compiling()
+    except AttributeError: return False
+pass
+
+
+def _release_keepalive(entry, stream = None):
+    """Drop an inflight D2H source once its packing stream is ordered after the copy."""
+    copied, owner = entry[1], entry[2]
+    if copied is not None: (owner or stream).wait_event(copied)
+    entry[0] = entry[1] = entry[2] = None
+pass
+
+
+class _OffloadedActivation:
+    """One saved activation: a host copy (`copied` marks the D2H), or still a device tensor."""
+    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "ready_stream", "index", "pinned_bytes",
+                 "unpacked", "group", "keepalive", "__weakref__")
+
+    def __init__(self, device, index):
+        self.device        = device
+        self.host          = None
+        self.copied        = None
+        self.device_tensor = None
+        self.ready         = None  # set only on a prefetched device_tensor
+        self.ready_stream  = None  # the stream that allocated it
+        self.index         = index
+        self.pinned_bytes  = 0
+        self.unpacked      = False
+        self.group         = 0     # which hooks() entry (checkpoint call) packed it
+        self.keepalive     = None  # its inflight entry: [source, copied, packing stream]
+
+    def __del__(self):
+        try:
+            # Graph dropped before the keepalive was retired: release the source now, after its copy.
+            if self.keepalive is not None: _release_keepalive(self.keepalive)
+            if self.pinned_bytes: _release_pinned(self.pinned_bytes)
+            # Prefetch dropped unread: order the allocating stream after the reload still writing it.
+            if self.ready is not None: self.ready_stream.wait_event(self.ready)
+        except Exception:
+            pass  # interpreter shutdown
+pass
+
+
+class NonReentrantActivationOffloader:
+    """
+    All Unsloth Zoo code licensed under LGPLv3
+    saved_tensors_hooks for torch's non-reentrant checkpoint: the checkpoint inputs that
+    need grad go to pinned host memory on a side stream, so the D2H overlaps the next
+    layers instead of queueing on the compute stream.
+
+    UNSLOTH_GC_OFFLOAD_BACKEND=unsloth_stream (from the datta0/unsloth-zoo FSDP2 prototype)
+    also keeps the last UNSLOTH_GC_STREAM_KEEP_LAST (default 1) activations on the device,
+    whose backward comes first, and reloads layer i-1 on a second side stream while layer i
+    recomputes. Costs up to one more layer's checkpoint inputs of VRAM each way.
+    """
+    def __init__(self, stream_mode = None):
+        if stream_mode is None:
+            stream_mode = os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "").strip().lower() == "unsloth_stream"
+        self.stream_mode = bool(stream_mode)
+        try:
+            self.keep_last = max(0, int(os.environ.get("UNSLOTH_GC_STREAM_KEEP_LAST", "1")))
+        except ValueError:
+            self.keep_last = 1
+        # 0: copy on the compute stream (single GPU default). N > 0: side stream, at most N sources
+        # kept alive per device, released after the compute stream waits on the copy. No
+        # record_stream on the side stream: its block reuse depends on how far the CPU runs ahead
+        # (distributed default 1).
+        default_inflight = 1 if is_distributed() else 0
+        try:
+            self.max_inflight = max(0, int(os.environ.get("UNSLOTH_GC_MAX_INFLIGHT_COPIES", default_inflight)))
+        except ValueError:
+            self.max_inflight = default_inflight
+        self.inflight = {}
+        self.d2h_streams = {}
+        self.h2d_streams = {}
+        # Weak, so a graph dropped without backward frees its activations. Forward order.
+        self.order = []
+        self.backward_started = False
+        self.group = 0
+        self.stats = {"pinned": 0, "pageable": 0, "kept": 0, "prefetched": 0, "prefetch_hits": 0}
+    pass
+
+    def _stream(self, cache, device_index):
+        stream = cache.get(device_index)
+        if stream is None:
+            stream = cache[device_index] = _new_extra_stream(device_index)
+        return stream
+    pass
+
+    def _to_host(self, record, x):
+        nbytes = x.numel() * x.element_size()
+        if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled() and _reserve_pinned(nbytes):
+            device_index = x.device.index
+            if self.max_inflight == 0:
+                try:
+                    host = x.to("cpu", non_blocking = True)
+                except RuntimeError as e:
+                    _release_pinned(nbytes)
+                    if not _is_host_alloc_oom(e): raise
+                    _warn_pinned_unavailable(e)
+                else:
+                    record.host, record.pinned_bytes = host, nbytes
+                    self.stats["pinned"] += 1
+                    return
+                record.host = x.to("cpu")
+                self.stats["pageable"] += 1
+                return
+            inflight = self.inflight.get(device_index)
+            if inflight is None:
+                inflight = self.inflight[device_index] = collections.deque()
+            compute = torch.cuda.current_stream(device_index)
+            self._retire(inflight, compute, self.max_inflight - 1)
+            side = self._stream(self.d2h_streams, device_index)
+            side.wait_stream(compute)
+            try:
+                with torch.cuda.stream(side):
+                    # A non_blocking D2H allocates its destination pinned.
+                    host = x.to("cpu", non_blocking = True)
+                    copied = torch.cuda.Event()
+                    copied.record(side)
+            except RuntimeError as e:
+                _release_pinned(nbytes)
+                if not _is_host_alloc_oom(e): raise
+                _warn_pinned_unavailable(e)
+            else:
+                # Keepalive: x's block must outlive the copy, and is released after `compute` waits on
+                # it. Allocated on another stream, that stream must also wait: record_stream is a
+                # no-op on the allocation stream, so the usual case pays nothing.
+                x.record_stream(compute)
+                entry = [x, copied, compute]
+                inflight.append(entry)
+                record.host, record.copied, record.pinned_bytes, record.keepalive = host, copied, nbytes, entry
+                self.stats["pinned"] += 1
+                return
+        record.host = x.to("cpu")
+        self.stats["pageable"] += 1
+    pass
+
+    @staticmethod
+    def _retire(inflight, compute, keep):
+        while inflight and (len(inflight) > keep or inflight[0][1] is None or inflight[0][1].query()):
+            _release_keepalive(inflight.popleft(), compute)
+    pass
+
+    def _drain(self):
+        """Release every keepalive (backward reads the host copies after waiting on them)."""
+        for device_index, inflight in self.inflight.items():
+            if inflight: self._retire(inflight, torch.cuda.current_stream(device_index), 0)
+    pass
+
+    def pack(self, x):
+        if not x.requires_grad or x.device.type == "cpu":
+            return None, x
+        if DEVICE_TYPE not in ("cuda", "hip") or x.device.type != "cuda" or _is_compiling():
+            return x.device, x.to("cpu", non_blocking = True)
+        if self.backward_started:
+            self.backward_started = False
+            self.order = []
+        record = _OffloadedActivation(x.device, len(self.order))
+        record.group = self.group
+        self.order.append(weakref.ref(record))
+        x = x.detach()
+        if self.stream_mode and self.keep_last > 0:
+            record.device_tensor = x
+            self.stats["kept"] += 1
+            if record.index >= self.keep_last:
+                older = self.order[record.index - self.keep_last]()
+                if older is not None and older.host is None and older.device_tensor is not None:
+                    self._to_host(older, older.device_tensor)
+                    older.device_tensor = None
+                    self.stats["kept"] -= 1
+        else:
+            self._to_host(record, x)
+        return record
+    pass
+
+    def _prefetch(self, index):
+        if index < 0 or index >= len(self.order): return
+        record = self.order[index]()
+        # A checkpoint with several saved inputs unpacks them in order, so index - 1 can be an
+        # input of the same checkpoint that was already handed out: reloading it duplicates it.
+        if record is None or record.unpacked or record.host is None or record.device_tensor is not None: return
+        device_index = record.device.index
+        compute = torch.cuda.current_stream(device_index)
+        side = self._stream(self.h2d_streams, device_index)
+        # Allocated on the compute stream, which consumes it; the side stream waits for
+        # that stream's earlier users of the block and for this record's D2H.
+        try:
+            x = torch.empty_like(record.host, device = record.device)
+        except torch.cuda.OutOfMemoryError:
+            return  # unpack reloads it in place instead
+        side.wait_stream(compute)
+        if record.copied is not None: side.wait_event(record.copied)
+        with torch.cuda.stream(side):
+            x.copy_(record.host, non_blocking = True)
+            ready = torch.cuda.Event()
+            ready.record(side)
+        # No record_stream: compute waits on `ready` in unpack, or in __del__ if never read.
+        record.device_tensor, record.ready, record.ready_stream = x, ready, compute
+        self.stats["prefetched"] += 1
+    pass
+
+    def _prefetch_target(self, index, group):
+        """The newest record before `index` still to be reloaded. A checkpoint with several saved
+        inputs unpacks them back to back: skipping its own handed out inputs and the ones already
+        prefetched makes each unpack queue one input of the previous checkpoint, so all of them
+        are reloaded early, not only the one at index - 1. Single input checkpoints get index - 1.
+        Never past the previous checkpoint, so at most its inputs wait on the device, and only
+        index - 1 when the hooks were not entered per checkpoint (one group for every record)."""
+        start = index - 1
+        index = start
+        while index >= 0:
+            record = self.order[index]() if index < len(self.order) else None
+            if record is not None and (record.group < group - 1 or (
+                record.group == group and not record.unpacked and index != start
+            )):
+                return -1
+            if record is None or not (record.unpacked or record.device_tensor is not None): break
+            index -= 1
+        return index
+    pass
+
+    def unpack(self, packed):
+        if type(packed) is tuple:
+            device, x = packed
+            return x if device is None else x.to(device, non_blocking = True)
+        record = packed
+        if not self.backward_started: self._drain()
+        self.backward_started = True
+        record.unpacked = True
+        device_index = record.device.index
+        compute = torch.cuda.current_stream(device_index)
+        if record.device_tensor is not None:
+            x = record.device_tensor
+            if record.ready is not None:
+                compute.wait_event(record.ready)
+                # Consumed on another stream than it was allocated on: its free must wait for this one.
+                if compute != record.ready_stream: x.record_stream(compute)
+                # One shot: a retain_graph rerun reloads from the host copy.
+                record.device_tensor, record.ready, record.ready_stream = None, None, None
+                self.stats["prefetch_hits"] += 1
+        else:
+            if record.copied is not None: compute.wait_event(record.copied)
+            x = record.host.to(record.device, non_blocking = True)
+        if self.stream_mode: self._prefetch(self._prefetch_target(record.index, record.group))
+        return x
+    pass
+
+    def hooks(self):
+        # One call per checkpoint (vision.py wraps each checkpoint call): groups its saved inputs.
+        self.group += 1
+        return torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack)
+    pass
+pass
+
+
+NONREENTRANT_OFFLOADER = None
+
+def non_reentrant_offload_hooks():
+    """saved_tensors_hooks context that offloads non-reentrant checkpoint inputs to the host."""
+    global NONREENTRANT_OFFLOADER
+    if NONREENTRANT_OFFLOADER is None:
+        NONREENTRANT_OFFLOADER = NonReentrantActivationOffloader()
+    return NONREENTRANT_OFFLOADER.hooks()
 pass
 
 
@@ -1239,24 +2139,28 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         global BUFFER_EVENTS_A
         global BUFFER_EVENTS_B
         global NEXT_BUFFER_SLOT
+        _release_pool_pinned()
         for i in range(len(CPU_BUFFERS)):
             if hasattr(CPU_BUFFERS[i], "resize_"): CPU_BUFFERS[i].resize_(0)
             if type(CPU_BUFFERS) is list: CPU_BUFFERS[i] = None
-        for i in range(len(GPU_BUFFERS)):
-            if hasattr(GPU_BUFFERS[i], "resize_"): GPU_BUFFERS[i].resize_(0)
-            if type(GPU_BUFFERS) is list: GPU_BUFFERS[i] = None
+        # Only devices that were used: indexing an untouched slot would allocate it.
+        for buffer in _allocated_slots(GPU_BUFFERS):
+            if hasattr(buffer, "resize_"): buffer.resize_(0)
+        # resize_(0) keeps the storage: drop the loop reference so empty_cache() below can release it.
+        buffer = None
         if GPU_BUFFERS_B is not None:
-            for i in range(len(GPU_BUFFERS_B)):
-                if hasattr(GPU_BUFFERS_B[i], "resize_"): GPU_BUFFERS_B[i].resize_(0)
-            GPU_BUFFERS_B = None
-            USE_DOUBLE_BUFFER = False
+            _free_gpu_buffers_b()
         CPU_BUFFERS = None
+        _reset_cpu_slots()
         GPU_BUFFERS = None
         BUFFER_EVENTS_A = None
         BUFFER_EVENTS_B = None
         NEXT_BUFFER_SLOT = None
-        torch.cuda.empty_cache()
+        # Collect first so tensors only reachable through cycles are freed before the cache is emptied.
         gc.collect()
+        if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+        elif DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
+        else: torch.cuda.empty_cache()
 
     if (torch.utils.checkpoint.checkpoint.__name__ == "unsloth_checkpoint") and \
         hasattr(torch.utils.checkpoint, "_old_checkpoint"):
@@ -1306,6 +2210,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
     if len(CPU_BUFFERS) == 0:
         return
 
+    _release_pool_pinned(INITIAL_CPU_BUFFER_COUNT)
     # Reset CPU buffers to initial size; free any added during training
     for i in range(len(CPU_BUFFERS)):
         if i < INITIAL_CPU_BUFFER_COUNT:
@@ -1325,14 +2230,16 @@ def reset_unsloth_gradient_checkpointing_buffers():
     pass
 
     # Reset GPU buffers to initial size
-    for i in range(len(GPU_BUFFERS)):
-        if GPU_BUFFERS[i] is not None and hasattr(GPU_BUFFERS[i], "resize_"):
-            GPU_BUFFERS[i].resize_(INITIAL_GPU_BUFFER_SIZE)
+    for buffer in _allocated_slots(GPU_BUFFERS):
+        if hasattr(buffer, "resize_"):
+            buffer.resize_(INITIAL_GPU_BUFFER_SIZE)
     pass
 
     # Reset state for a fresh training run
     CPU_INDEX = 0
+    _reset_cpu_slots()
     BACKWARD_PASS = True
+    _reset_gc_prefetch_state()
     LAST_GC_INDEX = 0
     FIRST_PASS = True
     CURRENT_GC_INDEX = 0
@@ -1344,36 +2251,32 @@ def reset_unsloth_gradient_checkpointing_buffers():
     # Reset double buffering if buffer B still exists, or try to re-allocate
     if _double_buffer_disabled():
         if GPU_BUFFERS_B is not None:
-            for i in range(len(GPU_BUFFERS_B)):
-                if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
-                    GPU_BUFFERS_B[i].resize_(0)
-            GPU_BUFFERS_B = None
+            _free_gpu_buffers_b()
         USE_DOUBLE_BUFFER = False
     elif GPU_BUFFERS_B is not None:
-        for i in range(len(GPU_BUFFERS_B)):
-            if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
-                GPU_BUFFERS_B[i].resize_(INITIAL_GPU_BUFFER_SIZE)
+        for buffer in _allocated_slots(GPU_BUFFERS_B):
+            if hasattr(buffer, "resize_"):
+                buffer.resize_(INITIAL_GPU_BUFFER_SIZE)
         USE_DOUBLE_BUFFER = False
     else:
         try:
+            global GPU_BUFFER_DTYPE
+            if GPU_BUFFER_DTYPE is None and _allocated_slots(GPU_BUFFERS):
+                GPU_BUFFER_DTYPE = _allocated_slots(GPU_BUFFERS)[0].dtype
             n_gpus = len(GPU_BUFFERS)
-            dtype = GPU_BUFFERS[0].dtype
-            with _no_inference_mode():
-                GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype=dtype, device=f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-            if DEVICE_TYPE in ("cuda", "hip"):
-                event_ctor = torch.cuda.Event
-            elif DEVICE_TYPE == "xpu":
-                event_ctor = torch.xpu.Event
-            else:
-                raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
+            GPU_BUFFERS_B = _PerDeviceSlots(n_gpus, _new_gpu_buffer)
+            event_ctor = _double_buffer_event_ctor()
             BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
             BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
             USE_DOUBLE_BUFFER = False
         except RuntimeError:
             pass
 
-    torch.cuda.empty_cache()
+    # Collect first so tensors only reachable through cycles are freed before the cache is emptied.
     gc.collect()
+    if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+    elif DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
+    else: torch.cuda.empty_cache()
 pass
 
 

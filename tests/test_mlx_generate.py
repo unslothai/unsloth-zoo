@@ -91,6 +91,7 @@ def test_stop_scanner_trims_to_token_boundary():
         (GenerationRequest(prompt_token_ids=[]), "must not be empty"),
         (GenerationRequest(prompt=""), "must not be empty"),
         (GenerationRequest(prompt="x", image=object()), "text prompts only"),
+        (GenerationRequest(prompt="x", vision_inputs={}), "text prompts only"),
         (GenerationRequest(prompt="x", max_tokens=0), "must be positive"),
     ],
 )
@@ -342,16 +343,31 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
     tokenizer, adapter = _CharTokenizer(), object.__new__(_TextBatchAdapter)
     tokenizer.eos_token_ids = ()
     adapter.model, adapter.tokenizer = object(), tokenizer
-    adapter.defaults = GenerationDefaults(stop_strings=("<STOP>",), prefill_batch_size=2, completion_batch_size=3, max_kv_size=16)
+    adapter.defaults = GenerationDefaults(stop_strings=("<STOP>",), prefill_batch_size=2, completion_batch_size=3, max_kv_size=16, prefill_step_size=8192)
     adapter.batch_generator_type = Generator
     adapter.make_sampler = lambda **_kwargs: None
     result = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
     assert result.token_ids == [1] and Generator.instances[-1].removed == [7]
-    assert tuple(Generator.instances[-1].kwargs[name] for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size")) == (2, 3, 16)
+    assert tuple(Generator.instances[-1].kwargs[name] for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size", "prefill_step_size")) == (2, 3, 16, 8192)
     assert Generator.instances[-1].closed is True
     Generator.eos = True
     eos = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
     assert eos.token_ids == [1] and eos.finish_reason == "stop"
+    tokenizer.eos_token_ids = (2, 3)
+    for chosen, stops in ((None, [[2], [3]]), ([5, 6, 5], [[5], [6]])):
+        adapter.defaults = GenerationDefaults(stop_token_ids=chosen)
+        _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
+        assert Generator.instances[-1].kwargs["stop_tokens"] == stops
+        assert "prefill_step_size" not in Generator.instances[-1].kwargs  # the runtime's own step
+    # A runtime whose BatchGenerator takes no step keeps its own.
+    adapter.defaults = GenerationDefaults(prefill_step_size=8192)
+    adapter.batch_generator_type = type("Stepless", (Generator,), {"__init__": lambda self, model, max_tokens, stop_tokens, prefill_batch_size, completion_batch_size, max_kv_size: Generator.__init__(self, max_kv_size=max_kv_size)})  # noqa: E501
+    _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
+    assert Generator.instances[-1].kwargs == {"max_kv_size": None}
+    assert GenerationDefaults(256, SamplingParams(), (), 2, 3, 16).max_kv_size == 16
+    for bad in ([True], [-1], [1.5]):
+        with pytest.raises(ValueError, match="non-negative integer"):
+            GenerationDefaults(stop_token_ids=bad)
     Generator.eos = False
     Generator.fail = True
     Generator.close_fail = True
@@ -493,9 +509,13 @@ def test_vlm_requests_accept_stop_strings():
                                   GenerationDefaults(stop_strings=("STOP",)))
 
 
-def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
+def test_vlm_requests_reject_token_ids_with_media_and_unsupported_controls():
     from unsloth_zoo.mlx.generate import _validate_vlm_requests
-    cases = ((GenerationRequest(prompt_token_ids=[1]), GenerationDefaults(), "rendered prompt string"),
+    assert _validate_vlm_requests([GenerationRequest(prompt_token_ids=iter((1, 2)))], GenerationDefaults())[0].prompt_token_ids == (1, 2)  # noqa: E501
+    cases = ((GenerationRequest(prompt_token_ids=[1], image="i.png"), GenerationDefaults(), "token ids with media"),
+        (GenerationRequest(prompt="a", prompt_token_ids=[1]), GenerationDefaults(), "exactly one"),
+        (GenerationRequest(prompt_token_ids=[1], vision_inputs={}), GenerationDefaults(), "generate_batch or stream_batch only"),
+        (GenerationRequest(prompt="a", vision_inputs={}), GenerationDefaults(), "given as prompt_token_ids"),
         (GenerationRequest(prompt=""), GenerationDefaults(), "must not be empty"),
         (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
         # One mlx-vlm would drop rather than apply is refused: an inert start or bogus scheme,
@@ -511,6 +531,39 @@ def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
     # Path images normalize to str once: mlx-vlm's loader opens str only, and
     # grouping and preprocessing must see the same value.
     assert _validate_vlm_requests([GenerationRequest(prompt="a", image=pathlib.Path("/tmp/i.png"))], GenerationDefaults())[0].image == "/tmp/i.png"  # noqa: E501
+    # A prepared prompt (generate_batch / stream_batch) groups only with rows its vision inputs concatenate with.
+    import numpy as np
+    from dataclasses import replace
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _stream_batch
+    prepared = GenerationRequest(prompt_token_ids=[1, 2], vision_inputs={"pixel_values": np.zeros((2, 3))})
+    assert _validate_vlm_requests([prepared], GenerationDefaults(), prepared=True)[0].prompt_token_ids == (1, 2)
+    for request, message in ((replace(prepared, image="i.png"), "token ids with media"), (replace(prepared, vision_inputs={"input_ids": 1}), "other than input_ids")):
+        with pytest.raises(ValueError, match=message):
+            _validate_vlm_requests([request], GenerationDefaults(), prepared=True)
+    adapter = types.SimpleNamespace(batches_observable=True)
+    key = lambda **change: _VLMBatchAdapter._group_key(adapter, replace(prepared, **change))
+    assert key() == key(vision_inputs={"pixel_values": np.ones((2, 3))}) != key(vision_inputs={"pixel_values": np.ones((4, 3))})
+    assert key() != key(prompt_token_ids=(1, 2, 3))
+    assert key() not in (key(vision_inputs={"images": np.zeros((2, 3))}), key(vision_inputs={"pixel_values": np.zeros((2, 3), np.float16)}))
+    assert key(vision_inputs={"token": 9}) == key(vision_inputs={"token": np.int64(9)}) != key(vision_inputs={"token": 8})
+    listed = [replace(prepared, vision_inputs={"grid": [(1,)]}) for _ in range(2)]
+    assert len({_VLMBatchAdapter._group_key(adapter, request) for request in listed}) == 2
+    with pytest.raises(ValueError, match="no vision path"):
+        list(_stream_batch(types.SimpleNamespace(_is_vlm_model=True, language_model=None, _unsloth_supports_images=False), object(), [prepared]))  # noqa: E501
+    with pytest.raises(TypeError, match="model with eval"):
+        list(_stream_batch(types.SimpleNamespace(_is_vlm_model=True, language_model=None, _unsloth_supports_images=False), object(), [replace(prepared, vision_inputs={"mm_token_type_ids": np.zeros((1, 2)), "pixel_values": None})]))  # noqa: E501
+
+
+def test_a_prompt_cache_state_is_taken_only_by_a_vision_stream_row():
+    from unsloth_zoo.mlx.generate import _stream_batch, _validate_text_requests
+    with pytest.raises(TypeError, match="open\\(\\) and checkpoint\\(\\)"):
+        GenerationRequest(prompt="a", prompt_cache_state=object())
+    state = types.SimpleNamespace(open=lambda ids: ([], ()), checkpoint=lambda n, cache: None)
+    with pytest.raises(ValueError, match="only a vision BatchStream row"):
+        _validate_text_requests([GenerationRequest(prompt="a", prompt_cache_state=state)], GenerationDefaults())
+    vlm = types.SimpleNamespace(_is_vlm_model=True, language_model=None)
+    with pytest.raises(ValueError, match="taken only by a BatchStream row"):
+        list(_stream_batch(vlm, object(), [GenerationRequest(prompt="a", prompt_cache_state=state)]))
 
 
 def test_prompt_kwargs_fallback_splits_mrope_on_the_batch_axis():
@@ -603,10 +656,10 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     ids, embeds = (types.SimpleNamespace(tolist=lambda: [[1], [2]]),
                    types.SimpleNamespace(to_dict=lambda: {"inputs_embeds": "E", "position_ids": None}))
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
-    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant")
+    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant", prefill_step_size=8192, stop_token_ids=(5,))
     adapter.per_row_prompt_kwargs = True
-    adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
-    adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens", "kv_bits", "kv_quant_scheme", "quantized_kv_start"}  # noqa: E501
+    adapter.processor = types.SimpleNamespace(tokenizer=_CriteriaTokenizer())
+    adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens", "kv_bits", "kv_quant_scheme", "quantized_kv_start", "prefill_step_size"}  # noqa: E501
     adapter.prepare_inputs = lambda *a, **k: {"input_ids": ids, "extra": "D", "position_ids": "P"}  # noqa: E501
     adapter.make_sampler = lambda **k: object()
     adapter._add_special_tokens = lambda: True
@@ -622,7 +675,7 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
         config=types.SimpleNamespace(image_token_index=None), language_model=object(),
         get_input_embeddings=lambda *a, **k: (order.append("embed"), embeds)[1])
     adapter.generator_type = lambda *a, **k: (order.append("construct"),
-        seen.update(ctor=k), _vlm_stub(True, events=[[(0, 1, "stop")]])(*a[:2]))[2]
+        seen.update(ctor=k, stops=a[1].tokenizer.stopping_criteria), _vlm_stub(True, events=[[(0, 1, "stop")]])(*a[:2]))[2]
     assert [event.result for event in
             adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])] == [1, 1]
     assert order == ["wired", "embed", "policy", "construct"]
@@ -635,6 +688,20 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     # Per-row keeps configured sizes; EOS stays with the processor.
     assert (seen["ctor"]["prefill_batch_size"], seen["ctor"]["completion_batch_size"]) == (8, 32)
     assert "stop_tokens" not in seen["ctor"]
+    assert [seen["stops"](token) for token in (3, 5)] == [False, True] and adapter.processor.tokenizer.stopping_criteria(3)
+    assert seen["ctor"]["prefill_step_size"] == 8192
+    # A model that must not chunk its prefill still prefills whole.
+    adapter._chunked_prefill_kwargs = lambda **kw: {"prefill_step_size": None}
+    list(adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1]))
+    assert seen["ctor"]["prefill_step_size"] is None
+    # A prepared chunk prefills its own ids and vision inputs, never re-encoded.
+    import numpy as np
+    adapter.prepare_inputs = None
+    adapter.model.get_input_embeddings = lambda ids, pixels, mask, **k: (seen.update(embed=(ids.tolist(), pixels.tolist(), mask.tolist(), k)), embeds)[1]
+    list(adapter._run_chunk([GenerationRequest(prompt_token_ids=(1, i), vision_inputs={"pixel_values": np.full((1, 2), i), "token": 9}) for i in (7, 8)], [0, 1]))
+    assert seen["embed"] == ([[1, 7], [1, 8]], [[7, 7], [8, 8]], [[1, 1]] * 2, {"token": 9})
+    list(adapter._run_chunk([GenerationRequest(prompt_token_ids=(1, 7), vision_inputs={"images": np.full((1, 2), 7), "grid": [(7,), (8,)]})], [0]))
+    assert seen["embed"] == ([[1, 7]], [[7, 7]], [[1, 1]], {"grid": [(7,), (8,)]})
 
 
 @pytest.mark.parametrize("nested", (True, False))
@@ -1003,7 +1070,10 @@ def test_audio_fallback_forwards_the_request_to_the_stream():
     assert (kwargs["audio"], kwargs["max_tokens"]) == ("a.wav", 9)
     assert kwargs["sampler"] is adapter.sampler
     assert (adapter.sampler_kwargs["temp"], adapter.sampler_kwargs["top_k"]) == (0.25, 7)
-    assert kwargs["logits_processors"] == []
+    assert kwargs["logits_processors"] == [] and "prefill_step_size" not in kwargs
+    adapter.defaults = GenerationDefaults(prefill_step_size=8192)
+    _audio_row(adapter, GenerationRequest(prompt="p", audio="a.wav"))
+    assert adapter.stream_calls.pop()[1]["prefill_step_size"] == 8192
     # Decoding alone is not a reason to drop what the request asked for.
     shown = []
     _result, _ = _audio_row(adapter, GenerationRequest(
@@ -1089,7 +1159,8 @@ def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches()
     assert results[1].token_ids == [1]
 
 
-def test_vision_generation_resolves_the_saved_processor(monkeypatch):
+@pytest.mark.parametrize("audio", [None, [0.0, 0.1]])
+def test_vision_generation_resolves_the_saved_processor(monkeypatch, audio):
     # A text-only multimodal load publishes its inner tokenizer, so the typed
     # core resolves the saved processor for both it and fast_generate.
     from unsloth_zoo.mlx.generate import generate_batch as engine_generate_batch
@@ -1100,11 +1171,11 @@ def test_vision_generation_resolves_the_saved_processor(monkeypatch):
         def stream(self, requests):
             return iter([GenerationEvent(index=0, result="ok")])
     monkeypatch.setattr(engine, "_VLMBatchAdapter", _Adapter)
-    monkeypatch.setattr(engine, "generation_mode", lambda model: contextlib.nullcontext())
+    monkeypatch.setattr(engine, "generation_mode", lambda model, call: seen.update(call=call) or contextlib.nullcontext())
     processor = object()
     model = types.SimpleNamespace(_is_vlm_model=True, _processor=processor)
-    assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a")]) == ["ok"]
-    assert seen["tok"] is processor
+    assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a", audio=audio)]) == ["ok"]
+    assert seen["tok"] is processor and seen["call"] == ("batch", "vision", *(() if audio is None else ("audio",)))
 
 
 def _knob_sampler(**knobs):
@@ -1299,7 +1370,7 @@ class _OpenVLMGenerator:
     """mlx-vlm's open-batch surface: insert answers with uids, next reports."""
 
     def __init__(self, *args, **kwargs):
-        self.kwargs = kwargs
+        self.args, self.kwargs = args, kwargs
         self.inserted, self.removed, self.events = [], [], []
         self.closed = False
         self._next_uid = 0
@@ -1364,6 +1435,7 @@ def _vlm_adapter(generator_type = None):
         _VLMBatchAdapter._row_logits_processors, adapter)
     adapter._wired_limit = lambda: _wired_ctx(adapter.wired)
     adapter._decode_image = lambda request: request
+    adapter._prompt_inputs = types.MethodType(_VLMBatchAdapter._prompt_inputs, adapter)
     adapter._add_special_tokens = lambda: True
     adapter._split_prompt_kwargs = lambda kwargs, n: [dict(kwargs)] * n
     adapter._admission_stalled = lambda generator: False
@@ -1385,6 +1457,10 @@ def test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given():
         assert [session.generator.kwargs[n] for n in ("kv_bits", "kv_group_size")] == [8, 32]
     with contextlib.closing(_vlm_session(kv_bits = 4, kv_quant_scheme = "turboquant", quantized_kv_start = None)) as session:  # noqa: E501
         assert session.generator.kwargs["quantized_kv_start"] == 0  # from the first token, not mlx-vlm's 5000
+    with contextlib.closing(_vlm_session(prefill_step_size = 8192)) as session:
+        assert session.generator.kwargs["prefill_step_size"] == 8192
+    with contextlib.closing(_vlm_session(stop_token_ids = ())) as session:  # stops on nothing, not the EOS
+        assert session.generator.args[1].tokenizer.stopping_criteria.eos_token_ids == []
 
 
 def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
@@ -1426,6 +1502,100 @@ def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
         assert _keeps_what_it_prepared(model()) is (model in keeping), model.__name__
 
 
+def test_a_method_is_read_once_and_never_outlives_its_model(monkeypatch):
+    import gc, weakref
+    from unsloth_zoo.mlx import generate
+
+    class Model:
+        def _measure(self, ids): return len(ids)
+        def get_input_embeddings(self, ids): return self._measure(ids)
+
+    reads = []
+    source = inspect.getsource
+    monkeypatch.setattr(inspect, "getsource", lambda target: reads.append(target) or source(target))
+    assert not generate._keeps_what_it_prepared(Model())
+    assert not generate._keeps_what_it_prepared(Model())
+    assert not generate._draws_by_position(Model, "_measure") and not generate._draws_by_position(Model(), "_measure")
+    assert reads == [Model.get_input_embeddings, Model._measure, Model._measure]
+    assert generate._binds_self(Model._measure) is generate._binds_self(Model._measure)
+
+    # A method a model defines around itself is remembered only while that model lives.
+    model = Model()
+    def measure(ids, model = model): return len(ids) + len(vars(model))
+    model._measure = measure
+    assert not generate._keeps_what_it_prepared(model)
+    alive = weakref.ref(model)
+    del model, measure, reads[:]
+    gc.collect()
+    assert alive() is None
+
+    def keeping(self, ids): self._ids = ids
+
+    class Wrapper:
+        def __init__(self, wrapped): self.__wrapped__ = wrapped
+        def __call__(self, ids): return self.__wrapped__(self, ids)
+
+    wrapper = Wrapper(Model.get_input_embeddings)
+    wrapped = types.SimpleNamespace(get_input_embeddings = wrapper, _measure = len)
+    assert not generate._keeps_what_it_prepared(wrapped)
+    wrapper.__wrapped__ = keeping
+    assert generate._keeps_what_it_prepared(wrapped)
+
+    Model._measure.__code__ = keeping.__code__
+    assert generate._keeps_what_it_prepared(Model())
+
+
+def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
+    from unsloth_zoo.mlx.generate import _schedules_prefill
+
+    def prompt(uid, left):
+        return types.SimpleNamespace(uids = [uid], _inputs_embeds = types.SimpleNamespace(shape = (1, left, 4)))
+
+    def queued(uid, ids, columns = None):
+        embeds = None if columns is None else types.SimpleNamespace(shape = (1, columns, 4))
+        return (uid, [1] * ids, 5, {"inputs_embeds": embeds} if embeds else {})
+
+    session = _vlm_session(prefill_batch_size = 1)
+    long, short = prompt(0, 6000), prompt(1, 100)
+    gen = session.generator = types.SimpleNamespace(
+        _prompt_batch = long, _unprocessed_sequences = [queued(1, 100)], _generation_batch = [],
+        completion_batch_size = 4, apc = None)
+    assert _schedules_prefill(gen, session.adapter.defaults)
+    assert not _schedules_prefill(gen, GenerationDefaults(prefill_batch_size = 2))
+    session._schedule_prefill()
+    assert (gen._prompt_batch, session._parked) == (None, [long])  # mlx-vlm admits the short row
+    gen._prompt_batch, gen._unprocessed_sequences = short, []
+    session._schedule_prefill()
+    assert gen._prompt_batch is short
+    gen._prompt_batch, gen._generation_batch = None, [1]
+    session._schedule_prefill()
+    assert (gen._prompt_batch, session._parked) == (long, [])
+    # A row's media can expand past its ids; it is ranked by the columns it will prefill.
+    gen._prompt_batch, gen._unprocessed_sequences = prompt(2, 100), [queued(3, 20, columns = 276)]
+    session._schedule_prefill()
+    assert gen._prompt_batch.uids == [2]
+    gen._prompt_batch, gen._unprocessed_sequences = long, [queued(1, 100)]
+    # Parked rows hold completion slots that mlx-vlm's admission does not count.
+    gen.completion_batch_size = 2
+    session._schedule_prefill()
+    assert gen._prompt_batch is long
+    # One parked as often as there are slots runs to its end, before any queued row.
+    gen._generation_batch, gen.completion_batch_size = [], 4
+    for _ in range(3):
+        session._schedule_prefill()
+        assert (gen._prompt_batch, session._parked) == (None, [long])
+        gen._unprocessed_sequences = []  # admitted and prefilled
+        session._schedule_prefill()
+        assert gen._prompt_batch is long
+        gen._unprocessed_sequences = [queued(1, 100)]
+    session._schedule_prefill()
+    assert gen._prompt_batch is long
+    gen._prompt_batch, session._parked = short, [long]
+    session._schedule_prefill()
+    assert (gen._prompt_batch, session._parked) == (long, [short])
+    assert session._withdraw(1) and session._parked == []
+
+
 def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     """A key only some rows carry cannot be merged into a batch-wide keyword."""
     session = _vlm_session()
@@ -1441,6 +1611,20 @@ def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     assert (session.rows_in_flight, len(session.generator.inserted)) == (1, 1)
     session.adapter.model.get_input_embeddings = plain
     assert session.add(GenerationRequest(prompt = "fg")) == 1
+
+
+def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
+    session = _vlm_session()
+    session.adapter.prepare_inputs = lambda *a, **k: pytest.fail("processed")
+    assert session.add(GenerationRequest(prompt_token_ids = (7, 8, 9))) == 0
+    assert session.generator.inserted[0][0] == [[7, 8, 9]]
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.processor, adapter.batches_observable = types.SimpleNamespace(tokenizer = _CharTokenizer()), True
+    rows = [GenerationRequest(prompt_token_ids = (1, 2)), GenerationRequest(prompt_token_ids = (3, 4))]
+    assert adapter._group_key(rows[0]) != adapter._group_key(GenerationRequest(prompt = "ab"))
+    inputs = _VLMBatchAdapter._prompt_inputs(adapter, rows)
+    assert [inputs[k].tolist() for k in ("input_ids", "attention_mask")] == [[[1, 2], [3, 4]], [[1, 1]] * 2]
 
 
 def test_a_processor_is_shown_its_own_row_s_history_from_its_own_offset():
@@ -1491,6 +1675,17 @@ def test_a_text_row_carries_its_own_logits_processors_into_the_batch(monkeypatch
     assert seen[1 - carrying] == [[]]
     assert [_shows(processor, [4, 5, 6]) for processor in seen[carrying][0]] == [7]
 
+def test_only_an_mlx_lm_image_model_s_text_batch_takes_an_image_row(monkeypatch):
+    image_row = GenerationRequest(prompt = "p", image = "a.png")
+    assert _validate_text_requests([image_row], GenerationDefaults(), True) == [image_row]
+    for images, kwargs in ((False, {"prompt": "p", "image": 1}), (True, {"prompt_token_ids": [1], "image": 1}),
+                           (True, {"prompt": "p", "audio": 1})):
+        with pytest.raises(ValueError, match = "media|token ids"):
+            _validate_text_requests([GenerationRequest(**kwargs)], GenerationDefaults(), images)
+    with contextlib.closing(_open_stream(monkeypatch)) as stream, pytest.raises(ValueError, match = "media"):
+        stream.add(image_row)
+
+
 def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
     with pytest.raises(TypeError, match="must be GenerationDefaults"):
         stream_batch(object(), object(), [], defaults = {"stop_strings": ()})
@@ -1500,7 +1695,7 @@ def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
 
 
 def test_kv_quant_controls_and_processor_rows_are_refused_before_they_reach_a_cache():
-    assert [type(pytest.raises((TypeError, ValueError), GenerationDefaults, **kw).value) for kw in ({"kv_bits": True}, {"kv_bits": float("nan")}, {"kv_bits": float("inf")}, {"kv_group_size": True}, {"kv_group_size": -1}, {"kv_quant_scheme": 3}, {"quantized_kv_start": -1})] == [TypeError, ValueError, ValueError, TypeError, ValueError, TypeError, ValueError] and GenerationDefaults(kv_bits = 4.5, kv_group_size = 32, kv_quant_scheme = "turboquant", quantized_kv_start = 0).kv_bits == 4.5  # noqa: E501
+    assert [type(pytest.raises((TypeError, ValueError), GenerationDefaults, **kw).value) for kw in ({"kv_bits": True}, {"kv_bits": float("nan")}, {"kv_bits": float("inf")}, {"kv_group_size": True}, {"kv_group_size": -1}, {"kv_quant_scheme": 3}, {"quantized_kv_start": -1}, {"prefill_step_size": True}, {"prefill_step_size": 0})] == [TypeError, ValueError, ValueError, TypeError, ValueError, TypeError, ValueError, TypeError, ValueError] and GenerationDefaults(kv_bits = 4.5, kv_group_size = 32, kv_quant_scheme = "turboquant", quantized_kv_start = 0).kv_bits == 4.5  # noqa: E501
     with contextlib.closing(_vlm_session()) as session:
         session.adapter.row_logits_processors = False
         with pytest.raises(ValueError, match = "cannot carry") as refusal:
@@ -1511,6 +1706,15 @@ def test_kv_quant_controls_and_processor_rows_are_refused_before_they_reach_a_ca
 def test_the_preflight_refuses_defaults_every_add_would():
     from unsloth_zoo.mlx.generate import stream_unavailable_reason
     assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed")))  # noqa: E501
+
+
+def test_speculative_vision_rows_stop_on_the_callers_ids_and_audio_refuses_them(monkeypatch):
+    from unsloth_zoo.mlx import generate, speculative
+    monkeypatch.setattr(speculative, "install_speculative_seam", lambda: None)
+    monkeypatch.setattr(speculative, "SpeculativeEngine", lambda *a, **k: None)
+    adapter = dict(processor=types.SimpleNamespace(tokenizer=_CriteriaTokenizer()), model=None, _wired_limit=contextlib.nullcontext)
+    assert [generate._SpeculativeBatchSession(types.SimpleNamespace(**adapter, defaults=GenerationDefaults(stop_token_ids=stops)), types.SimpleNamespace(controller=None, drafter=None)).stop_tokens for stops in ((5, 7), ())] == [{5, 7}, set()]
+    assert pytest.raises(ValueError, generate._validate_vlm_requests, [GenerationRequest(prompt="p", audio="a.wav")], GenerationDefaults(stop_token_ids=(5,))).match("omit stop_token_ids")
 
 
 def test_a_cache_with_model_specific_state_refuses_a_quantized_batch_before_it_starts():
@@ -1539,11 +1743,16 @@ def test_a_prefill_batch_charges_each_row_its_own_prompt_and_not_the_padded_widt
 
 
 def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
-    # generation_mode enters both inference fusions for any model it is handed, and
+    # generation_mode enters every inference fusion for any model it is handed, and
     # these tests hand it plain stand-ins. The decode scope reads a module's own dict
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
-    from unsloth_zoo.mlx.inference import fused_decode_conv_silu, fused_moe_gate_up
+    from unsloth_zoo.mlx.inference import (exact_batch_invariant_decode, exact_dilated_depthwise_conv,
+                                           exact_ple_row_reads, exact_qsa_trim, exact_speculative_verify,
+                                           fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
+                                           fused_moe_router, fused_packed_gated_delta, fused_qwen4_decode,
+                                           fused_qwen4_prefill, fused_residual_norm, fused_residual_norm_handoff,
+                                           fused_verify_attention)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1551,5 +1760,210 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
             training = False,
             named_modules = lambda: [("plain", stub)],
         )
-        with fused_moe_gate_up(model), fused_decode_conv_silu(model):
+        with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
+                fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model), \
+                exact_speculative_verify(model), exact_batch_invariant_decode(model), fused_packed_gated_delta(model), \
+                fused_verify_attention(model), exact_ple_row_reads(model), exact_qsa_trim(model), \
+                exact_dilated_depthwise_conv(model), fused_qwen4_prefill(model), fused_qwen4_decode(model):
             pass
+
+
+def test_every_inference_scope_is_registered_and_every_generation_path_enters_the_registry(monkeypatch):
+    # A scope missing from the registry silently leaves every path native.
+    import ast
+
+    from unsloth_zoo.mlx import generate as generate_module, inference, loader
+    scopes = {value for name, value in vars(inference).items() if inspect.isfunction(value)
+              and name != "inference_scopes" and "_modules" in inspect.signature(value).parameters}
+    assert scopes == {scope.enter for scope in inference.INFERENCE_SCOPES}
+    entered = []
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [inference.InferenceScope(
+        lambda model, _modules: entered.append((model, _modules)) or contextlib.nullcontext())])
+    model = types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [("", stub)])
+    stub = types.SimpleNamespace(training=False)
+    with generate_module.generation_mode(model):
+        assert entered == [(model, (("", stub),))]
+    calls = [node for node in ast.walk(ast.parse(inspect.getsource(loader)))
+             if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "inference_scopes"]
+    # The loader's generate sites run no speculative verify rounds.
+    assert [ast.literal_eval(call.args[1]) for call in calls] == [("vision",), ()]
+
+
+def _recording_scopes(monkeypatch, entered, *scopes):
+    from unsloth_zoo.mlx import inference
+
+    def scope(name, fails = False):
+        @contextlib.contextmanager
+        def enter(model, *args, _modules):
+            assert type(_modules) is tuple   # the one walk every scope shares
+            if fails:
+                raise RuntimeError(name)
+            entered.append((name, args))
+            try:
+                yield model
+            finally:
+                entered.append(("exit " + name, ()))
+        enter.__name__ = name
+        return enter
+
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [
+        inference.InferenceScope(scope(name, **options.pop("scope", {})), **options) for name, options in scopes])
+    return inference.inference_scopes
+
+
+@pytest.mark.parametrize("call, opt_in, names", [
+    (None, None, ["every", "drafted", "vision"]),
+    ((), None, ["every"]),
+    (("vision", "speculative"), "1", ["every", "drafted", "vision", "opt_in"]),
+    ("speculative", "0", ["every", "drafted"]),
+    (("a trait this zoo does not know",), "true", ["every"]),
+    ("one-shot iterator", None, ["every", "vision"]),
+])
+def test_inference_scopes_enter_what_the_call_is_served_by_and_opt_in_only_when_switched_on(monkeypatch, call, opt_in, names):
+    entered = []
+    compose = _recording_scopes(monkeypatch, entered, ("every", {}), ("drafted", {"serves": frozenset({"speculative"})}),
+                                ("vision", {"serves": frozenset({"vision", "audio"})}),
+                                ("opt_in", {"opt_in": "UNSLOTH_MLX_TEST_SCOPE"}))
+    if opt_in is None:
+        monkeypatch.delenv("UNSLOTH_MLX_TEST_SCOPE", raising = False)
+    else:
+        monkeypatch.setenv("UNSLOTH_MLX_TEST_SCOPE", opt_in)
+    if call == "one-shot iterator":
+        call = iter(("vision", "audio"))
+    model = types.SimpleNamespace()
+    with compose(model, call) as active:
+        assert active is model and [name for name, _ in entered] == names
+    assert [name for name, _ in entered[len(names):]] == ["exit " + name for name in reversed(names)]
+
+
+def test_an_open_text_batch_holds_the_scopes_a_batch_is_served_by(monkeypatch):
+    entered = []
+    _recording_scopes(monkeypatch, entered, ("every", {}), ("batch", {"serves": frozenset({"batch"})}),
+                      ("drafted", {"serves": frozenset({"speculative"})}), ("vision", {"serves": frozenset({"vision"})}))
+    _open_stream(monkeypatch).close()
+    assert [name for name, _ in entered] == ["every", "batch", "exit batch", "exit every"]
+
+
+@pytest.mark.parametrize("vlm, speculative, call", [
+    (False, None, ("batch",)), (True, None, ("batch", "vision")), (True, object(), ("batch", "vision", "speculative"))])
+def test_a_batch_stream_describes_its_call_to_generation_mode(monkeypatch, vlm, speculative, call):
+    from unsloth_zoo.mlx import generate as module
+
+    seen = []
+    session = lambda *args: types.SimpleNamespace(close = lambda: None)
+    monkeypatch.setattr(module, "_stream_setup", lambda *args: (vlm, object()))
+    monkeypatch.setattr(module, "generation_mode", lambda model, call: seen.append(call) or contextlib.nullcontext())
+    for name in ("_generation_cache_hygiene", "_TextBatchSession", "_VLMBatchSession", "_SpeculativeBatchSession"):
+        monkeypatch.setattr(module, name, session if name.endswith("Session") else contextlib.nullcontext)
+    module.BatchStream(object(), object(), speculative = speculative).close()
+    assert seen == [call]
+
+
+def test_inference_scopes_pass_int8_prefill_only_where_registered_and_report_or_raise_refusals(monkeypatch):
+    entered, refused = [], []
+    compose = _recording_scopes(monkeypatch, entered, ("first", {"int8_prefill": True}),
+                                ("refuses", {"scope": {"fails": True}}), ("last", {}))
+    with compose(object(), int8_prefill = False, on_error = lambda name, error: refused.append((name, str(error)))):
+        assert entered == [("first", (False,)), ("last", ())] and refused == [("refuses", "refuses")]
+    entered.clear()
+    with pytest.raises(RuntimeError, match = "refuses"):
+        with compose(object()):
+            pass  # pragma: no cover
+    assert entered == [("first", (None,)), ("exit first", ())]
+
+
+@pytest.mark.parametrize("int8_prefill", [None, True])
+def test_warm_inference_generates_greedily_under_the_int8_decision(int8_prefill):
+    from unsloth_zoo.mlx.inference import warm_inference
+
+    calls = []
+    warm_inference(types.SimpleNamespace(generate = lambda prompt, **kwargs: calls.append((prompt.tolist(), kwargs))),
+                   int8_prefill = int8_prefill)
+    assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill})]
+
+
+def test_cache_layout_tells_quantized_packings_apart():
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.generate import _cache_layout
+
+    def cache(bits, group_size):
+        return [SimpleNamespace(offset = 0, bits = bits, group_size = group_size)]
+
+    assert _cache_layout(cache(8, 64)) == _cache_layout(cache(8, 64))
+    assert _cache_layout(cache(8, 64)) != _cache_layout(cache(4, 64))
+    assert _cache_layout(cache(8, 64)) != _cache_layout(cache(8, 32))
+
+
+def test_row_quantizer_starts_uniform_rows_at_the_first_token():
+    from unsloth_zoo.mlx.generate import _row_quantizer
+
+    class BatchGenerator:
+        def __init__(self, model, kv_bits=None, kv_group_size=64, kv_quant_scheme="uniform", quantized_kv_start=5000):
+            pass
+
+    module = types.SimpleNamespace(
+        BatchGenerator=BatchGenerator,
+        maybe_quantize_kv_cache=lambda *a, **k: None,
+        turboquant_enabled=lambda bits, scheme=None: scheme == "turboquant" or float(bits) != int(bits),
+    )
+    assert _row_quantizer(module, {}) is None
+    uniform = _row_quantizer(module, {"kv_bits": 4})
+    assert uniform.keywords == {"kv_group_size": 64, "quantized_kv_start": 0, "kv_bits": 4}
+    turbo = _row_quantizer(module, {"kv_bits": 3.5, "kv_quant_scheme": "turboquant"})
+    assert turbo.keywords["quantized_kv_start"] == 5000
+
+
+_SINGLE_ROW_MODEL = '''
+def _is_single_row_batch_cache(entry):
+    return entry.rows == 1
+
+
+def _extract_row_cache(entry, row):
+    return entry
+
+
+class Model(dict):
+    fa_idx = 0
+
+    def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, position_ids=None,
+                 capture_layer_ids=None, hidden_sink=None):
+        taken = hidden_sink is None and _is_single_row_batch_cache(cache[self.fa_idx])
+        if taken:
+            cache[self.fa_idx] = _extract_row_cache(cache[self.fa_idx], 0)
+        self.seen.append(taken)
+        return taken
+'''
+
+
+def test_single_row_decode_skips_the_shortcut_only_for_an_unpadded_decode_step():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.generate import single_row_batch_decode
+
+    namespace = {}
+    exec(_SINGLE_ROW_MODEL, namespace)
+    Model, native = namespace["Model"], namespace["_is_single_row_batch_cache"]
+    inner = Model()
+    inner.seen = []
+    model = types.SimpleNamespace(named_modules = lambda: [("stub", types.SimpleNamespace()), ("model", inner)])
+    row = lambda pad, rows = 1: types.SimpleNamespace(rows = rows, left_padding = mx.array([pad] * rows))
+    step, prefill = mx.zeros((1, 1)), mx.zeros((1, 4))
+    with single_row_batch_decode(model):
+        with single_row_batch_decode(model):
+            patched = type(inner)
+        assert type(inner) is patched and patched is not Model
+        # A call filling a hidden sink never takes the shortcut, so it is never run twice to compare.
+        inner(step, cache = [row(0)], hidden_sink = [])
+        # The first-use comparison runs on Metal; here the class is taken as already verified.
+        patched._unsloth_single_row_verdict = True
+        for cache, inputs in ((row(0), step), (row(2), step), (row(0), prefill), (row(0, rows = 2), mx.zeros((2, 1)))):
+            inner(inputs, cache = [cache])
+        assert inner.seen == [False, False, True, True, False]
+        patched._unsloth_single_row_verdict = False
+        inner(step, cache = [row(0)])
+        assert inner.seen[-1] is True
+    assert type(inner) is Model and "_unsloth_single_row_scopes" not in vars(inner)
+    # The stand-in predicate answers as mlx-vlm's own outside a skipped call.
+    assert namespace["_is_single_row_batch_cache"]._unsloth_native is native
+    assert namespace["_is_single_row_batch_cache"](row(0)) is True

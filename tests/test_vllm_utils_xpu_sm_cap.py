@@ -45,10 +45,14 @@ def test_get_vllm_state_dict_sm_cap_guards_rocm_and_xpu():
     assert idx != -1, "sm_cap computation missing from vllm_utils.py"
     window = src[max(0, idx - 400): idx + 400]
 
-    guard = re.search(r"if\s+not\s+is_hip\(\)\s+and\s+DEVICE_TYPE\s*!=\s*[\"']xpu[\"']\s*:", window)
+    guard = re.search(
+        r"if\s+not\s+is_hip\(\)\s+and\s+DEVICE_TYPE\s*"
+        r"(?:!=\s*[\"']xpu[\"']|not\s+in\s+\(\s*[\"']xpu[\"']\s*,\s*[\"']npu[\"']\s*\))\s*:",
+        window,
+    )
     assert guard is not None, (
-        "sm_cap guard must exclude both ROCm and Intel XPU from the CUDA "
-        "capability query, e.g. `if not is_hip() and DEVICE_TYPE != \"xpu\":`. "
+        "sm_cap guard must exclude ROCm, Intel XPU and Ascend NPU from the CUDA "
+        "capability query, e.g. `if not is_hip() and DEVICE_TYPE not in (\"xpu\", \"npu\"):`. "
         "Regression: XPU would call torch.cuda.get_device_capability() and crash."
     )
 

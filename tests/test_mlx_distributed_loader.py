@@ -120,6 +120,10 @@ def test_vlm_only_text_routing_checks_remapped_module_presence(monkeypatch):
     assert seen == ["mlx_lm.models.remapped"]
     monkeypatch.setattr(loader.importlib.util, "find_spec", lambda _: object())
     assert not loader._mlx_vlm_only_text_model({"model_type": "alias"}, "alias")
+    for error, routed in ((ValueError("engram layers"), True), (TypeError("missing field"), False), (None, False)):
+        args = types.SimpleNamespace(from_dict = lambda config, error = error: error and (_ for _ in ()).throw(error))
+        monkeypatch.setattr(loader.importlib, "import_module", lambda name: types.SimpleNamespace(ModelArgs = args))
+        assert loader._mlx_vlm_only_text_model({"model_type": "alias"}, "alias") is routed
     monkeypatch.setattr(loader.importlib.util, "find_spec", lambda _: None)
     monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: None)
     assert not loader._mlx_vlm_only_text_model({"model_type": "absent"}, "absent")
@@ -359,6 +363,14 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
     assert calls[0][1:3] == (tensor_group, None)
     assert all(call[1:3] == (None, pipeline_group) for call in calls[1:])
     assert len(bound_calls) == 5
+    # A mixed-bit GLM-5-Next checkpoint needs the fused-layer aliases on this path too.
+    patched = []
+    monkeypatch.setattr(
+        loader, "_patch_glm5_next_quantization_aliases", lambda t: patched.append((t, len(calls)))
+    )
+    loaded = len(calls)
+    _load_mlx_vlm_distributed("fake/vlm", "glm5_next", tensor_group=tensor_group)
+    assert patched == [("glm5_next", loaded)] and len(calls) == loaded + 1
 
 
 def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatch, tmp_path):
@@ -377,7 +389,12 @@ def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatc
 
     def distributed(_name, model_type, *, config_override_data=None, allow_remote_code=None, **_kwargs):
         calls.append((model_type, config_override_data, allow_remote_code))
-        return types.SimpleNamespace(), types.SimpleNamespace(tokenizer=object())
+        # from_pretrained walks the model's modules for an image path (#1587), so the fake
+        # answers named_modules() the way an mlx.nn.Module with no submodules does.
+        model = types.SimpleNamespace(named_modules=lambda: iter([("", None)]))
+        return model, types.SimpleNamespace(
+            tokenizer=types.SimpleNamespace(stopping_criteria=object()), detokenizer=object(),
+        )
 
     monkeypatch.setattr(loader, "_load_mlx_vlm_distributed", distributed)
     noops = (

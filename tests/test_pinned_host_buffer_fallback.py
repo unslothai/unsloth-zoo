@@ -102,7 +102,8 @@ def test_new_host_buffer_reraises_unrelated_errors(monkeypatch):
 @requires_cuda
 def test_grow_host_buffer_falls_back_when_pinned_resize_refuses(monkeypatch):
     """Issues 1744 and 1797 bisected here: growing a pinned buffer re-pins, and WSL refuses."""
-    buffer = torch.empty(128 * 1024, dtype = torch.float16, device = "cpu", pin_memory = True)
+    # Marked like every CPU_BUFFERS slot: an unmarked buffer counts as pageable and is replaced.
+    buffer = gc._mark_host_buffer(torch.empty(128 * 1024, dtype = torch.float16, device = "cpu", pin_memory = True))
     real_resize = torch.Tensor.resize_
 
     def refuse_growth(self, *size, **kwargs):

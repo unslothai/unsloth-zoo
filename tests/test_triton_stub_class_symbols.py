@@ -187,5 +187,49 @@ def test_flop_counter_imports_under_the_stub():
     assert "OK" in proc.stdout
 
 
+def test_triton_key_is_a_string():
+    """Inductor calls triton_key() for every compile's cache key; a _Noop raises there."""
+    stub = _load_stub_module()
+    for module in (stub.runtime.cache, stub.compiler.compiler):
+        key = module.triton_key()
+        assert isinstance(key, str) and key
+
+
+_COMPILE_SUBPROCESS = textwrap.dedent(
+    """
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location("triton_stub", {stub!r})
+    stub = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = stub
+    spec.loader.exec_module(stub)
+    stub.inject_into_sys_modules()
+
+    import torch
+    fn = torch.compile(lambda x: torch.nn.functional.silu(x) * 2)
+    x = torch.linspace(-4, 4, 64)
+    assert torch.allclose(fn(x), torch.nn.functional.silu(x) * 2)
+    linear = torch.nn.Linear(16, 16)
+    inputs = torch.randn(4, 16, requires_grad=True)
+    torch.compile(linear)(inputs).square().mean().backward()
+    assert inputs.grad is not None
+    print("OK")
+    """
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Inductor CPU needs MSVC on PATH on Windows")
+def test_torch_compile_on_cpu_under_the_stub():
+    """With the stub installed (MLX hosts), CPU torch.compile must still build and run."""
+    pytest.importorskip("torch")
+    import shutil
+    if not any(shutil.which(cc) for cc in ("g++", "clang++", "c++")):
+        pytest.skip(reason="Inductor builds CPU kernels with a C++ compiler (g++ / clang++); none on PATH")
+    code = _COMPILE_SUBPROCESS.format(stub=str(STUB_PATH))
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                          text=True, cwd=str(REPO_ROOT), timeout=900)
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-4000:]
+    assert "OK" in proc.stdout
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -53,7 +53,7 @@ jobs:
     steps:
       # harden-runner block-mode is Linux-only; stay in audit on macOS for parity.
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           egress-policy: audit
 
@@ -86,7 +86,7 @@ jobs:
         # ModuleNotFoundError: No module named 'torch'.
         run: |
           python -m pip install --upgrade pip
-          pip install "torch>=2.4.0,<2.13.0"
+          pip install "torch>=2.4.0,<2.15.0"
           pip install -e .[mlx]
           pip install pytest==9.0.3
           # The vision model used by tests/test_mlx_generate_metal.py loads
@@ -107,12 +107,7 @@ jobs:
         # silently remove the very check that is supposed to tell us whether the
         # next release is safe to adopt.
         #
-        # mlx-vlm is upgraded past its `<=0.7.1` ceiling too. The ceiling exists
-        # because the current mlx-vlm wants transformers>=5.14.0 against this
-        # repo's `transformers<=5.5.0` cap, and leaving it out would mean the one
-        # lane that could ever justify lifting that ceiling never tests the
-        # version it would be lifted to. Letting transformers move with it is the
-        # point of this leg, and is why it does not gate.
+        # Also past mlx-vlm's <=0.7.9 ceiling (and transformers with it): non-gating.
         if: matrix.mlx == 'latest'
         run: |
           pip install --upgrade mlx mlx-lm mlx-vlm
@@ -165,6 +160,11 @@ jobs:
         # MLXTrainer, exercising the PR 684 trainer rework end to end.
         run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
 
+      - name: tests/test_mlx_runtime_cce_compile.py
+        # The runtime CCE kernels under mx.compile. No other workflow runs this file,
+        # so without this step its Metal-only cases are never executed anywhere.
+        run: python -m pytest tests/test_mlx_runtime_cce_compile.py -v -rs
+
       - name: tests/test_mlx_generate.py
         # Batched-generation logic that needs no Metal but does need the mlx-vlm
         # import: release-protocol handling, prompt-kwarg splitting, stop-string
@@ -190,6 +190,11 @@ jobs:
         # only place the kernel runs, since the file needs real Metal.
         run: python -m pytest tests/test_mlx_decode_metal.py -v -rs
 
+      - name: tests/test_mlx_load_residency_metal.py
+        # A finished load must own its weights; an offloaded one reads PLE rows and
+        # experts from the checkpoint, bit-exact against the stock modules.
+        run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
+
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
         # equivalence with aligned sampled-token logprobs, memory-limit
@@ -205,6 +210,10 @@ jobs:
       - name: tests/test_mlx_cpt_partition_metal.py
         # CPT partition, target normalization and full-module save routing.
         run: python -m pytest tests/test_mlx_cpt_partition_metal.py -v -rs
+
+      - name: tests/test_mlx_group_by_length_metal.py
+        # group_by_length through the real text plan builder (needs real MLX).
+        run: python -m pytest tests/test_mlx_group_by_length_metal.py -v -rs
 
       - name: tests/test_mlx_pr684_full_validation_metal.py
         # Deep behavior checks: resume determinism, completion-only training,
@@ -265,3 +274,10 @@ jobs:
         # model, plus the paths that must not change (already-quantized base,
         # merged_16bit, push_to_hub_merged).
         run: python -m pytest tests/test_mlx_quantized_merge_save_metal.py -v -rs
+
+      - name: tests/test_mlx_decision_metal.py
+        # Typed-decision model logits against a torch reference of laya's DecisionModel.
+        run: python -m pytest tests/test_mlx_decision_metal.py -v -rs
+
+      - name: tests/test_mlx_qat.py
+        run: python -m pytest tests/test_mlx_qat.py -v -rs
