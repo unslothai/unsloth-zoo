@@ -2982,10 +2982,7 @@ def _build_cross_shard_fp8_index(save_directory, current_filename, header_cache 
     no tensor reads). HF shards a weight and its scale companion independently, so an FP8
     weight and its `*.weight_scale(_inv)` can land in different files; this lets the rewrite
     find a scale elsewhere and drop a scale whose weight was dequantized elsewhere.
-
-    `header_cache` ({filename: (stat stamp, entries)}, owned by one export's shard loop)
-    reuses a sibling's parsed header while its inode, size and mtime are unchanged, so S
-    shards cost S header parses instead of S^2. A rewritten shard is re-read."""
+    `header_cache` (one export's shard loop) reuses a header while (inode, size, mtime) holds."""
     index = {}
     try:
         siblings = [f for f in os.listdir(save_directory)
@@ -3110,7 +3107,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
     if header_cache is not None:
-        header_cache.pop(filename, None)  # this shard may have been rewritten just before
+        header_cache.pop(filename, None)  # pre-rewrites (compressed / float32) may have changed it
     filename_original = os.path.join(save_directory, filename)
     _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
@@ -3269,7 +3266,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
         temp_filename_safetensors = tmpfile.name
     save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})
     if header_cache is not None:
-        header_cache.pop(filename, None)  # the shard is rewritten below
+        header_cache.pop(filename, None)
     try:
         os.replace(temp_filename_safetensors, filename_original)
     except OSError as e:
@@ -5936,7 +5933,7 @@ def merge_and_overwrite_lora(
         _merge_base_model, lora_weights, _merge_tie_word_embeddings,
     ) if save_method == "merged_16bit" else {}
     _widened_total_size = 0
-    _fp8_header_cache = {}  # sibling shard headers for the FP8 cross-shard index
+    _fp8_header_cache = {}
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         if _mxfp4_rewrite is not None:
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)

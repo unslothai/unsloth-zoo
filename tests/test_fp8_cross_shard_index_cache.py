@@ -1,10 +1,20 @@
-"""The FP8 cross-shard index reuses sibling shard headers across one export's shard loop.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-Each shard's rewrite indexes every other shard's header, which was S^2 header parses for
-S shards. A loop-scoped cache keeps each parsed header while the file's inode, size and
-mtime are unchanged and drops the shard being rewritten, so the merged shards must stay
-byte-identical while parsing each header once per version.
-"""
+"""FP8 cross-shard index header cache: byte-identical export, S header parses instead of S^2."""
 from __future__ import annotations
 
 import hashlib
@@ -37,8 +47,7 @@ def _quant(W):
 
 
 def _write_checkpoint(d, n_shards = 5):
-    """Each shard holds a same-shard FP8 pair, a weight whose scale is in the NEXT shard,
-    the scale of the PREVIOUS shard's weight, and a bf16 tensor."""
+    """Per shard: a same-shard FP8 pair, a weight whose scale is in the next shard, a bf16 tensor."""
     torch.manual_seed(0)
     names = [f"model-{i + 1:05d}-of-{n_shards:05d}.safetensors" for i in range(n_shards)]
     shards = [dict() for _ in names]
