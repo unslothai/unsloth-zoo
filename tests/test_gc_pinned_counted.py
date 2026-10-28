@@ -249,17 +249,16 @@ def test_foreign_pin_between_reservations_counts_against_the_cap(gc_module, allo
 
 @pytest.mark.parametrize("settings", ["pinned_max_round_threshold_mb:1", "pinned_max_cached_size_mb:1"])
 def test_foreign_pin_present_at_the_baseline_and_then_freed_cannot_lift_the_cap(gc_module, allocator, settings):
-    # A pin_memory DataLoader holds 6 MiB when the first offload takes the baseline. Once those blocks
-    # are returned to the OS (our own cap flush empties the host cache), held - baseline reads 6 MiB
-    # below what we hold, so without our own live bytes as a floor the cap admits 6 MiB more.
+    # A user-set cap bounds all pinned memory the allocator holds: a pin_memory DataLoader's 6 MiB counts
+    # while held, and once returned to the OS it frees exactly that much room, never more.
     fake = allocator(settings, cap_bytes = 10 * MIB)
     foreign = fake.allocate(6 * MIB)
-    ours = [pin(gc_module, fake, 3 * MIB) for _ in range(3)]
-    assert all(ours)
+    assert pin(gc_module, fake, 3 * MIB) is not None
+    assert pin(gc_module, fake, 3 * MIB) is None
     fake.release(foreign)
     fake.empty_cache()
     while pin(gc_module, fake, 3 * MIB) is not None: pass
-    assert fake.held() <= 10 * MIB + 64
+    assert fake.peak <= 10 * MIB + 64 and fake.held() == pytest.approx(9 * MIB, abs = 64)
 
 
 def test_counted_path_reads_the_allocator_on_every_reservation(monkeypatch, gc_module, allocator):

@@ -212,7 +212,7 @@ _WARNED_ABOUT_PINNED_CAP = False
 _PINNED_CACHED = {}         # rounded block bytes -> count released but still cached
 _PINNED_LIVE = {}           # requested bytes -> blocks charged at allocation, still live
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
-_PINNED_RELEASED = 0        # settings mode: bytes released since the last flush (may be cached or wait on events)
+_PINNED_RELEASED = 0        # settings mode: blocks released since the last flush (may wait on events)
 
 
 # torch 2.13+ host allocator settings (c10/core/AllocatorConfig.h): above pinned_max_round_threshold_mb
@@ -319,7 +319,8 @@ def _host_cache_reuses_block(block):
     return False
 
 
-def _compute_pinned_cap():
+def _compute_pinned_cap(held = None):
+    """`held`: counted mode, the allocator's pinned bytes now (everyone's), which the cap then bounds."""
     env = os.environ.get("UNSLOTH_GC_PINNED_MAX_GB")
     if env:
         try: return max(0, int(float(env) * (1 << 30)))
@@ -332,8 +333,9 @@ def _compute_pinned_cap():
         return -1  # unmeasurable: keep the old uncapped behaviour
     if _local_world_size() == 1: return _PIN_PER_BLOCK
     reserve = max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
-    # Bytes this process already pinned are missing from `available`, so add them back.
-    return max(0, vm.available - reserve) // _local_world_size() + GC_PINNED_BYTES
+    # Bytes already pinned are missing from `available`, so add them back: ours, or in counted mode
+    # everything the allocator holds now (a user-set cap bounds all of it instead).
+    return max(0, vm.available - reserve) // _local_world_size() + (GC_PINNED_BYTES if held is None else held)
 
 
 def _block_fits_host_ram(block):
@@ -485,33 +487,25 @@ def _host_alloc_settings_active():
 
 def _reserve_pinned_counted(nbytes, block):
     """None if the allocator cannot be read (the simulated path then decides)."""
-    global GC_PINNED_BYTES, GC_PINNED_CAP, _HOST_HELD_BASELINE
+    global GC_PINNED_BYTES, GC_PINNED_CAP
     # Read on every reservation: other pinned users allocate between ours, and cache reuse is unknowable.
+    # The cap bounds everything the allocator holds (live, cached, event-pending, anyone's): our real block
+    # sizes are unobservable (a larger cached block can be reused), but they never exceed held.
     held = _host_allocator_held_bytes()
     if held is None: return None
-    if _HOST_HELD_BASELINE is None: _HOST_HELD_BASELINE = max(0, held - GC_PINNED_BYTES)
     if GC_PINNED_CAP is None:
-        GC_PINNED_CAP = _compute_pinned_cap()
+        GC_PINNED_CAP = _compute_pinned_cap(held)
     if GC_PINNED_CAP == _PIN_PER_BLOCK:
         if not _block_fits_host_ram(block) and not (_empty_host_cache() and _block_fits_host_ram(block)):
             _warn_host_ram_full()
             return False
-    elif GC_PINNED_CAP >= 0 and _counted_used(held) + block > GC_PINNED_CAP:
+    elif GC_PINNED_CAP >= 0 and held + block > GC_PINNED_CAP:
         if not _counted_slow_path_fits(block):
             _warn_pinned_cap()
             return False
-    GC_PINNED_BYTES += block  # our live blocks: a floor under the allocator's count (_counted_used)
+    GC_PINNED_BYTES += block  # bookkeeping only: the cap reads the allocator
     _charge_live(nbytes, -block)  # negative: released the counted way, whatever the settings by then
     return True
-
-
-def _counted_used(held):
-    # Our live and released (maybe still cached) blocks are a floor: a pinned user present when the baseline
-    # was taken may since have returned its blocks to the OS, which lowers held - baseline. Released bytes
-    # past what the allocator holds beyond our live blocks are gone, so drop those for good.
-    global _PINNED_RELEASED
-    _PINNED_RELEASED = min(_PINNED_RELEASED, max(0, held - GC_PINNED_BYTES))
-    return max(held - _HOST_HELD_BASELINE, GC_PINNED_BYTES + _PINNED_RELEASED)
 
 
 def _counted_slow_path_fits(block):
@@ -526,10 +520,10 @@ def _counted_slow_path_fits(block):
         if not _is_host_alloc_oom(exception): raise
     else: del drain
     held = _host_allocator_held_bytes()
-    if held is not None and _counted_used(held) + block <= GC_PINNED_CAP: return True
+    if held is not None and held + block <= GC_PINNED_CAP: return True
     if not _empty_host_cache(): return False
     held = _host_allocator_held_bytes()
-    return held is not None and _counted_used(held) + block <= GC_PINNED_CAP
+    return held is not None and held + block <= GC_PINNED_CAP
 
 
 def _charge_live(nbytes, block):
@@ -562,9 +556,9 @@ def _release_pinned_unlocked(nbytes):
         block = _pinned_block_bytes(nbytes)
     if not block: return
     if block < 0:
-        # Reserved against the allocator's count: it may stay cached or wait on its events.
+        # Reserved against the allocator's count: remember only that a block may wait on its events.
         GC_PINNED_BYTES = max(0, GC_PINNED_BYTES + block)
-        _PINNED_RELEASED -= block
+        _PINNED_RELEASED += 1
         return
     if _pinned_block_cached(block):
         _PINNED_CACHED[block] = _PINNED_CACHED.get(block, 0) + 1

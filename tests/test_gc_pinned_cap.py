@@ -438,19 +438,55 @@ def counted(monkeypatch, gc_module, allocator):
     return allocator
 
 
+def _auto_cap(monkeypatch, cap_bytes):
+    """Free host RAM worth `cap_bytes` per rank over two local ranks (reserve: 15% of 100 GiB)."""
+    gib = 1 << 30
+    _fake_host(monkeypatch, total_gib = 100, available_gib = 15 + 2 * cap_bytes / gib)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+
+
 def test_freed_baseline_pin_cannot_hide_our_cached_blocks(gc_module, counted):
-    # A 6 MiB foreign pin sets the baseline, one of our two 4 MiB blocks is released (cached), then the
-    # foreign block goes back to the OS: held is 8 MiB, all ours. A 5 MiB block must not pin to 13 MiB.
+    # A user-set cap bounds every pinned byte the allocator holds: with a 6 MiB foreign pin, one of our
+    # 4 MiB blocks released (cached) and the foreign block back to the OS, nothing pins past 10 MiB.
     fake = counted("pinned_max_cached_size_mb:4", cap_bytes = 10 * MIB)
     foreign = fake.allocate(6 * MIB)
-    a = pin(gc_module, fake, 3 * MIB)
-    b = pin(gc_module, fake, 3 * MIB)
-    assert a and b and fake.held() == 14 * MIB
-    unpin(gc_module, fake, 3 * MIB, b)
+    live = [(n, pin(gc_module, fake, n)) for n in (3 * MIB, 3 * MIB)]
+    live = [(n, block) for n, block in live if block]
+    assert live
+    unpin(gc_module, fake, *live.pop())
     fake.release(foreign)                        # above the cached max: returned to the OS
-    assert fake.held() == 8 * MIB
     pin(gc_module, fake, 5 * MIB)
-    assert fake.held() <= 10 * MIB
+    assert fake.peak <= 10 * MIB
+
+
+@pytest.mark.parametrize("user_cap", [True, False])
+def test_reused_larger_cached_block_cannot_lift_the_cap(monkeypatch, gc_module, counted, user_cap):
+    # Codex 4406863867, torch 2.14: a 3 MiB request reuses a cached 3.5 MiB block, so our own count runs
+    # 0.5 MiB short. Once the 6 MiB foreign pin is gone, 3 + 0.5 MiB more must still respect the cap.
+    if not user_cap: _auto_cap(monkeypatch, 10 * MIB)
+    fake = counted("pinned_max_round_threshold_mb:1", cap_bytes = 10 * MIB if user_cap else None)
+    foreign = fake.allocate(6 * MIB)
+    live = [(n, pin(gc_module, fake, n)) for n in (int(3.5 * MIB), int(3.5 * MIB))]
+    live = [(n, block) for n, block in live if block]
+    unpin(gc_module, fake, *live.pop())
+    live.append((3 * MIB, pin(gc_module, fake, 3 * MIB)))
+    fake.release(foreign)
+    fake.empty_cache()
+    live += [(n, pin(gc_module, fake, n)) for n in (3 * MIB, MIB // 2)]
+    assert fake.held() <= gc_module.GC_PINNED_CAP   # all ours now: 10.5 MiB before the fix
+    assert fake.peak <= gc_module.GC_PINNED_CAP
+    if user_cap: assert gc_module.GC_PINNED_CAP == 10 * MIB
+
+
+def test_auto_cap_is_not_reduced_by_foreign_pins_present_when_computed(monkeypatch, gc_module, counted):
+    # Free host RAM already excludes the 6 MiB pinned when the cap is computed, so the auto cap adds it back:
+    # the offload still gets its 10 MiB on top.
+    _auto_cap(monkeypatch, 10 * MIB)
+    fake = counted("pinned_max_round_threshold_mb:1")
+    fake.allocate(6 * MIB)
+    ours = [pin(gc_module, fake, 3 * MIB) for _ in range(4)]
+    assert all(ours[:3]) and ours[3] is None
+    assert gc_module.GC_PINNED_CAP == 16 * MIB and fake.peak == 15 * MIB
 
 
 def test_concurrent_reservations_cannot_spend_the_same_headroom(monkeypatch, gc_module, counted):
