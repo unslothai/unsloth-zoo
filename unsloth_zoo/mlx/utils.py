@@ -11034,6 +11034,36 @@ def _restore_mlx_rng_key(words):
     mx.random.seed((pair[0] << 32) | pair[1])
 
 
+def _compile_state_snapshot(tree):
+    """Shallow copies of every dict / list in a compiled step's captured state.
+
+    A captured-state ``mx.compile`` trace that raises leaves its placeholder
+    arrays (and any keys it added) in those containers, and evaluating one
+    later fails with "eval an array without a primitive".
+    """
+    snapshot = []
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            snapshot.append((node, dict(node)))
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            snapshot.append((node, list(node)))
+            pending.extend(node)
+    return snapshot
+
+
+def _restore_compile_state(snapshot):
+    # The plain container methods: nn.Module overrides update() with a strict tree merge.
+    for node, contents in snapshot:
+        if isinstance(node, dict):
+            dict.clear(node)
+            dict.update(node, contents)
+        else:
+            list.__setitem__(node, slice(None), contents)
+
+
 @contextlib.contextmanager
 def _preserved_preprocessing_rng():
     """Run a block without leaving the shared preprocessing RNGs advanced.
