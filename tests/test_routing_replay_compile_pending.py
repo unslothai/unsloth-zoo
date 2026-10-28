@@ -71,13 +71,11 @@ def _layer(replay, formula = "softmax"):
     model = _Model()
     assert replay.install_routing_replay(model) == 1
     layer = model.model.layers[0]
-    # What the trainer's preparation primes; the signature projection is left cold on purpose.
     layer.router._unsloth_replay_formula = formula
     return layer
 
 
 def _forward(replay, fn, x, forced, record = True):
-    # One checkpointed decoder forward, as _decoder_pre_hook sets it up.
     replay._STATE.in_forward = True
     replay._STATE.current = None if forced is None else torch.tensor(forced).unsqueeze(1)
     if replay._STATE.recomputed:
@@ -102,14 +100,12 @@ def test_cold_fullgraph_layer_traces_without_eager_warm_up(replay, backend):
     assert ids.sort(-1).values.tolist() == [[0, 1]] * 4
     out.sum().backward()
     assert torch.isfinite(x.grad).all()
-    # The op caches the projection the eager path builds: forwards keep their signatures.
     generator = torch.Generator().manual_seed(0x5EED)
     expected = torch.randn(8, 2, generator = generator, dtype = torch.float32)
     assert torch.equal(replay._SIGNATURE_PROJECTIONS[(8, "cpu")], expected)
 
 
 def _steps(replay, fn, counts):
-    # Identical inputs forced to different experts per forward, one backward per step.
     grads, graphs = [], []
     for count in counts:
         before = dynamo_utils.counters["stats"]["unique_graphs"]
@@ -139,11 +135,9 @@ def test_pending_forward_count_is_not_a_guard(replay, backend):
     grads, graphs = _steps(replay, fn, counts)
     # Forward + recompute graphs, and one more once _STATE.changed holds a tensor; none after.
     assert sum(graphs) <= 3 and graphs[2:] == [0] * (len(counts) - 2), graphs
-    # aot_eager runs the eager kernels: bitwise. Inductor fuses them: within a few ulp.
     exact = dict(rtol = 0, atol = 0) if backend == "aot_eager" else {}
     for got, want in zip(grads, reference):
         torch.testing.assert_close(got, want, **exact)
-    # Each forward recomputed with its own forced experts: the gradients tell them apart.
     assert not torch.equal(reference[1][0], reference[1][1])
 
 
@@ -166,8 +160,6 @@ def test_compiled_recompute_of_a_layer_that_never_replayed_keeps_natural_routing
     [(2, True), (3, False)], [(3, False), (2, True)], [(2, True), (2, False)], [(2, True), (2, True)],
 ])
 def test_non_reentrant_compiled_recompute_matches_eager(replay, forwards):
-    # (rows, replayed). A natural forward recomputes through the same ops as a replayed one, so
-    # the non-reentrant checkpoint sees the tensors its forward saved.
     def run(compiled, use_reentrant):
         replay.reset_routing_replay()
         torch._dynamo.reset()
@@ -197,9 +189,7 @@ def test_non_reentrant_compiled_recompute_matches_eager(replay, forwards):
 
 @pytest.mark.parametrize("natural_first", [False, True])
 def test_non_reentrant_natural_forward_with_identical_inputs_keeps_its_own_routing(replay, natural_first):
-    # Distinct inputs with identical values: one forward replays [0, 1], the other keeps its natural
-    # routing. Fingerprint and signature match, so only the natural forward's own record (and its
-    # input addresses) stops its recompute from taking the replayed forward's experts.
+    # Identical values, one replayed and one natural: only input addresses tell them apart.
     values = torch.arange(8.0).reshape(1, 8)  # natural top-2: experts [7, 6]
     order = [None, [[0, 1]]] if natural_first else [[[0, 1]], None]
 

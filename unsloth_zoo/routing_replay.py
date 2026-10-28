@@ -156,8 +156,7 @@ class _ReplayState:
         self.in_forward = False
         self.record = None
         self.pending = []
-        # bool(pending) for compiled regions: reading the list there guards on its length, so a
-        # compiled layer would recompile once per number of pending forwards.
+        # Read in compiled regions instead of the list, whose length would become a Dynamo guard.
         self.has_pending = False
         self.recomputed = False
         self.layer_inputs = {}
@@ -527,8 +526,7 @@ def _input_signature(args, tokens):
     # Autocast would run the projection in bf16 / fp16 and merge nearby inputs.
     with torch.no_grad(), torch.autocast(device_type = x.device.type, enabled = False):
         x = x.detach().reshape(tokens, -1)
-        # A fullgraph region cannot create the seeded Generator: the opaque op builds (and caches)
-        # the same projection at run time, so a cold compiled layer traces without an eager warm-up.
+        # Fullgraph cannot create the seeded Generator: the opaque op builds the projection.
         projection = _PROJECTION_OP(x) if torch.compiler.is_compiling() \
             else _signature_projection(x.shape[-1], x.device)
         # Chunked so the fp32 upcast stays bounded for long sequences.
@@ -550,9 +548,7 @@ def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
 
 
 def _compiled_recomputed_routes(layer_index, ids2, signature, layer_input):
-    # Traced code must not read the pending list: Dynamo would guard on its length and the layer
-    # would recompile once per number of pending forwards. The pick runs in an opaque op instead;
-    # it returns the natural ids, all invalid, when no forward recorded this layer.
+    # Opaque so Dynamo never guards on the pending list's length (recompile per forward count).
     if not _STATE.has_pending:
         return None
     _STATE.recomputed = True
@@ -575,7 +571,6 @@ def _recompute_fake(ids2, signature, layer_input, layer_index):
 
 
 def _natural_impl(ids2: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor]:
-    # The natural ids, every row invalid: reweighting with these keeps the natural routing.
     return ids2.long().clone(), torch.zeros(ids2.shape[0], 1, dtype = torch.bool, device = ids2.device)
 
 
@@ -743,8 +738,7 @@ def _router_hook(layer_index, compact = None):
             recomputed = None
         elif torch.compiler.is_compiling() and _STATE.has_pending \
                 and getattr(module, "_unsloth_replay_formula", None) is None:
-            # Recording a forward picks the formula first, so none of them replayed this layer:
-            # recompute it as it ran (as _recomputed_routes would), without tracing the formula probe.
+            # No forward replayed this layer: recompute as it ran, without tracing the formula probe.
             _STATE.recomputed = True
             recomputed = _NATURAL
         else:
@@ -760,10 +754,8 @@ def _router_hook(layer_index, compact = None):
             or row >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
         )
-        # A compiled checkpointed forward recomputes through the opaque pick, which always reweights
-        # (all rows invalid when nothing was recorded). Reweight here too, every row invalid, so the
-        # forward saves the same tensors as its recompute (non-reentrant checkpoint checks them).
-        # The weights and ids keep their natural values: torch.where picks the natural ones.
+        # The recompute always reweights via the opaque pick; reweight here too (all rows invalid)
+        # so the non-reentrant checkpoint sees identical saved tensors.
         mirror = natural and _STATE.record is not None and torch.compiler.is_compiling() \
             and isinstance(getattr(module, "_unsloth_replay_formula", None), str)
         if natural and not mirror:
@@ -800,8 +792,7 @@ def _router_hook(layer_index, compact = None):
             return None
 
         if mirror:
-            # Through an opaque op and the recompute's ops below: in-graph constants would be
-            # rematerialised in the backward instead of saved, and the saved tensors would differ.
+            # Opaque: in-graph constants are rematerialised in backward, so saved tensors would differ.
             recomputed = _NATURAL_OP(ids2)
         if recomputed is None:
             # Replay rows live on the input ids' device; a device map can put this layer elsewhere.
@@ -818,9 +809,7 @@ def _router_hook(layer_index, compact = None):
             forced, valid = recomputed
             forced = torch.where(valid, forced, ids2.long())
             if mirror:
-                # Recorded too (natural ids, every row invalid): a replayed forward with the same
-                # natural routes and router input would otherwise be the only candidate, and this
-                # forward's recompute would take its forced experts. Input addresses tell them apart.
+                # Recorded too, else an identical replayed forward would donate its forced experts.
                 _STATE.record[layer_index] = (
                     _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
                 )
