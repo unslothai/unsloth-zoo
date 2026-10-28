@@ -6778,16 +6778,14 @@ pass
 
 
 def _lora_is_sharded(model):
-    """True when native FSDP2 holds the adapters as DTensor shards. Only True is cached: the Trainer
-    shards a model after it loaded, so an early False can go stale."""
+    """True when FSDP2 holds the adapters as DTensors. Only True is cached: sharding happens after load."""
     # All Unsloth Zoo code licensed under LGPLv3
     if model.__dict__.get("_unsloth_lora_is_sharded"): return True
     try:
         from torch.distributed.tensor import DTensor
     except Exception:
         return False
-    # fully_shard shards every unit's adapters together, so the first lora_A / lora_B decides. Stopping
-    # there keeps the unsharded case (single GPU, DDP: every load_lora) from walking every parameter.
+    # First adapter decides; avoids walking every parameter on each load_lora.
     sharded = False
     for n, p in model.named_parameters():
         if ".lora_A." in n or ".lora_B." in n:
@@ -6799,20 +6797,14 @@ pass
 
 
 def _lora_state_dict(model):
-    """The lora_A / lora_B entries of model.state_dict(), whole, for vLLM and the adapter files.
-
-    Under native FSDP2 they are DTensor shards: each is gathered (full_tensor, a collective every rank
-    enters in state dict order), and the state dict is taken outside inference mode, where FSDP2's
-    state_dict fails with "Cannot set version_counter for inference tensor" (save_lora / load_lora
-    run under torch.inference_mode).
-    """
+    """Full lora_A / lora_B tensors. Under FSDP2: gathered (collective on every rank), and taken outside
+    inference mode, where FSDP2 state_dict fails with "Cannot set version_counter for inference tensor"."""
     # All Unsloth Zoo code licensed under LGPLv3
     def lora_items(state_dict):
         return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
     if not _lora_is_sharded(model):
         return lora_items(model.state_dict())
     from torch.distributed.tensor import DTensor
-    # A save gated on rank 0 (fine under DDP) would wait here forever for the other ranks' gather.
     _merged_rollout_log_once(
         "Unsloth: native FSDP2 gathers the LoRA adapters across ranks for save_lora / load_lora, "
         "so every rank must call them (a call on rank 0 alone waits for the others)."
@@ -6829,8 +6821,7 @@ def prepare_merged_rollout(model):
     # All Unsloth Zoo code licensed under LGPLv3
     if not _merged_rollout_enabled(): return None
     if _lora_is_sharded(model):
-        # The fold writes each rank's whole delta into the engine's weights; sharded adapters would
-        # need a gather per layer first. vLLM LoRA serves the gathered adapters instead (load_lora).
+        # Fold needs whole deltas; vLLM LoRA serves the gathered adapters instead.
         if getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
             _merged_rollout_log_once(
                 "Unsloth: merged-weight vLLM rollouts are off under native FSDP2 (sharded adapters); "

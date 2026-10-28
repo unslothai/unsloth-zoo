@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference = True under Unsloth's native FSDP2 (UNSLOTH_FSDP2=1 torchrun).
-
-FSDP2 holds the LoRA adapters as DTensor shards, so model.state_dict() hands save_lora / load_lora
-shards (and under their torch.inference_mode it fails outright). vLLM and the adapter files need each
-lora_A / lora_B whole: both now gather them (a collective every rank enters) outside inference mode,
-and merged-weight rollouts decline sharded adapters. CPU only: two
-torchrun ranks over gloo, fully_shard on a CPU mesh, no vLLM engine.
-"""
+"""save_lora / load_lora gather FSDP2-sharded LoRA adapters. CPU only: two gloo torchrun ranks, no vLLM."""
 
 import json
 import os
@@ -157,7 +150,6 @@ json.dump(res, open(sys.argv[1], "w"))
 
 
 def test_unsharded_check_stops_at_the_first_adapter(tmp_path):
-    # load_lora runs this every GRPO step on single GPU / DDP: it must not walk every parameter.
     script = tmp_path / "scan.py"
     script.write_text(textwrap.dedent(_SCAN_WORKER))
     out = tmp_path / "scan.json"
