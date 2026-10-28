@@ -17,7 +17,7 @@ import pytest
 import torch
 
 if not hasattr(torch, "float8_e4m3fn"):
-    pytest.skip("float8_e4m3fn unavailable", allow_module_level=True)
+    pytest.skip(reason = "this torch build has no float8_e4m3fn, so no FP8 shards can be written", allow_module_level = True)
 
 from safetensors.torch import save_file
 

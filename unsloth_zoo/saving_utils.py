@@ -5868,11 +5868,13 @@ def merge_and_overwrite_lora(
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("FP8 MoE-expert LoRA detected: dequantizing to 16bit, then merging experts.")
         _prerewrite_fp8_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list)
+        _prerewrite_header_cache = {}
         for _fn in final_safetensors_list:
             _merge_and_overwrite_lora_fp8(
                 save_directory, _fn, defaultdict(lambda: None), output_dtype, _merge_model_class_name,
                 tie_word_embeddings = _merge_tie_word_embeddings,
                 weight_block_size = _merge_weight_block_size,
+                header_cache = _prerewrite_header_cache,
             )
         _drop_resolved_fp8_scales_after_rewrite(save_directory, final_safetensors_list, _prerewrite_fp8_keys)
         # Model is now 16bit on disk; merge expert LoRA via the standard (non-quantized) path.
