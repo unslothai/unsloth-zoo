@@ -526,3 +526,26 @@ def test_frozen_head_without_entropy_keeps_the_log_prob_op(monkeypatch):
     _, _, engaged = _run(True, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, without_entropy = False,
                          entropy_coef = 0.01)
     assert engaged == 1
+
+
+def test_fused_oom_buffers_are_released_before_the_fallback(monkeypatch):
+    import gc
+    import weakref
+    refs, alive = [], []
+
+    def oom(*args, **kwargs):
+        buf = torch.empty(1024)  # a buffer the failed projection still holds when it raises
+        refs.append(weakref.ref(buf))
+        raise torch.cuda.OutOfMemoryError("injected")
+
+    real = rr.grpo_chunked_hidden_states_logprobs
+
+    def scorer(*args, **kwargs):
+        gc.collect()
+        alive.append(refs[-1]() is not None)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fg, "fused_linear_grpo_loss", oom)
+    monkeypatch.setattr(rr, "grpo_chunked_hidden_states_logprobs", scorer)
+    _run(True, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV)
+    assert alive == [False]

@@ -4056,8 +4056,10 @@ def grpo_accumulated_loss(
                 _fused_done = True
             except torch.cuda.OutOfMemoryError:
                 # Out of memory in the fused projection: the log-prob op and the loss below, as without the route
-                # (the deferred packed / PrefixGrouper projection otherwise loses their own OOM recovery).
+                # (the deferred packed / PrefixGrouper projection otherwise loses their own OOM recovery). Scored
+                # after the handler, so the failed call's traceback (and its buffers) is gone first.
                 _fused_stats["oom"] += 1
+            if not _fused_done:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 new_logprobs, new_entropies = _score_deferred(_fused_items, _entropy_bonus_on)
