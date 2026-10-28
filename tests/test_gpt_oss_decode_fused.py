@@ -49,8 +49,8 @@ _SCRIPT = textwrap.dedent('''
 
     def ulps(a, b):
         # Distance in units of the dtype's last place (bf16 / fp16 / fp32).
+        eps = torch.finfo(a.dtype).eps
         a, b = a.float(), b.float()
-        eps = torch.finfo(torch.bfloat16 if a.dtype == torch.bfloat16 else a.dtype).eps
         return float(((a - b).abs() / (b.abs().clamp_min(2.0 ** -10) * eps)).max())
 
     g = torch.Generator().manual_seed(0)
