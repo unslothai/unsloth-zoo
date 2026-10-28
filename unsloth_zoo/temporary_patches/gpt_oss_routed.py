@@ -27,6 +27,7 @@ __all__ = [
     "routed_decode_epoch",
 ]
 
+import functools
 import os
 import weakref
 from operator import attrgetter, is_, itemgetter, methodcaller
@@ -49,6 +50,20 @@ from .moe_routed import (
 )
 from .moe_grouped_modulelist import _StackedLoraLinear, _lora_stacks
 from . import moe_ready_epoch as _moe_ready
+
+
+def _eager_out_of_dynamo(fn):
+    """fn inlined while Dynamo traces it, and run with Dynamo off otherwise. When Inductor skips a compiled frame
+    (SkipFrame, e.g. bfloat16 on a T4) the frame runs eagerly but Dynamo still converts every nested frame, and the
+    eager branches here (pointer tables, data_ptr, direct Triton launches) cannot be traced on their own."""
+    eager = torch.compiler.disable(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return fn(*args, **kwargs)
+        return eager(*args, **kwargs)
+    return wrapper
 
 
 def _mixed_adapter_batch(module):
@@ -359,6 +374,8 @@ def _track(experts):
     return not hooked
 
 
+# Eager only, also for its direct callers outside the routed forwards (see _eager_out_of_dynamo).
+@torch.compiler.disable
 def prepare_routed_experts(experts, epoch = None):
     """Build (or validate) the pointer tables for a ModuleList NF4 experts module.
 
@@ -488,6 +505,7 @@ def _stacked_lora(projs, name, first, cache):
     return cache["A"], cache["B"], first.scaling[name]
 
 
+@_eager_out_of_dynamo
 def routed_experts_forward(experts, hidden_states, router_indices, routing_weights, _state = None):
     """Routed eval forward for NF4 gpt-oss experts, or None. routing_weights: [T, E] or [T, top_k]."""
     if _routed_disabled():
@@ -588,6 +606,7 @@ def routed_bf16_eligible(experts, hidden_states):
     return _bf16_supported_index(w.device.index)
 
 
+@_eager_out_of_dynamo
 def routed_bf16_forward(experts, hidden_states, router_indices, routing_weights):
     """gpt-oss experts on only the routed experts. routing_weights: [T, E] (dense, zero off
     the picked experts) or [T, top_k]; returns [B, S, H] in hidden_states.dtype."""
@@ -612,6 +631,7 @@ def routed_bf16_forward(experts, hidden_states, router_indices, routing_weights)
     return out.view(shape)
 
 
+@_eager_out_of_dynamo
 def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS, epoch = None):
     """gpt-oss MLP output from the router and only the routed experts, or None for calls larger
     than max_slots (token, expert) pairs or experts this path does not cover. epoch: see prepare_routed_experts."""
