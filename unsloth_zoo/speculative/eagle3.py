@@ -660,6 +660,7 @@ class UnslothEagle3Trainer(Trainer):
                 pad = getattr(tokenizer, "eos_token_id", 0) or 0
             kwargs["data_collator"] = MTPDataCollator(pad)
         kwargs["data_collator"] = _SupervisedRowLabels(kwargs["data_collator"])
+        model._unsloth_num_items_labels = "shifted"
         super().__init__(model = model, args = args, **kwargs)
         # compute_loss normalizes by num_items_in_batch itself, so the Trainer must not also divide by GA.
         self.model_accepts_loss_kwargs = True
