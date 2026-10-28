@@ -24,6 +24,8 @@ import textwrap
 import pytest
 import torch
 
+import torch._dynamo  # noqa: F401  (before runtime_wrappers: importing it alone is a circular import)
+
 runtime_wrappers = pytest.importorskip("torch._functorch._aot_autograd.runtime_wrappers")
 if not hasattr(runtime_wrappers, "_check_custom_op_aliasing"):
     pytest.skip("torch has no custom op aliasing check (< 2.11)", allow_module_level = True)
