@@ -50,7 +50,7 @@ from .utils import (
 )
 
 try:
-    from ..gpt_oss_decode_fused import (
+    from unsloth_zoo.gpt_oss_decode_fused import (
         fused_decode_ok as _fused_decode_ok,
         sink_scale_output as _sink_scale_output,
     )

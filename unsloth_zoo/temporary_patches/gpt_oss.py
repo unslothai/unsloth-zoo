@@ -47,7 +47,7 @@ except Exception:
     def _fused_route_or_none(*args, **kwargs):
         return None
 from .gpt_oss_routed import ROUTED_MAX_SLOTS, prepare_routed_experts, routed_experts_forward, routed_mlp_forward
-from ..gpt_oss_decode_fused import add_rms_norm as _fused_add_rms_norm, fused_decode_ok as _fused_decode_ok
+from unsloth_zoo.gpt_oss_decode_fused import add_rms_norm as _fused_add_rms_norm, fused_decode_ok as _fused_decode_ok
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
