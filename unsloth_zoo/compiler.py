@@ -2173,6 +2173,26 @@ pass
 
 
 _RELATIVE_IMPORT = re.compile(r"^(\s*)from (\.+)([A-Za-z_][\w.]*)? import ", flags = re.MULTILINE)
+_TOP_LEVEL_DEF = re.compile(r"^def (\w+)\(", flags = re.MULTILINE)
+
+
+def _items_to_import(functions, new_source, name):
+    """Names in `functions` used by `new_source`, minus `name` and its own top level defs."""
+    defined = None
+    items = []
+    for x in functions:
+        if x not in new_source or x == name:
+            continue
+        # Only ASCII identifiers are exactly what `\w+` captures.
+        if x.isascii() and x.isidentifier():
+            if defined is None:
+                defined = set(_TOP_LEVEL_DEF.findall(new_source))
+            if x in defined:
+                continue
+        elif re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE):
+            continue
+        items.append(x)
+    return items
 
 
 def _absolute_relative_imports(source, model_location):
@@ -2239,15 +2259,7 @@ def create_new_function(
     pass
 
     # Import items to make the function executable; a same-named method is not a local def
-    items = [
-        x
-        for x in functions
-        if (
-            (x in new_source)
-            and (x != name)
-            and not re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE)
-        )
-    ]
+    items = _items_to_import(functions, new_source, name)
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
@@ -6592,15 +6604,20 @@ def unsloth_compile_transformers(
     # Get functions which are called
     called_functions = []
     for function in functions:
+        # `called` needs `<function>(` and both must match; one match of each is enough.
+        if function + "(" not in full_source:
+            continue
         # Start of text
-        defined = re.findall(
+        defined = re.search(
             r"\bdef[\s]{1,}" + re.escape(function), full_source, flags=re.DOTALL
         )
+        if defined is None:
+            continue
         # Disable self.
-        called = re.findall(
+        called = re.search(
             r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags=re.DOTALL
         )
-        if len(defined) != 0 and len(called) != 0:
+        if called is not None:
             if function_defined_elsewhere(modeling_file, function):
                 continue
             called_functions.append(function)
