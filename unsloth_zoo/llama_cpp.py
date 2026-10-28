@@ -7066,17 +7066,78 @@ def _model_block_count(shapes):
     return highest + 1 if highest >= 0 else None
 
 
+# Arrays longer than this (the vocabulary: tokens, merges, scores, token types) are
+# not split into one numpy view per entry when the verifier reads a GGUF back.
+_GGUF_VERIFY_BULK_ARRAY_MIN = 1024
+
+
 def _open_gguf_reader(path):
-    """A plain `GGUFReader`, imported at the call site.
+    """A `GGUFReader`, imported at the call site, for the verifier only.
 
     A previous `Partial_GGUFReader` (an exec'd rewrite of `GGUFReader.__init__`
     building only the last tensor) bought nothing: the cost is `_build_fields`
-    parsing the vocabulary, while `_build_tensors` only makes lazy memmap views.
-    Reading a file back still costs the parent ~0.8 GB of unreclaimable anonymous
-    heap on a 262k vocabulary, and the parent has no OOM retry, unlike the child.
+    parsing the vocabulary, two numpy views per token, while `_build_tensors` only
+    makes lazy memmap views. So a long array is walked without those views: a
+    numeric one becomes a single view (`contents()` unchanged), and a string one
+    keeps only its first entry (`field.data` is still non-empty). The verifier never
+    reads array entries. Anything out of bounds goes to the stock parser, so a
+    truncated or corrupt file fails exactly as before.
     """
+    import struct
+    import sys
+    import numpy as np
+    from gguf.constants import GGUFValueType  # type: ignore
     from gguf.gguf_reader import GGUFReader  # type: ignore
-    return GGUFReader(path, "r")
+
+    class _VerifyGGUFReader(GGUFReader):
+        def _get_field_parts(self, orig_offs, raw_type):
+            bulk = None
+            try:
+                if raw_type == GGUFValueType.ARRAY:
+                    bulk = self._bulk_array_parts(orig_offs)
+            except Exception:
+                bulk = None
+            if bulk is not None:
+                return bulk
+            return super()._get_field_parts(orig_offs, raw_type)
+
+        def _bulk_array_parts(self, orig_offs):
+            raw_itype = self._get(orig_offs, np.uint32)
+            alen = self._get(orig_offs + 4, np.uint64)
+            if len(raw_itype) != 1 or len(alen) != 1:
+                return None
+            count = int(alen[0])
+            if count <= _GGUF_VERIFY_BULK_ARRAY_MIN:
+                return None
+            itype = GGUFValueType(int(raw_itype[0]))
+            types = [GGUFValueType.ARRAY, itype]
+            offs = orig_offs + 12
+            nptype = self.gguf_scalar_to_np.get(itype)
+            if nptype is not None:
+                items = self._get(offs, nptype, count)
+                if len(items) != count:
+                    return None
+                return 12 + int(items.nbytes), [raw_itype, alen, items], [2], types
+            if itype != GGUFValueType.STRING:
+                return None
+            order = np.dtype(np.uint64).newbyteorder(self.byte_order).byteorder
+            if order == "=" or order == "|":
+                order = "<" if sys.byteorder == "little" else ">"
+            unpack = struct.Struct(order + "Q").unpack_from
+            data = memoryview(self.data)
+            end = len(data)
+            first = offs
+            for _ in range(count):
+                if offs + 8 > end:
+                    return None
+                offs += 8 + unpack(data, offs)[0]
+                if offs > end:
+                    return None
+            first_len = self._get(first, np.uint64)
+            first_str = self._get(first + 8, np.uint8, first_len[0])
+            return offs - orig_offs, [raw_itype, alen, first_len, first_str], [3], types
+
+    return _VerifyGGUFReader(path, "r")
 
 
 def _gguf_open_shards(gguf_file):
