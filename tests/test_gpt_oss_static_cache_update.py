@@ -151,7 +151,7 @@ _GEN = textwrap.dedent('''
     with torch.no_grad():
         out = model.generate(ids, attention_mask = torch.ones_like(ids), max_new_tokens = 20, do_sample = False,
                              pad_token_id = 0, output_scores = True, return_dict_in_generate = True,
-                             cache_implementation = "static")
+                             cache_implementation = "static", disable_compile = True)  # eager decode loop
     res = {"tokens": out.sequences.tolist(), "scores": torch.stack(out.scores, 1).float().tolist(),
            "calls": F.FUSED_DECODE_CALLS["static_cache_update"]}
     print("RESULT " + json.dumps(res))
