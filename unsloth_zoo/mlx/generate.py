@@ -2682,6 +2682,7 @@ def _media_token_ids(config) -> set[int]:
 
 
 _SINGLE_ROW_PREDICATE = "_is_single_row_batch_cache"
+_SINGLE_ROW_EXTRACT = "_extract_row_cache"
 _SINGLE_ROW_PARAMETERS = (
     "self", "inputs", "inputs_embeds", "mask", "cache", "position_ids", "capture_layer_ids", "hidden_sink",
 )
@@ -2693,11 +2694,12 @@ def _single_row_predicate(call):
     """mlx-vlm's predicate for the single-row shortcut *call* takes, or None when it takes none we know.
 
     Its global is swapped once for a wrapper that answers the same unless a call through
-    ``single_row_batch_decode`` has asked to skip the shortcut on this thread.
+    ``single_row_batch_decode`` has asked to skip the shortcut on this thread, and the row
+    extractor's for one that records on this thread that the shortcut ran.
     """
 
     code = getattr(call, "__code__", None)
-    if code is None or not {_SINGLE_ROW_PREDICATE, "_extract_row_cache"} <= set(code.co_names):
+    if code is None or not {_SINGLE_ROW_PREDICATE, _SINGLE_ROW_EXTRACT} <= set(code.co_names):
         return None
     if tuple(inspect.signature(call).parameters) != _SINGLE_ROW_PARAMETERS:
         return None
@@ -2712,6 +2714,14 @@ def _single_row_predicate(call):
 
         predicate._unsloth_native = native
         namespace[_SINGLE_ROW_PREDICATE] = predicate
+    extract = namespace.get(_SINGLE_ROW_EXTRACT)
+    if callable(extract) and not hasattr(extract, "_unsloth_native"):
+        def extracting(cache_entry, row):
+            _SINGLE_ROW_BYPASS.extracted = True
+            return extract(cache_entry, row)
+
+        extracting._unsloth_native = extract
+        namespace[_SINGLE_ROW_EXTRACT] = extracting
     return native
 
 
@@ -2767,7 +2777,13 @@ def _first_single_row_decode(module, call, cache, extracts):
     evaluate = lambda leaves: mx.eval(*[leaf for leaf in leaves if isinstance(leaf, mx.array)])
     # The shortcut copies the entries it extracts but advances the ones it passes through.
     shadow = [entry if entry is None or extracts(entry) else _detached_cache_entry(entry) for entry in cache]
+    _SINGLE_ROW_BYPASS.extracted = False
     want = [call(cache = shadow), *_cache_leaves(shadow)]
+    if not _SINGLE_ROW_BYPASS.extracted:
+        # mlx-vlm 0.7.11 takes the shortcut only for prefill: the shadow step was the ordinary decode, so keep it.
+        type(module)._unsloth_single_row_verdict = False
+        cache[:] = shadow
+        return want[0]
     evaluate(want)
     got = [_bypassing_single_row(call, cache), *_cache_leaves(cache)]
     evaluate(got)
