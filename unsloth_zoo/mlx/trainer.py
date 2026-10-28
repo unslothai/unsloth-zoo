@@ -4109,36 +4109,6 @@ class MLXTrainer:
         if getattr(self.control, "should_training_stop", False):
             self.stop_requested = True
 
-    def _call_callback_log(self, logs):
-        """Record and dispatch a Hugging Face on_log callback event."""
-        if self.state.epoch is not None:
-            logs["epoch"] = self.state.epoch
-        output = dict(logs)
-        output["step"] = self.state.global_step
-        self.state.log_history.append(output)
-        self.control.should_log = False
-        self.control = self.callback_handler.call_event(
-            "on_log",
-            self.args, self.state, self.control, logs=logs,
-        )
-
-    def _call_callback_evaluate(self, metrics):
-        """Dispatch a Hugging Face on_evaluate callback event."""
-        self._call_callback_log(dict(metrics))
-        self.control.should_evaluate = False
-        self.control = self.callback_handler.call_event(
-            "on_evaluate",
-            self.args, self.state, self.control, metrics=metrics,
-        )
-
-    def _call_callback_save(self):
-        """Dispatch a Hugging Face on_save callback event."""
-        self.control.should_save = False
-        self.control = self.callback_handler.call_event(
-            "on_save",
-            self.args, self.state, self.control,
-        )
-
     def _callback_batches_per_epoch(self, batches):
         """Return the finite micro-batch count for one callback epoch."""
         if batches is None:
