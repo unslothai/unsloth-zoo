@@ -475,8 +475,7 @@ pass
 
 
 def _init_only_callers_of(module_source):
-    """Caller graph for ``_only_called_at_init``: called name -> set of owners. None if
-    unparseable. Build once per source and reuse it for every name queried against it."""
+    """Called name -> set of owners, built once per source; None if unparseable."""
     try:
         tree = ast.parse(textwrap.dedent(module_source))
     except Exception:
@@ -7431,7 +7430,7 @@ def unsloth_compile_transformers(
             all_standalone_classes[module] = parameters
         pass
 
-        init_only_callers = None  # built on first use, shared by this model's functions
+        init_only_callers = None  # lazy 1-tuple: the graph itself is None when unparseable
         for module in called_functions:
             if module in all_standalone_classes:
                 continue

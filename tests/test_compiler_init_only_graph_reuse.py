@@ -171,7 +171,6 @@ def _check_shared_graph(source):
 
 def test_shared_graph_matches_fresh_analysis_on_fixture():
     expected = _check_shared_graph(FIXTURE)
-    # Pin the interesting answers so the oracle itself cannot drift silently.
     assert expected["top"] and expected["mid"]  # transitive through a function chain
     assert not expected["leaf"]  # also reached from forward
     assert expected["ping"] and expected["pong"]  # cycle reached only from __init__
@@ -219,5 +218,5 @@ def test_shared_graph_matches_fresh_analysis_on_transformers(module_name):
     try:
         modeling = importlib.import_module(module_name)
     except Exception:
-        pytest.skip(f"{module_name} not available in this transformers")
+        pytest.skip(f"{module_name} is newer than the installed transformers")
     _check_shared_graph(inspect.getsource(modeling))
