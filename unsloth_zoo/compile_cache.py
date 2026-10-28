@@ -400,10 +400,8 @@ def _read_disk_bundle(directory, manifest_path):
 pass
 
 
-# Kinds torch stores as ONE file per key (last write wins); Triton re-records
-# autotune entries with new timings under the same key, so value identity grew
-# the bundle every run. Inductor / AOTAutograd keep several guarded variants
-# per key (key/sha256(content)), so they stay identified by content.
+# One file per key in torch (re-timed autotune entries would otherwise grow the
+# bundle every run); Inductor / AOTAutograd keep guarded variants per key by content.
 _SINGLE_ENTRY_KINDS = frozenset((
     "AutotuneCacheArtifact", "PGOCacheArtifact", "PrecompileCacheArtifact",
     "AUTOTUNE", "PGO",  # torch 2.7: one CacheArtifact class with a type enum
