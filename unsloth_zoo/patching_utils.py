@@ -31,6 +31,7 @@ __all__ = [
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
 from .device_type import DEVICE_TYPE
+from ._gc_passes import collect_garbage
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
@@ -841,13 +842,8 @@ def patch_model_and_tokenizer(
             verify_and_set_device(layer)
     pass
 
-    # Clear deleted GPU items
-    for _ in range(3):
-        collected = gc.collect()
-        if DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
-        else: torch.cuda.empty_cache()
-        # Nothing found and no gc.callbacks (which run around every pass): the next pass cannot find anything either.
-        if collected == 0 and not gc.callbacks: break
+    # Clear deleted GPU items; stops once a pass that really ran finds nothing (see _gc_passes).
+    collect_garbage(after = torch.xpu.empty_cache if DEVICE_TYPE == "xpu" else torch.cuda.empty_cache)
     return model, tokenizer
 pass
 
