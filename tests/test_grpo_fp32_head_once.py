@@ -24,6 +24,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 import unsloth_zoo.rl_replacements as _rl
+from unsloth_zoo.temporary_patches.common import UNSLOTH_COMPILE_DISABLE
 
 HIDDEN, VOCAB, ROWS = 16, 64, 4
 
@@ -101,3 +102,108 @@ def test_mini_batches_share_one_fp32_head(monkeypatch, fp32_head, raw_logits, ex
     fp32_copies = [d for d in heads.values() if d == torch.float32]
     assert len(fp32_copies) == expected, heads
     assert len(casts) == expected, len(casts)
+
+
+def _inductor_builds():
+    try:
+        torch.compile(lambda x: x + 1, backend = "inductor")(torch.ones(2))
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.parametrize("train_head", [False, True])
+def test_default_scorer_keeps_sharing_the_head_parameter(monkeypatch, train_head):
+    # A pre-cast fp32 head made the compiled scorer save a bf16 head copy per mini-batch.
+    monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    monkeypatch.setenv("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0")
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    for name in ("chunked_hidden_states_selective_log_softmax", "chunked_hidden_states_selective_log_softmax_recompute"):
+        monkeypatch.setattr(_rl, name, functools.partial(getattr(_rl, name), fp32_lm_head = True))
+
+    class _Loss:
+        @staticmethod
+        def apply(new_logps, *args):
+            return (new_logps.sum(),) + (torch.zeros(()),) * 5
+
+    monkeypatch.setattr(_rl, "UnslothEfficientGRPO", _Loss)
+    model = _Model()
+    model.head.requires_grad_(train_head)
+    trainer = types.SimpleNamespace(
+        args = types.SimpleNamespace(unsloth_grpo_mini_batch = ROWS, unsloth_logit_chunk_multiplier = 1),
+        processing_class = types.SimpleNamespace(pad_token_id = 0),
+        model = model,
+        accelerator = types.SimpleNamespace(unwrap_model = lambda m, keep_fp32_wrapper = False: m, scaler = None),
+        use_vllm = False,
+        beta = 0.0,
+        _autocast_dtype = torch.bfloat16,
+    )
+    input_ids = torch.randint(1, VOCAB, (ROWS, 6), generator = torch.Generator().manual_seed(0))
+    heads = {}
+
+    def pack(t):
+        if t.numel() == VOCAB * HIDDEN:
+            heads[t.untyped_storage().data_ptr()] = t.dtype
+        return t
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        loss = _rl.grpo_accumulated_loss(
+            trainer, input_ids, torch.ones_like(input_ids), 3, torch.ones(ROWS, 3, dtype = torch.long),
+            torch.zeros(ROWS), None, None, loss_type = "dapo", num_items_in_batch = 3 * ROWS,
+        )[0]
+    loss.backward()
+    if not UNSLOTH_COMPILE_DISABLE and not _inductor_builds():
+        pytest.skip("Inductor cannot build here, so the compiled scorer ran its eager fallback")
+    if UNSLOTH_COMPILE_DISABLE:
+        assert list(heads.values()) == [torch.float32], heads
+    else:
+        assert heads == {model.head.weight.untyped_storage().data_ptr(): torch.bfloat16}, heads
+
+
+@pytest.mark.parametrize("autocast_off", ["dtype_none", "disabled"])
+def test_compiled_scorer_without_autocast_shares_one_fp32_head(monkeypatch, autocast_off):
+    # Without autocast the compiled scorer's backward keeps its own fp32 head per call unless the head is pre-cast.
+    monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    monkeypatch.setenv("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0")
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    for name in ("chunked_hidden_states_selective_log_softmax", "chunked_hidden_states_selective_log_softmax_recompute"):
+        monkeypatch.setattr(_rl, name, functools.partial(getattr(_rl, name), fp32_lm_head = True))
+
+    class _Loss:
+        @staticmethod
+        def apply(new_logps, *args):
+            return (new_logps.sum(),) + (torch.zeros(()),) * 5
+
+    monkeypatch.setattr(_rl, "UnslothEfficientGRPO", _Loss)
+    model = _Model()
+    model.head.requires_grad_(True)
+    trainer = types.SimpleNamespace(
+        args = types.SimpleNamespace(unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1),
+        processing_class = types.SimpleNamespace(pad_token_id = 0),
+        model = model,
+        accelerator = types.SimpleNamespace(unwrap_model = lambda m, keep_fp32_wrapper = False: m, scaler = None),
+        use_vllm = False,
+        beta = 0.0,
+        _autocast_dtype = None if autocast_off == "dtype_none" else torch.bfloat16,
+    )
+    if autocast_off == "disabled":
+        trainer._autocast_enabled = False
+    input_ids = torch.randint(1, VOCAB, (ROWS, 6), generator = torch.Generator().manual_seed(0))
+    heads = {}
+
+    def pack(t):
+        if t.numel() == VOCAB * HIDDEN:
+            heads[t.untyped_storage().data_ptr()] = t.dtype
+        return t
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        _rl.grpo_accumulated_loss(
+            trainer, input_ids, torch.ones_like(input_ids), 3, torch.ones(ROWS, 3, dtype = torch.long),
+            torch.zeros(ROWS), None, None, loss_type = "dapo", num_items_in_batch = 3 * ROWS,
+        )
+    if not UNSLOTH_COMPILE_DISABLE and not _inductor_builds():
+        pytest.skip("Inductor cannot build here, so the compiled scorer ran its eager fallback")
+    fp32_heads = [p for p, d in heads.items() if d == torch.float32]
+    assert len(fp32_heads) == 1, heads

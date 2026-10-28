@@ -5521,7 +5521,7 @@ def _install_llama_pixtral_mistral_compile_patches():
             num_vision_tokens,
         ):
             batch_size, text_total_length, *_ = cross_attention_mask.shape
-            target_dtype = self.language_model.model.embed_tokens.weight.dtype
+            target_dtype = self.language_model.model.embed_tokens(mx.array([0])).dtype
             cross_attention_mask = mx.repeat(
                 cross_attention_mask, num_vision_tokens, axis=3
             )

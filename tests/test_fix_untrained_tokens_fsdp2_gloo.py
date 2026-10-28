@@ -91,6 +91,31 @@ def _worker(rank, init_file, out):
                 model.embed_tokens.weight.full_tensor().detach().clone(),
                 model.lm_head.weight.full_tensor().detach().clone(),
             )
+        # An ignored model must return before any all-gather.
+        from torch.distributed.tensor import DTensor
+
+        gathers = []
+        full_tensor = DTensor.full_tensor
+
+        def counting_full_tensor(self, *args, **kwargs):
+            gathers.append(tuple(self.shape))
+            return full_tensor(self, *args, **kwargs)
+
+        model = _Model(tied = False)
+        fully_shard(model.embed_tokens, mesh = mesh)
+        fully_shard(model.lm_head, mesh = mesh)
+        fully_shard(model, mesh = mesh)
+        before = [w.full_tensor().detach().clone() for w in (model.embed_tokens.weight, model.lm_head.weight)]
+        DTensor.full_tensor = counting_full_tensor
+        try:
+            tokenizer_utils.fix_untrained_tokens(
+                model, _Tokenizer(), [{"input_ids" : [1, 2, 4]}, {"input_ids" : [2, 3, 5]}],
+                IGNORED_TOKENIZER_NAMES = ["Unsloth/Tiny-Test-Model"],
+            )
+        finally:
+            DTensor.full_tensor = full_tensor
+        after = [w.full_tensor().detach().clone() for w in (model.embed_tokens.weight, model.lm_head.weight)]
+        res["ignored"] = (gathers, all(torch.equal(a, b) for a, b in zip(before, after)))
         torch.save(res, os.path.join(out, f"rank{rank}.pt"))
     finally:
         dist.destroy_process_group()
@@ -119,3 +144,10 @@ def test_fix_untrained_tokens_resets_rows_of_sharded_embeddings(ranks, tied):
             assert not torch.equal(w[5], torch.zeros(4)), w
     torch.testing.assert_close(results[0][2], results[1][2])
     torch.testing.assert_close(results[0][3], results[1][3])
+
+
+def test_fix_untrained_tokens_ignored_model_skips_the_gather(ranks):
+    for res in ranks:
+        gathers, unchanged = res["ignored"]
+        assert unchanged, "an ignored model's weights must not change"
+        assert gathers == [], f"ignored model all-gathered {gathers} before returning"

@@ -196,14 +196,51 @@ def _exact_lpt(device, dtype):
     return device.type == "cuda" and _ACCURACY == "2" and dtype in _HALF
 
 
+def _capturing(x):
+    return x.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
+def _half_mm_bounded(a, b):
+    """fp16 a @ b as a half-result GEMM (fp32 accumulation), returned in fp32, that cannot pass 65504.
+
+    |(a @ b)[i, j]| <= ||a[i]||_1 * max|b|. Rows under 32768 cannot overflow, so the plain half GEMM is safe; if any
+    row is over, eager mode falls back to the exact fp32 GEMM, and CUDA graph capture scales those rows down by a power
+    of two (exact, undone after the upcast; no host sync).
+    For HIP, whose fp32-out GEMM is 6-14x slower and whose fp32 GEMM of the upcast operands (a full fp32 copy of the
+    head per chunk) made fp16 3-6x slower than plain torch on gfx1151."""
+    # Reductions without an |a| / |b| temporary (b is a full head slice).
+    bound = torch.linalg.vector_norm(a, 1, dim = -1, keepdim = True, dtype = torch.float32) * \
+        torch.linalg.vector_norm(b, math.inf, dtype = torch.float32)
+    scale = torch.exp2(torch.floor(torch.log2(32768.0 / bound.clamp_min(1e-30)))).clamp_(min = 2.0 ** -38, max = 1.0)
+    if not _capturing(a):
+        # The bound is worst case, so it almost never trips (hidden rows sum to ~1e2-1e3, scaled dz rows to ~1e4).
+        # When it does, scaling a row down can flush its small entries below fp16's subnormal range (a +-16384 row
+        # with a 1e-4 entry loses that entry's contribution), so take the exact fp32 GEMM of upcast operands for this
+        # chunk. One host read of a flag; under CUDA graph capture (no sync allowed) the scaled path below runs.
+        if bool((scale < 1.0).any()):
+            return torch.mm(a.float(), b.float())
+        return (a @ b).float()
+    # Capture: a scale below fp16's smallest subnormal (2^-24) would round to 0 and drop the row, so apply it as two
+    # power-of-two factors that are each representable (2^-14 is the smallest normal); the product stays exact.
+    s1 = scale.clamp(min = 2.0 ** -14)
+    a = a * s1.to(a.dtype)
+    a.mul_((scale / s1).to(a.dtype))
+    return (a @ b).float().div_(scale)
+
+
 def _mm_fp32(a, b, out = None):
     """a @ b with an fp32 result, rounded once (CUDA half inputs); elsewhere an fp32 matmul of the upcast inputs."""
     if a.is_cuda and a.dtype in _HALF:
         if not _IS_HIP and _fp32_out_ok(a.device, a.dtype):
             return torch.mm(a, b, out_dtype = torch.float32, out = out) if out is not None \
                 else torch.mm(a, b, out_dtype = torch.float32)
-        # An fp16 result can pass 65504 (scaled forward gradient), so upcast.
-        r = torch.mm(a.float(), b.float()) if a.dtype == torch.float16 else (a @ b).float()
+        if a.dtype == torch.bfloat16:
+            r = (a @ b).float()
+        elif _IS_HIP:
+            r = _half_mm_bounded(a, b)
+        else:
+            # An fp16 result can pass 65504 (scaled forward gradient), so upcast.
+            r = torch.mm(a.float(), b.float())
     else:
         r = a.float() @ b.float() if a.dtype != torch.float64 else a @ b
     if out is not None:
@@ -218,6 +255,8 @@ def _addmm_fp32(acc, a, b):
             torch.addmm(acc, a, b, out_dtype = torch.float32, out = acc)
         elif a.dtype == torch.bfloat16:
             acc.add_(a @ b)
+        elif _IS_HIP:
+            acc.add_(_half_mm_bounded(a, b))
         else:
             # fp16 partials can pass 65504 before cancelling in acc.
             acc.addmm_(a.float(), b.float())
@@ -964,7 +1003,7 @@ def _dz_w(dz, w):
     V8 = _aligned(w.shape[0])
     if V8 < w.shape[0] and dz.is_cuda and dz.dtype == torch.float16 and (_IS_HIP or not _fp32_out_ok(dz.device, dz.dtype)):
         # fp16 partials can pass 65504 before the rest cancels.
-        return torch.mm(dz.float(), w.float())
+        return _half_mm_bounded(dz, w) if _IS_HIP else torch.mm(dz.float(), w.float())
     out = _mm_fp32(dz[:, :V8], w[:V8])
     if V8 < w.shape[0]:
         _addmm_fp32(out, dz[:, V8:], w[V8:])
@@ -1705,9 +1744,7 @@ if _OPS is None:
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
         s = grad_loss.to(acc) / scaling.to(acc)
         need_h, need_w, need_b = ctx.need
-        def scale(x):
-            return torch.ops.unsloth_zoo.fused_linear_scale_rows(x, s, x.dtype)
-
+        scale = _stored_grad_scaler(s, (grad_h, grad_w, grad_b))
         out_h = scale(grad_h) if need_h else None
         out_w = scale(grad_w) if need_w else None
         out_b = scale(grad_b) if need_b else None
@@ -1861,12 +1898,13 @@ _OPS["lp_impl"] = _logprobs_impl
 _OPS["lp_bwd_impl"] = _logprobs_bwd_impl
 
 
-def _scale_rows_impl(u, g, dtype):
+def _scale_rows_impl(u, g, dtype, out = None):
     # half * 0-dim fp32 would round g to half (0.2% off).
     sd = _stat_dtype(u.dtype)
     g = g.reshape(-1, 1).to(device = u.device, dtype = sd)
     one = g.shape[0] == 1
-    out = torch.empty(u.shape, device = u.device, dtype = dtype)
+    if out is None:
+        out = torch.empty(u.shape, device = u.device, dtype = dtype)
     if sd == torch.float32 and u.is_contiguous() and u.numel() > 0 and _use_triton(u.device):
         n = u.numel()
         block = 4096
@@ -1900,7 +1938,31 @@ def _scale_rows_impl(u, g, dtype):
     return out
 
 
+def _scale_rows_inplace_impl(u, g):
+    # Triton retry is safe in place: a launch that raises wrote nothing.
+    return _scale_rows_impl(u, g, u.dtype, out = u)
+
+
+_KEEP_GRAPH = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)
+
+
+def _stored_grad_scaler(s, saved):
+    """In place only in eager backward without retain_graph (else a second [V, H] grad coexists with .grad)."""
+    inplace = _OPS.get("scale_rows_inplace")
+    if inplace is not None and _KEEP_GRAPH is not None and all(
+        type(x) is torch.Tensor and not x.requires_grad for x in saved
+    ):
+        try:
+            keep = _KEEP_GRAPH()
+        except RuntimeError:  # not inside a backward pass
+            keep = True
+        if not keep:
+            return lambda x: inplace(x, s)
+    return lambda x: torch.ops.unsloth_zoo.fused_linear_scale_rows(x, s, x.dtype)
+
+
 _OPS["scale_rows_impl"] = _scale_rows_impl
+_OPS["scale_rows_inplace"] = _scale_rows_inplace_impl
 if "calls" in _OPS:
     CALLS = _OPS["calls"]
 else:
@@ -1940,6 +2002,7 @@ def _jsd_logprobs(h, w, bias, scale, cap, inv_t, sd, device):
 
 
 def _jsd_logits(h, w, bias, sd):
+    # On HIP fp16 _mm_fp32 is the bounded half-result GEMM: fast, and raw logits past 65504 stay finite.
     x = _mm_fp32(h, w.t()) if sd == torch.float32 else (h.to(sd) @ w.to(sd).t())
     if bias is not None:
         x.add_(bias.to(sd))
@@ -2043,6 +2106,12 @@ _JSD_TRITON_ROWS = os.environ.get("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB") is None
 
 def _jsd_triton(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
     """_jsd_body on CUDA with Triton: two (beta = 0) or three passes over the raw fp32 logits, dz written once."""
+    # Triton launches on the current device: else a head on another card falls back and marks it broken.
+    return _launch(s.device, lambda: _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap,
+                                                         want_grad, grad_dtype))
+
+
+def _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
     R, V = s.shape
     NB = triton.cdiv(V, _JSD_BLOCK)
     flags = dict(S_SCALE = s_scale != 1.0, S_CAP = s_cap != 0.0, T_SCALE = t_scale != 1.0, T_CAP = t_cap != 0.0,
@@ -2277,10 +2346,7 @@ if not _OPS.get("jsd_registered", False):
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
         s = grad_loss.to(acc) / scaling.to(acc)
         need_h, need_w, need_b = ctx.need
-
-        def scale(x):
-            return torch.ops.unsloth_zoo.fused_linear_scale_rows(x, s, x.dtype)
-
+        scale = _stored_grad_scaler(s, (grad_h, grad_w, grad_b))
         return ((scale(grad_h) if need_h else None, scale(grad_w) if need_w else None,
                  scale(grad_b) if need_b else None) + (None,) * 18)
 
@@ -2429,15 +2495,17 @@ def fused_linear_jsd(
     beta 0 is forward KL(teacher || student), 1 reverse KL, else the generalized JSD with mixture
     ``(1 - beta) p_student + beta p_teacher``. Rows are kept where ``mask`` is non zero and ``labels != ignore_index``
     (either may be omitted). The sum is divided by ``num_items_in_batch`` when given (TRL >= 1.x), else by the kept
-    row count (``reduction = "batchmean"``); a zero divisor counts as 1. The transform is ``* logit_scale`` then
-    softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
+    row count (``reduction = "batchmean"``); a zero divisor counts as 1. With neither labels, mask nor count, TRL 0.x
+    divides 3D logits by batch * sequence (as here), 1.x by batch: pass ``num_items_in_batch`` to pin one. The
+    transform is ``* logit_scale`` then softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
     taken in forward; teacher inputs are never differentiated and may have their own hidden size and device.
     ``scaling`` (fp16 GradScaler) multiplies stored gradients; backward divides it out."""
     beta = float(beta)
     temperature = float(temperature)
     if not 0.0 <= beta <= 1.0:
         raise ValueError(f"Unsloth: GKD beta must be in [0, 1], got {beta}.")
-    if not (temperature > 0.0 and math.isfinite(temperature)):
+    # Not math.isfinite: it graph-breaks on a SymFloat (dynamic = True); NaN / inf fail these comparisons.
+    if not (0.0 < temperature < math.inf):
         raise ValueError(f"Unsloth: GKD temperature must be finite and > 0, got {temperature}.")
     if teacher_weight.shape[0] != student_weight.shape[0]:
         raise ValueError(f"Unsloth: GKD student vocabulary {student_weight.shape[0]} != teacher vocabulary "

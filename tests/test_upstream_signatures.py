@@ -792,9 +792,8 @@ def test_GptOssTopKRouter_present():
 
 
 def test_GptOssAttention_forward_signature():
-    """gpt_oss.py:2201-2220 -- ``pre_attention_decoding(self,
-    hidden_states, position_embeddings, attention_mask, past_key_values,
-    cache_position, **kwargs)``."""
+    """gpt_oss.py patches ``GptOssAttention.forward(self, hidden_states,
+    position_embeddings, attention_mask, ...)``."""
     try:
         from transformers.models.gpt_oss.modeling_gpt_oss import (
             GptOssAttention,
@@ -804,8 +803,7 @@ def test_GptOssAttention_forward_signature():
     _assert_params_superset(
         GptOssAttention.forward,
         required=["hidden_states", "position_embeddings", "attention_mask"],
-        zoo_callsite="gpt_oss.py:2201 pre_attention_decoding shape vs "
-                     "GptOssAttention.forward",
+        zoo_callsite="gpt_oss.py GptOssAttention.forward patch",
     )
 
 

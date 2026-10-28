@@ -225,6 +225,8 @@ def _raw_trainer(trainer_class = None, **raw):
 def test_raw_sampling_params_follow_unsloth_generation(monkeypatch):
     # Current unsloth applies the raw fields that differ from SamplingParams(), so scoring does too.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    # support_triton_sampler follows the installed vLLM; pinned so the kwargs compare exactly.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     klass = _compiled_trainer_class(monkeypatch)
     assert rr.grpo_truncated_support_kwargs(_raw_trainer(klass, top_k = 20)) == {
         "support_top_k": 20, "support_top_p": 0.9, "support_min_p": 0.0,
@@ -245,6 +247,8 @@ def test_raw_sampling_params_follow_zoo_generation_helper(monkeypatch):
     # grpo_update_SamplingParams, which only copies non-empty list / tuple fields: raw scalars never
     # reach the rollout, so scoring must not use them either.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    # support_triton_sampler follows the installed vLLM; pinned so the kwargs compare exactly.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     applied = rr.grpo_update_SamplingParams(_RawSamplingParams, {}, _RawSamplingParams(top_k = 20, top_p = 0.8, stop = ["x"]))
     assert applied == {"stop": ["x"]}
     assert rr.grpo_truncated_support_kwargs(_raw_trainer(top_k = 20, top_p = 0.8)) == {
@@ -278,6 +282,8 @@ def test_raw_sampling_params_temperature_is_not_a_false_blocker(monkeypatch):
     # module's copies list fields only): the rollout samples at the trainer temperature, so a raw
     # temperature must not block truncated scoring.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    # support_triton_sampler follows the installed vLLM; pinned so the kwargs compare exactly.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     want = {"support_top_k": 0, "support_top_p": 0.9, "support_min_p": 0.0}
     klass = _compiled_trainer_class(monkeypatch)
     for trainer in (_raw_trainer(klass, temperature = 0.7), _raw_trainer(temperature = 0.7)):

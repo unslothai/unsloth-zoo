@@ -30,7 +30,9 @@ import torch
 from unsloth_zoo.flex_attention.sparse import SPARSE_ATTN_STATS, reset_sparse_attn_stats
 import unsloth_zoo.temporary_patches.sparse_attention as sparse_attention
 
-DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+# The consolidated CUDA spoof makes is_available() True on CPU-only runners.
+_REAL_CUDA = torch.cuda.is_available() and not getattr(torch.cuda, "_unsloth_consolidated_spoof", False)
+DEVICES = ["cpu"] + (["cuda"] if _REAL_CUDA else [])
 
 
 def _has(model_type):
@@ -282,7 +284,11 @@ def test_patch_is_idempotent_and_keeps_the_reference():
     reference = sparse_attention._REFERENCE["deepseek_v32.indexer"]
     _patch_all()
     _patch_all()
-    assert DeepseekV32Indexer.forward is sparse_attention.deepseek_v32_indexer_forward
+    # The sparse flex patch (sparse_attention_flex.py) wraps this forward and delegates to it.
+    forward = DeepseekV32Indexer.forward
+    if getattr(forward, "_unsloth_sparse_flex", False):
+        forward = DeepseekV32Indexer._unsloth_inner_forward
+    assert forward is sparse_attention.deepseek_v32_indexer_forward
     assert sparse_attention._REFERENCE["deepseek_v32.indexer"] is reference
     assert sparse_attention._is_transformers_function(reference, "deepseek_v32")
 

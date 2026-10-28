@@ -30,10 +30,14 @@ __all__ = [
 
 def _softplus(x):
     # Not F.softplus (returns x past 20), clamp_min(x, 0) + ... (derivative 1 at 0) or logaddexp (backward
-    # underflows for x << 0). The clamps keep the untaken branch finite.
+    # underflows for x << 0). The clamps keep the untaken branch finite. x = 0 takes the second branch, whose
+    # gradient must not come from x.clamp_max(0): its derivative at the bound is 1 before torch 2.14 and 0 from
+    # 2.14 on, which zeroed d softplus / dx = 0.5 at the tie. x > 0 and NaN keep the old detached values.
     positive = x > 0
     return torch.where(
-        positive, x + torch.log1p(torch.exp(-x.clamp_min(0))), torch.log1p(torch.exp(x.clamp_max(0))),
+        positive,
+        x + torch.log1p(torch.exp(-x.clamp_min(0))),
+        torch.log1p(torch.exp(torch.where(x <= 0, x, x.detach().clamp_max(0)))),
     )
 
 

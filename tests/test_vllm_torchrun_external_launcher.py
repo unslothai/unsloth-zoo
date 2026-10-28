@@ -54,6 +54,26 @@ def test_launch_info_needs_every_torchrun_variable():
         assert vu._torchrun_launch_info({**_TORCHRUN_ENV, **bad}) is None, bad
 
 
+def test_target_device_is_device_0_outside_torchrun(monkeypatch):
+    """vLLM's own executor takes device 0 whatever is current; a torchrun rank uses its own."""
+    for key in vu._TORCHRUN_ENV_KEYS + ("TORCHELASTIC_RUN_ID",):
+        monkeypatch.delenv(key, raising = False)
+    monkeypatch.setattr(vu, "_current_device_index", lambda: 1)
+    assert vu.get_target_device().index == 0
+    assert vu.get_target_device(3).index == 3
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    assert vu.get_target_device().index == 1
+
+
+def test_current_device_index_is_an_int_on_cpu(monkeypatch):
+    monkeypatch.setattr(vu, "DEVICE_TYPE", "cpu")
+    assert vu._current_device_index() == 0
+
+
 def test_process_group_timeout_env(monkeypatch):
     monkeypatch.delenv("UNSLOTH_DDP_TIMEOUT", raising = False)
     assert vu._process_group_timeout() == 1800
@@ -185,3 +205,33 @@ def test_save_lora_under_ddp_writes_through_a_private_folder(tmp_path, monkeypat
     monkeypatch.setattr(vu, "_distributed_rank_and_world", lambda: (0, 1))
     vu.save_lora(FakeModel(), target)
     assert calls[-1][0] == target
+
+
+@pytest.mark.parametrize("split_group", [None, "0", "1"])
+def test_split_group_gets_a_device_bound_default_group(monkeypatch, split_group):
+    import torch.distributed as dist
+
+    calls = []
+    monkeypatch.setattr(vu, "DEVICE_TYPE", "cuda")
+    monkeypatch.setattr(vu.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(vu.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(vu.torch.cuda, "set_device", lambda index: None)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(vu, "get_target_device", lambda index = None: "cuda:1")
+    monkeypatch.setattr(dist, "is_gloo_available", lambda: True)
+    monkeypatch.setattr(dist, "is_nccl_available", lambda: True)
+    if split_group is None:
+        monkeypatch.delenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", raising = False)
+    else:
+        monkeypatch.setenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", split_group)
+    vu._setup_vllm_external_launcher({}, (1, 1, 2))
+    assert len(calls) == 1
+    if split_group == "1":
+        assert calls[0]["device_id"] == vu.torch.device("cuda", 1)
+        assert calls[0]["backend"] == "cpu:gloo,cuda:nccl"
+    else:
+        # Not device bound, but CPU collectives still need gloo.
+        assert "device_id" not in calls[0] and calls[0]["backend"] == "cpu:gloo,cuda:nccl"

@@ -27,6 +27,7 @@ happened at import.
 This makes the flag work. It does NOT fix the shape bug.
 """
 
+import re
 import os
 import subprocess
 import sys
@@ -135,7 +136,13 @@ def test_the_helper_falls_back_to_identity_not_to_none():
 
 def test_the_flag_comes_from_the_shared_definition():
     """Re-reading os.environ in either place would drift from compiler.py."""
-    assert "UNSLOTH_COMPILE_DISABLE" not in _src(), "read it via _maybe_compile"
+    src = _src()
+    assert not re.search(r"(environ\.get|environ\[|getenv)\(?\s*[\"']UNSLOTH_COMPILE_DISABLE", src), (
+        "read it via _maybe_compile or the shared temporary_patches.common flag"
+    )
+    for line in src.splitlines():
+        if "UNSLOTH_COMPILE_DISABLE" in line:
+            assert "from unsloth_zoo.temporary_patches.common import UNSLOTH_COMPILE_DISABLE" in line, line
     common = _common_src()
     i = common.index("def _maybe_compile(")
     assert "UNSLOTH_COMPILE_DISABLE" in common[i:]

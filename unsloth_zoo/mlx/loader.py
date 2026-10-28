@@ -898,6 +898,71 @@ def _patch_glm5_next_quantization_aliases(model_type):
     model.quantization_path_aliases = quantization_path_aliases
 
 
+_DEEPSEEK_REFERENCE_PROJECTIONS = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+
+
+def _omlx_deepseek_v41_name(key):
+    """mlx-vlm's name for a tensor of a DeepSeek-V4.1 oQ quant (omlx keeps the source's names)."""
+    key = re.sub(r"^language_model\.embed\.", "language_model.embed_tokens.", key)
+    key = re.sub(
+        r"^(language_model\.layers\.\d+\.ffn\.experts)\.(w[123])\.",
+        lambda match: f"{match[1]}.{_DEEPSEEK_REFERENCE_PROJECTIONS[match[2]]}.", key,
+    )
+    return re.sub(r"^(vision\.blocks\.\d+)\.ffn\.", r"\1.mlp.", key)
+
+
+def _omlx_deepseek_v41_quantization(config_data):
+    """``quantization`` from omlx's ``omlx_deepseek_v41.quantized_modules``; None for any other checkpoint."""
+    converted = config_data.get("omlx_deepseek_v41")
+    if (
+        config_data.get("model_type") != "deepseek_v41" or "quantization" in config_data
+        or not isinstance(converted, dict) or converted.get("version") != 1
+    ):
+        return None
+    modules = {}
+    for name, spec in (converted.get("quantized_modules") or {}).items():
+        path = _omlx_deepseek_v41_name(f"{name}.weight").removesuffix(".weight").replace(".ffn.experts.", ".ffn.switch_mlp.")
+        path = re.sub(r"\.shared_experts\.(w[123])$", lambda match: f".shared_experts.{_DEEPSEEK_REFERENCE_PROJECTIONS[match[1]]}", path)
+        # Not quantize_input: it marks source FP8 projections, whose inputs mlx-vlm already fake-quantizes.
+        modules[path] = {"group_size": spec.get("group_size", 32), "bits": spec["bits"], "mode": spec["mode"]}
+    if not modules:
+        return None
+    # Routed experts hold the bytes: their format is the checkpoint's, so load_in_4bit keeps it.
+    specs = [spec for path, spec in modules.items() if ".switch_mlp." in path] or list(modules.values())
+    base = max(specs, key = specs.count)
+    return {**base, **modules}
+
+
+def _ensure_deepseek_v41_omlx_layout(model_type):
+    """Wrap mlx-vlm's deepseek_v41 sanitize to read oQ quants (DSpark stages dropped)."""
+    if model_type != "deepseek_v41":
+        return
+    try:
+        from mlx_vlm.models.deepseek_v41.deepseek_v41 import Model as model
+    except Exception:
+        return
+    if getattr(model.sanitize, "_unsloth_omlx_layout", False):
+        return
+    original = model.sanitize
+
+    def sanitize(self, weights):
+        weights = {
+            _omlx_deepseek_v41_name(key): value for key, value in weights.items()
+            if not key.startswith("language_model.mtp.")
+        }
+        import mlx.core as mx
+
+        # FP8 Engram table: sanitize packs it only under the source's ``.scale`` name.
+        for key in [key for key in weights if key.endswith(".engram.embed.scales")]:
+            weight = weights.get(key.removesuffix("scales") + "weight")
+            if weight is not None and weight.dtype == mx.uint8:
+                weights[key.removesuffix("s")] = weights.pop(key)
+        return original(self, weights)
+
+    sanitize._unsloth_omlx_layout = True
+    model.sanitize = sanitize
+
+
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
     """Let DeepSeek-OCR remote config imports survive newer Transformers.
 
@@ -1009,6 +1074,9 @@ def _normalize_tokenizer_config_extra_special_tokens(
 
 
 def _mlx_vlm_config_override_data(config_data):
+    quantization = _omlx_deepseek_v41_quantization(config_data)
+    if quantization is not None:
+        return {**config_data, "quantization": quantization}
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     if (
         corrected_model_type is None
@@ -2868,6 +2936,50 @@ def _fix_gemma3_text_rmsnorm_fp32(model=None):
     return True
 
 
+def _fix_gemma4_vision_pooler_fp32(model=None):
+    """fp16 only: pool and scale by sqrt(hidden_size) in fp32 as HF does, else 26B-A4B / 31B towers
+    overflow to inf and NaN soft tokens (unsloth#15473, torch path #931). bf16 / fp32 untouched."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma4.vision")
+    except Exception:
+        return False
+
+    pooler_cls = getattr(vision_module, "VisionPooler", None)
+    tower_cls = getattr(vision_module, "VisionModel", None)
+    if not isinstance(pooler_cls, type) or not isinstance(tower_cls, type):
+        return False
+    if getattr(pooler_cls, "_unsloth_fp32_pooler_patched", False):
+        return True
+    original_pool = pooler_cls.__call__
+    original_tower = tower_cls.__call__
+
+    @wraps(original_pool)
+    def pool(self, hidden_states, *args, **kwargs):
+        if hidden_states.dtype == mx.float16:
+            hidden_states = hidden_states.astype(mx.float32)
+        return original_pool(self, hidden_states, *args, **kwargs)
+
+    @wraps(original_tower)
+    def tower(self, *args, **kwargs):
+        out = original_tower(self, *args, **kwargs)
+        table = getattr(self.patch_embedder, "position_embedding_table", None)
+        if out.dtype == mx.float32 and getattr(table, "dtype", None) == mx.float16:
+            out = out.astype(mx.float16)
+        return out
+
+    try:
+        pooler_cls.__call__ = pool
+        tower_cls.__call__ = tower
+        pooler_cls._unsloth_fp32_pooler_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma4_vision_pooler_fp32 = True
+    return True
+
+
 def _fix_gemma3_vision_attention_fp32_sdpa(model=None):
     """Run Gemma3 vision SDPA in fp32, then cast back before the output proj."""
 
@@ -3346,6 +3458,7 @@ def _fix_paligemma_multimodal_causal_mask(model=None):
 # Upstream corrections applied to every VLM as it loads, in order.
 _VLM_MODEL_FIXUPS = (
     _fix_gemma4_kv_sharing,
+    _fix_gemma4_vision_pooler_fp32,
     _fix_gemma3_vision_post_layernorm_eps,
     _fix_gemma3_vision_attention_fp32_sdpa,
     _fix_gemma3_vision_encoder_fp32_layernorm,
@@ -4690,6 +4803,7 @@ class _MLXQuantizationSpec:
     quantize_modules: tuple[str, ...] | None = None
     has_callable_predicate: bool = False
     force_requantize: bool = False
+    quantize_embeddings: bool = False
 
     def to_metadata(self):
         data = asdict(self)
@@ -5811,6 +5925,7 @@ def _resolve_mlx_quantization_spec(
     quant_predicate,
     quantize_modules,
     force_requantize,
+    quantize_embeddings=False,
 ):
     if full_finetuning:
         load_in_4bit = load_in_8bit = load_in_fp8 = False
@@ -5953,6 +6068,7 @@ def _resolve_mlx_quantization_spec(
         quantize_modules=_normalize_quantize_modules(quantize_modules),
         has_callable_predicate=quant_predicate is not None,
         force_requantize=bool(force_requantize),
+        quantize_embeddings=bool(quantize_embeddings),
     )
 
 
@@ -6068,7 +6184,7 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
             if _beside_text_decoder(path, decoder_paths):
                 return False
 
-        if not explicitly_included:
+        if not explicitly_included and not spec.quantize_embeddings:
             if any(fragment in path_parts for fragment in _DEFAULT_QUANT_SKIP_FRAGMENTS):
                 return False
             if type(module).__name__ in {"Embedding", "QuantizedEmbedding"}:
@@ -9605,6 +9721,7 @@ class FastMLXModel:
             kwargs.pop("modules_to_quantize", kwargs.pop("mlx_quantize_modules", None)),
         )
         force_requantize = bool(kwargs.pop("force_requantize", False))
+        quantize_embeddings = bool(kwargs.pop("quantize_embeddings", False))
         quantization_spec = _resolve_mlx_quantization_spec(
             load_in_4bit=load_in_4bit,
             load_in_8bit=load_in_8bit,
@@ -9621,6 +9738,7 @@ class FastMLXModel:
             quant_predicate=quant_predicate,
             quantize_modules=quantize_modules,
             force_requantize=force_requantize,
+            quantize_embeddings=quantize_embeddings,
         )
         distributed_requested = _mlx_distributed_requested(pipeline_group, tensor_group)
 
@@ -9778,6 +9896,7 @@ class FastMLXModel:
                     quant_predicate=quant_predicate,
                     quantize_modules=quantize_modules,
                     force_requantize=force_requantize,
+                    quantize_embeddings=quantize_embeddings,
                     **(
                         {"mlx_quantization_config": mlx_quantization_config}
                         if mlx_quantization_config is not None
@@ -10117,6 +10236,7 @@ class FastMLXModel:
                             "load_in_fp8": False,
                             "load_in_mxfp4": False,
                             "load_in_nvfp4": False,
+                            "quantize_embeddings": bool(adapter_quant_policy.get("quantize_embeddings")),
                         }
                     )
                     if (
@@ -10449,6 +10569,7 @@ class FastMLXModel:
             _ensure_minicpmv4_7_text_positions(model_type)
             _ensure_audio_conv_sanitize(model_type)
             _ensure_qwen3_omni_audio_per_clip(model_type)
+            _ensure_deepseek_v41_omlx_layout(model_type)
             _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(
