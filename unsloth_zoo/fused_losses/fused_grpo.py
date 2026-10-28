@@ -47,8 +47,9 @@ _KIND = {"grpo": 0, "bnpo": 0, "dr_grpo": 0, "dapo": 0, "luspo": 0, "cispo": 1, 
 
 
 def _token_terms(lp, adv, old, ref, isr, kind, eps_low, eps_high, delta, beta, sapo_pos, sapo_neg, bias_kl):
-    """Per-token loss l and dl/dlogp, as TRL builds them (gradients follow torch.clamp / torch.minimum backward)."""
-    r = torch.exp(lp - old)
+    """Per-token loss l and dl/dlogp, as TRL builds them (gradients follow torch.clamp / torch.minimum backward).
+    old None is on-policy: exp(lp - lp.detach()), a ratio of 1 whose derivative is 1."""
+    r = torch.exp(lp - (old if old is not None else lp.detach()))
     if kind == 0:
         r1, d1 = r, r
         if delta > 0.0:
@@ -72,11 +73,17 @@ def _token_terms(lp, adv, old, ref, isr, kind, eps_low, eps_high, delta, beta, s
     if isr is not None:
         loss, grad = loss * isr, grad * isr
     if beta != 0.0:
+        # Unsloth's k3 (grpo_compute_loss): log ratio clamped to [-20, 20] for expm1, the term to [-10, 10] after the
+        # bias correction; a clamped side passes no gradient, as torch.clamp's backward.
         d = ref - lp
-        e = torch.exp(d)
-        kl, dkl = e - d - 1.0, 1.0 - e
+        live = (d >= -20.0) & (d <= 20.0)
+        d = torch.clamp(d, -20.0, 20.0)
+        kl = torch.expm1(d) - d
+        dkl = torch.where(live, -torch.expm1(d), torch.zeros_like(d))
         if bias_kl:
             kl, dkl = kl * r, dkl * r + kl * r
+        dkl = torch.where((kl >= -10.0) & (kl <= 10.0), dkl, torch.zeros_like(dkl))
+        kl = torch.clamp(kl, -10.0, 10.0)
         loss, grad = loss + beta * kl, grad + beta * dkl
     return loss, grad
 
@@ -129,7 +136,7 @@ def _grpo_impl(hidden, weight, bias, targets, mask, adv, old, ref, isr, w_tok, e
     loss = torch.zeros((), device = device, dtype = acc)
     inv_t, scale, cap = fl._scalars(temperature, mul, div, cap)
     grad = need_h or need_w or need_b
-    has_ref, has_isr = ref.numel() > 0, isr.numel() > 0
+    has_old, has_ref, has_isr = old.numel() > 0, ref.numel() > 0, isr.numel() > 0
     if n_keep > 0:
         fp32_logits, exact_mode = fl._logits_mode(device, compute_dtype)
         if compute_dtype not in fl._HALF:
@@ -151,7 +158,7 @@ def _grpo_impl(hidden, weight, bias, targets, mask, adv, old, ref, isr, w_tok, e
                 st, _ = fl._row_forward(device, x, None, t, bias, exact, None, (inv_t, scale, cap, 1.0, 0.0),
                                         (True, False, False, False), False)
                 lp, en = st["logp"], st["ent"]
-                ell, dl = _token_terms(lp, pick(adv), pick(old), pick(ref) if has_ref else None,
+                ell, dl = _token_terms(lp, pick(adv), pick(old) if has_old else None, pick(ref) if has_ref else None,
                                        pick(isr) if has_isr else None, kind, eps_low, eps_high, delta, beta,
                                        sapo_pos, sapo_neg, bias_kl)
                 wt, et = pick(w_tok), pick(e_tok)
@@ -252,11 +259,14 @@ def fused_linear_grpo_loss(
     scaling = None,
     rows_per_chunk = None,
     fp32_head_grad = None,
+    token_weights = None, entropy_weights = None,
 ):
     """TRL GRPOTrainer._compute_loss (token-level importance sampling) on hidden [B, T, H] -> (loss, logps, entropy).
 
     The returned log-probs / entropies are metrics (no gradient); the loss carries the whole gradient. With
-    UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 the same loss is built from fused_linear_logprobs + torch."""
+    UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 the same loss is built from fused_linear_logprobs + torch.
+    old_logps None is on-policy (ratio 1). token_weights / entropy_weights ([B, T]) replace the loss_type normaliser
+    and the entropy weights derived from the mask, for a caller with its own (Unsloth's grpo_compute_loss)."""
     if loss_type not in _KIND:
         raise ValueError(f"Unsloth: GRPO loss type {loss_type} has no forward gradient.")
     device = weight.device
@@ -267,8 +277,13 @@ def fused_linear_grpo_loss(
                                       max_completion_length = max_completion_length,
                                       gradient_accumulation_steps = gradient_accumulation_steps,
                                       steps_per_generation = steps_per_generation, num_processes = num_processes,
-                                      entropy_coef = entropy_coef, training = training)
-    old = old_logps.to(device = device, dtype = torch.float32).reshape(B, T)
+                                      entropy_coef = entropy_coef, training = training) \
+        if token_weights is None or entropy_weights is None else (None, None)
+    if token_weights is not None:
+        w_tok = token_weights.to(device = device, dtype = torch.float32).reshape(B, T)
+    if entropy_weights is not None:
+        e_tok = entropy_weights.to(device = device, dtype = torch.float32).reshape(B, T)
+    old = old_logps.to(device = device, dtype = torch.float32).reshape(B, T) if old_logps is not None else None
     ref = ref_logps.to(device = device, dtype = torch.float32).reshape(B, T) if beta != 0.0 else None
     isr = importance_sampling_ratio.to(device = device, dtype = torch.float32).expand(B, T) \
         if importance_sampling_ratio is not None else None
@@ -280,7 +295,8 @@ def fused_linear_grpo_loss(
                                           logit_scale_multiply = logit_scale_multiply,
                                           logit_scale_divide = logit_scale_divide,
                                           logit_softcapping = logit_softcapping, return_entropy = True,
-                                          entropy_requires_grad = bool(entropy_coef), rows_per_chunk = rows_per_chunk)
+                                          entropy_requires_grad = bool(e_tok.ne(0).any()),
+                                          rows_per_chunk = rows_per_chunk)
         lp, en = lp.reshape(B, T).float(), en.reshape(B, T).float()
         ell, _ = _token_terms(lp, adv, old, ref, isr, kind, *args)
         loss = (ell * w_tok).sum() + (en * e_tok).sum()
