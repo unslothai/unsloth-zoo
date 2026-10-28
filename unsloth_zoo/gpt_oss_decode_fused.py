@@ -22,7 +22,7 @@ Decode at batch 1 is host bound (the GPU is busy 16-45% of a step): every aten o
 Same math and rounding points as the eager code (the residual sum is rounded to the input dtype
 before the norm, the sink scale is rounded to the output dtype before the multiply). The sink
 epilogue is bit-identical on CUDA; the norm differs only in the order of its fp32 sum. Inference only: callers check
-fused_decode_ok() (CUDA / HIP tensors, Triton present, no autograd, not tracing).
+fused_decode_ok() (NVIDIA CUDA tensors, Triton present, no autograd, not tracing).
 Kill switch: UNSLOTH_GPT_OSS_FUSED_DECODE=0, read at import.
 """
 
@@ -56,7 +56,8 @@ if HAS_TRITON and not _INTERPRET:
     except Exception:
         _libdevice = None
 
-_ENABLED = HAS_TRITON and os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
+# NVIDIA only for now: the libdevice exp / rsqrt and rounding were verified on sm75 / sm80 / sm120, not on ROCm.
+_ENABLED = HAS_TRITON and torch.version.hip is None and os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
 # Engagement counters (tests and benchmarks read them).
 FUSED_DECODE_CALLS = {"add_rms_norm": 0, "sink_scale_output": 0}
 _MAX_COLS = 32768
