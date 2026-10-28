@@ -2646,7 +2646,7 @@ except:
 _TRL_COLLATOR_APPLIES_MASKS = None
 def trl_collator_applies_masks():
     # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
-    # TRL 0.18 applies completion_mask but reads no "labels" column, so labels built here would be dropped.
+    # TRL 0.18 applies completion_mask but never reads a "labels" column.
     global _TRL_COLLATOR_APPLIES_MASKS
     if _TRL_COLLATOR_APPLIES_MASKS is None:
         try:

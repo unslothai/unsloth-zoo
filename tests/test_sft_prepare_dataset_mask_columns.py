@@ -105,8 +105,7 @@ def test_plain_input_ids_still_get_the_lm_collator():
 
 
 class Trl018Collator:
-    """TRL 0.18's DataCollatorForLanguageModeling: labels are the input_ids, only completion_mask is applied, and a
-    "labels" column is never read."""
+    """TRL 0.18's collator: labels from input_ids, completion_mask applied, a "labels" column never read."""
 
     def __init__(self, pad_token_id, completion_only_loss = True, pad_to_multiple_of = None):
         self.pad_token_id = pad_token_id
