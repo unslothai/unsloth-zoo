@@ -352,6 +352,7 @@ def patch_CsmForConditionalGeneration_forward():
         **kwargs: KWARGS_TYPE,
     ) -> Union[Tuple, CsmOutputWithPast]:
         kwargs = process_output_options(self, locals(), kwargs)
+        depth_num_items_in_batch = kwargs.pop("_unsloth_csm_depth_num_items_in_batch", None)
 
         if input_ids is not None and input_ids.ndim == 2:
             merged_inputs = self._merge_input_ids_with_input_values(
@@ -414,9 +415,12 @@ def patch_CsmForConditionalGeneration_forward():
                 depth_decoder_labels = labels[train_mask]
 
                 depth_decoder_kwargs = kwargs.copy()
-                # Backbone num_items counts codebook 0; depth covers the other 31.
-                if 'num_items_in_batch' in depth_decoder_kwargs:
-                    depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
+                if depth_num_items_in_batch is not None:
+                    depth_decoder_kwargs["num_items_in_batch"] = depth_num_items_in_batch
+                # Direct callers do not carry Trainer's accumulation-window depth
+                # count. Preserve the full-depth behavior they had before.
+                elif "num_items_in_batch" in depth_decoder_kwargs:
+                    depth_decoder_kwargs["num_items_in_batch"] *= self.config.num_codebooks - 1
 
                 depth_decoder_kwargs.pop('return_dict', None)
                 # Move output_attentions/output_hidden_states (transformers 4.54 deletes them)
