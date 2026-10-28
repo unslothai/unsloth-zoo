@@ -66,3 +66,47 @@ def test_table_check_runs_eagerly_when_the_compiled_frame_is_skipped():
         torch._dynamo.reset()
     assert torch.equal(out, torch.full((2,), 2.0))
     assert len(graphs) >= 2  # the nested frame was compiled after the outer one was skipped
+
+
+
+def test_routed_forwards_run_their_eager_branch_without_dynamo():
+    # The routed forwards trace their compiled branch inline, but when Inductor skips that graph the frame runs
+    # eagerly and its eager branch (pointer tables, direct Triton launches) must not be converted frame by frame.
+    import sys
+    import torch._dynamo
+    from torch._dynamo.exc import SkipFrame
+    from unsloth_zoo.temporary_patches import gpt_oss_routed as routed
+
+    def eager_launch(x):
+        assert sys._getframe() is not None  # Dynamo cannot trace sys._getframe
+        return x + 1
+
+    def forward(x):
+        if torch.compiler.is_compiling():
+            return x + 1  # the traceable (custom op) branch
+        return eager_launch(x)
+
+    def double(x):
+        return x * 2
+
+    def skip_add_backend(gm, example_inputs):
+        # Declines every graph holding the forward's add, as Inductor declines a bfloat16 graph on a T4.
+        if any(n.target is torch.ops.aten.add.Tensor or getattr(n.target, "__name__", "") == "add"
+               for n in gm.graph.nodes):
+            raise SkipFrame("graph not compilable here")
+        return gm.forward
+
+    for wrap, ok in ((routed._eager_out_of_dynamo, True), (lambda f: f, False)):
+        fwd = wrap(forward)
+        step = lambda x: double(fwd(x))  # noqa: E731
+        torch._dynamo.reset()
+        try:
+            out = torch.compile(step, backend = skip_add_backend, fullgraph = True)(torch.ones(2))
+            assert ok, "the unwrapped forward should fail here (its eager branch converted by Dynamo)"
+            assert torch.equal(out, torch.full((2,), 4.0))
+        except torch._dynamo.exc.Unsupported:
+            assert not ok
+        finally:
+            torch._dynamo.reset()
+    for fn in (routed.routed_experts_forward, routed.routed_bf16_forward, routed.routed_mlp_forward):
+        assert fn.__wrapped__ is not None  # wrapped with _eager_out_of_dynamo
