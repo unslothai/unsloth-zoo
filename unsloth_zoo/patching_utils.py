@@ -180,6 +180,27 @@ def patch_dynamo_cleanup_hook_shutdown():
 pass
 
 
+def _drop_inductor_cache_dir_in_compile_location():
+    """Unset TORCHINDUCTOR_CACHE_DIR only when it is the compiled cache folder.
+
+    Inductor then falls back to its default. Removing every value instead sent a
+    persistent directory chosen by the user or by Studio to the temp default, so
+    restarts recompiled.
+    """
+    value = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if not value:
+        return
+    candidates = (UNSLOTH_COMPILE_LOCATION, os.environ.get("UNSLOTH_COMPILE_LOCATION"))
+    try:
+        current = os.path.realpath(value)
+        compile_folders = {os.path.realpath(x) for x in candidates if x}
+    except Exception:
+        return
+    if current in compile_folders:
+        os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+pass
+
+
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(debug) is bool)
@@ -232,10 +253,10 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # https://dev-discuss.pytorch.org/t/impact-of-multithreading-and-local-caching-on-torch-compile/2498/3
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
     os.environ["TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE"] = "1"
-    os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
-
-    # Duplicate functions will cause hashing issues
-    # os.environ["TORCHINDUCTOR_CACHE_DIR"] = UNSLOTH_COMPILE_LOCATION
+    # Duplicate functions will cause hashing issues, so Inductor's cache must not
+    # share the compiled cache folder (older Unsloth set it there). Any other
+    # choice, from the user, Studio or a workaround, is where the caches persist.
+    _drop_inductor_cache_dir_in_compile_location()
 
     # https://github.com/sayakpaul/diffusers-torchao?tab=readme-ov-file#things-to-keep-in-mind-when-benchmarking
     os.environ["ENABLE_AOT_AUTOGRAD_CACHE"] = "1"
