@@ -1403,6 +1403,29 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
     with pytest.raises(RuntimeError, match = "prepare"):
         generate(draft_model = draft, draft_kind = draft.draft_kind)
 
+
+def test_a_copies_only_draft_prefills_in_chunks_on_a_target_naming_no_chunking_policy(qwen, monkeypatch):
+    import importlib
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import SpeculativeDraft, install_speculative_seam
+    ar, (model, ids), lm = importlib.import_module("mlx_vlm.generate.ar"), qwen, type(qwen[0].language_model)
+    monkeypatch.delattr(lm, "chunked_prefill_policy")  # as mlx-vlm's Qwen3 text model, which then prefills a drafted prompt whole
+    [monkeypatch.setattr(ar, name, getattr(ar, name)) for name in ("run_speculative_rounds", "SpeculativePrefill", "_chunked_prefill_enabled")]
+    install_speculative_seam()
+    widths, forward = [], lm.__call__
+    rows = lambda args, kwargs: next(x.shape[1] for x in (*args, kwargs.get("inputs"), kwargs.get("inputs_embeds")) if getattr(x, "ndim", 0) >= 2)
+    monkeypatch.setattr(lm, "__call__", lambda self, *args, **kwargs: widths.append(rows(args, kwargs)) or forward(self, *args, **kwargs))
+    generate = lambda **kwargs: [int(token) for token, _ in ar.generate_step(
+        mx.array([ids[0]]), model, None, None, max_tokens = 32, temperature = 0.0, prefill_step_size = 16, **kwargs)]
+    plain = generate()
+    widths.clear()
+    (copies := SpeculativeDraft(_script(("copy", 4), ("plain", 3)))).prepare(ids[0], SamplingParams())
+    assert generate(draft_model = copies, draft_kind = copies.draft_kind) == plain and len(ids[0]) > 16 >= max(widths)
+    # A drafter reading the prefill's hidden states keeps mlx-vlm's whole prefill.
+    gate = lambda draft: ar._chunked_prefill_enabled(model, input_ids = mx.array([ids[0]]), draft_model = draft, draft_kind = "mtp")
+    assert gate(copies) and not gate(SpeculativeDraft(_script(("draft", 3)), object()))
+
+
 @pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
 def test_a_lazy_drafter_weighs_its_checkpoint_and_holds_a_started_row_without_allocating(request, companion):
     from mlx_vlm.utils import load

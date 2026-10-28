@@ -1344,6 +1344,21 @@ def install_speculative_seam() -> None:
         ar.run_speculative_rounds = _engine_rounds(ar.run_speculative_rounds)
     if getattr(ar.SpeculativePrefill, "unsloth_upstream", None) is None:
         ar.SpeculativePrefill = _prompt_tail_prefill(ar.SpeculativePrefill)
+    gate = getattr(ar, "_chunked_prefill_enabled", None)
+    if callable(gate) and getattr(gate, "unsloth_upstream", None) is None:
+        ar._chunked_prefill_enabled = _copies_chunk_alike(gate)
+
+
+def _copies_chunk_alike(upstream: Callable) -> Callable:
+    # mlx-vlm prefills a drafted prompt whole on a target naming no chunking policy, for the hidden states its
+    # drafter reads; copies read none, so they chunk as an undrafted prefill would.
+    def _chunked_prefill_enabled(model, *, draft_model = None, draft_kind = None, **kwargs):
+        if isinstance(draft_model, SpeculativeDraft) and draft_model.drafter is None:
+            draft_model = draft_kind = None
+        return upstream(model, draft_model = draft_model, draft_kind = draft_kind, **kwargs)
+
+    _chunked_prefill_enabled.unsloth_upstream = upstream
+    return _chunked_prefill_enabled
 
 
 def _engine_rounds(upstream: Callable) -> Callable:
