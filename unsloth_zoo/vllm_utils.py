@@ -6772,13 +6772,19 @@ def _lora_is_sharded(model):
     """True when FSDP2 holds the adapters as DTensors. Only True is cached: sharding happens after load."""
     # All Unsloth Zoo code licensed under LGPLv3
     if model.__dict__.get("_unsloth_lora_is_sharded"): return True
+    # FSDP2 shards only inside an initialized process group; save_lora / load_lora also take
+    # module-like objects without named_parameters.
+    named_parameters = getattr(model, "named_parameters", None)
+    if named_parameters is None: return False
     try:
+        import torch.distributed as dist
+        if not (dist.is_available() and dist.is_initialized()): return False
         from torch.distributed.tensor import DTensor
     except Exception:
         return False
     # First adapter decides; avoids walking every parameter on each load_lora.
     sharded = False
-    for n, p in model.named_parameters():
+    for n, p in named_parameters():
         if ".lora_A." in n or ".lora_B." in n:
             sharded = isinstance(p, DTensor)
             break

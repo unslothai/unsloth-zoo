@@ -162,3 +162,46 @@ def test_unsharded_check_stops_at_the_first_adapter(tmp_path):
     assert res["sharded"] is False, res
     assert res["params_total"] == 1200, res
     assert res["params_walked"] <= 3, res
+
+
+_PLAIN_WORKER = """
+import json, sys
+import torch
+import unsloth_zoo.vllm_utils as vu
+
+class NoParams:
+    def state_dict(self):
+        return {"layers.0.lora_A.default.weight": torch.zeros(2, 4)}
+
+model = torch.nn.Linear(4, 4)
+walked = []
+orig = model.named_parameters
+model.named_parameters = lambda *a, **k: walked.append(1) or orig(*a, **k)
+res = {
+    "no_params": vu._lora_is_sharded(NoParams()),
+    "no_params_state": sorted(vu._lora_state_dict(NoParams())),
+    "no_group": vu._lora_is_sharded(model),
+    "walked": len(walked),
+}
+json.dump(res, open(sys.argv[1], "w"))
+"""
+
+
+def test_no_process_group_or_no_named_parameters_is_unsharded(tmp_path):
+    # save_lora / load_lora take module-like objects without named_parameters; outside a process
+    # group nothing can be an FSDP2 DTensor, so the parameters are not walked either.
+    script = tmp_path / "plain.py"
+    script.write_text(textwrap.dedent(_PLAIN_WORKER))
+    out = tmp_path / "plain.json"
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_ALLOW_CPU = "1",
+               PYTHONPATH = os.pathsep.join([str(_ROOT), os.environ.get("PYTHONPATH", "")]))
+    r = subprocess.run([sys.executable, str(script), str(out)], env = env, capture_output = True, text = True,
+                       timeout = 300, cwd = tmp_path)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    res = json.loads(out.read_text())
+    assert res == {
+        "no_params": False,
+        "no_params_state": ["layers.0.lora_A.default.weight"],
+        "no_group": False,
+        "walked": 0,
+    }, res
