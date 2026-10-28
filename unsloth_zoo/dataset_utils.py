@@ -2669,8 +2669,7 @@ pass
 
 
 def trl_collator_ignores_labels(collator = None):
-    # TRL 0.18: its collator applies completion_mask but never reads "labels"; any other collator
-    # (padding-free DataCollatorWithFlattening, a user's DataCollatorForSeq2Seq) reads only "labels".
+    # TRL 0.18: its collator applies completion_mask, never "labels"; other collators read only "labels".
     if not _trl_collator_mask_probe()[1]: return False
     from trl.trainer.sft_trainer import DataCollatorForLanguageModeling as _TRLCollator
     return collator is None or isinstance(collator, _TRLCollator)
@@ -3070,8 +3069,7 @@ def sft_prepare_dataset(
             keep_masks = trl_collator_ignores_labels()
             collator = getattr(self, "data_collator", None)
             if keep_masks and collator is None:
-                # TRL 0.18 picks its collator in __init__ and only stores it in super().__init__, after this.
-                # Walk up: dict eval splits are prepared in a comprehension, its own frame before Python 3.12.
+                # TRL 0.18 stores its collator only in super().__init__; read __init__'s (dict eval comprehensions add a frame).
                 import sys as _sys
                 frame = _sys._getframe(1)
                 while frame is not None and not (frame.f_locals.get("self") is self and "data_collator" in frame.f_locals):
