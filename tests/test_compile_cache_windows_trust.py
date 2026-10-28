@@ -280,6 +280,70 @@ def test_api_failure_means_untrusted(monkeypatch, tmp_path):
         assert module._ensure_private_directory(str(tmp_path / "new" / "dir")) is False
 
 
+def _open_fds():
+    return len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "stubs msvcrt; the real path is covered below")
+def test_file_read_is_judged_on_the_open_handle(monkeypatch, tmp_path):
+    """The Windows read path off Windows: owner / DACL / attributes come from
+    the open handle, a file swapped between lstat and open is refused, and the
+    descriptor is closed on every path."""
+    module = _load_module()
+    path = tmp_path / "manifest.json"
+    path.write_bytes(b"{}")
+    monkeypatch.setattr(module, "_windows_token_sids", lambda: (USER, USER))
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle = lambda fd: fd))
+    handles = []
+
+    def read_with(security, **kwargs):
+        def fake_handle_security(handle):
+            handles.append(handle)
+            return security
+        monkeypatch.setattr(module, "_windows_handle_security", fake_handle_security)
+        with monkeypatch.context() as patch:
+            patch.setattr(module.os, "name", "nt")
+            return module._read_trusted_file(str(path), **kwargs)
+
+    before = _open_fds()
+    assert read_with((0x20, USER, STOCK_PROFILE)) == "{}"
+    assert read_with((0x20, USER, STOCK_PROFILE), binary = True) == b"{}"
+    assert handles and all(isinstance(h, int) for h in handles)
+    for security in (
+        (0x20, OTHER, STOCK_PROFILE),                                         # foreign owner
+        (0x20, USER, STOCK_PROFILE + [(ALLOW, INHERITED, WRITE, EVERYONE)]),  # foreign writer
+        (0x20, USER, None),                                                   # NULL DACL
+        (0x20 | 0x400, USER, STOCK_PROFILE),                                  # reparse point
+        (0x20 | 0x40, USER, STOCK_PROFILE),                                   # device
+        (0x10, USER, STOCK_PROFILE),                                          # a directory
+    ):
+        assert read_with(security) is None, security
+
+    def broken(handle):
+        raise OSError("GetSecurityInfo failed")
+    monkeypatch.setattr(module, "_windows_handle_security", broken)
+    with monkeypatch.context() as patch:
+        patch.setattr(module.os, "name", "nt")
+        assert module._read_trusted_file(str(path)) is None
+
+    # Swapped between the lstat and the open: a different file id is refused
+    # before its security is even queried.
+    real_fstat = os.fstat
+
+    def swapped_fstat(fd):
+        st = real_fstat(fd)
+        fields = list(st[:10])
+        fields[1] = st.st_ino + 1
+        return os.stat_result(fields)
+    handles.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(module.os, "fstat", swapped_fstat)
+        assert read_with((0x20, USER, STOCK_PROFILE)) is None
+    assert handles == []
+    if before is not None:
+        assert _open_fds() == before
+
+
 # --- real Windows ------------------------------------------------------------
 
 def _icacls(path, *args):

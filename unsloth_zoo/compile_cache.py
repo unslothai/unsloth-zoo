@@ -555,9 +555,9 @@ def _is_trusted_directory(path, *, allow_missing = True):
     A checksum stored next to a bundle only detects corruption; it cannot
     authenticate files to an attacker who can write the same directory. On
     POSIX, reject symlinks, directories owned by another user, and directories
-    writable by group or other users. The explicit feature opt-in remains the
-    trust boundary on platforms where POSIX ownership and mode bits do not
-    describe filesystem access controls.
+    writable by group or other users. On Windows, judge owner SID and DACL
+    instead (_windows_directory_is_trusted). On other non-POSIX platforms the
+    explicit feature opt-in remains the trust boundary.
 
     Missing directories are allowed so a cache miss can be created safely by
     ``_ensure_private_directory`` during the save path.
