@@ -815,6 +815,28 @@ def test_vlm_processor_inputs_retries_duplicate_add_special_tokens():
     assert "add_special_tokens" not in processor.calls[1]
 
 
+def test_vlm_processor_inputs_skip_truncation_a_processor_does_not_take():
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+
+    # A closed signature with no truncation keywords, as LFM3-Audio's processor.
+    class ClosedSignatureProcessor:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, text, images=None, padding=False, return_tensors=None):
+            self.calls.append({"padding": padding, "return_tensors": return_tensors})
+            return {
+                "input_ids": np.ones((len(text), 2), dtype=np.int32),
+                "attention_mask": np.ones((len(text), 2), dtype=np.int32),
+            }
+
+    processor = ClosedSignatureProcessor()
+    _processor_vlm_inputs(processor, ["a"], [["img0"]], 8)
+
+    # One call, keeping the keywords the processor does take.
+    assert processor.calls == [{"padding": True, "return_tensors": "np"}]
+
+
 def test_vlm_processor_inputs_retry_only_exact_pytorch_output_error():
     import torch
 
@@ -3242,6 +3264,8 @@ def test_qualified_families_carry_their_probed_requirements():
         "qwen3_omni_moe": versions("0.6.7"),
         "phi4mm": versions("0.4.4"),
         "minicpmo": versions("0.4.4"),
+        "lfm3_audio": versions("0.7.11"),
+        "lfm3_omni": versions("0.7.11"),
     }
 
 
