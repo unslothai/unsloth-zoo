@@ -196,19 +196,32 @@ def _exact_lpt(device, dtype):
     return device.type == "cuda" and _ACCURACY == "2" and dtype in _HALF
 
 
+def _capturing(x):
+    return x.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
 def _half_mm_bounded(a, b):
     """fp16 a @ b as a half-result GEMM (fp32 accumulation), returned in fp32, that cannot pass 65504.
 
-    |(a @ b)[i, j]| <= ||a[i]||_1 * max|b|, so each row of a is scaled down by a power of two (exact, undone after the
-    upcast) until that bound is <= 32768; rows already under it are untouched. On device: no host sync, capturable.
+    |(a @ b)[i, j]| <= ||a[i]||_1 * max|b|. Rows under 32768 cannot overflow, so the plain half GEMM is safe; if any
+    row is over, eager mode falls back to the exact fp32 GEMM, and CUDA graph capture scales those rows down by a power
+    of two (exact, undone after the upcast; no host sync).
     For HIP, whose fp32-out GEMM is 6-14x slower and whose fp32 GEMM of the upcast operands (a full fp32 copy of the
     head per chunk) made fp16 3-6x slower than plain torch on gfx1151."""
     # Reductions without an |a| / |b| temporary (b is a full head slice).
     bound = torch.linalg.vector_norm(a, 1, dim = -1, keepdim = True, dtype = torch.float32) * \
         torch.linalg.vector_norm(b, math.inf, dtype = torch.float32)
     scale = torch.exp2(torch.floor(torch.log2(32768.0 / bound.clamp_min(1e-30)))).clamp_(min = 2.0 ** -38, max = 1.0)
-    # A scale below fp16's smallest subnormal (2^-24) would round to 0 and drop the row: apply it as two power-of-two
-    # factors that are each representable (2^-14 is the smallest normal), so the product stays exact.
+    if not _capturing(a):
+        # The bound is worst case, so it almost never trips (hidden rows sum to ~1e2-1e3, scaled dz rows to ~1e4).
+        # When it does, scaling a row down can flush its small entries below fp16's subnormal range (a +-16384 row
+        # with a 1e-4 entry loses that entry's contribution), so take the exact fp32 GEMM of upcast operands for this
+        # chunk. One host read of a flag; under CUDA graph capture (no sync allowed) the scaled path below runs.
+        if bool((scale < 1.0).any()):
+            return torch.mm(a.float(), b.float())
+        return (a @ b).float()
+    # Capture: a scale below fp16's smallest subnormal (2^-24) would round to 0 and drop the row, so apply it as two
+    # power-of-two factors that are each representable (2^-14 is the smallest normal); the product stays exact.
     s1 = scale.clamp(min = 2.0 ** -14)
     a = a * s1.to(a.dtype)
     a.mul_((scale / s1).to(a.dtype))
