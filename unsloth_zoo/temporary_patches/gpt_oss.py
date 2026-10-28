@@ -47,6 +47,7 @@ except Exception:
     def _fused_route_or_none(*args, **kwargs):
         return None
 from .gpt_oss_routed import ROUTED_MAX_SLOTS, prepare_routed_experts, routed_experts_forward, routed_mlp_forward
+from unsloth_zoo.gpt_oss_decode_fused import add_rms_norm as _fused_add_rms_norm, fused_decode_ok as _fused_decode_ok
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -3857,6 +3858,46 @@ def patch_GptOssModel():
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         return hidden_states, residual
     pass
+
+    def add_rms_layernorm_forward(norm, hidden_states, residual):
+        """(RMSNorm(hidden_states + residual), hidden_states + residual) in one launch when it can;
+        residual None normalizes hidden_states alone."""
+        fused = _fused_add_rms_norm(hidden_states, residual, norm.weight, norm.variance_epsilon)
+        if fused is not None:
+            return fused
+        if residual is not None:
+            hidden_states += residual.to(hidden_states.device)
+        residual = hidden_states.clone()
+        return rms_layernorm_forward(norm, hidden_states), residual
+    pass
+
+    def fused_inference_forward(
+        self,
+        hidden_states,
+        pending_residual,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        use_cache,
+        cache_position,
+        position_embeddings,
+        **kwargs,
+    ):
+        """inference_forward with the previous layer's residual add folded into the input norm:
+        hidden_states is the previous MLP output (or the embeddings, pending_residual None)."""
+        hidden_states, residual = add_rms_layernorm_forward(self.input_layernorm, hidden_states, pending_residual)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        return add_rms_layernorm_forward(self.post_attention_layernorm, hidden_states, residual)
+    pass
     # if has_static_cache and Version(torch.__version__) >= Version("2.10.0"):
     #     # torch 2.9.0 has excessive compilations
     #     inference_forward = _torch_compile(inference_forward, dynamic = None, fullgraph = True, options = fused_torch_compile_options)
@@ -3970,6 +4011,9 @@ def patch_GptOssModel():
             # Initialize for common return path
             all_hidden_states = None
             all_router_logits = None
+            # Fused: each residual add rides in the next norm's kernel (one launch, not ~11 ops).
+            fused_norms = _fused_decode_ok(hidden_states)
+            pending_residual = None
             # This loop calls the layer's parts directly, so the block swapper's forward hooks never fire.
             for layer_idx, decoder_layer in enumerate(self.layers):
                 if block_swap is not None:
@@ -3978,9 +4022,10 @@ def patch_GptOssModel():
                     attention_mask,
                     _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
                 )
-                hidden_states, residual = inference_forward(
+                hidden_states, residual = (fused_inference_forward if fused_norms else inference_forward)(
                     decoder_layer,
                     hidden_states,
+                    *((pending_residual,) if fused_norms else ()),
                     mask,
                     position_ids,
                     past_key_values,
@@ -4005,11 +4050,17 @@ def patch_GptOssModel():
                     hidden_states, _ = mlp_forward(decoder_layer.mlp, hidden_states)
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
-                hidden_states += residual
+                if fused_norms:
+                    pending_residual = residual
+                else:
+                    hidden_states += residual
                 if block_swap is not None:
                     block_swap.leave(layer_idx)
             pass
-            hidden_states = rms_layernorm_forward(self.norm, hidden_states)
+            if fused_norms:
+                hidden_states, _ = add_rms_layernorm_forward(self.norm, hidden_states, pending_residual)
+            else:
+                hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:
             # flex_attention_with_sink builds its own BlockMask, so dropping the dense
             # one avoids an O(seq_len^2) allocation that OOMs at long context. Only that
