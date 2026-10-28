@@ -636,7 +636,6 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         return (None, hidden_states.grad,) + tuple(
             None if holder is None else holder.grad for holder in grad_holders
         )
-    pass
 pass
 
 
@@ -678,7 +677,6 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         return (None, hidden_states.grad,) + tuple(
             None if holder is None else holder.grad for holder in grad_holders
         )
-    pass
 pass
 
 
@@ -773,7 +771,6 @@ class _KeywordArgumentCall:
         kwargs = dict(self.constants)
         kwargs.update(zip(self.keys, args[split:]))
         return self.function(*args[:split], **kwargs)
-    pass
 pass
 
 
@@ -1752,7 +1749,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         pass
 
         return (None, None) + grads
-    pass
 pass
 
 
@@ -2009,7 +2005,6 @@ class NonReentrantActivationOffloader:
         # One call per checkpoint (vision.py wraps each checkpoint call): groups its saved inputs.
         self.group += 1
         return torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack)
-    pass
 pass
 
 
@@ -2290,7 +2285,6 @@ def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None,
     preserve = kwargs.pop("preserve_rng_state", True)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
     return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

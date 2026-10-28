@@ -348,7 +348,6 @@ def fix_lora_auto_mapping(model):
         }
         if getattr(config, "auto_mapping", None) is None:
             config.auto_mapping = auto_mapping_dict
-    pass
 pass
 
 
@@ -457,4 +456,3 @@ def get_auto_processor(name, **kwargs):
         except:
             raise TypeError(f"Unsloth: Failed loading a AutoProcessor from `{name}`")
     return processor
-pass

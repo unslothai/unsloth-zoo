@@ -1437,7 +1437,6 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         if ctx.upstream_scale is not None:
             grad_input = grad_input * (grad_output * ctx.upstream_scale)
         return (grad_input, None, None, None, None, None, None, None, None, None, None, None, None)
-    pass
 pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 

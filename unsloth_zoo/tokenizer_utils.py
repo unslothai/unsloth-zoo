@@ -319,7 +319,6 @@ def add_new_tokens(
             with torch.no_grad():
                 embedding_matrix[old_length+j] = mean_embedding_token
                 lm_head_matrix  [old_length+j] = mean_lm_head_token
-        pass
     else:
         # Now set the new tokens to the mean! Only touch the genuinely-new rows
         # [old_length:new_vocab_length]; on a padded embedding the rows past
@@ -965,7 +964,6 @@ def patch_processor_call(processor):
 
     processor._unsloth_patched_call = True
     return processor
-pass
 
 
 # Unsloth Zoo - Utilities for Unsloth

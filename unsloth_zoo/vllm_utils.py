@@ -513,7 +513,6 @@ if importlib.util.find_spec("vllm") is not None:
         # the install instructions, so leave the rest of this module usable.
         def _apply_4bit_weight(self, layer, x, bias = None):
             raise RuntimeError("Unsloth: `pip install vllm-bnb-plugin` for load_in_4bit.")
-        pass
     elif not hasattr(_vllm_bnb, "apply_bnb_4bit"):
         # Make the compute dtype dynamic instead of forcing torch.bfloat16
         def _apply_4bit_weight(
@@ -566,7 +565,6 @@ if importlib.util.find_spec("vllm") is not None:
                 out += bias
 
             return out
-        pass
     else:
         # Newer vLLM versions have _apply_bnb_4bit
         apply_bnb_4bit = _vllm_bnb.apply_bnb_4bit
@@ -639,7 +637,6 @@ if importlib.util.find_spec("vllm") is not None:
             kwargs["bnb_4bit_compute_dtype"] = _resolve_bnb_compute_dtype(kwargs)
             print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
             super().__init__(*args, **kwargs)
-        pass
     pass
 
     def patch_vllm_compute_dtype(dtype = torch.float16):
@@ -732,7 +729,6 @@ if importlib.util.find_spec("vllm") is not None:
         except:
             pass
         return
-    pass
 else:
     def patch_vllm_bitsandbytes():
         return
@@ -839,7 +835,6 @@ if _bitsandbytes_is_usable():
                 compute_dtype = getattr(torch, compute_dtype)
                 kwargs["compute_dtype"] = compute_dtype
             super().__init__(*args, **kwargs)
-        pass
     pass
 
     def patch_bitsandbytes_quant_state():
@@ -859,7 +854,6 @@ if _bitsandbytes_is_usable():
     def unpatch_bitsandbytes_compute_dtype():
         del os.environ["UNSLOTH_bnb_4bit_compute_dtype"]
         return
-    pass
 else:
     def patch_bitsandbytes_quant_state():
         return
@@ -1034,7 +1028,6 @@ def patch_vllm_enable_sleep_mode():
                         _memcpy(ptr, cpu_ptr, size_in_bytes, handle[0], to_device = True)
                         data.cpu_backup_tensor = None
             pass
-        pass
     pass
 
     def delete_memory():
@@ -1975,7 +1968,6 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     if len(failures) > 0:
         error_message = "\n".join([f"[{key}]\n{str(error)}" for key, error in failures.items()])
         raise RuntimeError(f"Unsloth: Failed comparing state_dict with {len(failures)}: {error_message}")
-    pass
 pass
 
 def _refresh_placeholder_dims(parent, attr_name, weight):
@@ -2450,7 +2442,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             # model.layers.0.* -> model.layers[0].*
             layer_name = re.sub(r"\.([\d]{1,})", lambda x: f"[{x.group(1)}]", layer_name)
             exec(f"new_model.{layer_name} = layer")
-        pass
     pass
 
     set_additional_modules(new_model, quant_state_dict, config)
@@ -6606,7 +6597,6 @@ class _MergedRolloutVerdict:
     def is_valid_for(self, model):
         if tuple(getattr(model, "peft_config", None) or ()) != self.adapters: return False
         return [_merged_rollout_layer_key(module) for module in _merged_rollout_lora_layers(model)] == self.keys
-    pass
 pass
 
 
@@ -6629,7 +6619,6 @@ class _MergedRolloutState(_MergedRolloutVerdict):
         self.engine_ref = _merged_rollout_ref(getattr(model, "vllm_engine", None))
         # Every LoRA layer, folded or not: is_valid_for compares against all of them.
         super().__init__(model, _merged_rollout_lora_layers(model))
-    pass
 pass
 
 
@@ -6652,7 +6641,6 @@ class _MergedLoRARequest:
     pass
     def __repr__(self):
         return f"_MergedLoRARequest(targets = {len(self.state.entries)})"
-    pass
 pass
 
 
@@ -8133,5 +8121,3 @@ def test_get_vllm_state_dict():
             raise RuntimeError(f"[{model_name}]\n{error}")
         gc.collect()
         _device_empty_cache()
-    pass
-pass

@@ -207,7 +207,6 @@ def get_peft_regex(
                 only_linear_modules.append(proj)
             else:
                 projection_modules[proj] = j
-        pass
     else:
         assert(type(target_modules) is list)
         only_linear_modules = list(target_modules)
@@ -653,7 +652,6 @@ def requires_grad_for_gradient_checkpointing(model):
                 register(hook, with_kwargs = True)
             else:
                 register(hook)
-        pass
     pass
 
     # Remove all previous forward hooks for gradient checkpointing
@@ -737,7 +735,6 @@ def requires_grad_for_gradient_checkpointing(model):
                 val.requires_grad_(True)
                 return
             pass
-        pass
     pass
 
     def requires_grad_frontend_hook(module, input, output):
@@ -910,8 +907,6 @@ def requires_grad_for_gradient_checkpointing(model):
                 )
                 embedding.register_forward_hook(requires_grad_post_hook_eager)
         pass
-    pass
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

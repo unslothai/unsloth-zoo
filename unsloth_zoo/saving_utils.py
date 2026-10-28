@@ -159,7 +159,6 @@ def add_vllm_namespace_skip_module_aliases(skipped_modules):
                 if alias in seen: continue
                 seen.add(alias)
                 aliases.append(alias)
-        pass
     pass
     if not aliases: return skipped_modules
     return list(skipped_modules) + sorted(aliases)
@@ -197,7 +196,6 @@ def add_vllm_fused_skip_module_aliases(skipped_modules):
             if alias in seen: continue
             seen.add(alias)
             aliases.append(alias)
-        pass
     pass
     if not aliases: return skipped_modules
     return list(skipped_modules) + sorted(aliases)
@@ -242,7 +240,6 @@ def drop_skip_module_aliases_that_widen(skipped_modules, aliased, module_names):
                 # Treat that as unsafe and drop the alias.
                 widens = True
             if widens: safe.discard(alias)
-        pass
     pass
     if len(safe) == len(added): return aliased
     return list(skipped_modules) + [alias for alias in added if alias in safe]
@@ -939,7 +936,6 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             elif name in remove_keys: continue
 
             state_dict[name] = param
-        pass
     else:
         state_dict = None
     pass
@@ -4042,7 +4038,6 @@ def _carry_over_vocab_pad_records(base_config, trained_config):
         # The first holder is get_text_config(), which vllm_utils._padded_vocab_ids reads.
         try: setattr(targets[0], key, list(ids))
         except Exception: pass
-    pass
 pass
 
 
@@ -9233,7 +9228,6 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Direct tensor write failed for {output_key}: {e}")
         return False
-pass
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #

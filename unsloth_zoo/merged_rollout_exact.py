@@ -188,7 +188,6 @@ class ExactFoldTarget:
             R = a.shape[1], BLOCK_N = _BLOCK_N, BLOCK_K = _BLOCK_K,
             num_warps = 4, enable_fp_fusion = False,
         )
-    pass
 pass
 
 
@@ -316,4 +315,3 @@ def exact_unfold(targets, stream = None):
             f"Unsloth: exact LoRA unfold checksum mismatch on {len(bad)} of {len(targets)} weights; "
             "the base weights may be corrupted."
         )
-pass

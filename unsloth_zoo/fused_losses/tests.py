@@ -111,8 +111,6 @@ def test_fused_ce_loss(
             new_lm_bias_grad = lm_head_bias.grad.detach().clone()
             del lm_head_bias.grad
             torch.testing.assert_close(new_lm_bias_grad, old_lm_bias_grad, msg = "LM Bias grad diff too high")
-    pass
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

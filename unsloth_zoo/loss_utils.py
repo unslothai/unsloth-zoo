@@ -749,7 +749,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     #         TRAINING_ITERATIONS = 0
     #     TRAINING_ITERATIONS += 1
     return batch_samples, num_items_in_batch
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

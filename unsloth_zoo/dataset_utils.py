@@ -116,8 +116,6 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
                 x = left*"\n" + stripped + right*"\n"
                 x = tokenizer(x, add_special_tokens = False).input_ids
                 all_input_ids.append(x)
-            pass
-        pass
     else:
         x = tokenizer(component, add_special_tokens = False).input_ids
         all_input_ids.append(x)
@@ -3095,7 +3093,6 @@ def patch_torchcodec_audio_decoder():
         )
     except (ImportError, AttributeError, RuntimeError):
         pass  # torchcodec not available or different datasets version
-pass
 
 
 # Unsloth Zoo - Utilities for Unsloth

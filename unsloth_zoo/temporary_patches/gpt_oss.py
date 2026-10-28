@@ -919,7 +919,6 @@ def patch_gpt_oss():
                 intermediate_cache3 = intermediate_cache3.reshape(*leading_shape, intermediate_cache3.shape[-1])
             return intermediate_cache3.to(input_dtype)
 
-        pass
 
     patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
 
@@ -3222,7 +3221,6 @@ def torch_native_forward(
         rw = routing_weights.transpose(0, 1).unsqueeze(-1)
         mixed = (outs.to(dtype) * rw.to(dtype)).sum(dim=0)
         return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
-    pass
 pass
 
 # torch_native_forward protects the down projection three ways in float16 training: swiglu and
@@ -3715,7 +3713,6 @@ def patch_GptOssModel():
                     finally:
                         _config._attn_implementation = original_impl
                 return f(*args, **kwargs)
-            pass
         return return_attention_mask
     pass
     create_causal_mask = getattr(

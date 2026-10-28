@@ -719,7 +719,6 @@ class UnslothFusedLoss(torch.autograd.Function):
         if grad_lm_head_bias is not None: grad_lm_head_bias = grad_lm_head_bias * scale_factor
 
         return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None, None, None,)
-    pass
 pass
 
 # Resolved once here, not per call: under torch.compile dynamo ignores functools.cache, traces
@@ -968,7 +967,6 @@ def unsloth_loss_count_kwargs(loss_function, n_items):
     if n_items is None or not _loss_takes_count(loss_function):
         return {}
     return {"num_items_in_batch": n_items}
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

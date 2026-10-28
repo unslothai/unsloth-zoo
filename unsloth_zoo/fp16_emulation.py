@@ -355,7 +355,6 @@ class _FP16SplitMatmul(torch.autograd.Function):
                 A.t().contiguous(), grad_output.contiguous(), dtype, terms, products, scale,
             ).to(B.dtype)
         return grad_A, grad_B, None, None, None, None
-    pass
 pass
 
 

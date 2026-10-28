@@ -3474,7 +3474,6 @@ pass
 
 class _StageRepairedByAnother(Exception):
     """Another process published a valid entry while we were about to clear ours."""
-    pass
 
 
 class _ConverterSourcesIncomplete(RuntimeError):
@@ -3482,7 +3481,6 @@ class _ConverterSourcesIncomplete(RuntimeError):
 
     Its own type so the patcher's broad `except Exception` re-raises the actionable
     message unchanged."""
-    pass
 
 
 def _detect_converter_layout(entry_content_bytes, llama_cpp_dir):
@@ -4957,7 +4955,6 @@ def _convert_to_gguf(command, output_filename, print_output = False, print_outpu
             line = f"Unsloth: Converted to {output_filename} with size = {x}\n"
             if print_output: print(line, flush = True, end = "")
             if print_outputs is not None: print_outputs.append(line)
-        pass
     else:
         raise RuntimeError(
             "Unsloth: Failed converting to GGUF since we did not create an GGUF files?"

@@ -1539,7 +1539,6 @@ def patch_causal_conv1d_cuda_probe():
             mod._lazy_load_causal_conv1d = _disabled_lazy_load
         if hasattr(mod, "_causal_conv1d_cache"):
             mod._causal_conv1d_cache = (None, None)
-    pass
 pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
@@ -1729,8 +1728,6 @@ def _bind_mamba_ssm_to_torch_reference():
                 setattr(_module, _name, _reference)
             except Exception:
                 pass
-        pass
-    pass
 pass
 
 
@@ -1835,7 +1832,6 @@ def _force_slow_path_on_raising_mamba_mixers():
         except Exception:
             pass
         pass
-    pass
 pass
 
 
@@ -2240,7 +2236,6 @@ def patch_datasets_map_worker_death_retry():
             # num_proc=1 still forks a worker and the kernel can kill it again.
             call_kwargs["num_proc"] = None
             return original_map(self, *call_args, **call_kwargs)
-        pass
     pass
 
     map._unsloth_worker_death_retry = True
