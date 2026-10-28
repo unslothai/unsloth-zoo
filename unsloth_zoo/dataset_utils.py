@@ -2670,7 +2670,8 @@ pass
 
 def trl_collator_ignores_labels(collator = None):
     # TRL 0.18: its collator applies completion_mask, never "labels"; other collators read only "labels".
-    if not _trl_collator_mask_probe()[1]: return False
+    if not _trl_collator_mask_probe()[1]:
+        return False
     from trl.trainer.sft_trainer import DataCollatorForLanguageModeling as _TRLCollator
     return collator is None or isinstance(collator, _TRLCollator)
 pass
