@@ -2598,17 +2598,23 @@ RL_REPLACEMENTS["grpo_rollout_as_old_ratio_metrics"] = grpo_rollout_as_old_ratio
 
 
 # Forward-gradient GRPO routing (fused_linear_grpo_loss). Counts per grpo_accumulated_loss call: "fused" took the
-# forward-gradient op, "head_budget" deferred but scored with the log-prob op (trainable head over its memory budget).
+# forward-gradient op, "head_budget" deferred but scored with the log-prob op (an opted-in trainable head over its
+# memory budget).
 GRPO_FUSED_ROUTE_STATS = {"fused": 0, "head_budget": 0}
+# A trainable lm_head takes the log-prob op unless opted in: the forward-gradient op's float32 head accumulator costs
+# 4 V H bytes and measured 0.86x / 0.95x of the log-prob op on an L4 (bf16, V 151936, H 4096, 2k / 8k tokens), while
+# a frozen head (LoRA) is 1.4x faster with an entropy term and level without.
+GRPO_FUSED_TRAINABLE_HEAD = os.environ.get("UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD", "0") == "1"
 
 
 def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = False, support_kwargs = None,
-                        pixel_values = None, zero3_head = None):
+                        pixel_values = None, zero3_head = None, lm_head = None):
     """True when grpo_compute_loss's per-token loss is a closed form of each token's own log-prob, so the GRPO loss can
     take fused_linear_grpo_loss: every token's gradient is known in the forward. Off for GSPO (sequence-level ratio),
     VESPO, the off-policy and top-entropy-quantile masks (all read every token's log-prob or entropy first), rollout_rs,
     rollout logps as pi_old (clamped log ratio), a truncated support or fp32 head (other scorers), vision inputs and a
-    gathered ZeRO-3 head. UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 turns it off."""
+    gathered ZeRO-3 head, and a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1.
+    UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 turns it off."""
     from unsloth_zoo.fused_losses import fused_grpo as _fused_grpo
     return bool(
         _fused_grpo.GRPO_FWD_GRAD
@@ -2622,6 +2628,7 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
         and not support_kwargs
         and pixel_values is None
         and zero3_head is None
+        and (lm_head is None or not lm_head.requires_grad or GRPO_FUSED_TRAINABLE_HEAD)
         and os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") != "1"
         and not grpo_scorer_keeps_logits(support_kwargs)
     )
@@ -3169,7 +3176,7 @@ def grpo_accumulated_loss(
         from unsloth_zoo.rl_replacements import grpo_fused_route_ok as _grpo_fused_route_ok
         _fused_route = _grpo_fused_route_ok(
             kwargs, entropy_mask_on = _entropy_mask_on, rollout_logps_as_old = _rollout_logps_as_old,
-            support_kwargs = _support_kwargs, pixel_values = pixel_values, zero3_head = _zero3_head,
+            support_kwargs = _support_kwargs, pixel_values = pixel_values, zero3_head = _zero3_head, lm_head = lm_head,
         )
         _fused_W = logits_to_keep + max_left_pad if pixel_values is None else logits_to_keep
         _fused_pad = []

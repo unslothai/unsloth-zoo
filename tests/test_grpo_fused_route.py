@@ -102,9 +102,10 @@ def _side_inputs(seed = 0):
 
 
 def _run(fused, monkeypatch, *, loss_type = "grpo", old = None, ref = None, sampling = None, adv = None,
-         packed = False, head_grad = True, bias = False, completion_mask = None, loss_kwargs = None, backward_scale = 1.0,
-         **trainer_kwargs):
+         packed = False, head_grad = False, bias = False, completion_mask = None, loss_kwargs = None, backward_scale = 1.0,
+         trainable_opt_in = True, **trainer_kwargs):
     monkeypatch.setattr(fg, "GRPO_FWD_GRAD", fused)
+    monkeypatch.setattr(rr, "GRPO_FUSED_TRAINABLE_HEAD", trainable_opt_in)
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "1" if packed else "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
     model = _Model(head_grad, bias).to(DEVICE)
@@ -197,8 +198,22 @@ def test_sample_weight_truncated_rows_bias_and_frozen_head(monkeypatch):
     _compare(monkeypatch, loss_type = "grpo", beta = 0.04, old = OLD, ref = REF, adv = ADV, completion_mask = mask,
              mask_truncated_completions = True, loss_kwargs = dict(sample_weight = torch.rand(ROWS) / 10))
     _compare(monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, bias = True)
-    _, grads = _compare(monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, head_grad = False)
+    _, grads = _compare(monkeypatch, loss_type = "dapo", old = OLD, adv = ADV)
     assert "head.weight" not in grads
+
+
+@pytest.mark.parametrize("packed", [False, True], ids = ["padded", "packed"])
+@pytest.mark.parametrize("loss_type,beta,ent", [("grpo", 0.04, 0.0), ("dapo", 0.0, 0.05), ("cispo", 0.04, 0.01)])
+def test_trainable_head_opted_in(monkeypatch, packed, loss_type, beta, ent):
+    _, grads = _compare(monkeypatch, packed = packed, loss_type = loss_type, beta = beta, old = OLD, ref = REF,
+                        adv = ADV, entropy_coef = ent, head_grad = True, bias = True)
+    assert "head.weight" in grads and "head.bias" in grads
+
+
+def test_trainable_head_defaults_to_the_log_prob_route(monkeypatch):
+    assert _run(True, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, head_grad = True,
+                trainable_opt_in = False)[2] == 0
+    assert not rr.grpo_fused_route_ok(dict(loss_type = "dapo"), lm_head = torch.zeros(2, requires_grad = True))
 
 
 def test_mixed_precision_scale_and_deepspeed_upstream(monkeypatch):
@@ -208,14 +223,14 @@ def test_mixed_precision_scale_and_deepspeed_upstream(monkeypatch):
     # DeepSpeed (no scaler): grad_output times upstream_scale
     _compare(monkeypatch, loss_type = "grpo", old = OLD, adv = ADV, is_deepspeed_enabled = True,
              loss_is_scaled_for_ga = False, compute_loss_func = None, backward_scale = 0.25,
-             entropy_coef = 0.05)
+             entropy_coef = 0.05, head_grad = True)
 
 
 def test_trainable_head_over_budget_keeps_the_log_prob_op(monkeypatch):
     monkeypatch.setattr(rr, "grpo_fused_head_fits", lambda lm_head, budget_fraction = None: False)
     before = rr.GRPO_FUSED_ROUTE_STATS["head_budget"]
-    a, ga, n = _run(True, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, entropy_coef = 0.05)
-    b, gb, _ = _run(False, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, entropy_coef = 0.05)
+    a, ga, n = _run(True, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, entropy_coef = 0.05, head_grad = True)
+    b, gb, _ = _run(False, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, entropy_coef = 0.05, head_grad = True)
     assert n == 0 and rr.GRPO_FUSED_ROUTE_STATS["head_budget"] == before + 1
     torch.testing.assert_close(a[0], b[0])
     for name in gb:
