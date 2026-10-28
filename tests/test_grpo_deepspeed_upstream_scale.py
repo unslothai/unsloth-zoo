@@ -27,6 +27,13 @@ import transformers
 
 import unsloth_zoo.rl_replacements as _rl
 
+
+@pytest.fixture(autouse = True)
+def _log_prob_route(monkeypatch):
+    # These stub UnslothEfficientGRPO, the log-prob route; test_grpo_fused_route.py covers the forward-gradient one.
+    import unsloth_zoo.fused_losses.fused_grpo as _fused_grpo
+    monkeypatch.setattr(_fused_grpo, "GRPO_FWD_GRAD", False)
+
 HIDDEN, VOCAB, GAS = 4, 8, 4
 INPUT_IDS = torch.tensor([[1, 2, 3, 4, 5], [1, 2, 6, 7, 3]])
 MASK = torch.tensor([[1, 1, 1], [1, 1, 0]])
