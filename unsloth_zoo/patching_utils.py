@@ -181,20 +181,14 @@ pass
 
 
 def _drop_inductor_cache_dir_in_compile_location():
-    """Unset TORCHINDUCTOR_CACHE_DIR only when it is the compiled cache folder.
-
-    Inductor then falls back to its default. Removing every value instead sent a
-    persistent directory chosen by the user or by Studio to the temp default, so
-    restarts recompiled.
-    """
+    """Unset TORCHINDUCTOR_CACHE_DIR only when empty or the compiled cache folder; keep user / Studio dirs."""
     value = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
     if not value:
-        # Empty is no choice: torch resolves "" to the CWD or fails os.makedirs("").
+        # torch resolves "" to the CWD or fails os.makedirs("").
         os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
         return
     candidates = (UNSLOTH_COMPILE_LOCATION, os.environ.get("UNSLOTH_COMPILE_LOCATION"))
     try:
-        # normcase: Windows paths compare case-insensitively.
         current = os.path.normcase(os.path.realpath(value))
         compile_folders = {os.path.normcase(os.path.realpath(x)) for x in candidates if x}
     except Exception:
@@ -256,9 +250,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # https://dev-discuss.pytorch.org/t/impact-of-multithreading-and-local-caching-on-torch-compile/2498/3
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
     os.environ["TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE"] = "1"
-    # Duplicate functions will cause hashing issues, so Inductor's cache must not
-    # share the compiled cache folder (older Unsloth set it there). Any other
-    # choice, from the user, Studio or a workaround, is where the caches persist.
+    # Duplicate functions break hashing if Inductor's cache shares the compiled cache folder.
     _drop_inductor_cache_dir_in_compile_location()
 
     # https://github.com/sayakpaul/diffusers-torchao?tab=readme-ov-file#things-to-keep-in-mind-when-benchmarking
