@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""The repeated `gc.collect(); empty_cache()` release passes in vllm_utils and tokenizer_utils go through
-_gc_passes.collect_garbage, which stops once a pass that really ran finds nothing. Such a pass freed nothing
-and ran no finalizer, so the next one cannot find anything either. Anything else keeps every pass: gc.callbacks
-registered, a non-zero or None result, or a pass skipped because another thread was collecting."""
+"""collect_garbage stops after a pass that ran and found nothing; every other case keeps all passes."""
 
 from __future__ import annotations
 
@@ -20,7 +17,6 @@ ROOT = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
 
 def _load():
-    # The module only imports gc: load it on its own, without the package's torch imports.
     spec = importlib.util.spec_from_file_location("_gc_passes_under_test", ROOT / "_gc_passes.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -28,7 +24,7 @@ def _load():
 
 
 class _FakeGC:
-    """`script` items: an int or None is what a pass that runs returns; "skip" returns 0 without collecting."""
+    """`script`: int / None = a pass that ran; "skip" = returns 0 without collecting."""
 
     def __init__(self, script, callbacks = ()):
         self.script = iter(script)
@@ -108,13 +104,11 @@ def test_a_pass_skipped_for_another_threads_collection_does_not_end_it():
         passes = []
 
         def after():
-            # Thread A finishes between our first and second pass.
             release.set()
             a.join(30)
             passes.append(1)
 
         collect_garbage(after = after)
-        # Skipped, then found ours, then quiet.
         assert len(passes) == 3
         assert not any(type(o) is Ours for o in real_gc.get_objects())
     finally:
