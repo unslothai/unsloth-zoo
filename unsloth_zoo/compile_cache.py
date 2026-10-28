@@ -73,18 +73,11 @@ _FORMAT_VERSION = 1
 _BUNDLE_NAME = "megacache.bin"
 _MANIFEST_NAME = "manifest.json"
 _LOCK_NAME = ".lock"
-# Bounded so a wedged writer can never hang interpreter exit; on timeout another
-# live writer owns the key, so this save is skipped (its union lands next run).
+# Bounded so a wedged writer cannot hang interpreter exit; on timeout the save is skipped.
 _LOCK_TIMEOUT = 60
 
-# One fingerprint accumulates every model loaded in this process; each
-# unsloth_compile_transformers call extends the key. The key is the SET of
-# distinct model entries (deduplicated, canonically ordered), not the call
-# history: torch's cache entries are content-addressed (graph + config +
-# system), so a bundle can only be hit by the exact graphs it was built from
-# and the key merely groups artifacts. Reloading a model, or loading the same
-# models in another order, therefore reuses one bundle instead of minting a
-# fresh key that never hits.
+# The key is the SET of models loaded in this process, not the call order: torch's
+# entries are content-addressed, so order would only mint keys that never hit.
 _STATE = {
     "armed": False,
     "loaded_key": None,
@@ -313,9 +306,7 @@ pass
 
 
 def _register_model_key(entry):
-    """Add one model entry to the process key: exact repeats are dropped and
-    entries kept in canonical order, so the key is a function of the model SET.
-    Returns whether the set changed."""
+    """Add a model entry to the order-free key set; returns whether it changed."""
     if entry in _STATE["model_keys"]:
         return False
     _STATE["model_keys"] = sorted(
@@ -410,9 +401,8 @@ pass
 
 
 def _artifact_identity(artifact):
-    """(kind, cache key), not value: Triton re-records autotune best_config
-    entries on every run with new timings under the same key, so value
-    equality kept one more copy per warm run and the bundle grew forever."""
+    """(kind, cache key), not value: Triton re-records autotune entries with new
+    timings under the same key, so value identity grew the bundle every run."""
     return (type(artifact).__name__, getattr(artifact, "key", artifact))
 pass
 
@@ -424,12 +414,8 @@ def _merge_recorded_artifacts(data):
     loaded-and-hit or compiled, so without this a run that exercises a subset
     of a warm bundle (a different shape, one of several cached models) would
     replace the bundle with that subset and silently drop the rest. One copy
-    per identity: this run's copy wins over the disk's, and duplicate disk
-    copies collapse.
-
-    Returns the set of identities in the on-disk bundle (None if it could not
-    be read) so the caller can skip a write that would add nothing.
-    Best-effort: a failure just means this save may narrow the bundle."""
+    per identity; this run's copy wins. Returns the disk bundle's identities
+    (None if unreadable). Best-effort: a failure may narrow the bundle."""
     try:
         from torch.compiler._cache import CacheArtifactManager
         artifacts = CacheArtifactManager.deserialize(data)
@@ -458,8 +444,7 @@ pass
 
 
 def _recorded_identities():
-    """Identities of everything torch's artifact manager holds now (this run's
-    plus merged), or None if it cannot be inspected."""
+    """Identities torch's artifact manager holds now, or None."""
     try:
         from torch.compiler._cache import CacheArtifactManager
         return {_artifact_identity(a) for a in list(CacheArtifactManager._seen_artifacts)}
@@ -469,9 +454,8 @@ pass
 
 
 def _prepare_lock_file(path):
-    """Create (or open) the lock file ourselves, owner-only, and refuse
-    anything that is not a plain single-link regular file we own, so the lock
-    can never be redirected through a symlink or hard link."""
+    """Create the lock file owner-only; refuse anything but a single-link regular
+    file we own, so it cannot be redirected through a symlink or hard link."""
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(path, flags, 0o600)
@@ -492,9 +476,8 @@ pass
 
 
 def _platform_lock(path):
-    """The OS lock class itself, never filelock's SoftFileLock: an existence
-    lock left by a killed writer would block every later save until it times
-    out. ``fallback_to_soft`` / ``mode`` are absent on older filelock."""
+    """The OS lock, never SoftFileLock: a killed writer's existence lock would
+    block every later save. Older filelock lacks ``fallback_to_soft`` / ``mode``."""
     import filelock
     lock_class = filelock.WindowsFileLock if os.name == "nt" else filelock.UnixFileLock
     for kwargs in ({"mode": 0o600, "fallback_to_soft": False}, {"mode": 0o600}, {}):
@@ -515,13 +498,9 @@ pass
 
 
 def _probe_os_lock(path):
-    """One non-blocking flock on our own descriptor before filelock's acquire.
-    filelock 3.x retries every flock error but ENOSYS (3.10: every one) until
-    the timeout, so a filesystem that refuses locks (NFS without a lock
-    manager: ENOLCK; EOPNOTSUPP) stalled interpreter exit for _LOCK_TIMEOUT.
-    Contention passes through to the real acquire; any other errno raises
-    here and is classified by _locking_unsupported. msvcrt.locking errors
-    other than contention already raise inside filelock."""
+    """Non-blocking flock before filelock's acquire: filelock retries every flock
+    error but ENOSYS until the timeout, so ENOLCK / EOPNOTSUPP filesystems (NFS
+    without a lock manager) would stall exit for _LOCK_TIMEOUT."""
     if os.name != "posix":
         return
     import fcntl
@@ -538,16 +517,10 @@ pass
 
 @contextlib.contextmanager
 def _key_lock(directory):
-    """Serialize savers of one key across processes: read-merge-publish-collect
-    must not interleave, or one writer collects the bundle another's manifest
-    is about to name (a dangling manifest) and concurrent unions drop each
-    other's artifacts. flock / msvcrt locks are released by the OS if the
-    holder dies, so a crashed writer leaves no stale lock.
-
-    Yields True when the save may proceed. Only where locking is genuinely
-    unsupported (filelock missing, a filesystem without flock, a platform with
-    neither lock) does it proceed unlocked, exactly as before the lock existed;
-    a timeout (another live writer) or an untrustworthy lock file skips it."""
+    """Serialize savers of one key across processes, or one writer collects the
+    bundle another's manifest names and concurrent unions drop artifacts.
+    Yields whether to save: unlocked only where locking is unsupported; a
+    timeout or an untrusted lock file skips the save."""
     lock = None
     may_save = True
     try:
@@ -623,8 +596,7 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
 
     manifest, data = _read_disk_bundle(directory, manifest_path)
     if manifest is None and os.path.exists(manifest_path):
-        # A concurrent save may have replaced the manifest and collected the
-        # bundle it named between our two reads; the new manifest is complete.
+        # A concurrent save may have replaced the manifest between our two reads.
         manifest, data = _read_disk_bundle(directory, manifest_path)
     if manifest is None:
         _log(f"no bundle for key {key} (will compile locally and save on exit)")
@@ -692,19 +664,15 @@ def _save_locked(torch, key, directory, manifest_path):
     # semantics; see _merge_recorded_artifacts).
     _, existing = _read_disk_bundle(directory, manifest_path)
     disk_ids = _merge_recorded_artifacts(existing) if existing is not None else None
-    # Always serialize: save_cache_artifacts also records deferred Dynamo
-    # precompile entries, which a skipped call would never capture.
+    # Always serialize: it also records deferred Dynamo precompile entries.
     result = torch.compiler.save_cache_artifacts()
     if not result or not result[0]:
         _log("nothing to save (no compile artifacts recorded)")
         return False
     data = result[0]
     new_sha = hashlib.sha256(data).hexdigest()
-    # Skip rewriting a bundle that already holds everything, so a no-op run
-    # doesn't churn the cache (and its mtime) every exit. Bytes alone miss
-    # it: serialization follows this run's recording order and autotune
-    # entries come back re-timed, so compare identities recorded after the
-    # save call as well.
+    # Skip a no-op rewrite. Bytes alone miss it (recording order, re-timed
+    # autotune entries), so compare identities too.
     if existing is not None and hashlib.sha256(existing).hexdigest() == new_sha:
         _log("bundle unchanged; skipping save")
         return False
@@ -713,18 +681,12 @@ def _save_locked(torch, key, directory, manifest_path):
         if recorded is not None and recorded <= disk_ids:
             _log("bundle already holds every recorded artifact; skipping save")
             return False
-    # The bundle is content-addressed and the manifest names it, so the
-    # pair stays consistent even for an unlocked (fallback) writer: bundles
-    # are differently named, the manifest replace is atomic, and the last
-    # manifest to land points at its own complete file. Same name always
-    # implies same bytes.
+    # Content-addressed bundle + atomic manifest replace keep the pair
+    # consistent even for an unlocked (fallback) writer.
     bundle_name = f"megacache-{new_sha[:16]}.bin"
     bundle_path = os.path.join(directory, bundle_name)
-    # Content-addressing means a trusted file of this name already holds
-    # these bytes, but a leftover from an older writer could be group-
-    # writable; skipping the write would leave the manifest pointing at an
-    # untrusted bundle that every load rejects. (Re)write unless the
-    # existing file already passes the trusted-file checks.
+    # A same-named leftover may be group-writable (every load would reject it):
+    # rewrite unless it passes the trusted-file checks.
     if _read_trusted_file(bundle_path, binary = True) is None:
         temporary_path = f"{bundle_path}.tmp.{os.getpid()}"
         with open(temporary_path, "wb") as file:
@@ -752,8 +714,8 @@ def _save_locked(torch, key, directory, manifest_path):
     _log(f"saved bundle for key {key} ({len(data)} bytes)")
     # Best-effort GC of superseded bundle files (including the legacy
     # fixed-name one). A reader that already opened one keeps its handle;
-    # a later reader re-reads the manifest and finds the new name. Per file:
-    # Windows refuses to unlink a bundle a reader holds open.
+    # a later reader re-reads the manifest. Per file: Windows refuses to
+    # unlink a bundle a reader holds open.
     try:
         names = os.listdir(directory)
     except Exception:

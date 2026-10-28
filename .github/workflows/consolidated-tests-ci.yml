@@ -293,9 +293,7 @@ jobs:
         # test_vllm_direct_lora_loading pins the vLLM direct hot-load slot
         # mapping (no GPU, no vLLM needed). test_sft_prepare_dataset_double_bos
         # pins add_special_tokens for text that already carries BOS.
-        # test_compile_cache_concurrency pins the Mega-cache order-free key, the
-        # per-key save lock (two real writer processes, forced interleave) and
-        # the union / no-rewrite save, with fake artifacts (no torch compile).
+        # test_compile_cache_concurrency pins the Mega-cache key, save lock and union.
         #
         # The two MoE registry files pin preprocess_weight's layout resolution (#849)
         # and that the weight-preprocessor registry is one dict across the package
