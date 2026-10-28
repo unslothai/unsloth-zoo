@@ -1943,6 +1943,21 @@ def _rotate_head_input(head, hidden):
     return hidden
 
 
+def _get_lm_head_layer(model):
+    """The affirmatively resolved output head (see describe_output_head).
+
+    Raises for unknown topology: the loss factories gate on the descriptor
+    first, so reaching this without a resolved head is a caller bug.
+    """
+    desc = describe_output_head(model)
+    if desc.module is None:
+        raise ValueError(
+            "Unsloth: output-head topology is unresolved for this model; "
+            "gate on describe_output_head before requesting the head layer."
+        )
+    return desc.module
+
+
 def _is_quantized_layer(layer):
     """Check if a layer has quantized weights (has .scales attribute)."""
     return hasattr(layer, "scales")
@@ -6418,6 +6433,11 @@ def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0,
     ))
 
 
+def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
+    """Pad token ids and labels for one labeled MLX text batch."""
+    return _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=pad_id)
+
+
 @dataclass(frozen=True)
 class _FiniteTextRow:
     input_ids: tuple
@@ -6849,6 +6869,32 @@ def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
         # Horizon-expanded/truncated schedules replay stored order (identity).
         visit_policy="epoch_permute" if num_batches is None else "identity",
         visit_seed=seed,
+    )
+
+
+def _create_tokenized_text_batches(tokenized, batch_size, max_seq_length,
+                                   num_batches=None, seed=42, pad_id=0):
+    """Batch pretokenized text rows with mlx-lm's sorting and shuffle contract."""
+    return _create_tokenized_text_plan(
+        tokenized,
+        batch_size,
+        max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        pad_id=pad_id,
+    ).materialize_all()
+
+
+def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
+                                 num_batches=None, seed=42, pad_id=0):
+    """Batch labeled text rows with mlx-lm's default sorting and shuffle contract."""
+    return _create_tokenized_text_batches(
+        tokenized,
+        batch_size,
+        max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        pad_id=pad_id,
     )
 
 
