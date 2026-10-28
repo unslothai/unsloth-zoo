@@ -17,7 +17,7 @@
 """grpo_accumulated_loss routed through fused_linear_grpo_loss against the log-prob route (fused_linear_logprobs +
 UnslothEfficientGRPO + UnslothGRPOEntropyBonus): loss, metrics and every parameter gradient, on the padded and the
 sequence-packed forward, plus the routing decisions."""
-import copy
+import os
 import types
 
 import pytest
@@ -28,6 +28,8 @@ import unsloth_zoo.fused_losses.fused_linear as fl
 import unsloth_zoo.rl_replacements as rr
 
 H, V, LTK = 8, 13, 5
+# GRPO_FUSED_ROUTE_DEVICE=cuda runs the same comparisons on a GPU (float32, no autocast).
+DEVICE = torch.device(os.environ.get("GRPO_FUSED_ROUTE_DEVICE", "cpu"))
 # Prompt 3 + completion 5, pad 0: left pads on rows 1 and 3, completions ending early (pads after EOS) on 0 and 2.
 INPUT_IDS = torch.tensor([
     [4, 5, 6, 7, 8, 9, 3, 0],
@@ -105,21 +107,26 @@ def _run(fused, monkeypatch, *, loss_type = "grpo", old = None, ref = None, samp
     monkeypatch.setattr(fg, "GRPO_FWD_GRAD", fused)
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "1" if packed else "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
-    model = _Model(head_grad, bias)
+    model = _Model(head_grad, bias).to(DEVICE)
+    model.device = DEVICE
     trainer = _trainer(model, **trainer_kwargs)
     if completion_mask is None:
         completion_mask = (INPUT_IDS[:, -LTK:] != 0).long()
+    to = lambda x: x.to(DEVICE) if torch.is_tensor(x) else x  # noqa: E731
+    completion_mask, old, ref, sampling, adv = map(to, (completion_mask, old, ref, sampling, adv))
+    if loss_kwargs and "sample_weight" in loss_kwargs:
+        loss_kwargs = dict(loss_kwargs, sample_weight = to(loss_kwargs["sample_weight"]))
     kwargs = dict(
         loss_type = loss_type, epsilon_low = 0.2, epsilon_high = 0.28 if loss_type != "cispo" else 4.0,
-        max_completion_length = LTK, num_items_in_batch = torch.tensor(float(completion_mask.sum())),
+        max_completion_length = LTK, num_items_in_batch = completion_mask.sum().float(),
         current_gradient_accumulation_steps = 2, num_processes = 1,
         importance_sampling_level = trainer_kwargs.get("importance_sampling_level", "token"),
         sampling_per_token_logps = sampling,
     )
     kwargs.update(loss_kwargs or {})
     call = lambda: rr.grpo_accumulated_loss(  # noqa: E731
-        trainer, INPUT_IDS, (INPUT_IDS != 0).long(), LTK, completion_mask,
-        adv if adv is not None else torch.linspace(-1.0, 1.2, ROWS), old, ref, **kwargs,
+        trainer, INPUT_IDS.to(DEVICE), (INPUT_IDS != 0).long().to(DEVICE), LTK, completion_mask,
+        adv if adv is not None else torch.linspace(-1.0, 1.2, ROWS, device = DEVICE), old, ref, **kwargs,
     )
     if packed:
         call()  # first use verifies the packed forward against per-row forwards
@@ -128,7 +135,7 @@ def _run(fused, monkeypatch, *, loss_type = "grpo", old = None, ref = None, samp
     out = call()
     engaged = fl.CALLS.get("grpo_fwd_grad", 0) - before
     (out[0] * backward_scale).backward()
-    grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+    grads = {n: p.grad.cpu() for n, p in model.named_parameters() if p.grad is not None}
     return out, grads, engaged
 
 
@@ -140,7 +147,7 @@ def _compare(monkeypatch, **kw):
         if x is None or y is None:
             assert x is None and y is None
         elif x.numel():
-            torch.testing.assert_close(x.detach().float(), y.detach().float(), rtol = 1e-5, atol = 1e-6)
+            torch.testing.assert_close(x.detach().float().cpu(), y.detach().float().cpu(), rtol = 1e-5, atol = 1e-6)
         else:
             assert y.numel() == 0
     assert ga.keys() == gb.keys() and len(ga) >= 3
@@ -226,7 +233,7 @@ def test_configs_without_a_closed_form_keep_the_log_prob_route(monkeypatch, chan
     if "off_policy_mask_threshold" in change:
         kw["get_off_policy_mask"] = lambda **k: torch.ones_like(k["per_token_logps"])
     if kw["loss_type"] == "vespo":
-        kw["get_gamma_weights"] = lambda **k: torch.ones(ROWS, 1)
+        kw["get_gamma_weights"] = lambda **k: torch.ones(ROWS, 1, device = DEVICE)
     assert _run(True, monkeypatch, **kw)[2] == 0
 
 
