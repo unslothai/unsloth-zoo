@@ -65,13 +65,8 @@ inductor_config_source = inspect.getsource(torch._inductor.config)
 
 
 def _disable_torch_2_9_0_cpp_symbolic_shape_guards():
-    # torch 2.9.0 is the only release that turned on the C++ symbolic shape guards
-    # (2.9.1 and 2.10+ ship `enable_cpp_symbolic_shape_guards = False`). They can drop
-    # a duck-sizing equality: Gemma3's compiled attention `prepare` traced at prefill
-    # with mask (1, 1, L, L) and q_len L was then reused for decode's (1, 1, 1, kv)
-    # mask, and Inductor's input check raised
-    # "AssertionError: expected size 512==1, stride 1==1 at dim=3" in generate().
-    # The Python guards 2.9.1 went back to evaluate it and recompile.
+    # Only torch 2.9.0 enables C++ symbolic shape guards; they drop a duck-sizing equality, so
+    # Gemma3's prefill-compiled `prepare` is reused for decode and Inductor asserts in generate().
     if not torch.__version__.startswith("2.9.0"): return False
     try:
         import torch._dynamo.config as dynamo_config

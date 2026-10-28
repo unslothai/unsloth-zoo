@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma3's compiled attention `prepare` must recompile when decode follows prefill.
-
-Prefill traces `prepare` with a (1, 1, L, L) mask and q_len L, so duck sizing ties the
-mask dims to q_len. Decode then passes q_len 1 with a (1, 1, 1, L + 1) mask. torch 2.9.0
-shipped C++ symbolic shape guards that skipped that equality, so the prefill graph ran
-for decode and Inductor raised "AssertionError: expected size 512==1, stride 1==1 at
-dim=3" (FunctionGemma 270M notebook, generate() after training). Runs in a subprocess so
-the compile cache and patched class do not leak into other tests."""
+"""Gemma3 compiled `prepare` must recompile for decode after prefill (torch 2.9.0 C++ shape guards)."""
 
 import os
 import subprocess
