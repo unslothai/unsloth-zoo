@@ -4803,6 +4803,7 @@ class _MLXQuantizationSpec:
     quantize_modules: tuple[str, ...] | None = None
     has_callable_predicate: bool = False
     force_requantize: bool = False
+    quantize_embeddings: bool = False
 
     def to_metadata(self):
         data = asdict(self)
@@ -5924,6 +5925,7 @@ def _resolve_mlx_quantization_spec(
     quant_predicate,
     quantize_modules,
     force_requantize,
+    quantize_embeddings=False,
 ):
     if full_finetuning:
         load_in_4bit = load_in_8bit = load_in_fp8 = False
@@ -6066,6 +6068,7 @@ def _resolve_mlx_quantization_spec(
         quantize_modules=_normalize_quantize_modules(quantize_modules),
         has_callable_predicate=quant_predicate is not None,
         force_requantize=bool(force_requantize),
+        quantize_embeddings=bool(quantize_embeddings),
     )
 
 
@@ -6181,7 +6184,7 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
             if _beside_text_decoder(path, decoder_paths):
                 return False
 
-        if not explicitly_included:
+        if not explicitly_included and not spec.quantize_embeddings:
             if any(fragment in path_parts for fragment in _DEFAULT_QUANT_SKIP_FRAGMENTS):
                 return False
             if type(module).__name__ in {"Embedding", "QuantizedEmbedding"}:
@@ -9718,6 +9721,7 @@ class FastMLXModel:
             kwargs.pop("modules_to_quantize", kwargs.pop("mlx_quantize_modules", None)),
         )
         force_requantize = bool(kwargs.pop("force_requantize", False))
+        quantize_embeddings = bool(kwargs.pop("quantize_embeddings", False))
         quantization_spec = _resolve_mlx_quantization_spec(
             load_in_4bit=load_in_4bit,
             load_in_8bit=load_in_8bit,
@@ -9734,6 +9738,7 @@ class FastMLXModel:
             quant_predicate=quant_predicate,
             quantize_modules=quantize_modules,
             force_requantize=force_requantize,
+            quantize_embeddings=quantize_embeddings,
         )
         distributed_requested = _mlx_distributed_requested(pipeline_group, tensor_group)
 
@@ -9891,6 +9896,7 @@ class FastMLXModel:
                     quant_predicate=quant_predicate,
                     quantize_modules=quantize_modules,
                     force_requantize=force_requantize,
+                    quantize_embeddings=quantize_embeddings,
                     **(
                         {"mlx_quantization_config": mlx_quantization_config}
                         if mlx_quantization_config is not None
@@ -10230,6 +10236,7 @@ class FastMLXModel:
                             "load_in_fp8": False,
                             "load_in_mxfp4": False,
                             "load_in_nvfp4": False,
+                            "quantize_embeddings": bool(adapter_quant_policy.get("quantize_embeddings")),
                         }
                     )
                     if (
