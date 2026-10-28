@@ -89,13 +89,14 @@ def fused_decode_ok(x):
         and x.is_cuda
         and not torch.is_grad_enabled()
         and not torch.compiler.is_compiling()
+        and not torch.jit.is_tracing()
     )
 
 
 if HAS_TRITON:
     @triton.jit
     def _add_rms_norm_kernel(
-        X, R, W, Y, N, stride_x, stride_r, stride_y, eps, inv_n,
+        X, R, W, Y, S, N, stride_x, stride_r, stride_y, stride_s, eps, inv_n,
         HAS_RES: tl.constexpr, BLOCK: tl.constexpr, EXACT: tl.constexpr,
     ):
         row = tl.program_id(0).to(tl.int64)
@@ -106,7 +107,7 @@ if HAS_TRITON:
             r = tl.load(R + row * stride_r + cols, mask = ok, other = 0.0)
             # Eager `hidden_states += residual`: one rounding to the activation dtype.
             x = (x.to(tl.float32) + r.to(tl.float32)).to(X.dtype.element_ty)
-            tl.store(X + row * stride_x + cols, x, mask = ok)
+            tl.store(S + row * stride_s + cols, x, mask = ok)
         xf = x.to(tl.float32)
         # aten's mean is sum * (1 / N); only the order of the fp32 sum differs from it.
         var = tl.sum(xf * xf, axis = 0) * inv_n + eps
@@ -143,15 +144,20 @@ if HAS_TRITON:
 
 
 def add_rms_norm(x, residual, weight, eps):
-    """RMSNorm(x + residual) with x overwritten by x + residual (the next residual); residual None
-    skips the add and leaves x untouched. x [..., N] contiguous; returns the normed tensor, or None
-    when the shapes or devices are not supported (callers then run the eager ops)."""
+    """(RMSNorm(x + residual), x + residual) in one launch, the sum in a new tensor (x is never written,
+    so an exception after the launch leaves the caller's eager fallback correct); residual None returns
+    (RMSNorm(x), x). x [..., N] contiguous; None when disabled or the shapes or devices are not supported
+    (callers then run the eager ops)."""
+    if not _ENABLED or torch.jit.is_tracing():
+        return None
     N = x.shape[-1]
     if (
         N > _MAX_COLS or not x.is_contiguous() or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
         or weight.shape != (N,) or weight.device != x.device
     ):
         return None
+    if not weight.is_contiguous():  # the kernel reads it with unit stride
+        weight = weight.contiguous()
     if residual is not None and (
         residual.shape != x.shape or residual.dtype != x.dtype or not residual.is_contiguous()
         or residual.device != x.device
@@ -159,13 +165,14 @@ def add_rms_norm(x, residual, weight, eps):
         return None
     rows = x.numel() // N
     y = torch.empty_like(x)
+    s = x if residual is None else torch.empty_like(x)
     if rows == 0:
-        return y
+        return y, s
     BLOCK = triton.next_power_of_2(N)
     try:
         with _on_device(x):
             _add_rms_norm_kernel[(rows,)](
-                x, x if residual is None else residual, weight, y, N, N, N, N, float(eps), 1.0 / N,
+                x, x if residual is None else residual, weight, y, s, N, N, N, N, N, float(eps), 1.0 / N,
                 HAS_RES = residual is not None, BLOCK = BLOCK, EXACT = _libdevice is not None,
                 num_warps = 8 if BLOCK >= 4096 else 4,
                 **_NO_FMA,
@@ -173,12 +180,14 @@ def add_rms_norm(x, residual, weight, eps):
     except Exception as e:
         return _disable(e)
     FUSED_DECODE_CALLS["add_rms_norm"] += 1
-    return y
+    return y, s
 
 
 def sink_scale_output(attn_output, lse, sinks):
     """(attn_output * sigmoid(lse - sinks)).transpose(1, 2).contiguous() in one launch.
-    attn_output [B, H, Q, D], lse [B, H, Q] (fp32), sinks [H]; None when unsupported."""
+    attn_output [B, H, Q, D], lse [B, H, Q] (fp32), sinks [H]; None when disabled or unsupported."""
+    if not _ENABLED or torch.jit.is_tracing():
+        return None
     if attn_output.dim() != 4 or lse.dim() != 3 or sinks.dim() != 1:
         return None
     B, H, Q, D = attn_output.shape

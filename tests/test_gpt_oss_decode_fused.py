@@ -64,13 +64,14 @@ _SCRIPT = textwrap.dedent('''
                 ref_sum = x + r
                 ref = eager_rms(w, 1e-5, ref_sum)
                 xx = x.clone()
-                y = F.add_rms_norm(xx, r, w, 1e-5)
+                y, ss = F.add_rms_norm(xx, r, w, 1e-5)
                 key = f"{dtype}_{N}_{rows}_{w_dtype}"
-                res["sum_exact_" + key] = bool(torch.equal(xx, ref_sum))
+                res["sum_exact_" + key] = bool(torch.equal(ss, ref_sum))
+                res["no_res_untouched_x_" + key] = bool(torch.equal(xx, x))
                 res["norm_ulps_" + key] = ulps(y, ref) if dtype != "float32" else float((y - ref).abs().max())
                 res["norm_mismatch_frac_" + key] = float((y != ref).float().mean())
                 x0 = x.clone()
-                y0 = F.add_rms_norm(x0, None, w, 1e-5)
+                y0, _ = F.add_rms_norm(x0, None, w, 1e-5)
                 res["no_res_untouched_" + key] = bool(torch.equal(x0, x))
                 res["no_res_ulps_" + key] = float((y0.float() - eager_rms(w, 1e-5, x).float()).abs().max())
 
@@ -197,11 +198,11 @@ _LOOP = textwrap.dedent('''
         # checked against the eager ops above.
         def _stand_in(x, residual, weight, eps):
             if residual is not None:
-                x += residual
+                x = x + residual
             h = x.float()
             h = h * torch.rsqrt(h.square().mean(-1, keepdim = True) + eps) * weight.float()
             F.FUSED_DECODE_CALLS["add_rms_norm"] += 1
-            return h.to(x.dtype)
+            return h.to(x.dtype), x
         G._fused_add_rms_norm = _stand_in
         G._fused_decode_ok = lambda x: F._ENABLED and not torch.is_grad_enabled()
         # Without a GPU flex_attention reports unavailable and exports no decode helpers; the model
@@ -285,3 +286,30 @@ def test_launch_failure_falls_back_and_disables(monkeypatch):
     monkeypatch.setattr(F, "_ENABLED", True)
     assert F.sink_scale_output(torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1), torch.randn(2)) is None
     assert not F._ENABLED
+
+
+def test_disabled_or_tracing_never_launches(monkeypatch):
+    from unsloth_zoo import gpt_oss_decode_fused as F
+    launches = []
+
+    class _Counting:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(grid)
+                raise RuntimeError("no compiler")
+            return launch
+
+    monkeypatch.setattr(F, "_add_rms_norm_kernel", _Counting())
+    monkeypatch.setattr(F, "_sink_scale_kernel", _Counting())
+    monkeypatch.setattr(F, "_ENABLED", True)
+    x, r, w = torch.randn(2, 8), torch.randn(2, 8), torch.ones(8)
+    # One failed launch disables the path: later calls in the same step go straight to the eager ops.
+    assert F.add_rms_norm(x, r, w, 1e-5) is None
+    assert F.add_rms_norm(x, r, w, 1e-5) is None
+    assert F.sink_scale_output(torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1), torch.randn(2)) is None
+    assert len(launches) == 1
+    monkeypatch.setattr(F, "_ENABLED", True)
+    monkeypatch.setattr(torch.jit, "is_tracing", lambda: True)
+    assert F.add_rms_norm(x, r, w, 1e-5) is None
+    assert F.sink_scale_output(torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1), torch.randn(2)) is None
+    assert len(launches) == 1 and F._ENABLED

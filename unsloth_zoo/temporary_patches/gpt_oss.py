@@ -3860,11 +3860,11 @@ def patch_GptOssModel():
     pass
 
     def add_rms_layernorm_forward(norm, hidden_states, residual):
-        """(RMSNorm(hidden_states + residual), hidden_states + residual) in one launch when it can,
-        the sum written into hidden_states; residual None normalizes hidden_states alone."""
-        normed = _fused_add_rms_norm(hidden_states, residual, norm.weight, norm.variance_epsilon)
-        if normed is not None:
-            return normed, hidden_states
+        """(RMSNorm(hidden_states + residual), hidden_states + residual) in one launch when it can;
+        residual None normalizes hidden_states alone."""
+        fused = _fused_add_rms_norm(hidden_states, residual, norm.weight, norm.variance_epsilon)
+        if fused is not None:
+            return fused
         if residual is not None:
             hidden_states += residual.to(hidden_states.device)
         residual = hidden_states.clone()
