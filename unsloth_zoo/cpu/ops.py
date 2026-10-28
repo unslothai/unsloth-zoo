@@ -71,10 +71,11 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         total = torch.zeros((), dtype = torch.float32)
         for start in range(0, rows, chunk_rows):
             end = min(start + chunk_rows, rows)
-            h = hidden[start:end]
             y = labels[start:end]
-            logits = (h @ weight.t()).float()
             valid = y != ignore_index
+            # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
+            h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
+            logits = (h @ weight.t()).float()
             safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
             logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
             total -= (log_p_target.squeeze(-1) * valid).sum()
@@ -90,13 +91,20 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
                         grad_hidden[start:end] = logits.to(h.dtype) @ weight
                 if need_weight_grad:
                     grad_weight.addmm_(logits.t(), h.float())
-        # num_items_in_batch == 0 (a fully masked accumulation group): a finite 0, as TRL's clamped divisor gives.
-        loss = total / (1.0 if divisor == 0 else divisor)
-        ctx.divisor = divisor
-        ctx.save_for_backward(
+        saved = (
             grad_hidden if grad_hidden is not None else torch.empty(0),
             grad_weight if grad_weight is not None else torch.empty(0),
         )
+        # num_items_in_batch == 0 (a fully masked accumulation group): a finite 0, as TRL's clamped divisor gives.
+        if torch.is_tensor(divisor):
+            # Keep tensor counts as tensors: .item() breaks fullgraph tracing.
+            loss = total / torch.where(divisor == 0, torch.ones_like(divisor), divisor)
+            ctx.divisor = None
+            saved = saved + (divisor,)
+        else:
+            loss = total / (1.0 if divisor == 0 else divisor)
+            ctx.divisor = divisor
+        ctx.save_for_backward(*saved)
         ctx.has_hidden = need_hidden_grad
         ctx.has_weight = need_weight_grad
         ctx.weight_dtype = weight.dtype
@@ -105,11 +113,17 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        grad_hidden, grad_weight = ctx.saved_tensors
+        grad_hidden, grad_weight = ctx.saved_tensors[:2]
         # Every label ignored: the loss is NaN like F.cross_entropy(mean), but its gradient is zero.
         # Also num_items_in_batch == 0 (a fully masked accumulation group): stock CE's gradient is zero there.
-        empty = math.isnan(ctx.divisor) or ctx.divisor == 0
-        scale = torch.zeros_like(grad_output) if empty else grad_output / ctx.divisor
+        if ctx.divisor is None:
+            divisor = ctx.saved_tensors[2]
+            empty = torch.isnan(divisor) | (divisor == 0)
+            scale = torch.where(empty, torch.zeros_like(grad_output),
+                                grad_output / torch.where(empty, torch.ones_like(divisor), divisor))
+        else:
+            empty = math.isnan(ctx.divisor) or ctx.divisor == 0
+            scale = torch.zeros_like(grad_output) if empty else grad_output / ctx.divisor
         dh = (grad_hidden * scale.to(grad_hidden.dtype)).to(ctx.hidden_dtype) if ctx.has_hidden else None
         dw = (grad_weight * scale).to(ctx.weight_dtype) if ctx.has_weight else None
         return dh, dw, None, None, None, None
@@ -406,12 +420,13 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
     hidden = hidden.reshape(-1, hidden.shape[-1])
     shift_labels = shift_labels.reshape(-1).to(hidden.device)
     if num_items_in_batch is None:
-        divisor = (shift_labels != ignore_index).sum().clamp(min = 1).item()
+        count = (shift_labels != ignore_index).sum().to(torch.float32)
         # Matches F.cross_entropy(reduction="mean"): NaN when every label is ignored.
-        if (shift_labels != ignore_index).sum().item() == 0:
-            divisor = float("nan")
+        divisor = torch.where(count == 0, torch.full_like(count, float("nan")), count)
+    elif torch.is_tensor(num_items_in_batch):
+        divisor = num_items_in_batch.detach().to(device = hidden.device, dtype = torch.float32).reshape(())
     else:
-        divisor = num_items_in_batch.item() if torch.is_tensor(num_items_in_batch) else num_items_in_batch
+        divisor = float(num_items_in_batch)
     # Skip ignored rows' LM head work. Eager only: the sync breaks compile; chunk loop zeroes them anyway.
     if not torch.compiler.is_compiling():
         valid = shift_labels != ignore_index
@@ -421,7 +436,7 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
     if chunk_rows is None:
         # ~64 MB of fp32 logits per chunk.
         chunk_rows = max(16, int(os.environ.get("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", 16 * 1024 * 1024)) // weight.shape[0])
-    return _ChunkedLinearCrossEntropy.apply(hidden, weight, shift_labels, float(divisor), chunk_rows, ignore_index)
+    return _ChunkedLinearCrossEntropy.apply(hidden, weight, shift_labels, divisor, chunk_rows, ignore_index)
 
 
 # Architectures whose causal-LM loss is plain CE over lm_head(hidden). Others (soft caps, logit scales,

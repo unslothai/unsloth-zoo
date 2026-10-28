@@ -25,6 +25,11 @@ MODEL = "mlx-community/Qwen3.5-0.8B-bf16"
 QUANTIZED = "mlx-community/Qwen3.5-0.8B-4bit"
 MTP_MODEL = "Qwen/Qwen3.5-0.8B"
 GEMMA, GEMMA_ASSISTANT = "mlx-community/gemma-4-e4b-it-bf16", "mlx-community/gemma-4-E4B-it-assistant-bf16"
+QWEN4_TEXT = dict(model_type = "qwen4_exp_text", hidden_size = 512, num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 2,
+                  head_dim = 128, linear_num_key_heads = 2, linear_num_value_heads = 6, linear_key_head_dim = 128, linear_value_head_dim = 128,
+                  linear_conv_kernel_dim = 4, num_experts = 64, num_experts_per_tok = 10, moe_intermediate_size = 640,
+                  shared_expert_intermediate_size = 640, hc_lowrank = 320, rms_norm_eps = 1e-6, vocab_size = 1024, max_position_embeddings = 4096,
+                  ple_layer_ids = [2], ngram_vocab_size_base = 4096, split_ngram_parts = 4, eos_token_id = 1)
 CODE = (
     "def merge_sort(values):\n    if len(values) <= 1:\n        return values\n    middle = len(values) // 2\n"
     "    left = merge_sort(values[:middle])\n    right = merge_sort(values[middle:])\n    return merge(left, right)\n"
@@ -129,13 +134,8 @@ def qwen4():
     from mlx_vlm.models import qwen4_exp
     from unsloth_zoo.mlx.loader import _ensure_exact_verify_sums_promoted
     _ensure_exact_verify_sums_promoted()  # as FastMLXModel's VLM load does
-    text = dict(model_type = "qwen4_exp_text", hidden_size = 512, num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 2,
-                head_dim = 128, linear_num_key_heads = 2, linear_num_value_heads = 6, linear_key_head_dim = 128, linear_value_head_dim = 128,
-                linear_conv_kernel_dim = 4, num_experts = 64, num_experts_per_tok = 10, moe_intermediate_size = 640,
-                shared_expert_intermediate_size = 640, hc_lowrank = 320, rms_norm_eps = 1e-6, vocab_size = 1024, max_position_embeddings = 4096,
-                ple_layer_ids = [2], ngram_vocab_size_base = 4096, split_ngram_parts = 4, eos_token_id = 1)
     vision = dict(depth = 1, hidden_size = 64, num_heads = 2, intermediate_size = 128, out_hidden_size = 512)
-    model = qwen4_exp.Model(qwen4_exp.ModelConfig.from_dict(dict(model_type = "qwen4_exp", text_config = text, vision_config = vision)))
+    model = qwen4_exp.Model(qwen4_exp.ModelConfig.from_dict(dict(model_type = "qwen4_exp", text_config = QWEN4_TEXT, vision_config = vision)))
     # Constructors zero gates and residual scales, which would cut the paths under test.
     model.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05
                           if mx.issubdtype(a.dtype, mx.floating) and not mx.any(a).item() else a, model.parameters()))
@@ -1240,11 +1240,103 @@ def test_a_head_kept_under_the_language_model_of_an_mlx_conversion_is_built_with
     assert all(mx.array_equal(built[key.removeprefix("language_model.mtp.")], value) for key, value in tensors.items() if ".mtp." in key)
 
 
+def test_a_head_whose_overrides_name_its_checkpoint_paths_is_built_at_its_stored_widths(qwen4, tmp_path):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_vlm.speculative.drafters import qwen4_exp_mtp
+    from unsloth_zoo.mlx.speculative import native_mtp_drafter
+    default = {"group_size": 64, "bits": 4, "mode": "affine"}
+    wide = {"fc_hidden": {**default, "bits": 8}, "layers.0.self_attn.q_proj": {**default, "bits": 8},
+            "layers.0.mlp.shared_expert.down_proj": {**default, "bits": 8, "group_size": 128}}
+    head = qwen4_exp_mtp.Model(qwen4_exp_mtp.ModelConfig.from_dict({"text_config": QWEN4_TEXT}))
+    nn.quantize(head, class_predicate = lambda name, layer: hasattr(layer, "to_quantized") and not name.endswith("mlp.gate") and wide.get(name, default))
+    tensors = {f"mtp.{key}": value for key, value in tree_flatten(head.parameters())}
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors, metadata = {"format": "mlx"})
+    quantization = {**default, **{f"mtp.{name}": spec for name, spec in wide.items()}}
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen4_exp", "text_config": QWEN4_TEXT, "quantization": quantization}))
+    drafter = native_mtp_drafter(tmp_path, qwen4[0])
+    model, built = drafter.model, dict(tree_flatten(drafter.model.parameters()))
+    layer = model.layers[0]
+    modules = (model.fc_embedding, model.fc_hidden, layer.self_attn.q_proj, layer.self_attn.k_proj, layer.mlp.shared_expert.down_proj, layer.mlp.switch_mlp.up_proj)
+    assert [(module.bits, module.group_size) for module in modules] == [(4, 64), (8, 64), (8, 64), (4, 64), (8, 128), (4, 64)]
+    assert built.keys() == {key.removeprefix("mtp.") for key in tensors}
+    assert all(mx.array_equal(built[key.removeprefix("mtp.")], value) for key, value in tensors.items())
+
+
+GLM5_TEXT = dict(model_type = "glm5_next_text", hidden_size = 256, num_hidden_layers = 4, num_nextn_predict_layers = 1, vocab_size = 512,
+                 num_attention_heads = 2, num_key_value_heads = 2, q_lora_rank = 128, kv_lora_rank = 64, qk_head_dim = 64, qk_nope_head_dim = 64,
+                 qk_rope_head_dim = 0, v_head_dim = 64, head_dim = 0, intermediate_size = 256, moe_intermediate_size = 64, n_routed_experts = 4,
+                 n_shared_experts = 1, num_experts_per_tok = 2, first_k_dense_replace = 1, index_head_dim = 32, index_n_heads = 2, index_topk = 16,
+                 index_kpool = 4, n_group = 1, topk_group = 1, routed_scaling_factor = 2.5, rms_norm_eps = 1e-5, hc_mult = 4, hc_eps = 1e-6,
+                 hc_sinkhorn_iters = 4, swiglu_limit = 10.0, max_position_embeddings = 4096, layer_types = ["linear_attention"] * 3 + ["deepseek_sparse_attention"],
+                 indexer_types = ["full"] * 4, mlp_layer_types = ["dense"] + ["sparse"] * 3,
+                 linear_attn_config = {"num_heads": 2, "gate_lower_bound": -5.0, "head_dim": 64, "short_conv_kernel_size": 4, "kda_layers": [0, 1, 2], "full_attn_layers": [3]})
+
+
+def test_a_nextn_head_omlx_stores_as_mtp_blocks_is_built_as_from_its_source_layout(monkeypatch, tmp_path):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten, tree_unflatten
+    from mlx_vlm.speculative.drafters import glm5_next_mtp
+    from unsloth_zoo.mlx import speculative
+    head = glm5_next_mtp.Model(glm5_next_mtp.ModelConfig.from_dict({"model_type": "glm5_next_mtp", "text_config": GLM5_TEXT, "block_size": 2}))
+    # Distinct values per tensor, so a mapping that swaps two same-shaped tensors (enorm, hnorm) shows.
+    head.update(tree_unflatten([(key, mx.random.normal(value.shape, key = mx.random.key(i)) * 0.05) for i, (key, value) in enumerate(tree_flatten(head.parameters()))]))
+    default, wide = {"group_size": 64, "bits": 4, "mode": "affine"}, {"group_size": 64, "bits": 8, "mode": "affine"}
+    nn.quantize(head, class_predicate = lambda name, layer: hasattr(layer, "to_quantized") and not name.endswith("mlp.gate")
+                and layer.weight.shape[-1] % 64 == 0 and (wide if ".self_attn." in name or "shared_experts" in name else default))
+    expected = dict(tree_flatten(head.parameters()))
+    # As omlx converts the nextn layer: the decoder layer as the target's own sanitize leaves it, the fusion tensors beside it.
+    stored, split = {}, {"mlp.shared_experts.gate_up_proj": (("gate_proj", "up_proj"), 2), "self_attn.qkv_a_proj": (("q_a_proj", "kv_a_proj_with_mqa"), [GLM5_TEXT["q_lora_rank"]])}
+    for key, value in expected.items():
+        module, leaf = key.rsplit(".", 1)
+        name = f"mtp.0.block.{module.removeprefix('mtp_block.')}" if module.startswith("mtp_block.") else "mtp.0.norm" if module == "shared_head_norm" else f"mtp.0.{module}"
+        fused = next((part for part in split if module.endswith(part)), None)
+        if fused is None:
+            stored[f"language_model.{name}.{leaf}"] = value
+            continue
+        (first, second), at = split[fused]
+        base = name.removesuffix(fused.split(".")[-1])
+        stored.update(zip((f"language_model.{base}{first}.{leaf}", f"language_model.{base}{second}.{leaf}"), mx.split(value, at, axis = 0)))
+    stored["language_model.model.norm.weight"] = mx.ones(8)  # a trunk tensor the head must not take
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), stored, metadata = {"format": "mlx"})
+    overrides = {key.rsplit(".", 1)[0]: wide for key in stored if key.endswith(".scales") and (".self_attn." in key or "shared_experts" in key)}
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm5_next", "text_config": GLM5_TEXT, "quantization": {**default, **overrides}}))
+    monkeypatch.setattr(speculative, "_built", lambda wrapper, model, target, **kwargs: model)
+    assert speculative.has_native_mtp_head(tmp_path)
+    built = dict(tree_flatten(speculative.native_mtp_drafter(tmp_path, None).parameters()))
+    assert built.keys() == expected.keys() and all(mx.array_equal(built[key], value) for key, value in expected.items())
+
+
 def test_a_separate_mtp_head_checkpoint_is_wrapped_as_the_built_in_head(qwen_mtp, tmp_path):
     from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
     from unsloth_zoo.mlx.speculative import MTPDrafter, companion_drafter
     assert detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(tmp_path)) and type(companion_drafter(tmp_path, qwen_mtp[0])) is MTPDrafter and qwen_mtp[0]._unsloth_speculates
 
+
+
+def test_an_assistant_merged_into_its_target_checkpoint_is_built_as_its_own_checkpoint_would_be(gemma, tmp_path):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.utils import get_model_path
+    from unsloth_zoo.mlx.speculative import AssistantDrafter, has_native_mtp_head, native_mtp_drafter
+    model, _, companion = gemma
+    assistant, target = get_model_path(GEMMA_ASSISTANT), json.loads((get_model_path(GEMMA) / "config.json").read_text())
+    # As omlx merges it: the assistant's config inside the target's, its weights under language_model.mtp.
+    target["text_config"]["mtp_assistant_config"] = json.loads((assistant / "config.json").read_text())
+    tensors = {f"language_model.mtp.{key}": value for key, value in mx.load(str(assistant / "model.safetensors")).items()}
+    # Beside a target tensor, which the build must leave out.
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {**tensors, "language_model.model.norm.weight": mx.ones(8)}, metadata = {"format": "mlx"})
+    (tmp_path / "config.json").write_text(json.dumps(target))
+    assert has_native_mtp_head(tmp_path) and not has_native_mtp_head(get_model_path(GEMMA))
+    drafter = native_mtp_drafter(tmp_path, model)
+    built, expected = dict(tree_flatten(drafter.model.parameters())), dict(tree_flatten(companion.model.parameters()))
+    assert type(drafter) is AssistantDrafter and built.keys() == expected.keys()
+    # Dtypes too: the stored int64 token ordering is the assistant's int32 only after its own sanitize.
+    assert all(built[key].dtype == value.dtype and mx.array_equal(built[key], value) for key, value in expected.items())
+    # Only a Gemma 4 assistant drafts against its target's KV, so neither another family's nor another Gemma 4 drafter kind is a head.
+    for model_type in ("muse_glimmer_assistant", "gemma4_dflash"):
+        target["text_config"]["mtp_assistant_config"]["model_type"] = model_type
+        (tmp_path / "config.json").write_text(json.dumps(target))
+        assert not has_native_mtp_head(tmp_path)
 
 
 def test_assistant_drafts_from_the_target_kv_alone_and_in_batches(gemma, monkeypatch):

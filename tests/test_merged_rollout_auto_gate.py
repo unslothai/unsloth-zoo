@@ -29,7 +29,8 @@ def _fresh_platform_cache():
 def _platform(monkeypatch, *, platform = "linux", release = "6.8.0-generic", hip = None, cuda = True,
               triton = True, vllm = "0.19.1"):
     monkeypatch.setattr(vllm_utils.sys, "platform", platform)
-    monkeypatch.setattr(vllm_utils.os, "uname", lambda: types.SimpleNamespace(release = release))
+    # raising = False: native Windows has no os.uname.
+    monkeypatch.setattr(vllm_utils.os, "uname", lambda: types.SimpleNamespace(release = release), raising = False)
     monkeypatch.setattr(vllm_utils.torch.version, "hip", hip)
     monkeypatch.setattr(vllm_utils.torch.cuda, "is_available", lambda: cuda)
     import unsloth_zoo.merged_rollout_exact as exact

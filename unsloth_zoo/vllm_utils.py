@@ -169,6 +169,13 @@ def _torchrun_group_backend(local_index):
     return "cpu:gloo,cuda:nccl"
 pass
 
+def _vllm_split_group_requested():
+    try:
+        return int(os.environ.get("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", "0") or "0") != 0
+    except ValueError:
+        return False
+pass
+
 def _init_torchrun_process_group(launch_info):
     """Bind this rank to its card and create the job's env:// group if nothing has yet.
 
@@ -183,13 +190,13 @@ def _init_torchrun_process_group(launch_info):
         local_index = local_rank if local_rank < count else local_rank % max(count, 1)
         torch.cuda.set_device(local_index)
     if not dist.is_initialized():
-        # Same timeout accelerate uses for a torchrun job (HF ddp_timeout = 1800 s); the Trainer
-        # reuses an initialized group. backend None would register the accelerator's backend only
-        # (nccl on CUDA), and the CPU collectives later code runs on this group (the gates here,
-        # unsloth's FSDP2 rank agreements) need gloo beside it.
+        # HF ddp_timeout (1800 s). backend None registers nccl only on CUDA; CPU collectives
+        # (rank gates, FSDP2 rank agreements) need gloo beside it.
+        kwargs = dict(backend = _torchrun_group_backend(local_index))
+        if local_index is not None and _vllm_split_group_requested():
+            kwargs = dict(backend = "cpu:gloo,cuda:nccl", device_id = torch.device("cuda", local_index))
         dist.init_process_group(
-            backend = _torchrun_group_backend(local_index), init_method = "env://",
-            timeout = timedelta(seconds = _process_group_timeout()),
+            init_method = "env://", timeout = timedelta(seconds = _process_group_timeout()), **kwargs
         )
     elif dist.get_world_size() != world_size:
         logger.warning(
@@ -200,10 +207,7 @@ def _init_torchrun_process_group(launch_info):
 pass
 
 def _group_takes_cpu_tensors(group = None):
-    """True when `group` has a backend for CPU tensors (gloo, or "cpu:gloo,cuda:nccl").
-
-    init_process_group(backend = None) on a CUDA host registers only nccl (torch's
-    BackendConfig maps "undefined" to the detected accelerator), and so does "nccl"."""
+    """True when `group` has a CPU backend. backend None on CUDA reports "undefined" but is nccl only."""
     import torch.distributed as dist
     try:
         config = str(dist.get_backend_config(group)).lower()
@@ -214,13 +218,11 @@ def _group_takes_cpu_tensors(group = None):
     return config not in ("nccl", "xccl", "hccl", "undefined")
 pass
 
-# (default group, its gloo twin): one gloo group per default group, made on first use.
+# (default group, its gloo twin)
 _CPU_REDUCE_GROUP = [None, None]
 
 def _cpu_reduce_group(group = None):
-    """A gloo group over the same ranks as the default group, or None (another group, no gloo).
-
-    new_group is collective over the default group: _all_reduce_int's callers run on every rank."""
+    """Gloo twin of the default group, or None. new_group is collective: callers run on every rank."""
     import torch.distributed as dist
     if group is not None or not dist.is_gloo_available():
         return None

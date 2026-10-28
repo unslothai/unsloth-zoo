@@ -76,6 +76,7 @@ def _env(monkeypatch):
                  "UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS"):
         monkeypatch.delenv(name, raising = False)
     sb._FAILED.clear()
+    getattr(sparse_gates, "_BACKWARD_OK", set()).clear()
 
 
 def _patched():
@@ -558,7 +559,7 @@ def test_indexer_forward_without_class_attributes(monkeypatch, family):
 def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
     """Unsloth compiles each decoder layer (fullgraph=False). Above the budget the flex call leaves that graph
     (one break) and engages, matching eager flex; within the budget nothing breaks the graph. Without the
-    block flag a compiled call keeps the model's path."""
+    region flag a compiled call keeps the model's path, including the block traced in a user's fullgraph=True."""
     import sys
     import types
     import torch._dynamo
@@ -579,9 +580,10 @@ def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
     attn = attn.cuda().bfloat16()
     block = types.ModuleType("unsloth.models._block_compile")
     block._IN_BLOCK = [0]
+    block._IN_COMPILED_REGION = [False]
     monkeypatch.setitem(sys.modules, "unsloth.models._block_compile", block)
 
-    def run(S, compiled, in_block):
+    def run(S, compiled, in_block, fullgraph = False):
         (cos, sin), pos = _rope(config, family, S, "cuda")
         torch.manual_seed(1)
         x = torch.randn(1, S, config.hidden_size, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
@@ -589,17 +591,27 @@ def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
             ~torch.ones(S, S, dtype = torch.bool, device = "cuda").tril(), float("-inf"))
 
         def fn(t):
-            return attn(t, (cos.bfloat16(), sin.bfloat16()), mask, position_ids = pos)[0]
+            if in_block != "inline":
+                return attn(t, (cos.bfloat16(), sin.bfloat16()), mask, position_ids = pos)[0]
+            # The block wrapper traced inside a user's compile (_inline): _IN_BLOCK is set, the region flag not.
+            block._IN_BLOCK[0] = 1
+            try:
+                return attn(t, (cos.bfloat16(), sin.bfloat16()), mask, position_ids = pos)[0]
+            finally:
+                block._IN_BLOCK[0] = 0
 
         torch._dynamo.reset()
         counters.clear()
         if compiled:
-            fn = torch.compile(fn, fullgraph = False)
-        block._IN_BLOCK[0] = 1 if in_block else 0
+            fn = torch.compile(fn, fullgraph = fullgraph)
+        # Unsloth's own compiled block (run): both flags set around the compiled call.
+        block._IN_BLOCK[0] = 1 if in_block is True else 0
+        block._IN_COMPILED_REGION[0] = in_block is True
         try:
             out = fn(x)
         finally:
             block._IN_BLOCK[0] = 0
+            block._IN_COMPILED_REGION[0] = False
         out.float().square().mean().backward()
         return out.detach().float(), x.grad.float(), sum(counters["graph_break"].values())
 
@@ -615,6 +627,17 @@ def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
     before = _stat("flex", family)
     run(512, True, False)
     assert _stat("flex", family) == before  # any other compile: the model's path, as before
+    # A user's fullgraph=True compile over a block-wrapped layer: no break allowed, the model's path.
+    _, _, breaks = run(512, True, "inline", fullgraph = True)
+    assert _stat("flex", family) == before and breaks == 0
+    # An Unsloth without the region flag: the model's path in its block compile too (no fullgraph failure).
+    del block._IN_COMPILED_REGION
+    block._IN_BLOCK[0] = 1
+    try:
+        assert not sb.in_unsloth_block()
+    finally:
+        block._IN_BLOCK[0] = 0
+    block._IN_COMPILED_REGION = [False]
     _, _, breaks = run(within, True, True)
     assert breaks == 0, breaks
     assert not sb._FAILED, sb._FAILED
@@ -824,3 +847,245 @@ def test_config_output_attentions_keeps_the_model_path(family):
         assert not sb.dsa_flex_eligible(module, q, q, q, mask, {}, None)
         config.output_attentions = False
         assert sb.dsa_flex_eligible(module, q, q, q, mask, {}, None)
+
+
+@needs_models
+@gpu
+@pytest.mark.parametrize("finite_bias", [False, True])
+def test_dsa_flex_cuda_graph_capture_matches_eager(finite_bias):
+    """The finite-bias check is a host sync; under stream capture it invalidated the capture
+    (cudaErrorStreamCaptureInvalidated). Capturing keeps the bias instead: the replay matches the eager call."""
+    torch.manual_seed(0)
+    dev, dt = "cuda", torch.bfloat16
+    B, H, S, T, D = 1, 4, 64, 1024, 64
+    q = torch.randn(B, H, S, D, device = dev, dtype = dt)
+    k = torch.randn(B, H, T, D, device = dev, dtype = dt)
+    topk_idx = torch.randperm(T, device = dev)[:256].sort().values.int().expand(B, S, -1)
+    mask = torch.zeros(B, 1, S, T, device = dev, dtype = dt)
+    mask[..., -64:] = torch.finfo(dt).min
+    if finite_bias:
+        mask = mask + torch.rand_like(mask).mul(0.5)
+
+    def fn():
+        if hasattr(topk_idx, "_unsloth_dsa_flex"):
+            del topk_idx._unsloth_dsa_flex  # rebuild the block mask (and run the bias check) every call
+        return sb.dsa_flex_attention(q, k, k, topk_idx, mask, D ** -0.5)
+
+    eager = fn().clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            fn()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream = stream):
+        out = fn()
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _rel(out, eager) < 1e-2, _rel(out, eager)
+
+
+@needs_models
+@gpu
+def test_dsa_flex_capture_same_shape_mixed_bias():
+    """Two same-shape calls in one capture, one with a finite bias and one 0 / min only: the warm-up of the
+    biased call must not be overwritten by the plain one (a stale no-bias answer asserted on replay)."""
+    torch.manual_seed(0)
+    dev, dt = "cuda", torch.bfloat16
+    B, H, S, T, D = 1, 4, 64, 1024, 64
+    q = torch.randn(B, H, S, D, device = dev, dtype = dt)
+    k = torch.randn(B, H, T, D, device = dev, dtype = dt)
+    topk_idx = torch.randperm(T, device = dev)[:256].sort().values.int().expand(B, S, -1)
+    plain = torch.zeros(B, 1, S, T, device = dev, dtype = dt)
+    plain[..., -64:] = torch.finfo(dt).min
+    biased = plain + torch.rand_like(plain).mul(0.5)
+
+    def fn():
+        outs = []
+        for mask in (biased, plain):
+            if hasattr(topk_idx, "_unsloth_dsa_flex"):
+                del topk_idx._unsloth_dsa_flex
+            outs.append(sb.dsa_flex_attention(q, k, k, topk_idx, mask, D ** -0.5))
+        return outs
+
+    eager = [o.clone() for o in fn()]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            fn()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream = stream):
+        outs = fn()
+    for o in outs:
+        o.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    for o, e in zip(outs, eager):
+        assert _rel(o, e) < 1e-2, _rel(o, e)
+
+
+@gpu
+def test_capture_bias_answer_is_per_caller_kind():
+    """V4 and DSA compile separate flex kernels: a biased V4 warm-up must not make a captured DSA call of the
+    same mask shape ask for a bias kernel that DSA never compiled (and the reverse)."""
+    from unsloth_zoo.flex_attention import sparse as sp
+    dev, dt = "cuda", torch.bfloat16
+    plain = torch.zeros(1, 64, 1024, device = dev, dtype = dt)
+    plain[..., -64:] = torch.finfo(dt).min
+    biased = plain + torch.rand_like(plain).mul(0.5)
+    visible = plain > torch.finfo(dt).min / 2
+    sp._BIAS_SEEN.clear()
+    assert sp.additive_bias_present(biased, visible, "deepseek_v4")
+    assert not sp.additive_bias_present(plain, visible, "dsa")
+    answers = {}
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream = stream):
+        answers["dsa"] = sp.additive_bias_present(plain, visible, "dsa")
+        answers["deepseek_v4"] = sp.additive_bias_present(biased, visible, "deepseek_v4")
+    graph.replay()
+    torch.cuda.synchronize()
+    sp._BIAS_SEEN.clear()
+    assert answers == {"dsa": False, "deepseek_v4": True}
+
+
+def test_flex_failure_under_capture_is_raised_not_latched(monkeypatch):
+    """A failure while a CUDA graph is being captured has invalidated the capture, so the dense fallback cannot
+    run either: it is raised, and the shape class stays on flex."""
+    import types
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    query = types.SimpleNamespace(
+        is_cuda = True, device = types.SimpleNamespace(index = 0), dtype = torch.bfloat16, shape = (1, 4, 64, 64),
+    )
+
+    def fail():
+        raise RuntimeError("operation not permitted when stream is capturing")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match = "capturing"):
+        s._flex_or_none("dsa", "DSA", fail, query, query, query)
+    assert not sb._FAILED
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert s._flex_or_none("dsa", "DSA", fail, query, query, query) is None
+    assert len(sb._FAILED) == 1
+
+
+class _BackwardFails(torch.autograd.Function):
+    """Flex kernel whose forward runs and backward fails."""
+
+    @staticmethod
+    def forward(ctx, query):
+        return query * 2
+
+    @staticmethod
+    def backward(ctx, grad):
+        raise RuntimeError("out of resource: shared memory, Required: 262144, Hardware limit: 101376")
+
+
+def _qkv(requires_grad = True):
+    g = torch.Generator().manual_seed(0)
+    return [torch.randn(1, 4, 32, 16, generator = g).requires_grad_(requires_grad) for _ in range(3)]
+
+
+def test_flex_backward_failure_is_latched_before_the_step():
+    """A failing flex backward is caught by the probe and latches the dense path."""
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    q, k, v = _qkv()
+
+    def flex(query, key, value):
+        sb._count("flex", "dsa")
+        return _BackwardFails.apply(query) + key * value
+
+    flex_before, fallback_before = _stat("flex", "dsa"), _stat("fallback", "dsa")
+    out = s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v)
+    assert out is None, "a flex call whose backward fails was returned to autograd"
+    assert len(sb._FAILED) == 1 and "out of resource" in next(iter(sb._FAILED.values()))
+    assert _stat("flex", "dsa") == flex_before and _stat("fallback", "dsa") == fallback_before + 1
+    assert q.grad is None and k.grad is None
+    assert sb._failure_key("dsa", q, k, v) in sb._FAILED
+
+
+def test_flex_backward_probe_runs_once_and_matches():
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    q, k, v = _qkv()
+    calls = []
+
+    def flex(query, key, value):
+        calls.append(query.requires_grad)
+        sb._count("flex", "dsa")
+        return query * key + value
+
+    before = _stat("flex", "dsa")
+    out = s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v)
+    assert calls == [True, True] and _stat("flex", "dsa") == before + 1  # probe + real call, the probe uncounted
+    assert out.grad_fn is not None
+    out.sum().backward()
+    torch.testing.assert_close(q.grad, k.detach())
+    torch.testing.assert_close(v.grad, torch.ones_like(v))
+    assert s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v) is not None
+    assert len(calls) == 3  # probed once per shape class
+    assert not sb._FAILED
+
+
+def test_flex_backward_probe_skipped_without_autograd():
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    calls = []
+
+    def flex(query, key, value):
+        calls.append(1)
+        return _BackwardFails.apply(query) + key + value
+
+    q, k, v = _qkv(requires_grad = False)
+    assert s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v) is not None  # no backward will run
+    q, k, v = _qkv()
+    with torch.no_grad():
+        assert s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v) is not None
+    assert len(calls) == 2 and not sb._FAILED and not sparse_gates._BACKWARD_OK
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_flex_backward_probe_under_gradient_checkpointing(use_reentrant):
+    """The probe's saved tensors bypass the checkpoint's hooks: recompute sees the same saved tensors as the forward."""
+    from torch.utils.checkpoint import checkpoint
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    w = torch.randn(16, 16, requires_grad = True)
+
+    def flex(query, key, value):
+        return torch.softmax(query @ key.transpose(-1, -2), -1) @ value
+
+    def layer(x):
+        q, k, v = (x @ w).sin(), (x @ w).cos(), x @ w
+        out = s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v)
+        return (out @ w).sin()  # like o_proj: flex is not the region's last saved tensor (checkpoint early stop)
+
+    x = torch.randn(1, 4, 32, 16, requires_grad = True)
+    checkpoint(layer, x, use_reentrant = use_reentrant).sum().backward()
+    got = (x.grad.clone(), w.grad.clone())
+    assert len(sparse_gates._BACKWARD_OK) == 1
+    x.grad, w.grad = None, None
+    layer(x).sum().backward()
+    torch.testing.assert_close(got[0], x.grad)
+    torch.testing.assert_close(got[1], w.grad)
+
+
+def test_flex_backward_probe_traces_without_graph_break():
+    """Inside a compiled region the probe is a no-op (the flex call there is already outside the graph)."""
+    calls = []
+
+    def flex(query, key, value):
+        calls.append(1)
+        return query + key + value
+
+    @torch.compile(backend = "eager", fullgraph = True)
+    def f(q, k, v):
+        sparse_gates.probe_flex_backward(("dsa", None), flex, (q, k, v))
+        return q * 2
+
+    q, k, v = _qkv()
+    f(q, k, v)
+    assert not calls and not sparse_gates._BACKWARD_OK

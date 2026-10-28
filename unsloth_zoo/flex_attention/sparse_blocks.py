@@ -36,7 +36,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from .sparse import record_sparse_attn, sparse_flex_enabled
+from .sparse import additive_bias_present, record_sparse_attn, sparse_flex_enabled
 
 _TILE = 128
 _FAILED = {}
@@ -66,10 +66,12 @@ def _wants_attentions(module, kwargs):
 
 
 def in_unsloth_block():
-    """Inside Unsloth's per-decoder-layer compile region (fullgraph=False), where a graph break is legal."""
+    """Inside Unsloth's per-decoder-layer compile region (fullgraph=False), where a graph break is legal.
+    _IN_BLOCK is also set while a user's torch.compile (maybe fullgraph=True) inlines the block, so only
+    _IN_COMPILED_REGION counts; an Unsloth without it keeps the model's path in every compile."""
     block = sys.modules.get("unsloth.models._block_compile")
-    flag = getattr(block, "_IN_BLOCK", None)
-    return bool(flag) and flag[0] != 0
+    flag = getattr(block, "_IN_COMPILED_REGION", None)
+    return bool(flag) and bool(flag[0])
 
 
 def _compiled_without_break():
@@ -398,7 +400,7 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling,
         bias = None
         if mask.dtype != torch.bool:
             values = mask[:, 0]
-            if bool((_visible(values) & (values != 0)).any()):
+            if additive_bias_present(values, _visible(values), "dsa"):
                 # Finite biases (not just 0 / masked): added through score_mod like upstream's additive mask.
                 bias = _pad_to(_pad_to(torch.where(_visible(values), values, 0), 1, q_pad, 0), 2, kv_pad, 0)
                 bias = bias.expand(batch, -1, -1)

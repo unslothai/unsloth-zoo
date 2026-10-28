@@ -55,6 +55,9 @@ def _reset(monkeypatch):
     monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_FLEX", raising = False)
     F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
     F4._DEVICE_OK.clear()
+    getattr(F4, "_FAILED", {}).clear()
+    from unsloth_zoo.flex_attention import sparse as sparse_gates
+    getattr(sparse_gates, "_BACKWARD_OK", set()).clear()
     # Small shapes keep the tests fast; the default policy is checked on its own below.
     monkeypatch.setattr(F4, "_MIN_KEYS", {8: {None: 16}, 9: {None: 16}, 10: {None: 16}})
     yield
@@ -359,6 +362,11 @@ def test_layers_equal_eager_in_float32(monkeypatch):
         F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
         o_eager, g_eager = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, False, weight)
         o_flex, g_flex = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, True, weight)
+        # fp32 head_dim 512 flex backward needs ~200 KB smem (A100 has 163 KB): needs H100 / B200.
+        oor = [e for e in F4._FAILED.values() if "out of resource" in e]
+        if oor:
+            assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 2}
+            pytest.skip(f"fp32 flex backward does not fit this card's shared memory: {oor[0][:300]}")
         assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 1, "eager": 1}, layer.self_attn.layer_type
         assert _rel(o_flex, o_eager) < 1e-5
         for name in g_eager:
@@ -526,3 +534,110 @@ def test_device_probe_traces_without_graph_break():
         return x + F4._min_keys(attn, device, True)
 
     assert torch.compile(probe, fullgraph = True)(torch.zeros(1, device = "cuda")).item() == 16
+
+
+def _capture(fn):
+    """fn() warmed up on a side stream, captured into a CUDA graph and replayed: (replayed output, eager output)."""
+    eager = fn().clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            fn()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream = stream):
+        out = fn()
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    return out, eager
+
+
+@needs_flex_gpu
+@pytest.mark.parametrize("finite_bias", [False, True])
+def test_cuda_graph_capture_matches_eager(finite_bias):
+    """The finite-bias check is a host sync; under stream capture it invalidated the capture
+    (cudaErrorStreamCaptureInvalidated). Capturing keeps the bias instead: the replay matches the eager call."""
+    torch.manual_seed(0)
+    attn = _Attn(4, "cuda").to(torch.bfloat16)
+    q = torch.randn(1, 4, 256, 64, device = "cuda", dtype = torch.bfloat16)
+    kv = torch.randn(1, 1, 256 + 64, 64, device = "cuda", dtype = torch.bfloat16)
+    mask = _mask(1, 256, 128, 64, 4, 16, torch.bfloat16, "cuda")
+    if finite_bias:
+        mask = mask + torch.rand_like(mask).mul(0.5)
+    with torch.no_grad():
+        out, eager = _capture(lambda: modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)[0])
+    assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == 4 and F4.DEEPSEEK_V4_FLEX_STATS["eager"] == 0
+    assert _rel(out, eager) < 1e-2, _rel(out, eager)
+
+
+@needs_flex_gpu
+def test_cold_fullgraph_compile_is_one_graph(monkeypatch):
+    """Right after install, a fullgraph dynamic compile of the dispatcher is one graph: the compiled flex
+    callable used to be set lazily inside the trace, and its `_FLEX is None` guard recompiled the next call."""
+    import torch._dynamo
+    monkeypatch.setattr(modeling, "eager_attention_forward", ORIGINAL)
+    monkeypatch.setattr(F4, "_FLEX", None)
+    F4.patch_deepseek_v4_sparse_flex()
+    attn = _Attn(4, "cuda").to(torch.bfloat16)
+    q = torch.randn(1, 4, 256, 64, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+    kv = torch.randn(1, 1, 320, 64, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+    mask = _mask(1, 256, 128, 64, 4, 16, torch.bfloat16, "cuda")
+    forward = modeling.eager_attention_forward
+
+    def fn(q, kv, mask):
+        return forward(attn, q, kv, kv, mask, 0.125)[0]
+
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    compiled = torch.compile(fn, fullgraph = True, dynamic = True)
+    for _ in range(2):
+        compiled(q, kv, mask).float().sum().backward()
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 1, dict(torch._dynamo.utils.counters["stats"])
+
+
+class _BackwardFails(torch.autograd.Function):
+    """Flex kernel whose forward runs and backward fails."""
+
+    @staticmethod
+    def forward(ctx, query):
+        return query.transpose(1, 2).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad):
+        raise RuntimeError("out of resource: shared memory, Required: 262144, Hardware limit: 101376")
+
+
+def test_flex_backward_failure_latches_eager(monkeypatch):
+    """A failing flex backward is caught by the probe and latches eager."""
+    calls = []
+
+    def flex(module, query, key, attention_mask, scaling):
+        calls.append(1)
+        return _BackwardFails.apply(query)
+
+    monkeypatch.setattr(F4, "_flex_applies", lambda *args: not getattr(F4, "_FAILED", {}))
+    monkeypatch.setattr(F4, "deepseek_v4_flex_attention", flex)
+    attn, q, kv, mask = _gate_inputs("cpu", dtype = torch.float32)
+    q.requires_grad_()
+    out, _ = modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    out.sum().backward()
+    ref, _ = ORIGINAL(attn, q.detach(), kv, kv, mask, 0.125)
+    torch.testing.assert_close(out.detach(), ref)
+    assert len(F4._FAILED) == 1 and F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
+    modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    assert len(calls) == 1  # latched: not tried again (the failing probe was the only flex call)
+
+
+def test_flex_forward_failure_latches_eager(monkeypatch):
+    def flex(module, query, key, attention_mask, scaling):
+        raise RuntimeError("triton compile error")
+
+    monkeypatch.setattr(F4, "_flex_applies", lambda *args: True)
+    monkeypatch.setattr(F4, "deepseek_v4_flex_attention", flex)
+    attn, q, kv, mask = _gate_inputs("cpu", dtype = torch.float32)
+    with torch.no_grad():
+        out, _ = modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    torch.testing.assert_close(out, ORIGINAL(attn, q, kv, kv, mask, 0.125)[0])
+    assert len(F4._FAILED) == 1 and F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}

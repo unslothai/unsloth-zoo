@@ -396,8 +396,8 @@ def ple_sites(model):
 
 
 def _checkpoint_name(store, name):
-    """The checkpoint's name for a parameter: its MLX name, the Hugging Face layout of it, or, for a
-    text checkpoint mlx-vlm wraps as its language model, the text layout."""
+    """The checkpoint's name for a parameter: its MLX name, the Hugging Face layout of it, for a text
+    checkpoint mlx-vlm wraps as its language model the text layout, or an ``experts.`` stack (omlx)."""
     if name in store.specs:
         return name
     prefix = "language_model.model."
@@ -405,6 +405,12 @@ def _checkpoint_name(store, name):
         for alternate in ("model.language_model.", "model."):
             if alternate + name[len(prefix):] in store.specs:
                 return alternate + name[len(prefix):]
+    stacked = re.search(r"\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(\w+)$", name)
+    if stacked is not None:
+        for projection in (stacked[1], _REFERENCE_NAMES[stacked[1]]):
+            alternate = f"{name[:stacked.start()]}.experts.{projection}.{stacked[2]}"
+            if alternate in store.specs:
+                return alternate
     return None
 
 
@@ -1323,7 +1329,7 @@ OFFLOAD_CONTEXT_STEP = 256
 _PLE_TENSORS = (".embed_tokens_per_layer.", ".ngram_embedding.shards.")
 # Tables mlx-vlm always reads row by row from the checkpoint, never resident: DeepSeek V4.1's Engram.
 _MAPPED_TENSORS = (".engram.embed.",)
-_EXPERT_TENSOR = re.compile(r"\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias|global_scale)$")
+_EXPERT_TENSOR = re.compile(r"\.(?:switch_mlp|experts)\.(gate_proj|up_proj|down_proj|w1|w2|w3)\.(weight|scales|biases|bias|global_scale)$")
 _EXPERT_APART = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj|w1|w2|w3)\.(weight|scales|biases|bias|global_scale)$")
 _FLOAT_BYTES = {"F16": 2, "BF16": 2, "F32": 4, "F64": 8}
 _NESTED_CONFIGS = ("text_config", "thinker_config", "language_config", "llm_config")
@@ -1370,14 +1376,14 @@ def _tensors(model_dir, dtype_bytes):
 def offload_inventory(model_dir, dtype_bytes = None):
     """``offload.offloadable``'s sizes plus ``total_bytes``, from the safetensors headers alone (floats
     at ``dtype_bytes`` an element), to price a load before it is made. It counts every quantized
-    ``switch_mlp``, so it can count experts a loaded model keeps; the ``mtp.`` head is never counted."""
+    expert stack, so it can count experts a loaded model keeps; never an MTP head's."""
     total = ple = 0
     layers = {}  # prefix -> [bytes, experts, quantized projections, global scales]
     for name, shape, size in _tensors(model_dir, dtype_bytes):
         if any(part in name for part in _MAPPED_TENSORS):
             continue
         total += size
-        if name.startswith("mtp."):
+        if name.startswith(("mtp.", "language_model.mtp.")):
             continue
         if any(part in name for part in _PLE_TENSORS):
             ple += size
@@ -1388,7 +1394,7 @@ def offload_inventory(model_dir, dtype_bytes = None):
             layer = layers.setdefault(name[:(match or apart).start()], [0, 0, set(), False])
             layer[0] += size
             projection, field = match.groups() if match is not None else apart.groups()[1:]
-            if match is not None and name.endswith(".up_proj.weight"):
+            if match is not None and field == "weight":
                 layer[1] = shape[0]
             if apart is not None:
                 layer[1] = max(layer[1], int(apart.group(1)) + 1)

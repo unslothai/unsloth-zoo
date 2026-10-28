@@ -1883,7 +1883,12 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
         assert capacity < batch[0].shape[0] * (batch[0].shape[1] - 1)
         assert kernel_rows == [capacity] * (2 if reference and kind == "dpo" else 1)
         for want, got in zip(expected[0], actual[0]):
-            assert mx.allclose(want, got, atol=1e-4, rtol=1e-5).item()
+            atol = 1e-4
+            if dtype == "float32" and want.ndim:
+                # rewards/margins subtracts rewards/rejected from rewards/chosen, so it keeps a few
+                # float32 ulps of those sums, which the kernel and the logits round differently.
+                atol += 4 * mx.finfo(mx.float32).eps * mx.abs(want[:2]).max().item()
+            assert mx.allclose(want, got, atol=atol, rtol=1e-5).item()
         # A bfloat16 run accumulates chunks in a different order; the softcap derivative amplifies that.
         rtol = 2e-4 if dtype == "float32" else 2e-2 if head == "softcap" else 5e-3
         for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):

@@ -19,7 +19,7 @@
 The additive mask (sliding window + padding, then the compressor's block_bias) becomes a block-sparse
 BlockMask; the sink is applied exactly from the logsumexp:
 softmax([l, s]) @ v == (softmax(l) @ v) * sigmoid(lse(l) - s). Prefill / training only, from a measured
-per-GPU key length (_MIN_KEYS). UNSLOTH_SPARSE_ATTN_FLEX: 0 = eager, 1 = also other sm80+ parts with
+per-GPU key length (_MIN_KEYS). An eager flex failure (forward or probed backward) latches that shape class to eager. UNSLOTH_SPARSE_ATTN_FLEX: 0 = eager, 1 = also other sm80+ parts with
 >= 160 KB shared memory, unset = measured generations only.
 """
 
@@ -68,6 +68,8 @@ _MIN_SHARED_MEMORY = 160 * 1024
 
 _FLEX = None
 _DEVICE_OK = {}
+# _failure_key -> error for shape classes whose flex call or backward probe failed.
+_FAILED = {}
 # Looked up once: find_spec is skipped by dynamo, and the first call can come from inside a compiled graph.
 _HAS_TRITON = importlib.util.find_spec("triton") is not None
 
@@ -104,6 +106,7 @@ def _count(key):
 
 
 def _compiled_flex():
+    # Built at install: set lazily inside a trace, the `_FLEX is None` guard recompiled the next call.
     global _FLEX
     if _FLEX is None:
         from torch.nn.attention.flex_attention import flex_attention
@@ -130,6 +133,9 @@ def _device_thresholds(device, forced):
                         thresholds = {None: _FORCED_MIN_KEYS}
         except Exception:
             thresholds = None
+        # Cached from eager calls only: filled inside a trace, the dict guard recompiled the next call.
+        if torch.compiler.is_compiling():
+            return thresholds
         _DEVICE_OK[key] = thresholds
     return _DEVICE_OK[key]
 
@@ -173,6 +179,9 @@ def _flex_applies(module, query, key, value, attention_mask, dropout, kwargs):
         return False
     if attention_mask.shape[0] not in (1, bsz):
         return False
+    # Eager only: a traced lookup would guard on the dict.
+    if not torch.compiler.is_compiling() and _failure_key(query) in _FAILED:
+        return False
     min_keys = _min_keys(module, query.device, setting == "1")
     return min_keys is not None and key.shape[2] >= min_keys
 
@@ -190,6 +199,7 @@ def deepseek_v4_block_mask(attention_mask, batch):
     (and -inf) are hard-masked; every other value is added to the score like eager does, so finite custom
     biases are kept. Whole 128 x 128 tiles with nothing visible are skipped."""
     from torch.nn.attention.flex_attention import BlockMask
+    from unsloth_zoo.flex_attention.sparse import additive_bias_present
 
     q_len, kv_len = attention_mask.shape[-2], attention_mask.shape[-1]
     nq, nk = -(-q_len // _BLOCK), -(-kv_len // _BLOCK)
@@ -200,7 +210,7 @@ def deepseek_v4_block_mask(attention_mask, batch):
     # transformers' own masks are 0 / min only; reading a bias per score costs 5-15%, so only when present.
     # Inside a compiled graph the check would be a data-dependent branch, so the bias is always kept there.
     bias = None
-    if torch.compiler.is_compiling() or bool((visible & (attention_mask[:, 0] != 0)).any()):
+    if torch.compiler.is_compiling() or additive_bias_present(attention_mask[:, 0], visible, "deepseek_v4"):
         bias = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK))
         bias[:, :q_len, :kv_len] = torch.where(visible, attention_mask[:, 0], 0)
         if bias.shape[0] != batch:
@@ -256,11 +266,35 @@ def deepseek_v4_flex_attention(module, query, key, attention_mask, scaling):
     return out.transpose(1, 2).contiguous()
 
 
+def _failure_key(query):
+    return ("deepseek_v4", query.device.index, query.dtype, query.shape[1], query.shape[-1])
+
+
+def _flex_or_none(module, query, key, attention_mask, scaling):
+    """Flex output, or None after a (latched) failure so the caller runs eager. Not caught while traced."""
+    args = (module, query, key, attention_mask, scaling)
+    if torch.compiler.is_compiling():
+        return deepseek_v4_flex_attention(*args)
+    from unsloth_zoo.flex_attention.sparse import probe_flex_backward
+    try:
+        probe_flex_backward(_failure_key(query), deepseek_v4_flex_attention, args)
+        return deepseek_v4_flex_attention(*args)
+    except Exception as error:
+        # Capture is already invalid and the shape class is not at fault: raise, don't latch.
+        if query.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise
+        _FAILED[_failure_key(query)] = repr(error)[:500]
+        logger.warning(f"Unsloth: DeepSeek-V4 flex attention failed, using eager attention: {error}")
+        return None
+
+
 def _make_attention_forward(original):
     def eager_attention_forward(module, query, key, value, attention_mask, scaling, dropout = 0.0, **kwargs):
         if _flex_applies(module, query, key, value, attention_mask, dropout, kwargs):
-            _count("flex")
-            return deepseek_v4_flex_attention(module, query, key, attention_mask, scaling), None
+            out = _flex_or_none(module, query, key, attention_mask, scaling)
+            if out is not None:
+                _count("flex")
+                return out, None
         _count("eager")
         return original(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
 
@@ -283,6 +317,7 @@ def patch_deepseek_v4_sparse_flex():
     # DeepseekV4Attention resolves the module global per call, so the dispatcher sees every call that
     # transformers would have sent to eager.
     modeling.eager_attention_forward = _make_attention_forward(original)
+    _compiled_flex()
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: DeepSeek-V4 prefill / training attention runs on flex attention.")
 pass
