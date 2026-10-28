@@ -92,8 +92,8 @@ def _patch_post_init(cls):
 
     @functools.wraps(original)
     def __post_init__(self, *args, **kwargs):
-        # TRL resolves bf16=None to "not fp16" before the base class validates it, so normalise both
-        # before (fp16/optim) and after (TRL's resolved bf16) the original runs.
+        # TRL resolves bf16=None to not-fp16 before the base class validates it, so normalize fp16/optim before the
+        # original runs and TRL's resolved bf16 after it.
         normalize_cpu_training_arguments(self)
         result = original(self, *args, **kwargs)
         if getattr(self, "bf16", False) and not cpu_bf16_supported():
@@ -105,9 +105,9 @@ def _patch_post_init(cls):
 
 
 def _patch_cpu_fp16_accelerator(trainer_cls):
-    """accelerate turns fp16 into a silent fp32 run on CPU (no autocast, no scaler). When
-    normalize_cpu_training_arguments kept fp16 (native fp16, no native bf16), enable CPU autocast
-    and a CPU GradScaler before the model and optimizer are prepared."""
+    """accelerate turns fp16 into a silent fp32 run on CPU (no autocast, no scaler); when
+    normalize_cpu_training_arguments kept fp16 (no native bf16), enable CPU autocast and a CPU GradScaler before the
+    model and optimizer are prepared."""
     original = trainer_cls.create_accelerator_and_postprocess
     if getattr(original, "_unsloth_cpu", False):
         return

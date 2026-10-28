@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MLX LoRA QAT: the forward is ``quantize(dequantize(W) + BA)``, what ``merged_4bit`` saves
-(unlike torchao, which fake-quantizes W only), with a straight-through gradient."""
+"""MLX LoRA QAT: forward is quantize(dequantize(W) + BA), what merged_4bit saves (unlike torchao, which fake-quantizes W only), with a straight-through gradient."""
 
 _SCHEME_BITS = {"auto": None, "int4": 4, "int8": 8}
 _QAT_FLAG = "_unsloth_mlx_qat_active"

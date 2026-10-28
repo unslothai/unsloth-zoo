@@ -14,15 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Make transformers' kernel-hub fallback wrapper see real torch.export state under torch.compile.
-
-`use_kernel_func_from_hub_with_fallback` runs its pure-torch reference whenever
-`is_torchdynamo_exporting()` is True. On torch < 2.12 Dynamo constant-folds
-`torch.compiler.is_exporting()` to True in every trace (pytorch 2.12 reads
-`torch.compiler._is_exporting_flag` instead), so a compiled caller silently skips fla /
-mamba_ssm / causal_conv1d and runs the slow reference (glm5_next and kimi_linear KDA).
-Only the hub_kernels module global is swapped; modeling files keep their own reference.
-"""
+"""Makes transformers' kernel-hub fallback see real torch.export state under torch.compile: torch < 2.12 constant-folds
+is_exporting() to True, skipping fla/mamba_ssm/causal_conv1d; the patch reads torch.compiler._is_exporting_flag as
+2.12 does; only the hub_kernels global is swapped."""
 
 __all__ = [
     "patch_hub_kernel_export_check",

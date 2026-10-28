@@ -15,9 +15,7 @@ from pathlib import Path
 
 
 def _atomic_write_text(path: Path, data: str, encoding: str) -> None:
-    """Write ``data`` to ``path`` atomically: stage a same-dir tmp file, fsync,
-    then os.replace, so a crash leaves old or new content, never a truncated file.
-    """
+    """Write atomically via a same-dir tmp file, fsync, then os.replace, so a crash leaves old or new content, never a truncated file."""
     dirpath = str(path.parent) or "."
     fd, tmp_path = tempfile.mkstemp(prefix=".kwargs_fix.", dir=dirpath)
     try:
@@ -60,7 +58,6 @@ def enforce_spacing(text: str) -> tuple[str, bool]:
 
         line_changed = False
 
-        # Insert a space before '=' when missing and not preceded by whitespace.
         if col > 0 and line[col - 1] not in {" ", "\t"}:
             line = f"{line[:col]} {line[col:]}"
             offsets[line_index] += 1
@@ -68,7 +65,6 @@ def enforce_spacing(text: str) -> tuple[str, bool]:
             line_changed = True
             changed = True
 
-        # Insert a space after '=' when missing and not followed by whitespace or newline.
         next_index = col + 1
         if next_index < len(line) and line[next_index] not in {" ", "\t", "\n", "\r"}:
             line = f"{line[:next_index]} {line[next_index:]}"

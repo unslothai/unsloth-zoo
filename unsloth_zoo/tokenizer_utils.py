@@ -17,9 +17,7 @@
 try:
     import torch
 except ImportError:
-    # MLX (Apple Silicon) is torch-free. Only the embedding-fix helpers below use
-    # torch and they are never called on MLX, so keep the module importable so the
-    # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
+    # MLX is torch-free: keep torch optional so patch_tokenizer and get_chat_template work there.
     torch = None
 import copy
 import contextlib
@@ -72,12 +70,7 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     where_untrained = torch.where(indicator_untrained)[0]
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
-    # if n_untrained != 0:
-    #     print(
-    #         f"Unsloth: Not an error, but your model has {n_untrained} untrained tokens.\n"\
-    #         "We shall set them to the mean of the other trained tokens."
-    #     )
-    # pass
+    # Untrained tokens are set to the mean of the trained tokens (the notice print is commented out).
 
     # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
@@ -117,9 +110,8 @@ def _round_up_vocab(n_rows, pad_to_multiple_of):
 pass
 
 
-# On the text config so they survive save / load and reach vLLM through the model config:
-# every alignment row (no token has it: vLLM biases these), and the subset of those Unsloth itself
-# put in suppress_tokens (only these are released when a row becomes a token).
+# On text config to survive save/load and reach vLLM: every pad row (vLLM biases these) and the subset Unsloth put in
+# suppress_tokens; only that subset is released when a row becomes a token
 _VOCAB_PAD_IDS_KEY = "unsloth_vocab_pad_ids"
 _VOCAB_PAD_SUPPRESSED_KEY = "unsloth_vocab_pad_suppressed_ids"
 
@@ -151,9 +143,7 @@ def _suppress_padded_rows(model, start, end, now_valid = range(0), old_rows = No
     owned = list(owned) if owned is not None else list(rows)
     suppress = getattr(generation_config, "suppress_tokens", None) or []
     if suppress and not rows and len(now_valid) and config is not None and not hasattr(config, _VOCAB_PAD_IDS_KEY):
-        # Saved by padding code that did not record its rows: those are exactly every row past the
-        # tokenizer, all suppressed. A model suppressing only some spare rows keeps them. Rows from
-        # a resize in this call are not legacy rows, so bound by the pre-resize count.
+        # Legacy unrecorded rows are every row past the tokenizer, all suppressed; bound by pre-resize count.
         if old_rows is None:
             embeddings = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
             old_rows = getattr(getattr(embeddings, "weight", None), "shape", (0,))[0]
@@ -177,8 +167,7 @@ def _suppress_padded_rows(model, start, end, now_valid = range(0), old_rows = No
     generation_config.suppress_tokens = suppress or None
     if config is not None:
         _set_or_drop(config, _VOCAB_PAD_IDS_KEY, rows)
-        # An empty ownership list beside remaining rows is kept: dropping it would read back as
-        # "every row is ours" and release suppression the caller set on those rows.
+        # Keep an empty ownership list beside remaining rows: dropping it would read as every row is ours.
         if rows: setattr(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
         else: _set_or_drop(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
     pass
@@ -228,15 +217,12 @@ def add_new_tokens(
     # add_tokens dedupes; a repeat here would shift every later interpolation row.
     new_tokens = list(dict.fromkeys(new_tokens))
 
-    # Get mean of trained tokens
-    # mean_embedding, mean_lm_head = fix_untrained_tokens(model)
 
     # Weirdly be careful reserved tokens can pop out
     mean_embedding, mean_lm_head = mean_of_trained_tokens(model)
     mean_embedding = mean_embedding.to(torch.float32)
     mean_lm_head   = mean_lm_head  .to(torch.float32)
 
-    # Get old lengths
     old_input_embedding  = model.get_input_embeddings ().weight
     old_output_embedding = model.get_output_embeddings().weight
     old_input_length  = old_input_embedding .shape[0]
@@ -254,17 +240,11 @@ def add_new_tokens(
             tokenizer(token, add_special_tokens = False).input_ids for token in new_tokens
         ]
 
-    # Add tokens!
     old_length = len(tokenizer)
     tokenizer.add_tokens(new_tokens)
     new_vocab_length = len(tokenizer)
-    # Some models ship an embedding that is padded LARGER than the tokenizer
-    # vocab (e.g. Gemma3: 262208 embedding rows vs 262145 tokens). Resizing to
-    # new_vocab_length would then SHRINK the matrix and silently destroy the
-    # already-trained rows past the tokenizer length. Never resize below the
-    # existing embedding: grow only when the new tokens overflow the padding.
-    # new_vocab_length already includes the freshly added tokens, so do NOT add
-    # their count again here.
+    # Embedding may be padded past the tokenizer vocab (Gemma3: 262208 rows vs 262145 tokens); never shrink it, grow
+    # only on overflow; new_vocab_length already includes the new tokens, so do not add their count again
     resize_target = max(old_input_length, old_output_length, new_vocab_length)
     # Align only when the new tokens overflow the existing rows.
     pad_to_multiple_of = _vocab_pad_multiple(pad_to_multiple_of)
@@ -275,15 +255,12 @@ def add_new_tokens(
     # Also resizes lm_head as well!
     model.resize_token_embeddings(resize_target)
 
-    # If we use interpolation, we interpolate between the mean embeddings and
-    # the Word2Vec sum of the other vectors
+    # With method interpolation, new rows blend the mean embedding with the Word2Vec sum of the other vectors.
     embedding_matrix = model.get_input_embeddings ().weight
     lm_head_matrix   = model.get_output_embeddings().weight
 
-    # Confirm sizes are correct. Compare against resize_target (not
-    # new_vocab_length): for padded embeddings the matrices keep their larger
-    # row count. The old check compared against new_vocab_length, so on a padded
-    # model it either never fired (masking the silent shrink) or fired spuriously.
+    # Compare sizes against resize_target, not new_vocab_length: padded matrices keep their larger row count; the old
+    # check either never fired (masking the silent shrink) or fired spuriously on padded models
     if embedding_matrix.shape[0] != resize_target:
         raise RuntimeError(
             "Unsloth: Embedding matrix size did not get resized properly. Please file a bug report!"
@@ -311,20 +288,16 @@ def add_new_tokens(
                 mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
                 mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
 
-            # Interpolate
             mean_embedding_token = mean_embedding*(1-interpolation) + mean_embedding_token*interpolation
             mean_lm_head_token   = mean_lm_head  *(1-interpolation) + mean_lm_head_token  *interpolation
 
-            # Set the new vector
             with torch.no_grad():
                 embedding_matrix[old_length+j] = mean_embedding_token
                 lm_head_matrix  [old_length+j] = mean_lm_head_token
         pass
     else:
-        # Now set the new tokens to the mean! Only touch the genuinely-new rows
-        # [old_length:new_vocab_length]; on a padded embedding the rows past
-        # new_vocab_length are the model's original alignment padding and must be
-        # left as shipped (the old [old_length:] slice overwrote those too).
+        # Set only the new rows [old_length:new_vocab_length] to the mean; rows past new_vocab_length are the model's
+        # alignment padding and must stay as shipped (the old [old_length:] slice overwrote them too)
         with torch.no_grad():
             embedding_matrix[old_length:new_vocab_length] = mean_embedding
             lm_head_matrix  [old_length:new_vocab_length] = mean_lm_head
@@ -352,10 +325,8 @@ def add_new_tokens(
     pass
     internal_model._need_to_train_embeddings = True
 
-    # Fix up all vocab sizes. Use resize_target, not len(tokenizer): config
-    # vocab_size must equal the actual embedding / lm_head row count or the model
-    # cannot round-trip through save_pretrained/from_pretrained (state_dict shape
-    # mismatch). For a padded embedding these differ.
+    # Config vocab_size must match the embedding and lm_head row count, so use resize_target not len(tokenizer) (they
+    # differ when padded) or save_pretrained/from_pretrained hits a shape mismatch
     current_model = model
     while hasattr(current_model, "model") and hasattr(current_model, "config"):
         if hasattr(current_model.config, "vocab_size"):
@@ -366,8 +337,7 @@ def add_new_tokens(
             current_model.config.update({"vocab_size" : resize_target})
     pass
 
-    # Must tie lm_head and embed_tokens if they are tied!
-    # Otherwise error will occur on saving models ie use save_model
+    # Must re-tie lm_head and embed_tokens if they are tied, otherwise saving with save_model raises an error
     if is_tied: model.tie_weights()
 
     # Clear deleted GPU items
@@ -388,9 +358,8 @@ def _count_input_ids(train_dataset, mapping):
         train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
         return
     pass
-    # `mapping` flattens its batch into one array, so passing the whole dataset is an
-    # O(total tokens) transient. Chunking is exactly equivalent because it accumulates into
-    # a counter and .map(batched=True) already calls it once per batch.
+    # mapping flattens its batch into one array, so passing the whole dataset is an O(total tokens) transient; chunking
+    # is exactly equivalent since it accumulates into a counter and .map(batched=True) already calls it once per batch
     batch = []
     for row in train_dataset:
         if "input_ids" not in row: continue
@@ -409,8 +378,7 @@ def _requires_arguments(method):
     try:
         signature = inspect.signature(method)
     except (TypeError, ValueError, AttributeError):
-        # signature() raises TypeError for unreadable metadata too, so the lookup
-        # cannot share a try with bind(): only bind() failing proves arguments.
+        # signature() also raises TypeError for unreadable metadata, so only bind() failing (not the lookup) proves the arguments don't fit
         return False
     try:
         signature.bind()
@@ -796,8 +764,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
 pass
 
 
-# Pad-token repair lives in the shared pad_token module (single source of truth
-# for unsloth + unsloth-zoo). Re-exported here for backwards compatibility.
+# Pad-token repair lives in the shared pad_token module (single source of truth for unsloth and unsloth-zoo); re-exported here for backwards compatibility.
 from .pad_token import (
     fix_pad_token,
     POSSIBLE_RESERVED_TOKENS,
@@ -831,16 +798,13 @@ def patch_tokenizer(model, tokenizer):
             return model, original_tokenizer
         tokenizer = inner
 
-    # Heal a bad/missing pad_token via the shared single source of truth: it picks
-    # a reserved pad-like token already in the vocab (text-only models never reuse
-    # a vision token), or adds one and raises if none exists, and stamps
-    # model.config / generation_config pad_token_id when it changes.
-    # Fixes https://github.com/unslothai/unsloth/issues/5 and #4104.
+    # Heals bad/missing pad_token via the shared pad_token module: picks a reserved pad-like vocab token (text-only
+    # models never reuse a vision token) or adds one and raises if none exists; stamps model.config / generation_config
+    # pad_token_id when it changes; fixes unsloth issues 5 and 4104
     model_config = getattr(model, "config", None)
     result = fix_pad_token(original_tokenizer, model = model, model_config = model_config)
 
-    # No-op case: tokenizer already had a valid pad_token, but the model config
-    # may still be missing pad_token_id - mirror it across.
+    # No-op case: the tokenizer already had a valid pad_token, but model config may still lack pad_token_id, so copy it across.
     if not result["changed"] and model is not None and model_config is not None:
         if getattr(model_config, "pad_token_id", None) is None:
             pad_token_id = getattr(tokenizer, "pad_token_id", None)
@@ -945,8 +909,7 @@ def patch_processor_call(processor):
                 kwargs["text"] = text
         return original_call(self, *args, **kwargs)
 
-    # Patch via a dynamic subclass reusing the original class name so
-    # save_pretrained writes the correct processor_class (fixes issue #4085).
+    # Patch via a dynamic subclass reusing the original class name so save_pretrained writes the correct processor_class (fixes issue 4085).
     original_class = processor.__class__
     patched_class = type(
         original_class.__name__,

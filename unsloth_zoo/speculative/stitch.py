@@ -269,8 +269,8 @@ def _append_mtp_shard(directory, layout, has_index, head, prefix, dtype):
         with open(index_path, "r", encoding = "utf-8") as f:
             index = json.load(f)
     else:
-        # A lone model.safetensors needs an index once a second part exists, or transformers
-        # reads only the first file and the converter's part listing is the only thing left.
+        # A lone model.safetensors needs an index once a second part exists, or transformers reads only the first file
+        # and the converter's part listing is the only thing left.
         index = {"metadata": {}, "weight_map": dict(layout)}
     index.setdefault("metadata", {})
     index["weight_map"].update({name: shard_path.name for name in tensors})

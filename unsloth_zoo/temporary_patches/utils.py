@@ -117,10 +117,8 @@ try:
     t_Unpack = t.Unpack
 except:
     from typing_extensions import Unpack as t_Unpack
-# Fix stale module caching (Kaggle/Colab after upgrading packages mid-session):
-# old modules stay cached in sys.modules and fail when new on-disk files reference
-# upgraded-only symbols. PIL: clear sys.modules. numpy/scipy: C extensions cannot
-# be reloaded, so raise a clear restart error.
+# Stale modules after mid-session upgrades (Kaggle/Colab) fail when new files use upgraded-only symbols; PIL is fixed by
+# clearing sys.modules, numpy/scipy C extensions cannot be reloaded so raise a restart error.
 import sys as _sys
 from importlib.metadata import version as _get_pkg_version
 try:
@@ -159,24 +157,15 @@ if _pil_mod is not None and hasattr(_pil_mod, "__version__"):
         pass
 del _sys, _pil_mod
 
-# ROCm on Windows ships PyTorch without the full torch.distributed C-extension
-# stack. torchao pulls the entire distributed chain in at module-import time,
-# cascading into ImportError even for code paths that never use distributed
-# features (e.g. plain LoRA training).
-# Fix: if torchao can't be imported, install a sys.meta_path hook intercepting
-# all "torchao"/"torchao.*" imports and returning self-contained stub modules.
-# Each stub satisfies `from torchao.X import Y` via a no-op sentinel class, so
-# transformers can define TorchAoHfQuantizer at import time. Any runtime call
-# needing a real torchao op still fails loudly.
-# Ref: https://github.com/ROCm/TheRock/issues/3284
+# Windows ROCm torch lacks the torch.distributed C-extensions torchao imports; only if the torchao import fails does a
+# sys.meta_path hook stub torchao, so transformers can still define TorchAoHfQuantizer; ROCm/TheRock issue 3284.
 import sys as _sys_rocm_stub, types as _types_rocm_stub
 from importlib.abc import MetaPathFinder as _MetaPathFinder, Loader as _Loader
 from importlib.machinery import ModuleSpec as _ModuleSpec
 
 
-# Metaclass making sentinel classes chainable via attribute access
-# (AffineQuantizedTensor.subattr -> another sentinel). peft does
-# isinstance(weight, AffineQuantizedTensor), which needs a real type.
+# Metaclass so sentinel classes chain via attribute access (AffineQuantizedTensor.subattr is another sentinel); peft's
+# isinstance(weight, AffineQuantizedTensor) needs a real type.
 class _ROCmSentinelMeta(type):
     def __getattr__(cls, name):
         # Dunders must miss: a sentinel __wrapped__ sends inspect.unwrap down an endless chain.
@@ -250,11 +239,8 @@ class _ROCmTorchaoFinder(_MetaPathFinder):
         return None
 
 
-# Only Windows + ROCm (HIP) PyTorch needs this stub -- the one build where
-# `import torchao` crashes on the missing torch.distributed C-extension stack.
-# Elsewhere a failing import just means torchao isn't installed (transformers
-# handles that), and the stub would be harmful: it makes torchao look present,
-# so anything probing the package gets stub answers instead of a clean miss.
+# Only Windows + ROCm (HIP) torch needs this stub, where import torchao crashes on the missing torch.distributed
+# C-extensions; elsewhere the stub would fake torchao's presence.
 _is_windows_rocm = False
 if _sys_rocm_stub.platform == "win32":
     try:
@@ -271,12 +257,10 @@ if _is_windows_rocm and "torchao" not in _sys_rocm_stub.modules:
     try:
         import torchao  # noqa: F401
     except Exception:
-        # torchao import failed on Windows ROCm: install the meta path hook so
-        # subsequent "import torchao.*" gets a harmless stub.
+        # On Windows ROCm, a failed torchao import installs the sys.meta_path hook so later `import torchao.*` gets a harmless stub.
         _sys_rocm_stub.meta_path.insert(0, _ROCmTorchaoFinder())
 
-# Keep _rocm_make_torchao_stub / _rocm_make_sentinel / _ROCmSentinelMeta alive;
-# the loader and sentinel classes call them at runtime.
+# Keep _rocm_make_torchao_stub, _rocm_make_sentinel and _ROCmSentinelMeta alive: the loader and sentinel classes call them at runtime.
 del _ROCmTorchaoLoader, _ROCmTorchaoFinder
 del _MetaPathFinder, _Loader, _ModuleSpec, _sys_rocm_stub, _types_rocm_stub
 del _is_windows_rocm
@@ -286,9 +270,7 @@ _TORCHVISION_BROKE = (
     "`pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
 )
 
-# A torchao built for a newer torch imports symbols straight out of torch (e.g.
-# `from torch.nn.functional import ScalingType`). On an older pinned torch the
-# symbol is absent, and the ImportError arrives here naming neither package.
+# A torchao built for newer torch imports symbols such as ScalingType from torch.nn.functional; on an older pinned torch that ImportError names neither package.
 _TORCHAO_TORCH_SYMBOLS = ("ScalingType", "ScalingGranularity", "Float8Tensor")
 
 
@@ -344,12 +326,8 @@ except ImportError as e:
         raise RuntimeError(_TORCHVISION_BROKE)
     elif "No module named 'torchvision.io.video'" in e or \
          "No module named 'torchvision.io._video'" in e:
-        # A half-installed torchvision, like the nms arm above. No release raises
-        # this alone (0.25 ships `io/video.py`, 0.26 dropped it with its importer),
-        # so only a tree partly overwritten by a venv install gets here.
-        # The MISSING-MODULE form only: `cannot import name 'read_video' from
-        # 'torchvision.io.video'` carries the same substring while the module is
-        # right there, and the message below would then be a lie.
+        # No release raises this alone (0.25 ships io/video.py, 0.26 dropped it), so only a half-installed torchvision
+        # reaches it; match only the MISSING-MODULE form, since a cannot-import-name error shares the substring.
         raise RuntimeError(
             f"***** Your torchvision install is incomplete: `torchvision.io` "
             f"imports a `video` module that is not there. Please run "
@@ -371,9 +349,7 @@ except ImportError as e:
     )
 except Exception as e:
     e_str = str(e)
-    # The nms arm above, for the case that never arrives as an ImportError: a
-    # torchvision whose compiled ops do not match torch fails inside
-    # `_meta_registrations` at `register_fake("torchvision::nms")`, a RuntimeError.
+    # Torchvision ops mismatched with torch fail as RuntimeError in _meta_registrations at register_fake of torchvision::nms, not as ImportError.
     if "torchvision::nms does not exist" in e_str:
         raise RuntimeError(_TORCHVISION_BROKE)
     if "numpy" in e_str and ("_blas" in e_str or "_multiarray" in e_str):
@@ -403,7 +379,6 @@ def process_output_options(
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else getattr(self.config, "output_hidden_states", False)
     )
-    # Move to kwargs
     kwargs["output_attentions"]    = output_attentions
     kwargs["output_hidden_states"] = output_hidden_states
     return kwargs
@@ -550,8 +525,7 @@ def _canonicalize_annotation(annotation: Any) -> Any:
         if origin is not None:
             args = t.get_args(annotation)
             args = tuple(canonicalize_annotation(arg) for arg in args)
-            # Canonicalize origin (types.UnionType -> typing.Union) so
-            # `int | str` and `Union[int, str]` match.
+            # Canonicalize origin (types.UnionType -> typing.Union) so `int | str` and `Union[int, str]` match.
             origin = TYPE_MAPPINGS.get(origin, origin)
             return (origin, args)
     return TYPE_MAPPINGS.get(annotation, annotation)
@@ -559,8 +533,7 @@ pass
 def canonicalize_annotation(annotation: Any) -> Any:
     annotation = _canonicalize_annotation(annotation)
     if type(annotation) is tuple and len(annotation) == 2:
-        # Dedupe + sort Union args (Union[str, List[str], list[str]] ->
-        # Union[str, list[str]]); sort by str(x) since sets are unordered.
+        # Dedupe and sort Union args, e.g. Union[str, List[str], list[str]] -> Union[str, list[str]]; sort key str(x) since sets are unordered.
         if annotation[0] == t.Union:
             args = list(set(annotation[1]))
             args.sort(key = lambda x: str(x))
@@ -672,7 +645,6 @@ def can_safely_patch(
             while i < len(old_fp):
                 old_arg = old_fp[i]
                 if old_arg["name"] in removed_flags_list:
-                    # Go to the end
                     i += 1
                     while i < len(old_fp):
                         old_arg = old_fp[i]
@@ -693,8 +665,7 @@ def can_safely_patch(
 
 
     if len(old_fp) != len(new_fp):
-        # transformers 4.54.0 dropped output_attentions/output_hidden_states;
-        # tolerate exactly that removal.
+        # transformers 4.54.0 dropped output_attentions and output_hidden_states; tolerate exactly that removal and nothing else.
         removed_flags_list = removed_flags(old_fp, new_fp)
         if removed_flags_list == ("output_attentions", "output_hidden_states",):
             return False, f"New function removed output_attentions and output_hidden_states"
@@ -776,14 +747,11 @@ def _saved_tensor_hook_accessor():
     function so a test can stand in for an older torch without writing to the
     read-only `torch._C._autograd`."""
     return getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
-# `CheckpointFunction.forward`/`.backward`, the reentrant path's own frames.
-# Reentrant checkpointing re-differentiates what it recomputes, so a mode flip
-# cannot strand it, and both phases carry one of these.
+# CheckpointFunction.forward and .backward are the reentrant path's own frames (both take a ctx); reentrant recompute
+# re-differentiates, so a mode flip cannot strand it.
 _REENTRANT_FRAMES = ("forward", "backward")
 
-# `checkpoint_sequential` opens no region of its own: it calls `checkpoint` per
-# segment and deliberately runs the LAST segment outside every one of them, so
-# the catch-all below must skip it rather than read it as proof of a region.
+# checkpoint_sequential opens no region of its own and runs its LAST segment outside every checkpoint, so the catch-all below must skip it.
 _SEQUENTIAL_FRAME = "checkpoint_sequential"
 
 
@@ -833,9 +801,7 @@ def _walk_for_checkpoint_frame():
             if name == _SEQUENTIAL_FRAME:
                 pass                            # keep scanning outward
             elif name in _REENTRANT_FRAMES:
-                # `checkpoint_sequential`'s per-segment closure is also called
-                # `forward` in this same file, so only the locals tell them
-                # apart: the autograd Function frames take a `ctx`.
+                # checkpoint_sequential's per-segment closure is also named forward here, so only the ctx local tells it from the autograd Function frames.
                 if _frame_local(frame, "ctx") is not _UNKNOWN:
                     reentrant += 1
             elif name == "checkpoint":
@@ -909,11 +875,9 @@ def _in_non_reentrant_checkpoint():
     return _walk_for_checkpoint_frame()
 
 
-# Set when a compiled call ran with a non-reentrant checkpoint's pack hook on
-# top: activations packed COMPILED, a backward still owed. Asking only whether
-# the CURRENT call is in a region (as the give-up path used to) is false once
-# that layer's forward returned, so latching mid-step left it to recompute
-# eagerly in backward -- an abort, or wrong gradients when the shapes line up.
+# Set when a compiled call ran under a non-reentrant checkpoint pack hook (activations packed COMPILED, backward still
+# owed); asking only if the current call is in a region is false once its forward returns, so latching mid-step left
+# eager recompute in backward (abort or wrong grads).
 _PACKED_COMPILED_IN_CHECKPOINT = False
 
 
@@ -931,12 +895,9 @@ def _dynamo_is_tracing():
     return False
 
 
-# Fruitless walks the per-call probe pays for in one step before it stops
-# asking. With no hook accessor the walk is the only signal, ~15us at stack
-# depth 60 against ~0.1us for the wrapper itself. Non-reentrant checkpointing
-# latches on one of its first calls (layer 0 is already in a region) so never
-# spends this; a run without it would pay the walk on every call forever, so
-# cap the loss at ~1ms per step. Reset at each step boundary, and by a latch.
+# Budget of fruitless stack walks per step (_CHECKPOINT_PROBE_MISS_BUDGET): with no hook accessor the walk is the only
+# signal, and a run that never latches would pay it every call; reset each step and on latch; non-reentrant
+# checkpointing usually latches on its first calls.
 _CHECKPOINT_PROBE_MISSES = 0
 _CHECKPOINT_PROBE_MISS_BUDGET = 64
 
@@ -1181,18 +1142,8 @@ def _is_recompile_limit_unsupported(exc):
             or "recompile_limit reached" in text)
 
 
-# The complete set of texts Dynamo uses to refuse a disabled callable, one per
-# wording, each a literal from the single `_torchdynamo_disable` branch of
-# `UserFunctionVariable.call_function` in `torch/_dynamo/variables/functions.py`.
-# Nothing else in Dynamo emits them, which is what keeps the match narrow.
-#
-#   torch 2.4 to 2.6  unimplemented(f"call torch._dynamo.disable() wrapped
-#                     function {self.value}")   (2.4.0 L604, 2.5.1 L655, 2.6.0 L620)
-#   torch 2.7+        unimplemented_v2(gb_type="Skip calling
-#                     `torch.compiler.disable()`d function", ...)  (2.7.0 L1173)
-#
-# Both spellings stay listed: pyproject allows torch>=2.4, and the older one is
-# all those releases ever emit.
+# Complete set of Dynamo refusal texts for a disabled callable (only the _torchdynamo_disable branch emits them); torch
+# 2.4-2.6 and 2.7+ wordings both kept since pyproject allows torch>=2.4.
 _DISABLED_HOOK_SIGNATURES = (
     ("Skip calling", "torch.compiler.disable"),
     ("torch._dynamo.disable() wrapped function",),
@@ -1222,9 +1173,7 @@ def dynamo_tracing_disabled():
             config = _DYNAMO_CONFIG = torch._dynamo.config
         except Exception:
             return False
-    # The module object is cached, the flag is not: this runs on every call
-    # into a compiled region, where the `import` statement alone cost about as
-    # much as a small torch op.
+    # The module is cached but the flag is read each time: this runs on every call into a compiled region, where an import statement is too costly.
     return bool(config.disable)
 
 
@@ -1253,16 +1202,14 @@ def _is_our_own_disabled_hook(exc):
     )
 
 
-# torch 2.7 renamed both recompile budgets, keeping the old names as aliases,
-# so bumping whichever of the pair the installed torch actually reads is the
-# only portable way to buy the current step a few more compilations.
+# torch 2.7 renamed both recompile budgets and kept the old names as aliases, so bumping whichever of each pair the
+# installed torch reads is the only portable way to allow a few more compiles this step.
 _RECOMPILE_LIMIT_NAMES = (
     ("recompile_limit", "cache_size_limit"),
     ("accumulated_recompile_limit", "accumulated_cache_size_limit"),
 )
 
-# Headroom per bump, and bumps one wrapper may ask for before going eager.
-# Bounded on purpose: the limit exists to stop unbounded compilation.
+# Recompile-limit headroom per bump, and max bumps per wrapper before eager; bounded to cap compiles.
 _RECOMPILE_LIMIT_BUMP = 16
 _MAX_RECOMPILE_LIMIT_BUMPS = 4
 
@@ -1274,12 +1221,8 @@ _MAX_RECOMPILE_LIMIT_BUMPS = 4
 _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS = 8
 _GLOBAL_BUMPS = 0
 _ORIGINAL_RECOMPILE_LIMITS = {}
-# name -> {bumped value: value it was bumped from}. Restore only a name still
-# holding a value we wrote, back to the baseline THAT value came from: bumps nest
-# inside `torch._dynamo.config.patch`, and the two orderings need opposite
-# answers, which one recorded original cannot give.
-#   bump 1024->1040, patch, bump inside, exit  -> dynamo hands back 1040, owes 1024
-#   patch(2), bump 2->18, exit, bump 8->24     -> live 24 owes 8, NOT the scoped 2
+# Key baselines by bumped value; restore only a name still holding a value we wrote, back to the baseline that value
+# came from, since bumps nest in config.patch and need opposite restores.
 _BUMPED_RECOMPILE_LIMITS = {}
 
 
@@ -1291,9 +1234,7 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
         import torch._dynamo.config as _config
     except Exception:
         return False
-    # Measured here, not carried over from the last restore: that may have run
-    # under a `config.patch` hiding our value, where the count reads 0, while
-    # the borrow below happens outside it against the real raised limit.
+    # Measure the depth now, not from the last restore: a config.patch there hides our value and reads 0.
     _GLOBAL_BUMPS = max((_live_bump_depth(_config, n)
                          for n in _BUMPED_RECOMPILE_LIMITS), default = 0)
     if _GLOBAL_BUMPS >= _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS:
@@ -1307,11 +1248,7 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
                     setattr(_config, name, current + extra)
                 except Exception:
                     continue
-                # Key the baseline by the value we wrote: only the live value
-                # at restore time says which bump is still standing. A stack per
-                # value, not one entry, because a scoped patch can repeat a
-                # baseline -- bump 8->24, patch to 8, bump to 24 again -- and one
-                # entry collapsed the two debts.
+                # Stack per written value: a scoped patch can repeat a baseline, and one entry merged two debts.
                 _BUMPED_RECOMPILE_LIMITS.setdefault(name, {}).setdefault(
                     current + extra, []).append(current)
                 _ORIGINAL_RECOMPILE_LIMITS.setdefault(name, current)
@@ -1348,13 +1285,9 @@ def _restore_recompile_limits():
     # A new step packs its own activations; last step's are long since freed.
     _PACKED_COMPILED_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0
-    # `_COMPILED_OK_LABELS` is deliberately NOT cleared here. This runs whenever
-    # the last borrowed bump is handed back, which `_release_borrowed_budget`
-    # does mid-step after a caught exception, not only at a step boundary. One
-    # wrapper releasing budget would then erase another wrapper's record of
-    # having packed compiled under a still-open checkpoint, and that wrapper's
-    # next refusal would latch eager and let its pack be recomputed eagerly.
-    # The genuine step boundary, `apply_pending_eager_fallbacks`, clears it.
+    # _COMPILED_OK_LABELS is deliberately not cleared on mid-step budget release: clearing it there erases another
+    # wrapper record of packed compiled work, so that pack gets recomputed eagerly; apply_pending_eager_fallbacks clears
+    # it at the step boundary.
     if not _ORIGINAL_RECOMPILE_LIMITS:
         return 0
     try:
@@ -1367,15 +1300,9 @@ def _restore_recompile_limits():
             live = getattr(_config, name, None)
             baselines = _BUMPED_RECOMPILE_LIMITS.get(name, {})
             if live not in baselines:
-                # Not our value: someone else's write, or a live `config.patch`
-                # hiding ours, indistinguishably. Dropping the claim loses the
-                # original when that patch exits and hands our bump back, so
-                # keep it and settle at a later boundary.
+                # Not ours, keep the claim: dropping it loses the original when a hiding config.patch exits.
                 continue
-            # Follow the chain back: successive bumps record 1040->1024,
-            # 1056->1040 and so on, so one hop would hand back the previous bump
-            # rather than the starting value. `chain` also stops a cycle if a
-            # bump ever lands on an earlier one.
+            # Follow the chain to the starting value (one hop gives the previous bump); chain stops cycles.
             original, chain = baselines[live][-1], [live]
             while original in baselines and original not in chain:
                 chain.append(original)
@@ -1384,10 +1311,7 @@ def _restore_recompile_limits():
             restored += 1
         except Exception:
             continue
-        # Only the branch just unwound: dropping the whole map also threw away
-        # branches a live `config.patch` still hides -- bump 8->24, patch to 2,
-        # bump 2->18, restore killed the 24->8 debt, and the patch exit then
-        # resurrected 24 permanently.
+        # Pop only the branch just unwound; clearing the map would erase branches a live config.patch hides.
         for value in chain:
             stack = baselines.get(value)
             if stack: stack.pop()
@@ -1395,9 +1319,7 @@ def _restore_recompile_limits():
         if not baselines:
             _ORIGINAL_RECOMPILE_LIMITS.pop(name, None)
             _BUMPED_RECOMPILE_LIMITS.pop(name, None)
-    # Repay only the debts actually settled. Zeroing while a scoped patch still
-    # hid a live bump handed the next wrapper the whole global allowance again,
-    # so repeated patches walked straight past the total cap.
+    # Repay only settled debts; zeroing under a scoped patch re-grants the allowance past the total cap.
     _GLOBAL_BUMPS = max((_live_bump_depth(_config, n)
                          for n in _BUMPED_RECOMPILE_LIMITS), default = 0)
     return restored
@@ -1449,31 +1371,16 @@ def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
     return eager_under_zero3(func, _fall_back_to_eager_on_recompile_limit(compiled, func, label))
 
 
-# Call sites that have already given up, by label. Outlives the wrappers, which
-# the registry holds only weakly.
+# Call sites that gave up, by label; outlives the wrappers, which the registry holds only weakly.
 _LATCHED_EAGER_LABELS: set = set()
 
-# Call sites that deferred their switch to the next step boundary. Same reason:
-# a wrapper built inside a forward is unreachable before the boundary arrives,
-# so the deferral has to be recorded somewhere that survives it.
+# Labels deferred to the next step boundary; wrappers built in a forward are unreachable before it.
 _PENDING_EAGER_LABELS: set = set()
 
-# The same latches, but only since the last settle. `_LATCHED_EAGER_LABELS` is
-# deliberately permanent, which makes it the wrong thing to read as EVIDENCE
-# that something fell back just now: train two models in one process and the
-# first one's labels answer for the second. Cleared at every settle, so this
-# one says "in this step", which is the question being asked.
+# Latches since last settle; the permanent _LATCHED_EAGER_LABELS would answer for other models.
 _RECENT_EAGER_LABELS: set = set()
 
-# Labels whose compiled callable returned at least once UNDER A CHECKPOINT,
-# SINCE THE LAST SETTLE. Both qualifiers earn their place: see `_note_compiled_ok`
-# for why an uncheckpointed compiled call must not go in here.
-# `_give_up_on_backend` reads this to decide whether going eager could
-# desynchronise a pack from its recompute, and that question is only ever about
-# the step being executed: last step's activations are long since freed. Holding
-# it per wrapper instead would answer for a step that is over, which is exactly
-# backwards -- it would re-raise on a first refusal in a later step, where
-# nothing compiled has been packed and the fallback is safe.
+# Labels whose compiled call returned in a checkpoint since last settle; read by _give_up_on_backend.
 _COMPILED_OK_LABELS: set = set()
 
 
@@ -1532,20 +1439,11 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     if not errors and not graph_break_errors and not backend_errors:
         return compiled_func
 
-    # Warn once. The condition repeats every call, and the log should not.
-    # Eager/pending come from the LABEL, not the object: a wrapper built inside
-    # a forward (GRPO's `accumulate_chunk` closes over per-call accumulators, so
-    # it cannot be hoisted) dies with that forward and the registry holds it
-    # weakly, so latching it bought nothing -- the next step compiled a fresh
-    # one, borrowed again, and the bounded transition to eager never happened.
-    # Whether the compiled callable has returned is deliberately NOT held here:
-    # it lives in the module-level `_COMPILED_OK_LABELS`, which is cleared at
-    # every step boundary. See that set for why the answer has to be per step
-    # rather than per wrapper.
+    # Warn once; eager and pending are keyed by label because per-call wrappers die with their forward; whether the
+    # compiled callable returned is deliberately NOT held here but in _COMPILED_OK_LABELS.
     state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
              "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0,
-             # Was the compiler switched off when this wrapper was FIRST called?
-             # None until then. Decided once, deliberately: see the wrapper.
+             # Whether the compiler was off at the wrapper's first call; None until then, then decided once.
              "compiler_off": None}
 
     def _warn(message):
@@ -1621,8 +1519,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         try:
             result = compiled_func(*args, **kwargs)
         except errors:
-            # Keep the bump: the caller latches everything that borrowed to
-            # eager next, and that hand-back is what restores the budgets.
+            # Keep the bump: the caller latches all borrowers to eager, and that hand-back restores the budgets.
             return _NO_RESULT
         except graph_break_errors as e:
             if _is_recompile_limit_unsupported(e) or _is_our_own_disabled_hook(e):
@@ -1630,13 +1527,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             _release_borrowed_budget()
             raise
         except _checkpoint_early_stop_errors() as e:
-            # Not a failure: with early-stop on, checkpoint's recompute hook
-            # raises this once every needed tensor is back and the machinery
-            # swallows it as a successful recomputation. Releasing the bump and
-            # returning left the wrapper compiled with its counters reset, so
-            # every new guard variant could borrow again and walk past both the
-            # per-wrapper and global caps. The retry DID finish; treat it as one
-            # and still let the signal out.
+            # Early-stop signal is not a failure: the retry finished, so keep the bump or the caps get walked past, and still let the signal propagate.
             state["pending_eager"] = True
             _PENDING_EAGER_LABELS.add(label)
             _warn(
@@ -1646,30 +1537,15 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             )
             raise
         except BaseException:
-            # A real failure of the model, not of the compiler: falling through
-            # to eager would run the call twice, reapplying any mutation it
-            # already made, and bury the error. The caller may catch it and
-            # carry on (skipping a bad batch, say), so hand the budget back
-            # rather than strand it on a call that never completed.
+            # A real model failure, not a compiler one: eager fallback would rerun the call; release the budget.
             _release_borrowed_budget()
             raise
         state["pending_eager"] = True
         _PENDING_EAGER_LABELS.add(label)
-        # Deferring is for checkpointed training, where flipping mid-step makes
-        # the pack and the recompute of one region disagree. Outside a region
-        # nothing is half-packed, and no boundary is coming either:
-        # `apply_pending_eager_fallbacks` runs from the trainer's step hook, so
-        # a compiled inference function (GPT-OSS's module-level `_torch_compile`
-        # ones) would hold the process-global limits raised for the rest of the
-        # process and never make the switch it just promised. Settle it here
-        # instead, but only on a definite False: None means torch could not say,
-        # and guessing "no region" is the answer that corrupts a backward.
+        # Defer only in a checkpoint; elsewhere settle now on a definite False, since no boundary comes.
         if _in_non_reentrant_checkpoint() is False and \
             not _PACKED_COMPILED_IN_CHECKPOINT:
-            # THIS wrapper only. Taking every live borrower along is what a step
-            # boundary wants, not this: one inference function out of cache
-            # would knock every patched kernel in the process eager mid-step,
-            # and nothing spans this call the way a checkpointed region does.
+            # Latch this wrapper only; latching every borrower would knock all patched kernels eager mid-step.
             state["eager"] = True
             state["pending_eager"] = False
             _PENDING_EAGER_LABELS.discard(label)
@@ -1700,10 +1576,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         with, so end the step instead. Every borrower is eager by now, so the
         caller's retry is consistent -- the contract `force_eager_fallback`
         offers reactively."""
-        # Read BEFORE latching, which hands the budget back, and that settlement
-        # is a step boundary that clears the marker. Not just "in a region now":
-        # anything packed compiled this step owes a backward that would now
-        # recompute eagerly.
+        # Read the packed flag before latching, since latching hands the budget back and clears it; not just whether a
+        # region is open now, because anything packed compiled this step owes a backward.
         packed = _in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT
         _latch_all_to_eager()
         _warn(
@@ -1756,25 +1630,13 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             (_in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT)
             and label in _COMPILED_OK_LABELS
         )
-        # `_note_packed_under_checkpoint` ran before the compiled call and set
-        # the process-wide marker, but the call refused at compile time so no
-        # compiled code ran and nothing compiled was packed. Leaving the marker
-        # set would make an unrelated wrapper's `_give_up` believe this
-        # checkpoint holds a compiled pack and end the step for no reason.
+        # _note_packed_under_checkpoint set the process-wide marker before a call that refused at compile time, so
+        # nothing compiled was packed; the marker must be restored or an unrelated wrapper's _give_up ends the step for
+        # no reason.
         _PACKED_COMPILED_IN_CHECKPOINT = marker_before
         state["eager"] = True
         _LATCHED_EAGER_LABELS.add(label)
-        # And as current-step EVIDENCE, which is a different question from the
-        # permanent latch and the reason `_latch_all_to_eager` writes both.
-        # `force_eager_fallback` deliberately refuses to read
-        # `_LATCHED_EAGER_LABELS` -- it is permanent, so a previous model's
-        # labels would answer for this one -- and falls back to asking the live
-        # wrappers. The wrapper that fails here need not be one: GRPO builds
-        # `accumulate_chunk` inside the forward, so it is collected before the
-        # backward that calls `force_eager_fallback`. With no live wrapper and
-        # no recent label the call returns 0, the caller reads that as "no
-        # compile-mode flip happened" and re-raises the very failure it was
-        # asked to retry past.
+        # Current-step evidence, since a permanent latch from an earlier model would answer for this one.
         _RECENT_EAGER_LABELS.add(label)
         _warn(warning)
         if packed:
@@ -1920,26 +1782,19 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         if state["eager"]:
             return eager_func(*args, **kwargs)
         if torch.compiler.is_compiling():
-            # Inlined by an enclosing compile: the bookkeeping below would guard its
-            # graph on `state["compiler_off"] is None`, recompiling it on the next call.
+            # Inlined by an enclosing compile: skip this, or the graph guards on compiler_off and recompiles.
             return compiled_func(*args, **kwargs)
         if state["compiler_off"] is None:
             state["compiler_off"] = dynamo_tracing_disabled()
         if state["compiler_off"]:
-            # Checked BEFORE the call, not recovered from afterwards. Torch runs
-            # the body and only then raises "found no compiled frames" from its
-            # post-call bookkeeping (torch/_dynamo/eval_frame.py), so catching
-            # that and re-running eager executes the body twice, consuming RNG
-            # twice and repeating any mutation it made.
+            # Checked before the call: torch raises after the body runs, so an eager retry would run it twice.
             return eager_func(*args, **kwargs)
         marker_before = _PACKED_COMPILED_IN_CHECKPOINT
         try:
             _note_packed_under_checkpoint()
             result = compiled_func(*args, **kwargs)
         except backend_errors as e:
-            # Before the recompile-limit clause: these are disjoint classes, but
-            # the ordering states the intent, which is that a backend refusal is
-            # never a budget problem and must not consume budget.
+            # Ordered before the recompile-limit clause: the classes are disjoint, but a backend refusal is never a budget problem and must not consume budget.
             if not _is_backend_refusal_we_handle(e):
                 # Either the caller asked for a hard failure, or some other
                 # backend refused. Only Inductor's simplifier gaps are
@@ -1953,9 +1808,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 raise
             result = _retry_catching_backend_refusal(args, kwargs, marker_before)
             if type(result) is _EagerFallbackTaken:
-                # The retry hit a codegen refusal and already ran eager. Hand
-                # that value straight back: recording it as compiled would be a
-                # lie in the direction that recomputes a pack in the wrong mode.
+                # Return the eager retry's value as is; marking it compiled would recompute a pack in the wrong mode.
                 return result.value
             if result is not _NO_RESULT:
                 # The retry COMPILED and returned, so this region may now have
@@ -1966,9 +1819,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 return result
             return _give_up(e, args, kwargs)
         except graph_break_errors as e:
-            # Cache exhaustion on a torch that has no exception class for it
-            # (2.4), then our own `torch.compiler.disable` hook. Anything else
-            # is a real graph break and must keep raising.
+            # On torch 2.4 cache exhaustion arrives as our torch.compiler.disable hook; other breaks still raise.
             if _is_recompile_limit_unsupported(e):
                 # The 2.4 route to the same place as the typed arm above, so it
                 # needs the same two things: a refusal from the retry must reach
@@ -1988,20 +1839,13 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 raise
             return _give_up_on_disabled_hook(e, args, kwargs, marker_before)
         else:
-            # The compiled callable returned, so anything it packed under a
-            # checkpoint is packed compiled. Only `_give_up_on_backend` reads
-            # this, to decide whether switching to eager could desynchronise a
-            # pack from its recompute.
+            # A returned compiled call marks its checkpoint packs compiled; _give_up_on_backend reads this.
             _note_compiled_ok()
             return result
 
-    # Keep the compiled callable reachable for anything that unwraps it, and
-    # keep `get_compiler_config` present so the unwrap check below still sees
-    # a compiled function and reaches `__wrapped__` (the eager original).
+    # Keep get_compiler_config so unwrap checks still see a compiled function and reach __wrapped__.
     wrapper._unsloth_compiled_func = compiled_func
-    # Anything asking "is this compiled?" (torch included) looks here, and the
-    # wrapper is what callers now hold, so forward it rather than let the
-    # fallback look like it un-compiled the region.
+    # Forward the compiled-check attributes to the wrapper, so the fallback does not look un-compiled.
     _orig = getattr(compiled_func, "_torchdynamo_orig_callable", None)
     if _orig is not None:
         wrapper._torchdynamo_orig_callable = _orig
@@ -2012,10 +1856,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     wrapper._unsloth_fallback_state = state
     wrapper._unsloth_fallback_label = label
     _EAGER_FALLBACK_WRAPPERS.append(weakref.ref(wrapper))
-    # GRPO rebuilds and re-wraps `accumulate_chunk` inside every backward, so the
-    # registry gained an entry per step forever and every scan above walked them
-    # all: quadratic over a long run. Compacting once the list has doubled is
-    # amortised O(1) per append and keeps scans proportional to live wrappers.
+    # GRPO re-wraps accumulate_chunk on every backward, so the registry grew without bound and scans went quadratic;
+    # compacting once the list doubles keeps appends amortised O(1).
     global _EAGER_FALLBACK_PRUNE_AT
     if len(_EAGER_FALLBACK_WRAPPERS) >= _EAGER_FALLBACK_PRUNE_AT:
         _EAGER_FALLBACK_WRAPPERS[:] = [
@@ -2024,9 +1866,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     return wrapper
 
 
-# Every wrapper built above, weakly, so a patched-then-discarded model does not
-# keep its functions alive. Weak refs also mean the registry cannot report a
-# switch for something nobody is calling any more.
+# Every wrapper is held weakly so discarded models stay collectable; dead ones are not reported.
 _EAGER_FALLBACK_WRAPPERS: list = []
 _EAGER_FALLBACK_PRUNE_AT: int = 64
 
@@ -2038,15 +1878,13 @@ def eager_fallback_state() -> dict[str, bool]:
         w = ref()
         if w is not None:
             label = w._unsloth_fallback_label
-            # OR, not assign: labels can collide, and a later False would hide an
-            # earlier True, reporting compiled for an already-eager path.
+            # Use OR, not assignment: labels can collide, and a later False would hide an earlier True.
             out[label] = out.get(label, False) or bool(w._unsloth_fallback_state["eager"])
     return out
 
 
 _RAISED_INSIDE_CHECKPOINT = False
-# Retries are bounded: one collection per step forever would cost more than the
-# stale hooks do, and torch < 2.8 cannot report them at all.
+# Retries are bounded: a gc pass per step costs more than stale hooks; torch < 2.8 cannot see them.
 _MAX_CHECKPOINT_SETTLE_ATTEMPTS = 8
 _CHECKPOINT_SETTLE_ATTEMPTS = 0
 
@@ -2082,10 +1920,7 @@ def _settle_abandoned_checkpoint_generator():
     import gc
     gc.collect()
     _CHECKPOINT_SETTLE_ATTEMPTS += 1
-    # A caller retrying from inside `except ... as exc` roots the traceback, so
-    # the generator survives every collection: stay pending and try again at the
-    # next boundary. `_UNKNOWN` counts as pending, since before 2.8 nothing can
-    # be inspected and that is precisely when the retry is needed.
+    # Retry inside except roots the traceback, so the generator survives gc; _UNKNOWN counts as pending.
     _left = _checkpoint_hooks_left_installed()
     if (_left is _UNKNOWN or _left) and \
         _CHECKPOINT_SETTLE_ATTEMPTS < _MAX_CHECKPOINT_SETTLE_ATTEMPTS:
@@ -2095,8 +1930,7 @@ def _settle_abandoned_checkpoint_generator():
     return True
 
 
-# True only while generate() runs a compiled decode step for a model that opted in. A
-# one-element list so Dynamo guards on the value and retraces when it flips.
+# True only during generate()'s compiled decode of an opted-in model; a list makes Dynamo retrace.
 UNSLOTH_DECODE_COMPILE = [False]
 # [weakref to an eager stance Unsloth installed (True if torch has none), stance it replaced]
 UNSLOTH_EAGER_STANCE_OWNED = []
@@ -2175,11 +2009,8 @@ def unsloth_decode_compile():
                         _claim_current_stance(owned[1])
 
 
-# Set while generate() runs an eager decode step (no grad, one new token per row) on this
-# thread. Compiled regions then call their eager original: at one token their guard checks
-# and wrapper cost more than the fusion saves (Qwen3.5-2B, A100: 3.6 s -> 2.8 s per 64 tokens).
-# Thread-local, never set while tracing or with grad on, and only read outside tracing, so
-# training (including on another thread) and any outer compile keep the compiled path.
+# Thread-local flag set only during eager one-token no-grad decode in generate(); never set while tracing or with grad
+# on, and only read outside tracing, so training and outer compiles keep the compiled path.
 _EAGER_DECODE_STATE = threading.local()
 
 
@@ -2380,21 +2211,14 @@ def apply_pending_eager_fallbacks() -> int:
 
     Safe to call on every step. Nothing pending means nothing happens.
     """
-    # A new step: whatever was packed compiled belonged to the last one. Only
-    # `_restore_recompile_limits` cleared the marker, which an ordinary
-    # successful step never reaches, so it stayed true for the rest of the run
-    # and made `_give_up` re-raise for a later call nowhere near a checkpoint.
-    # Cleared first, before any early return below.
+    # Clear the packed marker first, before any early return; only the restore path cleared it before.
     global _PACKED_COMPILED_IN_CHECKPOINT, _CHECKPOINT_PROBE_MISSES
     _PACKED_COMPILED_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0             # a new step, a new probe budget
     _COMPILED_OK_LABELS.clear()              # and a new compiled-pack history
     _settled = _settle_abandoned_checkpoint_generator()
     if _RAISED_INSIDE_CHECKPOINT and not _settled:
-        # Still rooted, so its saved-tensor hooks are still on the stack and the
-        # next region would pack under them. Almost always a caller retrying
-        # from inside `except ... as exc`, whose traceback holds the frames
-        # alive. Say so rather than let the flip read as a clean boundary.
+        # Still-rooted generator keeps its saved-tensor hooks installed, so the next region packs under them.
         logger.warning_once(
             "Unsloth: a checkpoint region left by the compile-mode fallback has "
             "not been finalised yet, so its saved-tensor hooks are still "
@@ -2403,24 +2227,12 @@ def apply_pending_eager_fallbacks() -> int:
         )
     live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
             if w is not None]
-    # By label as well as by object: a wrapper built inside a forward is already
-    # collected by the time the boundary arrives, so asking only the live ones
-    # answered "nothing pending" and the next step compiled it again, and the
-    # bounded transition never happened for GRPO's `accumulate_chunk`.
+    # Also match by label: a wrapper built inside a forward is collected before the boundary arrives.
     if not _PENDING_EAGER_LABELS and \
         not any(w._unsloth_fallback_state.get("pending_eager") for w in live):
-        # Cleared here too, not just on the settle path below: a wrapper giving
-        # up OUTSIDE a checkpoint records its label without a pending entry, so
-        # every later boundary took this early return and the label never
-        # expired. A genuine checkpoint failure in a later step, or in a second
-        # model in the same process, then read it as evidence of a compile-mode
-        # flip, latched healthy wrappers eager and asked for a retry instead of
-        # letting the real error through.
+        # Clear recent labels here too: a give-up outside a checkpoint never gets a pending entry to expire.
         _RECENT_EAGER_LABELS.clear()
-        # Nothing to flip, but a borrower that bumped and was then collected
-        # (training aborted, or the patched object replaced) would otherwise
-        # leave the process-wide limit raised and its allowance spent forever.
-        # The helper declines while any live wrapper still needs the headroom.
+        # Nothing to flip, but a collected borrower would leave limits raised; restore only if idle.
         _restore_recompile_limits_if_idle()
         return 0
     flipped = 0
@@ -2429,18 +2241,13 @@ def apply_pending_eager_fallbacks() -> int:
             flipped += 1
         w._unsloth_fallback_state["eager"] = True
         w._unsloth_fallback_state["pending_eager"] = False
-    # The deferral is settled, so those call sites stay eager however often
-    # their wrappers are rebuilt.
+    # Once settled, those call sites stay eager however often their wrappers are rebuilt.
     _LATCHED_EAGER_LABELS.update(_PENDING_EAGER_LABELS)
     _PENDING_EAGER_LABELS.clear()
     _RECENT_EAGER_LABELS.clear()
-    # A genuine settlement: everything is eager now, so the step is being
-    # abandoned and the compiled-pack history answers for nobody.
-    # `_restore_recompile_limits` deliberately does NOT do this, because it also
-    # runs mid-step when a borrower hands its bump back.
+    # Clear compiled-pack history only on real settlement; _restore_recompile_limits runs mid-step too.
     _COMPILED_OK_LABELS.clear()
-    # Everything that borrowed headroom is eager now, so hand the budget back
-    # rather than leaving the process permanently raised.
+    # Everything that borrowed is eager now, so hand the budget back rather than leave limits raised.
     _restore_recompile_limits()
     return flipped
 
@@ -2464,10 +2271,7 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     """
     live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
             if w is not None]
-    # The label sets count too: a wrapper built inside a forward (GRPO's
-    # `accumulate_chunk`) is collected before backward, so its record of having
-    # failed survives only there, and asking the live ones alone returned 0 --
-    # the caller then re-raised the very failure this exists to retry past.
+    # Label sets count too: a wrapper collected before backward keeps its failure record only there.
     if only_if_already_triggered and not (
             _RECENT_EAGER_LABELS or _PENDING_EAGER_LABELS or any(
             w._unsloth_fallback_state["eager"]
@@ -2479,14 +2283,12 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
         w._unsloth_fallback_state["pending_eager"] = False
         _label = getattr(w, "_unsloth_fallback_label", None)
         if _label is not None: _LATCHED_EAGER_LABELS.add(_label)
-    # Settle deferrals too, or the per-call wrapper the retry rebuilds reads a
-    # still-pending label and compiles again.
+    # Settle deferrals too, or a rebuilt per-call wrapper reads the still-pending label and compiles.
     _LATCHED_EAGER_LABELS.update(_PENDING_EAGER_LABELS)
     _PENDING_EAGER_LABELS.clear()
     _RECENT_EAGER_LABELS.clear()
     _restore_recompile_limits()
-    # Latched labels, not live objects: a call site with no wrapper alive right
-    # now is still eager, and returning 0 would read as "nothing fell back".
+    # Count latched labels, not live objects: a call site with no live wrapper is still eager.
     return max(len(live), len(_LATCHED_EAGER_LABELS))
 
 

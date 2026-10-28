@@ -102,8 +102,7 @@ _TRANSPARENT_METHODS = frozenset(("float", "contiguous", "to"))
 
 
 def _unwrap_logits_rhs(value: ast.AST):
-    """``(self.<HEAD>(...) call, scale_kws)``, or None for any wrapper besides ``* s`` / ``/ s``
-    (peeling blindly dropped it and trained on wrongly scaled logits)."""
+    """Returns (self.<HEAD>(...) call, scale_kws), or None for wrappers other than * s and / s; blind peeling dropped the scale and trained on wrongly scaled logits."""
     scale_kws: list = []
     node = value
     while True:
@@ -138,8 +137,7 @@ def _unwrap_logits_rhs(value: ast.AST):
 
 
 def _find_loss_function_call(if_block: ast.If) -> ast.Call | None:
-    # Only direct body statements: nested ifs inside the labels branch would
-    # be dropped by the wholesale rewrite.
+    # Only direct body statements are scanned: nested ifs inside the labels branch would be dropped by the wholesale rewrite.
     for stmt in if_block.body:
         if isinstance(stmt, ast.Assign):
             v = stmt.value
@@ -762,11 +760,7 @@ def _plan(source: str, extended: bool):
 
 
 def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | None]:
-    """Rewrite a forward function source string.
-
-    Returns (new_source, capture) on success, (None, None) if the canonical
-    triplet wasn't found (and the caller should leave the class alone).
-    """
+    """Returns (new_source, capture), or (None, None) if the canonical triplet is missing, so the caller leaves the class alone."""
     plan = _plan(source, extended = False)
     if plan is None:
         return (None, None)
@@ -780,8 +774,7 @@ def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | No
             continue
         new_body.append(stmt)
     fn.body = new_body
-    # @can_return_tuple carries return_dict=False semantics and must survive;
-    # strip only the docstring-only decorators below.
+    # @can_return_tuple carries return_dict=False semantics and must survive; strip only the docstring-only decorators listed below.
     _DROP_DECORATORS = {
         "auto_docstring",
         "add_start_docstrings",
@@ -881,10 +874,8 @@ def _is_one(node) -> bool:
 
 
 def rewrite_count_aware_ce_spliced(source: str):
-    """Make an unfusable head's own mean token CE count-aware: (new_source, shifted) or (None, None).
-
-    Bails on a weighted / smoothed / non-mean CE, a second CE, or a CE outside the labels block.
-    """
+    """Make an unfusable head's own mean token CE count-aware, returning (new_source, shifted) or (None, None); bails on
+    weighted, smoothed or non-mean CE, a second CE, or CE outside labels."""
     try:
         tree = ast.parse(textwrap.dedent(source))
     except SyntaxError:

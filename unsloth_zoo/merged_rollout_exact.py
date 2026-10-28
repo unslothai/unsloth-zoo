@@ -14,16 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Exact in-place LoRA fold / unfold without a pristine copy of the base weights.
-
-fold:   W <- round(W + d),  d = s * B @ A in fp32
-unfold: W <- round(W - d), then the elements where that round trip is not exact are
-        overwritten with their original bits, recorded during the fold.
-
-Only those elements are kept, in host memory while vLLM generates. d must be bit-identical
-in fold and unfold: one kernel binary for all modes, explicit fma in a fixed order, fp fusion
-off. A checksum over the weight bits proves each restore; a mismatch raises.
-"""
+"""Exact in-place LoRA fold/unfold, no pristine base copy: d = s * B @ A in fp32 must be bit-identical (one kernel,
+explicit fma in a fixed order, no fp fusion); unfold restores the original bits of inexact elements from host stores;
+a weight-bit checksum raises on mismatch."""
 
 __all__ = [
     "exact_merge_available",
@@ -149,11 +142,8 @@ pass
 
 
 class ExactFoldTarget:
-    """One weight to fold: W viewed as [E, N, K] with A_e [R, K] and B_e [N, R] per expert e.
-
-    `w_view` is a strided [E, N, K] view of the shared base weight (E = 1 for dense layers),
-    `a` / `b` are [E, R, K] / [E, N, R] (any strides), `scale` the LoRA scaling.
-    """
+    """One weight to fold, W viewed as [E, N, K]: w_view is its strided base view (E=1 for dense); a [E, R, K] and b [E,
+    N, R] take any strides; scale is the LoRA scaling."""
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = ("w", "a", "b", "scale", "counts", "checksum", "idx", "val", "host_idx", "host_val", "folded", "ready")
 
@@ -198,8 +188,7 @@ pass
 
 
 def exact_fold(targets, stream = None):
-    """Fold every target in place; returns {"bad": n, "elements": m} and leaves each target's
-    fix-up store (index, original bits) in pinned host memory, copied on `stream`."""
+    """Fold targets in place and return {"bad": n, "elements": m}; each target's fix-up store (index, original bits) stays in pinned host memory, copied on stream."""
     # All Unsloth Zoo code licensed under LGPLv3
     total_bad, total_elements = 0, 0
     for t in targets:

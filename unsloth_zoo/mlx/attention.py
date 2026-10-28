@@ -33,8 +33,7 @@ def _result_dtype(queries, q_keys, q_values):
 
 
 def _row_bytes(q_cache, group_size, dtype):
-    # Dequantized plus packed: a prefix view is compacted first, and contiguity is not visible
-    # from the arrays, so the compaction is charged always.
+    # Dequantized plus packed bytes; a prefix view is compacted first, and contiguity is not visible from the arrays, so compaction is always charged.
     packed = sum(part.shape[-1] * part.dtype.size for part in q_cache)
     return q_cache[1].shape[-1] * group_size * dtype.size + packed
 
@@ -49,8 +48,8 @@ def dequantizing_is_smaller(queries, q_keys, q_values, group_size):
     return scores > copy
 
 
-# The calls mlx fuses (ScaledDotProductAttention::has_fused_kernel and use_fallback, mlx 0.32.3).
-# Elsewhere mlx builds the scores anyway, so the copy would cost extra rather than instead.
+# Shapes of the calls mlx fuses, per ScaledDotProductAttention::has_fused_kernel and use_fallback (mlx 0.32.3);
+# elsewhere mlx builds the scores anyway, so a copy would add cost rather than replace it.
 _FUSED_FULL_HEAD_DIMS = frozenset((64, 72, 80, 96, 128))
 _FUSED_VECTOR_HEAD_DIMS = frozenset((64, 96, 128, 256))
 _SPLIT_MIN_QUERIES = 1024
@@ -118,8 +117,7 @@ def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
 
 
 def dequantized_sdpa(queries, q_keys, q_values, scale, mask=None, group_size=64, bits=8):
-    """The fused kernel over one dequantized copy. An emptied row averages, as the unfused path
-    does: mlx masks with a finite minimum, not -inf."""
+    """Fused SDPA over one dequantized copy; an emptied row averages as in the unfused path, since mlx masks with a finite minimum rather than -inf."""
     dtype = _result_dtype(queries, q_keys, q_values)
     keys = mx.dequantize(*q_keys, group_size=group_size, bits=bits).astype(dtype)
     values = mx.dequantize(*q_values, group_size=group_size, bits=bits).astype(dtype)
@@ -262,9 +260,8 @@ inline uint qsa_order_key(float score) {
 }
 """
 
-# One threadgroup per query row. A radix select over the order keys finds the top-k threshold; the
-# blocks above it and the highest-index blocks tied with it are argpartition's set (the last k of
-# MLX's stable ascending argsort), written in increasing order after the -1 of missing picks.
+# One threadgroup per query row: a radix select over order keys finds the top-k threshold; ties keep the highest-index
+# blocks (last k of MLX's stable argsort); -1s, then picks ascending.
 _SELECT_SOURCE = """
     constexpr uint TG = 1024;
     constexpr uint NSG = TG / 32;
@@ -400,12 +397,8 @@ def _divisor(head_dim):
 
 
 def select_blocks(scores, complete, topk, head_dim):
-    """mlx-vlm's QSA block selection from float32 per-head scores [B, H, L, blocks], in one launch.
-
-    Returns [B, L, topk] int32: the set `argpartition` picks among each row's first `complete`
-    blocks, ascending, after one -1 per missing pick, which is the order the indexed attention
-    kernel sorts any selection into.
-    """
+    """mlx-vlm QSA block selection on float32 [B, H, L, blocks] scores, one launch; returns [B, L, topk] int32:
+    argpartition's picks among each row's first complete blocks, -1 per missing pick first, then ascending."""
     B, H, L, nb = scores.shape
     if topk < 1:
         raise ValueError(f"Unsloth: QSA block selection needs topk >= 1, got {topk}")
@@ -467,11 +460,9 @@ inline void nax_mma(thread vec<C, 8>& c0, thread vec<C, 8>& c1, const thread vec
 
 """ + _ROW_REDUCE[1:]
 
-# MLX's NAX flash attention (steel_attention_nax.h) over gathered keys. A threadgroup is one (query row, KV head);
-# fragment rows are that KV head's query heads. Simdgroup sg scores half of D, the halves meet in threadgroup
-# memory, and sg accumulates P V for its half of D. Keys come 32 at a time from 8 units: the row's sorted picks
-# (-1 first), then its partial tail block. A lane's 16-byte gather feeds two fragments, which permutes D: Q must
-# gather the same dims as K, and V the same dims as the output store.
+# MLX NAX flash attention (steel_attention_nax.h) over gathered keys, one threadgroup per (query row, KV head); 32 keys
+# at a time from sorted picks (-1 first) then the partial tail; 16-byte gathers permute D, so Q must gather K's dims and
+# V the dims of the output store.
 _PREFILL_SOURCE = """
     constexpr int D = 256;
     const ushort lane = thread_index_in_simdgroup;
@@ -846,8 +837,8 @@ def probe_simd_prefill():
 
 
 def _fp32_prefill(queries, keys, values, picks, ends, scale):
-    """fp32 attention over each row's visible keys: its picked complete blocks and its partial tail block. On the
-    CPU, as some GPUs run fp32 matmuls at reduced precision; no import of mlx-vlm, which costs seconds."""
+    """fp32 attention over each row's visible keys (picked complete blocks plus partial tail), on the CPU since some
+    GPUs run fp32 matmuls at reduced precision; no mlx-vlm import, which costs seconds."""
     with mx.stream(mx.cpu):
         _, H, L, _ = queries.shape
         kL, nb = keys.shape[2], (keys.shape[2] + 3) // 4
@@ -883,8 +874,7 @@ def _probe_cases():
 def _assert_rounding_close(got, want, case):
     error = mx.abs(got.astype(mx.float32) - want.astype(mx.float32)).max().item()
     assert error <= 0.02 * mx.abs(want.astype(mx.float32)).max().item(), (case, error)
-    # Only rounding differs (fp32 summation order; the tensor units also round P's last bits), so nearly
-    # every bf16 output matches.
+    # Only rounding differs (fp32 summation order; the tensor units also round P's last bits), so nearly every bf16 output matches.
     assert mx.mean(got == want).item() >= 0.99, case
 
 

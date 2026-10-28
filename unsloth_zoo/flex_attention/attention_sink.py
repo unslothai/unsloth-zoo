@@ -66,9 +66,8 @@ pass
 def generate_sliding_window_with_sink(window_size: int):
     def sliding_window(batch, head, q_idx, kv_idx):
         causal_mask = (q_idx + 1) >= kv_idx
-        # Official PyTorch attends to 1 extra token
-        # windowed_mask = q_idx - kv_idx <= window_size
-        # HuggingFace and official GPT OSS attends to only 128 tokens not (128+1)
+        # Official PyTorch attends 1 extra token (windowed_mask q_idx - kv_idx <= window_size); HuggingFace and official
+        # GPT OSS attend only 128 tokens, not 128+1.
         windowed_mask = (q_idx + 1) - kv_idx < window_size
         sink_first_column = kv_idx == 0
         return (causal_mask & windowed_mask) | sink_first_column
@@ -99,11 +98,8 @@ def old_flex_attention_with_sink(
     sliding_window = None,
     compile = True,
 ):
-    """
-    One sink token attended to for full/sliding window attention (cf. Efficient
-    Streaming Language Models with Attention Sinks). Primarily for GPT-OSS 2025.
-    [WARNING] Training only; inference fails since KV cache absolute positioning breaks.
-    """
+    """One sink token for full/sliding window attention (cf. Efficient Streaming Language Models with Attention Sinks),
+    primarily GPT-OSS; training only, since inference breaks KV cache absolute positioning."""
     if not self_attn.training:
         raise NotImplementedError("Unsloth: This version of flex attention only works for training")
     assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"
@@ -166,11 +162,8 @@ def flex_attention_with_sink(
     compile = True,
     has_static_cache = True,
 ):
-    """
-    One sink token attended to for full/sliding window attention (cf. Efficient
-    Streaming Language Models with Attention Sinks). Primarily for GPT-OSS 2025.
-    [WARNING] higher error than old_flex_attention_with_sink, but works for inference.
-    """
+    """One sink token for full/sliding window attention (cf. Efficient Streaming Language Models with Attention Sinks),
+    primarily GPT-OSS; higher error than old_flex_attention_with_sink but works for inference."""
     assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"
     sink_weights = self_attn.sinks
     enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
@@ -198,8 +191,7 @@ def flex_attention_with_sink(
                 # We must account for left padding
                 padding_start_idx = attention_mask.argmax(1).to(query.device)
                 do_padding = torch.arange(max(qlen_Q, qlen_KV), device = query.device).repeat((bsz, 1)) < padding_start_idx.unsqueeze(0).T
-                # Padded tokens: Q=1, K=-inf so Q*K=-inf (exp=0). Q=K=0 would
-                # give Q*K=0 with exp(0)=1, which is wrong.
+                # Padded tokens: Q=1 and K=-inf so Q*K=-inf gives exp=0; Q=K=0 would give Q*K=0 and exp(0)=1, which is wrong.
                 query.transpose(2, 1)[do_padding[:, :qlen_Q ]] = 1
                 key  .transpose(2, 1)[do_padding[:, :qlen_KV]] = -torch.inf
                 value.transpose(2, 1)[do_padding[:, :qlen_KV]] = 0
@@ -222,9 +214,8 @@ def flex_attention_with_sink(
             generate_sliding_window_mask(sliding_window) \
             if type(sliding_window) is int and sliding_window != 0 else \
             causal_mask
-        # Stateless mask_mod, so reuse one block mask across layers and checkpoint replays.
-        # causal_mask / sliding_window never read batch_idx or head_idx, so one broadcast
-        # (B = H = None) mask serves every row: built in O(blocks), not O(bsz * heads * blocks).
+        # Stateless mask_mod: causal_mask and sliding_window never read batch_idx or head_idx, so one broadcast (B = H =
+        # None) block mask serves all layers and replays, built in O(blocks), not O(bsz * heads * blocks).
         if block_mask is None:
             block_mask = reused_compiled_create_block_mask(mask_mod, None, None, qlen_Q, qlen_KV, device = key.device)
     if block_mask is None:
@@ -243,15 +234,9 @@ def flex_attention_with_sink(
         **FLEX_LSE_KWARGS, # log(sum(exp(xi)))
     ))
 
-    #### 3 versions to add sink tokens ####
-    #### Version 1: Basic reciprocal denominator removal
-    # softmax_sum = torch.exp(logsumexp)
-    # new_denominator = softmax_sum / (softmax_sum + torch.exp(self_attn.sinks.unsqueeze(1)))
-    # sink_scale = new_denominator
+    # Three sink-token variants: Version 1 (reciprocal denominator removal) is commented out, and Version 3 (sigmoid) below is the one in use.
     
-    ### Version 2: logaddexp does log(exp(x1) + exp(x2))
-    # logsumexp_new = torch.logaddexp(logsumexp, self_attn.sinks.unsqueeze(1))
-    # sink_scale = torch.exp(logsumexp - logsumexp_new)
+    # Version 2 (commented out) uses logaddexp, i.e. log(exp(x1) + exp(x2)), to add the sink to the logsumexp.
 
     ### Version 3: Most simple uses sigmoid and scale
     sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
@@ -264,8 +249,7 @@ def flex_attention_with_sink(
     return attn_output
 pass
 
-# Fails sometimes
-# @torch.compile(dynamic = True, fullgraph = False, mode = "reduce-overhead")
+# Fails sometimes, so the decorator @torch.compile(dynamic = True, fullgraph = False, mode = 'reduce-overhead') is commented out.
 def flex_attention_with_sink_decoding(
     self_attn,
     query,
@@ -304,10 +288,8 @@ def flex_attention_with_sink_inference(self_attn, query, key, value, block_mask,
     # Longer queries can have no valid flex_decoding config (#2100), so they force the main kernel.
     kwargs = {"kernel_options": {} if query.shape[-2] == 1 else PREFILL_KERNEL_OPTIONS}
     if query.shape[-2] == 1:
-        # Inductor only picks flex_decoding for a static batch. Generating at a second batch size
-        # makes Dynamo's batch dim dynamic, and the main kernel then pads every 1-row query to
-        # BLOCK_M (3x slower decode on T4). One recompile per batch size, never per step.
-        # Marked here, eager or traced, since the compiled flex_attention is what specializes.
+        # Inductor picks flex_decoding only for a static batch: a second batch size makes the batch dim dynamic and pads
+        # 1-row queries to BLOCK_M; mark dim 0 static, eager or traced; one recompile per batch size, never per step.
         for x in (query, key, value):
             torch._dynamo.mark_static(x, 0)
     attn_output, logsumexp = flex_output_and_lse(flex_attention(

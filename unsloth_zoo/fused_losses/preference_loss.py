@@ -75,8 +75,7 @@ def _use_fused_linear(weight):
 
 
 def _linear_float32(hidden, weight, bias):
-    # A half-precision head rounds its logits to bf16 / fp16 before the softmax; that rounding
-    # dominates the logp error, so ask the GEMM for float32 output (torch >= 2.8) where it can.
+    # Half-precision head logits round to bf16 / fp16 before softmax and dominate the logp error; request float32 GEMM output (torch >= 2.8) where possible.
     key = (hidden.device.type, weight.dtype)
     # Not on ROCm: half-in / fp32-out GEMM is a slow fallback.
     if torch.version.hip is None and weight.dtype in (torch.float16, torch.bfloat16) and _MM_OUT_DTYPE_OK.get(key, True):
@@ -93,8 +92,7 @@ def _linear_float32(hidden, weight, bias):
 
 
 def _mm_float32(a, b):
-    # Half GEMM with float32 output: per slice / row group partial sums can exceed the fp16 range
-    # before they cancel in the float32 accumulators.
+    # Half GEMM with float32 output: per slice or row group partial sums can exceed the fp16 range before cancelling in the float32 accumulators.
     key = (a.device.type, a.dtype)
     if _MM_OUT_DTYPE_OK.get(key, True):
         try:
@@ -118,11 +116,9 @@ _HALF_DTYPES = (torch.float16, torch.bfloat16)
 
 @torch.no_grad()
 def _sliced_backward(ctx, hidden, weight, bias, labels, lse, logps, grad_logps):
-    # A trainable half precision head: a float32 vocab x hidden accumulator plus per chunk GEMM and
-    # cast copies cost about 10 x vocab x hidden bytes, and summing chunks in the head dtype loses
-    # bits every chunk. Loop over vocab slices instead, each summed over every row chunk in a float32
-    # accumulator of about one chunk's size: the head gradient costs what autograd's own does, with
-    # the float32 accumulation of the per chunk loop.
+    # Trainable half head: float32 vocab x hidden accumulator plus per-chunk GEMM/cast copies cost ~10 x vocab x hidden
+    # bytes, and head-dtype chunk sums lose bits; loop over vocab slices, each summed over row chunks in a float32
+    # accumulator of about one chunk size, costing the same as autograd.
     need_hidden, need_weight, need_bias = ctx.needs_input_grad[:3]
     scale_multiply, scale_divide, softcapping = ctx.transforms
     scale = 1.0
@@ -200,9 +196,9 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
         # A trainable half precision head runs the vocab sliced backward, which needs each row's lse.
         sliced = ctx.needs_input_grad[1] and weight.dtype in _HALF_DTYPES
         if sliced and ctx.needs_input_grad[0]:
-            # Sliced backward holds a float32 rows x hidden gradient plus its cast (6 N H bytes for a
-            # half hidden) and a head dtype head gradient (2 V H); the per chunk loop holds float32
-            # head sized copies (10 V H) and a hidden dtype gradient. Long contexts favour the latter.
+            # Sliced backward holds a float32 rows x hidden gradient plus its cast (6 N H bytes for half hidden) and a
+            # head-dtype grad (2 V H); the per-chunk loop holds float32 head-sized copies (10 V H) and a hidden-dtype
+            # grad, favoured for long contexts.
             vocab_size = weight.shape[0]
             hidden_bytes = hidden.element_size()
             cast_bytes = hidden_bytes if hidden.dtype != torch.float32 else 0
@@ -314,9 +310,8 @@ class _BackwardContext:
 
 def _compact_forward(hidden, weight, bias, labels, mask, chunk_size, transforms,
                      want_mean, want_lssp, sliced_ok, need_hidden):
-    # Eager body of the custom op: the boolean compaction has a data dependent row count, so it
-    # and the Python chunk loop stay behind the op boundary, and every output is sized by
-    # hidden's row count, which torch.compile can treat as an ordinary (dynamic) shape.
+    # Eager body of the custom op: boolean compaction has a data-dependent row count, so it and the Python chunk loop
+    # stay behind the op; outputs are sized by hidden's row count (dynamic shape).
     n_all = hidden.shape[0]
     dtype = torch.promote_types(weight.dtype, torch.float32)
     selected_hidden = hidden[mask]
@@ -325,9 +320,9 @@ def _compact_forward(hidden, weight, bias, labels, mask, chunk_size, transforms,
     rows = _rows_per_chunk(n_rows, weight.shape[0], None if chunk_size <= 0 else chunk_size)
     sliced = sliced_ok
     if sliced and need_hidden:
-        # Sliced backward holds a float32 rows x hidden gradient plus its cast (6 N H bytes for a
-        # half hidden) and a head dtype head gradient (2 V H); the per chunk loop holds float32
-        # head sized copies (10 V H) and a hidden dtype gradient. Long contexts favour the latter.
+        # Sliced backward holds a float32 rows x hidden gradient plus its cast (6 N H bytes for half hidden) and a
+        # head-dtype grad (2 V H); the per-chunk loop holds float32 head-sized copies (10 V H) and a hidden-dtype grad,
+        # favoured for long contexts.
         vocab_size = weight.shape[0]
         hidden_bytes = hidden.element_size()
         cast_bytes = hidden_bytes if hidden.dtype != torch.float32 else 0
@@ -361,8 +356,8 @@ def _compact_forward(hidden, weight, bias, labels, mask, chunk_size, transforms,
     if sliced:
         saved_lse = expand(saved_lse)
     elif sliced_ok:
-        # The selected count switched to the per chunk backward, which never reads the lse, but
-        # the fake kernel can only see sliced_ok, so the metadata keeps its n_all length.
+        # The selected count switched to the per-chunk backward, which never reads lse; the fake kernel only sees
+        # sliced_ok, so the metadata keeps its n_all length.
         saved_lse = torch.zeros(n_all, dtype = dtype, device = device)
     return (
         expand(logps),
@@ -399,8 +394,8 @@ def _compact_backward(grad_logps, hidden, weight, bias, labels, mask, logps, sav
     return grad_hidden, grad_weight, grad_bias
 
 
-# Versioned: a saved compile cache keys a custom op by name, so a schema change under the old name replays the
-# old calling convention after an upgrade (the backward gained `logps`). Bump on every schema change.
+# Versioned name: a saved compile cache keys custom ops by name, so a schema change under the old name replays the old
+# calling convention (the backward gained `logps`); bump on every schema change.
 _OP_NAMESPACE = "unsloth_zoo_fused_preference_v2"
 _HAS_CUSTOM_OP = hasattr(torch, "library") and hasattr(torch.library, "custom_op") \
     and hasattr(torch.library, "register_fake")
@@ -423,8 +418,7 @@ if _HAS_CUSTOM_OP:
                           scale_divide, softcapping, want_mean, want_lssp, sliced_ok, need_hidden):
         n_all = hidden.shape[0]
         dtype = torch.promote_types(weight.dtype, torch.float32)
-        # Whether the sliced backward runs is decided from the selected count, so its lse is
-        # sized for every row whenever it might be needed.
+        # Whether the sliced backward runs is decided from the selected count, so its lse is sized for every row whenever it might be needed.
         return (
             hidden.new_empty(n_all, dtype = dtype),
             hidden.new_empty(n_all if want_mean else 0, dtype = dtype),

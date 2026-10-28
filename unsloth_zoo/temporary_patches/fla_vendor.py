@@ -60,8 +60,7 @@ _HUB_REPAIR_MODELING = _REPAIR_MODELING + _KDA_MODELING
 # olmo_hybrid is not covered: it has not been validated on the vendored tree.
 _VENDOR_COVERED_MODELS = frozenset(_HUB_REPAIR_MODELING)
 
-# All gated-delta consumers; olmo_hybrid can bind an installed fla's #640 kernel.
-# Kimi Linear absent: remote code on KDA ops, never reaches chunk_bwd_dqkwg.
+# olmo_hybrid can bind installed fla's issue 640 kernel; Kimi Linear never reaches chunk_bwd_dqkwg.
 _GATED_DELTA_MODELING = _REPAIR_MODELING + ("olmo_hybrid",)
 
 _UNCOVERED_GATED_DELTA = tuple(
@@ -113,8 +112,8 @@ def _version_strictly_after(value, threshold):
 
 
 def _hopper_dqkwg_suspect(torch_mod, triton_mod):
-    """Any visible GPU is Hopper with triton in [3.4.0, 3.7.1) (fla #640 miscompile).
-    Probes every device: a mixed host may run the model on a nonzero Hopper card."""
+    """Any visible GPU is Hopper with triton in [3.4.0, 3.7.1) (fla issue 640 miscompile); probes every device, since a
+    mixed host may run the model on a nonzero Hopper card."""
     try:
         from packaging import version
         v = version.parse(str(triton_mod.__version__).split("+")[0])
@@ -300,8 +299,7 @@ _FLA_DISABLED_REASON = None
 
 
 def fla_unavailable_reason():
-    """A user-facing explanation of why Unsloth disabled fla's gated-delta kernels,
-    or ``None`` when they were not disabled. Read by unsloth's model loader."""
+    """User-facing reason Unsloth disabled fla's gated-delta kernels, or None if they were not disabled; read by unsloth's model loader."""
     return _FLA_DISABLED_REASON
 
 
@@ -346,8 +344,7 @@ def _should_defer_to_installed_fla():
 
 
 def _neutralize_tilelang_backend_probe():
-    """Force the pruned TileLang backend unavailable; a broken tilelang can raise a
-    non-ImportError in its probe. Call while ``tilelang`` is shadowed."""
+    """Forces the pruned TileLang backend unavailable, since a broken tilelang can raise a non-ImportError in its probe; call while tilelang is shadowed."""
     try:
         from fla.ops.common.backends.tilelang import TileLangBackend
         TileLangBackend.is_available = classmethod(lambda cls: False)
@@ -376,8 +373,8 @@ def _neutralize_intracard_backend_probe():
 
 
 def _withhold_kda_on_rocm():
-    """ROCm: Triton's AMD pipeline pass fails compiling the KDA kernels (gfx1151, triton 3.6), so
-    fla.ops.kda stays unimportable and the kernel-hub wrappers keep the torch fallback."""
+    """ROCm: Triton's AMD pipeline fails compiling KDA kernels (gfx1151, triton 3.6), so fla.ops.kda stays unimportable
+    and kernel-hub wrappers keep the torch fallback."""
     try:
         import torch
         if getattr(torch.version, "hip", None) is None:
@@ -389,8 +386,7 @@ def _withhold_kda_on_rocm():
 
 
 def _blackwell_import_device(torch_mod):
-    """Blackwell device to make current during import, else None: fla.utils freezes
-    IS_NVIDIA_BLACKWELL from the current device at import."""
+    """Device to make current during import, or None; fla.utils freezes IS_NVIDIA_BLACKWELL from it."""
     try:
         if not torch_mod.cuda.is_available():
             return None
@@ -406,8 +402,7 @@ def _blackwell_import_device(torch_mod):
 
 
 def _inject_vendored_fla():
-    """Register the vendored tree as ``fla``. Returns ``(injected, replaced_real)``;
-    ``replaced_real`` means a real fla was purged."""
+    """Register vendored tree as fla; returns (injected, replaced_real), latter if real fla was purged."""
     vendored_dir = _vendored_fla_dir()
     init_path = os.path.join(vendored_dir, "__init__.py")
     if not os.path.isfile(init_path):
@@ -538,8 +533,7 @@ def _patch_is_available(probe=None):
 
 
 def _repair_already_imported_modeling(force_rebind=False):
-    """Rebind fla globals on modeling modules imported before injection.
-    ``force_rebind`` also replaces non-None globals pointing at a purged real fla."""
+    """Rebind fla globals in pre-imported modeling modules; force_rebind also replaces purged-fla ones."""
     fused_rms = chunk_fn = fused_recurrent_fn = None
     loaded = False
     for pkg in _REPAIR_MODELING:
@@ -604,8 +598,7 @@ def _disable_already_imported_gated_delta(packages=_GATED_DELTA_MODELING, why="U
 
 _INSTALLED_FLA_PATCH_MARK = "_unsloth_hopper_dqkwg_patched"
 
-# threading.local, not a saved/restored global: autograd runs one backward thread per
-# device and drops the GIL, so a global save/restore interleaves across GPUs.
+# threading.local: autograd runs one backward thread per GPU, so a global save/restore interleaves.
 _installed_fla_tls = threading.local()
 
 
@@ -614,12 +607,7 @@ def _installed_fla_forcing_small_tile():
 
 
 def _patch_installed_fla_dqkwg():
-    """Apply the #640 BK=64 workaround to a user-installed fla in place.
-
-    Sets ``IS_NVIDIA_HOPPER`` False permanently (only the guard reads it) and shims
-    ``check_shared_mem`` to answer False under the thread-local override, giving BK=32.
-    Returns True if patched (idempotent); False leaves fla untouched.
-    """
+    """Apply the fla issue 640 BK=64 workaround (gives BK=32) in place; True if patched, idempotent."""
     try:
         import triton
         import fla.ops.common.chunk_o as chunk_o
@@ -743,8 +731,7 @@ def _mark_fla_disabled_hopper():
 
 
 def _transformers_uses_availability_probe():
-    """Whether transformers still selects kernels via the availability probe (pre-#47630).
-    Must run before ``_patch_is_available``, which creates that attribute."""
+    """Pre-47630 transformers still uses the availability probe; must run before _patch_is_available."""
     try:
         from transformers.integrations import hub_kernels
     except Exception:
@@ -770,8 +757,7 @@ def _warn_hopper_optout_degraded():
     )
 
 
-# transformers#47630 asks fla for recurrent_gated_delta_rule, which fla never exported
-# (it is fused_recurrent_...), so decode silently ran the torch fallback.
+# transformers 47630 wants fla's recurrent_gated_delta_rule, unexported; decode silently ran torch.
 _MISSING_GATED_DELTA_ALIASES = {
     "recurrent_gated_delta_rule": "fused_recurrent_gated_delta_rule",
 }
@@ -909,9 +895,7 @@ def _glm5_record_kda_bound(bound):
 
 
 def _install_glm5_kda_safe_gate():
-    """Make Glm5NextTextLinearAttention.__init__ record its bound. The modeling module is imported
-    here (~0.1 s) once transformers' modeling_utils is loaded, so the patch never depends on
-    whether the model class was imported before or after this runs."""
+    """Patch Glm5NextTextLinearAttention.__init__ to record its bound, independent of import order."""
     module = sys.modules.get(_GLM5_NEXT_MODULE)
     if module is None:
         if "transformers.modeling_utils" not in sys.modules:
@@ -1038,8 +1022,7 @@ def _gdn_backend():
 
 
 def _flashqla_version(flash_qla):
-    """Version of the imported flash_qla: the distribution's only if it owns the imported file
-    (a checkout earlier on sys.path can shadow an installed flash-qla)."""
+    """Distribution version only if it owns the imported file; earlier sys.path checkout can shadow it."""
     version = getattr(flash_qla, "__version__", None)
     if version:
         return version
@@ -1093,8 +1076,7 @@ def _load_flashqla():
 
 
 def _flashqla_unsupported(q, k, v, g, beta, initial_state, cu_seqlens, cp_context, extra):
-    """Why FlashQLA cannot serve this call, or None. Mirrors fla's own FlashQLA backend
-    verifier (fla/ops/gated_delta_rule/backends/flash_qla.py)."""
+    """Reason FlashQLA cannot serve this call, or None; mirrors fla's FlashQLA backend verifier."""
     import torch
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         return "not CUDA"
@@ -1382,8 +1364,7 @@ def _patch_vendor_fla(phase=None):
             _patch_is_available(_unavailable_probe)
             _disable_already_imported_gated_delta()
             return
-        # Post-#47630 pure torch is unreachable; fall through so the resolved fla is
-        # patched or vendored, never an unpatched BK=64 install.
+        # Post transformers 47630 torch is unreachable: fla is patched or vendored, never unpatched BK=64.
         _warn_hopper_optout_degraded()
         optout_degraded = True
 

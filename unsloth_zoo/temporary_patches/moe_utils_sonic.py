@@ -236,8 +236,7 @@ def _env_flag(name, default):
     return os.environ.get(name, default) == "1"
 
 
-# Calling gemm_tuned.fn with a pinned config skips the 18-arg custom op and autotuner key
-# (~0.18 ms -> ~0.03 ms host per call, bit-identical; scripts/sonic_host_profile.py).
+# Calling gemm_tuned.fn with a pinned config skips the 18-arg custom op and autotuner key; bit-identical to the normal call (see scripts/sonic_host_profile.py).
 
 _GEMM_INTERFACE = None
 _CONFIG_CACHE = {}
@@ -444,9 +443,8 @@ def _interleave_columns(tensor):
     return torch.stack((gate, up), dim=-1).reshape(*tensor.shape[:-1], two_i)
 
 
-# concat_layout=("B",) interleaves B's NON-stride-1 dim with no copy, so gate_up must be the
-# K-major view W.transpose(-2, -1) (else the contraction dim is interleaved). preact comes back
-# interleaved: against a chunked reference that reads as rel err sqrt(2), not a bug.
+# concat_layout=("B",) interleaves B's non-stride-1 dim with no copy, so gate_up must be the K-major view
+# W.transpose(-2, -1); preact comes back interleaved, which reads as rel err sqrt(2) but is not a bug.
 
 _CONCAT_SUPPORTED = None
 

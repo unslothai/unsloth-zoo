@@ -60,13 +60,7 @@ def get_max_flat_qlen(
     target_gb = 0.5,
     padded_length = 64,
 ):
-    # flat_qlen = bsz*qlen
-    # flat_qlen = torch.arange(0, 512*1024, 1024)
-    # forward_memory_usage  = 3*flat_qlen*mlp_size + flat_qlen*hd
-    # backward_memory_usage = forward_memory_usage + 3*hd*mlp_size
-    # saved_tensors = 10*flat_qlen*hd # 2 norms, 2 residual, 4 QKVO, 2 attention
-    # total_memory_usage = saved_tensors + backward_memory_usage
-    # total_memory_usage = total_memory_usage * nbytes / 1024 / 1024 / 1024
+    # Saved tensors are 10*hd per token (2 norms, 2 residual, 4 QKVO, 2 attention); MLP terms added.
     numerator = target_gb * 1024 * 1024 * 1024 / nbytes - (3*hd*mlp_size)
     denominator = (10*hd + 3*mlp_size + hd)
     max_flat_qlen = math.ceil(numerator / denominator)
@@ -76,11 +70,8 @@ pass
 
 
 def _default_target_gb(device = None):
-    # Size the tile memory budget from the free memory actually available on the
-    # current backend, so a device with little memory left does not pick chunks
-    # that immediately OOM. Mirror the CUDA path: query free memory and keep half.
-    # None means the current device, never index 0: under torchrun asking GPU 0
-    # reads the wrong card and opens a CUDA context on a GPU the rank never uses.
+    # Budget from free memory on the current device, keeping half; None means the current device, never GPU 0, because
+    # under torchrun GPU 0 is the wrong card and opens a CUDA context
     index = None
     if device is not None:
         if not isinstance(device, torch.device):
@@ -93,9 +84,8 @@ def _default_target_gb(device = None):
         free = torch.cuda.mem_get_info(index)[0]
         return free / 1024 / 1024 / 1024 * 0.5
     if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-        # Present from torch 2.6, but raises on some Intel GPUs (e.g. Arc B580,
-        # Lunar Lake). When the accelerator cannot report free memory, use a small
-        # bounded default: host RAM would overshoot VRAM and still OOM the tiler.
+        # torch.xpu.mem_get_info is present from torch 2.6 but raises on some Intel GPUs (e.g. Arc B580, Lunar Lake);
+        # then use a small bounded default, since host RAM would overshoot VRAM
         try:
             free = torch.xpu.mem_get_info(index)[0]
             return free / 1024 / 1024 / 1024 * 0.5
@@ -149,7 +139,6 @@ class TiledMLP(torch.autograd.Function):
         # evenly divisible with sequence length. Then the last shard will have the remainder.
         ctx.shard_dim = -2
         B, S, H = x.shape
-        # ctx.num_shards = int(max(1, min(S, math.ceil(S / max(1, H)))))
         ctx.num_shards = num_shards
         if max_flat_qlen:
             qlen_chunk_size = min(max_flat_qlen, B*S)
@@ -182,8 +171,7 @@ class TiledMLP(torch.autograd.Function):
                 ctx.had_device_in_fwd = True
                 ctx.fwd_devices, ctx.fwd_device_states = get_device_states(x)
 
-        # with device?
-        # preserve rng_state should be false if not dropout in mlp
+        # preserve_rng_state should be False without MLP dropout; the with-device question is open.
         start_idx = 0
         final_output = None
         extra_outputs = []
@@ -268,12 +256,11 @@ def _mxfp4_instance_forward(mlp_module):
 
 _DROPOUT_TYPES = (getattr(torch.nn.modules.dropout, "_DropoutNd", torch.nn.Dropout),)
 
-# Bumped when a submodule is registered under a tiled MLP (e.g. PEFT adding lora_dropout) to
-# invalidate dropout lists. Only MLP subtrees count: transformers slices `self.layers[:n]` every
-# forward, which re-registers every layer and would otherwise force a rescan per layer per token.
+# Bumped when a tiled-MLP submodule is added (PEFT lora_dropout) to invalidate dropout lists; MLP subtrees only, since
+# transformers slices self.layers every forward, re-registering every layer and forcing a rescan per layer per token
 _MODULE_TREE_VERSION = [0]
-# id -> module, weak: a freed module's id reused by a sliced ModuleList must not match, and
-# keying on id avoids hashing arbitrary modules inside a process-wide hook.
+# Weak id->module map: a freed module's id reused by a sliced ModuleList must not match; keyed by id so arbitrary
+# modules are not hashed inside a process-wide hook
 _TRACKED_MODULES = weakref.WeakValueDictionary()
 
 def _bump_module_tree_version(module, name, submodule):
@@ -297,11 +284,9 @@ except Exception:
 pass
 
 def _mlp_needs_rng_state(mlp_module):
-    # Per forward, not at patch time: unsloth patches before get_peft_model adds lora_dropout,
-    # so a patch time scan missed it and the recompute drew different masks (wrong grads).
+    # Check per forward: get_peft_model adds lora_dropout after patching, so a patch-time scan misses it.
     if _is_compiling():
-        # Traced: scan directly. Refreshing the cache would create weakrefs (unsupported under
-        # fullgraph=True) and guard every graph on the process-wide tree version.
+        # Scan directly when tracing: weakrefs are unsupported under fullgraph=True and guard every graph.
         return any(
             m.training and m.p > 0 for m in mlp_module.modules() if isinstance(m, _DROPOUT_TYPES)
         )
@@ -358,7 +343,6 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
         n_shards, remainder = divmod(flat_qlen, max_flat_qlen)
         n_shards = max(1, n_shards)
 
-        # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
         preserve_rng_state = _mlp_needs_rng_state(self)
         return TiledMLP.apply(inner_forward, self, x, preserve_rng_state, n_shards, max_flat_qlen)
@@ -371,7 +355,6 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
         n_shards = max(1, n_shards)
         # remainder gets added to the last shard in the forward pass
 
-        # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
         preserve_rng_state = _mlp_needs_rng_state(self)
         return TiledMLP.apply(inner_forward, self, x, preserve_rng_state, n_shards, chunk_size)

@@ -37,8 +37,7 @@ __all__ = [
     "patch_medias_processor",
 ]
 
-# Canonical media placeholder tokens live in vlm_tokens so the CUDA and MLX paths
-# share one source of truth. Re-exported here for backwards compatibility.
+# Canonical media placeholder tokens live in vlm_tokens (shared by the CUDA and MLX paths); re-exported here for backwards compatibility.
 from .vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS
 
 import torch
@@ -60,8 +59,7 @@ import requests
 from packaging import version
 from typing import Union, Tuple, List, Dict, Sequence
 from itertools import takewhile
-# torchvision is optional (only the video reader path needs it); guard the
-# import so a CPU-only zoo install without it can still import this module.
+# torchvision is optional (only the video reader needs it); guard the import so a CPU-only install can still import this module.
 try:
     import torchvision
     from torchvision import io, transforms
@@ -122,16 +120,14 @@ def resolve_file_uri_to_path(path):
     return url2pathname(path_part) or path
 
 
-# Dataset rows carry arbitrary http(s) URLs and the collators fetch them server
-# side, so without a destination check a row can reach 127.0.0.1, the LAN or the
-# metadata endpoint. Public URLs and local files are unaffected; serving media
-# from a private host needs UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1.
+# Dataset rows carry arbitrary http(s) URLs fetched server-side, so without a destination check they can reach
+# 127.0.0.1, the LAN or the metadata endpoint; public URLs and local files are unaffected; serving media from a private
+# host needs UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1
 UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH"
 UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR   = "UNSLOTH_MAX_MEDIA_DOWNLOAD_MB"
 _MAX_MEDIA_REDIRECTS = 5
 
-# Spelled out, not left to ipaddress alone: is_private is documented False for
-# the RFC 6598 range 100.64.0.0/10, and only a list answers the same everywhere.
+# Spelled out, not left to ipaddress: is_private is documented False for the RFC 6598 range 100.64.0.0/10; only a list answers the same everywhere.
 _BLOCKED_CIDRS = (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
     "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
@@ -196,8 +192,7 @@ def _resolve_host(host: str):
     import socket
 
     try:
-        # SOCK_STREAM or glibc answers once per socket type, and the connection
-        # would then dial each address three times over.
+        # Restrict to SOCK_STREAM: glibc answers once per socket type, so without it each address is dialled three times.
         infos = socket.getaddrinfo(host, None, type = socket.SOCK_STREAM)
     except Exception:
         return None
@@ -250,16 +245,14 @@ def _host_forms(host: str) -> tuple:
     a pin recorded under the unicode spelling alone would never match and the
     fetch would quietly resolve the name for itself again.
     """
-    # urllib3 1.x hands the connection an IPv6 literal still in its brackets
-    # while 2.x strips them, and a pin has to match either spelling.
+    # urllib3 1.x hands the connection IPv6 literals still in brackets while 2.x strips them, so a pin must match either spelling.
     host = _normalize_host(host)
     wire = _wire_host(host)
     return (host,) if wire == host else (host, wire)
 
 
 def _normalize_host(host: str) -> str:
-    # urllib3 1.x hands the connection an IPv6 literal still in its brackets
-    # while 2.x strips them, and a pin has to match either spelling.
+    # Brackets are stripped because urllib3 1.x passes IPv6 literals still bracketed while 2.x strips them; a pin must match either spelling.
     return host.rstrip(".").strip("[]").lower()
 
 
@@ -303,8 +296,7 @@ def _wire_host(host: str) -> str:
         import idna
         return idna.encode(host, uts46 = True).decode("ascii").lower()
     except Exception:
-        # Without the idna package requests falls back to the builtin encoding,
-        # so matching it here keeps the pin on whatever it will send.
+        # Without the idna package requests falls back to the builtin encoding; matching it keeps the pin on the host actually sent.
         try:
             return host.encode("idna").decode("ascii").lower()
         except Exception:
@@ -328,17 +320,13 @@ def _check_fetchable_url(url: str):
             f"Unsloth: Refusing to fetch media over the `{parsed.scheme}` scheme. "
             f"Only http and https URLs are fetched; use a local path for local files."
         )
-    # Parser differential: urlparse reads `http://127.0.0.1\@example.com/` as
-    # userinfo plus host example.com, the client makes the backslash a path
-    # separator and connects to 127.0.0.1. Not legal in an authority anyway.
+    # urlparse and the HTTP client disagree on the host when a backslash appears (example.com vs 127.0.0.1); it is illegal in an authority anyway.
     if "\\" in parsed.netloc:
         raise ValueError(
             f"Unsloth: Refusing to fetch media from `{url}` since its authority contains "
             f"a backslash, which HTTP clients and URL parsers disagree about."
         )
-    # Same story for an encoded host (`http://%31%32%37.0.0.1/` checks as
-    # unresolvable then fetches 127.0.0.1), but userinfo may legitimately carry
-    # escapes, so screen only the host.
+    # Same mismatch for a percent-encoded host (checks as unresolvable but fetches 127.0.0.1); only the host is screened since userinfo may carry escapes.
     if "%" in parsed.netloc.rpartition("@")[2]:
         raise ValueError(
             f"Unsloth: Refusing to fetch media from `{url}` since its host is "
@@ -347,8 +335,7 @@ def _check_fetchable_url(url: str):
     host = parsed.hostname
     if host is None:
         raise ValueError(f"Unsloth: Refusing to fetch media from a URL with no host: `{url}`")
-    # Resolve exactly once and hand the answer back to the caller: resolving again
-    # for the connection is the whole DNS rebinding hole, see _PinnedConnectionMixin.
+    # Resolve once and pass the answer to the connection; resolving again for the connection is the whole DNS rebinding hole, see _PinnedConnectionMixin.
     blocked_name = _is_blocked_hostname(host)
     # Resolve the spelling that will be dialled, not the one that was typed.
     addresses = None if blocked_name else _resolve_host(_resolvable_host(host))
@@ -358,11 +345,9 @@ def _check_fetchable_url(url: str):
             f"loopback, private, link-local or otherwise internal address. "
             f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to allow it."
         )
-    # A proxy makes the connection go to the proxy, not to these addresses, so
-    # there is nothing of ours to pin on that path.
+    # With a proxy the connection goes to the proxy rather than these addresses, so there is nothing of ours to pin on that path.
     if _proxy_applies(url):
-        # Behind a proxy an unresolvable name is not harmless: the proxy resolves
-        # it instead of us, so nothing was ever checked.
+        # Behind a proxy an unresolvable name is not harmless: the proxy resolves it instead, so nothing was ever checked.
         if not addresses:
             raise ValueError(
                 f"Unsloth: Refusing to fetch media from `{host}` since this machine cannot "
@@ -370,20 +355,12 @@ def _check_fetchable_url(url: str):
                 f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 if the proxy is trusted."
             )
         return _UNPINNED
-    # An empty set pins the host to nothing: a name that did not resolve for the
-    # check must not be resolved again for the connection, since the second
-    # answer is the attacker's chance to return an internal address.
+    # An empty set pins to nothing: an unresolved name must not be looked up again, as a second answer is the attacker's chance for an internal address.
     return (_host_forms(host), tuple(str(ip) for ip in addresses or ()))
 
 
-# Validating the hostname and then handing the name to the HTTP client resolves
-# DNS twice, and an attacker who serves the authoritative zone for a hostname in
-# a dataset row can answer the two queries differently: a public address for the
-# check, 127.0.0.1 or an RFC1918 address for the connection. The fetch then
-# reaches an address the guard would have rejected. Closed by connecting to the
-# address that was actually checked, and restoring the hostname before the
-# connection is handed back, so the Host header, the SNI extension and
-# certificate verification all still see the hostname.
+# Resolving twice (check, then HTTP client) lets an attacker answer the two lookups differently (public, then private);
+# connect to the checked address but keep the hostname for Host, SNI and certificate checks.
 _PINNED_ADDRESSES = contextvars.ContextVar("unsloth_pinned_addresses", default = None)
 # The address is not ours to choose here: the guard is off, or a proxy picks it.
 _UNPINNED = "unsloth_unpinned"
@@ -428,8 +405,7 @@ class _PinnedConnectionMixin:
         original = self._dns_host
         error = None
         for address in addresses:
-            # Every address here came back from the one checked resolution, so
-            # keep trying them in order the way the resolver path would.
+            # All addresses come from the one checked resolution, so try them in order the way the resolver path would.
             self._dns_host = address
             try:
                 return super()._new_conn()
@@ -461,9 +437,8 @@ def _pinned_adapter_class():
                 "https": _PinnedHTTPSConnectionPool,
             }
 
-    # Prove the pools really are ours rather than trusting that this urllib3
-    # reads pool_classes_by_scheme off the manager: unpinned but working is the
-    # one outcome that must not be possible. Pools are lazy, nothing is dialled.
+    # Prove the pools are ours rather than trusting urllib3 to read pool_classes_by_scheme; unpinned but working must
+    # not be possible; pools are lazy, nothing is dialled.
     probe = _PinnedAddressAdapter()
     try:
         for scheme in ("http", "https"):
@@ -504,12 +479,10 @@ def _stream_guarded_media(url: str, sink, timeout: int = 30) -> int:
     max_bytes = _max_media_download_bytes()
     written = 0
     current = url
-    # One session for the chain: requests used to carry the cookie jar across
-    # hops itself, and signed-cookie CDNs rely on it.
+    # One session for the whole redirect chain: signed-cookie CDNs rely on the cookie jar carrying across hops.
     with _guarded_session() as session:
         for _ in range(_MAX_MEDIA_REDIRECTS + 1):
-            # Each hop is checked and each hop connects to the address that check
-            # resolved, so a redirect cannot be rebound either.
+            # Each redirect hop is checked and connects to the address that check resolved, so a redirect cannot be rebound either.
             token = _PINNED_ADDRESSES.set(_check_fetchable_url(current))
             try:
                 response = session.get(current, stream = True, timeout = timeout, allow_redirects = False)
@@ -736,9 +709,7 @@ def _read_video_pyav(video_path: str, start: float = 0.0, end: Union[float, None
         rate = stream.average_rate or stream.guessed_rate
         video_fps = float(rate) if rate else 0.0
         if start and stream.time_base:
-            # Jump to the keyframe at or before `start`, as torchvision does, rather than
-            # decoding and discarding everything ahead of a late segment. The filter below
-            # still drops the frames between that keyframe and `start`.
+            # Seek to the keyframe at or before `start` as torchvision does, instead of decoding ahead; the filter still drops frames between it and `start`.
             try:
                 container.seek(int(start / stream.time_base), stream=stream, backward=True)
             except av.error.FFmpegError:
@@ -779,8 +750,7 @@ def _read_video_torchvision(
             output_format="TCHW",
         )
     except TypeError as exc:
-        # torchvision's read_video passes av.open(..., metadata_errors="ignore"), which PyAV 19
-        # removed, so every read fails before decoding. Decode the same range with PyAV directly.
+        # torchvision's read_video passes metadata_errors to av.open, which PyAV 19 removed, so every read fails; decode the range with PyAV directly.
         if "metadata_errors" not in str(exc):
             raise
         video, info = _read_video_pyav(
@@ -924,7 +894,6 @@ def _read_video_torchcodec(
     video = decoder.get_frames_at(indices=idx).data
     # Ensure channel-first layout (T, C, H, W). torchcodec returns NHWC.
     if hasattr(video, "ndim") and video.ndim == 4:
-        # If second dim looks like height and last dim like channels, permute to TCHW
         if video.shape[-1] in (1, 3, 4) and video.shape[1] not in (1, 3, 4):
             video = video.permute(0, 3, 1, 2).contiguous()
     if UNSLOTH_ENABLE_LOGGING:
@@ -998,9 +967,7 @@ def _is_network_share(path: str) -> bool:
     return p.startswith("//") and p[2:].split("/", 1)[0].lower() not in _LOCAL_SHARE_HOSTS
 
 
-# A real video container never starts like this (nor with whitespace or a BOM, which a padded
-# text document would); a playlist would make ffmpeg open its entries itself (file:// segments
-# included), outside every check here.
+# No real container starts with these heads, nor whitespace or a BOM; a playlist would make ffmpeg open its entries (file:// included) outside every check.
 _PLAYLIST_HEADS = (b"#EXTM3U", b"<", b"ffconcat", b"\xef\xbb\xbf", b" ", b"\t", b"\r", b"\n")
 
 
@@ -1033,8 +1000,7 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
     if isinstance(ele["video"], str):
         # Pick the decoder first: if none is installed, a temp file would strand.
         video_reader_backend = get_video_reader_backend()
-        # The decoders fetch remote URLs themselves and follow redirects with no
-        # way to refuse, so download through the guard and decode a local file.
+        # The decoders fetch remote URLs and follow redirects with no way to refuse, so download through the guard and decode a local file.
         downloaded = None
         source = ele["video"]
         scheme = _ffmpeg_protocol(source)
@@ -1190,8 +1156,7 @@ def video_processor_kwargs(processor, videos, fps):
             n = int(video.shape[0]) if hasattr(video, "shape") else len(video)
             indices = list(range(n))
             if cap and n != cap:
-                # Every clip gets exactly cap frames (short ones repeat frames), as the
-                # processor stacks them into one tensor.
+                # Every clip gets exactly cap frames (short ones repeat frames) because the processor stacks clips into one tensor.
                 indices = torch.linspace(0, n - 1, cap).round().long().tolist()
                 video = video[indices] if hasattr(video, "shape") else [video[j] for j in indices]
             rate = float(fps[i])
@@ -1242,9 +1207,8 @@ def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
 
 
 def _fix_audio_feature_extractor_padding_side(processor):
-    # The loader's padding_side="left" (a text setting) leaks into the audio
-    # feature extractor via from_pretrained. Frame-validity masks assume right
-    # padding; left padding desyncs Gemma 4 audio token counts (crash on tf < 5.10).
+    # The loader's padding_side="left" leaks into the audio feature extractor via from_pretrained; frame-validity masks
+    # assume right padding, and left padding desyncs Gemma 4 audio token counts (crash on transformers < 5.10).
     for sub in _audio_sub_processors(processor):
         if getattr(sub, "padding_side", None) == "left":
             sub.padding_side = "right"
@@ -1268,9 +1232,8 @@ def _audio_call_kwarg(processor):
 
 @lru_cache(maxsize=1)
 def _audio_decoder_types():
-    # torchcodec AudioDecoder type (datasets >= 4 Audio() columns), matched
-    # directly so an unpatched decoder (only __getitem__) is still recognized.
-    # Returns () when datasets < 4 / the dep is unavailable. See #7226.
+    # AudioDecoder type (datasets >= 4 Audio() columns), matched directly so an unpatched decoder is recognized; () if
+    # datasets < 4 or the dependency is missing (issue 7226).
     try:
         from datasets.features._torchcodec import AudioDecoder
     except (ImportError, AttributeError, RuntimeError):
@@ -1279,10 +1242,8 @@ def _audio_decoder_types():
 
 
 def _is_audio_mapping(audio):
-    # True for anything _resolve_audio_dict can read "array"/"sampling_rate" from:
-    # a Mapping, a torchcodec AudioDecoder, or a duck-typed mapping. isinstance(dict)
-    # alone drops decoders into the raw-waveform catch-all (#7226). callable() (not
-    # hasattr) rejects objects with a non-callable get/keys.
+    # Covers Mapping, torchcodec AudioDecoder and duck-typed mappings; isinstance(dict) alone sends decoders to the
+    # raw-waveform path (issue 7226); callable() (not hasattr) rejects non-callable get/keys.
     if isinstance(audio, Mapping):
         return True
     if isinstance(audio, _audio_decoder_types()):
@@ -1295,8 +1256,7 @@ def _is_audio_mapping(audio):
 
 
 def _audio_get(audio, key, default=None):
-    # Mapping-style lookup that falls back to subscripting for an unpatched
-    # AudioDecoder (only __getitem__, no .get).
+    # Mapping-style lookup that falls back to subscripting for an unpatched AudioDecoder, which has __getitem__ but no .get.
     getter = getattr(audio, "get", None)
     if callable(getter):
         return getter(key, default)
@@ -1307,8 +1267,7 @@ def _audio_get(audio, key, default=None):
 
 
 def _resolve_audio_dict(audio, sampling_rate=None):
-    # HuggingFace Audio feature dict -> waveform array, else a path / url string
-    # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
+    # HuggingFace Audio feature dict gives a waveform array, else a path or url string, covering Audio(decode=False) payloads like {"bytes": None, "path": ...}.
     _check_audio_sampling_rate(_audio_get(audio, "sampling_rate"), sampling_rate)
     value = _audio_get(audio, "array")
     if value is None:
@@ -1332,8 +1291,7 @@ def extract_audio_info(
                 for ele in content:
                     if not (isinstance(ele, dict) and ele.get("type") == "audio"):
                         continue
-                    # Qwen2-Audio's template and docs use `audio_url`. `is None`, not `or`:
-                    # truthiness raises on a numpy waveform.
+                    # Qwen2-Audio uses audio_url; the check is `is None`, not `or`, because truthiness raises on a numpy waveform.
                     audio = next((
                         v for v in (ele.get(k) for k in ("audio", "url", "path", "audio_url"))
                         if v is not None and not (isinstance(v, str) and not v)
@@ -1391,8 +1349,7 @@ def get_padding_tokens_ids(tokenizer):
         placeholder_tokens = placeholder_tokens + [tokenizer.audio_token]
 
     padding_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
-    # Tokens absent from this tokenizer map to the unk id; do not mask unk from loss
-    # (mirrors the MLX path in mlx/utils.py). pad_token_id is added separately below.
+    # Tokens missing from this tokenizer map to the unk id, so unk is not masked from loss (mirrors mlx/utils.py); pad_token_id is added separately below.
     unk_id = getattr(tokenizer, "unk_token_id", None)
     if unk_id is not None:
         padding_token_ids = [x for x in padding_token_ids if x != unk_id]
@@ -1824,8 +1781,7 @@ class UnslothVisionDataCollator:
         max_seq_length  = None,
         formatting_func = None,
         resize = "min", # Can be (10, 10) or "min" to resize to fit
-                        # the model's default image_size or "max"
-                        # for no resizing and leave image intact
+                        # resize may also be the model's default image_size, or "max" for no resizing so the image is left intact.
         ignore_index = -100,
         train_on_responses_only = False,
         instruction_part = None,
@@ -1891,8 +1847,7 @@ class UnslothVisionDataCollator:
             else:
                 self.patch_size = IMAGE_FACTOR // 2
 
-        # Configs like InternVL3 store patch_size as (height, width); coerce to
-        # an int since it is used as a scalar size factor (patch_size * 2).
+        # Configs like InternVL3 store patch_size as (height, width); coerce to int, since it is a scalar size factor (patch_size * 2).
         if isinstance(self.patch_size, (tuple, list)):
             if len(self.patch_size) == 0:
                 self.patch_size = IMAGE_FACTOR // 2
@@ -1913,8 +1868,7 @@ class UnslothVisionDataCollator:
         if resize == "min":
             try:
                 image_size = model.config.vision_config.image_size
-                # Configs like InternVL3 store image_size as [height, width];
-                # a tuple makes _resize_images_inplace do a fixed-size resize.
+                # Configs like InternVL3 store image_size as [height, width]; a tuple makes _resize_images_inplace do a fixed-size resize.
                 if isinstance(image_size, (tuple, list)):
                     image_size = tuple(int(x) for x in image_size) if len(image_size) else None
                 self.image_size = image_size
@@ -1974,8 +1928,7 @@ class UnslothVisionDataCollator:
         _adopt_tokenizer_chat_template(processor)
         _patch_string_content_chat_template(processor)
 
-        # Check what type for assistant VLM tokenizer allows!
-        # Good for Mistral V3 and Pixtral I think
+        # Probes what assistant content type the VLM tokenizer allows; noted as fitting Mistral V3 and Pixtral.
         self.assistant_single_content = _probe_assistant_single_content(
             processor, model, "image" if has_images else "audio",
         )
@@ -2028,12 +1981,10 @@ class UnslothVisionDataCollator:
         for example in examples:
             messages = self._select_messages_or_raw(example)
 
-            # Check if data format is correct for VLMs!
             if len(messages) != 0:
                 messages = self._validate_and_normalize_first_message(messages)
 
-                # Also fix the messages if assistant must only be 1 string!
-                # Only affects Mistral V3 I think!
+                # Collapse assistant content to one string when the tokenizer requires it; noted to only affect Mistral V3.
                 if self.assistant_single_content:
                     messages = self._collapse_assistant_content(messages)
                 messages = self._clean_none_keys(messages)
@@ -2060,12 +2011,9 @@ class UnslothVisionDataCollator:
             audio = self._extract_audio_for_example(example, messages)
             audios.extend(audio)
 
-        # Tokenize the texts and process the images
-        # When audio is present, omit max_length/truncation from the top-level processor
-        # call — passing them at top-level causes _merge_kwargs to broadcast them into
-        # audio_kwargs, which makes the audio feature extractor truncate the waveform to
-        # max_length *samples* (e.g. 512 samples = 32ms) instead of leaving it intact.
-        # We truncate input_ids manually after the call instead.
+        # With audio, omit max_length/truncation from the top-level processor call: _merge_kwargs broadcasts them into
+        # audio_kwargs, which truncates the waveform to max_length samples instead of leaving it intact; truncate
+        # input_ids manually after the call.
         proc_kwargs = dict(
             text=texts,
             padding=True,
@@ -2097,8 +2045,7 @@ class UnslothVisionDataCollator:
             if seq_len > self.max_seq_length:
                 batch = self._truncate_sequence_tensors(batch, seq_len)
 
-        # Cannot remove due to bidirectional attention from Gemma 3!
-        # batch.pop("token_type_ids", None)
+        # token_type_ids cannot be removed: Gemma 3 needs it for bidirectional attention.
         if 'pixel_values' in batch:
             batch = self._cast_pixel_values_dtype_inplace(batch)
         if 'pixel_values_videos' in batch:
@@ -2207,8 +2154,8 @@ class UnslothVisionDataCollator:
                 and "videos" not in proc_kwargs and "audio" not in proc_kwargs
             ):
                 return self._call_processor_mixed_rows(proc_kwargs)
-            # Nemotron Omni returns per-image pixel tensors that BatchFeature cannot stack.
-            # transformers 5.x: "Unable to convert output", 4.x: "Unable to create tensor".
+            # Nemotron Omni returns per-image pixel tensors BatchFeature cannot stack; the error reads Unable to convert
+            # output on transformers 5.x, Unable to create tensor on 4.x.
             if not has_images or not any(m in str(e) for m in ("Unable to convert output", "Unable to create tensor")):
                 raise
             proc_kwargs = dict(proc_kwargs, return_tensors = None)
@@ -2222,9 +2169,8 @@ class UnslothVisionDataCollator:
             return batch
 
     def _call_processor_mixed_rows(self, proc_kwargs):
-        # Run image rows and text-only rows as two valid batches, then merge them back in row order.
-        # Text-only rows get Mllama's empty image slot (zeros, first tile of aspect_ratio_mask set)
-        # and an all-zero cross_attention_mask, so the model masks them out.
+        # Image and text-only rows run as two valid batches, merged back in row order; text-only rows get Mllama's empty
+        # image slot (zeros, first aspect_ratio_mask tile set) and an all-zero cross_attention_mask.
         from transformers.feature_extraction_utils import BatchFeature
         texts, images = proc_kwargs["text"], proc_kwargs["images"]
         base = {k: v for k, v in proc_kwargs.items() if k not in ("text", "images")}
@@ -2269,7 +2215,6 @@ class UnslothVisionDataCollator:
         for message in messages:
             if message["role"] == "assistant":
                 if isinstance(content := message["content"], list):
-                    # Only extract text from items that have type "text"
                     text_parts = [item["text"] for item in content if isinstance(item, dict) and item.get("type") == "text"]
                     if text_parts:
                         message["content"] = "".join(text_parts)
@@ -2283,8 +2228,8 @@ class UnslothVisionDataCollator:
         )
 
     def _load_column_images(self, images):
-        # SSRF-guarded decode (Idefics2-style processors fetch URLs unguarded); unresized and EXIF-transposed like datasets' PIL.
-        # None entries (text-only rows of a mixed images column) carry no image.
+        # SSRF-guarded decode since Idefics2-style processors fetch URLs unguarded; unresized and EXIF-transposed like
+        # datasets' PIL; None entries (text-only rows) are dropped.
         return [
             ImageOps.exif_transpose(_decode_image(img)) if isinstance(img, (str, bytes, bytearray, dict)) else img
             for img in images if img is not None
@@ -2327,8 +2272,7 @@ class UnslothVisionDataCollator:
         elif isinstance(audio_val, (list, tuple)):
             if len(audio_val) == 0:
                 clips = []
-            # A flat list of samples is one clip, not a list of clips
-            # (strings are path/url clips, so they stay in the list-of-clips branch)
+            # A flat list of samples is one clip, not a list of clips; strings are path or url clips, so they stay in the list-of-clips branch.
             elif (
                 not _is_audio_mapping(audio_val[0])
                 and not isinstance(audio_val[0], (list, tuple, str))
@@ -2383,8 +2327,7 @@ class UnslothVisionDataCollator:
         return normalized
 
     def _truncate_sequence_tensors(self, batch, seq_len):
-        # Slice only per-token tensors. Matching on shape[-1] == seq_len can clip
-        # input_features [B, frames, mel] or input_features_mask [B, frames].
+        # Slice only per-token tensors; matching on shape[-1] == seq_len can clip input_features [B, frames, mel] or input_features_mask [B, frames].
         new_len = self.max_seq_length
         keys = [
             k for k in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids")
@@ -2394,9 +2337,8 @@ class UnslothVisionDataCollator:
         audio_tokens = list(AUDIO_TOKENS)
         if getattr(tok, "audio_token", None) is not None:
             audio_tokens.append(tok.audio_token)
-        # Audio strings absent from this tokenizer map to the unk id (matching
-        # get_padding_tokens_ids); excluding it keeps a truncated unk text token from being
-        # miscounted as an audio token and tripping the alignment check below.
+        # Audio strings missing from this tokenizer map to unk (as get_padding_tokens_ids does); excluding unk keeps a
+        # truncated unk text token from being miscounted as audio and tripping the alignment check.
         unk_id = getattr(tok, "unk_token_id", None)
         audio_ids = torch.tensor(
             [i for i in tok.convert_tokens_to_ids(audio_tokens)
@@ -2405,8 +2347,7 @@ class UnslothVisionDataCollator:
         )
         n_audio = int(torch.isin(batch["input_ids"], audio_ids).sum())
         if self._tokenizer_padding_side() == "left":
-            # Keep each row's first new_len content tokens and re-pad on the left,
-            # otherwise short rows keep only their left padding.
+            # Keep each row's first new_len content tokens and re-pad on the left; otherwise short rows keep only their left padding.
             lengths = batch["attention_mask"].sum(-1)
             starts = seq_len - torch.clamp(lengths, min=new_len)
             gather_idx = starts.unsqueeze(1) + torch.arange(new_len, device=starts.device)
@@ -2468,7 +2409,6 @@ class UnslothVisionDataCollator:
             if is_tuple:
                 image[i] = img.resize(image_size, LANCZOS)
                 continue
-            # Cache size_func(img) once.
             side = self.size_func(img)
             if side > image_size and hasattr(img, "resize"):
                 w, h = img.size
@@ -2539,7 +2479,6 @@ class UnslothVisionDataCollator:
         B, L = input_ids.shape
         device = input_ids.device
 
-        # Early exit if no padding exists
         if attention_mask.all():
             if extra_tensors:
                 return attention_mask, input_ids, tuple(extra_tensors)
@@ -2693,8 +2632,7 @@ class UnslothVisionDataCollator:
                     self._collapse_assistant_content(c)
                 c = self._clean_none_keys(c)
                 pc_txt = self._render_chat(prompt_messages=p, completion_messages=c, example=ex)
-                # some models append common template items so this removes them.
-                # see trl/data_utils.py
+                # Some models append common template items, so split prompt and completion at their shared prefix; see trl/data_utils.py.
                 p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
                 c_txt = pc_txt[len(p_txt):]
             else:
@@ -2751,8 +2689,7 @@ class UnslothVisionDataCollator:
 
         p_ids, c_ids = proc_prompts["input_ids"], proc_completions["input_ids"]
         p_m, c_m = proc_prompts["attention_mask"], proc_completions["attention_mask"]
-        # Gemma 3n emits token_type_ids, Gemma 4 mm_token_type_ids; route whichever
-        # exists, else dict(proc_prompts) keeps a stale prompt-width copy.
+        # Gemma 3n emits token_type_ids and Gemma 4 mm_token_type_ids; route whichever exists, else dict(proc_prompts) keeps a stale prompt-width copy.
         tt_key = "token_type_ids" if "token_type_ids" in proc_prompts else "mm_token_type_ids"
         p_tt, c_tt = proc_prompts.get(tt_key, None), proc_completions.get(tt_key, None)
 

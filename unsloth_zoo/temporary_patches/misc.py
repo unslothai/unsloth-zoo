@@ -23,9 +23,7 @@ from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import functools
 import contextlib
-# Guarded because tests load this file by path rather than as
-# `unsloth_zoo.temporary_patches.misc`, where a two-level relative import
-# raises "attempted relative import beyond top-level package".
+# Guarded because tests load this file by path, where a two-level relative import fails with 'attempted relative import beyond top-level package'.
 try:
     from unsloth_zoo.log import logger
 except (ImportError, ValueError):
@@ -604,8 +602,7 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
-# Compiled, `_ignore_causal_mask_sdpa` always refuses, so SDPA loses its `is_causal` kernels.
-# Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
+# Compiled, _ignore_causal_mask_sdpa always refuses, losing SDPA is_causal kernels; plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
 CAUSAL_MASK_SKIP_STATS = {"skipped": 0, "right_padded": 0}
 _SKIP_CAUSAL_MASK_ENV = "UNSLOTH_SKIP_CAUSAL_MASK"
 # Right-padded rows also skip the mask: causal attention hides the pad tail, only pad outputs change.
@@ -696,8 +693,8 @@ _FLASH_SDPA_ACCEPTS_CACHE = {}
 
 
 def _flash_sdpa_accepts(device, dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
-    # Ask torch's own dispatcher: flash also rejects by arch, torch version, dropout and grad
-    # (torch 2.6 has no flash past sm90; sm86 / sm89 / sm120 refuse head_dim > 224 training with dropout).
+    # Ask torch's own dispatcher: flash also rejects by arch, torch version, dropout and grad; torch 2.6 has no flash
+    # past sm90, and sm86 / sm89 / sm120 refuse head_dim > 224 training with dropout.
     key = (str(device), dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad)
     accepts = _FLASH_SDPA_ACCEPTS_CACHE.get(key, None)
     if accepts is not None:
@@ -725,8 +722,8 @@ _EFFICIENT_SDPA_ACCEPTS_CACHE = {}
 
 
 def _efficient_sdpa_accepts_mha(device, dtype, num_heads, head_dim, dropout, requires_grad):
-    # Equal head counts need no enable_gqa, so the mem-efficient kernel also runs a maskless causal
-    # call. transformers < 5 still passes enable_gqa = True there, so both forms must be accepted.
+    # Equal head counts need no enable_gqa, so mem-efficient SDPA also runs a maskless causal call; transformers < 5
+    # still passes enable_gqa = True, so both forms must be accepted.
     key = (str(device), dtype, num_heads, head_dim, dropout, requires_grad)
     accepts = _EFFICIENT_SDPA_ACCEPTS_CACHE.get(key, None)
     if accepts is not None:
@@ -746,8 +743,8 @@ def _efficient_sdpa_accepts_mha(device, dtype, num_heads, head_dim, dropout, req
 
 
 def _flash_sdpa_takes_causal(config, embeds):
-    """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; anything
-    else falls to the math kernel and its [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
+    """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; other kernels fall to
+    math with [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
     if embeds.dtype not in (torch.float16, torch.bfloat16) or not embeds.is_cuda:
         return False
     if torch.version.hip is not None or not torch.backends.cuda.flash_sdp_enabled():
@@ -814,11 +811,9 @@ def _module_spans_devices(module):
 
 
 def _calling_model_spans_devices(max_depth = 8):
-    """True when the module whose forward builds this mask has weights on more than one device.
-
-    A device_map split can put later layers on a GPU (or a shape) flash cannot take, where SDPA
-    without a mask falls back to the math kernel. Cached per module; no calling module found = False.
-    """
+    """True when the module whose forward builds this mask spans several devices: a device_map split can put later
+    layers on a GPU or shape flash cannot take, where maskless SDPA falls to math; cached per module, False if no
+    caller is found."""
     frame = sys._getframe(1)
     for _ in range(max_depth):
         frame = frame.f_back
@@ -961,8 +956,7 @@ def _warm_mask_mod_devices(mask_mod, device):
 
 
 def _patch_block_mask_to():
-    # Inductor cannot lower a device copy inside Flex's mask subgraph, so copy
-    # captured masks when accelerate moves the BlockMask to the next device.
+    # Inductor cannot lower a device copy inside Flex's mask subgraph, so captured masks are copied when accelerate moves the BlockMask to the next device.
     try:
         from torch.nn.attention.flex_attention import BlockMask
     except Exception:
@@ -1544,8 +1538,8 @@ pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
-# Kaggle T4, mamba_ssm 2.3.1: Triton 3.2 fails (`map::at`), 3.3 fails (`PassManager::run failed`), 3.4-3.6 train.
-# V100 (sm_70), Triton 3.6: Granite-4.0-H and Falcon-H1 train with matching losses (unsloth-zoo#2090).
+# Kaggle T4 (mamba_ssm 2.3.1): Triton 3.2 fails (map::at) and 3.3 fails (PassManager::run failed), 3.4-3.6 train; V100
+# (sm_70) on Triton 3.6 trains Granite-4.0-H and Falcon-H1 with matching losses (unsloth-zoo 2090).
 _MAMBA_SM75_MIN_TRITON = (3, 4)
 
 
@@ -1587,11 +1581,8 @@ pass
 
 
 def _single_mamba_ssm_autotune_config(extra_packages = ()):
-    """Keep one autotune config per mamba_ssm kernel (and per kernel in `extra_packages`).
-
-    Compiling every config before step 1 takes minutes on a T4. Keeps the config
-    mamba_ssm's deterministic mode picks: least shared memory.
-    """
+    """Keep one autotune config per mamba_ssm kernel (and per kernel in `extra_packages`): compiling all configs takes
+    minutes on a T4; keeps the config mamba_ssm's deterministic mode picks (least shared memory)."""
     import sys
     try:
         from triton.runtime.autotuner import Autotuner
@@ -3219,13 +3210,9 @@ _SFT_SHIELDED_INPUT_TYPES = {}
 
 
 def _sft_shielded_inputs(inputs, contents):
-    """A copy of `contents` that silently drops the liger-only forward kwargs.
-
-    The injection happens inside `compute_loss`, on the mapping the caller
-    handed in, so the mapping is the only interception point available. Built
-    from the caller's own mapping type so a `BatchEncoding` stays one, and
-    cached per type so the class is created once rather than per step.
-    """
+    """Copy of contents without the liger-only forward kwargs, built as the caller's own mapping type (a BatchEncoding
+    stays one) and cached per type; compute_loss injects on the mapping the caller passed in, the only interception
+    point."""
     if not isinstance(inputs, Mapping):
         return contents
     cls = type(inputs)

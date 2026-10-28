@@ -225,12 +225,9 @@ def _pow2(n):
     return 1 << max(int(n) - 1, 0).bit_length()
 
 
-# fp32 gpt-oss down GEMM operands per backend when UNSLOTH_GPTOSS_FP16_DOWN_OPERAND=auto.
-# "fp32" is the loop's exact math (IEEE fp32, fp32 dequant stack); "fp16" rounds x / W / dY to fp16
-# (dY per-row power-of-two scaled) with an fp32 accumulate and output. Colab T4 (cuBLAS), 20B layer
-# fwd + bwd vs the loop: fp16 1.9x / 1.7x at 512 / 2048 tokens, fp32 1.33x / 0.97x (no fp32 tensor
-# cores). Triton: fp16 beats fp32 operands on A100 (1.9x / 2.0x at 512 / 2048 tokens), RTX PRO 6000
-# (1.3x / 1.5x), L4 (1.3x / 1.2x); fp16 runs on the tensor cores, IEEE fp32 on CUDA-core FMA.
+# UNSLOTH_GPTOSS_FP16_DOWN_OPERAND=auto: fp16 rounds x, W and dY to fp16 (dY per-row power-of-two scaled) with fp32
+# accumulate and output on tensor cores; fp32 is the exact loop math on CUDA-core FMA; auto picks fp16 for triton and
+# cublas.
 DOWN_OPERAND_AUTO = {"triton": "fp16", "cublas": "fp16"}
 
 
@@ -238,9 +235,8 @@ def use_cublas(device) -> bool:
     mode = os.environ.get("UNSLOTH_GPTOSS_FP16_GEMM", "auto")
     if mode in ("cublas", "triton"):
         return mode == "cublas"
-    # Measured, gpt-oss-20b MoE layer fwd + bwd (Colab, torch 2.11, Triton 3.6): Triton wins on
-    # A100 (sm80) and RTX PRO 6000 (sm120) and B200 (sm100); on L4 (sm89) cuBLAS ties at 512
-    # tokens and is 1.43x faster at 2048; on T4 (sm75) Triton has no MMA at all.
+    # Measured on a gpt-oss-20b MoE layer fwd + bwd with torch 2.11 and Triton 3.6: Triton wins on sm80, sm100 and
+    # sm120; cuBLAS ties or wins on sm89 (L4); Triton has no MMA on sm75 (T4).
     return device.type == "cuda" and (_capability(device) < (8, 0) or _capability(device) == (8, 9))
 
 
@@ -347,8 +343,8 @@ def _gemm_config(M, E, N, K, device, split):
     return BM, max(16, min(BN, _pow2(N))), max(16, min(BK if BM == 128 else 64, _pow2(K))), 4 if BM < 128 else 8, 3
 
 
-# Best-geomean tiles per rows-per-expert bucket, swept on A100 / L4 / RTX PRO 6000 over common MoE expert shapes.
-# Keys: "big" (N, K > 32), "N" (N <= 32), "K" (K <= 32). Rows: (max rows per expert or None, tile).
+# Best-geomean tiles per rows-per-expert bucket, swept on A100 / L4 / RTX PRO 6000; keys "big" (N, K > 32), "N" (N <=
+# 32), "K" (K <= 32); rows are (max rows per expert or None, tile).
 _GENERIC_GEMM = {
     "sm80": {
         "big": ((16, (32, 256, 64, 8, 3, 0)), (128, (64, 256, 64, 8, 3, 0)), (None, (128, 128, 64, 4, 3, 8))),

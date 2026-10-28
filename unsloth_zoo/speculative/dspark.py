@@ -14,18 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DSpark drafters for Qwen3 targets (DeepSpec `Qwen3DSparkModel` schema).
-
-Contract (unslothai/llama.cpp `src/models/dflash.cpp`, `common/speculative.cpp` draft-dspark,
-`conversion/qwen.py` DSparkModel, sample_from_anchor = true for this schema):
-- context = concat of target decoder-layer outputs `target_layer_ids` (pre final norm), each
-  position p injected as K/V of `hidden_norm(fc(context))` at position p;
-- a block at anchor a holds [x_a, mask, ..., mask] at positions a..a+B-1, attends non-causally to
-  itself and to context positions < a; slot j predicts x[a+j+1];
-- logits = lm_head(norm(h)) + markov_w2(markov_w1(prev)), prev = x_a for slot 0, then the previous
-  slot's token (teacher forced in training, greedy argmax in llama.cpp);
-- confidence = sigmoid(proj([norm(h); markov_w1(prev)])), trained against 1 - TV(target, draft).
-"""
+"""DSpark drafters for Qwen3 targets (DeepSpec schema); context is pre-final-norm target layer outputs; a block at
+anchor a attends non-causally to itself and context positions < a; slot j predicts x[a+j+1]; logits add
+markov_w2(markov_w1(prev)); confidence is trained against 1 - TV."""
 
 __all__ = [
     "Qwen3DSparkDrafter",
@@ -65,8 +56,7 @@ class _Rotary(nn.Module):
             raise NotImplementedError(f"Unsloth: DSpark drafter supports default RoPE, got {rope_type!r}.")
         theta = float(rope.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        # A plain attribute, not a buffer: `.to(bfloat16)` on the drafter must not round the
-        # frequencies (bf16 inv_freq drifts badly at long positions).
+        # A plain attribute, not a buffer: .to(bfloat16) on the drafter must not round the frequencies (bf16 inv_freq drifts badly at long positions).
         self.inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype = torch.int64).float() / dim))
 
     @torch.no_grad()
@@ -147,10 +137,7 @@ class _ConfidenceHead(nn.Module):
 
 
 def sample_anchor_positions(loss_mask, num_anchors, generator = None):
-    """DeepSpec anchor sampler: anchors a with loss_mask[a] and loss_mask[a+1], sorted, padded.
-
-    Returns (anchors [B, N] long, keep [B, N] bool); padded slots point at 0 with keep False.
-    """
+    """Sorted anchors a with loss_mask[a] and loss_mask[a+1]; returns (anchors [B, N] long, keep [B, N] bool); padded slots point at 0 with keep False."""
     B, S = loss_mask.shape
     device = loss_mask.device
     n_cand = max(S - 1, 0)
@@ -324,11 +311,8 @@ class Qwen3DSparkDrafter(nn.Module):
         return out
 
     def forward_train(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None):
-        """Teacher-forced DeepSpec training forward over sampled anchor blocks.
-
-        Returns hidden (normed draft states [B, N, bs, H]), target_ids, prev_ids, eval_mask,
-        label_index (position of each label), keep.
-        """
+        """Teacher-forced DSpark forward over sampled anchor blocks; returns normed hidden [B, N, bs, H], target_ids,
+        prev_ids, eval_mask, label_index (position of each label), keep."""
         B, S = input_ids.shape
         bs = self.block_size
         if anchors is None:
@@ -395,12 +379,8 @@ def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher_hidden, teacher_w, labels)
 
 def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 0.9,
                 confidence_alpha = 1.0, decay_gamma = 4.0, chunk_size = 1024, teacher_lm_head_weight = None):
-    """DeepSpec DSpark loss, chunked over supervised rows with per-chunk recomputation.
-
-    teacher_hidden: target post-norm states [B, S, H]; slot j's teacher is the target's own
-    prediction at label_index - 1, projected with `teacher_lm_head_weight` (the target's lm_head;
-    defaults to the drafter's copy). Returns (loss, stats).
-    """
+    """Chunked DSpark loss over supervised rows; teacher_hidden [B, S, H] is post-norm target states projected by
+    teacher_lm_head_weight (defaults to the drafter's copy); returns (loss, stats)."""
     eval_mask = out["eval_mask"]
     rows = eval_mask.nonzero(as_tuple = True)
     hidden = out["hidden"][rows]
@@ -473,10 +453,7 @@ class DSparkTrainingArguments(TrainingArguments):
 
 
 class UnslothDSparkTrainer(Trainer):
-    """Trains a DSpark drafter (`model`) against a frozen target, one target pass per batch.
-
-    Rows need `input_ids` and optionally `labels` (-100 = not supervised, e.g. the prompt).
-    """
+    """Trains a DSpark drafter against a frozen target, one target pass per batch; rows need input_ids and optional labels (-100 = not supervised, e.g. the prompt)."""
 
     def __init__(self, model = None, args = None, target_model = None, **kwargs):
         if target_model is None:

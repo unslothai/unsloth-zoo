@@ -36,8 +36,7 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 
-# MLX's `is_nax_available`, which Python cannot call: macOS 26.2 and a generation-17 GPU,
-# 18 for the `p` class.
+# Mirrors MLX's `is_nax_available`, which Python cannot call: needs macOS 26.2 and GPU generation 17, or 18 for the `p` class.
 _MIN_MACOS = (26, 2)
 _GPU_ARCHITECTURE_PATTERN = re.compile(r"applegpu_g(\d+)([a-z])")
 
@@ -102,11 +101,10 @@ class Gap(NamedTuple):
     closed_on_main: bool
 
 
-# A release missing from `open_in` keeps a gap only while MLX main has not closed it, so both
-# the first release with the upstream fix and older unmeasured releases turn the route off.
+# A gap stays open only while MLX main has not closed it; releases absent from `open_in`, including the first fixed one
+# and older unmeasured ones, turn the route off.
 _GAPS = {
-    # A few rows of a transposed quantized matmul run qmv/qmv_wide below the qmv batch limit,
-    # then qmm_t_splitk until the output is wide enough for qmm_nax.
+    # A few rows of a transposed quantized matmul run qmv/qmv_wide below the qmv batch limit, then qmm_t_splitk until the output is wide enough for qmm_nax.
     "small_m_qmm": Gap(open_in = ("0.32.2", "0.32.3", "0.32.4"), closed_on_main = False),
     # Without NAX the same rows run qmv_wide (plain qmv before generation 15), then qmm_t_splitk.
     "small_m_qmm_simd": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
@@ -181,12 +179,9 @@ def _probe_build():
 
 
 def kernel_probe_passed(key: str, module: str, function: str, available = None) -> bool:
-    """Run `module.function()` once in a subprocess; cache pass/fail per (macOS build, MLX version, key).
-
-    A Metal build failure inside `mx.fast.metal_kernel` can abort the process, so each kernel is
-    first built and checked here, where a failure only disables it. `available` says whether the
-    kernel's route exists on this GPU; by default, whether NAX does.
-    """
+    """Run `module.function()` in a subprocess, cached per (macOS build, MLX version, key), since a Metal build abort
+    must only disable the kernel; `available` (default nax_available) says whether the kernel's route exists on this
+    GPU."""
     try:
         if not (available or nax_available)():
             return False
@@ -209,16 +204,14 @@ def kernel_probe_passed(key: str, module: str, function: str, available = None) 
         return False
 
 
-# Small-row affine quantized matmul `x @ W^T` on matmul2d, reading the stock packed codes, scales
-# and biases in place. Each quant group is one TM x TN x group_size matmul into fp32, folded as
-# `acc += P * scale + sum(x over the group) * bias`: stock qmv's factorization on the same codes,
-# so only the fp32 summation order differs. K is split across threadgroups so that a few rows
-# still fill the GPU, and the splits' fp32 partials are then added in a fixed order.
+# Small-row affine `x @ W^T` on matmul2d reading stock packed codes in place; each group folds `acc += P * scale +
+# sum(x) * bias` in fp32 like stock qmv, so only summation order differs; K is split across threadgroups so few rows
+# still fill the GPU, partials added in fixed order.
 _QMM_BITS = (4, 8)
 _QMM_GROUP_SIZES = (32, 64, 128)
 _QMM_MAX_ROWS = 16
-# Threadgroups per call by row tile. In a chain of dependent projections one kernel runs at a time,
-# so its own grid must fill the GPU: these fill the 16-core M5 Pro, and scale with the core count.
+# Threadgroups per call by row tile: a kernel in a dependent projection chain runs alone, so its grid must fill the GPU
+# (sized on the 16-core M5 Pro, scaled by core count).
 _QMM_THREADGROUPS = {8: 1400, 16: 700}
 _QMM_MEASURED_CORES = 16
 _QMM_THREADGROUP_MEMORY = 32768
@@ -414,10 +407,9 @@ def small_m_qmm(x, w, scales, biases, group_size, bits):
                   output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
 
 
-# Rows per call where the kernel beat stock by >= 1.05x on chained projections (M5 Pro; the M5
-# family is assumed to match its bandwidth per core). First match wins: (bits, group size or None,
-# fewest weights, widest N, fewest rows, most rows). Heads wider than 64K never start below the
-# narrower outputs' entry: a head alone gains too little. Unmeasured generations keep >= 1.3x rows.
+# Rows per call beating stock by >= 1.05x on chained projections (M5 Pro; M5 family alike); first match on (bits, group
+# or None, fewest weights, widest N, fewest rows, most rows); heads over 64K never start below narrower outputs (a head
+# alone gains too little); unmeasured keep >= 1.3x rows.
 _QMM_ROWS_BY_GPU = {
     17: (
         (4, None, 1 << 22, 8192, 6, 16), (4, None, 1 << 22, 65536, 6, 15), (4, None, 1 << 22, None, 6, 16),
@@ -448,8 +440,8 @@ def small_m_qmm_row_range(N, K, group_size, bits):
 
 
 def probe_small_m_qmm():
-    """Subprocess probe for the small-row kernel: at each bit width, both row tiles full and ragged,
-    both column tiles, split and unsplit K, every group size, bf16 and fp16."""
+    """Subprocess probe of the small-row kernel over every bit width, full and ragged row tiles, both column tiles,
+    split and unsplit K, all group sizes, bf16 and fp16."""
     for dtype in (mx.bfloat16, mx.float16):
         for bits in _QMM_BITS:
             for (N, K), group_size in itertools.product(((384, 512), (320, 256)), _QMM_GROUP_SIZES):
@@ -464,13 +456,9 @@ def probe_small_m_qmm():
                     assert error <= 0.02 * mx.abs(native).max().item(), (bits, group_size, M, error)
 
 
-# Prefill `x @ W^T` with int8 activations (oMLX's QxA8 design), reading the stock packed codes,
-# scales and biases in place. Each row's activation group of x (the quant group, at most 64 wide)
-# becomes int8 codes a with an fp32 scale sa and code sum Ra; each is one exact int8 x int8 -> int32
-# matmul P against the codes, folded in fp32 as `acc += sa * s * P`. The bias term, the sum over
-# groups of sa * Ra * b', is then one matmul of U (sa * Ra summed over each quant group), stored as
-# bf16 high and low halves, against b'. Codes under 8 bits enter as they are with b' = b; 8-bit codes are
-# centred (q - 128) and b' = b + 128 * s, applied as two matmuls so b' is never rounded.
+# Prefill x @ W^T with int8 activations (oMLX QxA8 design); activation groups at most 64 wide become int8 codes with
+# fp32 scale sa; codes under 8 bits enter as is, bias unchanged; 8-bit codes centred (q - 128) with bias b + 128 * s,
+# applied as two matmuls so it is never rounded.
 _INT8_QMM_GROUP_SIZES = (32, 64, 128)
 _INT8_QMM_BITS = (3, 4, 5, 6, 8)
 
@@ -484,11 +472,9 @@ _INT8_QMM_HEADER = """
 using namespace metal;
 """
 
-# One threadgroup per row, a simdgroup per quant group. The GEMM's lanes each read a quarter of an
-# activation group (16 codes, or 8 for 32-wide groups), 4 codes per matmul step; for 4-bit each word's
-# even and odd nibbles are separate steps, so the codes of a step are k, k+2, k+4, k+6 and the
-# activations are stored in that order. A group with a non-finite value gets a NaN scale, so the output
-# keeps the NaN.
+# One threadgroup per row, a simdgroup per quant group; each lane reads a quarter of a group (16 codes, or 8 for 32-wide
+# groups); 4-bit even and odd nibbles are separate steps, so activations are stored k, k+2, k+4, k+6; a non-finite group
+# gets a NaN scale so output keeps NaN.
 _INT8_ACTIVATION_QUANTIZE_SOURCE = """
     constexpr int GW = K / GS;
     constexpr int GP = (GW + 15) / 16 * 16;
@@ -540,13 +526,9 @@ _INT8_ACTIVATION_QUANTIZE_SOURCE = """
     }
 """
 
-# A simdgroup computes 2 x 16 rows by 32 columns with single-simdgroup 16x32x16 int8 matmuls whose
-# operands are filled from registers; a threadgroup is WM x WN simdgroups. The bias matmul uses bf16 x T
-# operands in the same register layout: an fp32 operand would change it. Rows past the tile's valid
-# range load its last valid row and are never stored. GATHER: `w` holds one matrix per expert and
-# the rows are sorted by expert; `starts` gives each expert's first row and `tiles` its first tile,
-# so every tile belongs to one expert. MAP: row i's activations are row `rmap[i]` of the quantized x,
-# which holds one row per token however many experts it is routed to.
+# A simdgroup computes 2 x 16 rows by 32 columns; bias matmul needs bf16 operands (fp32 would change it); GATHER: rows
+# sorted by expert, starts/tiles mark each expert; MAP: row i uses row `rmap[i]` of quantized x; rows past the valid
+# range reload the last valid row and are never stored.
 _INT8_QMM_SOURCE = """
     static_assert(sizeof(T) == 2, "16-bit activations, scales and biases only");
     constexpr int G = K / AG;
@@ -786,8 +768,8 @@ def _int8_qmm(x, w, scales, biases, group_size, bits, simdgroups, starts = None,
         output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
 
 
-# (row, column) simdgroups per threadgroup: 32 x 64 tiles under 8 bits, 64 x 64 for 8-bit; experts
-# use 32-row tiles, which waste fewer rows on short expert segments.
+# (row, column) simdgroups per threadgroup: 32 x 64 tiles under 8 bits, 64 x 64 for 8-bit; expert kernels use 32-row
+# tiles, which waste fewer rows on short segments.
 _INT8_QMM_SIMDGROUPS = {3: (1, 2), 4: (1, 2), 5: (1, 2), 6: (1, 2), 8: (2, 2)}
 _INT8_GATHER_QMM_SIMDGROUPS = {bits: (1, 2) for bits in _INT8_QMM_BITS}
 
@@ -821,16 +803,15 @@ def _differentiable_qmm(group_size, bits, gather, int8 = True):
 
 
 def int8_qmm(x, w, scales, biases, bits):
-    """`quantized_matmul(x, w, scales, biases, transpose=True)` for a 2-D x, with int8 activations and
-    the group size the scales imply; x, scales and biases must be float16 or bfloat16."""
+    """`quantized_matmul(x, w, scales, biases, transpose=True)` for 2-D x with int8 activations; group size is implied
+    by scales; x, scales and biases must be float16 or bfloat16."""
     return _differentiable_qmm(x.shape[-1] // scales.shape[-1], bits, False)(x, w, scales, biases)
 
 
 def int8_gather_qmm(x, w, scales, biases, indices, bits, token_rows = None):
-    """`gather_qmm(x, w, ..., rhs_indices=indices, transpose=True, sorted_indices=True)` for x of
-    shape [T, K] and sorted expert indices [T], with int8 activations; returns [T, N]. x, scales and
-    biases must be float16 or bfloat16. With `token_rows`, row i reads `x[token_rows[i]]`, so each
-    row of x is quantized once however many experts it is routed to."""
+    """`gather_qmm` with sorted expert indices for x [T, K] and int8 activations, returns [T, N]; x, scales, biases are
+    float16/bfloat16; `token_rows` maps row i to `x[token_rows[i]]`, so each row of x is quantized once however many
+    experts route to it."""
     routed = _differentiable_qmm(x.shape[-1] // scales.shape[-1], bits, True)
     if token_rows is None:
         return routed(x, w, scales, biases, indices)
@@ -857,8 +838,8 @@ def _int8_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_rows
 _INT8_PREFILL_MIN_ROWS = _QMM_MAX_ROWS + 1
 _INT8_PREFILL_MIN_N = _INT8_PREFILL_MIN_K = 1024
 _INT8_PREFILL_MAX_N = 65536
-# Rows per routed expert by bits: (calls that quantize each token once for all its experts, every other
-# call). Down projections lose at 12 rows per expert except at 4 bits.
+# Rows per routed expert by bits, as (calls quantizing each token once for all its experts, other calls); down
+# projections lose at 12 rows per expert except at 4 bits.
 _INT8_PREFILL_EXPERT_ROWS = {3: (8, 32), 4: (8, 8), 5: (8, 32), 6: (8, 32), 8: (16, 32)}
 
 
@@ -868,15 +849,14 @@ def int8_prefill_min_rows(N, K):
 
 
 def int8_prefill_expert_min_rows(E, bits, per_token = False):
-    """The fewest sorted rows per call at which the gathered int8 route is measured faster, or 0;
-    `per_token` for a call whose rows read one quantized copy of each token."""
+    """Fewest sorted rows per call where the gathered int8 route measured faster (0 if none); `per_token` selects the
+    variant whose rows read one quantized copy per token."""
     return _INT8_PREFILL_EXPERT_ROWS.get(bits, (0, 0))[not per_token] * E
 
 
 def probe_int8_qmm():
-    """Subprocess probe for the int8 kernels: at each bit width, full and ragged row tiles (per expert
-    when gathered, with empty experts), two column tile counts, every group size, dense, gathered and
-    gathered through a token map, bf16 and fp16."""
+    """Subprocess probe of the int8 kernels: bit widths, full and ragged row tiles (per expert, with empty experts), two
+    column tile counts, every group size, dense, gathered and token-mapped, bf16 and fp16."""
     for dtype in (mx.bfloat16, mx.float16):
         for bits in _INT8_QMM_BITS:
             for (N, K), group_size in itertools.product(((384, 512), (320, 256)), _INT8_QMM_GROUP_SIZES):
@@ -902,8 +882,7 @@ def probe_int8_qmm():
                         assert error <= 0.05 * mx.abs(native).max().item(), (bits, group_size, M, error)
 
 
-# Bit-identical to MLX's sorted NAX gather (same ops, same K order); only the schedule differs.
-# MAP reads row i from row `rmap[i]` of x.
+# Bit-identical to MLX's sorted NAX gather (same ops, same K order), only the schedule differs; MAP reads row i from row `rmap[i]` of x.
 _SORTED_GATHER_BITS = (4, 8)
 _SORTED_GATHER_GROUP_SIZES = (32, 64, 128)
 _SORTED_GATHER_TILE = 64
@@ -1064,8 +1043,8 @@ def sorted_gather_qmm_supported(N, K, group_size, bits, mode):
 
 
 def sorted_gather_qmm(x, w, scales, biases, indices, bits, token_rows = None):
-    """Sorted transposed `gather_qmm` of 16-bit float x [T, K] by expert indices [T], bit for bit;
-    returns [T, N]. With `token_rows`, row i reads `x[token_rows[i]]` in place."""
+    """Sorted transposed `gather_qmm` of 16-bit float x [T, K] by expert indices [T], bit for bit; returns [T, N];
+    `token_rows` makes row i read `x[token_rows[i]]` in place."""
     routed = _differentiable_qmm(x.shape[-1] // scales.shape[-1], bits, True, False)
     if token_rows is None:
         return routed(x, w, scales, biases, indices)

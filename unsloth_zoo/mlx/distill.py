@@ -14,11 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Off-policy knowledge distillation (GKD) for the MLX trainer: a frozen teacher
-scores the student's batch and the student trains on TRL's generalized JSD."""
+"""Off-policy knowledge distillation (GKD) for the MLX trainer: a frozen teacher scores the student's batch and the student trains on TRL's generalized JSD."""
 
-# Bound at import: a deferred `import mlx.core` would resolve to the
-# tests/mlx_simulation stub once that has replaced sys.modules["mlx.core"].
+# Bound at import: a deferred `import mlx.core` would resolve to the tests/mlx_simulation stub once that has replaced sys.modules["mlx.core"].
 import functools
 
 import mlx.core as mx
@@ -43,8 +41,8 @@ __all__ = [
 DEFAULT_CHUNK_SIZE = 128
 _depends = getattr(mx, "depends", None)
 
-# Peak per batch*seq*vocab fp32 buffer, fitted on Qwen2.5-0.5B <- 3B and rounded up: an
-# oversized step aborts with "[METAL] Command buffer execution failed" and wedges the GPU.
+# Peak per batch*seq*vocab fp32 buffer, fitted on Qwen2.5-0.5B <- 3B and rounded up; an oversized step aborts with
+# "[METAL] Command buffer execution failed" and wedges the GPU.
 NAIVE_ACTIVATION_MULTIPLIER = 16.0
 CHUNKED_ACTIVATION_MULTIPLIER = 13.0
 MEMORY_SAFETY_FRACTION = 0.85
@@ -64,8 +62,7 @@ def _kl_divergence_log_target(input_log_probs, target_log_probs):
 
 
 def _jsd_per_position(student_logits, teacher_logits, beta, temperature):
-    # float32: the mixture is a logaddexp of two near-equal terms that the outer
-    # combination then subtracts, which bf16 cannot resolve.
+    # Kept in float32: the mixture is a logaddexp of two near-equal terms that the outer combination then subtracts, which bf16 cannot resolve.
     student_log_probs = nn.log_softmax(student_logits.astype(mx.float32) / temperature, axis=-1)
     teacher_log_probs = nn.log_softmax(teacher_logits.astype(mx.float32) / temperature, axis=-1)
 
@@ -167,10 +164,9 @@ def generalized_jsd_loss(
     temperature = 1.0,
     chunk_size = DEFAULT_CHUNK_SIZE,
 ):
-    """TRL's ``GKDTrainer.generalized_jsd_loss`` in MLX: beta 0 is forward KL,
-    1 reverse KL; mean over non -100 positions (TRL's labels=None batchmean
-    divides by batch size instead); ``chunk_size`` positions at a time (0 =
-    unchunked). The teacher logits are treated as constants."""
+    """MLX port of TRL's GKDTrainer.generalized_jsd_loss: beta 0 is forward KL, 1 reverse KL; mean over non -100
+    positions (TRL's labels=None batchmean divides by batch size); chunk_size positions at a time (0 is unchunked);
+    teacher logits are constants."""
     if labels is None:
         mask = mx.ones(student_logits.shape[:2])
     else:
@@ -186,8 +182,7 @@ def _is_chunked(chunk_size, sequence_length):
 
 def assert_tokenizers_compatible(student_tokenizer, teacher_tokenizer,
                                  student_vocab_size = None, teacher_vocab_size = None):
-    """Raise unless the vocab widths match and both tokenizers encode the probes
-    identically: equal widths alone still permit misaligned targets."""
+    """Raise unless vocab widths match and both tokenizers encode the probes identically: equal widths alone still permit misaligned targets."""
     if (student_vocab_size is not None and teacher_vocab_size is not None
             and student_vocab_size != teacher_vocab_size):
         raise ValueError(
@@ -225,9 +220,8 @@ def assert_tokenizers_compatible(student_tokenizer, teacher_tokenizer,
 
 
 def _assert_vocab_mappings_match(student_tokenizer, teacher_tokenizer):
-    """Every token must map to the same id: the divergence compares every vocab
-    column, so even an added token absent from the data (Qwen3's <think> vs a
-    Qwen2.5 teacher) moves the targets. Tokenizers without get_vocab skip this."""
+    """Every token must map to the same id: the divergence compares every vocab column, so even an added token absent
+    from the data (Qwen3's <think> vs a Qwen2.5 teacher) moves targets; tokenizers without get_vocab skip this."""
     try:
         student_vocab = student_tokenizer.get_vocab()
         teacher_vocab = teacher_tokenizer.get_vocab()
@@ -266,8 +260,7 @@ def largest_tokens_that_fit(vocab_size, resident_bytes, budget_bytes,
 def preflight_memory(batch_size, sequence_length, vocab_size, resident_bytes,
                      system_bytes, chunked = True, bytes_per_element = 4,
                      skip = False):
-    """Raise before the first step if this configuration cannot fit; ``skip``
-    downgrades the refusal to a warning since the estimate is conservative."""
+    """Raise before the first step if this configuration cannot fit; `skip` downgrades the refusal to a warning since the estimate is conservative."""
     budget = int(system_bytes * MEMORY_SAFETY_FRACTION)
     estimate = estimate_distillation_peak_bytes(
         batch_size, sequence_length, vocab_size, resident_bytes,
@@ -336,8 +329,7 @@ def validate_gkd_config(gkd_beta, gkd_temperature, gkd_lmbda):
 
 
 def load_teacher(model_name_or_path):
-    """Load a teacher in eval mode (mlx_lm.load already sets it; explicit here
-    so dropout-bearing teachers stay deterministic) and freeze it."""
+    """Load a teacher in eval mode (mlx_lm.load already sets it; explicit so dropout-bearing teachers stay deterministic) and freeze it."""
     from mlx.utils import tree_flatten
     from mlx_lm import load
 
@@ -364,8 +356,7 @@ def load_teacher(model_name_or_path):
 
 def build_gkd_loss_fn(teacher_model, args, vocab_size, batch_size,
                       resident_bytes, system_bytes):
-    """Loss fn with the trainer's ``(model, batch, lengths, labels=None) ->
-    (loss, ntoks)`` contract; the teacher runs under ``stop_gradient``."""
+    """Loss fn with the trainer's `(model, batch, lengths, labels=None) -> (loss, ntoks)` contract; the teacher runs under `stop_gradient`."""
     beta = float(getattr(args, "gkd_beta", 0.5))
     temperature = float(getattr(args, "gkd_temperature", 1.0))
     chunk_size = int(getattr(args, "gkd_chunk_size", DEFAULT_CHUNK_SIZE))

@@ -47,11 +47,9 @@ _PATCHED_ARCHES: set[str] = set()
 _PATCHED_PATTERN_BUNDLES: set[str] = set()
 _PATCH_BINDINGS: set[tuple[str, str, str, str]] = set()
 
-# Controls whether the Qwen3-VL vision-block norm patch casts the fp32
-# norm output back to the activation dtype. Mirrors MLXTrainingConfig
-# `cast_norm_output_to_input_dtype`. Flipped by the trainer's
-# `_set_norm_output_cast_to_input_dtype` so the generic and Qwen3-VL
-# paths agree.
+# Whether the Qwen3-VL vision norm patch casts the fp32 norm output back to the activation dtype; mirrors
+# MLXTrainingConfig cast_norm_output_to_input_dtype, flipped by the trainer's _set_norm_output_cast_to_input_dtype so
+# both paths agree.
 _QWEN3_VISION_NORM_CAST_OUTPUT = True
 _QWEN3_VISUAL_STATE_KEY = "_unsloth_qwen3_visual_state"
 _QWEN3_VISUAL_POSITIONS_KEY = "_unsloth_qwen3_visual_positions"
@@ -62,15 +60,9 @@ def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
     global _QWEN3_VISION_NORM_CAST_OUTPUT
     _QWEN3_VISION_NORM_CAST_OUTPUT = bool(enabled)
 
-# Architectures explicitly verified for mlx compile support.
-# Training verification currently covers:
-# - qwen2_5_vl: real end-to-end compiled training via train.py
-# - gemma3 / qwen3_vl / qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
-#   compiled synthetic forward+backward
-# - gemma4_unified: real compiled LoRA training on gemma-4-12B, text and image
-# SmolVLM has processor/template support, but real mlx-vlm training still hits
-# MLX primitive-less-array failures after a compiled call. Keep it patched but
-# unqualified until a real dataset compile run passes.
+# mlx compile verified: qwen2_5_vl real training; gemma4_unified real training; gemma3, qwen3_vl, qwen3_5, qwen3_5_moe,
+# gemma4, paligemma, moondream3 synthetic only; SmolVLM patched, unqualified until a real run passes (mlx-vlm hits MLX
+# primitive-less-array failures after compiled calls).
 _VERIFIED_TRAINING_ARCHES: set[str] = {
     "aya_vision",
     "deepseekocr",
@@ -84,8 +76,8 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "dots_ocr",
     "ernie4_5_moe_vl",
     "glm4v",
-    # glm4v_moe stays eager: MLX 0.32 raises IndexError (_Map_base::at) compiling its
-    # decoder, which re-sections one cos/sin array per layer; the fallback misses it.
+    # glm4v_moe stays eager: MLX 0.32 raises IndexError (_Map_base::at) compiling its decoder, which re-sections one
+    # cos/sin array per layer; the fallback misses it.
     "glm5_next",
     "glm_ocr",
     "idefics2",
@@ -136,8 +128,7 @@ _MODEL_REPO_TRAINING_COMPILE_BLOCKLIST: tuple[tuple[str, str], ...] = (
     ),
 )
 
-# Compiled training here is qualified on the CCE loss only: `use_cce=False` runs
-# the upstream `Model.__call__`, which still reads these values on the host.
+# Compiled training is qualified on the CCE loss only: use_cce=False runs the upstream Model.__call__, which still reads these values on the host.
 _CCE_ONLY_TRAINING_COMPILE_ARCHES: dict[str, str] = {
     "ernie4_5_moe_vl": "its token types and rotary positions",
 }
@@ -291,11 +282,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class MLXVLMTraitReport:
-    """Static scan result for one installed `mlx_vlm` architecture.
-
-    Architecture-level hints only: surface likely blocker categories, identify
-    shared patch bundles, and explain qualification state.
-    """
+    """Static scan result for one installed `mlx_vlm` architecture; architecture-level hints only (blocker categories, shared patch bundles, qualification state)."""
 
     arch: str
     blocker_categories: tuple[str, ...]
@@ -307,12 +294,8 @@ class MLXVLMTraitReport:
 
 @dataclass(frozen=True)
 class CompilePatternBundle:
-    """A reusable compile patch bundle keyed by architecture traits.
-
-    Declarative: a bundle names its `matcher`, semantic primitives, family
-    adapter, and runtime primitives. Installation runs through a generic
-    patch-plan executor rather than per-architecture installer dispatch.
-    """
+    """Reusable compile patch bundle keyed by architecture traits: declares its matcher, semantic primitives, family
+    adapter and runtime primitives; installed by a generic patch-plan executor, not per-architecture dispatch."""
 
     name: str
     description: str
@@ -377,11 +360,8 @@ class CompilePatchPrimitive:
 
 @dataclass(frozen=True)
 class CompilePatchAdapter:
-    """Thin family-level contract description for shared patch primitives.
-
-    Prefer semantic matching (source traits / naming) over explicit
-    architecture lists so future families pick up existing adapters.
-    """
+    """Thin family-level contract for shared patch primitives; prefer semantic matching (source traits or naming) over
+    explicit architecture lists so new families pick up existing adapters."""
 
     name: str
     description: str
@@ -392,8 +372,7 @@ class CompilePatchAdapter:
 
 @dataclass(frozen=True)
 class CompilePatchPlan:
-    """Resolved patch plan: bridges the declarative bundle registry and the
-    monkey patches applied at runtime."""
+    """Resolved patch plan that bridges the declarative bundle registry and the monkey patches applied at runtime."""
 
     bundle_name: str
     adapter_name: str | None
@@ -486,11 +465,7 @@ class CompilePatchabilityReport:
 
 
 def _iter_arch_modules() -> Iterable[tuple[str, Path]]:
-    """Yield installed `mlx_vlm.models.<arch>` package roots.
-
-    Inspects the installed package (not a static registry) so qualification
-    reflects actual venv contents.
-    """
+    """Yield installed `mlx_vlm.models.<arch>` package roots, inspecting the installed package rather than a static registry so qualification matches the venv."""
 
     try:
         import mlx_vlm.models as vlm_models_pkg
@@ -593,12 +568,8 @@ def _support_state(
     patched: bool,
     matched_patterns: tuple[str, ...] = (),
 ) -> str:
-    """Return the user-facing support state for one architecture.
-
-    `supported_inferred` means the shared patch system matched reusable
-    patterns but the family is not yet explicitly verified; runtime policy
-    stays conservative without verification.
-    """
+    """User-facing support state for one architecture; `supported_inferred` means patterns matched but the family is not
+    explicitly verified, so runtime policy stays conservative."""
 
     if training_ok or generation_ok:
         return "supported_verified"
@@ -671,11 +642,7 @@ def list_compile_patch_primitives() -> tuple[CompilePatchPrimitive, ...]:
 def list_protocol_requirements(
     protocol_name: str | None = None,
 ) -> tuple[CompileProtocolRequirement, ...]:
-    """Return the protocol registry used for generic compile target discovery.
-
-    Protocols are broader than architecture names: they describe the stable
-    runtime contracts checked when reusing a patch primitive for a new family.
-    """
+    """Protocol registry for generic compile target discovery; protocols are the stable runtime contracts checked when reusing a patch primitive for a new family."""
 
     protocols = (
         CompileProtocolRequirement(
@@ -868,12 +835,8 @@ def _config_get(config, key, default=None):
 
 
 def _iter_backend_subconfigs(config) -> Iterable[tuple[str, object]]:
-    """Yield likely nested backend configs from an MLX config object.
-
-    Checks the explicit `*_config` allowlist, then also scans visible
-    attributes / mapping keys for nested config-shaped values with a
-    `model_type` (to catch newer mlx-vlm families).
-    """
+    """Yield likely nested backend configs: the explicit `*_config` allowlist, then visible attributes or mapping keys
+    with a `model_type` to catch newer mlx-vlm families."""
 
     if config is None:
         return ()
@@ -1148,12 +1111,8 @@ def _discover_protocol_target_for_module_functions(
 def discover_compile_protocol_targets(
     model_or_arch,
 ) -> tuple[CompileProtocolTarget, ...]:
-    """Discover patchable protocol targets for an architecture or loaded model.
-
-    Main new-family triage helper: inspects installed `mlx_vlm` modules and
-    reports which generic compile protocols match classes/methods, plus any
-    missing source tokens that prevented a clean match.
-    """
+    """Discover patchable protocol targets for an arch or loaded model: new-family triage over installed mlx_vlm
+    modules, listing matched protocols and missing source tokens."""
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
     if not arch:
@@ -1302,11 +1261,7 @@ def find_similar_compile_families(
     limit: int = 5,
     verified_only: bool = False,
 ) -> tuple[tuple[str, float, tuple[str, ...]], ...]:
-    """Return nearby families based on shared traits, bundles, and protocols.
-
-    Answers "what existing architecture looks most like this one?" when adding
-    a new family, so patchability/trace can be compared against a neighbor.
-    """
+    """Return nearby families by shared traits, bundles and protocols, to compare patchability and trace against a neighbor when adding a new family."""
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
     if not arch:
@@ -1494,11 +1449,8 @@ def model_has_qwen35_attention_layers(model) -> bool:
 
 
 def _model_repo_training_compile_block_reason(model_or_arch) -> str | None:
-    """Return a repo-specific compile block reason when policy should stay eager.
-
-    Separate from architecture qualification: an arch can be patchable while a
-    known repo family still fails real training on an unresolved runtime issue.
-    """
+    """Repo-specific reason to stay eager for training; separate from arch qualification, since a patchable arch can
+    still fail real training on an unresolved runtime issue."""
 
     if isinstance(model_or_arch, str):
         return None
@@ -1626,11 +1578,7 @@ def _adapter_matches(
     arch: str,
     report: MLXVLMTraitReport,
 ) -> bool:
-    """Return whether a declarative adapter applies to one architecture.
-
-    Matches on exact names (exceptions), prefixes (family naming), and
-    required traits (semantic reuse).
-    """
+    """Whether an adapter applies to one arch: exact names (exceptions), name prefixes (family naming), or required traits (semantic reuse)."""
 
     if arch in adapter.arch_names:
         return True
@@ -1662,11 +1610,7 @@ def _recommend_compile_settings(
     decision: ResolvedTrainingCompileDecision | None = None,
     args=None,
 ) -> tuple[CompileSettingRecommendation, ...]:
-    """Return compile-aware training setting recommendations.
-
-    Conservative: targets settings that materially affect compiled training
-    stability or memory behavior.
-    """
+    """Conservative compile-aware training setting recommendations, limited to settings that materially affect compiled training stability or memory."""
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
     report = get_compile_trait_report(model_or_arch if arch else "")
@@ -1728,12 +1672,8 @@ def resolve_training_compile(
     args=None,
     use_cce=None,
 ) -> ResolvedTrainingCompileDecision:
-    """Resolve whether a training run should use `mx.compile`.
-
-    Order: normalize policy + overrides; check repo blocklist; require main and
-    backend architectures training-qualified; return enabled, or eager
-    fallback / raise depending on policy strictness.
-    """
+    """Resolve whether training uses `mx.compile`: normalize policy, check the repo blocklist, require main and backend
+    archs training-qualified, then enable it or fall back to eager or raise depending on policy strictness."""
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
     compiled_policy = build_compile_policy(policy=policy, args=args)
@@ -1969,11 +1909,8 @@ def _patch_method(cls, name, fn):
 
 
 def _try_import_module(module_name: str):
-    """Best-effort import for optional `mlx_vlm` modules.
-
-    Returns None silently since the installed MLX stack may not include every
-    architecture; keeps the patch registry idempotent across environments.
-    """
+    """Best-effort import of optional mlx_vlm modules, returning None silently since not every architecture is
+    installed; keeps the patch registry idempotent across environments."""
 
     try:
         return importlib.import_module(module_name)
@@ -2057,10 +1994,8 @@ def _flatten_feature_rows(feature_rows, hidden_dim):
 
 
 def _raise_on_feature_count_mismatch(mask, feature_rows, inputs_embeds, exact=True):
-    """Each tower's own upstream count check (equal, or `exact=False`: no shortfall).
-
-    Needs a host value, so a traced mask is left alone.
-    """
+    """Each tower's upstream count check: counts must be equal, or with exact=False no feature shortfall is allowed; a
+    traced mask is left alone since it needs host values."""
 
     import mlx.core as mx
 
@@ -2185,11 +2120,7 @@ def _merge_replacement_segments(inputs_embeds, replacements_by_batch):
 
 
 def _masked_scatter_no_numpy(final_embedding, image_mask_expanded, scaled_image_features):
-    """Compile-safe replacement for `masked_scatter`-style multimodal merges.
-
-    Stays in pure MLX array ops (no NumPy / mutation) so it runs under
-    `mx.compile` and backward.
-    """
+    """Compile-safe replacement for masked_scatter-style multimodal merges, in pure MLX array ops (no NumPy, no mutation) so it runs under mx.compile and backward."""
 
     import mlx.core as mx
 
@@ -2586,12 +2517,8 @@ def _qwen3_visual_window(
     position_widths=None,
     window,
 ):
-    """Restore flattened Qwen3 features for one compact-state window.
-
-    Compact positions follow the mask coordinate system in which they were
-    packed. A shorter live mask is a chunk sliced from that full coordinate
-    row; otherwise a whole-row mask starts at zero.
-    """
+    """Restore flattened Qwen3 features for one compact-state window; positions use the coordinates of the full packed
+    mask row, where a shorter live mask is a slice of it and a whole-row mask starts at zero."""
 
     batch_size = int(visual_pos_masks.shape[0])
     mask_offsets = tuple(int(offset) for offset in mask_offsets)
@@ -2631,9 +2558,8 @@ def _qwen3_visual_window(
 
         row_positions = visual_positions[row]
         if whole_row and visual_pos_masks.shape[-1] >= position_width:
-            # why: the whole mask row is consumed, so the feature window spans
-            # the whole row too -- a non-zero cache offset here belongs to an
-            # earlier prompt, not to this mask.
+            # The whole mask row is consumed, so the feature window spans the whole row too; a non-zero cache offset
+            # there belongs to an earlier prompt, not this mask.
             feature_start, feature_stop = 0, int(visual_pos_masks.shape[-1])
         else:
             feature_start = max(0, mask_start)
@@ -2789,9 +2715,8 @@ def _pad_qwen3_prompt_rows(prompt_kwargs_list):
     if template is None:
         return prompt_kwargs_list
 
-    # why: a row still on mlx-vlm's native deepstack keys owns real features
-    # that no compact state can stand in for, so synthesizing an empty one
-    # would replace them with zeros. Leave the batch exactly as it is.
+    # A row still on mlx-vlm's native deepstack keys owns real features, so synthesizing an empty compact state would
+    # replace them with zeros; leave the batch unchanged.
     if any(
         kwargs
         and kwargs.get(_QWEN3_VISUAL_STATE_KEY) is None
@@ -3973,8 +3898,7 @@ def _install_qwen3_omni_compile_patches(
     original_deepstack = backbone_cls._deepstack_process
 
     def patched_deepstack(self, hidden_states, visual_pos_masks, visual_embeds):
-        # Upstream's embedder (inference, audio) scatters full-length residuals that
-        # the row gather would misplace; the patched one hands a tuple of row blocks.
+        # Upstream's embedder (inference, audio) scatters full-length residuals that a row gather would misplace, so the patch passes a tuple of row blocks.
         if not isinstance(visual_pos_masks, tuple):
             return original_deepstack(self, hidden_states, visual_pos_masks, visual_embeds)
         for mask, rows in zip(visual_pos_masks, visual_embeds):
@@ -4328,11 +4252,8 @@ def _install_glm_ocr_compile_patches():
 
 
 def _install_dots_ocr_compile_patches():
-    """Install compile-safe dots_ocr vision and merge patches.
-
-    Its tower reads the grid on the host and reduces the same array with
-    `mx.max`; the merge counts placeholders per row on the device.
-    """
+    """Install compile-safe dots_ocr vision and merge patches: the tower reads the grid on the host and reduces the same
+    array with mx.max; the merge counts placeholders on the device."""
 
     module = _try_import_module("mlx_vlm.models.dots_ocr.dots_ocr")
     vision_module = _try_import_module("mlx_vlm.models.dots_ocr.vision")
@@ -4474,11 +4395,7 @@ def _install_kimi_k3_compile_patches():
 
 
 def _install_muse_glimmer_compile_patches():
-    """Install compile-safe muse_glimmer vision and merge patches.
-
-    The tower opens by reading the grid on the host, and the merge counts its
-    placeholders on the device before scattering.
-    """
+    """Install compile-safe muse_glimmer patches: the tower reads the grid on the host, and the merge counts placeholders on the device before scattering."""
 
     module = _try_import_module("mlx_vlm.models.muse_glimmer.muse_glimmer")
     vision_module = _try_import_module("mlx_vlm.models.muse_glimmer.vision")
@@ -4549,12 +4466,8 @@ def _install_muse_glimmer_compile_patches():
 
 
 def _install_minimax_m3_vl_compile_patches():
-    """Install compile-safe minimax_m3_vl vision and merge patches.
-
-    Every host read of the grid runs through `_segment_grid_thw`, the encoder
-    splits on cumulative lengths it reads back, and the merge compares its
-    placeholder count with the feature size on the host.
-    """
+    """Install compile-safe minimax_m3_vl patches: host reads of the grid go through `_segment_grid_thw`, the encoder
+    splits on cumulative lengths read back, and the merge compares counts on the host."""
 
     module = _try_import_module("mlx_vlm.models.minimax_m3_vl.minimax_m3_vl")
     vision_module = _try_import_module("mlx_vlm.models.minimax_m3_vl.vision")
@@ -4696,11 +4609,8 @@ def _install_minimax_m3_vl_compile_patches():
 
 
 def _install_ernie4_5_moe_vl_compile_patches():
-    """Install compile-safe ernie4_5_moe_vl vision, resampler and merge patches.
-
-    The tower, the resampler and the merge each read the grid or the placeholder
-    count back on the host; these take the grid as Python tuples instead.
-    """
+    """Install compile-safe ernie4_5_moe_vl vision, resampler and merge patches; they take the grid as Python tuples
+    because each part otherwise reads it back on the host."""
 
     module = _try_import_module("mlx_vlm.models.ernie4_5_moe_vl.ernie4_5_moe_vl")
     vision_module = _try_import_module("mlx_vlm.models.ernie4_5_moe_vl.vision")
@@ -5304,12 +5214,8 @@ def _install_paddleocr_vl_compile_patches():
 
 
 def _install_qwen_like_image_merge_patches():
-    """Patch qwen-style placeholder-token image merges with a shared helper.
-
-    Covers the one-placeholder-token-per-image-segment pattern. Qwen3 is
-    excluded: it returns an extra broadcast mask and has its own deepstack
-    plumbing.
-    """
+    """Patch qwen-style one-placeholder-per-image-segment merges with a shared helper; Qwen3 is excluded since it
+    returns an extra broadcast mask and has its own deepstack plumbing."""
 
     for arch in sorted(_QWEN_LIKE_MERGE_ARCHES):
         module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
@@ -5877,8 +5783,7 @@ def _gemma3n_language_contract(method):
 
 
 def _gemma3n_cache_offset(cache):
-    """Absolute token progress for per-layer embedding slices, read from the
-    public ``offset``: a rotating cache's private ``_idx`` wraps, ``offset`` does not."""
+    """Absolute token progress for per-layer embedding slices, read from the public offset, since a rotating cache's private _idx wraps while offset does not."""
 
     raw_offset = next(
         (
@@ -5960,8 +5865,7 @@ def _install_gemma3n_compile_patches():
         return img
 
     def _safe_branch_magnitude(x):
-        # AltUp RMS rescaling squares hidden states; in fp16 finite activations
-        # can overflow `x ** 2`, so compute the magnitude in float32.
+        # AltUp RMS rescaling squares hidden states; finite fp16 activations can overflow `x ** 2`, so the magnitude is computed in float32.
         return (mx.mean(x.astype(mx.float32) ** 2, axis=-1, keepdims=True) ** 0.5)
 
     def patched_gemma3model_call(
@@ -6536,10 +6440,7 @@ def _install_masked_scatter_multimodal_patches():
 
 
 def _install_idefics_family_compile_patches():
-    """Patch Idefics-family image filtering and multimodal merges for compile.
-
-    Shared issue: Python-side padded-image filtering and placeholder merging.
-    """
+    """Patch Idefics-family image filtering and merges for compile; the shared issue is Python-side padded-image filtering and placeholder merging."""
 
     def patched_prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         special_image_mask = input_ids == self.config.image_token_index
@@ -7037,11 +6938,7 @@ def _install_phi4_multimodal_patches():
 
 @lru_cache(maxsize=1)
 def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
-    """Return the shared compile patch registry.
-
-    Main entrypoint for adding new compile patterns. Matchers should prefer
-    source traits over hardcoded architecture lists for reusable fixes.
-    """
+    """Shared compile patch registry and entrypoint for new compile patterns; matchers should prefer source traits over hardcoded architecture lists."""
 
     return (
         CompilePatternBundle(
@@ -7399,11 +7296,8 @@ def _resolve_compile_patch_plan(bundle: CompilePatternBundle) -> CompilePatchPla
 
 
 def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
-    """Return the runtime primitive executor registry.
-
-    Small semantic units composed by bundle plans; installation no longer
-    dispatches on architecture-local installer names.
-    """
+    """Runtime primitive executor registry: small semantic units composed by bundle plans, so installation no longer
+    dispatches on architecture-local installer names."""
 
     return {
         "qwen_like_image_merge_runtime": _install_qwen_like_image_merge_patches,
@@ -7439,11 +7333,7 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
 
 
 def _apply_compile_patch_plan(plan: CompilePatchPlan) -> None:
-    """Apply one resolved runtime patch plan.
-
-    Generic executor: new families usually only need registry updates (extend a
-    trait matcher, point a bundle at an adapter, reuse/add runtime primitives).
-    """
+    """Generic executor for one resolved runtime patch plan; new families usually need only registry updates (trait matcher, bundle adapter, runtime primitives)."""
 
     executors = _runtime_patch_primitive_installers()
     for primitive_name in plan.runtime_primitives:
@@ -7457,11 +7347,8 @@ def _apply_compile_patch_plan(plan: CompilePatchPlan) -> None:
 
 
 def trace_patch_bindings(model_or_arch) -> tuple[tuple[str, str, str, str], ...]:
-    """Return concrete runtime patch bindings applied for one architecture.
-
-    Lower-level than `trace_compile_application`: lists which class/method
-    names were actually monkey-patched, for diffing against upstream changes.
-    """
+    """Concrete runtime patch bindings for one arch: which class and method names were monkey-patched, a lower-level
+    view than trace_compile_application, for diffing upstream."""
 
     arch = model_or_arch if isinstance(model_or_arch, str) else get_model_architecture(model_or_arch)
     if not arch:

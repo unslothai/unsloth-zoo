@@ -2,56 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Decide a CI skip gate from a pytest JUnit XML report instead of re-running pytest.
-
-Several lanes gate on "the suite must not have skipped" or "at least one test
-must really have run". That was expressed as a second pytest invocation of the
-same file whose stdout was grepped:
-
-    python -m pytest tests/x.py -q -rs | tee out.txt
-    if grep -qiE '[0-9]+ skipped' out.txt; then ...
-
-which runs the whole file twice. The first run already knows the answer, so it
-writes `--junitxml=<report>` and this script reads the report.
-
-Two policies, matching the two the greps expressed. They are NOT the same check
-and must not be merged:
-
-    no-skips    -- fail if any test skipped (the `grep -qiE '[0-9]+ skipped'`
-                   gates: any skip at all means the numeric gate gated nothing).
-    one-passed  -- fail unless at least one test passed (the
-                   `grep -qiE '[1-9][0-9]* passed'` gates: these files skip
-                   wholesale when an optional import is missing, and a file that
-                   skips everything still exits 0).
-
-A skip recorded at collection time -- the whole module skipped at import, which
-is precisely the case these gates exist for -- appears in the report as a
-testcase carrying a <skipped> element, so both policies see it.
-
-xfail is bucketed on its own and satisfies neither policy, matching the terminal
-summary the greps read (an xfail is reported as "xfailed", not as "skipped" or
-"passed"). A non-strict xpass is the one outcome JUnit XML cannot distinguish
-from a plain pass; none of the gated files use xfail markers, so the two agree
-today, and a strict xpass is a failure in both worlds.
-
-Anything that stops the report from being a truthful record of a real run is a
-failure, never a pass: a missing file, an empty file, unparseable XML, no
-testsuite element, zero testcases, or a testcase count that disagrees with the
-suite's own `tests` attribute. A gate that cannot read its evidence has not
-been satisfied.
-
-Failures and errors also fail the gate. In the workflow they cannot reach it --
-the pytest step that wrote the report already returned non-zero and stopped the
-job -- but a report containing red tests must never be reported as a pass by
-this script, whoever calls it.
-
-Exit codes: 0 = gate satisfied; 1 = gate violated or report unusable;
-2 = bad usage.
-
-Usage:
-    python3 scripts/pytest_junit_gate.py --report "$RUNNER_TEMP/x.xml" \
-        --require no-skips --message "real mlx is installed but ... skipped"
-"""
+"""Decide CI gates from a pytest --junitxml report: no-skips fails on any skip, one-passed needs a pass; they must not
+be merged; xfail satisfies neither; failures or errors must never pass, nor a missing, empty or inconsistent report;
+exit 0 satisfied, 1 violated or unusable, 2 bad usage."""
 
 from __future__ import annotations
 
@@ -125,9 +78,7 @@ def read_report(path: Path) -> Counts:
     passed = skipped = failed = errored = xfailed = 0
     declared = 0
     for suite in suites:
-        # pytest writes the case count on the suite. A file that parses can still
-        # be a partial write or a report merged from elsewhere, and then the
-        # elements below are not the run we think we are gating on.
+        # The suite's tests attribute is checked against the testcase count, since a file that parses can still be a partial or merged report.
         attribute = suite.get("tests")
         if attribute is None:
             raise ReportUnusable(
@@ -147,11 +98,8 @@ def read_report(path: Path) -> Counts:
             elif case.find("failure") is not None:
                 failed += 1
             elif skip is not None:
-                # An xfail is written as <skipped type="pytest.xfail">, but pytest's
-                # terminal summary counts it as "xfailed", not "skipped" and not
-                # "passed". The greps these gates replace were reading that summary,
-                # so an xfail satisfied neither policy and violated neither. Keep it
-                # in its own bucket to stay exactly as strict as before.
+                # An xfail is recorded as a skipped element with type pytest.xfail, but pytest counts it as xfailed, so
+                # it satisfies neither policy and gets its own bucket.
                 if skip.get("type") == "pytest.xfail":
                     xfailed += 1
                 else:

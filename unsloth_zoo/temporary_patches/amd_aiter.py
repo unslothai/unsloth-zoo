@@ -13,25 +13,8 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""
-AMD aiter Flash Attention registered as a transformers attention backend.
-
-The source rewrite in compiler.py cannot reach modern models: on transformers
-4.50+ the attention forward has no literal SDPA call, it dispatches through
-ALL_ATTENTION_FUNCTIONS and the real call lives in
-transformers/integrations/sdpa_attention.py, which the compiler never reads.
-A census of 4.51.3 / 4.57.6 / 5.5.0 finds 0 of 106 SDPA call sites in a shape
-any rewrite could match.
-
-Registering a backend reaches every model that uses the attention interface,
-needs no codegen, and cannot emit invalid Python.
-
-Layout: the interface passes q/k/v as (B, H, S, D) and expects (B, S, H, D)
-back, which is aiter's native layout, so one transpose in and none out.
-
-Anything not provably safe falls through to the stock SDPA backend, so this is
-a kernel swap and never a behaviour change.
-"""
+"""AMD aiter Flash Attention as a transformers attention backend (transformers 4.50+; compiler.py rewrites miss modern
+models); takes (B, H, S, D) and returns (B, S, H, D); unsafe cases fall back to SDPA, so never a behaviour change."""
 
 import os
 
@@ -44,22 +27,19 @@ __all__ = ["patch_amd_aiter_attention", "aiter_attention_forward"]
 
 _DISABLE_ENV = "UNSLOTH_DISABLE_AITER"
 
-# flash_attn_func applies 1/sqrt(head_dim) itself and takes no softmax_scale,
-# so a model asking for a different scale must not take this path.
+# flash_attn_func applies 1/sqrt(head_dim) itself and takes no softmax_scale, so a model with a different scale must not take this path.
 _SCALE_RTOL = 1e-6
 
-# Delivered by the interface but harmless here: RoPE is already applied to q/k
-# and cache bookkeeping happens outside the kernel. Measured on transformers
-# 4.57.6, 5.0.0 and 5.14.1.
+# Kwargs the interface delivers but this kernel ignores: RoPE is already applied to q/k and cache bookkeeping is outside
+# it; measured on transformers 4.57.6, 5.0.0 and 5.14.1.
 _BENIGN_KWARGS = frozenset((
     "position_ids", "use_cache", "cache_position", "past_key_value",
     "past_key_values", "layer_idx", "layer_head_mask", "output_attentions",
     "head_mask", "sliding_window", "position_bias",
 ))
 
-# These change the result and plain flash_attn_func cannot express them:
-# sliding_window is windowed attention, position_bias becomes an additive mask
-# on transformers >= 5.14, softcap and s_aux are soft capping and sinks.
+# These change the result and flash_attn_func cannot express them: sliding_window is windowed attention, position_bias
+# becomes an additive mask on transformers >= 5.14, softcap and s_aux are soft capping and sinks.
 _SEMANTIC_KWARGS = (
     "sliding_window", "position_bias", "softcap", "logit_softcapping",
     "s_aux", "attention_chunk_size", "head_mask",
@@ -77,10 +57,7 @@ def aiter_attention_forward(
     is_causal = None,
     **kwargs,
 ):
-    """Use aiter when provably safe, else the stock SDPA backend.
-
-    Signature matches transformers' sdpa_attention_forward on 4.51 through 5.x.
-    """
+    """Use aiter when provably safe, else stock SDPA; signature matches transformers sdpa_attention_forward on 4.51 through 5.x."""
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
     def _fallback():
@@ -92,9 +69,8 @@ def aiter_attention_forward(
     if os.environ.get(_DISABLE_ENV, "0") == "1":
         return _fallback()
 
-    # Registration is AMD gated, but this is exported, directly callable, and the
-    # gate behind it is cached at import. Re-check per call: `is_hip` is uncached
-    # and cheap, and ROCm tensors report device.type "cuda", so both are needed.
+    # Registration is AMD gated but this is callable directly and the gate is cached at import, so re-check per call:
+    # is_hip is uncached and cheap, and ROCm tensors report device.type "cuda", so both checks are needed.
     from unsloth_zoo.device_type import is_hip
     if not is_hip() or not query.is_cuda:
         return _fallback()
@@ -107,9 +83,8 @@ def aiter_attention_forward(
         if kwargs.get(name) is not None:
             return _fallback()
 
-    # An unknown keyword means a newer transformers grew an argument this
-    # backend has never seen, so fall back rather than ignore its semantics.
-    # Do not name the loop variable `value`, it would shadow the tensor.
+    # An unknown kwarg means a newer transformers added an argument this backend has not seen, so fall back rather than
+    # ignore its semantics; do not name the loop variable `value`, it would shadow the tensor.
     for kwarg_name, kwarg_value in kwargs.items():
         if (kwarg_name not in _BENIGN_KWARGS
                 and kwarg_value is not None and kwarg_value is not False):
@@ -125,8 +100,7 @@ def aiter_attention_forward(
     if flash_attn_func is None:
         return _fallback()
 
-    # aiter aligns causal masks bottom-right, SDPA top-left, so they agree only
-    # with no explicit mask and equal q/k lengths.
+    # aiter aligns causal masks bottom-right while SDPA aligns top-left, so they agree only with no explicit mask and equal q/k lengths.
     if attention_mask is not None or query.shape[-2] != key.shape[-2]:
         return _fallback()
     if dropout:
@@ -136,8 +110,7 @@ def aiter_attention_forward(
     if query.dtype not in (torch.float16, torch.bfloat16):
         return _fallback()
 
-    # aiter asserts return_lse when any input requires grad and we omit it, so
-    # the fast path is inference only.
+    # aiter asserts return_lse when any input requires grad and it is omitted here, so the fast path is inference only.
     if query.requires_grad or key.requires_grad or value.requires_grad:
         return _fallback()
 
@@ -160,8 +133,7 @@ def aiter_attention_forward(
             causal = True,
         )
     except Exception:
-        # Unsupported head dim, arch mismatch or a JIT build failure degrades to
-        # SDPA instead of killing the forward pass.
+        # Unsupported head dim, arch mismatch or a JIT build failure degrades to SDPA instead of killing the forward pass.
         return _fallback()
     if attn_output is None:
         return _fallback()

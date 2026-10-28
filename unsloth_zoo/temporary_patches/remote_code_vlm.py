@@ -14,11 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Repairs for trust_remote_code classes, applied as `get_class_in_module` loads them:
-legacy hybrid caches without `get_query_offset` (transformers 5 masking calls it), InternVL-style
-forwards whose in-place image merge breaks training and ragged `pixel_values`, and RADIO
-`summary_idxs` buffers that meta-device loading leaves unset.
-"""
+"""Repairs trust_remote_code classes as get_class_in_module loads them: legacy hybrid caches without get_query_offset
+(transformers 5 masking calls it), InternVL forwards (in-place image merge breaks training; ragged pixel_values),
+RADIO summary_idxs unset on meta load."""
 
 import functools
 import inspect
@@ -218,8 +216,8 @@ def _restore_summary_idxs(model):
 
 
 def repair_radio_summary_idxs(cls):
-    # summary_idxs is built in __init__ and not stored, so meta-device loads leave garbage
-    # (4-bit: out-of-range index, device-side assert). Recompute it on the first forward.
+    # summary_idxs is built in __init__ and not stored, so meta-device loads leave garbage (4-bit: out-of-range index,
+    # device-side assert); recompute it on the first forward.
     if getattr(cls, "__name__", "") != "RADIOModel":
         return False
     original = cls.__dict__.get("forward")

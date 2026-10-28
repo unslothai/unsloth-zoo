@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Qwen4Exp (Qwen3.8-Flash-Next) patches.
-
-MoE takes the Qwen3.5-MoE grouped-GEMM backend. QSA indexer: when kv_length < budget +
-compress_ratio every complete block is selected, so the mask is the visible mask and the
-per-query nonzero/topk loop (B*T host syncs) is skipped. Kill switch: UNSLOTH_QWEN4_EXP_FAST_QSA=0.
-"""
+"""Qwen4Exp (Qwen3.8-Flash-Next) patches: MoE uses the Qwen3.5-MoE grouped-GEMM backend; QSA indexer skips its per-query
+nonzero/topk loop when kv_length < budget + compress_ratio; UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables."""
 
 __all__ = ["patch_qwen4_exp"]
 
@@ -64,8 +60,8 @@ _reference_ple_forward = None
 def qwen4_exp_ple_layer_forward(self, hidden_states, input_ids, past_key_values, conv_mask=None):
     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     from unsloth_zoo.temporary_patches.qwen4_exp import _reference_ple_forward
-    # Autocast's float32 gate `sum` would make a half residual stream (and every later MoE input) float32.
-    # A float32 residual keeps autocast: it is what casts it for the half short convolution.
+    # Keep a half residual stream half: the float32 gate sum under autocast would make it and every later MoE input
+    # float32; a float32 residual keeps autocast, which casts it for the half short convolution.
     device_type = hidden_states.device.type
     if (
         hidden_states.dtype in (torch.bfloat16, torch.float16)

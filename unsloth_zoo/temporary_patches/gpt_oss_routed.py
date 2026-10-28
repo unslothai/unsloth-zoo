@@ -167,7 +167,7 @@ def _tensors_in(items):
 
 
 def _ptrs(tensors):
-    # Tensor.data_ptr on a Params4bit goes through its __torch_function__ (about 1.5 us each).
+    # Params4bit's __torch_function__ slows Tensor.data_ptr, so call TensorBase.data_ptr directly.
     return [torch._C.TensorBase.data_ptr(t) for t in tensors]
 
 
@@ -450,8 +450,8 @@ def routed_bf16_eligible(experts, hidden_states):
             return False
         if w.dtype == torch.bfloat16 and not _bf16_supported(w.device):
             return False
-    # Below sm80 (T4) only one-token decode routes (moe_routed.sub_sm80_devices). Per device, not
-    # sub_sm80_devices(): its first call runs torch.cuda.device_count(), which a cold fullgraph trace rejects.
+    # Below sm80 (T4) only one-token decode routes (moe_routed.sub_sm80_devices); check per device, not via
+    # sub_sm80_devices(), whose first call runs torch.cuda.device_count(), which a cold fullgraph trace rejects.
     if hidden_states.numel() == hidden_states.shape[-1] or w.device.index is None:
         return True
     return _bf16_supported_index(w.device.index)

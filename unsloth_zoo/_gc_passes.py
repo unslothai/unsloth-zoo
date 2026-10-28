@@ -20,13 +20,9 @@ __all__ = ["collect_garbage"]
 
 
 def collect_garbage(passes = 3, after = None):
-    """Up to `passes` full gc.collect() passes, `after` (e.g. empty_cache) after each.
-
-    Stops after a pass that ran and returned 0. Every pass still runs when gc.callbacks are registered, the
-    pass returned None (gc.collect stubbed by vLLM capture), or the gen-2 stats did not move by exactly one
-    quiet collection (CPython returns 0 without collecting while another thread collects). Not covered:
-    a finalizer that resurrects its object returns 0, so garbage it releases waits for the next automatic pass.
-    """
+    """Up to `passes` gc.collect() passes, calling `after` after each; stops after a pass returning 0 unless
+    gc.callbacks are registered, gc.collect returned None (vLLM stub), or gen-2 stats did not move by exactly one
+    quiet collection; resurrecting finalizers return 0, so garbage waits for the next pass."""
     for _ in range(passes):
         seen = gc.get_stats()[2]
         found = gc.collect()

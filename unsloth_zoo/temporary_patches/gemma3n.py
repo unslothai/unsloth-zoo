@@ -58,8 +58,7 @@ pass
 
 @torch_compile
 def Gemma3nRMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
-    # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
-    # See https://github.com/huggingface/transformers/pull/29402
+    # Llama does x.to(float16) * w but Gemma2 does (x * w).to(float16); see transformers PR 29402.
     output = self._norm(x.float())
     # transformers 5.5 dropped the tensor(1.0) weight of with_scale=False norms.
     if getattr(self, "with_scale", True) and hasattr(self, "weight"):
@@ -134,7 +133,6 @@ def patch_Gemma3nTextAltUp_predict():
 pass
 
 def patch_Gemma3nConv_Embed_forwards():
-    # helper function to patch both forwards
     try:
         patch_Gemma3nConvNormAct_forward()
         patch_Gemma3nMultimodalEmbedder_forward()
@@ -243,8 +241,7 @@ _GEMMA3N_ATTENTION_FORWARD = {}
 _GEMMA3N_KV_LEAVES_KEY = "_unsloth_kv_leaves"
 
 def _gemma3n_shared_kv_stand_in(config, anchor):
-    # One stand-in per forward: every layer of a forward, and its checkpoint recompute, gets the same
-    # rotary cos tensor, so it scopes the entry and a finalizer drops it with that tensor.
+    # One stand-in per forward, scoped to the rotary cos tensor that every layer and checkpoint recompute shares; a finalizer drops the entry with that tensor.
     key = (id(config), None if anchor is None else id(anchor))
     stand_in = _GEMMA3N_SHARED_KV.get(key)
     if stand_in is None:
@@ -267,9 +264,8 @@ def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
             kwargs["past_key_values"] = holder
         shared = getattr(holder, "shared_layers", None)
 
-    # Reentrant checkpointing stores source KV with no graph and recomputes shared layers first:
-    # collect their KV gradient on leaves and hand it to the source layer's recompute below.
-    # Leaves live in the mapping itself (plain dict on 5.6 - 5.8, UserDict later), which is only indexed by layer.
+    # Reentrant checkpointing stores source KV with no graph and recomputes shared layers first; their KV grads go to
+    # leaves in the shared mapping (plain dict on 5.6-5.8, UserDict later), indexed only by layer.
     grad_enabled = torch.is_grad_enabled()
     leaves = shared.get(_GEMMA3N_KV_LEAVES_KEY) if shared is not None else None
     if self.is_kv_shared_layer and shared is not None and grad_enabled:

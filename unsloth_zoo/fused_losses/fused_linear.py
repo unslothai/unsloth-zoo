@@ -60,8 +60,8 @@ _ACCURACY = os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1")
 _U_FP32 = os.environ.get("UNSLOTH_LOGPROB_U_FP32", "0") == "1"
 # fp32 forward + half backward is WRONG (3x worse gradient); both passes read this so saved lse matches recompute.
 _RECOMPUTE_FP32 = os.environ.get("UNSLOTH_FUSED_LINEAR_RECOMPUTE_FP32", "1") != "0"
-# Half backward recompute with each _TOP_COLS block's two largest logits restored to fp32; plain half logits under
-# an fp32 lse are 3x worse than TRL (top logits' rounding no longer cancels).
+# Half backward recompute restores each _TOP_COLS block's two largest logits to fp32; plain half logits under an fp32
+# lse are 3x worse than TRL, since top-logit rounding no longer cancels.
 _BWD_EXACT_TOP = os.environ.get("UNSLOTH_FUSED_LINEAR_BWD_EXACT_TOP", "1") != "0"
 _SINGLE_MIN_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_SINGLE_MIN_COLS", 8192)), 0)
 # 128 not 2048: frequent tokens cluster at low ids, so wide blocks give 3x worse gradients.
@@ -79,8 +79,8 @@ _HIP_TILES = torch.version.hip is not None
 _BWD_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_ROWS", 1024 if _HIP_TILES else 4096)), 1)
 _BWD_TILE_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_TILE_MB", 8 if _HIP_TILES else 256) * 1024**2), 1)
 _HALF = (torch.float16, torch.bfloat16)
-# Frozen CUDA head: flash-style tiled forward gradient; no-grad makes the same calls so policy == reference bitwise.
-# Cards > 24 GiB keep chunks below 4096 rows (faster there on A100).
+# Frozen CUDA head uses a flash-style tiled forward gradient; no-grad makes the same calls so policy == reference
+# bitwise; cards above 24 GiB keep chunks below 4096 rows (faster there on A100).
 _FLASH = os.environ.get("UNSLOTH_FUSED_LINEAR_FLASH", "1") != "0"
 _FLASH_MIN_ROWS = (max(int(_env_float("UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS", 0)), 0)
                    if os.environ.get("UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS") is not None else None)
@@ -191,8 +191,8 @@ def _logits_mode(device, dtype = torch.float16):
 
 
 def _exact_lpt(device, dtype):
-    # Static (the fake uses it): True iff _logits_mode picks the exact target logit, so logps is not log p_t of
-    # the logits the gradient reads and the op returns that separately.
+    # Static (the fake uses it): True iff _logits_mode picks the exact target logit, so logps is not log p_t of the
+    # logits the gradient reads; the op returns that separately.
     return device.type == "cuda" and _ACCURACY == "2" and dtype in _HALF
 
 
@@ -213,15 +213,14 @@ def _half_mm_bounded(a, b):
         torch.linalg.vector_norm(b, math.inf, dtype = torch.float32)
     scale = torch.exp2(torch.floor(torch.log2(32768.0 / bound.clamp_min(1e-30)))).clamp_(min = 2.0 ** -38, max = 1.0)
     if not _capturing(a):
-        # The bound is worst case, so it almost never trips (hidden rows sum to ~1e2-1e3, scaled dz rows to ~1e4).
-        # When it does, scaling a row down can flush its small entries below fp16's subnormal range (a +-16384 row
-        # with a 1e-4 entry loses that entry's contribution), so take the exact fp32 GEMM of upcast operands for this
-        # chunk. One host read of a flag; under CUDA graph capture (no sync allowed) the scaled path below runs.
+        # Bound is worst case (hidden rows sum to ~1e2-1e3, scaled dz rows ~1e4), so it rarely trips; when it does,
+        # scaling a row down can flush small entries below fp16 subnormal range, so take an exact fp32 GEMM for this
+        # chunk; under CUDA graph capture (no sync allowed) the scaled path runs.
         if bool((scale < 1.0).any()):
             return torch.mm(a.float(), b.float())
         return (a @ b).float()
-    # Capture: a scale below fp16's smallest subnormal (2^-24) would round to 0 and drop the row, so apply it as two
-    # power-of-two factors that are each representable (2^-14 is the smallest normal); the product stays exact.
+    # Under capture, a scale below fp16's smallest subnormal (2^-24) would round to 0, so apply it as two power-of-two
+    # factors (2^-14 is the smallest normal); product stays exact.
     s1 = scale.clamp(min = 2.0 ** -14)
     a = a * s1.to(a.dtype)
     a.mul_((scale / s1).to(a.dtype))
@@ -303,8 +302,8 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fl_nll(zt, m, so):
-        # lse - zt from the max m and so = sum_{j != t} exp(z_j - m): softplus(log(so) + m - zt) never adds e^0 = 1
-        # to e^-margin, so it stays exact past the fp32 cliff (margin ~16.6, arXiv 2610.31642) and is never < 0.
+        # lse - zt from the max m and so = sum_{j != t} exp(z_j - m); softplus(log(so) + m - zt) never adds e^0 = 1 to
+        # e^-margin, so it stays exact past the fp32 cliff (margin ~16.6, arXiv 2610.31642) and is never negative.
         r = tl.log(so) + m - zt
         return tl.maximum(r, 0.0) + _fl_log1p(tl.exp(-tl.abs(r)))
 
@@ -323,8 +322,8 @@ if _HAS_TRITON:
     @triton.jit
     def _fl_block_others(x_row, bias_ptr, bstart, n_end, tgt, m, inv_t, scale, cap, cols,
                          HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr):
-        # sum_{j != tgt} exp(z_j - m) over the block at bstart: the sweep leaves the target's block out entirely (a
-        # scalar choice per block, no per-element mask in the hot loop) and this re-read adds the rest of it back.
+        # sum_{j != tgt} exp(z_j - m) over the block at bstart: the sweep leaves the target's block out (a scalar choice
+        # per block, no per-element mask) and this re-read adds the rest back.
         offs = bstart + cols
         ok = offs < n_end
         x = tl.load(x_row + offs, mask = ok, other = 0.0).to(tl.float32)
@@ -337,8 +336,8 @@ if _HAS_TRITON:
     @triton.jit
     def _fl_row_stats(row, valid, zt, m, so, a, exact_ptr, logp_ptr, lse_ptr, ent_ptr, lpt_ptr, inv_t, scale, cap,
                       HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr, WANT_ENT: tl.constexpr):
-        # so excludes the target. lse must match the logits the gradient reads; mixing in the exact target logit biases
-        # gradients. lpt = log p_t of those logits (logp unless HAS_EXACT): the backward's 1 - p_t = -expm1(lpt).
+        # so excludes the target; lse must match the logits the gradient reads (mixing in the exact target logit biases
+        # gradients); lpt = log p_t of those logits, logp unless HAS_EXACT; backward uses 1 - p_t = -expm1(lpt).
         s = so + tl.where(valid, tl.exp(zt - m), 0.0)
         tl.store(lse_ptr + row, m + tl.log(s))
         nll = _fl_nll(zt, m, so)
@@ -438,8 +437,8 @@ if _HAS_TRITON:
         WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,
         WANT_TGT: tl.constexpr, WANT_BLOCK_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        # Split width depends only on the vocabulary, so a row's statistics do not depend on chunk size.
-        # WANT_BLOCK_TOP: top_ptr[row, 2 k + {0, 1}] = two largest z of the k-th SUB-aligned column group.
+        # Split width depends only on the vocabulary, so row statistics do not depend on chunk size; WANT_BLOCK_TOP
+        # writes the two largest z of each SUB-aligned column group k to top_ptr[row, 2k + {0, 1}].
         row = tl.program_id(0).to(tl.int64)
         split = tl.program_id(1).to(tl.int64)
         x_row = x_ptr + row * x_stride
@@ -581,9 +580,9 @@ if _HAS_TRITON:
         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_ENT_GRAD: tl.constexpr,
         ALIASED: tl.constexpr, HAS_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        # dz = g * (keep * onehot + each - p) - ge * p * (z - lse + H). HAS_TOP: half x; each SUB group's two largest
-        # z take the forward's fp32 values (rounding keeps order; ties in half take their mean). The target column
-        # takes the forward's log p_t: 1 - p_t = -expm1(lpt) is the others' mass (exp(z_t - lse) rounds to 1).
+        # dz = g * (keep * onehot + each - p) - ge * p * (z - lse + H); with HAS_TOP (half x) each SUB group's two
+        # largest z take fp32 forward values (ties in half take their mean); target column takes forward log p_t, since
+        # 1 - p_t = -expm1(lpt) (exp(z_t - lse) rounds to 1).
         row = tl.program_id(0).to(tl.int64)
         x_row = x_ptr + row * x_stride
         dz_row = dz_ptr + row * dz_stride
@@ -759,8 +758,8 @@ if _HAS_TRITON:
                            beta, log1mb, logb, s_scale, s_cap, t_scale, t_cap, inv_t,
                            MODE: tl.constexpr, WRITE_DZ: tl.constexpr, S_SCALE: tl.constexpr,
                            S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr):
-        # MODE 0: beta = 0, partial loss and (WRITE_DZ) dz = p - q in one pass. MODE 1: beta = 1, partial
-        # sum p (ls - lt). MODE 2: interior, partial sum q (lt - m) and sum p (ls - m).
+        # MODE 0 (beta = 0): partial loss and, if WRITE_DZ, dz = p - q in one pass; MODE 1 (beta = 1): partial sum p (ls
+        # - lt); MODE 2 (interior): partial sums q (lt - m), p (ls - m).
         row = tl.program_id(0)
         blk = tl.program_id(1)
         cols = blk * BLOCK + tl.arange(0, BLOCK)
@@ -894,8 +893,7 @@ def _torch_forward(x, bias, tgt, inv_t, scale, cap, exact, want):
     valid = (tgt >= 0) & (tgt < V)
     tc = torch.where(valid, tgt, torch.zeros_like(tgt)).unsqueeze(-1)
     zt = z.gather(-1, tc).squeeze(-1)
-    # lse without the target, then log p_t = -softplus(lse_o - z_t): exact past the softmax collapse cliff.
-    # z is this call's own tensor: mask the target in place and put it back.
+    # lse without the target, then log p_t = -softplus(lse_o - z_t), exact past softmax collapse; z is this call's own tensor, masked in place then restored.
     lse_o = torch.logsumexp(z.scatter_(-1, tc, -float("inf")), dim = -1)
     z.scatter_(-1, tc, zt.unsqueeze(-1))
     lse = torch.logaddexp(lse_o, zt)
@@ -988,8 +986,7 @@ def _logits_into(h, w, out, fp32_logits):
         elif h.is_cuda:
             torch.mm(h, w[a:b].t(), out = out[:, a:b])
         else:
-            # CPU fp16 mm with out= into this strided column slice reads the slice's stale contents on
-            # avx512_fp16 hosts (torch 2.10, oneDNN): NaN logits from an uninitialised buffer, wrong ones otherwise.
+            # CPU fp16 mm with out= into a strided column slice reads stale contents on avx512_fp16 hosts (torch 2.10, oneDNN): NaN or wrong logits.
             out[:, a:b].copy_(torch.mm(h, w[a:b].t()))
     return out
 
@@ -1450,8 +1447,8 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
     fp32_logits, exact_mode = _logits_mode(device, compute_dtype)
     if compute_dtype not in _HALF:
         fp32_logits, exact_mode = False, False
-    # log p_t of the logits the gradient reads; only the exact target logit makes it differ from logps (else a
-    # copy at the end: an op output may not alias another).
+    # log p_t of the logits the gradient reads; differs from logps only with the exact target logit, else a copy at the
+    # end (an op output may not alias another).
     exact_lpt = _exact_lpt(device, compute_dtype)
     lpt = torch.zeros(N, **f32) if exact_lpt else None
     if n_keep > 0:
@@ -2128,8 +2125,7 @@ def _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap
     log1mb = math.log1p(-beta) if mode == 2 else 0.0
     logb = math.log(beta) if mode == 2 else 0.0
     part = torch.empty((R, NB, 2), device = s.device, dtype = torch.float32)
-    # c = d at the student's argmax. With p ~ 1 there, d - sum_k p_k d_k cancels to rounding noise in fp32 (the
-    # softmax-collapse failure); written as (d - c) - sum_k p_k (d_k - c) the peak's own term drops out exactly.
+    # c = d at the student's argmax; subtracting it avoids fp32 cancellation of d - sum_k p_k d_k when p ~ 1 (softmax collapse), dropping the peak term exactly.
     c = torch.zeros(R, device = s.device, dtype = torch.float32)
     if mode != 0:
         j = s.argmax(-1, keepdim = True)

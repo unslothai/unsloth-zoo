@@ -635,9 +635,9 @@ _assume_constant_result = getattr(torch.compiler, "assume_constant_result", None
 
 @_assume_constant_result
 def _resolve_decode_mode(index):
-    # Dynamo runs this eagerly on real tensors at trace time, so a cold compiled region bakes in the probed mode
-    # instead of the fma fallback the op body (traced on FakeTensors) would see.
-    # Pass the index so a traced call never constructs a torch.device.
+    # Dynamo runs this eagerly on real tensors at trace time, so a cold compiled region bakes in the probed mode, not
+    # the fma fallback the op body (traced on FakeTensors) would see; pass the index so a traced call never builds a
+    # torch.device.
     return _asm_ok(index, eager = True)
 
 

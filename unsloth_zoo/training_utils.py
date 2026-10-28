@@ -50,8 +50,7 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
     """Warn/raise when labels are all -100 (masked), which zeroes the loss."""
     # All Unsloth Zoo code licensed under LGPLv3
     if isinstance(train_dataset, datasets.IterableDataset):
-        # Skip the check since the code below assumes
-        # an indexable dataset
+        # Skip IterableDataset since the checks below assume an indexable dataset.
         return
     
     if len(train_dataset) == 0: return
@@ -170,8 +169,7 @@ def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
         return cached
 
     if instance_forward:
-        # Per-instance forward unknown at class creation, so this rare path keeps a
-        # generic signature (remove_unused_columns keeps all columns).
+        # Per-instance forward is unknown at class creation, so this rare path keeps a generic signature (remove_unused_columns keeps all columns).
         _wrapped = _bf16_autocast_instance_forward
     else:
         _orig_forward = cls.forward
@@ -183,8 +181,7 @@ def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
                 self, args, kwargs, compute_dtype,
             )
 
-    # Unique name for module-level registration; __name__ stays the base class so
-    # save_pretrained records the base in architectures.
+    # Unique name for module-level registration; __name__ stays the base class so save_pretrained records the base in architectures.
     pickle_name = cls.__name__ + "WithUnslothBf16Autocast"
     module = sys.modules[__name__]
     if hasattr(module, pickle_name) and getattr(module, pickle_name) is not None:
@@ -217,9 +214,8 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
 
     instance_forward = model.__dict__.get("forward")
     if instance_forward is not None:
-        # An instance-level forward shadows a class override, so swapping __class__ alone
-        # would not intercept it; move it off the instance and route via instance_mode so
-        # forward stays a class attribute (picklable/deepcopy-safe).
+        # An instance-level forward shadows the class override, so swapping __class__ alone won't intercept it; move it
+        # off the instance and route via instance_mode so forward stays a class attribute (picklable/deepcopy-safe)
         model._unsloth_autocast_orig_forward = instance_forward
         del model.__dict__["forward"]
         model.__class__ = _make_bf16_autocast_subclass(
@@ -265,10 +261,9 @@ def _iter_configs(config):
                 stack.append(sub)
 
 
-# Marks a config that never had use_cache, as distinct from one holding None.
-# A class, not object(): deepcopy and pickle preserve a class's identity but not
-# an instance's, which broke the `is` check below and wrote this unserializable
-# object into cfg.use_cache (TRL deepcopies a prepared model for its ref model).
+# Marks a config with no use_cache, distinct from None; a class not object() because deepcopy/pickle keep a class's
+# identity but not an instance's, which broke the is check and wrote an unserializable object into cfg.use_cache (TRL
+# deepcopies a prepared model for its ref model)
 class _ABSENT:
     """Marker type; never instantiated."""
 
@@ -287,8 +282,7 @@ def disable_use_cache(model):
     originals = getattr(model, "_unsloth_use_cache_originals", None)
     if originals is None:
         originals = []
-    # Record by identity, not only on the first call: a config first reached
-    # later was disabled but never recorded, so restore could not undo it.
+    # Record by identity, not only on the first call: a config first reached later was disabled but unrecorded, so restore could not undo it.
     recorded = {id(cfg) for cfg, _ in originals}
     for cfg in _iter_configs(config):
         has_use_cache = hasattr(cfg, "use_cache")
@@ -298,9 +292,8 @@ def disable_use_cache(model):
             # first baseline wins; _ABSENT so restore deletes rather than invents
             originals.append((cfg, cfg.use_cache if has_use_cache else _ABSENT))
             recorded.add(id(cfg))
-        # Set it even when absent: transformers 5 sub-configs inherit no default,
-        # so a forward reading self.config.use_cache raises AttributeError
-        # instead (stepfun-ai/Step-3.7-Flash ships exactly such a text config).
+        # Set it even when absent: transformers 5 sub-configs inherit no default, so a forward reading
+        # self.config.use_cache raises AttributeError instead (stepfun-ai/Step-3.7-Flash ships such a text config)
         cfg.use_cache = False
     if originals:
         try:
@@ -380,8 +373,7 @@ def prepare_model_for_training(
         # We need to upcast to float32
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
-        # Full finetuning upcasts weights to float32; sync config dtype so the
-        # KV cache matches and generation avoids a dtype mismatch in index_copy_().
+        # Full finetuning upcasts weights to float32; sync config dtype so the KV cache matches and generation avoids a dtype mismatch in index_copy_().
         if full_finetuning:
             model._unsloth_original_dtype = dtype
             model.config.torch_dtype = torch.float32
@@ -400,8 +392,7 @@ def prepare_model_for_training(
     pass
     # Defer to an external norm dtype policy (_pre_set_compute_dtype); skip those params.
     _externally_managed_param_ids = set()
-    # Also detect norms by owning-module class name (catches custom norms whose param
-    # names lack a token, e.g. Gemma audio tower).
+    # Also detect norms by owning-module class name; catches custom norms whose param names lack a token (e.g. Gemma audio tower).
     _norm_class_re = re.compile(r"(?i)(rms_?norm|layer_?norm)")
     _norm_param_ids = set()
     for _, _module in model.named_modules():
@@ -426,8 +417,7 @@ def prepare_model_for_training(
             or "norm2." in nm
         )
 
-    # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to
-    # requires_grad=True and would all stay trainable on the LoRA path (#2343 review).
+    # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to requires_grad=True and would all stay trainable on the LoRA path (ref 2343 review).
     _is_peft_model = hasattr(model, "peft_config")
 
     for name, param in model.named_parameters():
@@ -447,18 +437,15 @@ def prepare_model_for_training(
                 requires_grad = True
             elif (_is_peft_model and "bias" in name and param.requires_grad
                     and ".modules_to_save." not in name):
-                # Respect PEFT's bias decision: bias="all"/"lora_only" marks biases
-                # trainable; freezing them here disabled bias training (#2343).
-                # _keep_param_dtype: keep the loaded dtype, since fp32 on a bf16/fp16
-                # Linear breaks the matmul. modules_to_save is excluded so a saved head
-                # with a frozen weight isn't partially trained via its bias (#2343 review).
+                # Respect PEFT's bias setting (bias="all"/"lora_only" mark biases trainable; ref 2343);
+                # _keep_param_dtype keeps the loaded dtype since fp32 breaks the matmul on a bf16/fp16 Linear;
+                # modules_to_save is excluded so a frozen head is not partly trained via its bias (ref 2343 review)
                 requires_grad = True
                 _keep_param_dtype = True
             else:
                 requires_grad = False
         else:
-            # Norms need fp32 for adam writeback (~60% of bf16 norm updates round to
-            # zero otherwise); a prior dangling else on train_lm_head had clobbered this.
+            # Norms need fp32 for Adam writeback (~60% of bf16 norm updates round to zero otherwise); a dangling else on train_lm_head once clobbered it.
             requires_grad = True
             upcast = False
             if (train_layernorms
@@ -467,15 +454,13 @@ def prepare_model_for_training(
                     and not _disable_float32_norm_upcast):
                 upcast = True
         pass
-        # Set training or not
         if requires_grad:
             param.requires_grad_(True)
         else:
             param.requires_grad_(False)
 
-        # Cast storage in place (keeps Parameter identity so tied weights stay tied);
-        # skip externally-managed params (preserve their fp32 cast) and dtype-pinned
-        # params (trainable biases must match their Linear weight).
+        # Cast storage in place to keep Parameter identity so tied weights stay tied; skip externally-managed params
+        # (keep their fp32 cast) and dtype-pinned params (trainable biases must match their Linear weight)
         if (requires_grad
                 and not _keep_param_dtype
                 and id(param) not in _externally_managed_param_ids):
@@ -493,8 +478,7 @@ def prepare_model_for_training(
                 param.data = param.data.to(torch.float32)
     pass
 
-    # Wrap only if fp32 norms actually exist (our upcast, legacy env, or external policy);
-    # gating on presence avoids wrapping a model that has none.
+    # Wrap only if fp32 norms exist (our upcast, legacy env, or external policy); gating on presence avoids wrapping a model with none.
     _has_fp32_norms = any(
         _is_norm_parameter(nm, p) and p.dtype == torch.float32
         for nm, p in model.named_parameters()
@@ -543,9 +527,9 @@ def prepare_model_for_training(
             model.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, input, output):
-                # Deliberately NOT guarded on is_compiling() like the peft_utils pre hook:
-                # this is the only thing making a FROZEN embedding's output require grad,
-                # so skipping it would silently starve the adapters of gradients.
+                # Deliberately NOT guarded on is_compiling(), like the peft_utils pre hook: this is the only thing
+                # making a frozen embedding's output require grad, so skipping it would silently starve adapters of
+                # gradients
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass
@@ -582,8 +566,7 @@ pass
 
 
 def get_max_steps(training_args, n_training_samples, train_dataset):
-    # Approximately from https://github.com/huggingface/transformers/blob/main/src/transformers/trainer.py#L2092
-    # Determines batch size, max steps, ga etc
+    # Approximately from transformers trainer.py line 2092; determines batch size, max steps, ga etc.
     if training_args.world_size > 1:
         raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
     pass
@@ -686,7 +669,6 @@ def unsloth_train(trainer):
     total_train_batch_size, max_steps, num_train_epochs = \
         get_max_steps(training_args, n_training_samples, trainer.train_dataset)
 
-    # Get LR scheduler
     lr_scheduler = transformers_get_scheduler(
         name = training_args.lr_scheduler_type,
         optimizer = optimizer,
@@ -701,10 +683,6 @@ def unsloth_train(trainer):
     clip_grad_norm_ = torch.nn.utils.clip_grad_norm_
     bsz = training_args.per_device_train_batch_size
     ga  = training_args.gradient_accumulation_steps
-    # inverse_gradient_accumulation_steps = 1.0 / ga
-    # inverse_gradient_accumulation_steps = \
-    #     torch.FloatTensor([inverse_gradient_accumulation_steps])\
-    #     .to(device = "cuda:0", non_blocking = True)[0]
 
     # Mixed precision scaling
     _amp_device = DEVICE_TYPE_TORCH if DEVICE_TYPE in ("xpu", "npu") else "cuda"
@@ -763,7 +741,6 @@ def unsloth_train(trainer):
         f' "-____-"     Number of trainable parameters = {n_parameters_to_train:,}'
     print(debug_info)
 
-    # Get per epoch counter
     max_iters_per_epoch = math.ceil(n_training_samples / total_train_batch_size)
     leftover_samples = n_training_samples % total_train_batch_size
     # But also consider leftover steps
@@ -771,7 +748,6 @@ def unsloth_train(trainer):
     if leftover_samples == 0: leftover_ga = ga
 
     logging_steps = training_args.logging_steps
-    # Go through each epoch
     start_time = time.time()
     with ProgressBar(total = max_steps, dynamic_ncols = True) as progress_bar:
         for epoch in range(num_train_epochs):
@@ -810,7 +786,6 @@ def unsloth_train(trainer):
 
                     with autocast_context_manager:
                         loss = model(input_ids = input_ids, labels = labels, n_items = n_items).loss
-                        # loss = loss * inverse_gradient_accumulation_steps
                         accumulated_loss += loss.detach().to(train_device)
                     pass
 
@@ -847,7 +822,6 @@ def unsloth_train(trainer):
     print("Unsloth: Finished training!")
     end_time = time.time()
 
-    # Return stats
     trainer_stats = Trainer_Stats(metrics = {"train_runtime" : end_time - start_time})
     return trainer_stats
 pass

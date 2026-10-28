@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Generic NextN / MTP head built from the target's own decoder layer class.
-
-Teacher-forced training follows llama.cpp's `draft-mtp` driver (common/speculative.cpp).
-Chain p starts at position p from (h[p-1], x_p). Its row m (position p+m, token x_{p+m})
-takes h = the output of step m-1 of the same chain. A head's KV holds row 0 of every chain
-(llama.cpp fills it from the target's h over committed positions) plus the chain's own
-rows 1..m. Single-head families reuse head 0 recursively; chained families run head k at
-step k, which rebuilds its own rows 0..k, exactly as the driver does.
-"""
+"""Generic NextN/MTP head built from the target's decoder layer class; teacher forcing follows llama.cpp's draft-mtp
+driver (chain p starts from (h[p-1], x_p)); single-head families reuse head 0, chained families run head k at step k."""
 
 __all__ = [
     "NextNHead",
@@ -79,8 +72,7 @@ class _ChainKV:
 
 
 def _window_mask(mask, positions, cache, window):
-    """Restrict an additive mask to keys within `window` positions of each query (HF / llama.cpp
-    sliding window: attend iff q_pos - k_pos < window). Key positions are tracked on the cache."""
+    """Restrict an additive mask to sliding-window keys (attend iff q_pos - k_pos < window, as HF and llama.cpp); key positions are tracked on the cache."""
     key_positions = positions if cache.positions is None else torch.cat([cache.positions, positions], dim = 1)
     distance = positions[:, :, None] - key_positions[:, None, :]
     outside = (distance >= window)[:, None]
@@ -147,11 +139,8 @@ def _call_kwargs(layer):
 
 
 class NextNHead(nn.Module):
-    """Native MTP head(s) of a DeepSeek-V3 style family, outside the target model.
-
-    `state_dict()` uses canonical names (see mtp_families), `mtp_state_dict()` the checkpoint's.
-    The token embedding and lm_head are the target's (or the head's own frozen copies).
-    """
+    """Native MTP head(s) of a DeepSeek-V3 style family; state_dict() uses canonical names, mtp_state_dict() the
+    checkpoint's; embedding and lm_head are the target's or frozen copies."""
 
     def __init__(self, config, family = None):
         super().__init__()
@@ -206,8 +195,8 @@ class NextNHead(nn.Module):
             mapped = self.family.from_ckpt(name, n)
             return mapped is not None and mapped[1].split(".")[2] not in frozen
 
-        # A full-model save drops the MTP layer, so owned copies (unlike duplicates, which
-        # llama.cpp and the loader replace with the target's matrices) must be appended back.
+        # A full-model save drops the MTP layer, so owned copies must be appended back; duplicates are not, since
+        # llama.cpp and the loader use the target's matrices.
         prefix = getattr(self, "_ckpt_prefix", None)
         prefix = self.family.default_prefix() if prefix is None else prefix
         owned = {}
@@ -244,9 +233,8 @@ class NextNHead(nn.Module):
         return out[0] if isinstance(out, (tuple, list)) else out
 
     def attach_frozen(self, state_dict, target_embed = None, target_lm_head = None):
-        """Pop head-serialized embedding / lm_head copies out of `state_dict`. Copies equal to
-        the target's matrices are dropped (the target's are used instead); others stay as frozen
-        buffers. Exports never write either. Returns {canonical name: "duplicate" | "owned"}."""
+        """Pop head-serialized embed/lm_head copies from state_dict: copies equal to the target's are dropped, others
+        stay as frozen buffers; exports never write either; returns {canonical name: duplicate | owned}."""
         kinds = {}
         for i, head in enumerate(self.heads):
             for canon, attr, target in (
@@ -297,11 +285,8 @@ class NextNHead(nn.Module):
         )
 
     def forward_train(self, hidden_in, input_ids, embed_tokens, attention_mask = None, num_steps = 1, position_ids = None):
-        """Teacher-forced drafting; same contract and return value as Qwen35MTPHead.forward_train.
-
-        hidden_in is the target hidden the family feeds (post final norm, or the last layer's
-        output for `h_source="last_layer"` families).
-        """
+        """Teacher-forced drafting, same contract as Qwen35MTPHead.forward_train; hidden_in is the target hidden the
+        family feeds (post final norm, or last layer output for h_source="last_layer")."""
         B, S = input_ids.shape
         device = input_ids.device
         valid = torch.ones(B, S, dtype = torch.bool, device = device) if attention_mask is None \
@@ -365,12 +350,8 @@ class NextNHead(nn.Module):
 
     @torch.no_grad()
     def draft_greedy(self, hidden_in, input_ids, embed_tokens, lm_head_weight, anchor, num_steps):
-        """Greedy draft of `num_steps` tokens after committed prefix input_ids[:, :anchor + 1].
-
-        Mirrors the driver: every head's KV covers committed rows (x_j, h[j-1]) for j <= anchor;
-        step k decodes the drafted row at position anchor + k under head k (chained) or head 0.
-        Returns token ids [B, num_steps].
-        """
+        """Greedy draft of num_steps tokens after input_ids[:, :anchor + 1]; step k uses head k if chained else head 0;
+        KV covers rows (x_j, h[j-1]) for j <= anchor; returns token ids [B, num_steps]."""
         B = input_ids.shape[0]
         device = input_ids.device
         dtype = self.heads[0].eh_proj.weight.dtype
@@ -411,8 +392,7 @@ class NextNHead(nn.Module):
 
 
 def pack_experts(state_dict, reference):
-    """Per-expert checkpoint tensors -> packed module tensors where `reference` (the module's
-    state_dict) is packed. Returns (state_dict, packed prefixes)."""
+    """Pack per-expert checkpoint tensors into the packed module layout that reference (the module's state_dict) uses; returns (state_dict, packed prefixes)."""
     groups, out = {}, {}
     for name, tensor in state_dict.items():
         m = _PER_EXPERT.match(name)
@@ -491,8 +471,8 @@ def build_nextn_head(config, state_dict = None, dtype = None, device = None, str
                 f"Unsloth: MTP state_dict does not match the head: missing={missing}, unexpected={unexpected}"
             )
         for name, buffer in head.named_buffers():
-            # to_empty leaves persistent buffers the checkpoint does not carry uninitialised
-            # (never the frozen embedding / lm_head copies attached above).
+            # to_empty leaves persistent buffers the checkpoint lacks uninitialised, so float ones are zeroed; never the
+            # frozen embedding / lm_head copies attached above.
             if name in reference and name not in state_dict and buffer.is_floating_point():
                 buffer.zero_()
     if dtype is not None:
@@ -501,8 +481,7 @@ def build_nextn_head(config, state_dict = None, dtype = None, device = None, str
             keep = {n: b.detach().clone().float() for n, b in head.rotary_emb.named_buffers(recurse = False) if "inv_freq" in n}
         frozen = {(i, attr): getattr(h, attr) for i, h in enumerate(head.heads)
                   for attr in ("embed_weight", "lm_head_weight") if getattr(h, attr) is not None}
-        # transformers keeps e.g. MoE routing correction biases in fp32 (_keep_in_fp32_modules*):
-        # rounded to bf16 they reorder the top-k experts.
+        # transformers keeps e.g. MoE routing correction biases in fp32 (_keep_in_fp32_modules*); rounding them to bf16 reorders the top-k experts.
         fp32_names = _keep_in_fp32_names(head.family)
         keep_fp32 = {
             name: tensor.detach().clone().float()
@@ -548,10 +527,7 @@ def _init_unset(head, std):
 
 
 def load_nextn_state_dict(source, config, revision = None):
-    """Read only the MTP tensors of a checkpoint for a NextN family.
-
-    Returns (state_dict with canonical names, per-expert layout as in the checkpoint, info).
-    """
+    """Read only MTP tensors of a NextN family checkpoint; returns (state_dict with canonical names, per-expert layout as in checkpoint, info)."""
     from safetensors import safe_open
     from .mtp import _weight_map
 

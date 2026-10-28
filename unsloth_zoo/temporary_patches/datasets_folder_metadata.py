@@ -37,11 +37,10 @@ _CANDIDATE_REGEX = r"://|\.\.|^[/\\]|^[A-Za-z]:"
 def _file_name_escapes(value):
     if "://" in value:
         return True
-    # Backslashes first: datasets turns them into "/" before joining, so a POSIX normpath
-    # of the raw value would miss "sub\..\..\x" written with backslash separators.
+    # Convert backslashes to slashes first: datasets does so before joining, so normpath of the raw value would miss dot-dot paths written with backslashes.
     relpath = posixpath.normpath(value.replace("\\", "/"))
-    # Windows: Python 3.13 isabs() no longer counts "/x", and "C:x" is drive-relative,
-    # yet os.path.join(dir, either) leaves dir, so check the root and drive directly.
+    # Windows: Python 3.13 isabs() no longer counts a root-relative /x, and C:x is drive-relative, yet os.path.join(dir,
+    # either) leaves dir, so check root and drive directly.
     return (
         os.path.isabs(value)
         or relpath.startswith("/")
@@ -52,8 +51,8 @@ def _file_name_escapes(value):
 
 
 def _is_path_key(name, list_depth):
-    # Only the shapes datasets resolves: a singular key holding a string, a plural key
-    # holding a list of strings. A list under "*_file_name" stays ordinary metadata.
+    # Only shapes datasets resolves: a singular key holding a string, or a plural key holding a list of strings; a list
+    # under a *_file_name key stays ordinary metadata.
     if list_depth == 0:
         return name == "file_name" or name.endswith("_file_name")
     if list_depth == 1:
@@ -62,8 +61,8 @@ def _is_path_key(name, list_depth):
 
 
 def _file_name_arrays(name, array, list_depth = 0):
-    # Folder builders resolve these keys at any depth, and Parquet metadata can wrap them in
-    # dictionary encoding or any list flavour, so unwrap by type rather than by layout.
+    # Folder builders resolve these keys at any depth, and Parquet metadata may wrap them in dictionary encoding or any
+    # list type, so unwrap by type rather than layout.
     import pyarrow as pa
 
     def is_any(kind, *checks):

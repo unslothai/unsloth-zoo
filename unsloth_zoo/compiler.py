@@ -102,11 +102,10 @@ OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 # device capability
 major = None
 minor = None
-# Bound before the branches: DEVICE_TYPE == "cpu" takes none of them, and
-# `fuse_lm_head` then read this global and raised NameError.
+# Bound before the branches: on DEVICE_TYPE cpu none of them run, and fuse_lm_head then read this global and raised NameError.
 OLD_CUDA_ARCH_VERSION = False
-# Visible pre-Turing (or unreadable) card indices. The rewrite is installed before placement,
-# so a head a device_map puts on one skips Inductor and CCE per forward (lm_head_on_old_cuda_arch).
+# Visible pre-Turing or unreadable card indices; the rewrite is installed before placement, so a head a device_map puts
+# on one skips Inductor and CCE per forward (lm_head_on_old_cuda_arch).
 OLD_CUDA_ARCH_INDICES = frozenset()
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
@@ -127,10 +126,8 @@ if DEVICE_TYPE == "cuda":
             pass
         OLD_CUDA_ARCH_INDICES = frozenset(_old_indices)
     else:
-        # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
-        # ask whether a device is present before asking what it can do. There is
-        # no arch to read, and the old-arch compile workarounds only ever run on
-        # a real GPU, so False is the answer that changes nothing.
+        # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE cuda on driverless hosts, so check device presence before capability;
+        # old-arch workarounds need a real GPU, so False changes nothing.
         OLD_CUDA_ARCH_VERSION = False
 elif DEVICE_TYPE == "hip":
     OLD_CUDA_ARCH_VERSION = False
@@ -206,8 +203,8 @@ DISABLE_COMPILE_FUNCTIONS = [
     # nothing today; it is here so one that goes back to importing it by name, the
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
-    # KDA chunk fallback (glm5_next, kimi_linear): Inductor unrolls the per-chunk loop, 25+ min AOT compile.
-    # recurrent_kimi_delta_attention stays compiled: decode only (seq_len 1), 2x faster than eager.
+    # KDA chunk fallback (glm5_next, kimi_linear) stays uncompiled: Inductor unrolls its per-chunk loop into a very long
+    # AOT compile; recurrent_kimi_delta_attention stays compiled (decode only, seq_len 1), faster than eager.
     "chunk_kimi_delta_attention",
 
     # transformers 5.9+ VL files import these; `grid_thw.tolist()` builds shapes from
@@ -227,18 +224,17 @@ DISABLE_COMPILE_FUNCTIONS = [
     "get_vision_interpolation_indices_and_weights",
     "get_vision_bilinear_indices_and_weights",
 
-    # Locally defined grid helpers get their own compile decorators. Listing them
-    # disables helper compilation and allows graph breaks in their callers.
-    # Keep temporal_merge_index listed: it fails on supported torch 2.9.1 even
-    # though it traces on 2.10.0 and 2.13.0.
+    # Locally defined grid helpers get their own compile decorators unless listed (listing disables their compile and
+    # allows graph breaks in their callers); keep temporal_merge_index listed: it fails on supported torch 2.9.1 though
+    # it traces on 2.10.0 and 2.13.0.
     "get_vision_pixel_shuffle_index",   # muse_glimmer
     "get_vision_frame_index",           # kimi_k25
     "get_vision_temporal_merge_index",  # kimi_k25
 ]
 
 
-# Per model_type DISABLE_COMPILE_FUNCTIONS. deepseek_v4 rope: dynamic = True Inductor backward of its
-# trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
+# Per model_type DISABLE_COMPILE_FUNCTIONS: deepseek_v4 rope with dynamic=True, Inductor's backward of the trailing
+# x[..., -rope_dim:] slice reads out of bounds (wrong or NaN grads; pytorch#198553).
 DISABLE_COMPILE_MODEL_FUNCTIONS = {
     "deepseek_v4": ["apply_rotary_pos_emb"],
     # Community port: V4 rope slice plus host-side helpers (dynamo cannot trace tokenizers `NFKC.__new__`).
@@ -273,8 +269,8 @@ MODEL_FUNCTION_SOURCE_REWRITES = {
 }
 
 
-# {model_type: {class: (old, new, mode)}}: a class whose forward contains `old` exactly once leaves
-# DISABLE_COMPILE_MODULES. mode() -> None (stay listed), "stock" (compile unchanged), else apply old -> new.
+# {model_type: {class: (old, new, mode)}}: a class whose forward has old exactly once leaves DISABLE_COMPILE_MODULES;
+# mode() None keeps it listed, stock compiles as-is, else old -> new.
 MODULE_FORWARD_SOURCE_REWRITES = {
     "deepseek_v4": {
         "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
@@ -289,9 +285,8 @@ MODULE_FORWARD_SOURCE_REWRITES = {
 }
 
 
-# {model_type: {class: (old, new)}}: forward rewrites that apply whether or not the class compiles
-# (the eager mixer saves its FP32 upcast for backward; compiled blocks do not, and the helper
-# keeps the stock math under torch.compile).
+# {model_type: {class: (old, new)}}: forward rewrites applied whether or not the class compiles; the eager mixer saves
+# its FP32 upcast for backward, compiled blocks do not; the helper keeps stock math under torch.compile.
 MODULE_FORWARD_EAGER_REWRITES = {
     "deepseek_v4": {"DeepseekV4HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
     "deepseek_v41": {"DeepseekV41HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
@@ -335,9 +330,8 @@ def module_forward_source_rewrites(modeling_file, model_type):
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
             if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
-                # Block compile rebinds a layer's forward to its modeling module's globals, so the
-                # helper the rewritten forward calls must resolve there too, not only in the
-                # generated module that imports it.
+                # Block compile rebinds a layer's forward to its modeling module's globals, so the helper a rewritten
+                # forward calls must also resolve there, not only in the generated module.
                 from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
 
                 modeling_file.unsloth_sinkhorn_knopp = unsloth_sinkhorn_knopp
@@ -748,7 +742,6 @@ _patch_functions = [
 ]
 
 
-# Empty causal mask
 def no_update_causal_mask(*args, **kwargs):
     return None
 
@@ -918,9 +911,8 @@ def _owns_its_lines(node, lines):
     return not after or after.startswith("#")
 
 
-# Emitted into every rewritten block and checked before rewriting, so a second
-# pass is a no-op. Without it the two SDPA fallbacks this emits are themselves
-# valid matches, and re-running triples the block.
+# The AMD aiter marker is emitted into every rewritten block and checked before rewriting, so a second pass is a no-op;
+# without it the two emitted SDPA fallbacks would match and triple the block.
 _AITER_MARKER = "# AMD aiter Flash Attention"
 
 
@@ -1063,15 +1055,13 @@ def _get_compile_folder(use_tempfile=False):
     else:
         location = UNSLOTH_COMPILE_LOCATION
         try:
-            # Try creating the directory
             os.makedirs(location, exist_ok=True)
             return location, UNSLOTH_COMPILE_USE_TEMP
         except Exception as e:
             logger.error(
                 f"Unsloth: Failed to create directory `{UNSLOTH_COMPILE_LOCATION}` because {str(e)}"
             )
-            # Tell every rank to resolve its own temp directory. Creating rank
-            # 0's temp path here could raise before the broadcast completes.
+            # Each rank resolves its own temp directory; creating rank 0's temp path here could raise before the broadcast completes.
             UNSLOTH_COMPILE_USE_TEMP = True
             return None, True
     return location, UNSLOTH_COMPILE_USE_TEMP
@@ -1413,7 +1403,6 @@ def higher_precision_layernorms(modeling_file):
     else:
         dtype = torch.float16
 
-    # Set environment variable
     higher_precision = os.environ.get("UNSLOTH_HIGH_PRECISION_LAYERNORM", "0") == "1"
     if dtype == torch.float32:
         higher_precision = True
@@ -1681,20 +1670,16 @@ def _moe_utils_copy_is_importable(folder):
     """
     if not folder:
         return False
-    # A verbatim moe_utils.py does not settle it: `from moe_utils import ...`
-    # resolves BY NAME, so a planted moe_utils/ package or moe_utils.so in the
-    # same directory is what Python picks, exactly as for a generated module.
-    # Same check, same reasoning, one name over.
+    # A verbatim moe_utils.py does not settle it: `from moe_utils import` resolves by name, so a planted moe_utils/
+    # package or moe_utils.so in the same directory wins; same check as the generated module.
     try:
         _reject_shadowing_import_candidates(folder, "moe_utils")
     except Exception:
         return False
     try:
-        # Absolute, not `.temporary_patches.moe_utils`: transformers finds
-        # relative imports with a regex and joins the raw dotted capture onto the
-        # directory, so the relative spelling makes custom_object_save try to
-        # open unsloth_zoo/temporary_patches.moe_utils.py and fail every
-        # remote-code checkpoint save. See tests/test_relative_imports_resolve.py.
+        # Absolute import, not the relative .temporary_patches.moe_utils: transformers joins the raw dotted capture onto
+        # the directory, so custom_object_save fails on every remote-code save; see
+        # tests/test_relative_imports_resolve.py.
         from unsloth_zoo.temporary_patches.moe_utils import cached_copy_is_importable
     except Exception:
         return False
@@ -1737,8 +1722,7 @@ def _drop_untrusted_cache_from_sys_path(folders):
 _MOE_UTILS_BLOCK_LOCK = threading.Lock()
 _MOE_UTILS_BLOCK = {"depth": 0, "previous": None, "was_present": False}
 
-# Distinct from None, which is itself a meaningful binding: None in sys.modules
-# is what BLOCKS the name.
+# Sentinel distinct from None, which is itself a meaningful binding: None in sys.modules is what blocks the name.
 _NO_MOE_UTILS_BINDING = object()
 
 
@@ -1796,10 +1780,9 @@ def _untrusted_cache_kept_out_of_imports(*folders):
         if binding is _NO_MOE_UTILS_BINDING:
             yield
             return
-    # Only the outermost guard touches sys.modules, or the inner one saves the
-    # outer's entry and restores it permanently. Mutations sit inside the try and
-    # the increment arms the restore, since a signal lands between bytecodes:
-    # depth first, name second, so an interrupt restores what was recorded.
+    # Only the outermost guard touches sys.modules, or an inner one saves the outer entry and restores it permanently;
+    # mutations sit inside the try, depth is bumped before the name, since a signal lands between bytecodes, so an
+    # interrupt restores what was recorded.
     entered = False
     try:
         with _MOE_UTILS_BLOCK_LOCK:
@@ -1833,9 +1816,8 @@ def _reject_shadowing_import_candidates(compile_folder, name):
     it -- the last only when no source is there, which is the case this used to
     call nothing to reject. Suffix lists come from importlib.machinery.
     """
-    # Not a real directory: zipimport claims any sys.path entry that is a ZIP,
-    # so a zip named `unsloth_compiled_cache` passes every isfile check below and
-    # still serves `moe_utils`. See cached_copy_is_importable.
+    # Reject a cache path that exists but is not a directory: zipimport claims any ZIP on sys.path, so a zip named
+    # unsloth_compiled_cache would still serve moe_utils; see cached_copy_is_importable.
     if os.path.exists(compile_folder) and not os.path.isdir(compile_folder):
         raise RuntimeError(
             f"Unsloth: Refusing to import {name} because {compile_folder} exists "
@@ -1855,10 +1837,9 @@ def _reject_shadowing_import_candidates(compile_folder, name):
         (suffix, "sourceless bytecode")
         for suffix in importlib.machinery.BYTECODE_SUFFIXES
     ] + [
-        # Every SOURCE suffix but the one the digest covers. Windows registers
-        # `.pyw`, which loses to `<name>.py` but decides the import when that is
-        # absent -- the case cached_copy_is_importable() calls nothing to reject.
-        # Read from the interpreter, so this is empty on POSIX.
+        # Every source suffix except .py, which the digest covers; Windows registers .pyw, which loses to <name>.py but
+        # decides the import when that is absent, a case cached_copy_is_importable() does not reject; read from the
+        # interpreter, so empty on POSIX.
         (suffix, "a source module")
         for suffix in importlib.machinery.SOURCE_SUFFIXES if suffix != ".py"
     ]
@@ -1931,9 +1912,8 @@ def _replace_compiled_cache_file(function_location, new_write_bytes):
         dir = directory,
     )
     try:
-        # Through the DESCRIPTOR: mkstemp settles who created the file and
-        # nothing after, so reopening the name would put the write and the mode
-        # wherever it resolves by then.
+        # Write via the descriptor, not by reopening the name: mkstemp settles who created the file, and reopening would
+        # put the write and mode wherever the name resolves by then.
         with os.fdopen(descriptor, "wb") as file:
             descriptor = None
             file.write(new_write_bytes)
@@ -2069,8 +2049,7 @@ def _compiled_cache_decision(function_location, write_new_source, overwrite):
     should_write = overwrite or not os.path.isfile(function_location)
     if should_write:
         return True, hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
-    # Digest the file, not write_new_source: UNSLOTH_COMPILE_OVERWRITE=0 keeps an
-    # older cache file on purpose.
+    # Digest the file on disk, not write_new_source: UNSLOTH_COMPILE_OVERWRITE=0 keeps an older cache file on purpose.
     try:
         with open(function_location, "rb") as f:
             return False, hashlib.sha256(f.read()).hexdigest()
@@ -5664,8 +5643,7 @@ pass
 
 
 def compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING=False):
-    # For Liquid, Falcon and other Mamba type models
-    # We disable compiling on them!
+    # Liquid, Falcon and other Mamba-type models: compiling is disabled on causal_conv1d_fn.
     try:
         import causal_conv1d
 
@@ -5880,8 +5858,7 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
 
 def calls_output_capture_target(init, source, target_names):
     """Detect direct calls to submodules targeted by Transformers output hooks."""
-    # A forward decorated with @capture_outputs installs the hooks itself, even
-    # when its captured submodules are built indirectly (e.g. via helpers).
+    # A forward decorated with @capture_outputs installs the hooks itself, even when submodules are built indirectly, e.g. via helpers.
     if re.search(r"^\s*@capture_outputs\b", source, flags=re.MULTILINE):
         return True
     for target_name in target_names:

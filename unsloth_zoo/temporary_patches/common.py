@@ -46,16 +46,12 @@ UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1"
 # "partial" keeps the source rewrites but turns torch.compile off, like compiler.py does.
 UNSLOTH_COMPILE_DISABLE_PARTIAL = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
 
-# Marks this package's wrapper on `transformers.conversion_mapping.get_model_conversion_mapping`.
-# Lives here rather than in the module that installs it because two modules read it:
-# `conversion_mapping_rescope.py` sets it, and `bitsandbytes.py` asks whether the repair is live
-# before its error message blames the transformers version for a load the repair already fixed.
+# Marks this package's wrapper on transformers.conversion_mapping.get_model_conversion_mapping; set in
+# conversion_mapping_rescope.py and read by bitsandbytes.py before it blames the transformers version.
 RESCOPE_PATCH_FLAG = "_unsloth_zoo_patched_composite_prefix_renaming"
 
-# Links a wrapper on that same function to the callable it wraps, for readers that need to walk
-# the chain. Deliberately NOT `__wrapped__`: the rescope unwraps `__wrapped__` to find the
-# function to wrap, so publishing one on a wrapper that must survive would make the rescope
-# replace it instead of sitting on top of it, silently dropping that wrapper's behaviour.
+# Links a wrapper to the callable it wraps; deliberately not __wrapped__, because rescope unwraps __wrapped__ to pick
+# its target and would replace a surviving wrapper, dropping its behaviour.
 WRAPPER_INNER_ATTR = "_unsloth_wrapper_inner"
 
 # Get only allowed options
@@ -64,8 +60,8 @@ import torch
 inductor_config_source = inspect.getsource(torch._inductor.config)
 
 def _persistent_tma_matmul_ok():
-    # torch 2.12+ guards every GEMM size when Inductor considers its TMA templates
-    # (pytorch/pytorch#172925), so a compiled torch._scaled_mm recompiles for each new token count.
+    # torch 2.12+ guards every GEMM size when Inductor considers TMA templates (pytorch/pytorch issue 172925), so a
+    # compiled torch._scaled_mm recompiles per new token count.
     import re
     found = re.match(r"(\d+)\.(\d+)", torch.__version__)
     return found is not None and (int(found.group(1)), int(found.group(2))) < (2, 12)
@@ -118,8 +114,8 @@ def allow_inductor_pool_aliasing():
     custom op is still checked.
     """
     try:
-        # torch._dynamo first: importing runtime_wrappers on its own is a circular import that leaves
-        # torch._dynamo half initialised (torch.compile then fails for the whole process).
+        # Import torch._dynamo first: importing runtime_wrappers alone is a circular import that leaves torch._dynamo
+        # half initialised, which breaks torch.compile for the whole process.
         import torch._dynamo
         import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
     except Exception:
@@ -155,8 +151,7 @@ def get_torch_compile_options(
     UNSLOTH_COMPILE_IGNORE_ERRORS = os.environ.get("UNSLOTH_COMPILE_IGNORE_ERRORS", "0") == "1"
     if UNSLOTH_ENABLE_LOGGING: logging = True
 
-    # https://github.com/pytorch/pytorch/blob/c665594c1edca9a507b0ec8b18ab74a0ecb65bc3/torch/_inductor/config.py#L1283
-    # Needs integer
+    # multi_kernel needs an integer, per torch/_inductor/config.py at L1283, so bools are converted to 1 or 0.
     multi_kernel = 1 if multi_kernel else 0
     if memory_planning: allow_inductor_pool_aliasing()
 
@@ -196,9 +191,7 @@ def get_torch_compile_options(
         # "reorder_for_compute_comm_overlap"  : True, # Fails for single GPU
         "cuda.compile_opt_level"              : "-O2",
         "cuda.enable_cuda_lto"                : True,
-        # "cuda.use_fast_math"                : True, # Disable fast math
-        # Causes incompatible gradient sizes on 2.6
-        # And TypeError: bad operand type for unary -: 'SymbolicCallArg'
+        # cuda.use_fast_math is left off: it causes incompatible gradient sizes on 2.6 and TypeError: bad operand type for unary -: 'SymbolicCallArg'.
         "combo_kernels"                       : combo_kernels,
         "benchmark_combo_kernel"              : True,
         "combo_kernel_foreach_dynamic_shapes" : True,
@@ -273,15 +266,11 @@ def unwrap_already_compiled(function):
     """
     seen = set()
     while callable(function) and hasattr(function, "get_compiler_config"):
-        # A bound method forwards attribute lookups to the function underneath it,
-        # so `__wrapped__` here is the UNBOUND original and following it would drop
-        # the receiver. torch's own `innermost_fn` stops on a bound method for that
-        # exact reason ("id(bound_method) != id(wrapper_function), so we won't
-        # unwrap through __func__ and lose the self binding").
+        # A bound method forwards attribute lookups, so __wrapped__ is the UNBOUND original and following it would drop
+        # the receiver; torch's innermost_fn stops on a bound method for that reason.
         if getattr(function, "__self__", None) is not None: break
         inner = getattr(function, "__wrapped__", None)
-        # No `__wrapped__` (an OptimizedModule, say) or a cycle: leave it be and
-        # let the caller's guard deal with whatever torch makes of it.
+        # No __wrapped__ (an OptimizedModule, say) or a cycle: leave it and let the caller's guard deal with whatever torch makes of it.
         if not callable(inner) or id(inner) in seen: break
         seen.add(id(function))
         function = inner
@@ -289,9 +278,8 @@ def unwrap_already_compiled(function):
 pass
 
 
-# Warn once per call site, not once per compile attempt: the temporary patches
-# re-run at every phase and for every model, so an unwarned repeat would print
-# the same line several times per load.
+# Warn once per call site, not per compile attempt: temporary patches re-run at every phase and for every model, so
+# repeats would print the same line several times per load.
 _UNCOMPILED_CALL_SITES: set = set()
 
 
@@ -358,8 +346,7 @@ def _compile_or_fall_back(*args, **kwargs):
 
 if UNSLOTH_COMPILE_DISABLE:
     torch_compile = noop
-    # For the one caller that applies the fallback itself, so the alias's
-    # routing does not wrap it twice.
+    # _raw_torch_compile is for the one caller that applies the fallback itself, so the alias routing does not wrap it twice.
     _raw_torch_compile = noop
 else:
     torch_compile = functools.partial(

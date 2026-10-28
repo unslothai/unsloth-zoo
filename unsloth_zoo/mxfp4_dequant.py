@@ -44,9 +44,8 @@ except Exception:
 # Bounds the torch path's temporaries to ~256 MB (a whole gpt-oss-120b stack would be 8.5 GB).
 _TORCH_CHUNK_BYTES = 256 << 20
 
-# ROCm Triton (gfx11, Triton 3.6) lowers bf16 x bf16 to v_dot2_bf16_bf16(a, b, +0) (flushes subnormals,
-# -0 -> +0) and fp32 multiply then fp16 cast to v_fma_mixlo_f16(a, b, +0) (-0 -> +0). There the kernel
-# multiplies in fp32 and rounds to 16 bits with integer ops instead.
+# bf16 x bf16 lowers to v_dot2_bf16_bf16 (flushes subnormals, -0 to +0) and fp32-then-fp16 to v_fma_mixlo_f16 (-0 to
+# +0); on ROCm Triton (gfx11, Triton 3.6) the kernel multiplies in fp32 and rounds to 16 bits with integer ops.
 _IS_HIP = torch.version.hip is not None
 
 # torch < 2.12's ldexp forms 2^e in the input dtype: inf from 2^16 in fp16, and from 2^128 (e8m0 255) in fp32 (0 -> NaN).
@@ -261,8 +260,7 @@ def _outside_trace(fn):
         return run
 
 
-# Verdicts reached inside a trace. Never read while tracing (a dict the traced frame read must not change under
-# it), only by the next eager call, which moves them into _KERNEL_VERIFIED.
+# Verdicts inside a trace are never read while tracing (the dict must not change under the traced frame); the next eager call moves them into _KERNEL_VERIFIED.
 _TRACE_VERIFIED = {}
 
 
@@ -301,8 +299,8 @@ def _kernel_verified(device, dtype, transpose):
     if verified is not None:
         return verified
     if _tracing():
-        # The probe's torch.equal is data dependent (fullgraph refuses it, e.g. a cold compiled backward): run it
-        # outside the trace, so the traced graph already gets the verdict (the kernel) instead of the reference.
+        # The probe's torch.equal is data dependent and fullgraph refuses it, so run it outside the trace; the traced
+        # graph gets the kernel verdict, not the reference.
         return _kernel_verified_outside_trace(*key)
     if _TRACE_VERIFIED.get(key) is True:
         _KERNEL_VERIFIED[key] = True

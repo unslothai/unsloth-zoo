@@ -39,26 +39,15 @@ from textwrap import dedent
 import re
 
 
-# transformers releases that drop the bnb quant_state sidecars of some composite checkpoints.
-# `.dev0` bounds so a prerelease sorts with its own release line: without it
-# `Version("5.6.0.dev0") < Version("5.6.0")` puts a 5.6.0 rc inside the window.
-# Compared with `packaging.version.Version`, NOT `unsloth_zoo.utils.Version`: that one answers
-# `Version('5.6.0.1')` for "5.6.0.dev0", which sorts after the release it must sort before.
+# Transformers releases that drop bnb quant_state sidecars of composite checkpoints; .dev0 bounds keep prereleases in
+# their own line; compare with packaging.version.Version, since unsloth_zoo.utils.Version reads 5.6.0.dev0 as 5.6.0.1.
 _QUANT_STATE_BROKEN_TRANSFORMERS = ("5.4.0.dev0", "5.6.0.dev0")
 
 
 def _transformers_drops_prequantized_quant_state():
-    """True when the installed transformers is inside the quant_state defect window.
-
-    transformers PR #44300 (5.4.0) recursed the conversion mapping into `PreTrainedModel`
-    submodules, pulling the text model's `^model.language_model` -> `model` renaming into the
-    composite mapping, where it rewrites the packed weight and its five sidecars off the map.
-    The weight survives because the loader retries the ORIGINAL key when that key is a model
-    parameter; a sidecar's never is. PR #45567 scoped it in 5.6.0.
-
-    Version only, so necessary and not sufficient: it also needs a text submodel mapping that
-    STRIPS the composite prefix (`qwen3_5_text`, `gemma3n_text`), not one that adds one.
-    """
+    """True in the transformers window from 5.4.0 (PR 44300) until 5.6.0 (PR 45567) fixed it, which drops bnb
+    quant_state sidecars; necessary, not sufficient, as a text submodel mapping must also strip the composite prefix
+    (qwen3_5_text, gemma3n_text)."""
     installed = _installed_transformers_version()
     if installed == "unknown": return False
     try:
@@ -71,11 +60,8 @@ def _transformers_drops_prequantized_quant_state():
 
 
 def _installed_transformers_version():
-    """The installed transformers version, or "unknown".
-
-    Falls back to an already-imported `transformers.__version__`: a source checkout or frozen
-    bundle has no `.dist-info` to read. Reads `sys.modules` only, so it never triggers an import.
-    """
+    """Installed transformers version, or unknown; falls back to the already-imported transformers.__version__ for
+    source or frozen builds, and never triggers an import."""
     try:
         from importlib.metadata import version as _version
         return _version("transformers")
@@ -89,18 +75,9 @@ def _installed_transformers_version():
 
 
 def _composite_renaming_repair_installed():
-    """Is the runtime repair for that defect live in THIS process?
-
-    Either package's mark counts (zoo's `conversion_mapping_rescope.py`, unsloth's
-    `fix_transformers_composite_prefix_renaming`), anywhere down the chain, since they compose
-    in either order with `moe_utils_bnb4bit.py`'s wrapper. Follow `WRAPPER_INNER_ATTR` as well
-    as `__wrapped__`: a wrapper that must survive a rescope install cannot publish
-    `__wrapped__`, which the rescope unwraps to choose what to wrap.
-
-    Asked because with the repair live, a module reaching this guard has a checkpoint whose
-    sidecars really are absent, the one case where re-quantizing IS the answer and the version
-    branch says the opposite.
-    """
+    """Repair live? A mark from conversion_mapping_rescope.py or unsloth fix_transformers_composite_prefix_renaming
+    counts anywhere in the chain; also follow WRAPPER_INNER_ATTR, since a rescope-surviving wrapper cannot publish
+    __wrapped__; if live, absent sidecars mean re-quantizing is the answer."""
     try:
         from transformers import conversion_mapping
     except Exception:
@@ -121,8 +98,7 @@ def _packed_weight_without_quant_state_error(module):
     """Message for a Linear4bit whose packed weight arrived with no quant_state."""
     transformers_version = _installed_transformers_version()
     shape = tuple(module.weight.shape)
-    # No cause here: this inspects the module, never the checkpoint, and a genuinely
-    # stateless checkpoint reaches this same line. The branches below qualify it.
+    # No cause here: this inspects the module, not the checkpoint, and a genuinely stateless checkpoint reaches this same line; the branches below qualify it.
     head = (
         f"Unsloth: a bitsandbytes Linear4bit holds what looks like its PACKED 4-bit "
         f"weight (shape {shape}, dtype {module.weight.dtype}, out_features "
@@ -130,8 +106,7 @@ def _packed_weight_without_quant_state_error(module):
         f"cannot be dequantized. Its quantization metadata is missing."
     )
     if _transformers_drops_prequantized_quant_state() and _composite_renaming_repair_installed():
-        # Inside the window, but the repair is live, so the renaming never fired and the
-        # version is not what went wrong here.
+        # Inside the window, but the repair is live so the renaming never fired; the transformers version is not what went wrong here.
         return (
             f"{head}\nInstalled transformers=={transformers_version}, which is inside the "
             f"window that discards quant_state sidecars -- but Unsloth's runtime repair for "

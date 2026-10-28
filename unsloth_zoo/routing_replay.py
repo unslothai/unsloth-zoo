@@ -123,9 +123,8 @@ def routing_replay_engine_args(config):
         )
         return {}
     if _config_is_hybrid_attention(config) and not _vllm_at_least(0, 21):
-        # vLLM 0.14 to 0.20 size the shared capture buffer by KV cache tokens of one group but
-        # index it by slot, so a hybrid model's first generate dies with an IndexError. 0.21
-        # keeps per-request buffers indexed by position.
+        # vLLM 0.14 to 0.20 size the shared capture buffer by one group's KV cache tokens but index it by slot, so a
+        # hybrid model's first generate hits IndexError; 0.21 indexes by position.
         warnings.warn(
             f"Unsloth: {ROUTING_REPLAY_ENV}=1 needs vLLM 0.21 or newer for hybrid attention MoE "
             "models. Routing replay is off.",
@@ -136,8 +135,8 @@ def routing_replay_engine_args(config):
     if _vllm_at_least(0, 21) and not _vllm_at_least(0, 22) and "async_scheduling" in _engine_arg_names():
         # vLLM 0.21 refuses routed experts capture with (default-on) async scheduling.
         args["async_scheduling"] = False
-    # Fused FlashInfer MoE kernels (auto on Blackwell) pick experts internally and leave the
-    # capture all zeros (vllm-project/vllm#44116); the Triton backend goes through the hook.
+    # Fused FlashInfer MoE kernels (auto on Blackwell) pick experts internally and leave the capture all zeros
+    # (vllm-project/vllm 44116); Triton goes through the hook.
     if "moe_backend" in _engine_arg_names():
         args["moe_backend"] = "triton"
     return args
@@ -151,8 +150,8 @@ class _ReplayState:
         self.forwarded_since_record = True
         self.pad_token_id = None
         self.current = None
-        # Gradient checkpointing: routes each decoder forward forced per layer, so the recompute
-        # in backward replays its own forward even after later forwards (chunked GRPO losses).
+        # Gradient checkpointing: each decoder forward is forced per layer, so the backward recompute replays its own
+        # forward even after later forwards (chunked GRPO losses).
         self.in_forward = False
         self.record = None
         self.pending = []
@@ -238,8 +237,8 @@ def _fill_prefix(rows, full, start, store):
 
 
 def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = None):
-    """Store vLLM's per-token expert ids per finished completion. prompt_starts: per-request
-    `SamplingParams.routed_experts_prompt_start` (prompt position of the first returned row)."""
+    """Store vLLM's per-token expert ids per finished completion; prompt_starts gives each request's
+    SamplingParams.routed_experts_prompt_start, the prompt position of the first returned row."""
     if pad_token_id is None:
         pad_token_id = _STATE.pad_token_id
     store = {}
@@ -461,8 +460,7 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
         return None
-    # Left set after the forward on purpose: the gradient checkpointing recompute in
-    # backward must see the same routing as the forward it replays.
+    # Left set after the forward on purpose: the gradient checkpointing recompute in backward must see the same routing as the forward it replays.
     _STATE.current = _build_replay(
         input_ids, kwargs.get("position_ids", None), kwargs.get("attention_mask", None),
     )
@@ -482,8 +480,8 @@ def _uses_checkpointing(decoder):
 
 
 def _fingerprint(ids):
-    # The natural top-k ids, order-free per token. Kept whole rather than hashed: two forwards
-    # whose routes merely hash alike would otherwise swap their replays in the recompute.
+    # Natural top-k ids, order-free per token; kept whole rather than hashed, since forwards whose routes merely hash
+    # alike would swap their replays in the recompute.
     return ids.sort(-1).values.to(torch.int16)
 
 
@@ -505,9 +503,8 @@ def _signature_projection(width, device):
 
 
 def _input_signature(args, tokens):
-    # Per token fp32 random projections of the router input. The recompute feeds the router the
-    # same bits as the forward did, so this tells apart forwards whose natural routes are equal.
-    # Random directions, not a plain sum: zero-centred (LayerNorm) inputs all sum to about zero.
+    # Per token fp32 random projections of the router input, so forwards with equal natural routes are told apart (the
+    # recompute feeds the same bits); random, not a plain sum, as zero-centred (LayerNorm) inputs all sum to about zero.
     x = args[0] if args and torch.is_tensor(args[0]) else None
     if x is None or not x.is_floating_point() or tokens == 0 or x.numel() % tokens != 0:
         return None
@@ -523,28 +520,27 @@ def _input_signature(args, tokens):
 
 
 def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
-    # A router call outside a decoder forward is a checkpoint recompute: pick the recorded forward
-    # whose natural routing it reproduces, without a host sync. None when no forward was recorded.
+    # A router call outside a decoder forward is a checkpoint recompute: it picks the recorded forward with the same
+    # natural routing, with no host sync; None if none was recorded.
     if not _STATE.pending:
         return None
     _STATE.recomputed = True
     candidates = [r[layer_index] for r in _STATE.pending if layer_index in r and r[layer_index][1].shape == ids2.shape]
     if not candidates:
-        # No forward replayed this layer: recompute it exactly as it ran, with no extra ops
-        # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
+        # No forward replayed this layer: recompute it exactly as it ran, with no extra ops, since a non-reentrant
+        # checkpoint rejects a recompute that saves other tensors.
         return _NATURAL
     fp = _fingerprint(ids2)
     match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
     if torch.is_tensor(layer_input):
-        # Recompute reuses the forward's input tensors, so the forward sharing the most addresses
-        # is the one recomputed. A mask, not a narrowed list: in a compiled layer the addresses are only known at run time.
+        # Recompute reuses the forward's input tensors, so the forward sharing the most input addresses is recomputed; a
+        # mask, not a narrowed list, as compiled layers know addresses only at run time.
         recorded = [c[4] if len(c) > 4 and torch.is_tensor(c[4]) else layer_input[:0] for c in candidates]
         mask = _IDENTITY_MASK_OP(layer_input, recorded) if torch.compiler.is_compiling() \
             else _identity_mask(layer_input, recorded)
         match = match & mask.to(match.device, non_blocking = True)
     if signature is not None:
-        # Narrow the natural matches to the forwards whose router input was the same too. Only a
-        # refinement: when no input matches exactly, the natural matches stand as before.
+        # Narrow natural matches to forwards whose router input was the same too; only a refinement, so when no input matches exactly the natural matches stand.
         has = [len(c) > 3 and c[3] is not None and c[3].shape == signature.shape for c in candidates]
         if all(has):
             same = (torch.stack([c[3] for c in candidates]) == signature).flatten(1).all(-1)
@@ -559,9 +555,7 @@ def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
     pick = match.to(torch.int32).argmax().reshape(1)
     forced_all = torch.stack([c[1] for c in candidates])
     forced = forced_all.index_select(0, pick)[0]
-    # Several forwards with the same natural routing but different replays cannot be told
-    # apart, so keep the natural routing there rather than guess. Only the expert set counts:
-    # the same experts in another order route and weight every token identically.
+    # Forwards with equal natural routing but different replays cannot be told apart, so keep the natural routing; only the expert set counts, not its order.
     agree = ((forced_all.sort(-1).values == forced.sort(-1).values).flatten(1).all(-1) | ~match).all()
     valid = torch.stack([c[2] for c in candidates]).index_select(0, pick)[0] & match.any() & agree
     return forced, valid
@@ -569,14 +563,13 @@ def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
 
 def _softmax_gather(logits, ids, renorm):
     if renorm:
-        # Equal to softmax over all experts gathered then renormalised, but without the 0 / 0 NaN
-        # when every forced expert underflows (forced logits far below the natural top-k).
+        # Equal to softmax over all experts gathered then renormalised, but without the 0 / 0 NaN when every forced
+        # expert underflows (forced logits far below natural top-k).
         return F.softmax(logits.float().gather(-1, ids), dim = -1)
     return F.softmax(logits.float(), dim = -1).gather(-1, ids)
 
 
-# Below this the forced experts' probability mass is gone: 1 / total would reach 1e20 in the
-# backward, and the router could not have picked them anyway.
+# Below this the forced experts' probability mass is gone: 1 / total would reach 1e20 in backward, and the router could not have picked them anyway.
 _MIN_RENORM_TOTAL = 1e-20
 
 
@@ -584,10 +577,8 @@ def _probs_gather(probs, ids, renorm):
     w = probs.float().gather(-1, ids)
     if not renorm:
         return w
-    # Forced experts whose probabilities (nearly) all underflowed have no weights to renormalise:
-    # w / total there is 0 / 0, and a subnormal total still overflows the backward (~1 / total).
-    # Those rows return zeros (the router hook then keeps the natural routing); dividing by 1
-    # there keeps the masked-out branch's gradient finite.
+    # Underflowed forced weights return zeros, so the hook keeps natural routing; w / total would be 0 / 0 there and a
+    # subnormal total overflows backward; dividing by 1 keeps the gradient finite.
     total = w.sum(dim = -1, keepdim = True)
     ok = total > _MIN_RENORM_TOTAL
     out = w / torch.where(ok, total, torch.ones_like(total))
@@ -595,8 +586,8 @@ def _probs_gather(probs, ids, renorm):
 
 
 def _formulas():
-    # softmax_renorm also covers gpt-oss style softmax over the top-k logits: they are equal.
-    # probs_*: transformers 5.2 - 5.7 Qwen MoE routers return softmax probabilities as "logits".
+    # softmax_renorm also covers gpt-oss style softmax over top-k logits (they are equal); probs_*: transformers 5.2 -
+    # 5.7 Qwen MoE routers return softmax probabilities as logits.
     return OrderedDict(
         softmax_renorm = lambda logits, ids: _softmax_gather(logits, ids, True),
         softmax = lambda logits, ids: _softmax_gather(logits, ids, False),
@@ -611,8 +602,8 @@ def _looks_like_probs(logits2):
 
 
 def _split_router_output(output):
-    """(logits position, weights position, ids position, dense) in a (logits, weights, ids) style
-    tuple. dense: the weights are [tokens, experts] scores, zero off the top-k (Unsloth's GPT-OSS)."""
+    """Tuple of (logits position, weights position, ids position, dense) for a (logits, weights, ids) style router
+    output; dense means [tokens, experts] scores, zero off the top-k (Unsloth's GPT-OSS)."""
     if not isinstance(output, tuple) or len(output) != 3:
         return None
     ids_pos = [i for i, x in enumerate(output) if torch.is_tensor(x) and not x.is_floating_point()]
@@ -633,16 +624,15 @@ def _split_router_output(output):
 
 
 def _count(name, amount = 1):
-    # Python counters read inside a compiled region become Dynamo guards whose value changes every
-    # call, recompiling the router (or a compiled decoder) each step. They are diagnostics only,
-    # so skip them there.
+    # Counters read in a compiled region become Dynamo guards that change every call, recompiling the router each step;
+    # they are diagnostics only, so skip them when compiling.
     if not torch.compiler.is_compiling():
         _STATE.stats[name] += amount
 
 
 def _router_hook(layer_index, compact = None):
-    # compact: (position among the MoE layers, number of MoE layers) when some decoder layers are
-    # dense. vLLM 0.21 numbers routed experts by MoE layer only, so its rows skip dense layers.
+    # compact is (position among MoE layers, MoE layer count) when some decoder layers are dense; vLLM 0.21 numbers
+    # routed experts by MoE layer only, so its rows skip dense layers.
     def hook(module, args, output):
         replay = _STATE.current
         row = layer_index
@@ -694,11 +684,11 @@ def _router_hook(layer_index, compact = None):
 
         formula = getattr(module, "_unsloth_replay_formula", None)
         if formula is None:
-            # Pick the weight formula that reproduces this router's own natural weights.
-            # Probabilities must never be softmaxed again: near ties would pass the check below.
+            # Pick the weight formula that reproduces this router's natural weights; probabilities must never be
+            # softmaxed again, since near ties would pass the check below.
             probs = _looks_like_probs(logits2)
-            # A router that states whether it renormalises the top-k decides it: top-k mass near
-            # one would otherwise pass a normalised formula for an unnormalised router.
+            # A router stating whether it renormalises the top-k decides it; top-k mass near one would otherwise pass a
+            # normalised formula for an unnormalised router.
             renorm = getattr(module, "norm_topk_prob", None)
             for name, fn in _formulas().items():
                 if name.startswith("probs") != probs:
@@ -737,8 +727,7 @@ def _router_hook(layer_index, compact = None):
         reweight = _formulas()[formula]
         new_weights = reweight(logits2, forced)
         if formula == "probs_renorm":
-            # The forced probabilities (nearly) all underflowed: nothing to replay with, so keep the
-            # natural routing (_probs_gather returns zeros there).
+            # Forced probabilities (nearly) all underflowed, so there is nothing to replay: keep the natural routing (_probs_gather returns zeros there).
             valid = valid & (new_weights.sum(dim = -1, keepdim = True) > 0)
             forced = torch.where(valid, forced, ids2.long())
         new_weights = new_weights.to(weights2.dtype)
@@ -784,8 +773,8 @@ def _register_op(name, impl, fake):
         # A reloaded module copy may own the name; custom_op silently re-registers (torch 2.10 segfaults).
         if hasattr(torch.ops.unsloth_zoo, full):
             continue
-        # Opaque host ops: a CUDA graph replay would skip them and reuse the captured CPU output,
-        # so tag them cudagraph unsafe and Inductor keeps the graph out of CUDA graphs.
+        # Opaque host ops: a CUDA graph replay would skip them and reuse the captured CPU output, so they are tagged
+        # cudagraph unsafe to keep the graph out of CUDA graphs.
         tag = getattr(torch.Tag, "cudagraph_unsafe", None)
         kwargs = dict(tags = (tag,)) if tag is not None and "tags" in _CUSTOM_OP_PARAMS else {}
         try:
@@ -802,9 +791,8 @@ _IDENTITY_MASK_OP = None
 
 
 def _layer_inputs_op():
-    # data_ptr() is untraceable and fullgraph forbids breaks: opaque ops, registered eagerly. Returning
-    # the addresses lets the router hook read them in-graph (not frozen at trace time) and keeps the op
-    # alive. Matching is a second op: no CPU kernels for Inductor to compile inside a GPU graph.
+    # data_ptr() is untraceable and fullgraph forbids breaks, so these ops register eagerly; returned addresses are read
+    # in-graph (not frozen) and keep the op alive; matching is a second op so no CPU kernels land in a GPU graph.
     global _LAYER_INPUTS_OP, _IDENTITY_MASK_OP
     if _LAYER_INPUTS_OP is None:
         _LAYER_INPUTS_OP = _register_op("routing_replay_input_addresses", _layer_inputs_impl, _layer_inputs_fake)
@@ -899,8 +887,7 @@ def install_routing_replay(model, llm = None, tokenizer = None):
         parent = model.get_submodule(decoder_name.rpartition(".")[0])
 
         def parent_pre_hook(module, args, kwargs):
-            # Routes are keyed by token ids alone, so two images behind the same tokens would swap
-            # routes: media forwards keep their natural routing.
+            # Routes are keyed by token ids alone, so two images behind the same tokens would swap routes; media forwards keep their natural routing.
             media = any(kwargs.get(k) is not None for k in _MEDIA_KWARGS)
             parent_input_ids.append(None if media else _input_ids(args, kwargs))
 

@@ -45,8 +45,7 @@ except Exception:  # pragma: no cover
     triton = None
     tl = None
 
-# calls / fallbacks: eager dispatch decisions; launches: kernel runs (forward and dX), counted
-# inside the op so a compiled caller is counted too.
+# calls and fallbacks count eager dispatch decisions; launches count kernel runs (forward and dX) inside the op, so compiled callers are counted too.
 NF4_FUSED_STATS = {"calls": 0, "fallbacks": 0, "launches": 0}
 _DISABLED_REASON = None   # set by hand / tests: every stack takes the dequant path
 FAILED_SHAPES = {}        # (inner, outer, s_i, s_j) -> reason: a build or launch failed for that GEMM
@@ -64,8 +63,8 @@ def nf4_fused_mode() -> str:
     return "0"
 
 
-# Average rows per expert (tokens * top_k / E) at or below which "auto" fuses: the dequant pass is
-# then most of the current path's time. Measured crossover on L4 bf16.
+# Average rows per expert (tokens * top_k / E) at or below which "auto" fuses, since dequant is most of the current
+# path's time there; crossover measured on L4 bf16.
 AUTO_MAX_ROWS = 128
 
 

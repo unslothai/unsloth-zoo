@@ -220,14 +220,13 @@ def copy_attributes(original_model, new_model):
                 original_val = getattr(original_module, attr)
 
                 if attr in buffer_names and attr != "layer_scalar":
-                    # gemma3 etc. keep embed_scale / position_ids as buffers; copy
-                    # them to avoid inconsistencies.
+                    # gemma3 etc. keep embed_scale and position_ids as buffers, so copy such buffers from the original,
+                    # moved to the new model's device, to avoid inconsistencies.
                     setattr(module, attr, original_val.to(new_model.device))
                 elif is_comparable(original_val):
                     setattr(module, attr, original_val)
                     copied_count += 1
                 elif isinstance(original_val, dict):
-                    # Only copy dicts whose attribute name exists in config keys
                     if attr in config_keys:
                         setattr(module, attr, deepcopy(original_val))
                         copied_count += 1
@@ -727,7 +726,6 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     else:
         new_model, original_meta_model, num_layers = create_empty_causal_lm(config, dtype)
 
-    # Get layer names from config
     layer_templates = get_model_layer_config(return_non_layered=False)
     layer_names = sum(layer_templates.values(), [])
 
@@ -783,12 +781,8 @@ def _is_known_architecture(architecture):
 pass
 
 
-# `blocks[0]` or `blocks[0][1]`: a name followed by digit-only subscripts. The name part
-# is "anything without brackets" rather than an ASCII identifier, because Python
-# identifiers are not ASCII-only and PyTorch registers a submodule under a Unicode name
-# without complaint. Only the subscripts are constrained, which is what keeps this a
-# name-and-index walk; the name itself is handed straight to getattr, exactly as the
-# eval this replaces did.
+# Matches `blocks[0]` or `blocks[0][1]`: a name without brackets (not limited to ASCII identifiers, since PyTorch allows
+# Unicode submodule names) plus digit-only subscripts; the name goes to getattr.
 _INDEXED_COMPONENT = re.compile(r"([^\[\]]+)((?:\[\d+\])+)")
 _INDEX = re.compile(r"\[(\d+)\]")
 
@@ -1489,8 +1483,8 @@ def get_model_layer_config(return_non_layered=True):
             for bound in ("input_min", "input_max", "output_min", "output_max")
         },
         'additional_layers': {
-            # Primarily for layers that are neither language decoder layers or vision transformer layers/blocks.
-            # Basically anything that is a merger, convertor or bridge in between. Preferably iterable layers
+            # Layers that are neither language decoder nor vision transformer layers/blocks: mergers, convertors or
+            # bridges in between; preferably iterable layers.
 
             "model.visual.merger.mlp.{kk}",
             "model.visual.merger.mlp.{kk}",
@@ -1501,7 +1495,6 @@ def get_model_layer_config(return_non_layered=True):
             # Mistral3
             "model.multi_modal_projector.patch_merger.merging_layer",
             "model.multi_modal_projector.linear_{kk}",
-            # "model.multi_modal_projector.linear_2",
 
             # qwen 3 vl
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
@@ -1512,8 +1505,7 @@ def get_model_layer_config(return_non_layered=True):
 
         },
         "non_layered_components":{
-            # we do not handle quantization for these layers yet
-            # the set_additional_modules would process these layers
+            # Quantization is not handled for these layers yet, but set_additional_modules would process these layers.
             "model.visual.merger.linear_fc1",
             "model.visual.merger.linear_fc2",
             "model.multi_modal_projector",
@@ -1569,8 +1561,7 @@ def get_model_layer_config(return_non_layered=True):
 def get_model_type(config):
     model_type = getattr(config, "model_type", "causal_lm")
     if hasattr(config, "vision_config"):
-        # vLLM reports qwen2_5_vl as qwen2_5_vl_text, but vision_config.model_type
-        # keeps the real qwen2_5_vl; prefer the vision_config value.
+        # vLLM reports qwen2_5_vl as qwen2_5_vl_text, but vision_config.model_type keeps the real qwen2_5_vl, so prefer the vision_config value.
         model_type = getattr(config.vision_config, "model_type", model_type)
     return model_type
 
@@ -1746,8 +1737,8 @@ def vllm_moe_expert_weights(experts, where, config = None, gated = True):
 pass
 
 
-# The one FP8 MoE runtime format training can alias: vLLM's Triton experts over canonical
-# [E, 2I, H] / [E, H, I] float8_e4m3fn weights with fp32 128x128 block dequant multipliers.
+# The one FP8 MoE runtime format training can alias: vLLM's Triton experts over canonical [E, 2I, H] / [E, H, I]
+# float8_e4m3fn weights with fp32 128x128 block dequant multipliers.
 FP8_MOE_SHARED_BLOCK = (128, 128)
 
 

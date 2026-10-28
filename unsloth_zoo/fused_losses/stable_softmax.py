@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Target log-probabilities without softmax collapse (arXiv 2610.31642, Section 2): ``z_t - logsumexp(z)``
-rounds to 0 past a ~16.6 nat margin in float32, so ``log p_t = -softplus(logsumexp_{j != t}(z_j) - z_t)``."""
+"""Target log-probs without softmax collapse (arXiv 2610.31642, Section 2): z_t - logsumexp(z) rounds to 0 past a ~16.6
+nat float32 margin, so log p_t = -softplus(logsumexp_{j != t}(z_j) - z_t)."""
 
 import torch
 
@@ -29,10 +29,9 @@ __all__ = [
 
 
 def _softplus(x):
-    # Not F.softplus (returns x past 20), clamp_min(x, 0) + ... (derivative 1 at 0) or logaddexp (backward
-    # underflows for x << 0). The clamps keep the untaken branch finite. x = 0 takes the second branch, whose
-    # gradient must not come from x.clamp_max(0): its derivative at the bound is 1 before torch 2.14 and 0 from
-    # 2.14 on, which zeroed d softplus / dx = 0.5 at the tie. x > 0 and NaN keep the old detached values.
+    # Not F.softplus (x past 20), clamp_min(x, 0)+... (derivative 1 at 0), or logaddexp (underflows for x << 0); clamps
+    # keep untaken branches finite; x = 0 takes second branch, whose grad must not come from x.clamp_max(0) (derivative
+    # 1 before torch 2.14, 0 after); x > 0 and NaN keep old detached values.
     positive = x > 0
     return torch.where(
         positive,
@@ -42,10 +41,9 @@ def _softplus(x):
 
 
 def _centred(z, target):
-    """(log p_t, logsumexp(z) - m, m, z - m) with m the detached row max. Centred so a shared offset cannot
-    round the normaliser away; the normaliser is logaddexp(lse_others, z_t), never z_t - logp (cancels when
-    the target trails); target by masked sum, not gather (elementwise backward, no saved float32 copy);
-    finfo.min, not -inf, keeps a target-only support NaN free."""
+    """Returns (log p_t, logsumexp(z) - m, m, z - m) with m the detached row max; centred so a shared offset cannot
+    round the normaliser away; normaliser is logaddexp(lse_others, z_t), not z_t - logp; masked-sum target, not
+    gather; finfo.min, not -inf, keeps target-only support NaN free."""
     m = z.detach().amax(-1, keepdim = True)
     m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
     z = z - m
@@ -113,8 +111,8 @@ def _acc(dtype):
 
 
 def _rows_forward(chunk, target):
-    # Saves the row max and the logsumexp relative to it: an absolute lse rounds away the normaliser once
-    # the logits share a large offset, and exp(z - lse) would then disagree with the forward.
+    # Saves row max and lse relative to it: an absolute lse rounds the normaliser away at a large shared logit offset,
+    # and exp(z - lse) would disagree with the forward.
     logp, lse_c, m, _ = _centred(chunk.to(_acc(chunk.dtype)), target)
     return logp, lse_c, m
 
@@ -146,8 +144,8 @@ _COMPILED_ROWS = {}
 
 
 def _rows_impl(logits):
-    """(forward, backward) per chunk: one fused Inductor kernel each on GPUs (eager here reads the chunk ~6
-    times, 1.9x stock's time on an A100), the in place eager pair elsewhere or when compiling fails."""
+    """Returns (forward, backward) per chunk: one fused Inductor kernel each on cuda / xpu (eager reads the chunk ~6
+    times); in-place eager pair elsewhere or if compiling fails."""
     if logits.device.type not in ("cuda", "xpu") or _COMPILED_ROWS.get("failed") or _compile_disabled():
         return _rows_forward_eager, _rows_backward_eager
     if not _COMPILED_ROWS:
@@ -182,8 +180,8 @@ class _CrossEntropyRows(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, target):
         if torch.compiler.is_compiling():
-            # No Python row loop when traced: range() over a symbolic row count specialises it (a recompile
-            # per length, ConstraintViolationError under mark_dynamic); Inductor fuses the upcast anyway.
+            # No Python row loop when traced: range() over a symbolic row count specialises it (recompile per length,
+            # ConstraintViolationError under mark_dynamic); Inductor fuses the upcast.
             logp, lse_c, m = _rows_forward(logits, target)
             ctx.save_for_backward(logits, target, logp, lse_c, m)
             return -logp

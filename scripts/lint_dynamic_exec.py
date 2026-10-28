@@ -43,17 +43,12 @@ SINKS = ("exec", "eval", "compile")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST_PATH = Path(__file__).resolve().parent / "dynamic_exec_allowlist.json"
 
-# Directories scanned by default. Tests are excluded: they legitimately keep the
-# removed exec/eval around as an oracle to prove the replacement matches it.
+# Default scan targets; tests are excluded because they keep the removed exec/eval around as an oracle for the replacement.
 DEFAULT_TARGETS = ("unsloth_zoo", "unsloth_zoo_downloads", "unsloth", "studio", "scripts")
 
 
 def _relative(path: Path) -> str:
-    """Repo-relative where possible; absolute for the self-test's temp files.
-
-    Always forward slashes: the allowlist is committed, and a Windows checkout that
-    regenerated it with backslashes would rewrite every entry.
-    """
+    """Repo-relative where possible, else absolute for self-test temp files; always forward slashes, since a Windows-regenerated allowlist would rewrite every entry."""
     try:
         return path.relative_to(REPO_ROOT).as_posix()
     except ValueError:
@@ -80,11 +75,7 @@ def _is_interpolated(node: ast.AST) -> str | None:
 
 
 def _sink_name(function: ast.AST) -> str | None:
-    """The sink this call target names, if any.
-
-    Both `exec(...)` and `builtins.exec(...)` execute. Matching only `ast.Name` meant
-    the second form passed the lint with zero findings.
-    """
+    """The sink a call target names, matching both `exec(...)` and `builtins.exec(...)`; matching only ast.Name missed the latter."""
     if isinstance(function, ast.Name) and function.id in SINKS:
         return function.id
     if isinstance(function, ast.Attribute) and function.attr in SINKS:
@@ -94,16 +85,8 @@ def _sink_name(function: ast.AST) -> str | None:
 
 
 def _source_argument(node: ast.Call, sink: str) -> ast.AST | None:
-    """The source argument of a sink call, whether positional or by keyword.
-
-    `exec` and `eval` take their source positional-only, so for those it is always
-    `args[0]`. `compile` does not: its signature is
-    `compile(source, filename, mode, ...)` with no `/`, so
-    `compile(source = f"y = {x}", filename = "<x>", mode = "exec")` compiles exactly
-    the same payload with `node.args` empty. Checking only `args[0]` meant that call
-    was skipped entirely. `studio/backend/core/inference/tools.py` already resolves
-    sink arguments this way.
-    """
+    """Source argument of a sink call: exec and eval take it positionally as args[0], but compile also accepts source=
+    by keyword, which args[0] alone skipped; studio/backend/core/inference/tools.py resolves sink arguments this way."""
     if node.args:
         return node.args[0]
     if sink.rpartition(".")[2] == "compile":
@@ -126,8 +109,7 @@ class _Visitor(ast.NodeVisitor):
 
     def _enter(self, node):
         self.scope.append(node.name)
-        # A fresh scope: a name built in one function says nothing about the same name
-        # in another.
+        # Each scope gets a fresh taint map, since a name built in one function says nothing about the same name in another.
         self.tainted.append({})
         self.generic_visit(node)
         self.tainted.pop()
@@ -138,14 +120,7 @@ class _Visitor(ast.NodeVisitor):
     visit_ClassDef = _enter
 
     def visit_Assign(self, node: ast.Assign):
-        """Tracks `payload = f"...{x}..."` so `exec(payload)` is still caught.
-
-        One level of local indirection, which is all it took to defeat the previous
-        version: moving the interpolation onto the line above is a two-line refactor
-        that leaves the vulnerability shape exactly as it was. Rebinding a tracked name
-        to something that is not a built string clears it, so this does not accumulate
-        false positives.
-        """
+        """Tracks a name bound to a built string (e.g. an interpolated f-string) so exec(payload) is caught; rebinding it to a non-built value clears it."""
         reason = _is_interpolated(node.value)
         for target in node.targets:
             if not isinstance(target, ast.Name): continue
@@ -177,20 +152,12 @@ class _Visitor(ast.NodeVisitor):
 
 
 def _call_hash(node: ast.Call) -> str:
-    """Hashes the call, canonicalised through `ast.unparse`.
-
-    Line numbers drift whenever anything above the call changes; the call itself does
-    not. Unparsing means reindenting, rewrapping or reflowing the call does not
-    invalidate a justification, while changing what is interpolated does.
-    """
+    """Digest of ast.unparse(call), so line drift and reformatting keep a justification valid while changing what is interpolated does not."""
     return hashlib.sha256(ast.unparse(node).encode("utf-8")).hexdigest()[:16]
 
 
 def scan_file(path: Path) -> list[dict]:
-    # A hard CI gate must not fall over on something that is not a readable file. A
-    # dangling symlink, a directory named `*.py`, or a symlink to one all reach here
-    # through rglob and raise out of read_text, failing the build for a reason that has
-    # nothing to do with dynamic execution.
+    # A hard CI gate must not fail on unreadable paths: a dangling symlink, a directory named *.py, or a symlink to one raises OSError in read_text.
     try:
         source = path.read_text(encoding = "utf-8", errors = "replace")
     except OSError:
@@ -198,16 +165,14 @@ def scan_file(path: Path) -> list[dict]:
     try:
         tree = ast.parse(source, filename = str(path))
     except (SyntaxError, ValueError):
-        # compileall in the same lint job is what reports unparseable files. ValueError
-        # covers a source containing a NUL byte, which ast.parse rejects separately.
+        # compileall in the same CI job reports unparseable files; ValueError covers NUL bytes, which ast.parse rejects separately.
         return []
     visitor = _Visitor(path)
     try:
         visitor.visit(tree)
     except RecursionError:
-        # A deeply nested literal can exhaust the stack during the walk, after parse
-        # succeeded. Report nothing rather than taking the gate down; compileall still
-        # sees the file.
+        # A deeply nested literal can raise RecursionError during the walk after a good parse; report nothing so the
+        # gate survives, compileall still sees the file.
         return []
     return visitor.findings
 
@@ -226,8 +191,7 @@ def collect_paths(targets: list[str]) -> list[Path]:
         if root.is_file() and root.suffix == ".py":
             paths.append(root)
         elif root.is_dir():
-            # `is_file()` on each hit, so a directory named `foo.py` and a symlink that
-            # points at one are skipped rather than read.
+            # Filter rglob hits with is_file(), so a directory named foo.py and a symlink pointing at one are skipped rather than read.
             paths.extend(
                 p for p in root.rglob("*.py")
                 if p.is_file() and "tests" not in p.relative_to(REPO_ROOT).parts
@@ -243,14 +207,8 @@ def load_allowlist() -> dict[str, dict]:
 
 
 def key_of(finding: dict) -> str:
-    """Identity of a reviewed call: where it is, and what it is.
-
-    The hash alone is not an identity. Two different call sites with byte-identical
-    source share a hash, so approving one approved the other, and copying an
-    allowlisted call into a function with attacker-controlled inputs inherited its
-    justification without review. The location is half of what was reviewed, so it is
-    half of the key.
-    """
+    """Path, qualname and hash together: the hash alone let one approval cover byte-identical calls elsewhere, including
+    copies placed in functions with attacker-controlled inputs."""
     return f"{finding['path']}::{finding['qualname']}::{finding['hash']}"
 
 
@@ -388,8 +346,7 @@ def main() -> int:
         for entry in allowlist.values()
         if entry.get("reason", "").strip().upper() in ("", "REVIEW ME")
     ]
-    # Staleness is only meaningful over the whole tree: with --paths the scan is a
-    # subset, so every entry outside it would look stale.
+    # Staleness is only judged over the whole tree; with --paths the scan is a subset, so every entry outside it would look stale.
     seen = {key_of(f) for f in findings}
     stale = [] if args.paths else [entry for key, entry in allowlist.items() if key not in seen]
 

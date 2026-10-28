@@ -29,9 +29,7 @@ import re
 if "TOKENIZERS_PARALLELISM" not in os.environ:
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Detect offline mode first. hf_transfer is a Rust downloader that bypasses
-# huggingface_hub's offline guard, so leaving it on defeats HF_HUB_OFFLINE
-# and TRANSFORMERS_OFFLINE entirely.
+# Detect offline mode first: hf_transfer bypasses huggingface_hub's offline guard, so leaving it on defeats HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE.
 _OFFLINE_TRUE = {"1", "true", "yes", "on"}
 _offline_env = (
     os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in _OFFLINE_TRUE
@@ -39,18 +37,14 @@ _offline_env = (
     or os.environ.get("HF_DATASETS_OFFLINE", "").strip().lower() in _OFFLINE_TRUE
 )
 
-# hf_transfer's Rust extension cannot complete a download on Windows on ARM:
-# every fetch dies with "an error occurred while downloading using hf_transfer",
-# and the same fetch succeeds once it is off.
+# hf_transfer cannot complete downloads on Windows on ARM (every fetch fails), so it is not enabled there; the same fetch succeeds once it is off.
 def _detect_windows_on_arm() -> bool:
     if sys.platform != "win32":
         return False
     if platform.machine().lower() in ("arm64", "aarch64"):
         return True
-    # An x64 process emulated on ARM64 still reports AMD64 on Python < 3.12,
-    # which reads only PROCESSOR_ARCHITECTURE/ARCHITEW6432 -- and Windows sets
-    # the latter for 32-bit processes only, so nothing there names the host.
-    # IsWow64Process2's pNativeMachine does, emulated or not.
+    # Emulated x64 on ARM64 reports AMD64 on Python below 3.12, which reads only PROCESSOR_ARCHITECTURE/ARCHITEW6432;
+    # IsWow64Process2 pNativeMachine names the real host.
     try:
         import ctypes
 
@@ -67,8 +61,7 @@ def _detect_windows_on_arm() -> bool:
 
 _windows_on_arm = _detect_windows_on_arm()
 
-# Only when hf_transfer is importable: huggingface_hub < 1.0 honours the flag and refuses every
-# download ("'hf_transfer' package is not available") when it is not, as after a --no-deps install.
+# Set hf_transfer only if importable: huggingface_hub below 1.0 refuses every download when the flag is set without the package, e.g. after a --no-deps install.
 import importlib.util as _importlib_util
 
 
@@ -76,8 +69,7 @@ def _hf_transfer_importable() -> bool:
     try:
         return _importlib_util.find_spec("hf_transfer") is not None
     except (ImportError, ValueError):
-        # A stub placed in sys.modules without a __spec__ makes find_spec raise; importing
-        # unsloth_zoo must not fail on it, and a stub is not the real downloader.
+        # A sys.modules stub without __spec__ makes find_spec raise; the probe must not fail on it, and a stub is not the real downloader.
         return False
 
 
@@ -99,16 +91,13 @@ if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
     os.environ["HF_HUB_DISABLE_XET"] = "1" # Disable XET
     os.environ["HF_XET_HIGH_PERFORMANCE"] = "0" # This causes "429 Too Many Requests"
 
-# Cross-sync the three offline flags: setting any one implies all three.
-# Without HF_DATASETS_OFFLINE, load_dataset() still hits the network for
-# dataset metadata even when the rest of the HF stack is offline.
+# Setting any offline flag implies all three; HF_DATASETS_OFFLINE is needed because load_dataset() otherwise still hits the network for metadata.
 if _offline_env:
     for _v in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         os.environ[_v] = "1"
 del _OFFLINE_TRUE, _offline_env
 
-# A 429 in hf_xet's own logs means the ACCOUNT, not the machine, is the bottleneck, so it lowers
-# the stream ceiling rather than the memory caps.
+# A 429 in hf_xet logs means the account, not the machine, is the bottleneck, so it lowers the stream ceiling rather than the memory caps.
 from pathlib import Path
 def has_429_exact_full_read(log_dir: str | Path) -> bool:
     log_dir = Path(log_dir).expanduser()
@@ -122,8 +111,7 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
             continue
     return False
 
-# Redirect the HF cache off a read-only default (locked-down machines) so
-# snapshot_download() can write. Runs before any huggingface_hub import.
+# Redirect the HF cache off a read-only default so snapshot_download() can write; must run before any huggingface_hub import.
 from .hf_cache import redirect_hf_cache_if_readonly, _active_caches
 redirect_hf_cache_if_readonly()
 
@@ -139,7 +127,6 @@ _, _, xet_cache = _active_caches()
 apply_xet_env(throttled = has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else False)
 del has_429_exact_full_read, xet_cache, redirect_hf_cache_if_readonly, _active_caches, apply_xet_env
 
-# More verbose HF Hub info
 if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
     os.environ["HF_HUB_VERBOSITY"] = "info"
 
@@ -157,11 +144,9 @@ if (os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1") or \
 
 # Triton compile debugging
 if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
-    # Lots of debugging info
-    # BUT weirdly blocks torch.compile, so we disable
+    # Lots of debugging info, but it weirdly blocks torch.compile, so TRITON_ENABLE_LLVM_DEBUG is forced to 0.
     os.environ["TRITON_ENABLE_LLVM_DEBUG"] = "0"
-    # Can add print statements, but slower so disable
-    # Also fails on get_int1_ty for example (bool)
+    # TRITON_INTERPRET allows print statements but is slower and fails on bool types (get_int1_ty), so it is forced to 0.
     os.environ["TRITON_INTERPRET"] = "0"
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1" # Blocking calls for debugging
 
@@ -170,9 +155,7 @@ from importlib.util import find_spec
 from unsloth_zoo.mlx.runtime import is_mlx_available
 from .model_lists import FORCE_FLOAT32
 
-# Import-time fixes live in ``unsloth/import_fixes.py`` and run at ``import
-# unsloth`` time. Zoo cannot be imported standalone (the GPU init below
-# requires ``find_spec("unsloth")``), so they are always already in place.
+# Import-time fixes live in unsloth/import_fixes.py and run at import unsloth; zoo's GPU init needs find_spec for unsloth, so they are always in place.
 
 # Detect Apple Silicon MLX mode: torch absent (pure MLX) or unsloth detected MLX
 _is_mlx_only = is_mlx_available()
@@ -196,8 +179,7 @@ else:
     _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
     if _SKIP_GPU_INIT:
-        # `compiler.py` does `from . import DEVICE_TYPE` at module scope, so the
-        # constants must still exist when the init that sets them is skipped.
+        # `compiler.py` imports DEVICE_TYPE at module scope, so these constants must still be defined when GPU init is skipped.
         DEVICE_TYPE = "cpu"
         DEVICE_TYPE_TORCH = "cpu"
         DEVICE_COUNT = 0
@@ -205,9 +187,8 @@ else:
 
 _IS_CPU_BACKEND = False
 
-# Stub the CUDA-only imports whenever GPU init is skipped (MLX host or the opt-in
-# download child), so they resolve to a loud no-op instead of a hard ImportError. On a
-# normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
+# Stub CUDA-only imports when GPU init is skipped (MLX host or download child) so they resolve to a loud no-op, not a
+# hard ImportError; CUDA/CPU keeps real modules.
 if _SKIP_GPU_INIT:
     from unsloth_zoo.stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()
@@ -250,18 +231,15 @@ class _LazyMLXAlias(_types.ModuleType):
         return real
 
     def __getattr__(self, name):
-        # Skip dunder probes (inspect.getmodule, hasattr(..., '__file__'), etc.)
-        # so we don't trigger an mlx import while torch walks sys.modules during
-        # its own init. Real attribute access (e.g. FastMLXModel) still resolves.
+        # Dunder lookups raise AttributeError so torch walking sys.modules during init does not trigger an mlx import;
+        # real attributes such as FastMLXModel still resolve.
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
         try:
             real = self._resolve()
         except ModuleNotFoundError:
-            # mlx is Apple-only; on non-mlx hosts the submodule import fails.
-            # Surface as AttributeError so sys.modules walkers (notably
-            # pickle.whichmodule, used by torch._inductor's FX graph hash
-            # pickler) skip this stub cleanly instead of crashing the compile.
+            # mlx is Apple-only; raising AttributeError instead of ModuleNotFoundError lets sys.modules walkers such as
+            # the torch._inductor FX hash pickler skip this stub.
             raise AttributeError(name)
         return getattr(real, name)
 
@@ -287,8 +265,7 @@ if not _SKIP_GPU_INIT:
     _ORIGINAL_PYTORCH_HIP_ALLOC_CONF = os.environ.get("PYTORCH_HIP_ALLOC_CONF")
     _HAS_ORIGINAL_PYTORCH_ALLOC_CONF = "PYTORCH_ALLOC_CONF" in os.environ
 
-    # We support Pytorch 2
-    # Fixes https://github.com/unslothai/unsloth/issues/38
+    # Supports PyTorch 2; fixes unslothai/unsloth issue 38.
     from importlib.metadata import version as importlib_version
     torch_version_raw = str(importlib_version("torch"))
     torch_version = str(re.match(r"[0-9\.]{3,}", torch_version_raw).group(0)).split(".")
@@ -301,8 +278,8 @@ if not _SKIP_GPU_INIT:
     def _is_wsl():
         if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
             return True
-        # Docker on WSL2 has no WSL_* variables but shares the *-microsoft-standard-WSL2 kernel,
-        # where expandable_segments dies with `CUDA driver error: unknown error` (unslothai/unsloth#3511).
+        # Docker on WSL2 lacks WSL_* env vars but shares the *-microsoft-standard-WSL2 kernel, where expandable_segments
+        # dies with a CUDA driver error (unslothai/unsloth issue 3511).
         try:
             return "microsoft" in os.uname().release.lower()
         except Exception:
@@ -310,10 +287,8 @@ if not _SKIP_GPU_INIT:
     IS_WSL_OR_WINDOWS = os.name == "nt" or _is_wsl()
     del _is_wsl
 
-    # Nor on an NVIDIA Tegra board, where the CUDA VMM calls it is built on fail: a 1MiB
-    # buffer dies with `RuntimeError: CUDA driver error: out of memory` on a board with 50GB
-    # free (unslothai/unsloth#2401). Detection is filesystem only because this runs before
-    # torch is imported; see unsloth_zoo/integrated_device.py.
+    # Also unsupported on NVIDIA Tegra boards, where the CUDA VMM calls fail even with memory free (unslothai/unsloth
+    # issue 2401); detection is filesystem-only since torch is not yet imported; see unsloth_zoo/integrated_device.py.
     from .integrated_device import expandable_segments_unsupported
     EXPANDABLE_SEGMENTS_UNSUPPORTED = expandable_segments_unsupported()
 
@@ -387,22 +362,19 @@ if not _SKIP_GPU_INIT:
         delete_key("PYTORCH_HIP_ALLOC_CONF")
         delete_key("PYTORCH_ALLOC_CONF")
     elif IS_WSL_OR_WINDOWS:
-        # Strip unsupported expandable_segments but keep other user config; a
-        # roundup fallback is applied below (unslothai/unsloth#7203).
+        # Strip only expandable_segments and keep other user config; a roundup fallback is applied below (unslothai/unsloth issue 7203).
         remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
 
-    # IMPORTANT: same ordering rule as the ROCm cleanup below. Adds nothing back, unlike the
-    # WSL branch: a unified-memory board has no separate VRAM pool to defragment, and rounding
-    # every block up would waste the system RAM the model is competing for.
+    # Unified-memory boards get no roundup fallback, unlike WSL: there is no separate VRAM pool to defragment and
+    # rounding up wastes shared RAM. Same ordering rule as ROCm: runs before torch import.
     if EXPANDABLE_SEGMENTS_UNSUPPORTED:
         remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
 
-    # IMPORTANT: run ROCm cleanup before importing device_type (which imports torch).
-    # HIP allocator settings can be read during torch initialization.
+    # Run the ROCm cleanup before importing device_type (which imports torch), since HIP allocator settings can be read during torch init.
     if IS_TORCH_ROCM_BUILD:
         remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
@@ -410,11 +382,10 @@ if not _SKIP_GPU_INIT:
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
         delete_key("PYTORCH_HIP_ALLOC_CONF")
 
-    # Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
-    # Please see https://github.com/pytorch/ao/issues/2919 for more info
+    # Hides torchao's 'skipping cpp extensions' warning for incompatible torch/torchao versions (e.g. torch 2.7.0 with
+    # torchao 0.14.1); see pytorch/ao issue 2919.
     import logging
     torchao_logger = logging.getLogger("torchao")
-    # Ignore logging messages
     class HideLoggingMessage(logging.Filter):
         __slots__ = "text",
         def __init__(self, text): self.text = text
@@ -491,29 +462,21 @@ if not _SKIP_GPU_INIT:
         _alloc_key = "PYTORCH_ALLOC_CONF" if IS_TORCH_2_10_OR_NEWER else "PYTORCH_CUDA_ALLOC_CONF"
         # Promotion above can re-add expandable_segments (only cleaned for standby/ROCm); strip it.
         remove_expandable_segments(_alloc_key)
-        # Only fill when absent. An explicit empty value is a user opt-out
-        # (gradient_checkpointing.py advises PYTORCH_CUDA_ALLOC_CONF="").
+        # Only set when absent; an explicit empty value opts out, as gradient_checkpointing.py advises with PYTORCH_CUDA_ALLOC_CONF set to empty.
         if _alloc_key not in os.environ:
             os.environ[_alloc_key] = "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
         del _alloc_key
 
-    # CCE fails on Torch 2.8 and above
-    # OutOfResources: out of resource: shared memory, Required: 98304, Hardware limit: 65536. Reducing block sizes or `num_stages`
+    # CCE fails on torch 2.8 and above (OutOfResources: shared memory 98304 over the 65536 hardware limit), so UNSLOTH_ENABLE_CCE is disabled.
     if (major_torch >= 2 and minor_torch >= 8) or (major_torch > 2):
         os.environ["UNSLOTH_ENABLE_CCE"] = "0"
     elif DEVICE_TYPE == "hip":
         # CCE also fails in HIP / AMD
         os.environ["UNSLOTH_ENABLE_CCE"] = "0"
 
-    # ROCm RDNA2/3/3.5/4: the bundled hipBLASLt can ship no fallback Tensile kernels
-    # (e.g. none for gfx1151, unlike rocBLAS), so odd GEMM shapes from the compiled
-    # fwd+bwd graph get JIT-built via Composable Kernel on the first training step
-    # (the ~300s "a_grid_desc_*" descriptor flood). rocBLAS has prebuilt fallbacks
-    # and never JITs, so prefer it. DISABLE_ADDMM_HIP_LT is read at addmm dispatch,
-    # so setting it here (before the first GEMM) keeps addmm off hipBLASLt-LT even on
-    # Windows, where the runtime setter below is a no-op; the TORCH_BLAS_PREFER_* env
-    # vars back it up on other paths. NVIDIA/Intel/Mac and AMD CDNA are untouched.
-    # Kill switch: UNSLOTH_ROCM_PREFER_ROCBLAS=0.
+    # ROCm RDNA2/3/3.5/4: prefer rocBLAS (hipBLASLt can lack fallback Tensile kernels, so odd GEMMs JIT on first step);
+    # DISABLE_ADDMM_HIP_LT set early since addmm reads it at dispatch and runtime setter is a no-op on Windows; NVIDIA,
+    # Intel, Mac, CDNA untouched; UNSLOTH_ROCM_PREFER_ROCBLAS=0 disables.
     if IS_HIP_RUNTIME and os.environ.get(
         "UNSLOTH_ROCM_PREFER_ROCBLAS", "1"
     ).strip().lower() not in ("0", "off", "false", "no"):
@@ -542,8 +505,8 @@ if not _SKIP_GPU_INIT:
             os.environ.setdefault("TORCH_BLAS_PREFER_CUBLASLT", "0")
             if not _user_wants_lt:
                 os.environ.setdefault("DISABLE_ADDMM_HIP_LT", "1")
-            # Non-Windows: also flip at runtime (no-op setter on Windows). Skip when
-            # the user pinned a backend, so an explicit hipBLASLt choice is honoured.
+            # Non-Windows also flips the backend at runtime (a no-op on Windows); skipped when the user pinned a backend
+            # so an explicit hipBLASLt choice is honored.
             if not _user_blas and _sys.platform != "win32" and _torch is not None:
                 _pref = getattr(getattr(_torch.backends, "cuda", None), "preferred_blas_library", None)
                 if callable(_pref):
@@ -592,10 +555,7 @@ if not _SKIP_GPU_INIT and not _IS_CPU_BACKEND:
 
     # Top some pydantic warnings
     try:
-        # pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True
-        # was provided to the `Field()` function, which has no effect in the context it was used.
-        # 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment.
-        # This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+        # Silences pydantic UnsupportedFieldAttributeWarning: frozen=True on Field() has no effect inside type-statement aliases or union members.
         from pydantic.warnings import UnsupportedFieldAttributeWarning
         warnings.filterwarnings(action = "ignore", category = UnsupportedFieldAttributeWarning)
         del UnsupportedFieldAttributeWarning

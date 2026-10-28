@@ -13,20 +13,9 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Fused MoE router: logits -> (fp32 weights [T, k], int64 ids [T, k]) in one Triton launch,
-plus a Triton backward matching eager autograd for the logits.
-
-Modes:
-  MODE_SOFTMAX_TOPK  softmax(fp32) -> top_k -> optional renorm (Qwen3/Qwen2/OLMoE/Mixtral MoE).
-  MODE_TOPK_SOFTMAX  top_k on logits -> softmax over the selected (gpt-oss).
-  MODE_SIGMOID       sigmoid + e_score_correction_bias -> group top_k -> UNBIASED scores ->
-                     renorm (+1e-20) * routed_scaling_factor (DeepSeek-V3, GLM4-MoE). Masked
-                     groups use -inf (transformers 5) or 0.0 (transformers 4).
-
-Ties pick the lower index (same set as CUDA torch.topk; order inside exact ties may differ).
-Logits a float32 ulp apart can rank differently from eager. NaN unsupported; bias gets no grad.
-Opt-in: UNSLOTH_MOE_FUSED_ROUTER=1, read every eager call.
-"""
+"""Fused MoE router: logits to fp32 weights [T, k] and int64 ids [T, k] in one Triton launch, with a Triton backward;
+opt-in via UNSLOTH_MOE_FUSED_ROUTER=1 (read every eager call); ties pick lower index, NaN unsupported, bias gets no
+grad."""
 
 __all__ = [
     "moe_router",
@@ -396,8 +385,8 @@ def fused_route_or_none(logits, top_k, mode = "softmax_topk", renorm = False, bi
     return moe_router(logits, top_k, mode, renorm, bias, n_group, topk_group, scale, mask_zero)
 
 
-# transformers router classes. A class is patched only when its forward (and get_topk_indices)
-# reads exactly as below, so a reworded upstream router keeps its own forward.
+# Patch a transformers router class only when its forward (and get_topk_indices) reads exactly as the forms below; a
+# reworded upstream router keeps its own forward.
 _SOFTMAX_HEAD = (
     "hidden_states = hidden_states.reshape(-1, self.hidden_dim)",
     "router_logits = F.linear(hidden_states, self.weight)",
@@ -580,8 +569,8 @@ def patch_moe_fused_router():
 
 
 def enable_fused_router(model):
-    """Loader hook: also patch router classes Unsloth's compiler re-created (compiled-cache
-    modules), which the import-time class patch cannot reach. Returns the patched class names."""
+    """Loader hook patching router classes Unsloth's compiler re-created (compiled-cache modules) that the import-time
+    patch cannot reach; returns patched class names."""
     if not fused_router_enabled() or not HAS_TRITON or model is None or not hasattr(model, "modules"):
         return []
     names = {name for _, name in _ROUTER_CLASSES}

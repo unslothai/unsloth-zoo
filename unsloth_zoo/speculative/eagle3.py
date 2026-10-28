@@ -14,18 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""EAGLE-3 drafters for targets without a native MTP head, in the vllm-project/speculators layout.
-
-Contract (speculators `models/eagle3/core.py`, vLLM `llama_eagle3.py`, unslothai/llama.cpp
-`src/models/eagle3.cpp`):
-- aux id k = residual stream entering target layer k (k == L: last layer output, pre final norm);
-  fused g = fc(cat[aux]);
-- row t = (g_t, x_{t+1}) at position t + 1 predicts x_{t+2}; one llama decoder layer whose
-  attention reads cat[input_layernorm(embed(x)), hidden_norm(g)], residual = raw g;
-- logits = lm_head(norm(h)) over the draft vocabulary, draft id d -> target id d + d2t[d];
-- step k > 0 feeds back the previous step's pre-norm output h; training-time test unrolls the
-  steps with keys = causal step-0 rows plus each later step's own row (diagonal).
-"""
+"""EAGLE-3 drafters (speculators layout): aux id k = residual entering target layer k (k == L: last layer output, pre
+final norm); fused g = fc(cat[aux]); row t = (g_t, x_{t+1}) at position t+1 predicts x_{t+2}; draft id d -> target id
+d + d2t[d]; step k>0 feeds back pre-norm h."""
 
 __all__ = [
     "EAGLE3_TARGET_TYPES",
@@ -56,8 +47,8 @@ from transformers import Trainer, TrainingArguments
 from .trainer import token_average_scale
 from .capture import effective_lm_head_weight, resolve_text_parts, run_frozen_target
 
-# Target text model_types where llama.cpp exposes layer inputs (`t_layer_inp`) AND vLLM 0.31
-# implements SupportsEagle3. Mistral checkpoints convert to llama.cpp's llama arch.
+# Target text model_types where llama.cpp exposes layer inputs (t_layer_inp) and vLLM 0.31 implements SupportsEagle3;
+# Mistral converts to llama.cpp's llama arch.
 EAGLE3_TARGET_TYPES = {
     "llama"           : "llama",
     "mistral"         : "llama",
@@ -103,8 +94,8 @@ def eagle3_supported(config):
 
 
 def build_eagle3_vocab_map(token_id_lists, target_vocab_size, draft_vocab_size = 32000):
-    """(d2t, t2d) from token frequencies: the `draft_vocab_size` most frequent ids (ties by id),
-    padded with the lowest unused ids, sorted. target id = draft index + d2t[index]."""
+    """(d2t, t2d) from token counts: the draft_vocab_size most frequent ids (ties by id), padded with the lowest unused
+    ids, sorted; target id = draft index + d2t[index]."""
     target_vocab_size = int(target_vocab_size)
     draft_vocab_size = min(int(draft_vocab_size), target_vocab_size)
     counts = Counter()
@@ -236,9 +227,8 @@ def _additive(allowed, dtype):
 
 
 class Eagle3Drafter(nn.Module):
-    """One-layer EAGLE-3 drafter. The target's embedding matrix is shared (frozen, never saved);
-    `lm_head` starts as the target's lm_head rows of the draft vocabulary and stays frozen
-    (speculators `DraftVocabMixin`)."""
+    """One-layer EAGLE-3 drafter; target embedding is shared and frozen, never saved; lm_head starts as target
+    draft-vocab rows, frozen (speculators DraftVocabMixin)."""
 
     def __init__(self, layer_config, draft_vocab_size, aux_layer_ids, target_hidden_size = None,
                  norm_before_residual = False):
@@ -316,9 +306,8 @@ class Eagle3Drafter(nn.Module):
         return out
 
     def forward_train(self, aux_hidden, input_ids, attention_mask = None, ttt_steps = 3, return_hidden = False):
-        """Training-time test over full sequences (speculators `Eagle3DraftModel.forward` after
-        `shift_batch`). aux_hidden [B, S, 3Ht] from the target pass over input_ids [B, S].
-        Returns per-step logits [B, S-1, Vd]; step k row t predicts x_{t+2+k}."""
+        """Training-time test over full sequences (speculators forward after shift_batch); aux_hidden [B, S, 3Ht] in,
+        per-step logits [B, S-1, Vd] out; step k row t predicts x_{t+2+k}."""
         from transformers import DynamicCache
 
         B, S = input_ids.shape
@@ -347,8 +336,7 @@ class Eagle3Drafter(nn.Module):
 
     @torch.no_grad()
     def draft_greedy(self, aux_hidden, input_ids, anchor, num_steps):
-        """Greedy drafts (target ids) after the committed tokens input_ids[:, :anchor + 1]; the
-        target has produced aux states for positions < anchor + 1 (row anchor - 1 sees x_anchor)."""
+        """Greedy drafts (target ids) after committed tokens input_ids[:, :anchor + 1]; aux states exist for positions < anchor + 1, so row anchor - 1 sees x_anchor."""
         from transformers import DynamicCache
 
         c = int(anchor)
@@ -530,8 +518,7 @@ def convert_eagle3_to_gguf(drafter_dir, target_dir, out_path, outtype = "f16", c
 
 
 def eagle3_loss(step_logits, teacher_logits, loss_mask, decay = 1.0):
-    """Sum over TTT steps of masked mean forward KL(teacher || draft) (speculators `compute_metrics`
-    with kl_div). Returns (loss, stats with per-step loss / top-1 accuracy / counts)."""
+    """Sum over TTT steps of masked mean forward KL(teacher || draft) (speculators compute_metrics kl_div); returns (loss, per-step loss / top-1 accuracy / counts)."""
     total = 0.0
     stats = {"loss": [], "acc": [], "count": []}
     for k, logits in enumerate(step_logits):
@@ -555,10 +542,9 @@ def eagle3_loss(step_logits, teacher_logits, loss_mask, decay = 1.0):
 
 def eagle3_chunked_loss(drafter, step_hidden, final_hidden, lm_head_weight, loss_mask, decay = 1.0,
                         chunk_rows = 1024, normalizer = None, teacher_logit_softcap = None):
-    """`eagle3_loss` from the drafter's hidden states, on supervised rows only, in checkpointed chunks:
-    draft and teacher logits never exist for the whole batch ([B, T, Vd] fp32 per step OOMs 24 GB cards).
-    `normalizer` (supervised tokens in the whole accumulated batch) replaces the per-microbatch count,
-    so gradient accumulation weights every token equally."""
+    """eagle3_loss on supervised rows in checkpointed chunks so per-step [B, T, Vd] fp32 logits never exist for the
+    whole batch (OOM on 24 GB cards); normalizer (supervised tokens in the accumulated batch) replaces the
+    per-microbatch count so grad accumulation weights every token equally."""
     from torch.utils.checkpoint import checkpoint
 
     weight = lm_head_weight[drafter.t2d.to(lm_head_weight.device)] if drafter.uses_draft_vocab else lm_head_weight
@@ -608,8 +594,8 @@ class Eagle3TrainingArguments(TrainingArguments):
 
 
 class _SupervisedRowLabels:
-    """Labels that count only what the loss supervises (row t is scored by labels[t + 1], so never
-    position 0 or padding): every transformers version counts num_items_in_batch from raw labels."""
+    """Labels counting only what the loss supervises (row t is scored by labels[t + 1], never position 0 or padding);
+    every transformers version counts num_items_in_batch from raw labels."""
 
     def __init__(self, collate):
         self.collate = collate
@@ -628,10 +614,8 @@ class _SupervisedRowLabels:
 
 
 class UnslothEagle3Trainer(Trainer):
-    """Trains an EAGLE-3 drafter (`model`) against a frozen target, one target pass per batch.
-
-    Rows need `input_ids` and optionally `labels` (-100 = not supervised, e.g. the prompt).
-    """
+    """Trains an EAGLE-3 drafter against a frozen target, one target pass per batch; rows need input_ids and optional
+    labels (-100 = not supervised, e.g. the prompt)."""
 
     def __init__(self, model = None, args = None, target_model = None, **kwargs):
         if target_model is None:

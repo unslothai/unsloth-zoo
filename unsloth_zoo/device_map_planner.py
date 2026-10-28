@@ -183,9 +183,8 @@ def _config_attr(holder, name, default = None):
         return default
 
 
-# The names ``PretrainedConfig.get_text_config`` searches, in its order. Asking
-# the method is not enough: T5Gemma overrides it to return ``self`` on
-# transformers 4.56.x, hiding the soft cap on ``config.decoder``.
+# Names PretrainedConfig.get_text_config searches, in order; asking the method is not enough, since T5Gemma returns self
+# on transformers 4.56.x, hiding config.decoder's soft cap.
 _TEXT_CONFIG_ATTRS = ("text_config", "decoder", "text_encoder")
 
 
@@ -210,13 +209,9 @@ def _model_config(model_or_config):
     return model_or_config
 
 
-# Composites that build their own ``lm_head`` over a bare ``AutoModel`` tower
-# instead of the family's ``*ForCausalLM``. The tower's config still declares the
-# scale but the wrapper's ``forward`` never applies it (``logit_scale`` does not
-# appear in ``modeling_aya_vision.py`` / ``modeling_cohere2_vision.py``), so
-# crediting it reserves a temporary nobody allocates. Not here: Granite Speech
-# (builds an ``AutoModelForCausalLM``, so it does divide) and Gemma 3n
-# (re-applies the cap in its own ``forward``).
+# Composites with their own lm_head over a bare AutoModel tower never apply the tower's declared scale (logit_scale
+# absent from aya_vision and cohere2_vision), so it is not credited; Granite Speech (builds an AutoModelForCausalLM, so
+# it divides) and Gemma 3n (re-applies its cap) are excluded.
 _OWN_UNTRANSFORMED_HEAD = frozenset({"aya_vision", "cohere2_vision"})
 
 # Config field -> which magnitude it contributes, by default.
@@ -228,12 +223,8 @@ _TRANSFORM_FIELDS = (
     ("logit_scale_divide", ("logits_scaling",)),
 )
 
-# ``logits_scaling`` is not one knob. Granite divides the logits by it;
-# HyperCLOVA X multiplies, as transformers notes on the line itself ("MuP:
-# multiply logits by logits_scaling (cf. GraniteForCausalLM which divides)");
-# MiniCPM3 scales the HIDDEN STATES before the head, so it is not a logit
-# transform at all. Keyed on the ``model_type`` of the config the field came
-# from, so a composite is judged by the tower it wraps.
+# logits_scaling is not one knob: Granite divides logits by it, HyperCLOVA X multiplies, and MiniCPM3 scales hidden
+# states before the head; overrides are keyed on the source config's model_type.
 _BUCKET_OVERRIDES = {
     ("logits_scaling", "hyperclovax"): "logit_scale_multiply",
     ("logits_scaling", "minicpm3"): None,
@@ -302,8 +293,7 @@ def detect_logit_transforms(model_or_config) -> dict:
         if config is None:
             return zero
         found = dict(zero)
-        # A re-heading wrapper carries the tower's transforms without applying
-        # them, so only its own top-level config counts.
+        # A re-heading wrapper carries the tower's transforms without applying them, so only its own top-level config counts.
         own_head = _config_attr(config, "model_type") in _OWN_UNTRANSFORMED_HEAD
         for holder in _text_configs(config):
             if own_head and holder is not config:
@@ -321,9 +311,8 @@ def detect_logit_transforms(model_or_config) -> dict:
                     try:
                         found[bucket] = float(value)
                     except Exception:
-                        # Anything at all: a huge int raises OverflowError, and
-                        # the outer handler would discard the fields already
-                        # read.
+                        # Catches anything, since a huge int raises OverflowError in float(), and the outer handler
+                        # would otherwise discard the fields already read.
                         continue
                     break
         return found
@@ -382,8 +371,7 @@ def logit_headroom_bytes(
     if temperature_scaled:
         per_chunk += rows_per_chunk * vocab_size * 4
     if retained_rows:
-        # backward allocates one float32 gradient buffer of the chunk shape while
-        # the saved forward tensors of every chunk are still resident.
+        # Backward allocates one float32 gradient buffer of the chunk shape while every chunk's saved forward tensors are still resident.
         per_chunk += rows_per_chunk * vocab_size * 4
     retained = int(retained_rows) * vocab_size * (4 + (s if softcapped else 0))
     return int(per_chunk + retained + safety_bytes)
@@ -507,9 +495,8 @@ def _undeclared_sibling_blocks(model: nn.Module, declared: set[str]) -> set[str]
 def resolve_no_split_classes(model: nn.Module) -> list[str]:
     """Decoder / encoder block classes that must not be split across devices."""
     classes = getattr(model, "_no_split_modules", None)
-    # `[]` is the model declaring that nothing is atomic, which several
-    # transformers models do (camembert, colpali, colqwen2, efficientnet, fuyu).
-    # Only `None`, the base-class default, means "not declared, go and detect".
+    # [] means the model declares nothing atomic, as several transformers models do (camembert, colpali, colqwen2,
+    # efficientnet, fuyu); only None, the base-class default, means not declared, so detect.
     if classes is not None:
         declared = {str(c) for c in classes}
         # transformers 4.x declares a composite's blocks on its sub-models, not the root (unsloth#2864).
@@ -517,8 +504,7 @@ def resolve_no_split_classes(model: nn.Module) -> list[str]:
             if module is not model:
                 declared |= {str(c) for c in (getattr(module, "_no_split_modules", None) or ())}
         return sorted(declared | _undeclared_sibling_blocks(model, declared))
-    # Fallback: every distinct child class of every nn.ModuleList that holds
-    # more than one entry. That is where repeated transformer blocks live.
+    # Fallback: every distinct child class of each nn.ModuleList holding more than one entry, which is where repeated transformer blocks live.
     found: set[str] = set()
     for _, mod in model.named_modules():
         if isinstance(mod, nn.ModuleList) and len(mod) > 1:
@@ -738,16 +724,14 @@ def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[st
             attempts.append(({"hf_quantizer": hf_quantizer}, True))
         elif size_kwargs:
             supported = {k: v for k, v in size_kwargs.items() if k in accepted}
-            # Drop the extras one at a time rather than all at once: an older
-            # accelerate without `special_dtypes` still gets the storage dtype,
-            # which is the term that actually moves the number.
+            # Drop extras one at a time: an older accelerate without special_dtypes still gets the storage dtype, which
+            # is the term that actually moves the number.
             if supported:
                 attempts.append((supported, supported.keys() >= size_kwargs.keys()))
             if "dtype" in supported and len(supported) > 1:
                 attempts.append(({"dtype": supported["dtype"]}, False))
-        # Last resort. Correct for an unquantised model with nothing to say, an
-        # over-estimate for a quantised one -- which refuses rather than OOMs, so
-        # it is the safe way to be wrong.
+        # Last resort: correct for an unquantised model with nothing to say, an over-estimate for a quantised one, which
+        # refuses rather than OOMs, so it is the safe way to be wrong.
         attempts.append(({}, hf_quantizer is None and not size_kwargs))
         for kwargs, complete in attempts:
             try:
@@ -1174,14 +1158,9 @@ def _split_units(
     units: list[tuple[str, int]] = []
 
     def walk(prefix: str, module: nn.Module) -> None:
-        # `_modules`, not `named_children()`: that helper drops repeated
-        # registrations of the SAME object, so `nn.ModuleList([block] * n)`
-        # yields one name and the aliases never become placement units. The
-        # coverage check enumerates parameters with `remove_duplicate=False`, so
-        # the missing aliases were then reported as an internal failure on a
-        # model that fits. Sizing counts the shared tensors once, so an alias
-        # unit is zero bytes, and the tied-parameter grouping below co-locates
-        # it with the name that carries the weight.
+        # Uses _modules, not named_children(), which drops repeated registrations of one object (nn.ModuleList([block] *
+        # n)); else the remove_duplicate=False coverage check reports aliases as an internal failure; alias units are
+        # zero bytes, co-located with the name that carries the weight.
         children = [(n, m) for n, m in module._modules.items() if m is not None]
         size = sizes.get(prefix, 0)
         if prefix and (type(module).__name__ in no_split or not children or size == 0):
@@ -1190,17 +1169,12 @@ def _split_units(
         if not children:
             units.append((prefix, size))
             return
-        # Direct parameters/buffers owned by this module (not by a child) have
-        # to travel with the module itself, so keep them as their own unit.
+        # Direct parameters and buffers owned by this module (not a child) travel with it, so they are kept as their own unit.
         own_tensors = list(module.named_parameters(recurse=False)) + \
                       list(module.named_buffers(recurse=False))
-        # Size direct state from the same quantiser-aware table as everything
-        # else, by subtracting the children from the subtree. `element_size()` on
-        # the live tensor is the number this module exists to avoid: a
-        # preprocessed meta `Params4bit` reports the full unpacked shape in
-        # float32, so the units would stop summing to `total_weight_bytes` and
-        # the planner would refuse a model that fits (or overcommit one that
-        # does not).
+        # Sizes direct state from the quantiser-aware table minus children, not element_size(): a preprocessed meta
+        # Params4bit reports the unpacked float32 shape, so units would stop summing to total_weight_bytes, and the
+        # planner would refuse a model that fits.
         child_bytes = sum(
             sizes.get(f"{prefix}.{child_name}" if prefix else child_name, 0)
             for child_name, _ in children
@@ -1475,8 +1449,8 @@ def plan_device_map(
     if len(devices) < 2:
         return None
 
-    # `_colocate`: internal (tower, excluded blocks) pairs sharing a device; None = try
-    # whole, then anchored, then the old split so previously plannable models still plan.
+    # _colocate is internal (tower, excluded blocks) pairs sharing a device; None tries whole, then anchored, then the
+    # old split, so previously plannable models still plan.
     if _colocate is None:
         towers = [] if no_split_module_classes is not None else _sub_model_towers(model)
         if not towers:
@@ -1519,8 +1493,7 @@ def plan_device_map(
     if quantizer_note is not None:
         notes.append(quantizer_note)
 
-    # `[]` is a real override -- "split anywhere, no block is atomic" -- and is
-    # not the same request as `None`, which means "detect the block classes".
+    # [] is a real override meaning split anywhere with no atomic block; it is not the same request as None, which means detect the block classes.
     no_split = (
         list(no_split_module_classes) if no_split_module_classes is not None
         else resolve_no_split_classes(model)
@@ -1549,8 +1522,7 @@ def plan_device_map(
         logit_dtype = w.dtype if w is not None and w.dtype.is_floating_point else torch.bfloat16
 
     if softcapped is None or logit_scaled is None:
-        # Missing a transform drops its temporary from the headroom and
-        # under-reserves the head's card.
+        # A missing transform drops its temporary from the headroom and under-reserves the head's card.
         transforms = detect_logit_transforms(model)
         if softcapped is None:
             softcapped = bool(transforms["logit_softcapping"])
@@ -1575,9 +1547,7 @@ def plan_device_map(
     if free_space_policy not in ("balanced", "head_max"):
         raise ValueError(f"free_space_policy must be 'balanced' or 'head_max', got {free_space_policy!r}")
 
-    # Units that must travel with the head. Resolved BEFORE the reserve is
-    # derived: the head's device pays for them on top of the headroom, so the
-    # reserve cap below cannot be computed without knowing how big they are.
+    # Units that must travel with the head are resolved before the reserve is derived, since the head's device pays for them on top of the headroom.
     pinned: list[str] = []
     if head_name is not None:
         pinned.append(head_name)
@@ -1595,29 +1565,16 @@ def plan_device_map(
             )
 
     unit_size = dict(units)
-    # Expand each pinned module to every placement unit at or below it. A head
-    # that is a plain nn.Linear is a leaf and is its own unit, so this is a
-    # no-op there; a composite head is split by `_split_units` into descendants
-    # like `lm_head.proj` and the head's own name never appears as a unit, so an
-    # exact-name filter dropped it from `pinned` entirely and the greedy walk was
-    # free to put it on a card that is not `head_device` -- leaving the logit
-    # headroom reserved on the wrong GPU.
-    # ... and up as well as down. When the head sits inside a module whose class
-    # is in `no_split_module_classes`, the unit is that atomic ANCESTOR and the
-    # head's own name never appears, so a descendants-only filter emptied
-    # `pinned` and the greedy walk was free to put the head's card's contents
-    # anywhere -- headroom reserved on a GPU that does not hold the head.
+    # Pin units below and above each pinned module: a composite head split into lm_head.proj, or inside an atomic
+    # ancestor in no_split_module_classes, never appears by its own name; an exact filter lost it, so its headroom
+    # landed on the wrong GPU.
     pinned = list(dict.fromkeys(
         u for p in pinned for u, _ in units
         if u == p or u.startswith(p + ".") or p.startswith(u + ".")
     ))
 
-    # Co-locate every group of units that shares a parameter, not just the
-    # input/output embedding pair. `compute_module_sizes` counts a shared tensor
-    # once, so splitting its owners across devices makes accelerate materialise a
-    # second copy that `weight_bytes` never accounted for, and a plan that
-    # measured as feasible OOMs during dispatch. Encoder/decoder models that tie
-    # `shared` to both embedding tables are the common case.
+    # Co-locate every group sharing a parameter, not just the embedding pair: compute_module_sizes counts a shared
+    # tensor once, so splitting owners makes accelerate copy it and OOM at dispatch.
     unit_names = [u for u, _ in units]
     parent = {u: u for u in unit_names}
 
@@ -1655,8 +1612,7 @@ def plan_device_map(
             if a != b:
                 parent[a] = b
 
-    # A tied group that touches the head travels with the head; the rest just
-    # have to stay together.
+    # A tied group touching the head is pinned with the head; the other tied groups only have to stay together.
     pinned_roots = {_root(p) for p in pinned}
     tied_with_head = [u for u in unit_names if u not in pinned and _root(u) in pinned_roots]
     if tied_with_head:
@@ -1668,8 +1624,7 @@ def plan_device_map(
         )
     pinned_bytes = sum(unit_size[p] for p in pinned)
 
-    # Placement items: one per co-location group, in first-appearance order, so
-    # the walks below cannot separate units that share a tensor.
+    # Placement items are one per co-location group in first-appearance order, so the walks cannot split units that share a tensor.
     free_groups: list[tuple[tuple[str, ...], int]] = []
     _group_index: dict[str, int] = {}
     for name, size in units:
@@ -1684,17 +1639,12 @@ def plan_device_map(
             _group_index[root] = len(free_groups)
             free_groups.append(((name,), size))
 
-    # A reserve the caller measured is a constraint; a reserve we guessed is a
-    # heuristic. Only the guess may be relaxed to make a placement fit (see
-    # `attempt`), otherwise a per-device mapping built from measurements -- the
-    # documented answer to the asymmetric-activation caveat above -- could be
-    # quietly reduced to zero and the run would OOM on a card the plan still
-    # claimed had the reserve free.
+    # A caller-measured reserve is a constraint; only a guessed reserve may be relaxed (see `attempt`), else a measured
+    # per-device map could silently drop to zero and OOM.
     reserve_is_explicit = activation_reserve_bytes is not None
     requested_reserve = activation_reserve_bytes
 
-    # Per head candidate, the balanced reserve the flat-average planner asked
-    # for. `attempt` relaxes from it as well as from the prorated one.
+    # Per head candidate, the reserve the flat-average planner asked for; `attempt` relaxes from it as well as from the prorated one.
     flat_reserve: dict[int, dict[int, int]] = {}
 
     def reserve_for(head_device: int) -> dict[int, int]:
@@ -1710,98 +1660,15 @@ def plan_device_map(
         value = requested_reserve
         if value is None:
             if free_space_policy == "balanced":
-                # Give every device the same activation budget, then hand the
-                # head's device the logit headroom on top.
-                #
-                # This equal split is a heuristic and it is only right when the
-                # per-device activation demand is symmetric. It is NOT symmetric
-                # for a vision-LM whose GPU 0 also carries the vision tower, the
-                # input embedding and the generation KV cache: a measured GRPO
-                # step (4 x 640 completion tokens, a 30B 4-bit model,
-                # 2 x 14.56 GiB) OOMs on GPU 0 under the equal split while
-                # succeeding under accelerate's own layout. Pass a per-device
-                # mapping when you have measurements.
+                # Equal activation split plus logit headroom on the head's device is a heuristic, right only for
+                # symmetric demand; a vision-LM whose GPU 0 also holds the vision tower, input embedding and KV cache
+                # can OOM there (measured: a 30B 4-bit GRPO step OOMed on GPU 0 under the equal split); pass a
+                # per-device mapping when you have measurements.
                 slack = sum(raw_budgets.values()) - total
                 value = max(0, (slack - headroom) // len(devices))
-                # The head's device pays the headroom on top of its share, so an
-                # equal split of the global slack can exceed that one device's
-                # own budget even when the totals fit. Cap by each device's own
-                # budget less the weight it has to hold, and less the headroom
-                # only on the card that will carry it, otherwise a model that
-                # trivially fits is refused.
-                #
-                # That weight is at least the pinned units, which the head's
-                # device takes whole. An average share alone is not enough:
-                # `attempt` only relaxes the reserve on the OTHER cards, so once
-                # the head's budget goes negative every step fails and the plan
-                # is refused. A four-layer model whose head is larger than half
-                # the weights (share 24 KiB, head 32 KiB) was rejected on
-                # 2 x 8 GiB for exactly that reason.
-                # Cap PER DEVICE, not by the smallest cap across all of them:
-                # a single `min` lets the head's card -- the only one paying
-                # the headroom, so the only one whose cap can go negative --
-                # zero the reserve on cards that had room for one. Measured on
-                # Kaggle-Muse_Glimmer_(30B)-GRPO, 2 x 14.56 GiB: budgets 13.104
-                # each, weights 20.310, headroom 4.104, so value 0.897 GiB and
-                # caps 2.949 (cuda:0) and -1.155 (cuda:1, the head). That min
-                # gave both cards a 0.000 GiB reserve, cuda:0 was packed to
-                # within 0.161 GiB and the run OOMed on the first training
-                # step's 254 MiB while cuda:1 left 5.737 GiB unused. Clamping
-                # each device at 0 still keeps the head's own reserve
-                # non-negative, so `attempt` -- which only relaxes the OTHER
-                # cards -- is never handed an infeasible head budget.
-                #
-                # Charge each device the weight IT holds, not the flat average.
-                # The packing is capacity-proportional, so on unequal cards the
-                # average is the weight of no device: 16 + 80 GiB holding a
-                # 62.81 GiB model gives an average of 31.41, which is larger
-                # than the whole 16 GiB card, so its cap went to -15.41 and the
-                # clamp zeroed its reserve -- and the packing then filled it to
-                # 0.09 GiB free (99.4%) while the 80 GiB card kept 16.41. Same
-                # shape at 24 + 48.
-                #
-                # Prorating only ever LOOSENS the flat-average share, never
-                # tightens it (`min` below), and that one-sidedness is load
-                # bearing twice over. The proration is symmetric, so it charges
-                # the BIGGER card more than the average -- and the bigger card
-                # is the one the head lands on, the only one that also pays the
-                # headroom. Charged both, its own cap can go where the small
-                # card's used to: budgets 852 + 1089 with 1368 of weights, 358
-                # of headroom and a 168-byte pinned head kept 107 and 47, and
-                # the raw proportional share turns that into 107 and 0. On a
-                # real pair, 10 + 18 GiB carrying a 4-layer 8192-wide model with
-                # 12 GiB of logit headroom loses the head's whole 1.094 GiB
-                # reserve. Taking the smaller of the two shares fixes the small
-                # card without ever moving the big one: the cap is per device
-                # monotone against the flat-average planner, so no card can come
-                # out of this with less than it had.
-                #
-                # On identical cards the prorated share IS the flat average, so
-                # `min` collapses onto the old expression and the measured Muse
-                # Glimmer arithmetic stands: 13.104 each of 26.208 gives 10.155,
-                # caps 2.949 and -1.155. Ceiling division on both sides is what
-                # makes the two agree byte for byte. Single-device budgets are
-                # unchanged too (the share is the whole model either way).
-                #
-                # The pinned floor is the HEAD's alone, because the head's card
-                # is the only one that holds the pinned units. Charging it to
-                # every card is what the flat-average planner did, and it
-                # recreates on a small card exactly the zero reserve this branch
-                # exists to remove: `_Bins([100, 50], head = 150)` on budgets
-                # 400 + 2000 with no headroom has 1200 bytes of weights and a
-                # 600-byte pinned head, so cuda:0's proportional share is 200
-                # but a shared floor raises it to 600, its cap 400 - 600 clamps
-                # to zero and the in-order walk fills all 400 bytes of the card
-                # while cuda:1 leaves 1200 free. Head-only, cuda:0 keeps 200.
-                # The cap stays per device monotone against the flat-average
-                # planner either way (`min(flat, prorated) <= flat <=
-                # max(flat, pinned_bytes)`), and `attempt`'s per-card legacy
-                # floor is what guarantees the higher non-head ask can never
-                # settle BELOW the old answer: measured over 36,460 configs, 0
-                # devices anywhere come out under 7c9a7ac0, and 3 x 80 GiB on a
-                # 4-layer 8192-wide model -- the shape that regressed when the
-                # floor was head-only and that guard did not yet exist -- is
-                # byte identical.
+                # Cap each device at its own budget less the weight it holds, the head card also paying headroom,
+                # clamped at 0 so attempt never gets a negative head budget; the smaller of flat and prorated share
+                # keeps each card reserve at least the flat planner; shared pinned floor zeroes small cards
                 capacity = sum(raw_budgets.values()) or 1
                 flat = -(-total // len(devices))
                 share = {
@@ -1819,12 +1686,8 @@ def plan_device_map(
                     )))
                     for d in devices
                 }
-                # What the flat-average planner would have asked for. `attempt`
-                # walks this ladder too, so every rung it used stays reachable.
-                # It keeps the SHARED pinned floor on purpose: this mapping has
-                # to reproduce the old planner exactly, floor included, or the
-                # per-card guarantee `attempt` derives from it is not a
-                # statement about the previous release.
+                # The flat-average planner's reserve, kept with the shared pinned floor so this mapping reproduces the
+                # old planner exactly; `attempt` walks its ladder too.
                 flat_reserve[head_device] = {
                     d: int(max(0, min(
                         value,
@@ -1860,23 +1723,9 @@ def plan_device_map(
         if reserve_is_explicit:
             return _fill(head_device, reserve, max(reserve.values()))
 
-        # The reserve is per device now, so it is a range: the top is what we
-        # would like every card to keep, the floor the least of it (`min` of a
-        # clamp is the clamp of the `min`). Relaxing from the top alone can
-        # land BELOW that floor --
-        # a request missing by one percent is answered by a whole 5% rung -- so
-        # 4 x 80 GiB holding a 144 GiB model kept 41.72 GiB per card where the
-        # shared cap kept 43.68.
-        #
-        # So try every rung EITHER planner would have tried, best first: the
-        # non-head cards stepped down from the per-device range and from the
-        # old shared floor, then both ladders again with the head's own reserve
-        # relaxed too. The old planner's ladders are in that set rung for rung,
-        # and the per-card floor below is what stops a rung with a larger
-        # minimum from being taken when it keeps some card less. The head-relaxing
-        # rungs exist because relaxing only the OTHER cards can miss the head's
-        # card by less than its reserve and refuse a model that fits. The logit
-        # headroom is never touched by any of them.
+        # Try every rung either planner would have tried, stepping down from the per-device range and its floor, since
+        # relaxing from the top alone can land below the floor; head reserve is relaxed too, as relaxing only other
+        # cards can refuse a fitting model; logit headroom is never touched
         def ladder(base: dict[int, int]) -> list[dict[int, int]]:
             top, floor = max(base.values()), min(base.values())
             rungs = sorted(
@@ -1895,20 +1744,15 @@ def plan_device_map(
                 out.append(dict.fromkeys(devices, floor * (20 - step) // 20))
             return out
 
-        # Both ladders, because a rung is 5% of the mapping it is scaled from:
-        # prorating raises the non-head asks on unequal cards, and the coarser
-        # ladder off that higher start can step straight PAST a flat-average
-        # rung that fit. Budgets 1264 + 1354, 1368 of weights and 3 of headroom
-        # ask 580/623 flat and 603/623 prorated; free units of 272 and 768 make
-        # the flat 493 rung fit, and the prorated ladder lands on 482 instead.
+        # Both ladders are tried, because a rung is 5% of the mapping it scales from: prorating raises non-head asks on
+        # unequal cards, and the coarser ladder can step straight past a flat-average rung that fits
         candidates = ladder(reserve)
         flat = flat_reserve.get(head_device)
         legacy = ladder(flat) if flat is not None and flat != reserve else []
         candidates += legacy
 
         def _ordered(cands):
-            # Most-kept first. Passing `max(kept.values())` as the non-head cap
-            # makes `_fill` keep exactly this mapping.
+            # Most-kept first; passing `max(kept.values())` as the non-head cap makes `_fill` keep exactly this mapping.
             seen = set()
             out = []
             for kept in cands:
@@ -1928,24 +1772,8 @@ def plan_device_map(
                 filled[key] = _fill(head_device, kept, max(kept.values()))
             return filled[key]
 
-        # What the flat-average planner would have kept: its own ladder, walked
-        # on its own. Ordering by the smallest reserve any card keeps is not
-        # coordinate-wise monotone, so merging the two ladders and taking the
-        # largest minimum can hand one card LESS than that planner did while
-        # another gains. `_Bins([249, 230, 144, 203, 223, 68], head = 32)` on
-        # budgets 3050 + 3977 with 504 of headroom asks 752/963 flat and
-        # 963/963 prorated; 963 does not fit, the prorated ladder's next rung
-        # 914/914 does, and its larger minimum sorts ahead of the still feasible
-        # 752/963 -- so the head, the card that also pays the logit headroom,
-        # comes out 49 short of what it used to keep. That fixture scales
-        # linearly, so on real cards it is gigabytes of activation reserve. A
-        # 1500 config fuzz at MiB scale put it at 58 shapes.
-        #
-        # So a candidate is only better if it is at least the legacy reserve on
-        # EVERY card. The legacy rung itself always passes that test, so this
-        # can never refuse a plan the old planner accepted, and the best rung
-        # above it is still taken: the fixture ends on 866/963, keeping the
-        # head whole AND lifting the small card 114 over the old answer.
+        # The legacy ladder is the flat planner's own; a candidate must be at least its reserve on every card, as
+        # ordering by the smallest reserve is not monotone.
         legacy_kept = None
         for kept in _ordered(legacy):
             if _below_floor(kept):
@@ -1965,10 +1793,8 @@ def plan_device_map(
         return None
 
     def _fill(head_device: int, reserve: dict[int, int], other_reserve: int):
-        # What this attempt really keeps free per device, which is what the plan
-        # reports: a per-device mapping is not one number, and `attempt` relaxes
-        # the reserve on the non-head cards, so a single scalar would promise
-        # headroom the accepted packing did not keep.
+        # Reserve kept per device, which the plan reports: `attempt` relaxes non-head cards, so a single scalar would
+        # promise headroom the accepted packing did not keep.
         kept = {d: reserve[d] if d == head_device else min(reserve[d], other_reserve)
                 for d in devices}
         budget = {
@@ -1984,23 +1810,12 @@ def plan_device_map(
             return None
         used, assign = _walk_in_order(free_groups, budget, head_device)
         if used is None:
-            # The in-order walk is next-fit with a first-fit rescue, and neither
-            # backtracks, so it can run out of room while a valid assignment
-            # exists: capacities 10 and 10 with units 7, 6, 3, 2, 2 build loads
-            # of 9 and 9 and then reject the last unit, although 7+3 and 6+2+2
-            # both fit. Differently sized units -- a vision tower, a projector
-            # and decoder blocks in one model -- produce exactly that shape. So
-            # before giving up, repack largest-first into the tightest device
-            # that still fits. This runs ONLY after the in-order walk has
-            # failed, so a plan that already worked is never rewritten: layout
-            # in definition order keeps consecutive layers together, which
-            # costs fewer cross-device hops than a size-sorted one.
+            # The in-order walk cannot backtrack, so a largest-first best-fit repack runs only after it fails; in-order
+            # keeps consecutive layers together for fewer cross-device hops.
             used, assign = _best_fit(free_groups, budget, head_device)
         if used is None:
-            # Best-fit is not exact either: capacities 10 and 10 with units
-            # 6, 5, 3, 2, 2, 2 pack 6+3 and 5+2+2 and then reject the last 2,
-            # although 6+2+2 and 5+3+2 both fit. Last resort before refusing a
-            # model that demonstrably fits.
+            # Best-fit is not exact either: capacities 10 and 10 with units 6,5,3,2,2,2 reject a fitting packing, so
+            # exact fit is the last resort before refusing.
             used, assign = _exact_fit(free_groups, budget, head_device)
         if used is None:
             return None
@@ -2008,11 +1823,7 @@ def plan_device_map(
             assign[p] = head_device
             used[head_device] += unit_size[p]
         weight_bytes = {d: used[d] for d in devices}
-        # `budget` is the *remaining* capacity the packing walks were allowed to
-        # use, so the head device has already paid for the pinned units. The
-        # public field means "budget available to weights after every reserve"
-        # and `weight_bytes` counts those same pinned units, so hand the pinned
-        # bytes back or the head device reports weights above its own budget.
+        # Budget is the remaining capacity after the head paid for pinned units; public budgets add `pinned_bytes` back since `weight_bytes` counts them too.
         public_budgets = {d: budget[d] for d in devices}
         public_budgets[head_device] += pinned_bytes
         return assign, weight_bytes, public_budgets, kept
@@ -2043,11 +1854,8 @@ def plan_device_map(
         return peak
 
     def _walk_in_order(free, budget, head_device: int):
-        # `head_max` means "push as much weight off the head's card as possible".
-        # Walking plain device order defeats that whenever the head is not the
-        # last device -- `prefer_head_device = 0`, or a higher-index candidate
-        # that could not hold the pinned head -- because the walk then fills the
-        # head's card first and leaves the later GPUs empty.
+        # `head_max` pushes weight off the head's card by walking it last; plain device order fills it first when the
+        # head is not the last device, leaving later GPUs empty.
         order = devices
         if free_space_policy == "head_max":
             order = [d for d in devices if d != head_device] + [head_device]
@@ -2076,8 +1884,7 @@ def plan_device_map(
                     break
                 cursor += 1
             if not placed:
-                # Sequential cursor exhausted: try any earlier device that still
-                # has room rather than falling off to CPU.
+                # When the sequential cursor is exhausted, try any earlier device with room rather than falling back to CPU.
                 for d in order:
                     if fits(d, size, t, r):
                         assign.update(dict.fromkeys(names, d))
@@ -2198,9 +2005,7 @@ def plan_device_map(
         return {d: budget[d] - remaining[d] for d in devices}, assign
 
     if prefer_head_device is not None and prefer_head_device not in devices:
-        # Otherwise the candidate loop below skips every option and the failure
-        # is reported as a memory shortfall, which sends the caller looking in
-        # entirely the wrong place.
+        # Raise here for an unknown `prefer_head_device`; otherwise the candidate loop skips every option and reports a memory shortfall instead.
         raise ValueError(
             f"prefer_head_device={prefer_head_device} is not one of the usable "
             f"devices {devices}"
@@ -2270,8 +2075,7 @@ def plan_device_map(
             " loading may run out of memory"
         )
     if result is None:
-        # Report the reserve of the first candidate actually tried; it is what
-        # the failing arithmetic used.
+        # Report the reserve of the first candidate actually tried, since that is what the failing arithmetic used.
         reserve = reserve_for(next((c for c in order if c in devices), devices[0]))
         reserved_total = sum(reserve.values())
         slack = sum(raw_budgets.values()) - total - reserved_total
@@ -2300,11 +2104,8 @@ def plan_device_map(
 
     assign, weight_bytes, budgets, reserve_kept = result
     activation_reserve_bytes = max(reserve_kept.values()) if reserve_kept else 0
-    # Sanity: the map must cover every parameter and buffer.
-    # `remove_duplicate=False`, because accelerate's own `check_device_map`
-    # walks `state_dict()`, which lists a tied tensor under every name it has.
-    # Covering only the deduplicated names lets a map through that accelerate
-    # then rejects with "does not give any device for the following parameters".
+    # The map must cover every parameter and buffer: use `remove_duplicate=False`, since accelerate's `check_device_map`
+    # walks `state_dict()`, which lists tied tensors under every name.
     uncovered = []
     for pname, _ in list(model.named_parameters(remove_duplicate=False)) + \
                     list(model.named_buffers(remove_duplicate=False)):

@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-MLX utilities for Apple Silicon training.
-
-Provides loss functions (CCE and baseline CE), data batching,
-weight extraction helpers, and model save/load/export for LoRA adapters
-and merged models (safetensors, GGUF, HuggingFace Hub).
-"""
+"""MLX utilities for Apple Silicon training: CCE and baseline CE losses, batching, weight helpers, and LoRA/merged model
+save, load and export to safetensors, GGUF, HuggingFace Hub."""
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -373,18 +368,9 @@ def restore_mlx_norm_output_cast_state(snapshot) -> None:
 
 
 def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
-    """Control whether MLX norm outputs are cast back to activation dtype.
-
-    MLX training can keep norm parameters in fp32 for stability, but letting
-    fp32 norm outputs flow through the rest of the graph promotes downstream
-    intermediates and materially increases LoRA/QLoRA memory. Casting the
-    result back keeps bf16/fp16 downstream activations.
-
-    This patches norm classes process-wide, not per model. Use
-    snapshot_mlx_norm_output_cast_state() and restore_mlx_norm_output_cast_state()
-    to bracket temporary changes; overlapping trainer/inference runs in the
-    same process are still not safe because the patched classes are shared.
-    """
+    """Toggles casting norm outputs back to activation dtype, so fp32 norms do not inflate LoRA/QLoRA memory; patches
+    norm classes process-wide, so overlapping runs in one process are unsafe; bracket changes with
+    snapshot_mlx_norm_output_cast_state and restore_mlx_norm_output_cast_state."""
     with _MLX_NORM_OUTPUT_CAST_STATE.lock:
         try:
             from . import compile as _mlx_compile
@@ -401,10 +387,9 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
         _set_mlx_norm_output_cast_classes(enabled, norm_classes)
 
 
-# MLX raises instead of returning zero when a backward pass reaches a
-# gather/scatter index, aborting every graph that derives indices from activations:
-# MoE routing, SwitchGLU's gather-sort, GLM-5.x's sparse mask. Detaching changes no
-# forward value; producers, consumers and integer `__getitem__` keys are all detached.
+# MLX raises instead of returning zero on backward through a gather/scatter index, aborting graphs that derive indices
+# from activations (MoE routing, SwitchGLU gather-sort, GLM-5.x sparse mask); detaching changes no forward value;
+# producers, consumers and integer __getitem__ keys are detached.
 _MLX_INDEX_PRODUCERS = ("argpartition", "argsort", "argmax", "argmin")
 _MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
     "take": (1,), "take_along_axis": (1,), "put_along_axis": (1,),
@@ -412,19 +397,14 @@ _MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
 _MLX_INDEX_KEYWORDS = frozenset(("indices", "lhs_indices", "rhs_indices"))
 _MLX_INDEX_OP_NAMES = _MLX_INDEX_PRODUCERS + tuple(_MLX_INDEX_CONSUMERS)
 _MLX_INDEX_GRADIENT_LOCK = threading.RLock()
-# Two depths, with different scopes. Physical: how many runs still need `mlx.core`
-# wrapped. Global under the lock, since unpatching is process-wide.
+# Physical depth (runs still needing mlx.core wrapped) is global under the lock since unpatching is process-wide; the logical depth below is context-local.
 _MLX_TRAINING_PATCH_DEPTH = 0
-# Logical: is THIS context inside a training step. Context-local because a global
-# one is wrong both ways -- never cleared, a nested evaluation reads as training;
-# always cleared, one trainer's evaluation clears the flag under another that is
-# still differentiating, and a call site passing no `use_kernel` (GLM-5.x) then
-# routes its backward to the fused kernel, which has no VJP. ContextVar covers
-# threads and asyncio Tasks; `threading.local` would cover only the first.
+# Logical depth (is this context inside a training step) is a ContextVar, since a global fails both ways: never cleared
+# makes evals read as training; always cleared lets one eval clear another's flag, sending a GLM-5.x call with no
+# use_kernel to the fused kernel (no VJP); covers threads and asyncio Tasks.
 _MLX_TRAINING_ACTIVE_DEPTH = contextvars.ContextVar(
     "unsloth_mlx_training_active_depth", default=0)
-# Tuple, not list: a mutable ContextVar default is shared by every context that
-# never set one, putting the stack straight back in global scope.
+# Tuple, not list: a mutable ContextVar default is shared by every context that never set one, which puts the stack back in global scope.
 _MLX_TRAINING_PAUSE_STACK = contextvars.ContextVar(
     "unsloth_mlx_training_pause_stack", default=())
 # MLX differentiates integer arrays, so only real index positions are detached.
@@ -532,8 +512,8 @@ def _wrap_create_causal_mask(original):
 
 
 def _windowed_attention(sdpa, q, k, v, scale, window, block):
-    # Query blocks folded into the batch, each vs its own + previous key block. Not per-block
-    # slices: their full-size gradient scatters fuse past Metal's kernel argument limit.
+    # Query blocks folded into the batch, each vs its own and the previous key block; per-block slices would fuse their
+    # full-size gradient scatters past Metal's kernel argument limit.
     B, T = q.shape[0], q.shape[-2]
     n = -(-T // block)
 
@@ -608,8 +588,7 @@ def _set_mlx_windowed_attention(enabled: bool) -> None:
 
 
 def acquire_mlx_training_patches() -> None:
-    """Reference-counted: the `mlx.core` patches are process-wide while trainer
-    runs are not, so an inner run must not unpatch an outer one."""
+    """Reference-counted because the mlx.core patches are process-wide while trainer runs are not, so an inner run must not unpatch an outer one."""
     global _MLX_TRAINING_PATCH_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
         from .attention import install_sparse_attention_training
@@ -634,15 +613,9 @@ def release_mlx_training_patches() -> None:
 
 
 def pause_mlx_training_patches() -> bool:
-    """Evaluation runs under `model.eval()` but inside the trainer's window, which
-    would otherwise route it down the training paths.
-
-    Always clears the logical flag, but only for THIS context, so a second trainer
-    on another thread keeps its own. The return value reports only whether the
-    process-wide patches came off: they stay while another run needs them, which
-    costs nothing, since they stop gradients into gather indices and evaluation
-    takes none.
-    """
+    """Pauses training patches around evaluation under model.eval(), which would otherwise take training paths; clears
+    only this context's flag; returns whether process-wide patches came off, which stay while another run needs them
+    (harmless, as evaluation takes no gradients)."""
     global _MLX_TRAINING_PATCH_DEPTH
     _MLX_TRAINING_PAUSE_STACK.set(
         _MLX_TRAINING_PAUSE_STACK.get() + (_MLX_TRAINING_ACTIVE_DEPTH.get(),))
@@ -657,14 +630,9 @@ def pause_mlx_training_patches() -> bool:
 
 
 def resume_mlx_training_patches(paused: bool) -> None:
-    """Give back exactly what `pause_mlx_training_patches` took.
-
-    By increment, never assignment: another trainer may have acquired during the
-    pause, and assigning 1 there would drop this run's reference, so that
-    trainer's release would unpatch `mlx.core` mid-differentiation. The logical
-    depth comes off this context's own stack, so it does not count a second run
-    the way `acquire()` would.
-    """
+    """Undoes pause_mlx_training_patches by increment, never assignment: if another trainer acquired during the pause,
+    assigning 1 would drop this run's reference and let that trainer's release unpatch mlx.core mid-differentiation.
+    Depth comes off this context's own stack, not a second acquire()."""
     global _MLX_TRAINING_PATCH_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
         if paused:
@@ -682,10 +650,9 @@ def mlx_training_patches_active() -> bool:
     return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
 
 
-# Sorted `gather_qmm` silently corrupts its output on neural-accelerator Metal GPUs:
-# unaligned K (ml-explore/mlx#3887, open) and rows past 32768 (ml-explore/mlx#3856,
-# fixed by #3922). `sorted_indices` is only a dispatch hint, so dropping it where a
-# probe measures corruption is safe. Kill switch: UNSLOTH_MLX_GATHER_QMM_GUARD=0.
+# Sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue 3887, open), rows
+# past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a probe measures corruption;
+# kill switch UNSLOTH_MLX_GATHER_QMM_GUARD=0.
 _MLX_MAX_SORTED_ROWS = 32768
 _MLX_CANARY_ERROR_LIMIT = 1.0
 _MLX_K_REMAINDER = "k_remainder"
@@ -752,10 +719,8 @@ def _gather_qmm_canary_defective(condition, group_size, bits, mode, device) -> b
     try:
         max_error = _gather_qmm_canary_error(condition, group_size, bits, mode, device)
     except Exception as error:
-        # Fails CLOSED, unlike the pass-through in `_gather_qmm_guarded`: an unusable
-        # probe proves nothing, and rerouting a healthy call only costs throughput
-        # where admitting a corrupt one costs gradients. Uncached, so a later call
-        # re-probes.
+        # Fails closed, unlike _gather_qmm_guarded's pass-through: an unusable probe proves nothing, and rerouting costs
+        # only throughput where admitting a corrupt call costs gradients; uncached, so each later call re-probes.
         print(f"Unsloth: sorted gather_qmm {condition} probe failed ({error}); "
               f"rerouting this call.")
         return True
@@ -807,9 +772,8 @@ def _gather_qmm_gradient_rows(x, w, lhs_indices, rhs_indices):
 
 
 def _gather_qmm_conditions(x, w, args, kwargs):
-    """Defects this call is exposed to, empty when it misses the kernel. Re-derived
-    per geometry: a `shapeless=True` trace would instead freeze one call's answer onto
-    every later one, since the sorted flag is baked into the traced primitive."""
+    """Defects this call is exposed to (empty when it misses the kernel), re-derived per geometry; shapeless=True would
+    freeze one answer, since the sorted flag is baked into the primitive."""
     if not kwargs.get("sorted_indices"):
         return ()
     if _gather_qmm_target_device(kwargs).type != mx.gpu:
@@ -853,8 +817,8 @@ def _gather_qmm_guarded(x, w, *args, **kwargs):
                    for condition in conditions):
                 kwargs = dict(kwargs, sorted_indices=False)
     except Exception as error:
-        # Failing to READ a call is not a reason to fail it: this stands on a core mlx
-        # op, and the reachable cause is an mlx predating the NAX kernels. Pass through.
+        # Failing to read a call is no reason to fail it: this rests on a core mlx op, and the reachable cause is an mlx
+        # predating the NAX kernels; pass through.
         if not _MLX_GATHER_QMM_UNREADABLE:
             _MLX_GATHER_QMM_UNREADABLE = True
             print(f"Unsloth: could not inspect this gather_qmm call "
@@ -870,10 +834,8 @@ _gather_qmm_guarded._unsloth_gather_qmm_guard = True
 def is_gather_qmm_nax_guard_applied() -> bool:
     """True for the guard anywhere in the chain, index-stop wrapper included."""
     current = mx.gather_qmm
-    # Bounded: the real chain is the guard under at most one index-stop wrapper, but
-    # `getattr(..., None)` only terminates for an object that can be missing an
-    # attribute. A permissive stand-in for mx (the mlx test shim, a Mock) answers every
-    # attribute with a fresh object, so an unbounded walk never reaches None and spins.
+    # Bounded walk: the real chain has the guard under at most one index-stop wrapper; getattr(..., None) only ends for
+    # objects that can lack an attribute, and a permissive mx stand-in (test shim, Mock) never reaches None.
     for _ in range(16):
         if current is None:
             break
@@ -884,8 +846,7 @@ def is_gather_qmm_nax_guard_applied() -> bool:
 
 
 def apply_gather_qmm_nax_guard() -> bool:
-    """Idempotent, thread-safe, and installed UNDER the index-stop wrapper, which
-    removes itself by inspecting `mx` and would be stranded by anything on top."""
+    """Idempotent and thread-safe; installed under the index-stop wrapper, which removes itself by inspecting mx and would be stranded by anything on top."""
     global _MLX_GATHER_QMM_ORIGINAL
     if os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD", "1") == "0":
         return False
@@ -930,11 +891,7 @@ def _get_transformer_layers(model):
 
 
 def _get_vision_encoder_layers(model):
-    """Find vision tower encoder layers (e.g. SigLIP for Gemma3).
-
-    Walks ``model.vision_tower.vision_model.encoder.layers`` and a few
-    fallback paths used by other VLM families.
-    """
+    """Finds vision tower encoder layers (e.g. SigLIP for Gemma3) at model.vision_tower.vision_model.encoder.layers, plus fallback paths for other VLM families."""
     vt = getattr(model, "vision_tower", None) or getattr(model, "vision_model", None)
     if vt is None:
         return None
@@ -956,14 +913,12 @@ def _get_vision_encoder_layers(model):
 
 
 def _detach_integer_arrays(value):
-    """`mx.checkpoint` makes every argument a primal of the recomputed function,
-    so a layer that embeds the token ids it was handed derives a gather index."""
+    """mx.checkpoint makes every argument a primal of the recomputed function, so a layer that embeds the token ids it was handed derives a gather index."""
     if isinstance(value, list):
         return [_detach_integer_arrays(v) for v in value]
     if isinstance(value, tuple):
         detached = tuple(_detach_integer_arrays(v) for v in value)
-        # A NamedTuple is a tuple subclass; rebuilding it as a plain tuple would
-        # turn a layer's `payload.ids` into an AttributeError.
+        # A NamedTuple is a tuple subclass; rebuilding it as a plain tuple would turn a layer's payload.ids into an AttributeError.
         return type(value)(*detached) if hasattr(value, "_fields") else detached
     if isinstance(value, dict):
         return {k: _detach_integer_arrays(v) for k, v in value.items()}
@@ -977,9 +932,8 @@ def _tie_shared_kv_cotangent(x, shared_kv):
 
 @_tie_shared_kv_cotangent.vjp
 def _tie_shared_kv_cotangent_vjp(primals, cotangents, outputs):
-    # Only the source layer's backward consumes borrowed K/V's cotangent, and
-    # `mx.eval` defers it to there, keeping every borrowing layer's T x T
-    # attention cotangents alive; the hidden state's makes it run in place.
+    # Only the source layer backward consumes the borrowed K/V cotangent; mx.eval defers it to there, keeping every
+    # borrowing layer T x T attention cotangents alive; the hidden state cotangent makes it run in place.
     d_x, d_shared_kv = cotangents
     return mx.depends(d_x, list(d_shared_kv)), d_shared_kv
 
@@ -1017,8 +971,7 @@ def _patch_layer_class_for_gc(layer_cls):
             return mx.checkpoint(inner_fn)(
                 self.trainable_parameters(), *args, **kwargs)
 
-        # Shared K/V crosses the checkpoint boundary as a traced argument and a
-        # traced result; read off the slot and the VJP drops the gradient.
+        # Shared K/V must cross the checkpoint boundary as a traced argument and traced result; reading it off the slot makes the VJP drop the gradient.
         outer = (args, kwargs)
 
         def inner_fn(params, borrowed, *args, **kwargs):
@@ -1047,13 +1000,9 @@ def _unpatch_layer_class_gc(layer_cls):
 
 
 def apply_gradient_checkpointing(model):
-    """Apply gradient checkpointing to language and vision tower layers.
-
-    Patches each layer class's ``__call__`` with ``mx.checkpoint`` to recompute
-    the forward during backward instead of storing activations. Trades ~30%
-    extra compute for large memory savings — critical for VLM vision towers at
-    native resolution, which can otherwise materialize tens of GB.
-    """
+    """Applies gradient checkpointing to language and vision layers by patching each layer __call__ with mx.checkpoint;
+    trades ~30% extra compute for memory, critical for VLM vision towers at native resolution, which could otherwise
+    need tens of GB."""
     lm_layers = _get_transformer_layers(model)
     if lm_layers is not None and len(lm_layers) > 0:
         _patch_layer_class_for_gc(type(lm_layers[0]))
@@ -1175,12 +1124,9 @@ def _build_gemma_image_attention_mask(token_type_ids, attention_mask=None,
     return mx.expand_dims(mask, axis=1)
 
 
-# Families that read the padding mask, or whose layers fall back on a stored
-# `_full_attn_mask` without one -- falcon_perception never clears it, so a text
-# batch can inherit the previous image batch's. Elsewhere a supplied mask
-# reaches the layers, where it REPLACES causality. Listed rather than probed
-# from the signature, since molmo_point declares `mask` and never reads it, and
-# keyed on `model_type`, so aliases need their own entry.
+# Families reading the padding mask or falling back on a stored _full_attn_mask (falcon_perception never clears it);
+# elsewhere a supplied mask replaces causality. Listed, not probed: molmo_point declares mask but never reads it; keyed
+# on model_type, so aliases need entries.
 _VLM_FAMILIES_KEEPING_FORWARDED_MASK = frozenset({
     "gemma3", "paligemma",
     "llava_qwen2", "fastvlm",                    # FastVLM answers to both
@@ -1190,26 +1136,14 @@ _VLM_FAMILIES_KEEPING_FORWARDED_MASK = frozenset({
 
 def _keeps_forwarded_mask(model):
     model_type = _config_get(getattr(model, "config", None), "model_type")
-    # mlx-vlm lower-cases model_type to resolve the module but leaves the
-    # config's own spelling alone, so match the way it resolves.
+    # mlx-vlm lower-cases model_type to resolve the module but keeps the config's own spelling, so the lookup must lower-case the same way.
     return str(model_type).lower() in _VLM_FAMILIES_KEEPING_FORWARDED_MASK
 
 
 class _SharedKVSlot:
-    """A cache with training semantics, so KV-shared layers borrow rather than
-    rebuild K/V that the reference implementation never recomputes.
-
-    Position stays 0 and nothing is ever trimmed; a prompt cache would forget
-    past its sliding window and re-rope queries at an advancing offset. No
-    version gate: gemma4 from mlx-vlm 0.5.0 reads shared K/V from its layer
-    results instead; the slots still travel with the batch, but stop being where
-    the sharing is read and leave the training result unchanged.
-
-    `borrow`/`install`/`recorded` exist because gradient checkpointing cannot
-    see an attribute read -- the recomputed VJP drops the gradient while the
-    forward stays correct -- so the wrapper passes K/V in as an argument and
-    takes it back as a result.
-    """
+    """Training-semantics cache so KV-shared layers borrow K/V; position stays 0 and nothing is trimmed; no version gate
+    since gemma4 from mlx-vlm 0.5.0 reads shared K/V from layer results; borrow/install/recorded pass K/V as
+    arguments because checkpointing cannot see attribute reads."""
 
     __slots__ = ("keys", "values")
 
@@ -1241,9 +1175,8 @@ class _SharedKVSlot:
         return self.keys, self.values
 
 
-# Language models that scale token embeddings by sqrt(hidden_size) on the ids
-# path only, so every multimodal forward loses it. gemma3 is absent because
-# `_run_hidden_stack`, the route it takes, already compensates.
+# Language models that scale token embeddings by sqrt(hidden_size) on the ids path only, so multimodal forwards lose the
+# scale; gemma3 is absent because _run_hidden_stack, its route, already compensates.
 _VLM_EMBED_SCALE_FAMILIES = frozenset({"gemma3n_text"})
 
 
@@ -1257,13 +1190,8 @@ def _vlm_embed_scale(model):
 
 
 def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
-    """Scale the token embeddings a multimodal merge left unscaled.
-
-    Only positions still holding a plain token embedding: merged features
-    already carry the scaled magnitude. Found by difference, not by token id --
-    gemma3n's closing audio delimiter carries a feature without being the audio
-    token, and an id-based mask would rescale it.
-    """
+    """Scales only positions still holding plain token embeddings (merged features are already scaled), found by
+    difference, not id: an id mask would rescale gemma3n's closing audio delimiter."""
     scale = _vlm_embed_scale(model)
     if scale is None or input_ids is None:
         return merged_embeds
@@ -1273,25 +1201,18 @@ def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
         return merged_embeds
     raw = embed_tokens(input_ids).astype(merged_embeds.dtype)
     untouched = mx.all(merged_embeds == raw, axis=-1, keepdims=True)
-    # In the embedding dtype, as the ids path does: an fp32 product rounded back
-    # lands on different bf16 values.
+    # Scales in the embedding dtype as the ids path does; an fp32 product rounded back to bf16 lands on different values.
     return mx.where(untouched, merged_embeds * scale, merged_embeds)
 
 
-# Families whose MLX stack multiplies the embedding by sqrt(hidden_size) after
-# the module returns, without exposing the factor as an attribute. Named by the
-# base the model type normalizes to, since a tower is reachable as either
-# `gemma3` or `gemma3_text` depending on how the wrapper exposes it.
+# Families whose MLX stack scales the embedding by sqrt(hidden_size) after the module returns, without exposing the
+# factor as an attribute; named by normalized base type, since a tower is reachable as gemma3 or gemma3_text.
 _MLX_SQRT_EMBED_SCALE_FAMILIES = frozenset({
     "gemma", "gemma2", "gemma3", "gemma3n",
 })
-# Architectures transformers has always scaled inside the embedding, used when
-# the installed transformers cannot be asked because it predates them.
-# minicpm3 is deliberately absent: no transformers in the supported range has a
-# built-in one, so the reference is trust_remote_code, which multiplies by
-# scale_emb outside the embedding just as mlx-lm does. Correcting would make MLX
-# scale_emb times weaker. A later transformers adds the scaled class, and the
-# gate then reads it directly.
+# Architectures transformers always scaled inside the embedding, used when installed transformers predates them;
+# minicpm3 is absent: no supported transformers has one, and its trust_remote_code reference scales outside the
+# embedding like mlx-lm, so correcting would make MLX scale_emb times weaker.
 _SCALED_INSIDE_WHEN_UNASKABLE = frozenset({
     "gemma3", "gemma3n", "gemma4", "gemma4_unified",
 })
@@ -1304,17 +1225,9 @@ def _model_type_base(model_type):
 
 @lru_cache(maxsize=None)
 def _transformers_scales_inside_embedding(model_type):
-    """Whether the installed transformers applies this architecture's embedding
-    multiply inside the embedding module, so its NEFTune hook fires after it.
-
-    Asked, not assumed: transformers moved gemma and gemma2's multiply into the
-    module partway through the supported range, so a fixed answer would be wrong
-    at one end. None when it cannot be asked (no such architecture installed).
-
-    Read through the loader, never imported: a modeling module needs torch, which
-    is deliberately absent on macOS arm64. Source first, then compiled code, so
-    the answer survives a package shipped without its source.
-    """
+    """Asks whether installed transformers applies the embedding multiply inside the module, so NEFTune fires after it
+    (gemma/gemma2 moved it mid-range); None if unaskable; read via loader, never imported (no torch on macOS arm64);
+    source before compiled code, so source-less packages work"""
     base = _model_type_base(model_type)
     if not base:
         return None
@@ -1342,13 +1255,9 @@ def _transformers_scales_inside_embedding(model_type):
 
 
 def _neftune_embed_scale(model):
-    """The multiply applied after the embedding returns that NEFTune noise has
-    to be divided by, or None when nothing needs correcting.
-
-    MLX multiplies once the embedding module has returned, so noise injected
-    there rides through it; transformers adds its noise after the same multiply
-    wherever it keeps it inside the embedding.
-    """
+    """Returns the post-embedding multiply that NEFTune noise is divided by, or None; MLX multiplies after the embedding
+    module returns, so noise injected there is scaled too; transformers adds noise after the same multiply wherever
+    it sits inside the embedding."""
     text_model = _get_text_model(model)
     backbone = getattr(text_model, "model", None)
     # mlx-lm keeps this on `args`, mlx-vlm on `config`, at either level.
@@ -1364,13 +1273,9 @@ def _neftune_embed_scale(model):
         return None
 
     def _usable(value):
-        """The value as a positive float, or None if it is not one.
-
-        Truthiness is not enough: embed_scale can be a 0-d array (fine), a
-        multi-element array or a string (neither converts), and a non-positive
-        scale would flip or blow up the noise. Anything unusable counts as
-        absent, so the next candidate is tried instead of crashing.
-        """
+        """Positive float or None. Truthiness is not enough: 0-d arrays convert, but multi-element arrays and strings do
+        not, and a non-positive scale flips or blows up the noise; unusable counts as absent so the next candidate is
+        tried."""
         if value is None:
             return None
         try:
@@ -1398,15 +1303,8 @@ def _neftune_embed_scale(model):
 
 
 def _vlm_compares_embedding_values(model):
-    """Whether the forward finds merged positions by comparing embedding
-    values, which noise redrawn per call invalidates. Read off the scale
-    families so the two cannot drift apart.
-
-    Matched on the normalized model type too, since `_vlm_embed_scale` compares
-    the raw spelling and would miss a tower exposing the bare family name.
-    Refusing is the conservative side: a missed refusal injects noise into that
-    comparison, a spurious one only trains un-noised.
-    """
+    """True when the forward finds merged positions by comparing embedding values, which per-call noise invalidates;
+    also matches the normalized model type, since _vlm_embed_scale would miss a bare family name; refusing errs safe."""
     if _vlm_embed_scale(model) is not None:
         return True
     config = getattr(getattr(_get_text_model(model), "model", None), "config", None)
@@ -1418,14 +1316,8 @@ def _vlm_compares_embedding_values(model):
 
 
 def _identify_vlm_embedding_module(model):
-    """The module a text-only embedding forward uses to build ``inputs_embeds``.
-
-    Observed, not looked up: wrappers disagree on attribute name and container,
-    some expose none, and an untied ``lm_head`` carries the same weight shape --
-    a quantized embedding carries no such shape at all. Of the modules producing
-    the returned shape, drop those another encloses, which picks an adapter over
-    the embedding it wraps. None means decline, never guess.
-    """
+    """Identifies the embedding by observed output shapes, not lookup, since wrappers vary and an untied lm_head shares
+    the weight shape; drops modules another encloses so the adapter wins over the embedding it wraps; None declines."""
     calls, stack, swapped, recorders = [], [], [], {}
     def _recorder(base):
         cls = recorders.get(base)
@@ -1449,8 +1341,7 @@ def _identify_vlm_embedding_module(model):
     try:
         seen = set()
         for _, module in model.named_modules():
-            # One module can appear under several names; wrapping it per name
-            # stacks recorders and leaves one installed.
+            # One module can appear under several names; wrapping it once per name would stack recorders and leave one installed.
             if id(module) in seen:
                 continue
             seen.add(id(module))
@@ -1485,18 +1376,11 @@ def _identify_vlm_embedding_module(model):
 
 
 def _probe_vlm_embedding_module(model):
-    """``_identify_vlm_embedding_module`` with the random stream it consumed put
-    back.
-
-    Training mode is deliberately untouched: a quantized-activation layer
-    requantizes its weights on every flip, and shapes do not depend on the mode.
-    """
-    # Rewound through the same pair the compile fallbacks use: it reseeds from
-    # the key's own words, so it survives mlx 0.32 making mx.random.state a
-    # sentinel that refuses item assignment. None (unreadable key) leaves the
-    # probe's draws on the caller's stream rather than raising. Never restore by
-    # rebinding mx.random.state -- that shadows the sentinel mx.compile captured
-    # and stops a compiled step redrawing, turning NEFTune into a fixed offset.
+    """Runs _identify_vlm_embedding_module and restores the random stream it consumed; training mode is left alone since
+    flipping it requantizes quantized-activation weights."""
+    # Rewinds via the key's own words (as the compile fallbacks do), surviving mlx 0.32 making mx.random.state a
+    # sentinel; an unreadable key leaves probe draws in place. Never rebind mx.random.state: it shadows mx.compile's
+    # sentinel, freezing NEFTune into a fixed offset.
     rng_key = _mlx_rng_key()
     try:
         return _identify_vlm_embedding_module(model)
@@ -1507,25 +1391,17 @@ def _probe_vlm_embedding_module(model):
 
 
 def _shared_kv_slot_count(model):
-    """How many cache slots this stack needs, or 0 when it shares no K/V.
-
-    Not `first_kv_shared_layer_idx > 0`: upstream derives that as
-    `num_hidden_layers - num_kv_shared_layers`, so it is positive with zero
-    sharing too, as gemma4 12B/26B declare.
-    """
+    """Cache slots this stack needs, or 0 when it shares no K/V; not first_kv_shared_layer_idx > 0, since upstream
+    derives it as num_hidden_layers - num_kv_shared_layers, positive even with zero sharing (gemma4 12B/26B)."""
     backbone = getattr(_get_text_model(model), "model", None)
     if backbone is None:
         return 0
     config = getattr(backbone, "config", None)
     if not (_config_get(config, "num_kv_shared_layers") or 0):
         return 0
-    # mlx-vlm 0.5.0+ threads shared K/V itself, so `_fix_gemma4_kv_sharing`
-    # leaves those backbones alone and they keep the ordinary per-layer cache
-    # contract. These slots are shorter than the layer count by construction
-    # (`first_kv_shared_layer_idx == num_hidden_layers - num_kv_shared_layers`),
-    # so handing them over as `cache` would truncate the zip over layers and
-    # silently drop the shared tail of the stack. Imported here rather than at
-    # module scope: loader imports nothing from this module and vice versa.
+    # mlx-vlm 0.5.0+ threads shared K/V itself, so _fix_gemma4_kv_sharing skips those backbones; their slots are shorter
+    # than the layer count, so handing them over as cache silently drops the shared tail; imported here, not at module
+    # scope, as loader and this module import nothing from each other.
     from .loader import _gemma4_has_native_shared_kv
     if _gemma4_has_native_shared_kv(backbone):
         return 0
@@ -1556,8 +1432,7 @@ def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
     mask = kwargs.get("mask")
     if mask is None:
         mask = kwargs.get("attention_mask_4d")
-    # No fallback to the 2-D `attention_mask`: layers use what they are handed
-    # verbatim, so it would replace causality.
+    # No fallback to the 2-D attention_mask: layers use the mask they are handed verbatim, so a 2-D mask would replace causality.
     token_type_ids = kwargs.get("token_type_ids")
     token_type_mask = None
     if token_type_ids is not None:
@@ -1569,9 +1444,8 @@ def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
     if mask is None and token_type_mask is None:
         mask = create_attention_mask(h, cache)
 
-    # mlx-vlm gemma3/gemma4 stacks copy these onto the module, but fall back to
-    # config (sliding_window) so a stack that only stores them there still
-    # builds windowed masks instead of treating every layer as global.
+    # mlx-vlm gemma3/gemma4 stacks copy these onto the module, falling back to config (sliding_window) so windowed masks
+    # still build instead of every layer going global.
     sliding_window_pattern = getattr(stack, "sliding_window_pattern", None)
     if sliding_window_pattern is None:
         sliding_window_pattern = _config_get(config, "sliding_window_pattern")
@@ -1671,8 +1545,7 @@ _RAW_HEAD_TYPES = (nn.Linear, nn.QuantizedLinear, nn.Embedding, nn.QuantizedEmbe
 
 
 def _self_attr_chain(node):
-    """Dotted chain for an ``ast.Attribute`` rooted at the name ``self``,
-    else None (subscripts, calls, or other roots break the chain)."""
+    """Dotted chain for an ast.Attribute rooted at self, else None; subscripts, calls, or other roots break the chain."""
     parts = []
     while isinstance(node, ast.Attribute):
         parts.append(node.attr)
@@ -1683,9 +1556,7 @@ def _self_attr_chain(node):
 
 
 def _output_accessor_chains(tree):
-    """Chains with recognized accessor syntax within a parsed body: the X of
-    ``self.X.as_linear(...)`` and ``self.X.weight.T``. Syntax-level, so
-    strings, comments, and prose can never contribute."""
+    """Chains with recognized accessor syntax (self.X.as_linear(...) or self.X.weight.T) from a parsed body; syntax-level, so strings and comments never contribute."""
     chains = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
@@ -1703,16 +1574,9 @@ def _output_accessor_chains(tree):
 
 
 def _analyze_output_route(tm):
-    """Syntactic evidence from the analyzed forward bodies, live-resolved.
-
-    Parses ``type(tm).__call__`` (AST — strings/comments never count) plus one
-    hop of ``self.<method>()`` delegation, returning ``(accessor_modules,
-    called_module_ids, references_tie_flag)``: chains under
-    ``self.X.as_linear(...)`` / ``self.X.weight.T``; modules a self-rooted chain
-    is called on (``self.lm_head(x)``); and whether ``tie_word_embeddings`` is
-    referenced anywhere. Reachability is NOT analyzed — any recognized syntax
-    counts (dead branches included); uniqueness plus fail-closed consumers bound
-    mis-selection. Unresolvable chains contribute nothing."""
+    """Returns (accessor_modules, called_module_ids, references_tie_flag) from the AST of type(tm).__call__ plus one
+    self.method() hop; reachability is not analyzed, so dead branches count; uniqueness and fail-closed consumers
+    bound mis-selection."""
     cls = type(tm)
 
     def _parse(method):
@@ -1765,20 +1629,14 @@ def _analyze_output_route(tm):
 
 
 def _output_accessor_modules(tm):
-    """Live modules with recognized accessors in the analyzed forward bodies
-    (see ``_analyze_output_route``). Returns ``{id(module): (path, module)}``."""
+    """Maps id(module) to (path, module) for live modules with recognized accessors in the analyzed forward bodies (see _analyze_output_route)."""
     return _analyze_output_route(tm)[0]
 
 
 def _resolve_embedding_anchor(owner, types, accessor_modules=None):
-    """(name, module) of the unique direct child whose type is exactly in
-    ``types``; None when absent, ambiguous, or not a module tree. Multiple
-    embedding candidates (Gemma-4 backbones carry a second vocab-sized
-    per-layer embedding) resolve ONLY by live accessor identity — the unique
-    candidate that IS one of the modules the output route accesses
-    (`_output_accessor_modules`). Dimensional agreement is deliberately not
-    identity evidence (metadata can be stale after a vocab resize).
-    Still-ambiguous stays None (fail closed)."""
+    """Returns (name, module) of the unique direct child whose exact type is in types, else None; with several
+    candidates (Gemma-4 has a second vocab-sized embedding) only live accessor identity resolves, as dimensions can
+    be stale after a vocab resize; still ambiguous gives None."""
     children = getattr(owner, "children", None)
     if not callable(children):
         return None
@@ -1789,8 +1647,7 @@ def _resolve_embedding_anchor(owner, types, accessor_modules=None):
 
 
 def _embedding_dims(emb):
-    """Semantic (vocab, hidden). QuantizedEmbedding packs its weight, so read
-    the stored attributes instead of the array shape."""
+    """Returns (vocab, hidden); QuantizedEmbedding packs its weight, so the stored attributes are read instead of the array shape."""
     if type(emb) is nn.QuantizedEmbedding:
         return int(emb.num_embeddings), int(emb.dims)
     return int(emb.weight.shape[0]), int(emb.weight.shape[1])
@@ -1944,11 +1801,7 @@ def _rotate_head_input(head, hidden):
 
 
 def _get_lm_head_layer(model):
-    """The affirmatively resolved output head (see describe_output_head).
-
-    Raises for unknown topology: the loss factories gate on the descriptor
-    first, so reaching this without a resolved head is a caller bug.
-    """
+    """Returns the output head resolved by describe_output_head; raises for unknown topology, since the loss factories gate on the descriptor first."""
     desc = describe_output_head(model)
     if desc.module is None:
         raise ValueError(
@@ -1973,17 +1826,11 @@ def _get_logit_softcap(model):
 
 
 def _get_logit_scale(model):
-    """Get the scalar multiplier some archs apply to lm-head logits, if any.
-
-    Cohere-family models (mlx-lm ``cohere``/``cohere2``, mlx-vlm
-    ``aya_vision``/``cohere2_moe``) multiply logits by ``logit_scale`` inside
-    the forward — a step CCE bypasses and must re-apply. Returns
-    ``(scale, invalid)``: scale None when absent or 1.0; ``invalid=True`` for
-    bool/non-scalar/non-finite/out-of-range values (callers must fall back).
-    """
+    """Returns (scale, invalid) for the logit_scale multiply that Cohere-family forwards apply inside the forward, which
+    CCE bypasses and must re-apply; scale is None when absent or 1.0; invalid covers bool, non-scalar, non-finite or
+    out-of-range values, where callers must fall back."""
     tm = _get_output_transform_owner(model)
-    # Only the verified application sites — args (cohere/cohere2/cohere2_moe)
-    # then config (aya_vision); no upstream forward reads a direct attribute.
+    # Reads only verified application sites: args (cohere/cohere2/cohere2_moe) then config (aya_vision), since no upstream forward reads a direct attribute.
     scale = None
     if hasattr(tm, "args"):
         scale = getattr(tm.args, "logit_scale", None)
@@ -2006,8 +1853,7 @@ def _validated_head_multiplier(scale):
         return None, True
     if scale == 1.0:
         return None, False
-    # Pre-scaling is validated only for moderate magnitudes; extreme scales
-    # can under/overflow before accumulation, so fail closed outside 2^-6..4.
+    # Pre-scaling is validated only for moderate magnitudes; extreme scales can under/overflow before accumulation, so fail closed outside 2^-6..4.
     if scale != 0.0 and not (2.0 ** -6 <= abs(scale) <= 2.0 ** 2):
         return None, True
     return scale, False
@@ -2015,10 +1861,9 @@ def _validated_head_multiplier(scale):
 
 _KNOB_MISSING = object()
 
-# Knobs whose consuming forwards transform logits after the output head,
-# with lookup sites in consumer-preference order. "attr" = the live module
-# attribute (Granite/Phi3Small forwards read a constructor copy, so copy vs
-# config drift must fail closed); others read args (config for VLM wrappers).
+# Knobs that transform logits after the output head, with lookup sites in consumer-preference order; attr is the live
+# module attribute (Granite/Phi3Small read a constructor copy, so copy vs config drift must fail closed), others read
+# args (config for VLM wrappers).
 _HEAD_TRANSFORM_KNOBS = {
     "logit_scale": ("args", "config"),          # Cohere: out * logit_scale
     "output_multiplier": ("attr", "args", "config"),  # Muse Glimmer: pre-softcap multiply
@@ -2027,9 +1872,8 @@ _HEAD_TRANSFORM_KNOBS = {
     "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
     "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
 }
-# Where a knob is read and what values are usable, not where it sits in the forward.
-# Fused CCE pre-scales and caps after, so a row here asserts the model scales before
-# it caps. Every softcapping architecture in mlx-lm and mlx-vlm does.
+# Where a knob is read and which values are usable, not where it sits in the forward; fused CCE pre-scales then caps, so
+# a row here asserts the model scales before it caps, as every softcapping architecture in mlx-lm and mlx-vlm does.
 _KNOB_AUX_SITES = {
     "embedding_multiplier": ("args", "config"),
     "hidden_size": ("args", "config"),
@@ -2045,8 +1889,7 @@ def _knob_values_equal(a, b):
 
 
 def _knob_value(tm, name, sites):
-    """(value, conflict) from the consumer sites; ``_KNOB_MISSING`` when no
-    site defines the knob. A present ``None`` is a value, never absence."""
+    """Returns (value, conflict) from the consumer sites, or _KNOB_MISSING when no site defines the knob; a present None is a value, never absence."""
     holders = {"attr": tm, "args": getattr(tm, "args", None), "config": getattr(tm, "config", None)}
     found = [v for site in sites if holders[site] is not None
              for v in (getattr(holders[site], name, _KNOB_MISSING),)
@@ -2079,8 +1922,7 @@ def _detect_logit_softcap(model):
     present) fails closed rather than dropping the cap.
     """
     tm = _get_output_transform_owner(model)
-    # Presence, not value: an explicitly-None legacy attr still makes the
-    # dual-attr combination unverified.
+    # Presence, not value: an explicitly-None legacy attr still makes the dual-attr combination unverified.
     legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
     if legacy is _KNOB_MISSING and hasattr(tm, "args"):
         legacy = getattr(tm.args, "final_logit_softcapping", _KNOB_MISSING)
@@ -2115,14 +1957,8 @@ def _aux_knob(tm, name):
 
 
 def _detect_head_transform(model, head_status):
-    """Resolve known output-transform knobs to one effective logit scale.
-
-    Mirrors the scalar transforms the consuming forwards apply between the
-    output head and the returned logits. Returns ``(scale, problem)``: a
-    reason string means fall back to the eager baseline; scale None is the
-    no-op case; accepted scales obey the ``_get_logit_scale`` range.
-    ``head_status`` selects branch-conditional transforms as the forwards do.
-    """
+    """Resolves output-transform knobs to one logit scale as (scale, problem): a problem string means fall back to
+    eager, scale None is a no-op, and head_status selects branch-conditional transforms as the forwards do."""
     tm = _get_output_transform_owner(model)
     present = {}
     for name, sites in _HEAD_TRANSFORM_KNOBS.items():
@@ -2138,17 +1974,14 @@ def _detect_head_transform(model, head_status):
         return None, None
     knob, raw = next(iter(present.items()))
     if knob == "mup_width_multiplier":
-        # Its only consumer (Phi3Small) masks dummy-token logits after the
-        # value-guarded divide: presence alone makes the tail non-scalar.
+        # Its only consumer (Phi3Small) masks dummy-token logits after the value-guarded divide, so presence alone makes the tail non-scalar.
         return None, ("mup_width_multiplier models mask logits after the "
                       "output head, which fused CCE cannot reproduce")
     if knob in ("logit_scale", "output_multiplier"):
-        # A present-None value is malformed live state (the forward would
-        # multiply logits by None); fail closed rather than run unscaled.
+        # A present-None value is malformed live state (the forward would multiply logits by None); fail closed rather than run unscaled.
         if raw is None:
             return None, f"{knob} is present but None"
-        # logit_scale re-reads its own consumer sites; output_multiplier is
-        # read straight off the resolved knob, whose sites already agreed.
+        # logit_scale re-reads its own consumer sites; output_multiplier is read straight off the resolved knob, whose sites already agreed.
         scale, invalid = (
             _get_logit_scale(model)
             if knob == "logit_scale"
@@ -2188,24 +2021,14 @@ def _detect_head_transform(model, head_status):
 
 
 def _is_lm_head_trainable(model):
-    """Whether fused CCE should compute the output head's weight gradient.
-
-    Returns False when the head is frozen by a LoRA/adapter setup or is
-    unresolved (its gradient would be a wasted V x chunk_size x H matmul per
-    chunk, so callers wrap the weight with mx.stop_gradient); True when the
-    resolved head carries a trainable param, or when there are no adapters at
-    all (full fine-tuning). Resolution is by descriptor module identity in the
-    registered tree, not by name — a property-backed ``language_model``
-    returning ``self`` is not a registered child, and an alt-named tied
-    embedding (InternLM2 ``tok_embeddings``) is classified like any head.
-    """
+    """Whether fused CCE computes the head's weight gradient: False when LoRA freezes it or it is unresolved (callers
+    then wrap it in mx.stop_gradient); True when trainable or with no adapters; resolved by module identity, not
+    name."""
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-    # Module-anchored so unrelated trainables containing the substring
-    # "lora" are not treated as adapter state.
+    # Module-anchored so unrelated trainables containing the substring lora are not treated as adapter state.
     adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
-    # Drop reload-leaked base tensors INSIDE a LoRA-wrapped head (would
-    # defeat the CCE memory guard) while keeping intentional trainables
-    # like `lm_head.bias`. Shares the filter with save_trainable_adapters.
+    # Drops reload-leaked base tensors inside a LoRA-wrapped head (would defeat the CCE memory guard) but keeps
+    # intentional trainables like lm_head.bias; shares the filter with save_trainable_adapters.
     _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
     lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
     has_root_lora_module = any(name == "" for name in _lora_module_names)
@@ -2294,28 +2117,19 @@ def _runtime_cce_by_mode(**kwargs):
     loss_only = _get_runtime_cce(**kwargs)
     if not (kwargs.get("quantized") or kwargs.get("weight_is_frozen")):
         return lambda model: loss_only
-    # Training builds a frozen head's hidden gradient in the forward, which would
-    # double the cost of evaluation, where nothing is differentiated.
+    # Training builds a frozen head's hidden gradient in the forward, which would double evaluation cost, where nothing is differentiated.
     training = _get_runtime_cce(**kwargs, precompute_hidden_gradient=True)
     return lambda model: training if model.training else loss_only
 
 
 def make_cce_loss_fn(model, label_smoothing=0.0):
-    """Create a chunked cross-entropy (CCE) loss function.
-
-    CCE computes loss directly from hidden states and the LM head weight,
-    avoiding full logit materialization (big memory savings for large vocabs).
-
-    Returns a function (model, batch, lengths, labels=None) -> (loss, ntoks).
-    With labels, uses labels[:,1:] as targets and (targets != -100) as mask.
-    The returned function has a ``_unsloth_cce_backend`` attribute for logging.
-    """
+    """Chunked cross-entropy loss from hidden states and the LM head weight, avoiding full logit materialization;
+    returns (model, batch, lengths, labels=None) -> (loss, ntoks), with targets labels[:,1:] masked by != -100; sets
+    _unsloth_cce_backend for logging."""
     label_smoothing = _normalize_label_smoothing(label_smoothing)
-    # Topology first (mirrors the VLM factory), then head eligibility, then
-    # scale validation — no positive CCE notice may precede a fallback decision.
-    # Backboneless models (e.g. a stack not exposed as `.model` or as direct
-    # embed_tokens/layers/norm attributes) cannot yield pre-head hidden states,
-    # so the full model forward is the only faithful loss.
+    # Checks topology first (mirrors the VLM factory), then head eligibility, then scale validation, so no positive CCE
+    # notice precedes a fallback; backboneless models cannot yield pre-head hidden states, so the full forward is the
+    # only faithful loss.
     if _get_text_backbone(model) is None and not _has_direct_hidden_stack(model):
         print("Unsloth: text model does not expose a separable hidden-state "
               "backbone for CCE; falling back to standard cross-entropy.")
@@ -2371,11 +2185,9 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         return _resolve_module_path(model, _head_path)
 
     if use_quantized:
-        # Backstop: quantized CCE backward zeros the weight gradient
-        # (dequant->grad->requant unimplemented). Fine when the LM head is
-        # frozen (LoRA on a quantized base flows grad through grad_hidden), but
-        # full fine-tuning would silently skip the LM head update. The loader
-        # rejects this earlier; this is a safety net.
+        # Backstop: quantized CCE backward zeros the weight gradient (dequant->grad->requant unimplemented); fine for a
+        # frozen LM head (LoRA on a quantized base flows grad through grad_hidden), but full fine-tuning would silently
+        # skip the head update; the loader rejects this earlier.
         if getattr(model, "_unsloth_full_finetuning", False):
             raise ValueError(
                 "Unsloth: full_finetuning=True with a quantized LM head is "
@@ -2418,8 +2230,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 bi = mx.zeros_like(sc)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
-            # Widen unsigned dtypes so mx.where can inject the signed -100
-            # (mx.where on uint crashes the torch-backed shim).
+            # Widen unsigned dtypes so mx.where can inject the signed -100; mx.where on uint crashes the torch-backed shim.
             targets = _normalize_cce_label_dtype(targets)
             if labels is None:
                 mask = length_mask
@@ -2430,9 +2241,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
             if logit_scale is not None:
-                # (h * s) @ W equals s * (h @ W) per vocab chunk, so softcap
-                # and the CCE backward see the model's own scaled logits while
-                # cached kernels stay scale-independent.
+                # (h * s) @ W equals s * (h @ W) per vocab chunk, so softcap and the CCE backward see scaled logits while cached kernels stay scale-independent.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             hidden_flat, targets_flat = _compact_cce_inputs(
@@ -2508,8 +2317,7 @@ def _model_logits(output):
     if logits is not None:
         return logits
     if hasattr(output, "logits"):
-        # Unwrapping to None instead leaves a `'NoneType' has no attribute 'ndim'`
-        # inside cross-entropy.
+        # Unwrapping to None instead leaves a 'NoneType' has no attribute 'ndim' error inside cross-entropy.
         raise ValueError(
             "Unsloth: the model returned an output wrapper whose `logits` is "
             "None, so there is nothing to compute a loss from."
@@ -2524,19 +2332,14 @@ def _masked_correct(logits, targets, mask):
 
 
 def make_baseline_loss_fn(label_smoothing=0.0):
-    """Create a standard cross-entropy loss function (full logits via LM head).
-
-    Used when use_cce=False. Returns a function
-    (model, batch, lengths, labels=None) -> (loss, ntoks). With labels, uses
-    labels[:,1:] and (targets != -100) as mask. With label_smoothing=0 the
-    labels=None branch is byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
-    """
+    """Standard cross-entropy over full LM-head logits, used when use_cce=False; returns (model, batch, lengths,
+    labels=None) -> (loss, ntoks); with label_smoothing=0 the labels=None branch is byte-identical to
+    mlx_lm.tuner.trainer.default_loss."""
     eps = _normalize_label_smoothing(label_smoothing)
     if eps > 0.0:
 
         def _token_ce(logits, targets):
-            # HF LabelSmoother form: lse - (1-eps)*target - eps*mean_v, with
-            # the smoothed vocabulary term reduced in float32.
+            # HF LabelSmoother form: lse - (1-eps)*target - eps*mean_v, with the smoothed vocabulary term reduced in float32.
             logits32 = logits.astype(mx.float32)
             lse = mx.logsumexp(logits32, axis=-1)
             tgt = mx.take_along_axis(
@@ -2548,8 +2351,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
 
     def loss_fn(model, batch, lengths, labels=None, return_correct=False):
         if labels is None:
-            # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
-            # (:360, :393, :439) and mlx_lm's lengths convention.
+            # Half-open [start, end) end-exclusive mask; matches the CCE/labels paths (:360, :393, :439) and mlx_lm's lengths convention.
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
             logits = _model_logits(model(inputs))
@@ -2557,16 +2359,14 @@ def make_baseline_loss_fn(label_smoothing=0.0):
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             ce = _token_ce(logits, targets) * mask
             ntoks = mask.sum()
-            # Raw ntoks (no safe denominator) to match mlx_lm default_loss
-            # byte-for-byte; the safe wrapper stays on the labels-aware path.
+            # Raw ntoks (no safe denominator) to match mlx_lm default_loss byte-for-byte; the safe wrapper stays on the labels-aware path.
             ce = ce.astype(mx.float32).sum() / ntoks
             if return_correct:
                 return ce, ntoks, _masked_correct(logits, targets, mask)
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
-        # Widen unsigned dtypes so mx.where(..., -100, ...) and the
-        # `targets != -100` compare both see signed int64.
+        # Widen unsigned dtypes so mx.where(..., -100, ...) and the targets != -100 compare both see signed int64.
         targets = _normalize_cce_label_dtype(labels[:, 1:])
         logits = _model_logits(model(inputs))
         steps = mx.arange(1, targets.shape[1] + 1)
@@ -2575,8 +2375,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
             mask = length_mask.astype(mx.float32)
         else:
             mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
-        # Replace -100 with 0 before CE, MLX has no ignore_index;
-        # the mask already zeros out these positions in the loss.
+        # Replace -100 with 0 before CE since MLX has no ignore_index; the mask already zeros these positions in the loss.
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
@@ -2591,9 +2390,8 @@ def make_baseline_loss_fn(label_smoothing=0.0):
     return loss_fn
 
 
-# Image/vision/audio special tokens that should never contribute to loss.
-# Single source of truth shared with the CUDA collator (unsloth_zoo/vlm_tokens.py),
-# so the two backends cannot drift apart.
+# Image/vision/audio special tokens that never contribute to loss; shared with the CUDA collator via
+# unsloth_zoo/vlm_tokens.py so the two backends cannot drift apart.
 from unsloth_zoo.vlm_tokens import VLM_PLACEHOLDER_TOKENS
 _IMAGE_TOKEN_STRINGS = tuple(VLM_PLACEHOLDER_TOKENS)
 
@@ -2634,11 +2432,7 @@ def _convert_token_to_id(tokenizer, token):
 
 
 def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
-    """Resolve VLM token IDs that should be ignored by SFT loss labels.
-
-    Mirrors the CUDA vision collator's best-effort token masking without making
-    the loss depend on processor state attached to the model.
-    """
+    """Resolves VLM token IDs to ignore in SFT labels, mirroring the CUDA vision collator's best-effort masking without depending on processor state on the model."""
     if processor is None and model is not None:
         processor = getattr(model, "_processor", None)
     if config is None and model is not None:
@@ -2656,9 +2450,7 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
             "audio_token",
             "boi_token",
             "eoi_token",
-            # Gemma 4 wraps every audio run in these, the way boi/eoi wrap an
-            # image run: processing_gemma4.py builds boa_token + placeholders +
-            # eoa_token per clip.
+            # Gemma 4 wraps every audio run in these, as boi/eoi wrap an image run: processing_gemma4.py builds boa_token + placeholders + eoa_token per clip.
             "boa_token",
             "eoa_token",
         ):
@@ -2675,8 +2467,7 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
             "image_token_id",
             "video_token_id",
             "audio_token_id",
-            # Delimiters around a media run are generated the same way the run
-            # is, so they are no more a target than the run itself.
+            # Delimiters around a media run are generated the same way as the run, so they are no more a target than the run itself.
             "audio_start_id",
             "audio_end_id",
             "boa_token_id",
@@ -2703,10 +2494,9 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
     ):
         _append_unique_int(ids, _config_get(config, key, None))
 
-    # The repeated audio placeholder, which the names above do not always reach:
-    # Phi-4 spells it `<|endoftext11|>` and declares it in neither the tokenizer
-    # attributes nor its checkpoint config, so every audio position was a
-    # supervised target. Resolved the same way run counting resolves it.
+    # The repeated audio placeholder the names above can miss: Phi-4 spells it <|endoftext11|>, declares it in neither
+    # tokenizer attributes nor checkpoint config, so every audio position was a supervised target; resolved as run
+    # counting does.
     for token_id in _get_vlm_audio_soft_token_ids(processor, config) or ():
         _append_unique_int(ids, token_id)
 
@@ -2721,15 +2511,9 @@ def _get_image_token_ids(model):
 
 
 def _get_vlm_audio_soft_token_ids(processor=None, config=None):
-    """Resolve the repeated audio placeholder ("soft") token IDs.
-
-    Narrower than the loss-masking set in two ways: image placeholders are
-    excluded, and so are the begin/end audio delimiters, which appear once per
-    clip and would corrupt run counting. Families that identify their
-    placeholder only by a config index resolve through a config when one is
-    reachable; when nothing resolves, the caller refuses the row rather than
-    training on an unverifiable audio/text alignment.
-    """
+    """Resolves repeated audio placeholder (soft) token IDs; families identifying placeholders only by config index
+    resolve via a config when reachable; image and per-clip begin/end audio delimiters are excluded; if nothing
+    resolves, the row is refused, not trained on unverifiable alignment"""
     ids = []
     tokenizer = _get_processor_tokenizer(processor)
     if tokenizer is not None:
@@ -2746,14 +2530,9 @@ def _get_vlm_audio_soft_token_ids(processor=None, config=None):
 
 
 def _normalize_cce_label_dtype(labels):
-    """Widen unsigned label dtypes to int64 so masking can inject -100.
-
-    uint8/16/32 fit losslessly in int64. uint64 values in (2**63, 2**64)
-    wrap negative on cast and are routed to a positive out-of-vocab
-    sentinel (1<<62) so runtime CCE's validity check NaN-poisons those
-    rows instead of letting an overflowed uint64 like 2**64-100 collide
-    with ignore_index=-100. Signed/float dtypes pass through unchanged.
-    """
+    """Widens unsigned label dtypes to int64 so -100 can be injected; uint64 values above 2**63 wrap negative on cast,
+    so they map to a positive out-of-vocab 1<<62 sentinel that runtime CCE's check NaN-poisons, not colliding with
+    ignore_index=-100."""
     if labels is None:
         return labels
     dtype = getattr(labels, "dtype", None)
@@ -2761,8 +2540,7 @@ def _normalize_cce_label_dtype(labels):
         return labels
     uint64_dtype = getattr(mx, "uint64", None)
     if uint64_dtype is not None and dtype == uint64_dtype:
-        # Cast to signed int64 first; uint64 compares crash the torch shim.
-        # `labels_i64 < 0` catches every uint64 >= 2**63.
+        # Cast to signed int64 first since uint64 compares crash the torch shim; labels_i64 < 0 catches every uint64 >= 2**63.
         labels_i64 = labels.astype(mx.int64)
         invalid_sentinel = mx.array((1 << 62), dtype=mx.int64)
         return mx.where(labels_i64 < 0, invalid_sentinel, labels_i64)
@@ -2780,12 +2558,9 @@ def _normalize_cce_label_dtype(labels):
 
 
 def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
-    """Decide WHICH VLM positions are ignored (ignore tokens, attention zeros,
-    positions a response/completion mask already set to -100). Label VALUES come
-    at finalize time from the SAME converted ids the legacy path used, so
-    coercion parity holds by construction. Float comparisons mirror MLX's
-    effective float32 narrowing so placement matches the finalized tensors.
-    """
+    """Decides which VLM positions are ignored (ignore tokens, attention zeros, prior -100 mask positions); label values
+    come at finalize time from the same converted ids as the legacy path; float compares mirror MLX float32
+    narrowing."""
     generated = labels is None
     if labels is None:
         labels = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
@@ -2853,9 +2628,8 @@ def _reject_non_integer_host_vlm_ids(context):
 
 
 def _vlm_ids_integer_host(inputs):
-    """True when label-bearing ids are integer host values (the staged case).
-    Float or exotic-dtype ids route to the bit-exact legacy path instead of a
-    numpy re-implementation of MLX float semantics."""
+    """True when label-bearing ids are integer host values; float or exotic dtypes route to the bit-exact legacy path,
+    not a numpy re-implementation of MLX float semantics."""
     ids = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
     if ids is None:
         ids = inputs.get("input_ids")
@@ -2883,15 +2657,9 @@ def _vlm_inputs_host_valued(inputs):
 
 
 class _HostStagedVLMBatch:
-    """Host-side VLM batch: processor fields + decided labels, pre-MLX.
-
-    ``prefinalized`` carries an already-MLX legacy batch for MLX-valued
-    processor outputs in synchronous mode. In producer mode those stage
-    opaquely instead, materialized producer-side because lazy MLX graphs cannot
-    cross threads: plain-SFT rides ``inputs`` with ``label_mask=None``,
-    prompt/completion rides ``pc_opaque`` with the combine deferred to the
-    consumer finalizer.
-    """
+    """Host-side VLM batch, pre-MLX; prefinalized holds an MLX batch only in synchronous mode, while producer mode
+    materializes MLX outputs producer-side since lazy graphs cannot cross threads; pc_opaque defers the combine to
+    the consumer."""
 
     __slots__ = ("inputs", "label_mask", "widen_labels_int64", "host_valued",
                  "ignore_token_ids", "config", "prefinalized", "pc_opaque",
@@ -2913,17 +2681,9 @@ class _HostStagedVLMBatch:
 
 
 def _finalize_vlm_batch(staged, keep_raw_carrier=False, phase=None):
-    """The single consumer-thread point converting staged VLM batches to MLX.
-
-    Host-staged batches already made every label decision, so only conversion
-    and compile preparation run here. Opaque processor-owned payloads (plain-SFT
-    with ``label_mask=None``, ``pc_opaque`` prompt/completion carriers) instead
-    run their combine and legacy label decisions here.
-
-    ``phase`` is forwarded verbatim to the terminal compile preparation at every
-    exit, so ``"content"`` stops at the width seam and leaves the caller to pad
-    to a planned width and run the ``"positions"`` phase.
-    """
+    """Single consumer-thread point converting staged VLM batches to MLX; opaque payloads run their combine and label
+    decisions here; phase is forwarded to compile prep, and the content phase stops at the width seam so the caller
+    can pad, then run positions."""
     if staged.prefinalized is not None:
         return _prepare_vlm_batch_for_compile(
             staged.prefinalized, staged.config, phase=phase,
@@ -2950,17 +2710,15 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False, phase=None):
         )
     batch = _to_mx_vlm_batch(staged.inputs)
     if staged.label_mask is None:
-        # Opaque processor outputs (mlx-vlm wrappers return MLX arrays): run the
-        # legacy label path here on the consumer thread. The producer only
-        # materialized the processor's own pending graphs, nothing more.
+        # Opaque processor outputs (mlx-vlm wrappers return MLX arrays) run the legacy label path on the consumer
+        # thread; the producer only materialized pending graphs.
         batch["labels"] = _apply_vlm_label_masks(
             batch, ignore_token_ids=staged.ignore_token_ids,
         )
         batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
         return _prepare_vlm_batch_for_compile(batch, staged.config, phase=phase)
     if staged.label_mask is not None:
-        # Values ride the same converted ids legacy used, so conversion-time
-        # errors match exactly; only the host-decided placement differs.
+        # Values use the same converted ids as the legacy path, so conversion-time errors match exactly; only the host-decided placement differs.
         raw = (
             batch.get(_RAW_INPUT_IDS_FOR_LABELS)
             if keep_raw_carrier
@@ -2998,10 +2756,9 @@ def _mask_image_tokens(targets, image_token_ids):
 
 def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
                            ignore_index=-100):
-    # Do NOT narrow to int32: runtime CCE validates the original dtype before
-    # its own narrow, so wide/unsigned invalid ids (e.g. uint32(2**32-100))
-    # must survive as out-of-vocab sentinels instead of wrapping to -100.
-    # Prefer the pre-narrow raw carrier when deriving labels from input_ids.
+    # Do not narrow to int32: runtime CCE validates the original dtype before its own narrow, so wide/unsigned invalid
+    # ids (e.g. uint32(2**32-100)) must stay out-of-vocab sentinels, not wrap to -100; prefer the pre-narrow raw carrier
+    # when deriving labels from input_ids.
     generated = labels is None
     if labels is None:
         labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, batch_dict["input_ids"])
@@ -3012,8 +2769,7 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     labels = _mask_label_token_ids(labels, ignore_token_ids, ignore_index)
     spans = _audio_span_positions_np(batch_dict, labels.shape)
     if spans is not None:
-        # This path decides labels for processor output the host staging could
-        # not claim, so it owns the span masking too.
+        # This path decides labels for processor output the host staging could not claim, so it also owns the span masking.
         labels = mx.where(mx.array(spans),
                           mx.array(ignore_index, dtype=labels.dtype), labels)
     attention_mask = batch_dict.get("attention_mask")
@@ -3027,11 +2783,8 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
 
 
 def _mask_prompt_tokens(targets, assistant_token_id):
-    """Mask tokens before the first assistant response (train_on_completions_only).
-
-    Per row, positions before the first assistant_token_id become -100. If the
-    token is absent, the row is left unmasked (assumed all completion).
-    """
+    """Masks positions before each row's first assistant_token_id to -100 (train_on_completions_only); a row without the
+    token is left unmasked, assumed all completion."""
     if assistant_token_id <= 0:
         return targets
     targets = _normalize_cce_label_dtype(targets)
@@ -3058,11 +2811,7 @@ def _is_vlm_model(model) -> bool:
 
 
 def _align_logits_with_labels(logits, labels):
-    """Truncate logits or labels so their sequence dimensions match.
-
-    VLMs can inject vision tokens that change the sequence length of logits
-    relative to the label sequence.
-    """
+    """Truncates logits or labels so sequence dimensions match, since VLMs can inject vision tokens that change the logits length relative to the labels."""
     l_seq = logits.shape[1]
     t_seq = labels.shape[1]
     if l_seq > t_seq:
@@ -3073,13 +2822,8 @@ def _align_logits_with_labels(logits, labels):
 
 
 def _trim_sequence_aligned_vlm_kwargs(extra_kwargs, seq_len):
-    """Trim auxiliary VLM tensors that track token sequence length.
-
-    Some VLMs, notably Qwen3-VL, pass position_ids through the batch. The loss
-    function shifts input_ids for causal LM training, so these auxiliary tensors
-    must be shifted to the same token length before the model builds rotary
-    embeddings.
-    """
+    """Trims sequence-aligned VLM kwargs such as Qwen3-VL position_ids to the shifted token length, since the loss
+    shifts input_ids before the model builds rotary embeddings."""
     position_ids = extra_kwargs.get("position_ids")
     if position_ids is not None and hasattr(position_ids, "shape"):
         if position_ids.shape[-1] != seq_len:
@@ -3093,8 +2837,7 @@ def _vlm_forward_logits(model, batch_dict):
     pixel_values = batch_dict.get("pixel_values")
     attention_mask = batch_dict.get("attention_mask")
 
-    # The full sequence, left for the caller to shift (Qwen3-VL mRoPE/deepstack
-    # need it); mirrors `_vlm_hidden_states` so use_cce={True,False} stay in parity.
+    # The full sequence is left for the caller to shift (Qwen3-VL mRoPE/deepstack need it); mirrors `_vlm_hidden_states` so use_cce={True,False} stay in parity.
     inputs = input_ids
 
     # Extras (e.g. image_grid_thw) pass through; `_unsloth_*` carriers do not.
@@ -3113,8 +2856,7 @@ def _vlm_forward_logits(model, batch_dict):
     shared_kv = _build_shared_kv_caches(model)
     if shared_kv is not None:
         fwd_kwargs["cache"] = shared_kv
-    # gemma3n scales embeddings only on the ids path; merge + rescale here as
-    # `_vlm_cce_forward` does, or text embeddings train ~45x too small.
+    # gemma3n scales embeddings only on the ids path; merge and rescale here as `_vlm_cce_forward` does, or text embeddings train ~45x too small.
     scaled_embeds = None
     # Self-routed generation wrappers consume premerged embeddings, not pixels.
     if (_vlm_embed_scale(model) is not None
@@ -3134,8 +2876,7 @@ def _vlm_forward_logits(model, batch_dict):
         for key, value in embed_kwargs.items():
             fwd_kwargs.setdefault(key, value)
     if scaled_embeds is not None:
-        # Not `model(...)`: mlx-vlm <= 0.4.4 re-embeds from ids there and drops
-        # `inputs_embeds`, losing the rescale.
+        # Not `model(...)`: mlx-vlm <= 0.4.4 re-embeds from ids there and drops `inputs_embeds`, losing the rescale.
         output = _get_text_model(model)(
             inputs, inputs_embeds=scaled_embeds,
             **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),
@@ -3147,13 +2888,7 @@ def _vlm_forward_logits(model, batch_dict):
 
 def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                               ignore_token_ids=None):
-    """Create a standard cross-entropy loss function for VLMs.
-
-    Takes a batch dict with input_ids, pixel_values, attention_mask.
-
-    Returns:
-        A function (model, batch_dict) -> (loss, ntoks).
-    """
+    """Standard cross-entropy loss for VLMs over a batch dict with input_ids, pixel_values and attention_mask; returns (model, batch_dict) -> (loss, ntoks)."""
     _image_token_ids = (
         ignore_token_ids
         if ignore_token_ids is not None
@@ -3182,9 +2917,8 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                 length_mask = mx.ones_like(targets, dtype=mx.float32)
             mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
         else:
-            # Prefer the raw (pre-narrow) input_ids so wide invalid ids
-            # (e.g. np.uint32(2**32-100)) reach runtime CCE as out-of-vocab
-            # sentinels instead of wrapping to -100 via the int32 narrow.
+            # Prefer the raw pre-narrow input_ids so wide invalid ids (e.g. np.uint32(2**32-100)) reach runtime CCE as
+            # out-of-vocab sentinels instead of wrapping to -100 via the int32 narrow.
             target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
             targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
@@ -3205,8 +2939,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                 length_mask,
             )
 
-        # Replace -100 with 0 before CE, MLX has no ignore_index;
-        # the mask already zeros out these positions in the loss.
+        # Replace -100 with 0 before CE since MLX has no ignore_index; the mask already zeros out these positions in the loss.
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
@@ -3227,14 +2960,9 @@ _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4"})
 
 
 def _drop_pair_token_type_ids(batch_dict, kwargs):
-    """Keep suffix/prefix pair markers out of the text stack.
-
-    A suffix-supervised text-only row is encoded as a tokenizer pair, so its
-    `token_type_ids` mean "1 = suffix". Gemma3's stack reads the same key as
-    "1 = image" and makes every marked span bidirectional, which would let the
-    answer attend to its own future tokens. The model-level kwargs still carry
-    it, because PaliGemma's prefix-LM wrapper is the consumer that wants it.
-    """
+    """Drops token_type_ids from text-stack kwargs for suffix-supervised rows: Gemma3 reads 1 as image and makes marked
+    spans bidirectional, letting the answer attend to its future tokens; model kwargs keep it for PaliGemma's
+    prefix-LM."""
     if not batch_dict.get("_unsloth_suffix_only_loss", False):
         return kwargs
     return {k: v for k, v in kwargs.items() if k != "token_type_ids"}
@@ -3248,8 +2976,7 @@ def _apply_static_vlm_metadata(model, batch_dict, kwargs):
     ):
         return
     if not keys:
-        # Compile only: an unpatched tower (`patch_mode="unpatched"`) still
-        # calls `.tolist()` on what it is handed.
+        # Compile only: an unpatched tower (`patch_mode="unpatched"`) still calls `.tolist()` on what it is handed.
         decision = getattr(model, "_unsloth_compile_decision", None)
         if decision is None or not getattr(decision, "enabled", False):
             return
@@ -3266,11 +2993,8 @@ def _apply_static_vlm_metadata(model, batch_dict, kwargs):
 
 
 def _unpack_embed_result(embed_result, model, input_ids=None, attention_mask=None):
-    """Unpack get_input_embeddings result into embeds + backbone kwargs.
-
-    Handles plain mx.array returns and the InputEmbeddingsFeatures dataclass
-    (gemma4 per_layer_inputs, qwen3-vl position_ids/deepstack, etc.).
-    """
+    """Unpacks get_input_embeddings output into embeds and backbone kwargs, handling plain mx.array returns and the
+    InputEmbeddingsFeatures dataclass (gemma4 per_layer_inputs, qwen3-vl position_ids)."""
     backbone_kwargs = {}
     if hasattr(embed_result, "inputs_embeds"):
         merged_embeds = embed_result.inputs_embeds
@@ -3362,9 +3086,8 @@ def _vlm_hidden_states(model, batch_dict):
     inputs = input_ids
     fwd_attn_mask = attention_mask
 
-    # Collect extra keys (e.g. image_grid_thw for Qwen). Read the private
-    # collated-position flag first, then strip all `_unsloth_*` carriers
-    # so the embedder/backbone never sees them.
+    # Collect extra keys (e.g. image_grid_thw for Qwen); read the private collated-position flag first, then strip all
+    # `_unsloth_*` carriers so the embedder/backbone never sees them.
     use_collated_position_ids = bool(
         batch_dict.get("_unsloth_collated_position_ids")
     )
@@ -3396,9 +3119,8 @@ def _vlm_hidden_states(model, batch_dict):
             embed_result, model, input_ids=inputs, attention_mask=attention_mask,
         )
         merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
-    # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
-    # CUDA-parity full-sequence positions; recomputing inside the embedder moved
-    # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
+    # Prefer collator-built mRoPE IDs when present: Qwen/GLM collators build CUDA-parity full-sequence positions;
+    # recomputing in the embedder moved Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
     if use_collated_position_ids and "position_ids" in extra_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
     if "token_type_ids" in _drop_pair_token_type_ids(batch_dict, extra_kwargs):
@@ -3449,9 +3171,8 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
         ntoks = (masked_targets != -100).sum()
     else:
-        # Prefer the raw (pre-narrow) input_ids so wide invalid ids
-        # (e.g. np.uint32(2**32-100)) reach runtime CCE as out-of-vocab
-        # sentinels instead of wrapping to -100 via the int32 narrow.
+        # Prefer the raw pre-narrow input_ids so wide invalid ids (e.g. np.uint32(2**32-100)) reach runtime CCE as
+        # out-of-vocab sentinels instead of wrapping to -100 via the int32 narrow.
         target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
         targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
@@ -3503,13 +3224,8 @@ def _config_to_mapping(config):
 
 
 def _phi4mm_token_ids(config):
-    """Phi-4-multimodal's image and audio token ids.
-
-    Its checkpoint config.json declares neither; mlx-vlm supplies both as
-    dataclass defaults. Training threads the checkpoint mapping rather than the
-    model's config object, so read the defaults off the dataclass instead of
-    restating them here.
-    """
+    """Phi-4-multimodal image and audio token ids: its checkpoint config.json declares neither, so read mlx-vlm's
+    dataclass defaults, since training threads the checkpoint mapping, not the config object."""
     image_id = _config_get(config, "image_token_index")
     audio_id = _config_get(config, "audio_token_index")
     if image_id is None or audio_id is None:
@@ -3552,11 +3268,9 @@ def _mlx_vlm_canonical_model_type(model_type):
     return name
 
 
-# Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
-# `.prod()`, `[:, 1:]`), so a tuple raises inside their tower. Everything else
-# keeps the tuple the Qwen/Paddle compile patches trace: an array becomes a
-# tracer under mx.compile and `.tolist()` raises there instead. Pinned by
-# tests/test_mlx_text_path_contract.py.
+# Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`, `.prod()`, `[:, 1:]`) get an array,
+# since a tuple raises there; others keep the tuple Qwen/Paddle compile patches trace (an array becomes a tracer under
+# mx.compile); pinned by tests/test_mlx_text_path_contract.py.
 _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm4v",
     "glm_ocr",
@@ -3565,8 +3279,8 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
 })
 
 
-# Towers that read these keys on the host (a tracer under mx.compile): handed the
-# processor's Python values. Per family, since a tuple raises in the towers above.
+# Towers that read these keys on the host (a tracer under mx.compile) get the processor's Python values, set per family
+# since a tuple raises in the towers above.
 _VLM_STATIC_METADATA_MODEL_TYPES = {
     # Its embedder reads only the image grid; there is no video pixel path.
     "dots_ocr": ("image_grid_thw",),
@@ -3604,14 +3318,9 @@ def _normalize_int_tuple(values):
 
 
 def _normalize_numpy_cce_labels(labels):
-    """numpy-side analogue of `_normalize_cce_label_dtype` for VLM expand paths.
-
-    np.uint64 values above 2**63-1 would OverflowError when packed into the
-    int64 buffer used by `_expand_image_token_sequences` / `_expand_token_runs`;
-    route them to a positive 1<<62 sentinel (so an overflowed 2**64-100 cannot
-    silently masquerade as ignore_index=-100) and downcast other unsigned
-    dtypes to int64.
-    """
+    """Numpy analogue of _normalize_cce_label_dtype for VLM expand paths: np.uint64 above 2**63-1 would OverflowError in
+    the int64 buffer, so they map to a 1<<62 sentinel, not ignore_index=-100; other unsigned dtypes downcast to
+    int64."""
     labels_np = np.asarray(labels)
     if labels_np.dtype == np.uint64:
         overflow_mask = labels_np > np.uint64((1 << 63) - 1)
@@ -3668,8 +3377,7 @@ def _expand_image_token_sequences(
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
-    # int64 so wide invalid labels survive without OverflowError before the
-    # runtime CCE validity check; CCE owns dtype narrowing post-validate.
+    # Labels use int64 so wide invalid values survive without OverflowError until the runtime CCE validity check; CCE owns dtype narrowing after validation.
     padded_labels = (
         np.full((len(expanded_labels), max_len), -100, dtype=np.int64)
         if expanded_labels is not None else None
@@ -3993,9 +3701,8 @@ def _build_glm_ocr_position_ids(
 
 _RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
 
-# Text-width-aligned arrays the VLM pipeline owns, with the inert value their
-# right-padded tail takes ("pad" is the tokenizer pad id). Only these are padded;
-# any other array sharing an extent with the text width declines its batch.
+# Only these are padded: text-width-aligned arrays the VLM pipeline owns, right-padded with an inert value (pad =
+# tokenizer pad id); any other array sharing an extent declines the batch.
 _VLM_WIDTH_PADDABLE_KEYS = {
     "input_ids": "pad",
     "attention_mask": 0,
@@ -4006,8 +3713,7 @@ _VLM_WIDTH_PADDABLE_KEYS = {
 }
 # Width-derived arrays generated AFTER width finalization (sequence axis last).
 _VLM_WIDTH_GENERATED_KEYS = ("position_ids",)
-# Model types whose position ids the position phase builds, and rebuilds after
-# planned padding; elsewhere they are processor-authored, so the batch declines.
+# Model types whose position ids the position phase builds and rebuilds after planned padding; elsewhere ids are processor-authored, so the batch declines.
 _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen2_vl",
     "qwen2_5_vl",
@@ -4029,10 +3735,8 @@ _VLM_POSITION_GENERATING_MODEL_TYPES = (
 
 
 def _vlm_pipeline_disposable_keys(config):
-    """Keys the position-recording phase overwrites wholesale for this config.
-
-    Whatever a processor placed under them is disposable for width admission:
-    it can neither decline a batch nor forbid extents."""
+    """Keys the position-recording phase overwrites wholesale for this config; anything a processor placed under them is
+    disposable for width admission, so it can neither decline a batch nor forbid extents."""
     model_type = _config_get(config, "model_type")
     if model_type in _VLM_POSITION_GENERATING_MODEL_TYPES:
         return frozenset(("position_ids",))
@@ -4042,25 +3746,9 @@ def _vlm_pipeline_disposable_keys(config):
 
 
 def _vlm_width_survey(batch_dict, disposable_keys=None):
-    """(text_width, symbolic_axes, padable, forbidden) for a prepared batch.
-
-    ``text_width`` is the post-prepare ``input_ids`` width. ``symbolic_axes``
-    maps pipeline-owned width-coupled leaf paths to their sequence axis for
-    ``_vlm_batch_family``. ``forbidden`` collects extents appearing at any
-    depth in arrays the pipeline does not pad: a planned endpoint must avoid
-    them, or an untouched array would suddenly share the text width and
-    reclassify the batch. ``padable`` is False (and the axes None) whenever
-    right-padding cannot be proven safe: invalid array-metadata captures, no
-    exact-mx 2-D ``input_ids``, position data under a key outside
-    ``disposable_keys`` (the pipeline neither pads nor regenerates it), a
-    non-mx shape-carrying leaf, an ``attention_mask`` row that is not
-    content-then-padding, or an untouched array already sharing an extent
-    with the text width.
-
-    The walk mirrors the family serializer's traversal and reads metadata
-    only through the import-time captures, so classification and the
-    symbolic family always describe the same pytree.
-    """
+    """Returns (text_width, symbolic_axes, padable, forbidden); padable is False when right-padding cannot be proven
+    safe; planned widths must avoid forbidden extents or untouched arrays would share the text width and reclassify
+    the batch."""
     if not _MX_ARRAY_CAPTURES_VALID:
         return None, None, False, frozenset()
 
@@ -4087,9 +3775,8 @@ def _vlm_width_survey(batch_dict, disposable_keys=None):
         nonlocal declined
         if declined:
             return
-        # Mirror the family serializer's dispatch: raw runtime types (a lying
-        # __class__ cannot smuggle a non-container in) and exact built-in
-        # constants. Anything else has no validated metadata and refuses padding.
+        # Mirror the family serializer's dispatch on raw runtime types (a lying __class__ cannot smuggle a non-container
+        # in) and exact built-in constants; anything else has no validated metadata and refuses padding.
         node_type = type(node)
         if node_type is _MX_ARRAY_TYPE:
             extents = dims_of(node)
@@ -4140,10 +3827,9 @@ def _vlm_width_survey(batch_dict, disposable_keys=None):
                 forbidden.update(value_dims)
             continue
         if key in disposable_keys:
-            # The position phase rebuilds this key wholesale, so anything here is
-            # disposable: it neither declines the batch nor forbids extents. Only a
-            # canonical exact-array sequence-last position_ids earns the symbolic
-            # axis; anything else stays concrete and still surfaces drift.
+            # The position phase rebuilds this key wholesale, so it is disposable: it neither declines the batch nor
+            # forbids extents; only a canonical exact-array sequence-last position_ids gets the symbolic axis; anything
+            # else stays concrete and still surfaces drift.
             if (
                 key in _VLM_WIDTH_GENERATED_KEYS
                 and type(value) is _MX_ARRAY_TYPE
@@ -4170,16 +3856,9 @@ def _vlm_width_survey(batch_dict, disposable_keys=None):
 def _finalize_vlm_batch_width(
     batch_dict, target_width, pad_token_id, disposable_keys=None,
 ):
-    """Right-pad the pipeline-owned text-aligned arrays to ``target_width``.
-
-    Runs after expansion and response masking produce the final content but
-    before width-derived sidecars are generated, so recorded absolute
-    positions refer to the preserved content prefix and sidecars are born at
-    the final width. Padded tails are inert: pad id under a zero attention
-    mask, labels -100. Batches the width survey declines return unchanged; a
-    target below the current width fails hard. ``max_seq_length`` is never
-    consulted, since post-expansion widths may legitimately exceed it.
-    """
+    """Right-pads text-aligned arrays after expansion and masking, before width-derived sidecars; pad id under zero
+    attention mask, labels -100; declined batches pass through; a target below the current width fails hard;
+    max_seq_length is never consulted since expanded widths may exceed it."""
     width, _axes, padable, forbidden = _vlm_width_survey(
         batch_dict, disposable_keys=disposable_keys,
     )
@@ -4208,8 +3887,7 @@ def _finalize_vlm_batch_width(
         )
     for key, pad_value in _VLM_WIDTH_PADDABLE_KEYS.items():
         value = batch_dict.get(key)
-        # The survey guarantees paddable keys are exact mx arrays, and metadata
-        # uses the same captured descriptors, so a patched property cannot skip a pad.
+        # The survey guarantees paddable keys are exact mx arrays and metadata uses the same captured descriptors, so a patched property cannot skip a pad.
         if type(value) is not _MX_ARRAY_TYPE:
             continue
         value_shape = tuple(
@@ -4233,16 +3911,9 @@ def _finalize_vlm_batch_width(
 
 
 def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
-    """Prepare a collated VLM batch for the compiled/training path.
-
-    ``phase`` splits the work at the width seam: ``"content"`` runs sidecar
-    normalization and the expansions that may rebuild the text arrays at
-    data-dependent lengths; ``"positions"`` runs the steps that record
-    absolute positions or generate width-derived sidecars and must see the
-    final text width. ``None`` runs both back to back, byte-identical to the
-    historical single pass since each model type takes exactly one of the
-    disjoint branches.
-    """
+    """Splits the prepare work at the width seam: "content" does sidecar normalization and expansions that may rebuild
+    text arrays; "positions" records absolute positions and width-derived sidecars, which need the final text width;
+    None runs both, byte-identical to the historical single pass."""
     if phase is None:
         batch_dict = _prepare_vlm_batch_for_compile(
             batch_dict, config, phase="content",
@@ -4255,7 +3926,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     if phase != "content":
         raise ValueError(f"unknown VLM prepare phase: {phase!r}")
     validate_legacy_image_batch(batch_dict)
-    # The provenance marker is pipeline-private: processor output carrying it is a
+    # The provenance marker (_unsloth_collated_position_ids) is pipeline-private: processor output carrying it is a
     # forgery that would misclassify foreign position ids as regenerated.
     batch_dict.pop("_unsloth_collated_position_ids", None)
     model_type = _config_get(config, "model_type")
@@ -4263,8 +3934,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
 
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
-    # Kimi's processor names the same `(t, h, w)` metadata differently and emits
-    # two-element rows for stills.
+    # Kimi's processor names the same (t, h, w) metadata differently and emits two-element rows for stills.
     grid_thws = _normalize_grid_thw(batch_dict.get("grid_thws"))
     image_grid_hws = _normalize_grid_thw(batch_dict.get("image_grid_hws"))
     video_grid_hws = _normalize_grid_thw(batch_dict.get("video_grid_hws"))
@@ -4272,8 +3942,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    # Resolved, not raw: an aliased config is routed to the canonical family's
-    # tower, so the grid form has to follow it there.
+    # Resolved, not raw: an aliased config is routed to the canonical family's tower, so the grid form has to follow it there.
     grid_as_array = (
         _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
     )
@@ -4298,13 +3967,11 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
                 value = normalized
             batch_dict[key] = value
             static_metadata[key] = normalized
-    # Only when there is metadata: every VLM batch goes through here, and an
-    # always-present empty dict is a new key in every text-only batch's pytree.
+    # Only when there is metadata: every VLM batch passes through here, and an always-present empty dict would add a new key to every text-only batch's pytree.
     if static_metadata:
         batch_dict["_unsloth_static_vlm_metadata"] = static_metadata
     if audio_embed_sizes is not None:
-        # The model calls .item() on each entry, so hand over an array; the
-        # tuple above is only for this function's span arithmetic.
+        # The model calls .item() on each entry, so hand over an array; the tuple above is only for this function's span arithmetic.
         batch_dict["audio_embed_sizes"] = mx.array(list(audio_embed_sizes))
 
     if model_type == "multi_modality":
@@ -4312,10 +3979,9 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         if input_ids is not None:
             _labels = batch_dict.get("labels")
             _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
-            # Labels absent: expand the raw pre-narrow carrier so labels-free
-            # paths still see wide invalid ids for NaN-poisoning. Labels
-            # present: pop the now-stale carrier so a pre-expansion copy
-            # cannot break _apply_response_mask_to_vlm_batch with a shape mismatch.
+            # Labels absent: expand the raw pre-narrow carrier so labels-free paths still see wide invalid ids for
+            # NaN-poisoning; labels present: pop the stale carrier so a pre-expansion copy cannot break
+            # _apply_response_mask_to_vlm_batch with a shape mismatch.
             _label_source = _labels if _labels is not None else _raw_labels
             _expanded = _expand_image_token_sequences(
                 input_ids=input_ids,
@@ -4362,8 +4028,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
                     replacements.append(tuple(batch_replacements))
                 _labels = batch_dict.get("labels")
                 _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
-                # See multi_modality branch above for why we expand the raw
-                # carrier when labels are absent and pop it when labels exist.
+                # Same rule as the multi_modality branch above: expand the raw carrier when labels are absent and pop it when labels exist.
                 _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
@@ -4439,8 +4104,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
             if replacements:
                 _labels = batch_dict.get("labels")
                 _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
-                # See multi_modality branch above for why we expand the raw
-                # carrier when labels are absent and pop it when labels exist.
+                # Same rule as the multi_modality branch above: expand the raw carrier when labels are absent and pop it when labels exist.
                 _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
@@ -4466,10 +4130,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
 
 
 def _vlm_positions_for_compile(batch_dict, config):
-    """Position-recording prepare steps: absolute-position constants and
-    width-derived sidecars, computed from the final text arrays (after any
-    expansion and planned padding, whose tails never shift a content
-    position)."""
+    """Records absolute-position constants and width-derived sidecars from the final text arrays; planned padding tails never shift a content position."""
     model_type = _config_get(config, "model_type")
     config = _multimodal_config(config)
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
@@ -4532,15 +4193,9 @@ def _vlm_positions_for_compile(batch_dict, config):
 
 
 def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
-    """Create a CCE loss function for VLMs.
-
-    Uses model.get_input_embeddings() for merged vision+text embeddings, runs
-    the backbone to pre-lm_head hidden states, and applies CCE. Falls back to
-    baseline loss when get_input_embeddings is unavailable.
-
-    assistant_token_id > 0 enables completion-only training (mask tokens before
-    the first occurrence). Returns a function (model, batch_dict) -> (loss, ntoks).
-    """
+    """CCE loss over pre-lm_head hidden states from get_input_embeddings() merged embeddings, with baseline loss as
+    fallback; assistant_token_id > 0 enables completion-only training, masking tokens before its first occurrence;
+    returns (model, batch_dict) -> (loss, ntoks)."""
     def _marked_vlm_baseline():
         loss_fn = make_vlm_baseline_loss_fn(
             model,
@@ -4590,8 +4245,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     if _softcap_problem is not None:
         print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
         return _marked_vlm_baseline()
-    # Every decision above prints when it declines; print when it accepts too, since
-    # a silently ignored head transform is the failure this prevents.
+    # Every decision prints when it declines; print when it accepts too, since a silently ignored head transform is the failure this prevents.
     if softcap > 0:
         print(f"Unsloth: VLM CCE using logit_softcap={softcap} for this model.")
     if logit_scale is not None:
@@ -4614,9 +4268,8 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         print(f"Unsloth: Completion-only training (assistant_token_id={_assistant_token_id}).")
 
     if use_quantized:
-        # Backstop (as in the text CCE path): full FT against a quantized LM
-        # head silently skips the LM head update. Reject loudly here in case
-        # the loader-level check is bypassed.
+        # Backstop as in the text CCE path: full FT against a quantized LM head silently skips the LM head update;
+        # reject loudly in case the loader check is bypassed.
         if getattr(model, "_unsloth_full_finetuning", False):
             raise ValueError(
                 "Unsloth: full_finetuning=True with a quantized VLM LM head "
@@ -4648,13 +4301,11 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             bi = getattr(lm_head, "biases", None)
             if bi is None and quant_mode == "affine":
                 bi = mx.zeros_like(sc)
-            # Quantized backward already returns zero weight/scales/biases
-            # gradients (see runtime_cce.py VJP), so stop_gradient is
-            # redundant here even when the LM head is frozen.
+            # Quantized backward already returns zero weight/scales/biases gradients (see runtime_cce.py VJP), so
+            # stop_gradient is redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
             if logit_scale is not None:
-                # (h * s) @ W equals s * (h @ W) per vocab chunk (Aya Vision,
-                # Cohere2-MoE apply logit_scale in their forward tails).
+                # (h * s) @ W equals s * (h @ W) per vocab chunk; Aya Vision and Cohere2-MoE apply logit_scale in their forward tails.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             indices = batch_dict.get("_unsloth_cce_indices")
@@ -4719,8 +4370,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     loss_fn._unsloth_cce_backend = "runtime-cce"
     loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
     if use_quantized:
-        # Absolute: a dotted relative import is unresolvable to transformers' remote-code
-        # walk. See tests/test_relative_imports_resolve.py.
+        # Absolute import: a dotted relative import is unresolvable to transformers' remote-code walk; see tests/test_relative_imports_resolve.py.
         from unsloth_zoo.mlx.cce import runtime_cce
         budget = runtime_cce._CHUNK_BUDGET or runtime_cce._get_memory_budget()
         base_chunk = max(2048, (lm_layer.weight.shape[0] + 15) // 16)
@@ -4730,16 +4380,8 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
 
 
 def _get_vlm_image_size(config, processor):
-    """Get target image size for uniform resizing, matching the GPU collator.
-
-    Tries vision_config.image_size (dict or dataclass), then
-    processor.image_processor.size, falls back to 512.
-
-    Note: Qwen2.5-VL's image_processor.size holds *area pixel counts*
-    (shortest_edge/longest_edge = min/max pixels), not dimensions. Reading
-    them as height would 3136x3136-upsample -> 50k patches -> OOM, so skip
-    area-style ``size`` dicts.
-    """
+    """Target size for uniform resizing, from vision_config.image_size then processor.image_processor.size, else 512;
+    area-style size dicts (Qwen2.5-VL min/max pixels) are skipped: as dimensions they upsample to 3136x3136 and OOM."""
     vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
     if vc is not None:
         sz = vc.get("image_size") if isinstance(vc, dict) else getattr(vc, "image_size", None)
@@ -4749,8 +4391,7 @@ def _get_vlm_image_size(config, processor):
     if ip is not None:
         sz = getattr(ip, "size", None)
         if isinstance(sz, dict):
-            # Skip area-pixel-count dicts (Qwen2.5-VL style) — those use
-            # {shortest_edge, longest_edge} as area bounds, not dimensions.
+            # Skip area-pixel-count dicts (Qwen2.5-VL style): their shortest_edge and longest_edge are area bounds, not dimensions.
             if "longest_edge" in sz and sz.get("longest_edge", 0) > 1_000_000:
                 pass  # area-count form, fall through to default
             else:
@@ -4789,10 +4430,9 @@ def _get_processor_tokenizer(processor):
     tokenizer = getattr(processor, "tokenizer", None)
     if tokenizer is not processor and callable(tokenizer):
         return tokenizer
-    # HF fast tokenizers expose the public API directly while their _tokenizer
-    # is the low-level Rust backend (no convert_tokens_to_ids / chat_template /
-    # apply_chat_template). Only unwrap _tokenizer for wrappers that do not
-    # already speak the HF tokenizer API (mlx-lm's TokenizerWrapper proxies it).
+    # HF fast tokenizers expose the public API directly while their _tokenizer is the low-level Rust backend (no
+    # convert_tokens_to_ids, chat_template or apply_chat_template); only unwrap _tokenizer for wrappers lacking the HF
+    # API (mlx-lm TokenizerWrapper proxies it).
     if hasattr(processor, "convert_tokens_to_ids"):
         return processor
     if hasattr(processor, "_tokenizer"):
@@ -4913,12 +4553,8 @@ def normalize_vlm_processor_chat_template(
     model_type=None,
     strict=False,
 ):
-    """Make mlx-vlm processors behave like regular Unsloth vision processors.
-
-    mlx-vlm often returns processors where the inner tokenizer has a template
-    but the processor itself does not. Transformers' VLM processors expect the
-    template on the processor for apply_chat_template(), so copy it once here.
-    """
+    """mlx-vlm processors often lack the chat template their inner tokenizer has; copy it onto the processor, since
+    Transformers' apply_chat_template() reads it there."""
     return normalize_mlx_chat_template(
         processor,
         chat_template=chat_template,
@@ -4952,12 +4588,8 @@ def _collect_mlx_values(value, out):
 
 
 def _materialize_mlx_values(*trees):
-    """Force pending MLX graphs on the thread that created them.
-
-    Lazy MLX arrays cannot be evaluated from another thread, so opaque
-    processor-owned payloads must cross the prefetch boundary materialized.
-    This only completes computation the processor already issued on this thread.
-    """
+    """Materializes pending MLX graphs on the creating thread, since lazy arrays cannot be evaluated elsewhere;
+    completes only work the processor already issued there, so payloads cross the prefetch boundary materialized."""
     arrays = []
     for tree in trees:
         _collect_mlx_values(tree, arrays)
@@ -5101,10 +4733,9 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                         for key in ("input_image", "image_url"):
                             if key in clean:
                                 clean.setdefault("image", clean.pop(key))
-                        # Gemma 3n's template renders a placeholder for
-                        # "audio" alone, so a part left under an alias carries
-                        # a clip with nothing behind it, and an untyped one
-                        # reaches neither the family gate nor the extractor.
+                        # Gemma 3n's template renders a placeholder for 'audio' alone, so a part left under an alias
+                        # carries a clip with nothing behind it; an untyped one reaches neither the family gate nor the
+                        # extractor.
                         if "type" not in clean:
                             if "text" in clean:
                                 clean["type"] = "text"
@@ -5161,12 +4792,7 @@ def _vlm_numbered_audio_stem(processor):
 
 
 def _flatten_vlm_content_for_text_template(messages, image_token=None, audio_stem=None):
-    """Render list-style VLM content as text for text-only chat templates.
-
-    Rebuilt shallowly rather than deep-copied: only `content` is replaced, and a
-    deepcopy would clone every PIL image on the row. This runs per training
-    sample, so that cost is the whole collator's.
-    """
+    """Renders list-style content as text for text-only templates via a shallow rebuild; deepcopy would clone every PIL image on each row, per training sample."""
     flattened = []
     clips = 0
     for message in messages:
@@ -5326,11 +4952,7 @@ def _vlm_token_messages(processor, messages):
 
 
 def _mark_vlm_image_parts(messages, image_token):
-    """Replace image parts with a literal image token, sharing everything else.
-
-    Shallow by construction: the copy exists to swap one part dict, and deep
-    copying would duplicate the row's PIL images on every render.
-    """
+    """Swaps image parts for a literal image token via a shallow copy; deep copying would duplicate the row's PIL images on every render."""
     if not image_token:
         return messages
     marked = []
@@ -5412,11 +5034,9 @@ def _render_vlm_messages(
             continue
         return text
     if rendered is not None:
-        # A template is allowed to transform what it renders: Qwen3/QwQ strip
-        # <think> from history, autoescaping ones rewrite `<` and `&`, others
-        # drop roles they do not model. The checks above pick the best-preserved
-        # candidate, but they cannot tell a deliberate transform from damage, so
-        # they do not get to fail a render the template itself accepted.
+        # A template may transform its render (Qwen3/QwQ strip <think> from history, autoescaping ones rewrite < and &,
+        # others drop roles they do not model); the checks above only pick the best-preserved candidate and cannot tell
+        # that from damage, so they never fail an accepted render.
         return rendered
     raise RuntimeError(
         "Unsloth MLX VLM: failed to render chat messages with this "
@@ -5793,18 +5413,9 @@ class _MLXPromptCompletionTokens:
 def _mlx_prompt_completion_boundary(
     prompt_ids, input_ids, *, strict=True, step_back=False,
 ):
-    """Locate the completion after tolerating one boundary-merged token.
-
-    Without ``strict`` it may fall wherever the two tokenizations stop agreeing.
-
-    ``step_back`` drops the verification rather than raising on it. That is what
-    ORPOTrainer.build_tokenized_answer does in trl/trainer/orpo_trainer.py: when
-    the prompt is not a token prefix it steps back exactly one token and never
-    checks what precedes it. Reproducing that is deliberate parity, not an
-    oversight, and only the preference path asks for it: a recovered prompt is a
-    character prefix and so lands mid-token routinely, where SFT's prompt is
-    tokenized from the same text it re-tokenizes and a mismatch is a real error.
-    """
+    """Completion boundary tolerating one boundary-merged token; without strict it falls where tokenizations diverge;
+    step_back skips the check as ORPOTrainer.build_tokenized_answer does (trl/trainer/orpo_trainer.py), for
+    preference prompts only; SFT mismatches stay errors."""
     prompt_ids = tuple(prompt_ids)
     input_ids = tuple(input_ids)
     if input_ids[:len(prompt_ids)] == prompt_ids:
@@ -5845,8 +5456,7 @@ def _encode_mlx_prompt_completion(
     return _MLXPromptCompletionTokens(
         prompt_ids,
         input_ids,
-        # A template may re-render the prompt's last message once a completion
-        # follows, leaving it no longer even a text prefix.
+        # A template may re-render the prompt's last message once a completion follows, leaving it no longer even a text prefix.
         _mlx_prompt_completion_boundary(
             prompt_ids, input_ids, strict=full_text.startswith(prompt_text),
             step_back=step_back,
@@ -6011,12 +5621,8 @@ def _prepare_labeled_text_dataset(
 
 
 def _coerce_mlx_token_list(value, field_name, state=None):
-    """Convert one token-id field from a pretokenized row to a Python list.
-
-    With ``state``, an MLX-valued field marks the stream ``host_valued=False``
-    BEFORE conversion, since the conversion is itself MLX work the prefetch
-    producer must reject rather than run off the consumer thread.
-    """
+    """Converts a pretokenized token-id field to a list; with state, an MLX-valued field marks host_valued=False first,
+    since that conversion is MLX work the prefetch producer must reject."""
     if state is not None and _contains_mlx_values(value):
         if state.get("reject_mlx_valued"):
             raise ValueError(
@@ -6053,15 +5659,8 @@ def _resolve_mlx_pretokenized_completion_only_loss(dataset, completion_only_loss
 def _prompt_completion_formatter_conflict(
     dataset, formatting_func, completion_only_loss
 ):
-    """Detect a formatter that erases a prompt/completion boundary under the default.
-
-    SFTTrainer resolves the completion_only_loss default to True for prompt/completion
-    datasets and then rejects a formatting_func as incompatible, because formatting
-    collapses the row into free text and drops the completion boundary. We only reach
-    this after formatting produced no labeled rows, so raising here mirrors that
-    guardrail instead of silently training on the full formatted sequence. A formatter
-    that keeps prompt/completion keys still yields labeled rows and never lands here.
-    """
+    """Flags a formatting_func that erases the prompt/completion boundary, as SFTTrainer rejects under its
+    completion_only_loss default, rather than training on the full sequence; only reached when no rows were labeled."""
     if formatting_func is None or completion_only_loss is not None:
         return False
     for item in dataset:
@@ -6207,21 +5806,18 @@ def _is_mlx_lazy_text_source(dataset):
     if isinstance(dataset, Iterator):
         return True
     source_mro = type(dataset).__mro__
-    # Explicit iteration wins over map-style methods, which may be advisory or
-    # deliberately unusable and must not be probed just to classify the source.
+    # Explicit iteration wins over map-style methods, which may be advisory or deliberately unusable, so they must not be probed just to classify the source.
     if any("__iter__" in cls.__dict__ for cls in source_mro):
         return True
-    # Python's sequence-iteration fallback accepts __getitem__ without __iter__:
-    # both protocols means map-style, getitem-only stays lazy. Neither is probed.
+    # Python's sequence-iteration fallback accepts __getitem__ without __iter__: having both protocols means map-style,
+    # while getitem-only stays lazy; neither is probed.
     has_getitem = any("__getitem__" in cls.__dict__ for cls in source_mro)
     has_len = any("__len__" in cls.__dict__ for cls in source_mro)
     return has_getitem and not has_len
 
 
 def _is_mlx_hf_iterable_text_source(dataset):
-    """Return whether Hugging Face defines this source as replayable. Detected
-    through ``sys.modules`` so classification never imports ``datasets``: if the
-    package was never imported, no instance can exist."""
+    """Whether the source is a Hugging Face IterableDataset; checked via sys.modules so datasets is never imported, as an unimported package cannot have instances."""
     hf_datasets = sys.modules.get("datasets")
     hf_iterable = getattr(hf_datasets, "IterableDataset", None)
     return hf_iterable is not None and isinstance(dataset, hf_iterable)
@@ -6233,11 +5829,8 @@ def _mlx_lazy_text_source(dataset):
 
 
 class _MLXIterableTokenizedDatasetView:
-    """Iterable-only public view over MLX's lazy text normalization pipeline.
-
-    Deliberately has no ``__len__`` or ``__getitem__``. Preserves the source's
-    replay/one-shot behavior and forwards epoch changes without consuming a row.
-    """
+    """Iterable-only view over the lazy text pipeline, deliberately without __len__ or __getitem__; keeps the source's
+    replay or one-shot behavior and forwards epoch changes without consuming a row."""
 
     _INVALIDATED_SOURCE_METADATA = frozenset((
         "column_names", "features", "info", "num_columns", "supervised_keys",
@@ -6326,19 +5919,16 @@ class _MLXIterableTokenizedDatasetView:
 
 
 def _labeled_row_has_supervision(labels, max_seq_length):
-    # Keep rows with a supervised token in labels[1:max_seq_length] (causal shift,
-    # length-capped); an all-masked batch aborts training. labels=None always kept.
+    # Keep rows with a supervised token in labels[1:max_seq_length] (causal shift, length-capped); an all-masked batch
+    # aborts training; labels=None is always kept.
     if labels is None:
         return True
     return any(int(x) != -100 for x in labels[1:max_seq_length])
 
 
 class _HostStagedTextBatch:
-    """Host-side (python/numpy) text batch awaiting MLX finalization.
-
-    ``host_valued`` is False when any staged field arrived as an MLX array:
-    synchronous mode accepts those unchanged, the prefetch producer rejects them.
-    """
+    """Host-side text batch awaiting MLX finalization; host_valued is False if any field arrived as an MLX array, which
+    synchronous mode accepts but the prefetch producer rejects."""
 
     __slots__ = ("ids", "lengths_info", "labels", "host_valued")
 
@@ -6369,12 +5959,8 @@ def _stage_tokenized_text_batch(
     host_valued=None,
     width_policy=None,
 ):
-    """Host staging of one pretokenized text batch (no MLX work).
-
-    ``host_valued=None`` computes the flag from the items; the lazy pipeline
-    instead passes the stream-level flag recorded at row normalization, where
-    MLX origin is still visible.
-    """
+    """Host staging of one pretokenized batch, no MLX work; host_valued=None derives the flag from items, while the lazy
+    pipeline passes the stream flag from row normalization, where MLX origin is still visible."""
     valid_items = [item for item in batch_items if item is not None]
     lengths = [
         0 if item is None else min(len(item[0]), max_seq_length)
@@ -6447,13 +6033,8 @@ class _FiniteTextRow:
 
 def _finite_text_pad_width(raw_width, *, pad_to_multiple=0, minimum_width=1,
                            max_seq_length):
-    """Shared finite text pad-width policy.
-
-    Order of operations is observable and fixed: optional
-    ``1 + pad_to_multiple * ceil(raw_width / pad_to_multiple)`` round-up
-    (identity when the multiple is zero), then minimum width, then the
-    ``max_seq_length`` cap.
-    """
+    """Pad width policy: optional 1 + pad_to_multiple * ceil(raw_width / pad_to_multiple) round-up (identity at zero),
+    then minimum width, then the max_seq_length cap; this order is fixed."""
     width = int(raw_width)
     if pad_to_multiple:
         width = 1 + pad_to_multiple * (
@@ -6476,14 +6057,9 @@ class _FiniteVisitMixin:
         return self._visit_policy
 
     def batch_index_for_visit(self, absolute_visit):
-        """Map an absolute batch visit to one stored schedule index.
-
-        Identity plans replay the schedule cyclically (the historical
-        ``visit % len``). ``epoch_permute`` plans replay the stored order for
-        epoch 0, then visit a deterministic permutation of the same batch
-        multiset each later epoch, derived only from the normalized seed and
-        the epoch, never from ambient RNG state.
-        """
+        """Identity plans replay the schedule cyclically (visit % len); epoch_permute replays the stored order for epoch
+        0, then a deterministic permutation of the same batches derived only from the normalized seed and epoch,
+        never ambient RNG."""
         count = len(self._schedule)
         if count == 0:
             raise ValueError("cannot resolve a visit on an empty schedule")
@@ -6556,17 +6132,15 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self._shape_plan = None
         self._cce_capacities = {}
         self._visit_policy = str(visit_policy)
-        # Normalized eagerly so visits never depend on ambient RNG state and a
-        # reconstructed plan (fresh-process resume) derives identical visits.
+        # Seed normalized eagerly so visits never depend on ambient RNG state; a plan rebuilt in a fresh process on resume derives identical visits.
         self._visit_seed = (
             None if self._visit_policy == "identity"
             else _normalize_seed(visit_seed)
         )
         self._visit_epoch_cache = None
-        # Micro-batches in ONE dataset pass, which len(schedule) is not once a
-        # num_batches horizon cycles the plan. Batching drops sub-two-token rows
-        # and can expand one source item into several, so only the plan itself
-        # knows this count; callback epoch accounting reads it.
+        # Micro-batches per ONE dataset pass (not len(schedule) once a num_batches horizon cycles the plan); batching
+        # drops sub-two-token rows and can expand one source item into several, so only the plan knows this count;
+        # callback epoch accounting reads it.
         self._cycle_length = (
             None if cycle_length is None else max(1, int(cycle_length))
         )
@@ -6605,8 +6179,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         return self._cycle_length
 
     def batch_width(self, index):
-        # Explicit widths are authoritative; skip the per-row length scan
-        # (constructor validation keeps widths/schedule index-aligned).
+        # Explicit widths are authoritative, so skip the per-row length scan (constructor validation keeps widths and schedule index-aligned).
         if self._widths is not None:
             return self._widths[int(index)]
         batch_indices = self._schedule[index]
@@ -6661,10 +6234,9 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self._cce_capacities = {}
         if not enabled:
             return
-        # tuple.count scans in C and a schedule revisits rows, so neither the
-        # per-label compare nor the repeat visit reaches Python. Label-masked
-        # corpora put every token of every row in this window, which is what
-        # makes the difference worth having.
+        # tuple.count scans in C and a schedule revisits rows, so neither the per-label compare nor the repeat visit
+        # reaches Python; label-masked corpora put every token of every row in this window, which is what makes the
+        # difference worth having.
         row_counts = {}
 
         def supervised(row_index):
@@ -6865,8 +6437,7 @@ def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
         cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=pad_id,
-        # One reusable shuffled cycle: eligible for epoch-permuted visits.
-        # Horizon-expanded/truncated schedules replay stored order (identity).
+        # One reusable shuffled cycle is eligible for epoch-permuted visits; horizon-expanded or truncated schedules replay stored order (identity).
         visit_policy="epoch_permute" if num_batches is None else "identity",
         visit_seed=seed,
     )
@@ -6969,11 +6540,9 @@ def _resize_vlm_images(images, image_size):
             if _is_vlm_no_resize_image_size(image_size):
                 pass
             elif isinstance(image_size, int):
-                # Match UnslothVisionDataCollator resize="min": shrink large
-                # images to the model limit, but let processors handle upscaling.
-                # Scale on the larger side so tall portrait images (e.g.
-                # 512x2048 with a 512 cap) also shrink instead of slipping
-                # through on a width-only check.
+                # Match UnslothVisionDataCollator resize="min": shrink large images to the model limit, but let
+                # processors handle upscaling; scale on the larger side so tall portrait images (e.g. 512x2048 with a
+                # 512 cap) also shrink instead of slipping through a width-only check.
                 width, height = image.size
                 side = max(width, height)
                 if side > image_size:
@@ -7125,8 +6694,7 @@ class _AudioVersions(NamedTuple):
             return False
         try:
             found = _Version(installed)
-            # Only published final releases were probed, and mlx-vlm has shipped
-            # no prerelease, post-release or local build in 73 releases.
+            # Only published final releases were probed; mlx-vlm has shipped no prerelease, post-release or local build in 73 releases.
             if found.is_prerelease or found.is_postrelease or found.local:
                 return False
             return _Version(self.minimum) <= found
@@ -7182,11 +6750,9 @@ _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "minicpmo": _AudioVersions("0.4.4"),
 }
 
-# Families probed only on a newer transformers than this package pins, at the
-# version the probes ran on. Older releases expand their audio tokens
-# differently, so they are refused rather than assumed compatible.
-# Redundant now gemma4's floor is 0.6.2 (every mlx-vlm there needs
-# transformers>=5.5.0), but kept for hand-assembled environments.
+# Families probed on a newer transformers than this package pins (5.5, per _AUDIO_MIN_TRANSFORMERS); older releases
+# expand audio tokens differently, so they are refused; redundant now that gemma4's floor is 0.6.2 (its mlx-vlm needs
+# transformers>=5.5.0), kept for hand-assembled environments.
 _AUDIO_MIN_TRANSFORMERS = {"gemma4": (5, 5), "gemma4_unified": (5, 5)}
 
 _AUDIO_CAST_HINT = (
@@ -7197,12 +6763,7 @@ _AUDIO_CAST_HINT = (
 
 
 def _audio_family_from_processor(processor):
-    """Identify the audio model family behind a processor.
-
-    Returns a lowercase family key drawn from the processor's defining module
-    (mlx-vlm processors live in ``mlx_vlm.models.<family>.processing_<family>``)
-    with a class-name fallback for wrappers.
-    """
+    """Lowercase audio family key from the processor's defining module (mlx_vlm.models.<family>.processing_<family>), with a class-name fallback for wrappers."""
     module = getattr(type(processor), "__module__", "") or ""
     for part in module.lower().split("."):
         if part.startswith("processing_"):
@@ -7240,9 +6801,8 @@ def _check_audio_transformers_floor(family):
         import transformers
 
         version = transformers.__version__
-        # PEP 440, not int(split(".")), which raised on "5.5rc1" or a v-prefixed
-        # tag. Compared whole, not by `.release`: that reads 5.5rc1 as 5.5, and
-        # PEP 440 sorts the prerelease below 5.5.0.
+        # Parse with PEP 440, not int(split(".")), which raised on "5.5rc1" or a v-prefixed tag; compare the whole
+        # version, not .release, which reads 5.5rc1 as 5.5 while PEP 440 sorts it below 5.5.0.
         found = _Version(version)
     except Exception:
         raise NotImplementedError(
@@ -7259,19 +6819,13 @@ def _check_audio_transformers_floor(family):
         )
 
 
-# Gemma 4's audio encoder subsamples time through two stride-2, kernel-3 conv
-# blocks (SubSampleConvProjection), each padding one frame on either side.
+# Gemma 4's audio encoder subsamples time through two stride-2, kernel-3 conv blocks (SubSampleConvProjection), each padding one frame on either side.
 _GEMMA4_AUDIO_SUBSAMPLE_BLOCKS = 2
 
 
 def _gemma4_audio_frame_mask(extractor, waveform, sampling_rate):
-    """The mel frames one clip fills, extracted on its own.
-
-    Alone is the only way to ask: mlx-vlm pads waveforms to the longest in the
-    batch before framing, and 0.4.4 derives the mask by subsampling a
-    sample-level one, so a shorter clip's valid count moves with whatever else
-    it is batched against.
-    """
+    """Mel frames one clip fills, extracted alone: mlx-vlm pads to the batch's longest clip and 0.4.4 subsamples a
+    sample-level mask, so batching would shift a clip's valid count."""
     features = extractor(
         [np.asarray(waveform, dtype=np.float32)],
         sampling_rate=sampling_rate,
@@ -7279,8 +6833,7 @@ def _gemma4_audio_frame_mask(extractor, waveform, sampling_rate):
     )
     if "input_features_mask" in features:
         return np.asarray(features["input_features_mask"])[0].astype(bool)
-    # An extractor that reports no mask leaves the encoder without one too, and
-    # Gemma 4 then treats every frame as real audio.
+    # An extractor that reports no mask leaves the encoder without one too, and Gemma 4 then treats every frame as real audio.
     return np.ones(
         int(np.asarray(features["input_features"]).shape[-2]), dtype=bool,
     )
@@ -7294,21 +6847,9 @@ def _gemma4_audio_encoder_positions(frames):
 
 
 def _gemma4_audio_placeholder_count(processor, waveform, sampling_rate):
-    """How many audio placeholders one Gemma 4 clip needs.
-
-    Must equal the number of positions the audio tower emits, or the merge has
-    nothing to put behind the surplus placeholder. mlx-vlm's processor instead
-    counts ``ceil(duration / 40 ms)``: 40 ms is only the nominal frame period,
-    so the count runs one over whenever a duration lands near a frame boundary
-    (3 of 10 real LibriSpeech utterances).
-
-    The frames are read off the installed extractor rather than recomputed from
-    a copy of its framing arithmetic, because that arithmetic changed inside the
-    supported span -- mlx-vlm added the reference's semicausal left-pad in
-    0.5.0, and a formula assuming it predicts a frame 0.4.4 never produces. The
-    extractor's own truncation applies for the same reason: the count has to
-    follow the audio the tower is actually given.
-    """
+    """Placeholder count per Gemma 4 clip, which must equal the audio tower's output positions; read off the installed
+    extractor since mlx-vlm 0.5.0 added a semicausal left-pad to framing, and mlx-vlm's own ceil(duration / 40 ms)
+    count can run one over."""
     extractor = getattr(processor, "feature_extractor", None)
     if extractor is None:
         raise NotImplementedError(
@@ -7322,24 +6863,16 @@ def _gemma4_audio_placeholder_count(processor, waveform, sampling_rate):
 
 
 def _trim_gemma4_audio_batch_mask(inputs, clips, processor):
-    """Mask each clip to the frames its own audio fills.
-
-    Batch padding otherwise leaves a shorter clip holding frames that are
-    entirely silence, which the encoder reports as valid positions and the model
-    trains on as speech. Restoring each clip's own mask also puts the valid
-    count back in step with the placeholder run written for it.
-    """
+    """Restores each clip's own frame mask so batch-padding silence is not counted as valid speech frames, keeping the valid count in step with its placeholder run."""
     extractor = getattr(processor, "feature_extractor", None)
     features = inputs.get("input_features")
     if extractor is None or features is None:
         return inputs
     mask = inputs.get("input_features_mask")
-    # An extractor that reports no mask leaves every padded frame looking real,
-    # so the batch needs one written for it rather than left out.
+    # An extractor that reports no mask leaves every padded frame looking real, so the batch needs one written for it rather than left out.
     shape = np.asarray(features).shape[:2]
     if mask is not None and np.asarray(mask).shape != shape:
-        # Nothing downstream compares these two, and a mask short of its
-        # features broadcasts over the rows it does not cover.
+        # Nothing downstream compares these two, and a mask short of its features broadcasts over the rows it does not cover.
         raise ValueError(
             f"Unsloth MLX: {type(processor).__name__} returned an audio mask "
             f"of shape {tuple(np.asarray(mask).shape)} for features of shape "
@@ -7347,12 +6880,10 @@ def _trim_gemma4_audio_batch_mask(inputs, clips, processor):
             f"be paired with their clips."
         )
     if shape[0] != len(clips):
-        # The feature-count check reports this; repairing part of the batch
-        # would hide it behind a plausible-looking mask.
+        # The feature-count check reports this; repairing part of the batch would hide it behind a plausible-looking mask.
         return inputs
     if len(clips) < 2:
-        # One clip is extracted the way it will be used, so nothing was padded
-        # against a neighbour and its mask already covers only its own audio.
+        # One clip is extracted the way it will be used, so nothing was padded against a neighbour and its mask already covers only its own audio.
         return inputs
     trimmed = np.zeros(shape, dtype=bool)
     default_rate = audio_extractor_sampling_rate(processor)
@@ -7378,9 +6909,8 @@ def _repair_gemma4_audio_processor(processor):
             f"be matched to the model's audio encoder. This mlx-vlm release is "
             f"not usable for Gemma 4 audio training."
         )
-    # Bound on the instance, not the class: a class-level patch would follow the
-    # processor type into every other use of it in this process. Unlike
-    # __call__, this one is reached through the instance dict.
+    # Bound on the instance, not the class: a class-level patch would follow the processor type into every other use in
+    # this process; unlike __call__, this one is reached via the instance dict.
     processor._compute_audio_num_tokens = partial(
         _gemma4_audio_placeholder_count, processor,
     )
@@ -7400,31 +6930,22 @@ def _audio_count_corrected(processor):
 
 
 def _audio_repaired_processor(processor):
-    """A processor counting audio placeholders the way its encoder does.
-
-    A copy, because the correction has a second half -- the batch mask -- that
-    can only be applied where the collated batch is held. Correcting the shared
-    processor in place would hand the count alone to anything else using it,
-    including a concurrent collation's own model call, and a corrected count
-    meeting an uncorrected mask misaligns a batch that lined up before.
-    Components are shared by reference, so the copy costs a dict.
-    """
+    """Returns a copy that counts audio placeholders as the encoder does, leaving the shared processor untouched; the
+    batch-mask half can only apply where the batch is held, and a corrected count with an uncorrected mask misaligns."""
     repair = _AUDIO_PROCESSOR_REPAIRS.get(
         _audio_family_from_processor(processor),
     )
     if repair is None:
         return processor
     corrected = copy.copy(processor)
-    # Only an instance-level hook is ours to put back; pinning an inherited one
-    # would leave a copy of it shadowing the class's own.
+    # Only an instance-level hook is ours to put back; pinning an inherited one would leave a copy shadowing the class's own.
     state = getattr(processor, "__dict__", None) or {}
     own_hook = state.get("_compute_audio_num_tokens", _AUDIO_NO_OWN_HOOK)
     repair(corrected)
     if _audio_count_corrected(processor):
-        # The copy shares state with the processor this run was handed, so the
-        # correction reached it too. Half of it -- the batch mask -- can only
-        # be applied to a batch collated here, and the count alone misaligns a
-        # batch that lined up before, so put back what was there and refuse.
+        # The copy shares state with the processor this run was handed, so the correction reached it too; half of it
+        # (the batch mask) can only apply to a batch collated here, and the count alone misaligns a batch that lined up
+        # before, so put back what was there and refuse.
         if own_hook is _AUDIO_NO_OWN_HOOK:
             del corrected._compute_audio_num_tokens
         else:
@@ -7441,8 +6962,7 @@ def _repair_audio_batch(inputs, clips, processor):
     repair = _AUDIO_BATCH_MASK_REPAIRS.get(
         _audio_family_from_processor(processor),
     )
-    # Only on the processor whose count was corrected: the two describe one
-    # contract, so applying either alone puts them back out of step.
+    # Only on the processor whose count was corrected: the two describe one contract, so applying either alone puts them out of step.
     if not clips or repair is None or not _audio_count_corrected(processor):
         return inputs
     return repair(inputs, clips, processor)
@@ -7500,13 +7020,8 @@ def audio_extractor_sampling_rate(processor):
 
 
 class AudioInputCapability(NamedTuple):
-    """Whether a loaded checkpoint can take audio input.
-
-    ``processor_ok`` and ``model_ok`` are the two halves, each ``True``,
-    ``False``, or ``None`` when it was not evaluated. ``capable`` requires both
-    to be ``True``, so a call without a model can refute a checkpoint but never
-    affirm one. ``reason`` names what was observed.
-    """
+    """Audio-input verdict: capable needs processor_ok and model_ok both True (None means not evaluated), so a
+    model-less call can refute a checkpoint but never confirm one; reason names the observation."""
 
     capable: bool
     reason: str
@@ -7514,30 +7029,23 @@ class AudioInputCapability(NamedTuple):
     model_ok: "bool | None"
 
 
-# Two pitches two octaves apart, long enough for any pinned extractor's
-# framing and short enough that four calls cost a moment.
+# Two pitches two octaves apart, long enough for any pinned extractor's framing and short enough that four calls cost a moment.
 _AUDIO_PROBE_TONES = (440.0, 1760.0)
 _AUDIO_PROBE_SECONDS = 0.2
 _AUDIO_PROBE_RATE = 16000
-# Marker-free by contract: which marker a processor needs is prompt-rendering
-# knowledge, so callers supply their own candidates through `texts`.
+# Marker-free by contract: which marker a processor needs is prompt-rendering knowledge, so callers supply their own candidates through texts.
 _AUDIO_PROBE_TEXT = "Describe the audio."
 
 
 def _audio_probe_tone(rate, hertz):
-    """A fresh mono tone. Fresh matters: a processor keying on buffer identity
-    rather than sample values must not see the same object twice."""
+    """Builds a fresh mono tone each call, so a processor keying on buffer identity rather than sample values never sees the same object twice."""
     count = max(int(rate * _AUDIO_PROBE_SECONDS), 1)
     time = np.arange(count, dtype=np.float32) / float(rate)
     return (0.25 * np.sin(2.0 * np.pi * hertz * time)).astype(np.float32)
 
 
 def _audio_probe_fingerprint(value):
-    """A content fingerprint of a processor's output.
-
-    Arrays enter by their bytes, so a field that echoes the call rather than the
-    audio compares equal and cannot be mistaken for evidence.
-    """
+    """Content fingerprint of processor output, with arrays keyed by their bytes, so a field that echoes the call rather than the audio cannot pass as evidence."""
     if isinstance(value, Mapping):
         return tuple(
             (str(key), _audio_probe_fingerprint(value[key]))
@@ -7549,8 +7057,7 @@ def _audio_probe_fingerprint(value):
         try:
             value = np.asarray(value)
         except Exception:
-            # Only the dtypes numpy has no equivalent for, where float32 is
-            # lossless. Casting everything would collapse large exact integers.
+            # Cast only the dtypes numpy has no equivalent for, where float32 is lossless; casting everything would collapse large exact integers.
             value = np.asarray(value.astype(mx.float32))
     if isinstance(value, np.ndarray):
         if value.dtype == object:
@@ -7566,8 +7073,7 @@ def _audio_probe_once(processor, text, kwarg, rate, hertz, held):
     # Held for the probe's lifetime so no later buffer can reuse its address.
     held.append(clip)
     payload = _format_vlm_audio_for_processor([[clip]], processor=processor)
-    # Answering "not capable" from a payload-shape refusal would report a
-    # working checkpoint as unusable.
+    # Answering "not capable" from a payload-shape refusal would report a working checkpoint as unusable.
     return _call_pairing_audio_on_refusal(
         lambda call_kwargs: processor(**call_kwargs),
         {"text": [text], kwarg: payload}, kwarg,
@@ -7576,16 +7082,8 @@ def _audio_probe_once(processor, text, kwarg, rate, hertz, held):
 
 
 def _audio_probe_processor(processor, texts):
-    """Whether audio content demonstrably reaches this processor's output.
-
-    Per candidate text: a discarded warm-up call absorbs one-time state, then
-    the same tone twice -- which must agree, or the processor cannot repeat
-    itself and its outputs carry no evidence -- then a second tone, which must
-    differ. Both tones share duration, dtype and construction, so sample values
-    are the only input property that separates them: a processor that sizes its
-    output from the clip length, echoes the call, or drops the audio entirely
-    produces identical outputs and is refused.
-    """
+    """Whether audio reaches the output: per candidate text, a warm-up call, then the same tone twice must agree, then a
+    second tone must differ; length-sized, echoing or audio-dropping processors are refused."""
     try:
         kwarg = _vlm_processor_audio_kwarg(processor)
     except Exception:
@@ -7625,13 +7123,9 @@ def _audio_probe_processor(processor, texts):
 
 
 def _model_carries_audio_modules(model):
-    """Whether the loaded model has audio machinery, by name.
-
-    A name walk rather than a fixed attribute list: the pinned families spell it
-    ``audio_tower``, ``embed_audio``, ``audio_projection_layer``,
-    ``audio_encoder`` and ``audio_projection``, and Phi-4 nests its pair under
-    an intermediate submodule.
-    """
+    """Detects audio modules by walking named_modules, not a fixed list, since pinned families name them audio_tower,
+    embed_audio, audio_projection_layer, audio_encoder or audio_projection, and Phi-4 nests its pair under an
+    intermediate submodule."""
     walk = getattr(model, "named_modules", None)
     if walk is None:
         return False
@@ -7648,24 +7142,9 @@ def _model_carries_audio_modules(model):
 
 
 def audio_input_capability(model, processor, texts=None):
-    """Whether this loaded checkpoint can take audio input.
-
-    Answered from observed behaviour, per checkpoint: audio content has to
-    change what the processor returns, and the model has to carry audio
-    modules. Two exports of one family can therefore disagree -- a processor
-    whose checkpoint omits the audio half of its preprocessor configuration
-    accepts the argument, drops the audio, and is refused here.
-
-    ``texts`` supplies candidate prompts, as one string or a sequence; a
-    processor that needs a marker only its own template emits will not answer
-    positively without one, and which marker that is belongs to whoever renders
-    prompts, not here. The built-in candidate carries none.
-
-    Never raises: anything unevaluable answers not capable, so this cannot fail
-    a model load. A positive says audio reaches the processor's output and the
-    model has somewhere to put it -- not that features merge correctly, which
-    the per-batch checks continue to guard.
-    """
+    """Observed behavior: audio must change processor output and the model must carry audio modules; texts gives
+    candidate prompts (some need a template-only marker); never raises and unevaluable answers not capable; a
+    positive does not prove features merge correctly."""
     processor_ok = model_ok = None
     try:
         if isinstance(texts, str):
@@ -7688,17 +7167,8 @@ def audio_input_capability(model, processor, texts=None):
 
 
 class _AudioClip(np.ndarray):
-    """A mono waveform that remembers the rate it was decoded at.
-
-    Processors normally take bare waveforms, but some want
-    ``(samples, sampling_rate)`` pairs and do not expose a rate of their own, so
-    the value verified during extraction has to travel with the samples.
-
-    The rate survives views, slicing and copies, which is all collation does to
-    a clip. It does not survive concatenation, stacking, ``np.asarray`` or
-    pickling; anything that grows such a step must pass the rate explicitly
-    rather than expect it to ride along.
-    """
+    """Mono ndarray carrying its decode sampling_rate through views, slices and copies only; concatenation, stacking,
+    np.asarray and pickling drop it, so those steps must pass the rate explicitly."""
 
     def __new__(cls, samples, sampling_rate):
         obj = np.asarray(samples, dtype=np.float32).view(cls)
@@ -7711,12 +7181,8 @@ class _AudioClip(np.ndarray):
 
 
 def _audio_samples_to_mono(samples, *, channel_first):
-    """Reduce decoded samples to a 1-D mono waveform.
-
-    ``channel_first`` records the source's documented layout rather than
-    guessing from extents: torchcodec returns ``(channels, samples)``, and a
-    short clip can legitimately have more channels than samples.
-    """
+    """Reduces decoded samples to 1-D mono; channel_first is the source's documented layout (torchcodec gives (channels,
+    samples)), since a short clip can have more channels than samples."""
     array = np.asarray(samples)
     if array.ndim == 1:
         return array
@@ -7731,18 +7197,9 @@ def _audio_samples_to_mono(samples, *, channel_first):
 
 
 def _normalize_audio_clip(clip, expected_rate):
-    """Coerce one dataset audio value into a mono waveform at ``expected_rate``.
-
-    Accepts decoded ``{"array", "sampling_rate"}`` mappings (datasets 3.x) and
-    decoder objects exposing ``get_all_samples()`` (datasets 4.x). Every form
-    must carry its own sampling rate: without one the waveform's duration is
-    unknowable, and feeding it to an extractor expecting another rate silently
-    changes the features (and, for families whose placeholder budget follows
-    clip duration, the number of placeholders too).
-    Undecoded values -- ``{"path", "bytes"}`` mappings and bare paths or URLs --
-    are refused, since decoding them needs an audio backend this package does
-    not depend on and casting the column solves it at the dataset layer.
-    """
+    """Coerces decoded audio (datasets 3.x {array, sampling_rate} mappings, 4.x get_all_samples() decoders) to mono at
+    expected_rate; each must carry its own rate or features silently change; undecoded path/bytes mappings and bare
+    paths or URLs are refused; cast the column to decode."""
     if isinstance(clip, (str, os.PathLike)):
         raise ValueError(
             f"Unsloth MLX: audio file paths are not decoded during training. "
@@ -7790,8 +7247,7 @@ def _normalize_audio_clip(clip, expected_rate):
 
 
 def _is_vlm_audio_part(part):
-    # Key-only `{"audio": clip}` too: the template renders a placeholder for
-    # it, so skipping it left the row a waveform short.
+    # Key-only {"audio": clip} too: the template renders a placeholder for it, so skipping it left the row a waveform short.
     return isinstance(part, dict) and (
         part.get("type") in _AUDIO_PART_TYPES
         or any(key in part for key in _AUDIO_PART_TYPES)
@@ -7825,16 +7281,11 @@ def _vlm_audio_part_state(messages):
 
 
 def _raw_row_has_audio(item):
-    """Best-effort audio detection on an unvalidated row.
-
-    Runs before a formatting function rewrites the row, so the family gate sees
-    the data the user actually supplied. Shapes it cannot parse are reported as
-    audio-free and left to the normal collation errors.
-    """
+    """Best-effort audio detection on the raw row, before any formatter rewrites it; unparseable shapes count as
+    audio-free and fall through to the normal collation errors."""
     if isinstance(item, list):
-        # A bare message list is a supported row shape -- _collate_vlm_batch
-        # normalizes one -- so it has to be scanned here too, or a formatter
-        # that drops its clips leaves the gate nothing to refuse.
+        # A bare message list is a supported row shape (_collate_vlm_batch normalizes one), so it must be scanned here
+        # too, or a formatter that drops its clips leaves the gate nothing to refuse.
         try:
             return any(_vlm_audio_part_state(_normalize_vlm_messages(item)))
         except Exception:
@@ -7842,10 +7293,8 @@ def _raw_row_has_audio(item):
     if not isinstance(item, dict):
         return False
     if "role" in item and "content" in item:
-        # A single message is a supported row shape too -- `_normalize_mlx_
-        # messages` wraps one as `[item]`. Scanned here because the lookups
-        # below read a row, and `_select_vlm_messages_or_raw` hands such a row
-        # straight back, where the identity guard drops it unscanned.
+        # A single message is a valid row (wrapped as [item] by _normalize_mlx_messages); scanned here because
+        # _select_vlm_messages_or_raw returns it raw, skipping the identity guard.
         try:
             if any(_vlm_audio_part_state(_normalize_vlm_messages(item))):
                 return True
@@ -7869,11 +7318,8 @@ def _raw_row_has_audio(item):
 
 
 def _format_vlm_row_gating_audio(row, formatting_func, processor):
-    """Format one row, gating audio a formatter would otherwise hide.
-
-    Callers that format here go on to collate with no formatter, so the
-    collation gate would have nothing left to refuse.
-    """
+    """Formats one row and gates audio before a formatter can hide it, since the collation that follows runs without a
+    formatter and its gate would have nothing to refuse."""
     _validate_mlx_image_input(processor, _row_has_images(row))
     if formatting_func is not None:
         if _raw_row_has_audio(row):
@@ -7884,12 +7330,8 @@ def _format_vlm_row_gating_audio(row, formatting_func, processor):
 
 
 def _extract_vlm_audio(item, messages, processor):
-    """Collect this row's audio clips as mono waveforms at the model's rate.
-
-    Sources, in order: embedded message audio parts, then top-level ``audio`` /
-    ``audios`` columns. Rows carrying audio are gated to verified families
-    before any decoding work happens.
-    """
+    """Collects a row's clips as mono waveforms at the model rate, from message audio parts then top-level audio/audios
+    columns; rows with audio pass the family gate before any decoding."""
     bare_placeholders, payloads = _vlm_audio_part_state(messages)
     column = []
     if isinstance(item, dict):
@@ -7934,21 +7376,14 @@ _AUDIO_FEATURE_PAYLOAD_KEYS = (
     "input_features", "input_audio_embeds", "audio_features", "sound_clips",
 )
 
-# Some image processors keep one tensor per image when aspect-ratio-dependent
-# preprocessing produces different spatial shapes. Their vision tower consumes
-# that ragged list directly; collapsing to value[0] silently drops later images.
+# Some image processors keep one tensor per image when aspect-ratio preprocessing gives different shapes; the vision
+# tower consumes that ragged list, so collapsing to value[0] silently drops later images.
 _VLM_RAGGED_MEDIA_PAYLOAD_KEYS = (*_AUDIO_FEATURE_PAYLOAD_KEYS, "pixel_values")
 
 
 def _assert_audio_features_present(inputs, expected, processor):
-    """Fail when a row carried clips but the processor returned no audio tensors.
-
-    A processor that accepts ``audio=`` and silently discards it would otherwise
-    stage a placeholder run with nothing behind it, which trains the model on
-    text while the placeholders resolve to whatever the merge invents. Masks and
-    size vectors do not count: only the feature payload itself does, and it must
-    carry one entry per clip so features and placeholder runs stay paired.
-    """
+    """Fails if clips were passed but no feature payload came back, which would train on placeholders with nothing
+    behind them; masks and size vectors do not count, and payloads need one entry per clip."""
     if not expected or not isinstance(inputs, Mapping):
         return
     for key in _AUDIO_FEATURE_PAYLOAD_KEYS:
@@ -7981,13 +7416,8 @@ def _assert_audio_features_present(inputs, expected, processor):
 
 
 def _image_bounds_per_row(inputs):
-    """Per-row image placeholder spans, when the processor states them.
-
-    MiniCPM-V and MiniCPM-o report ``image_bound`` as absolute columns into the
-    layout they padded, offsetting it by each row's leading pad count. The
-    values are coordinates like ``audio_bounds``, not labels that travel with a
-    row, so a repair that moves the tokens invalidates them the same way.
-    """
+    """MiniCPM-V and MiniCPM-o image_bound values are absolute columns offset by each row's leading pads, so any repair
+    that moves tokens invalidates them, as it does audio_bounds."""
     bounds = inputs.get("image_bound") if isinstance(inputs, Mapping) else None
     if bounds is None:
         return None
@@ -7999,16 +7429,8 @@ def _image_bounds_per_row(inputs):
 
 
 def _audio_bounds_per_row(inputs):
-    """Per-row ``(start, end)`` audio spans, when the processor states them.
-
-    Counting runs of a soft token only verifies alignment when that token means
-    "audio". MiniCPM-o repeats ``<unk>`` between its delimiters, which a real
-    unknown word in the transcript is indistinguishable from, so its runs carry
-    no alignment evidence at all. Processors in that shape report the spans
-    themselves, which is a better starting point than counting runs, though not
-    a trustworthy one: see ``_assert_audio_bounds_intact`` for how a reported
-    span can still be wrong.
-    """
+    """Per-row (start, end) audio spans as stated by the processor; MiniCPM-o repeats <unk> so run counting carries no
+    evidence there, but reported spans can still be wrong (see _assert_audio_bounds_intact)."""
     bounds = inputs.get("audio_bounds") if isinstance(inputs, Mapping) else None
     if bounds is None:
         return None
@@ -8020,20 +7442,14 @@ def _audio_bounds_per_row(inputs):
 
 
 def _audio_span_positions_np(inputs, shape):
-    """Positions covered by stated audio spans, or None when there are none.
-
-    These hold placeholder tokens, never text to predict, and they cannot be
-    found by token id: the marker is not always an audio-specific token --
-    MiniCPM-o repeats ``<unk>`` -- so an id-based rule either misses the run or
-    masks real unknown words along with it.
-    """
+    """Positions inside stated audio spans (placeholders, never text to predict), found by span not token id since
+    MiniCPM-o's <unk> marker is also a real unknown word; None if no spans."""
     bounds = _audio_bounds_per_row(inputs)
     if not bounds or len(shape) != 2:
         return None
     rows, width = int(shape[0]), int(shape[1])
     positions = np.zeros((rows, width), dtype=bool)
-    # Every caller runs after the collation check, which has already refused
-    # spans that fall outside their row.
+    # Callers run after the collation check, which has already refused spans that fall outside their row.
     for row, spans in enumerate(bounds[:rows]):
         for start, end in spans:
             positions[row, int(start):int(end)] = True
@@ -8042,13 +7458,8 @@ def _audio_span_positions_np(inputs, shape):
 
 def _assert_audio_bounds_intact(rows, ids, attention_mask, audio_counts,
                                 max_seq_length, processor):
-    """Reject rows whose stated audio spans cannot be trusted.
-
-    Read off the processor's own spans: one span per clip, each covering at
-    least one position inside the row's real content so truncation cannot have
-    clipped it, and each naming a placeholder run rather than ordinary text --
-    one token repeated, the same token in every span of the batch.
-    """
+    """Rejects rows whose stated spans cannot be trusted: one span per clip, each covering real content so truncation
+    cannot have clipped it, each naming a repeated token common to every span in the batch."""
     ids_np = np.asarray(ids)
     if ids_np.ndim == 1:
         ids_np = ids_np.reshape(1, -1)
@@ -8075,11 +7486,9 @@ def _assert_audio_bounds_intact(rows, ids, attention_mask, audio_counts,
             width if mask_np is None
             else int(mask_np[index].astype(bool).sum())
         )
-        # Audio-bearing rows only, as in the run path: a stated-span family
-        # reports bounds for every row, so an audio-free one would be capped too.
+        # Check only audio-bearing rows, as the run path does: a stated-span family reports bounds for every row, so an audio-free one would be capped too.
         if expected and max_seq_length and attended > int(max_seq_length):
-            # Padding is not the row's own length, so this counts what the model
-            # attends -- the same quantity the run check caps.
+            # Padding is not the row's own length, so this counts the tokens the model attends, the same quantity the run check caps.
             raise ValueError(
                 f"Unsloth MLX: row {index} is {attended} tokens but "
                 f"max_seq_length={max_seq_length}; this processor did not apply "
@@ -8106,21 +7515,16 @@ def _assert_audio_bounds_intact(rows, ids, attention_mask, audio_counts,
                     f"{end}) outside its {width} position(s), so the span names "
                     f"tokens the row does not have."
                 )
-            # Attended positions, not their count: a left-padded row holds its
-            # content at the top of the range, so comparing against a total
-            # rejects spans that are perfectly placed.
+            # Check attended positions rather than a count: a left-padded row holds content at the top of the range, so
+            # comparing against a total rejects well-placed spans.
             if mask_np is not None and not mask_np[index][start:end].astype(bool).all():
                 raise ValueError(
                     f"Unsloth MLX: row {index} has an audio span ({start}, "
                     f"{end}) covering padding, so its clip is not aligned with "
                     f"the tokens the model attends."
                 )
-            # These processors report spans by pairing the n-th opening
-            # delimiter with the n-th closing one, so a delimiter that the
-            # rendered text carries of its own shifts every later pair onto
-            # ordinary tokens. The span still counts, fits and attends, and only
-            # the run it names gives it away: a placeholder run is one token
-            # repeated, and the same token in every span.
+            # These processors pair the n-th opening and n-th closing delimiter, so a delimiter in the rendered text
+            # shifts later spans onto ordinary tokens; only a run check (one repeated marker token) reveals it.
             run = np.unique(ids_np[index][start:end])
             if run.size != 1 or (marker is not None and run[0] != marker):
                 raise ValueError(
@@ -8167,8 +7571,7 @@ def _audio_clip_limit_samples(processor):
 
 
 def _split_audio_past_the_window(messages, clips, processor):
-    """Split clips past the processor's limit into near-equal pieces (none too
-    short to frame), one placeholder each. Returns its arguments unchanged otherwise."""
+    """Splits clips past the processor's limit into near-equal pieces, none too short to frame, one placeholder each; otherwise returns its arguments unchanged."""
     if not clips:
         return messages, clips
     limit = _audio_clip_limit_samples(processor)
@@ -8220,18 +7623,8 @@ def _audio_delimiter_strings(processor):
 
 
 def _assert_text_carries_no_audio_delimiters(texts, clips, processor):
-    """Reject audio rows whose text already contains the run's delimiters.
-
-    A processor that reports spans finds them by pairing the n-th opening
-    delimiter with the n-th closing one, within a row. A delimiter the text
-    brought itself is indistinguishable from a generated one, so it shifts the
-    pairing onto ordinary tokens, and truncation can drop the generated span and
-    leave the foreign one standing in for it. Nothing downstream can tell the
-    two apart -- the foreign span attends, sits inside the content, holds a
-    repeated marker, and can be any length, including exactly the right one --
-    so the text is refused before the processor ever expands it. The pairing is
-    per row, so a row carrying no clip has no pairing to disturb.
-    """
+    """Refuses audio rows whose text already holds the run delimiters before the processor expands it; spans pair the
+    n-th open and close delimiter per row, so text-supplied ones shift the pairing."""
     delimiters = _audio_delimiter_strings(processor)
     if not delimiters:
         return
@@ -8249,20 +7642,9 @@ def _assert_text_carries_no_audio_delimiters(texts, clips, processor):
 
 
 def _assert_audio_clips_fit_the_extractor(clips, processor):
-    """Reject clips the audio feature extractor would truncate.
-
-    These processors size the placeholder run from the whole waveform while
-    their extractor keeps a fixed window, so a longer clip asks for positions
-    whose audio the model never receives: the merge stops at the shorter side
-    and the tail keeps ordinary text embeddings, which no count, range or run
-    check can see.
-
-    Sizing the run from the waveform also leaves the count one or two above the
-    embeddings on ordinary clips, because the two round their framing
-    differently. That is upstream's own arithmetic, it happens with the whole
-    clip present, and inference merges the same way, so it is not what this
-    rejects -- only a clip whose audio is actually cut.
-    """
+    """Rejects clips longer than the extractor's fixed window: the run is sized from the whole waveform, so positions
+    for audio the model never receives keep text embeddings; whole-clip counts one or two above the embeddings are
+    upstream rounding and allowed."""
     window = _extractor_window_samples(processor)
     if not window or not clips:
         return
@@ -8285,9 +7667,8 @@ _reported_cut_audio = set()
 
 
 def _assert_audio_runs_cover_their_clips(clips, processor):
-    """Refuse a long clip whose surplus frames would land on the next clip's
-    positions (Gemma 4 unified caps the run, keeps every frame); warn once on a
-    plain cut. Message rows are split before this."""
+    """Refuses a long clip whose surplus frames would spill onto the next clip's positions (Gemma 4 unified caps the run
+    but keeps every frame); a plain cut only warns once; message rows are split first."""
     if not any(clips or ()):
         return
     advice = "Split the clip, or give the row as messages."
@@ -8323,25 +7704,9 @@ def _assert_audio_runs_cover_their_clips(clips, processor):
 
 def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
                               truncated=True, clips=None):
-    """Reject rows whose audio placeholder runs did not survive tokenization.
-
-    The processor expands each clip into a run of soft tokens whose length the
-    model matches against its encoder output, so a run that vanished misaligns
-    audio features against text positions. Two conditions are enforced per row:
-    one surviving placeholder run per clip, and a length within
-    ``max_seq_length`` (some processors divert the truncation arguments to their
-    audio feature extractor and leave the text over the cap).
-
-    A run that was *shortened* rather than dropped needs the family's
-    post-subsampling token budget. Families that state a fixed count per clip
-    before the model runs have each of their runs checked against it here.
-
-    Processors that state their spans take a different route, since their run
-    carries no identifying token. Those rows are held to the conditions in
-    ``_assert_audio_bounds_intact`` instead of the two above, and their clips
-    may not be longer than the window the feature extractor keeps. On the run
-    path a clip may not be longer than a cap on its run that its audio ignores.
-    """
+    """Rejects rows whose audio runs were dropped or shortened: one run per clip, length within max_seq_length (some
+    processors divert truncation to the extractor), fixed counts checked; span processors defer to
+    _assert_audio_bounds_intact; run-path clips may not exceed the cap their audio ignores."""
     ids = inputs.get("input_ids") if isinstance(inputs, Mapping) else None
     if ids is None:
         if not any(audio_counts):
@@ -8352,8 +7717,7 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
         )
     bounds = _audio_bounds_per_row(inputs)
     if bounds is not None:
-        # Stated spans beat inferred ones, so they are checked instead of the
-        # runs rather than alongside them.
+        # Stated spans take precedence over inferred runs, so when bounds exist they are checked instead of the runs rather than alongside them.
         total_runs = _assert_audio_bounds_intact(
             bounds, ids, inputs.get("attention_mask"), audio_counts,
             max_seq_length if truncated else None, processor,
@@ -8375,18 +7739,14 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
         max_seq_length if truncated else None,
         budget=_audio_fixed_budget(processor),
     )
-    # Placeholders with nothing behind them misalign the sequence however they
-    # got there -- e.g. a formatter that kept the text but dropped the clip.
+    # Placeholders without a clip misalign the sequence however they got there, e.g. a formatter that kept the text but dropped the clip.
     _assert_audio_features_present(inputs, total_runs, processor)
     _assert_audio_runs_cover_their_clips(clips, processor)
 
 
 def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
                                   max_seq_length, budget=None):
-    """Run-integrity check over materialized ids (see the caller's contract).
-
-    Returns the total number of surviving placeholder runs in the batch.
-    """
+    """Returns the total of surviving placeholder runs over materialized ids; the caller's run-integrity contract defines what counts as intact."""
     if not soft_ids:
         return 0
     total_runs = 0
@@ -8425,10 +7785,8 @@ def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
         starts = int(begins.sum())
         total_runs += starts
         if expected_clips and budget:
-            # Fixed-budget families merge exactly `budget` per clip, so every
-            # run must be that long. Checking the total instead lets a short
-            # run hide behind a long one and pairs a clip with the wrong
-            # positions.
+            # Fixed-budget families merge exactly `budget` per clip, so every run must be that length; checking only the
+            # total lets a short run hide behind a long one and misalign clips.
             ends = is_soft & ~np.concatenate((is_soft[1:], [False]))
             lengths = (np.flatnonzero(ends) - np.flatnonzero(begins) + 1).tolist()
             if any(int(length) != budget for length in lengths):
@@ -8446,16 +7804,13 @@ def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
                 f"tokenization. Every clip needs its own placeholder in the "
                 f"rendered text, and none may be dropped by truncation."
             )
-        # Only rows that carry audio, as the two checks above are: the cap is
-        # here so a placeholder run is not cut unnoticed, and an audio-free row
-        # has none to cut. An omni checkpoint resolves soft ids whether or not
-        # the run uses audio, so without this a plain text or image batch wider
-        # than the cap is refused -- which the shape planner states is normal.
+        # Audio rows only: the cap keeps a placeholder run from being cut unnoticed; omni checkpoints resolve soft ids
+        # without audio, so plain text or image batches over the cap would be refused, though the shape planner states
+        # such widths are normal.
         if max_seq_length is None or not expected_clips:
             continue
         if int(valid.sum()) > int(max_seq_length):
-            # Some processors divert the truncation kwargs to their audio
-            # extractor, leaving the text over the cap.
+            # Some processors divert truncation kwargs to their audio extractor, leaving the text over the cap.
             raise ValueError(
                 f"Unsloth MLX: row {index} is {int(valid.sum())} tokens but "
                 f"max_seq_length={max_seq_length}; this processor did not apply "
@@ -8469,22 +7824,14 @@ def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
 def _vlm_processor_prefers_nested_audio(processor):
     cls = processor.__class__
     marker = f"{getattr(cls, '__module__', '')}.{getattr(cls, '__name__', '')}".lower()
-    # A flat list leaves these processors to guess which row owns which clip:
-    # they count audio markers in the rendered text, which a chat template need
-    # not emit, and hand every clip to row 0 when the count comes up short.
+    # A flat list makes these processors guess row ownership: they count audio markers in the rendered text, which a
+    # chat template need not emit, and hand all clips to row 0 on a short count.
     return any(name in marker for name in ("minicpmo",))
 
 
 def _call_pairing_audio_on_refusal(invoke, kwargs, audio_kwarg, to_pairs):
-    """Call a processor, retrying once as ``(samples, rate)`` pairs.
-
-    Some processors take their audio as pairs and refuse a bare waveform by
-    failing to unpack it. The shape is not discoverable in advance, so it is
-    corrected from the refusal. A processor that refuses the corrected payload
-    too reports its own first refusal rather than the second one; a failure
-    while building the pairs is raised as itself, since it says nothing about
-    what the processor wanted.
-    """
+    """Retries once as (samples, rate) pairs after a bare-waveform refusal, since the shape is not discoverable; a
+    second refusal surfaces the first, and pair-building errors raise as themselves."""
     try:
         return invoke(kwargs)
     except ValueError as error:
@@ -8500,31 +7847,15 @@ def _call_pairing_audio_on_refusal(invoke, kwargs, audio_kwarg, to_pairs):
 
 
 def _mlx_vlm_audio_rate(processor):
-    """The rate mlx-vlm assumes this processor's audio is at.
-
-    It resamples a decoded file to ``feature_extractor.sampling_rate`` and
-    falls back to 16 kHz; an array it forwards untouched, so this is the rate
-    the samples are expected to be at rather than one it enforced. Reading the
-    rate from anywhere else risks labelling them with a rate the rest of
-    mlx-vlm never assumed. An extractor that states ``None`` takes the same
-    fallback, since a pair has to carry a number.
-    """
+    """The rate mlx-vlm assumes for audio it forwards untouched (feature_extractor.sampling_rate, else 16000), so pairs
+    carry the rate the rest of mlx-vlm assumes rather than an enforced one."""
     extractor = getattr(processor, "feature_extractor", None)
     return getattr(extractor, "sampling_rate", None) or 16000
 
 
 def _audio_payload_as_pairs(clips, processor):
-    """The ``(samples, rate)`` form processors that reject bare waveforms want.
-
-    A clip carries the rate it was decoded at; the processor's own extractor
-    rate stands in for anything that does not.
-
-    The nested payload a processor like MiniCPM-o is handed keeps its shape: a
-    row is a list of clips, not a clip, so pairing it whole would fuse a row
-    into one 2-D "clip" carrying no rate -- or raise out of numpy when the
-    row's clips differ in length, which reports a payload the processor never
-    saw. Rows are paired clip by clip instead.
-    """
+    """Pairs each clip as (samples, rate) using its decode rate or the extractor rate; nested rows are paired clip by
+    clip, since pairing a whole row would fuse it or fail inside numpy."""
     default_rate = audio_extractor_sampling_rate(processor)
 
     def _pair(clip):
@@ -8623,16 +7954,12 @@ def _format_vlm_images_for_processor(all_images, processor=None, image_layout=No
     return _flatten_vlm_images(all_images)
 
 
-# Private key used to pass raw (pre-int32-narrowing) input_ids through
-# the VLM batch dict to labels-free / response-mask paths. Stripped from
-# model forward kwargs so the backbone never sees it.
+# Private key carrying raw (pre-int32-narrowing) input_ids to labels-free and response-mask paths; stripped from model
+# forward kwargs so the backbone never sees it.
 
 
-# One array per row, and rows hold different clip and image counts. Stacking
-# them raises, and the generic fallback below then keeps only the first row --
-# which the model indexes per row, so every later row reads row 0's coordinates
-# instead of its own. Converted row by row instead, so the ragged shape survives
-# and the batch still describes itself to the planner.
+# Per-row media keys convert row by row because rows hold different clip and image counts; stacking raises, the fallback
+# keeps only row 0's coordinates, and ragged shapes survive for the planner.
 _VLM_PER_ROW_MEDIA_KEYS = ("audio_bounds", "image_bound", "tgt_sizes")
 
 
@@ -8643,8 +7970,7 @@ def _to_mx_vlm_batch(inputs):
     batch = {}
     for key, value in inputs.items():
         if key == "sound_clips" and isinstance(value, (list, tuple)):
-            # Nemotron's outer list is the clip axis. Stacking equal lengths
-            # turns it into one 2-D clip, which its extractor downmixes.
+            # Nemotron's outer list is the clip axis; stacking equal-length clips would turn it into one 2-D clip, which its extractor downmixes.
             batch[key] = [
                 x if isinstance(x, mx.array) else mx.array(np.asarray(x))
                 for x in value
@@ -8665,10 +7991,8 @@ def _to_mx_vlm_batch(inputs):
                 ])
             except Exception:
                 if key in _VLM_RAGGED_MEDIA_PAYLOAD_KEYS and len(value) > 1:
-                    # Unequal media shapes do not stack, and dropping to value[0]
-                    # would leave one payload behind ids, placeholder runs and
-                    # labels for all of them. Keep every entry so model-specific
-                    # eager paths can apply their own ragged handling.
+                    # Unequal media shapes do not stack; dropping to value[0] would leave one payload behind the ids,
+                    # placeholder runs and labels of all of them, so every entry is kept.
                     batch[key] = [
                         x if isinstance(x, mx.array) else mx.array(np.asarray(x))
                         for x in value
@@ -8685,10 +8009,8 @@ def _to_mx_vlm_batch(inputs):
             batch[key] = batch[key].reshape((1, -1))
 
     if "input_ids" in batch:
-        # Preserve raw input_ids under a private key BEFORE the int32 narrow
-        # so labels-free / response-mask paths can derive labels from the
-        # original processor output (wide invalid ids like uint32(2**32-100)
-        # would otherwise wrap to -100 and be treated as ignore_index).
+        # Keep raw input_ids under a private key before the int32 narrow, so labels-free paths use original ids; wide
+        # invalid ids like uint32(2**32-100) would wrap to -100 (ignore_index).
         if "labels" not in batch:
             batch[_RAW_INPUT_IDS_FOR_LABELS] = _normalize_cce_label_dtype(
                 batch["input_ids"]
@@ -8696,9 +8018,8 @@ def _to_mx_vlm_batch(inputs):
         batch["input_ids"] = batch["input_ids"].astype(mx.int32)
     if "attention_mask" in batch:
         batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
-    # Do NOT narrow labels to int32: runtime CCE validates the original
-    # dtype before its own narrow. Unsigned dtypes still need widening to
-    # int64 so the masking helpers can mx.where the signed -100 sentinel.
+    # Do not narrow labels to int32: runtime CCE validates the original dtype; unsigned label dtypes still widen to
+    # int64 so mx.where can apply the signed -100 sentinel.
     if "labels" in batch:
         batch["labels"] = _normalize_cce_label_dtype(batch["labels"])
     if "token_type_ids" in batch:
@@ -8821,11 +8142,7 @@ _VLM_MM_TOKEN_TYPE_PROCESSOR_MARKERS = (
 
 
 def _effective_processor_call_owner(cls):
-    """Return the first MRO class that supplies the active processor call.
-
-    Keeping this lookup separate makes the distinction between inherited
-    behavior and a subclass override explicit at the policy boundary.
-    """
+    """First MRO class supplying the active __call__, so inherited behavior and a subclass override are told apart at the policy boundary."""
 
     return next(
         (
@@ -8838,31 +8155,18 @@ def _effective_processor_call_owner(cls):
 
 
 def _processor_class_owns_gemma3n_token_types(cls):
-    """Recognize the effective Gemma3n processor call across relocation.
-
-    A subclass can live in a custom namespace, but an override can also replace
-    the inherited call contract. Classify the first MRO class that actually
-    supplies ``__call__`` so both cases keep their own behavior.
-    """
+    """Recognizes Gemma3n by the first MRO class supplying __call__, so a subclass in a custom namespace or an overridden call keeps its own behavior."""
 
     owner = _effective_processor_call_owner(cls)
-    # Class names can be regenerated or reused by custom processors. Only the
-    # module that supplies the effective call identifies the installed owner.
+    # Class names can be regenerated or reused by custom processors; only the module supplying the effective call identifies the installed owner.
     module = str(getattr(owner, "__module__", "")).lower()
-    # why: remote-code and single-file loads land the marker as a suffix
-    # (`...selfcontained.processing_gemma3n`), never as its own path component.
+    # Remote-code and single-file loads put the marker in a module suffix (`...selfcontained.processing_gemma3n`), never as its own path component.
     return "gemma3n" in module
 
 
 def _vlm_processor_requests_mm_token_type_ids(processor):
-    """Return whether the installed processor owns the multimodal type flag.
-
-    Gemma3n builds token types itself and forwards unknown kwargs to its
-    tokenizer. Follow the effective call owner for both negative and positive
-    classification so relocated inheritance preserves the installed behavior,
-    while a subclass override retains its own request contract.
-    Concrete wrapper names never authorize or suppress the processor flag.
-    """
+    """Whether the processor owns the multimodal token-type flag, judged by the effective __call__ owner (Gemma3n builds
+    token types itself); wrapper class names never grant or suppress it."""
 
     cls = processor.__class__
     owner = _effective_processor_call_owner(cls)
@@ -8877,8 +8181,7 @@ def _vlm_processor_requests_mm_token_type_ids(processor):
 
 
 def _mlx_vlm_process_inputs_adapter(original):
-    """Negotiate mlx-vlm's processor boundary: the Transformers PyTorch-only
-    output contract, and processors that take audio as (samples, rate) pairs."""
+    """Adapts mlx-vlm's processor boundary for Transformers' PyTorch-only output contract and for processors that take audio as (samples, rate) pairs."""
 
     if getattr(original, "_unsloth_pytorch_processor_output", False):
         return original
@@ -8904,10 +8207,8 @@ def _mlx_vlm_process_inputs_adapter(original):
             return_tensors=return_tensors,
             **kwargs,
         )
-        # mlx-vlm sends bare waveforms and refuses tuples, so a processor
-        # wanting pairs cannot be reached from the caller at all. The rate it
-        # assumes is read only when reshaping, since reaching for it on every
-        # request would touch attributes a non-audio processor need not have.
+        # mlx-vlm sends bare waveforms and refuses tuples, so pair-wanting processors cannot be reached; the audio rate
+        # is read only when reshaping, since non-audio processors may lack it.
         def _as_pairs(clips):
             rate = _mlx_vlm_audio_rate(processor)
             return [(np.asarray(clip), rate) for clip in clips]
@@ -8922,15 +8223,8 @@ def _mlx_vlm_process_inputs_adapter(original):
 
 
 def _drop_unsupported_processor_kwargs(processor, kwargs):
-    """Remove keyword arguments this processor's ``__call__`` does not take.
-
-    Processors disagree on which collation keywords they accept, and discovering
-    that by exception does not compose: a processor rejecting two of them raises
-    again inside the first retry. Filtering up front handles any number of them,
-    and a processor whose signature absorbs ``**kwargs`` keeps everything (the
-    per-keyword retries below still cover a signature that promises more than it
-    honours).
-    """
+    """Filters collation kwargs up front by __call__'s signature, since per-keyword retries fail again when a second
+    keyword is also rejected; a **kwargs signature keeps everything."""
     try:
         params = inspect.signature(processor.__call__).parameters
     except (TypeError, ValueError):
@@ -9121,35 +8415,16 @@ def _processor_vlm_inputs(
     if audio is not None:
         audio_kwarg = _vlm_processor_audio_kwarg(processor)
         base_kwargs[audio_kwarg] = audio
-        # Everything below this line collates through the corrected copy; the
-        # caller's processor stays as mlx-vlm made it.
+        # Everything below collates through the corrected copy of the processor; the caller's processor stays as mlx-vlm made it.
         processor = _audio_repaired_processor(processor)
     if truncation:
         base_kwargs["truncation"] = True
         if max_seq_length is not None:
             base_kwargs["max_length"] = max_seq_length
         if audio is not None:
-            # `max_length` is a token budget, but transformers' `_merge_kwargs`
-            # fans a flat keyword out to *every* modality that declares it, and
-            # `AudioKwargs` declares both `max_length` and `truncation`. So the
-            # token cap reaches the audio feature extractor, which reads the
-            # same number as a *sample* budget. Gemma 3n shows it plainly: a
-            # one-second 16 kHz clip under `max_length=512` comes back as
-            # `input_features` of shape (1, 0, 128) -- the waveform cut to 512
-            # samples, 0.032s, which frames to nothing -- while `input_ids` is
-            # untouched. Every clip longer than `max_seq_length` samples loses
-            # its audio that way, which at any realistic cap is every clip.
-            #
-            # An empty `audio_kwargs` shields the audio modality alone: a
-            # modality that appears in kwargs stops reading flat keywords, so
-            # the extractor no longer sees the cap while the text path keeps
-            # every flat keyword it has always had.
-            #
-            # Scoping the *text* side instead would take the same switch the
-            # other way and silently drop `padding`, `add_special_tokens` and
-            # `return_tensors` for the text modality, which returns ragged
-            # lists and a doubled BOS. The shield has to go on the side that
-            # should not be reading these keywords.
+            # transformers' _merge_kwargs fans flat max_length to each modality that declares it, so audio reads the
+            # token cap as a sample budget (Gemma 3n returns empty input_features); an empty audio_kwargs shields audio
+            # alone, as scoping text would drop padding, add_special_tokens and return_tensors.
             base_kwargs.update(_drop_unsupported_processor_kwargs(
                 processor, {"audio_kwargs": {}},
             ))
@@ -9191,10 +8466,8 @@ def _processor_vlm_inputs(
                     and "unexpected keyword argument" in str(exc)
                     and "audio_kwargs" in proc_kwargs
                 ):
-                    # Gemma 4 handles audio itself, then forwards remaining
-                    # kwargs to its tokenizer. It therefore rejects the
-                    # modality shield used by ProcessorMixin-based families;
-                    # its feature extractor never sees the flat text cap.
+                    # Gemma 4 handles audio itself and forwards leftover kwargs to its tokenizer, so it rejects the
+                    # audio_kwargs shield; its feature extractor never sees the flat text cap.
                     proc_kwargs.pop("audio_kwargs")
                     try:
                         return _call_vlm_processor(processor, (), proc_kwargs)
@@ -9275,14 +8548,11 @@ def _as_numpy_vlm_field(inputs, key):
     return arr
 
 
-# Text-width-aligned arrays a processor authors for itself, beyond the ones the
-# pipeline owns in `_VLM_WIDTH_PADDABLE_KEYS`. The deepseek pair place image
-# embeddings at these indices.
+# Text-width-aligned arrays a processor authors itself, beyond `_VLM_WIDTH_PADDABLE_KEYS`; the deepseek pair place image embeddings at these indices.
 _VLM_PROCESSOR_TOKEN_ALIGNED_KEYS = ("images_seq_mask",)
 
-# Of those, the ones the compaction may move: inert at zero, which is what the
-# gather writes into a vacated slot. That drops the label carriers, which the
-# pipeline rebuilds from the repaired ids anyway; ids and mask move on their own.
+# Compaction may move only keys inert at zero, since the gather writes zero into vacated slots; label carriers are
+# dropped and rebuilt from repaired ids, while ids and mask move on their own.
 _VLM_RELOCATABLE_SIDECAR_KEYS = tuple(
     key for key, inert in _VLM_WIDTH_PADDABLE_KEYS.items()
     if inert == 0 and key != "attention_mask"
@@ -9310,13 +8580,8 @@ def _vlm_token_aligned_sidecars(inputs, ids_shape):
 
 
 def _right_pad_vlm_rows(inputs, processor):
-    """Compact each row's real tokens to the front.
-
-    Causality is all that excludes the pads once the mask is withheld, and it
-    excludes a trailing pad, not a leading one. deepseek_vl_v2 and the falcon
-    pair left-pad multimodal rows whatever side they are asked for, so the
-    layout is repaired rather than demanded.
-    """
+    """Compacts each row's real tokens to the front: once the mask is withheld, causality excludes only trailing pads,
+    while deepseek_vl_v2 and the falcon pair left-pad whatever side is requested."""
     value = inputs.get("attention_mask") if hasattr(inputs, "get") else None
     if value is None:
         return inputs
@@ -9336,29 +8601,23 @@ def _right_pad_vlm_rows(inputs, processor):
             f"re-derived for the repaired row order."
         )
     bounds = _audio_bounds_per_row(inputs) or ()
-    # Only the rows the repair actually moves lose their coordinates, so a row
-    # that is already content-first keeps valid spans however its neighbours are
-    # padded. Rows with no spans have nothing to invalidate.
+    # Only rows the repair moves lose their span coordinates; a content-first row keeps valid spans whatever its
+    # neighbours' padding, and span-less rows have nothing to invalidate.
     stale = [
         index for index, spans in enumerate(bounds)
         if spans and index < moved.shape[0] and bool(moved[index])
     ]
     if stale:
-        # Stated spans are coordinates into the layout the repair replaces, and
-        # nothing re-derives them: they would keep naming pre-repair positions
-        # and put each clip's audio on whatever tokens moved there. Both ends of
-        # a stale span can still be attended, so no later check would catch it.
+        # Stated spans are coordinates into the pre-repair layout and nothing re-derives them, so each clip's audio
+        # would land on moved tokens; attended ends mean no later check catches it.
         raise ValueError(
             f"Unsloth MLX: {type(processor).__name__} did not put row(s) "
             f"{stale} content-first despite being asked for right-padded rows, "
             f"and reports their audio positions as spans, which name the layout "
             f"the repair replaces."
         )
-    # Same argument for image spans. `image_bound` is neither width-generated
-    # nor token-aligned -- an (images, 2) grid is not the ids shape -- so the
-    # sidecar relocation leaves it naming pre-repair columns, and the model
-    # would scatter each image's features onto whatever tokens moved there.
-    # Silent: the stale columns stay attended, so nothing downstream objects.
+    # Same for image spans: `image_bound` is an (images, 2) grid, neither width-generated nor token-aligned, so sidecar
+    # relocation leaves stale columns that stay attended, and features scatter silently onto moved tokens.
     image_stale = [
         index for index, spans in enumerate(_image_bounds_per_row(inputs) or ())
         if spans and index < moved.shape[0] and bool(moved[index])
@@ -9560,14 +8819,13 @@ def _collate_vlm_prompt_completion_batch(
         completion_raw = item.get("completion", "")
         prompt = _normalize_vlm_messages(prompt_raw)
         completion = _normalize_vlm_messages(completion_raw)
-        # Coerce a raw prompt to a chat message when the completion is chat-style so
-        # both render through one template and split cleanly (avoids None + list).
+        # Coerce a raw prompt to a user chat message when the completion is chat-style, so both render through one
+        # template and split cleanly (avoids None + list).
         if isinstance(completion, list) and isinstance(prompt, str):
             prompt = [{"role": "user", "content": prompt}]
         prompt_messages = prompt if isinstance(prompt, list) else None
         completion_messages = completion if isinstance(completion, list) else None
-        # Audio conditions the response, so it belongs to the prompt half;
-        # scanning the completion keeps a misplaced clip from passing the gate.
+        # Audio conditions the response, so it belongs in the prompt half; scanning the completion keeps a misplaced clip from passing the gate.
         if any(_vlm_audio_part_state(completion_messages or [])):
             raise ValueError(
                 "Unsloth MLX: audio in the completion half is not supported; "
@@ -9621,14 +8879,8 @@ def _collate_vlm_prompt_completion_batch(
     # Untruncated halves: only run presence is checkable until the combine.
     audio_counts = [len(clips) for clips in all_audio]
     if any(audio_counts) and _audio_bounds_per_row(prompt_inputs) is not None:
-        # A stated span is an absolute coordinate into the half it was measured
-        # on. The combine concatenates the halves and then flushes and truncates
-        # the joined rows, either of which can carry the prompt's tokens away
-        # from the positions its spans name and put the clip's audio on whatever
-        # lands there. Refused for the whole format rather than relocated, and
-        # for every row rather than the ones that would move: nothing here has
-        # verified a relocation, and this is not the format the family was
-        # qualified on.
+        # Stated spans are absolute coordinates into one half; combine plus flush and truncate can move tokens off them,
+        # and relocation is unverified, so the whole format is refused.
         raise NotImplementedError(
             f"Unsloth MLX: {type(processor).__name__} reports audio positions as "
             f"spans, which prompt/completion collation can move the tokens out "
@@ -9657,13 +8909,11 @@ def _collate_vlm_prompt_completion_batch(
         _vlm_inputs_host_valued(prompt_inputs)
         and _vlm_inputs_host_valued(completion_inputs)
     )
-    # Snapshot the tokenizer-derived collation scalars while this thread still
-    # owns the processor: the carrier transports data, never the live processor.
+    # Snapshot tokenizer-derived collation scalars while this thread owns the processor; the carrier transports data, never the live processor.
     flush_side = _vlm_tokenizer_padding_side(processor)
     pad_id = _vlm_pad_token_id(processor)
     if not pc_host_valued and reject_mlx_valued:
-        # Processor-owned MLX outputs: materialize their pending graphs here
-        # (lazy arrays cannot cross threads) and defer combine + labels.
+        # Materialize processor-owned MLX outputs here, since lazy arrays cannot cross threads, and defer combine and labels.
         _materialize_mlx_values(prompt_inputs, completion_inputs)
         return _HostStagedVLMBatch(
             None, None, host_valued=False,
@@ -9699,12 +8949,8 @@ def _combine_vlm_prompt_completion_inputs(
     image_token_ids=None,
     image_context_limit=None,
 ):
-    """Concatenate prompt/completion processor outputs into one staged batch.
-
-    Runs on the collating thread for host-valued outputs, on the consumer thread
-    (via ``pc_opaque``) for MLX-valued ones. Takes the tokenizer-derived
-    collation scalars, never the processor itself.
-    """
+    """Concatenates prompt/completion outputs into one staged batch: on the collating thread if host-valued, else on the
+    consumer via pc_opaque; takes tokenizer scalars, never the processor itself."""
     pc_host_valued = (
         _vlm_inputs_host_valued(prompt_inputs)
         and _vlm_inputs_host_valued(completion_inputs)
@@ -9750,9 +8996,8 @@ def _combine_vlm_prompt_completion_inputs(
         input_ids, attention_mask, "right", pad_id, extras,
     )
     if audio_counts and any(audio_counts):
-        # Flush + truncate is where a prompt-side run can actually be cut.
-        # With the family's fixed budget, since a run cut short still leaves one
-        # run per clip and only its length gives it away.
+        # Flush and truncate is where a prompt-side run can be cut; check it against the family's fixed budget, since a
+        # cut run still leaves one run per clip, identifiable only by length.
         _assert_audio_runs_intact_ids(
             input_ids, attention_mask, audio_counts, audio_soft_ids,
             input_ids.shape[1] if expanded else max_seq_length, budget=audio_budget,
@@ -9781,8 +9026,7 @@ def _combine_vlm_prompt_completion_inputs(
             widen_labels_int64=completion_only_loss_enabled,
         )
     if reject_mlx_valued:
-        # Non-stageable producer batches (float/exotic ids) must never reach
-        # MLX conversion off the consumer thread.
+        # Non-stageable producer batches (float or exotic ids) must never reach MLX conversion off the consumer thread.
         _reject_non_integer_host_vlm_ids("the processor")
     batch = _to_mx_vlm_batch(combined_inputs)
     batch["labels"] = _apply_vlm_label_masks(
@@ -9803,12 +9047,8 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
                        formatting_func=None, ignore_token_ids=None,
                        completion_only_loss=None,
                        return_prompt_completion=False, image_context_limit=None):
-    """Collate a batch of VLM samples using the processor directly.
-
-    Mirrors Unsloth's GPU UnslothVisionDataCollator: extract images, resize
-    to uniform size, apply_chat_template, then one processor() call for
-    tokenization + image processing + padding.
-    """
+    """Collates VLM samples with one processor() call (tokenize, image process, pad) after uniform image resizing and
+    chat templating, mirroring the GPU UnslothVisionDataCollator."""
     normalize_vlm_processor_chat_template(processor, strict=False)
     if reject_mlx_valued and any(_contains_mlx_values(item) for item in items):
         # Reject before formatting or the processor touches them off-thread.
@@ -9926,9 +9166,8 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             inputs, label_mask, ignore_token_ids=ignore_token_ids,
         )
     elif reject_mlx_valued and not _vlm_inputs_host_valued(inputs):
-        # The processor itself emitted MLX arrays (mlx-vlm wrappers always do):
-        # materialize its pending graphs here (lazy arrays cannot cross threads),
-        # carry the payload through untouched, and decide labels at finalize.
+        # Processor emitted MLX arrays (mlx-vlm wrappers always do): materialize pending graphs here since lazy arrays
+        # cannot cross threads, carry the payload untouched, decide labels at finalize.
         _materialize_mlx_values(inputs)
         staged = _HostStagedVLMBatch(
             inputs, None, host_valued=False,
@@ -9938,8 +9177,7 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         # Host-valued non-integer ids: legacy conversion would run producer-side.
         _reject_non_integer_host_vlm_ids("the processor")
     else:
-        # MLX-valued processor outputs: legacy synchronous label path, wrapped
-        # so the finalizer stays the only exit to the trainer.
+        # MLX-valued processor outputs take the legacy synchronous label path, wrapped so the finalizer remains the only exit to the trainer.
         batch = _to_mx_vlm_batch(inputs)
         batch["labels"] = _apply_vlm_label_masks(
             batch, ignore_token_ids=ignore_token_ids,
@@ -9952,15 +9190,9 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
 
 
 def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None):
-    """Apply response masking to a VLM batch dict, adding 'labels' key.
-
-    Converts input_ids to plain lists, runs the masking closure from
-    dataset_utils.train_on_responses_only with the current VLM labels, and
-    stores the result as an mx.array in batch_dict["labels"].
-    """
-    # Prefer the raw (pre-int32-narrowing) input_ids so the masking closure
-    # sees original processor ids; wide invalid ids like uint32(2**32-100)
-    # would otherwise have already wrapped to -100 in batch_dict["input_ids"].
+    """Adds an mx.array 'labels' key by running the dataset_utils.train_on_responses_only masking closure with the current VLM labels over plain-list input_ids."""
+    # Prefer raw pre-int32-narrowing input_ids so masking sees original processor ids; wide invalid ids like
+    # uint32(2**32-100) would already have wrapped to -100 in batch_dict.
     raw_input_ids = batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
     input_ids = raw_input_ids if raw_input_ids is not None else batch_dict["input_ids"]
     ids_list = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
@@ -9976,10 +9208,8 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None
     labels_list = result["labels"]
     if hasattr(labels_list, "tolist"):
         labels_list = labels_list.tolist()
-    # Widen unsigned label dtypes (numpy + mx normalizers) so mx.where with
-    # -100 does not crash on uint* and wide invalid ids reach runtime CCE
-    # as sentinels instead of wrapping. Then apply image-token + attention
-    # masking via the shared helper.
+    # Widen unsigned label dtypes (numpy and mx) so mx.where with -100 does not crash and wide invalid ids reach runtime
+    # CCE as sentinels; then apply shared image-token and attention masking.
     labels_np = _normalize_numpy_cce_labels(labels_list)
     labels_array = _normalize_cce_label_dtype(mx.array(labels_np))
     batch_dict["labels"] = _apply_vlm_label_masks(
@@ -10026,20 +9256,9 @@ def _build_response_masked_vlm_batch(
     target_width=None,
     width_policy=None,
 ):
-    """Collate VLM rows and apply the CUDA response-mask closure.
-
-    Plain-SFT and prompt/completion streams stage host-side and exit through the
-    single ``_finalize_vlm_batch`` call (``yield_host_staged`` defers it for the
-    prefetch producer). Response-masked streams run the verbatim legacy
-    consumer-side order and are rejected in producer modes.
-
-    ``target_width`` (an installed shape-plan endpoint) splits that finalization
-    at the width seam: the finalizer stops after its content phase, the pad lands
-    after expansion and response masking so padded tails stay inert, and the
-    position phase then runs at the final width.
-
-    ``width_policy`` is the streaming form, chosen from the post-expansion width.
-    """
+    """Host-staged streams finalize in one _finalize_vlm_batch call (yield_host_staged defers it for the prefetch
+    producer); response-masked streams keep the legacy order and are rejected in producer modes; target_width pads
+    after expansion and masking so tails stay inert."""
     staged, is_prompt_completion = _collate_vlm_batch(
         items, processor, max_seq_length, image_size,
         reject_mlx_valued=reject_mlx_valued,
@@ -10050,8 +9269,7 @@ def _build_response_masked_vlm_batch(
         image_context_limit=_vlm_image_context_limit(config),
     )
     staged.config = config
-    # Unplanned batches keep the historical single-pass order, including its
-    # failure ordering (a broken batch raises before the response-mask callback).
+    # Unplanned batches keep the single-pass order, including its failure ordering: a broken batch raises before the response-mask callback.
     widening = target_width is not None or (
         width_policy is not None and getattr(width_policy, "armed", True)
     )
@@ -10079,9 +9297,8 @@ def _build_response_masked_vlm_batch(
         )
 
     if response_mask_fn is not None and not is_prompt_completion:
-        # Closure semantics are defined on the converted, compile-prepared
-        # tensors (image-token expansion shifts positions), so response masking
-        # is consumer-side by nature and staging cannot cover it.
+        # Response-mask closures act on converted, compile-prepared tensors (image-token expansion shifts positions), so
+        # masking stays consumer-side and cannot be staged.
         if yield_host_staged:
             raise ValueError(
                 "Unsloth MLX VLM: train_on_responses_only streams are not "
@@ -10103,8 +9320,7 @@ def _build_response_masked_vlm_batch(
         return batch_dict
     if yield_host_staged:
         if target_width is not None:
-            # Staging defers conversion, so the batch has no width to pad yet.
-            # The sized planner owns every endpoint and never stages.
+            # Staging defers conversion, so there is no width to pad yet; the sized planner owns every endpoint and never stages.
             raise ValueError(
                 "Unsloth MLX VLM: a planned target_width cannot be applied to "
                 "a host-staged batch; finalize on the consumer thread first."
@@ -10135,8 +9351,7 @@ def _filter_trainable_vlm_indices(
     formatted_items = {} if formatting_func is not None else None
     supervision = {}
     removed = 0
-    # Formatted rows are kept for the batch builder, so they outlive the rows
-    # read after them and carry the same reuse-buffer exposure as the planner.
+    # Formatted rows are kept for the batch builder, so they outlive later reads and carry the same reuse-buffer exposure as the planner.
     media_pins = []
     for idx in indices:
         item = _format_vlm_row_gating_audio(
@@ -10155,8 +9370,7 @@ def _filter_trainable_vlm_indices(
             return_prompt_completion=True,
         )
         valid_rows = _vlm_trainable_label_rows(batch_dict)
-        # Removal keeps the causal-shift predicate; the checker flag keeps the
-        # legacy full-row one (a 1-token row can be good for one and not the other).
+        # Removal uses the causal-shift predicate while the checker flag keeps the legacy full-row one; a 1-token row can pass one and fail the other.
         labels = batch_dict.get("labels")
         if labels is None:
             checker_good = True
@@ -10184,18 +9398,13 @@ def _filter_trainable_vlm_indices(
     return kept_indices, removed, formatted_items, supervision
 
 
-# Deep enough for a chat row (row -> messages -> message -> content -> part);
-# the bound keeps a self-referential row from recursing without end.
+# Depth 8 covers a chat row (row, messages, message, content, part); the bound stops self-referential rows from recursing forever.
 _VLM_ROW_SNAPSHOT_DEPTH = 8
 
 
 def _vlm_pil_image_is_decoded(image):
-    """True when a PIL image already holds a decoded raster.
-
-    Pillow 11+ raises on ``.im`` before the load and exposes ``._im``; earlier
-    releases only expose ``.im``, left as None until then. Reading ``_im``
-    first keeps this correct on both, and under ``python -O``.
-    """
+    """Whether a PIL image holds a decoded raster; reads _im first, which stays correct on Pillow 11+ (.im raises before
+    load), older releases (.im None until loaded) and python -O."""
     for attribute in ("_im", "im"):
         try:
             return getattr(image, attribute) is not None
@@ -10205,39 +9414,21 @@ def _vlm_pil_image_is_decoded(image):
 
 
 def _vlm_media_bytes_digest(array):
-    """Order-sensitive CRC-32 over every byte of an array-like payload.
-
-    A sparse sample cannot see a mutation that misses its stride, and the
-    stride is derivable from the shape, so the probe reads the whole buffer.
-    A byte sum and a byte xor are both permutation-invariant, so an in-place
-    geometric augmentation over a reused buffer (flip, rotate, roll, channel
-    swap -- all exact byte permutations, for float payloads too) left both
-    unchanged and the corruption went unreported. CRC-32 is order sensitive,
-    and being one C pass rather than two numpy reductions it is also cheaper
-    than the pair it replaces: 0.62 ms against 1.40 ms per 1024x1024 RGB
-    probe here, against 3.63 ms for blake2b. This is a raw-byte view, so it
-    is exact for float payloads, and it is paid once per scheduled slot at
-    plan construction.
-    """
+    """Order-sensitive CRC-32 over the whole buffer: byte sum and byte xor miss in-place permutations such as flips or
+    rolls, and a sparse sample can miss a mutation; a raw-byte view, exact for floats; computed once per scheduled
+    slot at plan construction."""
     flat = np.ascontiguousarray(array).reshape(-1).view(np.uint8)
     return zlib.crc32(memoryview(flat))
 
 
 def _vlm_media_fingerprint(payload):
-    """Content probe for a mutable media payload, or None to skip it.
-
-    Rows are stored by reference, so a dataset that decodes into one reused
-    buffer silently rewrites rows already collected. Copying every payload
-    instead would cost one image per scheduled slot rather than per row, so
-    the plan probes content and reports the corruption rather than paying to
-    prevent it. Undecoded PIL handles are still skipped, because probing one
-    would force the decode this path exists to defer.
-    """
+    """Content probe for mutable media, or None to skip it: rows hold payloads by reference, so a reused decode buffer
+    rewrites stored rows; probing reports that rather than copying each payload. Undecoded PIL handles are skipped,
+    since probing would force the decode."""
     try:
         if isinstance(payload, _LazyVLMImage):
-            # A released handle re-opens its path, so the FILE is the payload
-            # and a reused path aliases exactly like a reused buffer. Identity
-            # metadata is O(1) where re-reading the bytes would be O(size).
+            # A released handle re-opens its path, so the file is the payload and a reused path aliases like a reused
+            # buffer; identity metadata is O(1) versus O(size) re-reads.
             return ("lazyfile", payload.path, _vlm_file_identity(payload.path))
         if isinstance(payload, np.ndarray):
             return ("ndarray", payload.shape, str(payload.dtype),
@@ -10256,8 +9447,7 @@ def _vlm_media_fingerprint(payload):
         if torch_module is not None and isinstance(payload, torch_module.Tensor):
             return ("tensor", tuple(payload.shape), str(payload.dtype),
                     _vlm_media_bytes_digest(payload.detach().cpu().numpy()))
-        # mlx arrays support in-place __setitem__, so an mlx-native dataset can
-        # alias exactly like a numpy one.
+        # mlx arrays support in-place __setitem__, so an mlx-native dataset can alias exactly like a numpy one.
         if isinstance(payload, _MX_ARRAY_TYPE):
             return ("mx", payload.shape, str(payload.dtype),
                     _vlm_media_bytes_digest(np.asarray(payload)))
@@ -10295,12 +9485,8 @@ def _verify_vlm_media_pins(pins, *, since_construction=False):
 
 
 def _snapshot_formatted_vlm_row(item, _depth=0, _pins=None):
-    """Snapshot one stored VLM row. A ``formatting_func`` (or dataset) that
-    mutates and returns its argument hands every visit the same object, so
-    without this a later visit's mutation would rewrite earlier stored visits.
-    Nested containers are rebuilt too, but payloads such as images are only
-    ever referenced, never copied. Passing ``_pins`` records a content probe
-    per media payload so the caller can verify none was rewritten later."""
+    """Snapshots a stored row so a formatting_func that mutates and returns its argument cannot rewrite earlier visits;
+    containers are rebuilt, media only referenced; _pins records per-media probes."""
     if _depth >= _VLM_ROW_SNAPSHOT_DEPTH:
         return item
     if isinstance(item, dict):
@@ -10313,9 +9499,8 @@ def _snapshot_formatted_vlm_row(item, _depth=0, _pins=None):
             _snapshot_formatted_vlm_row(value, _depth + 1, _pins) for value in item
         ]
     if type(item) is tuple:
-        # A tuple is immutable but its elements are not, and the image helpers
-        # accept a tuple wherever they accept a list. Subclasses (namedtuples)
-        # are left alone rather than rebuilt through the wrong constructor.
+        # Tuples are immutable but their elements are not, and image helpers accept them like lists; tuple subclasses
+        # (namedtuples) are left alone, not rebuilt via the wrong constructor.
         return tuple(
             _snapshot_formatted_vlm_row(value, _depth + 1, _pins) for value in item
         )
@@ -10327,15 +9512,8 @@ def _snapshot_formatted_vlm_row(item, _depth=0, _pins=None):
 
 
 class _FiniteVLMRow:
-    """CPU-side formatted VLM item plus its checker-supervision flag.
-
-    ``pins`` keeps this row's media probes alive past construction. The eager
-    builder converted every payload to tensors up front, so a caller that
-    mutated one afterwards could not reach training; this plan holds the
-    payload itself until materialize, so the same probe has to be re-read
-    there. The probes cost a stat for a released file and one crc32 pass
-    otherwise, both far below the processor call they precede.
-    """
+    """CPU-side formatted VLM row with its checker flag; pins keep the media probes alive so a payload mutated after
+    construction is caught at materialize, since the plan holds it unconverted."""
 
     __slots__ = ("item", "checker_good", "pins")
 
@@ -10358,12 +9536,8 @@ def _pinned_finite_vlm_row(item, checker_good=True, *, _all_pins=None, snapshot=
     )
 
 
-# The serializer trusts a genuine mlx.core at import time, the same trust the
-# trainer places in mx.compile. Array metadata is read through descriptors
-# captured here and validated against a probe array, so later patching of
-# mx.array's Python attributes cannot hide or forge shapes/dtypes. If the
-# captures are missing or fail the probe, every array leaf degrades to
-# unplannable rather than trusting unverifiable reads.
+# Trusts a genuine mlx.core at import; array shape and dtype come from descriptors captured here and probe-validated, so
+# later mx.array patches cannot forge them; failed captures make array leaves unplannable.
 _MX_ARRAY_TYPE = mx.array
 _MX_ARRAY_SHAPE = getattr(mx.array, "shape", None)
 _MX_ARRAY_DTYPE = getattr(mx.array, "dtype", None)
@@ -10381,12 +9555,8 @@ _MX_DTYPE_EQ = getattr(type(getattr(mx, "int32", None)), "__eq__", None)
 
 
 def _vlm_family_dtype_name(dtype_value):
-    """Stable name for a dtype read from an array, or None.
-
-    Dtype reads mint fresh wrapper objects, so identity cannot name them.
-    Comparison uses the __eq__ and dtype singletons captured at import, so
-    later patching of the Dtype class cannot forge or hide a name.
-    """
+    """Stable dtype name, or None; dtype reads mint fresh wrappers, so comparison uses __eq__ and dtype singletons
+    captured at import, so later patching of the Dtype class cannot forge or hide a name."""
     if _MX_DTYPE_EQ is None:
         return None
     for candidate, name in _MX_DTYPE_TABLE:
@@ -10416,18 +9586,14 @@ def _validate_mx_array_captures():
 _MX_ARRAY_CAPTURES_VALID = _validate_mx_array_captures()
 
 
-# First-read-wins tag per type object, held WEAKLY so dynamic per-batch types are
-# reclaimed while any recurring type keeps one stable tag: a surveyed family and a
-# later drift check always agree within a process. Cross-process equality holds
-# only for types with honest introspection (others are unplannable anyway).
+# Per-type tag is first-read-wins and held weakly so per-batch types are reclaimed; recurring types keep one tag per
+# process; cross-process equality needs honest introspection.
 _VLM_TYPE_TAG_CACHE = {}
 
 
 def _vlm_family_type_tag(node_type):
-    """First-observation type tag that survives hostile metaclasses: a type
-    whose introspection raises still classifies (as "unidentifiable.type"),
-    and one whose introspection varies across reads keeps its first observed
-    tag for its lifetime."""
+    """First-observed type tag, stable across hostile metaclasses: a type whose introspection raises tags as
+    'unidentifiable.type', and one whose introspection varies keeps its first tag for its lifetime."""
     entry = _VLM_TYPE_TAG_CACHE.get(id(node_type))
     if entry is not None and entry[0]() is node_type:
         return entry[1]
@@ -10450,18 +9616,8 @@ def _vlm_family_type_tag(node_type):
 
 
 def _vlm_family_encode_key(key):
-    """Encoding of one dictionary key for ``_vlm_batch_family``.
-
-    ``mx.compile`` records every key's ``__hash__()`` result, so a value
-    encoding is safe only where it is at least as fine as that hash within a
-    process. That holds for the exact built-ins whose hash is
-    value-determined: str/bytes, int/bool, None, non-NaN floats (the bit
-    pattern also splits the ``0.0``/``-0.0`` collision), and plain tuples of
-    these. Anything else (subclasses overriding ``__hash__``, NaN floats,
-    arbitrary hashable objects) could let one family span several compile
-    keys, so it is tagged ``unstable_key`` and ``_vlm_family_is_plannable``
-    excludes the whole family from shape planning.
-    """
+    """Key encoding must be at least as fine as mx.compile's __hash__ for exact built-ins; anything else (subclass
+    hashes, NaN floats, arbitrary objects) is tagged unstable_key, excluding the family from planning."""
     key_type = type(key)
     if key_type is bool or key_type is int:
         return ("int", int(key))
@@ -10482,19 +9638,8 @@ def _vlm_family_encode_key(key):
 
 
 def _audio_fixed_budget(processor, config=None):
-    """Placeholders a family emits per clip, when that count is fixed.
-
-    Gemma 3n always merges the same number of positions per clip, padding short
-    clips with learned padding embeddings, so the count is known before the
-    model runs and a row's placeholders can be checked against it.
-
-    A processor that converts clip duration into a token count has no such
-    constant: its ``audio_soft_tokens_per_image`` is an upper bound rather than
-    the per-clip budget (Gemma 4 reports 750 while emitting 25 placeholders for
-    a one-second clip), so the presence of a per-token duration is what rules
-    the check out. Those families are verified against the encoder's own output
-    instead.
-    """
+    """Fixed per-clip placeholder count (Gemma 3n); None when a per-token duration exists, since
+    audio_soft_tokens_per_image is then only an upper bound (Gemma 4) and is checked against encoder output."""
     if getattr(processor, "audio_ms_per_token", None):
         return None
     for source in (config, getattr(processor, "config", None)):
@@ -10517,48 +9662,25 @@ _AUDIO_OUTPUT_ATTRS = ("talker", "code2wav")
 _AUDIO_MERGE_SENTINEL = "_unsloth_audio_merge_patched"
 _AUDIO_MERGE_HOLDERS = "_unsloth_audio_merge_holders"
 _AUDIO_MERGE_ORIGINAL = "_unsloth_audio_merge_original"
-# The hold count is read, decided on and written back, which the GIL does not
-# make atomic, so two trainers starting close together could both install a
-# wrapper and the first to finish would restore the original mid-training.
-# Module-level: it is taken twice per run, so contention is irrelevant.
+# The hold count is read, decided on and written back in steps the GIL does not make atomic, so two trainers starting
+# together could both install a wrapper; the module-level lock is taken twice per run.
 _AUDIO_MERGE_LOCK = threading.Lock()
 
-# Families whose merge walks a flattened feature block with a running
-# placeholder count, so a padded row's tail is consumed by the next row. Gemma 3n
-# (fixed budget, merges its own padding) and Phi-4 (row by row) must not get it.
+# Families whose merge walks a flattened feature block with a running placeholder count consume a padded row's tail in
+# the next row; Gemma 3n and Phi-4 must not get this patch.
 _AUDIO_MERGE_PATCH_FAMILIES = frozenset({"gemma4"})
 
 
 def audio_merge_patch_needed(config):
-    """Whether this model family's audio merge must be corrected for training.
-
-    Matched case-insensitively because mlx-vlm lowercases ``model_type`` before
-    selecting the module: a checkpoint spelling it differently loads the same
-    family and passes the audio gate, so an exact match here would skip the
-    correction for a model that needs it.
-    """
+    """Case-insensitive model_type match against the merge-patch families, since mlx-vlm lowercases model_type when
+    selecting the module; an exact match would skip the needed correction."""
     model_type = _config_get(config, "model_type")
     return str(model_type).lower() in _AUDIO_MERGE_PATCH_FAMILIES
 
 
 def _compact_audio_features(embeddings, padding_mask, placeholders_per_row):
-    """Concatenate every clip's valid audio embeddings, in clip order.
-
-    The upstream merge flattens the whole padded feature block and walks it with
-    a running count of placeholder positions, so a short clip's padding is
-    consumed by the placeholders that follow it. Feeding that walk only the
-    valid embeddings, in the order the clips appear, makes the count line up
-    again -- collation emits clips row by row, so clip order is row order.
-
-    The encoder yields one entry per clip while placeholders are counted per
-    text row, and a row may hold several clips or none. Clips are therefore
-    assigned to rows in order and each row must be satisfied exactly: a batch
-    whose totals happen to agree while individual rows do not is still
-    mispaired, and is rejected here rather than trained on.
-
-    ``padding_mask`` marks padded frames (the encoder's own polarity), so valid
-    positions are its complement.
-    """
+    """Keeps only valid audio embeddings in clip order so the upstream placeholder walk is not consumed by padding; each
+    text row must match its clip count exactly or the batch is rejected; padding_mask marks padded frames."""
     selected = []
     counts = []
     for index in range(embeddings.shape[0]):
@@ -10590,22 +9712,14 @@ def _compact_audio_features(embeddings, padding_mask, placeholders_per_row):
 
 
 def install_audio_merge_patch(model, audio_token_id):
-    """Correct a model's audio merge for the duration of training.
-
-    Bound on the instance rather than the class, so a patch cannot leak into
-    inference on other models of the same type. Installs are counted: two
-    trainers sharing one model both hold a reference, and the correction stays
-    until the last of them releases it. Returns True when a hold was taken, so
-    every caller that gets True must release exactly once.
-    """
-    # Capture, install and record are one transition, so all of it is under the
-    # lock: split, an installer arriving mid-restore captures the outgoing
-    # wrapper as its "original" and the remover overwrites the new one.
+    """Patches the audio merge on the instance, not the class, so inference on same-type models is unaffected; installs
+    are ref-counted and True means a hold that must be released exactly once."""
+    # Capture, install and record are one transition under the lock; split apart, an installer arriving mid-restore
+    # captures the outgoing wrapper as its original and the remover overwrites the new one.
     with _AUDIO_MERGE_LOCK:
         holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
         if holders:
-            # Another run holds it: take a hold so it outlives whoever
-            # finishes first.
+            # Another run holds it: take a hold so it outlives whoever finishes first.
             setattr(model, _AUDIO_MERGE_HOLDERS, holders + 1)
             return True
         original = model.get_input_embeddings
@@ -10640,8 +9754,7 @@ def install_audio_merge_patch(model, audio_token_id):
         model.get_input_embeddings = patched
         setattr(model, _AUDIO_MERGE_SENTINEL, True)
         setattr(model, _AUDIO_MERGE_HOLDERS, 1)
-        # Put back exactly what was there: deleting would discard someone else's
-        # instance-level wrapper.
+        # Restore exactly what was there; deleting would discard someone else's instance-level wrapper.
         setattr(model, _AUDIO_MERGE_ORIGINAL, original if had_instance_attr else None)
         return True
 
@@ -10655,8 +9768,7 @@ def remove_audio_merge_patch(model):
         if holders > 1:
             setattr(model, _AUDIO_MERGE_HOLDERS, holders - 1)
             return False
-        # Last holder: restore inside the lock with the count drop, for the
-        # reason install gives.
+        # Last holder restores inside the lock together with the count drop, for the reason install gives.
         previous = getattr(model, _AUDIO_MERGE_ORIGINAL, None)
         if previous is not None:
             model.get_input_embeddings = previous
@@ -10680,17 +9792,9 @@ def _masked_scatter_rowwise(embeds, mask, source):
 
 
 def freeze_audio_modules(model):
-    """Freeze audio-input towers/projections and audio-output modules.
-
-    Audio towers are inference-only here: their encoders carry fp32 promotions,
-    long cumulative reductions and host-synchronizing guards that make them
-    poor training subjects, and the model-side merge assumes their output is a
-    fixed function of the clip. Audio-output modules are outside this input-only
-    training path. LoRA runs freeze everything by default, but a full fine-tune
-    would otherwise pull all of these parameters into the optimizer.
-
-    Returns the names of the modules that were frozen.
-    """
+    """Freezes audio towers, projections and output modules, inference-only here: towers carry fp32 promotions and host
+    syncs, and the merge assumes output is a fixed function of the clip; a full fine-tune would otherwise optimize
+    them. Returns the frozen module names."""
     frozen = []
     seen = set()
     for attr in _AUDIO_TOWER_ATTRS + _AUDIO_OUTPUT_ATTRS:
@@ -10702,9 +9806,8 @@ def freeze_audio_modules(model):
             module = getattr(owner, attr, None) if owner is not None else None
             if module is None or not hasattr(module, "freeze"):
                 continue
-            # Every owner, not just the first: a distinct `thinker.audio_tower`
-            # beside a top-level one would otherwise stay trainable. Deduped by
-            # identity so an alias is not reported twice.
+            # Freeze every owner, not just the first: a distinct `thinker.audio_tower` beside a top-level one would stay
+            # trainable; dedupe by identity so an alias is not reported twice.
             if id(module) in seen:
                 continue
             seen.add(id(module))
@@ -10714,20 +9817,16 @@ def freeze_audio_modules(model):
 
 
 def _vlm_batch_carries_audio(batch):
-    """Whether a prepared VLM batch carries audio feature tensors.
-
-    Audio feature extents vary per clip and belong to no padable axis, so a
-    batch carrying them cannot participate in compiled-signature planning.
-    """
+    """Whether a prepared batch carries audio feature tensors; their per-clip extents belong to no padable axis, so such
+    batches cannot be planned for compiled signatures."""
     if not isinstance(batch, Mapping):
         return False
     for key in _AUDIO_FEATURE_PAYLOAD_KEYS:
         value = batch.get(key)
         if value is None:
             continue
-        # An empty payload is how some processors report "no audio here":
-        # MiniCPM-o returns audio_features shaped (0, 80, 0) for a text-only
-        # batch, which must not route the run eagerly or abort a strict one.
+        # An empty payload means no audio: MiniCPM-o returns audio_features shaped (0, 80, 0) for text-only batches,
+        # which must not route eagerly or abort a strict run.
         shape = getattr(value, "shape", None)
         if shape is not None:
             if all(int(dim) for dim in shape):
@@ -10739,31 +9838,11 @@ def _vlm_batch_carries_audio(batch):
 
 
 def _vlm_batch_family(batch, symbolic_axes=None):
-    """Process-stable compile-key family of a prepared VLM batch pytree.
-
-    Mirrors the structure walk ``mx.compile`` uses to key its cache (mlx
-    ``python/src/transforms.cpp``), including its container asymmetry: lists
-    are read through raw C storage (subclass iteration overrides do not
-    participate) while tuples are read through Python iteration (overrides
-    do); both share one sequence marker. Dict entries participate in
-    insertion order via raw ``dict.items``, non-array constants by exact
-    value (bools as ints, floats by bit pattern), and ``mx.array`` leaves by
-    rank/shape/dtype. Value encodings apply only to exact built-in types; a
-    subclass constant becomes an ``unstable_const`` tag. Where the encodings
-    differ this one is finer for every pytree the compile walk accepts, so
-    for plannable families (see ``_vlm_family_is_plannable``) equal families
-    can never reach distinct compile keys, and families compare equal across
-    processes. Structures the compile walk rejects (non-dict mappings, non
-    ``mx.array`` leaves carrying shape/dtype, unsupported leaf types) get
-    stable ``mapping``/``opaque`` tags and planning skips them.
-
-    ``symbolic_axes`` maps a leaf path to the axis whose extent is replaced
-    by the symbolic ``"sequence"`` marker; unmapped arrays keep every
-    dimension concrete and so discriminate families exactly.
-    """
+    """Process-stable compile-key family mirroring mx.compile's pytree walk (raw list storage, tuple iteration,
+    insertion-ordered dicts); symbolic_axes maps leaf paths to axes whose extent becomes 'sequence'; unsupported
+    structures get mapping or opaque tags."""
     def encode(node, path):
-        # Dispatch on the raw runtime type, which a lying __class__ cannot mislead,
-        # matching the PyDict_Check/PyList_Check calls the compile walk performs.
+        # Dispatch on the raw runtime type, which a lying __class__ cannot mislead, matching the PyDict_Check and PyList_Check calls the compile walk makes.
         node_type = type(node)
         if issubclass(node_type, dict):
             return ("dict",) + tuple(
@@ -10778,8 +9857,7 @@ def _vlm_batch_family(batch, symbolic_axes=None):
                     for key, value in node.items()
                 )
             except Exception:
-                # mx.compile rejects non-dict mappings unread, so a raising items()
-                # must not break surveying; the tag marks the family unplannable.
+                # mx.compile rejects non-dict mappings unread, so a raising items() must not break surveying; the tag marks the family unplannable.
                 return ("mapping", tag, "unreadable")
             return ("mapping", tag) + entries
         if issubclass(node_type, (list, tuple)):
@@ -10799,9 +9877,8 @@ def _vlm_batch_family(batch, symbolic_axes=None):
                 for position, item in enumerate(walk)
             )
         if node_type is _MX_ARRAY_TYPE:
-            # Metadata through the validated import-time descriptors and dtype
-            # naming by captured equality, so no patchable protocol participates.
-            # Unvalidated captures never guess: the leaf opts out instead.
+            # Metadata comes from validated import-time descriptors and dtype names by captured equality, so no
+            # patchable protocol participates; unvalidated captures make the leaf opt out.
             if not _MX_ARRAY_CAPTURES_VALID:
                 return ("unstable_const", _vlm_family_type_tag(node_type))
             shape = _MX_ARRAY_SHAPE.__get__(node, node_type)
@@ -10834,15 +9911,9 @@ def _vlm_batch_family(batch, symbolic_axes=None):
 
 
 def _vlm_family_is_plannable(family):
-    """Whether shape planning may group compiled calls by this family.
-
-    False when any component's compile-key mapping is not one-to-one-or-finer:
-    ``unstable_key``/``unstable_const`` (subclass or identity hashing can
-    split one family across compile keys) and ``mapping``/``opaque``
-    (structures the compile walk rejects). Such a family must never be
-    admitted to planning, not even as an exact signature; runs containing
-    those batches keep unplanned behavior (eager fallback or strict error).
-    """
+    """False if any component is unstable_key, unstable_const, mapping or opaque; those can split a family across
+    compile keys or are rejected by the compile walk, and such families are never planned, not even as an exact
+    signature; their runs fall back to eager or strict error."""
     if not isinstance(family, tuple) or not family:
         return True
     if family[0] in ("unstable_key", "unstable_const", "mapping", "opaque"):
@@ -10855,8 +9926,7 @@ def _vlm_family_is_plannable(family):
 
 
 def _vlm_family_divergence(expected, observed, path="batch"):
-    """Location and description of the first difference between two families
-    produced by ``_vlm_batch_family``, or ``None`` when they are equal."""
+    """Return the location and description of the first difference between two families from _vlm_batch_family, or None if equal."""
     if expected == observed:
         return None
     if (
@@ -10918,14 +9988,8 @@ def _vlm_family_divergence(expected, observed, path="batch"):
     return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
 
 
-# Problem kinds already reported, so an unsupported key layout costs one message
-# per process rather than one per training step. Both trainer captures sit inside
-# the per-batch loop, so without this a run that is otherwise fine emits a warning
-# per batch. Keyed on the kind and not the rendered text: the message interpolates
-# the offending word, so a value that changes between draws would defeat both the
-# `warnings` registry and the stderr fallback below, which has no registry at all.
-# A plain set is enough here; two threads racing costs a duplicate message, never
-# a lost one.
+# Warn once per problem kind per process, not per batch; key on kind, since interpolated values would defeat the
+# warnings registry and stderr fallback; a race only duplicates a message.
 _reported_unrewindable_keys = set()
 
 
@@ -10950,11 +10014,9 @@ def _warn_unrewindable_key(kind, message):
     try:
         warnings.warn(message, RuntimeWarning, stacklevel = 3)
     except Exception:
-        # A filter promoted the warning, so say it on stderr rather than lose it.
-        # Guarded too, though: stderr can be closed (a daemonised Studio backend,
-        # or a test runner tearing down its capture) or a stream whose write
-        # raises, and this helper is called ABOVE the `try` that would contain
-        # such a raise. An unreportable diagnostic must not become the abort.
+        # If a filter promotes the warning to an error, print it to stderr instead; guard that write too, since stderr
+        # can be closed or raise and this helper runs above the try, so an unreportable diagnostic must not become the
+        # abort
         try:
             print(message, file = sys.stderr)
         except Exception:
@@ -10962,14 +10024,9 @@ def _warn_unrewindable_key(kind, message):
 
 
 def _mlx_rng_key():
-    """The current MLX PRNG key as its two 32-bit words, or None if unreadable.
-
-    Unreadable covers the torch simulation shim, whose state is a callable;
-    deciding that here is what lets the restore below stay unconditional. A
-    readable key that is not two words is different: the rewind no longer works
-    on the installed mlx, and a bare None would leave every compile fallback
-    silently not restoring, so it warns once and declines.
-    """
+    """Return the current MLX PRNG key as two 32-bit words, or None if unreadable (e.g. the torch shim's callable
+    state); a readable key that is not two words warns once and declines, so compile fallbacks are not silently left
+    unrestored."""
     try:
         words = mx.random.state[0].tolist()
     except Exception:
@@ -10987,20 +10044,8 @@ def _mlx_rng_key():
 
 
 def _as_uint32_pair(high, low):
-    """Both words as uint32, or None if either is not a 32-bit word at all.
-
-    mx.random.seed takes a uint64 and raises outside [0, 2**64), and that raise
-    would land in a `finally` or a compile-failure handler. Range-checking here
-    is what lets the restore below stay unguarded.
-
-    Range-checked rather than masked, though. A negative reads as the two's
-    complement of the uint32 mlx stores, so reinterpreting it loses nothing. A
-    value at or above 2**32 is not a 32-bit word under any reading, and masking
-    it would turn a key we cannot represent into a plausible wrong one:
-    (2**32, 0) would restore as (0, 0), so the fallback would look like it had
-    rewound the RNG while actually diverging. Declining says so instead, and is
-    the outcome every caller already handles.
-    """
+    """Return both words as uint32, or None if either is outside [-(2**31), 2**32); negatives are masked to 32 bits,
+    while (2**32, 0) is rejected rather than wrapped into a wrong key (0, 0); this keeps the restore unguarded."""
     converted = []
     for word in (high, low):
         if not -(2**31) <= word < 2**32:
@@ -11017,15 +10062,8 @@ def _as_uint32_pair(high, low):
 
 
 def _restore_mlx_rng_key(words):
-    """Rewind the PRNG to a key captured by ``_mlx_rng_key``.
-
-    mlx 0.32.1 made ``mx.random.state`` a sentinel that refuses item assignment.
-    Upstream builds a key as ``{seed >> 32, (uint32) seed}``, so reseeding with a
-    key's own words restores it exactly over the whole unsigned 64-bit range.
-    Unguarded on purpose: the range check in ``_as_uint32_pair`` removes the only
-    way this can raise, and a blanket ``except`` would be a failure
-    indistinguishable from an intentional no-op, which is the defect this fixes.
-    """
+    """Rewind to a key from _mlx_rng_key by reseeding with its words, since mlx 0.32.1 made mx.random.state refuse item
+    assignment; unguarded so failures are not hidden as no-ops."""
     if words is None:
         return
     pair = _as_uint32_pair(int(words[0]), int(words[1]))
@@ -11036,15 +10074,8 @@ def _restore_mlx_rng_key(words):
 
 @contextlib.contextmanager
 def _preserved_preprocessing_rng():
-    """Run a block without leaving the shared preprocessing RNGs advanced.
-
-    The descriptor survey builds every scheduled batch through the real
-    processor just to read shapes; an augmenting processor draws from the
-    process-global RNGs while doing so and those draws are never replayed, so
-    without this a compile-enabled run would train on a later augmentation
-    stream than an eager run from the same seed. Privately owned generators
-    stay the caller's responsibility.
-    """
+    """Restore process-global RNG state after the block, so the descriptor survey's augmenting processor does not shift
+    compile runs off the eager seed stream; private RNGs stay the caller's job."""
     states = []
     try:
         states.append((random.setstate, random.getstate()))
@@ -11076,15 +10107,8 @@ def _preserved_preprocessing_rng():
 
 
 def _vlm_file_identity(path):
-    """``(device, inode, mtime_ns, size)`` of a file, or None if unreadable.
-
-    A released handle is re-opened from its path, so a dataset that writes
-    every sample to ONE shared path would hand every row the last sample's
-    pixels. Identity is what makes that visible: ``stat`` is O(1) where
-    re-reading the bytes would be O(size) per scheduled slot and decoding
-    would be worse still. A file that has become unstat-able reads as None,
-    which differs from any real identity and is reported the same way.
-    """
+    """Identity (device, inode, mtime_ns, size) of a file via O(1) stat, or None if unreadable; identity exposes a
+    shared path that would hand every row the last sample's pixels on reopen."""
     try:
         status = os.stat(path)
     except OSError:
@@ -11105,17 +10129,8 @@ def _raise_vlm_lazy_file_changed(path):
 
 
 class _LazyVLMImage:
-    """Stand-in for a file-backed PIL handle whose descriptor was released.
-
-    ``PIL.Image.open`` leaves the file open until the raster is loaded, so
-    storing one row per scheduled slot would pin one descriptor per row and
-    exhaust the process limit on a few hundred rows. The path is re-opened at
-    materialization instead, which keeps the plan at O(1) descriptors without
-    forcing the O(N) decode that eagerly loading every row would cost.
-
-    The file's identity travels with the path, because a path alone cannot
-    tell a per-sample file from one shared scratch file rewritten per row.
-    """
+    """A stand-in for a file-backed PIL image: PIL.Image.open pins one descriptor per row until decoded, so the path is
+    reopened at materialization; identity separates per-row from shared scratch files."""
 
     __slots__ = ("path", "identity")
 
@@ -11124,8 +10139,7 @@ class _LazyVLMImage:
         self.identity = _vlm_file_identity(path)
 
     def open(self):
-        # Checked here as well as at plan build: the file can also be rewritten
-        # between building the plan and materializing this row.
+        # Re-check file identity here as well as at plan build, since the file can be rewritten between planning and materializing this row.
         if _vlm_file_identity(self.path) != self.identity:
             _raise_vlm_lazy_file_changed(self.path)
         from PIL import Image as _PIL_Image
@@ -11134,13 +10148,8 @@ class _LazyVLMImage:
 
 
 def _vlm_releasable_image_path(value):
-    """Absolute path of an undecoded, PIL-owned, file-backed image, else None.
-
-    Every clause is a reason it would be wrong to release the descriptor:
-    a caller-owned stream cannot be re-opened from a path, an already decoded
-    raster has no descriptor left to save, and a seeked multi-frame handle
-    would come back on frame zero.
-    """
+    """Return the absolute path of an undecoded, PIL-owned, file-backed image, else None: caller-owned streams cannot be
+    reopened, decoded rasters hold no descriptor, and seeked frames would reopen at frame zero."""
     if not getattr(value, "_exclusive_fp", False):
         return None
     if getattr(value, "fp", None) is None:
@@ -11158,8 +10167,7 @@ def _vlm_releasable_image_path(value):
         except Exception:
             return None
     try:
-        # Absolute so a later chdir cannot break the re-open, and checked now
-        # so an unreadable source fails at build time rather than mid-epoch.
+        # Store an absolute path so a later chdir cannot break the re-open, and check it now so an unreadable source fails at build time, not mid-epoch.
         path = os.path.abspath(filename)
         if not os.path.isfile(path):
             return None
@@ -11169,13 +10177,8 @@ def _vlm_releasable_image_path(value):
 
 
 def _release_vlm_row_image_handles(item, _depth=0):
-    """Swap file-backed lazy PIL handles in a stored row for path references.
-
-    Returns ``item`` itself when nothing is releasable, so rows that hold no
-    such handle keep their exact identity and behaviour. Never closes the
-    payload: the dataset may still own it, so the descriptor is freed only
-    when the caller's own reference goes away.
-    """
+    """Swap releasable lazy PIL handles in a row for path references; returns the same item when none qualify and never
+    closes the payload, which the dataset may still own."""
     if _depth >= _VLM_ROW_SNAPSHOT_DEPTH:
         return item
     path = _vlm_releasable_image_path(item)
@@ -11191,9 +10194,8 @@ def _release_vlm_row_image_handles(item, _depth=0):
                 released[key] = new_value
         return item if released is None else released
     if isinstance(item, tuple):
-        # A stored row can nest media in a tuple; a plain rebuild would also
-        # flatten a namedtuple, so reuse the concrete type when it takes an
-        # iterable and fall back to positional construction when it does not.
+        # Rebuild tuples with their concrete type so namedtuples are not flattened; fall back to positional construction
+        # when the type does not take an iterable.
         walked = [_release_vlm_row_image_handles(value, _depth + 1) for value in item]
         if all(new is old for new, old in zip(walked, item)):
             return item
@@ -11231,9 +10233,8 @@ def _restore_vlm_row_image_handles(item, _depth=0):
                 restored[key] = new_value
         return item if restored is None else restored
     if isinstance(item, tuple):
-        # A stored row can nest media in a tuple; a plain rebuild would also
-        # flatten a namedtuple, so reuse the concrete type when it takes an
-        # iterable and fall back to positional construction when it does not.
+        # Rebuild tuples with their concrete type so namedtuples are not flattened; fall back to positional construction
+        # when the type does not take an iterable.
         walked = [_restore_vlm_row_image_handles(value, _depth + 1) for value in item]
         if all(new is old for new, old in zip(walked, item)):
             return item
@@ -11256,11 +10257,8 @@ def _restore_vlm_row_image_handles(item, _depth=0):
 
 
 def _compact_vlm_cce_batch(batch, small_capacity_limit=0):
-    """Attach fixed-capacity CCE indices for a VLM batch's supervised targets.
-
-    Returns None when the batch has no 2-D labels or its supervised targets
-    fill more than half of the target positions.
-    """
+    """Attach fixed-capacity CCE indices for a VLM batch's supervised targets; returns None when labels are not 2-D or
+    supervised targets fill more than half the target positions."""
     labels = batch.get("labels")
     if labels is None or labels.ndim != 2:
         return None
@@ -11279,14 +10277,9 @@ def _compact_vlm_cce_batch(batch, small_capacity_limit=0):
 
 
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
-    """CPU-backed finite VLM schedule with on-demand MLX materialization.
-
-    Rows hold formatted dataset items (``formatting_func`` is consumed at
-    construction, once per scheduled slot), the schedule holds row positions
-    with a mask of distributed pad slots, and the plan-owned cache retains only
-    the most recent batch. Visits are identity-only: merged VLM epoch semantics
-    replay the stored schedule, so epoch permutation stays a text-plan behavior.
-    """
+    """Rows hold formatted items (formatting_func runs once per scheduled slot); the schedule holds row positions and a
+    pad mask; the cache keeps only the latest batch; visits are identity-only, and VLM epochs replay the stored
+    schedule, so only text plans permute."""
 
     __slots__ = (
         "_rows",
@@ -11341,8 +10334,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         )
         self._processor = processor
         self._config = config
-        # ``None`` stays ``None``: the VLM builder reads it as "no cap" (no
-        # ``max_length``, truncation a no-op) and the plan only forwards it.
+        # None stays None: the VLM builder reads it as no cap (no max_length, truncation a no-op), and the plan only forwards it.
         self.max_seq_length = (
             None if max_seq_length is None else int(max_seq_length)
         )
@@ -11397,11 +10389,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         return self._cycle_length
 
     def _build_batch(self, index, target_width=None):
-        """Build one batch through the complete existing VLM builder,
-        right-padded to ``target_width`` when an endpoint is given."""
-        # Re-read the probes before the payloads reach the processor: the
-        # construction check only covers the read window, and these rows are
-        # still the caller's own objects until here.
+        """Builds through the complete existing VLM builder, right-padded to target_width when an endpoint is given."""
+        # Re-read the media probes before payloads reach the processor, since the construction check only covers the
+        # read window and rows are still the caller's objects.
         for i in self._schedule[index]:
             _verify_vlm_media_pins(self._rows[i].pins, since_construction=True)
         batch_items = [
@@ -11430,10 +10420,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         return batch_dict
 
     def set_shape_plan(self, shape_plan, planned_widths):
-        """Install an admission plan plus each batch's planned event width
-        (the width the planner grouped it by; raw for declined batches).
-        Invalidates the cache: nothing built before installation may serve a
-        planned fetch."""
+        """Installs an admission plan and each batch's planned event width (raw for declined batches); invalidates the
+        cache so no pre-install batch serves a planned fetch."""
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
             raise ValueError("only exact or bucket shape plans can be installed")
         planned_widths = tuple(
@@ -11488,19 +10476,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         return compacted
 
     def materialize(self, index, target_width=None, *, phase=None):
-        """Build one batch through the complete existing VLM builder.
-
-        The cache holds only the most recent batch at its exact requested
-        width, so a repeated fetch (e.g. a compile-failure retry) is free;
-        a fetch it cannot serve drops it before building, so a transition to
-        the next batch never holds two. ``target_width``
-        right-pads to an explicit endpoint and keeps bypass authority; with
-        an installed shape plan, ``phase`` instead resolves the planned
-        endpoint, enforces phase-aware admission, and hard-fails on
-        structural drift from the surveyed family before the batch reaches a
-        compiled call. ``None``/``None`` preserves the historical
-        per-batch-maximum padding byte for byte.
-        """
+        """Builds through the full VLM builder; the MRU cache serves a repeat at the same width; target_width right-pads
+        to an endpoint; with a shape plan, phase resolves the planned endpoint and hard-fails on structural drift
+        before a compiled call; None/None keeps per-batch-maximum padding."""
         index = operator.index(index)
         check_drift = False
         if (
@@ -11520,20 +10498,14 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         cached = self._mru
         if cached is not None and cached[0] == (index, target_width):
             _key, cached_batch, drift_checked = cached
-            # Cache identity covers shape, not provenance: a batch cached by an
-            # explicit-width fetch has not passed the structural proof, so a planned
-            # fetch must verify it before the compiled path consumes it.
+            # Cache identity covers shape, not provenance: a batch cached by an explicit-width fetch has not passed the
+            # structural proof, so a planned fetch must verify it first.
             if check_drift and not drift_checked:
                 self.check_family_drift(index, cached_batch)
                 self._mru = (_key, cached_batch, True)
             return cached_batch
-        # This fetch cannot be served from the cache, so the cached batch is
-        # already dead weight. Release it before the builder allocates its
-        # replacement: the trainer clears its own ``batch_data`` reference
-        # ahead of every fetch, so this entry is the last thing keeping the
-        # previous batch resident, and holding it across the build would put
-        # two complete image/text batches in memory at every transition. A
-        # same-batch retry is unaffected, having returned above.
+        # Drop the cached batch before building its replacement, since it is the last reference to the previous batch
+        # and holding it keeps two image/text batches resident; same-batch retries return earlier.
         self._mru = None
         cached = None
         batch_dict = self._build_batch(index, target_width=target_width)
@@ -11558,10 +10530,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         return batches
 
     def supervision_counts(self, max_check=100):
-        """(all_masked_rows, trainable_rows) over the first ``max_check``
-        scheduled rows, from construction-time metadata. Does no processor
-        work or materialization, so a caller's distributed reduction is never
-        preceded by new rank-local work."""
+        """Returns (all_masked_rows, trainable_rows) over the first max_check rows from construction metadata only; no
+        processor work, so no rank-local work precedes a distributed reduction."""
         seen_bad = 0
         seen_good = 0
         checked = 0
@@ -11582,23 +10552,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         return seen_bad, seen_good
 
     def advance_preprocessing(self, visits):
-        """Replay the processor over the first ``visits`` visits, discarding
-        the batches.
-
-        ``resume_from_checkpoint`` starts the loop past the micro-batches the
-        killed run already consumed. The eager builder had produced every one
-        of them through the real processor, so a preprocessing pipeline that
-        draws from the shared RNGs was already past them when the killed run
-        reached this point; a lazy plan that simply skips them would hand the
-        first resumed batch the opening draw instead. Rebuilding here (MRU
-        dropped, one batch alive at a time) restores that progression exactly,
-        the way the streaming path fast-forwards its iterator. Unlike the
-        descriptor survey this deliberately does NOT preserve RNG state.
-
-        Visits past the stored schedule replayed prebuilt batches eagerly, so
-        the processor ran at most once per scheduled batch however far the
-        killed run reached; the count is clamped to match.
-        """
+        """Replays the processor over the first visits, discarding batches, so a resumed run's RNG draws match the
+        killed run; skipping would hand the first resumed batch the opening draw. Clamped to the schedule (eager
+        replay ran each batch once); RNG state is not preserved."""
         visits = min(operator.index(visits), len(self._schedule))
         if visits <= 0:
             return
@@ -11609,17 +10565,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._mru = None
 
     def ensure_descriptors(self):
-        """Survey every scheduled batch's compile-key family, once.
-
-        The MRU cache is dropped up front and never repopulated here, and each
-        batch is released before the next is built, so the survey owns at most
-        one batch at a time; repeated calls return the stored descriptors.
-        Runs under preserved global preprocessing RNG state, so a stochastic
-        processor's augmentation draws are not consumed here. Draw state a
-        processor owns privately is out of that preservation's reach and does
-        advance by one survey; ``check_family_drift`` names this when the
-        difference reaches the shapes.
-        """
+        """Surveys each batch's compile-key family once, dropping the MRU cache and holding one batch at a time; global
+        preprocessing RNG is preserved so augmentation draws are not consumed, but privately held processor draw
+        state advances by one survey (see check_family_drift)."""
         if self._descriptors is not None:
             return self._descriptors
         self._mru = None
@@ -11635,8 +10583,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                     batch,
                     disposable_keys=_vlm_pipeline_disposable_keys(self._config),
                 )
-                # Padable batches get symbolic families (batches differing only in
-                # text width coincide); declined batches keep every extent concrete.
+                # Padable batches get symbolic families so batches differing only in text width coincide; declined batches keep every extent concrete.
                 family = _vlm_batch_family(
                     batch, symbolic_axes=axes if padable else None,
                 )
@@ -11656,18 +10603,14 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
 
     @property
     def pad_token_id(self):
-        """The tokenizer pad id planned padding would use, or None. Without
-        one no batch can be widened, so width planning degrades the run to
-        eager before surveying anything."""
+        """Tokenizer pad id that planned padding would use, or None; without one no batch can be widened, so width
+        planning degrades the run to eager before surveying."""
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
         return getattr(tokenizer, "pad_token_id", None)
 
     def carries_audio_hint(self):
-        """Whether this plan carries audio, without forcing a full survey.
-
-        Uses the survey when one has run, else builds a single batch. Callers
-        that must materialize nothing should survey and ask ``carries_audio``.
-        """
+        """Audio presence without forcing a full survey: uses the survey if one has run, else builds a single batch;
+        callers that must materialize nothing should survey and ask carries_audio."""
         if self._audio_flags is not None:
             return any(self._audio_flags)
         if not len(self._schedule):
@@ -11680,13 +10623,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             del batch
 
     def carries_audio_in(self, indices):
-        """Whether any of the named surveyed batches carries audio.
-
-        The whole-plan answer counts batches the schedule drops, and audio
-        confined to that tail would route a run eagerly, or abort strict mode,
-        over a batch no compiled call reaches -- the same reason family
-        admission is restricted to the executed set.
-        """
+        """Whether any named surveyed batch carries audio; a whole-plan answer would count dropped tail batches and
+        route runs eagerly or abort strict mode, as family admission already avoids by limiting to the executed set."""
         flags = self._audio_flags
         if flags is None:
             raise RuntimeError(
@@ -11714,8 +10652,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         return self._descriptors[operator.index(index)]
 
     def batch_width(self, index):
-        """Surveyed post-prepare text width for one scheduled batch (None
-        when the batch exposes no 2-D input_ids)."""
+        """Surveyed post-prepare text width for one scheduled batch; None when the batch exposes no 2-D input_ids."""
         if self._descriptors is None:
             raise RuntimeError(
                 "Unsloth MLX: VLM batch widths have not been surveyed; "
@@ -11724,19 +10661,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         return self._widths[operator.index(index)]
 
     def planned_event_widths(self):
-        """Per-batch planner event widths from the survey: padable batches
-        take the shared rounded width policy capped at the surveyed maximum
-        final width (never ``max_seq_length``, which post-expansion widths may
-        exceed) and bumped off the union of untouched-array extents; declined
-        batches keep their raw widths. Deterministic given the survey, so
-        planning and installation derive identical widths.
-
-        The bump outranks the cap, so an endpoint may land above the surveyed
-        maximum: a width the finalizer would reject as an untouched extent is
-        no endpoint at all, and stepping up costs a few pad columns (at most
-        one per member of the finite union) while declining the capped width
-        instead would split one shared endpoint back into one per raw width --
-        the signature count this plan exists to bound."""
+        """Padable batches take the rounded width capped at the surveyed max final width (not max_seq_length), bumped
+        off untouched-array extents even past the cap; declined batches keep raw widths. Stepping up costs few pad
+        columns; declining would split one shared endpoint per raw width."""
         if self._descriptors is None:
             raise RuntimeError(
                 "Unsloth MLX: VLM batch widths have not been surveyed; "
@@ -11767,12 +10694,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         return tuple(widths)
 
     def check_family_drift(self, index, batch):
-        """Hard-fail when a materialized batch's structure leaves its
-        surveyed family. Container structure, dict keys and order, constant
-        values, and every array extent outside the detected text axis must
-        hold on every visit; that axis is symbolic for padable batches, so
-        planned padding is not drift. Value nondeterminism inside
-        equal-shaped arrays stays undetected by design."""
+        """Hard-fails when a batch's structure leaves its surveyed family: container structure, dict keys and order,
+        constants and extents off the text axis must hold; planned padding on that axis is not drift; value
+        nondeterminism in equal-shaped arrays goes undetected by design."""
         index = operator.index(index)
         _width, axes, padable, _forbidden = _vlm_width_survey(
             batch,
@@ -11803,13 +10727,8 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
                        num_epochs=None, completion_only_loss=None,
                        image_size=None, comm_group=None,
                        distributed_pad_mode="cycle"):
-    """Build the CPU-backed finite VLM batch plan (no materialization).
-
-    Mirrors the eager builder's construction exactly — filtering, formatting,
-    epoch/global slicing, rank slicing, and pad-slot resolution — but stores
-    row indices and pad masks instead of built batches. Returns ``None`` for
-    an empty dataset (the wrapper preserves the historical ``[]``).
-    """
+    """Build the CPU-backed VLM plan without materializing batches, mirroring the eager builder but storing row indices
+    and pad masks; None for an empty dataset (the wrapper keeps [])."""
     import numpy as np
 
     if not _vlm_has_sized_index_space(dataset):
@@ -11915,27 +10834,13 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
         )
 
     if formatted_items is None:
-        # One row per scheduled slot, read in schedule order: the eager builder
-        # indexed the dataset (and ran the formatter) while building every
-        # batch, so a stochastic or epoch-dependent dataset or formatter must
-        # refresh on every revisit. Consuming it here still keeps user code out
-        # of re-materialization, and each result is snapshotted so a later
-        # visit cannot rewrite an earlier one.
-        # Media payloads stay referenced: copying them would cost one image per
-        # scheduled slot rather than per row. `media_pins` probes their content
-        # instead, so a dataset that reuses one decode buffer is reported.
-        # The processor also no longer runs between one slot and the next, so a
-        # pipeline whose formatter and processor draw the SAME process-global
-        # RNG sees a different interleaving than the eager builder gave it.
-        # Restoring it would mean processing at construction, which is the
-        # memory this plan exists to save.
+        # Rows are read per scheduled slot so stochastic datasets refresh, each snapshotted; media stays referenced and
+        # media_pins probes it for shared decode buffers; a shared process-global RNG is drawn in a different order than
+        # eager building.
         media_pins = []
         rows = tuple(
-            # Release before pinning, not after: a pin holds its payload so
-            # the probe can re-read it, which would keep every row's file
-            # open for the whole collection. The released stand-in is
-            # pinned by identity instead, which costs a stat and catches a
-            # dataset that rewrites one shared path per row.
+            # Release before pinning, since a pin holds its payload and would keep each file open; the stand-in is
+            # pinned by identity (one stat), catching datasets rewriting one shared path.
             _pinned_finite_vlm_row(
                 _release_vlm_row_image_handles(
                     _format_vlm_row_gating_audio(
@@ -11955,8 +10860,7 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
             offset += len(batch)
         schedule = remapped
     else:
-        # Compact remap over the filter's already-formatted rows: the eager
-        # builder reused those same per-index objects on every visit.
+        # Compact remap over already-formatted rows; the eager builder reused those same per-index objects on every visit.
         used = []
         seen_used = set()
         for batch in schedule:
@@ -11965,8 +10869,7 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
                     seen_used.add(idx)
                     used.append(idx)
         position = {idx: pos for pos, idx in enumerate(used)}
-        # The filter already formatted these, so they are referenced rather
-        # than snapshotted, but they reach the processor just as late.
+        # The filter already formatted these, so rows are referenced rather than snapshotted, but they reach the processor just as late.
         rows = tuple(
             _pinned_finite_vlm_row(
                 _release_vlm_row_image_handles(formatted_items[idx]),
@@ -12026,14 +10929,9 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
 
 
 def _vlm_has_sized_index_space(dataset):
-    """True when the VLM batcher can index the dataset (`__len__` + `__getitem__`).
-
-    Both must be declared on the TYPE (instance `__getattr__` proxies do not
-    make an object subscriptable), and known iterable-only bases are excluded
-    even when they inherit a raising `__getitem__` or declare stream topology.
-    Everything else streams lazily; the sized path's permutations and
-    response-mask pre-scan require real indexing.
-    """
+    """True when the type declares __len__ and __getitem__ (instance __getattr__ proxies do not count) and does not
+    inherit a known iterable-only base; other sources stream lazily, since permutations and response-mask pre-scans
+    need real indexing."""
     cls = type(dataset)
     if not callable(getattr(cls, "__len__", None)):
         return False
@@ -12103,13 +11001,9 @@ def _iterate_lazy_vlm_training_batches(
     ignore_token_ids=None, yield_host_staged=False, reject_mlx_valued=False,
     should_stop=None, width_policy=None,
 ):
-    """Unsized VLM batches under the lazy text-stream lifecycle contracts.
-
-    Single-process only: every-rank consumption of the global stream is
-    intentionally removed and rank-owned dispatch of ragged VLM tensors is a
-    planned follow-up. Trainability filtering, label masking, and collation
-    reuse the sized-path helpers unchanged.
-    """
+    """Yield unsized VLM batches under the lazy text-stream lifecycle; single-process only, as every-rank consumption is
+    removed and rank-owned ragged VLM dispatch is a follow-up; filtering, masking and collation reuse the sized-path
+    helpers."""
     if (yield_host_staged or reject_mlx_valued) and response_mask_fn is not None:
         # Zero-touch rejection: no set_epoch, no iterator, no source pull.
         raise ValueError(
@@ -12146,9 +11040,8 @@ def _iterate_lazy_vlm_training_batches(
         )
 
     def _filter_stream_item(item):
-        """Return a formatted trainable streaming row, or None to skip it.
-        Synchronous response-masked filtering finalizes and runs the legacy
-        closure; producer modes reject before reaching here."""
+        """Returns a formatted trainable streaming row, or None to skip it; synchronous response-masked filtering runs
+        the legacy closure, while producer modes reject before reaching here."""
         if response_mask_fn is None:
             return item
         if yield_host_staged or reject_mlx_valued:
@@ -12337,8 +11230,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   prefetch_skip_batches=0,
                                   prefetch_control=None,
                                   width_policy=None):
-    """Streaming VLM batch generator using processor directly. Yields batch
-    dicts with input_ids, pixel_values, attention_mask, and optionally labels."""
+    """Streaming VLM batch generator that calls the processor directly; it yields dicts with input_ids, pixel_values, attention_mask, and optionally labels."""
     import numpy as np
 
     image_size = _resolve_vlm_image_size(image_size, config, processor)
@@ -12445,8 +11337,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
     else:
         prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
         if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
-            # The shared producer stages; the VLM finalizer converts on the
-            # consumer thread. Response-masked streams reject at iterator entry.
+            # The shared producer stages; the VLM finalizer converts on the consumer thread; response-masked streams reject at iterator entry.
             prefetcher = _LazyTextPrefetcher(
                 None,
                 prefetch_depth,
@@ -12506,23 +11397,9 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
                      formatting_func=None, chat_template=None,
                      model_name=None, model_type=None,
                      append_eos=True):
-    """Wrap a HuggingFace dataset into mlx-lm's dataset classes.
-
-    Uses CacheDataset from mlx_lm while leaving rendered text token-exact.
-
-    If a formatting_func is provided, each item is pre-formatted into a
-    ``{"text": ...}`` dict before wrapping.
-
-    ``append_eos`` controls whether the tokenizer's EOS id is appended to
-    each encoded row. Default True preserves the pre-PR behavior that
-    delegated EOS appending to ``mlx_lm.tuner.datasets.TextDataset`` for
-    direct MLX text fine-tuning callers (raw ``{"text": str}`` rows
-    without already-rendered EOS). Unsloth passes False because its
-    chat-template rendering already includes EOS.
-
-    Returns:
-        A CacheDataset ready for ``iterate_batches``.
-    """
+    """Wrap an HF dataset in mlx-lm CacheDataset, pre-formatting rows with formatting_func and keeping rendered text
+    token-exact; append_eos defaults to True for raw text, and Unsloth passes False since its chat template already
+    adds EOS."""
     from mlx_lm.tuner.datasets import CacheDataset
 
     normalize_mlx_chat_template(
@@ -12564,8 +11441,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     _eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
 
     class _StudioTextDataset:
-        """TextDataset variant. Optionally appends EOS (mlx-lm parity);
-        Unsloth passes append_eos=False because chat templates already render it."""
+        """TextDataset variant; optionally appends EOS for mlx-lm parity, but Unsloth passes append_eos=False since chat templates already render EOS."""
 
         def __init__(self, data, tokenizer, text_key="text", eos_id=None):
             self._data = data
@@ -12619,9 +11495,7 @@ def _create_default_text_plan(
         cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=0,
-        # Match mlx-lm iterate_batches padding (1 + 32*ceil(len/32)) so the
-        # default text path keeps mlx-lm's causal-shift contract and bounded
-        # signatures, like the distributed/streaming builders.
+        # Match mlx-lm iterate_batches padding (1 + 32*ceil(len/32)) to keep its causal-shift contract and bounded signatures.
         minimum_width=2,
         pad_to_multiple=32,
         visit_policy="epoch_permute" if num_batches is None else "identity",
@@ -12637,24 +11511,9 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
                             completion_only_loss=None,
                             assistant_only_loss=False, comm_group=None,
                             distributed_pad_mode="cycle"):
-    """Build a finite CPU-backed text batch plan.
-
-    Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
-    samples are sorted by length, grouped into batches, and padded to the
-    max length within each batch (rounded up to the nearest multiple of 32),
-    capped at max_seq_length.
-
-    Tokenization is delegated to mlx_lm's TextDataset (appends EOS, etc.)
-    so behaviour matches ``mlx_lm.lora`` exactly.
-
-    In DDP, ``batch_size`` remains the local per-rank micro-batch size. The
-    optional ``comm_group`` is used only to derive a global batch for sharding,
-    then tail global batches are padded so every rank yields the same number
-    of local batches.
-
-    Public callers use :func:`create_batches`, which eagerly materializes this
-    plan for compatibility. Finite training retains the plan and indexes it.
-    """
+    """Build a finite CPU text plan via mlx_lm iterate_batches: length-sorted, padded to the batch max rounded to a
+    multiple of 32, capped at max_seq_length; tokenized by TextDataset to match mlx_lm.lora; DDP batch_size is
+    per-rank, comm_group pads tail batches so ranks get equal counts."""
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
@@ -12802,12 +11661,8 @@ def _rank_slice_distributed_batch(
     pad_source=None,
     pad_mode="cycle",
 ):
-    """Return this rank's local slice from one global DDP micro-batch.
-
-    Tail global batches are padded so every rank executes the same number of
-    micro-batches and collectives stay aligned. Training uses ``cycle`` to keep
-    full batches; eval can use ``empty`` so padded rows do not contribute tokens.
-    """
+    """Return this rank's slice of one global DDP micro-batch; tail batches are padded so collectives stay aligned,
+    using cycle for training and empty for eval so pad rows add no tokens."""
     rank, world_size = _distributed_rank_size(comm_group)
     items = list(items)
     if world_size <= 1:
@@ -12904,12 +11759,8 @@ def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length,
 
 
 def _mask_empty_vlm_padding_rows(batch_dict, empty_rows, processor=None):
-    """Mask synthetic VLM eval padding labels so they do not affect metrics.
-
-    Keep input_ids and attention_mask unchanged: VLM processors may have
-    already attached row-aligned image features, and the forward still needs a
-    valid text/vision row. Labels alone exclude the row from eval loss.
-    """
+    """Mask synthetic eval padding rows via labels only; input_ids and attention_mask stay intact, since processors
+    attach row-aligned image features and the forward needs a valid row."""
     if not any(empty_rows):
         return batch_dict
     row_mask = np.asarray(empty_rows, dtype=bool)
@@ -12939,17 +11790,12 @@ def _create_distributed_text_plan(
     tokenizer=None,
 ):
     """Distributed variant of mlx-lm's length-sorted text batch iterator."""
-    # Length is measured on the tokenized row. CacheDataset.itemlen returns
-    # len(raw_row), which for the {"text": ...} rows _prepare_dataset produces
-    # is the dict key count (1), not the token count, so it cannot gate the
-    # two-token minimum below. Reading dataset[idx][0] yields the processed
-    # token ids (mirroring _iter_tokenized_text_rows) and caches the processed
-    # row on the CacheDataset, so the batch build below reuses it.
+    # Length is measured on the tokenized row: CacheDataset.itemlen returns the dict key count (1) for {text} rows, so
+    # it cannot gate the two-token minimum; dataset[idx][0] yields the processed token ids and caches the row for reuse
+    # by the batch build.
     len_fn = lambda idx: len(dataset[idx][0])
-    # Drop rows with fewer than two tokens (no causal target). Length sorting
-    # places these shortest rows first, so without this filter an all-short
-    # first global microbatch would sum to zero supervised tokens and trip the
-    # zero-supervised-token abort in trainer.py.
+    # Drop rows under two tokens (no causal target): length sorting puts them first, and an all-short first microbatch
+    # would trip the zero-supervised-token abort in trainer.py.
     idx = sorted((i for i in range(len(dataset)) if len_fn(i) >= 2), key=len_fn)
     if not idx:
         raise ValueError(
@@ -12965,9 +11811,7 @@ def _create_distributed_text_plan(
     rng = np.random.RandomState(_normalize_seed(seed))
 
     schedule = []
-    # Micro-batches in ONE dataset pass. Every permutation visits all global
-    # batches and a local slice is non-empty regardless of visit order, so this
-    # holds for every pass even if num_batches truncates the first one.
+    # Micro-batch count per pass: every permutation visits all global batches and local slices stay non-empty, even when num_batches truncates the first pass.
     cycle_length = sum(
         1 for group in batch_idx
         if _rank_slice_distributed_batch(
@@ -13207,15 +12051,8 @@ def _create_ordered_text_plan(
     assistant_only_loss=False,
     comm_group=None,
 ):
-    """Plan text batches with an explicit dataset order.
-
-    Unsloth uses this to mirror CUDA's effective sampler stream without
-    changing generic mlx-lm batching behavior.
-
-    In DDP, ``batch_size`` remains local to each rank. ``comm_group`` expands
-    the ordered stream into global micro-batches, pads the final global batch
-    if needed, and returns only this rank's local slice.
-    """
+    """Build a text batch plan over an explicit dataset order, mirroring CUDA's sampler stream without changing mlx-lm
+    batching; under DDP, comm_group expands to global micro-batches and returns this rank's slice."""
 
     labeled = False
     tokenized = []
@@ -13514,8 +12351,7 @@ def _iter_lazy_tokenized_text_rows(
         if completion_only_loss is not None:
             return completion_only_loss
         if item_has_boundary or row_has_boundary:
-            # Resolve from the row's own shape: inheriting a plain-text row's
-            # False would silently train prompt tokens, order-dependently.
+            # Resolve from the row's own shape; inheriting a plain-text row's False would silently train prompt tokens, depending on row order.
             state["pretokenized_completion_only_loss"] = True
             return True
         if "pretokenized_completion_only_loss" in state:
@@ -13526,8 +12362,7 @@ def _iter_lazy_tokenized_text_rows(
         completion_mode,
         has_completion_boundary=False,
     ):
-        # Empty label-owned rows have no labels yet are not an unlabeled schema
-        # transition; a non-None sentinel preserves that.
+        # Empty label-owned rows have no labels yet are not an unlabeled schema transition; the non-None () sentinel preserves that.
         label_owned = response_mask_fn is not None or assistant_only_loss or (
             completion_mode is True and has_completion_boundary
         )
@@ -13560,8 +12395,7 @@ def _iter_lazy_tokenized_text_rows(
             and formatting_func is not None
             and "assistant_source_checked" not in state
         ):
-            # Eager/SFT contract: validate the first original sample once, then
-            # every formatter result below. Pretokenized rows bypass both.
+            # Eager/SFT contract: validate the first original sample once, then every formatter result; pretokenized rows bypass both.
             if not source_has_input_ids:
                 _require_assistant_conversation(item)
             state["assistant_source_checked"] = True
@@ -13800,13 +12634,9 @@ def _close_mlx_owned_iterator(iterator):
 
 def _probe_lazy_replayability(source_dataset, current_iterator, set_epoch,
                               require_replayable, resume_error):
-    """Classify a lazy source's replayability; prove it when resume needs it.
-
-    Returns ``(replayable, cached_next_iterator)``; ``replayable`` is True /
-    False / None (unknown until first restart), and the cached proven-fresh
-    traversal is retained only for sources without ``set_epoch`` (epoch-aware
-    sources recreate after ``set_epoch`` advances).
-    """
+    """Return (replayable, cached_next_iterator); replayable is True, False or None (unknown until first restart), and
+    the iterator is kept only for sources without set_epoch, since epoch-aware sources recreate after set_epoch
+    advances."""
     if isinstance(source_dataset, Iterator):
         replayable = False
     elif _is_mlx_hf_iterable_text_source(source_dataset):
@@ -13854,15 +12684,9 @@ _PREFETCH_ERROR = "error"
 
 
 class _LazyTextPrefetcher:
-    """Bounded single-producer prefetch over host-staged text batches.
-
-    The producer thread owns source consumption and host staging; MLX
-    finalization runs only on the consumer thread. A queue slot is reserved
-    BEFORE staging each batch so read-ahead is exactly the configured depth.
-    Cancellation is cooperative, and a bounded join that times out marks the
-    prefetcher ORPHANED; while the orphan lives the trainer refuses to reuse the
-    shared preprocessing objects.
-    """
+    """A bounded single-producer prefetch: a queue slot is reserved before staging, so read-ahead equals the configured
+    depth; MLX finalization stays on the consumer; a timed-out join marks it ORPHANED, blocking reuse of shared
+    preprocessing."""
 
     _JOIN_TIMEOUT = 5.0
     _QUIESCE_TIMEOUT = 30.0
@@ -13936,14 +12760,12 @@ class _LazyTextPrefetcher:
                     except Exception:
                         pass
             finally:
-                # quiesce() treats _done as proof the thread is finished with
-                # the shared objects, so publish it only after cleanup.
+                # quiesce() treats _done as proof the thread is finished with shared objects, so set it only after cleanup.
                 self._done.set()
 
     def _ensure_started(self):
         with self._lifecycle_lock:
-            # One lock covers the closed check and thread publication, so a
-            # concurrent close() cannot report "clean" then see a new producer.
+            # One lock covers the closed check and thread publication, so a concurrent close() cannot report clean and then see a new producer.
             if self._closed or self._stop.is_set():
                 raise StopIteration
             if self._thread is None:
@@ -14001,16 +12823,10 @@ class _LazyTextPrefetcher:
         self._pause.clear()
 
     def close(self):
-        """Join the producer, then release any queued batches once it is
-        confirmed dead. Terminal, idempotent, safe under concurrent callers.
-        Returns True when the producer terminated (queue drained), False when it
-        overran the join and is a live orphan. Join, classification, and drain
-        run under one lock, so a True return guarantees the queue was drained
-        before it was reported and no concurrent closer can see it half-drained.
-        ``orphaned`` is set conservatively before the join, so an interrupted
-        join leaves a live producer classified as an orphan."""
-        # Conservative orphan up front: an interrupt during the lock, join, or
-        # drain then leaves the producer unresolved rather than falsely clean.
+        """Joins the producer then drains queued batches; terminal, idempotent and safe for concurrent callers. Returns
+        True only if it terminated and was drained under one lock, else False for a live orphan; orphaned is set
+        before the join so an interrupted join leaves a live producer classified as orphan."""
+        # Mark orphaned before the join: an interrupt during the lock, join, or drain leaves the producer unresolved, not falsely clean.
         self.orphaned = True
         with self._lifecycle_lock:
             self._stop.set()
@@ -14022,17 +12838,13 @@ class _LazyTextPrefetcher:
                 thread.join(timeout=self._JOIN_TIMEOUT)
             terminated = thread is None or not thread.is_alive()
             if terminated:
-                # A joined-dead thread never writes again, so this cannot lose
-                # a batch. Clear the flag only after the drain, so an interrupt
-                # mid-drain still leaves a conservative orphan.
+                # A joined-dead thread never writes again, so no batch is lost; orphaned is cleared only after the drain, so an interrupt keeps it set.
                 self._drain_envelopes()
                 self.orphaned = False
             return terminated
 
     def _drain_envelopes(self):
-        """Discard queued batches so their payloads (device tensors for opaque
-        VLM outputs) are released at close instead of being retained until the
-        consumer generator is collected."""
+        """Discards queued batches so payloads (device tensors for opaque VLM outputs) are freed at close, not held until the consumer generator is collected."""
         while True:
             try:
                 self._envelopes.get_nowait()
@@ -14097,16 +12909,9 @@ def _iterate_lazy_text_training_batches(
     should_stop=None,
     width_policy=None,
 ):
-    """Yield text batches without materializing an unsized source.
-
-    ``sequential`` order and ``length_window_batches=1`` emit exact source
-    order. Default order with a window > 1 pools that many global micro-batches
-    of trainable rows, stable-sorts them by truncated prepared-token length, and
-    emits the full chunks in a seeded deterministic permutation (partial chunk
-    last). Custom replayable sources must return independent fresh traversals
-    from ``iter(source)``; resume validation may create one non-consuming
-    iterator ahead of the serving iterator.
-    """
+    """Unsized text: sequential or window 1 keeps source order; otherwise pooled windows are stable-sorted by token
+    length and full chunks emitted in a seeded permutation, partial chunk last; replayable sources need fresh
+    iter(source) traversals; resume may open one extra non-consuming iterator."""
     if dataset_order == "torch_randperm":
         raise ValueError(
             "Unsloth MLX: dataset_order='torch_randperm' is not supported for "
@@ -14120,8 +12925,7 @@ def _iterate_lazy_text_training_batches(
         # Sequential contract: exact source order, length grouping off.
         length_window = 1
     window_seed = _normalize_seed(window_seed)
-    # Cycle padding only feeds direct multi-rank slicing; single-process and
-    # rank-0 owner iterators must not retain a pass-long first batch.
+    # Cycle padding only feeds direct multi-rank slicing; single-process and rank-0 owner iterators must not retain a pass-long first batch.
     needs_padding_source = _distributed_rank_size(comm_group)[1] > 1
 
     prepared_view = (
@@ -14200,8 +13004,7 @@ def _iterate_lazy_text_training_batches(
             window_ordinal = 0
 
             def _flush_window():
-                # Stable sort by truncated length, chunk, then seeded-permute
-                # the FULL chunks only, so a partial chunk always emits last.
+                # Stable sort by truncated length, chunk, then seeded-permute only the FULL chunks, so a partial chunk always emits last.
                 nonlocal window_rows, window_ordinal, yielded
                 if not window_rows:
                     return
@@ -14282,8 +13085,7 @@ def _iterate_lazy_text_training_batches(
                     yield first
 
             def _stoppable(source):
-                # Cancellation lands between source rows: checked before each
-                # pull (so a stop costs no extra blocking read) and after it.
+                # Cancellation lands between source rows: checked before each pull (so a stop costs no extra blocking read) and after it.
                 iterator = iter(source)
                 while True:
                     if should_stop():
@@ -14439,8 +13241,7 @@ def _iterate_lazy_text_training_batches(
             if replay_iterator is active_iterator
             else (active_iterator, replay_iterator)
         )
-        # Close every owned cursor without replacing an in-flight failure. The
-        # epoch-boundary close above stays strict and still surfaces errors.
+        # Close every owned cursor without replacing an in-flight failure; the epoch-boundary close above stays strict and surfaces errors.
         for iterator in cleanup_iterators:
             try:
                 _close_mlx_owned_iterator(iterator)
@@ -14536,12 +13337,8 @@ def _iterate_dispatched_lazy_text_training_batches(
     distributed_pad_mode="cycle",
     **kwargs,
 ):
-    """Dispatch rank-0-owned lazy text batches to all data-parallel ranks.
-
-    The owner retains the first global batch of the pass only to keep legacy
-    cycle-padding deterministic. Non-owner ranks never touch the source, so the
-    supplied source is interpreted as the global, unsharded stream.
-    """
+    """Dispatch batches from rank 0, the only rank reading the source, to all DDP ranks; the source is the global
+    unsharded stream, and rank 0 keeps its first batch for legacy cycle padding."""
     rank, world_size = _distributed_rank_size(comm_group)
     target_size = int(batch_size) * world_size
     if target_size <= 0:
@@ -14568,9 +13365,8 @@ def _iterate_dispatched_lazy_text_training_batches(
                     "before split_dataset_by_node(); MLX owns rank partitioning."
                 )
         except BaseException as exc:
-            # Defer even interrupts: peers block in the dispatch collective
-            # below, so rank 0 must broadcast the failure status before it
-            # unwinds. Re-raised through the loop's rank-0 path.
+            # Defer even interrupts: peers block in the dispatch collective below, so rank 0 must broadcast failure
+            # status before unwinding; re-raised through the loop's rank-0 path.
             owner_contract_error = exc
         owner_iterator = _iterate_lazy_text_training_batches(
             dataset,
@@ -14592,8 +13388,7 @@ def _iterate_dispatched_lazy_text_training_batches(
             width = 0
             has_labels = 0
             status = 0
-            # Drop the previous fetch before pulling, so dispatch never holds
-            # two batches alongside the window.
+            # Drop the previous fetch before pulling so dispatch never holds two batches alongside the window.
             owner_batch = input_ids = lengths = labels = None
             if rank == 0:
                 try:
@@ -14618,9 +13413,8 @@ def _iterate_dispatched_lazy_text_training_batches(
                 except StopIteration:
                     pass
                 except BaseException as exc:
-                    # Synchronize interrupts too: peers are entering the all_sum
-                    # below and would hang if rank 0 unwound past it. The
-                    # original error is re-raised on rank 0 after the sync.
+                    # Synchronize interrupts too: peers enter the all_sum below and would hang if rank 0 unwound past
+                    # it; rank 0 re-raises the original error after the sync.
                     owner_error = exc
                     status = -1
 
@@ -14801,17 +13595,9 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              prefetch_skip_batches=0,
                              prefetch_control=None,
                              width_policy=None):
-    """Streaming batch generator for MLX training.
-
-    Map-style datasets retain the existing mlx-lm batching behavior. Unsized
-    text sources are normalized and tokenized incrementally, retaining at most
-    ``length_window_batches`` global micro-batches of prepared rows (plus the
-    rank-0 owner's pass-long cycle-padding batch under DDP). Default order with
-    a window > 1 emits length-grouped, seeded-permuted batches; ``sequential``
-    and window 1 preserve exact source order. Yields ``(batch, lengths, labels)``
-    like create_batches, with ``labels`` None unless text prompt/completion
-    masking is active.
-    """
+    """Streaming MLX batch generator: map-style data keeps mlx-lm batching; unsized text is tokenized incrementally with
+    at most length_window_batches global micro-batches of prepared rows held (plus one pass-long cycle-padding batch
+    under DDP); yields (batch, lengths, labels), labels None unless prompt/completion masking."""
     from mlx_lm.tuner.trainer import iterate_batches
 
     if _is_mlx_lazy_text_source(dataset):
@@ -14903,11 +13689,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     if assistant_only_loss:
         _validate_mlx_text_assistant_only_dataset(dataset)
 
-    # Normalize once (capturing the return, which may swap the tokenizer) so
-    # both the labeled path below and the default/ordered path share it and we
-    # never double-normalize a plain-text dataset (completion_only_loss=None
-    # enters the labeled block, finds no prompt/completion rows, and falls
-    # through here).
+    # Normalize once and keep the returned tokenizer, which may swap it; plain-text data with completion_only_loss=None
+    # falls through the labeled block, so never normalize twice.
     tokenizer = normalize_mlx_chat_template(
         tokenizer,
         chat_template=chat_template,
@@ -14994,28 +13777,14 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
 
 
 def _inherit_target_permissions(tmp_file, target):
-    """Carry an existing target's access bits onto the temp file replacing it.
-
-    os.replace() installs the temp file's inode, so the destination's mode and
-    group would otherwise be dropped for whatever the temp file was created with.
-    An in-place write kept both, so without this a re-save widens a deliberately
-    restricted adapter (0600 -> 0644 under the usual umask), and in a directory
-    that is not setgid it also moves the file to the writer's primary group,
-    which is how collaborators lose access to a group-shared checkpoint.
-
-    First save has no target to inherit from; the umask default is then correct.
-
-    Only mode and group are carried. Restoring a different owner needs privileges
-    we do not have, and POSIX ACLs have no interface in the standard library, so
-    a checkpoint relying on either is outside what this can preserve.
-    """
+    """Copy the target's mode and group onto the temp file before os.replace, else a re-save widens 0600 to 0644 or,
+    outside setgid dirs, moves the file to the writer's group; owner and POSIX ACLs are not carried."""
     try:
         info = os.stat(str(target))
     except OSError:
         return  # First save, or an unreadable target; the umask default stands.
     try:
-        # Group before mode: chown clears the setgid bit on some systems, so
-        # applying the mode afterwards is what keeps it. Owner is left alone.
+        # Group before mode: chown clears the setgid bit on some systems, so applying the mode afterwards keeps it; the owner is left alone.
         os.chown(str(tmp_file), -1, info.st_gid)
     except OSError:
         pass  # Not a member of that group, or a filesystem without ownership.
@@ -15026,8 +13795,7 @@ def _inherit_target_permissions(tmp_file, target):
 
 
 def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
-    # Refuse to write adapter_config.json without adapters.safetensors next
-    # to it; mlx-lm reload chokes on the missing weights file.
+    # Refuse to write adapter_config.json without adapters.safetensors beside it; mlx-lm reload chokes on the missing weights file.
     if not tensors:
         raise ValueError(
             "Unsloth: _save_adapter_artifacts() requires non-empty "
@@ -15080,9 +13848,8 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    # mx.load() arrays stay file-backed, so saving over the source truncates them
-    # mid-read (mlx 0.32.1: "[read] Unable to read from file"). Re-saving into the
-    # directory an adapter came from is the ordinary switch/merge path.
+    # mx.load() arrays stay file-backed, so saving over the source truncates them mid-read (mlx 0.32.1, 'Unable to read
+    # from file'); re-saving into the source directory is the ordinary switch/merge path.
     target = path / "adapters.safetensors"
     mx.eval(*tensors.values())
     tmp_file = target.with_name(f"{target.stem}.tmp{target.suffix}")
@@ -15259,9 +14026,8 @@ def _extract_mlx_lora_parameters(model):
     for _, m in iter_mlx_lora_modules(model):
         a_tensor = m.lora_a
         a_shape = tuple(getattr(a_tensor, "shape", ()))
-        # Switch LoRA layouts vary across mlx-lm versions; lora_b's last axis is
-        # always `rank`, so prefer it when num_experts is declared. Plain
-        # LoRALinear uses (in_dims, rank) where rank is shape[-1].
+        # Switch LoRA layouts vary across mlx-lm versions; lora_b's last axis is always rank, so prefer it when
+        # num_experts is declared; plain LoRALinear uses shape[-1] for rank.
         b_tensor = getattr(m, "lora_b", None)
         b_shape = tuple(getattr(b_tensor, "shape", ())) if b_tensor is not None else ()
         if hasattr(m, "num_experts") and len(b_shape) >= 3:
@@ -15278,11 +14044,8 @@ def _extract_mlx_lora_parameters(model):
 
 
 def iter_mlx_lora_modules(model):
-    """Yield (module_name, module) for each module that owns a complete LoRA pair.
-
-    mlx-lm reload only recreates lowercase lora_a / lora_b wrappers, so we
-    skip uppercase or half-built modules that cannot be reloaded.
-    """
+    """Yield (name, module) for modules with both lora_a and lora_b, skipping uppercase or half-built ones, since mlx-lm
+    reload only recreates lowercase lora_a / lora_b wrappers."""
     for module_name, module in model.named_modules():
         if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
             yield module_name, module
@@ -15294,13 +14057,8 @@ def is_mlx_dora_module(module):
 
 
 def collect_mlx_lora_adapter_tensors(model):
-    """Collect tensors for every module exposing a complete LoRA attr pair.
-
-    Anchors on the modules themselves so substring-`lora_` paths (e.g.
-    ``router.lora_gate.weight``) are not exported, and so callers can
-    still detect LoRA after reload/freeze when trainable_parameters()
-    no longer lists adapter tensors.
-    """
+    """Collect tensors of modules with a complete LoRA pair, anchored on modules so names like router.lora_gate.weight
+    are not exported; LoRA stays detectable after freeze or reload."""
     parameters = dict(mlx.utils.tree_flatten(model.parameters()))
     adapter_keys = set()
     for module_name, module in iter_mlx_lora_modules(model):
@@ -15314,10 +14072,8 @@ def collect_mlx_lora_adapter_tensors(model):
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
 
-# Wrapped base / quantization tensor suffixes (LoRALinear, DoRALinear,
-# LoRAEmbedding) that are reload-leaked state we must drop from adapter
-# saves. `.linear.bias` and `.bias` are intentionally NOT here: those are
-# legitimate trainable user state.
+# Wrapped base and quantization tensor suffixes (LoRALinear, DoRALinear, LoRAEmbedding) are reload-leaked state dropped
+# from adapter saves; .linear.bias and .bias stay trainable.
 _LORA_WRAPPED_BASE_SUFFIXES = (
     ".weight",
     ".scales",
@@ -15330,8 +14086,7 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
     ".embedding.biases",
 )
 
-# Same wrapped-base set for the rare root-level LoRA wrapper case where
-# the empty module prefix means we cannot match by suffix alone.
+# Same wrapped-base set for the root-level LoRA wrapper case, where the empty module prefix means suffix matching alone cannot work.
 _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
     "weight", "scales", "biases",
     "linear.weight", "linear.scales", "linear.biases",
@@ -15342,13 +14097,8 @@ _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
 def _is_base_tensor_inside_lora_module(
     key, lora_module_prefixes, has_root_lora_module=False,
 ):
-    """True when `key` looks like the wrapped base tensor of a LoRA module.
-
-    Prefix-match against LoRA module names + suffix whitelist of base /
-    quantization tensor names. `has_root_lora_module` separately covers
-    a root-level wrapper where the empty-name prefix is intentionally
-    omitted from `lora_module_prefixes` to avoid matching every key.
-    """
+    """True when key is a wrapped base or quantization tensor under a LoRA module prefix; the root wrapper is covered by
+    has_root_lora_module, since an empty prefix would match every key."""
     matches_prefix = lora_module_prefixes and any(
         key.startswith(p) for p in lora_module_prefixes
     )
@@ -15360,12 +14110,8 @@ def _is_base_tensor_inside_lora_module(
 
 
 def save_trainable_adapters(model, path, adapter_config=None):
-    """Save the current trainable parameter tree for training checkpoints.
-
-    Includes all LoRA adapter tensors (frozen or not). Excludes wrapped
-    base weights INSIDE a LoRA module (reload-leaked state that would
-    reintroduce the original Unsloth adapter-export bloat).
-    """
+    """Save trainable parameters plus all LoRA adapter tensors, frozen or not; wrapped base weights inside LoRA modules
+    are excluded, as reload leaks them and would bloat the adapter export."""
     _reject_mixed_lora_dora(model)
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
@@ -15392,29 +14138,17 @@ def save_trainable_adapters(model, path, adapter_config=None):
 
 
 def save_optimizer_state(optimizer, path):
-    """Save MLX optimizer state (Adam/AdamW m,v moments, step, learning_rate)
-    to ``<path>/optimizer_state.safetensors`` so training can resume from a
-    checkpoint with identical optimizer dynamics.
-
-    The optimizer's ``.state`` is a nested dict whose leaves are ``mx.array``,
-    except that a quantized first moment is a 3-element list that ``tree_flatten``
-    decomposes into ``<param>.m.0/.1/.2``. Either way the flattened values are all
-    arrays, so the whole tree serializes cleanly with ``mx.save_safetensors``.
-
-    ``group_size``/``bits`` live on the optimizer instance rather than in the state
-    tree, so they are written as safetensors metadata; without them a resume cannot
-    tell how the packed moments were laid out.
-    """
+    """Save Adam/AdamW moments, step and learning_rate to optimizer_state.safetensors for identical resume; quantized
+    first moments flatten to .m.0/.1/.2 and group_size/bits go in metadata."""
     import os
     os.makedirs(path, exist_ok=True)
     flat = dict(mlx.utils.tree_flatten(optimizer.state))
     target = f"{path}/optimizer_state.safetensors"
-    # load_optimizer_state() hands back mx.load()'s file-backed arrays, so checkpointing
-    # where a resume came from truncates the source under them. Write beside, replace.
+    # load_optimizer_state() returns file-backed mx.load() arrays, so checkpointing over the resume source truncates
+    # them; write beside the target, then replace.
     if flat:
         mx.eval(*flat.values())
-    # ".tmp.safetensors", not ".safetensors.tmp": mx.save_safetensors appends
-    # ".safetensors" to any path lacking it, silently writing a third file.
+    # Name the temp file .tmp.safetensors, not .safetensors.tmp: mx.save_safetensors appends .safetensors to any path lacking it, silently writing a third file.
     tmp_target = f"{path}/optimizer_state.tmp.safetensors"
     try:
         if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
@@ -15440,29 +14174,16 @@ def save_optimizer_state(optimizer, path):
 
 
 def load_optimizer_state(optimizer, path):
-    """Inverse of save_optimizer_state. Loads
-    ``<path>/optimizer_state.safetensors`` and replaces ``optimizer.state``
-    with the unflattened tree.
-
-    Raises FileNotFoundError if the file is missing -- a resume request with
-    no optimizer state is a hard error, not silent fall-back, because resuming
-    with a fresh optimizer would silently restart Adam's moment estimates.
-
-    Reconciles a quantized first moment with the optimizer being resumed into.
-    Loading packed moments into a plain Adam/AdamW would otherwise reach
-    ``b1 * m`` on a list and raise a bare ``TypeError`` from inside mlx, and a
-    group_size mismatch would only surface as a dequantize shape error.
-    """
+    """Load optimizer_state.safetensors into optimizer.state; a missing file raises FileNotFoundError rather than
+    resetting Adam moments, and quantized moments are reconciled with the target optimizer."""
     from .optimizers_quantized import (
         state_has_quantized_moments,
         unpack_quantized_moments,
     )
 
     state_path = f"{path}/optimizer_state.safetensors"
-    # Metadata form first: loading twice would keep two full copies of a
-    # multi-GB optimizer checkpoint live at once. Backends without the flag (the
-    # torch shim) still return a bare dict, so check the shape of what came back
-    # rather than trusting the kwarg to have been honoured.
+    # Metadata form first: loading twice would keep two copies of a multi-GB optimizer checkpoint live; backends without
+    # return_metadata (torch shim) return a bare dict, so check the shape.
     metadata = {}
     try:
         loaded = mx.load(state_path, return_metadata=True)
@@ -15496,16 +14217,8 @@ def load_optimizer_state(optimizer, path):
 
 
 def save_trainer_state(trainer_state, path):
-    """Save trainer scalar state to ``<path>/trainer_state.json``.
-
-    ``trainer_state`` is a plain dict (JSON-serializable). Currently:
-      - ``global_step``: int, the step the checkpoint represents
-      - ``train_loss_history``: list[float], for UI continuity
-      - ``best_metric``/``best_step``: best-model tracking (may be null)
-      - ``es_patience_counter``: int, early-stopping no-improve count
-    Kept separate from the safetensors blob because these are scalars/lists,
-    not tensors, and JSON is easier to inspect.
-    """
+    """Save scalar trainer state (global_step, train_loss_history, best_metric, best_step (may be null),
+    es_patience_counter) to trainer_state.json, kept apart from the safetensors blob as they are not tensors."""
     import json
     import os
     os.makedirs(path, exist_ok=True)
@@ -15514,8 +14227,7 @@ def save_trainer_state(trainer_state, path):
 
 
 def load_trainer_state(path):
-    """Inverse of save_trainer_state. Returns the dict, or raises
-    FileNotFoundError if not present (resume requires it)."""
+    """Inverse of save_trainer_state; raises FileNotFoundError when trainer_state.json is missing, since resume requires it."""
     import json
     with open(f"{path}/trainer_state.json", "r") as f:
         return json.load(f)
@@ -15581,20 +14293,9 @@ def _lora_module_types(model):
 
 
 def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
-    """Save LoRA adapter weights (lora_a / lora_b, plus DoRA magnitudes) to
-    disk.
-
-    Args:
-        model: MLX model with LoRA-wrapped modules.
-        path: Directory to save adapters.
-        adapter_config: Optional dict with LoRA config metadata.
-        adapter_format: "mlx" (default: the native MLX artifact) or "peft"
-            (standard Hugging Face layout). Uniform plain-LoRA exports load in
-            transformers, PEFT, and vLLM; per-module rank/alpha patterns are
-            transformers/PEFT-only, since vLLM applies one global rank/alpha.
-            The live module tree supplies the linear-vs-embedding oracle where
-            the layout demonstrably mirrors Hugging Face.
-    """
+    """Save lora_a/lora_b and DoRA magnitudes; adapter_format is mlx (native) or peft (HF layout), where uniform LoRA
+    loads in transformers, PEFT and vLLM, but per-module rank/alpha only in transformers/PEFT (vLLM has one global
+    rank/alpha)."""
     if adapter_format not in ("mlx", "peft"):
         raise ValueError(
             f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
@@ -15688,8 +14389,8 @@ def _model_ties_output_to_embedding(model, by_name=None):
         return True
     if by_name is None:
         by_name = dict(model.named_modules())
-    # No head module => tied, even if declared False (some use as_linear).
-    # Bare "output" is root-only: nested attention projections share the name.
+    # No head module means tied, even if declared False (some use as_linear); bare 'output' matches root only, since
+    # nested attention projections share the name.
     return not any(
         name in ("lm_head", "output", "embed_out")
         or name.endswith(".lm_head")
@@ -15867,9 +14568,8 @@ def _effective_mlx_quantization_map(model):
     for name, module in model.named_modules():
         if not name:
             continue
-        # isinstance, not an exact class-name match: a training-time subclass of
-        # the quantized layer (e.g. NEFTune's _NEFTuneEmbed) must still be
-        # recognised, else embed_tokens is silently dropped from the map.
+        # Use isinstance, not an exact class-name match: training-time subclasses such as NEFTune's _NEFTuneEmbed must
+        # still match, else embed_tokens is dropped from the map.
         if not isinstance(module, quantized_types):
             continue
         name = _canonical_mlx_quantization_path(name)
@@ -15948,8 +14648,7 @@ def _get_mlx_config_quantization(model):
 def _get_mlx_dropout_probability(drop):
     if drop is None:
         return 0.0
-    # MLX nn.Dropout stores keep-prob as _p_1; shims may also set a stale .p,
-    # so _p_1 wins when numeric and we fall back to .p otherwise.
+    # MLX nn.Dropout stores keep-prob as _p_1; shims may also set a stale .p, so _p_1 wins when numeric and .p is the fallback.
     p1 = getattr(drop, "_p_1", None)
     if p1 is not None:
         try:
@@ -15977,12 +14676,8 @@ def _read_mlx_lora_dropout(module):
 
 
 def _coerce_mlx_lora_scale(scale, default=1.0):
-    """Return a Python float from an mlx-lm LoRA wrapper's `.scale` attribute.
-
-    LoRASwitchLinear stores per-expert mx.array scales; raw float()/.item()
-    raise. Read the first broadcast value (= alpha/r for every expert) so
-    we don't silently lose the trained alpha/r by defaulting to 1.0.
-    """
+    """Return a Python float from a LoRA wrapper's scale: LoRASwitchLinear stores per-expert mx.array scales, which
+    float() and .item() reject; read the first broadcast value (alpha/r) instead of defaulting to 1.0."""
     if scale is None:
         return float(default)
 
@@ -16046,8 +14741,7 @@ def _infer_mlx_lora_rank(module):
     if len(lora_a_shape) < 2 or len(lora_b_shape) < 2:
         return None
 
-    # Standard 2D LoRA, two conventions:
-    # 1. mlx-lm layer: lora_a (rank, in), lora_b (out, rank)
+    # Standard 2D LoRA, two conventions: 1 = mlx-lm layer, lora_a (rank, in) and lora_b (out, rank); 2 = raw array, below.
     if is_layer:
         if lora_a_shape[0] == lora_b_shape[-1]:
             return int(lora_a_shape[0])
@@ -16061,13 +14755,8 @@ def _infer_mlx_lora_rank(module):
 
 
 def _sync_mlx_lora_keys(adapter_config, lora_parameters):
-    """Mirror `unsloth_mlx_lora_module_paths` into `lora_parameters["keys"]`.
-
-    mlx-lm.load_adapters() reads `lora_parameters.keys` to pick which
-    submodules to wrap on reload. Mirror the authoritative path list when
-    present (an empty list is its own valid pin); otherwise drop a stale
-    caller-supplied `keys` so mlx-lm falls back to its scan default.
-    """
+    """Mirror unsloth_mlx_lora_module_paths into lora_parameters["keys"] (an empty list is a valid pin); otherwise drop
+    a stale caller keys so mlx-lm.load_adapters falls back to its scan."""
     if "unsloth_mlx_lora_module_paths" in adapter_config:
         lora_parameters["keys"] = list(
             adapter_config.get("unsloth_mlx_lora_module_paths") or []
@@ -16163,33 +14852,27 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     else:
         adapter_config.pop("unsloth_peft_converted", None)
 
-    # Only stamp LoRA fields when the live model has LoRA modules (or the
-    # caller declared a lora/dora artifact); otherwise mlx-lm.load_adapters()
-    # would inject LoRA wrappers before binding full-precision weights and
-    # break reload.
+    # Only stamp LoRA fields when live LoRA modules exist or the caller declared a lora/dora artifact; otherwise
+    # mlx-lm.load_adapters() injects wrappers and breaks reload.
     has_lora_modules = any(True for _ in iter_mlx_lora_modules(model))
     declared_lora_artifact = (
         has_lora_modules
         and adapter_config.get("fine_tune_type") in {"lora", "dora"}
     )
-    # Override a stale caller fine_tune_type="full" when LoRA modules are
-    # live, else mlx-lm reload would skip LoRA wrapping and drop tensors.
+    # Override a stale caller fine_tune_type of 'full' when LoRA modules are live; otherwise mlx-lm reload skips LoRA wrapping and drops tensors.
     if has_lora_modules and adapter_config.get("fine_tune_type") == "full":
         adapter_config["fine_tune_type"] = "lora"
         declared_lora_artifact = True
-    # Detect DoRA so we stamp 'dora' instead of 'lora'; otherwise mlx-lm's
-    # load_adapters() rebuilds plain LoRA and the saved q_proj.m magnitude
-    # tensor silently drops via strict=False.
+    # Detect DoRA so 'dora' is stamped instead of 'lora'; otherwise mlx-lm load_adapters() rebuilds plain LoRA and the
+    # saved q_proj.m magnitude tensor drops via strict=False.
     has_dora_modules = any(
         type(module).__name__.startswith("DoRA")
         for _, module in iter_mlx_lora_modules(model)
     )
     if has_lora_modules or declared_lora_artifact:
-        # Saved tensor shapes are authoritative: always re-derive
-        # rank/scale/dropout from live modules so a stale caller
-        # `lora_parameters` (e.g. rank=99) cannot survive. The path-
-        # filtered walker below owns the explicit-paths case so we do
-        # not borrow rank from an unselected module.
+        # Saved tensor shapes are authoritative: re-derive rank/scale/dropout from live modules so a stale caller
+        # lora_parameters (e.g. rank=99) cannot survive; the path-filtered walker never borrows rank from unselected
+        # modules.
         _has_explicit_paths_hint = "unsloth_mlx_lora_module_paths" in adapter_config
         if has_lora_modules and not _has_explicit_paths_hint:
             rank, scale, dropout = _extract_mlx_lora_parameters(model)
@@ -16205,9 +14888,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 "scale": scale,
                 "dropout": dropout,
             }
-        # Mirror lora_parameters to top-level for mlx-vlm; overwrite
-        # caller-supplied top-level rank/scale/dropout so stale values
-        # cannot shadow the canonical ones.
+        # Mirror lora_parameters to top level for mlx-vlm, overwriting caller-supplied rank/scale/dropout so stale values cannot shadow the canonical ones.
         if "lora_parameters" in adapter_config:
             lora_parameters = adapter_config["lora_parameters"]
             for key in ("rank", "scale", "dropout"):
@@ -16256,14 +14937,12 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     adapter_config["num_layers"] = len(layers)
             except Exception:
                 pass
-        # Derive fine_tune_type from the live model so a stale caller value
-        # (e.g. 'dora' over plain LoRA) cannot survive; otherwise mlx-lm
-        # would expect a `m` tensor and drop every adapter via strict=False.
+        # Derive fine_tune_type from the live model so a stale caller value (e.g. dora over plain LoRA) cannot survive;
+        # otherwise mlx-lm expects an m tensor and drops every adapter via strict=False.
         adapter_config["fine_tune_type"] = "dora" if has_dora_modules else "lora"
         adapter_config["peft_type"] = "LORA"
     else:
-        # Full fine-tune: stamp 'full' explicitly so reload routes to the
-        # no-LoRA path (mlx-lm defaults missing fine_tune_type to 'lora').
+        # Full fine-tune: stamp 'full' explicitly so reload takes the no-LoRA path, since mlx-lm defaults a missing fine_tune_type to 'lora'.
         adapter_config["fine_tune_type"] = "full"
         for _stale in (
             "peft_type", "lora_parameters", "rank", "scale", "dropout",
@@ -16273,12 +14952,10 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         ):
             adapter_config.pop(_stale, None)
 
-    # Persist module paths + rank/scale/dropout so reload reproduces logits.
-    # The walker below backfills lora_parameters via _infer_mlx_lora_rank
-    # and respects explicit caller path filters.
+    # Persist module paths and rank/scale/dropout so reload reproduces logits; the walker backfills lora_parameters via
+    # _infer_mlx_lora_rank and honours explicit path filters.
     try:
-        # Reuse the loader-side normalizer so save/load accept the same
-        # shapes (str / list / tuple / set / dict / pathlib.Path).
+        # Reuse the loader-side normalizer so save and load accept the same shapes: str, list, tuple, set, dict or pathlib.Path.
         from .loader import _normalize_mlx_lora_module_paths
         # distinguish "caller passed nothing" from "caller passed [] / None".
         has_explicit_paths = "unsloth_mlx_lora_module_paths" in adapter_config
@@ -16291,23 +14968,20 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             adapter_config["unsloth_mlx_lora_module_paths"] = explicit_paths
         else:
             explicit_paths = None
-        # Empty explicit list pins caller topology but should NOT suppress
-        # global parameter inference; treat empty as "no filter".
+        # An empty explicit list pins caller topology but must not suppress global parameter inference; treat empty as no filter.
         explicit_path_set = set(explicit_paths) if explicit_paths else None
 
         lora_paths = []
         lora_rank = None
         lora_scale = None
         lora_dropout = None
-        # Track whether an explicit filter selected any real live module:
-        # if it did but rank inference failed, refusing the caller fallback
-        # below is what prevents persisting stale rank=8 placeholders.
+        # Track whether an explicit filter selected any live module; if it did but rank inference failed, refusing the
+        # caller fallback prevents persisting stale rank=8 placeholders.
         selected_lora_seen = False
         for name, module in iter_mlx_lora_modules(model):
             lora_paths.append(name)
             inferred_rank = _infer_mlx_lora_rank(module)
-            # Only infer from caller-selected modules so an unrelated LoRA
-            # cannot write the wrong language-tower params.
+            # Only infer from caller-selected modules so an unrelated LoRA cannot write the wrong language-tower params.
             if explicit_path_set is not None and name not in explicit_path_set:
                 continue
             selected_lora_seen = True
@@ -16323,16 +14997,13 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
 
-        # Live LoRA module state describes the tensors being saved, so an
-        # inferable live rank ALWAYS overrides caller scalar metadata.
+        # Live LoRA module state describes the tensors being saved, so an inferable live rank always overrides caller scalar metadata.
         existing_lora_parameters = dict(adapter_config.get("lora_parameters") or {})
         has_caller_lora_metadata = any(
             key in existing_lora_parameters or key in adapter_config
             for key in ("rank", "scale", "dropout")
         )
-        # When the caller pinned explicit paths that selected real modules
-        # but rank inference failed everywhere, do NOT fall back to caller
-        # metadata; it is stale by construction.
+        # When explicit paths selected real modules but rank inference failed everywhere, do not fall back to caller metadata; it is stale by construction.
         allow_caller_metadata_fallback = not (
             explicit_path_set is not None
             and selected_lora_seen
@@ -16346,9 +15017,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 "scale": lora_scale,
                 "dropout": lora_dropout,
             })
-            # Mirror the authoritative path list under `keys` so mlx-lm.
-            # load_adapters() does not interpret a missing `keys` as "scan
-            # every Linear/Embedding/Switch layer".
+            # Mirror the authoritative path list under keys so mlx-lm load_adapters() does not treat a missing keys as
+            # scanning every Linear/Embedding/Switch layer.
             lora_parameters = _sync_mlx_lora_keys(adapter_config, lora_parameters)
             adapter_config["lora_parameters"] = lora_parameters
             adapter_config["rank"] = lora_rank
@@ -16356,9 +15026,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             adapter_config["dropout"] = lora_dropout
             adapter_config.setdefault("peft_type", "LORA")
             adapter_config.setdefault("fine_tune_type", "lora")
-            # mlx-lm.load_adapters() attr-accesses `config.num_layers` on
-            # a SimpleNamespace, so the key MUST be present. -1 is the
-            # legacy "all layers" sentinel for the no-detect case.
+            # mlx-lm load_adapters() attribute-accesses config.num_layers on a SimpleNamespace, so the key must exist;
+            # -1 is the legacy all-layers sentinel when undetected.
             if "num_layers" not in adapter_config:
                 layers = _get_transformer_layers(model)
                 try:
@@ -16369,9 +15038,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                     n_layers = -1
                 adapter_config["num_layers"] = n_layers
         elif has_caller_lora_metadata and allow_caller_metadata_fallback:
-            # Caller-supplied metadata path: copy top-level rank/scale/dropout
-            # into lora_parameters (or vice versa) and backfill missing keys
-            # from inferred values so mlx-lm.load_adapters sees a complete dict.
+            # Caller-supplied metadata path: copy top-level rank/scale/dropout into lora_parameters (or vice versa) and
+            # backfill missing keys from inferred values so mlx-lm load_adapters sees a complete dict
             lora_parameters = existing_lora_parameters
             for key in ("rank", "scale", "dropout"):
                 if key not in lora_parameters and key in adapter_config:
@@ -16410,8 +15078,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                         n_layers = -1
                     adapter_config["num_layers"] = n_layers
     except (TypeError, ValueError, AttributeError) as _enrich_exc:
-        # Surface enrichment failures so the user knows adapter_config
-        # metadata may be incomplete on reload.
+        # Surface enrichment failures as a warning so the user knows adapter_config metadata may be incomplete on reload.
         import warnings as _warnings
         _warnings.warn(
             f"Unsloth MLX: skipped LoRA metadata enrichment "
@@ -16444,12 +15111,8 @@ def _config_to_plain_python(value):
 
 
 def _get_model_config(model):
-    """Extract config dict from an MLX model.
-
-    mlx-lm stores the raw config dict at model._config when loaded.
-    mlx-vlm exposes config dataclasses at model.config.
-    Falls back to reconstructing from model.args dataclass.
-    """
+    """Return the config dict of an MLX model: mlx-lm keeps the raw dict at model._config, mlx-vlm exposes dataclasses
+    at model.config, and the model.args dataclass is the fallback."""
     import dataclasses
 
     if hasattr(model, "_config") and isinstance(model._config, dict):
@@ -16546,8 +15209,7 @@ def _get_mlx_vlm_model_sanitize_pipelines(model):
     if model is None:
         return []
 
-    # Submodule-only sanitizers (wrapper without its own sanitize) still
-    # need replay pipelines, so the wrapper step is optional.
+    # Submodule-only sanitizers (wrapper without its own sanitize) still need replay pipelines, so the wrapper step is optional.
     model_step = [(model, None)] if getattr(model, "sanitize", None) is not None else []
     pipelines = [model_step] if model_step else []
 
@@ -16662,9 +15324,8 @@ def _vlm_gguf_name_candidates(name):
         if value not in candidates:
             candidates.append(value)
 
-    # An encoder MLX keeps at the top level sits under "model." in the HF layout these
-    # converters read. llama.cpp drops a tensor whose name it does not recognize, so a
-    # missed prefix costs the mmproj its projector and only fails at load time.
+    # An encoder kept at top level sits under model. in the HF layout these converters read; llama.cpp drops
+    # unrecognized tensor names, so a missed prefix costs the mmproj its projector.
     if name.startswith(
         (
             "audio_tower.",
@@ -16690,9 +15351,8 @@ def _vlm_gguf_name_candidates(name):
         add(f"model.language_model.visual.{suffix}")
         add(f"vit.{suffix}")
 
-    # Pre-fold text-tower names. Key-gated sanitizers (Qwen3.5) shift only under
-    # these, so they are what lets the replay recover the shift from an
-    # already-converted MLX checkpoint, where the measurement comes back bare.
+    # Pre-fold text-tower names: key-gated sanitizers (Qwen3.5) shift only under these, so replay can recover the shift
+    # from an already-converted MLX checkpoint where measurement is bare.
     if name.startswith("language_model.model."):
         suffix = name[len("language_model.model."):]
         add(f"model.language_model.{suffix}")
@@ -16704,11 +15364,8 @@ def _vlm_gguf_name_candidates(name):
 
 
 def _vlm_gguf_layout_candidates(name, tensor):
-    """The candidates that only move axes, named apart so a caller can tell one won.
-
-    A permutation of equally sized axes leaves the shape alone, so a caller comparing
-    shapes cannot see it; the MoE pass reads this directory next and would move those
-    axes a second time."""
+    """Return candidates that only move axes, named apart so the caller can tell which one won: equal-sized axis
+    permutations leave the shape unchanged, and the MoE pass would move them a second time."""
     shape = getattr(tensor, "shape", ())
     if len(shape) == 5:
         return [mx.transpose(tensor, (0, 4, 1, 2, 3))]
@@ -16839,11 +15496,8 @@ _MLX_NORM_OFFSET_PROBE = 1.0
 
 
 def _mlx_norm_offset_probe(weights, fill):
-    """Replace every 1-D float weight with ``fill``, passing the rest through.
-
-    Keys, shapes and dtypes survive, and every real sanitizer gate reads only
-    those, so the replay reproduces the gate while carrying a value we chose.
-    """
+    """Replace every 1-D float weight with fill, keeping keys, shapes and dtypes, which are all the real sanitizer gates
+    read, so the replay reproduces the gate with a chosen value."""
     return {
         key: (
             mx.zeros(value.shape, dtype=value.dtype) + fill
@@ -16860,15 +15514,13 @@ def _mlx_constant_1d_value(value):
         return None
     if not mx.issubdtype(value.dtype, mx.floating):
         return None
-    # mx.min refuses a zero-size reduce, and the raise would discard every
-    # offset measured alongside this one.
+    # mx.min refuses a zero-size reduce, and raising there would discard every offset measured alongside this one.
     if value.shape[0] == 0:
         return None
     low = mx.min(value).item()
     high = mx.max(value).item()
-    # A sanitizer dividing by a weight the probe zeroed returns inf or NaN, and
-    # NaN fails every comparison, so the spread check below would read it as
-    # constant and the export would subtract it into a real weight.
+    # A sanitizer dividing by a probe-zeroed weight yields inf or NaN; NaN fails every comparison, so the spread check
+    # reads it as constant and export subtracts it into a real weight.
     if not math.isfinite(low) or not math.isfinite(high):
         return None
     if abs(low - high) > _MLX_NORM_OFFSET_TOLERANCE:
@@ -16877,31 +15529,17 @@ def _mlx_constant_1d_value(value):
 
 
 def _mlx_sanitize_probe(model, weights):
-    """Replay ``model.sanitize`` where its writes to ``self`` cannot escape.
-
-    Sanitizers are not pure: phi4mm caches its split LoRA weights on the
-    instance and gemma3_text pops the ``lm_head`` submodule for a tied
-    checkpoint, so measuring on the model itself would rebuild it out of the
-    probe halfway through an export. A model that cannot be copied is left
-    unmeasured; the caller treats that as unmeasurable, which is what the export
-    did before this existed.
-    """
+    """Run model.sanitize on a shallow copy, since phi4mm caches split LoRA weights on the instance and gemma3_text pops
+    lm_head for tied checkpoints; an uncopyable model is left unmeasured."""
     probe = copy.copy(model)
     probe._unsloth_measuring_norm_offsets = True
     return probe.sanitize(weights)
 
 
 def _mlx_sanitizer_norm_offsets(model):
-    """Measure the constants a model's sanitizer ADDS to its 1-D float weights.
-
-    The MTP families shift RMSNorm weights by +1 on load, gated on the source
-    checkpoint's contents rather than the model class, so replay the real
-    sanitizer over two probes -- 1-D floats all zero, then all one -- and keep a
-    key only where the output rose by the difference. Rising is what makes the
-    constant an ADDED one, so a sanitizer that invents a 1-D tensor the source
-    never held (Inkling's expert scales) or transforms one non-additively is
-    rejected. None means unmeasurable, not unshifted.
-    """
+    """Measure the constant a sanitizer adds to 1-D float weights by replaying all-zero and all-one probes; keys must
+    rise by the difference, rejecting invented tensors (Inkling's expert scales) and non-additive transforms; None
+    means unmeasurable, not unshifted."""
     src_path = _get_src_path(model)
     sanitize = getattr(model, "sanitize", None)
     if src_path is None or not callable(sanitize):
@@ -17006,11 +15644,9 @@ def _prepare_mlx_gguf_export_directory(
     path, model=None, replay_sanitizers=True, norm_offsets=_UNMEASURED,
     relaid_out=None,
 ):
-    """Restore HF tensor names, layouts and norm convention in the export dir.
-
-    ``replay_sanitizers`` gates the VLM-only name/layout inversion; the norm correction
-    always runs. ``norm_offsets`` is one source measurement shared by every pass, and
-    ``relaid_out`` collects the names whose axes this pass moved, for the same reason."""
+    """Restore HF tensor names, layouts and norm convention in the export dir; replay_sanitizers gates VLM-only
+    name/layout inversion while the norm fix always runs; norm_offsets is shared by every pass and relaid_out
+    collects names whose axes were moved."""
     path = Path(path)
     config_path = path / "config.json"
     if not config_path.exists():
@@ -17039,14 +15675,12 @@ def _prepare_mlx_gguf_export_directory(
         file_rewritten = 0
         for name, tensor in tensors.items():
             original_tensor = tensor
-            # An empty measurement is ambiguous: an already-converted MLX
-            # source shifts nothing at load yet still holds shifted norms.
+            # An empty measurement is ambiguous: an already-converted MLX source shifts nothing at load yet still holds shifted norms.
             offset = 1.0 if not norm_offsets else norm_offsets.get(name, 0.0)
             new_name, tensor, changed = _rewrite_mlx_vlm_tensor_for_gguf(
                 name, tensor, sanitize_steps, offset
             )
-            # The replay cannot observe a gate that spans the whole checkpoint,
-            # so a value it left alone is one the measurement has to recover.
+            # The replay cannot observe a gate spanning the whole checkpoint, so a value it leaves alone is one the measurement must recover.
             if (
                 norm_offsets
                 and offset
@@ -17058,11 +15692,9 @@ def _prepare_mlx_gguf_export_directory(
                 raise RuntimeError(
                     f"Unsloth: duplicate tensor name after GGUF rewrite: {new_name}"
                 )
-            # Which candidate won, not what the shape says: a permutation of equally
-            # sized axes leaves the shape alone. The MoE pass reads this directory
-            # after this one, and an adjacent-axis move is its own inverse, so
-            # replaying the sanitizer over a second inversion hands back what is on
-            # disk and the confirmation accepts it, transposed off HF layout.
+            # Judge by which candidate won, not the shape: equal-sized axes permute unseen, and an adjacent-axis move is
+            # its own inverse, so a second inversion in the later MoE pass would be accepted, leaving the tensor
+            # transposed off HF layout.
             if relaid_out is not None and changed and any(
                 _mlx_arrays_match(tensor, candidate)
                 for candidate in _vlm_gguf_layout_candidates(name, original_tensor)
@@ -17072,8 +15704,7 @@ def _prepare_mlx_gguf_export_directory(
             name_map[name] = new_name
             file_rewritten += int(changed)
         if file_rewritten:
-            # mx.load() arrays may be file-backed; saving over the source can
-            # truncate them before they materialize, so write beside and replace.
+            # mx.load() arrays may be file-backed; saving over the source can truncate them before they materialize, so write beside and replace.
             mx.eval(*updated.values())
             tmp_file = file.with_name(f"{file.stem}.tmp{file.suffix}")
             mx.save_safetensors(str(tmp_file), updated, metadata={"format": "mlx"})
@@ -17103,8 +15734,8 @@ def _prepare_mlx_gguf_export_directory(
     return rewritten
 
 
-# mlx-lm stacks per-expert HF tensors into one SwitchLinear name llama.cpp cannot map.
-# Legacy leaf names first, identity last: only they name tensors the converter reads.
+# mlx-lm stacks per-expert HF tensors into one SwitchLinear name llama.cpp cannot map; try legacy leaf names first and
+# identity last, since only they name tensors the converter reads.
 _MOE_EXPERT_GROUPS = ("experts", "mlp")
 _MOE_EXPERT_LEAF_ALIASES = (
     {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"},
@@ -17145,9 +15776,8 @@ def _mlx_stacked_expert_tensor_names(model, tensor_names):
 
 @contextlib.contextmanager
 def _mlx_module_state_restored(modules):
-    """Leave these modules as they were found: an mlx `Module` is a dict of
-    parameters and children plus plain attributes, and both halves are put back.
-    State inside plain objects a module merely references is not reached."""
+    """Restores each mlx module's dict entries (parameters and children) and plain attributes on exit; state inside
+    plain objects it merely references is not reached."""
     state = [(module, dict(module) if isinstance(module, dict) else None,
               dict(vars(module))) for module in modules]
     try:
@@ -17163,8 +15793,7 @@ def _mlx_module_state_restored(modules):
 
 
 class _MlxReplayedSanitizers:
-    """Sanitizers replayed in order, leaving no module of the model changed: Gemma 3
-    ties its head and drops `lm_head` if handed no `lm_head.weight`."""
+    """Replays sanitizers in order without changing any model module; Gemma 3 ties its head and drops lm_head when handed no lm_head.weight."""
 
     def __init__(self, owners, held):
         self.owners = tuple(owners)
@@ -17198,10 +15827,8 @@ def _mlx_moe_sanitizers(model):
 
 
 def _mlx_moe_sanitized_probe(sanitizer, probe):
-    """Replay a probe, copying the tensors a sanitizer writing in place could reach:
-    mlx-vlm offsets a norm weight with `+=`, writing through to the caller's tensor and
-    to every later tensor sharing that shape-cached marker. 1-D only, as wider copies
-    would cost a synchronization."""
+    """Copy 1-D probe tensors when the sanitizer writes in place, since mlx-vlm's += on norm weights writes through to
+    shared shape-cached markers; wider copies would cost a synchronization."""
     if _mlx_sanitizer_writes_in_place(sanitizer):
         probe = {
             name: mx.array(tensor) if getattr(tensor, "ndim", 0) == 1 else tensor
@@ -17218,8 +15845,8 @@ def _mlx_augmented_assignment(instruction):
 
 
 def _mlx_sanitizer_writes_in_place(sanitizer):
-    """Whether a sanitizer's code holds an augmented assignment, which may write
-    through. From bytecode, since measuring costs the synchronization this avoids."""
+    """Check whether the sanitizer's bytecode has an augmented assignment that may write through, read from bytecode
+    since measuring would cost the synchronization this avoids."""
     if getattr(sanitizer, "_writes_in_place", None) is None:
         sanitizer._writes_in_place = any(
             _mlx_augmented_assignment(instruction)
@@ -17343,8 +15970,7 @@ def _mlx_sanitizer_own_functions(found, package, mentioned):
 
 
 def _mlx_sanitizer_code(sanitizers):
-    """Every code object a sanitizer reaches inside the model's own package; a walk
-    into mlx or numpy would cost a vocabulary of everything and prove nothing."""
+    """Collect the code objects a sanitizer reaches within the model's own package; walking into mlx or numpy would add a vocabulary of everything and prove nothing."""
     reached, walked = [], set()
 
     def walk(function, calls):
@@ -17357,8 +15983,8 @@ def _mlx_sanitizer_code(sanitizers):
             return
         package = (getattr(function, "__module__", "") or "").split(".")[0]
         namespace = getattr(function, "__globals__", None) or {}
-        # Descend into nested code objects: before PEP 709 (3.12) a comprehension gets
-        # its own, hiding from `co_names` the helper a rename is spelled in.
+        # Descend into nested code objects: before PEP 709 (3.12) a comprehension has its own code object, hiding from
+        # co_names the helper a rename is spelled in.
         names, mentioned, pending = [], set(), [code]
         while pending:
             current = pending.pop(0)
@@ -17407,8 +16033,7 @@ def _mlx_sanitizer_vocabulary(sanitizers):
 
 
 def _mlx_sanitizer_fusion_groups(sanitizers):
-    """Each tuple of names a sanitizer holds, with the fragments beside it. A fuser
-    names its inputs in one tuple in concatenation order, so the tuple is the group."""
+    """Each tuple of names a sanitizer holds is one fuser's inputs in concatenation order, so the tuple itself is the group."""
     def named(obj):
         return (isinstance(obj, tuple) and 1 < len(obj) <= _MOE_SPLIT_PARTS
                 and len(set(obj)) == len(obj)
@@ -17428,15 +16053,14 @@ def _mlx_sanitizer_fusion_groups(sanitizers):
 
 
 def _mlx_moe_rename_candidates(vocabulary, names, ubiquity=_MOE_VOCABULARY_UBIQUITY):
-    """Substitutions worth trying, as (replaced, replacement) pairs; ``ubiquity`` of 1
-    offers every fragment, right once ``names`` is already narrowed."""
+    """Return substitutions to try, as (replaced, replacement) pairs; ubiquity of 1 offers every fragment, right once names is already narrowed."""
     limit = max(1, int(len(names) * ubiquity))
     for replaced in vocabulary:
         carried = [name for name in names if replaced in name]
         if not carried:
             continue
-        # A fragment on most tensors names the checkpoint's shape, not a block layout,
-        # unless every carrier starts with it: a relocated namespace, as in qwen4_exp.
+        # A fragment on most tensors names the checkpoint's shape, not a block layout, unless every carrier starts with
+        # it, as in a relocated namespace such as qwen4_exp.
         relocation = len(carried) > limit
         if relocation and not all(name.startswith(replaced) for name in carried):
             continue
@@ -17465,14 +16089,13 @@ def _mlx_moe_renamed(names, replaced, replacement):
     return renamed if len(set(renamed.values())) == len(renamed) else {}
 
 
-# Two probes, as (base, spread): tensor n is marked base + n * spread. One cannot tell a
-# doubled 1-D tensor from an offset one; two alike could not tell a constant from a swap.
+# Two probes as (base, spread), tensor n marked base + n * spread: one probe cannot tell a doubled 1-D tensor from an
+# offset one; two alike cannot tell a constant from a swap.
 _MOE_PROBE_MARKERS = ((3.0, 1.0), (5.0, 7.0))
 
 def _mlx_moe_replay_marker(shape, value):
-    """A marker for replay measurement: 1-D whole, since a shift along one reads as a
-    constant from a truncated corner; wider ones truncated, and counted rather than
-    filled so an axis move still shows."""
+    """Build a replay marker: 1-D markers are kept whole, since a truncated corner would read a shift as a constant;
+    wider ones are truncated and counted, not filled, so axis moves still show."""
     if len(shape) == 1:
         return mx.full(shape, value, dtype=mx.float32)
     shape = tuple(min(dim, 2) for dim in shape)
@@ -17501,14 +16124,13 @@ def _mlx_moe_constant_offset(sanitized, marker):
         return None
 
 
-# Axis pairs an mlx-lm sanitizer moves, (source, destination) HF to MLX: Kimi Linear
-# stores KDA convolutions (d_inner, d_conv, 1) for (d_inner, 1, d_conv).
+# Axis pairs an mlx-lm sanitizer moves, as (source, destination) HF to MLX: Kimi Linear stores KDA convolutions (d_inner, d_conv, 1) for (d_inner, 1, d_conv).
 _MOE_TENSOR_LAYOUTS = ((2, 1), (1, 0), (2, 0))
 
 
 def _mlx_moe_replay_match(sanitized, marker):
-    """What a sanitizer did to one marker: a constant added and an axis moved, or None.
-    Measured with the name, since a re-laid-out tensor cannot be inverted by renaming."""
+    """Describe what a sanitizer did to one marker: an added constant and an axis move, or None; measured with the name,
+    since a re-laid-out tensor cannot be inverted by renaming."""
     if sanitized is marker:
         return 0.0, None
     if sanitized is None:
@@ -17528,8 +16150,8 @@ def _mlx_moe_replay_match(sanitized, marker):
 
 
 def _mlx_moe_replayed_corrections(sanitizers, proposal, staged, markers=None, required=()):
-    """For each saved tensor a sanitizer still produces, how it produced it: step3p5
-    stores a norm weight one greater, Kimi Linear's KDA convolutions transposed."""
+    """For each saved tensor a sanitizer still produces, the correction that produced it, e.g. step3p5's norm weight one
+    greater or Kimi Linear's KDA convolutions transposed."""
     markers = {} if markers is None else markers
     for sanitizer in sanitizers:
         corrections, replays = {}, []
@@ -17589,8 +16211,7 @@ def _completed_mlx_moe_rename_candidate(candidate, corrections, unproven, vocabu
     return candidate, corrections
 
 
-# Splits reached here are in two (gate/up, or MLA key/value); DBRX's per-expert split
-# belongs to the stack family. Widening costs a factor of the vocabulary per part.
+# Splits here are two-part (gate/up, MLA key/value); DBRX's per-expert split belongs to the stack family; widening costs a vocabulary factor per part.
 _MOE_MERGE_PARTS = 2
 _MOE_MERGE_PROBE_WIDTHS = (2, None)
 _MOE_MERGE_ROUNDS = 4
@@ -17611,8 +16232,7 @@ def _mlx_moe_group_recipe(parts, recipe):
 
 
 def _mlx_moe_merged(parts, recipe):
-    """Rebuild the checkpoint tensor a sanitizer split into `parts`. A share means it
-    instead fused several into one part, so what comes back is one slice of it."""
+    """Rebuild the checkpoint tensor from split parts; a share means the sanitizer fused several tensors into one part, so the result is only one slice of it."""
     _, layouts, axis, flattened, *share = recipe
     merged = mx.concatenate(
         [
@@ -17659,8 +16279,7 @@ def _mlx_moe_merge_recipes(shapes):
 
 
 def _mlx_moe_merge_groups(staged, substitutions):
-    """The staged tensors each substituted name collects, in substitution order:
-    checkpoint order would let one layer collect its parts the other way round."""
+    """Group staged tensors by each substituted name, in substitution order rather than checkpoint order, which would collect a layer's parts the other way round."""
     groups = {}
     for name in staged:
         for rank, (replaced, replacement) in enumerate(substitutions):
@@ -17687,8 +16306,7 @@ def _mlx_moe_merge_arrivals(staged, vocabulary):
 
 def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
                                  native=False):
-    """The recipe under which the sanitizer reproduces every merged part, else the name
-    of a tensor it wanted and did not find."""
+    """Return the recipe under which the sanitizer reproduces every merged part, or else the name of a tensor it wanted and did not find."""
     merged_parts = {part for parts in groups.values() for part in parts}
     others, floor_probe = {}, {}
     for position, (name, tensor) in enumerate(staged.items()):
@@ -17699,8 +16317,7 @@ def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
             others[name] = marker
     # The floor: a sanitizer can drop a sibling once the fused tensor is present.
     try:
-        # Must go through the probe helper: `floor_probe` shares marker objects with
-        # `others`, so an in-place `+=` measures the floor one step ahead.
+        # Must use the probe helper: `floor_probe` shares marker objects with `others`, so an in-place `+=` measures the floor one step ahead.
         floor = _mlx_moe_sanitized_probe(sanitizer, floor_probe)
     except Exception:
         return
@@ -17788,8 +16405,8 @@ def _mlx_moe_restored_module(name):
 
 def _completed_mlx_moe_merge_plan(sanitizers, staged, arrivals, groups, substitutions,
                                   recipe):
-    """mlx-vlm 0.7.8 expert helpers skip a missing sibling and accept `<name>.weight`,
-    so extend the plan to siblings and drop `.weight` while replay still proves it."""
+    """mlx-vlm 0.7.8 expert helpers skip a missing sibling and accept <name>.weight, so the plan extends to siblings and
+    drops .weight only while replay still proves it."""
     modules = {_mlx_moe_restored_module(target) for target in groups}
     claimed = {part for parts in groups.values() for part in parts}
     tried = set(substitutions)
@@ -17864,8 +16481,7 @@ def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutio
 
 
 def _build_mlx_moe_merge_plan(model, staged, sanitizers=None):
-    """Recover checkpoint tensors a sanitizer split into several staged ones, as
-    GraniteMoE's fused gate/up projection no rename reaches."""
+    """Recover checkpoint tensors a sanitizer split into several staged ones, such as GraniteMoE's fused gate/up projection, which no rename reaches."""
     owned = _mlx_moe_sanitizers(model)
     vocabulary = _mlx_sanitizer_vocabulary(owned)
     if not vocabulary:
@@ -17907,9 +16523,8 @@ class _MlxRelabelledSanitizer:
 
 
 def _build_mlx_moe_renamed_merge_plan(model, staged, renames):
-    """Merges the checkpoint still needs once the renames have been proved: splitting
-    plus relocating leaves no staged name one substitution from the checkpoint's, but
-    the proved name is one away (Qwen3-VL-MoE)."""
+    """Build the merges still needed after renames are proved, for when splitting plus relocating leaves no staged name
+    one substitution from the checkpoint's but the proved name is one away, as in Qwen3-VL-MoE."""
     if not renames:
         return {}
     renamed = {renames.get(name, name): tensor for name, tensor in staged.items()}
@@ -17933,9 +16548,8 @@ def _build_mlx_moe_renamed_merge_plan(model, staged, renames):
 
 
 def _mlx_moe_expert_stacks(staged):
-    """Staged names alike but for one component spelling a run of experts. DBRX builds
-    each with an f-string, so no fragment stands for the index and the run identifies
-    them."""
+    """Find groups of staged names alike but for one component spelling a run of experts; DBRX builds them with
+    f-strings, so no fragment stands for the index and the run identifies them."""
     runs = {}
     for name in staged:
         components = name.split(".")
@@ -17950,9 +16564,7 @@ def _mlx_moe_expert_stacks(staged):
 
 
 def _mlx_moe_stack_recipes(rank, count):
-    """Every concatenation of the parts one split produced, all arranged alike: every
-    expert is split the same way, so the search stays layouts times axes rather than
-    layouts to the expert count."""
+    """Yield every concatenation recipe for the parts of one split, all arranged alike, so the search is layouts times axes, not layouts to the expert count."""
     choices = [None] + [layout for layout in _MOE_TENSOR_LAYOUTS
                         if max(layout) < rank]
     for layout in choices:
@@ -18003,8 +16615,7 @@ def _proved_mlx_moe_expert_stack(sanitizers, staged, heads, tail, fragment,
 
 
 def _build_mlx_moe_expert_stack_plan(model, staged):
-    """Recover a checkpoint tensor a sanitizer split into one tensor per expert: DBRX's
-    parts are told apart by index, so the run of indices finds the group."""
+    """Recover a checkpoint tensor a sanitizer split into one tensor per expert; DBRX's parts differ only by index, so a run of indices identifies the group."""
     sanitizers = _mlx_moe_sanitizers(model)
     vocabulary = _mlx_sanitizer_vocabulary(sanitizers)
     if not vocabulary:
@@ -18036,9 +16647,8 @@ _MOE_SPLIT_PARTS = 4
 
 
 def _mlx_moe_split_recipes(rank, count):
-    """Every way one staged tensor could be the concatenation of `count` parts. Both
-    directions of every axis move, unlike a merge's: a merge undoes what the sanitizer
-    did to a part it was given, a split does it to one it hands over."""
+    """Yield every way one staged tensor could be the concatenation of count parts, trying both directions of each axis
+    move, since a split applies the move to the parts it hands over."""
     moves = [layout for layout in _MOE_TENSOR_LAYOUTS if max(layout) < rank]
     # Moved layouts first, identity last: where both replay the moved one is right.
     for layout in moves + [(after, before) for before, after in moves] + [None]:
@@ -18047,8 +16657,7 @@ def _mlx_moe_split_recipes(rank, count):
 
 
 def _proved_mlx_moe_name_split(sanitizer, staged, source, proposals, recipes):
-    """The naming and recipe under which the sanitizer fuses parts into `source`: the
-    names are new, so what must come back is the one tensor they were built into."""
+    """Return the naming and recipe under which the sanitizer fuses new-named parts into source, so the one tensor they were built into must come back."""
     others = {name: mx.full(tuple(tensor.shape), float(position), dtype=mx.float32)
               for position, (name, tensor) in enumerate(staged.items())
               if name != source}
@@ -18091,8 +16700,8 @@ def _proved_mlx_moe_name_split(sanitizer, staged, source, proposals, recipes):
 
 
 def _build_mlx_moe_name_split_plan(model, staged, claimed):
-    """Recover checkpoint tensors a sanitizer fused into one staged tensor, as glm5_next
-    does a layer's three KDA convolutions. Each part is a share of what it came from."""
+    """Recover checkpoint tensors a sanitizer fused into one staged tensor, as glm5_next does with a layer's three KDA
+    convolutions; each part is a share of its source."""
     sanitizers = _mlx_moe_sanitizers(model)
     groups = _mlx_sanitizer_fusion_groups(sanitizers)
     if not groups:
@@ -18132,8 +16741,8 @@ def _build_mlx_moe_name_split_plan(model, staged, claimed):
 
 
 def _mlx_moe_merge_placement(files, merges):
-    """Which shard receives each merged tensor, and which holds each part. Rewriting a
-    shard drops the parts it held, so a merge goes in the first of its parts'."""
+    """Return which shard receives each merged tensor and which holds each part; rewriting a shard drops the parts it
+    held, so a merge goes to the first shard holding its parts."""
     owned, owner, anchors = {}, {}, {}
     if merges:
         consumed = {part for parts, *_ in merges.values() for part in parts}
@@ -18149,9 +16758,8 @@ def _mlx_moe_merge_placement(files, merges):
 
 
 def _mlx_moe_written_order(files, plan, merges, owned):
-    """Every name the rewrite writes, in the order it will be read back in. Asked, not
-    predicted: order depends on the names alone, so a file of one byte apiece answers
-    it without writing the checkpoint again."""
+    """Return every name the rewrite writes, in read-back order; probed by writing one-byte files, since order depends
+    only on names, so the checkpoint is not written again."""
     consumed = {part for parts, *_ in merges.values() for part in parts}
     order = []
     with tempfile.TemporaryDirectory() as directory:
@@ -18172,8 +16780,7 @@ def _mlx_moe_written_order(files, plan, merges, owned):
 
 
 def _mlx_moe_shard_merges(file, tensors, owner, owned):
-    """Every merged tensor one shard receives, built from the shards holding the parts.
-    A call, not a block, so the shards it read are released when it returns."""
+    """Build every merged tensor one shard receives from the shards holding its parts; a function rather than a block, so those shards are released on return."""
     built, loaded = {}, {}
     for target, recipe in owned.items():
         parts = recipe[0]
@@ -18193,8 +16800,8 @@ def _mlx_moe_shard_merges(file, tensors, owner, owned):
 
 
 def _mlx_moe_rewritten_checkpoint(staged, plan, offsets, layouts, merges):
-    """The names and tensors the rewrite writes, or None if two collide: colliding
-    reconstructions land in different shards and the index picks by position."""
+    """Return the names and tensors the rewrite writes, or None if two collide, since colliding reconstructions land in
+    different shards and the index picks one by position."""
     consumed = {part for parts, *_ in merges.values() for part in parts}
     written = {
         target: _mlx_moe_merged([staged[part] for part in recipe[0]], recipe)
@@ -18221,12 +16828,9 @@ def _mlx_moe_rewritten_checkpoint(staged, plan, offsets, layouts, merges):
 
 def _confirmed_mlx_moe_rewrite(sanitizers, files, plan, offsets, layouts, merges,
                                restored=(), owned=None):
-    """Whether replaying the whole rewrite hands the staged checkpoint back.
-
-    On the checkpoint, not markers, which bfloat16's eight bits cannot tell apart, and
-    all at once, since reconstructions proved singly need not hold together. The floor
-    is doing nothing: what the sanitizer already fails to reproduce is not the
-    rewrite's to lose, but everything the rewrite claims must come back."""
+    """Check whether replaying the whole rewrite returns the staged checkpoint, compared on tensors rather than markers
+    (bfloat16 cannot tell them apart) and all at once; the sanitizer's own losses are excluded, but every claimed
+    tensor must come back."""
     claimed = set(plan) | set(offsets) | set(layouts)
     claimed.update(part for parts, *_ in merges.values() for part in parts)
     order = _mlx_moe_written_order(files, plan, merges, owned or {})
@@ -18283,13 +16887,9 @@ _MOE_REWRITE_COLLIDES = object()
 
 def _replayed_mlx_moe_rewrite(sanitizer, files, plan, offsets, layouts, merges,
                               produced, required, order, reverse, mirrored=None):
-    """Replay the rewritten checkpoint once, against the shards as they stand.
-
-    Answers with the residue the shards could not account for; given `mirrored` (the
-    other replay's residue), each is compared as produced. None says this replay did not
-    hand the checkpoint back, disagreed, or could not run; `_MOE_REWRITE_COLLIDES` says
-    the plan wants one name twice. Only one replay may be alive: each holds every
-    shard."""
+    """Replay the rewrite once against the shards, returning the residue they cannot account for, compared with
+    mirrored; None means failure, and _MOE_REWRITE_COLLIDES means one name is wanted twice; one replay at a time,
+    since each holds every shard."""
     try:
         written = _mlx_moe_rewritten_checkpoint(
             _mlx_staged_checkpoint(files), plan, offsets, layouts, merges)
@@ -18326,8 +16926,8 @@ def _replayed_mlx_moe_rewrite(sanitizer, files, plan, offsets, layouts, merges,
 
 
 def _kept_mlx_moe_residue(unaccounted, mirrored, name, tensor):
-    """Hold one residue for the other replay, or hold it to what that one left. Name
-    before value: one the other replay never produced is a disagreement."""
+    """Keep a residue for the other replay, or check it against what that replay left; a name the other replay never
+    produced is a disagreement, and names are checked before values."""
     if mirrored is None:
         unaccounted[name] = tensor
         return True
@@ -18373,8 +16973,7 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
     claimed_names = frozenset(claimed)
 
     def produced_once(proposal):
-        """Whether every name it produces is distinct from the others and the split's:
-        two landing on one reach the replay through a single probe entry."""
+        """True if every produced name is distinct from the others and from the split's; two names landing on one reach the replay through a single probe entry."""
         produced = proposal.values()
         return len(set(produced)) == len(proposal) and claimed_names.isdisjoint(produced)
 
@@ -18430,8 +17029,7 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
     return renames, constants, layouts
 
 
-# The per-layer projections llama.cpp maps under `model.layers.{bid}.`, as mlx-lm
-# spells them. Deliberately wider than any one architecture needs.
+# Per-layer projections llama.cpp maps under `model.layers.{bid}.` (mlx-lm spelling); deliberately wider than any one architecture needs.
 _GGUF_MAPPED_LAYER_LEAVES = frozenset((
     "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
     "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
@@ -18439,11 +17037,8 @@ _GGUF_MAPPED_LAYER_LEAVES = frozenset((
 
 
 def _kept_for_the_gguf_converter(name):
-    """Whether this is a name the rewrite leaves alone.
-
-    Exactness would need llama.cpp's own per-architecture table, so this reads the HF
-    layer prefix and errs towards keeping: taking away a name the converter reads
-    breaks a working export (mlx-lm rebuilds dense Hunyuan's `mlp.gate_and_up_proj`)."""
+    """Check whether a name is left alone: judged from the HF layer prefix since exact matching needs llama.cpp's
+    per-architecture table; errs towards keeping, as dropping a name the converter reads breaks exports."""
     parts = name.split(".")
     return (len(parts) > 4 and parts[0] == "model" and parts[1] == "layers"
             and parts[2].isdigit()
@@ -18634,14 +17229,8 @@ _PACKED_QUANT_SIDECARS = frozenset({"quantize_config.json", "quant_config.json"}
 
 
 def _asset_link_stays_in_the_model(file, source):
-    """Refuse a sidecar symlink that points outside the model it came from.
-
-    A writable model directory is otherwise enough to aim `generation_config.json`
-    at a credential file and have the save dereference it into an adapter that is
-    then published. A Hugging Face snapshot is itself a tree of symlinks into a
-    sibling `blobs/` directory, so the allowed root is the cache repo directory
-    when the source sits under `snapshots/<sha>`, not the source alone.
-    """
+    """Refuse sidecar symlinks pointing outside the model, since a writable dir could aim generation_config.json at a
+    credential file; for snapshots/<sha> sources the root is the cache repo dir, so blobs/ links pass."""
     try:
         if not file.is_symlink():
             return True
@@ -18661,8 +17250,8 @@ def _asset_link_stays_in_the_model(file, source):
 
 @contextlib.contextmanager
 def _detached_detokenizer(processor):
-    """Without mlx-vlm's attached streaming detokenizer: transformers deep-copies a processor's
-    attributes to serialize it, and the naive one (tiktoken tokenizers, e.g. Kimi) cannot be copied."""
+    """Detach mlx-vlm's streaming detokenizer during the block: transformers deep-copies processor attributes to
+    serialize, and the naive one (tiktoken tokenizers such as Kimi) cannot be copied."""
     detokenizer = vars(processor).pop("detokenizer", None) if hasattr(processor, "__dict__") else None
     try:
         yield
@@ -18836,13 +17425,8 @@ def _copy_source_sidecars(src_path, path):
     return copied
 
 def _fuse_mlx_module(module, dequantize):
-    """Call ``module.fuse()`` regardless of how the flag is spelled.
-
-    mlx-lm renamed it from ``de_quantize`` (0.28.3) to ``dequantize`` (0.28.4)
-    and the supported range spans both, so pick the spelling the installed
-    implementation accepts. A flagless ``fuse()`` (mlx-vlm's ``ExtendedLmHead``)
-    has nothing to dequantize and ``save_merged_model`` dequantizes afterwards.
-    """
+    """Call module.fuse() with the flag spelled as installed: mlx-lm renamed de_quantize (0.28.3) to dequantize
+    (0.28.4); a flagless fuse (ExtendedLmHead) is called as is, and save_merged_model dequantizes afterwards."""
     fuse = module.fuse
     try:
         parameters = inspect.signature(fuse).parameters
@@ -18871,16 +17455,12 @@ def _model_has_quantized_module(model):
     def _is_quantized(module):
         if isinstance(module, quantized_types):
             return True
-        # MLA's QuantizedMultiLinear and the distributed Quantized*Linear
-        # subclass none of the above; missing one writes quantized tensors
-        # with no metadata to load them by.
+        # MLA's QuantizedMultiLinear and distributed Quantized*Linear match none of the checks above; missing one writes
+        # quantized tensors with no load metadata.
         if type(module).__name__.startswith("Quantized"):
             return True
-        # mlx.nn's QQLinear is neither: not a subclass, not Quantized*-named.
-        # Ask for a packed weight rather than just the attributes, so a module
-        # that merely carries bits/group_size cannot suppress the quantize.
-        # save_merged_model has already called .eval(), which is when QQLinear
-        # holds its weights packed.
+        # mlx.nn QQLinear is neither a subclass nor Quantized*-named, so detect a packed uint32 weight, not
+        # bits/group_size alone; it is packed after save_merged_model's eval().
         if hasattr(module, "bits") and hasattr(module, "group_size"):
             weight = getattr(module, "weight", None)
             return weight is not None and weight.dtype == mx.uint32
@@ -18889,8 +17469,7 @@ def _model_has_quantized_module(model):
     return any(_is_quantized(module) for _, module in model.named_modules())
 
 
-# The loader's runtime-quantization defaults, so save- and load-quantized models
-# land on the same grid.
+# The loader's runtime-quantization defaults; using them keeps save- and load-quantized models on the same grid.
 _MERGED_SAVE_QUANT_BITS = 4
 _MERGED_SAVE_QUANT_GROUP_SIZE = 64
 _MERGED_SAVE_QUANT_MODE = "affine"
@@ -18905,11 +17484,8 @@ def _merged_save_cast_dtypes():
 
 
 def _merged_save_cast_dtype(config):
-    """The checkpoint dtype, as ``mlx_lm.convert`` resolves it.
-
-    Both spellings: mlx-lm reads only ``torch_dtype``, but transformers >= 4.56
-    writes plain ``dtype``, which would otherwise get no cast at all.
-    """
+    """Return the checkpoint dtype as mlx_lm.convert resolves it; mlx-lm reads only torch_dtype, but transformers >=
+    4.56 writes dtype, so both spellings are checked."""
     if not isinstance(config, dict):
         return None
     candidates = [config.get("torch_dtype"), config.get("dtype")]
@@ -18925,10 +17501,8 @@ def _merged_save_cast_dtype(config):
 
 
 def _cast_merged_model_to_config_dtype(model, config):
-    """Cast floating parameters to the config dtype, as ``mlx_lm.convert`` does
-    before quantizing: ``full_finetuning=True`` trains in float32, which would
-    otherwise leave float32 scales, norms and embeddings in a "4-bit" file.
-    """
+    """Cast floating parameters to the config dtype before quantizing, as mlx_lm.convert does, so full_finetuning
+    float32 scales, norms and embeddings do not reach a 4-bit file."""
     from mlx.utils import tree_map_with_path
 
     dtype = _merged_save_cast_dtype(config)
@@ -18948,13 +17522,8 @@ def _cast_merged_model_to_config_dtype(model, config):
 
 
 def _quantize_merged_model_for_save(model):
-    """Quantize an unquantized merged model so ``merged_4bit`` really is 4-bit.
-
-    ``LoRALinear.fuse(dequantize=False)`` requantizes only an already-quantized
-    base, so ``load_in_16bit`` / ``full_finetuning`` used to write full precision
-    silently. Uses the loader's predicate, not a bare ``nn.quantize``, so the
-    artifact matches a model quantized at load time (embeddings / lm_head skipped).
-    """
+    """Quantize an unquantized merged model so merged_4bit is really 4-bit, since LoRALinear.fuse only requantizes
+    quantized bases; uses the loader's predicate, not a bare nn.quantize, so embeddings and lm_head are skipped."""
     from mlx_lm.utils import quantize_model
     from .loader import _MLXQuantizationSpec, _compose_mlx_quant_predicate
 
@@ -18967,9 +17536,8 @@ def _quantize_merged_model_for_save(model):
     )
     predicate = _compose_mlx_quant_predicate(model, spec, is_vlm=False)
     config = _get_model_config(model) or {}
-    # Any grid here is stale. Kept, quantize_model() emits per-layer entries
-    # with no top-level group_size (reload raises KeyError), or copies a
-    # populated one verbatim over tensors that do not use it.
+    # Any grid here is stale: kept, quantize_model() emits per-layer entries with no top-level group_size (reload raises
+    # KeyError) or copies a populated one over tensors that do not use it.
     config = _strip_mlx_quantization_metadata(config)
     model = _cast_merged_model_to_config_dtype(model, config)
     model, updated_config = quantize_model(
@@ -18981,8 +17549,7 @@ def _quantize_merged_model_for_save(model):
         quant_predicate=predicate,
     )
     if not _model_has_quantized_module(model):
-        # quantize_model() writes the grid from its arguments, not from what
-        # it converted, so dimensions incompatible with the group size would
+        # quantize_model() writes the grid from its arguments, not from what it converted; incompatible dimensions would
         # label a full-precision checkpoint 4-bit.
         model._config = _strip_mlx_quantization_metadata(updated_config)
         print(
@@ -19006,29 +17573,21 @@ _ABSENT = object()
 
 
 def _snapshot_mlx_model_state(model):
-    """Everything needed to undo a save-time cast + quantize on a live model.
-
-    Nothing is copied, but pinning the tree holds the originals alongside the
-    cast and quantized copies, so the save peaks higher.
-    """
+    """Hold references to the live model's modules, parameters and config for undoing a save-time cast and quantize;
+    holding them keeps originals alive beside the copies, raising peak save memory."""
     return (model.leaf_modules(), model.parameters(),
             getattr(model, "_config", _ABSENT))
 
 
 def _restore_mlx_model_state(model, snapshot):
-    """Put the live model back the way the caller handed it over.
-
-    Otherwise a ``merged_4bit`` save leaves the session holding a 4-bit model: a
-    later ``merged_16bit`` export writes weights dequantized from 4-bit, and
-    training continues on quantized layers. The LoRA fuse is deliberate and stays.
-    """
+    """Undo the save-time cast and quantize, else a merged_4bit save leaves a 4-bit model for later merged_16bit exports
+    and training; the deliberate LoRA fuse stays."""
     leaf_modules, parameters, config = snapshot
     model.update_modules(leaf_modules)
     model.update(parameters)
     if config is _ABSENT:
-        # Quantizing assigns `_config` unconditionally, so a model that had
-        # none must lose it again or the next save writes 4-bit metadata over
-        # full-precision weights. delattr: mlx Modules subclass dict.
+        # Quantizing sets `_config` unconditionally, so a model that had none must lose it again or saves write 4-bit
+        # metadata over full-precision weights; use delattr since mlx Modules subclass dict.
         try:
             delattr(model, "_config")
         except AttributeError:
@@ -19040,25 +17599,9 @@ def _restore_mlx_model_state(model, snapshot):
 
 def save_merged_model(model, tokenizer, path, dequantize=False,
                       quantize_unquantized=False):
-    """Fuse LoRA weights and save the full merged model.
-
-    Produces an HF-compatible directory with sharded safetensors,
-    config.json, tokenizer files, and a model card. The output can
-    be reloaded with ``mlx_lm.load()`` or uploaded to HuggingFace Hub.
-
-    Args:
-        model: MLX model with LoRA layers.
-        tokenizer: Tokenizer to save alongside.
-        path: Directory to save merged model.
-        dequantize: If True, dequantize quantized layers when fusing
-            (saves as fp16/bf16 — needed for GGUF). If False, keep the
-            base quantization.
-        quantize_unquantized: If True and nothing in the model is quantized,
-            quantize the merged weights before writing. Set only by
-            ``save_method='merged_4bit'``, never inferred from
-            ``dequantize=False`` -- that is also ``push_to_hub_merged``'s
-            default, which must keep the model's existing precision.
-    """
+    """Fuse LoRA and save an HF-style merged dir (sharded safetensors, config, tokenizer, card); dequantize=True writes
+    fp16/bf16 for GGUF; quantize_unquantized is only set by merged_4bit, never inferred from dequantize=False
+    (push_to_hub_merged's default, which must keep precision)."""
     from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
 
@@ -19086,23 +17629,20 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
             if unpacked:
                 model._config = _dense_hadamard_pack_config(model._config)
     elif quantize_unquantized and not _model_has_quantized_module(model):
-        # The fuse had nothing to requantize: quantize now or say so, but
-        # never write full precision in silence.
+        # If the fuse left nothing to requantize, quantize now or print a notice; never write a full-precision save in silence.
         if _is_vlm_model(model) or _has_vision_config(_get_model_config(model)):
             print(
                 "Unsloth: save_method='merged_4bit' on an unquantized VLM is "
                 "not supported yet — saving at full precision instead. Load "
                 "the VLM quantized (the default) to get a 4-bit merge."
             )
-            # A surviving grid would label this full-precision artifact 4-bit.
-            # Strip what is actually saved: _get_model_config may resolve from
-            # `model.config` or `model.args`, not just `_config`.
+            # A surviving grid would label this full-precision artifact 4-bit; strip what is saved, since
+            # _get_model_config may resolve from model.config or model.args.
             cfg = _get_model_config(model)
             if isinstance(cfg, dict):
                 model._config = _strip_mlx_quantization_metadata(cfg)
         else:
-            # Quantizing rewrites the caller's live model; snapshot it before
-            # the try, restore even when the quantize is what fails.
+            # Quantizing rewrites the caller's live model; snapshot it before the try and restore it even when the quantize itself fails.
             restore_after_save = _snapshot_mlx_model_state(model)
 
     # `model` is rebound below; this is what the caller still holds.
@@ -19151,14 +17691,9 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
 
 
 def _ensure_hub_repo_visibility(api, repo_id, private):
-    """create_repo + update_repo_settings + verify on failure.
-
-    private=None  : skip the visibility update entirely (Hub policy).
-    private=False : soft-fail on update error (stuck-private is not a leak).
-    private=True  : verify via repo_info on update failure; only raise when
-                    the repo is confirmed non-private (covers tokens lacking
-                    write:repo_settings on a just-created private repo).
-    """
+    """Create the repo, then set visibility: None skips the update; False soft-fails on error since stuck-private is not
+    a leak; True raises on update failure only if repo_info confirms non-private (tokens may lack
+    write:repo_settings)."""
     _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
     if private is not None:
         _create_repo_kwargs["private"] = bool(private)
@@ -19197,9 +17732,7 @@ def _ensure_hub_repo_visibility(api, repo_id, private):
         ) from exc
 
 
-# Module-level constants so _caller_wants_commit_metadata can distinguish
-# "caller explicitly wants this Unsloth default" from "caller wants their
-# own commit string"; same pattern as push_to_hub_merged.
+# Module-level defaults so _caller_wants_commit_metadata can tell an explicit Unsloth default from a caller's own commit string; same as push_to_hub_merged.
 _LORA_DEFAULT_COMMIT_MESSAGE = "Trained with Unsloth"
 _LORA_DEFAULT_COMMIT_DESCRIPTION = "Upload LoRA adapters trained with Unsloth 2x faster"
 
@@ -19215,30 +17748,23 @@ def _push_lora_adapters_to_hub(
     create_pr=False,
     revision=None,
 ):
-    """Upload an already-written LoRA adapter directory to the Hub.
-
-    Mirrors push_to_hub_merged's repo / commit / privacy / tag / upload
-    semantics, but skips the merged save_model fallback so it does not
-    overwrite adapters.safetensors with a full merged model.
-    """
+    """Upload a written LoRA adapter dir with push_to_hub_merged's repo, commit, privacy and tag semantics, minus its
+    save_model fallback, which would overwrite adapters.safetensors with a full model."""
     from huggingface_hub import HfApi
 
     save_directory = Path(save_directory)
     if repo_id is None:
         repo_id = save_directory.name
 
-    # Capture caller intent BEFORE backfilling defaults. Treat the Unsloth
-    # default strings the same as None so an outer wrapper that forwards
-    # the default verbatim is not mistaken for a custom request (the
-    # upload_large_folder fallback cannot preserve commit metadata).
+    # Capture intent before backfilling defaults; Unsloth default strings count as None so a forwarded default is not a
+    # custom request; upload_large_folder cannot keep commit metadata.
     _caller_wants_commit_metadata = bool(
         create_pr
         or commit_message not in (None, _LORA_DEFAULT_COMMIT_MESSAGE)
         or commit_description not in (None, _LORA_DEFAULT_COMMIT_DESCRIPTION)
     )
 
-    # Match push_to_hub_merged's commit conventions so the history is
-    # recognizable across CUDA and MLX backends.
+    # Match push_to_hub_merged's commit conventions so history looks the same across CUDA and MLX backends.
     if commit_message is None:
         commit_message = _LORA_DEFAULT_COMMIT_MESSAGE
     if "Unsloth" not in commit_message:
@@ -19255,8 +17781,7 @@ def _push_lora_adapters_to_hub(
         try:
             from huggingface_hub import ModelCard
             card_path = save_directory / "README.md"
-            # Seed a minimal card: fresh adapter dirs have no README, so
-            # ModelCard.load() would otherwise raise and tags would be lost.
+            # Seed a minimal card: fresh adapter dirs have no README, so ModelCard.load() would raise and drop the tags.
             if not card_path.exists():
                 card_path.write_text(
                     "---\n"
@@ -19281,9 +17806,7 @@ def _push_lora_adapters_to_hub(
     _lora_allow_patterns = [
         "adapters.safetensors",
         "adapter_config.json",
-        # `adapter_model.safetensors` is intentionally excluded: MLX writes
-        # `adapters.safetensors`, so a matching PEFT file is stale by
-        # definition and would corrupt the remote artifact.
+        # `adapter_model.safetensors` is excluded on purpose: MLX writes `adapters.safetensors`, so a PEFT file is stale and would corrupt the remote artifact.
         "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",
@@ -19302,9 +17825,7 @@ def _push_lora_adapters_to_hub(
         ".gitattributes",
     ]
 
-    # Prefer upload_folder for LoRA dirs (small, single commit honours
-    # commit_message / create_pr / revision); upload_large_folder is the
-    # last-resort fallback when upload_folder is unavailable.
+    # Prefer upload_folder for small LoRA dirs: one commit honours commit_message, create_pr and revision; upload_large_folder is the last-resort fallback.
     try:
         api.upload_folder(
             folder_path=str(save_directory),
@@ -19317,8 +17838,7 @@ def _push_lora_adapters_to_hub(
             allow_patterns=_lora_allow_patterns,
         )
     except (AttributeError, TypeError) as exc:
-        # Refuse to fall back to upload_large_folder when the caller asked
-        # for commit metadata it cannot preserve.
+        # Refuse to fall back to upload_large_folder when the caller asked for commit metadata it cannot preserve.
         if _caller_wants_commit_metadata:
             raise RuntimeError(
                 "Unsloth: upload_folder() failed but commit metadata or "
@@ -19352,33 +17872,9 @@ def save_pretrained_merged(
     create_pr=False,
     revision=None,
 ):
-    """Save the model in HF-compatible format using the requested method.
-
-    This mirrors the CUDA path's ``model.save_pretrained_merged()``.
-
-    Args:
-        model: MLX model (with optional LoRA layers).
-        tokenizer: Tokenizer to save alongside.
-        save_directory: Output directory path.
-        save_method: One of:
-            - ``"lora"``: save adapter weights only (smallest, default).
-            - ``"merged_16bit"``: fuse LoRA into base, dequantize, save full
-              fp16/bf16 model. Needed for GGUF / llama.cpp downstream.
-            - ``"merged_4bit"``: fuse LoRA into base while keeping the
-              base's 4-bit quantization, or quantize the merged weights to
-              4-bit when the base was loaded unquantized (``load_in_16bit``
-              or ``full_finetuning``). Unquantized VLMs are saved at full
-              precision with a notice; quantizing those is not supported yet.
-        push_to_hub: If True, upload to HuggingFace Hub after saving.
-        token: HuggingFace token for pushing.
-        private: Whether the HF repo should be private.
-        tags: Additional tags for the model card.
-        repo_id: HuggingFace repo ID. If None, uses save_directory name.
-        commit_message: Commit title for the upload.
-        commit_description: Optional longer commit body.
-        create_pr: If True, push to a PR branch instead of main.
-        revision: Target branch (defaults to main).
-    """
+    """Mirror CUDA save_pretrained_merged: save_method is lora (adapters, default), merged_16bit (fused, dequantized
+    fp16/bf16 for GGUF), or merged_4bit (keeps base 4-bit or quantizes; unquantized VLMs save full precision);
+    repo_id defaults to the save_directory name."""
     method = (save_method or "lora").lower().replace(" ", "_")
     if method not in ("lora", "merged_16bit", "merged_4bit"):
         raise ValueError(
@@ -19393,18 +17889,15 @@ def save_pretrained_merged(
                 "Unsloth: save_method='lora' but the model has no LoRA "
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
             )
-        # Preserve intentionally trainable non-LoRA tensors OUTSIDE any
-        # LoRA module; exclude wrapped base weights INSIDE a LoRA module
-        # so reload-trainable q_proj.weight cannot leak through the save.
+        # Keep trainable non-LoRA tensors outside LoRA modules; exclude wrapped base weights inside them so a
+        # reload-trainable q_proj.weight cannot leak into the save.
         trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
         adapter_keys = set(adapter_tensors)
         lora_module_prefixes = tuple(
             f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
         )
-        # Route to save_trainable_adapters when an external param or an
-        # intentionally trainable non-base param under a LoRA module (e.g.
-        # q_proj.bias) is present. _is_base_tensor_inside_lora_module
-        # treats wrapped `.weight`/`.scales`/`.biases` (+ `.linear.*`) as
+        # Route to save_trainable_adapters when an external or non-base trainable param sits under a LoRA module (e.g.
+        # q_proj.bias); _is_base_tensor_inside_lora_module treats wrapped .weight/.scales/.biases (+ .linear.*) as
         # reload-leaks; everything else under a LoRA prefix is user state.
         has_root_lora_module = any(
             name == "" for name, _ in iter_mlx_lora_modules(model)
@@ -19425,8 +17918,7 @@ def save_pretrained_merged(
         except Exception:
             pass
     else:
-        # merged_16bit → dequantize fused weights to fp16/bf16
-        # merged_4bit  → keep base quantization (LoRA absorbed)
+        # merged_16bit dequantizes fused weights to fp16/bf16; merged_4bit keeps the base quantization with LoRA absorbed.
         save_merged_model(
             model, tokenizer, save_directory,
             dequantize=(method == "merged_16bit"),
@@ -19435,9 +17927,8 @@ def save_pretrained_merged(
 
     if push_to_hub:
         if method == "lora":
-            # LoRA artifacts must NOT route through push_to_hub_merged: it
-            # would fall back to save_merged_model() (no index.json) and
-            # overwrite adapters.safetensors with a full merged model.
+            # LoRA artifacts must not route through push_to_hub_merged: it would fall back to save_merged_model (no
+            # index.json) and overwrite adapters.safetensors.
             _push_lora_adapters_to_hub(
                 save_directory,
                 repo_id=repo_id,
@@ -19464,31 +17955,23 @@ def save_pretrained_merged(
 
 
 def _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
-    """Whether we may `pip install` a package out of this llama.cpp checkout.
-
-    Installing a local directory runs its build backend, so only a checkout we
-    manage (~/.unsloth) or one the operator named via UNSLOTH_LLAMA_CPP_PATH
-    qualifies. A CWD-relative ./llama.cpp does not: the working directory is not
-    always the operator's, and gguf is on the package index anyway.
-    """
+    """Only a llama.cpp checkout under ~/.unsloth or named by UNSLOTH_LLAMA_CPP_PATH may be pip installed, since that
+    runs its build backend; a CWD-relative ./llama.cpp never qualifies."""
     from unsloth_zoo.llama_cpp import UNSLOTH_HOME
 
     def _canonical(path):
-        # realpath so a symlinked home (or macOS' /tmp -> /private/tmp) compares
-        # equal; normcase so Windows' case-insensitive paths do too.
+        # Use realpath so a symlinked home (or macOS /tmp, which resolves to /private/tmp) compares equal; normcase handles case-insensitive Windows paths.
         return os.path.normcase(os.path.realpath(path))
 
     def _contains(parent, child):
         parent = _canonical(parent)
-        # Trailing separator: "~/.unsloth-evil" is not inside "~/.unsloth".
-        # join(parent, "") keeps a root parent as "/" rather than "//".
+        # A trailing separator stops ~/.unsloth-evil matching inside ~/.unsloth; join with an empty part keeps a root parent as / rather than //.
         return child == parent or child.startswith(os.path.join(parent, ""))
 
     try:
         real_folder = _canonical(llama_cpp_folder)
         if _contains(UNSLOTH_HOME, real_folder): return True
-        # Raw and stripped: LLAMA_CPP_DEFAULT_DIR uses the variable verbatim
-        # while Studio strips it, so both spellings must read as trusted.
+        # Trust both raw and stripped spellings of UNSLOTH_LLAMA_CPP_PATH: LLAMA_CPP_DEFAULT_DIR uses it verbatim while Studio strips it.
         raw = os.environ.get("UNSLOTH_LLAMA_CPP_PATH") or ""
         for operator_path in (raw, raw.strip()):
             if operator_path and _contains(operator_path, real_folder): return True
@@ -19502,8 +17985,7 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
     """Install llama.cpp on macOS by cloning and building with cmake."""
     import subprocess
     if llama_cpp_folder is None:
-        # The managed checkout, not a CWD-relative "llama.cpp", so we never build
-        # or install out of whatever sits in the working directory.
+        # Use the managed checkout, not a CWD-relative llama.cpp, so nothing is built or installed from the working directory.
         from unsloth_zoo.llama_cpp import LLAMA_CPP_DEFAULT_DIR
         llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
 
@@ -19543,9 +18025,7 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
         shutil.rmtree(llama_cpp_folder, ignore_errors=True)
         _clone()
 
-    # Install deps; prefer gguf from the cloned repo to stay in sync, but only
-    # from a trusted checkout. Otherwise take the index copy, which keeps the
-    # export working without building an unvetted local package.
+    # Prefer gguf from the cloned repo only when the checkout is trusted; otherwise install the index copy, avoiding an unvetted local build.
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
     if os.path.exists(gguf_py_dir) and _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
         subprocess.run(
@@ -19565,11 +18045,8 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
     print("Unsloth: Building llama.cpp with cmake...")
 
     def _run_build_step(cmd, description):
-        # capture_output keeps a successful build quiet, but on failure cmake's
-        # stdout/stderr would be swallowed inside CalledProcessError and the user
-        # would see a bare non-zero exit with no build log. Surface the captured
-        # output in the RuntimeError so macOS build failures are debuggable (this
-        # mirrors how the Linux source-build path in llama_cpp.py reports errors).
+        # capture_output keeps success quiet, so on failure the captured output goes into the RuntimeError
+        # (CalledProcessError would hide the build log); mirrors llama_cpp.py.
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
@@ -19582,9 +18059,8 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
 
     _run_build_step(
         ["cmake", llama_cpp_folder, "-B", build_dir,
-         # macOS uses a single-config generator, so the build type must be set
-         # at configure time; --config Release on the build step is ignored and
-         # the binaries would otherwise be built unoptimized (very slow).
+         # macOS uses a single-config generator, so the build type must be set at configure time; --config Release at
+         # build time is ignored, leaving slow unoptimized binaries.
          "-DCMAKE_BUILD_TYPE=Release",
          "-DBUILD_SHARED_LIBS=OFF", "-DGGML_METAL=ON"],
         "llama.cpp cmake configure",
@@ -19612,9 +18088,8 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
     print("Unsloth: llama.cpp installed successfully.")
 
 
-# Markers naming a repackaging, not a different model. The imatrix is published against the base,
-# so these peel one per match, repeatedly, after the verbatim name is tried: -unsloth-bnb-4bit
-# goes all the way down. \d+-?bit covers both spellings mlx-community uses (-4bit and -4-bit).
+# Suffixes naming a repackaging, not another model; the imatrix is published against the base, so peel repeatedly after
+# the verbatim name (-unsloth-bnb-4bit); bit markers cover -4bit and -4-bit.
 _REPACKAGED_MODEL_SUFFIX = re.compile(
     r"-(?:\d+-?bit|int\d+|bf16|fp16|f16|fp8|mxfp4|float16|float32|mlx|awq|gptq|hqq|bnb|unsloth)$",
     re.IGNORECASE,
@@ -19622,12 +18097,8 @@ _REPACKAGED_MODEL_SUFFIX = re.compile(
 
 
 def _exported_gguf_files(save_directory, imatrix_source=None):
-    """The *.gguf files this export produced, excluding a caller-supplied imatrix.
-
-    imatrix_file may point inside save_directory. It is copied out before use, but the original
-    stays put, and both the summary and the Hub upload glob save_directory, so without this it
-    would be published as though it were an exported model.
-    """
+    """Excludes a caller-supplied imatrix: it may sit inside save_directory (copied out before use, original stays), and
+    the summary and Hub upload glob would publish it as a model."""
     files = sorted(Path(save_directory).glob("*.gguf"))
     if imatrix_source is None:
         return files
@@ -19635,11 +18106,8 @@ def _exported_gguf_files(save_directory, imatrix_source=None):
 
 
 def _is_same_file(a, b):
-    """True when two paths name one file, asked of the filesystem rather than of the strings.
-
-    The on-disk spelling is the filesystem's to choose: a case-insensitive mount folds case, APFS
-    stores NFD, and a symlink defeats equality outright. The fallback covers a path already gone.
-    """
+    """Asks the filesystem (os.path.samefile) since case-insensitive mounts, APFS NFD storage and symlinks defeat string
+    equality; abspath fallback if a path is gone."""
     try:
         return os.path.samefile(a, b)
     except OSError:
@@ -19682,12 +18150,8 @@ _GGUF_SHARD_SUFFIX = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
 
 
 def _gguf_shard_family(first_file, produced_files):
-    """`first_file` plus the shards llama.cpp wrote for the same `--outfile`.
-
-    A vision projector is a separate `--outfile` and so carries a different stem.
-    Grouping by stem keeps it out without pattern-matching filenames, which would
-    misfire on a model legitimately named `example-mmproj-model`.
-    """
+    """first_file plus the shards llama.cpp wrote for the same --outfile; grouped by stem so a vision projector (its own
+    --outfile) is excluded, since name patterns would misfire on a model legitimately named example-mmproj-model."""
     def shard_stem(path):
         name = os.path.basename(path)
         match = _GGUF_SHARD_SUFFIX.search(name)
@@ -19709,9 +18173,8 @@ _GGUF_QUANT_ALIASES = {
 
 
 def _normalize_gguf_quantization_methods(quantization_method):
-    """(ordered unique lower-case llama.cpp types, whether a list/tuple was passed).
-
-    Folded because outputs are `{base}.{TYPE}.gguf`: "BF16" and "bf16" are one file."""
+    """Returns ordered unique lower-case llama.cpp types and whether a list/tuple was passed; folded because outputs are
+    {base}.{TYPE}.gguf, so BF16 and bf16 are one file."""
     is_list = isinstance(quantization_method, (list, tuple))
     methods = list(quantization_method) if is_list else [quantization_method]
     if not methods:
@@ -20110,19 +18573,16 @@ def push_to_hub_merged(
     if repo_id is None:
         repo_id = save_directory.name
 
-    # Capture caller intent BEFORE backfilling defaults; upload_large_folder
-    # cannot preserve commit_message / commit_description / create_pr (only
-    # those three force the upload_folder route). Treat None and the
-    # Unsloth default strings the same so a wrapper forwarding the default
-    # is not mistaken for a custom request.
+    # Capture intent before backfilling defaults; upload_large_folder cannot keep commit_message, commit_description or
+    # create_pr, so those force upload_folder; Unsloth defaults count as None so a forwarded default is not a custom
+    # request.
     _caller_wants_commit_metadata = bool(
         create_pr
         or commit_message not in (None, _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE)
         or commit_description not in (None, _PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION)
     )
 
-    # Match the GPU path's "(Trained with Unsloth)" suffix convention so
-    # the commit history is recognizable across both backends.
+    # Match the GPU path's (Trained with Unsloth) commit suffix so commit history is recognizable across both backends.
     if commit_message is None:
         commit_message = ""
     if "Unsloth" not in commit_message:
@@ -20139,8 +18599,7 @@ def push_to_hub_merged(
         try:
             from huggingface_hub import ModelCard
             card_path = save_directory / "README.md"
-            # Seed a minimal card: fresh dirs without one would crash
-            # ModelCard.load() and silently lose the requested tags.
+            # Seed a minimal card: fresh dirs without a README would make ModelCard.load() crash and silently lose the requested tags.
             if not card_path.exists():
                 card_path.write_text(
                     "---\n"
@@ -20159,9 +18618,7 @@ def push_to_hub_merged(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    # upload_large_folder resumes / chunks (good for multi-GB merges) but
-    # drops commit_message / commit_description / create_pr; route through
-    # upload_folder when the caller asked for any of those.
+    # upload_large_folder resumes and chunks multi-GB merges but drops commit_message, commit_description and create_pr; use upload_folder when any is set.
     if _caller_wants_commit_metadata:
         try:
             api.upload_folder(
@@ -20174,8 +18631,7 @@ def push_to_hub_merged(
                 revision=revision,
             )
         except (AttributeError, TypeError) as exc:
-            # Refuse to fall back to upload_large_folder; it cannot preserve
-            # commit_message / commit_description / create_pr.
+            # Refuse to fall back to upload_large_folder, which cannot preserve commit_message, commit_description or create_pr.
             if _caller_wants_commit_metadata:
                 raise RuntimeError(
                     "Unsloth: upload_folder() failed but commit metadata "
@@ -20253,8 +18709,7 @@ def push_to_hub_gguf(
     reported = result.get("gguf_files") if isinstance(result, dict) else None
 
     api = HfApi(token=token)
-    # Same fail-loud private=True rule as the LoRA / merged paths so a
-    # private=True request never silently leaks GGUF shards public.
+    # Same fail-loud private=True rule as the LoRA and merged paths, so a private=True request never leaks GGUF shards publicly.
     _ensure_hub_repo_visibility(api, repo_id, private)
 
     gguf_files = _exported_gguf_files(

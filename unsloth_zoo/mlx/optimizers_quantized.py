@@ -14,70 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""8-bit optimizer state for MLX: quantized Adam/AdamW FIRST moment.
-
-Adam holds two moment buffers per parameter, so state is 2x the trainable bytes.
-Packing ``m`` to 8 bits cuts that by ``1 - (f*(1/b + 2/G) + (1-f) + 1)/2`` for a
-dtype of ``b`` bytes, group size ``G`` and an eligible byte fraction ``f``.
-Measured end to end on SmolLM2-135M, group_size=64:
-
-    full fine-tune, float32 state   35.9%     LoRA r=32/r=64   35.9%
-    full fine-tune, bfloat16 state  23.4%     LoRA r=16        34.6%
-
-Only the first two are the "8-bit vs 32-bit" figure. MLX creates moments with
-``mx.zeros_like(parameter)``, so a bfloat16 model has bfloat16 moments and the
-packed moment is being compared against 2 bytes, not 4.
-
-Eligibility is measured in elements, not shape: moments are quantized over a
-flattened view, so a rank-16 LoRA_B and a 3-D MoE expert stack pack as readily as
-a square matrix. An earlier rule required 2-D with a divisible last axis, which
-silently excluded LoRA_B below rank 64 and held r=16/r=32 to 18.3%. Anything under
-``MIN_QUANTIZE_SIZE`` elements keeps a full-width moment: those are the norms and
-biases, worth no bytes and the least tolerant of the error. bitsandbytes draws the
-same line at the same threshold (``min_8bit_size``).
-
-That floor is why r=16 lands at 34.6% rather than 35.9%: under grouped-query
-attention the k/v projections are narrow, so their LoRA_B is ``(kv_dim, r)`` and at
-r=16 that is 3072 elements on a 135M model. The figure is therefore model-shape
-dependent below r=32; a square fixture will report the full 35.9% and overstate it.
-
-This shrinks PERSISTENT state, not peak allocation: ``apply_single`` materialises
-a full-width ``m`` per parameter per step, and peak rose 11.7% on Metal and 29.9%
-on the CPU backend in a 135M full fine-tune. Loss impact over 200 steps is 0.44%
-MAPE full fine-tune and 0.76% LoRA against the same seed and data order.
-
-``v`` is deliberately NOT quantized. It is a running mean of squared gradients, so
-it spans orders of magnitude and sits near zero early; MLX's affine ``mx.quantize``
-reconstructs poorly there, ``sqrt(v)`` lands in the denominator, and the step
-explodes - measured, for both int8 m+v and fp32 m + int8 v:
-
-    1.0590 -> 0.8627 -> 19.3755 -> 10.2466 -> nan
-
-That needs bitsandbytes-style dynamic quantization, which MLX does not expose.
-``v`` keeps whatever dtype the parameter has; it is unquantized, not float32.
-
-Three constraints are load-bearing; do not "simplify" them away:
-
-1. Optimizer state must hold ONLY ``mx.array`` leaves - it is walked by
-   ``tree_flatten`` (checkpointing) and ``mx.compile``. A Python ``bool`` beside
-   the moments raises ``TypeError: object of type 'bool' has no len()``, so
-   group_size/bits live on the instance and are checkpointed as safetensors
-   metadata by ``save_optimizer_state``.
-
-2. ``mx.quantize`` returns a LIST on mlx 0.32, and ``tree_unflatten`` rebuilds the
-   triple as a list too, so ``isinstance(m, tuple)`` alone fails with
-   ``TypeError: can't multiply sequence by non-int of type 'float'``. Test
-   ``(tuple, list)``.
-
-3. Whether to re-pack is decided from ``is_quantizable(parameter)``, never from
-   the current type of ``state["m"]``. A checkpoint written by plain AdamW loads
-   an unpacked array, and inferring from it would leave that moment full width
-   for the rest of the run while the banner claims otherwise.
-
-Compiled and uncompiled runs agree under ``inputs=state, outputs=state``. The
-triple flattens to ``<param>.m.0/.1/.2``, so save/load_optimizer_state round-trip
-it and a resumed step reproduces the next parameters and state exactly.
-"""
+"""8-bit Adam/AdamW first moment; v stays unquantized (quantized v goes NaN); state holds only mx.array leaves
+(tree_flatten, mx.compile); mx.quantize returns a list on mlx 0.32, so test (tuple, list); re-pack from
+is_quantizable, never from the loaded type; saves persistent state, not peak memory."""
 
 import mlx.core as mx
 import mlx.optimizers as optim
@@ -98,8 +37,7 @@ DEFAULT_GROUP_SIZE = 64
 DEFAULT_BITS = 8
 # mx.quantize's supported group sizes; all three are exercised by the test suite.
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
-# Below this, packing a moment saves bytes that do not matter on parameters that
-# do not tolerate the error well. Matches bitsandbytes' min_8bit_size default.
+# Below this many elements, packing saves bytes that do not matter on parameters that tolerate error poorly; matches bitsandbytes min_8bit_size default.
 MIN_QUANTIZE_SIZE = 4096
 # Names already announced in this process; see announce_quantized_optimizer.
 _ANNOUNCED = set()
@@ -113,15 +51,13 @@ def _as_int(value, name):
 
 
 class _QuantizedFirstMomentMixin:
-    """Store ``state["m"]`` 8-bit packed; delegate the update math to the parent,
-    so bias correction and AdamW's decoupled decay stay the stock implementation."""
+    """Stores state["m"] 8-bit packed and delegates the update math to the parent, keeping bias correction and AdamW decoupled decay stock."""
 
     def _init_quantization(self, group_size, bits):
         # Instance attributes, NOT optimizer state (which holds arrays only).
         bits = _as_int(bits, "bits")
         if bits != DEFAULT_BITS:
-            # Rejected rather than offered untested: this state is demonstrably
-            # quantization-sensitive (see the second-moment NaN trace above).
+            # Other bits are rejected, not offered untested: this state is quantization-sensitive (second-moment NaN trace in the module docstring).
             raise ValueError(
                 f"Unsloth: quantized optimizer state supports bits={DEFAULT_BITS} "
                 f"only, got bits={bits}. Optimizer moments are quantization-"
@@ -138,15 +74,9 @@ class _QuantizedFirstMomentMixin:
         self.bits = bits
 
     def is_quantizable(self, parameter):
-        """``mx.quantize`` constrains the LAST axis only, so a flattened view makes
-        eligibility a question of element count rather than shape. That admits 3-D
-        MoE expert stacks and LoRA_B at rank 16/32, which the previous 2-D rule
-        rejected while their partner matrices were packed.
-
-        Tensors under ``MIN_QUANTIZE_SIZE`` stay full width: they are a rounding
-        error in the state budget but include the norm and bias parameters, which
-        are the ones least worth adding quantization error to. bitsandbytes draws
-        the same line at the same threshold (``min_8bit_size``)."""
+        """Eligibility is by element count, not shape: mx.quantize only constrains the last axis, so flattened moments
+        admit 3-D expert stacks and LoRA_B at rank 16/32; tensors under MIN_QUANTIZE_SIZE (norms, biases) stay full
+        width, as bitsandbytes min_8bit_size does."""
         return (
             parameter.size >= MIN_QUANTIZE_SIZE
             and parameter.size % self.group_size == 0
@@ -159,8 +89,7 @@ class _QuantizedFirstMomentMixin:
         )
 
     def _unpack(self, packed, shape):
-        """``mx.dequantize`` is self-describing, so this also reads checkpoints
-        written by the earlier per-row layout, whose triple carries its own shape."""
+        """Also reads checkpoints from the earlier per-row layout, since mx.dequantize is self-describing and the triple carries its own shape."""
         moment = mx.dequantize(
             *packed, group_size=self.group_size, bits=self.bits,
         )
@@ -176,13 +105,11 @@ class _QuantizedFirstMomentMixin:
         # tuple OR list: mx.quantize and tree_unflatten both give a list.
         if isinstance(packed, (tuple, list)):
             moment = self._unpack(packed, parameter.shape)
-            # Affine dequantization does not land exactly on zero, and v == 0
-            # means this coordinate has only seen zero gradients, so its true
-            # moment is zero. Without this the residue is divided by eps alone.
+            # Affine dequantization does not land exactly on zero; v == 0 means only zero gradients were seen, so the
+            # true moment is zero; otherwise the residue is divided by eps alone.
             state["m"] = mx.where(state["v"] == 0, mx.zeros_like(moment), moment)
         updated = super().apply_single(gradient, parameter, state)
-        # Re-pack from eligibility, not from what was loaded: a checkpoint
-        # written by plain AdamW arrives unpacked and must not stay that way.
+        # Re-pack from is_quantizable, not the loaded type: a checkpoint written by plain AdamW arrives unpacked and must not stay that way.
         if self.is_quantizable(parameter):
             state["m"] = self._pack(state["m"])
         return updated
@@ -246,12 +173,8 @@ def describe_quantized_optimizer(optimizer_name, group_size = DEFAULT_GROUP_SIZE
 def announce_quantized_optimizer(
     optimizer_name, group_size = DEFAULT_GROUP_SIZE, enabled = True,
 ):
-    """Print the routing line at most once per process. Returns whether it printed.
-
-    ``_build_optimizer`` runs per training run and per rank, so an unguarded print
-    put five wrapped lines on screen for every rank and every re-run of a notebook
-    cell, for what is the default optimizer in every Unsloth example.
-    """
+    """Prints the routing line once per process, returning whether it printed; _build_optimizer runs per run and rank,
+    so an unguarded print repeats per rank and notebook re-run."""
     if not enabled or optimizer_name in _ANNOUNCED:
         return False
     _ANNOUNCED.add(optimizer_name)
@@ -260,25 +183,16 @@ def announce_quantized_optimizer(
 
 
 def unpack_quantized_moments(state, group_size = DEFAULT_GROUP_SIZE, bits = DEFAULT_BITS):
-    """Dequantize every packed first moment in a loaded state tree.
-
-    Lets a checkpoint written by a quantized optimizer load into a plain
-    ``optim.Adam``/``AdamW``, which would otherwise reach ``b1 * m`` on a list and
-    raise ``TypeError: can't multiply sequence by non-int of type 'float'`` from
-    inside mlx with no mention of quantization.
-
-    Applies the same ``v == 0`` mask ``apply_single`` does. Carrying the residue out
-    to a plain optimizer would reintroduce the blow-up there: measured 5.96e-08 of
-    residue moving inactive coordinates by 5.4e-02 over 200 zero-gradient steps.
-    """
+    """Dequantizes packed first moments so a quantized checkpoint loads into plain optim.Adam/AdamW (else b1 * m on a
+    list raises TypeError); applies the v == 0 mask as apply_single does, since carried residue would move inactive
+    coordinates."""
     if isinstance(state, dict):
         out = {}
         for key, value in state.items():
             if key == "m" and isinstance(value, (tuple, list)) and len(value) == 3:
                 moment = mx.dequantize(*value, group_size = group_size, bits = bits)
                 second = state.get("v")
-                # ``v`` is the only full-width leaf here, so it carries the shape a
-                # flat-packed moment has to be restored to before the mask lines up.
+                # v is the only full-width leaf, so it carries the shape a flat-packed moment must be restored to before the v == 0 mask lines up.
                 if isinstance(second, mx.array) and second.size == moment.size:
                     moment = moment.reshape(second.shape)
                     moment = mx.where(second == 0, mx.zeros_like(moment), moment)

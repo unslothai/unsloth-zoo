@@ -48,19 +48,9 @@ _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION
 
 
 def _storage_only_float_dtypes():
-    """float8 dtypes, which are a storage format rather than a compute dtype.
-
-    `torch.float8_e4m3fn.is_floating_point` is True, so a plain floating-point
-    test reads an FP8 checkpoint's stored weight as the dtype its Linear wants
-    its activations in. It is not: transformers' `FP8Linear` / `FbgemmFp8Linear`
-    take bfloat16 or float16 in, do their own scaled quantization, and hand back
-    the input dtype. Casting the hidden states straight to unscaled float8 would
-    throw away range before the scaling that exists to preserve it, and leave
-    the Q/K norm and SDPA downstream holding a dtype they do not support.
-
-    Built by lookup rather than hard-coded, so a torch that predates one of
-    these (or adds another) neither raises nor silently stops excluding it.
-    """
+    """Float8 dtypes are storage formats, not compute dtypes: is_floating_point is True, but transformers' FP8Linear /
+    FbgemmFp8Linear take bfloat16 or float16 and do their own scaled quantization; looked up by name so a torch that
+    predates one (or adds one) neither raises nor stops excluding it."""
     names = ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz",
              "float8_e8m0fnu")
     return frozenset(
@@ -73,47 +63,14 @@ _STORAGE_ONLY_FLOAT_DTYPES = _storage_only_float_dtypes()
 
 
 def _linear_boundary_dtype(module, *attr_names):
-    """Dtype of the activations that the given projections expect, or None.
-
-    The UNSLOTH_FORCE_FLOAT32 Gemma3 patches run the heavy reductions (RMSNorm
-    variance, SwiGLU, attention) in float32 for fp16 overflow safety and hand a
-    float16 activation to every Linear. That hard-coded float16 silently assumes
-    the projection weights are float16 too. They are for LoRA / QLoRA, where the
-    base weights stay float16, but full finetuning upcasts the trainable weights
-    to float32, and then a float16 activation meets a float32 weight and the
-    matmul dies with "expected mat1 and mat2 to have the same dtype".
-
-    So read the dtype off the weights that will actually do the multiply. The
-    first ordinary floating-point weight wins.
-
-    A weight carrying a `quant_state` is quantized and never answers, whatever
-    its dtype says. bitsandbytes packs a 4bit weight into a blob of
-    `bnb_4bit_quant_storage`, which defaults to uint8 but is a public knob:
-    FSDP can only shard float dtypes, so FSDP-QLoRA setups are told to set it
-    to bfloat16, and `vllm_utils` / the bnb MoE loaders plumb the configured
-    value straight through. That makes `Params4bit.weight.dtype` bfloat16 while
-    the tensor is still packed 4bit, so a plain floating-point test reads a
-    storage container as the activation dtype. `Linear4bit` dequantizes to its
-    own compute dtype and hands back the caller's input dtype, so answering
-    here would cast activations and forced outputs to the storage dtype and
-    change QLoRA forward and gradient numerics. `quant_state` is the only
-    reliable discriminator, and is read with getattr so a plain `nn.Parameter`
-    or a non-bitsandbytes backend is unaffected.
-
-    None means "no weight answered, so leave the activation alone". It is not
-    float16. On a 4bit model every projection is skipped, and a float16 default
-    would narrow a bfloat16 QLoRA activation on the generic (non-forced) path
-    that the unpatched forward passed through untouched -- costing exactly the
-    exponent range bfloat16 is chosen for. Under UNSLOTH_FORCE_FLOAT32 the
-    activation reaching here is already float16 out of RMSNorm, so "leave it
-    alone" and the old float16 default are the same value on that path.
-    """
+    """Dtype the projections expect, read from the first float weight that does the multiply (a hard-coded float16
+    breaks full-finetune fp32 weights); quant_state weights never answer, since their dtype is only the
+    bnb_4bit_quant_storage; None means leave the activation alone, not float16."""
     for name in attr_names:
         module_or_param = getattr(module, name, None)
         if module_or_param is None: continue
         weight = getattr(module_or_param, "weight", module_or_param)
-        # Quantized weights describe storage, not the activation dtype. Must be
-        # tested before the dtype checks, which a float quant_storage passes.
+        # Quantized weights describe storage, not the activation dtype; test quant_state before the dtype checks, since a float quant_storage passes them.
         if getattr(weight, "quant_state", None) is not None: continue
         dtype = getattr(weight, "dtype", None)
         if dtype is None or not dtype.is_floating_point: continue
@@ -124,39 +81,16 @@ pass
 
 
 def _to_boundary_dtype(x, dtype):
-    """Move an *already correctly typed* activation onto a Linear's dtype.
-
-    For the input boundaries only, where x arrives as float16 out of RMSNorm.
-    float16 weights (LoRA / QLoRA) hit the identity branch on every call, so the
-    common path keeps exactly the casts it had before and its numerics are
-    unchanged. Only the float32 full-finetuning mismatch actually converts.
-
-    A None dtype means "no weight answered" and is identity, which is safe here
-    precisely because x is already the float16 these lines used to hard-code.
-    Do NOT use this at a forced output boundary, where x is a deliberately
-    upcast float32 reduction and identity would leak that float32 into the
-    projection -- use `_to_forced_output_dtype` there.
-    """
+    """Casts x to a Linear's dtype at input boundaries only (x is float16 from RMSNorm); None or a matching dtype is
+    identity. Not for forced outputs, where identity leaks float32: use _to_forced_output_dtype."""
     if dtype is None or x.dtype == dtype: return x
     return x.to(dtype)
 pass
 
 
 def _to_forced_output_dtype(x, dtype):
-    """Downcast a forced-float32 reduction before its output projection.
-
-    The counterpart of `_to_boundary_dtype` for the two boundaries where the
-    incoming activation is the explicitly upcast float32 SwiGLU / attention
-    reduction rather than a float16 RMSNorm output. Those lines used to be a
-    bare `.to(torch.float16)`, so "no weight answered" must still mean float16,
-    not identity: on 4bit QLoRA every projection weight is a packed 4bit blob
-    and nothing answers, and bitsandbytes `Linear4bit` returns its caller's
-    input dtype, so an identity here would make `down_proj` / `o_proj` hand back
-    float32 and change the forward and gradient dtypes of the common QLoRA path.
-
-    Kept as a separate name, rather than a default argument on the helper above,
-    so the two kinds of boundary cannot be confused at the call site.
-    """
+    """Downcasts a forced float32 reduction before its output projection; None means float16, not identity: on 4bit
+    QLoRA nothing answers and Linear4bit echoes the input dtype. Kept separate from _to_boundary_dtype."""
     if dtype is None: dtype = torch.float16
     if x.dtype == dtype: return x
     return x.to(dtype)
@@ -164,16 +98,8 @@ pass
 
 
 def _publish_boundary_helpers(modeling_module):
-    """Make the three boundary helpers importable from the modeling module.
-
-    The auto-compiler serializes a patched forward into unsloth_compiled_cache
-    as source text, and `create_new_function` resolves the free names it finds
-    by importing them from `transformers.models.gemma3.modeling_gemma3`. A
-    helper that lives only in this patch module is not there, so the generated
-    forward raises NameError the first time it runs and compiled Gemma3
-    training dies. The RMSNorm helpers are published for exactly this reason;
-    every forward below references these two, so they need it too.
-    """
+    """Publish the boundary helpers into transformers' modeling_gemma3: compiled forwards are rebuilt from source and
+    import free names from there, else NameError on first run."""
     publish_to_modeling_module(
         modeling_module,
         _linear_boundary_dtype  = _linear_boundary_dtype,
@@ -196,8 +122,8 @@ def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states
     if attention_mask is None:
         if sliding_window is None: return None
         q_len, kv_len = query_states.shape[2], key_states.shape[2]
-        # FA2 leaves the window (and cached-chunk offset) to its kernel; SDPA needs them explicit.
-        # Batch-invariant [1, 1, q, kv]: no larger than transformers' own sdpa sliding mask.
+        # FA2 applies the window (and cached-chunk offset) in its kernel, but SDPA needs them explicit; the mask is
+        # batch-invariant [1, 1, q, kv], no larger than transformers' sdpa mask.
         if kv_len > sliding_window or (1 < q_len < kv_len):
             return _gemma3_causal_window_mask(q_len, kv_len, sliding_window, query_states.device)
         return None
@@ -224,8 +150,7 @@ def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states
 
 
 def _gemma3_rms_norm(x, weight, eps, out_dtype):
-    # Inline Gemma3RMSNorm so compiled prepare() doesn't nest another compiled
-    # forward, which broke Dynamo on older torch (unsloth#3535).
+    # Inline Gemma3RMSNorm so compiled prepare() does not nest another compiled forward, which broke Dynamo on older torch (unsloth#3535).
     x_fp32 = x.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim=True)
     hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + eps)
@@ -252,9 +177,8 @@ def _make_gemma3_attn_forwards(forward_function, has_cache_position):
 
 
 def _resolve_truncation(padding, truncation, max_length):
-    # HF activates "longest_first" truncation when max_length is set with padding=False and no explicit
-    # truncation. We drop padding to pad manually, so pin the strategy the tokenizer would have derived
-    # (from the caller's original padding) and pass it explicitly, keeping truncation behaviour identical.
+    # HF activates longest_first truncation when max_length is set with padding=False and no explicit truncation;
+    # padding is dropped here, so pin the same strategy explicitly.
     if truncation is not None:
         return truncation
     return "longest_first" if (max_length is not None and padding is False) else False
@@ -266,17 +190,15 @@ def _fix_double_bos_and_pad(
     return_mm_token_type_ids, padding, padding_side, return_tensors,
     max_length = None, pad_to_multiple_of = None, model_max_length = None,
 ):
-    # Gemma3 doubles the BOS (chat template + tokenizer). Strip the duplicate on every row and on
-    # every per-token field returned (attention_mask, token_type_ids, special_tokens_mask,
-    # offset_mapping, ...), rebuild mm token type ids, then pad each field so ragged rows stack.
-    # Honours "do_not_pad"/max_length/model max/pad_to_multiple_of and the return_tensors=None list contract.
+    # Gemma3 doubles BOS (chat template plus tokenizer): strip the duplicate per row and in every per-token field, then
+    # re-pad so ragged rows stack; honours do_not_pad, max_length, model max, pad_to_multiple_of and return_tensors=None
+    # lists.
     n_rows = len(text_inputs["input_ids"])
     input_lens = [len(x) for x in text_inputs["input_ids"]]
     double_bos = [bos_token_id, bos_token_id]
     strip = [x[:2] == double_bos for x in text_inputs["input_ids"]]
-    # only fields whose rows match the matching input_ids row length are token aligned; this keeps
-    # non-aligned tokenizer outputs out of the per-row strip/pad. overflowing_tokens is a per-example
-    # list of tails, so exclude it by name too in case a tail length coincidentally matches its row.
+    # Only fields whose rows match input_ids row lengths are token aligned, keeping other outputs out of the per-row
+    # strip/pad; overflowing_tokens is excluded by name since a tail can match a row length.
     non_aligned = {"overflowing_tokens", "overflow_to_sample_mapping", "num_truncated_tokens", "length"}
     per_token_keys = [
         k for k, v in text_inputs.items()
@@ -576,9 +498,8 @@ _GEMMA3_FP16_MAX = float(torch.finfo(torch.float16).max)
 _GEMMA3_FP16_MIN = float(torch.finfo(torch.float16).min)
 
 
-# Every Gemma3 RMSNorm shares this one kernel, so its Dynamo cache holds the product
-# of every axis its guards see. A plain Tensor weight view keeps the width dynamic
-# and a rank 2 input drops the rank axis, leaving dtype, grad mode and requires_grad.
+# All Gemma3 RMSNorms share this kernel, so Dynamo caches the product of its guard axes; a Tensor weight keeps width
+# dynamic and rank 2 input drops rank, leaving dtype, grad mode and requires_grad.
 def _gemma3_rms_norm_float32(hidden_states_2d, weight_1d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -589,8 +510,7 @@ def _gemma3_rms_norm_float32(hidden_states_2d, weight_1d, eps):
     return clamped_output_fp32.to(torch.float16)
 pass
 
-# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
-# this wrapper latches to eager instead of aborting the run.
+# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only this wrapper latches to eager instead of aborting the run.
 _gemma3_rms_norm_float32 = compile_with_eager_fallback(_gemma3_rms_norm_float32, "Gemma3RMSNorm.forward (float32)")
 
 

@@ -94,8 +94,7 @@ def _truncated_support_mask_impl(
     return torch.isfinite(logits)
 pass
 
-# Opaque to Inductor: with dynamic chunk rows its lowering of these reductions raises CantSplit
-# (torch 2.13), and the set is a constant of the backward anyway.
+# Opaque to Inductor: dynamic chunk rows make its lowering of these reductions raise CantSplit (torch 2.13); the support set is constant in backward anyway.
 try:
     _truncated_support_mask = torch.library.custom_op(
         "unsloth_zoo::truncated_support_mask", mutates_args = (),
@@ -107,12 +106,9 @@ except Exception:
     _truncated_support_mask = _truncated_support_mask_impl
 pass
 
-# Mirrors vLLM v1 processed_logprobs: renormalised over what survives min_p, then top_k, then top_p
-# (sampler.py `sample`, topk_topp_sampler.py `apply_top_k_top_p`). The scored token is always kept
-# so a boundary disagreement between the trainer's recomputed set and the sampler's stays finite.
-# A scored token tied with the smallest kept logit but dropped by the sort counts as one of the kept
-# tokens (vLLM keeps an arbitrary subset of a tied run): it takes the place of one kept tied token,
-# so both the value and its gradient are those of a kept token.
+# Mirrors vLLM v1 processed_logprobs (renormalised after min_p, top_k, top_p; sampler.py sample, topk_topp_sampler.py
+# apply_top_k_top_p); scored token always kept so boundary mismatches stay finite; a tied scored token the sort drops
+# swaps in for a kept one, so value and gradient match a kept token.
 def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False, excluded_ids = None):
     index = chunk_index.unsqueeze(-1)
     selected_logits = torch.gather(chunk_logits, dim = -1, index = index)
@@ -725,8 +721,7 @@ pass
 RL_REPLACEMENTS["create_completion_attention_mask"] = create_completion_attention_mask
 
 
-# Rebuild Qwen-style mm_token_type_ids from full input_ids after GRPO generation changes sequence length.
-# This is primarily towards VLMs that use MRoPE
+# Rebuild Qwen-style mm_token_type_ids from full input_ids after GRPO generation changes sequence length; mainly for VLMs that use MRoPE.
 def _unsloth_get_mm_token_id(processing_class, attr_name, token):
     tokenizer = getattr(processing_class, "tokenizer", processing_class)
     token_id = getattr(processing_class, attr_name, None)
@@ -1280,8 +1275,7 @@ def grpo_compute_loss(
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
-# Same eager fallback as every other fullgraph region: a bare decorator leaves
-# cache exhaustion fatal under fullgraph.
+# Same eager fallback as other fullgraph regions: a bare decorator leaves cache exhaustion fatal under fullgraph.
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     f"from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"\
     f"@torch_compile_with_fallback(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
@@ -1292,7 +1286,6 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
         "def grpo_compute_loss_slow",
 )
 
-# Unsloth's memory efficient GRPO implementation
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under AGPL3
     @staticmethod
@@ -1512,8 +1505,7 @@ RL_REPLACEMENTS["grpo_entropy_bonus_weights"] = grpo_entropy_bonus_weights
 
 _HIGH_ENTROPY_MASK_PADS = {}
 def _high_entropy_mask_pads(method):
-    # TRL >= 0.24 pads every rank to one length before the gather; TRL 0.22 / 0.23 gather the
-    # raw valid tokens and return early on a rank that has none
+    # TRL >= 0.24 pads every rank to one length before the gather; TRL 0.22 and 0.23 gather the raw valid tokens and return early on a rank that has none.
     func = getattr(method, "__func__", method)
     pads = _HIGH_ENTROPY_MASK_PADS.get(func, None)
     if pads is None:
@@ -1925,9 +1917,8 @@ pass
 RL_REPLACEMENTS["_warn_deprecated_n_chunks"] = _warn_deprecated_n_chunks
 
 
-# The multimodal keys TRL's GRPO trainer puts in the inputs dict. Both Unsloth logprob
-# paths read this one tuple: they must forward the same inputs, or the importance ratio
-# compares two different policies. unslothai/unsloth#6960.
+# Multimodal keys TRL's GRPO trainer puts in the inputs dict; both Unsloth logprob paths must forward these same keys or
+# the importance ratio compares two policies (unslothai/unsloth issue 6960).
 GRPO_VISION_KEYS = (
     "pixel_values",
     "image_grid_thw",
@@ -1935,8 +1926,7 @@ GRPO_VISION_KEYS = (
     "image_sizes",
     "spatial_shapes",
     "num_tiles",
-    # One Gemma 4 field under both TRL names: pixel_position_ids in 1.0.x, renamed in
-    # 1.1.0. Only ever one of the two is present.
+    # One Gemma 4 field under both TRL names: pixel_position_ids in 1.0.x, renamed in 1.1.0; only one of the two is ever present.
     "image_position_ids",
     "pixel_position_ids",
     "num_images",
@@ -1962,11 +1952,9 @@ pass
 RL_REPLACEMENTS["grpo_get_vision_inputs"] = grpo_get_vision_inputs
 
 
-# What every released unsloth up to 2026.9.4 forwards on the no-grad side, hard coded in its
-# own `_get_per_token_logps_and_entropies` replacement. The conservative answer when the
-# installed companion is present but cannot be read: forwarding MORE than this on the gradient
-# side alone is what makes the two policies differ, so an unknown companion is assumed to be
-# one of those rather than assumed to be current.
+# The vision keys every released unsloth up to 2026.9.4 forwards on the no-grad side (hard coded in its
+# _get_per_token_logps_and_entropies replacement); an unreadable companion is assumed one of these, since forwarding
+# more on the gradient side alone makes the policies differ.
 GRPO_RELEASED_VISION_KEYS = (
     "pixel_values",
     "image_grid_thw",
@@ -1977,11 +1965,9 @@ GRPO_RELEASED_VISION_KEYS = (
     "mm_token_type_ids",
 )
 
-# The names whose presence in the installed unsloth's no-grad replacement means it reads THIS
-# module's key tuple rather than a list of its own. Either one is enough: unslothai/unsloth#11031
-# collects the keys in a module level helper and names only the chunker inside the replacement.
-# One constant rather than two literals per site, because the integration test has to ask the
-# same question the gate asks and a second copy of the answer drifts.
+# Markers whose presence in the installed unsloth's no-grad replacement means it reads this module's key tuple; either
+# one suffices (unslothai/unsloth issue 11031 collects keys in a helper, naming only the chunker); one constant keeps
+# the test and gate in step.
 GRPO_SHARED_HELPER_MARKERS = ("grpo_get_vision_inputs", "grpo_vision_chunks")
 
 # Memo for grpo_companion_vision_keys. Set once per process; tests reset it to None.
@@ -2407,8 +2393,7 @@ def grpo_parse_is_clip(spec, mode):
     if (lower is not None and not (0 <= lower < math.inf)) or (upper is not None and not (0 < upper < math.inf)):
         raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP needs a finite lower >= 0 and upper > 0, got {spec!r}.")
     if lower is not None and upper is not None and lower >= upper:
-        # TRL GRPOConfig rejects clip_min >= clip_max: equal bounds make truncate a constant weight
-        # and the mask modes keep only ratios exactly equal to it.
+        # TRL GRPOConfig rejects clip_min >= clip_max: equal bounds make truncate a constant weight and mask modes keep only ratios equal to it.
         raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP lower bound must be below the upper bound in {spec!r}.")
     if lower is None and upper is None and str(mode).endswith("_truncate"):
         raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP={spec!r} gives no bound for {mode}.")
@@ -3947,12 +3932,8 @@ def _distillation_jsd_chunk(
     student_log_probs = torch.nn.functional.log_softmax(student_logits, dim = -1)
     teacher_log_probs = torch.nn.functional.log_softmax(teacher_logits, dim = -1)
 
-    # Reduce on the STUDENT head's device. Each projection above left its result
-    # on its own head's device, which under an accelerate dispatch that splits
-    # the two models is not the same device, and the divergence then raises. The
-    # student's side is the right target because the gradient accumulates there.
-    # Both moves are no-ops when the heads are co-located, which is every
-    # single-device run.
+    # Reduce on the STUDENT head's device (the gradient accumulates there); an accelerate split can put the two heads on
+    # different devices; both moves are no-ops when co-located.
     if teacher_log_probs.device != student_log_probs.device:
         teacher_log_probs = teacher_log_probs.to(student_log_probs.device)
     if valid.device != student_log_probs.device:
@@ -4016,9 +3997,7 @@ def _distillation_jsd_grad_fn(argnums):
 pass
 
 
-# Keep ``lru_cache``'s one useful method so callers that need a fresh compile
-# decision, notably anything toggling the compile-disable flag mid process, do
-# not have to know the memo is a dict now.
+# Keep lru_cache's cache_clear so callers needing a fresh compile (e.g. toggling the compile-disable flag mid process) need not know the memo is a dict.
 _distillation_jsd_grad_fn.cache_clear = _DISTILLATION_JSD_GRAD_FNS.clear
 
 

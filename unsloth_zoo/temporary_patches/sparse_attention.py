@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Skip sparse-attention indexers when top-k keeps every key anyway (exact).
-
-Within the budget (DSA `index_topk`, MiniMax-M3 `index_topk_blocks`, DeepSeek-V4 CSA `index_topk`)
-top-k selects every visible key, so the indexer's fp32 multi-head scoring is wasted. The patched
-indexers return the same selection without scoring and still update their own key cache.
-UNSLOTH_SPARSE_ATTN_SKIP_FULL=0 restores upstream.
-"""
+"""Exact skip of indexer fp32 scoring when top-k keeps every visible key (DSA index_topk, MiniMax-M3 index_topk_blocks,
+DeepSeek-V4 CSA index_topk); still updates key caches; UNSLOTH_SPARSE_ATTN_SKIP_FULL=0 restores upstream."""
 
 __all__ = [
     "patch_deepseek_v32_sparse_skip",
@@ -44,8 +39,7 @@ _DSA_CACHE_OK = {}
 
 
 def _transformers_tested():
-    """Checked on transformers 5.17-5.20; older 5.x indexers differ (no mask for unpadded SDPA,
-    per-query MiniMax blocks), so those keep upstream."""
+    """Checked on transformers 5.17-5.20; older 5.x indexers differ (no mask for unpadded SDPA, per-query MiniMax blocks), so those keep upstream."""
     try:
         import transformers
         from packaging.version import Version

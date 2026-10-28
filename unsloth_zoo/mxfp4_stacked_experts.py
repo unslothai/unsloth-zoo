@@ -51,9 +51,9 @@ def _experts_per_chunk(param, dtype, budget = None):
     return max(1, min(param._original_shape[0], (_chunk_bytes() if budget is None else budget) // per_expert))
 
 
-# Dequantize fallback: per GPU, [the chunk bytes to try, the calls left before the full chunk budget is tried
-# again, the smallest chunk bytes that failed to allocate]. Bytes, not experts: params with smaller experts
-# (a down_proj expert is half a gate_up one) still probe the dequantize path below the failed size.
+# Per-GPU dequantize fallback state: [chunk bytes to try, calls left before the full budget is retried, smallest failed
+# chunk bytes]; in bytes, not experts, so smaller experts (a down_proj is half a gate_up) still probe below the failed
+# size.
 _CHUNK_BUDGET = {}
 _CHUNK_RETRY_CALLS = 1024
 
@@ -118,8 +118,8 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
                 raise
             weight = None
         if weight is None:
-            # The dequantized chunk did not fit (2 GiB default on a small GPU): halve it, keep that size for the
-            # next calls, and below one expert use the fused kernel, which never builds a 16-bit expert.
+            # A dequantized chunk (2 GiB default) that does not fit is halved and that size kept for later calls; below
+            # one expert, use the fused kernel, which never builds a 16-bit expert.
             failed = step * _expert_bytes(param, dtype)
             if step > 1:
                 step //= 2
@@ -150,8 +150,8 @@ def _fused(inputs, param, transpose = True):
         return False
     if mxfp4_gemm_available(inputs.device, inputs.dtype):
         return True
-    # sm_75: only decode rows, which take the GEMV; the tile kernel loses to dequantize + grouped GEMM there.
-    # Except under torch.compile or CUDA graph capture: the fallback reads routing offsets on the host.
+    # On sm_75 only decode rows take the GEMV, since the tile kernel loses to dequantize + grouped GEMM; under
+    # torch.compile or CUDA graph capture all rows do, as the fallback reads host offsets.
     return (
         (_gemv_rows(inputs.shape[0], param.shape[0], transpose) or _tracing_or_capturing(inputs.device))
         and mxfp4_grouped_gemv_available(inputs.device, inputs.dtype)

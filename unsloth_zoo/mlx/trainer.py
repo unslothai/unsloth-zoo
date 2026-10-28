@@ -105,9 +105,8 @@ def _mlx_rank0_resolve_int(comm_group, resolver, context):
             value = int(resolver())
             status = 1
         except BaseException as exc:
-            # Synchronize the failure (interrupts included) before it
-            # propagates: peers block in the metadata collective and would hang
-            # if rank 0 unwound past it. Re-raised on rank 0 below.
+            # Sync the failure (interrupts included) before it propagates: peers block in the metadata collective and
+            # would hang if rank 0 unwound past it; re-raised on rank 0 below.
             owner_error = exc
             status = -1
     metadata = mx.array(
@@ -185,20 +184,9 @@ _DEFAULT_FLOW_FINAL_STEP_EVAL = None
 
 
 def _default_flow_evaluates_final_step():
-    """Whether the installed DefaultFlowCallback forces a final-step evaluation.
-
-    transformers 5.x evaluates again at ``state.global_step >= state.max_steps``
-    when the step interval did not already land there; 4.x has no such block.
-    Ask the shipped callback rather than pinning a version, so the loop's own
-    cadence tracks whichever transformers is installed and a with-flow run and a
-    without-flow run always agree.
-
-    Probed by running the real callback: it reads plain attributes, so the
-    torch-free _MLXTrainerState/_MLXTrainerControl stand in for HF's own and the
-    probe adds no import to the module. No transformers -- or a future one that
-    reads an argument this stand-in lacks -- keeps the 4.x answer, which is what
-    the loop did before this cadence existed.
-    """
+    """Whether the installed transformers DefaultFlowCallback forces a final-step eval (5.x does, 4.x does not); probed
+    on the real callback, not pinned, so with-flow and without-flow runs always agree; no transformers or failing
+    probe keeps 4.x; the probe adds no import to the module."""
     global _DEFAULT_FLOW_FINAL_STEP_EVAL
     if _DEFAULT_FLOW_FINAL_STEP_EVAL is None:
         _DEFAULT_FLOW_FINAL_STEP_EVAL = False
@@ -229,13 +217,9 @@ def _default_flow_evaluates_final_step():
 
 
 def _resolve_interval_steps(value, total_steps):
-    """Resolve an HF-style step interval to an absolute number of steps.
-
-    HF accepts logging_steps / eval_steps / save_steps as a step count or a
-    ratio in (0, 1) of the total steps, expanded in TrainerState.compute_steps.
-    int(ratio) would turn 0.1 into 0, silently disabling the interval and
-    making HF's DefaultFlowCallback divide by zero.
-    """
+    """Resolve an HF step interval (a count, or a ratio in (0, 1) of total steps, as TrainerState.compute_steps expands
+    it); int(ratio) would turn 0.1 into 0, silently disabling the interval and making DefaultFlowCallback divide by
+    zero."""
     try:
         value = float(value or 0)
     except (TypeError, ValueError):
@@ -248,18 +232,13 @@ def _resolve_interval_steps(value, total_steps):
     return int(value)
 
 
-# HF's rule is a bare "loss" suffix, which it can afford because it never emits
-# perplexity; this trainer emits it for every token objective.
+# HF's bare loss-suffix rule is affordable only because HF never emits perplexity; this trainer emits perplexity for every token objective.
 _LOWER_IS_BETTER_SUFFIXES = ("loss", "perplexity")
 
 
 def _resolve_greater_is_better(args):
-    """Whether metric_for_best_model improves upward, mirroring HF Trainer.
-
-    HF infers the direction from the metric name when it is not set. Defaulting
-    to False instead would keep the worst checkpoint for every metric that is
-    not a loss, which is what preference runs select on.
-    """
+    """Whether metric_for_best_model improves upward, mirroring HF's name-based inference when unset; defaulting to
+    False would keep the worst checkpoint for every non-loss metric, which preference runs select on."""
     explicit = getattr(args, "greater_is_better", None)
     if explicit is not None:
         return bool(explicit)
@@ -416,14 +395,8 @@ class _MLXTokenizedDatasetView:
 
 
 class _PeekedBatchStream:
-    """A peeked batch put back in front of its source, cleanup intact.
-
-    ``itertools.chain`` would do the putting back, but it owns no ``close`` and
-    the run's cleanup only closes what it is handed -- so the producer behind a
-    peeked stream, and whatever it holds open, would survive the run that made
-    it. Close is forwarded to the source instead, at whatever point the run
-    ends, including before the first batch is drawn.
-    """
+    """Puts a peeked batch back before its source; itertools.chain has no close, so close is forwarded to the source,
+    keeping the producer's cleanup intact at any point the run ends."""
 
     def __init__(self, source, pending = ()):
         self._pending = list(pending)
@@ -462,15 +435,13 @@ def _mlx_stream_declares_infinite(dataset):
             and getattr(ex_iterable, "num_times", 0) is None
         ):
             return True
-        # Private datasets internals: read defensively so a future rename only
-        # loses detection instead of failing eval for every matching stream.
+        # Private datasets internals are read defensively: a rename only loses detection instead of failing eval for every matching stream.
         if kind in (
             "VerticallyConcatenatedMultiSourcesExamplesIterable",
             "HorizontallyConcatenatedMultiSourcesExamplesIterable",
         ):
-            # Vertical concat runs children in sequence; horizontal concat
-            # drops each as it exhausts and ends with the LONGEST child. Both
-            # are infinite when ANY child is.
+            # Vertical concat runs children in sequence; horizontal concat drops each as it exhausts and ends with the
+            # longest child; both are infinite when any child is.
             return any(
                 _is_infinite(child, seen)
                 for child in getattr(ex_iterable, "ex_iterables", ())
@@ -539,8 +510,7 @@ class _MLXLazyEvalBatchView:
                 except StopIteration:
                     return
         finally:
-            # Truncation and early consumer exits must release the owned
-            # source cursors deterministically.
+            # Truncation and early consumer exits must deterministically release the owned source cursors.
             close = getattr(iterator, "close", None)
             if callable(close):
                 close()
@@ -700,16 +670,13 @@ from .shape_guard import (
     select_text_shape_padding_budget,
 )
 
-# Finite CPU-backed batch plans sharing one protocol (visit mapping,
-# __getitem__/materialize, __len__).
+# Finite CPU-backed batch plans sharing one protocol: visit mapping, __getitem__/materialize and __len__.
 _FINITE_BATCH_PLAN_TYPES = (
     FiniteTextBatchPlan, FiniteVLMBatchPlan, FinitePreferenceBatchPlan, GRPOBatchPlan,
 )
-# Plans a compile-failure fallback may refetch unpadded. The text plan rebuilds
-# from stored token ids and touches no RNG, and the GRPO plan reuses its cached
-# generation. The VLM plan reruns the caller's processor, so a refetch would
-# draw twice and offset every later batch; it reuses the materialized batch
-# instead, whose planned padding is masked.
+# Plans a compile-failure fallback may refetch unpadded: text rebuilds from token ids with no RNG, GRPO reuses its
+# cached generation; VLM reruns the processor, which would draw twice and offset later batches, so it reuses the batch
+# with masked padding.
 _EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan, GRPOBatchPlan)
 
 
@@ -740,9 +707,8 @@ def _resolve_response_mask_tokenizer(tokenizer):
             tokenizer = processor_tokenizer
             continue
 
-        # mlx-lm TokenizerWrapper stores the HF tokenizer under _tokenizer.
-        # HF fast tokenizers also expose _tokenizer, but that is the low-level
-        # Rust tokenizer and is not callable like PreTrainedTokenizerBase.
+        # mlx-lm TokenizerWrapper stores the HF tokenizer under _tokenizer; HF fast tokenizers also expose _tokenizer,
+        # but that is the low-level Rust tokenizer, not callable like PreTrainedTokenizerBase.
         wrapped = getattr(tokenizer, "_tokenizer", None)
         if (
             wrapped is not None
@@ -792,9 +758,8 @@ def _model_type_of(trainer):
 
 
 def _clear_cached_marker_attrs(obj):
-    """Drop Unsloth's cached instruction/response markers (on obj and its inner tokenizer)
-    so a chat_template override forces re-detection instead of masking with markers from the
-    old template."""
+    """Drop cached instruction/response markers on obj and its inner tokenizer, so a chat_template override re-detects
+    instead of masking with the old template's markers."""
     for target in (obj, getattr(obj, "tokenizer", None)):
         if target is None:
             continue
@@ -806,17 +771,9 @@ def _clear_cached_marker_attrs(obj):
 
 
 def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer, return_function=False):
-    """Object to auto-detect (instruction_part, response_part) from.
-
-    VLM templates live on the processor, so detection must see it (the HF helper unwraps to the
-    inner tokenizer for matching). Detection must use the processor that will actually render the
-    masked batches: when return_function=False the trainer renders them via _resolve_vlm_processor
-    (trainer.processor / trainer.tokenizer / model._processor), so a tokenizer= override is not
-    used by batching and must not drive detection; when return_function=True the caller applies the
-    returned mask, so the explicit override is preferred. A configured chat_template override is
-    applied (and any markers cached from a prior template dropped first) so detection matches the
-    rendered batches. Falls back to resolved_tokenizer when no processor/override applies.
-    """
+    """With return_function=False the processor that renders the batches drives detection, so a tokenizer= override
+    cannot drive it; with return_function=True the explicit override is preferred; a chat_template override is
+    applied with stale markers dropped; resolved_tokenizer is the fallback."""
     args = getattr(trainer, "args", None)
     model = getattr(trainer, "model", None)
     model_name = getattr(model, "_hf_repo", None)
@@ -849,9 +806,9 @@ def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer, ret
                 return processor
         return resolved_tokenizer
 
-    # Text: apply the chat_template override before detecting so markers match batches. Clear stale
-    # markers BEFORE normalize: a raw Jinja override supplies none (so the HF helper re-detects),
-    # while an Unsloth template name/tuple sets fresh correct markers that must be preserved.
+    # Text path: apply the chat_template override before detecting so markers match batches; clear stale markers BEFORE
+    # normalize, since a raw Jinja override supplies none (HF re-detects) while an Unsloth template name or tuple sets
+    # fresh markers to keep.
     if args is not None and getattr(args, "chat_template", None) is not None:
         try:
             _clear_cached_marker_attrs(resolved_tokenizer)
@@ -890,8 +847,7 @@ def _normalize_mlx_optimizer_name(name):
         name = name.value
     opt_name = str(name or "adamw").strip().lower()
     opt_name = opt_name.rsplit(".", 1)[-1].replace("-", "_")
-    # "*_8bit" route to a real 8-bit optimizer. "paged_*" / "*_bnb_*" stay
-    # collapsed: they promise CPU offload / a library MLX does not use.
+    # *_8bit names route to a real 8-bit optimizer; paged_* and *_bnb_* stay collapsed since they promise CPU offload or a library MLX does not use.
     if opt_name in (
         "paged_adamw_8bit",
         "adamw_bnb_8bit",
@@ -917,8 +873,7 @@ def _normalize_mlx_optimizer_name(name):
 
 
 def _donate_optimizer_state(optimizer):
-    """Zero-copy reshape of each new state array splits mx.compile's multi-output
-    update kernel (whose inputs MLX never donates) so p, m, v update in place."""
+    """Zero-copy reshape of each new state array splits mx.compile's multi-output update kernel, whose inputs MLX never donates, so p, m, v update in place."""
     apply_single = getattr(type(optimizer), "apply_single", None)
     if apply_single is None:
         return optimizer
@@ -949,9 +904,8 @@ def _layer_path_prefix(model):
 
 
 def _async_eval_by_layer(tree, prefix):
-    """Eval a parameter-shaped tree layer by layer, last first, then non-layer leaves,
-    each group behind the previous, so each layer's grad frees as the backward passes it.
-    Ascending order, leaves first, or no pacing each lose the saving."""
+    """Eval a tree layer by layer, last layer first, then non-layer leaves, each group behind the previous so each
+    layer's grad frees during backward; ascending order, leaves first, or no pacing lose that saving."""
     parent = prefix.rsplit(".", 2)[0] + "." if prefix.count(".") > 1 else ""
     layers, rest = {}, []
     for name, value in tree_flatten(tree):
@@ -969,8 +923,7 @@ def _async_eval_by_layer(tree, prefix):
 
 
 def _resolve_adam_epsilon(value):
-    """Reject what torch.optim.Adam rejects (``not 0.0 <= eps``, incl. NaN);
-    MLX adds eps to the denominator unchecked, so bad values train silently."""
+    """Reject what torch.optim.Adam rejects (``not 0.0 <= eps``, including NaN); MLX adds eps to the denominator unchecked, so bad values train silently."""
     try:
         epsilon = float(value)
     except (TypeError, ValueError):
@@ -987,9 +940,8 @@ def _resolve_adam_epsilon(value):
 
 
 def _hf_optim_args(args, allowed, unsupported):
-    """HF ``optim_args`` ("k=v,...") keys MLX can honour; ``unsupported`` keys
-    (MLX lacks them) raise unless at their no-op value. ``weight_decay`` is
-    skipped: HF param groups override it in torch too."""
+    """HF ``optim_args`` (k=v,...) keys MLX can honour; ``unsupported`` keys raise unless at their no-op value;
+    weight_decay is skipped, as HF param groups override it in torch too."""
     raw = getattr(args, "optim_args", None)
     if not raw:
         return {}
@@ -1079,8 +1031,8 @@ def _mlx_scheduler_kwargs(args):
     return dict(raw)
 
 
-# min-LR cosine reuses HF's cosine lambda (optimization.py:324). cosine_warmup_with_min_lr
-# is NOT aliased: its ramp/progress are off by one (optimization.py:400-406).
+# min-LR cosine reuses HF's cosine lambda (optimization.py:324); cosine_warmup_with_min_lr is NOT aliased, since its
+# ramp and progress are off by one (optimization.py:400-406).
 _MLX_LR_SCHEDULER_ALIASES = {
     "cosine_with_min_lr": "cosine",
 }
@@ -1142,13 +1094,9 @@ def _validate_mlx_scheduler_kwargs(sched_type, sched_kwargs):
 
 
 def _resolve_mlx_grad_clipping(args):
-    """Resolve mutually exclusive MLX clipping knobs.
-
-    Returns ``(max_grad_norm, max_grad_value, max_grad_leaf_norm, mode)``.
-    ``max_grad_value`` keeps elementwise clamp semantics. ``max_grad_leaf_norm``
-    is the cheap proportional alternative: cap each gradient leaf's L2 norm
-    without a cross-tree global reduction.
-    """
+    """Resolve mutually exclusive MLX clipping knobs to (max_grad_norm, max_grad_value, max_grad_leaf_norm, mode);
+    max_grad_value keeps elementwise clamp semantics, max_grad_leaf_norm caps each leaf's L2 norm with no global
+    reduction."""
     max_grad_norm = float(getattr(args, "max_grad_norm", 0.0) or 0.0)
     raw_value = getattr(args, "max_grad_value", None)
     raw_leaf = getattr(args, "max_grad_leaf_norm", None)
@@ -1194,14 +1142,8 @@ def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
 
 
 def _build_generation_defaults(args):
-    """Build the engine's sampling parameters, validating them as a side effect.
-
-    The engine validates in its own frozen dataclasses, so building them at
-    configuration time turns a crash at the first evaluation into a
-    configuration error. Values stay uncoerced: coercing would hide the type
-    checks this exists to run. Its messages name its own fields, so they are
-    restated against the config field the user set.
-    """
+    """Build the engine's SamplingParams at config time so bad values fail as configuration errors; values stay
+    uncoerced so its type checks still run, and its messages are restated against the config field."""
     from .generate import GenerationDefaults, SamplingParams
 
     try:
@@ -1220,12 +1162,8 @@ def _build_generation_defaults(args):
 
 
 def _escape_terminal_controls(text):
-    """Show control characters instead of executing them.
-
-    Dataset prompts and model completions are untrusted: str.split() leaves
-    ESC/BEL intact. Escaping all of Cc/Cf also covers U+200D joiners and the
-    Unicode tag block, while leaving CJK and backslashes alone.
-    """
+    """Escape Cc/Cf characters (ESC, BEL, U+200D joiners, the Unicode tag block) in untrusted prompts and completions,
+    since str.split() leaves ESC/BEL intact; CJK and backslashes stay."""
     return "".join(
         (
             character
@@ -1256,13 +1194,8 @@ def _global_grad_norm_fp32(grad):
 
 
 def _clip_grad_norm_fp32(grad, max_norm):
-    """Global norm clipping with a float32 norm reduction.
-
-    ``mlx.optimizers.clip_grad_norm`` reduces each leaf in its storage dtype.
-    For bf16/fp16 VLMs, that can move the global scale away from PyTorch/HF,
-    which computes the clipping norm in fp32. Keep clipped leaves in their
-    original dtype, but compute the single global scale in fp32.
-    """
+    """Global norm clip with fp32 norm reduction: mlx.optimizers.clip_grad_norm reduces in storage dtype, which can
+    shift bf16/fp16 VLM scales away from PyTorch/HF; leaves keep their dtype."""
     total_norm = _global_grad_norm_fp32(grad)
     scale = mx.minimum(
         mx.array(max_norm, dtype=mx.float32) / (
@@ -1274,9 +1207,8 @@ def _clip_grad_norm_fp32(grad, max_norm):
 
 
 def _validate_label_smoothing(value, is_vlm):
-    """Configuration gate for ``label_smoothing_factor``: delegates the
-    domain check to the shared loss-layer normalizer (config errors raise,
-    unlike model-derived properties, which fall back) and adds the VLM rule."""
+    """Config gate for ``label_smoothing_factor``: domain check delegated to the shared normalizer, where config errors
+    raise (model-derived properties fall back); adds the VLM rule."""
     eps = _normalize_label_smoothing(value)
     if is_vlm and eps > 0.0:
         raise ValueError(
@@ -1286,12 +1218,9 @@ def _validate_label_smoothing(value, is_vlm):
 
 
 def _require_complete_resume_checkpoint(resume_from):
-    """Reject an incomplete resume directory and name the warm-start route.
-
-    A saved adapter directory has only adapters.safetensors. Called from every
-    path that reads resume state, so the streaming-prefetch early read raises
-    the same guidance instead of a raw FileNotFoundError from trainer_state.json.
-    """
+    """Reject an incomplete resume dir (a saved adapter dir has only adapters.safetensors) and name the warm-start
+    route; every resume read calls it, so the streaming-prefetch early read raises this instead of a raw
+    FileNotFoundError."""
     if not resume_from:
         return
     _missing_resume = [
@@ -1312,13 +1241,8 @@ def _require_complete_resume_checkpoint(resume_from):
 
 
 def _prune_stale_checkpoints(output_dir, save_total_limit, keep_step=None):
-    """Keep the newest ``save_total_limit`` checkpoint-* dirs (HF Trainer parity).
-
-    ``keep_step`` is never rotated out, mirroring HF's _rotate_checkpoints, which
-    protects best_model_checkpoint: without it a best result at an early step is
-    deleted by a later worse save and the state field is left pointing at nothing.
-    ``-1`` / ``0`` / ``None`` preserve the existing "no limit" contract.
-    """
+    """Keep the newest ``save_total_limit`` checkpoint-* dirs, never rotating out ``keep_step`` (as HF's
+    _rotate_checkpoints does for best_model_checkpoint); -1, 0 or None means no limit."""
     if not save_total_limit or save_total_limit < 1:
         return
     import shutil
@@ -1326,8 +1250,7 @@ def _prune_stale_checkpoints(output_dir, save_total_limit, keep_step=None):
 
     checkpoints = []
     for child in Path(output_dir).glob("checkpoint-*"):
-        # Only prune real step-checkpoint dirs the trainer created; never
-        # follow symlinks or touch user paths that share the prefix.
+        # Only prune real step-checkpoint dirs the trainer created; never follow symlinks or touch user paths that merely share the checkpoint- prefix.
         if child.is_symlink() or not child.is_dir():
             continue
         try:
@@ -1359,35 +1282,9 @@ def _prune_stale_checkpoints(output_dir, save_total_limit, keep_step=None):
 
 
 def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
-    """Input-token positions in a training microbatch (HF num_input_tokens_seen).
-
-    HF's TrainerState.num_input_tokens_seen counts the main input tensor's numel
-    (every forwarded position: prompt + response + padding), NOT just the
-    supervised/label tokens the loss mask counts. Mirror that here so a callback
-    reading state.num_input_tokens_seen for token-budget stopping or throughput
-    reporting is not undercounted by the masked/prompt fraction (which for
-    completion-only / assistant-only loss is most of the sequence).
-
-    ``mode`` is HF's normalized include_num_input_tokens_seen value. "all" (and
-    the un-normalized True a non-TrainingArguments config keeps) counts every
-    forwarded position as above. "non_padding" follows HF's ladder instead --
-    identical in transformers 4.57.x (the inline block in _inner_training_loop)
-    and 5.x (Trainer._track_num_input_tokens): the attention mask when the batch
-    carries one, else a pad-token comparison when the processing class exposes a
-    pad_token_id, else every position. The text/preference/GRPO tuple batch has
-    no attention_mask, but its ``lengths`` column 1 is the exclusive end of the
-    real tokens (the same column the loss masks compare against, and what
-    mlx-lm's iterate_batches emits), and rows are written at ``[0, length)``, so
-    summing it is exactly that batch's attention-mask sum. DDP pad rows carry
-    length 0 and therefore drop out, as they should.
-
-    Uses ``.shape`` (a tuple under both real mlx and the torch test shim) rather
-    than a backend-specific ``.size`` / ``.numel``. Handles the text/preference/
-    GRPO tuple batch (input ids, or a vision preference dict, first) and the VLM
-    dict batch (``input_ids`` key);
-    returns 0 when no input-id tensor is present so the counter simply does not
-    advance rather than raising.
-    """
+    """HF num_input_tokens_seen positions in a microbatch: mode 'all' counts every forwarded position; 'non_padding'
+    uses the mask or pad_token_id ladder (same in transformers 4.57.x and 5.x); tuple batches lack attention_mask, so
+    the lengths column 1 sum stands in; 0 without input ids."""
     import math
     attention_mask = None
     lengths = None
@@ -1468,9 +1365,8 @@ def _resolve_text_dataset_order(args, *, for_training=True):
     return "sequential" if preserve else dataset_order
 
 
-# Fields added after the original public MLXTrainingConfig surface. Keep them a
-# suffix of the declaration order (append new ones at the end and list them
-# here) so positional copies from older configs keep mapping correctly.
+# Fields added after the original MLXTrainingConfig surface: keep them a suffix of the declaration order (append new
+# ones at the end and list them in this tuple) so positional copies from older configs keep mapping correctly.
 _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "max_eval_batches",
     "streaming_text_length_window_batches",
@@ -1512,21 +1408,14 @@ class MLXTrainingConfig:
     weight_decay: float = 0.001
     adam_beta1: float | None = None
     adam_beta2: float | None = None
-    # Global L2 norm clip (transformers/CUDA max_grad_norm). Disabled by
-    # default on MLX: the per-leaf cap below is the default instead, since
-    # global norm's cross-tree reduction costs more peak memory (measured
-    # ~1 GB more at 3B, scaling with size). Set this for CUDA-exact clipping;
-    # note per-leaf and global agree when no spike binds but diverge on
-    # gradient spikes (per-leaf cannot see an aggregate norm spread across
-    # many tensors).
+    # Global L2 norm clip (transformers/CUDA max_grad_norm), off by default on MLX since its cross-tree reduction costs
+    # peak memory; set it for CUDA-exact clipping: per-leaf and global agree unless a spike binds, because per-leaf
+    # cannot see a norm spread across many tensors.
     max_grad_norm: float = 0.0
-    # Elementwise clip to `[-v, +v]`. None means "not requested";
-    # positive values override other clipping modes to preserve API meaning.
+    # Elementwise clip to [-v, +v]; None means not requested; positive values override other clipping modes to preserve API meaning.
     max_grad_value: float | None = None
-    # Proportional per-leaf L2 norm cap and the MLX default (1.0 when no clip
-    # knob is set). Preserves each tensor's direction and avoids max_grad_norm's
-    # cross-tree memory overhead, but is not a drop-in for global max_grad_norm
-    # (see above). None uses the 1.0 default unless another clip knob is explicit.
+    # Per-leaf L2 norm cap (None uses the MLX default 1.0 unless another clip knob is set); keeps each tensor's
+    # direction and avoids max_grad_norm's cross-tree memory cost, but is not a drop-in for global max_grad_norm.
     max_grad_leaf_norm: float | None = None
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
@@ -1583,47 +1472,31 @@ class MLXTrainingConfig:
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
     per_device_eval_batch_size: int | None = None
     image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
-    # Appended by main after image_size; kept before the streaming fields so a
-    # positional copy from a main config still maps correctly.
+    # Appended after image_size, before the streaming fields, so a positional copy from a main config still maps correctly.
     label_smoothing_factor: float = 0.0  # HF LabelSmoother epsilon (text models only)
 
-    # Opt-in true global grad-norm reporting when global-norm clipping is off; a
-    # no-op when it is on, since clipping computes the pre-clip norm anyway.
-    # Appended after the fields that predate it so each keeps its positional
-    # index. Enabling it costs one cross-tree fp32 reduction per update, the same
-    # class of peak-memory cost global clipping pays. When False (default)
-    # grad_norm is absent everywhere and no reduction exists in the graph.
-    # Reporting never changes numerics: the value is the fp32 norm of the
-    # token-normalized gradient, after the accumulation divide and DDP reduction,
-    # before clipping, decay, the update and the scoped-LR rescale.
+    # Opt-in global grad_norm (appended for positional binding); no-op under global-norm clipping; off: grad_norm
+    # absent, no reduction in graph; on: one cross-tree fp32 reduction per update; reports the pre-clip fp32 norm of the
+    # token-normalized grad after accumulation and DDP; numerics unchanged.
     report_grad_norm: bool = False
 
-    # Lazy-streaming fields, appended after every pre-existing field so
-    # positional copies from older configs keep mapping correctly. Listed in
-    # _MLX_CONFIG_OPTIONAL_COPY_FIELDS.
+    # Lazy-streaming fields, appended after all pre-existing fields so positional copies from older configs map; listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS.
     max_eval_batches: int | None = None  # Bound an explicitly infinite lazy text eval stream
-    # Lazy default-order text streams: pool this many global micro-batches,
-    # length-sort, emit seeded-permuted batches. 1 = exact source order. Memory
-    # scales with world size; the DDP owner retains one extra padding batch.
+    # Lazy default-order text streams pool this many global micro-batches, length-sort and emit seeded-permuted batches;
+    # 1 keeps exact source order; memory scales with world size, and the DDP owner keeps one extra padding batch.
     streaming_text_length_window_batches: int = 8
-    # Lazy text streams: prepare this many batches ahead on a producer thread
-    # (0 = synchronous default; single-process, host-valued rows only). Queued
-    # batches add to the window bound.
+    # Lazy text streams prefetch this many batches on a producer thread (0 = synchronous; single-process, host-valued
+    # rows only); queued batches add to the window bound.
     streaming_prefetch_batches: int = 0
 
-    # Callback-visible run metadata (HF TrainingArguments parity). Declared LAST
-    # for the same reason as the fields above: the initializer binds positional
-    # args by field order, so inserting them mid-list would shift the positional
-    # slot of every field after it. Also listed in
-    # _MLX_CONFIG_OPTIONAL_COPY_FIELDS so they stay an exact suffix of it.
+    # Callback-visible run metadata (HF TrainingArguments parity); declared last since the initializer binds positional
+    # args by field order; also in _MLX_CONFIG_OPTIONAL_COPY_FIELDS as an exact suffix.
     logging_dir: str | None = None
     run_name: str | None = None
 
-    # None keeps MLX's default (1e-8, same as HF). Adam family only: MLX
-    # Adafactor's eps is a 2-tuple.
+    # None keeps MLX's default 1e-8 (same as HF); Adam family only, since MLX Adafactor's eps is a 2-tuple.
     adam_epsilon: float | None = None
-    # Must stay last (positional binding). HF "k=v,..." string; rmsprop/adagrad
-    # only, as in transformers' _get_rmsprop/_get_adagrad.
+    # Must stay last (positional binding); HF k=v,... string, read for rmsprop/adagrad only, as in transformers' _get_rmsprop/_get_adagrad.
     optim_args: str | None = None
 
     # Declared LAST (positional binding); None = HF's per-scheduler default.
@@ -1633,8 +1506,8 @@ class MLXTrainingConfig:
     # HF's TrainingArguments.lr_scheduler_kwargs (dict or JSON string); wins over the three above.
     lr_scheduler_kwargs: dict | str | None = None
 
-    # GKD (unsloth_zoo/mlx/distill.py), inert while teacher_model_name_or_path
-    # is None. Appended LAST: the initializer binds positional args by order.
+    # GKD fields (see unsloth_zoo/mlx/distill.py), inert while teacher_model_name_or_path is None; appended last since
+    # the initializer binds positional args by order.
     teacher_model_name_or_path: str | None = None
     gkd_beta: float = 0.5
     gkd_temperature: float = 1.0
@@ -1681,11 +1554,9 @@ class MLXTrainingConfig:
 
         warmup_steps_default = type(self).warmup_steps
         warmup_ratio_default = type(self).warmup_ratio
-        # A config copied or round-tripped from an older Unsloth may omit later
-        # fields; still treat it as a wholesale copy for warmup semantics, or a
-        # copied default warmup_steps would override a non-default warmup_ratio.
-        # So tolerate every field appended since: the positional optional-copy
-        # fields plus the later scalar additions.
+        # Configs copied from an older Unsloth may omit later fields; still treat them as a wholesale copy for warmup,
+        # or a copied default warmup_steps overrides a non-default warmup_ratio; tolerate all fields appended since (the
+        # optional-copy fields and later scalar additions).
         _appended_fields = set(_MLX_CONFIG_OPTIONAL_COPY_FIELDS) | {
             "compile_max_variants",
             "label_smoothing_factor",
@@ -1752,8 +1623,8 @@ class MLXTrainingConfig:
         self._unsloth_mlx_warmup_steps_explicit = (
             "warmup_steps" in provided and not copied_default_warmup_with_ratio
         )
-        # max_length defaults to TRL's 1024, below the usual max_seq_length, so a
-        # run predating these fields silently narrows. Record the caller's intent.
+        # TRL's max_length defaults to 1024, below the usual max_seq_length, so runs predating these fields would
+        # silently narrow; record whether the caller set max_length explicitly.
         self._unsloth_mlx_max_length_explicit = "max_length" in provided
         if self.compile_max_variants is not None:
             resolve_compile_max_variants(self.compile_max_variants)
@@ -1774,15 +1645,9 @@ class MLXTrainingConfig:
         return json.dumps(self.to_dict(), indent=2, default=str)
 
     def to_sanitized_dict(self):
-        """Serialize this config like TrainingArguments.to_sanitized_dict().
-
-        The other integration callbacks read the config through to_dict() /
-        to_json_string(); HF's NeptuneCallback reads it through this method
-        instead, unguarded, so omitting it aborts on_train_begin. HF reports
-        the resolved batch sizes next to the raw fields and stringifies
-        anything a tracker cannot store, so mirror both. torch.Tensor is on
-        HF's allow-list but cannot occur here: this module stays Torch-free.
-        """
+        """HF's NeptuneCallback calls to_sanitized_dict unguarded, so omitting it aborts on_train_begin; mirror HF's
+        resolved batch sizes and stringified untrackable values; torch.Tensor cannot occur here since this module
+        stays Torch-free."""
         output = self.to_dict()
         output["train_batch_size"] = self.per_device_train_batch_size
         output["eval_batch_size"] = (
@@ -1799,14 +1664,9 @@ class MLXTrainingConfig:
 
 @dataclass(init=False)
 class MLXORPOConfig(MLXTrainingConfig):
-    """Configuration owned by MLXORPOTrainer.
-
-    max_completion_length only applies to encoder-decoder models, so it is inert
-    here. A branch whose capped prompt plus the longer answer still overruns
-    max_length has its answer sliced to max_length minus max_prompt_length
-    instead, which trims the answer's tail when max_prompt_length stands above
-    max_length.
-    """
+    """Config owned by MLXORPOTrainer; max_completion_length is inert here (encoder-decoder only); a branch whose prompt
+    plus answer overruns max_length has its answer sliced to max_length minus max_prompt_length, which trims the
+    answer's tail when max_prompt_length exceeds max_length."""
 
     beta: float = field(default=0.1, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
@@ -1814,8 +1674,7 @@ class MLXORPOConfig(MLXTrainingConfig):
     max_prompt_length: int | None = field(default=512, kw_only=True)
     max_completion_length: int | None = field(default=None, kw_only=True)
     truncation_mode: str = field(default="keep_end", kw_only=True)
-    # Batched decoding is not batch-invariant, so a prompt can decode
-    # differently depending on what shares its batch.
+    # Batched decoding is not batch-invariant, so a prompt can decode differently depending on what shares its batch.
     generate_during_eval: bool = field(default=False, kw_only=True)
     num_generation_prompts: int = field(default=8, kw_only=True)
     generation_max_tokens: int = field(default=128, kw_only=True)
@@ -1856,12 +1715,8 @@ class MLXDPOConfig(MLXTrainingConfig):
 
 @dataclass(init=False)
 class MLXKTOConfig(MLXTrainingConfig):
-    """Configuration owned by MLXKTOTrainer.
-
-    Batches are cut in dataset order, as TRL's KTOTrainer does, since each row's
-    KL pair takes the completion of its neighbor within a batch;
-    ``dataset_order="torch_randperm"`` reorders whole batches.
-    """
+    """KTO config: batches are cut in dataset order as in TRL's KTOTrainer, since each row's KL pair takes its
+    neighbor's completion in the batch; dataset_order="torch_randperm" reorders whole batches."""
 
     beta: float = field(default=0.1, kw_only=True)
     loss_type: str = field(default="kto", kw_only=True)
@@ -1882,13 +1737,9 @@ class MLXKTOConfig(MLXTrainingConfig):
 
 @dataclass(init=False)
 class MLXGRPOConfig(MLXTrainingConfig):
-    """Configuration owned by MLXGRPOTrainer: TRL 0.24's GRPOConfig fields with
-    CUDA Unsloth's GRPO defaults and rewrites, resolved at construction as there.
-
-    ``top_k`` and ``min_p`` None switch those filters off, as TRL documents,
-    rather than falling back to the model's generation config.
-    ``max_prompt_length`` only warns: prompts are never truncated.
-    """
+    """GRPO config: TRL 0.24's GRPOConfig fields with CUDA Unsloth's GRPO defaults, resolved at construction; top_k and
+    min_p None switch those filters off rather than using the model's generation config; max_prompt_length only
+    warns, prompts are never truncated."""
 
     num_generations: int = field(default=8, kw_only=True)
     max_prompt_length: int | None = field(default=None, kw_only=True)
@@ -1929,12 +1780,8 @@ class MLXGRPOConfig(MLXTrainingConfig):
 
 @dataclass(init=False)
 class MLXCPOConfig(MLXTrainingConfig):
-    """Configuration owned by MLXCPOTrainer.
-
-    As in TRL's CPOConfig, loss_type="alphapo" is shorthand for
-    loss_type="simpo" with cpo_alpha=0.0, and max_prompt_length must stay below
-    max_length. max_completion_length is inert, as for MLXORPOConfig.
-    """
+    """CPO config: as in TRL's CPOConfig, loss_type="alphapo" is shorthand for loss_type="simpo" with cpo_alpha=0.0;
+    max_prompt_length must stay below max_length; max_completion_length is inert, as for MLXORPOConfig."""
 
     beta: float = field(default=0.1, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
@@ -1986,28 +1833,16 @@ def _shape_guard_report(
 
 
 def _mlx_epoch_microbatches(args, batches, *, includes_epochs=False):
-    """Micro-batches in one epoch when epoch boundaries drive the schedule.
-
-    None for streaming, for runs with no declared epoch count, and for max_steps
-    runs whose batch source cannot report an exact one-pass length: those keep
-    the flat accumulation model. Mirrors the epoch branches of
-    MLXTrainer._callback_batches_per_epoch so the budget, the forced boundary
-    update and the callback epoch events all land on the same micro-batch.
-
-    num_train_epochs is a float in TrainingArguments/SFTConfig, so the declared
-    count is read as one: truncating it sent 0 < num_train_epochs < 1 down the
-    no-epoch flat path, which budgets a whole pass. Only the prebuilt-epochs
-    split needs a whole number, and that branch keeps its integer guard.
-    """
+    """None for streaming, no declared epoch count, or max_steps runs with no exact one-pass length (flat accumulation);
+    mirrors MLXTrainer._callback_batches_per_epoch; num_train_epochs is a float: truncating 0 < n < 1 sent it to the
+    flat path; only the prebuilt-epochs split needs a whole number."""
     if batches is None:
         return None
     total = len(batches)
     if total <= 0:
         return None
-    # The plan's own one-pass length, when it can report one. Only that exact
-    # count qualifies: the dataset-size approximation cannot see what batching
-    # retained, so forcing updates on it would move optimizer steps onto
-    # micro-batches that are not boundaries.
+    # Only the plan's exact one-pass count qualifies: the dataset-size estimate cannot see what batching retained, so
+    # forcing updates on it would move steps onto non-boundary micro-batches.
     plan_cycle = getattr(batches, "cycle_length", None)
     plan_cycle = max(1, int(plan_cycle)) if plan_cycle else None
     if int(getattr(args, "max_steps", 0) or 0) > 0:
@@ -2021,12 +1856,9 @@ def _mlx_epoch_microbatches(args, batches, *, includes_epochs=False):
     if epochs <= 0:
         return None
     if plan_cycle is not None:
-        # why: a prebuilt fractional schedule holds a whole number of
-        # micro-batches but a fractional number of passes, so int(epochs) does
-        # not divide it. 1.5 epochs of 5 is 8 batches, and dividing by 1 reads
-        # the lot as one epoch: the boundary at micro-batch 5 disappears, the
-        # accumulation window never restarts there and the budget lands on 4
-        # updates where HF takes 5.
+        # A prebuilt fractional schedule has whole micro-batches but fractional passes, so int(epochs) does not divide
+        # it: 1.5 epochs of 5 is 8 batches, and read as one epoch the boundary at micro-batch 5 vanishes (4 updates, HF
+        # takes 5).
         return plan_cycle
     whole_epochs = int(epochs)
     if includes_epochs and whole_epochs > 0 and total % whole_epochs == 0:
@@ -2042,12 +1874,9 @@ def _mlx_steps_per_epoch(epoch_microbatches, grad_accum):
 
 
 def _mlx_microstep_for_step(global_step, epoch_microbatches, grad_accum):
-    """Micro-batches consumed once ``global_step`` optimizer steps have run.
-
-    Epochs close on a forced step, so the mapping is per-epoch rather than flat
-    (HF: epochs_trained * steps_in_epoch + global_step % updates_per_epoch *
-    grad_accum). Equals global_step * grad_accum for a divisible epoch.
-    """
+    """Micro-batches consumed once global_step optimizer steps have run; epochs close on a forced step, so the mapping
+    is per-epoch, not flat (HF: epochs_trained * steps_in_epoch + global_step % updates_per_epoch * grad_accum);
+    equals global_step * grad_accum for a divisible epoch."""
     epoch_microbatches = int(epoch_microbatches)
     grad_accum = max(1, int(grad_accum))
     per_epoch = _mlx_steps_per_epoch(epoch_microbatches, grad_accum)
@@ -2067,12 +1896,9 @@ def _mlx_resume_microstep(global_step, epoch_microbatches, grad_accum):
 def _mlx_microstep_phase(
     compile_scope, grad_accum, index, epoch_microbatches=None,
 ):
-    """Compiled-argument phase at one micro-batch, epoch flush included.
-
-    Accumulation windows restart at every epoch boundary and the epoch's last
-    micro-batch forces the update, so both the window position and the update
-    flag are per-epoch once ``epoch_microbatches`` is known.
-    """
+    """Compiled-argument phase at one micro-batch; accumulation windows restart at each epoch boundary and the epoch's
+    last micro-batch forces the update, so window position and update flag are per-epoch once epoch_microbatches is
+    known."""
     if not epoch_microbatches:
         return phase_for_microstep(compile_scope, grad_accum, index)
     epoch_microbatches = int(epoch_microbatches)
@@ -2083,38 +1909,27 @@ def _mlx_microstep_phase(
         or position != epoch_microbatches - 1
     ):
         return phase
-    # Epoch-final micro-batch: it traces the updating signature even when it is
-    # not the accumulation window's last position.
+    # The epoch-final micro-batch traces the updating signature even when it is not the accumulation window's last position.
     if phase == "none_no_update":
         return "single"
     if phase == "tree_no_update":
         return "tree_update"
     return phase
 class _VLMCompileDecisionError(RuntimeError):
-    """A compile decision that mandates an abort, never maskable by
-    best-effort degradation (per-architecture strict overrides set
-    should_raise even while the base policy mode is best_effort)."""
+    """Compile decision that mandates an abort, never masked by best-effort degradation; per-architecture strict
+    overrides set should_raise even while the base policy mode is best_effort."""
 
 
 def _effective_compile_mode(compile_policy, compile_decision):
-    """Return the compile mode in force after arch/backend overrides.
-
-    ``resolve_training_compile`` can resolve strict under a best_effort base
-    policy, so strictness checks must follow the resolved mode or an
-    override-selected strict run silently degrades to eager. Decisions
-    predating the field fall back to the policy mode.
-    """
+    """Compile mode in force after arch/backend overrides; strictness checks must use it, since resolve_training_compile
+    can resolve strict under a best_effort policy; decisions predating policy_mode fall back to the policy mode."""
     mode = getattr(compile_decision, "policy_mode", None)
     return mode if mode else compile_policy.mode
 
 
 class _StreamWidthPolicy:
-    """Grid width policy consulted per batch; returns None while disarmed or holding.
-
-    Created disarmed (staging is wired before the compile decision) and armed
-    in place later, so a running prefetch thread sees it. Prefetch finalizers
-    select on the policy's presence, not ``armed``: their body runs before arming.
-    """
+    """Returns None while disarmed or holding; created disarmed and armed in place later so a running prefetch thread
+    sees it; prefetch finalizers test the policy's presence, not armed, since they run before arming."""
 
     __slots__ = ("grid", "armed", "exact_ceiling", "observed", "gate_released")
 
@@ -2237,16 +2052,9 @@ def _plan_single_process_vlm_shapes(
     install_plan=True,
     carries_audio=None,
 ):
-    """Plan finite VLM shapes for the single-process compiled path.
-
-    Must run only after compile qualification resolved: the descriptor
-    survey materializes every scheduled batch once. Padable batches take
-    the shared rounded width policy capped at the surveyed maximum final
-    width (post-expansion widths legitimately exceed ``max_seq_length``,
-    which is never consulted); batches the survey declined join at their
-    exact raw widths. An unplannable family forces eager fallback for the
-    run, since grouping it could span several compile keys.
-    """
+    """Runs after compile qualification, as the survey materializes each batch once; padable batches use the rounded
+    width policy capped at the surveyed max final width (post-expansion widths exceed max_seq_length); declined
+    batches keep exact raw widths; unplannable families force eager fallback."""
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
@@ -2254,8 +2062,7 @@ def _plan_single_process_vlm_shapes(
     if compile_decision is not None and getattr(
         compile_decision, "should_raise", False,
     ):
-        # Checked before EVERY applicability class (including streaming) so the
-        # mandated abort surfaces inside the coordinated block, not rank-locally.
+        # Checked before every applicability class (including streaming) so the mandated abort surfaces inside the coordinated block, not rank-locally.
         raise _VLMCompileDecisionError(
             "Unsloth: strict mx.compile requested for VLM arch "
             f"'{getattr(compile_decision, 'arch', 'unknown')}', but compile "
@@ -2292,8 +2099,7 @@ def _plan_single_process_vlm_shapes(
             "not_applicable", "vlm_compile_unqualified", cap,
             lazy_batches=lazy,
         ), True, None
-    # Strictness follows the RESOLVED mode: an arch/backend override can select
-    # strict under a best_effort base policy, and that run must abort, not degrade.
+    # Strictness follows the resolved mode: an arch or backend override can select strict under a best_effort base policy, and that run must abort, not degrade.
     effective_mode = _effective_compile_mode(compile_policy, compile_decision)
     max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
     if (
@@ -2301,8 +2107,7 @@ def _plan_single_process_vlm_shapes(
         and max_grad_norm > 0
         and args.gradient_accumulation_steps > 1
     ):
-        # Compilation is disabled later here, so skip the survey (it materializes
-        # every batch) for a plan that could never be compiled.
+        # Compilation is disabled later here, so skip the survey (it materializes every batch) for a plan that could never be compiled.
         return None, _shape_guard_report(
             "not_applicable", "compile_ineligible_global_norm", cap,
             lazy_batches=lazy,
@@ -2324,21 +2129,13 @@ def _plan_single_process_vlm_shapes(
         return None, report, False, None
 
     batches.ensure_descriptors()
-    # Admit only the batches the loop actually visits. The gradient-accumulation
-    # floor drops the schedule's trailing micro-batches, and an unplannable
-    # family confined to that tail would otherwise degrade the whole run to
-    # eager (or abort strict mode) over a batch no compiled call can reach.
-    # Resume is not resolved yet at this call site, so visits start at 0: that
-    # is a superset of what a resumed loop runs, and a superset only ever
-    # admits more than needed. The survey itself stays whole-schedule, because
-    # planned_event_widths() reduces the maximum padable width and the union of
-    # untouched extents over EVERY batch -- narrowing that input would silently
-    # move the endpoints of the batches that do train.
+    # Admit only batches the loop visits, so an unplannable family in the dropped accumulation tail cannot force eager
+    # or abort strict; visits start at 0 before resume is resolved (a superset); survey stays whole-schedule since
+    # planned_event_widths() needs every batch.
     grad_accum = args.gradient_accumulation_steps
-    # Same epoch-aware mapping the runtime loop uses, as the text planner does.
-    # A ragged epoch turns its tail micro-batch into an update phase, and
-    # cataloging the flat phase left that signature unadmitted, so compiled VLM
-    # training aborted at the first ragged boundary.
+    # Same epoch-aware step mapping as the runtime loop and text planner: a ragged epoch's tail micro-batch becomes an
+    # update phase, and a flat-phase catalog left that signature unadmitted, so compiled VLM training aborted at the
+    # first ragged boundary.
     epoch_microbatches = _mlx_epoch_microbatches(args, batches)
     total_microsteps = (
         _mlx_microstep_for_step(total_steps, epoch_microbatches, grad_accum)
@@ -2348,10 +2145,8 @@ def _plan_single_process_vlm_shapes(
         batches.batch_index_for_visit(microstep)
         for microstep in range(total_microsteps)
     })
-    # Scoped to `executed` for the same reason the family admission below is:
-    # a ragged epoch drops its trailing micro-batches, and audio confined to
-    # that tail must not route the whole run eagerly or abort strict mode over
-    # a batch no compiled call reaches.
+    # Scoped to `executed` like the family admission below: a ragged epoch drops its trailing micro-batches, so audio
+    # confined to that tail must not route the run eagerly or abort strict.
     if batches.carries_audio_in(executed):
         if effective_mode == "strict":
             raise RuntimeError(
@@ -2418,9 +2213,8 @@ def _plan_single_process_vlm_shapes(
         frontier = build_text_shape_frontier(
             events, compile_scope=compile_scope,
         )
-        # VLM catalogs keep every media family as its own endpoint group, so
-        # budget compression drops too few signatures to pay for its padded
-        # compute. Stay exact until the signature cap genuinely binds.
+        # VLM catalogs keep each media family as its own endpoint group, so budget compression drops too few signatures
+        # to pay for padded compute; stay exact until the signature cap binds.
         shape_plan = select_text_shape_padding_budget(
             frontier,
             exact_signature_threshold=AUTOMATIC_TEXT_COMPILE_CEILING,
@@ -2438,12 +2232,9 @@ def _plan_single_process_vlm_shapes(
                 f"({shape_plan.report.reason})."
             )
         return shape_plan, shape_plan.report, False, frontier
-    # Only widening writes the tokenizer pad id into a tail, so a pad id is
-    # required by the BUILT plan rather than by the processor: uniform-width
-    # and declined-only schedules pad nothing and stay compilable without one.
-    # Same admitted set as above, or a tail batch nobody widens (it is only
-    # ever built unpadded, by advance_preprocessing or a plain fetch) would
-    # still demand a pad id the run never uses.
+    # Only widening writes the tokenizer pad id into a tail, so the BUILT plan (not the processor) needs one;
+    # uniform-width or declined-only schedules stay compilable without it; unwidened tails, built unpadded, must not
+    # demand it.
     if batches.pad_token_id is None and any(
         shape_plan.endpoint_for(
             batches.batch_family(index), planned_widths[index],
@@ -2550,12 +2341,9 @@ def _plan_single_process_text_shapes(
         args, batches, includes_epochs=includes_epochs,
     )
     if epoch_microbatches:
-        # Epoch-count runs visit whole epochs and each epoch's last micro-batch
-        # forces the update, so the stream is shorter than total_steps * accum.
-        # A fractional num_train_epochs stops part-way through the final epoch,
-        # and those micro-batches are still fetched, so the catalog counts them
-        # via the same step -> micro-batch mapping the runtime fetch uses.
-        # Whole epoch counts land on an epoch boundary and are unchanged.
+        # Epoch-count runs force an update at each epoch's last micro-batch, so the stream is shorter than total_steps *
+        # accum; a fractional num_train_epochs stops part-way through the last epoch, whose micro-batches are fetched
+        # and counted via the runtime mapping; whole counts are unchanged.
         total_microsteps = _mlx_microstep_for_step(
             total_steps, epoch_microbatches, grad_accum,
         )
@@ -2583,9 +2371,7 @@ def _plan_single_process_text_shapes(
             ), False, None
     event_counts = {}
     for microstep in range(total_microsteps):
-        # Same visit mapping as the runtime fetch, so the enumerated catalog
-        # equals the actually visited (family, width, phase) sequence even for
-        # epoch-permuted plans.
+        # Same visit mapping as the runtime fetch, so the enumerated catalog equals the visited (family, width, phase) sequence even for epoch-permuted plans.
         batch_index = batches.batch_index_for_visit(microstep)
         family = batches.batch_family(batch_index)
         phase = _mlx_microstep_phase(
@@ -2595,8 +2381,7 @@ def _plan_single_process_text_shapes(
             epoch_microbatches,
         )
         if isinstance(batches, GRPOBatchPlan):
-            # A rollout's width is known only once it is sampled, so the visit
-            # counts once at every width its generation can reach.
+            # A rollout's width is known only once sampled, so the visit is counted at every width its generation can reach.
             widths, rows = batches.width_rungs(batch_index), batches.batch_size
         else:
             widths = (batches.batch_width(batch_index),)
@@ -2658,21 +2443,16 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
             args, batches, includes_epochs=includes_epochs,
         )
         if epoch_microbatches:
-            # Each epoch's last micro-batch forces an optimizer step (HF's
-            # do_sync_step), so an epoch costs the ceil and never the floor, which
-            # dropped the ragged tail into the next epoch's window. num_train_epochs
-            # is a float, so the product is rounded up as transformers does in
-            # set_initial_training_values; truncating shortened 1.5 to one epoch and
-            # stretched 0.5 to a full pass. Whole counts are unchanged.
+            # Each epoch's last micro-batch forces an update, so an epoch costs the ceil, not the floor (the floor
+            # folded the ragged tail into the next epoch); num_train_epochs rounds up as in set_initial_training_values,
+            # since truncation shortened 1.5 to one and stretched 0.5 to a full pass.
             steps_per_epoch = _mlx_steps_per_epoch(
                 epoch_microbatches, grad_accum,
             )
             if includes_epochs:
-                # A prebuilt schedule may stop part-way through its last epoch,
-                # and that tail costs its own windows, not a pro-rata share of a
-                # full epoch's. Scaling steps_per_epoch by n_batches /
-                # epoch_microbatches over-counts it: 1.5 epochs of 3 at accum 2
-                # is 2 + 1 = 3 updates, where the ratio gives ceil(5/3 * 2) = 4.
+                # A prebuilt schedule may stop part-way through its last epoch; that partial tail costs its own windows,
+                # not a pro-rata share, so scaling by n_batches / epoch_microbatches over-counts (1.5 epochs of 3 at
+                # accum 2 is 3 updates, not 4).
                 whole, tail = divmod(n_batches, epoch_microbatches)
                 total_steps = whole * steps_per_epoch + math.ceil(
                     tail / grad_accum
@@ -2723,13 +2503,8 @@ def _training_patches_paused():
 
 
 def _warn_resume_adapter_mismatch(model, adapter_file):
-    """Say so when a checkpoint does not cover the LoRA modules now wrapped.
-
-    Resume binds with ``strict=False``, so an adapter saved when selection was
-    narrower loads without complaint and leaves the modules it does not name at
-    their initialisation. They train from scratch while the optimizer state
-    restored beside them describes the older, smaller parameter tree.
-    """
+    """Warn when the checkpoint misses LoRA modules now wrapped: resume loads with strict=False, leaving them at init
+    while the restored optimizer state describes the smaller parameter tree."""
     import warnings
     if not os.path.exists(adapter_file):
         return
@@ -2739,9 +2514,8 @@ def _warn_resume_adapter_mismatch(model, adapter_file):
     except Exception:
         return                              # never block a resume to report on it
 
-    # An adapter held as a module rather than an array is stored one level down,
-    # so both spellings name the same weights; collect_mlx_lora_adapter_tensors
-    # writes whichever the wrapper uses.
+    # An adapter held as a module, not an array, is stored one level down, so both spellings (name.leaf and
+    # name.leaf.weight) name the same weights; collect_mlx_lora_adapter_tensors writes whichever the wrapper uses.
     def covered(name, leaf):
         return (f"{name}.{leaf}" in saved
                 or f"{name}.{leaf}.weight" in saved)
@@ -2770,12 +2544,8 @@ class MLXTrainer:
 
 
     def _preference_length_policy(self, args):
-        """Resolve the objective's length policy once per run.
-
-        Training and evaluation have to score the same token spans, so both
-        plans take this one immutable policy rather than resolving their own;
-        resolving twice would also repeat its narrowed-budget warnings.
-        """
+        """Resolve the length policy once per run so training and evaluation score the same token spans; resolving twice
+        would also repeat the narrowed-budget warnings."""
         policy = getattr(self, "_resolved_preference_length_policy", None)
         if policy is None:
             tokenizer = None
@@ -3012,16 +2782,14 @@ class MLXTrainer:
 
     @property
     def stop_requested(self):
-        """True while an early stop is pending. Externally owned: a controller
-        (e.g. the Studio cancel button) may set it at ANY time, even pre-train()."""
+        """True while an early stop is pending; externally owned, so a controller such as the Studio cancel button may set it at any time, even before train()."""
         return self._stop_requested
 
     @stop_requested.setter
     def stop_requested(self, value):
         self._stop_requested = value
-        # Stamp the request with its run generation, bumped when a run finishes:
-        # a stop latched by run N stamps N, a cancel raised after it stamps N+1.
-        # train() clears only the former, so a pre-train() cancel is never lost.
+        # Stamp the stop request with its run generation, bumped when a run finishes: a stop latched by run N stamps N,
+        # a later cancel stamps N+1; train() clears only the former, so a pre-train() cancel survives.
         self._stop_requested_generation = getattr(self, "_run_generation", 0)
 
     def _stop_request_generation(self):
@@ -3086,9 +2854,8 @@ class MLXTrainer:
         self._distributed_is_main_process = True
 
     def _resolved_best_metric_name(self):
-        """metric_for_best_model as it is looked up in eval metrics, mirroring
-        HF Trainer: a present-but-None value falls back to eval_loss, and a
-        bare name ("loss") gets the eval_ prefix eval metric keys carry."""
+        """metric_for_best_model as looked up in eval metrics: a None value falls back to eval_loss, and a bare name
+        like loss gets the eval_ prefix, as in HF Trainer."""
         name = getattr(self.args, "metric_for_best_model", None) or "eval_loss"
         return name if name.startswith("eval_") else f"eval_{name}"
 
@@ -3097,12 +2864,8 @@ class MLXTrainer:
         return getattr(self, "_mlx_train_dataset_for_batches", self.train_dataset)
 
     def _ensure_distributed(self):
-        """Initialize and cache MLX distributed metadata.
-
-        MLX distributed collectives are no-ops at world size 1. The torch-backed
-        MLX test shim returns ``None`` from ``mx.distributed.init()``, so keep a
-        rank-0/world-size-1 fallback for non-real distributed runtimes.
-        """
+        """MLX collectives are no-ops at world size 1; the torch-backed test shim returns None from
+        mx.distributed.init(), so keep a rank-0/world-size-1 fallback for non-real runtimes."""
         if getattr(self, "_distributed_initialized", False):
             return getattr(self, "_distributed_world", None)
 
@@ -3245,10 +3008,8 @@ class MLXTrainer:
         peak_memory = mx.get_peak_memory() / 1e9
         per_rank_peak_memory = self._distributed_rank_vector(peak_memory)
         per_rank_runtime = self._distributed_rank_vector(total_time)
-        # trained_tokens is the all-reduced global total, so gathering it would
-        # report the same world_size-inflated figure for every rank. Use this
-        # rank's local accumulated tokens (same logging cadence) so the
-        # per-rank field reflects true per-rank work.
+        # trained_tokens is the all-reduced global total, so gathering it would repeat a world_size-inflated figure per
+        # rank; use this rank's local accumulated tokens for the per-rank field.
         local_trained_tokens = int(
             sum(getattr(self, "_local_token_count_history", []))
         )
@@ -3339,15 +3100,9 @@ class MLXTrainer:
         keep_exact_local=False,
         compile_mode=None,
     ):
-        """Require every DDP rank to admit its local finite shape plan.
-
-        ``compile_mode`` is the resolved mode (an override can select strict
-        under a best_effort base), so a strict run aborts rather than degrade to
-        eager. ``keep_exact_local`` keeps an exact automatic plan out of the
-        shared-cap re-materialization, whose maximum would force compressed
-        peers to decompress; those ranks still contribute a neutral value and
-        run every collective in order, so the schedule is unchanged.
-        """
+        """compile_mode is the resolved mode, so override-selected strict runs abort rather than degrade to eager;
+        keep_exact_local keeps an exact automatic plan out of the shared-cap re-materialization, which would force
+        compressed peers to decompress; those ranks still run every collective in order."""
         strict_mode = (compile_mode or compile_policy.mode) == "strict"
         if self.distributed_world_size <= 1:
             if local_error is not None:
@@ -3461,9 +3216,8 @@ class MLXTrainer:
         if not failed_any:
             return
         if exc is not None and not isinstance(exc, Exception):
-            # Interrupts were captured only so this rank could join the
-            # consensus. Re-raise unwrapped without mutating trainer state, so
-            # a reused trainer does not inherit a stop request.
+            # Interrupts were captured only so this rank could join the consensus; re-raise unwrapped without mutating
+            # trainer state, so a reused trainer does not inherit a stop request.
             raise exc
         self.stop_requested = True
         if exc is not None:
@@ -3486,11 +3240,9 @@ class MLXTrainer:
 
     def _admit_stream_batch(self, registry, batch_data, compile_scope,
                             grad_accum, microstep, world_size):
-        """True = go eager for the run, ``"eager_batch"`` = this batch only.
-
-        One all-max per fetch (2 failed > 1 trip > 0), even for ``batch_data=None``,
-        so every rank switches together: a lone eager rank cannot replay a step's RNG.
-        """
+        """Returns True to go eager for the run, or "eager_batch" for this batch only; one all-max per fetch (2 failed >
+        1 trip > 0), even for batch_data=None, keeps ranks switching together, since a lone eager rank cannot replay
+        the step's RNG."""
         key = None
         uncertifiable = False
         error = None
@@ -3548,15 +3300,8 @@ class MLXTrainer:
         return should_stop
 
     def _distributed_sync_control_actions(self):
-        """OR the callback log/eval/save requests across ranks.
-
-        Callbacks fire on every rank, but a rank-dependent one can still flip
-        control.should_log / should_evaluate / should_save on a subset. Those
-        actions run collective code (metric all-reduce, eval, rank-0-guarded
-        saves), so every rank must agree before entering them or the peers
-        deadlock at the collective. One packed all-sum keeps the flags in
-        lockstep; a no-op at world size 1.
-        """
+        """OR the log/eval/save control flags across ranks: a rank-dependent callback can flip them on a subset, and
+        peers would deadlock at the collective; one packed all-sum, no-op at world size 1."""
         world = self._ensure_distributed()
         if world is None or self._distributed_world_size <= 1:
             return
@@ -3625,12 +3370,9 @@ class MLXTrainer:
                 "resume_from_checkpoint path."
             )
         if int(missing_total.item()) > 0:
-            # missing_total is all-reduced, so every rank enters this branch
-            # together and raising here cannot strand a peer in a later
-            # collective. A rank that can see adapters.safetensors but not the
-            # rest is holding a saved adapter directory, so give it the same
-            # warm-start guidance the single-process path gives; the plain
-            # visibility failure keeps the coordinated message below.
+            # missing_total is all-reduced so every rank enters this branch together, so raising cannot strand a peer; a
+            # rank seeing adapters.safetensors but not the rest gets single-process warm-start guidance; plain
+            # visibility failures keep the coordinated message.
             if (path / "adapters.safetensors").is_file():
                 _require_complete_resume_checkpoint(str(path))
             raise RuntimeError(
@@ -3641,21 +3383,14 @@ class MLXTrainer:
         return str(path)
 
     def add_step_callback(self, fn):
-        """Register a callback called after each logged step.
-
-        fn(step, total_steps, loss, lr, tokens_sec, peak_gb, elapsed,
-           num_tokens, grad_norm=None)
-        grad_norm: fp32 pre-clip norm — a float when global-norm clipping
-        is active or ``report_grad_norm=True``, otherwise None.
-        """
+        """Callback fn(step, total_steps, loss, lr, tokens_sec, peak_gb, elapsed, num_tokens, grad_norm=None) runs after
+        each logged step; grad_norm is fp32 pre-clip, a float when global-norm clipping is active or
+        report_grad_norm=True, else None."""
         self._step_callbacks.append(fn)
 
     def add_eval_callback(self, fn):
-        """Register a callback called after each evaluation.
-
-        fn(step, eval_loss, perplexity); perplexity is None for a preference
-        objective, which reports no token-level likelihood to exponentiate.
-        """
+        """Callback fn(step, eval_loss, perplexity) runs after each evaluation; perplexity is None for a preference
+        objective, which reports no token-level likelihood to exponentiate."""
         self._eval_callbacks.append(fn)
 
     def add_callback(self, callback):
@@ -3672,42 +3407,26 @@ class MLXTrainer:
         return self.callback_handler.pop_callback(callback)
 
     def _suppress_torch_only_final_artifacts(self):
-        """Disable HF final-model artifacts for one on_train_end dispatch.
-
-        WandbCallback.on_train_end and DVCLiveCallback.on_train_end both log that
-        artifact by building a Torch ``Trainer`` around ``args``/``model``, which
-        raises AttributeError here (``full_determinism`` on 5.x,
-        ``batch_eval_metrics`` on 4.57.x). Adapters are already saved by then, so
-        the casualty is the caller's MLXTrainOutput -- and for DVCLive also the
-        ``self.live.end()`` that trails the artifact block, leaving the tracked
-        run unfinalized. Per-checkpoint artifacts are untouched: neither on_save
-        builds a Trainer, and DVCLive's ``log_model="all"`` (its per-checkpoint
-        mode) never enters the Trainer branch, which upstream gates on
-        ``self._log_model is True``. Returns (callback, previous_mode) pairs for
-        _restore_final_artifact_modes. Duck-typed so unsloth_zoo.mlx still
-        imports without Torch.
-        """
+        """Wandb and DVCLive on_train_end build a Torch Trainer that raises AttributeError here (full_determinism on
+        5.x, batch_eval_metrics on 4.57.x), skipping DVCLive's live.end(); adapters are already saved and
+        per-checkpoint artifacts are untouched; returns (callback, previous_mode) pairs."""
         suppressed = []
         for callback in getattr(self.callback_handler, "callbacks", ()):
-            # Match the MRO, not just the concrete class: subclassing an
-            # integration callback to customise logging is a common recipe and
-            # inherits the same on_train_end.
+            # Match the MRO, not just the concrete class: subclassing an integration callback to customise logging still inherits the same on_train_end.
             names = {base.__name__ for base in type(callback).__mro__}
             mode = getattr(callback, "_log_model", None)
             if "WandbCallback" in names:
                 if mode is None or not getattr(mode, "is_enabled", False):
                     continue
                 try:
-                    # WandbLogModel is a str Enum, so the "false" member is
-                    # reachable from the instance without importing transformers.
+                    # WandbLogModel is a str Enum, so the false member is reachable from the instance without importing transformers.
                     disabled = type(mode)("false")
                 except Exception:
                     continue
                 if getattr(disabled, "is_enabled", True):
                     continue
             elif "DVCLiveCallback" in names:
-                # Mirror upstream's identity test, so "all" keeps logging its
-                # per-checkpoint artifact (on_save, no Trainer) untouched.
+                # Mirror upstream's identity test, so the 'all' value keeps logging its per-checkpoint artifact (on_save, no Trainer) untouched.
                 if mode is not True:
                     continue
                 disabled = False
@@ -3723,16 +3442,9 @@ class MLXTrainer:
             callback._log_model = mode
 
     def _suppress_torch_only_wandb_watch(self):
-        """Neutralize WANDB_WATCH for one on_train_begin dispatch.
-
-        WandbCallback.setup calls wandb.watch(model, ...) when WANDB_WATCH is
-        gradients/parameters/all, and wandb.watch raises TypeError("Expected a
-        pytorch model (torch.nn.Module)") on an mlx Module, so the opt-in aborts
-        training during callback setup. Upstream reads the environment variable
-        directly, so this is the lever that does not monkeypatch wandb. Returns
-        the previous value for _restore_wandb_watch, or None when there is
-        nothing to suppress.
-        """
+        """WANDB_WATCH set to gradients, parameters or all makes WandbCallback.setup call wandb.watch, which raises
+        TypeError on an mlx Module and aborts setup; the env var is the lever that avoids a wandb monkeypatch;
+        returns the previous value for _restore_wandb_watch, or None."""
         previous = os.environ.get("WANDB_WATCH", "false")
         if previous not in ("all", "parameters", "gradients"):
             return None
@@ -3769,9 +3481,8 @@ class MLXTrainer:
             args.eval_delay = 0
         if not hasattr(args, "include_num_input_tokens_seen"):
             args.include_num_input_tokens_seen = False
-        # Integration-facing fields, at HF's own TrainingArguments defaults.
-        # TrackioCallback and SwanLabCallback read them directly in
-        # on_train_begin, so a missing one aborts the run before step 1.
+        # Integration fields at HF's TrainingArguments defaults; TrackioCallback and SwanLabCallback read them directly
+        # in on_train_begin, so a missing one aborts before step 1.
         if not hasattr(args, "project"):
             args.project = "huggingface"
         for _integration_arg in (
@@ -3786,14 +3497,8 @@ class MLXTrainer:
             args.run_name = args.output_dir
 
     def _sync_synthesized_arg(self, name, value):
-        """Set a callback-compat arg we synthesized, refreshing it per run.
-
-        These strategies derive from MLX knobs that stay writable after
-        construction, so without a per-run refresh a trainer built without eval
-        keeps eval_strategy="no" once eval is enabled later and HF's
-        EarlyStoppingCallback asserts in on_train_begin. Only values this trainer
-        wrote are refreshed; a real field or a user override is never clobbered.
-        """
+        """Refresh a synthesized callback-compat arg each run: a stale eval_strategy="no" makes HF's
+        EarlyStoppingCallback assert in on_train_begin; real fields and user overrides are never clobbered."""
         args = self.args
         synthesized = getattr(self, "_synthesized_callback_args", None)
         if synthesized is None:
@@ -3818,23 +3523,8 @@ class MLXTrainer:
         )
 
     def _static_cadence_enabled(self, name):
-        """Whether the loop's own step cadence applies, as HF decides it.
-
-        _sync_synthesized_arg deliberately preserves a caller-supplied strategy
-        (a real TrainingArguments/SFTConfig carries one, and a hand-set override
-        wins over our derivation), so the loop must read the same field HF's
-        DefaultFlowCallback reads instead of acting on the interval alone.
-        transformers only raises a step-interval action under
-        IntervalStrategy/SaveStrategy.STEPS (trainer_callback.
-        DefaultFlowCallback.on_step_end), so "no" must not act at all and
-        "epoch" must leave the cadence to on_epoch_end rather than adding a
-        second action on top of it.
-
-        Both are str Enums, so a plain "steps" and the member itself normalize
-        here. A missing field means the args object never went through
-        _ensure_callback_args_compat, so keep the legacy interval-only cadence
-        rather than silently disabling the action.
-        """
+        """Mirrors HF's DefaultFlowCallback, which raises a step action only under STEPS: "no" and "epoch" must not add
+        one; str-Enum values normalize; a missing field keeps the legacy interval-only cadence."""
         strategy = getattr(self.args, name, None)
         if strategy is None:
             return True
@@ -3854,16 +3544,8 @@ class MLXTrainer:
         return self._static_cadence_enabled("save_strategy")
 
     def _best_save_strategy_enabled(self):
-        """Whether save_strategy asks for HF's save-on-improvement rule.
-
-        SaveStrategy.BEST (transformers >= 4.47) is the one member
-        DefaultFlowCallback never raises: its on_step_end and on_epoch_end act
-        on STEPS and EPOCH only, so HF's Trainer core decides this one itself,
-        immediately after the evaluation that produced the metric. Gating the
-        static cadence on the strategy therefore left "best" with no cadence at
-        all -- the same hole the epoch cadence fills for "epoch". Same str-Enum
-        normalization as the other two; a missing field is not "best".
-        """
+        """SaveStrategy.BEST (transformers >= 4.47) is never raised by DefaultFlowCallback; HF's Trainer core decides it
+        right after the evaluation that produced the metric; a missing field is not best."""
         strategy = getattr(self.args, "save_strategy", None)
         if strategy is None:
             return False
@@ -3871,15 +3553,9 @@ class MLXTrainer:
         return str(strategy).lower() == "best"
 
     def _epoch_cadence_enabled(self, name):
-        """Whether a strategy field asks for HF's epoch cadence.
-
-        The mirror of _static_cadence_enabled for the other half of the flow,
-        DefaultFlowCallback.on_epoch_end, which raises its action under
-        IntervalStrategy/SaveStrategy.EPOCH. Same str-Enum normalization; a
-        missing field means the args object never went through
-        _ensure_callback_args_compat, so it keeps the legacy interval-only
-        cadence and gains no epoch action it never asked for.
-        """
+        """Mirror of _static_cadence_enabled for DefaultFlowCallback.on_epoch_end, which raises under
+        IntervalStrategy/SaveStrategy.EPOCH; a missing field gains no epoch action and keeps the legacy interval
+        cadence."""
         strategy = getattr(self.args, name, None)
         if strategy is None:
             return False
@@ -3887,42 +3563,9 @@ class MLXTrainer:
         return str(strategy).lower() == "epoch"
 
     def _request_epoch_cadence_actions(self):
-        """Raise the epoch-strategy log/eval/save requests at a dataset boundary.
-
-        transformers' Trainer always installs DefaultFlowCallback, so its
-        on_epoch_end is what turns a caller's "epoch" strategy into an action.
-        MLXTrainer installs no flow callback of its own, so gating the loop's
-        static interval on the strategy (see _static_cadence_enabled) would
-        otherwise leave a caller who hand-sets "epoch" and passes their own
-        callbacks with NO periodic log, checkpoint or evaluation at all -- worse
-        than the wrong-cadence bug that gating fixes. Raise the same requests
-        here so the cadence holds either way.
-
-        Deduplicated against an installed flow by construction: this sets
-        exactly the control flags DefaultFlowCallback.on_epoch_end sets, so the
-        two requests coalesce into the single boolean the loop already clears
-        when it runs the action (CallbackHandler.on_log/on_evaluate/on_save
-        clear theirs the same way) -- one on_save, one checkpoint-N write, one
-        eval_loss in log_history per boundary. It adds no repeat of its own:
-        every boundary that already dispatched on_epoch_end now carries the
-        request, and no boundary is visited twice. Callers invoke this
-        immediately BEFORE firing on_epoch_end, which is also where HF raises it
-        (the flow sits at index 0 of the callback list), so the callbacks that
-        follow observe the same control state they would under HF.
-
-        This does not, and cannot, deduplicate ACROSS boundaries: when an epoch
-        is shorter than one accumulation window (_mlx_epoch_microbatches returns
-        None under max_steps for a source with no cycle_length, so the ragged
-        tail is not forced to an optimizer step) the loop dispatches several
-        on_epoch_end events at one global_step and repeats the action at each,
-        exactly as it already does for a caller who installs the flow.
-
-        DDP-safe with no collective of its own: args and state.epoch are
-        rank-consistent, and every call site sits on the near side of the
-        _distributed_sync_control_actions() that follows the on_epoch_end fire,
-        which OR-reduces the flags before any rank enters the collective
-        log/eval/save paths.
-        """
+        """Raises the flags DefaultFlowCallback.on_epoch_end sets, just before it fires; deduped against an installed
+        flow (one on_save and one eval_loss per boundary); repeats per on_epoch_end when an epoch is shorter than one
+        accumulation window; DDP-safe as flags are OR-synced after."""
         if self._epoch_cadence_enabled("logging_strategy"):
             self.control.should_log = True
         if self._epoch_cadence_enabled("eval_strategy"):
@@ -3937,58 +3580,25 @@ class MLXTrainer:
             self.control.should_save = True
 
     def _request_step_cadence_actions(self):
-        """Raise the non-interval requests DefaultFlowCallback.on_step_end makes.
-
-        The loop's static interval (see _static_cadence_enabled) covers the
-        periodic half of DefaultFlowCallback.on_step_end. This covers the rest:
-        the logging_first_step log at step 1, and the save/eval HF forces once
-        state.global_step reaches state.max_steps. MLXTrainer installs no flow
-        callback of its own, so without these a run whose interval does not
-        divide the step budget silently lost its LAST resumable checkpoint --
-        checkpoint-<max_steps> and its on_save, the one an interrupted run
-        resumes from, which the unconditional final save_model() cannot replace
-        because it holds adapters only, no optimizer or trainer state -- and, on
-        a transformers that forces one, the final evaluation that
-        load_best_model_at_end and EarlyStoppingCallback read last.
-
-        Deduplicated against an installed flow exactly like
-        _request_epoch_cadence_actions: these are the control flags
-        DefaultFlowCallback sets, so both requests coalesce into the single
-        boolean the loop clears when it runs the action -- one on_save, one
-        checkpoint-N write, one eval_loss in log_history. Callers raise it
-        immediately BEFORE on_step_end, which is where the flow raises it (index
-        0 of the callback list), so the callbacks that follow observe the same
-        control state they would under HF.
-
-        The final-step test reads state.max_steps, the same fixed field HF's
-        flow tests, not the loop's live budget: a run whose budget
-        _honor_epoch_stop_skip shrank stops short of max_steps and gets no
-        forced final action, with or without a flow installed.
-
-        DDP-safe with no collective of its own: args and state are
-        rank-consistent, and every call site sits on the near side of the
-        _distributed_sync_control_actions() that follows the on_step_end fire.
-        """
+        """Raises the non-interval flags DefaultFlowCallback.on_step_end sets (first-step log; save and eval forced at
+        state.max_steps, not the live budget); call it just before on_step_end fires; deduped against an installed
+        flow."""
         args = self.args
         current_step = int(getattr(self.state, "global_step", 0) or 0)
-        # Deliberately not gated on logging_strategy: HF raises the first-step
-        # log before it tests the strategy, so "no" and "epoch" log step 1 too.
+        # Deliberately not gated on logging_strategy: HF raises the first-step log before testing the strategy, so 'no' and 'epoch' log step 1 too.
         if current_step == 1 and getattr(args, "logging_first_step", False):
             self.control.should_log = True
         max_steps = int(getattr(self.state, "max_steps", 0) or 0)
         if max_steps <= 0 or current_step < max_steps:
             return
-        # HF forces the final save from the strategy alone, with no save_steps
-        # guard, so an interval that does not divide the budget still leaves a
-        # checkpoint at the end.
+        # HF forces the final save from the strategy alone with no save_steps guard, so an interval that does not divide the budget still saves at the end.
         if self._static_save_cadence_enabled():
             self.control.should_save = True
         eval_steps = int(getattr(self.state, "eval_steps", 0) or 0)
         if (
             _default_flow_evaluates_final_step()
-            # HF skips the forced eval when the interval already evaluated here.
-            # Its modulo has no zero guard; a 0 interval means "never" for the
-            # loop's own cadence, so keep it meaning that rather than raising.
+            # HF skips the forced eval when the interval already evaluated here; its modulo has no zero guard, so a 0
+            # interval keeps meaning never rather than raising.
             and eval_steps > 0
             and current_step % eval_steps != 0
             and self._static_eval_cadence_enabled()
@@ -4047,14 +3657,12 @@ class MLXTrainer:
     def _init_callback_state(self, total_steps, resume_step, batches=None):
         """Initialize TrainerState for HF callback lifecycle events."""
         args = self.args
-        # Expand HF's fractional (ratio-of-total-steps) intervals to absolute
-        # counts before storing them, as TrainerState.compute_steps does.
+        # Expand HF's fractional (ratio-of-total-steps) intervals to absolute counts before storing, as TrainerState.compute_steps does.
         eval_steps = _resolve_interval_steps(
             getattr(args, "eval_steps", 0), total_steps,
         )
-        # Reflect the real MLX rank so HF callbacks (loggers, savers) gate their
-        # own I/O correctly. MLX distributed is single-node, so local and world
-        # process-zero both track rank 0.
+        # Reflect the real MLX rank so HF callbacks (loggers, savers) gate their own I/O; MLX distributed is
+        # single-node, so local and world process-zero both track rank 0.
         is_main_process = self.is_main_process
         self.state = _MLXTrainerState(
             global_step=int(resume_step),
@@ -4080,18 +3688,14 @@ class MLXTrainer:
             num_input_tokens_seen=int(
                 getattr(self, "_resume_num_input_tokens_seen", 0) or 0
             ),
-            # Continue the checkpoint's history on resume (HF restores the whole
-            # TrainerState from trainer_state.json); empty on a fresh run.
+            # Continue the checkpoint's log history on resume (HF restores the whole TrainerState from trainer_state.json); empty on a fresh run.
             log_history=list(getattr(self, "_resume_log_history", None) or []),
             is_local_process_zero=is_main_process,
             is_world_process_zero=is_main_process,
         )
-        # Seed the callback-visible best-model fields from the restored native best
-        # state, or a resumed run starts at best_metric=None and EarlyStoppingCallback
-        # treats the first post-resume eval as the new best, overwriting the real one
-        # and diverging from _run_best_tracking. Own checkpoint key, since it advances
-        # even when native tracking is off; falls back to the native value on fresh
-        # runs and pre-fix checkpoints.
+        # Seed callback-visible best_metric from the restored native best, or EarlyStoppingCallback treats the first
+        # post-resume eval as new best, diverging from _run_best_tracking; own checkpoint key, as it advances even with
+        # native tracking off; native value on fresh runs and pre-fix checkpoints.
         _cb_best_metric = getattr(self, "_resume_callback_best_metric", None)
         _cb_best_step = getattr(self, "_resume_callback_best_step", None)
         self.state.best_metric = (
@@ -4146,8 +3750,7 @@ class MLXTrainer:
         total = len(batches)
         if total <= 0:
             return None
-        # Epoch-count runs share this length with the step budget and the forced
-        # epoch-final update, so both read it from one place.
+        # Epoch-count runs share this length with the step budget and the forced epoch-final update, so both read it from one place.
         epoch_microbatches = _mlx_epoch_microbatches(
             self.args,
             batches,
@@ -4162,18 +3765,13 @@ class MLXTrainer:
             if epochs > 0 and total % epochs == 0:
                 return max(1, total // epochs)
             return total
-        # max_steps>0: `batches` is the whole cycled run, NOT one dataset pass, so
-        # using its length as the epoch would make state.epoch climb to 1.0 across
-        # the run and fire the epoch events once, starving epoch-based callbacks.
-        # Approximate the per-epoch count from the dataset size and global batch,
-        # matching HF's len(dataloader) accounting. Callback-visible only; never
-        # touches the data or the gradient steps. Floored at 1 but not
-        # upper-clamped, so a sub-one-pass run reports its true fraction.
+        # With max_steps>0 batches is the whole cycled run, not one pass, so its length would fire epoch events once;
+        # approximate the per-epoch count from dataset size and global batch (as HF len(dataloader)); callback-visible
+        # only; floored at 1, not clamped above.
         if int(getattr(self.args, "max_steps", 0) or 0) > 0:
-            # Prefer the plan's own one-pass count: the approximation below
-            # cannot see what batching retained (sub-two-token rows dropped, one
-            # source item expanding into several, floored tail), so it fires the
-            # epoch events at micro-batches that are not dataset boundaries.
+            # Prefer the plan's own one-pass count: the approximation cannot see what batching retained (sub-two-token
+            # rows dropped, items expanding into several, floored tail), so it fires epoch events off dataset
+            # boundaries.
             plan_cycle = getattr(batches, "cycle_length", None)
             if plan_cycle:
                 return max(1, int(plan_cycle))
@@ -4209,14 +3807,9 @@ class MLXTrainer:
         return metric_name
 
     def _export_callback_states(self):
-        """Populate state.stateful_callbacks from ExportableState callbacks.
-
-        HF does this in _save_checkpoint, so a callback's internal bookkeeping
-        (EarlyStoppingCallback.early_stopping_patience_counter) travels with the
-        checkpoint. Duck-typed on a working `state()` to keep this module
-        Torch-free. TrainerControl is excluded: MLX rebuilds control flags every
-        train(), and rehydrating should_training_stop would end a resume at step 0.
-        """
+        """Fills state.stateful_callbacks from callbacks with a working state(), as HF does in _save_checkpoint;
+        TrainerControl is excluded because MLX rebuilds its flags every train() and rehydrating should_training_stop
+        would end a resume at step 0."""
         exported = {}
         for cb in self.callback_handler.callbacks:
             state_fn = getattr(cb, "state", None)
@@ -4230,8 +3823,7 @@ class MLXTrainer:
                 continue
             name = type(cb).__name__
             if name in exported:
-                # HF stores duplicates of one class as a list, positionally
-                # matched back to the callbacks on restore.
+                # HF stores duplicate callbacks of one class as a list, positionally matched back to the callbacks on restore.
                 if not isinstance(exported[name], list):
                     exported[name] = [exported[name]]
                 exported[name].append(cb_state)
@@ -4241,21 +3833,14 @@ class MLXTrainer:
         return exported
 
     def _restore_callback_states(self, stateful_callbacks):
-        """Seed state.stateful_callbacks from a checkpoint. Rehydrating the live
-        callbacks is HF's opt-in restore_callback_states_from_checkpoint path,
-        which this config does not expose, so only the visible state is mirrored."""
+        """Seeds state.stateful_callbacks from a checkpoint only; live callbacks are not rehydrated, since HF's
+        restore_callback_states_from_checkpoint opt-in is not exposed here."""
         if isinstance(stateful_callbacks, dict) and stateful_callbacks:
             self.state.stateful_callbacks = dict(stateful_callbacks)
 
     def _update_callback_best_metric(self, metrics):
-        """Update TrainerState.best_metric after eval callbacks inspect prior state.
-
-        Returns whether this evaluation is a new best, like HF's
-        _determine_best_metric, so save_strategy="best" can act on it. No
-        configured metric and a NaN both mean "not a new best", which is also
-        what HF concludes (metric_for_best_model None short-circuits its
-        is_new_best_metric to False, and np.less/np.greater are False on NaN).
-        """
+        """Updates TrainerState.best_metric after eval callbacks inspect the prior state; returns whether this eval is a
+        new best, as in HF _determine_best_metric; no metric or NaN means not a new best."""
         metric_name = self._metric_for_best_model_name(metrics, require=False)
         if metric_name is None:
             return False
@@ -4288,18 +3873,14 @@ class MLXTrainer:
 
     @staticmethod
     def _peek_stream_carries_audio(batch_iter):
-        """Peek one batch for audio and chain it back, consuming nothing.
-
-        Returns ``(carries_audio, batch_iter)``; streaming plans cannot be
-        surveyed and batches are the only place audio is observable.
-        """
+        """Peeks one batch and chains it back, returning (carries_audio, batch_iter); streaming plans cannot be
+        surveyed, so that batch is the only place audio is observable."""
         if batch_iter is None:
             return False, batch_iter
         try:
             first = next(batch_iter)
         except StopIteration:
-            # Exhausted, but still the run's to close: the source may hold a
-            # file or a worker open past its last batch.
+            # Exhausted, but still the run's to close: the source may hold a file or worker open past its last batch.
             return False, _PeekedBatchStream(batch_iter)
         payload = first[0] if isinstance(first, tuple) else first
         return (
@@ -4309,13 +3890,8 @@ class MLXTrainer:
 
     @staticmethod
     def _streamed_audio_leaves_the_compiled_path(batch_data, batches):
-        """Whether this streamed batch has to drop the run to eager.
-
-        The stream counterpart to the plan's ``carries_audio_in``: a finite
-        plan is surveyed whole and already routed, but a stream only ever
-        offered the one batch ``_peek_stream_carries_audio`` looked at, so
-        audio appearing later has to be noticed here.
-        """
+        """Stream counterpart to carries_audio_in: a stream only ever peeks one batch, so audio appearing in a later
+        batch must be caught here to drop the run to eager."""
         if isinstance(batches, FiniteVLMBatchPlan):
             return False
         payload = batch_data[0] if isinstance(batch_data, tuple) else batch_data
@@ -4323,13 +3899,8 @@ class MLXTrainer:
 
     @staticmethod
     def _ensure_lora_frozen(model):
-        """Freeze accidentally trainable norm params when LoRA is active.
-
-        LayerNorm/RMSNorm weights left trainable make adaptive optimizers NaN
-        on 1D tensors at init (second-moment starts at 0 -> divide by ~eps).
-        Only norms are frozen; projector/vision/other intentional non-LoRA
-        params are left alone.
-        """
+        """Freeze stray trainable norm params under LoRA: adaptive optimizers NaN on 1D norm weights at init (second
+        moment starts at 0); only norms are frozen, other non-LoRA params are left alone."""
         trainable = dict(tree_flatten(model.trainable_parameters()))
         if not trainable:
             return  # nothing trainable; stub models may lack model.parameters().
@@ -4338,8 +3909,7 @@ class MLXTrainer:
         if not has_lora:
             return  # Not a LoRA model — don't touch
 
-        # Only freeze accidentally-unfrozen norms; leave components the user
-        # explicitly unfroze (train_projector, train_vision) alone.
+        # Only freeze accidentally-unfrozen norms; leave components the user explicitly unfroze (train_projector, train_vision) alone.
         _NORM_FRAGMENTS = (".norm.", "norm.weight", "norm.bias",
                            ".ln_", "ln_f.weight", "ln_f.bias")
         _INTENTIONAL_COMPONENTS = (
@@ -4378,8 +3948,8 @@ class MLXTrainer:
 
         warmup_steps = getattr(self.args, "warmup_steps", 0) or 0
         if isinstance(warmup_steps, numbers.Real) and 0 < warmup_steps < 1:
-            # HF TrainingArguments.get_warmup_steps: below 1 is a ratio of total steps.
-            # Multiply in the value's own type: float(np.float32(0.1)) * 100 ceils to 11.
+            # HF TrainingArguments.get_warmup_steps: a value below 1 is a ratio of total steps; multiply in the value's
+            # own type, since float(np.float32(0.1)) * 100 ceils to 11.
             warmup_steps = math.ceil(max(0, int(total_steps)) * warmup_steps)
         warmup_steps = int(warmup_steps)
         warmup_ratio = getattr(self.args, "warmup_ratio", 0.0)
@@ -4398,9 +3968,8 @@ class MLXTrainer:
             "_unsloth_mlx_warmup_steps_explicit",
             warmup_steps != default_warmup_steps,
         )
-        # HF get_warmup_steps parity: a zero warmup_steps never overrides a positive
-        # warmup_ratio. warmup_steps == 0 means "use the ratio" even when explicitly
-        # set, so only a positive explicit step count wins over the ratio.
+        # HF get_warmup_steps parity: warmup_steps of 0 means use the ratio even when explicitly set, so only a positive
+        # explicit step count overrides warmup_ratio.
         if steps_explicit and warmup_steps > 0:
             return max(0, warmup_steps)
 
@@ -4568,13 +4137,8 @@ class MLXTrainer:
         optimizer.learning_rate = self._schedule_value(schedule, step)
 
     def _build_optimizer(self, total_steps):
-        """Create MLX optimizer with LR schedule from config.
-
-        For AdamW, MLX applies weight decay inside the leaf update without a
-        parameter-group filter. Keep MLX AdamW's built-in decay disabled and
-        apply decoupled decay ourselves so bias and norm parameters match
-        HuggingFace Trainer behavior.
-        """
+        """MLX AdamW applies weight decay in the leaf update with no parameter-group filter, so its built-in decay stays
+        off and decoupled decay is applied here to match HF's bias/norm exemption."""
         schedule = self._build_schedule(total_steps)
         initial_lr = self._schedule_value(schedule, 0)
         self._lr_schedule = schedule if callable(schedule) else None
@@ -4597,8 +4161,7 @@ class MLXTrainer:
                 )
                 opt_name = "adamw"
 
-        # After the Adafactor->AdamW fallback so it carries betas/eps; non-Adam
-        # optimizers ignore them like HF, except Lion (trainer_optimizer.py).
+        # Taken after the Adafactor->AdamW fallback so it carries betas/eps; non-Adam optimizers ignore them like HF, except Lion (trainer_optimizer.py).
         adam_kwargs = {}
         adam_beta1 = getattr(self.args, "adam_beta1", None)
         adam_beta2 = getattr(self.args, "adam_beta2", None)
@@ -4621,8 +4184,7 @@ class MLXTrainer:
                 weight_decay=0.0,
             )
         elif opt_name == "adamw":
-            # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
-            # to False, which makes early warmup updates much larger.
+            # Match HF/PyTorch AdamW semantics; MLX defaults bias_correction to False, which makes early warmup updates much larger.
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.AdamW(
                 learning_rate=initial_lr,
@@ -4639,8 +4201,7 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name in ("adamw_8bit", "adam_8bit"):
-            # One line, once per process, main process only: _build_optimizer runs
-            # per run and per rank, and this is the default optim in every example.
+            # Announce once per process, main process only: _build_optimizer runs per run and per rank, and this is the default optim in every example.
             from .optimizers_quantized import (
                 QuantizedMomentAdam,
                 QuantizedMomentAdamW,
@@ -4663,10 +4224,8 @@ class MLXTrainer:
                     **adam_kwargs,
                 )
         elif opt_name == "sgd":
-            # HF/PyTorch SGD couples weight decay into the gradient (and thus
-            # momentum/Nesterov), unlike AdamW's decoupled shrink. Apply our
-            # own bias/norm-aware coupled decay so the exemption matches HF
-            # while keeping SGD's coupled dynamics.
+            # HF/PyTorch SGD couples weight decay into the gradient (so momentum/Nesterov too), unlike AdamW's decoupled
+            # shrink; apply our own bias/norm-aware coupled decay so exemptions match HF.
             self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "muon":
@@ -4738,12 +4297,8 @@ class MLXTrainer:
         )
 
     def _apply_manual_weight_decay(self, model, optimizer, grad):
-        """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
-
-        AdamW, Adafactor, Muon and Lion are built with ``weight_decay=0.0`` so
-        this owns the decay term, as HF does via ``param_groups``. SGD and Adam
-        use coupled decay instead (``_apply_coupled_weight_decay``).
-        """
+        """Decoupled decay on trainable non-bias/non-norm leaves; AdamW, Adafactor, Muon and Lion are built with
+        weight_decay=0.0 so this owns the decay, as HF's param_groups do; SGD and Adam use coupled decay."""
         wd = float(getattr(self, "_manual_weight_decay", 0.0) or 0.0)
         if wd <= 0:
             return
@@ -4768,14 +4323,8 @@ class MLXTrainer:
             model.update(tree_unflatten(decayed))
 
     def _apply_coupled_weight_decay(self, model, grad):
-        """Fold HF/PyTorch-SGD coupled decay (wd * param) into the gradient.
-
-        SGD adds ``weight_decay * parameter`` to the gradient before the
-        momentum/Nesterov update, so it must be applied to ``grad`` rather
-        than as a post-update parameter shrink. Keeps HF's bias/norm
-        exemption. Returns a possibly-modified grad tree; the original is
-        returned unchanged when no decay applies.
-        """
+        """Adds weight_decay * param to the grad before the momentum/Nesterov update, not as a post-update shrink; keeps
+        HF's bias/norm exemption; returns grad unchanged when no decay applies."""
         wd = float(getattr(self, "_coupled_weight_decay", 0.0) or 0.0)
         if wd <= 0:
             return grad
@@ -4802,12 +4351,8 @@ class MLXTrainer:
 
     @staticmethod
     def _adafactor_unsupported_parameters(model):
-        """Return trainable params MLX Adafactor cannot update safely.
-
-        It treats ndim >= 2 as factored and reconstructs via matmul (correct
-        for 2-D), but rank-3/4 tensors from vision patch embeddings, convs, and
-        some projectors fail or broadcast incorrectly.
-        """
+        """Trainable params MLX Adafactor cannot update safely: it treats ndim >= 2 as factored, correct only for 2-D,
+        so rank-3/4 tensors (patch embeddings, convs, some projectors) fail or broadcast wrong."""
         unsupported = []
         try:
             trainable = tree_flatten(model.trainable_parameters())
@@ -4821,21 +4366,9 @@ class MLXTrainer:
         return unsupported
 
     def _fire_prediction_step(self):
-        """Dispatch HF's on_prediction_step for one processed eval batch.
-
-        transformers fires this once per evaluation batch from its evaluation
-        loop (`self.control = self.callback_handler.on_prediction_step(args,
-        self.state, self.control)` in Trainer.evaluation_loop), which is how
-        stock ProgressCallback advances its evaluation bar and how per-batch
-        evaluation instrumentation is notified. The handler passes its
-        eval_dataloader through, so a sized batch list gives ProgressCallback a
-        real total and a lazy view (no __len__) makes it no-op, like HF's own
-        has_length guard.
-
-        No-ops when the handler is absent: _evaluate is reachable from helper
-        paths that never built one, and evaluation must not start depending on
-        the callback bridge to produce a loss.
-        """
+        """Fires HF on_prediction_step once per eval batch for ProgressCallback; a sized batch list gives a real total
+        and a lazy view with no __len__ is a no-op; no-op without a handler, since evaluation must not start
+        depending on the callback bridge to produce a loss."""
         handler = getattr(self, "callback_handler", None)
         if handler is None:
             return
@@ -4844,17 +4377,8 @@ class MLXTrainer:
         )
 
     def _close_split_prediction_bars(self):
-        """End per-split evaluation progress bars when eval_dataloader rotates.
-
-        HF scores one eval_dataset split per evaluate() call, so its per-split
-        on_evaluate closes ProgressCallback's prediction bar before the next
-        split opens a new one sized to that split. MLX reports the whole dict as
-        one evaluation, so without this the first split's bar keeps counting
-        every later split's batch past its own total (2/2 climbing to 9/2 across
-        three splits). The last split's bar is still closed by on_evaluate, as
-        in HF. Duck-typed to keep this module Torch-free, and a no-op on ranks
-        and callbacks that never opened a bar.
-        """
+        """Closes ProgressCallback's prediction bar at each eval split, since MLX reports all splits as one evaluation
+        and the bar would count past its total; no-op for ranks or callbacks without a bar."""
         for callback in getattr(
             getattr(self, "callback_handler", None), "callbacks", ()
         ) or ():
@@ -5008,8 +4532,7 @@ class MLXTrainer:
         if args.streaming and _is_mlx_lazy_text_source(eval_dataset):
             max_batches = getattr(args, "max_eval_batches", None)
             if max_batches is not None:
-                # Reject rather than truncate: silent coercion would change how
-                # much eval data is scored.
+                # Reject rather than truncate: silent coercion would change how much eval data is scored.
                 coerced = None
                 if not isinstance(max_batches, bool):
                     try:
@@ -5048,20 +4571,10 @@ class MLXTrainer:
         )
 
     def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
-        """Run evaluation loop.
-
-        Returns:
-            ``(avg_loss, perplexity)``. Perplexity is None for a preference
-            objective, whose loss is not a per-token likelihood.
-
-        The weight each batch contributes is whatever its loss function returns
-        second: supervised tokens for a token objective, scored pairs for a
-        preference one.
-        """
+        """Returns (avg_loss, perplexity), perplexity None for a preference objective; each batch is weighted by the
+        second value its loss_fn returns (supervised tokens, or scored pairs for preference)."""
         self.model.eval()
-        # Restored on every path: a raise here would otherwise leave the model
-        # in eval mode for the rest of training, silently disabling dropout and
-        # NEFTune noise.
+        # Restored on every path: a raise here would leave the model in eval mode for the rest of training, silently disabling dropout and NEFTune noise.
         try:
             metrics = {}
             # Set by the preference scorer, which has no perplexity to report.
@@ -5096,10 +4609,8 @@ class MLXTrainer:
                 all_losses = mx.array(0.0)
                 ntokens = mx.array(0)
                 all_stats = None
-                # HF evaluates one split at a time and rebuilds its eval_dataloader
-                # per split, so on_prediction_step reports the split being consumed
-                # rather than the dict of splits (whose len is the split count, and
-                # would give ProgressCallback a nonsense bar total).
+                # HF evaluates one split at a time with a per-split eval_dataloader, so on_prediction_step gets the
+                # consumed split, not the splits dict (its len would give ProgressCallback a nonsense total).
                 handler = getattr(self, "callback_handler", None)
                 outer_dataloader = getattr(handler, "eval_dataloader", None)
                 try:
@@ -5243,8 +4754,7 @@ class MLXTrainer:
         self._prior_metal_limits = {}
 
     def _setup_report_to_callbacks(self):
-        """Auto-register W&B / TensorBoard callbacks from report_to, mirroring
-        Unsloth worker.py log keys so notebook and Unsloth runs chart identically."""
+        """Auto-register W&B / TensorBoard callbacks from report_to, using the same log keys as Unsloth worker.py so notebook and Unsloth runs chart identically."""
         raw = getattr(self.args, "report_to", "none")
         if not raw or raw == "none":
             return
@@ -5317,9 +4827,8 @@ class MLXTrainer:
                     pass
 
         def _on_eval(step, eval_loss, perplexity):
-            # Everything the evaluation reported, not just the two values this
-            # callback is handed: "eval_rewards/chosen" charts as
-            # "eval/rewards/chosen", matching the existing "eval/loss".
+            # Report everything the evaluation produced, not just the two values this callback gets: eval_rewards/chosen
+            # charts as eval/rewards/chosen, matching eval/loss.
             reported = {
                 f"eval/{name[len('eval_'):]}": value
                 for name, value in (self._last_eval_metrics or {}).items()
@@ -5348,15 +4857,11 @@ class MLXTrainer:
         self._report_to_callbacks = (_on_step, _on_eval)
 
     def _install_neftune(self):
-        """NEFTune: add scaled uniform noise to input embeddings during training.
-        No-op in eval. Text models read the embedding off the backbone; VLM
-        wrappers agree on too little for that, so theirs is identified by running
-        the text-only embed path. Uses __class__ reassignment rather than a
-        module swap, so .weight stays readable for tied LM-head models and
-        __call__ resolves on the subtype so interception fires."""
+        """NEFTune noise on input embeddings, no-op in eval; VLM wrappers are located by running the text-only embed
+        path; __class__ reassignment, not a module swap, keeps .weight readable for tied LM heads, and __call__
+        resolves on the subtype so interception fires."""
         alpha = float(getattr(self.args, "neftune_noise_alpha", 0.0) or 0.0)
-        # Reject non-finite alpha: nan slips past `alpha <= 0` and would poison
-        # every embedding with nan/inf noise from step 0.
+        # Reject non-finite alpha: nan slips past `alpha <= 0` and would poison every embedding with nan/inf noise from step 0.
         if not math.isfinite(alpha) or alpha <= 0:
             return
         if self._is_vlm:
@@ -5384,10 +4889,9 @@ class MLXTrainer:
 
         _Base = type(emb)
         _alpha = alpha
-        # These families multiply the embedding after this module returns, so
-        # undivided noise would ride through it; transformers adds its noise
-        # after that multiply. An unreadable config degrades to uncorrected
-        # noise, as every other lookup here does, rather than aborting train().
+        # These families multiply the embedding after this module returns, so undivided noise would ride through;
+        # transformers adds noise after that multiply; an unreadable config degrades to uncorrected noise, not a train()
+        # abort.
         try:
             _embed_scale = _neftune_embed_scale(self.model) or 1.0
         except Exception as e:
@@ -5398,9 +4902,8 @@ class MLXTrainer:
         class _NEFTuneEmbed(_Base):
             _unsloth_neftune_active = True
             _neftune_noise_enabled = True
-            # *args/**kwargs, not (self, x): the VLM probe returns whichever
-            # module produced the embedding shape, which may take more arguments
-            # on the image path the probe never exercises.
+            # Takes *args/**kwargs, not (self, x): the VLM probe returns whichever module made the embedding shape,
+            # which may take more args on the unprobed image path.
             def __call__(self, *args, **kwargs):
                 out = _Base.__call__(self, *args, **kwargs)
                 if (
@@ -5415,21 +4918,16 @@ class MLXTrainer:
                     return out + noise
                 return out
 
-        # Report the base class's name so the save-window DoRA detection
-        # (`is_mlx_dora_module` in mlx/utils.py) sees
-        # through this transparent stand-in. An embedding-only DoRA adapter
-        # (use_dora=True targets embed_tokens) is what NEFTune subclasses here,
-        # so a bare "_NEFTuneEmbed" name would fail that check and silently
-        # demote the DoRA adapter to plain LoRA on save. The quantization-map
-        # scan is safe without this: it already keys on isinstance, not name.
+        # Report the base class name so is_mlx_dora_module (mlx/utils.py) sees through this stand-in; a bare
+        # _NEFTuneEmbed name would silently demote an embed_tokens DoRA adapter to LoRA on save; quantization scan keys
+        # on isinstance.
         _NEFTuneEmbed.__name__ = _Base.__name__
         _NEFTuneEmbed.__qualname__ = getattr(_Base, "__qualname__", _Base.__name__)
 
         self._neftune_emb = emb
         self._neftune_base_cls = _Base
         emb.__class__ = _NEFTuneEmbed
-        # Report the divisor: on gemma3/gemma3n/gemma4 the same alpha perturbs
-        # sqrt(hidden_size) times less than before this correction.
+        # Divides noise by the post-embedding scale; on gemma3/gemma3n/gemma4 the same alpha perturbs sqrt(hidden_size) times less than before this correction.
         if _embed_scale != 1.0:
             print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}, noise divided by "
                   f"the post-embedding scale {_embed_scale:.4f} to match transformers).")
@@ -5451,8 +4949,7 @@ class MLXTrainer:
         """Best-effort release of an iterator owned by the training run."""
         batch_iter = getattr(self, "_active_batch_iter", None)
         self._active_batch_iter = None
-        # Every exit path lands here: close the producer and persist a live
-        # orphan so the next run's gate sees it.
+        # Every exit path closes the producer and persists a live orphan so the next run's gate sees it.
         control = getattr(self, "_mlx_prefetch_control", None)
         prefetcher = control.get("prefetcher") if control else None
         try:
@@ -5461,9 +4958,7 @@ class MLXTrainer:
                 try:
                     close()
                 except Exception:
-                    # A cleanup error must not mask an in-flight training error
-                    # or diverge ranks after a final collective. A propagating
-                    # signal is still honored (see finally).
+                    # Cleanup errors must not mask an in-flight training error or diverge ranks after a final collective; a propagating signal is still honored.
                     pass
             if prefetcher is not None:
                 try:
@@ -5472,9 +4967,8 @@ class MLXTrainer:
                     pass
         finally:
             if prefetcher is not None:
-                # close() marks a conservative orphan up front, so an unclean
-                # close or a propagating interrupt leaves orphaned=True. Persist
-                # it either way; the next run's gate drains and clears it.
+                # close() marks a conservative orphan up front, so an unclean close or propagating interrupt leaves
+                # orphaned=True; persist it either way for the next run's gate to drain.
                 if prefetcher.orphaned:
                     self._mlx_prefetch_orphan = prefetcher
                 if control is not None:
@@ -5482,12 +4976,9 @@ class MLXTrainer:
 
 
     def _quiesce_prefetcher_for_save(self, terminal=False):
-        """Make serialization exclusive over shared preprocessing objects.
-
-        ``terminal=True`` closes the producer for good; otherwise an active
-        producer is PAUSED and returned so the caller can resume it after the
-        save. Live persisted orphans always refuse.
-        """
+        """Makes serialization exclusive over shared preprocessing objects; terminal=True closes the producer for good,
+        otherwise an active one is paused and returned to resume after the save; live persisted orphans always
+        refuse."""
         orphan = getattr(self, "_mlx_prefetch_orphan", None)
         if orphan is not None:
             if orphan.orphan_alive():
@@ -5497,8 +4988,7 @@ class MLXTrainer:
                     "to serialize concurrently. Wait for the thread to "
                     "terminate, then call save_model() again."
                 )
-            # Terminated orphan: close() drains its queued device tensors
-            # before this save instead of waiting on the reference drop.
+            # A terminated orphan's close() drains its queued device tensors before this save, rather than waiting on the reference drop.
             orphan.close()
             self._mlx_prefetch_orphan = None
         control = getattr(self, "_mlx_prefetch_control", None)
@@ -5508,9 +4998,7 @@ class MLXTrainer:
         if not terminal:
             prefetcher.quiesce()
             return prefetcher
-        # Gate on close()'s return, not a fresh orphan_alive() read: it drained
-        # the queue iff it reports clean, so a save can never proceed with
-        # staged device tensors still queued.
+        # Gate on close()'s return, not a fresh orphan_alive() read: close() drains the queue iff clean, so no save proceeds with staged device tensors queued.
         if not prefetcher.close():
             self._mlx_prefetch_orphan = prefetcher
             control["prefetcher"] = None
@@ -5520,8 +5008,7 @@ class MLXTrainer:
                 "serialize concurrently. Wait for the thread to terminate, "
                 "then call save_model() again."
             )
-        # Terminal close succeeded: drop the control reference so the ensuing
-        # save_model() wrapper gate is a no-op.
+        # Terminal close succeeded: drop the control reference so the save_model() wrapper gate becomes a no-op.
         control["prefetcher"] = None
         return None
 
@@ -9518,11 +9005,9 @@ class MLXTrainer:
                     "Unsloth MLX preference: streaming datasets are not supported."
                 )
             _reject_group_by_length(_resolve_text_dataset_order(args), "preference")
-            # A cadence is optional -- a callback can raise should_evaluate --
-            # but selecting a best model reads a metric only an evaluation makes.
+            # A cadence is optional (a callback can raise should_evaluate), but selecting a best model needs a metric only an evaluation produces.
             _sampling_eval = bool(getattr(args, "generate_during_eval", False))
-            # Match the loop's trigger: eval_steps > 0 under eval_strategy "no"
-            # evaluates never, and "epoch" is a cadence without eval_steps.
+            # Match the loop trigger: eval_steps > 0 under eval_strategy 'no' never evaluates, and epoch is a cadence without eval_steps.
             _eval_cadence = (
                 (
                     _resolve_interval_steps(args.eval_steps, 1) > 0
@@ -9543,18 +9028,15 @@ class MLXTrainer:
                 if isinstance(self.eval_dataset, dict)
                 else [] if self.eval_dataset is None else [self.eval_dataset]
             )
-            # Scoring nothing still reports eval_loss 0.0: a best watermark no
-            # real evaluation can beat, and a reset of early stopping's patience.
+            # Scoring nothing still reports eval_loss 0.0: a best watermark no real evaluation can beat, and a reset of early stopping's patience.
             if self.eval_dataset is not None and not _splits:
                 raise ValueError(
                     "Unsloth MLX preference: evaluation requires at least one "
                     "eval split to score."
                 )
-            # Read exactly once, by the plan builder, and never indexed. The
-            # declared length stands in for a guarantee the pass ends, which
-            # nothing can establish for an arbitrary iterable. That refuses a
-            # bare generator one traversal would have served; hanging on an
-            # endless one is the worse trade.
+            # Each eval split is read once and never indexed; len() stands in for a guarantee the pass ends, which
+            # nothing can establish for an arbitrary iterable, so a bare generator is refused (hanging on an endless one
+            # is worse).
             for _split in _splits:
                 try:
                     _size = len(_split)
@@ -9607,8 +9089,7 @@ class MLXTrainer:
                         "cadence is set; sampling runs only when a callback "
                         "requests an evaluation."
                     )
-            # Without a cadence _best_step stays None and the restore is
-            # silently skipped. A callback may own the cadence, so only notice.
+            # Without a cadence _best_step stays None and the restore is silently skipped; a callback may own the cadence, so only notice.
             if (
                 self.eval_dataset is not None
                 and not _eval_cadence
@@ -9882,9 +9363,8 @@ class MLXTrainer:
                 batches = [] if plan is None else plan
                 run_checker = _vlm_mask_fn is not None and len(batches) > 0
                 if defer_vlm_checker:
-                    # The coordinated preflight owns the collective schedule, so
-                    # rank-local preparation must stay collective-free. Stash the
-                    # pending check for the preflight to invoke.
+                    # The coordinated preflight owns the collective schedule, so rank-local preparation must stay
+                    # collective-free; the pending check is stashed for it to invoke.
                     self._deferred_vlm_all_masked_check = (
                         (lambda: _check_vlm_all_masked(
                             batches,
@@ -10061,8 +9541,7 @@ class MLXTrainer:
         try:
             return self._save_model_impl(output_dir)
         finally:
-            # A mid-training save pauses the producer for exclusivity and
-            # resumes it; only end-of-training closes it terminally.
+            # A mid-training save pauses the producer for exclusivity and resumes it; only end-of-training closes it terminally.
             if paused_prefetcher is not None:
                 paused_prefetcher.resume()
 
@@ -10075,8 +9554,7 @@ class MLXTrainer:
         )
         output_dir = output_dir or self.args.output_dir
 
-        # Detect LoRA from module structure so reloaded/frozen adapters
-        # still take the adapter-save path.
+        # Detect LoRA from module structure so reloaded or frozen adapters still take the adapter-save path.
         adapter_tensors = collect_mlx_lora_adapter_tensors(self.model)
         has_lora = bool(adapter_tensors)
 
@@ -10084,25 +9562,22 @@ class MLXTrainer:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""
 
 
-            # Infer rank/scale/dropout from the first reloadable module; leave
-            # None on failure rather than persisting mis-scaling placeholders
-            # (_enrich_mlx_adapter_config gets a second shot).
+            # Infer rank/scale/dropout from the first reloadable module; leave None on failure rather than persist
+            # mis-scaling placeholders (_enrich_mlx_adapter_config gets a second attempt).
             _lora_rank = _lora_scale = _lora_dropout = None
             for _, m in iter_mlx_lora_modules(self.model):
                 inferred_rank = _infer_mlx_lora_rank(m)
                 if inferred_rank is None:
                     continue
                 _lora_rank = inferred_rank
-                # _coerce handles LoRASwitchLinear's per-expert mx.array where
-                # raw float()/.item() raise.
+                # _coerce_mlx_lora_scale handles LoRASwitchLinear's per-expert mx.array, where raw float() or .item() raise.
                 _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
                 _lora_dropout = _read_mlx_lora_dropout(m)
                 break
 
             from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
-            # mlx-lm.load_adapters() attr-accesses config.num_layers, so the
-            # key MUST be present; -1 is the legacy "all layers" sentinel.
+            # mlx-lm.load_adapters() attr-accesses config.num_layers, so the key MUST be present; -1 is the legacy all-layers sentinel.
             try:
                 _num_layers = len(layers) if layers is not None else -1
             except TypeError:
@@ -10140,10 +9615,9 @@ class MLXTrainer:
                 adapter_config["scale"] = _lora_scale
                 adapter_config["dropout"] = _lora_dropout
 
-            # Keep intentionally-trained non-LoRA tensors OUTSIDE any LoRA
-            # module; drop wrapped base weights INSIDE one (else q_proj.weight
-            # under a LoRA-wrapped q_proj re-leaks the Unsloth reload bug). Uses
-            # the shared filter to match save_trainable_adapters / _merged.
+            # Keep intentionally trained non-LoRA tensors outside any LoRA module but drop wrapped base weights inside
+            # one, else q_proj.weight under a LoRA-wrapped q_proj re-leaks the Unsloth reload bug; uses the shared
+            # filter to match save_trainable_adapters / _merged.
             trainable = dict(tree_flatten(self.model.trainable_parameters()))
             adapter_keys = set(adapter_tensors)
             lora_module_prefixes = tuple(
@@ -10217,9 +9691,8 @@ class MLXDPOTrainer(MLXTrainer):
 
 
 class MLXKTOTrainer(MLXTrainer):
-    """MLX trainer for Kahneman-Tversky Optimization on unpaired, labeled
-    completions; the reference is chosen as for MLXDPOTrainer. As in TRL,
-    ``model_adapter_name`` and ``ref_adapter_name`` are trainer arguments."""
+    """MLX Kahneman-Tversky Optimization trainer for unpaired labeled completions; reference chosen as in MLXDPOTrainer;
+    model_adapter_name and ref_adapter_name are trainer arguments, as in TRL."""
 
     config_class = MLXKTOConfig
     preference_kind = "kto"
@@ -10243,13 +9716,9 @@ class MLXKTOTrainer(MLXTrainer):
 
 
 class MLXGRPOTrainer(MLXTrainer):
-    """MLX trainer for Group Relative Policy Optimization of a text model, as
-    TRL's GRPOTrainer trains one on CUDA Unsloth. ``reward_funcs`` are callables
-    TRL's way: called with ``prompts``, ``completions``, ``completion_ids``,
-    every other dataset column and ``trainer_state``, returning one reward (or
-    None) per completion. An entry may also be a torch sequence-classification
-    model or its model id, tokenized by its ``reward_processing_classes`` entry.
-    The reference for ``beta != 0`` is the model with its adapters disabled, or its starting weights for a full fine-tune."""
+    """MLX GRPO trainer matching TRL's GRPOTrainer; reward_funcs get prompts, completions, completion_ids, dataset
+    columns and trainer_state, return one reward or None each; seq-cls model entries use reward_processing_classes;
+    beta != 0 reference: adapters-disabled model or starting weights."""
 
     config_class = MLXGRPOConfig
     preference_kind = "grpo"
@@ -10349,20 +9818,9 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             num_epochs=None, return_dataset=False,
                             comm_group=None, distributed_pad_mode="cycle",
                             return_plan=False, grad_accum=None):
-    """Create padded batches with label masks for train_on_responses_only.
-
-    Tokenizes each dataset item, applies the masking closure to get labels,
-    sorts by length, and produces right-padded 3-tuple batches.
-
-    Returns:
-        List of (batch, lengths, labels) tuples where:
-        - batch: mx.array (BS, padded_len) — input_ids padded with pad_token_id
-        - lengths: mx.array of shape (BS, 2) holding [1, actual_len]
-          per sequence. Right-half-open `[start, end)` matching the
-          exclusive-end loss masks in `utils.py:360`, `:393`, `:429`,
-          `:439`.
-        - labels: mx.array (BS, padded_len) — labels padded with -100
-    """
+    """Tokenized, sorted by length and right-padded into (batch, lengths, labels) mx.arrays; batch and labels are (BS,
+    padded_len) padded with pad_token_id and -100; lengths is (BS, 2) of [1, actual_len], half-open like the loss
+    masks."""
     eos_id = tokenizer.eos_token_id
     tokenizer = normalize_mlx_chat_template(
         tokenizer,
@@ -10409,10 +9867,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             labels = labels.tolist()
         return (encoded, labels[0])
 
-    # Filter out samples where all labels are -100 (no valid training signal).
-    # This can happen when truncation cuts off the response_part entirely,
-    # e.g. long reasoning/analysis channels in GPT-OSS that exceed max_seq_length.
-    # Such samples cause NaN loss since cross_entropy(mean) computes 0/0.
+    # Filter rows whose labels are all -100 (no training signal): truncation can cut off response_part (e.g. long
+    # GPT-OSS reasoning past max_seq_length), and cross_entropy(mean) gives NaN on 0/0.
     def _has_valid_labels(labels):
         """Return whether a response-masked row still has trainable labels."""
         # Loss supervises labels[1:] (causal shift), so the first label never trains.
@@ -10445,8 +9901,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             "Check your dataset and formatting_func."
         )
 
-    # 2. Sample order; must agree with unlabeled `create_ordered_batches`
-    # (utils.py:2845-2849) so `train_on_responses_only` sees the same stream.
+    # Sample order must agree with unlabeled create_ordered_batches (utils.py:2845-2849) so train_on_responses_only sees the same stream.
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     _order_requested = preserve_dataset_order or (
         dataset_order not in (None, "default")
@@ -10465,8 +9920,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             return list(range(len(all_items)))
         if dataset_order == "torch_randperm":
             from .utils import _torch_randperm_order, _normalize_seed
-            # Reseed per epoch (matches `create_ordered_batches`). Normalize a
-            # None seed first so seed=None does not raise on the int add.
+            # Reseed per epoch (matches create_ordered_batches); normalize a None seed first so seed=None does not raise on the int add.
             order = _torch_randperm_order(
                 len(all_items), _normalize_seed(seed) + epoch_idx
             )
@@ -10497,9 +9951,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         and not preserve_dataset_order
         and dataset_order in ("torch_randperm", "length_grouped")
     )
-    # Normalized so seed=None is deterministic (canonicalized) instead of
-    # entropy-derived; explicit seeds are unchanged. Visits stay identity —
-    # these plans carry explicitly materialized epoch blocks.
+    # Seed None is canonicalized so it is deterministic rather than entropy-derived; explicit seeds are unchanged, and
+    # visits stay identity since epoch blocks are materialized.
     rng = random.Random(_normalize_seed(seed))
     schedule = []
     widths = []
@@ -10596,13 +10049,8 @@ def _create_response_masked_dataset(items):
 
 
 def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
-    """Raise if all labels in the first N batches are -100 (mirrors
-    fix_zero_training_loss from the HF path).
-
-    In DDP ``batches`` is only this rank's shard, so the per-rank bad/good
-    counts are all-summed before the decision. Otherwise a rank whose shard
-    happens to be entirely masked would raise ZeroDivisionError alone while
-    peers with trainable labels advance to the first collective and hang."""
+    """Raise if all labels in the first N batches are -100 (mirrors HF fix_zero_training_loss); under DDP counts are
+    all-summed first, or a fully masked rank raises ZeroDivisionError alone and hangs its peers."""
     seen_bad = 0
     seen_good = 0
     checked = 0
@@ -10634,8 +10082,7 @@ def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
         if checked >= max_check:
             break
 
-    # Reduce across ranks before deciding so every rank raises/warns together
-    # (all ranks reach this collective; the early return below is post-reduce).
+    # Reduce across ranks before deciding so every rank raises or warns together; all ranks reach this collective, so the early return is post-reduce.
     if comm_group is not None and world_size > 1:
         counts = mx.distributed.all_sum(
             mx.array([seen_bad, seen_good], dtype=mx.int32),
@@ -10666,18 +10113,13 @@ def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
 
 
 def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1):
-    """_check_all_masked for finite VLM batch plans (construction metadata).
-
-    As in the text path, under DDP ``batches`` is only this rank's shard, so
-    counts are all-summed before deciding: otherwise a rank whose shard is
-    entirely masked would raise alone and hang its peers."""
-    # The checker consumes construction-time plan metadata: no extra processor
-    # work or materialization ahead of the collective below, or a failing rank
-    # would strand its peers there.
+    """Same check as the text path, on construction-time supervision counts; under DDP counts are all-summed first, or a
+    fully masked rank raises alone and hangs its peers."""
+    # The checker consumes construction-time plan metadata: no processor work or materialization may precede the
+    # collective, or a failing rank strands its peers.
     seen_bad, seen_good = batches.supervision_counts(max_check)
 
-    # Reduce across ranks before deciding so every rank raises/warns together
-    # (all ranks reach this collective; the early return below is post-reduce).
+    # Reduce across ranks before deciding so every rank raises or warns together; all ranks reach this collective, so the early return is post-reduce.
     if comm_group is not None and world_size > 1:
         counts = mx.distributed.all_sum(
             mx.array([seen_bad, seen_good], dtype=mx.int32),
@@ -10968,8 +10410,7 @@ def train_on_responses_only(
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset
 
-        # Safety check: detect all-masked labels early. In DDP batches is this
-        # rank's shard, so pass the group to reduce counts before deciding.
+        # Detect all-masked labels early; under DDP the batches are this rank's shard, so pass the group to reduce counts before deciding.
         _check_all_masked(
             batches,
             comm_group=comm_group,

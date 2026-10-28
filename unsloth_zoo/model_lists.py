@@ -14,34 +14,14 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Shared cross-platform model lists.
-
-Lives in its own dependency-free module so it can be imported during
-unsloth_zoo's early init without dragging in compiler.py's torch/triton
-imports.
-"""
+"""Shared cross-platform model lists; dependency-free, so early init can import it without pulling in compiler.py's torch or triton imports."""
 
 __all__ = ["FORCE_FLOAT32"]
 
 
-# Architectures whose activations exceed fp16's finite range (~6.5e4) and
-# must run in bf16 or fp32. Loaded as float16 they silently NaN/Inf at
-# training time. Shared source of truth for the CUDA loader
-# (unsloth/models/loader.py) and the MLX loader (unsloth_zoo/mlx/loader.py).
-#
-# Entries are HuggingFace ``config.json`` ``model_type`` strings (the same
-# values returned by ``unsloth_zoo.hf_utils.get_transformers_model_type``).
-# Examples on the Hub:
-#   google/gemma-3-*            -> "gemma3"
-#   google/embeddinggemma-*     -> "gemma3_text"   (matches "gemma3text" after _ stripping)
-#   google/gemma-3n-*           -> "gemma3n"
-#   openai/gpt-oss-*            -> "gpt_oss"
-#   Qwen/Qwen3.5-*              -> "qwen3_5"
-# The CUDA loader matches via substring against a comma-joined model_types
-# string, so the trailing comma on "gemma3," keeps it from prefix-matching
-# "gemma3n". The MLX helper ``_is_force_float32_arch`` strips ``-``/``_``
-# and the trailing comma before comparing, so ``"gpt-oss"`` / ``"gpt_oss"``
-# and ``"gemma3_text"`` / ``"gemma3text"`` all resolve correctly.
+# Architectures whose activations overflow fp16 (~6.5e4) and need bf16 or fp32, else NaN/Inf in training; entries are
+# config.json model_type strings shared by CUDA and MLX loaders; trailing comma stops gemma3 prefix-matching gemma3n;
+# MLX strips -, _ and the comma.
 FORCE_FLOAT32 = [
     "embedding_gemma2",  # fp16 unsupported upstream; text-only loads have no gemma4 sub-config to match
     "embedding_gemma2_text",  # explicit entry for the MLX exact-match helper

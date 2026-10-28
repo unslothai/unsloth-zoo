@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Scoped MLX inference fusions: quantized MoE gate and up projections,
-the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
-small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
-Qwen exact speculative verify blocks, wide-head decode and Gemma 4 verify-block attention, Qwen sparse attention block selection,
-QSA indexer blocks kept across cache trims, dilated depthwise convolutions, and SSD-backed PLE row reads."""
+"""Scoped MLX inference fusions for quantized MoE gate/up, recurrent decode conv, MoE routing, Qwen experts and sparse
+attention, Gemma 4 verify attention, SSD-backed PLE row reads."""
 
 import ast
 import functools
@@ -57,8 +54,7 @@ def _fusion_modules(model, modules):
     )
 
 
-# Pin the upstream function bodies the fusions read, rewrite or reimplement, since a fusion
-# mirroring an upstream body would compute the old arithmetic once that body changes.
+# Pins the upstream function bodies that fusions read, rewrite or reimplement: a mirror would keep computing the old arithmetic once the body changes.
 _ALIASES = (("mx", mx), ("nn", nn))
 _CONTRACT_MISSES = set()
 
@@ -87,15 +83,9 @@ def _resolve_dotted(module, path):
 
 
 def _resolved_bindings(contract):
-    """Resolve a `{module: {dotted name: fingerprint}}` contract, None pinning the name not the body.
-
-    A fingerprint may be a tuple of alternatives, for a body that differs across the supported
-    range of an upstream package.
-
-    Returns what each name resolved to, for `_bindings_intact` to recheck, or None when an entry
-    differs. A fusion has to recheck the bindings of the resolution that produced the callables it
-    captured, so these are returned rather than written into a list a later resolution would reuse.
-    """
+    """Resolve a {module: {dotted name: fingerprint}} contract: None pins the name not the body; a tuple gives
+    alternatives for a body differing across upstream versions; bindings are returned for _bindings_intact to
+    recheck, not kept in a list a later resolution reuses, or None if an entry differs."""
     holds, found = True, {}
     for module_name, names in contract.items():
         module = sys.modules.get(module_name)
@@ -106,8 +96,8 @@ def _resolved_bindings(contract):
             holder = _resolve_dotted(module, owner) if owner else module
             target = getattr(holder, name, None)
             target = _exact_route_native(target) or target
-            # The sparse-attention training wrapper outlives training and calls what it wraps outside it. A wrapper
-            # around it inherits the marker through functools.wraps, but its own __wrapped__ is not the marked one.
+            # The sparse-attention training wrapper outlives training and calls what it wraps outside it; a wrapper
+            # around it inherits the marker via functools.wraps, but its own __wrapped__ is not the marked one.
             marked = getattr(target, "_unsloth_sparse_attention_original", None)
             source = marked if marked is not None and getattr(target, "__wrapped__", None) is marked else target
             try:
@@ -135,8 +125,8 @@ def _resolved_bindings(contract):
 
 
 def _exact_route_native(function):
-    """The native a route marked `_unsloth_exact_route_of` runs unchanged, so a contract on that native holds.
-    functools.wraps copies the mark onto a wrapper around the route, whose own __wrapped__ gives it away."""
+    """The native a route marked _unsloth_exact_route_of runs unchanged, so a contract on it holds; functools.wraps
+    copies the mark onto a wrapper around the route, which its own __wrapped__ gives away."""
     native = getattr(function, "_unsloth_exact_route_of", None)
     return None if native is None or hasattr(function, "__wrapped__") else native
 
@@ -250,8 +240,8 @@ def _moe_gate_up_packable(module, projection_type):
             return False
     if gate.weight.ndim != 3 or gate.scales.ndim != 3:
         return False
-    # MLX reads a row-count remainder to pick the single-row gather matmul, so a pack whose
-    # doubled rows cross that boundary would take a different kernel than the pair it replaces.
+    # MLX picks the single-row gather matmul by a row-count remainder; doubled rows crossing that boundary would use a
+    # different kernel than the pair it replaces.
     if gate.weight.shape[1] % _MOE_PACK_ROW_MULTIPLE:
         return False
     return all(
@@ -332,8 +322,8 @@ def _fused_moe_gate_up_class(original_class, projection_type, scatter_unsort, de
 
         def fused_call(self, x, indices, *args, **kwargs):
             packed = self._unsloth_moe_gate_up
-            # Short sequences reach a separate upstream decode path, and routing weights, shared
-            # expert output and residuals are combined by one this body does not reimplement.
+            # Short sequences take a separate upstream decode path, and routing weights, shared-expert output and
+            # residuals are combined by an upstream body this one does not reimplement.
             if (self.training or not packed.matches(self) or not _bindings_intact(bindings)
                     or (x.ndim == 3 and 1 < x.shape[1] <= decode_block)
                     or any(extra is not None for extra in (*args, *kwargs.values()))):
@@ -373,8 +363,7 @@ def _fused_moe_gate_up_class(original_class, projection_type, scatter_unsort, de
 
 @contextmanager
 def _uncached_allocations():
-    """Free buffers to the driver: a pack replaces two arrays with one of their combined size,
-    which neither freed buffer can serve, so cached they only accumulate."""
+    """Free buffers to the driver: a pack replaces two arrays with one of their combined size, which neither freed buffer can serve, so caching only accumulates."""
     previous_limit = mx.set_cache_limit(0)
     try:
         yield
@@ -384,11 +373,8 @@ def _uncached_allocations():
 
 @contextmanager
 def fused_moe_gate_up(model, *, _modules = None):
-    """Fuse quantized MoE gate and up projections while their weights stay fixed.
-
-    Repacking at entry makes weight edits between scopes visible. Overlapping scopes
-    share packing until the last exit; training or custom projections retain native calls.
-    """
+    """Fuse quantized MoE gate/up projections while their weights stay fixed; repacks at entry so edits between scopes
+    show, overlapping scopes share packing until the last exit, and training or custom projections keep native calls."""
     patched = []
     try:
         with _MOE_GATE_UP_LOCK, _uncached_allocations():
@@ -513,9 +499,8 @@ _PURE_TEST_NODES = (ast.expr_context, ast.boolop, ast.unaryop, ast.cmpop,
 
 
 def _decode_conv_sites(outer):
-    """(concatenate index, branch chain index, tests ahead of the decode branch), or None.
-
-    The fused call decides at the concatenate, so those tests must be call-free and read nothing assigned after it."""
+    """Returns (concatenate index, branch chain index, tests ahead of the decode branch) or None; the fused call decides
+    at the concatenate, so those tests must be call-free and read nothing assigned after it."""
     body = outer.body
     starts = [i for i, statement in enumerate(body) if _source_expression(statement) == _CONCATENATE]
     if len(starts) != 1:
@@ -597,8 +582,8 @@ def _decode_conv_contract(base):
         return None
 
 
-# The single-token step below repeats each stock kernel's per-lane order and calls the elementwise functors
-# MLX's compiled kernels call, on the same typed temporaries, so every intermediate rounds where stock rounds.
+# Single-token step repeats each stock kernel's per-lane order and calls MLX's elementwise functors on the same typed
+# temporaries, so every intermediate rounds where stock does.
 _DECODE_STEP_SOURCE = """
     constexpr uint NT = 32 * TY;
     constexpr uint KEY = Hk * Dk;
@@ -715,8 +700,8 @@ _DECODE_STEP_SOURCE = """
         y[n * Dv + d] = static_cast<T>(Multiply()(silu, static_cast<float>(normed)));
     }
 """
-# Simdgroups per value head; each carries Dv / 16 state rows. Layers run one after another in a decode step, so
-# a few heads per row must fill the GPU: 16 measured up to 18% faster per layer than 8 at <= 64 heads.
+# Simdgroups per value head, each with Dv / 16 state rows; layers run one after another in a decode step, so a few heads
+# per row must fill the GPU, and 16 beats 8 at 64 heads or fewer.
 _DECODE_STEP_ROWS = 16
 
 
@@ -762,8 +747,8 @@ def _decode_step(conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, 
 
 # The `_normalize_qk` bodies the decode step mirrors, by the RMSNorm epsilon each uses for a head width.
 _NORMALIZE_QK_EPS = {"8f16e229aec08b7a": lambda width: 1e-6, "f23945a25dd3df5f": lambda width: 1e-6 / width}
-# Bodies the decode step mirrors. `gated_delta_kernel` is left out: the packed scope rebinds it, and its
-# single-token route is the generic kernel whose arithmetic `_make_gated_delta_kernel` pins.
+# Bodies the decode step mirrors; gated_delta_kernel is left out since the packed scope rebinds it, and its single-token
+# route is the generic kernel that _make_gated_delta_kernel pins.
 _DECODE_STEP_CONTRACT = {
     "mlx_vlm.models.qwen3_5.language": {
         "Qwen3_5GatedDeltaNet.__call__": "f8deff65c803d4da",
@@ -1025,8 +1010,8 @@ _GATED_DELTA_VERDICTS = {}
 
 @functools.cache
 def _packed_gated_delta_kernel():
-    # The layout and reduction order of mlx-lm's packed kernel (ml-explore/mlx-lm#1559): four lanes own
-    # a value row and hold 32 state elements each, and the sums follow the tree simd_sum lowers to.
+    # Layout and reduction order of mlx-lm's packed kernel (ml-explore/mlx-lm#1559): four lanes own a value row with 32
+    # state elements each; sums follow the tree simd_sum lowers to.
     try:
         if not mx.metal.is_available():
             return None
@@ -1174,11 +1159,9 @@ def _gated_delta_sources(modules):
 
 @contextmanager
 def fused_packed_gated_delta(model, *, _modules = None):
-    """Run multi-token gated-delta calls on a packed kernel, bit-identical to the generic one.
-
-    Each head layout and dtype is compared bit for bit on first use. `gated_delta_kernel` is rebound
-    process-wide while any scope is open. `UNSLOTH_MLX_PACKED_GATED_DELTA=0` turns the route off.
-    """
+    """Run multi-token gated-delta calls on a packed kernel, bit-identical to the generic one; each head layout and
+    dtype is compared on first use; gated_delta_kernel is rebound process-wide while any scope is open;
+    UNSLOTH_MLX_PACKED_GATED_DELTA=0 turns the route off."""
     entered = []
     try:
         with _GATED_DELTA_LOCK:
@@ -1403,12 +1386,9 @@ def _qwen4_prefill_class(base):
 
 @contextmanager
 def fused_qwen4_prefill(model, *, _modules = None):
-    """Run Qwen4-Exp prefill's hyper-connection reads (norm and stream mix) as fused kernels.
-
-    Calls of 32 or more token rows take kernels bit-identical to mlx-vlm, each layout and dtype compared on
-    its first use; decode, verify, training and any drifted mlx-vlm body keep the native calls. Eligibility is
-    settled when the scope opens. `UNSLOTH_MLX_QWEN4_PREFILL=0` turns the route off.
-    """
+    """Qwen4-Exp prefill hyper-connection reads as fused kernels for 32+ token rows, bit-identical to mlx-vlm and
+    checked per layout and dtype on first use; eligibility settled when the scope opens; decode, verify, training and
+    drifted mlx-vlm keep native; UNSLOTH_MLX_QWEN4_PREFILL=0 disables."""
     changed = []
     try:
         with _QWEN4_PREFILL_LOCK:
@@ -1702,14 +1682,9 @@ def _qwen4_decode_read(forward, module, x):
 
 @contextmanager
 def fused_qwen4_decode(model, *, _modules = None):
-    """Run Qwen4-Exp's single-token decode hyper-connection reads as two fused launches.
-
-    mlx-vlm's batch-invariant decode forward reads each hyper-connection through a norm, two quantized projections
-    and a stream mix; a one-row read of this model's modules takes kernels bit-identical to it, each layout,
-    quantization and dtype compared on its first use. Eligibility is settled when the scope opens: modules,
-    projections and mlx-vlm methods replaced while it is open are not rechecked. Verify blocks, training and a
-    drifted mlx-vlm keep the native read. `UNSLOTH_MLX_QWEN4_DECODE=0` turns the route off.
-    """
+    """Qwen4-Exp single-token decode hyper-connection reads as two fused launches, bit-identical to mlx-vlm (each
+    layout, quantization and dtype checked on first use); eligibility is fixed at scope open; verify, training and
+    drifted mlx-vlm keep native; UNSLOTH_MLX_QWEN4_DECODE=0 disables."""
     changed, forward = [], None
     try:
         with _QWEN4_DECODE_LOCK:
@@ -1963,8 +1938,8 @@ def _scalar(value):
     return mx.array(value, mx.int32)
 
 
-# MLX's rms_norm reads N_READS values per thread, and rows wider than RMS_LOOPED_LIMIT take its
-# looped kernel with a full 1024-thread group; the add-then-norm kernels partition rows the same way.
+# MLX's rms_norm reads N_READS values per thread, and rows wider than RMS_LOOPED_LIMIT take its looped kernel with a
+# full 1024-thread group; add-then-norm kernels partition rows the same way.
 _NORM_READS = 4
 _NORM_LOOPED_LIMIT = 4096
 _NORM_LOOPED_GROUP = 1024
@@ -2232,8 +2207,8 @@ def _fused_add_rms_norm(x, r, w, eps):
 class _Handoff:
     """The residual a decoder layer returns, already normalized by the next layer's input norm."""
 
-    # One (residual, normed, weight, eps) tuple, swapped whole: overlapping generate calls share the
-    # slot, and a field-by-field read could pair one call's residual with another's normed output.
+    # Holds one (residual, normed, weight, eps) tuple swapped whole, since overlapping generate calls share the slot and
+    # a field-by-field read could pair one call's residual with another call's normed output.
     __slots__ = ("consumer", "value")
 
     def __init__(self, consumer):
@@ -2320,8 +2295,8 @@ def _prenorm_class(base):
     if not (isinstance(first.value, ast.BinOp) and isinstance(first.value.op, ast.Add)
             and isinstance(first.value.left, ast.Name) and isinstance(first.value.right, ast.Name)):
         return None
-    # The norm moves up to the addition, so it must be the first call of the plain statement right
-    # after it (nothing there binds a name): every other call there encloses it.
+    # The norm moves up to the addition, so it must be the first call in the plain statement right after it, which binds
+    # no name; every other call there encloses it.
     norms = [node for s in body[adds[0] + 1:] for node in ast.walk(s) if _is_self_call(node, h)]
     nodes = list(ast.walk(body[adds[0] + 1]))
     calls = [node for node in nodes if isinstance(node, ast.Call)]
@@ -2412,10 +2387,9 @@ def fused_residual_norm(model, *, _modules = None):
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and _residual_norm_kernel() is not None:
                 for _, module in _fusion_modules(model, _modules):
                     base = type(module)
-                    # Type first, for the reason fused_decode_conv_silu gives: generation enters
-                    # this scope for whatever named_modules() yields, including plain stand-ins
-                    # that need not carry `training`, and reading it before the check raises out
-                    # of generation instead of skipping an ineligible entry.
+                    # Type is checked before training, as in fused_decode_conv_silu: named_modules() can yield stand-ins
+                    # without training, and reading it first would raise out of generation instead of skipping the
+                    # entry.
                     if not isinstance(module, dict) or module.training:
                         continue
                     if hasattr(base, "_unsloth_residual_norm_base"):
@@ -2494,9 +2468,9 @@ def fused_residual_norm_handoff(model, *, _modules = None):
 
 _QWEN_ROUTING, _GEMMA_ROUTING = 0, 1  # kernel MODE
 
-# The kernel emulates the chain's rounding: softmax partials and reciprocal, stable tie order,
-# sequential bf16 sum of the top-k scores. `_moe_router_verified` checks that at first use.
-# unary_ops.h's Sigmoid, as mx.sigmoid evaluates the shared-expert gate.
+# Kernel emulates the chain's rounding (softmax partials and reciprocal, stable tie order, sequential bf16 sum of the
+# top-k scores), checked by _moe_router_verified at first use; the sigmoid copies unary_ops.h's Sigmoid, as mx.sigmoid
+# evaluates the shared-expert gate.
 _MOE_ROUTER_SIGMOID = """
     template <typename T>
     METAL_FUNC T unsloth_sigmoid(T x) {
@@ -2506,8 +2480,8 @@ _MOE_ROUTER_SIGMOID = """
 """
 
 
-# MLX's block softmax adds per-simdgroup totals with one simd_sum over lanes; past two
-# simdgroups (256 experts) that differs from adding them in turn, so wide routing has its own source.
+# MLX's block softmax adds per-simdgroup totals with one simd_sum over lanes; past two simdgroups (256 experts) that
+# differs from adding them in turn, so wide routing has its own source.
 _MOE_ROUTER_GROUP_TOTAL = "total += simd_sum(partial);"
 _MOE_ROUTER_WIDE_GROUP_TOTAL = """
                         const float group = simd_sum(partial);
@@ -2747,8 +2721,8 @@ def _drifted_call(self, native):
     return current
 
 
-# Bitwise copies of MLX's unsorted one-row gather (qmv_fast / fp_qmv_fast), compiled SwiGLU and the block's
-# combine. Headers are trimmed from the installed MLX since `metal_kernel` hashes its whole source per launch.
+# Bitwise copies of MLX's unsorted one-row gather (qmv_fast / fp_qmv_fast), compiled SwiGLU and the block's combine;
+# headers are trimmed from installed MLX since metal_kernel hashes its whole source per launch.
 _INCLUDE = re.compile(r'#include "([^"]+)"')
 # (header, first declaration kept, first declaration dropped); None is the header's start or end.
 _SIGMOID = ("unary_ops.h", "Sigmoid", "Sign")
@@ -3251,8 +3225,7 @@ def _trailing(a, dtype, rows, cols):
 
 
 def _one_row_kernel(mode, group_size, bits, dtype, k, n, w, scales, biases):
-    """MLX's one-row gather kernel for (K, N) with these weights: 1 for qmv_fast / fp_qmv_fast, 0 for the affine
-    qmv, -1 for one the routed kernels do not reproduce."""
+    """MLX one-row gather kernel for (K, N) with these weights: 1 for qmv_fast / fp_qmv_fast, 0 for the affine qmv, -1 for one the routed kernels do not reproduce."""
     affine = mode == "affine"
     known = (
         (affine and 2 <= bits <= 8 and bits != 7 and group_size in (32, 64, 128))
@@ -3398,18 +3371,15 @@ def _run(launch, weights, activations):
 
 
 def _routed_gate_up(x, inds, gate, up, group_size, bits, mode):
-    """SwiGLU(gate, up) of experts `inds` (..., top_k) on x (..., K): (..., top_k, N), or None.
-
-    `gate` and `up` are a projection's (weight, scales[, biases]) shaped (E, N, ...), read with their
-    own expert stride, so row-slice views of a packed weight serve as they are.
-    """
+    """SwiGLU(gate, up) of experts inds (..., top_k) on x (..., K) giving (..., top_k, N), or None; gate and up are a
+    projection's (weight, scales[, biases]) shaped (E, N, ...), read with their own expert stride, so row-slice views
+    serve as they are."""
     launch = _gate_up_plan(_key(x), _key(inds), tuple(map(_key, gate)), tuple(map(_key, up)), group_size, bits, mode)
     return _run(launch, [*gate, *up], [x, inds])
 
 
 def _routed_down(x, inds, scores, shared, s, w, group_size, bits, mode):
-    """`(y * scores[..., None]).sum(-2) + shared * s` for y the down projections of x (..., top_k, K)
-    by experts `inds`, or None."""
+    """(y * scores[..., None]).sum(-2) + shared * s for y the down projections of x (..., top_k, K) by experts inds, or None."""
     launch = _down_plan(*map(_key, (x, inds, scores, shared, s)), tuple(map(_key, w)), group_size, bits, mode)
     return _run(launch, list(w), [x, inds, scores, shared, s])
 
@@ -3541,8 +3511,8 @@ def _moe_routed_experts(block):
     return _RoutedExperts(mlp, base, projection_type, native.SwiGLU, decode_block, bindings + routed_bindings)
 
 
-# MLX multiplies and sums in the array dtype, in route order; the kernel rounds at the same two places.
-# Single precision is left native: its sum does not round like a sequential one.
+# MLX multiplies and sums in the array dtype in route order, and the kernel rounds at the same two places; single
+# precision stays native, as its sum does not round like a sequential one.
 _MOE_COMBINE_DTYPES = (mx.bfloat16, mx.float16)
 _MOE_COMBINE_MAX_ELEMENTS = 1 << 32
 _MOE_COMBINE_SOURCE = """
@@ -3610,8 +3580,8 @@ def _fused_moe_combine(switch_mlp, x, inds, scores):
 
 
 def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
-    # 0.7.1 scales the shared expert by `_shared_expert_scale`, earlier bodies gate it
-    # by a sigmoid. mlx_lm honours `norm_topk_prob`; mlx_vlm always normalizes.
+    # 0.7.1 scales the shared expert by _shared_expert_scale, while earlier bodies gate it by a sigmoid; mlx_lm honours
+    # norm_topk_prob, but mlx_vlm always normalizes.
     def fused_call(self, x, target_verify = False):
         drifted = _drifted_call(self, native)
         if drifted is not None:
@@ -3680,9 +3650,9 @@ def _gemma4_router_call(native):
 
 # Routing bodies the fused calls reimplement: builder, kernel mode, expert-count and top-k attributes.
 _MOE_ROUTER_BODIES = {
-    # mlx_vlm qwen3_5_moe: 0.4.4-0.5.0 and 0.6.16-0.7.0; 0.6.0-0.6.15 takes a target-verify
-    # argument; 0.7.1 scales the shared expert. qwen4_exp reuses the block, subclassing it in 0.7.1.
-    # mlx_vlm 0.7.5 adds stop_gradient on the indices below; 0.7.8 qwen3_5_moe honours norm_topk_prob.
+    # mlx_vlm qwen3_5_moe body applies to 0.4.4-0.5.0 and 0.6.16-0.7.0; 0.6.0-0.6.15 takes a target-verify argument;
+    # 0.7.1 scales the shared expert; qwen4_exp reuses the block, subclassing it in 0.7.1; 0.7.5 adds stop_gradient on
+    # the indices; 0.7.8 honours norm_topk_prob.
     "903a5a99afcad95a": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
     "0ca80e0451802015": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
     "b948b94a9d18333f": (functools.partial(_qwen3_5_moe_call, scaled_shared = True, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
@@ -3715,10 +3685,9 @@ def _moe_router_class(base):
     return patched, mode, experts_path, top_k_path
 
 
-# `generation_mode` serializes, but the loader's two generate() wrappers enter this scope directly
-# and do not, and this is the only one of the four carrying a per-module count: unlocked,
-# `count += 1` against a `finally` that pops the same key strands the patched class or raises
-# AttributeError out of generation (5 of 40 contended rounds).
+# generation_mode serializes calls, but the loader's two generate() wrappers enter this scope directly without it; this
+# is the only one of four scopes with a per-module count, so unlocked count += 1 against a finally that pops the same
+# key strands the patched class or raises AttributeError.
 _MOE_ROUTER_LOCK = RLock()
 
 @contextmanager
@@ -3785,15 +3754,9 @@ def fused_moe_router(model, *, _modules = None):
 
 @contextmanager
 def fused_moe_routed_experts(model, *, _modules = None):
-    """Run Qwen sparse MoE blocks' routed experts on two decode kernels during serialized inference.
-
-    Gate/up with SwiGLU, and down with the routing-weight combine and shared-expert add, serve
-    calls whose routes MLX gathers unsorted, each checked bitwise against the native experts at
-    first use; where they serve a call, the routing launch also writes the shared-expert gate's
-    sigmoid. The kernels run from `fused_moe_router`'s fused call and from `exact_speculative_verify`'s
-    verify blocks, so without either scope the blocks stay native. Training and distributed models keep the native experts, and so does
-    every model while UNSLOTH_MLX_ROUTED_EXPERTS=0.
-    """
+    """Qwen MoE routed experts on two decode kernels for MLX unsorted-gather calls (gate/up SwiGLU, down with combine),
+    checked bitwise at first use, within fused_moe_router or exact_speculative_verify scopes; training, distributed
+    and UNSLOTH_MLX_ROUTED_EXPERTS=0 keep native experts."""
     changed = []
     try:
         with _MOE_ROUTER_LOCK:
@@ -3872,10 +3835,8 @@ def _small_row_route():
 
 
 def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
-    """Compare the kernel with stock's fp32 qmv of each row, within fp32 reordering of K products.
-
-    A batched native call is no reference: its qmm rounds dequantized weights to the input dtype.
-    """
+    """Compares the kernel with stock's fp32 qmv of each row within fp32 reordering of K products; a batched native call
+    is no reference since its qmm rounds dequantized weights to the input dtype."""
     x32 = x.astype(mx.float32)
     scales32, biases32 = scales.astype(mx.float32), biases.astype(mx.float32)
     row = lambda i, a, s, b: mx.quantized_matmul(a[i:i + 1], w, s, b, transpose = True,
@@ -3917,8 +3878,7 @@ def _nax_small_m_qmm(module, x, bindings):
             or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32)
             or scales.shape != (N, K // group_size) or biases.shape != scales.shape):
         return None
-    # Every kernel variant a call can select is checked on its own first use; a ragged row count
-    # selects the bounds-checked one.
+    # Each kernel variant a call can select is checked on its own first use; a ragged row count selects the bounds-checked one.
     geometry = route.call("_geometry", M, N, K, group_size)
     key = (N, K, bits, group_size, x.dtype, geometry, M % geometry[0] == 0)
     verified = _NAX_QMM_VERIFIED.get(key)
@@ -3957,8 +3917,7 @@ def _nax_qmm_eligible(supported, K, dtype, w, scales, biases, group_size, bits, 
 
 
 def _nax_int8_qmm_matches_native(x, w, scales, biases, group_size, bits, routed, indices):
-    """Whether rows spread over the call quantize to x within half a code step and the kernel matches
-    stock's fp32 product of those rounded rows."""
+    """Whether rows spread over the call quantize to x within half a code step, and the kernel matches stock's fp32 product of those rounded rows."""
     M, K = x.shape
     rows = mx.array(sorted({round(i * (M - 1) / 31) for i in range(32)}))
     codes, step, *_ = nax._int8_quantize_activations(x[rows], group_size, bits)
@@ -4049,9 +4008,9 @@ def _nax_gather_rows(owner, flag, x, w, indices, sorted_indices, bindings, token
 
 def _nax_int8_prefill_gather(owner, x, w, scales, biases, indices, sorted_indices, group_size, bits, mode, bindings,
                      token_rows = None):
-    """The gathered int8 kernel's result for x of shape [T, 1, K] sorted by expert, or None for the
-    native call. `owner` enabled the route; `w` may pack several projections. With `token_rows`, x
-    holds one row per token and sorted row i is `x[token_rows[i]]`."""
+    """Gathered int8 kernel result for x shaped [T, 1, K] sorted by expert, or None for the native call; owner enabled
+    the route; w may pack several projections; with token_rows, x holds one row per token and sorted row i is
+    x[token_rows[i]]."""
     T = _nax_gather_rows(owner, "_unsloth_nax_int8_prefill", x, w, indices, sorted_indices, bindings, token_rows)
     if not T or not _nax_qmm_eligible(nax.int8_qmm_supported, x.shape[-1], x.dtype, w, scales, biases, group_size,
                                       bits, mode):
@@ -4109,8 +4068,8 @@ def _nax_sorted_gather_route(module):
         biases, module.group_size, module.bits, module.mode)
 
 
-# Keyed by the current methods: a transient wrapper, such as the training patches', misses only
-# while it is installed. Fallbacks read the base method at call time so a later one is honored.
+# Keyed by the current methods, so a transient wrapper such as the training patches misses the cache only while
+# installed; fallbacks read the base method at call time, so a later one is honored.
 @functools.cache
 def _nax_qmm_classes(route, *cache_key):
     bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
@@ -4218,8 +4177,7 @@ def _nax_int8_prefill_packed(model):
 
 
 def _nax_int8_prefill_route(module, classes, switches, packed):
-    """The fewest rows at which a quantized linear takes the int8 route, True for a routed-expert
-    projection whose calls it can take (their rows are checked per call), or 0."""
+    """Fewest rows at which a quantized linear takes the int8 route, True for a routed-expert projection whose calls it can take (rows checked per call), or 0."""
     base = _native_type(module)
     dense = base is nn.QuantizedLinear and base in classes
     if not (dense or base in switches):
@@ -4250,13 +4208,9 @@ class Int8PrefillStatus(NamedTuple):
 
 
 def int8_prefill_available(model):
-    """Whether `int8_prefill=True` can route any of `model`'s projections to int8 activations
-    when it generates here through `generation_mode`.
-
-    Checks the device, the model's quantization and shapes, then, once per macOS build and MLX
-    version, that the kernels build. It ignores the flag, `UNSLOTH_MLX_INT8_PREFILL` and training
-    mode, and leaves the model unchanged.
-    """
+    """Whether int8_prefill=True can route any projection to int8 activations when generating through generation_mode;
+    checks device, quantization, shapes, then kernel builds once per macOS build and MLX version; ignores the flag,
+    UNSLOTH_MLX_INT8_PREFILL and training mode; leaves the model unchanged."""
     if not nax.nax_available():
         return Int8PrefillStatus(False, "nax_unavailable", 0)
     if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
@@ -4439,8 +4393,8 @@ _DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "
 _DENSE_QMM_LOCK = RLock()
 _DENSE_QMM_VERIFIED = {}
 _DENSE_QMM_MIN_ROWS = 1024
-# MLX's quantized and dense matmuls each split the sum over K for small outputs, by different rules,
-# and then round differently; at or below this many 16x16 output tiles the comparison would mostly fail.
+# MLX's quantized and dense matmuls split the sum over K for small outputs by different rules and round differently; at
+# or below this many 16x16 output tiles the comparison would mostly fail.
 _DENSE_QMM_MIN_TILES = 4096
 # The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
 _DENSE_QMM_MAX_WEIGHTS = 1 << 28
@@ -4448,15 +4402,15 @@ _DENSE_QMM_DISPATCH_MLX = ("0.32.3", "0.32.4")  # 0.32.4's thin NAX case needs N
 
 
 def _dense_qmm_rows(M, N, K):
-    """MLX 0.32.3/0.32.4's row-count decisions past the tile floor (dense steel_matmul_axpby split K, tiles,
-    K blocks, row alignment; qmm reads rows only in bounds checks): one comparison per distinct tuple."""
+    """MLX 0.32.3/0.32.4 row-count decisions past the tile floor (dense steel_matmul_axpby split K, tiles, K blocks, row
+    alignment); qmm reads rows only in bounds checks, so one comparison per distinct tuple."""
     widest = max(M, N)
     return (K >= 3 * widest, M <= 2048 and N <= 2048, K >= 8192 and K > M + N, N > M, M * N >= 1 << 20,
             2 * widest > K, next((rows for rows in (128, 64, 32) if M % rows == 0), 0))
 
 
-# Stock's transposed affine qmm (`qmm_t_impl`) at a 64x32x64 tile instead of 32x32x32: every output element
-# still sums its 32-wide K steps in the same order, so it reproduces stock's plain qmm bit for bit.
+# Stock's transposed affine qmm (qmm_t_impl) at a 64x32x64 tile instead of 32x32x32; every output still sums its 32-wide
+# K steps in the same order, so it matches plain qmm bit for bit.
 _TILED_QMM_BITS = (2, 3, 4, 5, 6, 8)
 _TILED_QMM_GROUP_SIZES = (32, 64, 128)
 _TILED_QMM_TILE = {"BM": 64, "BK": 32, "BN": 64}
@@ -4516,10 +4470,9 @@ _QMM_SPLITK_THREADGROUPS = 512
 
 
 def _tile_shape_loses(M, N):
-    """Whether the tile pads more rows than stock's 32-row tiles, or its grid has fewer threadgroups than stock's
-    split-K aims for: a quarter of stock's grid leaves the GPU idle between a layer's dependent calls.
-
-    Otherwise stock runs plain qmm: its grid is four times the tile's, and 33+ rows are past its qmv limit."""
+    """True when the tile pads more rows than stock's 32-row tiles, or has fewer threadgroups than stock's split-K aims
+    for (a quarter of stock's grid idles the GPU between dependent calls); otherwise stock runs plain qmm, with a
+    grid four times the tile's and 33+ rows past its qmv limit."""
     BM, BN = _TILED_QMM_TILE["BM"], _TILED_QMM_TILE["BN"]
     return -(-M // BM) * BM > -(-M // 32) * 32 or (N // BN) * -(-M // BM) < _QMM_SPLITK_THREADGROUPS
 
@@ -4579,13 +4532,9 @@ def _tiled_prefill_enabled():
 
 
 def _dense_prefill_qmm(module, x, bindings):
-    """`x` times the dequantized weight for a prefill-sized call, or None when it takes the native call.
-
-    MLX's quantized matmul dequantizes inside every tile; dequantizing once is the same arithmetic.
-    Compared bit for bit on first use per (`_dense_qmm_rows`, shape, quantization, dtypes). Another MLX or a
-    one-column output (matvec, kernel picked per row count) would need a check per prompt length: native.
-    Calls it declines go to the tiled route when that is on, exact by construction and not compared.
-    """
+    """Prefill calls get x times the dequantized weight, or None for native; checked bit-identical on first use per
+    _dense_qmm_rows, shape, quantization and dtypes; other MLX versions and one-column outputs stay native (needs a
+    per-prompt-length check); declines go to tiled route if enabled."""
     if mx.__version__ not in _DENSE_QMM_DISPATCH_MLX:
         return None
     if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
@@ -4671,19 +4620,9 @@ def _dense_qmm_class(*cache_key):
 
 @contextmanager
 def dense_prefill_linear(model, *, _modules = None):
-    """Run prefill-sized quantized projections as one dequantize and a dense matmul.
-
-    Calls of 1024 or more rows on a large enough output dequantize the weight once and multiply
-    densely, bit-identical to the quantized matmul; smaller calls,
-    training, and any shape that fails its first-use comparison keep the native call. A linear the
-    NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
-    `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
-
-    Where stock MLX runs no NAX kernels, affine calls this route leaves to stock's plain quantized matmul
-    run that kernel at a 64x32x64 tile instead. It sums K in stock's order, so it is bit-identical by
-    construction (checked once per MLX version by a probe, not per shape); `UNSLOTH_MLX_TILED_PREFILL=0`
-    turns that off.
-    """
+    """Prefill 1024+ rows, large outputs: one dequantize, dense matmul, bit-identical to qmm after a first-use check per
+    shape; small, training and failing calls stay native (UNSLOTH_MLX_DENSE_PREFILL=0 off); no NAX: stock qmm as
+    64x32x64 tiles, probed per MLX version (UNSLOTH_MLX_TILED_PREFILL=0 off)."""
     changed = []
     try:
         with _DENSE_QMM_LOCK:
@@ -4726,8 +4665,8 @@ def dense_prefill_linear(model, *, _modules = None):
                     module.__dict__.pop("_unsloth_tiled_qmm", None)
 
 
-# The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
-# 0.7.1 added the verifier's `verify` entry; earlier releases miss it and stay native.
+# Pinned mlx-vlm bodies the verify scope wraps, and the projection kernels its slices follow; 0.7.1 added the verifier's
+# `verify` entry, so earlier releases miss it and stay native.
 _EXACT_VERIFY_CONTRACT = {
     "mlx_vlm.models.qwen3_5.speculative_verifier": {
         "Qwen3_5BatchInvariantForward.verify": "14bdd46f35e8adfa",
@@ -4752,8 +4691,7 @@ _EXACT_VERIFY_CONTRACT = {
         "supports_optimized_affine_head": "b0611c0de3000a20",
     },
 }
-# qwen4_exp runs its decode steps as well as its verify blocks on one batch-invariant forward, entered at
-# `__call__`, whose `_model` already submits each layer. It inherits the Qwen3.5 bodies pinned above.
+# qwen4_exp decodes and verifies on one batch-invariant forward entered at `__call__`, whose `_model` submits each layer; it inherits the pinned Qwen3.5 bodies.
 _QWEN4_FORWARD_CONTRACT = {
     "mlx_vlm.models.qwen4_exp.language": {
         "Qwen4ExpBatchInvariantForward.__call__": "d7a813b4f944d125",
@@ -4819,8 +4757,8 @@ def _verify_sliced(project, linears, x, eligible):
     return _verify_admitted(key, lambda: project(x), sliced)
 
 
-# A taped verify block writes only each recurrent layer's final state, and its commit replays the retained
-# prefix with the same kernel, where stock writes the state after every step and commits one of them.
+# A taped verify block writes only each recurrent layer's final state and its commit replays the retained prefix with
+# the same kernel; stock writes every step's state and commits one.
 _VERIFY_TAPE_CONTRACT = {
     "mlx_vlm.models.qwen3_5.speculative_verifier": {"Qwen3_5BatchInvariantForward._gated_delta": "a2958b13863bfa3f"},
     "mlx_vlm.models.qwen3_5.gated_delta": {"gated_delta_update": "dc29a058a40f2dce",
@@ -4862,8 +4800,7 @@ def _taped_update(native, with_states):
     def gated_delta_update(q, k, v, a, b, A_log, dt_bias, state = None, mask = None, use_kernel = True,
                            state_steps = None, cache = None, cache_index = 1):
         tapes, length = getattr(_VERIFY_STATE, "tapes", None), q.shape[1]
-        # A two-step block's replay costs about what its one per-step state did, and stock commits an entry
-        # state of another batch size for rows retaining nothing.
+        # A two-step block's replay costs about what its one per-step state did; stock commits an entry state of another batch size for rows retaining nothing.
         if (tapes is None or cache is None or state is not None or state_steps is not None or length < 3
                 or getattr(cache, "history_capacity", 0) != length
                 or getattr(cache[cache_index], "shape", q.shape)[0] != q.shape[0]):
@@ -4921,8 +4858,8 @@ def _taped_transaction_class(base):
     return type(f"_Taped{base.__name__}", (base,), {"commit": commit, "abort": abort})
 
 
-# A verify block's convolution through gated norm in one launch per head, the decode step's arithmetic per row:
-# every row's taps, SiLU, q/k norms and gates, then the recurrence over the rows, then every row's gated norm.
+# One launch per head runs a verify block's convolution through gated norm with the decode step's per-row arithmetic:
+# taps, SiLU, q/k norms, gates, recurrence, then gated norm.
 _VERIFY_GDN_SOURCE = """
     constexpr uint NT = 32 * TY;
     constexpr uint KEY = Hk * Dk;
@@ -5120,8 +5057,8 @@ def _verify_gdn_fits(layer, inputs, mask, cache):
 
 
 def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
-    """The verifier's `_gated_delta` for a block `_verify_gdn_fits` took, its convolution through gated norm fused
-    once a first block matched the stock ops bit for bit; the commit replays the kernel's q/k/v like a taped block's."""
+    """The verifier's _gated_delta, and its conv through gated norm, fused for a block _verify_gdn_fits takes once a
+    first block matched the stock ops bit for bit; the commit replays the kernel's q/k/v like a taped block's."""
     batch, length, _ = inputs.shape
     K, Dv, Hk = layer.conv_kernel_size, layer.head_v_dim, layer.num_k_heads
     mixed_qkv, z, b, a = self._linears((layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a), inputs)
@@ -5179,9 +5116,9 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
         cache.advance(length)
         self._helpers()._qwen3_5_advance_lengths_info(cache, length)
     return self._linear(layer.out_proj, output.reshape(batch, length, -1))
-# MLX 0.32.3's sdpa_vector_2pass_1 and _2 over a causal block of rows, each row's arithmetic and
-# order the one-row call's: key i goes to block i % BLOCKS, and a row skips the keys past its own.
-# Each simdgroup carries two rows, so a K/V load serves both; the row pairs of a threadgroup share it through L1.
+# MLX 0.32.3's sdpa_vector_2pass_1 and _2 over a causal block: each row keeps the one-row call's arithmetic and order
+# (key i to block i % BLOCKS, skipping keys past its own); each simdgroup's two rows share a K/V load, and row pairs in
+# a threadgroup share it through L1.
 _EXACT_ATTENTION_ROWS = """
     constexpr int qk = D / 32;
     const int h = threadgroup_position_in_grid.x;
@@ -5299,13 +5236,13 @@ _EXACT_ATTENTION_MIN_KEYS = 8192
 # Per timing key: True once the kernel timed faster, else [timings, calls left before retiming], as short of memory the kernel can run slow for a while.
 _EXACT_ATTENTION_TIMED = {}
 _EXACT_ATTENTION_TIMINGS, _EXACT_ATTENTION_RETRY = 3, 128
-# Per (dtype, query heads per KV head): the rows kernel's threadgroup limit on this device, once a launch was refused
-# (640 on M1-class GPUs). Row pairs per threadgroup only share loads through L1, so fewer leave every row's bits as they are.
+# Per (dtype, query heads per KV head): the rows kernel's threadgroup limit once a launch was refused (640 on M1-class
+# GPUs); row pairs share loads only via L1, so fewer pairs per threadgroup leave every row's bits unchanged.
 _EXACT_ATTENTION_THREADS = {}
 
 
-# Seconds per `matmul.qmv_rows` launch by (rows, inputs prepared), per (dtype, group size, bits), measured on the device:
-# the fastest launch width depends on the GPU and not monotonically on the rows (a wider launch can spill registers).
+# Seconds per `matmul.qmv_rows` launch by (rows, inputs prepared), per (dtype, group size, bits), measured on the
+# device; the fastest width varies by GPU and not monotonically with rows (wider can spill registers).
 _QMV_ROWS_COSTS = {}
 # Per (dtype, group size, bits, weight shape): whether every kind of `matmul.qmv_rows` gave each row its one-row stock bits.
 _QMV_ROWS_LAYOUTS = {}
@@ -5319,11 +5256,11 @@ def _stock_linear_pinned(linear):
 
 
 def _qmv_rows_kernel(p):
-    """The (dtype, group size, bits) `matmul.qmv_rows` runs an affine projection's verify rows with, or None. Settled once
-    per quantized weight, at load or on its first block: built, timed, and checked on random rows."""
+    """Returns the (dtype, group size, bits) matmul.qmv_rows runs an affine projection's verify rows with, or None;
+    settled once per quantized weight at load or first block, checked on random rows."""
     arrays, settled = (p.get("weight"), p.get("scales"), p.get("biases")), p.__dict__.get("_unsloth_qmv_rows")
-    # The kernel bypasses the layer's call, so it must be one whose one-row result is the stock one; zoo's own
-    # wrappers count as stock, so a projection settled at load keeps its verdict when generation installs them.
+    # The kernel bypasses the layer's call, so that call must be one whose one-row result is stock's; zoo's own wrappers
+    # count as stock, so a load-time verdict survives generation installing them.
     call, linear = type(p).__call__, nn.QuantizedLinear.__call__
     stock = isinstance(p, nn.QuantizedLinear) and (call is linear or call in _ONE_ROW_STOCK_CALLS)
     quantized = (stock, linear, *(getattr(p, name, None) for name in ("group_size", "bits", "mode")))
@@ -5675,38 +5612,18 @@ def _exact_forwards(model, forwards, modules):
 
 @contextmanager
 def exact_speculative_verify(model, *, _modules = None):
-    """Speed up mlx-vlm's exact speculative verifier for Qwen3.5 language models during serialized inference.
-
-    Each layer of a verify block is submitted for evaluation as it is built, so the GPU runs while the host builds on.
-    A verify block wider than the eight rows mlx-vlm's fused verify kernels serve runs each frozen
-    quantized projection over balanced row slices, once its first block of that shape matched the
-    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition, and
-    over a long KV cache a block wider than two rows reads each full-attention layer's keys and values once per
-    pair of rows instead of once per row, where that measured faster on this device. A block's gated-delta layers
-    write only their final state, and the commit replays each layer over the retained prefix with the same kernel
-    instead of keeping every step's state, once replays of a key's first block matched every per-step state bit
-    for bit. 4-, 5-, 6- and 8-bit affine projections run every row of a block in one call per eight rows, each row
-    with its one-row decode arithmetic, on the same condition; `UNSLOTH_MLX_VERIFY_QMV_ROWS=0` keeps them native.
-    Only verify calls of the
-    language models found here are served; other, training and distributed models, and an mlx-vlm whose verifier
-    drifted, keep the native methods.
-    """
+    """Qwen3.5 verifier fast paths (row slices on blocks over 8 rows, decode-kernel routed experts, gated-delta replays)
+    after a bit-exact first block; only calls of found language models; drifted mlx-vlm, training, distributed stay
+    native; UNSLOTH_MLX_VERIFY_QMV_ROWS=0 keeps 4/5/6/8-bit native."""
     with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
         yield model
 
 
 @contextmanager
 def exact_batch_invariant_decode(model, *, _modules = None):
-    """Speed up the batch-invariant forward qwen4_exp runs its one-token decode steps and its speculative verify blocks
-    on, during serialized inference.
-
-    As `exact_speculative_verify` does for the Qwen3.5 verifier, frozen quantized projections in blocks wider than
-    eight rows run over balanced row slices and sparse blocks' routed experts run on the decode kernels, each once its
-    first call of that shape matched the native call bit for bit; affine projections of multi-row blocks run their
-    rows together as there. The forward already submits each layer. Only calls
-    of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
-    forward drifted, keep the native methods.
-    """
+    """qwen4_exp batch-invariant forward for one-token decode and speculative verify: row slices on blocks wider than 8
+    rows, decode-kernel routed experts, each after a bit-exact first call; only calls of found language models;
+    drifted mlx-vlm, training, distributed stay native."""
     with _exact_forwards(model, (_QWEN4_FORWARD,), _modules):
         yield model
 
@@ -5738,8 +5655,8 @@ def _dynamic_convolve(group_size):
 
 
 def _top_candidates(logits, k):
-    # Metal's argpartition sorts the whole vocabulary; each chunk's top k, then theirs, select the same entries in the
-    # same order, as its sort is stable. A vocabulary no chunk divides keeps the one call, which padding could change.
+    # Metal's argpartition sorts the whole vocabulary; per-chunk top-k then a merge picks the same entries in the same
+    # order since its sort is stable; a vocab no chunk divides keeps one call, as padding could change results.
     chunk = next((c for c in (512, 256) if logits.shape[-1] % c == 0 and logits.shape[-1] > 2 * c and k <= c), None)
     if chunk is None:
         return mx.argpartition(logits, -k, axis = -1)[..., -k:]
@@ -5753,8 +5670,8 @@ def _top_candidates(logits, k):
 
 @mx.compile
 def _candidate_walk(predecessors, hidden, successors, unary, candidates):
-    # Every edge from each candidate at a position to each at the next, then the greedy walk over those tables:
-    # each edge is `CandidateSelector.select`'s own bf16 product and sum.
+    # Builds every edge from each candidate at a position to each at the next, then walks the greedy path; each edge is
+    # CandidateSelector.select's own bf16 product and sum.
     edges = mx.sum((predecessors * hidden[:, :, None])[:, :, :, None] * successors[:, :, None], axis = -1)
     scores = unary[:, :, None] + edges
     choice, path = mx.zeros((candidates.shape[0],), mx.int32), []
@@ -5801,8 +5718,8 @@ def _fused_dflash2_class(base):
 
 
 def fused_drafter_ops(model) -> int:
-    """Run a DFlash2 drafter's grouped dynamic convolutions and greedy candidate selection in a few kernels instead of
-    hundreds; returns how many modules now do. Each produces the drafts mlx-vlm's methods do, bit for bit."""
+    """Runs a DFlash2 drafter's grouped dynamic convolutions and greedy candidate selection in a few kernels,
+    bit-identical to mlx-vlm's methods; returns how many modules now do."""
     module = sys.modules.get(_DFLASH2)
     bindings = _resolved_bindings(_DFLASH2_CONTRACT) if module is not None else None
     if bindings is None:
@@ -6014,8 +5931,8 @@ def _vector_attention(queries, keys, values, scale, blocks):
 
 
 def _decode_attention(queries, keys, values, scale):
-    """Each row as a decode step attends it; at head dim 512 MLX puts a lone query on its vector kernel for
-    GQA 8 only, so GQA-4 heads are paired up first and that row is MLX's vector kernel rather than decode."""
+    """Each row is attended as a decode step would; at head dim 512 MLX's lone-query vector kernel is used only at GQA
+    8, so GQA-4 heads are paired up first and that row runs on the vector kernel."""
     _, heads, rows, dim = queries.shape
     kv_heads = keys.shape[1]
     repeat = 8 // (heads // kv_heads)
@@ -6029,10 +5946,9 @@ def _decode_attention(queries, keys, values, scale):
     return mx.concatenate(outs, axis = 2)
 
 
-# Query heads per KV head served by default: at 8 (E2B, 26B-A4B, 31B) MLX decodes a lone query on the same
-# vector kernel, so each verify row is the attention a decode step computes. At 4 (E4B) decode stays unfused
-# and the kernel only changes rounding, so it is opt-in with UNSLOTH_MLX_VERIFY_ATTENTION=1. At 16 (12B) the
-# unfused attention is already as fast.
+# Default at 8 query heads per KV head (E2B, 26B-A4B, 31B): decode uses the same vector kernel, so verify rows match it;
+# at 4 (E4B) decode stays unfused and the kernel only changes rounding, so opt-in via UNSLOTH_MLX_VERIFY_ATTENTION=1; at
+# 16 (12B) unfused is already fast.
 _VERIFY_ATTENTION_GQA = (8,)
 _VERIFY_ATTENTION_OPT_IN_GQA = (4,)
 _VERIFY_ATTENTION_DIM = 512
@@ -6130,8 +6046,8 @@ def _wide_attention_class(base, helper, cache_type):
 
 @contextmanager
 def fused_decode_attention(model, *, _modules = None):
-    """Route MLX 0.32.4's wide BF16 single-token decode attention through the vector kernel after bitwise agreement;
-    everything else, training and distributed models stay native."""
+    """Routes MLX 0.32.4's wide BF16 single-token decode attention through the vector kernel after bitwise agreement;
+    other calls, training and distributed models stay native."""
     changed = []
     try:
         with _WIDE_ATTENTION_LOCK:
@@ -6323,8 +6239,8 @@ def _qsa_select_route(native, bindings):
         past = cache.offset if cache is not None else 0
         selection = native(self, qk, cache, position_ids)
         pooled = getattr(cache, "index_block_keys", None)
-        # The native top-k is still lazy; once the picks replace it, it is never evaluated.
-        # The kernel needs a positive budget: a config whose indexer budget is under one block leaves it at 0.
+        # The native top-k stays lazy and is never evaluated once the picks replace it; the kernel needs a positive
+        # budget, and a config whose indexer budget is under one block leaves it at 0.
         if (selection is None or not selection.zero_padding or not isinstance(pooled, mx.array) or self.block_topk < 1
                 or pooled.shape[2] <= self.block_topk or self.training or not _bindings_intact(bindings)):
             return selection
@@ -6413,13 +6329,9 @@ def _qsa_routes(model, modules, enter):
 
 
 def fused_qsa_attention(model, *, _modules = None):
-    """Speed up mlx-vlm's Qwen sparse attention (qwen4_exp) block selection during serialized inference.
-
-    Block selection runs on one kernel per query row that picks exactly `argpartition`'s blocks
-    from the native float32 scores, checked against the native selection at first use per layout.
-    `Qwen4ExpQSAIndexer.select_from_projected` is rebound process-wide while any scope is open.
-    `UNSLOTH_MLX_QSA_SELECT=0` turns the route off.
-    """
+    """Block selection on one kernel per query row, picking exactly argpartition's blocks from native float32 scores,
+    checked per layout at first use; Qwen4ExpQSAIndexer.select_from_projected is rebound process-wide while any scope
+    is open; UNSLOTH_MLX_QSA_SELECT=0 disables."""
     def enter(entered, language, indexer):
         if os.environ.get("UNSLOTH_MLX_QSA_SELECT", "1") != "0" and attention._select_kernel() is not None:
             _qsa_enter(entered, "select", _QSA_SELECT_CONTRACT, indexer, "select_from_projected", _qsa_select_route)
@@ -6428,11 +6340,9 @@ def fused_qsa_attention(model, *, _modules = None):
 
 
 def fast_qsa_prefill(model, *, _modules = None):
-    """Run mlx-vlm's indexed QSA prefill on the neural accelerators (Qwen3.8 layout), or on GPUs without
-    them on simdgroup matrices, once the kernel passes a probe. Not bitwise, as its fp32 sums run in another
-    order, but measured no less accurate than stock against fp32 attention. Other calls keep the native
-    kernel. `dispatch_qsa_attention` is rebound process-wide while any scope is open.
-    `UNSLOTH_MLX_FAST_QSA=0` turns the route off."""
+    """Runs indexed QSA prefill (Qwen3.8 layout) on neural accelerators, or simdgroup matrices without them, once a
+    probe passes; not bitwise but no less accurate than stock vs fp32 attention; dispatch_qsa_attention is rebound
+    process-wide while any scope is open; UNSLOTH_MLX_FAST_QSA=0 disables."""
     def enter(entered, language, indexer):
         kernels = sys.modules.get("mlx_vlm.models.qwen4_exp.qsa_kernel")
         if kernels is None or os.environ.get("UNSLOTH_MLX_FAST_QSA", "1") == "0":
@@ -6451,18 +6361,17 @@ def fast_qsa_prefill(model, *, _modules = None):
 
     return _qsa_routes(model, _modules, enter)
 
-# mlx-vlm gathers SSD-backed Qwen4-Exp PLE rows by fancy-indexing memory maps: a row on a page that is not in
-# core is a serial page fault taken with the GIL held, and even a cached page costs a fault to map. Cold rows are
-# read with concurrent preads instead, which release the GIL, and handed to the unchanged gather in place of the
-# memory map reads it would make.
+# mlx-vlm's memory-map gather of SSD-backed Qwen4-Exp PLE rows page-faults serially under the GIL on non-resident pages,
+# and even resident ones cost a fault to map; cold rows are read with concurrent preads (GIL released) and fed to the
+# unchanged gather.
 _PLE_STORAGE = "mlx_vlm.models.qwen4_exp.ple_storage"
 _PLE_READ_CONTRACT = {_PLE_STORAGE: {"QuantizedMMapNGramEmbedding._read_rows": "4a31310895b56550"}}
 _PLE_READ_LOCK = RLock()
 _PLE_READ_CLASSES = {}
 _PLE_PENDING = local()  # this thread's reads for the gather it is running
 _PLE_READ_WORKERS = 32
-# A pread costs a few microseconds of Python per row, more than a gather from mapped resident pages, so a gather
-# whose sampled new rows are all in core keeps the memory map read; one cold page in a hundred already costs more.
+# A pread costs a few microseconds of Python per row, more than a mapped resident gather, so a sample whose new rows are
+# all in core keeps the memory map; one cold page in a hundred already costs more.
 _PLE_RESIDENT_SAMPLE = 256
 _PLE_RESIDENT = 0.99
 
@@ -6616,11 +6525,9 @@ def _ple_unwrap_maps(table):
 
 @contextmanager
 def exact_ple_row_reads(model, *, _modules = None):
-    """Read cold SSD-backed Qwen4-Exp PLE rows with concurrent preads, byte for byte the memory map's rows.
-
-    mlx-vlm's own gather still assembles every row. Tables return to their own class and memory maps when the
-    last scope holding them exits.
-    """
+    """Reads cold SSD-backed Qwen4-Exp PLE rows with concurrent preads, byte-identical to the memory map's rows;
+    mlx-vlm's own gather still assembles every row; tables return to their own class and memory map when the last
+    scope holding them exits."""
     changed = []
     try:
         with _PLE_READ_LOCK:
@@ -6687,11 +6594,9 @@ def _qsa_trim_route(native, bindings):
 
 @contextmanager
 def exact_qsa_trim(model, *, _modules = None):
-    """Keep the pooled QSA indexer blocks a cache trim leaves complete; the indexer re-pools only the tail.
-
-    The kept blocks are the ones a re-pool would rebuild bit for bit. The QSA caches' `trim` is rebound
-    process-wide while any scope is open. `UNSLOTH_MLX_QSA_TRIM_KEEPS_BLOCKS=0` turns this off.
-    """
+    """Keeps pooled QSA indexer blocks that a cache trim leaves complete, so the indexer re-pools only the tail; those
+    blocks are what a re-pool would rebuild bit for bit; the QSA caches' trim is rebound process-wide while any scope
+    is open; UNSLOTH_MLX_QSA_TRIM_KEEPS_BLOCKS=0 disables."""
     entered = False
     try:
         with _QSA_TRIM_LOCK:
@@ -6724,8 +6629,8 @@ def exact_qsa_trim(model, *, _modules = None):
                     _QSA_TRIM_HELD.clear()
 
 
-# MLX takes its depthwise kernel only without dilation, so a dilated depthwise convolution (the Qwen4-Exp
-# PLE short conv) runs as a grouped implicit GEMM with one group per channel.
+# MLX takes its depthwise kernel only without dilation, so a dilated depthwise conv (Qwen4-Exp PLE short conv) runs as a
+# grouped implicit GEMM with one group per channel.
 _DEPTHWISE_CONV_CONTRACT = {"mlx.nn.layers.convolution": {"Conv1d.__call__": "e6c4e02415104dd1"}}
 _DEPTHWISE_CONV_DTYPES = (mx.bfloat16, mx.float16, mx.float32)
 _DEPTHWISE_CONV_LOCK = RLock()
@@ -6805,11 +6710,9 @@ def _depthwise_conv_eligible(module):
 
 @contextmanager
 def exact_dilated_depthwise_conv(model, *, _modules = None):
-    """Run dilated depthwise `nn.Conv1d` layers on a depthwise kernel, bit-identical to `mx.conv1d`.
-
-    Each dtype and geometry is compared bit for bit against `mx.conv1d` before a layer is switched,
-    and layers return to `nn.Conv1d` when the last scope holding them exits.
-    """
+    """Runs dilated depthwise nn.Conv1d layers on a depthwise kernel, bit-identical to mx.conv1d; each dtype and
+    geometry is compared against mx.conv1d before a layer switches, and layers revert to nn.Conv1d when the last
+    scope holding them exits."""
     changed = []
     try:
         with _DEPTHWISE_CONV_LOCK:
@@ -6848,8 +6751,8 @@ def exact_dilated_depthwise_conv(model, *, _modules = None):
 
 
 class InferenceScope(NamedTuple):
-    """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
-    `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
+    """serves: call traits that admit a call (empty admits all); opt_in: env switch that must equal 1; int8_prefill:
+    pass the generation's Int8 Prefill decision as the second argument."""
     enter: Callable
     serves: frozenset = frozenset()
     opt_in: str = None
@@ -6921,8 +6824,8 @@ _WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17
 
 
 def warm_inference(model, int8_prefill = None):
-    """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
-    first-use checks; checks keyed by a request's row count still run then."""
+    """Generates two greedy tokens from a short prompt so the first request skips the scopes' kernel builds and
+    first-use checks; checks keyed by a request's row count still run on that request."""
     model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
                    int8_prefill = int8_prefill)
     _warm_qmv_rows(model)
@@ -6930,9 +6833,8 @@ def warm_inference(model, int8_prefill = None):
 
 
 def _warm_verify_gdn(model):
-    """Build the fused verify block's pipeline for each linear-attention layer shape, and settle each block width's
-    bitwise checks through the verifier for a model a drafter was built for: either would otherwise land in the first
-    speculative replies."""
+    """Builds the fused verify pipeline for each linear-attention layer shape and settles each block width's bitwise
+    checks, for a model a drafter was built for; otherwise both would land in the first speculative replies."""
     language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
     if (language is None or os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") == "0" or not hasattr(model, "named_modules")
             or mx.default_device() != mx.gpu or not _verify_gdn_kernel()):
@@ -6985,8 +6887,7 @@ def _settle_verify_gdn(model, language, shapes):
 
 
 def _warm_qmv_rows(model):
-    """Settle `_qmv_rows_kernel` for the projections of every language model the multi-row scopes serve, for a model a
-    drafter was built for."""
+    """Settles _qmv_rows_kernel for the projections of every language model the multi-row scopes serve, for a model a drafter was built for."""
     if not getattr(model, "_unsloth_speculates", False) or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS") == "0":
         return
     with exact_speculative_verify(model), exact_batch_invariant_decode(model):
