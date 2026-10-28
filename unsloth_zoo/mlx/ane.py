@@ -462,6 +462,7 @@ _DOWN_SLAB = 4608       # widest down-projection K the Neural Engine runs at ful
 _ACT_SCALE = 1 / 16     # keeps the fp16 activation and its down projection in range
 _MIN_GAIN = 0.05        # below this the split is not worth its approximation
 _WATCHDOG = 5.0         # seconds a Neural Engine evaluation may take before the split is abandoned
+_MEMORY_SHARE = 0.5     # of the memory the model leaves free; the rest stays for the KV cache and activations
 _STATE = "_unsloth_ane_split"
 _CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "unsloth", "mlx_ane_prefill.json")
 _LOCK = threading.RLock()
@@ -572,6 +573,19 @@ def _program(mlp, k, tile):
         total = part if total is None else fn.op("add", (1, hidden, 1, tile), x = total, y = part)
     y = fn.op("mul", (1, hidden, 1, tile), x = total, y = fn.const("fp16", repr(1 / _ACT_SCALE)))
     return fn.program([y]), blob.bytes()
+
+
+def _split_bytes(mlp, k):
+    """Memory a split adds to the checkpoint's: int8 Neural Engine weights, wired outside the process, and the GPU's
+    copy of down's remaining columns (the gate and up remainders are views)."""
+    down = _projections(mlp)[2]
+    hidden, rest = down.weight.shape[0], _mlp_shape(mlp)[1] - k
+    return 3 * k * hidden + hidden * rest * down.bits // 8 + 2 * hidden * rest // down.group_size * down.scales.itemsize
+
+
+def _memory_budget():
+    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+    return int(_MEMORY_SHARE * (0.85 * info["memory_size"] - mx.get_active_memory()))
 
 
 def _remainder(p, rows = None, columns = None):
@@ -794,6 +808,20 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
         if not share:
             return AnePrefillStatus(0, 0.0, gpu, split_ms, time.perf_counter() - started,
                                     f"the split ({split_ms:.1f} ms) is not 5% faster than the GPU ({gpu:.1f} ms)")
+        free, admitted = _memory_budget(), []
+        for mlp in mlps:   # layers may be quantized differently, so each is costed on its own
+            free -= _split_bytes(mlp, _aligned(shape[1], share))
+            if free < 0:
+                break
+            admitted.append(mlp)
+        if len(admitted) < len(mlps):
+            logger.warning("Neural Engine prefill: free memory admits %d of %d layers", len(admitted), len(mlps))
+            if first is not None and not admitted:
+                first.close()
+                first = None
+            mlps = admitted
+        if not mlps:
+            return AnePrefillStatus(0, share, gpu, split_ms, time.perf_counter() - started, "not enough free memory")
         # A partial tile padded to a full one costs the split's time, so it pays once the GPU would take longer.
         pad_from = min(tile, math.ceil(tile * split_ms / gpu)) if gpu else tile
         attached = []

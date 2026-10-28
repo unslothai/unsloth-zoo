@@ -262,6 +262,41 @@ def test_calibration_takes_the_balanced_share_only_with_a_gain_and_caches_it(spl
     ane.release_ane_prefill(model)
 
 
+def test_free_memory_admits_layers_by_their_own_cost(monkeypatch):
+    mx.random.seed(0)
+    model = Model(nn.silu, False)
+    model.set_dtype(mx.bfloat16)
+    nn.quantize(model, group_size = 64, bits = 4, class_predicate = lambda path, m: hasattr(m, "to_quantized") and (
+        {"group_size": 64, "bits": 8} if path.startswith("layers.0") else True))
+    model.eval()
+    # int8 gate/up/down rows for 512 channels, plus the GPU's copy of down's other 512 columns and its scales/biases
+    four, eight = ane._split_bytes(model.layers[1], 512), ane._split_bytes(model.layers[0], 512)
+    assert four == 3 * 512 * 256 + 256 * 512 // 2 + 2 * 256 * 8 * 2 and eight == four + 256 * 512 // 2
+    for budget, layers in ((four + eight - 1, 1), (four + eight, 2), (min(four, eight) - 1, 0)):
+        monkeypatch.setattr(ane, "_memory_budget", lambda: budget)
+        status = ane.prepare_ane_prefill(model, tile = TILE, share = 0.5)
+        assert status.layers == layers and (status.reason == "not enough free memory") == (not layers)
+        assert sum(ane._STATE in layer.__dict__ for layer in model.layers) == layers
+        ane.release_ane_prefill(model)
+
+
+def test_the_budget_is_half_of_what_the_model_leaves(monkeypatch):
+    monkeypatch.setattr(ane.mx, "device_info", lambda: {"memory_size": 1000})
+    monkeypatch.setattr(ane.mx, "get_active_memory", lambda: 250)
+    assert ane._memory_budget() == 300
+
+
+def test_a_calibration_split_no_layer_has_memory_for_is_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(ane, "_CACHE_PATH", str(tmp_path / "cache.json"))
+    timings = iter([10.0, 2.5, 6.0])
+    monkeypatch.setattr(ane, "_median_ms", lambda function, **_: (function(), next(timings))[1])
+    monkeypatch.setattr(ane, "_memory_budget", lambda: 0)
+    closed, close = [], ane._Split.close
+    monkeypatch.setattr(ane._Split, "close", lambda self: (closed.append(self.k), close(self)))
+    assert ane.prepare_ane_prefill(_model(), tile = TILE).reason == "not enough free memory"
+    assert closed == [640]
+
+
 def test_scope_is_opt_in():
     from unsloth_zoo.mlx.inference import INFERENCE_SCOPES
 
