@@ -27,6 +27,13 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
+# The child imports unsloth_zoo.compiler, which needs torch and transformers. CI legs that
+# install neither (the macOS staging leg) skip here instead of failing in the child.
+pytest.importorskip("torch")
+pytest.importorskip("transformers")
+
 _SCRIPT = textwrap.dedent(
     """
     import json, os, sys
