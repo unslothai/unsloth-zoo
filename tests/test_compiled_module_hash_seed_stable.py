@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""The generated compiled modules are the same bytes in every process.
+"""Generated compiled modules are byte-identical under any PYTHONHASHSEED (CPU only).
 
-The names in a combined module's `from transformers.models.X.modeling_X import (...)`
-line used to come out of a set of strings, whose order follows PYTHONHASHSEED. The
-file then differed from process to process for gpt_oss and qwen3_next, so every new
-process rewrote it (write + fsync, new mtime), and two processes sharing one cache
-kept replacing each other's copy.
-
-Each child generates into its own folder under a different hash seed; every file must
-match byte for byte. CPU only.
+The modeling import list used to follow set order, so gpt_oss, qwen3_next and
+granitemoehybrid files were rewritten by every new process.
 """
 
 import os
@@ -20,11 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-# With the set-ordered import list these seeds disagree on CPython 3.13 (qwen3_next
-# for 1 vs 2, gpt_oss for 1 vs 6). Other versions hash differently; any pair that
-# disagrees is enough.
+# With set order, at least one pair of these seeds disagrees for each model type on CPython 3.13.
 SEEDS = ("1", "2", "3", "6")
-MODEL_TYPES = ("gpt_oss", "qwen3_next")
+MODEL_TYPES = ("gpt_oss", "qwen3_next", "granitemoehybrid")
 
 _CHILD = r'''
 import os, sys, io, contextlib
@@ -73,7 +65,7 @@ def test_generated_modules_do_not_depend_on_hash_seed(tmp_path):
             continue
         model_types.append(model_type)
     if not model_types:
-        pytest.skip("this transformers has neither gpt_oss nor qwen3_next")
+        pytest.skip(reason = f"installed transformers has none of {MODEL_TYPES}")
 
     with ThreadPoolExecutor(max_workers = len(SEEDS)) as pool:
         outputs = list(pool.map(lambda seed: _generate(tmp_path, seed, model_types), SEEDS))
