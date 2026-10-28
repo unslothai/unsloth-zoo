@@ -209,6 +209,7 @@ _PIN_PER_BLOCK = -2
 _PIN_HEADROOM_BYTES = 1 << 30
 _WARNED_ABOUT_PINNED_CAP = False
 _PINNED_CACHED = {}         # rounded block bytes -> count released but still cached
+_PINNED_LIVE = {}           # requested bytes -> blocks charged at allocation, still live
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
 
 
@@ -411,6 +412,7 @@ def _reserve_pinned(nbytes):
         if free is None or free >= block or (
             GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0 and _host_cache_reuses_block(block)
         ):
+            _charge_live(nbytes, block)
             return True  # the allocator hands back the cached block, already charged
         # Another pinned user took the block: it is no longer ours, and this request is new.
         GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
@@ -458,7 +460,16 @@ def _reserve_pinned(nbytes):
             )
         return False
     GC_PINNED_BYTES += block
+    _charge_live(nbytes, block)
     return True
+
+
+def _charge_live(nbytes, block):
+    # The block size depends on the allocator settings at allocation: release must use this one,
+    # not one re-derived from settings that may have changed while the buffer was live.
+    blocks = _PINNED_LIVE.get(nbytes)
+    if blocks is None: _PINNED_LIVE[nbytes] = [block]
+    else: blocks.append(block)
 
 
 def _flushed_cached_fits(block, used):
@@ -477,7 +488,12 @@ def _release_pinned(nbytes):
     """The block stays pinned in torch's host cache, so it stays charged until reused; one above
     pinned_max_cached_size_mb (torch 2.13+) goes back to the OS, so it stops being charged."""
     global GC_PINNED_BYTES
-    block = _pinned_block_bytes(nbytes)
+    blocks = _PINNED_LIVE.get(nbytes)
+    if blocks:
+        block = blocks.pop()
+        if not blocks: del _PINNED_LIVE[nbytes]
+    else:
+        block = _pinned_block_bytes(nbytes)
     if not block: return
     if _pinned_block_cached(block):
         _PINNED_CACHED[block] = _PINNED_CACHED.get(block, 0) + 1

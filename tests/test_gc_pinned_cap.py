@@ -23,6 +23,7 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "GC_PINNED_BYTES", 0, raising = False)
     monkeypatch.setattr(gc_module, "GC_PINNED_CAP", None, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
     monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: None, raising = False)
     monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: None, raising = False)
@@ -375,3 +376,23 @@ def test_settings_change_is_picked_up(host_alloc_conf, gc_module):
     assert gc_module._pinned_block_bytes(3 * MIB) == 3 * MIB
     host_alloc_conf("pinned_max_round_threshold_mb:8")
     assert gc_module._pinned_block_bytes(3 * MIB) == 4 * MIB
+
+
+def test_release_uses_the_block_charged_at_allocation(monkeypatch, host_alloc_conf, gc_module):
+    host_alloc_conf("pinned_max_round_threshold_mb:1")
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(4 * MIB / (1 << 30)))
+    flushes = []
+    monkeypatch.setattr(gc_module, "_empty_host_cache", lambda: flushes.append(1) or False)
+    assert gc_module._reserve_pinned(3 * MIB)       # exact 3 MiB block above the threshold
+    assert gc_module._reserve_pinned(MIB)
+    assert gc_module.GC_PINNED_BYTES == 4 * MIB
+    # Settings change while both buffers are live: their blocks are still 3 MiB and 1 MiB.
+    host_alloc_conf("pinned_max_round_threshold_mb:8")
+    gc_module._release_pinned(3 * MIB)
+    gc_module._release_pinned(MIB)
+    assert gc_module._PINNED_CACHED == {3 * MIB: 1, MIB: 1}
+    assert gc_module.GC_PINNED_BYTES == 4 * MIB and not gc_module._PINNED_LIVE
+    # No cached 4 MiB block exists, so a 4 MiB request is new and over the cap: it must not take
+    # the cached-block shortcut and pin another 4 MiB past the cap.
+    assert not gc_module._reserve_pinned(4 * MIB)
+    assert flushes and gc_module.GC_PINNED_BYTES == 4 * MIB
