@@ -229,15 +229,15 @@ def _snapshot_current(experts, snap):
 # reads per layer, about 10% of an NF4 decode step on a slow host). A one-token decode step on the cache of the
 # previous decode step belongs to the same epoch: a layer's tables are fully checked on its first call of an
 # epoch, then only _sentinel_current (the first gate_up / down expert) runs until the epoch changes. A new epoch
-# starts with a new cache object, on every generate() call and cache reset (a reused static cache), and whenever a
-# module or parameter is registered anywhere (setattr of a Module / Parameter, as PEFT merges and unloads do); a
-# caller's epoch captured before such a registration no longer matches, so that call is fully checked too. The
-# shortcut also needs moe_ready_epoch's stamp unchanged since the full check: the experts are tracked there, so a
-# move (.to / .cuda / .half, which pops these tables), a buffer registration, requires_grad_, a PEFT state method
-# or an optimizer step ends it, and without that machinery every call is fully checked. A check without an epoch
-# (the experts' eval forward, as in prefill) clears the stamp. Not rechecked inside one generation: a non-first
-# expert's weight replaced by direct dict assignment, a parameter set to None, or quant_state / tensor surgery in
-# place between two one-token steps on one cache. UNSLOTH_GPTOSS_ROUTED_EPOCH=0 checks every call fully.
+# starts with a new cache object, on every generate() call and on a cache reset (a reused static cache). The
+# shortcut also needs moe_ready_epoch's stamp, read at the call, unchanged since the full check: the experts subtree
+# is tracked there, so a module / parameter / buffer registered in it (setattr, as PEFT merges and unloads do), a
+# move (.to / .cuda / .half, which also pops these tables), requires_grad_, a PEFT state method or an optimizer
+# step ends it, even inside a decode step; without that machinery (or under accelerate / FSDP2 hooks) every call is
+# fully checked. A check without an epoch (the experts' eval forward, as in prefill) clears the stamp. Not rechecked
+# inside one generation: a non-first expert's weight swapped by .data assignment, a parameter set to None, or
+# quant_state / tensor surgery in place between two one-token steps. UNSLOTH_GPTOSS_ROUTED_EPOCH=0 checks every
+# call fully.
 _EPOCH_ENABLED = os.environ.get("UNSLOTH_GPTOSS_ROUTED_EPOCH", "1") != "0"
 # Counts per prepare_routed_experts call on built tables: "full" ran _snapshot_current, "sentinel" only the O(1) check.
 ROUTED_EPOCH_STATS = {"full": 0, "sentinel": 0}
@@ -273,14 +273,8 @@ def _install_epoch_hooks():
         return _EPOCH_HOOKS[0]
     _EPOCH_HOOKS.append(False)
     try:
-        from torch.nn.modules.module import (
-            register_module_module_registration_hook,
-            register_module_parameter_registration_hook,
-        )
         from transformers import cache_utils
         from transformers.generation.utils import GenerationMixin
-        _EPOCH_HOOKS.append(register_module_module_registration_hook(_bump_epoch))
-        _EPOCH_HOOKS.append(register_module_parameter_registration_hook(_bump_epoch))
         _wrap_epoch_boundary(GenerationMixin, "generate")
         # Every cache class defining reset (Cache and its layers on transformers 5, StaticCache on 4.x).
         for obj in vars(cache_utils).values():
@@ -355,6 +349,16 @@ def _compiled_state(experts):
     return state
 
 
+def _track(experts):
+    """Track the experts subtree in moe_ready_epoch (registrations and moves there move its stamp; a move pops these
+    tables). False under accelerate / FSDP2 hooks, which swap storage without any hook firing."""
+    try:
+        hooked, _ = _moe_ready.scan(experts)
+    except Exception:
+        return False
+    return not hooked
+
+
 def prepare_routed_experts(experts, epoch = None):
     """Build (or validate) the pointer tables for a ModuleList NF4 experts module.
 
@@ -368,8 +372,8 @@ def prepare_routed_experts(experts, epoch = None):
     if state is False:
         return None
     try:
-        if epoch is not None and (epoch != _EPOCH[0] or not _moe_ready.enabled()):
-            epoch = None  # a registration since the caller's capture, or no move tracking: full check
+        if epoch is not None and not _moe_ready.enabled():
+            epoch = None  # no registration / move tracking: full check
         stamp = _moe_ready.stamp() if epoch is not None else None
         if isinstance(state, dict):
             if (
@@ -380,6 +384,8 @@ def prepare_routed_experts(experts, epoch = None):
                 return state
             ROUTED_EPOCH_STATS["full"] += 1
             if _snapshot_current(experts, state["snapshot"]):
+                if epoch is not None and not state.get("tracked"):
+                    state["tracked"] = _track(experts)
                 state["epoch"], state["stamp"] = (epoch, stamp) if state.get("tracked") else (None, None)
                 return state
         # Declined keyed by ids/addresses, not references, so a moved model frees its old copy.
@@ -400,12 +406,7 @@ def prepare_routed_experts(experts, epoch = None):
     if gate_up is None or down is None or down["K"] * 2 != gate_up["N"] or gate_up["K"] != down["N"]:
         experts._unsloth_routed_nf4 = _decline_key(experts)
         return None
-    tracked = False
-    if epoch is not None:
-        # Tracked by moe_ready_epoch: a move of any expert pops these tables and moves its stamp. Subtrees with
-        # accelerate / FSDP2 hooks swap storage without any hook firing: always fully checked.
-        hooked, _ = _moe_ready.scan(experts)
-        tracked = not hooked
+    tracked = _track(experts) if epoch is not None else False
     state = {"gate_up": gate_up, "down": down, "key": tuple(snap["ptrs"]), "snapshot": snap,
              "weights": tuple(snap["weights"]), "tracked": tracked,
              "epoch": epoch if tracked else None, "stamp": stamp if tracked else None}
