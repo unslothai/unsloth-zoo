@@ -62,7 +62,7 @@ def _token_terms(lp, adv, old, ref, isr, kind, eps_low, eps_high, delta, beta, s
         loss = -torch.minimum(t1, t2)
         grad = -adv * (s1 * d1 + (1.0 - s1) * d2)
     elif kind == 1:
-        c = torch.clamp(r, max = eps_high)
+        c = torch.clamp(r, max = eps_high).detach()  # a stop-gradient weight, as grpo_compute_loss
         loss = -c * adv * lp
         grad = -c * adv
     else:

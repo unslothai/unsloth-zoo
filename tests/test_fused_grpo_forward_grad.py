@@ -147,8 +147,8 @@ def test_matches_trl_fp64(cfg, temperature, with_bias, head):
             torch.testing.assert_close(g.double(), 3.0 * r, rtol = 2e-4, atol = 2e-6)
 
 
-def test_kill_switch_path_matches(monkeypatch):
-    cfg = CFGS[1]
+@pytest.mark.parametrize("cfg", CFGS, ids = lambda c: f"{c['loss_type']}-b{c['beta']}-e{c['ent']}-d{c['delta']}")
+def test_kill_switch_path_matches(monkeypatch, cfg):
     h, W, bias, tgt, mask, adv, old, ref, isr = _case(1, 1.0, False)
     outs = []
     for on in (True, False):
