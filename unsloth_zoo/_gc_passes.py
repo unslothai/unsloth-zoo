@@ -14,19 +14,18 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Full gc.collect() passes that stop once a pass that really ran finds nothing. No torch import."""
-
 import gc
 
 __all__ = ["collect_garbage"]
 
 
 def collect_garbage(passes = 3, after = None):
-    """Up to `passes` full gc.collect() passes, `after` run after each.
+    """Up to `passes` full gc.collect() passes, `after` (e.g. empty_cache) after each.
 
-    Stops after a pass that ran and found nothing. Keeps going while gc.callbacks are registered (they
-    may drop references) or when the gen 2 stats do not show one more empty collection (CPython returns 0
-    without collecting while another thread is collecting).
+    Stops after a pass that ran and returned 0. Every pass still runs when gc.callbacks are registered, the
+    pass returned None (gc.collect stubbed by vLLM capture), or the gen-2 stats did not move by exactly one
+    quiet collection (CPython returns 0 without collecting while another thread collects). Not covered:
+    a finalizer that resurrects its object returns 0, so garbage it releases waits for the next automatic pass.
     """
     for _ in range(passes):
         seen = gc.get_stats()[2]

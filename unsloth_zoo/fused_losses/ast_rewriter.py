@@ -308,15 +308,6 @@ def _is_shift_labels_pop(stmt: ast.stmt, kwargs_name) -> bool:
             and ast.unparse(stmt) == f"shift_labels = {kwargs_name}.pop('shift_labels', labels)")
 
 
-def _find_loss_assign_target(if_block: ast.If, call: ast.Call) -> str | None:
-    for stmt in if_block.body:
-        if isinstance(stmt, ast.Assign) and stmt.value is call and len(stmt.targets) == 1:
-            tgt = stmt.targets[0]
-            if isinstance(tgt, ast.Name):
-                return tgt.id
-    return None
-
-
 def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False) -> TripletCapture | None:
     """`extended` (compiler fallback) adds logit scale, explicit `shift_labels=` and legacy CE shapes."""
     body = fn.body
