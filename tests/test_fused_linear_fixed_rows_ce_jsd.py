@@ -306,3 +306,26 @@ def test_reduce_overhead_compile(op):
         torch.testing.assert_close(got[0], ref.detach(), rtol = 1e-4, atol = 1e-5)
         torch.testing.assert_close(got[1].float(), proj.weight.grad.float(), rtol = 2e-2, atol = 2e-3)
     assert fl.CALLS.get("fixed_rows", 0) > before  # recorded under capture
+
+
+
+@pytest.mark.parametrize("beta", [0.0, 0.5])
+@pytest.mark.parametrize("all_dropped", [False, True])
+def test_jsd_fixed_rows_overflowing_dropped_dz(beta, all_dropped, monkeypatch):
+    # fp16 with a GradScaler-sized scaling: a dropped row (zero hidden, opposite student / teacher biases) has an
+    # overflowing dz. It must be filled with 0, not multiplied by the mask (inf * 0 = NaN in the head gradient).
+    mask = torch.tensor([False, False] + ([] if all_dropped else [True]))
+    h = torch.zeros(len(mask), 2)
+    if not all_dropped:
+        h[-1] = torch.tensor([0.5, -0.25])
+    w = torch.tensor([[0.5, -0.5], [-0.25, 0.75]])
+    tw = torch.tensor([[0.25, 0.5], [-0.5, 0.25]])
+    b, tb = torch.tensor([10.0, -10.0]), torch.tensor([-10.0, 10.0])
+    case = tuple(x.half() for x in (h, w, b, torch.zeros_like(h), tw, tb)) + (mask,)
+    ref = _jsd(False, monkeypatch, *case, True, beta, scaling = 65536.0)
+    got = _jsd(True, monkeypatch, *case, True, beta, scaling = 65536.0)
+    for r, x in zip(ref, got):
+        # A kept row may overflow too (GradScaler then skips the step); it must match compaction, never become NaN.
+        assert not x.float().isnan().any()
+        torch.testing.assert_close(x, r, rtol = 1e-3, atol = 1e-3)
+    assert (got[1][~mask] == 0).all()

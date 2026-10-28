@@ -2294,8 +2294,12 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
                     total += (row if kc is None else torch.where(kc, row, 0)).sum(dtype = acc)
                     if not grad:
                         continue
+                    if kc is not None:
+                        # Fill, not multiply: a dropped row's dz can be inf (fp16, large scaling), and inf * 0 is NaN
+                        # in the bias sum and in the head gradient (its zero hidden row does not cancel it).
+                        dzc.masked_fill_(~kc[:, None], 0)
                     if need_b:
-                        acc_b += (dzc if kc is None else dzc * kc[:, None]).sum(0, dtype = sd)
+                        acc_b += dzc.sum(0, dtype = sd)
                     _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, need_w, sd)
                     # Free this chunk's dz before the next chunk's logits are allocated.
                     del dzc, row
@@ -2319,8 +2323,10 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
                 if dcap is not None:
                     dz.mul_(dcap)
                     del dcap
+                if kc is not None:
+                    dz.masked_fill_(~kc[:, None], 0)
                 if need_b:
-                    acc_b += (dz if kc is None else dz * kc[:, None]).sum(0)
+                    acc_b += dz.sum(0)
                 dzc = dz.to(compute_dtype) if compute_dtype != sd else dz
                 _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, need_w, sd)
     if fixed and need_h:
