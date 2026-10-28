@@ -1483,6 +1483,7 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
     banked, size = {}, len(tok.encode(texts[0], add_special_tokens = False))
     state = SimpleNamespace(checkpoint = lambda count, cache: banked.update({count: deepcopy(cache)}))
     state.open = lambda prompt: (deepcopy(banked[max(banked)]) if banked else make_prompt_cache(model.language_model), [size - 9, size - 1])
+    retired, state.retire = [], lambda take: retired.append(take()) or mx.eval([entry.state for entry in retired[-1]])
     resumed = GenerationRequest(prompt = texts[0], max_tokens = 24, prompt_cache_state = state)
     greedy = [GenerationRequest(prompt = texts[0], max_tokens = 40), GenerationRequest(prompt = texts[1], max_tokens = 200)]
     sampled = GenerationRequest(prompt = texts[1], max_tokens = 32, sampling = SamplingParams(temperature = 0.8, top_k = 20, seed = 7))
@@ -1523,6 +1524,11 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
     del banked[size - 1]
     warm = run({0: resumed})[0]
     assert (warm.cached_token_count, sorted(banked), warm.token_ids) == (size - 9, [size - 9, size - 1], batched[8].token_ids) and warm.draft_tokens > 0
+    # The resumed row hands back its own cache as it leaves: batched, alone, and on its first token.
+    run({0: replace(resumed, max_tokens = 1)})
+    kv = [(i, entry) for i, entry in enumerate(banked[size - 9]) if hasattr(entry, "keys")]
+    assert len(retired) == 3 and kv and all(mx.array_equal(getattr(taken[i], name)[..., : size - 9, :], getattr(entry, name)[..., : size - 9, :]).item()
+                                             for taken in retired for i, entry in kv for name in ("keys", "values"))
     # Rows that join mid-flight draft from the features their own prefill captured.
     assert not companion or all(batched[row].draft_tokens > 0 for row in (3, 6))
 

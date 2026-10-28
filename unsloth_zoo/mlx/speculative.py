@@ -980,6 +980,8 @@ class SpeculativeEngine:
         self.cache: list | None = None
         self.draft_cache: list | None = None
         self.round_refusal: str | None = None
+        # uid -> retire(take), called as that row leaves with take() returning its own cache.
+        self.retiring: dict = {}
 
     @property
     def rows(self) -> list[Any]:
@@ -1002,6 +1004,11 @@ class SpeculativeEngine:
         keep = [i for i, row in enumerate(self._rows) if row.uid != uid]
         if len(keep) == len(self._rows):
             raise KeyError(uid)
+        retire = self.retiring.pop(uid, None)
+        if retire is not None:
+            from .generate import _row_cache
+
+            retire(lambda: _row_cache(self.cache, self.rows.index(uid)))
         self._rows = [self._rows[i] for i in keep]
         self.cache = _split(self.cache, keep)
         if self.drafter is not None:
