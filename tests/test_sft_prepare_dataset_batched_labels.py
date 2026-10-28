@@ -83,6 +83,8 @@ def test_fully_masked_rows_are_dropped_by_a_batched_filter(monkeypatch):
         tokenizer = transformers.AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
     except Exception as e:  # offline runner
         pytest.skip(f"cannot load tokenizer: {e}")
+    # Keep the mask columns (TRL >= 1.7 would turn them into labels): this test reads assistant_masks.
+    monkeypatch.setattr(dataset_utils, "trl_collator_applies_masks", lambda: True)
     calls = []
     original_filter = Dataset.filter
     def filter(self, function = None, *args, **kwargs):
