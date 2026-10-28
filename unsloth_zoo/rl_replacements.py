@@ -2605,15 +2605,21 @@ GRPO_FUSED_ROUTE_STATS = {"fused": 0, "head_budget": 0, "oom": 0}
 # 4 V H bytes and measured 0.86x / 0.95x of the log-prob op on an L4 (bf16, V 151936, H 4096, 2k / 8k tokens), while
 # a frozen head (LoRA) is 1.4x faster with an entropy term and level without.
 GRPO_FUSED_TRAINABLE_HEAD = os.environ.get("UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD", "0") == "1"
+# A frozen head gains only the entropy bonus's logits recompute (1.4-1.5x with it); without one the log-prob op's
+# vocab-tiled forward is faster on large cards past 4k tokens (B200 bf16, V 151936, H 4096: 0.91x at 8k, 0.86x at
+# 16k), so that case keeps the log-prob op unless UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY=1.
+GRPO_FUSED_WITHOUT_ENTROPY = os.environ.get("UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY", "0") == "1"
 
 
 def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = False, support_kwargs = None,
-                        pixel_values = None, zero3_head = None, lm_head = None, fp16_unscaled = False):
+                        pixel_values = None, zero3_head = None, lm_head = None, fp16_unscaled = False,
+                        entropy_bonus_on = True):
     """True when grpo_compute_loss's per-token loss is a closed form of each token's own log-prob, so the GRPO loss can
     take fused_linear_grpo_loss: every token's gradient is known in the forward. Off for GSPO (sequence-level ratio),
     VESPO, the off-policy and top-entropy-quantile masks (all read every token's log-prob or entropy first), rollout_rs,
     rollout logps as pi_old (clamped log ratio), a truncated support or fp32 head (other scorers), vision inputs and a
-    gathered ZeRO-3 head, a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1, and float16 compute without a
+    gathered ZeRO-3 head, a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1, a frozen head without an entropy
+    bonus unless UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY=1 (nothing to save there), and float16 compute without a
     GradScaler: the op stores its gradients in the hidden dtype at the loss's own scale, where GRPO's 1 / tokens weights
     sit in float16's subnormal range (a GradScaler's scale lifts them out of it).
     UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 turns it off."""
@@ -2632,6 +2638,7 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
         and zero3_head is None
         and not fp16_unscaled
         and (lm_head is None or not lm_head.requires_grad or GRPO_FUSED_TRAINABLE_HEAD)
+        and (entropy_bonus_on or GRPO_FUSED_WITHOUT_ENTROPY or (lm_head is not None and lm_head.requires_grad))
         and os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") != "1"
         and not grpo_scorer_keeps_logits(support_kwargs)
     )
@@ -3158,6 +3165,7 @@ def grpo_accumulated_loss(
         _fused_route = _grpo_fused_route_ok(
             kwargs, entropy_mask_on = _entropy_mask_on, rollout_logps_as_old = _rollout_logps_as_old,
             support_kwargs = _support_kwargs, pixel_values = pixel_values, zero3_head = _zero3_head, lm_head = lm_head,
+            entropy_bonus_on = _entropy_bonus_on,
             # A GradScaler backed off below 2^7 counts as unscaled: the op's float16 gradients lose to the log-prob op
             # there (fp64 check: 7.6e-2 vs 2.6e-2 relative grad error at scale 1, level from 128 up).
             fp16_unscaled = (

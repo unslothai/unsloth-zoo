@@ -108,12 +108,13 @@ def _side_inputs(seed = 0, input_ids = INPUT_IDS, ltk = LTK):
 
 def _run(fused, monkeypatch, *, loss_type = "grpo", old = None, ref = None, sampling = None, adv = None,
          packed = False, head_grad = False, bias = False, completion_mask = None, loss_kwargs = None, backward_scale = 1.0,
-         trainable_opt_in = True, input_ids = INPUT_IDS, ltk = LTK, pg_funcs = None, **trainer_kwargs):
+         trainable_opt_in = True, without_entropy = True, input_ids = INPUT_IDS, ltk = LTK, pg_funcs = None, **trainer_kwargs):
     monkeypatch.setattr(fg, "GRPO_FWD_GRAD", fused)
     if pg_funcs is not None:
         # grpo_accumulated_loss memoises its PrefixGrouper helpers on the function object
         monkeypatch.setattr(rr.grpo_accumulated_loss, "_pg_funcs", pg_funcs, raising = False)
     monkeypatch.setattr(rr, "GRPO_FUSED_TRAINABLE_HEAD", trainable_opt_in)
+    monkeypatch.setattr(rr, "GRPO_FUSED_WITHOUT_ENTROPY", without_entropy)
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "1" if packed else "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0" if pg_funcs is None else "1")
     model = _Model(head_grad, bias).to(DEVICE)
@@ -510,3 +511,18 @@ def test_fused_oom_falls_back_to_the_log_prob_route(monkeypatch, packed, entropy
     torch.testing.assert_close(got[0], want[0])
     for name in want_grads:
         torch.testing.assert_close(got_grads[name], want_grads[name])
+
+
+def test_frozen_head_without_entropy_keeps_the_log_prob_op(monkeypatch):
+    monkeypatch.setattr(rr, "GRPO_FUSED_WITHOUT_ENTROPY", False)
+    ok = dict(loss_type = "dapo")
+    frozen, trainable = torch.zeros(4, 3), torch.zeros(4, 3, requires_grad = True)
+    assert not rr.grpo_fused_route_ok(ok, lm_head = frozen, entropy_bonus_on = False)
+    assert rr.grpo_fused_route_ok(ok, lm_head = frozen, entropy_bonus_on = True)
+    monkeypatch.setattr(rr, "GRPO_FUSED_TRAINABLE_HEAD", True)
+    assert rr.grpo_fused_route_ok(ok, lm_head = trainable, entropy_bonus_on = False)
+    _, _, engaged = _run(True, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, without_entropy = False)
+    assert engaged == 0
+    _, _, engaged = _run(True, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, without_entropy = False,
+                         entropy_coef = 0.01)
+    assert engaged == 1
