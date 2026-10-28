@@ -15,27 +15,20 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""A pre-5 bnb 4-bit checkpoint names its skipped modules in the old layout (`model.layers.7.self_attn.o_proj`).
-
-`check_conversion_mappings` maps a new-layout key back through the class's
-`_checkpoint_conversion_mapping` to find them. Qwen2-VL and Qwen2.5-VL key their language
-rule on a nested lookahead, `^model(?!\\.(language_model|visual))`, and stripping groups
-non-greedily left `model)`, so a skipped `model.language_model.layers.7.self_attn.o_proj`
-never matched. The Linear was quantized although the checkpoint stores it in 16-bit, and the
-load fails with "Supplied state dict for ... does not contain `bitsandbytes__*`".
-"""
+"""Old-layout bnb skip entries must match through Qwen2-VL's nested-lookahead conversion mapping
+(`^model(?!\\.(language_model|visual))`); else the 16-bit Linear is quantized and loading fails."""
 
 import pytest
 
 from unsloth_zoo.patching_utils import check_conversion_mappings
 
-# Verbatim from transformers 4.56 Qwen2VLForConditionalGeneration / Qwen2_5_VLForConditionalGeneration.
+# transformers 4.56 Qwen2(.5)-VL.
 QWEN_VL_MAPPING = {
     "^visual": "model.visual",
     r"^model(?!\.(language_model|visual))": "model.language_model",
 }
 
-# Excerpt of llm_int8_skip_modules in unsloth/Qwen2.5-VL-72B-Instruct-unsloth-bnb-4bit.
+# From unsloth/Qwen2.5-VL-72B-Instruct-unsloth-bnb-4bit.
 SKIP = [
     "lm_head",
     "visual.merger.mlp",
