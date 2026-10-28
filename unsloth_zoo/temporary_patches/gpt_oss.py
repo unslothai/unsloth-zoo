@@ -46,8 +46,14 @@ try:
 except Exception:
     def _fused_route_or_none(*args, **kwargs):
         return None
-from .gpt_oss_routed import ROUTED_MAX_SLOTS, prepare_routed_experts, routed_experts_forward, routed_mlp_forward
-from unsloth_zoo.gpt_oss_decode_fused import add_rms_norm as _fused_add_rms_norm, fused_decode_ok as _fused_decode_ok
+from .gpt_oss_routed import (
+    ROUTED_MAX_SLOTS, prepare_routed_experts, routed_decode_epoch, routed_experts_forward, routed_mlp_forward,
+)
+from unsloth_zoo.gpt_oss_decode_fused import (
+    add_rms_norm as _fused_add_rms_norm,
+    fused_decode_ok as _fused_decode_ok,
+    static_cache_update as _static_cache_update,
+)
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -3495,8 +3501,11 @@ def patch_GptOssAttention():
             if cache_dtype is not None and key_states.dtype != cache_dtype:
                 key_states = key_states.to(cache_dtype)
                 value_states = value_states.to(cache_dtype)
-            cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            updated = _static_cache_update(past_key_value, key_states, value_states, self.layer_idx)
+            if updated is None:
+                cache_kwargs = {"cache_position": cache_position}
+                updated = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = updated
         if key_states.dtype != query_states.dtype or value_states.dtype != query_states.dtype:
             key_states = key_states.to(query_states.dtype)
             value_states = value_states.to(query_states.dtype)
@@ -4013,6 +4022,8 @@ def patch_GptOssModel():
             all_router_logits = None
             # Fused: each residual add rides in the next norm's kernel (one launch, not ~11 ops).
             fused_norms = _fused_decode_ok(hidden_states)
+            # NF4 routed tables: fully rechecked once per epoch, not at every layer of every step.
+            routed_epoch = None if torch.compiler.is_compiling() else routed_decode_epoch(past_key_values)
             pending_residual = None
             # This loop calls the layer's parts directly, so the block swapper's forward hooks never fire.
             for layer_idx, decoder_layer in enumerate(self.layers):
@@ -4035,7 +4046,7 @@ def patch_GptOssModel():
                     **kwargs,
                 )
                 _actual_experts = _unwrap_peft_experts(decoder_layer.mlp.experts)
-                routed = routed_mlp_forward(decoder_layer.mlp, hidden_states)
+                routed = routed_mlp_forward(decoder_layer.mlp, hidden_states, epoch = routed_epoch)
                 if routed is not None:
                     hidden_states = routed
                 elif hasattr(_actual_experts, "gate_up_projs"):

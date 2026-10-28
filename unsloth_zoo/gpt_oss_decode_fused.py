@@ -19,6 +19,10 @@ Decode at batch 1 is host bound (the GPU is busy 16-45% of a step): every aten o
   add_rms_norm      (x + residual) -> new residual, RMSNorm(x + residual): replaces the residual
                     clone + bf16 add + 9-op fp32 RMSNorm (rms_layernorm_forward) with one kernel.
   sink_scale_output attention * sigmoid(lse - sink), transposed to [B, Q, H, D]: replaces 6 ops.
+  static_cache_update  one-token update of transformers' StaticLayer / StaticSlidingWindowLayer: the
+                    sliding roll + host index tensor (a pageable copy, so a stream sync per layer) +
+                    index_put + copy becomes cat + copy; the full layer's arange + add drop out.
+                    Pure data movement, bit-identical; torch ops, so CUDA, ROCm and CPU.
 Same math and rounding points as the eager code (the residual sum is rounded to the input dtype
 before the norm, the sink scale is rounded to the output dtype before the multiply). The sink
 epilogue is bit-identical on CUDA; the norm differs only in the order of its fp32 sum. Inference only: callers check
@@ -30,6 +34,7 @@ __all__ = [
     "fused_decode_ok",
     "add_rms_norm",
     "sink_scale_output",
+    "static_cache_update",
     "FUSED_DECODE_CALLS",
 ]
 
@@ -59,7 +64,7 @@ if HAS_TRITON and not _INTERPRET:
 # NVIDIA only for now: the libdevice exp / rsqrt and rounding were verified on sm75 / sm80 / sm120, not on ROCm.
 _ENABLED = HAS_TRITON and torch.version.hip is None and os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
 # Engagement counters (tests and benchmarks read them).
-FUSED_DECODE_CALLS = {"add_rms_norm": 0, "sink_scale_output": 0}
+FUSED_DECODE_CALLS = {"add_rms_norm": 0, "sink_scale_output": 0, "static_cache_update": 0}
 _MAX_COLS = 32768
 # aten rounds every multiply before the add that follows it; contracting them into FMAs would not.
 _NO_FMA = {} if _INTERPRET else {"enable_fp_fusion": False}
@@ -216,3 +221,90 @@ def sink_scale_output(attn_output, lse, sinks):
         return _disable(e)
     FUSED_DECODE_CALLS["sink_scale_output"] += 1
     return out
+
+
+# static_cache_update replays transformers' own decode branch with fewer ops, so it runs only where that
+# code is the one verified here (transformers 5.8 - 5.17): sha256 of each method's stripped source lines.
+_CACHE_ENABLED = (
+    os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
+    and os.environ.get("UNSLOTH_GPT_OSS_FAST_CACHE_UPDATE", "1") != "0"
+)
+_VERIFIED_UPDATE = {
+    "Cache": ("035177fec467f485",),
+    "StaticLayer": ("6a9b8de193e7b639",),
+    "StaticSlidingWindowLayer": ("c114eb5d4cfb9a71",),
+}
+_STATIC_CLASSES = None
+
+
+def _source_digest(func):
+    import hashlib
+    import inspect
+    lines = (line.strip() for line in inspect.getsource(func).splitlines())
+    return hashlib.sha256("\n".join(line for line in lines if line).encode()).hexdigest()[:16]
+
+
+def _static_classes():
+    """(Cache, StaticLayer, StaticSlidingWindowLayer) when their update methods are the verified ones, else ()."""
+    global _STATIC_CLASSES
+    if _STATIC_CLASSES is None:
+        _STATIC_CLASSES = ()
+        try:
+            from transformers import cache_utils
+            classes = (cache_utils.Cache, cache_utils.StaticLayer, cache_utils.StaticSlidingWindowLayer)
+            if all(_source_digest(c.update) in _VERIFIED_UPDATE[c.__name__] for c in classes):
+                _STATIC_CLASSES = classes
+        except Exception:
+            pass
+    return _STATIC_CLASSES
+
+
+def static_cache_update(cache, key_states, value_states, layer_idx):
+    """cache.update(key_states, value_states, layer_idx) for one new token on an initialized StaticLayer or a
+    full StaticSlidingWindowLayer, with the same results and state; None when the call is not covered (callers
+    then run cache.update)."""
+    if (
+        not _CACHE_ENABLED or key_states.shape[-2] != 1 or key_states.device.type not in ("cuda", "cpu")
+        or torch.is_grad_enabled() or torch.compiler.is_compiling() or torch.jit.is_tracing()
+    ):
+        return None
+    classes = _static_classes()
+    if not classes:
+        return None
+    base, static, sliding = classes
+    if type(cache).update is not base.update or getattr(cache, "offloading", False):
+        return None
+    layers = getattr(cache, "layers", None)
+    if layers is None or not (0 <= layer_idx < len(layers)):
+        return None
+    layer = layers[layer_idx]
+    kind = type(layer)
+    if (kind is not static and kind is not sliding) or not getattr(layer, "is_initialized", False):
+        return None
+    keys, values = layer.keys, layer.values
+    if (
+        key_states.dtype != keys.dtype or value_states.dtype != values.dtype
+        or key_states.device != keys.device or value_states.device != values.device
+        or key_states.shape[:2] != keys.shape[:2] or key_states.shape[-1] != keys.shape[-1]
+        or value_states.shape[:2] != values.shape[:2] or value_states.shape[-1] != values.shape[-1]
+    ):
+        return None
+    if kind is sliding:
+        # transformers: is_full -> roll(-1), write the last slot through a host-built index, copy back.
+        if layer.cumulative_length_int < layer.max_cache_len:
+            return None
+        layer.cumulative_length_int += 1
+        keys.copy_(torch.cat((keys[:, :, 1:], key_states), dim = -2))
+        values.copy_(torch.cat((values[:, :, 1:], value_states), dim = -2))
+    else:
+        # transformers: index_copy_ at arange(1) + cumulative_length, then cumulative_length += 1. The copies
+        # read the counter before the add on the same stream.
+        position = layer.cumulative_length
+        if position.dim() != 0 or position.device != keys.device:
+            return None
+        position = position.view(1)
+        keys.index_copy_(2, position, key_states)
+        values.index_copy_(2, position, value_states)
+        layer.cumulative_length.add_(1)
+    FUSED_DECODE_CALLS["static_cache_update"] += 1
+    return keys, values
