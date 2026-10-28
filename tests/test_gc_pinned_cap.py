@@ -395,3 +395,32 @@ def test_release_uses_the_block_charged_at_allocation(monkeypatch, host_alloc_co
     # No cached 4 MiB block: the request must not take the cached-block shortcut past the cap.
     assert not gc_module._reserve_pinned(4 * MIB)
     assert flushes and gc_module.GC_PINNED_BYTES == 4 * MIB
+
+
+def test_concurrent_releases_keep_the_cap_bookkeeping_consistent(gc_module, monkeypatch):
+    # Split-model backward releases on autograd worker threads; the read-modify-write over the cap
+    # globals must not lose updates (a lost update leaks charged bytes and offload goes pageable early).
+    import sys, threading
+    MIB = 1 << 20
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        leaked = errors = 0
+        for _ in range(20):
+            gc_module.GC_PINNED_BYTES, gc_module._PINNED_CACHED, gc_module._PINNED_LIVE = 0, {}, {}
+            for _ in range(400): assert gc_module._reserve_pinned(MIB)
+            bad = []
+            def release():
+                for _ in range(200):
+                    try: gc_module._release_pinned(MIB)
+                    except Exception as e: bad.append(e)
+            threads = [threading.Thread(target = release) for _ in range(2)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+            cached = sum(k * v for k, v in gc_module._PINNED_CACHED.items())
+            leaked += (gc_module.GC_PINNED_BYTES - cached) // MIB
+            errors += len(bad)
+    finally:
+        sys.setswitchinterval(old)
+    assert errors == 0
+    assert leaked == 0

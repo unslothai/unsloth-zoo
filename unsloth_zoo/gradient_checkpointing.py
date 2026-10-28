@@ -399,7 +399,7 @@ def _reset_pinned_cap():
     _WARNED_ABOUT_PINNED_CAP = False
 
 
-def _reserve_pinned(nbytes):
+def _reserve_pinned_unlocked(nbytes):
     """Count `nbytes` against the pinned cap; False means allocate pageable instead."""
     global GC_PINNED_BYTES, GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _HOST_HELD_BASELINE
     block = _pinned_block_bytes(nbytes)
@@ -545,7 +545,7 @@ def _flushed_cached_fits(block, used):
     return max(GC_PINNED_BYTES, held - _HOST_HELD_BASELINE) + block <= GC_PINNED_CAP
 
 
-def _release_pinned(nbytes):
+def _release_pinned_unlocked(nbytes):
     """The block stays pinned in torch's host cache, so it stays charged until reused; one above
     pinned_max_cached_size_mb (torch 2.13+) goes back to the OS, so it stops being charged."""
     global GC_PINNED_BYTES, _PINNED_RELEASED
@@ -566,6 +566,22 @@ def _release_pinned(nbytes):
     else:
         GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
 
+
+
+# Releases can run on autograd worker threads (split-model backward) while the main thread reserves, and the
+# cap bookkeeping is a read-modify-write over several globals: serialise both (re-entrant for flushes).
+_PINNED_LOCK = threading.RLock()
+
+
+def _reserve_pinned(nbytes):
+    """Count `nbytes` against the pinned cap; False means allocate pageable instead."""
+    with _PINNED_LOCK:
+        return _reserve_pinned_unlocked(nbytes)
+
+
+def _release_pinned(nbytes):
+    with _PINNED_LOCK:
+        return _release_pinned_unlocked(nbytes)
 
 def _view_bytes_as(buffer, nbytes, dtype, shape):
     """Reinterpret raw buffer bytes, never cast: the init dtype can differ from the activation's."""
