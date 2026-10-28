@@ -514,6 +514,28 @@ def _locking_unsupported(error):
 pass
 
 
+def _probe_os_lock(path):
+    """One non-blocking flock on our own descriptor before filelock's acquire.
+    filelock 3.x retries every flock error but ENOSYS (3.10: every one) until
+    the timeout, so a filesystem that refuses locks (NFS without a lock
+    manager: ENOLCK; EOPNOTSUPP) stalled interpreter exit for _LOCK_TIMEOUT.
+    Contention passes through to the real acquire; any other errno raises
+    here and is classified by _locking_unsupported. msvcrt.locking errors
+    other than contention already raise inside filelock."""
+    if os.name != "posix":
+        return
+    import fcntl
+    fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+            raise
+    finally:
+        os.close(fd)
+pass
+
+
 @contextlib.contextmanager
 def _key_lock(directory):
     """Serialize savers of one key across processes: read-merge-publish-collect
@@ -533,6 +555,7 @@ def _key_lock(directory):
             raise NotImplementedError(os.name)
         path = os.path.join(directory, _LOCK_NAME)
         if _prepare_lock_file(path):
+            _probe_os_lock(path)
             lock = _platform_lock(path)
             lock.acquire()
         else:

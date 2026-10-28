@@ -250,6 +250,41 @@ def test_unsupported_locking_keeps_the_unlocked_save(cache, recorder, monkeypatc
     assert cache.megacache_save() is True
 
 
+
+class _RetriesUntilTimeout:
+    """filelock 3.x on a filesystem that refuses flock: every non-ENOSYS error is retried until the timeout."""
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+
+    def acquire(self):
+        import filelock
+        time.sleep(self.timeout)
+        raise filelock.Timeout("lock")
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "flock")
+@pytest.mark.parametrize("code, saved", [("ENOLCK", True), ("EOPNOTSUPP", True), ("EIO", False)])
+def test_a_filesystem_refusing_flock_never_waits_for_the_timeout(cache, recorder, monkeypatch, code, saved):
+    import errno
+    import fcntl
+
+    real_flock = fcntl.flock
+
+    def refusing_flock(fd, operation):
+        if operation & fcntl.LOCK_EX:
+            raise OSError(getattr(errno, code), os.strerror(getattr(errno, code)))
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", refusing_flock)
+    monkeypatch.setattr(cache, "_LOCK_TIMEOUT", 5)
+    monkeypatch.setattr(cache, "_platform_lock", lambda path: _RetriesUntilTimeout(cache._LOCK_TIMEOUT))
+    recorder.record("a", "1")
+    started = time.monotonic()
+    # Unsupported locking saves unlocked as before the lock existed; any other error skips; neither waits.
+    assert cache.megacache_save() is saved
+    assert time.monotonic() - started < 2
+
 def test_platform_lock_never_downgrades_to_a_soft_lock(cache):
     import filelock
 
