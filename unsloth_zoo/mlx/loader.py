@@ -2707,7 +2707,22 @@ def _config_source_has_modality(package_dir: Path) -> bool:
             }
             if fields.intersection(_VLM_MODALITY_CONFIG_FIELDS):
                 return True
+            # Assigned to self at init from a checkpoint's own layout, as LFM3-Audio's audio_encoder_config.
+            for item in ast.walk(node):
+                if isinstance(item, ast.Assign) and not (isinstance(item.value, ast.Constant) and item.value.value is None):
+                    for target in item.targets:
+                        if (
+                            isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                            and target.value.id == "self" and _names_modality_config(target.attr)
+                        ):
+                            return True
     return False
+
+
+def _names_modality_config(name: str) -> bool:
+    return name in _VLM_MODALITY_CONFIG_FIELDS or (
+        name.endswith("_config") and ("audio" in name or "vision" in name)
+    )
 
 
 def _build_vlm_model_types():
