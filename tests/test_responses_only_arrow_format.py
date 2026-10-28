@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`train_on_responses_only` on a `with_format("arrow")` split.
-
-Arrow-format rows are pyarrow Tables: the masking crashed on them, and a torch
-DataLoader cannot index them either. The split must keep and drop exactly what
-the default format does, print the same messages, and come back in the default
-format so a trainer can batch it. CPU-pure, offline.
-"""
+"""An arrow split masks like the default format and comes back batchable (pyarrow Tables are not)."""
 
 import contextlib
 import io

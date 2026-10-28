@@ -2154,12 +2154,10 @@ def train_on_responses_only(
         _refuse_packing_that_will_not_happen(trainer.data_collator, None)
 
     def _mask_split(dataset, dataset_name):
-        # Arrow-format rows are pyarrow Tables, which neither the steps below nor a torch
-        # DataLoader can read, so the split comes back in the default (python) format.
+        # Arrow rows are pyarrow Tables, unreadable here and by a torch DataLoader: return python format.
         fmt = None if isinstance(dataset, IterableDataset) else getattr(dataset, "format", None)
         if isinstance(fmt, dict) and fmt.get("type") == "arrow":
-            # `_format_columns`, not format["columns"]: the latter lists every column
-            # when no selection was made, which would pin today's columns.
+            # `_format_columns`: format["columns"] lists every column when none were selected.
             dataset = dataset.with_format(
                 None,
                 columns = getattr(dataset, "_format_columns", fmt.get("columns")),
