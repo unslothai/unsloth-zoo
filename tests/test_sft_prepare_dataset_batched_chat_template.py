@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import unsloth_zoo.dataset_utils as dataset_utils
 from unsloth_zoo.dataset_utils import sft_prepare_dataset
 
 transformers = pytest.importorskip("transformers")
@@ -43,6 +44,12 @@ def _conversation(i):
         {"role": "user", "content": f"Question {i}: what is {i} plus {i}? " * (1 + i % 3)},
         {"role": "assistant", "content": f"The answer is {2 * i}. " * (1 + i % 4)},
     ]
+
+
+@pytest.fixture(autouse = True)
+def _keep_mask_columns(monkeypatch):
+    # TRL >= 1.7 turns the mask columns into labels inside sft_prepare_dataset; these tests read the masks.
+    monkeypatch.setattr(dataset_utils, "trl_collator_applies_masks", lambda: True)
 
 
 def _prepare(tokenizer, rows, assistant_only_loss = False, max_length = 4096):
@@ -86,7 +93,7 @@ def test_prompt_completion_rows_share_template_calls(monkeypatch):
     assert counter.calls == 2, counter.calls
     for row, ids, mask in zip(rows, out["input_ids"], out["completion_mask"]):
         full = tokenizer.apply_chat_template(row["prompt"] + row["completion"], tokenize = True, return_dict = True)["input_ids"]
-        prompt = tokenizer.apply_chat_template(row["prompt"], tokenize = True, add_generation_prompt = True)
+        prompt = tokenizer.apply_chat_template(row["prompt"], tokenize = True, add_generation_prompt = True, return_dict = False)
         assert ids == list(full)
         assert mask == [0] * len(prompt) + [1] * (len(full) - len(prompt))
 
@@ -114,5 +121,9 @@ def test_a_failing_row_raises_the_row_by_row_error():
     tokenizer = _tokenizer()
     rows = [{"messages": _conversation(i)} for i in range(8)]
     rows[5]["messages"] = []
-    with pytest.raises(IndexError):
+    # transformers 4.x raises IndexError for an empty conversation, 5.x a ValueError: expect what one row raises.
+    with pytest.raises(Exception) as expected:
+        tokenizer.apply_chat_template([], tokenize = True, return_dict = True)
+    with pytest.raises(expected.type) as raised:
         _prepare(tokenizer, rows)
+    assert str(raised.value) == str(expected.value)
