@@ -1190,9 +1190,7 @@ _CPU_SLOT_TOP = 0       # slots [0, _CPU_SLOT_TOP) have been handed out at least
 _CPU_SLOT_EPOCH = 0     # bumped by every pool reset; a lease from an older epoch is ignored
 # A slot released on one device's side stream and leased on another waits on the release event.
 _SLOT_FENCES = {}       # slot index -> (device index, event recorded at release)
-# A backward returns its slot, but a graph kept with retain_graph=True can be backpropagated
-# again and reads the same slot. Such a slot is set aside instead of being overwritten by the
-# next forward, and comes back once that graph is freed.
+# A retain_graph=True graph re-reads its slot on the next backward: hold it until the graph is freed.
 _SLOT_HOLDERS = {}      # slot index -> weakref to the autograd ctx whose backward returned it
 _RETAINED_SLOTS = {}    # slot index -> weakref to a ctx whose graph is still retained
 
@@ -1209,13 +1207,12 @@ pass
 
 
 def _graph_retained(ctx_ref):
-    """True while the ctx's saved tensors are alive, i.e. its graph can still be backpropagated."""
     ctx = ctx_ref()
     if ctx is None: return False
     try:
         ctx._raw_saved_tensors
     except (RuntimeError, AttributeError):
-        return False  # freed by a backward without retain_graph
+        return False
     return True
 pass
 
@@ -1650,8 +1647,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 if in_chain:
                     _prefetch_offloaded_input(CPU_INDEX - 1, device_index, generation, buffer_slot)
             pass
-            # Reload is queued on EXTRA_STREAM, as is the next offload into it: safe to reuse now,
-            # unless this graph is retained for another backward (checked when the slot is leased).
+            # Reload is queued on EXTRA_STREAM, as is the next offload into it: safe to reuse now
+            # unless the graph is retained (checked at lease time).
             lease = getattr(ctx, "_cpu_slot", None)
             if lease is not None: lease.release(ctx)
         else:

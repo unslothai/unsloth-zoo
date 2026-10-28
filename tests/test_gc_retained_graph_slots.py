@@ -2,14 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Smart GC host slots for a graph kept with retain_graph=True.
-
-A backward returned its host slot right away, so in F0 B0(retain_graph) F1 B1 B0 the forward
-of step 1 overwrote the activations that the second backward of step 0 reads back, and that
-backward silently produced wrong gradients. The slot of a retained graph is now set aside until
-the graph is freed. The device side is replaced with no-op streams so the host bookkeeping runs
-on CPU unchanged; grads must match a plain stack bit for bit.
-"""
+"""Regression: in F0 R0 F1 B1 B0 the forward of step 1 overwrote the host slot the retained
+graph of step 0 re-reads, giving wrong grads. Streams are stubbed so this runs on CPU."""
 import contextlib
 import gc
 
@@ -75,7 +69,7 @@ def _fwd(G, ws, x, ckpt):
 
 
 def _run(G, schedule, ckpt):
-    """schedule: (op, k) with op F (forward), R (backward, retain_graph) or B (backward)."""
+    """op: F forward, R backward(retain_graph), B backward."""
     ws, xs = _setup()
     losses, grads = {}, []
     for op, k in schedule:
@@ -94,12 +88,12 @@ def _parse(text):
 
 
 @pytest.mark.parametrize("schedule", [
-    "F0 R0 F1 B1 B0",          # second backward of a retained graph after another step
-    "F0 R0 B0 F1 B1",          # retain then backward again right away
-    "F0 R0 F1 R1 F2 B2 B1 B0",  # several retained graphs in flight
+    "F0 R0 F1 B1 B0",
+    "F0 R0 B0 F1 B1",
+    "F0 R0 F1 R1 F2 B2 B1 B0",
 ])
 def test_retained_graph_backward_matches_plain_stack(G, schedule):
-    _run(G, _parse("F0 B0"), True)  # settle FIRST_PASS / LAST_GC_INDEX like a real run
+    _run(G, _parse("F0 B0"), True)  # settle FIRST_PASS / LAST_GC_INDEX
     ref = _run(G, _parse(schedule), False)
     got = _run(G, _parse(schedule), True)
     assert len(ref) == len(got)
@@ -120,7 +114,7 @@ def test_retained_slots_return_once_the_graph_is_freed(G):
     del loss, loss2
     gc.collect()
     top = G._CPU_SLOT_TOP
-    for k in range(3):  # retained graph gone: plain steps reuse the pool, it does not grow
+    for k in range(3):
         loss = _fwd(G, ws, xs[k].requires_grad_(), True)
         loss.backward()
     assert G._CPU_SLOT_TOP == top
