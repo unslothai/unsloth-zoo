@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""``add_new_tokens`` with a repeated entry in ``new_tokens``.
-
-``tokenizer.add_tokens`` keeps one row per distinct token, but the interpolation loop
-wrote one row per list entry: a repeat shifted every later token onto its neighbour's
-row and the last write landed past the new tokens (IndexError on a tight embedding,
-a clobbered alignment row on a padded one).
-"""
+"""A repeated entry in ``new_tokens`` must not shift later interpolation rows."""
 
 import pytest
 import torch
@@ -45,7 +39,6 @@ def test_repeated_new_token_keeps_one_row_per_token(padded):
     model, tokenizer = _build(padded)
     emb = model.get_input_embeddings().weight
     before = emb.detach().clone()
-    # Two tokens whose pieces differ, the first one repeated.
     first, second = "tok5 tok6", "tok7 tok8"
 
     add_new_tokens(
@@ -62,5 +55,4 @@ def test_repeated_new_token_keeps_one_row_per_token(padded):
         expected = mean * 0.5 + before[pieces].float().mean(0) * 0.5
         assert torch.allclose(row, expected, atol = 1e-5), token
     if padded > VOCAB_TOK:
-        # Alignment rows past the two new tokens are left as shipped.
         assert torch.equal(emb[VOCAB_TOK + 2:padded], before[VOCAB_TOK + 2:padded])

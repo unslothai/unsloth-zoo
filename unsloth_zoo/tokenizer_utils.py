@@ -223,7 +223,7 @@ def add_new_tokens(
         )
         new_tokens = [x for x in new_tokens if x not in overlapping_tokens]
     pass
-    # add_tokens keeps one row per distinct token, so a repeat would shift the interpolation rows below.
+    # add_tokens dedupes; a repeat here would shift every later interpolation row.
     new_tokens = list(dict.fromkeys(new_tokens))
 
     # Get mean of trained tokens
