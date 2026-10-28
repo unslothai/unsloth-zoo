@@ -2,8 +2,8 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The reversed-key index in `_infer_prefix_and_remap` must give the exact candidates
-of the linear suffix scan it replaces: a wrong candidate list silently routes a LoRA
-delta onto the wrong tensor. Pure-function, CPU-only."""
+"""The reversed-key index must return exactly the linear scan's candidates: a wrong list routes a LoRA delta onto the wrong tensor."""
 
 from __future__ import annotations
 
@@ -71,22 +69,18 @@ def test_index_matches_linear_scan_randomized():
     for _ in range(3000):
         lora = [".".join(r.choice(_COMP) for _ in range(r.randint(1, 4))) for _ in range(r.randint(1, 6))]
         keys = [r.choice(_PREFIX) + r.choice(lora) + r.choice(_SUFFIX) for _ in range(r.randint(1, 12))]
-        keys += r.sample(keys, r.randint(0, min(3, len(keys))))  # exact duplicates
+        keys += r.sample(keys, r.randint(0, min(3, len(keys))))
         r.shuffle(keys)
         for k in lora + [r.choice(keys)]:
             assert _indexed(keys, k) == _linear_candidates(keys, k), (keys, k)
 
 
 @pytest.mark.parametrize("keys, k", [
-    # Suffix inside a path component is still a match (arbitrary string suffix semantics).
     (["xmodel.layers.0.q.weight"], "model.layers.0.q"),
     (["model.layers.0.q.weight", "xmodel.layers.0.q.weight"], "odel.layers.0.q"),
-    # Two prefixes: both must surface so the ambiguity guard sees them.
     (["a.model.q.weight", "b.model.q.weight", "a.model.q.weight"], "model.q"),
-    # .weight hits come before .linear.weight hits, each in original key order.
     (["z.m.q.linear.weight", "a.m.q.weight", "y.m.q.weight"], "m.q"),
     (["p.m.q.linear.weight", "p.m.q.weight"], "m.q"),
-    # Neighbours in sorted reversed order that are NOT suffix hits.
     (["m.q.weightx", "xm.q.weight", "m.qq.weight", "m.q.weight.weight"], "m.q"),
     (["\U0001f600.m.q.weight", "ém.q.weight"], "m.q"),
 ])
@@ -119,9 +113,9 @@ def test_remap_unchanged_by_index(container, monkeypatch):
     disk = [
         "language_model.model.layers.0.q.weight",
         "language_model.model.layers.0.k.linear.weight",
-        "a.model.layers.1.q.weight", "b.model.layers.1.q.weight",   # ambiguous -> unmatched
-        "xmodel.q.weight",                                          # in-component suffix
-        "lm_head.weight",                                           # direct
+        "a.model.layers.1.q.weight", "b.model.layers.1.q.weight",
+        "xmodel.q.weight",
+        "lm_head.weight",
     ]
     expected = _reference_remap(_lw(lora), container(disk), monkeypatch)
     assert expected is not None
@@ -138,7 +132,7 @@ def test_index_built_once_and_only_when_needed(monkeypatch):
     assert len(calls) == 1
     calls.clear()
     assert su._infer_prefix_and_remap(_lw(["language_model.model.layers.0.q"]), disk) is None
-    assert calls == []  # every key matched directly: no index
+    assert calls == []
 
 
 def test_unsupported_inputs_keep_linear_scan(monkeypatch):
@@ -148,6 +142,5 @@ def test_unsupported_inputs_keep_linear_scan(monkeypatch):
     assert su._build_reversed_key_index({"a.weight": 1}.keys()) is None
     assert su._build_reversed_key_index(["a.weight", S("b.weight")]) is None
     assert su._build_reversed_key_index(["a.weight", 3]) is None
-    # A non-string shard key still fails exactly as the linear scan does.
     with pytest.raises(AttributeError):
         su._infer_prefix_and_remap(_lw(["m.q"]), ["x.m.q.weight", 3])

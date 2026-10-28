@@ -6782,11 +6782,7 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefix
 pass
 
 def _build_reversed_key_index(safetensor_keys):
-    """Sorted `(reversed key, position)` pairs (+ the keys), so a suffix lookup is a `bisect` scan.
-
-    `None` for anything but plain `str` keys in a list/tuple/set/frozenset; the caller then
-    keeps the original linear scan, so odd inputs behave exactly as before.
-    """
+    """Sorted (reversed key, position) pairs + keys; None unless plain str keys in a list/tuple/set/frozenset (caller keeps the linear scan)."""
     if type(safetensor_keys) not in (list, tuple, set, frozenset):
         return None
     keys = safetensor_keys if type(safetensor_keys) in (list, tuple) else list(safetensor_keys)
@@ -6808,7 +6804,6 @@ def _indexed_prefix_candidates(index, keys, k):
         start = end = bisect.bisect_left(index, (reversed_suffix,))
         while end < len(index) and index[end][0].startswith(reversed_suffix):
             end += 1
-        # Original key order, as the linear scan visits them.
         for position in sorted(position for _, position in index[start:end]):
             prefix = keys[position][: -len(suffix)]
             if prefix:
@@ -6848,7 +6843,7 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             continue
         # unique prefix candidates; also accept a .linear.weight shard (Gemma4) so a
         # prefix-add onto it is not dropped.
-        if not suffix_index_built:   # built once per call, only if a key needs it
+        if not suffix_index_built:
             suffix_index, suffix_index_built = _build_reversed_key_index(safetensor_keys), True
         if suffix_index is not None and type(k) is str:
             candidates = _indexed_prefix_candidates(*suffix_index, k)
