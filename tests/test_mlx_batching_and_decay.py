@@ -3066,6 +3066,55 @@ def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
     assert Gemma4TextModel()._make_masks(None, [None, None]) == ["upstream", "upstream"]
 
 
+def test_gemma4_unified_call_hands_image_token_types_to_the_text_model(monkeypatch):
+    """Upstream's call drops them, so training saw no vision overlay while generation did."""
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+
+    module = pytest.importorskip("mlx_vlm.models.gemma4_unified.gemma4_unified")
+    for name in ("__call__", "_update_chunked_prefill_mode"):
+        monkeypatch.setattr(module.Model, name, getattr(module.Model, name))
+    monkeypatch.setattr(module, "_compact_prefix_rows", getattr(module, "_compact_prefix_rows", None))
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    from unsloth_zoo.mlx.utils import _call_forwards_mm_token_type_ids
+
+    install = mc._runtime_patch_primitive_installers()["gemma4_unified_multimodal_runtime"]
+    stock = module.Model.__call__
+    assert not _call_forwards_mm_token_type_ids(stock)
+    install()
+    patched = module.Model.__call__
+    install()
+    assert module.Model.__call__ is patched
+    # The CCE loss forwards token types only where this call does.
+    assert _call_forwards_mm_token_type_ids(patched)
+
+    def forwarding_upstream(self, input_ids=None, mm_token_type_ids=None, **kwargs):
+        return mm_token_type_ids
+
+    monkeypatch.setattr(module.Model, "__call__", forwarding_upstream)
+    install()
+    assert module.Model.__call__ is forwarding_upstream
+    monkeypatch.setattr(module.Model, "__call__", patched)
+
+    seen = {}
+    model = NS(
+        get_input_embeddings=lambda **kw: seen.update(embed=sorted(kw)) or NS(
+            inputs_embeds="embeds", per_layer_inputs="per_layer"),
+        language_model=lambda *a, **kw: seen.update(lm=(a, kw)) or "out",
+    )
+    types, pair = object(), object()
+    out = patched(model, "ids", "pixels", mask="mask", cache="cache", mm_token_type_ids=types,
+                  token_type_ids=pair, logits_to_keep=1, image_position_ids="pos")
+    assert out == "out"
+    assert seen["embed"] == ["image_position_ids", "input_ids", "logits_to_keep",
+                             "mm_token_type_ids", "pixel_values", "token_type_ids"]
+    assert seen["lm"] == ((None,), dict(
+        cache="cache", inputs_embeds="embeds", mask="mask", per_layer_inputs="per_layer",
+        logits_to_keep=1, mm_token_type_ids=types))
+
+
 def test_cce_only_compile_family_is_refused_on_the_standard_loss():
     """ernie's upstream forward, which `use_cce=False` runs, still reads on the
     host; compile must be refused up front rather than fail mid-run."""

@@ -2411,10 +2411,11 @@ def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
     )
 
 
-@pytest.mark.parametrize("model_type,forwarded", [
-    ("gemma4", True), ("gemma4_unified", False),
+@pytest.mark.parametrize("model_type,call_forwards,forwarded", [
+    ("gemma4", True, True), ("gemma4_unified", True, True),
+    ("gemma4_unified", False, False), ("qwen3_vl", True, False),
 ])
-def test_cce_forwards_mm_token_types_where_the_model_does(model_type, forwarded):
+def test_cce_forwards_mm_token_types_where_the_model_does(model_type, call_forwards, forwarded):
     """CCE loss passes `mm_token_type_ids` only where `Model.__call__` does."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.utils import _vlm_cce_forward
@@ -2438,6 +2439,13 @@ def test_cce_forwards_mm_token_types_where_the_model_does(model_type, forwarded)
             return SimpleNamespace(
                 inputs_embeds=mx_.zeros((*inputs.shape, 4), dtype=mx_.float32))
 
+    def forwarding_call(self, inputs, mm_token_type_ids=None, **_kwargs):
+        return self.language_model.model(inputs, mm_token_type_ids=mm_token_type_ids)
+
+    def dropping_call(self, inputs, **_kwargs):
+        return self.language_model.model(inputs)
+
+    _Model.__call__ = forwarding_call if call_forwards else dropping_call
     ids = mx_.array([[5, 6, 7, 8], [5, 6, 7, 8]], dtype=mx_.int32)
     types = mx_.array([[0, 1, 1, 0], [0, 0, 1, 1]], dtype=mx_.int32)
     _vlm_cce_forward(_Model(), {

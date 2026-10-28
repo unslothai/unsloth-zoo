@@ -3222,8 +3222,17 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     return loss_fn
 
 
-# gemma4_unified shares the text model but its `Model.__call__` drops `mm_token_type_ids`.
-_VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4"})
+# Their text model reads `mm_token_type_ids`; forwarded only where `Model.__call__`
+# forwards it too, so both losses agree (unpatched gemma4_unified drops it).
+_VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4", "gemma4_unified"})
+
+
+@lru_cache(maxsize=None)
+def _call_forwards_mm_token_type_ids(call):
+    try:
+        return "mm_token_type_ids" in inspect.getsource(call)
+    except (OSError, TypeError):
+        return False
 
 
 def _drop_pair_token_type_ids(batch_dict, kwargs):
@@ -3409,6 +3418,7 @@ def _vlm_hidden_states(model, batch_dict):
         "mm_token_type_ids" in extra_kwargs
         and _config_get(getattr(model, "config", None), "model_type")
         in _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES
+        and _call_forwards_mm_token_type_ids(getattr(type(model), "__call__", None))
     ):
         backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 

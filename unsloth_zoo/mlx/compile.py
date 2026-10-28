@@ -6112,6 +6112,34 @@ def _install_gemma4_unified_compile_patches():
         setattr(module, "_compact_prefix_rows", _static_shape_prefix_rows)
 
     model_cls = getattr(module, "Model", None)
+    original_call = getattr(model_cls, "__call__", None)
+    if original_call is not None and "mm_token_type_ids" not in _safe_getsource(original_call):
+
+        def patched_call(self, input_ids=None, pixel_values=None, mask=None, cache=None, **kwargs):
+            # Upstream's call drops `mm_token_type_ids`, so image tokens missed the
+            # vision overlay that generation (which calls the language model) applies.
+            features = self.get_input_embeddings(
+                input_ids=input_ids, pixel_values=pixel_values, **kwargs,
+            )
+            lm_kwargs = {
+                k: kwargs[k]
+                for k in (
+                    "capture_layer_ids", "hidden_sink", "shared_kv_sink", "return_hidden",
+                    "return_shared_kv", "logits_to_keep", "mm_token_type_ids",
+                )
+                if k in kwargs
+            }
+            return self.language_model(
+                None,
+                cache=cache,
+                inputs_embeds=features.inputs_embeds,
+                mask=mask,
+                per_layer_inputs=features.per_layer_inputs,
+                **lm_kwargs,
+            )
+
+        _patch_method(model_cls, "__call__", patched_call)
+
     original_update = getattr(model_cls, "_update_chunked_prefill_mode", None)
     if original_update is None:
         return
@@ -7174,7 +7202,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
         ),
         CompilePatternBundle(
             name="gemma4_unified_multimodal",
-            description="Gemma 4 unified padded-feature compaction and chunked-prefill bookkeeping.",
+            description="Gemma 4 unified padded-feature compaction, chunked-prefill bookkeeping, and image token types handed to the text model.",
             matcher=lambda arch, report: arch == "gemma4_unified",
             primitive_names=(
                 "static_shape_feature_compaction",
