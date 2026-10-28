@@ -91,7 +91,7 @@ print("OK")
 
 def test_gemma3_prepare_decode_after_prefill():
     pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", UNSLOTH_ZOO_DISABLE_GPU_INIT = "1")
     env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p)
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     env.pop("UNSLOTH_FORCE_FLOAT32", None)
