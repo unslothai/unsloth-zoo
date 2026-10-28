@@ -7087,7 +7087,16 @@ def _open_gguf_reader(path):
     import sys
     import numpy as np
     from gguf.constants import GGUFValueType  # type: ignore
+    from gguf import gguf_reader as _stock_reader_module  # type: ignore
     from gguf.gguf_reader import GGUFReader  # type: ignore
+
+    def _stock_limit(name):
+        # gguf-py releases that bound array and string lengths check them inside the
+        # per-entry parser this skips; past either bound the stock parser decides.
+        try:
+            return int(getattr(_stock_reader_module, name, 1 << 30))
+        except Exception:
+            return 0
 
     class _VerifyGGUFReader(GGUFReader):
         def _get_field_parts(self, orig_offs, raw_type):
@@ -7109,6 +7118,8 @@ def _open_gguf_reader(path):
             count = int(alen[0])
             if count <= _GGUF_VERIFY_BULK_ARRAY_MIN:
                 return None
+            if count > _stock_limit("GGUF_MAX_ARRAY_ELEMENTS"):
+                return None
             itype = GGUFValueType(int(raw_itype[0]))
             types = [GGUFValueType.ARRAY, itype]
             offs = orig_offs + 12
@@ -7126,11 +7137,15 @@ def _open_gguf_reader(path):
             unpack = struct.Struct(order + "Q").unpack_from
             data = memoryview(self.data)
             end = len(data)
+            max_string = _stock_limit("GGUF_MAX_STRING_LENGTH")
             first = offs
             for _ in range(count):
                 if offs + 8 > end:
                     return None
-                offs += 8 + unpack(data, offs)[0]
+                length = unpack(data, offs)[0]
+                if length > max_string:
+                    return None
+                offs += 8 + length
                 if offs > end:
                     return None
             first_len = self._get(first, np.uint64)

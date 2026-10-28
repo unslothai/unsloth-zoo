@@ -138,3 +138,32 @@ def test_corrupt_files_fail_like_stock(llama_cpp, tmp_path):
         path = tmp_path / f"{name}.gguf"
         path.write_bytes(data)
         assert _outcome(llama_cpp._open_gguf_reader, str(path)) == _outcome(_stock, path), name
+
+
+@pytest.mark.parametrize("limit, value", [
+    ("GGUF_MAX_ARRAY_ELEMENTS", 2000),
+    ("GGUF_MAX_STRING_LENGTH", 100),
+])
+def test_stock_length_limits_are_left_to_the_stock_parser(llama_cpp, tmp_path, monkeypatch, limit, value):
+    # Newer gguf-py rejects arrays and strings past module-level bounds inside the
+    # per-entry parser. Past a bound the fast path must step aside, so the stock
+    # parser raises (or, on releases without the check, reads) exactly as before.
+    import gguf.gguf_reader as stock_module
+
+    path = tmp_path / "long_token.gguf"
+    w = GGUFWriter(str(path), "llama")
+    w.add_block_count(2)
+    w.add_token_list(["t" * 300 if i == 3000 else f"t{i}" for i in range(VOCAB)])
+    w.add_token_scores([float(i % 7) for i in range(VOCAB)])
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    monkeypatch.setattr(stock_module, limit, value, raising = False)
+    stock_outcome = _outcome(_stock, path)
+    assert _outcome(llama_cpp._open_gguf_reader, str(path)) == stock_outcome
+    if stock_outcome[0] == "ok":
+        fast = llama_cpp._open_gguf_reader(str(path))
+        stock = _stock(path)
+        for key in ("tokenizer.ggml.tokens", "tokenizer.ggml.scores") if limit.endswith("ELEMENTS") else ("tokenizer.ggml.tokens",):
+            assert len(fast.fields[key].parts) == len(stock.fields[key].parts), key
