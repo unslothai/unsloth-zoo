@@ -4853,14 +4853,6 @@ def _get_existing_mlx_quantization(config_data: dict):
     return None
 
 
-def _vlm_config_is_already_quantized(config_data: dict) -> bool:
-    """Return True when config indicates pre-quantized MLX/HF weights."""
-    quantization = _get_existing_mlx_quantization(config_data)
-    if quantization:
-        return True
-    return False
-
-
 def _quant_config_to_dict(quantization_config):
     if quantization_config is None:
         return {}
