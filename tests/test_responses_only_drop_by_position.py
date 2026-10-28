@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""``train_on_responses_only`` drops fully masked rows by the positions its label scan found.
-
-The scan over the ``labels`` column already lists every fully masked row. The filter that
-removes them used to decode every column of every row again to re-derive the same answer;
-it now keeps a row exactly when its position is not on that list. Survivors must be the
-same rows in the same order, including on shuffled / selected views, formatted datasets and
-under ``num_proc``; a custom transform still re-reads the labels.
-
-CPU-pure and offline: the tokenizer is a local stub.
-"""
+"""train_on_responses_only drops fully masked rows by scan position; survivors match the label re-read."""
 
 import random
 import types
@@ -92,8 +83,7 @@ def test_filter_decides_by_position_without_reading_rows(monkeypatch):
     assert out["input_ids"] == _expected(dataset)
     assert len(seen) == 1
     function, kwargs = seen[0]
-    # The predicate answers from row positions alone: handing it rows that cannot be read
-    # must still give the same keep mask the run used.
+    # Rows that raise on any read must still give the run's keep mask.
     masked = {i for i, row in enumerate(dataset["input_ids"]) if ASSISTANT_ID not in row}
     if kwargs.get("batched") and kwargs.get("with_indices"):
         mask = function(_Unreadable(), list(range(len(dataset))))
