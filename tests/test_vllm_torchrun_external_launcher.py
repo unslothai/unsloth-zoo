@@ -221,6 +221,8 @@ def test_split_group_gets_a_device_bound_default_group(monkeypatch, split_group)
     monkeypatch.setattr(dist, "get_rank", lambda: 1)
     monkeypatch.setattr(dist, "get_world_size", lambda: 2)
     monkeypatch.setattr(vu, "get_target_device", lambda index = None: "cuda:1")
+    monkeypatch.setattr(dist, "is_gloo_available", lambda: True)
+    monkeypatch.setattr(dist, "is_nccl_available", lambda: True)
     if split_group is None:
         monkeypatch.delenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", raising = False)
     else:
@@ -231,4 +233,5 @@ def test_split_group_gets_a_device_bound_default_group(monkeypatch, split_group)
         assert calls[0]["device_id"] == vu.torch.device("cuda", 1)
         assert calls[0]["backend"] == "cpu:gloo,cuda:nccl"
     else:
-        assert "device_id" not in calls[0] and calls[0]["backend"] is None
+        # Not device bound, but CPU collectives still need gloo.
+        assert "device_id" not in calls[0] and calls[0]["backend"] == "cpu:gloo,cuda:nccl"

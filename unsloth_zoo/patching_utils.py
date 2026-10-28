@@ -187,6 +187,9 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     assert(type(O3)    is bool)
     import os, logging
     patch_dynamo_cleanup_hook_shutdown()
+    # config.memory_planning = True below: keep CI runs from failing on Inductor's own pool op.
+    from unsloth_zoo.temporary_patches.common import allow_inductor_pool_aliasing
+    allow_inductor_pool_aliasing()
 
     if debug:
         DEBUGGING = " with debugging"
@@ -924,7 +927,9 @@ def check_conversion_mappings(model, current_key_name_str, skip_modules):
         for pattern, replacement in reverse_conversion_mappings.items():
             try:
                 replacement = replacement.lstrip("^")  # strip unneeded chars/patterns
-                replacement = re.sub(r"\(.*?\)", "", replacement)
+                # Innermost first: a non-greedy strip left `model)` from Qwen2-VL's nested lookahead.
+                while (stripped := re.sub(r"\([^()]*\)", "", replacement)) != replacement:
+                    replacement = stripped
                 key, n_replace = re.subn(pattern, replacement, current_key_name_str)
                 if n_replace > 0:
                     new_current_key_names_str = key

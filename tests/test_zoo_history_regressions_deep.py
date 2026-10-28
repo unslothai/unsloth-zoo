@@ -262,21 +262,21 @@ def test_compiler_conv_prologue_casts_to_weight_dtype():
 
 
 def test_compiler_lora_forward_emits_torch_result_dtype_cast():
-    """PR #564: LoRA forward early-return casts back to base-layer dtype
+    """PR #564: the LoRA update casts back to base-layer dtype
     when autocast is disabled."""
     src = _get_source("unsloth_zoo.compiler")
     assert "torch_result_dtype" in src, (
         "compiler.py no longer references `torch_result_dtype` -- "
         "regression of PR #564 (autocast-disabled dtype mismatch on "
-        "PEFT LoRA forward). The early-return must cast back to the "
+        "PEFT LoRA forward). The update must cast back to the "
         "base-layer dtype."
     )
     assert re.search(
-        r"return\s+lora_forward\([^)]+\)\.to\(",
+        r"lora_forward\([^)]+\)\.to\(",
         src,
     ), (
-        "compiler.py no longer emits `return lora_forward(...).to(...)` "
-        "-- the dtype-cast on the LoRA early return is gone (PR #564)."
+        "compiler.py no longer emits `lora_forward(...).to(...)` "
+        "-- the dtype-cast on the LoRA update is gone (PR #564)."
     )
 
 

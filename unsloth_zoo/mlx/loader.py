@@ -2936,6 +2936,50 @@ def _fix_gemma3_text_rmsnorm_fp32(model=None):
     return True
 
 
+def _fix_gemma4_vision_pooler_fp32(model=None):
+    """fp16 only: pool and scale by sqrt(hidden_size) in fp32 as HF does, else 26B-A4B / 31B towers
+    overflow to inf and NaN soft tokens (unsloth#15473, torch path #931). bf16 / fp32 untouched."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma4.vision")
+    except Exception:
+        return False
+
+    pooler_cls = getattr(vision_module, "VisionPooler", None)
+    tower_cls = getattr(vision_module, "VisionModel", None)
+    if not isinstance(pooler_cls, type) or not isinstance(tower_cls, type):
+        return False
+    if getattr(pooler_cls, "_unsloth_fp32_pooler_patched", False):
+        return True
+    original_pool = pooler_cls.__call__
+    original_tower = tower_cls.__call__
+
+    @wraps(original_pool)
+    def pool(self, hidden_states, *args, **kwargs):
+        if hidden_states.dtype == mx.float16:
+            hidden_states = hidden_states.astype(mx.float32)
+        return original_pool(self, hidden_states, *args, **kwargs)
+
+    @wraps(original_tower)
+    def tower(self, *args, **kwargs):
+        out = original_tower(self, *args, **kwargs)
+        table = getattr(self.patch_embedder, "position_embedding_table", None)
+        if out.dtype == mx.float32 and getattr(table, "dtype", None) == mx.float16:
+            out = out.astype(mx.float16)
+        return out
+
+    try:
+        pooler_cls.__call__ = pool
+        tower_cls.__call__ = tower
+        pooler_cls._unsloth_fp32_pooler_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma4_vision_pooler_fp32 = True
+    return True
+
+
 def _fix_gemma3_vision_attention_fp32_sdpa(model=None):
     """Run Gemma3 vision SDPA in fp32, then cast back before the output proj."""
 
@@ -3414,6 +3458,7 @@ def _fix_paligemma_multimodal_causal_mask(model=None):
 # Upstream corrections applied to every VLM as it loads, in order.
 _VLM_MODEL_FIXUPS = (
     _fix_gemma4_kv_sharing,
+    _fix_gemma4_vision_pooler_fp32,
     _fix_gemma3_vision_post_layernorm_eps,
     _fix_gemma3_vision_attention_fp32_sdpa,
     _fix_gemma3_vision_encoder_fp32_layernorm,
@@ -4758,6 +4803,7 @@ class _MLXQuantizationSpec:
     quantize_modules: tuple[str, ...] | None = None
     has_callable_predicate: bool = False
     force_requantize: bool = False
+    quantize_embeddings: bool = False
 
     def to_metadata(self):
         data = asdict(self)
@@ -5879,6 +5925,7 @@ def _resolve_mlx_quantization_spec(
     quant_predicate,
     quantize_modules,
     force_requantize,
+    quantize_embeddings=False,
 ):
     if full_finetuning:
         load_in_4bit = load_in_8bit = load_in_fp8 = False
@@ -6021,6 +6068,7 @@ def _resolve_mlx_quantization_spec(
         quantize_modules=_normalize_quantize_modules(quantize_modules),
         has_callable_predicate=quant_predicate is not None,
         force_requantize=bool(force_requantize),
+        quantize_embeddings=bool(quantize_embeddings),
     )
 
 
@@ -6136,7 +6184,7 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
             if _beside_text_decoder(path, decoder_paths):
                 return False
 
-        if not explicitly_included:
+        if not explicitly_included and not spec.quantize_embeddings:
             if any(fragment in path_parts for fragment in _DEFAULT_QUANT_SKIP_FRAGMENTS):
                 return False
             if type(module).__name__ in {"Embedding", "QuantizedEmbedding"}:
@@ -9673,6 +9721,7 @@ class FastMLXModel:
             kwargs.pop("modules_to_quantize", kwargs.pop("mlx_quantize_modules", None)),
         )
         force_requantize = bool(kwargs.pop("force_requantize", False))
+        quantize_embeddings = bool(kwargs.pop("quantize_embeddings", False))
         quantization_spec = _resolve_mlx_quantization_spec(
             load_in_4bit=load_in_4bit,
             load_in_8bit=load_in_8bit,
@@ -9689,6 +9738,7 @@ class FastMLXModel:
             quant_predicate=quant_predicate,
             quantize_modules=quantize_modules,
             force_requantize=force_requantize,
+            quantize_embeddings=quantize_embeddings,
         )
         distributed_requested = _mlx_distributed_requested(pipeline_group, tensor_group)
 
@@ -9846,6 +9896,7 @@ class FastMLXModel:
                     quant_predicate=quant_predicate,
                     quantize_modules=quantize_modules,
                     force_requantize=force_requantize,
+                    quantize_embeddings=quantize_embeddings,
                     **(
                         {"mlx_quantization_config": mlx_quantization_config}
                         if mlx_quantization_config is not None
@@ -10185,6 +10236,7 @@ class FastMLXModel:
                             "load_in_fp8": False,
                             "load_in_mxfp4": False,
                             "load_in_nvfp4": False,
+                            "quantize_embeddings": bool(adapter_quant_policy.get("quantize_embeddings")),
                         }
                     )
                     if (

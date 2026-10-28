@@ -55,6 +55,9 @@ def _reset(monkeypatch):
     monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_FLEX", raising = False)
     F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
     F4._DEVICE_OK.clear()
+    getattr(F4, "_FAILED", {}).clear()
+    from unsloth_zoo.flex_attention import sparse as sparse_gates
+    getattr(sparse_gates, "_BACKWARD_OK", set()).clear()
     # Small shapes keep the tests fast; the default policy is checked on its own below.
     monkeypatch.setattr(F4, "_MIN_KEYS", {8: {None: 16}, 9: {None: 16}, 10: {None: 16}})
     yield
@@ -359,6 +362,11 @@ def test_layers_equal_eager_in_float32(monkeypatch):
         F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
         o_eager, g_eager = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, False, weight)
         o_flex, g_flex = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, True, weight)
+        # fp32 head_dim 512 flex backward needs ~200 KB smem (A100 has 163 KB): needs H100 / B200.
+        oor = [e for e in F4._FAILED.values() if "out of resource" in e]
+        if oor:
+            assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 2}
+            pytest.skip(f"fp32 flex backward does not fit this card's shared memory: {oor[0][:300]}")
         assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 1, "eager": 1}, layer.self_attn.layer_type
         assert _rel(o_flex, o_eager) < 1e-5
         for name in g_eager:
@@ -587,3 +595,49 @@ def test_cold_fullgraph_compile_is_one_graph(monkeypatch):
     for _ in range(2):
         compiled(q, kv, mask).float().sum().backward()
     assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 1, dict(torch._dynamo.utils.counters["stats"])
+
+
+class _BackwardFails(torch.autograd.Function):
+    """Flex kernel whose forward runs and backward fails."""
+
+    @staticmethod
+    def forward(ctx, query):
+        return query.transpose(1, 2).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad):
+        raise RuntimeError("out of resource: shared memory, Required: 262144, Hardware limit: 101376")
+
+
+def test_flex_backward_failure_latches_eager(monkeypatch):
+    """A failing flex backward is caught by the probe and latches eager."""
+    calls = []
+
+    def flex(module, query, key, attention_mask, scaling):
+        calls.append(1)
+        return _BackwardFails.apply(query)
+
+    monkeypatch.setattr(F4, "_flex_applies", lambda *args: not getattr(F4, "_FAILED", {}))
+    monkeypatch.setattr(F4, "deepseek_v4_flex_attention", flex)
+    attn, q, kv, mask = _gate_inputs("cpu", dtype = torch.float32)
+    q.requires_grad_()
+    out, _ = modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    out.sum().backward()
+    ref, _ = ORIGINAL(attn, q.detach(), kv, kv, mask, 0.125)
+    torch.testing.assert_close(out.detach(), ref)
+    assert len(F4._FAILED) == 1 and F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
+    modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    assert len(calls) == 1  # latched: not tried again (the failing probe was the only flex call)
+
+
+def test_flex_forward_failure_latches_eager(monkeypatch):
+    def flex(module, query, key, attention_mask, scaling):
+        raise RuntimeError("triton compile error")
+
+    monkeypatch.setattr(F4, "_flex_applies", lambda *args: True)
+    monkeypatch.setattr(F4, "deepseek_v4_flex_attention", flex)
+    attn, q, kv, mask = _gate_inputs("cpu", dtype = torch.float32)
+    with torch.no_grad():
+        out, _ = modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    torch.testing.assert_close(out, ORIGINAL(attn, q, kv, kv, mask, 0.125)[0])
+    assert len(F4._FAILED) == 1 and F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}

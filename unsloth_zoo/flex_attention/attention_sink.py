@@ -20,6 +20,7 @@ __all__ = [
     "is_flex_attention_decoding",
     "flex_attention_with_sink_decoding",
     "flex_attention_add_sinks",
+    "flex_attention_with_sink_inference",
     "flash_attention_left_padded",
 ]
 
@@ -287,6 +288,43 @@ def flex_attention_with_sink_decoding(
         **FLEX_LSE_KWARGS, # log(sum(exp(xi)))
     ))
     return attn_output, logsumexp
+pass
+
+def flex_attention_with_sink_inference(self_attn, query, key, value, block_mask, scale = None):
+    """Padding, unwritten cache slots and the window live in the mask; Q, K, V and the cache are never written."""
+    enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
+    if scale is None:
+        scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None)
+    q_len, kv_len = block_mask.seq_lengths
+    if key.shape[-2] > kv_len:
+        # Static cache slots past the mask (transformers 5.x on torch < 2.11).
+        key, value = key[:, :, :kv_len], value[:, :, :kv_len]
+    elif key.shape[-2] < kv_len:
+        block_mask = block_mask._adjust(q_len, key.shape[-2])
+    # Longer queries can have no valid flex_decoding config (#2100), so they force the main kernel.
+    kwargs = {"kernel_options": {} if query.shape[-2] == 1 else PREFILL_KERNEL_OPTIONS}
+    if query.shape[-2] == 1:
+        # Inductor only picks flex_decoding for a static batch. Generating at a second batch size
+        # makes Dynamo's batch dim dynamic, and the main kernel then pads every 1-row query to
+        # BLOCK_M (3x slower decode on T4). One recompile per batch size, never per step.
+        # Marked here, eager or traced, since the compiled flex_attention is what specializes.
+        for x in (query, key, value):
+            torch._dynamo.mark_static(x, 0)
+    attn_output, logsumexp = flex_output_and_lse(flex_attention(
+        query,
+        key,
+        value,
+        block_mask = block_mask,
+        score_mod = None,
+        enable_gqa = enable_gqa,
+        scale = scale,
+        **kwargs,
+        **FLEX_LSE_KWARGS,
+    ))
+    # A row with no visible key has lse = -inf, so its sink scale (and output) is 0.
+    sink_scale = torch.sigmoid(logsumexp.float() - self_attn.sinks.float().unsqueeze(1))
+    attn_output = attn_output * sink_scale.unsqueeze(-1).to(attn_output.dtype)
+    return attn_output.transpose(1, 2).contiguous()
 pass
 
 def flex_attention_add_sinks(
