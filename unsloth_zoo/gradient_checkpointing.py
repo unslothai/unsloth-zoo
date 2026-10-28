@@ -197,9 +197,10 @@ def _grow_host_buffer(buffer, new_size):
 # torch's CachingHostAllocator rounds each pinned block up to a power of two and keeps
 # freed blocks page-locked in per-size free lists until empty_host_cache (aten/src/ATen/
 # core/CachingHostAllocator.h: PowerOf2Ceil in allocate, free_list_ in free, torch 2.6
-# through 2.13). So GC_PINNED_BYTES charges rounded blocks, a release only moves a block
-# into _PINNED_CACHED (reusable by the next reservation of that size), and it drops only
-# when torch.cuda.host_memory_stats() shows the allocator holding less.
+# through 2.14; 2.13+ settings turn both off above a size, see _host_alloc_policy). So
+# GC_PINNED_BYTES charges rounded blocks, a release only moves a block into _PINNED_CACHED
+# (reusable by the next reservation of that size), and it drops only when
+# torch.cuda.host_memory_stats() shows the allocator holding less.
 # A single local rank has no other ranks to leave RAM for, and a refused pin still stores the
 # same bytes pageable, so it only refuses a block that would not fit in the RAM available now.
 GC_PINNED_BYTES = 0
@@ -211,9 +212,76 @@ _PINNED_CACHED = {}         # rounded block bytes -> count released but still ca
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
 
 
+# torch 2.13+ host allocator settings (c10/core/AllocatorConfig.h, set through PYTORCH_ALLOC_CONF /
+# PYTORCH_CUDA_ALLOC_CONF or torch._C._accelerator_setAllocatorSettings): a request above
+# pinned_max_round_threshold_mb or pinned_max_cached_size_mb is not rounded to a power of two, and
+# a freed block above pinned_max_cached_size_mb is returned to the OS instead of cached. torch 2.12
+# accepts the keys but ignores them. Keyed on the settings string, so the hot path is one call.
+_HOST_ALLOC_POLICY = (None, None, None)  # (settings string, round threshold bytes, max cached bytes)
+_TORCH_MINOR = Version(torch.__version__).release[:2]  # nightlies (2.13.0a0) included
+_HOST_ALLOC_KNOBS = _TORCH_MINOR >= (2, 13)
+_INF = float("inf")
+
+
+def _host_allocator_settings():
+    getter = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
+    if getter is not None:
+        try: return getter() or ""
+        except Exception: pass
+    return os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or ""
+
+
+def _parse_host_alloc_policy(settings):
+    round_max = cached_max = _INF
+    for item in settings.split(","):
+        key, _, value = item.partition(":")
+        key = key.strip()
+        if key not in ("pinned_max_round_threshold_mb", "pinned_max_cached_size_mb"): continue
+        try: limit = int(float(value.strip()) * (1 << 20))
+        except ValueError: continue
+        if key == "pinned_max_round_threshold_mb": round_max = limit
+        else: cached_max = limit
+    return round_max, cached_max
+
+
+def _host_alloc_policy():
+    """(round threshold, max cached size) in bytes; inf when unset or unsupported by this torch."""
+    global _HOST_ALLOC_POLICY
+    if not _HOST_ALLOC_KNOBS: return _INF, _INF
+    settings = _host_allocator_settings()
+    policy = _HOST_ALLOC_POLICY
+    if settings != policy[0]:
+        policy = _HOST_ALLOC_POLICY = (settings, *_parse_host_alloc_policy(settings))
+        if policy[1] != _INF: _warn_short_block_reuse()
+    return policy[1], policy[2]
+
+
+_WARNED_SHORT_BLOCK = False
+def _warn_short_block_reuse():
+    # torch 2.13's get_free_block returns any cached block in the Log2 bucket; with unrounded
+    # blocks there it can hand out a block shorter than the request (fixed in 2.14).
+    global _WARNED_SHORT_BLOCK
+    if _WARNED_SHORT_BLOCK or _TORCH_MINOR >= (2, 14): return
+    _WARNED_SHORT_BLOCK = True
+    warnings.warn(
+        "Unsloth: pinned_max_round_threshold_mb is set on torch 2.13, whose pinned host cache can "
+        "reuse a smaller block for a larger request above that threshold (fixed in torch 2.14). "
+        "Gradient checkpointing offload grows pinned buffers, so upgrade torch or unset it.",
+        stacklevel = 2,
+    )
+
+
 def _pinned_block_bytes(nbytes):
+    """Bytes torch's host allocator really pins for an `nbytes` request."""
     if nbytes <= 0: return 0
+    round_max, cached_max = _host_alloc_policy()
+    if nbytes > round_max or nbytes > cached_max: return int(nbytes)
     return 1 << (int(nbytes) - 1).bit_length()
+
+
+def _pinned_block_cached(block):
+    """False when torch frees a released block of this size instead of caching it."""
+    return block <= _host_alloc_policy()[1]
 
 
 def _host_allocator_held_bytes():
@@ -406,9 +474,15 @@ def _flushed_cached_fits(block, used):
 
 
 def _release_pinned(nbytes):
-    """The block stays pinned in torch's host cache, so it stays charged until reused."""
+    """The block stays pinned in torch's host cache, so it stays charged until reused; one above
+    pinned_max_cached_size_mb (torch 2.13+) goes back to the OS, so it stops being charged."""
+    global GC_PINNED_BYTES
     block = _pinned_block_bytes(nbytes)
-    if block: _PINNED_CACHED[block] = _PINNED_CACHED.get(block, 0) + 1
+    if not block: return
+    if _pinned_block_cached(block):
+        _PINNED_CACHED[block] = _PINNED_CACHED.get(block, 0) + 1
+    else:
+        GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
 
 
 def _view_bytes_as(buffer, nbytes, dtype, shape):

@@ -314,3 +314,64 @@ def test_cap_flush_counts_only_blocks_the_allocator_released(monkeypatch, gc_mod
     # Once the allocator really frees it, the same request fits.
     held["bytes"] = 0
     assert gc_module._reserve_pinned(7000)
+
+
+# torch 2.13+ host allocator settings: above pinned_max_round_threshold_mb (or
+# pinned_max_cached_size_mb) a pinned block is the exact request, and above
+# pinned_max_cached_size_mb a freed block goes back to the OS instead of the cache.
+MIB = 1 << 20
+
+
+@pytest.fixture
+def host_alloc_conf(monkeypatch, gc_module):
+    def set_conf(settings, knobs = True):
+        monkeypatch.setattr(torch._C, "_accelerator_getAllocatorSettings", lambda: settings, raising = False)
+        monkeypatch.setattr(gc_module, "_HOST_ALLOC_KNOBS", knobs, raising = False)
+        monkeypatch.setattr(gc_module, "_HOST_ALLOC_POLICY", (None, None, None), raising = False)
+        monkeypatch.setattr(gc_module, "_WARNED_SHORT_BLOCK", True, raising = False)
+    return set_conf
+
+
+def test_round_threshold_charges_the_exact_request(host_alloc_conf, gc_module):
+    host_alloc_conf("expandable_segments:True,pinned_max_round_threshold_mb:1")
+    assert gc_module._pinned_block_bytes(3 * MIB + 5) == 3 * MIB + 5
+    assert gc_module._pinned_block_bytes(MIB - 7) == MIB      # at or below: still a power of two
+    assert gc_module._pinned_block_bytes(3000) == 4096
+
+
+def test_round_threshold_lets_more_buffers_pin_under_the_cap(monkeypatch, host_alloc_conf, gc_module, pin_requests):
+    host_alloc_conf("pinned_max_round_threshold_mb:1")
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(7 * MIB / (1 << 30)))
+    # Two 3 MiB slots are 6 MiB really pinned; charged as 4 + 4 MiB the second went pageable.
+    gc_module._new_host_buffer(3 * MIB // 2, torch.float16)
+    gc_module._new_host_buffer(3 * MIB // 2, torch.float16)
+    assert pin_requests == [True, True]
+    assert gc_module.GC_PINNED_BYTES == 6 * MIB
+
+
+def test_block_above_max_cached_size_is_not_kept_charged(host_alloc_conf, gc_module):
+    host_alloc_conf("pinned_max_cached_size_mb:2")
+    assert gc_module._reserve_pinned(3 * MIB)
+    assert gc_module.GC_PINNED_BYTES == 3 * MIB
+    gc_module._release_pinned(3 * MIB)
+    # torch freed it, so nothing of ours is cached and the bytes are no longer held.
+    assert gc_module.GC_PINNED_BYTES == 0 and not any(gc_module._PINNED_CACHED.values())
+    # Small blocks are still rounded and cached.
+    assert gc_module._reserve_pinned(3000)
+    gc_module._release_pinned(3000)
+    assert gc_module.GC_PINNED_BYTES == 4096 and gc_module._PINNED_CACHED == {4096: 1}
+
+
+def test_unset_or_unsupported_settings_keep_power_of_two(host_alloc_conf, gc_module):
+    host_alloc_conf("")
+    assert gc_module._pinned_block_bytes(3 * MIB + 5) == 4 * MIB
+    # torch 2.12 accepts the key but ignores it.
+    host_alloc_conf("pinned_max_round_threshold_mb:1", knobs = False)
+    assert gc_module._pinned_block_bytes(3 * MIB + 5) == 4 * MIB
+
+
+def test_settings_change_is_picked_up(host_alloc_conf, gc_module):
+    host_alloc_conf("pinned_max_round_threshold_mb:1")
+    assert gc_module._pinned_block_bytes(3 * MIB) == 3 * MIB
+    host_alloc_conf("pinned_max_round_threshold_mb:8")
+    assert gc_module._pinned_block_bytes(3 * MIB) == 4 * MIB
