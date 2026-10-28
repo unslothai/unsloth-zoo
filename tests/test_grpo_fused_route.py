@@ -268,6 +268,12 @@ def test_route_decisions():
         assert rr.grpo_fused_route_ok({**ok, "loss_type": lt})
 
 
+def test_float16_without_a_grad_scaler_keeps_the_log_prob_route():
+    ok = dict(loss_type = "dapo")
+    assert not rr.grpo_fused_route_ok(ok, fp16_unscaled = True)
+    assert rr.grpo_fused_route_ok(ok, fp16_unscaled = False)
+
+
 def test_route_switches(monkeypatch):
     ok = dict(loss_type = "grpo")
     monkeypatch.setattr(fg, "GRPO_FWD_GRAD", False)

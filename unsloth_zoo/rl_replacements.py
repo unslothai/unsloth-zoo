@@ -2608,12 +2608,14 @@ GRPO_FUSED_TRAINABLE_HEAD = os.environ.get("UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD", 
 
 
 def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = False, support_kwargs = None,
-                        pixel_values = None, zero3_head = None, lm_head = None):
+                        pixel_values = None, zero3_head = None, lm_head = None, fp16_unscaled = False):
     """True when grpo_compute_loss's per-token loss is a closed form of each token's own log-prob, so the GRPO loss can
     take fused_linear_grpo_loss: every token's gradient is known in the forward. Off for GSPO (sequence-level ratio),
     VESPO, the off-policy and top-entropy-quantile masks (all read every token's log-prob or entropy first), rollout_rs,
     rollout logps as pi_old (clamped log ratio), a truncated support or fp32 head (other scorers), vision inputs and a
-    gathered ZeRO-3 head, and a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1.
+    gathered ZeRO-3 head, a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1, and float16 compute without a
+    GradScaler: the op stores its gradients in the hidden dtype at the loss's own scale, where GRPO's 1 / tokens weights
+    sit in float16's subnormal range (a GradScaler's scale lifts them out of it).
     UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 turns it off."""
     from unsloth_zoo.fused_losses import fused_grpo as _fused_grpo
     return bool(
@@ -2628,6 +2630,7 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
         and not support_kwargs
         and pixel_values is None
         and zero3_head is None
+        and not fp16_unscaled
         and (lm_head is None or not lm_head.requires_grad or GRPO_FUSED_TRAINABLE_HEAD)
         and os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") != "1"
         and not grpo_scorer_keeps_logits(support_kwargs)
@@ -3177,6 +3180,9 @@ def grpo_accumulated_loss(
         _fused_route = _grpo_fused_route_ok(
             kwargs, entropy_mask_on = _entropy_mask_on, rollout_logps_as_old = _rollout_logps_as_old,
             support_kwargs = _support_kwargs, pixel_values = pixel_values, zero3_head = _zero3_head, lm_head = lm_head,
+            fp16_unscaled = trainer.accelerator.scaler is None and (
+                trainer._autocast_dtype == torch.float16 if _autocast_on else lm_head.dtype == torch.float16
+            ),
         )
         _fused_W = logits_to_keep + max_left_pad if pixel_values is None else logits_to_keep
         _fused_pad = []
