@@ -61,6 +61,12 @@ def _embeds(model):
     return out.inputs_embeds if hasattr(out, "inputs_embeds") else out[0]
 
 
+@pytest.fixture(autouse = True, scope = "module")
+def _finite_reference():
+    if not bool(mx.isfinite(_embeds(_model(mx.float32))).all()):
+        pytest.skip("this mlx-vlm's Gemma 4 tower is non-finite even in float32 (0.4.4): no fp16 overflow to guard")
+
+
 @pytest.fixture
 def unpatched(monkeypatch):
     for cls in (vision.VisionPooler, vision.VisionModel):
