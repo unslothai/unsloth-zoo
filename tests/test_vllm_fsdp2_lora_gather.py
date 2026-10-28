@@ -17,8 +17,9 @@
 """fast_inference = True under Unsloth's native FSDP2 (UNSLOTH_FSDP2=1 torchrun).
 
 FSDP2 holds the LoRA adapters as DTensor shards, so model.state_dict() hands save_lora / load_lora
-shards. vLLM and the adapter files need each lora_A / lora_B whole: both now gather them (a
-collective every rank enters), and merged-weight rollouts decline sharded adapters. CPU only: two
+shards (and under their torch.inference_mode it fails outright). vLLM and the adapter files need each
+lora_A / lora_B whole: both now gather them (a collective every rank enters) outside inference mode,
+and merged-weight rollouts decline sharded adapters. CPU only: two
 torchrun ranks over gloo, fully_shard on a CPU mesh, no vLLM engine.
 """
 
@@ -66,11 +67,13 @@ class Model(torch.nn.Module):
 torch.manual_seed(0)
 model = Model()
 full = {k: v.detach().clone() for k, v in model.state_dict().items() if ".lora_" in k}
+# Checked before the Trainer shards the model: that False must not stick.
+early_sharded = vu._lora_is_sharded(model) if hasattr(vu, "_lora_is_sharded") else None
 mesh = init_device_mesh("cpu", (2,))
 for layer in model.layers:
     fully_shard(layer, mesh = mesh)
 fully_shard(model, mesh = mesh)
-res = {"helper": hasattr(vu, "_gather_lora_tensors")}
+res = {"helper": hasattr(vu, "_lora_state_dict"), "early_sharded": early_sharded}
 try:
     vu.save_lora(model, os.path.join(out_dir, "lora"))
     saved = model.saved
@@ -82,9 +85,14 @@ try:
 except Exception as e:
     res["save_error"] = type(e).__name__ + ": " + str(e)[:300]
 if res["helper"]:
-    sd = {k: v for k, v in model.state_dict().items() if ".lora_" in k}
-    gathered = vu._gather_lora_tensors(sd)
-    res["gather_equal"] = all(type(v) is torch.Tensor and torch.equal(v, full[k]) for k, v in gathered.items())
+    # load_lora(load_tensors = True) takes it under torch.inference_mode.
+    try:
+        with torch.inference_mode():
+            gathered = vu._lora_state_dict(model)
+        res["gather_equal"] = sorted(gathered) == sorted(full) and all(
+            type(v) is torch.Tensor and torch.equal(v, full[k]) for k, v in gathered.items())
+    except Exception as e:
+        res["gather_error"] = type(e).__name__ + ": " + str(e)[:300]
 if hasattr(vu, "_lora_is_sharded"):
     vu._merged_rollout_enabled = lambda: True
     res["sharded"] = vu._lora_is_sharded(model)
@@ -113,5 +121,6 @@ def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path):
         res = json.loads((tmp_path / f"rank{rank}.json").read_text())
         assert "save_error" not in res, res
         assert res["save_plain"] and res["save_equal"] and res["disk_plain"], res
-        assert res["helper"] and res["gather_equal"], res
+        assert res["helper"] and "gather_error" not in res and res["gather_equal"], res
+        assert res["early_sharded"] is False, res
         assert res["sharded"] is True and res["merged_rollout"] is True, res

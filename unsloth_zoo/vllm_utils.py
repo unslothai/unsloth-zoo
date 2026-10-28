@@ -5637,28 +5637,11 @@ pass
 
 
 @torch.inference_mode
-def _gather_lora_tensors(state_dict):
-    """Whole LoRA tensors from a state dict whose adapters native FSDP2 sharded (DTensor shards).
-
-    vLLM and the adapter files need each lora_A / lora_B whole. full_tensor() is a collective over
-    the FSDP2 group, so every rank gathers the same keys in the same (state dict) order.
-    """
-    # All Unsloth Zoo code licensed under LGPLv3
-    try:
-        from torch.distributed.tensor import DTensor
-    except Exception:
-        return state_dict
-    return {k: (v.full_tensor() if isinstance(v, DTensor) else v) for k, v in state_dict.items()}
-pass
-
-
 def save_lora(model, save_directory, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
-    state_dict = model.state_dict()
     dtype = model.get_input_embeddings().weight.dtype
     # Cast LoRA to float16 / bfloat16
-    state_dict = {k:v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
-    state_dict = {k:v.to(dtype) for k, v in _gather_lora_tensors(state_dict).items()}
+    state_dict = {k:v.to(dtype) for k, v in _lora_state_dict(model).items()}
     kwargs["state_dict"] = state_dict
     rank, world_size = _distributed_rank_and_world()
     if world_size <= 1 or kwargs.get("push_to_hub", False):
@@ -6795,10 +6778,10 @@ pass
 
 
 def _lora_is_sharded(model):
-    """True when native FSDP2 holds the adapters as DTensor shards (checked once per model)."""
+    """True when native FSDP2 holds the adapters as DTensor shards. Only True is cached: the Trainer
+    shards a model after it loaded, so an early False can go stale."""
     # All Unsloth Zoo code licensed under LGPLv3
-    cached = model.__dict__.get("_unsloth_lora_is_sharded")
-    if cached is not None: return cached
+    if model.__dict__.get("_unsloth_lora_is_sharded"): return True
     try:
         from torch.distributed.tensor import DTensor
         sharded = any(
@@ -6806,8 +6789,30 @@ def _lora_is_sharded(model):
         )
     except Exception:
         sharded = False
-    model.__dict__["_unsloth_lora_is_sharded"] = sharded
+    if sharded: model.__dict__["_unsloth_lora_is_sharded"] = True
     return sharded
+pass
+
+
+def _lora_state_dict(model):
+    """The lora_A / lora_B entries of model.state_dict(), whole, for vLLM and the adapter files.
+
+    Under native FSDP2 they are DTensor shards: each is gathered (full_tensor, a collective every rank
+    enters in state dict order), and the state dict is taken outside inference mode, where FSDP2's
+    state_dict fails with "Cannot set version_counter for inference tensor" (save_lora / load_lora
+    run under torch.inference_mode).
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    def lora_items(state_dict):
+        return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+    if not _lora_is_sharded(model):
+        return lora_items(model.state_dict())
+    from torch.distributed.tensor import DTensor
+    with torch.inference_mode(False), torch.no_grad():
+        return {
+            k: (v.full_tensor() if isinstance(v, DTensor) else v).detach()
+            for k, v in lora_items(model.state_dict()).items()
+        }
 pass
 
 
@@ -7412,10 +7417,7 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
     if load_tensors:
         # We extract it directly from the model's state_dict
         peft_config = _live_lora_config(model, save_directory)
-        state_dict = model.state_dict()
-        items = state_dict.items()
-        state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
-        state_dict = _gather_lora_tensors(state_dict)
+        state_dict = {k.replace(".default", ""):v for k, v in _lora_state_dict(model).items()}
         if exclude:
             # Folded into the base weights already: sending them too would apply the delta twice.
             state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}
