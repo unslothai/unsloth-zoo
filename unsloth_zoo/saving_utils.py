@@ -4543,6 +4543,20 @@ def _pick_int_scheme(base, schemes, packed_shape, scale_shape, logical_shape, ha
 pass
 
 
+def _read_tensors_by_shard(save_directory, locations, names):
+    """`{name: tensor}` in `names` order, opening each shard once and closing it before the next."""
+    by_shard = {}
+    for name in names:
+        by_shard.setdefault(locations[name], []).append(name)
+    tensors = {}
+    for filename, keys in by_shard.items():
+        with safe_open(os.path.join(save_directory, filename), framework = "pt", device = "cpu") as f:
+            for key in keys:
+                tensors[key] = f.get_tensor(key)
+    return {name: tensors[name] for name in names}
+pass
+
+
 def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
     """All refusals happen here, before any shard is touched; companions in other shards are read up front."""
     locations, shapes, stored_shapes = {}, {}, {}
@@ -4555,11 +4569,7 @@ def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
                 elif key.endswith(".weight_shape"):
                     stored_shapes[key] = tuple(int(x) for x in f.get_tensor(key).tolist())
 
-    def read(key):
-        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
-            return f.get_tensor(key)
-
-    bases, logical, elsewhere = {}, {}, {}
+    bases, logical, elsewhere = {}, {}, []
     for key in sorted(k for k in locations if k.endswith("_packed")):
         base = key[: -len(".weight_packed")]
         if not key.endswith(".weight_packed") or len(shapes[key]) != 2 or base + ".weight_scale" not in locations:
@@ -4582,7 +4592,8 @@ def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
         for suffix in _INT_PACKED_SUFFIXES[1:]:
             companion = base + "." + suffix
             if companion in locations and locations[companion] != locations[key]:
-                elsewhere[companion] = read(companion)
+                elsewhere.append(companion)
+    elsewhere = _read_tensors_by_shard(save_directory, locations, elsewhere)
     return dict(bases = bases, logical = logical, elsewhere = elsewhere)
 pass
 
@@ -4806,15 +4817,11 @@ def _plan_compressed_mxfp4_rewrite(save_directory, filenames, model):
                 f"{(packed_shape[0], packed_shape[1] * 2)}. Nothing was merged."
             )
 
-    def read(key):
-        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
-            return f.get_tensor(key)
-
-    elsewhere = {
-        base + ".weight_scale": read(base + ".weight_scale")
+    elsewhere = _read_tensors_by_shard(save_directory, locations, [
+        base + ".weight_scale"
         for base in packed_bases
         if locations[base + ".weight_scale"] != locations[base + ".weight_packed"]
-    }
+    ])
     return dict(
         stacks = stacks, keys_of = keys_of, shapes = shapes, packed_bases = packed_bases,
         targets = targets, elsewhere = elsewhere, deltas = {},
