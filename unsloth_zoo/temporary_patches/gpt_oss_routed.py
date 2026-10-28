@@ -48,6 +48,7 @@ from .moe_routed import (
     triton,
 )
 from .moe_grouped_modulelist import _StackedLoraLinear, _lora_stacks
+from . import moe_ready_epoch as _moe_ready
 
 
 def _mixed_adapter_batch(module):
@@ -228,12 +229,15 @@ def _snapshot_current(experts, snap):
 # reads per layer, about 10% of an NF4 decode step on a slow host). A one-token decode step on the cache of the
 # previous decode step belongs to the same epoch: a layer's tables are fully checked on its first call of an
 # epoch, then only _sentinel_current (the first gate_up / down expert) runs until the epoch changes. A new epoch
-# starts with a new cache object (every generate() call without a passed-in cache) and whenever a module or
-# parameter is registered anywhere (setattr of a Module / Parameter, as PEFT merges and unloads do), and a check
-# without an epoch (the experts' eval forward, as in prefill) clears the stamp. So weights swapped, merged or moved
-# between generate() calls are rechecked. Not rechecked inside an epoch: a single non-first expert's weight
-# replaced by direct dict assignment or quant_state surgery between two one-token steps on one cache.
-# UNSLOTH_GPTOSS_ROUTED_EPOCH=0 checks every call fully, as before.
+# starts with a new cache object, on every generate() call and cache reset (a reused static cache), and whenever a
+# module or parameter is registered anywhere (setattr of a Module / Parameter, as PEFT merges and unloads do); a
+# caller's epoch captured before such a registration no longer matches, so that call is fully checked too. The
+# shortcut also needs moe_ready_epoch's stamp unchanged since the full check: the experts are tracked there, so a
+# move (.to / .cuda / .half, which pops these tables), a buffer registration, requires_grad_, a PEFT state method
+# or an optimizer step ends it, and without that machinery every call is fully checked. A check without an epoch
+# (the experts' eval forward, as in prefill) clears the stamp. Not rechecked inside one generation: a non-first
+# expert's weight replaced by direct dict assignment, a parameter set to None, or quant_state / tensor surgery in
+# place between two one-token steps on one cache. UNSLOTH_GPTOSS_ROUTED_EPOCH=0 checks every call fully.
 _EPOCH_ENABLED = os.environ.get("UNSLOTH_GPTOSS_ROUTED_EPOCH", "1") != "0"
 # Counts per prepare_routed_experts call on built tables: "full" ran _snapshot_current, "sentinel" only the O(1) check.
 ROUTED_EPOCH_STATS = {"full": 0, "sentinel": 0}
@@ -246,25 +250,52 @@ def _bump_epoch(*args):
     _EPOCH[0] += 1
 
 
+def _wrap_epoch_boundary(owner, name):
+    """owner.name, wrapped to start a new decode epoch on entry (generate(), Cache.reset)."""
+    import functools
+    f = owner.__dict__.get(name)
+    if f is None or not callable(f) or getattr(f, "_unsloth_routed_epoch", False):
+        return False
+
+    @functools.wraps(f)
+    def wrapped(*args, **kwargs):
+        _EPOCH[0] += 1
+        return f(*args, **kwargs)
+
+    wrapped._unsloth_routed_epoch = True
+    setattr(owner, name, wrapped)
+    return True
+
+
 def _install_epoch_hooks():
+    """True when every generation boundary starts a new epoch (else the shortcut stays off)."""
     if _EPOCH_HOOKS:
-        return
-    _EPOCH_HOOKS.append(None)
+        return _EPOCH_HOOKS[0]
+    _EPOCH_HOOKS.append(False)
     try:
         from torch.nn.modules.module import (
             register_module_module_registration_hook,
             register_module_parameter_registration_hook,
         )
+        from transformers import cache_utils
+        from transformers.generation.utils import GenerationMixin
         _EPOCH_HOOKS.append(register_module_module_registration_hook(_bump_epoch))
         _EPOCH_HOOKS.append(register_module_parameter_registration_hook(_bump_epoch))
+        _wrap_epoch_boundary(GenerationMixin, "generate")
+        # Every cache class defining reset (Cache and its layers on transformers 5, StaticCache on 4.x).
+        for obj in vars(cache_utils).values():
+            if isinstance(obj, type) and obj.__module__ == cache_utils.__name__ and "reset" in obj.__dict__:
+                _wrap_epoch_boundary(obj, "reset")
+        _EPOCH_HOOKS[0] = True
     except Exception:
         pass
+    return _EPOCH_HOOKS[0]
 
 
 def routed_decode_epoch(cache):
     """Epoch of a one-token decode step on cache (see _EPOCH): the current one when the previous step used the
     same cache object, else a new one. None (always fully checked) without a cache."""
-    if cache is None or not _EPOCH_ENABLED:
+    if cache is None or not _EPOCH_ENABLED or not _install_epoch_hooks():
         return None
     last = _LAST_CACHE[0]
     if last is None or last() is not cache:
@@ -337,13 +368,19 @@ def prepare_routed_experts(experts, epoch = None):
     if state is False:
         return None
     try:
+        if epoch is not None and (epoch != _EPOCH[0] or not _moe_ready.enabled()):
+            epoch = None  # a registration since the caller's capture, or no move tracking: full check
+        stamp = _moe_ready.stamp() if epoch is not None else None
         if isinstance(state, dict):
-            if epoch is not None and state.get("epoch") == epoch and _sentinel_current(experts, state["snapshot"]):
+            if (
+                epoch is not None and state.get("epoch") == epoch and state.get("stamp") == stamp
+                and _sentinel_current(experts, state["snapshot"])
+            ):
                 ROUTED_EPOCH_STATS["sentinel"] += 1
                 return state
             ROUTED_EPOCH_STATS["full"] += 1
             if _snapshot_current(experts, state["snapshot"]):
-                state["epoch"] = epoch
+                state["epoch"], state["stamp"] = (epoch, stamp) if state.get("tracked") else (None, None)
                 return state
         # Declined keyed by ids/addresses, not references, so a moved model frees its old copy.
         if isinstance(state, tuple) and state == _decline_key(experts):
@@ -363,9 +400,15 @@ def prepare_routed_experts(experts, epoch = None):
     if gate_up is None or down is None or down["K"] * 2 != gate_up["N"] or gate_up["K"] != down["N"]:
         experts._unsloth_routed_nf4 = _decline_key(experts)
         return None
+    tracked = False
+    if epoch is not None:
+        # Tracked by moe_ready_epoch: a move of any expert pops these tables and moves its stamp. Subtrees with
+        # accelerate / FSDP2 hooks swap storage without any hook firing: always fully checked.
+        hooked, _ = _moe_ready.scan(experts)
+        tracked = not hooked
     state = {"gate_up": gate_up, "down": down, "key": tuple(snap["ptrs"]), "snapshot": snap,
-             "weights": tuple(snap["weights"]), "epoch": epoch}
-    _install_epoch_hooks()
+             "weights": tuple(snap["weights"]), "tracked": tracked,
+             "epoch": epoch if tracked else None, "stamp": stamp if tracked else None}
     experts._unsloth_routed_nf4 = state
     return state
 

@@ -184,3 +184,86 @@ def test_kill_switch_checks_every_call(monkeypatch):
         GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache))
         _, full, sentinel = _full_checks(lambda: GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache)))
     assert full == 1 and sentinel == 0
+
+
+def test_generate_and_cache_reset_start_a_new_epoch(monkeypatch):
+    # A static cache is reset and reused by the next generate(): its identity is no generation boundary.
+    monkeypatch.setattr(GR, "_EPOCH_ENABLED", True)
+    cache_utils = pytest.importorskip("transformers.cache_utils")
+    from transformers.generation.utils import GenerationMixin
+    cache = cache_utils.Cache(layers = [cache_utils.StaticLayer(8)])
+    e = GR.routed_decode_epoch(cache)
+    assert GR.routed_decode_epoch(cache) == e
+    cache.reset()
+    e2 = GR.routed_decode_epoch(cache)
+    assert e2 != e
+    with pytest.raises(Exception):
+        GenerationMixin.generate(object())  # the wrapper starts the epoch before generate runs
+    assert GR.routed_decode_epoch(cache) != e2
+
+
+@needs_cuda
+@pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
+@pytest.mark.parametrize("what", ["module", "weight"])
+def test_registration_after_the_steps_epoch_capture_rebuilds(proj, what):
+    # The decode loop captures the epoch once per token, before its layers run: a replacement registered after
+    # that capture (a hook inside the step) must not be served from the old tables.
+    ex = _Experts(True).eval()
+    mid = E // 2
+    cache = _Cache()
+    with torch.no_grad():
+        GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache))
+        GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache))
+    captured = GR.routed_decode_epoch(cache)
+    new = _swap(ex, proj, what, mid)
+    del new
+    torch.cuda.empty_cache()
+    junk = torch.full((1 << 22,), float("nan"), device = "cuda")
+    assert _routed_matches_reference(ex, mid, captured)
+    del junk
+
+
+@needs_cuda
+@pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
+def test_in_place_change_before_a_cache_reset_rebuilds(proj):
+    # quant_state surgery in place registers nothing; the next generation (here: the reused cache's reset) checks
+    # every expert again.
+    cache_utils = pytest.importorskip("transformers.cache_utils")
+    ex = _Experts(True).eval()
+    mid = E // 2
+    cache = cache_utils.Cache(layers = [cache_utils.StaticLayer(8)])
+    with torch.no_grad():
+        GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache))
+        GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache))
+        getattr(ex, proj)[mid].weight.quant_state.offset.add_(0.25)
+    cache.reset()
+    assert _routed_matches_reference(ex, mid, GR.routed_decode_epoch(cache))
+
+
+@needs_cuda
+@pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
+def test_moved_middle_expert_inside_an_epoch_rebuilds(proj):
+    # Module.cpu() / .cuda() frees and reallocates storage without registering anything.
+    ex = _Experts(True).eval()
+    mid = E // 2
+    cache = _Cache()
+    with torch.no_grad():
+        GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache))
+        GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache))
+    getattr(ex, proj)[mid].cpu()
+    torch.cuda.empty_cache()
+    junk = torch.full((1 << 24,), float("nan"), device = "cuda")
+    getattr(ex, proj)[mid].cuda()
+    assert _routed_matches_reference(ex, mid, GR.routed_decode_epoch(cache))
+    del junk
+
+
+@needs_cuda
+def test_without_move_tracking_every_call_is_fully_checked(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_MOE_FAST_READY", "0")
+    ex = _Experts(True).eval()
+    cache = _Cache()
+    with torch.no_grad():
+        GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache))
+        _, full, sentinel = _full_checks(lambda: GR.prepare_routed_experts(ex, GR.routed_decode_epoch(cache)))
+    assert full == 1 and sentinel == 0

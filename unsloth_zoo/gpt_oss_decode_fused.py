@@ -224,13 +224,14 @@ def sink_scale_output(attn_output, lse, sinks):
 
 
 # static_cache_update replays transformers' own decode branch with fewer ops, so it runs only where that
-# code is the one verified here (transformers 5.8 - 5.17): sha256 of each method's stripped source lines.
+# code is the one verified here (transformers 5.8 - 5.21): sha256 of each method's stripped source lines. 5.20 / 5.21
+# change Cache.update only in its offloading branch, which this path declines.
 _CACHE_ENABLED = (
     os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
     and os.environ.get("UNSLOTH_GPT_OSS_FAST_CACHE_UPDATE", "1") != "0"
 )
 _VERIFIED_UPDATE = {
-    "Cache": ("035177fec467f485",),
+    "Cache": ("035177fec467f485", "f5c3ba02bbf4c5f4"),
     "StaticLayer": ("6a9b8de193e7b639",),
     "StaticSlidingWindowLayer": ("c114eb5d4cfb9a71",),
 }
@@ -272,14 +273,17 @@ def static_cache_update(cache, key_states, value_states, layer_idx):
     if not classes:
         return None
     base, static, sliding = classes
-    if type(cache).update is not base.update or getattr(cache, "offloading", False):
+    if type(cache).update is not base.update or "update" in cache.__dict__ or getattr(cache, "offloading", False):
         return None
     layers = getattr(cache, "layers", None)
     if layers is None or not (0 <= layer_idx < len(layers)):
         return None
     layer = layers[layer_idx]
     kind = type(layer)
-    if (kind is not static and kind is not sliding) or not getattr(layer, "is_initialized", False):
+    if (
+        (kind is not static and kind is not sliding) or "update" in layer.__dict__
+        or not getattr(layer, "is_initialized", False)
+    ):
         return None
     keys, values = layer.keys, layer.values
     if (

@@ -100,12 +100,24 @@ def test_uncovered_calls_return_none(monkeypatch):
                 return super().update(*args, **kwargs)
         custom = Custom(layers = cache.layers)
         assert F.static_cache_update(custom, k1, v1, 0) is None
+        # An update overridden on the instance (cache or layer) is the caller's own code: left to it.
+        cache.update = lambda *args, **kwargs: None
+        assert F.static_cache_update(cache, k1, v1, 0) is None
+        del cache.update
+        cache.layers[0].update = lambda *args, **kwargs: None
+        assert F.static_cache_update(cache, k1, v1, 0) is None
+        del cache.layers[0].update
         monkeypatch.setattr(F, "_CACHE_ENABLED", False)
         assert F.static_cache_update(cache, k1, v1, 0) is None
         monkeypatch.setattr(F, "_CACHE_ENABLED", True)
         monkeypatch.setattr(F, "_STATIC_CLASSES", ())  # a transformers whose update code is not the verified one
         assert F.static_cache_update(cache, k1, v1, 0) is None
     assert F.static_cache_update(cache, k1, v1, 0) is None  # autograd on
+
+
+def test_cache_update_digests_cover_5_20_and_5_21():
+    # transformers 5.20 / 5.21 change Cache.update only inside its offloading branch, which the fast path declines.
+    assert "f5c3ba02bbf4c5f4" in F._VERIFIED_UPDATE["Cache"]
 
 
 def test_unverified_source_is_rejected(monkeypatch):
