@@ -734,6 +734,19 @@ def is_trl_padding_free_collator(collator):
 pass
 
 
+class _KeepUnlistedRows:
+    # Batched `Dataset.filter(..., with_indices = True)` predicate: keep every row whose
+    # position is not in `dropped`. Reads no column, so no row is decoded. A class, not a
+    # closure, so it pickles to `num_proc` workers.
+    def __init__(self, dropped):
+        self.dropped = frozenset(dropped)
+
+    def __call__(self, batch, indices):
+        dropped = self.dropped
+        return [index not in dropped for index in indices]
+pass
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -1267,7 +1280,18 @@ def train_on_responses_only(
         # Drop via filter (Arrow mask), not select(keep_indices): a keep list would be one
         # Python int per surviving row (GBs on a large corpus). _has_valid_labels is the
         # exact inverse of `dropped`, so survivors are identical.
-        dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        if getattr(dataset, "_format_type", None) == "custom":
+            # A custom transform can change labels per view: re-read them as before.
+            dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        else:
+            # The scan above already found every fully masked row by its position, so
+            # decide by position instead of decoding every column of every row again.
+            dataset = dataset.filter(
+                _KeepUnlistedRows(dropped),
+                with_indices = True,
+                batched = True,
+                num_proc = _effective_num_proc(dataset),
+            )
         n_removed = n_before - len(dataset)
         if n_removed > 0:
             print(
