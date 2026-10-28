@@ -99,11 +99,25 @@ class _TritonLoader:
                 setattr(parent, parts[1], module)
 
 
+# Optional modules torch probes with `try: import ... except ImportError`. Real Triton
+# may not ship them, so they must stay unimportable: a stub here hands torch a _Noop
+# where it expects a plain value. torch 2.15 reads `triton._torchtlx_default.DEFAULT_MODE`
+# while building torch._inductor.config, and a _Noop there fails its config check, which
+# takes down torch._dynamo and with it every transformers model / generation import.
+_ABSENT_SUBMODULES = frozenset({
+    "triton._torchtlx_default",
+})
+
+
 class _TritonFinder(MetaPathFinder):
     """Intercepts any `import triton` or `import triton.*`."""
     _loader = _TritonLoader()
 
     def find_spec(self, fullname, path, target=None):
+        if fullname in _ABSENT_SUBMODULES:
+            # The stub `triton` has an empty __path__, so declining here ends the
+            # lookup in ModuleNotFoundError, exactly as a Triton without it would.
+            return None
         if fullname == "triton" or fullname.startswith("triton."):
             if fullname not in sys.modules:
                 return ModuleSpec(fullname, self._loader,
