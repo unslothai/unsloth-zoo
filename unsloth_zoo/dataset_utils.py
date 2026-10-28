@@ -2668,10 +2668,12 @@ def trl_collator_applies_masks():
 pass
 
 
-def trl_collator_ignores_labels():
-    # TRL 0.18: its collator applies completion_mask but never reads "labels", while the padding-free
-    # (or user-supplied) DataCollatorWithFlattening reads only "labels", so both columns must reach it.
-    return _trl_collator_mask_probe()[1]
+def trl_collator_ignores_labels(collator = None):
+    # TRL 0.18: its collator applies completion_mask but never reads "labels"; any other collator
+    # (padding-free DataCollatorWithFlattening, a user's DataCollatorForSeq2Seq) reads only "labels".
+    if not _trl_collator_mask_probe()[1]: return False
+    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling as _TRLCollator
+    return collator is None or isinstance(collator, _TRLCollator)
 pass
 
 # Faster SFTTrainer prepare_dataset
@@ -3065,7 +3067,12 @@ def sft_prepare_dataset(
             if isinstance(dataset, Dataset):
                 label_kwargs["num_proc"] = map_kwargs.get("num_proc", None)
                 label_kwargs["desc"] = f"Unsloth: Building labels for {dataset_name} dataset"
-            keep_masks = trl_collator_ignores_labels()
+            collator = getattr(self, "data_collator", None)
+            if collator is None:
+                # TRL 0.18 picks its collator in __init__ and only stores it in super().__init__, after this.
+                import sys as _sys
+                collator = _sys._getframe(1).f_locals.get("data_collator")
+            keep_masks = trl_collator_ignores_labels(collator)
             dataset = dataset.map(_build_labels, remove_columns = [] if keep_masks else mask_columns, **label_kwargs)
             if not keep_masks:
                 used_column_names = [x for x in used_column_names if x not in mask_columns]

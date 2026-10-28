@@ -143,11 +143,29 @@ def test_trl_018_completion_mask_reaches_its_collator(trl_018_collator):
     assert sorted(x for x in labels.flatten().tolist() if x != -100) == [13, 14, 21, 22]
 
 
-def test_trl_018_flattening_collator_reads_built_labels(trl_018_collator):
-    from transformers import DataCollatorWithFlattening
+@pytest.mark.parametrize("collator", ["flattening", "seq2seq"])
+def test_trl_018_label_reading_collator_gets_labels_only(trl_018_collator, collator):
+    from transformers import DataCollatorForSeq2Seq, DataCollatorWithFlattening
 
+    trainer = Trainer()
+    trainer.data_collator = DataCollatorWithFlattening() if collator == "flattening" else DataCollatorForSeq2Seq(None)
     dataset = Dataset.from_list([{"input_ids": r["input_ids"], "completion_mask": r["completion_mask"]} for r in ROWS])
-    out = sft_prepare_dataset(Trainer(), dataset, Tokenizer(), Args(), False, None, "train")
+    out = sft_prepare_dataset(trainer, dataset, Tokenizer(), Args(), False, None, "train")
+    assert set(out.column_names) == {"input_ids", "labels"}
     batch = DataCollatorWithFlattening(return_tensors = "pt")([out[i] for i in range(len(out))])
     ids, labels = batch["input_ids"].flatten().tolist(), batch["labels"].flatten().tolist()
     assert sorted(t for t, y in zip(ids, labels) if y != -100) == [13, 14, 21, 22]
+
+
+def test_trl_018_collator_found_in_init_before_it_is_stored(trl_018_collator):
+    from transformers import DataCollatorWithFlattening
+
+    class InitTrainer(Trainer):
+        def __init__(self):
+            self.model = None
+            self.completion_only_loss = True
+            data_collator = DataCollatorWithFlattening()  # noqa: F841 -- read from this frame, as TRL 0.18's __init__
+            dataset = Dataset.from_list([{"input_ids": r["input_ids"], "completion_mask": r["completion_mask"]} for r in ROWS])
+            self.out = sft_prepare_dataset(self, dataset, Tokenizer(), Args(), False, None, "train")
+
+    assert set(InitTrainer().out.column_names) == {"input_ids", "labels"}
