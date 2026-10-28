@@ -65,3 +65,27 @@ def test_rows_under_the_bound_are_the_plain_half_gemm():
     a = (torch.randn(16, 512, generator = g) * 0.01).half()
     b = (torch.randn(512, 32, generator = g) * 0.1).half()
     assert torch.equal(fl._half_mm_bounded(a, b), (a @ b).float())
+
+
+def test_scale_below_fp16_subnormal_keeps_the_row():
+    # A row bound past ~2^39 needs a scale under fp16's smallest subnormal (2^-24); one fp16 factor would round it to 0
+    # and drop the row. 65504 * 4096 * 4096 = 1.0990e12, finite in the fp32 result.
+    a = torch.full((1, 4096), 65504.0, dtype = torch.float16)
+    b = torch.full((4096, 1), 4096.0, dtype = torch.float16)
+    out = fl._half_mm_bounded(a, b)
+    ref = a.double() @ b.double()
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.double(), ref, rtol = 2e-3, atol = 0)
+
+
+def test_logits_past_half_range_stay_finite():
+    # Raw logits outside fp16 range (+-160000) must stay finite: a plain half GEMM gives +-inf and the log-sum-exp NaNs.
+    h = torch.zeros(2, 64, dtype = torch.float16)
+    h[:, :16] = 100.0
+    w = torch.full((8, 64), 100.0, dtype = torch.float16)
+    w[1::2] = -100.0
+    out = fl._half_mm_bounded(h, w.t())
+    assert not torch.isfinite((h @ w.t()).float()).all()
+    ref = h.double() @ w.double().t()
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.double(), ref, rtol = 2e-3, atol = 0)

@@ -206,9 +206,13 @@ def _half_mm_bounded(a, b):
     # Reductions without an |a| / |b| temporary (b is a full head slice).
     bound = torch.linalg.vector_norm(a, 1, dim = -1, keepdim = True, dtype = torch.float32) * \
         torch.linalg.vector_norm(b, math.inf, dtype = torch.float32)
-    scale = torch.exp2(torch.floor(torch.log2(32768.0 / bound.clamp_min(1e-30)))).clamp_(max = 1.0)
-    r = ((a * scale.to(a.dtype)) @ b).float()
-    return r.div_(scale)
+    scale = torch.exp2(torch.floor(torch.log2(32768.0 / bound.clamp_min(1e-30)))).clamp_(min = 2.0 ** -38, max = 1.0)
+    # A scale below fp16's smallest subnormal (2^-24) would round to 0 and drop the row: apply it as two power-of-two
+    # factors that are each representable (2^-14 is the smallest normal), so the product stays exact.
+    s1 = scale.clamp(min = 2.0 ** -14)
+    a = a * s1.to(a.dtype)
+    a.mul_((scale / s1).to(a.dtype))
+    return (a @ b).float().div_(scale)
 
 
 def _mm_fp32(a, b, out = None):
@@ -1985,11 +1989,8 @@ def _jsd_logprobs(h, w, bias, scale, cap, inv_t, sd, device):
 
 
 def _jsd_logits(h, w, bias, sd):
-    if _IS_HIP and h.is_cuda and h.dtype == torch.float16 and sd == torch.float32:
-        # Half logits upcast once, as the CE / log-prob ops take them on HIP (_logits_mode).
-        x = (h @ w.t()).float()
-    else:
-        x = _mm_fp32(h, w.t()) if sd == torch.float32 else (h.to(sd) @ w.to(sd).t())
+    # On HIP fp16 _mm_fp32 is the bounded half-result GEMM: fast, and raw logits past 65504 stay finite.
+    x = _mm_fp32(h, w.t()) if sd == torch.float32 else (h.to(sd) @ w.to(sd).t())
     if bias is not None:
         x.add_(bias.to(sd))
     return x
