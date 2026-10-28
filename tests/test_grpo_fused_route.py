@@ -43,6 +43,8 @@ ROWS = INPUT_IDS.shape[0]
 
 
 class _Model(torch.nn.Module):
+    pg_forwards = 0  # forwards over a PrefixGrouper shared-prefix stream
+
     def __init__(self, head_grad = True, bias = False):
         super().__init__()
         torch.manual_seed(0)
@@ -58,6 +60,8 @@ class _Model(torch.nn.Module):
         return self.head
 
     def forward(self, input_ids = None, attention_mask = None, logits_to_keep = None, **kwargs):
+        # Position-local, so a PrefixGrouper stream (prefix once, then each suffix) gives every row's own hidden states
+        _Model.pg_forwards += kwargs.get("prefix_seg_info", None) is not None
         hidden = torch.tanh(self.mix(self.emb(input_ids))) * 2.0
         return types.SimpleNamespace(logits = hidden)
 
@@ -87,47 +91,50 @@ def _trainer(model, beta = 0.0, scaler = None, entropy_coef = 0.0, use_vllm = Fa
     )
 
 
-def _side_inputs(seed = 0):
+def _side_inputs(seed = 0, input_ids = INPUT_IDS, ltk = LTK):
     """old / ref / vLLM log-probs near the policy's own, on the [rows, W] grid the loss reads."""
     model = _Model()
-    pad = rr.calculate_pad_tokens_in_prompt(INPUT_IDS, LTK, 0)
-    W = LTK + int(pad.max())
-    ids = rr.left_pack_padding(INPUT_IDS, 0)
+    pad = rr.calculate_pad_tokens_in_prompt(input_ids, ltk, 0)
+    W = ltk + int(pad.max())
+    ids = rr.left_pack_padding(input_ids, 0)
     with torch.no_grad():
         logp = torch.log_softmax(model.head(model(ids).logits), -1)
         lp = logp[:, :-1].gather(-1, ids[:, 1:, None])[..., 0][:, -W:]
     g = torch.Generator().manual_seed(seed)
     noise = lambda s: lp + s * torch.randn(lp.shape, generator = g)  # noqa: E731
-    return noise(0.15), noise(0.3), noise(0.1), torch.randn(ROWS, generator = g)
+    return noise(0.15), noise(0.3), noise(0.1), torch.randn(input_ids.shape[0], generator = g)
 
 
 def _run(fused, monkeypatch, *, loss_type = "grpo", old = None, ref = None, sampling = None, adv = None,
          packed = False, head_grad = False, bias = False, completion_mask = None, loss_kwargs = None, backward_scale = 1.0,
-         trainable_opt_in = True, **trainer_kwargs):
+         trainable_opt_in = True, input_ids = INPUT_IDS, ltk = LTK, pg_funcs = None, **trainer_kwargs):
     monkeypatch.setattr(fg, "GRPO_FWD_GRAD", fused)
+    if pg_funcs is not None:
+        # grpo_accumulated_loss memoises its PrefixGrouper helpers on the function object
+        monkeypatch.setattr(rr.grpo_accumulated_loss, "_pg_funcs", pg_funcs, raising = False)
     monkeypatch.setattr(rr, "GRPO_FUSED_TRAINABLE_HEAD", trainable_opt_in)
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "1" if packed else "0")
-    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0" if pg_funcs is None else "1")
     model = _Model(head_grad, bias).to(DEVICE)
     model.device = DEVICE
     trainer = _trainer(model, **trainer_kwargs)
     if completion_mask is None:
-        completion_mask = (INPUT_IDS[:, -LTK:] != 0).long()
+        completion_mask = (input_ids[:, -ltk:] != 0).long()
     to = lambda x: x.to(DEVICE) if torch.is_tensor(x) else x  # noqa: E731
     completion_mask, old, ref, sampling, adv = map(to, (completion_mask, old, ref, sampling, adv))
     if loss_kwargs and "sample_weight" in loss_kwargs:
         loss_kwargs = dict(loss_kwargs, sample_weight = to(loss_kwargs["sample_weight"]))
     kwargs = dict(
         loss_type = loss_type, epsilon_low = 0.2, epsilon_high = 0.28 if loss_type != "cispo" else 4.0,
-        max_completion_length = LTK, num_items_in_batch = completion_mask.sum().float(),
+        max_completion_length = ltk, num_items_in_batch = completion_mask.sum().float(),
         current_gradient_accumulation_steps = 2, num_processes = 1,
         importance_sampling_level = trainer_kwargs.get("importance_sampling_level", "token"),
         sampling_per_token_logps = sampling,
     )
     kwargs.update(loss_kwargs or {})
     call = lambda: rr.grpo_accumulated_loss(  # noqa: E731
-        trainer, INPUT_IDS.to(DEVICE), (INPUT_IDS != 0).long().to(DEVICE), LTK, completion_mask,
-        adv if adv is not None else torch.linspace(-1.0, 1.2, ROWS, device = DEVICE), old, ref, **kwargs,
+        trainer, input_ids.to(DEVICE), (input_ids != 0).long().to(DEVICE), ltk, completion_mask,
+        adv if adv is not None else torch.linspace(-1.0, 1.2, input_ids.shape[0], device = DEVICE), old, ref, **kwargs,
     )
     if packed:
         call()  # first use verifies the packed forward against per-row forwards
@@ -182,6 +189,65 @@ def test_matches_log_prob_route(monkeypatch, packed, loss_type, beta, old, bias_
 def test_entropy_bonus_folds_into_the_loss(monkeypatch, packed, loss_type):
     _compare(monkeypatch, packed = packed, loss_type = loss_type, beta = 0.04, old = OLD, ref = REF, adv = ADV,
              entropy_coef = 0.05)
+
+
+def _prefix_grouper_funcs():
+    """unsloth's PrefixGrouper layout builder, loaded from its own file (importing unsloth needs a GPU stack)."""
+    import importlib.util
+    import sys
+    spec = importlib.util.find_spec("unsloth")
+    if spec is None or not spec.submodule_search_locations:
+        pytest.skip("needs unsloth's PrefixGrouper")
+    root = os.path.join(list(spec.submodule_search_locations)[0], "utils")
+    if not os.path.exists(os.path.join(root, "prefix_grouper.py")):
+        pytest.skip("this unsloth has no PrefixGrouper")
+    pkg = types.ModuleType("_pg_stub")
+    pkg.__path__ = [root]
+    sys.modules.setdefault("_pg_stub", pkg)
+    mods = {}
+    for name in ("prefix_grouper_kernel", "prefix_grouper"):
+        full = f"_pg_stub.{name}"
+        if full not in sys.modules:
+            s = importlib.util.spec_from_file_location(full, os.path.join(root, f"{name}.py"))
+            m = importlib.util.module_from_spec(s)
+            sys.modules[full] = m
+            s.loader.exec_module(m)
+        mods[name] = sys.modules[full]
+    pg = mods["prefix_grouper"]
+    built = []
+
+    def build(*args, **kwargs):
+        layout = pg.build_group_layout(*args, **kwargs)
+        built.append(layout)
+        return layout
+    # enabled, no first-use verify (trusted), so the grouped forward feeds the loss directly
+    return (build, lambda: True, lambda: False, pg.tol_ok, pg.TOL_KILL), built
+
+
+# Two prompts x 3 completions: prompt 4 (one shares a left pad), completion 4 (pads after EOS on two rows).
+PG_IDS = torch.tensor([
+    [0, 5, 6, 7, 10, 11, 12, 3],
+    [0, 5, 6, 7, 8, 1, 0, 0],
+    [0, 5, 6, 7, 2, 3, 4, 5],
+    [4, 9, 6, 2, 7, 7, 1, 0],
+    [4, 9, 6, 2, 11, 12, 3, 5],
+    [4, 9, 6, 2, 6, 8, 9, 10],
+])
+PG_LTK = 4
+
+
+@pytest.mark.parametrize("loss_type,beta,bias", [
+    ("grpo", 0.04, False), ("dapo", 0.0, True), ("cispo", 0.04, False), ("sapo", 0.02, False),
+])
+def test_prefix_grouper_forward_matches_log_prob_route(monkeypatch, loss_type, beta, bias):
+    funcs, built = _prefix_grouper_funcs()
+    old, ref, _, adv = _side_inputs(input_ids = PG_IDS, ltk = PG_LTK)
+    before = _Model.pg_forwards
+    _compare(monkeypatch, loss_type = loss_type, beta = beta, old = old, ref = ref, adv = adv, bias = bias,
+             input_ids = PG_IDS, ltk = PG_LTK, pg_funcs = funcs, num_generations = 3)
+    # both arms grouped the batch and ran the shared-prefix forward (fused once, log-prob route once)
+    assert len(built) == 2 and all(x is not None for x in built)
+    assert _Model.pg_forwards - before == 2
 
 
 @pytest.mark.parametrize("mode", ["token_truncate", "token_mask", "sequence_truncate", "geometric_mask"])
