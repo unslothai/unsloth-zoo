@@ -49,6 +49,16 @@ from .utils import (
     generate_decoding_sliding_window_mask_with_padding,
 )
 
+try:
+    from ..gpt_oss_decode_fused import (
+        fused_decode_ok as _fused_decode_ok,
+        sink_scale_output as _sink_scale_output,
+    )
+except Exception:
+    def _fused_decode_ok(x):
+        return False
+    _sink_scale_output = None
+
 def causal_mask_with_sink(batch, head, q_idx, kv_idx):
     """
       0 1 2 3     0 1 2 3
@@ -322,6 +332,10 @@ def flex_attention_with_sink_inference(self_attn, query, key, value, block_mask,
         **FLEX_LSE_KWARGS,
     ))
     # A row with no visible key has lse = -inf, so its sink scale (and output) is 0.
+    if _fused_decode_ok(attn_output):
+        out = _sink_scale_output(attn_output, logsumexp, self_attn.sinks)
+        if out is not None:
+            return out
     sink_scale = torch.sigmoid(logsumexp.float() - self_attn.sinks.float().unsqueeze(1))
     attn_output = attn_output * sink_scale.unsqueeze(-1).to(attn_output.dtype)
     return attn_output.transpose(1, 2).contiguous()
