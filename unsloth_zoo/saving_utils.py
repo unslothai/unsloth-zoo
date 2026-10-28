@@ -3850,11 +3850,13 @@ def _is_export_source_loaded_repo(model_name, model):
 pass
 
 
-def _read_export_base_config(model_name, token, model, source_is_loaded_repo = False):
+def _read_export_base_config(model_name, token, model, source_is_loaded_repo = False, commit = None):
     # Repo code re-runs only for the exact repo (and Hub commit) the load trusted; siblings were never approved.
+    # `commit` pins the plain read to the commit the shards come from (a cache hit, no request).
     from transformers import AutoConfig
     try:
-        return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False)
+        pinned = {"revision": commit} if commit else {}
+        return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False, **pinned)
     except Exception:
         if not (source_is_loaded_repo and _loaded_with_trust_remote_code(model)): raise
         commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
@@ -4461,7 +4463,7 @@ def _find_quantization_config(config):
 pass
 
 
-def _compressed_tensors_quantization_config(model_name, token = None):
+def _compressed_tensors_quantization_config(model_name, token = None, commit = None):
     config = None
     try:
         if os.path.isdir(str(model_name)):
@@ -4469,7 +4471,8 @@ def _compressed_tensors_quantization_config(model_name, token = None):
         else:
             from huggingface_hub import hf_hub_download
             repo_id, revision = _hub_repo_and_revision(model_name)
-            path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token, revision = revision)
+            path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token,
+                                   revision = revision or commit)
         with open(path, "r", encoding = "utf-8") as f:
             config = json.load(f)
     except Exception:
@@ -4487,9 +4490,9 @@ def _compressed_tensors_quantization_config(model_name, token = None):
 pass
 
 
-def _compressed_packed_format(model_name, token = None):
+def _compressed_packed_format(model_name, token = None, commit = None):
     """``"mxfp4-pack-quantized"`` if every packed group is MXFP4, else the formats found; None if unpacked."""
-    quant = _compressed_tensors_quantization_config(model_name, token)
+    quant = _compressed_tensors_quantization_config(model_name, token, commit)
     if quant is None:
         return None
     top = quant.get("format")
@@ -4504,9 +4507,9 @@ pass
 _INT_PACKED_SUFFIXES = ("weight_packed", "weight_scale", "weight_shape", "weight_zero_point", "weight_g_idx")
 
 
-def _compressed_int_pack_schemes(model_name, token = None):
+def _compressed_int_pack_schemes(model_name, token = None, commit = None):
     """Weight args of every group of an all-``pack-quantized`` checkpoint; RuntimeError if not exactly decodable."""
-    quant = _compressed_tensors_quantization_config(model_name, token) or {}
+    quant = _compressed_tensors_quantization_config(model_name, token, commit) or {}
     refuse = lambda why: RuntimeError(  # noqa: E731
         f"Unsloth: `{model_name}` stores its weights compressed-tensors packed (pack-quantized) "
         f"and {why}, so a merged_16bit export of it is not supported. Nothing was written. Save "
@@ -5472,8 +5475,11 @@ def merge_and_overwrite_lora(
     pass
 
     # Default handle 16 bit merge and save/push
+    # The commit the shard listing was pinned to, so the config reads below describe the same
+    # files the merge fetches; it is also already in the Hub cache, so they cost no request.
+    _config_commit = None if is_local_path else _hub_revision
     # Before Step 1: an in-place export overwrites the source config.json without its quantization config.
-    _ct_packed_format = _compressed_packed_format(model_name, token) if save_method == "merged_16bit" else None
+    _ct_packed_format = _compressed_packed_format(model_name, token, _config_commit) if save_method == "merged_16bit" else None
     if _ct_packed_format is not None and _ct_packed_format not in ("mxfp4-pack-quantized", "pack-quantized"):
         raise RuntimeError(
             f"Unsloth: `{model_name}` stores its weights compressed-tensors packed "
@@ -5487,7 +5493,7 @@ def merge_and_overwrite_lora(
             f"is stored quantized ({quant_type or _ct_packed_format}). Nothing was merged. Use "
             f"`output_dtype = None` for the default 16-bit merge."
         )
-    _ct_int_schemes = _compressed_int_pack_schemes(model_name, token) if _ct_packed_format == "pack-quantized" else None
+    _ct_int_schemes = _compressed_int_pack_schemes(model_name, token, _config_commit) if _ct_packed_format == "pack-quantized" else None
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
         # `config` is `model.config`, already the nested text config under `text_only = True`,
@@ -5498,6 +5504,7 @@ def merge_and_overwrite_lora(
             base_config = _read_export_base_config(
                 model_name, token, model,
                 source_is_loaded_repo = _is_export_source_loaded_repo(model_name, model),
+                commit = _config_commit,
             )
         except Exception as base_config_error:
             warnings.warn(
@@ -5514,7 +5521,7 @@ def merge_and_overwrite_lora(
             loaded_commit = _trusted_code_commit(model) if _is_export_source_loaded_repo(model_name, model) else None
             source_model_type = _source_config_model_type(model_name, token, loaded_commit)
         elif getattr(type(base_config), "attribute_map", None):
-            source_config = _source_config_dict(model_name, token)
+            source_config = _source_config_dict(model_name, token, _config_commit)
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
             _restore_source_model_type(Path(save_directory) / "config.json", source_model_type)
