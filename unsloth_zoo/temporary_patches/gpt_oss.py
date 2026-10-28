@@ -3807,7 +3807,6 @@ def patch_GptOssModel():
     from unsloth_zoo.flex_attention import (
         is_flex_attention_decoding,
         flex_attention_with_sink_decoding,
-        flex_attention_add_sinks,
     )
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
