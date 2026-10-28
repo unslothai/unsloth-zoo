@@ -998,10 +998,14 @@ def test_exact_top_backward_keeps_fp32_gradient_accuracy(monkeypatch, ent_grad, 
 
 
 @CUDA
-@pytest.mark.parametrize("V", [1003, 20001, 40000])
-def test_trainable_head_grad_and_no_grad_passes_are_bit_identical(monkeypatch, V):
+@pytest.mark.parametrize("small_card", [False, True])
+@pytest.mark.parametrize("V", [1003, 20001, 40000, 40001, 40008, 49153])
+def test_trainable_head_grad_and_no_grad_passes_are_bit_identical(monkeypatch, V, small_card):
     if not fl._HAS_TRITON:
         pytest.skip("needs Triton")
+    # Small cards (<= 24.5 GiB) take the tiled route for frozen heads too and cap tiles at 16384 columns.
+    monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", 0 if small_card else 4096)
+    monkeypatch.setattr(fl, "_FWD_TILE_COLS", None)
     for dtype in _dtypes("cuda"):
         h, w, t = _peaked("cuda", dtype, 96, 64, V)
         mask = torch.ones(96, dtype = torch.bool, device = "cuda")
