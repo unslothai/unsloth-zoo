@@ -493,3 +493,20 @@ def test_fused_route_keeps_the_logits_row_cap(monkeypatch):
     monkeypatch.setenv("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "3")
     _compare(monkeypatch, loss_type = "dapo", old = OLD, adv = ADV)
     assert seen and all(r == -3 for r in seen)
+
+
+@pytest.mark.parametrize("packed,entropy_coef", [(False, 0.0), (True, 0.0), (False, 0.01)])
+def test_fused_oom_falls_back_to_the_log_prob_route(monkeypatch, packed, entropy_coef):
+    def oom(*args, **kwargs):
+        raise torch.cuda.OutOfMemoryError("injected")
+
+    want, want_grads, _ = _run(False, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, packed = packed,
+                               entropy_coef = entropy_coef)
+    monkeypatch.setattr(fg, "fused_linear_grpo_loss", oom)
+    before = rr.GRPO_FUSED_ROUTE_STATS["oom"]
+    got, got_grads, _ = _run(True, monkeypatch, loss_type = "dapo", old = OLD, adv = ADV, packed = packed,
+                             entropy_coef = entropy_coef)
+    assert rr.GRPO_FUSED_ROUTE_STATS["oom"] == before + 1
+    torch.testing.assert_close(got[0], want[0])
+    for name in want_grads:
+        torch.testing.assert_close(got_grads[name], want_grads[name])

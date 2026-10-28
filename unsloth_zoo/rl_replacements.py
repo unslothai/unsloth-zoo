@@ -2599,8 +2599,8 @@ RL_REPLACEMENTS["grpo_rollout_as_old_ratio_metrics"] = grpo_rollout_as_old_ratio
 
 # Forward-gradient GRPO routing (fused_linear_grpo_loss). Counts per grpo_accumulated_loss call: "fused" took the
 # forward-gradient op, "head_budget" deferred but scored with the log-prob op (an opted-in trainable head over its
-# memory budget).
-GRPO_FUSED_ROUTE_STATS = {"fused": 0, "head_budget": 0}
+# memory budget), "oom" ran out of memory in the fused op and fell back to the log-prob op.
+GRPO_FUSED_ROUTE_STATS = {"fused": 0, "head_budget": 0, "oom": 0}
 # A trainable lm_head takes the log-prob op unless opted in: the forward-gradient op's float32 head accumulator costs
 # 4 V H bytes and measured 0.86x / 0.95x of the log-prob op on an L4 (bf16, V 151936, H 4096, 2k / 8k tokens), while
 # a frozen head (LoRA) is 1.4x faster with an entropy term and level without.
@@ -2751,7 +2751,7 @@ def grpo_fused_policy_loss(
     loss = _GRPOFusedUpstream.apply(loss, scaling, upstream_scale)
     new_logprobs = torch.zeros(B * W + 1, device = device, dtype = torch.float32).index_put(
         (slots,), logps[0],
-    )[:-1].view(B, W)
+    )[:-1].view(B, W).to(completion_mask.device)  # metrics on the inputs' device (lm_head may sit elsewhere)
     with torch.no_grad():
         _, completion_length, mean_kl, delta, flat_is_ratio, coef_1, _ = grpo_compute_loss(
             ref_logps, new_logprobs, old_logps, sampling_per_token_logps, completion_input_ids, completion_mask,
@@ -3947,6 +3947,26 @@ def grpo_accumulated_loss(
         else:
             _fused_items = [_fused_pack] if _fused_pack is not None else []
         _fused_pad = _fused_pack = _fused_pg = None
+
+        def _score_deferred(items, need_entropy):
+            # The deferred lm_head rows scored with the log-prob op: ([rows, W] log-probs, entropies or None)
+            h = torch.cat([_x[0] for _x in items]).unsqueeze(0)
+            t = torch.cat([_x[1] for _x in items]).unsqueeze(0)
+            slots = torch.cat([_x[2] for _x in items])
+            grid = lambda v: torch.zeros(  # noqa: E731
+                total_rows * _fused_W + 1, dtype = torch.float32, device = slots.device,
+            ).index_put((slots,), v[0].to(torch.float32))[:-1].view(total_rows, _fused_W)
+            with autocaster:
+                if need_entropy:
+                    lp, en = _hidden_logps_and_entropies(h, t, total_rows * multiplier)
+                    return grid(lp), grid(en)
+                lp = chunked_hidden_states_selective_log_softmax(
+                    h, lm_head, t, total_rows * multiplier,
+                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                    lm_head_bias = lm_head_bias,
+                )
+            return grid(lp), None
+
         if _fused_items:
             from unsloth_zoo.rl_replacements import (
                 grpo_fused_head_fits as _grpo_fused_head_fits,
@@ -3956,26 +3976,11 @@ def grpo_accumulated_loss(
             if not _grpo_fused_head_fits(lm_head):
                 # A trainable head over its memory budget: score the deferred rows with the log-prob op as before
                 _fused_stats["head_budget"] += 1
-                _fused_h = torch.cat([_x[0] for _x in _fused_items]).unsqueeze(0)
-                _fused_t = torch.cat([_x[1] for _x in _fused_items]).unsqueeze(0)
-                _fused_s = torch.cat([_x[2] for _x in _fused_items])
+                new_logprobs, _fused_en = _score_deferred(_fused_items, _need_entropy)
                 _fused_items = None
-                with autocaster:
-                    if _need_entropy:
-                        _fused_lp, _fused_en = _hidden_logps_and_entropies(_fused_h, _fused_t, total_rows * multiplier)
-                        all_entropies_list = [torch.zeros(
-                            total_rows * _fused_W + 1, dtype = torch.float32, device = _fused_s.device,
-                        ).index_put((_fused_s,), _fused_en[0].to(torch.float32))[:-1].view(total_rows, _fused_W)]
-                    else:
-                        _fused_lp = chunked_hidden_states_selective_log_softmax(
-                            _fused_h, lm_head, _fused_t, total_rows * multiplier,
-                            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                            lm_head_bias = lm_head_bias,
-                        )
-                new_logprobs = torch.zeros(
-                    total_rows * _fused_W + 1, dtype = torch.float32, device = _fused_s.device,
-                ).index_put((_fused_s,), _fused_lp[0].to(torch.float32))[:-1].view(total_rows, _fused_W)
-                _fused_h = _fused_t = _fused_s = _fused_lp = _fused_en = None
+                if _fused_en is not None:
+                    all_entropies_list = [_fused_en]
+                _fused_en = None
 
         if kept_completion_rows is not None:
             completion_mask = completion_mask * kept_completion_rows.to(
@@ -4032,16 +4037,24 @@ def grpo_accumulated_loss(
                 _fused_ent_w = _grpo_entropy_bonus_weights(
                     completion_mask, None, _entropy_coef, kwargs, training = _training,
                 )
-            with autocaster:
-                loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, new_logprobs = _grpo_fused_policy_loss(
-                    _fused_items, lm_head, lm_head_bias, total_rows, _fused_W,
-                    old_logps, ref_logps, sampling_per_token_logps, completion_input_ids, completion_mask, advantages,
-                    trainer.beta, trainer.accelerator.scaler, kwargs, upstream_scale, _fused_ent_w,
-                    temperature, logit_scale_multiply, logit_scale_divide, logit_softcapping,
-                )
+            try:
+                with autocaster:
+                    loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, new_logprobs = _grpo_fused_policy_loss(
+                        _fused_items, lm_head, lm_head_bias, total_rows, _fused_W,
+                        old_logps, ref_logps, sampling_per_token_logps, completion_input_ids, completion_mask,
+                        advantages, trainer.beta, trainer.accelerator.scaler, kwargs, upstream_scale, _fused_ent_w,
+                        temperature, logit_scale_multiply, logit_scale_divide, logit_softcapping,
+                    )
+                _fused_done = True
+            except torch.cuda.OutOfMemoryError:
+                # Out of memory in the fused projection: the log-prob op and the loss below, as without the route
+                # (the deferred packed / PrefixGrouper projection otherwise loses their own OOM recovery).
+                _fused_stats["oom"] += 1
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                new_logprobs, new_entropies = _score_deferred(_fused_items, _entropy_bonus_on)
             _fused_items = _fused_ent_w = None
-            _fused_done = True
-        else:
+        if not _fused_done:
             with autocaster:
                 loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
                     new_logprobs,
