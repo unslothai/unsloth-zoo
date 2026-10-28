@@ -1176,7 +1176,7 @@ def grpo_compute_loss(
         loss_i = -soft_coef_1 * advantages
     elif loss_type == "vespo":
         if get_gamma_weights is None:
-            raise Exception("vespo is only available in TRL 0.26.0+")
+            raise Exception("vespo is only available in TRL 1.0.0+")
         # rollout_rs rejected tokens leave the sequence weight (verl response_mask *= keep): neutral IS factor.
         vespo_is_ratio = importance_sampling_ratio
         if rs_keep is not None and importance_sampling_ratio is not None and importance_sampling_ratio.shape == rs_keep.shape:
