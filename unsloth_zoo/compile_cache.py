@@ -42,9 +42,10 @@ Environment knobs:
       Unset -> enabled on POSIX, where the trust checks below enforce that a
       cache directory is owned by the current user and not group/other writable
       (an untrusted directory is refused, not loaded, so the feature fails
-      closed). Unset -> disabled on non-POSIX platforms, whose ACLs those POSIX
-      ownership/mode checks cannot model; there an explicit opt-in is the trust
-      boundary. torch.compile artifacts are executable/deserialized data.
+      closed). Unset -> disabled on non-POSIX platforms. On Windows an opted-in
+      cache is checked by owner SID and DACL instead (_windows_acl_is_trusted),
+      failing closed on any API error; the default there is still off.
+      torch.compile artifacts are executable/deserialized data.
       0 / off / false / no -> fully disabled (kill switch), any platform.
       1 / on / true / yes  -> enabled, any platform.
   UNSLOTH_MEGA_CACHE_DIR   = bundle root (default ~/.cache/unsloth/mega_cache).
@@ -64,6 +65,7 @@ import hashlib
 import json
 import os
 import stat
+import struct
 import sys
 import time
 
@@ -125,6 +127,428 @@ def _cache_root():
 pass
 
 
+# ---------------------------------------------------------------------------
+# Windows trust check (owner SID + DACL), the counterpart of the POSIX owner and
+# mode-bit checks. ctypes over advapi32 / kernel32 only. The decision logic
+# (_windows_acl_is_trusted, _windows_parse_acl, _windows_parse_sid) is pure
+# Python so it is testable anywhere; the ctypes layer only extracts the owner
+# SID, the raw DACL bytes and the file attributes from an open handle. Every
+# API failure raises inside the helpers and the callers turn it into
+# "untrusted", so the check fails closed.
+#
+# Rules, for each existing component of the path:
+#   leaf (the cache dir being validated, and every cache file read):
+#     owner is the current user (or the token's default owner, which is
+#     BUILTIN\Administrators for an elevated process), and no ACE that applies
+#     to the object grants ANY write / delete / re-ACL right to anyone other
+#     than the current user, SYSTEM, Administrators or TrustedInstaller.
+#   ancestors (the root and every parent up to the drive):
+#     owner is one of those principals, and no ACE grants anyone else a right
+#     that can rename, delete or re-ACL an existing entry (FILE_DELETE_CHILD,
+#     DELETE, WRITE_DAC, WRITE_OWNER). Add-file / add-subdirectory rights are
+#     allowed there, like a sticky POSIX parent: they can create new names but
+#     not replace an existing one, and a name created first by someone else is
+#     refused by the owner check when the walk reaches it.
+#   any component that is a reparse point (symlink, junction): untrusted.
+#   a NULL DACL (everyone full access, also what ACL-less FAT/exFAT reports),
+#   an unparseable ACL, or an allow ACE of a type not understood: untrusted.
+# Deny ACEs only remove rights and are ignored; inherit-only ACEs do not apply
+# to the object itself and are skipped (they are judged on the children, which
+# are checked themselves when they are on the walk).
+# ---------------------------------------------------------------------------
+
+_WIN_SID_SYSTEM = "S-1-5-18"
+_WIN_SID_ADMINISTRATORS = "S-1-5-32-544"
+_WIN_SID_TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+_WIN_SID_CREATOR_OWNER = "S-1-3-0"
+_WIN_SID_CREATOR_GROUP = "S-1-3-1"
+_WIN_SID_OWNER_RIGHTS = "S-1-3-4"
+_WIN_SYSTEM_PRINCIPALS = (
+    _WIN_SID_SYSTEM, _WIN_SID_ADMINISTRATORS, _WIN_SID_TRUSTED_INSTALLER,
+)
+# Placeholders that grant nothing on the object itself (CREATOR OWNER / GROUP
+# are substituted only at inheritance) or that resolve to the owner, whom the
+# owner check already requires to be trusted (OWNER RIGHTS).
+_WIN_PLACEHOLDER_SIDS = (
+    _WIN_SID_CREATOR_OWNER, _WIN_SID_CREATOR_GROUP, _WIN_SID_OWNER_RIGHTS,
+)
+
+_WIN_ACCESS_ALLOWED = 0x00
+_WIN_ACCESS_DENIED = 0x01
+_WIN_ACCESS_ALLOWED_CALLBACK = 0x09
+_WIN_ACCESS_DENIED_CALLBACK = 0x0A
+_WIN_DENY_ACE_TYPES = (0x01, 0x06, 0x0A, 0x0C)  # plain, object, callback, callback object
+_WIN_SIMPLE_ACE_TYPES = (0x00, 0x01, 0x09, 0x0A)  # header, mask, SID (+ callback data)
+_WIN_INHERIT_ONLY_ACE = 0x08
+
+_WIN_FILE_WRITE_DATA = 0x0002        # FILE_ADD_FILE on a directory
+_WIN_FILE_APPEND_DATA = 0x0004       # FILE_ADD_SUBDIRECTORY on a directory
+_WIN_FILE_WRITE_EA = 0x0010
+_WIN_FILE_DELETE_CHILD = 0x0040
+_WIN_FILE_WRITE_ATTRIBUTES = 0x0100
+_WIN_DELETE = 0x00010000
+_WIN_WRITE_DAC = 0x00040000
+_WIN_WRITE_OWNER = 0x00080000
+_WIN_MAXIMUM_ALLOWED = 0x02000000
+_WIN_GENERIC_ALL = 0x10000000
+_WIN_GENERIC_EXECUTE = 0x20000000
+_WIN_GENERIC_WRITE = 0x40000000
+_WIN_GENERIC_READ = 0x80000000
+_WIN_FILE_ALL_ACCESS = 0x001F01FF
+_WIN_GENERIC_MAP = (
+    (_WIN_GENERIC_READ, 0x00120089),
+    (_WIN_GENERIC_WRITE, 0x00120116),
+    (_WIN_GENERIC_EXECUTE, 0x001200A0),
+    (_WIN_GENERIC_ALL, _WIN_FILE_ALL_ACCESS),
+    (_WIN_MAXIMUM_ALLOWED, _WIN_FILE_ALL_ACCESS),  # never valid in an ACE: treat as everything
+)
+_WIN_REPLACE_RIGHTS = _WIN_FILE_DELETE_CHILD | _WIN_DELETE | _WIN_WRITE_DAC | _WIN_WRITE_OWNER
+_WIN_WRITE_RIGHTS = (
+    _WIN_REPLACE_RIGHTS | _WIN_FILE_WRITE_DATA | _WIN_FILE_APPEND_DATA
+    | _WIN_FILE_WRITE_EA | _WIN_FILE_WRITE_ATTRIBUTES
+)
+
+_WIN_FILE_ATTRIBUTE_DIRECTORY = 0x10
+_WIN_FILE_ATTRIBUTE_DEVICE = 0x40
+_WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+# Token SIDs are fixed for the life of the process; cached once read.
+_WIN_TOKEN_SIDS = []
+# Private WinDLL handles with our own argtypes (never the shared ctypes.windll).
+_WIN_API = []
+
+
+def _windows_parse_sid(data, offset = 0):
+    """Binary SID -> "S-R-A-S1-..." string. Raises ValueError on a bad SID."""
+    if len(data) < offset + 8:
+        raise ValueError("truncated SID")
+    revision, count = data[offset], data[offset + 1]
+    end = offset + 8 + 4 * count
+    if revision != 1 or count > 15 or len(data) < end:
+        raise ValueError("invalid SID")
+    authority = int.from_bytes(bytes(data[offset + 2 : offset + 8]), "big")
+    subs = struct.unpack_from("<%dI" % count, data, offset + 8)
+    return "S-%d-%d" % (revision, authority) + "".join("-%d" % s for s in subs)
+pass
+
+
+def _windows_parse_acl(data):
+    """Raw ACL bytes -> [(ace_type, ace_flags, mask, sid)]. Types other than the
+    simple allow/deny (and callback) layouts come back with mask/sid None, for
+    the decision function to refuse. Raises ValueError on a malformed ACL."""
+    if len(data) < 8:
+        raise ValueError("truncated ACL")
+    revision, _, acl_size, ace_count, _ = struct.unpack_from("<BBHHH", data, 0)
+    if revision not in (2, 4) or acl_size < 8 or acl_size > len(data):
+        raise ValueError("invalid ACL header")
+    aces = []
+    offset = 8
+    for _ in range(ace_count):
+        if offset + 4 > acl_size:
+            raise ValueError("truncated ACE header")
+        ace_type, ace_flags, ace_size = struct.unpack_from("<BBH", data, offset)
+        if ace_size < 4 or offset + ace_size > acl_size:
+            raise ValueError("invalid ACE size")
+        mask = sid = None
+        if ace_type in _WIN_SIMPLE_ACE_TYPES:
+            body = bytes(data[offset : offset + ace_size])
+            if len(body) < 16:
+                raise ValueError("truncated ACE")
+            mask = struct.unpack_from("<I", body, 4)[0]
+            sid = _windows_parse_sid(body, 8)
+        aces.append((ace_type, ace_flags, mask, sid))
+        offset += ace_size
+    return aces
+pass
+
+
+def _windows_expand_generic(mask):
+    for generic, specific in _WIN_GENERIC_MAP:
+        if mask & generic:
+            mask |= specific
+    return mask
+pass
+
+
+def _windows_acl_is_trusted(owner_sid, aces, user_sids, *, leaf):
+    """Pure decision: may a cache object with this owner and DACL be trusted?
+
+    ``user_sids`` are the current token's user SID and default owner SID.
+    ``aces`` is ``_windows_parse_acl`` output, or None for a NULL DACL.
+    ``leaf`` selects the strict rule (cache dir / file) over the ancestor rule.
+    """
+    user_sids = tuple(sid for sid in user_sids if sid)
+    if not user_sids or not owner_sid:
+        return False
+    allowed_owners = user_sids if leaf else user_sids + _WIN_SYSTEM_PRINCIPALS
+    if owner_sid not in allowed_owners:
+        return False
+    if aces is None:
+        return False
+    trusted_writers = user_sids + _WIN_SYSTEM_PRINCIPALS + _WIN_PLACEHOLDER_SIDS
+    forbidden = _WIN_WRITE_RIGHTS if leaf else _WIN_REPLACE_RIGHTS
+    for ace_type, ace_flags, mask, sid in aces:
+        if ace_flags & _WIN_INHERIT_ONLY_ACE:
+            continue
+        if ace_type in _WIN_DENY_ACE_TYPES:
+            continue
+        # Conditional (callback) allows are judged as unconditional grants;
+        # object ACEs and anything else in a DACL are not understood here.
+        if ace_type not in (_WIN_ACCESS_ALLOWED, _WIN_ACCESS_ALLOWED_CALLBACK):
+            return False
+        if mask is None or sid is None:
+            return False
+        if sid in trusted_writers:
+            continue
+        if _windows_expand_generic(mask) & forbidden:
+            return False
+    return True
+pass
+
+
+def _windows_api():
+    """advapi32 / kernel32 entry points with explicit signatures. Raises off
+    Windows (no ctypes.WinDLL), which every caller treats as untrusted."""
+    if _WIN_API:
+        return _WIN_API[0]
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error = True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    PVOID = ctypes.c_void_p
+    PPVOID = ctypes.POINTER(ctypes.c_void_p)
+
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, PPVOID, PPVOID, PPVOID, PPVOID, PPVOID,
+    ]
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.IsValidSid.argtypes = [PVOID]
+    advapi32.IsValidSid.restype = wintypes.BOOL
+    advapi32.GetLengthSid.argtypes = [PVOID]
+    advapi32.GetLengthSid.restype = wintypes.DWORD
+    advapi32.IsValidAcl.argtypes = [PVOID]
+    advapi32.IsValidAcl.restype = wintypes.BOOL
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, PVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, PPVOID, ctypes.POINTER(wintypes.ULONG),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, PVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, PVOID]
+    kernel32.CreateDirectoryW.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, PVOID]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [PVOID]
+    kernel32.LocalFree.restype = PVOID
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    _WIN_API[:] = [(ctypes, wintypes, advapi32, kernel32)]
+    return _WIN_API[0]
+pass
+
+
+def _windows_sid_at(ctypes, advapi32, psid):
+    if not psid or not advapi32.IsValidSid(psid):
+        raise OSError("invalid SID")
+    return _windows_parse_sid(ctypes.string_at(psid, advapi32.GetLengthSid(psid)))
+pass
+
+
+def _windows_token_sids():
+    """(user SID, default owner SID) of this process' token."""
+    if _WIN_TOKEN_SIDS:
+        return tuple(_WIN_TOKEN_SIDS)
+    ctypes, wintypes, advapi32, kernel32 = _windows_api()
+    TOKEN_QUERY = 0x0008
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        sids = []
+        for token_class in (1, 4):  # TokenUser, TokenOwner: both start with a PSID
+            size = wintypes.DWORD(0)
+            advapi32.GetTokenInformation(token, token_class, None, 0, ctypes.byref(size))
+            if size.value == 0:
+                raise ctypes.WinError(ctypes.get_last_error())
+            buffer = ctypes.create_string_buffer(size.value)
+            if not advapi32.GetTokenInformation(token, token_class, buffer, size, ctypes.byref(size)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            psid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+            sids.append(_windows_sid_at(ctypes, advapi32, psid))
+    finally:
+        kernel32.CloseHandle(token)
+    _WIN_TOKEN_SIDS[:] = sids
+    return tuple(sids)
+pass
+
+
+def _windows_handle_security(handle):
+    """(file attributes, owner SID, parsed DACL or None) for an open handle."""
+    ctypes, wintypes, advapi32, kernel32 = _windows_api()
+    info = (wintypes.DWORD * 13)()  # BY_HANDLE_FILE_INFORMATION, attributes first
+    if not kernel32.GetFileInformationByHandle(handle, info):
+        raise ctypes.WinError(ctypes.get_last_error())
+    SE_FILE_OBJECT = 1
+    OWNER_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION = 0x1, 0x4
+    owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    status = advapi32.GetSecurityInfo(
+        handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(descriptor),
+    )
+    if status != 0:
+        raise ctypes.WinError(status)
+    try:
+        owner_sid = _windows_sid_at(ctypes, advapi32, owner.value)
+        aces = None
+        if dacl.value:
+            if not advapi32.IsValidAcl(dacl.value):
+                raise OSError("invalid ACL")
+            acl_size = struct.unpack_from("<H", ctypes.string_at(dacl.value, 4), 2)[0]
+            aces = _windows_parse_acl(ctypes.string_at(dacl.value, acl_size))
+        return int(info[0]), owner_sid, aces
+    finally:
+        if descriptor.value:
+            kernel32.LocalFree(descriptor.value)
+pass
+
+
+def _windows_path_security(path):
+    """Like _windows_handle_security for a path, opening the path itself (never
+    a reparse point's target) so the attributes, owner and DACL describe the
+    same object."""
+    ctypes, wintypes, advapi32, kernel32 = _windows_api()
+    READ_CONTROL, FILE_READ_ATTRIBUTES = 0x00020000, 0x0080
+    SHARE_ALL, OPEN_EXISTING = 0x7, 3
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT = 0x02000000, 0x00200000
+    handle = kernel32.CreateFileW(
+        os.fspath(path), READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL, None, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None,
+    )
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return _windows_handle_security(handle)
+    finally:
+        kernel32.CloseHandle(handle)
+pass
+
+
+def _windows_security_is_trusted(security, *, directory, leaf):
+    attributes, owner_sid, aces = security
+    if attributes & (_WIN_FILE_ATTRIBUTE_REPARSE_POINT | _WIN_FILE_ATTRIBUTE_DEVICE):
+        return False
+    if bool(attributes & _WIN_FILE_ATTRIBUTE_DIRECTORY) != directory:
+        return False
+    return _windows_acl_is_trusted(owner_sid, aces, _windows_token_sids(), leaf = leaf)
+pass
+
+
+def _windows_directory_is_trusted(path, allow_missing):
+    """The Windows walk of _is_trusted_directory: the target as leaf, every
+    existing parent up to the drive root as an ancestor. Raises on API errors;
+    the caller maps that to untrusted."""
+    target = os.path.abspath(os.fspath(path))
+    current = target
+    target_exists = False
+    while True:
+        try:
+            os.lstat(current)
+            exists = True
+        except FileNotFoundError:
+            exists = False
+        if exists:
+            is_target = current == target
+            target_exists = target_exists or is_target
+            security = _windows_path_security(current)
+            if not _windows_security_is_trusted(security, directory = True, leaf = is_target):
+                return False
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return target_exists or allow_missing
+pass
+
+
+def _windows_make_private_directory(path):
+    """mkdir with a protected owner-only DACL (current user, SYSTEM,
+    Administrators; inherited by the files saved inside), the counterpart of
+    POSIX mkdir 0o700. Raises FileExistsError if the path exists."""
+    ctypes, wintypes, advapi32, kernel32 = _windows_api()
+    user_sid = _windows_token_sids()[0]
+    sddl = "D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" % user_sid
+    descriptor = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ctypes.byref(descriptor), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", wintypes.BOOL),
+        ]
+
+    try:
+        attributes = SECURITY_ATTRIBUTES(ctypes.sizeof(SECURITY_ATTRIBUTES), descriptor.value, False)
+        if not kernel32.CreateDirectoryW(os.fspath(path), ctypes.byref(attributes)):
+            error = ctypes.get_last_error()
+            if error == 183:  # ERROR_ALREADY_EXISTS
+                raise FileExistsError(path)
+            raise ctypes.WinError(error)
+    finally:
+        kernel32.LocalFree(descriptor.value)
+pass
+
+
+def _windows_read_trusted_file(path, binary):
+    """The Windows branch of _read_trusted_file: refuse links and non-regular
+    files, open, confirm the handle is the file that was checked, then judge
+    owner and DACL on the open handle (no path re-resolution)."""
+    try:
+        before = os.lstat(path)
+    except OSError:
+        return None
+    if (not stat.S_ISREG(before.st_mode)
+            or getattr(before, "st_file_attributes", 0) & _WIN_FILE_ATTRIBUTE_REPARSE_POINT):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None
+    try:
+        after = os.fstat(fd)
+        if (not stat.S_ISREG(after.st_mode)
+                or (after.st_ino, after.st_dev) != (before.st_ino, before.st_dev)):
+            return None
+        import msvcrt
+        security = _windows_handle_security(msvcrt.get_osfhandle(fd))
+        if not _windows_security_is_trusted(security, directory = False, leaf = True):
+            return None
+        with os.fdopen(fd, "rb" if binary else "r") as file:
+            fd = -1
+            return file.read()
+    except Exception:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+pass
+
+
 def _is_trusted_directory(path, *, allow_missing = True):
     """Return whether an existing cache directory is safe to load from.
 
@@ -141,6 +565,8 @@ def _is_trusted_directory(path, *, allow_missing = True):
     if path is None:
         return True
     try:
+        if os.name == "nt":
+            return _windows_directory_is_trusted(path, allow_missing)
         if os.name != "posix":
             try:
                 directory_stat = os.lstat(path)
@@ -198,6 +624,23 @@ def _ensure_private_directory(path):
     only if ``_is_trusted_directory`` accepts it. No process-wide umask change."""
     try:
         target = os.path.abspath(os.fspath(path))
+        if os.name == "nt":
+            # Only missing components are created (protected owner-only
+            # DACL); pre-existing ones are judged as they are, like POSIX.
+            components = []
+            current = target
+            while not os.path.lexists(current):
+                components.append(current)
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+            for directory in reversed(components):
+                try:
+                    _windows_make_private_directory(directory)
+                except FileExistsError:
+                    pass
+            return _is_trusted_directory(target)
         if os.name != "posix":
             os.makedirs(target, exist_ok = True)
             return _is_trusted_directory(target)
@@ -349,6 +792,8 @@ def _read_trusted_file(path, *, binary = False):
     checksum) rewritten in place; reject those. Returns None if the file is
     missing or untrusted, and never blocks on a FIFO/device."""
     mode = "rb" if binary else "r"
+    if os.name == "nt":
+        return _windows_read_trusted_file(path, binary)
     if os.name != "posix":
         try:
             with open(path, mode) as file:

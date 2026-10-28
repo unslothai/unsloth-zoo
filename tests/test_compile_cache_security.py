@@ -267,12 +267,25 @@ def test_non_posix_load_requires_explicit_opt_in(monkeypatch, tmp_path):
     _configure_load(monkeypatch, module, root, loaded)
     monkeypatch.setattr(module.os, "name", "nt")
 
-    # non-POSIX has no ownership/ACL safeguard, so unset stays disabled
+    # Windows stays opt-in: unset is disabled
     monkeypatch.delenv("UNSLOTH_MEGA_CACHE")
     assert module.megacache_load("disabled-model") is False
     assert loaded == []
 
-    monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "1")  # explicit opt-in
+    # Opted in, the Windows owner/DACL check runs; here (no advapi32) every
+    # call fails, which must mean untrusted, never a load.
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "1")
+    assert module.megacache_load("unverifiable-model") is False
+    assert loaded == []
+
+    # With the ACL checks reporting trusted, the opt-in loads.
+    monkeypatch.setattr(module, "_windows_directory_is_trusted", lambda path, allow_missing: True)
+
+    def _read(path, binary):
+        with open(path, "rb" if binary else "r") as file:
+            return file.read()
+
+    monkeypatch.setattr(module, "_windows_read_trusted_file", _read)
     assert module.megacache_load("trusted-model") is True
     assert loaded != []
 
