@@ -2646,16 +2646,16 @@ def grpo_fused_head_fits(lm_head, budget_fraction = None):
     otherwise the log-prob op, whose backward tiles the vocabulary. A frozen head (LoRA) costs nothing extra."""
     if not (torch.is_grad_enabled() and lm_head.requires_grad):
         return True
-    from unsloth_zoo.fused_losses import fused_grpo as _fused_grpo
-    half = lm_head.dtype in (torch.float16, torch.bfloat16)
-    extra = lm_head.numel() * lm_head.element_size() * (3 if half and _fused_grpo.GRPO_FP32_HEAD_GRAD else 1)
     device = lm_head.device
     if device.type == "cpu":
         return True
-    if budget_fraction is None:
-        budget_fraction = float(os.environ.get("UNSLOTH_GRPO_FUSED_HEAD_BUDGET", "0.5"))
     if device.type != "cuda":
         return False
+    from unsloth_zoo.fused_losses import fused_grpo as _fused_grpo
+    half = lm_head.dtype in (torch.float16, torch.bfloat16)
+    extra = lm_head.numel() * lm_head.element_size() * (3 if half and _fused_grpo.GRPO_FP32_HEAD_GRAD else 1)
+    if budget_fraction is None:
+        budget_fraction = float(os.environ.get("UNSLOTH_GRPO_FUSED_HEAD_BUDGET", "0.5"))
     free, _ = torch.cuda.mem_get_info(device)
     free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     return extra <= budget_fraction * free
@@ -2665,36 +2665,8 @@ RL_REPLACEMENTS["grpo_fused_head_fits"] = grpo_fused_head_fits
 
 def grpo_fused_token_weights(mask, loss_kwargs):
     """Per-token weights w with sum(w * loss_i) == grpo_compute_loss's normalised loss, for a [B, T] completion mask."""
-    m = mask.to(torch.float32)
-    B = m.shape[0]
-    loss_type = loss_kwargs.get("loss_type", "grpo")
-    ga = loss_kwargs.get("current_gradient_accumulation_steps", 1)
-    steps_per_generation = loss_kwargs.get("steps_per_generation", None)
-    num_processes = loss_kwargs.get("num_processes", 1)
-    sample_weight = loss_kwargs.get("sample_weight", None)
-    if sample_weight is not None:
-        normalizer = 1.0 / num_processes
-        if steps_per_generation:
-            normalizer = normalizer * ga / steps_per_generation
-        return m * sample_weight.to(device = m.device, dtype = torch.float32).unsqueeze(-1) / normalizer
-    if loss_type in ("grpo", "sapo"):
-        return m / m.sum(-1, keepdim = True).clamp(min = 1.0) / B / ga
-    if loss_type == "bnpo":
-        return m / m.sum().clamp(min = 1.0) / ga
-    if loss_type == "dr_grpo":
-        return m / (B * loss_kwargs.get("max_completion_length", 8192)) / ga
-    if loss_type in ("cispo", "dapo"):
-        num_items_in_batch = loss_kwargs.get("num_items_in_batch", None)
-        if torch.is_tensor(num_items_in_batch):
-            normalizer = num_items_in_batch.to(m.device).clamp(min = 1.0) / num_processes
-        else:
-            normalizer = max(float(num_items_in_batch), 1.0) / num_processes
-        if steps_per_generation:
-            normalizer = normalizer * ga / steps_per_generation
-        return m / normalizer
-    if loss_type == "luspo":
-        return m / B / ga
-    raise ValueError(f"Unsloth: GRPO loss type {loss_type} has no forward gradient.")
+    from unsloth_zoo.fused_losses.fused_grpo import grpo_loss_token_weights
+    return grpo_loss_token_weights(mask, loss_kwargs)
 pass
 RL_REPLACEMENTS["grpo_fused_token_weights"] = grpo_fused_token_weights
 

@@ -35,7 +35,7 @@ import torch
 
 from . import fused_linear as fl
 
-__all__ = ["fused_linear_grpo_loss", "grpo_token_weights", "GRPO_FWD_GRAD"]
+__all__ = ["fused_linear_grpo_loss", "grpo_token_weights", "grpo_loss_token_weights", "GRPO_FWD_GRAD"]
 
 GRPO_FWD_GRAD = os.environ.get("UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD", "1") != "0"
 # A trainable half lm_head gradient accumulates across row chunks in float32 (one float32 copy of the head while the
@@ -88,31 +88,59 @@ def _token_terms(lp, adv, old, ref, isr, kind, eps_low, eps_high, delta, beta, s
     return loss, grad
 
 
+def grpo_loss_token_weights(mask, loss_kwargs):
+    """Per-token weights w with sum(w * loss_i) == Unsloth's grpo_compute_loss normalised loss, for a [B, T] completion
+    mask and that function's kwargs (loss_type, current_gradient_accumulation_steps, steps_per_generation,
+    num_processes, num_items_in_batch, max_completion_length, sample_weight)."""
+    m = mask.to(torch.float32)
+    B = m.shape[0]
+    loss_type = loss_kwargs.get("loss_type", "grpo")
+    ga = loss_kwargs.get("current_gradient_accumulation_steps", 1)
+    steps_per_generation = loss_kwargs.get("steps_per_generation", None)
+    num_processes = loss_kwargs.get("num_processes", 1)
+    sample_weight = loss_kwargs.get("sample_weight", None)
+    if sample_weight is not None:
+        normalizer = 1.0 / num_processes
+        if steps_per_generation:
+            normalizer = normalizer * ga / steps_per_generation
+        return m * sample_weight.to(device = m.device, dtype = torch.float32).unsqueeze(-1) / normalizer
+    if loss_type in ("grpo", "sapo"):
+        return m / m.sum(-1, keepdim = True).clamp(min = 1.0) / B / ga
+    if loss_type == "bnpo":
+        return m / m.sum().clamp(min = 1.0) / ga
+    if loss_type == "dr_grpo":
+        return m / (B * loss_kwargs.get("max_completion_length", 8192)) / ga
+    if loss_type in ("cispo", "dapo"):
+        num_items_in_batch = loss_kwargs.get("num_items_in_batch", None)
+        if torch.is_tensor(num_items_in_batch):
+            normalizer = num_items_in_batch.to(m.device).clamp(min = 1.0) / num_processes
+        else:
+            normalizer = max(float(num_items_in_batch), 1.0) / num_processes
+        if steps_per_generation:
+            normalizer = normalizer * ga / steps_per_generation
+        return m / normalizer
+    if loss_type == "luspo":
+        return m / B / ga
+    raise ValueError(f"Unsloth: GRPO loss type {loss_type} has no forward gradient.")
+
+
 def grpo_token_weights(mask, loss_type, *, num_items_in_batch = None, max_completion_length = None,
                        gradient_accumulation_steps = 1, steps_per_generation = 1, num_processes = 1,
                        entropy_coef = 0.0, training = True):
     """(w, e): per-token weights of the policy loss and the entropy term for a [B, T] completion mask (TRL 1.15)."""
+    kw = dict(loss_type = loss_type, num_items_in_batch = num_items_in_batch, num_processes = num_processes,
+              current_gradient_accumulation_steps = gradient_accumulation_steps if training else 1,
+              steps_per_generation = steps_per_generation if training else None)
+    if max_completion_length is not None:
+        kw["max_completion_length"] = max_completion_length
+    w = grpo_loss_token_weights(mask, kw)
     m = mask.to(torch.float32)
-    B = m.shape[0]
     ga = float(gradient_accumulation_steps) if training else 1.0
-    if loss_type in ("grpo", "sapo"):
-        w = m / m.sum(-1, keepdim = True).clamp(min = 1.0) / B / ga
-    elif loss_type == "bnpo":
-        w = m / m.sum().clamp(min = 1.0) / ga
-    elif loss_type == "dr_grpo":
-        w = m / (B * float(max_completion_length)) / ga
-    elif loss_type in ("cispo", "dapo"):
-        norm = torch.as_tensor(num_items_in_batch, dtype = torch.float32, device = m.device).clamp(min = 1.0)
-        norm = norm / num_processes
-        if training:
-            norm = norm * float(gradient_accumulation_steps) / float(steps_per_generation)
-        w = m / norm
-    elif loss_type == "luspo":
-        w = m / B / ga
-    else:
-        raise ValueError(f"Unsloth: GRPO loss type {loss_type} has no forward gradient.")
     e = -float(entropy_coef) * m / m.sum().clamp(min = 1.0) / ga if entropy_coef else torch.zeros_like(m)
     return w, e
+
+
+fl.CALLS.setdefault("grpo_fwd_grad", 0)
 
 
 def _grpo_impl(hidden, weight, bias, targets, mask, adv, old, ref, isr, w_tok, e_tok, scaling, kind, eps_low, eps_high,
@@ -202,7 +230,7 @@ if "grpo_impl" not in _OPS:
         div: float, cap: float, compute_dtype: torch.dtype, need_h: bool, need_w: bool, need_b: bool, rows: int,
         fp32_head_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        fl.CALLS["grpo_fwd_grad"] = fl.CALLS.get("grpo_fwd_grad", 0) + 1
+        fl.CALLS["grpo_fwd_grad"] += 1
         return _OPS["grpo_impl"](hidden, weight, bias, targets, mask, adv, old, ref, isr, w_tok, e_tok, scaling, kind,
                                  eps_low, eps_high, delta, beta, sapo_pos, sapo_neg, bias_kl, temperature, mul, div,
                                  cap, compute_dtype, need_h, need_w, need_b, rows, fp32_head_grad)
@@ -295,7 +323,7 @@ def fused_linear_grpo_loss(
                                           logit_scale_multiply = logit_scale_multiply,
                                           logit_scale_divide = logit_scale_divide,
                                           logit_softcapping = logit_softcapping, return_entropy = True,
-                                          entropy_requires_grad = bool(e_tok.ne(0).any()),
+                                          entropy_requires_grad = bool(entropy_coef) or entropy_weights is not None,
                                           rows_per_chunk = rows_per_chunk)
         lp, en = lp.reshape(B, T).float(), en.reshape(B, T).float()
         ell, _ = _token_terms(lp, adv, old, ref, isr, kind, *args)

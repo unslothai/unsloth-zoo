@@ -212,3 +212,21 @@ def test_bf16_head_grad_accumulates_in_fp32():
         assert gw.dtype == torch.bfloat16
         errs[fp32] = ((gw.double() - gw_ref).norm() / gw_ref.norm()).item()
     assert errs[True] <= errs[False] and errs[True] < 1e-2
+
+
+@pytest.mark.parametrize("kind", ["grpo", "dapo", "cispo", "sapo"])
+def test_opcheck(kind, monkeypatch):
+    # Eager backward scales the saved gradients (op outputs) in place; opcheck compares outputs after backward.
+    monkeypatch.setattr(fl, "_KEEP_GRAPH", None)
+    h, W, bias, tgt, mask, adv, old, ref, isr = _case(5, 0.9, True)
+    w_tok, e_tok = fg.grpo_token_weights(mask, kind, num_items_in_batch = mask.sum(), max_completion_length = T,
+                                         entropy_coef = 0.01)
+    flat = lambda x: x.reshape(-1).contiguous()  # noqa: E731
+    W = W.requires_grad_(True)
+    b = fl._head_bias(bias.requires_grad_(True), W)
+    torch.library.opcheck(
+        getattr(torch.ops.unsloth_zoo, fg._OP).default,
+        (h.reshape(-1, H).requires_grad_(True), W, b, flat(tgt), flat(mask), flat(adv[:, None].expand(B, T)),
+         flat(old), flat(ref), flat(isr), flat(w_tok), flat(e_tok), torch.ones(()), fg._KIND[kind], 0.2, 0.28, 0.0,
+         0.04, 1.0, 1.05, False, 0.9, 0.0, 0.0, 0.0, torch.float32, True, True, True, 8, True),
+    )
