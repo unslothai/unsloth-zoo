@@ -35,6 +35,7 @@ import fcntl
 import functools
 import json
 import logging
+import math
 import os
 import platform
 import queue
@@ -601,7 +602,7 @@ class _Split:
         self.rest = (_remainder(gate, rows = k), _remainder(up, rows = k), _remainder(down, columns = k))
         mx.eval([p.parameters() for p in self.rest])
         self.sources = tuple((p, p.weight, p.scales, p.biases) for p in (gate, up, down))
-        self.failed = False
+        self.failed, self.pad_from = False, tile
 
     def serves(self, mlp):
         """Whether `mlp` still has the projections and quantized tensors this split was built from."""
@@ -650,16 +651,21 @@ def _split_call(base):
             split.close()
             split = None
         rows = x.size // x.shape[-1]
-        if split is None or split.failed or _ABANDONED or self.training or rows < split.tile:
+        if split is None or split.failed or _ABANDONED or self.training or rows < split.pad_from:
             return base.__call__(self, x)
         flat, tiles = x.reshape(rows, x.shape[-1]), rows // split.tile
+        tail = rows - tiles * split.tile
+        padded = tail >= split.pad_from
         try:
             parts = [split(flat[i * split.tile:(i + 1) * split.tile]) for i in range(tiles)]
+            if padded:   # the MLP is token-local, so zero rows cannot change the tail's own
+                rest = mx.concatenate([flat[tiles * split.tile:], mx.zeros((split.tile - tail, x.shape[-1]), x.dtype)])
+                parts.append(split(rest)[:tail])
         except (AneError, concurrent.futures.TimeoutError) as error:
             split.failed = True
             logger.warning("Neural Engine prefill split failed (%s); this layer uses the GPU from now on", error)
             return base.__call__(self, x)
-        if tiles * split.tile < rows:
+        if tail and not padded:
             parts.append(base.__call__(self, flat[tiles * split.tile:][None]).reshape(-1, x.shape[-1]))
         return mx.concatenate(parts).reshape(x.shape)
     return call
@@ -788,12 +794,15 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
         if not share:
             return AnePrefillStatus(0, 0.0, gpu, split_ms, time.perf_counter() - started,
                                     f"the split ({split_ms:.1f} ms) is not 5% faster than the GPU ({gpu:.1f} ms)")
+        # A partial tile padded to a full one costs the split's time, so it pays once the GPU would take longer.
+        pad_from = min(tile, math.ceil(tile * split_ms / gpu)) if gpu else tile
         attached = []
         try:
             for mlp in mlps:
                 k = _aligned(_projections(mlp)[0].weight.shape[0], share)
                 split = first if first is not None and mlp is mlps[0] and first.k == k else None
-                mlp.__dict__[_STATE] = split or _Split(mlp, k, tile, surfaces)
+                mlp.__dict__[_STATE] = split = split or _Split(mlp, k, tile, surfaces)
+                split.pad_from = pad_from
                 attached.append(mlp)
         except AneError as error:
             logger.warning("Neural Engine prefill stopped after %d of %d layers: %s", len(attached), len(mlps), error)
@@ -816,8 +825,8 @@ def release_ane_prefill(model):
 def ane_prefill_mlp(model, *, _modules = None):
     """Route prefill tiles of the MLPs `prepare_ane_prefill` attached through their Neural Engine split.
 
-    Prepares the model on first entry. Calls of fewer rows than one tile, training and a split that failed keep
-    the native module.
+    Prepares the model on first entry. A partial tile is padded to a full one when calibration measured that as
+    faster; shorter partial tiles, training and a split that failed keep the native module.
     """
     changed = []
     try:

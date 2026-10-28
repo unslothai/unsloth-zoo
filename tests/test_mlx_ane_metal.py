@@ -105,6 +105,19 @@ def test_split_tiles_match_the_native_mlp_and_the_rest_stays_native(prepared):
     assert mx.array_equal(decode, mlp(x[:, :3])).item()
 
 
+def test_a_partial_tile_worth_padding_takes_the_split(prepared):
+    mlp = prepared.layers[1]
+    mlp.__dict__[ane._STATE].pad_from = TILE // 2
+    x, alone, short = _rows(TILE + TILE // 2 + 3), _rows(TILE // 2, seed = 2), _rows(TILE + TILE // 2 - 1, seed = 3)
+    with ane.ane_prefill_mlp(prepared):
+        split, split_alone, split_short = mlp(x), mlp(alone), mlp(short)
+    for got, native in ((split[:, TILE:], mlp(x[:, TILE:])), (split_alone, mlp(alone))):
+        assert got.shape == native.shape and _cosine(got, native) > 0.999
+        assert (mx.abs(got - native).max() / mx.abs(native).max()).item() < 0.05
+        assert not mx.array_equal(got, native).item()
+    assert mx.array_equal(split_short[:, TILE:], mlp(short[:, TILE:])).item()   # a tail below the threshold
+
+
 def test_each_split_reads_its_own_layer(prepared):
     x = _rows(TILE)
     natives = [layer(x) for layer in prepared.layers]
@@ -244,6 +257,8 @@ def test_calibration_takes_the_balanced_share_only_with_a_gain_and_caches_it(spl
     monkeypatch.setattr(ane, "_median_ms", None)   # a cached decision measures nothing
     model = _model(seed = 3)
     assert ane.prepare_ane_prefill(model, tile = TILE).layers == (2 if share else 0)
+    if share:   # a tile split in 6 of the GPU's 10 ms: padding pays from ceil(64 * 0.6) rows
+        assert [layer.__dict__[ane._STATE].pad_from for layer in model.layers] == [39, 39]
     ane.release_ane_prefill(model)
 
 
