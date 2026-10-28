@@ -229,6 +229,12 @@ class FastCPUModel:
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
             _print(f"{model_name} is pre-quantized; loading {base} for 16-bit training.")
             model_name = base
+        # Studio's progress / stall-watchdog callback, never a model kwarg; adapter before base, as on GPU.
+        on_model_resolved = kwargs.pop("on_model_resolved", None)
+        if on_model_resolved is not None:
+            if adapter_name is not None and adapter_name != model_name:
+                on_model_resolved(adapter_name)
+            on_model_resolved(model_name)
 
         quantization_config = None
         if use_4bit and not _PREQUANTIZED_SUFFIX.search(model_name):
