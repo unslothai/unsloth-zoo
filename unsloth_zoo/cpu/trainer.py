@@ -195,6 +195,27 @@ _LEGACY_SFT_KWARGS = {
 }
 
 
+def _patch_max_seq_length_alias(config_cls):
+    """TRL >= 0.20 dropped SFTConfig(max_seq_length), which notebooks and Studio pass: map it to max_length."""
+    fields = getattr(config_cls, "__dataclass_fields__", {})
+    if "max_seq_length" in fields or "max_length" not in fields:
+        return
+    original = config_cls.__init__
+    if getattr(original, "_unsloth_cpu", False):
+        return
+
+    @functools.wraps(original)
+    def __init__(self, *args, **kwargs):
+        if "max_seq_length" in kwargs:
+            max_seq_length = kwargs.pop("max_seq_length")
+            if max_seq_length is not None:
+                kwargs["max_length"] = max_seq_length
+        return original(self, *args, **kwargs)
+
+    __init__._unsloth_cpu = True
+    config_cls.__init__ = __init__
+
+
 def _make_cpu_sft_trainer(base):
     if getattr(base, "_unsloth_cpu", False):
         return base
@@ -228,8 +249,19 @@ def _make_cpu_sft_trainer(base):
                 normalize_cpu_training_arguments(training_args)
             super().__init__(*args, **kwargs)
 
-    SFTTrainer.__module__ = base.__module__
+    # Pickled by reference: by value (TRL's tokenize map, dataset_num_proc > 1) fails on torch config modules.
+    SFTTrainer.__module__ = __name__
+    SFTTrainer.__qualname__ = "_CPUSFTTrainer"
     return SFTTrainer
+
+
+def __getattr__(name):
+    # Spawn workers unpickling the CPU class get it, not stock TRL's SFTTrainer.
+    if name == "_CPUSFTTrainer":
+        install_cpu_training_defaults()
+        if name in globals():
+            return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def install_cpu_training_defaults():
@@ -248,10 +280,13 @@ def install_cpu_training_defaults():
         cls = getattr(trl, name, None)
         if cls is not None and "__post_init__" in vars(cls):
             _patch_post_init(cls)
+    if getattr(trl, "SFTConfig", None) is not None:
+        _patch_max_seq_length_alias(trl.SFTConfig)
     _patch_sft_compute_loss(sft_trainer.SFTTrainer)
     from .ops import patch_trl_fused_lm_head
     patch_trl_fused_lm_head()
     trainer = _make_cpu_sft_trainer(sft_trainer.SFTTrainer)
+    globals()["_CPUSFTTrainer"] = trainer
     for module in (sft_trainer, trl, sys.modules.get("trl.trainer")):
         if module is not None:
             setattr(module, "SFTTrainer", trainer)

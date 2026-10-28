@@ -3807,7 +3807,6 @@ def patch_GptOssModel():
     from unsloth_zoo.flex_attention import (
         is_flex_attention_decoding,
         flex_attention_with_sink_decoding,
-        flex_attention_add_sinks,
     )
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
@@ -3815,43 +3814,6 @@ def patch_GptOssModel():
         from transformers.integrations.mxfp4 import mlp_forward
     except:
         mlp_forward = None
-
-    def pre_attention_decoding(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: KWARGS_TYPE,
-    ):
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        if past_key_values is not None:
-            cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        return query_states, key_states, value_states, input_shape
-    pass
-
-    # Do flex_attention_with_sink_decoding with cannot be compiled
-    # attn_output, logsumexp = flex_attention_with_sink_decoding(
-    #     self,
-    #     query_states,
-    #     key_states,
-    #     value_states,
-    # )
-    def post_attention_decoding(self_attn, attn_output, logsumexp, input_shape):
-        attn_output = flex_attention_add_sinks(self_attn, attn_output, logsumexp)
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self_attn.o_proj(attn_output)
-        return attn_output
-
-    pass
 
     # RMSNorm forward
     def rms_layernorm_forward(self, hidden_states):

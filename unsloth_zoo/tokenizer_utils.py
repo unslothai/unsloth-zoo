@@ -33,6 +33,7 @@ import datasets
 import re
 
 from .log import logger
+from ._gc_passes import collect_garbage
 
 __all__ = [
     "mean_of_trained_tokens",
@@ -224,6 +225,8 @@ def add_new_tokens(
         )
         new_tokens = [x for x in new_tokens if x not in overlapping_tokens]
     pass
+    # add_tokens dedupes; a repeat here would shift every later interpolation row.
+    new_tokens = list(dict.fromkeys(new_tokens))
 
     # Get mean of trained tokens
     # mean_embedding, mean_lm_head = fix_untrained_tokens(model)
@@ -368,9 +371,7 @@ def add_new_tokens(
     if is_tied: model.tie_weights()
 
     # Clear deleted GPU items
-    for _ in range(3):
-        gc.collect()
-        torch.cuda.empty_cache()
+    collect_garbage(after = torch.cuda.empty_cache)
     return
 pass
 
@@ -789,9 +790,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     lm_head_matrix  [where_untrained] = mean_lm_head  .to(lm_head_matrix  .dtype)
 
     # Clean up
-    for _ in range(3):
-        gc.collect()
-        torch.cuda.empty_cache()
+    collect_garbage(after = torch.cuda.empty_cache)
     pass
     return
 pass

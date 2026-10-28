@@ -470,10 +470,16 @@ _INIT_ONLY_CALLERS = frozenset(("__init__", "__post_init__", "_init_weights", "p
 def function_only_called_at_init(module_source: str, name: str) -> bool:
     """True if ``name`` is only reached from ``__init__``-time methods (directly or via such
     helpers): these build buffers on meta, so compiling them fails at load. False if unparseable."""
+    return _only_called_at_init(_init_only_callers_of(module_source), name)
+pass
+
+
+def _init_only_callers_of(module_source):
+    """Called name -> set of owners, built once per source; None if unparseable."""
     try:
         tree = ast.parse(textwrap.dedent(module_source))
     except Exception:
-        return False
+        return None
     callers_of = {}
     # owner = (name, is_method); nested defs keep their enclosing owner.
     def visit(node, owner):
@@ -491,7 +497,14 @@ def function_only_called_at_init(module_source: str, name: str) -> bool:
                     callers_of.setdefault(called, set()).add(owner)
             visit(child, owner)
     visit(tree, None)
-    seen = set()
+    return callers_of
+pass
+
+
+def _only_called_at_init(callers_of, name):
+    if callers_of is None:
+        return False
+    seen = set()  # fresh per query: transitive and cyclic answers depend on it
     def init_only(fn):
         if fn in seen:
             return True
@@ -2160,6 +2173,26 @@ pass
 
 
 _RELATIVE_IMPORT = re.compile(r"^(\s*)from (\.+)([A-Za-z_][\w.]*)? import ", flags = re.MULTILINE)
+_TOP_LEVEL_DEF = re.compile(r"^def (\w+)\(", flags = re.MULTILINE)
+
+
+def _items_to_import(functions, new_source, name):
+    """Names in `functions` used by `new_source`, minus `name` and its own top level defs."""
+    defined = None
+    items = []
+    for x in functions:
+        if x not in new_source or x == name:
+            continue
+        # Only ASCII identifiers are exactly what `\w+` captures.
+        if x.isascii() and x.isidentifier():
+            if defined is None:
+                defined = set(_TOP_LEVEL_DEF.findall(new_source))
+            if x in defined:
+                continue
+        elif re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE):
+            continue
+        items.append(x)
+    return items
 
 
 def _absolute_relative_imports(source, model_location):
@@ -2226,15 +2259,7 @@ def create_new_function(
     pass
 
     # Import items to make the function executable; a same-named method is not a local def
-    items = [
-        x
-        for x in functions
-        if (
-            (x in new_source)
-            and (x != name)
-            and not re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE)
-        )
-    ]
+    items = _items_to_import(functions, new_source, name)
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
@@ -5117,6 +5142,35 @@ def _patch_lora_base_layer_input_cast(source):
     )
 
 
+def _patch_lora_update(source):
+    # All Unsloth Zoo code licensed under LGPLv3
+    old1 = "output = lora_B(lora_A(dropout(x))) * scaling"
+    old2 = "result = result + lora_B(lora_A(dropout(x))) * scaling"
+    add = "result = result + output"
+
+    if (old1 not in source and add not in source) and (old2 not in source):
+        return source
+    # Same statement as PEFT's, so PEFT's own dtype restore (after or inside the adapter loop) still runs.
+    source = source.replace(old2, "result = lora_forward(result, lora_A, lora_B, dropout, x, scaling)")
+    if old1 not in source:
+        return source
+    # bnb Linear4bit/8bitLt never set torch_result_dtype; their result stays in the base-layer dtype.
+    if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
+        dtype_cast = "torch_result_dtype"
+    else:
+        dtype_cast = "result.dtype"
+    update = f"lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
+    # `continue` skips `result = result + output`; a `return` here would drop every later active adapter.
+    looped = source.replace(old1, f"result = {update}; continue")
+    try:
+        compile(looped, "<peft lora forward>", "exec")
+    except SyntaxError:
+        # Update outside the adapter loop.
+        return source.replace(old1, f"return {update}")
+    return looped
+pass
+
+
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
@@ -5140,25 +5194,7 @@ def patch_lora_forwards(torch_compile_options):
         source = source.replace("result = result.clone()", "")
 
         # Use addmm
-        old1 = "output = lora_B(lora_A(dropout(x))) * scaling"
-        old2 = "result = result + lora_B(lora_A(dropout(x))) * scaling"
-        add = "result = result + output"
-
-        if (old1 not in source and add not in source) and (old2 not in source):
-            pass
-        else:
-            # Linear/GPTQ/LoraParallel reassign result to float32 before the
-            # loop, so they save the original dtype in torch_result_dtype.
-            # Linear4bit/Linear8bitLt only cast x, leaving result untouched,
-            # so result.dtype is still the base-layer dtype at return time.
-            if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
-                dtype_cast = "torch_result_dtype"
-            else:
-                dtype_cast = "result.dtype"
-            replace = f"return lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
-            source = source.replace(old1, replace)
-            source = source.replace(old2, replace)
-        pass
+        source = _patch_lora_update(source)
 
         # Update function name
         source = source.replace(
@@ -6568,15 +6604,20 @@ def unsloth_compile_transformers(
     # Get functions which are called
     called_functions = []
     for function in functions:
+        # `called` needs `<function>(` and both must match; one match of each is enough.
+        if function + "(" not in full_source:
+            continue
         # Start of text
-        defined = re.findall(
+        defined = re.search(
             r"\bdef[\s]{1,}" + re.escape(function), full_source, flags=re.DOTALL
         )
+        if defined is None:
+            continue
         # Disable self.
-        called = re.findall(
+        called = re.search(
             r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags=re.DOTALL
         )
-        if len(defined) != 0 and len(called) != 0:
+        if called is not None:
             if function_defined_elsewhere(modeling_file, function):
                 continue
             called_functions.append(function)
@@ -6912,7 +6953,9 @@ def unsloth_compile_transformers(
     pass
     # Import allow-list for the generated cache, not a compile list: the emitted
     # classes still reference uncompiled modules and NameError without them.
-    functions += list(bad_torch_modules)
+    # Definition order, not set order: set order follows PYTHONHASHSEED and the
+    # cache file would be rewritten by every new process.
+    functions += [module for module in torch_modules if module in bad_torch_modules]
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
@@ -7417,6 +7460,7 @@ def unsloth_compile_transformers(
             all_standalone_classes[module] = parameters
         pass
 
+        init_only_callers = None  # lazy 1-tuple: the graph itself is None when unparseable
         for module in called_functions:
             if module in all_standalone_classes:
                 continue
@@ -7486,9 +7530,12 @@ def unsloth_compile_transformers(
                 if not function_has_tensor_inputs(source):
                     bad = True
                     bad_reason = "it takes no tensor inputs"
-                elif function_only_called_at_init(full_source, module):
-                    bad = True
-                    bad_reason = "it is only called while constructing modules"
+                else:
+                    if init_only_callers is None:
+                        init_only_callers = (_init_only_callers_of(full_source),)
+                    if _only_called_at_init(init_only_callers[0], module):
+                        bad = True
+                        bad_reason = "it is only called while constructing modules"
             pass
             if not bad:
                 # Functions defined inside an if/else come back indented
