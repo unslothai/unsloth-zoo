@@ -1319,6 +1319,7 @@ def test_on_model_resolved_is_reported_and_not_passed_to_the_model(monkeypatch, 
     import transformers
     from unsloth_zoo.cpu import loader
     seen, reported = {}, []
+    monkeypatch.delenv("HF_TOKEN", raising = False)  # `seen` holds the token; keep a real one out of failure output
     monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
 
     def fake_load(model_name, **k):
@@ -1329,6 +1330,21 @@ def test_on_model_resolved_is_reported_and_not_passed_to_the_model(monkeypatch, 
     loader.FastCPUModel.from_pretrained(name, load_in_4bit = False, on_model_resolved = reported.append)
     assert "on_model_resolved" not in seen
     assert reported == [resolved] == [seen["name"]]
+
+
+def test_on_model_resolved_reports_an_adapter_then_its_base(monkeypatch):
+    """As the GPU loader: the requested adapter repo first, then the base actually fetched."""
+    import transformers
+    from unsloth_zoo.cpu import loader
+    reported = []
+    monkeypatch.delenv("HF_TOKEN", raising = False)
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: ("org/base", None))
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", lambda *a, **k: _tiny_llama())
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    import peft
+    monkeypatch.setattr(peft.PeftModel, "from_pretrained", lambda model, *a, **k: model)
+    loader.FastCPUModel.from_pretrained("org/adapter", load_in_4bit = False, on_model_resolved = reported.append)
+    assert reported == ["org/adapter", "org/base"]
 
 
 def test_sft_config_takes_max_seq_length_as_max_length(monkeypatch, tmp_path):
@@ -1376,11 +1392,36 @@ def test_cpu_sft_trainer_pickles_by_reference(monkeypatch):
     from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
     base = sft_trainer.SFTTrainer
     base = base.__mro__[1] if getattr(base, "_unsloth_cpu", False) else base
+    from unsloth_zoo.cpu import trainer as cpu_trainer
     cls = _make_cpu_sft_trainer(base)
     monkeypatch.setattr(sft_trainer, "SFTTrainer", cls)
+    monkeypatch.setattr(cpu_trainer, "_CPUSFTTrainer", cls, raising = False)
     assert pickle.loads(pickle.dumps(cls)) is cls
     assert dill.loads(dill.dumps(cls)) is cls
     assert len(dill.dumps(cls)) < 200  # a reference, not the class and its globals by value
+
+
+def test_cpu_sft_trainer_unpickles_as_the_cpu_class_in_a_fresh_process(monkeypatch, tmp_path):
+    """A process that never installed the CPU defaults (spawn worker) must not get stock TRL's SFTTrainer."""
+    import pickle
+    import subprocess
+    import sys
+    from trl.trainer import sft_trainer
+    from unsloth_zoo.cpu import trainer as cpu_trainer
+    from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
+    base = sft_trainer.SFTTrainer
+    base = base.__mro__[1] if getattr(base, "_unsloth_cpu", False) else base
+    cls = _make_cpu_sft_trainer(base)
+    monkeypatch.setattr(sft_trainer, "SFTTrainer", cls)
+    monkeypatch.setattr(cpu_trainer, "_CPUSFTTrainer", cls, raising = False)
+    blob = tmp_path / "cls.pkl"
+    blob.write_bytes(pickle.dumps(cls))
+    script = "import pickle, sys; c = pickle.load(open(sys.argv[1], 'rb')); print('CPU', getattr(c, '_unsloth_cpu', False))"
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "")
+    env.pop("HF_TOKEN", None)
+    done = subprocess.run([sys.executable, "-c", script, str(blob)], capture_output = True, text = True,
+                          timeout = 300, env = env, cwd = str(tmp_path))
+    assert "CPU True" in done.stdout, (done.stdout[-2000:], done.stderr[-3000:])
 
 
 _CPU_SFT_SCRIPT = r'''

@@ -231,8 +231,11 @@ class FastCPUModel:
             model_name = base
         # As on GPU: a loader callback (Studio's progress / stall watchdog) told which repo is fetched, never
         # a from_pretrained kwarg (the model's __init__ rejects it).
+        # A Hub adapter is reported before its base, in the GPU loader's order.
         on_model_resolved = kwargs.pop("on_model_resolved", None)
         if on_model_resolved is not None:
+            if adapter_name is not None and adapter_name != model_name:
+                on_model_resolved(adapter_name)
             on_model_resolved(model_name)
 
         quantization_config = None

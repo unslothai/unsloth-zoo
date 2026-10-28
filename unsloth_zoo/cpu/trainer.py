@@ -251,12 +251,23 @@ def _make_cpu_sft_trainer(base):
                 normalize_cpu_training_arguments(training_args)
             super().__init__(*args, **kwargs)
 
-    # Importable as trl.trainer.sft_trainer.SFTTrainer (installed there below), so pickle / dill store the
-    # class by reference. TRL's tokenize map closes over the trainer; with dataset_num_proc > 1 dill would
-    # otherwise serialise this class and TRL's by value, globals included, and fail on torch's config modules.
-    SFTTrainer.__module__ = base.__module__
-    SFTTrainer.__qualname__ = base.__qualname__
+    # Importable as unsloth_zoo.cpu.trainer._CPUSFTTrainer (registered by install_cpu_training_defaults; the
+    # module __getattr__ below installs it in a fresh process), so pickle / dill store the class by reference.
+    # TRL's tokenize map closes over the trainer; with dataset_num_proc > 1 dill would otherwise serialise this
+    # class and TRL's by value, globals included, and fail on torch's config modules.
+    SFTTrainer.__module__ = __name__
+    SFTTrainer.__qualname__ = "_CPUSFTTrainer"
     return SFTTrainer
+
+
+def __getattr__(name):
+    # A process that unpickles the CPU trainer class without having installed the CPU defaults (spawn
+    # workers) gets the CPU class, not stock TRL's under the same name.
+    if name == "_CPUSFTTrainer":
+        install_cpu_training_defaults()
+        if name in globals():
+            return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def install_cpu_training_defaults():
@@ -281,6 +292,7 @@ def install_cpu_training_defaults():
     from .ops import patch_trl_fused_lm_head
     patch_trl_fused_lm_head()
     trainer = _make_cpu_sft_trainer(sft_trainer.SFTTrainer)
+    globals()["_CPUSFTTrainer"] = trainer
     for module in (sft_trainer, trl, sys.modules.get("trl.trainer")):
         if module is not None:
             setattr(module, "SFTTrainer", trainer)
