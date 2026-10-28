@@ -1190,6 +1190,11 @@ _CPU_SLOT_TOP = 0       # slots [0, _CPU_SLOT_TOP) have been handed out at least
 _CPU_SLOT_EPOCH = 0     # bumped by every pool reset; a lease from an older epoch is ignored
 # A slot released on one device's side stream and leased on another waits on the release event.
 _SLOT_FENCES = {}       # slot index -> (device index, event recorded at release)
+# A backward returns its slot, but a graph kept with retain_graph=True can be backpropagated
+# again and reads the same slot. Such a slot is set aside instead of being overwritten by the
+# next forward, and comes back once that graph is freed.
+_SLOT_HOLDERS = {}      # slot index -> weakref to the autograd ctx whose backward returned it
+_RETAINED_SLOTS = {}    # slot index -> weakref to a ctx whose graph is still retained
 
 
 def _reset_cpu_slots():
@@ -1198,6 +1203,28 @@ def _reset_cpu_slots():
     _CPU_SLOT_TOP = 0
     _CPU_SLOT_EPOCH += 1
     _SLOT_FENCES.clear()
+    _SLOT_HOLDERS.clear()
+    _RETAINED_SLOTS.clear()
+pass
+
+
+def _graph_retained(ctx_ref):
+    """True while the ctx's saved tensors are alive, i.e. its graph can still be backpropagated."""
+    ctx = ctx_ref()
+    if ctx is None: return False
+    try:
+        ctx._raw_saved_tensors
+    except (RuntimeError, AttributeError):
+        return False  # freed by a backward without retain_graph
+    return True
+pass
+
+
+def _reclaim_retained_slots():
+    for index, ctx_ref in list(_RETAINED_SLOTS.items()):
+        if not _graph_retained(ctx_ref):
+            del _RETAINED_SLOTS[index]
+            heapq.heappush(_FREE_CPU_SLOTS, index)
 pass
 
 
@@ -1207,9 +1234,17 @@ class _CpuSlotLease:
 
     def __init__(self, device = None, stream = None):
         global _CPU_SLOT_TOP
-        if _FREE_CPU_SLOTS:
-            self.index = heapq.heappop(_FREE_CPU_SLOTS)
-        else:
+        if _RETAINED_SLOTS: _reclaim_retained_slots()
+        self.index = None
+        while _FREE_CPU_SLOTS:
+            index = heapq.heappop(_FREE_CPU_SLOTS)
+            holder = _SLOT_HOLDERS.pop(index, None)
+            if holder is not None and _graph_retained(holder):
+                _RETAINED_SLOTS[index] = holder
+                continue
+            self.index = index
+            break
+        if self.index is None:
             self.index = _CPU_SLOT_TOP
             _CPU_SLOT_TOP += 1
         self.epoch = _CPU_SLOT_EPOCH
@@ -1218,11 +1253,16 @@ class _CpuSlotLease:
         if fence is not None and fence[0] != device and stream is not None:
             stream.wait_event(fence[1])
 
-    def release(self):
+    def release(self, ctx = None):
         index, self.index = self.index, None
         if index is not None and self.epoch == _CPU_SLOT_EPOCH:
             if self.stream is not None:
                 _SLOT_FENCES[index] = (self.device, self.stream.record_event())
+            if ctx is not None:
+                try:
+                    _SLOT_HOLDERS[index] = weakref.ref(ctx)
+                except TypeError:
+                    pass
             heapq.heappush(_FREE_CPU_SLOTS, index)
 
     def __del__(self):
@@ -1610,9 +1650,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 if in_chain:
                     _prefetch_offloaded_input(CPU_INDEX - 1, device_index, generation, buffer_slot)
             pass
-            # Reload is queued on EXTRA_STREAM, as is the next offload into it: safe to reuse now.
+            # Reload is queued on EXTRA_STREAM, as is the next offload into it: safe to reuse now,
+            # unless this graph is retained for another backward (checked when the slot is leased).
             lease = getattr(ctx, "_cpu_slot", None)
-            if lease is not None: lease.release()
+            if lease is not None: lease.release(ctx)
         else:
             # No GPU buffer seen
             if len(tensor_indices) != 0:
