@@ -1071,6 +1071,7 @@ def _merge_and_overwrite_lora(
     use_dequant_base = False,
     biases = None,
     vocab_modules = None,
+    fp8_header_cache = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -1100,6 +1101,7 @@ def _merge_and_overwrite_lora(
             model_class_name, tie_word_embeddings = tie_word_embeddings,
             weight_block_size = weight_block_size,
             biases = biases, vocab_modules = vocab_modules,
+            header_cache = fp8_header_cache,
         )
     pass
 
@@ -2982,11 +2984,12 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
     W_real = _fp8_dequant_blockwise(W, scale_inv, block_size = weight_block_size)
     return W_real, scale_keys
 
-def _build_cross_shard_fp8_index(save_directory, current_filename):
+def _build_cross_shard_fp8_index(save_directory, current_filename, header_cache = None):
     """{key: (filename, dtype)} for tensors in the OTHER *.safetensors shards (headers only,
     no tensor reads). HF shards a weight and its scale companion independently, so an FP8
     weight and its `*.weight_scale(_inv)` can land in different files; this lets the rewrite
-    find a scale elsewhere and drop a scale whose weight was dequantized elsewhere."""
+    find a scale elsewhere and drop a scale whose weight was dequantized elsewhere.
+    `header_cache` (one export's shard loop) reuses a header while (inode, size, mtime) holds."""
     index = {}
     try:
         siblings = [f for f in os.listdir(save_directory)
@@ -2994,15 +2997,30 @@ def _build_cross_shard_fp8_index(save_directory, current_filename):
     except OSError:
         return index
     for fn in siblings:
-        try:
-            with open(os.path.join(save_directory, fn), "rb") as fp:
-                length = int.from_bytes(fp.read(8), "little")
-                hdr = json.loads(fp.read(length))
-        except Exception:
-            continue
-        for k, meta in hdr.items():
-            if k != "__metadata__" and isinstance(meta, dict):
-                index.setdefault(k, (fn, meta.get("dtype")))
+        path = os.path.join(save_directory, fn)
+        stamp = entries = None
+        if header_cache is not None:
+            try:
+                st = os.stat(path)
+                stamp = (st.st_ino, st.st_size, st.st_mtime_ns)
+            except OSError:
+                stamp = None
+            cached = header_cache.get(fn)
+            if stamp is not None and cached is not None and cached[0] == stamp:
+                entries = cached[1]
+        if entries is None:
+            try:
+                with open(path, "rb") as fp:
+                    length = int.from_bytes(fp.read(8), "little")
+                    hdr = json.loads(fp.read(length))
+            except Exception:
+                continue
+            entries = [(k, meta.get("dtype")) for k, meta in hdr.items()
+                       if k != "__metadata__" and isinstance(meta, dict)]
+            if stamp is not None:
+                header_cache[fn] = (stamp, entries)
+        for k, dtype in entries:
+            index.setdefault(k, (fn, dtype))
     return index
 pass
 
@@ -3092,9 +3110,11 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames, prerewrit
     return removed
 pass
 
-def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None, vocab_modules = None):
+def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None, vocab_modules = None, header_cache = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
+    if header_cache is not None:
+        header_cache.pop(filename, None)  # pre-rewrites (compressed / float32) may have changed it
     filename_original = os.path.join(save_directory, filename)
     _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
@@ -3134,7 +3154,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             )
 
         # FP8 weight/scale pairs can be split across shards, so index the other shards once.
-        cross_shard = _build_cross_shard_fp8_index(save_directory, filename)
+        cross_shard = _build_cross_shard_fp8_index(save_directory, filename, header_cache)
 
         def _load_cross_shard_scale(scale_key):
             entry = cross_shard.get(scale_key)
@@ -3252,6 +3272,8 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
     with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
         temp_filename_safetensors = tmpfile.name
     save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})
+    if header_cache is not None:
+        header_cache.pop(filename, None)
     try:
         os.replace(temp_filename_safetensors, filename_original)
     except OSError as e:
@@ -5850,11 +5872,13 @@ def merge_and_overwrite_lora(
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("FP8 MoE-expert LoRA detected: dequantizing to 16bit, then merging experts.")
         _prerewrite_fp8_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list)
+        _prerewrite_header_cache = {}
         for _fn in final_safetensors_list:
             _merge_and_overwrite_lora_fp8(
                 save_directory, _fn, defaultdict(lambda: None), output_dtype, _merge_model_class_name,
                 tie_word_embeddings = _merge_tie_word_embeddings,
                 weight_block_size = _merge_weight_block_size,
+                header_cache = _prerewrite_header_cache,
             )
         _drop_resolved_fp8_scales_after_rewrite(save_directory, final_safetensors_list, _prerewrite_fp8_keys)
         # Model is now 16bit on disk; merge expert LoRA via the standard (non-quantized) path.
@@ -5916,6 +5940,7 @@ def merge_and_overwrite_lora(
         _merge_base_model, lora_weights, _merge_tie_word_embeddings,
     ) if save_method == "merged_16bit" else {}
     _widened_total_size = 0
+    _fp8_header_cache = {}
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         if _mxfp4_rewrite is not None:
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
@@ -5939,6 +5964,7 @@ def merge_and_overwrite_lora(
             use_dequant_base = _use_dequant_base,
             biases = biases,
             vocab_modules = _vocab_modules,
+            fp8_header_cache = _fp8_header_cache,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
@@ -6788,6 +6814,41 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefix
     return False
 pass
 
+def _build_reversed_key_index(safetensor_keys):
+    """Sorted (reversed key, position) pairs + keys; None unless plain str keys in a list/tuple/set/frozenset (caller keeps the linear scan)."""
+    if type(safetensor_keys) not in (list, tuple, set, frozenset):
+        return None
+    keys = safetensor_keys if type(safetensor_keys) in (list, tuple) else list(safetensor_keys)
+    index = []
+    for position, key in enumerate(keys):
+        if type(key) is not str:
+            return None
+        index.append((key[::-1], position))
+    index.sort()
+    return index, keys
+pass
+
+def _indexed_prefix_candidates(index, keys, k):
+    """Same list, in the same order, as the linear scan in `_infer_prefix_and_remap`."""
+    import bisect
+    candidates = []
+    for suffix in (k + ".weight", k + ".linear.weight"):
+        reversed_suffix = suffix[::-1]
+        start = end = bisect.bisect_left(index, (reversed_suffix,))
+        while end < len(index) and index[end][0].startswith(reversed_suffix):
+            end += 1
+        for position in sorted(position for _, position in index[start:end]):
+            prefix = keys[position][: -len(suffix)]
+            if prefix:
+                candidates.append(prefix)
+    return list(dict.fromkeys(candidates))
+pass
+
+def _component_signature(parts):
+    """A vote needs equal prefix multisets over a shared suffix, so equal full multisets: pairs with different signatures never vote."""
+    return tuple(sorted(p for p in parts if p))
+pass
+
 def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     """Infer missing key prefixes by matching LoRA keys against safetensor keys.
 
@@ -6808,6 +6869,7 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     changed = False
     inferred_prefixes = []  # track prefixes from successful per-key matches
     unmatched_keys = []     # keys that couldn't be matched at all
+    suffix_index, suffix_index_built = None, False
 
     for k, v in lora_weights.items():
         if not isinstance(k, str):
@@ -6819,12 +6881,17 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             continue
         # unique prefix candidates; also accept a .linear.weight shard (Gemma4) so a
         # prefix-add onto it is not dropped.
-        candidates = list(dict.fromkeys(
-            sf_key[: -len(suffix)]
-            for suffix in (k + ".weight", k + ".linear.weight")
-            for sf_key in safetensor_keys
-            if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
-        ))
+        if not suffix_index_built:
+            suffix_index, suffix_index_built = _build_reversed_key_index(safetensor_keys), True
+        if suffix_index is not None and type(k) is str:
+            candidates = _indexed_prefix_candidates(*suffix_index, k)
+        else:
+            candidates = list(dict.fromkeys(
+                sf_key[: -len(suffix)]
+                for suffix in (k + ".weight", k + ".linear.weight")
+                for sf_key in safetensor_keys
+                if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
+            ))
         if len(candidates) == 1:
             remapped[candidates[0] + k] = v
             inferred_prefixes.append(candidates[0])
@@ -6848,15 +6915,17 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             if module_key is None:
                 continue
             sf_parts = module_key.split(".")
+            signature = _component_signature(sf_parts)
             for sl in range(1, min(3, len(sf_parts)) + 1):
-                sf_parts_by_suffix[(sl, tuple(sf_parts[-sl:]))].append(sf_parts)
+                sf_parts_by_suffix[(signature, sl, tuple(sf_parts[-sl:]))].append(sf_parts)
         for k, _ in unmatched_keys:
             if not isinstance(k, str):
                 continue
             k_parts = k.split(".")
+            signature = _component_signature(k_parts)
             seen_sf = set()
             for sl in range(min(3, len(k_parts)), 0, -1):
-                for sf_parts in sf_parts_by_suffix.get((sl, tuple(k_parts[-sl:])), ()):
+                for sf_parts in sf_parts_by_suffix.get((signature, sl, tuple(k_parts[-sl:])), ()):
                     sf_id = tuple(sf_parts)
                     if sf_id in seen_sf:        # process each sf once, at its longest match
                         continue

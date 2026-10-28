@@ -31,6 +31,7 @@ __all__ = [
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
 from .device_type import DEVICE_TYPE
+from ._gc_passes import collect_garbage
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
@@ -180,6 +181,24 @@ def patch_dynamo_cleanup_hook_shutdown():
 pass
 
 
+def _drop_inductor_cache_dir_in_compile_location():
+    """Unset TORCHINDUCTOR_CACHE_DIR only when empty or the compiled cache folder; keep user / Studio dirs."""
+    value = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if not value:
+        # torch resolves "" to the CWD or fails os.makedirs("").
+        os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+        return
+    candidates = (UNSLOTH_COMPILE_LOCATION, os.environ.get("UNSLOTH_COMPILE_LOCATION"))
+    try:
+        current = os.path.normcase(os.path.realpath(value))
+        compile_folders = {os.path.normcase(os.path.realpath(x)) for x in candidates if x}
+    except Exception:
+        return
+    if current in compile_folders:
+        os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+pass
+
+
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(debug) is bool)
@@ -232,10 +251,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # https://dev-discuss.pytorch.org/t/impact-of-multithreading-and-local-caching-on-torch-compile/2498/3
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
     os.environ["TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE"] = "1"
-    os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
-
-    # Duplicate functions will cause hashing issues
-    # os.environ["TORCHINDUCTOR_CACHE_DIR"] = UNSLOTH_COMPILE_LOCATION
+    # Duplicate functions break hashing if Inductor's cache shares the compiled cache folder.
+    _drop_inductor_cache_dir_in_compile_location()
 
     # https://github.com/sayakpaul/diffusers-torchao?tab=readme-ov-file#things-to-keep-in-mind-when-benchmarking
     os.environ["ENABLE_AOT_AUTOGRAD_CACHE"] = "1"
@@ -845,10 +862,7 @@ def patch_model_and_tokenizer(
     pass
 
     # Clear deleted GPU items
-    for _ in range(3):
-        gc.collect()
-        if DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
-        else: torch.cuda.empty_cache()
+    collect_garbage(after = torch.xpu.empty_cache if DEVICE_TYPE == "xpu" else torch.cuda.empty_cache)
     return model, tokenizer
 pass
 
