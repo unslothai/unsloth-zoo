@@ -192,3 +192,23 @@ def test_rejects_unknown_loss_type():
     h, W, bias, tgt, mask, adv, old, ref, isr = _case(4, 1.0, False)
     with pytest.raises(ValueError):
         fg.fused_linear_grpo_loss(h, W, tgt, mask = mask, advantages = adv, old_logps = old, loss_type = "vespo")
+
+
+def test_bf16_head_grad_accumulates_in_fp32():
+    cfg = CFGS[1]
+    h, W, bias, tgt, mask, adv, old, ref, isr = _case(5, 1.0, False)
+    Wr = W.bfloat16().double().requires_grad_()
+    ref_loss = _trl_loss(h.bfloat16().double(), Wr, None, tgt, mask, adv, old, ref, isr, cfg, 1.0)
+    (gw_ref,) = torch.autograd.grad(ref_loss, [Wr])
+    errs = {}
+    for fp32 in (True, False):
+        WW = W.bfloat16().requires_grad_()
+        loss = fg.fused_linear_grpo_loss(
+            h.bfloat16(), WW, tgt, mask = mask, advantages = adv, old_logps = old, ref_logps = ref, beta = cfg["beta"],
+            epsilon_high = cfg["eps_high"], entropy_coef = cfg["ent"], gradient_accumulation_steps = 2,
+            rows_per_chunk = 2, fp32_head_grad = fp32,
+        )[0]
+        (gw,) = torch.autograd.grad(loss, [WW])
+        assert gw.dtype == torch.bfloat16
+        errs[fp32] = ((gw.double() - gw_ref).norm() / gw_ref.norm()).item()
+    assert errs[True] <= errs[False] and errs[True] < 1e-2

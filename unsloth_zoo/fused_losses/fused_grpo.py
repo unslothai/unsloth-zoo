@@ -38,6 +38,9 @@ from . import fused_linear as fl
 __all__ = ["fused_linear_grpo_loss", "grpo_token_weights", "GRPO_FWD_GRAD"]
 
 GRPO_FWD_GRAD = os.environ.get("UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD", "1") != "0"
+# A trainable half lm_head gradient accumulates across row chunks in float32 (one float32 copy of the head while the
+# loss runs), matching the per-tile float32 accumulation of the fused_linear_logprobs backward. "0" trades it for memory.
+GRPO_FP32_HEAD_GRAD = os.environ.get("UNSLOTH_FUSED_LINEAR_GRPO_FP32_HEAD_GRAD", "1") != "0"
 _OP = "fused_linear_grpo_v1"
 # 0: clipped surrogate (grpo, bnpo, dr_grpo, dapo, luspo), 1: cispo, 2: sapo.
 _KIND = {"grpo": 0, "bnpo": 0, "dr_grpo": 0, "dapo": 0, "luspo": 0, "cispo": 1, "sapo": 2}
@@ -107,7 +110,7 @@ def grpo_token_weights(mask, loss_type, *, num_items_in_batch = None, max_comple
 
 def _grpo_impl(hidden, weight, bias, targets, mask, adv, old, ref, isr, w_tok, e_tok, scaling, kind, eps_low, eps_high,
                delta, beta, sapo_pos, sapo_neg, bias_kl, temperature, mul, div, cap, compute_dtype, need_h, need_w,
-               need_b, rows):
+               need_b, rows, fp32_head_grad):
     device = weight.device
     N, H = hidden.shape
     V = weight.shape[0]
@@ -118,7 +121,10 @@ def _grpo_impl(hidden, weight, bias, targets, mask, adv, old, ref, isr, w_tok, e
     logps = torch.zeros(N, **f32)
     ent = torch.zeros(N, **f32)
     grad_h = torch.zeros((N, H), device = device, dtype = hidden.dtype) if need_h else hidden.new_empty(0)
-    acc_w = torch.zeros(weight.shape, device = device, dtype = weight.dtype) if need_w else None
+    acc_w = None
+    if need_w:
+        acc_w = torch.zeros(weight.shape, device = device,
+                            dtype = torch.float32 if fp32_head_grad and weight.dtype in fl._HALF else weight.dtype)
     acc_b = torch.zeros(V, **f32) if need_b else None
     loss = torch.zeros((), device = device, dtype = acc)
     inv_t, scale, cap = fl._scalars(temperature, mul, div, cap)
@@ -171,7 +177,7 @@ def _grpo_impl(hidden, weight, bias, targets, mask, adv, old, ref, isr, w_tok, e
                     fl._dz_t_h(acc_w, dz, h)
                 if need_b:
                     acc_b += dz.sum(0, dtype = torch.float32)
-    grad_w = acc_w if need_w else hidden.new_empty(0)
+    grad_w = acc_w.to(weight.dtype) if need_w else hidden.new_empty(0)
     grad_b = acc_b.to(bias.dtype) if need_b else hidden.new_empty(0)
     return loss.float(), logps, ent, grad_h, grad_w, grad_b
 
@@ -187,16 +193,17 @@ if "grpo_impl" not in _OPS:
         w_tok: torch.Tensor, e_tok: torch.Tensor, scaling: torch.Tensor, kind: int, eps_low: float, eps_high: float,
         delta: float, beta: float, sapo_pos: float, sapo_neg: float, bias_kl: bool, temperature: float, mul: float,
         div: float, cap: float, compute_dtype: torch.dtype, need_h: bool, need_w: bool, need_b: bool, rows: int,
+        fp32_head_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         fl.CALLS["grpo_fwd_grad"] = fl.CALLS.get("grpo_fwd_grad", 0) + 1
         return _OPS["grpo_impl"](hidden, weight, bias, targets, mask, adv, old, ref, isr, w_tok, e_tok, scaling, kind,
                                  eps_low, eps_high, delta, beta, sapo_pos, sapo_neg, bias_kl, temperature, mul, div,
-                                 cap, compute_dtype, need_h, need_w, need_b, rows)
+                                 cap, compute_dtype, need_h, need_w, need_b, rows, fp32_head_grad)
 
     @_grpo_op.register_fake
     def _grpo_fake(hidden, weight, bias, targets, mask, adv, old, ref, isr, w_tok, e_tok, scaling, kind, eps_low,
                    eps_high, delta, beta, sapo_pos, sapo_neg, bias_kl, temperature, mul, div, cap, compute_dtype,
-                   need_h, need_w, need_b, rows):
+                   need_h, need_w, need_b, rows, fp32_head_grad):
         N = hidden.shape[0]
         f32 = dict(device = weight.device, dtype = torch.float32)
         return (
@@ -215,14 +222,14 @@ if "grpo_impl" not in _OPS:
 
     def _grpo_backward(ctx, grad_loss, *_):
         if grad_loss is None:
-            return (None,) * 29
+            return (None,) * 30
         grad_h, grad_w, grad_b, scaling = ctx.saved_tensors
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
         s = grad_loss.to(acc) / scaling.to(acc)
         need_h, need_w, need_b = ctx.need
         scale = fl._stored_grad_scaler(s, (grad_h, grad_w, grad_b))
         return (scale(grad_h) if need_h else None, scale(grad_w) if need_w else None,
-                scale(grad_b) if need_b else None) + (None,) * 26
+                scale(grad_b) if need_b else None) + (None,) * 27
 
     _grpo_op.register_autograd(_grpo_backward, setup_context = _grpo_setup)
 _OPS["grpo_impl"] = fl._guarded(_grpo_impl)
@@ -244,6 +251,7 @@ def fused_linear_grpo_loss(
     logit_scale_multiply = 0.0, logit_scale_divide = 0.0, logit_softcapping = 0.0,
     scaling = None,
     rows_per_chunk = None,
+    fp32_head_grad = None,
 ):
     """TRL GRPOTrainer._compute_loss (token-level importance sampling) on hidden [B, T, H] -> (loss, logps, entropy).
 
@@ -296,5 +304,6 @@ def fused_linear_grpo_loss(
         flat(w_tok), flat(e_tok), scaling, kind, *args, float(temperature), float(logit_scale_multiply or 0.0),
         float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0), fl._compute_dtype(hidden, weight),
         need_h, need_w, need_b, int(rows_per_chunk or 0),
+        GRPO_FP32_HEAD_GRAD if fp32_head_grad is None else bool(fp32_head_grad),
     )
     return loss, lp.reshape(B, T), en.reshape(B, T)
