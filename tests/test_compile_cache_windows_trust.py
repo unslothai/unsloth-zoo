@@ -393,3 +393,62 @@ def test_windows_save_then_load_round_trip(monkeypatch, tmp_path):
     loaded.clear()
     assert module.megacache_load("windows-model") is False
     assert loaded == []
+
+
+_FRESH_PROCESS_LOAD = r'''
+import importlib.util, json, sys, types
+path, key = sys.argv[1], sys.argv[2]
+loaded = []
+sys.modules["torch"] = types.SimpleNamespace(compiler = types.SimpleNamespace(
+    load_cache_artifacts = lambda bundle: loaded.append(bundle) or {},
+    save_cache_artifacts = lambda: (b"", {})))
+spec = importlib.util.spec_from_file_location("compile_cache_fresh", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._bundle_key = lambda: key
+module.atexit.register = lambda function: None
+print(json.dumps({"loaded": module.megacache_load("windows-model"), "bytes": [len(b) for b in loaded],
+                  "root": module._cache_root()}))
+'''
+
+
+@windows_only
+def test_windows_stock_root_save_then_fresh_process_load(monkeypatch):
+    """The real default root (%USERPROFILE%\\.cache\\unsloth\\mega_cache, no
+    UNSLOTH_MEGA_CACHE_DIR): a key dir this code creates on save is trusted by
+    the next process. Only the test's own key dir (and the root / its parents if
+    the test created them) is removed afterwards."""
+    import shutil
+    import uuid
+
+    module = _load_module()
+    monkeypatch.delenv("UNSLOTH_MEGA_CACHE_DIR", raising = False)
+    root = Path(module._cache_root())
+    created = [p for p in (root.parent.parent, root.parent, root) if not p.exists()]
+    key = "trust-roundtrip-%s" % uuid.uuid4().hex
+    data = b"stock root artifact bundle"
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(compiler = types.SimpleNamespace(
+        load_cache_artifacts = lambda bundle: {}, save_cache_artifacts = lambda: (data, {}))))
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "1")
+    monkeypatch.setattr(module, "_bundle_key", lambda: key)
+    monkeypatch.setattr(module.atexit, "register", lambda function: None)
+    module._STATE["armed"] = True
+    module._STATE["loaded_key"] = key
+    try:
+        assert module.megacache_save() is True
+        assert module._is_trusted_directory(str(root / key), allow_missing = False) is True
+        env = dict(os.environ, UNSLOTH_MEGA_CACHE = "1")
+        env.pop("UNSLOTH_MEGA_CACHE_DIR", None)
+        out = subprocess.run([sys.executable, "-c", _FRESH_PROCESS_LOAD, str(_COMPILE_CACHE_PATH), key],
+                             capture_output = True, text = True, env = env, timeout = 120)
+        assert out.returncode == 0, out.stderr
+        result = json.loads(out.stdout.strip().splitlines()[-1])
+        assert result["root"] == str(root)
+        assert result["loaded"] is True and result["bytes"] == [len(data)]
+    finally:
+        shutil.rmtree(root / key, ignore_errors = True)
+        for directory in reversed(created):
+            try:
+                directory.rmdir()  # only if now empty
+            except OSError:
+                pass

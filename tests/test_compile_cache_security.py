@@ -272,8 +272,14 @@ def test_non_posix_load_requires_explicit_opt_in(monkeypatch, tmp_path):
     assert module.megacache_load("disabled-model") is False
     assert loaded == []
 
-    # Opted in, the Windows owner/DACL check runs; here (no advapi32) every
-    # call fails, which must mean untrusted, never a load.
+    # Opted in, the Windows owner/DACL check runs. Force every Win32 call to
+    # fail (on real Windows advapi32 exists and the user-owned tmp_path would
+    # pass), which must mean untrusted, never a load, on every host.
+    def _no_win32(*_args, **_kwargs):
+        raise OSError("Win32 security API unavailable")
+
+    monkeypatch.setattr(module, "_windows_api", _no_win32)
+    monkeypatch.setattr(module, "_windows_token_sids", _no_win32)
     monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "1")
     assert module.megacache_load("unverifiable-model") is False
     assert loaded == []
