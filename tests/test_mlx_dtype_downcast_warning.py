@@ -61,8 +61,7 @@ def test_force_float32_list_exported():
 
 
 def test_force_float32_matches_config_json_model_types():
-    """Entries are real config.json `model_type` strings; the MLX matcher must
-    accept the on-disk variants verbatim."""
+    """Real on-disk config.json model_type strings; the MLX matcher must accept them verbatim."""
     from unsloth_zoo.mlx.loader import _is_force_float32_arch
     # Real config.json model_type strings as they appear on the Hub.
     real_world = [

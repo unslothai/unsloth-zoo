@@ -13,11 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""fast_inference on block FP8 MoE: training aliases vLLM's float8 experts AND their scales.
-
-Mock vLLM layers pin the one shareable runtime format (Triton FP8 experts, 128x128 fp32 block
-scales, dynamic activations, TP = 1) and the refusal of every other FP8 runtime.
-"""
+"""fast_inference on block FP8 MoE aliases vLLM's float8 experts and their scales; mocks pin the one shareable runtime
+(Triton FP8 experts, 128x128 fp32 block scales, dynamic activations, TP = 1) and refuse the rest."""
 import sys, os, types
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

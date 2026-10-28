@@ -1,19 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
-"""`UNSLOTH_ALLOW_CPU=1` has to survive the import on a driverless host.
-
-A CUDA-built torch with no usable device -- a driverless container, a CI runner,
-a laptop with the runtime and no card -- is what that variable exists for.
-`get_device_type()` deliberately keeps `DEVICE_TYPE` at `"cuda"` there, so a
-module-scope `torch.cuda.get_device_capability()` runs with nothing to query and
-raises `RuntimeError: No CUDA GPUs are available` out of `_lazy_init()`.
-
-`compiler` and `loss_utils` are both on the path `import unsloth` walks, so a
-regression in either takes the whole import down with it.
-
-Module import is process-global and one-shot, so each case runs in a fresh
-interpreter with `CUDA_VISIBLE_DEVICES=""`.
-"""
+"""UNSLOTH_ALLOW_CPU=1 must survive import on a driverless CUDA-built torch, where module-scope get_device_capability()
+raises; compiler and loss_utils are on the import unsloth path; each case is a fresh interpreter with
+CUDA_VISIBLE_DEVICES set empty."""
 
 import os
 import pathlib
@@ -27,15 +16,13 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 _NO_DEVICE = "No CUDA GPUs are available"
 
-# Every unsloth_zoo module reached at import time that reads a device capability
-# at module scope. `vllm_utils` is deliberately absent: its probes sit behind
-# `fast_inference = True` and are not import-time.
+# Every unsloth_zoo module reached at import time that reads a device capability at module scope; vllm_utils is absent
+# since its probes sit behind fast_inference = True.
 _MODULES = ("unsloth_zoo", "unsloth_zoo.compiler", "unsloth_zoo.loss_utils", "unsloth_zoo.patching_utils")
 
 
 def _needs_cuda_build():
-    """Only a CUDA-built torch reaches the branch under test. On ROCm or a
-    CPU-only build `DEVICE_TYPE` is not `"cuda"` and there is nothing to prove."""
+    """Only a CUDA-built torch reaches the branch under test; on ROCm or CPU-only builds DEVICE_TYPE is not cuda, so there is nothing to prove."""
     if getattr(torch.version, "hip", None):
         pytest.skip("ROCm build: DEVICE_TYPE is not the cuda branch this covers")
     if not getattr(torch.version, "cuda", None):
@@ -46,12 +33,8 @@ def _run(code, **env):
     path = [str(_ROOT)]
     if os.environ.get("PYTHONPATH"):
         path.append(os.environ["PYTHONPATH"])
-    # `conftest.py` sets UNSLOTH_ALLOW_CPU=1 for the whole session, so each case
-    # has to say for itself whether the child gets it.
-    #
-    # UNSLOTH_ZOO_DISABLE_GPU_INIT goes with it: it skips the device detection these cases
-    # are about, so a child that inherits it imports cleanly whatever the answer should
-    # have been, and "the import still refuses" passes for the wrong reason.
+    # conftest.py sets UNSLOTH_ALLOW_CPU=1 for the session, so each case decides whether the child gets it;
+    # UNSLOTH_ZOO_DISABLE_GPU_INIT is stripped as it skips device detection, else refusal tests pass wrongly.
     _SKIPPED_BY = ("UNSLOTH_ALLOW_CPU", "UNSLOTH_ZOO_DISABLE_GPU_INIT")
     clean = {k: v for k, v in os.environ.items() if k not in _SKIPPED_BY}
     return subprocess.run(
@@ -86,9 +69,7 @@ def test_the_module_imports_on_a_driverless_host(module):
 
 
 def test_a_host_with_no_device_claims_no_capability():
-    """Where a capability cannot be read, take the conservative answer. Cut cross
-    entropy is a Triton GPU kernel, and the old-arch compile workarounds only ever
-    run on a real GPU, so False is the answer that also changes nothing."""
+    """An unreadable capability answers False: cut cross entropy is a Triton GPU kernel, and old-arch workarounds only run on a real GPU, so False changes nothing."""
     _needs_cuda_build()
     out = _run(
         "from unsloth_zoo.device_type import DEVICE_TYPE\n"
@@ -100,16 +81,15 @@ def test_a_host_with_no_device_claims_no_capability():
         UNSLOTH_ALLOW_CPU = "1",
     )
     assert out.returncode == 0, out.stderr[-3000:]
-    # The variable is what keeps DEVICE_TYPE on the cuda branch; without that
-    # there is no branch to guard and this file is testing nothing.
+    # The variable keeps DEVICE_TYPE on the cuda branch; without it there is no branch to guard and these asserts test nothing.
     assert "DEVICE_TYPE cuda" in out.stdout, out.stdout
     assert "OLD_CUDA_ARCH_VERSION False" in out.stdout, out.stdout
     assert "HAS_CUT_CROSS_ENTROPY False" in out.stdout, out.stdout
 
 
 def test_without_the_variable_the_import_still_refuses():
-    """The documented refusal is not what this fix relaxes. A driverless host now gets the CPU
-    training backend instead, so opt out of it to reach the refusal."""
+    """The documented refusal is not what this fix relaxes; a driverless host gets the CPU training backend, so
+    UNSLOTH_DISABLE_CPU_FALLBACK=1 is needed to reach the refusal."""
     _needs_cuda_build()
     out = _run("import unsloth_zoo.compiler", UNSLOTH_DISABLE_CPU_FALLBACK = "1")
     assert out.returncode != 0, out.stdout

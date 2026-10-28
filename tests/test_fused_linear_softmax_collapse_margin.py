@@ -14,10 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Margin sweep (arXiv 2610.31642 Section 2) through the public entry points, CPU torch bodies and CUDA Triton.
-
-One row per call, so the head gradient's target row is exactly (1 - p_t) h = -expm1(log p_t) h: the target
-gradient, which collapses to 0 with the loss once the margin passes ~16.6 nats in fp32."""
+"""Margin sweep (arXiv 2610.31642 Section 2) over public entry points, CPU torch bodies and CUDA Triton; one row per
+call so the head gradient's target row is exactly (1 - p_t) h, which collapses to 0 once the margin passes ~16.6 nats
+in fp32."""
 
 import pytest
 import torch

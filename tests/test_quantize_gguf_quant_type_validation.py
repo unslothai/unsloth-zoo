@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""quant_type reaches a shell=True command line, so it must be a bare token.
-
-`quantization_method` is a user facing argument all the way from
-`save_pretrained_gguf(..., quantization_method=...)` down to
-`quantize_gguf(quant_type=...)`, and the command is assembled as a string.
-Every legitimate value (unsloth's ALLOWED_QUANTS / IMATRIX_QUANTS, and the MLX
-quant_map) is `[a-z0-9_]+`, so anything carrying shell metacharacters is
-rejected outright instead of being interpolated.
-"""
+"""Validates quant_type as a bare [a-z0-9_]+ token before it reaches the shell=True command line; shell metacharacters
+are rejected, not interpolated (ALLOWED_QUANTS, IMATRIX_QUANTS, MLX quant_map fit)."""
 
 from __future__ import annotations
 
@@ -39,8 +32,7 @@ _MODULE = None
 
 
 def _load_llama_cpp_module():
-    """Loaded once per session: re-executing llama_cpp for every test churns
-    global torch state and slows the suite down for no extra coverage."""
+    """Loads llama_cpp once per session; re-executing it per test churns global torch state and slows the suite for no extra coverage."""
     global _MODULE
     if _MODULE is None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -156,8 +148,7 @@ def test_surrounding_whitespace_is_trimmed_not_rejected(monkeypatch):
 
 @pytest.mark.parametrize("is_windows", [False, True])
 def test_command_is_byte_identical_across_platforms(monkeypatch, is_windows):
-    """The validated token is inserted bare, so cmd.exe and every POSIX shell
-    see exactly the command previous releases produced."""
+    """The validated token is inserted bare, so cmd.exe and every POSIX shell receive a byte-identical command."""
     llama_cpp = _load_llama_cpp_module()
     captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
     _stub_output_exists(monkeypatch)

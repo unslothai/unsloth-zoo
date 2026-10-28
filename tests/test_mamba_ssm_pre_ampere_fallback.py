@@ -14,15 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests patch_mamba_ssm_pre_ampere_fallback in temporary_patches/misc.py.
-
-mamba_ssm's Triton kernels need sm_80+. On a T4 the package imports fine and
-is_fast_path_available is True, so the layer routes into cuda_kernels_forward
-and Triton fails once training starts. The patch must fire ONLY on pre-Ampere
-NVIDIA CUDA: ROCm, XPU, MPS and CPU are left alone, Ampere+ keeps the fast path.
-
-Extracted by AST so the test needs neither a GPU nor a transformers import.
-"""
+"""Tests patch_mamba_ssm_pre_ampere_fallback in temporary_patches/misc.py: fires only on pre-Ampere NVIDIA CUDA (T4 has
+is_fast_path_available True but Triton fails); ROCm, XPU, MPS, CPU and Ampere+ untouched; AST-extracted, no GPU or
+transformers import needed."""
 
 import ast
 import os
@@ -106,8 +100,7 @@ def env(monkeypatch):
     model_mod.mamba_split_conv1d_scan_combined = lambda *a, **k: None
     sys.modules[MODEL_MOD] = model_mod
 
-    # transformers 5 also resolves these from the Hub, through
-    # integrations.hub_kernels.lazy_load_kernel, which asks no predicate.
+    # transformers 5 also resolves these from the Hub via integrations.hub_kernels.lazy_load_kernel, which asks no availability predicate.
     hk = types.ModuleType("transformers.integrations.hub_kernels")
     hk._HUB_KERNEL_MAPPING = {
         "causal-conv1d": {"repo_id": "kernels-community/causal-conv1d"},
@@ -124,11 +117,8 @@ def env(monkeypatch):
     sys.modules["transformers.integrations"] = integrations
     sys.modules["transformers.integrations.hub_kernels"] = hk
 
-    # The config step imports these two by name. Park empty stubs on them so no
-    # test reaches out to the installed transformers and permanently rewrites
-    # the real ZambaConfig.__init__; a module with no config class in it is
-    # skipped. Tests that want the class install their own over the top, and
-    # this fixture's teardown restores whatever was there.
+    # The config step imports these by name; empty stubs stop tests from permanently rewriting the real
+    # ZambaConfig.__init__, a module with no config class is skipped, and teardown restores them.
     for cfg_mod_name in CONFIG_MODS:
         saved[cfg_mod_name] = sys.modules.get(cfg_mod_name)
         sys.modules[cfg_mod_name] = types.ModuleType(cfg_mod_name)
@@ -145,10 +135,8 @@ def env(monkeypatch):
             sys.modules[parent] = m
             saved.setdefault(parent, None)
     sys.modules["transformers"].utils = sys.modules["transformers.utils"]
-    # `import a.b.c as x` resolves through getattr(a.b, "c"), so this attribute
-    # outlives a sys.modules-only teardown and hands the stub to every later
-    # `import transformers.utils.import_utils as iu` (test_vendor_fla.py:219,
-    # fla_vendor.py:473). Restore it too.
+    # import a.b.c as x resolves through getattr, so this attribute outlives a sys.modules-only teardown and must be
+    # restored too, or later imports get the stub (test_vendor_fla.py, fla_vendor.py).
     utils_mod = sys.modules["transformers.utils"]
     had_attr = hasattr(utils_mod, "import_utils")
     saved_attr = getattr(utils_mod, "import_utils", None)
@@ -164,15 +152,9 @@ def env(monkeypatch):
 
 
 def _no_local_wheel():
-    """Make `import mamba_ssm` raise, for the not-installed branch.
-
-    None in sys.modules does that even where the real package is installed,
-    which popping the fake would not. Assigned rather than
-    `monkeypatch.setitem`: monkeypatch undoes after the `env` teardown and
-    would put the fake back, and a `types.ModuleType` has `__spec__` None, so
-    a leaked one makes every later `importlib.util.find_spec("mamba_ssm")`
-    raise ValueError. `env` owns the key and restores it.
-    """
+    """None in sys.modules makes import raise even when installed, unlike popping; assigned, not monkeypatch, which
+    would re-add the fake after env teardown; a leaked ModuleType (__spec__ None) makes later find_spec raise
+    ValueError; env owns and restores the key."""
     sys.modules["mamba_ssm"] = None
 
 
@@ -189,14 +171,9 @@ def test_pre_ampere_disables_fast_path(env):
 
 
 def _fake_mixer_module(mod_name, cls_name, weight_attr):
-    """A stand-in for jamba/zamba: the flag plus a mixer that raises on it.
-
-    Both bind `self.use_fast_kernels = config.use_mamba_kernels` (True by
-    default) at construction, and their forward raises rather than falling back
-    when the module flag is False (transformers 4.57.6
-    models/jamba/modeling_jamba.py:815-821, models/zamba/modeling_zamba.py:553-560;
-    zamba still does in 5.5.0 and 5.14.1).
-    """
+    """Stand-in for jamba/zamba: both bind self.use_fast_kernels from config.use_mamba_kernels (default True) and
+    forward raises rather than falling back when the flag is False (transformers 4.57.6; zamba still does so in 5.5.0
+    and 5.14.1)."""
     mod = types.ModuleType(mod_name)
     mod.is_fast_path_available = True
     mod.selective_scan_fn = lambda *a, **k: None
@@ -257,20 +234,9 @@ def test_the_mixer_wrapper_is_applied_once(env):
 
 
 def _lazy_flag_mixer_module(mod_name, cls_name, weight_attr, hk):
-    """transformers >= 5.3's shape, where the module flag does not exist yet.
-
-    5.3 moved the kernel resolution into the mixer's `__init__`, so the module
-    carries no `is_fast_path_available` at all until a mixer has been built
-    (`global is_fast_path_available`, models/zamba/modeling_zamba.py:257 in
-    5.5.0) and `forward` recomputes it as a local (line 449). Verified against
-    the real 5.5.0 wheel: right after
-    `import transformers.models.zamba.modeling_zamba`,
-    `"is_fast_path_available" in module.__dict__` is False.
-
-    Availability is read back from `_HUB_KERNEL_MAPPING` the way
-    `lazy_load_kernel` does, so unregistering the Hub kernels is what makes the
-    fast path unavailable here, exactly as on a real 5.5 install.
-    """
+    """transformers >= 5.3 shape: kernel resolution moved into the mixer __init__, so the module has no
+    is_fast_path_available until a mixer is built; availability is read from _HUB_KERNEL_MAPPING like
+    lazy_load_kernel, so unregistering Hub kernels disables it."""
     mod = types.ModuleType(mod_name)
 
     def _kernels_available():
@@ -304,15 +270,9 @@ def _lazy_flag_mixer_module(mod_name, cls_name, weight_attr, hk):
 def test_the_mixer_is_wrapped_before_any_mixer_exists(
     env, mod_name, cls_name, weight_attr,
 ):
-    """The wrapper must not hang off the module's `is_fast_path_available`.
-
-    On transformers >= 5.3 that name is absent from the module dict until a
-    mixer has been constructed, and on 4.x the predicate flip in step 1 has
-    already made it False by the time the modeling module is imported. Gating
-    the wrapper on it left the mixer unwrapped in both orderings, and the guard
-    then handed back `ValueError: Fast Mamba kernels are not available` instead
-    of the slow path. Reproduced on real transformers 5.5.0 and 4.57.6.
-    """
+    """The wrapper must not gate on module is_fast_path_available: it is absent on 5.3+ until a mixer exists and already
+    False on 4.x; gating on it left the mixer unwrapped, so the guard raised ValueError instead of the slow path;
+    reproduced on transformers 5.5.0 and 4.57.6."""
     _model_mod, _iu, hk = env
     saved = sys.modules.get(mod_name)
     mod, Mixer = _lazy_flag_mixer_module(mod_name, cls_name, weight_attr, hk)
@@ -329,8 +289,7 @@ def test_the_mixer_is_wrapped_before_any_mixer_exists(
 
 
 def test_the_mixer_is_wrapped_without_a_local_mamba_ssm_wheel(env):
-    """Unregistering the Hub kernels is on its own enough to make Zamba raise,
-    so the wrapper has to be installed before the local-wheel early return."""
+    """Unregistering the Hub kernels alone makes Zamba raise, so the wrapper must be installed before the local-wheel early return."""
     _model_mod, _iu, hk = env
     mod_name = "transformers.models.zamba.modeling_zamba"
     saved = sys.modules.get(mod_name)
@@ -362,9 +321,7 @@ def test_the_lazy_flag_wrapper_is_applied_once(env):
 
 
 def test_the_config_flag_is_cleared_for_jamba_5_5(env):
-    """Jamba on 5.5 routes on `self.config.use_mamba_kernels`, not on the
-    instance flag (models/jamba/modeling_jamba.py:462-472), and clears exactly
-    that field on its own fallback."""
+    """Jamba on 5.5 routes on self.config.use_mamba_kernels rather than the instance flag, and its own fallback clears exactly that config field."""
     _model_mod, _iu, _hk = env
     mod_name = "transformers.models.jamba.modeling_jamba"
     saved = sys.modules.get(mod_name)
@@ -390,13 +347,8 @@ def test_the_config_flag_is_cleared_for_jamba_5_5(env):
 
 
 def _fake_config_module(mod_name, cls_name):
-    """A stand-in for jamba/zamba's configuration module.
-
-    `use_mamba_kernels` defaults to True and is also written out into every
-    checkpoint's config.json, so both the default and an explicit True have to
-    end up cleared (transformers 4.57.6 configuration_zamba.py:151/193, and the
-    strict-dataclass field `use_mamba_kernels: bool = True` on 5.5.0:81).
-    """
+    """Stand-in for jamba/zamba config: use_mamba_kernels defaults to True and is written into every config.json, so
+    both the default and an explicit True must end up cleared."""
     mod = types.ModuleType(mod_name)
 
     class Config:
@@ -426,18 +378,9 @@ class _ConfigBoundMixer:
 def test_the_config_flag_is_cleared_when_modeling_is_imported_later(
     env, cfg_mod_name, cls_name, modeling,
 ):
-    """The mixer wrapper alone cannot fire when nothing has imported modeling.
-
-    `unsloth_compile_transformers` returns at models/_utils.py:3277 when
-    `trust_remote_code = True`, before both the pre_compile and the post_compile
-    phase, so the only phase that ran is "init", at `import unsloth`, and
-    transformers imports modeling_zamba later, from inside `from_pretrained`.
-    Measured: with trust_remote_code = True there is no
-    `_run_temporary_patches` call at all, and the module is still absent from
-    sys.modules when the call returns. Step 0 has already unregistered the Hub
-    kernels by then, so an unwrapped mixer raises instead of taking the slow
-    path this guard promises. Clearing the config flag is what covers it.
-    """
+    """With trust_remote_code = True, unsloth_compile_transformers returns before pre_compile and post_compile, so
+    modeling is imported later and the mixer wrapper cannot fire; clearing the config flag covers it, since an
+    unwrapped mixer would raise."""
     saved = sys.modules.get(modeling)
     sys.modules.pop(modeling, None)
     _mod, Config = _fake_config_module(cfg_mod_name, cls_name)
@@ -465,8 +408,7 @@ def test_the_config_wrapper_is_applied_once(env):
 
 
 def test_the_config_step_leaves_no_attribute_on_the_config_class(env):
-    """transformers 5 configs are strict dataclasses, so the idempotency marker
-    goes on the wrapper function rather than on the class."""
+    """transformers 5 configs are strict dataclasses, so the idempotency marker goes on the wrapper function, not on the config class."""
     _mod, Config = _fake_config_module(CONFIG_MODS[1], "ZambaConfig")
     before = set(Config.__dict__)
     patch()
@@ -475,23 +417,19 @@ def test_the_config_step_leaves_no_attribute_on_the_config_class(env):
 
 
 def test_the_config_step_does_not_walk_sys_modules(env):
-    """Two import_module calls on names we already know, not a third pass over
-    every loaded module."""
+    """The config step uses two import_module calls on known names, not another pass over every loaded module."""
     assert _SRC.count("for _name, _mod in list(sys.modules.items()):") == 1
 
 
 def test_the_mixer_scan_does_not_walk_sys_modules(env):
-    """The two mixers are reached by direct `sys.modules` lookup, not by another
-    pass over every loaded module, so the extra work is two dict gets."""
+    """The two mixers are reached by direct sys.modules.get lookup, not by another pass over every loaded module."""
     assert 'sys.modules.get(_name, None)' in _SRC
     assert _SRC.count("for _name, _mod in list(sys.modules.items()):") == 1
 
 
 def test_alias_modules_are_not_probed_through_getattr():
-    """transformers 5 registers ~200 `image_processing_<m>_fast` alias modules
-    whose catch-all __getattr__ imports the real image processor. Probing them
-    with getattr costs seconds per phase and can propagate an ImportError out
-    of `import unsloth`, so the scan must read __dict__ instead."""
+    """transformers 5 registers image_processing_<m>_fast alias modules whose catch-all __getattr__ imports the real
+    processor; getattr can raise ImportError out of import unsloth, so the scan must read __dict__ instead."""
     assert '_mod.__dict__.get("is_fast_path_available", False)' in _SRC
     assert 'getattr(_mod, "is_fast_path_available", False)' not in _SRC
 
@@ -534,9 +472,8 @@ def test_no_mamba_ssm_is_untouched(env):
     assert iu.is_mamba_ssm_available() is True
 
 
-# lazy_load_kernel resolves mamba-ssm from kernels-community when the `kernels`
-# package is installed. It needs no local wheel and never calls
-# is_mamba_ssm_available, so the predicates above cannot reach it.
+# lazy_load_kernel resolves mamba-ssm from kernels-community when the `kernels` package is installed; it needs no local
+# wheel and never calls is_mamba_ssm_available, so the predicates above cannot reach it.
 
 def test_pre_ampere_unregisters_the_hub_kernels(env):
     _model_mod, _iu, hk = env
@@ -554,8 +491,7 @@ def test_unrelated_hub_kernels_are_left_registered(env):
 
 
 def test_hub_kernels_go_even_without_the_local_wheel(env):
-    """The Hub path is the one that reaches a pre-Ampere GPU with no wheel
-    installed, so unregistering has to precede the mamba_ssm import."""
+    """The Hub path reaches a pre-Ampere GPU with no wheel installed, so unregistering must precede the mamba_ssm import."""
     _model_mod, _iu, hk = env
     _no_local_wheel()
     assert patch() is None
@@ -600,8 +536,7 @@ def test_registered_as_a_temporary_patch():
     assert "TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)" in _SRC
 
 
-# Triton 3.4+ compiles mamba_ssm's kernels on sm_75 (T4), so the slow path is
-# only forced there on an older Triton.
+# Triton 3.4+ compiles mamba_ssm kernels on sm_75 (T4), so the slow path is forced only on an older Triton.
 
 @pytest.mark.parametrize("version", ["3.4.0", "3.4rc1", "3.5.1", "3.6.0", "3.10.0", "4.0.0+git1234"])
 def test_t4_with_a_new_triton_keeps_fast_path(env, monkeypatch, capsys, version):
@@ -614,9 +549,8 @@ def test_t4_with_a_new_triton_keeps_fast_path(env, monkeypatch, capsys, version)
 
 
 def test_t4_fast_path_takes_mamba_ssm_from_the_local_package(env, monkeypatch):
-    """Only the local package's autotune configs can be trimmed, so the Hub
-    mamba-ssm goes. falcon_mamba-ssm (Mamba-1, no autotuned Triton and no
-    local fallback), causal-conv1d (LFM2) and unrelated kernels stay."""
+    """Only the local package's autotune configs can be trimmed, so the Hub mamba-ssm goes; falcon_mamba-ssm (no
+    autotuned Triton, no local fallback), causal-conv1d (LFM2) and unrelated kernels stay."""
     _model_mod, _iu, hk = env
     _set_triton(monkeypatch, "3.6.0")
     assert patch() is None
@@ -709,8 +643,7 @@ def test_local_kernel_fallback_follows_the_same_rule():
     assert "_mamba_ssm_fast_path_blocker(" in seg and "(8, 0)" not in seg
 
 
-# On sm_75 every autotune config compiles before the first step (6 to 9 minutes
-# on a T4), so the fast path keeps one config per mamba_ssm kernel there.
+# On sm_75 every autotune config compiles before the first step, so the fast path keeps one config per mamba_ssm kernel there.
 
 class _FakeAutotuner:
     def __init__(self, configs):
@@ -816,8 +749,7 @@ def test_a_late_local_mamba_ssm_import_is_trimmed_too():
 
 
 def test_an_already_resolved_hub_kernel_is_trimmed_too(env, monkeypatch):
-    """A Hub module bound into a modeling module before the patch keeps running,
-    so its autotuners are trimmed alongside the local package's."""
+    """A Hub module already bound into a modeling module before the patch keeps running, so its autotuners are trimmed alongside the local package's."""
     _model_mod, _iu, hk = env
     local_kernel, local_cheapest = _autotuned_mamba_module(monkeypatch)
     hub_name = "kernels_hub_mamba_ssm_abc123"
@@ -851,10 +783,8 @@ def test_two_ampere_gpus_keep_the_fast_path(env, monkeypatch):
 
 # Keep last: it checks what the `env` fixture left behind after teardown.
 def test_the_fixture_leaves_no_stub_bound_on_transformers_utils():
-    """The stub must not outlive the fixture. `import a.b.c as x` goes through
-    getattr(a.b, "c"), so a leaked attribute is handed to every later
-    `import transformers.utils.import_utils as iu` -- the form used by
-    tests/test_vendor_fla.py:219 and unsloth_zoo/temporary_patches/fla_vendor.py:473."""
+    """The stub must not outlive the fixture: import a.b.c as x resolves via getattr, so a leaked transformers.utils
+    attribute reaches later import_utils imports (tests/test_vendor_fla.py, fla_vendor.py)."""
     utils_mod = sys.modules.get("transformers.utils")
     if utils_mod is None or getattr(utils_mod, "__file__", None) is None:
         pytest.skip("real transformers.utils was never imported in this session")
@@ -869,8 +799,7 @@ if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 
 
-# Without mamba_ssm / causal_conv1d, Jamba (transformers 4.x) and Zamba (up to
-# 5.14) raise on every GPU, not only below sm_80; 5.15 falls back instead.
+# Without mamba_ssm / causal_conv1d, Jamba (transformers 4.x) and Zamba (up to 5.14) raise on every GPU, not only below sm_80; 5.15 falls back.
 
 def _set_specs(monkeypatch, present):
     import importlib.util

@@ -52,8 +52,8 @@ def _run_fused(ce, bsz, qlen, n_chunks, dtype, hd = 8, vocab = 48, bias = False)
     def loss_function(hidden_states, *args, **kwargs):
         rows.append(int(hidden_states.shape[0]))
         return ce.compute_fused_ce_loss(hidden_states, *args, **kwargs)
-    # Positional: loss_function, hidden_states, lm_head_weight, lm_head_bias, labels, mask,
-    # n_items, scaling, shift_labels, target_gb, torch_compile, overwrite, extra_kwargs.
+    # Positional order of UnslothFusedLoss.apply: loss_function, hidden_states, lm_head_weight, lm_head_bias, labels,
+    # mask, n_items, scaling, shift_labels, target_gb, torch_compile, overwrite, extra_kwargs.
     loss = ce.UnslothFusedLoss.apply(
         loss_function, hidden, weight, b, labels, None, None, None, True, None, False, False,
         {"n_chunks": n_chunks},

@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for unsloth_zoo.hf_xet_fallback: watchdog, Xet->HTTP transport policy,
-file/snapshot entrypoints, the UNSLOTH_DISABLE_XET knob, and HF_HUB_DISABLE_XET.
-
-CPU-only, no network, no real subprocess (the download seam is monkeypatched).
-The modules under test come from ``unsloth_zoo_downloads``, which does not
-import the full ``unsloth_zoo`` package (torch + GPU init).
-"""
+"""Tests for unsloth_zoo.hf_xet_fallback (watchdog, Xet to HTTP policy, file/snapshot entrypoints, UNSLOTH_DISABLE_XET,
+HF_HUB_DISABLE_XET); CPU-only, no network, no real subprocess; imports unsloth_zoo_downloads to skip torch and GPU
+init."""
 
 from __future__ import annotations
 
@@ -59,14 +55,7 @@ def hf_cache(tmp_path, monkeypatch):
 
 
 def _supervised_child(monkeypatch, *partials: str) -> int:
-    """A child that exists and writes exactly *partials*, whatever else is running on the host.
-
-    These tests pass a pid only to reach the data branch. A made-up pid (4242) left the outcome to
-    the runner: when some process of ours happened to hold it, psutil read it as a live child owning
-    no partial, the watchdog took the test's fresh partial for a peer's download and held the clock,
-    and three "must trip" tests failed together on a CI runner. Own the partials explicitly and use
-    a pid that is certainly alive, so the watchdog asks the question each test means to ask.
-    """
+    """Child that owns exactly the given partials, with a certainly-alive pid (os.getpid()); a made-up pid can belong to a live process and skew the watchdog on CI."""
     monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set(partials))
     return os.getpid()
 
@@ -89,25 +78,15 @@ def _wait(predicate, timeout: float = 2.0, step: float = 0.02) -> bool:
 def _watch_while_growing(
     grown: Path, **watchdog_kwargs
 ) -> "tuple[list[str], float, float, list[int]]":
-    """Grow *grown* every 0.05 s under a watchdog for past its stall timeout.
-
-    Returns ``(stall calls, longest gap between writes, stall_timeout, sizes read after each write)``,
-    the last being what the watchdog's own reader saw, so a firing says whether the grower paused
-    or the size the watchdog reads did not move. A stall is no growth for
-    stall_timeout, so a claim that growth keeps the watchdog quiet needs the grower to have kept
-    writing with no gap that long. On a loaded xdist runner a starved grower is a real stall and the
-    watchdog is right to fire; the gap tells the two apart (#1349).
-    """
+    """Grows the file every 0.05 s past its stall timeout and returns (stall calls, longest write gap, stall_timeout,
+    sizes seen); the longest gap tells a starved grower, a real stall the watchdog should fire on, from one that kept
+    writing (issue 1349)."""
     grow_stop = threading.Event()
     writes: list[float] = []
 
     sizes: list[int] = []
 
-    # Appended and flushed, the way a download grows a partial. The watchdog reads st_blocks
-    # (sparse-aware), and rewriting the whole file with O_TRUNC every 0.05 s left that number to
-    # the filesystem's allocation: #1367's first CI run saw the repo-wide watchdog fire with the
-    # grower never idle for 1.5 s. Not reproduced on XFS here; fsync pins each write's blocks, and
-    # the sizes recorded below say which side moved if it happens again.
+    # Append+flush like downloads, not O_TRUNC: st_blocks tracked allocation and CI 1367 falsely fired.
     def _grow():
         with open(grown, "ab") as out:
             while not grow_stop.wait(0.05):
@@ -135,16 +114,14 @@ def _watch_while_growing(
         time.sleep(stall_timeout + 0.5)
     finally:
         stop.set()
-        # Joined, not just signalled: stop.wait() can return and the thread be preempted mid-tick, so
-        # a callback could still land after the signal. The timestamp follows the join, so the
-        # measured interval covers everything the watchdog saw.
+        # Join the watchdog before taking the stop timestamp, not just signal it: a callback can still land after the
+        # signal, so the interval must follow the join.
         watchdog[0].join(timeout = 10)
         stopped = time.monotonic()
         grow_stop.set()
         grower.join(timeout = 5)
     assert not watchdog[0].is_alive(), "the watchdog thread did not stop"
-    # Through the moment the watchdog stopped: a grower starved after its last write leaves a
-    # trailing gap the watchdog saw too.
+    # Gap runs up to the watchdog stop, so a grower starved after its last write still shows as a gap.
     marks = [started] + [w for w in writes if w < stopped] + [stopped]
     gap = max(b - a for a, b in zip(marks, marks[1:]))
     return calls, gap, stall_timeout, sizes
@@ -201,8 +178,7 @@ def test_transient_unmeasurable_tick_is_progress(hf_cache, monkeypatch):
     """An unmeasurable tick (state -> None) counts as progress, but a later frozen state still stalls."""
     seq = {"n": 0}
     frozen = (2048, True)  # constant size + active .incomplete
-    # A real partial as well as the mocked repo-wide figure: the watchdog phases its clocks on bytes
-    # in ACTIVE partials, so a mocked total alone would sit in the 90s connect phase, never the 0.3s one.
+    # A real active partial, not only a mocked total: the watchdog phases clocks on active partial bytes.
     (_blobs_dir(hf_cache) / "frozen.incomplete").write_bytes(b"\0" * 2048)
 
     def fake_state(*args, **kwargs):
@@ -496,8 +472,7 @@ def test_custom_cache_dir_is_watched_and_cleaned(tmp_path, monkeypatch):
     finally:
         stop.set()
 
-    # HTTP-prep purge removes the unsafe partial from the custom cache (real impl;
-    # the autouse fixture stubs the attribute). Age past the grace so it reads stalled.
+    # Real HTTP-prep purge (the autouse fixture stubs it); partial aged past grace so it reads stalled.
     old = time.time() - 600
     os.utime(partial, (old, old))
     _REAL_DEFAULT_PREPARE("model", REPO, cache_dir = str(custom_cache))
@@ -698,8 +673,7 @@ def test_status_callback_failure_does_not_kill_watchdog(hf_cache):
         stop.set()
 
 
-# Transport policy: cached short-circuit, cancel, error propagation, the single Xet->HTTP
-# fallback, injected prepare seam, UNSLOTH_DISABLE_XET. _run_download_attempt is faked, so no spawn.
+# Transport policy: _run_download_attempt is faked (no spawn); cancel, errors, Xet-to-HTTP fallback.
 DL_REPO, FILE = "ztest/xet-dl", "model-Q4_K_XL.gguf"
 
 
@@ -839,8 +813,7 @@ def test_crashed_child_retries_over_http(monkeypatch):
 
 
 def test_crashed_child_on_every_rung_raises_transport_error(monkeypatch):
-    """A crash on Xet and on every HTTP child surfaces as DownloadTransportError once the budget is
-    spent -- not as a bare RuntimeError a caller would read as "carry on without the guard"."""
+    """Crashes on Xet and every HTTP child raise DownloadTransportError once the budget is spent, not a bare RuntimeError that reads as "carry on without the guard"."""
     fake = _install(
         monkeypatch, [("crashed", "boom"), ("crashed", "boom"), ("crashed", "boom")]
     )
@@ -867,10 +840,8 @@ def test_retryable_error_on_every_rung_raises_transport_error(monkeypatch):
 
 
 def test_transport_error_is_a_stall_error_and_a_runtime_error(monkeypatch):
-    """The guard downstream puts around the supervised download is `except DownloadStallError`; a
-    transport error that is not one lets a retryable CDN fault fall through to the unguarded
-    in-process load, which is the hang in unslothai/unsloth-zoo#1122. Still a RuntimeError, so an
-    existing `except RuntimeError` keeps matching."""
+    """Downstream guards catch DownloadStallError; a transport error that is not one lets a retryable CDN fault fall
+    through to the unguarded in-process load (the issue 1122 hang); still a RuntimeError."""
     assert issubclass(xf.DownloadTransportError, xf.DownloadStallError)
     err = ("retryable_error", "HfHubHTTPError: Server error '503 Service Unavailable' for url ...")
     _install(monkeypatch, [err, err, err])
@@ -881,8 +852,7 @@ def test_transport_error_is_a_stall_error_and_a_runtime_error(monkeypatch):
 
 
 def test_is_retryable_download_error_classification():
-    """Transient transport failures (hf_xet/CAS, timeout, reset, 5xx/429) are retryable; deterministic
-    Hub/OS errors are not, on either rung."""
+    """Transient transport failures (hf_xet/CAS, timeout, reset, 5xx/429) are retryable; deterministic Hub/OS errors are not, on either rung."""
     def f(exc, on_xet = True):
         return xf._is_retryable_download_error(exc, on_xet = on_xet)
 
@@ -929,14 +899,12 @@ def test_is_retryable_download_error_classification():
         # A local filesystem failure is not transport-attributable: the other transport writes there too.
         assert f(PermissionError("cache dir is read-only"), on_xet) is False, on_xet
 
-    # An UNRECOGNIZED error is decided by the rung: hf_xet reports a CAS fault as a bare RuntimeError,
-    # and reading it as deterministic skipped the HTTP rung entirely (unslothai/unsloth-zoo#1122).
+    # Unknown errors use the rung default: CAS RuntimeError read as deterministic skipped HTTP (1122).
     cas = RuntimeError(
         "Task error: File reconstruction error: CAS Client Error: Format error: "
         "I/O error: error decoding response body"
     )
-    # It must reach the RUNG DEFAULT, not a hint: the wording belongs to xet-core, so a hint covering
-    # this one chain would leave the next one deterministic again.
+    # Must reach the rung default, not a hint: wording is xet-core's, so a hint misses the next chain.
     text = f"{type(cas).__name__}: {cas}".lower()
     assert not any(h in text for h in xf._TRANSIENT_ERROR_HINTS), "must not be hint-matched"
     assert f(cas, True) is True
@@ -946,9 +914,8 @@ def test_is_retryable_download_error_classification():
 
 
 def test_local_entry_not_found_transient_is_retryable():
-    """A transient LocalEntryNotFoundError (HEAD connection error/timeout) is retryable; a genuine
-    offline miss stays deterministic and type-preserved -- on the Xet rung too, where the named
-    deterministic set still wins over the unknown-error default."""
+    """A transient LocalEntryNotFoundError (HEAD connection error or timeout) is retryable; a genuine offline miss stays
+    deterministic, even on the Xet rung where the named set wins."""
     def f(exc):
         return xf._is_retryable_download_error(exc, on_xet = True)
 
@@ -1005,8 +972,7 @@ def test_recovered_xet_retry_never_reaches_http(monkeypatch):
 
 
 def test_xet_retry_purges_the_dead_child_partial(monkeypatch):
-    """hf_xet rebuilds from offset zero, so the killed child's partial must go or the watchdog
-    would read a frozen byte count on the retry and trip a false stall."""
+    """hf_xet rebuilds from offset zero, so the killed child's partial must be purged or the watchdog reads a frozen byte count and trips a false stall."""
     purged = []
     monkeypatch.setattr(
         xf, "_purge_owned_partials_for_xet_retry",
@@ -1021,8 +987,7 @@ def test_xet_retry_purges_the_dead_child_partial(monkeypatch):
 
 
 def test_injected_prepare_for_http_not_used_between_xet_attempts(monkeypatch):
-    """The injected (marker-aware) hook belongs to the transport CHANGE only: running it between two
-    Xet attempts would stamp an "http" marker over a partial Xet still owns."""
+    """The injected marker-aware prepare hook runs only at the transport change; between Xet attempts it would stamp an "http" marker over a partial Xet owns."""
     monkeypatch.setattr(
         xf, "_default_prepare_for_http", lambda *a, **k: pytest.fail("generic prepare ran")
     )
@@ -1036,8 +1001,7 @@ def test_injected_prepare_for_http_not_used_between_xet_attempts(monkeypatch):
 
 
 def test_pre_byte_stall_skips_the_xet_retry(monkeypatch):
-    """"did not start" is as likely slow metadata as a broken Xet, and retrying it would buy a
-    second full connect window before HTTP: straight to HTTP instead."""
+    """A "did not start" verdict can be slow metadata as easily as broken Xet, and a retry buys a second connect window, so go straight to HTTP."""
     verdict = "Download did not start (xet transport) -- no data after 90s"
     fake = _install(monkeypatch, [("stall", verdict), ("ok", "/cache/model.gguf")])
     out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
@@ -1072,9 +1036,8 @@ def test_attempts_knob_rejects_junk_and_clamps(monkeypatch):
 
 
 def test_http_rung_retries_a_transient_error(monkeypatch):
-    """The Xet bridge CDN serves Xet-backed blobs over plain HTTP too, so a degraded CDN 5xx fails
-    BOTH rungs. A single HTTP child turned that retryable blip into a hard failure
-    (unslothai/unsloth-zoo#1122); the rung now gets its own budget."""
+    """The Xet bridge CDN serves Xet blobs over plain HTTP too, so a degraded CDN 5xx fails both rungs; the HTTP rung
+    gets its own retry budget (unslothai/unsloth-zoo issue 1122)."""
     fake = _install(
         monkeypatch,
         [("retryable_error", "503 Service Unavailable"),
@@ -1094,8 +1057,7 @@ def test_http_rung_retries_a_crash(monkeypatch):
 
 
 def test_http_stall_still_raises_on_the_first_verdict(monkeypatch):
-    """The HTTP budget is for faults, not for hangs: the patient HTTP threshold has already waited
-    out everything a retry would wait for again."""
+    """The HTTP retry budget is for faults, not hangs: the patient HTTP stall threshold has already waited out what a retry would wait for again."""
     fake = _install(monkeypatch, [("retryable_error", "503"), ("stall", None)])
     with pytest.raises(xf.DownloadStallError):
         xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
@@ -1134,9 +1096,8 @@ def test_http_attempts_knob_rejects_junk_and_clamps(monkeypatch):
 
 
 def test_http_retry_prepares_the_cache_exactly_once(monkeypatch):
-    """The purge belongs to the transport CHANGE. Repeating it per HTTP child would spare the partial
-    the failed child just wrote (younger than active_grace), leaving has_active_incomplete_blobs true
-    and forcing force_download -- so every retry would restart the download from zero."""
+    """The purge runs once at the transport change; per HTTP child it would spare the fresh partial (younger than
+    active_grace), forcing force_download and restarting from zero."""
     prepared = []
     monkeypatch.setattr(
         xf, "_default_prepare_for_http",
@@ -1153,8 +1114,7 @@ def test_http_retry_prepares_the_cache_exactly_once(monkeypatch):
 
 
 def test_cancel_in_the_http_failure_window_reports_cancelled(monkeypatch):
-    """A cancel landing while the HTTP rung is failing ends the ladder as a cancel, not as a
-    transport error, and buys no further child."""
+    """A cancel landing while the HTTP rung is failing ends the ladder as a cancel, not a transport error, and starts no further child."""
     cancel = threading.Event()
     fake = _install(
         monkeypatch, [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")]
@@ -1174,8 +1134,7 @@ def test_cancel_in_the_http_failure_window_reports_cancelled(monkeypatch):
 
 
 def test_wait_before_http_retry_is_interruptible(monkeypatch):
-    """A cancel arriving during the backoff raises rather than spending another child on a download
-    the caller has abandoned; without one the wait is a plain sleep."""
+    """A cancel during the retry backoff raises rather than spending another child on an abandoned download; without a cancel event the wait is a plain sleep."""
     monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "30")
     cancel = threading.Event()
     cancel.set()
@@ -1189,9 +1148,8 @@ def test_wait_before_http_retry_is_interruptible(monkeypatch):
 
 
 def test_transient_xet_error_is_charged_only_when_http_rescues_it(monkeypatch):
-    """A CDN fault that fails BOTH rungs is not evidence against THIS MACHINE's Xet. Charging it
-    demoted a healthy machine to HTTP for 24h after two such downloads -- which is exactly what a
-    degraded CDN produces. Only an HTTP rescue proves the Xet path alone was broken."""
+    """A CDN fault failing both rungs is not evidence against this machine's Xet; charging it demoted a healthy machine
+    to HTTP for 24h. Only an HTTP rescue proves the Xet path alone was broken."""
     outcomes = []
     monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
     err = ("retryable_error", "503 Service Unavailable")
@@ -1221,10 +1179,8 @@ def test_crash_on_xet_is_charged_only_when_http_rescues_it(monkeypatch):
 
 
 def test_offline_mode_is_deterministic_on_both_rungs(monkeypatch):
-    """OfflineModeIsEnabled subclasses builtin ConnectionError, so it is an OSError with no errno and
-    no builtin of its own name -- nothing else in the predicate catches it. Without an entry in the
-    name set the rung default would spend an HTTP child AND the destructive pre-HTTP purge on a repo
-    the user has deliberately switched offline."""
+    """OfflineModeIsEnabled is an OSError with no errno or builtin name; without an entry in _DETERMINISTIC_ERROR_NAMES,
+    a deliberately offline repo gets an HTTP child and a destructive purge."""
     from huggingface_hub.errors import OfflineModeIsEnabled
 
     assert "OfflineModeIsEnabled" in xf._DETERMINISTIC_ERROR_NAMES
@@ -1237,9 +1193,8 @@ def test_offline_mode_is_deterministic_on_both_rungs(monkeypatch):
 
 
 def test_deterministic_http_error_does_not_charge_a_held_transport_fault(monkeypatch):
-    """A Xet fault held for proof, then an unrelated deterministic failure on HTTP (disk full): the
-    download succeeded on neither rung, so nothing ever showed the Xet path alone was broken. Two of
-    these would demote the machine to HTTP for 24h."""
+    """A held Xet fault followed by an unrelated deterministic HTTP failure (disk full) is not charged: the download
+    succeeded on neither rung, so Xet was never proven broken."""
     outcomes = []
     monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
     _install(
@@ -1253,8 +1208,7 @@ def test_deterministic_http_error_does_not_charge_a_held_transport_fault(monkeyp
 
 
 def test_a_stall_is_still_charged_when_a_later_error_ends_the_ladder(monkeypatch):
-    """The counterpart to the test above, and the invariant it must not break: a STALL stands on its
-    own as evidence, so a deterministic error afterwards still reports it."""
+    """A stall stands on its own as evidence, so a deterministic error afterwards still reports it; this is the invariant the test above must not break."""
     outcomes = []
     monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
     _install(
@@ -1267,10 +1221,8 @@ def test_a_stall_is_still_charged_when_a_later_error_ends_the_ladder(monkeypatch
 
 
 def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeypatch):
-    """An unsafe partial that could not be cleared forces a clean re-download on the FIRST HTTP
-    child. Leaving force_download latched would make every retry in the new budget discard the
-    partial that child wrote and start again from zero -- the whole file per attempt on a large
-    repo, which is a cost the budget must not introduce."""
+    """An unsafe partial that cannot be cleared forces a clean re-download on the first HTTP child only; once gone,
+    later retries must resume rather than restart from zero."""
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     # Present at the transition and GONE once the forced child ran: that is what makes a resume safe.
@@ -1292,14 +1244,8 @@ def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeyp
 
 
 def test_http_retry_keeps_forcing_while_the_unsafe_partial_survives(monkeypatch):
-    """The counterpart: a forced HTTP child that FAILED before replacing the partial must not make
-    the next child resumable.
-
-    huggingface_hub unlinks the .incomplete only after its HEAD/metadata call, so a child that died
-    on a 5xx there -- the degraded CDN this ladder exists for -- leaves the sparse Xet partial exactly
-    as it was. Resuming over it finalizes a silently corrupt blob, so "one HTTP child has run" is not
-    proof; only the partial's disappearance is.
-    """
+    """A failed forced HTTP child must keep forcing: one child having run is not proof, only the partial disappearing
+    is; huggingface_hub unlinks .incomplete only after HEAD, so resuming finalizes a corrupt blob."""
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     monkeypatch.setattr(
@@ -1329,8 +1275,7 @@ def test_http_retry_keeps_a_caller_requested_force_download(monkeypatch):
 
 
 def test_http_retry_backoff_honours_zero(monkeypatch):
-    """0 is the value a CI run or a test harness actually reaches for. _env_seconds would read it as
-    junk and silently restore the full default, so this knob does not use it."""
+    """0 is a real value (CI and harnesses set it); _env_seconds would read it as junk and silently restore the default, so this knob does not use it."""
     monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
     assert xf._http_retry_backoff() == 0.0
     monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "1.5")
@@ -1347,8 +1292,7 @@ def test_http_retry_backoff_honours_zero(monkeypatch):
 
 
 def test_recovered_stall_is_not_charged_to_the_machine(monkeypatch):
-    """Health takes ONE outcome per download: two stalls recorded separately would let a single
-    download hit the two-consecutive-failure demotion threshold on its own."""
+    """Health takes one outcome per download; two separately recorded stalls would let a single download hit the two-consecutive-failure demotion alone."""
     outcomes = []
     monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
     _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
@@ -1365,8 +1309,7 @@ def test_exhausted_xet_records_exactly_one_failure(monkeypatch):
 
 
 def test_deferred_stall_is_reported_when_a_later_attempt_errors(monkeypatch):
-    """A deterministic error on the retry ends the ladder without an HTTP rung, but the earlier
-    stall was still real evidence and must not be silently forgiven."""
+    """A deterministic error on the retry ends the ladder without an HTTP rung, but the earlier stall is still real evidence and must not be silently forgiven."""
     outcomes = []
     monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
     _install(
@@ -1450,8 +1393,7 @@ def test_file_path_accepts_cache_dir(monkeypatch):
     assert fake.calls[0].cache_dir == "/custom/cache"
 
 
-# Spawn env-timing: the parent sets HF_HUB_DISABLE_XET before the child starts, so the child
-# inherits it before re-importing huggingface_hub (constants cache it at import). Fake spawn context.
+# Spawn env: the child inherits HF_HUB_DISABLE_XET before huggingface_hub reads it at import.
 class _FakeProc:
     def __init__(self, recorder):
         self._rec = recorder
@@ -1463,8 +1405,7 @@ class _FakeProc:
         self._rec["hf_transfer"] = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER")
         self._rec["skip_gpu_init"] = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT")
         self._rec["main_file"] = getattr(sys.modules.get("__main__"), "__file__", None)
-        # What the child would actually inherit: hf_xet reads these natively at import, so the
-        # spawn window is the only moment they can be set.
+        # Child inherits HF_XET_* env: hf_xet reads them at import, so only the spawn window can set them.
         self._rec["xet"] = {k: v for k, v in os.environ.items() if k.startswith("HF_XET_")}
 
     def is_alive(self):
@@ -1543,9 +1484,7 @@ def _spawn_xet_env(monkeypatch) -> dict:
 
 
 def test_child_keeps_a_user_set_high_performance_flag(monkeypatch):
-    """The download child is the only process that matters here, so standing our sizing down for a
-    user who asked for high-performance mode has to hold on this path too. Forcing the flag back to
-    0 and re-adding the caps is the behaviour that cost a 192-core host 2.55x."""
+    """The download child must honor a user's high-performance flag too; forcing it back to 0 and re-adding the caps cost a 192-core host throughput."""
     from unsloth_zoo.hf_xet_tuning import _CAPS_VOIDED_BY_HIGH_PERFORMANCE
 
     for var in ("HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS", "UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE"):
@@ -1563,8 +1502,7 @@ def test_child_keeps_a_user_set_high_performance_flag(monkeypatch):
 
 
 def test_child_is_capped_when_nothing_asked_otherwise(monkeypatch):
-    """The default path is unchanged: no flag means the caps go to the child and the preset that
-    would void them is turned off."""
+    """With no flag set, the child gets the caps and the high-performance preset that would void them is turned off."""
     for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
         monkeypatch.delenv(var, raising = False)
     monkeypatch.delenv("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", raising = False)
@@ -1576,8 +1514,7 @@ def test_child_is_capped_when_nothing_asked_otherwise(monkeypatch):
 
 
 def test_force_caps_still_beats_the_flag_for_the_child(monkeypatch):
-    """The escape hatch survives: someone who wants a machine bounded regardless still gets the
-    caps, which only mean anything once the preset is off."""
+    """UNSLOTH_XET_FORCE_CAPS still beats the flag: the caps reach the child, which only means anything once the preset is off."""
     monkeypatch.delenv("HF_XET_HP", raising = False)
     monkeypatch.setenv("HF_XET_HIGH_PERFORMANCE", "1")
     monkeypatch.setenv("UNSLOTH_XET_FORCE_CAPS", "1")
@@ -1588,10 +1525,8 @@ def test_force_caps_still_beats_the_flag_for_the_child(monkeypatch):
 
 
 def test_the_child_is_sized_for_the_cache_dir_it_was_given(monkeypatch, tmp_path):
-    """``cache_dir`` is what huggingface_hub uses (``file_download.py``: ``if cache_dir is None:
-    cache_dir = constants.HF_HUB_CACHE``), so it, not the process's HF_HUB_CACHE, is the volume the
-    child writes to. Sizing from the global cache hands a nearly full target disk the whole budget,
-    and clamps a roomy target to the floor whenever an unrelated default cache is full."""
+    """Size the child from the cache_dir it writes to (hub uses HF_HUB_CACHE only when cache_dir is None), not the
+    global cache, which misjudges the target volume's space."""
     import collections
     import shutil
 
@@ -2225,8 +2160,7 @@ def test_force_download_file_skips_cache_probe(monkeypatch, tmp_path):
     assert len(fake.calls) == 1 and fake.calls[0].force_download is True
 
 
-# Precondition: HF_HUB_DISABLE_XET is read at import time, so assert its effect in a
-# FRESH interpreter (huggingface/huggingface_hub#3266 once ignored it).
+# HF_HUB_DISABLE_XET is read at import: check in a new interpreter; huggingface_hub 3266 ignored it.
 def _safe_path() -> str:
     import os
 
@@ -2548,9 +2482,7 @@ def test_disable_xet_read_under_spawn_lock(monkeypatch):
     assert seen.get("held") is True
 
 
-# Conservative fast-path gate + pre/post-download acceptance split. The gate fast-paths ONLY the
-# unambiguous canonical model cache, deferring everything else to the watched child. Pre-download
-# (skip the child?) and post-download (accept the result?) are asymmetric: strict pre, lenient post.
+# Fast-path gate covers only the canonical model cache; pre-download checks are strict, post lenient.
 def _mk_snapshot(tmp_path, name):
     blob = tmp_path / "_blob"
     if not blob.exists():
@@ -2757,11 +2689,9 @@ def test_pre_download_does_not_skip_diffusers_but_post_accepts(tmp_path):
 
 
 def test_post_accepts_nonstandard_sharded_safetensors_names(tmp_path):
-    """Regression for issue #889: unsloth/Qwen3.5-4B shards its safetensors with a NON-standard name that
-    keeps the format suffix in the middle (model.safetensors-00001-of-00002.safetensors), referenced that
-    way by model.safetensors.index.json. transformers enumerates the weight through the index, so the
-    post-download gate must accept it rather than raise a spurious DownloadStallError. Shard completeness
-    is still enforced: a missing shard is rejected, and the standard sharded layout is unaffected."""
+    """Regression for issue 889: unsloth/Qwen3.5-4B shards with a non-standard name
+    (model.safetensors-00001-of-00002.safetensors) listed in its index must pass the post-download gate; missing
+    shards still fail."""
     shards = ["model.safetensors-00001-of-00002.safetensors",
               "model.safetensors-00002-of-00002.safetensors"]
     # Complete cache with the non-standard shard names -> accepted (the #889 fix).
@@ -2795,10 +2725,8 @@ def test_post_accepts_nonstandard_sharded_safetensors_names(tmp_path):
 
 
 def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_path):
-    """A sentence-transformers model reads a weight-bearing subfolder module (2_Dense) the canonical root
-    gate does not check, so a partial cache holding the root weight but missing the 2_Dense weight must
-    defer to the child (else the ST load fetches it over un-killable Xet). A weightless module (Pooling)
-    needs no weight, and a complete ST cache still fast-paths."""
+    """A sentence-transformers weight-bearing subfolder (2_Dense) missing its weight must defer to the child, else the
+    ST load fetches it over un-killable Xet; weightless Pooling needs none."""
     def _modules(*mods):
         return json.dumps([
             {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
@@ -2832,8 +2760,7 @@ def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_
     assert xf._cache_can_skip_download(
         snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
-    # A bin-only Dense subfolder DEFERS under the default safetensors-preferred gate (the load could fetch
-    # 2_Dense/model.safetensors over Xet), but fast-paths when safetensors is ignored (bin is the read format).
+    # Bin-only Dense subfolder defers (safetensors could come over Xet); fast-paths when it is ignored.
     snap3, blob3 = _mk_snapshot(tmp_path, "st_dense_bin")
     (snap3 / "model.safetensors").symlink_to(blob3)
     (snap3 / "pytorch_model.bin").symlink_to(blob3)
@@ -2849,9 +2776,8 @@ def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_
 
 
 def test_post_download_rejects_sentence_transformers_missing_known_subfolder_weight(tmp_path):
-    """POST mirrors the ST subfolder guard but leniently: a KNOWN weight-bearing module (2_Dense) missing
-    its weight is rejected so it retries over HTTP, while an UNKNOWN / custom module type with no weight
-    must NOT false-reject a finished download."""
+    """Post-download mirrors the ST subfolder guard leniently: a known weight-bearing module (2_Dense) missing its
+    weight is rejected for HTTP retry; unknown module types must not false-reject."""
     def _modules(*mods):
         return json.dumps([
             {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
@@ -2923,10 +2849,9 @@ def test_post_download_rejects_canonical_only_for_variant(tmp_path):
 
 
 def test_post_accepts_nonstandard_sharded_variant_names(tmp_path):
-    """Variant analog of #889: a variant sharded with NON-standard shard names the variant-weight regex
-    misses (the format suffix kept in the middle) is enumerated through model.safetensors.index.fp16.json,
-    so the post-download gate must accept it rather than raise a spurious DownloadStallError. Shard
-    completeness is still enforced via the index: a missing shard is rejected."""
+    """Variant analog of issue 889: non-standard variant shard names (model.fp16.safetensors-00001-of-00002.safetensors)
+    missed by the variant regex must pass via model.safetensors.index.fp16.json (else a spurious DownloadStallError);
+    missing shards still fail."""
     shards = ["model.fp16.safetensors-00001-of-00002.safetensors",
               "model.fp16.safetensors-00002-of-00002.safetensors"]
     snap, blob = _mk_snapshot(tmp_path, "varnonstd")
@@ -3206,8 +3131,7 @@ def test_post_download_checks_explicit_checkpoint_shard_completeness(tmp_path):
     (snap3 / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob3)  # lone, but not read
     assert xf._download_result_usable(
         snap3, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is True
-    # A nested checkpoint the request targets (allow=['foo/checkpoint-7/*']) still rejects its lone
-    # shard: the scope check matches a checkpoint dir at any leading segment.
+    # Nested checkpoint, allow=['foo/checkpoint-7/*'], still rejects lone shard: scope matches any depth.
     snap4, blob4 = _mk_snapshot(tmp_path, "ckpt_nested")
     (snap4 / "foo" / "checkpoint-7").mkdir(parents = True)
     (snap4 / "foo" / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob4)
@@ -3455,11 +3379,8 @@ def test_post_download_rejects_incomplete_diffusers_component_shards_unpatterned
 
 
 def test_post_accepts_nonstandard_sharded_diffusers_component_names(tmp_path):
-    """Diffusers analog of issue #889: a pipeline COMPONENT (unet/) sharded with the NON-standard name that
-    keeps the format suffix in the middle (diffusion_pytorch_model.safetensors-00001-of-00002.safetensors),
-    enumerated via unet/diffusion_pytorch_model.safetensors.index.json, must be accepted rather than raise a
-    spurious DownloadStallError. The presence check reads the component index like the root does; shard
-    completeness stays the component-shard check's job, and an ignored format is not rescued."""
+    """Diffusers analog of issue 889: a unet/ component with non-standard shard names listed in its index passes the
+    presence check; shard completeness stays with the component-shard check; ignored formats are not rescued."""
     shards = ["diffusion_pytorch_model.safetensors-00001-of-00002.safetensors",
               "diffusion_pytorch_model.safetensors-00002-of-00002.safetensors"]
 
@@ -3502,10 +3423,9 @@ def test_post_accepts_nonstandard_sharded_diffusers_component_names(tmp_path):
 
 
 def test_diffusers_component_index_review_hardening(tmp_path):
-    """Hardening of the component-index presence path: (a) a component-scoped ignore matches the component's
-    OWN base (not model.*), so ignoring unet/ weights leaves the component unproven; (b) a stale malformed
-    index sidecar is not accepted as a component index; (c) a variant load accepts a canonical FALLBACK
-    index only when its shards are complete (the variant completeness pass does not validate it)."""
+    """Component-index hardening: (a) a component ignore matches its own base, not model.*, so ignoring unet/ weights
+    leaves it unproven; (b) a stale malformed index sidecar is not accepted as a component index; (c) a variant load
+    accepts a canonical fallback index only if its shards are complete."""
     nonstd = ["diffusion_pytorch_model.safetensors-00001-of-00002.safetensors",
               "diffusion_pytorch_model.safetensors-00002-of-00002.safetensors"]
 
@@ -3686,10 +3606,8 @@ def test_post_download_diffusers_variant_presence_scoped_to_declared(tmp_path):
 
 
 def test_post_download_rejects_diffusers_missing_declared_component(tmp_path):
-    """A declared weight-bearing component absent (or holding only its config) is retried over HTTP, not
-    accepted -- else the in-process pipeline load fetches the missing component over un-killable Xet. A
-    ``[null, null]`` (disabled) component and weightless components (scheduler / tokenizer) are not
-    required."""
+    """A declared weight-bearing component that is absent or config-only is retried over HTTP, else the pipeline load
+    fetches it over un-killable Xet; [null, null] and weightless components are not required."""
     def _mi():
         return json.dumps({
             "_class_name": "StableDiffusionPipeline",
@@ -3770,10 +3688,8 @@ def test_post_download_rejects_diffusers_missing_declared_component(tmp_path):
 
 
 def test_post_download_rejects_diffusers_component_dir_without_weight_or_config(tmp_path):
-    """A declared active component dir that is non-empty but holds NEITHER a config.json NOR a readable
-    weight NOR a weightless sidecar (only a stray file or a nested checkpoint) is an incomplete model
-    component -> retried over HTTP, not accepted. A weightless component (its *_config.json sidecar) still
-    passes without a weight."""
+    """A non-empty declared component dir with no config.json, readable weight or weightless *_config.json sidecar is
+    incomplete and retried over HTTP; a weightless one still passes."""
     def _mi():
         return json.dumps({
             "_class_name": "StableDiffusionPipeline",
@@ -3822,9 +3738,8 @@ def test_post_download_rejects_diffusers_component_dir_without_weight_or_config(
 
 
 def test_post_download_rejects_diffusers_component_with_only_sidecar_weight(tmp_path):
-    """A declared component whose only weight is a non-canonical sidecar (unet/adapter_model.safetensors)
-    is NOT a warm component: the pipeline still loads unet/diffusion_pytorch_model.* and would fetch it
-    over Xet. Only the canonical component weight names count."""
+    """A component whose only weight is a non-canonical sidecar (unet/adapter_model.safetensors) is not warm: the
+    pipeline loads unet/diffusion_pytorch_model.* and would fetch it over Xet."""
     snap, blob = _mk_snapshot(tmp_path, "comp_sidecar_only")
     (snap / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -3840,9 +3755,8 @@ def test_post_download_rejects_diffusers_component_with_only_sidecar_weight(tmp_
 
 
 def test_post_download_diffusers_component_weight_must_be_at_component_root(tmp_path):
-    """A component weight counts only at the component ROOT (unet/diffusion_pytorch_model.safetensors); a
-    stale NESTED file (unet/old/diffusion_pytorch_model.safetensors) must not mask a missing top-level
-    weight, else the pipeline load fetches the real component weight over Xet."""
+    """A component weight counts only at the component root (unet/diffusion_pytorch_model.safetensors); a stale nested
+    copy must not mask a missing root weight, else the load fetches it over Xet."""
     snap, blob = _mk_snapshot(tmp_path, "comp_nested_only")
     (snap / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -3859,8 +3773,7 @@ def test_post_download_diffusers_component_weight_must_be_at_component_root(tmp_
 
 
 def test_post_download_disabled_diffusers_component_shard_index_not_rejected(tmp_path):
-    """A [null, null] disabled component (safety_checker) that the pipeline does not load must not
-    force-fail a complete pipeline: a stale incomplete shard index under it is ignored by the shard check."""
+    """A [null, null] disabled component (safety_checker) is never loaded, so a stale incomplete shard index under it must not fail a complete pipeline."""
     snap, blob = _mk_snapshot(tmp_path, "disabled_comp_stale_index")
     (snap / "model_index.json").write_text(json.dumps({
         "_class_name": "StableDiffusionPipeline",
@@ -3882,9 +3795,8 @@ def test_post_download_disabled_diffusers_component_shard_index_not_rejected(tmp
 
 
 def test_post_download_subfolder_single_weight_beats_stale_index(tmp_path):
-    """In a selected subfolder, a single canonical weight is read before a same-format shard index
-    (transformers precedence), so a stale co-resident index must not false-reject the warm; a shard index
-    with no single is still required complete."""
+    """In a selected subfolder a single canonical weight is read before a same-format shard index (transformers
+    precedence), so a stale index must not false-reject; a shard index with no single weight must still be complete."""
     snap, blob = _mk_snapshot(tmp_path, "subdir_single_beats_index")
     enc = snap / "encoder"
     enc.mkdir()
@@ -3936,10 +3848,8 @@ def test_post_download_single_variant_beats_stale_variant_index(tmp_path):
 
 
 def test_post_download_variant_component_sidecar_is_not_warm(tmp_path):
-    """A variant diffusers load must count only CANONICAL component variant weights: a variant-named
-    SIDECAR (unet/adapter_model.fp16.safetensors) is not the weight the pipeline reads
-    (unet/diffusion_pytorch_model.fp16.*), so a component holding only the sidecar is retried over Xet,
-    not accepted. Mirrors the plain-branch canonical-basename filter."""
+    """A variant diffusers load counts only canonical component variant weights; a variant-named sidecar
+    (unet/adapter_model.fp16.safetensors) is retried over Xet, not accepted."""
     snap, blob = _mk_snapshot(tmp_path, "variant_comp_sidecar_only")
     (snap / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -3957,9 +3867,8 @@ def test_post_download_variant_component_sidecar_is_not_warm(tmp_path):
 
 
 def test_post_download_diffusers_component_single_beats_stale_index(tmp_path):
-    """A diffusers pipeline component reads a single canonical weight before a same-format shard index in
-    its own subfolder, so a stale co-resident index must not false-reject a complete component; a component
-    holding only a stale index (no single) is still incomplete."""
+    """A diffusers component reads a single canonical weight before a same-format shard index, so a stale co-resident
+    index must not false-reject; an index-only component stays incomplete."""
     snap, blob = _mk_snapshot(tmp_path, "diff_comp_single_beats_index")
     (snap / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -3987,9 +3896,8 @@ def test_post_download_diffusers_component_single_beats_stale_index(tmp_path):
 
 
 def test_post_download_adapter_single_beats_stale_index(tmp_path):
-    """A PEFT adapter load (allow=['adapter_model*', 'adapter_config.json']) reads a single
-    adapter_model.safetensors before a shard index, so a stale co-resident adapter_model.safetensors.index.json
-    must not false-reject the warm; a sharded adapter missing a shard is still incomplete."""
+    """A PEFT adapter load reads a single adapter_model.safetensors before its shard index, so a stale
+    adapter_model.safetensors.index.json must not false-reject; a missing shard stays incomplete."""
     snap, blob = _mk_snapshot(tmp_path, "adapter_single_beats_index")
     (snap / "adapter_config.json").write_text("{}")
     (snap / "adapter_model.safetensors").symlink_to(blob)
@@ -4011,10 +3919,8 @@ def test_post_download_adapter_single_beats_stale_index(tmp_path):
 
 
 def test_post_download_model_component_stray_sidecar_rejected(tmp_path):
-    """A declared MODEL component (unet) holding only a stray weightless sidecar (a lone
-    tokenizer_config.json), no config.json and no weight, is an incomplete component -> rejected: its
-    declared class (UNet2DConditionModel) is weight-bearing, so a stray sidecar cannot pass it as
-    weightless. A genuinely weightless component (PNDMScheduler) needs no weight."""
+    """A declared weight-bearing model component (UNet2DConditionModel) holding only a stray tokenizer_config.json, with
+    no config.json or weight, is rejected; PNDMScheduler needs no weight."""
     snap, blob = _mk_snapshot(tmp_path, "model_comp_stray_sidecar")
     (snap / "model_index.json").write_text(json.dumps({
         "_class_name": "StableDiffusionPipeline",
@@ -4039,10 +3945,8 @@ def test_post_download_model_component_stray_sidecar_rejected(tmp_path):
 
 
 def test_http_prep_empty_owned_set_scopes_to_nothing(tmp_path):
-    """An EMPTY owned-set scopes the purge to nothing (own nothing -> delete nothing). A stall that fires
-    before the child opens any partial must therefore pass ownership=None (unscoped), not the empty set, or
-    an aged pre-existing stale blob/link is stranded for the retry to inherit. Documents the semantic the
-    stall path relies on when it normalises an empty ownership set to None."""
+    """An empty owned set scopes the purge to nothing, so a stall before any partial must pass ownership=None
+    (unscoped), else stale blobs and links are stranded for the retry."""
     repo = "ztest/empty-owned"
     repo_dir = tmp_path / f"models--{repo.replace('/', '--')}"
     blobs = repo_dir / "blobs"
@@ -4654,9 +4558,7 @@ def test_http_prep_scopes_blob_cleanup_to_owned_partials(tmp_path):
 # Tiered stall detection: a hang BEFORE the first byte used to be invisible.
 
 def test_connect_phase_hang_is_detected(hf_cache):
-    """A child stuck in DNS / TLS / metadata never creates a .incomplete. The watchdog used to reset
-    its clock whenever no partial existed, so this state (a Xet download "hanging at 0%") could not
-    be detected at all; connect_timeout governs it now."""
+    """A child stuck in DNS, TLS or metadata never creates a .incomplete, so connect_timeout (not the stall clock) governs that phase."""
     calls: list[str] = []
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
@@ -4673,8 +4575,7 @@ def test_connect_phase_hang_is_detected(hf_cache):
 
 
 def test_connect_grace_is_longer_than_the_stall_trip():
-    """Metadata round trips on a congested link are legitimately slow; only the ACTIVE phase gets
-    the aggressive 30s trip."""
+    """Metadata round trips on a congested link are legitimately slow; only the active data phase gets the aggressive 30s stall trip."""
     assert xf.DEFAULT_CONNECT_TIMEOUT > xf.DEFAULT_STALL_TIMEOUT
     assert xf.DEFAULT_STALL_TIMEOUT == 30.0
     # HTTP is the fallback of last resort: killing it has nowhere left to go.
@@ -4686,8 +4587,7 @@ def test_connect_grace_is_longer_than_the_stall_trip():
     [(False, xf.DEFAULT_STALL_TIMEOUT), (True, xf.DEFAULT_HTTP_STALL_TIMEOUT)],
 )
 def test_default_stall_timeout_is_transport_aware(hf_cache, monkeypatch, xet_disabled, expected):
-    """No explicit timeout: aggressive on Xet (a stall there has somewhere to fall back to), patient
-    on HTTP (it does not)."""
+    """With no explicit timeout, Xet trips fast because it has a fallback, while HTTP uses the patient threshold because it has nowhere to fall back to."""
     defaults: dict[str, float] = {}
 
     def _record(name, default):
@@ -4716,8 +4616,7 @@ def test_stall_timeout_env_ignores_junk(monkeypatch, bad):
 
 
 def test_post_download_init_is_not_a_stall(hf_cache):
-    """Once a partial has appeared and then gone, the transfer is done: model init and lock waits
-    that follow must never be read as a stall."""
+    """Once a partial has appeared and gone, the transfer is done; model init and lock waits after it must never be read as a stall."""
     blobs = _blobs_dir(hf_cache)
     part = blobs / "finishing.incomplete"
     part.write_bytes(b"\0" * 1024)
@@ -4728,9 +4627,7 @@ def test_post_download_init_is_not_a_stall(hf_cache):
         interval = 0.05, stall_timeout = 5.0, connect_timeout = 5.0,
     )
     try:
-        # Hold the partial long enough that the watchdog thread certainly measured it once: a 0.15s
-        # hold passed on an idle box but not under a loaded suite, where the thread could first run
-        # AFTER the unlink, and a watchdog that never saw a partial cannot tell finished from never started.
+        # Hold the partial past one watchdog sample: a 0.15s hold passed idle but not under load, and an unseen partial cannot tell finished from never started.
         time.sleep(0.6)
         part.unlink()                      # download completed
         (blobs / "finishing").write_bytes(b"\0" * 1024)
@@ -4741,9 +4638,8 @@ def test_post_download_init_is_not_a_stall(hf_cache):
 
 
 def test_lock_wait_behind_a_live_peer_is_not_a_stall(hf_cache):
-    """Two callers of the same uncached file serialise on the hub's per-file lock. The waiter owns no
-    .incomplete, so in watch_new_partials_only mode it looks like a child stuck before the first byte
-    and the connect clock killed it; repo-wide growth tells the two apart."""
+    """A waiter on the hub's per-file lock owns no .incomplete, so in watch_new_partials_only mode it looks stuck
+    pre-byte; repo-wide growth tells it from a hung child."""
     blobs = _blobs_dir(hf_cache)
     peer = blobs / "held-by-the-other-writer.incomplete"
     peer.write_bytes(b"\0" * 1024)
@@ -4787,9 +4683,8 @@ def test_connect_timeout_still_trips_when_nothing_is_moving(hf_cache):
 
 
 def test_empty_partial_gets_the_connect_deadline_not_the_stall_one(hf_cache):
-    """An .incomplete created before the first byte must not consume the 30s data budget: hub/hf_xet
-    can open the destination before CAS setup finishes, so phasing on the file's existence handed a
-    healthy-but-slow connect the short deadline. Bytes mark the transition."""
+    """Phasing on an .incomplete's existence gave a slow but healthy connect the 30s data deadline, since hub/hf_xet
+    open it before CAS setup ends; bytes mark the transition."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "opened-but-empty.incomplete").write_bytes(b"")
 
@@ -4825,9 +4720,8 @@ def test_a_partial_that_stops_growing_still_trips(hf_cache):
 
 
 def test_owned_partial_is_purged_even_when_freshly_killed(hf_cache):
-    """The child we just killed leaves a ~30s-old partial and the sibling grace is 180s. Sparing it
-    made has_active_incomplete_blobs() force force_download, re-downloading every complete shard over
-    the slower transport. Uses the real prepare (the autouse fixture stubs it out)."""
+    """The killed child's fresh partial must be purged despite the 180s sibling grace; sparing it made
+    has_active_incomplete_blobs() force force_download. Uses the real prepare, not the autouse stub."""
     blobs = _blobs_dir(hf_cache)
     mine = blobs / "killed-child.incomplete"
     theirs = blobs / "live-sibling.incomplete"
@@ -4845,10 +4739,8 @@ def test_owned_partial_is_purged_even_when_freshly_killed(hf_cache):
 
 
 def test_cached_blobs_do_not_consume_the_connect_budget(hf_cache):
-    """A snapshot whose config/tokenizer are already cached is still in its connect phase. Repo-wide
-    bytes include blobs completed before this download began, so phasing on that total latched the
-    data deadline and charged a healthy CAS setup the 30s budget instead of 90s -- i.e. every resume,
-    and every snapshot where a small file landed first."""
+    """Repo-wide bytes include blobs finished before this download, so counting them latched the 30s data deadline
+    instead of the 90s connect budget on resumes and small-file-first snapshots."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "already-complete-config").write_bytes(b"\0" * 65536)  # no .incomplete suffix
     (blobs / "opened-but-empty.incomplete").write_bytes(b"")
@@ -4866,10 +4758,8 @@ def test_cached_blobs_do_not_consume_the_connect_budget(hf_cache):
 
 
 def test_a_child_buffering_from_the_network_is_not_a_stall(hf_cache, monkeypatch):
-    """xet-core writes strictly sequentially, so a thin link shows a flat partial for minutes:
-    measured at a 20 Mbit/s proxy, 431 MB arrived while the .incomplete stayed at 0.5 MB for 171
-    consecutive seconds. RSS is the sensor because /proc io rchar counts VFS reads and reqwest reads
-    sockets with recv(2), so rchar is frozen on a healthy download."""
+    """xet-core writes sequentially, so a thin link leaves the partial flat for minutes; RSS is the sensor since /proc
+    io rchar counts VFS reads and misses recv(2) socket reads."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "buffering.incomplete").write_bytes(b"\0" * 4096)
 
@@ -4934,10 +4824,8 @@ def test_the_buffering_grace_is_skipped_when_rss_is_unreadable(hf_cache, monkeyp
 
 
 def test_snapshot_lock_waiter_is_not_killed_while_a_peer_owns_the_partial(hf_cache, monkeypatch):
-    """In snapshot mode the phase signal is repo-wide, so a lock waiter inherits the PEER's bytes and
-    lands in the data branch where its own disk and RSS are flat by definition. It was killed at
-    stall_timeout and charged a Xet failure, hitting the demotion threshold on a multi-rank launch's
-    first run."""
+    """In snapshot mode the phase signal is repo-wide, so a lock waiter inherits the peer's bytes and lands in the data
+    branch with flat disk and RSS; it must not be killed while a peer owns the partial."""
     blobs = _blobs_dir(hf_cache)
     peer = blobs / "owned-by-the-writer.incomplete"
     peer.write_bytes(b"\0" * (8 * 1024 * 1024))   # peer is buffering: present, fresh, not growing
@@ -4981,10 +4869,8 @@ def test_snapshot_child_that_owns_a_frozen_partial_still_trips(hf_cache, monkeyp
 
 
 def test_a_hang_between_snapshot_files_is_detected(hf_cache):
-    """A snapshot does metadata and the cache lock BEFORE creating the next .incomplete, so "bytes
-    flowed and no partial is open" is a normal mid-download state, not only the finished one.
-    Resetting the clock there made a child hung between files invisible to both clocks forever once
-    any byte had been seen, so the connect clock only ever protected the FIRST file."""
+    """Between snapshot files a normal state is bytes flowed with no partial open; the clock must not reset there, or a
+    hang between files is invisible and only file 1 is protected."""
     blobs = _blobs_dir(hf_cache)
     part = blobs / "first-file.incomplete"
     part.write_bytes(b"\0" * 1024)
@@ -5008,10 +4894,8 @@ def test_a_hang_between_snapshot_files_is_detected(hf_cache):
 
 
 def test_single_file_lock_waiter_survives_a_buffering_peer(hf_cache):
-    """The peer's disk stays FLAT while it buffers, so growth alone cannot prove it is alive: a
-    healthy Xet transfer writes strictly sequentially and the .incomplete sat unchanged for 171s at
-    20 Mbit/s. Requiring continuous growth killed the waiter at connect_timeout while the lock holder
-    downloaded normally."""
+    """A buffering peer's disk stays flat, so growth cannot prove liveness; requiring continuous growth killed the lock
+    waiter at connect_timeout while the holder downloaded fine."""
     blobs = _blobs_dir(hf_cache)
     peer = blobs / "held-by-a-buffering-peer.incomplete"
     peer.write_bytes(b"\0" * 4096)          # present and fresh, and it never grows
@@ -5059,9 +4943,8 @@ def test_a_stale_peer_partial_does_not_mask_a_real_hang(hf_cache):
 
 
 def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monkeypatch):
-    """xet's reconstruction buffer is a process-wide budget reused across files, so episode N+1
-    refills BELOW episode N's peak. A lifetime high-water baseline made that fill invisible and
-    killed a child receiving at wire rate, on any multi-shard snapshot."""
+    """xet's reconstruction buffer is process-wide and reused across files, so each refill stays below the lifetime
+    peak; a high-water baseline hid it and killed multi-shard downloads."""
     blobs = _blobs_dir(hf_cache)
     part = blobs / "shard.incomplete"
     part.write_bytes(b"\0" * 4096)
@@ -5090,9 +4973,8 @@ def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monke
 
 
 def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
-    """Pins the decision NOT to compare consecutive samples: requiring the epsilon between polls
-    demands a sustained ~6.7 Mbit/s floor at production constants, so a slower link would false-trip
-    on its first buffering episode."""
+    """Pins that consecutive samples are not compared: requiring the epsilon between polls demands a sustained ~6.7
+    Mbit/s floor at production constants, false-tripping slower links."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "slow.incomplete").write_bytes(b"\0" * 4096)
 
@@ -5118,9 +5000,7 @@ def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
 
 
 def test_a_later_snapshot_file_gets_the_connect_deadline_too(hf_cache):
-    """The phase latch left files 2..N unprotected: once file 1 had bytes `seen_bytes` stayed true,
-    so file 2's empty .incomplete was charged the 30s data deadline with elapsed still running from
-    file 1's last write."""
+    """A later snapshot file must get the connect deadline too: a seen_bytes latch left from file 1 charged file 2's empty .incomplete the 30s data deadline."""
     blobs = _blobs_dir(hf_cache)
     first = blobs / "file-one.incomplete"
     first.write_bytes(b"\0" * 4096)
@@ -5141,10 +5021,7 @@ def test_a_later_snapshot_file_gets_the_connect_deadline_too(hf_cache):
 
 
 def test_a_slow_peers_partial_stays_live_past_the_http_stall_window(hf_cache, monkeypatch):
-    """The peer liveness window used to be max(connect_timeout, 180s), only 9s above the measured
-    171s of flat disk at 20 Mbit/s, so any slower link expired the peer mid-transfer and killed the
-    waiter -- reaching the demotion threshold on a multi-rank launch's first run. The window is the
-    suppression ceiling now."""
+    """The peer liveness window is the suppression ceiling, since a short one expired slow-link peers mid-transfer and killed their waiters."""
     import os as _os
 
     blobs = _blobs_dir(hf_cache)
@@ -5171,9 +5048,8 @@ def test_a_slow_peers_partial_stays_live_past_the_http_stall_window(hf_cache, mo
 
 
 def test_a_peer_hold_after_bytes_is_bounded_by_the_ceiling(hf_cache, monkeypatch):
-    """Widening the peer window to an hour means the mtime no longer bounds a stale leftover, so the
-    ceiling has to. The post-byte branches suppress while seen_bytes is true, exactly when the
-    pre-byte branch clears its bookkeeping, so they need a bound of their own."""
+    """With the peer window widened to an hour, mtime no longer bounds stale leftovers, so the ceiling must; post-byte
+    branches suppress while seen_bytes is true and need their own bound."""
     import os as _os
     import threading as _threading
 
@@ -5185,8 +5061,7 @@ def test_a_peer_hold_after_bytes_is_bounded_by_the_ceiling(hf_cache, monkeypatch
     peer = blobs / "peer-owned.incomplete"
     peer.write_bytes(b"\0" * (16 * 1024 * 1024))
 
-    # Keep the peer's mtime permanently fresh so only the hold ceiling under test can end the
-    # suppression, else this passes for the wrong reason.
+    # Keep the peer's mtime fresh so only the hold ceiling under test can end the suppression; otherwise the test passes for the wrong reason.
     done = _threading.Event()
 
     def _keep_fresh():
@@ -5216,15 +5091,12 @@ def test_a_peer_hold_after_bytes_is_bounded_by_the_ceiling(hf_cache, monkeypatch
 
 
 def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch):
-    """4 MiB over the 30s deadline is a 1.12 Mbit/s floor, and xet writes only at head-of-line term
-    boundaries, so under that rate the disk is flat AND the RSS gain is below the epsilon at once,
-    killing a healthy tethered-mobile or rural-DSL transfer mid-flight. Growth above the noise floor
-    but below the epsilon means receiving-but-slow and earns the patient deadline."""
+    """RSS growth above the 256 KiB noise floor but under the 4 MiB epsilon (a 1.12 Mbit/s floor over the 30s deadline)
+    means receiving-but-slow and earns the patient deadline; xet writes only at term boundaries."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "shard.incomplete").write_bytes(b"\0" * 4096)   # opened, then flat for the whole run
 
-    # 400 KiB per 0.05s tick against a 0.4s deadline: over the 256 KiB noise floor, under the 4 MiB
-    # epsilon -- the regime that used to trip.
+    # 400 KiB per 0.05s tick vs a 0.4s deadline: above the 256 KiB noise floor, below the 4 MiB epsilon, the regime that used to trip the check.
     rss = {"v": 100 * 1024 * 1024}
     monkeypatch.setattr(xf, "_child_rss", lambda _pid: rss["v"])
     monkeypatch.setattr(xf, "DEFAULT_HTTP_STALL_TIMEOUT", 30.0)
@@ -5245,9 +5117,7 @@ def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch)
 
 
 def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch):
-    """The patient deadline is for a child demonstrably receiving. Flat RSS plus flat disk means both
-    sensors say nothing is arriving, and must still fall back fast, else the slow-link fix would turn
-    every 30s stall into a 180s one."""
+    """The patient deadline is only for a child demonstrably receiving; flat RSS plus flat disk must still fall back fast, else every 30s stall becomes a 180s one."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "shard.incomplete").write_bytes(b"\0" * 4096)
 
@@ -5268,10 +5138,7 @@ def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch)
 
 
 def test_a_whole_load_caller_is_not_charged_the_connect_clock(hf_cache):
-    """Callers wrapping start_watchdog around the ENTIRE load_model see "no partial and a frozen byte
-    count" as the normal case: the repo is cached and the time goes into quantising to 4-bit. Both
-    connect trips would fire on a download that already succeeded. Only the stall clock, which needs
-    a demonstrably open partial, applies to them."""
+    """Whole-load callers on a cached repo must not trip the connect clock; only the stall clock applies."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "cached-weights").write_bytes(b"\0" * 4096)   # fully cached, nothing in flight
 
@@ -5289,8 +5156,7 @@ def test_a_whole_load_caller_is_not_charged_the_connect_clock(hf_cache):
 
 
 def test_an_exited_child_is_finalising_not_hung(hf_cache):
-    """An exited downloader cannot be wedged and its exit code is what the ladder acts on; tripping
-    would kill a dead process group and charge the machine a Xet failure it did not earn."""
+    """An exited child is finalising, not hung: tripping would kill a dead group and charge Xet unearned."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "done").write_bytes(b"\0" * 4096)
 
@@ -5311,9 +5177,7 @@ def test_an_exited_child_is_finalising_not_hung(hf_cache):
 
 
 def test_peer_liveness_cannot_suppress_the_clock_forever(hf_cache, monkeypatch):
-    """The parent cannot tell which blob its child waits for, so peer liveness is approximate: a
-    continuous series of UNRELATED same-repo downloads reset the connect clock on every tick and a
-    genuinely hung child never fell back. The ceiling bounds that approximation."""
+    """Unrelated same-repo downloads can reset the connect clock; PEER_SUPPRESSION_CEILING bounds that."""
     monkeypatch.setattr(xf, "PEER_SUPPRESSION_CEILING", 0.5)
     blobs = _blobs_dir(hf_cache)
     monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set())
@@ -5343,9 +5207,7 @@ def test_peer_liveness_cannot_suppress_the_clock_forever(hf_cache, monkeypatch):
 
 
 def test_a_seeded_parent_still_hands_the_child_its_own_disks_numbers(monkeypatch, tmp_path):
-    """The real parent has already sized itself at import, so its environment carries a buffer limit
-    computed for the global cache. Because the pre-spawn call is setdefault, that stale number would
-    survive into the child unless our own seeded values are dropped first."""
+    """Import-time buffer sizing is for the global cache; drop seeded values first or setdefault keeps it."""
     import collections
     import os
     import shutil
@@ -5392,10 +5254,7 @@ def test_a_seeded_parent_still_hands_the_child_its_own_disks_numbers(monkeypatch
 
 
 def test_a_concurrent_spawns_overlay_is_not_read_as_the_users_own_settings(monkeypatch, tmp_path):
-    """The spawn window puts the child's ``HF_XET_*`` into the parent environment for the duration of
-    ``proc.start()``. Sizing from a copy taken outside the lock can catch that overlay, and since
-    those values are not the ones we seeded they read as explicit user settings, so setdefault keeps
-    them and this child is left with the import-time sizing instead of its own destination's."""
+    """Read env under the spawn lock, or the child's HF_XET_* overlay is taken for user settings."""
     import collections
     import shutil
     import threading
@@ -5462,13 +5321,8 @@ def test_a_concurrent_spawns_overlay_is_not_read_as_the_users_own_settings(monke
 
 
 def test_http_retry_backoff_rejects_non_finite_and_clamps(monkeypatch):
-    """nan / inf survive a `value < 0` test but not time.sleep or Event.wait.
-
-    nan raises ValueError, inf raises OverflowError, and a merely huge value exceeds Windows'
-    ~49.7 day PY_TIMEOUT_MAX and raises OverflowError there. None of those is a DownloadStallError,
-    so an escaping one is swallowed by the caller as "continuing with the normal load" -- exactly the
-    fall-through DownloadTransportError exists to prevent.
-    """
+    """nan/inf pass a value<0 check but break time.sleep and Event.wait; huge values exceed Windows PY_TIMEOUT_MAX; an
+    escaping error is swallowed as a normal load, which DownloadTransportError exists to prevent."""
     for raw in ("nan", "NaN", "inf", "-inf", "Infinity", "1e999"):
         monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", raw)
         assert xf._http_retry_backoff() == xf.DEFAULT_HTTP_RETRY_BACKOFF, raw
@@ -5485,8 +5339,7 @@ def test_http_retry_backoff_rejects_non_finite_and_clamps(monkeypatch):
 
 
 def test_env_seconds_rejects_non_finite(monkeypatch):
-    """Same hole in the shared timeout parser: nan makes every deadline comparison False, so the
-    watchdog would never fire, and inf raises OverflowError inside the wait."""
+    """nan makes every deadline comparison False, so the watchdog never fires; inf raises OverflowError."""
     for raw in ("nan", "inf", "-inf"):
         monkeypatch.setenv("UNSLOTH_XET_STALL_TIMEOUT", raw)
         assert xf._env_seconds("UNSLOTH_XET_STALL_TIMEOUT", 30.0) == 30.0, raw
@@ -5495,13 +5348,7 @@ def test_env_seconds_rejects_non_finite(monkeypatch):
 
 
 def test_a_proven_stall_outranks_a_later_unproven_fault(monkeypatch):
-    """One reason slot, two kinds of evidence: a stall was proven by the watchdog on this machine, a
-    fault only counts once HTTP shows the network was fine. A fault must not overwrite a stall, or
-    the both-rungs-failed exit drops it and a genuinely stalling machine is never demoted.
-
-    Reachable exactly as the degraded CDN this ladder targets: Xet stalls, the Xet retry hits the CAS
-    fault, HTTP then fails too.
-    """
+    """A later unproven fault must not overwrite a proven stall, or the both-rungs-failed exit drops it."""
     outcomes = []
     monkeypatch.setattr(
         xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append((ok, reason))
@@ -5545,9 +5392,7 @@ def test_a_proven_stall_survives_a_crash_on_the_second_xet_child(monkeypatch):
     ],
 )
 def test_cancel_wins_over_every_failure_verdict(monkeypatch, verdict, payload):
-    """Cancellation precedence has to be uniform. Per-branch checks meant a cancel landing on a
-    transient HTTP error reported Cancelled while the same cancel landing on a stall or a
-    deterministic error reported the download's own failure instead."""
+    """Cancel must win over every failure verdict; per-branch checks let a stall or hard error mask it."""
     outcomes = []
     monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
     cancel = threading.Event()
@@ -5586,10 +5431,7 @@ def test_cancel_skips_the_destructive_pre_http_purge(monkeypatch):
 
 
 def test_unknown_terminal_error_after_a_transport_fault_stays_guard_class(monkeypatch):
-    """An unrecognized error cannot be rebuilt by _raise_child_error, so it leaves as a bare
-    RuntimeError -- which the caller's `except DownloadStallError` misses, sending a transport that
-    just failed on both rungs into the unguarded in-process load. That is #1122 one rung further
-    along, so once a transport fault is established the terminal error stays inside the guard."""
+    """Unrecognized error after a transport fault must stay DownloadStallError, not RuntimeError (1122)."""
     _install(monkeypatch, [
         ("retryable_error", "RuntimeError: CAS Client Error"),
         ("error", "SomeBrandNewHubError: unrecognized"),
@@ -5611,9 +5453,7 @@ def test_a_known_deterministic_error_still_preserves_its_type(monkeypatch):
 
 
 def test_local_oserror_under_the_xet_cache_dir_is_deterministic():
-    """str(OSError) embeds the FILENAME, and the Xet cache lives at ~/.cache/huggingface/xet/, so a
-    text scan reads a local permission error there as a transient 'xet' transport fault. Builtin
-    OSErrors are decided by class instead."""
+    """Builtin OSErrors are judged by class: str(OSError) embeds the path, which contains 'xet'."""
     denied = PermissionError(
         13, "Permission denied", "/home/u/.cache/huggingface/xet/chunk-cache/ab/cd"
     )
@@ -5639,20 +5479,13 @@ def test_local_oserror_under_the_xet_cache_dir_is_deterministic():
 
 
 def test_control_flow_exceptions_are_never_transport_faults():
-    """The child reports through `except BaseException`, so an interpreter shutdown reaches the
-    classifier. The rung default would call it retryable and spend an HTTP child plus the destructive
-    pre-HTTP purge because someone asked the process to stop."""
+    """Interpreter shutdown must never count as a transport fault, or the rung retries it and purges."""
     for exc in (KeyboardInterrupt(), SystemExit(1), GeneratorExit()):
         assert xf._is_retryable_download_error(exc, on_xet = True) is False, exc
         assert xf._is_retryable_download_error(exc, on_xet = False) is False, exc
 
 def _stall_then_fault_then(monkeypatch, final):
-    """Xet stalls, a Xet retry faults, and the ladder ends on HTTP with *final*.
-
-    The stall is PROVEN: the watchdog saw no progress on this machine, so it is charged whichever
-    door the ladder finally leaves by. The fault that follows it is unproven and must not displace
-    it. This shape is the degraded CDN the ladder exists for.
-    """
+    """Proven stall is charged whichever door ends the ladder; later unproven faults must not displace it."""
     outcomes = []
     monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "2")
     monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "1")
@@ -5665,11 +5498,7 @@ def _stall_then_fault_then(monkeypatch, final):
 
 
 def test_a_proven_stall_is_charged_when_http_also_returns_an_incomplete_snapshot(monkeypatch):
-    """A terminal HTTP incomplete snapshot must not swallow a stall proven on this machine.
-
-    Dropping it means an actually stalling machine never reaches the tracker's two-failure demotion
-    threshold, so every later download keeps paying the full Xet stall timeout before falling back.
-    """
+    """Terminal HTTP incomplete snapshot must not swallow a proven stall, or Xet demotion never triggers."""
     monkeypatch.setattr(xf, "_snapshot_payload_incomplete", lambda p, **k: p == "INCOMPLETE")
     outcomes = _stall_then_fault_then(monkeypatch, ("ok", "INCOMPLETE"))
     with pytest.raises(xf.DownloadStallError):
@@ -5686,9 +5515,7 @@ def test_a_proven_stall_is_charged_when_http_stalls_too(monkeypatch):
 
 
 def test_an_unproven_failure_is_still_dropped_on_those_same_doors(monkeypatch):
-    """The counterpart, and the reason the flush is conditional: with no stall anywhere, a fault
-    that hit BOTH rungs is a degraded CDN, not a bad Xet path on this machine, so it stays unproven
-    and the tracker is not charged."""
+    """With no stall, a fault on both rungs is a degraded CDN, not a bad Xet path: unproven, not charged."""
     outcomes = []
     monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "2")
     monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "1")
@@ -5702,13 +5529,7 @@ def test_an_unproven_failure_is_still_dropped_on_those_same_doors(monkeypatch):
     assert outcomes == [], "a fault both rungs met is not evidence against this machine's Xet"
 
 def test_a_partial_the_purge_could_not_scope_still_holds_the_latch(monkeypatch, tmp_path):
-    """The unsafe set is UNSCOPED, and scoping it by the purge's owned-blob set is backwards.
-
-    The purge skips every blob outside that set, so the partials that SURVIVE it are exactly the
-    ones outside it, and they are why has_active_incomplete_blobs() returned True in the first
-    place. Filtering them out empties the unsafe set and hands the next HTTP child a sparse partial
-    to resume, which finalizes a silently corrupt blob. Real cache layout, real scan.
-    """
+    """Unsafe set must stay unscoped; scoping by owned blobs drops the surviving partials a child resumes."""
     blobs = tmp_path / xf.repo_cache_dir_name("model", DL_REPO) / "blobs"
     blobs.mkdir(parents = True)
     # Left by an earlier crashed run: not owned by this download's child, so the purge spares it.
@@ -5748,12 +5569,7 @@ def _sparse(path, size = 64 * 1024 * 1024):
 
 
 def _repo_cache(tmp_path, monkeypatch, repo_id = "o/r"):
-    """A real cache layout for *repo_id*, with the scan pointed at it.
-
-    Deliberately a real directory tree rather than a stubbed iterator: the scan does its own
-    single-listing repo-dir selection so an OSError there cannot be swallowed, and stubbing that
-    out would silently stop exercising it.
-    """
+    """Real directory tree, not a stub, so the scan's own single-listing repo-dir selection really runs."""
     blobs = tmp_path / xf.repo_cache_dir_name("model", repo_id) / "blobs"
     blobs.mkdir(parents = True)
     monkeypatch.setattr(xf, "hf_cache_root", lambda *a, **k: tmp_path)
@@ -5761,13 +5577,7 @@ def _repo_cache(tmp_path, monkeypatch, repo_id = "o/r"):
 
 
 def test_an_unreadable_cache_root_reports_unknown_not_empty(tmp_path, monkeypatch):
-    """The half that has to be fail-CLOSED, and the trap under it.
-
-    ``hf_cache_root`` and ``_case_safe_repo_cache_dirs`` both swallow ``OSError`` and report an
-    unreadable or briefly absent root as "no directories", which reads as "every partial vanished".
-    A root that disappears after the guard engaged is a remount or a permission flap, not proof, so
-    the scan has to probe the root itself.
-    """
+    """Unreadable cache root must count as unknown, not empty, since hf_cache_root swallows OSError."""
     _repo_cache(tmp_path, monkeypatch)
     assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) == set()
 
@@ -5785,20 +5595,7 @@ def test_an_unreadable_cache_root_reports_unknown_not_empty(tmp_path, monkeypatc
 
 
 def test_a_surviving_partial_holds_the_latch_however_whole_it_looks(tmp_path, monkeypatch):
-    """Absence is the only evidence the guard accepts, and this is why.
-
-    Three ways of judging a partial that is still on disk to be a safe prefix were tried here and
-    each released the guard on a real filesystem: the basename, which cannot tell the sparse Xet
-    partial from the resumable one huggingface_hub rewrites at the same path; the inode, which is
-    unstable on overlayfs and FUSE caches, absent from some Windows stats, reusable after an unlink,
-    and identical in shape to what a same-repo sibling's own Xet retry produces; and allocation
-    metadata, which is worse still, because XFS turns speculative preallocation into unwritten
-    extents that are counted in st_blocks and read back as zeros.
-
-    So a partial that is present holds the latch no matter how complete it looks. Getting this wrong
-    installs a zero-filled file under its sha256 blob name with no error at all, because the HTTP
-    path verifies size and not content.
-    """
+    """A present partial holds the guard however whole it looks; HTTP verifies size, not content."""
     blobs = _repo_cache(tmp_path, monkeypatch, DL_REPO)
     # Fully allocated, no holes, indistinguishable from a good prefix by any allocation test.
     whole = blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}"
@@ -5826,13 +5623,7 @@ def test_a_surviving_partial_holds_the_latch_however_whole_it_looks(tmp_path, mo
 
 
 def test_the_repo_dir_scan_fails_closed_when_the_root_flaps(tmp_path, monkeypatch):
-    """One root listing, and any error out of it is reported as unknown.
-
-    The scan used to probe the root and then hand the repo-dir selection to a helper that lists the
-    root AGAIN and swallows OSError. A permission flap or a FUSE/network remount between the two
-    listings therefore came back as "no repo dirs", then as "no partials" -- the empty set that
-    releases the guard and lets the next child resume a sparse partial.
-    """
+    """Root listed once; any error reports unknown, since a re-listing could flap and release the guard."""
     blobs = _repo_cache(tmp_path, monkeypatch)
     (blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}").write_bytes(b"x")
     assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) is not None
@@ -5864,12 +5655,7 @@ def test_the_repo_dir_scan_fails_closed_when_the_root_flaps(tmp_path, monkeypatc
 
 
 def test_a_partial_appearing_after_a_release_re_arms_the_guard(tmp_path, monkeypatch):
-    """The guard has to re-arm, not just release once.
-
-    A concurrent Xet downloader can create a partial under the same blob name after the guard
-    released, typically while this child is still waiting on the blob lock. Releasing permanently on
-    the first empty scan let that child resume it unforced and finalize a corrupt blob.
-    """
+    """Guard must re-arm: a partial reappearing after a release holds it again, or it is resumed unforced."""
     blobs = _repo_cache(tmp_path, monkeypatch, DL_REPO)
     partial = blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}"
     partial.write_bytes(b"x" * 16)
@@ -5882,8 +5668,8 @@ def test_a_partial_appearing_after_a_release_re_arms_the_guard(tmp_path, monkeyp
     real = xf._incomplete_partial_names
 
     def _staged(*a, **k):
-        # Staged on the HTTP CHILD, not the probe: the transition probes the cache too.
-        # Gone by the second HTTP child (the guard releases), then a sibling recreates it.
+        # Staged on the HTTP child, not the probe (the transition also probes the cache); gone by the second HTTP child
+        # (guard releases), then a sibling recreates it.
         http_children = len([c for c in fake.calls if c.disable_xet])
         if http_children == 1 and partial.exists():
             partial.unlink()
@@ -5907,10 +5693,7 @@ def test_a_partial_appearing_after_a_release_re_arms_the_guard(tmp_path, monkeyp
 
 
 def test_hub_short_download_error_spends_the_http_retry_budget():
-    """huggingface_hub raises a bare EnvironmentError when a download ends at the wrong length, and
-    its own message says it is usually a network issue and to retry. Deciding builtin OSErrors by
-    class alone surfaced it immediately, so the HTTP retry budget this PR adds never applied to the
-    one failure it most obviously covers."""
+    """A bare EnvironmentError for a short download must spend the HTTP retry budget, not fail at once."""
     msg = (
         "Consistency check failed: file should be of size 100 but has size 40 (model.safetensors).\n"
         "This is usually due to network issues while downloading the file. "
@@ -5936,13 +5719,7 @@ def _held_then_http(monkeypatch, first, http_first):
 
 
 def test_an_http_crash_clears_an_unproven_xet_reason(monkeypatch):
-    """The symmetric case to the transient-HTTP-error branch, and it was missed.
-
-    Once HTTP has died the same way, the incident is shown to have hit both rungs, so it is not
-    evidence against this machine's Xet. Clearing only at the terminal exit meant a later HTTP retry
-    succeeding flushed the held reason and charged Xet, and two such downloads demote a healthy
-    machine to HTTP for 24 hours.
-    """
+    """An HTTP crash must clear an unproven Xet reason, so a later retry cannot charge Xet for it."""
     outcomes = _held_then_http(
         monkeypatch, ("retryable_error", "503"), ("crashed", "exited (code=-9) without a result")
     )
@@ -5961,8 +5738,7 @@ def test_an_http_crash_after_a_xet_crash_also_clears(monkeypatch):
 
 
 def test_an_http_crash_does_not_clear_a_proven_stall(monkeypatch):
-    """The counterpart that keeps the clearing honest: a stall the watchdog proved on this machine
-    is not unproven, so an HTTP crash afterwards must not discard it."""
+    """A watchdog-proven stall is not unproven, so a later HTTP crash must not discard it."""
     outcomes = _held_then_http(
         monkeypatch, ("stall", "no progress for 30s after 1.2 GB"),
         ("crashed", "exited (code=-9) without a result"),
@@ -5972,8 +5748,7 @@ def test_an_http_crash_does_not_clear_a_proven_stall(monkeypatch):
 
 
 def test_a_lone_xet_fault_rescued_by_http_is_still_charged(monkeypatch):
-    """And the control: with no matching HTTP failure, an HTTP success IS the proof that only the
-    Xet path was broken, so the tracker is charged exactly as before."""
+    """An HTTP success after a lone Xet fault proves only Xet broke, so the tracker is still charged."""
     outcomes = _held_then_http(
         monkeypatch, ("retryable_error", "503"), ("ok", "/cache/x")
     )
@@ -6003,20 +5778,14 @@ def _unknown_on_http(monkeypatch, *, health_demote = False, user_disable = False
 
 
 def test_a_health_demotion_to_http_keeps_unknown_errors_inside_the_guard(monkeypatch):
-    """The health tracker can put a machine on HTTP before the ladder starts, and that demotion is
-    internal to this module. The caller's in-process fallback therefore still has Xet ENABLED, so
-    letting a bare RuntimeError escape there reproduces the unguarded hang this PR exists to stop.
-    Scoping the wrap by whether THIS ladder used Xet missed it."""
+    """Health demotion leaves Xet enabled for the caller's fallback, so unknown errors must stay wrapped."""
     _unknown_on_http(monkeypatch, health_demote = True)
     with pytest.raises(xf.DownloadStallError):
         xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
 
 
 def test_an_explicit_user_disable_still_surfaces_unknown_errors_unchanged(monkeypatch):
-    """The counterpart, and the reason the wrap is scoped rather than universal: a user-level
-    disable is an environment variable the in-process load inherits, so its fallback really is
-    Xet-free and can still be allowed to run. Wrapping here would turn a load that currently
-    succeeds into a hard failure."""
+    """Inherited user-level disable keeps the in-process fallback Xet-free, so it must not be wrapped."""
     _unknown_on_http(monkeypatch, user_disable = True)
     with pytest.raises(RuntimeError) as exc:
         xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)

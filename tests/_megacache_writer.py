@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""One Mega-cache writer process for test_compile_cache_concurrency.py.
-
-argv: compile_cache.py path, cache root, comma-separated artifact keys, pause
-point ("" | "after_read" | "before_manifest"), sync dir. Fakes torch's artifact
-manager (bundle = sorted JSON list of [type, key]) so no torch is imported.
-When paused it writes ``<sync>/paused`` and waits for ``<sync>/go``; every
-writer writes ``<sync>/entered.<pid>`` as it enters megacache_save."""
+"""Mega-cache writer process for test_compile_cache_concurrency.py; fakes torch's artifact manager (no torch import)
+and, when paused, waits for <sync>/go after writing <sync>/paused; every writer writes <sync>/entered.<pid> on
+entering megacache_save."""
 
 import importlib.util
 import json
@@ -33,8 +29,7 @@ class CacheArtifactManager:
 
 
 def save_cache_artifacts():
-    # Like torch: move what was recorded (incl. merged) into the appending
-    # serializer and return everything serialized so far.
+    # Like torch: moves what was recorded (incl. merged) into the appending serializer and returns everything serialized so far.
     manager = CacheArtifactManager
     for items in manager._new_cache_artifacts.values():
         manager._serialized.extend(items)

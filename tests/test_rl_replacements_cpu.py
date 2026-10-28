@@ -6,34 +6,8 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""CPU-pure unit tests for `unsloth_zoo.rl_replacements`.
-
-The GRPO replacement helpers are normally exercised inside a torch.compile'd
-GRPO step on GPU. Several are pure-torch shape ops with well-defined IO
-contracts; this pins them with tiny CPU fixtures so refactors can't silently
-break the contract.
-
-Covers:
-  - `calculate_pad_tokens_in_prompt` (left-pad counter)
-  - `create_completion_attention_mask` (0/1 mask after slicing prompt off)
-  - `left_pack_padding` (stable sort that moves pad tokens to the right)
-  - `align_logprobs_with_mask` (insert per-batch left padding into logprobs)
-  - `sanitize_logprob` (filter NaN logprob values from vLLM outputs)
-  - `_warn_unsupported_grpo_options` (warn-once for ignored TRL GRPO options:
-    top_entropy_quantile; use_bias_correction_kl is supported so it must not warn)
-  - the GRPO k3 KL clamp (log-ratio to [-20, 20], k3 to [-10, 10]) matches verl
-    `low_var_kl` / SkyRL `k3` in loss, mean_kl and gradient; with bias correction the
-    [-10, 10] clamp applies to the weighted term, so a saturated KL never pushes away from ref
-  - `grpo_compute_loss` with `use_bias_correction_kl=True` (KL x importance-sampling
-    ratio, TRL GRPOConfig.use_bias_correction_kl) matches an inline TRL-mirror
-    reference in loss, gradient and mean_kl for token and sequence IS levels
-  - `_warn_deprecated_n_chunks` (warn-once that unsloth_num_chunks has no effect)
-  - `UnslothEfficientGRPO` on the single-chunk path (the only path
-    grpo_accumulated_loss uses) matches a naive grpo_compute_loss pass in loss
-    and gradient for every loss type
-  - `RL_REPLACEMENTS` dict integrity (every value is callable; the
-    well-known public-API keys are populated).
-"""
+"""CPU-pure tests pinning unsloth_zoo.rl_replacements GRPO helpers: shape and mask contracts, warn-once options, k3 and
+bias-corrected KL clamps, loss and gradient vs TRL-mirror and naive references, RL_REPLACEMENTS keys."""
 
 from __future__ import annotations
 
@@ -124,8 +98,8 @@ def test_grpo_kl_clamp_follows_bias_correction_before_beta(use_bias_correction_k
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_grpo_saturated_bias_corrected_kl_descends_true_reverse_kl(dtype):
-    # Two outcomes, on-policy: the expected gradient must point the same way as the exact
-    # reverse KL's. Clamping k3 before the ratio left 10 * grad(ratio) on the saturated outcome.
+    # Two outcomes, on-policy: the expected gradient must point the same way as the exact reverse KL's; clamping k3
+    # before the ratio left 10 * grad(ratio) on the saturated outcome.
     beta, p_ref, p_pol = 0.01, [0.8, 0.2], [0.04, 0.96]
     logits = torch.tensor(p_pol, dtype=dtype).log().requires_grad_()
     grad = torch.zeros_like(logits)
@@ -174,8 +148,7 @@ def test_grpo_sequence_level_beta_zero_mean_kl_still_zero():
 
 def test_calculate_pad_tokens_in_prompt_counts_left_pads():
     PAD = 0
-    # batch=2, seq_len=6, logits_to_keep=3 -> prompt_section is the
-    # first 3 cols. Row 0 has 3 pads, row 1 has 1 pad.
+    # batch=2, seq_len=6, logits_to_keep=3: prompt_section is the first 3 cols; row 0 has 3 pads, row 1 has 1 pad.
     input_ids = torch.tensor(
         [
             [PAD, PAD, PAD, 7, 8, 9],
@@ -197,10 +170,8 @@ def test_calculate_pad_tokens_in_prompt_rejects_invalid_keep():
 
 def test_create_completion_attention_mask_zeros_left_prompt_and_right_pads():
     PAD = 0
-    # batch=2, completion_len=6. left_pad_tokens_per_prompt says
-    # row 0 had 0 left pads, row 1 had 2 left pads. max_left_pad=3
-    # means we need to also zero out an extra (max - row_pad) leading
-    # cols on each row.
+    # batch=2, completion_len=6; left_pad_tokens_per_prompt gives row 0 zero and row 1 two left pads; max_left_pad=3
+    # means zeroing (max - row_pad) extra leading cols per row.
     completion_input_ids = torch.tensor(
         [
             [10, 11, 12, 13,  PAD, PAD],
@@ -240,10 +211,8 @@ def test_left_pack_padding_idempotent_on_already_packed():
 
 
 def test_align_logprobs_with_mask_inserts_per_row_left_padding():
-    # Each row's left-pad count in attention_mask determines where
-    # the row's logprob block starts in the output tensor.
-    # row 0: attention_mask has 1 leading 0 then 3 ones; logprob_seq_len=2.
-    # row 1: attention_mask has 0 leading 0s then 4 ones; logprob_seq_len=2.
+    # Each row's left-pad count in attention_mask sets where its logprob block starts: row 0 has 1 leading 0 then 3
+    # ones, row 1 has none; logprob_seq_len=2 for both.
     attention_mask = torch.tensor(
         [
             [0, 1, 1, 1],
@@ -278,15 +247,7 @@ def test_sanitize_logprob_returns_none_for_nan():
 
 
 def test_RL_REPLACEMENTS_values_are_callables_or_source_strings():
-    """`RL_REPLACEMENTS` mixes two kinds of values:
-
-      - callables (regular Python functions) used by direct callers,
-      - source strings (raw `def ...` text) that the compiler
-        injects verbatim into a generated module at compile time.
-
-    Both are valid; what's NOT valid is `None`, an int, a torch
-    tensor, etc. -- any other type would mean a registration bug.
-    """
+    """RL_REPLACEMENTS values are callables or raw `def` source strings injected into generated modules; None, ints or tensors would be a registration bug."""
     table = rr.RL_REPLACEMENTS
     assert isinstance(table, dict)
     assert len(table) >= 5, (
@@ -301,8 +262,7 @@ def test_RL_REPLACEMENTS_values_are_callables_or_source_strings():
 
 
 def test_RL_REPLACEMENTS_contains_public_api_keys():
-    # The known-good keys that downstream unsloth + Unsloth code calls
-    # by name. If any of these go missing the consumer side breaks.
+    # Keys that downstream unsloth and Unsloth code calls by name; if any goes missing the consumer side breaks.
     expected = {
         "calculate_pad_tokens_in_prompt",
         "create_completion_attention_mask",
@@ -430,8 +390,8 @@ def test_grpo_accumulated_loss_does_not_forward_n_chunks():
     assert "n_chunks" not in apply_args
 
 
-# unsloth text-copies these bodies into its generated trainer cache, so a new cache can
-# run against an older unsloth_zoo with neither helper: the calls must no-op, not raise.
+# unsloth text-copies these bodies into its generated trainer cache, so a new cache can run against an older unsloth_zoo
+# lacking them; the calls must no-op, not raise.
 
 
 def _helper_call_snippets():
@@ -687,8 +647,8 @@ def test_grpo_generation_normalizer_covers_one_accumulation_window(
     torch.testing.assert_close(accumulated, expected)
 
 
-# Per TRL _compute_loss (main @ f782735): kl_i *= the pre-clamp non-detached coef_1,
-# before the loss_type dispatch, feeding both the beta term and the kl metric.
+# Per TRL _compute_loss (main @ f782735): kl_i is multiplied by the pre-clamp non-detached coef_1 before loss_type
+# dispatch, feeding the beta term and the kl metric.
 
 
 def _trl_mirror_grpo_loss(
@@ -712,8 +672,7 @@ def _trl_mirror_grpo_loss(
     coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
     per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
     if vllm_is_ratio is not None:
-        # TRL v1.12.0 grpo_trainer.py:3236 then :3239 - the vLLM ratio scales the policy
-        # term only, and the KL is added after it.
+        # TRL v1.12.0 grpo_trainer.py:3236 then :3239: the vLLM ratio scales the policy term only, and the KL is added after it.
         per_token_loss = per_token_loss * vllm_is_ratio
     per_token_loss = per_token_loss + beta * per_token_kl
     loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
@@ -724,17 +683,16 @@ def _trl_mirror_grpo_loss(
 @pytest.mark.parametrize("mode", ["sequence_mask", "token_truncate"])
 @pytest.mark.parametrize("use_bias_correction_kl", [False, True])
 def test_bias_correction_kl_is_not_scaled_by_the_vllm_ratio(mode, use_bias_correction_kl):
-    # fast_inference=True feeds sampling_per_token_logps, and the vLLM ratio must reach
-    # the policy term only. Multiplying the corrected KL by it too would apply the
-    # correction twice with the wrong ratio.
+    # fast_inference=True feeds sampling_per_token_logps; the vLLM ratio must reach only the policy term, since
+    # multiplying the corrected KL too applies the correction twice with the wrong ratio.
     beta = 0.04
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
     sampling = old - 0.3 * torch.randn(old.shape, generator=torch.Generator().manual_seed(5),
                                        dtype=old.dtype)
     kwargs.update(
         use_vllm=True,
-        # The ratio is applied only when the correction is on: the off-policy mask consumes the
-        # same sampling logprobs with the correction off, so this states which one is under test.
+        # The ratio applies only when the correction is on; the off-policy mask consumes the same sampling logprobs with
+        # the correction off, so this states which path is under test.
         vllm_importance_sampling_correction=True,
         vllm_importance_sampling_mode=mode,
         vllm_importance_sampling_clip_min=0.0,
@@ -1052,8 +1010,7 @@ def test_offloaded_recompute_weight_grad_not_double_counted(shared, preexisting)
     assert not torch.allclose(_weight_grad(buggy.apply, shared, preexisting), ref, atol=1e-4)
 
 
-# backward's event wait is load-bearing: the pinned non_blocking copy races
-# without it.
+# backward's event wait is load-bearing: without it the pinned non_blocking copy races.
 
 
 def _eager_selective_log_softmax(hidden_states, lm_head, index, chunks,
@@ -1134,9 +1091,8 @@ def test_offloaded_log_softmax_pinned_offload_is_event_synced_and_guarded():
 @pytest.mark.parametrize(
     "vendor,hip_version,device,expect",
     [
-        # torch.cuda is also the HIP backend, so ROCm reports device.type "cuda"
-        # and needs no branch of its own; see gradient_checkpointing.py, which
-        # likewise treats DEVICE_TYPE in ("cuda", "hip") identically.
+        # torch.cuda is also the HIP backend, so ROCm reports device.type "cuda" with no branch needed;
+        # gradient_checkpointing.py treats DEVICE_TYPE in ("cuda", "hip") alike.
         ("nvidia", None, "cuda", "torch.cuda"),
         ("amd_rocm", "6.2.41134", "cuda", "torch.cuda"),
         ("intel", None, "xpu", "torch.xpu"),
@@ -1160,12 +1116,8 @@ def test_offloaded_log_softmax_stream_module_dispatch(monkeypatch, vendor, hip_v
 
 
 def test_offloaded_log_softmax_releases_clone_before_forward_compute():
-    # hidden_states is normally a [:, :-1, :] slice, so .contiguous() allocates a
-    # full copy. Holding it across the no-grad log-softmax would keep it resident
-    # alongside the chunk logits and raise the forward-phase peak; measured at
-    # +0.376 GiB on an 8x8192x4096 bf16 chunk before this ordering was fixed.
-    # record_stream still blocks reuse until the D2H lands, so dropping the
-    # reference early is safe.
+    # hidden_states is a [:, :-1, :] slice, so .contiguous() copies it; holding that copy across the no-grad forward
+    # raises the forward peak; record_stream blocks reuse until the D2H lands, so the early del is safe.
     block = _offloaded_block_source()
     released = block.index("del detached_hidden_states")
     compute = block.index("with torch.no_grad():")
@@ -1181,13 +1133,11 @@ def test_offloaded_log_softmax_stream_module_accepts_tensor_or_device():
 
 
 def test_offloaded_log_softmax_never_retains_hidden_states_on_gpu():
-    # The caller is already memory bound, so retaining hidden states on device
-    # would raise the free VRAM needed to finish a step.
+    # The caller is already memory bound, so retaining hidden states on device would raise the free VRAM needed to finish a step.
     block = _offloaded_block_source()
     assigns = [ln.strip() for ln in block.splitlines()
                if "saved_hidden_states =" in ln and "ctx.saved_hidden_states" not in ln]
-    # Any number of "= None" resets is fine; what matters is that the only values
-    # ever stored are the pinned host buffer and the CPU copy, never the device tensor.
+    # Any number of "= None" resets is fine; the only values ever stored are the pinned host buffer and the CPU copy, never the device tensor.
     stored = [a for a in assigns if a != "saved_hidden_states = None"]
     assert stored == [
         "saved_hidden_states = pinned_buffer",
@@ -1200,9 +1150,8 @@ def test_offloaded_log_softmax_never_retains_hidden_states_on_gpu():
 
 @pytest.mark.parametrize("head", ["leaf", "nonleaf"])
 def test_offloaded_log_softmax_runs_head_hook_once(head):
-    # A Tensor.register_hook fires for tensors named in autograd.grad's `inputs`,
-    # so recomputing against the real lm_head would apply a user's grad mask or
-    # scaler twice. The recompute must use a private detached leaf.
+    # Tensor.register_hook fires for tensors named in autograd.grad inputs, so recomputing with the real lm_head would
+    # apply a user's grad mask or scaler twice; use a private detached leaf.
     Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
     args = (4, 0.0, 0.0, 0.0, 1.0)
 
@@ -1289,10 +1238,8 @@ def test_offloaded_log_softmax_recompute_keeps_autocast_off_when_forward_had_non
 
 
 
-# get_off_policy_mask adapter: TRL renamed its 3rd parameter old_per_token_logps ->
-# sampling_per_token_logps in 0.27.1 (huggingface/trl#4857), so the old hardcoded keyword
-# crashed on TRL >= 0.27.1. grpo_compute_loss now passes a version-stable keyword that
-# grpo_accumulated_loss adapts to the installed parameter name.
+# get_off_policy_mask adapter: TRL renamed its 3rd parameter old_per_token_logps to sampling_per_token_logps in 0.27.1
+# (huggingface/trl 4857); the old hardcoded keyword crashes on TRL >= 0.27.1, so grpo_accumulated_loss adapts the name.
 
 
 def test_grpo_compute_loss_uses_version_stable_off_policy_keyword():
@@ -1304,8 +1251,8 @@ def test_grpo_compute_loss_uses_version_stable_off_policy_keyword():
         "grpo_compute_loss must pass the version-stable keyword; the adapter in "
         "grpo_accumulated_loss maps it to the installed TRL parameter name."
     )
-    # The removed TRL 0.27.0 keyword must NOT be passed here -- it is the crash source
-    # on TRL >= 0.27.1 and branching on it would live inside the compiled function.
+    # The removed TRL 0.27.0 keyword must not be passed here: it is the crash source on TRL >= 0.27.1, and branching on
+    # it would live inside the compiled function.
     assert "old_per_token_logps=" not in src, (
         "grpo_compute_loss must not hardcode the old_per_token_logps= keyword "
         "(TypeError on TRL >= 0.27.1)."
@@ -1317,17 +1264,14 @@ def test_grpo_accumulated_loss_adapts_both_trl_off_policy_signatures():
     flat = src.replace(" ", "")
     # Version detection happens here (eager, outside torch.compile), not in the loss.
     assert "signature(" in src and "get_off_policy_mask" in src
-    # The adapter forwards the stable arg to BOTH the TRL 0.27.0 parameter name and
-    # the TRL >= 0.27.1 name, so it works across the huggingface/trl#4857 rename.
+    # The adapter forwards the stable arg to both the TRL 0.27.0 and TRL >= 0.27.1 parameter names, so it works across the rename in huggingface/trl 4857.
     assert "old_per_token_logps=sampling_per_token_logps" in flat
     assert "sampling_per_token_logps=sampling_per_token_logps" in flat
 
 
 def test_installed_trl_get_off_policy_mask_needs_signature_adapter():
-    """Behavioral pin against the actually-installed TRL: calling
-    get_off_policy_mask with the wrong (renamed-away) keyword raises TypeError,
-    while the installed name returns the (B, 1) Keep/Drop mask. This is the exact
-    failure the adapter routes around."""
+    """Pins the installed TRL: get_off_policy_mask raises TypeError on the renamed-away keyword but returns the (B, 1)
+    Keep/Drop mask under the installed name; the adapter routes around it."""
     pytest.importorskip("trl")
     try:
         from trl.trainer.grpo_trainer import GRPOTrainer
@@ -1369,13 +1313,9 @@ def test_installed_trl_get_off_policy_mask_needs_signature_adapter():
 # ---------------------------------------------------------------------------
 # off-policy mask None fallback (num_iterations == 1, no vLLM)
 # ---------------------------------------------------------------------------
-#
-# TRL defaults old_per_token_logps to per_token_logps.detach() when it is absent
-# (num_iterations == 1), then feeds that as the mismatch logprobs, so
-# get_off_policy_mask never receives None. grpo_compute_loss must do the same:
-# when both sampling_per_token_logps and old are None, fall back to new.detach().
-# get_off_policy_mask computes `mismatch - per_token_logps.detach()`, so None would
-# crash; new.detach() gives a zero-KL keep-all mask.
+# TRL defaults old_per_token_logps to per_token_logps.detach() when absent (num_iterations == 1); grpo_compute_loss
+# falls back to new.detach() when both sampling and old are None, since get_off_policy_mask would crash on None;
+# new.detach() gives a zero-KL keep-all mask.
 
 
 def _trl_faithful_off_policy_mask(
@@ -1415,8 +1355,7 @@ def test_grpo_compute_loss_off_policy_mask_falls_back_to_new_when_old_absent():
 
 def test_grpo_compute_loss_source_has_new_detach_off_policy_fallback():
     flat = inspect.getsource(rr.grpo_compute_loss).replace(" ", "")
-    # The mismatch logprobs must fall back to new.detach() when old is also None,
-    # matching TRL's old_per_token_logps = per_token_logps.detach() default.
+    # The mismatch logprobs fall back to new.detach() when old is also None, matching TRL's old_per_token_logps = per_token_logps.detach() default.
     assert "new.detach()" in flat
     assert "oldifoldisnotNoneelsenew.detach()" in flat
 
@@ -1424,12 +1363,8 @@ def test_grpo_compute_loss_source_has_new_detach_off_policy_fallback():
 # ---------------------------------------------------------------------------
 # off-policy mask uses vLLM sampling logps independently of IS correction
 # ---------------------------------------------------------------------------
-#
-# TRL feeds the vLLM sampling logprobs to get_off_policy_mask whenever the batch
-# has them, regardless of vllm_importance_sampling_correction (which only gates the
-# IS ratio applied to the loss). grpo_compute_loss must do the same: the off-policy
-# mask sees sampling_per_token_logps even with correction off, while the IS ratio
-# stays gated on the flag.
+# TRL feeds vLLM sampling logprobs to get_off_policy_mask whenever present, even with
+# vllm_importance_sampling_correction off; that flag only gates the IS ratio.
 
 
 def _grpo_vllm_kwargs(mask, **extra):
@@ -1506,9 +1441,9 @@ def test_grpo_compute_loss_is_ratio_blocks_gated_on_correction_flag_source():
 
 
 def test_off_policy_adapter_cache_compares_bound_method_by_value():
-    # trainer.get_off_policy_mask returns a fresh bound-method object every access, so the adapter
-    # cache must compare `_unsloth_wrapped` by value (`!=`), not identity (`is not`) - otherwise the
-    # cache never hits and a new closure is built every step, re-triggering torch.compile.
+    # trainer.get_off_policy_mask returns a fresh bound method per access, so the adapter cache must compare
+    # _unsloth_wrapped by value (!=), not identity; otherwise the cache never hits and torch.compile re-triggers every
+    # step.
     src = inspect.getsource(rr.grpo_accumulated_loss)
     assert 'getattr(_adapter, "_unsloth_wrapped", None) != _off_policy_mask_fn' in src
     assert 'getattr(_adapter, "_unsloth_wrapped", None) is not _off_policy_mask_fn' not in src
@@ -1525,10 +1460,9 @@ def test_off_policy_adapter_cache_compares_bound_method_by_value():
 
 
 def test_sampling_logps_gated_on_actual_consumer():
-    # grpo_accumulated_loss must keep vLLM sampling logps only when the off-policy mask
-    # (off_policy_mask_threshold) or the IS ratio (vllm_importance_sampling_correction)
-    # consumes them - otherwise the plain vLLM path pays for an unused aligned/compiled
-    # input and UnslothEfficientGRPO returns empty (not None) delta/flat_is_ratio.
+    # grpo_accumulated_loss keeps vLLM sampling logps only if off_policy_mask_threshold or
+    # vllm_importance_sampling_correction consumes them; otherwise the plain vLLM path pays for an unused
+    # aligned/compiled input and UnslothEfficientGRPO returns empty (not None) delta/flat_is_ratio.
     src = inspect.getsource(rr.grpo_accumulated_loss)
     flat = src.replace(" ", "")
     assert "_sampling_logps_used" in src

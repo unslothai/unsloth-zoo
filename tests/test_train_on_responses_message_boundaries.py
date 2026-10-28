@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""``train_on_responses_only`` must stop each response span at a message boundary.
-
-The span loop used to run from the assistant marker to the next *user* marker, so a
-tool conversation - which has no user turn in between - supervised the tool result
-and the role headers around it, and after packing the last span ran on into the next
-sample's BOS and system prompt.
-
-Every fixture gives the turn terminator an id that is NOT ``eos_token_id``, so a span
-stopping in the right place proves the message opener was recognised rather than the
-EOS check having covered for it.
-
-CPU-pure and offline: the tokenizers are local stubs, no weights are loaded.
-"""
+"""train_on_responses_only must end response spans at message boundaries, not the next user marker, which trained tool
+results, role headers and the next packed sample's BOS and system prompt; fixtures give the turn terminator a non-EOS
+id; CPU-only, stub tokenizers."""
 
 import pytest
 
@@ -70,8 +60,8 @@ class StubTokenizer:
         return _Result()
 
 
-# ChatML: <|im_start|> is an added special but NOT an attribute special, the way Qwen,
-# Llama 3, Gemma and Phi-4 store their openers. <|im_end|> ends a turn, <|endoftext|> is EOS.
+# ChatML: <|im_start|> is an added special but NOT an attribute special, the way Qwen, Llama 3, Gemma and Phi-4 store
+# their openers; <|im_end|> ends a turn, <|endoftext|> is EOS.
 IM_START, IM_END, NL, EOS, BOS = 1, 7, 6, 9, 8
 USER, ASSISTANT, TOOL, SYSTEM = 2, 3, 4, 5
 CHATML_VOCAB = {
@@ -192,8 +182,7 @@ def test_existing_labels_are_preserved_inside_a_retained_span():
     assert labels == existing, "an existing label mask was overwritten"
 
 
-# NVIDIA Nemotron: the markers are not atomic and their shared prefix is a bare "\n"
-# that the tokenizer does register as a special token.
+# NVIDIA Nemotron: markers are not atomic, and their shared prefix is a bare newline that the tokenizer does register as a special token.
 NEMO_NL, NEMO_USER, NEMO_ASSISTANT, NEMO_END, NEMO_EOS = 11, 12, 13, 14, 15
 NEMO_ANSWER_A, NEMO_ANSWER_B = 201, 202
 

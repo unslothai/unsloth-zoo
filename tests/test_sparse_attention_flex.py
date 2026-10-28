@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Long-context sparse flex attention (MiniMax M3, DeepSeek V3.2, GLM-MoE-DSA).
-
-CPU: chunked indexers select exactly what upstream selects, block ids are ascending, the
-patches install on transformers 5.17 and stay off where they must. GPU (sm80+): flex output
-and Q / K / V gradients match upstream's dense masked attention, and whole tiny models match
-with flex on vs off."""
+"""Sparse flex attention (MiniMax M3, DeepSeek V3.2, GLM-MoE-DSA): CPU checks indexer selection, block id order and
+patch install on transformers 5.17; GPU sm80+ checks flex matches upstream dense attention and tiny models match flex
+on vs off."""
 
 import importlib
 import os
@@ -32,8 +29,7 @@ transformers = pytest.importorskip("transformers")
 
 
 def _find_spec(name):
-    # find_spec on a dotted name imports the parent package, which raises on transformers
-    # releases that do not ship it (4.57.6 has no minimax_m3_vl).
+    # find_spec on a dotted name imports the parent package, which raises on transformers releases that lack it (4.57.6 has no minimax_m3_vl).
     try:
         return importlib.util.find_spec(name)
     except ModuleNotFoundError:
@@ -196,8 +192,7 @@ def test_dsa_chunked_indexer_selects_like_upstream(monkeypatch, family):
     ref = indexer._unsloth_original_forward(h, q_resid, (cos, sin), mask, pos)
     monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_Q_CHUNK", "64")
     got = indexer(h, q_resid, (cos, sin), mask, pos)
-    # Rows whose valid keys are fewer than topk select some -inf keys; those ids are arbitrary
-    # but masked out downstream. Compare the selected valid keys.
+    # Rows with fewer valid keys than topk select some -inf keys; those ids are arbitrary but masked out downstream, so compare only the selected valid keys.
     keep_ref = torch.zeros(2, seq, seq, dtype = torch.bool).scatter(-1, ref.long(), True) & mask
     keep_got = torch.zeros(2, seq, seq, dtype = torch.bool).scatter(-1, got.long(), True) & mask
     assert torch.equal(keep_ref, keep_got)
@@ -405,10 +400,8 @@ def test_dsa_flex_engages_above_the_budget(monkeypatch):
 @gpu
 @pytest.mark.parametrize("family", ["deepseek_v32", "glm_moe_dsa", "minimax_m3_vl"])
 def test_tiny_model_cached_decode_after_flex_prefill(monkeypatch, family):
-    """Prefill above the budget (flex), then decode with the cache: same logits as flex off.
-
-    MiniMax uses one layer: a second layer's indexer reselects blocks from bf16 hidden states,
-    and near-tie block scores flip between any two attention backends."""
+    """Prefill above the budget (flex) then cached decode gives the same logits as flex off; MiniMax uses one layer
+    because a second indexer reselects blocks from bf16 hidden states, and near-tie scores flip between backends."""
     _patched()
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS", "65")
     if family == "minimax_m3_vl":
@@ -456,8 +449,8 @@ def test_skip_and_flex_compose(order, family):
 @gpu
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "glm_moe_dsa"])
 def test_flex_graphs_stay_bounded_over_lengths(family):
-    """Varying lengths (incl. non multiples of 128) and batch 1 / 2, fwd + bwd: at most four graphs (static
-    first length, then dynamic, batch 1 vs > 1), none added per new length after that."""
+    """Varying lengths (incl. non multiples of 128) and batch 1 / 2, fwd + bwd: at most four graphs (static first
+    length, then dynamic; batch 1 vs > 1), none added per new length."""
     import torch._dynamo
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()
@@ -505,10 +498,9 @@ def _packed_logits(model, ids, pos, docs, packed):
 @gpu
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32", "glm_moe_dsa"])
 def test_packed_sequences(monkeypatch, family):
-    """Padding-free packing (position_ids reset per document, no attention_mask): transformers builds a
-    block-diagonal mask. DSA keeps documents apart, so packed flex must match each document run alone.
-    MiniMax's indexer anchors blocks to absolute key slots and mixes documents upstream: flex must match
-    upstream's packed result instead."""
+    """Padding-free packing (position_ids reset per document, no attention_mask): DSA keeps documents apart, so packed
+    flex must match each document alone; MiniMax's indexer anchors blocks to absolute slots and mixes documents
+    upstream, so flex must match upstream's packed result."""
     _patched()
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS", "65")
     if family == "minimax_m3_vl":
@@ -533,8 +525,7 @@ def test_packed_sequences(monkeypatch, family):
 @needs_models
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32", "glm_moe_dsa"])
 def test_indexer_forward_without_class_attributes(monkeypatch, family):
-    """Unsloth's compiler rebuilds the classes from source, dropping attributes set on them at patch time:
-    the patched indexer forwards must not read them."""
+    """Unsloth's compiler rebuilds classes from source and drops attributes set at patch time, so patched indexer forwards must not read class attributes."""
     _patched()
     config = _minimax_config() if family == "minimax_m3_vl" else _dsa_config(family)
     m, indexer = _indexer_module(family, config)
@@ -557,9 +548,8 @@ def test_indexer_forward_without_class_attributes(monkeypatch, family):
 @gpu
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
 def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
-    """Unsloth compiles each decoder layer (fullgraph=False). Above the budget the flex call leaves that graph
-    (one break) and engages, matching eager flex; within the budget nothing breaks the graph. Without the
-    region flag a compiled call keeps the model's path, including the block traced in a user's fullgraph=True."""
+    """Unsloth compiles each decoder layer (fullgraph=False): above budget the flex call takes one graph break and
+    matches eager flex; without the region flag the model path is kept, even in user fullgraph=True."""
     import sys
     import types
     import torch._dynamo
@@ -651,9 +641,8 @@ def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
 )
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
 def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
-    """An attention layer under an enclosing torch.compile (fullgraph, dynamic): the BlockMask build plus
-    flex call miscompiled there (MiniMax output 95% off, silently), so the model's own path runs inside a
-    compiled graph. Compiled with flex on == compiled upstream, and eager flex stays close to eager upstream."""
+    """Attention under an enclosing fullgraph dynamic torch.compile: BlockMask build plus flex call miscompiled (MiniMax
+    95% off, silently); compiled flex must match compiled upstream, eager stays close."""
     import torch._dynamo
     _patched()
     torch.manual_seed(0)
@@ -700,8 +689,7 @@ def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
     got, got_g = run(True, True)
     # Inside the compiled graph the patch keeps the model's path: same result as compiling upstream.
     assert nrel(got, compiled_ref) < 1e-3 and nrel(got_g, compiled_ref_g) < 1e-3, (nrel(got, compiled_ref), nrel(got_g, compiled_ref_g))
-    # (Compiled upstream vs eager upstream is not compared: Inductor's fp32 indexer scores can reorder the
-    # DSA top-k, ~5% here, which is upstream's own behaviour.)
+    # Compiled vs eager upstream is not compared: Inductor's fp32 indexer scores can reorder the DSA top-k (~5% here), upstream's own behaviour.
     assert nrel(flex, ref) < 3e-2 and nrel(flex_g, ref_g) < 3e-2, (nrel(flex, ref), nrel(flex_g, ref_g))
     assert not sb._FAILED, sb._FAILED
 
@@ -713,8 +701,7 @@ def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
 )
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
 def test_chunked_indexer_compiles_once_over_lengths(monkeypatch, family):
-    """Inside torch.compile (dynamic) the chunk loop's trip count specialised the graph on the length:
-    one graph per length. One graph now, same selection as eager."""
+    """Under dynamic torch.compile the chunk loop's trip count specialised the graph per length; now one graph with the same selection as eager."""
     import torch._dynamo
     monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_Q_CHUNK", "64")
     torch.manual_seed(0)
@@ -746,8 +733,7 @@ def test_chunked_indexer_compiles_once_over_lengths(monkeypatch, family):
 @needs_models
 @gpu
 def test_dsa_flex_keeps_finite_mask_biases_in_float32():
-    """A float DSA mask is additive upstream: finite entries (here -0.5 / +0.25 on visible keys) shift the
-    scores. They were read as hard exclusions (output ~59% off)."""
+    """Finite float DSA mask entries are additive upstream (they shift scores); reading them as hard exclusions gave output ~59% off; the test keeps them in float32."""
     torch.manual_seed(0)
     B, H, S, D, topk = 2, 4, 384, 64, 96
     keep = torch.ones(S, S, dtype = torch.bool, device = "cuda").tril()[None, None].expand(B, 1, S, S)
@@ -769,9 +755,8 @@ def test_dsa_flex_keeps_finite_mask_biases_in_float32():
 @gpu
 @pytest.mark.parametrize("shape", ["query", "key", "batch"])
 def test_broadcast_masks_match_their_expansion(monkeypatch, shape):
-    """Callers' masks broadcast upstream over queries ([B, 1, 1, T]), keys ([B, 1, S, 1]) or batch
-    ([1, 1, S, T]). Padding a singleton dim hid keys (only key 0, or only query 0, stayed visible), and the
-    chunked DSA indexer failed slicing a query-singleton mask on the second chunk."""
+    """Masks broadcast upstream over queries [B, 1, 1, T], keys [B, 1, S, 1] or batch [1, 1, S, T]; padding a singleton
+    dim hid keys and broke the chunked DSA indexer on chunk two."""
     torch.manual_seed(0)
     dev, dt = "cuda", torch.bfloat16
     B, H, S, D = 2, 4, 512, 64
@@ -853,8 +838,8 @@ def test_config_output_attentions_keeps_the_model_path(family):
 @gpu
 @pytest.mark.parametrize("finite_bias", [False, True])
 def test_dsa_flex_cuda_graph_capture_matches_eager(finite_bias):
-    """The finite-bias check is a host sync; under stream capture it invalidated the capture
-    (cudaErrorStreamCaptureInvalidated). Capturing keeps the bias instead: the replay matches the eager call."""
+    """The finite-bias check is a host sync that invalidated CUDA stream capture (cudaErrorStreamCaptureInvalidated), so
+    capture keeps the bias; replay must match eager."""
     torch.manual_seed(0)
     dev, dt = "cuda", torch.bfloat16
     B, H, S, T, D = 1, 4, 64, 1024, 64
@@ -890,8 +875,8 @@ def test_dsa_flex_cuda_graph_capture_matches_eager(finite_bias):
 @needs_models
 @gpu
 def test_dsa_flex_capture_same_shape_mixed_bias():
-    """Two same-shape calls in one capture, one with a finite bias and one 0 / min only: the warm-up of the
-    biased call must not be overwritten by the plain one (a stale no-bias answer asserted on replay)."""
+    """Two same-shape calls in one capture (finite bias, and 0 / min only): the biased warm-up must not be overwritten
+    by the plain call's stale no-bias answer on replay."""
     torch.manual_seed(0)
     dev, dt = "cuda", torch.bfloat16
     B, H, S, T, D = 1, 4, 64, 1024, 64
@@ -930,8 +915,8 @@ def test_dsa_flex_capture_same_shape_mixed_bias():
 
 @gpu
 def test_capture_bias_answer_is_per_caller_kind():
-    """V4 and DSA compile separate flex kernels: a biased V4 warm-up must not make a captured DSA call of the
-    same mask shape ask for a bias kernel that DSA never compiled (and the reverse)."""
+    """V4 and DSA compile separate flex kernels: a biased V4 warm-up must not make a same-shape captured DSA call ask
+    for a bias kernel DSA never compiled, nor the reverse."""
     from unsloth_zoo.flex_attention import sparse as sp
     dev, dt = "cuda", torch.bfloat16
     plain = torch.zeros(1, 64, 1024, device = dev, dtype = dt)
@@ -955,8 +940,7 @@ def test_capture_bias_answer_is_per_caller_kind():
 
 
 def test_flex_failure_under_capture_is_raised_not_latched(monkeypatch):
-    """A failure while a CUDA graph is being captured has invalidated the capture, so the dense fallback cannot
-    run either: it is raised, and the shape class stays on flex."""
+    """A failure during CUDA graph capture invalidates the capture, so the dense fallback cannot run either: the error is raised and the shape class stays on flex."""
     import types
     from unsloth_zoo.temporary_patches import sparse_attention_flex as s
     query = types.SimpleNamespace(

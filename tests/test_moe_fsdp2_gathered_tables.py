@@ -14,16 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FSDP2 all-gathered 4-bit experts (unsloth fsdp2_qlora marks them `_unsloth_fsdp2_gathered`):
-FSDP2 frees and re-allocates their storage around every forward and backward, so the NF4 pointer
-tables keyed by weight address must not be trusted across calls.
-
-1. moe_ready_epoch.scan treats such a subtree like an accelerate-hooked one (no cached record), so
-   the grouped readiness and the pointer tables re-key over every expert on each call.
-2. The gpt-oss grouped QLoRA weight provider re-reads its table when it runs (the backward
-   recompute), instead of the table captured in forward, which pointed at the freed forward
-   all-gather (wrong dX on 2 GPUs: max |dX - ref| 0.4, bit-exact with the refresh).
-"""
+"""FSDP2 all-gathered 4-bit experts (_unsloth_fsdp2_gathered) reallocate storage each pass, so NF4 pointer tables go
+stale; moe_ready_epoch.scan treats them as accelerate-hooked; gpt-oss re-reads its table in backward, since the
+forward one pointed at freed storage (wrong dX on 2 GPUs)."""
 
 import torch
 import torch.nn as nn

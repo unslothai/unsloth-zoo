@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Decode arch gates without a GPU (capability faked, kernels not launched):
-
-1. gpt-oss 16-bit routed eligibility traces under fullgraph on a cold process, before anything has
-   listed the visible devices (torch.cuda.device_count() is not traceable).
-2. The GDN ReplaySSM launch wrapper shrinks the table nk for small key dims instead of rejecting BKT < 16.
-"""
+"""Decode arch gates without a GPU (capability faked): gpt-oss 16-bit routed eligibility must trace under fullgraph in a
+cold process, as torch.cuda.device_count() is not traceable; GDN ReplaySSM shrinks nk for small key dims instead of
+rejecting BKT < 16."""
 
 import os
 import types

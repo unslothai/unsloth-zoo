@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""An OOM in the GRPO packed (grad) forward caps the packed length instead of
-disabling packing for the run. The real block from `grpo_accumulated_loss` runs on CPU."""
+"""An OOM in the GRPO packed (grad) forward caps the packed length rather than disabling packing for the run; the real grpo_accumulated_loss block runs on CPU."""
 
 import contextlib
 import inspect
@@ -176,8 +175,8 @@ def test_oom_log_reports_the_cap_not_disabled(monkeypatch, capsys):
 
 
 def test_capped_batch_skips_packing_prep(monkeypatch):
-    # A batch at or above the OOM cap decides from the host lengths alone: no flatten of the
-    # ids and no active-row read (both cost a GPU sync and keep buffers alive).
+    # A batch at or above the OOM cap decides from host lengths alone: no flatten of the ids and no active-row read,
+    # since both cost a GPU sync and keep buffers alive.
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     model = _Model(torch.cuda.OutOfMemoryError("CUDA out of memory"))
     ns = _run(model, LONG)

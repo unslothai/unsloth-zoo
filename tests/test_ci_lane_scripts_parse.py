@@ -1,29 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""
-The concurrent CI lanes must be syntactically whole shell, and their pytest
-invocations must still carry every file.
-
-Fusing matrix cells onto one runner turns YAML into shell, and shell that is
-assembled rather than written has a failure mode YAML validation cannot see. The
-fused Core job shipped with
-
-    "$venv/bin/python" -m pytest -v --tb=short -rs \\
-                tests/test_upstream_pinned_symbols_transformers.py \\\\
-                tests/test_torchvision_video_removed_message.py \\\\
-
--- double backslashes, from a generator whose f-string escaped one too many. The
-YAML parsed, actionlint passed, and every lane reported `install=0 tests=missing`
-because the continuation ended the command and the remaining files ran as their
-own (nonexistent) commands. Twenty test files silently stopped being a test run.
-
-`bash -n` catches the class in a second, which is the whole point: it is cheaper
-than a CI round trip and it is what was missing.
-
-The file-count assertion is the other half. A command that parses is not the same
-as a command that still runs everything; a dropped continuation can leave a
-perfectly valid pytest call that collects three files instead of twenty.
-"""
+"""Concurrent CI lanes must parse as whole shell with every pytest file present: a double-backslash continuation
+silently left twenty files out of the run; bash -n plus a file-count check guard it."""
 
 from __future__ import annotations
 
@@ -39,8 +17,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
-# Steps that build shell by hand for concurrent lanes. Matched on content rather
-# than a hardcoded list, so a new fused job is covered the day it lands.
+# Steps that hand-build shell for concurrent lanes, matched by content rather than a hardcoded list so new fused jobs are covered automatically.
 _LANE_MARKERS = ("lane()", ".lanes/", "venv-")
 
 
@@ -91,12 +68,7 @@ def test_every_lane_step_is_valid_shell(workflow: str, job: str, name: str, run:
     ids = lambda v: v if isinstance(v, str) and len(v) < 40 else "",
 )
 def test_no_double_backslash_continuations(workflow: str, job: str, name: str, run: str) -> None:
-    """
-    `\\\\` at end of line is an escaped backslash, not a continuation. It ends the
-    command and hands the next line to the shell as its own -- which is how twenty
-    pytest files became twenty "command not found" lines that nothing checked.
-    Valid shell, wrong program, and `bash -n` alone would not object.
-    """
+    """A double backslash at line end is an escaped backslash, not a continuation: the next line runs as its own command, which bash -n does not flag."""
     bad = [
         i + 1
         for i, line in enumerate(run.splitlines())
@@ -108,11 +80,8 @@ def test_no_double_backslash_continuations(workflow: str, job: str, name: str, r
     )
 
 
-# The twenty drift files the fused Core lane inherited from the three matrix cells it
-# replaced. Named rather than counted: a name tells you which file a dropped
-# continuation lost. An exact count made #1114 (which legitimately added the mxfp4
-# load-path file) turn this guard red. Removing a file from the lane is the deliberate
-# act: drop it from this set in the same commit.
+# Twenty drift files from the three fused matrix cells, named not counted: an exact count went red when ref 1114
+# legitimately added a file; removing one means dropping it from this set in the same commit.
 _FUSED_CORE_LANE_REQUIRED = frozenset({
     "tests/test_compiler_dynamic_exec.py",
     "tests/test_compiler_rewriter_exhaustive.py",
@@ -138,11 +107,7 @@ _FUSED_CORE_LANE_REQUIRED = frozenset({
 
 
 def test_the_fused_core_job_still_runs_every_drift_file() -> None:
-    """
-    A command can parse and still have lost most of its arguments. This pins the
-    files against the workflow the cells were fused from, so a continuation that
-    silently drops files fails here rather than going green having run three.
-    """
+    """Pins the fused Core lane's files against the workflow it was fused from, so a continuation that silently drops files fails instead of passing with three."""
     doc = yaml.safe_load((WORKFLOWS / "consolidated-tests-ci.yml").read_text(encoding = "utf-8"))
     steps = doc["jobs"]["core-upstream-matrix"]["steps"]
     run = next(s["run"] for s in steps if "concurrently" in (s.get("name") or ""))
@@ -158,8 +123,7 @@ def test_the_fused_core_job_still_runs_every_drift_file() -> None:
         f"matrix cells it replaced each ran all of them, so dropping one silently "
         f"narrows upstream-drift coverage. Lane currently runs: {sorted(files)}"
     )
-    # A repeated name would mask a drop from the set check above, which is
-    # multiplicity-blind.
+    # A repeated name would mask a dropped file, since the set check above is blind to multiplicity.
     duplicated = sorted({name for name in files if files.count(name) > 1})
     assert not duplicated, (
         f"the fused Core lane names {duplicated} more than once; pytest would collect "
@@ -171,11 +135,8 @@ def test_the_fused_core_job_still_runs_every_drift_file() -> None:
     )
 
 
-# The capture is `{ cmd1; ...; cmdN } > "$log" || rc=$?`, and a brace group reports
-# only cmdN -- so every earlier failure was recorded as rc=0 and the job continued
-# with a half-built venv: a truncated mlx download surfaced two steps later as
-# ModuleNotFoundError, with the build step green. `set -e` inside the group does NOT
-# help: it sits on the left of `|| rc=$?`, where POSIX ignores errexit.
+# A brace group captured with || rc=$? reports only its last command, so earlier failures read as rc=0 and a half-built
+# venv goes on; set -e inside the group does not help, since POSIX ignores errexit left of ||.
 
 def _capture_groups(run: str) -> list[str]:
     """Bodies of every `{ ... } > ... || rc=$?` status-capture group in a lane."""
@@ -196,11 +157,7 @@ def _capture_groups(run: str) -> list[str]:
 
 
 def _statements(body: str) -> list[str]:
-    """Logical statements: continuations joined, blanks and comment lines dropped.
-
-    A comment between two `&&`-chained commands is legal shell (the newline after
-    `&&` may be followed by comments), so it is not a statement for this purpose.
-    """
+    """Joins line continuations and drops blank and comment lines; a comment between && chained commands is legal shell, so it is not a statement here."""
     joined = body.replace("\\\n", " ")
     return [
         ln.strip() for ln in joined.splitlines()
@@ -209,11 +166,7 @@ def _statements(body: str) -> list[str]:
 
 
 def test_lane_status_capture_sees_every_failure() -> None:
-    """
-    Every command in a status-capture group must be `&&`-chained to the next, so a
-    failure anywhere becomes the lane's recorded status rather than being masked by
-    a later command that happens to succeed.
-    """
+    """Every command in a status-capture group must be &&-chained, so any failure becomes the lane's recorded status instead of being masked by a later success."""
     checked = 0
     for workflow, job, name, run in _lane_steps():
         for body in _capture_groups(run):
@@ -235,11 +188,7 @@ def test_lane_status_capture_sees_every_failure() -> None:
 
 
 def test_the_chaining_idiom_actually_propagates_failure() -> None:
-    """
-    Pins the shell semantics the test above relies on, so the reasoning is checked
-    rather than asserted: the old form swallows, `set -e` does not rescue it, and
-    `&&`-chaining does, while still tolerating a deliberate `|| true` step.
-    """
+    """Pins the shell semantics: the old form swallows failures even under set -e, && chaining propagates them, and a deliberate || true step still passes."""
     def rc_of(script: str) -> int:
         return subprocess.run(
             [ "bash", "-c", f"rc=0; {script} || rc=$?; exit $rc" ],
@@ -258,17 +207,7 @@ def test_the_chaining_idiom_actually_propagates_failure() -> None:
 
 
 def test_network_bound_installs_are_retried() -> None:
-    """
-    pip's `--retries` only covers establishing a connection, so a body truncated
-    mid-download (ProtocolError / IncompleteRead) is not retried and the install
-    dies. The lanes wrap those installs in retry().
-
-    The pip bootstrap used to be excluded here. It is network-bound like the
-    rest, and it runs before anything else in the lane, so a blip there costs the
-    whole lane: `retry` around `pip install -e .[core]` demonstrably saved a lane
-    from an IncompleteRead on 2026-09-09, and there was no reason the line above
-    it should have been the one left unprotected.
-    """
+    """pip --retries covers only connecting, not a body truncated mid-download (IncompleteRead), so network installs are wrapped in retry(), bootstrap included."""
     for workflow, job, name, run in _lane_steps():
         for body in _capture_groups(run):
             installs = [

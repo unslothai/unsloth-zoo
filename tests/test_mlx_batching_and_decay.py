@@ -184,10 +184,8 @@ def test_ordered_text_torch_randperm_can_materialize_multiple_epochs():
 
 
 def test_ordered_text_fractional_num_epochs_builds_the_partial_pass():
-    # int(num_epochs) rounded the requested row count down: 0 < epochs < 1 built
-    # an empty plan, surfacing later as "No training batches created" and
-    # blaming the dataset, and 1.5 built a single pass. Five rows at batch 1 is
-    # 3 batches for half an epoch and 8 for one and a half.
+    # Fractional num_epochs must not be truncated by int(): 0 < epochs < 1 built an empty plan blamed on the dataset;
+    # 1.5 built one pass only; 5 rows at batch 1 give 3 batches at 0.5 and 8 at 1.5.
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
@@ -208,10 +206,8 @@ def test_ordered_text_fractional_num_epochs_builds_the_partial_pass():
 
 
 def test_ordered_text_fractional_epochs_match_transformers_step_budget():
-    # Golden values measured by running a real transformers.Trainer on the same
-    # shapes: HF quantizes a fractional num_train_epochs to whole accumulation
-    # windows and re-iterates the dataloader, so 0.5 epochs of 5 rows at batch 2
-    # and accum 2 is one update over 4 rows, not a proportional 3.
+    # Matches transformers.Trainer, which quantizes fractional num_train_epochs to whole accumulation windows and
+    # re-iterates the dataloader: 0.5 epochs of 5 rows (batch 2, accum 2) is 4 rows.
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
@@ -382,8 +378,7 @@ class _CountingProcessor(_ContentProcessor):
 
 
 def _digest_vlm_batches(batches):
-    """Complete-pytree digest: sorted keys, per-array dtype/shape/values,
-    non-array constants verbatim — the serialization the frozen goldens use."""
+    """Complete-pytree digest: sorted keys, per-array dtype, shape and values, constants verbatim; matches the frozen goldens serialization."""
     out = []
     for batch in batches:
         entry = []
@@ -406,9 +401,8 @@ def _digest_vlm_batches(batches):
 
 
 class _MultiModalityStyleProcessor(_ContentProcessor):
-    """Representative of prepare-time sequence expansion: negative-free
-    placeholder ids are repeated by _expand_image_token_sequences for
-    multi_modality model types, changing the final text width."""
+    """Representative of prepare-time sequence expansion: placeholder ids are repeated by _expand_image_token_sequences
+    for multi_modality types, changing text width."""
 
     def __call__(self, text, **kwargs):
         rows = [[int(t), 250, 2] for t in text]
@@ -426,10 +420,8 @@ class _FakeWorld:
 
 
 def test_finite_vlm_plan_reproduces_merged_main_goldens():
-    """Independent oracle: complete-pytree digests frozen from the pre-plan
-    eager builder on merged main (two smoke modes; full matrix recorded).
-    Re-frozen after the staged VLM finalizer stopped emitting the private
-    raw-input-ids carrier; both digests still come from the eager builder."""
+    """Independent oracle: digests frozen from the pre-plan eager builder, re-frozen after the finalizer stopped
+    emitting the raw-input-ids carrier; both still come from the eager builder"""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -457,9 +449,7 @@ def test_finite_vlm_plan_reproduces_merged_main_goldens():
 
 
 def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeypatch):
-    """The pad-slot rank has bad>0 metadata; the checker must reach the
-    all_sum collective without any processor call or materialization even
-    when the processor would fail — a failing rank must not strand peers."""
+    """A rank with bad>0 metadata must reach the all_sum collective with no processor call or materialization, so a failing rank cannot strand its peers."""
     _skip_if_mlx_core_was_replaced()
     import mlx.core as mx_core
     from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
@@ -504,14 +494,9 @@ def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeyp
 
 
 def test_vlm_family_invariant_against_live_mx_compile_traces():
-    """The serializer's central safety invariant checked against OBSERVED
-    mx.compile cache behavior, with families computed BEFORE the compile walk
-    (production survey-then-compile order). 'merge' pairs share one plannable
-    family and one trace; 'split' pairs (one per value-encoding rule) produce
-    two traces and two still-plannable families; 'guard' pairs are cases MLX
-    keys apart that one family may absorb ONLY by being unplannable; leaves
-    the compile walk rejects are unplannable too. The exhaustive adversarial
-    matrix is retained as recorded validation evidence outside the repo."""
+    """Checks family invariant vs live mx.compile traces, families computed before the compile walk: merge pairs share
+    one plannable family and trace; split pairs get two traces and two plannable families; guard pairs may share a
+    family only if unplannable; compile-rejected leaves are unplannable."""
     _skip_if_mlx_core_was_replaced()
     import collections
 
@@ -554,8 +539,7 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
         if kind == "merge":
             assert same_key and fam_left == fam_right and plannable(fam_left)
         elif kind == "split":
-            # Both stay plannable while splitting: making common constants
-            # unplannable would regress ordinary batches to eager.
+            # Both must stay plannable while splitting: marking common constants unplannable would regress ordinary batches to eager.
             assert not same_key and fam_left != fam_right
             assert plannable(fam_left) and plannable(fam_right)
         else:
@@ -576,10 +560,8 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
 
 
 def test_per_row_audio_spans_stay_plannable():
-    """Spans are carried one array per row, since rows hold different clip
-    counts and stacking them raises. Leaving them as host arrays would describe
-    every batch of the family as opaque, sending it to eager and making a
-    strict run raise -- text-only batches of that family included."""
+    """Audio spans are one array per row because clip counts differ and stacking raises; host arrays would mark the
+    family opaque, sending it to eager and failing strict runs."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import (
         _to_mx_vlm_batch,
@@ -597,17 +579,13 @@ def test_per_row_audio_spans_stay_plannable():
             "input_ids": np.zeros((2, 8), dtype=np.int32),
             "audio_bounds": spans,
         })
-        # Both halves matter: the generic conversion also yields something
-        # plannable, by stacking equal rows and keeping only the first of ragged
-        # ones, so plannability alone would not show the rows survived.
+        # Values must be checked too: the generic conversion is also plannable, stacking equal rows and keeping only the first of ragged ones.
         assert [np.asarray(row).tolist() for row in batch["audio_bounds"]] == expected
         assert plannable(family(batch))
 
 
 class _VarWidthProcessor(_CountingProcessor):
-    """Batch width AND structure follow content: different scheduled
-    batches produce genuinely distinct families even after the text axis
-    goes symbolic (odd-width batches carry an extra sidecar array)."""
+    """Batch width and structure follow content, so batches produce distinct families even after the text axis is symbolic; odd widths add a sidecar."""
 
     def __call__(self, text, **kwargs):
         self.calls += 1
@@ -624,10 +602,8 @@ class _VarWidthProcessor(_CountingProcessor):
 
 
 def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
-    """ensure_descriptors() never runs at construction, stores each index's
-    OWN family (the fixture makes families differ across indices), builds
-    once per batch, invalidates rather than reuses the plan cache, and is
-    idempotent with no further processor work."""
+    """ensure_descriptors() never runs at construction; it stores each index's own family, builds once per batch,
+    invalidates the plan cache instead of reusing it, and is idempotent with no further processor work."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import (
         _create_vlm_batch_plan,
@@ -672,17 +648,14 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
 
 
 def test_vlm_plan_survey_does_not_consume_preprocessing_rng():
-    """The survey is RNG-neutral: an augmenting processor sees the SAME draws
-    whether or not it ran, so enabling compile cannot shift the training data
-    stream. Without the save/restore the surveyed run augments differently."""
+    """The survey must not consume preprocessing RNG: the save/restore keeps augmenting draws identical, so enabling compile cannot shift the data stream."""
     _skip_if_mlx_core_was_replaced()
     import random as _random
 
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
     class _AugmentingProcessor(_VarWidthProcessor):
-        """Width depends only on the items (so shapes are call-order
-        independent); the pixel content is a random augmentation draw."""
+        """Width depends only on the items, so shapes are call-order independent; pixel content is a random augmentation draw."""
 
         def __call__(self, text, **kwargs):
             batch = super().__call__(text, **kwargs)
@@ -715,10 +688,7 @@ def test_vlm_plan_survey_does_not_consume_preprocessing_rng():
 
 
 def test_vlm_plan_survey_releases_each_batch_before_the_next_build(monkeypatch):
-    """One-at-a-time TENSOR ownership: every mx.array leaf of every built
-    batch is tracked by weakref, all of the previous batch's tensors are
-    already collected before the next build starts, and none survive the
-    survey."""
+    """Tensors are owned one batch at a time: the previous batch's mx.array leaves are collected before the next build, and none survive the survey."""
     _skip_if_mlx_core_was_replaced()
     import gc
     import weakref
@@ -782,13 +752,7 @@ def _open_fd_count():
 
 
 def test_vlm_plan_does_not_pin_one_file_descriptor_per_row(tmp_path):
-    """FILE ownership, the counterpart to the tensor-ownership survey above.
-
-    ``PIL.Image.open`` leaves the file open until the raster is loaded, so a
-    plan that stores one row per scheduled slot must not pin one descriptor
-    per row: a few hundred rows would blow past the 256 soft limit that macOS,
-    the platform MLX runs on, hands every process by default.
-    """
+    """File ownership: PIL.Image.open holds the file open until the raster loads, so the plan must not pin one descriptor per row past macOS's 256 soft limit."""
     Image = pytest.importorskip("PIL.Image")
     import gc
 
@@ -839,10 +803,7 @@ def test_vlm_plan_does_not_pin_one_file_descriptor_per_row(tmp_path):
 
 
 def test_vlm_family_drift_check_fails_hard_with_location():
-    """The runtime drift seam accepts a faithful rebuild against its OWN
-    index and hard-fails on added keys, dtype drift, shape drift, key-order
-    drift, and cross-index confusion, naming the batch and the
-    divergence."""
+    """The drift check accepts a faithful rebuild of its own index and hard-fails on added keys, dtype, shape, key-order or cross-index drift, naming the batch."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -861,8 +822,7 @@ def test_vlm_family_drift_check_fails_hard_with_location():
     retyped = {**batch, "input_ids": batch["input_ids"].astype(mx.int16)}
     with pytest.raises(RuntimeError, match=r"'input_ids'.*int16"):
         plan.check_family_drift(1, retyped)
-    # A width change alone is NOT drift (the text axis is symbolic), but an
-    # inconsistent one (one array narrowed, siblings unchanged) is.
+    # A width change alone is not drift since the text axis is symbolic; an inconsistent one, with one array narrowed and siblings unchanged, is.
     narrowed = {**batch, "input_ids": batch["input_ids"][:, :-1]}
     with pytest.raises(RuntimeError, match=r"batch 1 drifted"):
         plan.check_family_drift(1, narrowed)
@@ -922,10 +882,7 @@ def _vlm_planner_fixtures(processor=None, rows=6):
 
 
 def test_vlm_should_raise_decision_aborts_inside_the_coordinated_block():
-    """A compile decision that mandates an abort raises during planning —
-    inside the coordinated block — rather than surviving as a benign
-    non-planning state that would strand peers at a later rank-local
-    raise."""
+    """A compile decision that mandates abort must raise inside the coordinated block, not become a benign state that strands peers at a later raise."""
     _skip_if_mlx_core_was_replaced()
     from types import SimpleNamespace
 
@@ -947,9 +904,8 @@ def test_vlm_should_raise_decision_aborts_inside_the_coordinated_block():
 
 
 def test_vlm_shape_planning_follows_the_resolved_override_mode():
-    """The RESOLVED mode decides: an arch override selecting strict under a
-    best_effort base must abort on a shape-planning failure, and the reverse
-    override must still degrade under a strict base."""
+    """The resolved mode decides: an arch override selecting strict under a best_effort base must abort on
+    shape-planning failure; the reverse must still degrade under a strict base."""
     _skip_if_mlx_core_was_replaced()
     from types import SimpleNamespace
 
@@ -1020,18 +976,14 @@ class _TailUnplannableProcessor(_ContentProcessor):
 
 
 def test_vlm_admission_covers_only_the_batches_the_loop_visits():
-    """A schedule whose length is not a multiple of the accumulation factor
-    ends in micro-batches the loop never reaches. An unplannable family
-    confined to that tail must not degrade the run to eager or abort strict
-    mode, since no compiled call can ever see it; the same family inside the
-    executed region still must."""
+    """Admission only checks visited batches: an unplannable family in the unreached tail (length not a multiple of
+    accumulation) must not force eager or abort strict."""
     _skip_if_mlx_core_was_replaced()
     from types import SimpleNamespace
 
     from unsloth_zoo.mlx.trainer import _plan_single_process_vlm_shapes
 
-    # 10 scheduled batches against 2 steps x 4 accumulation = 8 visits, so
-    # batches 8 and 9 are surveyed and never trained.
+    # 10 scheduled batches vs 2 steps x 4 accumulation = 8 visits: batches 8 and 9 are surveyed but never trained.
     args = SimpleNamespace(
         compile_max_variants=None, gradient_accumulation_steps=4,
     )
@@ -1151,9 +1103,7 @@ def test_vlm_batches_keep_unbounded_max_seq_length_as_none():
 
 
 def test_vlm_plan_refreshes_visit_dependent_formatting_per_occurrence():
-    """A stochastic or epoch-dependent formatting_func must refresh on every
-    scheduled visit, the way the eager builder did when it formatted inside
-    each batch build, while re-materialization stays free of user code."""
+    """Stochastic or epoch-dependent formatting_func must re-run on every scheduled visit, as the eager builder did, while re-materialization runs no user code."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -1187,13 +1137,7 @@ def test_vlm_plan_refreshes_visit_dependent_formatting_per_occurrence():
 
 
 class _RandomAugmentingProcessor(_ContentProcessor):
-    """A processor whose augmentation draws from the process-global RNG.
-
-    The drawn value is stamped into the produced ids, so a batch's contents
-    reveal which position of the preprocessing stream built it. When ``log``
-    is given, every call also records ``(rows, draw)`` so a test can tell which
-    stretch of the stream built which split.
-    """
+    """Augments from the process-global RNG and stamps the draw into the ids, so a batch reveals its stream position; log records (rows, draw) per call."""
 
     def __init__(self, log=None):
         self.log = log
@@ -1215,11 +1159,7 @@ class _RandomAugmentingProcessor(_ContentProcessor):
 def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
                           eval_dataset=None, grad_accum=1, max_steps=4,
                           seed=3407, processor_log=None):
-    """Run the real training loop and return the ids each micro-step saw.
-
-    The model maths are stubbed; every data path (plan construction, eval
-    batch construction, resume handling, batch fetch) stays real.
-    """
+    """Runs the real training loop and returns the ids each micro-step saw; only the model math is stubbed, all data paths stay real."""
     import os
     import random
     import mlx.nn as nn
@@ -1271,8 +1211,7 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
             max_grad_norm=0.0,
             max_grad_leaf_norm=0.0,
             disable_memory_limits=True,
-            # Large enough that evaluation never fires inside the loop; the
-            # eval BATCHES are still built before it.
+            # Large enough that evaluation never fires inside the loop; eval batches are still built before the loop.
             eval_steps=(10 ** 6 if eval_dataset is not None else 0),
         ),
         processor=processor,
@@ -1307,10 +1246,8 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
     if resume_step:
         checkpoint = os.path.join(output_dir, f"checkpoint-{resume_step}")
         os.makedirs(checkpoint, exist_ok=True)
-        # Write the files a real checkpoint carries. The loaders below are
-        # stubbed, but the trainer refuses a checkpoint whose resume state is
-        # missing rather than silently restarting from step 0, so a directory
-        # that only pretends to exist is no longer a usable fixture.
+        # Write the files a real checkpoint carries: the trainer refuses a checkpoint missing resume state rather than
+        # restarting from step 0, though loaders are stubbed.
         mx.save_safetensors(
             os.path.join(checkpoint, "adapters.safetensors"),
             {"placeholder": mx.zeros((1,))},
@@ -1330,8 +1267,7 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
                              "train_loss_history": []},
         )
 
-    # Warm one-time lazy imports (some draw from the global RNG when first
-    # loaded) so only the processor's own draws are measured.
+    # Warm one-time lazy imports first, since some draw from the global RNG when loaded, so only the processor's own draws are counted.
     utils_mod.create_vlm_batches(
         dataset=[{"text": "0"}, {"text": "1"}],
         processor=_RandomAugmentingProcessor(),
@@ -1349,14 +1285,7 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
 def test_vlm_resume_replays_the_skipped_preprocessing_stream(
     monkeypatch, tmp_path,
 ):
-    """Resuming must hand the first resumed batch the augmentation an
-    uninterrupted run used there, not the opening draw.
-
-    The eager builder created every scheduled batch up front, so the skipped
-    micro-batches had still run the processor; the lazy plan has to replay
-    them or a stochastic preprocessing pipeline restarts its stream at the
-    resume point.
-    """
+    """Resume must replay skipped micro-batches through the processor, as the eager builder did up front, so augmentation does not restart at the resume point."""
     _skip_if_mlx_core_was_replaced()
 
     full = _train_stochastic_vlm(
@@ -1374,9 +1303,8 @@ def test_vlm_resume_replays_the_skipped_preprocessing_stream(
 def test_vlm_eval_batches_leave_the_training_preprocessing_stream_alone(
     monkeypatch, tmp_path,
 ):
-    """Building eval batches must not consume the draws the first training
-    batch is owed. Eager training batches were built before the eval ones, so
-    adding an eval split never moved the training augmentation stream."""
+    """Building eval batches must not consume draws owed to training; eager built training batches first, so adding an
+    eval split never shifted the augmentation stream."""
     _skip_if_mlx_core_was_replaced()
 
     without_eval = _train_stochastic_vlm(
@@ -1394,16 +1322,8 @@ def test_vlm_eval_batches_leave_the_training_preprocessing_stream_alone(
 def test_vlm_eval_splits_each_draw_their_own_augmentation_stretch(
     monkeypatch, tmp_path,
 ):
-    """A dict ``eval_dataset`` must keep the preprocessing stream progressing
-    ACROSS splits.
-
-    Keeping eval builds out of the training stream is one preservation around
-    the whole set of splits, not one per split: restoring between splits hands
-    every split the identical snapshot, so an augmenting processor replays the
-    same draw sequence for each of them instead of progressing the way
-    sequential construction did. The training stream must still be untouched
-    however many splits there are.
-    """
+    """A dict eval_dataset must advance the preprocessing stream across splits: preserve RNG once around all splits,
+    since restoring per split replays identical draws; training stream stays untouched."""
     _skip_if_mlx_core_was_replaced()
 
     without_eval = _train_stochastic_vlm(
@@ -1436,9 +1356,7 @@ def test_vlm_eval_splits_each_draw_their_own_augmentation_stretch(
 
 
 def test_vlm_plan_pins_each_visit_against_an_in_place_formatting_func():
-    """A formatting_func that mutates and returns its argument must not let a
-    later visit rewrite the row an earlier visit already stored, so every batch
-    keeps the value the eager builder collated at that point in the schedule."""
+    """An in-place formatting_func must not let a later visit rewrite a row an earlier visit stored; each batch keeps the value eager collation saw."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -1464,9 +1382,7 @@ def test_vlm_plan_pins_each_visit_against_an_in_place_formatting_func():
 
 
 def test_vlm_plan_reads_scheduled_rows_only_once_per_occurrence():
-    """Unscheduled rows never reach the formatter or the dataset, and every
-    scheduled slot gets exactly one read, the way the eager builder indexed
-    the dataset while building each batch."""
+    """Unscheduled rows never reach the formatter or dataset; each scheduled slot gets exactly one read, as in the eager builder."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -1515,9 +1431,7 @@ def test_vlm_plan_reads_scheduled_rows_only_once_per_occurrence():
 
 
 def test_vlm_plan_resamples_a_visit_dependent_dataset_per_occurrence():
-    """A map-style dataset with stochastic __getitem__ augmentation must be
-    re-read on every scheduled visit, so a revisited index does not replay the
-    sample the first visit happened to draw."""
+    """A map-style dataset with stochastic __getitem__ augmentation is re-read on every visit, so a revisited index does not replay the first draw."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -1555,9 +1469,7 @@ def test_vlm_plan_resamples_a_visit_dependent_dataset_per_occurrence():
 
 
 def test_vlm_plan_pins_each_visit_against_a_nested_in_place_formatting_func():
-    """An in-place formatting_func that reaches a nested container must not let
-    a later visit rewrite an earlier stored visit, and pinning a visit must
-    reference the row's payloads rather than duplicate them."""
+    """A nested in-place formatting_func must not let a later visit rewrite an earlier stored one; pinning must reference row payloads, not copy them."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -1660,12 +1572,8 @@ def _pixels(batch):
 
 
 def test_vlm_plan_is_excluded_from_eager_fallback_refetch():
-    """The fallback refetch is restricted to plans whose rebuild is free.
-
-    FiniteTextBatchPlan rebuilds from stored token ids and touches no RNG, so
-    it keeps unpadding on fallback. FiniteVLMBatchPlan reruns the caller's
-    processor, so it must reuse the materialized batch instead.
-    """
+    """Fallback refetch only for free rebuilds: FiniteTextBatchPlan rebuilds from stored ids with no RNG;
+    FiniteVLMBatchPlan reruns the processor, so it reuses the batch."""
     from unsloth_zoo.mlx import trainer as trainer_module
     from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, FiniteVLMBatchPlan
 
@@ -1682,8 +1590,7 @@ def test_vlm_plan_is_excluded_from_eager_fallback_refetch():
 
 
 def test_vlm_fallback_refetch_would_shift_the_augmentation_stream():
-    """Why the exclusion exists: the refetch is a second processor call whose
-    draws offset every later batch, and the reuse it replaces is loss-safe."""
+    """The refetch is a second processor call whose draws would offset every later batch; the reuse it replaces is loss-safe."""
     plan = _make_plan()
     eager = [_pixels(plan[i]) for i in range(len(plan))]
     eager_tail = int(np.random.randint(0, 1 << 30))
@@ -1760,8 +1667,7 @@ class _NoPadTokenizer:
 
 
 class _UniformNoPadProcessor:
-    """Uniform width, no tokenizer pad id: every planned endpoint would equal
-    the raw width, so this plan looks like it never needs to pad."""
+    """Uniform width with no tokenizer pad id: every planned endpoint equals the raw width, so the plan looks like it never needs padding."""
 
     image_processor = object()
 
@@ -1828,8 +1734,7 @@ class _WideningNoPadProcessor(_UniformNoPadProcessor):
 
 
 def test_vlm_exact_plan_compiles_without_a_pad_token():
-    """A pad id is required by the BUILT plan, not by the processor: when no
-    admitted endpoint widens a batch, nothing is ever padded."""
+    """A pad id is required by the built plan, not the processor: if no admitted endpoint widens a batch, nothing is padded."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.shape_guard import FULL_STEP_SCOPE, phase_for_microstep
 
@@ -1853,8 +1758,7 @@ def test_vlm_exact_plan_compiles_without_a_pad_token():
 
 
 def test_vlm_declined_only_plan_compiles_without_a_pad_token():
-    """A sidecar sharing the text extent declines every batch, so the width
-    finalizer returns them untouched and no pad id is consulted."""
+    """A sidecar sharing the text extent declines every batch, so the width finalizer returns them untouched without consulting a pad id."""
     _skip_if_mlx_core_was_replaced()
 
     class _DeclinedNoPadProcessor(_UniformNoPadProcessor):
@@ -1875,8 +1779,7 @@ def test_vlm_declined_only_plan_compiles_without_a_pad_token():
 
 
 def test_vlm_widening_plan_still_requires_a_pad_token():
-    """Widening still needs a fill value, including the forbidden-width bump
-    that widens batches whose raw widths are identical."""
+    """Widening still needs a fill value, including the forbidden-width bump on batches whose raw widths are identical."""
     _skip_if_mlx_core_was_replaced()
 
     processor = _WideningNoPadProcessor()
@@ -1898,17 +1801,12 @@ def test_vlm_widening_plan_still_requires_a_pad_token():
 
 
 def test_vlm_planned_width_steps_above_the_surveyed_maximum_on_collision():
-    """The forbidden-extent bump outranks the surveyed-maximum cap.
-
-    Declining the capped width instead would split one shared endpoint back
-    into one per raw width, so the overflow is the cheaper of the two; it
-    still has to produce endpoints every member batch can actually reach.
-    """
+    """Forbidden-extent bump outranks the surveyed-maximum cap, since declining the capped width would split shared
+    endpoints per raw width; endpoints must stay reachable."""
     _skip_if_mlx_core_was_replaced()
 
     class _ForeignExtentProcessor(_UniformNoPadProcessor):
-        # The last two batches carry a sidecar whose extent equals the widest
-        # surveyed text width, so the union forbids that width for everyone.
+        # The last two batches carry a sidecar whose extent equals the widest surveyed text width, so the union forbids that width for every batch.
         _ROWS = ((20, 6), (32, 6), (20, 6), (32, 6), (20, 32), (20, 32))
 
         def __init__(self):
@@ -1947,8 +1845,7 @@ def test_vlm_planned_width_steps_above_the_surveyed_maximum_on_collision():
 
 
 def test_vlm_plan_rejects_a_rebuild_that_leaves_its_frozen_endpoint():
-    """Endpoints freeze at survey time, so a processor that rebuilds at a new
-    width hard-fails on the planned fetch whether or not a pad id exists."""
+    """Endpoints freeze at survey time, so a processor rebuilding at a new width hard-fails on the planned fetch, with or without a pad id."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.shape_guard import FULL_STEP_SCOPE, phase_for_microstep
 
@@ -1976,18 +1873,13 @@ def test_vlm_plan_rejects_a_rebuild_that_leaves_its_frozen_endpoint():
     processor.training = True
     assert plan.check_family_drift(0, plan._build_batch(0)) is None
 def test_vlm_drift_error_names_the_survey_for_privately_owned_draw_state():
-    """The survey builds every batch through the processor once before
-    training and preserves only the PROCESS RNGs around it, so a processor
-    carrying draw state of its own reaches training one survey further along
-    and drifts. There is no generic way to restore another object's state, so
-    the message has to say where the shift came from: on its own it sends the
-    user to a data pipeline that is fine on the eager path."""
+    """Survey runs the processor once and only preserves process RNGs, so privately owned draw state drifts; no generic
+    restore exists, so the error must name the survey as the cause."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
     class _PrivateCounterProcessor(_ContentProcessor):
-        """Carries the reviewer's 'augmentation counter': private state that
-        no RNG preservation reaches, advanced once per call."""
+        """Carries private augmentation counter state that no RNG preservation reaches, advanced once per call."""
 
         def __init__(self):
             self.calls = 0
@@ -2011,8 +1903,7 @@ def test_vlm_drift_error_names_the_survey_for_privately_owned_draw_state():
     assert processor.calls == 4
 
     rebuilt = plan._build_batch(0)
-    # Training resumes the private stream past the survey, so batch 0 rebuilds
-    # into a structure its own surveyed family never had.
+    # Training resumes the private stream past the survey, so batch 0 rebuilds into a structure its surveyed family never had.
     assert processor.calls == 5 and "extra_mask" in rebuilt
     with pytest.raises(RuntimeError) as excinfo:
         plan.check_family_drift(0, rebuilt)
@@ -2023,16 +1914,7 @@ def test_vlm_drift_error_names_the_survey_for_privately_owned_draw_state():
 def test_vlm_plan_releases_the_previous_batch_before_building_the_next(
     monkeypatch,
 ):
-    """A move to the next scheduled batch must not hold two batches at once.
-
-    The training loop clears its own ``batch_data`` reference before every
-    fetch, so the plan's most-recent-batch cache is the last thing that can
-    keep the previous batch alive while the builder allocates the next one.
-    Holding it across the build doubles the batch-side residency at every
-    transition, which for large image batches is a peak-memory cost paid for
-    nothing: the cached batch can no longer serve this fetch. A repeated
-    fetch of the same batch still returns from the cache without rebuilding.
-    """
+    """Plan drops its last-batch cache before building the next batch so two batches never coexist (the loop already clears batch_data); repeat fetches still hit it."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan, _create_vlm_batch_plan
 
@@ -2134,10 +2016,8 @@ def _reused_buffer_vlm_datasets():
 
 
 def test_vlm_plan_reports_a_dataset_that_overwrites_a_media_buffer():
-    """Every scheduled row is collected before any is processed, so a dataset
-    that reuses one decode buffer leaves earlier rows holding the last image.
-    Copying each payload would cost one image per scheduled slot rather than
-    per row, so the plan probes content and reports it instead."""
+    """Rows are collected before processing, so a dataset reusing one decode buffer aliases earlier rows to the last
+    image; the plan probes and reports it, since copying each payload would cost one image per slot."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -2155,9 +2035,7 @@ def test_vlm_plan_reports_a_dataset_that_overwrites_a_media_buffer():
 
 
 def test_vlm_plan_rechecks_media_between_setup_and_the_batch_that_uses_it():
-    """Batches are built on demand, so a payload mutated after setup is still
-    live when the processor finally reads it. The eager builder had already
-    converted every row to tensors, so the same mutation could not reach it."""
+    """Batches are built on demand, so media mutated after setup is still live at read time; the eager builder had already converted rows to tensors."""
     _skip_if_mlx_core_was_replaced()
     import numpy as np
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
@@ -2190,9 +2068,7 @@ def test_vlm_plan_rechecks_media_between_setup_and_the_batch_that_uses_it():
 
 
 def test_vlm_plan_keeps_referencing_media_payloads_it_does_not_own():
-    """The probe must stay a probe: a dataset that returns its images by
-    reference on every revisit keeps ONE object per row across all scheduled
-    slots, because copying them would scale with steps rather than rows."""
+    """The probe must stay a probe: a dataset returning images by reference keeps one object per row across slots, since copying would scale with steps, not rows."""
     _skip_if_mlx_core_was_replaced()
     from PIL import Image
 
@@ -2220,8 +2096,7 @@ def test_vlm_plan_keeps_referencing_media_payloads_it_does_not_own():
 
 
 def test_vlm_plan_accepts_a_dataset_that_returns_a_fresh_image_per_read():
-    """The probe must not fire on a dataset that decodes fresh, which is what
-    HuggingFace `datasets` and a plain list of rows both do."""
+    """The probe must not fire on datasets that decode a fresh image per read, such as HuggingFace datasets or a plain list of rows."""
     _skip_if_mlx_core_was_replaced()
     from PIL import Image
 
@@ -2250,9 +2125,7 @@ def test_vlm_plan_accepts_a_dataset_that_returns_a_fresh_image_per_read():
 
 
 def test_vlm_media_probe_sees_a_change_that_a_sparse_sample_would_miss():
-    # A sampled probe reads a fixed stride derived from the shape, so a
-    # mutation that lands between samples is invisible to it. The digest reads
-    # every byte, so a change that cancels under a sum still registers.
+    # A sampled probe reads a fixed stride, so mutations between samples are invisible; the digest reads every byte, so cancelling sum changes still register.
     Image = pytest.importorskip("PIL.Image")
     from unsloth_zoo.mlx.utils import _vlm_media_fingerprint
 
@@ -2287,10 +2160,7 @@ def test_vlm_media_probe_sees_a_change_that_a_sparse_sample_would_miss():
 
 
 def test_vlm_media_probe_sees_an_in_place_byte_permutation():
-    """Geometric augmentation rewrites a buffer with a permutation of its own
-    bytes, which both a byte sum and a byte xor are blind to. The digest must
-    be order sensitive or the plan accepts exactly the corruption it exists to
-    report."""
+    """Media digest must be order sensitive, or in-place geometric byte permutations pass as unchanged, since a byte sum and a byte xor are both blind to them."""
     Image = pytest.importorskip("PIL.Image")
     torch = pytest.importorskip("torch")
     from unsloth_zoo.mlx.utils import _vlm_media_fingerprint
@@ -2318,8 +2188,7 @@ def test_vlm_media_probe_sees_an_in_place_byte_permutation():
         ), f"{name} must be a byte permutation, or it is not the gap under test"
         assert _vlm_media_fingerprint(base) != _vlm_media_fingerprint(mutated), name
 
-    # Byte permutation for float payloads too: reversing an axis moves whole
-    # 4-byte groups, so the byte multiset survives.
+    # Byte permutation also for float payloads: reversing an axis moves whole 4-byte groups, so the byte multiset survives.
     tensor = torch.from_numpy(base.astype(np.float32) / 255.0)
     assert _vlm_media_fingerprint(tensor) != _vlm_media_fingerprint(
         torch.flip(tensor, dims=[1]).contiguous()
@@ -2330,16 +2199,12 @@ def test_vlm_media_probe_sees_an_in_place_byte_permutation():
 
 
 def test_vlm_plan_reports_an_in_place_augmentation_over_a_reused_buffer():
-    """The reachable form of the same gap: one decode buffer plus an in-place
-    flip per read leaves every stored row aliasing the final image, and each
-    read is a byte permutation of the last, so a commutative digest saw no
-    change at all."""
+    """One decode buffer with an in-place flip per read aliases every row to the final image; a commutative digest sees no change, so it must be order sensitive."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
     class _FlipInPlace:
-        """Augments one shared buffer, the way a single-sample or repeated-row
-        dataset with in-place geometric augmentation does."""
+        """Augments one shared buffer in place, like a single-sample or repeated-row dataset with in-place geometric augmentation."""
 
         def __init__(self):
             self.buffer = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
@@ -2371,9 +2236,8 @@ def test_vlm_plan_reports_an_in_place_augmentation_over_a_reused_buffer():
 
 
 def test_vlm_plan_releases_image_handles_nested_in_a_tuple(tmp_path):
-    # The snapshot walker traverses tuples, so the release and restore walkers
-    # must too: a row shaped {"images": (Image.open(path),)} otherwise keeps
-    # every descriptor open for the life of the plan.
+    # The snapshot walker traverses tuples, so release and restore must too; otherwise a tuple-nested Image.open keeps
+    # every descriptor open for the plan's life.
     Image = pytest.importorskip("PIL.Image")
     from unsloth_zoo.mlx.utils import (
         _release_vlm_row_image_handles,
@@ -2416,18 +2280,14 @@ def test_vlm_plan_releases_image_handles_nested_in_a_tuple(tmp_path):
 
 
 def test_vlm_plan_reports_a_dataset_that_reuses_one_temporary_image_path(tmp_path):
-    """Releasing a handle makes the FILE the payload, so a reused path aliases
-    exactly like a reused decode buffer: every scheduled row re-opens the last
-    sample. The eager builder decoded each handle before the next read, so this
-    is only reachable once the plan collects every row first."""
+    """After releasing handles, a reused temp path makes the file the payload and aliases rows like a reused buffer; only reachable since rows are collected first."""
     Image = pytest.importorskip("PIL.Image")
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
     shared = tmp_path / "row.png"
 
     class _OneSharedPath:
-        """Writes every sample to one scratch file, the way a dataset that
-        renders or downloads to a fixed temporary path does."""
+        """Writes every sample to one scratch file, like a dataset that renders or downloads to a fixed temporary path."""
 
         def __init__(self):
             self.written = []
@@ -2459,8 +2319,7 @@ def test_vlm_plan_reports_a_dataset_that_reuses_one_temporary_image_path(tmp_pat
 
 
 def test_vlm_plan_materializes_per_row_image_files_unchanged(tmp_path):
-    """The control for the check above: one file per sample is the normal
-    shape, so it must plan, materialize and read back its own pixels."""
+    """Control case: one file per sample is the normal shape and must plan, materialize and read back its own pixels."""
     Image = pytest.importorskip("PIL.Image")
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -2501,8 +2360,7 @@ def test_vlm_plan_materializes_per_row_image_files_unchanged(tmp_path):
 
 
 def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_path):
-    """The second half of the same window: a released row is only re-opened at
-    materialize, so the file can also be rewritten after the plan is built."""
+    """Released rows reopen their file only at materialize, so a file rewritten after the plan is built is also reported."""
     Image = pytest.importorskip("PIL.Image")
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -2593,10 +2451,8 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
     assert target is not None and target > guarded_width
 
 
-# Per family: the rebindings its installer must make, as (module, class or None
-# for a module-level name, attribute[, the `unsloth_zoo.mlx.compile` attribute it
-# must be bound to]); the merge it replaces, as (class or None, attribute,
-# upstream requires equal counts), or None when it only delegates to a shared one.
+# Per family: rebindings as (module, class or None, attribute[, unsloth_zoo.mlx.compile attribute]); merge as (class or
+# None, attribute, upstream requires equal counts) or None when delegating.
 HOST_GRID_FAMILIES = [
     ("dots_ocr",
      [("vision", "VisionModel", "__call__"),
@@ -2650,11 +2506,7 @@ HOST_GRID_FAMILIES = [
 
 @contextlib.contextmanager
 def _installer_patches_restored(arch):
-    """Run an installer and put both of its modules back exactly as they were.
-
-    The installers rebind class methods and module-level names, and anything
-    left behind would change what a later test in this session measures.
-    """
+    """Runs an installer and restores both modules afterwards, since installers rebind methods and module names that later tests would otherwise see."""
     import importlib
 
     import unsloth_zoo.mlx.compile as mc
@@ -2686,10 +2538,8 @@ def _installer_patches_restored(arch):
 
 @pytest.mark.parametrize("arch,bindings,merge", HOST_GRID_FAMILIES)
 def test_each_host_grid_family_is_qualified_and_really_patched(arch, bindings, merge):
-    """Qualifying one of these without wiring its installer would compile the
-    unpatched tower, which reads the grid back on the host; a no-op installer
-    would satisfy that wiring and still leave the tower unpatched. The merge it
-    replaces also has to keep refusing what its own upstream refused."""
+    """Each host-grid family needs a real installer, since an unpatched tower reads the grid back on the host; a no-op
+    installer would pass wiring yet leave it unpatched; the merge must refuse what upstream refuses."""
     _skip_if_mlx_core_was_replaced()
     import ast
     import inspect
@@ -2744,8 +2594,7 @@ def test_each_host_grid_family_is_qualified_and_really_patched(arch, bindings, m
         if isinstance(node, ast.Call)
         and getattr(node.func, "id", None) == "_raise_on_feature_count_mismatch"]
     assert len(calls) == 1, method
-    # Three positional args: the mask, the features, and the embeddings whose
-    # width turns the feature block into a count of placeholders it can fill.
+    # Three positional args: the mask, the features, and the embeddings whose width turns the feature block into a placeholder count it can fill.
     assert len(calls[0].args) == 3, method
     relaxed = any(
         keyword.arg == "exact" and keyword.value.value is False
@@ -2754,9 +2603,8 @@ def test_each_host_grid_family_is_qualified_and_really_patched(arch, bindings, m
 
 
 def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch):
-    """Qwen3-Omni reuses the Qwen3 VL patches; its own embedder has to keep
-    upstream's exact count refusal, hand audio to upstream, and its backbone must
-    drop the per-layer eval only while training."""
+    """Qwen3-Omni reuses the Qwen3 VL patches; its embedder keeps upstream's exact count refusal and hands audio
+    upstream; backbone drops per-layer eval only in training."""
     from types import SimpleNamespace as NS
 
     import unsloth_zoo.mlx.compile as mc
@@ -2820,14 +2668,13 @@ def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch
     assert backbone(None) == "original"
     backbone.training, backbone.norm = True, lambda h: h + 1
     backbone.layers = [lambda h, *args: h] * 2
-    # Compiled end to end: a per-layer eval would raise, and the embedder's
-    # deepstack rows (vision rows * 10) must land on their own positions, then norm.
+    # Compiled end to end, since a per-layer eval would raise; the embedder's deepstack rows (vision rows * 10) must land on their own positions, then norm.
     trained = mx.compile(lambda h: backbone(
         None, inputs_embeds=h, mask="m", visual_pos_masks=out.visual_pos_masks,
         deepstack_visual_embeds=out.deepstack_visual_embeds))
     assert trained(out.inputs_embeds).tolist() == [[[12.0], [1.0], [34.0], [23.0]]]
-    # Upstream's embedder hands full-length residuals: added in place, as upstream does,
-    # never gathered as rows (that would put row 0's residual on the first image token).
+    # Upstream's embedder hands full-length residuals that are added in place, never gathered as rows, which would put
+    # row 0's residual on the first image token.
     full = mx.array([[[0.0], [0.0], [5.0], [7.0]]])
     assert backbone._deepstack_process(
         mx.zeros((1, 4, 1)), mx.array([[False, False, True, True]]), full
@@ -2842,8 +2689,7 @@ def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch
 
 
 def test_the_glm5_next_merge_really_refuses_a_count_mismatch():
-    """Its upstream refuses either direction, so the installed replacement has
-    to as well. Its merge takes no model, so it can be called directly."""
+    """Upstream refuses a count mismatch in either direction, so the installed glm5_next replacement must too; its merge takes no model and can be called directly."""
     _skip_if_mlx_core_was_replaced()
 
     with _installer_patches_restored("glm5_next") as (mc, modules):
@@ -2863,8 +2709,7 @@ def test_the_glm5_next_merge_really_refuses_a_count_mismatch():
 
 
 def test_glm4v_moe_is_patched_but_not_qualified_for_compiled_training():
-    """Its decoder does not compile on MLX 0.32 (IndexError the runtime fallback
-    does not catch), so it must stay eager even though its tower is patched."""
+    """glm4v_moe decoder does not compile on MLX 0.32 (IndexError the runtime fallback does not catch), so it stays eager even though its tower is patched."""
     _skip_if_mlx_core_was_replaced()
     from types import SimpleNamespace
 
@@ -2883,8 +2728,7 @@ def test_glm4v_moe_is_patched_but_not_qualified_for_compiled_training():
 
 
 def test_glm5_next_on_an_older_tower_contract_stays_eager(monkeypatch):
-    """mlx-vlm 0.7.0's glm5_next has no VisionAttention: installing must neither
-    raise (it would abort every family's install) nor qualify the family."""
+    """mlx-vlm 0.7.0's glm5_next lacks VisionAttention: install must neither raise, which would abort every family's install, nor qualify the family."""
     _skip_if_mlx_core_was_replaced()
 
     with _installer_patches_restored("glm5_next") as (mc, modules):
@@ -3065,8 +2909,7 @@ def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
 
 
 def test_cce_only_compile_family_is_refused_on_the_standard_loss():
-    """ernie's upstream forward, which `use_cce=False` runs, still reads on the
-    host; compile must be refused up front rather than fail mid-run."""
+    """ernie's upstream forward, run when use_cce=False, still reads on the host, so compile must be refused up front, not fail mid-run."""
     _skip_if_mlx_core_was_replaced()
     from types import SimpleNamespace as NS
 

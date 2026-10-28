@@ -578,9 +578,7 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert abs(ranks[0]["vlm_param_sum"] - ranks[1]["vlm_param_sum"]) < 1e-5
     assert [rank["resume_ok"] for rank in ranks] == ["resume_ckpt", "resume_ckpt"]
     assert all("all ranks must either resume" in rank["resume_mismatch"] for rank in ranks)
-    # An adapter-only directory is the mistake the single-process resume gate
-    # names FastMLXModel.from_pretrained for; DDP must name it on every rank
-    # instead of blaming cross-rank file visibility.
+    # Adapter-only dirs: the single-process resume gate names FastMLXModel.from_pretrained; DDP must name it on every rank, not blame cross-rank file visibility
     assert all(
         "FastMLXModel.from_pretrained" in rank["resume_adapter_only"]
         and "optimizer_state.safetensors" in rank["resume_adapter_only"]
@@ -624,8 +622,7 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[1]["stream_labeled_empty"][1]["labels"][0] == [-100, -100]
     # Compatibility break: lazy VLM is now rejected on all ranks pre-consumption.
     assert [rank["stream_vlm_rejection"] for rank in ranks] == ["rejected", "rejected"]
-    # W=2: rows 10..14 pool into [10,11],[12,13]; seed 42 emits [12,13] first,
-    # so the partial tail [14] cycle-pads from it.
+    # With W=2, rows 10..14 pool into [10,11] and [12,13]; seed 42 emits [12,13] first, so the partial tail [14] cycle-pads from it
     assert [rank["stream_window"] for rank in ranks] == [
         [[12], [10], [14]], [[13], [11], [12]],
     ]

@@ -12,19 +12,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A test file may not reach a sibling through the `tests.` package.
-
-This repo's `tests/` carries no `__init__.py`, so `tests.foo` does not name
-anything here: it names whatever `tests` package is importable, and there is
-one. Unsloth's Core CI runs these files with its own repo root on `sys.path`,
-and unsloth DOES ship `tests/__init__.py`, so `from tests.x import y` bound to
-that project's package and raised `ModuleNotFoundError: No module named
-'tests.x'` -- taking the whole module out at collection and failing the job
-with exit 2, on every unsloth pull request rather than on anything zoo changed.
-
-A grep, because the import only misbehaves under a `sys.path` this suite does
-not control, so no amount of running the files from this repo would catch it.
-"""
+"""Test files must not import siblings via tests.: unsloth ships tests/__init__.py, so under its CI sys.path that import
+raises ModuleNotFoundError; a grep enforces it."""
 
 import ast
 import pathlib
@@ -41,8 +30,7 @@ def _imports_through_the_tests_package(source: str) -> list:
     found = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            # `level` is the number of leading dots: a relative import names
-            # this directory and is not the failure mode.
+            # level counts leading dots: relative imports name this directory and are not the failure mode, so only absolute tests. imports are flagged.
             if not node.level and (node.module or "").split(".")[0] == "tests":
                 found.append(f"from {node.module} import ...")
         elif isinstance(node, ast.Import):
@@ -64,13 +52,7 @@ def test_the_pattern_is_recognized():
 
 
 def _scan_the_suite() -> dict:
-    """Every file under `tests/` that reaches a sibling through `tests.`.
-
-    This file is scanned too. Its own examples are string literals and parse to
-    no import node, so there is nothing to exempt - and exempting it would have
-    let the one module whose whole job is refusing this pattern be the one
-    module allowed to carry it.
-    """
+    """Scans all tests/ files for sibling imports through tests.; this file is not exempt, since its own examples are string literals and parse to no import node."""
     offenders = {}
     for path in sorted(TESTS.rglob("*.py")):
         hits = _imports_through_the_tests_package(

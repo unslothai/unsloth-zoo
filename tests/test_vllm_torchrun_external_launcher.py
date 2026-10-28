@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference = True under plain torchrun (DDP).
-
-vLLM's default executor rendezvouses a private world_size = 1 group over a fresh
-tcp:// port. torchrun exports TORCHELASTIC_USE_AGENT_STORE=True, so that rendezvous
-is a TCPStore client of a server that never exists and engine init hangs. load_vllm
-now joins the torchrun group with vLLM's external_launcher executor instead. CPU only:
-the torchrun cases use gloo and never build an engine.
-"""
+"""fast_inference = True under torchrun (DDP): vLLM's private world_size = 1 tcp:// rendezvous hangs since
+TORCHELASTIC_USE_AGENT_STORE=True makes it a TCPStore client with no server; load_vllm uses external_launcher; CPU
+only, gloo."""
 
 import os
 import pathlib

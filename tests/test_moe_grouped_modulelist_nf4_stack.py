@@ -1,9 +1,5 @@
-"""Pointer-table NF4 stacks for the transformers<5 ModuleList grouped MoE path.
-
-_build_gate_up_stack / _build_down_stack build the frozen expert stacks from one Triton launch
-per projection kind (gpt_oss_routed._build_table + nf4_dequant_expert_stack). They must be
-bitwise equal to the bitsandbytes per-expert builders and fall back to them otherwise.
-"""
+"""Pointer-table NF4 stacks for the transformers<5 ModuleList grouped MoE path, built with one Triton launch per
+projection kind; must be bitwise equal to the bitsandbytes per-expert builders and fall back to them otherwise."""
 import pytest
 import torch
 import torch.nn as nn

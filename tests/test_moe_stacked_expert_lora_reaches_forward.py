@@ -14,18 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Expert LoRA must reach the forward for a stacked-expert MoE, whatever forward runs.
-
-`_patched_param_wrapper_forward` does not let PEFT fold an expert LoRA into the stacked
-expert weight. It stashes the factors on the experts module and expects the experts forward
-to apply them as a separate grouped GEMM. Unsloth installs such a forward for the MoE
-families it patches; for a stacked-expert family it does not patch, transformers' own
-experts forward runs and the stash is written and deleted unread, so the adapter has no
-effect on the output while still looking healthy in `named_parameters`.
-
-These tests pin both halves: the stash-reading forwards keep the separated path bit for bit,
-and a forward that ignores the stash gets handed back to PEFT so the LoRA is applied anyway.
-"""
+"""Expert LoRA must reach stacked-expert MoE forwards; stash readers keep the separated path, while forwards that never
+read the stash are handed back to PEFT, else the adapter has no effect."""
 
 from __future__ import annotations
 
@@ -48,13 +38,8 @@ from unsloth_zoo.temporary_patches import moe_utils as MU
 
 
 def _moe_utils_copies():
-    """Every loaded copy of moe_utils that can hold the saved PEFT forward.
-
-    `install_to_cache` copies this module into unsloth_compiled_cache and
-    `patch_param_wrapper_for_moe` prefers that copy, so the function PEFT ends up with, and
-    the saved original, usually belong to `unsloth_cached_moe_utils` and not to the package
-    module a test imported.
-    """
+    """Every loaded moe_utils copy that can hold the saved PEFT forward; patch_param_wrapper_for_moe prefers the
+    unsloth_cached_moe_utils copy from install_to_cache over the imported module."""
     copies = [MU]
     for name in ("unsloth_cached_moe_utils", "moe_utils"):
         module = sys.modules.get(name)
@@ -65,13 +50,8 @@ def _moe_utils_copies():
 
 @pytest.fixture
 def restore_param_wrapper():
-    """Start every test from PEFT's own `ParamWrapper.forward`, and put back what was there.
-
-    Importing `unsloth_zoo.temporary_patches` applies the MoE patches as a side effect, so
-    the wrapper may already be patched by the time a test runs. Without this reset the
-    "before" half of a before-and-after comparison would be measured through the patch too,
-    and the comparison would pass by being vacuous.
-    """
+    """Starts each test from PEFT's own ParamWrapper.forward and restores it after; importing
+    unsloth_zoo.temporary_patches already patches it, else before/after checks pass vacuously."""
     peft_layer = pytest.importorskip("peft.tuners.lora.layer")
     ParamWrapper = getattr(peft_layer, "ParamWrapper", None)
     if ParamWrapper is None:
@@ -99,11 +79,7 @@ def _assert_wrapper_is_unpatched(ParamWrapper):
 
 
 class _StashIgnoringExperts(nn.Module):
-    """Stacked experts whose forward never looks at `_unsloth_lora_*`.
-
-    This is what transformers' own experts forward does for every MoE family Unsloth has no
-    patch for, Olmoe among them.
-    """
+    """Stacked experts whose forward never reads the _unsloth_lora_* stash, like transformers' own experts forward for MoE families Unsloth does not patch (Olmoe)."""
 
     def __init__(self, num_experts=4, hidden=8, intermediate=6):
         super().__init__()
@@ -194,8 +170,7 @@ def test_verdict_is_cached_per_parameter_and_invalidated_by_a_new_forward():
     assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is False
     assert MU.moe_lora_forward_applies_stash(experts, "down_proj") is True
 
-    # Re-patching the forward must retire the verdict rather than answer for a function
-    # that is no longer the one that will run.
+    # Re-patching the forward must retire the recorded verdict, not answer for a function that is no longer the one that will run.
     experts.forward = lambda hidden_states: hidden_states
     assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is None
 
@@ -360,8 +335,7 @@ def test_every_stash_read_goes_through_the_helper(filename):
     """A raw read would not be recorded, so the wrapper would think the LoRA was applied."""
     path = Path(MU.__file__).with_name(filename)
     source = path.read_text(encoding="utf-8")
-    # The writer side lives in `_patched_param_wrapper_forward` and uses the experts module,
-    # not `self`, so only `self`-qualified reads are the forward-side ones.
+    # The writer lives in _patched_param_wrapper_forward and uses the experts module, not self, so only self-qualified reads count as forward-side reads.
     offenders = _STASH_READ.findall(source) + _STASH_ATTR.findall(source)
     assert offenders == [], (
         f"{filename} reads the expert LoRA stash directly for {sorted(set(offenders))}; "
@@ -383,14 +357,7 @@ def test_fp8_last_resort_loop_still_refuses_an_unappliable_lora():
 
 
 def test_has_bnb_is_false_when_params4bit_is_not_a_class():
-    """`HAS_BNB` must mean "isinstance against Params4bit is legal", not "the import ran".
-
-    Where the real bitsandbytes is absent, unsloth_zoo injects a permissive stub whose every
-    attribute is a placeholder object. `from bitsandbytes.nn import Params4bit` then succeeds
-    and returns a non-class, and `_is_moe_experts_module` and `_get_base_weight` both go
-    straight into `isinstance(param, Params4bit)`, which raises
-    `TypeError: isinstance() arg 2 must be a type`. That is every expert forward on a Mac.
-    """
+    """HAS_BNB must mean Params4bit is a real class: without bitsandbytes, the stub makes isinstance(param, Params4bit) raise TypeError on every Mac expert forward."""
     if MU.HAS_BNB:
         assert isinstance(MU.Params4bit, type)
     else:
@@ -401,11 +368,7 @@ def test_has_bnb_is_false_when_params4bit_is_not_a_class():
     "moe_utils", "moe_utils_bnb4bit", "moe_grouped_modulelist",
 ])
 def test_every_module_level_has_bnb_implies_a_real_class(module_name):
-    """The same guard in every sibling that keeps its own HAS_BNB and Params4bit pair.
-
-    Each of these does `isinstance(w, Params4bit)` gated only on its own HAS_BNB, so one of
-    them left honest and the others not is a half fix.
-    """
+    """Every sibling module with its own HAS_BNB and Params4bit pair needs the same real-class guard; one left unguarded is a half fix."""
     import importlib
     module = importlib.import_module(f"unsloth_zoo.temporary_patches.{module_name}")
     if getattr(module, "HAS_BNB", False):
@@ -433,22 +396,7 @@ def test_is_moe_experts_module_survives_a_stubbed_params4bit(monkeypatch):
 
 
 def test_non_reentrant_gradient_checkpointing_survives_the_measurement(restore_param_wrapper):
-    """The measuring call must not save tensors the later calls do not save.
-
-    `torch.utils.checkpoint` with `use_reentrant = False` replays the region in the
-    backward and refuses, with `CheckpointError: A different number of tensors was saved
-    during the original forward and recomputation`, if the replay does not save what the
-    forward saved. Measuring in band cannot satisfy that: the first call runs the experts
-    forward to find out and then again through PEFT when the answer is no, while the
-    recompute already has the verdict and runs it once.
-
-    This is the configuration transformers 5 chooses by default, from
-    `modeling_utils.gradient_checkpointing_enable`:
-    `gradient_checkpointing_kwargs = {"use_reentrant": False}`, and the one Unsloth's own
-    vision path selects whenever the run is distributed. Both halves of the family split
-    are checked, because a fix that only reroutes differently would still leave the
-    stash-reading half saving a different number of tensors on its first call.
-    """
+    """The measuring call must not save tensors later calls do not: non-reentrant checkpoint (transformers 5 default) raises CheckpointError on a count mismatch."""
     from torch.utils.checkpoint import checkpoint
 
     assert MU.patch_param_wrapper_for_moe()
@@ -467,12 +415,8 @@ def test_non_reentrant_gradient_checkpointing_survives_the_measurement(restore_p
 
 
 def test_the_measurement_happens_once_and_costs_one_forward_afterwards(restore_param_wrapper):
-    """Steady state is one experts forward per call, for both halves of the family split.
-
-    The measurement is a one-off. If it were not, a family that ignores the stash would pay
-    the double call on every step, and a family that reads it would stop being byte for
-    byte what main runs.
-    """
+    """The stash measurement is one-off; after it each call runs one experts forward, else stash-ignoring families pay a
+    double call every step and stash readers stop matching main byte for byte."""
     assert MU.patch_param_wrapper_for_moe()
     x = _inputs()
     for experts_cls in (_StashIgnoringExperts, _StashReadingExperts):
@@ -505,17 +449,10 @@ def test_the_measurement_happens_once_and_costs_one_forward_afterwards(restore_p
 
 
 def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold(monkeypatch):
-    """PEFT folds by adding a delta to the stored parameter, which needs a real float.
-
-    A stacked expert weight held as `Params4bit`, MXFP4 blocks or FP8 is not one, so the
-    reroute must decline and leave that case as it is on main. The MXFP4 GPT-OSS experts
-    forward is the live one: it reads its LoRA through `_get_lora_wrapper_for_param`, which
-    resolves to None against PEFT's `target_parameters` layout, so nothing records a read
-    and the verdict for that forward is False.
-    """
-    # Through monkeypatch: a saved forward left behind here is the one every later test
-    # ends up calling, and a stand-in that returns None would make those look like a model
-    # producing no output at all.
+    """PEFT folds by adding a delta, which needs a real float, so Params4bit, MXFP4 and FP8 expert weights must decline
+    the reroute; MXFP4 GPT-OSS gets False because _get_lora_wrapper_for_param resolves to None under
+    target_parameters."""
+    # Set through monkeypatch: a saved forward left behind would be called by every later test, and a None stand-in would look like a model producing no output.
     monkeypatch.setattr(
         MU,
         "_original_param_wrapper_forward",
@@ -545,19 +482,8 @@ def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold(monkeypatch)
 
 
 def test_the_probe_retains_no_autograd_graph_for_the_second_forward():
-    """The probe must not keep a graph alive while PEFT's forward allocates its own.
-
-    An earlier shape of this code ran the probe in-band and held its output in a local
-    across the fallback call, so that forward's expert activations stayed resident, by way
-    of the result's grad_fn, while the second forward built its own set. MoE training sits
-    near the memory limit and this happens once per newly probed layer on the FIRST step,
-    so the doubling reads as a first-step OOM that later steps never reproduce.
-
-    `_measure_moe_lora_stash_read` answers it structurally rather than by releasing
-    afterwards: the probe runs under `torch.no_grad()` and its return value is not bound at
-    all, so there is no graph to retain. Both halves are asserted, because either one alone
-    can be lost in a refactor and neither is visible in a passing functional test.
-    """
+    """The probe runs under torch.no_grad() with its return value unbound, so no autograd graph outlives it; an in-band
+    probe kept a graph alive and doubled peak memory on the first step."""
     import ast
     import inspect
 
@@ -598,8 +524,7 @@ def test_the_probe_retains_no_autograd_graph_for_the_second_forward():
 
 
 def test_the_probe_result_never_reaches_the_peft_fallback():
-    """The same property from the outside: when PEFT's forward runs, no local in the
-    patched forward is holding a tensor that carries a grad_fn."""
+    """When PEFT's forward runs, no local of the patched forward may hold a tensor that carries a grad_fn."""
     import inspect
 
     assert MU.patch_param_wrapper_for_moe()
@@ -657,8 +582,7 @@ class _ProbeWrapper(nn.Module):
 
 
 def _run_probe(monkeypatch, experts):
-    """Drive `_measure_moe_lora_stash_read` with the surrounding machinery stubbed out,
-    so what the test observes is the probe forward and nothing else."""
+    """Runs _measure_moe_lora_stash_read with LoRA extraction, stash reset, read detection and verdict recording stubbed, so only the probe forward is observed."""
     monkeypatch.setattr(MU, "_extract_lora_from_wrapper", lambda wrapper: None)
     monkeypatch.setattr(MU, "_reset_moe_lora_stash_read", lambda module, name: None)
     monkeypatch.setattr(MU, "_moe_lora_stash_was_read", lambda module, name: True)
@@ -669,16 +593,7 @@ def _run_probe(monkeypatch, experts):
 
 
 def test_the_probe_forward_leaves_the_rng_where_it_found_it(monkeypatch):
-    """`no_grad` turns off the graph, it does not preserve RNG.
-
-    Every random draw in the throwaway forward advances the generator, so without a fork
-    the call that counts gets different numbers than it would have without the probe. The
-    sharp edge is gradient checkpointing: non-reentrant checkpointing restores the RNG
-    state at the start of the region and replays it, and the original pass runs probe plus
-    real forward while the recompute has the verdict cached and runs the real forward
-    alone, so the two draw different dropout masks for the same region and the gradients
-    are computed against a mask the forward never used.
-    """
+    """no_grad turns off the graph, not RNG: the probe forks RNG, else its draws shift the counted forward and checkpoint recompute gets different dropout masks."""
     experts = _RNGConsumingExperts()
 
     torch.manual_seed(1234)
@@ -695,8 +610,7 @@ def test_the_probe_forward_leaves_the_rng_where_it_found_it(monkeypatch):
 
 
 def test_the_probe_still_reports_a_raising_forward_as_no_evidence(monkeypatch):
-    """NEGATIVE CONTROL: the fork must not swallow the failure path. A probe that raises
-    still returns None, which caches nothing and leaves the call on the stash path."""
+    """NEGATIVE CONTROL: a probe whose forward raises still returns None, which caches no verdict and leaves the call on the stash path."""
 
     class _Raises(nn.Module):
         def forward(self, x, *args, **kwargs):
@@ -706,10 +620,8 @@ def test_the_probe_still_reports_a_raising_forward_as_no_evidence(monkeypatch):
 
 
 def test_the_probe_names_the_backend_rather_than_letting_fork_rng_guess(monkeypatch):
-    """`fork_rng`'s `devices` identifies devices WITHIN `device_type`, which it otherwise
-    resolves from `torch.accelerator.current_accelerator()` and falls back to "cuda" for.
-    An XPU activation forked without naming the backend asks the wrong module for a
-    generator state."""
+    """fork_rng's devices are within device_type, which otherwise comes from torch.accelerator.current_accelerator()
+    (cuda fallback); unnamed, XPU forks ask the wrong module for RNG state."""
     seen = {}
 
     def _record(devices = None, enabled = True, device_type = None, **kwargs):
@@ -750,14 +662,8 @@ def test_a_fork_that_cannot_be_set_up_leaves_the_forward_running(monkeypatch):
 
 
 def test_the_probe_does_not_run_at_all_while_dynamo_is_tracing(monkeypatch):
-    """Dynamo has no notion of a one-time measurement.
-
-    It traces the throwaway forward into the graph beside the call that counts, so the
-    compiled region runs the experts forward three times on EVERY invocation rather than
-    once during a warm-up: six expert einsums in one graph where two are correct, measured
-    on PyTorch 2.12 with fullgraph. Returning None caches no verdict and leaves the call on
-    the stash path, which is what this module did before the probe existed.
-    """
+    """Under Dynamo the probe would be traced and run the experts forward three times per call (six einsums, not two;
+    PyTorch 2.12 fullgraph), so it returns None while tracing."""
     experts = _RNGConsumingExperts()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     assert _run_probe(monkeypatch, experts) is None
@@ -769,8 +675,7 @@ def test_the_probe_does_not_run_at_all_while_dynamo_is_tracing(monkeypatch):
 
 
 def test_the_rng_guard_is_inert_while_tracing(monkeypatch):
-    """The helper is usable on its own, so it keeps its own check: a generator-based
-    context manager in a captured graph is a break, and under fullgraph a hard error."""
+    """The RNG guard keeps its own check: a generator-based context manager is a graph break inside a captured graph, and a hard error under fullgraph."""
     called = {"n": 0}
 
     def _count(*args, **kwargs):
@@ -793,18 +698,10 @@ def test_the_rng_guard_is_inert_while_tracing(monkeypatch):
 def test_a_compiled_first_call_applies_the_lora_instead_of_the_unread_stash(
     restore_param_wrapper, monkeypatch
 ):
-    """A model whose FIRST invocation is compiled has no verdict and no way to get one.
-
-    The probe cannot run inside a captured graph without being captured with it and re-run
-    on every call. Leaving the call inconclusive took the separated stash path, and on a
-    family whose experts forward ignores the stash Dynamo would reuse that graph forever
-    with the expert LoRA absent from every output and gradient. The fold has to happen
-    instead, and while tracing it happens without PEFT's parametrization.
-    """
+    """A compiled first call cannot probe, so it folds the LoRA without PEFT's parametrization, since the stash path would let Dynamo reuse a graph with no LoRA."""
     assert MU.patch_param_wrapper_for_moe()
     x = _inputs()
-    # The reference runs on its own copy, so the subject's FIRST call is the compiled one
-    # and no verdict has been measured for it.
+    # The reference runs on its own copy, so the subject's first call is the compiled one with no verdict measured yet.
     with torch.no_grad():
         folded = _build(_StashIgnoringExperts)(x)
 
@@ -819,8 +716,7 @@ def test_a_compiled_first_call_applies_the_lora_instead_of_the_unread_stash(
         "expert LoRA is absent from the output"
     )
     assert MU._forward_statically_reads_stash(experts) is False
-    # Nothing recorded, so the first eager call still measures and every later compile
-    # uses the real verdict rather than this assumption.
+    # Nothing is recorded yet, so the first eager call still measures and later compiles use the real verdict rather than the tracing assumption.
     assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is None
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
@@ -832,9 +728,7 @@ def test_a_compiled_first_call_applies_the_lora_instead_of_the_unread_stash(
 def test_a_compiled_first_call_keeps_the_stash_path_for_a_stash_reading_family(
     restore_param_wrapper, monkeypatch
 ):
-    """NEGATIVE CONTROL: the assumption must not cost the supported families their fast
-    path when a verdict already exists. Once measured eagerly, a compiled call follows the
-    recorded verdict, not the tracing assumption."""
+    """NEGATIVE CONTROL: once an eager verdict exists, a compiled call follows it, not the tracing assumption, so stash-reading families keep their fast path."""
     assert MU.patch_param_wrapper_for_moe()
     calls = []
 
@@ -859,21 +753,13 @@ def test_a_compiled_first_call_keeps_the_stash_path_for_a_stash_reading_family(
 
 
 def test_the_static_answer_recognises_a_stash_reading_forward():
-    """The thing the compiled cold start is decided on, on its own.
-
-    Every forward that applies the separated expert LoRA calls take_moe_lora_stash, so the
-    name in its code object is what tells an Unsloth-installed forward from transformers'
-    own. Both wrong answers are costly, which is why the decision is not a fixed
-    assumption: assuming unread sends a supported family into PEFT's ParamWrapper.forward,
-    which registers a parametrization while tracing and hard-fails under fullgraph;
-    assuming read leaves the LoRA out of every output on a family that ignores the stash.
-    """
+    """_forward_statically_reads_stash finds take_moe_lora_stash in a forward's code object; assuming unread hard-fails
+    fullgraph for supported families, assuming read drops the LoRA from stash-ignoring ones."""
     assert MU._forward_statically_reads_stash(_StashReadingExperts(4, 8, 4)) is True
     assert MU._forward_statically_reads_stash(_StashIgnoringExperts(4, 8, 4)) is False
 
     class _ReadsInAHelper(_StashIgnoringExperts):
-        """Nested code objects count too: a comprehension or an inner function is where a
-        real forward often makes the call."""
+        """Nested code objects count too, since a comprehension or inner function is often where a real forward makes the stash call."""
 
         def forward(self, hidden_states):
             def _inner():
@@ -889,14 +775,8 @@ def test_the_static_answer_recognises_a_stash_reading_forward():
 
 
 def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper):
-    """The reroute must not cost these families full-graph compilation.
-
-    PEFT's `_activate_lora` registers a parametrization for the call, and the `set_` that
-    performs on the stored parameter is a graph-input mutation Dynamo refuses with
-    "Getting an inplace view on a graph input is not supported", which is a hard error
-    under fullgraph. Folding the same delta ourselves has to give PEFT's numbers, PEFT's
-    gradients, and a model that still compiles.
-    """
+    """The reroute must not cost full-graph compilation: PEFT _activate_lora registers a parametrization and calls set_
+    on the stored parameter, which Dynamo refuses under fullgraph; the fold must match PEFT numbers and gradients."""
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     x = _inputs()
@@ -928,15 +808,8 @@ def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper)
 
 
 def test_the_fold_swaps_inside_parameters_and_never_shadows_through_dunder_dict(restore_param_wrapper):
-    """The swap has to be one Dynamo can trace, and `__dict__` is not one.
-
-    Shadowing the registered parameter with an entry in the instance `__dict__` reads
-    correctly and restores correctly, and it is still wrong here: `experts_module.__dict__`
-    is an unknown type to Dynamo, so taking the shadow back out raises `Unsupported:
-    Dynamo does not know how to trace method 'pop' of class '<unknown type>'` on torch
-    2.10, which is inside the range this package supports. Swapping the value inside
-    `_parameters`, which `nn.Module.__getattr__` reads, traces on the whole range.
-    """
+    """Swap the value inside _parameters, not the instance __dict__: Dynamo cannot trace removing the shadow from
+    __dict__ (Unsupported on torch 2.10); _parameters traces on the whole range."""
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrapper = next(
@@ -966,8 +839,7 @@ def test_the_fold_swaps_inside_parameters_and_never_shadows_through_dunder_dict(
 
 
 def test_the_fold_refuses_a_parameter_something_else_already_shadows(restore_param_wrapper):
-    """NEGATIVE CONTROL: swapping `_parameters` under a shadow folds into a value nothing
-    reads, which is the silent no-op this whole file exists to rule out."""
+    """NEGATIVE CONTROL: swapping _parameters under an instance-dict shadow folds into a value nothing reads, the silent no-op this file exists to rule out."""
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrapper = next(
@@ -985,11 +857,7 @@ def test_the_fold_refuses_a_parameter_something_else_already_shadows(restore_par
 
 
 def _install_peft_main_delta_factors(model):
-    """PEFT main's `get_delta_factors` on this model's wrappers, for a PEFT without it.
-
-    The installed peft predates the factored API, so the route that matters for memory
-    cannot be exercised through it. This is upstream's implementation verbatim.
-    """
+    """Installs PEFT main's get_delta_factors verbatim, since the installed peft predates the factored API and cannot exercise the memory-relevant route."""
     import types
 
     def get_delta_factors(self, adapter_name):
@@ -1012,13 +880,8 @@ def _install_peft_main_delta_factors(model):
 
 
 def test_one_adapter_over_many_experts_folds_through_the_factors(restore_param_wrapper):
-    """PEFT keeps the low-rank factors for this case, and so must this fold.
-
-    `get_delta_weight` materialises a delta the size of the whole expert stack, and the
-    add then allocates a second one. On OlmoE that is 64 experts of dense weight twice per
-    projection per layer, which is what a single `baddbmm` over the factors avoids. The
-    result has to be the same weight either way.
-    """
+    """Fold via low-rank factors in one baddbmm as PEFT does; get_delta_weight plus the add allocate two dense
+    expert-stack tensors per projection (64 experts on OlmoE)."""
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrappers = _install_peft_main_delta_factors(model)
@@ -1036,13 +899,8 @@ def test_one_adapter_over_many_experts_folds_through_the_factors(restore_param_w
 
 
 def test_a_peft_without_the_factored_api_still_folds(restore_param_wrapper, monkeypatch):
-    """NEGATIVE CONTROL: `get_delta_factors` is newer than the oldest PEFT that has
-    `target_parameters`, so its absence must fall back to the dense delta, not to nothing.
-
-    The absence is simulated rather than asserted, since peft>=0.18.0 is unbounded here and
-    0.21.0 already ships the factored API, so asserting it would fail on a resolution the
-    package allows.
-    """
+    """NEGATIVE CONTROL: get_delta_factors is newer than the oldest PEFT with target_parameters, so its absence must
+    fall back to the dense delta, not to nothing; 0.21.0 ships it, so the test simulates the absence."""
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrapper = next(m for m in model.modules() if type(m).__name__ == "ParamWrapper")
@@ -1057,9 +915,7 @@ def test_a_peft_without_the_factored_api_still_folds(restore_param_wrapper, monk
 
 
 def test_the_eager_path_still_goes_through_peft(restore_param_wrapper, monkeypatch):
-    """NEGATIVE CONTROL: the parametrization-free fold is for the compiled path only.
-    Eagerly PEFT stays in charge, so nothing it does inside `_activate_lora` is bypassed
-    on a path where it runs perfectly well."""
+    """NEGATIVE CONTROL: the parametrization-free fold is for the compiled path only; eagerly PEFT stays in charge, so its _activate_lora work is not bypassed."""
     assert MU.patch_param_wrapper_for_moe()
     calls = []
 
@@ -1078,15 +934,8 @@ def test_the_eager_path_still_goes_through_peft(restore_param_wrapper, monkeypat
 
 
 def test_the_static_answer_follows_a_delegating_forward():
-    """The installed Qwen MoE forward is a dispatcher, so the scan has to follow the call.
-
-    `_make_qwen_moe_experts_forward` installs `forward_moe_backend`, whose own code object
-    names only `forward_native_grouped_mm`, `forward_triton_grouped_gemm` and
-    `forward_native_moe_loop`. Each of those reads the stash, so stopping at the
-    dispatcher calls these supported families stash-ignorant and sends their first
-    compiled call into PEFT's parametrization path, which is the fullgraph failure this
-    patch exists to remove.
-    """
+    """The installed Qwen MoE forward dispatches: forward_moe_backend names only forward_native_grouped_mm,
+    forward_triton_grouped_gemm and forward_native_moe_loop; those read the stash, so the scan must follow calls."""
     from unsloth_zoo.temporary_patches.qwen3_moe import _make_qwen_moe_experts_forward
 
     class _Dispatching:
@@ -1096,8 +945,7 @@ def test_the_static_answer_follows_a_delegating_forward():
 
 
 def test_the_static_answer_does_not_follow_a_call_into_an_unrelated_helper():
-    """NEGATIVE CONTROL: following calls must not turn every forward into a stash reader.
-    A forward that delegates to a helper which never reaches the stash is still False."""
+    """NEGATIVE CONTROL: following calls must not make every forward a stash reader; a forward delegating to a helper that never reaches the stash is still False."""
 
     def _unrelated_helper(hidden_states):
         return hidden_states * 2
@@ -1132,13 +980,8 @@ def test_the_scan_terminates_on_a_recursive_call_graph():
 
 
 def test_every_float8_storage_dtype_is_refused_not_just_the_cuda_pair():
-    """`param + delta` raises for all five float8 dtypes, not the two named originally.
-
-    Naming `float8_e4m3fn` and `float8_e5m2` by hand let the `fnuz` pair that ROCm uses
-    through, so the compiled fold was permitted on a weight it cannot fold, turning a
-    quantized path that used to be left alone into a hard failure. PEFT lists the whole set
-    in `UPCAST_DTYPES`; this pins that we track it rather than restate it.
-    """
+    """param + delta raises for all five float8 dtypes, including the fnuz pair ROCm uses; _FLOAT8_STORAGE_DTYPES must
+    track PEFT's UPCAST_DTYPES, not a hand-written pair."""
     import torch
     from unsloth_zoo.temporary_patches.moe_utils import _FLOAT8_STORAGE_DTYPES
 
@@ -1164,15 +1007,8 @@ def test_every_float8_storage_dtype_is_refused_not_just_the_cuda_pair():
 
 
 def test_the_static_scan_does_not_wedge_dynamo(restore_param_wrapper):
-    """The scan runs while Dynamo is tracing, which is the whole point of it, so nothing
-    in it may install a guard that cannot match.
-
-    `id(forward)` did: Dynamo guards the expression it tracked, `experts_module.forward`,
-    and a bound method is reallocated on every attribute access, so `___check_obj_id`
-    failed on the frame that created it. That is an AssertionError under BOTH fullgraph
-    settings with no eager fallback, so every MoE family whose verdict is unmeasured at
-    the first compiled call was unable to compile at all.
-    """
+    """The scan runs under Dynamo, so it must not install a guard that cannot match; id(forward) on a bound method,
+    reallocated per access, failed its guard and blocked every unmeasured family from compiling."""
     import torch
 
     class _Experts(torch.nn.Module):
@@ -1195,17 +1031,8 @@ def test_the_static_scan_does_not_wedge_dynamo(restore_param_wrapper):
 
 
 def test_the_static_scan_takes_no_id_at_all():
-    """Pin the mechanism, because each spelling here breaks a different thing.
-
-    `id(forward)` wedged Dynamo: its argument traces to `experts_module.forward`, a bound
-    method reallocated on every access, so `___check_obj_id` failed on the frame that
-    created it. Keying on the code objects themselves instead collapsed equal-but-distinct
-    ones. Keying on `id(code)` fixed that but Dynamo rejects it on some torch versions
-    with "Unsupported: id() with unsupported args", which is a hard compile failure in the
-    branch whose whole purpose is to keep compilation working.
-
-    What survives all three is identity via `is`, so the scan must take no id() at all.
-    """
+    """The scan takes no id(): id(forward) wedges Dynamo, id(code) is rejected on some torch versions, and code-object
+    keys collapse equal ones; identity via is survives all three."""
     import ast
     import inspect
     import textwrap
@@ -1223,16 +1050,8 @@ def test_the_static_scan_takes_no_id_at_all():
 
 
 def test_a_deep_visit_does_not_suppress_a_shallower_one():
-    """The scan must not depend on the hash seed.
-
-    A helper reachable both directly and through a chain can be popped first at the depth
-    limit, where its callees are not followed, and a plain visited set then discards the
-    later shallow entry. Measured before the fix: 5 of 14 PYTHONHASHSEED values returned
-    False for this forward, which does reach the stash, and a False there sends the
-    compiled cold start down the PEFT path that fails under fullgraph.
-
-    Built by exec so the call graph is exact rather than incidental to this file.
-    """
+    """The scan must not depend on PYTHONHASHSEED; a plain visited set can discard a later shallower revisit after a
+    deep pop at the depth limit (5 of 14 seeds gave a wrong False)."""
     import torch.nn as nn
 
     source = (
@@ -1254,8 +1073,7 @@ def test_a_deep_visit_does_not_suppress_a_shallower_one():
 
 
 def test_the_scan_terminates_on_mutual_recursion():
-    """Revisiting at a shallower depth must not make the walk unbounded. The depth limit
-    caps how many times any one code object can be re-entered."""
+    """Revisiting a node at a shallower depth must not make the walk unbounded: the depth limit caps how many times one code object is re-entered."""
     import torch.nn as nn
 
     source = (
@@ -1272,14 +1090,8 @@ def test_the_scan_terminates_on_mutual_recursion():
 
 
 def test_equal_but_distinct_code_objects_are_both_scanned():
-    """The visited map is keyed by identity, not equality.
-
-    Two functions compiled from identical source at the same filename and name have code
-    objects that compare equal AND hash equal while being distinct objects carrying
-    different `__globals__`. Keyed by the code objects themselves, the second is skipped
-    as already seen, so a forward whose stash-reading route is the second one answers
-    False and its compiled cold start goes down the PEFT path that fails under fullgraph.
-    """
+    """The visited map is keyed by identity; equal-but-distinct code objects (same source, different __globals__) must
+    both be scanned or a stash reader answers False."""
     import torch.nn as nn
 
     source = "def helper(m): return target(m)\n"
@@ -1312,27 +1124,12 @@ def test_equal_but_distinct_code_objects_are_both_scanned():
 def test_a_real_cold_compile_reaches_the_static_probe_without_a_guard_on_a_bound_method(
     restore_param_wrapper, experts_cls, fullgraph
 ):
-    """REGRESSION: the cold compiled start, compiled for real rather than simulated.
-
-    The other cold-start tests reach the probe by monkeypatching
-    `torch.compiler.is_compiling` to True while running eagerly, so `torch.compile` never
-    traces `_forward_statically_reads_stash` and nothing here was ever exercised under
-    Dynamo. It has to be, because the probe reads `experts_module.forward` off a module
-    Dynamo is tracing, and Unsloth installs its forwards on the CLASS, so that attribute
-    is a bound method CPython allocates fresh on every access. Taking `id()` of it made
-    Dynamo guard `___check_obj_id(module.forward, <address>)`, which cannot hold by the
-    time it is checked: Dynamo saw a guard fail on the frame that created it and raised
-    `AssertionError: Guard failed on the same frame it was created`, under both fullgraph
-    settings, on precisely the first-compiled-call path this patch exists to serve.
-
-    Both families are covered because the probe runs before the answer is known, so a
-    guard installed here breaks the supported families too, not only the rerouted ones.
-    """
+    """REGRESSION: a real cold compile must not guard on the bound method module.forward; id() of it raised
+    AssertionError (guard failed on the same frame) under both fullgraph settings, for supported families too."""
     assert MU.patch_param_wrapper_for_moe()
     x = _inputs()
 
-    # The reference gets its own model, so the subject's FIRST call is the compiled one
-    # and no eagerly measured verdict can stand in for the probe.
+    # The reference gets its own model, so the subject's first call is the compiled one and no eagerly measured verdict can stand in for the probe.
     with torch.no_grad():
         expected = _build(experts_cls)(x)
 
@@ -1368,8 +1165,8 @@ def test_a_real_cold_compile_reaches_the_static_probe_without_a_guard_on_a_bound
 def test_a_compiled_only_run_records_the_layout_its_forward_used(
     restore_param_wrapper, monkeypatch, tmp_path, experts_cls, expected, fullgraph
 ):
-    """A compiled-only run never reaches the eager probe: a stash-ignoring family folds
-    rank-major there, so the saved marker must say rank_major despite the legacy declaration."""
+    """A compiled-only run never reaches the eager probe; a stash-ignoring family folds rank-major, so the marker must
+    say rank_major despite the legacy UNSLOTH_MOE_LORA_B_LAYOUT declaration."""
     monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT)
     assert MU.patch_param_wrapper_for_moe()
     model = _build(experts_cls)

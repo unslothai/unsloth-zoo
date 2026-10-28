@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""bf16 and T4 (forced-float32 cast / fp16 + fp16 autocast) forward+backward on tiny
-random shrinks of Gemma 4 E2B, Gemma 4 26B-A4B MoE, Gemma 4 12B Unified, Qwen3.5 (FLA),
-Qwen3.6 MoE and Muse-Glimmer. CPU only, no downloads; one subprocess for all of them."""
+"""Forward+backward on tiny random shrinks of Gemma 4 (E2B, 26B-A4B MoE, 12B Unified), Qwen3.5 (FLA), Qwen3.6 MoE and
+Muse-Glimmer for bf16 and T4 paths; CPU only, no downloads, one subprocess."""
 
 import json
 import os

@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Exact full-selection skip for sparse-attention indexers (temporary_patches/sparse_attention.py).
-
-Tiny random models with shrunk selection budgets so both regimes are reachable: below the budget
-the patched model must match upstream bit for bit (logits and every gradient) while engaging the
-skip; above it the reference indexer runs. A short prefill followed by decoding past the budget
-must reproduce upstream's tokens, logits and indexer cache.
-"""
+"""Exact full-selection skip for sparse-attention indexers (temporary_patches/sparse_attention.py): below the budget
+logits and every gradient match upstream bit for bit; above it the reference indexer runs; decoding past the budget
+reproduces upstream tokens, logits and indexer cache."""
 
 import importlib.util
 
@@ -303,8 +299,7 @@ def test_missing_model_is_a_no_op(monkeypatch):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v4"])
 def test_no_grad_indexers_match_unpatched_upstream(family, device, monkeypatch):
-    """Upstream runs these two indexers with autograd on; their integer output carries no gradient,
-    so running them under no_grad must leave logits and every gradient unchanged."""
+    """Upstream runs these two indexers with autograd on; their integer output has no gradient, so no_grad must leave logits and every gradient unchanged."""
     if not _has(family):
         pytest.skip(f"transformers without {family}, or older than 5.17")
     modeling = importlib.import_module(f"transformers.models.{family}.modeling_{family}")

@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""swap_moe_weights_for_call (the dequantize-then-dispatch path of the bnb 4-bit and FP8 MoE
-backends) must leave the experts module's parameters registered exactly as it found them.
-
-It installs the dense weights with object.__setattr__, which writes the instance __dict__. Writing
-the original Parameter back the same way left it in __dict__, shadowing `_parameters`: FSDP2 swaps
-`_parameters[name]` between the sharded and the all-gathered parameter around every forward, so
-after one call the module kept returning a stale all-gather buffer (`'Params4bit' object has no
-attribute '_local_tensor'` in FSDP2's lazy init, or freed storage in the next forward).
-"""
+"""swap_moe_weights_for_call must leave expert parameters registered as found; restoring via object.__setattr__ left a
+__dict__ shadow that breaks FSDP2's _parameters swaps."""
 
 import torch
 import torch.nn as nn

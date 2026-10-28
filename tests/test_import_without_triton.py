@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""AMD Windows wheels ship no Triton: the modules Unsloth imports must load without it and the fused losses take
-their torch path."""
+"""AMD Windows wheels ship no Triton, so the modules Unsloth imports must load without it and the fused losses must fall back to their torch path."""
 
 import os
 import subprocess

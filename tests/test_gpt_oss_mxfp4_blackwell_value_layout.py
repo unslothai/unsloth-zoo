@@ -14,18 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""gpt-oss MXFP4 on Blackwell: value swizzling must be skipped on builds whose
-matmul kernel refuses it, and only on those.
-
-Measured motivation, B200 (sm_100) + triton_kernels @ 0add6826 + transformers
-4.56.2: `unsloth/gpt-oss-20b` loads natively, then the first `generate` dies with
-`CompileTimeAssertionFailure: Only Hopper swizzling is supported for values`,
-because that build's layout selector hands back `BlackwellMXValueLayout` while
-its `_matmul_ogs` asserts `SWIZZLE_MX_VALUE == "HOPPER_VALUE" or ... is None`.
-
-CPU-only: everything here is decision logic, with `triton_kernels` faked. The
-hardware claims live in the B200 and Kaggle T4x2 runs, not in this file.
-"""
+"""gpt-oss MXFP4 value swizzling is skipped only on builds whose _matmul_ogs rejects Blackwell values (triton_kernels @
+0add6826, transformers 4.56.2; CompileTimeAssertionFailure on B200); CPU-only, triton_kernels faked."""
 import sys
 import types
 
@@ -42,9 +32,7 @@ from unsloth_zoo.temporary_patches.gpt_oss import (
 )
 
 
-# Verbatim from the affected build (triton_kernels @ 0add6826,
-# matmul_ogs_details/_matmul_ogs.py:107-114), so an upstream rewrite fails here
-# rather than silently under-detecting.
+# Verbatim from triton_kernels @ 0add6826 (matmul_ogs_details/_matmul_ogs.py:107-114); an upstream rewrite fails the test rather than silently under-detecting.
 HOPPER_ONLY_SOURCE = '''
 @triton.jit
 def _matmul_ogs(Y, X, W, stride_w_k, WMxScale, SWIZZLE_MX_VALUE: tl.constexpr,
@@ -179,8 +167,7 @@ def test_probe_declines_when_source_is_unreadable(monkeypatch):
 
 
 def test_probe_declines_when_triton_kernels_is_absent(monkeypatch):
-    """Blocking the package, not just the leaf: vLLM vendors triton_kernels under
-    its real name, so a leaf-only block still resolves to a live module."""
+    """Block the whole package, not just the leaf: vLLM vendors triton_kernels under its real name, so a leaf-only block still resolves to a live module."""
     for name in ("triton_kernels", "triton_kernels.matmul_ogs_details"):
         monkeypatch.setitem(sys.modules, name, None)
     assert _blackwell_value_swizzle_unsupported() is False
@@ -263,8 +250,7 @@ def test_guard_survives_a_capability_lookup_that_raises(monkeypatch):
 # --- the arguments handed to convert_layout ---------------------------------
 
 class _OldStyleLayoutModule:
-    """triton_kernels @ 0add6826: selector returns (class, kwargs), convert_layout
-    instantiates `layout_cls(shape, **kwargs)`."""
+    """triton_kernels @ 0add6826: the selector returns (class, kwargs) and convert_layout instantiates layout_cls(shape, **kwargs)."""
     BlackwellMXValueLayout = BlackwellMXValueLayout
     HopperMXValueLayout = HopperMXValueLayout
     StridedLayout = StridedLayout
@@ -275,8 +261,7 @@ class _OldStyleLayoutModule:
 
 
 class _NewStyleLayoutModule:
-    """Current triton_kernels: selector returns an instance and convert_layout
-    takes it as is, so unpacking the result would raise TypeError."""
+    """Current triton_kernels: the selector returns an instance and convert_layout takes it as is, so unpacking it would raise TypeError."""
     BlackwellMXValueLayout = BlackwellMXValueLayout
     HopperMXValueLayout = HopperMXValueLayout
     StridedLayout = StridedLayout

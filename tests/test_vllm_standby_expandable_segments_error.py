@@ -14,39 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression tests for vLLM load-failure classification with standby mode.
-
-`load_vllm` used to classify a failed vLLM load as an out of memory condition
-with `("memory" in error.lower() or "alloc" in error.lower())`. The bare
-`"alloc"` substring also matches the deterministic *configuration* assertion
-raised by `CuMemAllocator.__init__`:
-
-    Standby mode is not supported with expandable segments.
-    Please set environment variable PYTORCH_CUDA_ALLOC_CONF without
-    `expandable_segments:True`.
-
-because that text contains `PYTORCH_CUDA_ALLOC_CONF`. Upstream vLLM's own
-wording ("Expandable segments are not compatible with memory pool.") collides
-with the `"memory"` half instead. Either way the user was told their GPU ran
-out of memory and offered three fixes, two of which cannot possibly help. This
-was reproduced on a 183 GB B200 with roughly 180 GB free.
-
-A third failure is mislabelled the same way. vLLM asserts that free VRAM went
-*down* across its profiling forward pass, and raises
-
-    Error in memory profiling. Initial free memory 11.87 GiB, current free
-    memory 138.8 GiB. This happens when other processes sharing the same
-    container release GPU memory while vLLM is profiling during initialization.
-
-when another tenant on a shared GPU frees memory mid-profile. Free memory went
-*up*, so nothing ran out, but "free memory" is itself a genuine OOM marker
-(vLLM's real shortfall reads "Free memory on device ... is less than desired
-GPU memory utilization"), so this was reported as an OOM too. It is transient
-and clears on a plain retry. Seen twice on a shared 8x B200, 178.4 GB per GPU.
-
-These tests pin the classification (config clash vs profiling race vs real
-OOM), the wording of the new messages, and the wiring inside `load_vllm`.
-"""
+"""Pins vLLM load-failure classification in standby mode: expandable-segments config clashes and memory profiling races
+are not OOMs (loose 'alloc', 'memory' and 'free memory' substring checks caught them); real OOMs still are; load_vllm
+wiring is checked."""
 
 from __future__ import annotations
 
@@ -74,8 +44,7 @@ _VLLM_ASSERTION = (
     "for the latest updates."
 )
 
-# Verbatim from a shared 8x B200, 178.4 GB per GPU, GRPO notebook. Raised by
-# the assert in vllm/v1/worker/gpu_worker.py determine_available_memory().
+# Verbatim profiling-race error from a shared 8x B200; raised by the assert in vllm/v1/worker/gpu_worker.py determine_available_memory().
 _PROFILING_RACE = (
     "Error in memory profiling. Initial free memory 11.87 GiB, current free memory 138.8 GiB. "
     "This happens when other processes sharing the same container release GPU memory while vLLM "
@@ -83,16 +52,14 @@ _PROFILING_RACE = (
     "isolate vLLM in its own container."
 )
 
-# The XPU worker asserts with the same opening phrase and a different tail
-# (vllm/v1/worker/xpu_worker.py), so the marker must not depend on the tail.
+# XPU worker (vllm/v1/worker/xpu_worker.py) asserts with the same opening phrase but a different tail, so the marker must match only the phrase.
 _PROFILING_RACE_XPU = (
     "Error in memory profiling. Initial free memory 12746588160, current free memory 149023916032. "
     "This happens when the GPU memory was not properly cleaned up before initializing the vLLM "
     "instance."
 )
 
-# vLLM's real KV cache exhaustion (vllm/v1/core/kv_cache_utils.py). Unlike the
-# profiling race this is deterministic and gpu_memory_utilization is the fix.
+# vLLM's real KV cache exhaustion (vllm/v1/core/kv_cache_utils.py); unlike the profiling race it is deterministic and gpu_memory_utilization is the fix.
 _KV_CACHE_OOM = (
     "To serve at least one request with the models's max seq len (8192), (18.00 GiB KV cache is "
     "needed, which is larger than the available KV cache memory (4.00 GiB). Based on the available "
@@ -133,8 +100,7 @@ _REAL_OOM_ERRORS = (
     ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"),
 )
 def test_expandable_segments_assertion_is_not_an_oom(env_var):
-    # The bug: the bare "alloc" substring (and "memory" for the upstream wording)
-    # returned True, so a config clash was raised as MemoryError.
+    # The bug: bare 'alloc' (and 'memory' for upstream wording) substrings returned True, so a config clash was raised as MemoryError.
     error = _unsloth_assertion(env_var)
     assert vllm_utils._is_expandable_segments_error(error) is True
     assert vllm_utils._is_out_of_memory_error(error) is False
@@ -165,8 +131,7 @@ def test_unrelated_errors_are_neither(error):
 
 
 def test_torch_oom_hint_about_expandable_segments_is_not_a_config_clash():
-    # torch's genuine OOM text recommends PYTORCH_CUDA_ALLOC_CONF=
-    # expandable_segments:True, so the config-clash markers must be full phrases.
+    # torch's genuine OOM text recommends PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, so config-clash markers must be full phrases.
     torch_oom = _REAL_OOM_ERRORS[0]
     assert "expandable_segments:True" in torch_oom
     assert vllm_utils._is_out_of_memory_error(torch_oom) is True
@@ -184,8 +149,7 @@ def test_classifiers_accept_exception_objects_not_just_strings():
     ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"),
 )
 def test_message_names_the_offending_env_var_on_every_platform(env_var):
-    # PYTORCH_HIP_ALLOC_CONF is the ROCm/AMD one, PYTORCH_ALLOC_CONF the unified
-    # torch >= 2.10 one. Whichever actually carries the setting must be named.
+    # PYTORCH_HIP_ALLOC_CONF is the ROCm/AMD env var and PYTORCH_ALLOC_CONF the unified torch >= 2.10 one; name whichever env var actually carries the setting.
     cleared = {k: "" for k in vllm_utils._ALLOC_CONF_ENV_VARS}
     cleared[env_var] = "expandable_segments:True,roundup_power2_divisions:[32:256]"
     with mock.patch.dict(vllm_utils.os.environ, cleared, clear = False):
@@ -214,8 +178,7 @@ def test_message_lists_all_three_env_vars_when_none_are_visible():
 
 @pytest.mark.parametrize("error", (_PROFILING_RACE, _PROFILING_RACE_XPU))
 def test_profiling_race_is_not_an_oom(error):
-    # The bug: "free memory" appears twice here, so the OOM markers matched and
-    # a 178 GB GPU was reported out of memory with 138.8 GiB of it free.
+    # The bug: 'free memory' appears twice here, so the OOM markers matched and a 178 GB GPU was reported out of memory with 138.8 GiB free.
     assert "free memory" in error.lower()
     assert vllm_utils._is_memory_profiling_race_error(error) is True
     assert vllm_utils._is_out_of_memory_error(error) is False
@@ -232,8 +195,8 @@ def test_profiling_race_and_kv_cache_oom_classify_differently():
 
 
 def test_free_memory_marker_still_covers_the_real_startup_shortfall():
-    # Dropping the "free memory" marker would silently lose this genuine shortfall,
-    # whose text never says "out of memory" (vllm/v1/worker/utils.py request_memory).
+    # Dropping the 'free memory' marker would silently lose the real startup shortfall; its text never says 'out of
+    # memory' (vllm/v1/worker/utils.py request_memory).
     shortfall = (
         "Free memory on device (78.68/79.15 GiB) on startup is less than desired GPU memory "
         "utilization (0.9, 71.24 GiB). Decrease GPU memory utilization or reduce GPU memory "
@@ -271,8 +234,7 @@ def test_profiling_race_message_never_offers_the_oom_remedies(standby):
 
 
 def test_profiling_race_message_explains_why_standby_cannot_retry_in_process():
-    # CuMemAllocator is a process wide singleton and Unsloth runs the engine
-    # in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0), so a retry needs a new process.
+    # CuMemAllocator is a process-wide singleton and Unsloth runs the engine in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0), so a retry needs a new process.
     standby = vllm_utils._memory_profiling_race_message(
         _PROFILING_RACE, trials = 1, unsloth_vllm_standby = True,
     )
@@ -287,14 +249,12 @@ def test_profiling_race_message_explains_why_standby_cannot_retry_in_process():
 
 
 def test_load_vllm_retries_a_profiling_race_without_shrinking_anything():
-    # The generic branch below reacts to "memory" by scaling gpu_memory_utilization
-    # by 0.85 and max_num_seqs by 0.75, neither of which caused a profiling race.
+    # The generic branch reacts to 'memory' by scaling gpu_memory_utilization by 0.85 and max_num_seqs by 0.75, neither of which caused a profiling race.
     source = inspect.getsource(vllm_utils.load_vllm)
     race_at = source.index("_is_memory_profiling_race_error(error)")
     standby_at = source.index("if trials >= 2 or unsloth_vllm_standby:")
     shrink_at = source.index('engine_args["gpu_memory_utilization"] *= 0.85')
-    # Checked before the standby short-circuit, which gives up after a single
-    # attempt on a transient fault.
+    # Checked before the standby short-circuit, which gives up after a single attempt on a transient fault.
     assert race_at < standby_at < shrink_at
     assert "continue" in source[race_at:standby_at]
     assert "_MEMORY_PROFILING_RACE_MAX_TRIALS" in source[race_at:standby_at]
@@ -302,8 +262,7 @@ def test_load_vllm_retries_a_profiling_race_without_shrinking_anything():
 
 
 def test_profiling_race_retries_do_not_spend_the_generic_retry_budget():
-    # A race is counted on its own `race_trials`. Sharing `trials` would make a race
-    # then a real OOM hit `trials >= 2` and raise, skipping the shrink-and-retry.
+    # A race is counted on its own race_trials; sharing trials would let a race, then a real OOM, hit trials >= 2 and raise, skipping the shrink-and-retry.
     source = inspect.getsource(vllm_utils.load_vllm)
     race_at = source.index("_is_memory_profiling_race_error(error)")
     bump_at = source.index("            trials += 1")
@@ -317,8 +276,7 @@ def test_profiling_race_retries_do_not_spend_the_generic_retry_budget():
 
 
 def test_load_vllm_retry_handler_is_wired_to_the_precise_classifiers():
-    # Guards the raise site: the loose substring test must be gone, the config clash
-    # checked before the MemoryError, and the OOM branch keeps `Original error:`.
+    # Guards the raise site: the loose substring test must be gone, the config clash is checked before MemoryError, and the OOM branch keeps 'Original error:'.
     source = inspect.getsource(vllm_utils.load_vllm)
     assert '"alloc" in error.lower()' not in source
     assert not re.search(r'\(\s*"memory" in error\.lower\(\)', source)

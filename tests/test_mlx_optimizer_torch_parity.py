@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch-style MLX optimizer defaults, pinned to the installed torch / HF Trainer.
-
-Holds under the shim or real mlx (conftest may bind real mlx first); real-mlx-only checks: test_mlx_optimizer_defaults.py.
-"""
+"""Pins torch-style MLX optimizer defaults to the installed torch and HF Trainer; holds under the shim or real mlx, with
+real-mlx-only checks in test_mlx_optimizer_defaults.py."""
 
 import inspect
 

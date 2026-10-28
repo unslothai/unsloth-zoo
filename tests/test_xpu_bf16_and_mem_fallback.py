@@ -186,8 +186,8 @@ def test_xpu_bf16_keeps_old_answer_beside_an_older_unsloth(on_xpu, monkeypatch):
 @pytest.mark.parametrize("core_answer", [True, False])
 @pytest.mark.parametrize("current, expected", [(0, True), (1, False)])
 def test_xpu_bf16_released_unsloth_never_narrows_the_current_device(on_xpu, monkeypatch, core_answer, current, expected):
-    # Released unsloth judges every visible XPU: its False for an unused emulating sibling must not
-    # turn bf16 off on a native current XPU. The current device's own answer decides.
+    # Released unsloth judges every visible XPU: an unused emulating sibling's False must not turn bf16 off on a native
+    # current XPU; the current device's own answer decides.
     on_xpu(_fake_xpu((True, _PROVEN_NO_BF16), current = current))
     core = types.ModuleType("unsloth.device_type")
     core.xpu_supports_native_bf16 = lambda: core_answer
@@ -430,8 +430,8 @@ def test_vllm_xpu_dtype_follows_vllms_bf16_check(on_xpu, vu, monkeypatch, flags,
 @not_on_macos
 @pytest.mark.parametrize("core_has_rule", [True, False])
 def test_vllm_xpu_bf16_refusal_switches_beside_any_unsloth(on_xpu, vu, monkeypatch, core_has_rule):
-    # Released unsloth has no xpu_vllm_refuses_bf16 and still asks for bf16. vLLM must switch anyway,
-    # or its engine raises on an A770; convert_vllm_to_huggingface then follows the fp16 weights.
+    # Released unsloth lacks xpu_vllm_refuses_bf16 and still asks for bf16; vLLM must switch to fp16 anyway or its
+    # engine raises on an A770; convert_vllm_to_huggingface then follows the fp16 weights.
     expected = "float16"
     on_xpu(_fake_xpu((_PROVEN_NO_BF16,)))
     _fake_vllm_platforms(monkeypatch, refuses = True)
@@ -452,9 +452,9 @@ def test_vllm_xpu_bf16_refusal_switches_beside_any_unsloth(on_xpu, vu, monkeypat
 @pytest.mark.parametrize("flags", [(True,), (_PROVEN_NO_BF16,)])
 @pytest.mark.parametrize("dtype", [None, "bfloat16"])
 def test_vllm_xpu_a770_refusal_beside_released_unsloth_main(on_xpu, vu, monkeypatch, flags, dtype):
-    # zoo#1947 / zoo#1929 / unsloth#14493: unsloth main exports xpu_supports_native_bf16 (every
-    # visible XPU) and xpu_keeps_explicit_bf16, but no xpu_vllm_refuses_bf16. Neither an explicit
-    # nor an automatic bf16 may reach vLLM's A770 refusal beside it.
+    # Issues zoo 1947, zoo 1929 and unsloth 14493: unsloth main exports xpu_supports_native_bf16 (every visible XPU) and
+    # xpu_keeps_explicit_bf16 but no xpu_vllm_refuses_bf16; neither explicit nor automatic bf16 may reach vLLM's A770
+    # refusal beside it.
     on_xpu(_fake_xpu(flags))
     _fake_vllm_platforms(monkeypatch, refuses = True)
     core = types.ModuleType("unsloth.device_type")

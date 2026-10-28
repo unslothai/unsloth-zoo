@@ -6,18 +6,9 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Import-smoke regression suite for `unsloth_zoo.temporary_patches`.
-
-The subsystem star-imports every model-family submodule from __init__.py, so
-a broken decorator or syntax error in any one cascades into a confusing
-package-wide ImportError at training time. This suite pins:
-  - Every submodule imports cleanly.
-  - The __init__.py star-import chain succeeds.
-  - `common.torch_compile_options` is a dict (rl_replacements.py imports it
-    at module top, so a break here breaks RL training too).
-
-Runs under the GPU-free harness in tests/conftest.py; no GPU required.
-"""
+"""Import-smoke suite for unsloth_zoo.temporary_patches: every submodule and the __init__ star-import chain must import;
+common.torch_compile_options must stay a dict (rl_replacements imports it at module top); runs GPU-free under
+tests/conftest.py."""
 
 from __future__ import annotations
 
@@ -26,22 +17,14 @@ import os
 
 import pytest
 
-# Every `temporary_patches` submodule imports torch, so on a runner without it this whole
-# suite is a precondition failure, not a finding: 37 of its 40 cases go red on merge base
-# too. The macOS staging runner is one, because pyproject declares no torch on darwin/arm64.
-# The two sibling suites in the same CI step already guard this way.
+# pytest.importorskip('torch') because every temporary_patches submodule imports torch; without torch this is a
+# precondition failure, not a finding (macOS staging: pyproject has no torch on darwin/arm64).
 pytest.importorskip("torch")
 
 
-# The switch `__init__.py:179` reads into _SKIP_GPU_INIT, which the device-capacity tests
-# below are entirely about: with it on, the import skips device detection and DEVICE_TYPE
-# becomes "cpu", so gpt_oss takes its `else` branch and device_memory is 0 rather than the
-# stubbed card's capacity. A child that inherits it therefore fails on a real GPU-less
-# machine and on a machine with a card, for a reason that is neither.
-#
-# It is inheritable in an ordinary run: hf_xet_fallback sets it on the PARENT process
-# around a download spawn (hf_xet_fallback.py:1520). So strip it here rather than assume
-# nothing in the session ever turns it on.
+# Strip the GPU-init switch _GPU_INIT_GATE (UNSLOTH_ZOO_DISABLE_GPU_INIT) from child envs: when set, __init__.py:179
+# skips device detection (DEVICE_TYPE cpu, device_memory 0); hf_xet_fallback sets it on the parent around a download
+# spawn.
 _GPU_INIT_GATE = "UNSLOTH_ZOO_DISABLE_GPU_INIT"
 
 
@@ -52,8 +35,7 @@ def _child_env(**overrides: str) -> dict:
     return env
 
 
-# Per-submodule import smoke. Explicit (not a glob) so a silent drop or rename
-# surfaces as a missing test; new files must be added to this list.
+# Per-submodule import smoke list kept explicit, not a glob, so a dropped or renamed file shows as a missing test; new files must be added here.
 
 
 TEMPORARY_PATCHES_SUBMODULES = [
@@ -135,14 +117,12 @@ def test_temporary_patches_submodule_imports(module_path):
 
 
 def test_temporary_patches_star_import_chain():
-    """The __init__ star-imports every submodule; if any blows up at import,
-    downstream `from unsloth_zoo.temporary_patches import *` fails wholesale."""
+    """__init__ star-imports every submodule, so one import-time failure makes 'from unsloth_zoo.temporary_patches import *' fail wholesale."""
     importlib.import_module("unsloth_zoo.temporary_patches")
 
 
 def test_torch_compile_options_is_dict():
-    """`common.torch_compile_options` is imported by rl_replacements at module
-    top; a non-dict contract breaks every @torch.compile decorator there."""
+    """common.torch_compile_options must stay a dict: rl_replacements imports it at module top, and a non-dict breaks every @torch.compile decorator there."""
     from unsloth_zoo.temporary_patches import common
     assert hasattr(common, "torch_compile_options"), (
         "common.torch_compile_options removed -- rl_replacements.py "
@@ -158,8 +138,7 @@ def test_torch_compile_options_is_dict():
 
 
 def test_temporary_patches_submodule_list_is_complete():
-    """TEMPORARY_PATCHES_SUBMODULES must stay in sync with files on disk; a new
-    submodule not added here would silently bypass the import smoke above."""
+    """TEMPORARY_PATCHES_SUBMODULES must match the files on disk; a new submodule missing from it would silently bypass the import smoke test."""
     import unsloth_zoo.temporary_patches as tp
     import pathlib
 
@@ -184,9 +163,8 @@ def test_temporary_patches_submodule_list_is_complete():
 
 
 def test_gpt_oss_imports_without_visible_gpus():
-    """gpt_oss.py computes device_memory at import; with UNSLOTH_ALLOW_CPU=1
-    DEVICE_TYPE stays "cuda" on GPU-less hosts, so the capacity lookup must be
-    guarded. Subprocess so conftest's mem_get_info stub cannot mask it."""
+    """gpt_oss.py computes device_memory at import; with UNSLOTH_ALLOW_CPU=1 DEVICE_TYPE stays 'cuda' on GPU-less hosts,
+    so the lookup must be guarded; subprocess keeps conftest's mem_get_info stub from masking it."""
     import subprocess
     import sys
 
@@ -205,11 +183,8 @@ def test_gpt_oss_imports_without_visible_gpus():
 
 
 def test_xet_submodule_import_does_not_query_free_device_memory():
-    """Importing a download helper must not create an accelerator context.
-
-    gpt_oss only needs total capacity to select combo-kernel options. Device
-    properties provide that without the context-creating mem_get_info call.
-    """
+    """Importing the xet download submodule must not call mem_get_info, which creates an accelerator context; device
+    properties give the total capacity gpt_oss needs."""
     import subprocess
     import sys
 
@@ -250,12 +225,8 @@ print("IMPORT_OK")
 
 
 def test_flex_attention_import_does_not_query_free_device_memory():
-    """The same probe pattern in flex_attention/utils.py.
-
-    It only needs total capacity, like gpt_oss, and gpt_oss imports it, so leaving
-    mem_get_info() here would put back the context the gpt_oss fix removes for anyone
-    who reaches the flex-attention path.
-    """
+    """flex_attention/utils.py must not call mem_get_info() at import: it needs only total capacity like gpt_oss, and
+    gpt_oss imports it, so the context would return."""
     import subprocess
     import sys
 

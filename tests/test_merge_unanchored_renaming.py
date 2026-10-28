@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""LoRA keys of a natively loaded Ling 3.0 (bailing_hybrid) resolve to checkpoint keys per shard.
-
-Transformers 5.20 renames `.attention.` to `.self_attn.` with an unanchored pattern, so a shard
-without `model.word_embeddings` reads as new-format and its attention LoRAs were never merged
-(unslothai/unsloth#13948: "# of LoRAs = 144 does not match # of saved modules = 92").
-"""
+"""Maps LoRA keys of natively loaded Ling 3.0 (bailing_hybrid) to checkpoint keys per shard; transformers 5.20's
+unanchored .attention. rename made shards lacking model.word_embeddings read as new-format, so attention LoRAs were
+never merged (unslothai/unsloth issue 13948)."""
 from collections import defaultdict
 
 import pytest

@@ -14,17 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""An OOM-killed GGUF conversion can usually just be retried onto disk.
-
-The converter holds tensors in host RAM, so a large model on a free Colab or
-Kaggle VM is OOM-killed and subprocess reports only SIGKILL. Measured on
-`Gemma3N_(4B)-Audio`, which trains, infers and merges cleanly with 155GB disk
-free, then dies here.
-
-llama.cpp's `--use-temp-file` is the documented fix, but it refuses to run
-alongside splitting ("Cannot use temp file when splitting") and
-`--split-max-size` is always passed, so the retry must drop the split options.
-"""
+"""An OOM-killed GGUF conversion is retried onto disk with `--use-temp-file`, dropping the split options since llama.cpp refuses temp files when splitting."""
 
 import sys
 from pathlib import Path
@@ -76,8 +66,7 @@ BASE = ["/usr/bin/python3", "/root/.unsloth/llama.cpp/unsloth_convert_hf_to_gguf
 
 
 def test_the_split_option_is_removed():
-    """llama.cpp exits 1 on the combination, so keeping --split-max-size would
-    only swap one failure for another."""
+    """llama.cpp exits 1 when --use-temp-file is combined with splitting, so keeping --split-max-size only swaps one failure for another."""
     out = _retry_with_temp_file(BASE)
     assert "--split-max-size" not in out
     assert "50G" not in out
@@ -162,8 +151,7 @@ def _touch(directory, name, data = b"GGUF"):
 
 
 def test_the_shards_of_a_killed_split_run_are_removed(tmp_path):
-    """The writer opens every shard with "wb" before any tensor byte, so a
-    SIGKILL leaves stubs that would ship beside the retry's unsharded file."""
+    """The writer opens every shard with `wb` before any tensor byte, so a SIGKILL leaves stub shards that would ship beside the retry's unsharded file."""
     out = str(tmp_path / "model.BF16.gguf")
     shards = [_touch(tmp_path, f"model.BF16-{i:05d}-of-00003.gguf") for i in (1, 2, 3)]
     _remove_gguf_outputs(out)
@@ -186,8 +174,7 @@ def test_unrelated_ggufs_are_left_alone(tmp_path):
 
 
 def test_a_neighbour_whose_name_ends_with_ours_is_left_alone(tmp_path):
-    """Matched against the whole filename: these are os.remove'd, so an
-    unanchored match would take "old-model.BF16-00001-of-00002" too."""
+    """Match the whole filename: these are os.remove'd, so an unanchored match would also take neighbours like old-model.BF16-00001-of-00002."""
     keep = [_touch(tmp_path, "old-model.BF16-00001-of-00002.gguf"),
             _touch(tmp_path, "my-model.BF16-00002-of-00002.gguf")]
     mine = _touch(tmp_path, "model.BF16-00001-of-00002.gguf")
@@ -210,17 +197,15 @@ def test_the_paths_include_the_file_and_its_shards(tmp_path):
 
 
 def test_the_retry_clears_the_old_output_first():
-    # Anchored on the OOM branch: the loop grew a second `command = retry`, for a
-    # converter that rejects --no-mtp, that a bare index() finds first. Only the OOM
-    # retry drops --split-max-size and can leave the killed run's shards behind.
+    # Anchor on the OOM branch: a bare index() finds a second command = retry (for converters rejecting --no-mtp) first;
+    # only the OOM retry drops --split-max-size and can leave the killed run's shards behind.
     body = _loop_src()
     oom = body.index("_converter_was_oom_killed(e)")
     assert body.index("_remove_gguf_outputs(output_file)", oom) < body.index("command = retry", oom)
 
 
 def test_a_failed_projector_is_removed_and_stops_claiming_vlm():
-    """The converter truncates its --outfile at header time, so the failed run
-    leaves a partial projector that would be uploaded as valid."""
+    """The converter truncates its --outfile at header time, so a failed run leaves a partial projector that would upload as valid; it must be removed."""
     src = (ROOT / "unsloth_zoo" / "llama_cpp.py").read_text(encoding="utf-8")
     i = src.index("if not required:")
     body = src[i:src.index("if optional_failed:", i)]

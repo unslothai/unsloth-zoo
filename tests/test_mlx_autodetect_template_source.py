@@ -1,10 +1,6 @@
-"""_resolve_autodetect_template_source must auto-detect markers from the right template:
-the VLM processor (whose template the inner tokenizer lacks) and after any configured
-chat_template override, so markers match the rendered batches.
-
-Hermetic: synthetic templates on a tiny offline tokenizer, under the mlx-on-torch shim;
-skips (never fails) when the tokenizer cache or unsloth_zoo is unavailable.
-"""
+"""_resolve_autodetect_template_source must detect markers from the template that renders the batches (the VLM
+processor, or after a chat_template override); hermetic, and skips, never fails, when the tokenizer cache or
+unsloth_zoo is unavailable."""
 import pytest
 
 
@@ -121,8 +117,7 @@ def test_text_override_detects_from_configured_template():
 
 
 def test_vlm_processor_only_template_is_used_for_detection():
-    """Issue 1: a processor-only template must drive auto-detection, not the
-    unwrapped inner tokenizer (which would raise 'No chat_template')."""
+    """Issue 1: a processor-only template must drive auto-detection, not the unwrapped inner tokenizer, which would raise 'No chat_template'."""
     T, get_parts = _load()
 
     inner = _new_tok(); inner.chat_template = None
@@ -147,9 +142,7 @@ def test_vlm_processor_only_template_is_used_for_detection():
 
 
 def test_vlm_override_aligns_with_who_applies_the_mask():
-    """VLM detection must use the processor that renders the masked batches: the explicit
-    tokenizer= override when the caller applies the returned mask (return_function=True), but
-    trainer.processor when the trainer applies it to its own batches (return_function=False)."""
+    """VLM detection uses the processor that renders the masked batches: the tokenizer= override when return_function=True, else trainer.processor."""
     T, get_parts = _load()
 
     trainer_proc = _ProcessorOnly(_new_tok_none(), _new_tok_with(CHATML))
@@ -160,15 +153,14 @@ def test_vlm_override_aligns_with_who_applies_the_mask():
     detect = T._resolve_autodetect_template_source(tr, override_proc, resolved, return_function=True)
     assert detect is override_proc
 
-    # return_function=False: the trainer renders batches with trainer.processor, so detect
-    # from that, otherwise the mask is built for one template and applied to text from another.
+    # return_function=False: the trainer renders batches with trainer.processor, so detect from it; otherwise the mask
+    # is built for one template and applied to another.
     detect = T._resolve_autodetect_template_source(tr, override_proc, resolved, return_function=False)
     assert detect is trainer_proc
 
 
 def test_explicit_markers_bypass_template_resolution():
-    """Explicit instruction/response parts need no template; the wrapper must not
-    require a chat_template and must return a working mask function."""
+    """Explicit instruction/response parts need no template: the wrapper must not require a chat_template and must still return a working mask function."""
     T, _ = _load()
     inner = _new_tok(); inner.chat_template = None
     proc = _ProcessorOnly(inner, _new_tok())
@@ -189,8 +181,7 @@ MISTRAL = (
 
 
 def test_headerless_template_marker_excludes_eos():
-    """A headerless template (add_generation_prompt is a no-op) must reach the fallback and
-    detect [INST] without gluing the preceding eos into instruction_part."""
+    """A headerless template (add_generation_prompt is a no-op) must reach the fallback and detect [INST] without gluing the preceding eos into instruction_part."""
     _, get_parts = _load()
     tok = _new_tok(); tok.chat_template = MISTRAL
     ins, res = get_parts(tok)
@@ -207,8 +198,8 @@ HEADER_EOS = (
 
 
 def test_header_equals_respgap_strips_eos_from_instruction_marker():
-    """When the generation prompt equals the assistant header but only assistant turns carry eos,
-    the instruction marker must not glue on that eos (else non-final assistant eos is masked)."""
+    """When the generation prompt equals the assistant header and only assistant turns carry eos, the instruction marker
+    must not glue that eos on, or non-final assistant eos gets masked."""
     _, get_parts = _load()
     tok = _new_tok()
     tok.add_special_tokens({"additional_special_tokens": ["<|user|>", "<|assistant|>"]})
@@ -219,8 +210,7 @@ def test_header_equals_respgap_strips_eos_from_instruction_marker():
 
 
 def test_chat_template_override_clears_stale_cached_markers():
-    """A chat_template override must drop markers cached from a prior Unsloth template so the
-    HF helper re-detects, instead of masking with the old markers."""
+    """A chat_template override must drop markers cached from a prior Unsloth template so the HF helper re-detects instead of masking with the old markers."""
     T, _ = _load()
     tok = _new_tok(); tok.chat_template = CHATML
     tok._unsloth_input_part = "OLD_USER"; tok._unsloth_output_part = "OLD_ASST"
@@ -232,8 +222,8 @@ def test_chat_template_override_clears_stale_cached_markers():
 
 
 def test_unsloth_template_override_preserves_fresh_markers(monkeypatch):
-    """An Unsloth template name/tuple override sets fresh correct markers via get_chat_template;
-    those must survive (only the stale ones are dropped, and only before the override applies)."""
+    """An Unsloth template name/tuple override sets fresh markers via get_chat_template, which must survive; only stale
+    markers are dropped, and only before the override applies."""
     T, _ = _load()
     tok = _new_tok(); tok.chat_template = CHATML
     tok._unsloth_input_part = "STALE_U"; tok._unsloth_output_part = "STALE_A"
@@ -251,8 +241,7 @@ def test_unsloth_template_override_preserves_fresh_markers(monkeypatch):
 
 
 def test_processor_template_preferred_over_inner_when_both_present():
-    """When both the processor and its inner tokenizer carry a chat_template, detection must
-    render with the processor's (what VLM batching uses), not the inner tokenizer's."""
+    """When both the processor and its inner tokenizer carry a chat_template, detection must render with the processor's, which is what VLM batching uses."""
     _, get_parts = _load()
     proc = _ProcessorOnly(_new_tok_with(CHATML), _new_tok_with(INST))
     proc.tokenizer.chat_template = CHATML   # inner tokenizer ALSO has a (different) template

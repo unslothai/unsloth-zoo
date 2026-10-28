@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for the LoRA-save key remap and backed-module count in saving_utils.py.
-
-Covers the VLM prefix reorder fix, vision-onto-language misroute guards, and the
-backed-module count across model families (VLM, Gemma4 ClippableLinear, MoE, tied
-embeddings, absent vision tower). Pure-function, CPU-only, no disk/download.
-"""
+"""Tests the LoRA-save key remap and backed-module count in saving_utils.py (VLM prefix reorder, misroute guards, model families); CPU-only, no disk or download."""
 
 from __future__ import annotations
 
@@ -28,9 +23,7 @@ import importlib.util
 import sys
 import types
 
-# Stub bitsandbytes (imported at module scope) for CPU-only runs. Needs a real __spec__
-# so find_spec() probes don't raise; built inline so package init can't pull the deps
-# the stub avoids.
+# CPU-only bitsandbytes stub: needs a real __spec__ so find_spec() probes do not raise; built inline so package init cannot pull in the deps the stub avoids.
 if importlib.util.find_spec("bitsandbytes") is None:
     from importlib.machinery import ModuleSpec
     _bnb = types.ModuleType("bitsandbytes")
@@ -446,8 +439,7 @@ def test_create_lora_statistics_counts_align_for_unmatched_class():
 
 
 def test_non_lora_scaled_module_not_misclassified():
-    """A module with `scaling` + singular active_adapter but no LoRA tensors
-    (e.g. an attention scale) must not be captured as a LoRA wrapper (#806)."""
+    """A module with scaling and a singular active_adapter but no lora_A or lora_B (e.g. an attention scale) must not be captured as a LoRA wrapper (issue 806)."""
     inner = _Inner(2)  # two real LoRA layers (have lora_A/lora_B)
     non_lora = nn.Linear(8, 8, bias=False)
     non_lora.scaling = 0.125

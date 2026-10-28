@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MLX wrapper-selection coverage: routed SwitchLinear experts, and DoRA
-wrappers that accept only exact dense linear bases."""
+"""MLX wrapper-selection tests: routed SwitchLinear experts and DoRA wrappers, which accept only exact dense linear bases."""
 
 import json
 import importlib
@@ -26,12 +25,9 @@ import pytest
 
 
 def _real_mlx_runtime():
-    """True only when mlx and the routed switch layers are the genuine packages.
-
-    Sibling files install the mlx_simulation stub unconditionally, so `import
-    mlx` still succeeds: reject the pure stub (placeholder SwitchLinear) and the
-    hybrid where mlx.core was swapped under real switch layers.
-    """
+    """True only for genuine mlx and mlx_lm switch layers; sibling files install the mlx_simulation stub, so import mlx
+    still succeeds; reject the pure stub (placeholder SwitchLinear) and a hybrid with mlx.core swapped under real
+    switch layers."""
     try:
         switch_layers = importlib.import_module("mlx_lm.models.switch_layers")
     except Exception:  # mlx / mlx-lm absent entirely
@@ -473,9 +469,8 @@ def test_switch_adapter_public_lifecycle(
         assert config["base_resolved_quantization_map_supports_switch"] is True
     weights_path = adapter / "adapters.safetensors"
     weights = mx.load(str(weights_path))
-    # These arrays stay backed by weights_path, which the corrupt branches below
-    # rewrite in place. Materialize first, or the save truncates the source and mlx
-    # raises "[read] Unable to read from file" instead of the corruption under test.
+    # Arrays stay backed by weights_path, which corrupt branches rewrite in place; materialize first, or saving
+    # truncates the source and mlx raises [read] Unable to read from file instead of the corruption under test.
     mx.eval(*weights.values())
     assert {value.ndim for value in weights.values()} == (
         {1, 3} if external_case else {3}
@@ -564,8 +559,7 @@ def test_legacy_switch_rank_layout(tmp_path):
 
 
 def _require_real_mlx_wrappers():
-    """A sibling test can install the simulation after import, stubbing both
-    wrapper modules; nothing that wraps a base survives that."""
+    """A sibling test may install the simulation after import, stubbing both wrapper modules; nothing that wraps a base survives that."""
     from mlx_lm.tuner.dora import DoRALinear
     from mlx_lm.tuner.lora import LoRALinear
     if not all(isinstance(cls, type) for cls in (DoRALinear, LoRALinear)):
@@ -638,8 +632,7 @@ def test_dora_refuses_fused_and_routed_bases_atomically():
     assert type(wrapper.linear).__name__ == "QuantizedLinear"
     assert wrapper.m.shape == (16,)
 
-    # A late refusal must not leave earlier layers converted, or the error's
-    # own advice (use_dora=False) fails on a half-wrapped tree.
+    # A late refusal must not leave earlier layers converted, or the error's own advice (use_dora=False) fails on a half-wrapped tree.
     model = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
     config = {"rank": 4, "alpha": 8, "dropout": 0.0, "scale": 2.0,
               "use_dora": True, "keys": {"proj"}}
@@ -668,8 +661,7 @@ def test_dora_validation_mirrors_the_per_layer_selection():
     config = {"rank": 4, "alpha": 8, "dropout": 0.0, "scale": 2.0,
               "use_dora": True, "keys": {"proj"}}
 
-    # Preflight must use the conversion's per-layer predicates: the `keys`
-    # union would refuse a module the conversion never touches.
+    # Preflight must use the conversion's per-layer predicates: the `keys` union would refuse a module the conversion never touches.
     model = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
     attached = linear_to_lora_layers(
         model, num_layers=2,
@@ -705,8 +697,7 @@ def test_dora_refuses_quantized_widths_its_wrapper_cannot_unpack():
 
     _require_real_mlx_wrappers()
 
-    # DoRALinear.from_base recovers the unpacked width as `32 // bits`, exact
-    # only when bits divides 32; plain LoRA is fine at 3/5/6.
+    # DoRALinear.from_base recovers the unpacked width as `32 // bits`, exact only when bits divides 32; plain LoRA is fine at 3/5/6.
     for bits in (2, 4, 8):
         base = nn.QuantizedLinear(64, 16, bias=False, bits=bits, group_size=64)
         wrapper = _mlx_dora_wrapper_type(base, "proj").from_base(

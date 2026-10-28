@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A GPU whose KV cache estimate cannot hold max_seq_length gets vLLM's
-max_model_len lowered. The notice must name the requested and the reduced
-length (#2666 printed 256 twice), and the clamp itself must not move.
-Run off the source: load_vllm needs a GPU."""
+"""When the KV cache estimate cannot hold max_seq_length, vLLM's max_model_len is lowered: the notice must name both
+lengths (issue 2666 printed 256 twice) and the clamp must not move; reads the source since load_vllm needs a GPU."""
 
 import ast
 import pathlib

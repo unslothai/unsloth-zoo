@@ -179,6 +179,5 @@ def _nested_frames_compiled(recursive):
 
 
 def test_recursive_disable_keeps_the_subtree_eager_outside_decode():
-    # The Qwen MoE block relied on the default recursive disable: nothing it calls may be
-    # captured by an outer training compile.
+    # The Qwen MoE block relies on the default recursive disable: nothing it calls may be captured by an outer training compile.
     assert _nested_frames_compiled(recursive = True) < _nested_frames_compiled(recursive = False)

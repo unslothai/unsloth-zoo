@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""End-to-end LoRA merge correctness for the vocab-grow / resized rewrite path.
-
-Growing the tokenizer makes embed_tokens / lm_head larger than the base shard, so
-the merge falls back to the resized-shard rewrite (streaming, or the disk-aware
-in-place variant). Checks the rewritten embed/lm_head match the resized weights, old
-rows are preserved, attention LoRA still merges, everything else is byte-identical.
-"""
+"""Vocab-grow merge: embed_tokens and lm_head use the resized shard rewrite; old rows are kept."""
 
 from __future__ import annotations
 
@@ -65,8 +59,7 @@ def _build_resized_case(tmp_path, *, dtype=torch.float32, force_inplace=False,
     adapted = H.extract_adapted(pm)  # q_proj / v_proj only
 
     if force_inplace:
-        # streaming-vs-in-place is chosen purely from free disk vs estimated shard
-        # size; force in-place via an enormous estimate and spy on both paths.
+        # The path is chosen from free disk vs estimated shard size; an enormous estimate forces in-place.
         import unsloth_zoo.saving_utils as SU
         real_inplace = SU._inplace_rewrite_resized_shard
         real_stream = SU._stream_rewrite_resized_shard_and_replace
@@ -122,8 +115,7 @@ def test_resized_vocab_grow_modules_to_save(tmp_path):
 
 
 def test_resized_vocab_grow_low_disk_inplace(tmp_path, monkeypatch):
-    """In-place branch (opt-in) produces the same correct output as streaming.
-    Forced via an enormous shard-size estimate; spies confirm which path ran."""
+    """The opt-in in-place branch must match streaming output; an enormous shard-size estimate forces it."""
     calls = {"inplace": 0, "stream": 0}
     res = _build_resized_case(tmp_path, force_inplace=True, optin=True,
                               monkeypatch=monkeypatch, calls=calls)
@@ -133,8 +125,7 @@ def test_resized_vocab_grow_low_disk_inplace(tmp_path, monkeypatch):
 
 
 def test_resized_vocab_grow_low_disk_fail_closed(tmp_path, monkeypatch):
-    """Without the opt-in, a low-disk resized rewrite fails closed (raises, shard
-    untouched) instead of the non-atomic in-place rewrite."""
+    """Without opt-in, low-disk resized rewrite raises with shard untouched, not non-atomic in-place."""
     calls = {"inplace": 0, "stream": 0}
     with pytest.raises(RuntimeError, match="not enough free disk"):
         _build_resized_case(tmp_path, force_inplace=True, optin=False,

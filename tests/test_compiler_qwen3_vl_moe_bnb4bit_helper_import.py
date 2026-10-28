@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Copied Qwen3-VL-MoE expert forwards call _bnb4bit_experts_forward_or_none, so the emitted
-module must import it (it raised NameError on every call, 16-bit experts included)."""
+"""Emitted Qwen3-VL-MoE modules must import _bnb4bit_experts_forward_or_none; without it every expert call raised NameError, 16-bit experts included."""
 
 import ast
 import pathlib

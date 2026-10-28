@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_VLLM_FP32_LM_HEAD with the recompute scorer: the mini-batches grpo_accumulated_loss keeps until the
-loss share one fp32 head copy instead of saving one each."""
+"""With UNSLOTH_VLLM_FP32_LM_HEAD and the recompute scorer, the mini-batches grpo_accumulated_loss keeps until the loss share one fp32 head copy, not one each."""
 import functools
 import types
 

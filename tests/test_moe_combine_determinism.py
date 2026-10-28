@@ -14,26 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The MoE top_k combine must be reproducible, and must still be the right sum.
-
-`forward_native_grouped_mm` used to finish with
-`zeros(num_tokens, hidden).index_add_(0, sorted_indices // top_k, permuted)`.
-Each token index appears `top_k` times in that single call, so on CUDA it takes
-index_add_'s atomicAdd path, which fixes no accumulation order; in bf16 that was
-enough to give 40 distinct losses, spread over 0.0284 nats, from 40 repeats of one
-identical Gemma-4 MoE forward on one loaded model with no optimizer step.
-
-Three things are asserted here, because any one alone is easy to pass by accident:
-  1. equivalence - the replacement computes the same sum as the index_add_ form
-     (checked in float64, where both are exact);
-  2. reproducibility - repeated calls on identical input are bitwise identical
-     in bf16, with a duplicate-heavy index pattern;
-  3. cast placement - `out_dtype` is applied after the reduction, not before it.
-     That only has an observable effect when the routed slots arrive wider than
-     `out_dtype`, so it needs a case built specifically for it: every other test
-     here feeds `permuted` already in `out_dtype`, where the cast is a no-op and
-     could be moved anywhere without a single assertion noticing.
-"""
+"""Tests that the MoE top_k combine is reproducible (CUDA index_add_ atomics made bf16 nondeterministic), equals the
+index_add_ sum in float64, and casts after the reduction."""
 
 import pytest
 import torch
@@ -71,15 +53,13 @@ def test_combine_matches_index_add_exactly_in_float64(top_k):
         permuted, sorted_indices, num_tokens, top_k, hidden, torch.float64,
     )
     assert got.shape == want.shape == (num_tokens, hidden)
-    # float64 + a handful of addends: both orderings are exact, so require equality
-    # rather than a tolerance that would also accept a wrong-but-close reduction.
+    # float64 with a few addends makes both orderings exact, so require equality rather than a tolerance that would accept a wrong-but-close reduction.
     torch.testing.assert_close(got, want, rtol = 0, atol = 1e-12)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "atomics are a CUDA property")
 def test_combine_is_bitwise_reproducible_in_bf16():
-    # Large hidden dim and top_k > 1 so many threads contend for the same output
-    # rows; that contention is exactly what made the old index_add_ drift.
+    # Large hidden dim and top_k > 1 so many threads contend for the same output rows, the contention that made the old index_add_ drift.
     num_tokens, top_k, hidden, num_experts = 4096, 4, 1024, 128
     sorted_indices, permuted = _make_case(
         num_tokens, top_k, hidden, num_experts, torch.bfloat16, "cuda",
@@ -95,8 +75,7 @@ def test_combine_is_bitwise_reproducible_in_bf16():
 
 
 def test_combine_covers_every_slot_exactly_once():
-    """A permutation is assumed; a combine that dropped or doubled slots would
-    still look plausible on random data, so pin it with a counting case."""
+    """Combine assumes a permutation; one that dropped or doubled slots would look plausible on random data, so a counting case pins it."""
     num_tokens, top_k, hidden, num_experts = 32, 4, 8, 7
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sorted_indices, _ = _make_case(
@@ -118,14 +97,8 @@ def _inverse_permutation(sorted_indices):
 
 
 def test_combine_casts_to_out_dtype_after_the_sum_not_before():
-    """fp32 summands, bf16 output: the one shape where cast placement is visible.
-
-    An fp32 router (Gemma 4, DeepSeek V3) promotes the routing-weight multiply, so the
-    routed slots reach the combine in fp32 while the model runs in bf16. Casting first
-    rounds each of the top_k summands to bf16 and adds them in bf16; casting last adds
-    in fp32 and rounds once, which is what transformers' own grouped_mm path does. The
-    second assertion below exists so this test cannot quietly stop discriminating.
-    """
+    """fp32 summands, bf16 output: an fp32 router (Gemma 4, DeepSeek V3) makes cast placement visible; casting last sums
+    in fp32 and rounds once, as transformers' grouped_mm does; a second assertion keeps it discriminating."""
     num_tokens, top_k, hidden, num_experts = 512, 4, 64, 16
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sorted_indices, permuted = _make_case(
@@ -155,13 +128,8 @@ def test_combine_casts_to_out_dtype_after_the_sum_not_before():
 
 
 def test_combine_rejects_a_non_permutation():
-    """The slot-count guard must be a raised exception, not a bare `assert`.
-
-    `python -O` strips `assert`, and a build with the guard stripped is precisely the
-    one where a short `sorted_indices` would silently read the wrong rows. Requiring
-    ValueError also fails this test if the guard is reverted to an assert, which would
-    raise AssertionError instead.
-    """
+    """The slot-count guard must raise ValueError, not a bare assert: python -O strips asserts and a short
+    sorted_indices would silently read wrong rows; reverting to assert fails the test."""
     num_tokens, top_k, hidden, num_experts = 32, 4, 8, 7
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sorted_indices, permuted = _make_case(
@@ -174,13 +142,8 @@ def test_combine_rejects_a_non_permutation():
 
 
 def test_combine_gradient_matches_the_index_add_form():
-    """The combine sits in the backward path of every MoE training step, so agreeing
-    on the forward is not enough: a reduction that summed the right values through a
-    different graph would pass every test above and still train a different model.
-
-    Both spellings are gathers in reverse, so with the same upstream gradient this is
-    an exact equality rather than a tolerance, in every dtype.
-    """
+    """The combine is in every MoE training backward, so forward agreement is not enough: with the same upstream
+    gradient, grads must match the index_add_ form exactly in every dtype."""
     num_tokens, top_k, hidden, num_experts = 512, 4, 64, 16
     device = "cuda" if torch.cuda.is_available() else "cpu"
     for dtype in (torch.float64, torch.float32, torch.bfloat16):

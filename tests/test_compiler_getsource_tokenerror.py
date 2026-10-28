@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`inspect.getsource` raising `tokenize.TokenError` must not fail a model load.
-TokenError subclasses Exception directly, so it escaped the OSError/TypeError catches;
-it fires when a generated compile-folder file is read mid-rewrite. Subprocesses: the
-compiler mutates torch.nn process-wide and reads UNSLOTH_COMPILE_LOCATION at import.
-"""
+"""getsource raising tokenize.TokenError must not fail a model load: it escapes the OSError/TypeError catches; tests run
+in subprocesses since the compiler mutates torch.nn and reads UNSLOTH_COMPILE_LOCATION at import."""
 
 from __future__ import annotations
 
@@ -68,10 +65,7 @@ def _run(body: str, cache_dir: Path, timeout: int = 900):
     env = dict(os.environ)
     env["UNSLOTH_COMPILE_LOCATION"] = str(cache_dir)
     env["UNSLOTH_COMPILE_DISABLE"] = "1"
-    # On a CPU-only runner the zoo's get_device_type raises "Unsloth cannot find
-    # any torch accelerator" during the child's import, before either TokenError
-    # handler is reached. Measured: neuter tests/conftest.py's UNSLOTH_ALLOW_CPU
-    # setdefault and all three tests here die on the import.
+    # CPU-only runners need UNSLOTH_ALLOW_CPU, or get_device_type raises during the child's import before either TokenError handler runs.
     env.setdefault("UNSLOTH_ALLOW_CPU", "1")
     return subprocess.run(
         [sys.executable, "-c", script],
@@ -135,9 +129,7 @@ def test_compile_transformers_survives_tokenerror_from_getsource(tmp_path):
     )
 
 
-# The markers #967 added to every forward _patch_torch_dtype_modules installs.
-# Dropping them puts a compile-folder forward back in the state the patcher treats
-# as "not mine yet", which is what the rewrite path below needs to be reachable.
+# Markers that issue 967 adds to forwards _patch_torch_dtype_modules installs; dropping them makes the rewrite path reachable.
 _STRIP_DTYPE_MARKERS = """
         for _name in compiler._patch_functions:
             _cls = getattr(torch.nn, _name, None)
@@ -155,14 +147,7 @@ _STRIP_DTYPE_MARKERS = """
 
 
 def test_a_second_pass_does_not_read_its_own_generated_forward(tmp_path):
-    """#967's idempotence guarantee, which is what makes the probe below artificial.
-
-    The warm-up leaves every patched torch.nn forward served out of the compile
-    folder AND marked `__unsloth_dtype_wrapped__`. A second pass must recognise its
-    own output and skip it, because re-reading it would stack a second dtype
-    prologue and return a bf16 activation as fp32. Measured on this tree: 12 of 12
-    generated forwards are marked, so the second pass calls getsource on none.
-    """
+    """A second pass must skip forwards marked __unsloth_dtype_wrapped__ (issue 967): re-reading them would stack a second dtype prologue and return bf16 as fp32."""
     proc = _run(
         """
         import torch
@@ -219,14 +204,8 @@ def test_a_second_pass_does_not_read_its_own_generated_forward(tmp_path):
 
 
 def test_dtype_patcher_survives_tokenerror_on_its_generated_forward(tmp_path):
-    """The handler itself: getsource raising on a compile-folder forward must not fail the load.
-
-    The markers are stripped first. Before #967 a second pass reached this on its
-    own, which is how the case was found; #967 closed that route deliberately, so
-    reproducing the state has to be explicit now. The handler is still live for a
-    forward built by exec or one whose file has gone, and the contract it owes is
-    unchanged: wrap rather than skip, so the casts survive without the source.
-    """
+    """getsource failing on a compile-folder forward must wrap rather than skip, so dtype casts survive without the
+    source; markers are stripped to reach it (issue 967)."""
     proc = _run(
         """
         import torch
@@ -310,12 +289,7 @@ def test_the_probe_sets_cpu_mode_itself_rather_than_inheriting_it():
 
 
 def test_the_stripped_markers_are_the_ones_compiler_sets():
-    """A rename in compiler.py must fail here, not quietly disarm the probe above.
-
-    Stripping names nothing sets would leave every forward marked, the second pass
-    would skip them all, and the TokenError test would go back to reporting zero
-    hits -- the exact failure this file was carrying on main.
-    """
+    """Fails if compiler.py stops setting a marker the probe strips, which would leave every forward marked and silently disarm the TokenError probe."""
     compiler_source = (ROOT / "unsloth_zoo" / "compiler.py").read_text(encoding="utf-8")
     for marker in (
         "__unsloth_dtype_wrapped__",

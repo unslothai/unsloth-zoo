@@ -28,8 +28,7 @@ import torch
 
 
 def _mods():
-    # attention_sink imports create_block_mask from utils, which only exists when this torch has
-    # flex attention, so check before importing it rather than after.
+    # attention_sink imports create_block_mask from utils, which exists only when torch has flex attention, so check utils.HAS_FLEX_ATTENTION first
     from unsloth_zoo.flex_attention import utils
     if not utils.HAS_FLEX_ATTENTION:
         pytest.skip("no flex attention")

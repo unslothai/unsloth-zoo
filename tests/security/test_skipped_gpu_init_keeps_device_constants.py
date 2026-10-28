@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`UNSLOTH_ZOO_DISABLE_GPU_INIT=1` must not remove the device constants.
-
-CI sets the flag to run this suite, and `compiler.py` imports `DEVICE_TYPE` at module
-scope, so the job failed during COLLECTION while still reporting a result.
-"""
+"""UNSLOTH_ZOO_DISABLE_GPU_INIT=1 must keep the device constants: CI runs this suite with it, and compiler.py imports
+DEVICE_TYPE at module scope, so collection failed."""
 
 from __future__ import annotations
 

@@ -14,34 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`fullgraph = True` regions when the user has switched the compiler off.
-
-`TORCH_COMPILE_DISABLE=1` (and `torch._dynamo.config.disable = True`, which is
-the same flag by hand) takes torch.compile out of the picture while debugging.
-Up to torch 2.13 a `fullgraph = True` region then ran eagerly. From torch 2.14
-torch runs the body and raises afterwards, out of its post-call bookkeeping:
-
-    RuntimeError: torch.compile with fullgraph=True found no compiled frames.
-    Skipped frames: ... Dynamo tracing is disabled
-
-Every `torch_compile_with_fallback` region inherits that, and there are many:
-`rl_replacements.py` wraps the GRPO loss accumulator in one, and `compiler.py`
-writes the decorator into every generated `unsloth_compiled_cache` module. So a
-user who disables torch.compile on torch 2.14 loses GRPO training at the first
-step, having asked only to turn the compiler off.
-
-The flag is read before the call, never recovered from after one: torch has
-already run the body by the time it raises, so recovering would run it twice.
-And it is read at the FIRST call, not at decoration and not on every call. At
-decoration is too early, since a flag set only while modules import would stick
-for the run. Every call is too late to be consistent: a checkpoint's pack and
-its recompute must agree, and by the time a recompute runs the forward that
-packed it is gone.
-
-`TORCHDYNAMO_DISABLE=1` is a different switch, handled inside
-`torch._dynamo.optimize`, which returns the undecorated function. Nothing here
-has to deal with it, and the tests below pin that too.
-"""
+"""Up to torch 2.13 fullgraph=True regions run eagerly under TORCH_COMPILE_DISABLE=1, from 2.14 they raise after the
+body; read the flag at the first call and never recover it after a call (body would run twice); not at decoration
+(sticks) or each call (pack and recompute must agree)"""
 
 import pytest
 import torch
@@ -53,10 +28,8 @@ pytestmark = pytest.mark.usefixtures("compile_enabled")
 
 @pytest.fixture(autouse = True)
 def clear_checkpoint_markers():
-    # A compiled call under a checkpoint sets these process-wide, and only a
-    # step boundary clears them. Left set, they make the recompile-limit arm
-    # re-raise rather than fall back, in this file's tests and in any that run
-    # after it.
+    # A compiled call under a checkpoint sets these process-wide and only a step boundary clears them; left set, the
+    # recompile-limit arm re-raises instead of falling back in later tests
     yield
     u._PACKED_COMPILED_IN_CHECKPOINT = False
     u._COMPILED_OK_LABELS.clear()
@@ -132,11 +105,7 @@ def test_decorated_while_disabled_runs_eagerly_and_exactly_once(dynamo_off):
 
 
 def test_a_flag_held_only_over_decoration_does_not_stick():
-    """Disabled while the module imports, restored before the first call.
-
-    Deciding at decoration time pinned such a region to eager for the whole
-    run, which is what reading the flag at the first call instead avoids.
-    """
+    """A flag held only over decoration must not stick: deciding at decoration would pin the region to eager for the whole run, so the flag is read at the first call"""
     fn, _ = _counting_fn()
     prev = torch._dynamo.config.disable
     torch._dynamo.config.disable = True
@@ -155,8 +124,7 @@ def test_fullgraph_false_is_untouched(dynamo_off):
 
 
 def test_a_real_graph_break_still_raises():
-    # The eager dispatch is keyed on the flag, not on an error message, so a
-    # genuine fullgraph failure is never absorbed.
+    # The eager dispatch is keyed on the flag rather than on an error message, so a genuine fullgraph failure is never absorbed
     def breaks(x):
         print("graph break")
         return x + 1
@@ -170,8 +138,7 @@ def test_a_real_graph_break_still_raises():
     reason = "torch.compiler.set_stance is new in torch 2.6; the floor is 2.4",
 )
 def test_the_force_eager_stance_is_left_to_torch():
-    # torch only raises "found no compiled frames" while the stance is
-    # "default" (torch/_dynamo/eval_frame.py), so force_eager needs nothing.
+    # torch raises 'found no compiled frames' only while the stance is 'default' (torch/_dynamo/eval_frame.py), so force_eager needs no handling
     fn, calls = _counting_fn()
     wrapped = u.torch_compile_with_fallback(fullgraph = True)(fn)
     torch.compiler.set_stance("force_eager")
@@ -197,11 +164,8 @@ def test_dynamo_tracing_disabled_reads_the_live_config():
 
 
 # ------------------------------------------------- checkpointing consistency
-#
-# Non-reentrant checkpointing recomputes the forward during backward and
-# compares what each pass saved, so a pack and its recompute running in
-# different modes raises CheckpointError and ends the step. Each of these was
-# a live failure of a per-call read of the flag.
+# Non-reentrant checkpointing recomputes the forward and compares what each pass saved, so a pack and its recompute in
+# different modes raise CheckpointError; each was a live failure of a per-call read of the flag
 
 
 @pytest.mark.parametrize("disabled", [True, False])
@@ -217,19 +181,14 @@ def test_a_checkpointed_step_runs_with_the_compiler_either_way(disabled):
         torch._dynamo.config.disable = prev
     assert w.grad is not None
     if disabled:
-        # The forward and its recompute, each exactly once. Compiled, the
-        # recompute replays a graph and never re-enters the Python body.
+        # Eager, the forward and its recompute each run the Python body exactly once; compiled, the recompute replays a
+        # graph and never re-enters the Python body
         assert len(calls) == 2
 
 
 def test_the_snapshot_survives_a_flip_between_a_forward_and_its_backward():
-    """Re-enabling mid-step must not recompute an eager pack compiled.
-
-    Only this direction is ours. Disabling mid-step over a COMPILED pack is
-    torch's own: it consults `config.disable` whenever it converts a frame, so
-    the recompute's variant is skipped and runs eager whatever we do. That case
-    raises `CheckpointError` identically on `main`.
-    """
+    """Re-enabling mid-step must not recompute an eager pack as compiled; disabling over a compiled pack is torch's own
+    behavior and raises CheckpointError on main too"""
     prev = torch._dynamo.config.disable
     torch._dynamo.config.disable = True
     try:
@@ -243,12 +202,7 @@ def test_the_snapshot_survives_a_flip_between_a_forward_and_its_backward():
 
 
 def test_two_outstanding_packs_of_one_wrapper_agree():
-    """Two live packs of one wrapper, with a flip between their forwards.
-
-    A mode held per wrapper and updated per call described only the newest
-    pack, so the older one was recomputed in the other mode. Fails on `main`
-    as well, where the second forward is what changes mode.
-    """
+    """The mode must be held per pack, not per wrapper and updated per call, or the older pack is recomputed in the other mode; this also fails on main"""
     prev = torch._dynamo.config.disable
     torch._dynamo.config.disable = True
     try:
@@ -263,13 +217,8 @@ def test_two_outstanding_packs_of_one_wrapper_agree():
 
 
 def test_a_completed_checkpointed_step_leaves_no_state_to_expire():
-    """The decision is the wrapper's own, and it does not drift after a step.
-
-    Nothing in this package calls `apply_pending_eager_fallbacks`, so a mode
-    that had to be expired at a step boundary never would be. Checked away from
-    a checkpoint: whether torch can still run a COMPILED region once the flag
-    is set is torch's own frame-conversion behaviour, unchanged from `main`.
-    """
+    """The mode belongs to the wrapper and needs no expiry, since nothing here calls apply_pending_eager_fallbacks;
+    whether torch runs a compiled region after the flag is set is torch's"""
     prev = torch._dynamo.config.disable
     torch._dynamo.config.disable = False
     try:
@@ -285,8 +234,7 @@ def test_a_completed_checkpointed_step_leaves_no_state_to_expire():
 
 
 def test_a_nested_wrapper_is_traceable_after_running_eager():
-    # An outer fullgraph trace must not reach a checkpoint-hook probe: it is a
-    # pybind builtin Dynamo refuses to enter, which is fatal under fullgraph.
+    # An outer fullgraph trace must not reach a checkpoint-hook probe, a pybind builtin Dynamo refuses to enter; that is fatal under fullgraph
     def inner(x):
         return x * 2
     wrapped = u.torch_compile_with_fallback(fullgraph = True)(inner)

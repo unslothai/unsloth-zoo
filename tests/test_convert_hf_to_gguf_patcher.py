@@ -107,8 +107,7 @@ def get_model_class(name, mmproj=False):
     return ModelBase
 """
 
-# conversion/qwen.py: both expert-key literals in one find_hparam call (upstream
-# already handles the alias).
+# The qwen.py fixture puts both expert-key literals in one find_hparam call, since upstream already handles the alias.
 _PACKAGE_QWEN_PY = b"""\
 from .base import ModelBase
 
@@ -221,8 +220,7 @@ def test_extract_returns_empty_for_missing_dict(package_layout):
 
 
 def test_extract_returns_empty_for_unparseable_file(tmp_path):
-    """If conversion/__init__.py is missing or unparseable, we get an empty set
-    rather than raising — patcher then warns but does not abort."""
+    """A missing or unparseable conversion/__init__.py yields an empty set instead of raising; the patcher then warns and does not abort."""
     llama_cpp = _load_llama_cpp_module()
     assert llama_cpp._extract_dict_keys_from_conversion_init(str(tmp_path / "nope.py"), "TEXT_MODEL_MAP") == set()
 
@@ -301,13 +299,7 @@ def test_conversion_sibling_info_changes_when_base_py_changes(package_layout):
 
 
 def test_conversion_sibling_info_still_keys_a_monolith_on_its_own_directory(monolith_layout):
-    """A monolith has no conversion/ or gguf-py/gguf, and used to key on nothing.
-
-    The converter's own directory is sys.path[0] for the subprocess, so it is
-    exactly where a module shadowing one of its imports would sit. Keying on
-    nothing there meant a shadowing module could be added between exports without
-    the patcher cache noticing.
-    """
+    """A monolith keys the patcher cache on its own directory, sys.path[0] for the converter subprocess, so a module shadowing an import is noticed between exports."""
     llama_cpp = _load_llama_cpp_module()
     info = llama_cpp._conversion_sibling_info(str(monolith_layout))
     assert info is not None
@@ -324,13 +316,8 @@ def test_conversion_sibling_info_none_when_there_is_nothing_on_disk(tmp_path):
 
 
 def test_conversion_sibling_info_covers_a_module_the_patcher_never_edits(package_layout):
-    """The key decides whether the package is RESCANNED, not just re-patched.
-
-    _scan_conversion_package reads every module in conversion/, so a key built
-    from only __init__.py, base.py and qwen.py left a changed fourth module
-    invisible: in a long-lived process the next export returned the cached
-    converter without rescanning, and then executed the file that had changed.
-    """
+    """The key decides whether the package is rescanned, so it must cover every conversion/ module: a key built from
+    only __init__.py, base.py and qwen.py missed a changed fourth one."""
     llama_cpp = _load_llama_cpp_module()
     other = package_layout / "conversion" / "zz_helper.py"
     other.write_bytes(b"VALUE = 1\n")
@@ -409,8 +396,7 @@ def test_package_layout_does_not_require_module_import(tmp_path, monkeypatch):
 
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(root))
 
-    # A call here means the patcher fell through to the monolith path on package
-    # layout, which is the bug being guarded.
+    # A call here means the patcher fell through to the monolith path on package layout, which is the bug this test guards against.
     called = {"hit": False}
     def _trap(*a, **kw):
         called["hit"] = True
@@ -432,9 +418,7 @@ def test_package_layout_does_not_require_module_import(tmp_path, monkeypatch):
 
 
 def test_patcher_anchors_on_custom_dir_when_override_set(tmp_path):
-    """Build a custom llama.cpp tree with the new package layout in a temp
-    dir, point a synthetic local_script_info at it, and confirm sibling
-    info + layout detection target THAT dir, not the hardcoded default."""
+    """When an override dir is set, sibling info and layout detection must target that custom llama.cpp tree, not the hardcoded default."""
     llama_cpp = _load_llama_cpp_module()
     root = tmp_path / "custom_llama_cpp"
     root.mkdir()
@@ -461,8 +445,7 @@ def test_patcher_anchors_on_custom_dir_when_override_set(tmp_path):
     # because widening the header in place is what silently handed this slice a
     # bare flag where it expected a (path, digest) pair.
     assert isinstance(sib[0], tuple), sib[0]
-    # (path, size, digest) per module. Pinned rather than open-ended, so a
-    # widening is a deliberate edit here instead of a silent shift of the slice.
+    # Each sibling entry is a (path, size, digest) tuple; the slice is pinned rather than open-ended, so widening it is a deliberate edit.
     assert all(isinstance(entry, tuple) and len(entry) == 3 for entry in sib[1:]), sib
     paths = {entry[0] for entry in sib[1:]}
     assert str(conv / "base.py") in paths, paths
@@ -513,9 +496,7 @@ def test_latest_upstream_detected_as_package_layout(latest_llama_cpp):
 
 
 def test_latest_upstream_branding_patch_applies(latest_llama_cpp):
-    """Against the live upstream conversion/base.py, the branding regex must
-    still match. If upstream changes the indentation or arguments of
-    Metadata.load, this test fails fast so we can update the regex."""
+    """Fails fast if upstream conversion/base.py changes Metadata.load indentation or arguments, so the branding regex can be updated."""
     llama_cpp = _load_llama_cpp_module()
     base_py = latest_llama_cpp / "conversion" / "base.py"
     status = llama_cpp._apply_branding_patch_to_base(str(base_py))
@@ -535,9 +516,7 @@ def test_latest_upstream_qwen_already_handles_aliases(latest_llama_cpp):
 
 
 def test_latest_upstream_arch_enumeration_non_empty(latest_llama_cpp):
-    """TEXT_MODEL_MAP in upstream conversion/__init__.py must produce a non-empty
-    architecture allowlist. This is the assertion that would have caught the
-    original 'No supported architectures' warning if it had been a test."""
+    """Upstream TEXT_MODEL_MAP in conversion/__init__.py must yield a non-empty arch allowlist; this guards against the 'No supported architectures' warning."""
     llama_cpp = _load_llama_cpp_module()
     init_py = latest_llama_cpp / "conversion" / "__init__.py"
     text_archs = llama_cpp._extract_dict_keys_from_conversion_init(str(init_py), "TEXT_MODEL_MAP")
@@ -593,8 +572,7 @@ def test_patched_content_parses_gate():
 @pytest.mark.parametrize("indent", [8, 12, 16, 20])
 @pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
 def test_num_experts_patch_preserves_the_line_ending(indent, newline):
-    """The inserted lines must use the file's own ending, not a bare LF, or a CRLF
-    checkout comes out with mixed endings."""
+    """Inserted lines must reuse the file's own line ending, not a bare LF, or a CRLF checkout comes out with mixed endings."""
     import ast
 
     module = _load_llama_cpp_module()
@@ -678,8 +656,7 @@ def test_patched_content_parses_gate_cases(content, expected):
 
 
 def test_the_gate_rejects_the_hardcoded_indent_failure_mode():
-    """What the old hardcoded replacement produced at 16 spaces: the statement landed
-    at 12, one dedent below the comment, and was written without a syntax check."""
+    """The old hardcoded replacement at 16-space indent put the statement at 12 spaces, one dedent below the comment, and wrote it without a syntax check."""
     module = _load_llama_cpp_module()
     broken = (
         b"class Model:\n"
@@ -699,8 +676,7 @@ def test_the_gate_rejects_the_hardcoded_indent_failure_mode():
     [b"  ", b"\t", b"  # noqa", b"  # keep this comment", b" #x"],
 )
 def test_num_experts_patch_keeps_a_trailing_comment_or_spaces(trailer):
-    """Anchoring the pattern on the whole line must not lose the checkouts the old
-    unanchored regex covered: a trailer is preserved and the patch still applies."""
+    """Whole-line anchoring must still match a line with a trailing comment or spaces, as the old unanchored regex did, and keep that trailer."""
     import ast
 
     module = _load_llama_cpp_module()
@@ -762,8 +738,7 @@ def test_choose_content_falls_back_to_the_original_when_the_first_patch_broke_it
 
 
 def test_choose_content_does_not_blame_our_patches_when_upstream_needs_a_newer_python():
-    """If the untouched converter does not parse on the running interpreter, dropping
-    our patches fixes nothing and would silently disable them. Keep them."""
+    """If the untouched converter does not parse on this interpreter, dropping our patches fixes nothing and would silently disable them, so keep them."""
     module = _load_llama_cpp_module()
     broken_base = b"class C[T]:\n    pass\n" if sys.version_info < (3, 12) else b"def f(:\n"
     stages = _stage_list(("base", broken_base), ("p1", broken_base + b"x = 1\n"))
@@ -855,8 +830,7 @@ def _drive_patcher(llama_cpp, tmp_path, monkeypatch, source, name = "convert_hf_
 @pytest.mark.parametrize("indent", [12, 16])
 @pytest.mark.parametrize("trailer", [b"", b"  # inline"])
 def test_end_to_end_monolith_patch_is_written_and_parses(tmp_path, monkeypatch, indent, trailer):
-    """Drive the whole patcher over a monolith whose target sits at a depth the old
-    hardcoded replacement could not produce: the written file parses and is patched."""
+    """Runs the whole patcher on a monolith whose target sits at a depth the old hardcoded replacement could not produce; the output must parse and be patched."""
     import ast
 
     llama_cpp = _load_llama_cpp_module()
@@ -907,8 +881,7 @@ def test_end_to_end_writes_the_original_when_every_patch_stage_is_broken(tmp_pat
 
 @pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf"])
 def test_end_to_end_crlf_and_bom_monolith(tmp_path, monkeypatch, prefix):
-    """CRLF throughout, optionally with a utf-8 BOM: the written converter must parse
-    and must not gain a lone LF."""
+    """CRLF throughout, optionally with a utf-8 BOM: the written converter must still parse and must not gain a bare LF."""
     import ast
 
     llama_cpp = _load_llama_cpp_module()
@@ -1005,8 +978,7 @@ def test_branding_patch_on_a_crlf_base_py_stays_crlf(tmp_path):
 
 
 def test_gguf_attribute_patch_keeps_the_blank_lines_after_the_import(tmp_path, monkeypatch):
-    """The guards go straight after `import gguf`; the lines that followed it stay
-    where they were."""
+    """The gguf attribute guards go straight after the import gguf line; the lines that followed it keep their place."""
     module = _load_llama_cpp_module()
     source = _MONOLITH_HEAD.replace(b"import gguf\n", b"import gguf\n\n\n") + b"\n"
     written, _ = _drive_patcher(module, tmp_path, monkeypatch, source)
@@ -1016,10 +988,7 @@ def test_gguf_attribute_patch_keeps_the_blank_lines_after_the_import(tmp_path, m
 
 @pytest.mark.parametrize("indent", [12, 16])
 def test_patching_an_already_patched_monolith_converges(tmp_path, monkeypatch, indent):
-    """Patching the patcher's own output must be a no-op, not a second insertion.
-
-    The monolith branding patch has no marker inside the file it edits, so before the
-    guard it matched `Metadata.load(...)` again and appended another copy every time."""
+    """Re-patching patched output must be a no-op: the branding patch has no marker in the file it edits, so it matched Metadata.load again and appended copies."""
     import ast
 
     llama_cpp = _load_llama_cpp_module()
@@ -1042,8 +1011,7 @@ def test_patching_an_already_patched_monolith_converges(tmp_path, monkeypatch, i
 
 
 def test_a_pristine_converter_is_still_branded(tmp_path, monkeypatch):
-    """The idempotency guard keys on a line upstream never ships, so a fresh
-    checkout is branded exactly as before."""
+    """The idempotency guard keys on a line upstream never ships, so a fresh checkout is still branded exactly as before."""
     llama_cpp = _load_llama_cpp_module()
     source = _monolith_with_num_experts(12)
     assert b"quantized_by" not in source
@@ -1056,12 +1024,8 @@ def test_a_pristine_converter_is_still_branded(tmp_path, monkeypatch):
 def test_a_new_gguf_reference_is_guarded_on_a_converter_already_patched_once(
     tmp_path, monkeypatch
 ):
-    """One pre-existing guard must not suppress guarding for every other name.
-
-    The old convergence guard keyed on a single substring, so a converter patched once
-    and then updated to reference a new `gguf` enum kept that enum unguarded, which is
-    the exact AttributeError this patch exists to prevent.
-    """
+    """Guards must be per attribute: a single-substring guard left a new gguf enum unguarded on a converter already
+    patched once, the AttributeError this patch prevents."""
     import ast
 
     llama_cpp = _load_llama_cpp_module()
@@ -1097,8 +1061,7 @@ def test_a_new_gguf_reference_is_guarded_on_a_converter_already_patched_once(
 
 
 def test_a_converter_with_nothing_new_is_still_byte_identical(tmp_path, monkeypatch):
-    """Per-attribute detection is only safe if re-patching a fully covered file writes
-    the same bytes; otherwise every conversion grows the converter."""
+    """Per-attribute detection is only safe if re-patching a fully covered file writes identical bytes; otherwise every conversion grows the converter."""
     llama_cpp = _load_llama_cpp_module()
     first, second = tmp_path / "first", tmp_path / "second"
     first.mkdir(); second.mkdir()
@@ -1108,9 +1071,7 @@ def test_a_converter_with_nothing_new_is_still_byte_identical(tmp_path, monkeypa
 
 
 def test_an_unterminated_final_target_keeps_the_files_line_ending():
-    """A converter whose LAST line is the match carries no terminator to reuse, so it
-    must inherit the file's dominant ending. A `\\n` fallback would leave a CRLF
-    checkout with mixed endings, which still parses and so is easy to miss."""
+    """An unterminated last-line target inherits the file's dominant ending; a bare LF fallback would leave a CRLF checkout with mixed endings that still parses."""
     llama_cpp = _load_llama_cpp_module()
     crlf = (
         b"class M:\r\n"
@@ -1131,8 +1092,7 @@ def test_an_unterminated_final_target_keeps_the_files_line_ending():
 
 
 def test_a_terminated_target_still_reuses_its_own_ending():
-    """The fallback must only apply where there is nothing to reuse. A line that HAS a
-    terminator keeps it, even in a file whose dominant ending is the other one."""
+    """Fallback only applies with nothing to reuse: a terminated target keeps its own line ending even when the file's dominant ending differs."""
     llama_cpp = _load_llama_cpp_module()
     mostly_lf = (
         b"class M:\n"

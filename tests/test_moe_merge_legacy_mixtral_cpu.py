@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU regression for legacy-Mixtral MoE merge (#5403).
-
-transformers v5 fuses Mixtral experts in-memory but still writes them unfused on
-disk; the merge must map those disk keys back to the mlp.experts LoRA.
-"""
+"""Legacy-Mixtral MoE merge CPU regression (issue 5403): transformers v5 fuses experts in memory but writes them unfused, so disk keys must map to mlp.experts LoRA."""
 
 from __future__ import annotations
 
@@ -77,16 +73,9 @@ def _make_lora_weights(num_layers, num_experts, rank_per, hidden, intermediate, 
 
 
 def _delta(A, B, alpha, expert_idx, num_experts):
-    """One expert's delta from a fused PEFT-0.19 adapter, spelled out as PEFT packs it.
-
-    "Legacy" in this file is about the on-disk key format: transformers v5 fuses Mixtral
-    experts in memory but still writes unfused `w1`/`w2`/`w3`. The adapter itself is a current
-    fused PEFT one (see `_make_lora_weights`), so it is read with PEFT's packing, not with any
-    older Unsloth convention: `lora_A` is expert-slowest, a contiguous row block per expert,
-    while `lora_B` is expert-FASTEST, `reshape(out, rank, num_experts)` exactly as
-    `ParamWrapper.get_delta_factors` does, so expert `e` is plane `e` of that reshape. Written
-    out rather than imported so the expectation stays independent of the merge code.
-    """
+    """Legacy means on-disk unfused w1/w2/w3 keys; the adapter is a fused PEFT-0.19 one, read with PEFT packing, not an
+    older Unsloth convention (lora_A expert-slowest, lora_B expert-fastest, reshape out,rank,num_experts); written
+    out, not imported."""
     r = A.shape[0] // num_experts
     a = A[expert_idx * r:(expert_idx + 1) * r].to(torch.float64)
     b = B.reshape(B.shape[0], r, num_experts)[:, :, expert_idx].to(torch.float64)
@@ -269,9 +258,9 @@ def test_legacy_mixtral_down_proj_keyed_adapter_is_merged(tmp_path):
 
 
 def test_legacy_mixtral_both_fused_keys_resolve_num_experts(tmp_path):
-    """gate_up on .gate_up_proj AND down on .down_proj, with no .base_layer / bare .experts
-    key. Neither matches the #5410 num_experts override, so num_experts must come from the
-    wrapped module (lora_stats), not the shard key scan, or the fused rank slices are wrong."""
+    """Fused .gate_up_proj and .down_proj keys with no .base_layer or bare .experts: neither matches the issue 5410
+    num_experts override, so num_experts must come from the wrapped module (lora_stats), not the shard key scan, or
+    the fused rank slices are wrong."""
     num_layers, num_experts, rank_per = 1, 4, 3
     hidden, intermediate = 12, 8
     alpha = 2.0
@@ -428,10 +417,9 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
 
 
 def test_legacy_mixtral_fp8_dequant_then_merge_16bit(tmp_path):
-    """Option C two-phase: dequantize an FP8 legacy-Mixtral shard to 16bit (no LoRA), then
-    merge the expert LoRA via the standard 16bit path. Output is genuine bf16 (not FP8), all
-    scales dropped, and the per-expert delta matches the analytic reference. Mirrors what the
-    orchestrator does for an FP8 MoE merged_16bit export."""
+    """Option C two-phase: dequantize FP8 legacy-Mixtral shard to 16bit (no LoRA), then merge expert LoRA on the
+    standard path; output is genuine bf16 with scales dropped, delta matches the analytic reference; mirrors the
+    orchestrator's FP8 merged_16bit export."""
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
         _fp8_dequant_blockwise, _fp8_requant_blockwise,
     )

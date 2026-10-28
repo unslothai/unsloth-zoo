@@ -45,8 +45,8 @@ def _model(dtype):
     mx.random.seed(3407)
     model = gemma4.Model(config)
     tower = model.vision_tower
-    # 768 patch values x 26 embed near 2e4: pooled x sqrt(16) reaches 8e4, as the 26B tower's
-    # ~2.5e3 x sqrt(1152) does. std_scale brings it back to the real tower's single digits.
+    # 768 patch values x 26 embed near 2e4: pooled x sqrt(16) reaches 8e4, as the 26B tower's ~2.5e3 x sqrt(1152) does;
+    # std_scale brings it back to the real tower's single digits.
     embedder = tower.patch_embedder
     embedder.input_proj.weight = mx.full(embedder.input_proj.weight.shape, 26.0)
     tower.std_scale = mx.full(tower.std_scale.shape, 1e-4)

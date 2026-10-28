@@ -1,13 +1,5 @@
-"""The vendored third-party MIT license and notice must ship inside the wheel.
-
-A built wheel installs only importable .py modules (setuptools packages.find with
-include-package-data = false), so the plain LICENSE / NOTICE / MANIFEST files under
-unsloth_zoo/_vendored are not packaged. unsloth_zoo/_vendored/_licenses.py mirrors
-that text as importable module strings so the MIT attribution required to
-redistribute the vendored fla sources travels with the code, with no pyproject
-package-data entry. These CPU-only tests guard that the module exists, carries the
-MIT license, and stays byte-identical to the canonical source-tree files.
-"""
+"""Vendored MIT license and notice must ship in the wheel: unsloth_zoo/_vendored/_licenses.py mirrors the plain files as
+importable strings, byte-identical, with no package-data entry."""
 import importlib.util
 import os
 
@@ -16,9 +8,8 @@ _VENDORED = os.path.join(_REPO_ROOT, "unsloth_zoo", "_vendored")
 
 
 def _load_licenses_module():
-    # Load by file path so the test does not import the full unsloth_zoo package
-    # (which pulls in the patching machinery). setuptools packages.find ships every
-    # .py under the _vendored package, so a valid module here travels in the wheel.
+    # Load by file path to avoid importing unsloth_zoo (it pulls in the patching machinery); setuptools packages.find
+    # ships every .py under _vendored, so the module reaches the wheel.
     path = os.path.join(_VENDORED, "_licenses.py")
     spec = importlib.util.spec_from_file_location("unsloth_zoo_vendored_licenses", path)
     mod = importlib.util.module_from_spec(spec)

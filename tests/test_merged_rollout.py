@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Opt-in merged-weight GRPO rollouts (UNSLOTH_VLLM_MERGED_ROLLOUT), CPU only.
-
-The HF base weights are row views of a fake fused vLLM qkv tensor, exactly the aliasing
-fast_inference sets up, and the vLLM engine is a stub whose generate records what the
-weights held while it ran. No vLLM engine is built.
-"""
+"""Opt-in merged-weight GRPO rollouts (UNSLOTH_VLLM_MERGED_ROLLOUT), CPU only: HF base weights alias a fake fused vLLM
+qkv tensor and the stub engine records weights during generate; no vLLM engine is built."""
 
 import copy
 import inspect
@@ -1141,8 +1137,7 @@ def test_failed_reset_after_restore_blocks_plain_calls_until_it_resets(how):
 
 
 def test_async_engine_is_not_wrapped_and_keeps_vllm_lora(monkeypatch, _isolate):
-    # AsyncLLMEngine.generate is an async generator: a fold around the call would be
-    # restored before inference, so such engines stay on the vLLM LoRA path.
+    # AsyncLLMEngine.generate is an async generator: a fold around the call would be restored before inference, so such engines stay on vLLM LoRA.
     model, llm, vllm_model = _make_model(wrap = False)
 
     async def generate(prompts, sampling_params = None, *, lora_request = None):
@@ -1232,9 +1227,8 @@ def test_attention_mode_with_only_attention_lora_sends_no_request(_attention_mod
 @pytest.mark.parametrize("cause", ["refused", "reset_failed", "mixed_list"])
 @pytest.mark.parametrize("name_check", ["on", "off"])
 def test_attention_engine_never_gets_attention_lora_it_cannot_serve(cause, name_check, monkeypatch, _attention_mode):
-    # vLLM was started without attention LoRA: every path that would hand it attention tensors
-    # (refused model, failed pre-fold cache reset, mixed per-prompt list) must raise, never let
-    # vLLM drop them, even with the name check disabled.
+    # vLLM has no attention LoRA: a refused model, failed pre-fold cache reset or mixed per-prompt list must raise, not
+    # be dropped, even with name check disabled.
     if name_check == "off": monkeypatch.setenv("UNSLOTH_DISABLE_LORA_NAME_CHECK", "1")
     model, llm, vllm_model = _make_model(lora_bias = True) if cause == "refused" else _make_model()
     llm._unsloth_lora_without_attention = True
@@ -1321,8 +1315,7 @@ def test_cuda_exact_failed_unfold_poisons(monkeypatch):
 
 @_cuda
 def test_cuda_exact_failed_target_build_keeps_state_usable(monkeypatch):
-    # e.g. an OOM casting the adapter factors: nothing was folded, so the original error
-    # surfaces, the weights are untouched and the next rollout works.
+    # E.g. an OOM casting the adapter factors: nothing was folded, so the original error surfaces, weights stay untouched and the next rollout works.
     import unsloth_zoo.vllm_utils as vu
     model, llm, vllm_model = _make_model(device = "cuda")
     state = prepare_merged_rollout(model)
@@ -1464,8 +1457,7 @@ def test_exact_mode_needs_one_device(monkeypatch):
     assert vllm_utils._merged_rollout_use_exact(two) is False
 
 
-# Automatic default (variable unset): only the exact fold, never the pinned copy; no MoE experts;
-# an engine the load-time gate declined stays silent.
+# Automatic default (variable unset): only the exact fold, never the pinned copy; no MoE experts; an engine the load-time gate declined stays silent.
 @pytest.fixture
 def _automatic(monkeypatch):
     monkeypatch.setattr(vllm_utils, "_merged_rollout_auto_platform", lambda: None)

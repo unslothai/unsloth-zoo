@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Grouped QLoRA training for gpt-oss ModuleList NF4 experts (gpt_oss_grouped_qlora).
-
-* The pointer-table stacked dequant is torch.equal to bitsandbytes per expert (nested and
-  flat absmax, every quant dtype, blocksize 64 / 128, subnormal scales that bnb flushes).
-* The grouped forward with per-expert LoRA matches the per-expert loop
-  (UNSLOTH_GPTOSS_GROUPED=0) in output and in every LoRA / input gradient, runs without a
-  host sync, and moving one expert's lora_B moves the output.
-* Unsupported adapters (dropout, DoRA, lora_bias, several active, disabled), fp16 inputs
-  to bf16 experts and unsupported compute dtypes keep the per-expert loop. fp32 inputs (the
-  residual stream after the first MoE layer) take the grouped path in bf16, as Linear4bit does.
-* float16 experts (the loader keeps down in fp32) take moe_grouped_fp16's Triton GEMMs and
-  match the per-expert loop with Unsloth's forced-float32 LoRA forward, and an fp64 oracle.
-"""
+"""Grouped QLoRA for gpt-oss NF4 experts: stacked dequant equals bitsandbytes; grouped forward matches the
+UNSLOTH_GPTOSS_GROUPED=0 loop in output and grads with no host sync; unsupported adapters and fp16 inputs to bf16
+experts keep the loop; fp16 experts use moe_grouped_fp16 Triton GEMMs."""
 import os
 
 import pytest
@@ -368,8 +358,8 @@ def test_in_place_quant_edit_is_not_stale(kernel, edit, fast, monkeypatch):
             qs.offset.add_(0.05)
         else:
             qs.code = qs.code.flip(0)
-    # A hook-less edit of one interior expert: seen per call with UNSLOTH_MOE_FAST_READY=0, else at
-    # the next bump (in-place absmax edits need neither: the tables read them live).
+    # A hook-less edit of one interior expert is seen per call with UNSLOTH_MOE_FAST_READY=0, else at the next bump;
+    # in-place absmax edits need neither, as the tables read them live.
     if fast == "1" and edit in ("offset", "code"):
         moe_ready_epoch.bump()
     out, _, delta = _run(ex, x, idx, w, True, monkeypatch)
@@ -475,9 +465,8 @@ def test_replaced_middle_expert_rebuilds_tables(proj, monkeypatch):
 @pytest.mark.parametrize("change", ["dropout", "dropout_p", "merge", "disable", "dora_flag", "unwrap"])
 @pytest.mark.parametrize("fast", ["1", "0"])
 def test_ready_cache_sees_a_middle_expert(change, fast, monkeypatch):
-    # A direct edit of one middle expert must re-run the check: per call with
-    # UNSLOTH_MOE_FAST_READY=0; else through the hooks / dropout compare, or at the next bump for
-    # hook-less edits (merged_adapters / use_dora written directly).
+    # A direct edit of a middle expert must re-run the check: per call with UNSLOTH_MOE_FAST_READY=0, else via hooks or
+    # dropout compare, or at the next bump for hook-less edits such as merged_adapters or use_dora written directly.
     monkeypatch.setenv("UNSLOTH_MOE_FAST_READY", fast)
     monkeypatch.delenv("UNSLOTH_GPTOSS_GROUPED", raising = False)
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
@@ -529,8 +518,8 @@ def test_unrouted_expert_gets_zero_lora_grads(monkeypatch):
 
 
 # ---------------------------------------------------------------------------------------------
-# float16 (T4): gate_up in fp16, down kept in fp32 by the loader (_pre_set_compute_dtype), the
-# adapters through Unsloth's forced-float32 LoRA forward. moe_grouped_fp16's Triton GEMMs.
+# float16 (T4): gate_up in fp16, down kept fp32 by the loader (_pre_set_compute_dtype), adapters via Unsloth's
+# forced-float32 LoRA forward; moe_grouped_fp16 Triton GEMMs.
 # ---------------------------------------------------------------------------------------------
 import types
 
@@ -542,12 +531,11 @@ needs_fp16_grouped = pytest.mark.skipif(not FP16_OK, reason = "fp16 grouped GEMM
 
 
 def _fp16_experts(nested = True, rule = True, down_scale = None):
-    """What unsloth's loader leaves for gpt-oss NF4 on float16: gate_up fp16; down with
-    quant_state.dtype / compute_dtype / _pre_set_compute_dtype / bias in fp32 (rule)."""
+    """gpt-oss NF4 on float16 as the loader leaves it: gate_up fp16; down's quant_state.dtype, compute_dtype, _pre_set_compute_dtype and bias in fp32 (loader rule)."""
     ex = _Experts(nested, dtype = F16)
     for p in list(ex.gate_up_projs) + list(ex.down_projs):
-        # bitsandbytes < 0.46 adopts an fp32 input's dtype on the first call unless told the
-        # compute dtype is final (>= 0.46 sets this whenever compute_dtype is passed).
+        # bitsandbytes < 0.46 adopts an fp32 input's dtype on the first call unless told the compute dtype is final; >=
+        # 0.46 sets this whenever compute_dtype is passed.
         p.compute_type_is_set = True
     for p in ex.down_projs:
         if down_scale is not None:
@@ -680,9 +668,8 @@ def test_fp16_grouped_matches_loop_and_oracle(r, x_dtype, rule, grad_scale, gemm
         if grad_scale == 1.0:
             assert close, (n, _rel(gr[n], ref_g[n]))
         else:
-            # Unscaled 1e-6 grads sit in fp16's subnormal range on the loop's own fp16 paths
-            # (gate_up and its LoRA, down's xA, a fp16 down's dX), so the loop is no reference
-            # there: the fp64 oracle is.
+            # Unscaled 1e-6 grads sit in fp16's subnormal range on the loop's own fp16 paths (gate_up and its LoRA,
+            # down's xA, dX), so the fp64 oracle is the reference, not the loop.
             assert close or _rel(gr[n], o_g[n]) <= 1.25 * _rel(ref_g[n], o_g[n]) + 1e-3, (
                 n, _rel(gr[n], ref_g[n]), _rel(gr[n], o_g[n]), _rel(ref_g[n], o_g[n]))
     # fp64 oracle: the grouped path is no less accurate than the loop (aggregate over LoRA grads).
@@ -713,8 +700,7 @@ def test_fp16_down_output_above_fp16_max_stays_finite(gemm, monkeypatch):
     for n in ref_g:
         if _rel(gr[n], ref_g[n]) <= 0.05:
             continue
-        # Gate / linear values sit on the swiglu clamp edges here, so one fp16 ulp in gate_up
-        # flips a clamp mask in either arm (A100 cuBLAS: one lora_B at 6.6%): judge by fp64.
+        # Gate and linear values sit on the swiglu clamp edges, so one fp16 ulp in gate_up flips a clamp mask in either arm on A100 cuBLAS; judge by fp64.
         if o_g is None:
             _, o_g = _oracle_layer(ex, x, idx, w, upstream)
         assert _rel(gr[n], o_g[n]) <= 1.25 * _rel(ref_g[n], o_g[n]) + 1e-3, (
@@ -724,8 +710,8 @@ def test_fp16_down_output_above_fp16_max_stays_finite(gemm, monkeypatch):
 @needs_fp16_grouped
 @pytest.mark.parametrize("gemm", ["triton", "cublas"])
 def test_fp16_lora_scaled_before_rounding(gemm, monkeypatch):
-    # Unscaled x @ A.T @ B.T past 65504 but finite once scaled: the forced-float32 LoRA forward
-    # adds scaling * product in one addmm, so the grouped path must not round the product first.
+    # Unscaled x @ A.T @ B.T exceeds 65504 but is finite once scaled: the forced-float32 LoRA forward adds scaling *
+    # product in one addmm, so grouped must not round it first.
     monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", gemm)
     ex = _fp16_lora(_fp16_experts(rule = True))
     g = torch.Generator(device = "cuda").manual_seed(5)
@@ -751,8 +737,8 @@ def test_fp16_lora_scaled_before_rounding(gemm, monkeypatch):
 @pytest.mark.parametrize("mm_out_dtype", [True, False])
 @pytest.mark.parametrize("down_operand", ["fp16", "fp32"])
 def test_fp16_cublas_down_stays_fp32_under_autocast(mm_out_dtype, down_operand, monkeypatch):
-    # fp16 autocast must not narrow the cuBLAS down GEMM (its fp32 fallback for torch.mm without
-    # out_dtype, or fp32 operands) to fp16: down outputs past 65504 stay finite, as in the loop.
+    # fp16 autocast must not narrow the cuBLAS down GEMM (fp32 fallback for torch.mm without out_dtype, or fp32
+    # operands) to fp16; down outputs past 65504 must stay finite.
     monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", "cublas")
     monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_DOWN_OPERAND", down_operand)
     monkeypatch.setitem(mg._MM_OUT_DTYPE, F16, None if mm_out_dtype else False)
@@ -869,8 +855,8 @@ def test_fp16_grouped_no_host_sync(monkeypatch):
 @needs_fp16_grouped
 @pytest.mark.parametrize("gemm", ["triton", "cublas"])
 def test_fp32_down_operands_match_the_loop_down_exactly_enough(gemm, monkeypatch):
-    # fp32 operand mode = the loop's fp32 down math: fp32 dequant stack (bit-exact bnb), fp32 x,
-    # fp32 dY, IEEE accumulate. Against per-expert fp32 matmuls only summation order differs.
+    # fp32 operand mode matches the loop's fp32 down math: fp32 dequant stack (bit-exact bnb), fp32 x and dY, IEEE
+    # accumulate; only summation order differs from per-expert matmuls.
     from unsloth_zoo.temporary_patches.moe_grouped_fp16 import Groups, grouped_frozen_linear
     monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", gemm)
     ex = _fp16_experts()
@@ -896,14 +882,12 @@ def test_fp32_down_operands_match_the_loop_down_exactly_enough(gemm, monkeypatch
 
 
 # ---------------------------------------------------------------------------------------------
-# FSDP2 all-gathered experts (unsloth fsdp2_qlora marks them `_unsloth_fsdp2_gathered`): FSDP2
-# frees the forward all-gather and re-gathers before backward, possibly at another address. The
-# backward recompute of both grouped paths (bf16 _StackProvider, fp16 _Fp16StackProvider) must
-# dequantize from the current weights, not from the pointer table captured in forward.
+# FSDP2 re-gathers experts before backward, possibly at another address (marked _unsloth_fsdp2_gathered), so the
+# backward recompute of both grouped paths (bf16 _StackProvider, fp16 _Fp16StackProvider) must dequantize current
+# weights, not the forward pointer table.
 # ---------------------------------------------------------------------------------------------
 def _regather_elsewhere(ex):
-    # What FSDP2 does between forward and backward, made deterministic: the weights move to new
-    # storage and the old storage is overwritten (NF4 code 0 everywhere = -1.0 * absmax).
+    # Mimics FSDP2's re-gather: weights move to new storage and the old storage is overwritten with NF4 code 0 (-1.0 * absmax everywhere).
     for p in list(ex.gate_up_projs) + list(ex.down_projs):
         old = p.weight.data
         p.weight.data = old.clone()

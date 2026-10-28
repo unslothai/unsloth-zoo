@@ -40,8 +40,8 @@ class _MLP(torch.nn.Module):
 @pytest.fixture
 def reload_tiled_mlp():
     saved = (device_type.DEVICE_TYPE, device_type.DEVICE_TYPE_TORCH)
-    # Restore the original namespace, not a fresh reload: a reload defines a new TiledMLP class,
-    # so anything that imported the old one (other tests, unsloth) patches a class nobody calls.
+    # Restore the original module namespace rather than reloading: a reload makes a new TiledMLP class, so code holding
+    # the old one would patch a class nobody calls.
     saved_namespace = dict(vars(tiled_mlp))
 
     def _reload(label, torch_label):

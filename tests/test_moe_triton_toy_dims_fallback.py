@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""forward_triton_grouped_gemm with a hidden / MoE intermediate size the Triton tiles cannot cover.
-
-tl.dot needs tile dims >= 16 and the kernels static_assert K % BLOCK_SIZE_K == 0, so a toy config
-(tiny-Qwen3MoeForCausalLM: hidden_size 8) failed to compile on every GPU. It now runs the same routing
-on grouped_mm (or the eager loop); sizes that are multiples of 16 still take the Triton kernels.
-"""
+"""forward_triton_grouped_gemm falls back to grouped_mm or the eager loop for sizes Triton cannot tile (tl.dot needs
+dims >= 16; K % BLOCK_SIZE_K must be 0); multiples of 16 stay on Triton."""
 
 import pytest
 import torch

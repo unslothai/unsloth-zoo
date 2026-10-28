@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""merged_4bit really produces 4-bit, driven through save_pretrained_merged.
-
-Every branch goes through the public entry point: one reachable only from the
-helper would be dead code that still passed a helper-level test. The paths that
-must NOT change are covered too (already-quantized base, `merged_16bit`,
-`push_to_hub_merged`).
-"""
+"""merged_4bit really yields 4-bit via the public save_pretrained_merged; pre-quantized bases, merged_16bit and push_to_hub_merged must not change."""
 
 from __future__ import annotations
 
@@ -94,15 +88,12 @@ def test_merged_4bit_quantizes_a_full_finetuned_model():
     quantization, weight_bytes = _saved_artifact(model, tokenizer, "merged_4bit")
 
     assert quantization == {"group_size": 64, "bits": 4, "mode": "affine"}
-    # The checkpoint dtype comes from the config (bfloat16), not from the
-    # float32 training, so this holds to the 16-bit LoRA bound.
+    # The checkpoint dtype comes from the config (bfloat16), not the float32 training, so this holds to the 16-bit LoRA bound.
     assert weight_bytes < 700e6, f"weights still {weight_bytes / 1e6:.1f}MB"
 
 
 def test_full_finetuned_and_lora_merges_agree_on_size():
-    """Same base, same grid: a size gap between a float32 full-finetune and a
-    16-bit LoRA run means a training dtype leaked into the checkpoint.
-    """
+    """Same base and grid: a size gap between a float32 full-finetune and a 16-bit LoRA run means a training dtype leaked into the checkpoint."""
     lora_model, tokenizer = _load_and_adapt(
         FP_MODEL, load_in_16bit=True, load_in_4bit=False)
     _, lora_bytes = _saved_artifact(lora_model, tokenizer, "merged_4bit")
@@ -118,9 +109,7 @@ def test_full_finetuned_and_lora_merges_agree_on_size():
 
 
 def test_merged_4bit_artifact_has_no_float32_tensors():
-    """float32 scales/embeddings are the tell. Packed weights are uint32, so
-    this checks the float dtype, not "32 appears in the name".
-    """
+    """float32 scales/embeddings are the tell: packed weights are uint32, so check the float dtype, not whether 32 appears in the name."""
     model, tokenizer = _load_and_adapt(FP_MODEL, full_finetuning=True)
     with tempfile.TemporaryDirectory() as directory:
         model.save_pretrained_merged(directory, tokenizer, save_method="merged_4bit")
@@ -151,10 +140,7 @@ def test_quantized_save_reloads_and_runs():
 
 
 def test_already_quantized_merged_4bit_is_unchanged():
-    """An already-4bit base must not be re-quantized. Its metadata passes
-    through verbatim and mlx-community configs may omit ``mode``, so assert the
-    grid, not an exact dict.
-    """
+    """An already-4bit base must not be re-quantized; its metadata passes through verbatim and mlx-community configs may omit mode, so check the grid only."""
     model, tokenizer = _load_and_adapt(QUANTIZED_MODEL)
     quantization, weight_bytes = _saved_artifact(model, tokenizer, "merged_4bit")
     assert quantization is not None
@@ -173,10 +159,7 @@ def test_merged_16bit_still_writes_full_precision():
 
 
 def test_push_to_hub_merged_does_not_quantize():
-    """`push_to_hub_merged` calls save_merged_model with the default
-    dequantize=False, so inferring "quantize" from that flag would 4-bit every
-    hub push of an unquantized model.
-    """
+    """push_to_hub_merged calls save_merged_model with default dequantize=False, so inferring quantize from that flag would 4-bit every unquantized push."""
     from unsloth_zoo.mlx.utils import save_merged_model
 
     model, tokenizer = _load_and_adapt(

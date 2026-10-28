@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""trl's SFTTrainer touches outputs.logits TWICE, and rebinding entropy_from_logits
-only covers the first. On trl 1.x the second one runs FIRST, so the rebind is inert.
-
-    trl 0.22.2  sft_trainer.py:1080  shift_logits = outputs.logits[..., :-1, :]
-    trl 0.24.0  sft_trainer.py:1146  shift_logits = outputs.logits[..., :-1, :]
-    trl 0.25.1  sft_trainer.py:1151  shift_logits = outputs.logits[..., :-1, :]
-    trl 1.9.2   sft_trainer.py:1769  shift_logits = outputs.logits[..., :-1, :]
-
-Two shapes are exercised here. The installed trl's REAL compute_loss (no stubbing
-of trl) against both real sentinels, and a stand-in for trl 1.x -- whose liger
-branch runs BEFORE the forward and injects forward kwargs, so "pretend liger is
-on" is only safe there if those kwargs are kept out of the model call.
-"""
+"""Tests trl's SFTTrainer logits metrics: outputs.logits is read twice, and on trl 1.x the second read runs first so the
+entropy rebind is inert; runs the real compute_loss and a trl 1.x stand-in that keeps liger-only kwargs out of the
+forward."""
 import collections
 import contextlib
 import inspect
@@ -49,8 +39,7 @@ def _none(*a, **k): return None
 
 
 class EmptyLogits:
-    """The compiler.py sentinel. The fused-loss path returns torch.empty(0)
-    instead, so both are parametrised wherever the sentinel is the input."""
+    """compiler.py sentinel; the fused-loss path returns torch.empty(0) instead, so tests parametrise over both wherever the sentinel is input."""
 
     def raise_getattr_error(self, attr): return _none if attr == "to" else _raise
     __getitem__ = _raise
@@ -83,13 +72,8 @@ class _Model:
 
 @pytest.fixture(autouse = True)
 def _pin_the_accelerate_device(monkeypatch):
-    """`accelerate.PartialState` is a process-global borg. Anything earlier in
-    the session that builds an Accelerator (many tests here do) leaves
-    `_shared_state["device"] = cuda`, and the entropy fallback then allocates
-    its scalar there, where it meets the CPU tensors below and raises "Expected
-    all tensors to be on the same device". Pinned so the result of this module
-    does not depend on what ran before it in the same process.
-    """
+    """accelerate.PartialState is process-global: an earlier Accelerator leaves cuda in its shared state, so the entropy
+    fallback fails on CPU tensors; pin it to cpu."""
     state = pytest.importorskip("accelerate.state")
     monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cpu"))
 
@@ -100,9 +84,8 @@ def sft():
     sftmod = pytest.importorskip("trl.trainer.sft_trainer")
     if not hasattr(sftmod, "SFTTrainer"):
         pytest.skip("this trl has no SFTTrainer")
-    # trl 1.15 computes the loss, entropy and accuracy from its own fused LM head
-    # (`model(**inputs, fused_lm_head=True)`) and never reads `outputs.logits`, so the
-    # empty-logits path these tests drive does not exist there.
+    # trl 1.15 computes loss, entropy and accuracy via model(**inputs, fused_lm_head=True) and never reads
+    # outputs.logits, so the empty-logits path does not exist there.
     if "fused_lm_head" in inspect.getsource(sftmod.SFTTrainer.compute_loss):
         pytest.skip("this trl scores SFT through its fused LM head, not outputs.logits")
     from unsloth_zoo.temporary_patches.misc import (
@@ -125,10 +108,8 @@ def _trainer(sftmod = None):
     self._metrics = {"train": collections.defaultdict(list),
                      "eval": collections.defaultdict(list)}
     self._total_train_tokens = 0
-    # Tensor parallel ranks see the same batch, so trl divides the gathered token
-    # count by this. One process here, so one. `object.__new__` skips the
-    # __init__ that would have set it; see test_the_stub_covers_what_trl_reads
-    # for the guard that catches the next attribute trl adds.
+    # _tp_size is 1: tensor parallel ranks see the same batch and trl divides the gathered token count by it; one
+    # process runs here. object.__new__ skips the __init__ that would set it, see test_the_stub_covers_what_trl_reads.
     self._tp_size = 1
     self.aux_loss_enabled = False
     self.compute_loss_func = None
@@ -153,9 +134,8 @@ def _run_steps(sftmod, logits, steps = 3, pop_labels = False):
 
     def fake(self, model, inputs, return_outputs = False, num_items_in_batch = None):
         calls[0] += 1
-        # transformers pops labels out of the inputs whenever `compute_loss_func`
-        # or label smoothing is set, so a retry that reuses the same mapping
-        # would run a forward with no labels and no loss.
+        # transformers pops labels from inputs whenever compute_loss_func or label smoothing is set, so a retry reusing
+        # the same mapping runs a forward with no labels or loss.
         if pop_labels: inputs.pop("labels")
         assert "labels" in inputs or pop_labels
         out = Out(loss, logits)
@@ -178,16 +158,14 @@ def _run_steps(sftmod, logits, steps = 3, pop_labels = False):
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_a_run_with_no_logits_completes(sft, sentinel):
-    """The whole point. Before this patch the step aborted -- at the entropy
-    line on trl <= 0.25 and at the accuracy line on trl 1.x."""
+    """Before this patch the step aborted: at the entropy line on trl <= 0.25 and at the accuracy line on trl 1.x."""
     self, _ = _run_steps(sft, sentinel())
     assert self._metrics["train"]["num_tokens"] == [36.0]
 
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_the_token_counter_is_not_double_counted_by_the_retry(sft, sentinel):
-    """The failing call already advanced _total_train_tokens; a naive retry
-    would count the first step twice."""
+    """The failing call already advanced _total_train_tokens, so a naive retry would count the first step twice."""
     self, _ = _run_steps(sft, sentinel(), steps = 3)
     assert self._total_train_tokens == 36
 
@@ -199,9 +177,7 @@ def test_only_the_first_step_pays_for_the_detection(sft, sentinel):
 
 
 def test_the_retry_still_has_the_labels_the_first_attempt_popped(sft):
-    """transformers `Trainer.compute_loss` pops `labels` out of the inputs when
-    a custom loss function or label smoothing is in play. Replaying the same
-    mapping into the retry would hand the model a batch with no labels."""
+    """Trainer.compute_loss pops labels out of inputs when a custom loss or label smoothing is set, so a retry replaying the same mapping has no labels."""
     self, _ = _run_steps(sft, EmptyLogits(), steps = 2, pop_labels = True)
     assert self._metrics["train"]["num_tokens"] == [24.0]
 
@@ -243,8 +219,7 @@ def test_a_real_error_is_not_swallowed(sft):
 
 
 def test_a_failure_with_real_logits_is_not_swallowed(sft):
-    """The discriminator is the logits trl was holding, not the exception. A
-    genuine bug in the metric block, with real logits, must still raise."""
+    """The discriminator is the logits trl was holding, not the exception: a genuine bug in the metric block with real logits must still raise."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss logits")
     original = Trainer.compute_loss
@@ -288,16 +263,8 @@ def _self_reads(func):
 
 
 def test_the_stub_covers_what_trl_reads(sft):
-    """`_trainer` builds an SFTTrainer with `object.__new__` and hand-seeds the
-    instance state, so trl adding one attribute to __init__ breaks every test in
-    this module at once with an AttributeError from deep inside trl. That is what
-    `_tp_size` did on trl 1.13: 29 failures, none of them naming the cause.
-
-    This is the one test that should go red instead. `hasattr` runs against a real
-    SFTTrainer instance, so class attributes and methods answer for themselves --
-    only genuinely new per-instance state trips it, which is exactly the case the
-    stub has to keep up with.
-    """
+    """_trainer hand-seeds state after object.__new__, so a new trl __init__ attribute (_tp_size on trl 1.13) breaks
+    every test at once; this test alone goes red, via hasattr on a real SFTTrainer."""
     self = _trainer(sft)
     missing = sorted(name for name in _self_reads(sft.SFTTrainer.compute_loss)
                      if not hasattr(self, name))
@@ -309,10 +276,8 @@ def test_the_stub_covers_what_trl_reads(sft):
 
 
 # ---- against a stand-in for trl 1.x --------------------------------------
-#
-# trl 1.x is not the version installed here, and its compute_loss differs in the
-# one way that decides whether the off switch is usable at all: the liger branch
-# runs BEFORE the forward and writes liger-only kwargs into the batch.
+# trl 1.x is not installed here; its liger branch runs BEFORE the forward and writes liger-only kwargs into the batch,
+# which decides whether the off switch is usable at all.
 
 FORWARD_KWARGS_SEEN = []
 
@@ -397,9 +362,7 @@ def test_the_1x_shape_completes_too(sentinel):
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_liger_only_kwargs_never_reach_the_forward(sentinel):
-    """`skip_logits` / `return_token_accuracy` / `use_token_scaling` are for a
-    liger-patched forward. The model here is an Unsloth one, and it would be
-    handed them on the retry and on every step after it."""
+    """skip_logits, return_token_accuracy and use_token_scaling are liger-only; the Unsloth model here would receive them on the retry and every later step."""
     _run_1x(sentinel())
     assert FORWARD_KWARGS_SEEN, "the forward was never called"
     for seen in FORWARD_KWARGS_SEEN:
@@ -409,8 +372,7 @@ def test_liger_only_kwargs_never_reach_the_forward(sentinel):
 
 
 def test_the_1x_liger_kernel_bug_report_is_not_shown(recwarn):
-    """With the flag forced on, trl 1.x asks the user to report a bug to
-    liger-kernel for not returning token_accuracy. There is no liger here."""
+    """With the flag forced on, trl 1.x asks users to report a liger-kernel bug for not returning token_accuracy; there is no liger here."""
     warnings.simplefilter("always")
     _run_1x(EmptyLogits())
     assert not [w for w in recwarn if "liger-kernel" in str(w.message)]
@@ -427,12 +389,8 @@ def test_the_1x_shape_keeps_real_metrics():
 
 @pytest.fixture(scope = "module")
 def trl_logs_aux(sft):
-    """Does the INSTALLED trl log aux_loss once the metric block is skipped?
-
-    0.23.0-0.25.x keep it inside the `use_liger_kernel` branch; 0.29.0 and 1.x
-    moved it out (0.29.1 sft_trainer.py:1323). Asked by running it, so a future
-    move either way is picked up.
-    """
+    """Probes whether the installed trl logs aux_loss when the metric block is skipped: 0.23.0-0.25.x keep it inside
+    use_liger_kernel, 0.29.0 and 1.x move it out; asked by running trl, so either move is caught."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss logits aux_loss")
     loss, aux = torch.tensor(1.0), torch.tensor(0.25)
@@ -463,13 +421,8 @@ def trl_logs_aux(sft):
 
 def _run_with_aux(sftmod, logits, steps = 3, aux = torch.tensor(0.25),
                   trainer_logs_aux = False):
-    """As `_run_steps`, but the outputs carry `aux_loss` and the trainer is a
-    MoE one (`output_router_logits = True` -> `aux_loss_enabled`).
-
-    `trainer_logs_aux` stands in for trl 1.x, which moved this metric OUT of
-    the `use_liger_kernel` branch (1.9.2 sft_trainer.py:1826 "applies to both
-    Liger and non-Liger") and therefore logs it itself.
-    """
+    """Like _run_steps but outputs carry aux_loss on a MoE trainer; trainer_logs_aux stands in for trl 1.x, which moved
+    aux_loss out of the use_liger_kernel branch and logs it itself."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss logits aux_loss")
     loss = torch.tensor(1.0)
@@ -496,38 +449,29 @@ def _run_with_aux(sftmod, logits, steps = 3, aux = torch.tensor(0.25),
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_aux_loss_survives_the_skipped_metric_block(sft, sentinel):
-    """On trl 0.23.0-0.25.x this metric sits INSIDE the block being skipped, so
-    without a replay a MoE run silently stops logging it."""
+    """On trl 0.23.0-0.25.x aux_loss sits inside the skipped metric block, so without a replay a MoE run silently stops logging it."""
     self = _run_with_aux(sft, sentinel(), steps = 3)
     assert self._metrics["train"]["aux_loss"] == [0.25, 0.25, 0.25]
 
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_aux_loss_is_not_logged_twice(sft, trl_logs_aux, sentinel):
-    """trl 1.x logs it outside the branch, so replaying would double-count.
-    Gated on the count rather than on a version number. Stand in for that only
-    when the installed trl does not already do it, or the stand-in is a second
-    logger and doubles the count by itself.
-    """
+    """trl 1.x logs aux_loss outside the branch, so a replay would double-count; the stand-in is used only when the
+    installed trl does not log it, gated on the count rather than a version number."""
     self = _run_with_aux(sft, sentinel(), steps = 3,
                          trainer_logs_aux = not trl_logs_aux)
     assert self._metrics["train"]["aux_loss"] == [0.25, 0.25, 0.25]
 
 
 def test_aux_loss_is_left_alone_when_the_run_is_not_moe(sft):
-    """`aux_loss_enabled` is False for every dense model, and nothing should
-    appear for them."""
+    """aux_loss_enabled is False for every dense model, so no aux_loss metric should appear for them."""
     self, _ = _run_steps(sft, EmptyLogits(), steps = 2)
     assert self._metrics["train"]["aux_loss"] == []
 
 
 def test_the_ordinary_call_shape_is_unchanged_for_a_dense_run():
-    """`return_outputs` is forced only when there is an aux_loss to rescue.
-
-    Asked of the wrapper's own call into trl, not of trl's call into
-    transformers: trl passes `return_outputs = True` inward on every version,
-    since that is how it reaches `outputs.logits` at all.
-    """
+    """return_outputs is forced only when an aux_loss must be rescued; checked on the wrapper's own call into trl, since
+    trl passes return_outputs = True on every version."""
     from unsloth_zoo.temporary_patches.misc import _sft_call_without_logits_metrics
     seen = []
 
@@ -558,15 +502,13 @@ def test_a_trainer_that_asked_for_outputs_still_gets_them():
     result, outputs = _sft_call_without_logits_metrics(
         original, self, (self.model, _inputs(), True), {})
     assert result is pair, "the caller asked, so the tuple is handed back intact"
-    # Still harvested for the replay: an eval step arrives already asking, and
-    # those are the batches that would otherwise lose the metric.
+    # Still harvested for the replay: an eval step arrives already asking for outputs, and those are the batches that would otherwise lose the metric.
     assert outputs is pair[1]
 
 
 def test_a_missing_logits_attribute_still_raises(sft):
-    """`getattr(outputs, "logits", None)` would call an absent attribute
-    unusable and retry with the metrics off, turning a broken output contract
-    into silent training."""
+    """A getattr default of None would treat an absent logits attribute as unusable and retry with metrics off, turning
+    a broken output contract into silent training."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss")
 
@@ -588,22 +530,13 @@ def test_a_missing_logits_attribute_still_raises(sft):
 
 
 def test_an_explicit_none_logits_is_still_the_sentinel(sft):
-    """The distinction is absent-vs-present, not None-vs-not: a model that
-    really sets `logits = None` must still be handled."""
+    """The check distinguishes absent from present, not None from not-None: a model that really sets logits = None must still be handled."""
     self, _ = _run_steps(sft, None, steps = 2)
     assert self._metrics["train"]["mean_token_accuracy"] == []
 
 
 class _Records(logging.Handler):
-    """Reads the warnings off the logger that emits them.
-
-    `caplog` installs its handler on the ROOT logger, so it only sees what
-    propagates there. misc.py borrows a transformers logger, and once `unsloth`
-    is installed and imported that logger no longer propagates -- the warning
-    still reaches the user on stderr, but caplog.text is empty and the test reads
-    as "the warning was not shown". Attaching to the logger itself asks the
-    question the test is actually asking, whatever else configured logging first.
-    """
+    """Attaches to the emitting logger because caplog only sees root-propagated records; misc.py's transformers logger stops propagating once unsloth is imported."""
 
     def __init__(self):
         super().__init__(level = logging.WARNING)
@@ -629,9 +562,7 @@ def _warnings_from(logger):
 
 
 def test_the_entropy_warning_is_not_shown_when_both_are_omitted(sft):
-    """The entropy patch promises "Entropy will be reported as 0.0". When the
-    accuracy read then fails, the wrapper reports that BOTH are omitted, so the
-    first message is wrong and the user sees two contradictory ones on step 1."""
+    """The entropy warning says entropy will be reported as 0.0; when the accuracy read also fails both are omitted, so that warning must not show."""
     from unsloth_zoo.temporary_patches.misc import logger as misc_logger
     import trl.trainer.utils as trl_utils
     flag = getattr(trl_utils.entropy_from_logits, "_unsloth_warned", None)
@@ -650,8 +581,7 @@ def test_the_entropy_warning_is_not_shown_when_both_are_omitted(sft):
 
 
 def test_a_real_failure_leaves_the_entropy_flag_alone(sft):
-    """The mute is for the probing call only; an unrelated error must restore
-    it rather than swallow the next legitimate entropy warning."""
+    """The warning mute covers only the probing call; an unrelated error must restore the flag rather than swallow the next legitimate entropy warning."""
     from transformers import Trainer
     import trl.trainer.utils as trl_utils
     flag = getattr(trl_utils.entropy_from_logits, "_unsloth_warned", None)
@@ -677,26 +607,20 @@ def test_a_real_failure_leaves_the_entropy_flag_alone(sft):
 
 
 def _log_would_divide_by_zero(self):
-    """Names of metrics trl's own `log` would choke on.
-
-    `SFTTrainer.log` averages every key it finds with `sum(val) / len(val)`
-    (0.25.1 sft_trainer.py:1194), so an empty list is a ZeroDivisionError at
-    the first logging step, not a missing metric.
-    """
+    """Returns names of empty metrics: SFTTrainer.log on trl 0.25.1 averages every key with sum(val) / len(val), so an
+    empty list is a ZeroDivisionError at the first log."""
     return sorted(n for n, v in self._metrics["train"].items() if len(v) == 0)
 
 
 def test_a_dense_run_does_not_invent_an_aux_loss_key(sft):
-    """`_metrics[mode]` is a defaultdict(list), so reading the key would create
-    it, on every step, for models that will never have an aux_loss."""
+    """_metrics[mode] is a defaultdict(list), so merely reading aux_loss would create the key on every step for dense models."""
     self, _ = _run_steps(sft, EmptyLogits(), steps = 3)
     assert "aux_loss" not in self._metrics["train"]
     assert _log_would_divide_by_zero(self) == []
 
 
 def test_a_healthy_run_does_not_invent_one_either(sft):
-    """The count is taken before the probe, so real-logits steps pass through
-    it too and a dense trainer would be poisoned without ever failing."""
+    """The count is taken before the probe, so real-logits steps pass through it too and would poison a dense trainer without ever failing."""
     self, _ = _run_steps(sft, torch.randn(2, 6, 11), steps = 2)
     assert "aux_loss" not in self._metrics["train"]
     assert _log_would_divide_by_zero(self) == []
@@ -704,8 +628,7 @@ def test_a_healthy_run_does_not_invent_one_either(sft):
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_the_rollback_removes_keys_the_probe_invented(sft, sentinel):
-    """The failed probe can get as far as appending entropy before the accuracy
-    read fails. Truncating that list to [] leaves the key behind."""
+    """A failed probe can append entropy before the accuracy read fails; emptying that list to [] would leave the key behind, so the key itself must go."""
     self, _ = _run_steps(sft, sentinel(), steps = 2)
     assert _log_would_divide_by_zero(self) == []
 
@@ -726,8 +649,7 @@ def test_trl_can_actually_log_after_the_retry(sft, sentinel):
 
 
 def test_a_metric_the_probe_only_extended_is_truncated_not_dropped(sft):
-    """A key that already existed keeps its earlier values; only the probe's
-    own additions go."""
+    """A key that already existed keeps its earlier values; only the probe's own additions are truncated away."""
     self = _trainer(sft)
     self._metrics["train"]["mean_token_accuracy"].extend([0.5, 0.75])
     from transformers import Trainer
@@ -750,8 +672,7 @@ def test_a_metric_the_probe_only_extended_is_truncated_not_dropped(sft):
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_a_positional_return_outputs_is_replaced_not_duplicated(sft, sentinel):
-    """`compute_loss(model, inputs, False, ...)` is a legal public call. Adding
-    the keyword beside the positional would raise "got multiple values"."""
+    """compute_loss(model, inputs, False, ...) is a legal public call; adding return_outputs as a keyword beside the positional raises got multiple values."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss logits aux_loss")
 
@@ -774,9 +695,7 @@ def test_a_positional_return_outputs_is_replaced_not_duplicated(sft, sentinel):
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_aux_loss_survives_an_eval_step_too(sft, sentinel):
-    """`Trainer.prediction_step` calls compute_loss(..., return_outputs=True),
-    so `force` is False and the outputs side channel would be empty for exactly
-    the batches that still want the metric."""
+    """Trainer.prediction_step passes return_outputs=True, so force is False and the outputs side channel is empty for eval batches that still want the metric."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss logits aux_loss")
 
@@ -801,15 +720,9 @@ def test_aux_loss_survives_an_eval_step_too(sft, sentinel):
 
 
 def test_a_failing_retry_does_not_latch_the_fast_path():
-    """If the logits are wanted by something other than the metric block
-    (trl's loss_type='dft', a custom loss), the retry raises too. Latching
-    before it would keep this trainer in the no-logits path for the rest of the
-    process, including a rerun with UNSLOTH_RETURN_LOGITS=1 set.
-
-    Driven through the wrapper directly: the detector reads a frame local
-    named `outputs`, and going via the installed trl would only ever raise
-    from the metric block, which the retry skips by construction.
-    """
+    """Latch the fast path only after the retry succeeds: logits wanted elsewhere (loss_type='dft', custom loss) make
+    the retry raise, so an early latch keeps the no-logits path for the process, even with UNSLOTH_RETURN_LOGITS=1;
+    the detector reads a local named outputs."""
     from unsloth_zoo.temporary_patches.misc import _sft_wrap_compute_loss
     Out = collections.namedtuple("Out", "loss logits")
     calls = []
@@ -828,8 +741,7 @@ def test_a_failing_retry_does_not_latch_the_fast_path():
 
 
 def test_a_succeeding_retry_still_latches(sft):
-    """The other half: the fast path exists so step 2 onwards costs one attempt,
-    not two."""
+    """The other half: once a retry succeeds the fast path latches, so step 2 onwards costs one attempt, not two."""
     self, calls = _run_steps(sft, EmptyLogits(), steps = 3)
     assert getattr(self, "_unsloth_logits_are_empty", False)
     assert calls == 4, calls

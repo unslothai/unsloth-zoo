@@ -1,19 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`UNSLOTH_ZOO_DISABLE_GPU_INIT=1` must leave the package fully defined.
-
-The security-audit lane sets that flag, and the skip branch used to define none
-of the four device constants, so `from . import DEVICE_TYPE` in compiler.py
-raised at import time and took a whole security module out at COLLECTION.
-
-Two properties: the constants must be reachable, and reaching them must stay
-lazy (`.device_type` costs ~1.4s and pulls in torch, and the download-only child
-this flag exists for never reads one). Hence the torch checks below.
-
-Everything runs in a subprocess, since both properties are about what happens
-during `import unsloth_zoo` and this process already imported it.
-"""
+"""Under UNSLOTH_ZOO_DISABLE_GPU_INIT=1 the four device constants must stay reachable (compiler.py does from . import
+DEVICE_TYPE) but lazy, so torch is not loaded; run in subprocesses."""
 
 from __future__ import annotations
 
@@ -45,10 +34,7 @@ def _mlx_branch_is_live() -> bool:
 
 
 def _load_real_predicate():
-    """`is_mlx_available` loaded by file path, so the package (and torch) stays out of it.
-
-    `unsloth_zoo/mlx/runtime.py` imports stdlib only, so this is safe.
-    """
+    """Loads is_mlx_available by file path so the package and torch stay out; mlx/runtime.py imports only the stdlib, which is what makes this safe."""
     path = REPO_ROOT / "unsloth_zoo" / "mlx" / "runtime.py"
     spec = importlib.util.spec_from_file_location("_zoo_mlx_runtime_under_test", path)
     module = importlib.util.module_from_spec(spec)
@@ -56,8 +42,7 @@ def _load_real_predicate():
     return module.is_mlx_available
 
 
-# MLX binds the constants eagerly, so PEP 562 __getattr__ never runs and "does not
-# pull torch" would pass for the wrong reason. Skip the pair together, not vacuously green.
+# Under MLX the constants bind eagerly, so PEP 562 __getattr__ never runs and the no-torch check would pass vacuously; skip both tests together.
 _needs_lazy_path = pytest.mark.skipif(
     _mlx_branch_is_live(),
     reason = "MLX branch defines the device constants eagerly; the lazy path is not taken",
@@ -71,15 +56,9 @@ _needs_torch = pytest.mark.skipif(
 
 
 def _public_upper_names(body) -> set:
-    """Module-level UPPER_CASE names bound by a branch of `__init__.py`.
-
-    Descends into nested `if`s (still module-level bindings) but not `def`/`class`.
-
-    Annotated assignment and unpacked targets count: `device_type.py` uses
-    `DEVICE_TYPE : str = ...`, and a binding form we miss shrinks the
-    intersection, letting the contract test pass while the skip path is short a
-    name. A bare `X: int` with no value binds nothing.
-    """
+    """Collects module-level UPPER_CASE names bound in __init__.py, descending into if but not def or class; annotated
+    and unpacked targets count, since a missed form shrinks the intersection and hides a gap; bare X: int binds
+    nothing."""
     found = set()
     stack = list(body)
     while stack:
@@ -105,13 +84,8 @@ def _public_upper_names(body) -> set:
 
 
 def _cross_path_contract() -> set:
-    """Names that BOTH the MLX branch and the normal path bind at module level.
-
-    A name bound on only one path (`UNSLOTH_ZOO_IS_PRESENT` is MLX-only,
-    `IS_HIP_RUNTIME` normal-only) is that path's private business and is not read
-    off the package root. The intersection is what every path promises, so it is
-    what the skip path has to keep reachable.
-    """
+    """Names bound by both the MLX and normal branches of __init__.py at module level; single-branch names like
+    UNSLOTH_ZOO_IS_PRESENT and IS_HIP_RUNTIME are excluded, and the skip path must keep the intersection reachable."""
     tree = ast.parse(INIT_PY.read_text(encoding = "utf-8"))
     mlx, normal = set(), set()
     for node in tree.body:
@@ -133,8 +107,7 @@ def _run(code: str, skip_gpu_init: bool = True) -> subprocess.CompletedProcess:
         env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
     else:
         env.pop("UNSLOTH_ZOO_DISABLE_GPU_INIT", None)
-    # CI runners have no accelerator; `get_device_type` honours this sentinel,
-    # and `tests/conftest.py` sets it for the same reason.
+    # CI runners have no accelerator; get_device_type honours the UNSLOTH_ALLOW_CPU sentinel, which tests/conftest.py also sets for the same reason.
     env.setdefault("UNSLOTH_ALLOW_CPU", "1")
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
@@ -170,11 +143,7 @@ def test_the_module_that_actually_broke_imports():
 @_needs_lazy_path
 @_needs_torch
 def test_importing_the_package_does_not_pull_in_torch():
-    """The skip stays a skip: torch is not imported until a constant is read.
-
-    Fails if the lazy resolver becomes a top-level `from .device_type import
-    ...`, which would pass every test above.
-    """
+    """torch must not load until a constant is read; a top-level from .device_type import would pass every other test here while breaking that."""
     result = _run(
         "import sys\n"
         "import unsloth_zoo\n"
@@ -247,12 +216,7 @@ def test_an_unknown_attribute_still_raises_attribute_error():
 
 
 def test_the_skip_path_covers_every_name_the_other_two_paths_promise():
-    """The contract is DERIVED from `__init__.py`, not restated here.
-
-    A hardcoded list of names is the trap that caused the original bug: add a
-    fifth constant to the MLX branch and the normal path, and the skip path
-    silently lacks it. Reading the branches from source fails loudly instead.
-    """
+    """Contract derived from __init__.py source, not hardcoded: a constant added to both branches would otherwise go silently missing from the skip path."""
     contract = _cross_path_contract()
     assert contract == set(_NAMES), (
         f"the set of names bound by BOTH the MLX branch and the normal path is "
@@ -273,11 +237,7 @@ def test_the_skip_path_covers_every_name_the_other_two_paths_promise():
     ),
 )
 def test_the_contract_parser_sees_every_shape_a_constant_can_arrive_in(snippet):
-    """The derivation is only as good as the binding forms it recognises.
-
-    A missed form shrinks the intersection rather than growing it, so the
-    contract test passes while the skip path is missing a name.
-    """
+    """The derivation is only as good as the binding forms it recognises: a missed form shrinks the intersection, so the contract test passes with a name missing."""
     assert "NEW_CONST" in _public_upper_names(ast.parse(snippet).body), snippet
 
 
@@ -296,12 +256,7 @@ def test_the_contract_parser_sees_every_shape_a_constant_can_arrive_in(snippet):
 def test_the_mlx_guard_agrees_with_is_mlx_available(
     monkeypatch, system, machine, has_mlx, force_gpu, expected,
 ):
-    """The guard copies `is_mlx_available`, so check it against the real one, not just a table.
-
-    A table alone would stay green if the production predicate gained a condition,
-    while `_needs_lazy_path` silently skipped the wrong environments. Asserting both
-    against `expected` catches drift on either side.
-    """
+    """_needs_lazy_path copies is_mlx_available, so check the real predicate, not just a table; drift in production would otherwise skip the wrong environments."""
     monkeypatch.setattr(platform, "system", lambda: system)
     monkeypatch.setattr(platform, "machine", lambda: machine)
     real_find_spec = importlib.util.find_spec

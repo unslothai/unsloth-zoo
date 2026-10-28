@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Every fused lm_head entry point (SFT CE, chunked / masked log-probs, the preference API, GRPO) reaches the fused
-linear op by default, keeps its contract against an fp64 oracle and the pre-op path, and traces as one graph."""
+"""Each fused lm_head entry point (SFT CE, chunked / masked log-probs, preference API, GRPO) uses the fused linear op by
+default, matches an fp64 oracle and the pre-op path, and traces as one graph."""
 
 import pytest
 import torch

@@ -1,32 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""The FlashInfer decision has to reach the vLLM WORKER, not just this process.
-
-Measured on vLLM 0.29.0:
-
-- vLLM re-resolves the attention backend inside the worker
-  (``platforms/cuda.py::get_attn_backend_cls``). ``VllmConfig`` carries only the
-  request, so with ``backend=None`` every process re-runs the scan itself.
-- On a default single-GPU run the EngineCore is its own child process
-  (``VLLM_ENABLE_V1_MULTIPROCESSING`` defaults to True).
-- ``VLLM_WORKER_MULTIPROC_METHOD`` defaults to ``fork``, but
-  ``utils/system_utils.py::_maybe_force_spawn`` overrides it to ``spawn`` when
-  ``cuda_is_initialized()``, under WSL, under Ray, and for ``vllm serve``.
-
-Unsloth always has CUDA initialised before ``load_vllm`` (the model is already on
-the GPU), so the forced-spawn branch is the normal case, not the exotic one.
-Measured directly: vLLM logs ``Overriding VLLM_WORKER_MULTIPROC_METHOD to
-'spawn' ... Reasons: CUDA is initialized``.
-
-``sys.modules`` is NOT inherited across spawn, so the import block alone is a
-no-op there. ``VLLM_ATTENTION_BACKEND`` was removed in vLLM 0.13.0, so the env
-var is not an option either. The engine arg is, because it travels inside the
-config that gets pickled into the child.
-
-These tests are CPU only and need no GPU. The multiprocessing ones use a
-synthetic module rather than the real flashinfer, so they run anywhere.
-"""
+"""The FlashInfer decision must reach the vLLM worker: on vLLM 0.29.0 spawn is forced once CUDA is initialised,
+sys.modules is not inherited, and VLLM_ATTENTION_BACKEND was removed in 0.13.0, so the engine arg, pickled into the
+child config, is the option; tests are CPU-only."""
 
 from __future__ import annotations
 
@@ -71,8 +48,7 @@ def _make_canary(tmp_path):
 
 @pytest.mark.parametrize("method", ["fork", "spawn"])
 def test_sys_modules_block_is_inherited_only_by_fork(tmp_path, monkeypatch, method):
-    """The crux. os.environ crosses both start methods; sys.modules crosses only
-    fork. This is why the block alone cannot carry the decision to the worker."""
+    """os.environ crosses both fork and spawn but sys.modules crosses only fork, so the import block alone cannot carry the decision to the worker."""
     if method not in mp.get_all_start_methods():
         pytest.skip(f"{method} unavailable on this platform")
 
@@ -105,9 +81,7 @@ def test_sys_modules_block_is_inherited_only_by_fork(tmp_path, monkeypatch, meth
 # ------------------------------------------------- the durable channel
 
 def test_engine_arg_is_set_only_when_flashinfer_was_rejected():
-    """An explicit backend is a HARD PIN: vLLM raises on an unsupported value instead of
-    falling through. Setting one unconditionally would break hosts where FlashInfer works,
-    and ROCm, which never reaches the blocker."""
+    """An explicit attention backend is a hard pin that vLLM enforces, so it is set only when FlashInfer was rejected, never on hosts where it works or on ROCm."""
     source = inspect.getsource(vllm_utils.load_vllm)
     guard = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE:")
     for backend in ('"FLASH_ATTN"', '"TRITON_MLA"'):
@@ -116,12 +90,10 @@ def test_engine_arg_is_set_only_when_flashinfer_was_rejected():
 
 
 def test_engine_arg_is_set_before_the_signature_filter():
-    """Ordering matters twice over: the filter is what makes this safe on an
-    older vLLM with no such argument, by deleting the key instead of raising."""
+    """The engine arg must be set before the EngineArgs signature filter, which deletes unsupported keys on an older vLLM instead of raising."""
     source = inspect.getsource(vllm_utils.load_vllm)
     assign = source.index('engine_args["attention_backend"] = "FLASH_ATTN"')
-    # Specifically the EngineArgs filter. An earlier `good_keys` in this function
-    # filters CompilationConfig and is not the one that protects this key.
+    # The EngineArgs good_keys filter is what protects this key; an earlier good_keys in the function filters CompilationConfig and does not.
     filt = source.index(
         "good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs)"
     )
@@ -134,16 +106,15 @@ def test_the_flag_defaults_to_false():
 
 
 def test_the_flag_is_reset_per_call():
-    """Otherwise one rejected call pins FLASH_ATTN for every later load_vllm in
-    the process, including after the user installs nvcc."""
+    """The flag must reset per call, or one rejected load pins FLASH_ATTN for every later load_vllm in the process, even after nvcc is installed."""
     source = inspect.getsource(vllm_utils.load_vllm)
     assert "global _UNSLOTH_FLASHINFER_UNUSABLE" in source
     assert "_UNSLOTH_FLASHINFER_UNUSABLE = False" in source
 
 
 def test_both_blocking_arms_also_set_the_flag():
-    """The sys.modules block and the engine arg must never disagree, or the
-    parent and the worker choose different backends."""
+    """The sys.modules block and the engine arg must never disagree, or parent and worker choose different backends;
+    each block arm also sets _UNSLOTH_FLASHINFER_UNUSABLE."""
     source = inspect.getsource(vllm_utils.load_vllm)
     blocks = source.count("_block_flashinfer_import()")
     flags = source.count("_UNSLOTH_FLASHINFER_UNUSABLE = True")
@@ -160,8 +131,7 @@ def test_installed_vllm_accepts_the_argument_or_the_filter_drops_it():
     """Forwards and backwards compatibility, checked against whatever is here."""
     from vllm import EngineArgs
     accepted = "attention_backend" in inspect.signature(EngineArgs).parameters
-    # Either it is accepted, or load_vllm's existing filter removes it. Both are
-    # fine; what would not be fine is passing an argument that raises.
+    # Either EngineArgs accepts attention_backend or load_vllm's existing filter removes it; passing an argument that raises is the only bad outcome.
     assert accepted or True
     if not accepted:
         source = inspect.getsource(vllm_utils.load_vllm)
@@ -175,12 +145,8 @@ def test_installed_vllm_accepts_the_argument_or_the_filter_drops_it():
     [((7, 0), False), ((7, 5), False), ((8, 0), True), ((9, 0), True), ((10, 0), True)],
 )
 def test_flash_attn_is_only_pinned_from_ampere_up(monkeypatch, capability, expected):
-    """FLASH_ATTN declares supports_compute_capability() >= (8, 0), and an explicitly
-    selected backend is a HARD requirement in vLLM: platforms/cuda.py raises "Selected
-    backend ... is not valid for this configuration" rather than falling through.
-
-    So pinning it on Volta (V100, 7.0) or Turing (T4, 7.5) converts a working XFORMERS
-    run into a startup error, every time the FlashInfer pre-flight rejects."""
+    """FLASH_ATTN needs compute capability 8.0+, and an explicit backend is a hard requirement, so pinning it on V100 or
+    T4 makes a working XFORMERS run fail at startup."""
     import torch
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: capability)
@@ -189,8 +155,7 @@ def test_flash_attn_is_only_pinned_from_ampere_up(monkeypatch, capability, expec
 
 
 def test_flash_attn_is_not_pinned_on_rocm(monkeypatch):
-    """FLASH_ATTN is a CUDA backend. ROCm already takes its own branch in the pre-flight
-    and must never be handed a CUDA-only hard pin."""
+    """FLASH_ATTN is CUDA-only; ROCm takes its own pre-flight branch and must never receive this hard pin."""
     import torch
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
@@ -206,8 +171,7 @@ def test_flash_attn_is_not_pinned_without_cuda(monkeypatch):
 
 
 def test_an_unknown_device_does_not_get_a_hard_pin(monkeypatch):
-    """Fail open. If we cannot establish the capability we have no basis for imposing a
-    requirement vLLM will treat as absolute."""
+    """Fail open: if the device capability cannot be established there is no basis for a requirement that vLLM treats as absolute."""
     import torch
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     def _boom(*a, **k):
@@ -225,8 +189,7 @@ def test_the_engine_arg_is_gated_on_the_capability_check():
 
 
 def test_installed_vllm_still_requires_sm80_for_flash_attn():
-    """Pin the premise against the installed vLLM rather than trusting it. If upstream
-    relaxes this, the guard is merely conservative, not wrong."""
+    """Checks the installed vLLM still requires sm80 for FLASH_ATTN; if upstream relaxes this, the guard is merely conservative, not wrong."""
     import importlib.util
     import pathlib
     spec = importlib.util.find_spec("vllm")
@@ -243,15 +206,13 @@ def test_installed_vllm_still_requires_sm80_for_flash_attn():
 # ------------------------------------------------- the block follows the engine lifecycle
 
 def test_delete_vllm_hands_flashinfer_back(monkeypatch):
-    """The block protects an engine. Once the engine is deleted there is nothing left to
-    protect, and an unrelated `import flashinfer` in the same session should work again."""
+    """The block protects a live engine; once delete_vllm removes it, flashinfer must import again for unrelated code in the same session."""
     monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
     vllm_utils._block_flashinfer_import()
     assert sys.modules.get("flashinfer") is None, "precondition: the block is on"
     monkeypatch.setattr(vllm_utils, "_UNSLOTH_FLASHINFER_UNUSABLE", True, raising = False)
 
-    # delete_vllm's real teardown needs a live distributed environment, which this host
-    # does not have. The unblock runs first precisely so a failing teardown cannot skip it.
+    # delete_vllm's real teardown needs a live distributed environment this host lacks; the unblock runs first so a failing teardown cannot skip it.
     with contextlib.suppress(Exception):
         vllm_utils.delete_vllm()
 
@@ -260,9 +221,8 @@ def test_delete_vllm_hands_flashinfer_back(monkeypatch):
 
 
 def test_the_unblock_is_the_first_thing_delete_vllm_does():
-    """Ordering is the whole point: the distributed teardown below it can raise, and the
-    caller who asked for the engine to be deleted should not be left with a hidden module
-    either way. Ownership bookkeeping comes first, but nothing that can fail does."""
+    """delete_vllm must unblock flashinfer before any step that can raise (ownership bookkeeping may come first); the
+    distributed teardown below can raise and the module must not stay hidden."""
     source = inspect.getsource(vllm_utils.delete_vllm)
     assert source.index("_unblock_flashinfer_import()") < source.index(
         "from vllm.distributed.parallel_state import"
@@ -270,8 +230,7 @@ def test_the_unblock_is_the_first_thing_delete_vllm_does():
 
 
 def test_a_failed_load_vllm_restores_flashinfer():
-    """A startup error leaves no engine, so keeping the module hidden for the rest of the
-    session buys nothing and breaks unrelated code."""
+    """A failed load_vllm must restore flashinfer on the except BaseException path: a startup error leaves no engine, so keeping the block buys nothing."""
     source = inspect.getsource(vllm_utils.load_vllm)
     assert "except BaseException:" in source, "no restore arm on the failure path"
     restore = source.index("except BaseException:")
@@ -282,9 +241,7 @@ def test_a_failed_load_vllm_restores_flashinfer():
 
 
 def test_return_args_does_not_leave_flashinfer_blocked():
-    """`load_vllm(..., return_args=True)` builds no engine, so nothing will ever reach
-    delete_vllm to lift the block, and the failure arm is not reached either. The pin
-    still travels in engine_args, so the caller keeps the decision."""
+    """load_vllm with return_args=True builds no engine, so nothing reaches delete_vllm to lift the block; the FLASH_ATTN pin still travels in engine_args."""
     source = inspect.getsource(vllm_utils.load_vllm)
     marker = source.index("if return_args:")
     window = source[marker:marker + 1400]
@@ -297,10 +254,8 @@ def test_return_args_does_not_leave_flashinfer_blocked():
 # ------------------------------------------------- MLA models need an MLA backend
 
 def test_an_mla_config_is_not_pinned_to_flash_attn(monkeypatch):
-    """Under MLA the priority list in platforms/cuda.py holds only MLA backends, and the
-    base validate_configuration rejects any backend whose is_mla() disagrees with use_mla.
-    An explicit backend is a hard requirement, so pinning the non-MLA FLASH_ATTN on
-    DeepSeek-V2/V3 turns a working run into a startup error."""
+    """Under MLA, platforms/cuda.py's priority list holds only MLA backends and validate_configuration rejects an
+    is_mla() mismatch, so a pinned FLASH_ATTN on DeepSeek-V2/V3 fails startup."""
     monkeypatch.delenv("VLLM_MLA_DISABLE", raising = False)
     deepseek = types.SimpleNamespace(kv_lora_rank = 512)
     assert vllm_utils._config_uses_mla(deepseek) is True
@@ -325,8 +280,7 @@ def test_vllm_mla_disable_turns_the_path_off(monkeypatch):
 
 
 def test_an_unreadable_config_is_assumed_to_be_mla(monkeypatch):
-    """The only cost of a false positive is that vLLM picks its own backend, which is
-    what it would do without the pin anyway. A false negative is a startup error."""
+    """An unreadable config is assumed to be MLA: a false positive only lets vLLM pick its own backend, while a false negative is a startup error."""
     monkeypatch.delenv("VLLM_MLA_DISABLE", raising = False)
 
     class _Hostile:
@@ -337,8 +291,7 @@ def test_an_unreadable_config_is_assumed_to_be_mla(monkeypatch):
 
 
 def test_the_pin_is_gated_on_both_the_device_and_the_config():
-    """Device capability alone is not enough: an MLA model on an sm_80+ host must not get
-    the non-MLA FLASH_ATTN."""
+    """Device capability alone is not enough: an MLA model on an sm_80+ host must not get the non-MLA FLASH_ATTN pin."""
     source = inspect.getsource(vllm_utils.load_vllm)
     assign = source.index('engine_args["attention_backend"] = "FLASH_ATTN"')
     window = source[source.index("if _UNSLOTH_FLASHINFER_UNUSABLE:"):assign]
@@ -347,9 +300,8 @@ def test_the_pin_is_gated_on_both_the_device_and_the_config():
 
 
 def test_an_mla_model_gets_an_mla_backend_not_nothing(monkeypatch):
-    """The engine arg is the only exclusion that survives into a spawned EngineCore, so
-    dropping it for MLA would let the worker re-probe FlashInfer and pick FLASHINFER_MLA,
-    reintroducing the missing-nvcc failure this change exists to avoid."""
+    """The engine arg is the only exclusion that survives into a spawned EngineCore; dropping it for MLA lets the worker
+    re-probe FlashInfer and pick FLASHINFER_MLA, reintroducing the missing-nvcc failure."""
     source = inspect.getsource(vllm_utils.load_vllm)
     marker = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE:")
     window = source[marker:marker + 500]
@@ -359,9 +311,8 @@ def test_an_mla_model_gets_an_mla_backend_not_nothing(monkeypatch):
 
 
 def test_triton_mla_is_a_real_backend_with_no_nvcc_requirement():
-    """Pin the premise against the installed vLLM rather than trusting it. TRITON_MLA is
-    chosen because it is pure Triton and accepts every compute capability, which makes it
-    the fallback vLLM would reach anyway once the FlashInfer MLA backends are excluded."""
+    """Checks the premise against the installed vLLM: TRITON_MLA is pure Triton, accepts every compute capability, and
+    is the fallback once FlashInfer MLA backends are excluded."""
     import pathlib
     spec = importlib.util.find_spec("vllm")
     if spec is None or not spec.origin:
@@ -382,9 +333,8 @@ def test_triton_mla_is_a_real_backend_with_no_nvcc_requirement():
 
 
 def test_the_dry_run_unblock_is_skipped_when_the_arg_was_filtered():
-    """On an older vLLM whose EngineArgs has no attention_backend, the compatibility
-    filter drops the key, so unblocking would leave the caller with no exclusion at all
-    and vLLM free to select FlashInfer again. A hidden module is the lesser harm."""
+    """On an older vLLM without attention_backend in EngineArgs the filter drops the key, so unblocking would leave no
+    exclusion and vLLM could pick FlashInfer again; a hidden module is the lesser harm."""
     source = inspect.getsource(vllm_utils.load_vllm)
     marker = source.index("if return_args:")
     window = source[marker:marker + 1400]
@@ -405,8 +355,7 @@ def test_the_filter_runs_before_the_dry_run_exit():
 # ------------------------------------------------- the block is owned, not global state
 
 def test_a_second_failed_load_keeps_a_live_engine_s_block(monkeypatch):
-    """The block is process-wide. A later load_vllm that fails must not lift the block an
-    already-running engine still depends on for its lazy FlashInfer imports."""
+    """The block is process-wide: a later failed load_vllm must not lift the block a running engine still needs for its lazy FlashInfer imports."""
     monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
     vllm_utils._block_flashinfer_import()
     monkeypatch.setattr(vllm_utils, "_UNSLOTH_FLASHINFER_UNUSABLE", True, raising = False)
@@ -450,9 +399,8 @@ def test_the_dry_run_exit_also_respects_ownership():
 
 
 def test_the_reprobe_unblock_also_respects_owners():
-    """The top of load_vllm lifts a previous call's block so a newly installed nvcc can be
-    re-probed. With a live engine that was built under the block, that strips its
-    protection, and this path never reinstates the block on a healthy second load."""
+    """The top of load_vllm lifts a previous block so a new nvcc can be re-probed; with a live engine built under it,
+    that strips its protection, and a healthy second load never reinstates it."""
     source = inspect.getsource(vllm_utils.load_vllm)
     marker = source.index("_no_flashinfer = os.environ.get")
     window = source[marker:marker + 400]
@@ -463,8 +411,7 @@ def test_the_reprobe_unblock_also_respects_owners():
 
 
 def test_every_unblock_site_is_owner_gated():
-    """Three exits reach _unblock_flashinfer_import inside load_vllm: the re-probe, the
-    dry run and the failure arm. All three must agree, or the weakest one wins."""
+    """Three exits in load_vllm reach _unblock_flashinfer_import (re-probe, dry run, failure arm); all three must agree or the weakest one wins."""
     source = inspect.getsource(vllm_utils.load_vllm)
     sites = [i for i in range(len(source))
              if source.startswith("_unblock_flashinfer_import()", i)]

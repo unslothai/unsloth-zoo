@@ -161,8 +161,8 @@ def test_peaked_rows_match_fp64(beta):
     lead = torch.tensor([20.0, 40.0, 80.0]).repeat(n // 3)
     peak = torch.randint(0, V, (n,), generator = g)
     hs[torch.arange(n), peak] += lead
-    # Teacher: mildly peaked on the student's token on odd rows, sharply peaked on another token on even rows,
-    # so the true gradient is O(1) (both collapsed onto one token leaves only rounding noise to compare).
+    # Teacher is mildly peaked on the student's token on odd rows and sharply on another token on even rows, so the true
+    # gradient is O(1); both collapsed onto one token leaves only rounding noise.
     ht[torch.arange(1, n, 2), peak[1::2]] += 3.0
     ht[torch.arange(0, n, 2), (peak[::2] + 1) % V] += lead[::2]
     labels = torch.randint(0, V, (n,), generator = g)
@@ -172,7 +172,7 @@ def test_peaked_rows_match_fp64(beta):
     loss.backward()
     torch.testing.assert_close(loss.double(), ref, rtol = 1e-5, atol = 1e-6)
     # Peaked rows have exponentially small true gradients for beta > 0, so compare at the fp32 noise floor of O(1)
-    # logits; the beta = 0 rows keep O(0.1) gradients and must match tightly.
+    # logits; beta = 0 rows keep O(0.1) gradients and must match tightly.
     err = (h.grad.double() - gh).norm(dim = -1)
     assert torch.isfinite(h.grad).all()
     assert (err <= 1e-6 + 1e-5 * gh.norm(dim = -1)).all(), err

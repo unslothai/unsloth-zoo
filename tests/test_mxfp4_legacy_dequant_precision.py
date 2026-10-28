@@ -15,8 +15,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch < 2.12 decodes MXFP4 through fp32 (its ldexp forms 2^e in the output dtype). That detour must not narrow a
-float64 output, and the converter's generic loop (non 16-byte blocks, CPU, other dtypes) must take it too."""
+"""torch < 2.12 decodes MXFP4 via fp32 (ldexp forms 2^e in the output dtype); that detour must not narrow float64
+output, and the generic converter loop (non 16-byte blocks, CPU, other dtypes) must take it too."""
 
 import pytest
 import torch

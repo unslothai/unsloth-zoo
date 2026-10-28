@@ -15,14 +15,7 @@ def _load_llama_cpp_module():
 
 
 def test_converter_is_parsed_not_imported(tmp_path):
-    """The downloaded converter is AST-parsed, so a script whose sibling
-    imports cannot resolve (and whose top level has side effects) still yields
-    its registered architectures without executing anything.
-
-    This replaces the old `_load_module_from_path` sibling-import test: that
-    helper imported the freshly downloaded llama.cpp script in-process and has
-    been removed.
-    """
+    """The converter is AST-parsed, not imported, so unresolvable sibling imports and top-level side effects never run; architectures are still read."""
     llama_cpp = _load_llama_cpp_module()
     marker = tmp_path / "executed"
     source = textwrap.dedent(

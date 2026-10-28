@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A composite vision-language merge must either merge every tower or refuse (#5290).
-
-A Qwen2.5-VL checkpoint is flat (`model.layers.N...`) while the paths PEFT adapts are
-composite (`model.language_model.layers.N...`). The bridge came from
-`<ModelClass>._checkpoint_conversion_mapping`, which Transformers 5 moved into a registry, and
-without it every language adapter resolved to nothing and dropped out of both sides of the
-merge's count check, so the base weights were written back and reported as success.
-"""
+"""A composite VLM merge must merge every tower or refuse (issue 5290); the checkpoint conversion mapping moved into a
+registry in Transformers 5, and without it language adapters vanish and base weights get written back."""
 
 from __future__ import annotations
 
@@ -55,8 +49,7 @@ def _skip_unless_vl_available():
 
 
 def _build_tiny_vl(base_dir, dtype=torch.float32):
-    """A tiny real Qwen2.5-VL. Which layout `save_pretrained` writes is Transformers'
-    business: the tests read it back rather than assume it."""
+    """A tiny real Qwen2.5-VL; tests read back the layout save_pretrained writes instead of assuming it."""
     import transformers as T
 
     cfg = T.AutoConfig.for_model(_VL_FAMILY)
@@ -105,8 +98,7 @@ def _stage_tiny_vl(work_dir):
     return base_dir, out_dir, base_tensors, peft_model, adapted
 
 
-# Spelled out so the reference is independent of the resolution under test, and tried after
-# the identity so a release that writes the composite layout on disk needs no change.
+# Spelled out, independent of the code under test; tried after identity, so composite layouts pass.
 _EXPECTED_DISK_RENAMES = (
     ("model.language_model.", "model."),
     ("model.visual.",        "visual."),
@@ -164,8 +156,7 @@ def _language_weight_keys(base_tensors):
 
 
 def test_conversion_mapping_available_for_composite_vl():
-    """An empty mapping here is the root cause of #5290. Only the language rename is required:
-    5.5 ships it alone, and prefix inference reaches the vision tower but not the language one."""
+    """An empty mapping caused issue 5290; only the language rename is needed, vision is inferred."""
     _skip_unless_vl_available()
     mapping = _get_checkpoint_conversion_mapping(_VL_CLASS)
     assert mapping, (
@@ -177,9 +168,7 @@ def test_conversion_mapping_available_for_composite_vl():
 
 
 def test_partial_mapping_does_not_shadow_prefix_inference():
-    """Gemma 3 is written `language_model.model.layers...` while its class registers only
-    `^language_model -> model.language_model`, the remaining hop living on a nested sub-model.
-    Taken literally that resolves to `language_model.layers...`, which is in no shard."""
+    """A partial language mapping must not shadow prefix inference; literal Gemma 3 keys match no shard."""
     if not H.family_available("gemma3"):
         pytest.skip("gemma3 unavailable in this transformers")
     lora_keys = [f"model.language_model.layers.{i}.self_attn.q_proj" for i in range(2)]
@@ -288,8 +277,7 @@ def test_vl_merge_covers_language_and_vision_towers(tmp_path):
 
 
 def test_vl_merge_refuses_when_the_bridge_is_unavailable(tmp_path, monkeypatch):
-    """The mapping is removed, not mocked lower down: that is the state a Transformers release
-    can put Unsloth in."""
+    """Mapping is removed, not mocked lower down: a Transformers release can leave Unsloth in that state."""
     _skip_unless_vl_available()
     base_dir, out_dir, base_tensors, peft_model, _ = _stage_tiny_vl(str(tmp_path))
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})
@@ -303,8 +291,7 @@ def test_vl_merge_refuses_when_the_bridge_is_unavailable(tmp_path, monkeypatch):
     assert "Refusing to write a partially merged model" in message, message
     assert "UNSLOTH_ALLOW_PARTIAL_LORA_MERGE" in message, message
 
-    # Refused BEFORE the first shard was rewritten: a refusal after the loop leaves a
-    # half-merged export behind.
+    # Refuse before the first shard is rewritten; a refusal after the loop leaves a half-merged export.
     if os.path.isdir(out_dir):
         staged = H.read_safetensors_dir(out_dir)
         for key, tensor in staged.items():
@@ -436,9 +423,7 @@ def test_even_one_unplaced_module_refuses_and_states_its_share(tmp_path, monkeyp
 
 
 def test_a_convolution_target_is_named_instead_of_crashing_the_matmul():
-    """Reachable because `proj` is both a vision patch-embedding Conv2d and an attention output
-    projection, so a name-based `target_modules` adapts both. The arithmetic cannot work either
-    way; what changes is whether the caller learns which module to exclude."""
+    """name-based target_modules adapts a vision Conv2d named proj; report it, not crash in matmul."""
     stats = LoraStats(
         module = _FakeLinear(32, 3), lora_A = torch.zeros(8, 3),
         lora_B = torch.zeros(32, 8), alpha = 1.0,
@@ -457,10 +442,7 @@ def test_a_convolution_target_is_named_instead_of_crashing_the_matmul():
 
 
 def test_save_method_lora_warns_that_it_is_not_an_adapter_save(tmp_path):
-    """`save_method = "lora"` matches no `save_method ==` branch and falls through to a plain
-    16bit merge, so the caller gets a full-size checkpoint with no adapter_config.json. A
-    warning, not a refusal: `unsloth/save.py`'s `unsloth_generic_save` still defaults to this
-    value, so raising would break calls that complete today."""
+    """save_method "lora" falls to a 16bit merge; warn, since raising would break existing calls."""
     if not H.family_available("llama"):
         pytest.skip("llama unavailable in this transformers")
     H.set_offline_cpu_env()
@@ -595,8 +577,7 @@ def test_the_guard_is_a_noop_when_no_shard_is_staged_yet(tmp_path):
 
 
 def test_a_quantized_module_is_measured_by_its_feature_counts():
-    """A 4-bit layer's packed shape says nothing about the tensor the merge writes, so the
-    accounting reads the feature counts or silently dies on every 4-bit merge."""
+    """A 4-bit layer's packed shape is not the merged tensor's shape; read its feature counts instead."""
     class _Packed(torch.nn.Module):
         in_features, out_features = _H, 2 * _H
         def __init__(self):
@@ -652,10 +633,7 @@ def test_the_guard_stays_cheap_on_a_large_adapter():
 
 
 def test_a_packed_target_gets_a_logical_shape_so_the_bridge_is_still_reported(tmp_path, monkeypatch):
-    """An mxfp4 target is `<module>_blocks` + `<module>_scales` with no `.weight`, so it had no
-    entry in `disk_module_shapes` and was dropped at `disk_shape is None` -- and the merge's own
-    count cancels the same omission out of both its sides, the #5290 shape. `_blocks` is
-    `(out, G, B)` at two 4-bit values per byte, so the width is `G * B * 2` = 2048 here."""
+    """mxfp4 <module>_blocks has no .weight: dropped from disk shapes, count cancels out (issue 5290)."""
     from safetensors.torch import save_file
 
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})

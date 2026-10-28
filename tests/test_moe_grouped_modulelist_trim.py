@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Per-call host trimming of the transformers<5 ModuleList grouped MoE forward.
-
-The per-expert projection lists are built once per readiness verdict (_block_projs) and must follow
-a projection swap on any expert.
-"""
+"""Per-call host trimming of the transformers<5 ModuleList grouped MoE forward; per-expert projection lists
+(_block_projs) are built once per readiness verdict and must follow projection swaps."""
 import pytest
 import torch
 
@@ -76,8 +73,7 @@ def test_disable_drops_the_projection_lists():
 
 
 def test_compiled_forward_reads_the_live_projections():
-    """An eager forward fills _moe_projs; after an interior projection is replaced, a compiled trace
-    must use the new module, not the cached lists."""
+    """An eager forward fills _moe_projs; after an interior projection is replaced, a compiled trace must use the new module, not the cached lists."""
     import copy
     model, blk = L.build("qwen3", base = "bf16", prefer_hf = False)
     L.enable(model, blk)

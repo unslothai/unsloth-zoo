@@ -70,8 +70,7 @@ def test_array_grid_families_get_an_indexable_grid(mutils, model_type):
 
 @pytest.mark.parametrize("model_type", ["qwen2_vl", "qwen2_5_vl", "paddle_ocr"])
 def test_compile_patched_families_keep_the_traceable_tuple(mutils, model_type):
-    # An mx.array becomes a tracer under mx.compile and its .tolist() raises,
-    # which is why these keep Python tuples.
+    # An mx.array becomes a tracer under mx.compile and its .tolist() raises, which is why these keep Python tuples.
     out = _prepare(mutils, model_type, image_grid_thw = [[1, 2, 2]])
     assert isinstance(out["image_grid_thw"], tuple)
 
@@ -145,11 +144,7 @@ def test_a_wrapper_with_no_logits_says_so(mutils):
 
 
 def test_generate_keeps_a_falsy_processor(monkeypatch):
-    """A processor is preferred because a tokenizer cannot preprocess images.
-
-    Resolution is observed through the object whose stopping criteria generate
-    resets, which is the first thing it does with whatever it picked.
-    """
+    """A processor is preferred because a tokenizer cannot preprocess images; the pick is observed through the object whose stopping criteria generate resets."""
     import types
     import unsloth_zoo.mlx.loader as loader
     import unsloth_zoo.mlx.utils as mutils
@@ -173,9 +168,8 @@ def test_generate_keeps_a_falsy_processor(monkeypatch):
     def _fake_to_mx_vlm_batch(inputs):
         raise _Stop
 
-    # The module object, not a dotted string: a string target is resolved by walking
-    # attributes, which fails on a real MLX runtime where the submodule is not bound
-    # on its parent package yet.
+    # Pass the module object, not a dotted string: a string target is resolved by walking attributes, which fails on
+    # real MLX while the submodule is not yet bound on its parent package.
     monkeypatch.setattr(mutils, "_to_mx_vlm_batch", _fake_to_mx_vlm_batch)
     with pytest.raises(_Stop):
         loader._mlx_generate_vlm(model, "hello")

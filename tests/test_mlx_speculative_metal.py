@@ -127,8 +127,7 @@ def qwen_4bit():
 
 @pytest.fixture(scope = "module")
 def qwen4():
-    """A small random qwen4_exp quantized like the 4-bit releases, so its decode takes the batch-invariant forward, with
-    their expert and hyper-connection widths, which pick the projections' kernels."""
+    """Random quantized qwen4_exp like the 4-bit releases: decode takes the batch-invariant forward, and its expert and hyper-connection widths pick the kernels."""
     import mlx.nn as nn
     from mlx.utils import tree_map
     from mlx_vlm.models import qwen4_exp
@@ -748,8 +747,7 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, q
         patch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
         inference.warm_inference(model)
         assert len(builds) == 1 and not inference._VERIFY_GDN_VERDICTS
-        # A block evaluated inside a function transformation or under memory pressure is checked on a later one; a
-        # rejected build is not retried.
+        # A block evaluated inside a function transformation or under memory pressure is checked on a later call; a rejected build is not retried.
         block = lambda: _verified(model.language_model, cache, mx.array([ids[0][24 : 27]]), 0)
         with inference.exact_speculative_verify(model):
             for later in (ValueError("[eval] Attempting to eval an array during function transformations"),
@@ -1593,8 +1591,7 @@ def test_unquantized_companion_mtp_heads_and_dflash_drafters_load_at_4_bits_unle
         dflash = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
         return speculative.companion_drafter(split, qwen_mtp[0]), speculative._built(speculative.ContextDrafter, dflash, qwen[0].language_model, quantize = True)
     head, dflash = built(None)
-    # A head stored partly quantized keeps its full-precision layers; one read whole out of a model's checkpoint, as
-    # its own head or a companion, stays as stored.
+    # A partly quantized head keeps its full-precision layers; a head read whole from a checkpoint, as its own head or a companion, stays as stored.
     kept, native, whole = (build(path, qwen_mtp[0]) for build, path in ((speculative.companion_drafter, packed), (speculative.native_mtp_drafter, source), (speculative.companion_drafter, source)))
     plain_head, plain_dflash = built("0")
     assert head.model.fc.bits == head.model.layers[0].mlp.up_proj.bits == dflash.model.fc.bits == dflash.model.layers[0].mlp.up_proj.bits == 4

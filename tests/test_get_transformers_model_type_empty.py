@@ -1,23 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression tests for get_transformers_model_type's config unwrapping and guard.
-
-Two behaviours are pinned here:
-
-1. An unresolved config must not come back as `[]`. `model_types` is assigned from
-   `list(find(...))`, so it reaches the guard as `[]` and never as `None`; the guard
-   used to test `is None`, so `[]` passed through and consumers broke on it --
-   `unsloth/models/vision.py` indexes `model_types[0]`, `unsloth/models/loader.py`
-   joins the list and silently matches no architecture.
-2. `model.peft_config` maps adapter name -> config, and only the literal key
-   "default" used to be unwrapped, so an adapter named anything else was unreadable.
-   A single-adapter dict now unwraps whatever its key is; a multi-adapter dict
-   without "default" stays ambiguous and must raise rather than pick a winner.
-
-All cases are CPU-only and network-free: configs are built in a temp directory so
-AutoConfig resolves from disk and never contacts the Hub.
-"""
+"""Pins get_transformers_model_type: an unresolved config must not come back as [] (consumers index or join it), a
+single peft_config adapter unwraps whatever its key is, and ambiguous multi-adapter dicts raise; CPU-only,
+network-free."""
 
 import json
 import os
@@ -33,9 +19,8 @@ _UNRESOLVED_MESSAGE = "Cannot determine model type for config file"
 
 @pytest.fixture(autouse = True)
 def _no_env_leak():
-    """get_transformers_model_type sets os.environ["UNSLOTH_MODEL_NAME"] as a side
-    effect for every PeftConfig input (hf_utils.py). Other test modules read that
-    variable, so restore it rather than leaking temp paths into the session."""
+    """get_transformers_model_type sets `UNSLOTH_MODEL_NAME` in os.environ for every PeftConfig input (hf_utils.py), so
+    restore it to keep temp paths out of other tests."""
     sentinel = object()
     previous = os.environ.get("UNSLOTH_MODEL_NAME", sentinel)
     try:
@@ -77,8 +62,7 @@ def _lora_config(base_model_name_or_path):
 
 
 def test_single_adapter_dict_with_non_default_name_resolves(local_llama_base):
-    """`get_peft_model(..., adapter_name = "my_adapter")` produces a peft_config keyed
-    by that name. One adapter is unambiguous, so it must resolve like "default" does."""
+    """A single adapter under a non-default name, as `get_peft_model` with `adapter_name` produces, is unambiguous and must resolve like the default key."""
     config = {"my_adapter": _lora_config(local_llama_base)}
     assert get_transformers_model_type(config) == ["llama"]
 
@@ -148,11 +132,8 @@ def test_peft_config_dict_keyed_default_unchanged(local_llama_base):
 # --- the swallowing call site in hf_utils.py must behave identically ---------
 
 def test_bare_except_call_site_still_swallows(local_llama_base):
-    """get_auto_processor wraps `get_transformers_model_type(peft_config)[0]` in a
-    bare `except:`. That caught the old IndexError and catches the new TypeError
-    alike, so `model_type` stays None and the caller falls through to
-    AutoTokenizer. Uses an ambiguous multi-adapter dict, which still cannot
-    resolve after the unwrap change."""
+    """Bare except in get_auto_processor catches both the old IndexError and the new TypeError, leaving model_type None
+    so AutoTokenizer is used; the input is an ambiguous multi-adapter dict."""
     config = {
         "adapter_a": _lora_config(local_llama_base),
         "adapter_b": _lora_config(local_llama_base),
@@ -168,8 +149,7 @@ def test_bare_except_call_site_still_swallows(local_llama_base):
 # --- the OTHER guard (the AutoConfig fallback) must be untouched -------------
 
 def test_peft_config_with_unresolvable_base_still_raises(tmp_path):
-    """When AutoConfig cannot resolve the base, `retry_config` stays False, so
-    `model_types` is still genuinely None at the guard. That path is unchanged."""
+    """If AutoConfig cannot resolve the base, `retry_config` stays False and `model_types` is genuinely None at the guard; that path is unchanged."""
     missing = str(tmp_path / "definitely-not-a-model")
     with pytest.raises(TypeError, match = _UNRESOLVED_MESSAGE):
         get_transformers_model_type(_lora_config(missing))

@@ -133,8 +133,7 @@ def test_second_call_unsuppresses_the_rows_it_turns_into_tokens(monkeypatch):
 
 
 def test_padding_off_keeps_suppression_it_does_not_own(monkeypatch):
-    # The model's own suppress_tokens may name a spare row a new token now takes: without
-    # padding, add_new_tokens must leave that list exactly as it was.
+    # The model's own suppress_tokens may name a spare row that a new token now takes; without padding, add_new_tokens must leave that list untouched.
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
     model, tokenizer = _load()
     rows = model.get_input_embeddings().weight.shape[0]
@@ -191,8 +190,7 @@ def test_legacy_padded_model_releases_its_rows(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("pad", [None, 64])
 def test_legacy_padded_model_releases_its_rows_when_growing(monkeypatch, tmp_path, pad):
-    # New tokens overflowing the legacy alignment rows grow the embedding: the rows from that
-    # resize must not hide the legacy layout, or the old alignment ids stay suppressed as tokens.
+    # Growing the embedding past legacy alignment rows must not hide the legacy layout, or the old alignment ids stay suppressed after becoming tokens.
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
     model, tokenizer = _load()
     add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
@@ -212,8 +210,7 @@ def test_legacy_padded_model_releases_its_rows_when_growing(monkeypatch, tmp_pat
 
 
 def test_alignment_rows_already_suppressed_are_still_recorded_for_vllm(monkeypatch):
-    # vLLM only biases the recorded rows, so a row the caller already suppressed must be recorded
-    # too; it stays the caller's suppression when it later becomes a token.
+    # vLLM only biases recorded rows, so a row the caller already suppressed must still be recorded; it stays the caller's suppression once it becomes a token.
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
     model, tokenizer = _load()
     n0 = len(tokenizer)
@@ -292,8 +289,8 @@ class _AsyncClient:
 
 
 class _LLMEngine:
-    # vLLM 0.29 LLMEngine.add_request: process_inputs (clones params) or a prebuilt
-    # EngineCoreRequest whose own params win, then n > 1 fan-out, then engine_core.add_request.
+    # vLLM 0.29 LLMEngine.add_request: process_inputs clones the params, or a prebuilt EngineCoreRequest keeps its own;
+    # then n > 1 fan-out, then engine_core.add_request.
     def __init__(self):
         self.engine_core = _Client()
 
@@ -366,8 +363,7 @@ def test_vllm_padded_vocab_biases_prebuilt_engine_core_request():
 
 
 def test_vllm_padded_vocab_biases_async_streaming_chunks():
-    # AsyncLLM streaming input: each chunk's own SamplingParams go through process_inputs and
-    # straight to engine_core.add_request_async, never through AsyncLLM.add_request.
+    # AsyncLLM streaming input: each chunk's SamplingParams go through process_inputs and straight to engine_core.add_request_async, never AsyncLLM.add_request.
     import asyncio
 
     class AsyncLLM:
@@ -419,9 +415,9 @@ class _V0Params:
 
 
 class _V0LLMEngine:
-    # vLLM 0.10.2 V0 LLMEngine: add_request(request_id, prompt, params, ...) rejects requests that
-    # already carry logits_processors, then _add_processed_request(params = ...), which n > 1
-    # children (ParallelSampleSequenceGroup) and _AsyncLLMEngine.add_request_async also call.
+    # vLLM 0.10.2 V0: LLMEngine.add_request rejects requests already carrying logits_processors;
+    # _add_processed_request(params = ...) is called by ParallelSampleSequenceGroup (n > 1) and
+    # _AsyncLLMEngine.add_request_async.
     def __init__(self):
         self.seen = []
 
@@ -518,8 +514,7 @@ def test_return_args_warns_for_padded_vocab(capsys):
 
 
 def test_caller_suppression_kept_after_owned_rows_run_out(monkeypatch):
-    # Once every row Unsloth suppressed has become a token, the remaining alignment row is still
-    # the caller's: the empty ownership record must not fall back to "all rows are ours".
+    # Once all Unsloth-suppressed rows are tokens, the leftover alignment row is the caller's; an empty ownership record must not mean all rows are ours.
     from unsloth_zoo.tokenizer_utils import _round_up_vocab
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
     model, tokenizer = _load()
@@ -542,8 +537,7 @@ def test_caller_suppression_kept_after_owned_rows_run_out(monkeypatch):
 
 
 def test_merged_export_config_keeps_vocab_pad_records():
-    # merge_and_overwrite_lora writes the base checkpoint's config with the trained vocab_size:
-    # the alignment-row records must travel with it, or vLLM samples the tokenless rows.
+    # merge_and_overwrite_lora writes the base config with the trained vocab_size, so alignment-row records must travel with it or vLLM samples tokenless rows.
     from transformers import LlamaConfig
     from unsloth_zoo.saving_utils import _carry_over_vocab_size
     from unsloth_zoo.vllm_utils import _padded_vocab_ids

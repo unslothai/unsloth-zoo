@@ -14,29 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The conversion-mapping re-scope, and the guard message that depends on it.
-
-transformers 5.4.0 (PR #44300) merges a submodule's own prefix renaming into a composite
-model's conversion mapping, where it renames every checkpoint key off the map and the
-bitsandbytes quant_state sidecars are dropped. PR #45567 fixed it in 5.6.0.
-`temporary_patches/conversion_mapping_rescope.py` re-scopes the leaked renaming for the
-releases in between.
-
-Measured on one B200 with `unsloth/qwen3.8-27b-unsloth-bnb-4bit`, 352 Linear4bit modules:
-
-    transformers   repair off            repair on
-    5.3.0          0/352  forward ok     0/352  (declines to install)
-    5.4.0          352/352 forward dies  0/352  forward ok
-    5.5.4          352/352 forward dies  0/352  forward ok
-    5.6.2          0/352  forward ok     0/352  (declines to install)
-    5.17.0         0/352  forward ok     0/352  (declines to install)
-
-and the repaired arms reproduce the known-good releases' logits mean to all 16 digits
-(-2.540154457092285), so the recovered state is the same state and not merely a non-null one.
-
-CPU only, no GPU, no network, no model downloads: every model here is built on the meta
-device from a config.
-"""
+"""Tests the conversion_mapping_rescope repair for transformers 5.4.0 (PR 44300) to before the 5.6.0 fix (PR 45567),
+where leaked renames drop bnb quant_state sidecars; CPU only, meta-device models."""
 
 from __future__ import annotations
 
@@ -54,11 +33,8 @@ from unsloth_zoo.temporary_patches.common import RESCOPE_PATCH_FLAG, WRAPPER_INN
 
 def _core_model_loading():
     core = pytest.importorskip("transformers.core_model_loading")
-    # On a transformers that predates the module (4.x), importing unsloth installs an inert
-    # stand-in under this name so peft can import (`_build_transformers_core_model_loading_stub`
-    # in unsloth/import_fixes.py). Its WeightRenaming stores its patterns and renames nothing,
-    # so every assertion below would measure the stand-in rather than transformers. A real
-    # module is a file on disk; the stand-in's `__file__` is `<unsloth stub: ...>`.
+    # On transformers 4.x unsloth installs an inert stand-in from unsloth/import_fixes.py whose renames do nothing; its
+    # __file__ is not a file on disk, so skip it.
     if not os.path.isfile(getattr(core, "__file__", None) or ""):
         pytest.skip(
             f"transformers.core_model_loading is a stand-in ({getattr(core, '__file__', None)!r}), "
@@ -75,12 +51,7 @@ def _renaming(source, target):
 
 
 def _requires_submodule_extraction():
-    """The leak detector needs `extract_weight_conversions_for_model` to exist.
-
-    It first appears in 5.4.0. Before that there is no per-submodule recursion to correct, the
-    install gate answers "leave transformers alone", and nothing here is ever called in anger --
-    so these tests skip rather than assert against a function the release does not have.
-    """
+    """Needs extract_weight_conversions_for_model, first present in 5.4.0; earlier releases have no submodule recursion to correct, so these tests skip."""
     conversion_mapping = pytest.importorskip("transformers.conversion_mapping")
     if not hasattr(conversion_mapping, "extract_weight_conversions_for_model"):
         pytest.skip("this transformers has no per-submodule conversion extraction")
@@ -210,13 +181,8 @@ def test_rescoped_renaming_refuses_an_unanchored_pattern():
 
 
 def test_on_a_fixed_transformers_the_rescope_changes_nothing(composite_model):
-    """The stronger claim, and the one that survives the install gate being wrong.
-
-    On a release that already scopes submodule mappings, the leaked SIGNATURE is still present
-    in the mapping -- the renaming really was collected from the text model -- but transformers
-    has set `scope_prefix` on it, so the entry is skipped and the caller's own list comes back.
-    Measured by identity, so this cannot pass by rebuilding an equal list.
-    """
+    """On a release that already scopes submodule mappings the leaked signature remains, but transformers sets
+    scope_prefix so the entry is skipped and the caller's own list returns; checked by identity."""
     conversion_mapping = _requires_submodule_extraction()
     if not rescope._transformers_rescopes_submodule_prefix_renamings():
         pytest.skip("this transformers is inside the defect window; see the real-checkpoint matrix")
@@ -230,14 +196,8 @@ def test_on_a_fixed_transformers_the_rescope_changes_nothing(composite_model):
 
 
 def test_the_leaked_entry_is_the_language_model_prefix_strip(composite_model):
-    """Name what the detector finds, so a silent change of target shows up as a failure.
-
-    Only asserted where a leak exists at all. The releases differ in where they scope: 5.4/5.5
-    hand the entry over unscoped, which is the defect; 5.6 to 5.9 rewrite its patterns at
-    extraction time, so nothing reaches here to leak; 5.10+ set `scope_prefix` on the
-    extracted object, which still looks destructive on its own and is skipped downstream
-    instead (see test_on_a_fixed_transformers_the_rescope_changes_nothing).
-    """
+    """Pins the detector target so a silent retarget fails; the leak exists only on 5.4/5.5 (entry handed over
+    unscoped); 5.6-5.9 rewrite at extraction, 5.10+ set scope_prefix, which is skipped downstream."""
     _requires_submodule_extraction()
     leaked, _ = rescope._leaked_submodule_prefix_renamings(composite_model)
     if not leaked:
@@ -258,12 +218,8 @@ def test_a_non_composite_model_gets_its_own_list_back():
 
 
 def _base_mapping_fn(conversion_mapping):
-    """The genuinely unwrapped `get_model_conversion_mapping`.
-
-    conftest applies TEMPORARY_PATCHES, so by the time a test runs the module attribute is
-    already this package's wrappers. Walking to the base is what lets a test install onto a
-    clean function instead of being refused by the already-installed check.
-    """
+    """Walks past the wrappers TEMPORARY_PATCHES leave on the module attribute, so a test installs onto a clean
+    function, not one the already-installed check refuses."""
     function = conversion_mapping.get_model_conversion_mapping
     for _ in range(8):
         following = (
@@ -317,10 +273,8 @@ def test_repair_detection_sees_both_packages_marks():
     on_top.__wrapped__ = unsloth_marked
     assert rescope._repair_already_installed(on_top) is True
 
-    # And under one that publishes only WRAPPER_INNER_ATTR, which is what
-    # moe_utils_bnb4bit.py installs. It cannot use __wrapped__: the installer unwraps that
-    # to choose what to wrap, so publishing it would have the rescope REPLACE the MoE
-    # wrapper instead of sitting on top of it, dropping the per-expert converters.
+    # Marks only WRAPPER_INNER_ATTR (as moe_utils_bnb4bit.py does), since publishing __wrapped__ would make the rescope
+    # replace the MoE wrapper and drop per-expert converters.
     def moe_style():
         pass
     setattr(moe_style, WRAPPER_INNER_ATTR, zoo_marked)
@@ -328,17 +282,10 @@ def test_repair_detection_sees_both_packages_marks():
 
 
 def test_the_moe_wrapper_does_not_hide_the_repair_from_either_probe():
-    """Regression: the MoE wrapper used to be an opaque lid over the repair.
-
-    `TEMPORARY_PATCHES` runs three times (init, pre_compile, post_compile) and the rescope
-    installs before `moe_utils_bnb4bit`, so from pass 1 onward the MoE wrapper was outermost
-    with no link down. Measured on transformers 5.5.4 before the fix: pass 1 left
-    `_composite_renaming_repair_installed()` False, so the Linear4bit error blamed the
-    transformers version for a load the repair had already fixed, and pass 2 stacked a
-    second rescope wrapper.
-    """
-    # importorskip, not a bare import: transformers 4.x has no conversion_mapping at all, so
-    # on the 4.57.6 CI lane this was a collection-time ModuleNotFoundError rather than a skip.
+    """Regression: the MoE wrapper, outermost with no link down from pass 1, hid the repair from
+    _composite_renaming_repair_installed on transformers 5.5.4; pass 2 then stacked a second rescope."""
+    # Use importorskip, not a bare import: transformers 4.x (4.57.6 CI lane) has no conversion_mapping, so a bare import
+    # was a collection-time ModuleNotFoundError.
     cm = pytest.importorskip("transformers.conversion_mapping")
     moe = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
     patch_bnb4bit_model_conversion_mapping = moe.patch_bnb4bit_model_conversion_mapping
@@ -383,17 +330,14 @@ def test_repair_detection_cannot_spin_on_a_cycle():
         ("5.6.0", False),
         ("5.17.0", False),
         ("4.57.6", False),
-        # A prerelease sorts with the release line it belongs to. Without the `.dev0` bounds
-        # `Version("5.6.0.dev0") < Version("5.6.0")` accuses a build that carries the fix.
+        # A prerelease sorts with its release line: without the .dev0 bounds, 5.6.0.dev0 sorts below 5.6.0 and would accuse a build that carries the fix.
         ("5.6.0.dev0", False),
         ("5.6.0rc1", False),
         ("5.4.0.dev0", True),
     ],
 )
 def test_defect_window_bounds_including_prereleases(monkeypatch, version, expected):
-    # The raw string, as `importlib.metadata.version` returns it. Deliberately NOT routed
-    # through `unsloth_zoo.utils.Version`, which answers `Version('5.6.0.1')` for the string
-    # "5.6.0.dev0" and would sort a prerelease after the release it belongs before.
+    # Raw importlib.metadata string on purpose: unsloth_zoo.utils.Version reads '5.6.0.dev0' as 5.6.0.1, which sorts it after the release it precedes.
     monkeypatch.setattr(bnb_patch, "_installed_transformers_version", lambda: version)
     assert bnb_patch._transformers_drops_prequantized_quant_state() is expected
 
@@ -447,18 +391,9 @@ def test_repair_probe_never_raises_without_transformers(monkeypatch):
 
 
 def test_the_sweep_leaves_a_wrapper_it_does_not_supersede(monkeypatch):
-    """Someone else's wrapper on an imported alias must survive the rebinding sweep.
-
-    The sweep exists because a module that did `from .conversion_mapping import
-    get_model_conversion_mapping` holds the OBJECT, so rebinding the module attribute alone
-    leaves it on the unrepaired function. But a binding under that name is not necessarily the
-    function we wrapped: another integration may have wrapped the alias and left the module
-    attribute alone, and our wrapper closes over the module attribute, so overwriting the alias
-    drops their behaviour with no trace -- silently disabling unrelated conversion logic.
-
-    Reproduced before the fix: `modeling_utils.get_model_conversion_mapping` came back as ours
-    and `third_party` was nowhere in the chain.
-    """
+    """The rebinding sweep is needed because a from-import holds the function object, but it must not overwrite a
+    third-party wrapper on the alias: our wrapper closes over the module attribute, so overwriting silently drops
+    their behaviour."""
     conversion_mapping = _requires_submodule_extraction()
     if rescope._transformers_rescopes_submodule_prefix_renamings():
         pytest.skip("this transformers carries the upstream fix; the re-scope declines")
@@ -497,14 +432,7 @@ def test_the_sweep_still_rebinds_a_plain_alias(monkeypatch):
 
 
 def test_a_third_party_wrapper_on_the_module_attribute_survives(monkeypatch):
-    """The canonical-binding half of the same hazard.
-
-    Installing used to unwrap `__wrapped__` before wrapping, to avoid re-wrapping a wrapper of
-    ours that had lost its mark. But the already-installed check declines whenever either mark
-    is anywhere in the chain, so that case cannot reach the unwrap, while a third party's
-    `functools.wraps` wrapper on the module attribute WAS unwrapped past and then replaced,
-    dropping their behaviour with nothing left in the chain.
-    """
+    """Installing must not unwrap __wrapped__ before wrapping: that replaced a third-party functools.wraps wrapper on the module attribute and dropped its behaviour."""
     conversion_mapping = _requires_submodule_extraction()
     if rescope._transformers_rescopes_submodule_prefix_renamings():
         pytest.skip("this transformers carries the upstream fix; the re-scope declines")

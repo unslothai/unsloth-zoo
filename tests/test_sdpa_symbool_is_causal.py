@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A SymBool `is_causal` must not graph break the patched SDPA forward.
-
-Moonshine computes `is_causal = self.is_causal and attention_mask is None and q_len > 1`,
-which under dynamic shapes is a SymBool; SDPA only takes a Python bool, so every
-decoder attention call graph broke with "TypeError when making fake tensor call".
-"""
+"""A SymBool is_causal (Moonshine under dynamic shapes) must not graph break the patched SDPA forward, which only takes a Python bool."""
 
 import os
 
@@ -36,8 +31,8 @@ def test_symbool_is_causal_compiles_fullgraph(monkeypatch):
     import transformers.integrations.sdpa_attention as sdpa_module
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    # CI runs with UNSLOTH_COMPILE_DISABLE=1, where the patch is (rightly) skipped; install it
-    # here and restore transformers' forward afterwards so the rest of the session is unchanged.
+    # CI sets UNSLOTH_COMPILE_DISABLE=1, which skips the patch; install it here and restore transformers' forward
+    # afterwards so the rest of the session is unchanged.
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
     monkeypatch.setattr(sdpa_module, "sdpa_attention_forward", sdpa_module.sdpa_attention_forward)
     monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS, "sdpa", ALL_ATTENTION_FUNCTIONS["sdpa"])

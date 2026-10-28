@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""The Xet reachability probe must not carry the user's Hugging Face token.
-
-A hand-rolled `urllib` Request ignores `HF_HUB_DISABLE_IMPLICIT_TOKEN` and keeps
-`Authorization` across a cross-host 3xx. Loopback only, enforced by the package conftest.
-"""
+"""Xet reachability probe must send no Hugging Face token: a hand-rolled urllib Request ignores
+HF_HUB_DISABLE_IMPLICIT_TOKEN and keeps Authorization across cross-host 3xx; loopback only, enforced by package
+conftest."""
 
 import os
 import threading
@@ -126,8 +124,7 @@ def test_probe_sends_no_authorization_across_a_cross_host_redirect(
 
 def test_probe_does_not_read_a_token_at_all(module, monkeypatch, origin):
     """No credential lookup, so HF_HUB_DISABLE_IMPLICIT_TOKEN cannot be contradicted."""
-    # HF_TOKEN must be ABSENT or the old code short-circuits before get_token and the spy proves
-    # nothing on the unpatched tree either.
+    # HF_TOKEN must be unset, else the old code short-circuits before get_token and the spy proves nothing, even on the unpatched tree.
     monkeypatch.delenv("HF_TOKEN", raising = False)
     monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 
@@ -169,11 +166,7 @@ def test_a_401_is_inconclusive_and_still_carries_no_credential(
 
 
 def test_source_carries_no_authorization_header():
-    """A lint-shaped guard: nothing in this module may add an Authorization header.
-
-    EXECUTABLE strings only: a text scan must exempt the comment explaining the removal, and
-    that exemption then blesses every other mention, a real header included.
-    """
+    """Source must add no Authorization header: checked over executable strings via AST, since a text scan exempting the removal comment would bless real headers."""
     import ast
 
     path = REPO_ROOT / "unsloth_zoo_downloads" / "hf_xet_health.py"

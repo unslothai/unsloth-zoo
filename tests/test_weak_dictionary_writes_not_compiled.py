@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dynamo must not compile the standard library's weak-dictionary writes.
-
-Fine-tuning gemma-4-E2B-it on a T4 dies in the second step with "AssertionError:
-Something went unexpectedly wrong in activation checkpoint". The exhausted
-recompile budget is `weakref.__setitem__`'s -- 1030 compiles against a limit of
-1024 in that step -- not the gemma4 RMSNorm kernel the warning names, which
-compiles six times in the whole run. Checkpointing's saved-tensor bookkeeping
-reaches those writes from inside a compiled region with a fresh key object per
-region, so none of those compilations can ever be reused.
-
-Kaggle T4 `danielhanchen/unsloth-t4-ci-e29ca7f0`: with these four code objects
-skipped and nothing else changed, the asserting run completes, still compiled.
-"""
+"""Dynamo must not compile weakref.__setitem__: its exhausted recompile budget (1030 compiles vs limit 1024) on
+gemma-4-E2B-it T4 broke activation checkpoint; skipping the four marked code objects lets the run complete (Kaggle
+danielhanchen/unsloth-t4-ci-e29ca7f0)."""
 
 import sys
 from pathlib import Path
@@ -58,13 +48,8 @@ def test_every_weak_dictionary_writer_is_marked():
 
 
 def test_the_marked_frames_are_never_compiled():
-    """No Dynamo cache entry for any of the four, through the real accessor.
-
-    Weaker than it looks off a T4: whether Dynamo intercepts these frames at all
-    depends on how they are reached, and the failing arrangement (checkpoint
-    recompute on an autograd thread under a compiled region) has not been
-    reproduced elsewhere. The invariant holds either way.
-    """
+    """No Dynamo cache entry for the four marked frames via the accessor; weaker than it looks, since interception
+    depends on how frames are reached; the invariant holds either way."""
     import weakref
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
 
@@ -107,8 +92,7 @@ def test_it_is_safe_to_call_twice():
 
 
 def test_a_torch_without_the_accessor_is_not_an_error():
-    """This runs at import, so a torch that cannot be asked must mean
-    "nothing marked", never a failed import."""
+    """Runs at import, so a torch lacking the accessor must mean nothing is marked, never a failed import."""
     with pytest.MonkeyPatch.context() as patch:
         patch.delattr("torch._dynamo.eval_frame.skip_code")
         assert P.stop_compiling_weak_dictionary_writes() == 0
@@ -136,8 +120,7 @@ def test_a_missing_weak_dictionary_is_skipped_quietly():
 
 
 def test_patching_torch_compile_marks_them():
-    """Nothing else calls it, so a `patch_torch_compile` that forgets it is the
-    bug back again."""
+    """Nothing else calls stop_compiling_weak_dictionary_writes, so a patch_torch_compile that forgets it reintroduces the bug."""
     called = []
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(P, "stop_compiling_weak_dictionary_writes",

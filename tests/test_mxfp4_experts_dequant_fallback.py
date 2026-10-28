@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_dequantize_mxfp4_experts returns (E, in, out) whichever convert_moe_packed_tensors is installed,
-never calls a loader-hook dequantize, and decodes on its own otherwise (square case included)."""
+"""_dequantize_mxfp4_experts returns (E, in, out) whichever convert_moe_packed_tensors is installed, never calls a
+loader-hook dequantize, and decodes itself otherwise (square case too)."""
 import itertools
 import types
 

@@ -1,8 +1,5 @@
-"""torchvision.io.read_video passes av.open(..., metadata_errors=...), which PyAV 19 removed.
-
-_read_video_torchvision is both a primary backend and fetch_video's last resort, so on
-PyAV 19 video input stopped working unless decord or torchcodec happened to succeed.
-"""
+"""PyAV 19 removed the metadata_errors kwarg that torchvision.io.read_video passes to av.open; _read_video_torchvision
+is both a primary backend and last resort, so video broke."""
 
 import pytest
 

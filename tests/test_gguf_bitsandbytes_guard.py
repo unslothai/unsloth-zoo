@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests the bitsandbytes guard in llama_cpp.convert_to_gguf.
-
-llama.cpp has no bitsandbytes dequantizer and only refuses after reading the
-entire model, so the guard has to fire before the subprocess. The detector
-recurses because VLMs keep quantization_config under a sub-config.
-"""
+"""Tests the bitsandbytes guard in llama_cpp.convert_to_gguf: llama.cpp has no bitsandbytes dequantizer and refuses only
+after reading the whole model, so the guard must fire before the subprocess; the detector recurses for VLM
+sub-configs."""
 
 import ast
 from pathlib import Path

@@ -29,12 +29,9 @@ import pytest
 
 from mlx_simulation import mlx_is_simulated, simulate_mlx_on_torch
 
-# `find_spec("mlx")` alone answers "can mlx be imported", which is NOT the same
-# question once a sibling module has installed the torch shim: that registers
-# `mlx` in sys.modules and a finder in sys.meta_path, so the spec exists and this
-# file concludes it is on real MLX. It then runs the `requires_real_mlx` tests
-# against a shim where `mx.argpartition` is a `_Noop`, and whether that happens
-# comes down to collection order.
+# find_spec on mlx alone does not show real MLX once a sibling installed the torch shim, which registers mlx in
+# sys.modules and sys.meta_path; requires_real_mlx tests then run against a shim where mx.argpartition is a _Noop,
+# depending on collection order.
 _HAS_REAL_MLX = importlib.util.find_spec("mlx") is not None and not mlx_is_simulated()
 if not _HAS_REAL_MLX:
     simulate_mlx_on_torch()
@@ -216,9 +213,7 @@ def test_structural_detection():
 
 
 def test_structural_detection_matches_unnamed_linear_attention(monkeypatch):
-    """GLM-5.x holds the gate-decay pair on a `Glm5NextForgetGate` under a mixer
-    named `Glm5NextLinearAttention`; what separates it from an SSM gate carrying the
-    same parameters is that its defining module binds `gated_delta_update`."""
+    """GLM-5.x gate pair sits on Glm5NextForgetGate under Glm5NextLinearAttention; unlike an SSM gate with the same parameters, its module binds gated_delta_update."""
     from unsloth_zoo.mlx.compile import model_has_gated_delta_layers
 
     class _ForgetGate:
@@ -270,8 +265,7 @@ def _make_case(B, T, Hk, Hv, Dk, Dv, dtype, vectorized=False):
 
 
 CASES = [
-    # (B, T, Hk, Hv, Dk, Dv, dtype, tol, vectorized); B >= 2 everywhere.
-    # vectorized=True exercises kimi_linear-style per-column gating.
+    # Tuple fields are (B, T, Hk, Hv, Dk, Dv, dtype, tol, vectorized); B >= 2 everywhere; vectorized=True exercises kimi_linear-style per-column gating.
     (2, 96, 2, 4, 64, 32, mx.float32, 5e-4, False),
     (3, 70, 2, 4, 32, 16, mx.float32, 5e-4, False),
     (2, 130, 4, 4, 96, 64, mx.bfloat16, 2e-2, False),
@@ -301,8 +295,7 @@ def test_vjp_matches_plain_autodiff(impl, case):
 
 @requires_metal
 def test_patched_update_routes_training_to_kernel_path(monkeypatch):
-    """A call site asking for the differentiable path, or an open window, takes the
-    kernel VJP; an empty cache alone must not. Only the spy proves which ran."""
+    """A call asking for the differentiable path, or an open training window, takes the kernel VJP; an empty cache alone must not; only the spy proves which ran."""
     import unsloth_zoo.gated_delta_vjp as gv
 
     called = {}
@@ -400,9 +393,7 @@ def test_patched_update_delegates_an_unknown_keyword(fake_mlx_lm):
 def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
     fake_mlx_lm, monkeypatch,
 ):
-    """patch_gated_delta_vlm covers mlx_vlm >= 0.6's own module (a distinct
-    function the identity sweep leaves alone), and the sweep must treat the
-    sibling patch as owned, not foreign."""
+    """patch_gated_delta_vlm also covers mlx_vlm >= 0.6's own module, a distinct function the sweep leaves alone and must treat as owned, not foreign."""
     calls = {}
 
     def vlm_original(q, k, v, a, b, A_log, dt_bias,
@@ -446,10 +437,8 @@ def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
 
 
 def test_vlm_patch_rebinds_language_holding_a_stale_copy(fake_mlx_lm, monkeypatch):
-    """`language` from-imports the function at import time, so a later reload of
-    .gated_delta leaves it holding a different object than the one being replaced.
-    The identity sweep cannot see that; the patch must bind `language` by name or
-    qwen3_5 trains without the memory-efficient VJP."""
+    """language from-imports the function at import time, so a reload of .gated_delta leaves it stale and the identity
+    sweep cannot see that; the patch must bind language by name or qwen3_5 trains without the memory-efficient VJP."""
     def _update(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True):
         return "y", state
 
@@ -483,9 +472,8 @@ def test_vlm_patch_rebinds_language_holding_a_stale_copy(fake_mlx_lm, monkeypatc
 
 @requires_metal
 def test_kernel_dispatch_guards_partial_threadgroup_rows():
-    """Dv not divisible by the threadgroup row count must fall back to the
-    ops VJP: the backward kernel's shared-memory pre-reduction would read
-    uninitialized slots in a partial trailing threadgroup."""
+    """Dv not divisible by the threadgroup row count must fall back to the ops VJP: the backward kernel's shared-memory
+    pre-reduction reads uninitialized slots in a partial trailing threadgroup."""
     import unsloth_zoo.gated_delta_vjp as gv
 
     q = mx.zeros((1, 8, 2, 32))
@@ -498,12 +486,9 @@ def test_kernel_dispatch_guards_partial_threadgroup_rows():
 
 @pytest.mark.skipif(_HAS_METAL, reason="the off-Metal answer is what is pinned here")
 def test_kernel_support_declines_off_metal_without_touching_the_layout_search():
-    """Off Metal the predicate must answer False, not raise.
-
-    The layout search reads `dtype.size`, which only a real mx.Dtype has, so with
-    it ahead of the device guard a training call under the torch shim died with
-    AttributeError instead of falling back to the ops VJP.
-    """
+    """Off Metal the predicate must answer False, not raise; the layout search reads dtype.size, which only a real
+    mx.Dtype has, so it must run after the device guard or torch-shim training calls raise AttributeError instead of
+    falling back to the ops VJP."""
     import unsloth_zoo.gated_delta_vjp as gv
 
     q = mx.zeros((1, 8, 2, 64))
@@ -515,14 +500,12 @@ def test_kernel_support_declines_off_metal_without_touching_the_layout_search():
 
 @pytest.mark.skipif(_HAS_METAL, reason="the off-Metal answer is what is pinned here")
 def test_training_call_falls_back_to_ops_vjp_off_metal(monkeypatch):
-    """The whole dispatch, not just the predicate: an open training window off
-    Metal must reach gated_delta_ops_efficient."""
+    """Covers the whole dispatch, not just the predicate: an open training window off Metal must reach gated_delta_ops_efficient."""
     import types
 
     import unsloth_zoo.gated_delta_vjp as gv
 
-    # patch_gated_delta does `from mlx_lm.models import gated_delta`, which reads
-    # the package ATTRIBUTE, so sys.modules alone is not enough to redirect it.
+    # patch_gated_delta does from mlx_lm.models import gated_delta, which reads the package attribute, so sys.modules alone is not enough to redirect it.
     package = types.ModuleType("mlx_lm")
     models = types.ModuleType("mlx_lm.models")
     module = types.ModuleType("mlx_lm.models.gated_delta")
@@ -568,15 +551,13 @@ def index_stop():
 
 
 def test_window_depth_accounting():
-    """Trainer runs overlap and the patches are global: an inner window must not
-    unpatch an outer one, and a pause must refuse while anyone else holds it."""
+    """Trainer runs overlap and the patches are global: an inner window must not unpatch an outer one, and a pause must refuse while others hold it."""
     originals = {name: getattr(mx, name) for name in _MLX_INDEX_OP_NAMES}
     assert not mlx_training_patches_active()
     acquire_mlx_training_patches()
     acquire_mlx_training_patches()
-    # The outer run still needs the patches, so removing them is refused, but the
-    # evaluation doing the pausing must still stop reading as training, otherwise
-    # nesting silently routes it down the training paths.
+    # The outer run still needs the patches so removal is refused, but the pausing evaluation must still not read as
+    # training, or nesting silently routes it down training paths.
     assert pause_mlx_training_patches() is False
     assert not mlx_training_patches_active()
     assert mx.take_along_axis._unsloth_index_stop_gradient
@@ -596,8 +577,7 @@ def test_window_depth_accounting():
 
 
 def test_pause_stops_evaluation_reading_as_training_at_any_depth():
-    """`_is_training_call` consults the window, so an evaluation that cannot
-    remove the process-wide patches must still stop being counted as training."""
+    """_is_training_call consults the window, so an evaluation that cannot remove the process-wide patches must still not be counted as training."""
     for depth in (1, 2, 3):
         for _ in range(depth):
             acquire_mlx_training_patches()
@@ -614,9 +594,8 @@ def test_pause_stops_evaluation_reading_as_training_at_any_depth():
 
 
 def test_one_trainers_evaluation_leaves_another_threads_flag_alone():
-    """The flag is what routes a backward pass, so clearing it globally is a crash,
-    not a slowdown: a call site like GLM-5.x's passes no `use_kernel`, and reading
-    as inference sends its backward to the fused kernel, which has no VJP."""
+    """The flag routes backward passes, so clearing it globally is a crash, not a slowdown: a call site like GLM-5.x's
+    passes no use_kernel, and read as inference its backward would reach the fused kernel, which has no VJP."""
     import threading
 
     b_holds, a_paused = threading.Event(), threading.Event()
@@ -652,8 +631,7 @@ def test_one_trainers_evaluation_leaves_another_threads_flag_alone():
 
 
 def test_resume_keeps_its_reference_when_another_run_acquired_mid_pause():
-    """If resume assigns the depth instead of incrementing it, A's reference is
-    lost and B's release unpatches mlx.core while A is still differentiating."""
+    """If resume assigns the depth instead of incrementing it, A's reference is lost and B's release unpatches mlx.core while A is still differentiating."""
     acquire_mlx_training_patches()                      # A trains
     try:
         paused = pause_mlx_training_patches()           # A evaluates, sole holder
@@ -671,8 +649,7 @@ def test_resume_keeps_its_reference_when_another_run_acquired_mid_pause():
 
 
 def test_detaching_preserves_container_types():
-    """`mx.checkpoint` hands the layer its own arguments back, so rebuilding a
-    NamedTuple as a plain tuple turns `payload.ids` into an AttributeError."""
+    """mx.checkpoint hands the layer its own arguments back, so rebuilding a NamedTuple as a plain tuple turns payload.ids into an AttributeError."""
     import collections
 
     Payload = collections.namedtuple("Payload", "ids hidden")
@@ -692,8 +669,7 @@ def test_detaching_preserves_container_types():
 
 
 def test_patch_gated_delta_survives_an_mlx_lm_without_the_module(monkeypatch):
-    """Layers are matched structurally now, so an mlx-vlm-defined gated-delta
-    mixer routes here even where mlx_lm ships no `models/gated_delta`."""
+    """Layers are matched structurally, so an mlx-vlm-defined gated-delta mixer routes here even where mlx_lm ships no models/gated_delta."""
     from unsloth_zoo import gated_delta_vjp
 
     class _Block:
@@ -713,8 +689,8 @@ def test_patch_gated_delta_survives_an_mlx_lm_without_the_module(monkeypatch):
 
 @requires_real_mlx
 def test_checkpointed_layer_detaches_integer_arguments():
-    """A layer that embeds the token ids it was handed derives a gather index,
-    and `mx.checkpoint` makes every argument a primal MLX wants a gradient for."""
+    """A layer that embeds the token ids it was handed derives a gather index, and mx.checkpoint makes every argument a
+    primal MLX wants a gradient for, so integer arguments must be detached."""
     from unsloth_zoo.mlx.utils import _patch_layer_class_for_gc, _unpatch_layer_class_gc
 
     class _Layer(nn.Module):
@@ -739,8 +715,7 @@ def test_checkpointed_layer_detaches_integer_arguments():
 
 @requires_real_mlx
 def test_router_gradient_matches_detached_reference(index_stop):
-    """Top-k routing in the shape every MoE block uses. An all-zero grad would
-    mean the score path was severed with the index path, leaving it untrained."""
+    """Top-k routing in the shape every MoE block uses; an all-zero grad would mean the score path was severed with the index path, leaving it untrained."""
     x, w = mx.random.normal((4, 8)), mx.random.normal((8, 6))
     raw = mx.argpartition._unsloth_index_original
 
@@ -839,8 +814,7 @@ def test_shared_patch_rebinds_consumers_and_forwards_lower_bound(shared_name, mo
     # mlx-vlm had no `lower_bound` here before 0.6.9; do not invent one for it.
     assert seen["kw"] == {}
 
-    # Inside a window it takes the training branch, which must gate through
-    # `compute_g_safe`: GLM-5.x clamps the decay and qwen3_5 does not.
+    # Inside a window the training branch must gate through compute_g_safe: GLM-5.x clamps the decay and qwen3_5 does not.
     import unsloth_zoo.gated_delta_vjp as gv
     shared.compute_g = lambda *a: pytest.fail("bounded gate took the plain path")
     shared.compute_g_safe = lambda A_log, a, dt, lb: seen.setdefault("bound", lb)
@@ -855,10 +829,9 @@ def test_shared_patch_rebinds_consumers_and_forwards_lower_bound(shared_name, mo
     assert seen["bound"] == -5.0
 
 
-# mlx-vlm 0.7.1 gave the cache ownership of recurrent state: `gated_delta_update`
-# grew `cache`, `cache_index` and `state_steps`, and qwen3_5 / glm5_next pass
-# `cache=` on every call, cached or not. These pin the wrapper's half of that
-# contract without an installed mlx-vlm.
+# mlx-vlm 0.7.1 gave the cache ownership of recurrent state: gated_delta_update grew cache, cache_index and state_steps,
+# and qwen3_5 / glm5_next pass cache= on every call, cached or not; these tests pin the wrapper's half without an
+# installed mlx-vlm.
 def _cache_aware_upstream(seen):
     def upstream(q, k, v, a, b, A_log, dt_bias, state=None, mask=None,
                  use_kernel=True, lower_bound=None, state_steps=None,
@@ -903,8 +876,7 @@ def _install_qwen35(monkeypatch, upstream, fake_mlx_lm):
     return vlm_gd.gated_delta_update
 
 
-# Both wrappers grew the same keyword-drift tolerance, so both must prove it: the
-# qwen3_5 copy is where the 0.7.1 `cache=` TypeError actually fired.
+# Both wrappers grew the same keyword-drift tolerance, so both must be proven; the qwen3_5 copy is where the 0.7.1 cache= TypeError actually fired.
 @pytest.fixture(params=["shared", "qwen3_5"])
 def install_vlm_patch(request, monkeypatch, fake_mlx_lm):
     if request.param == "shared":
@@ -915,9 +887,8 @@ def install_vlm_patch(request, monkeypatch, fake_mlx_lm):
 def test_cache_owned_calls_delegate_with_their_keywords_intact(
     install_vlm_patch, monkeypatch,
 ):
-    """A cache owns the recurrent state and the retained history, so neither
-    shape is a training call however wide the window is open. Forward the
-    keywords verbatim and preserve upstream's variable return arity."""
+    """A cache owns the recurrent state and retained history, so such calls are never training however wide the window
+    is open; forward keywords verbatim and keep upstream's variable return arity."""
     seen = []
     patched = install_vlm_patch(_cache_aware_upstream(seen))
 
@@ -928,16 +899,14 @@ def test_cache_owned_calls_delegate_with_their_keywords_intact(
         assert seen[-1]["cache"] == "prompt-cache"
         assert seen[-1]["cache_index"] == 3
 
-        # `state_steps` asks for per-step states; upstream answers with a triple.
-        # No `state`, so only the history rule can be what delegates this.
+        # state_steps asks for per-step states and upstream answers with a triple; with no state, only the history rule can delegate this call.
         assert patched(*[object()] * 7, use_kernel=False,
                        state_steps=2) == ("cached", None, "history")
         assert seen[-1]["state_steps"] == 2
     finally:
         release_mlx_training_patches()
 
-    # An explicit `cache=None` is what every 0.7.1 call site passes when training,
-    # and it must still reach the memory-efficient VJP.
+    # An explicit cache=None is what every 0.7.1 call site passes when training, and it must still reach the memory-efficient VJP.
     import unsloth_zoo.gated_delta_vjp as gv
     monkeypatch.setattr(gv, "gated_delta_kernel_supported", lambda *a: False)
     monkeypatch.setattr(gv, "gated_delta_ops_efficient", lambda *a: "vjp")
@@ -951,8 +920,7 @@ def test_cache_owned_calls_delegate_with_their_keywords_intact(
 def test_unrecognized_keyword_delegates_instead_of_being_dropped(
     install_vlm_patch, monkeypatch, capsys,
 ):
-    """The training branch recomputes the gate from its own inputs, so a keyword
-    it does not understand would be silently lost rather than raise. Delegate."""
+    """The training branch recomputes the gate from its own inputs, so an unrecognized keyword would be silently dropped rather than raise; delegate instead."""
     seen = []
 
     def upstream(q, k, v, a, b, A_log, dt_bias, state=None, mask=None,
@@ -982,8 +950,7 @@ def test_unrecognized_keyword_delegates_instead_of_being_dropped(
 
 
 def test_pre_0_6_9_upstream_is_never_handed_a_keyword_it_lacks(monkeypatch):
-    """Backward compatibility: older mlx-vlm has none of these parameters, and
-    the wrapper must not invent one to pass along."""
+    """Backward compatibility: older mlx-vlm (pre-0.6.9 here) lacks these parameters, and the wrapper must not invent one to pass along."""
     seen = []
 
     def old_upstream(q, k, v, a, b, A_log, dt_bias,
@@ -998,10 +965,9 @@ def test_pre_0_6_9_upstream_is_never_handed_a_keyword_it_lacks(monkeypatch):
 
 @requires_real_mlx
 def test_patched_wrappers_accept_every_keyword_the_installed_mlx_vlm_declares():
-    """Upstream adds keywords faster than this patch is revised -- 0.6.9 added
-    `lower_bound`, 0.7.1 added three more -- and each addition reached a training
-    step as a TypeError. Fail here instead, where the answer is a decision about
-    whether the training branch can honour the new parameter."""
+    """Upstream adds keywords faster than this patch is revised (0.6.9 added lower_bound, 0.7.1 three more), and each
+    reached training as a TypeError; fail here, where the training branch decides whether it can honour the new
+    keyword."""
     pytest.importorskip("mlx_vlm")
     import inspect
 
@@ -1015,8 +981,8 @@ def test_patched_wrappers_accept_every_keyword_the_installed_mlx_vlm_declares():
         except ImportError:
             continue
         checked.append(name)
-        # A sibling test may already have patched this module in-process, and the
-        # wrapper's own signature hides every upstream keyword behind **kwargs.
+        # A sibling test may already have patched this module in-process, and the wrapper's **kwargs hides every
+        # upstream keyword, so the upstream signature is read from the saved original.
         upstream = getattr(module, "_unsloth_gated_delta_original",
                            module.gated_delta_update)
         optional = {
@@ -1069,15 +1035,9 @@ def test_disabling_a_fusion_targets_only_fused_modules(disable, flag, extra):
 
 
 def _has_glm5_next() -> bool:
-    """Whether mlx_vlm ships glm5_next, without letting the question raise.
-
-    find_spec on a SUBMODULE imports its parent package first, so it raises rather
-    than returning None when mlx_vlm is missing -- and raises whatever the parent
-    raises when it is present but unimportable (a torch/mlx-vlm version skew does
-    exactly that). Either way the exception escapes at MODULE level, so the whole
-    file fails to collect on a real-MLX machine that simply has no mlx-vlm. Only
-    the shim's catch-all finder hid this: it answers for any name.
-    """
+    """Whether mlx_vlm ships glm5_next, without raising: find_spec on a submodule imports the parent and raises if
+    mlx_vlm is missing or broken (e.g. torch/mlx-vlm version skew); at module level that fails collection of the
+    whole file. Only the catch-all finder of the shim hid this."""
     try:
         return importlib.util.find_spec("mlx_vlm.models.glm5_next") is not None
     except Exception:
@@ -1086,8 +1046,7 @@ def _has_glm5_next() -> bool:
 
 @pytest.mark.parametrize("raised", [ModuleNotFoundError("no mlx_vlm"), ImportError("skew")])
 def test_the_glm5_next_probe_answers_instead_of_raising(monkeypatch, raised):
-    """Non-vacuity for the try/except above: both shapes reach this file at MODULE
-    level, where an exception is a collection error for every test in it."""
+    """Non-vacuity check: both exception shapes reach this file at module level, where any escape is a collection error for every test in it."""
     def _raise(name):
         raise raised
 
@@ -1108,8 +1067,7 @@ def test_unfused_projection_matches_the_fused_one():
     import inspect
 
     if "_fused_ready" not in inspect.getsource(Glm5NextLinearAttention):
-        # mlx-vlm 0.7.1 projects q, k and v through one weight, so there is no
-        # concatenated copy to disable and `_disable_fused_input_projections` finds nothing.
+        # mlx-vlm 0.7.1 projects q, k and v through one weight, so there is no concatenated copy and _disable_fused_input_projections finds nothing.
         pytest.skip("mlx-vlm does not cache fused input projections")
 
     config = TextConfig(
@@ -1131,8 +1089,7 @@ def test_unfused_projection_matches_the_fused_one():
     fused = module(x)
     mx.eval(fused)
 
-    # A zero-initialized adapter leaves the output unchanged, but the fusion
-    # reads `.weight` off the projection and LoRALinear has none.
+    # A zero-initialized adapter leaves the output unchanged, but the fusion reads .weight off the projection and LoRALinear has none.
     from mlx_lm.tuner.lora import LoRALinear
     module.update_modules({"q_proj": LoRALinear.from_base(module.q_proj, r=4)})
     module._fused_ready = False

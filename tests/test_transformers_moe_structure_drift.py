@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Transformers MoE expert-container drift canary (#5410). Pins
-fused_3d vs module_list per tracked block. CPU only."""
+"""Transformers MoE expert-container drift canary (issue 5410): pins fused_3d vs module_list per tracked block; CPU only."""
 
 from __future__ import annotations
 

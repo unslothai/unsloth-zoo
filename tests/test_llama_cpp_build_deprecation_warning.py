@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A compiler `... is deprecated` warning must not fail a successful llama.cpp source build.
-
-GCC 16 (Fedora 44) warns `-Wdeprecated-enum-enum-conversion` in tools/mtmd (unsloth#5832).
-Runs a real cmake build of a stand-in checkout whose source triggers such a warning.
-"""
+"""A compiler 'is deprecated' warning must not fail a llama.cpp source build; GCC 16 warns -Wdeprecated-enum-enum-conversion in tools/mtmd (unsloth#5832)."""
 
 from __future__ import annotations
 

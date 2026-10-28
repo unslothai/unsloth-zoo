@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unslothai/unsloth#2390: merged_16bit must keep BitNet's online quantization_config.
-
-microsoft/bitnet-b1.58-2B-4T-bf16 ships bf16 master weights that AutoBitLinear ternarizes at
-runtime only while config.json carries `quant_method: bitnet, quantization_mode: online`.
-Stripping it (as for bnb) reloads the merge as a dense model: eval loss 9.64 vs 1.70 for base.
-"""
+"""unslothai/unsloth issue 2390: merged_16bit must keep the BitNet online quantization_config (quant_method bitnet,
+quantization_mode online), which AutoBitLinear needs to ternarize bf16 weights at runtime; stripping it reloads a
+dense model."""
 import json
 
 import pytest

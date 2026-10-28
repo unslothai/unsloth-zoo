@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""Buffer teardown must run gc.collect() before empty_cache(): a tensor only reachable through a reference cycle is
-still allocated when empty_cache() runs first, so its block stays cached until the next empty_cache()."""
+"""Buffer teardown must run gc.collect() before empty_cache(): a cycle-only tensor is still allocated then, so its block stays cached until the next empty_cache()."""
 
 from __future__ import annotations
 

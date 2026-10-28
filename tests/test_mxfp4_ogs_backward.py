@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Native MXFP4 gpt-oss experts (triton_kernels matmul_ogs) train: backward vs an fp32 reference on the
-exact dequantized weights."""
+"""Native MXFP4 gpt-oss experts (triton_kernels matmul_ogs) train; backward is checked against an fp32 reference on the exact dequantized weights."""
 
 import importlib
 import types

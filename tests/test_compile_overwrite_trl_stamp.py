@@ -14,27 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_COMPILE_OVERWRITE=0 must still recompile when TRL changes.
-
-The version stamp `create_new_function` writes into every generated file is
-[unsloth_zoo, unsloth, transformers, trl], but the escape hatch only ever
-compared index 2. TRL matters just as much: the generated RL trainers mirror
-the installed TRL config signature and import symbols straight out of
-`trl.trainer.<x>_trainer`. A cache built against TRL 0.25 and reused on TRL 1.9
-fails to import (`cannot import name 'AutoConfig' from
-'trl.trainer.grpo_trainer'`), Unsloth quietly falls back to TRL's own untouched
-trainer, and the user is back to
-
-    TypeError: GRPOConfig.__init__() got an unexpected keyword argument
-    'max_prompt_length'
-
-with none of Unsloth's patching applied.
-
-The counterweights are that the hatch has to keep working when nothing moved,
-or hand-edited caches stop being editable, and that a TRL bump must not reach
-caches TRL had no hand in: the combined model modules and the peft/torch
-forward patches are generated from transformers, peft and torch source.
-"""
+"""UNSLOTH_COMPILE_OVERWRITE=0 recompiles on a TRL change (stamp index 3, stale RL trainers fail to import) yet keeps
+caches when nothing moved; non-TRL caches are not regenerated"""
 
 import pytest
 
@@ -51,12 +32,8 @@ _OMIT = object()
 
 
 def _emit(tmp_path, monkeypatch, overwrite=_OMIT, model_location=TRL_LOCATION, source=PROBE_SOURCE):
-    """Run create_new_function against an isolated cache dir, return the path.
-
-    Leaving `overwrite` out exercises the default-argument call sites, which
-    read the cache down a different path than the explicit `overwrite=False`
-    ones and so have to be covered separately.
-    """
+    """Runs create_new_function on an isolated cache dir and returns the path; omitting overwrite exercises the
+    default-argument call sites, which take a different path than overwrite=False"""
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path))
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
     kwargs = {} if overwrite is _OMIT else {"overwrite": overwrite}
@@ -132,11 +109,7 @@ def test_the_warning_names_the_library_that_moved(tmp_path, monkeypatch, caplog)
 
 
 def test_a_default_overwrite_caller_is_invalidated_too(tmp_path, monkeypatch):
-    """The zoo's own peft and combined-module caches omit the argument.
-
-    Those callers never populated `file_source`, so the stamp comparison was
-    unreachable for them and the hatch kept the cache whatever had moved.
-    """
+    """The zoo's own peft and combined-module callers omit overwrite and never set file_source, so the stamp check was unreachable and stale caches were kept"""
     path = _emit(tmp_path, monkeypatch, overwrite=True)
     installed_trl = _stamp_lines(path)[3]
     _rewrite_trl_stamp(path, "0.0.1-stale")
@@ -199,11 +172,7 @@ def test_a_first_run_with_no_cache_still_writes_the_file(tmp_path, monkeypatch):
 
 
 def test_a_trl_bump_leaves_a_non_trl_cache_alone(tmp_path, monkeypatch):
-    """A combined model module cannot go stale because TRL moved.
-
-    It is generated from transformers source and never imports trl, so
-    regenerating it here would destroy the hand edit for nothing.
-    """
+    """A combined model module is generated from transformers source and never imports trl, so a TRL bump must not regenerate it and destroy hand edits"""
     path = _emit(tmp_path, monkeypatch, overwrite=True, model_location=NON_TRL_LOCATION)
     marker = "# hand edited, do not clobber\n"
     path.write_text(path.read_text() + marker)
@@ -229,12 +198,7 @@ def test_a_transformers_bump_still_reaches_a_non_trl_cache(tmp_path, monkeypatch
 
 
 def test_a_trl_body_is_invalidated_even_from_a_non_trl_location(tmp_path, monkeypatch):
-    """Backstop for a model_location that ever resolves outside trl.
-
-    Missing an invalidation is the expensive direction: the stale trainer fails
-    to import and Unsloth silently falls back to TRL's own untouched trainer.
-    Every generated trainer body carries the marker even if the path does not.
-    """
+    """Backstop for a model_location outside trl: a generated trainer body is still invalidated, since a missed one silently falls back to TRL's own trainer"""
     trl_body = 'def _unsloth_stamp_probe():\n    _tag_names = ["trl", "sft"]\n    return 1\n'
     path = _emit(
         tmp_path, monkeypatch, overwrite=True,
@@ -253,12 +217,8 @@ def test_a_trl_body_is_invalidated_even_from_a_non_trl_location(tmp_path, monkey
 
 
 def test_a_relocated_experimental_trainer_is_still_invalidated(tmp_path, monkeypatch):
-    """TRL moves trainers to trl.experimental, and rl.py follows them there.
-
-    On trl 0.25.1 BCO already resolves to trl.experimental.bco.bco_trainer, so
-    the dependency signal keys on the top-level package rather than a
-    `trl.trainer.` prefix, which would skip exactly the trainers that moved.
-    """
+    """TRL moves trainers to trl.experimental (BCO on trl 0.25.1), so the dependency signal keys on the top-level trl
+    package, not a trl.trainer. prefix that would skip them"""
     location = "trl.experimental.bco.bco_trainer"
     path = _emit(tmp_path, monkeypatch, overwrite=True, model_location=location)
     installed_trl = _stamp_lines(path)[3]

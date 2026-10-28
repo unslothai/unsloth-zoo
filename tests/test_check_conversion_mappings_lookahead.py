@@ -15,8 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""Old-layout bnb skip entries must match through Qwen2-VL's nested-lookahead conversion mapping
-(`^model(?!\\.(language_model|visual))`); else the 16-bit Linear is quantized and loading fails."""
+"""Old-layout bnb skip entries must match through Qwen2-VL's nested-lookahead conversion mapping; otherwise the 16-bit Linear is quantized and loading fails."""
 
 import pytest
 

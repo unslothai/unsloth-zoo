@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""``_resolve_decode_mode`` must be trace-safe: on sm_75 it is compiled as its own frame with a symbolic
-index, where ``torch.device("cuda", SymInt)`` raised under fullgraph. CPU only."""
+"""_resolve_decode_mode must be trace-safe: on sm_75 it compiles as its own frame with a symbolic index, where building
+torch.device('cuda', SymInt) raised under fullgraph; CPU only."""
 
 import pytest
 import torch

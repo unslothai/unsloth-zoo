@@ -150,8 +150,7 @@ def test_bf16_policy_times_bf16_when_cpu_flags_are_unreadable(monkeypatch):
 
 
 def test_bnb_cpu_4bit_grads_survive_eval_forward():
-    """bitsandbytes repacks Linear4bit weights for its AVX512-BF16 kernel on an eval no-grad forward,
-    after which backward is wrong. The CPU loader turns that repacking off; check grads after an eval."""
+    """bitsandbytes repacks Linear4bit weights for its AVX512-BF16 kernel on an eval no-grad forward, which breaks backward; the CPU loader disables that repacking."""
     from unsloth_zoo.cpu.runtime import cpu_bnb_4bit_supported
     if not cpu_bnb_4bit_supported():
         pytest.skip("no working bitsandbytes CPU 4-bit backend on this host")
@@ -309,8 +308,7 @@ def _tiny_llama():
 
 
 def test_deepcopied_models_run_their_own_weights():
-    """TRL reference models and merged copies are deepcopies; the patched forward and generate must
-    run the copy, not the model they were copied from."""
+    """TRL reference models and merged copies are deepcopies; patched forward and generate must run the copy's own weights, not the original's."""
     import copy
     from unsloth_zoo.cpu.loader import FastCPUModel
     from unsloth_zoo.cpu.ops import patch_chunked_causal_lm_loss
@@ -584,8 +582,8 @@ class _StubTokenizer:
 
 
 def test_reloaded_lora_checkpoint_is_trainable_and_keeps_its_weights(monkeypatch, tmp_path):
-    """FastLanguageModel.from_pretrained("lora_model") must give back a trainable PeftModel with the
-    saved adapter weights; get_peft_model on it keeps them; merged_16bit then writes a full model."""
+    """FastLanguageModel.from_pretrained on a saved LoRA dir must return a trainable PeftModel with its adapter weights;
+    get_peft_model keeps them and merged_16bit writes a full model."""
     import transformers
     from types import SimpleNamespace
     from peft import LoraConfig, PeftModel, get_peft_model
@@ -978,8 +976,8 @@ def test_cpu_fused_lm_head_single_pass_under_bf16_autocast_and_no_grad():
 
 
 def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
-    """TRL 1.x calls `_ChunkedLogProbFunction.apply` from SFTTrainer.compute_loss; CPU tensors (and a
-    missing kernel) take the torch path, accelerator tensors keep the kernel."""
+    """TRL 1.x calls _ChunkedLogProbFunction.apply from SFTTrainer.compute_loss; CPU tensors or a missing kernel take
+    the torch path, accelerator tensors keep the kernel."""
     from types import SimpleNamespace
     from trl.trainer import utils as trl_utils
     from unsloth_zoo.cpu import ops
@@ -1456,8 +1454,8 @@ print("CPU_SFT_OK", losses)
 
 
 def test_cpu_lora_sft_end_to_end(tmp_path):
-    """FastCPUModel + stock TRL SFTTrainer, as notebooks and Studio call them: on_model_resolved,
-    SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name; trains and saves the adapter."""
+    """FastCPUModel with stock TRL SFTTrainer as notebooks and Studio call them (on_model_resolved,
+    SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name); trains and saves the adapter."""
     import subprocess
     import sys
     from tokenizers import Tokenizer, models, pre_tokenizers

@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests unsloth_zoo.block_swap. The scheduling is driven through fake blocks so it
-runs on a CPU-only runner; the one case that needs a real Params4bit round trip
-skips without a GPU.
-
-The module is loaded from its file, not through the package: ``import unsloth_zoo``
-refuses to run without unsloth installed, and the conftest stubs torch.cuda for
-import, neither of which this module needs or should be exercised through."""
+"""Tests unsloth_zoo.block_swap with fake blocks on a CPU-only runner (one real Params4bit case skips without a GPU);
+loaded from file since import unsloth_zoo needs unsloth, and conftest stubs torch.cuda."""
 
 import importlib.util
 import os
@@ -770,9 +765,8 @@ def test_host_load_moves_a_layer_only_once_all_its_weights_landed():
 
 
 def _core_model_loading_or_none():
-    # Same lookup load_layers_to_host does. Not find_spec: on transformers 4 unsloth registers a
-    # stand-in transformers.core_model_loading with __spec__ None, and find_spec raises ValueError
-    # on it, which failed this test on the HF 4.57 leg while the code under test was fine.
+    # Same lookup load_layers_to_host uses, not find_spec: on transformers 4 unsloth registers a stand-in
+    # transformers.core_model_loading with __spec__ None, and find_spec raises ValueError on it.
     try:
         return importlib.import_module("transformers.core_model_loading")
     except ImportError:

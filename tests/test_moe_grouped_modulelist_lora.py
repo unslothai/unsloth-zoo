@@ -1,13 +1,6 @@
-"""Expert LoRA / QLoRA on the transformers<5 ModuleList grouped MoE path.
-
-Blocks: the real Qwen3-MoE / Mixtral / OLMoE sparse MoE blocks when transformers still stores
-experts as an nn.ModuleList (< 5), else synthetic twins running the same per-expert loop.
-Experts carry real PEFT LoRA (bf16 or bitsandbytes NF4 base). The grouped forward is checked
-against the original loop with a float64 oracle that shares the loop's routing: the grouped
-error must stay within a small multiple of the loop's own bf16 error, and a perturbed adapter
-must fail the same bound. Unsupported adapter states fall back to the loop (engagement 0), and
-a forced engagement shows each guard is load-bearing.
-"""
+"""Expert LoRA/QLoRA on the transformers<5 ModuleList grouped MoE path: grouped forward vs the per-expert loop and an
+fp64 oracle (error within a small multiple of the loop's bf16 error); a perturbed adapter must fail that bound;
+unsupported adapter states fall back to the loop"""
 import contextlib
 import copy
 import os
@@ -277,8 +270,7 @@ def measure(blk, model, autocast = False, seed = 1):
             rel(go, lo), engaged)
 
 
-# Grouped error vs the oracle may exceed the loop's own bf16 error by at most this factor
-# (plus a small absolute floor for near-exact cases); the perturbed control must exceed it.
+# Grouped error vs the oracle may exceed the loop's own bf16 error by at most RATIO, plus FLOOR for near-exact cases; the perturbed control must exceed it.
 RATIO, FLOOR = 2.0, 2e-3
 
 
@@ -360,8 +352,8 @@ def test_lora_parity_fp16():
 
 
 def test_resident_cache_rebuilt_after_merge_unmerge():
-    """UNSLOTH_MOE_GROUPED_CACHE stacks are dropped when the adapter state changes (a bf16 merge
-    edits the base in place; unmerge leaves bf16 rounding behind), so they track the live base."""
+    """UNSLOTH_MOE_GROUPED_CACHE stacks are dropped on adapter state changes: a bf16 merge edits the base in place and
+    unmerge leaves bf16 rounding behind, so the cache must track the live base"""
     model, blk = build("qwen3", base = "bf16", r = 8)
     enable(model, blk, cache = True)
     x = torch.randn(1, 64, H, device = DEV, dtype = DT)
@@ -506,7 +498,6 @@ def _decline_case(name):
         model, blk = build("qwen3", alpha_pattern = {"experts.2.up_proj": 64})
     elif name == "partial_wrap":
         model, blk = build("qwen3", targets = "all")
-        # unwrap expert 5's up_proj back to its base layer
         ex = blk.experts[5]
         ex.up_proj = ex.up_proj.base_layer
     elif name == "trainable_base":
@@ -617,8 +608,8 @@ def test_kill_switch_keeps_lora_blocks_on_the_loop():
 
 @pytest.mark.parametrize("wrapped", [True, False])
 def test_expert_bias_declines(wrapped, monkeypatch):
-    """A base bias on any expert projection keeps the loop (the grouped GEMMs add none), both at
-    patch time and per call; with the guard removed the grouped output drops the bias."""
+    """A base bias on any expert projection keeps the loop, at patch time and per call, since the grouped GEMMs add no
+    bias; with the guard removed the grouped output drops it"""
     model, blk = build("qwen3", targets = "all" if wrapped else "gate", seed = 7)
     if not wrapped:
         for ex in blk.experts:
@@ -640,8 +631,8 @@ def test_expert_bias_declines(wrapped, monkeypatch):
 
 
 def test_non_lora_peft_wrapper_declines(monkeypatch):
-    """A non-LoRA PEFT tuner (IA3) wraps the experts with base_layer and no lora_A: the block keeps
-    the loop; with the guard removed the grouped output drops the tuner's scaling."""
+    """A non-LoRA PEFT tuner (IA3) wraps experts with base_layer but no lora_A, so the block keeps the loop; without
+    that guard the grouped output drops the tuner's scaling"""
     from peft import IA3Config
     torch.manual_seed(7)
     _, g, u, d, _ = KINDS["qwen3"]
@@ -673,9 +664,9 @@ def test_non_lora_peft_wrapper_declines(monkeypatch):
 
 @pytest.mark.parametrize("fast", ["1", "0"])
 def test_signature_tracks_dtype_of_every_expert(fast, monkeypatch):
-    """Casting one non-first expert's adapter in place keeps every Parameter identity; the cached
-    verdict must still be re-checked (here: lora_A / lora_B dtypes now differ -> loop). Per-expert
-    Parameters (a stack has one dtype; see the stacked LoRA tests)."""
+    """An in-place cast of one non-first expert's adapter keeps Parameter identity, so the cached verdict must be
+    re-checked (mixed lora_A / lora_B dtypes fall back to the loop); per-expert Parameters only, as a stack has one
+    dtype"""
     monkeypatch.setenv("UNSLOTH_MOE_STACKED_LORA", "0")
     monkeypatch.setenv("UNSLOTH_MOE_FAST_READY", fast)
     model, blk = build("qwen3")

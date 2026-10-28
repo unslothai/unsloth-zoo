@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The weight-preprocessor registry is one dict across every loaded copy of moe_utils.
-
-get_forward_moe_backend() prefers the forward from the unsloth_compiled_cache copy, a
-separate module object that used to carry its own _WEIGHT_PREPROCESSORS, so a
-registration through the package never reached the forward that ran and a square expert
-weight fell back to layout inference (#849). These load a real copy and check both ways.
-"""
+"""The weight-preprocessor registry is one dict shared by every loaded moe_utils copy, so a registration reaches the unsloth_compiled_cache forward (ref 849)."""
 
 import os
 import sys
@@ -35,9 +29,7 @@ _CACHED_NAME = "unsloth_cached_moe_utils"
 
 @pytest.fixture(scope="module")
 def cache_copy(tmp_path_factory):
-    """moe_utils loaded from a scratch compile location, as the cache copy is.
-
-    One copy per module, as in a real process; any earlier one is set aside."""
+    """Loads moe_utils from a scratch compile location, as the cache copy is; any earlier moe_utils module is set aside, leaving one copy as in a real process."""
     patch = pytest.MonkeyPatch()
     patch.setenv("UNSLOTH_COMPILE_LOCATION", str(tmp_path_factory.mktemp("compile_location")))
     moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py")
@@ -57,8 +49,7 @@ def cache_copy(tmp_path_factory):
 
 
 def test_backend_resolves_to_the_cache_copy(cache_copy):
-    # The premise: it runs with the copy's globals, so a package-local registry is
-    # never consulted by it.
+    # Premise: the forward runs with the cache copy's globals, so a package-local registry is never consulted by it.
     forward = moe_utils.get_forward_moe_backend()
     assert forward is cache_copy.forward_moe_backend
     assert forward.__globals__ is cache_copy.__dict__
@@ -77,8 +68,7 @@ def test_package_registration_is_visible_from_the_cache_copy(cache_copy, capsys)
     moe_utils.register_weight_preprocessor(key, fn)
     try:
         assert cache_copy.get_weight_preprocessor(key) is fn
-        # Square, no experts_module: unregistered this guesses (#849), registered it
-        # dispatches before any shape logic.
+        # Square weight with no experts_module: unregistered it guesses the layout (ref 849); registered, it dispatches before any shape logic.
         out = cache_copy.preprocess_weight(torch.randn(4, 64, 64), "gate_up", 64, model_type=key)
         assert out is sentinel
         assert "ambiguous" not in capsys.readouterr().err.lower()
@@ -97,17 +87,11 @@ def test_cache_copy_registration_lands_in_the_package(cache_copy):
 
 
 def test_bare_moe_utils_copy_shares_the_registry(cache_copy, monkeypatch):
-    # A third copy: compiler.py puts the compile location on sys.path, so the bare
-    # `from moe_utils import ...` generated modules do is its own module too.
+    # A third copy: compiler.py puts the compile location on sys.path, so the bare `from moe_utils import ...` in generated modules is its own module too.
     monkeypatch.syspath_prepend(os.environ["UNSLOTH_COMPILE_LOCATION"])
-    # Restored by hand rather than through monkeypatch, and that is not a style
-    # choice. delitem() on a name that is absent records nothing, and by the time
-    # setitem() runs the import below has already put `bare` in sys.modules, so
-    # setitem records `bare` as the value to restore. The undo then REINSTATES it
-    # and every later test in the process resolves `moe_utils` to this copy --
-    # loaded from a tmp_path_factory directory that is deleted at session end.
-    # That is what broke test_compiled_cache_collective.py's recovery test, whose
-    # generated module does exactly the bare `from moe_utils import ...` above.
+    # Restore by hand, not monkeypatch: delitem on an absent name records nothing and setitem records the bare-import
+    # module, so undo reinstates a tmp-dir copy that every later test resolves moe_utils to; this broke
+    # test_compiled_cache_collective.py.
     previous = sys.modules.pop("moe_utils", None)
     key = "unit_test_registry_shared_arch_bare"
     fn = lambda weight, proj_type, hidden_dim: weight

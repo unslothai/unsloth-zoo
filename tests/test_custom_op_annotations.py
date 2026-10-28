@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch.library.custom_op functions live in modules without postponed annotations.
-
-Under `from __future__ import annotations` every annotation is a string, and the torch floor cannot
-read those: torch 2.4's infer_schema rejects a string `torch.Tensor` parameter outright, and torch
-2.6 evals the string in its own module, where `Tuple` does not exist. #1934's fused router hit both
-at import, which `temporary_patches/__init__.py` does unconditionally. Newer torch reads the strings
-fine, so only the floor lanes see it; this static check catches it on any torch.
-"""
+"""Static check that custom_op modules avoid postponed annotations; torch 2.4 rejects string Tensor params and torch 2.6
+evals string annotations where Tuple is undefined (issue 1934); this check catches it on any torch."""
 
 import ast
 import pathlib

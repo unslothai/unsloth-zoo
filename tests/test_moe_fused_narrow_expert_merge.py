@@ -14,15 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU regression for the fused-3D MoE merge on narrow-expert layouts.
-
-In a narrow-expert MoE (Gemma-4 26B-A4B, Qwen3.5-35B-A3B) gate_up is
-(2*intermediate, hidden) with 2*intermediate < hidden. The shape-magnitude
-heuristic assumes 2*intermediate > hidden, so it mislabels these as transposed
-and drops the LoRA delta. These tests feed a narrow-expert standard layout (no
-hint, and the WRONG is_transposed=True hint) and require the delta to still be
-applied -- the LoRA-dimension layout must win.
-"""
+"""CPU regression: fused-3D MoE LoRA merge must still apply the delta on narrow-expert layouts (2*intermediate <
+hidden), where the shape heuristic mislabels them transposed; the LoRA-dimension layout wins even with a wrong
+is_transposed=True hint"""
 
 from __future__ import annotations
 
@@ -58,13 +52,9 @@ def _build(hidden, intermediate, dtype=torch.float32):
 
 
 def _reference(W, A, B, alpha):
-    """The merged weight PEFT's own packing implies, restated from PEFT rather than imported.
-
-    `lora_A` is expert-slowest, so expert `e` is the contiguous row block `e*RANK:(e+1)*RANK`.
-    `lora_B` is expert-FASTEST: PEFT's ParamWrapper reshapes it to `(out, rank, num_experts)`,
-    so expert `e` is plane `e` of that reshape, not a contiguous column block. Written out
-    literally here so the expectation cannot become a mirror of the helper under test.
-    """
+    """PEFT's merged-weight packing written out independently: lora_A is expert-slowest (contiguous row block per
+    expert), lora_B expert-fastest (plane e of an (out, rank, num_experts) reshape); so the expectation cannot mirror
+    the helper under test"""
     out = W.clone().to(torch.float64)
     for e in range(NUM_EXPERTS):
         b_e = B.reshape(B.shape[0], RANK, NUM_EXPERTS)[:, :, e].to(torch.float64)

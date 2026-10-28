@@ -14,19 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The packed path's first-use verifier needs the same width dispatch.
-
-The packed call site dispatches on width, but the self-verify below it takes a
-second per-row forward and always sends it through the lm_head matmul helper.
-A forward that ignores UNSLOTH_RETURN_HIDDEN_STATES returns real vocab logits
-from both, so the verifier raises, the outer handler sets
-`_unsloth_seq_packing_grad_ok = False`, and packing is off for the rest of the
-run. Since the very first packed batch is always verified, the raw-logits
-branch would never be reachable.
-
-The block is exec'd from its own source against a model that returns real
-logits, so the test exercises the dispatch rather than reading it.
-"""
+"""The packed first-use verifier must dispatch on width too: a forward ignoring UNSLOTH_RETURN_HIDDEN_STATES returns
+vocab logits, which would set _unsloth_seq_packing_grad_ok False for the run; the block is exec'd."""
 
 import contextlib
 import inspect
@@ -50,13 +39,8 @@ PAD_ID, L, KEEP = 0, 8, 4
 
 
 class _Model(torch.nn.Module):
-    """`hidden_states = False` ignores UNSLOTH_RETURN_HIDDEN_STATES and returns
-    real [.., vocab] logits; True is the Unsloth generated forward.
-
-    Position-local, so the packed block-diagonal forward and the per-row
-    forward agree exactly and the verifier's own tolerance is not what is
-    under test here.
-    """
+    """hidden_states=False ignores UNSLOTH_RETURN_HIDDEN_STATES and returns real [.., vocab] logits; True is the Unsloth
+    generated forward; position-local, so packed and per-row forwards agree exactly."""
     def __init__(self, hidden_states = False):
         super().__init__()
         torch.manual_seed(0)
@@ -104,8 +88,7 @@ def _run_packed_block(hidden_states = False, need_entropy = False):
         "_refresh_lm_head": lambda: None, "_fp32_bind": lambda entropy = False: None, "lm_head_bias": None,
         "create_completion_attention_mask": rr.create_completion_attention_mask,
         "device_synchronize": lambda *a, **k: None,
-        # On: the block swallows its own exceptions, so its log line is the
-        # only record of why the packed path was rejected.
+        # Logging on (UNSLOTH_ENABLE_LOGGING): the block swallows its own exceptions, so its log line is the only record of why the packed path was rejected.
         "UNSLOTH_ENABLE_LOGGING": True,
         "trainer": SimpleNamespace(processing_class = SimpleNamespace(pad_token_id = PAD_ID)),
         "unwrapped_model": model,
@@ -141,11 +124,7 @@ def _rejected(ns, capsys):
 
 
 def _reference_logprobs(model, input_ids, max_left_pad):
-    """Per-row logprobs straight from the model, no packing involved.
-
-    Pads are dropped first, so the row's leading token has no predecessor and
-    stays 0, exactly as both the packed scatter and the padded loop leave it.
-    """
+    """Per-row logprobs with pads dropped first, so each row's leading token has no predecessor and stays 0, as in the packed scatter and the padded loop."""
     width = KEEP + max_left_pad
     out = torch.zeros(input_ids.shape[0], L)
     for row in range(input_ids.shape[0]):

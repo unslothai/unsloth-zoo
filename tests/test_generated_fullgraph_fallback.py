@@ -12,24 +12,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Generated `fullgraph = True` regions must not hard-fail on cache exhaustion.
-
-`patch_function` already routes its own fullgraph compiles through
-`_fall_back_to_eager_on_recompile_limit`, but the modules written into
-`unsloth_compiled_cache` decorate their functions directly and never reach it,
-so every one of those regions kept the failure the wrapper exists to remove.
-
-Gemma4 has ten. Its vision tower drives `Gemma4RMSNorm_forward` past the budget
-and training stops at step 0 with
-
-    FailOnRecompileLimitHit: Hard failure due to fullgraph=True
-
-from `unsloth_compiled_module_gemma4.py`. Measured on the real notebook path
-with `recompile_limit = 2`: released zoo and this branch without the fix both
-die at step 0; with it all 7 steps run and the loss falls 3.187 -> 1.202.
-Lowering the limit makes the failure reachable on any GPU -- a T4 gets there
-unaided, a B200 at the default never does.
-"""
+"""Generated fullgraph regions fall back to eager on recompile-limit hits, not FailOnRecompileLimitHit"""
 
 import os
 import re
@@ -47,37 +30,14 @@ pytestmark = pytest.mark.usefixtures("compile_enabled")
 
 ZOO = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 COMPILER = ZOO / "compiler.py"
-# Not just the compiler: the first pass scanned compiler.py alone and passed while
-# GRPO's own `grpo_compute_loss_slow` and `accumulate_chunk` stayed bare, and so fatal.
+# Scanning compiler.py alone missed grpo_compute_loss_slow and accumulate_chunk, left bare and fatal.
 FULLGRAPH_SITES = (COMPILER, ZOO / "rl_replacements.py",
                    ZOO / "temporary_patches" / "common.py")
 
 
 def _run_in_fresh_interpreter(body, compile_disable):
-    """Run `body` in a new interpreter with UNSLOTH_COMPILE_DISABLE pinned.
-
-    `None` clears the variable, a string sets it. unsloth's consolidated CI runs
-    this whole suite with `UNSLOTH_COMPILE_DISABLE=1` at the job level, so a test
-    that needs the other setting cannot get it from the ambient environment.
-
-    `common.py` reacts to that variable in two different ways, and only one of
-    them needs this:
-
-    * **Bound at import.** `torch_compile`, `_torch_compile` and
-      `_raw_torch_compile` are assigned under a module-level
-      `if UNSLOTH_COMPILE_DISABLE:` and are already `noop` function objects by
-      the time any test runs. Rebinding `common.UNSLOTH_COMPILE_DISABLE`
-      afterwards cannot undo that, so asserting on these three needs a fresh
-      interpreter.
-    * **Read per call.** `_maybe_compile` reads `UNSLOTH_COMPILE_DISABLE` and
-      `UNSLOTH_COMPILE_DISABLE_PARTIAL` in its own body on every call.
-      `monkeypatch.setattr` on the module attributes is enough there, and is
-      what the `_maybe_compile` tests below use; a subprocess would only buy a
-      five second package import per assertion.
-
-    A subprocess, not `importlib.reload`, because reloading the module
-    mid-session rebinds objects other tests in the same run already hold.
-    """
+    """Runs body in a fresh interpreter with UNSLOTH_COMPILE_DISABLE pinned (None clears); needed because CI sets it
+    ambiently and common binds these names at import; not importlib.reload, which rebinds objects other tests hold"""
     env = dict(os.environ)
     if compile_disable is None:
         env.pop("UNSLOTH_COMPILE_DISABLE", None)
@@ -101,11 +61,7 @@ def _run_with_compile_disabled(body):
 
 
 def test_no_emitter_writes_a_bare_fullgraph_compile():
-    """Every emitted `fullgraph` decorator has to carry the fallback.
-
-    Source-level because the alternative is generating a module per model, and
-    one missed emitter is how the cross-entropy template kept its bare decorator
-    after the first four were fixed."""
+    """Every emitted fullgraph decorator must carry the fallback; a source scan catches missed emitters"""
     bare = []
     for path in FULLGRAPH_SITES:
         for line in path.read_text().splitlines():
@@ -118,9 +74,7 @@ def test_no_emitter_writes_a_bare_fullgraph_compile():
 
 
 def test_the_grpo_loss_regions_are_wrapped():
-    """The two sites the first pass missed. `grpo_compute_loss_slow` is emitted
-    as source into the generated trainer, and `accumulate_chunk` is compiled at
-    call time inside UnslothEfficientGRPO's backward."""
+    """grpo_compute_loss_slow is emitted as source; accumulate_chunk is compiled at call time"""
     from unsloth_zoo.rl_replacements import RL_REPLACEMENTS
     slow = RL_REPLACEMENTS["grpo_compute_loss_slow"]
     assert "@torch_compile_with_fallback(" in slow
@@ -132,8 +86,7 @@ def test_the_grpo_loss_regions_are_wrapped():
 
 
 def test_maybe_compile_routes_fullgraph_through_the_fallback(monkeypatch):
-    """Three more fullgraph regions go through this one helper, so wiring it
-    covers them without touching each decorator."""
+    """Three more fullgraph regions go through _maybe_compile, so wiring the helper covers them all."""
     from unsloth_zoo.temporary_patches import common
     src = (ZOO / "temporary_patches" / "common.py").read_text()
     body = src.split("def _maybe_compile(", 1)[1].split("\ndef ", 1)[0]
@@ -141,8 +94,7 @@ def test_maybe_compile_routes_fullgraph_through_the_fallback(monkeypatch):
     # Without fullgraph Dynamo already falls back by itself, so leave it alone.
     assert 'if not kwargs.get("fullgraph"):' in body
 
-    # `_maybe_compile` reads both switches on every call, so pinning the module
-    # attributes is exact.
+    # _maybe_compile reads both switches per call, so monkeypatching the module attributes is exact.
     monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", False)
     monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE_PARTIAL", False)
 
@@ -151,11 +103,7 @@ def test_maybe_compile_routes_fullgraph_through_the_fallback(monkeypatch):
     wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
     assert hasattr(wrapped, "_unsloth_fallback_state")
 
-    # `_unsloth_fallback_state` is stamped on only under fullgraph, so its absence
-    # cannot single out a non-fullgraph compile that went through the helper anyway.
-    # Record the call instead: `_maybe_compile` imports the name off `utils` at call
-    # time, so rebinding the attribute is enough. Verified by replacing the guard's
-    # body with `pass`, which the `hasattr` form did not notice and this does.
+    # _unsloth_fallback_state is stamped only under fullgraph, so hasattr misses non-fullgraph calls.
     import unsloth_zoo.temporary_patches.utils as U
     calls = []
 
@@ -174,13 +122,7 @@ def test_maybe_compile_routes_fullgraph_through_the_fallback(monkeypatch):
 @pytest.mark.parametrize("flag", ["UNSLOTH_COMPILE_DISABLE",
                                   "UNSLOTH_COMPILE_DISABLE_PARTIAL"])
 def test_maybe_compile_is_a_no_op_when_compilation_is_switched_off(monkeypatch, flag):
-    """The other half of the switch. Turning compilation off has to drop the
-    fallback wrapper as well, or torch is still handed a fullgraph region by the
-    one helper three of them go through.
-
-    Monkeypatch, again because the read is per call: setting the variable in the
-    environment instead would do nothing to an already imported module, and a
-    subprocess would be spelling `False -> True` the long way round."""
+    """With compilation off the fallback wrapper must also drop, or torch still gets fullgraph regions."""
     from unsloth_zoo.temporary_patches import common
 
     monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", False)
@@ -194,14 +136,7 @@ def test_maybe_compile_is_a_no_op_when_compilation_is_switched_off(monkeypatch, 
 
 
 def test_the_alias_is_the_no_op_when_compilation_is_switched_off():
-    """The same half of the switch for the import-bound side.
-
-    Nothing else pins this: the source scan below only recognises the enabled
-    spelling, `functools.partial(...)`, so a disabled branch that bound bare
-    `torch.compile` would pass every other test in this file while handing
-    unsloth's CPU CI job the fullgraph regions it asked not to have. Needs a
-    fresh interpreter for the reason in `_run_in_fresh_interpreter`: these three
-    names are bound once, at import."""
+    """Import-bound aliases must be no-ops if compilation is off; bare torch.compile evades the scan"""
     _run_with_compile_disabled("""
         from unsloth_zoo.temporary_patches import common
 
@@ -226,8 +161,7 @@ def test_the_cross_entropy_template_carries_its_own_import():
 
 
 def test_fullgraph_false_is_returned_untouched():
-    """Dynamo already falls back on its own there, so a wrapper could never
-    fire and would only add a frame."""
+    """Without fullgraph Dynamo falls back itself, so a wrapper would never fire and only add a frame."""
     def f(x):
         return x + 1
 
@@ -243,8 +177,7 @@ def test_fullgraph_true_is_wrapped():
     assert hasattr(wrapped, "_unsloth_fallback_state")
 
 
-# aot_eager, not inductor: inductor shells out to a host compiler, so this raised
-# `Compiler: cl is not found` on the Windows runner, a statement about MSVC.
+# aot_eager, not inductor: inductor shells out to a host compiler (cl missing on Windows)
 _BACKEND = "aot_eager"
 
 
@@ -258,8 +191,7 @@ def test_the_wrapper_still_computes_the_right_answer():
 
 
 def test_the_helper_takes_a_backend_like_torch_compile_does():
-    """It forwards **compile_kwargs, and the generated decorators rely on that
-    for `dynamic` and `options`; a dropped kwarg would compile the wrong thing."""
+    """Forwards **compile_kwargs (generated decorators need dynamic and options); dropping one miscompiles"""
     import inspect
     sig = inspect.signature(torch_compile_with_fallback)
     assert any(p.kind is inspect.Parameter.VAR_KEYWORD
@@ -292,12 +224,7 @@ def test_the_eager_path_is_the_original_function():
 
 
 def _bare_fullgraph_alias_sites():
-    """Every `@torch_compile(... fullgraph = True)` in the package.
-
-    The scan above reads three named files and only recognises a literal
-    `torch.compile`, so the alias sites in gpt_oss / qwen3_vl_moe / gemma sat
-    outside it: `torch_compile` was `functools.partial(torch.compile)`, straight
-    to Dynamo, where cache exhaustion under fullgraph is fatal."""
+    """Finds torch_compile(fullgraph=True) alias sites the literal scan misses; cache exhaustion is fatal"""
     import re
     pattern = re.compile(r"\b_?torch_compile\s*\([^)]*fullgraph\s*=\s*True", re.S)
     found = []
@@ -314,20 +241,16 @@ def _bare_fullgraph_alias_sites():
 
 
 def test_the_alias_sites_exist_and_are_covered_by_the_alias_itself():
-    """They are not rewritten one by one; the alias routes them. Fixing ten
-    decorators leaves the eleventh, so `torch_compile` and `_torch_compile` go
-    through `_compile_or_fall_back`, which hands any fullgraph compile to
-    `torch_compile_with_fallback`."""
+    """Alias sites are covered by routing torch_compile and _torch_compile through _compile_or_fall_back"""
     sites = _bare_fullgraph_alias_sites()
     assert sites, "the scan found no alias sites at all; has the spelling changed?"
 
     common = (ZOO / "temporary_patches" / "common.py").read_text(encoding = "utf-8")
     assert "def _compile_or_fall_back" in common
     assert "torch_compile_with_fallback" in common
-    # By line, not by substring: `_torch_compile = ...` is a substring of
-    # `_raw_torch_compile = ...`, which deliberately DOES partial torch.compile
-    # (compile_with_eager_fallback applies the wrapper itself, and wrapping a wrapper
-    # leaves the inner one swallowing the exhaustion).
+    # Match by line, not substring: `_torch_compile = ` occurs inside `_raw_torch_compile = `, which deliberately does
+    # partial torch.compile; compile_with_eager_fallback applies that wrapper itself, and wrapping a wrapper leaves the
+    # inner one swallowing exhaustion.
     lines = common.split("\n")
     for name in ("torch_compile", "_torch_compile"):
         starts = [i for i, ln in enumerate(lines)
@@ -365,8 +288,7 @@ def test_the_alias_routes_a_fullgraph_compile_through_the_fallback():
 
 
 def test_the_alias_still_accepts_a_function_positionally():
-    """`prepare = torch_compile(prepare, fullgraph = True)` is how gemma.py and
-    gpt_oss.py call it, and a kwargs-only helper would TypeError there."""
+    """torch_compile takes fn positionally (gemma.py, gpt_oss.py); kwargs-only would TypeError"""
     from unsloth_zoo.temporary_patches import common as C
 
     def _f(x): return x * 2
@@ -376,19 +298,8 @@ def test_the_alias_still_accepts_a_function_positionally():
 
 
 def test_a_non_fullgraph_compile_is_left_alone():
-    """Dynamo already falls back by itself without fullgraph, so wrapping there
-    would add a layer that can never fire.
-
-    In a fresh interpreter, because in process this asserted nothing whenever
-    the switch was off, which is the position unsloth's Core job runs the whole
-    suite in: the alias is `noop` there, so the helper is unreachable and the
-    recorder stays at zero however the routing is written. Removing the
-    `if not kwargs.get("fullgraph")` guard from `_compile_or_fall_back` left the
-    in-process form green under `UNSLOTH_COMPILE_DISABLE=1` and `partial`.
-
-    `_torch_compile` comes along for free here; nothing else ran it. A positive
-    control first, or every assertion below passes the moment the recorder
-    stops recording."""
+    """Non-fullgraph compiles skip the wrapper; run in a fresh interpreter (in-process it passes vacuously when compile
+    is off) and take a positive control first, or every assertion passes once the recorder stops recording"""
     _run_with_compile_enabled("""
         import unsloth_zoo.temporary_patches.utils as U
         calls = []

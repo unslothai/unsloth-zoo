@@ -2,12 +2,9 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""saved_tensors_hooks offload for torch's non-reentrant checkpoint.
-
-Gradients must match plain non-reentrant checkpointing bit for bit in every mode: side
-stream pinned copies, unsloth_stream (keep last N on device, reload i-1 ahead), and the
-pageable fallback once the pinned cap is hit. The engagement counters prove each path ran.
-"""
+"""saved_tensors_hooks offload for non-reentrant checkpoint: grads must match plain checkpointing bit for bit in
+side-stream pinned, unsloth_stream (keep last N on device, reload i-1 ahead) and the pageable fallback past the
+pinned cap; engagement counters prove each path ran."""
 import functools
 import weakref
 
@@ -96,8 +93,7 @@ def test_gradients_match_plain_checkpoint(gc_module, monkeypatch, mode):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_side_stream_host_copy_is_pinned(gc_module):
-    # Bytes are charged to the pinned cap only for a destination that really is pinned:
-    # a non_blocking CUDA to CPU .to() allocates it from the pinned host allocator.
+    # Bytes are charged to the pinned cap only for a destination that is really pinned: non_blocking CUDA-to-CPU .to() allocates from the pinned host allocator.
     offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
     x = torch.randn(1024, 1024, device = "cuda", requires_grad = True)
     record = offloader.pack(x)
@@ -171,8 +167,8 @@ def test_stream_prefetch_skips_inputs_already_unpacked(gc_module, monkeypatch, k
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 @pytest.mark.parametrize("keep_last", ["0", "1"])
 def test_stream_prefetch_reloads_every_input_of_the_previous_checkpoint(gc_module, monkeypatch, keep_last):
-    # Each unpack queues the newest input still on the host, so both inputs of checkpoint i-1
-    # are reloaded while checkpoint i recomputes; only the last checkpoint's inputs load cold.
+    # Each unpack queues the newest host-resident input, so both inputs of checkpoint i-1 reload while checkpoint i
+    # recomputes; only the last checkpoint loads cold.
     monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", keep_last)
     torch.manual_seed(0)
     layers = [_TwoInputLayer().cuda() for _ in range(5)]
@@ -213,8 +209,7 @@ def _max_prefetched_waiting(offloader, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_stream_prefetch_never_reaches_past_the_previous_checkpoint(gc_module, monkeypatch):
-    # A three input checkpoint after single input ones: its three unpacks may only reload the
-    # one input of the checkpoint before it, not walk on into older checkpoints.
+    # A three-input checkpoint after single-input ones: its unpacks may reload only the one input of the checkpoint before, never older checkpoints.
     monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", "0")
     torch.manual_seed(0)
     singles = [torch.nn.Linear(256, 256).cuda() for _ in range(3)]
@@ -236,8 +231,7 @@ def test_stream_prefetch_never_reaches_past_the_previous_checkpoint(gc_module, m
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_stream_prefetch_is_one_step_when_hooks_span_every_checkpoint(gc_module, monkeypatch):
-    # One hooks() entry around all checkpoints gives no checkpoint boundaries: keep to index - 1,
-    # so at most the next reload is queued while one still waits, however deep the stack is.
+    # One hooks() entry spanning all checkpoints has no boundaries, so prefetch stays at index - 1: at most one reload waits ahead, however deep the stack.
     monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", "0")
     torch.manual_seed(0)
     layers = [_TwoInputLayer().cuda() for _ in range(8)]
@@ -255,8 +249,8 @@ def test_stream_prefetch_is_one_step_when_hooks_span_every_checkpoint(gc_module,
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_low_ram_growth_fallback_frees_the_old_pinned_block(gc_module, monkeypatch):
-    # One local rank, host RAM short: the grown slot goes pageable and its old pinned block must
-    # be returned to the OS, not left cached in torch's host allocator beside the pageable copy.
+    # One local rank, host RAM short: the grown slot goes pageable and its old pinned block must go back to the OS, not
+    # sit in torch's host allocator beside the pageable copy.
     monkeypatch.setattr(gc_module, "PINNED_MEMORY_AVAILABLE", True, raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
     monkeypatch.setattr(gc_module, "GC_PINNED_CAP", gc_module._PIN_PER_BLOCK, raising = False)
@@ -294,8 +288,7 @@ def _forward_peak_active(hooks, n_layers = 12):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_single_gpu_default_copies_on_the_compute_stream(gc_module, monkeypatch):
-    # Copying on the compute stream, like the saved_tensors_hooks Unsloth used before, frees
-    # each block in stream order, so offloading adds no VRAM over that baseline.
+    # Copying on the compute stream frees each block in stream order, so offloading adds no VRAM over the earlier saved_tensors_hooks baseline.
     monkeypatch.delenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", raising = False)
     monkeypatch.setattr(gc_module, "is_distributed", lambda: False)
     offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
@@ -324,9 +317,9 @@ def test_distributed_default_bounds_inflight_copies(gc_module, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_capped_pinning_survives_blocks_freed_after_async_copies(gc_module, monkeypatch):
-    # unpack's non_blocking H2D leaves each freed host block in torch's event queue, and
-    # host_memory_stats() does not drain it, so the cached blocks read as not free. Once the
-    # cap was reached, every later layer used to go pageable for the rest of training.
+    # unpack's non_blocking H2D leaves each freed host block in torch's event queue; host_memory_stats() does not drain
+    # it, so blocks read as not free and, once the cap was reached, every later layer went pageable for the rest of
+    # training.
     if not hasattr(torch.cuda, "host_memory_stats"):
         pytest.skip("torch < 2.7 has no host_memory_stats")
     torch.cuda.synchronize()
@@ -356,8 +349,7 @@ def test_capped_pinning_survives_blocks_freed_after_async_copies(gc_module, monk
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_a_probe_that_pins_a_new_block_releases_it(gc_module):
-    # Another pinned user holds the cached block, so the probe pins a fresh one: it must not stay
-    # cached past the cap.
+    # Another pinned user holds the cached block, so the probe pins a fresh one that must not stay cached past the cap.
     if not hasattr(torch.cuda, "host_memory_stats"):
         pytest.skip("torch < 2.7 has no host_memory_stats")
     torch.cuda.synchronize()
@@ -392,9 +384,9 @@ def test_a_probe_failure_other_than_oom_is_raised(gc_module, monkeypatch):
     assert gc_module._host_cache_reuses_block(1 << 20) is False
 
 
-# Caching allocator model on CPU: a block freed on its allocation stream is reusable there at
-# once, so a use on another stream is safe only if, at free time, the allocation stream waited on
-# it or record_stream() named a stream that did (record_stream ignores the allocation stream).
+# CPU caching allocator: a block freed on its allocation stream is reusable at once, so other-stream use is safe only
+# if, at free time, the allocation stream waited on it or record_stream() named a stream that did; record_stream ignores
+# the allocation stream.
 class _Stream:
     def __init__(self, name): self.name, self.waited, self.ops = name, [], []
     def wait_event(self, event): self.waited.append(event)
@@ -417,8 +409,7 @@ class _Source:
 
     @staticmethod
     def _free(alloc_stream, uses, guards, freed):
-        # Every guard (a copy's event, or work queued on a consumer stream) must be ordered before
-        # reuse on the allocation stream.
+        # Every guard (a copy's event, or work queued on a consumer stream) must be ordered before reuse on the allocation stream.
         for guard in guards:
             if isinstance(guard, _Stream):
                 freed.append(guard is alloc_stream or guard in uses)

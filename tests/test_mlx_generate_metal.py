@@ -9,8 +9,7 @@ try:
 except Exception:  # module-level nn.Module subclasses below need mlx to exist
     pytest.skip("requires mlx", allow_module_level=True)
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
-# Importable is not real: a sibling module installs the mlx simulation process-wide while it is
-# collected, so these can import mlx against the shim (see tests/test_mlx_attention_metal.py).
+# Imports can succeed against the shim installed during collection (test_mlx_attention_metal.py).
 from mlx_simulation import mlx_is_simulated  # noqa: E402
 
 _HAS_REAL_MLX = not mlx_is_simulated()
@@ -26,8 +25,7 @@ def _nax_available():
     return nax.nax_available()
 
 
-# The NAX kernels need MetalPerformancePrimitives tensor ops: macOS 15 cannot build them and
-# paravirtual or pre-M5 GPUs cannot load them, so they run only where the product would route.
+# NAX needs MetalPerformancePrimitives: not built on macOS 15, not loaded on paravirtual/pre-M5 GPUs.
 nax_only = pytest.mark.skipif(not _nax_available(), reason="requires an Apple GPU with neural accelerators")
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 VLM_MODEL = "mlx-community/FastVLM-0.5B-bf16"
@@ -231,8 +229,7 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     )
     model, processor = load(VLM_MODEL)
     model._is_vlm_model = True
-    # One prompt, several images: many processors reject unequal prompt lengths,
-    # so batching is exercised through the images.
+    # One prompt, several images: many processors reject unequal prompt lengths, so batching is exercised through the images.
     prompt = apply_chat_template(processor, model.config, "Name the colour.", num_images=1)
     requests = [
         GenerationRequest(prompt=prompt, image=Image.new("RGB", size, colour), max_tokens=4)
@@ -245,8 +242,7 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
         assert result.token_ids
         assert result.logprobs is None or len(result.logprobs) == len(result.token_ids)
         assert result.finish_reason in ("stop", "length")
-    # Against upstream's own sequential decoding, not just against ourselves:
-    # this is what proves the bypassed preprocessing agrees with mlx-vlm.
+    # Upstream mlx-vlm's own sequential decoding; proves the bypassed preprocessing agrees with it.
     from mlx_vlm import stream_generate
     from mlx_lm.sample_utils import make_sampler
     events = [event for event in stream_generate(
@@ -265,8 +261,7 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     chunked = generate_batch(model, processor, requests, defaults=GenerationDefaults(
         max_tokens=4, prefill_batch_size=1, completion_batch_size=1))
     assert [item.token_ids for item in chunked] == [item.token_ids for item in results]
-    # Concurrent sequences must not share a detokenizer buffer, so text must
-    # match too, not just ids.
+    # Concurrent sequences must not share a detokenizer buffer, so text must match too, not just ids.
     assert [item.text for item in chunked] == [item.text for item in results]
     assert all(r.text == "" or not r.text.startswith(results[0].text + results[1].text) for r in results)  # noqa: E501
 
@@ -388,8 +383,7 @@ def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
     cold_state = state(make_prompt_cache(lm))
     (cold,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=cold_state))
     length, kept = cold.prompt_token_count, cold_state.kept
-    # Checkpoints land only where a prefill chunk ends: the 2048 grid, and from mlx-vlm 0.7.0,
-    # which chunks a tail shorter than a step, the held-back last token.
+    # Checkpoints land at prefill chunk ends: 2048 grid, and the held-back last token from mlx-vlm 0.7.0.
     held_back = [length - 1] if Version(mlx_vlm.__version__) >= Version("0.7.0") else []
     assert sorted(kept) == [*range(2048, length - 1, 2048), *held_back]
     # Alone, as the cold row decoded: batched decode depends on what decodes beside a row.
@@ -538,8 +532,7 @@ def test_vlm_stream_turboquant_rows_quantize_their_own_cache_as_a_single_decode_
     assert isinstance(cold_state.kept[2048][0], TurboQuantKVCache)
     (warm,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=_RowCacheState(_own_copy(cold_state.kept[2048]))))
     assert (warm.token_ids, warm.logprobs, warm.cached_token_count) == (cold.token_ids, cold.logprobs, 2048)
-    # A cold row opens float but decodes quantized, so it joins the resumed one; so does a
-    # one-token row, whose only forward is its last.
+    # A cold row opens float but decodes quantized, so it joins the resumed one; so does a one-token row.
     rows = run(GenerationRequest(prompt=prompt, prompt_cache_state=_RowCacheState(_own_copy(cold_state.kept[2048]))),
                GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(fresh())),
                GenerationRequest(prompt="Hi", prompt_cache_state=_RowCacheState(fresh())))
@@ -652,8 +645,7 @@ def test_vlm_stream_row_left_alone_decodes_bitwise_without_the_single_row_shortc
             # One step runs both paths to compare them; the batch stays on its own path after that.
             assert 0 < scoped_extracted < stock_extracted
     if not disagreement:
-        # generate_batch enters the scope too. It batches only prompts of one length, so the
-        # story runs twice and the batch shrinks to one row when the shorter copy ends.
+        # generate_batch enters the scope too; equal-length prompts only, so the batch shrinks as copies end.
         rows, short_story = {}, GenerationRequest(prompt=story.prompt, max_tokens=6)
         for name, single_row_scope in (("stock", stock_scope), ("scoped", scope)):
             monkeypatch.setattr(engine, "single_row_batch_decode", single_row_scope)
@@ -811,8 +803,7 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
 
 @metal_only
 def test_a_penalised_row_answers_the_same_batched_and_alone():
-    """A row shown its whole prompt is penalised against text it never sees alone, and the
-    two prompts differ in length, so one offset cannot serve both rows."""
+    """Penalised on the whole prompt, which a row never sees alone; differing lengths rule out one offset."""
     from mlx_lm import load, stream_generate
     from mlx_lm.sample_utils import make_logits_processors, make_sampler
     from unsloth_zoo.mlx.generate import (
@@ -961,8 +952,7 @@ def test_residual_norm_matches_reduction_rounding_and_scale(dtype):
         norm = nn.RMSNorm(width, eps = 1e-6)
         norm.weight = mx.random.normal((width,)).astype(dtype)
         norm.eval()
-        # The last entry spreads magnitudes within the row rather than scaling the whole
-        # row. Uniform rows agree bitwise even if the squares accumulate without fma.
+        # The last entry spreads magnitudes within each row; uniform rows agree bitwise even without fma.
         for magnitude in (0.01, 1., 10., None):
             spread = mx.power(10., mx.random.uniform(-4, 4, (1, 1, width)))
             x = (mx.random.normal((1, 1, width)) * (spread if magnitude is None else magnitude)).astype(dtype)
@@ -1051,9 +1041,7 @@ def test_residual_norm_respects_an_existing_native_patch(monkeypatch):
 
 
 def test_residual_norm_scope_tolerates_a_stand_in_without_training(monkeypatch):
-    """named_modules() yields whatever the generation API was handed, including the plain
-    stand-ins it deliberately tolerates. Reading `.training` on one raises out of generation
-    instead of skipping it, which is why the decode-fusion scope checks the type first."""
+    """Reading `.training` on a plain stand-in from named_modules() raises; the scope checks type first."""
     from unsloth_zoo.mlx import inference as decode
 
     class _StandIn:
@@ -2201,10 +2189,9 @@ def test_nax_int8_prefill_partial_is_exact(bits, group_size):
     import numpy as np
     from unsloth_zoo.mlx import nax
 
-    # Integer activations peaking at 127 per activation group (at most 64 wide) quantize to themselves,
-    # scaled by 1 or 2 per row and activation group; zero weights under the peaks and two +-1 entries
-    # per row keep every output (at most 2 * 2 * 510) exact in float16. Code sums of 379 to 383 per
-    # activation group need both bfloat16 halves, and 17 quant groups span a full and a partial block.
+    # Integer activations peak at 127 per activation group (at most 64 wide) and quantize exactly; outputs exact in
+    # float16 (at most 2 * 2 * 510); code sums of 379 to 383 need bfloat16 halves; 17 quant groups span a full and a
+    # partial block.
     rng = np.random.default_rng(bits)
     E, N, K, G, span = 3, 320, 17 * group_size, 17, min(group_size, 64)
     peaks = (np.arange(0, K, span)[:, None] + [0, 11, 22]).ravel()
@@ -2298,8 +2285,8 @@ def test_nax_int8_prefill_routes_dense_and_expert_calls_from_their_row_minimum(m
             assert (type(model.moe).__name__ != "SwitchGLU") is packed
             for rows, native in natives.items():
                 routed = run(rows)
-                # Dense projections route from 64 rows; the 2 * rows expert rows sort from 32 and route from
-                # 30 per expert (240), or 20 (160) where the packed gate and up quantize each token once.
+                # Dense projections route from 64 rows; the 2 * rows expert rows sort from 32 and route from 30 per
+                # expert (240), or 20 (160) where packed gate and up quantize each token once.
                 T = 2 * rows
                 down = [("gather", T, 256)] * (T >= 240)
                 unpacked = [("gather", T, 128)] * 2 * (T >= 240)

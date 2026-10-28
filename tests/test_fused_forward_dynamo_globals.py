@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The rewritten fused forward compiles on every torch version.
-
-The rewritten forward runs in a copy of the modeling module globals plus EMPTY_LOGITS, os and the
-fused helpers. Dynamo before torch 2.14 resolves an inlined function's globals through
-sys.modules[__name__] whenever __name__ is set, so torch.compile of the model failed with
-"modeling_qwen3 has no attribute EMPTY_LOGITS" (or "os") on torch 2.13.
-"""
+"""Rewritten forward uses a globals copy: Dynamo before torch 2.14 failed on missing EMPTY_LOGITS/os."""
 
 import inspect
 import os

@@ -1,5 +1,4 @@
-"""The bnb4bit grouped-mm dispatcher follows the pin-vs-recompute policy, biased to
-recompute for the 4-bit base; it never pre-dequantizes and then re-holds the stack."""
+"""Tests the bnb4bit grouped-mm dispatcher's pin-vs-recompute policy, biased to recompute for the 4-bit base; it never pre-dequantizes and then re-holds the stack."""
 import os
 
 import pytest
@@ -166,9 +165,8 @@ def test_env_override_forces_pin(monkeypatch):
 
 
 def test_pre_dequantized_dense_is_never_recomputed(monkeypatch):
-    # The invariant behind the swap path: when the policy says pin, a pre-dequantized
-    # dense stack must not be scheduled for a backward recompute (which would re-hold it
-    # for no memory benefit).
+    # Invariant: when the policy says pin, a pre-dequantized dense stack is never scheduled for backward recompute,
+    # which would re-hold it with no memory benefit.
     monkeypatch.setattr(mu, "_base_is_recomputable", lambda src, dtype = None: True)
     dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)  # requires_grad False
     monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "0")
@@ -179,8 +177,7 @@ def test_pre_dequantized_dense_is_never_recomputed(monkeypatch):
 
 
 def test_source_pins_large_dequant_classifies_4bit_only(monkeypatch):
-    # Only a frozen bnb 4-bit expert reports a "large dequant" pinned form; a plain
-    # dense base pins its own storage, so it is not flagged.
+    # Only a frozen bnb 4-bit expert reports the large-dequant pinned form; a plain dense base pins its own storage, so it is not flagged.
     q = _quantized_expert_param()
     dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)
     assert mu._source_pins_large_dequant(q) is True

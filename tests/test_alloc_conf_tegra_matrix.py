@@ -1,19 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""What ``import unsloth_zoo`` leaves in the allocator variables on a Tegra board
-(unslothai/unsloth#2401: the CUDA VMM calls behind ``expandable_segments:True`` fail on a
-Jetson AGX Orin, so a 1MiB buffer died with ``CUDA driver error: out of memory`` on a board
-with ~50GB free).
-
-Each case imports in a FRESH SUBPROCESS: the allocator block is process-global and cannot be
-re-run in-process. The child loads the real detector standalone and points it at a temporary
-Jetson device tree, so nothing in the product is stubbed and no Tegra hardware is needed.
-
-Imports nothing from the module under test, so it still collects against a checkout that
-predates it and fails on the behaviour rather than on an ImportError. Linux only: on Windows
-the same import takes the WSL branch, and unsloth-zoo declares no torch on Apple Silicon.
-"""
+"""Allocator env left by import unsloth_zoo on Tegra (unslothai/unsloth issue 2401: expandable_segments:True fails on
+Jetson AGX Orin); fresh subprocess per case since the allocator is process-global; imports nothing under test so it
+collects on older checkouts; Linux only, Windows takes WSL branch."""
 
 from __future__ import annotations
 

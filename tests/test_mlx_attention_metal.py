@@ -27,22 +27,8 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 pytest.importorskip("mlx_lm")
 
-# "Is mlx importable" is not "is this real mlx", and this file needs the second.
-# simulate_mlx_on_torch() installs process-wide and one sibling module calls it
-# while being IMPORTED (test_mlx_arrays_cache_advance.py, which sorts just before
-# this one), so collection alone is enough to make the importorskip above succeed
-# against the shim. These tests then run against a simulation that refuses the
-# operation they are built on:
-#
-#     NotImplementedError: mlx-shim: mx.quantize is not implemented in the
-#     simulation. Use real MLX on a Mac to produce quantized weights.
-#
-# 40 failures, every one of them on a box that simply has no MLX. That is the
-# trap test_mlx_real_detection_is_order_independent.py documents; it guards the
-# find_spec spellings of it, and importorskip is a third spelling that lies the
-# same way. Alone this file skips and passes, which is why it stayed hidden here
-# while failing unsloth's Core job, the one place that runs this suite as a
-# whole directory rather than a curated list.
+# Importable is not real MLX: test_mlx_arrays_cache_advance.py calls simulate_mlx_on_torch() on import, so importorskip
+# passes and 40 tests fail on boxes with no MLX; check mlx_is_simulated().
 from mlx_simulation import mlx_is_simulated  # noqa: E402
 
 if mlx_is_simulated():
@@ -306,13 +292,9 @@ def test_fused_kernel_exists_matches_what_the_installed_mlx_fuses(monkeypatch, D
 @pytest.mark.parametrize("runtime", ["mlx_lm", "mlx_vlm"])
 def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, bits, group_size,
                                                                  last):
-    """mlx-vlm runs batched, as its array masks are; those masks also drop every seventh key.
-
-    Both array masks carry a leading 1: `mlx_vlm<0.6.5` -- which is what `mlx-vlm<=0.7.9` against
-    unsloth's `transformers<=5.5.0` resolves to -- broadcasts a `[B, 1, L, S]` mask against its own
-    5-D grouped scores only when B is 1. A per-row batched mask above the tie is covered by
-    `test_a_batched_mask_the_pinned_runtime_cannot_broadcast` below.
-    """
+    """mlx-vlm runs batched and its array masks drop every seventh key; mlx_vlm<0.6.5 (which mlx-vlm<=0.7.9 with
+    unsloth's transformers<=5.5.0 resolves to) broadcasts a [B, 1, L, S] mask only when B is 1; see
+    test_a_batched_mask_the_pinned_runtime_cannot_broadcast."""
     unfused = _runtime(runtime)
     B, HQ, HKV, S, D = (2 if runtime == "mlx_vlm" else 1), 32, 8, 640, 128
     cache = _cache(B, HKV, S, D, bits, group_size)
@@ -339,9 +321,9 @@ def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, 
 
 @pytest.mark.parametrize("runtime", ["mlx_lm", "mlx_vlm"])
 def test_a_batched_mask_the_pinned_runtime_cannot_broadcast(runtime):
-    """A per-row `[B, 1, L, S]` mask over grouped heads, which above the tie no longer reaches the
-    runtime. `mlx_lm` 0.31.3 and `mlx_vlm` 0.6.4 raise on it (mlx_lm 0.32 broadcasts it); the fused kernel takes it as
-    given, so gate on a float32 reference rather than on their answer."""
+    """Above the tie, a per-row [B, 1, L, S] mask over grouped heads no longer reaches the runtime; mlx_lm 0.31.3 and
+    mlx_vlm 0.6.4 raise on it (mlx_lm 0.32 broadcasts it), while the fused kernel takes it as given, so gate on a
+    float32 reference rather than their answer."""
     unfused = _runtime(runtime)
     B, HQ, HKV, S, L, D, bits = 2, 32, 8, 640, 256, 128, 4
     cache = _cache(B, HKV, S, D, bits)
@@ -406,8 +388,8 @@ def test_the_result_dtype_is_the_one_the_runtime_returns(query_dtype, key_dtype,
 
 @pytest.mark.parametrize("mask_dtype", [mx.bfloat16, mx.float16, mx.float32])
 def test_an_additive_mask_the_fused_kernel_would_reject_stays_on_the_runtime(mask_dtype):
-    """`scores += mask` widens the runtime's result, where the fused kernel refuses any mask that
-    does not promote to its output. Whichever it is, the caller must get the runtime's answer."""
+    """scores += mask widens the runtime's result, where the fused kernel refuses any mask that does not promote to its
+    output; whichever happens, the caller must get the runtime's answer."""
     unfused = _runtime("mlx_lm")
     B, HQ, HKV, S, L, D, bits = 1, 32, 8, 256, 128, 128, 4
     cache = _cache(B, HKV, S, D, bits)
@@ -469,8 +451,7 @@ def test_installing_the_patch_redirects_both_runtimes():
 
 
 def test_every_model_load_path_installs_the_patch():
-    """Checked as a shape: every model-returning `return` in `from_pretrained` goes through
-    `_finish_load`, since reaching each branch needs repositories this suite lacks."""
+    """Checked as a shape: every model-returning return in from_pretrained goes through _finish_load, since reaching each branch needs repositories this suite lacks."""
     import ast
     import inspect
 

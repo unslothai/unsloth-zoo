@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Rollout logprobs as pi_old (unsloth UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1) against float64 oracles.
-
-verl rollout_correction bypass_mode with loss_type="ppo_clip" (verl/trainer/ppo/rollout_corr_helper.py
-apply_bypass_mode, core_algos.py compute_policy_loss_bypass_mode): old_log_prob = rollout_log_prob, then
-compute_policy_loss_vanilla with no IS weight (would be double-counting):
-    r = exp(log_prob - rollout_log_prob)
-    l = max(-A r, -A clip(r, 1 - eps_low, 1 + eps_high)), and for A < 0 the dual clip min(l, -A c), c = 3.0
-vime (--use-rollout-logprobs, ppo_utils.compute_policy_loss with eps_clip_c) is the same per-token loss.
-TRL's delta (clamp(r, max = delta) on the unclipped term) equals that dual clip for delta > 1 + eps_high,
-which unsloth sets to verl's c = 3.0 when delta is unset. Bypass mismatch metrics are verl's
-compute_offpolicy_metrics with the current log_prob in place of old_log_prob: k1 = rollout - current,
-k3 = r - 1 - log r, ESS = (sum r)^2 / (N sum r^2).
-"""
+"""Rollout logprobs as pi_old (UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1) vs float64 oracles of verl bypass ppo_clip with
+no IS weight, dual clip c=3.0 (unsloth sets TRL delta to c=3.0 when unset); bypass mismatch metrics are verl's k1, k3
+and ESS with the current logp in place of old."""
 
 import collections
 import types
@@ -325,9 +315,8 @@ def test_accumulated_loss_without_the_marker_is_unchanged(monkeypatch):
 
 
 def test_accumulated_loss_reports_the_clipped_ratio(monkeypatch):
-    # r (and the ESS built on it) is the loss ratio coef_1, like verl's SAFETY_BOUND clamped IS
-    # weights; |log r| and the k1 / k3 metrics use the raw new - rollout, like verl
-    # compute_offpolicy_metrics, so a gap past the [-20, 20] loss clamp is not under-reported.
+    # r and its ESS are the loss ratio coef_1 (verl SAFETY_BOUND-clamped), but |log r| and the k1/k3 metrics use raw new
+    # - rollout, so gaps past the [-20, 20] loss clamp are not under-reported.
     values = torch.tensor([1.5, 0.5, 1.0, 2.0, 1.0, 0.25, 1.1, 7.0, 9.0, 3.0, 0.1, 4.0, 2.5, 1.25, 0.75])
 
     def coef_of(mask):
@@ -395,10 +384,8 @@ def test_marker_with_trainer_old_logps_is_refused(monkeypatch):
         _drive(monkeypatch, True, old_logps = torch.zeros(3, 3))
 
 
-# Rollout rejection (UNSLOTH_GRPO_ROLLOUT_RS) in grpo_accumulated_loss: the keep mask that
-# grpo_compute_loss applies must also zero the reported IS weights on the rollout-as-old path
-# (so rejected_frac / ESS see the rejection, as on the vLLM IS path) and the entropy bonus
-# weights on both paths (verl drops rejected tokens from response_mask, entropy included).
+# The keep mask grpo_compute_loss applies must also zero reported IS weights on the rollout-as-old path (so
+# rejected_frac and ESS see rejections) and the entropy bonus weights on both paths, as verl's response_mask does.
 from test_grpo_rollout_rejection_exclusion import _oracle_keep  # noqa: E402
 
 
@@ -412,8 +399,8 @@ def _capture_entropy_weights(monkeypatch):
             return (entropies.to(torch.float32) * weights).sum()
 
     monkeypatch.setattr(rr, "UnslothGRPOEntropyBonus", _Bonus)
-    # The expected weights are TRL >= 1.10's; without a pin, a TRL < 1.10 install takes the legacy
-    # dapo branch, which needs num_items_in_batch that this fake trainer does not pass.
+    # Pins trl_version to 1.10.0: the expected weights are TRL >= 1.10's; TRL < 1.10 takes a legacy dapo branch that
+    # needs num_items_in_batch, which this fake trainer does not pass.
     weights_fn = rr.grpo_entropy_bonus_weights
     monkeypatch.setattr(
         rr, "grpo_entropy_bonus_weights",
@@ -422,9 +409,8 @@ def _capture_entropy_weights(monkeypatch):
     return captured
 
 
-# The toy model's logps sit 0.9 to 2.6 nats below the rollout's: token_k1 within [0.01, 5.5]
-# keeps the gaps up to log 5.5 = 1.70 and rejects the rest. On the vLLM IS path the trainer old
-# logps below put gaps of 1.4 and 2.0 (rejected by [0.01, 3]) next to gaps of 0.
+# Toy logps sit 0.9 to 2.6 nats below rollout: token_k1 [0.01, 5.5] keeps gaps up to log 5.5 = 1.70 and rejects the
+# rest; on the vLLM IS path [0.01, 3] rejects gaps of 1.4 and 2.0.
 _BOUNDS = {True: "0.01_5.5", False: "0.01_3"}
 
 

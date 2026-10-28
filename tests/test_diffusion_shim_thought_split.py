@@ -14,16 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Thought-channel splitting in the DiffusionGemma OpenAI shim.
-
-The shim splits the model's thinking out of committed text into OpenAI-style
-``reasoning_content``. DiffusionGemma emits two thinking dialects -- the chat
-template's native ``<|channel>thought ... <channel|>`` and DeepSeek-style
-``<think> ... </think>`` when thinking is not explicitly templated -- and
-commits arrive in 256-token canvas blocks, so a marker can straddle a block
-boundary mid-stream. These tests pin the splitter and the streaming holdback
-that keeps marker fragments out of both channels.
-"""
+"""Splits DiffusionGemma thinking (<|channel>thought or <think> dialects) into reasoning_content; 256-token commit
+blocks can split a marker, so streaming holdback keeps fragments out of both channels."""
 
 import pytest
 
@@ -110,8 +102,7 @@ def test_holdback_covers_partial_markers():
 
 
 def _stream(full):
-    """Replay *full* one character per commit through the shim's split + holdback
-    + per-channel prefix-diff logic; return the concatenated channel outputs."""
+    """Replays the full text one character per commit through the shim's split, holdback and per-channel prefix-diff logic; returns both channel outputs."""
     sent_reasoning = ""
     sent_content = ""
     out_reasoning = []

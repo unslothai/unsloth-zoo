@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth#409: the compiled trainers' EMPTY_LOGITS must not claim protocol dunders.
-
-A catch-all ``__getattr__`` made ``hasattr`` true for every name, so torch's
-``_apply_to_tensors`` saw ``__dataclass_fields__``, called ``dataclasses.replace``
-and killed every FSDP2 mixed-precision step. Under test is the source text in
-``compiler._cross_entropy_code`` (never imported, so exec'd); _utils.py has a twin.
-"""
+"""Compiled trainers' EMPTY_LOGITS must not claim protocol dunders (issue 409): a catch-all __getattr__ made hasattr
+true, so torch's _apply_to_tensors called dataclasses.replace and broke FSDP2 mixed precision; tests exec
+compiler._cross_entropy_code source (_utils.py has a twin)."""
 
 import dataclasses
 

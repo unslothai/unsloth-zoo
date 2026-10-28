@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`install_package` must not read EOF on a terminal as consent.
-
-`input()` raises EOFError both for a headless stdin and for Ctrl-D at a live prompt.
-Only the first is an implicit ENTER; the second must keep cancelling.
-"""
+"""install_package must not read EOF on a terminal as consent: headless stdin EOF is an implicit ENTER, but Ctrl-D at a live prompt must keep cancelling"""
 
 from __future__ import annotations
 

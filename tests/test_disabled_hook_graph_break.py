@@ -14,23 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Two Unsloth fixes collide; the run should not die of it.
-
-One wraps the gradient-checkpointing `requires_grad` hooks in
-`torch.compiler.disable`, because Dynamo cannot trace
-`Tensor.requires_grad_()`. The other compiles a forward with
-`fullgraph = True`. The disabled hook is then invoked from inside that
-fullgraph region and Dynamo refuses:
-
-    Unsupported: Skip calling `torch.compiler.disable()`d function
-
-Neither fix is wrong on its own and a user can do nothing about the
-combination, so it should cost speed rather than the run.
-
-The hazard guarded against here is over-catching. The fallback takes exactly
-this one extra case, matched on the disable signature, and most of the tests
-below are about the graph breaks that must STILL raise.
-"""
+"""Two fixes collide: a disabled gradient-checkpointing hook called inside a fullgraph region falls back to eager,
+matched on the disable signature only; other graph breaks must still raise."""
 
 import sys
 from pathlib import Path
@@ -45,13 +30,11 @@ from unsloth_zoo.temporary_patches import utils as U  # noqa: E402
 
 @pytest.fixture(autouse = True)
 def _clear_latches():
-    """The latch is process-global and keyed by label, and every `_wrap` below
-    reuses "TestMod", so the first fallback would leak into every later test."""
+    """The latch is process-global and keyed by label; every _wrap here reuses TestMod, so a first fallback would leak into later tests."""
     for _s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
                U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
         _s.discard("TestMod")
-    # Left set by an earlier test file, the give-up arms here read "a compiled
-    # pack is outstanding" and end the step instead of falling back.
+    # State left by an earlier test file would make the give-up arms read a compiled pack as outstanding, ending the step instead of falling back.
     _packed = U._PACKED_COMPILED_IN_CHECKPOINT
     U._PACKED_COMPILED_IN_CHECKPOINT = False
     yield
@@ -79,10 +62,8 @@ def test_it_recognises_our_own_disabled_hook():
 _HOOK = ("<function requires_grad_for_gradient_checkpointing.<locals>."
          "requires_grad_pre_hook at 0x7f00>")
 
-# Dynamo's refusal to trace a disabled callable, one wording per torch in the
-# >=2.4,<2.13 range: 2.4-2.6 use `variables/functions.py`'s `_dynamo.disable` text
-# (2.4.0 L604, 2.5.1 L655, 2.6.0 L620), 2.7 `unimplemented_v2` (2.7.0 L1173), 2.8
-# added the trailing reason. Miss a wording and the run dies on that torch.
+# Dynamo refuses to trace a disabled callable, one wording per torch in >=2.4,<2.13: 2.4-2.6 use variables/functions.py
+# _dynamo.disable text, 2.7 unimplemented_v2, 2.8 adds a trailing reason; a missed wording kills the run on that torch.
 _OLD_WORDING = f"call torch._dynamo.disable() wrapped function {_HOOK}"
 _NEW_WORDING = (
     "Skip calling `torch.compiler.disable()`d function\n"
@@ -117,8 +98,7 @@ def test_an_ordinary_graph_break_is_not_matched():
 
 
 def test_a_mention_of_disable_alone_is_not_enough():
-    """Both halves of the signature are required, so a message that merely
-    talks about torch.compiler.disable does not qualify."""
+    """Both halves of the signature are required, so a message that merely mentions torch.compiler.disable does not qualify."""
     assert not U._is_our_own_disabled_hook(
         RuntimeError("consider using torch.compiler.disable here"))
     # Same for the pre-2.7 wording: the whole literal is required, not the name.
@@ -157,12 +137,8 @@ def test_our_disabled_hook_falls_back_to_eager():
 
 
 def test_the_fallback_latches():
-    """Do not reverse this. Per-call retry was tried and does not keep a
-    checkpoint pack and its own recompute in the same mode: they run under
-    different guards, so the compiler can flip either way. Latching leaves
-    exactly one inconsistent step, which unsloth catches and retries via
-    `force_eager_fallback`, instead of an unbounded number.
-    """
+    """Do not reverse to per-call retry: a checkpoint pack and its recompute run under different guards and can flip
+    either way; latching leaves one inconsistent step, retried via force_eager_fallback, not an unbounded number."""
     calls = {"n": 0}
 
     def compiled(*a, **k):
@@ -175,9 +151,7 @@ def test_the_fallback_latches():
 
 
 def test_every_later_call_takes_the_same_path():
-    """The property the checkpoint depends on, in the form that survived: once
-    the switch has happened, it is total. A build that sends some calls eager
-    and some compiled is the configuration that aborts the backward."""
+    """Once the switch to eager has happened it must be total: a build sending some calls eager and some compiled aborts the backward."""
     outcomes = iter(["ok", "fail", "ok", "ok"])
     seen = []
 
@@ -260,15 +234,8 @@ def test_the_compiled_callable_stays_reachable():
 
 
 def test_it_degrades_to_the_compiled_function_when_torch_offers_none_of_them():
-    """On a torch with no such exceptions at all, wrapping buys nothing and
-    must not add a layer.
-
-    All THREE families have to be absent. The wrapper now also catches Inductor
-    codegen refusals, and `_backend_compile_errors()` is non-empty on every
-    supported torch, so mocking only the two recompile families left the third
-    live and the wrapper rightly kept its layer -- this asserted "no exceptions
-    at all" while one family was still there.
-    """
+    """When torch offers none of the recompile-limit, graph-break or backend compile exceptions, wrapping must not add a
+    layer; _backend_compile_errors() is non-empty on every supported torch, so all three must be mocked out."""
     import unittest.mock as mock
     with mock.patch.object(U, "_recompile_limit_errors", lambda: ()), \
          mock.patch.object(U, "_disabled_hook_graph_break_error", lambda: ()), \
@@ -279,12 +246,8 @@ def test_it_degrades_to_the_compiled_function_when_torch_offers_none_of_them():
 
 
 def test_backend_errors_alone_are_enough_to_keep_the_wrapper():
-    """The other half of the contract, and the reason the test above changed.
-
-    A torch that reports no recompile-limit exception and no graph-break
-    exception can still refuse to generate code, so the layer has to stay --
-    otherwise the codegen fallback would silently not exist there.
-    """
+    """A torch with no recompile-limit or graph-break exception can still refuse codegen, so the wrapper must keep its
+    layer or the codegen fallback silently vanishes."""
     import unittest.mock as mock
     if not U._backend_compile_errors():
         pytest.skip("this torch exposes no backend compile exception")

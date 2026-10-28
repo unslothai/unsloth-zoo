@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Post-conversion GGUF verification: unsloth#6056, unsloth#8360, unsloth#8513.
-Builds its GGUFs with `gguf.GGUFWriter`, so no network, model or llama.cpp build.
-"""
+"""Post-conversion GGUF verification (unsloth 6056, unsloth 8360, unsloth 8513); builds GGUFs with `gguf.GGUFWriter`, so
+no network, model or llama.cpp build is needed."""
 
 import importlib.util
 import os
@@ -61,12 +60,8 @@ INDEXER = {
 
 def write_gguf(path, architecture = "llama", keys = None, tensors = None,
                raw_dtype = None):
-    """A minimal GGUF with exactly the KV keys and tensors asked for.
-
-    `tensors` maps a name to an array, or to None for a default 2x2 of ones.
-    `raw_dtype` declares the arrays as a quantized GGML type, so the bytes are
-    block-format bytes rather than values.
-    """
+    """Writes a minimal GGUF with exactly the given keys; `tensors` maps names to arrays (None gives a 2x2 of ones) and
+    `raw_dtype` marks arrays as quantized block bytes."""
     writer = GGUFWriter(str(path), architecture)
     for key, value in (keys or {}).items():
         if isinstance(value, str):
@@ -116,8 +111,7 @@ def test_missing_architecture_is_reported(llama_cpp, tmp_path):
 
 
 def test_indexer_tensor_without_indexer_metadata_is_reported(llama_cpp, tmp_path):
-    """unsloth#8360 / unsloth#8513: `blk.N.indexer.*` tensors without
-    `{arch}.attention.indexer.head_count`."""
+    """unsloth 8360 / unsloth 8513: `blk.N.indexer.*` tensors without `{arch}.attention.indexer.head_count` must be reported."""
     path = write_gguf(
         tmp_path / "indexer.gguf", keys = UNIVERSAL,
         tensors = {"blk.0.attn_q.weight": None, "blk.0.indexer.k_proj.weight": None},
@@ -130,8 +124,7 @@ def test_indexer_tensor_without_indexer_metadata_is_reported(llama_cpp, tmp_path
 
 
 def test_the_minimax_shape_is_still_refused_for_a_requiring_architecture(llama_cpp, tmp_path):
-    """The exemption below must not weaken the case the gate exists for:
-    minimax-m3.cpp:21-25 reads all three keys with no `false`."""
+    """The exemption must not weaken the case the gate exists for: minimax-m3.cpp:21-25 reads all three keys with no trailing `false`."""
     path = write_gguf(
         tmp_path / "minimax.gguf", architecture = "minimax-m3", keys = {
             "minimax-m3.context_length": 8,
@@ -145,8 +138,7 @@ def test_the_minimax_shape_is_still_refused_for_a_requiring_architecture(llama_c
 
 
 def test_an_architecture_that_reads_the_indexer_keys_optionally_is_exempt(llama_cpp, tmp_path):
-    """src/models/hy-v4.cpp:46-48 reads the three keys with a trailing `false`, so
-    a `hy_v4` file without them loads and the gate must not fire on it."""
+    """src/models/hy-v4.cpp:46-48 reads the three keys with a trailing `false`, so a `hy_v4` file without them loads and the gate must not fire."""
     path = write_gguf(
         tmp_path / "hyv4.gguf", architecture = "hy_v4", keys = {
             "hy_v4.context_length": 8,
@@ -182,8 +174,7 @@ def test_indexer_metadata_present_is_accepted(llama_cpp, tmp_path):
 
 
 def test_indexer_compressor_tensors_also_imply_the_keys(llama_cpp, tmp_path):
-    """llama.cpp spells some with an underscore (`blk.N.indexer_compressor_kv`), so
-    an `indexer.` prefix test would miss them."""
+    """llama.cpp spells some tensors with an underscore (`blk.N.indexer_compressor_kv`), so an `indexer.` prefix test would miss them."""
     path = write_gguf(
         tmp_path / "compressor.gguf", keys = UNIVERSAL,
         tensors = {"blk.0.indexer_compressor_kv.weight": None},
@@ -200,8 +191,7 @@ def test_ssm_tensor_implies_conv_kernel(llama_cpp, tmp_path):
 
 
 def test_expert_tensors_imply_expert_counts_as_a_warning(llama_cpp, tmp_path):
-    """Without `expert_count` the model loads and is silently wrong, but a converter
-    can legitimately reach this state, so it is a warning and not a refusal."""
+    """Without `expert_count` the model loads but is silently wrong; a converter can legitimately reach that state, so it is a warning, not a refusal."""
     path = write_gguf(tmp_path / "moe.gguf", keys = UNIVERSAL,
                       tensors = {"blk.0.ffn_gate_exps.weight": None})
     assert llama_cpp.gguf_metadata_problems(path) == []
@@ -245,8 +235,7 @@ def test_unreadable_file_is_reported_not_raised(llama_cpp, tmp_path):
 # --- Split exports ---
 
 def test_any_shard_resolves_to_the_whole_set(llama_cpp, tmp_path):
-    """Only shard 1 carries the KV metadata, so handed shard 2 the gate must read
-    shard 1 and still see shard 2's tensors."""
+    """Only shard 1 carries the KV metadata, so given shard 2 the gate must read shard 1 for metadata and still check shard 2's tensors."""
     write_gguf(tmp_path / "m-00001-of-00002.gguf", keys = UNIVERSAL,
                tensors = {"blk.0.attn_q.weight": None})
     second = write_gguf(tmp_path / "m-00002-of-00002.gguf", architecture = "llama",
@@ -268,8 +257,7 @@ def test_a_lone_file_is_its_own_shard_set(llama_cpp, tmp_path):
 
 
 def test_a_missing_middle_shard_is_reported(llama_cpp, tmp_path):
-    """Shard 1 present is not the same as the set being complete. The declared count
-    lives only in the `-of-NNNNN` of the filename."""
+    """Shard 1 present does not mean the set is complete; the declared shard count lives only in the `-of-NNNNN` suffix of the filename."""
     first = write_gguf(tmp_path / "m-00001-of-00003.gguf", keys = UNIVERSAL,
                        tensors = {"blk.0.attn_q.weight": None})
     write_gguf(tmp_path / "m-00003-of-00003.gguf", architecture = "llama",
@@ -289,8 +277,7 @@ def test_a_missing_middle_shard_is_reported(llama_cpp, tmp_path):
 
 
 def test_a_corrupt_later_shard_is_reported_as_a_problem(llama_cpp, tmp_path):
-    """Present but unreadable is exactly as unloadable as absent, and the empty list
-    is what a caller uses to ACCEPT a set."""
+    """Present but unreadable is as unloadable as absent, and an empty problem list is what a caller uses to accept a set."""
     first = write_gguf(tmp_path / "b-00001-of-00002.gguf", keys = UNIVERSAL,
                        tensors = {"blk.0.attn_q.weight": None})
     corrupt = tmp_path / "b-00002-of-00002.gguf"
@@ -320,8 +307,7 @@ def test_a_complete_shard_set_reports_nothing_missing(llama_cpp, tmp_path):
 
 
 def test_assert_correct_gguf_checks_each_split_set_once(llama_cpp, tmp_path, monkeypatch):
-    """A caller hands back the whole shard LIST, and every member used to resolve to
-    the same set and revalidate it, reparsing a 40 shard model 40 times."""
+    """A caller may pass the whole shard list, so each split set must be validated once, not reparsed once per member."""
     shards = [
         str(write_gguf(tmp_path / f"m-{index:05d}-of-00004.gguf",
                        keys = UNIVERSAL if index == 1 else {},
@@ -349,8 +335,7 @@ def test_assert_correct_gguf_checks_each_split_set_once(llama_cpp, tmp_path, mon
 # --- Tensor sanity (unsloth#6056) ---
 
 def test_a_damaged_non_final_tensor_is_caught(llama_cpp, tmp_path):
-    """unsloth#6056: the reader built `tensors_fields[-1:]`, so only the last tensor
-    existed and a zeroed text tower was invisible."""
+    """unsloth 6056: the reader only saw `tensors_fields[-1:]`, so only the last tensor was checked and a zeroed text tower went unnoticed."""
     path = write_gguf(
         tmp_path / "zeroed.gguf", keys = UNIVERSAL,
         tensors = {
@@ -395,8 +380,7 @@ def test_a_zero_bias_is_not_a_problem(llama_cpp, tmp_path):
 
 
 def test_a_zeroed_identity_projection_is_not_a_problem(llama_cpp, tmp_path):
-    """LLaMA Pro block expansion (arXiv 2401.02415) leaves o_proj and down_proj at
-    exactly zero, and llama.cpp loads that file."""
+    """LLaMA Pro block expansion (arXiv 2401.02415) leaves o_proj and down_proj at exactly zero, and llama.cpp loads that file."""
     path = write_gguf(
         tmp_path / "identity.gguf", keys = UNIVERSAL,
         tensors = {
@@ -424,8 +408,7 @@ def test_an_ordinary_zeroed_block_weight_is_still_refused(llama_cpp, tmp_path):
 
 
 def test_a_zeroed_f16_tensor_is_caught(llama_cpp, tmp_path):
-    """gguf-py can hand half precision tensors back as raw bytes, which a plain
-    `np.issubdtype(..., np.floating)` guard skipped."""
+    """gguf-py can return half precision tensors as raw bytes, which a plain `np.issubdtype(..., np.floating)` guard skipped."""
     path = write_gguf(
         tmp_path / "f16.gguf", keys = UNIVERSAL,
         tensors = {
@@ -489,8 +472,7 @@ def test_the_gate_accepts_a_good_file(llama_cpp, tmp_path):
 
 
 def test_a_legitimately_zero_tensor_outside_the_blocks_is_allowed(llama_cpp, tmp_path):
-    """BERT-family `token_types.weight` is legitimately all zeros: outside `blk.`
-    zero is a real weight."""
+    """BERT-family `token_types.weight` is legitimately all zeros; outside `blk.` tensors, zero is a real weight."""
     path = write_gguf(
         tmp_path / "bert.gguf", keys = UNIVERSAL, tensors = {
             "blk.0.attn_q.weight": np.ones((8, 8), dtype = np.float32),
@@ -528,8 +510,7 @@ def test_a_non_finite_value_outside_the_blocks_is_still_caught(llama_cpp, tmp_pa
 
 
 def test_f16_takes_the_float_dtype_path(llama_cpp, tmp_path):
-    """gguf-py returns a real float16 dtype; if that changes, every F16 tensor would
-    silently stop being checked."""
+    """gguf-py returns a real float16 dtype; if that changes, every F16 tensor would silently stop being checked."""
     bad = np.ones((8, 8), dtype = np.float16)
     bad[0, 0] = np.nan
     path = write_gguf(tmp_path / "f16.gguf", keys = UNIVERSAL,
@@ -542,8 +523,7 @@ def test_f16_takes_the_float_dtype_path(llama_cpp, tmp_path):
 
 
 def test_the_gate_skips_tensor_values_on_a_quantized_export(llama_cpp, tmp_path):
-    """A quantized block format is bytes, not values, so the tensor checks run only
-    for float tensors, read off the FILE rather than the caller's dtype."""
+    """Quantized block formats are bytes, not values, so tensor checks run only for float tensors, judged from the file rather than the caller's dtype."""
     zeros = np.zeros((32, 32), dtype = np.float32)
     plain = write_gguf(tmp_path / "plain.gguf", keys = UNIVERSAL,
                        tensors = {"blk.0.attn_q.weight": zeros})
@@ -557,8 +537,7 @@ def test_the_gate_skips_tensor_values_on_a_quantized_export(llama_cpp, tmp_path)
 
 
 def test_the_dtype_argument_is_ignored(llama_cpp, tmp_path):
-    """`quantization_type` is accepted for compatibility and ignored: the file is
-    the authority on what it holds."""
+    """`quantization_type` is accepted for compatibility and ignored; the file is the authority on what it holds."""
     zeros = np.zeros((32, 32), dtype = np.float32)
     path = write_gguf(tmp_path / "ignored.gguf", keys = UNIVERSAL,
                       tensors = {"blk.0.attn_q.weight": zeros})
@@ -626,8 +605,7 @@ def test_a_nan_float_block_weight_beside_quantized_blocks_is_caught(llama_cpp, t
 
 
 def test_a_mixed_file_is_not_counted_as_value_skipped(llama_cpp, tmp_path, caplog):
-    """A mixed file did get a value check, so the closing line must not claim the
-    tensor pass was skipped."""
+    """A mixed file still gets a value check, so the closing log line must not claim the tensor pass was skipped."""
     ones = np.ones((32, 32), dtype = np.float32)
     path = write_mixed_gguf(
         tmp_path / "clean_mixed.gguf", keys = UNIVERSAL,
@@ -640,8 +618,7 @@ def test_a_mixed_file_is_not_counted_as_value_skipped(llama_cpp, tmp_path, caplo
 
 
 def test_quantized_block_bytes_are_left_alone_in_a_mixed_file(llama_cpp, tmp_path):
-    """A quantized tensor whose block bytes are entirely zero must not be refused
-    just because a float tensor put the file back in scope."""
+    """A quantized tensor whose block bytes are all zero must not be refused just because a float tensor brings the file back in scope."""
     zeros = np.zeros((32, 32), dtype = np.float32)
     ones = np.ones((32, 32), dtype = np.float32)
     path = write_mixed_gguf(
@@ -700,8 +677,7 @@ def test_the_gate_checks_a_split_set_once(llama_cpp, tmp_path):
 # --- What the rebuild removed ---
 
 def test_the_reader_is_no_longer_rebuilt_with_exec(llama_cpp):
-    """The old validator rebuilt `GGUFReader.__init__` through `exec` to read only
-    the final tensor. Parsed rather than grepped: the docstrings still name it."""
+    """The validator must not rebuild `GGUFReader.__init__` through exec (it read only the final tensor); ast-parsed because the docstrings still name exec."""
     import ast
     source = Path(llama_cpp.__file__).read_text()
     tree = ast.parse(source)
@@ -727,8 +703,7 @@ def test_the_public_surface_is_exported(llama_cpp):
 
 
 def test_an_unreadable_output_warns_rather_than_refusing(llama_cpp, tmp_path, caplog):
-    """The installed `gguf` can be older than the converter that wrote the file, so
-    a reader failure is not evidence the export is bad."""
+    """The installed `gguf` can be older than the converter that wrote the file, so a reader failure alone is not evidence the export is bad."""
     import logging
     path = tmp_path / "stub.gguf"
     path.write_bytes(b"not a gguf")
@@ -740,8 +715,7 @@ def test_an_unreadable_output_warns_rather_than_refusing(llama_cpp, tmp_path, ca
 def test_an_unreadable_output_is_refused_when_its_own_writer_cannot_reopen_it(
     llama_cpp, tmp_path, monkeypatch
 ):
-    """Version skew is the ONLY reason the failure above is a warning: a file its own
-    writer cannot reopen is malformed or truncated."""
+    """Version skew is the only reason an unreadable output is just a warning; a file its own writer cannot reopen is malformed or truncated."""
     import contextlib
     path = tmp_path / "stub.gguf"
     path.write_bytes(b"not a gguf")
@@ -758,8 +732,7 @@ def test_an_unreadable_output_is_refused_when_its_own_writer_cannot_reopen_it(
 def test_a_writer_tree_that_cannot_be_imported_warns_rather_than_refusing(
     llama_cpp, tmp_path, monkeypatch, caplog
 ):
-    """An ImportError never reached the file's bytes: a tree that imports in the
-    child can still fail in the parent over a dependency the child had."""
+    """An ImportError never reached the file's bytes: a writer tree that imports in the child can still fail in the parent over a dependency the child had."""
     import contextlib, logging
     path = tmp_path / "fine.gguf"
     write_gguf(path, keys = UNIVERSAL, tensors = {"blk.0.attn_q.weight": None})
@@ -782,8 +755,7 @@ def test_a_writer_tree_that_cannot_be_imported_warns_rather_than_refusing(
 def test_a_quantized_export_does_not_claim_its_values_were_checked(
     llama_cpp, tmp_path, capsys
 ):
-    """The tensor pass does not run on a quantized export, so a bare "Verified"
-    would claim a value check that never happened."""
+    """The tensor pass does not run on quantized exports, so a bare "Verified" would claim a value check that never happened."""
     path = write_gguf(
         tmp_path / "quant.gguf", keys = UNIVERSAL,
         tensors = {"blk.0.attn_q.weight": np.zeros((32, 32), dtype = np.float32)},
@@ -814,8 +786,7 @@ def test_the_refusal_names_the_file_and_the_way_out(llama_cpp, tmp_path, monkeyp
 
 
 def test_a_split_set_missing_its_first_shard_says_so(llama_cpp, tmp_path):
-    """Without shard 1 every required key reads as missing, so the report has to
-    name the absent file instead."""
+    """Without shard 1 every required key reads as missing, so the report must name the absent file instead."""
     second = write_gguf(tmp_path / "m-00002-of-00002.gguf", keys = {},
                         tensors = {"blk.1.attn_q.weight": None})
     problems = llama_cpp.gguf_metadata_problems(second)
@@ -825,8 +796,7 @@ def test_a_split_set_missing_its_first_shard_says_so(llama_cpp, tmp_path):
 
 
 def test_the_read_back_announces_itself_and_reports_its_cost(llama_cpp, tmp_path, capsys, monkeypatch):
-    """A silent stall after "Successfully saved" reads like a hang, so the read-back
-    says what it is doing, that the cost is flat, and how to turn it off."""
+    """A silent stall after Successfully saved reads like a hang, so the read-back announces itself, says its cost is flat, and says how to turn it off."""
     path = tmp_path / "m.gguf"
     path.write_bytes(b"not a gguf")
     monkeypatch.setattr(llama_cpp, "_gguf_open_shards", lambda f: [(str(path), None)])
@@ -913,11 +883,7 @@ class _FakeModel:
 
 
 def _two_shard_readers(llama_cpp, tmp_path, second_shape):
-    """A two shard set holding one block each, the second sized by the caller.
-
-    Give a test that builds two sets its own directory for the second: these readers
-    hold the files mapped, and Windows refuses to rewrite a mapped file.
-    """
+    """Two-shard set with one block each, the second sized by the caller; a second set needs its own directory, as Windows refuses to rewrite mapped files."""
     tmp_path = pathlib.Path(tmp_path)
     tmp_path.mkdir(parents = True, exist_ok = True)
     shapes = {
@@ -940,8 +906,7 @@ def _two_shard_readers(llama_cpp, tmp_path, second_shape):
 
 
 def test_a_wrong_shape_past_the_first_shard_is_reported(llama_cpp, tmp_path):
-    """The shape comparison was handed `readers[0][1]` alone, so a wrong shape past
-    the first shard was never compared with the model."""
+    """A wrong shape past the first shard must be compared with the model; passing only readers[0][1] to the shape check missed it."""
     model, readers = _two_shard_readers(llama_cpp, tmp_path, (2, 2))
     problems = llama_cpp._gguf_shape_problems(model, readers, sample_size = 8)
     assert any("blk.1.attn_q.weight" in problem for problem in problems), problems
@@ -955,14 +920,13 @@ def test_a_correct_split_export_reports_nothing(llama_cpp, tmp_path):
 
 
 def test_an_unreadable_later_shard_does_not_break_the_shape_pass(llama_cpp, tmp_path):
-    """An unreadable shard is already fatal through the metadata pass, so the shape
-    pass skips it and still checks the shards it can read."""
+    """An unreadable shard is already fatal in the metadata pass, so the shape pass skips it and still checks the readable shards."""
     model, readers = _two_shard_readers(llama_cpp, tmp_path, (2, 2))
     readers = [readers[0], (readers[1][0], None)]
     assert llama_cpp._gguf_shape_problems(model, readers, sample_size = 8) == []
 
-    # With only the unreadable one left, nothing to compare rather than an exception.
-    # Its own directory: the readers above still hold the first set mapped.
+    # With only the unreadable shard left there is nothing to compare rather than an exception; the second set gets its
+    # own directory since the first is still mapped.
     model, readers = _two_shard_readers(llama_cpp, tmp_path / "second", (2, 2))
     assert llama_cpp._gguf_shape_problems(
         model, [(readers[0][0], None)], sample_size = 8,
@@ -999,8 +963,7 @@ def test_a_location_outside_a_gguf_package_is_refused(llama_cpp, tmp_path):
 
 
 def test_the_readback_always_uses_the_tree_that_wrote_the_file(llama_cpp, tmp_path):
-    """No version comparison: which package wrote the bytes is the only thing known,
-    and version ordering cannot establish compatibility."""
+    """No version comparison: the package that wrote the bytes is the only known fact, and version ordering cannot establish compatibility."""
     tree, location = _fake_gguf_tree(tmp_path)
     import sys as _sys
     import types as _types
@@ -1029,8 +992,7 @@ def test_a_report_with_no_usable_location_still_changes_nothing(llama_cpp, tmp_p
 
 
 def test_the_conversion_passes_the_derived_tree_to_the_verifier(llama_cpp):
-    """The derivation is only worth anything if `convert_to_gguf` uses it. Checked
-    through the AST so a refactor of the call site does not fail it."""
+    """The derived tree only matters if convert_to_gguf uses it; checked through the AST so a call-site refactor does not fail the test."""
     import ast as _ast
     tree = _ast.parse(Path(llama_cpp.__file__).read_text())
     fn = next(n for n in _ast.walk(tree)
@@ -1072,8 +1034,7 @@ class _BareTokenizer:
 
 
 def test_a_projector_gguf_is_not_rejected_for_having_no_vocabulary(llama_cpp, tmp_path):
-    """An mmproj holds a vision encoder, not a vocabulary, so it legitimately carries
-    no `tokenizer.ggml.tokens`."""
+    """An mmproj holds a vision encoder, not a vocabulary, so a missing tokenizer.ggml.tokens key is legitimate for it."""
     path = write_gguf(
         tmp_path / "model.F16-mmproj.gguf", architecture = "clip",
         tensors = {"v.blk.0.attn_q.weight": None},
@@ -1102,8 +1063,7 @@ def test_the_exemption_is_read_from_the_metadata_pass_constant(llama_cpp):
 
 
 def test_the_named_tree_takes_precedence_over_every_other_path_entry(llama_cpp, tmp_path):
-    """The tree is NAMED, not searched for, so it must beat an ambient gguf-py
-    checkout sitting at `sys.path[0]`."""
+    """The named gguf tree is not searched for, so it must win over an ambient gguf-py checkout sitting at sys.path[0]."""
     tree, _location = _fake_gguf_tree(tmp_path)
     decoy = tmp_path / "decoy"
     (decoy / "gguf").mkdir(parents = True)
@@ -1121,8 +1081,7 @@ def test_the_named_tree_takes_precedence_over_every_other_path_entry(llama_cpp, 
 
 
 def test_two_threads_cannot_swap_gguf_trees_at_once(llama_cpp, tmp_path):
-    """`sys.path` and `sys.modules` are process-global, so the tree swap has to be
-    serialised or two conversions interleave."""
+    """sys.path and sys.modules are process-global, so the gguf tree swap must be serialised or two conversions interleave."""
     import threading
 
     first, _location = _fake_gguf_tree(tmp_path / "one")
@@ -1191,9 +1150,8 @@ def _many_parameter_model(llama_cpp, tmp_path, block_count_key = True):
 def test_the_name_map_is_sized_by_the_blocks_not_the_parameters(
     llama_cpp, tmp_path, monkeypatch, block_count_key,
 ):
-    """`TensorNameMap`'s second argument is the BLOCK count, and sizing it by the
-    parameter count builds names for thousands of layers that do not exist. The file's
-    declared block count is used, with the parameter names as the fallback."""
+    """TensorNameMap's second argument is the block count; sizing it by parameter count builds names for nonexistent
+    layers, so use the file's declared block count, with parameter names as fallback."""
     import gguf.tensor_mapping as tensor_mapping
 
     _RecordingNameMap.calls = []
@@ -1204,8 +1162,7 @@ def test_the_name_map_is_sized_by_the_blocks_not_the_parameters(
 
 
 def test_a_corrupt_shard_is_reported_for_a_projector_too(llama_cpp, tmp_path):
-    """The architecture exemption is about which metadata KEYS a loader reads: a
-    projector with a corrupt shard is still unloadable."""
+    """The architecture exemption only covers which metadata keys a loader reads; a projector with a corrupt shard is still unloadable."""
     first = write_gguf(tmp_path / "p-00001-of-00002.gguf", architecture = "clip", keys = {},
                        tensors = {"blk.0.attn_q.weight": None, "mm.0.weight": None})
     (tmp_path / "p-00002-of-00002.gguf").write_bytes(b"not a gguf at all")
@@ -1236,8 +1193,7 @@ def test_a_required_run_that_fails_verification_raises(llama_cpp, tmp_path):
 
 
 def test_a_failed_optional_run_is_dropped_and_the_export_continues(llama_cpp, tmp_path, capsys):
-    """The projector is an OPTIONAL run, and aborting would throw away a text model
-    that is present and valid."""
+    """The projector is an optional run; aborting on its failure would throw away a present and valid text model."""
     keys = {k: v for k, v in UNIVERSAL.items() if k != "llama.block_count"}
     path = write_gguf(tmp_path / "mmproj.gguf", keys = keys,
                       tensors = {"blk.0.attn_q.weight": None})
@@ -1261,8 +1217,7 @@ def test_a_clean_optional_run_is_kept(llama_cpp, tmp_path):
 
 
 def test_the_conversion_drops_only_the_failed_optional_runs_files(llama_cpp):
-    """The loop removes only that run's files and flips is_vlm, rather than aborting.
-    Pinned through the AST."""
+    """The failed optional run's files are removed and is_vlm is flipped instead of aborting; pinned through the AST."""
     import ast as _ast
     tree = _ast.parse(Path(llama_cpp.__file__).read_text())
     fn = next(n for n in _ast.walk(tree)

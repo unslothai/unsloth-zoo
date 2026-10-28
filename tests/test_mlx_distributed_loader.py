@@ -143,13 +143,7 @@ def test_text_only_vlm_load_stays_on_vlm_path_when_mlx_lm_has_no_model(monkeypat
 
 
 def test_a_model_module_that_exits_at_import_is_a_verdict_not_a_dead_process(monkeypatch):
-    """mlx_lm and mlx-vlm both ship modules that call `exit(1)` at import when an
-    optional dependency is missing -- `mlx_lm/models/olmo.py` does it without
-    ai2-olmo, which no install pulls in. `SystemExit` is not an `Exception`, so
-    catching only that let a routing question take the process down with no
-    traceback. Every one of these imports asks a question whose answer, when the
-    module will not import, is simply "this backend cannot build it".
-    """
+    """mlx_lm/mlx-vlm modules exit(1) at import without an optional dep; SystemExit is not an Exception."""
     import importlib
 
     import unsloth_zoo.mlx.loader as loader
@@ -389,8 +383,7 @@ def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatc
 
     def distributed(_name, model_type, *, config_override_data=None, allow_remote_code=None, **_kwargs):
         calls.append((model_type, config_override_data, allow_remote_code))
-        # from_pretrained walks the model's modules for an image path (#1587), so the fake
-        # answers named_modules() the way an mlx.nn.Module with no submodules does.
+        # from_pretrained walks the model's modules for an image path (issue 1587); the fake has none.
         model = types.SimpleNamespace(named_modules=lambda: iter([("", None)]))
         return model, types.SimpleNamespace(
             tokenizer=types.SimpleNamespace(stopping_criteria=object()), detokenizer=object(),

@@ -259,7 +259,7 @@ def test_capability_widens_only_patched_architectures():
 
 
 def test_refusal_matcher_matches_recoverssm_under_speculation():
-    # vLLM 0.29 config/vllm.py validate_mamba_cached_kernel: use_replayssm + speculative tokens
-    # becomes RecoverSSM, refused for every model but Kimi KDA (e.g. Nemotron-H + suffix decoding).
+    # vLLM 0.29 config/vllm.py validate_mamba_cached_kernel: use_replayssm with speculative tokens becomes RecoverSSM;
+    # that is refused for all but Kimi KDA (e.g. Nemotron-H with suffix decoding).
     assert NS["_is_vllm_replayssm_refusal"]("RecoverSSM is only supported for Kimi-K3 KDA")
     assert NS["_is_vllm_replayssm_refusal"]("RecoverSSM currently requires pipeline_parallel_size=1")

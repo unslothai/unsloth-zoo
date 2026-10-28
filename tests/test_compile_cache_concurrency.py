@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Mega-cache key stability and concurrent-save safety, CPU-only with fake
-torch artifacts (no torch import, no compile)."""
+"""Mega-cache key stability and concurrent-save safety, tested CPU-only with fake torch artifacts (no torch import, no compile)."""
 
 from __future__ import annotations
 
@@ -106,8 +105,7 @@ def _seed(module, artifacts):
 
 
 def test_reloading_the_same_model_repopulates_torch_caches(cache):
-    # No "already loaded" shortcut: a cleared FX cache or a changed
-    # TORCHINDUCTOR_CACHE_DIR must be refilled, not reported as a hit.
+    # No already-loaded shortcut: a cleared FX cache or a changed TORCHINDUCTOR_CACHE_DIR must be refilled, not reported as a hit.
     cache._STATE["model_keys"] = []
     cache._register_model_key(cache._model_key("llama", {}, {}))
     _, data = _seed(cache, [("inductor", "a")])
@@ -131,9 +129,9 @@ _Artifact = AutotuneCacheArtifact
 
 
 class _FakeRecorder:
-    """torch.compiler._cache.CacheArtifactManager semantics that matter here:
-    record_artifact dedupes by value into _new_cache_artifacts/_seen_artifacts,
-    serialize moves _new into an appending serializer and returns all of it."""
+    """Models the torch.compiler._cache.CacheArtifactManager semantics that matter: record_artifact dedupes by value
+    into _new_cache_artifacts/_seen_artifacts; serialize moves _new into an appending serializer and returns all of
+    it."""
 
     def __init__(self):
         from collections import defaultdict
@@ -336,10 +334,9 @@ def _wait_for(path, timeout = 60):
 
 @pytest.mark.parametrize("pause", ("after_read", "before_manifest"))
 def test_concurrent_saves_publish_a_loadable_union(tmp_path, pause):
-    """Writer 1 stalls inside its save (after reading the old bundle, or after
-    writing its bundle but before publishing the manifest) while writer 2 saves.
-    Without a per-key lock writer 2's artifacts are dropped from the union, or
-    writer 2 collects writer 1's bundle and writer 1's manifest then dangles."""
+    """Writer 1 pauses mid-save (after reading the old bundle, or after writing its bundle but before the manifest)
+    while writer 2 saves; without a per-key lock, writer 2's artifacts drop from the union or writer 2 collects
+    writer 1's bundle and its manifest dangles."""
     root = tmp_path / "mega"
     root.mkdir()
     sync1, sync2 = tmp_path / "sync1", tmp_path / "sync2"

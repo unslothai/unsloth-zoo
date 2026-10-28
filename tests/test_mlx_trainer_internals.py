@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Deeper MLX component exercises: trainer, compile discovery,
-cce backward, and quantization helpers, beyond just imports.
-
-If a test fails, the failing component identifies the next gap.
-"""
+"""Deeper MLX component tests (trainer, compile discovery, cce backward, quantization helpers) beyond imports; a failing test identifies the next gap."""
 
 from __future__ import annotations
 
@@ -42,15 +38,9 @@ def _install_shim():
             or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
         )
 
-    # The unsloth_zoo.mlx.* entries are saved as well as the mlx* ones, because
-    # this fixture drops them and the next importer therefore builds a NEW module
-    # object. Anything that ran earlier in this process and did
-    # `from unsloth_zoo.mlx.utils import ...` at import time keeps the OLD one, so
-    # it and the code under test end up on two copies of the same module globals:
-    # the training window one opens is invisible to the other, and a gated-delta
-    # op quietly takes the cached path instead of the VJP. Serially that never
-    # happens (alphabetical order puts this file after the pair it would break);
-    # under `-n N --dist loadfile` it depends on which worker draws which file.
+    # Saves unsloth_zoo.mlx.* entries too: dropping them lets the next importer build a new module, so earlier
+    # from-imports keep the old copy and gated-delta takes the cached path, not the VJP; serial runs never hit it, but
+    # under -n N --dist loadfile it depends on the worker.
     from mlx_simulation import (
         restore_modules,
         simulate_mlx_on_torch,
@@ -163,9 +153,8 @@ def test_finite_text_training_plan_keeps_long_schedule_cpu_only():
 
 
 def test_default_text_plan_uses_mlx_lm_padding():
-    # Regression: the default (non-pretokenized) finite text plan must pad to
-    # mlx-lm's 1 + 32*ceil(len/32) width, not the raw row length, so it keeps
-    # the causal-shift contract and the bounded compile signatures.
+    # Regression: the default (non-pretokenized) finite text plan must pad to mlx-lm's 1 + 32*ceil(len/32) width, not
+    # the raw row length; this keeps the causal-shift contract and bounded compile signatures.
     from unsloth_zoo.mlx.utils import _create_default_text_plan
 
     class _DS:
@@ -338,8 +327,7 @@ def test_ddp_automatic_shape_guard_reuses_frontier_at_shared_maximum_cap():
 
 
 def test_ddp_vlm_exact_rank_keeps_local_plan_and_neutral_cap_share():
-    """An exact rank must not export its catalog size as the shared cap
-    (widening budget-bucketed peers) and keeps its local plan."""
+    """An exact rank must not export its catalog size as the shared cap, which would widen budget-bucketed peers; it keeps its local plan."""
     from unsloth_zoo.mlx import shape_guard as sg
     from unsloth_zoo.mlx.compile import build_compile_policy
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -608,12 +596,10 @@ def test_text_shape_guard_dispositions_for_vlm_streaming_and_clipped_accum():
     )
 
     cases = (
-        # VLM with no resolved compile decision: planning must not run before
-        # qualification.
+        # VLM with no resolved compile decision: planning must not run before qualification.
         (True, None, MLXTrainingConfig(), "vlm_compile_unqualified"),
         (False, iter(()), MLXTrainingConfig(), "streaming"),
-        # Compiled global-norm clipping with accumulation is eligible, so the
-        # guard plans instead of declining.
+        # Compiled global-norm clipping with gradient accumulation is eligible, so the guard plans instead of declining.
         (False, None, MLXTrainingConfig(gradient_accumulation_steps=2,
                                         max_grad_norm=1.0), None),
     )
@@ -877,8 +863,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "assistant_only_loss",
     ):
         assert must_have in fields, f"missing field: {must_have}"
-    # dataset_text_field follows the eval block; newer eval knobs (eg load_best_model_at_end)
-    # may sit between them, so assert relative order rather than strict adjacency.
+    # dataset_text_field follows the eval block; newer eval knobs such as load_best_model_at_end may sit between them, so order is checked, not adjacency.
     assert field_names.index("dataset_text_field") > field_names.index("eval_steps")
     assert field_names[field_names.index("append_eos") + 1] == "train_on_completions"
     assert field_names.index("per_device_eval_batch_size") > field_names.index("vlm_chat_template")
@@ -1005,8 +990,7 @@ def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
     class Tokenizer:
         pad_token_id = 99
 
-    # Shortest row has 2 tokens so it survives the sub-two-token filter while
-    # still being padded out to the block length, exercising the pad id path.
+    # Shortest row has 2 tokens so it survives the sub-two-token filter yet is padded to block length, exercising the pad id path.
     dataset = [([5, 6], 0), ([7, 8, 9], 0)]
     np.random.seed(123)
     expected = np.random.random(3)
@@ -1038,8 +1022,7 @@ def test_distributed_text_batches_filter_sub_two_token_rows():
     class Tokenizer:
         pad_token_id = 99
 
-    # The length-1 row (token 5) has no causal target and must be filtered, so
-    # every batch is drawn only from the length-2 row (tokens 6, 7).
+    # The length-1 row (token 5) has no causal target and must be filtered, so every batch draws only from the length-2 row (tokens 6, 7).
     dataset = [([5], 0), ([6, 7], 0)]
     batches = _create_distributed_text_batches(
         dataset,
@@ -1059,10 +1042,8 @@ def test_distributed_text_batches_filter_sub_two_token_rows():
 
 
 def test_distributed_text_batches_use_token_length_not_cache_itemlen(monkeypatch):
-    # Regression: real mlx_lm CacheDataset.itemlen returns len(raw_row); for the
-    # {"text": ...} rows _prepare_dataset builds that is the dict key count (1),
-    # so an itemlen-based sub-two-token filter would drop every row and raise.
-    # The filter must measure the processed token length instead.
+    # Regression: real mlx_lm CacheDataset.itemlen returns len(raw_row), the dict key count (1) for text rows; an
+    # itemlen-based filter would drop every row and raise, so measure processed token length.
     import sys
 
     from unsloth_zoo.mlx.utils import _create_distributed_text_batches
@@ -1207,8 +1188,7 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     )
     assert clamped_trainer._resolve_warmup_steps(total_steps=8) == 8
 
-    # Explicit warmup_steps=0 must not disable a positive warmup_ratio (HF parity):
-    # a zero step count means "use the ratio", not "no warmup".
+    # Explicit warmup_steps=0 must not disable a positive warmup_ratio (HF parity): zero steps means use the ratio, not no warmup.
     zero_steps_ratio_trainer = MLXTrainer.__new__(MLXTrainer)
     zero_steps_ratio_trainer.args = MLXTrainingConfig(
         learning_rate=5e-5,
@@ -1262,9 +1242,7 @@ def test_adamw_weight_decay_uses_hf_bias_norm_filter():
 
 @pytest.mark.parametrize("optim_name", ["muon", "lion"])
 def test_decoupled_optimizers_use_hf_parity_manual_decay(optim_name):
-    """Muon and Lion mirror the AdamW pattern: zero out the optimizer's
-    built-in `weight_decay` and let `_apply_manual_weight_decay` own the
-    decoupled decay so bias and norm params are excluded."""
+    """Muon and Lion mirror AdamW: built-in `weight_decay` is zeroed and `_apply_manual_weight_decay` owns the decoupled decay, excluding bias and norm params."""
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     class DummyModel:
@@ -1321,8 +1299,7 @@ def test_adafactor_applies_hf_weight_decay():
 
 
 def test_sgd_weight_decay_is_coupled_not_decoupled():
-    """SGD must use coupled decay (folded into the gradient before momentum)
-    to match HF/PyTorch SGD, not the AdamW-style decoupled parameter shrink."""
+    """SGD must use coupled decay (folded into the gradient before momentum) to match HF/PyTorch SGD, not the AdamW-style decoupled parameter shrink."""
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     class DummyModel:
@@ -1467,9 +1444,7 @@ def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup)
     ]
 
     if scheduler == "linear" and warmup == 0:
-        # Match `transformers.get_scheduler("linear", num_warmup_steps=0,
-        # num_training_steps=total_steps)` as seen by optimizer steps across
-        # Transformers 4.56.1 through 5.5.0: step 1 uses base LR, then decays.
+        # Matches transformers get_scheduler linear with num_warmup_steps=0 on Transformers 4.56.1 through 5.5.0: step 1 uses base LR, then decays.
         lr = trainer.args.learning_rate
         expected = [lr * (total_steps - step) / total_steps for step in range(total_steps)]
         assert values == pytest.approx(expected)
@@ -1516,9 +1491,7 @@ def test_mlx_text_dataset_does_not_append_eos(monkeypatch):
     dataset = _prepare_dataset([{"text": "hello"}], Tokenizer(), append_eos=False)
     assert dataset[0] == ([1, 2, 3], 0)
 
-    # Default (mlx-lm parity for direct MLX text fine-tuning callers)
-    # appends the tokenizer EOS so a raw `{"text": str}` row still
-    # trains the model to predict EOS.
+    # Default appends the tokenizer EOS (mlx-lm parity for direct MLX callers) so a raw text row still trains the model to predict EOS.
     dataset_default = _prepare_dataset([{"text": "hello"}], Tokenizer())
     assert dataset_default[0] == ([1, 2, 3, 99], 0)
 
@@ -2645,10 +2618,7 @@ def test_evaluate_batch_totals_uses_single_eval_status_collective():
 
 
 def test_check_all_masked_reduces_counts_across_ranks(monkeypatch):
-    # In DDP each rank only sees its own shard. A rank whose shard happens to be
-    # entirely masked must not raise alone (that would hang peers at the next
-    # collective); the bad/good counts are all-summed first so the raise/warn
-    # decision is global and identical on every rank.
+    # In DDP a fully masked local shard must not raise alone (peers hang at the next collective); counts are all-summed so the decision is global.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
@@ -2661,8 +2631,7 @@ def test_check_all_masked_reduces_counts_across_ranks(monkeypatch):
     monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
 
     all_bad = [("ids", None, mx.array([[-100, -100]]))]
-    # Local shard is fully masked, but the global reduction sees good rows, so
-    # no rank raises. (Would raise ZeroDivisionError without the reduction.)
+    # Local shard is fully masked but the global reduction sees good rows, so no rank raises (ZeroDivisionError without the reduction).
     _check_all_masked(all_bad, comm_group=object(), world_size=2)
 
 
@@ -2685,17 +2654,13 @@ def test_eval_callback_stop_request_synced_before_best_model_track():
     cb_idx = src.index("for cb in self._eval_callbacks")
     track_idx = src.index("_track = not self.stop_requested")
     assert cb_idx < track_idx
-    # A rank-wide stop sync must sit between the rank-0-only eval callbacks and
-    # the divergent best-model / early-stopping branch, else a callback that
-    # sets stop_requested on rank 0 alone makes _track diverge and hangs peers
-    # at the rank-0-guarded best-model save collective.
+    # A rank-wide stop sync must sit between rank-0-only eval callbacks and the _track branch, else a rank-0-only stop_requested hangs peers at the save.
     assert src.find("self._distributed_should_stop()", cb_idx, track_idx) != -1
 
 
 def _all_masked_vlm_plan():
-    # Response-mask filtering drops all-masked rows, so an all-bad checked plan
-    # only arises from rows that bypass it (pad slots, prompt/completion rows).
-    # Model that directly through the class contract (checker_good=False rows).
+    # Mask filtering drops all-masked rows, so an all-bad plan only comes from bypassing rows (pad slots,
+    # prompt/completion); model it via checker_good=False rows.
     from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan, _FiniteVLMRow
 
     return FiniteVLMBatchPlan(
@@ -2710,8 +2675,7 @@ def _all_masked_vlm_plan():
 
 
 def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
-    # VLM mirror of the text-path mask check: a fully-masked local shard must not
-    # raise alone in DDP, since supervision counts are all-summed first.
+    # VLM mirror of the text-path mask check: a fully-masked local shard must not raise alone in DDP; counts are all-summed first.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
@@ -2738,8 +2702,7 @@ def test_reset_run_state_clears_last_eval_metrics():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     trainer = MLXTrainer.__new__(MLXTrainer)
-    # A prior run's eval metrics must not leak into a reused trainer that then
-    # runs without eval (eval_steps=0 or no eval dataset).
+    # A prior run's eval metrics must not leak into a reused trainer that then runs without eval (eval_steps=0 or no eval dataset).
     trainer._last_eval_metrics = {"eval_loss": 1.23, "eval_perplexity": 4.5}
     trainer._reset_run_state()
     assert trainer._last_eval_metrics == {}
@@ -2752,8 +2715,7 @@ def test_distributed_diagnostics_per_rank_tokens_use_local_history():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     src = inspect.getsource(MLXTrainer._distributed_training_diagnostics)
-    # per_rank_tokens must be gathered from this rank's LOCAL token total, not
-    # the all-reduced global trained_tokens (which would inflate by world_size).
+    # per_rank_tokens must come from this rank's LOCAL token total, not the all-reduced global trained_tokens (which would inflate by world_size).
     m = re.search(
         r"per_rank_tokens\s*=\s*self\._distributed_rank_vector\(\s*([A-Za-z_]+)",
         src,
@@ -2763,10 +2725,7 @@ def test_distributed_diagnostics_per_rank_tokens_use_local_history():
 
 
 def test_mlx_batch_input_token_count_counts_all_positions():
-    # The helper feeding num_input_tokens_seen must count every input position
-    # (prompt + response + padding), matching HF's input_ids.numel(), for both
-    # the text/preference/GRPO tuple batch and the VLM dict batch, and degrade to
-    # 0 (rather than raise) when no input-id tensor is present.
+    # num_input_tokens_seen counts every input position (prompt, response, padding) like HF input_ids.numel(); returns 0, never raises, when no input ids.
     import mlx.core as mx
     from unsloth_zoo.mlx.trainer import _mlx_batch_input_token_count
 
@@ -2781,10 +2740,7 @@ def test_mlx_batch_input_token_count_counts_all_positions():
 
 
 def test_on_init_end_dispatch_uses_distributed_failure_consensus():
-    # Because on_init_end now runs with rank-specific process-zero flags, a
-    # rank-0-only callback failure there must abort every rank via the same DDP
-    # failure consensus as _fire; otherwise rank 0 unwinds __init__ while peers
-    # proceed into train() and hang at the next collective.
+    # A rank-0-only failure in on_init_end must use the same DDP failure consensus as _fire, or rank 0 unwinds __init__ while peers hang at the next collective.
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -2798,10 +2754,7 @@ def test_on_init_end_dispatch_uses_distributed_failure_consensus():
 
 
 def test_num_input_tokens_seen_persisted_and_restored_across_resume():
-    # HF saves num_input_tokens_seen in trainer_state.json and restores it on
-    # resume; the MLX loop increments it every step, so it must be checkpointed
-    # and restored into the callback-visible state (else a token-budget callback
-    # restarts at 0 after resume and overruns).
+    # num_input_tokens_seen is checkpointed and restored like HF's trainer_state.json; else a token-budget callback restarts at 0 on resume and overruns.
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -2815,10 +2768,7 @@ def test_num_input_tokens_seen_persisted_and_restored_across_resume():
 
 
 def test_should_epoch_stop_field_reset_and_honored():
-    # HF's TrainerControl.should_epoch_stop must (1) exist so a callback reading
-    # it does not AttributeError, (2) be reset at on_epoch_begin, and (3) be
-    # honored by ending the current epoch early -- skipping its remaining
-    # micro-batches to the next epoch boundary, rank-synced for DDP lockstep.
+    # HF's TrainerControl.should_epoch_stop must exist, reset at on_epoch_begin, and end the current epoch early by skipping to the next boundary, rank-synced.
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer, _MLXTrainerControl
 
@@ -2829,27 +2779,20 @@ def test_should_epoch_stop_field_reset_and_honored():
     assert "def _sync_epoch_stop" in src
     assert "_distributed_any_flag(self.control.should_epoch_stop)" in src
     assert "_sync_epoch_stop()" in src
-    # The honor fast-forwards to the next epoch boundary (shared skip helper) for
-    # every run with a known epoch length: materialized batches advance the index,
-    # declared-length streams drain the producer to the same boundary. Gating the
-    # honor itself on `batch_iter is None` dropped the request for streams.
+    # Epoch-stop honor fast-forwards to the next boundary for any known epoch length (shared skip helper); materialized
+    # batches advance the index and declared-length streams drain the producer; gating on batch_iter is None dropped
+    # stream requests.
     assert "def _honor_epoch_stop_skip" in src
     assert "batch_idx += next_boundary - it_val" in src
     assert "for _ in range(next_boundary - it_val):" in src
     assert "batch_idx = next_boundary" in src
     assert "if batches_per_epoch and _sync_epoch_stop():" in src
     assert "batches_per_epoch and batch_iter is None" not in src
-    # On an epoch-count-driven path the shortened epoch also shrinks the
-    # optimizer-step budget so the run does not overtrain past num_train_epochs.
-    # The budget is recomputed from the micro-batches that remain after the skip
-    # (conceptual total minus the advanced cursor). Using
-    # _epoch_stop_total_microbatches covers BOTH epoch layouts (the default cycled
-    # single-pass and the torch_randperm materialized-all-epochs path); the old
-    # flag-gated len(batches) form skipped the default path.
+    # On epoch-count runs an early epoch stop also shrinks the step budget so it does not overtrain past
+    # num_train_epochs; the remaining micro-batches are _epoch_stop_total_microbatches minus the cursor, covering both
+    # the cycled and torch_randperm layouts.
     assert "_remaining = _epoch_stop_total_microbatches - batch_idx" in src
-    # The skip lands on an epoch boundary, so what remains is whole epochs and
-    # each costs a ceil'd step count; flooring the micro-batches shortens the
-    # epochs that were never truncated.
+    # The skip lands on an epoch boundary, so the remainder is whole epochs, each a ceil'd step count; flooring micro-batches shortens untruncated epochs.
     assert "(_remaining // _epoch_flush_microbatches)" in src
     assert "_mlx_steps_per_epoch(" in src
     assert "_remaining // grad_accum" in src
@@ -2857,8 +2800,7 @@ def test_should_epoch_stop_field_reset_and_honored():
 
 
 def test_reset_run_state_does_not_own_stop_requested_attr():
-    # _reset_run_state must not touch stop_requested at all: with the attribute
-    # absent, the reset leaves it absent (train() entry is the sole owner).
+    # _reset_run_state must not touch stop_requested; with the attribute absent it stays absent, since train() entry is its sole owner.
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     trainer = MLXTrainer.__new__(MLXTrainer)
@@ -2871,10 +2813,8 @@ def test_reset_run_state_preserves_callbacks_and_batches():
 
     trainer = MLXTrainer.__new__(MLXTrainer)
 
-    # Callbacks registered via add_step_callback / add_eval_callback before
-    # train() (and the report_to callbacks set up inside train() before
-    # _train_inner) must survive the per-run reset that _train_inner runs, else
-    # user eval hooks never fire and W&B / TensorBoard logging is dropped.
+    # Callbacks from add_step_callback/add_eval_callback/report_to must survive the per-run reset in _train_inner, else
+    # eval hooks and W&B/TensorBoard are dropped.
     step_cb, eval_cb = object(), object()
     prebuilt = ["batch"]
     trainer._batches = prebuilt
@@ -2909,8 +2849,7 @@ def test_resolved_best_metric_name_mirrors_hf_lookup():
 
 
 def test_best_metric_direction_is_inferred_when_it_is_not_set():
-    # A preference run selects on rewards/accuracies, where "better" is upward.
-    # An unset direction defaulting to False would keep the worst checkpoint.
+    # A preference run selects on rewards/accuracies where higher is better, so an unset direction defaulting to False would keep the worst checkpoint.
     from unsloth_zoo.mlx.trainer import _resolve_greater_is_better
 
     class Args:
@@ -2933,10 +2872,7 @@ def test_best_metric_direction_is_inferred_when_it_is_not_set():
 
 
 def test_perplexity_is_inferred_as_lower_is_better():
-    # HF's rule is a bare "loss" suffix, because HF never emits perplexity. This
-    # trainer emits it for every token objective, and the field defaulted to
-    # False before the direction was inferred at all -- so reading it upward
-    # would invert best-checkpoint selection for runs that predate inference.
+    # Perplexity must infer lower-is-better: HF never emits it, so its bare loss suffix rule misses it; reading it upward inverts best-checkpoint selection.
     from unsloth_zoo.mlx.trainer import _resolve_greater_is_better
 
     class Args:
@@ -2949,9 +2885,7 @@ def test_perplexity_is_inferred_as_lower_is_better():
 
 
 def test_the_resolved_direction_is_not_written_to_the_callers_config():
-    # The direction has to be a real boolean on the arguments before any
-    # callback reads it, but `args` belongs to the caller: a config handed to
-    # two trainers, or inspected afterwards, must come back as it went in.
+    # The resolved direction must be a real boolean before callbacks read it, but args belongs to the caller and must come back unchanged.
     import dataclasses
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
@@ -3449,17 +3383,9 @@ def test_qwen3_vl_vision_rotary_uses_transformers_fp32_math():
 
 
 def test_qwen3_vl_vision_block_mlp_fp32_guard_for_fp16():
-    """Pin the fp16 MLP overflow guard in patched_qwen3_vision_block_call.
-
-    On M1/M2 Macs (no native bf16), MLX defaults to float16 for the vision
-    tower. The vision block's MLP linear_fc1 (up-projection) produces output
-    magnitudes that exceed fp16's 65504 ceiling for some inputs; downcasting
-    to fp16 saturates to inf and cascades to NaN in the backward.
-
-    Fix: when activation dtype is fp16, upcast the MLP input to fp32 so the
-    entire MLP (fc1, GELU, fc2) runs in fp32. The output is cast back to
-    source dtype at the residual add. bf16/fp32 keep the original path.
-    """
+    """Pins the fp16 MLP overflow guard in patched_qwen3_vision_block_call: M1/M2 default the vision tower to fp16,
+    linear_fc1 can exceed 65504 and go inf/NaN in backward, so fp16 MLP input is upcast to run the MLP in fp32 and
+    cast back at the residual add; bf16/fp32 unchanged."""
     import inspect
     import unsloth_zoo.mlx.compile as mc
 
@@ -4106,9 +4032,8 @@ def test_quantized_linear_forward():
 
 
 def test_on_log_eval_request_or_syncs_onto_peer_ddp(monkeypatch):
-    # world_size == 2: a callback sets should_evaluate during on_log on rank 0
-    # only; _distributed_sync_control_actions must OR it onto the peer (rank 1)
-    # so both ranks agree to enter the collective eval, none left spinning.
+    # At world_size 2, a should_evaluate set in on_log on rank 0 only is OR-ed onto rank 1 by
+    # _distributed_sync_control_actions so both enter the collective eval.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
@@ -4138,8 +4063,7 @@ def test_on_log_eval_request_or_syncs_onto_peer_ddp(monkeypatch):
     rank0._distributed_sync_control_actions()
     assert rank0.control.should_evaluate is True
 
-    # Rank 1 saw no local request but must adopt rank 0's eval after the sync,
-    # so it enters the same collective eval instead of hanging.
+    # Rank 1 saw no local request but must adopt rank 0's eval after the sync, so it enters the same collective eval instead of hanging.
     rank1 = make_trainer(rank=1)
     rank1.control.should_evaluate = False
     peer["value"] = base  # rank 0 contributes its should_evaluate into the OR
@@ -4148,10 +4072,8 @@ def test_on_log_eval_request_or_syncs_onto_peer_ddp(monkeypatch):
 
 
 def test_on_evaluate_save_request_or_syncs_onto_peer_ddp(monkeypatch):
-    # world_size == 2: a callback sets should_save during on_evaluate on rank 0
-    # only; _distributed_sync_control_actions must OR it onto the peer (rank 1)
-    # so both ranks agree to enter the collective checkpoint save, none left
-    # spinning at the on_save / _raise_distributed_failure collective.
+    # At world_size 2, a should_save set in on_evaluate on rank 0 only is OR-ed onto rank 1 by
+    # _distributed_sync_control_actions so both enter the collective save.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
@@ -4181,8 +4103,7 @@ def test_on_evaluate_save_request_or_syncs_onto_peer_ddp(monkeypatch):
     rank0._distributed_sync_control_actions()
     assert rank0.control.should_save is True
 
-    # Rank 1 saw no local request but must adopt rank 0's save after the sync,
-    # so it enters the same collective checkpoint instead of hanging.
+    # Rank 1 saw no local request but must adopt rank 0's save after the sync, so it joins the same collective checkpoint instead of hanging.
     rank1 = make_trainer(rank=1)
     rank1.control.should_save = False
     peer["value"] = base * base  # rank 0 contributes its should_save into the OR
@@ -4191,12 +4112,8 @@ def test_on_evaluate_save_request_or_syncs_onto_peer_ddp(monkeypatch):
 
 
 def test_fire_rank_zero_callback_failure_syncs_across_ranks(monkeypatch):
-    # Regression for "Synchronize rank-zero callback failures". A callback that
-    # raises on rank 0 must not unwind rank 0 alone: the peers never enter the
-    # rank-0-only dispatch, so they would return and hang at the next collective
-    # while rank 0 aborts. _fire routes the rank-0 failure through the
-    # distributed consensus (_raise_distributed_failure), which every rank calls
-    # in lockstep, so all ranks raise together and the original error surfaces.
+    # A callback raising on rank 0 must not unwind rank 0 alone (peers would hang at the next collective); _fire routes
+    # the failure through _raise_distributed_failure so every rank raises together.
     import inspect
 
     import mlx.core as mx
@@ -4204,21 +4121,17 @@ def test_fire_rank_zero_callback_failure_syncs_across_ranks(monkeypatch):
     import unsloth_zoo.mlx.trainer as trainer_mod
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
-    # Source-level: _fire wraps the rank-0 call_event and routes failures through
-    # the distributed consensus path rather than propagating on rank 0 alone.
+    # Source-level check: _fire wraps the rank-0 call_event and routes failures through the distributed consensus path, not rank 0 alone.
     src = inspect.getsource(MLXTrainer._train_inner)
     fire_def = src.index("def _fire(event, **kwargs):")
     fire_body = src[fire_def:src.index("def _sync_stop():", fire_def)]
     assert "call_event" in fire_body
-    # BaseException, not Exception: an interrupt raised inside a callback
-    # (KeyboardInterrupt from a Ctrl-C landing there, SystemExit) has to reach the
-    # same consensus, or the peers strand in it. See
-    # test_callback_interrupt_joins_the_ddp_failure_consensus.
+    # Catches BaseException, not Exception: an interrupt (KeyboardInterrupt, SystemExit) in a callback must reach the
+    # same consensus or peers strand; see test_callback_interrupt_joins_the_ddp_failure_consensus.
     assert "except BaseException" in fire_body
     assert "self._raise_distributed_failure(" in fire_body
 
-    # Behavioral world_size == 2 consensus: rank 0 failed, peer succeeded, both
-    # must raise (no peer left waiting at the collective).
+    # Behavioral world_size 2 consensus: rank 0 failed and the peer succeeded, so both must raise and no peer is left waiting at the collective.
     peer = {"value": 0}
     def fake_all_sum(value, group=None, stream=None):
         return value + mx.array(peer["value"], dtype=value.dtype)
@@ -4240,8 +4153,7 @@ def test_fire_rank_zero_callback_failure_syncs_across_ranks(monkeypatch):
     with pytest.raises(RuntimeError, match="callback"):
         rank0._raise_distributed_failure(True, "on_log callback", ValueError("boom"))
 
-    # Rank 1 saw no local failure but the reduced consensus is non-zero, so it
-    # aborts too instead of hanging at the next all-reduce.
+    # Rank 1 saw no local failure but the reduced consensus is non-zero, so it aborts too rather than hang at the next all-reduce.
     rank1 = make_trainer(rank=1)
     peer["value"] = 1  # rank 0 contributes its failure into the reduction
     with pytest.raises(RuntimeError, match="peer rank failed"):
@@ -4249,21 +4161,9 @@ def test_fire_rank_zero_callback_failure_syncs_across_ranks(monkeypatch):
 
 
 def test_on_save_requires_a_resumable_checkpoint(monkeypatch):
-    # Regression: the adapter write set checkpoint_written, then a failing
-    # save_optimizer_state / save_trainer_state was swallowed with a printed
-    # warning -- so on_save still fired and integrations (hub uploaders,
-    # checkpoint trackers) recorded checkpoint-N as a resume point. It is not
-    # one: save_trainer_state opens trainer_state.json before json.dump raises,
-    # leaving the file truncated and unparseable.
-    #
-    # HF never reaches on_save here. _save_checkpoint calls
-    # _save_optimizer_and_scheduler and state.save_to_json with no fallback, so
-    # the failure propagates out of _maybe_log_save_evaluate before
-    # callback_handler.on_save. Measured on transformers 5.14.1 and 4.57.6 with
-    # an ExportableState callback returning a datetime: train() raises
-    # TypeError("Object of type datetime is not JSON serializable") and the
-    # on_save log stays empty. _prune_stale_checkpoints in this same function
-    # is already gated on the completeness flag, for the same reason.
+    # A failed save_optimizer_state/save_trainer_state must not advertise checkpoint-N via on_save: trainer_state.json
+    # is left truncated; HF propagates before on_save (verified on transformers 5.14.1 and 4.57.6);
+    # _prune_stale_checkpoints gates on the same completeness flag.
     import json
 
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -4280,9 +4180,8 @@ def test_on_save_requires_a_resumable_checkpoint(monkeypatch):
             return control
 
     class UnserializableState:
-        """A callback exporting bookkeeping json.dump cannot encode.
-        _export_callback_states is duck-typed on state(), so this reaches the
-        stateful_callbacks payload."""
+        """A callback exporting bookkeeping that json.dump cannot encode; _export_callback_states is duck-typed on
+        state(), so this reaches the stateful_callbacks payload."""
         def state(self):
             import datetime
 
@@ -4328,8 +4227,7 @@ def test_on_save_requires_a_resumable_checkpoint(monkeypatch):
     # The resume state could not be written, so nothing may advertise it.
     broken, broken_dir = run([UnserializableState()])
     assert broken.advertised == []
-    # The adapters are still kept on disk: the swallow itself is deliberate,
-    # only the advertisement was wrong.
+    # Adapters stay on disk and the swallow is deliberate; only the on_save advertisement of the checkpoint was wrong.
     assert os.path.exists(os.path.join(broken_dir, "adapters.safetensors"))
     # ... and the directory really is unresumable, which is what on_save claimed.
     with open(os.path.join(broken_dir, "trainer_state.json")) as fh:
@@ -4390,8 +4288,7 @@ def test_streaming_window_identity_grouping_padding_gate_and_ddp_slice():
     assert grouped == _window_batches(rows, window=4) != baseline
     assert [ids for ids, _ in _window_batches(rows, window=4, seed=1)] != [ids for ids, _ in grouped]
 
-    # Single process: pad_source must be empty (cycle padding is multi-rank only)
-    # and the partial tail stays short.
+    # Single process: pad_source must be empty (cycle padding is multi-rank only) and the partial tail stays short.
     from unsloth_zoo.mlx import utils as mlx_utils
     odd, seen_pads = _window_rows(_WINDOW_LENGTHS[:7]), []
     original = mlx_utils._rank_slice_distributed_batch
@@ -4779,15 +4676,9 @@ def test_epoch_permuted_visits_are_deterministic_and_guard_enumerated():
 
 
 def test_wandb_artifact_mode_suppressed_for_on_train_end():
-    # transformers' WandbCallback.on_train_end logs its final-model artifact by
-    # constructing a Torch Trainer around args/model and calling its Torch
-    # save_model (integrations/integration_utils.py, 4.x and 5.x alike). MLX
-    # models are not torch.nn.Module and MLXTrainingConfig is not a
-    # TrainingArguments, so that constructor raises AttributeError
-    # (full_determinism on 5.x, batch_eval_metrics on 4.57.x). The adapters are
-    # already on disk by then, so the crash costs the caller the whole
-    # MLXTrainOutput of a run that actually finished. The bridge must clear the
-    # artifact mode for that one dispatch and restore it afterwards.
+    # WandbCallback.on_train_end builds a torch Trainer that raises AttributeError on MLX configs (full_determinism in
+    # 5.x, batch_eval_metrics in 4.57.x); clear artifact mode for that dispatch and restore it, since the adapters are
+    # already on disk.
     import enum
     import inspect
 
@@ -4822,8 +4713,7 @@ def test_wandb_artifact_mode_suppressed_for_on_train_end():
                 )
 
     class CustomWandbCallback(WandbCallback):
-        """Subclassing WandbCallback to customise logging is a common recipe,
-        and it inherits the same on_train_end."""
+        """A WandbCallback subclass, a common recipe for custom logging, inherits the same on_train_end."""
 
     class OtherCallback:
         def __init__(self):
@@ -4852,8 +4742,7 @@ def test_wandb_artifact_mode_suppressed_for_on_train_end():
     # Both artifact modes are cleared for the dispatch...
     assert artifact_cb._log_model.is_enabled is False
     assert checkpoint_cb._log_model.is_enabled is False
-    # ... a WandbCallback that never asked for artifacts is untouched, and a
-    # same-shaped non-Wandb callback is never rewritten.
+    # Only WandbCallbacks with artifact logging enabled are changed; a WandbCallback with it off and a same-shaped non-Wandb callback are left alone.
     assert off_cb._log_model is _LogModel.FALSE
     assert other_cb._log_model is _LogModel.END
 
@@ -4869,19 +4758,15 @@ def test_wandb_artifact_mode_suppressed_for_on_train_end():
     assert artifact_cb._log_model is _LogModel.END
     assert checkpoint_cb._log_model is _LogModel.CHECKPOINT
 
-    # ...and the training loop actually wires it around the real dispatch,
-    # with a restore that survives a callback raising.
+    # The training loop wires the artifact-mode suppression around the real dispatch, with a restore that survives a callback raising.
     source = inspect.getsource(MLXTrainer._train_inner)
     assert "_suppress_torch_only_final_artifacts()" in source
     assert 'finally:\n            self._restore_final_artifact_modes(' in source
 
 
 def test_wandb_watch_is_neutralized_for_the_on_train_begin_dispatch():
-    # transformers' WandbCallback.setup runs on the first on_train_begin and,
-    # when WANDB_WATCH is gradients/parameters/all, calls wandb.watch(model),
-    # which raises TypeError("Expected a pytorch model (torch.nn.Module)") on an
-    # mlx Module. The opt-in therefore aborts training during callback setup.
-    # Upstream reads the environment variable, so that is the lever.
+    # WandbCallback.setup on the first on_train_begin calls wandb.watch when WANDB_WATCH is gradients/parameters/all,
+    # which raises TypeError and aborts training on an MLX module; upstream reads that env var, so it is the lever.
     import inspect
 
     from unsloth_zoo.mlx.trainer import (
@@ -4933,17 +4818,14 @@ def test_wandb_watch_is_neutralized_for_the_on_train_begin_dispatch():
         else:
             os.environ["WANDB_WATCH"] = previous
 
-    # The loop wires it around the real dispatch, restoring even if a callback
-    # raises.
+    # The loop wires the WANDB_WATCH suppression around the real dispatch and restores it even if a callback raises.
     source = inspect.getsource(MLXTrainer._train_inner)
     assert "_suppress_torch_only_wandb_watch()" in source
     assert "finally:\n            self._restore_wandb_watch(" in source
 
 
 def test_best_checkpoint_survives_save_total_limit_rotation(tmp_path):
-    # HF's _rotate_checkpoints never deletes best_model_checkpoint. Ours pruned
-    # by age alone, so save_total_limit=1 with a best result at step 1 and a worse
-    # save at step 2 deleted checkpoint-1 and left callbacks a dangling path.
+    # Like HF's _rotate_checkpoints, pruning must never delete best_model_checkpoint; age-only pruning left callbacks a dangling path with save_total_limit=1.
     from unsloth_zoo.mlx.trainer import _prune_stale_checkpoints
 
     for step in (1, 2, 3):
@@ -4958,8 +4840,7 @@ def test_best_checkpoint_survives_save_total_limit_rotation(tmp_path):
     _prune_stale_checkpoints(str(tmp_path), 1)
     assert [p.name for p in tmp_path.iterdir()] == ["checkpoint-3"]
 
-    # Protecting an old best must not stop the limit binding: excluding it from
-    # the stale slice instead retained save_total_limit + 1 from then on.
+    # Protecting an old best must not stop the limit binding; excluding it from the stale slice retained save_total_limit + 1 checkpoints.
     for step in (1, 2, 3, 4):
         (tmp_path / f"checkpoint-{step}").mkdir(exist_ok=True)
     _prune_stale_checkpoints(str(tmp_path), 2, keep_step=1)
@@ -4969,9 +4850,7 @@ def test_best_checkpoint_survives_save_total_limit_rotation(tmp_path):
 
 
 def test_final_metrics_separate_sample_and_token_throughput(monkeypatch):
-    # train_samples_per_second is HF's standard sample-throughput key and this
-    # payload now reaches integration callbacks, so publishing tokens/s under it
-    # recorded a sequence-length-dependent number as samples/s.
+    # train_samples_per_second is HF's sample-throughput key and reaches integration callbacks, so tokens/s must not be published under it.
     _patch_value_and_grad_with_aux(monkeypatch)
 
     trainer, _batches = _epoch_flush_loop_trainer(
@@ -4989,10 +4868,8 @@ def test_final_metrics_separate_sample_and_token_throughput(monkeypatch):
 
 
 def test_pre_loop_stop_still_reports_a_numeric_epoch(monkeypatch):
-    # A callback that stops the run from on_train_begin exits before the loop
-    # sets state.epoch. HF's TrainerState defaults it to 0, and stock callbacks
-    # rely on that: NotebookProgressCallback.on_train_end does int(state.epoch),
-    # so a zero-step cancellation raised TypeError instead of returning.
+    # A stop from on_train_begin exits before the loop sets state.epoch; HF's TrainerState defaults it to 0 and
+    # NotebookProgressCallback.on_train_end calls int(state.epoch), so it must stay numeric.
     _patch_value_and_grad_with_aux(monkeypatch)
 
     class _StopAtBegin:
@@ -5019,10 +4896,8 @@ def test_pre_loop_stop_still_reports_a_numeric_epoch(monkeypatch):
 
 
 def test_best_checkpoint_path_is_recorded_for_callbacks(monkeypatch):
-    # HF's _save_checkpoint records checkpoint-<best_global_step> on state so
-    # on_save and on_train_end callbacks can find the best checkpoint. Ours left
-    # the field None for the whole run whenever best tracking is callback-side,
-    # so integrations could not locate a directory that was on disk.
+    # HF's _save_checkpoint records checkpoint-<best_global_step> on state so on_save and on_train_end callbacks can
+    # find the best checkpoint; ours stayed None under callback-side best tracking.
     _patch_value_and_grad_with_aux(monkeypatch)
 
     class _SaveSpy:
@@ -5030,8 +4905,7 @@ def test_best_checkpoint_path_is_recorded_for_callbacks(monkeypatch):
             self.paths = []
 
         def on_step_end(self, args, state, control, **kwargs):
-            # Stands in for an improving evaluation: HF's _determine_best_metric
-            # advances best_global_step and nothing else.
+            # Stands in for an improving evaluation: HF's _determine_best_metric advances best_global_step and nothing else.
             state.best_global_step = state.best_global_step or state.global_step
             return control
 
@@ -5079,8 +4953,7 @@ def _tiny_lm_for_loop_tests():
 
 
 def _frozen_optimizer():
-    """Optimizer stub that never changes the weights, so two runs see the
-    identical per-batch losses and only the log cadence differs."""
+    """Optimizer stub that never changes weights, so two runs see identical per-batch losses and differ only in log cadence."""
     import mlx.core as mx
 
     return lambda _total_steps: types.SimpleNamespace(
@@ -5091,9 +4964,8 @@ def _frozen_optimizer():
 
 
 def _patch_value_and_grad_with_aux(monkeypatch):
-    """The MLX-on-torch shim's nn.value_and_grad has no aux support, so the
-    trainer's (loss, tokens) return unpacks wrong. Return the real loss with
-    zero gradients; the frozen optimizer keeps the weights fixed anyway."""
+    """The shim's nn.value_and_grad has no aux support, so the trainer's (loss, tokens) return unpacks wrong; return the
+    real loss with zero gradients, since the frozen optimizer keeps weights fixed anyway."""
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_map
@@ -5107,10 +4979,8 @@ def _patch_value_and_grad_with_aux(monkeypatch):
 
 
 def test_resume_mid_epoch_fires_epoch_begin(monkeypatch):
-    # HF dispatches on_epoch_begin at the top of every epoch, including the
-    # resumed partial one, and only then skips its already-trained batches. The
-    # MLX loop fired begin at exact boundaries only, so a mid-epoch resume
-    # delivered an on_epoch_end with no preceding begin.
+    # HF fires on_epoch_begin at the top of every epoch, including a resumed partial one, before skipping trained
+    # batches; MLX fired it only at exact boundaries, leaving on_epoch_end unpaired.
     import tempfile
 
     import mlx.core as mx
@@ -5174,8 +5044,7 @@ def test_resume_mid_epoch_fires_epoch_begin(monkeypatch):
     resumed = EpochOrderCallback()
     build(resumed).train(resume_from_checkpoint=ckpt)
 
-    # Every end is paired with a preceding begin, and the resumed partial epoch
-    # opens with one rather than closing an epoch nobody opened.
+    # Every on_epoch_end must have a preceding on_epoch_begin, including the resumed partial epoch.
     assert resumed.events, resumed.events
     assert resumed.events[0] == "begin", resumed.events
     depth = 0
@@ -5185,8 +5054,7 @@ def test_resume_mid_epoch_fires_epoch_begin(monkeypatch):
 
 
 def test_train_bumps_run_generation_in_finally():
-    # The stamp only separates runs if every train() closes its generation, a
-    # raising one included, else a failed run's stop would block the next one.
+    # The generation stamp only separates runs if every train() closes its generation, raising ones included, else a failed run's stop blocks the next run.
     import inspect
 
     from unsloth_zoo.mlx.trainer import MLXTrainer
@@ -5198,9 +5066,7 @@ def test_train_bumps_run_generation_in_finally():
 
 
 def test_stateful_callbacks_exported_into_checkpoints(monkeypatch):
-    # TrainerState declared stateful_callbacks but nothing wrote it, so
-    # checkpoints carried no callback bookkeeping. HF populates it in
-    # _save_checkpoint unconditionally (the opt-in flag gates only RESTORE).
+    # Checkpoints must export stateful_callbacks: HF fills it in _save_checkpoint unconditionally, and the opt-in flag gates only restore.
     import json
 
     import mlx.core as mx
@@ -5263,23 +5129,20 @@ def test_stateful_callbacks_exported_into_checkpoints(monkeypatch):
 
     with open(os.path.join(out_dir, "checkpoint-4", "trainer_state.json")) as fh:
         saved = json.load(fh)
-    # The exporting callback is recorded by class name; the one whose state()
-    # raises NotImplementedError is skipped rather than aborting the save.
+    # Exporting callbacks are recorded by class name, and one whose state() raises NotImplementedError is skipped rather than aborting the save.
     assert saved["stateful_callbacks"] == {
         "Patience": {"args": {}, "attributes": {"counter": 4}}
     }
     assert "NotExportable" not in saved["stateful_callbacks"]
 
-    # Resuming mirrors the checkpoint into the callback-visible state instead of
-    # leaving the declared field empty.
+    # Resuming mirrors the checkpoint into the callback-visible state instead of leaving the declared field empty.
     resumed = build([Patience()])
     resumed.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
     assert resumed.state.stateful_callbacks["Patience"]["attributes"]["counter"] == 2
 
-    # Reusing that SAME trainer for a fresh train() must not keep serving run-1's
-    # checkpoint bookkeeping: _resume_stateful_callbacks is cached and the restore
-    # is unconditional. HF rebuilds TrainerState from the live callbacks each run
-    # and only loads trainer_state.json when resume_from_checkpoint is given.
+    # A fresh train() on a reused trainer must not serve run-1's bookkeeping: _resume_stateful_callbacks is cached and
+    # restore is unconditional; HF rebuilds TrainerState from live callbacks each run and loads trainer_state.json only
+    # with resume_from_checkpoint.
     seen = []
 
     class Recorder:
@@ -5294,12 +5157,8 @@ def test_stateful_callbacks_exported_into_checkpoints(monkeypatch):
 
 
 def test_checkpoint_epoch_reaches_resumed_lifecycle_events(monkeypatch):
-    # The checkpoint payload carried global_step but not state.epoch, so
-    # _init_callback_state opened every resumed run at epoch=None: callbacks saw
-    # no progress at on_train_begin, and a no-op resume (checkpoint already at
-    # max_steps, loop body never runs) kept None through on_train_end, where
-    # HF's stock NotebookProgressCallback does int(state.epoch). HF checkpoints
-    # TrainerState wholesale, so epoch is restored alongside global_step.
+    # Checkpoints must carry state.epoch, not only global_step: otherwise resumed runs open at epoch=None, and a no-op
+    # resume keeps None through on_train_end, where NotebookProgressCallback calls int(state.epoch).
     import json
 
     import mlx.core as mx
@@ -5330,8 +5189,7 @@ def test_checkpoint_epoch_reaches_resumed_lifecycle_events(monkeypatch):
 
     def build(spy):
         args = MLXTrainingConfig(
-            # 4 rows at batch size 1 = 4 micro-batches per epoch, so the
-            # checkpoint at step 2 sits exactly half way through epoch 1.
+            # 4 rows at batch size 1 give 4 micro-batches per epoch, so the step-2 checkpoint sits exactly half way through epoch 1.
             per_device_train_batch_size=1,
             max_steps=4,
             gradient_accumulation_steps=1,
@@ -5364,47 +5222,36 @@ def test_checkpoint_epoch_reaches_resumed_lifecycle_events(monkeypatch):
     with open(os.path.join(out_dir, "checkpoint-2", "trainer_state.json")) as fh:
         assert json.load(fh)["epoch"] == pytest.approx(0.5)
 
-    # Mid-epoch resume: on_train_begin reports the checkpoint's progress, which
-    # is what HF's restored TrainerState carries there.
+    # Mid-epoch resume: on_train_begin reports the checkpoint's progress, as HF's restored TrainerState does.
     mid = EpochSpy()
     build(mid).train(
         resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
     assert mid.begin == [pytest.approx(0.5)], mid.begin
 
-    # No-op resume: the loop body never runs, so nothing else can supply the
-    # epoch and it must stay the checkpoint's through on_train_end.
+    # No-op resume: the loop body never runs, so nothing else supplies the epoch and it must stay the checkpoint's through on_train_end.
     noop = EpochSpy()
     reused = build(noop)
     reused.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-4"))
     assert noop.begin == [pytest.approx(1.0)], noop.begin
     assert noop.end == [pytest.approx(1.0)], noop.end
 
-    # Reusing that trainer for a fresh train() must not serve the checkpoint's
-    # epoch: HF only reads trainer_state.json when resume_from_checkpoint is
-    # given. It opens at TrainerState's own default instead, not None, so a run
-    # cancelled before the loop still hands callbacks a number.
+    # A fresh train() on a reused trainer must not serve the checkpoint's epoch (HF reads trainer_state.json only with
+    # resume_from_checkpoint); it opens at TrainerState's default, not None, so a run cancelled before the loop still
+    # gives callbacks a number.
     reused.train()
     assert noop.begin[1] == pytest.approx(0.0), noop.begin
 
 
 def _periodic_log_steps(state):
-    """Steps of the per-window training logs, with the final summary dropped.
-
-    train() ends with one aggregate on_log (train_loss / train_runtime / ...),
-    like HF's Trainer.log(metrics) immediately before on_train_end, so the tail
-    entry is a run summary rather than a training-window log. Asserted here so
-    callers keep pinning both the cadence and the summary.
-    """
+    """Steps of per-window training logs, excluding the final run-summary on_log that train() emits (train_loss, train_runtime) before on_train_end."""
     entries = list(state.log_history)
     assert entries and "train_runtime" in entries[-1], entries[-1:]
     return [entry["step"] for entry in entries[:-1]]
 
 
 def test_log_history_persisted_and_restored_across_resume(monkeypatch):
-    # trainer_state.json carried the native loss history but not the
-    # callback-visible TrainerState.log_history, which _init_callback_state reset
-    # to [], so a resumed run reported only its post-resume entries. HF restores
-    # the whole TrainerState, log_history included, from trainer_state.json.
+    # trainer_state.json must persist log_history, which _init_callback_state reset to [] so resumed runs reported only
+    # post-resume entries; HF restores the whole TrainerState from it.
     import json
 
     import mlx.core as mx
@@ -5458,8 +5305,7 @@ def test_log_history_persisted_and_restored_across_resume(monkeypatch):
     resumed.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
     assert _periodic_log_steps(resumed.state) == [1, 2, 3, 4]
 
-    # Reusing that SAME trainer for a fresh run must start from an empty history
-    # (HF only loads trainer_state.json when resume_from_checkpoint is given).
+    # A reused trainer's fresh run must start from an empty history; HF loads trainer_state.json only when resume_from_checkpoint is given.
     resumed.train()
     assert _periodic_log_steps(resumed.state) == [1, 2, 3, 4]
 
@@ -5476,18 +5322,16 @@ def test_log_history_persisted_and_restored_across_resume(monkeypatch):
 
 
 def test_fractional_step_intervals_resolve_against_total_steps(monkeypatch):
-    # HF accepts these as a step count or a ratio in (0, 1) of the total steps,
-    # expanded in TrainerState.compute_steps. int(ratio) turned 0.5 into 0, which
-    # silently disabled logging and checkpointing while the synthesized strategy
-    # still said "steps", and made DefaultFlowCallback take global_step % 0.
+    # Fractional step intervals in (0, 1) resolve against total steps as in TrainerState.compute_steps; int(ratio)
+    # turned 0.5 into 0, silently disabling logging and saving while the strategy still said steps, and making
+    # DefaultFlowCallback compute global_step % 0.
     import mlx.core as mx
 
     from unsloth_zoo.mlx.trainer import (
         MLXTrainer, MLXTrainingConfig, _resolve_interval_steps,
     )
 
-    # Mirrors transformers' TrainerState.compute_steps: ceil(max_steps * ratio),
-    # with plain counts passed through untouched.
+    # Mirrors transformers' TrainerState.compute_steps: ceil(max_steps * ratio), with plain counts passed through untouched.
     assert _resolve_interval_steps(0.1, 20) == 2
     assert _resolve_interval_steps(0.25, 20) == 5
     assert _resolve_interval_steps(0.5, 20) == 10
@@ -5553,12 +5397,8 @@ def test_fractional_step_intervals_resolve_against_total_steps(monkeypatch):
 
 
 class _FakeClock:
-    """Wall clock that only moves when the loop consumes a micro-batch.
-
-    perf_counter() is a pure read, so `train_time += perf_counter() - tic`
-    charges exactly COST[i] seconds to micro-batch i, making the reported
-    tokens/s and step times exact, checkable numbers.
-    """
+    """Fake clock that moves only when a micro-batch is consumed (perf_counter() is a pure read), charging exactly
+    COST[i] seconds to micro-batch i, so reported tokens/s and step times are exact."""
 
     def __init__(self, real):
         self._real = real
@@ -5572,11 +5412,9 @@ class _FakeClock:
 
 
 def test_forced_epoch_log_splits_pending_wall_clock_from_committed(monkeypatch):
-    # Regression: the committed/pending split covered loss/tokens/steps but not
-    # train_time. With the epoch boundary on a NON-update microstep (grad_accum=2,
-    # batches-per-epoch=3), the forced log reported COMMITTED tokens yet was
-    # charged the pending micro-batch's duration, understating its tokens/s and
-    # then hiding that duration from the window that owned it.
+    # train_time must follow the committed/pending split: a forced epoch-end log on a non-update microstep
+    # (grad_accum=2, batches-per-epoch=3) reported committed tokens but was charged the pending micro-batch's duration,
+    # understating tokens/s and hiding it from its owning window.
     import tempfile
     import time as _time
 
@@ -5585,14 +5423,12 @@ def test_forced_epoch_log_splits_pending_wall_clock_from_committed(monkeypatch):
 
     _patch_value_and_grad_with_aux(monkeypatch)
 
-    # micro-batch: 1 2 3 4 5 6   (updates at 2, 4 -> no; grad_accum=2 -> 2, 4, 6)
-    # epoch boundaries at 3 and 6; microstep 3 is a substep, and it is expensive.
+    # With grad_accum=2 updates land at micro-batches 2, 4 and 6; epoch boundaries at 3 and 6, and microstep 3 is an expensive non-update substep.
     costs = [1.0, 1.0, 10.0, 1.0, 1.0, 1.0]
     clock = _FakeClock(_time)
     monkeypatch.setattr(trainer_mod, "time", clock)
 
-    # The per-micro-batch input-token count is this test's clock hook, and it only
-    # runs when include_num_input_tokens_seen is enabled, so opt in explicitly.
+    # The per-micro-batch input-token count is this test's clock hook and only runs when include_num_input_tokens_seen is enabled, so opt in explicitly.
     consumed = {"i": 0}
     real_count = trainer_mod._mlx_batch_input_token_count
 
@@ -5637,14 +5473,12 @@ def test_forced_epoch_log_splits_pending_wall_clock_from_committed(monkeypatch):
 
     trainer.train()
 
-    # Two logs: the forced epoch-end log at microstep 3 (committed = micro 1+2)
-    # and the final-step log (committed = micro 3+4 and 5+6).
+    # Two logs are expected: a forced epoch-end log at microstep 3 (committed micro 1+2) and a final-step log (committed micro 3+4 and 5+6).
     assert len(trainer._tokens_per_second_history) == 2
     tokens = trainer._global_token_count_history
     assert len(tokens) == 2
 
-    # Window 1 owns micro-batches 1 and 2 -> 1.0 + 1.0 = 2.0 s.
-    # Window 2 owns micro-batches 3..6 -> 10.0 + 1.0 + 1.0 + 1.0 = 13.0 s.
+    # Window 1 owns micro-batches 1-2 (2.0 s); window 2 owns micro-batches 3-6 (13.0 s, including the expensive micro-batch 3).
     assert trainer._tokens_per_second_history[0] == pytest.approx(
         tokens[0] / 2.0, rel=1e-9,
     )
@@ -5653,8 +5487,7 @@ def test_forced_epoch_log_splits_pending_wall_clock_from_committed(monkeypatch):
     )
     # _step_times is the window's wall clock over its micro-batch count.
     assert trainer._step_times == pytest.approx([2.0 / 2, 13.0 / 4], rel=1e-9)
-    # Guard the guard: the unsplit clock charged window 1 all 12.0 s (micro 3
-    # included) and left window 2 with only 3.0 s.
+    # Guards the split: an unsplit clock would charge window 1 all 12.0 s (micro 3 included) and leave window 2 only 3.0 s.
     assert trainer._tokens_per_second_history[0] != pytest.approx(
         tokens[0] / 12.0, rel=1e-9,
     )
@@ -5664,12 +5497,8 @@ def test_forced_epoch_log_splits_pending_wall_clock_from_committed(monkeypatch):
 
 
 def test_eval_request_from_eval_log_is_cleared_before_on_evaluate(monkeypatch):
-    # Regression: _run_eval cleared control.should_evaluate BEFORE dispatching the
-    # eval-metrics on_log, so a callback requesting evaluation from on_log had its
-    # fresh should_evaluate=True survive on_evaluate. HF clears it inside
-    # CallbackHandler.on_evaluate, i.e. after evaluate() logged its metrics. With
-    # the early reset, _maybe_callback_epoch_end saw the stale flag and ran a
-    # SECOND full evaluation at the same global_step.
+    # _run_eval must clear control.should_evaluate inside on_evaluate as HF does; an early reset let an on_log request
+    # survive into a second eval at the same step.
     import inspect
     import tempfile
 
@@ -5722,8 +5551,7 @@ def test_eval_request_from_eval_log_is_cleared_before_on_evaluate(monkeypatch):
     trainer._callback_batches_per_epoch = lambda _batches: 4
     trainer.eval_dataset = [{"input_ids": [1, 2, 3, 4]}]
     trainer._eval_batches_labeled = ["batch-0"]
-    # The eval maths is exercised elsewhere; here only the control-flag lifecycle
-    # around the on_log/on_evaluate dispatch matters.
+    # Eval maths is covered elsewhere; this test checks only the control-flag lifecycle around the on_log/on_evaluate dispatch.
     evaluations = []
 
     def _fake_evaluate(batches, loss_fn, is_vlm=False):
@@ -5737,8 +5565,7 @@ def test_eval_request_from_eval_log_is_cleared_before_on_evaluate(monkeypatch):
 
     trainer.train()
 
-    # Exactly one evaluation at the boundary step, and HF's flag state inside
-    # on_evaluate (already cleared), not the stale True.
+    # Expects one eval at the boundary step, and HF's flag state inside on_evaluate already cleared, not the stale True.
     assert spy.evaluates == [(4, False)]
     assert evaluations == [1], "the eval ran once, not twice at the same step"
     eval_records = [
@@ -5749,8 +5576,7 @@ def test_eval_request_from_eval_log_is_cleared_before_on_evaluate(monkeypatch):
 
 
 def test_callback_num_train_epochs_mirrors_hf_arithmetic():
-    # Unit coverage of the paths one run cannot reach: epoch-count runs pass
-    # through untouched, and a streaming / length-less plan stays at 0.
+    # Unit coverage for paths one run cannot reach: epoch-count runs pass through untouched; streaming or length-less plans stay at 0.
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     trainer = MLXTrainer.__new__(MLXTrainer)
@@ -5768,8 +5594,7 @@ def test_callback_num_train_epochs_mirrors_hf_arithmetic():
     # grad_accum=3 -> ceil(4 / 3) = 2 updates/epoch -> ceil(50 / 2) = 25.
     trainer.args.gradient_accumulation_steps = 3
     assert trainer._callback_num_train_epochs(50, list(range(100))) == 25
-    # A run shorter than one epoch still reports one epoch, like HF's
-    # `max_steps // nupe + int(max_steps % nupe > 0)` for max_steps < nupe.
+    # A run shorter than one epoch still reports one epoch, like HF's max_steps // nupe + int(max_steps % nupe > 0) for max_steps < nupe.
     trainer.args.gradient_accumulation_steps = 1
     assert trainer._callback_num_train_epochs(2, list(range(100))) == 1
     # Streaming: no finite plan, no epoch events, field left alone.
@@ -5782,9 +5607,7 @@ def test_callback_num_train_epochs_mirrors_hf_arithmetic():
 
 
 def test_callback_num_train_epochs_honors_max_steps_over_configured_epochs():
-    # HF derives the total from max_steps whenever it is set, ignoring
-    # num_train_epochs, which a real TrainingArguments leaves at 3.0.
-    # MLXTrainingConfig.max_steps defaults to 60, so this is the common path.
+    # HF takes the total from max_steps whenever it is set, ignoring num_train_epochs (3.0 in TrainingArguments); MLXTrainingConfig.max_steps defaults to 60.
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     trainer = MLXTrainer.__new__(MLXTrainer)
@@ -5802,22 +5625,14 @@ def test_callback_num_train_epochs_honors_max_steps_over_configured_epochs():
     # A max_steps run cut short of one pass reports the truncated total, not 3.
     trainer.args.gradient_accumulation_steps = 1
     assert trainer._callback_num_train_epochs(3, list(range(3))) == 1
-    # Streaming has no boundaries to derive from: keep the configured value
-    # rather than dropping back to the ZeroDivisionError-prone 0.
+    # Streaming has no boundaries to derive from, so keep the configured value rather than falling back to the ZeroDivisionError-prone 0.
     assert trainer._callback_num_train_epochs(60, None) == 3
 
 
 def test_fractional_num_train_epochs_reports_a_ceiled_callback_total(monkeypatch):
-    # num_train_epochs is a float in TrainingArguments/SFTConfig and a
-    # fractional value is supported. HF reports the CEILED count in
-    # TrainerState -- `num_train_epochs = math.ceil(args.num_train_epochs)`
-    # (transformers set_initial_training_values, identical in 5.14.1 and
-    # 4.57.6) -- which is the same rounding its step budget uses
-    # (`max_steps = ceil(num_train_epochs * num_update_steps_per_epoch)`), and
-    # the MLX budget already matched. The callback total truncated instead, so
-    # a 1.5-epoch run advertised 1 epoch while state.epoch climbed to 1.5:
-    # every callback normalizing progress by the total read 150 percent, and
-    # the two numbers HF keeps consistent contradicted each other.
+    # HF reports the ceiled num_train_epochs (math.ceil, the same rounding as its max_steps budget, identical in
+    # transformers 5.14.1 and 4.57.6); truncating advertised 1 epoch for a 1.5-epoch run, so callbacks normalizing
+    # progress read 150 percent.
     _patch_value_and_grad_with_aux(monkeypatch)
 
     class EpochTotalSpy:
@@ -5840,27 +5655,19 @@ def test_fractional_num_train_epochs_reports_a_ceiled_callback_total(monkeypatch
     )
     trainer.train()
 
-    # Real transformers on this shape (4 rows at batch 1, grad_accum 2,
-    # num_train_epochs=1.5): max_steps = ceil(1.5 * 2) = 3, num_train_epochs =
-    # ceil(1.5) = 2, final state.epoch = 1.5. Measured on 5.14.1 and 4.57.6.
+    # Golden values from transformers 5.14.1 and 4.57.6 (4 rows, batch 1, grad_accum 2, num_train_epochs=1.5); max_steps 3, num_train_epochs 2, state.epoch 1.5.
     assert trainer.state.max_steps == 3
     assert spy.at_train_begin == 2
     assert trainer.state.num_train_epochs == 2
     assert trainer.state.epoch == pytest.approx(1.5)
-    # Progress never exceeds 100 percent now that the total covers the epochs
-    # the run actually reports.
+    # Progress stays at or below 100 percent because the callback total covers the epochs the run actually reports.
     assert spy.progress == [pytest.approx(0.5), pytest.approx(0.75)]
     assert max(spy.progress) <= 1.0
 
 
 def test_callback_best_metric_persisted_across_resume_without_native_tracking(monkeypatch):
-    # The callback-visible watermark (TrainerState.best_metric) advances on every
-    # eval whenever metric_for_best_model is set, but the NATIVE best fields are
-    # only written by _run_best_tracking, gated on load_best_model_at_end or
-    # early_stopping_patience. With both off the checkpoint persisted only the null
-    # native value, so on resume EarlyStoppingCallback saw best_metric=None and
-    # called the first post-resume eval a new best. HF has no such split: it
-    # checkpoints and reloads the whole TrainerState.
+    # best_metric advances with metric_for_best_model alone, but native best fields need load_best_model_at_end or
+    # early_stopping_patience; HF checkpoints the whole TrainerState, so best_metric must survive resume.
     import json
 
     import mlx.core as mx
@@ -5946,16 +5753,14 @@ def test_callback_best_metric_persisted_across_resume_without_native_tracking(mo
     assert saved["callback_best_metric"] == pytest.approx(0.9)
     assert saved["callback_best_step"] == 2
 
-    # Resume: the first post-resume eval is WORSE (1.5 > 0.9). Callbacks must see
-    # the restored 0.9 watermark, and it must survive the worse metric.
+    # On resume the first eval (1.5) is worse than the restored 0.9 watermark; callbacks must see 0.9 and it must survive the worse metric.
     resumed, resumed_spy = build(4, [1.5])
     resumed.train(resume_from_checkpoint=ckpt)
     assert resumed_spy.seen == [(4, pytest.approx(0.9), 2)]
     assert resumed.state.best_metric == pytest.approx(0.9)
     assert resumed.state.best_global_step == 2
 
-    # Reusing that same trainer for a FRESH run must not carry the watermark over
-    # (HF only loads trainer_state.json when resume_from_checkpoint is given).
+    # A fresh run on the same trainer must not carry the watermark over; HF only loads trainer_state.json when resume_from_checkpoint is given.
     fresh_spy = BestSpy()
     resumed.callback_handler.callbacks = [
         cb for cb in resumed.callback_handler.callbacks
@@ -5973,8 +5778,7 @@ def test_callback_best_metric_persisted_across_resume_without_native_tracking(mo
     resumed.train()
     assert fresh_spy.seen == [(2, None, None)], "no phantom best on a fresh run"
 
-    # A pre-fix checkpoint has no callback_best_* keys and must stay resumable,
-    # falling back to the native value exactly as before.
+    # Checkpoints lacking callback_best_* keys must stay resumable and fall back to the native best value.
     saved.pop("callback_best_metric")
     saved.pop("callback_best_step")
     with open(os.path.join(ckpt, "trainer_state.json"), "w") as fh:
@@ -5986,13 +5790,9 @@ def test_callback_best_metric_persisted_across_resume_without_native_tracking(mo
 
 @pytest.mark.parametrize("best_weights_present", [False, True])
 def test_missing_best_weights_clears_callback_best_state(monkeypatch, best_weights_present):
-    # Resuming a checkpoint copied into an output_dir without best/ restarts the
-    # NATIVE best tracking, but the callback-visible watermark was still restored
-    # from the checkpoint. EarlyStoppingCallback then measured the first eval
-    # against weights that no longer exist (patience 1 stops immediately) while
-    # _run_best_tracking called that same eval a new best and overwrote the
-    # watermark with that worse value. HF keeps one watermark for both, and its
-    # _determine_best_metric only ever moves it in the improving direction.
+    # Without best/ the restored callback watermark must be cleared: early stopping would measure evals against missing
+    # weights, and native tracking would overwrite the watermark with a worse value; HF keeps one watermark that only
+    # improves.
     import json
     import shutil
 
@@ -6073,8 +5873,7 @@ def test_missing_best_weights_clears_callback_best_state(monkeypatch, best_weigh
         saved = json.load(fh)
     assert saved["callback_best_metric"] == pytest.approx(0.9)
 
-    # Copy the checkpoint alone into a fresh output_dir; best/ follows only in
-    # the control leg.
+    # Copy the checkpoint alone into a fresh output_dir; best/ follows only in the control leg.
     shutil.copytree(ckpt, os.path.join(dir_b, "checkpoint-2"))
     if best_weights_present:
         shutil.copytree(os.path.join(dir_a, "best"), os.path.join(dir_b, "best"))
@@ -6085,15 +5884,13 @@ def test_missing_best_weights_clears_callback_best_state(monkeypatch, best_weigh
     resumed.train(resume_from_checkpoint=os.path.join(dir_b, "checkpoint-2"))
 
     if best_weights_present:
-        # Weights are there, so the restored watermark is real: the first worse
-        # eval exhausts patience and the best stays where it was.
+        # With best/ present the restored watermark is real: the first worse eval exhausts patience and the best stays where it was.
         assert spy.seen == [(4, pytest.approx(0.9), 2, f"{dir_b}/best")]
         assert resumed.state.global_step == 4
         assert (resumed._best_metric, resumed._best_step) == (0.9, 2)
         assert resumed.state.best_metric == pytest.approx(0.9)
     else:
-        # Tracking restarted, so callbacks must see no watermark and the run must
-        # not stop against a model it cannot restore.
+        # Tracking restarted without best/, so callbacks must see no watermark and the run must not stop against a model it cannot restore.
         assert spy.seen[0] == (4, None, None, None)
         assert resumed.state.global_step == 8
         assert [step for step, *_ in spy.seen] == [4, 6, 8]
@@ -6105,21 +5902,9 @@ def test_missing_best_weights_clears_callback_best_state(monkeypatch, best_weigh
 
 
 def test_externally_cancelled_eval_is_not_dispatched_to_callbacks(monkeypatch):
-    # Regression: stop_requested is an externally owned property -- a controller
-    # (the Studio cancel button) may set it at any time -- and
-    # _evaluate_batch_totals deliberately skips every remaining eval batch while
-    # it is set. With zero batches scored _evaluate returns eval_loss 0.0, yet
-    # _run_eval dispatched that phantom result anyway: EarlyStoppingCallback read
-    # 0.0 as an improvement and reset its patience counter, and
-    # _update_callback_best_metric latched a watermark no real evaluation can
-    # ever beat. _run_checkpoint then persisted both into checkpoint-N, so the
-    # corruption survived into the resumed run.
-    #
-    # A CALLBACK stop must keep its real evaluation: it is deliberately left in
-    # control.should_training_stop until after this step's log/eval/save (HF's
-    # _maybe_log_save_evaluate runs _determine_best_metric and the checkpoint
-    # before the loop honors should_training_stop), so it never reaches this
-    # gate. The second half of this test pins that.
+    # External stop_requested (set by a controller such as the Studio cancel button) skips every eval batch; the phantom
+    # 0.0 eval_loss must not reach callbacks or checkpoints, since it reset early-stopping patience and latched the best
+    # watermark; a callback stop keeps its real eval.
     import inspect
     import json
 
@@ -6132,8 +5917,7 @@ def test_externally_cancelled_eval_is_not_dispatched_to_callbacks(monkeypatch):
     _patch_value_and_grad_with_aux(monkeypatch)
 
     def eval_capable_lm():
-        """_tiny_lm_for_loop_tests' train() takes no mode, so nn.Module.eval()
-        (which calls train(False)) raises. The real _evaluate needs both."""
+        """_tiny_lm_for_loop_tests' train() takes no mode argument, so nn.Module.eval() (which calls train(False)) raises; the real _evaluate needs both."""
         class TinyLM(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -6176,8 +5960,7 @@ def test_externally_cancelled_eval_is_not_dispatched_to_callbacks(monkeypatch):
             return control
 
     class StopAtLastEval:
-        """external=True stands in for a controller cancelling the run;
-        external=False is an ordinary callback stop."""
+        """external=True stands in for a controller cancelling the run; external=False is an ordinary callback stop."""
         def __init__(self, step, external):
             self.step = step
             self.external = external
@@ -6229,8 +6012,7 @@ def test_externally_cancelled_eval_is_not_dispatched_to_callbacks(monkeypatch):
         trainer._prepare_data = lambda _is_vlm: (
             [make_batch(10) for _ in range(6)], None,
         )
-        # Real eval batches: the abort under test lives in _evaluate_batch_totals,
-        # so _evaluate must not be stubbed out.
+        # Keep real eval batches: the abort under test lives in _evaluate_batch_totals, so _evaluate must not be stubbed out.
         trainer._eval_batches_labeled = [make_batch(10)]
         trainer._build_optimizer = _frozen_optimizer()
         trainer.save_model = lambda *_a, **_kw: None
@@ -6270,10 +6052,8 @@ def test_externally_cancelled_eval_is_not_dispatched_to_callbacks(monkeypatch):
         "early_stopping_patience_counter": 2,
     }
 
-    # The rank agreement is invisible at world size 1, so pin it at the source:
-    # the suppression is decided by the OR-reduce, or a cancel landing on one
-    # rank after _evaluate's last eval-status collective returns that rank alone
-    # and strands its peers inside _fire.
+    # World size 1 hides rank agreement, so pin it in source: suppression must come from the OR-reduce, else a cancel
+    # landing on one rank after the last _evaluate eval-status collective strands peers in _fire.
     src = inspect.getsource(MLXTrainer._train_inner)
     eval_body = src[src.index("def _run_eval("):src.index("def _run_best_tracking(")]
     guard = eval_body.index("if self._distributed_should_stop():")
@@ -6282,12 +6062,8 @@ def test_externally_cancelled_eval_is_not_dispatched_to_callbacks(monkeypatch):
 
 
 def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
-    # train_loss_token_sum/_total are written only by _run_training_log, so a
-    # checkpoint taken on a step whose applied updates are not logged yet (a save
-    # cadence out of phase with the log cadence) persisted totals covering fewer
-    # steps than its own global_step, and the resumed run's final train_loss lost
-    # them. The payload must fold the committed window in without mutating the
-    # live accumulators, or the later log of the same window double counts.
+    # train_loss_token_sum/_total are written only by _run_training_log; the checkpoint folds in the committed but
+    # unlogged window (else resume loses it) without mutating live totals, which would double count.
     import json
 
     import mlx.core as mx
@@ -6317,8 +6093,7 @@ def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
         args = MLXTrainingConfig(
             max_steps=4,
             gradient_accumulation_steps=1,
-            # No log cadence: the only forced log is the final step, so the
-            # step-2 checkpoint lands with steps 1-2 committed but unlogged.
+            # No log cadence, so only the final step is logged; the step-2 checkpoint lands with steps 1-2 committed but unlogged.
             logging_steps=100,
             save_steps=2,
             use_cce=False,
@@ -6330,8 +6105,7 @@ def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
             disable_memory_limits=True,
             output_dir=out_dir,
         )
-        # Same init in every run so the frozen-weight losses are comparable
-        # across the reference run and the interrupted/resumed pair.
+        # Same init in every run so frozen-weight losses are comparable across the reference run and the interrupted/resumed pair.
         mx.random.seed(1234)
         trainer = MLXTrainer(
             _tiny_lm_for_loop_tests(),
@@ -6347,8 +6121,7 @@ def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
         trainer.save_model = lambda *_a, **_kw: None
         return trainer
 
-    # Reference: one uninterrupted 4-step run. The frozen optimizer keeps every
-    # per-batch loss identical, so its totals are exactly twice a 2-step run's.
+    # Reference is one uninterrupted 4-step run; the frozen optimizer keeps per-batch losses identical, so its totals are exactly twice a 2-step run's.
     whole = build()
     whole.train()
     assert whole._train_loss_token_total > 0
@@ -6362,8 +6135,7 @@ def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
     assert saved["train_loss_token_sum"] == pytest.approx(
         whole._train_loss_token_sum / 2
     )
-    # ... and folding it into the payload must not double count in the live run:
-    # the final totals still cover exactly the 4 applied steps.
+    # ... and folding it into the payload must not double count in the live run: the final totals still cover exactly the 4 applied steps.
     assert whole._train_loss_token_total == 2 * saved["train_loss_token_total"]
 
     interrupted = build(stop_after=2)
@@ -6382,9 +6154,8 @@ def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
 
 
 def test_integration_callback_args_cover_stock_trackio_and_swanlab():
-    # transformers' own TrackioCallback / SwanLabCallback read TrainingArguments
-    # fields straight off args inside on_train_begin, so any field this compat
-    # shim omits aborts a real MLX run with AttributeError before step 1.
+    # Stock TrackioCallback and SwanLabCallback read TrainingArguments fields in on_train_begin, so any field this shim
+    # omits aborts the run with AttributeError.
     import inspect
     import re
 
@@ -6400,8 +6171,7 @@ def test_integration_callback_args_cover_stock_trackio_and_swanlab():
     trainer._ensure_callback_args_compat()
     args = trainer.args
 
-    # HF's own TrainingArguments defaults, so an unconfigured run reaches the
-    # tracking SDK exactly as it would from a Torch Trainer.
+    # Uses HF's own TrainingArguments defaults, so an unconfigured run reaches the tracking SDK exactly as it would from a Torch Trainer.
     assert args.project == "huggingface"
     for name in (
         "trackio_space_id", "trackio_bucket_id", "trackio_static_space_id",
@@ -6425,14 +6195,9 @@ def test_integration_callback_args_cover_stock_trackio_and_swanlab():
 
 
 def test_callback_events_dispatch_on_every_rank(monkeypatch):
-    # Regression for "Dispatch state-mutating callbacks on every rank". HF fires
-    # callbacks in every process and expects host I/O to self-gate on
-    # state.is_world_process_zero. Firing on rank 0 only left the peers'
-    # process-local state un-mutated: an on_pre_optimizer_step callback that
-    # overrides optimizer.learning_rate updated rank 0 alone, so the peers applied
-    # the same all-reduced gradient with a different LR and the replicas silently
-    # diverged. The per-rank flags _init_callback_state already seeds also stayed
-    # unobservable, since only rank 0 (always world-process-zero) ever saw them.
+    # Callbacks fire on every rank as in HF, whose host I/O self-gates on state.is_world_process_zero; rank-0-only
+    # dispatch let an on_pre_optimizer_step callback overriding optimizer.learning_rate silently diverge the replicas
+    # and hid per-rank flags from peers.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
@@ -6440,8 +6205,7 @@ def test_callback_events_dispatch_on_every_rank(monkeypatch):
 
     _patch_value_and_grad_with_aux(monkeypatch)
 
-    # Homogeneous world of 2: every rank contributes an identical value, so the
-    # all-sum is the local value doubled and average_gradients is the identity.
+    # Homogeneous world of 2: identical values per rank make all_sum the local value doubled and average_gradients the identity.
     monkeypatch.setattr(
         trainer_mod.mx.distributed, "all_sum",
         lambda value, group=None, stream=None: value * mx.array(2, dtype=value.dtype),
@@ -6515,8 +6279,7 @@ def test_callback_events_dispatch_on_every_rank(monkeypatch):
             optimizer = types.SimpleNamespace(
                 learning_rate=mx.array(base_lr), state={},
             )
-            # The fused update reads optimizer.learning_rate, so the value held
-            # here is what actually moves this rank's parameters.
+            # The fused update reads optimizer.learning_rate, so the value recorded here is what actually moves this rank's parameters.
             optimizer.update = lambda _model, _grad: seen_lr.append(
                 round(float(mx.array(optimizer.learning_rate).item()), 6)
             )
@@ -6536,23 +6299,17 @@ def test_callback_events_dispatch_on_every_rank(monkeypatch):
     # Guard the guard: rank-0-only dispatch left the peer on the un-overridden LR.
     assert rank1_seen != [base_lr] * 4
 
-    # Cost check: the peer sees the real flag, so a stock-shaped callback still
-    # does its host I/O exactly once across the world.
+    # Cost check: the peer sees the real flag, so a stock-shaped callback still does its host I/O exactly once across the world.
     assert rank0_io_cb.peer_flags and all(rank0_io_cb.peer_flags)
     assert rank1_io_cb.peer_flags and not any(rank1_io_cb.peer_flags)
-    # Two cadence logs (logging_steps=2 over 4 steps) plus the run summary
-    # train() dispatches before on_train_end.
+    # Writes are two cadence logs (logging_steps=2 over 4 steps) plus the run summary that train() dispatches before on_train_end.
     assert rank0_io_cb.writes == 3
     assert rank1_io_cb.writes == 0
 
 
 def test_training_config_exposes_sanitized_dict_for_integration_callbacks():
-    # Regression for "Add the serialization method required by NeptuneCallback".
-    # HF's NeptuneCallback reads the config through args.to_sanitized_dict()
-    # (integrations/integration_utils.py) with a bare attribute access, so
-    # omitting it raised AttributeError out of on_train_begin and aborted the
-    # run. HF reports the resolved batch sizes and keeps only exact
-    # bool/int/float/str, stringifying anything a tracker cannot store.
+    # NeptuneCallback reads args.to_sanitized_dict() by bare attribute access, so omitting it aborts on_train_begin;
+    # like HF, report resolved batch sizes and keep only exact bool/int/float/str, stringifying the rest.
     import json
 
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
@@ -6578,9 +6335,7 @@ def test_training_config_exposes_sanitized_dict_for_integration_callbacks():
         per_device_train_batch_size=4,
     ).to_sanitized_dict()["eval_batch_size"] == 4
 def test_vlm_checker_consumes_plan_metadata_only():
-    """Call-path contract after the eager internals were deleted: the
-    all-masked checker reads construction-time plan supervision counts and
-    no longer iterates materialized batch dicts."""
+    """The all-masked VLM checker reads construction-time plan supervision counts and no longer iterates materialized batch dicts."""
     import inspect
 
     from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
@@ -6654,9 +6409,8 @@ def test_real_hf_concat_infinite_detection_matches_actual_termination(axis):
 
 
 def test_appended_config_fields_union_keeps_legacy_dumps_wholesale():
-    # The appended-field set must be the union of every field either side added,
-    # or a full-field dump from a release predating any of them stops counting as
-    # a wholesale copy and its default warmup_steps overrides warmup_ratio.
+    # The appended-field set must be the union of fields either side added; otherwise a full dump from an older release
+    # is not treated as wholesale and default warmup_steps overrides warmup_ratio.
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
 
     appended = (
@@ -6693,11 +6447,8 @@ def test_appended_config_fields_union_keeps_legacy_dumps_wholesale():
 
 
 def test_resume_cursor_is_epoch_aligned_for_ragged_epochs():
-    # Once an epoch's tail forces a step, global_step no longer maps flatly onto
-    # micro-batches, so rebuilding the cursor as global_step * grad_accum skips the
-    # next epoch's opening micro-batch and cycles into an unplanned extra pass.
-    # HF rebuilds it per epoch (epochs_trained * steps_in_epoch +
-    # global_step % num_update_steps_per_epoch * grad_accum).
+    # With a forced epoch-tail step, global_step * grad_accum skips the next epoch's first micro-batch; HF rebuilds the
+    # cursor per epoch as epochs_trained * steps_in_epoch + global_step % num_update_steps_per_epoch * grad_accum.
     from unsloth_zoo.mlx.trainer import _mlx_microstep_for_step
 
     # 3 micro-batches at grad_accum=2: steps consume 2, 1, 2, 1 micro-batches.
@@ -6717,20 +6468,9 @@ def test_resume_cursor_is_epoch_aligned_for_ragged_epochs():
 
 
 def test_max_steps_ragged_pass_flushes_before_the_epoch_callbacks(monkeypatch):
-    # End-to-end through the real loop on the path a user actually hits: a
-    # max_steps run over a finite dataset gets a FiniteTextBatchPlan whose
-    # cycle_length is the exact one-pass micro-batch count. With 3 micro-batches
-    # per pass and grad_accum=2 the pass boundary fell on a NON-update microstep,
-    # so on_epoch_end (and the epoch-cadence checkpoint it requests) observed the
-    # model with the pass's last gradient still pending, and that gradient was
-    # then folded into the next pass's accumulation window.
-    #
-    # Golden values from real transformers (5.14.1 AND 4.57.6): 6 rows at
-    # per_device_train_batch_size=2, gradient_accumulation_steps=2, max_steps=3,
-    # save_strategy="epoch" -> 3 optimizer steps, on_epoch_end at (2, 1.0) and
-    # (3, 5/3), on_substep_end only at global_step 0 and 2, checkpoints at steps
-    # 2 and 3. The flat model produced on_epoch_end (1, 1.0) / (3, 2.0) and wrote
-    # its first checkpoint at step 1.
+    # FiniteTextBatchPlan cycle_length must be the exact one-pass micro-batch count; a pass ending on a non-update
+    # microstep must flush before on_epoch_end or its gradient leaks into the next pass; goldens match transformers
+    # 5.14.1 and 4.57.6.
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     from unsloth_zoo.mlx.utils import FiniteTextBatchPlan
 
@@ -6821,14 +6561,12 @@ def test_max_steps_ragged_pass_flushes_before_the_epoch_callbacks(monkeypatch):
     # The pass's 3rd micro-batch forced its own update, so it is NOT a substep.
     assert spy.substep_end == [0, 2]
     assert spy.saves == [(2, 1.0), (3, 1.666667)]
-    # The epoch checkpoint lands where HF's does, holding a model that HAS seen
-    # the pass's last micro-batch. The flat model wrote checkpoint-1 instead.
+    # The epoch checkpoint lands where HF's does, with the model having seen the pass's last micro-batch; the flat model wrote checkpoint-1 instead.
     assert sorted(
         entry for entry in os.listdir(args.output_dir)
         if entry.startswith("checkpoint-")
     ) == ["checkpoint-2", "checkpoint-3"]
-    # Step 1 took micro-batches 0+1, step 2 took the pass tail (2) alone, step 3
-    # opened the next pass with 3+4 -- the tail never mixed across the boundary.
+    # Step 1 took micro-batches 0+1, step 2 the pass tail (2) alone, step 3 opened the next pass with 3+4; the tail never mixed across the boundary.
     assert plan.visits == [0, 1, 2, 3, 4]
 
 
@@ -6836,12 +6574,9 @@ def _epoch_flush_loop_trainer(
     out_dir, *, microbatches_per_epoch, grad_accum, epochs, save_steps=0,
     callbacks=(), cycle_length=None,
 ):
-    """Trainer wired to run the real loop over recorded micro-batch visits.
-
-    cycle_length makes the plan a prebuilt multi-epoch schedule (the
-    torch_randperm path): microbatches_per_epoch is then the whole schedule and
-    cycle_length is one pass through the dataset.
-    """
+    """Trainer running the real loop over recorded micro-batch visits; cycle_length makes the plan a prebuilt
+    multi-epoch schedule (torch_randperm path): microbatches_per_epoch is then the whole schedule and cycle_length is
+    one pass through the dataset."""
     import mlx.core as mx
 
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -6895,8 +6630,7 @@ def _epoch_flush_loop_trainer(
     trainer.save_model = lambda *_a, **_kw: None
     if cycle_length is not None:
         RecordingBatches.cycle_length = int(cycle_length)
-        # _batches set so train() keeps the prebuilt-epoch flag it clears on the
-        # freshly-prepared path.
+        # Sets _batches so train() keeps the prebuilt-epoch flag, which it clears on the freshly-prepared path.
         trainer._batches = batches
         trainer._prepared_batches_include_epochs = True
     return trainer, batches
@@ -6929,12 +6663,8 @@ class _EpochScheduleSpy:
 
 
 def test_ragged_epoch_schedule_matches_transformers(monkeypatch):
-    # End-to-end through the real loop. Golden values measured by running
-    # transformers.Trainer (5.14.1 and 4.57.6) on the same shape: 6 rows at
-    # per_device_train_batch_size=2 is 3 micro-batches per epoch, grad_accum=2,
-    # num_train_epochs=2. HF runs 4 optimizer steps and fires on_epoch_end at
-    # (2, 1.0) and (4, 2.0); the flat model ran 3 and fired at (1, 1.0), (3, 2.0)
-    # with the epoch's last gradient still pending at the first on_epoch_end.
+    # Golden values from transformers 5.14.1 and 4.57.6: 3 micro-batches per epoch at grad_accum=2 over 2 epochs give 4
+    # optimizer steps and on_epoch_end at (2, 1.0), (4, 2.0).
     _patch_value_and_grad_with_aux(monkeypatch)
 
     spy = _EpochScheduleSpy()
@@ -6950,19 +6680,14 @@ def test_ragged_epoch_schedule_matches_transformers(monkeypatch):
     assert spy.step_end == [
         (1, 0.666667), (2, 1.0), (3, 1.666667), (4, 2.0),
     ]
-    # Every micro-batch is visited exactly once per epoch and no step straddles
-    # the boundary: visits 0,1 -> step 1; visit 2 -> step 2 (forced).
+    # Each micro-batch is visited once per epoch and no step straddles the boundary: visits 0,1 -> step 1; visit 2 -> step 2 (forced).
     assert batches.visits == [0, 1, 2, 0, 1, 2]
 
 
 def test_fractional_prebuilt_schedule_keeps_every_pass_boundary(monkeypatch):
-    # The torch_randperm path prebuilds every epoch, so 1.5 epochs of a
-    # 5-micro-batch pass is ONE plan spanning two passes and int(num_train_epochs)
-    # does not divide it. Reading the pass length as len(plan) // 1 made the whole
-    # plan a single epoch: the boundary at micro-batch 5 vanished and the
-    # accumulation window never restarted there. The plan's own cycle_length is
-    # the pass. Shape measured from a real transformers Trainer: 5 optimizer
-    # steps over 9 micro-batches.
+    # torch_randperm prebuilds every epoch, so 1.5 epochs of a 5-micro-batch pass is one plan that int(num_train_epochs)
+    # does not divide; pass length must come from cycle_length, not len(plan) // 1 (which dropped the boundary);
+    # transformers shape: 5 optimizer steps over 9 micro-batches.
     _patch_value_and_grad_with_aux(monkeypatch)
 
     spy = _EpochScheduleSpy()
@@ -6979,10 +6704,8 @@ def test_fractional_prebuilt_schedule_keeps_every_pass_boundary(monkeypatch):
 
 
 def test_divisible_epoch_schedule_is_unchanged(monkeypatch):
-    # Backwards compatibility: when the epoch divides evenly by grad_accum the
-    # ceil equals the floor, no micro-batch is ever a forced flush that was not
-    # already an update, and the schedule is bit-for-bit the pre-fix one (which
-    # also equals transformers: 8 rows at batch 2, grad_accum=2, 2 epochs -> 4).
+    # When the epoch divides evenly by grad_accum, ceil equals floor and no forced flush is added; the schedule is
+    # unchanged and matches transformers (8 rows at batch 2, grad_accum=2, 2 epochs -> 4).
     _patch_value_and_grad_with_aux(monkeypatch)
 
     spy = _EpochScheduleSpy()
@@ -6999,12 +6722,9 @@ def test_divisible_epoch_schedule_is_unchanged(monkeypatch):
 
 
 def test_epoch_aligned_resume_consumes_each_microbatch_once(monkeypatch):
-    # A ragged-epoch resume must pick up at the epoch boundary the checkpoint
-    # closed. The flat cursor (global_step * grad_accum) skipped the next epoch's
-    # opening micro-batch and ran two micro-batches into a third dataset pass
-    # num_train_epochs never authorised. transformers resumes the same run with
-    # epochs_trained = global_step // num_update_steps_per_epoch and consumes
-    # exactly the 3 remaining micro-batches.
+    # A ragged-epoch resume must restart at the epoch boundary: the flat cursor global_step * grad_accum skipped an
+    # epoch's first micro-batch and ran two micro-batches into an unauthorised third pass; transformers uses
+    # epochs_trained = global_step // num_update_steps_per_epoch.
     _patch_value_and_grad_with_aux(monkeypatch)
 
     out_dir = tempfile.mkdtemp()
@@ -7023,8 +6743,7 @@ def test_epoch_aligned_resume_consumes_each_microbatch_once(monkeypatch):
     )
     resumed.train(resume_from_checkpoint=ckpt)
 
-    # Epoch 2 only: 3 micro-batches, 2 optimizer steps, no repeat of epoch 1 and
-    # no third pass.
+    # Resumes epoch 2 only: 3 micro-batches and 2 optimizer steps, with no repeat of epoch 1 and no third pass.
     assert resumed_batches.visits == [0, 1, 2]
     assert resumed._global_step == 4
     assert spy.step_end == [(3, 1.666667), (4, 2.0)]
@@ -7032,12 +6751,8 @@ def test_epoch_aligned_resume_consumes_each_microbatch_once(monkeypatch):
 
 
 def test_epoch_stop_budget_keeps_untruncated_epochs_whole(monkeypatch):
-    # A should_epoch_stop callback truncates ONE epoch. Recomputing the remaining
-    # budget with a flat floor also shortened the epochs that were never
-    # truncated, silently dropping their last micro-batch. 5 micro-batches per
-    # epoch at grad_accum=2 over 2 epochs, stopping epoch 1 after step 2:
-    # transformers runs 5 steps (2 + a full 3) and fires on_epoch_end at
-    # (2, 0.8) then (5, 2.0).
+    # should_epoch_stop truncates only that epoch; recomputing budget with a flat floor silently dropped the last
+    # micro-batch of untruncated epochs (HF runs 5 steps: 2 + a full 3).
     _patch_value_and_grad_with_aux(monkeypatch)
 
     class StopEpochAtStepTwo:
@@ -7062,24 +6777,19 @@ def test_epoch_stop_budget_keeps_untruncated_epochs_whole(monkeypatch):
 @pytest.mark.parametrize(
     "microbatches_per_epoch,epochs,stop_at,expect_steps,expect_epoch_end,expect_visits",
     [
-        # 10 rows at per_device_train_batch_size=2 is 5 micro-batches per epoch,
-        # grad_accum=2 (3 optimizer steps per epoch), num_train_epochs=1.5 ->
-        # max_steps = ceil(1.5 * 3) = 5. Stopping epoch 1 after its first update
-        # leaves the whole authorized second epoch: HF runs 1 + 3 = 4 steps.
+        # 10 rows at batch 2 is 5 micro-batches per epoch, grad_accum=2 (3 steps per epoch), num_train_epochs=1.5 gives
+        # max_steps = ceil(1.5 * 3) = 5; stopping epoch 1 after its first update leaves the whole second epoch, so HF
+        # runs 1 + 3 = 4 steps.
         (5, 1.5, 1, 4, [(1, 0.4), (4, 2.0)], [0, 1, 0, 1, 2, 3, 4]),
-        # num_train_epochs=2.5 -> ceil(2.5 * 3) = 8 authorized steps; the stop
-        # forfeits only epoch 1's tail, so HF runs 1 + 3 + 3 = 7.
+        # num_train_epochs=2.5 gives ceil(2.5 * 3) = 8 authorized steps; the stop forfeits only epoch 1's tail, so HF runs 1 + 3 + 3 = 7.
         (5, 2.5, 1, 7, [(1, 0.4), (4, 2.0), (7, 3.0)],
          [0, 1, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4]),
-        # A DIVISIBLE epoch (4 micro-batches, grad_accum=2) is affected too: the
-        # defect is the truncated epoch count, not the ragged tail. 2 steps per
-        # epoch, ceil(1.5 * 2) = 3 authorized; HF runs 1 + 2 = 3.
+        # A divisible epoch (4 micro-batches, grad_accum=2) is hit too: the defect is the truncated epoch count, not the
+        # ragged tail; ceil(1.5 * 2) = 3 authorized, HF runs 1 + 2 = 3.
         (4, 1.5, 1, 3, [(1, 0.5), (3, 2.0)], [0, 1, 0, 1, 2, 3]),
-        # The ceiled horizon must never GROW the budget past what the fractional
-        # run authorized. 7 micro-batches per epoch, grad_accum=2 -> 4 steps per
-        # epoch, ceil(1.5 * 4) = 6 authorized. Stopping at step 3 and then running
-        # a whole second epoch would reach 3 + 4 = 7, but HF stops at max_steps:
-        # 6 steps, with the last epoch left partial at 1.857143.
+        # The ceiled horizon must never grow the budget past the fractional run's authorization: 7 micro-batches per
+        # epoch at grad_accum=2 give 4 steps per epoch and ceil(1.5 * 4) = 6 authorized; HF stops at max_steps with the
+        # last epoch partial at 1.857143.
         (7, 1.5, 3, 6, [(3, 0.857143), (6, 1.857143)],
          [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5]),
     ],
@@ -7088,17 +6798,9 @@ def test_fractional_epoch_stop_keeps_the_authorized_tail_epochs(
     monkeypatch, microbatches_per_epoch, epochs, stop_at, expect_steps,
     expect_epoch_end, expect_visits,
 ):
-    # A should_epoch_stop callback shrinks the remaining budget from a CONCEPTUAL
-    # horizon of total micro-batches. That horizon truncated num_train_epochs
-    # (int(1.5) == 1), so a fractional run that stopped inside its first epoch saw
-    # "one pass" as the whole run: the remaining budget went to zero and training
-    # ended at the stop instead of continuing into the epochs num_train_epochs had
-    # authorized. transformers sizes its epoch loop with
-    # num_train_epochs = ceil(args.num_train_epochs) (set_initial_training_values)
-    # and stops on max_steps = ceil(args.num_train_epochs * num_update_steps_per_
-    # epoch), so the horizon must ceil and the shrunk budget must be clamped.
-    # Golden values measured by running transformers.Trainer (5.14.1 and 4.57.6)
-    # on the matching row counts.
+    # A should_epoch_stop horizon that truncated num_train_epochs (int(1.5) == 1) ended fractional runs at the stop; HF
+    # ceils num_train_epochs for its epoch loop and max_steps, so the horizon must ceil and the budget be clamped;
+    # golden values from transformers 5.14.1 and 4.57.6.
     _patch_value_and_grad_with_aux(monkeypatch)
 
     class StopEpochAtStep:
@@ -7120,9 +6822,8 @@ def test_fractional_epoch_stop_keeps_the_authorized_tail_epochs(
 
 
 def test_mlx_batch_input_token_count_non_padding_ladder():
-    # The helper mirrors HF's "non_padding" ladder: attention mask first, then the
-    # text tuple batch's lengths column (its exclusive real-token end, i.e. that
-    # batch's attention mask), then a pad-token comparison, then every position.
+    # Mirrors HF's non_padding ladder: attention mask, then the text-tuple lengths column (exclusive real-token end),
+    # then pad-token comparison, then every position.
     import mlx.core as mx
 
     from unsloth_zoo.mlx.trainer import _mlx_batch_input_token_count
@@ -7142,8 +6843,8 @@ def test_mlx_batch_input_token_count_non_padding_ladder():
     assert _mlx_batch_input_token_count(tuple_batch) == 8
     assert _mlx_batch_input_token_count(tuple_batch, mode="non_padding") == 5
 
-    # Neither: the pad id is used when known, else every position (HF's warning
-    # path). 99 appears only as padding here, so both rungs agree with the mask.
+    # Neither mask nor lengths: pad id is used when known, else every position (HF's warning path); 99 appears only as
+    # padding, so both rungs agree with the mask.
     bare = {"input_ids": ids}
     assert _mlx_batch_input_token_count(
         bare, mode="non_padding", pad_token_id=99,
@@ -7165,19 +6866,8 @@ def test_mlx_batch_input_token_count_non_padding_ladder():
 
 @pytest.mark.parametrize("interrupt", [SystemExit, KeyboardInterrupt])
 def test_callback_interrupt_joins_the_ddp_failure_consensus(monkeypatch, interrupt):
-    # Regression for "Route callback interrupts through DDP failure consensus".
-    # _fire captured only `Exception`, so a callback raising a non-Exception
-    # BaseException (KeyboardInterrupt from a Ctrl-C landing inside a callback,
-    # or SystemExit) unwound that rank WITHOUT entering the failure consensus,
-    # while every peer entered it and blocked there forever: MLX collectives have
-    # no timeout and block in C holding the GIL, so the peers cannot even be
-    # signalled out. Verified on a real two-rank `mlx.launch --backend ring` run:
-    # pre-fix the peer was still parked in _distributed_status_mask 25 s later and
-    # needed SIGKILL. Every other consensus call site in this file (batch fetch,
-    # evaluation, optimizer step, checkpoint, best-model restore) already captures
-    # BaseException, and _raise_distributed_failure_from_any already re-raises a
-    # non-Exception unwrapped without mutating trainer state -- that branch was
-    # simply unreachable from _fire.
+    # _fire must catch BaseException, not just Exception: a KeyboardInterrupt or SystemExit from a callback skipped the
+    # DDP failure consensus and left peers blocked forever, since MLX collectives have no timeout.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
@@ -7185,8 +6875,7 @@ def test_callback_interrupt_joins_the_ddp_failure_consensus(monkeypatch, interru
 
     _patch_value_and_grad_with_aux(monkeypatch)
 
-    # Homogeneous world of 2: the all-sum doubles the local value, so
-    # _distributed_any_flag(True) aborts and _distributed_any_flag(False) does not.
+    # Homogeneous world of 2: all-sum doubles the local value, so _distributed_any_flag(True) aborts and _distributed_any_flag(False) does not.
     monkeypatch.setattr(
         trainer_mod.mx.distributed, "all_sum",
         lambda value, group=None, stream=None: value * mx.array(2, dtype=value.dtype),
@@ -7262,18 +6951,14 @@ def test_callback_interrupt_joins_the_ddp_failure_consensus(monkeypatch, interru
     raiser_contexts, raiser_outcome, raiser_stop = run(raising=True)
 
     assert peer_outcome is None
-    # The interrupt still reaches the caller unwrapped, exactly as HF's
-    # callback_handler.call_event lets it propagate (transformers
-    # trainer_callback.py wraps nothing).
+    # The interrupt reaches the caller unwrapped, as HF's callback_handler.call_event lets it propagate (trainer_callback.py wraps nothing).
     assert type(raiser_outcome) is interrupt
     assert str(raiser_outcome) == "callback interrupt"
     # The interrupt branch must not latch a stop into a reusable trainer.
     assert raiser_stop is False
 
-    # The lockstep invariant the collective actually requires: up to the abort,
-    # the interrupted rank took part in EVERY consensus its peer took part in,
-    # ending with the on_step_end dispatch that raised. Pre-fix the raiser
-    # skipped that last one, and the peer blocked in it with nobody to meet.
+    # The interrupted rank must join every consensus its peer joins, ending with the on_step_end dispatch that raised;
+    # skipping that last one left the peer blocked.
     assert raiser_contexts, "the interrupted rank joined no consensus at all"
     assert raiser_contexts[-1] == "on_step_end callback"
     assert raiser_contexts == peer_contexts[:len(raiser_contexts)]
@@ -7281,26 +6966,8 @@ def test_callback_interrupt_joins_the_ddp_failure_consensus(monkeypatch, interru
 
 
 def test_declared_length_streaming_dispatches_callback_epochs(monkeypatch):
-    # Regression for "Use known streaming lengths for callback epoch boundaries".
-    # A streaming num_train_epochs run whose iterable declares a reliable __len__
-    # is supported: _prepare_data resolves _streaming_epoch_batch_count and derives
-    # total_steps from it. The loop, though, built epoch metadata only for
-    # max_steps streams, so batches_per_epoch stayed None: on_epoch_begin /
-    # on_epoch_end never fired and state.epoch stayed None for the whole run, so
-    # epoch-based logging/eval/checkpoint callbacks were silently skipped and
-    # WandbCallback.on_save in checkpoint mode raised
-    # "TypeError: type NoneType doesn't define __round__ method" on
-    # round(state.epoch, 2).
-    #
-    # The expected trace below is what real transformers produces (verified on
-    # 5.14.1 AND 4.57.6) for the equivalent run -- a torch IterableDataset with
-    # __len__ == 6, per_device_train_batch_size=2, num_train_epochs=2,
-    # save_steps=2: len(train_dataloader) == 3, state.max_steps == 6,
-    # on_epoch_begin/on_epoch_end twice each, state.epoch walking
-    # 0 -> 1/3 -> 2/3 -> 1.0 -> 1.0 -> 4/3 -> 5/3 -> 2.0, and checkpoint aliases
-    # epoch_0.67 / epoch_1.33 / epoch_2.0. HF gets there because
-    # steps_in_epoch = len(epoch_dataloader) (transformers trainer.py) and an
-    # IterableDataset with __len__ gives its dataloader a length.
+    # Declared-length streams must build epoch metadata too, else on_epoch_begin/on_epoch_end never fire and state.epoch
+    # stays None; HF gets steps_in_epoch from len(epoch_dataloader), per transformers 5.14.1 and 4.57.6.
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     _patch_value_and_grad_with_aux(monkeypatch)
@@ -7357,8 +7024,7 @@ def test_declared_length_streaming_dispatches_callback_epochs(monkeypatch):
     trainer._build_optimizer = _frozen_optimizer()
     trainer.train()
 
-    # The stream really is the length-declaring kind this branch is meant to serve,
-    # and the run length is unchanged -- only the callback lifecycle was missing.
+    # The stream declares its length, the case this branch serves; run length is unchanged and only the callback lifecycle was missing.
     assert trainer._streaming_epoch_batch_count == 3
     assert trainer.state.max_steps == 6
     assert trainer.state.num_train_epochs == 2
@@ -7378,26 +7044,8 @@ def test_declared_length_streaming_dispatches_callback_epochs(monkeypatch):
 
 
 def test_declared_length_streaming_honors_should_epoch_stop(monkeypatch):
-    # A declared-length streaming run carries a real epoch lifecycle (the test
-    # above), so a callback can raise control.should_epoch_stop from it -- but the
-    # honoring was gated on `batch_iter is None`, i.e. on materialized batches. The
-    # request was therefore dropped: the producer ran the epoch's whole remainder
-    # and the next on_epoch_begin silently cleared the flag, so the run was
-    # indistinguishable from one that never asked to stop.
-    #
-    # HF breaks its inner AND outer step loops on should_epoch_stop for any
-    # dataloader (transformers _inner_training_loop: the
-    # `if self.control.should_epoch_stop or self.control.should_training_stop:
-    # break` pair), then rebuilds iter(epoch_dataloader) for the next epoch, so the
-    # abandoned tail of the pass is skipped. Draining the producer to the next pass
-    # boundary reaches the same place.
-    #
-    # Golden values from real transformers (5.14.1 AND 4.57.6) on the equivalent
-    # run -- IterableDataset with __len__ == 6, per_device_train_batch_size=2
-    # (3 micro-batches per pass), gradient_accumulation_steps=1,
-    # num_train_epochs=3, save_steps=2, stopping the epoch at global_step 1:
-    # state.max_steps 9, 7 optimizer steps, on_epoch_end at
-    # (1, 1/3), (4, 2.0), (7, 3.0), and on_save at (2, 4/3), (4, 2.0), (6, 8/3).
+    # should_epoch_stop was only honored on materialized batches, so declared-length streams dropped it; HF abandons the
+    # pass tail, giving 7 optimizer steps of max_steps 9 (transformers 5.14.1 and 4.57.6).
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     _patch_value_and_grad_with_aux(monkeypatch)
@@ -7457,9 +7105,8 @@ def test_declared_length_streaming_honors_should_epoch_stop(monkeypatch):
 
     assert trainer._streaming_epoch_batch_count == 3
     assert trainer.state.max_steps == 9
-    # Epoch 1 gave up its last two micro-batches, so the run is one whole epoch's
-    # worth of steps shorter than the untruncated 9 -- it did not silently make
-    # them up out of the following passes.
+    # Epoch 1 gave up its last two micro-batches, so the run is a whole epoch's worth of steps shorter than the
+    # untruncated 9 and does not borrow from later passes.
     assert trainer._global_step == 7
     assert spy.epoch_end == [(1, 0.333333), (4, 2.0), (7, 3.0)]
     assert spy.step_end == [
@@ -7467,17 +7114,15 @@ def test_declared_length_streaming_honors_should_epoch_stop(monkeypatch):
         (5, 2.333333), (6, 2.666667), (7, 3.0),
     ]
     assert spy.saves == [(2, 1.333333), (4, 2.0), (6, 2.666667)]
-    # Every epoch after the truncated one begins on a fresh pass: the producer was
-    # drained to the pass boundary, so set_epoch still advances once per pass and
-    # no epoch starts part way through the source.
+    # Epochs after the truncated one start on a fresh pass: draining the producer keeps set_epoch advancing once per
+    # pass, so no epoch starts part way through the source.
     assert trainer.train_dataset.epochs == [0, 1, 2]
 
 
 def test_no_consensus_site_captures_bare_exception():
-    # A rank that captures only Exception skips _raise_distributed_failure on an
-    # interrupt while its peers enter and block in it, with no way out: the
-    # collective holds the GIL in C so Ctrl-C never reaches Python. Every site
-    # feeding a consensus must therefore capture BaseException.
+    # A rank catching only Exception skips _raise_distributed_failure on an interrupt while peers block in it with no
+    # way out; the collective holds the GIL so Ctrl-C never reaches Python, hence every consensus site must catch
+    # BaseException.
     import inspect
     import re
 
@@ -7502,17 +7147,9 @@ def _hf_flow_args(
     logging_strategy="steps", logging_steps=10 ** 6, logging_first_step=False,
     save_strategy="no", save_steps=10 ** 6,
 ):
-    """Stand in for TrainingArguments when driving DefaultFlowCallback.
-
-    A real TrainingArguments cannot be built on Apple Silicon: pyproject omits
-    accelerate there, and the constructor hard-requires accelerate>=1.1.0
-    whenever torch is importable. Since that is the platform MLX actually runs
-    on, building one would make this file uncollectable for its own users.
-    Only the attributes DefaultFlowCallback reads matter, and
-    IntervalStrategy/SaveStrategy are str enums, so plain strings compare equal
-    to them. test_hf_flow_args_stand_in_matches_real_training_arguments pins
-    the equivalence wherever a real one can be constructed.
-    """
+    """Stand-in for TrainingArguments: Apple Silicon omits accelerate, which the constructor hard-requires as
+    accelerate>=1.1.0 whenever torch is importable; IntervalStrategy/SaveStrategy compare equal to plain strings;
+    test_hf_flow_args_stand_in_matches_real_training_arguments pins parity."""
     return types.SimpleNamespace(
         eval_strategy=eval_strategy,
         eval_steps=eval_steps,
@@ -7526,16 +7163,13 @@ def _hf_flow_args(
 
 
 def test_hf_flow_args_stand_in_matches_real_training_arguments():
-    # The stand-in above only holds while it agrees with the real object on
-    # every field DefaultFlowCallback reads, including the enum normalization
-    # TrainingArguments applies in __post_init__. Skipped on the platform that
-    # forced the stand-in, which is exactly where it cannot be checked.
+    # The stand-in must match the real TrainingArguments on every field DefaultFlowCallback reads, including the
+    # __post_init__ enum normalization; skipped on the platform that forces it, where it cannot be checked.
     import tempfile
 
     from transformers.utils import is_accelerate_available
 
-    # The same predicate the constructor itself raises on, so this skips for a
-    # too-old accelerate as well as for a missing one.
+    # Uses the same predicate the constructor raises on, so it also skips for a too-old accelerate, not only a missing one.
     if not is_accelerate_available():
         pytest.skip("TrainingArguments needs accelerate, omitted on arm64 macOS")
     from transformers import TrainingArguments
@@ -7544,8 +7178,7 @@ def test_hf_flow_args_stand_in_matches_real_training_arguments():
         "eval_strategy", "eval_delay", "logging_strategy",
         "logging_first_step", "save_strategy",
     )
-    # Every strategy on every axis, so the stand-in is pinned for the log and
-    # save cadences as well as the eval one.
+    # Every strategy on every axis, which pins the stand-in for the log and save cadences as well as the eval one.
     for strategy, steps, delay in (
         ("no", 2, 0), ("steps", 2, 0), ("epoch", 2, 0), ("steps", 2, 3),
     ):
@@ -7562,8 +7195,7 @@ def test_hf_flow_args_stand_in_matches_real_training_arguments():
             assert getattr(stub, field) == getattr(real, field), (
                 strategy, delay, field,
             )
-        # Equal as strings is not enough: the flow compares against enum
-        # members, so the stub must land on the same side of those tests.
+        # Equal as strings is not enough: the flow compares against enum members, so the stub must land on the same side of those tests.
         for action in ("evaluate", "log", "save"):
             assert (
                 _flow_fires(
@@ -7594,8 +7226,7 @@ def _flow_fires(args, *, total_steps, steps_per_epoch, action="evaluate"):
         state.global_step = step
         state.epoch = step / steps_per_epoch
         control = flow.on_step_end(args, state, TrainerControl())
-        # HF clears the flag when it runs the action, so a step can only run it
-        # once however many hooks asked for it.
+        # HF clears the flag when it runs the action, so a step runs it only once however many hooks asked for it.
         if not getattr(control, flag) and step % steps_per_epoch == 0:
             control = flow.on_epoch_end(args, state, TrainerControl())
         if getattr(control, flag):
@@ -7606,12 +7237,8 @@ def _flow_fires(args, *, total_steps, steps_per_epoch, action="evaluate"):
 def _hf_eval_steps_from_default_flow(
     *, total_steps, steps_per_epoch, eval_strategy, eval_steps, eval_delay=0,
 ):
-    """Ask the installed transformers DefaultFlowCallback which steps evaluate.
-
-    Derived from the shipped implementation rather than hardcoded, so the
-    expectation tracks the 4.x/5.x differences in DefaultFlowCallback (5.x adds
-    a final-step evaluation for the steps strategy) instead of pinning one.
-    """
+    """Asks the installed transformers DefaultFlowCallback which steps evaluate rather than hardcoding, since 5.x adds a
+    final-step evaluation for the steps strategy."""
     return _flow_fires(
         _hf_flow_args(
             eval_strategy=eval_strategy,
@@ -7655,10 +7282,8 @@ def _run_eval_cadence_probe(monkeypatch, *, eval_steps, **arg_overrides):
         args=args,
         callbacks=[DefaultFlowCallback()],
     )
-    # Eval is live, so the bridge synthesized eval_strategy="steps" already; the
-    # override below is therefore a genuine caller-supplied strategy, exactly
-    # what _sync_synthesized_arg preserves for a real TrainingArguments/
-    # SFTConfig or a hand-set override.
+    # Eval is live, so the bridge already synthesized eval_strategy="steps"; the override below is a genuine
+    # caller-supplied strategy that _sync_synthesized_arg preserves.
     assert trainer.args.eval_strategy == "steps"
     for name, value in arg_overrides.items():
         setattr(trainer.args, name, value)
@@ -7682,12 +7307,9 @@ def _run_eval_cadence_probe(monkeypatch, *, eval_steps, **arg_overrides):
 
 
 def test_static_eval_cadence_honors_caller_supplied_eval_strategy(monkeypatch):
-    # Regression: the loop's static cadence evaluated purely from eval_steps, so
-    # a caller-supplied eval_strategy -- which _sync_synthesized_arg explicitly
-    # preserves -- was ignored. eval_strategy="no" still evaluated on the step
-    # cadence, and eval_strategy="epoch" evaluated on BOTH the step cadence and
-    # DefaultFlowCallback's epoch end, double-counting every epoch for
-    # early-stopping and best-model tracking.
+    # Regression: the static eval cadence ignored a caller-supplied eval_strategy that _sync_synthesized_arg preserves;
+    # "no" still evaluated on steps and "epoch" double-counted with DefaultFlowCallback's epoch end, skewing early
+    # stopping and best-model tracking.
     for strategy in ("no", "epoch"):
         expected = _hf_eval_steps_from_default_flow(
             total_steps=4, steps_per_epoch=2,
@@ -7697,8 +7319,7 @@ def test_static_eval_cadence_honors_caller_supplied_eval_strategy(monkeypatch):
             monkeypatch, eval_steps=2, eval_strategy=strategy,
         )
         assert got == expected, (strategy, got, expected)
-    # The steps strategy is unchanged, and is still deduplicated against the
-    # identical request DefaultFlowCallback raises on the same step.
+    # The steps strategy is unchanged and still deduplicated against the identical request DefaultFlowCallback raises on the same step.
     expected = _hf_eval_steps_from_default_flow(
         total_steps=4, steps_per_epoch=2, eval_strategy="steps", eval_steps=2,
     )
@@ -7709,9 +7330,7 @@ def test_static_eval_cadence_honors_caller_supplied_eval_strategy(monkeypatch):
 
 
 def test_static_eval_cadence_honors_eval_delay(monkeypatch):
-    # DefaultFlowCallback gates its step evaluation on
-    # `args.eval_delay <= state.global_step`; the loop's own cadence bypassed it
-    # entirely and evaluated from step 1.
+    # DefaultFlowCallback gates step evaluation on args.eval_delay <= state.global_step; the loop's own cadence bypassed that and evaluated from step 1.
     expected = _hf_eval_steps_from_default_flow(
         total_steps=4, steps_per_epoch=2,
         eval_strategy="steps", eval_steps=2, eval_delay=3,
@@ -7727,20 +7346,9 @@ def _run_log_save_cadence_probe(
     steps_per_epoch=3, eval_steps=None, with_flow=True, extra_callbacks=(),
     eval_losses=None, **arg_overrides,
 ):
-    """Run the real loop and report the steps that logged, saved and evaluated.
-
-    6 steps over 2 epochs of 3, so an interval of 2 lands off the epoch
-    boundaries and the steps/epoch/no strategies are told apart.
-
-    Passing eval_steps attaches an eval dataset and a stub _evaluate, so the
-    third cadence axis runs on the same 6-step/2-epoch geometry as the other
-    two; leaving it None keeps the run eval-free.
-
-    with_flow=False drops DefaultFlowCallback from the callback list.
-    MLXTrainer does not install one itself (transformers' Trainer always does),
-    so that is the configuration a caller who passes their own callbacks
-    actually gets, and each cadence must hold in both.
-    """
+    """Runs the real loop and reports logged, saved and evaluated steps (6 steps, 2 epochs of 3); eval_steps adds an
+    eval set and stub _evaluate; with_flow=False drops DefaultFlowCallback (MLXTrainer does not install one itself),
+    and each cadence must hold in both."""
     import tempfile
 
     from transformers.trainer_callback import (
@@ -7773,9 +7381,7 @@ def _run_log_save_cadence_probe(
     class _Spy:
         def on_log(self, args, state, control, logs=None, **kwargs):
             payload = logs or {}
-            # The run summary train() dispatches before on_train_end is not a
-            # cadence log, and an evaluation dispatches its metrics through
-            # on_log too, so keep all three apart.
+            # The train_runtime run summary dispatched before on_train_end is not a cadence log, and eval metrics also arrive via on_log; keep all three apart.
             if "train_runtime" in payload:
                 summaries.append((state.global_step, dict(payload)))
             elif "eval_loss" in payload:
@@ -7800,16 +7406,14 @@ def _run_log_save_cadence_probe(
         eval_dataset=(
             [{"input_ids": [1, 2, 3, 4]}] if eval_steps is not None else None
         ),
-        # ProgressCallback is a real stock consumer of on_log, so the payloads
-        # below are exercised through shipped transformers code, not just a spy.
+        # ProgressCallback is a stock transformers consumer of on_log, so the payloads are exercised through shipped code, not only a spy.
         callbacks=(
             ([DefaultFlowCallback()] if with_flow else [])
             + [ProgressCallback(), _Spy()] + list(extra_callbacks)
         ),
     )
-    # Both strategies were synthesized from the positive MLX intervals, so an
-    # override below is a genuine caller-supplied strategy -- exactly what
-    # _sync_synthesized_arg preserves for a hand-set field.
+    # Both strategies were synthesized from the positive MLX intervals, so an override below is a genuine
+    # caller-supplied strategy that _sync_synthesized_arg preserves.
     assert trainer.args.logging_strategy == "steps"
     assert trainer.args.save_strategy == "steps"
     if eval_steps is not None:
@@ -7823,8 +7427,7 @@ def _run_log_save_cadence_probe(
     trainer.save_model = lambda *_a, **_kw: None
     if eval_steps is not None:
         trainer._eval_batches_labeled = ["batch-0"]
-        # eval_losses drives a controlled improve/worsen sequence, which is what
-        # the "best" save strategy keys on; the default is a flat metric.
+        # eval_losses drives a controlled improve/worsen sequence, which the "best" save strategy keys on; the default is a flat metric.
         losses = list(eval_losses or ())
 
         def _fake_evaluate(batches, loss_fn, is_vlm=False):
@@ -7861,13 +7464,8 @@ def _hf_flow_steps(action, *, total_steps=6, steps_per_epoch=3, **fields):
 
 
 def test_static_save_cadence_honors_caller_supplied_save_strategy(monkeypatch):
-    # Regression: the loop checkpointed purely from save_steps, so a
-    # caller-supplied save_strategy -- which _sync_synthesized_arg explicitly
-    # preserves -- was ignored. save_strategy="no" still wrote checkpoint-N and
-    # dispatched on_save on the step cadence (with HF's default save_steps=500
-    # that is a surprise checkpoint every 500 steps), and save_strategy="epoch"
-    # wrote the step checkpoints on top of the epoch ones, doubling on_save at
-    # every boundary and advertising checkpoints the strategy never asked for.
+    # Regression: the static save cadence ignored a caller-supplied save_strategy that _sync_synthesized_arg preserves;
+    # "no" still checkpointed every save_steps (HF default save_steps=500) and "epoch" doubled on_save at each boundary.
     for strategy in ("no", "epoch", "steps"):
         expected = _hf_flow_steps(
             "save", save_strategy=strategy, save_steps=2,
@@ -7879,26 +7477,21 @@ def test_static_save_cadence_honors_caller_supplied_save_strategy(monkeypatch):
         assert probe["saved"] == expected, (strategy, probe["saved"], expected)
         # on_save must advertise exactly the checkpoints that exist on disk.
         assert probe["checkpoints"] == sorted(set(expected)), strategy
-    # The three strategies really are distinguishable at these parameters, so
-    # the assertions above cannot pass by coincidence.
+    # The three strategies are distinguishable at these parameters, so the assertions above cannot pass by coincidence.
     assert _hf_flow_steps("save", save_strategy="no", save_steps=2) == []
     assert _hf_flow_steps("save", save_strategy="epoch", save_steps=2) == [3, 6]
     assert _hf_flow_steps("save", save_strategy="steps", save_steps=2) == [2, 4, 6]
 
 
 def test_static_log_cadence_honors_caller_supplied_logging_strategy(monkeypatch):
-    # Regression: the loop logged purely from logging_steps, so a
-    # caller-supplied logging_strategy was ignored. logging_strategy="no" still
-    # emitted a log every logging_steps, and "epoch" logged on both the step
-    # cadence and DefaultFlowCallback's epoch end.
+    # Regression: the static log cadence ignored a caller-supplied logging_strategy; "no" still logged every
+    # logging_steps and "epoch" logged on both the step cadence and the epoch end.
     for strategy in ("no", "epoch", "steps"):
         expected = _hf_flow_steps(
             "log", logging_strategy=strategy, logging_steps=2,
         )
-        # The loop always flushes the run's last window at the final step so the
-        # returned train_loss covers it; HF folds the same trailing window into
-        # its returned train_loss silently. That flush is the one cadence entry
-        # MLX adds, and it lands on the final step whatever the strategy.
+        # The loop always flushes the last log window at the final step so the returned train_loss covers it, whatever
+        # the strategy; HF folds that window in silently, and it is the one entry MLX adds.
         expected = sorted(set(expected) | {6})
         probe = _run_log_save_cadence_probe(
             monkeypatch, logging_steps=2, save_steps=10 ** 6,
@@ -7912,8 +7505,7 @@ def test_static_log_cadence_honors_caller_supplied_logging_strategy(monkeypatch)
     assert _hf_flow_steps("log", logging_strategy="steps", logging_steps=2) == [2, 4, 6]
 
 
-# The three cadence axes, each as (DefaultFlowCallback action name, the args
-# field that selects its strategy, the probe key recording where it fired).
+# The three cadence axes, each a tuple of (DefaultFlowCallback action name, args field selecting its strategy, probe key recording where it fired).
 _CADENCE_AXES = (
     ("log", "logging_strategy", "logged"),
     ("save", "save_strategy", "saved"),
@@ -7932,14 +7524,8 @@ def _run_one_axis_cadence_probe(
     """Probe one cadence axis at one strategy, with/without the HF flow."""
     field = dict((a, f) for a, f, _ in _CADENCE_AXES)[action]
     key = dict((a, k) for a, _, k in _CADENCE_AXES)[action]
-    # The probed axis gets `interval` on a 6-step/3-per-epoch run, so "steps"
-    # and "epoch" (3, 6) cannot be confused. The other two axes keep an interval
-    # far past the run so they never interfere.
-    # Both intervals are swept: 2 divides 6, 4 does not, and
-    # DefaultFlowCallback.on_step_end forces a final-step save (4.x and 5.x)
-    # and, on 5.x, a final-step evaluation once state.global_step reaches
-    # state.max_steps. The divisible interval hides that tail entirely, which is
-    # why the loop's missing copy of it survived a matrix that only swept 2.
+    # Sweeps interval 2 and 4 over 6 steps; only non-divisor 4 exposes the final-step save DefaultFlowCallback forces
+    # (4.x and 5.x) and, on 5.x, final evaluation; other axes use huge intervals.
     kwargs = dict(logging_steps=10 ** 6, save_steps=10 ** 6, with_flow=with_flow)
     kwargs[_CADENCE_INTERVAL_FIELD[action]] = interval
     kwargs[field] = strategy
@@ -7955,29 +7541,16 @@ def _hf_cadence_reference(action, strategy, interval=2, **fields):
     }
     expected = _hf_flow_steps(action, **fields)
     if action == "log":
-        # The loop always flushes the run's last window at the final step so the
-        # returned train_loss covers it, whatever the strategy (see
-        # test_static_log_cadence_honors_caller_supplied_logging_strategy).
+        # The loop always flushes the run's last log window at the final step so the returned train_loss covers it,
+        # whatever the strategy (see test_static_log_cadence_honors_caller_supplied_logging_strategy).
         expected = sorted(set(expected) | {6})
     return expected
 
 
 def test_epoch_cadence_fires_without_a_default_flow_callback(monkeypatch):
-    # Regression: gating the loop's static log/save/eval interval on the
-    # caller-supplied strategy is only half of DefaultFlowCallback.on_step_end.
-    # The other half is on_epoch_end, and MLXTrainer -- unlike transformers'
-    # Trainer, which always installs DefaultFlowCallback -- installs no flow
-    # callback of its own. So a caller who hand-sets "epoch" and passes their own
-    # callbacks got the step cadence switched off with nothing put in its place:
-    # no periodic checkpoint, no periodic log and no periodic evaluation for the
-    # whole run, which is strictly worse than the wrong-cadence bug being fixed.
-    # The loop must raise the epoch action itself, so all three axes match HF
-    # whether or not a flow callback happens to be installed.
-    # Collected rather than asserted per cell so a failure names every cell that
-    # drifted, not just the first.
-    # Both a step interval that divides the 6-step budget and one that does not
-    # (4), because DefaultFlowCallback's final-step force only shows up in the
-    # second -- see test_step_cadence_forces_the_final_step_action.
+    # MLXTrainer installs no flow callback, unlike transformers' Trainer, so a hand-set "epoch" strategy lost all
+    # periodic save, log and eval; the loop must raise the epoch action itself; interval 4 exposes the final-step force,
+    # see test_step_cadence_forces_the_final_step_action.
     mismatches = []
     for action, _field, _key in _CADENCE_AXES:
         for strategy in ("steps", "epoch", "no"):
@@ -7995,8 +7568,7 @@ def test_epoch_cadence_fires_without_a_default_flow_callback(monkeypatch):
                              got, expected)
                         )
     assert mismatches == [], mismatches
-    # The strategies really are distinguishable at these parameters on every
-    # axis, so the assertions above cannot pass by coincidence.
+    # The strategies are distinguishable at these parameters on every axis, so the assertions above cannot pass by coincidence.
     for action in ("log", "save", "evaluate"):
         assert _hf_cadence_reference(action, "steps") == [2, 4, 6], action
         assert _hf_cadence_reference(action, "epoch") == [3, 6], action
@@ -8004,25 +7576,15 @@ def test_epoch_cadence_fires_without_a_default_flow_callback(monkeypatch):
         assert _hf_cadence_reference(action, "no") == (
             [6] if action == "log" else []
         ), action
-        # And the non-divisible interval keeps the epoch cadence distinct from
-        # the steps one, so the added cells test something the old ones did not.
+        # The non-divisible interval keeps the epoch cadence distinct from the steps one, so the added cells test what the old divisible-only matrix could not.
         assert _hf_cadence_reference(action, "epoch", 4) == [3, 6], action
         assert 4 in _hf_cadence_reference(action, "steps", 4), action
 
 
 def test_step_cadence_forces_the_final_step_action(monkeypatch):
-    # Regression: DefaultFlowCallback.on_step_end forces a save once
-    # state.global_step reaches state.max_steps whenever save_strategy is
-    # "steps" (4.x and 5.x), and 5.x forces an evaluation too when the interval
-    # did not already land there. MLXTrainer installs no flow callback, so with
-    # an interval that does not divide the budget the run wrote no
-    # checkpoint-<max_steps> -- the LAST resumable checkpoint, and the only one
-    # carrying optimizer/trainer state, since the unconditional final
-    # save_model() writes adapters alone -- and dispatched no on_save for it. On
-    # 5.x the final evaluation went missing too, so load_best_model_at_end could
-    # restore a stale earlier model and early-stopping/reporting callbacks never
-    # saw the run's last metrics. An interval of 4 over 6 steps is exactly that
-    # gap; the divisible interval the older matrix swept hid it.
+    # MLXTrainer installs no DefaultFlowCallback, so a non-divisor save interval lost the forced final
+    # checkpoint-<max_steps> (save_strategy steps, 4.x and 5.x), the last resumable one with optimizer state; on 5.x the
+    # final eval was lost too.
     mismatches = []
     for action in ("save", "evaluate"):
         expected = _hf_cadence_reference(action, "steps", 4)
@@ -8036,8 +7598,7 @@ def test_step_cadence_forces_the_final_step_action(monkeypatch):
                      got, expected)
                 )
     assert mismatches == [], mismatches
-    # on_save must advertise exactly the checkpoints that exist on disk, and the
-    # final one is the point of the fix.
+    # on_save must advertise exactly the checkpoints on disk, and the final one is the point of the fix.
     for with_flow in (True, False):
         probe = _run_log_save_cadence_probe(
             monkeypatch, logging_steps=10 ** 6, save_steps=4,
@@ -8045,12 +7606,10 @@ def test_step_cadence_forces_the_final_step_action(monkeypatch):
         )
         assert probe["saved"] == [4, 6], (with_flow, probe["saved"])
         assert probe["checkpoints"] == [4, 6], (with_flow, probe["checkpoints"])
-    # The save axis forces the final step on every supported transformers, so
-    # this cell pins the shape of the fix and cannot pass by coincidence.
+    # The save axis forces the final step on every supported transformers, so this cell pins the fix's shape and cannot pass by coincidence.
     assert _hf_cadence_reference("save", "steps", 4) == [4, 6]
-    # The eval axis is the 4.x/5.x split, so it stays derived: 5.x forces the
-    # final evaluation, 4.x has no such block. The loop's own answer must be the
-    # installed callback's answer.
+    # The eval axis is the 4.x/5.x split, so it stays derived: 5.x forces the final evaluation and 4.x has no such
+    # block; the loop must match the installed callback.
     from unsloth_zoo.mlx.trainer import _default_flow_evaluates_final_step
 
     eval_reference = _hf_cadence_reference("evaluate", "steps", 4)
@@ -8059,12 +7618,8 @@ def test_step_cadence_forces_the_final_step_action(monkeypatch):
 
 
 def test_step_cadence_honors_logging_first_step(monkeypatch):
-    # Regression: DefaultFlowCallback.on_step_end raises should_log at
-    # state.global_step == 1 when args.logging_first_step, BEFORE it tests
-    # logging_strategy -- so "no" and "epoch" log step 1 as well.
-    # _ensure_callback_args_compat exposes and preserves the flag, but the
-    # loop's own cadence only logged interval multiples plus its final-window
-    # flush, so step 1 was silently dropped whenever logging_steps > 1.
+    # With logging_first_step, DefaultFlowCallback raises should_log at step 1 before checking logging_strategy, so
+    # strategies no and epoch log step 1 too; the loop dropped it when logging_steps > 1.
     mismatches = []
     for strategy in ("steps", "no", "epoch"):
         expected = _hf_cadence_reference(
@@ -8081,10 +7636,8 @@ def test_step_cadence_honors_logging_first_step(monkeypatch):
                      got, expected)
                 )
     assert mismatches == [], mismatches
-    # First-step logging is not gated on the strategy, the three strategies stay
-    # distinguishable, and the flag is off by default -- so none of the cells
-    # above can pass by coincidence. The trailing 6 is the loop's own
-    # final-window flush.
+    # First-step logging is not gated on the strategy, the flag is off by default, and the three strategies stay
+    # distinguishable; the trailing 6 is the loop's own final-window flush.
     assert _hf_cadence_reference(
         "log", "steps", 4, logging_first_step=True) == [1, 4, 6]
     assert _hf_cadence_reference(
@@ -8095,11 +7648,9 @@ def test_step_cadence_honors_logging_first_step(monkeypatch):
 
 
 def test_default_flow_final_step_eval_probe_matches_the_installed_flow():
-    # The loop asks the shipped DefaultFlowCallback whether it forces a
-    # final-step evaluation instead of pinning a transformers version, so the
-    # probe has to agree with what that callback actually does. A future release
-    # that reads an argument the probe's stand-in lacks falls back to "no forced
-    # evaluation"; this is what makes that fallback visible.
+    # The loop asks the shipped DefaultFlowCallback whether it forces a final-step evaluation instead of pinning a
+    # transformers version; a future release reading an argument the stand-in lacks falls back to "no forced
+    # evaluation", which this test makes visible.
     from unsloth_zoo.mlx import trainer as trainer_mod
 
     trainer_mod._DEFAULT_FLOW_FINAL_STEP_EVAL = None
@@ -8138,28 +7689,23 @@ def test_step_cadence_request_reads_the_same_fields_as_the_static_cadence():
     assert _requested(
         global_step=3, max_steps=0, save_strategy="steps",
     ) == (False, False, False)
-    # logging_first_step fires at step 1 whatever the logging strategy, and only
-    # when the caller asked for it.
+    # logging_first_step fires at step 1 whatever the logging strategy, and only when the caller asked for it.
     assert _requested(
         global_step=1, max_steps=6,
         logging_first_step=True, logging_strategy="no",
     )[0] is True
     assert _requested(global_step=1, max_steps=6, logging_strategy="no")[0] is False
-    # The final save follows save_strategy, and only "steps" -- HF leaves the
-    # epoch strategy to on_epoch_end and "no" to nobody.
+    # The final save follows save_strategy, and only steps triggers it; HF leaves epoch to on_epoch_end and no to nobody.
     for strategy, expected in (("steps", True), ("epoch", False), ("no", False)):
         assert _requested(
             global_step=6, max_steps=6, save_strategy=strategy,
         )[2] is expected, strategy
-    # A 0 eval interval means "never" for the loop's own cadence, so it must not
-    # reach HF's unguarded modulo.
+    # A 0 eval interval means "never" for the loop's own cadence, so it must not reach HF's unguarded modulo.
     assert _requested(
         global_step=6, max_steps=6, eval_strategy="steps", eval_steps=0,
     )[1] is False
-    # An args object that never went through _ensure_callback_args_compat keeps
-    # the legacy answer on BOTH halves of the same rule: _static_save_cadence_
-    # enabled() says the interval cadence applies, so the final step it belongs
-    # to does too. train() always populates the field, so this is unit-only.
+    # An args object that skipped _ensure_callback_args_compat keeps the legacy answer on both halves:
+    # _static_save_cadence_enabled() applies, so its final step does too; train() always populates the field.
     assert _requested(global_step=6, max_steps=6)[2] is True
 
 
@@ -8186,8 +7732,7 @@ def test_save_strategy_best_checkpoints_every_improving_evaluation(monkeypatch):
         assert probe["checkpoints"] == [2, 6], (with_flow, probe["checkpoints"])
         assert probe["state"].best_metric == 0.5
         assert probe["state"].best_global_step == 6
-    # The other order pins that it is the improvement and not the step index
-    # doing the work.
+    # The other loss order pins that the improvement, not the step index, is what triggers the save.
     probe = _run_log_save_cadence_probe(
         monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
         eval_steps=2, save_strategy="best", with_flow=False,
@@ -8206,11 +7751,8 @@ def test_save_strategy_best_checkpoints_every_improving_evaluation(monkeypatch):
 
 
 def test_save_strategy_best_without_a_usable_metric_writes_nothing(monkeypatch):
-    # An unresolvable metric_for_best_model means _update_callback_best_metric
-    # reports no improvement, which is what HF's _determine_best_metric returns
-    # too (its whole body is under `if args.metric_for_best_model is not None`),
-    # so nothing is saved rather than everything. HF's Trainer.__init__ rejects
-    # "best" without a metric outright; MLXTrainer must at least not checkpoint
+    # An unresolvable metric_for_best_model reports no improvement, as HF's _determine_best_metric does, so nothing is
+    # saved; HF's Trainer.__init__ rejects "best" without a metric, so MLXTrainer must at least not checkpoint
     # indiscriminately.
     for metric in (None, "does_not_exist"):
         probe = _run_log_save_cadence_probe(
@@ -8221,9 +7763,8 @@ def test_save_strategy_best_without_a_usable_metric_writes_nothing(monkeypatch):
         assert probe["evaluated"] == [2, 4, 6], (metric, probe["evaluated"])
         assert probe["saved"] == [], (metric, probe["saved"])
         assert probe["checkpoints"] == [], (metric, probe["checkpoints"])
-    # MLXTrainingConfig defaults metric_for_best_model to "eval_loss", so the
-    # strategy does work out of the box -- the empty results above are about the
-    # metric being unusable, not about "best" being inert.
+    # MLXTrainingConfig defaults metric_for_best_model to "eval_loss", so "best" works out of the box; the empty results
+    # above come from an unusable metric, not an inert strategy.
     probe = _run_log_save_cadence_probe(
         monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
         eval_steps=2, save_strategy="best", with_flow=False,
@@ -8233,13 +7774,8 @@ def test_save_strategy_best_without_a_usable_metric_writes_nothing(monkeypatch):
 
 
 def test_epoch_cadence_request_is_deduplicated_against_default_flow(monkeypatch):
-    # The loop's epoch request and DefaultFlowCallback's on_epoch_end ask for the
-    # same action on the same step, so a second mechanism (running the action
-    # directly at the boundary) would double-fire it: two on_save events and two
-    # writes of the same checkpoint-N, a duplicate eval_loss in log_history that
-    # EarlyStoppingCallback would count twice. Both go through the one
-    # control.should_* request the loop already clears when it runs the action,
-    # which makes the pair idempotent.
+    # Epoch actions must share the control.should_* request that the loop clears when it runs them; a direct call at the
+    # boundary double-fires on_save and eval_loss.
     probe = _run_log_save_cadence_probe(
         monkeypatch, logging_steps=2, save_steps=2, eval_steps=2,
         logging_strategy="epoch", save_strategy="epoch", eval_strategy="epoch",
@@ -8256,12 +7792,7 @@ def test_epoch_cadence_request_is_deduplicated_against_default_flow(monkeypatch)
 
 
 def test_epoch_cadence_closes_a_truncated_final_epoch(monkeypatch):
-    # HF fires on_epoch_end for a truncated final epoch after its inner step
-    # loop breaks and feeds the result straight into _maybe_log_save_evaluate,
-    # so an "epoch" strategy still gets that boundary's action. 5 steps over
-    # epochs of 3 leaves exactly that shape: a natural boundary at 3 and a
-    # truncated close at 5. Raising the request only at natural boundaries would
-    # drop the run's LAST checkpoint, the one a caller most wants.
+    # A truncated final epoch must still raise its epoch action, as HF does; raising it only at natural boundaries would drop the run's last checkpoint.
     for action, field, key, interval in (
         ("log", "logging_strategy", "logged", "logging_steps"),
         ("save", "save_strategy", "saved", "save_steps"),
@@ -8283,12 +7814,7 @@ def test_epoch_cadence_closes_a_truncated_final_epoch(monkeypatch):
 
 
 def test_epoch_cadence_closes_a_callback_stopped_epoch(monkeypatch):
-    # The third on_epoch_end site: a callback that sets control.should_epoch_stop
-    # mid-epoch. HF breaks its inner step loop, fires on_epoch_end and feeds
-    # _maybe_log_save_evaluate, so its flow raises the epoch action for the
-    # epoch the callback just closed -- at the fractional epoch, not a snapped
-    # one. The loop must raise it on the same terms, or the checkpoint an
-    # early-stopping integration expects at the cut is silently missing.
+    # A mid-epoch should_epoch_stop closes the epoch at its fractional position, and the epoch action must fire there like HF, or the cut's checkpoint is lost.
     class _EndEpochAtStep2:
         def on_step_end(self, args, state, control, **kwargs):
             if state.global_step == 2:
@@ -8301,8 +7827,7 @@ def test_epoch_cadence_closes_a_callback_stopped_epoch(monkeypatch):
             save_strategy="epoch", with_flow=with_flow,
             extra_callbacks=[_EndEpochAtStep2()],
         )
-        # Step 2 is the truncated first epoch (2 of 3 micro-batches), and the
-        # skip lands the loop on the next boundary.
+        # Step 2 is the truncated first epoch (2 of 3 micro-batches), and the skip lands the loop on the next boundary.
         assert probe["saved"][0] == 2, (with_flow, probe["saved"])
         assert probe["checkpoints"][0] == 2, (with_flow, probe["checkpoints"])
     runs = [
@@ -8317,10 +7842,8 @@ def test_epoch_cadence_closes_a_callback_stopped_epoch(monkeypatch):
 
 
 def test_final_training_metrics_dispatch_survives_logging_strategy_no(monkeypatch):
-    # The summary is not a DefaultFlowCallback cadence, so gating the periodic
-    # interval on logging_strategy must not suppress it: HF calls
-    # Trainer.log(metrics) unconditionally, and logging_strategy="no" is exactly
-    # the case where that is the run's only log.
+    # The run summary is not a DefaultFlowCallback cadence, so logging_strategy "no" must not suppress it: HF calls
+    # Trainer.log(metrics) unconditionally, and "no" is the case where it is the run's only log.
     probe = _run_log_save_cadence_probe(
         monkeypatch, logging_steps=2, save_steps=10 ** 6,
         logging_strategy="no",
@@ -8331,9 +7854,8 @@ def test_final_training_metrics_dispatch_survives_logging_strategy_no(monkeypatc
 
 
 def test_eval_dataloader_tracks_the_split_being_evaluated():
-    # HF rebuilds its eval_dataloader per split, so on_prediction_step reports
-    # the split being consumed; the dict itself has len == split count, which
-    # would give ProgressCallback a nonsense bar total.
+    # HF rebuilds eval_dataloader per split, so on_prediction_step reports the split being consumed; a dict's len is the
+    # split count, which would give ProgressCallback a nonsense bar total.
     import mlx.core as mx
 
     from unsloth_zoo.mlx.trainer import (
@@ -8373,18 +7895,13 @@ def test_eval_dataloader_tracks_the_split_being_evaluated():
 
     trainer._evaluate(splits, _loss_fn)
     assert spy.seen == [splits["a"], splits["b"], splits["b"]]
-    # Restored afterwards, so a later single-split eval is not left pointing at
-    # the last split.
+    # Restored afterwards, so a later single-split eval is not left pointing at the last split.
     assert trainer.callback_handler.eval_dataloader is splits
 
 
 def test_dict_eval_rebuilds_the_prediction_bar_per_split(monkeypatch):
-    # Stock ProgressCallback sizes its evaluation bar from the first
-    # on_prediction_step's eval_dataloader and only tears it down in
-    # on_evaluate, which MLX fires once for the whole dict. The first split's
-    # bar therefore kept counting every later split's batch past its own total:
-    # 2/2 climbed to 9/2 across splits of 2, 3 and 4 batches. HF recurses
-    # Trainer.evaluate per split, so it rebuilds the bar: 2/2, 3/3, 4/4.
+    # Stock ProgressCallback sizes the eval bar from the first on_prediction_step and only tears it down in on_evaluate,
+    # which MLX fires once for the dict, so bars overran (2/2 reached 9/2); HF recurses per split and rebuilds the bar.
     import mlx.core as mx
     from transformers.trainer_callback import ProgressCallback
 
@@ -8467,11 +7984,7 @@ def test_dict_eval_rebuilds_the_prediction_bar_per_split(monkeypatch):
 
 
 def test_restored_callback_states_are_visible_to_callbacks_after_resume():
-    """A checkpoint's stateful_callbacks must reach TrainerState on resume.
-
-    The export side was covered but the restore side was not, so dropping the
-    assignment entirely went unnoticed.
-    """
+    """A checkpoint's stateful_callbacks must reach TrainerState on resume; the restore side was not covered, so dropping the assignment went unnoticed."""
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     trainer = MLXTrainer.__new__(MLXTrainer)
@@ -8480,8 +7993,7 @@ def test_restored_callback_states_are_visible_to_callbacks_after_resume():
     saved = {"EarlyStoppingCallback": {"early_stopping_patience_counter": 2}}
     trainer._restore_callback_states(saved)
     assert trainer.state.stateful_callbacks == saved
-    # Mirrored, not aliased: mutating the checkpoint payload afterwards must
-    # not reach into live state.
+    # Mirrored, not aliased: mutating the checkpoint payload afterwards must not reach into live state.
     saved["EarlyStoppingCallback"] = {"early_stopping_patience_counter": 99}
     assert trainer.state.stateful_callbacks["EarlyStoppingCallback"] == {
         "early_stopping_patience_counter": 2
@@ -8502,8 +8014,7 @@ def test_qwen3_visual_window_keeps_features_when_mask_spans_whole_window():
     embeds = [mx.array([[1], [2]])]
     packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
 
-    # The mask already covers only the new turn, so an offset carried over from
-    # an earlier turn must not be applied to it a second time.
+    # The mask already covers only the new turn, so an offset carried over from an earlier turn must not be applied to it again.
     for carried_offset in (0, 6, 20):
         window_masks, window_embeds = mc._qwen3_visual_window(
             masks,
@@ -8517,11 +8028,8 @@ def test_qwen3_visual_window_keeps_features_when_mask_spans_whole_window():
 
 
 def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
-    """A row carrying mlx-vlm's own deepstack features keeps them.
-
-    Synthesizing empty compact state for such a row hands the language call
-    zeros in place of its real visual features.
-    """
+    """A row carrying mlx-vlm's own deepstack features keeps them; synthesizing empty compact state would hand the
+    language call zeros in place of its real visual features."""
     import mlx.core as mx
     import unsloth_zoo.mlx.compile as mc
 
@@ -8557,8 +8065,7 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     )
     assert seen[0].tolist() == [[7.0], [8.0]]
 
-    # A mask-only row owns no features, so it still gets an empty state to keep
-    # its slot in the batch.
+    # A mask-only row owns no features, so it still gets an empty state to keep its slot in the batch.
     mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
     filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()

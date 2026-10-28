@@ -14,20 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The media guard must connect to the address it checked.
-
-Checking a hostname and then handing the name to the HTTP client resolves DNS
-twice, and whoever serves the zone for a hostname in a dataset row answers both
-queries: a public address for the check, loopback or RFC1918 for the connection.
-The bytes are consumed as an image, so the payoff is a blind internal GET rather
-than a read primitive, but that is still enough for dataset content to probe
-services inside the victim's network.
-
-These tests drive the real requests/urllib3 stack over a loopback HTTP server
-with a stubbed resolver, so the address actually connected to is observed rather
-than assumed. Nothing here talks to an external name server or host: the
-resolver is monkeypatched and every non-loopback connect is refused in-process.
-"""
+"""The media guard must connect to the address it checked, so a DNS rebind between check and fetch cannot reach internal
+hosts; tests run offline over loopback with a stubbed resolver."""
 
 from __future__ import annotations
 
@@ -107,13 +95,8 @@ def server():
 
 @pytest.fixture
 def resolver(monkeypatch):
-    """A resolver that can answer the same name differently on each lookup.
-
-    `answers("host.invalid", "1.2.3.4", "127.0.0.1")` hands out the first address
-    once and the second one from then on, which is exactly what an attacker
-    controlling the authoritative zone does: the guard sees a public address, the
-    connection sees loopback.
-    """
+    """Scripted resolver that answers the same name differently per lookup: public address for the guard, loopback for
+    the connection, like an attacker-controlled zone."""
     real = socket.getaddrinfo
     scripted = {}
     failing_first = set()
@@ -157,12 +140,7 @@ def resolver(monkeypatch):
 
 @pytest.fixture
 def connects(monkeypatch):
-    """Record every TCP connect and refuse anything that is not loopback.
-
-    Keeps the suite offline: a fetch that escapes to a routable address is
-    reported as a refused connection to that address instead of leaving the
-    test hanging on a real network round trip.
-    """
+    """Records every TCP connect and refuses non-loopback addresses, keeping the suite offline and failing fast instead of hanging on a real network round trip."""
     targets = []
     real_connect = socket.socket.connect
 
@@ -178,9 +156,7 @@ def connects(monkeypatch):
 
 @pytest.fixture
 def loopback_counts_as_public(monkeypatch):
-    """Let 127.0.0.1 pass the classifier so a real server can stand in for a
-    public host. Only the transport is under test here; which addresses are
-    internal is pinned exhaustively in test_vision_url_ssrf_guard.py."""
+    """Lets 127.0.0.1 pass the classifier so a real server can stand in for a public host; address classification is tested in test_vision_url_ssrf_guard.py."""
     import ipaddress
 
     real = vision_utils._is_blocked_ip
@@ -194,8 +170,7 @@ def loopback_counts_as_public(monkeypatch):
 
 
 def test_rebinding_to_loopback_after_the_check_is_refused(server, resolver, connects):
-    """The fix under test: the guard checks the public answer, and the fetch goes
-    to that same address rather than re-resolving into 127.0.0.1."""
+    """The fix under test: the guard checks the public answer and the fetch connects to that same address, not one re-resolved to 127.0.0.1."""
     resolver.answers("rebind.invalid", PUBLIC_IP, "127.0.0.1")
     url = f"http://rebind.invalid:{server.server_address[1]}/x.png"
 
@@ -209,18 +184,13 @@ def test_rebinding_to_loopback_after_the_check_is_refused(server, resolver, conn
 
 
 def test_without_pinning_the_same_setup_does_reach_loopback(server, resolver, connects, monkeypatch):
-    """The differential that makes the test above mean something.
-
-    Validation alone, with the connection left to resolve the name for itself,
-    is the pre-fix behaviour, and against the very same scripted resolver it
-    lands on the loopback server and returns its bytes.
-    """
+    """Differential: validation without pinning, letting the connection re-resolve the name, is the pre-fix behaviour:
+    same resolver, loopback server, returns its bytes."""
     real_check = vision_utils._check_fetchable_url
 
     def validate_only(url):
         real_check(url)
-        # Pin nothing, exactly like handing the client the hostname and letting
-        # it resolve for itself, which is what the guard used to do.
+        # _UNPINNED pins nothing, the same as handing the client the hostname to resolve itself, the behaviour the pin exists to avoid.
         return vision_utils._UNPINNED
 
     monkeypatch.setattr(vision_utils, "_check_fetchable_url", validate_only)
@@ -236,8 +206,7 @@ def test_without_pinning_the_same_setup_does_reach_loopback(server, resolver, co
 def test_a_public_hostname_still_fetches_and_keeps_its_host_header(
     server, resolver, connects, loopback_counts_as_public
 ):
-    """Ordinary fetches keep working, and the request that arrives still carries
-    the hostname, not the pinned address."""
+    """Ordinary fetches still work, and the request that arrives still carries the hostname, not the pinned address."""
     resolver.answers("images.invalid", "127.0.0.1")
     port = server.server_address[1]
 
@@ -249,8 +218,7 @@ def test_a_public_hostname_still_fetches_and_keeps_its_host_header(
 
 
 def test_a_mixed_case_hostname_is_pinned_too(server, resolver, connects):
-    """Hostnames are case insensitive, so the pin must be matched that way or a
-    capital letter in a dataset row would opt the fetch back out of pinning."""
+    """Hostnames are case insensitive, so the pin must match case-insensitively; otherwise a capital letter in a dataset row opts the fetch out of pinning."""
     resolver.answers("rebind.invalid", PUBLIC_IP, "127.0.0.1")
     url = f"http://ReBiNd.InVaLiD:{server.server_address[1]}/x.png"
 
@@ -263,8 +231,7 @@ def test_a_mixed_case_hostname_is_pinned_too(server, resolver, connects):
 
 
 def test_every_checked_address_is_tried_in_order(server, resolver, connects, loopback_counts_as_public):
-    """A multi-address answer must not lose failover: the first address refuses
-    the connection here and the fetch still completes on the second."""
+    """A multi-address answer must keep failover: when the first address refuses the connection, the fetch still completes on the second."""
     resolver.answers("multi.invalid", (PUBLIC_IP, "127.0.0.1"))
     port = server.server_address[1]
 
@@ -277,8 +244,7 @@ def test_every_checked_address_is_tried_in_order(server, resolver, connects, loo
 def test_a_redirect_hop_is_pinned_to_its_own_checked_address(
     server, resolver, connects, loopback_counts_as_public
 ):
-    """Per-hop re-validation still holds, and each hop connects to the address
-    its own check resolved, so the second hop cannot be rebound either."""
+    """Per-hop re-validation still holds, and each redirect hop connects to the address its own check resolved, so later hops cannot be rebound either."""
     port = server.server_address[1]
     resolver.answers("images.invalid", "127.0.0.1")
     resolver.answers("rebind.invalid", PUBLIC_IP, "127.0.0.1")
@@ -295,8 +261,7 @@ def test_a_redirect_hop_is_pinned_to_its_own_checked_address(
 def test_a_redirect_to_an_internal_address_is_still_blocked_before_connecting(
     server, resolver, connects, loopback_counts_as_public
 ):
-    """The existing per-hop check is untouched: a hop that resolves internally is
-    refused by the guard, with no connection attempted at all."""
+    """The existing per-hop check is untouched: a redirect hop resolving to an internal address is refused before any connection is attempted."""
     port = server.server_address[1]
     resolver.answers("images.invalid", "127.0.0.1")
     resolver.answers("internal.invalid", "10.1.2.3")
@@ -316,8 +281,7 @@ def test_a_directly_private_hostname_is_rejected_before_any_connect(resolver, co
 
 
 def test_the_opt_out_still_fetches_a_loopback_url(server, connects):
-    """UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1 is the documented way to serve media
-    from a private host, and it must keep working with pinning in place."""
+    """UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1 is the documented way to serve media from a private host, and it must keep working with the DNS pin."""
     import os
     port = server.server_address[1]
     os.environ["UNSLOTH_ALLOW_PRIVATE_URL_FETCH"] = "1"
@@ -332,9 +296,7 @@ def test_the_opt_out_still_fetches_a_loopback_url(server, connects):
 def test_tls_is_verified_against_the_hostname_not_the_pinned_address(
     server_tls, resolver, connects, loopback_counts_as_public
 ):
-    """Pinning must not turn into certificate verification against an IP: the
-    handshake here succeeds only if SNI and hostname matching still use the
-    hostname, and a certificate for another name must still be rejected."""
+    """Pinning must not turn into certificate checks against an IP: SNI and hostname matching still use the hostname; a cert for another name is rejected."""
     httpd, certificate = server_tls
     port = httpd.server_address[1]
     resolver.answers("secure.invalid", "127.0.0.1")
@@ -399,11 +361,8 @@ def server_tls(tmp_path):
     ))
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    # PROTOCOL_TLS_SERVER negotiates the highest both ends offer, so in practice this
-    # server speaks 1.2 or 1.3 already. The floor is set anyway because the CONTEXT still
-    # permits 1.0 and 1.1, which is what a reader -- and CodeQL's py/insecure-protocol --
-    # sees, and a fixture that models a TLS attack should not be the one place in the repo
-    # accepting a protocol version the attack surface it models was retired over.
+    # PROTOCOL_TLS_SERVER already negotiates 1.2 or 1.3, but the context still permits 1.0 and 1.1 (flagged by CodeQL
+    # py/insecure-protocol), so the TLSv1_2 floor is explicit.
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(certificate_path), str(key_path))
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
@@ -421,8 +380,7 @@ def server_tls(tmp_path):
 
 
 def test_the_pinned_connection_restores_the_hostname_before_tls_runs():
-    """urllib3 reads `host` for SNI, hostname matching and the Host header after
-    `_new_conn` returns, so the address may only be in place across the connect."""
+    """urllib3 reads `host` for SNI, hostname matching and the Host header after `_new_conn` returns, so the pinned address may only apply during connect."""
     observed = []
 
     class Base:
@@ -465,10 +423,7 @@ def _pinned_probe_class(observed):
 
 
 def test_a_missing_or_foreign_pin_is_refused_rather_than_resolved_again():
-    """Falling back to the client's own DNS answer is the bug, so every state
-    other than a matching pin has to refuse. `_UNPINNED` is the one exception:
-    the opt-out and the proxy path really do leave the address to someone else.
-    """
+    """Falling back to the client's own DNS answer is the bug: any state but a matching pin must refuse, except `_UNPINNED` for the opt-out and proxy paths."""
     observed = []
     pinned_class = _pinned_probe_class(observed)
 
@@ -503,16 +458,14 @@ def test_a_missing_or_foreign_pin_is_refused_rather_than_resolved_again():
 
 
 def test_a_public_ipv6_literal_url_still_connects_to_that_address(connects):
-    """There is no name to rebind here, and the pin must recognise the address
-    as its own host rather than refusing a perfectly ordinary URL."""
+    """An IP literal has no name to rebind, so the pin must recognise the address as its own host rather than refusing a perfectly ordinary URL."""
     with pytest.raises(requests.exceptions.ConnectionError):
         vision_utils.fetch_image({"image": "http://[2606:4700:4700::1111]/x.png"})
     assert connects == [("2606:4700:4700::1111", 80)], connects
 
 
 def test_a_bracketed_ipv6_host_matches_the_pin(connects):
-    """urllib3 1.x leaves an IPv6 literal in its brackets where 2.x strips them,
-    and either spelling has to match or the fetch would be refused outright."""
+    """urllib3 1.x keeps the brackets around an IPv6 literal host where 2.x strips them; both spellings must match the pin or the fetch is refused outright."""
     observed = []
     pinned_class = _pinned_probe_class(observed)
     token = vision_utils._PINNED_ADDRESSES.set(
@@ -526,16 +479,8 @@ def test_a_bracketed_ipv6_host_matches_the_pin(connects):
 
 
 def test_a_punycoded_hostname_is_still_pinned(server, resolver, connects):
-    """requests punycodes a non-ASCII host before it builds the connection, so a
-    pin held only under the unicode spelling would never match and the fetch
-    would resolve the name for itself again. One accented letter in a dataset
-    row must not be a way back to the old behaviour.
-
-    The two spellings are answered differently here, which is the whole hazard:
-    the guard has to resolve the one that will be dialled. It refuses this URL
-    outright rather than pinning the unicode answer, because the spelling
-    requests sends is the loopback one.
-    """
+    """requests punycodes non-ASCII hosts before connecting, so a pin held under the unicode spelling never matches; the
+    guard must resolve the punycode form it dials, which is loopback here, and refuses."""
     port = server.server_address[1]
     resolver.answers("rébind.invalid", PUBLIC_IP)
     resolver.answers("xn--rbind-bsa.invalid", "127.0.0.1")
@@ -551,8 +496,7 @@ def test_a_punycoded_hostname_is_still_pinned(server, resolver, connects):
 
 
 def test_a_name_that_fails_the_check_lookup_cannot_resolve_at_connect_time(server, resolver, connects):
-    """Answering the guard's query with a failure and the client's with loopback
-    is the same two-answer trick, so an unresolvable name pins to nothing."""
+    """Answering the guard's lookup with a failure and the client's with loopback is the two-answer trick, so an unresolvable name must pin to nothing."""
     port = server.server_address[1]
     resolver.fails_then_answers("flaky.invalid", "127.0.0.1")
 
@@ -564,8 +508,7 @@ def test_a_name_that_fails_the_check_lookup_cannot_resolve_at_connect_time(serve
 
 
 def test_the_checked_addresses_are_not_dialled_once_per_socket_type(monkeypatch):
-    """getaddrinfo answers once per socket type unless it is told otherwise, and
-    dialling each address three times would treble the wait on a dead host."""
+    """getaddrinfo answers once per socket type unless told otherwise, and dialling each address three times would treble the wait on a dead host."""
     import socket as socket_module
 
     seen = {}

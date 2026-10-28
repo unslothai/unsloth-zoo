@@ -14,23 +14,9 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A device without torch._grouped_mm must not reach torch._grouped_mm.
-
-`select_moe_backend` already falls to `unsloth_triton` when the probe says the kernel
-is unsupported, but `forward_triton_grouped_gemm` applied its separated LoRA delta
-through `native_moe_grouped_mm`, which calls the primitive the backend was chosen to
-avoid, so a LoRA MoE off an H100 died at the first step:
-
-    RuntimeError: torch._grouped_mm is only supported on CUDA devices with
-    compute capability = 9.0
-
-Found on a B200 under torch 2.8.0, whose check is `dprops->major == 9` exactly
-(Blas.cpp, `sm90_only`), so an A100 is refused the same way. 2.6/2.7 have no
-`_grouped_mm`; 2.9 falls back inside torch, which is why only older pins show this.
-
-The guard goes in `_grouped_mm_with_backward_fix`, the choke point every LoRA and
-base path shares.
-"""
+"""A device without torch._grouped_mm support must not reach it: torch 2.8 checks dprops->major == 9 exactly (B200 and
+A100 refused); the guard sits in _grouped_mm_with_backward_fix, the shared choke point; 2.6/2.7 lack it, 2.9 falls
+back internally."""
 
 from unittest import mock
 
@@ -151,8 +137,7 @@ def test_the_gradients_match_plain_autograd(unsupported):
 
 
 def test_a_gradient_is_only_produced_where_it_is_wanted(unsupported):
-    """A frozen base stack asks for dX only, and building dW anyway is a
-    full-size allocation per call for nothing."""
+    """A frozen base stack asks for dX only; building dW anyway is a full-size allocation per call for nothing."""
     inputs, weight, offsets = _case()
     inputs = inputs.requires_grad_(True)
     M._grouped_mm_with_backward_fix(inputs, weight, offsets).sum().backward()
@@ -171,15 +156,8 @@ def test_an_empty_group_contributes_no_gradient(unsupported):
 
 
 def test_it_saves_only_shape_stable_tensors(unsupported):
-    """The whole point. A slice's shape is the router-decided group size, so saving
-    slices made non-reentrant checkpointing compare metadata across two routings and
-    abort the backward:
-
-        CheckpointError: saved torch.Size([38, 8]) recomputed torch.Size([39, 8])
-
-    Qwen3_5_MoE on a B200 died exactly there once the capability guard let it reach
-    training. Saved shapes must depend on nothing but the inputs.
-    """
+    """Saved shapes must depend only on inputs: a slice's shape is the router-decided group size, so saving slices made
+    non-reentrant checkpointing abort with CheckpointError (Qwen3_5_MoE on B200)."""
     inputs, weight, offsets = _case()
     inputs = inputs.requires_grad_(True)
     out = M._grouped_mm_with_backward_fix(inputs, weight, offsets)
@@ -202,9 +180,8 @@ def test_it_survives_non_reentrant_checkpointing(unsupported):
 
 
 def test_the_modulelist_stride_fallback_shares_the_same_helper():
-    """`moe_grouped_modulelist._grouped_mm_fix` had its own copy of the loop, and two
-    of its callers tape the result, so the same slice-shaped saved tensors were
-    reachable there through the 16-byte stride error."""
+    """moe_grouped_modulelist._grouped_mm_fix had its own copy of the loop, and two callers tape its result, so the same
+    slice-shaped saved tensors were reachable via the 16-byte stride error."""
     from unsloth_zoo.temporary_patches import moe_grouped_modulelist as G
 
     def _stride_error(*args, **kwargs):
@@ -231,14 +208,8 @@ def test_the_modulelist_stride_fallback_shares_the_same_helper():
 # --- what the first review round found --------------------------------------
 
 def test_a_routing_change_in_the_replay_is_named_not_swallowed(unsupported):
-    """Shape-stable saves are parity with the fused op, not permission to lie.
-
-    Non-reentrant checkpointing replaces the SAVED tensors with the replay's, so a
-    backward that just uses them pairs the original `grad_output` with the replay's
-    partition: a gradient for a routing that never produced the loss, worse than the
-    CheckpointError it replaced. So the forward's own boundaries are kept off the tape
-    and compared.
-    """
+    """A replayed routing change must be named, not swallowed: non-reentrant checkpointing would pair the original
+    grad_output with the replay's partition, so boundaries are compared off-tape."""
     inputs = torch.randn(12, 8)
     weight = torch.randn(3, 8, 6)
     replayed = torch.tensor([4, 9, 12], dtype = torch.int32)   # one token over
@@ -260,9 +231,7 @@ class _ReplayCtx:
 
 
 def test_a_count_preserving_reshuffle_is_caught_too(unsupported):
-    """Offsets are the routing histogram, not the assignment: swap two tokens between
-    equal-sized experts and every boundary is where it was, so an offsets-only check
-    waves the replay through and pairs `grad_output` with reordered input rows."""
+    """Offsets only record the routing histogram; swapping tokens between equal-sized experts keeps every boundary, so offsets-only checks miss the reorder."""
     inputs = torch.randn(12, 8)
     weight = torch.randn(3, 8, 6)
     offsets = torch.tensor([4, 8, 12], dtype = torch.int32)
@@ -319,8 +288,7 @@ def test_the_same_routing_twice_is_not_flagged(unsupported):
 
 
 def test_backward_survives_a_reduced_precision_grad_output(unsupported):
-    """`Function.backward` runs OUTSIDE the forward's autocast, so grad_output can be
-    bf16 while the saved tensors are still fp32. Unaligned, the first matmul raises."""
+    """Function.backward runs outside the forward's autocast, so grad_output can be bf16 while saved tensors stay fp32; unaligned, the first matmul raises."""
     inputs = torch.randn(8, 4, dtype = torch.float32, requires_grad = True)
     weight = torch.randn(2, 4, 6, dtype = torch.float32, requires_grad = True)
     offsets = torch.tensor([4, 8], dtype = torch.int32)
@@ -334,17 +302,16 @@ def test_backward_survives_a_reduced_precision_grad_output(unsupported):
 
 
 def test_it_is_marked_as_not_compilable():
-    """A data-dependent group loop cannot be traced; breaking cleanly beats
-    aborting mid-trace, and the tensorized rewrites all cost more than they save."""
+    """A data-dependent group loop cannot be traced, so it is marked not compilable: breaking cleanly beats aborting
+    mid-trace, and tensorized rewrites cost more than they save."""
     assert getattr(M._manual_grouped_mm, "_torchdynamo_disable", False) or \
         "disable" in type(M._manual_grouped_mm).__name__.lower() or \
         hasattr(M._manual_grouped_mm, "__wrapped__"), M._manual_grouped_mm
 
 
 def test_the_signature_ignores_autocast(unsupported):
-    """`mv`/`mm` are on the autocast lower-precision list and only the forward sees it
-    (backward runs with autocast disabled), so FP32 inputs hashed bf16 one side and
-    fp32 the other and every backward raised the routing error on unchanged routing."""
+    """mv/mm are on the autocast lower-precision list and only the forward sees it, so FP32 inputs hashed bf16 on one
+    side and fp32 on the other, and every backward raised a routing error."""
     inputs = torch.randn(12, 8, dtype = torch.float32)
     offsets = torch.tensor([4, 8, 12], dtype = torch.int32)
 
@@ -355,9 +322,8 @@ def test_the_signature_ignores_autocast(unsupported):
 
 
 def test_a_row_orthogonal_to_the_projection_does_not_collide(unsupported):
-    """One dot product per row maps it to a scalar, so every row orthogonal to the
-    projection hashes like the zero row; swapping such a pair across an expert boundary
-    is a routing change the check has to see."""
+    """A dot product per row maps it to a scalar, so rows orthogonal to the projection hash like the zero row; swapping
+    such a pair across an expert boundary must still be seen."""
     hidden = 8
     ramp = torch.linspace(1.0, 2.0, hidden, dtype = torch.float32)
     p = torch.sin(ramp * M._SIGNATURE_STRIDES[0])
@@ -373,11 +339,8 @@ def test_a_row_orthogonal_to_the_projection_does_not_collide(unsupported):
 
 
 def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
-    """Grad off means `apply` builds no node, so nothing will ever read the signature
-    and the `[T, hidden]` projection is pure cost. The reentrant-checkpoint gap this
-    leaves is documented at the call site: the stash that tried to close it keyed on a
-    weight the LoRA path rebuilds per call, so it missed the replay AND pinned a fresh
-    GPU tensor on every no-grad decode step."""
+    """With grad off no node is built, so no signature is taken (the [T, hidden] projection is pure cost); a stash keyed
+    on the weight missed replays and pinned GPU tensors per decode step."""
     inputs, weight, offsets = _case()
     taken = []
     real = M._routing_signature
@@ -398,26 +361,8 @@ def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
 
 
 def _live_tensor_count():
-    """Live tensors in the process, without tripping over somebody else's dead weakref.
-
-    ``gc.get_objects()`` returns every tracked object in the PROCESS, which includes dead
-    ``weakref.proxy`` objects other test modules leave behind; PEFT's parametrization makes
-    them. ``torch.is_tensor(o)`` is ``isinstance(o, torch.Tensor)``, and isinstance on a
-    dead weakproxy RAISES ``ReferenceError`` rather than answering False, so the walk died
-    with "weakly-referenced object no longer exists" -- a message about a weakref, raised
-    from a test about tensor retention, in a file that never creates one.
-
-    Reproduced deterministically rather than guessed: make a ``weakref.proxy``, drop its
-    referent, collect, then walk ``gc.get_objects()`` calling ``torch.is_tensor``. A single
-    dead proxy anywhere in the process is enough. That is why this only ever failed under
-    xdist, where other modules share the worker, and never when the file ran alone.
-
-    test_moe_fused_lora_merge_layout.py already clears its own proxies for this reason, and
-    that is worth keeping. It cannot be the whole answer though: it asks every producer to
-    remember, and any test in any file may leave one behind. So the consumer is made safe
-    too. Skipping the unreadable object is right -- a dead weakproxy is not a live tensor,
-    which is the only thing being counted.
-    """
+    """Counts live tensors via gc.get_objects, skipping dead weakref.proxy objects: isinstance on one raises
+    ReferenceError, and any test in a shared xdist worker may leave one (PEFT parametrization makes them)."""
     import gc
 
     total = 0
@@ -431,9 +376,8 @@ def _live_tensor_count():
 
 
 def test_no_grad_decoding_retains_nothing(unsupported):
-    """The stash that was here held a strong reference to each `weight`, and the PEFT
-    extraction path hands over a FRESH contiguous tensor per call, so a long generation
-    accumulated live GPU tensors. Nothing module-level may grow across grad-off calls."""
+    """Nothing module-level may grow across grad-off calls: an earlier stash held a strong ref to each weight, and PEFT
+    passes a fresh tensor per call, so long generations accumulated live GPU tensors."""
     import gc
 
     inputs, _, offsets = _case()
@@ -447,13 +391,7 @@ def test_no_grad_decoding_retains_nothing(unsupported):
 
 
 def test_the_live_tensor_walk_survives_a_dead_weakproxy():
-    """The regression that sent Core zoo red, pinned so it cannot come back.
-
-    Without the guard this raises ReferenceError instead of counting, and it does so only
-    when some other module in the same worker has left a dead proxy around, which is the
-    hardest kind of failure to attribute: the traceback names neither the test that made
-    the proxy nor anything this file does.
-    """
+    """Pins the dead-weakproxy guard in _live_tensor_count: without it, counting raises ReferenceError once another module in the worker left a dead proxy behind."""
     import gc
     import weakref
 
@@ -474,23 +412,15 @@ def test_the_live_tensor_walk_survives_a_dead_weakproxy():
 
 
 def test_the_signature_carries_a_term_the_projections_cannot_reach(unsupported):
-    """Four projections leave a common `hidden - 4` null space, so two rows differing
-    by a vector in it project alike. The norm is not linear in the row, so it does not
-    share that null space.
-
-    Asserted structurally, not by constructing a colliding pair: an exact null-space
-    vector is not representable in the float32 the signature uses, so such a pair
-    separates on rounding noise and the test would pass against a projections-only
-    signature too. What can be checked is that the extra term is there, is the norm,
-    and reaches the packed output.
-    """
+    """Four projections leave a hidden - 4 null space; the norm term is not linear in the row so it escapes that space,
+    and must reach the packed output. Checked structurally, since float32 cannot represent an exact null-space
+    collision."""
     assert M._SIGNATURE_EXTRA == 1
     assert M._SIGNATURE_WIDTH == len(M._SIGNATURE_STRIDES) + M._SIGNATURE_EXTRA
 
     offsets = torch.tensor([2], dtype = torch.int32)
     hidden = 8
-    # Same direction, different length: the norm separates them on magnitude, which no
-    # linear projection can be relied on to do inside the shared null space.
+    # Same direction, different length: the norm separates them by magnitude, which no linear projection can be relied on to do inside the shared null space.
     unit = torch.zeros(2, hidden); unit[0, 0] = 1.0; unit[1, 0] = 1.0
     scaled = unit.clone(); scaled[1, 0] = 4.0
     assert M._routing_signature(unit, offsets) != \
@@ -501,9 +431,7 @@ def test_the_signature_carries_a_term_the_projections_cannot_reach(unsupported):
 
 
 def test_the_forward_does_not_sync_the_offsets_twice(unsupported):
-    """`_routing_signature` packs the offsets into its own transfer, so re-reading them
-    in the group loop was a second stream sync per grouped matmul, over every layer's
-    base and LoRA projections."""
+    """_routing_signature packs the offsets into its own transfer, so re-reading them in the group loop would add a second stream sync per grouped matmul."""
     inputs, weight, offsets = _case()
     calls = []
     real = torch.Tensor.cpu
@@ -516,9 +444,8 @@ def test_the_forward_does_not_sync_the_offsets_twice(unsupported):
 
 
 def test_the_norm_does_not_materialize_fp32_copies(unsupported):
-    """`(x.float() * x.float()).sum(...)` held two fp32 copies and their product at
-    once. Asserted on the source: the temporaries are freed before any allocator
-    snapshot a CPU test could take."""
+    """The norm uses vector_norm: (x.float() * x.float()).sum() held two fp32 copies and their product at once; asserted
+    on source since CPU tests cannot snapshot the allocator."""
     import inspect
 
     body = inspect.getsource(M._routing_signature)
@@ -527,12 +454,8 @@ def test_the_norm_does_not_materialize_fp32_copies(unsupported):
 
 
 def _backward_matmul_out_usage(out, seed):
-    """Which of `torch.matmul`'s calls during `out.backward(seed)` passed `out=`.
-
-    Only the in-place branch calls `torch.matmul` by name; the casting branch uses
-    the `@` operator, which does not route through this patch. So an empty record
-    means the casting branch ran.
-    """
+    """Records which torch.matmul calls during out.backward(seed) passed out=; only the in-place branch calls
+    torch.matmul by name, so an empty record means the casting branch ran."""
     from unittest import mock
 
     seen = []
@@ -548,9 +471,7 @@ def _backward_matmul_out_usage(out, seed):
 
 
 def test_the_backward_writes_each_group_straight_into_its_slice(unsupported):
-    """Assigning a matmul result allocates a temporary and copies it in, twice per
-    group. `out=` does neither, and the loop is 37% cheaper for it on a 128-expert
-    layer. Pinned on the call, since the gradients below are equal either way."""
+    """Backward writes each group with out= to avoid a temporary and a copy per group; pinned on the call, since gradients match either way."""
     inputs, weight, offsets = _case()
     out = M._ManualGroupedMM.apply(
         inputs.requires_grad_(True), weight.requires_grad_(True), offsets)
@@ -560,8 +481,7 @@ def test_the_backward_writes_each_group_straight_into_its_slice(unsupported):
 
 
 def test_a_cast_still_takes_the_temporary(unsupported):
-    """`out=` cannot cast, so an autocast forward over fp32 saves has to keep the
-    plain path. Left ungated it raises rather than writing."""
+    """out= cannot cast, so an autocast forward over fp32 saves must keep the plain path; left ungated it raises rather than writing."""
     inputs, weight, offsets = _case(dtype = torch.float32)
     inputs.requires_grad_(True)
     weight.requires_grad_(True)
@@ -575,16 +495,8 @@ def test_a_cast_still_takes_the_temporary(unsupported):
 
 
 def test_writing_in_place_changes_no_gradient(unsupported):
-    """Every group's gradient lands in ITS OWN slice, against both reference forms.
-
-    Closeness, not `torch.equal`: bit-exactness is not portable here. The ubuntu
-    CPU runner disagreed in the last bit against BOTH references, the `out=` one
-    included, while this box and a B200 matched exactly -- `out=` lets the kernel
-    write the destination directly rather than a fresh contiguous buffer, and how
-    that rounds is the BLAS build's business. The bug this guards against is a
-    gradient written into the wrong slice, which moves values by whole
-    magnitudes, so tolerance costs nothing here.
-    """
+    """Each group's gradient must land in its own slice; compared by closeness, not torch.equal, since out= rounding
+    varies by BLAS build (a misplaced slice moves values by whole magnitudes)."""
     inputs, weight, offsets = _case(n_experts = 4, rows_each = 3, k = 6, n = 5)
     x = inputs.detach().clone().requires_grad_(True)
     w = weight.detach().clone().requires_grad_(True)
@@ -611,10 +523,9 @@ def test_writing_in_place_changes_no_gradient(unsupported):
 
 
 def test_higher_order_gradients_still_work(unsupported):
-    """`out=` refuses autograd, so the in-place write has to stand down when the
-    backward itself is being differentiated. `torch._grouped_mm` double-backwards
-    on a supported device (checked on a B200, torch 2.9.1), so a fallback that
-    raised there would make the answer depend on the card."""
+    """out= refuses autograd, so the in-place write must stand down when the backward is itself differentiated;
+    torch._grouped_mm double-backwards on a supported device (B200, torch 2.9.1), so a raising fallback would make
+    results depend on the card."""
     inputs, weight, offsets = _case()
     x = inputs.detach().clone().requires_grad_(True)
     w = weight.detach().clone().requires_grad_(True)
@@ -636,8 +547,7 @@ def test_higher_order_gradients_still_work(unsupported):
 
 
 def test_an_ordinary_backward_still_writes_in_place(unsupported):
-    """The guard above must not cost the common case: the engine runs a plain
-    backward with grad mode off, so `out=` still applies."""
+    """The autograd guard must not cost the common case: the engine runs a plain backward with grad mode off, so out= still applies."""
     inputs, weight, offsets = _case()
     out = M._ManualGroupedMM.apply(
         inputs.requires_grad_(True), weight.requires_grad_(True), offsets)
@@ -685,21 +595,8 @@ def test_the_triton_backend_is_not_offered_without_make_tensor_descriptor(monkey
 
 
 def test_the_triton_backend_is_not_offered_without_a_cuda_device(monkeypatch):
-    """A box without CUDA must not be told the Triton grouped GEMM is available.
-
-    `_check_grouped_gemm_available` answered purely on whether
-    `unsloth.kernels.moe.grouped_gemm.interface` imports, but the kernel opens with
-    `assert X.device.type == "cuda"`. So on a CPU machine that happens to have unsloth
-    installed the probe said yes, `select_moe_backend` chose "unsloth_triton", and the
-    first expert forward died on "X and W must be on CUDA" rather than taking the
-    native loop. Importable is not usable; the sibling probe
-    `_check_torch_grouped_mm_supported` already refuses without an accelerator.
-
-    The kernel import is STUBBED to succeed. Without that this test passes on any host
-    that cannot import unsloth at all, which is most CI boxes and was how the first
-    version of it passed with the guard deleted: the ImportError arm returned False and
-    nothing about the device was ever exercised.
-    """
+    """_check_grouped_gemm_available must refuse without CUDA even when the kernel imports, since the kernel asserts
+    CUDA; the import is stubbed so the device check runs."""
     import sys, types
 
     for name in (
@@ -725,11 +622,8 @@ def test_the_triton_backend_is_not_offered_without_a_cuda_device(monkeypatch):
     monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
     assert M._check_grouped_gemm_available() is False
 
-    # And the selector then has to land somewhere that runs on this device.
-    # select_moe_backend is lru_cached: read it cold, or this asserts on whatever an
-    # earlier test selected, and clear it on the way out, or the "native_torch" it
-    # computes under these patches outlives them and every later test in the process
-    # skips the GPU backends.
+    # The selector must pick a backend that runs on this device; select_moe_backend is lru_cached, so clear it before
+    # and after, or a native_torch pick made under these patches outlives them and later tests skip GPU backends.
     monkeypatch.setattr(M, "_TORCH_GROUPED_MM_SUPPORTED", False, raising = False)
     monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
     monkeypatch.delenv("UNSLOTH_MOE_BACKEND", raising = False)

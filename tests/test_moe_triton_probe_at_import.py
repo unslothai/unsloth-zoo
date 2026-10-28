@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""moe_triton_kernels_available() is probed at import, so a compiled frame never guards on an unprobed
-_TRITON and does not recompile once an eager call has run."""
+"""Checks moe_triton_kernels_available() is probed at import; compiled frames then never guard on an unprobed _TRITON or recompile after an eager call."""
 
 import importlib.util
 import sys

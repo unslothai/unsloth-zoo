@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_COMPILE_DISABLE ("1" or "partial") only switches off torch.compile.
-
-"1" used to exit the compiler before installing the rewritten classes and skipped the fast LoRA
-forward, and it switched off the SDPA bool-mask fix. Every optimization must stay on, eager, with no
-Dynamo frame traced. The flag is read at import, so each value is probed in a subprocess.
-"""
+"""Checks that UNSLOTH_COMPILE_DISABLE set to '1' or 'partial' only switches off torch.compile: rewritten classes, fast
+LoRA forward and SDPA mask fix stay on, eager, with no Dynamo frame traced; probed in a subprocess since the flag is
+read at import"""
 
 import json
 import os

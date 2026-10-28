@@ -13,12 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""TiledMLP must replay dropout masks when PEFT adds lora_dropout after patching (CPU only).
-
-Unsloth patches MLPs inside from_pretrained, before get_peft_model injects LoRA and its
-lora_dropout. A patch time scan found no dropout, so the backward recompute drew fresh masks
-and the gradients belonged to a different function than the one the forward computed.
-"""
+"""TiledMLP must replay dropout masks when PEFT adds lora_dropout after patching; a patch-time dropout scan misses it, so recompute drew fresh masks; CPU only."""
 import copy
 
 import pytest

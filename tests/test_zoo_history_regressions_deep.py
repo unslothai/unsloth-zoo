@@ -22,8 +22,7 @@ import pytest
 
 
 def _module_source_path(module_name: str) -> pathlib.Path:
-    # find_spec is metadata-only so we avoid running compiler.py:87's
-    # torch.cuda.get_device_capability() on CPU-only CI.
+    # find_spec is metadata-only, so it avoids running compiler.py:87's torch.cuda.get_device_capability() on CPU-only CI.
     spec = importlib.util.find_spec(module_name)
     if spec is None or spec.origin in (None, "built-in"):
         raise ImportError(f"could not locate source for {module_name!r}")
@@ -56,8 +55,7 @@ def test_longest_common_sublist_empty_and_no_overlap():
 
 
 def test_no_unguarded_legacy_pretrained_config_import():
-    """PR #322: transformers 4.57 renamed PretrainedConfig -> PreTrainedConfig.
-    Reject unguarded legacy imports."""
+    """PR 322: transformers 4.57 renamed PretrainedConfig to PreTrainedConfig; reject unguarded legacy imports of the old name."""
     import pathlib
     root = pathlib.Path(
         importlib.import_module("unsloth_zoo").__file__,
@@ -88,8 +86,7 @@ def test_no_unguarded_legacy_pretrained_config_import():
 
 
 def test_empty_model_exception_var_consistent():
-    """PR #374: bound exception variable matches body references
-    (UnboundLocalError when `as error` body uses `e`)."""
+    """PR 374: an except-bound variable must match body references (UnboundLocalError when the `as error` body uses `e`)."""
     src = _get_source("unsloth_zoo.empty_model")
     tree = ast.parse(src)
 
@@ -145,8 +142,7 @@ def test_distributed_function_runs_without_init():
 
 
 def test_version_garbage_input_clean_error():
-    """PR #425: Version() raises clean RuntimeError on garbage input,
-    not NameError/UnboundLocalError on undefined `e`."""
+    """PR 425: Version() must raise a clean RuntimeError on garbage input, not NameError or UnboundLocalError from an undefined `e`."""
     from unsloth_zoo.utils import Version
     bad_inputs = [
         "not.a.real.package.name",
@@ -188,8 +184,7 @@ def test_version_falls_back_for_unknown_package_strings():
 
 
 def test_canonicalize_annotation_union_pep604_equivalence():
-    """PR #458: Union[int, str] and int|str canonicalise identically
-    (origin must flow through TYPE_MAPPINGS)."""
+    """PR 458: Union[int, str] and int|str must canonicalise identically; origin must flow through TYPE_MAPPINGS."""
     pytest.importorskip("transformers")
     from unsloth_zoo.temporary_patches.utils import canonicalize_annotation
     import typing as t
@@ -203,8 +198,7 @@ def test_canonicalize_annotation_union_pep604_equivalence():
 
 
 def test_patching_utils_should_convert_module_uses_substring():
-    """PR #491: _unsloth_should_convert_module uses substring component
-    matching (transformers 5.x prefix-anchored re.match misses vision_tower)."""
+    """PR 491: _unsloth_should_convert_module must use substring component matching, since prefix-anchored re.match on transformers 5.x misses vision_tower."""
     src = _get_source("unsloth_zoo.patching_utils")
     assert "_unsloth_should_convert_module" in src, (
         "The transformers-5.x should_convert_module patch is missing "
@@ -225,8 +219,7 @@ def test_patching_utils_should_convert_module_uses_substring():
 
 
 def test_compiler_disables_fullgraph_for_dynamic_rope_update():
-    """PR #533: compiler flips fullgraph=False when dynamic_rope_update
-    decorator is present (Phi-4 longrope data-dependent branching)."""
+    """PR 533: compiler sets fullgraph=False when the dynamic_rope_update decorator is present (Phi-4 longrope data-dependent branching)."""
     src = _get_source("unsloth_zoo.compiler")
     assert "dynamic_rope_update" in src, (
         "compiler.py no longer references dynamic_rope_update -- "
@@ -245,8 +238,7 @@ def test_compiler_disables_fullgraph_for_dynamic_rope_update():
 
 
 def test_compiler_conv_prologue_casts_to_weight_dtype():
-    """PR #552: Conv wrappers cast input to weight dtype BEFORE the op
-    (autocast bf16 weight + fp16 input crashes)."""
+    """PR 552: Conv wrappers must cast input to the weight dtype BEFORE the op, since autocast bf16 weight with fp16 input crashes."""
     src = _get_source("unsloth_zoo.compiler")
     has_save = re.search(r"original_dtype\s*=\s*input\.dtype", src)
     has_cast = re.search(
@@ -262,8 +254,7 @@ def test_compiler_conv_prologue_casts_to_weight_dtype():
 
 
 def test_compiler_lora_forward_emits_torch_result_dtype_cast():
-    """PR #564: the LoRA update casts back to base-layer dtype
-    when autocast is disabled."""
+    """PR 564: the LoRA update casts back to base-layer dtype when autocast is disabled."""
     src = _get_source("unsloth_zoo.compiler")
     assert "torch_result_dtype" in src, (
         "compiler.py no longer references `torch_result_dtype` -- "
@@ -281,8 +272,7 @@ def test_compiler_lora_forward_emits_torch_result_dtype_cast():
 
 
 def test_compiler_peft_forward_skips_quantized_dtype_cast():
-    """PR #482: skip x.to(weight.dtype) on Params4bit (weight.dtype==uint8
-    corrupts inputs); gated by hasattr(weight, 'quant_state')."""
+    """PR 482: skip x.to(weight.dtype) on Params4bit, since weight.dtype is uint8 and corrupts inputs; gated by hasattr(weight, 'quant_state')."""
     src = _get_source("unsloth_zoo.compiler")
     assert "quant_state" in src, (
         "compiler.py has no `quant_state` mention -- regression of "
@@ -299,8 +289,7 @@ def test_compiler_peft_forward_skips_quantized_dtype_cast():
 
 
 def test_vllm_lora_manager_no_duplicate_vllm_config_kwarg():
-    """PR #466: _call_create_lora_manager must not pass vllm_config
-    both positionally and as keyword."""
+    """PR 466: _call_create_lora_manager must not pass vllm_config both positionally and as a keyword."""
     src = _get_source("unsloth_zoo.vllm_lora_worker_manager")
     bad: list[str] = []
     for m in re.finditer(
@@ -319,8 +308,7 @@ def test_vllm_lora_manager_no_duplicate_vllm_config_kwarg():
 
 
 def test_gemma4_proxy_hides_zero_num_kv_shared_layers():
-    """PR #580: _Gemma4KVSharedSafeProxy hides num_kv_shared_layers==0
-    so transformers' layer_types[:-0] doesn't return []."""
+    """PR 580: _Gemma4KVSharedSafeProxy must hide num_kv_shared_layers==0, else transformers' layer_types[:-0] does not return []."""
     pytest.importorskip("torch")
     mod = importlib.import_module(
         "unsloth_zoo.temporary_patches.gemma4",
@@ -347,8 +335,7 @@ def test_gemma4_proxy_hides_zero_num_kv_shared_layers():
 
 
 def test_grpo_softcap_formula_is_cap_times_tanh():
-    """PR #593: softcap is `cap * tanh(logits/cap)`, not
-    `logits * tanh(logits/cap)` (else saturates to no-op)."""
+    """PR 593: softcap is `cap * tanh(logits/cap)`, not `logits * tanh(logits/cap)`, which would saturate to a no-op."""
     src = _get_source(
         "unsloth_zoo.rl_replacements",
         "chunked_hidden_states_selective_log_softmax",
@@ -375,8 +362,7 @@ def test_grpo_softcap_formula_is_cap_times_tanh():
 
 
 def test_rl_replacements_scalar_tensor_init_for_accumulators():
-    """PR #543: accumulated_loss = torch.zeros(1, ...)[0] (shape [])
-    so transformers 5.x in-place += doesn't broadcast-crash."""
+    """PR 543: accumulated_loss must be a shape-[] scalar (torch.zeros(1, ...)[0]) so transformers 5.x in-place += does not broadcast-crash."""
     src = _get_source("unsloth_zoo.rl_replacements")
     hit = re.search(
         r"accumulated_loss\s*=\s*torch\.zeros\(1[^)]*\)\[0\]",
@@ -390,8 +376,7 @@ def test_rl_replacements_scalar_tensor_init_for_accumulators():
 
 
 def test_sft_prepare_dataset_removes_original_columns_in_non_packing_path():
-    """PR #477: .map(_tokenize, ...) passes remove_columns= so raw
-    JSON columns don't leak to the collator."""
+    """PR 477: .map(_tokenize, ...) must pass remove_columns= so raw JSON columns do not leak to the collator."""
     src = _get_source("unsloth_zoo.dataset_utils")
     m = re.search(
         r"\.map\(\s*_tokenize\s*,\s*batched\s*=\s*True[^)]*\)",
@@ -411,8 +396,7 @@ def test_sft_prepare_dataset_removes_original_columns_in_non_packing_path():
 
 
 def test_saving_utils_uses_atomic_replace_for_shard_rewrite():
-    """PR #595: _stream_rewrite_resized_shard_and_replace uses atomic os.replace
-    (not remove+move; Windows WinError 1224 on shard rewrite)."""
+    """PR 595: _stream_rewrite_resized_shard_and_replace must use atomic os.replace, not remove+move (Windows WinError 1224 on shard rewrite)."""
     src = _get_source(
         "unsloth_zoo.saving_utils", "_stream_rewrite_resized_shard_and_replace",
     )
@@ -433,8 +417,7 @@ def test_saving_utils_uses_atomic_replace_for_shard_rewrite():
 
 
 def test_saving_utils_uses_device_type_helpers():
-    """PR #615: GGUF merge path uses DEVICE_TYPE helpers (XPU + ROCm
-    have no torch.cuda namespace)."""
+    """PR 615: the GGUF merge path must use DEVICE_TYPE helpers, since XPU and ROCm have no torch.cuda namespace."""
     src = _get_source("unsloth_zoo.saving_utils")
     has_helpers = (
         "DEVICE_TYPE" in src
@@ -449,8 +432,7 @@ def test_saving_utils_uses_device_type_helpers():
 
 
 def test_unsloth_get_batch_samples_accepts_4_args():
-    """PR #91: _unsloth_get_batch_samples accepts the 4th `device`
-    parameter transformers 4.50 added."""
+    """PR 91: _unsloth_get_batch_samples must accept the 4th `device` parameter that transformers 4.50 added."""
     pytest.importorskip("transformers")
     mod = importlib.import_module("unsloth_zoo.loss_utils")
     fn = getattr(mod, "_unsloth_get_batch_samples", None)
@@ -475,8 +457,7 @@ def test_unsloth_get_batch_samples_accepts_4_args():
 
 
 def test_all_modules_all_entries_have_no_concatenated_names():
-    """PR #617: __all__ entries with snake_case+CamelCase boundary
-    (e.g. `raise_errorUnpack`) are the missing-comma bug fingerprint."""
+    """PR 617: __all__ entries with a snake_case plus CamelCase boundary (e.g. `raise_errorUnpack`) are the missing-comma bug fingerprint."""
     import pathlib
     root = pathlib.Path(
         importlib.import_module("unsloth_zoo").__file__,
@@ -514,8 +495,7 @@ def test_all_modules_all_entries_have_no_concatenated_names():
 
 
 def test_gemma4_moe_guards_logits_to_keep_slice():
-    """PR #612: gemma4_moe guards the slice behind `if logits_to_keep != 0`
-    (Python's slice(-0, None) == slice(0, None) trap)."""
+    """PR 612: gemma4_moe guards the slice behind `if logits_to_keep != 0` because slice(-0, None) equals slice(0, None)."""
     try:
         src = _get_source("unsloth_zoo.temporary_patches.gemma4_moe")
     except Exception:
@@ -530,8 +510,7 @@ def test_gemma4_moe_guards_logits_to_keep_slice():
 
 
 def test_smart_gradient_checkpointing_patches_transformers_modeling_utils():
-    """PR #549: gradient_checkpointing patches transformers.modeling_utils
-    (transformers 5.2+ moved the checkpoint reference)."""
+    """PR 549: gradient_checkpointing must patch transformers.modeling_utils, since transformers 5.2+ moved the checkpoint reference."""
     pytest.importorskip("transformers")
     src = _get_source("unsloth_zoo.gradient_checkpointing")
     assert "transformers.modeling_utils" in src or "modeling_utils" in src, (
@@ -541,8 +520,7 @@ def test_smart_gradient_checkpointing_patches_transformers_modeling_utils():
 
 
 def test_vllm_utils_no_unsafe_dict_mutation_during_iteration():
-    """PR #218: no `del d[k]` / `d.pop(k)` inside `for k in d:` loops
-    in vllm_utils (dict-changed-size-during-iteration)."""
+    """PR 218: no `del d[k]` or `d.pop(k)` inside `for k in d:` loops in vllm_utils (dict changed size during iteration)."""
     src = _get_source("unsloth_zoo.vllm_utils")
     tree = ast.parse(src)
     bad: list[str] = []
@@ -579,8 +557,7 @@ def test_vllm_utils_no_unsafe_dict_mutation_during_iteration():
 
 
 def test_vllm_lora_worker_no_strict_len_assertion_on_lora_tensors():
-    """PR #84: no `assert len(lora_tensors)` guard (blocked load_lora
-    when filtering yields legitimately empty list)."""
+    """PR 84: no `assert len(lora_tensors)` guard, which blocked load_lora when filtering legitimately yields an empty list."""
     src = _get_source("unsloth_zoo.vllm_lora_worker_manager")
     bad = re.findall(
         r"^\s*assert\s+len\(lora_tensors\)\s*[!=<>]?[^A-Za-z]",
@@ -594,8 +571,7 @@ def test_vllm_lora_worker_no_strict_len_assertion_on_lora_tensors():
 
 
 def test_only_one_canonical_version_helper():
-    """PR #437 / #461: only one top-level `def Version(...)` across zoo
-    (no duplicate divergent helpers)."""
+    """PR 437 and 461: only one top-level `def Version(...)` may exist across zoo, so no duplicate divergent helpers."""
     import pathlib
     root = pathlib.Path(
         importlib.import_module("unsloth_zoo").__file__,
@@ -615,8 +591,7 @@ def test_only_one_canonical_version_helper():
 
 
 def test_chunk_multiplier_guards_against_zero_target_gb():
-    """PR #432: _get_chunk_multiplier guards against zero target_gb
-    (ZeroDivisionError on GPU OOM)."""
+    """PR 432: _get_chunk_multiplier guards against zero target_gb, which would raise ZeroDivisionError on GPU OOM."""
     pytest.importorskip("torch")
     src = _get_source(
         "unsloth_zoo.fused_losses.cross_entropy_loss", "_get_chunk_multiplier",
@@ -638,8 +613,7 @@ def test_chunk_multiplier_guards_against_zero_target_gb():
 
 
 def test_ce_loss_uses_reshape_for_hidden_states():
-    """PR #591: CE loss uses .reshape (not .view) on hidden_states slices
-    (non-contiguous from logits_to_keep slicing)."""
+    """PR 591: CE loss must use .reshape, not .view, on hidden_states slices, which are non-contiguous after logits_to_keep slicing."""
     pytest.importorskip("torch")
     src = _get_source(
         "unsloth_zoo.fused_losses.cross_entropy_loss",
@@ -664,8 +638,7 @@ def test_ce_loss_uses_reshape_for_hidden_states():
 
 
 def test_compiler_disabled_keywords_includes_5x_gemma3_mask():
-    """PR #488: DISABLED_KEYWORDS includes create_causal_mask_mapping
-    (Gemma3/3N transformers 5.x compile crash)."""
+    """PR 488: DISABLED_KEYWORDS must include create_causal_mask_mapping to avoid a Gemma3/3N transformers 5.x compile crash."""
     src = _get_source("unsloth_zoo.compiler")
     assert "create_causal_mask_mapping" in src, (
         "compiler.py DISABLED_KEYWORDS no longer mentions "
@@ -675,8 +648,7 @@ def test_compiler_disabled_keywords_includes_5x_gemma3_mask():
 
 
 def test_saving_utils_guards_embedding_dims():
-    """PR #559: saving guards in_features/out_features access for
-    Embedding modules (which lack those attrs)."""
+    """PR 559: saving must guard in_features/out_features access, since Embedding modules lack those attributes."""
     src = _get_source("unsloth_zoo.saving_utils")
     if "in_features" not in src:
         pytest.skip(
@@ -696,8 +668,7 @@ def test_saving_utils_guards_embedding_dims():
 
 
 def test_no_single_arg_logger_log_calls():
-    """PR #441: no `logger.log(<str>)` single-arg calls (Logger.log
-    requires (level, msg); UNSLOTH_ENABLE_LOGGING=1 would TypeError)."""
+    """PR 441: no single-argument logger.log(str) calls, since Logger.log requires (level, msg) and UNSLOTH_ENABLE_LOGGING=1 would TypeError."""
     import pathlib
     root = pathlib.Path(
         importlib.import_module("unsloth_zoo").__file__,

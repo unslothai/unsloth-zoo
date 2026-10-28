@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Eval gpt-oss eager attention splits long prefills into query chunks with unchanged output.
-
-Subprocess so torch.compile is identity before unsloth_zoo imports (tests/test_gpt_oss_attention_mask.py).
-"""
+"""Eval gpt-oss eager attention splits long prefills into query chunks with unchanged output; runs in a subprocess so
+torch.compile is identity before unsloth_zoo imports."""
 from __future__ import annotations
 
 import os

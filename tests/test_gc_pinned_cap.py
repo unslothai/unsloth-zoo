@@ -2,8 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Past the pinned cap (free host RAM per local rank) offload buffers go pageable, never raise.
-CPU only: torch.empty is spied so a pinned request is recorded, not performed."""
+"""Offload buffers past the pinned cap (free host RAM per local rank) go pageable instead of raising; CPU only,
+torch.empty is spied so pinned requests are recorded, not performed."""
 import types
 
 import pytest
@@ -208,8 +208,7 @@ def _fake_host(monkeypatch, total_gib, available_gib):
 
 
 def test_single_rank_low_ram_host_still_pins_what_fits(monkeypatch, gc_module, pin_requests):
-    # 8 GiB host with 3 GiB available: the 4 GiB reserve meant for other ranks must not
-    # force a single process to pageable copies that pinned fine before the cap existed.
+    # 8 GiB host with 3 GiB available: the 4 GiB reserve meant for other ranks must not force a single process to pageable copies.
     monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
     _fake_host(monkeypatch, total_gib = 8, available_gib = 3)
     for _ in range(8):
@@ -237,8 +236,7 @@ def test_several_local_ranks_keep_the_split_cap(monkeypatch, gc_module):
 
 
 def test_single_rank_frees_dead_cached_blocks_before_going_pageable(monkeypatch, gc_module):
-    # A grown pinned buffer leaves its old block in torch's host cache. When RAM runs short
-    # those blocks are returned to the OS first, so they do not sit beside the pageable copies.
+    # A grown pinned buffer leaves its old block in torch's host cache; under low RAM those dead blocks are released to the OS before going pageable.
     gib = 1 << 30
     monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
     monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
@@ -265,8 +263,7 @@ def test_single_rank_frees_dead_cached_blocks_before_going_pageable(monkeypatch,
 
 
 def test_baseline_is_taken_once_host_stats_appear(monkeypatch, gc_module):
-    # The cap can be computed before CUDA initialises (host_memory_stats() is empty then): the
-    # foreign-bytes baseline must be latched at the first reading, not stay unset for good.
+    # Cap may be computed before CUDA init (host_memory_stats() is empty then), so the foreign-bytes baseline must latch at the first reading, not stay unset.
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
     held = {"bytes": None}
     monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: held["bytes"])
@@ -278,8 +275,8 @@ def test_baseline_is_taken_once_host_stats_appear(monkeypatch, gc_module):
 
 
 def test_cap_flushes_our_released_blocks_before_going_pageable(monkeypatch, gc_module):
-    # A grown slot's old block counts against the cap until torch frees it. At the cap those dead
-    # blocks are returned to the OS once, so a bigger block can still be pinned.
+    # A grown slot's old block counts against the cap until torch frees it; at the cap these dead blocks go back to the
+    # OS once, so a bigger block can still pin.
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
     monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
     monkeypatch.setattr(gc_module, "_synchronize_used_devices", lambda: None)
@@ -296,8 +293,8 @@ def test_cap_flushes_our_released_blocks_before_going_pageable(monkeypatch, gc_m
 
 
 def test_cap_flush_counts_only_blocks_the_allocator_released(monkeypatch, gc_module):
-    # Our released 4096 block was taken by another pinned user (a DataLoader): the flush cannot
-    # free it, so an 8192 request still does not fit under a 10000 cap.
+    # Our released 4096 block was taken by another pinned user (a DataLoader), so the flush cannot free it and an 8192
+    # request still does not fit under a 10000 cap.
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
     monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
     monkeypatch.setattr(gc_module, "_synchronize_used_devices", lambda: None)

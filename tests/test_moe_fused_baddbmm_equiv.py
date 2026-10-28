@@ -1,6 +1,5 @@
-"""The batched baddbmm path for fused MoE expert LoRA must be numerically identical to the
-per-expert loop it replaces, for both the standard and transposed (GPT-OSS) layouts, with the
-LoRA scaling (alpha) applied exactly once per expert."""
+"""Batched baddbmm path for fused MoE expert LoRA must be numerically identical to the per-expert loop for standard and
+GPT-OSS transposed layouts, with alpha applied once per expert."""
 import pytest
 import torch
 
@@ -15,16 +14,8 @@ gpu_available = (
 
 
 def _loop_reference(merged, lora_A, lora_B, num_experts, rank, alpha, use_transpose):
-    """The per-expert loop, written against PEFT's packing rather than against the code.
-
-    PEFT stores a fused expert LoRA as two ordinary Linear weights that are NOT flattened the
-    same way: `lora_A` is `(num_experts * rank, in)` expert-slowest, so expert `e` owns the
-    contiguous row block `e*rank : (e+1)*rank`; `lora_B` is `(out, num_experts * rank)`
-    expert-FASTEST, `reshape(out, rank, num_experts)` (ParamWrapper.get_delta_factors), so
-    expert `e` owns plane `e` of that reshape, i.e. columns `e::num_experts`. Spelled out here
-    instead of calling `unflatten_moe_lora_b` / `moe_lora_b_expert_columns` so this stays an
-    independent statement of what both the loop and the batched path have to compute.
-    """
+    """Per-expert loop written against PEFT's packing, not the code: lora_A expert e owns rows e*rank:(e+1)*rank, lora_B
+    expert e owns columns e::num_experts; independent of unflatten_moe_lora_b."""
     out = merged.clone()
     for e in range(num_experts):
         b_e = lora_B.reshape(lora_B.shape[0], rank, num_experts)[:, :, e]

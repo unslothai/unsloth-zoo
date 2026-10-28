@@ -1,33 +1,9 @@
-"""Auto-detect must handle role markers whose tokenization depends on context (Zephyr).
-
-Zephyr's role tags ("<|user|>", "<|assistant|>") are NOT special tokens: the underlying
-SentencePiece tokenizer splits them into pieces, and the leading "<" becomes "▁<" at text
-start (or standalone) but a bare "<" mid-text after "</s>\n". Two failures followed:
-
-  response_part    - "<|assistant|>\n" tokenized standalone never matches the rendered
-                     conversation, so get_chat_template_parts raised
-                     "Could not reliably auto-detect response_part".
-  instruction_part - "<|user|>\n" DID validate, but only via its text-start occurrence
-                     (the very first user turn). At masking time that single-context match
-                     misses every later user turn, so the span after an assistant header
-                     would run to the end of the sample and train on user content.
-
-get_chat_template_parts now also probes a leading-newline candidate ("\n<|assistant|>\n")
-and prefers candidates whose token core matches at least twice in the 3-turn probe (i.e.
-from the second turn on), falling back to the previous single-match acceptance for the
-original candidates. Special-token templates match their first candidate 3x and are
-unaffected.
-
-Self-contained and hermetic: builds the Zephyr template on a tiny SentencePiece tokenizer
-that is already cached locally, WITHOUT registering the role tags as special tokens (that
-is the point). Skips (not fails) when no tokenizer can be constructed offline or when the
-`unsloth`/`unsloth_zoo` package is not importable.
-"""
+"""Zephyr role markers are not special tokens, so get_chat_template_parts needs context-aware auto-detect: it probes
+leading-newline candidates and prefers ones matching at least twice in a 3-turn probe; skips when no offline
+tokenizer or unsloth_zoo is available."""
 import pytest
 
-# unsloth_zoo is imported lazily in _setup(), not module scope: its __init__ raises
-# ImportError when the separate `unsloth` package is absent, which would break pytest
-# collection before the skip.
+# unsloth_zoo is imported lazily in _setup(): its __init__ raises ImportError without the separate unsloth package, which would break collection.
 
 
 def _tokenizer():
@@ -37,17 +13,15 @@ def _tokenizer():
         from tokenizers import Tokenizer
     except ImportError:
         return None  # dependency-light run: skip instead of erroring
-    # SentencePiece tokenizer (Llama/Mistral) so "<" tokenizes context-dependently;
-    # role tags must stay ordinary text, NOT added special tokens.
+    # Uses a SentencePiece tokenizer (Llama/Mistral) so "<" tokenizes context-dependently; role tags must stay ordinary text, not added special tokens.
     try:
         tok = AutoTokenizer.from_pretrained(
             "hf-internal-testing/llama-tokenizer", local_files_only=True
         )
     except Exception:
         return None
-    # Zephyr parses "</s>" mid-text as the eos token (AddedToken normalized=False); the
-    # testing tokenizer ships normalized=True and would split it into "</ s >". Flip the
-    # flag so the fixture tokenizes like Zephyr (eos then prefix space "▁<0x0A><|...").
+    # Zephyr parses "</s>" mid-text as the eos token (normalized=False); the fixture tokenizer ships normalized=True and
+    # would split it, so the flag is flipped to match Zephyr.
     d = json.loads(tok.backend_tokenizer.to_str())
     for t in d["added_tokens"]:
         if t["content"] == "</s>":
@@ -118,8 +92,7 @@ def test_zephyr_autodetects_context_dependent_markers():
     assert tr("ANSWERONE") and tr("ANSWERTWO")
     assert not tr("SYSPROMPT terse")
     assert not tr("QONE alpha") and not tr("QTWO bravo")
-    # Both assistant eos terminators trained; the FINAL eos must never be -100 or the
-    # model never learns to stop.
+    # Both assistant eos terminators are trained; the FINAL eos must never be -100 or the model never learns to stop.
     eos_id = tok.eos_token_id
     eos_positions = [i for i, t in enumerate(ids) if t == eos_id]
     assert labels[eos_positions[-1]] != -100
@@ -127,8 +100,8 @@ def test_zephyr_autodetects_context_dependent_markers():
 
 
 def test_zephyr_first_user_turn_variant_not_picked():
-    # "<|user|>\n" matches ONLY at position 0 (text start); accepting that single-context
-    # variant would leave later user turns trained.
+    # The '<|user|>' plus newline marker matches ONLY at text start; a single text-start match must not beat 2+ mid-text
+    # matches or later user turns get trained.
     tok, get_chat_template_parts, train_on_responses_only = _setup()
     tok.chat_template = ZEPHYR
     ins, _ = get_chat_template_parts(tok)
@@ -136,8 +109,7 @@ def test_zephyr_first_user_turn_variant_not_picked():
 
 
 def test_special_token_template_unchanged():
-    # ChatML template whose markers ARE special tokens still detects the plain first
-    # candidate (3/3 matches): the new preference cannot alter it.
+    # A ChatML template whose markers are special tokens still picks the plain first candidate (3/3 matches); the new preference must not alter it.
     tok, get_chat_template_parts, _ = _setup()
     tok.add_special_tokens({"additional_special_tokens": ["<|im_start|>", "<|im_end|>"]})
     tok.chat_template = (

@@ -85,9 +85,8 @@ GRANITE_SPEECH = """    def forward(self, input_ids=None, attention_mask=None, l
 """
 
 
-# The rewrite takes ~20 ms. This bound only has to catch the exponential backtracking #1571 fixed,
-# which never finished, so it is generous and counts this process's CPU time: wall time on a
-# shared runner also counts time spent descheduled, which once read 1.6 s for this call.
+# Generous bound that only catches the exponential backtracking fixed in issue 1571; counts process CPU time since
+# shared-runner wall time includes descheduling.
 _REWRITE_CPU_BUDGET_S = 5.0
 
 
@@ -145,8 +144,8 @@ def test_installed_forwards_are_fused(module, cls):
         pytest.skip(f"{cls} has no local lm_head in this transformers")
     _, fused = _fused(source, cls)
     if "self.lm_head(" not in source:
-        # transformers 4.57 (and Qwen2-Audio 5.4 - 5.9) take `logits = outputs[0]` from the inner
-        # language model: there is no local hidden state to fuse, so the rewriter must decline.
+        # transformers 4.57 and Qwen2-Audio 5.4 - 5.9 take `logits = outputs[0]` from the inner model, leaving no local
+        # hidden state to fuse; the rewriter must decline.
         assert not fused, f"{cls} has no local lm_head call, yet its forward was rewritten"
     else:
         assert fused

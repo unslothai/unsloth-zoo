@@ -238,8 +238,7 @@ def test_short_budgets_never_plan_empty_drafts():
 
 
 def test_copy_probe_displaces_a_winning_drafter():
-    # Two perfect copy tokens tie a perfect depth-2 draft on tokens and skip its forward, but
-    # the copy prior scores below the drafter, so only a probe can find that out.
+    # Two perfect copy tokens tie a perfect depth-2 draft yet skip its forward, but the copy prior scores below the drafter, so only a probe finds that out.
     controller = DraftController(max_depth = 2, max_copy = 12)
     _run(controller, _Machine(draft_slope = 0.05), [([1.0, 1.0], 1.0)], rounds = 400, copies = 2)
     assert controller.copy_acceptance.count > 1
@@ -318,8 +317,7 @@ def test_a_fresh_loads_first_reply_drafts_on_its_own_accepted_rounds():
 
 @pytest.mark.parametrize("draft, floor", [([1.0], 0.97), ([0.5] * 16, 0.97)])
 def test_wide_batch_settles_on_plain_without_endless_probes(draft, floor):
-    # Plain step 2 and a width-2 verify of 4.3 at B=16: depth 1 is a close loser, probed in
-    # bursts longer than a probe interval; depth 16 leaves sixteen hopeless stale widths.
+    # At B=16 (plain step 2, width-2 verify 4.3) depth 1 is a close loser probed in bursts longer than the probe interval; depth 16 leaves sixteen stale widths.
     step = 2 / 3.25
     machine, report = _Machine(step = step, draft_slope = 0.01 / step, verify_slope = 1.9 / (16 * step)), {}
     controller = DraftController(max_depth = len(draft), can_copy = False, explore_fraction = 0.05)
@@ -335,8 +333,7 @@ def test_each_row_probes_its_own_sources():
 
 
 def test_drafter_recovers_while_plain_wins():
-    # Rejected drafts leave the drafter scored below failing copies while plain wins, yet
-    # perfect drafts become the fastest choice.
+    # Rejected drafts score the drafter below failing copies while plain wins, yet perfect drafts still become the fastest choice.
     controller = DraftController(max_depth = 2, max_copy = 12)
     machine = _Machine(draft_slope = 0.1, overhead = 1.1)
     _run(controller, machine, [([0.0, 0.0], 1e-9)], rounds = 500, copies = 2)
@@ -412,12 +409,7 @@ def _init_attributes(cls) -> set[str]:
 
 
 def _bare_engine(cls, **attrs):
-    """An engine without __init__ (which imports mlx_vlm), every attribute __init__ sets present and off.
-
-    Built by hand, a flag added to __init__ later (#1871's _invariant) is simply missing and the
-    method under test dies with AttributeError instead of taking its default path. Defaulting every
-    __init__ attribute to None keeps the hand-built engine on the plain path whatever flags join.
-    """
+    """Hand-built engine skips __init__ (imports mlx_vlm) and sets each attribute to None, so a flag added later (issue 1871's _invariant) takes its default path."""
     engine = object.__new__(cls)
     for name in _init_attributes(cls):
         setattr(engine, name, None)
@@ -440,8 +432,7 @@ def test_only_the_verify_forward_is_built_as_a_verify_block():
     import importlib
     from unsloth_zoo.mlx.speculative import SpeculativeEngine
 
-    # The module _verify's `from .inference import` resolves, i.e. sys.modules. The package
-    # attribute can be a stale copy after the shim tests purge and restore unsloth_zoo.mlx.
+    # _verify's from .inference import resolves via sys.modules; the package attribute can go stale after shim tests purge and restore unsloth_zoo.mlx.
     inference = importlib.import_module("unsloth_zoo.mlx.inference")
 
     marked = lambda: getattr(inference._VERIFY_STATE, "attention", False)

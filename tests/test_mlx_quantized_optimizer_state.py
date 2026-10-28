@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""8-bit first-moment optimizer state for MLX.
-
-Behaviour over steps, not construction. Needs a real mlx runtime: Apple Silicon
-Metal, or Linux via ``mlx-cpu`` (both are wired up in CI). The routing half runs
-under the torch shim, which cannot implement ``mx.quantize``. No ``Dataset.map``
-here, so the spawn-vs-fork matrix does not apply.
-"""
+"""8-bit first-moment optimizer state for MLX, tested on real mlx (Metal or mlx-cpu); routing runs under the torch shim, which cannot implement mx.quantize."""
 
 import tempfile
 
@@ -31,8 +25,7 @@ _SKIP = "Requires a real mlx runtime (Apple Silicon Metal, or Linux mlx-cpu)"
 mx = pytest.importorskip("mlx.core", reason=_SKIP)
 nn = pytest.importorskip("mlx.nn", reason=_SKIP)
 optim = pytest.importorskip("mlx.optimizers", reason=_SKIP)
-# importorskip alone is not enough: another test module may have installed the
-# mlx-on-torch shim into sys.modules first, and the shim raises on mx.quantize.
+# importorskip alone is not enough: another test module may have installed the mlx-on-torch shim first, and the shim raises on mx.quantize.
 if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
     pytest.skip(_SKIP, allow_module_level=True)
 
@@ -52,10 +45,7 @@ from unsloth_zoo.mlx.utils import load_optimizer_state, save_optimizer_state
 
 @pytest.fixture(autouse=True)
 def _reject_shimmed_session():
-    """The shim is installed by other modules at test time, after this one was
-    imported, and it then owns mx.quantize for whichever unsloth_zoo module
-    imported mlx later. CI runs this file in its own pytest invocation (and fails
-    the job if it skips), so skipping here only affects mixed local runs."""
+    """Other modules install the mlx-on-torch shim at test time, which then owns mx.quantize; CI runs this file in its own pytest run and fails if it skips."""
     import sys
     if "mlx_simulation" in sys.modules:
         pytest.skip("the mlx-on-torch shim is active in this process")
@@ -72,9 +62,7 @@ def _build_model(width=256):
 
 
 def _build_ineligible_model():
-    """Nothing here is quantization-eligible. Eligibility counts elements, not
-    axes, so this needs weights that are both small (under MIN_QUANTIZE_SIZE) and
-    not a whole number of groups: 30*50 = 1500, and 1500 % 64 != 0."""
+    """Nothing is quantization-eligible: eligibility counts elements, not axes, so weights must be under MIN_QUANTIZE_SIZE and not whole groups of 64 (30*50 = 1500)."""
     mx.random.seed(0)
     model = nn.Sequential(nn.Linear(50, 30), nn.ReLU(), nn.Linear(30, 50))
     mx.eval(model.parameters())
@@ -87,9 +75,7 @@ def _batch(width=256, rows=32):
 
 
 def _build_bottleneck_model(width=256, hidden=64):
-    """Both weights stay quantization-eligible, but the model has far fewer
-    parameters than _underdetermined_batch has targets, so the loss floors above
-    zero instead of collapsing to ~1e-9."""
+    """Both weights stay quantization-eligible, but the model has fewer parameters than _underdetermined_batch has targets, so loss floors above zero."""
     mx.random.seed(0)
     model = nn.Sequential(nn.Linear(width, hidden), nn.ReLU(), nn.Linear(hidden, width))
     mx.eval(model.parameters())
@@ -126,8 +112,7 @@ def _train(optimizer, model, x, y, steps=STEPS, compiled=False):
 
 
 def _state_bytes(state):
-    """Sum every array in the state tree. Default traversal only: marking
-    tuple/list as a leaf would stop at the top-level ``layers`` list."""
+    """Sums every array in the state tree using default traversal; treating tuple/list as leaves would stop at the top-level layers list."""
     return sum(v.nbytes for _, v in tree_flatten(state) if isinstance(v, mx.array))
 
 
@@ -146,9 +131,7 @@ def test_loss_decreases_with_quantized_first_moment():
 
 
 def test_loss_trajectory_tracks_fp32_baseline():
-    """Compare the whole trajectory over a target the model CANNOT fit. On the
-    overparameterised fixture the loss reaches ~1e-9, where a relative comparison
-    measures nothing but float noise."""
+    """Compares the whole trajectory on a target the model cannot fit; the overparameterised fixture hits ~1e-9, where a relative comparison is only float noise."""
     x, y = _underdetermined_batch()
     steps = 200
     fp32 = _train(optim.Adam(learning_rate=1e-3, bias_correction=True),
@@ -184,9 +167,7 @@ def test_optimizer_state_is_measurably_smaller():
 
 
 def test_quantized_state_saves_reloads_and_resumes_identically():
-    """Compares POST-update parameters and every state leaf. ``_train`` returns the
-    loss computed before the update, so comparing that would pass even with
-    load_optimizer_state removed entirely."""
+    """Compares post-update parameters and every state leaf; _train returns the pre-update loss, which passes even with load_optimizer_state removed."""
     x, y = _batch()
     model = _build_model()
     opt = QuantizedMomentAdam(1e-3, bias_correction=True)
@@ -203,8 +184,7 @@ def test_quantized_state_saves_reloads_and_resumes_identically():
     resumed_model = _build_model()
     resumed_model.update(tree_unflatten(list(weights.items())))
     resumed_opt = QuantizedMomentAdam(1e-3, bias_correction=True)
-    # Materialise the state tree, then overwrite both weights and state so only
-    # the checkpoint contributes to the next step.
+    # Materialise the state tree, then overwrite weights and optimizer state so only the checkpoint contributes to the next step.
     _train(resumed_opt, resumed_model, x, y, steps=1)
     resumed_model.update(tree_unflatten(list(weights.items())))
     load_optimizer_state(resumed_opt, checkpoint)
@@ -252,23 +232,9 @@ def test_compiled_and_uncompiled_agree():
     )
 
     worst = max(abs(a - b) for a, b in zip(plain, compiled))
-    # Tolerance, not equality. MLX documents compiled and uncompiled output as
-    # "the same up to numerical precision", never bit-identical: mx.compile fuses
-    # elementwise chains, so intermediates stay in registers instead of being
-    # rounded to fp32 on every store, and the fused arithmetic reassociates.
-    #
-    # This asserted `== 0.0` and held on macos-14, where the fused kernel happened
-    # to land on the same bits. On macos-15 it does not: the trajectory differs by
-    # 5.96e-08 at worst, which is 2**-24, half an fp32 ULP on an O(1) loss.
-    #
-    # The point of the test is that compiling does not BREAK the quantized
-    # optimizer, and that still holds at this bar. A compiled path that diverged
-    # for real would grow monotonically across steps as the error fed back through
-    # the moments; this one does not compound (steps 1, 3, 4 and 8 match exactly)
-    # and stays ~1e5 times under the int8-vs-fp32 gap the neighbouring tests
-    # already tolerate. 1e-6 is ~8 fp32 ULP here: loose enough for fusion to pick
-    # a different but equally valid kernel, tight enough that real divergence
-    # still fails loudly.
+    # Tolerance, not equality: mx.compile fuses elementwise chains and reassociates, so output matches only to
+    # precision; macos-15 differs by 5.96e-08 (2**-24); 1e-6 is ~8 fp32 ULP, while a real divergence would grow
+    # monotonically across steps.
     assert worst <= 1e-6, f"mx.compile changed the loss trajectory by {worst:.3e}: {plain} vs {compiled}"
 
 
@@ -322,12 +288,10 @@ def test_unsupported_group_size_is_rejected(group_size):
 
 
 def test_zero_gradient_coordinates_never_move():
-    """A coordinate whose gradient is identically zero keeps v == 0, so the Adam
-    denominator is eps alone and any dequantization residue is amplified ~1e8x.
-    Plain Adam moves it by exactly nothing and so must this."""
+    """Zero-gradient coordinates keep v == 0 so the Adam denominator is eps alone and dequantization residue is
+    amplified ~1e8x; plain Adam moves them by exactly nothing and the quantized optimizer must too"""
     steps, lr = 500, 1e-3
-    # MIN_QUANTIZE_SIZE elements, so the moment really is packed: a smaller
-    # parameter is ineligible and the test would never reach the residue at all.
+    # Width is MIN_QUANTIZE_SIZE elements so the moment really is packed; a smaller parameter is ineligible and the test would never reach the residue.
     width = MIN_QUANTIZE_SIZE
     grad = mx.array([[1.0] + [0.0] * (width - 1)])
 
@@ -352,8 +316,7 @@ def test_zero_gradient_coordinates_never_move():
 
 
 def test_plain_checkpoint_migrates_to_packed_on_resume():
-    """Before this optimizer existed, adamw_8bit produced plain AdamW state. Such a
-    checkpoint must not leave the moment full width for the rest of the run."""
+    """A plain AdamW checkpoint, as adamw_8bit once wrote, must migrate to packed moments on resume rather than leave the moment full width for the rest of the run."""
     x, y = _batch()
     model = _build_model()
     plain = optim.Adam(learning_rate=1e-3, bias_correction=True)
@@ -391,9 +354,7 @@ def test_packed_checkpoint_loads_into_plain_optimizer():
 
 
 def test_unpacking_does_not_carry_the_zero_residue_out():
-    """Dequantization leaves a residue where the true moment is zero. Handing that
-    to a plain optimizer would divide it by eps while v == 0, reintroducing the
-    blow-up on the far side of the switch."""
+    """Dequantization leaves a residue where the true moment is zero; handing it to a plain optimizer would divide by eps while v == 0, reintroducing the blow-up."""
     steps, lr = 200, 1e-3
     width = MIN_QUANTIZE_SIZE
     grad = mx.array([[1.0] + [0.0] * (width - 1)])
@@ -478,9 +439,8 @@ def test_adamw_variant_also_quantizes():
     assert (DEFAULT_GROUP_SIZE, DEFAULT_BITS) == (opt.group_size, opt.bits)
 
 
-# Eligibility counts elements, not axes. The earlier rule was 2-D with a
-# divisible last axis, which excluded the shapes below while packing their
-# partner matrices, so a LoRA run saved half of what it reported.
+# Eligibility counts elements, not axes: the old 2-D divisible-last-axis rule skipped some LoRA shapes while packing
+# their partners, so a LoRA run saved half of what it reported.
 @pytest.mark.parametrize(
     "shape, eligible, why",
     [
@@ -517,8 +477,7 @@ def test_small_parameters_keep_full_width_moments():
 
 
 def test_lora_b_at_rank_16_trains_and_is_packed():
-    """The regression this change exists for: previously ineligible, so its
-    moment stayed full width while lora_a next to it was packed."""
+    """Regression guard: a (512, 16) matrix was ineligible under the old rule, so its moment stayed full width while lora_a next to it was packed."""
     mx.random.seed(0)
     model = nn.Sequential(nn.Linear(512, 16, bias=False), nn.Linear(16, 512, bias=False))
     mx.eval(model.parameters())
@@ -541,8 +500,7 @@ def test_lora_b_at_rank_16_trains_and_is_packed():
 
 
 def test_reads_a_checkpoint_written_in_the_old_per_row_layout():
-    """mx.dequantize is self-describing, so a moment packed per row (the previous
-    layout) still loads: only the packed triple's own shape changes."""
+    """mx.dequantize is self-describing, so a moment packed per row (the old layout) still loads; only the packed triple's own shape changes."""
     mx.random.seed(0)
     parameter = mx.random.normal((256, 256))
     moment = mx.random.normal((256, 256)) * 0.01

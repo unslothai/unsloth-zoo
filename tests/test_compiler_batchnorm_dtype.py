@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The compiled torch.nn.BatchNorm forward Unsloth installs accepts an input whose dtype differs from
-its weight (Canary's conformer under QLoRA feeds float32 into a bfloat16 BatchNorm1d).
-
-Runs in a fresh interpreter: the compiler mutates torch.nn process-wide."""
+"""Compiled torch.nn.BatchNorm accepts an input whose dtype differs from its weight (float32 into bfloat16 under QLoRA);
+runs in a fresh interpreter since the compiler mutates torch.nn."""
 
 from __future__ import annotations
 

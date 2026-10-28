@@ -14,21 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The generated trainer must actually be installed, and failing is silent.
-
-`_patch_trl_rl_trainers` and `patch_trl_rl_trainers` each swallow generation
-errors, so a break raises nothing, prints nothing at default log level, and
-every SFT run quietly falls back to plain `trl.SFTTrainer`.
-
-That happened. `_maybe_compile` was added to `rl_replacements.py`, and since the
-compiler copies function SOURCE verbatim into the generated module, decorator
-line included, the generated module hit `NameError: name '_maybe_compile' is not
-defined`. Three notebooks then failed with three unrelated-looking errors, all
-downstream of trl's own SFTTrainer running instead of ours.
-
-So this file asserts the end state -- the generated class is installed -- rather
-than any particular reason it might not be.
-"""
+"""Asserts the generated trainer is installed, since `_patch_trl_rl_trainers` and `patch_trl_rl_trainers` swallow errors and silently fall back to trl SFTTrainer."""
 
 import os
 import subprocess
@@ -51,8 +37,7 @@ def _have_unsloth():
 
 
 def _run(body: str, timeout: int = 900):
-    """A subprocess: unsloth patches trl at import and the decision is then
-    cached in sys.modules for the life of the process."""
+    """Runs in a subprocess because unsloth patches trl at import, and that decision is cached in sys.modules for the life of the process."""
     script = textwrap.dedent(f"""
         import os, sys
         sys.path.insert(0, {str(ROOT)!r})
@@ -63,13 +48,11 @@ def _run(body: str, timeout: int = 900):
     cache = Path(os.environ.get("UNSLOTH_WORKSPACE", ROOT.parent)) / "temp" / "gen_test_cache"
     cache.mkdir(parents=True, exist_ok=True)
     env["UNSLOTH_COMPILE_LOCATION"] = str(cache)
-    # conftest sets UNSLOTH_ALLOW_CPU=1 suite-wide, which makes PatchFastRL
-    # early-return: inherited here it would guarantee a plain SFTTrainer and so
-    # fail this file on a healthy tree.
+    # conftest sets UNSLOTH_ALLOW_CPU=1 suite-wide, which makes PatchFastRL return early; inherited here it would
+    # guarantee a plain SFTTrainer and fail this file.
     env.pop("UNSLOTH_ALLOW_CPU", None)
-    # On a host with no accelerator unsloth now loads its CPU backend, which trains with
-    # trl's own SFTTrainer by design, so the generated class this file guards is never
-    # built there. Keep the GPU path or abort, as before the CPU backend existed.
+    # With no accelerator unsloth loads its CPU backend, which uses trl's SFTTrainer, so the generated class is never
+    # built; UNSLOTH_DISABLE_CPU_FALLBACK=1 keeps the GPU path or abort.
     env["UNSLOTH_DISABLE_CPU_FALLBACK"] = "1"
     return subprocess.run([sys.executable, "-c", script], capture_output=True,
                           text=True, timeout=timeout, env=env)
@@ -101,8 +84,7 @@ def test_the_generated_sft_trainer_is_what_trl_hands_out(installed):
 
 
 def test_generation_raises_loudly_when_called_directly():
-    """The swallow is deliberate (TRL 1.x renames classes), so the guard is that
-    a direct call still surfaces the error -- the only way to debug this."""
+    """The swallow is deliberate because TRL 1.x renames classes; a direct call must still raise, the only way to debug this."""
     if not _have_unsloth():
         pytest.skip("unsloth is not installed")
     r = _run("""
@@ -119,8 +101,7 @@ def test_generation_raises_loudly_when_called_directly():
 # ---- the specific shape that broke, so it cannot come back ---------------
 
 def test_every_name_in_a_copied_decorator_is_importable_by_the_generator():
-    """Each decorator on a function whose source gets copied needs a matching
-    import rule in compiler.py, or the generated module NameErrors at import."""
+    """Each decorator on a function whose source is copied into generated code needs a matching import rule in compiler.py, or NameError at import."""
     import ast
 
     src = (ROOT / "unsloth_zoo" / "rl_replacements.py").read_text(encoding="utf-8")

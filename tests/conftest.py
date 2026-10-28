@@ -145,9 +145,7 @@ def _preload_real_device_type(
 
 
 def _install_device_type_stub(name: str) -> None:
-    """Last-resort stub when the real preload can't run (no torch / no
-    package installed). Matches the surface ``unsloth`` and ``unsloth_zoo``
-    consumers read at import time."""
+    """Last-resort stub when the real preload cannot run (no torch or package); matches the surface unsloth and unsloth_zoo read at import time."""
     stub = types.ModuleType(name)
     stub.DEVICE_TYPE = "cuda"
     stub.DEVICE_TYPE_TORCH = "cuda"
@@ -163,13 +161,8 @@ def _install_device_type_stub(name: str) -> None:
 
 
 def _patch_torch_cuda_for_import() -> None:
-    """Stub torch.cuda.* calls made at IMPORT time on CPU-only CI runners.
-
-    Covers mem_get_info (used by temporary_patches/*), get_device_capability
-    (compiler.py:87, loss_utils.py:39 -- gates cut_cross_entropy on Ampere+),
-    and get_device_properties. Return (8, 0) so Ampere-gated imports proceed;
-    the cut_cross_entropy import itself is try/except wrapped.
-    """
+    """Stub torch.cuda calls made at import on CPU-only CI (mem_get_info, get_device_capability, get_device_properties);
+    capability (8, 0) lets Ampere-gated imports proceed; cut_cross_entropy import is try/except wrapped."""
     try:
         import torch  # type: ignore
         import torch.cuda.memory as _cuda_memory  # type: ignore
@@ -233,17 +226,15 @@ def _apply_upstream_import_fixes_for_tests() -> None:
     try:
         import unsloth  # noqa: F401  # runs unsloth/import_fixes.py
     except Exception:
-        # unsloth missing (security-only suites) or import failed; drift
-        # detectors will surface any pathology the patches would mask.
+        # unsloth missing (security-only suites) or import failed; drift detectors will surface any pathology the patches would mask.
         pass
 
 
 _apply_upstream_import_fixes_for_tests()
 
 
-# Xet health state isolation: the ladder persists per-machine verdicts next to the HF cache, so
-# without this fixture a suite of SIMULATED failures would demote the real machine and later tests
-# would start on HTTP and contradict their own assertions.
+# Isolate Xet health state: the ladder persists per-machine verdicts beside the HF cache, so simulated failures would
+# demote the real machine and later tests would start on HTTP.
 
 import pytest as _pytest
 
@@ -263,11 +254,9 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
         yield
 
 
-# grpo_accumulated_loss sets UNSLOTH_RETURN_HIDDEN_STATES=1 and only resets it on its way out, so
-# a test that stops it part way (test_grpo_autotune_per_step raises _Stop from inside it) leaves the
-# flag on for the rest of its xdist worker. Every patched causal LM forward then returns hidden
-# states and loss=None, and test_gpt_oss_router_logits_capture failed on
-# `'NoneType' object has no attribute 'backward'` whenever it followed one of those on a worker.
+# grpo_accumulated_loss sets UNSLOTH_RETURN_HIDDEN_STATES=1 and resets it only on exit, so a test stopping early
+# (test_grpo_autotune_per_step) leaks it to its xdist worker; patched causal LM forwards then return hidden states and
+# loss=None, breaking test_gpt_oss_router_logits_capture.
 import os as _os
 
 _HIDDEN_STATES_FLAG = "UNSLOTH_RETURN_HIDDEN_STATES"
@@ -283,14 +272,9 @@ def _restore_hidden_states_flag():
         _os.environ[_HIDDEN_STATES_FLAG] = before
 
 
-# UNSLOTH_COMPILE_DISABLE only switches off torch.compile, and since #1866 the fused losses and
-# maybe_compile honour it, so a test of the compile path itself sees no compiled call and no
-# fallback wrapper under it. Unsloth's Core zoo legs run this suite with the switch set, which is
-# the only place these tests run. Tests of the compile machinery opt in with
-# `pytestmark = pytest.mark.usefixtures("compile_enabled")`: the switch is cleared for the test and
-# every flag the modules froze from it at import is turned back on, then restored.
-# Modules copy the switch with `from ...common import UNSLOTH_COMPILE_DISABLE`, so every loaded
-# unsloth_zoo module carrying one of these names is patched, not a hand-kept list.
+# UNSLOTH_COMPILE_DISABLE only stops torch.compile, but since PR/issue 1866 fused losses and maybe_compile honour it
+# too; compile-path tests opt in via pytest.mark.usefixtures('compile_enabled'), which clears it and re-enables frozen
+# flags in every loaded module for the test.
 _COMPILE_SWITCH_FLAGS = {
     "UNSLOTH_COMPILE_DISABLE": False,
     "UNSLOTH_COMPILE_DISABLE_PARTIAL": False,
@@ -314,8 +298,8 @@ def _enable_compile(monkeypatch):
     import importlib
     import sys
 
-    # Import first, under the caller's environment: a module first imported after the switch is
-    # cleared would freeze its flags compile-on, and monkeypatch would restore those values.
+    # Import first under the caller's environment: a module first imported after the switch is cleared would freeze its
+    # flags compile-on, and monkeypatch would restore those values.
     for name in _COMPILE_SWITCH_MODULES:
         importlib.import_module(name)
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
@@ -327,44 +311,13 @@ def _enable_compile(monkeypatch):
                 monkeypatch.setattr(module, flag, enabled)
 
 
-# A test that swaps a module into sys.modules and does not swap it back breaks whatever
-# imports that name later IN THE SAME PROCESS. Serially that is often invisible, because
-# the victim happens to sort before the polluter and never sees it; under pytest-xdist a
-# worker can take them the other way round and the victim fails for a reason that has
-# nothing to do with it.
-#
-# That is not hypothetical. test_vllm_to_hf_conversion installed a bitsandbytes.functional
-# carrying only dequantize_4bit and left it there, so every later
-# `from bitsandbytes.functional import QuantState` -- which is what
-# temporary_patches/moe_utils_bnb4bit.py does at import time -- failed with
-#
-#     cannot import name 'QuantState' from 'bitsandbytes.functional' (unknown location)
-#
-# Six tests in test_moe_bnb4bit_per_expert_conversions.py failed that way under -n 4 while
-# passing serially, because m sorts before v.
-#
-# Narrow on purpose. It watches the names that have actually been swapped here rather than
-# all of sys.modules, because reloading a module under test is a legitimate and common
-# thing to do in this suite and a blanket check would flag all of it. The remedy is always
-# the same and is already used elsewhere in these files: monkeypatch.setitem, which puts
-# the original back.
+# A sys.modules swap left unrestored breaks later imports in the same process (test_vllm_to_hf_conversion's
+# bitsandbytes.functional stub broke QuantState under -n 4); the check watches only names swapped, since reloads are
+# legitimate; fix with monkeypatch.setitem.
 _GUARDED_MODULES = ("bitsandbytes", "bitsandbytes.functional", "bitsandbytes.nn")
 
-# Names that nothing in the installed environment provides. A top-level `moe_utils`
-# only ever resolves because something put a compile-cache directory on sys.path.
-# Leaving one behind makes the bare `from moe_utils import ...` in every generated
-# MoE module resolve to it, which is invisible because that import is deliberately
-# swallowed -- the module loads reporting success with its backend names undefined.
-# That is how test_compiled_cache_collective.py's recovery test failed on main while
-# passing when run alone.
-#
-# Flagged only when the copy came out of a pytest temp directory, and that
-# qualification is load-bearing rather than caution. Compiling a MoE architecture
-# imports moe_utils out of the real unsloth_compiled_cache as ordinary production
-# behaviour, and that copy stays valid for the rest of the session; a rule without
-# the qualification fails test_compiler_dynamic_exec.py for doing its job. A copy
-# read from a tmp_path_factory directory is the opposite: it outlives the directory
-# and is a different module from the one the next test means to import.
+# Top-level moe_utils resolves only via a compile-cache dir on sys.path; flagged only from pytest temp dirs, since a
+# leftover copy shadows the swallowed bare import while real cache copies stay valid.
 _GUARDED_BARE_MODULES = ("moe_utils",)
 
 
@@ -374,10 +327,8 @@ def _is_from_pytest_tmp(mod):
     path = getattr(mod, "__file__", None)
     if not path:
         return False
-    # Matched on the "pytest-of-<user>" element tmp_path_factory always creates,
-    # rather than on a basetemp looked up from the config: --basetemp overrides it,
-    # xdist gives each worker its own, and a stale entry can outlive the fixture
-    # that made it. The directory name is the stable part.
+    # Match the pytest-of-<user> path element tmp_path_factory always creates, not the basetemp config: --basetemp
+    # overrides it, xdist gives each worker its own, and stale entries can outlive the fixture.
     return any(
         part.startswith("pytest-of-") for part in pathlib.Path(path).parts
     )
@@ -385,22 +336,14 @@ _MODULE_SNAPSHOT_KEY = "_unsloth_guarded_module_snapshot"
 
 
 def _is_module_stub(mod):
-    """A real module has a file behind it; these substitutes are bare ModuleType.
-
-    That is also why the resulting ImportError says "(unknown location)".
-    """
+    """Real modules have a __file__; these substitutes are bare ModuleType, which is why the ImportError says (unknown location)."""
     return mod is not None and getattr(mod, "__file__", None) is None
 
 
 def _is_unsloth_stub(mod):
-    """unsloth_zoo installs its own bitsandbytes stub where no real wheel exists, which
-    is every Apple Silicon machine (stubs/bitsandbytes_stub.py). The finder mints
-    submodules on first import, so the first test to import anything that touches
-    bitsandbytes.nn looks like a polluter while doing nothing wrong: the stub is
-    process wide, deliberate and idempotent, and putting it "back" would mean deleting
-    a module the rest of the session expects. Every stub module carries the marker,
-    finder-minted ones included.
-    """
+    """unsloth_zoo's bitsandbytes stub (stubs/bitsandbytes_stub.py, used where no wheel exists) is process-wide and
+    deliberate, so the first test importing bitsandbytes.nn is not a polluter; all stub modules carry
+    IS_UNSLOTH_STUB, finder-minted ones included."""
     return bool(getattr(mod, "IS_UNSLOTH_STUB", False))
 
 
@@ -415,14 +358,8 @@ def pytest_runtest_setup(item):
 
 @_pytest.hookimpl(trylast = True)
 def pytest_runtest_teardown(item, nextitem):
-    """Checked here rather than in an autouse fixture, and that is not a style choice.
-
-    Fixtures tear down in reverse order of setup, and _isolate_xet_health_state above
-    requests monkeypatch, which pulls monkeypatch's setup earlier than any fixture
-    defined after it. A fixture-based check therefore ran BEFORE the test's own
-    monkeypatch had put sys.modules back, and reported every correct test as a leak.
-    A trylast teardown hook runs after fixture finalisation, which is the point.
-    """
+    """Leak check runs as a trylast teardown hook, not an autouse fixture: fixtures tear down in reverse setup order, so
+    a fixture check ran before monkeypatch restored sys.modules and flagged correct tests."""
     import sys as _sys
 
     before = getattr(item, _MODULE_SNAPSHOT_KEY, None)
@@ -434,22 +371,18 @@ def pytest_runtest_teardown(item, nextitem):
         if now is was:
             continue
         if name in _GUARDED_BARE_MODULES:
-            # See _GUARDED_BARE_MODULES: for these the import itself can be the
-            # swap, so the exemption below does not apply. Narrowed to the copies
-            # that go stale, which are the ones a later test can be misled by.
+            # See _GUARDED_BARE_MODULES: for these the import itself can be the swap, so the exemption below does not
+            # apply; narrowed to copies that go stale and mislead later tests.
             if _is_from_pytest_tmp(now):
                 leaked.append(name)
             continue
         if was is None and (not _is_module_stub(now) or _is_unsloth_stub(now)):
-            # Nothing was there and the test imported the real thing, or the zoo's own
-            # bitsandbytes stub. Either is an import, not a swap, and flagging it would
-            # fail every test that touches the package.
+            # Nothing was there before and the test imported the real package or the zoo's bitsandbytes stub; that is an
+            # import, not a swap, and flagging it would fail every test touching it.
             continue
         leaked.append(name)
     if leaked:
-        # Naming the file is the whole diagnosis for the bare names: whether the copy
-        # is a leak or the compile folder doing its job is a question about where it
-        # was read from, and without this the report is the same either way.
+        # Naming the source file is the whole diagnosis for bare names: a leak and the compile folder doing its job differ only in where the copy was read from.
         where = ", ".join(
             f"{n} from {getattr(_sys.modules.get(n), '__file__', None)!r}"
             for n in leaked
@@ -463,11 +396,9 @@ def pytest_runtest_teardown(item, nextitem):
         )
 
 
-# Where real mlx is installed, it and the torch-backed shim would share one sys.modules,
-# so a session's results depended on which test modules it collected
-# (unslothai/unsloth#8138). Each test module runs under the mlx modules it was imported
-# with, as in a process of its own, and the session's come back after it. Inert without
-# real mlx.
+# With real mlx installed, it and the torch-backed shim would share sys.modules, making results depend on collection
+# order (unslothai/unsloth PR/issue 8138); each module runs under its own mlx modules, restored afterwards; inert
+# without real mlx.
 _PLATFORM_ATTRS = ("system", "machine", "_orig_system_for_mlx_shim", "_orig_machine_for_mlx_shim")
 _MISSING = object()
 
@@ -486,10 +417,8 @@ def _is_shim(obj):
 
 
 class _RealMlxKeeper:
-    """Hands back the real-mlx modules a world hid instead of importing them again: a
-    second mlx.core import aborts the interpreter (nanobind refuses to register its
-    types twice), and a second unsloth_zoo.mlx.utils patches mlx_vlm classes the first
-    one already patched. Never under the shim, which gets copies of its own."""
+    """Hands back real mlx modules a world hid instead of re-importing: a second mlx.core import aborts (nanobind
+    refuses double registration) and a second unsloth_zoo.mlx.utils re-patches mlx_vlm; never under the shim."""
 
     def __init__(self):
         self.modules = {}
@@ -555,9 +484,8 @@ class _MlxModuleWorlds:
                 delattr(platform, attr)
 
     def _world_for(self, module, world):
-        """A module that never installs the shim also sees every real mlx, mlx_lm and mlx_vlm
-        module loaded so far: zoo caches what it finds in sys.modules (_resolved_bindings),
-        so hiding them there decides differently from the real session."""
+        """Modules that never install the shim also see every real mlx, mlx_lm and mlx_vlm module loaded so far, since
+        zoo caches sys.modules lookups in _resolved_bindings; hiding them would decide differently."""
         try:
             installs_shim = "simulate_mlx_on_torch(" in module.path.read_text(encoding = "utf-8")
         except (AttributeError, OSError):
@@ -594,8 +522,7 @@ class _MlxModuleWorlds:
     def pytest_runtest_teardown(self, item, nextitem):
         # trylast: after module-scoped fixtures are finalised (see the leak guard above).
         if nextitem is None or nextitem.getparent(_pytest.Module) is not item.getparent(_pytest.Module):
-            # Kept for a later visit (interleaved node IDs): a session fixture that installed
-            # the shim here will not run again.
+            # Save the world for a later visit (interleaved node IDs): a session fixture that installed the shim here will not run again.
             if self.active is not None:
                 self.worlds[self.active] = self._capture()
             self._install(self.base)

@@ -14,17 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Capture and rewind of the MLX global PRNG key.
-
-mlx 0.32.1 made `mx.random.state` a sentinel that refuses item assignment, so
-the key is rewound by reseeding with the captured key's own two 32-bit words;
-`mx.random.key` builds `{seed >> 32, (uint32) seed}`, making that exact over the
-whole unsigned 64-bit range.
-
-Deliberately not in tests/test_mlx_training_e2e_metal.py: none of this needs
-Metal, and that lane is opt-in and usually skipped, so tests parked behind it
-never run on a pull request. The Linux CPU lane gates these on every push.
-"""
+"""Capture and rewind of the MLX PRNG key: mlx 0.32.1 refuses item assignment to mx.random.state, so rewind reseeds from
+the two 32-bit key words, exact over the whole uint64 range; kept out of opt-in tests/test_mlx_training_e2e_metal.py
+so the Linux CPU lane gates it"""
 
 import contextlib
 from types import SimpleNamespace
@@ -38,10 +30,9 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
-# `importorskip` is not enough: most tests/test_mlx_*.py files install the torch-backed
-# tests/mlx_simulation stub into sys.modules and never remove it, so in a full-suite run
-# `mlx.core` can be that stub. Everything below pins real mlx >= 0.32.1 semantics (a
-# `mx.random.state` sentinel refusing item assignment), which the stub does not model.
+# importorskip is not enough: most test_mlx_*.py files leave the torch-backed tests/mlx_simulation stub in sys.modules,
+# so mlx.core may be the stub; these tests need real mlx >= 0.32.1 semantics, such as a mx.random.state sentinel
+# refusing item assignment.
 if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
     pytest.skip("mlx.core is the tests/mlx_simulation stub, not real MLX",
                 allow_module_level = True)
@@ -64,9 +55,7 @@ class _NoItemAssignment:
 
     def __init__(self, words = None, dtype = None):
         self._words = words
-        # uint32 is what mlx stores today. A wider dtype is the only way a word
-        # outside the 32-bit range can reach the capture at all, and is what a
-        # future upstream key layout would look like from here.
+        # uint32 is what mlx stores today; a wider dtype is the only way an out-of-range word can reach capture, as a future upstream key layout might use.
         self._dtype = dtype
 
     def __len__(self):
@@ -85,8 +74,7 @@ class _NoItemAssignment:
 
 @pytest.fixture(autouse = True)
 def _forget_reported_key_problems():
-    """The report-once set is process-global, so without this the first test to
-    trip a warning silences it for every test after it."""
+    """The report-once set is process-global; without clearing it, the first test to trip a warning silences that warning for every later test."""
     _reported_unrewindable_keys.clear()
     yield
     _reported_unrewindable_keys.clear()
@@ -132,8 +120,7 @@ def _draw_after_seed(seed):
     _SPLIT_KEY_SEED,
 ])
 def test_the_key_packing_is_exactly_invertible(seed):
-    """Half of all real keys have the high bit set, so a signed packing anywhere
-    would break those runs. Checked, not assumed."""
+    """Half of all real keys have the high bit set, so any signed packing would break those runs; checked, not assumed."""
     words = mx.random.key(seed).tolist()
     assert words == [seed >> 32, seed & 0xFFFFFFFF]
     assert ((int(words[0]) << 32) | int(words[1])) == seed
@@ -155,8 +142,7 @@ def test_restore_reproduces_the_draws_that_followed_the_capture():
 
 
 def test_restore_works_where_the_state_refuses_item_assignment():
-    """A stand-in with mlx 0.32.1's shape (no ``__setitem__``) pins the contract
-    on whichever mlx is installed, including ones where state is still a list."""
+    """A stand-in shaped like mlx 0.32.1 (no __setitem__) pins the restore contract on any installed mlx, including ones where state is still a list."""
     expected = _draw_after_seed(_SPLIT_KEY_SEED)
 
     mx.random.seed(1)
@@ -181,8 +167,7 @@ def test_capture_reads_nothing_where_the_state_is_not_indexable():
 
 
 def test_shadowing_the_state_does_not_outlive_the_test():
-    """Regression guard for the helper above: on mlx < 0.31.2 an unshadow by
-    `delattr` deletes the PRNG state for the rest of the process."""
+    """Regression guard: on mlx < 0.31.2 an unshadow by delattr deletes the PRNG state for the rest of the process."""
     before = _mlx_rng_key()
     assert before is not None
 
@@ -196,18 +181,9 @@ def test_shadowing_the_state_does_not_outlive_the_test():
 
 @pytest.mark.parametrize("words", [(-1, -2), (-2147483648, 5), (0, -1)])
 def test_restore_reinterprets_signed_words(words):
-    """`mx.random.seed` takes a uint64 and hard-raises outside [0, 2**64).
-
-    The restore is unguarded on purpose, since a blanket `except` would be a
-    failure indistinguishable from an intentional no-op. That holds only if the
-    words cannot put it out of range, and capture does not type-check the state,
-    so this conversion is what makes "cannot raise" true. A raise would land in
-    `_preserved_preprocessing_rng`'s `finally`, or replace the compile error a
-    fallback is recovering from.
-
-    A negative word is the two's complement of the uint32 mlx stores, so
-    reinterpreting it is lossless and the round trip must survive it.
-    """
+    """mx.random.seed hard-raises outside uint64; restore is unguarded on purpose since a blanket except would hide
+    failure as a no-op, so word conversion must never raise; a negative word is a two-complement reading of the
+    stored uint32, so reinterpreting it is lossless"""
     _restore_mlx_rng_key(words)
     assert _mlx_rng_key() == (words[0] & 0xFFFFFFFF, words[1] & 0xFFFFFFFF)
 
@@ -216,13 +192,8 @@ def test_restore_reinterprets_signed_words(words):
     (2**32, 0), (0, 2**32), (2**62, 1), (-(2**31) - 1, 0), (0, -(2**40)),
 ])
 def test_words_that_are_not_32_bit_are_declined_not_truncated(words):
-    """Masking these would be worse than declining them.
-
-    (2**32, 0) masks to (0, 0), so a key that cannot be represented becomes a
-    plausible wrong one and a compile fallback looks like it rewound the RNG
-    while actually diverging. Declining is the outcome every caller already
-    handles, and it is the only one that says so out loud.
-    """
+    """Declining beats masking: (2**32, 0) masks to (0, 0), a plausible wrong key that makes a diverging compile
+    fallback look rewound; declining is loud and callers already handle it."""
     _restore_mlx_rng_key((0, 0))
     before = _mlx_rng_key()
 
@@ -230,10 +201,8 @@ def test_words_that_are_not_32_bit_are_declined_not_truncated(words):
         with pytest.warns(RuntimeWarning, match = "not a 32-bit word"):
             assert _mlx_rng_key() is None
 
-    # Restore is total: a caller that hands it these words directly must get a
-    # no-op and a warning, never a raise into a `finally` and never a wrong key.
-    # Cleared first so this asserts the restore path reports on its own, rather
-    # than riding on the report the capture above already made.
+    # Restore is total: bad words must give a no-op and a warning, never a raise into a finally or a wrong key; cleared
+    # first so the restore path reports on its own.
     _reported_unrewindable_keys.clear()
     with pytest.warns(RuntimeWarning, match = "not a 32-bit word"):
         _restore_mlx_rng_key(words)
@@ -245,12 +214,8 @@ def test_words_that_are_not_32_bit_are_declined_not_truncated(words):
     ((1, 2, 3), False),
 ])
 def test_warnings_as_errors_does_not_turn_declining_into_raising(state, expect_words):
-    """`PYTHONWARNINGS=error` must not promote the diagnostic into the abort.
-
-    Every caller reads the key before entering the `try` a raise would land in,
-    so a filter that turns RuntimeWarning into an exception would abort training
-    or preprocessing on exactly the path documented as declining safely.
-    """
+    """With PYTHONWARNINGS=error the RuntimeWarning must not become an exception, since callers read the key before
+    their try and would abort training or preprocessing."""
     dtype = mx.int64 if len(state) == 2 else mx.uint32
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
@@ -270,8 +235,7 @@ def test_capture_reinterprets_a_state_whose_words_are_not_unsigned():
 
 @pytest.mark.parametrize("n", [1, 3, 4])
 def test_a_key_that_is_not_two_words_is_reported_rather_than_swallowed(n):
-    """A bare None here would leave every compile fallback silently not
-    rewinding, as the old `isinstance(state, list)` guard did."""
+    """A bare None would silently skip the rewind in every compile fallback, as the old isinstance(state, list) guard did; the key must be reported instead."""
     class _WideKey:
         def __len__(self): return 1
         def __getitem__(self, index): return mx.array([1] * n, dtype = mx.uint32)
@@ -282,8 +246,7 @@ def test_a_key_that_is_not_two_words_is_reported_rather_than_swallowed(n):
 
 
 def test_an_unreadable_state_does_not_warn():
-    """The simulation shim is an intentional no-op, not a surprise; warning on
-    every call would train operators to ignore the warning that matters."""
+    """The shim's no-op state is intentional, so it must not warn on every call; that would teach operators to ignore the warning that matters."""
     import warnings
     with _shadowing_random_state(lambda: {"counter": 0}):
         with warnings.catch_warnings():
@@ -347,9 +310,7 @@ class _TinyLM(nn.Module):
 
 
 def test_a_runtime_compile_failure_retries_eagerly_from_the_captured_key(tmp_path, monkeypatch):
-    """Without the rewind the failed attempt's draws stay in the stream, and a
-    run that falls back diverges from an eager run of the same seed.
-    """
+    """Without the rewind, the failed attempt's draws stay in the RNG stream, so a run that falls back diverges from an eager run with the same seed."""
     keys = []
     failed = False
 
@@ -417,11 +378,8 @@ def test_a_runtime_compile_failure_retries_eagerly_from_the_captured_key(tmp_pat
 
 
 def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
-    """The single-process retry is exercised for real above; its DDP twin needs
-    a distributed group no unit test can raise, so it is pinned structurally.
-    On the parse tree, not substring counts: a harmless refactor must not fail
-    this, and a misplaced restore must.
-    """
+    """The DDP retry needs a distributed group no unit test can raise, so it is pinned on the AST, not substring counts:
+    harmless refactors pass, misplaced restores fail."""
     import ast
     import inspect
     import textwrap
@@ -456,8 +414,7 @@ def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
             node = parents[node]
             yield node
 
-    # The branch type is not pinned: single-process recovers inside `except`,
-    # DDP inside an `if` after the try (it syncs ranks first).
+    # Branch type is not pinned: single-process restores inside an except handler, while DDP restores inside an if after the try because it syncs ranks first.
     for restore in restores:
         recovery = [a for a in ancestors(restore)
                     if isinstance(a, (ast.ExceptHandler, ast.If))]
@@ -472,13 +429,8 @@ def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
 
 
 def test_an_unsupported_key_is_reported_once_not_once_per_step():
-    """Both trainer captures run inside the per-batch loop.
-
-    The message interpolates the offending word, so a value that changes between
-    draws makes every message unique and the `warnings` registry can never
-    suppress it. The stderr fallback has no registry at all. Without dedup an
-    otherwise fine run emits one warning per batch.
-    """
+    """Trainer captures run per batch: the message embeds the offending word so the warnings registry cannot dedupe it,
+    and stderr has no registry, so dedup is manual."""
     seen = []
     with warnings.catch_warnings(record = True) as caught:
         warnings.simplefilter("always")
@@ -507,13 +459,7 @@ def test_an_unsupported_key_is_reported_once_not_once_per_step():
     (lambda: _hostile_stream(), "stderr.write raises"),
 ])
 def test_an_unreportable_diagnostic_still_does_not_raise(stderr_factory, label):
-    """The helper's contract is that it never raises, and callers rely on it.
-
-    Both trainer captures and `_preserved_preprocessing_rng` read the key above
-    the `try` that would contain a raise, so if the stderr fallback itself throws
-    the unsupported key aborts the run anyway, which is the whole thing this
-    helper exists to prevent.
-    """
+    """The diagnostic helper must never raise: callers read the key outside any try, so a throwing stderr fallback would abort the run anyway."""
     _reported_unrewindable_keys.clear()
     original = sys.stderr
     sys.stderr = stderr_factory()

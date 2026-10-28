@@ -194,8 +194,7 @@ def test_fullgraph_compile_and_cuda_graph_replay_with_changed_routes(lora):
 
 
 def test_decode_path_applies_expert_lora():
-    """moe_forward_inference_bf16 (the compiled qlen == 1 decode branch) used to unwrap PEFT and
-    read the base expert weights, so generation ignored expert LoRA that training applied."""
+    """moe_forward_inference_bf16's compiled qlen == 1 decode branch must apply expert LoRA; unwrapping PEFT to read base expert weights made generation ignore it."""
     from unsloth_zoo.temporary_patches.gpt_oss import moe_forward_inference_bf16
     model, mlp = _toy(True)
     x = torch.randn(1, 1, H, device = "cuda").to(DT)
@@ -233,8 +232,7 @@ def test_param_wrapper_hook_routes_only_at_the_outermost_wrapper():
 @pytest.mark.parametrize("lora", [False, True])
 @pytest.mark.parametrize("B", [1, 3])
 def test_routed_mlp_forward_matches_module_on_batched_decode(monkeypatch, lora, B):
-    """routed_mlp_forward gets [B, 1, H] decode states. The transformers 5 router normalizes its
-    top-k scores with softmax(dim=1), so it has to see [tokens, H], else every pick weighs 1."""
+    """routed_mlp_forward gets [B, 1, H] decode states; transformers 5's router softmaxes top-k scores over dim=1, so it must see [tokens, H] or every pick weighs 1."""
     _needs_16bit_routing(B)
     from unsloth_zoo.temporary_patches.gpt_oss_routed import routed_mlp_forward
     model, mlp = _toy(lora)

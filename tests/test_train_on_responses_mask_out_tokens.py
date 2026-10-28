@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""``mask_out_tokens`` on ``train_on_responses_only`` (unslothai/unsloth#6695).
-
-Every route to the masking closure threads the argument through a different call,
-and a route that drops it fails silently, so each is pinned with a control that
-leaves the argument out: the list path (``datasets.map``), the tensor path (what
-``UnslothVisionDataCollator.__call__`` hands over), the vision-collator path
-(``train_on_responses_only(trainer, ...)``) and the MLX delegation. CPU-pure and
-offline; one test builds a real ``PreTrainedTokenizerFast`` in memory.
-"""
+"""mask_out_tokens on train_on_responses_only (unslothai/unsloth issue 6695): every route to the masking closure must
+thread it, as a dropped one fails silently; covers list, tensor, vision-collator and MLX paths; CPU-only and offline."""
 
 import sys
 import types
@@ -151,8 +144,7 @@ def test_datasets_map_batched_is_the_text_sft_route():
 
 
 def test_tensor_batches_keep_their_type_and_their_existing_masks():
-    """A collator's batch: padded tensors, pads already -100. The closer is matched on
-    ``input_ids`` and masked in ``labels``; kept positions come from ``labels``."""
+    """A collator batch of padded tensors with pads already -100: the closer is matched on input_ids and masked in labels; kept positions come from labels."""
     row_a = ROW + [PAD_ID, PAD_ID]
     row_b = [USER_ID, 12, ASSISTANT_ID, 30, THINK_ID, 31, 32, PAD_ID, PAD_ID, PAD_ID, PAD_ID]
     sentinel_a = [900 + i if t != PAD_ID else -100 for i, t in enumerate(row_a)]
@@ -252,8 +244,7 @@ def test_the_vision_collator_without_the_argument_trains_the_closer():
 
 
 def test_the_mlx_delegation_forwards_the_argument(monkeypatch):
-    """The MLXTrainer branch forwards keyword by keyword, and a missing keyword is
-    accepted silently. ``unsloth_zoo.mlx.trainer`` is faked so this runs without MLX."""
+    """The MLXTrainer branch forwards keyword by keyword and a missing keyword is accepted silently; unsloth_zoo.mlx.trainer is faked so MLX is not needed."""
     calls = []
 
     class MLXTrainer:
@@ -283,8 +274,7 @@ def test_the_mlx_delegation_forwards_the_argument(monkeypatch):
 
 
 def test_the_precompute_against_a_real_fast_tokenizer():
-    """A real ``PreTrainedTokenizerFast`` built in memory: word-level vocab, the markers
-    and ``</think>`` as added special tokens. No weights, no network."""
+    """A real PreTrainedTokenizerFast built in memory: word-level vocab with the markers and </think> as added special tokens; no weights, no network."""
     from tokenizers import AddedToken, Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
@@ -328,8 +318,7 @@ def test_the_precompute_against_a_real_fast_tokenizer():
 
 
 def test_a_separate_space_token_before_the_closer_stays_trained():
-    """Qwen3 / SmolLM3 encode " </think>" as [space, </think>]; only the closer is
-    masked, the space before it is not."""
+    """Qwen3 and SmolLM3 encode ' </think>' as [space, </think>]; only the closer is masked, the space before it stays trained."""
     space = ord(" ")
     row = [USER_ID, 10, ASSISTANT_ID, 20, space, THINK_ID, 21]
 

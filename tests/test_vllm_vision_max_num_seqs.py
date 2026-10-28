@@ -108,9 +108,8 @@ def _engine_max_num_seqs(monkeypatch, float8_kv_cache):
     if not hasattr(transformers, "Qwen2_5_VLConfig"):
         pytest.skip("Qwen2_5_VLConfig needs a newer transformers")
     if "vllm_version" not in vars(vllm_utils):
-        # load_vllm refuses to run without vLLM, and past that guard it patches vLLM itself,
-        # so this end-to-end check needs the real install (the GPU lanes). The cap arithmetic
-        # above runs everywhere.
+        # load_vllm refuses to run without vLLM and patches it, so this end-to-end check needs a real install (GPU
+        # lanes); the cap arithmetic above runs everywhere.
         pytest.skip("load_vllm needs vLLM installed")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda *a, **k: True)

@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MoE routing replay against vLLM's output contracts (0.21 split routes, prompt start offset,
-async scheduling), duplicate completions and checkpoint recompute identity. CPU only."""
+"""MoE routing replay against vLLM output contracts (0.21 split routes, prompt start offset, async scheduling),
+duplicate completions and checkpoint recompute identity; CPU only."""
 
 import ast
 import os
@@ -262,8 +262,8 @@ class _NoStream:
 
 
 def test_the_cpu_stream_stand_in_covers_every_stream_call():
-    """The offload path calls these on whatever stream it holds; a method the stand-in lacks stops
-    the recompute test below with an AttributeError instead of checking the recompute."""
+    """The offload path calls these on whatever stream it holds; a method the stand-in lacks stops the recompute test
+    with AttributeError instead of checking the recompute."""
     import unsloth_zoo.gradient_checkpointing as gc
 
     tree = ast.parse(pathlib.Path(gc.__file__).read_text(encoding = "utf-8"))
@@ -281,9 +281,8 @@ def test_the_cpu_stream_stand_in_covers_every_stream_call():
 
 @pytest.fixture
 def offloaded_gc(monkeypatch):
-    """Unsloth's offloaded checkpoint (UnslothCheckpointFunction) with its offload branch on, CPU
-    tensors standing in for the device: the first activation is copied to a host buffer in forward
-    and rebuilt in the one reused staging buffer for every recompute, as on a GPU."""
+    """UnslothCheckpointFunction with its offload branch on (CPU tensors stand in for the device): the first activation
+    is copied to host in forward and rebuilt in one reused staging buffer."""
     import contextlib
 
     from unsloth_zoo import gradient_checkpointing as gc

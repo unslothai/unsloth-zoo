@@ -14,18 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-Smoke + Tier 1 + Tier 2 tests for the mlx_stub package.
-
-Verifies:
-1. simulate_mlx_on_torch() succeeds and registers all named submodules.
-2. Unsloth backend's 5 fresh symbols (mx.metal.is_available, set_wired_limit,
-   device_info, clear_cache, synchronize) work as expected.
-3. The ~70 trivial passthroughs round-trip vs torch on random inputs.
-4. Sub-architecture VLM submodules auto-resolve via the MetaPathFinder.
-5. Tree utils (tree_flatten/tree_unflatten/tree_map) roundtrip.
-6. JAX-style RNG keys split deterministically.
-"""
+"""Smoke and tier 1-2 tests for the mlx_stub shim: simulate_mlx_on_torch registers submodules, 5 fresh Unsloth backend
+symbols work, ~70 passthroughs match torch, VLM submodules auto-resolve via MetaPathFinder, tree utils round-trip,
+RNG keys split deterministically."""
 
 from __future__ import annotations
 
@@ -33,8 +24,7 @@ import pytest
 import torch
 
 
-# Install the shim once at session start so all later `import mlx*` resolve to
-# the stubs (loaded via the workspace conftest.py that puts it on sys.path).
+# Install the shim once per session so later `import mlx*` resolve to the stubs; the workspace conftest.py puts it on sys.path.
 @pytest.fixture(autouse=True, scope="session")
 def _install_mlx_shim():
     from mlx_simulation import simulate_mlx_on_torch

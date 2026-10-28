@@ -1,10 +1,4 @@
-"""Regression tests for unsloth#2343: bias training was silently disabled.
-
-The LoRA branch froze every non-adapter param, so LoraConfig(bias="all"/"lora_only")
-had no effect. The fix preserves PEFT's bias decision (trainable biases keep their
-loaded dtype, frozen on bias="none", gated to PEFT models). Pure CPU, tiny Llama;
-PEFT tests import-or-skip.
-"""
+"""Regression tests: PEFT's bias choice must survive prepare_model_for_training; CPU-only tiny Llama."""
 import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -86,8 +80,7 @@ def test_peft_bias_none_stays_frozen():
 
 
 def test_peft_trainable_bias_keeps_module_dtype():
-    """A trainable bias keeps its Linear's bf16 dtype, not fp32 (else the matmul
-    dtype mismatches)."""
+    """A trainable bias keeps its Linear's bf16 dtype; fp32 would mismatch the matmul dtype."""
     pytest.importorskip("peft")
     from unsloth_zoo.training_utils import prepare_model_for_training
 
@@ -105,8 +98,7 @@ def test_peft_trainable_bias_keeps_module_dtype():
 
 
 def test_peft_bias_gradient_flows_after_backward():
-    """End-to-end on CPU: with bias='all', a backward pass populates a finite
-    gradient on a trainable bias; a frozen base weight gets none."""
+    """With bias='all' on CPU, trainable biases get a finite grad after backward; frozen weights get none."""
     pytest.importorskip("peft")
     from unsloth_zoo.training_utils import prepare_model_for_training
 
@@ -117,8 +109,7 @@ def test_peft_bias_gradient_flows_after_backward():
     )
 
     input_ids = torch.randint(0, 64, (1, 8))
-    # Loss from logits, not labels=: the labelled forward uses fused CUDA CE that
-    # aborts on a CPU-only build; logits stay CPU-only and still drive a backward.
+    # Compute loss from logits: labels= hits fused CUDA CE, which aborts on a CPU-only build.
     logits = model(input_ids=input_ids).logits.float()
     loss = torch.nn.functional.cross_entropy(
         logits.view(-1, logits.size(-1)), input_ids.view(-1))
@@ -136,8 +127,7 @@ def test_peft_bias_gradient_flows_after_backward():
 
 
 def test_non_peft_model_biases_stay_frozen():
-    """A non-PEFT model's biases default to requires_grad=True but must still be
-    frozen on the LoRA path; bias preservation is a PEFT-only decision."""
+    """Non-PEFT biases start requires_grad=True but stay frozen on the LoRA path; only PEFT keeps bias."""
     from unsloth_zoo.training_utils import prepare_model_for_training
 
     model = _tiny_llama()  # plain LlamaForCausalLM, no PEFT
@@ -153,9 +143,8 @@ def test_non_peft_model_biases_stay_frozen():
 
 
 def test_modules_to_save_bias_not_preserved_on_bias_none():
-    """bias='none' + modules_to_save: a saved module is trainable because the whole
-    module is saved, not as a bias decision; with patch_modules_to_save=False bias and
-    weight stay frozen together (#2343 review)."""
+    """With bias=none and modules_to_save the module is trainable as a whole, not as a bias decision; with
+    patch_modules_to_save=False bias and weight stay frozen (unsloth issue 2343 review)."""
     pytest.importorskip("peft")
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.training_utils import prepare_model_for_training

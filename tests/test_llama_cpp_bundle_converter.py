@@ -1,15 +1,5 @@
-"""Tests for the llama.cpp bundle converter resolver (_resolve_bundle_convert_script).
-
-A prebuilt llama.cpp bundle ships convert_hf_to_gguf.py co-versioned with its own
-conversion/ package. When UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is unset, the resolver
-prefers the bundle's converter only when the paired conversion/ package (both
-__init__.py and base.py) is present; otherwise it returns None (monolith installs
-/ hosts without a paired package fall through to the network).
-
-Loads llama_cpp.py in isolation (spec_from_file_location), matching the idiom in
-tests/test_convert_hf_to_gguf_patcher.py, and monkeypatches LLAMA_CPP_DEFAULT_DIR
-to a tmp tree. No network, no GPU.
-"""
+"""With UNSLOTH_LLAMA_CPP_SCRIPTS_DIR unset, the bundle converter is used only if conversion/__init__.py and base.py
+both exist; otherwise None, so monolith installs or hosts without a paired package fall through to the network."""
 
 from __future__ import annotations
 
@@ -38,9 +28,7 @@ def mod():
 
 def _make_bundle(root, *, conversion=True, base=True,
                  converter="convert_hf_to_gguf.py"):
-    """Create a fake bundle dir. `conversion` writes conversion/__init__.py,
-    `base` writes conversion/base.py; `converter` (or None) writes that converter
-    filename at the bundle root."""
+    """Fake bundle dir: conversion writes conversion/__init__.py, base writes conversion/base.py, converter (or None) writes that filename at the bundle root."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     if conversion:
@@ -78,8 +66,7 @@ def test_returns_none_with_conversion_but_no_converter(mod, monkeypatch, tmp_pat
 
 
 def test_returns_none_when_base_py_missing(mod, monkeypatch, tmp_path):
-    # __init__.py present but base.py absent: must match _detect_converter_layout
-    # (which needs both) and fall through to the network instead of mis-selecting.
+    # conversion/__init__.py without base.py must match _detect_converter_layout (which needs both) and fall through to the network, not mis-select.
     bundle = _make_bundle(tmp_path / "nobase", conversion=True, base=False)
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
     assert mod._resolve_bundle_convert_script() is None
@@ -120,10 +107,8 @@ def test_underscore_wins_when_both_converters_present(mod, monkeypatch, tmp_path
 
 
 def test_source_or_new_layout_checkout_also_resolves(mod, monkeypatch, tmp_path):
-    # The resolver keys purely on (conversion/{__init__,base}.py + converter), so a
-    # new-layout source checkout under LLAMA_CPP_DEFAULT_DIR also resolves locally
-    # rather than hitting the network. This is intended (its converter is
-    # genuinely co-versioned with its own conversion/) and documented here.
+    # The resolver keys only on conversion/__init__.py, conversion/base.py and the converter, so a new-layout checkout
+    # under LLAMA_CPP_DEFAULT_DIR also resolves locally; intended.
     src = _make_bundle(tmp_path / "src_checkout")
     (src / "ggml").mkdir()  # extra source-tree noise, ignored by the resolver
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(src))
@@ -134,9 +119,8 @@ def test_source_or_new_layout_checkout_also_resolves(mod, monkeypatch, tmp_path)
 
 
 def test_env_pin_resolver_takes_precedence_over_bundle(mod, monkeypatch, tmp_path):
-    # _download_convert_hf_to_gguf consults _resolve_local_convert_script first
-    # and only falls back to the bundle when it returns None. Here the env pin
-    # resolves, so the bundle is never reached.
+    # _download_convert_hf_to_gguf tries _resolve_local_convert_script first and falls back to the bundle only when it
+    # returns None; an env pin wins, so the bundle is unreached.
     scripts_dir = _make_bundle(tmp_path / "pinned", conversion=False)
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(scripts_dir))
 

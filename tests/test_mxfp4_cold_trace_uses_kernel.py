@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A cold compiled graph (first decode of the process happens inside the trace) must already use the verified
-fused kernel, not bake the ~50x slower torch reference in until some eager call happens. Fresh process per case."""
+"""A cold compiled graph must already use the verified fused MXFP4 kernel, not bake in the slow torch reference; each case runs in a fresh process."""
 import os, subprocess, sys, textwrap
 
 import pytest

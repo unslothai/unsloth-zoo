@@ -14,23 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Kaggle detection, GGUF sizing and the /tmp redirect.
-
-Both bugs under test are bugs of *degree* -- code that ran and returned an
-answer, just the wrong one, never an exception:
-
-1. `IS_KAGGLE_ENVIRONMENT` was "any env var starts with KAGGLE_", which is how
-   the Kaggle CLI authenticates on an ordinary machine, so anyone who had ever
-   used it had save paths rewritten to /tmp on their own laptop.
-2. The free-disk estimate sized a GGUF export at the model twice over. The
-   real peak is merge PLUS intermediate GGUF PLUS quants, since nothing is
-   deleted in between.
-
-The module is loaded straight from its file rather than through
-`import unsloth_zoo`, so these run without torch, without a GPU and without
-the package's import-time device detection. Nothing touches a real /tmp or
-/kaggle: KAGGLE_TMP and KAGGLE_WORKING are pointed at a scratch tree.
-"""
+"""Kaggle detection, GGUF disk sizing and the /tmp redirect, run without torch or GPU; IS_KAGGLE_ENVIRONMENT must not
+fire on Kaggle CLI credentials; GGUF peak is merge plus intermediate plus quants; KAGGLE_TMP and KAGGLE_WORKING point
+at a scratch tree."""
 
 import importlib.util
 import os
@@ -73,11 +59,7 @@ def kaggle_tree(tmp_path, disk_utils, monkeypatch):
 
 
 def _fake_free(disk_utils, monkeypatch, sizes):
-    """Report `sizes[path] = free bytes`, falling through to the real answer.
-
-    Longest matching prefix wins, so a subdirectory inherits its parent's free
-    space the way a real filesystem would report it.
-    """
+    """Reports sizes[path] as free bytes, falling through to the real answer; the longest matching prefix wins, so a subdirectory inherits its parent's free space."""
     real = disk_utils.free_bytes
 
     def fake(path):
@@ -102,9 +84,7 @@ class TestKaggleDetection:
         assert disk_utils.is_kaggle_environment() is True
 
     def test_kaggle_cli_credentials_are_not_a_kernel(self, disk_utils, kaggle_tree, monkeypatch):
-        """The exact false positive the old check had: a laptop with the Kaggle
-        CLI configured exports KAGGLE_USERNAME and KAGGLE_KEY and has no
-        KAGGLE_KERNEL_RUN_TYPE, yet `"\\nKAGGLE_" in keynames` said Kaggle."""
+        """The old check's false positive: a laptop with Kaggle CLI credentials (KAGGLE_USERNAME, KAGGLE_KEY) and no KAGGLE_KERNEL_RUN_TYPE was detected as Kaggle."""
         monkeypatch.delenv("KAGGLE_KERNEL_RUN_TYPE", raising = False)
         monkeypatch.setenv("KAGGLE_USERNAME", "datadinosaur")
         monkeypatch.setenv("KAGGLE_KEY", "0" * 32)
@@ -237,9 +217,8 @@ class TestLogicalSize:
         assert disk_utils.model_16bit_bytes(model) == 2 * 1_100_000
 
     def test_mxfp4_blocks_are_worth_twice_their_bytes(self, disk_utils):
-        """gpt-oss kept packed has no quant_state, so numel() is the only signal
-        and it is half the truth: `convert_moe_packed_tensors` turns (..., G, B)
-        into (..., G, B * 2) and consumes the scales."""
+        """gpt-oss packed MXFP4 has no quant_state, so numel() is half the truth: convert_moe_packed_tensors turns (...,
+        G, B) into (..., G, B * 2) and consumes the scales."""
         blocks = _MXFP4Param(90_000_000)
         assert (
             disk_utils.logical_numel(blocks, "model.layers.0.mlp.experts.gate_up_proj_blocks")
@@ -276,9 +255,8 @@ class TestLogicalSize:
 
 class TestGGUFEstimate:
     def test_peak_is_merge_plus_intermediate_plus_quants(self, disk_utils):
-        """The under-estimate, stated as arithmetic: a 7B to q4_k_m writes a
-        14GB merge, a 14GB f16 GGUF and a ~4.3GB quant, and neither of the
-        first two is deleted first. "Two copies" is 28GB; the floor is 32GB."""
+        """Under-estimate: a 7B to q4_k_m writes a 14GB merge, a 14GB f16 GGUF and a ~4.3GB quant, and the first two are
+        not deleted first; two copies (28GB) is below the 32GB floor."""
         n = 7_000_000_000
         need = disk_utils.estimate_gguf_export_bytes(
             n_parameters = n, quantization_methods = ["q4_k_m"], first_conversion = "f16"
@@ -307,8 +285,7 @@ class TestGGUFEstimate:
         assert two - one == int(n * 5.7 / 8)
 
     def test_a_convert_only_export_still_counts_the_file_it_writes(self, disk_utils):
-        """A GGUF has to be written before it can be deleted, so no export ever
-        peaks below merge + first conversion."""
+        """A GGUF must be written before it can be deleted, so no export peaks below merge plus first conversion."""
         n = 1_000_000_000
         need = disk_utils.estimate_gguf_export_bytes(
             n_parameters = n, quantization_methods = [], first_conversion = "f16"
@@ -361,15 +338,8 @@ class TestGGUFEstimate:
         assert with_cache - without == n * 2
 
     def test_the_three_failing_rows_are_now_caught(self, disk_utils):
-        """Gemma4 31B Vision: 174GB free, and it still did not fit.
-
-        62GB went on pre-warming the Hugging Face cache with the base model,
-        62GB on the merge, leaving 50GB for a GGUF needing 62GB - it died at
-        48GB of a 65GB shard. Two copies (the old estimate) called that safe,
-        and so did three; only counting the cached base too exceeds the free
-        space, which is what lets the guard say no - or, better, drop the
-        pre-warm and let the export through, which is what unsloth now does.
-        """
+        """On 174GB free a Gemma4 31B Vision export still failed: 62GB pre-warmed base cache plus 62GB merge left 50GB
+        for a 62GB GGUF; only counting the cached base exceeds free space; unsloth now drops the pre-warm."""
         n = 31_000_000_000
         free = 174 * GB
         old_style = 2 * n * 2 + 2 * GB

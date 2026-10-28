@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Worker for test_fp16_path_tiny_models.py, in its own process because temporary
-patches rewrite transformers classes process-wide. Runs every arch in bf16 first,
-then re-applies the patches with UNSLOTH_FORCE_FLOAT32=1 (as the loader does per
-load) and runs the T4 path: forced-float32 cast (or plain fp16) + fp16 autocast.
-
-argv: arch names. Prints one JSON line per (mode, arch).
-"""
+"""Worker for test_fp16_path_tiny_models.py, in its own process as temporary patches rewrite transformers process-wide;
+runs every arch in bf16, then the T4 path with UNSLOTH_FORCE_FLOAT32=1 (float32 cast or fp16, plus fp16 autocast);
+prints one JSON line per (mode, arch)."""
 
 import importlib
 import importlib.util
@@ -82,17 +78,15 @@ BUILDERS = {
 }
 
 
-# Patch modules these architectures route through; the rest (vLLM, TRL, datasets) cost
-# seconds and touch none of them.
+# Patch modules these architectures route through; the rest (vLLM, TRL, datasets) cost seconds and touch none of them.
 _PATCH_MODULES = ("common", "misc", "fla_vendor", "gemma4", "gemma4_float32", "gemma4_moe",
                   "gemma4_banded_attention", "gemma4_flash_sliding", "qwen3_5_moe",
                   "muse_glimmer_banded_attention", "moe_experts_interface", "moe_grouped_modulelist")
 
 
 def _strict(fn, name):
-    # On GPU the T4 path reaches flex attention, which is not an autocast op and
-    # rejects mixed q/k/v dtypes. SDPA/eager under CPU autocast would unify them
-    # silently, so check the invariant at the call instead.
+    # On GPU the T4 path reaches flex attention, which is not an autocast op and rejects mixed q/k/v dtypes; SDPA/eager
+    # under CPU autocast would unify them silently, so check the invariant at the call instead.
     def wrapper(*args, **kwargs):
         q, k, v = (args[i] if len(args) > i else kwargs[n] for i, n in ((0, "query"), (1, "key"), (2, "value")))
         if isinstance(q, torch.nn.Module):  # attention-interface signature: (module, q, k, v, ...)

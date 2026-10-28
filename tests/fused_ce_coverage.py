@@ -14,15 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Which model classes get the fused lm_head + CE loss on the installed transformers, and by which route.
-
-Run as a script (a fresh process, so the import hook sees every modeling import):
-    python tests/fused_ce_coverage.py              # print the census as JSON
-    python tests/fused_ce_coverage.py --update     # record it in tests/fused_ce_coverage.json
-
-Routes mirror production: "hook" (forward rewritten by the import hook), "regex" / "ast"
-(compiler.fused_lm_head_forward would fuse it), None (trains with full logits).
-"""
+"""Census of fused lm_head + CE loss routes on installed transformers: hook (import-hook rewrite), regex/ast
+(compiler.fused_lm_head_forward would fuse it), or None (full logits); fresh process so the import hook sees every
+modeling import; --update writes tests/fused_ce_coverage.json."""
 import argparse
 import importlib
 import inspect

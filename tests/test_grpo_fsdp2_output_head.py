@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth-zoo#1850: grpo_accumulated_loss under FSDP2 must read the output head after the forward.
-
-FSDP2 swaps a module's sharded DTensor parameters for plain tensors in its pre-forward hook and
-back after backward. Capturing ``output_embeddings.weight`` before the forward handed the matmul a
-DTensor ("aten.mm.default got mixed torch.Tensor and DTensor"). Two gloo ranks run two
-accumulation steps; loss and reduced gradients must match an unsharded reference.
-"""
+"""grpo_accumulated_loss under FSDP2 must read output_embeddings.weight after the forward (unsloth-zoo 1850); FSDP2
+swaps DTensor params in its hooks; loss and reduced grads of 2 gloo ranks must match an unsharded reference."""
 
 import json
 import os

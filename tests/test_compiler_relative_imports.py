@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Generated compiled modules live outside transformers, so relative imports copied out of a modeling
-file (MusicgenForConditionalGeneration.__init__) must become absolute."""
+"""Compiled modules live outside transformers, so relative imports copied from a modeling file (MusicgenForConditionalGeneration.__init__) must be made absolute."""
 
 import importlib
 import inspect

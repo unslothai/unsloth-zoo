@@ -1,15 +1,5 @@
-"""Tests for the prequantized per-expert bnb-4bit MoE loading converters.
-
-tf4-era unsloth-bnb-4bit checkpoints store MoE experts as one quantized tensor per
-expert per projection (`experts.<N>.gate_proj.weight` + absmax/quant_map/quant_state
-aux keys). Under transformers v5 the model's MergeModulelist converters match those
-keys first, byte-concat packed uint8 as if bf16, and drop every aux key, so
-`_bnb4bit_per_expert_conversions` builds prepended "twin" converters that collect the
-aux keys and reassemble one stacked Params4bit per projection.
-
-These tests drive the twin-construction and routing logic on CPU with synthetic
-converters; the full checkpoint path is exercised by the model loading integration.
-"""
+"""Tests per-expert bnb-4bit MoE converters: under transformers v5 MergeModulelist byte-concats packed uint8 and drops
+aux keys, so prepended twins restack them; CPU-only with synthetic converters."""
 
 from __future__ import annotations
 
@@ -23,19 +13,11 @@ _core_model_loading = pytest.importorskip(
     reason="requires transformers v5 core_model_loading",
 )
 
-# Six tests here import bitsandbytes in their bodies without guarding it, so on a
-# runner that has transformers v5 but no bitsandbytes they FAIL rather than skip.
-# That never showed because no job executed this file: `pytest tests/ --collect-only`
-# only imports it. Guard it the same way the module above is guarded.
+# Skip the whole module without bitsandbytes: six tests import it in their bodies, and without this a transformers v5 runner would fail rather than skip.
 pytest.importorskip("bitsandbytes", reason="requires bitsandbytes")
 
-# On transformers < v5 the real `core_model_loading` module does not exist, but
-# unsloth injects an inert compat stub of the same name into `sys.modules` so
-# peft LoRA reloads keep working. That stub's `WeightConverter` accepts any
-# arguments and stores nothing, so `importorskip` above finds the module and
-# does not skip. Skip unless the real v5 API is present (its `WeightConverter`
-# exposes `target_patterns`, a `__slots__` descriptor inherited from
-# `WeightTransform`), so these tests only run against genuine transformers v5.
+# On transformers<5 the core_model_loading compat stub (kept so peft LoRA reloads keep working) accepts any args, so
+# importorskip does not skip; skip unless WeightConverter has target_patterns
 if not hasattr(_core_model_loading.WeightConverter, "target_patterns"):
     pytest.skip(
         "transformers.core_model_loading is a transformers<5 compat stub, "
@@ -94,8 +76,7 @@ def test_twin_built_for_per_expert_expert_converter():
     expected_aux = [b + suf for b in conv.source_patterns for suf in _AUX_SUFFIXES]
     assert list(twin.source_patterns[: len(expected_aux)]) == expected_aux
 
-    # Bare weight patterns are `$`-anchored so pattern_to_converter (last-wins)
-    # does not let the twin shadow the model's own converter for bf16 checkpoints.
+    # Bare weight patterns are $-anchored so pattern_to_converter (last-wins) does not let the twin shadow the model's converter for bf16 checkpoints.
     anchored = list(twin.source_patterns[len(expected_aux):])
     assert anchored == [s + "$" for s in conv.source_patterns]
     assert twin.target_patterns[0] == conv.target_patterns[0]
@@ -128,8 +109,7 @@ def test_down_proj_converter_also_twinned():
 
 
 def test_unquantized_layer_falls_back_to_original_merge():
-    """Layers whose experts were skipped by dynamic quantization carry no aux keys;
-    the twin must reproduce the model's own merge for them."""
+    """Layers whose experts were skipped by dynamic quantization carry no aux keys, so the twin must reproduce the model's own merge for them."""
     conv = _expert_merge_converter()
     twin = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0]
     op = twin.operations[0]
@@ -177,8 +157,7 @@ def _fused_passthrough_converter(name="model.layers.*.mlp.experts.gate_up_proj")
 
 
 def test_fused_passthrough_converter_twinned():
-    """Model converters over a fused expert param (e.g. qwen3_vl_moe's Transpose)
-    precede appended quantizer conversions, so they need a prepended twin too."""
+    """Model converters over a fused expert param (e.g. qwen3_vl_moe's Transpose) run before appended quantizer conversions, so they need a prepended twin too."""
     conv = _fused_passthrough_converter()
     twins = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)
     assert len(twins) == 1
@@ -244,8 +223,7 @@ def test_fused_prequantized_builds_params4bit():
 
 @pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 def test_fused_prequantized_orientation_mismatch_raises():
-    """A blob quantized in the transposed (checkpoint) layout must fail loudly:
-    a transpose op cannot be applied to packed 4-bit data."""
+    """A blob quantized in the transposed (checkpoint) layout must raise: a transpose op cannot be applied to packed 4-bit data."""
     import bitsandbytes as bnb
     import torch.nn as nn
 
@@ -278,10 +256,7 @@ def test_fused_prequantized_orientation_mismatch_raises():
 
 
 def _stack_input_dict(op, weights_per_src):
-    """Build the per-expert list input_dict for _PerExpertStackDeserialize.
-
-    weights_per_src: [src][expert] float weight tensors (out, in) on CUDA.
-    """
+    """Build the per-expert input_dict for _PerExpertStackDeserialize; weights_per_src is [src][expert] float (out, in) tensors on CUDA."""
     import bitsandbytes as bnb
 
     input_dict = {}
@@ -357,8 +332,7 @@ def test_stack_prequantized_block_alignment(out_dim, in_dim, exact):
         # Same bytes and absmax as the per-expert quantization: dequant is identical.
         assert err == 0.0, err
     else:
-        # Repack path adds one requant of already-quantized values (~0.16 here);
-        # raw concat instead mis-scales across the partial block boundary.
+        # Repack path adds one requant of already-quantized values (~0.16 here); raw concat instead mis-scales across the partial block boundary.
         assert err < 0.25, err
 
 
@@ -388,15 +362,7 @@ def _convert_prequantized(op, conv, weights_per_src, n_experts):
 
 @pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 def test_misaligned_repack_slices_an_oversized_stack(monkeypatch):
-    """The repack branch quantizes the WHOLE stack in one call, so it reaches
-    the same 32-bit element count the load path has to slice around.
-
-    4 x 8 per segment is 32 elements, not a whole 64-block, which is what forces
-    the repack; two sources make 64 per expert, which is a whole block and so
-    can be sliced. Compared against the same conversion with the threshold left
-    alone, so the assertion is that slicing changed nothing, not merely that it
-    produced something plausible.
-    """
+    """Repack quantizes the whole stack in one call; 4x8 segments (32 elements, not a whole 64-block) force it, and slicing that stack must change nothing."""
     from unsloth_zoo.temporary_patches import moe_utils_bnb4bit as _M
 
     torch.manual_seed(0)
@@ -414,13 +380,10 @@ def test_misaligned_repack_slices_an_oversized_stack(monkeypatch):
 
     unsliced = _convert_prequantized(op, conv, weights_per_src, n_experts)
 
-    # Just above one expert, so every slice holds exactly one and there are as
-    # many calls as experts.
+    # Threshold set just above one expert, so every slice holds exactly one expert and there are as many calls as experts.
     monkeypatch.setattr(_M, "_BNB_MAX_QUANTIZE_NUMEL", per_expert + 1)
 
-    # Without this the test is vacuous: with the repack branch still on the
-    # single call, both conversions take the identical path and compare equal,
-    # so it would pass against the very code it exists to check.
+    # Lowering the threshold is needed or both conversions take the same single-call path and compare equal, passing even against the code under test.
     taken = []
     real_slicer = _M._quantize_expert_stack_in_slices
 

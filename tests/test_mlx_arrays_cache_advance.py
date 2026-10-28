@@ -1,17 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""The ArraysCache.advance patch, on any platform.
-
-Everything that decides *whether* to rewrite a third-party class -- the body
-matcher, the install latch, the retry policy, the deferred arithmetic and the
-adoption of caches built before installation -- is plain Python. None of it needs
-mlx, Metal or Apple Silicon, and the companion Metal suite is opt-in behind a
-label, so this is the coverage that runs on every pull request.
-
-The Metal-only assertions (live buffer counts, real decoding) stay in
-tests/test_mlx_generate_metal.py.
-"""
+"""ArraysCache.advance patch decision logic (body matcher, install latch, retry policy, deferred arithmetic, adoption of
+pre-install caches) is plain Python needing no mlx, Metal or Apple Silicon; Metal-only checks stay in
+tests/test_mlx_generate_metal.py."""
 
 import importlib.util
 import sys
@@ -177,8 +169,7 @@ def test_a_failed_attempt_is_not_a_decision(fresh, monkeypatch):
     engine._install_arrays_cache_advance_fix()
     assert not engine._ARRAYS_CACHE_ADVANCE_RESOLVED
 
-    # Not undo(): it reverts the injected module too, so the retry could not tell
-    # "declined to latch" from "nothing to look at".
+    # Not undo(): it also reverts the injected module, so the retry could not tell 'declined to latch' from 'nothing to look at'.
     monkeypatch.setattr(engine, "_has_replaceable_advance", real_matcher)
     engine._install_arrays_cache_advance_fix()
     assert engine._ARRAYS_CACHE_ADVANCE_RESOLVED
@@ -193,8 +184,7 @@ def test_a_missing_mlx_lm_is_inert(fresh, monkeypatch):
 
 
 def test_mlx_vlm_vendored_cache_is_patched_too(fresh):
-    # mlx-vlm vendors its own copy of this body from 0.6.4, which patching mlx-lm
-    # alone never reaches.
+    # mlx-vlm vendors its own copy of this body from 0.6.4, which patching mlx-lm alone never reaches.
     text_cache = fresh(stock_bodied_cache())
     vision_cache = fresh(stock_bodied_cache(), "mlx_vlm.models.cache")
     sys.modules.setdefault("mlx_vlm", types.ModuleType("mlx_vlm"))

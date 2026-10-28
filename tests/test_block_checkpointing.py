@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests unsloth_zoo.block_checkpointing on tiny diffusers, transformers and plain models (CPU).
-
-Loaded from its file, like test_block_swap: ``import unsloth_zoo`` needs unsloth installed."""
+"""Tests unsloth_zoo.block_checkpointing on tiny diffusers, transformers and plain models (CPU); loaded from file because import unsloth_zoo needs unsloth installed."""
 
 import functools
 import importlib.util
@@ -290,8 +288,8 @@ class _NeedsState(nn.Module):
         self.lin = nn.Linear(4, 4)
 
     def forward(self, x):
-        # State used by the first op, as fetched weights are: recompute cannot stop before reaching it.
-        # A trailing op that saves nothing: non-reentrant recompute would stop before the post-hook.
+        # State used by the first op (like fetched weights) means recompute cannot stop before it; a trailing op that
+        # saves nothing makes non-reentrant recompute stop before the post-hook.
         return self.lin(x * self.scale) + 1
 
 

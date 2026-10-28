@@ -1,10 +1,6 @@
-"""Parity tests for the transformers<5 ModuleList grouped-GEMM MoE path.
-
-transformers>=5 stacks its experts, so no shipped model exercises the ModuleList path there.
-These build synthetic ModuleList blocks (Qwen3-MoE / Mixtral / OLMoE) and check
-grouped_moe_forward against a per-expert reference loop across the default/cache/recompute
-modes, forward and backward. Skipped where torch._grouped_mm is unsupported.
-"""
+"""Parity tests for the transformers<5 ModuleList grouped-GEMM MoE path: synthetic Qwen3-MoE/Mixtral/OLMoE blocks
+(transformers>=5 stacks experts) vs a per-expert loop in default/cache/recompute modes, forward and backward; skipped
+without torch._grouped_mm."""
 import types
 import torch
 import torch.nn as nn
@@ -202,10 +198,9 @@ def test_wrap_loader_idempotent_and_enables():
 
 
 def test_auto_enable_reevaluates_after_adapter_attaches():
-    """Re-running auto_enable after an adapter attaches restores a block whose expert LoRA the
-    grouped path cannot run (here only one expert is wrapped) to the original loop, while a
-    frozen block stays grouped (what makes the loader leaf-wrap safe). Supported expert LoRA
-    stays grouped: tests/test_moe_grouped_modulelist_lora.py."""
+    """Re-running auto_enable after an adapter attaches restores a block whose expert LoRA the grouped path cannot run
+    (only one expert wrapped) to the loop; frozen blocks stay grouped (leaf-wrap safe); supported expert LoRA stays
+    grouped, see tests/test_moe_grouped_modulelist_lora.py."""
     spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
     model = nn.Module()
     model.layers = nn.ModuleList(
@@ -259,8 +254,8 @@ def test_experts_grouped_ready_checks_every_expert():
 
 
 def test_frozen_only_contract_for_experts():
-    """Frozen bnb 4-bit experts are eligible; an unfrozen expert bails (a real Params4bit is uint8
-    and can never require grad, so the reachable trainable case is a plain bf16 expert)."""
+    """Frozen bnb 4-bit experts are eligible; an unfrozen expert bails, since a real Params4bit is uint8 and cannot
+    require grad, so the trainable case is a plain bf16 expert."""
     spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
 
     if HAS_BNB:
@@ -290,8 +285,8 @@ if __name__ == "__main__":
 
 
 def test_enable_warms_the_probes_on_each_card_holding_experts(monkeypatch):
-    """A compiled first forward on a second GPU model must not open an eager probe region (a graph
-    break, or Unsupported under fullgraph): enabling warms that card's support and view probes."""
+    """A compiled first forward on a second GPU model must not open an eager probe region (graph break or Unsupported
+    under fullgraph); enabling warms each card's support and view probes."""
     from unsloth_zoo.temporary_patches import moe_utils
 
     seen = []

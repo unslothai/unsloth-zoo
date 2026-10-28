@@ -88,10 +88,8 @@ def _generated_forward_source():
 
 
 def _generated_module(compiled, name = "unsloth_compiled_module_test"):
-    """A module object with the stance globals of a generated module and the forward
-    `apply_fused_lm_head` produces. Separate calls give separate modules, as two model types
-    would. `compiled` is the decoder body; the returned `forward(module, x, labels)` follows
-    `module`'s train / eval mode."""
+    """Module with the stance globals of a generated module, plus the forward apply_fused_lm_head produces; each call
+    gives a new module; compiled is the decoder body; forward(module, x, labels) follows module's train/eval mode."""
     header = compiler._license_header
     start = header.index("global INFERENCE_RUNS")
     end = header.index("from unsloth_zoo import DEVICE_TYPE_TORCH")

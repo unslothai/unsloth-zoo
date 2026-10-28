@@ -13,26 +13,9 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""The eager fallback must not flip compile modes inside a checkpointed step.
-
-Non-reentrant activation checkpointing (`use_reentrant = False`) runs the region
-twice -- packing every saved intermediate in the forward, recomputing them in the
-backward -- and checks the two agree. A compiled forward recomputed eagerly does
-not, and torch aborts the backward with either
-
-    torch.utils.checkpoint: Recomputed values for the following tensors have
-    different metadata than during the forward pass.
-
-or the sibling
-
-    AssertionError: Something went unexpectedly wrong in activation
-    checkpoint. Please report this bug by filing an issue to PyTorch.
-
-The fallback exists to survive an exhausted recompile cache, a speed problem,
-and must not turn one into a dead training step. It now buys a little more
-budget, finishes the call compiled, and defers the switch to
-`apply_pending_eager_fallbacks()` at the next step boundary.
-"""
+"""Eager recompile fallback must not flip compile mode inside a non-reentrant checkpoint (torch aborts backward); it
+exists for an exhausted recompile cache and must not cause a dead step; it buys budget, finishes compiled, defers the
+switch to apply_pending_eager_fallbacks() at next step boundary."""
 import pytest
 import torch
 import torch.nn as nn
@@ -46,8 +29,7 @@ _BACKEND = "aot_eager"
 
 
 def _norm(w, x, k):
-    # `k` is a plain int, so Dynamo specialises on it and every block recompiles, the
-    # way a real vision run exhausts the cache one guard a shape.
+    # k is a plain int, so Dynamo specialises on it and every block recompiles, the way a real vision run exhausts the cache one guard per shape.
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * w * (1.0 + 0.0 * k)
 
 
@@ -95,9 +77,8 @@ def dynamo_limits():
     saved = {n: getattr(dynamo.config, n) for n in names
              if hasattr(dynamo.config, n)}
     n_wrappers = len(U._EAGER_FALLBACK_WRAPPERS)
-    # These tests end with a bump deliberately outstanding: left behind, a later
-    # fallback restores this test's limit of 2 over the process default, or finds the
-    # allowance spent and takes EVERY live borrower eager.
+    # These tests leave a bump outstanding on purpose: left behind, a later fallback restores this test's limit of 2
+    # over the process default, or finds the allowance spent and takes every live borrower eager.
     saved_states = [(_w, dict(_w._unsloth_fallback_state))
                     for _w in (_r() for _r in U._EAGER_FALLBACK_WRAPPERS)
                     if _w is not None]
@@ -158,13 +139,8 @@ def test_exhausted_recompile_cache_does_not_break_the_backward(dynamo_limits):
     reason = "torch < 2.8 cannot report whether a checkpoint region is live",
 )
 def test_a_spent_budget_ends_the_step_instead_of_flipping_mid_region(dynamo_limits):
-    """The same regression, on the path where there is no budget left to buy.
-
-    Deferring needs a compiled result to defer with, and here the call raised
-    and the retry could not be paid for. Running it eagerly finishes the forward
-    but strands what the step already packed compiled, so the backward aborts or
-    (when the shapes line up) returns silently wrong gradients. End the step and
-    let the caller retry it consistently."""
+    """With no budget left, eager finishes but strands what was packed compiled: backward aborts, or (when shapes line
+    up) silently returns wrong grads; end the step and let the caller retry."""
     _reset_dynamo(2)
     compiled = torch.compile(_norm, fullgraph = True, dynamic = False,
                              backend = _BACKEND)
@@ -191,10 +167,7 @@ def test_a_spent_budget_ends_the_step_instead_of_flipping_mid_region(dynamo_limi
 
 
 def test_the_pre_2_8_fallback_answers_the_same_as_the_accessor():
-    """torch 2.4 to 2.7 have no accessor, and answering None there would quietly
-    restore the old behaviour on releases pyproject still supports. The frame
-    walk must agree with the accessor where both exist, including False for
-    reentrant checkpointing, which is not at risk."""
+    """torch 2.4 to 2.7 lack the accessor, so the frame walk must agree with it (False for reentrant); answering None there would restore the old behaviour."""
     assert U._walk_for_checkpoint_frame() is False, "outside any region"
 
     seen = []
@@ -214,10 +187,7 @@ def test_the_pre_2_8_fallback_answers_the_same_as_the_accessor():
 
 
 def test_a_user_hook_on_top_does_not_hide_the_region():
-    """`saved_tensors_hooks` / `save_on_cpu` entered inside a checkpointed
-    function sits above ours, and the accessor reports only the top one. Reading
-    that as "no region" sends the give-up path eager in exactly the case it
-    exists to refuse."""
+    """A user saved_tensors_hooks or save_on_cpu entered inside a checkpoint sits above ours, and the accessor reports only the top; that must not read as no region."""
     seen = []
     def probe(x):
         seen.append(U._in_non_reentrant_checkpoint())
@@ -233,9 +203,7 @@ def test_a_user_hook_on_top_does_not_hide_the_region():
 
 
 def test_a_reentrant_region_does_not_hide_an_outer_non_reentrant_one():
-    """The frame walk is all torch 2.4 to 2.7 have, and a reentrant checkpoint
-    nested inside a non-reentrant one used to end it at the reentrant frames and
-    answer False -- while the outer region is just as strandable by a flip."""
+    """The frame walk is all torch 2.4 to 2.7 have; a reentrant checkpoint nested in a non-reentrant one must not end the walk early and answer False."""
     seen = []
     def probe(x):
         seen.append((U._in_non_reentrant_checkpoint(), U._walk_for_checkpoint_frame()))
@@ -254,8 +222,7 @@ def test_a_reentrant_region_does_not_hide_an_outer_non_reentrant_one():
 
 
 def test_an_older_torch_falls_through_to_the_frame_walk():
-    """Standing in for 2.4 to 2.7, where the accessor does not exist. Returning
-    None there would silently restore the pre-fix behaviour."""
+    """Stands in for torch 2.4 to 2.7, which lack the accessor; returning None there would silently restore the pre-fix behaviour."""
     seen = []
     def probe(x):
         seen.append(U._in_non_reentrant_checkpoint())
@@ -280,8 +247,7 @@ def test_an_older_torch_falls_through_to_the_frame_walk():
     reason = "this torch has no recompile-limit exception to raise",
 )
 def test_a_spent_budget_still_falls_back_outside_a_checkpoint(dynamo_limits):
-    """The majority case must not regress. With no checkpoint region live there
-    is nothing packed to strand, so eager is safe and the run continues."""
+    """Outside any checkpoint region nothing is packed to strand, so eager fallback is safe there and the run continues."""
     _reset_dynamo(2)
     compiled = torch.compile(_norm, fullgraph = True, dynamic = False,
                              backend = _BACKEND)
@@ -325,10 +291,7 @@ def test_pending_switch_is_applied_at_the_step_boundary(dynamo_limits):
     reason = "torch < 2.8 cannot report whether the hooks are still installed",
 )
 def test_settlement_retries_until_the_generator_is_actually_collected():
-    """A caller retrying from inside `except ... as exc` still roots the
-    traceback, so the abandoned generator survives the collection and its hooks
-    stay installed. Clearing the pending flag regardless meant the next boundary
-    never tried again."""
+    """A retry inside except ... as exc keeps the traceback alive, so the abandoned generator and its hooks survive; the pending flag must persist until collection."""
     import gc
 
     def boom(x):
@@ -344,13 +307,8 @@ def test_settlement_retries_until_the_generator_is_actually_collected():
             cycle = {"exc": exc}                # a cycle, as raising through
             cycle["self"] = cycle               # compiled frames leaves
             U._RAISED_INSIDE_CHECKPOINT = True
-            # Which torch is this? Newer releases throw the exception into the
-            # checkpoint generator themselves (`gen.throw(e)` in
-            # torch/utils/checkpoint.py, present in 2.13), so the region is
-            # unwound before the caller ever sees it and there is no abandoned
-            # generator to settle. Older ones drop the generator on the floor,
-            # which is the case the retry was written for. Read which is running
-            # rather than assume it, and assert accordingly.
+            # Newer torch (gen.throw in torch/utils/checkpoint.py, present in 2.13) unwinds the region itself, so
+            # nothing is abandoned; older releases drop the generator, the case the retry covers; check which runs.
             abandoned = U._in_non_reentrant_checkpoint() is True
             # The traceback is still live, so no collection can finalise anything.
             U.apply_pending_eager_fallbacks()
@@ -396,11 +354,7 @@ def test_bump_recompile_limits_raises_whichever_names_torch_uses(dynamo_limits):
 
 
 def test_the_packed_marker_does_not_survive_the_step():
-    """`_PACKED_COMPILED_IN_CHECKPOINT` says "this step packed compiled". Only
-    `_restore_recompile_limits` cleared it, which an ordinary successful step
-    never reaches, so once set it stayed true for the rest of the run and a
-    later call nowhere near a checkpoint had `_give_up` re-raise the compiler
-    error instead of taking the safe eager fallback."""
+    """_PACKED_COMPILED_IN_CHECKPOINT must not outlive its step: a stale True made _give_up re-raise compiler errors instead of taking the eager fallback."""
     U._PACKED_COMPILED_IN_CHECKPOINT = True
     U.apply_pending_eager_fallbacks()          # nothing pending: still a boundary
     assert U._PACKED_COMPILED_IN_CHECKPOINT is False
@@ -424,19 +378,12 @@ def _sequential_walk(segments, use_reentrant):
 
 
 def test_a_reentrant_sequential_is_not_read_as_a_non_reentrant_region():
-    """`checkpoint_sequential` keeps its own frame in `torch.utils.checkpoint`,
-    and its per-segment closure is called `forward` in that same file. Counting
-    the closure as a `CheckpointFunction` frame left the outer frame hitting the
-    pack/recompute catch-all, so a fully reentrant sequence answered
-    "non-reentrant region open" and `_give_up` re-raised instead of falling
-    back."""
+    """checkpoint_sequential's closure is named forward like CheckpointFunction's; counting it as a checkpoint frame misread reentrant sequences as non-reentrant."""
     assert _sequential_walk(2, True) == [False] * 4
 
 
 def test_the_last_sequential_segment_is_outside_every_region():
-    """The final segment is run directly, not through `checkpoint`, so nothing
-    is packed while it executes and eager is safe there even when the earlier
-    segments are non-reentrant."""
+    """The last checkpoint_sequential segment runs outside checkpoint, so nothing is packed during it and eager is safe even after non-reentrant segments."""
     assert _sequential_walk(2, False) == [True, True, False, False]
 
 
@@ -480,15 +427,9 @@ def hook_label():
     reason = "torch < 2.8 cannot report whether a checkpoint region is live",
 )
 def test_a_disabled_hook_does_not_flip_a_region_that_packed_compiled(hook_label):
-    """The Gemma4 abort.
-
-    Dynamo only discovers a disabled hook while TRACING, so this arm fires on a
-    recompile, routinely the backward recompute of a region whose forward already
-    packed compiled. It used to set `state["eager"]` and run eager on the spot,
-    with none of the checkpoint question the other give-up arms ask, and torch
-    raised CheckpointError about recomputed tensors having different metadata,
-    with `_LATCHED_EAGER_LABELS` still empty because this arm recorded nothing.
-    """
+    """Gemma4 abort: Dynamo finds a disabled hook only while tracing, often in the backward recompute of a region
+    already packed compiled; eager there makes torch raise CheckpointError, so it must ask the checkpoint question
+    like the other give-up arms."""
     calls = {"n": 0}
 
     def compiled(*args, **kwargs):
@@ -517,8 +458,7 @@ def test_a_disabled_hook_does_not_flip_a_region_that_packed_compiled(hook_label)
     assert U._RAISED_INSIDE_CHECKPOINT, "the abandoned region must be settled"
     assert fn._unsloth_fallback_state["eager"], "the retry has to be eager"
 
-    # `ei` roots the traceback, hence the abandoned generator and its still
-    # installed hooks -- the case `_settle_abandoned_checkpoint_generator` covers.
+    # ei roots the traceback, so the abandoned generator and its still installed hooks survive; this is the case _settle_abandoned_checkpoint_generator covers.
     del ei
     U.apply_pending_eager_fallbacks()
     assert U._in_non_reentrant_checkpoint() is False, "the region never closed"
@@ -529,9 +469,7 @@ def test_a_disabled_hook_does_not_flip_a_region_that_packed_compiled(hook_label)
     reason = "torch < 2.8 cannot report whether a checkpoint region is live",
 )
 def test_a_disabled_hook_still_falls_back_when_nothing_packed_compiled(hook_label):
-    """The majority case must not regress: a refusal on the FIRST call means
-    nothing compiled was packed by this label, so eager pack and eager recompute
-    agree. Turning that into a dead step would cost users a working run."""
+    """A refusal on the first call packs nothing compiled, so eager pack and eager recompute agree; making that a dead step would cost users a working run."""
     def compiled(*args, **kwargs):
         raise _disabled_hook_error()
 

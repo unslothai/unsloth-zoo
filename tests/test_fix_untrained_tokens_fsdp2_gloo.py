@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""fix_untrained_tokens on FSDP2 (DTensor) embeddings, e.g. a second Trainer on an already sharded
-model, which raised "Cannot set version_counter for inference tensor". Gloo CPU world of 2."""
+"""Checks fix_untrained_tokens on FSDP2 (DTensor) embeddings, e.g. a second Trainer on a sharded model, which raised
+'Cannot set version_counter for inference tensor'; Gloo CPU world of 2."""
 
 import multiprocessing
 import os
@@ -56,10 +56,9 @@ def _worker(rank, init_file, out):
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
 
-    # A spawned rank runs the real unsloth_zoo/__init__ (not conftest's setup), which refuses to
-    # import without unsloth unless GPU init is skipped; tokenizer_utils needs none of it. Set here,
-    # in the rank process that exits after this, not at module scope, where pytest's collection
-    # would apply it to every test on the xdist worker.
+    # A spawned rank imports the real unsloth_zoo/__init__, which refuses to import without unsloth unless
+    # UNSLOTH_ZOO_DISABLE_GPU_INIT is set; tokenizer_utils needs none of it. Set it inside the rank, not at module
+    # scope, or collection would apply it to every xdist test.
     import importlib.util
 
     if importlib.util.find_spec("unsloth") is None:

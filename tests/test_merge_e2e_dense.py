@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""End-to-end LoRA merge-to-16bit correctness for dense decoder models.
-
-Llama / Qwen3 / Mistral / Gemma2 via the real merge: adapted == base + scale*(B@A),
-untargeted tensors byte-identical. Covers full / attn-only / mlp-only, per-module
-alpha+rank, bf16, and forced multi-shard.
-"""
+"""Dense LoRA merge to 16bit: adapted == base + scale*(B@A); untargeted tensors stay byte-identical."""
 
 from __future__ import annotations
 
@@ -53,8 +48,7 @@ def test_dense_merge_bf16(family, tmp_path):
 
 
 def test_dense_per_module_alpha_rank_pattern(tmp_path):
-    """Per-module alpha/rank: the merge must read scale per module, not a single
-    global lora_alpha/r."""
+    """The merge must read alpha and rank per module, not one global lora_alpha/r."""
     _skip_if_missing("llama")
     H.run_case(
         "llama", "full", str(tmp_path),
@@ -64,7 +58,6 @@ def test_dense_per_module_alpha_rank_pattern(tmp_path):
 
 
 def test_dense_forced_multishard(tmp_path):
-    """Tiny max_shard_size forces multiple shards + index, catching stale-shard /
-    index-mismatch bugs."""
+    """Tiny max_shard_size forces multiple shards and an index; catches stale-shard and index mismatch."""
     _skip_if_missing("llama")
     H.run_case("llama", "full", str(tmp_path), max_shard_size="40KB")

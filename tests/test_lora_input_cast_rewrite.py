@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Source-level tests for the LoRA input cast rewrite in compiler.py (#4127).
-
-Deleting PEFT's cast outright under UNSLOTH_FORCE_FLOAT32 is safe for vanilla LoRA, which
-is rewritten into the self-casting `lora_forward`, but handed variants (DoRA, QALoRA,
-aLoRA) an uncast `x` and killed DoRA with "c10::Half != float".
-"""
+"""Source-level tests for the LoRA input cast rewrite in compiler.py (4127): dropping PEFT's cast under
+UNSLOTH_FORCE_FLOAT32 is safe only for vanilla LoRA, which is rewritten into the self-casting `lora_forward`; DoRA,
+QALoRA and aLoRA get an uncast x, and DoRA failed with 'c10::Half != float'."""
 
 from __future__ import annotations
 
@@ -77,8 +74,7 @@ LAYER_LINEAR = """\
         return result
 """
 
-# peft/tuners/lora/bnb.py, class Linear4bit: the cast is the LAST statement of an
-# `if requires_conversion:` block, so removing the line would leave it empty.
+# peft/tuners/lora/bnb.py, class Linear4bit: the cast is the last statement of an `if requires_conversion:` block, so removing it would empty the block.
 BNB_LINEAR4BIT = """\
     def forward(self, x, *args, **kwargs):
         self._check_forward_args(x, *args, **kwargs)
@@ -152,8 +148,7 @@ def _assigns_x(node: ast.Assign) -> bool:
 
 
 def _cast_assignments_in_adapter_loop(source: str) -> list[str]:
-    """Casts of `x` to the LoRA dtype inside a `for active_adapter` loop. Outside one,
-    the guard compiles and then raises NameError at the first forward."""
+    """Matches casts of `x` to the LoRA dtype inside a `for active_adapter` loop; outside one, the guard compiles and then raises NameError at the first forward."""
     tree = ast.parse(source)
     found: list[str] = []
 

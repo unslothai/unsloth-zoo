@@ -14,16 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A100-class 128-wide chunk_o backward tiles (fla PR #1514).
-
-chunk_bwd_dv, chunk_bwd_dv_local and chunk_bwd_dqkwg pick their K/V tile from the
-device's shared-memory tier. A100 (164 KB) used to fall into the Ada tier (64); with
-16-bit inputs 128-wide tiles fit, and chunk_bwd_kernel_dqkwg runs ~19% faster there.
-fp32 inputs need more shared memory than an A100 has, so they must keep 64, and no
-other tier may change. ``check_shared_mem`` is read at call time, so the tier is
-simulated on any CUDA host and the Triton kernels are swapped for recorders: only the
-block-size arithmetic under test runs.
-"""
+"""A100-class 128-wide chunk_o backward tiles for 16-bit inputs (fla PR 1514); fp32 stays at 64 and other tiers are
+unchanged; tiers are simulated with Triton kernels swapped for recorders."""
 
 import os
 
@@ -144,8 +136,7 @@ def test_a100_fp32_keeps_64_wide_tiles(monkeypatch):
 
 @pytest.mark.skipif(not _cuda_available(), reason="needs CUDA")
 def test_a100_fp32_states_keep_dqkwg_at_64(monkeypatch):
-    """simple GLA keeps fp32 h / dh in its backward: dqkwg loads them, so it stays at 64,
-    while the two dv kernels (which do not load h) take 128."""
+    """Simple GLA keeps fp32 h and dh in backward: dqkwg loads them and stays at 64, while the two dv kernels (which do not load h) take 128."""
     import torch
 
     chunk_o = _load_vendored_fla()
@@ -169,8 +160,7 @@ def test_other_tiers_unchanged(tier, expected, dtype_name, monkeypatch):
 
 @pytest.mark.skipif(not _cuda_available(), reason="needs CUDA")
 def test_gdn_fwd_bwd_matches_fp32_recurrence_with_128_tiles(monkeypatch):
-    """End to end through the real kernels with the A100 tier forced: the GDN backward
-    must stay within bf16 rounding of an fp32 naive recurrence."""
+    """End to end through the real kernels with the A100 tier forced; the GDN backward must match an fp32 naive recurrence within bf16 rounding."""
     import torch
     import torch.nn.functional as F
 

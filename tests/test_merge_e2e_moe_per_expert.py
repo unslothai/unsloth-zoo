@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""End-to-end LoRA merge correctness for per-expert MoE models.
-
-Qwen3-MoE / GLM4-MoE / GraniteMoE store experts as separate 2D Linears, so each
-expert projection merges like a dense layer. Cases: full (expert + attention) and
-attn_only (no expert LoRA -> every expert/shared/router tensor stays byte-identical).
-"""
+"""Per-expert MoE: experts are 2D Linears merged like dense; attn_only keeps them byte-identical."""
 
 from __future__ import annotations
 
@@ -39,14 +34,12 @@ def _skip_if_missing(family):
 
 @pytest.mark.parametrize("family", PER_EXPERT)
 def test_moe_per_expert_full(family, tmp_path):
-    """Experts + attention adapted: every adapted expert projection matches the
-    reference; nothing else changes."""
+    """Every adapted expert projection matches the reference; nothing else changes."""
     _skip_if_missing(family)
     try:
         n_adapted, _ = H.run_case(family, "full", str(tmp_path))
     except H.KeyResolutionError as e:
-        # expert key layout differs across transformers versions (fused-3D vs
-        # per-expert); that path is covered by the fused suite + real-model sweep.
+        # Expert key layout differs by transformers version (fused-3D vs per-expert); fused suite covers it.
         pytest.skip(f"{family}: expert key layout differs on this transformers "
                     f"version ({e}); covered by the fused suite / real-model sweep")
     # attention + expert projections
@@ -55,8 +48,7 @@ def test_moe_per_expert_full(family, tmp_path):
 
 @pytest.mark.parametrize("family", PER_EXPERT)
 def test_moe_per_expert_attention_only_keeps_experts_byte_identical(family, tmp_path):
-    """No expert LoRA -> all expert/router/shared-expert tensors byte-identical
-    (assert_merge_correct enforces byte-identity for every non-adapted tensor)."""
+    """No expert LoRA: expert, router and shared-expert tensors stay byte-identical."""
     _skip_if_missing(family)
     n_adapted, n_pass = H.run_case(family, "attn_only", str(tmp_path))
     assert n_adapted >= 1 and n_pass >= 1

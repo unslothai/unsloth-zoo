@@ -146,8 +146,7 @@ def test_remote_composite_export_is_the_composite_with_its_code(tmp_path):
 
 
 def test_checkpoint_model_type_survives_a_different_config_class_type(tmp_path):
-    # DeepSeek-OCR: config.json says `deepseek_vl_v2`, `DeepseekOCRConfig.model_type` is
-    # `DeepseekOCR`; vLLM only loads the former (#3911).
+    # config.json says deepseek_vl_v2, not the DeepseekOCR model_type; vLLM reads only that (issue 3911).
     import transformers as T
     H.set_offline_cpu_env()
     os.environ["HF_MODULES_CACHE"] = os.path.join(str(tmp_path), "modules")

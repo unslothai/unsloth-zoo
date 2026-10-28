@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Value guards for the routed NF4 gpt-oss declines: a decline test only proves the routed
-path returned None, so these check the decode entry (torch_native_forward, which tries the
-routed kernels first) against an fp64 reference that applies everything PEFT applies."""
+"""Value guards for routed NF4 gpt-oss declines: checks torch_native_forward (decode entry, tries routed kernels first)
+against an fp64 reference applying all PEFT math."""
 import os
 
 import pytest

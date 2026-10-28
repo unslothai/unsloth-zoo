@@ -844,8 +844,7 @@ def test_vlm_processor_inputs_retry_only_exact_pytorch_output_error():
     converted = _call_vlm_processor(
         pytorch_only, (), {"return_tensors": "mlx"}
     )
-    # why: a sibling module can swap the util's `mx` for the simulation stub,
-    # whose `array` is a factory rather than a type.
+    # A sibling module can swap the util's mx for a simulation stub whose array is a factory, not a type.
     from unsloth_zoo.mlx import utils as mlx_utils
 
     if "mlx_simulation" not in str(getattr(mlx_utils.mx, "__file__", "")):
@@ -1290,14 +1289,8 @@ def test_other_loads_keep_every_parameter_trainable(flags):
 
 @pytest.mark.parametrize("model_type", ["lfm2-vl", "lille-130m", "nemotron-nas"])
 def test_a_hyphenated_model_type_keeps_its_hyphens(model_type):
-    """mlx_lm names these modules after the raw config spelling.
-
-    Asserted on the resolved module name, which is what this change decides.
-    Reaching the class as well needs mlx_lm to import, and it does not everywhere:
-    `mlx_lm/utils.py` imports `resource`, a Unix-only stdlib module, so on Windows
-    -- where mlx now does ship a wheel -- every one of these resolves to None for
-    a reason that has nothing to do with hyphens.
-    """
+    """mlx_lm names these modules after the raw config spelling; only the module name is asserted, since the class
+    lookup is None on Windows (mlx_lm/utils.py imports Unix-only resource)."""
     from unsloth_zoo.mlx import loader
 
     assert loader._mlx_lm_module_name(model_type) == model_type
@@ -1310,8 +1303,7 @@ def test_a_hyphenated_model_type_keeps_its_hyphens(model_type):
 
 
 def test_vlm_generate_prefers_the_processor_over_the_published_tokenizer():
-    """A text-only multimodal load stays on the vision path but publishes its
-    inner tokenizer, which cannot drive mlx-vlm preprocessing."""
+    """A text-only multimodal load stays on the vision path but publishes its inner tokenizer, which cannot drive mlx-vlm preprocessing."""
     from types import SimpleNamespace
 
     from unsloth_zoo.mlx import loader
@@ -1409,8 +1401,7 @@ def test_mlx_lm_keeps_a_wrapper_only_while_its_model_args_take_the_config(monkey
 
 
 def test_mlx_lm_serves_images_by_its_own_processor_rule(monkeypatch):
-    """Muse Spark: mlx_lm.processors registers a processor per model module, keyed by
-    `processor_type` when the config names one, and only for a populated vision_config."""
+    """Muse Spark: mlx_lm.processors registers a processor per model module, keyed by processor_type if the config names one, and only for a populated vision_config."""
     import sys
     import types
     from unsloth_zoo.mlx import loader
@@ -1935,12 +1926,9 @@ def test_vlm_prefetch_identity_laziness_and_masked_rejection():
 
 
 def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
-    """Lazy processor-owned MLX graphs must cross the prefetch boundary.
-
-    Regression: without the producer-side materialization barrier, consumer
-    evaluation raises "There is no Stream ... in current thread". Label decisions
-    for both opaque routes must run on the consumer thread only.
-    """
+    """Lazy processor-owned MLX graphs must cross the prefetch boundary: without the producer-side materialization
+    barrier, consumer evaluation raises 'There is no Stream ... in current thread'; label decisions for both opaque
+    routes run on the consumer thread only."""
     import threading
 
     import mlx.core as mx
@@ -2023,8 +2011,7 @@ def test_gemma3n_token_type_ownership_survives_module_relocation():
             return {}
         return type(name, (object,), {"__module__": module, "__call__": __call__})()
 
-    # Remote-code and single-file loads expose the marker only as a suffix of
-    # the module name, never as a standalone path component.
+    # Remote-code and single-file modules carry the marker only as a name suffix, not a path component.
     for module in (
         "transformers.models.gemma3n.processing_gemma3n",
         "google.gemma-3n-E4B-it.a1b2c3.processing_gemma3n",
@@ -2066,8 +2053,7 @@ def _run_loss(model_type, kv_shared=0):
         def get_input_embeddings(self, input_ids=None, pixel_values=None, mask=None):
             return None
 
-        # Keyword-only and required, as thirteen families declare it: omitting
-        # it is a TypeError, so every case below also proves it is always sent.
+        # Keyword-only required mask in thirteen families; omitting it is a TypeError, so each case sends it.
         def __call__(self, inputs, pixel_values=None, *, mask, cache=None, **kw):
             seen["mask"], seen["cache"] = mask, cache
             return SimpleNamespace(
@@ -2098,8 +2084,7 @@ _MASK_KEEPING_FAMILIES = (
 ])
 def test_baseline_loss_fn_sends_the_padding_mask_only_where_it_is_read(
         model_type, keeps):
-    # Elsewhere it reaches the layers verbatim and replaces causality, letting
-    # every supervised position read the token it is scored on.
+    # Elsewhere a forwarded padding mask would replace causality and let positions read their own target.
     seen, batch = _run_loss(model_type)
     assert seen["mask"] is (batch["attention_mask"] if keeps else None)
 
@@ -2107,8 +2092,7 @@ def test_baseline_loss_fn_sends_the_padding_mask_only_where_it_is_read(
 def test_mask_keeping_allowlist_is_exactly_these_families_and_all_their_aliases():
     from unsloth_zoo.mlx.utils import _VLM_FAMILIES_KEEPING_FORWARDED_MASK as listed
     assert set(listed) == set(_MASK_KEEPING_FAMILIES)
-    # A config keeps its model_type through mlx-vlm's remap, so an alias onto a
-    # listed module has to be listed under its own spelling too.
+    # Config model_type survives mlx-vlm's remap, so an alias onto a listed module must be listed too.
     remap = pytest.importorskip("mlx_vlm.utils").MODEL_REMAPPING
     assert not {a for a, t in remap.items() if t in listed and a not in listed}
 
@@ -2118,11 +2102,8 @@ class _NoPadIdTokenizer(_FakeTokenizer):
 
 
 class _LayoutProcessor(_FakeProcessor):
-    """Emits one fixed layout, honouring `padding_side` only when told to.
-
-    Instruct checkpoints ship `padding_side: left`; deepseek_vl_v2 and the
-    falcon pair left-pad multimodal rows whichever side they are asked for.
-    """
+    """Emits one fixed layout, honouring padding_side only when asked; Instruct checkpoints ship padding_side: left, and
+    deepseek_vl_v2 and the falcon pair always left-pad multimodal rows."""
 
     def __init__(self, rows, masks, honours_side=False, tokenizer=None, **extras):
         self.rows, self.masks, self.extras = rows, masks, extras
@@ -2151,8 +2132,7 @@ _MARKS = np.array([[0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.int32)
 
 @pytest.mark.parametrize("honours_side", [True, False])
 def test_collation_delivers_content_then_padding(honours_side):
-    # Causality is all that excludes the pads once the mask is withheld, and it
-    # excludes a trailing pad, not a leading one.
+    # With the mask withheld, causality alone excludes trailing pads, not leading ones.
     batch = _finalized_collate(
         [{"text": "a"}] * 2, _LayoutProcessor(*_RAGGED, honours_side=honours_side),
         8, None)
@@ -2177,9 +2157,7 @@ def test_collation_moves_token_aligned_sidecars_with_their_tokens(key):
 
 @pytest.mark.parametrize("key", ["image_grid_hw", "some_unlisted_field"])
 def test_collation_leaves_an_unlisted_field_alone(key):
-    # Three images of two columns, in a batch of three rows two tokens wide:
-    # per-image metadata shaped exactly like a per-token array. Recognising
-    # sidecars by shape would compact row 1's to [5, 0], losing its height.
+    # Match sidecars by name: per-image grids can share a per-token shape and must not be compacted.
     grid = np.array([[2, 3], [4, 5], [6, 7]], dtype=np.int32)
     batch = _finalized_collate(
         [{"text": "a"}] * 3,
@@ -2194,9 +2172,7 @@ def test_collation_leaves_an_unlisted_field_alone(key):
 
 @pytest.mark.parametrize("key", ["position_ids", "rope_deltas"])
 def test_collation_refuses_a_processor_authored_layout_coordinate(key, monkeypatch):
-    # Sidecars label tokens and travel with them; these are coordinates of the
-    # layout the repair replaces. `rope_deltas` is injected into the pipeline's
-    # own collection, so naming "position_ids" inline would fail this.
+    # Layout coordinates such as rope_deltas are refused; the pipeline injects it into its own set.
     from unsloth_zoo.mlx import utils
 
     monkeypatch.setattr(utils, "_VLM_WIDTH_GENERATED_KEYS",
@@ -2209,8 +2185,7 @@ def test_collation_refuses_a_processor_authored_layout_coordinate(key, monkeypat
 
 @pytest.mark.parametrize("honours_side", [True, False])
 def test_collation_does_not_require_a_pad_id(honours_side):
-    # falcon_ocr and falcon_perception ship no pad id and pad with 0, so
-    # demanding one would refuse batches they collate fine, repair or not.
+    # falcon_ocr and falcon_perception ship no pad id and pad with 0, so a pad id must not be required.
     batch = _finalized_collate(
         [{"text": "a"}] * 2,
         _LayoutProcessor(*_RAGGED, honours_side=honours_side,
@@ -2223,9 +2198,7 @@ def test_collation_does_not_require_a_pad_id(honours_side):
 
 
 def test_baseline_loss_fn_forwards_real_shared_kv_slots():
-    # Slots, not placeholders, and one per producer: a list of Nones forwards
-    # the same shape while every shared layer rebuilds K/V from its own
-    # projections, and one slot repeated leaves them all reading the last.
+    # Shared layers need one real slot per producer; Nones rebuild K/V; a repeated slot reads the last.
     from unsloth_zoo.mlx.utils import _SharedKVSlot
 
     seen, _batch = _run_loss("gemma4", kv_shared=20)
@@ -2241,12 +2214,8 @@ def test_baseline_loss_fn_forwards_real_shared_kv_slots():
 
 
 def test_a_natively_shared_backbone_gets_no_legacy_slots():
-    """mlx-vlm 0.5.0+ threads shared K/V itself, so `_fix_gemma4_kv_sharing`
-    leaves those backbones alone and they keep the ordinary per-layer cache
-    contract. The legacy slot list is shorter than the layer count by
-    construction -- `first_kv_shared_layer_idx` is
-    `num_hidden_layers - num_kv_shared_layers` -- so forwarding it as `cache`
-    truncates the zip over layers and silently drops the shared tail."""
+    """mlx-vlm 0.5.0+ shares K/V itself so _fix_gemma4_kv_sharing skips it; the legacy slot list is short by
+    num_kv_shared_layers, so passing it as cache truncates the layer zip and drops the shared tail."""
     from types import SimpleNamespace
 
     from unsloth_zoo.mlx.utils import _build_shared_kv_caches
@@ -2281,8 +2250,7 @@ def _scale_probe(model_type, hidden_size=16):
     from unsloth_zoo.mlx import utils
 
     mx_ = _utils_mx()
-    # Every position shares one token id, so an id-based mask cannot tell the
-    # feature-carrying position from the plain ones -- only a difference can.
+    # All positions share one token id, so only a difference can flag the merged position.
     ids = mx_.array([[7, 7, 7]], dtype=mx_.int32)
     raw = mx_.ones((1, 3, hidden_size), dtype=mx_.float32)
 
@@ -2300,8 +2268,7 @@ def _scale_probe(model_type, hidden_size=16):
 
 @pytest.mark.parametrize("model_type,scaled", [
     ("gemma3n_text", True),
-    # gemma3_text is compensated for in `_run_hidden_stack`, the route it takes,
-    # so scaling it here would apply the factor twice.
+    # gemma3_text is compensated in _run_hidden_stack; scaling it here would apply the factor twice.
     ("qwen2_vl", False), ("gemma3_text", False), ("gemma4_text", False),
 ])
 def test_embed_scale_lifts_only_gemma3n_plain_tokens(model_type, scaled):
@@ -2313,20 +2280,8 @@ def test_embed_scale_lifts_only_gemma3n_plain_tokens(model_type, scaled):
 
 
 def _baseline_scale_model(model_type, hidden_size=16):
-    """A VLM whose merge leaves the ids-path scale off, as mlx-vlm's does.
-
-    `Model.__call__` sends ids through `get_input_embeddings`, which embeds
-    without the sqrt(hidden_size) factor the language stack applies on the ids
-    path; the stack then takes the `inputs_embeds` branch and never applies it.
-    Recording what the language model receives is the only way to see which
-    route the loss backend took.
-
-    The outer `__call__` here is mlx-vlm 0.4.4's -- the floor this package
-    declares -- which re-embeds from ids and discards a supplied
-    `inputs_embeds`. 0.5.0 onwards forwards it straight to the language model
-    instead. Modelling the older one is what makes the rescale observable:
-    routed through this outer call the factor is silently dropped.
-    """
+    """Models mlx-vlm 0.4.4, the floor this package declares: its __call__ re-embeds ids and drops supplied
+    inputs_embeds, losing the sqrt(hidden_size) scale the ids path applies; 0.5.0+ forwards them."""
     from types import SimpleNamespace
 
     mx_ = _utils_mx()
@@ -2358,9 +2313,7 @@ def _baseline_scale_model(model_type, hidden_size=16):
 
         def __call__(self, inputs, pixel_values=None, **kwargs):
             seen["outer"] = kwargs
-            # 0.4.4: whatever it was handed, it embeds again from the ids.
-            # Embedded here rather than via `get_input_embeddings` so `merged`
-            # stays a marker of the loss backend's own merge.
+            # mlx-vlm 0.4.4 re-embeds from ids whatever it is handed; embed here so merged marks the loss merge.
             return self.language_model(
                 inputs, inputs_embeds=_Backbone().embed_tokens(inputs),
             )
@@ -2374,10 +2327,9 @@ def _baseline_scale_model(model_type, hidden_size=16):
 ])
 def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
         model_type, rescaled):
-    """use_cce={True,False} have to agree. `_vlm_cce_forward` merges and
-    rescales itself; handing the model ids on the baseline path skipped the
-    factor, training text embeddings ~sqrt(hidden_size) times too small beside
-    merged audio or image features."""
+    """use_cce={True,False} must agree: _vlm_cce_forward merges and rescales itself, but ids on the baseline path
+    skipped the factor, leaving text embeddings ~sqrt(hidden_size) times too small beside merged audio or image
+    features."""
     from unsloth_zoo.mlx.utils import make_vlm_baseline_loss_fn
 
     mx_ = _utils_mx()
@@ -2391,8 +2343,7 @@ def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
     })
 
     if not rescaled:
-        # Every other family keeps the untouched ids path: the outer model is
-        # entered, and it is the one that embeds.
+        # Other families keep the untouched ids path; the outer model is entered and does the embedding.
         assert "outer" in seen and "merged" not in seen
         assert seen["forwarded"] is not None
         assert np.asarray(seen["forwarded"])[0][0][0] == pytest.approx(1.0)
@@ -2401,9 +2352,7 @@ def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
     assert seen.get("merged"), "the loss backend never merged"
     embeds = seen.get("forwarded")
     assert embeds is not None, "the language model still received bare ids"
-    # The scale has to survive all the way to the language model. Routed
-    # through `Model.__call__` on mlx-vlm 0.4.4 it does not: that call embeds
-    # again from the ids and the factor arrives as a plain 1.0.
+    # mlx-vlm 0.4.4 Model.__call__ drops rescaled embeddings, re-embeds from ids; factor arrives as 1.0.
     assert np.asarray(embeds)[0][0][0] == pytest.approx(scale)
     assert "outer" not in seen, (
         "the rescaled embeddings went through Model.__call__, which drops them "
@@ -2453,8 +2402,7 @@ def test_cce_forwards_mm_token_types_where_the_model_does(model_type, forwarded)
 
 
 def test_paligemma_mask_is_bidirectional_on_the_prefix_and_causal_on_the_suffix():
-    """PaliGemma's own mask is an outer product of the padding mask, so with
-    nothing padded the suffix being trained on reads the tokens after it."""
+    """PaliGemma's own mask is an outer product of the padding mask, so with nothing padded the trained suffix reads the tokens after it (not causal)."""
     from unsloth_zoo.mlx.loader import (
         _VLM_MODEL_FIXUPS, _fix_paligemma_multimodal_causal_mask,
         _paligemma_prefix_lm_mask,
@@ -2478,8 +2426,7 @@ def test_paligemma_mask_is_bidirectional_on_the_prefix_and_causal_on_the_suffix(
     both_real = real[q_idx] & real[kv_idx]
     both_prefix = prefix[q_idx] & prefix[kv_idx]
     ahead = q_idx < kv_idx
-    # The suffix is causal: outside the prefix nothing reads ahead. Left as an
-    # outer product every one of these is visible.
+    # The suffix must stay causal: an outer-product mask would make every future position visible.
     assert not m[ahead & ~both_prefix & both_real].any()
     # The prefix stays bidirectional, which is what PaliGemma is trained for.
     assert m[both_prefix].all()
@@ -2490,8 +2437,7 @@ def test_paligemma_mask_is_bidirectional_on_the_prefix_and_causal_on_the_suffix(
 
 
 def test_paligemma_mask_is_left_alone_without_token_types():
-    """`Model.__call__` forwards no extra kwargs, so on the plain loss path the
-    token types never arrive and there is no prefix boundary to derive."""
+    """Model.__call__ forwards no extra kwargs, so on the plain loss path token types never arrive and there is no prefix boundary to derive."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.loader import (
         _paligemma_causal_mask_wrapper, _paligemma_replace_mask,
@@ -2520,8 +2466,7 @@ def test_paligemma_mask_is_left_alone_without_token_types():
 
 @pytest.mark.parametrize("has_native_mask", [False, True])
 def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped(has_native_mask):
-    """The wrapper is what actually reaches a loaded model, so it has to hand the
-    token types on rather than return upstream's mask untouched."""
+    """The wrapper is what reaches a loaded model, so it must pass the token types on rather than return upstream's mask untouched."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.loader import _paligemma_causal_mask_wrapper
 
@@ -2545,8 +2490,7 @@ def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped(has_native_mask
 
 @pytest.mark.parametrize("has_native_mask", [False, True])
 def test_paligemma_plain_loss_path_also_gets_the_causal_suffix(has_native_mask):
-    """Upstream's call embeds with a fixed three arguments, dropping the token
-    types, so without threading them the `use_cce=False` path keeps leaking."""
+    """Upstream's call embeds with three fixed arguments and drops the token types, so without threading them the use_cce=False path keeps leaking."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.loader import (
         _paligemma_call_wrapper, _paligemma_causal_mask_wrapper,
@@ -2581,8 +2525,7 @@ def test_paligemma_plain_loss_path_also_gets_the_causal_suffix(has_native_mask):
 
 
 class _FakePaligemma:
-    """Upstream's shape: `__call__` embeds with a fixed three arguments, so the
-    token types it was given never reach the embedder on their own."""
+    """Upstream's __call__ embeds with three fixed arguments, so token types it is given never reach the embedder on their own."""
 
     outer_product = None          # set per test, so identity can be compared
     seen = None
@@ -2602,8 +2545,7 @@ class _FakePaligemma:
 
 
 def test_paligemma_install_puts_both_wrappers_on_the_class():
-    """Removing either assignment leaves the matching production loss path
-    unfixed, so the install itself has to be checked, not just the wrappers."""
+    """Removing either assignment leaves its production loss path unfixed, so the install itself must be checked, not just the wrappers."""
     from unsloth_zoo.mlx.loader import _install_paligemma_causal_mask
 
     mx_ = _utils_mx()
@@ -2627,8 +2569,7 @@ def test_paligemma_install_puts_both_wrappers_on_the_class():
 
 
 def test_paligemma_token_types_do_not_cross_between_concurrent_callers():
-    """One model can serve several callers at once; an attribute on the model
-    would let one read another's batch."""
+    """One model can serve several concurrent callers, so token types must not live on the model, or one caller would read another's batch."""
     import threading
     from unsloth_zoo.mlx.loader import (
         _install_paligemma_causal_mask, _paligemma_pending_token_types,
@@ -2700,8 +2641,7 @@ def _broken_altup(mx_, hidden=4, inputs=3):
 
 
 def test_gemma3n_altup_correction_survives_a_batch_larger_than_one():
-    """Upstream transposes its coefficients as though the batch axis were last,
-    which only broadcasts when the batch is one."""
+    """Upstream transposes its coefficients as though the batch axis were last, which only broadcasts correctly when the batch is one."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.loader import (
         _VLM_MODEL_FIXUPS, _altup_correct_handles_batch, _fix_gemma3n_altup_batch,
@@ -2737,8 +2677,7 @@ def test_gemma3n_altup_correction_survives_a_batch_larger_than_one():
         assert np.allclose(both[:, row:row + 1], one, atol=1e-5), \
             f"row {row} differs when corrected in a batch"
 
-    # The formula stays upstream's. At a batch of one, where upstream is
-    # already right, the replacement has to reproduce it exactly.
+    # Formula stays upstream's; at batch one, where upstream is right, the replacement must reproduce it.
     one_act, one_pred = activated[:1], predictions[:, :1]
     assert np.allclose(np.asarray(altup.correct(one_pred, one_act)),
                        np.asarray(upstream_correct(altup, one_pred, one_act)),
@@ -2871,8 +2810,7 @@ def _audio_hiding_plan_kwargs(**extra):
 
 
 def test_batch_plan_gates_audio_a_formatter_hides_under_response_masking():
-    """With a response mask the plan filters rows first, formatting there and
-    collating with no formatter, so it needs the same gate."""
+    """With a response mask the plan filters rows first, formatting there and collating with no formatter, so it needs the same audio gate."""
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
     with pytest.raises((NotImplementedError, ValueError), match="audio"):
@@ -2882,8 +2820,7 @@ def test_batch_plan_gates_audio_a_formatter_hides_under_response_masking():
 
 
 def test_batch_plan_gates_audio_that_a_formatter_would_hide():
-    """The plan formats at construction and collates with no formatter, so the
-    collation gate never sees the audio the user actually supplied."""
+    """The plan formats at construction and collates with no formatter, so the collation gate never sees the audio the user supplied."""
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
     dataset = [
@@ -2902,8 +2839,7 @@ def test_batch_plan_gates_audio_that_a_formatter_would_hide():
         )
 
 
-# Channel-first stereo must average to the same mono waveform, never flatten
-# into a 20-sample concatenation of both channels.
+# Channel-first stereo averages to one mono waveform, never a concatenation of both channels.
 @pytest.mark.parametrize("clip", [_CLIP, _FakeAudioDecoder(_MONO),
                                   _FakeAudioDecoder(_STEREO)],
                          ids=["datasets3_mapping", "datasets4_decoder", "stereo"])
@@ -2913,8 +2849,7 @@ def test_audio_source_forms_reach_the_processor_as_mono(monkeypatch, clip):
     feats = np.asarray(_finalized_collate([row], _FakeGemmaAudioProcessor(),
                                           16, None)["input_features"])
     assert feats.shape == (1, 10) and np.allclose(feats[0], 0.5)
-    # A bare message list must reach extraction; a single dict rendering
-    # without a placeholder must be refused, not trained on.
+    # A bare message list must reach extraction; a dict rendering with no audio placeholder is refused.
     bare = _finalized_collate([row["messages"]], _FakeGemmaAudioProcessor(), 16, None)
     assert np.asarray(bare["input_features"]).shape[0] == 1
     with pytest.raises(ValueError, match="0 placeholder run"):
@@ -2953,11 +2888,9 @@ def test_unusable_audio_rows_are_rejected(monkeypatch, clip, message, max_len):
 
 
 def test_an_audio_free_row_over_the_cap_still_collates(monkeypatch):
-    """The over_cap refusal above is for rows that carry audio. An omni
-    checkpoint resolves its soft token whether or not the run uses audio, so
-    without a clip-count guard the same cap refuses ordinary text and image
-    training -- and a rendered row wider than max_seq_length is normal, which
-    is why the shape planner plans for it rather than rejecting it."""
+    """over_cap refusal is for audio rows; an omni checkpoint resolves its soft token regardless, so without a
+    clip-count guard the cap would refuse text and image training too; rows wider than max_seq_length are planned
+    for, not rejected."""
     processor = _FakeGemmaAudioProcessor()
     _qualify(monkeypatch, processor=processor)
     row = {"messages": [
@@ -2978,23 +2911,20 @@ def test_fixed_budget_families_reject_shortened_runs(monkeypatch):
 
     processor = _Budgeted(truncates=True)
     _qualify(monkeypatch, processor=processor)
-    # Truncation leaves 2 of 3 placeholders: one run survives, so only the
-    # budget can tell the row was clipped.
+    # Truncation leaves 2 of 3 placeholders, one run survives, so only the budget reveals the clipping.
     with pytest.raises(ValueError, match="merges 3 per clip"):
         _finalized_collate([_audio_row(_CLIP)], processor, 4, None)
 
 
 def test_a_prompt_completion_combine_cannot_clip_a_fixed_budget_run(monkeypatch):
-    """The combine truncates after the halves are checked, so it is its own
-    chance to cut a run short. One run per clip still survives that, which is
-    why the budget has to reach the post-combine check too."""
+    """The combine truncates after the halves are checked, so it can cut a run short; one run per clip still survives,
+    so the budget must reach the post-combine check too."""
     class _Budgeted(_FakeGemmaAudioProcessor):
         audio_seq_length = 3
 
     processor = _Budgeted()
     _qualify(monkeypatch, processor=processor)
-    # The halves are checked untruncated and pass; the combine then cuts the
-    # run to 2 of 3, which still leaves one run for the count check to accept.
+    # Each half passes untruncated; the combined row is cut to 2 of 3, which the count check accepts.
     with pytest.raises(ValueError, match="merges 3 per clip"):
         _finalized_collate([_PC_AUDIO_ROW], processor, 4, None,
                            return_prompt_completion=True)
@@ -3003,11 +2933,7 @@ def test_a_prompt_completion_combine_cannot_clip_a_fixed_budget_run(monkeypatch)
 def test_processors_taking_audio_pairs_are_accommodated(monkeypatch):
     """Some processors want (samples, rate) pairs and reject add_special_tokens."""
     class _PairsOnly(_FakeGemmaAudioProcessor):
-        """Takes (samples, rate) pairs and no add_special_tokens, like phi4mm.
-
-        It also exposes no sampling rate of its own, so the only source for the
-        pair's rate is the one extraction verified on the clip.
-        """
+        """Takes (samples, rate) pairs, no add_special_tokens, like phi4mm; rate comes only from extraction."""
         feature_extractor = None
         seen = {}
 
@@ -3043,18 +2969,14 @@ def test_placeholders_without_features_are_rejected(monkeypatch):
                            formatting_func=lambda _: {"text": "<audio>hi"})
     message = str(caught.value)
     assert "returned no audio features" in message
-    # This processor is fine and never saw a clip, so the message has to reach
-    # that cause and introduce the checkpoint as an example. Prose cannot be
-    # checked for every way of blaming it; what is pinned is that the hedge
-    # still introduces the checkpoint clause.
+    # The processor is healthy and never saw a clip, so the message has to reach that cause; only the hedge introducing
+    # the checkpoint as an example is pinned, not every blame wording.
     assert "never received" in message
     assert "for instance the checkpoint" in message
 
 
 def test_a_checkpoint_that_drops_its_audio_is_named_as_the_cause(monkeypatch):
-    """An export whose preprocessor configuration omits its audio half accepts
-    the audio argument and skips the audio, so this is where the user learns
-    their checkpoint is the problem rather than their dataset."""
+    """An export whose preprocessor config omits its audio half accepts audio and skips it, so the refusal must name the checkpoint, not the dataset."""
     class _Drops(_FakeGemmaAudioProcessor):
         def __call__(self, text, audio=None, max_length=None, **kwargs):
             out = super().__call__(text, audio, max_length, **kwargs)
@@ -3072,8 +2994,7 @@ def test_a_checkpoint_that_drops_its_audio_is_named_as_the_cause(monkeypatch):
     assert "audio feature extractor" in message
     # Actionable, not just diagnostic.
     assert "train on the text and image parts" in message
-    # One message serves both callers, and the other one has a healthy
-    # processor, so the checkpoint stays introduced as an example.
+    # One message serves both callers; the other has a healthy processor, so the checkpoint stays introduced as an example.
     assert "for instance the checkpoint" in message
     assert "never received" in message
 
@@ -3120,9 +3041,8 @@ def test_prompt_completion_audio_rides_the_prompt_half(monkeypatch):
 
 
 def test_prompt_completion_refuses_audio_stated_as_spans(monkeypatch):
-    """A span is an absolute coordinate into the half it was measured on, and
-    the combine joins the halves before flushing and truncating the result.
-    Letting it through would place the clip's audio on whatever landed there."""
+    """A span is an absolute coordinate into the half it was measured on, yet the combine joins halves before flushing
+    and truncating, so stated spans would misplace audio."""
     class _Spans(_FakeGemmaAudioProcessor):
         def __call__(self, text, audio=None, max_length=None, **kwargs):
             out = super().__call__(text, audio, max_length, **kwargs)
@@ -3152,9 +3072,7 @@ def test_prompt_completion_refuses_audio_stated_as_spans(monkeypatch):
 
 
 def test_the_deferred_combine_carries_the_fixed_budget_too(monkeypatch):
-    """MLX-valued halves defer the combine to the consumer thread, so the
-    budget has to survive the carrier as well -- a run the combine cuts short
-    still leaves one run per clip, and the count check alone accepts it."""
+    """MLX-valued halves defer the combine to the consumer thread, so the fixed budget must survive the carrier too; the count check alone would accept a cut run."""
     import mlx.core as current_mx
     if current_mx is not mx:
         pytest.skip("requires real MLX runtime without mlx_simulation monkeypatch")
@@ -3195,9 +3113,8 @@ def test_deferred_prompt_completion_staging_rechecks_audio_runs(monkeypatch):
     staged, _ = _collate_vlm_batch([_PC_AUDIO_ROW], processor, 2, None,
                                    reject_mlx_valued=True,
                                    return_prompt_completion=True)
-    # MLX-valued halves defer the combine, so the counts must ride pc_audio for
-    # the post-combine check to be possible on the consumer thread. This family
-    # has no fixed budget, hence the third slot is empty.
+    # MLX-valued halves defer the combine, so the counts must ride pc_audio for the post-combine check on the consumer
+    # thread; this family has no fixed budget, so the third slot is empty.
     assert staged.pc_opaque is not None
     assert staged.pc_audio == ([1], [300], None)
     # Truncation drops the run; the deferred check must catch it.
@@ -3212,12 +3129,10 @@ def test_audio_merge_compacts_valid_features_per_row():
 
     embeds = mx_.array([[[1.0], [2.0], [9.0]], [[3.0], [4.0], [5.0]]])
     padded = mx_.array([[False, False, True], [False, False, False]])
-    # Row 0 keeps 2 of 3 positions, row 1 keeps 3: the compacted source is the
-    # valid ones in row order, so the merge's running count lines up again.
+    # Row 0 keeps 2 of 3 positions and row 1 keeps 3; compaction takes the valid positions in row order so the merge's running count lines up.
     out = _compact_audio_features(embeds, padded, [2, 3])
     assert out.flatten().tolist() == [1.0, 2.0, 3.0, 4.0, 5.0]
-    # Each row must come out exact: [2, 3] clips against [3, 2] rows sums to
-    # five either way while everything after the first position is mispaired.
+    # Each row must pair exactly: clip counts [2, 3] against rows [3, 2] sum to five either way, yet everything after the first position is mispaired.
     with pytest.raises(ValueError, match="cannot be paired for this row"):
         _compact_audio_features(embeds, padded, [3, 2])
     with pytest.raises(ValueError, match="cannot be paired for this row"):
@@ -3225,12 +3140,8 @@ def test_audio_merge_compacts_valid_features_per_row():
 
 
 def test_qualified_families_carry_their_probed_requirements():
-    """The table itself: which families, over which mlx-vlm releases.
-
-    Gemma 4 starts higher than the rest because below 0.6.2 mlx-vlm cannot load
-    the checkpoint at all: E2B's KV-shared layers ship no k_proj/v_proj/k_norm,
-    and mlx-vlm built those modules regardless until Blaizzy/mlx-vlm#1301.
-    """
+    """Gemma 4 floor is 0.6.2: below it mlx-vlm cannot load E2B, whose KV-shared layers ship no k_proj/v_proj/k_norm;
+    mlx-vlm built those regardless until Blaizzy/mlx-vlm 1301."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     versions = mlx_utils._AudioVersions
@@ -3308,10 +3219,7 @@ def test_the_gate_admits_final_releases_at_or_above_its_floor(installed, admitte
 ])
 def test_the_gate_itself_honours_the_floor_not_just_the_version_object(
         monkeypatch, installed, allowed):
-    """Drives `_check_audio_family_gate`, not `_AudioVersions.admits`.
-
-    Whether an audio row trains or is refused is decided here.
-    """
+    """Drives _check_audio_family_gate, not _AudioVersions.admits, because whether an audio row trains or is refused is decided in the gate."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     monkeypatch.setattr(mlx_utils, "_AUDIO_MIN_TRANSFORMERS", {})
@@ -3328,14 +3236,8 @@ def test_the_gate_itself_honours_the_floor_not_just_the_version_object(
 
 
 def test_only_a_published_final_release_is_at_or_above_the_floor():
-    """The qualification covers published final releases and nothing else.
-
-    A post-release is conventionally the same code repackaged, but nothing
-    enforces that, and a local build carries whatever its builder put there.
-    mlx-vlm has published no prerelease, post-release or local build across 73
-    releases, so admitting them would widen a fail-closed gate for a case that
-    has never happened.
-    """
+    """Only final releases qualify: post-releases and local builds are not enforced to match the code, and mlx-vlm has
+    published no prerelease, post-release or local build across 73 releases."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     gemma4 = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
@@ -3390,16 +3292,8 @@ def test_diffusion_gemma_uses_the_generic_unsupported_family_refusal():
 
 def test_the_transformers_floor_refuses_a_prerelease_for_the_right_reason(
         monkeypatch):
-    """`int(x) for x in version.split(".")` raised on any version that is not
-    plain digits, and the catch-all handler reported that as a version it could
-    not determine. So `5.5rc1` was refused with a reason naming the wrong
-    problem, and `v5.5.0` -- a real 5.5 -- was refused outright.
-
-    A prerelease is still refused, because PEP 440 sorts it below the release
-    and the floor exists precisely because older transformers expand audio
-    tokens differently. What changes is that it is refused as the older version
-    it is, rather than as an unreadable one.
-    """
+    """Parsing with int() per version part rejected 5.5rc1 and v5.5.0 as unreadable; prereleases stay refused as the
+    older version they sort to, since older transformers expand audio tokens differently."""
     import sys
     import types
 
@@ -3429,18 +3323,9 @@ def test_the_transformers_floor_refuses_a_prerelease_for_the_right_reason(
 
 
 class _Gemma4Extractor:
-    """Gemma 4's mel framing and masking, in the two shapes mlx-vlm has shipped.
-
-    Both releases pad waveforms to the longest in the batch and on to a multiple
-    of 128 samples before framing. 0.5.0 added the reference's semicausal
-    left-pad and its mask rule -- a frame is valid only when its whole analysis
-    window is real audio -- where 0.4.4 subsamples a sample-level mask, which
-    keeps frames a padded batch filled with silence.
-
-    Frame counts and mask sums match the shipped extractors at every length
-    asserted below. Mel values, dithering, normalisation and the 480,000-sample
-    truncation are not reproduced; nothing here depends on them.
-    """
+    """Gemma 4 framing for mlx-vlm 0.4.4 and 0.5.0, both padding to a multiple of 128 samples; 0.5.0 adds semicausal
+    left-pad and marks a frame valid only if its whole window is real audio. Frame counts and mask sums match; mel
+    values are not modelled."""
     sampling_rate = 16000
     frame_length, hop_length, pad_multiple = 320, 160, 128
 
@@ -3495,11 +3380,7 @@ class Gemma4Processor:  # named as mlx-vlm's, so the family resolves to gemma4
 
 
 class _ForwardsTheHook(Gemma4Processor):
-    """Keeps its own attributes, but writes that one hook through to another.
-
-    The narrowest sharing there is: a probe watching any other attribute name
-    sees an independent copy.
-    """
+    """Keeps its own attributes but forwards writes to _compute_audio_num_tokens to the origin; any other attribute name stays an independent copy."""
     def __setattr__(self, name, value):
         origin = self.__dict__.get("_origin")
         if origin is not None and name == "_compute_audio_num_tokens":
@@ -3519,14 +3400,11 @@ class _ForwardsTheHook(Gemma4Processor):
 
 
 @pytest.mark.parametrize("samples,reference,floor_044,mask_blind", [
-    # 5.855 s: ceil(duration / 40 ms) says 147 and the reference agrees, but
-    # 0.4.4's extractor emits one frame fewer -- copying the reference formula
-    # would keep predicting a frame that extractor never produces.
+    # At 5.855 s, ceil(duration / 40 ms) gives 147 like the reference, but 0.4.4 emits 146, so copying the formula predicts a frame never produced.
     (93680, 147, 146, 147),
     # 2.245 s: both extractors emit 56; only the duration rule is over, at 57.
     (35920, 56, 56, 56),
-    # Short enough that the reference's trailing frames are all padding, so a
-    # count taken from the frame total instead of the mask says two.
+    # The reference's trailing frames are all padding at this length, so counting frames instead of the mask gives two, not one.
     (769, 1, 1, 2),
 ])
 def test_gemma4_audio_placeholders_track_the_installed_extractor(
@@ -3541,13 +3419,11 @@ def test_gemma4_audio_placeholders_track_the_installed_extractor(
         counts.append(processor._compute_audio_num_tokens(clip, 16000))
     assert counts == [reference, floor_044]
 
-    # What a count that ignored the mask would produce, so the cases above that
-    # differ from it show the mask is load-bearing.
+    # mask_blind is what a count ignoring the mask would produce; the cases where it differs from the reference show the mask is load-bearing.
     frames = _Gemma4Extractor(True)([clip])["input_features"].shape[1]
     assert mlx_utils._gemma4_audio_encoder_positions(
         np.ones(frames, dtype=bool)) == mask_blind
-    # An extractor reporting no mask leaves the encoder without one too, so
-    # every frame counts -- the same number.
+    # With no mask from the extractor the encoder has none either, so every frame counts and gives the same number as the mask-blind count.
     maskless = Gemma4Processor(_Gemma4Extractor(True, emit_mask=False))
     mlx_utils._repair_gemma4_audio_processor(maskless)
     assert maskless._compute_audio_num_tokens(clip, 16000) == mask_blind
@@ -3559,8 +3435,7 @@ def test_padded_audio_batch_masks_each_clip_to_its_own_audio(order, emit_mask):
     """Batch padding must not hand a short clip frames that are silence."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    # The 0.4.4 mask rule this corrects, and an extractor reporting no mask at
-    # all: padding looks like real audio either way once a batch is padded.
+    # Covers the 0.4.4 mask rule being corrected and an extractor reporting no mask: once a batch is padded, padding looks like real audio either way.
     extractor = _Gemma4Extractor(False, emit_mask=emit_mask)
     processor = Gemma4Processor(extractor)
     clips = [np.zeros(samples, np.float32) for samples in order]
@@ -3570,29 +3445,24 @@ def test_padded_audio_batch_masks_each_clip_to_its_own_audio(order, emit_mask):
     as_collated = batched.get("input_features_mask")
     features = batched["input_features"]
     if emit_mask:
-        # The short clip keeps two frames of pure padding, and how many it
-        # keeps depends on what it was batched against.
+        # The short clip keeps two frames of pure padding, and how many it keeps depends on what it was batched against.
         assert sorted(int(m.sum()) for m in as_collated) == [225, 584]
 
     corrected = mlx_utils._audio_repaired_processor(processor)
     repaired = mlx_utils._repair_audio_batch(batched, clips, corrected)
     counts = [corrected._compute_audio_num_tokens(clip, 16000) for clip in clips]
     mask = repaired["input_features_mask"]
-    # Exact, not just the count: the frames kept must be that clip's own, at
-    # its own offsets, or the encoder reads silence for real audio.
+    # Checks the kept frames, not just the count: they must be that clip's own at its own offsets, or the encoder reads silence for real audio.
     assert mask.shape == (2, 584) and mask.dtype == np.dtype(bool)
     for row, keep in enumerate(solo):
         assert mask[row][:keep].all() and not mask[row][keep:].any()
-    # Every row's surviving positions now match the run written for that clip,
-    # and the features those positions index are still there.
+    # Each row's surviving positions match the run written for its clip, and the feature rows those positions index are still present.
     assert [mlx_utils._gemma4_audio_encoder_positions(row)
             for row in mask] == counts
     assert repaired["input_features"] is features
 
-    # Half a contract: on a processor whose count was left alone, so is the
-    # mask. A clip list that does not pair with the feature rows -- in either
-    # direction -- is left alone too, so the collation check reports that
-    # instead of a plausible-looking mask hiding it.
+    # The mask is left alone when the processor's count is; a clip list that does not pair with the feature rows, in
+    # either direction, is left alone too, so collation reports the mismatch instead of a plausible mask hiding it.
     three = [*clips, np.zeros(74000, np.float32)]
     left_alone = [
         mlx_utils._repair_audio_batch(dict(extractor(clips)), clips, processor),
@@ -3605,8 +3475,7 @@ def test_padded_audio_batch_masks_each_clip_to_its_own_audio(order, emit_mask):
                 else untouched["input_features_mask"].tolist()
                 == expected.tolist())
 
-    # A mask that does not cover its features is not left to broadcast: no
-    # other check compares the two.
+    # A mask that does not cover its features must not be left to broadcast, since no other check compares the two.
     if emit_mask:
         for batch_clips in (clips, clips[:1]):
             ragged = dict(extractor(batch_clips))
@@ -3629,8 +3498,7 @@ def test_collation_repairs_the_audio_batch_before_the_model_sees_it():
     )
     assert [int(m.sum()) for m in inputs["input_features_mask"]] == [584, 223]
     assert inputs["input_features"].shape[:2] == (2, 584)
-    # The shared processor is never touched: a corrected count on it would meet
-    # an uncorrected mask in anything else using it, concurrently or after.
+    # The shared processor is never touched: a corrected count on it would meet an uncorrected mask in other users, concurrently or later.
     assert "_compute_audio_num_tokens" not in vars(processor)
     assert not mlx_utils._audio_count_corrected(processor)
     pickle.loads(pickle.dumps(processor))
@@ -3657,8 +3525,7 @@ def test_the_corrected_count_rides_a_copy_and_only_for_its_family(monkeypatch):
     # Built on the copy, not installed on the original and moved across.
     assert corrected._compute_audio_num_tokens.args[0] is corrected
 
-    # Same family name, so the repair is reached, but not independently
-    # copyable -- correcting either would correct the caller's own processor.
+    # Same family name so the repair is reached, but not independently copyable: correcting either would correct the caller's own processor.
     for cls in (type("Gemma4Processor", (Gemma4Processor,),
                      {"__copy__": lambda self: self}),
                 type("Gemma4Processor", (_ForwardsTheHook,), {})):
@@ -3669,14 +3536,12 @@ def test_the_corrected_count_rides_a_copy_and_only_for_its_family(monkeypatch):
             with pytest.raises(NotImplementedError, match="independent object"):
                 mlx_utils._audio_repaired_processor(shared)
             assert not mlx_utils._audio_count_corrected(shared)
-            # Refusing must leave the processor exactly as it was: whatever it
-            # had of its own, and nothing where it had been inheriting.
+            # Refusing must leave the processor exactly as it was: its own attributes kept, and nothing set where it had been inheriting.
             if own is not None:
                 assert shared._compute_audio_num_tokens is own
             else:
                 assert "_compute_audio_num_tokens" not in vars(shared)
-    # The gate only decides support; nothing about the original changes, so a
-    # concurrent user of it cannot pick up half the correction.
+    # The gate only decides support and changes nothing on the original, so a concurrent user cannot pick up half the correction.
     assert "_compute_audio_num_tokens" not in vars(processor)
     assert not mlx_utils._audio_count_corrected(processor)
 
@@ -3701,14 +3566,10 @@ def test_gemma4_repair_refuses_a_processor_it_cannot_correct():
 
 
 def test_the_merge_correction_follows_the_family_not_its_spelling():
-    """mlx-vlm lowercases model_type before selecting the module, so a
-    differently spelled checkpoint loads the same family and passes the audio
-    gate. Matching it exactly here would skip the correction for a model whose
-    merge needs it, and the misalignment that follows is silent."""
+    """mlx-vlm lowercases model_type when selecting the module, so any spelling loads the same family; an exact match would silently skip the merge correction."""
     from unsloth_zoo.mlx.utils import audio_merge_patch_needed
 
-    # Every casing, not a sample of them: a listed few can be satisfied by
-    # matching those strings, which is the defect this guards against.
+    # Checks every casing of gemma4, not a sample: a short list could pass by matching those exact strings, the defect this guards against.
     import itertools
     for chars in itertools.product(*({c.lower(), c.upper()} for c in "gemma4")):
         spelling = "".join(chars)
@@ -3746,15 +3607,8 @@ def test_audio_merge_patch_is_held_and_restored_exactly():
 
 
 def test_concurrent_installs_take_one_wrapper_and_one_hold_each():
-    """The hold count is read, decided on and written back, which is not atomic
-    under the GIL. Two trainers starting close together -- the case this
-    function documents as supported -- could otherwise both read zero, both
-    install a wrapper, and both leave the count at one, so the first to finish
-    would restore the original embedder while the other was still training.
-
-    The barrier lines the threads up on the read, which is where they would
-    interleave; without the lock the count lands on 1 instead of the number of
-    holders."""
+    """The hold count read-decide-write is not atomic under the GIL: unlocked installs can both read zero, both wrap,
+    and leave the count at one, so the first finisher restores the embedder under the other."""
     import threading
 
     from unsloth_zoo.mlx.utils import (
@@ -3784,10 +3638,9 @@ def test_concurrent_installs_take_one_wrapper_and_one_hold_each():
     assert granted == [True] * workers, "every caller must be told it holds"
     assert getattr(model, _AUDIO_MERGE_HOLDERS) == workers
     assert model.get_input_embeddings.__name__ == "patched", "exactly one wrapper"
-    # Note this alone does not prove serialization: the read and the write are
-    # adjacent, so the GIL rarely switches between them and the assertions
-    # above hold by luck even unlocked. The regression guard is the test below,
-    # which asserts the critical section is actually entered under the lock.
+    # This alone does not prove serialization: the assertions above hold by luck even unlocked, as the read and write
+    # are adjacent and the GIL rarely switches; the regression guard is the test below, which checks the lock is
+    # entered.
 
     # And the correction survives until the last release, not the first.
     for _ in range(workers - 1):
@@ -3798,9 +3651,7 @@ def test_concurrent_installs_take_one_wrapper_and_one_hold_each():
 
 
 def test_the_hold_count_is_only_touched_under_the_lock(monkeypatch):
-    """The guard the threaded test above cannot be: assert the read/decide/write
-    really runs inside the lock, by counting acquisitions. Drop the `with` and
-    the count goes to zero, whatever the scheduler happens to do."""
+    """Counts lock acquisitions to assert the read/decide/write runs under the lock, which the threaded test cannot show; dropping the with leaves the count at zero."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     acquired = []
@@ -3834,15 +3685,8 @@ def test_the_hold_count_is_only_touched_under_the_lock(monkeypatch):
 
 
 def test_the_wrapper_swap_happens_inside_the_critical_section(monkeypatch):
-    """Counting acquisitions is not enough: the capture, the install and the
-    restoration have to be *inside* the lock, not merely preceded by it. If the
-    lock is released after the count and before the swap, an installer arriving
-    while the last holder restores can capture the outgoing wrapper as its own
-    original, and the remover then overwrites the freshly installed one.
-
-    Observed by recording what `get_input_embeddings` is at lock entry and
-    exit: a swap that happened inside shows a difference across that span.
-    """
+    """Capture, install and restore must all sit inside the lock, or an installer can capture the outgoing wrapper and
+    the remover overwrites it; checked by comparing get_input_embeddings at lock entry and exit."""
     import threading
 
     from unsloth_zoo.mlx import utils as mlx_utils
@@ -3932,12 +3776,8 @@ def test_patched_audio_merge_places_each_row_own_features():
 
 
 def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
-    """Phi-4-multimodal's config.json declares neither token index.
-
-    Training threads the checkpoint mapping rather than the model's config
-    object, so both arrive absent and the compile preparation cannot read them
-    directly. mlx-vlm carries them as dataclass defaults.
-    """
+    """Phi-4-multimodal's config.json declares neither token index, and training passes the checkpoint mapping, so the
+    ids are resolved from mlx-vlm's dataclass defaults."""
     from unsloth_zoo.mlx.utils import _phi4mm_token_ids
 
     config_cls = pytest.importorskip("mlx_vlm.models.phi4mm.config").ModelConfig
@@ -3950,8 +3790,7 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
     assert _phi4mm_token_ids(
         {"image_token_index": -7, "audio_token_index": 11}
     ) == (-7, 11)
-    # One present, one absent: only the missing side falls back, either way
-    # round, so neither explicit value can be overwritten by the other's gap.
+    # Only the missing index falls back when one is present and one absent, so neither explicit value is overwritten by the other's gap.
     assert _phi4mm_token_ids({"image_token_index": -7}) == (-7, expected[1])
     assert _phi4mm_token_ids({"audio_token_index": 11}) == (expected[0], 11)
 
@@ -4130,11 +3969,8 @@ def test_phi4mm_keeps_a_merged_decision_adapter_across_its_weight_swaps(tmp_path
 
 
 def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
-    """The regression this guards is in the compile-preparation branch, not the
-    helper: training threads the checkpoint mapping, which declares neither
-    index, and `int(None)` raised there before the first step. Surviving the
-    call is not enough -- the positions have to come out where the real marker
-    ids sit, so resolving the wrong ids or swapping them is caught too."""
+    """Guards the compile-preparation branch: the checkpoint mapping declares neither index and int(None) raised before
+    the first step; positions must land on the real marker ids."""
     from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
 
     config_cls = pytest.importorskip("mlx_vlm.models.phi4mm.config").ModelConfig
@@ -4152,13 +3988,11 @@ def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
     prepared = _prepared({"model_type": "phi4mm"}, [7, image_id, 8, audio_id, 9])
     assert prepared["image_token_positions"] == ((1,),)
     assert prepared["audio_token_spans"] == (((3, 4),),)
-    # The markers are also resolved a second time, to rewrite the ids: a pair
-    # corrupted only there would leave the metadata above intact.
+    # Markers are also resolved a second time to rewrite the ids; a pair corrupted only there would leave the metadata above intact.
     assert np.asarray(prepared["input_ids"]).tolist() == [
         [7, image_id, 8, audio_id, 9]
     ]
-    # An explicit config wins at the call site too, not only in the helper, and
-    # at both resolutions: the rewrite ignoring it would restore the defaults.
+    # An explicit config must win at the call site and in both resolutions, not only in the helper; ignoring it in the rewrite restores the defaults.
     declared = _prepared({"model_type": "phi4mm", "image_token_index": 7,
                           "audio_token_index": 9}, [7, image_id, 8, audio_id, 9])
     assert declared["image_token_positions"] == ((0,),)
@@ -4202,8 +4036,7 @@ def _prepared_positions(model_type):
 
 
 def test_qwen_mrope_families_get_pipeline_built_position_ids():
-    """Without them the decoder falls back to mlx-vlm's `get_rope_index`, which
-    calls `.item()` on grid entries the pipeline hands it as plain ints."""
+    """Without pipeline-built position ids the decoder falls back to mlx-vlm's get_rope_index, which calls .item() on grid entries given as plain ints."""
     for model_type in ("qwen2_vl", "qwen3_vl", "qwen3_5", "qwen4_exp"):
         prepared = _prepared_positions(model_type)
         assert prepared["_unsloth_collated_position_ids"] is True, model_type
@@ -4214,8 +4047,7 @@ def test_qwen_mrope_families_get_pipeline_built_position_ids():
 
 
 def test_qwen3_omni_pipeline_positions_equal_its_upstream_rope_index():
-    """It has no builder of its own; the qwen one has to reproduce upstream
-    across rows, several images, and right padding."""
+    """qwen3_omni_moe has no builder of its own, so the qwen builder must reproduce upstream rope index across rows, several images and right padding."""
     from types import SimpleNamespace
 
     arch = "qwen3_omni_moe"
@@ -4248,8 +4080,7 @@ def test_qwen3_omni_pipeline_positions_equal_its_upstream_rope_index():
 
 @pytest.mark.parametrize("arch", ["glm4v", "glm4v_moe"])
 def test_glm4v_pipeline_positions_equal_its_upstream_rope_index(arch):
-    """glm4v has no builder of its own; the qwen one has to reproduce upstream
-    across rows, several images, and right padding."""
+    """glm4v has no builder of its own, so the qwen builder must reproduce upstream rope index across rows, several images and right padding."""
     from types import SimpleNamespace
 
     language = pytest.importorskip(f"mlx_vlm.models.{arch}.language")
@@ -4281,11 +4112,7 @@ def test_glm4v_pipeline_positions_equal_its_upstream_rope_index(arch):
 
 
 def _bounds_inputs(bounds, width=8, rows=1, features=1):
-    """A processor output shaped like MiniCPM-o's: spans, not identifiable runs.
-
-    The ids are one repeated token, which is what a placeholder run looks like;
-    tests that need a span landing on ordinary text overwrite them.
-    """
+    """MiniCPM-o-shaped output with audio_bounds spans, not identifiable runs; ids are one repeated token, so tests needing ordinary text overwrite them."""
     return {
         "input_ids": np.zeros((rows, width), dtype=np.int32),
         "attention_mask": np.ones((rows, width), dtype=np.int32),
@@ -4295,9 +4122,7 @@ def _bounds_inputs(bounds, width=8, rows=1, features=1):
 
 
 def test_the_delimiters_around_an_audio_run_are_not_targets():
-    """A stated span covers the run's interior only, so the delimiters the
-    processor generated around it would otherwise stay supervised -- and they
-    are generated the same way the run is."""
+    """A stated span covers only the run interior, so the processor's delimiters around it would otherwise stay supervised, since they are generated the same way."""
     from unsloth_zoo.mlx.utils import _get_vlm_ignore_token_ids
 
     class _Delimited(_FakeProcessor):
@@ -4314,10 +4139,8 @@ def test_nemotron_declares_its_sampling_rate_on_the_processor():
 
 
 def test_a_bare_message_list_row_is_scanned_for_audio(monkeypatch):
-    """A row that is itself a list of messages is a supported shape, which
-    _collate_vlm_batch normalizes. The pre-formatter scan has to see it too:
-    a formatting_func that drops the clips otherwise leaves the family gate
-    nothing to refuse, and the row trains as text with its audio discarded."""
+    """A message-list row is a supported shape and must be scanned before the formatter, or a formatting_func that drops
+    clips leaves the family gate nothing to refuse."""
     from unsloth_zoo.mlx.utils import (
         _format_vlm_row_gating_audio, _raw_row_has_audio,
     )
@@ -4345,14 +4168,7 @@ def test_a_bare_message_list_row_is_scanned_for_audio(monkeypatch):
 
 
 def test_a_row_that_is_one_message_dict_is_scanned_for_audio(monkeypatch):
-    """The single-message form of the row above, and the same hazard.
-
-    `_normalize_mlx_messages` wraps a `role`/`content` dict as one message, so
-    it is a supported row. The scan reached it through
-    `_select_vlm_messages_or_raw`, which hands such a row straight back, where
-    the `candidate is item` guard dropped it unscanned -- leaving the gate
-    uncalled and a formatter free to discard the user's clip in silence.
-    """
+    """A single role/content message dict is a supported row too; a `candidate is item` guard dropped it unscanned, so the audio gate never ran."""
     from unsloth_zoo.mlx.utils import (
         _format_vlm_row_gating_audio, _normalize_vlm_messages,
         _raw_row_has_audio,
@@ -4382,11 +4198,8 @@ def test_a_row_that_is_one_message_dict_is_scanned_for_audio(monkeypatch):
 
 
 def test_gemma4_audio_delimiters_are_not_targets():
-    """Gemma 4 spells them boa/eoa rather than audio_start/audio_end, and wraps
-    every clip in them: processing_gemma4 renders boa_token + placeholders +
-    eoa_token per clip, and gemma4/config.py declares boa_token_id/eoa_token_id.
-    The image pair boi/eoi was already resolved; without the audio pair the two
-    delimiters stayed supervised on every audio row."""
+    """Gemma 4 spells audio delimiters boa/eoa, not audio_start/audio_end, wrapping each clip (boa_token_id,
+    eoa_token_id in gemma4/config.py); without them they stay supervised."""
     from unsloth_zoo.mlx.utils import _get_vlm_ignore_token_ids
 
     class _Gemma4(_FakeProcessor):
@@ -4409,30 +4222,21 @@ def test_gemma4_audio_delimiters_are_not_targets():
 
 
 def test_an_audio_part_canonicalizes_whichever_alias_it_uses(monkeypatch):
-    """Every audio spelling ends up typed "audio", whether the caller wrote the
-    type out or left it off. An untyped alias otherwise reaches neither the
-    family gate nor the extractor, and one left under an explicit alias reaches
-    both but renders no placeholder."""
+    """Audio parts are canonicalized to type 'audio'; untyped aliases skip the family gate and extractor, and explicit ones reach them but render no placeholder."""
     from unsloth_zoo.mlx.utils import (
         _extract_vlm_audio, _normalize_vlm_messages, _raw_row_has_audio,
     )
 
     processor = _FakeGemmaAudioProcessor()
     _qualify(monkeypatch, processor=processor)
-    # A ramp rather than the shared constant clip, so a clip substituted for
-    # the caller's cannot coincide with it.
+    # Uses a ramp rather than the shared constant clip, so a clip substituted for the caller's cannot coincide with it.
     ramp = {"array": np.linspace(-0.5, 0.5, 16, dtype=np.float32),
             "sampling_rate": 16000}
     text = {"type": "text", "text": "hi"}
     for alias in ("audio", "audio_url", "input_audio"):
         for part in ({alias: ramp}, {"type": alias, alias: ramp}):
-            # The clip takes the first, an interior and the last position on
-            # both axes -- content entry within a message, and message within
-            # the conversation -- past index 1 on each, and one layout carries
-            # two clips, once across messages and once within one. An
-            # implementation that reaches only some positions, ties the two
-            # indices together, or stops after the first clip in a message or
-            # in the row, fails one of these.
+            # Clips at the first, an interior and the last position on both axes (entry within a message, message within
+            # the conversation); two-clip layouts catch partial, tied or early-stopping walks.
             for content in ([[dict(part), text]],
                             [[text, dict(part)]],
                             [[text, dict(part), text]],
@@ -4446,9 +4250,8 @@ def test_an_audio_part_canonicalizes_whichever_alias_it_uses(monkeypatch):
                 row = {"messages": [{"role": "user", "content": entries}
                                     for entries in content]}
                 messages = _normalize_vlm_messages(row["messages"])
-                # Normalization retypes in place: the conversation keeps its
-                # shape and every clip keeps the coordinates it was given, so
-                # a pass that relocated or dropped one would not survive here.
+                # Normalization retypes in place: the conversation keeps its shape and every clip keeps its coordinates,
+                # so a pass that relocated or dropped one fails here.
                 at = [(index, position)
                       for index, entries in enumerate(content)
                       for position, entry in enumerate(entries) if alias in entry]
@@ -4459,13 +4262,11 @@ def test_an_audio_part_canonicalizes_whichever_alias_it_uses(monkeypatch):
                         for position, entry in enumerate(message["content"])
                         if alias in entry] == at, (part, content)
                 for index, position in at:
-                    # "audio", not the alias: Gemma 3n's template renders a
-                    # placeholder for that spelling alone.
+                    # The type must be audio, not the alias: Gemma 3n's template renders a placeholder for that spelling alone.
                     assert messages[index]["content"][position]["type"] == \
                         "audio", (part, content)
                 assert _raw_row_has_audio(row) is True, (part, content)
-                # ...and the caller's own clips reach the extractor, which
-                # reads the payload from the key the caller used.
+                # The caller's own clips still reach the extractor, which reads the payload from the key the caller used.
                 clips = _extract_vlm_audio(row, messages, processor)
                 assert len(clips) == len(at), (part, content)
                 for clip in clips:
@@ -4478,14 +4279,10 @@ def test_an_audio_part_canonicalizes_whichever_alias_it_uses(monkeypatch):
 
 
 def test_a_fixed_budget_row_cannot_hide_a_short_run_behind_a_long_one():
-    """Runs of the wrong lengths still total correctly and still start once per
-    clip, so the total cannot stand in for the individual runs: a clip then
-    spills into the next run and pairs audio with the wrong positions."""
+    """Runs of wrong lengths can still total correctly and start once per clip, so the total cannot replace per-run checks; a clip then spills into the next run."""
     from unsloth_zoo.mlx.utils import _assert_audio_runs_intact_ids
 
-    # Budget 3, three clips: runs of 3, 2 and 4 total 9 and begin three times,
-    # which the total check and the run-count check both accept. The aligned
-    # row comes first, so a check that reads only row 0 cannot pass.
+    # Runs of 3, 2 and 4 pass the total and run-count checks; the aligned row comes first so a check reading only row 0 cannot pass.
     ids = np.array([[1, 7, 7, 7, 1, 7, 7, 7, 1, 7, 7, 7, 1],
                     [1, 7, 7, 7, 1, 7, 7, 1, 7, 7, 7, 7, 1]])
     with pytest.raises(ValueError,
@@ -4493,11 +4290,8 @@ def test_a_fixed_budget_row_cannot_hide_a_short_run_behind_a_long_one():
         _assert_audio_runs_intact_ids(
             ids, np.ones_like(ids), [3, 3], [7], None, budget=3)
 
-    # One wrong run in each position in turn, so an implementation that skips
-    # any single position accepts the row whose only bad run sits there. The
-    # fourth case keeps both bad runs past a three-run prefix, which a check
-    # reading only the first few runs would clear, and the last is uniformly
-    # wrong, which a check comparing the runs to each other would clear.
+    # One wrong run in each position catches skipped positions; case four puts bad runs past a three-run prefix, which
+    # prefix-only checks would clear; the uniformly wrong last case would pass a check comparing runs to each other.
     for lengths in ([2, 3, 3], [3, 2, 3], [3, 3, 2], [3, 3, 3, 2, 4], [4, 4]):
         row = [1]
         for length in lengths:
@@ -4543,9 +4337,7 @@ def test_audio_bounds_reject_a_batch_that_cannot_be_aligned(bounds, counts, mess
 
 
 def test_the_projection_after_the_audio_tower_is_frozen_too():
-    """Freezing the encoder alone leaves the layer that projects its output into
-    the language model trainable, which a full fine-tune would pull into the
-    optimizer. Families name that layer differently."""
+    """Freezing only the encoder leaves its projection into the language model trainable, pulling it into the optimizer; families name that layer differently."""
     from unsloth_zoo.mlx.utils import freeze_audio_modules
 
     class _Module:
@@ -4723,8 +4515,7 @@ def test_a_loaded_model_freezes_modules_built_without_init():
 
 
 def test_nemotron_floor_clears_the_unconditional_sound_conv_sanitize():
-    """Below 0.6.10, `sanitize_audio_weights` double-transposes a pre-converted
-    sound conv ((128,3,3,1) -> (128,3,1,3)) and the checkpoint cannot load."""
+    """Below 0.6.10, sanitize_audio_weights double-transposes a pre-converted sound conv ((128,3,3,1) -> (128,3,1,3)) so the checkpoint cannot load."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     floor = mlx_utils._AUDIO_QUALIFIED_FAMILIES["nemotron_h_nano_omni"]
@@ -4734,8 +4525,7 @@ def test_nemotron_floor_clears_the_unconditional_sound_conv_sanitize():
 
 
 def test_a_turn_without_content_is_returned_untouched():
-    """A dict with no "content" key raised KeyError where every other shape
-    check in this helper returns the message unchanged."""
+    """A message dict without a content key must come back unchanged; indexing it raised KeyError, unlike every other shape check in this helper."""
     from unsloth_zoo.mlx.loader import _normalize_qwen3_omni_counted_message
 
     for message in ({"role": "user"}, {"role": "assistant", "content": None}):
@@ -4743,10 +4533,7 @@ def test_a_turn_without_content_is_returned_untouched():
 
 
 def test_stated_spans_refuse_the_left_padding_repair():
-    """The repair moves each row's tokens forward but re-derives nothing, so a
-    stated span would keep naming its pre-repair position and land the clip's
-    audio on whatever moved there. Both ends of a stale span can still be
-    attended, so no later check would catch it."""
+    """The left-padding repair moves tokens but re-derives nothing, so stated spans keep stale positions and misplace audio; no later check would catch it."""
     from unsloth_zoo.mlx.utils import _right_pad_vlm_rows
 
     left_padded = _bounds_inputs([[[4, 6]]], width=8)
@@ -4754,8 +4541,7 @@ def test_stated_spans_refuse_the_left_padding_repair():
     with pytest.raises(ValueError, match=r"row\(s\) \[0\] content-first"):
         _right_pad_vlm_rows(left_padded, _FakeProcessor())
 
-    # Interior padding moves tokens just as leading padding does, so the refusal
-    # covers it and must not describe the layout as merely left-padded.
+    # Interior padding moves tokens just as leading padding does, so the refusal covers it and must not call the layout merely left-padded.
     interior = _bounds_inputs([[[5, 7]]], width=8)
     interior["attention_mask"] = np.array([[1, 1, 0, 0, 1, 1, 1, 1]], np.int32)
     with pytest.raises(ValueError, match=r"row\(s\) \[0\] content-first"):
@@ -4766,24 +4552,21 @@ def test_stated_spans_refuse_the_left_padding_repair():
     right_padded["attention_mask"] = np.array([[1, 1, 1, 1, 1, 1, 0, 0]], np.int32)
     _right_pad_vlm_rows(right_padded, _FakeProcessor())
 
-    # These processors report the field on every batch, empty when there is no
-    # audio, so keying the refusal on the field would strand text-only rows.
+    # These processors report the field on every batch, empty without audio, so keying the refusal on the field would strand text-only rows.
     no_audio = _bounds_inputs([[], []], width=8, rows=2, features=0)
     no_audio["attention_mask"] = np.array([[0, 0, 1, 1, 1, 1, 1, 1],
                                            [0, 1, 1, 1, 1, 1, 1, 1]], np.int32)
     repaired = _right_pad_vlm_rows(no_audio, _FakeProcessor())
     assert np.asarray(repaired["attention_mask"])[:, 0].tolist() == [1, 1]
 
-    # Only the text-only row moves. The audio row keeps its layout, so its spans
-    # keep naming the same tokens and the batch is repairable.
+    # Only the text-only row moves; the audio row keeps its layout, so its spans keep naming the same tokens and the batch stays repairable.
     neighbour_moves = _bounds_inputs([[[1, 3]], []], width=8, rows=2)
     neighbour_moves["attention_mask"] = np.array([[1, 1, 1, 1, 1, 1, 0, 0],
                                                   [0, 0, 1, 1, 1, 1, 1, 1]], np.int32)
     repaired = _right_pad_vlm_rows(neighbour_moves, _FakeProcessor())
     assert np.asarray(repaired["attention_mask"])[:, 0].tolist() == [1, 1]
 
-    # The moving span-bearing row is not row 0, so checking only the first row's
-    # spans would repair this batch and strand row 1's coordinates.
+    # The moving span-bearing row is not row 0; checking only the first row's spans would repair this batch and strand row 1's coordinates.
     later_row = _bounds_inputs([[[1, 3]], [[4, 6]]], width=8, rows=2, features=2)
     later_row["attention_mask"] = np.array([[1, 1, 1, 1, 1, 1, 0, 0],
                                             [0, 0, 1, 1, 1, 1, 1, 1]], np.int32)
@@ -4805,13 +4588,8 @@ def _image_bound_inputs(bounds, mask):
 
 
 def test_stated_image_bounds_refuse_the_left_padding_repair():
-    """`image_bound` is the same kind of thing as `audio_bounds`: absolute
-    columns into the layout the processor padded, which MiniCPM-V offsets by
-    each row's leading pad count. It is neither width-generated nor token
-    aligned -- an (images, 2) grid is not the ids shape -- so the sidecar
-    relocation leaves it behind, and the model would scatter each image's
-    features onto whatever tokens moved into those columns. The stale columns
-    stay attended, so nothing downstream objects."""
+    """image_bound, like audio_bounds, holds absolute columns that the sidecar relocation leaves stale, so the repair
+    refuses it rather than scatter images onto moved tokens."""
     from unsloth_zoo.mlx.utils import _right_pad_vlm_rows
 
     moved = _image_bound_inputs([[[2, 4]]], [[0, 0, 1, 1, 1]])
@@ -4830,8 +4608,7 @@ def test_stated_image_bounds_refuse_the_left_padding_repair():
     _right_pad_vlm_rows(
         _image_bound_inputs([[[0, 2]]], [[1, 1, 1, 0, 0]]), _FakeProcessor())
 
-    # Reported on every batch, empty when the row has no image: keying the
-    # refusal on the field would strand text-only rows.
+    # Reported on every batch and empty when the row has no image, so keying the refusal on the field would strand text-only rows.
     repaired = _right_pad_vlm_rows(
         _image_bound_inputs([[], []], [[0, 0, 1, 1, 1], [0, 1, 1, 1, 1]]),
         _FakeProcessor())
@@ -4852,10 +4629,8 @@ def test_stated_image_bounds_refuse_the_left_padding_repair():
 
 
 def test_spans_that_do_not_name_a_placeholder_run_are_refused():
-    """These processors pair the n-th opening delimiter with the n-th closing
-    one, so a delimiter the rendered text carries itself shifts every later pair
-    onto ordinary tokens. The shifted span still counts, fits and attends: only
-    the tokens it names show it is wrong."""
+    """Processors pair the n-th opening delimiter with the n-th closing one, so a delimiter in the rendered text shifts
+    later pairs onto ordinary tokens; only the named tokens reveal it."""
     from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
 
     shifted = _bounds_inputs([[[1, 4]]], width=8)
@@ -4871,8 +4646,7 @@ def test_spans_that_do_not_name_a_placeholder_run_are_refused():
     with pytest.raises(ValueError, match="does not name a placeholder run"):
         _assert_audio_runs_intact(mixed, [1, 1], _FakeProcessor(), 8)
 
-    # Two spans in one row, the second naming a different repeated token: a
-    # check comparing only each row's first span would accept this.
+    # Two spans in one row, the second naming a different repeated token; comparing only each row's first span would wrongly accept this.
     within_row = _bounds_inputs([[[1, 3], [4, 6]]], width=8, features=2)
     within_row["input_ids"] = np.array([[9, 0, 0, 9, 4, 4, 8, 6]], dtype=np.int32)
     with pytest.raises(ValueError, match="does not name a placeholder run"):
@@ -4887,11 +4661,8 @@ def test_spans_that_do_not_name_a_placeholder_run_are_refused():
 
 
 def test_clips_the_extractor_would_truncate_are_refused():
-    """A clip past the extractor's window asks for positions whose audio the
-    model never receives. Sizing the run from the waveform also leaves it a
-    position or two above the embeddings on ordinary clips, which is upstream's
-    own rounding with the whole clip present -- that must still be accepted, or
-    every real batch is refused."""
+    """Clips past the extractor window are refused; a run sized from the waveform sits a position or two above the
+    embeddings on ordinary clips (upstream rounding) and must still be accepted."""
     from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
 
     class _Windowed(_FakeProcessor):
@@ -4915,11 +4686,8 @@ def test_clips_the_extractor_would_truncate_are_refused():
 
 
 def test_text_carrying_the_audio_delimiters_itself_is_refused(monkeypatch):
-    """The processor pairs opening delimiters with closing ones across the whole
-    row, so one the text brought itself shifts the pairing, and truncation can
-    drop the generated span and leave the foreign one standing in for it at any
-    length -- including exactly the right one. Nothing downstream separates
-    them, so the text is refused before the processor expands it."""
+    """Text carrying the audio delimiters itself is refused before expansion: the processor pairs delimiters across the
+    row, so a foreign one can stand in for the generated span."""
     class _Delimited(_FakeGemmaAudioProcessor):
         tokenizer = type("_Tok", (_FakeGemmaAudioProcessor.tokenizer.__class__,), {
             "audio_start_id": 301, "audio_end_id": 302,
@@ -4929,8 +4697,7 @@ def test_text_carrying_the_audio_delimiters_itself_is_refused(monkeypatch):
 
     processor = _Delimited()
     _qualify(monkeypatch, processor=processor)
-    # Either delimiter alone is enough to shift the pairing, so each is refused
-    # on its own, not only a well-formed pair.
+    # Either delimiter alone is enough to shift the pairing, so each is refused on its own, not only a well-formed pair.
     for text, named in (("<|audio_start|>x<|audio_end|> hi", "<|audio_start|>"),
                         ("<|audio_start|> hi", "<|audio_start|>"),
                         ("<|audio_end|> hi", "<|audio_end|>")):
@@ -4939,23 +4706,19 @@ def test_text_carrying_the_audio_delimiters_itself_is_refused(monkeypatch):
         with pytest.raises(ValueError, match=f"already contains {re.escape(named)}"):
             _finalized_collate([row], processor, 16, None)
 
-    # The delimiter is on the second audio row: a check reading only the first
-    # would let it through and shift that row's spans.
+    # The delimiter is on the second audio row; a check reading only the first would let it through and shift that row's spans.
     later = _audio_row(_CLIP)
     later["messages"][0]["content"][1]["text"] = "<|audio_start|> hi"
     with pytest.raises(ValueError, match="row 1 already contains"):
         _finalized_collate([_audio_row(_CLIP), later], processor, 16, None)
 
-    # The pairing is per row, so a row with no clip has none to disturb: a
-    # text-only sibling may say whatever it likes beside an audio row.
+    # Pairing is per row, so a row with no clip has none to disturb: a text-only sibling may say whatever it likes beside an audio row.
     sibling = _audio_row(None, text="<|audio_start|> plain")
     _finalized_collate([_audio_row(_CLIP), sibling], processor, 16, None)
 
 
 def test_ragged_image_metadata_survives_an_audio_batch():
-    """An audio row may carry images too, and those rows were refused before
-    this family was qualified. Their per-row image coordinates are ragged for
-    the same reason the audio spans are, and the model indexes both by row."""
+    """Audio rows may carry images; their per-row image coordinates are ragged like audio spans, and the model indexes both by row, so both must survive batching."""
     from unsloth_zoo.mlx.utils import _to_mx_vlm_batch
 
     batch = _to_mx_vlm_batch({
@@ -4973,11 +4736,7 @@ def test_ragged_image_metadata_survives_an_audio_batch():
 
 
 def test_clips_of_unequal_duration_all_reach_the_model():
-    """Audio features are one array per clip and clips run different lengths,
-    so they do not stack. Keeping only the first left a batch whose ids,
-    placeholder runs and labels still described every clip -- the pairing
-    `_assert_audio_features_present` verifies a step earlier, undone here, and
-    silently: the run trains against features belonging to another clip."""
+    """Audio features are ragged (one array per clip) and cannot stack; keeping only the first silently trains other clips against features from another clip."""
     from unsloth_zoo.mlx.utils import (
         _assert_audio_features_present, _to_mx_vlm_batch,
         _vlm_batch_carries_audio,
@@ -4994,8 +4753,7 @@ def test_clips_of_unequal_duration_all_reach_the_model():
     features = _to_mx_vlm_batch(inputs)["input_features"]
     assert len(features) == 2, "a clip was dropped by the conversion"
     assert [tuple(f.shape) for f in features] == [(80, 300), (80, 137)]
-    # And the batch still reports itself as audio, so it is routed eagerly
-    # rather than into a compiled signature it has no fixed shape for.
+    # The batch still reports itself as audio, so it is routed eagerly rather than into a compiled signature with no fixed shape.
     assert _vlm_batch_carries_audio({"input_features": features}) is True
 
     # Equal-length clips stack as before -- the fallback is not the usual path.
@@ -5021,12 +4779,7 @@ def test_nemotron_sound_clips_stay_a_list_even_when_shapes_match():
 
 
 def test_mixed_aspect_ratio_images_all_reach_the_model():
-    """Gemma 4 keeps differently shaped processed images as a ragged list.
-
-    The generic conversion used to catch the failed stack and retain only the
-    first tensor, so a batch of two OCR examples reached the vision tower as one
-    unbatched 3-D image. Preserve every image and its row order instead.
-    """
+    """Gemma 4 keeps differently shaped images as a ragged list; the generic conversion must keep every image in row order, not only the first tensor."""
     from unsloth_zoo.mlx.utils import _to_mx_vlm_batch
 
     source = (
@@ -5056,11 +4809,8 @@ def test_equal_shape_images_stack_without_data_loss():
 
 
 def test_nested_audio_rows_are_paired_clip_by_clip():
-    """A processor that wants ``(samples, rate)`` pairs may also want its audio
-    nested per row (MiniCPM-o). Pairing the payload as though its entries were
-    clips fused each row into one 2-D 'clip' carrying no rate -- or, when the
-    row's clips ran different lengths, raised out of numpy, reporting a payload
-    the processor was never offered."""
+    """Processors wanting (samples, rate) pairs may nest audio per row (MiniCPM-o); pairing must go clip by clip, or
+    rows fuse into one rateless 2-D clip, or numpy raises when clip lengths differ."""
     from unsloth_zoo.mlx.utils import (
         _AudioClip, _audio_payload_as_pairs, _format_vlm_audio_for_processor,
     )
@@ -5084,8 +4834,7 @@ def test_nested_audio_rows_are_paired_clip_by_clip():
 
 
 def test_collation_hands_the_clip_lengths_to_the_window_check(monkeypatch):
-    """The check can only see clips the collation passes it, so dropping that
-    wiring would leave it live but blind."""
+    """The window check can only see clips that collation passes it, so dropping that wiring would leave it live but blind."""
     class _Spans(_FakeGemmaAudioProcessor):
         audio_processor = type("_Ex", (), {"n_samples": 4, "sampling_rate": 16})()
 
@@ -5124,9 +4873,8 @@ def _run_capped_processor(window=None, n_samples=None, cap=True):
 @pytest.mark.parametrize("window", [None, 16])
 def test_a_clip_longer_than_its_capped_run_is_refused_when_its_audio_is_kept(
         monkeypatch, window):
-    """Gemma 4 unified caps the run but keeps every frame, and the model fills
-    placeholders from the batch's frames in order, so the surplus is merged into
-    the next clip's positions."""
+    """Gemma 4 unified caps the run but keeps every frame, and placeholders fill in order, so surplus frames would merge
+    into the next clip's positions; refuse when audio is kept."""
     from unsloth_zoo.mlx import utils
 
     monkeypatch.setattr(utils, "_reported_cut_audio", set())
@@ -5147,8 +4895,7 @@ def test_a_clip_longer_than_its_capped_run_is_refused_when_its_audio_is_kept(
     dict(window=8, cap=False),
 ])
 def test_a_clip_its_extractor_cuts_is_warned_about_once(monkeypatch, kwargs):
-    """Gemma 4, Gemma 3n and Qwen3-Omni cut the waveform and size the run from
-    what is left, so the row stays aligned and only loses audio."""
+    """Gemma 4, Gemma 3n and Qwen3-Omni cut the waveform and size the run from what remains, so rows stay aligned and only lose audio."""
     from unsloth_zoo.mlx import utils
 
     monkeypatch.setattr(utils, "_reported_cut_audio", set())
@@ -5166,8 +4913,7 @@ def test_a_clip_its_extractor_cuts_is_warned_about_once(monkeypatch, kwargs):
 
 
 def test_a_cap_the_corrected_count_ignores_refuses_nothing(monkeypatch):
-    """Gemma 4's placeholder count is replaced by one read off the extractor's
-    frames, so a clip past its configured cap is still fully covered."""
+    """Gemma 4's placeholder count is read off the extractor's frames instead of the configured cap, so clips past the cap are still fully covered."""
     from unsloth_zoo.mlx import utils
 
     monkeypatch.setattr(utils, "_reported_cut_audio", set())
@@ -5262,8 +5008,7 @@ def test_collation_gives_each_piece_of_a_long_clip_its_own_run(monkeypatch, row)
 
 
 def test_ids_the_run_path_rejects_are_rejected_on_the_bounds_path_too():
-    """Reading rows and width off shape[0] and shape[1] would take a 3-D batch
-    for an 8-wide one and pass it on with its extra axis intact."""
+    """Rows and width must not be read from shape[0] and shape[1], which would take a 3-D batch for an 8-wide one and pass its extra axis on."""
     from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
 
     inputs = _bounds_inputs([[[1, 3]]], width=8)
@@ -5274,16 +5019,13 @@ def test_ids_the_run_path_rejects_are_rejected_on_the_bounds_path_too():
 
 
 def test_audio_clips_are_grouped_per_row_when_the_processor_assigns_them():
-    """A flat list leaves the row assignment to a marker count over the rendered
-    text, which a chat template need not emit; every clip then lands on row 0.
-    Grouping per row states the assignment instead of leaving it inferable."""
+    """A flat audio list leaves row assignment to a marker count in the rendered text, which a chat template need not emit, so clips land on row 0; group per row."""
     from unsloth_zoo.mlx.utils import _format_vlm_audio_for_processor
 
     class _MiniCPMOProcessor(_FakeProcessor):  # matched by class name, as images are
         pass
 
-    # A row with two clips: keeping only the first would drop one, and the span
-    # count would then disagree with what the row carries.
+    # A row with two clips: keeping only the first would drop one, and the span count would then disagree with what the row carries.
     clips = [[], ["one", "two"]]
     assert _format_vlm_audio_for_processor(clips, _MiniCPMOProcessor()) == [
         [], ["one", "two"]
@@ -5293,8 +5035,7 @@ def test_audio_clips_are_grouped_per_row_when_the_processor_assigns_them():
 
 
 def test_collation_hands_the_processor_the_grouping_it_assigns_by(monkeypatch):
-    """Whatever the helper decides is worth nothing if collation calls it without
-    the processor: the payload silently reverts to flat and rows are guessed."""
+    """The grouping the helper decides is lost if collation calls it without the processor; the payload then silently reverts to flat and rows are guessed."""
     seen = {}
 
     class _MiniCPMOish(_FakeGemmaAudioProcessor):
@@ -5311,10 +5052,7 @@ def test_collation_hands_the_processor_the_grouping_it_assigns_by(monkeypatch):
 
 
 def test_stated_spans_are_checked_instead_of_soft_token_runs():
-    """The run interior need not be an audio-specific token, so counting runs
-    would find none. A batch whose spans line up must still pass, and one whose
-    spans have no payload behind them must not: the placeholders would occupy
-    the sequence with nothing to merge into them."""
+    """Run interiors need not be audio-specific tokens, so stated spans are checked rather than counted runs; spans with no payload behind them must fail."""
     from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
 
     _assert_audio_runs_intact(_bounds_inputs([[[1, 5]]]), [1], _FakeProcessor(), 8)
@@ -5324,9 +5062,7 @@ def test_stated_spans_are_checked_instead_of_soft_token_runs():
     with pytest.raises(ValueError, match="audio"):
         _assert_audio_runs_intact(without_payload, [1], _FakeProcessor(), 8)
 
-    # Present is not enough: the payload has to carry one entry per span, no
-    # more and no fewer, or a clip's placeholders would be filled from another
-    # clip's features.
+    # Presence is not enough: the payload needs exactly one entry per span, or a clip's placeholders would be filled from another clip's features.
     for features in (1, 3):
         with pytest.raises(ValueError, match="audio"):
             _assert_audio_runs_intact(
@@ -5339,10 +5075,7 @@ def test_stated_spans_are_checked_instead_of_soft_token_runs():
 
 
 def test_audio_span_positions_are_excluded_from_the_loss():
-    """Placeholder positions are inputs, never text to predict, and they cannot
-    be masked by token id when the marker is the unknown token. Each row is
-    masked by its own spans: reusing row 0's would silently supervise one row's
-    audio while masking another's text."""
+    """Placeholder positions are inputs, not targets, and cannot be masked by id when the marker is the unknown token; each row must be masked by its own spans."""
     from unsloth_zoo.mlx.utils import _stage_vlm_label_mask_np
 
     inputs = _bounds_inputs([[[2, 5]], [], [[0, 1], [6, 8]]], width=8, rows=3)
@@ -5353,12 +5086,10 @@ def test_audio_span_positions_are_excluded_from_the_loss():
 
 
 @pytest.mark.parametrize("bounds, expected", [
-    # Rows holding different clip counts: stacking raises, and keeping only the
-    # first row would tell every later row it has no audio while its
-    # placeholders still occupy the sequence.
+    # Rows with different clip counts cannot be stacked; keeping only the first row would tell later rows they have no
+    # audio while placeholders still occupy the sequence.
     ([np.array([[1, 3]]), np.array([[1, 3], [4, 7]])], [[[1, 3]], [[1, 3], [4, 7]]]),
-    # A row without audio beside one with it: the empty row must stay empty and
-    # stay a row, or the audio row's index moves.
+    # A row without audio beside one with it: the empty row must stay empty and stay a row, or the audio row's index moves.
     ([np.zeros((0, 2), np.int32), np.array([[1, 3]])], [[], [[1, 3]]]),
 ])
 def test_ragged_audio_bounds_survive_conversion_to_mlx(bounds, expected):
@@ -5367,8 +5098,7 @@ def test_ragged_audio_bounds_survive_conversion_to_mlx(bounds, expected):
     batch = _to_mx_vlm_batch({
         "input_ids": np.zeros((2, 8), dtype=np.int32),
         "audio_bounds": bounds,
-        # Nested ints, the shape MiniCPM-o reports: no array to stack, so this
-        # rides the ordinary passthrough and needs no per-row handling.
+        # Nested ints, the shape MiniCPM-o reports: no array to stack, so this rides the ordinary passthrough with no per-row handling.
         "audio_feature_lens": [[9], [9, 4]],
     })
     assert [np.asarray(r).tolist() for r in batch["audio_bounds"]] == expected
@@ -5376,10 +5106,7 @@ def test_ragged_audio_bounds_survive_conversion_to_mlx(bounds, expected):
 
 
 def test_audio_spans_are_masked_on_the_deferred_label_path_too():
-    """Processor output the host staging cannot claim decides its labels at
-    finalize instead, and that decision has to exclude the spans as well. The
-    response-mask path arrives here with labels already chosen, so masking only
-    while deriving them would supervise audio under train_on_responses_only."""
+    """Labels decided at finalize must also exclude audio spans; masking only in host staging would supervise audio under train_on_responses_only."""
     import mlx.core as current_mx
     if current_mx is not mx:
         pytest.skip("requires real MLX runtime without mlx_simulation monkeypatch")
@@ -5397,8 +5124,7 @@ def test_audio_spans_are_masked_on_the_deferred_label_path_too():
     responses_only = np.asarray(_apply_vlm_label_masks(batch, supplied)).tolist()
     assert responses_only == [[-100, -100, -100, -100, -100, 10]]
 
-    # Each row by its own spans: broadcasting row 0's would supervise row 1's
-    # audio positions and mask text it should be learning.
+    # Each row uses its own spans: broadcasting row 0's would supervise row 1's audio positions and mask text it should be learning.
     rows = {
         "input_ids": mx.array([[5, 6, 7, 8, 9, 10]] * 2, dtype=mx.int32),
         "attention_mask": mx.array([[1] * 6] * 2, dtype=mx.int32),
@@ -5411,28 +5137,22 @@ def test_audio_spans_are_masked_on_the_deferred_label_path_too():
 
 
 def test_an_empty_audio_payload_is_not_audio():
-    """MiniCPM-o hands a text-only batch audio_features shaped (0, 80, 0).
-    Calling that audio would route the run eagerly and abort a strict one."""
+    """MiniCPM-o hands text-only batches audio_features shaped (0, 80, 0); treating that as audio would route the run eagerly and abort a strict one."""
     from unsloth_zoo.mlx.utils import _vlm_batch_carries_audio
 
     assert not _vlm_batch_carries_audio({"audio_features": np.zeros((0, 80, 0), np.float32)})
     assert _vlm_batch_carries_audio({"audio_features": np.zeros((1, 80, 4), np.float32)})
-    # A payload can arrive as a plain sequence too, and an empty one is no more
-    # audio than an empty array is.
+    # A payload can arrive as a plain sequence too, and an empty one is no more audio than an empty array is.
     assert not _vlm_batch_carries_audio({"input_audio_embeds": []})
     assert _vlm_batch_carries_audio({"input_audio_embeds": [object()]})
     assert not _vlm_batch_carries_audio({"sound_clips": []})
 
 
 def test_audio_spans_are_checked_against_attended_positions():
-    """A span covering padding is not placed on the tokens the model attends.
-    Rows reach here content-first, so the check is per row over the positions
-    the span names."""
+    """A span covering padding is not placed on attended tokens; rows arrive content-first, so the check runs per row over the positions each span names."""
     from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
 
-    # Row 1's span starts on content and runs off the end of it. Row 0 attends
-    # everything, so a check reading row 0's mask sees nothing wrong, and one
-    # reading only the span's first position sees nothing wrong either.
+    # Row 1's span starts on content and runs into padding; row 0 attends everything, and a check of only the first span position also misses it.
     straddling = _bounds_inputs([[[1, 3]], [[3, 6]]], width=8, rows=2, features=2)
     straddling["attention_mask"] = np.array([[1, 1, 1, 1, 1, 1, 1, 1],
                                              [1, 1, 1, 1, 0, 0, 0, 0]], np.int32)
@@ -5441,13 +5161,10 @@ def test_audio_spans_are_checked_against_attended_positions():
 
 
 def test_audio_bounds_require_a_row_per_tokenized_row():
-    """Bounds are indexed per row by the model, so a count that disagrees with
-    the tokenized rows would silently leave a row's audio unplaced. All three
-    counts have to agree, in both directions."""
+    """Bounds are indexed per row by the model, so a row count that disagrees with the tokenized rows silently leaves audio unplaced; all three counts must agree."""
     from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
 
-    # Dataset rows and tokenized rows agree; only the bounds disagree, so a
-    # check comparing just those two would pass this batch.
+    # Dataset rows and tokenized rows agree; only the bounds disagree, so a check comparing just those two would pass this batch.
     inputs = _bounds_inputs([[[1, 3]]], width=8, rows=2, features=2)
     with pytest.raises(ValueError, match="tokenized row"):
         _assert_audio_runs_intact(inputs, [1, 1], _FakeProcessor(), 8)
@@ -5463,17 +5180,14 @@ def test_audio_bounds_require_a_row_per_tokenized_row():
     with pytest.raises(ValueError, match="tokenized row"):
         _assert_audio_runs_intact(extra_bounds, [1, 1], _FakeProcessor(), 8)
 
-    # Bounds and tokenized rows agree; only the dataset rows do not, so a check
-    # comparing just those two would accept this.
+    # Bounds and tokenized rows agree but dataset rows do not; a check comparing only those two would accept this.
     extra_counts = _bounds_inputs([[[1, 3]], [[1, 3]]], width=8, rows=2, features=2)
     with pytest.raises(ValueError, match="dataset row"):
         _assert_audio_runs_intact(extra_counts, [1, 1, 1], _FakeProcessor(), 8)
 
 
 def test_overlong_rows_are_refused_by_what_the_model_attends():
-    """The run path caps each row's attended tokens. Capping the padded width
-    instead would refuse a batch it accepts, since padding is not the row's own
-    length."""
+    """Caps each row's attended tokens, not padded width, since padding is not the row's own length."""
     from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
 
     padded = _bounds_inputs([[[1, 3]]], width=12)
@@ -5484,8 +5198,7 @@ def test_overlong_rows_are_refused_by_what_the_model_attends():
         _assert_audio_runs_intact(_bounds_inputs([[[1, 3]]], width=12), [1],
                                   _FakeProcessor(), 8)
 
-    # Row 1 is the one over the cap: reading row 0's mask every time would
-    # accept it, since row 0 stays under.
+    # Row 1 is the one over the cap; reading row 0's mask every time would accept it, since row 0 stays under.
     later_row = _bounds_inputs([[[1, 3]], [[1, 3]]], width=12, rows=2, features=2)
     later_row["attention_mask"] = np.array([[1] * 6 + [0] * 6, [1] * 12], np.int32)
     with pytest.raises(ValueError, match="row 1 is 12 tokens"):
@@ -5523,14 +5236,11 @@ class _AudioModel:
 
 
 def test_the_mlx_vlm_boundary_reshapes_audio_a_processor_cannot_unpack():
-    """Inference reaches the processor through mlx-vlm, which decodes audio to
-    bare waveforms and refuses tuples, so a processor wanting (samples, rate)
-    pairs is unreachable from the caller and has to be met at this boundary."""
+    """mlx-vlm sends bare waveforms and refuses tuples, so pair-taking processors are adapted here."""
     from unsloth_zoo.mlx.utils import _mlx_vlm_process_inputs_adapter
 
     class _Processor:
-        # A rate mlx-vlm never consults, to catch a pairing that resolves the
-        # rate for itself instead of using the one the samples are actually at.
+        # A rate mlx-vlm never consults, to catch a pairing that resolves the rate itself instead of using the samples' actual rate.
         sampling_rate = 22050
 
     def pairs_only(processor, prompts, images=None, audio=None, **kwargs):
@@ -5543,8 +5253,7 @@ def test_the_mlx_vlm_boundary_reshapes_audio_a_processor_cannot_unpack():
     patched = _mlx_vlm_process_inputs_adapter(pairs_only)
     clip = np.zeros(4, dtype=np.float32)
     out = patched(_Processor(), ["hi"], audio=[clip])
-    # mlx-vlm resamples a decoded file to feature_extractor.sampling_rate and
-    # falls back to 16 kHz, so that is the rate it assumes these are at.
+    # mlx-vlm resamples a decoded file to feature_extractor.sampling_rate and falls back to 16 kHz, so that is the rate it assumes.
     assert [(int(np.asarray(s).size), r)
             for s, r in out["input_audio_embeds"]] == [(4, 16000)]
     assert len(calls) == 2, "the pair shape is a retry, not the first guess"
@@ -5558,8 +5267,7 @@ def test_the_mlx_vlm_boundary_reshapes_audio_a_processor_cannot_unpack():
         _Resampled(), ["hi"], audio=[clip])
     assert [r for _s, r in out["input_audio_embeds"]] == [24000]
 
-    # A request carrying no audio must not reach for audio attributes at all:
-    # processors expose some of them through properties that warn or raise.
+    # A request with no audio must not touch audio attributes at all, since processors expose some through properties that warn or raise.
     class _Hostile:
         @property
         def feature_extractor(self):
@@ -5571,8 +5279,7 @@ def test_the_mlx_vlm_boundary_reshapes_audio_a_processor_cannot_unpack():
     assert _mlx_vlm_process_inputs_adapter(text_only)(
         _Hostile(), ["hi"])["input_ids"] == ["hi"]
 
-    # Only a ValueError is a payload-shape refusal: another type carrying the
-    # same word is the processor's own failure and is raised on the first call.
+    # Only a ValueError is a payload-shape refusal; another exception type carrying the same word is the processor's own failure, raised on the first call.
     seen = []
 
     def wrong_type(processor, prompts, images=None, audio=None, **kwargs):
@@ -5584,9 +5291,7 @@ def test_the_mlx_vlm_boundary_reshapes_audio_a_processor_cannot_unpack():
             _Processor(), ["hi"], audio=[clip])
     assert len(seen) == 1
 
-    # Neither guard may be dropped: a refusal that is not about unpacking, and
-    # an unpacking refusal with no audio to reshape, are both raised on the
-    # first call rather than provoking a second in another shape.
+    # Neither guard may go: a non-unpacking refusal, or an unpacking refusal with no audio to reshape, raises on the first call instead of retrying.
     for label, message, audio in (("not an unpacking refusal", "some other complaint", [clip]),
                                   ("nothing to reshape", "too many values to unpack", [])):
         seen = []
@@ -5601,9 +5306,8 @@ def test_the_mlx_vlm_boundary_reshapes_audio_a_processor_cannot_unpack():
                 _Processor(), ["hi"], audio=audio)
         assert len(seen) == 1, label
 
-    # Only the retried call is answered with the first refusal. A failure
-    # while building the pairs says nothing about what the processor wanted,
-    # so it is raised as itself.
+    # Only the retried call is answered with the first refusal; a failure while building the pairs says nothing about
+    # what the processor wanted, so it is raised as itself.
     from unsloth_zoo.mlx.utils import _call_pairing_audio_on_refusal
 
     def always_refuses(call_kwargs):
@@ -5616,8 +5320,7 @@ def test_the_mlx_vlm_boundary_reshapes_audio_a_processor_cannot_unpack():
         _call_pairing_audio_on_refusal(
             always_refuses, {"audio": [clip]}, "audio", cannot_pair)
 
-    # Everything else the caller passed survives the retry, or a mixed
-    # image-and-audio request would silently lose its image.
+    # Every other argument the caller passed survives the retry, or a mixed image-and-audio request would silently lose its image.
     retries = []
 
     def records(processor, prompts, images=None, audio=None, **kwargs):
@@ -5642,10 +5345,7 @@ def test_the_mlx_vlm_boundary_reshapes_audio_a_processor_cannot_unpack():
 
 
 def test_a_pair_taking_processor_is_not_reported_unusable():
-    """Some processors take ``(samples, rate)`` pairs and reject a bare
-    waveform by failing to unpack it. Reading that first refusal as the answer
-    reports a working checkpoint as unusable, which is what Phi-4's
-    remote-code processor did."""
+    """A pair-taking processor's first refusal of a bare waveform is not proof it is unusable (Phi-4)."""
     from unsloth_zoo.mlx.utils import (
         _AUDIO_PROBE_RATE, _AUDIO_PROBE_TONES, _audio_payload_as_pairs,
         _audio_probe_tone, audio_input_capability,
@@ -5669,9 +5369,7 @@ def test_a_pair_taking_processor_is_not_reported_unusable():
     whole = len(_audio_probe_tone(_AUDIO_PROBE_RATE, _AUDIO_PROBE_TONES[0]))
     assert processor.seen and set(processor.seen) == {(whole, _AUDIO_PROBE_RATE)}
 
-    # A clip that carries no rate of its own -- what a dataset column yields --
-    # takes the rate the processor's extractor expects, which Phi-4 keeps on a
-    # separately named audio extractor rather than on the processor itself.
+    # A clip with no rate of its own, as a dataset column yields, takes the extractor's rate; Phi-4 keeps that on a separate audio extractor, not the processor.
     rated = type("_Rated", (_ProbeProcessor,), {
         "audio_processor": type("_Extractor", (), {"sampling_rate": 22050})(),
     })()
@@ -5680,10 +5378,7 @@ def test_a_pair_taking_processor_is_not_reported_unusable():
 
 
 def test_a_checkpoint_that_drops_its_audio_is_not_capable():
-    """The motivating defect: the export omits the audio half of its
-    preprocessor configuration, so the processor takes the argument and skips
-    the audio. Nothing raises and every field is well formed, so only the
-    content differential separates it from a working checkpoint."""
+    """Audio dropped from preprocessor config raises nothing; only a content differential catches it."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     class _Drops(_ProbeProcessor):
@@ -5699,9 +5394,7 @@ def test_a_checkpoint_that_drops_its_audio_is_not_capable():
 
 
 def test_output_that_follows_only_the_clip_length_is_not_capable():
-    """Both tones are the same duration, so a processor sizing its output from
-    the length alone produces identical outputs and cannot be told from one
-    that ignored the audio."""
+    """Both probe tones have equal duration, so a length-only processor matches one that ignores audio."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     class _LengthOnly(_ProbeProcessor):
@@ -5713,25 +5406,20 @@ def test_output_that_follows_only_the_clip_length_is_not_capable():
 
 
 def test_a_processor_that_cannot_repeat_itself_is_not_capable():
-    """The same tone twice must agree. A processor alternating between outputs
-    would otherwise show a difference that says nothing about the audio."""
+    """Repeated calls on one tone must agree; alternating outputs would read as an audio difference."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     class _Alternates(_ProbeProcessor):
         def __call__(self, text, audio=None, **kwargs):
             self.calls += 1
-            # A period that also makes the two tones' outputs differ, so only
-            # the same-tone agreement check can refuse this.
+            # A period that also makes the two tones' outputs differ, so only the same-tone agreement check can refuse this.
             return {"input_ids": np.full((1, 8), self.calls % 3, np.int32)}
 
     assert audio_input_capability(_AudioModel(), _Alternates()).capable is False
 
 
 def test_keying_on_the_buffer_instead_of_its_samples_is_not_capable():
-    """Every call gets a freshly built buffer, so a processor keying on object
-    identity sees four distinct clips -- the discarded warm-up and the three
-    measured calls -- and cannot repeat itself. Reusing one buffer per tone in
-    the probe would let this shape pass."""
+    """Fresh buffer per call exposes identity-keyed processors; one buffer per tone would hide them."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     class _KeysOnIdentity(_ProbeProcessor):
@@ -5749,8 +5437,7 @@ def test_keying_on_the_buffer_instead_of_its_samples_is_not_capable():
 
 
 def test_a_processor_that_warms_up_on_its_first_call_is_still_capable():
-    """One discarded call absorbs one-time state, so a real processor that
-    differs only on its first call is not mistaken for an unrepeatable one."""
+    """Discarded first call absorbs one-time state; processors differing only on call one stay capable."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     class _Warms(_ProbeProcessor):
@@ -5764,9 +5451,7 @@ def test_a_processor_that_warms_up_on_its_first_call_is_still_capable():
 
 
 def test_a_caller_supplied_text_answers_for_a_processor_that_needs_a_marker():
-    """Which marker a processor needs is prompt-rendering knowledge, so the
-    caller supplies candidates. A lone string is one candidate, not a sequence
-    of characters -- the form the Studio consumer passes."""
+    """Marker candidates come from the caller; a lone string is one candidate, not a char sequence."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     processor = _ProbeProcessor(needs_text="<|audio|> transcribe")
@@ -5789,8 +5474,7 @@ def test_a_processor_that_raises_answers_not_capable_without_escaping():
     verdict = audio_input_capability(_AudioModel(), _Raises())
     assert verdict.capable is False and "raised" in verdict.reason
 
-    # A model that raises escapes the probe's own guards, so only the outer
-    # one keeps this total.
+    # A model that raises escapes the probe's own guards, so only the outer guard keeps this total.
     class _BrokenModel:
         def named_modules(self):
             raise RuntimeError("this model cannot be walked")
@@ -5800,9 +5484,7 @@ def test_a_processor_that_raises_answers_not_capable_without_escaping():
 
 
 def test_audio_modules_are_found_wherever_the_family_nests_them():
-    """The families spell it five ways, so the walk keys on the name. The
-    nested path is a layout a fixed attribute list would miss -- not a claim
-    about where any one family puts it; Phi-4's pair sits at the top level."""
+    """Audio modules are matched by name, not a fixed attribute list that would miss nested layouts."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     for names in (("audio_tower", "embed_audio"),
@@ -5827,8 +5509,7 @@ def test_without_a_model_the_check_can_refute_but_never_affirm():
 
 
 def test_mlx_array_outputs_are_fingerprinted_by_their_own_values():
-    """Real processors return MLX arrays, and exact integer outputs must not be
-    collapsed by a lossy cast on the way to comparison."""
+    """Real processors return MLX arrays; exact integer outputs must not pass through a lossy cast."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     class _MXOut(_ProbeProcessor):
@@ -5842,8 +5523,7 @@ def test_mlx_array_outputs_are_fingerprinted_by_their_own_values():
 
 
 def test_a_later_candidate_text_still_answers():
-    """The contract takes a sequence, so a processor whose marker appears only
-    in a later candidate must still be found capable."""
+    """A marker found only in a later candidate still counts; the contract takes a sequence."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     processor = _ProbeProcessor(needs_text="second <|audio|>")
@@ -5854,8 +5534,7 @@ def test_a_later_candidate_text_still_answers():
 
 
 def test_a_processor_taking_only_audios_is_called_with_that_keyword():
-    """Families disagree on the keyword; resolving it wrongly would refuse a
-    capable checkpoint for a reason that has nothing to do with its audio."""
+    """Families disagree on the keyword; a wrong choice refuses capable checkpoints for non-audio reasons."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     class _AudiosOnly(_ProbeProcessor):
@@ -5868,8 +5547,7 @@ def test_a_processor_taking_only_audios_is_called_with_that_keyword():
 
 
 def test_even_a_base_exception_cannot_escape_the_capability_check():
-    """It runs at model-load time, so nothing it touches may abort a load --
-    including the interrupt-shaped exceptions a narrower guard would let past."""
+    """Runs at model load, so no exception may escape, even interrupt-shaped BaseException subclasses."""
     from unsloth_zoo.mlx.utils import audio_input_capability
 
     class _Interrupts:
@@ -5881,17 +5559,13 @@ def test_even_a_base_exception_cannot_escape_the_capability_check():
 
 
 def test_the_repeated_audio_placeholder_is_never_a_target(monkeypatch):
-    """Phi-4 spells its placeholder `<|endoftext11|>` and declares it in neither
-    the tokenizer attributes nor its checkpoint config, so the names the loss
-    mask collects from do not reach it and every audio position was supervised.
-    It is resolved the same way run counting resolves it."""
+    """Undeclared Phi-4 <|endoftext11|> audio placeholder was supervised; resolve it as run counting does."""
     from unsloth_zoo.mlx.utils import (
         _get_vlm_audio_soft_token_ids, _get_vlm_ignore_token_ids,
     )
 
     class _UndeclaredPlaceholder(_FakeProcessor):
-        # Phi-4's shape: the placeholder is in the vocabulary and nowhere else.
-        # No `audio_token` attribute, no config index -- only the spelling.
+        # Phi-4's shape: the placeholder is in the vocabulary and nowhere else, with no audio_token attribute or config index, only the spelling.
         tokenizer = type("_Tok", (_FakeTokenizer,), {
             "_vocab": dict(_FakeTokenizer._vocab, **{"<|endoftext11|>": 200011}),
         })()
@@ -5906,19 +5580,8 @@ def test_the_repeated_audio_placeholder_is_never_a_target(monkeypatch):
 
 
 class _TruncationDivertingAudioProcessor:
-    """A processor that fans its flat keywords out to its audio extractor.
-
-    This is what transformers' `_merge_kwargs` does: a flat keyword reaches
-    every modality that declares it, and `AudioKwargs` declares `max_length`
-    and `truncation`. Gemma 3n shows the result -- a one-second clip under
-    `max_length=512` comes back as zero mel frames, the waveform cut to 512
-    samples, while `input_ids` is untouched.
-
-    An empty `audio_kwargs` is what stops it: a modality present in kwargs
-    stops reading flat keywords. This fixture reproduces exactly that rule,
-    including the part that matters most -- the text side must keep reading
-    its flat keywords, or padding and `add_special_tokens` go with it.
-    """
+    """Mimics _merge_kwargs fanning flat max_length into the audio extractor; an empty audio_kwargs stops it, but the
+    text side must keep reading its flat keywords or padding and add_special_tokens go"""
 
     tokenizer = _FakeTokenizer()
     image_processor = object()
@@ -5954,13 +5617,7 @@ class _TruncationDivertingAudioProcessor:
 
 
 def test_a_text_cap_does_not_reach_the_audio_extractor():
-    """`max_length` is a token budget and must not be read as a sample budget.
-
-    Left flat, it fans out to every modality that declares it, and
-    `AudioKwargs` declares it. Every clip longer than `max_seq_length` samples
-    -- which is every clip, at any realistic cap -- then loses its audio while
-    the row keeps its placeholders, leaving placeholders with nothing behind.
-    """
+    """max_length is a token budget; if it reaches audio, clips lose their audio but keep placeholders."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     processor = _TruncationDivertingAudioProcessor()
@@ -5975,13 +5632,7 @@ def test_a_text_cap_does_not_reach_the_audio_extractor():
 
 
 def test_shielding_the_audio_side_leaves_the_text_side_flat():
-    """The shield goes on the audio modality, never the text one.
-
-    Putting `text_kwargs` in instead would stop the text modality reading its
-    flat keywords, taking `padding`, `add_special_tokens` and `return_tensors`
-    with the cap -- ragged output and a doubled BOS. So the text side must
-    still see both the cap and its padding flag.
-    """
+    """Shield audio_kwargs only: text_kwargs would drop padding and add_special_tokens, doubling the BOS."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     processor = _TruncationDivertingAudioProcessor()
@@ -6022,11 +5673,7 @@ def test_processor_forwarding_kwargs_to_its_tokenizer_drops_audio_shield():
 
 
 def test_a_text_only_batch_is_collated_exactly_as_before():
-    """The shield is for batches carrying audio, and only those.
-
-    A processor with no audio to fan the keyword into should see the call it
-    always did, so this cannot change collation for text or images.
-    """
+    """The shield applies only to batches with audio; text-only batches are collated exactly as before."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     processor = _TruncationDivertingAudioProcessor()
@@ -6035,9 +5682,7 @@ def test_a_text_only_batch_is_collated_exactly_as_before():
 
 
 def test_qwen3_omni_counts_video_url_as_video():
-    """`video_url` carries no "video" key, so the two counters disagreed on an
-    alias one of them accepts. Grouping only; the native template renders no
-    placeholder for this shape, verified against its own chat_template.jinja."""
+    """video_url must count as video; grouping only, since the native template renders no placeholder."""
     from unsloth_zoo.mlx.loader import (
         _qwen3_omni_media_counts,
         _normalize_qwen3_omni_counted_message,
@@ -6055,8 +5700,7 @@ def test_qwen3_omni_counts_video_url_as_video():
 
 
 def test_qwen3_omni_normalizes_media_turns_after_the_first():
-    """Only the anchor was normalized, so a later turn ordered `text, audio`
-    kept that order and the audio lost Thinker conditioning."""
+    """Later turns must be normalized too, or a text-then-audio turn drops audio's Thinker conditioning."""
     from mlx_vlm import prompt_utils
     from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
 
@@ -6102,10 +5746,7 @@ def test_qwen3_omni_deficit_still_lands_only_on_the_anchor():
 
 
 def test_key_only_audio_parts_are_extracted_like_the_template_renders_them():
-    """Qwen's template emits a placeholder for a key-only `{"audio": clip}`
-    (`content.type == 'audio' or 'audio' in content or 'audio_url' in content`),
-    but the extractor keyed on `part["type"]` alone and supplied no waveform,
-    leaving the row one placeholder short of a tensor."""
+    """Key-only audio parts get a placeholder from Qwen's template, so extraction must read them too."""
     import numpy as np
     from unsloth_zoo.mlx.loader import _qwen3_omni_media_counts
     from unsloth_zoo.mlx.utils import _vlm_audio_part_state
@@ -6124,8 +5765,7 @@ def test_key_only_audio_parts_are_extracted_like_the_template_renders_them():
 
 
 def test_a_bare_audio_placeholder_still_reports_itself_as_bare():
-    """A typed part with no payload keeps signalling a bare placeholder, and
-    non-audio parts are still ignored."""
+    """A typed part with no payload still signals a bare placeholder; non-audio parts are ignored."""
     from unsloth_zoo.mlx.utils import _vlm_audio_part_state
 
     bare, payloads = _vlm_audio_part_state(
@@ -6143,9 +5783,7 @@ def test_a_bare_audio_placeholder_still_reports_itself_as_bare():
 
 
 def test_qwen3_omni_normalizes_embedded_media_without_scalar_counts():
-    """Media embedded in the messages leaves `num_images`/`num_audios` at zero,
-    and the ordering is wrong on its own merits, so gating normalization on the
-    counts let `text, audio` reach the template unchanged."""
+    """Embedded media leaves num_images/num_audios at zero, so normalization must not depend on counts."""
     from mlx_vlm import prompt_utils
     from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
 
@@ -6163,8 +5801,7 @@ def test_qwen3_omni_normalizes_embedded_media_without_scalar_counts():
 
 
 def test_qwen3_omni_leaves_assistant_turns_alone_without_counts():
-    """Reordering every turn must still skip the roles the renderer treats as
-    non-user, otherwise assistant history gets rewritten."""
+    """Reordering must skip non-user roles, or assistant history gets rewritten."""
     from mlx_vlm import prompt_utils
     from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
 
@@ -6321,11 +5958,8 @@ def _suffix_pair_batch(suffixes=("answer",)):
 
 
 def test_suffix_pair_markers_never_reach_the_text_stack():
-    """A text-only row is encoded as a tokenizer pair, so its `token_type_ids`
-    mean "1 = suffix". Gemma3's stack reads that key as "1 = image" and turns
-    every marked span bidirectional, which would let the answer attend to its
-    own future tokens. The model-level kwargs still carry it, because
-    PaliGemma's prefix-LM wrapper is the consumer that wants that meaning."""
+    """Pair-encoded token_type_ids (1 = suffix) must not reach the text stack: Gemma3 reads 1 as image and makes marked
+    spans bidirectional, so the answer sees its own future tokens; model-level kwargs keep them for PaliGemma"""
     from unsloth_zoo.mlx.utils import _drop_pair_token_type_ids
 
     batch = _suffix_pair_batch()
@@ -6359,8 +5993,7 @@ def test_gemma_image_mask_is_bidirectional_over_a_marked_span():
      "<THINK>R</THINK>ANSWER"),
 ])
 def test_a_template_that_transforms_content_still_renders(template, expected):
-    """The content-preservation checks choose between candidates; they do not
-    get to fail a render the template itself accepted."""
+    """Content-preservation checks pick between candidates and never fail a render the template accepted."""
     from unsloth_zoo.mlx.utils import _render_vlm_messages
 
     class _Processor:
@@ -6393,8 +6026,7 @@ def test_a_template_that_renders_nothing_is_still_an_error():
 
 
 def test_rendering_does_not_copy_the_row_media():
-    """`_render_vlm_messages` runs per training sample, so deep-copying the
-    message list clones every image on every row."""
+    """Rendering runs per training sample, so deep-copying the message list would clone every image."""
     from unsloth_zoo.mlx.utils import _render_vlm_messages
 
     copied = []
@@ -6426,8 +6058,7 @@ def test_rendering_does_not_copy_the_row_media():
 ])
 def test_string_only_templates_number_the_audio_parts_a_processor_declares(
         monkeypatch, stem, expected):
-    """Phi-4's template concatenates content as a string, so a typed audio part
-    reaches it only as the `<|audio_N|>` its processor module declares."""
+    """String-only templates see audio parts only as the <|audio_N|> tokens the processor declares."""
     import sys
     from unsloth_zoo.mlx.utils import _render_vlm_messages
 
@@ -6459,9 +6090,7 @@ def test_string_only_templates_number_the_audio_parts_a_processor_declares(
 
 
 def test_compile_preparation_adds_no_metadata_key_without_metadata():
-    """Every VLM batch goes through the compile preparation, so writing the
-    static-metadata dict unconditionally puts a new key in every text-only
-    batch's pytree."""
+    """Every VLM batch goes through compile prep, so no metadata key may enter text-only batches."""
     from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
 
     text_only = _prepare_vlm_batch_for_compile(
@@ -6480,13 +6109,7 @@ def test_compile_preparation_adds_no_metadata_key_without_metadata():
     ("qwen2_vl", False), ("qwen2_5_vl", False), ("qwen3_vl", False), ("paddleocr_vl", False),
 ])
 def test_grid_form_follows_the_family_when_the_processor_emits_a_list(model_type, wants_array):
-    """These vision towers open with `grid_thw.tolist()` and a tuple raises there,
-    while the Qwen/Paddle compile patches trace the grid as static metadata and an
-    array becomes a tracer. A processor that hands over a plain list has to be
-    coerced to whichever form its own family reads.
-
-    Also pinned by tests/test_mlx_text_path_contract.py, which no workflow runs.
-    """
+    """Towers need an array for .tolist(); Qwen/Paddle compile needs a tuple, since an array traces."""
     from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
 
     out = _prepare_vlm_batch_for_compile(
@@ -6501,8 +6124,7 @@ def test_grid_form_follows_the_family_when_the_processor_emits_a_list(model_type
 
 
 def test_a_processor_emitted_grid_array_is_never_downgraded():
-    """The point of the change this pins: an array the processor built stays an
-    array even for a family whose default form is the tuple."""
+    """A grid array the processor built stays an array, even for families whose default form is a tuple."""
     from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
 
     out = _prepare_vlm_batch_for_compile(
@@ -6530,9 +6152,8 @@ def test_a_processor_emitted_grid_array_is_never_downgraded():
 def test_a_family_without_a_patched_embedder_still_gets_its_static_metadata(
     model_type, declared, undeclared,
 ):
-    """These towers read the metadata on the host, where the processor's array is
-    a tracer under mx.compile, and none of them has a patched embedder to declare
-    the key on. Keys the family does not read stay as the processor emitted them."""
+    """Towers with no patched embedder still get static metadata, read on the host where an array is a tracer under
+    mx.compile; keys the family does not read stay as the processor emitted them"""
     from types import SimpleNamespace
 
     from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
@@ -6555,16 +6176,13 @@ def test_a_family_without_a_patched_embedder_still_gets_its_static_metadata(
     ([[20, 5, 20]], 2, [0, None, 1]),
     # One image placeholder, so one feature row: the video token stays text.
     ([[10, 20, 20]], 1, [0, None, None]),
-    # Image token away from position zero: reading presence off the first token
-    # alone would pick the video placeholders here.
+    # Image token away from position zero: reading presence off the first token alone would pick the video placeholders here.
     ([[20, 10, 10]], 2, [None, 0, 1]),
 ])
 def test_the_exclusive_merge_fills_video_placeholders_only_without_images(
     ids, rows, expected_rows,
 ):
-    """dots_ocr and glm_ocr upstream fall back to the video placeholder only when
-    the sequence carries no image one, so a sequence holding both fills the image
-    positions alone."""
+    """Upstream dots_ocr and glm_ocr fill video placeholders only in sequences with no image placeholder."""
     from unsloth_zoo.mlx.compile import _merge_exclusive_special_token_features
 
     inputs_embeds = mx.zeros((1, 3, 2))
@@ -6579,9 +6197,7 @@ def test_the_exclusive_merge_fills_video_placeholders_only_without_images(
 
 
 def test_the_exclusive_merge_carries_the_dots_ocr_count_contract():
-    """Its upstream prefix-slices the block per row, so a trailing feature row is
-    ignored and only a shortfall is refused. Requiring equality here is the
-    mistake this wiring exists to avoid."""
+    """Upstream prefix-slices per row, so extra feature rows are ignored; only a shortfall is refused."""
     from unsloth_zoo.mlx.compile import _merge_exclusive_special_token_features
 
     inputs_embeds = mx.zeros((1, 3, 2))
@@ -6603,8 +6219,7 @@ def test_the_exclusive_merge_carries_the_dots_ocr_count_contract():
 @pytest.mark.parametrize("key", ["grid_thws", "image_grid_hws", "video_grid_hws"])
 @pytest.mark.parametrize("row", [[1, 16, 16], [16, 16]])
 def test_the_kimi_grid_key_names_are_measured_too(key, row):
-    """Kimi's processor names the grid differently and drops the frame axis for
-    stills, so the measured value has to keep whatever width the row had."""
+    """Kimi's grid key differs and stills drop the frame axis, so measure at the row's own width."""
     from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
 
     raw = mx.array([row])
@@ -6618,8 +6233,7 @@ def test_the_kimi_grid_key_names_are_measured_too(key, row):
 
 
 def test_a_tower_that_indexes_the_grid_as_an_array_is_left_alone():
-    """glm4v opens with `grid_thw.tolist()` and `mx.max(grid_thw[:, 1:])` on the
-    same object, so substituting the Python value would break it instead."""
+    """glm4v indexes the grid as an array (.tolist() and mx.max), so a Python value would break it."""
     from types import SimpleNamespace
 
     from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
@@ -6635,16 +6249,13 @@ def test_a_tower_that_indexes_the_grid_as_an_array_is_left_alone():
     assert isinstance(kwargs["image_grid_thw"], mx.array)
 
 
-# Two placeholders two elements wide: every layout holding four elements can
-# fill them, and (2, 1) cannot however its axes are read.
+# Two placeholders two elements wide: every layout holding four elements can fill them, but (2, 1) cannot however its axes are read.
 @pytest.mark.parametrize("shape,fills", [
     ((2, 2), True), ((1, 2, 2), True), ((2, 1, 2), True), ((4,), True),
     ((1, 4), True), ((2, 1), False), ((1, 1, 2), False),
 ])
 def test_the_count_is_of_placeholders_the_features_can_fill(shape, fills):
-    """minimax_m3_vl compares the elements it scatters rather than a row count,
-    so a folded or leading axis is not a mismatch there. Measuring an axis
-    instead refuses a batch its upstream accepts."""
+    """minimax_m3_vl compares scattered elements, not rows; measuring an axis would refuse valid batches."""
     from unsloth_zoo.mlx.compile import _raise_on_feature_count_mismatch
 
     mask, inputs_embeds = mx.array([[True, True, False]]), mx.zeros((1, 3, 2))
@@ -6657,9 +6268,7 @@ def test_the_count_is_of_placeholders_the_features_can_fill(shape, fills):
 
 
 def test_a_block_that_does_not_divide_into_rows_fills_nothing():
-    """Three elements cannot be read as rows two wide. Counting them as one row
-    would pass the surplus-tolerant check and then fail to reshape in the merge,
-    which is the shape of every mistake this guard has already made."""
+    """Three elements cannot be rows two wide; as one row they would pass the check and fail in the merge."""
     from unsloth_zoo.mlx.compile import _raise_on_feature_count_mismatch
 
     with pytest.raises(ValueError, match="tokens=1, features=0"):
@@ -6670,9 +6279,7 @@ def test_a_block_that_does_not_divide_into_rows_fills_nothing():
 
 @pytest.mark.parametrize("shape", [(2, 2), (1, 2, 2), (2, 1, 2), (4,), (1, 4)])
 def test_the_merge_indexes_a_folded_feature_block_by_its_elements(shape):
-    """Upstream scatters the block's elements, so a leading or folded axis holds
-    the same features in a different shape. Accepting one at the count and then
-    failing to index it would be worse than refusing it."""
+    """Merge indexes by element, as upstream scatters; accepting a block it then cannot index is worse."""
     from unsloth_zoo.mlx.compile import _merge_sequence_mask_features
 
     merged, _ = _merge_sequence_mask_features(
@@ -6685,8 +6292,7 @@ def test_the_merge_indexes_a_folded_feature_block_by_its_elements(shape):
 
 
 def test_the_shared_merge_itself_refuses_nothing():
-    """Idefics hands it a feature row per padded image slot, so the count
-    belongs to each tower rather than to the merge they share."""
+    """Idefics gives every padded image slot a feature row; the count belongs to its tower, not the merge."""
     from unsloth_zoo.mlx.compile import _merge_sequence_mask_features
 
     merged, _ = _merge_sequence_mask_features(
@@ -6699,8 +6305,7 @@ def test_the_shared_merge_itself_refuses_nothing():
 
 
 def test_the_count_check_steps_aside_for_a_mask_it_cannot_read():
-    """A mask derived from a compiled function's own inputs is a tracer, and the
-    comparison has no host value to make."""
+    """A mask derived from compiled inputs is a tracer with no host value, so the count check is skipped."""
     from unsloth_zoo.mlx.compile import _raise_on_feature_count_mismatch
 
     features = mx.array([[1.0, 1.0], [2.0, 2.0]])
@@ -6716,9 +6321,7 @@ def test_the_count_check_steps_aside_for_a_mask_it_cannot_read():
 
 @pytest.mark.parametrize("decision", [None, "disabled"])
 def test_the_family_table_stays_off_when_compile_is_not_running(decision):
-    """Its keys name what a patched tower reads. `patch_mode="unpatched"` leaves
-    the upstream tower in place, and that one still calls `.tolist()` on the
-    array it was handed."""
+    """Keys name what patched towers read; unpatched upstream towers still call .tolist() on the array."""
     from types import SimpleNamespace
 
     from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
@@ -6735,8 +6338,7 @@ def test_the_family_table_stays_off_when_compile_is_not_running(decision):
 
 
 def test_a_patched_embedder_declaration_still_applies_without_a_decision():
-    """The patch that declares the keys is the tower that reads them, so the
-    declaration cannot outlive the patch the way the table can."""
+    """The patch declaring keys is the tower reading them, so the declaration cannot outlive the patch."""
     from types import SimpleNamespace
 
     from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
@@ -6765,8 +6367,7 @@ def test_a_patched_embedder_declaration_wins_over_the_family_table():
         raise AssertionError("never called")
 
     embedder._unsloth_static_vlm_metadata = ("image_grid_thw",)
-    # An enabled decision, so the competing table path is live: pixtral's entry
-    # names `image_sizes`, which the declaration has to keep out of the kwargs.
+    # With an enabled compile decision the competing table path is live; pixtral's entry names `image_sizes`, which the declaration must keep out of kwargs.
     model = SimpleNamespace(
         config=SimpleNamespace(model_type="pixtral"), get_input_embeddings=embedder,
         _unsloth_compile_decision=SimpleNamespace(enabled=True))
@@ -6781,8 +6382,7 @@ def test_a_patched_embedder_declaration_wins_over_the_family_table():
 
 
 def test_a_sidecar_symlink_out_of_the_model_is_not_dereferenced(tmp_path):
-    """A writable model directory is otherwise enough to aim a sidecar at a
-    credential file and have the save copy it into a published adapter."""
+    """Symlinked sidecars pointing outside the model must not be followed, or credentials get published."""
     from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
 
     secret = tmp_path / "credentials.json"
@@ -6803,8 +6403,7 @@ def test_a_sidecar_symlink_out_of_the_model_is_not_dereferenced(tmp_path):
 
 
 def test_a_hugging_face_snapshot_symlink_is_still_followed(tmp_path):
-    """Every file in an HF snapshot is a symlink into a sibling blobs/ dir, so
-    the rule cannot be "must resolve inside the source"."""
+    """Snapshot files symlink into a sibling blobs/ dir, so the source-confinement rule cannot apply."""
     from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
 
     repo = tmp_path / "models--org--name"

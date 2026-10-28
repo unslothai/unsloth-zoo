@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fused linear CE / log-probs (torch.library ops, Triton row kernels on GPU) against an fp64 oracle, the chunked CE
-it replaces, and torch.compile(fullgraph=True)."""
+"""Fused linear CE and log-probs vs an fp64 oracle, the chunked CE, and torch.compile(fullgraph=True)."""
 
 import os
 
@@ -491,8 +490,8 @@ def test_opcheck():
 @pytest.mark.parametrize("V", [4096, 4096 * 3 + 5, 151936])
 @pytest.mark.parametrize("mode", ["0", "1", "2"])
 def test_gpu_accuracy_modes_and_inplace(monkeypatch, V, mode):
-    """Every accuracy mode (fp32 logits + in-place half gradient, half logits + exact target, plain half), with
-    several vocab blocks per row so the in-place gradient overlaps logits other warps still read."""
+    """Every accuracy mode (fp32 logits + in-place half grad; half logits + exact target; plain half), several vocab
+    blocks per row so in-place grad overlaps logits other warps read."""
     monkeypatch.setattr(fl, "_ACCURACY", mode)
     dtype = torch.bfloat16 if _half_ok("cuda") else torch.float16
     N, H = 300, 64

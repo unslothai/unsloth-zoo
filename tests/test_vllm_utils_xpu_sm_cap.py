@@ -14,15 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression guard for XPU SM-capability handling in _get_vllm_state_dict.
-
-Intel XPU (like AMD ROCm) has no NVIDIA SM capability, and
-torch.cuda.get_device_capability() fails there. _get_vllm_state_dict must skip
-the CUDA query and set sm_cap = 0 on XPU, gating out the SM90-only
-CUTLASS/DeepGEMM paths. The full function needs a live vLLM model, so this checks
-the source-level invariant (metadata-only, no import / no CUDA probe) the same
-way tests/test_zoo_history_regressions_deep.py does.
-"""
+"""Regression guard: XPU (like ROCm) has no NVIDIA SM capability and torch.cuda.get_device_capability() fails there, so
+_get_vllm_state_dict must skip it and set sm_cap = 0, gating out SM90-only CUTLASS/DeepGEMM paths; checked from
+source text without importing vllm_utils."""
 
 import importlib.util
 import pathlib
@@ -30,8 +24,7 @@ import re
 
 
 def _module_source_text(module_name: str) -> str:
-    # find_spec is metadata-only, so importing vllm_utils (and its import-time
-    # torch.cuda probes) is avoided on a CPU-only box.
+    # find_spec is metadata-only, so importing vllm_utils and its import-time torch.cuda probes is avoided on a CPU-only box.
     spec = importlib.util.find_spec(module_name)
     if spec is None or spec.origin in (None, "built-in"):
         raise ImportError(f"could not locate source for {module_name!r}")

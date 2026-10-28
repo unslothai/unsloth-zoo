@@ -14,21 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Which `moe_utils` the sys.modules leak gate in conftest.py treats as a leak.
-
-The gate has to separate two things that look identical in sys.modules. Compiling a
-MoE architecture imports moe_utils out of the compile folder as ordinary production
-behaviour, and CI points that folder at `$PWD/.lanes/compiled-<id>`, which lives for
-the whole job. A test that loads a copy from tmp_path_factory leaves behind a module
-whose directory is deleted underneath it, and every later bare `from moe_utils import
-...` silently resolves to that copy.
-
-Getting this backwards is not hypothetical in either direction: a rule with no
-qualification failed test_compiler_dynamic_exec.py for compiling a MoE model, and no
-rule at all is what let the tmp_path copy from
-test_moe_weight_preprocessor_registry_shared.py break the recovery test in
-test_compiled_cache_collective.py.
-"""
+"""Checks which moe_utils the conftest sys.modules leak gate flags: pytest tmp_path copies (directory deleted later) are
+leaks, the CI .lanes compile folder is not; both directions broke tests."""
 
 from __future__ import annotations
 
@@ -49,16 +36,14 @@ def test_moe_utils_is_the_guarded_bare_name():
 
 
 def test_a_copy_from_a_pytest_temp_directory_is_a_leak(tmp_path_factory):
-    # The real thing rather than a hand-written path, so this keeps tracking
-    # pytest's layout if it ever changes.
+    # Uses the real pytest temp layout rather than a hand-written path, so the test tracks pytest if its layout ever changes.
     real = tmp_path_factory.mktemp("compile_location") / "moe_utils.py"
     assert _is_from_pytest_tmp(_module(str(real)))
 
 
 def test_the_ci_lane_compile_folder_is_not_a_leak():
-    # consolidated-tests-ci.yml: UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$id".
-    # This copy stays valid for the whole job, and flagging it fails every test that
-    # compiles a MoE architecture.
+    # consolidated-tests-ci.yml sets UNSLOTH_COMPILE_LOCATION to $PWD/.lanes/compiled-$id; that copy stays valid for the
+    # whole job, so flagging it fails every MoE compile test.
     assert not _is_from_pytest_tmp(
         _module("/home/runner/work/unsloth-zoo/unsloth-zoo/.lanes/compiled-pyproject/moe_utils.py")
     )
@@ -74,12 +59,7 @@ def test_a_module_with_no_file_is_not_reported():
     assert not _is_from_pytest_tmp(None)
 
 
-# The other half of the gate: the bitsandbytes names, where a bare ModuleType is the
-# thing being watched for. unsloth_zoo mints exactly such a module on Apple Silicon,
-# which made the first test importing anything bitsandbytes-adjacent fail at teardown
-# on macOS while passing everywhere a real wheel exists (unsloth-zoo#1217's macOS leg:
-# "84 passed, 1 error", the error being test_guard_is_present_and_mirrors_the_stock
-# _predicate leaving bitsandbytes.nn behind).
+# Bitsandbytes names watch for a bare ModuleType: unsloth_zoo mints one on Apple Silicon, which failed teardown on macOS (unsloth-zoo issue 1217).
 
 from conftest import _GUARDED_MODULES, _is_module_stub, _is_unsloth_stub
 
@@ -103,8 +83,7 @@ def test_the_zoo_stub_is_not_a_leak():
 
 
 def test_an_unmarked_substitute_is_still_a_leak():
-    """The narrowing must not swallow the case the gate exists for: a test that drops
-    its own hand rolled bitsandbytes.functional in and leaves it there."""
+    """The narrowing must still flag an unmarked hand rolled substitute, such as a test that leaves its own bitsandbytes.functional module in sys.modules."""
     assert not _is_unsloth_stub(_stub_module("bitsandbytes.functional", marked = False))
     assert not _is_unsloth_stub(None)
 

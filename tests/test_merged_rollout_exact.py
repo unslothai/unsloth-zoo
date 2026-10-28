@@ -226,8 +226,7 @@ def test_offload_failure_after_fold_restores_from_device_stores(monkeypatch):
 
 
 def test_unfold_on_another_stream_waits_for_the_offload():
-    # The offload's device-to-host copies are held back on their stream; an unfold on the
-    # default stream must not read the host stores before they land.
+    # The offload's device-to-host copies are held back on their stream; an unfold on the default stream must not read the host stores before they land.
     W, A, B, scale = _dense(1024, 4096, 16, 1e-2)
     W0 = W.clone()
     t = _target(W, A, B, scale)

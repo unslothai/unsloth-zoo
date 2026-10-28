@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Routed NF4 / BF16 MoE decode kernels (moe_routed.py) for transformers v5 3D experts.
-
-Every arm is checked against an fp64 reference built from bitsandbytes' own dequant, and
-against the path the kernels replace (dequantize every expert + grouped_mm), which must be
-no more accurate than the routed one."""
+"""Routed NF4/BF16 MoE decode kernels in moe_routed.py for transformers v5 3D experts: checked against an fp64
+bitsandbytes dequant reference; the replaced dequant + grouped_mm path must be no more accurate."""
 import os
 
 import pytest

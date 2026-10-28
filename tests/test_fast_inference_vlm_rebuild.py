@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference vLLM -> HF rebuild for gemma4_unified (gemma-4-12b) and muse_glimmer, on CPU.
-
-The fake vLLM models mirror the module names of vllm/model_executor/models/gemma4_unified.py
-(language model from gemma4.py) and muse_glimmer.py; the reference is the transformers model.
-"""
+"""Checks the fast_inference vLLM to HF rebuild for gemma4_unified and muse_glimmer on CPU; fake vLLM modules mirror
+vLLM's module names and transformers is the reference."""
 
 import copy
 import os
@@ -198,8 +195,8 @@ def test_gemma4_unified_vllm_rebuild_matches_hf(monkeypatch, tmp_path):
 
 @_needs_gemma4_unified
 def test_gemma4_unified_bnb_patch_dense_is_dequantized(monkeypatch, tmp_path):
-    # load_in_4bit: vLLM builds vision_embedder.patch_dense with quant_config; its key is installed
-    # as a plain tensor, so a packed weight must come back dequantized, not as uint8.
+    # load_in_4bit: vLLM builds vision_embedder.patch_dense with quant_config and installs its key as a plain tensor, so
+    # a packed weight must come back dequantized, not uint8.
     bnb_functional = pytest.importorskip("bitsandbytes.functional")
     from safetensors.torch import save_file
     from transformers import Gemma4UnifiedForConditionalGeneration
@@ -220,9 +217,9 @@ def test_gemma4_unified_bnb_patch_dense_is_dequantized(monkeypatch, tmp_path):
     got = rebuilt.model.embed_vision.patch_dense.weight
     assert got.dtype == torch.float32 and torch.equal(got, expected)
     assert not got.is_inference()  # trainable (vision LoRA / full vision fine-tuning)
-    # NF4 rounds to within half its widest level gap (-1.0 to -0.696, so 0.152 x the block absmax).
-    # Checked through a flat dequantize: bitsandbytes' CPU dequantize_4bit reads the wrong block's
-    # absmax for 2-D shapes whose rows are not a multiple of the block size (this one is 24 x 12).
+    # NF4 rounds to within 0.152 x block absmax (half its widest level gap); bitsandbytes' CPU dequantize_4bit reads the
+    # wrong block's absmax for 2-D shapes whose rows are not a multiple of the block size, so the check dequantizes
+    # flat.
     original = reference.model.embed_vision.patch_dense.weight
     flat_state = copy.copy(quant_state)
     flat_state.shape = torch.Size([1, original.numel()])
@@ -444,8 +441,8 @@ def test_gemma4_dense_vllm_rebuild_matches_hf(monkeypatch, tmp_path):
 
 
 def test_set_module_attribute_keeps_buffers_as_buffers():
-    # gemma-4-26B-A4B: std_bias / std_scale are vision-tower buffers; set as Parameters the
-    # rebuilt-tower census failed ("unexpected parameter", "buffer missing").
+    # gemma-4-26B-A4B: std_bias and std_scale are vision-tower buffers; set as Parameters, the rebuilt-tower census
+    # fails with unexpected parameter or buffer missing.
     from unsloth_zoo.empty_model import _set_module_attribute
     root = torch.nn.Module()
     root.tower = torch.nn.Module()

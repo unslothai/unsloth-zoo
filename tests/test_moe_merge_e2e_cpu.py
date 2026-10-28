@@ -69,16 +69,8 @@ def _build_synthetic_layer(num_experts, rank_per, hidden, intermediate, layout, 
 
 
 def _peft_expert_factors(A, B, expert_idx, num_experts):
-    """One expert's `(lora_A_rows, lora_B_columns)` out of a fused pair, as PEFT packs them.
-
-    The two halves are flattened differently and that asymmetry is the whole point: `lora_A`
-    is `(num_experts * rank, in)` with the expert index SLOWEST, so expert `e` is the
-    contiguous row block `e*rank : (e+1)*rank`; `lora_B` is `(out, num_experts * rank)` with
-    the expert index FASTEST, `reshape(out, rank, num_experts)` in
-    `ParamWrapper.get_delta_factors`, so expert `e` is plane `e` of that reshape. Restated
-    from PEFT here rather than imported from unsloth_zoo, so this file keeps an independent
-    expectation instead of echoing the code it checks.
-    """
+    """Expert e's (A rows, B columns) from a PEFT fused pair: lora_A is expert-slowest (row block e*rank), lora_B
+    expert-fastest (reshape out,rank,E); restated, not imported."""
     r = A.shape[0] // num_experts
     a = A[expert_idx * r:(expert_idx + 1) * r].to(torch.float64)
     b = B.reshape(B.shape[0], r, num_experts)[:, :, expert_idx].to(torch.float64)
@@ -103,9 +95,7 @@ def _analytic_down_delta(A, B, alpha, expert_idx, num_experts, layout):
 
 @pytest.mark.parametrize("layout", ["swapped", "standard"])
 def test_per_layer_merge_round_trip(layout):
-    # num_experts != rank_per, and both > 1: with E == r the two packings of lora_B still
-    # differ, but a shape error between the two axes would not show up, and with either of
-    # them 1 the packings coincide and the test would prove nothing at all.
+    # Needs num_experts != rank_per and both > 1: at E == r an axis shape error goes unseen; with either at 1 the packings coincide and the test proves nothing.
     num_layers, num_experts, rank_per = 2, 4, 3
     hidden, intermediate = 12, 8
     alpha = 8.0

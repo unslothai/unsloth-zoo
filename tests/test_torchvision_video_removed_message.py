@@ -1,20 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""Name a half-installed torchvision instead of re-raising its ImportError.
-
-Found by running `Kaggle-Llama3.2_(11B)-Vision`: a venv installed over the base
-image left torchvision 0.25.0+cu128 partly overwritten, so `io/__init__.py`
-still imports a `video` module that is gone and `import unsloth` dies on a bare
-`No module named 'torchvision.io.video'`. Not a version boundary: 0.25 ships
-`io/video.py` and 0.26 removed it with its importer, so no release raises this.
-
-These tests drive the real guard, they do not read the source. The source-grep
-version of this file passed with the whole feature deleted, because the prose
-explaining an arm contains every string the arm does. So each case plants a
-`transformers.processing_utils` whose `Unpack` raises the exact error a broken
-install raises, re-imports `unsloth_zoo.temporary_patches.utils` in a
-subprocess, and reads back what came out.
-"""
+"""Name a half-installed torchvision (io/__init__.py still imports io/video.py, gone after a partial overwrite; 0.25
+ships it, 0.26 removed it) instead of re-raising its ImportError (not a version boundary). Tests run the real guard
+in a subprocess, not a source grep."""
 from __future__ import annotations
 
 import importlib
@@ -88,11 +76,8 @@ PIP = "pip install --upgrade --force-reinstall --no-cache-dir torchvision"
 def raised():
     """What each planted failure actually produces, from one warm subprocess."""
     pytest.importorskip("transformers")
-    # NOT `importorskip` on the module under test: it catches an ImportError
-    # raised while INITIALISING the module too, so a real init regression would
-    # skip all of these and leave the gate this file is listed in green. Skip
-    # only on the two absent-prerequisite guards `unsloth_zoo/__init__.py`
-    # raises; anything else is re-raised and fails.
+    # Not importorskip on the module under test: it would also skip on ImportErrors raised during init, hiding real
+    # regressions; skip only on the two absent-prerequisite guards in unsloth_zoo/__init__.py, re-raise the rest.
     try:
         importlib.import_module("unsloth_zoo.temporary_patches.utils")
     except BaseException as exc:
@@ -101,8 +86,7 @@ def raised():
             pytest.skip("prerequisite absent here -- " + text)
         raise
     root = Path(__file__).resolve().parents[1]
-    # The child gets the parent's environment, so it imports the same tree under
-    # the same accelerator settings; only the path to this checkout is added.
+    # The child inherits the parent's environment so it imports under the same accelerator settings; only this checkout's path is added to PYTHONPATH.
     env = dict(os.environ)
     env.setdefault("UNSLOTH_ALLOW_CPU", "1")
     env["PYTHONPATH"] = os.pathsep.join(
@@ -112,10 +96,8 @@ def raised():
         capture_output = True, text = True, timeout = 900, cwd = str(root), env = env,
     )
     if "<<<WARMFAIL>>>" in proc.stdout:
-        # A FAILURE, not a skip. The parent just imported the module, so a child
-        # that cannot is a real initialization regression -- and a skip reads as
-        # success to the CI gate this file is listed in, which would leave both
-        # handlers unexercised and every required check green.
+        # A failure, not a skip: the parent just imported the module, so a child that cannot is a real init regression;
+        # a skip would read as green CI and leave both handlers unexercised.
         pytest.fail("the child could not import what this process already did: "
                     + proc.stdout.split("<<<WARMFAIL>>>", 1)[1][:400])
     if "<<<RESULTS>>>" not in proc.stdout:
@@ -140,8 +122,7 @@ def test_a_missing_io_video_is_named_as_an_incomplete_install(raised, case, miss
 
 
 def test_a_mismatched_torchvision_is_caught_on_the_runtimeerror_arm(raised):
-    """`register_fake("torchvision::nms")` raises RuntimeError, not ImportError,
-    so the ImportError arm could never fire for it."""
+    """torchvision::nms via register_fake raises RuntimeError, not ImportError, so the ImportError arm could never fire for it."""
     got = raised["nms_runtime"]
     assert got["type"] == "RuntimeError", got
     assert "reinstall torchvision" in got["message"]
@@ -167,9 +148,8 @@ def test_an_unrelated_import_error_still_falls_through(raised):
 
 
 def test_a_missing_symbol_is_not_called_an_incomplete_install(raised):
-    """`cannot import name 'read_video' from 'torchvision.io.video'` holds the
-    same substring while the module is right there, so the incomplete-install
-    message would be false and its force-reinstall would not fix it."""
+    """A cannot-import-name for read_video from torchvision.io.video has the same substring while the module is present,
+    so an incomplete-install message would be false and reinstalling would not fix it."""
     got = raised["video_symbol"]
     assert "install is incomplete" not in (got["message"] or "")
     assert got["type"] == "Exception", got

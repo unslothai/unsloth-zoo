@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FP8 dense merge-to-16bit (unslothai/unsloth#4919).
-
-Pins the rewrite path: FP8 dequantizes to 16bit, scale keys drop, and a missing
-scale raises instead of corrupting silently (previously written straight back).
-"""
+"""FP8 dense merge-to-16bit (unslothai/unsloth issue 4919): FP8 dequantizes to 16bit, scale keys drop, and a missing scale raises instead of corrupting silently."""
 
 from __future__ import annotations
 
@@ -35,11 +31,9 @@ import torch
 if not hasattr(torch, "float8_e4m3fn"):
     pytest.skip("float8_e4m3fn unavailable", allow_module_level=True)
 
-# unsloth_zoo / transformers import bitsandbytes at import time (a 4bit-merge path these
-# FP8 tests never reach). Stub it only when absent so the suite runs in a CPU-only core
-# env; a real install is left untouched. The stub carries a valid __spec__ so
-# transformers' importlib.util.find_spec("bitsandbytes") probe returns a spec instead of
-# raising on a spec-less module (and then reports unavailable via missing dist metadata).
+# unsloth_zoo and transformers import bitsandbytes at import time (a 4bit path FP8 tests never reach); stub it only when
+# absent so CPU-only envs run, with a valid __spec__ so find_spec returns a spec instead of raising, then reports
+# unavailable via missing dist metadata.
 try:
     import bitsandbytes  # noqa: F401
 except Exception:
@@ -239,8 +233,7 @@ def test_fp8_quant_config_detection():
 
 
 def test_fp8_dense_per_channel_2d_scale_ignores_block_size(tmp_path):
-    """A 2-D per-channel (out, 1) scale dequantizes correctly even with a config
-    weight_block_size that does not tile the weight (it must not be applied)."""
+    """A 2-D per-channel (out, 1) scale dequantizes correctly even when weight_block_size does not tile the weight; the block size must not be applied."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(7)
@@ -270,12 +263,10 @@ def test_fp8_dense_per_channel_2d_scale_ignores_block_size(tmp_path):
 
 
 def test_fp8_dense_scale_grid_mismatch_with_block_size_raises(tmp_path):
-    """A 2-D scale grid that neither exact-divides the weight nor ceil-matches the configured
-    block size must raise, not silently dequantize with inferred tiles."""
+    """A 2-D scale grid that neither exactly divides the weight nor matches the configured block's ceil grid must raise, not dequantize with inferred tiles."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
-    # 130x256 weight, block (128,128) -> matching grid would be (2,2). A (3,2) grid matches
-    # neither exact division (130 % 3 != 0) nor the block-size ceil grid.
+    # 130x256 weight with block (128,128) would need a (2,2) grid; a (3,2) grid matches neither exact division (130 % 3 != 0) nor the block-size ceil grid.
     W_fp8 = (torch.randn(130, 256) * 0.1).clamp(-448, 448).to(torch.float8_e4m3fn)
     bad_scale = torch.rand(3, 2, dtype=torch.float32) + 0.5
     shard = tmp_path / "model.safetensors"
@@ -298,8 +289,7 @@ def test_fp8_dense_scale_grid_mismatch_with_block_size_raises(tmp_path):
 
 
 def _run_cross_shard_merge(tmp_path, weight_in, scale_in, process_order):
-    """Helper: write an FP8 weight and its scale into separate shards, run the per-shard
-    rewrite in the given order, then the orchestrator's order-independent scale cleanup."""
+    """Writes an FP8 weight and its scale into separate shards, runs the per-shard rewrite in the given order, then the order-independent scale cleanup."""
     from unsloth_zoo.saving_utils import (
         _merge_and_overwrite_lora, _drop_resolved_fp8_scales_after_rewrite,
         _collect_fp8_weight_keys,
@@ -348,17 +338,16 @@ def test_fp8_dense_scale_in_sibling_shard_weight_first(tmp_path):
 
 
 def test_fp8_dense_scale_in_sibling_shard_scale_first(tmp_path):
-    """Scale in shard 1, weight in shard 2, processed scale-first: the order-independent
-    cleanup must still drop the orphaned scale (per-shard processing alone cannot)."""
+    """Scale in shard 1, weight in shard 2, processed scale-first: the order-independent cleanup must still drop the
+    orphaned scale; per-shard processing alone cannot."""
     s1 = tmp_path / "model-00001-of-00002.safetensors"
     s2 = tmp_path / "model-00002-of-00002.safetensors"
     _run_cross_shard_merge(tmp_path, weight_in=s2, scale_in=s1, process_order=(s1.name, s2.name))
 
 
 def test_fp8_post_pass_preserves_unrelated_scale(tmp_path):
-    """The post-rewrite cleanup must drop FP8 companion scales but NOT an unrelated `*_scale`
-    buffer whose base weight exists and was never FP8 (regression: anchoring on a post-rewrite
-    name heuristic deleted such buffers, since every weight is 16bit by then)."""
+    """Cleanup must drop FP8 companion scales but keep an unrelated *_scale buffer whose base weight was never FP8;
+    anchoring on a post-rewrite name heuristic would delete it, as every weight is 16bit by then."""
     from unsloth_zoo.saving_utils import (
         _merge_and_overwrite_lora_fp8, _drop_resolved_fp8_scales_after_rewrite,
         _collect_fp8_weight_keys,
@@ -462,8 +451,7 @@ def test_fp8_dense_one_d_row_scale_dequantizes(tmp_path):
 
 
 def test_fp8_dense_block_scale_partial_block(tmp_path):
-    """Block-quant with a dim not a block multiple: weight_block_size dequantizes
-    correctly (inferring rows//srows is wrong)."""
+    """Block-quant with a dim not a multiple of the block: weight_block_size dequantizes correctly, while inferring rows // srows is wrong."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(3)
@@ -493,9 +481,8 @@ def test_fp8_dense_block_scale_partial_block(tmp_path):
 
 
 def test_fp8_dense_path_refuses_moe_expert_lora(tmp_path):
-    """The dense FP8 rewrite cannot fuse per-expert adapters, so it refuses MoE-expert LoRA
-    (the dispatcher routes those to the in-place quant-aware path instead; see
-    test_moe_merge_legacy_mixtral_cpu)."""
+    """The dense FP8 rewrite cannot fuse per-expert adapters so refuses MoE-expert LoRA; the dispatcher routes those to
+    the in-place quant-aware path (test_moe_merge_legacy_mixtral_cpu)."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora_fp8
 
     W_fp8, scale = _fp8_quant_channel(torch.randn(32, 48) * 0.1)
@@ -519,8 +506,7 @@ def test_fp8_dense_path_refuses_moe_expert_lora(tmp_path):
 
 
 def test_fp8_fused_moe_gate_up_lora_refused(tmp_path):
-    """Merging LoRA onto a fused 3-D FP8 gate_up_proj expert tensor must refuse rather than
-    merge raw FP8 values (which silently loses the delta)."""
+    """Merging LoRA onto a fused 3-D FP8 gate_up_proj expert tensor must refuse, since merging raw FP8 values silently loses the delta."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     n_experts, inter, hidden, r = 2, 8, 12, 4
@@ -545,8 +531,7 @@ def test_fp8_fused_moe_gate_up_lora_refused(tmp_path):
 
 
 def test_fp8_moe_expert_lora_routes_to_inplace_not_dense(tmp_path):
-    """The dispatcher must NOT send FP8 + MoE-expert LoRA to the dense rewrite (which would
-    raise); it falls through to the in-place quant-aware path which keeps FP8."""
+    """The dispatcher must not send FP8 MoE-expert LoRA to the dense rewrite (which would raise); it goes to the in-place quant-aware path, which keeps FP8."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_requant_blockwise, _fp8_dequant_blockwise
 
@@ -607,8 +592,7 @@ def test_fp8_e5m2_dequantizes(tmp_path):
 
 
 def test_fp8_fused_expert_underscore_scale(tmp_path):
-    """Fused expert FP8 with <key>_scale_inv naming (no .weight suffix) is found and
-    dequantized, not a missing-scale error."""
+    """Fused expert FP8 with <key>_scale_inv naming (no .weight suffix) is found and dequantized, not reported as a missing scale."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(12)
@@ -679,8 +663,7 @@ def test_resolve_fp8_16bit_sibling_quantized_sibling_ignored(tmp_path):
 
 
 def test_fp8_keeps_non_companion_scale_tensors(tmp_path):
-    """Tensors whose names merely end in `_scale`/`_scale_inv` but are NOT companions of
-    an FP8 weight (logit_scale, router per_expert_scale, ...) must survive the rewrite."""
+    """Tensors named *_scale or *_scale_inv that are not companions of an FP8 weight (logit_scale, router per_expert_scale) must survive the rewrite."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(3)
@@ -712,8 +695,7 @@ def test_fp8_keeps_non_companion_scale_tensors(tmp_path):
 
 
 def test_fp8_preserves_non_fp8_buffer_dtypes(tmp_path):
-    """Non-FP8, non-merged buffers (int64/bool/float32) must keep their dtype, not be cast
-    to output_dtype like a dequantized FP8 weight would be."""
+    """Non-FP8, non-merged buffers (int64, bool, float32) keep their dtype rather than being cast to output_dtype like dequantized FP8 weights."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(4)

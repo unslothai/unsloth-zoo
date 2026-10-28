@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""One pytest session must give the same results as one session per file where real
-mlx is installed (unslothai/unsloth#8138); tests/conftest.py gives each module its own mlx world."""
+"""One pytest session must match one session per file where real mlx is installed (unslothai/unsloth#8138); tests/conftest.py gives each module its own mlx world."""
 
 from __future__ import annotations
 
@@ -46,8 +45,7 @@ def test_installing_a_world_undoes_the_shim_and_puts_it_back():
 def test_shim_and_real_mlx_modules_pass_in_one_session(request):
     if not request.config.pluginmanager.has_plugin("unsloth-mlx-module-worlds"):
         pytest.skip("needs real mlx: without it the shim is the only mlx and nothing collides")
-    # The issue's example: the first installs the shim in a module fixture, the second
-    # imports real mlx and unsloth_zoo.gated_delta_vjp at collection.
+    # The issue's example: the first file installs the shim in a module fixture, the second imports real mlx and unsloth_zoo.gated_delta_vjp at collection.
     files = ["test_mlx_gated_delta.py", "test_mlx_gated_delta_batch_grad.py"]
     out = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *files],
