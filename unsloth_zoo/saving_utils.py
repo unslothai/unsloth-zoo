@@ -1351,8 +1351,7 @@ def _merge_and_overwrite_lora(
                     if lora_stats is None and not lm_head_key.startswith("model."):
                         lora_stats = converted_lora_weights.get("model." + lm_head_key, None)
 
-                # Nothing replaces this tensor: the shard already holds these bytes, so
-                # skip reading it and writing the same bytes back in place.
+                # Nothing replaces it: the shard already holds these exact bytes.
                 if (
                     lora_stats is None
                     and key not in bias_overrides
@@ -1360,7 +1359,6 @@ def _merge_and_overwrite_lora(
                 ):
                     continue
 
-                # Standard 16-bit tensor
                 W = file.get_tensor(key)
                 W_original_dtype = W.dtype
                 W = bias_overrides.get(key, W)

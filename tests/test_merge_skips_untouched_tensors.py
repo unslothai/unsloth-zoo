@@ -1,10 +1,4 @@
-"""The in-place 16-bit merge must not read or rewrite tensors nothing replaces.
-
-An untouched tensor (no LoRA, no trained bias, no live vocab rows) already holds its
-bytes in the shard, so reading it and writing the same bytes back is pure I/O. The
-merged shards must stay byte-identical: run_case asserts every pass-through tensor
-equals the base tensor exactly and every adapted one matches base + scale * B @ A.
-"""
+"""The in-place 16-bit merge must leave tensors nothing replaces unread and unwritten."""
 from __future__ import annotations
 
 import pytest
