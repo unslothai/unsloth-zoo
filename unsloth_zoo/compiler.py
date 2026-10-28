@@ -5117,6 +5117,35 @@ def _patch_lora_base_layer_input_cast(source):
     )
 
 
+def _patch_lora_update(source):
+    # All Unsloth Zoo code licensed under LGPLv3
+    old1 = "output = lora_B(lora_A(dropout(x))) * scaling"
+    old2 = "result = result + lora_B(lora_A(dropout(x))) * scaling"
+    add = "result = result + output"
+
+    if (old1 not in source and add not in source) and (old2 not in source):
+        return source
+    # Same statement as PEFT's, so PEFT's own dtype restore (after or inside the adapter loop) still runs.
+    source = source.replace(old2, "result = lora_forward(result, lora_A, lora_B, dropout, x, scaling)")
+    if old1 not in source:
+        return source
+    # bnb Linear4bit/8bitLt never set torch_result_dtype; their result stays in the base-layer dtype.
+    if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
+        dtype_cast = "torch_result_dtype"
+    else:
+        dtype_cast = "result.dtype"
+    update = f"lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
+    # `continue` skips `result = result + output`; a `return` here would drop every later active adapter.
+    looped = source.replace(old1, f"result = {update}; continue")
+    try:
+        compile(looped, "<peft lora forward>", "exec")
+    except SyntaxError:
+        # Update outside the adapter loop.
+        return source.replace(old1, f"return {update}")
+    return looped
+pass
+
+
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
@@ -5140,25 +5169,7 @@ def patch_lora_forwards(torch_compile_options):
         source = source.replace("result = result.clone()", "")
 
         # Use addmm
-        old1 = "output = lora_B(lora_A(dropout(x))) * scaling"
-        old2 = "result = result + lora_B(lora_A(dropout(x))) * scaling"
-        add = "result = result + output"
-
-        if (old1 not in source and add not in source) and (old2 not in source):
-            pass
-        else:
-            # Linear/GPTQ/LoraParallel reassign result to float32 before the
-            # loop, so they save the original dtype in torch_result_dtype.
-            # Linear4bit/Linear8bitLt only cast x, leaving result untouched,
-            # so result.dtype is still the base-layer dtype at return time.
-            if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
-                dtype_cast = "torch_result_dtype"
-            else:
-                dtype_cast = "result.dtype"
-            replace = f"return lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
-            source = source.replace(old1, replace)
-            source = source.replace(old2, replace)
-        pass
+        source = _patch_lora_update(source)
 
         # Update function name
         source = source.replace(
