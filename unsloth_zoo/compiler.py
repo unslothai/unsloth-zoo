@@ -470,10 +470,16 @@ _INIT_ONLY_CALLERS = frozenset(("__init__", "__post_init__", "_init_weights", "p
 def function_only_called_at_init(module_source: str, name: str) -> bool:
     """True if ``name`` is only reached from ``__init__``-time methods (directly or via such
     helpers): these build buffers on meta, so compiling them fails at load. False if unparseable."""
+    return _only_called_at_init(_init_only_callers_of(module_source), name)
+pass
+
+
+def _init_only_callers_of(module_source):
+    """Called name -> set of owners, built once per source; None if unparseable."""
     try:
         tree = ast.parse(textwrap.dedent(module_source))
     except Exception:
-        return False
+        return None
     callers_of = {}
     # owner = (name, is_method); nested defs keep their enclosing owner.
     def visit(node, owner):
@@ -491,7 +497,14 @@ def function_only_called_at_init(module_source: str, name: str) -> bool:
                     callers_of.setdefault(called, set()).add(owner)
             visit(child, owner)
     visit(tree, None)
-    seen = set()
+    return callers_of
+pass
+
+
+def _only_called_at_init(callers_of, name):
+    if callers_of is None:
+        return False
+    seen = set()  # fresh per query: transitive and cyclic answers depend on it
     def init_only(fn):
         if fn in seen:
             return True
@@ -7428,6 +7441,7 @@ def unsloth_compile_transformers(
             all_standalone_classes[module] = parameters
         pass
 
+        init_only_callers = None  # lazy 1-tuple: the graph itself is None when unparseable
         for module in called_functions:
             if module in all_standalone_classes:
                 continue
@@ -7497,9 +7511,12 @@ def unsloth_compile_transformers(
                 if not function_has_tensor_inputs(source):
                     bad = True
                     bad_reason = "it takes no tensor inputs"
-                elif function_only_called_at_init(full_source, module):
-                    bad = True
-                    bad_reason = "it is only called while constructing modules"
+                else:
+                    if init_only_callers is None:
+                        init_only_callers = (_init_only_callers_of(full_source),)
+                    if _only_called_at_init(init_only_callers[0], module):
+                        bad = True
+                        bad_reason = "it is only called while constructing modules"
             pass
             if not bad:
                 # Functions defined inside an if/else come back indented
