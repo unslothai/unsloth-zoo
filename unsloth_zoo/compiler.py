@@ -6912,7 +6912,11 @@ def unsloth_compile_transformers(
     pass
     # Import allow-list for the generated cache, not a compile list: the emitted
     # classes still reference uncompiled modules and NameError without them.
-    functions += list(bad_torch_modules)
+    # In definition order, never set order: the names land in the generated
+    # import line, and set order follows PYTHONHASHSEED, so the cache file would
+    # differ (and be rewritten) on every new process.
+    functions += [module for module in torch_modules if module in bad_torch_modules]
+    functions += sorted(bad_torch_modules.difference(torch_modules))
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
