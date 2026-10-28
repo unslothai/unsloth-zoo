@@ -369,8 +369,9 @@ def add_new_tokens(
 
     # Clear deleted GPU items
     for _ in range(3):
-        gc.collect()
+        collected = gc.collect()
         torch.cuda.empty_cache()
+        if collected == 0 and not gc.callbacks: break
     return
 pass
 
@@ -790,8 +791,9 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
 
     # Clean up
     for _ in range(3):
-        gc.collect()
+        collected = gc.collect()
         torch.cuda.empty_cache()
+        if collected == 0 and not gc.callbacks: break
     pass
     return
 pass

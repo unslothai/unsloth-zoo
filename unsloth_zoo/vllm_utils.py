@@ -1173,8 +1173,9 @@ def patch_vllm_graph_capture():
                 end_time - start_time
             )
             for _ in range(2):
-                gc.collect()
+                collected = gc.collect()
                 _device_empty_cache()
+                if collected == 0 and not gc.callbacks: break
             return result
         pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
@@ -1202,8 +1203,9 @@ def patch_vllm_graph_capture():
                     end_time - start_time
                 )
                 for _ in range(2):
-                    gc.collect()
+                    collected = gc.collect()
                     _device_empty_cache()
+                    if collected == 0 and not gc.callbacks: break
                 return result
             pass
             GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
@@ -2488,8 +2490,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
     # Cleanup
     for _ in range(3):
-        gc.collect()
+        collected = gc.collect()
         _device_empty_cache()
+        if collected == 0 and not gc.callbacks: break
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
@@ -4517,8 +4520,9 @@ def _release_failed_vllm_engine(snapshot):
             except Exception:
                 pass
     for _ in range(3):
-        gc.collect()
+        collected = gc.collect()
         _device_empty_cache()
+        if collected == 0 and not gc.callbacks: break
 pass
 
 
@@ -5618,8 +5622,9 @@ def load_vllm(
 
     # Cleanup
     for _ in range(3):
-        gc.collect()
+        collected = gc.collect()
         _device_empty_cache()
+        if collected == 0 and not gc.callbacks: break
     return llm
 pass
 
@@ -8043,8 +8048,9 @@ def _test_get_vllm_state_dict(
     del new_model
     print(f'Test passed!')
     for _ in range(3):
-        gc.collect()
+        collected = gc.collect()
         _device_empty_cache()
+        if collected == 0 and not gc.callbacks: break
 pass
 
 
