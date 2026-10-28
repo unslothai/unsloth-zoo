@@ -3,7 +3,7 @@
 
 """Generated compiled modules are byte-identical under any PYTHONHASHSEED (CPU only).
 
-The modeling import list used to follow set order, so gpt_oss, qwen3_next and
+The modeling import list used to follow set order, so gpt_oss, qwen3_next, gemma4 and
 granitemoehybrid files were rewritten by every new process.
 """
 
@@ -14,9 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-# With set order, at least one pair of these seeds disagrees for each model type on CPython 3.13.
+# With set order some pair of these seeds disagrees for each type (CPython 3.13; gemma4 needs transformers 5).
 SEEDS = ("1", "2", "3", "6")
-MODEL_TYPES = ("gpt_oss", "qwen3_next", "granitemoehybrid")
+MODEL_TYPES = ("gpt_oss", "qwen3_next", "granitemoehybrid", "gemma4")
 
 _CHILD = r'''
 import os, sys, io, contextlib
