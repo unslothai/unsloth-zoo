@@ -300,7 +300,8 @@ def _host_cache_reuses_block(block):
     """A pinned block freed after a non_blocking copy waits in torch's event queue, which only an
     allocation drains (host_memory_stats does not), so it reads as not free. Allocate and drop a
     block of that size to drain it: True if the allocator reused a cached block, False if it had
-    to pin a new one, which is released again so the probe never holds pinned memory past the cap."""
+    to pin a new one. That new block is left free in the allocator for the caller's next pin of this
+    size; the caller either charges it under the cap or flushes it (_reserve_pinned)."""
     held = _host_allocator_held_bytes()
     if held is None: return False
     try:
@@ -310,9 +311,7 @@ def _host_cache_reuses_block(block):
         return False
     after = _host_allocator_held_bytes()
     del probe
-    if after is not None and after <= held: return True
-    _empty_host_cache()
-    return False
+    return after is not None and after <= held
 
 
 def _compute_pinned_cap(held = None):
@@ -410,11 +409,26 @@ def _reserve_pinned_unlocked(nbytes):
         free = _host_allocator_free_bytes()
         # Under a fixed cap a refusal here is sticky (pageable copies never drain the queue), so
         # check the event queue; the per block mode re-checks host RAM below instead.
-        if free is None or free >= block or (
-            GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0 and _host_cache_reuses_block(block)
-        ):
+        if free is None or free >= block:
             _charge_live(nbytes, block)
             return True  # the allocator hands back the cached block, already charged
+        if GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0:
+            held = _host_allocator_held_bytes()
+            if _host_cache_reuses_block(block):
+                _charge_live(nbytes, block)
+                return True
+            # The probe pinned a new block, now free in the allocator. Usually our cached block is
+            # only still queued behind the last backward's copies: keep it ours and charge the new
+            # one when the allocator's real total stays under the cap, instead of flushing every
+            # cached block (a device sync) and pinning them all again. Otherwise flush as before.
+            if held is not None and _HOST_HELD_BASELINE is not None and (
+                max(GC_PINNED_BYTES, held - _HOST_HELD_BASELINE) + block <= GC_PINNED_CAP
+            ):
+                _PINNED_CACHED[block] += 1
+                GC_PINNED_BYTES += block
+                _charge_live(nbytes, block)
+                return True
+            _empty_host_cache()
         # Another pinned user took the block: it is no longer ours, and this request is new.
         GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
     held = _host_allocator_held_bytes()

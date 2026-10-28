@@ -514,3 +514,47 @@ def test_concurrent_reservations_cannot_spend_the_same_headroom(monkeypatch, gc_
     b.join(10)
     assert "a" in out and "b" in out and live is not None
     assert fake.peak <= 11 * MIB
+
+
+def _pending_block_setup(monkeypatch, gc_module, cap_bytes):
+    """One 4096 block reserved, released while its copy event is still pending (reads as active)."""
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(cap_bytes / (1 << 30)))
+    held = {"bytes": 0}
+    flushes = []
+    real_empty = torch.empty
+
+    def empty(*args, pin_memory = False, **kwargs):
+        if pin_memory: held["bytes"] += 4096    # the allocator cannot reuse the pending block yet
+        return real_empty(*args, **kwargs)
+
+    def flush():
+        flushes.append(True)
+        return False
+
+    monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: held["bytes"])
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 0)
+    monkeypatch.setattr(gc_module, "_empty_host_cache", flush)
+    assert gc_module._reserve_pinned(4096)
+    held["bytes"] = 4096
+    gc_module._release_pinned(4096)
+    return held, flushes
+
+
+def test_pending_cached_block_under_the_cap_pins_one_more_without_a_flush(monkeypatch, gc_module):
+    # A flush syncs every device and unpins every cached block; under the cap one more block is enough.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    assert gc_module._reserve_pinned(4096)
+    assert flushes == []
+    assert gc_module.GC_PINNED_BYTES == 8192 == held["bytes"]
+    assert gc_module._PINNED_CACHED == {4096: 1}      # the pending block is still ours, reused later
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 4096)  # its copy finished
+    assert gc_module._reserve_pinned(4096)              # the next request takes it, no new pin
+    assert held["bytes"] == 8192 and gc_module.GC_PINNED_BYTES == 8192
+
+
+def test_pending_cached_block_at_the_cap_still_flushes(monkeypatch, gc_module):
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 6000)
+    gc_module._reserve_pinned(4096)
+    assert flushes                                       # one more block would pass the cap
+    assert gc_module.GC_PINNED_BYTES <= 6000
