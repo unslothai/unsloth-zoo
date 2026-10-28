@@ -107,6 +107,32 @@ def is_transformers_v5_moe_quantization_available():
         )
     )
 
+def allow_inductor_pool_aliasing():
+    """
+    torch >= 2.11 checks custom op outputs for aliasing on a compiled function's first call
+    (torch/_functorch/_aot_autograd/runtime_wrappers.py, _AnalyzeCustomOpInputOutputMode). Under
+    inference_mode it also sees Inductor's own memory_planning op inductor::_alloc_from_pool, which
+    returns a view of its pool by design but declares no alias in its schema. That is a UserWarning,
+    and a RuntimeError when the CI env var is set (error_on_custom_op_aliasing = bool(CI)), so every
+    memory_planning=True graph under inference_mode fails in CI. Skip only that op; every other
+    custom op is still checked.
+    """
+    try:
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+    except Exception:
+        return
+    check = getattr(runtime_wrappers, "_check_custom_op_aliasing", None)
+    if check is None or getattr(check, "_unsloth_skips_alloc_from_pool", False):
+        return
+
+    def _check_custom_op_aliasing(name, *args, **kwargs):
+        if name == "inductor::_alloc_from_pool":
+            return None
+        return check(name, *args, **kwargs)
+    _check_custom_op_aliasing._unsloth_skips_alloc_from_pool = True
+    runtime_wrappers._check_custom_op_aliasing = _check_custom_op_aliasing
+pass
+
 def get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False,
@@ -129,6 +155,7 @@ def get_torch_compile_options(
     # https://github.com/pytorch/pytorch/blob/c665594c1edca9a507b0ec8b18ab74a0ecb65bc3/torch/_inductor/config.py#L1283
     # Needs integer
     multi_kernel = 1 if multi_kernel else 0
+    if memory_planning: allow_inductor_pool_aliasing()
 
     # Relabel Inductor's compile progress bar
     try:
