@@ -2150,40 +2150,6 @@ def _merge_special_token_features_only(
     return outputs
 
 
-def _merge_replacement_segments(inputs_embeds, replacements_by_batch):
-    batch_size = inputs_embeds.shape[0]
-    merged_batches = []
-    max_len = 0
-
-    for batch_idx in range(batch_size):
-        cur_embeds = inputs_embeds[batch_idx]
-        replacements = sorted(replacements_by_batch[batch_idx], key=lambda item: item[0])
-        parts = []
-        prev = 0
-        seq_len = int(cur_embeds.shape[0])
-        for start, end, features in replacements:
-            start = int(start)
-            end = int(end)
-            if start > prev:
-                parts.append(cur_embeds[prev:start])
-            parts.append(features.astype(cur_embeds.dtype))
-            prev = end
-        if prev < seq_len:
-            parts.append(cur_embeds[prev:])
-        merged = mx.concatenate(parts, axis=0) if parts else cur_embeds
-        merged_batches.append(merged)
-        max_len = max(max_len, int(merged.shape[0]))
-
-    if batch_size == 1:
-        return merged_batches[0][None, :]
-
-    hidden_dim = int(inputs_embeds.shape[-1])
-    padded = mx.zeros((batch_size, max_len, hidden_dim), dtype=inputs_embeds.dtype)
-    for idx, embeds in enumerate(merged_batches):
-        padded[idx, : embeds.shape[0]] = embeds
-    return padded
-
-
 def _masked_scatter_no_numpy(final_embedding, image_mask_expanded, scaled_image_features):
     """Compile-safe replacement for `masked_scatter`-style multimodal merges.
 
@@ -2242,30 +2208,6 @@ def _positions_to_tuple(positions):
         return ()
     positions = _tolist_if_needed(positions)
     return tuple((int(item[0]), int(item[1])) for item in positions)
-
-
-def _positions_per_batch_to_tuple(positions):
-    """Normalize batched 1D position metadata to immutable Python tuples."""
-
-    if positions is None:
-        return ()
-    positions = _tolist_if_needed(positions)
-    return tuple(
-        tuple(int(pos) for pos in batch_positions)
-        for batch_positions in positions
-    )
-
-
-def _spans_per_batch_to_tuple(spans):
-    """Normalize batched `(start, end)` span metadata to Python tuples."""
-
-    if spans is None:
-        return ()
-    spans = _tolist_if_needed(spans)
-    return tuple(
-        tuple((int(start), int(end)) for start, end in batch_spans)
-        for batch_spans in spans
-    )
 
 
 def _lengths_to_tuple(lengths):
@@ -5355,64 +5297,6 @@ def _install_qwen_like_image_merge_patches():
 
     qwen3_module.masked_scatter = _masked_scatter_no_numpy
     _patch_staticmethod(qwen3_module.Model, "merge_input_ids_with_image_features", merge_qwen3)
-    _PATCHED_ARCHES.add("qwen3_vl")
-
-
-def _install_qwen3_get_input_embeddings_patch():
-    """Patch Qwen3-VL embeddings to expose compile-safe multimodal metadata."""
-
-    module = _try_import_module("mlx_vlm.models.qwen3_vl.qwen3_vl")
-    if module is None:
-        return
-
-    InputEmbeddingsFeatures = module.InputEmbeddingsFeatures
-
-    def patched_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-
-        if pixel_values is None:
-            self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
-            return InputEmbeddingsFeatures(
-                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
-            )
-
-        dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = pixel_values.astype(dtype)
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-
-        cached = kwargs.get("cached_image_features", None)
-        if cached is not None:
-            hidden_states = cached
-            deepstack_image_embeds = None
-        else:
-            hidden_states, deepstack_image_embeds = self.vision_tower(pixel_values, grid_thw)
-
-        inputs_embeds, image_mask = self.merge_input_ids_with_image_features(
-            hidden_states,
-            inputs_embeds,
-            input_ids,
-            self.config.image_token_index,
-            self.config.video_token_index,
-        )
-
-        if image_grid_thw is not None or video_grid_thw is not None:
-            position_ids, rope_deltas = self.language_model.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, mask
-            )
-            self.language_model._position_ids = position_ids
-            self.language_model._rope_deltas = rope_deltas
-
-        return InputEmbeddingsFeatures(
-            inputs_embeds=inputs_embeds,
-            visual_pos_masks=image_mask[..., 0],
-            deepstack_visual_embeds=deepstack_image_embeds,
-        )
-
-    _patch_method(module.Model, "get_input_embeddings", patched_get_input_embeddings)
     _PATCHED_ARCHES.add("qwen3_vl")
 
 
