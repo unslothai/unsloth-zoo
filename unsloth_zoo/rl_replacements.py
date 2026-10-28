@@ -2777,8 +2777,7 @@ RL_REPLACEMENTS["grpo_fused_policy_loss"] = grpo_fused_policy_loss
 
 
 def grpo_nonzero_static(mask, count):
-    """mask.nonzero() when the True count is already known on the host: same [count, mask.dim()] rows in the
-    same order, without the device-to-host read nonzero needs to size its output."""
+    """mask.nonzero() with a host-known count, so no device-to-host read; falls back to nonzero."""
     nonzero_static = getattr(torch, "nonzero_static", None)
     if nonzero_static is not None:
         try:
@@ -2790,9 +2789,8 @@ pass
 
 
 def grpo_host_lengths_to_device(lengths, device):
-    """int32 packed_seq_lengths built from host ints via one pinned non_blocking copy (a pageable
-    torch.tensor(..., device = cuda) blocks the host). The ints ride along as `_unsloth_lengths_tuple`, so
-    Unsloth's packing helpers need not read them back."""
+    """int32 lengths via a pinned non_blocking copy (pageable copies block the host); host ints kept
+    on `_unsloth_lengths_tuple` so packing helpers need not read them back."""
     host = torch.tensor(lengths, dtype = torch.int32)
     if torch.device(device).type == "cpu":
         out = host
@@ -3422,7 +3420,7 @@ def grpo_accumulated_loss(
         if (_pack_enabled and not _pg_skip_pack and pixel_values is None
                 and token_type_ids is None and mm_token_type_ids is None and _pack_ok is not False):
             try:
-                # Bound here: this body is copied into the generated trainer without this module's names.
+                # Imported here: this body is copied into the generated trainer.
                 from unsloth_zoo.rl_replacements import grpo_nonzero_static, grpo_host_lengths_to_device
                 _pack_pad_id = trainer.processing_class.pad_token_id
                 _pack_keep = input_ids != _pack_pad_id
@@ -3432,12 +3430,11 @@ def grpo_accumulated_loss(
                 # completion start is per-row after left-packing: (L - logits_to_keep) minus that
                 # row's left-pad (matches create_completion_attention_mask exactly)
                 _pack_cstart = (_pack_L - logits_to_keep) - left_pad_tokens_per_prompt  # [rows]
-                # Loss targets: real tokens past their row's first real token, in the completion. The count
-                # sizes the index below without a boolean-mask sync.
+                # Loss targets; their count sizes the index below without a mask sync.
                 _pack_ctgt_2d = (_pack_keep & (_pack_csum > 1)) & (
                     torch.arange(_pack_L, device = input_ids.device) >= _pack_cstart.to(input_ids.device).unsqueeze(1)
                 )
-                # single GPU->CPU sync: row lengths, active completion rows and the target count, reused below
+                # The one host read per packed batch: row lengths, active rows, target count.
                 _pack_meta_cpu = torch.cat([
                     _pack_lengths.to(torch.long),
                     (completion_mask.sum(dim = 1) > 0).sum().to(device = _pack_lengths.device, dtype = torch.long).reshape(1),
@@ -3457,7 +3454,6 @@ def grpo_accumulated_loss(
                 # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
                 _pack_capped = _pack_unsafe is not None and _pack_T >= _pack_unsafe
                 if not _pack_capped:
-                    # Sizes are known on the host, so no boolean-mask / nonzero sync: same rows, same order.
                     _pack_nz_idx = grpo_nonzero_static(_pack_keep, _pack_T)     # [T, 2] = (row, col)
                     _pack_flat_ids = input_ids[_pack_nz_idx[:, 0], _pack_nz_idx[:, 1]].unsqueeze(0)
                     _pack_active = _pack_active_cpu

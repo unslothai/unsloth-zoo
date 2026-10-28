@@ -160,7 +160,7 @@ def test_packed_index_build_no_sync_cuda():
 
 
 def test_packed_block_has_no_boolean_mask_reads():
-    # The packed block of grpo_accumulated_loss: one .tolist(), no mask-indexed reads or bare nonzero().
+    # One .tolist(), no mask-indexed reads or bare nonzero().
     src = inspect.getsource(rr.grpo_accumulated_loss)
     start = src.index("_pack_keep = input_ids != _pack_pad_id")
     end = src.index("_pack_in_packed = True")
