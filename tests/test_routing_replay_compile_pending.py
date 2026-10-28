@@ -193,3 +193,46 @@ def test_non_reentrant_compiled_recompute_matches_eager(replay, forwards):
     reference = run(compiled = False, use_reentrant = True)
     for got, want in zip(run(compiled = True, use_reentrant = False), reference):
         torch.testing.assert_close(got, want, rtol = 0, atol = 0)
+
+
+@pytest.mark.parametrize("natural_first", [False, True])
+def test_non_reentrant_natural_forward_with_identical_inputs_keeps_its_own_routing(replay, natural_first):
+    # Distinct inputs with identical values: one forward replays [0, 1], the other keeps its natural
+    # routing. Fingerprint and signature match, so only the natural forward's own record (and its
+    # input addresses) stops its recompute from taking the replayed forward's experts.
+    values = torch.arange(8.0).reshape(1, 8)  # natural top-2: experts [7, 6]
+    order = [None, [[0, 1]]] if natural_first else [[[0, 1]], None]
+
+    def run(compiled):
+        replay.reset_routing_replay()
+        torch._dynamo.reset()
+        layer = _layer(replay)
+        fn = torch.compile(lambda x: layer(x), backend = "aot_eager", fullgraph = True) if compiled else layer
+        xs, ids_out, losses = [], [], []
+        for forced in order:
+            x = values.clone().requires_grad_()
+            xs.append(x)
+            replay._STATE.in_forward = True
+            replay._STATE.current = None if forced is None else torch.tensor(forced).unsqueeze(1)
+            if compiled:
+                replay._STATE.record = {}
+                replay._STATE.pending.append(replay._STATE.record)
+                replay._STATE.has_pending = True
+                out, ids = checkpoint(fn, x, use_reentrant = False)
+            else:
+                out, ids = fn(x)  # no checkpoint: the true gradients
+            replay._STATE.in_forward = False
+            replay._STATE.record = None
+            ids_out.append(ids.sort(-1).values.tolist())
+            losses.append((out * torch.arange(1.0, 9.0)).sum())
+        replay._STATE.current = None
+        sum(losses).backward()
+        return ids_out, [x.grad for x in xs]
+
+    want_ids, want = run(compiled = False)
+    assert sorted(map(tuple, (i[0] for i in want_ids))) == [(0, 1), (6, 7)]
+    got_ids, got = run(compiled = True)
+    assert got_ids == want_ids
+    assert not torch.equal(want[0], want[1])
+    for g, w in zip(got, want):
+        torch.testing.assert_close(g, w, rtol = 0, atol = 0)

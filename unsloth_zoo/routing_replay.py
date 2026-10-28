@@ -817,6 +817,13 @@ def _router_hook(layer_index, compact = None):
         else:
             forced, valid = recomputed
             forced = torch.where(valid, forced, ids2.long())
+            if mirror:
+                # Recorded too (natural ids, every row invalid): a replayed forward with the same
+                # natural routes and router input would otherwise be the only candidate, and this
+                # forward's recompute would take its forced experts. Input addresses tell them apart.
+                _STATE.record[layer_index] = (
+                    _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
+                )
         reweight = _formulas()[formula]
         new_weights = reweight(logits2, forced)
         if formula == "probs_renorm":
