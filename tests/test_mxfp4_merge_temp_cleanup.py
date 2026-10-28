@@ -1,10 +1,5 @@
-"""The mxfp4 merge spools each tensor to a temporary .pt file and memory-maps it back.
-
-On Windows a mapped file cannot be deleted, so the immediate os.remove fails and the
-.pt file used to be left behind in the temp directory (the whole dequantized shard).
-This simulates the Windows rule (remove raises while a tensor loaded from the file is
-alive) and checks that no .pt file survives and the merged shard bytes do not change.
-"""
+"""mxfp4 merge spools tensors to mmapped .pt files; Windows cannot delete a mapped file, so they
+leaked into TEMP. Simulates that rule; no .pt may survive and the merged bytes must not change."""
 import hashlib
 import os
 import tempfile

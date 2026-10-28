@@ -2584,7 +2584,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     filename_original = os.path.join(save_directory, filename)  # Original file path
     _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
-    pending_temp_files = []  # spooled .pt files Windows refused to delete while mapped
+    pending_temp_files = []
     count = 0
     safetensor_keys_seen = set()
     import psutil
@@ -2771,7 +2771,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
             try:
                 os.remove(temp_filename)
             except OSError:
-                # On Windows the mmap keeps the file open; removed once the save below drops it.
+                # Windows cannot delete a mapped file; retried after save_file drops the mappings.
                 pending_temp_files.append(temp_filename)
 
             tensors[output_key] = W
@@ -2793,7 +2793,6 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
         save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})  # Save to the temporary safetensors file
     finally:
         if pending_temp_files:
-            # Unmap the spooled tensors so Windows can delete their .pt files.
             tensors.clear()
             W = None
             gc.collect()
