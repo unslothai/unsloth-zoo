@@ -144,3 +144,23 @@ def test_unsupported_inputs_keep_linear_scan(monkeypatch):
     assert su._build_reversed_key_index(["a.weight", 3]) is None
     with pytest.raises(AttributeError):
         su._infer_prefix_and_remap(_lw(["m.q"]), ["x.m.q.weight", 3])
+
+
+_VOTE_COMP = ["model", "language_model", "vision_tower", "layers", "0", "1", "experts", "q_proj", "gate_proj", ""]
+
+
+def test_vote_signature_buckets_match_unfiltered_scan(monkeypatch):
+    r = random.Random(4321)
+    for _ in range(1500):
+        lora = [".".join(r.choice(_VOTE_COMP) for _ in range(r.randint(1, 5))) for _ in range(r.randint(1, 8))]
+        disk = []
+        for k in lora + [r.choice(lora)]:
+            parts = k.split(".")
+            if r.random() < 0.6:
+                r.shuffle(parts)
+            disk.append(r.choice(["", "model.", "language_model."]) + ".".join(parts) + r.choice([".weight", ".linear.weight", ".bias"]))
+        disk = r.sample(disk, r.randint(1, len(disk)))  # one shard of the checkpoint
+        with monkeypatch.context() as m:
+            m.setattr(su, "_component_signature", lambda parts: ())
+            expected = _items(su._infer_prefix_and_remap(_lw(lora), list(disk)))
+        assert _items(su._infer_prefix_and_remap(_lw(lora), list(disk))) == expected, (lora, disk)

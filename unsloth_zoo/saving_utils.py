@@ -6811,6 +6811,11 @@ def _indexed_prefix_candidates(index, keys, k):
     return list(dict.fromkeys(candidates))
 pass
 
+def _component_signature(parts):
+    """A vote needs equal prefix multisets over a shared suffix, so equal full multisets: pairs with different signatures never vote."""
+    return tuple(sorted(p for p in parts if p))
+pass
+
 def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     """Infer missing key prefixes by matching LoRA keys against safetensor keys.
 
@@ -6877,15 +6882,17 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             if module_key is None:
                 continue
             sf_parts = module_key.split(".")
+            signature = _component_signature(sf_parts)
             for sl in range(1, min(3, len(sf_parts)) + 1):
-                sf_parts_by_suffix[(sl, tuple(sf_parts[-sl:]))].append(sf_parts)
+                sf_parts_by_suffix[(signature, sl, tuple(sf_parts[-sl:]))].append(sf_parts)
         for k, _ in unmatched_keys:
             if not isinstance(k, str):
                 continue
             k_parts = k.split(".")
+            signature = _component_signature(k_parts)
             seen_sf = set()
             for sl in range(min(3, len(k_parts)), 0, -1):
-                for sf_parts in sf_parts_by_suffix.get((sl, tuple(k_parts[-sl:])), ()):
+                for sf_parts in sf_parts_by_suffix.get((signature, sl, tuple(k_parts[-sl:])), ()):
                     sf_id = tuple(sf_parts)
                     if sf_id in seen_sf:        # process each sf once, at its longest match
                         continue
