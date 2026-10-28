@@ -9,7 +9,7 @@ import _merge_e2e_helpers as H
 @pytest.mark.parametrize("scenario", ["attn_only", "mlp_only"])
 def test_merge_writes_only_adapted_tensors(scenario, tmp_path, monkeypatch):
     if not H.family_available("llama"):
-        pytest.skip("llama unavailable in this transformers")
+        pytest.skip(reason = "tiny llama config cannot be built by the installed transformers")
     import unsloth_zoo.saving_utils as sv
 
     written = []
