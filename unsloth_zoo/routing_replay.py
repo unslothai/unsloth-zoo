@@ -156,6 +156,8 @@ class _ReplayState:
         self.in_forward = False
         self.record = None
         self.pending = []
+        # Read in compiled regions instead of the list, whose length would become a Dynamo guard.
+        self.has_pending = False
         self.recomputed = False
         self.layer_inputs = {}
         self.stats = dict(
@@ -449,6 +451,7 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
             _STATE.recomputed = False
         _STATE.record = {}
         _STATE.pending.append(_STATE.record)
+        _STATE.has_pending = True
         if len(_STATE.pending) > _MAX_PENDING:
             del _STATE.pending[:-_MAX_PENDING]
             if not _STATE.warned_evicted:
@@ -504,6 +507,15 @@ def _signature_projection(width, device):
     return projection
 
 
+def _projection_impl(x: torch.Tensor) -> torch.Tensor:
+    # A copy: a custom op may not return a tensor it does not own (the cached projection).
+    return _signature_projection(x.shape[-1], x.device).clone()
+
+
+def _projection_fake(x):
+    return x.new_empty((x.shape[-1], 2), dtype = torch.float32)
+
+
 def _input_signature(args, tokens):
     # Per token fp32 random projections of the router input. The recompute feeds the router the
     # same bits as the forward did, so this tells apart forwards whose natural routes are equal.
@@ -514,7 +526,9 @@ def _input_signature(args, tokens):
     # Autocast would run the projection in bf16 / fp16 and merge nearby inputs.
     with torch.no_grad(), torch.autocast(device_type = x.device.type, enabled = False):
         x = x.detach().reshape(tokens, -1)
-        projection = _signature_projection(x.shape[-1], x.device)
+        # Fullgraph cannot create the seeded Generator: the opaque op builds the projection.
+        projection = _PROJECTION_OP(x) if torch.compiler.is_compiling() \
+            else _signature_projection(x.shape[-1], x.device)
         # Chunked so the fp32 upcast stays bounded for long sequences.
         return torch.cat([
             x[a : a + _SIGNATURE_CHUNK].float() @ projection
@@ -525,9 +539,49 @@ def _input_signature(args, tokens):
 def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
     # A router call outside a decoder forward is a checkpoint recompute: pick the recorded forward
     # whose natural routing it reproduces, without a host sync. None when no forward was recorded.
+    if torch.compiler.is_compiling():
+        return _compiled_recomputed_routes(layer_index, ids2, signature, layer_input)
     if not _STATE.pending:
         return None
     _STATE.recomputed = True
+    return _pick_recorded(layer_index, ids2, signature, layer_input)
+
+
+def _compiled_recomputed_routes(layer_index, ids2, signature, layer_input):
+    # Opaque so Dynamo never guards on the pending list's length (recompile per forward count).
+    if not _STATE.has_pending:
+        return None
+    _STATE.recomputed = True
+    return _RECOMPUTE_OP(ids2, signature, layer_input, layer_index)
+
+
+def _recompute_impl(
+    ids2: torch.Tensor, signature: typing.Optional[torch.Tensor],
+    layer_input: typing.Optional[torch.Tensor], layer_index: int,
+) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    picked = _pick_recorded(layer_index, ids2, signature, layer_input) if _STATE.pending else _NATURAL
+    if picked is _NATURAL:
+        return _natural_impl(ids2)
+    forced, valid = picked
+    return forced.long().clone(), valid.reshape(ids2.shape[0], 1).to(ids2.device).clone()
+
+
+def _recompute_fake(ids2, signature, layer_input, layer_index):
+    return _natural_fake(ids2)
+
+
+def _natural_impl(ids2: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    return ids2.long().clone(), torch.zeros(ids2.shape[0], 1, dtype = torch.bool, device = ids2.device)
+
+
+def _natural_fake(ids2):
+    return (
+        ids2.new_empty(ids2.shape, dtype = torch.int64),
+        ids2.new_empty((ids2.shape[0], 1), dtype = torch.bool),
+    )
+
+
+def _pick_recorded(layer_index, ids2, signature, layer_input):
     candidates = [r[layer_index] for r in _STATE.pending if layer_index in r and r[layer_index][1].shape == ids2.shape]
     if not candidates:
         # No forward replayed this layer: recompute it exactly as it ran, with no extra ops
@@ -670,25 +724,41 @@ def _router_hook(layer_index, compact = None):
         else:
             weights2 = weights.reshape(ids2.shape)
         signature = None
-        if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
+        if torch.compiler.is_compiling():
+            # The flag, not the list: its length would become a guard. An open record is pending.
+            wants_signature = _STATE.record is not None or (not _STATE.in_forward and _STATE.has_pending)
+        else:
+            wants_signature = _STATE.pending and (_STATE.record is not None or not _STATE.in_forward)
+        if wants_signature:
             signature = _input_signature(args, ids2.shape[0])
         # Read once and clear; traced with the pre hook, this is the op's runtime output.
         layer_input = _STATE.layer_inputs.get(layer_index)
         _STATE.layer_inputs[layer_index] = None
-        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature, layer_input)
+        if _STATE.in_forward:
+            recomputed = None
+        elif torch.compiler.is_compiling() and _STATE.has_pending \
+                and getattr(module, "_unsloth_replay_formula", None) is None:
+            # No forward replayed this layer: recompute as it ran, without tracing the formula probe.
+            _STATE.recomputed = True
+            recomputed = _NATURAL
+        else:
+            recomputed = _recomputed_routes(layer_index, ids2, signature, layer_input)
         if recomputed is not None:
             _count("router_calls_recomputed")
         if recomputed is _NATURAL:
             _count("router_calls_natural")
             return None
-        if recomputed is None and replay is None:
-            _count("router_calls_natural")
-            return None
-        if recomputed is None and (
-            replay.shape[0] != ids2.shape[0]
+        natural = recomputed is None and (
+            replay is None
+            or replay.shape[0] != ids2.shape[0]
             or row >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
-        ):
+        )
+        # The recompute always reweights via the opaque pick; reweight here too (all rows invalid)
+        # so the non-reentrant checkpoint sees identical saved tensors.
+        mirror = natural and _STATE.record is not None and torch.compiler.is_compiling() \
+            and isinstance(getattr(module, "_unsloth_replay_formula", None), str)
+        if natural and not mirror:
             _count("router_calls_natural")
             return None
 
@@ -721,12 +791,16 @@ def _router_hook(layer_index, compact = None):
             _count("router_calls_natural")
             return None
 
+        if mirror:
+            # Opaque: in-graph constants are rematerialised in backward, so saved tensors would differ.
+            recomputed = _NATURAL_OP(ids2)
         if recomputed is None:
             # Replay rows live on the input ids' device; a device map can put this layer elsewhere.
             forced = replay[:, row, :].to(ids2.device, non_blocking = True)
             valid = (forced >= 0).all(dim = -1, keepdim = True)
             forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
             if _STATE.record is not None:
+                _STATE.has_pending = True
                 # A copy: the output ids may alias forced, and MoE blocks can reuse them in place.
                 _STATE.record[layer_index] = (
                     _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
@@ -734,6 +808,11 @@ def _router_hook(layer_index, compact = None):
         else:
             forced, valid = recomputed
             forced = torch.where(valid, forced, ids2.long())
+            if mirror:
+                # Recorded too, else an identical replayed forward would donate its forced experts.
+                _STATE.record[layer_index] = (
+                    _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
+                )
         reweight = _formulas()[formula]
         new_weights = reweight(logits2, forced)
         if formula == "probs_renorm":
@@ -799,17 +878,26 @@ def _register_op(name, impl, fake):
 
 _LAYER_INPUTS_OP = None
 _IDENTITY_MASK_OP = None
+_PROJECTION_OP = None
+_RECOMPUTE_OP = None
+_NATURAL_OP = None
 
 
 def _layer_inputs_op():
     # data_ptr() is untraceable and fullgraph forbids breaks: opaque ops, registered eagerly. Returning
     # the addresses lets the router hook read them in-graph (not frozen at trace time) and keeps the op
     # alive. Matching is a second op: no CPU kernels for Inductor to compile inside a GPU graph.
-    global _LAYER_INPUTS_OP, _IDENTITY_MASK_OP
+    global _LAYER_INPUTS_OP, _IDENTITY_MASK_OP, _PROJECTION_OP, _RECOMPUTE_OP, _NATURAL_OP
     if _LAYER_INPUTS_OP is None:
         _LAYER_INPUTS_OP = _register_op("routing_replay_input_addresses", _layer_inputs_impl, _layer_inputs_fake)
     if _IDENTITY_MASK_OP is None:
         _IDENTITY_MASK_OP = _register_op("routing_replay_identity_mask", _identity_mask_impl, _identity_mask_fake)
+    if _PROJECTION_OP is None:
+        _PROJECTION_OP = _register_op("routing_replay_signature_projection", _projection_impl, _projection_fake)
+    if _RECOMPUTE_OP is None:
+        _RECOMPUTE_OP = _register_op("routing_replay_recomputed_routes", _recompute_impl, _recompute_fake)
+    if _NATURAL_OP is None:
+        _NATURAL_OP = _register_op("routing_replay_natural_routes", _natural_impl, _natural_fake)
     return _LAYER_INPUTS_OP
 
 
