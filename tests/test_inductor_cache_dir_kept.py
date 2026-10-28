@@ -69,6 +69,12 @@ def test_compiled_cache_folder_differing_in_case_is_dropped(monkeypatch, tmp_pat
     assert "TORCHINDUCTOR_CACHE_DIR" not in os.environ
 
 
+def test_empty_value_is_dropped(monkeypatch):
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "")
+    _run_patch_torch_compile()
+    assert "TORCHINDUCTOR_CACHE_DIR" not in os.environ
+
+
 def test_unset_stays_unset(monkeypatch):
     monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising = False)
     _run_patch_torch_compile()

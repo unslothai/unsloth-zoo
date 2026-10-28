@@ -189,6 +189,8 @@ def _drop_inductor_cache_dir_in_compile_location():
     """
     value = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
     if not value:
+        # Empty is no choice: torch resolves "" to the CWD or fails os.makedirs("").
+        os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
         return
     candidates = (UNSLOTH_COMPILE_LOCATION, os.environ.get("UNSLOTH_COMPILE_LOCATION"))
     try:
