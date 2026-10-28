@@ -2164,10 +2164,7 @@ _TOP_LEVEL_DEF = re.compile(r"^def (\w+)\(", flags = re.MULTILINE)
 
 
 def _items_to_import(functions, new_source, name):
-    """Names in `functions` used by `new_source`, minus `name` and its own top level defs.
-
-    One scan collects every top level def; a `^def <x>\\(` search per name cost ~2 s per import.
-    """
+    """Names in `functions` used by `new_source`, minus `name` and its own top level defs."""
     defined = None
     items = []
     for x in functions:

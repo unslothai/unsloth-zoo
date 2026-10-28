@@ -845,7 +845,7 @@ def patch_model_and_tokenizer(
             verify_and_set_device(layer)
     pass
 
-    # Clear deleted GPU items; stops once a pass that really ran finds nothing (see _gc_passes).
+    # Clear deleted GPU items
     collect_garbage(after = torch.xpu.empty_cache if DEVICE_TYPE == "xpu" else torch.cuda.empty_cache)
     return model, tokenizer
 pass
