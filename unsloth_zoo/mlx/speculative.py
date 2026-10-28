@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import copy
+import functools
 import gc
 import importlib
+import inspect
 import json
 import os
 import re
@@ -1221,6 +1223,14 @@ class SpeculativeEngine:
         return emitted
 
 
+@functools.cache
+def _history_starts_at_prompt(generate_step) -> bool:
+    try:
+        return "tokens = input_ids.flatten()" in inspect.getsource(generate_step)
+    except (OSError, TypeError):
+        return False
+
+
 def _shown_from(processor: Callable, start: int) -> Callable:
     def shown(tokens, logits):
         return processor(tokens[start:], logits)
@@ -1291,8 +1301,8 @@ class SpeculativeDraft:
         prompt, sampling, processors = request
         first = int(first_token.item())
         yield first, logprobs
-        # mlx-vlm's first step showed the processors the last prefilled chunk alone.
-        start = max(0, len(prompt) - int(input_ids.size))
+        # Before 0.7.11 mlx-vlm's first step showed the processors the last prefilled chunk alone.
+        start = 0 if _history_starts_at_prompt(importlib.import_module("mlx_vlm.generate.ar").generate_step) else max(0, len(prompt) - int(input_ids.size))
         processors = [_shown_from(processor, start) for processor in processors]
         engine = SpeculativeEngine(model, self.controller, self.drafter)
         engine.add(self._started(model, EngineRow(prompt_cache, first, prompt, sampling, max_tokens, processors = processors), last_outputs))
