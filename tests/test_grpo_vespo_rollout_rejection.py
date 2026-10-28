@@ -86,7 +86,6 @@ def _data(seed, rows = 6, cols = 9, spread = 0.4):
     mask[3] = 0
     adv = torch.randn(rows, generator = g, dtype = torch.float64)
     adv[0] = 0.0
-    # Ratios outside every clip window used below, so TRL's token_mask / truncate really fire.
     sampling[4, 2] = old[4, 2] - 2.0
     sampling[5, 3] = old[5, 3] + 2.0
     mask[4, 2] = mask[5, 3] = 1
@@ -127,8 +126,7 @@ def _compact(x, keep, fill):
 
 
 def _dropped_oracle(new, old, sampling, mask, adv, keep, mode, clip, beta, ref, bypass):
-    """TRL VESPO run on the sequences with the rejected tokens physically removed; the normaliser still
-    counts every completion token (as on the zoo rollout_rs path)."""
+    """TRL VESPO with rejected tokens removed; normaliser still counts every completion token."""
     k = (keep & (mask > 0))
     m = _compact(mask.double(), k, 0.0)
     n = _compact(new, k, 0.0)
@@ -171,7 +169,6 @@ def test_vespo_rollout_rs_matches_dropped_token_oracle(seed, options, thresholds
     lz, gz = _grad(lambda n: _zoo(n, old, sampling, mask, adv, beta, ref, mode, clip, level, parsed, bypass), new)
     lo, go = _grad(lambda n: _dropped_oracle(n, old, sampling, mask, adv, keep, mode, clip, beta, ref, bypass), new)
     torch.testing.assert_close(lz, lo, rtol = 1e-10, atol = 1e-12)
-    # The oracle compacts inside autograd, so its gradient is already at the original positions.
     torch.testing.assert_close(gz * mask, go, rtol = 1e-10, atol = 1e-12)
 
 
@@ -206,14 +203,12 @@ def test_rejected_tokens_perturbation_invariance(seed, bypass):
     shift = torch.randn(new.shape, generator = g, dtype = torch.float64) * 5.0
     new2 = torch.where(rejected, new + shift, new)
     if bypass:
-        # Rejection reads new - rollout: push that gap further out on its own side.
         new2 = torch.where(rejected, new + torch.sign(gap) * shift.abs(), new)
         sampling2 = sampling
         gap2 = new2 - sampling2.float().double()
         old2 = old
     else:
-        # Same rollout gap (same rejection) but a policy ratio of about 1 / 1e-8 on each rejected token,
-        # cancelling its zeroed IS factor's log(1e-8): before the fix this un-crushes the sequence weight.
+        # Policy ratio ~1/1e-8 on rejected tokens cancels log(1e-8): pre-fix this un-crushed the weight.
         lift = math.log(1e-8)
         new2 = torch.where(rejected, new + 0.1 * shift, new)
         old2 = torch.where(rejected, old + lift, old)
