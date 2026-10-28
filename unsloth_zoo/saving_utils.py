@@ -1071,6 +1071,7 @@ def _merge_and_overwrite_lora(
     use_dequant_base = False,
     biases = None,
     vocab_modules = None,
+    fp8_header_cache = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -1100,6 +1101,7 @@ def _merge_and_overwrite_lora(
             model_class_name, tie_word_embeddings = tie_word_embeddings,
             weight_block_size = weight_block_size,
             biases = biases, vocab_modules = vocab_modules,
+            header_cache = fp8_header_cache,
         )
     pass
 
@@ -2975,11 +2977,15 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
     W_real = _fp8_dequant_blockwise(W, scale_inv, block_size = weight_block_size)
     return W_real, scale_keys
 
-def _build_cross_shard_fp8_index(save_directory, current_filename):
+def _build_cross_shard_fp8_index(save_directory, current_filename, header_cache = None):
     """{key: (filename, dtype)} for tensors in the OTHER *.safetensors shards (headers only,
     no tensor reads). HF shards a weight and its scale companion independently, so an FP8
     weight and its `*.weight_scale(_inv)` can land in different files; this lets the rewrite
-    find a scale elsewhere and drop a scale whose weight was dequantized elsewhere."""
+    find a scale elsewhere and drop a scale whose weight was dequantized elsewhere.
+
+    `header_cache` ({filename: (stat stamp, entries)}, owned by one export's shard loop)
+    reuses a sibling's parsed header while its inode, size and mtime are unchanged, so S
+    shards cost S header parses instead of S^2. A rewritten shard is re-read."""
     index = {}
     try:
         siblings = [f for f in os.listdir(save_directory)
@@ -2987,15 +2993,30 @@ def _build_cross_shard_fp8_index(save_directory, current_filename):
     except OSError:
         return index
     for fn in siblings:
-        try:
-            with open(os.path.join(save_directory, fn), "rb") as fp:
-                length = int.from_bytes(fp.read(8), "little")
-                hdr = json.loads(fp.read(length))
-        except Exception:
-            continue
-        for k, meta in hdr.items():
-            if k != "__metadata__" and isinstance(meta, dict):
-                index.setdefault(k, (fn, meta.get("dtype")))
+        path = os.path.join(save_directory, fn)
+        stamp = entries = None
+        if header_cache is not None:
+            try:
+                st = os.stat(path)
+                stamp = (st.st_ino, st.st_size, st.st_mtime_ns)
+            except OSError:
+                stamp = None
+            cached = header_cache.get(fn)
+            if stamp is not None and cached is not None and cached[0] == stamp:
+                entries = cached[1]
+        if entries is None:
+            try:
+                with open(path, "rb") as fp:
+                    length = int.from_bytes(fp.read(8), "little")
+                    hdr = json.loads(fp.read(length))
+            except Exception:
+                continue
+            entries = [(k, meta.get("dtype")) for k, meta in hdr.items()
+                       if k != "__metadata__" and isinstance(meta, dict)]
+            if stamp is not None:
+                header_cache[fn] = (stamp, entries)
+        for k, dtype in entries:
+            index.setdefault(k, (fn, dtype))
     return index
 pass
 
@@ -3085,9 +3106,11 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames, prerewrit
     return removed
 pass
 
-def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None, vocab_modules = None):
+def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None, vocab_modules = None, header_cache = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
+    if header_cache is not None:
+        header_cache.pop(filename, None)  # this shard may have been rewritten just before
     filename_original = os.path.join(save_directory, filename)
     _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
@@ -3127,7 +3150,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             )
 
         # FP8 weight/scale pairs can be split across shards, so index the other shards once.
-        cross_shard = _build_cross_shard_fp8_index(save_directory, filename)
+        cross_shard = _build_cross_shard_fp8_index(save_directory, filename, header_cache)
 
         def _load_cross_shard_scale(scale_key):
             entry = cross_shard.get(scale_key)
@@ -3245,6 +3268,8 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
     with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
         temp_filename_safetensors = tmpfile.name
     save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})
+    if header_cache is not None:
+        header_cache.pop(filename, None)  # the shard is rewritten below
     try:
         os.replace(temp_filename_safetensors, filename_original)
     except OSError as e:
@@ -5909,6 +5934,7 @@ def merge_and_overwrite_lora(
         _merge_base_model, lora_weights, _merge_tie_word_embeddings,
     ) if save_method == "merged_16bit" else {}
     _widened_total_size = 0
+    _fp8_header_cache = {}  # sibling shard headers for the FP8 cross-shard index
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         if _mxfp4_rewrite is not None:
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
@@ -5932,6 +5958,7 @@ def merge_and_overwrite_lora(
             use_dequant_base = _use_dequant_base,
             biases = biases,
             vocab_modules = _vocab_modules,
+            fp8_header_cache = _fp8_header_cache,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
