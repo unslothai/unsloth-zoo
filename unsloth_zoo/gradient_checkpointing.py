@@ -494,13 +494,19 @@ def _reserve_pinned_counted(nbytes, block):
         if not _block_fits_host_ram(block) and not (_empty_host_cache() and _block_fits_host_ram(block)):
             _warn_host_ram_full()
             return False
-    elif GC_PINNED_CAP >= 0 and held - _HOST_HELD_BASELINE + block > GC_PINNED_CAP:
+    elif GC_PINNED_CAP >= 0 and _counted_used(held) + block > GC_PINNED_CAP:
         if not _counted_slow_path_fits(block):
             _warn_pinned_cap()
             return False
-    GC_PINNED_BYTES += block  # informational here: decisions read the allocator
+    GC_PINNED_BYTES += block  # our live blocks: a floor under the allocator's count (_counted_used)
     _charge_live(nbytes, -block)  # negative: released the counted way, whatever the settings by then
     return True
+
+
+def _counted_used(held):
+    # Our live blocks are a floor: a pinned user present when the baseline was taken may since have
+    # returned its blocks to the OS (our own cap flush empties the host cache), which lowers held - baseline.
+    return max(held - _HOST_HELD_BASELINE, GC_PINNED_BYTES)
 
 
 def _counted_slow_path_fits(block):
@@ -515,10 +521,10 @@ def _counted_slow_path_fits(block):
         if not _is_host_alloc_oom(exception): raise
     else: del drain
     held = _host_allocator_held_bytes()
-    if held is not None and held - _HOST_HELD_BASELINE + block <= GC_PINNED_CAP: return True
+    if held is not None and _counted_used(held) + block <= GC_PINNED_CAP: return True
     if not _empty_host_cache(): return False
     held = _host_allocator_held_bytes()
-    return held is not None and held - _HOST_HELD_BASELINE + block <= GC_PINNED_CAP
+    return held is not None and _counted_used(held) + block <= GC_PINNED_CAP
 
 
 def _charge_live(nbytes, block):
