@@ -249,6 +249,8 @@ def loop_runs(tmp_path_factory):
 
 
 def test_decode_loop_engages_fused_norms_and_kill_switch(loop_runs):
+    if not torch.cuda.is_available():
+        pytest.skip("the fused decode kernels only replace the eager ops on CUDA tensors")
     L = 4
     calls = loop_runs["fused"]["calls"]["add_rms_norm"]
     # Two per layer plus the final norm, per decode step (23 of them).

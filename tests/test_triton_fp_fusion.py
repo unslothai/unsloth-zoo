@@ -49,16 +49,24 @@ _DELIBERATE_FALSE = {
     "temporary_patches/moe_triton_kernels.py:fwd",
     "temporary_patches/moe_triton_kernels.py:bwd_dy",
     "temporary_patches/moe_triton_kernels.py:bwd_dw",
+    "gpt_oss_decode_fused.py:_add_rms_norm_kernel",
+    "gpt_oss_decode_fused.py:_sink_scale_kernel",
 }
 
 
 def _kwargs_dicts(tree):
     """id(launch call) -> the dict(...) / {...} each `**name` it splats was assigned in its function."""
     out = {}
+    # Module-level `NAME = {...}` splats too (gpt_oss_decode_fused's `_NO_FMA`); a function's own wins.
+    module = {
+        node.targets[0].id: node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+    }
     for func in ast.walk(tree):
         if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        dicts = {}
+        dicts = dict(module)
         for node in ast.walk(func):
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 dicts[node.targets[0].id] = node.value
@@ -71,6 +79,8 @@ def _kwargs_dicts(tree):
 
 def _fp_fusion_values(node, splatted):
     values = [k.value for k in node.keywords if k.arg == "enable_fp_fusion"]
+    # `{} if TRITON_INTERPRET else {...}`: the compiled branch is the one that states it.
+    splatted = [v.orelse if isinstance(v, ast.IfExp) else v for v in splatted]
     for value in splatted:
         if isinstance(value, ast.Call) and getattr(value.func, "id", None) == "dict":
             values += [k.value for k in value.keywords if k.arg == "enable_fp_fusion"]
