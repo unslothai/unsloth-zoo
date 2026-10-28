@@ -45,8 +45,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import ane_prefill, attention, matmul, nax
-from .ane_prefill import ane_prefill_mlp
+from . import ane, attention, matmul, nax
+from .ane import ane_prefill_mlp
 
 
 logger = logging.getLogger(__name__)
@@ -6877,7 +6877,7 @@ INFERENCE_SCOPES = [
     InferenceScope(fused_moe_routed_experts),
     InferenceScope(nax_quantized_linear, int8_prefill = True),
     InferenceScope(dense_prefill_linear),
-    InferenceScope(ane_prefill_mlp, opt_in = ane_prefill.OPT_IN),
+    InferenceScope(ane_prefill_mlp, opt_in = ane.OPT_IN),
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_qsa_attention),
     InferenceScope(fast_qsa_prefill),

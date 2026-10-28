@@ -31,7 +31,7 @@ if mlx_is_simulated():
 
 import mlx.nn as nn  # noqa: E402
 
-from unsloth_zoo.mlx import ane, ane_prefill  # noqa: E402
+from unsloth_zoo.mlx import ane  # noqa: E402
 
 if not ane.available():
     pytest.skip("no Neural Engine runtime", allow_module_level = True)
@@ -78,21 +78,21 @@ def _cosine(a, b):
 
 @pytest.fixture
 def prepared(monkeypatch):
-    monkeypatch.setenv(ane_prefill.OPT_IN, "1")
-    monkeypatch.setattr(ane_prefill, "_DOWN_SLAB", 256)   # several down slabs at this size
+    monkeypatch.setenv(ane.OPT_IN, "1")
+    monkeypatch.setattr(ane, "_DOWN_SLAB", 256)   # several down slabs at this size
     model = _model()
-    status = ane_prefill.prepare_ane_prefill(model, tile = TILE, share = 0.5)
+    status = ane.prepare_ane_prefill(model, tile = TILE, share = 0.5)
     assert status.layers == 2 and status.reason == ""
     model.__dict__["_unsloth_ane_prepared"] = True
     yield model
-    ane_prefill.release_ane_prefill(model)
+    ane.release_ane_prefill(model)
 
 
 def test_split_tiles_match_the_native_mlp_and_the_rest_stays_native(prepared):
     mlp = prepared.layers[1]
     x = _rows(2 * TILE + 5)
     native = mlp(x)
-    with ane_prefill.ane_prefill_mlp(prepared):
+    with ane.ane_prefill_mlp(prepared):
         split = mlp(x)
         decode = mlp(x[:, :3])
     assert type(mlp) is SwiGLU
@@ -108,16 +108,16 @@ def test_split_tiles_match_the_native_mlp_and_the_rest_stays_native(prepared):
 def test_each_split_reads_its_own_layer(prepared):
     x = _rows(TILE)
     natives = [layer(x) for layer in prepared.layers]
-    with ane_prefill.ane_prefill_mlp(prepared):
+    with ane.ane_prefill_mlp(prepared):
         splits = [layer(x) for layer in reversed(prepared.layers)][::-1]
     for native, split, other in zip(natives, splits, natives[::-1]):
         assert _cosine(split, native) > 0.999 > _cosine(split, other)
         assert not mx.array_equal(split, native).item()   # each layer ran its own split, not the native fallback
-    assert all(ane_prefill._STATE in layer.__dict__ for layer in prepared.layers)
+    assert all(ane._STATE in layer.__dict__ for layer in prepared.layers)
 
 
 def test_a_failed_evaluation_falls_back_to_the_gpu_for_good(prepared, monkeypatch):
-    split = prepared.layers[0].__dict__[ane_prefill._STATE]
+    split = prepared.layers[0].__dict__[ane._STATE]
 
     def fail():
         raise ane.AneError("injected")
@@ -125,7 +125,7 @@ def test_a_failed_evaluation_falls_back_to_the_gpu_for_good(prepared, monkeypatc
     calls = []
     monkeypatch.setattr(split.request, "run", lambda: (calls.append(1), fail()))
     x = _rows(TILE)
-    with ane_prefill.ane_prefill_mlp(prepared):
+    with ane.ane_prefill_mlp(prepared):
         out, again = prepared.layers[0](x), prepared.layers[0](x)
     assert split.failed and len(calls) == 1
     assert mx.array_equal(out, prepared.layers[0](x)).item() and mx.array_equal(again, out).item()
@@ -134,10 +134,10 @@ def test_a_failed_evaluation_falls_back_to_the_gpu_for_good(prepared, monkeypatc
 def test_a_timed_out_program_is_never_unloaded_and_stops_every_split(prepared, monkeypatch):
     import time
 
-    monkeypatch.setattr(ane_prefill, "_ABANDONED", [])
-    split, other = (layer.__dict__[ane_prefill._STATE] for layer in prepared.layers)
+    monkeypatch.setattr(ane, "_ABANDONED", [])
+    split, other = (layer.__dict__[ane._STATE] for layer in prepared.layers)
     calls = []
-    monkeypatch.setattr(ane_prefill, "_WATCHDOG", 0.05)
+    monkeypatch.setattr(ane, "_WATCHDOG", 0.05)
     monkeypatch.setattr(split.request, "run", lambda: time.sleep(0.5))
     monkeypatch.setattr(other.request, "run", lambda: calls.append(1))
     torn_down = []
@@ -158,35 +158,35 @@ def test_a_timed_out_program_is_never_unloaded_and_stops_every_split(prepared, m
     for owner in owners:
         monkeypatch.setattr(owner, "_finalizer", Spy(owner._finalizer))
     x = _rows(TILE)
-    with ane_prefill.ane_prefill_mlp(prepared):
+    with ane.ane_prefill_mlp(prepared):
         prepared.layers[0](x)
         out = prepared.layers[1](x)
     assert not calls and not other.failed and mx.array_equal(out, prepared.layers[1](x)).item()
-    ane_prefill.release_ane_prefill(prepared)
-    assert split.failed and split in ane_prefill._ABANDONED
+    ane.release_ane_prefill(prepared)
+    assert split.failed and split in ane._ABANDONED
     assert not torn_down and not any(owner._finalizer.real.alive for owner in owners)   # nor at exit
     time.sleep(0.5)   # let the worker finish before the next test queues behind it
 
 
 def test_only_the_common_mlp_shape_is_attached():
     model = _model(tower = True)
-    assert ane_prefill.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 2
-    assert ane_prefill._STATE not in model.tower[0].__dict__
-    ane_prefill.release_ane_prefill(model)
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 2
+    assert ane._STATE not in model.tower[0].__dict__
+    ane.release_ane_prefill(model)
 
 
 @pytest.mark.parametrize("error", [ane.AneError, concurrent.futures.TimeoutError])
 def test_a_failed_calibration_leaves_the_model_native(error, monkeypatch, tmp_path):
-    monkeypatch.setattr(ane_prefill, "_CACHE_PATH", str(tmp_path / "cache.json"))
+    monkeypatch.setattr(ane, "_CACHE_PATH", str(tmp_path / "cache.json"))
 
     def fail(self):
         raise error("injected")
 
-    monkeypatch.setattr(ane_prefill._Split, "evaluate", fail)
+    monkeypatch.setattr(ane._Split, "evaluate", fail)
     model = _model()
-    status = ane_prefill.prepare_ane_prefill(model, tile = TILE)
+    status = ane.prepare_ane_prefill(model, tile = TILE)
     assert status.layers == 0 and "injected" in status.reason
-    assert all(ane_prefill._STATE not in layer.__dict__ for layer in model.layers)
+    assert all(ane._STATE not in layer.__dict__ for layer in model.layers)
 
 
 @pytest.mark.parametrize("replaced", ["projection", "unquantized", "scales"])
@@ -200,13 +200,13 @@ def test_a_replaced_projection_detaches_the_split(prepared, replaced):
     else:
         mlp.down_proj.scales = mlp.down_proj.scales * 2
     x = _rows(TILE)
-    with ane_prefill.ane_prefill_mlp(prepared):
+    with ane.ane_prefill_mlp(prepared):
         out = mlp(x)
-    assert ane_prefill._STATE not in mlp.__dict__ and mx.array_equal(out, mlp(x)).item()
+    assert ane._STATE not in mlp.__dict__ and mx.array_equal(out, mlp(x)).item()
 
 
 def test_overlapping_scopes_keep_the_split_until_the_last_exit(prepared):
-    first, second = ane_prefill.ane_prefill_mlp(prepared), ane_prefill.ane_prefill_mlp(prepared)
+    first, second = ane.ane_prefill_mlp(prepared), ane.ane_prefill_mlp(prepared)
     first.__enter__()
     second.__enter__()
     first.__exit__(None, None, None)
@@ -217,8 +217,8 @@ def test_overlapping_scopes_keep_the_split_until_the_last_exit(prepared):
 
 def test_only_swiglu_mlps_are_attached(monkeypatch):
     model = _model(act = nn.gelu)
-    assert ane_prefill.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 0
-    assert all(ane_prefill._STATE not in layer.__dict__ for layer in model.layers)
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 0
+    assert all(ane._STATE not in layer.__dict__ for layer in model.layers)
 
 
 @pytest.mark.parametrize("change", ["training", "mixed_bits"])
@@ -228,27 +228,27 @@ def test_ineligible_projections_are_not_attached(change):
         model.layers[0].train()
     else:
         model.layers[0].down_proj = nn.QuantizedLinear(CHANNELS, HIDDEN, bias = False, group_size = 64, bits = 8)
-    assert ane_prefill.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 1
-    assert ane_prefill._STATE not in model.layers[0].__dict__ and ane_prefill._STATE in model.layers[1].__dict__
-    ane_prefill.release_ane_prefill(model)
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 1
+    assert ane._STATE not in model.layers[0].__dict__ and ane._STATE in model.layers[1].__dict__
+    ane.release_ane_prefill(model)
 
 
 @pytest.mark.parametrize("split_ms,share", [(9.6, 0.0), (6.0, 0.625)])
 def test_calibration_takes_the_balanced_share_only_with_a_gain_and_caches_it(split_ms, share, monkeypatch, tmp_path):
-    monkeypatch.setattr(ane_prefill, "_CACHE_PATH", str(tmp_path / "cache.json"))
+    monkeypatch.setattr(ane, "_CACHE_PATH", str(tmp_path / "cache.json"))
     # GPU MLP 10 ms; the Neural Engine 2.5 ms at half the channels balances at 2/3, aligned down to 640 of 1024.
     timings = iter([10.0, 2.5, split_ms])
-    monkeypatch.setattr(ane_prefill, "_median_ms", lambda function, **_: (function(), next(timings))[1])
-    status = ane_prefill.prepare_ane_prefill(_model(), tile = TILE)
+    monkeypatch.setattr(ane, "_median_ms", lambda function, **_: (function(), next(timings))[1])
+    status = ane.prepare_ane_prefill(_model(), tile = TILE)
     assert (status.layers, status.share) == ((2, share) if share else (0, 0.0))
-    monkeypatch.setattr(ane_prefill, "_median_ms", None)   # a cached decision measures nothing
+    monkeypatch.setattr(ane, "_median_ms", None)   # a cached decision measures nothing
     model = _model(seed = 3)
-    assert ane_prefill.prepare_ane_prefill(model, tile = TILE).layers == (2 if share else 0)
-    ane_prefill.release_ane_prefill(model)
+    assert ane.prepare_ane_prefill(model, tile = TILE).layers == (2 if share else 0)
+    ane.release_ane_prefill(model)
 
 
 def test_scope_is_opt_in():
     from unsloth_zoo.mlx.inference import INFERENCE_SCOPES
 
-    (scope,) = [s for s in INFERENCE_SCOPES if s.enter is ane_prefill.ane_prefill_mlp]
-    assert scope.opt_in == ane_prefill.OPT_IN
+    (scope,) = [s for s in INFERENCE_SCOPES if s.enter is ane.ane_prefill_mlp]
+    assert scope.opt_in == ane.OPT_IN
