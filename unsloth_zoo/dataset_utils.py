@@ -2644,9 +2644,10 @@ except:
 
 
 _TRL_COLLATOR_APPLIES_MASKS = None
-def trl_collator_applies_masks():
+def trl_collator_applies_masks(padding_free = False):
     # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
-    # TRL 0.18 applies completion_mask but never reads a "labels" column.
+    # TRL 0.18 applies completion_mask but never reads a "labels" column, except padding-free,
+    # where it swaps in transformers' DataCollatorWithFlattening, which reads only "labels".
     global _TRL_COLLATOR_APPLIES_MASKS
     if _TRL_COLLATOR_APPLIES_MASKS is None:
         try:
@@ -2654,12 +2655,14 @@ def trl_collator_applies_masks():
             collator = _TRLCollator(pad_token_id = 0)
             def masked(**row):
                 return bool(collator([{"input_ids": [1, 2], **row}])["labels"][0, 0] == -100)
-            _TRL_COLLATOR_APPLIES_MASKS = masked(assistant_masks = [0, 1]) or (
-                masked(completion_mask = [0, 1]) and not masked(labels = [-100, 2])
+            _TRL_COLLATOR_APPLIES_MASKS = (
+                masked(assistant_masks = [0, 1]),
+                masked(completion_mask = [0, 1]) and not masked(labels = [-100, 2]),
             )
         except Exception:
-            _TRL_COLLATOR_APPLIES_MASKS = True
-    return _TRL_COLLATOR_APPLIES_MASKS
+            _TRL_COLLATOR_APPLIES_MASKS = (True, False)
+    applies_masks, ignores_labels = _TRL_COLLATOR_APPLIES_MASKS
+    return applies_masks or (ignores_labels and not padding_free)
 pass
 
 # Faster SFTTrainer prepare_dataset
@@ -3036,7 +3039,7 @@ def sft_prepare_dataset(
     # Imported here: this function's source is copied into the compiled trainer module.
     from unsloth_zoo.dataset_utils import trl_collator_applies_masks
     column_names = set(next(iter(dataset)).keys())
-    if "labels" not in column_names and not trl_collator_applies_masks():
+    if "labels" not in column_names and not trl_collator_applies_masks(bool(getattr(args, "padding_free", False))):
         completion_only_loss = getattr(self, "completion_only_loss", None)
         if completion_only_loss is None:
             completion_only_loss = getattr(args, "completion_only_loss", None)

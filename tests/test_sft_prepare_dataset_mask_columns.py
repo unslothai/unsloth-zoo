@@ -140,3 +140,16 @@ def test_trl_018_completion_mask_reaches_its_collator(trl_018_collator):
     out = sft_prepare_dataset(Trainer(), dataset, Tokenizer(), Args(), False, None, "train")
     labels = Trl018Collator(pad_token_id = 0)([out[i] for i in range(len(out))])["labels"]
     assert sorted(x for x in labels.flatten().tolist() if x != -100) == [13, 14, 21, 22]
+
+
+def test_trl_018_padding_free_builds_labels_for_flattening_collator(trl_018_collator):
+    from transformers import DataCollatorWithFlattening
+
+    class PaddingFreeArgs(Args):
+        padding_free = True
+
+    dataset = Dataset.from_list([{"input_ids": r["input_ids"], "completion_mask": r["completion_mask"]} for r in ROWS])
+    out = sft_prepare_dataset(Trainer(), dataset, Tokenizer(), PaddingFreeArgs(), False, None, "train")
+    batch = DataCollatorWithFlattening(return_tensors = "pt")([out[i] for i in range(len(out))])
+    ids, labels = batch["input_ids"].flatten().tolist(), batch["labels"].flatten().tolist()
+    assert sorted(t for t, y in zip(ids, labels) if y != -100) == [13, 14, 21, 22]
