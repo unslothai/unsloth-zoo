@@ -3838,21 +3838,6 @@ def patch_GptOssModel():
         return query_states, key_states, value_states, input_shape
     pass
 
-    # Do flex_attention_with_sink_decoding with cannot be compiled
-    # attn_output, logsumexp = flex_attention_with_sink_decoding(
-    #     self,
-    #     query_states,
-    #     key_states,
-    #     value_states,
-    # )
-    def post_attention_decoding(self_attn, attn_output, logsumexp, input_shape):
-        attn_output = flex_attention_add_sinks(self_attn, attn_output, logsumexp)
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self_attn.o_proj(attn_output)
-        return attn_output
-
-    pass
-
     # RMSNorm forward
     def rms_layernorm_forward(self, hidden_states):
         input_dtype = hidden_states.dtype
