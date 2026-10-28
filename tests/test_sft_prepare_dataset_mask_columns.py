@@ -166,6 +166,11 @@ def test_trl_018_collator_found_in_init_before_it_is_stored(trl_018_collator):
             self.completion_only_loss = True
             data_collator = DataCollatorWithFlattening()  # noqa: F841 -- read from this frame, as TRL 0.18's __init__
             dataset = Dataset.from_list([{"input_ids": r["input_ids"], "completion_mask": r["completion_mask"]} for r in ROWS])
+            def prepare(split):  # a frame between, like TRL's dict eval comprehension before Python 3.12
+                return sft_prepare_dataset(self, dataset, Tokenizer(), Args(), False, None, split)
             self.out = sft_prepare_dataset(self, dataset, Tokenizer(), Args(), False, None, "train")
+            self.eval_out = prepare("eval")
 
-    assert set(InitTrainer().out.column_names) == {"input_ids", "labels"}
+    trainer = InitTrainer()
+    assert set(trainer.out.column_names) == {"input_ids", "labels"}
+    assert set(trainer.eval_out.column_names) == {"input_ids", "labels"}

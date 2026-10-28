@@ -3067,12 +3067,19 @@ def sft_prepare_dataset(
             if isinstance(dataset, Dataset):
                 label_kwargs["num_proc"] = map_kwargs.get("num_proc", None)
                 label_kwargs["desc"] = f"Unsloth: Building labels for {dataset_name} dataset"
+            keep_masks = trl_collator_ignores_labels()
             collator = getattr(self, "data_collator", None)
-            if collator is None:
+            if keep_masks and collator is None:
                 # TRL 0.18 picks its collator in __init__ and only stores it in super().__init__, after this.
+                # Walk up: dict eval splits are prepared in a comprehension, its own frame before Python 3.12.
                 import sys as _sys
-                collator = _sys._getframe(1).f_locals.get("data_collator")
-            keep_masks = trl_collator_ignores_labels(collator)
+                frame = _sys._getframe(1)
+                while frame is not None and not (frame.f_locals.get("self") is self and "data_collator" in frame.f_locals):
+                    frame = frame.f_back
+                if frame is not None:
+                    collator = frame.f_locals.get("data_collator")
+                del frame
+            keep_masks = keep_masks and trl_collator_ignores_labels(collator)
             dataset = dataset.map(_build_labels, remove_columns = [] if keep_masks else mask_columns, **label_kwargs)
             if not keep_masks:
                 used_column_names = [x for x in used_column_names if x not in mask_columns]
