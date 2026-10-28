@@ -293,6 +293,7 @@ jobs:
         # test_vllm_direct_lora_loading pins the vLLM direct hot-load slot
         # mapping (no GPU, no vLLM needed). test_sft_prepare_dataset_double_bos
         # pins add_special_tokens for text that already carries BOS.
+        # test_compile_cache_concurrency pins the Mega-cache key, save lock and union.
         #
         # The two MoE registry files pin preprocess_weight's layout resolution (#849)
         # and that the weight-preprocessor registry is one dict across the package
@@ -451,6 +452,7 @@ jobs:
           behavioral() {
             run_gate behavioral python -m pytest \
               tests/test_ci_cpu_gate_results.py \
+              tests/test_compile_cache_concurrency.py \
               tests/test_top_level_imports_are_declared.py \
               tests/test_custom_op_annotations.py \
               tests/test_training_utils_use_cache.py \
