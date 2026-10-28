@@ -171,3 +171,49 @@ def test_stock_length_limits_are_left_to_the_stock_parser(llama_cpp, tmp_path, m
         stock = _stock(path)
         for key in ("tokenizer.ggml.tokens", "tokenizer.ggml.scores") if limit.endswith("ELEMENTS") else ("tokenizer.ggml.tokens",):
             assert len(fast.fields[key].parts) == len(stock.fields[key].parts), key
+
+
+def _write_with_bytes_array(path, entries, nested = False):
+    w = GGUFWriter(str(path), "llama")
+    w.add_block_count(2)
+    w.add_token_list([f"t{i}" for i in range(16)])
+    if nested:
+        w.add_array("x.bytes", [[1, 2], [3, 4]])
+    else:
+        w.add_key_value("x.bytes", [i % 256 for i in range(entries)], gguf.GGUFValueType.ARRAY, sub_type = gguf.GGUFValueType.UINT8)
+    w.add_eos_token_id(2)
+    w.add_tensor("output_norm.weight", np.ones(64, dtype = np.float16))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    return path
+
+
+@pytest.mark.parametrize("entries, nested", [(10, False), (2000, False), (0, True)])
+def test_corrupt_numeric_array_count_fails_fast(llama_cpp, tmp_path, monkeypatch, entries, nested):
+    path = _write_with_bytes_array(tmp_path / "ok.gguf", entries, nested)
+    assert _outcome(llama_cpp._open_gguf_reader, str(path)) == _outcome(_stock, path)
+    raw = bytearray(path.read_bytes())
+    key = raw.find(b"x.bytes")
+    count_at = key + len(b"x.bytes") + 8
+    if nested:
+        # first inner array's count
+        count_at += 8 + 4
+    struct.pack_into("<Q", raw, count_at, 1 << 29)  # under gguf-py's own 2**30 array limit
+    bad = tmp_path / "bad.gguf"
+    bad.write_bytes(bytes(raw))
+
+    calls = [0]
+    real_get = GGUFReader._get
+
+    def _bounded_get(self, *args, **kwargs):
+        calls[0] += 1
+        if calls[0] > 200_000:
+            raise RuntimeError("reader kept going past the end of the file")
+        return real_get(self, *args, **kwargs)
+
+    monkeypatch.setattr(GGUFReader, "_get", _bounded_get)
+    with pytest.raises(IndexError, match = "exceeds the remaining file size"):
+        llama_cpp._open_gguf_reader(str(bad))
+    assert calls[0] < 1000
