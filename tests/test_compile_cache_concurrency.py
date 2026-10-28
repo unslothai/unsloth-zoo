@@ -452,3 +452,24 @@ def test_guarded_inductor_variants_under_one_key_are_all_kept(monkeypatch):
     assert [a.content for a in manager._new_cache_artifacts["inductor"]] == [b"guard_a"]
     # The new variant is not on disk yet, so the save must not be skipped.
     assert not module._recorded_identities() <= disk_ids
+
+
+def test_updated_pgo_profile_replaces_the_disk_copy_and_is_saved(monkeypatch):
+    # PGO / precompile keep one file per key, but a changed profile is a real update.
+    import dataclasses
+
+    @dataclasses.dataclass(frozen = True)
+    class PGOCacheArtifact:
+        key: str
+        content: bytes
+
+    module = _load_module()
+    manager = _fake_artifact_manager(
+        monkeypatch,
+        disk = [PGOCacheArtifact("frame", b"static")],
+        seen = [PGOCacheArtifact("frame", b"dynamic")],
+        kind = "pgo",
+    )
+    disk_ids = module._merge_recorded_artifacts(b"bundle")
+    assert manager._new_cache_artifacts["pgo"] == []  # stale disk copy not re-added
+    assert not module._recorded_identities() <= disk_ids

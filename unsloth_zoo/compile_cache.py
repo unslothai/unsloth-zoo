@@ -400,15 +400,18 @@ def _read_disk_bundle(directory, manifest_path):
 pass
 
 
-# One file per key in torch (re-timed autotune entries would otherwise grow the
-# bundle every run); Inductor / AOTAutograd keep guarded variants per key by content.
+# Kinds torch stores as one file per key: merged by key so this run's copy wins.
+# Inductor / AOTAutograd keep guarded variants per key, so they stay by content.
 _SINGLE_ENTRY_KINDS = frozenset((
     "AutotuneCacheArtifact", "PGOCacheArtifact", "PrecompileCacheArtifact",
     "AUTOTUNE", "PGO",  # torch 2.7: one CacheArtifact class with a type enum
 ))
+# Only re-timed autotune entries are interchangeable; a changed PGO profile or
+# precompile package is a real update, so it still counts as new when saving.
+_RETIMED_KINDS = frozenset(("AutotuneCacheArtifact", "AUTOTUNE"))
 
 
-def _artifact_identity(artifact):
+def _artifact_identity(artifact, key_only_kinds = _SINGLE_ENTRY_KINDS):
     kind = type(artifact).__name__
     artifact_type = getattr(artifact, "type", None)
     if kind == "CacheArtifact" and hasattr(artifact_type, "name"):
@@ -416,7 +419,7 @@ def _artifact_identity(artifact):
     key = getattr(artifact, "key", None)
     if key is None:
         return (kind, artifact)
-    if kind in _SINGLE_ENTRY_KINDS:
+    if kind in key_only_kinds:
         return (kind, key)
     content = getattr(artifact, "content", None)
     if isinstance(content, (bytes, bytearray, memoryview)):
@@ -432,8 +435,8 @@ def _merge_recorded_artifacts(data):
     loaded-and-hit or compiled, so without this a run that exercises a subset
     of a warm bundle (a different shape, one of several cached models) would
     replace the bundle with that subset and silently drop the rest. One copy
-    per identity; this run's copy wins. Returns the disk bundle's identities
-    (None if unreadable). Best-effort: a failure may narrow the bundle."""
+    per identity; this run's copy wins. Returns the disk bundle's save
+    identities (None if unreadable). Best-effort: a failure may narrow the bundle."""
     try:
         from torch.compiler._cache import CacheArtifactManager
         artifacts = CacheArtifactManager.deserialize(data)
@@ -445,7 +448,7 @@ def _merge_recorded_artifacts(data):
         for artifact_type, items in list(artifacts.items()):
             for artifact in list(items):
                 identity = _artifact_identity(artifact)
-                disk_ids.add(identity)
+                disk_ids.add(_artifact_identity(artifact, _RETIMED_KINDS))
                 if identity in seen_ids:
                     continue
                 seen_ids.add(identity)
@@ -465,7 +468,10 @@ def _recorded_identities():
     """Identities torch's artifact manager holds now, or None."""
     try:
         from torch.compiler._cache import CacheArtifactManager
-        return {_artifact_identity(a) for a in list(CacheArtifactManager._seen_artifacts)}
+        return {
+            _artifact_identity(a, _RETIMED_KINDS)
+            for a in list(CacheArtifactManager._seen_artifacts)
+        }
     except Exception:
         return None
 pass
