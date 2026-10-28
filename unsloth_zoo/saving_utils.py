@@ -1330,14 +1330,6 @@ def _merge_and_overwrite_lora(
 
                 output_key = key
                 action_logged = False
-                # Standard 16-bit tensor
-                W = file.get_tensor(key)
-                W_original_dtype = W.dtype
-                W = bias_overrides.get(key, W)
-
-                if W is None:
-                    continue
-
                 lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
                 lora_stats = converted_lora_weights.get(lora_key, None)
                 # Fallback: handle Gemma4ClippableLinear (.linear.weight -> .weight)
@@ -1358,6 +1350,23 @@ def _merge_and_overwrite_lora(
                         lora_stats = converted_lora_weights.get(lm_head_key[len("model."):], None)
                     if lora_stats is None and not lm_head_key.startswith("model."):
                         lora_stats = converted_lora_weights.get("model." + lm_head_key, None)
+
+                # Nothing replaces this tensor: the shard already holds these bytes, so
+                # skip reading it and writing the same bytes back in place.
+                if (
+                    lora_stats is None
+                    and key not in bias_overrides
+                    and vocab_overrides.get(lora_key) is None
+                ):
+                    continue
+
+                # Standard 16-bit tensor
+                W = file.get_tensor(key)
+                W_original_dtype = W.dtype
+                W = bias_overrides.get(key, W)
+
+                if W is None:
+                    continue
 
                 W = _apply_vocab_override(W, vocab_overrides, lora_key, lora_stats)
 
