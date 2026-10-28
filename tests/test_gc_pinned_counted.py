@@ -86,7 +86,6 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_RELEASED", 0, raising = False)
-    monkeypatch.setattr(gc_module, "_COUNTED_HELD_EST", None, raising = False)
     monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
     monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)
@@ -234,11 +233,28 @@ def test_unset_settings_keep_the_simulated_path(monkeypatch, gc_module, allocato
     assert gc_module._PINNED_CACHED == {4 * MIB: 1} and gc_module._PINNED_RELEASED == 0
 
 
-def test_fast_path_reads_the_allocator_only_near_the_cap(monkeypatch, gc_module, allocator):
+@pytest.mark.parametrize("settings", ["pinned_max_round_threshold_mb:1", "pinned_max_cached_size_mb:1"])
+def test_foreign_pin_between_reservations_counts_against_the_cap(gc_module, allocator, settings):
+    # Codex 4405981969: cap 10 MiB, reserve 3, another user pins 6 (training_utils.py's input_ids /
+    # labels, a pin_memory DataLoader), reserve 3. 12 MiB would really be held.
+    fake = allocator(settings, cap_bytes = 10 * MIB)
+    a = pin(gc_module, fake, 3 * MIB)
+    assert a and fake.held() == pytest.approx(3 * MIB, abs = 64)
+    foreign = fake.allocate(6 * MIB)
+    assert pin(gc_module, fake, 3 * MIB) is None
+    assert fake.held() == pytest.approx(9 * MIB, abs = 64)
+    # Once the foreign block is gone the next offload pins again.
+    fake.release(foreign)
+    fake.empty_cache()
+    assert pin(gc_module, fake, 3 * MIB) is not None
+    assert fake.peak <= 10 * MIB + 64
+
+
+def test_counted_path_reads_the_allocator_on_every_reservation(monkeypatch, gc_module, allocator):
     fake = allocator("pinned_max_round_threshold_mb:1", cap_bytes = 10 * MIB)
     reads = []
     held = fake.held
     monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: reads.append(1) or held())
     blocks = [pin(gc_module, fake, 3 * MIB) for _ in range(3)]
-    assert all(blocks) and len(reads) == 1      # the first reading only: 9 MiB of 10 is the upper bound
-    assert pin(gc_module, fake, 3 * MIB) is None and len(reads) >= 2
+    assert all(blocks) and len(reads) == 3
+    assert pin(gc_module, fake, 3 * MIB) is None and len(reads) >= 4

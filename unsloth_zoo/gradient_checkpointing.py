@@ -212,7 +212,6 @@ _PINNED_CACHED = {}         # rounded block bytes -> count released but still ca
 _PINNED_LIVE = {}           # requested bytes -> blocks charged at allocation, still live
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
 _PINNED_RELEASED = 0        # settings mode: blocks released since the last flush (may wait on events)
-_COUNTED_HELD_EST = None    # settings mode: last allocator reading + blocks reserved since (an upper bound)
 
 
 # torch 2.13+ host allocator settings (c10/core/AllocatorConfig.h, set through PYTORCH_ALLOC_CONF /
@@ -399,10 +398,9 @@ def _release_pool_pinned(start = 0):
 
 
 def _reset_pinned_cap():
-    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _COUNTED_HELD_EST
+    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP
     GC_PINNED_CAP = None
     _WARNED_ABOUT_PINNED_CAP = False
-    _COUNTED_HELD_EST = None
 
 
 def _reserve_pinned(nbytes):
@@ -495,29 +493,23 @@ def _host_alloc_settings_active():
 
 def _reserve_pinned_counted(nbytes, block):
     """None if the allocator cannot be read (the simulated path then decides)."""
-    global GC_PINNED_BYTES, GC_PINNED_CAP, _HOST_HELD_BASELINE, _COUNTED_HELD_EST
-    est = _COUNTED_HELD_EST
-    if est is None:
-        est = _host_allocator_held_bytes()
-        if est is None: return None
-        if _HOST_HELD_BASELINE is None: _HOST_HELD_BASELINE = max(0, est - GC_PINNED_BYTES)
+    global GC_PINNED_BYTES, GC_PINNED_CAP, _HOST_HELD_BASELINE
+    # Read the allocator on every reservation (~10-25 us): other pinned users (pin_memory DataLoaders,
+    # training_utils.py's input_ids / labels) allocate between ours, and whether torch serves this
+    # request from a cached block (any one in its Log2 bucket at least as large) cannot be known first.
+    held = _host_allocator_held_bytes()
+    if held is None: return None
+    if _HOST_HELD_BASELINE is None: _HOST_HELD_BASELINE = max(0, held - GC_PINNED_BYTES)
     if GC_PINNED_CAP is None:
         GC_PINNED_CAP = _compute_pinned_cap()
     if GC_PINNED_CAP == _PIN_PER_BLOCK:
         if not _block_fits_host_ram(block) and not (_empty_host_cache() and _block_fits_host_ram(block)):
             _warn_host_ram_full()
             return False
-    elif GC_PINNED_CAP >= 0 and est - _HOST_HELD_BASELINE + block > GC_PINNED_CAP:
-        # host_memory_stats costs ~10-25 us, so it is read only when the cheap upper bound (releases
-        # only lower the real count) says the cap would be exceeded.
-        held = _host_allocator_held_bytes()
-        if held is None or held - _HOST_HELD_BASELINE + block > GC_PINNED_CAP:
-            if not _counted_slow_path_fits(block):
-                _warn_pinned_cap()
-                return False
-            held = _host_allocator_held_bytes()
-        est = est if held is None else held
-    _COUNTED_HELD_EST = est + block
+    elif GC_PINNED_CAP >= 0 and held - _HOST_HELD_BASELINE + block > GC_PINNED_CAP:
+        if not _counted_slow_path_fits(block):
+            _warn_pinned_cap()
+            return False
     GC_PINNED_BYTES += block  # informational here: decisions read the allocator
     _charge_live(nbytes, -block)  # negative: released the counted way, whatever the settings by then
     return True
