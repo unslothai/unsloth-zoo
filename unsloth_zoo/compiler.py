@@ -5132,7 +5132,12 @@ def _patch_lora_update(source):
     else:
         dtype_cast = "result.dtype"
     update = f"lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
-    looped = source.replace(old1, f"result = {update}; continue").replace(old2, f"result = {update}; continue")
+    # Cast once after the loop like PEFT: a per-adapter bf16 cast drops small updates the sum keeps.
+    if "result = result.to(torch_result_dtype)" in source or dtype_cast == "result.dtype":
+        looped_update = "lora_forward(result, lora_A, lora_B, dropout, x, scaling)"
+    else:
+        looped_update = update
+    looped = source.replace(old1, f"result = {looped_update}; continue").replace(old2, f"result = {looped_update}; continue")
     try:
         compile(looped, "<peft lora forward>", "exec")
     except SyntaxError:

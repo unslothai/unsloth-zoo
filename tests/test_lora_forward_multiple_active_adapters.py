@@ -171,6 +171,8 @@ def unsloth_lora_forwards(tmp_path, monkeypatch):
         for cls, forward in saved:
             if forward is not None:
                 cls.forward = forward
+            elif "forward" in cls.__dict__:
+                del cls.forward
 
 
 def _peft_two_adapters():
@@ -228,3 +230,27 @@ def test_patched_peft_linear_trains_every_active_adapter(unsloth_lora_forwards):
     for name in ("first", "second"):
         grad = layer.lora_B[name].weight.grad
         assert grad is not None and grad.abs().max() > 0, f"adapter {name} got no gradient"
+
+
+def test_patched_peft_linear_accumulates_adapters_before_the_dtype_cast(unsloth_lora_forwards):
+    from peft import LoraConfig, get_peft_model
+
+    # bf16 base, fp32 adapters: each 0.003 update rounds away in bf16, their sum does not.
+    model = get_peft_model(
+        torch.nn.Sequential(torch.nn.Linear(1, 1, bias = False, dtype = torch.bfloat16)),
+        LoraConfig(r = 1, lora_alpha = 1, target_modules = ["0"]),
+        adapter_name = "a",
+    )
+    model.add_adapter("b", LoraConfig(r = 1, lora_alpha = 1, target_modules = ["0"]))
+    layer = model.base_model.model[0]
+    with torch.no_grad():
+        layer.base_layer.weight.fill_(1.0)
+        for name in ("a", "b"):
+            layer.lora_A[name].weight.fill_(1.0)
+            layer.lora_B[name].weight.fill_(0.003)
+    assert layer.lora_A["a"].weight.dtype == torch.float32
+    model.base_model.set_adapter(["a", "b"])
+    with torch.no_grad():
+        out = model(torch.tensor([[1.0]], dtype = torch.bfloat16))
+    assert out.dtype == torch.bfloat16
+    assert out.item() == 1.0078125
