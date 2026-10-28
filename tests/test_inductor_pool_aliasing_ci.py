@@ -75,3 +75,26 @@ def test_other_custom_ops_still_checked():
     with functorch_config.patch(error_on_custom_op_aliasing = True):
         with pytest.raises(RuntimeError):
             check("mylib::aliasing_op", (x,), {}, x)
+
+
+def test_helper_before_dynamo_import_keeps_compile_working():
+    # Called before anything imported torch._dynamo, the helper must not trigger the runtime_wrappers circular import
+    # (which leaves torch._dynamo half initialised and breaks torch.compile for the process).
+    path = os.path.join(os.path.dirname(__file__), "..", "unsloth_zoo", "temporary_patches", "common.py")
+    code = textwrap.dedent(f"""
+        import ast, sys, torch
+        assert "torch._dynamo" not in sys.modules
+        tree = ast.parse(open({os.path.abspath(path)!r}).read())
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "allow_inductor_pool_aliasing")
+        scope = {{}}
+        exec(compile(ast.Module([fn], []), "common.py", "exec"), scope)
+        scope["allow_inductor_pool_aliasing"]()
+        import torch._functorch._aot_autograd.runtime_wrappers as rw
+        assert getattr(rw._check_custom_op_aliasing, "_unsloth_skips_alloc_from_pool", False)
+        f = torch.compile(lambda x: x.sin() + 1, backend = "eager")
+        assert torch.allclose(f(torch.ones(3)), torch.ones(3).sin() + 1)
+        print("OK")
+    """)
+    out = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True,
+                         env = dict(os.environ, CUDA_VISIBLE_DEVICES = ""))
+    assert "OK" in out.stdout, out.stdout[-2000:] + out.stderr[-4000:]

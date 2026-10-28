@@ -118,6 +118,9 @@ def allow_inductor_pool_aliasing():
     custom op is still checked.
     """
     try:
+        # torch._dynamo first: importing runtime_wrappers on its own is a circular import that leaves
+        # torch._dynamo half initialised (torch.compile then fails for the whole process).
+        import torch._dynamo
         import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
     except Exception:
         return
