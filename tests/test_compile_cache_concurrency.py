@@ -117,14 +117,17 @@ def test_reloading_the_same_model_repopulates_torch_caches(cache):
     assert cache.loaded == [data, data]
 
 
-class _Artifact(tuple):
-    """Stand-in for torch's frozen (key, content) CacheArtifact."""
+class AutotuneCacheArtifact(tuple):
+    """Stand-in for torch's frozen (key, content) autotune CacheArtifact."""
 
     def __new__(cls, key, content):
         return super().__new__(cls, (key, content))
 
     key = property(lambda self: self[0])
     content = property(lambda self: self[1])
+
+
+_Artifact = AutotuneCacheArtifact
 
 
 class _FakeRecorder:
@@ -370,12 +373,12 @@ def test_concurrent_saves_publish_a_loadable_union(tmp_path, pause):
     assert [name for name in os.listdir(directory) if name.endswith(".bin")] == [bundle.name]
 
 
-def _fake_artifact_manager(monkeypatch, disk, seen):
+def _fake_artifact_manager(monkeypatch, disk, seen, kind = "autotune"):
     """torch.compiler._cache stand-in: frozen (key, content) artifacts like torch's."""
     import collections
 
     manager = types.SimpleNamespace(
-        deserialize = lambda data: {"autotune": list(disk)},
+        deserialize = lambda data: {kind: list(disk)},
         _seen_artifacts = set(seen),
         _new_cache_artifacts = collections.defaultdict(list),
     )
@@ -427,3 +430,25 @@ def test_merge_keeps_one_copy_per_key_and_this_runs_copy_wins(monkeypatch, autot
     assert [a.key for a in merged] == ["k3"]
     assert mine in manager._seen_artifacts
     assert autotune_artifact("k1", b"old") not in manager._seen_artifacts
+
+
+def test_guarded_inductor_variants_under_one_key_are_all_kept(monkeypatch):
+    # Inductor stores several guarded graphs per key (key/sha256(content)).
+    import dataclasses
+
+    @dataclasses.dataclass(frozen = True)
+    class InductorCacheArtifact:
+        key: str
+        content: bytes
+
+    module = _load_module()
+    manager = _fake_artifact_manager(
+        monkeypatch,
+        disk = [InductorCacheArtifact("g", b"guard_a")],
+        seen = [InductorCacheArtifact("g", b"guard_b")],
+        kind = "inductor",
+    )
+    disk_ids = module._merge_recorded_artifacts(b"bundle")
+    assert [a.content for a in manager._new_cache_artifacts["inductor"]] == [b"guard_a"]
+    # The new variant is not on disk yet, so the save must not be skipped.
+    assert not module._recorded_identities() <= disk_ids
