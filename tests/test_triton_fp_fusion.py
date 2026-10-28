@@ -49,23 +49,39 @@ _DELIBERATE_FALSE = {
     "temporary_patches/moe_triton_kernels.py:fwd",
     "temporary_patches/moe_triton_kernels.py:bwd_dy",
     "temporary_patches/moe_triton_kernels.py:bwd_dw",
+    # aten rounds every multiply before the add that follows it (_NO_FMA in that module).
+    "gpt_oss_decode_fused.py:_add_rms_norm_kernel",
+    "gpt_oss_decode_fused.py:_sink_scale_kernel",
 }
 
 
+def _assigned_names(scope_body):
+    return {
+        node.targets[0].id: node.value
+        for node in scope_body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+    }
+
+
 def _kwargs_dicts(tree):
-    """id(launch call) -> the dict(...) / {...} each `**name` it splats was assigned in its function."""
+    """id(launch call) -> the dict(...) / {...} each `**name` it splats was assigned in its function, or at
+    module level (a function-local name wins). `a if cond else b` contributes both branches."""
+    module = _assigned_names(tree.body)
     out = {}
     for func in ast.walk(tree):
         if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        dicts = {}
-        for node in ast.walk(func):
-            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                dicts[node.targets[0].id] = node.value
+        dicts = dict(module)
+        dicts.update(_assigned_names(ast.walk(func)))
         for node in ast.walk(func):
             if isinstance(node, ast.Call):
                 splats = [k.value.id for k in node.keywords if k.arg is None and isinstance(k.value, ast.Name)]
-                out[id(node)] = [dicts[n] for n in splats if n in dicts]
+                values = [dicts[n] for n in splats if n in dicts]
+                out[id(node)] = [
+                    branch
+                    for value in values
+                    for branch in ((value.body, value.orelse) if isinstance(value, ast.IfExp) else (value,))
+                ]
     return out
 
 

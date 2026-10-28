@@ -111,7 +111,12 @@ def _run(tmp_path, script, *args, env_extra = None):
     env = dict(os.environ)
     env.setdefault("UNSLOTH_IS_PRESENT", "1")
     env["PYTHONPATH"] = os.pathsep.join(x for x in (_ROOT, env.get("PYTHONPATH")) if x)
-    env.update(env_extra or {})
+    for key, value in (env_extra or {}).items():
+        # None unsets: CI exports switches (UNSLOTH_COMPILE_DISABLE=1) that skip the model patch under test.
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     proc = subprocess.run([sys.executable, str(path), *args], capture_output = True, text = True, env = env,
                           timeout = 1500)
     line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT ")]
@@ -243,7 +248,15 @@ def loop_runs(tmp_path_factory):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = "bfloat16" if dev == "cuda" else "float32"
     return {
-        arm: _run(tmp, _LOOP, dev, dtype, env_extra = {"UNSLOTH_GPT_OSS_FUSED_DECODE": flag})
+        arm: _run(
+            tmp, _LOOP, dev, dtype,
+            env_extra = {
+                "UNSLOTH_GPT_OSS_FUSED_DECODE": flag,
+                # patch_GptOssModel returns early under either, so neither arm would reach the decode loop.
+                "UNSLOTH_COMPILE_DISABLE": None,
+                "UNSLOTH_ENABLE_FLEX_ATTENTION": None,
+            },
+        )
         for arm, flag in (("fused", "1"), ("eager", "0"))
     }
 
@@ -313,3 +326,30 @@ def test_disabled_or_tracing_never_launches(monkeypatch):
     assert F.add_rms_norm(x, r, w, 1e-5) is None
     assert F.sink_scale_output(torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1), torch.randn(2)) is None
     assert len(launches) == 1 and F._ENABLED
+
+
+_LIVE = textwrap.dedent('''
+    import json, os
+    os.environ.setdefault("UNSLOTH_MODEL_NAME", "unsloth/gpt-oss-test")
+    import inspect
+    import transformers.models.gpt_oss.modeling_gpt_oss as M
+    stock = M.GptOssModel.forward
+    import unsloth_zoo.flex_attention as FA
+    for name in ("is_flex_attention_decoding", "flex_attention_with_sink_decoding"):
+        if not hasattr(FA, name):
+            setattr(FA, name, None)
+    from unsloth_zoo.temporary_patches import gpt_oss as G
+    G.patch_GptOssModel()
+    live = inspect.unwrap(M.GptOssModel.forward)
+    print("RESULT " + json.dumps({
+        "live": live.__module__,
+        "stock_has_cache_position": "cache_position" in inspect.signature(stock).parameters,
+    }))
+''')
+
+
+def test_the_model_forward_patch_is_live_on_this_transformers(tmp_path):
+    # The signature match is relaxed, but one parameter short is still refused: a zoo forward without
+    # cache_position stayed out on transformers 4.x, so nothing it carries (fused decode included) ran.
+    res = _run(tmp_path, _LIVE, env_extra = {"UNSLOTH_COMPILE_DISABLE": None, "UNSLOTH_ENABLE_FLEX_ATTENTION": None})
+    assert res["live"].startswith("unsloth_zoo"), res

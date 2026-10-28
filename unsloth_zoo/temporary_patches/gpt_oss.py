@@ -4136,6 +4136,29 @@ def patch_GptOssModel():
                 "router_logits": all_router_logits,
             })
 
+    # transformers 4.x still names cache_position in the signature, and the relaxed match refuses a
+    # forward one parameter short, which left the stock forward live on 4.57. Same body either way:
+    # it already reads cache_position from kwargs.
+    stock = transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel.forward
+    if "cache_position" in inspect.signature(stock).parameters:
+        _forward_without_cache_position = forward
+        def forward(
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Cache] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> MoeModelOutputWithPast:
+            if cache_position is not None:
+                kwargs["cache_position"] = cache_position
+            return _forward_without_cache_position(
+                self, input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, **kwargs,
+            )
+        pass
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
     # After the replacement, so the recorder wraps whichever forward ended up live:
     # zoo's own, or stock when the signature did not match.
