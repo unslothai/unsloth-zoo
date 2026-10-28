@@ -211,6 +211,8 @@ _WARNED_ABOUT_PINNED_CAP = False
 _PINNED_CACHED = {}         # rounded block bytes -> count released but still cached
 _PINNED_LIVE = {}           # requested bytes -> blocks charged at allocation, still live
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
+_PINNED_RELEASED = 0        # settings mode: blocks released since the last flush (may wait on events)
+_COUNTED_HELD_EST = None    # settings mode: last allocator reading + blocks reserved since (an upper bound)
 
 
 # torch 2.13+ host allocator settings (c10/core/AllocatorConfig.h, set through PYTORCH_ALLOC_CONF /
@@ -361,15 +363,16 @@ pass
 def _empty_host_cache():
     """Return cached free pinned blocks to the OS. A pinned buffer that grows leaves its old block
     in torch's host cache, and once growth goes pageable nothing reuses it. True if any were freed."""
-    global GC_PINNED_BYTES
+    global GC_PINNED_BYTES, _PINNED_RELEASED
     if DEVICE_TYPE not in ("cuda", "hip"): return False
     ours = sum(k * v for k, v in _PINNED_CACHED.items())
     free = _host_allocator_free_bytes()
     # host_memory_stats() does not process pending copy events, so a dead block whose last use was a
     # non_blocking copy (every pinned offload slot) still reads as active there: our own released
     # blocks are reason enough to flush, and _host_emptyCache processes those events first.
-    if not (ours or free): return False
-    if ours:
+    released = _PINNED_RELEASED
+    if not (ours or released or free): return False
+    if ours or released:
         # _host_emptyCache only frees blocks whose copy events completed: wait for our released
         # blocks' last non_blocking copies, or the bookkeeping below drops blocks still held.
         _synchronize_used_devices()
@@ -377,6 +380,7 @@ def _empty_host_cache():
     except Exception: return False
     GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - ours)
     _PINNED_CACHED.clear()
+    _PINNED_RELEASED = 0
     return True
 
 
@@ -395,15 +399,19 @@ def _release_pool_pinned(start = 0):
 
 
 def _reset_pinned_cap():
-    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP
+    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _COUNTED_HELD_EST
     GC_PINNED_CAP = None
     _WARNED_ABOUT_PINNED_CAP = False
+    _COUNTED_HELD_EST = None
 
 
 def _reserve_pinned(nbytes):
     """Count `nbytes` against the pinned cap; False means allocate pageable instead."""
     global GC_PINNED_BYTES, GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _HOST_HELD_BASELINE
     block = _pinned_block_bytes(nbytes)
+    if _host_alloc_settings_active():
+        counted = _reserve_pinned_counted(nbytes, block)
+        if counted is not None: return counted
     if _PINNED_CACHED.get(block, 0) > 0:
         _PINNED_CACHED[block] -= 1
         free = _host_allocator_free_bytes()
@@ -436,13 +444,7 @@ def _reserve_pinned(nbytes):
             used = max(used, held - _HOST_HELD_BASELINE)
     if GC_PINNED_CAP == _PIN_PER_BLOCK:
         if not _block_fits_host_ram(block) and not (_empty_host_cache() and _block_fits_host_ram(block)):
-            if not _WARNED_ABOUT_PINNED_CAP:
-                _WARNED_ABOUT_PINNED_CAP = True
-                print(
-                    "Unsloth: Host RAM is nearly full, so gradient checkpointing offload buffers that "
-                    "do not fit use pageable memory. Training continues; "
-                    "set UNSLOTH_GC_PINNED_MAX_GB to set a fixed pinned cap instead."
-                )
+            _warn_host_ram_full()
             return False
     elif GC_PINNED_CAP >= 0 and used + block > GC_PINNED_CAP and not (
         # Our released blocks (old blocks of grown slots) still count against the cap: return
@@ -450,18 +452,95 @@ def _reserve_pinned(nbytes):
         # so a full cap with nothing of ours cached costs no device sync.
         _PINNED_CACHED and any(_PINNED_CACHED.values()) and _flushed_cached_fits(block, used)
     ):
-        if not _WARNED_ABOUT_PINNED_CAP:
-            _WARNED_ABOUT_PINNED_CAP = True
-            print(
-                f"Unsloth: Gradient checkpointing pinned host memory reached its cap of "
-                f"{GC_PINNED_CAP / (1 << 30):.1f}GB (free host RAM split across local ranks), "
-                "so further offload buffers use pageable memory. Training continues; "
-                "set UNSLOTH_GC_PINNED_MAX_GB to change the cap."
-            )
+        _warn_pinned_cap()
         return False
     GC_PINNED_BYTES += block
     _charge_live(nbytes, block)
     return True
+
+
+def _warn_host_ram_full():
+    global _WARNED_ABOUT_PINNED_CAP
+    if _WARNED_ABOUT_PINNED_CAP: return
+    _WARNED_ABOUT_PINNED_CAP = True
+    print(
+        "Unsloth: Host RAM is nearly full, so gradient checkpointing offload buffers that "
+        "do not fit use pageable memory. Training continues; "
+        "set UNSLOTH_GC_PINNED_MAX_GB to set a fixed pinned cap instead."
+    )
+
+
+def _warn_pinned_cap():
+    global _WARNED_ABOUT_PINNED_CAP
+    if _WARNED_ABOUT_PINNED_CAP: return
+    _WARNED_ABOUT_PINNED_CAP = True
+    print(
+        f"Unsloth: Gradient checkpointing pinned host memory reached its cap of "
+        f"{GC_PINNED_CAP / (1 << 30):.1f}GB (free host RAM split across local ranks), "
+        "so further offload buffers use pageable memory. Training continues; "
+        "set UNSLOTH_GC_PINNED_MAX_GB to change the cap."
+    )
+
+
+# torch 2.13+ with pinned_max_round_threshold_mb / pinned_max_cached_size_mb set: one Log2 bucket holds
+# unrounded blocks, a request takes any cached block in its bucket at least as large, and a block above
+# pinned_max_cached_size_mb stays pinned until its copy events are processed. Simulating that drifts, so
+# the cap reads the allocator's own byte count (host_memory_stats allocated_bytes, live + cached +
+# event-pending) instead; _pinned_block_bytes only bounds what the next request can add.
+def _host_alloc_settings_active():
+    if not _HOST_ALLOC_KNOBS: return False
+    round_max, cached_max = _host_alloc_policy()
+    return round_max != _INF or cached_max != _INF
+
+
+def _reserve_pinned_counted(nbytes, block):
+    """None if the allocator cannot be read (the simulated path then decides)."""
+    global GC_PINNED_BYTES, GC_PINNED_CAP, _HOST_HELD_BASELINE, _COUNTED_HELD_EST
+    est = _COUNTED_HELD_EST
+    if est is None:
+        est = _host_allocator_held_bytes()
+        if est is None: return None
+        if _HOST_HELD_BASELINE is None: _HOST_HELD_BASELINE = max(0, est - GC_PINNED_BYTES)
+    if GC_PINNED_CAP is None:
+        GC_PINNED_CAP = _compute_pinned_cap()
+    if GC_PINNED_CAP == _PIN_PER_BLOCK:
+        if not _block_fits_host_ram(block) and not (_empty_host_cache() and _block_fits_host_ram(block)):
+            _warn_host_ram_full()
+            return False
+    elif GC_PINNED_CAP >= 0 and est - _HOST_HELD_BASELINE + block > GC_PINNED_CAP:
+        # host_memory_stats costs ~10-25 us, so it is read only when the cheap upper bound (releases
+        # only lower the real count) says the cap would be exceeded.
+        held = _host_allocator_held_bytes()
+        if held is None or held - _HOST_HELD_BASELINE + block > GC_PINNED_CAP:
+            if not _counted_slow_path_fits(block):
+                _warn_pinned_cap()
+                return False
+            held = _host_allocator_held_bytes()
+        est = est if held is None else held
+    _COUNTED_HELD_EST = est + block
+    GC_PINNED_BYTES += block  # informational here: decisions read the allocator
+    _charge_live(nbytes, -block)  # negative: released the counted way, whatever the settings by then
+    return True
+
+
+def _counted_slow_path_fits(block):
+    """Over the cap by the allocator's count. Blocks released after a non_blocking copy are freed or
+    cached only once their copy events are processed: process the completed ones, then return cached
+    blocks to the OS (after a device sync) and re-read. No trial allocation of `block`: one that the
+    cache cannot serve would itself pin past the cap."""
+    free = _host_allocator_free_bytes() or 0
+    if not (_PINNED_RELEASED or free > 0):
+        return False  # nothing cached or pending: cheap, and a full cap costs no device sync
+    # A tiny pinned allocation processes completed copy events (host_memory_stats does not).
+    try: drain = torch.empty(1, dtype = torch.uint8, device = "cpu", pin_memory = True)
+    except Exception as exception:
+        if not _is_host_alloc_oom(exception): raise
+    else: del drain
+    held = _host_allocator_held_bytes()
+    if held is not None and held - _HOST_HELD_BASELINE + block <= GC_PINNED_CAP: return True
+    if not _empty_host_cache(): return False
+    held = _host_allocator_held_bytes()
+    return held is not None and held - _HOST_HELD_BASELINE + block <= GC_PINNED_CAP
 
 
 def _charge_live(nbytes, block):
@@ -487,7 +566,7 @@ def _flushed_cached_fits(block, used):
 def _release_pinned(nbytes):
     """The block stays pinned in torch's host cache, so it stays charged until reused; one above
     pinned_max_cached_size_mb (torch 2.13+) goes back to the OS, so it stops being charged."""
-    global GC_PINNED_BYTES
+    global GC_PINNED_BYTES, _PINNED_RELEASED
     blocks = _PINNED_LIVE.get(nbytes)
     if blocks:
         block = blocks.pop()
@@ -495,6 +574,11 @@ def _release_pinned(nbytes):
     else:
         block = _pinned_block_bytes(nbytes)
     if not block: return
+    if block < 0:
+        # Reserved against the allocator's count: remember only that a block may wait on its events.
+        GC_PINNED_BYTES = max(0, GC_PINNED_BYTES + block)
+        _PINNED_RELEASED += 1
+        return
     if _pinned_block_cached(block):
         _PINNED_CACHED[block] = _PINNED_CACHED.get(block, 0) + 1
     else:
