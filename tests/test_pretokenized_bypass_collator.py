@@ -3428,3 +3428,36 @@ def test_a_repeated_masking_call_keeps_the_dispatcher():
                                  "images": [object()]}]) == {"mine": True}
     assert "mine" not in twice.data_collator(
         [{"input_ids": list(ROW), "labels": list(ROW)}])
+
+
+def test_a_raw_text_split_is_classified_with_one_column_scan(monkeypatch):
+    """Classifying a raw text split asks "pretokenized?" and then "raw text?".
+    Both read the same sampled rows and unlisted string columns; reading them
+    twice doubled the cost on a large corpus for the same answer."""
+    n = 3000
+    dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}hi{RESPONSE_PART}yo"] * n,
+        "source": [f"s{i}" for i in range(n)],
+    })
+    read = {"source": 0, "sampled": 0}
+    original_iter, original_getitem = Dataset.iter, Dataset.__getitem__
+
+    def counting_iter(self, *args, **kwargs):
+        for batch in original_iter(self, *args, **kwargs):
+            if list(batch) == ["source"]:
+                read["source"] += len(batch["source"])
+            yield batch
+
+    def counting_getitem(self, key):
+        if isinstance(key, int):
+            read["sampled"] += 1
+        return original_getitem(self, key)
+
+    monkeypatch.setattr(Dataset, "iter", counting_iter)
+    monkeypatch.setattr(Dataset, "__getitem__", counting_getitem)
+    trainer = StubTrainer(DataCollatorForSeq2Seq(tokenizer = StubProcessor()), dataset)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert len(out.train_dataset) == n
+    assert read["source"] == n, read
+    assert read["sampled"] == 16 + 1, read  # one 16-row classifier sample, plus the bypass peek
