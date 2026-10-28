@@ -196,14 +196,51 @@ def _exact_lpt(device, dtype):
     return device.type == "cuda" and _ACCURACY == "2" and dtype in _HALF
 
 
+def _capturing(x):
+    return x.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
+def _half_mm_bounded(a, b):
+    """fp16 a @ b as a half-result GEMM (fp32 accumulation), returned in fp32, that cannot pass 65504.
+
+    |(a @ b)[i, j]| <= ||a[i]||_1 * max|b|. Rows under 32768 cannot overflow, so the plain half GEMM is safe; if any
+    row is over, eager mode falls back to the exact fp32 GEMM, and CUDA graph capture scales those rows down by a power
+    of two (exact, undone after the upcast; no host sync).
+    For HIP, whose fp32-out GEMM is 6-14x slower and whose fp32 GEMM of the upcast operands (a full fp32 copy of the
+    head per chunk) made fp16 3-6x slower than plain torch on gfx1151."""
+    # Reductions without an |a| / |b| temporary (b is a full head slice).
+    bound = torch.linalg.vector_norm(a, 1, dim = -1, keepdim = True, dtype = torch.float32) * \
+        torch.linalg.vector_norm(b, math.inf, dtype = torch.float32)
+    scale = torch.exp2(torch.floor(torch.log2(32768.0 / bound.clamp_min(1e-30)))).clamp_(min = 2.0 ** -38, max = 1.0)
+    if not _capturing(a):
+        # The bound is worst case, so it almost never trips (hidden rows sum to ~1e2-1e3, scaled dz rows to ~1e4).
+        # When it does, scaling a row down can flush its small entries below fp16's subnormal range (a +-16384 row
+        # with a 1e-4 entry loses that entry's contribution), so take the exact fp32 GEMM of upcast operands for this
+        # chunk. One host read of a flag; under CUDA graph capture (no sync allowed) the scaled path below runs.
+        if bool((scale < 1.0).any()):
+            return torch.mm(a.float(), b.float())
+        return (a @ b).float()
+    # Capture: a scale below fp16's smallest subnormal (2^-24) would round to 0 and drop the row, so apply it as two
+    # power-of-two factors that are each representable (2^-14 is the smallest normal); the product stays exact.
+    s1 = scale.clamp(min = 2.0 ** -14)
+    a = a * s1.to(a.dtype)
+    a.mul_((scale / s1).to(a.dtype))
+    return (a @ b).float().div_(scale)
+
+
 def _mm_fp32(a, b, out = None):
     """a @ b with an fp32 result, rounded once (CUDA half inputs); elsewhere an fp32 matmul of the upcast inputs."""
     if a.is_cuda and a.dtype in _HALF:
         if not _IS_HIP and _fp32_out_ok(a.device, a.dtype):
             return torch.mm(a, b, out_dtype = torch.float32, out = out) if out is not None \
                 else torch.mm(a, b, out_dtype = torch.float32)
-        # An fp16 result can pass 65504 (scaled forward gradient), so upcast.
-        r = torch.mm(a.float(), b.float()) if a.dtype == torch.float16 else (a @ b).float()
+        if a.dtype == torch.bfloat16:
+            r = (a @ b).float()
+        elif _IS_HIP:
+            r = _half_mm_bounded(a, b)
+        else:
+            # An fp16 result can pass 65504 (scaled forward gradient), so upcast.
+            r = torch.mm(a.float(), b.float())
     else:
         r = a.float() @ b.float() if a.dtype != torch.float64 else a @ b
     if out is not None:
@@ -218,6 +255,8 @@ def _addmm_fp32(acc, a, b):
             torch.addmm(acc, a, b, out_dtype = torch.float32, out = acc)
         elif a.dtype == torch.bfloat16:
             acc.add_(a @ b)
+        elif _IS_HIP:
+            acc.add_(_half_mm_bounded(a, b))
         else:
             # fp16 partials can pass 65504 before cancelling in acc.
             acc.addmm_(a.float(), b.float())
@@ -964,7 +1003,7 @@ def _dz_w(dz, w):
     V8 = _aligned(w.shape[0])
     if V8 < w.shape[0] and dz.is_cuda and dz.dtype == torch.float16 and (_IS_HIP or not _fp32_out_ok(dz.device, dz.dtype)):
         # fp16 partials can pass 65504 before the rest cancels.
-        return torch.mm(dz.float(), w.float())
+        return _half_mm_bounded(dz, w) if _IS_HIP else torch.mm(dz.float(), w.float())
     out = _mm_fp32(dz[:, :V8], w[:V8])
     if V8 < w.shape[0]:
         _addmm_fp32(out, dz[:, V8:], w[V8:])
@@ -1963,6 +2002,7 @@ def _jsd_logprobs(h, w, bias, scale, cap, inv_t, sd, device):
 
 
 def _jsd_logits(h, w, bias, sd):
+    # On HIP fp16 _mm_fp32 is the bounded half-result GEMM: fast, and raw logits past 65504 stay finite.
     x = _mm_fp32(h, w.t()) if sd == torch.float32 else (h.to(sd) @ w.to(sd).t())
     if bias is not None:
         x.add_(bias.to(sd))
