@@ -86,7 +86,8 @@ UPDATE_OUTSIDE_LOOP = """\
         lora_B = self.lora_B["a"]
         dropout = self.lora_dropout["a"]
         scaling = self.scaling["a"]
-        result = result + lora_B(lora_A(dropout(x))) * scaling
+        output = lora_B(lora_A(dropout(x))) * scaling
+        result = result + output
         return result
 """
 
@@ -254,3 +255,23 @@ def test_patched_peft_linear_accumulates_adapters_before_the_dtype_cast(unsloth_
         out = model(torch.tensor([[1.0]], dtype = torch.bfloat16))
     assert out.dtype == torch.bfloat16
     assert out.item() == 1.0078125
+
+
+def test_dense_update_keeps_every_peft_dtype_restore():
+    # GPTQLoraLinear restores torch_result_dtype inside the adapter loop; a `continue` would skip it.
+    import inspect
+    old = "result = result + lora_B(lora_A(dropout(x))) * scaling"
+    checked = 0
+    for cls, _, _ in compiler.get_lora_layer_modules():
+        forward = getattr(cls, "forward", None)
+        try:
+            source = _dedent_like_compiler(inspect.getsource(forward))
+        except (OSError, TypeError):
+            continue
+        if old not in source:
+            continue
+        patched = compiler._patch_lora_update(source)
+        assert "; continue" not in patched and "return lora_forward(" not in patched
+        assert patched.count("torch_result_dtype)") == source.count("torch_result_dtype)")
+        checked += 1
+    assert checked

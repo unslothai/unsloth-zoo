@@ -5119,12 +5119,15 @@ def _patch_lora_base_layer_input_cast(source):
 
 def _patch_lora_update(source):
     # All Unsloth Zoo code licensed under LGPLv3
-    # `continue`, not `return`: a return inside the adapter loop drops every active adapter after the first.
     old1 = "output = lora_B(lora_A(dropout(x))) * scaling"
     old2 = "result = result + lora_B(lora_A(dropout(x))) * scaling"
     add = "result = result + output"
 
     if (old1 not in source and add not in source) and (old2 not in source):
+        return source
+    # Same statement as PEFT's, so PEFT's own dtype restore (after or inside the adapter loop) still runs.
+    source = source.replace(old2, "result = lora_forward(result, lora_A, lora_B, dropout, x, scaling)")
+    if old1 not in source:
         return source
     # bnb Linear4bit/8bitLt never set torch_result_dtype; their result stays in the base-layer dtype.
     if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
@@ -5132,17 +5135,13 @@ def _patch_lora_update(source):
     else:
         dtype_cast = "result.dtype"
     update = f"lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
-    # Cast once after the loop like PEFT: a per-adapter bf16 cast drops small updates the sum keeps.
-    if "result = result.to(torch_result_dtype)" in source or dtype_cast == "result.dtype":
-        looped_update = "lora_forward(result, lora_A, lora_B, dropout, x, scaling)"
-    else:
-        looped_update = update
-    looped = source.replace(old1, f"result = {looped_update}; continue").replace(old2, f"result = {looped_update}; continue")
+    # `continue` skips `result = result + output`; a `return` here would drop every later active adapter.
+    looped = source.replace(old1, f"result = {update}; continue")
     try:
         compile(looped, "<peft lora forward>", "exec")
     except SyntaxError:
         # Update outside the adapter loop.
-        return source.replace(old1, f"return {update}").replace(old2, f"return {update}")
+        return source.replace(old1, f"return {update}")
     return looped
 pass
 
