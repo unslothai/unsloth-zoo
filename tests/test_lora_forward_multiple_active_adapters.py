@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Generated LoRA forward with several active adapters (`set_adapter(["a", "b"])`).
-
-The vanilla branch used to `return lora_forward(...)` from inside the adapter loop, so every
-adapter after the first was dropped and the PEFT fallbacks of the fused LoRA kernels (which
-call this forward) lost them too.
-"""
+"""Generated LoRA forward with several active adapters (`set_adapter(["a", "b"])`)."""
 
 from __future__ import annotations
 
@@ -56,8 +51,7 @@ LAYER_LINEAR = """\
         return result
 """
 
-# peft/tuners/lora/bnb.py, class Linear4bit: the update is followed by statements that only
-# make sense for the line it replaces.
+# peft/tuners/lora/bnb.py, class Linear4bit.
 BNB_LINEAR4BIT = """\
     def forward(self, x, *args, **kwargs):
         result = self.base_layer(x, *args, **kwargs)
@@ -85,7 +79,6 @@ BNB_LINEAR4BIT = """\
         return result
 """
 
-# The update outside any loop: `continue` would not compile there.
 UPDATE_OUTSIDE_LOOP = """\
     def forward(self, x):
         result = self.base_layer(x)
@@ -111,7 +104,6 @@ def _run_generated(source, layer, x):
 
 
 def _layer(adapters):
-    """Two plain Linear adapters over an identity-ish base; returns (layer, reference fn)."""
     layer = SimpleNamespace(
         base_layer = torch.nn.Linear(6, 6),
         active_adapters = list(adapters),

@@ -5119,21 +5119,14 @@ def _patch_lora_base_layer_input_cast(source):
 
 def _patch_lora_update(source):
     # All Unsloth Zoo code licensed under LGPLv3
-    """Swaps PEFT's vanilla `result + lora_B(lora_A(dropout(x))) * scaling` for `lora_forward`.
-
-    The call ends the adapter's turn with `continue`, so the loop still reaches every other
-    active adapter (`set_adapter(["a", "b"])`); a `return` there dropped all but the first.
-    """
+    # `continue`, not `return`: a return inside the adapter loop drops every active adapter after the first.
     old1 = "output = lora_B(lora_A(dropout(x))) * scaling"
     old2 = "result = result + lora_B(lora_A(dropout(x))) * scaling"
     add = "result = result + output"
 
     if (old1 not in source and add not in source) and (old2 not in source):
         return source
-    # Linear/GPTQ/LoraParallel reassign result to float32 before the
-    # loop, so they save the original dtype in torch_result_dtype.
-    # Linear4bit/Linear8bitLt only cast x, leaving result untouched,
-    # so result.dtype is still the base-layer dtype at return time.
+    # bnb Linear4bit/8bitLt never set torch_result_dtype; their result stays in the base-layer dtype.
     if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
         dtype_cast = "torch_result_dtype"
     else:
@@ -5143,7 +5136,7 @@ def _patch_lora_update(source):
     try:
         compile(looped, "<peft lora forward>", "exec")
     except SyntaxError:
-        # The update sits outside the adapter loop, where `continue` is invalid.
+        # Update outside the adapter loop.
         return source.replace(old1, f"return {update}").replace(old2, f"return {update}")
     return looped
 pass
