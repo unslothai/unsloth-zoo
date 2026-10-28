@@ -2153,17 +2153,43 @@ def train_on_responses_only(
     if _pads_through_a_processor(getattr(trainer, "data_collator", None)):
         _refuse_packing_that_will_not_happen(trainer.data_collator, None)
 
+    def _mask_split(dataset, dataset_name):
+        # Under with_format("arrow") rows and batches are pyarrow Tables, which the
+        # tokenize / mask / fully-masked scan below read as python lists. Run the split
+        # through the default (python) format and hand it back as arrow, so it keeps
+        # and drops exactly the rows the default format does.
+        fmt = None if isinstance(dataset, IterableDataset) else getattr(dataset, "format", None)
+        arrow_format = fmt if isinstance(fmt, dict) and fmt.get("type") == "arrow" else None
+        if arrow_format is not None:
+            # `_format_columns`, not format["columns"]: the latter lists every column
+            # when no selection was made, which would pin today's columns.
+            dataset = dataset.with_format(
+                None,
+                columns = getattr(dataset, "_format_columns", arrow_format.get("columns")),
+                output_all_columns = arrow_format.get("output_all_columns", False),
+            )
+        dataset = _maybe_tokenize_dataset(dataset)
+        if isinstance(dataset, IterableDataset):
+            dataset = dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(dataset), batched = True)
+        else:
+            dataset = dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(dataset))
+        dataset = _filter_fully_masked(dataset, dataset_name)
+        if arrow_format is not None:
+            dataset = dataset.with_format(
+                "arrow",
+                columns = getattr(dataset, "_format_columns", dataset.format.get("columns")),
+                output_all_columns = dataset.format.get("output_all_columns", False),
+                **(arrow_format.get("format_kwargs") or {}),
+            )
+        return dataset
+    pass
+
     # Map both splits before assigning: a raise on eval must not leave train half-masked for a retry.
     _new_train = _new_eval = None
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-        _new_train = _maybe_tokenize_dataset(trainer.train_dataset)
-        if isinstance(_new_train, IterableDataset):
-            _new_train = _new_train.map(_train_on_responses_only, batch_size = _iterable_batch_size(_new_train), batched = True)
-        else:
-            _new_train = _new_train.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(_new_train))
-        _new_train = _filter_fully_masked(_new_train, "train_dataset")
+        _new_train = _mask_split(trainer.train_dataset, "train_dataset")
     pass
 
     if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
@@ -2175,21 +2201,11 @@ def train_on_responses_only(
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-                value = _maybe_tokenize_dataset(value)
-                if isinstance(value, IterableDataset):
-                    value = value.map(_train_on_responses_only, batch_size = _iterable_batch_size(value), batched = True)
-                else:
-                    value = value.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(value))
-                _new_eval[key] = _filter_fully_masked(value, f"eval_dataset[{key}]")
+                _new_eval[key] = _mask_split(value, f"eval_dataset[{key}]")
         else:
             if not hasattr(trainer.eval_dataset, "map"):
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-            _new_eval = _maybe_tokenize_dataset(trainer.eval_dataset)
-            if isinstance(_new_eval, IterableDataset):
-                _new_eval = _new_eval.map(_train_on_responses_only, batch_size = _iterable_batch_size(_new_eval), batched = True)
-            else:
-                _new_eval = _new_eval.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(_new_eval))
-            _new_eval = _filter_fully_masked(_new_eval, "eval_dataset")
+            _new_eval = _mask_split(trainer.eval_dataset, "eval_dataset")
         pass
     pass
     if _new_train is not None:
