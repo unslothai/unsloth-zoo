@@ -38,26 +38,6 @@ def _iterable_batch_size(dataset, default = 1000):
     return getattr(getattr(dataset, "_ex_iterable", None), "batch_size", None) or default
 
 
-# From https://www.geeksforgeeks.org/longest-common-substring-array-strings/
-# Longest Common Substring in an Array of Strings
-def _old_longest_common_substring(arr):
-    n = len(arr)
-    s = arr[0]
-    l = len(s)
-    res = ""
-    for i in range(l):
-        for j in range(i + 1, l + 1):
-            stem = s[i:j]
-            k = 1
-            for k in range(1, n):
-                if stem not in arr[k]:
-                    break
-            if (k + 1 == n and len(res) < len(stem)):
-                res = stem
-    return res
-pass
-
-
 def _longest_common_sublist(lists):
     """Longest common sublist among multiple lists (ties broken arbitrarily,
     empty list if none)."""
@@ -90,7 +70,6 @@ def _longest_common_sublist(lists):
         return True, list(common.pop())
     pass
 
-    # Binary search on length
     left, right = 1, min_len
     result = []
 
@@ -126,7 +105,6 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
     elif component.startswith("\n"): left_text = "\n"
     stripped = component.strip()
     
-    # Add current pieces and also newlines
     all_input_ids = []
     if not force_match:
         for left in range(3):
@@ -145,10 +123,6 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         all_input_ids.append(x)
     pass
 
-    # Old longest common substring is replaced with actual longest common list of numbers
-    # substring = _old_longest_common_substring([str(x + [0]) for x in all_input_ids])
-    # substring = substring.split(", ")[:-1]
-    # substring = [int(x) for x in substring if x.isdigit()]
     substring = _longest_common_sublist([x + [0] for x in all_input_ids])
 
     # substring == [0] may just be the original single token.
@@ -766,7 +740,7 @@ def train_on_responses_only(
     response_part     = None,
     force_match       = True,  # Match newlines as well!
     tokenizer         = None,  # Optional
-    return_function   = False, # Useful for iterating over lists
+    return_function   = False,
     num_proc          = None,
     last_response_only = False, # Train only on the last assistant turn
     mask_out_tokens   = None,  # e.g. ["</think>"] - also mask these inside kept responses
@@ -812,7 +786,6 @@ def train_on_responses_only(
     # Keep the original object (may be a VLM processor) so auto-detect can read a
     # chat template that lives only on the processor; the matcher uses the inner one.
     processor = tokenizer
-    # Get non vision tokenizer
     if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
@@ -861,7 +834,6 @@ def train_on_responses_only(
     if Q_must == A_must[:len(Q_must)] and Q_right:
         Q_must, Q_right = Q_must + Q_right, []
 
-    # Store some temporary stuff
     A_first = A_must[0]
     len_A_must = len(A_must)
     A_left_reversed = A_left[::-1]
@@ -959,7 +931,6 @@ def train_on_responses_only(
 
             spans = []
             while j < n:
-                # Find <assistant>
                 if (input_ids[j] == A_first) and \
                     (input_ids[j : (k := j + len_A_must)] == A_must):
 
@@ -974,7 +945,6 @@ def train_on_responses_only(
                         if optional_right == input_ids[k]: k += 1
                         else: break
                     pass
-                    # assistant_j = j
                     assistant_k = k
 
                     j = assistant_k
@@ -1011,7 +981,6 @@ def train_on_responses_only(
                                 else: break
                             pass
                             user_j = j
-                            # Account for last item
                             if user_j != n_minus_1:
                                 # Outer j += 1 lands on k, so an empty user turn cannot hide the next marker.
                                 j = k - 1
@@ -2516,7 +2485,6 @@ def standardize_data_formats(
                 uniques[key].append(value)
     pass
 
-    # Must be only 2 entries
     assert(len(uniques.keys()) == 2)
 
     keys = list(uniques.keys())
@@ -2547,7 +2515,6 @@ def standardize_data_formats(
         length_second = len(set(uniques[keys[1]]))
 
         if length_first < length_second:
-            # Role is assigned to the first element
             role_key    = keys[0]
             content_key = keys[1]
         else:
@@ -2556,7 +2523,6 @@ def standardize_data_formats(
         pass
     pass
 
-    # Check roles are in aliases
     roles = set(_normalize_role_alias(value) for value in uniques[role_key])
     leftover_aliases = (all_aliases | roles) - all_aliases
     if len(leftover_aliases) != 0:
