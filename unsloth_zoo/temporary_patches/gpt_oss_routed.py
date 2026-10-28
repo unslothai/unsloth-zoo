@@ -359,6 +359,10 @@ def _track(experts):
     return not hooked
 
 
+# Disabled for Dynamo, not only guarded by is_compiling() at the callers: when Inductor skips a compiled frame
+# (SkipFrame, e.g. bfloat16 on a T4) the frame runs eagerly while Dynamo still converts nested frames, and this one
+# cannot be traced (operator getters, data_ptr). About 0.3 us per call.
+@torch.compiler.disable
 def prepare_routed_experts(experts, epoch = None):
     """Build (or validate) the pointer tables for a ModuleList NF4 experts module.
 
