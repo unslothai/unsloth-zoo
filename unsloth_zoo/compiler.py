@@ -38,6 +38,7 @@ import os
 import stat
 import torch
 import subprocess
+import gc
 import types
 import time
 import logging
@@ -5209,12 +5210,19 @@ def patch_lora_forwards(torch_compile_options):
         if not hasattr(function, "forward"):
             continue
         original_forward = function.forward
+        previous_forward = None
         if original_forward.__name__ == "unsloth_forward":
             # Built under another flag (an fp16 load before a bf16 one): rebuild from PEFT's forward.
             if getattr(original_forward, "_unsloth_force_float32", force_float32) == force_float32:
                 continue
+            previous_forward = original_forward
             original_forward = getattr(original_forward, "_unsloth_original_forward", None)
             if original_forward is None:
+                continue
+            variant = getattr(previous_forward, "_unsloth_variants", {}).get(force_float32)
+            if variant is not None:
+                _install_lora_forward_variant(function, parent, child, previous_forward, variant)
+                success += 1
                 continue
 
         exec(f"import {parent}", locals(), globals())
@@ -5314,6 +5322,9 @@ def patch_lora_forwards(torch_compile_options):
             forward._unsloth_torch_compile_options = torch_compile_options
             if integer_input_inline:
                 forward._unsloth_integer_input = True
+            if previous_forward is not None:
+                _install_lora_forward_variant(function, parent, child, previous_forward, forward)
+                continue
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
             could_not_replace_modules.append(parent)
@@ -6207,6 +6218,35 @@ def _patch_torch_dtype_modules(
             pass
         pass
     pass
+
+
+def _install_lora_forward_variant(function, parent, child, previous_forward, forward):
+    """Switch PEFT's LoRA class to `forward` without changing the arithmetic of live layers.
+
+    Layers created under the previous flag keep their variant (a model loaded earlier must give
+    the same results after a later load); layers created later take the new one.
+    """
+    variants = dict(getattr(previous_forward, "_unsloth_variants", None) or {
+        previous_forward._unsloth_force_float32: previous_forward,
+    })
+    flag = forward._unsloth_force_float32
+    variants[flag] = forward
+    previous_flag = previous_forward._unsloth_force_float32
+    # type(), not isinstance: proxies and deprecated objects answer __class__ with errors / warnings.
+    for module in gc.get_objects():
+        if issubclass(type(module), function) and "_unsloth_force_float32" not in module.__dict__:
+            module._unsloth_force_float32 = previous_flag
+
+    def unsloth_forward(self, x, *args, **kwargs):
+        variant = variants.get(getattr(self, "_unsloth_force_float32", None), forward)
+        return variant(self, x, *args, **kwargs)
+
+    for key in ("_unsloth_force_float32", "_unsloth_original_forward",
+                "_unsloth_torch_compile_options", "_unsloth_integer_input"):
+        if hasattr(forward, key):
+            setattr(unsloth_forward, key, getattr(forward, key))
+    unsloth_forward._unsloth_variants = variants
+    exec(f"{parent}.{child}.forward = unsloth_forward", globals(), locals())
 
 
 def _reconcile_lora_forwards():
