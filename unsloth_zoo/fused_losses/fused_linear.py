@@ -73,6 +73,9 @@ _MIN_ROWS = int(_env_float("UNSLOTH_FUSED_LINEAR_MIN_ROWS", 0))
 _MAX_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_MAX_ROWS", 4096)), 1)
 _BLOCK = int(_env_float("UNSLOTH_FUSED_LINEAR_BLOCK", 4096))
 _SPLIT_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_SPLIT_COLS", 16384)), 0)
+# A multiple of 16: split bounds, vocab tiles and their buffers keep Triton's divisibility-by-16 specialisation
+# (see _split_launches), or the chunked and vocab-tiled passes of one row stop agreeing in the last bit.
+_SPLIT_COLS = -(-_SPLIT_COLS // 16) * 16
 _SPLIT_BLOCK = max(int(_env_float("UNSLOTH_FUSED_LINEAR_SPLIT_BLOCK", 2048)), 16)
 # ROCm: small tiles are ~2x faster on gfx1151.
 _HIP_TILES = torch.version.hip is not None
@@ -844,6 +847,17 @@ def _split_block():
     return min(triton.next_power_of_2(_SPLIT_BLOCK), triton.next_power_of_2(max(_SPLIT_COLS, 16)))
 
 
+def _split_launches(width):
+    """(offset, n_cols, splits) partial-kernel launches over width columns. Triton specialises n_cols on
+    divisibility by 16 (load width, so the fp32 summation order): full splits get a bound divisible by 16 and only a
+    ragged last split the remainder, so chunked and vocab-tiled passes run every split with the same kernel."""
+    k = -(-width // _SPLIT_COLS)
+    if k == 1 or width % 16 == 0:
+        return ((0, width, k),)
+    c = (k - 1) * _SPLIT_COLS
+    return ((0, c, k - 1), (c, width - c, 1))
+
+
 def _tiled_vocab(V):
     # The chunked pass merges splits only past two, so only there do tiled and chunked statistics agree.
     return _SPLIT_COLS > 0 and -(-V // _SPLIT_COLS) > 2
@@ -955,13 +969,23 @@ def _torch_dz(x, bias, tgt, lse, lpt, inv_t, scale, cap, coef_row, smooth_keep, 
     return dz
 
 
-class _Buffers:
-    """One logits buffer per call, reused by every chunk; odd vocab rows padded to a multiple of 8 for cuBLAS."""
+# Forward statistics buffers: Triton specialises the row stride on divisibility by 16 (load width, so the fp32
+# summation order), so the chunked [rows, V] buffer and a vocab tile must both have it or a no-grad pass and its
+# trainable-head twin disagree in the last bit (V % 16 != 0).
+_FWD_PAD = 16
 
-    def __init__(self, rows, n_cols, device, fp32, compute_dtype):
+
+def _padded(n_cols, pad = 8):
+    return -(-n_cols // pad) * pad
+
+
+class _Buffers:
+    """One logits buffer per call, reused by every chunk; odd vocab rows padded to a multiple of pad (8 for cuBLAS)."""
+
+    def __init__(self, rows, n_cols, device, fp32, compute_dtype, pad = 8):
         self.n_cols = n_cols
         self.fp32 = fp32
-        self.stride = -(-n_cols // 8) * 8
+        self.stride = _padded(n_cols, pad)
         self.dtype = torch.float32 if fp32 else compute_dtype
         self.buf = torch.empty((rows, self.stride), device = device, dtype = self.dtype)
 
@@ -1064,20 +1088,25 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
             splits = 1
 
         def run_split():
-            part = torch.empty((7, splits, n), **f32)
+            # The same kernel binaries as _tiled_forward (target logit kept in part[7]): with temperature != 1 the
+            # WANT_TGT / HAS_TGT variants contract x * inv_t into FMAs differently, so entropy and log-sum-p^2 of a
+            # no-grad pass would otherwise drift from its trainable-head twin in the last bit.
+            part = torch.empty((8, splits, n), **f32)
             flags = dict(HAS_BIAS = bias is not None, HAS_SCALE = scale != 1.0, HAS_CAP = cap != 0.0,
                          WANT_ENT = want_ent, WANT_SUM = want_sum, WANT_LSSP = want_lssp, WANT_TOP1 = want_top1)
             scal = (float(inv_t), float(scale), float(cap) if cap != 0.0 else 1.0)
-            _fl_partial_kernel[(n, splits)](
-                x, x.stride(0), V, n, _SPLIT_COLS, splits * n, 0, 0, bias if bias is not None else lse, tgt, part,
-                *scal, part, 0, WANT_TGT = False, WANT_BLOCK_TOP = False, SUB = 1, BLOCK = _split_block(),
-                num_warps = 4, enable_fp_fusion = True, **flags,
-            )
+            for c, n_c, k in _split_launches(V):
+                _fl_partial_kernel[(n, k)](
+                    x[:, c:], x.stride(0), n_c, n, _SPLIT_COLS, splits * n, c, c // _SPLIT_COLS,
+                    bias[c:] if bias is not None else part, tgt, part,
+                    *scal, part, 0, WANT_TGT = True, WANT_BLOCK_TOP = False, SUB = _top_cols(), BLOCK = _split_block(),
+                    num_warps = 4, enable_fp_fusion = True, **flags,
+                )
             _fl_combine_kernel[(n,)](
-                x, x.stride(0), V, n, splits, splits * n, _SPLIT_COLS, part,
-                tgt, exact if exact is not None else lse, bias if bias is not None else lse,
+                part, 0, V, n, splits, splits * n, _SPLIT_COLS, part,
+                tgt, exact if exact is not None else lse, lse,
                 logp, lse, ent, tot, lssp, top1, lpt, *scal,
-                HAS_EXACT = exact is not None, HAS_TGT = False,
+                HAS_EXACT = exact is not None, HAS_TGT = True,
                 SPLITS = max(triton.next_power_of_2(splits), 2),
                 num_warps = 1, enable_fp_fusion = True, **flags,
             )
@@ -1132,6 +1161,7 @@ def _tiled_layout(n_keep, V, cap_rows, bpl, device):
     cols = _FWD_TILE_COLS if _FWD_TILE_COLS is not None else (16384 if _flash_min_rows(device) == 0 else 0)
     if cols > 0 and bpl == 4:
         tile = min(tile, max(cols, _SPLIT_COLS))
+    # A multiple of _SPLIT_COLS (itself of 16), so the _FWD_PAD-padded buffer is exactly R x tile: the budget holds.
     tile = min(tile - tile % _SPLIT_COLS, -(-V // _SPLIT_COLS) * _SPLIT_COLS)
     return R, tile
 
@@ -1148,7 +1178,7 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
     bpl = _bytes_per_logit(fp32_logits, compute_dtype)
     R, tile = _tiled_layout(n_keep, V, cap_rows, bpl, device)
     splits = -(-V // _SPLIT_COLS)
-    buf = _Buffers(R, tile, device, fp32_logits, compute_dtype)
+    buf = _Buffers(R, tile, device, fp32_logits, compute_dtype, _FWD_PAD)
     flags = dict(HAS_BIAS = bias is not None, HAS_SCALE = scale != 1.0, HAS_CAP = cap != 0.0,
                  WANT_ENT = want_ent, WANT_SUM = want_sum, WANT_LSSP = want_lssp, WANT_TOP1 = want_top1)
     scal = (float(inv_t), float(scale), float(cap) if cap != 0.0 else 1.0)
@@ -1173,13 +1203,14 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
             bias_t = bias[first:last] if bias is not None else None
 
             def run():
-                _fl_partial_kernel[(n, -(-(last - first) // _SPLIT_COLS))](
-                    x, x.stride(0), last - first, n, _SPLIT_COLS, splits * n, first, first // _SPLIT_COLS,
-                    bias_t if bias_t is not None else part, t, part, *scal,
-                    top, top.stride(0) if block_top is not None else 0,
-                    WANT_TGT = True, WANT_BLOCK_TOP = block_top is not None, SUB = _top_cols(),
-                    BLOCK = _split_block(), num_warps = 4, enable_fp_fusion = True, **flags,
-                )
+                for c, n_c, k in _split_launches(last - first):
+                    _fl_partial_kernel[(n, k)](
+                        x[:, c:], x.stride(0), n_c, n, _SPLIT_COLS, splits * n, first + c, (first + c) // _SPLIT_COLS,
+                        bias_t[c:] if bias_t is not None else part, t, part, *scal,
+                        top, top.stride(0) if block_top is not None else 0,
+                        WANT_TGT = True, WANT_BLOCK_TOP = block_top is not None, SUB = _top_cols(),
+                        BLOCK = _split_block(), num_warps = 4, enable_fp_fusion = True, **flags,
+                    )
                 if u is None:
                     return
                 n_split = -(-(last - first) // _SPLIT_COLS)
@@ -1351,7 +1382,7 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
         fp32_logits, exact_mode = _logits_mode(device, compute_dtype)
         if compute_dtype not in _HALF:
             fp32_logits, exact_mode = False, False
-        R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
+        R = _chunk_rows(rows, n_keep, H, _padded(V, _FWD_PAD), _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         w = weight.to(compute_dtype)
         coef = (scaling.to(**f32) / divisor.to(**f32)).reshape(())
@@ -1372,7 +1403,7 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
             n_chunked = 0
         else:
             n_chunked = n_keep
-            buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
+            buf = _Buffers(R, V, device, fp32_logits, compute_dtype, _FWD_PAD)
         ratio = None
         if n_chunked and grad and compute_dtype in _HALF and (not need_w or acc_w.dtype == torch.float32):
             # half(coef) per row is a 0.4% bf16 scale error: buffer takes a power of two, fp32 the rest.
@@ -1492,9 +1523,9 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                     block_top.index_copy_(0, idx, top)
             return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + \
                 (lpt if exact_lpt else logps.clone(),)
-        R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
+        R = _chunk_rows(rows, n_keep, H, _padded(V, _FWD_PAD), _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
-        buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
+        buf = _Buffers(R, V, device, fp32_logits, compute_dtype, _FWD_PAD)
         coef = torch.full((), -u_scale, **f32)
         with torch.autocast(device.type, enabled = False):
             for a in range(0, n_keep, R):

@@ -162,3 +162,24 @@ def test_unsharded_check_stops_at_the_first_adapter(tmp_path):
     assert res["sharded"] is False, res
     assert res["params_total"] == 1200, res
     assert res["params_walked"] <= 3, res
+
+
+def test_a_single_process_never_walks_the_parameters():
+    """DTensors need a process group: without one the check answers no before touching the model,
+    so save_lora / load_lora keep working on objects that only expose state_dict()."""
+    import torch
+    import unsloth_zoo.vllm_utils as vu
+
+    assert not torch.distributed.is_initialized()
+
+    class StateDictOnly:
+        def state_dict(self):
+            return {"a.lora_A.weight": torch.ones(1)}
+
+        def named_parameters(self):
+            raise AssertionError("walked the parameters in a single process")
+
+    model = StateDictOnly()
+    assert vu._lora_is_sharded(model) is False
+    assert "_unsloth_lora_is_sharded" not in model.__dict__
+    assert list(vu._lora_state_dict(model)) == ["a.lora_A.weight"]

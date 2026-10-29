@@ -25,6 +25,7 @@ __all__ = [
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import contextlib
+import contextvars
 import hashlib
 import io
 import inspect
@@ -2213,6 +2214,43 @@ def _absolute_relative_imports(source, model_location):
 pass
 
 
+_COMPILE_VERSIONS_SCOPE = contextvars.ContextVar(
+    "_unsloth_compile_versions_scope", default=None
+)
+
+
+def _resolve_compile_versions():
+    versions = []
+    for package in ("unsloth_zoo", "unsloth", "transformers", "trl"):
+        try:
+            versions.append(importlib_version(package))
+        except:
+            versions.append("0")
+    return tuple(versions)
+
+
+def _get_compile_versions():
+    versions = _COMPILE_VERSIONS_SCOPE.get()
+    if versions is None:
+        versions = _resolve_compile_versions()
+    return versions
+
+
+def _compile_versions_scope(function):
+    # Per call, not per process: a package upgraded between two compile calls must reach the header.
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        if _COMPILE_VERSIONS_SCOPE.get() is not None:
+            return function(*args, **kwargs)
+        token = _COMPILE_VERSIONS_SCOPE.set(_resolve_compile_versions())
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _COMPILE_VERSIONS_SCOPE.reset(token)
+
+    return wrapper
+
+
 def create_new_function(
     name,
     new_source,
@@ -2385,22 +2423,12 @@ def create_new_function(
     new_source = prepend + new_source + append
 
     # Check versioning
-    try:
-        unsloth_zoo_version = importlib_version("unsloth_zoo")
-    except:
-        unsloth_zoo_version = "0"
-    try:
-        unsloth_version = importlib_version("unsloth")
-    except:
-        unsloth_version = "0"
-    try:
-        transformers_version = importlib_version("transformers")
-    except:
-        transformers_version = "0"
-    try:
-        trl_version = importlib_version("trl")
-    except:
-        trl_version = "0"
+    (
+        unsloth_zoo_version,
+        unsloth_version,
+        transformers_version,
+        trl_version,
+    ) = _get_compile_versions()
 
     versioning = (
         '"""\n' + f"{unsloth_zoo_version}\n"
@@ -6169,6 +6197,7 @@ def _patch_torch_dtype_modules(
     pass
 
 
+@_compile_versions_scope
 def unsloth_compile_transformers(
     model_type: str = "llama",
     sdpa_dynamic_mask: bool = True,

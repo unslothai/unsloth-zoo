@@ -997,21 +997,48 @@ def test_exact_top_backward_keeps_fp32_gradient_accuracy(monkeypatch, ent_grad, 
             assert eh < 0.4 * hh and ew < 0.4 * hw, (dtype, eh, hh, ew, hw)
 
 
+@pytest.mark.parametrize("split_cols", [16384, 4112, 1008])
+def test_split_launches_keep_full_split_bounds_divisible_by_16(monkeypatch, split_cols):
+    monkeypatch.setattr(fl, "_SPLIT_COLS", split_cols)
+    for width in (1, 15, 16, split_cols - 1, split_cols, split_cols + 1, 2 * split_cols + 8, 3 * split_cols + 15,
+                  151936, 40001, 49153):
+        launches = fl._split_launches(width)
+        assert sum(k for _, _, k in launches) == -(-width // split_cols)
+        assert launches[0][0] == 0 and launches[-1][0] + launches[-1][1] == width
+        if len(launches) == 2:
+            (c0, n0, k0), (c1, n1, k1) = launches
+            assert c1 == n0 == k0 * split_cols and n0 % 16 == 0 and k1 == 1 and 0 < n1 < split_cols
+
+
+def test_split_cols_env_is_rounded_to_a_multiple_of_16():
+    import subprocess
+    import sys
+    code = "import unsloth_zoo.fused_losses.fused_linear as fl; print(fl._SPLIT_COLS)"
+    env = dict(os.environ, UNSLOTH_FUSED_LINEAR_SPLIT_COLS = "4100", UNSLOTH_IS_PRESENT = "1", CUDA_VISIBLE_DEVICES = "")
+    out = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True, text = True, check = True)
+    assert int(out.stdout.strip().splitlines()[-1]) == 4112
+
+
 @CUDA
-@pytest.mark.parametrize("V", [1003, 20001, 40000])
-def test_trainable_head_grad_and_no_grad_passes_are_bit_identical(monkeypatch, V):
+@pytest.mark.parametrize("temperature", [1.0, 0.7, 1.3])
+@pytest.mark.parametrize("small_card", [False, True])
+@pytest.mark.parametrize("V", [1003, 20001, 40000, 40001, 40008, 49153])
+def test_trainable_head_grad_and_no_grad_passes_are_bit_identical(monkeypatch, V, small_card, temperature):
     if not fl._HAS_TRITON:
         pytest.skip("needs Triton")
+    # Small cards (<= 24.5 GiB) take the tiled route for frozen heads too and cap tiles at 16384 columns.
+    monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", 0 if small_card else 4096)
+    monkeypatch.setattr(fl, "_FWD_TILE_COLS", None)
     for dtype in _dtypes("cuda"):
         h, w, t = _peaked("cuda", dtype, 96, 64, V)
         mask = torch.ones(96, dtype = torch.bool, device = "cuda")
         mask[3::7] = False
         with torch.no_grad():
-            ref = fused_linear_logprobs(h, w, t, mask = mask, return_entropy = True)
+            ref = fused_linear_logprobs(h, w, t, mask = mask, return_entropy = True, temperature = temperature)
         w.requires_grad_(True)
         h.requires_grad_(True)
         tiled = fl.CALLS["tiled"]
-        out = fused_linear_logprobs(h, w, t, mask = mask, return_entropy = True)
+        out = fused_linear_logprobs(h, w, t, mask = mask, return_entropy = True, temperature = temperature)
         assert fl.CALLS["tiled"] == tiled + (V > 2 * fl._SPLIT_COLS)
         for x, y in zip(out, ref):
             assert torch.equal(x.detach(), y), (dtype, V)

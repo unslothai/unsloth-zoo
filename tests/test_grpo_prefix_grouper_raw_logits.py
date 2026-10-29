@@ -90,7 +90,7 @@ def _line_at(src, needle):
 
 def _pg_forward_source():
     src = inspect.getsource(rr.grpo_accumulated_loss)
-    start = _line_at(src, "    def _pg_grad_forward():")
+    start = _line_at(src, "    def _pg_grad_forward(")
     end   = _line_at(src, "    if _pg_layout is not None:")
     return textwrap.dedent(src[start:end])
 

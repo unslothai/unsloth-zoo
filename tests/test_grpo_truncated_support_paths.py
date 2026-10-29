@@ -30,6 +30,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_grpo_truncated_support import _vllm_processed_logprobs  # noqa: E402
 
 
+@pytest.fixture(autouse = True)
+def _log_prob_route(monkeypatch):
+    # These stub UnslothEfficientGRPO, the log-prob route; test_grpo_fused_route.py covers the forward-gradient one.
+    import unsloth_zoo.fused_losses.fused_grpo as _fused_grpo
+    monkeypatch.setattr(_fused_grpo, "GRPO_FWD_GRAD", False)
+
+
 @pytest.mark.parametrize("top_p", [0.9, 0.1])
 def test_tied_top_p_cutoff_matches_vllm_kept_count(top_p):
     # vLLM masks sorted positions, so a cutoff inside a run of equal logits keeps only part of it.

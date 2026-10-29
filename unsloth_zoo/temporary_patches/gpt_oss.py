@@ -46,7 +46,15 @@ try:
 except Exception:
     def _fused_route_or_none(*args, **kwargs):
         return None
-from .gpt_oss_routed import ROUTED_MAX_SLOTS, prepare_routed_experts, routed_experts_forward, routed_mlp_forward
+from .gpt_oss_routed import (
+    ROUTED_MAX_SLOTS, prepare_routed_experts, routed_decode_epoch, routed_experts_forward, routed_mlp_forward,
+)
+from unsloth_zoo.gpt_oss_decode_fused import (
+    add_rms_norm as _fused_add_rms_norm,
+    fused_decode_ok as _fused_decode_ok,
+    rope_decode as _rope_decode,
+    static_cache_update as _static_cache_update,
+)
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -3479,7 +3487,11 @@ def patch_GptOssAttention():
         key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        rotated = _rope_decode(query_states, key_states, cos, sin, apply_rotary_pos_emb) \
+            if _fused_decode_ok(query_states) else None
+        if rotated is None:
+            rotated = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = rotated
         if past_key_value is not None:
             cache_dtype = getattr(past_key_value, "dtype", None)
             if cache_dtype is None and hasattr(past_key_value, "layers"):
@@ -3492,8 +3504,11 @@ def patch_GptOssAttention():
             if cache_dtype is not None and key_states.dtype != cache_dtype:
                 key_states = key_states.to(cache_dtype)
                 value_states = value_states.to(cache_dtype)
-            cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            updated = _static_cache_update(past_key_value, key_states, value_states, self.layer_idx)
+            if updated is None:
+                cache_kwargs = {"cache_position": cache_position}
+                updated = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = updated
         if key_states.dtype != query_states.dtype or value_states.dtype != query_states.dtype:
             key_states = key_states.to(query_states.dtype)
             value_states = value_states.to(query_states.dtype)
@@ -3854,6 +3869,46 @@ def patch_GptOssModel():
         hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
         return hidden_states, residual
     pass
+
+    def add_rms_layernorm_forward(norm, hidden_states, residual):
+        """(RMSNorm(hidden_states + residual), hidden_states + residual) in one launch when it can;
+        residual None normalizes hidden_states alone."""
+        fused = _fused_add_rms_norm(hidden_states, residual, norm.weight, norm.variance_epsilon)
+        if fused is not None:
+            return fused
+        if residual is not None:
+            hidden_states += residual.to(hidden_states.device)
+        residual = hidden_states.clone()
+        return rms_layernorm_forward(norm, hidden_states), residual
+    pass
+
+    def fused_inference_forward(
+        self,
+        hidden_states,
+        pending_residual,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        use_cache,
+        cache_position,
+        position_embeddings,
+        **kwargs,
+    ):
+        """inference_forward with the previous layer's residual add folded into the input norm:
+        hidden_states is the previous MLP output (or the embeddings, pending_residual None)."""
+        hidden_states, residual = add_rms_layernorm_forward(self.input_layernorm, hidden_states, pending_residual)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        return add_rms_layernorm_forward(self.post_attention_layernorm, hidden_states, residual)
+    pass
     # if has_static_cache and Version(torch.__version__) >= Version("2.10.0"):
     #     # torch 2.9.0 has excessive compilations
     #     inference_forward = _torch_compile(inference_forward, dynamic = None, fullgraph = True, options = fused_torch_compile_options)
@@ -3967,6 +4022,11 @@ def patch_GptOssModel():
             # Initialize for common return path
             all_hidden_states = None
             all_router_logits = None
+            # Fused: each residual add rides in the next norm's kernel (one launch, not ~11 ops).
+            fused_norms = _fused_decode_ok(hidden_states)
+            # NF4 routed tables: fully rechecked once per epoch, not at every layer of every step.
+            routed_epoch = None if torch.compiler.is_compiling() else routed_decode_epoch(past_key_values)
+            pending_residual = None
             # This loop calls the layer's parts directly, so the block swapper's forward hooks never fire.
             for layer_idx, decoder_layer in enumerate(self.layers):
                 if block_swap is not None:
@@ -3975,9 +4035,10 @@ def patch_GptOssModel():
                     attention_mask,
                     _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
                 )
-                hidden_states, residual = inference_forward(
+                hidden_states, residual = (fused_inference_forward if fused_norms else inference_forward)(
                     decoder_layer,
                     hidden_states,
+                    *((pending_residual,) if fused_norms else ()),
                     mask,
                     position_ids,
                     past_key_values,
@@ -3987,7 +4048,7 @@ def patch_GptOssModel():
                     **kwargs,
                 )
                 _actual_experts = _unwrap_peft_experts(decoder_layer.mlp.experts)
-                routed = routed_mlp_forward(decoder_layer.mlp, hidden_states)
+                routed = routed_mlp_forward(decoder_layer.mlp, hidden_states, epoch = routed_epoch)
                 if routed is not None:
                     hidden_states = routed
                 elif hasattr(_actual_experts, "gate_up_projs"):
@@ -4002,11 +4063,17 @@ def patch_GptOssModel():
                     hidden_states, _ = mlp_forward(decoder_layer.mlp, hidden_states)
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
-                hidden_states += residual
+                if fused_norms:
+                    pending_residual = residual
+                else:
+                    hidden_states += residual
                 if block_swap is not None:
                     block_swap.leave(layer_idx)
             pass
-            hidden_states = rms_layernorm_forward(self.norm, hidden_states)
+            if fused_norms:
+                hidden_states, _ = add_rms_layernorm_forward(self.norm, hidden_states, pending_residual)
+            else:
+                hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:
             # flex_attention_with_sink builds its own BlockMask, so dropping the dense
             # one avoids an O(seq_len^2) allocation that OOMs at long context. Only that
@@ -4071,6 +4138,29 @@ def patch_GptOssModel():
                 "router_logits": all_router_logits,
             })
 
+    # transformers 4.x still names cache_position in the signature, and the relaxed match refuses a
+    # forward one parameter short, which left the stock forward live on 4.57. Same body either way:
+    # it already reads cache_position from kwargs.
+    stock = transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel.forward
+    if "cache_position" in inspect.signature(stock).parameters:
+        _forward_without_cache_position = forward
+        def forward(
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Cache] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: KWARGS_TYPE,
+        ) -> MoeModelOutputWithPast:
+            if cache_position is not None:
+                kwargs["cache_position"] = cache_position
+            return _forward_without_cache_position(
+                self, input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, **kwargs,
+            )
+        pass
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
     # After the replacement, so the recorder wraps whichever forward ended up live:
     # zoo's own, or stock when the signature did not match.
