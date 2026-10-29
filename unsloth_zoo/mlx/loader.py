@@ -1435,6 +1435,35 @@ def _tokenizer_class_for_model_type(model_path):
     return tokenizer_class_from_name(mapped) if mapped else None
 
 
+# Tekken tokenizer.json conversions shipped Llama-3's split (first) in place of
+# mistral-common's own, tekken.json's "config.pattern" (second).
+_MISTRAL_WRONG_SPLIT_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_MISTRAL_TEKKEN_SPLIT_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+def _has_wrong_mistral_split(model_path):
+    """Whether a Mistral-family tokenizer.json opens its pre-tokenizer with the wrong split.
+
+    transformers only warns here (``fix_mistral_regex``), and its own repair raises on
+    5.5. Matching the exact pattern leaves SentencePiece Mistral repos alone, which
+    transformers' version-based detection also flags.
+    """
+    model_type = _read_json_file(os.path.join(str(model_path), "config.json")).get("model_type")
+    if model_type not in ("mistral", "mistral3", "voxtral", "ministral", "pixtral"):
+        return False
+    pre_tokenizer = _read_json_file(os.path.join(str(model_path), "tokenizer.json")).get("pre_tokenizer") or {}
+    first = (pre_tokenizer.get("pretokenizers") or [{}])[0] if pre_tokenizer.get("type") == "Sequence" else {}
+    pattern = first.get("pattern") or {}
+    return first.get("type") == "Split" and pattern.get("Regex") == _MISTRAL_WRONG_SPLIT_PATTERN
+
+
 def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     """Load a tokenizer without letting AutoTokenizer resolve the model config.
 
@@ -1482,7 +1511,14 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     if not remote and (Path(model_path) / "tokenizer.json").is_file():
         if tokenizer_class is None or not issubclass(tokenizer_class, PreTrainedTokenizerFast):
             tokenizer_class = PreTrainedTokenizerFast
-        return tokenizer_class.from_pretrained(model_path, *args, **kwargs)
+        tokenizer = tokenizer_class.from_pretrained(model_path, *args, **kwargs)
+        if "fix_mistral_regex" not in kwargs and _has_wrong_mistral_split(model_path):
+            from tokenizers import Regex, pre_tokenizers
+
+            tokenizer.backend_tokenizer.pre_tokenizer[0] = pre_tokenizers.Split(
+                Regex(_MISTRAL_TEKKEN_SPLIT_PATTERN), behavior="isolated",
+            )
+        return tokenizer
     # Tokenizer metadata selects the class; model validators have no role here.
     if class_name or remote:
         kwargs["config"] = PretrainedConfig()

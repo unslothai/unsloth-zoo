@@ -4588,6 +4588,62 @@ def test_tokenizer_class_disagreeing_with_model_type_keeps_tokenizer_json(
     assert loaded.decode(ids) == text
 
 
+@pytest.mark.parametrize("model_type, kwargs, digits", [
+    ("mistral", {}, ["1", "2", "3", "4", "5"]),
+    ("llama", {}, ["123", "45"]),
+    ("mistral", {"fix_mistral_regex": False}, ["123", "45"]),
+])
+def test_mistral_tokenizer_with_llama3_split_gets_tekken_split(tmp_path, model_type, kwargs, digits):
+    """Tekken tokenizer.json conversions open with Llama-3's split, so digits group in
+    threes where mistral-common splits them one by one; Llama-3 itself keeps it."""
+    from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers, trainers
+    import unsloth_zoo.mlx.loader as loader
+
+    text = "Year 12345 camelCASE"
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.Sequence([
+        pre_tokenizers.Split(Regex(loader._MISTRAL_WRONG_SPLIT_PATTERN), behavior="isolated"),
+        pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+    ])
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator([text] * 4, trainers.BpeTrainer(
+        special_tokens=["<unk>", "<s>", "</s>"],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+    ))
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "PreTrainedTokenizerFast", "bos_token": "<s>", "eos_token": "</s>",
+    }))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+    loaded = loader._load_mlx_tokenizer(tmp_path, **kwargs)
+    pieces = loaded.backend_tokenizer.pre_tokenizer.pre_tokenize_str("12345")
+    assert [piece for piece, _ in pieces] == digits
+    ids = loaded.encode(text, add_special_tokens=False)
+    assert loaded.decode(ids) == text
+
+
+def test_sentencepiece_mistral_tokenizer_keeps_its_pre_tokenizer(tmp_path):
+    """Mistral 7B v0.1-v0.3 ship a Metaspace tokenizer.json; the Tekken split is not theirs."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    import unsloth_zoo.mlx.loader as loader
+
+    text = "Year 12345 camelCASE"
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.Metaspace()
+    backend.decoder = decoders.Metaspace()
+    backend.train_from_iterator([text] * 4, trainers.BpeTrainer(special_tokens=["<unk>", "<s>", "</s>"]))
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "PreTrainedTokenizerFast", "bos_token": "<s>", "eos_token": "</s>",
+    }))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "mistral"}))
+
+    loaded = loader._load_mlx_tokenizer(tmp_path)
+    assert loaded.backend_tokenizer.pre_tokenizer.__class__.__name__ == "Metaspace"
+    assert loaded.encode(text, add_special_tokens=False) == backend.encode(text).ids
+
+
 def test_model_type_lookup_never_builds_a_model_config(monkeypatch, tmp_path):
     """The recovery above must not reintroduce the validation this fix removes."""
     import transformers
