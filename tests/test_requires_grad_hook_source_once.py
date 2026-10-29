@@ -103,7 +103,6 @@ def test_source_read_once_per_forward(monkeypatch):
     trainable = sum(p.requires_grad for p in model.parameters())
     assert trainable == 32
     calls = _run(model, monkeypatch)
-    # Main reads the backbone forward once per trainable parameter: 33 reads here vs 5.
     assert calls == small_calls
     assert _hooked(small) == _hooked(model)
     assert _hooked(model) == [
@@ -114,8 +113,6 @@ def test_source_read_once_per_forward(monkeypatch):
 def test_instances_sharing_a_forward_get_the_same_targets(monkeypatch):
     model = _freeze_all_but_layers(_Twin())
     calls = _run(model, monkeypatch)
-    # Both backbones share one forward function: main reads it once per trainable parameter (8),
-    # plus the frontend probe's own reads.
     assert calls < sum(p.requires_grad for p in model.parameters())
     hooked = [name for name, _ in _hooked(model)]
     assert hooked == ["a.embed_tokens", "b.embed_tokens"]

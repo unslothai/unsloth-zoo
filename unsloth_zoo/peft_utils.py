@@ -752,8 +752,8 @@ def requires_grad_for_gradient_checkpointing(model):
     def collect_hook_targets():
         hook_targets = OrderedDict()
         fallback_targets = OrderedDict()
-        # Every LoRA weight of a layer walks up to the same few ancestors, so read each
-        # forward's source once per call. Keyed by id(function); the entry keeps it alive.
+        # id(forward) -> (forward, source): every LoRA weight walks up to the same ancestors.
+        # Holding the function keeps its id from being reused within this call.
         forward_sources = {}
 
         for name, param in model.named_parameters():
@@ -779,19 +779,14 @@ def requires_grad_for_gradient_checkpointing(model):
                 fallback_name   = name_pre
                 fallback_module = module
                 if hasattr(module, "forward"):
-                    try:
-                        forward_function = module.forward
-                        forward_function = getattr(forward_function, "__func__", forward_function)
-                    except:
-                        forward_function = None
-                    cached = forward_sources.get(id(forward_function), None)
-                    if forward_function is not None and cached is not None and cached[0] is forward_function:
-                        forward = cached[1]
-                    else:
-                        try: forward = inspect.getsource(module.forward)
-                        except: forward = None
-                        if forward_function is not None:
-                            forward_sources[id(forward_function)] = (forward_function, forward)
+                    forward_function = module.forward
+                    forward_function = getattr(forward_function, "__func__", forward_function)
+                    cached = forward_sources.get(id(forward_function))
+                    if cached is None:
+                        try: source = inspect.getsource(module.forward)
+                        except: source = None
+                        cached = forward_sources[id(forward_function)] = (forward_function, source)
+                    forward = cached[1]
                     if forward is None: continue
 
                     # Normal self.language_model(...)
