@@ -156,9 +156,7 @@ def test_compile_on_another_thread_uses_the_values():
 
 
 def test_checkpoint_recompute_on_device_thread_compiles_with_the_values(monkeypatch):
-    # On CUDA, CheckpointFunction.backward runs on autograd's device thread, in a fresh context:
-    # torch enters the caller's context only for AOT compiled backwards, never for this PyNode.
-    # On CPU backward runs on the caller, so run that body on a fresh thread to get the same view.
+    # On CUDA checkpoint backward runs on autograd's device thread; emulate it on CPU with a fresh thread.
     original = checkpoint_module.CheckpointFunction.backward
 
     def device_thread_backward(ctx, *grads):
@@ -234,8 +232,7 @@ def test_publish_existing_value_and_unknown_keys():
 
 
 def test_config_hash_matches_across_threads():
-    # The FX graph cache keys on save_config_portable(): both threads must export the same values.
-    # (get_hash() is not compared: it reprs object-valued entries by address, per thread.)
+    # FX graph cache keys on save_config_portable(); get_hash() reprs objects by address, so not compared.
     set_torch_config(inductor_config, "memory_planning", True)
     set_torch_config(dynamo_config, _LIMIT, 1031)
     main = inductor_config.save_config_portable() if hasattr(inductor_config, "save_config_portable") else None

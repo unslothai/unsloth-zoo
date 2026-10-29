@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Torch config writes that every thread sees.
-
-torch >= 2.12 keeps `torch._inductor.config.X = Y` (and the dynamo / functorch /
-compiler configs) in a per-thread ContextVar, so a value set at import is lost on
-autograd's device thread. A reentrant checkpoint's recompute runs there, and so do
-the compiles it triggers (the grad-mode graph and its lazily compiled backward).
-`env_value_default` is a plain attribute read by every thread that has no
-assignment of its own, so it is published there too.
-"""
+"""torch >= 2.12 keeps torch config assignments per thread (ContextVar), so values set at import are
+lost on autograd's device thread (reentrant checkpoint recompute + its compiles). Publish them to all threads."""
 
 __all__ = [
     "set_torch_config",
@@ -33,7 +26,6 @@ __all__ = [
 import sys
 from contextvars import ContextVar
 
-# ContextVars that cache the config hash / dict per thread (torch >= 2.13).
 _CACHE_VARS = (
     ("_hash_dirty_var", True),
     ("_hash_cache_var", None),
@@ -59,7 +51,6 @@ def torch_config_is_per_thread(config_module, name = None):
 
 
 def _invalidate_caches(config_module):
-    # Every thread must rehash: fresh ContextVars start dirty in all of them.
     if hasattr(config_module, "_is_dirty"):
         config_module._is_dirty = True  # torch 2.12: one shared hash cache
     module_name = getattr(config_module, "__name__", "torch_config")
@@ -74,8 +65,7 @@ def _publish(config_module, name, value, force, depth = 0):
         return False
     alias = getattr(entry, "alias", None)
     if alias is not None:
-        # An alias writes its target: a plain module attribute (shared already) or another
-        # per-thread entry (e.g. dynamo cache_size_limit -> recompile_limit), published there.
+        # e.g. dynamo cache_size_limit -> recompile_limit: publish on the target entry.
         module_name, _, target = alias.rpartition(".")
         target_module = sys.modules.get(module_name)
         if target_module is None or depth > 4:
@@ -90,24 +80,16 @@ def _publish(config_module, name, value, force, depth = 0):
 
 
 def publish_torch_config(config_module, name, force = False):
-    """Make the current thread's value of `config_module.name` the value of every thread.
+    """Publish this thread's `config_module.name` to every thread; False if already shared or missing.
 
-    force = False writes `env_value_default`: threads without an assignment of their own
-    (autograd device threads, new threads) read it, and `config.patch` still wins.
-    force = True writes `env_value_force`, which wins over every thread's assignment and
-    over `config.patch`. Returns True when the value was published, False on torch builds
-    whose config is shared by all threads already (nothing to do) or that lack the entry.
-    """
+    force = True also overrides other threads' assignments and `config.patch`."""
     if _entry(config_module, name) is None:
         return False
     return _publish(config_module, name, getattr(config_module, name), force)
 
 
 def set_torch_config(config_module, name, value, force = False):
-    """`setattr(config_module, name, value)` for every thread, not only the current one.
-
-    No-op beyond the plain assignment on torch < 2.12, where it is already global.
-    """
+    """`setattr(config_module, name, value)` for every thread."""
     setattr(config_module, name, value)
     _publish(config_module, name, value, force)
     return value
