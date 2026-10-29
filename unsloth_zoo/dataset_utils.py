@@ -3137,7 +3137,6 @@ def sft_prepare_dataset(
                 return _messages_result(input_ids, masks, labels)
 
             def _tokenize_messages_rows(rows):
-                # Rows with per-row tools / template kwargs go row by row.
                 batch_rows, batch_messages = [], []
                 if _batch_chat_template:
                     for i, row in enumerate(rows):

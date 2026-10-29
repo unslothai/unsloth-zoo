@@ -35,7 +35,7 @@ TOOLS = [{"type": "function", "function": {"name": "mul", "description": "Multip
 def _tokenizer():
     try:
         return transformers.AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
-    except Exception as e:  # offline runner
+    except Exception as e:
         pytest.skip(reason = f"offline runner, tokenizer download failed: {e}")
 
 
