@@ -422,4 +422,3 @@ def flash_attention_left_padded(
 
     attn_output = attn_output.contiguous()
     return attn_output
-pass

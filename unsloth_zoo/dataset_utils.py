@@ -50,6 +50,7 @@ def _longest_common_sublist(lists):
         """Return (exists, sublist) for a common sublist of `length`."""
         common = set()
         first = lists[0]
+        # All sublists of `length` from the first list
         for i in range(len(first) - length + 1):
             sub = tuple(first[i:i + length])
             common.add(sub)
@@ -115,8 +116,6 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
                 x = left*"\n" + stripped + right*"\n"
                 x = tokenizer(x, add_special_tokens = False).input_ids
                 all_input_ids.append(x)
-            pass
-        pass
     else:
         x = tokenizer(component, add_special_tokens = False).input_ids
         all_input_ids.append(x)
@@ -124,15 +123,17 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 
     substring = _longest_common_sublist([x + [0] for x in all_input_ids])
 
-    # substring == [0] may be just the original single token; fixes unsloth issue 1290, as Mistral [INST] [/INST]
-    # singular tokens break when [0] is output but [3] [4] are needed.
+    # substring == [0] may just be the original single token.
+    # Fixes https://github.com/unslothai/unsloth/issues/1290
+    # Mistral [INST] [/INST] singular tokens break since we output [0] but need [3] [4].
     if substring == [0] and len(all_input_ids[0]) == 1:
         single_token = all_input_ids[0][0]
         if all(single_token in x for x in all_input_ids):
             substring = [single_token]
     pass
 
-    # If substring is the original input_ids plus [0], keep the original; this happens when the chat template uses no newlines or spaces (e.g. Phi-4).
+    # If substring is original input_ids + [0], keep the original. Happens when
+    # the chat template uses no newlines/spaces (e.g. Phi-4).
     if (len(set(str(x) for x in all_input_ids)) == 1) and \
         (len(all_input_ids[0]) + 1 == len(substring)) and \
         (all_input_ids[0] == substring[:-1]):
@@ -140,8 +141,10 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         substring = all_input_ids[0]
     pass
 
-    # Recovers optional left/right tokens around the core; substring has an appended [0] sentinel, so track the match
-    # index explicitly, since fall-through sliced the last index or left j unbound on an empty tokenization.
+    # Recover optional left/right tokens around the matched core. `substring` carries
+    # an appended [0] sentinel, so it need not be a sublist of `original`; track the
+    # match index explicitly rather than letting the loop fall through (which sliced
+    # at the last index, or left `j` unbound on an empty tokenization).
     original = tokenizer(component, add_special_tokens = False).input_ids
     where = -1
     for j in range(len(original)):
@@ -149,14 +152,20 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
             where = j
             break
     if where == -1:
-        # A core never located in the component's tokenization may be the bare [0] sentinel or a token with it glued on
-        # (Phi-3); returning it matches every <unk>/<pad>/'!' or masks the whole dataset, so report no core; only
-        # force_match = False reaches this.
+        # The core was never located in the component's own tokenization, so it was
+        # never verified against real tokenizer output. It can be the bare [0]
+        # sentinel, or a real token with that sentinel glued on (Phi-3 gives
+        # [32010, 0] for a marker that tokenizes to [32010]). Returning it either
+        # makes A_first == 0 and matches every <unk>/<pad>/"!" in the corpus, or
+        # matches nothing and masks the whole dataset. Report no core instead, which
+        # both empty-core guards downstream already handle. Only force_match = False
+        # gets here: with force_match = True the core is the component's own
+        # tokenization, so it is always located at index 0.
         return [], [], []
     optional_left  = original[:where]
     optional_right = original[where+len(substring):]
-    # Plain-text marker edges can BPE-merge into the next message (aya-vision-32b), so they are optional only while an
-    # added token anchors the core, since an optional Q: edge would strip to Q and hit user text.
+    # Plain-text marker edges can BPE-merge with the next message (aya-vision-32b: ">" + "\\sigma" -> ">\\"),
+    # so make them optional, but only while an added token anchors the core: "Q:" -> "Q" hits user text.
     start, end = _stable_marker_edges(component, original, tokenizer)
     new_start, new_end = max(where, start), min(where + len(substring), end)
     if new_end > new_start and (new_start, new_end) != (where, where + len(substring)):
@@ -451,7 +460,8 @@ def _labels_are_token_level(dataset, sample):
     # No usable features: an in-memory dict-of-lists, or an IterableDataset.
     value = sample.get("labels") if isinstance(sample, dict) else None
     if value is None:
-        # Scan for the first non-null row, capped so a streaming or huge split is not walked end to end for a column verdict.
+        # Scan for the first non-null row, capped so a streaming or huge split
+        # is not walked end to end for a column verdict.
         try:
             for i, row in enumerate(dataset):
                 if i >= 100: break
@@ -460,7 +470,8 @@ def _labels_are_token_level(dataset, sample):
                 if value is not None: break
         except Exception: value = None
     if value is None: return None
-    # A string or bytes labels value is a class name, not tokens, so it can never be supervision and goes with the other raw columns.
+    # A string/bytes `labels` is a class NAME, not tokens; it can never be
+    # supervision, so it goes with the other raw columns.
     if isinstance(value, (str, bytes)): return False
     try:
         len(value)
@@ -555,8 +566,9 @@ def _keep_media_columns(trainer, keys):
         pass
 
 
-# A missing suffix silently trains a VLM row as text, so cover modern web formats (.avif, what most image CDNs serve
-# now) and the older spellings of the existing ones.
+# Every suffix a missing entry costs is a VLM row silently trained as text,
+# so cover the modern web formats too (`.avif` is what most image CDNs serve
+# now) and the older spellings of the ones already here.
 _MEDIA_SUFFIXES = (
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".gif", ".bmp", ".dib",
     ".webp", ".avif", ".tif", ".tiff", ".svg", ".heic", ".heif", ".heics",
@@ -585,8 +597,9 @@ def _looks_like_media_value(value, _depth = 0):
     return text.endswith(_MEDIA_SUFFIXES)
 
 
-# Raw prose kept beside media for the vision collator, which still reads these columns; tokenizer outputs live in
-# _TEXT_COLUMNS, and an image kept without its prompt left nothing to tokenize.
+# The prose that goes WITH the media. Tokenizer outputs live in `_TEXT_COLUMNS`;
+# these are the raw columns a vision collator still has to read, and a keep-list
+# that held the image but not its prompt left that collator nothing to tokenize.
 _RAW_TEXT_COMPANION_COLUMNS = frozenset((
     "text", "texts", "prompt", "prompts", "question", "questions",
     "caption", "captions", "instruction", "instructions", "input", "inputs",
@@ -622,18 +635,24 @@ class _MediaAwareCollator:
                  companion_keys = ()):
         self.text = text
         self.media = media
-        # Kept for the media collator and stripped on the text path (it cannot tensorize a raw string); lowercased
-        # because _keep tests key.lower(), since a mixed-case dataset_text_field such as Body never matched, so its raw
-        # string reached DataCollatorForSeq2Seq and crashed it.
+        # Kept so the media collator can read the prompt beside its image, and
+        # stripped again on the text path, which cannot tensorize a raw string.
+        # Lowercased: `_keep` below tests `key.lower()`, and unlike the other two
+        # sets this one carries the caller's own `dataset_text_field`. A
+        # mixed-case one (`Body`) never matched, so the raw string it names
+        # survived into a text batch and `DataCollatorForSeq2Seq` died on it.
         self.companion_keys = frozenset(
             k.lower() if isinstance(k, str) else k for k in companion_keys)
-        # Kept split, not merged: an ambiguous name is decided by its value, and folding the two would match url on the name alone.
+        # Split, not merged: an ambiguous name is decided by its value below,
+        # and folding the two would match `url` on the name alone.
         self.ambiguous_keys = frozenset(ambiguous_keys)
         self.media_keys = frozenset(media_keys) - self.ambiguous_keys
 
-    # Raw conversation columns hold images inside the value as typed parts, so no top-level key names them; route them
-    # to the media collator on the column's presence, since that collator handles this TRL format and the text one
-    # cannot.
+    # Raw conversational columns. Their images sit INSIDE the value, as
+    # `{"type": "image", ...}` parts, so no top-level key names them and a batch
+    # of them went to the text collator that cannot read the conversation at all,
+    # let alone its images. Routed to the media collator on the column's
+    # presence: that collator handles this TRL format, and the text one cannot.
     _CONVERSATION_KEYS = frozenset((
         "messages", "conversations", "conversation", "chat",
     ))
@@ -644,8 +663,10 @@ class _MediaAwareCollator:
             for k in keys:
                 if not isinstance(k, str): continue
                 lowered = k.lower()
-                # An ambiguous name like path or url is judged by its value, as the initial-split guard does, since
-                # matching the name alone would send every plain-URL row to the vision collator.
+                # An ambiguous name is weighed by its VALUE, the same trade the
+                # initial-split guard makes: `path`/`url` is a media reference
+                # or ordinary provenance, and matching the name alone would send
+                # every row carrying a plain URL to the vision collator.
                 if lowered in self.ambiguous_keys:
                     if _looks_like_media_value(feature.get(k)): return True
                     continue
@@ -657,9 +678,21 @@ class _MediaAwareCollator:
     def __call__(self, features):
         if self._has_media(features):
             return self.media(features)
-        # Strips media-only keys on copies, not in the keep-list: the media path needs them and only this point knows
-        # the path a batch took; ambiguous and companion names by value (only a raw string breaks the text collator);
-        # media names on sight; a number or tensor under output or content stays.
+        # Strip what only the MEDIA path wanted kept. The signature whitelist is
+        # global, so a benign `url`/`path`/`prompt`/`content` column now survives
+        # unused-column removal for every split -- and the text collator
+        # tensorizes every key it is handed, so a retained string kills the
+        # batch. Removed here, not from the keep-list: the media path still
+        # needs those columns, and this is the only point that knows which path
+        # a batch took. Copies, so the caller's rows are left alone.
+        # By VALUE for the ambiguous and companion names, not by name alone. Both
+        # sets are ordinary English words, so under `remove_unused_columns=False`
+        # a caller's tensorizable auxiliary input called `output` or `content`
+        # was dropped from every text batch and its custom `compute_loss` never
+        # saw it. What the text collator cannot stack is a raw STRING; a number
+        # or a tensor under the same name is a model input and stays.
+        # The media names go on sight: they are never model inputs, and a text
+        # batch is one `_has_media` already declined to call multimodal.
         maybe = self.ambiguous_keys | self.companion_keys
         def _keep(key, value):
             if not isinstance(key, str): return True
@@ -674,7 +707,8 @@ class _MediaAwareCollator:
         return self.text(stripped)
 
     def __getattr__(self, attribute):
-        # Only for names this class does not define; text is set in __init__, so the lookup cannot recurse through it.
+        # Only for names this class does not define; `text` is set in __init__,
+        # so this cannot recurse through it.
         if attribute.startswith("__"): raise AttributeError(attribute)
         return getattr(self.__dict__["text"], attribute)
 pass
@@ -1910,6 +1944,22 @@ def train_on_responses_only(
         return views
     pass
 
+    # Scan once per split (`_collatable` asks twice); holding the dataset pins its id.
+    _split_views_memo = {}
+    _split_views_uncached = _split_views
+
+    def _split_views(dataset):
+        hit = _split_views_memo.get(id(dataset))
+        if hit is None or hit[0] is not dataset:
+            try:
+                hit = (dataset, _split_views_uncached(dataset), None)
+            except Exception as exc:
+                hit = (dataset, None, exc)
+            _split_views_memo[id(dataset)] = hit
+        if hit[2] is not None: raise hit[2]
+        return hit[1]
+    pass
+
     def _dataset_is_pretokenized(dataset):
         """True when rows carry `input_ids` and nothing but plain text beside them,
         i.e. text tokenized up front where dataset-level masking is correct.
@@ -2449,7 +2499,8 @@ def standardize_data_formats(
     import collections
     import itertools
 
-    # VLMs need list-valued content, like [{"type": "text", "text": ...}], while text models use a plain string.
+    # VLMs need list-valued content ([{"type": "text", "text": ...}]); text
+    # models use a plain string.
     is_vlm = False
     if tokenizer is not None:
         if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
@@ -2477,7 +2528,8 @@ def standardize_data_formats(
         for alias in (aliases_for_system + aliases_for_user + aliases_for_assistant)
     )
 
-    # The cardinality heuristic ties on small datasets and may pick the content column wrongly, and the alias check then rejects the user's own text.
+    # The cardinality heuristic below ties on small datasets, picks the content column, and
+    # the alias check then rejects the user's own text.
     alias_keys = [
         key for key in keys
         if set(_normalize_role_alias(value) for value in uniques[key]) <= all_aliases
@@ -2514,7 +2566,8 @@ def standardize_data_formats(
         )
     pass
 
-    # Normalising can collapse two aliases the caller meant apart (Human for user, human for assistant), silently relabelling messages, so refuse instead.
+    # Normalization can collapse two aliases the caller meant to keep apart ("Human" for
+    # user, "human" for assistant), silently relabelling every such message. Refuse instead.
     aliases_mapping = {}
     for group, role in (
         (aliases_for_system, "system"),
@@ -2533,8 +2586,8 @@ def standardize_data_formats(
                 )
             aliases_mapping[key] = role
 
-    # Normalise only on a memo miss and memoise the spelling this dataset uses; the memo is capped by _ALIAS_MEMO_LIMIT
-    # so a pathological dataset cannot grow it without limit.
+    # Normalise only on a miss and memoise the spelling this dataset uses, capped so a
+    # pathological dataset cannot grow the dict without limit.
     _ALIAS_MEMO_LIMIT = 64
 
     def _standardize_dataset(examples):
@@ -2568,8 +2621,10 @@ def standardize_data_formats(
     }
 
     if not isinstance(dataset, IterableDataset):
-        # One policy lives in get_dataset_num_proc; the old local copy read stdlib multiprocessing's start method, not
-        # datasets' multiprocess, and fell back to 1 under memory pressure (a Pool(1) on datasets >= 4.1).
+        # One policy, one place. The copy that used to live here read stdlib
+        # multiprocessing's start method while datasets uses multiprocess, and it
+        # fell back to num_proc = 1 under memory pressure -- which is a Pool(1)
+        # on datasets >= 4.1, the pool this exists to avoid.
         from .dataset_num_proc import get_dataset_num_proc
         dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
@@ -2622,6 +2677,54 @@ def trl_collator_ignores_labels(collator = None):
     return collator is None or isinstance(collator, _TRLCollator)
 pass
 
+def _chat_template_batches_like_rows(processing_class):
+    # Processors and other backends (mistral-common) may not batch like one call per row.
+    try:
+        from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+    except Exception:
+        return False
+    return isinstance(processing_class, (PreTrainedTokenizer, PreTrainedTokenizerFast))
+pass
+
+
+def _is_conversation(messages):
+    # apply_chat_template reads a list whose first item is a list as a batch.
+    return isinstance(messages, list) and len(messages) != 0 and all(isinstance(m, dict) for m in messages)
+pass
+
+
+def _batched_columns(dataset):
+    # Batch columns hold the same Python values as one-row reads only with no output format;
+    # an IterableDataset runs lazily in training, so it stays row by row.
+    return isinstance(dataset, Dataset) and getattr(dataset, "format", {}).get("type", None) is None
+pass
+
+
+def _check_batch_lengths(batch_rows, *columns):
+    for column in columns:
+        if len(column) != len(batch_rows):
+            raise ValueError("Unsloth: batched chat template returned a different number of rows")
+pass
+
+
+def _batched_rows(tokenize_row, tokenize_rows):
+    # Any error in the batched pass reruns the batch row by row, so the raised error is main's.
+    def tokenize_batch(batch):
+        columns = list(batch.keys())
+        n = len(batch[columns[0]]) if columns else 0
+        rows = [{column: batch[column][i] for column in columns} for i in range(n)]
+        try:
+            results = tokenize_rows(rows)
+        except Exception:
+            results = [tokenize_row(row) for row in rows]
+        if not results:
+            return {}
+        return {key: [result[key] for result in results] for key in results[0]}
+    return tokenize_batch
+pass
+
+
+# Faster SFTTrainer prepare_dataset
 def sft_prepare_dataset(
     self,
     dataset: Union[Dataset, IterableDataset],
@@ -2639,6 +2742,8 @@ def sft_prepare_dataset(
 
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
+    # Imported here: this function's source is copied into the compiled trainer module.
+    from unsloth_zoo.dataset_utils import _batched_columns
     is_vlm = hasattr(processing_class, "tokenizer")
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
@@ -2842,11 +2947,41 @@ def sft_prepare_dataset(
                 )
             if assistant_only_loss:
                 used_column_names.append("assistant_masks")
+            from unsloth_zoo.dataset_utils import (
+                _chat_template_batches_like_rows, _is_conversation, _batched_rows, _check_batch_lengths,
+            )
+            _batch_map = _batched_columns(dataset)
+            _batch_chat_template = not is_vlm and _chat_template_batches_like_rows(processing_class)
+            _shared_template_kwargs = {}
+            if training_chat_template is not None:
+                _shared_template_kwargs["chat_template"] = training_chat_template
 
         if do_prompt_completion:
             _eos_token = getattr(tokenizer, 'eos_token', None)
 
+            def _pc_completion(example):
+                _completion = example["completion"]
+                if _eos_token and not _completion.endswith(_eos_token):
+                    _completion = _completion + _eos_token
+                return _completion
+
+            def _pc_result(prompt_ids, pc_ids, pc_masks, labels):
+                n_prompt = min(len(prompt_ids), len(pc_ids))
+                completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
+                result = {"input_ids": pc_ids, "completion_mask": completion_mask}
+                if assistant_only_loss:
+                    if marker_masks:
+                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                    else:
+                        result["assistant_masks"] = list(pc_masks)
+                if do_truncation and max_seq_length > 0:
+                    result = {k: v[:max_seq_length] for k, v in result.items()}
+                if _needs_token_type_ids:
+                    result["token_type_ids"] = [0] * len(result["input_ids"])
+                return result
+
             def _tokenize_pc(example):
+                pc_masks = None
                 if _is_conv:
                     template_kwargs = dict(example.get("chat_template_kwargs") or {})
                     if training_chat_template is not None:
@@ -2869,10 +3004,10 @@ def sft_prepare_dataset(
                     if isinstance(pc_processed.get("input_ids", [None])[0], list):
                         pc_processed = {k: v[0] for k, v in pc_processed.items()}
                     pc_ids = pc_processed["input_ids"]
+                    if assistant_only_loss and not marker_masks:
+                        pc_masks = pc_processed["assistant_masks"]
                 else:
-                    _completion = example["completion"]
-                    if _eos_token and not _completion.endswith(_eos_token):
-                        _completion = _completion + _eos_token
+                    _completion = _pc_completion(example)
                     prompt_ids = tokenizer(
                         example["prompt"], add_special_tokens=add_special_tokens,
                     )["input_ids"]
@@ -2880,20 +3015,57 @@ def sft_prepare_dataset(
                         example["prompt"] + _completion,
                         add_special_tokens=add_special_tokens,
                     )["input_ids"]
-                n_prompt = min(len(prompt_ids), len(pc_ids))
-                completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
-                result = {"input_ids": pc_ids, "completion_mask": completion_mask}
-                if assistant_only_loss:
-                    if marker_masks:
-                        labels = response_labels({"input_ids": [pc_ids]})["labels"][0]
-                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                labels = None
+                if assistant_only_loss and marker_masks:
+                    labels = response_labels({"input_ids": [pc_ids]})["labels"][0]
+                return _pc_result(prompt_ids, pc_ids, pc_masks, labels)
+
+            def _tokenize_pc_rows(rows):
+                # Rows with per-row tools / template kwargs go row by row.
+                if _is_conv:
+                    batch_rows = [
+                        i for i, row in enumerate(rows)
+                        if _batch_chat_template and row.get("tools") is None and not row.get("chat_template_kwargs")
+                        and _is_conversation(row["prompt"]) and _is_conversation(row["prompt"] + row["completion"])
+                    ]
+                else:
+                    batch_rows = list(range(len(rows)))
+                results = [None] * len(rows)
+                if batch_rows:
+                    if _is_conv:
+                        prompt_ids = processing_class.apply_chat_template(
+                            [rows[i]["prompt"] for i in batch_rows], tokenize=True,
+                            add_generation_prompt=True, return_dict=False, tools=None,
+                            **_shared_template_kwargs,
+                        )
+                        pc_processed = processing_class.apply_chat_template(
+                            [rows[i]["prompt"] + rows[i]["completion"] for i in batch_rows],
+                            return_dict=True, tokenize=True,
+                            return_assistant_tokens_mask=assistant_only_loss and not marker_masks, tools=None,
+                            **_shared_template_kwargs,
+                        )
+                        pc_ids = pc_processed["input_ids"]
+                        pc_masks = pc_processed["assistant_masks"] if assistant_only_loss and not marker_masks \
+                            else [None] * len(batch_rows)
                     else:
-                        result["assistant_masks"] = list(pc_processed["assistant_masks"])
-                if do_truncation and max_seq_length > 0:
-                    result = {k: v[:max_seq_length] for k, v in result.items()}
-                if _needs_token_type_ids:
-                    result["token_type_ids"] = [0] * len(result["input_ids"])
-                return result
+                        prompt_ids = tokenizer(
+                            [rows[i]["prompt"] for i in batch_rows], add_special_tokens=add_special_tokens,
+                        )["input_ids"]
+                        pc_ids = tokenizer(
+                            [rows[i]["prompt"] + _pc_completion(rows[i]) for i in batch_rows],
+                            add_special_tokens=add_special_tokens,
+                        )["input_ids"]
+                        pc_masks = [None] * len(batch_rows)
+                    _check_batch_lengths(batch_rows, prompt_ids, pc_ids, pc_masks)
+                    labels = [None] * len(batch_rows)
+                    if assistant_only_loss and marker_masks:
+                        labels = response_labels({"input_ids": pc_ids})["labels"]
+                    for j, i in enumerate(batch_rows):
+                        results[i] = _pc_result(prompt_ids[j], pc_ids[j], pc_masks[j], labels[j])
+                for i, row in enumerate(rows):
+                    if results[i] is None:
+                        results[i] = _tokenize_pc(row)
+                return results
 
             if use_desc:
                 map_kwargs["desc"] = 'Unsloth: Tokenizing ["prompt"+"completion"]'
@@ -2901,7 +3073,8 @@ def sft_prepare_dataset(
             with _w.catch_warnings():
                 _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
                 dataset = dataset.map(
-                    _tokenize_pc, batched=False,
+                    _batched_rows(_tokenize_pc, _tokenize_pc_rows) if _batch_map else _tokenize_pc,
+                    batched=_batch_map,
                     remove_columns=list(column_names), **map_kwargs,
                 )
             if assistant_only_loss:
@@ -2910,8 +3083,22 @@ def sft_prepare_dataset(
                 if pc_completion_only is None:
                     pc_completion_only = getattr(args, "completion_only_loss", None)
                 if pc_completion_only is None or pc_completion_only:
+                    if _batched_columns(dataset):
+                        dataset = dataset.filter(
+                            lambda assistant_masks, completion_mask: [
+                                any(a and c for a, c in zip(row_a, row_c))
+                                for row_a, row_c in zip(assistant_masks, completion_mask)
+                            ],
+                            batched = True, input_columns = ["assistant_masks", "completion_mask"],
+                        )
+                    else:
+                        dataset = dataset.filter(
+                            lambda row: any(a and c for a, c in zip(row["assistant_masks"], row["completion_mask"]))
+                        )
+                elif _batched_columns(dataset):
                     dataset = dataset.filter(
-                        lambda row: any(a and c for a, c in zip(row["assistant_masks"], row["completion_mask"]))
+                        lambda assistant_masks: [any(row) for row in assistant_masks],
+                        batched = True, input_columns = ["assistant_masks"],
                     )
                 else:
                     dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
@@ -2920,10 +3107,7 @@ def sft_prepare_dataset(
                 not locals().get("_unsloth_wrapped_packing", False)
             message_cut = slice(-max_seq_length, None) if truncate_messages and \
                 getattr(args, "truncation_mode", "keep_start") == "keep_end" else slice(None, max_seq_length)
-            def _tokenize_messages(example):
-                template_kwargs = dict(example.get("chat_template_kwargs") or {})
-                if training_chat_template is not None:
-                    template_kwargs["chat_template"] = training_chat_template
+            def _clean_messages(example):
                 # Arrow fills missing keys with None, which `is defined` template checks then index.
                 messages = [
                     {k: v for k, v in message.items() if v is not None}
@@ -2937,6 +3121,26 @@ def sft_prepare_dataset(
                         if isinstance(message, dict) and isinstance(message.get("content"), str) else message
                         for message in messages
                     ]
+                return messages
+
+            def _messages_result(input_ids, masks, labels):
+                result = {"input_ids": list(input_ids)}
+                if assistant_only_loss:
+                    if marker_masks:
+                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                    else:
+                        result["assistant_masks"] = list(masks)
+                if truncate_messages:
+                    result = {k: v[message_cut] for k, v in result.items()}
+                if _needs_token_type_ids:
+                    result["token_type_ids"] = [0] * len(result["input_ids"])
+                return result
+
+            def _tokenize_messages(example):
+                template_kwargs = dict(example.get("chat_template_kwargs") or {})
+                if training_chat_template is not None:
+                    template_kwargs["chat_template"] = training_chat_template
+                messages = _clean_messages(example)
                 tools = example.get("tools")
                 if isinstance(tools, str):
                     import json as _json
@@ -2950,33 +3154,65 @@ def sft_prepare_dataset(
                 input_ids = processed["input_ids"]
                 if input_ids and isinstance(input_ids[0], list):
                     input_ids = input_ids[0]
-                result = {"input_ids": list(input_ids)}
+                masks = labels = None
                 if assistant_only_loss:
                     if marker_masks:
-                        labels = response_labels({"input_ids": [result["input_ids"]]})["labels"][0]
-                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                        labels = response_labels({"input_ids": [list(input_ids)]})["labels"][0]
                     else:
                         masks = processed["assistant_masks"]
                         if masks and isinstance(masks[0], list):
                             masks = masks[0]
-                        result["assistant_masks"] = list(masks)
-                if truncate_messages:
-                    result = {k: v[message_cut] for k, v in result.items()}
-                if _needs_token_type_ids:
-                    result["token_type_ids"] = [0] * len(result["input_ids"])
-                return result
+                return _messages_result(input_ids, masks, labels)
+
+            def _tokenize_messages_rows(rows):
+                batch_rows, batch_messages = [], []
+                if _batch_chat_template:
+                    for i, row in enumerate(rows):
+                        if row.get("tools") is None and not row.get("chat_template_kwargs"):
+                            messages = _clean_messages(row)
+                            if _is_conversation(messages):
+                                batch_rows.append(i)
+                                batch_messages.append(messages)
+                results = [None] * len(rows)
+                if batch_rows:
+                    processed = processing_class.apply_chat_template(
+                        batch_messages, tools = None,
+                        tokenize = True, return_dict = True,
+                        return_assistant_tokens_mask = assistant_only_loss and not marker_masks,
+                        **_shared_template_kwargs,
+                    )
+                    input_ids = [list(x) for x in processed["input_ids"]]
+                    masks = processed["assistant_masks"] if assistant_only_loss and not marker_masks \
+                        else [None] * len(batch_rows)
+                    _check_batch_lengths(batch_rows, input_ids, masks)
+                    labels = [None] * len(batch_rows)
+                    if assistant_only_loss and marker_masks:
+                        labels = response_labels({"input_ids": input_ids})["labels"]
+                    for j, i in enumerate(batch_rows):
+                        results[i] = _messages_result(input_ids[j], masks[j], labels[j])
+                for i, row in enumerate(rows):
+                    if results[i] is None:
+                        results[i] = _tokenize_messages(row)
+                return results
 
             if use_desc: map_kwargs["desc"] = 'Unsloth: Tokenizing ["messages"]'
             import warnings as _w
             with _w.catch_warnings():
                 _w.filterwarnings("ignore", message = ".*couldn't be hashed properly.*")
                 dataset = dataset.map(
-                    _tokenize_messages, batched=False,
+                    _batched_rows(_tokenize_messages, _tokenize_messages_rows) if _batch_map else _tokenize_messages,
+                    batched=_batch_map,
                     remove_columns=list(column_names), **map_kwargs,
                 )
             if assistant_only_loss:
                 # Truncation can drop every assistant token; such a row has no target.
-                dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
+                if _batched_columns(dataset):
+                    dataset = dataset.filter(
+                        lambda assistant_masks: [any(row) for row in assistant_masks],
+                        batched = True, input_columns = ["assistant_masks"],
+                    )
+                else:
+                    dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
         else:
             if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
             import warnings as _w
@@ -3008,7 +3244,14 @@ def sft_prepare_dataset(
             def _build_labels(example):
                 masks = [example[x] for x in mask_columns]
                 return {"labels": [t if all(m) else -100 for t, *m in zip(example["input_ids"], *masks)]}
+            def _build_labels_batched(batch):
+                return {"labels": [
+                    [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
+                    for input_ids, *masks in zip(batch["input_ids"], *(batch[x] for x in mask_columns))
+                ]}
             label_kwargs = {}
+            if _batched_columns(dataset):
+                label_kwargs["batched"] = True
             if isinstance(dataset, Dataset):
                 label_kwargs["num_proc"] = map_kwargs.get("num_proc", None)
                 label_kwargs["desc"] = f"Unsloth: Building labels for {dataset_name} dataset"
@@ -3024,7 +3267,10 @@ def sft_prepare_dataset(
                     collator = frame.f_locals.get("data_collator")
                 del frame
             keep_masks = keep_masks and trl_collator_ignores_labels(collator)
-            dataset = dataset.map(_build_labels, remove_columns = [] if keep_masks else mask_columns, **label_kwargs)
+            dataset = dataset.map(
+                _build_labels_batched if label_kwargs.get("batched") else _build_labels,
+                remove_columns = [] if keep_masks else mask_columns, **label_kwargs,
+            )
             if not keep_masks:
                 used_column_names = [x for x in used_column_names if x not in mask_columns]
             used_column_names = used_column_names + ["labels"]
@@ -3074,7 +3320,6 @@ def patch_torchcodec_audio_decoder():
         )
     except (ImportError, AttributeError, RuntimeError):
         pass  # torchcodec not available or different datasets version
-pass
 
 
 # Unsloth Zoo - Utilities for Unsloth

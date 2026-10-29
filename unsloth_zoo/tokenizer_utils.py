@@ -294,7 +294,6 @@ def add_new_tokens(
             with torch.no_grad():
                 embedding_matrix[old_length+j] = mean_embedding_token
                 lm_head_matrix  [old_length+j] = mean_lm_head_token
-        pass
     else:
         # Set only the new rows [old_length:new_vocab_length] to the mean; rows past new_vocab_length are the model's
         # alignment padding and must stay as shipped (the old [old_length:] slice overwrote them too)
@@ -928,7 +927,6 @@ def patch_processor_call(processor):
 
     processor._unsloth_patched_call = True
     return processor
-pass
 
 
 # Unsloth Zoo - Utilities for Unsloth

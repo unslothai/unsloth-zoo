@@ -99,7 +99,6 @@ def Version(version):
             f"Unsloth: Could not get version for `{version}`\n"\
             f"File name = [{caller.filename}] Line number = [{caller.lineno}]"
         )
-    pass
 pass
 
 
