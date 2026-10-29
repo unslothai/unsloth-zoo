@@ -2707,7 +2707,7 @@ def _config_source_has_modality(package_dir: Path) -> bool:
             }
             if fields.intersection(_VLM_MODALITY_CONFIG_FIELDS):
                 return True
-            # Assigned to self at init from a checkpoint's own layout, as LFM3-Audio's audio_encoder_config.
+            # Built in __post_init__, as LFM3-Audio's audio_encoder_config.
             for item in ast.walk(node):
                 if isinstance(item, ast.Assign) and not (isinstance(item.value, ast.Constant) and item.value.value is None):
                     for target in item.targets:

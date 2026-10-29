@@ -7173,9 +7173,7 @@ class _AudioVersions(NamedTuple):
 # sanitize source, and Nemotron's `Model.sanitize` delegates to a module-level
 # function carrying neither.
 #
-# LFM3 Audio / Omni were measured on 0.7.11 against LiquidAI/LFM3-Audio-2B and
-# LFM3-Omni-2B: placeholder count vs `audio_tower` positions at 0.5s/1.0s/2.0s/3.7s,
-# two clips giving two losses. Their processor takes no truncation keywords.
+# LFM3 Audio / Omni: measured on 0.7.11 against LiquidAI/LFM3-Audio-2B and LFM3-Omni-2B.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4"),
     "gemma4": _AudioVersions("0.6.2"),
