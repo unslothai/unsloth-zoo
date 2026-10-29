@@ -1605,7 +1605,7 @@ def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
     elif reason in ("verified", "relinear"):   # exact_batch_invariant_decode's class already over the forward
         native = type(forward)
         methods = (getattr(native, name, None) for name in decode._VERIFY_METHODS)
-        verified = decode._exact_verify_class(native, "__call__", False, *methods)
+        verified = decode._exact_verify_class(native, "qwen4_exp", *methods)
         if reason == "relinear":   # a class under that one decorating its `_linear`
             sliced = verified._linear
             verified = type("Scaled", (verified,), {

@@ -29,6 +29,8 @@ import os
 import re
 import sys
 import time
+import weakref
+from contextlib import nullcontext
 from collections import deque
 from dataclasses import dataclass, field, replace
 from itertools import combinations
@@ -131,14 +133,16 @@ class RoundPlan:
     """A plain window of ``length`` steps, or one verify round over ``rows``.
 
     ``split`` asks the engine to evaluate drafts and catch-up before building the verify, so
-    the round's components can be timed apart. ``trim`` asks the controller to choose the
-    verified prefix from the drafter's confidences.
+    the round's components can be timed apart. A nonzero ``controller_depth`` marks a round
+    drafted deeper than planned; acceptance learns only through that depth. ``trim`` asks
+    the controller to choose the verified prefix from the drafter's confidences.
     """
 
     kind: Literal["plain", "round"]
     length: int = 0
     rows: tuple[RowPlan, ...] = ()
     split: bool = False
+    controller_depth: int = 0
     trim: bool = False
 
     @property
@@ -260,10 +264,11 @@ class _Calibration:
     _RECORDS = 256
     _REFIT_EVERY = 8
 
-    def __init__(self, depth: int):
+    def __init__(self, depth: int, trained: int | None = None):
         self.alpha, self.beta = [0.0] * depth, [1.0] * depth
         self._records = [deque(maxlen = self._RECORDS) for _ in range(depth)]
         self._rounds = 0
+        self._trained = depth if trained is None else trained
 
     @staticmethod
     def _logit(p: float) -> float:
@@ -291,6 +296,13 @@ class _Calibration:
         if self._rounds % self._REFIT_EVERY == 0 and any(self._records):
             self.alpha, slope = _logistic_fit(self._records, self.alpha, self.beta[0])
             self.beta = [slope] * len(self.beta)
+            # An unreached position past the trained depth takes the deepest reached offset, not the identity prior.
+            reached = 0.0
+            for position, records in enumerate(self._records):
+                if records:
+                    reached = self.alpha[position]
+                elif position >= self._trained:
+                    self.alpha[position] = reached
 
 
 def _logistic_fit(records, alpha, beta):
@@ -443,6 +455,20 @@ class DraftController:
         self.draft_cost = {depth: _Ema() for depth in range(1, self.max_depth + 1)}
         self.catch_up_cost = _Ema()
         self.hidden_drafting: dict[int, _Ema] = {}
+        # Rounds the engine drafted past the planned depth: their seconds, emitted tokens, and the tokens the planned depth would have emitted.
+        self.deepened_cost, self.deepened_emitted, self.deepened_planned = _Ema(), _Ema(), _Ema()
+        # Trimmed deepened rounds: the trim's regular choice and its cycle seconds, the counterfactual the gate compares.
+        self.deepened_reference = _Ema()
+        self._deepened_baseline: tuple[int, float] | None = None
+        self._deepened_pending: tuple[int, int] | None = None
+        # While deepening loses: the load's token count at which to retry it, and the gap to that.
+        self._deepened_retry: tuple[float, int] | None = None
+        # Set by an engine whose drafter timed deepened cycles at load: (regular full-width cycle, {width: deepened cycle}).
+        self.deepened_profile: tuple[float, dict[int, float]] | None = None
+        # Set by an engine whose drafter timed copy rounds at load: {width: seconds}, from the trained block's width up.
+        self.copy_profile: dict[int, float] | None = None
+        self.calibrated_depth = self.max_depth
+        self._deepened_excess = deque(maxlen = 16)
         self.tokens = 0
         # Probes and staleness run on sequence positions, so a wide batch probes no more often.
         self.steps = 0.0
@@ -457,6 +483,8 @@ class DraftController:
         self._probe_left = 0
         # Set by an engine whose drafter reports confidences.
         self.trims = False
+        # Set by an engine whose drafter names the verify rows below which a draft round gains nothing.
+        self.min_rows = 0
         self.calibration = _Calibration(self.max_depth)
         self.full_every = full_every
         self._since_full = 0
@@ -473,10 +501,15 @@ class DraftController:
     _COPY_PROBE = 4
     _STALL_RATIO = 2.0
     _EXHAUSTIVE_ROWS = 6
+    _DEEPENED_TRIAL = 8
 
     def new_reply(self) -> ReplyStats:
         if self.trims:
             # The calibration and cycle costs are the load's; their windows let a past reply's evidence age out.
+            if len(self.calibration.alpha) != self.calibrated_depth:
+                self.calibration = _Calibration(self.calibrated_depth, self.max_depth)
+            self._deepened_excess.clear()
+            self._deepened_pending = None
             self._since_full = 0
         return ReplyStats(self.draft_acceptance, self.copy_acceptance, self._base_backoff, self.seed_weight)
 
@@ -520,6 +553,15 @@ class DraftController:
             return step * self._ROUND_OVERHEAD + slope * (width - 1)
         return self._extrapolate(points, width, slope)
 
+    def _copy_seconds(self, bucket: int, width: int) -> float:
+        table, profile = self.verify_cost.get(bucket, {}), self.copy_profile if bucket == 1 else None
+        if profile and width > min(profile) and width in profile and (width not in table or table[width].count < 2):
+            # Cost steps at row tiles no narrower width predicts: the load's timing, at this controller's trained-width level.
+            anchor = table.get(min(profile))
+            offset = anchor.value - profile[min(profile)] if anchor is not None and anchor.count >= 2 else 0.0
+            return max(profile[width] + offset, 1e-9)
+        return self._verify_seconds(bucket, width)
+
     def _draft_seconds(self, depth: int) -> float:
         points = self._measured(self.draft_cost)
         slope = self._plain_step(1) * self._DRAFT_SLOPE
@@ -541,7 +583,8 @@ class DraftController:
     def round_seconds(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
         bucket = _bucket(len(rows))
         drafting = sum(self._row_seconds(row, state) for row, state in zip(plan.rows, rows))
-        return self._verify_seconds(bucket, width or plan.width) + self._drafting_paid(bucket, drafting)
+        verify = self._copy_seconds if all(row.source == "copy" for row in plan.rows) else self._verify_seconds
+        return verify(bucket, width or plan.width) + self._drafting_paid(bucket, drafting)
 
     def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None, optimism: float = 0.0) -> float:
         if plan.kind == "plain":
@@ -553,7 +596,7 @@ class DraftController:
     def _cap(state: RowState, length: int) -> int:
         return length if state.remaining is None else max(0, min(length, state.remaining - 1))
 
-    def _round_at(self, width: int, rows: Sequence[RowState]) -> RoundPlan:
+    def _round_at(self, width: int, rows: Sequence[RowState], floor: int = 0) -> RoundPlan:
         # Drafting rows add tokens and their own forward to one shared verify. Scored at the
         # nominal width, so the first row to draft does not carry the whole widening alone.
         base, options = [], []
@@ -561,7 +604,7 @@ class DraftController:
             copy = self._cap(state, min(state.copy_available, self.max_copy, width - 1))
             base.append(RowPlan("copy", copy) if copy else RowPlan())
             depth = self._cap(state, min(self.max_depth, width - 1))
-            if state.can_draft and depth:
+            if state.can_draft and depth and depth >= self._cap(state, floor):
                 draft = RowPlan("draft", depth)
                 gain = state.stats.expected(draft) - state.stats.expected(base[i])
                 options.append((gain, self._row_seconds(draft, state), i, draft))
@@ -585,7 +628,7 @@ class DraftController:
                 scored.append((gain, cost, options[:size]))
             scored += [(option[0], option[1], (option,)) for option in options]
         best = RoundPlan("round", rows = tuple(base))
-        best_score = rate(0.0, 0.0) if best.width > 1 else 0.0
+        best_score = tokens / self._copy_seconds(bucket, width) if best.width > 1 else 0.0
         for gain, cost, chosen in scored:
             if rate(gain, cost) > best_score:
                 plan = list(base)
@@ -597,6 +640,10 @@ class DraftController:
     @staticmethod
     def _identity(plan: RoundPlan, bucket: int) -> tuple:
         return (bucket, "plain") if plan.kind == "plain" else (bucket, "round", plan.width)
+
+    def _floor_depth(self, batch: int) -> int:
+        """The shallowest draft a round plans: ``min_rows`` of verify rows over the batch, within the controller's depth."""
+        return min(self.max_depth, max(0, -(-self.min_rows // batch) - 1))
 
     _PLANNING_FIELDS = ("_warmup", "_stale_gap", "_probing_sources", "_reference", "_next_probe",
                         "_probe", "_probe_left", "_window", "_current")
@@ -623,6 +670,9 @@ class DraftController:
             self.__dict__.update(prepared.changes)
             return prepared.plan
         bucket = _bucket(len(rows))
+        floor = self._floor_depth(len(rows))
+        while self._warmup and self._warmup[0] < floor:
+            self._warmup.pop(0)
         room = min((state.remaining for state in rows if state.remaining is not None), default = 1 << 30)
         plain = RoundPlan("plain", max(1, min(self._window, room)))
         self._probing_sources, self._reference = {}, None
@@ -646,14 +696,14 @@ class DraftController:
 
         rounds = {}
         for width in range(2, self.max_width + 1):
-            candidate = self._round_at(width, rows)
+            candidate = self._round_at(width, rows, floor)
             if candidate.width > 1:
                 rounds.setdefault(candidate.width, candidate)
         candidates = [plain] + list(rounds.values())
         chosen, probing = self._choose(candidates, rows, bucket)
         if not probing:
             # The deepest affordable draft probe: a full-depth one may not fit the credit a reply earns.
-            for depth in range(self.max_depth, 1, -1) or [self.max_depth]:
+            for depth in range(self.max_depth, max(1, floor - 1), -1) or [self.max_depth]:
                 probe, sources = self._source_probe(chosen, rows, depth)
                 if sources and (self._affordable(probe, chosen, rows) or self._unmeasured(sources)):
                     chosen, self._probing_sources, self._reference = probe, sources, self.score(chosen, rows)
@@ -677,7 +727,7 @@ class DraftController:
 
     def trim(self, plan: RoundPlan, rows: Sequence[RowState], confidences: Sequence[Sequence[float] | None]) -> RoundPlan:
         """The width to verify of a ``trim`` round, from each row's drafted-position probabilities (None for a row
-        without them: its reply's acceptance stands in)."""
+        without them: its reply's acceptance stands in). A deepened round prices its widths on the deepened cycles timed at load."""
         cycle = self.cycle_cost.get(len(rows))
         deepest = max(row.length for row in plan.rows)
 
@@ -690,6 +740,12 @@ class DraftController:
         def rate(depth, seconds):
             tokens = sum(expected(row, state, confidence, depth) for row, state, confidence in zip(plan.rows, rows, confidences))
             return tokens / seconds(depth + 1)
+        deepened = plan.controller_depth and self.deepened_profile is not None and cycle is not None and cycle.ready
+        self._deepened_baseline = self._deepened_pending = None
+        if deepened:
+            # What the planned round would have verified of the same drafts, the gate's counterfactual.
+            planned = max(range(min(deepest, plan.controller_depth) + 1), key = lambda depth: rate(depth, cycle.seconds))
+            self._deepened_baseline = (planned, cycle.seconds(planned + 1))
         self._since_full += 1
         if self._since_full >= self.full_every:
             self._since_full = 0
@@ -699,7 +755,8 @@ class DraftController:
                 if cycle is None or cycle.points.get(width, (0.0, 0))[1] < 2:
                     return replace(plan, rows = tuple(RowPlan("draft", min(width - 1, row.length)) for row in plan.rows))
             return plan
-        depth = max(range(deepest + 1), key = lambda depth: rate(depth, cycle.seconds))
+        seconds = (lambda width: self._deepened_seconds(cycle, width)) if deepened else cycle.seconds
+        depth = max(range(deepest + 1), key = lambda depth: rate(depth, seconds))
         trimmed = tuple(RowPlan("draft", min(depth, row.length)) for row in plan.rows)
         return replace(plan, rows = trimmed)
 
@@ -857,13 +914,57 @@ class DraftController:
         self._reference = None
         self._measured_at[(bucket, "plain")] = self.steps
 
+    def deepening_pays(self, plan: RoundPlan, rows: Sequence[RowState], retry: bool = False) -> bool:
+        """Whether rounds drafted past ``plan``'s depth have emitted tokens faster than ``plan`` would; assumed so for the first few.
+        Trimmed ones compare their cycles with the regular cycle of the width the trim would have verified instead. With
+        ``retry``, a losing verdict admits one deeper round after a doubling gap of tokens: a verdict no deeper round can
+        revise would let the few rounds of its trial decide for the whole load."""
+        if self.deepened_cost.count < self._DEEPENED_TRIAL:
+            return True
+        reference = self.deepened_reference.value if self.deepened_profile is not None else self.round_seconds(plan, rows)
+        if self.deepened_emitted.value * reference > self.deepened_planned.value * self.deepened_cost.value:
+            self._deepened_retry = None
+            return True
+        if not retry:
+            return False
+        at, gap = self._deepened_retry or (self.tokens + self._base_backoff, self._base_backoff)
+        if self.tokens < at:
+            self._deepened_retry = (at, gap)
+            return False
+        gap = min(2 * gap, self._max_backoff)
+        self._deepened_retry = (self.tokens + gap, gap)
+        return True
+
+    def _deepened_shape(self, width: int) -> float:
+        return self._extrapolate(sorted(self.deepened_profile[1].items()), width, 0.0)
+
+    def _deepened_seconds(self, cycle: _CycleCosts, width: int) -> float:
+        # The load's timed shape at this reply's level: the mean excess of its deepened cycles over the shape (roughly
+        # constant: re-drafting a block not prefetched deep), or before two of them, its regular full-width cycle's.
+        excess = self._deepened_excess
+        offset = sum(excess) / len(excess) if len(excess) >= 2 else cycle.seconds(self.max_depth + 1) - self.deepened_profile[0]
+        return max(self._deepened_shape(width) + offset, 1e-9)
+
     def observe_cycle(self, plan: RoundPlan, rows: Sequence[RowState], cycle_seconds: float, first_use: bool = False,
                       cold: bool = False) -> None:
         """Account the seconds a finished full-draft ``trim`` round took until the next block it drafted was ready. A ``cold``
         round drafted its own block too, as a reply's first does, or read the one that flushed a drafter backlog, as a long prompt's first does: that is no width's cost."""
         if not (self.trims and plan.trim and not first_use and all(row.source == "draft" for row in plan.rows)):
             return
-        if not cold and all(state.remaining is None or state.remaining > self.max_depth + 1 for state in rows):
+        if plan.controller_depth:
+            # The gate's four statistics cover the same rounds: those whose emission was recorded and whose cycle counts.
+            pending, self._deepened_pending = self._deepened_pending, None
+            if pending is None or not math.isfinite(cycle_seconds) or cycle_seconds <= 0 or any(
+                    state.remaining is not None and state.remaining <= max(self.deepened_profile[1]) for state in rows):
+                return
+            expected = self._deepened_seconds(self.cycle_cost[len(rows)], plan.width)
+            seconds = min(max(cycle_seconds, 0.5 * expected), 2.0 * expected)
+            self._deepened_excess.append(seconds - self._deepened_shape(plan.width))
+            self.deepened_emitted.update(pending[0], self.acceptance_alpha)
+            self.deepened_planned.update(pending[1], self.acceptance_alpha)
+            self.deepened_cost.update_time(cycle_seconds, self.cost_alpha)
+            self.deepened_reference.update(self._deepened_baseline[1], self.cost_alpha)
+        elif not cold and all(state.remaining is None or state.remaining > self.max_depth + 1 for state in rows):
             self.cycle_cost.setdefault(len(rows), _CycleCosts()).observe(plan.width, cycle_seconds)
 
     def record_round(
@@ -893,8 +994,10 @@ class DraftController:
         self._account(sum(min(max(0, int(count)), row.length) + 1 for row, count in zip(plan.rows, accepted)), seconds, stall_free)
         for i, (row, state, count) in enumerate(zip(plan.rows, rows, accepted)):
             count = max(0, min(int(count), row.length))
+            # An engine-deepened round trains only the positions the controller can plan.
+            depth = min(row.length, plan.controller_depth) if plan.controller_depth and row.source == "draft" else row.length
             stats = state.stats
-            for position in range(min(count + 1, row.length)):
+            for position in range(min(count + 1, depth)):
                 sample = 1.0 if position < count else 0.0
                 if row.source == "draft":
                     stats.draft[position].update(sample, alpha)
@@ -915,10 +1018,18 @@ class DraftController:
                 stats.probe_at[row.source] = stats.tokens + stats.backoff[row.source]
         self._probing_sources, self._reference = {}, None
         self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
+        if plan.controller_depth and not first_use:
+            count = max(0, min(int(accepted[0]), plan.rows[0].length))
+            if self.deepened_profile is None:
+                self.deepened_emitted.update(count + 1, alpha)
+                self.deepened_planned.update(min(count, plan.controller_depth) + 1, alpha)
+                self.deepened_cost.update_time(seconds, self.cost_alpha)
+            elif plan.trim and self._deepened_baseline is not None:
+                self._deepened_pending = (count + 1, min(count, self._deepened_baseline[0]) + 1)
         for row, count, confidence in zip(plan.rows, accepted, confidences or ()):
             if row.source == "draft" and confidence is not None:
                 self.calibration.observe(confidence, row.length, max(0, min(int(count), row.length)))
-        if first_use:
+        if first_use or plan.controller_depth:
             return
 
         if cycle_seconds is not None:
@@ -1222,12 +1333,18 @@ class SpeculativeEngine:
         self._batch_rounds = self._exact or self._invariant or call is _language_call("gemma4")
         if getattr(drafter, "confidences", False):
             controller.trims = True
+            controller.deepened_profile = getattr(drafter, "deepened_costs", None)
+            controller.calibrated_depth = (controller.max_depth if controller.deepened_profile is None
+                                           else max(controller.max_depth, drafter.extended_depth))
+        controller.min_rows = getattr(drafter, "min_verify_rows", 0)
+        controller.copy_profile = getattr(drafter, "copy_costs", None)
         self._mrope = hasattr(self.lm, "_rope_deltas")
         self._rows: list[_Row] = []
         self.cache: list | None = None
         self.draft_cache: list | None = None
         self.round_refusal: str | None = None
         self.retiring: dict = {}
+        self._extension_streak = False
         self._prepared_plan = None
 
     @property
@@ -1271,9 +1388,12 @@ class SpeculativeEngine:
         prepared, self._prepared_plan = self._prepared_plan, None
         if self._rounds_allowed():
             plan = self.controller.plan(states) if prepared is None else self.controller.plan(states, prepared)
+            plan = self._extend(plan, states)
         else:
             room = min((row.remaining for row in self._rows if row.remaining is not None), default = None)
             plan = RoundPlan("plain", self.controller.max_window if room is None else min(room, self.controller.max_window))
+        if plan.kind != "round":
+            self._extension_streak = False
         emitted = self._round(plan, states) if plan.kind == "round" else None
         for taken in [emitted] if emitted is not None else self._plain(max(1, plan.length), states, waiting):
             for row, tokens in zip(self._rows, taken):
@@ -1303,6 +1423,47 @@ class SpeculativeEngine:
                 and type(self.controller).plan is DraftController.plan
                 and self.controller._cycle_ready(self._rows) and not any(row.finished for row in self._rows)):
             self._prepared_plan = self.controller.prepare_plan(self._states(snapshot = True))
+
+    def _extension_candidate(self, plan: RoundPlan, states: list[RowState]) -> tuple[int, int] | None:
+        extended = getattr(self.drafter, "extended_depth", 0)
+        trained = getattr(self.drafter, "trained_depth", 0)
+        if (not self._exact or len(self._rows) != 1 or extended <= trained or self.controller.fixed_depth
+                or plan.kind != "round" or (plan.split and not plan.trim) or plan.controller_depth or len(plan.rows) != 1
+                or plan.rows[0] != RowPlan("draft", trained) or self.controller._reference is not None
+                or self._rows[0].sample.temperature != 0 or self._rows[0].processors):
+            return None
+        # Stay within the controller's widest verify, which callers bound through ``max_copy``; a copy-less one never deepens.
+        depth = min(extended, self.controller.max_width - 1)
+        if states[0].remaining is not None:
+            depth = min(depth, states[0].remaining - 1)
+        return (trained, depth) if depth > trained and self.drafter.extension_serves(self._rows[0].draft, depth) else None
+
+    def _verify_scope(self, plan: RoundPlan):
+        from .inference import deeper_causal_verify
+
+        return deeper_causal_verify(plan.width) if plan.controller_depth else nullcontext()
+
+    def _extend(self, plan: RoundPlan, states: list[RowState]) -> RoundPlan:
+        from .inference import fast_verify_enabled
+
+        candidate = self._extension_candidate(plan, states)
+        if candidate is None or not self._extension_streak:
+            return plan
+        trained, depth = candidate
+        stats = states[0].stats
+        trims = plan.trim and self.controller.deepened_profile is not None
+        if (stats.tokens < 4 * trained or stats.expected(plan.rows[0]) < (trained + 1) / 2
+                or (trims and not self.controller._cycle_ready(states))
+                or not self.controller.deepening_pays(plan, states, retry = fast_verify_enabled())):
+            return plan
+        # Without the load's deepened cycle costs a deep block verifies whole: the gate then compares it with the planned depth.
+        return replace(plan, rows = (RowPlan("draft", depth),), controller_depth = trained, trim = trims)
+
+    def _observe_extension(self, plan: RoundPlan, states: list[RowState], accepted: Sequence[int]) -> None:
+        # A wider verify only repays its rows while rounds keep accepting at least the trained depth; a shorter one ends the run.
+        trained = getattr(self.drafter, "trained_depth", 0)
+        eligible = bool(plan.controller_depth) or self._extension_candidate(plan, states) is not None
+        self._extension_streak = eligible and int(accepted[0]) >= trained
 
     def _position_kwargs(self) -> dict:
         if not self._mrope:
@@ -1431,7 +1592,7 @@ class SpeculativeEngine:
                 padded = mx.pad(drafts[:, : width - 1], [(0, 0), (0, max(width - 1 - depth, 0))])
                 inputs = mx.concatenate([inputs[:, :1], mx.where(columns < drafting, padded, inputs[:, 1:])], axis = 1)
         entries = list(self.cache)
-        with mx.stream(self._stream):
+        with mx.stream(self._stream), self._verify_scope(plan):
             logits, hidden, transaction = self._verify(inputs)
         if any(now is not before for now, before in zip(self.cache, entries)):
             self.cache[:] = entries
@@ -1519,6 +1680,7 @@ class SpeculativeEngine:
             plan, states, accepted, seconds = seconds, draft_seconds = draft_seconds,
             catch_up_seconds = catch_up_seconds, first_use = first_use, confidences = confidences,
         )
+        self._observe_extension(plan, states, accepted)
         self._prepare_next_plan()
         self._time_cycle(plan, states, committed, start, first_use, cold)
         return emitted
@@ -2121,6 +2283,8 @@ class ContextRow:
         # Whether `prefetched` moved a backlog of at least the drafter's `max_lag` rows into the context cache.
         self.flushed = False
         self.predrafted: list | None = None
+        self.requested_depth = 0
+        self.empty_context: mx.array | None = None
 
     @property
     def ready(self) -> bool:
@@ -2144,9 +2308,12 @@ class ContextDrafter:
         self.capture = {"capture_layer_ids": list(model.config.target_layer_ids)}
         # The trained block, not mlx-vlm's fixed runtime default: the controller picks the depth below it.
         self.max_depth = int(model.config.block_size) - 1
+        self.trained_depth = self.max_depth
+        # The engine may draft past the trained block up to this depth, where `_built` admits it.
+        self.extended_depth = self.max_depth
         # The greedy shortcut would bypass an overridden draft_block (DFlash2's selector, DSpark's Markov head).
         self._draft = model.draft_block_greedy if type(model).draft_block is DFlashDraftModel.draft_block else model.draft_block
-        from .inference import predraft_attention
+        from .inference import predraft_attention, fast_verify_enabled
 
         self.predraft_rows = predraft_attention(model)
         # When every layer slides, rows before the widest window would be projected only to be dropped.
@@ -2154,11 +2321,17 @@ class ContextDrafter:
         if attentions and all(a.is_sliding for a in attentions):
             self.context_rows = max(a.sliding_window - 1 for a in attentions)
         # DFlash2's selector reports each drafted position's probability, from which the controller trims a round.
-        self._selector = getattr(model, "candidate_selector", None)
+        # Fast Verify's dense rounds verify whole tiles instead.
+        enabled = not fast_verify_enabled() or any(hasattr(module, "switch_mlp") for _, module in target.named_modules())
+        self._selector = getattr(model, "candidate_selector", None) if enabled else None
         if self._selector is not None:
             self._selector.__dict__["_unsloth_wants_confidence"] = True
         self.confidences = self._selector is not None
         self.confidence: list[mx.array | None] = []
+        # Set by `warm_speculative_rounds`: (regular full-width cycle, {width: cycle of a block drafted at the extended depth}).
+        self.deepened_costs: tuple[float, dict[int, float]] | None = None
+        # Set by `warm_speculative_rounds`: {width: seconds of a copy round}, from the trained block's width to the widest.
+        self.copy_costs: dict[int, float] | None = None
 
     @property
     def config(self):
@@ -2211,21 +2384,42 @@ class ContextDrafter:
         return block, None if self._selector is None else self._selector.__dict__.pop("_unsloth_confidence", None)
 
     def _block(self, row: ContextRow, depth: int) -> mx.array:
-        context = (row.features[0] if len(row.features) == 1 else mx.concatenate(row.features))[None]
-        row.features = []
-        if self.context_rows is not None and (skip := context.shape[1] - self.context_rows) > 0:
-            # Their positions still count, as the layers' own trim counts them.
-            context = context[:, skip:]
-            for entry in row.cache:
-                entry.offset += skip
+        if row.features:
+            context = (row.features[0] if len(row.features) == 1 else mx.concatenate(row.features))[None]
+            row.features = []
+            if self.context_rows is not None and (skip := context.shape[1] - self.context_rows) > 0:
+                # Their positions still count, as the layers' own trim counts them.
+                context = context[:, skip:]
+                for entry in row.cache:
+                    entry.offset += skip
+            if self.extended_depth > self.trained_depth:
+                row.empty_context = mx.zeros((1, 0, context.shape[-1]), context.dtype)
+        else:
+            # A wider request reuses context without appending it twice.
+            context = row.empty_context
+            if context is None:
+                raise RuntimeError("a context block needs committed features")
         block, row.prefetched_confidence = self._drafted(row.pending, context, row.cache, depth + 1)
         return block
 
+    def extension_serves(self, row: ContextRow, depth: int) -> bool:
+        """Whether a block of ``depth`` drafts for ``row`` now runs on the sparse producer, the only one deeper rounds are
+        admitted for, under Fast Verify, whose verify cost model they rely on."""
+        from .inference import _SparseDrafter, fast_verify_enabled
+
+        return (fast_verify_enabled() and isinstance(self._draft, _SparseDrafter)
+                and self._draft.head_shape(1, depth, None, row.empty_context) is not None)
+
+    def _prepared_depth(self, row: ContextRow) -> int:
+        return min(self.extended_depth, max(self.trained_depth, row.requested_depth))
+
     def prefetch(self, rows: Sequence[ContextRow | None]) -> None:
-        """Draft each ready row's next block now; ``draft`` reads it unless a ``push`` comes first."""
+        """Draft each ready row's next block now, at its last requested depth between the trained and extended depths;
+        ``draft`` reads it unless a ``push`` comes first."""
         for row in rows:
             if row is not None and row.features:
-                row.prefetched = self._block(row, self.max_depth).reshape(1, self.max_depth)
+                depth = self._prepared_depth(row)
+                row.prefetched = self._block(row, depth).reshape(1, depth)
                 mx.async_eval(row.prefetched)
 
     def predraft(self, row: ContextRow, hidden: mx.array, accepted: mx.array, anchor: mx.array) -> bool:
@@ -2238,8 +2432,11 @@ class ContextDrafter:
 
         valid = mx.arange(hidden.shape[0]) <= accepted
         row.predrafted = [PredraftCache(entry, valid, accepted + 1 + entry.offset) for entry in row.cache]
-        block, row.prefetched_confidence = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, self.max_depth + 1)
-        row.prefetched = block.reshape(1, self.max_depth)
+        depth = self._prepared_depth(row)
+        if self.extended_depth > self.trained_depth:
+            row.empty_context = mx.zeros((1, 0, hidden.shape[-1]), hidden.dtype)
+        block, row.prefetched_confidence = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, depth + 1)
+        row.prefetched = block.reshape(1, depth)
         mx.async_eval(row.prefetched)
         return True
 
@@ -2252,10 +2449,12 @@ class ContextDrafter:
         blocks, self.confidence = [], []
         for row in rows:
             confidence = None
+            if row is not None:
+                row.requested_depth = depth
             if row is None or not row.ready:
                 blocks.append(mx.zeros((1, depth), mx.int32))
             elif row.prefetched is not None:
-                block = row.prefetched
+                block = row.prefetched if depth <= row.prefetched.shape[-1] else self._block(row, depth).reshape(1, depth)
                 # A slice of a finished block is a kernel the host would wait on, so a block of exactly this depth is used as is.
                 blocks.append(block if block.shape[-1] == depth else block[:, :depth])
                 if row.prefetched_confidence is not None:
@@ -2305,9 +2504,89 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
     lane_drafter_head(model, getattr(target, "lm_head", None) or getattr(language, "lm_head", None))
     if isinstance(drafter, ContextDrafter):
         drafter._draft = sparse_drafter(model, target, drafter._draft)
+        from .inference import (_SparseDrafter, _VERIFY_GDN_MAX_ROWS, fast_verify_covers,
+                                fast_verify_enabled, lane_tile_rows)
+
+        if (isinstance(drafter._draft, _SparseDrafter) and fast_verify_covers(target)
+                and drafter.predraft_rows >= _VERIFY_GDN_MAX_ROWS):
+            rows = _VERIFY_GDN_MAX_ROWS
+            if not any(hasattr(module, "switch_mlp") for _, module in target.named_modules()):
+                # Rows past the tile of most projections pay extra tile multiplies; sparse targets keep the gate alone.
+                rows = min(rows, lane_tile_rows(target))
+                if fast_verify_enabled():
+                    # Rows within the tile cost the same, so a draft round verifies the whole trained block, or the tile.
+                    drafter.min_verify_rows = min(drafter.trained_depth + 1, rows)
+            drafter.extended_depth = max(drafter.trained_depth, rows - 1)
+        if not lazy and fast_verify_covers(target):
+            language.__dict__["_unsloth_warm_drafter"] = weakref.ref(drafter)  # for `warm_speculative_rounds`
     drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
     target._unsloth_speculates = True  # so `warm_inference` runs the verify path's first-use checks at load
     return drafter
+
+
+_WARM_ROUNDS_PROMPT = 64
+
+
+def warm_speculative_rounds(model) -> None:
+    """Run one round at every verify width a reply can reach, so their first-use work stays out of replies: draft rounds
+    at each depth (deepened where the sparse producer serves it), then timed copy rounds from the trained block's width
+    up, which replies price copies on. A deepening drafter reporting confidences then has its deepened cycles timed."""
+    from .inference import fast_verify_enabled
+
+    reference = vars(getattr(model, "language_model", model)).get("_unsloth_warm_drafter")
+    drafter = reference() if reference is not None else None
+    if drafter is None or not fast_verify_enabled(model):
+        return
+    engine = SpeculativeEngine(model, DraftController(max_depth = drafter.max_depth), drafter)
+    if not engine._exact:
+        return
+    from mlx_vlm.models.cache import make_prompt_cache
+
+    from .generate import generation_mode
+
+    trained, widest, lm, controller = drafter.trained_depth, drafter.extended_depth, engine.lm, engine.controller
+    with generation_mode(model, call = ("batch", "speculative")):
+        prompt, cache = list(range(1, _WARM_ROUNDS_PROMPT + 1)), make_prompt_cache(lm)
+        with mx.stream(engine._stream):
+            out = lm(mx.array([prompt]), cache = cache, **_capture(drafter))
+            hidden = _features(drafter, out)
+        if widest > trained and not drafter.extension_serves(SimpleNamespace(empty_context = hidden[:, :0]), widest):
+            widest = trained
+        engine.add(EngineRow(cache, int(mx.argmax(out.logits[0, -1]).item()), prompt, hidden = hidden))
+        for depth in range(1, widest + 1):
+            plan = RoundPlan("round", rows = (RowPlan("draft", depth),), controller_depth = trained if depth > trained else 0)
+            if engine._round(plan, engine._states()) is None:
+                return
+        verify, widths = controller.verify_cost.setdefault(1, {}), range(trained + 1, controller.max_width + 1)
+        timed = lambda width: width in verify and verify[width].value is not None
+        for width in widths:
+            for _ in range(2):  # a round that ran first-use work records no cost
+                if not timed(width) and engine._round(RoundPlan("round", rows = (RowPlan("copy", width - 1),)),
+                                                      engine._states()) is None:
+                    return
+        if all(map(timed, widths)):
+            drafter.copy_costs = {width: verify[width].value for width in widths}
+        if not drafter.confidences or widest == trained:
+            return
+
+        def cycle(depth: int, width: int) -> float | None:
+            # The faster of two rounds drafting ``depth`` and verifying ``width``, each until its next block is ready.
+            engine.controller.trim = lambda plan, rows, confidences: replace(plan, rows = (RowPlan("draft", width - 1),))
+            plan = RoundPlan("round", rows = (RowPlan("draft", depth),), split = True, trim = True,
+                             controller_depth = trained if depth > trained else 0)
+            seconds = []
+            for _ in range(2):
+                start = time.perf_counter()
+                if engine._round(plan, engine._states()) is None:
+                    return None
+                mx.synchronize(engine._stream)
+                seconds.append(time.perf_counter() - start)
+            return min(seconds)
+
+        deepened = {width: cycle(widest, width) for width in range(1, widest + 2)}
+        regular = cycle(trained, trained + 1)
+        if regular and all(deepened.values()):
+            drafter.deepened_costs = (regular, deepened)
 
 
 def _head_drafter(model: nn.Module, target: nn.Module, **kwargs) -> MTPDrafter | HeadDrafter:

@@ -1878,6 +1878,38 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
             pass
 
 
+def test_target_head_precision_scope_preserves_shared_heads_training_and_ownership(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference
+
+    class Head(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bits, self.group_size, self.mode = 4, 64, "affine"
+            self._unsloth_lane_qmm = True
+
+    target, drafter, head = nn.Module(), nn.Module(), Head()
+    target.lm_head = drafter.lm_head = head
+    monkeypatch.setattr(inference, "_resolved_bindings", lambda contract: ())
+    with inference.target_head_precision(target):
+        assert target.lm_head is head and head.training
+    head.eval()
+    first, second = inference.target_head_precision(target), inference.target_head_precision(target)
+    first.__enter__()
+    replacement = target.lm_head
+    second.__enter__()
+    first.__exit__(None, None, None)
+    assert target.lm_head is replacement and replacement.base_head is drafter.lm_head is head
+    assert not replacement.training and not head.training
+    assert tuple(replacement.children()) == ("base_head",)
+    second.__exit__(None, None, None)
+    assert target.lm_head is drafter.lm_head is head
+    foreign = Head()
+    with inference.target_head_precision(target):
+        target.lm_head = foreign
+    assert target.lm_head is foreign and foreign.training
+
+
 def test_every_inference_scope_is_registered_and_every_generation_path_enters_the_registry(monkeypatch):
     # A scope missing from the registry silently leaves every path native.
     import ast

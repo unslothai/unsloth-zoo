@@ -571,6 +571,83 @@ def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkey
     assert costs == {(m, kind): m + extra[kind] for kind in extra for m in range(1, 17 if kind == "staged" else 9)}
 
 
+@pytest.mark.parametrize("mixed", [False, True])
+def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_restore(qwen_4bit, monkeypatch, mixed):
+    import copy
+    from mlx_vlm.models.qwen3_5 import language, speculative_verifier
+    from unsloth_zoo.mlx import inference, matmul
+    from unsloth_zoo.mlx.generate import SamplingParams, generation_mode
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, ids, cache), rows, kernel = qwen_4bit, [], matmul.lane_qmm
+    verifier, native = language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
+    unscoped, block = copy.copy(model.language_model), mx.array([ids[0][24:36]])   # shares the projections
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: rows.append((len(args[0]), args[1].shape[0])) or kernel(*args, **kwargs))
+    if mixed:   # projections as wide as `in_proj_z` stay native, so the GDN input group mixes lane and native members
+        z = next(m.weight.shape[0] for name, m in model.language_model.named_modules() if name.endswith("in_proj_z"))
+        supported = matmul.lane_qmm_supported
+        monkeypatch.setattr(matmul, "lane_qmm_supported", lambda N, *args: N != z and supported(N, *args))
+    monkeypatch.delenv("UNSLOTH_MLX_FAST_VERIFY", raising = False)
+    with generation_mode(model):
+        assert "_unsloth_lane_verify_native" not in vars(type(verifier)) and not inference.fast_verify_enabled()   # off unless asked for
+    with monkeypatch.context() as patch:   # nor when asked for with the kernel switched off
+        [patch.setenv(*switch) for switch in (("UNSLOTH_MLX_FAST_VERIFY", "1"), ("UNSLOTH_MLX_LANE_QMM", "0"))]
+        with generation_mode(model, call = ("batch", "speculative")):
+            assert "_unsloth_lane_verify_native" not in vars(type(verifier)) and not inference.fast_verify_enabled()
+    with inference.row_invariant_lane_projections(model):   # also without the exact scope under it, which may nest inside
+        assert type(verifier)._unsloth_lane_verify_native is native
+        with inference.exact_speculative_verify(model):
+            assert type(verifier)._unsloth_lane_verify_native._unsloth_verify_native is native
+        assert type(verifier)._unsloth_lane_verify_native is native
+    assert type(verifier) is native
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
+    assert inference.fast_verify_enabled(model) and not inference.fast_verify_enabled(object())
+    with generation_mode(model, call = ("batch", "speculative")):
+        # Layered over the exact scope's verifier, which keeps serving what lane does not cover, nested or not.
+        with inference.exact_speculative_verify(model):
+            pass
+        with monkeypatch.context() as patch:   # nor does a scope that ends while a binding has drifted
+            patch.setattr(native, "_linear", lambda self, *args: None)
+            with inference.row_invariant_lane_projections(model):
+                pass
+        assert type(verifier)._unsloth_lane_verify_native._unsloth_verify_native is native
+        head = model.language_model.model.layers[0].mlp.down_proj   # an untied head's stand-in: its fused head is declined
+        assert native.can_quantized_head(verifier, head) and not verifier.can_quantized_head(head)
+        x = mx.ones((1, 1, head.weight.shape[1] * 32 // head.bits), mx.bfloat16)
+        assert verifier.quantized_argmax(head, x) is None and verifier.quantized_linear(head, x) is None
+        _verified(unscoped, cache, block, 0)
+        # A model outside the scope verifies off the kernel; only its one-row calls of the shared modules take it.
+        assert rows and all(m == 1 for m, _ in rows)
+        rows.clear()
+        speculative, drafted, _ = _run(model, [ids[0], ids[1]], 96, _rounds_only(), SamplingParams())
+        assert speculative == [_solo(model, prompt, 96, SamplingParams()) for prompt in ids[:2]]   # the same greedy output
+    assert drafted[0][1] > 0 and {1, 2} <= {m for m, _ in rows}   # one-token steps and accepted copies' blocks
+    # Projections back to the hidden size verify alone, the input groups together: both take the kernel.
+    assert model.language_model.args.hidden_size in {n for _, n in rows} and len({n for _, n in rows}) > 1
+    assert type(verifier) is native
+    assert not any(k.startswith("_unsloth_lane") for _, m in model.named_modules() for k in m.__dict__)
+    assert not any(type(m).__name__.startswith("_Lane") for _, m in model.named_modules())
+
+
+def test_row_invariant_lane_projections_verify_rows_equal_one_token_decoding(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx import matmul
+    from unsloth_zoo.mlx.generate import generation_mode
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, ids, cache), heads, kernel = qwen_4bit, [], matmul.lane_qmm
+    lm = model.language_model
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: (args[1].shape[0] == lm.args.vocab_size and heads.append(len(args[0]))) or kernel(*args, **kwargs))
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
+    with generation_mode(model, call = ("batch", "speculative")):
+        for width in (1, 3, 8, 12):   # the tied head read once per block, not once per row
+            block, run, step, heads[:] = mx.array([ids[0][24:24 + width]]), _clone(cache), _clone(cache), []
+            out = lm(block, cache = run, speculative_verify = True, capture_layer_ids = [])
+            out.gdn_states.abort()
+            assert heads == [width], width
+            decoded = mx.concatenate([lm(block[:, i:i + 1], cache = step).logits for i in range(width)], axis = 1)
+            assert mx.array_equal(out.logits.view(mx.uint16), decoded.view(mx.uint16)).item(), width
+
+
 def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_kernel(qwen_4bit, monkeypatch):
     from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache, RotatingKVCache, make_prompt_cache
     from unsloth_zoo.mlx import inference
@@ -2238,10 +2315,11 @@ def test_a_long_prompts_first_round_reads_its_backlog_flush_and_prices_no_width(
     assert reads[0] == [True] and colds[0] and not any(flags[0] for flags in reads[1:]) and False in colds
 
 
-@pytest.mark.parametrize("moe", [False, True])
-def test_a_drafters_selector_reports_confidences_for_any_target(monkeypatch, moe):
+@pytest.mark.parametrize("lane,moe", [(False, False), (False, True), (True, False), (True, True)])
+def test_confidence_budget_skips_only_the_modes_dense_targets(monkeypatch, lane, moe):
     import mlx.nn as nn
     from unsloth_zoo.mlx.speculative import ContextDrafter
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", str(int(lane)))
     class Head(nn.Module):
         def bind(self, target):
             pass
@@ -2253,4 +2331,5 @@ def test_a_drafters_selector_reports_confidences_for_any_target(monkeypatch, moe
     if moe:
         target.switch_mlp = nn.Module()
     drafter = ContextDrafter(model, target)
-    assert drafter.confidences and model.candidate_selector.__dict__.get("_unsloth_wants_confidence")
+    assert drafter.confidences == (moe or not lane)
+    assert bool(model.candidate_selector.__dict__.get("_unsloth_wants_confidence")) == drafter.confidences

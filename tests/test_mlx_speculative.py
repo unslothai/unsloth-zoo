@@ -12,13 +12,14 @@
 import random
 from collections import Counter
 from math import prod
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("mlx.core")
 from unsloth_zoo.mlx.speculative import (
-    DraftController, NgramProposer, RoundPlan, RowPlan, RowState, _Calibration, _CycleCosts, _Ema, _upper,
+    DraftController, NgramProposer, RoundPlan, RowPlan, RowState, SpeculativeEngine, _Calibration, _CycleCosts, _Ema, _upper,
 )
 
 
@@ -105,6 +106,94 @@ def test_controller_finds_best_depth_including_plain(draft, slope):
         assert _throughput(choice, draft, machine) >= 0.95 * _throughput(best, draft, machine)
         # Probes and split rounds included, the second half runs near the optimum.
         assert report["rate"] >= 0.9 * _throughput(best, draft, machine)
+
+
+def _deepening_engine(controller, temperature = 0):
+    engine = object.__new__(SpeculativeEngine)
+    engine._exact, engine.controller, engine._extension_streak = True, controller, True
+    engine.drafter = SimpleNamespace(trained_depth = 7, extended_depth = 15, extension_serves = lambda row, depth: row.serves)
+    engine._rows = [SimpleNamespace(sample = SimpleNamespace(temperature = temperature), processors = [],
+                                    draft = SimpleNamespace(serves = True))]
+    return engine
+
+
+def test_deeper_rounds_follow_fully_accepted_blocks_within_the_controllers_limits():
+    controller = DraftController(max_depth = 7)
+    state = RowState(controller.new_reply(), remaining = 512)
+    base = RoundPlan("round", rows = (RowPlan("draft", 7),))
+    engine = _deepening_engine(controller)
+    for accepted in (7, 7, 7, 6):
+        controller.record_round(base, [state], [accepted], seconds = 1)
+        engine._observe_extension(base, [state], [accepted])
+    assert engine._extend(base, [state]) is base
+    engine._observe_extension(base, [state], [7])
+    wide = engine._extend(base, [state])
+    assert (controller.max_depth, wide.width, wide.controller_depth) == (7, 16, 7)
+    from unsloth_zoo.mlx import inference
+    narrow = inference._NATIVE_CAUSAL_ROWS
+    for plan, rows in ((RoundPlan("round", rows = (RowPlan("copy", 12),)), narrow), (wide, 16)):
+        with engine._verify_scope(plan):
+            assert getattr(inference._VERIFY_STATE, "causal_rows", narrow) == rows
+    before = state.stats.tokens
+    controller.record_round(wide, [state], [12], seconds = 1)
+    assert state.stats.tokens == before + 13 and 16 not in controller.verify_cost.get(1, {})
+    engine._observe_extension(wide, [state], [12])
+    assert engine._extend(base, [state]).width == 16
+    engine._observe_extension(wide, [state], [3])
+    assert engine._extend(base, [state]) is base
+    engine._observe_extension(RoundPlan("round", rows = (RowPlan("copy", 12),)), [state], [9])
+    assert engine._extend(base, [state]) is base
+
+    engine._extension_streak = True
+    split = replace(base, split = True)
+    assert engine._extend(split, [state]) is split
+    budget = replace(base, split = True, trim = True)
+    deep_budget = engine._extend(budget, [state])
+    assert deep_budget.width == 16 and deep_budget.controller_depth == 7 and not deep_budget.trim
+    assert engine._extend(base, [replace(state, remaining = 10)]).width == 10
+    assert _deepening_engine(DraftController(max_depth = 7, max_copy = 10))._extend(base, [state]).width == 11
+    assert _deepening_engine(DraftController(max_depth = 7, fixed_depth = True))._extend(base, [state]) is base
+    assert _deepening_engine(controller, temperature = 0.7)._extend(base, [state]) is base
+    for refusal in ("_exact", "rows", "processors", "probe", "producer"):
+        refused = _deepening_engine(controller)
+        if refusal == "_exact":
+            refused._exact = False
+        elif refusal == "rows":
+            refused._rows = refused._rows * 2
+        elif refusal == "processors":
+            refused._rows[0].processors = [object()]
+        elif refusal == "producer":
+            refused._rows[0].draft.serves = False
+        else:
+            refused.controller = DraftController(max_depth = 7)
+            refused.controller._reference = 1.0
+        assert refused._extend(base, [state]) is base, refusal
+    poor = RowState(controller.new_reply(), remaining = 512)
+    for _ in range(32):
+        controller.record_round(base, [poor], [0], seconds = 1)
+    assert engine._extend(base, [poor]) is base
+    cold = RowState(controller.new_reply(), remaining = 512)
+    for rate in cold.stats.draft:
+        rate.value = 0.95
+    cold.stats.draft_seen[:] = [True] * 7
+    assert engine._extend(base, [cold]) is base
+    engine._extension_streak = True
+    engine._rows[0].draft.serves = False
+    engine._observe_extension(base, [state], [7])
+    assert not engine._extension_streak
+
+
+def test_copy_candidates_keep_their_load_profile():
+    controller = DraftController(max_depth = 7)
+    controller.copy_profile = {8: 0.01, 12: 1.0}
+    controller.plain_cost[1] = _Ema(0.01, 2)
+    controller.verify_cost[1] = {8: _Ema(0.01, 2)}
+    controller.draft_cost[7] = _Ema(0.002, 2)
+    state = RowState(controller.new_reply(), copy_available = 11)
+    assert controller._round_at(12, [state]).rows == (RowPlan("draft", 7),)
+    state.can_draft = False
+    assert controller._round_at(12, [state]).rows == (RowPlan("copy", 11),)
+    assert controller.round_seconds(controller._round_at(12, [state]), [state]) == 1.0
 
 
 def test_controller_prefers_plain_decoding_over_width_one_rounds():
@@ -280,6 +369,10 @@ def test_drafter_confidences_are_calibrated_against_acceptance():
         cold.observe([0.99, 0.99, 0.99], 3, 0)
     assert cold.beta[2] == cold.beta[0] < 1.0
     assert cold.alpha[0] < 0 == cold.alpha[1] == cold.alpha[2]
+    deep = _Calibration(3, 1)
+    for _ in range(8):
+        deep.observe([0.99, 0.99, 0.99], 3, 0)
+    assert deep.alpha[2] == deep.alpha[1] == deep.alpha[0] < 0  # unreached deep positions take the last reached offset
     assert cold.expected([0.99] * 3) < 2.0
     before = [list(r) for r in cold._records]
     cold.observe([float("nan"), float("inf"), -0.1], 3, 3)
@@ -575,6 +668,7 @@ def test_a_context_drafter_drafts_the_next_block_ahead_until_a_push_overtakes_it
     from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
     sizes, drafter, row = [], object.__new__(ContextDrafter), ContextRow([])
     drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
+    drafter.trained_depth = drafter.extended_depth = 3
     # Each draft encodes its block's anchor and context length.
     drafter._draft = lambda pending, context, cache, size, sampler, dtype: sizes.append(size) or mx.array([[100 * pending + 10 * context.shape[1] + i for i in range(size - 1)]])
     drafter.push(row, [1, 2], mx.zeros((2, 4)))
@@ -591,6 +685,7 @@ def test_a_context_drafter_drafts_from_the_block_that_moves_a_long_backlog_into_
     from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
     sizes, drafter, row = [], object.__new__(ContextDrafter), ContextRow([])
     drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
+    drafter.trained_depth = drafter.extended_depth = 3
     drafter._draft = lambda pending, context, cache, size, sampler, dtype: sizes.append(size) or mx.array([[100 * pending + 10 * context.shape[1] + i for i in range(size - 1)]])
     drafter.push(row, [1], mx.zeros((63, 4)))
     assert row.ready and row.prefetched is None and not sizes and not row.flushed
@@ -605,6 +700,7 @@ def test_a_context_drafter_serves_a_prefetched_block_of_the_requested_depth_unsl
     from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
     drafter = object.__new__(ContextDrafter)
     drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
+    drafter.trained_depth = drafter.extended_depth = 3
     drafter._draft = lambda pending, context, cache, size, sampler, dtype: mx.arange(size - 1)[None]
     def ready():
         row = ContextRow([])
@@ -671,6 +767,8 @@ def test_prepared_plans_preserve_controller_state_and_choices():
     curve.observe(4, 0.04)
     baseline, original = copy.deepcopy((controller, states))
     for index in range(160):
+        # Reaching a verify floor also changes the warmup list during planning.
+        controller.min_rows = baseline.min_rows = 5 if index < 4 else 0
         before = pickle.dumps((controller, states))
         prepared = controller.prepare_plan(states)
         assert pickle.dumps((controller, states)) == before

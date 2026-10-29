@@ -1355,8 +1355,9 @@ apple_gpu_only = pytest.mark.skipif(not _apple_gpu(), reason="requires a non-par
 
 
 @apple_gpu_only
-def test_singleton_decode_serves_only_a_call_naming_the_speculative_trait():
+def test_singleton_decode_serves_only_a_call_naming_the_speculative_trait(monkeypatch):
     from unsloth_zoo.mlx import inference
+    monkeypatch.delenv("UNSLOTH_MLX_FAST_VERIFY", raising = False)
     model = nn.Module()
     model.proj = nn.QuantizedLinear(512, 512, bias = False, group_size = 64, bits = 4)
     model.eval()
@@ -1626,6 +1627,28 @@ def test_tensor_lane_readers_keep_each_rows_bits_within_fp32_reordering(monkeypa
                 assert mx.all(mx.abs(few.astype(mx.float32) - exact[:rows]) <= bound[:rows]).item(), rows
     matmul._lane_launch.cache_clear()
     matmul._lane_sums_launch.cache_clear()
+
+
+@apple_gpu_only
+def test_inference_scopes_hold_the_row_invariant_opt_in_around_every_scope_they_enter(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    head = nn.QuantizedLinear(512, 136, bias = False, group_size = 64, bits = 4)
+    head._unsloth_lane_qmm = True
+    head.__class__ = inference._lane_module_class(type(head))
+    model = nn.Module()
+    model.proj, model.lm_head = nn.QuantizedLinear(512, 512, bias = False, group_size = 64, bits = 4), head
+    model.eval()
+    for flag in ("0", "1", "1"):
+        monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", flag)
+        with pytest.raises(RuntimeError, match = "exit"), inference.inference_scopes(model, ("speculative",)):
+            with inference.inference_scopes(model, ("speculative",)):
+                held = inference._opt_in_held(inference._FAST_VERIFY_ENV)
+                assert held == (flag == "1") and ("_unsloth_singleton_scopes" in vars(model.proj)) != held
+                assert isinstance(model.lm_head, inference._TargetHeadFP32) == held
+            assert inference._opt_in_held(inference._FAST_VERIFY_ENV) == held
+            raise RuntimeError("exit")
+        assert not inference._opt_in_held(inference._FAST_VERIFY_ENV)
+        assert type(model.proj) is nn.QuantizedLinear and model.lm_head is head
 
 
 def test_lane_qmm_covers_affine_2_to_8_bit_weights_on_apple_gpus(monkeypatch):
