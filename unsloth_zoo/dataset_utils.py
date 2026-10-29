@@ -2664,9 +2664,8 @@ def trl_collator_ignores_labels(collator = None):
 pass
 
 def _batched_columns(dataset):
-    # Mask filters and label building read whole columns a batch at a time: same rows, same values, one
-    # Python call per batch. Only for a map-style Dataset with no output format, where a batch column holds
-    # the same Python values as one-row reads; an IterableDataset stays row by row (it runs lazily in training).
+    # Batch columns hold the same Python values as one-row reads only with no output format;
+    # an IterableDataset runs lazily in training, so it stays row by row.
     return isinstance(dataset, Dataset) and getattr(dataset, "format", {}).get("type", None) is None
 pass
 
