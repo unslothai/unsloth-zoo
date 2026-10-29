@@ -397,9 +397,10 @@ def _release_pool_pinned(start = 0):
 
 
 def _reset_pinned_cap():
-    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP
+    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _PINNED_LIVE_PEAK
     GC_PINNED_CAP = None
     _WARNED_ABOUT_PINNED_CAP = False
+    _PINNED_LIVE_PEAK = 0  # a new model's live set sets its own bound, not the last one's
 
 
 def _note_pinned_live():

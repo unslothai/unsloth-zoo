@@ -589,3 +589,17 @@ def test_pending_bound_follows_the_whole_live_set(monkeypatch, gc_module):
     gc_module._release_pinned(4096)
     gc_module._reserve_pinned(4096)                            # past 2 x the live set: flush
     assert flushes
+
+
+def test_reinit_drops_the_previous_live_peak(monkeypatch, gc_module):
+    # A larger model trained earlier in the same process must not widen the next model's bound.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    monkeypatch.setattr(gc_module, "_PINNED_LIVE_PEAK", 1 << 19)
+    gc_module._reset_pinned_cap()
+    assert gc_module._PINNED_LIVE_PEAK == 0
+    monkeypatch.setattr(gc_module, "GC_PINNED_CAP", 1 << 20)  # the next model's cap, computed
+    assert gc_module._reserve_pinned(4096)              # 2 x this model's 4096: kept
+    assert flushes == [] and gc_module._PINNED_LIVE_PEAK == 4096
+    gc_module._release_pinned(4096)
+    gc_module._reserve_pinned(4096)                     # a third generation flushes again
+    assert flushes
