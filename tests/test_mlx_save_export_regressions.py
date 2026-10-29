@@ -4544,6 +4544,32 @@ def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path)
     assert loaded("hello world")["input_ids"] == bare("hello world")["input_ids"]
 
 
+def test_tokenizer_class_from_another_family_keeps_tokenizer_json(tmp_path):
+    """Mistral fine-tunes declare LlamaTokenizerFast over a byte-level vocab.
+    transformers 5 builds that class's own Metaspace pipeline instead of
+    tokenizer.json's, so replies showed Ġ for spaces and Ċ for newlines
+    (unsloth #15858). AutoTokenizer keeps tokenizer.json when the declared
+    class and the model_type's class disagree."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    import unsloth_zoo.mlx.loader as loader
+
+    vocab = {"<unk>": 0, "<s>": 1, "</s>": 2, "h": 3, "i": 4, "Ġ": 5, "Ċ": 6, "hi": 7, "Ġhi": 8}
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[("h", "i"), ("Ġ", "hi")], unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "LlamaTokenizerFast",
+        "bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>",
+    }))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "mistral"}))
+
+    tokenizer = loader._load_mlx_tokenizer(tmp_path)
+    assert tokenizer.decode([7, 8, 6, 7]) == "hi hi\nhi"
+    assert tokenizer("hi hi\nhi", add_special_tokens=False)["input_ids"] == [7, 8, 6, 7]
+    assert tokenizer.eos_token == "</s>"
+
+
 def test_model_type_lookup_never_builds_a_model_config(monkeypatch, tmp_path):
     """The recovery above must not reintroduce the validation this fix removes."""
     import transformers
