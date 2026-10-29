@@ -1639,9 +1639,11 @@ def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
     assert [inputs[k].tolist() for k in ("input_ids", "attention_mask")] == [[[1, 2], [3, 4]], [[1, 1]] * 2]
 
 
-def test_a_vision_row_s_clips_reach_the_processor_in_order_and_group_only_with_the_same_clips():
+def test_a_vision_row_s_clips_reach_the_processor_in_order_and_group_only_with_the_same_clips(monkeypatch):
     from dataclasses import replace
+    from unsloth_zoo.mlx import generate
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _validate_vlm_requests
+    monkeypatch.setattr(generate, "_vlm_prepares_videos", lambda: True)
     rows = _validate_vlm_requests([
         GenerationRequest(prompt = "ab", videos = [pathlib.Path("a.mp4"), "b.mp4"], fps = 0.5),
         GenerationRequest(prompt = "cd", videos = ["c.mp4"], fps = 0.5),
@@ -1673,10 +1675,19 @@ def test_a_vision_row_s_clips_reach_the_processor_in_order_and_group_only_with_t
     (GenerationRequest(prompt = "p", videos = "a.mp4"), TypeError, "sequence of clip paths"),
     (GenerationRequest(prompt = "p", videos = ["a.mp4"], fps = 0), ValueError, "fps must be positive"),
 ])
-def test_a_vision_row_s_clips_are_refused_where_no_batch_can_read_them(request_, error, match):
-    from unsloth_zoo.mlx.generate import _validate_vlm_requests
+def test_a_vision_row_s_clips_are_refused_where_no_batch_can_read_them(request_, error, match, monkeypatch):
+    from unsloth_zoo.mlx import generate
+    monkeypatch.setattr(generate, "_vlm_prepares_videos", lambda: True)
     with pytest.raises(error, match = match):
-        _validate_vlm_requests([request_], GenerationDefaults())
+        generate._validate_vlm_requests([request_], GenerationDefaults())
+
+
+def test_a_vision_row_s_clips_are_refused_where_prepare_inputs_takes_no_videos(monkeypatch):
+    from unsloth_zoo.mlx import generate
+    monkeypatch.setattr(generate, "_vlm_prepares_videos", lambda: False)
+    with pytest.raises(ValueError, match = "mlx-vlm >= 0.5.0"):
+        generate._validate_vlm_requests([GenerationRequest(prompt = "p", videos = ["a.mp4"])], GenerationDefaults())
+    assert generate._validate_vlm_requests([GenerationRequest(prompt = "p")], GenerationDefaults())
 
 
 def test_a_processor_is_shown_its_own_row_s_history_from_its_own_offset():
@@ -2019,3 +2030,16 @@ def test_single_row_decode_skips_the_shortcut_only_for_an_unpadded_decode_step()
     # The stand-in predicate answers as mlx-vlm's own outside a skipped call.
     assert namespace["_is_single_row_batch_cache"]._unsloth_native is native
     assert namespace["_is_single_row_batch_cache"](row(0)) is True
+
+
+def test_the_videos_probe_reads_the_installed_mlx_vlm():
+    try:
+        utils = importlib.import_module("mlx_vlm.utils")
+    except Exception:
+        pytest.skip("mlx-vlm does not import here")
+    from unsloth_zoo.mlx import generate
+    if isinstance(utils, types.ModuleType) and "mlx_simulation" in (getattr(utils, "__file__", "") or ""):
+        pytest.skip("simulated mlx-vlm")
+    generate._vlm_prepares_videos.cache_clear()
+    takes = "videos" in inspect.signature(utils.prepare_inputs).parameters
+    assert generate._vlm_prepares_videos() is takes

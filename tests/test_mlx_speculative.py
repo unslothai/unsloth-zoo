@@ -454,7 +454,9 @@ def test_only_the_verify_forward_is_built_as_a_verify_block():
 
 
 @pytest.mark.parametrize("history_only", [True, False])
-def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_allow(history_only):
+def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_allow(history_only, monkeypatch):
+    import contextlib
+
     import mlx.core as mx
     from unsloth_zoo.mlx.speculative import EngineRow, SpeculativeEngine, _Row
 
@@ -467,7 +469,9 @@ def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_a
     queued = []
     step = lambda inputs, ahead = 0: queued.append(ahead) or (mx.array([3, 3]), None, None)
     record = SimpleNamespace(record_plain = lambda *_a: None, interrupts_plain = lambda _s: False)
-    engine = _bare_engine(SpeculativeEngine, _step = step, _stream = mx.default_stream(mx.default_device()), controller = record)
+    # No stream work happens here; the CPU shim implements none.
+    monkeypatch.setattr(mx, "stream", lambda _s: contextlib.nullcontext())
+    engine = _bare_engine(SpeculativeEngine, _step = step, _stream = None, controller = record)
     engine._rows, engine._states = rows, lambda: []
     list(engine._plain(3, []))
     assert (1 in queued) == history_only

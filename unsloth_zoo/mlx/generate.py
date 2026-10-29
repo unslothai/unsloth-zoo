@@ -595,6 +595,14 @@ def _unpadded_lengths(mask) -> list[int] | None:
 VLM_TOKEN_ID_PROMPTS = True
 
 
+@functools.cache
+def _vlm_prepares_videos() -> bool:
+    try:
+        return "videos" in inspect.signature(importlib.import_module("mlx_vlm.utils").prepare_inputs).parameters
+    except Exception:
+        return False
+
+
 def _validate_vlm_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
@@ -665,6 +673,9 @@ def _validate_vlm_requests(
             raise TypeError(f"requests[{index}].videos must be a sequence of clip paths.")
         if request.fps is not None and not request.fps > 0:
             raise ValueError(f"requests[{index}].fps must be positive.")
+        if request.videos and not _vlm_prepares_videos():
+            # Before 0.5.0 prepare_inputs swallows ``videos`` in **kwargs: the clip's markers would decode with no frames.
+            raise ValueError(f"requests[{index}] carries videos, which batched generation needs mlx-vlm >= 0.5.0 for.")
         if request.videos:
             validated[index] = replace(
                 validated[index], videos=tuple(os.fspath(clip) for clip in request.videos)
