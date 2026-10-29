@@ -105,6 +105,14 @@ def test_split_tiles_match_the_native_mlp_and_the_rest_stays_native(prepared):
     assert mx.array_equal(decode, mlp(x[:, :3])).item()
 
 
+def test_layers_share_a_program_that_unloads_with_the_last(prepared):
+    first, second = (mlp.__dict__.pop(ane._STATE) for mlp in prepared.layers)
+    first.close()
+    assert first.program is second.program and second.program._finalizer.alive   # still serving the other layer
+    second.close()
+    assert not second.program._finalizer.alive
+
+
 def test_a_partial_tile_worth_padding_takes_the_split(prepared):
     mlp = prepared.layers[1]
     mlp.__dict__[ane._STATE].pad_from = TILE // 2
@@ -300,11 +308,9 @@ def test_calibration_runs_on_the_most_common_quantization_and_keys_on_every_proj
     monkeypatch.setattr(ane, "_memory_budget", lambda: budget_layers * cost)
     assert ane.prepare_ane_prefill(model, tile = TILE).layers == budget_layers
     assert len(calibrated) == 1
-    serving = [layer for layer in model.layers if layer.__dict__.get(ane._STATE) is calibrated[0]]
-    if budget_layers == 5:   # the calibration split serves the uniform layer it was measured on, and only that one
-        assert len(serving) == 1 and ane._bits(serving[0]) == (4, 4, 4) and not closed
-    else:   # the probe was not admitted, so its split is closed
-        assert not serving and closed == [calibrated[0]]
+    # the layers' banks replace the calibration split, admitted or not
+    assert not any(layer.__dict__.get(ane._STATE) is calibrated[0] for layer in model.layers)
+    assert closed == [calibrated[0]] and [p.bits for p, *_ in calibrated[0].sources] == [4, 4, 4]
     ane.release_ane_prefill(model)
     keys = {ane._machine_key(model.layers[i], TILE, "stock") for i in (0, 1, 2, 3)}
     model.layers[2].up_proj = _projection(5, inputs = HIDDEN, outputs = CHANNELS)
@@ -349,6 +355,7 @@ def test_free_memory_admits_layers_by_their_own_cost(monkeypatch):
 @pytest.mark.parametrize("readings,factor", [([5, 6.5, 7, 9.5, 1, 10], 2.5), ([None, 1.5, 7, 9.5, 1, 10], 5.75),
                                              ([None] * 6, 0.0)])
 def test_program_loads_report_the_wired_memory_they_add(readings, factor, monkeypatch):
+    monkeypatch.setattr(ane, "_BANK_BYTES", 1)   # one layer per program
     weights = 3 * (CHANNELS // 2) * HIDDEN   # each layer's int8 Neural Engine bytes at share 0.5
     values = iter([None if r is None else r * weights for r in readings])
     monkeypatch.setattr(ane, "_wired_bytes", lambda: next(values))
@@ -362,8 +369,11 @@ def test_program_loads_report_the_wired_memory_they_add(readings, factor, monkey
     ane.release_ane_prefill(model)
 
 
-@pytest.mark.parametrize("level,over_layers,kept", [(1, 0, 3), (2, 0, 3), (1, 1.5, 1), (2, 0.5, 2), (4, 0, 0)])
-def test_memory_pressure_releases_layers_from_the_end(level, over_layers, kept, caplog, monkeypatch):
+@pytest.mark.parametrize("level,over_layers,kept,bank_bytes", [(1, 0, 3, 1), (2, 0, 3, 1), (1, 1.5, 1, 1),
+                                                                (2, 0.5, 2, 1), (4, 0, 0, 1), (2, 0.5, 1, None)])
+def test_memory_pressure_releases_layers_from_the_end(level, over_layers, kept, bank_bytes, caplog, monkeypatch):
+    # One layer per program releases layer by layer; with two in the last program, both go together.
+    monkeypatch.setattr(ane, "_BANK_BYTES", bank_bytes or ane._BANK_BYTES)
     model = _model()
     assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 2
     model.layers.append(_model(seed = 1).layers[0])   # a second prepare joins the first one's group
@@ -380,7 +390,7 @@ def test_memory_pressure_releases_layers_from_the_end(level, over_layers, kept, 
     with ane.ane_prefill_mlp(model):
         outputs = [mlp(_rows(TILE)) for mlp in order]
     assert [ane._STATE in mlp.__dict__ for mlp in order] == [True] * kept + [False] * (3 - kept)
-    assert closed == splits[kept:][::-1]
+    assert {id(s) for s in closed} == {id(s) for s in splits[kept:]}
     for mlp, out in zip(order, outputs):   # a released layer's own call already ran natively
         assert mx.array_equal(out, mlp(_rows(TILE))).item() != (ane._STATE in mlp.__dict__)
     warnings = [r for r in caplog.records if "memory pressure" in r.getMessage()]
@@ -409,6 +419,24 @@ def test_the_split_runs_only_on_the_gpu_route_it_was_tuned_on(monkeypatch, caplo
     assert runs(inference.inference_scopes(model)) == runs(inference.inference_scopes(model)) == 0
     assert runs(ane.ane_prefill_mlp(model)) == 2   # standalone, the projections run stock: slower is fine
     assert sum("stock/stock/int8, faster than the dense/dense/dense" in r.getMessage() for r in caplog.records) == 1
+    ane.release_ane_prefill(model)
+
+
+def test_pressure_releases_a_whole_program_wherever_its_layers_sit(monkeypatch):
+    model = _model()
+    model.layers.append(_model(seed = 1).layers[0])
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 3   # one program
+    model.layers[1].__dict__.pop(ane._STATE).close()   # as a stale split detaches; its procedure stays loaded
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 1   # a second program, in between
+    splits = [layer.__dict__[ane._STATE] for layer in model.layers]
+    wired = ane._WIRED_FACTOR * (splits[0].bank.bytes + splits[1].bank.bytes)   # all three of the first's slices
+    monkeypatch.setattr(ane, "_pressure_level", lambda: 1)
+    monkeypatch.setattr(ane, "_working_set", lambda: wired - 1)
+    monkeypatch.setattr(ane.mx, "get_active_memory", lambda: 0)
+    ane._relieve(splits[0].group)
+    kept = [ane._STATE in layer.__dict__ for layer in model.layers]
+    assert kept in ([True, False, True], [False, True, False])   # one program, with all of its layers
+    assert [split.program._finalizer.alive for split in splits] == kept
     ane.release_ane_prefill(model)
 
 

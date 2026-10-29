@@ -300,9 +300,9 @@ class Program:
             time.sleep(0.2)
         raise AneError(f"{what} failed: {message}")
 
-    def request(self, inputs, outputs):
-        """A reusable request binding `inputs` and `outputs` (Surfaces) to the program's tensors in order."""
-        return _Request(self, inputs, outputs)
+    def request(self, inputs, outputs, procedure = 0):
+        """A reusable request binding `inputs` and `outputs` (Surfaces) to procedure `procedure`'s tensors in order."""
+        return _Request(self, inputs, outputs, procedure)
 
     def close(self):
         self._finalizer()
@@ -349,16 +349,21 @@ def _unload(model, directory, marker):
 
 
 class _Request:
-    def __init__(self, program, inputs, outputs):
+    def __init__(self, program, inputs, outputs, procedure = 0):
         rt = _runtime()
         self.program, self.surfaces = program, (tuple(inputs), tuple(outputs))  # kept alive with the request
         with rt.pool():
+            # Each procedure's tensors are numbered among all of the program's: its own start after the earlier ones'.
+            model = rt.call(program.model, "model")
+            first = [rt.call(rt.call(model, f"{kind}SymbolIndicesForProcedureIndex:", procedure,
+                                     argtypes = [ctypes.c_uint]), "firstIndex", restype = ctypes.c_ulong)
+                     for kind in ("input", "output")]
             request = rt.call(
                 rt.cls("_ANERequest"),
                 "requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:",
-                rt.array([s.handle for s in inputs]), rt.array([rt.number(i) for i in range(len(inputs))]),
-                rt.array([s.handle for s in outputs]), rt.array([rt.number(i) for i in range(len(outputs))]),
-                None, None, rt.number(0))
+                rt.array([s.handle for s in inputs]), rt.array([rt.number(first[0] + i) for i in range(len(inputs))]),
+                rt.array([s.handle for s in outputs]), rt.array([rt.number(first[1] + i) for i in range(len(outputs))]),
+                None, None, rt.number(procedure))
             if not request:
                 raise AneError("the runtime rejected the request")
             self.handle = rt.retain(request)
@@ -445,12 +450,19 @@ class Function:
         size = self.const("tensor<int32, [4]>", f"[1, {channels}, 1, {rows}]")
         return self.op("slice_by_size", (1, channels, 1, rows), x = x, begin = begin, size = size)
 
-    def program(self, outputs):
+    def function(self, outputs):
         arguments = ", ".join(f"{type_} {name}" for name, type_ in self.inputs.items())
-        return ('program(1.3)\n[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, '
-                '{"coremlc-version", "3505.4.1"}})]\n{\n'
-                f"  func {self.name}<ios18>({arguments}) {{\n" + "\n".join(self.lines) +
-                f"\n  }} -> ({', '.join(outputs)});\n}}\n")
+        return (f"  func {self.name}<ios18>({arguments}) {{\n" + "\n".join(self.lines) +
+                f"\n  }} -> ({', '.join(outputs)});\n")
+
+    def program(self, outputs):
+        return mil_program([self.function(outputs)])
+
+
+def mil_program(functions):
+    """A program of several functions; a request selects one by its index, its procedure."""
+    return ('program(1.3)\n[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, '
+            '{"coremlc-version", "3505.4.1"}})]\n{\n' + "".join(functions) + "}\n")
 
 
 logger = logging.getLogger(__name__)
@@ -465,6 +477,7 @@ _WATCHDOG = 5.0         # seconds a Neural Engine evaluation may take before the
 _MEMORY_SHARE = 0.5     # of the memory the model leaves free; the rest stays for the KV cache and activations
 _PRESSURE_WARN, _PRESSURE_CRITICAL = 2, 4   # kern.memorystatus_vm_pressure_level
 _WIRED_FACTOR = 3       # the Neural Engine wires 1.85x (M3 Max) to 2.7x (M5 Pro) a program's int8 weights in prefill
+_BANK_BYTES = 2 << 30   # int8 weights per program; 1-4 GB banks load on M3 Max, and 2 GB ones on M5 Pro
 _STATE = "_unsloth_ane_split"
 _CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "unsloth", "mlx_ane_prefill.json")
 _LOCK = threading.RLock()
@@ -560,11 +573,18 @@ def _down_slabs(k):
     return next(n for n in range(1, k // _ALIGN + 1) if k % n == 0 and k // n <= _DOWN_SLAB)
 
 
-def _program(mlp, k, tile):
-    """MIL for channels [0, k): down[:, :k] @ (silu(gate[:k] @ x) * up[:k] @ x), x laid out [1, hidden, 1, tile]."""
+def _bank_program(layers, tile):
+    """MIL and weights of one program whose procedure i computes layer i's slice, for `layers` [(mlp, k)]."""
+    blob = Blob()
+    return mil_program([_slice(blob, i, mlp, k, tile) for i, (mlp, k) in enumerate(layers)]), blob.bytes()
+
+
+def _slice(blob, index, mlp, k, tile):
+    """Procedure `index` for channels [0, k): down[:, :k] @ (silu(gate[:k] @ x) * up[:k] @ x), x laid out
+    [1, hidden, 1, tile]."""
     gate, up, down = map(_dequantized, _projections(mlp))
     hidden = down.shape[0]
-    blob, fn = Blob(), Function("main", x = f"tensor<fp16, [1, {hidden}, 1, {tile}]>")
+    fn = Function(f"procedure{index:03d}", x = f"tensor<fp16, [1, {hidden}, 1, {tile}]>")
     gate_up = fn.conv1x1("x", fn.int8_weight(blob, *_int8_rows(mx.concatenate([gate[:k], up[:k]]))), 2 * k, tile)
     g, u = fn.slice_channels(gate_up, 0, k, tile), fn.slice_channels(gate_up, k, k, tile)
     shape = (1, k, 1, tile)
@@ -581,7 +601,7 @@ def _program(mlp, k, tile):
         part = fn.conv1x1(fn.slice_channels(act, i * width, width, tile), weight, hidden, tile)
         total = part if total is None else fn.op("add", (1, hidden, 1, tile), x = total, y = part)
     y = fn.op("mul", (1, hidden, 1, tile), x = total, y = fn.const("fp16", repr(1 / _ACT_SCALE)))
-    return fn.program([y]), blob.bytes()
+    return fn.function([y])
 
 
 def _split_bytes(mlp, k):
@@ -639,13 +659,14 @@ class _Attached:
 
 
 def _relieve(group):
-    """Release splits from the end of `group` when memory runs short: enough to bring active memory plus what the Neural
-    Engine wires back under the working set, or all of them at critical pressure."""
+    """Release programs from the end of `group` when memory runs short: enough to bring active memory plus what the
+    Neural Engine wires back under the working set, or all of them at critical pressure. Running any procedure wires a
+    whole program, including those of layers that have detached, so programs are what is priced and released."""
     level = _pressure_level()
     attached = [m for m in map(lambda ref: ref(), group.mlps)
                 if m is not None and getattr(m.__dict__.get(_STATE), "group", None) is group]
-    over = (mx.get_active_memory() - _working_set()
-            + sum(_WIRED_FACTOR * 3 * s.k * s.hidden for s in (m.__dict__[_STATE] for m in attached)))
+    banks = {id(s.bank): s.bank for s in (m.__dict__[_STATE] for m in attached)}.values()
+    over = mx.get_active_memory() - _working_set() + sum(_WIRED_FACTOR * bank.bytes for bank in banks)
     if level < _PRESSURE_CRITICAL and over <= 0:
         if level >= _PRESSURE_WARN and not group.warned:
             group.warned = True
@@ -653,10 +674,11 @@ def _relieve(group):
         return
     total, freed, group.warned = len(attached), 0, True
     while attached and (level >= _PRESSURE_CRITICAL or freed < over):
-        mlp = attached.pop()
-        split = mlp.__dict__.pop(_STATE)
-        freed += split.cost
-        split.close()
+        bank = attached[-1].__dict__[_STATE].bank   # with every layer it serves, wherever a later prepare put them
+        for mlp in [m for m in attached if m.__dict__[_STATE].bank is bank]:
+            mlp.__dict__.pop(_STATE).close()
+        attached = [m for m in attached if _STATE in m.__dict__]
+        freed += _WIRED_FACTOR * bank.bytes
     logger.warning("Neural Engine prefill: memory pressure released %d of %d layers (%.1f GB priced); they use the GPU until "
                    "prepare_ane_prefill(model) runs again", total - len(attached), total, freed / 2**30)
 
@@ -681,22 +703,37 @@ class _Surfaces:
         self.input, self.output = Surface(hidden * tile * 2), Surface(hidden * tile * 2)
 
 
+class _Bank:
+    """Consecutive layers' slices as the procedures of one program, so a model loads a few programs instead of one per
+    layer (the system loads at most 127). Running any procedure wires the whole program, so it unloads only with the
+    last split that uses it."""
+
+    def __init__(self, layers, tile):
+        source, before = _bank_program(layers, tile), _wired_bytes()
+        self.program = Program(*source)
+        after = _wired_bytes()
+        self.wired = None if before is None or after is None else after - before
+        self.bytes = sum(3 * k * _projections(mlp)[2].weight.shape[0] for mlp, k in layers)
+        self.users = 0
+
+    def release(self):
+        self.users -= 1
+        if not self.users:
+            self.program.close()
+
+
 class _Split:
-    def __init__(self, mlp, k, tile, surfaces, program = None):
+    def __init__(self, mlp, k, tile, surfaces, bank = None, procedure = 0):
         gate, up, down = _projections(mlp)
         self.k, self.tile, self.hidden, self.surfaces = k, tile, down.weight.shape[0], surfaces
-        self.wired = None
-        if program is None:
-            source, before = _program(mlp, k, tile), _wired_bytes()
-            program = Program(*source)
-            after = _wired_bytes()
-            self.wired = None if before is None or after is None else after - before
-        self.program = program
-        self.request = self.program.request([surfaces.input], [surfaces.output])
+        self.bank = bank or _Bank([(mlp, k)], tile)
+        self.bank.users += 1
+        self.program = self.bank.program
+        self.request = self.program.request([surfaces.input], [surfaces.output], procedure)
         self.rest = (_remainder(gate, rows = k), _remainder(up, rows = k), _remainder(down, columns = k))
         mx.eval([p.parameters() for p in self.rest])
         self.sources = tuple((p, p.weight, p.scales, p.biases) for p in (gate, up, down))
-        self.failed, self.pad_from, self.group, self.cost = False, tile, None, _split_bytes(mlp, k)
+        self.failed, self.pad_from, self.group = False, tile, None
         self.route = None
 
     def serves(self, mlp):
@@ -706,7 +743,7 @@ class _Split:
                    for p, (q, w, s, b) in zip(_projections(mlp), self.sources))
 
     def close(self):
-        self.program.close()
+        self.bank.release()
 
     def evaluate(self):
         """Run the Neural Engine half on the worker. A timed-out evaluation may still be running, so its native objects
@@ -930,32 +967,33 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
             if free < 0:
                 break
             admitted.append(mlp)
+        if first is not None:   # the layers' banks hold their own copy of it
+            first.close()
         if len(admitted) < len(mlps):
             logger.warning("Neural Engine prefill: free memory admits %d of %d layers", len(admitted), len(mlps))
-            if first is not None and all(m is not probe for m in admitted):
-                first.close()
-                first = None
             mlps = admitted
         if not mlps:
             return AnePrefillStatus(0, share, gpu, split_ms, time.perf_counter() - started, "not enough free memory")
         # A partial tile padded to a full one costs the split's time, so it pays once the GPU would take longer.
         pad_from = min(tile, math.ceil(tile * split_ms / gpu)) if gpu else tile
-        attached = []
+        k = _aligned(shape[1], share)
+        per_bank, attached = max(1, _BANK_BYTES // (3 * k * shape[0])), []
         try:
-            for mlp in mlps:
-                k = _aligned(_projections(mlp)[0].weight.shape[0], share)
-                split = first if first is not None and mlp is probe and first.k == k else None
-                mlp.__dict__[_STATE] = split = split or _Split(mlp, k, tile, surfaces)
-                split.pad_from, split.route = pad_from, _route(mlp, tile)
-                attached.append(mlp)
+            for start in range(0, len(mlps), per_bank):
+                layers = mlps[start:start + per_bank]
+                bank = _Bank([(mlp, k) for mlp in layers], tile)
+                for procedure, mlp in enumerate(layers):
+                    mlp.__dict__[_STATE] = split = _Split(mlp, k, tile, surfaces, bank, procedure)
+                    split.pad_from, split.route = pad_from, _route(mlp, tile)
+                    attached.append(mlp)
         except AneError as error:
             logger.warning("Neural Engine prefill stopped after %d of %d layers: %s", len(attached), len(mlps), error)
         # One group per model, so a second prepare's layers and the earlier ones share one shortfall.
         group = _Attached({id(m): m for _, m in model.named_modules() if m.__dict__.get(_STATE) is not None}.values())
         for mlp in group.mlps:
             mlp().__dict__[_STATE].group = group
-        loads = [split.wired / (3 * split.k * split.hidden) for split in (m.__dict__[_STATE] for m in attached)
-                 if split.wired is not None]
+        banks = {id(b): b for b in (m.__dict__[_STATE].bank for m in attached)}.values()
+        loads = [bank.wired / bank.bytes for bank in banks if bank.wired is not None]
         status = AnePrefillStatus(len(attached), share, gpu, split_ms, time.perf_counter() - started,
                                   wired_factor = float(np.median(loads)) if loads else 0.0)
         logger.info("Neural Engine prefill: %d layers at a %.0f%% channel share (one-tile MLP %.1f -> %.1f ms), "
