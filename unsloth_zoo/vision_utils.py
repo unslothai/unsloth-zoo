@@ -709,7 +709,9 @@ def _read_video_pyav(video_path: str, start: float = 0.0, end: Union[float, None
         rate = stream.average_rate or stream.guessed_rate
         video_fps = float(rate) if rate else 0.0
         if start and stream.time_base:
-            # Seek to the keyframe at or before `start` as torchvision does, instead of decoding ahead; the filter still drops frames between it and `start`.
+            # Jump to the keyframe at or before `start`, as torchvision does, rather than
+            # decoding and discarding everything ahead of a late segment. The filter below
+            # still drops the frames between that keyframe and `start`.
             try:
                 container.seek(int(start / stream.time_base), stream=stream, backward=True)
             except av.error.FFmpegError:
@@ -750,7 +752,8 @@ def _read_video_torchvision(
             output_format="TCHW",
         )
     except TypeError as exc:
-        # torchvision's read_video passes metadata_errors to av.open, which PyAV 19 removed, so every read fails; decode the range with PyAV directly.
+        # torchvision's read_video passes av.open(..., metadata_errors="ignore"), which PyAV 19
+        # removed, so every read fails before decoding. Decode the same range with PyAV directly.
         if "metadata_errors" not in str(exc):
             raise
         video, info = _read_video_pyav(
@@ -894,6 +897,7 @@ def _read_video_torchcodec(
     video = decoder.get_frames_at(indices=idx).data
     # Ensure channel-first layout (T, C, H, W). torchcodec returns NHWC.
     if hasattr(video, "ndim") and video.ndim == 4:
+        # If second dim looks like height and last dim like channels, permute to TCHW
         if video.shape[-1] in (1, 3, 4) and video.shape[1] not in (1, 3, 4):
             video = video.permute(0, 3, 1, 2).contiguous()
     if UNSLOTH_ENABLE_LOGGING:
@@ -967,7 +971,9 @@ def _is_network_share(path: str) -> bool:
     return p.startswith("//") and p[2:].split("/", 1)[0].lower() not in _LOCAL_SHARE_HOSTS
 
 
-# No real container starts with these heads, nor whitespace or a BOM; a playlist would make ffmpeg open its entries (file:// included) outside every check.
+# A real video container never starts like this (nor with whitespace or a BOM, which a padded
+# text document would); a playlist would make ffmpeg open its entries itself (file:// segments
+# included), outside every check here.
 _PLAYLIST_HEADS = (b"#EXTM3U", b"<", b"ffconcat", b"\xef\xbb\xbf", b" ", b"\t", b"\r", b"\n")
 
 
