@@ -53,6 +53,7 @@ from .common import (
     publish_to_modeling_module,
 )
 from .utils import compile_with_eager_fallback, patch_function, raise_error
+from .gemma import _linear_boundary_dtype, _to_boundary_dtype, _to_forced_output_dtype
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
@@ -360,12 +361,41 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4RMSNorm)
 
 
+def patch_Gemma4ClippableLinear():
+    """Cast the fp16 norm output to the Linear's dtype (fp32 on full finetuning; identity on LoRA)."""
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    for module, prefix in _gemma4_text_variants("ClippableLinear"):
+        publish_to_modeling_module(
+            module,
+            _linear_boundary_dtype = _linear_boundary_dtype,
+            _to_boundary_dtype = _to_boundary_dtype,
+        )
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "linear"))
+            if self.use_clipped_linears:
+                hidden_states = torch.clamp(hidden_states, self.input_min, self.input_max)
+
+            hidden_states = self.linear(hidden_states)
+
+            if self.use_clipped_linears:
+                hidden_states = torch.clamp(hidden_states, self.output_min, self.output_max)
+
+            return hidden_states
+        pass
+        patch_function(getattr(module, prefix + "ClippableLinear"), "forward", forward, match_level = "relaxed")
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear)
+
+
 def _patch_gemma4_text_attention(module, prefix):
     apply_rotary_pos_emb = module.apply_rotary_pos_emb
     ALL_ATTENTION_FUNCTIONS = module.ALL_ATTENTION_FUNCTIONS
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     from .gemma4_banded_attention import _packed_document_sdpa
+    from .sdpa_gqa import make_gqa_sdpa
+    gqa_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
     # Eager: the mask check syncs to host.
     packed_document_sdpa = torch.compiler.disable(_packed_document_sdpa, recursive = True)
     packed_documents = os.environ.get("UNSLOTH_GEMMA4_PACKED_DOCUMENTS", "1") != "0"
@@ -391,6 +421,10 @@ def _patch_gemma4_text_attention(module, prefix):
         cos, sin = position_embeddings
         cos = cos.to(torch.float32)
         sin = sin.to(torch.float32)
+
+        # fp16 norm output meets fp32 projections on full finetuning (identity on LoRA).
+        if not torch.is_autocast_enabled(hidden_states.device.type):
+            hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "q_proj"))
 
         # q: fp16 proj -> fp16 q_norm -> float32 -> RoPE (float32) -> (b, h, q, d)
         query_states = self.q_proj(hidden_states).view(hidden_shape)
@@ -504,21 +538,25 @@ def _patch_gemma4_text_attention(module, prefix):
                     getattr(self, "num_key_value_groups", 1) or 1,
                 )
             if attn_output is None:
-                attn_output = scaled_dot_product_attention(
+                attn_output = gqa_sdpa(
                     query_states,
                     key_states,
                     value_states,
-                    attn_mask = attn_mask,
-                    dropout_p = self.attention_dropout if self.training else 0.0,
-                    is_causal = is_causal,
-                    scale = self.scaling,
-                    enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                    attn_mask,
+                    self.attention_dropout if self.training else 0.0,
+                    is_causal,
+                    self.scaling,
+                    getattr(self, "num_key_value_groups", 1) or 1,
                 )
             attn_output = attn_output.transpose(1, 2)  # (b, h, q, d) -> (b, q, h, d)
 
         # (b, q, h, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
         attn_output = attn_output.contiguous().reshape(*input_shape, -1)
-        attn_output = attn_output.to(torch.float16)
+        # Match o_proj's dtype (fp32 on full finetuning); 4bit / unknown weights stay fp16.
+        if torch.is_autocast_enabled(attn_output.device.type):
+            attn_output = attn_output.to(torch.float16)
+        else:
+            attn_output = _to_forced_output_dtype(attn_output, _linear_boundary_dtype(self, "o_proj"))
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
     pass

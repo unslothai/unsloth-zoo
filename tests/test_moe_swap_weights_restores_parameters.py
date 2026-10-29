@@ -77,3 +77,73 @@ def test_swap_restores_plain_instance_attributes_and_raises_through():
         raise AssertionError("expected the forward's error")
     assert experts.__dict__["gate_up_proj"] is plain_gu
     assert experts.__dict__["down_proj"] is plain_dn
+
+
+import pytest
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_swap_traces_fullgraph_and_restores_under_compile(backend, dynamic):
+    # fullgraph=True on every supported torch (2.10 rejected the old `__dict__.pop` restore).
+    from torch._dynamo.utils import counters
+
+    experts = _Experts()
+    original_gu = experts._parameters["gate_up_proj"]
+    original_dn = experts._parameters["down_proj"]
+
+    def forward_fn(module, x):
+        return (x @ module.gate_up_proj[0].T).sum() + module.down_proj.sum()
+
+    @torch.compile(backend = backend, fullgraph = True, dynamic = dynamic)
+    def call(x, gu, dn):
+        return swap_moe_weights_for_call(experts, gu, dn, forward_fn, x) * 2
+
+    torch._dynamo.reset()
+    counters.clear()
+    try:
+        for rows in (3, 5, 9):
+            gu = torch.randn(2, 8, 4, requires_grad = True)
+            dn = torch.randn(2, 4, 4, requires_grad = True)
+            x = torch.randn(rows, 4)
+            out = call(x, gu, dn)
+            torch.testing.assert_close(out, 2 * ((x @ gu[0].T).sum() + dn.sum()))
+            out.backward()
+            assert gu.grad is not None and dn.grad is not None
+            assert "gate_up_proj" not in experts.__dict__
+            assert "down_proj" not in experts.__dict__
+            assert experts._parameters["gate_up_proj"] is original_gu
+            assert experts._parameters["down_proj"] is original_dn
+            assert experts.gate_up_proj is original_gu and experts.down_proj is original_dn
+        breaks = dict(counters["graph_break"])
+    finally:
+        torch._dynamo.reset()
+    assert sum(breaks.values()) == 0, breaks
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+@pytest.mark.parametrize("fullgraph", [False, True])
+def test_compiled_swap_keeps_parameters_registered(backend, fullgraph):
+    # torch 2.12 replayed a traced `__dict__.pop` as DELETE_ATTR, unregistering both expert Parameters.
+    experts = _Experts()
+    originals = dict(experts._parameters)
+
+    def forward_fn(module, x):
+        return x * module.gate_up_proj.sum() + module.down_proj.sum()
+
+    call = torch.compile(
+        lambda x: swap_moe_weights_for_call(experts, torch.ones(2, 8, 4), torch.ones(2, 4, 4), forward_fn, x),
+        backend = backend,
+        fullgraph = fullgraph,
+    )
+    torch._dynamo.reset()
+    try:
+        for _ in range(3):
+            out = call(torch.ones(1))
+            assert out.item() == 64 + 32
+            assert list(experts._parameters) == ["gate_up_proj", "down_proj"]
+            assert all(experts._parameters[n] is p for n, p in originals.items())
+            assert set(dict(experts.named_parameters())) == set(originals)
+            assert "gate_up_proj" not in experts.__dict__ and "down_proj" not in experts.__dict__
+    finally:
+        torch._dynamo.reset()

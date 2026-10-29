@@ -55,6 +55,14 @@
       "reason": "Loads the module this process just generated into its own compile cache folder."
     },
     {
+      "file": "unsloth_zoo/cpu/runtime.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "7e28e71786fdeb78",
+      "count": 1,
+      "reason": "Loads a fixed, package-shipped guard file (unsloth_zoo/temporary_patches/datasets_folder_metadata.py) by a hard-coded name; no caller-controlled path."
+    },
+    {
       "file": "unsloth_zoo/dataset_num_proc.py",
       "rule": "dynamic-import",
       "sink": "__import__",
@@ -101,14 +109,6 @@
       "digest": "228679880d1b3db7",
       "count": 1,
       "reason": "Iterates the fixed _VLLM_BNB_LOADER_PATHS pair of vLLM bitsandbytes loader modules."
-    },
-    {
-      "file": "unsloth_zoo_downloads/hf_xet_fallback.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "59e72c01edb14c86",
-      "count": 1,
-      "reason": "Iterates two fixed huggingface_hub module names."
     },
     {
       "file": "unsloth_zoo/llama_cpp.py",
@@ -211,7 +211,7 @@
       "rule": "dynamic-import",
       "sink": "import_module",
       "digest": "a0573ba00a682ea0",
-      "count": 2,
+      "count": 3,
       "reason": "Prefix-bounded to the installed mlx_lm / mlx_vlm package: a model's model_type can only select one of that package's own modules (#1083 removed the unbounded form)."
     },
     {
@@ -237,6 +237,14 @@
       "digest": "b0d2b11936c8679d",
       "count": 1,
       "reason": "Family is one of the two literals this file passes (qwen3_5, gemma4), bounded to mlx_vlm.models.<family>.language."
+    },
+    {
+      "file": "unsloth_zoo/mlx/speculative.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "1b828f3737f5d751",
+      "count": 1,
+      "reason": "Module name is a value of _MERGED_ASSISTANT_MODULES, a fixed table in this file; the checkpoint config only selects a key."
     },
     {
       "file": "unsloth_zoo/mlx/speculative.py",
@@ -337,6 +345,14 @@
     {
       "file": "unsloth_zoo/temporary_patches/fla_vendor.py",
       "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "f79d15f13ee764d4",
+      "count": 1,
+      "reason": "Imports _GLM5_NEXT_MODULE, a fixed transformers module path defined in this file, to patch Glm5NextTextLinearAttention."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/fla_vendor.py",
+      "rule": "dynamic-import",
       "sink": "spec_from_file_location",
       "digest": "992d2ddf3e2ecc8d",
       "count": 1,
@@ -421,6 +437,14 @@
       "digest": "e0884049feeeed7d",
       "count": 1,
       "reason": "Prefix-bounded to transformers.models.<name>.modeling_<name> over a fixed list of model names."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/moe_router_triton.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "e0884049feeeed7d",
+      "count": 1,
+      "reason": "Prefix-bounded to transformers.models.<name>.modeling_<name> over the fixed _ROUTER_CLASSES tuple of model names."
     },
     {
       "file": "unsloth_zoo/temporary_patches/moe_utils.py",
@@ -517,6 +541,14 @@
       "digest": "54cfcec6d18cb37d",
       "count": 1,
       "reason": "Fixed vLLM bitsandbytes module path held in a local."
+    },
+    {
+      "file": "unsloth_zoo_downloads/hf_xet_fallback.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "59e72c01edb14c86",
+      "count": 1,
+      "reason": "Iterates two fixed huggingface_hub module names."
     }
   ]
 }

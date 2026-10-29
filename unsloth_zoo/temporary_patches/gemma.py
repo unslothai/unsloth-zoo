@@ -41,8 +41,11 @@ from .utils import (
     Unpack,
     patch_function_past_key_values,
     dedent,
+    restore_original,
+    _get_unique_storage_name,
 )
 import inspect
+import sys
 
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
@@ -180,6 +183,28 @@ def _publish_boundary_helpers(modeling_module):
         _to_boundary_dtype      = _to_boundary_dtype,
         _to_forced_output_dtype = _to_forced_output_dtype,
     )
+pass
+
+
+# The forced float32 set below (embedding, MLP, projector, causal mask) has no
+# generic counterpart, so in one process an fp16 load followed by a bf16 load
+# kept them: the float32 embedding then met bf16 attention ("Expected query,
+# key, and value to have the same dtype"). patch_function re-stashes on every
+# pass, which would record our own forward as the original after pre_compile
+# + post_compile, so these stash once and undo when the flag is "0".
+def _patch_forced_float32(target_obj, attr_name, new_func, **kwargs):
+    stashed = _get_unique_storage_name(target_obj, attr_name) in vars(target_obj)
+    return patch_function(target_obj, attr_name, new_func, store_original = not stashed, **kwargs)
+pass
+
+
+def _undo_forced_float32(class_name, attr_name):
+    # Not imported means never patched; do not import gemma3 for this.
+    modeling = sys.modules.get("transformers.models.gemma3.modeling_gemma3")
+    target_obj = getattr(modeling, class_name, None)
+    if target_obj is None: return
+    if _get_unique_storage_name(target_obj, attr_name) in vars(target_obj):
+        restore_original(target_obj, attr_name)
 pass
 
 
@@ -463,7 +488,10 @@ TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        _undo_forced_float32("Gemma3Model", "_update_causal_mask")
+        _undo_forced_float32("Gemma3ForConditionalGeneration", "_update_causal_mask")
+        return
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3Model
@@ -543,15 +571,16 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
         return causal_mask
     pass
     if hasattr(transformers.models.gemma3.modeling_gemma3, "Gemma3Model"):
-        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Model, "_update_causal_mask", _update_causal_mask)
+        _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3Model, "_update_causal_mask", _update_causal_mask)
     else:
-        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration, "_update_causal_mask", _update_causal_mask)
+        _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration, "_update_causal_mask", _update_causal_mask)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
 
 
 def patch_Gemma3TextScaledWordEmbedding():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return _undo_forced_float32("Gemma3TextScaledWordEmbedding", "forward")
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding
@@ -566,7 +595,7 @@ def patch_Gemma3TextScaledWordEmbedding():
         )
         return input_embeds.to(torch.float32) * self.embed_scale
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
+    _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
@@ -633,7 +662,8 @@ TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
 
 def patch_Gemma3MLP():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return _undo_forced_float32("Gemma3MLP", "forward")
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3MLP
@@ -662,9 +692,47 @@ def patch_Gemma3MLP():
         down_proj_out = self.down_proj(intermediate)
         return down_proj_out
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
+    _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
+
+
+def patch_Gemma3MultiModalProjector():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return _undo_forced_float32("Gemma3MultiModalProjector", "forward")
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector
+    except Exception as e:
+        return raise_error("Gemma3MultiModalProjector.forward", e)
+
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
+
+    def forward(self, vision_outputs: torch.Tensor):
+        batch_size, _, hidden_size = vision_outputs.shape
+
+        reshaped_vision_outputs = vision_outputs.transpose(1, 2)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            batch_size, hidden_size, self.patches_per_image, self.patches_per_image
+        )
+        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
+
+        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
+        pooled_vision_outputs = pooled_vision_outputs.flatten(2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
+
+        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+        # mm_soft_emb_norm emits fp16; full finetuning has an fp32 weight and no autocast,
+        # so torch.matmul would see Half against float.
+        normed_vision_outputs = _to_boundary_dtype(
+            normed_vision_outputs, _linear_boundary_dtype(self, "mm_input_projection_weight")
+        )
+        projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
+        return projected_vision_outputs.type_as(vision_outputs)
+    pass
+    _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector, "forward", forward)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3MultiModalProjector)
 
 
 def patch_Gemma3Attention():
@@ -680,6 +748,8 @@ def patch_Gemma3Attention():
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
+    from .sdpa_gqa import make_gqa_sdpa
+    gqa_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
 
     def prepare(
         hidden_states,
@@ -851,15 +921,15 @@ def patch_Gemma3Attention():
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # During jit tracing shapes are tensors, so is_causal may be a tensor; SDPA needs a bool.
             if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-            attn_output_fp32 = scaled_dot_product_attention(
+            attn_output_fp32 = gqa_sdpa(
                 query_states_fp32.contiguous(),
                 key_states_fp32.contiguous(),
                 value_states_fp32.contiguous(),
-                attn_mask = attn_mask_for_sdpa,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = is_causal,
-                scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                attn_mask_for_sdpa,
+                self.attention_dropout if self.training else 0.0,
+                is_causal,
+                getattr(self, "scaling", None),
+                getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_weights = None # Defaulting to None
 
@@ -931,6 +1001,8 @@ def patch_Gemma3Attention_generic():
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
+    from .sdpa_gqa import make_gqa_sdpa
+    gqa_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
 
     def prepare(
         hidden_states,
@@ -1101,15 +1173,15 @@ def patch_Gemma3Attention_generic():
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # During jit tracing shapes are tensors, so is_causal may be a tensor; SDPA needs a bool.
             if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-            attn_output_fp32 = scaled_dot_product_attention(
+            attn_output_fp32 = gqa_sdpa(
                 query_states_fp32.contiguous(),
                 key_states_fp32.contiguous(),
                 value_states_fp32.contiguous(),
-                attn_mask = attn_mask_for_sdpa,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = is_causal,
-                scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                attn_mask_for_sdpa,
+                self.attention_dropout if self.training else 0.0,
+                is_causal,
+                getattr(self, "scaling", None),
+                getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_weights = None # Defaulting to None
 

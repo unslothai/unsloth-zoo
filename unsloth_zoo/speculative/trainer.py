@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 import torch
 from transformers import Trainer, TrainingArguments
 
-from .capture import resolve_text_parts, run_frozen_target
+from .capture import effective_lm_head_weight, resolve_text_parts, run_frozen_target
 from . import losses
 from .losses import chunked_lm_loss, fastmtp_step_weights
 
@@ -100,7 +100,8 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
         num_steps = args.mtp_num_steps,
     )
     weights = fastmtp_step_weights(args.mtp_step_beta, len(steps))
-    target_lm_head_weight = parts["lm_head"].weight
+    # The effective head: an unmerged LoRA on the target's lm_head is part of the teacher (and the draft).
+    target_lm_head_weight = effective_lm_head_weight(parts["lm_head"])
     supervised = data_labels != -100
     total = final_hidden.new_zeros((), dtype = torch.float32)
     stats = []
@@ -170,6 +171,7 @@ class UnslothMTPTrainer(Trainer):
             raise ValueError(f"Unsloth: unknown mtp_label_source {args.mtp_label_source!r}.")
         self.target_model = target_model
         self.target_parts = resolve_text_parts(target_model)
+        effective_lm_head_weight(self.target_parts["lm_head"])  # unsupported adapted heads fail here, not mid-run
         for p in target_model.parameters():
             p.requires_grad_(False)
         target_model.eval()

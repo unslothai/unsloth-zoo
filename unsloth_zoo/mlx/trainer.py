@@ -625,6 +625,7 @@ from .utils import (
     restore_mlx_norm_output_cast_state,
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
+    _get_processor_tokenizer,
     _get_text_model,
     _neftune_embed_scale,
     _probe_vlm_embedding_module,
@@ -635,8 +636,8 @@ from .utils import (
 )
 from .preference import (
     FinitePreferenceBatchPlan,
-    FiniteVisionPreferenceBatchPlan,
     PreferenceRunContext,
+    VisionPreferenceBatches,
     build_reference_policy,
     create_kto_batch_plan,
     create_preference_batch_plan,
@@ -715,7 +716,7 @@ _EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan,
 def _eager_refetchable(batches):
     # A vision preference plan reruns the processor like the VLM plan.
     return isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES) and not isinstance(
-        batches, FiniteVisionPreferenceBatchPlan,
+        batches, VisionPreferenceBatches,
     )
 
 
@@ -1419,6 +1420,54 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
     return int(math.prod(arr.shape))
 
 
+def _reject_group_by_length(order, context):
+    if order != "length_grouped":
+        return
+    if context == "vlm":
+        raise ValueError(
+            "Unsloth MLX: group_by_length=True is not supported for "
+            "vision-language training yet; the sequence length does not "
+            "account for image or audio tokens. Leave it unset."
+        )
+    if context == "streaming":
+        raise ValueError(
+            "Unsloth MLX: group_by_length=True requires a sized dataset and "
+            "is not supported with streaming=True. Use "
+            "streaming_text_length_window_batches to group lazily, or drop "
+            "streaming."
+        )
+    if context == "preference":
+        # CUDA fails too: TRL's LengthGroupedSampler cannot infer lengths without input_ids.
+        raise ValueError(
+            "Unsloth MLX preference: group_by_length=True is not supported for "
+            "preference or RL training. Leave it unset."
+        )
+    raise ValueError(f"Unsloth MLX: unknown group_by_length context {context!r}.")
+
+
+def _resolve_text_dataset_order(args, *, for_training=True):
+    # Every plan must use this, or train_on_responses_only masks a different stream than it trains on.
+    group_by_length = bool(getattr(args, "group_by_length", False))
+    preserve = bool(getattr(args, "preserve_dataset_order", False))
+    dataset_order = getattr(args, "dataset_order", "default")
+
+    if group_by_length:
+        if preserve:
+            raise ValueError(
+                "Unsloth MLX: group_by_length=True conflicts with "
+                "preserve_dataset_order=True (which forces the original "
+                "dataset order). Set only one."
+            )
+        if dataset_order not in (None, "default"):
+            raise ValueError(
+                "Unsloth MLX: group_by_length=True conflicts with "
+                f"dataset_order={dataset_order!r}. Set only one."
+            )
+        return "length_grouped" if for_training else dataset_order
+
+    return "sequential" if preserve else dataset_order
+
+
 # Fields added after the original public MLXTrainingConfig surface. Keep them a
 # suffix of the declaration order (append new ones at the end and list them
 # here) so positional copies from older configs keep mapping correctly.
@@ -1440,6 +1489,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "gkd_lmbda",
     "gkd_chunk_size",
     "gkd_skip_memory_preflight",
+    "group_by_length",
 )
 
 
@@ -1591,6 +1641,8 @@ class MLXTrainingConfig:
     gkd_lmbda: float = 0.0
     gkd_chunk_size: int = 128
     gkd_skip_memory_preflight: bool = False
+    # HF TrainingArguments.group_by_length; appended LAST (positional binding).
+    group_by_length: bool = False
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -2431,7 +2483,7 @@ def _plan_single_process_text_shapes(
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
-    vision_preference = isinstance(batches, FiniteVisionPreferenceBatchPlan)
+    vision_preference = isinstance(batches, VisionPreferenceBatches)
     strict = compile_policy.mode == "strict"
     if vision_preference:
         # The vision SFT planner's gates; the trainer reports an unqualified arch.
@@ -2453,6 +2505,11 @@ def _plan_single_process_text_shapes(
             return None, _shape_guard_report(
                 "not_applicable", "compile_ineligible_global_norm", cap,
             ), False, None
+    elif is_vlm and isinstance(batches, GRPOBatchPlan):
+        # Its vision inputs come only with each rollout, so no family is named ahead.
+        return None, _shape_guard_report(
+            "not_applicable", "grpo_vision_eager", cap,
+        ), False, None
     elif is_vlm:
         return _plan_single_process_vlm_shapes(
             batches,
@@ -2721,9 +2778,15 @@ class MLXTrainer:
         """
         policy = getattr(self, "_resolved_preference_length_policy", None)
         if policy is None:
+            tokenizer = None
+            if self.preference_kind == "kto":
+                tokenizer = (
+                    _get_processor_tokenizer(self._resolve_vlm_processor())
+                    if self._is_vlm else self.tokenizer
+                )
             policy = resolve_preference_length_policy(
                 self.preference_kind, args, max_seq_length=args.max_seq_length,
-                tokenizer=self.tokenizer if self.preference_kind == "kto" else None,
+                tokenizer=tokenizer,
             )
             self._resolved_preference_length_policy = policy
         return policy
@@ -7308,6 +7371,7 @@ class MLXTrainer:
                             mask_truncated_completions=args.mask_truncated_completions,
                             with_reference=self._uses_reference(args),
                             max_prompt_length=args.max_prompt_length, seed=args.seed,
+                            **self._grpo_vision_options(),
                         )
                         plan.bind(
                             model, self.reward_funcs, trainer_state=self.state,
@@ -7335,6 +7399,8 @@ class MLXTrainer:
                             grad_accum=1,
                             append_eos=bool(args.append_eos),
                             prompt_sink=prompt_sink,
+                            images_from=(eval_dataset, self.formatting_func),
+                            **self._preference_vision_options(),
                         )
                     if self.preference_kind:
                         # Sequential, so every evaluation scores the same
@@ -7352,6 +7418,7 @@ class MLXTrainer:
                             append_eos=bool(args.append_eos),
                             formatting_func=None,
                             prompt_sink=prompt_sink,
+                            images_from=(eval_dataset, self.formatting_func),
                             **self._preference_vision_options(),
                         )
                     if is_vlm:
@@ -9419,12 +9486,6 @@ class MLXTrainer:
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
 
-        if self.preference_kind in ("kto", "cpo") and is_vlm:
-            raise ValueError(
-                f"Unsloth MLX {self.preference_kind.upper()}: vision-language "
-                "models are not supported."
-            )
-
         if is_vlm:
             processor = self._resolve_vlm_processor()
         else:
@@ -9437,7 +9498,14 @@ class MLXTrainer:
                 strict=False,
             )
             if self.tokenizer is not None:
-                self.tokenizer._unsloth_supports_images = getattr(self.model, "_unsloth_supports_images", None)
+                supports_images = getattr(self.model, "_unsloth_supports_images", None)
+                if supports_images and not getattr(self.model, "_is_vlm_model", False):
+                    supports_images = False
+                    self.tokenizer._unsloth_image_input_error = (
+                        f"Unsloth MLX: `{model_type}` takes images in generation only; "
+                        "mlx_lm has no image training path."
+                    )
+                self.tokenizer._unsloth_supports_images = supports_images
                 self.tokenizer._unsloth_modality_model_type = model_type
 
         if self.preference_kind:
@@ -9449,6 +9517,7 @@ class MLXTrainer:
                 raise ValueError(
                     "Unsloth MLX preference: streaming datasets are not supported."
                 )
+            _reject_group_by_length(_resolve_text_dataset_order(args), "preference")
             # A cadence is optional -- a callback can raise should_evaluate --
             # but selecting a best model reads a metric only an evaluation makes.
             _sampling_eval = bool(getattr(args, "generate_during_eval", False))
@@ -9656,6 +9725,7 @@ class MLXTrainer:
                     dataset_order=args.dataset_order,
                     preserve_dataset_order=args.preserve_dataset_order,
                     seed=args.seed,
+                    **self._preference_vision_options(),
                 ), None
             return create_preference_batch_plan(
                 train_dataset,
@@ -9692,11 +9762,8 @@ class MLXTrainer:
                     "train_on_responses_only for response masking."
                 )
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
-            vlm_dataset_order = (
-                "sequential"
-                if getattr(args, "preserve_dataset_order", False)
-                else getattr(args, "dataset_order", "default")
-            )
+            vlm_dataset_order = _resolve_text_dataset_order(args)
+            _reject_group_by_length(vlm_dataset_order, "vlm")
             vlm_num_epochs = (
                 args.num_train_epochs
                 if (
@@ -9837,11 +9904,8 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
-                text_dataset_order = (
-                    "sequential"
-                    if getattr(args, "preserve_dataset_order", False)
-                    else getattr(args, "dataset_order", "default")
-                )
+                text_dataset_order = _resolve_text_dataset_order(args)
+                _reject_group_by_length(text_dataset_order, "streaming")
                 expected_rows_per_pass = None
                 require_replayable = bool(
                     getattr(self, "_resume_from_checkpoint", None)
@@ -9971,27 +10035,18 @@ class MLXTrainer:
                     assistant_only_loss=text_assistant_only_loss,
                     comm_group=comm_group,
                 )
-                if (
-                    getattr(args, "preserve_dataset_order", False)
-                    or getattr(args, "dataset_order", "default") != "default"
-                ):
-                    text_dataset_order = (
-                        "sequential"
-                        if getattr(args, "preserve_dataset_order", False)
-                        else getattr(args, "dataset_order", "default")
-                    )
+                text_dataset_order = _resolve_text_dataset_order(args)
+                if text_dataset_order != "default":
                     batch_kwargs["dataset_order"] = text_dataset_order
+                    batch_kwargs["grad_accum"] = args.gradient_accumulation_steps
                     if (
                         args.max_steps <= 0
                         and args.num_train_epochs > 0
-                        and text_dataset_order == "torch_randperm"
+                        and text_dataset_order in (
+                            "torch_randperm", "length_grouped",
+                        )
                     ):
                         batch_kwargs["num_epochs"] = args.num_train_epochs
-                        # The builder quantizes a fractional epoch count to whole
-                        # accumulation windows, as HF does, so it needs the factor.
-                        batch_kwargs["grad_accum"] = (
-                            args.gradient_accumulation_steps
-                        )
                         self._prepared_batches_include_epochs = True
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = _create_ordered_text_plan(**batch_kwargs)
@@ -10192,19 +10247,15 @@ class MLXGRPOTrainer(MLXTrainer):
     TRL's GRPOTrainer trains one on CUDA Unsloth. ``reward_funcs`` are callables
     TRL's way: called with ``prompts``, ``completions``, ``completion_ids``,
     every other dataset column and ``trainer_state``, returning one reward (or
-    None) per completion. The reference for ``beta != 0`` is the model with its
-    adapters disabled, or its starting weights for a full fine-tune."""
+    None) per completion. An entry may also be a torch sequence-classification
+    model or its model id, tokenized by its ``reward_processing_classes`` entry.
+    The reference for ``beta != 0`` is the model with its adapters disabled, or its starting weights for a full fine-tune."""
 
     config_class = MLXGRPOConfig
     preference_kind = "grpo"
 
     def __init__(self, *args, reward_funcs, reward_processing_classes=None, **kwargs):
-        if reward_processing_classes is not None:
-            raise ValueError(
-                "Unsloth MLX GRPO: reward_processing_classes tokenize for reward "
-                "models, which are not supported."
-            )
-        self.reward_funcs = grpo_reward_funcs(reward_funcs)
+        self.reward_funcs = grpo_reward_funcs(reward_funcs, reward_processing_classes)
         super().__init__(*args, **kwargs)
         args = self.args
         eval_batch_size = args.per_device_eval_batch_size or args.per_device_train_batch_size
@@ -10241,6 +10292,11 @@ class MLXGRPOTrainer(MLXTrainer):
         adapted = next(iter_mlx_lora_modules(self.model), None) is not None
         return super()._syncs_reference(args) and not adapted
 
+    def _grpo_vision_options(self):
+        options = self._preference_vision_options()
+        options.pop("image_size", None)  # TRL's GRPO hands the processor its images as given
+        return options
+
     def _create_grpo_plan(self, dataset, num_batches, num_epochs):
         args = self.args
         if args.dataset_order != "default" or args.preserve_dataset_order:
@@ -10260,6 +10316,7 @@ class MLXGRPOTrainer(MLXTrainer):
             with_reference=self._uses_reference(args),
             max_prompt_length=args.max_prompt_length, shuffle=args.shuffle_dataset,
             seed=args.seed, num_batches=num_batches, num_epochs=num_epochs,
+            **self._grpo_vision_options(),
         )
         # A resumed run generates at once, so its widths are planned from there.
         resume = getattr(self, "_resume_from_checkpoint", None)
@@ -10390,14 +10447,17 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # 2. Sample order; must agree with unlabeled `create_ordered_batches`
     # (utils.py:2845-2849) so `train_on_responses_only` sees the same stream.
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     _order_requested = preserve_dataset_order or (
         dataset_order not in (None, "default")
     )
-    if dataset_order not in (None, "default", "sequential", "torch_randperm"):
+    if dataset_order not in (
+        None, "default", "sequential", "torch_randperm", "length_grouped",
+    ):
         raise ValueError(
             f"Unsloth MLX: unsupported dataset_order={dataset_order!r}. "
             "Expected one of: None, 'default', 'sequential', "
-            "'torch_randperm'."
+            "'torch_randperm', 'length_grouped'."
         )
 
     def _order_indices_for_epoch(epoch_idx):
@@ -10411,6 +10471,15 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                 len(all_items), _normalize_seed(seed) + epoch_idx
             )
             return order
+        if dataset_order == "length_grouped":
+            from .utils import (
+                _length_grouped_order, _length_grouped_window, _normalize_seed,
+            )
+            return _length_grouped_order(
+                [len(item[0]) for item in all_items],
+                _length_grouped_window(batch_size, comm_group, grad_accum),
+                _normalize_seed(seed) + epoch_idx,
+            )
         # legacy default: length-sort once
         return sorted(range(len(all_items)), key=lambda i: len(all_items[i][0]))
 
@@ -10421,6 +10490,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     from .utils import (
         _finite_epoch_batch_budget, _finite_text_pad_width, _normalize_seed,
     )
+    # max_steps runs reseed each pass up to num_batches, as the unlabeled plan does.
+    _expand_to_num_batches = (
+        num_epochs is None
+        and num_batches is not None
+        and not preserve_dataset_order
+        and dataset_order in ("torch_randperm", "length_grouped")
+    )
     # Normalized so seed=None is deterministic (canonicalized) instead of
     # entropy-derived; explicit seeds are unchanged. Visits stay identity —
     # these plans carry explicitly materialized epoch blocks.
@@ -10428,8 +10504,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     schedule = []
     widths = []
     cycle_length = None
-    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    for epoch_idx in range(_n_epochs_materialize):
+    epoch_idx = 0
+    while True:
         epoch_order = _order_indices_for_epoch(epoch_idx)
         epoch_schedule = []
         for start in range(0, len(epoch_order), global_batch_size):
@@ -10465,6 +10541,15 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         # One dataset pass == this epoch's micro-batch count (pre-truncation).
         if cycle_length is None and len(epoch_schedule) > 0:
             cycle_length = len(epoch_schedule)
+
+        epoch_idx += 1
+        if not epoch_schedule:
+            break
+        if epoch_idx < _n_epochs_materialize:
+            continue
+        if _expand_to_num_batches and len(schedule) < num_batches:
+            continue
+        break
 
     # Fractional epochs end mid-pass on whole accumulation windows, as HF does.
     if num_batches is None and num_epochs is not None and cycle_length:
@@ -10668,7 +10753,7 @@ def _prepare_response_labeled_eval_batches(
                 else None
             ),
             append_eos=bool(getattr(args, "append_eos", True)),
-            dataset_order=getattr(args, "dataset_order", "default"),
+            dataset_order=_resolve_text_dataset_order(args, for_training=False),
             preserve_dataset_order=bool(
                 getattr(args, "preserve_dataset_order", False)
             ),
@@ -10809,6 +10894,9 @@ def train_on_responses_only(
         print("Unsloth: train_on_responses_only enabled (VLM mode).")
     else:
         args = trainer.args
+        if args.streaming:
+            # A sized dataset skips the lazy branch below and would cache an eager grouped plan.
+            _reject_group_by_length(_resolve_text_dataset_order(args), "streaming")
         train_dataset = trainer._train_dataset_for_batches()
         if args.streaming:
             trainer._mlx_response_mask_fn = mask_fn
@@ -10869,7 +10957,7 @@ def train_on_responses_only(
                 else None
             ),
             append_eos=bool(getattr(args, "append_eos", True)),
-            dataset_order=getattr(args, "dataset_order", "default"),
+            dataset_order=_resolve_text_dataset_order(args),
             preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
             num_epochs=labeled_num_epochs,
             return_dataset=True,

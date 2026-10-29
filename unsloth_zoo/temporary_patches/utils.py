@@ -2353,6 +2353,8 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     """
     def _decorate(func):
         func = unwrap_already_compiled(func)
+        if UNSLOTH_COMPILE_DISABLE:
+            return func
         compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
         if fullgraph:
             compiled = _fall_back_to_eager_on_recompile_limit(
@@ -2629,39 +2631,6 @@ def patch_function_past_key_values(
 pass
 
 
-def patch_multiple(
-    patches: List[Tuple[Any, str, Callable]], 
-    force: bool = False, 
-    fail_fast: bool = True,
-    match_level: str = "strict",
-    fullgraph = None,
-    dynamic = True,
-) -> Dict[str, bool]:
-    """Apply multiple patches at once."""
-    results = {}
-
-    for target_obj, attr_name, new_func in patches:
-        key = f"{getattr(target_obj, '__name__', str(target_obj))}.{attr_name}"
-        success = patch_function(
-            target_obj,
-            attr_name,
-            new_func,
-            force = force,
-            match_level = match_level,
-            fullgraph = fullgraph,
-            dynamic = dynamic,
-        )
-        results[key] = success
-
-        if fail_fast and not success:
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.error(f"Unsloth: Stopping patch process due to failure on {key}")
-            break
-
-    return results
-pass
-
-
 def restore_original(
     target_obj: Any,
     attr_name: str,
@@ -2688,28 +2657,3 @@ def restore_original(
 pass
 
 
-def list_stored_originals(target_obj: Any) -> List[str]:
-    """List all stored original functions on a target object."""
-    stored = []
-    for attr_name in dir(target_obj):
-        if attr_name.startswith('_original_') and not attr_name.startswith('_original___'):
-            # Name format: _original_{module}_{class}_{method} (method = last part).
-            parts = attr_name.split('_')[2:]
-            if len(parts) >= 2:
-                method_name = parts[-1]
-                stored.append(method_name)
-
-    return sorted(list(set(stored)))
-pass
-
-
-def restore_multiple(target_objs_and_attrs: List[Tuple[Any, str]]) -> Dict[str, bool]:
-    """Restore multiple original functions."""
-    results = {}
-
-    for target_obj, attr_name in target_objs_and_attrs:
-        key = f"{getattr(target_obj, '__name__', str(target_obj))}.{attr_name}"
-        results[key] = restore_original(target_obj, attr_name)
-
-    return results
-pass

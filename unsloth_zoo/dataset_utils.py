@@ -38,26 +38,6 @@ def _iterable_batch_size(dataset, default = 1000):
     return getattr(getattr(dataset, "_ex_iterable", None), "batch_size", None) or default
 
 
-# From https://www.geeksforgeeks.org/longest-common-substring-array-strings/
-# Longest Common Substring in an Array of Strings
-def _old_longest_common_substring(arr):
-    n = len(arr)
-    s = arr[0]
-    l = len(s)
-    res = ""
-    for i in range(l):
-        for j in range(i + 1, l + 1):
-            stem = s[i:j]
-            k = 1
-            for k in range(1, n):
-                if stem not in arr[k]:
-                    break
-            if (k + 1 == n and len(res) < len(stem)):
-                res = stem
-    return res
-pass
-
-
 def _longest_common_sublist(lists):
     """Longest common sublist among multiple lists (ties broken arbitrarily,
     empty list if none)."""
@@ -90,7 +70,6 @@ def _longest_common_sublist(lists):
         return True, list(common.pop())
     pass
 
-    # Binary search on length
     left, right = 1, min_len
     result = []
 
@@ -126,7 +105,6 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
     elif component.startswith("\n"): left_text = "\n"
     stripped = component.strip()
     
-    # Add current pieces and also newlines
     all_input_ids = []
     if not force_match:
         for left in range(3):
@@ -145,10 +123,6 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         all_input_ids.append(x)
     pass
 
-    # Old longest common substring is replaced with actual longest common list of numbers
-    # substring = _old_longest_common_substring([str(x + [0]) for x in all_input_ids])
-    # substring = substring.split(", ")[:-1]
-    # substring = [int(x) for x in substring if x.isdigit()]
     substring = _longest_common_sublist([x + [0] for x in all_input_ids])
 
     # substring == [0] may just be the original single token.
@@ -760,13 +734,24 @@ def is_trl_padding_free_collator(collator):
 pass
 
 
+class _KeepUnlistedRows:
+    # Batched with_indices filter predicate: reads no column; a class so it pickles to num_proc workers.
+    def __init__(self, dropped):
+        self.dropped = frozenset(dropped)
+
+    def __call__(self, batch, indices):
+        dropped = self.dropped
+        return [index not in dropped for index in indices]
+pass
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
     response_part     = None,
     force_match       = True,  # Match newlines as well!
     tokenizer         = None,  # Optional
-    return_function   = False, # Useful for iterating over lists
+    return_function   = False,
     num_proc          = None,
     last_response_only = False, # Train only on the last assistant turn
     mask_out_tokens   = None,  # e.g. ["</think>"] - also mask these inside kept responses
@@ -812,7 +797,6 @@ def train_on_responses_only(
     # Keep the original object (may be a VLM processor) so auto-detect can read a
     # chat template that lives only on the processor; the matcher uses the inner one.
     processor = tokenizer
-    # Get non vision tokenizer
     if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
@@ -861,7 +845,6 @@ def train_on_responses_only(
     if Q_must == A_must[:len(Q_must)] and Q_right:
         Q_must, Q_right = Q_must + Q_right, []
 
-    # Store some temporary stuff
     A_first = A_must[0]
     len_A_must = len(A_must)
     A_left_reversed = A_left[::-1]
@@ -959,7 +942,6 @@ def train_on_responses_only(
 
             spans = []
             while j < n:
-                # Find <assistant>
                 if (input_ids[j] == A_first) and \
                     (input_ids[j : (k := j + len_A_must)] == A_must):
 
@@ -974,7 +956,6 @@ def train_on_responses_only(
                         if optional_right == input_ids[k]: k += 1
                         else: break
                     pass
-                    # assistant_j = j
                     assistant_k = k
 
                     j = assistant_k
@@ -1011,7 +992,6 @@ def train_on_responses_only(
                                 else: break
                             pass
                             user_j = j
-                            # Account for last item
                             if user_j != n_minus_1:
                                 # Outer j += 1 lands on k, so an empty user turn cannot hide the next marker.
                                 j = k - 1
@@ -1295,10 +1275,17 @@ def train_on_responses_only(
         # template at all, so fail clearly instead of returning an empty dataset.
         if len(dropped) == n_before:
             raise _no_training_signal(dataset_name, "")
-        # Drop via filter (Arrow mask), not select(keep_indices): a keep list would be one
-        # Python int per surviving row (GBs on a large corpus). _has_valid_labels is the
-        # exact inverse of `dropped`, so survivors are identical.
-        dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        # filter (Arrow mask), not select(keep_indices): a keep list is one int per surviving row.
+        if getattr(dataset, "_format_type", None) == "custom":
+            # A custom transform can change labels per view: re-read them.
+            dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        else:
+            dataset = dataset.filter(
+                _KeepUnlistedRows(dropped),
+                with_indices = True,
+                batched = True,
+                num_proc = _effective_num_proc(dataset),
+            )
         n_removed = n_before - len(dataset)
         if n_removed > 0:
             print(
@@ -2184,17 +2171,30 @@ def train_on_responses_only(
     if _pads_through_a_processor(getattr(trainer, "data_collator", None)):
         _refuse_packing_that_will_not_happen(trainer.data_collator, None)
 
+    def _mask_split(dataset, dataset_name):
+        # Arrow rows are pyarrow Tables, unreadable here and by a torch DataLoader: return python format.
+        fmt = None if isinstance(dataset, IterableDataset) else getattr(dataset, "format", None)
+        if isinstance(fmt, dict) and fmt.get("type") == "arrow":
+            # `_format_columns`: format["columns"] lists every column when none were selected.
+            dataset = dataset.with_format(
+                None,
+                columns = getattr(dataset, "_format_columns", fmt.get("columns")),
+                output_all_columns = fmt.get("output_all_columns", False),
+            )
+        dataset = _maybe_tokenize_dataset(dataset)
+        if isinstance(dataset, IterableDataset):
+            dataset = dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(dataset), batched = True)
+        else:
+            dataset = dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(dataset))
+        return _filter_fully_masked(dataset, dataset_name)
+    pass
+
     # Map both splits before assigning: a raise on eval must not leave train half-masked for a retry.
     _new_train = _new_eval = None
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-        _new_train = _maybe_tokenize_dataset(trainer.train_dataset)
-        if isinstance(_new_train, IterableDataset):
-            _new_train = _new_train.map(_train_on_responses_only, batch_size = _iterable_batch_size(_new_train), batched = True)
-        else:
-            _new_train = _new_train.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(_new_train))
-        _new_train = _filter_fully_masked(_new_train, "train_dataset")
+        _new_train = _mask_split(trainer.train_dataset, "train_dataset")
     pass
 
     if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
@@ -2206,21 +2206,11 @@ def train_on_responses_only(
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-                value = _maybe_tokenize_dataset(value)
-                if isinstance(value, IterableDataset):
-                    value = value.map(_train_on_responses_only, batch_size = _iterable_batch_size(value), batched = True)
-                else:
-                    value = value.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(value))
-                _new_eval[key] = _filter_fully_masked(value, f"eval_dataset[{key}]")
+                _new_eval[key] = _mask_split(value, f"eval_dataset[{key}]")
         else:
             if not hasattr(trainer.eval_dataset, "map"):
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-            _new_eval = _maybe_tokenize_dataset(trainer.eval_dataset)
-            if isinstance(_new_eval, IterableDataset):
-                _new_eval = _new_eval.map(_train_on_responses_only, batch_size = _iterable_batch_size(_new_eval), batched = True)
-            else:
-                _new_eval = _new_eval.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(_new_eval))
-            _new_eval = _filter_fully_masked(_new_eval, "eval_dataset")
+            _new_eval = _mask_split(trainer.eval_dataset, "eval_dataset")
         pass
     pass
     if _new_train is not None:
@@ -2516,7 +2506,6 @@ def standardize_data_formats(
                 uniques[key].append(value)
     pass
 
-    # Must be only 2 entries
     assert(len(uniques.keys()) == 2)
 
     keys = list(uniques.keys())
@@ -2547,7 +2536,6 @@ def standardize_data_formats(
         length_second = len(set(uniques[keys[1]]))
 
         if length_first < length_second:
-            # Role is assigned to the first element
             role_key    = keys[0]
             content_key = keys[1]
         else:
@@ -2556,7 +2544,6 @@ def standardize_data_formats(
         pass
     pass
 
-    # Check roles are in aliases
     roles = set(_normalize_role_alias(value) for value in uniques[role_key])
     leftover_aliases = (all_aliases | roles) - all_aliases
     if len(leftover_aliases) != 0:
@@ -2644,17 +2631,36 @@ except:
 
 
 _TRL_COLLATOR_APPLIES_MASKS = None
-def trl_collator_applies_masks():
-    # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
+def _trl_collator_mask_probe():
     global _TRL_COLLATOR_APPLIES_MASKS
     if _TRL_COLLATOR_APPLIES_MASKS is None:
         try:
             from trl.trainer.sft_trainer import DataCollatorForLanguageModeling as _TRLCollator
-            labels = _TRLCollator(pad_token_id = 0)([{"input_ids": [1, 2], "assistant_masks": [0, 1]}])["labels"]
-            _TRL_COLLATOR_APPLIES_MASKS = bool(labels[0, 0] == -100)
+            collator = _TRLCollator(pad_token_id = 0)
+            def masked(**row):
+                return bool(collator([{"input_ids": [1, 2], **row}])["labels"][0, 0] == -100)
+            _TRL_COLLATOR_APPLIES_MASKS = (
+                masked(assistant_masks = [0, 1]),
+                masked(completion_mask = [0, 1]) and not masked(labels = [-100, 2]),
+            )
         except Exception:
-            _TRL_COLLATOR_APPLIES_MASKS = True
+            _TRL_COLLATOR_APPLIES_MASKS = (True, False)
     return _TRL_COLLATOR_APPLIES_MASKS
+pass
+
+
+def trl_collator_applies_masks():
+    # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
+    return _trl_collator_mask_probe()[0]
+pass
+
+
+def trl_collator_ignores_labels(collator = None):
+    # TRL 0.18: its collator applies completion_mask, never "labels"; other collators read only "labels".
+    if not _trl_collator_mask_probe()[1]:
+        return False
+    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling as _TRLCollator
+    return collator is None or isinstance(collator, _TRLCollator)
 pass
 
 # Faster SFTTrainer prepare_dataset
@@ -3029,7 +3035,7 @@ def sft_prepare_dataset(
     pass
 
     # Imported here: this function's source is copied into the compiled trainer module.
-    from unsloth_zoo.dataset_utils import trl_collator_applies_masks
+    from unsloth_zoo.dataset_utils import trl_collator_applies_masks, trl_collator_ignores_labels
     column_names = set(next(iter(dataset)).keys())
     if "labels" not in column_names and not trl_collator_applies_masks():
         completion_only_loss = getattr(self, "completion_only_loss", None)
@@ -3048,8 +3054,22 @@ def sft_prepare_dataset(
             if isinstance(dataset, Dataset):
                 label_kwargs["num_proc"] = map_kwargs.get("num_proc", None)
                 label_kwargs["desc"] = f"Unsloth: Building labels for {dataset_name} dataset"
-            dataset = dataset.map(_build_labels, remove_columns = mask_columns, **label_kwargs)
-            used_column_names = [x for x in used_column_names if x not in mask_columns] + ["labels"]
+            keep_masks = trl_collator_ignores_labels()
+            collator = getattr(self, "data_collator", None)
+            if keep_masks and collator is None:
+                # TRL 0.18 stores its collator only in super().__init__; read __init__'s (dict eval comprehensions add a frame).
+                import sys as _sys
+                frame = _sys._getframe(1)
+                while frame is not None and not (frame.f_locals.get("self") is self and "data_collator" in frame.f_locals):
+                    frame = frame.f_back
+                if frame is not None:
+                    collator = frame.f_locals.get("data_collator")
+                del frame
+            keep_masks = keep_masks and trl_collator_ignores_labels(collator)
+            dataset = dataset.map(_build_labels, remove_columns = [] if keep_masks else mask_columns, **label_kwargs)
+            if not keep_masks:
+                used_column_names = [x for x in used_column_names if x not in mask_columns]
+            used_column_names = used_column_names + ["labels"]
     pass
     if packing:
         # Use TRL's pack_dataset if available

@@ -96,7 +96,8 @@ def _run(model, input_ids, **overrides):
         "chunked_hidden_states_selective_log_softmax":
             rr.chunked_hidden_states_selective_log_softmax,
         "chunked_selective_log_softmax": rr.chunked_selective_log_softmax,
-        "_refresh_lm_head": lambda: None, "lm_head_bias": None,
+        "_refresh_lm_head": lambda: None, "_fp32_bind": lambda entropy = False: None, "lm_head_bias": None,
+        "_fused_route": False, "_fused_pack": None, "_pg_layout": None,
         "create_completion_attention_mask": rr.create_completion_attention_mask,
         "device_synchronize": lambda *a, **k: None,
         "UNSLOTH_ENABLE_LOGGING": False,

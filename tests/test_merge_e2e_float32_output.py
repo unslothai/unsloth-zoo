@@ -91,6 +91,22 @@ def test_bf16_base_float32_merge(tmp_path, output_dtype, max_shard_size):
     assert {p.dtype for p in reloaded.parameters()} == {torch.float32}
 
 
+@pytest.mark.parametrize("output_dtype", [torch.float32, None])
+def test_sharded_index_total_size_matches_the_written_shards(tmp_path, output_dtype):
+    """The copied index describes the 16-bit base; a float32 export must record its real size."""
+    base_dir, base, peft_model, adapted = _build("llama", str(tmp_path), "40KB")
+    out_dir = str(tmp_path / "merged")
+    H.run_merge(peft_model, base_dir, out_dir, save_dtype = output_dtype)
+
+    index = H.read_index(out_dir)
+    assert index is not None and len(set(index["weight_map"].values())) > 1
+    merged = H.read_safetensors_dir(out_dir)
+    actual = sum(t.numel() * t.element_size() for t in merged.values())
+    assert index["metadata"]["total_size"] == actual
+    if output_dtype is torch.float32:
+        assert H.read_index(base_dir)["metadata"]["total_size"] * 2 == actual
+
+
 def test_default_dtype_keeps_bf16(tmp_path):
     base_dir, base, peft_model, adapted = _build("llama", str(tmp_path))
     out_dir = str(tmp_path / "merged")
@@ -155,3 +171,17 @@ def test_float32_peak_counts_every_16bit_tensor_and_the_rewrite():
     assert _float32_merge_peak_bytes(10, 4) == 28
     # Streamed to the Hub: the 16-bit copies plus the largest shard's float32 copy and temp.
     assert _float32_merge_peak_bytes(10, 4, uploads_as_it_goes = True) == 22
+
+
+def test_index_total_size_keeps_a_cp1252_index_byte_for_byte(tmp_path):
+    """An index the loader reads in the locale encoding is fixed in place, not skipped or re-encoded."""
+    from unsloth_zoo.saving_utils import _set_index_total_size
+    raw = (
+        b'{\n  "metadata": {"total_size": 100},\n'
+        b'  "weight_map": {"caf\xe9.weight": "model-00001-of-00002.safetensors"}\n}\n'
+    )
+    path = tmp_path / "model.safetensors.index.json"
+    path.write_bytes(raw)
+    assert _set_index_total_size(str(tmp_path), 200)
+    assert path.read_bytes() == raw.replace(b'"total_size": 100', b'"total_size": 200')
+    assert not _set_index_total_size(str(tmp_path), 200)

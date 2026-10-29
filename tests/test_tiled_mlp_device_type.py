@@ -24,6 +24,8 @@ torch = pytest.importorskip("torch")
 import unsloth_zoo.device_type as device_type  # noqa: E402
 from unsloth_zoo import tiled_mlp  # noqa: E402
 
+_IMPORTED = (tiled_mlp.TiledMLP, tiled_mlp.patch_mlp)
+
 
 class _MLP(torch.nn.Module):
     def __init__(self):
@@ -38,6 +40,9 @@ class _MLP(torch.nn.Module):
 @pytest.fixture
 def reload_tiled_mlp():
     saved = (device_type.DEVICE_TYPE, device_type.DEVICE_TYPE_TORCH)
+    # Restore the original namespace, not a fresh reload: a reload defines a new TiledMLP class,
+    # so anything that imported the old one (other tests, unsloth) patches a class nobody calls.
+    saved_namespace = dict(vars(tiled_mlp))
 
     def _reload(label, torch_label):
         device_type.DEVICE_TYPE = label
@@ -46,7 +51,8 @@ def reload_tiled_mlp():
 
     yield _reload
     device_type.DEVICE_TYPE, device_type.DEVICE_TYPE_TORCH = saved
-    importlib.reload(tiled_mlp)
+    vars(tiled_mlp).clear()
+    vars(tiled_mlp).update(saved_namespace)
 
 
 @pytest.mark.parametrize("label, torch_label", [("hip", "cuda"), ("mlx", "mps"), ("cuda", "cuda")])
@@ -78,6 +84,21 @@ def test_tiled_forward_and_backward_on_every_device_label(reload_tiled_mlp, monk
     torch.testing.assert_close(x.grad, x_ref.grad)
     for p, q in zip(tiled.parameters(), reference.parameters()):
         torch.testing.assert_close(p.grad, q.grad)
+pass
+
+
+def test_the_original_classes_are_back_after_a_reload(reload_tiled_mlp):
+    # What test_tiled_mlp_deepcopy_module_arg imported at collection; a later reload must not orphan it.
+    TiledMLP, patch_mlp = _IMPORTED
+    reload_tiled_mlp("hip", "cuda")
+    assert tiled_mlp.TiledMLP is not TiledMLP
+pass
+
+
+def test_the_original_classes_are_back_after_the_reload_above():
+    TiledMLP, patch_mlp = _IMPORTED
+    assert tiled_mlp.TiledMLP is TiledMLP and tiled_mlp.patch_mlp is patch_mlp
+    assert patch_mlp.__globals__["TiledMLP"] is TiledMLP
 pass
 
 

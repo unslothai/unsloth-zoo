@@ -63,6 +63,29 @@ import inspect
 import torch
 inductor_config_source = inspect.getsource(torch._inductor.config)
 
+
+def _disable_torch_2_9_0_cpp_symbolic_shape_guards():
+    # Only torch 2.9.0 enables C++ symbolic shape guards; they drop a duck-sizing equality, so
+    # Gemma3's prefill-compiled `prepare` is reused for decode and Inductor asserts in generate().
+    if not torch.__version__.startswith("2.9.0"): return False
+    try:
+        import torch._dynamo.config as dynamo_config
+        if not getattr(dynamo_config, "enable_cpp_symbolic_shape_guards", False): return False
+        dynamo_config.enable_cpp_symbolic_shape_guards = False
+        return True
+    except Exception:
+        return False
+pass
+_disable_torch_2_9_0_cpp_symbolic_shape_guards()
+
+def _persistent_tma_matmul_ok():
+    # torch 2.12+ guards every GEMM size when Inductor considers its TMA templates
+    # (pytorch/pytorch#172925), so a compiled torch._scaled_mm recompiles for each new token count.
+    import re
+    found = re.match(r"(\d+)\.(\d+)", torch.__version__)
+    return found is not None and (int(found.group(1)), int(found.group(2))) < (2, 12)
+pass
+
 @functools.lru_cache(1)
 def determine_compile_threads():
     # See https://github.com/pytorch/pytorch/blob/ab2294d8289a7757a2fc321cdefac88e2b378edf/torch/_inductor/config.py#L771
@@ -99,6 +122,35 @@ def is_transformers_v5_moe_quantization_available():
         )
     )
 
+def allow_inductor_pool_aliasing():
+    """
+    torch >= 2.11 checks custom op outputs for aliasing on a compiled function's first call
+    (torch/_functorch/_aot_autograd/runtime_wrappers.py, _AnalyzeCustomOpInputOutputMode). Under
+    inference_mode it also sees Inductor's own memory_planning op inductor::_alloc_from_pool, which
+    returns a view of its pool by design but declares no alias in its schema. That is a UserWarning,
+    and a RuntimeError when the CI env var is set (error_on_custom_op_aliasing = bool(CI)), so every
+    memory_planning=True graph under inference_mode fails in CI. Skip only that op; every other
+    custom op is still checked.
+    """
+    try:
+        # torch._dynamo first: importing runtime_wrappers on its own is a circular import that leaves
+        # torch._dynamo half initialised (torch.compile then fails for the whole process).
+        import torch._dynamo
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+    except Exception:
+        return
+    check = getattr(runtime_wrappers, "_check_custom_op_aliasing", None)
+    if check is None or getattr(check, "_unsloth_skips_alloc_from_pool", False):
+        return
+
+    def _check_custom_op_aliasing(name, *args, **kwargs):
+        if name == "inductor::_alloc_from_pool":
+            return None
+        return check(name, *args, **kwargs)
+    _check_custom_op_aliasing._unsloth_skips_alloc_from_pool = True
+    runtime_wrappers._check_custom_op_aliasing = _check_custom_op_aliasing
+pass
+
 def get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False,
@@ -121,6 +173,7 @@ def get_torch_compile_options(
     # https://github.com/pytorch/pytorch/blob/c665594c1edca9a507b0ec8b18ab74a0ecb65bc3/torch/_inductor/config.py#L1283
     # Needs integer
     multi_kernel = 1 if multi_kernel else 0
+    if memory_planning: allow_inductor_pool_aliasing()
 
     # Relabel Inductor's compile progress bar
     try:
@@ -152,7 +205,7 @@ def get_torch_compile_options(
 
         "triton.multi_kernel"       : multi_kernel, # RuntimeError: name 'multi_kernel_0' is not defined
         "triton.use_block_ptr"      : use_block_ptr,
-        "triton.enable_persistent_tma_matmul" : True,
+        "triton.enable_persistent_tma_matmul" : _persistent_tma_matmul_ok(),
         "triton.autotune_at_compile_time"     : False,
         "triton.cooperative_reductions"       : False,
         # "reorder_for_compute_comm_overlap"  : True, # Fails for single GPU

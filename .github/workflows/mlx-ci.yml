@@ -53,7 +53,7 @@ jobs:
     steps:
       # harden-runner block-mode is Linux-only; stay in audit on macOS for parity.
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
         with:
           egress-policy: audit
 
@@ -61,7 +61,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -107,7 +107,7 @@ jobs:
         # silently remove the very check that is supposed to tell us whether the
         # next release is safe to adopt.
         #
-        # Also past mlx-vlm's <=0.7.8 ceiling (and transformers with it): non-gating.
+        # Also past mlx-vlm's <=0.7.9 ceiling (and transformers with it): non-gating.
         if: matrix.mlx == 'latest'
         run: |
           pip install --upgrade mlx mlx-lm mlx-vlm
@@ -191,7 +191,8 @@ jobs:
         run: python -m pytest tests/test_mlx_decode_metal.py -v -rs
 
       - name: tests/test_mlx_load_residency_metal.py
-        # A finished load must own its weights.
+        # A finished load must own its weights; an offloaded one reads PLE rows and
+        # experts from the checkpoint, bit-exact against the stock modules.
         run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
 
       - name: tests/test_mlx_generate_metal.py
@@ -209,6 +210,10 @@ jobs:
       - name: tests/test_mlx_cpt_partition_metal.py
         # CPT partition, target normalization and full-module save routing.
         run: python -m pytest tests/test_mlx_cpt_partition_metal.py -v -rs
+
+      - name: tests/test_mlx_group_by_length_metal.py
+        # group_by_length through the real text plan builder (needs real MLX).
+        run: python -m pytest tests/test_mlx_group_by_length_metal.py -v -rs
 
       - name: tests/test_mlx_pr684_full_validation_metal.py
         # Deep behavior checks: resume determinism, completion-only training,
@@ -273,3 +278,6 @@ jobs:
       - name: tests/test_mlx_decision_metal.py
         # Typed-decision model logits against a torch reference of laya's DecisionModel.
         run: python -m pytest tests/test_mlx_decision_metal.py -v -rs
+
+      - name: tests/test_mlx_qat.py
+        run: python -m pytest tests/test_mlx_qat.py -v -rs

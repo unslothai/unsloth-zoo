@@ -24,9 +24,11 @@ __all__ = [
     "routed_bf16_forward",
     "routed_bf16_eligible",
     "routed_mlp_forward",
+    "routed_decode_epoch",
 ]
 
 import os
+import weakref
 from operator import attrgetter, is_, itemgetter, methodcaller
 
 import torch
@@ -35,6 +37,8 @@ from .moe_routed import (
     ACT_GPTOSS,
     ROUTED_MAX_SLOTS,
     _bf16_supported,
+    _bf16_supported_index,
+    _eager_out_of_dynamo,
     _lora_delta,
     routed_bf16_gemm,
     routed_bf16_moe,
@@ -45,6 +49,7 @@ from .moe_routed import (
     triton,
 )
 from .moe_grouped_modulelist import _StackedLoraLinear, _lora_stacks
+from . import moe_ready_epoch as _moe_ready
 
 
 def _mixed_adapter_batch(module):
@@ -221,6 +226,107 @@ def _snapshot_current(experts, snap):
     return list(map(_get_version, snap["versioned"])) == snap["versions"]
 
 
+# Decode epochs. _snapshot_current rechecks every expert (identity, addresses, versions: a few hundred attribute
+# reads per layer, about 10% of an NF4 decode step on a slow host). A one-token decode step on the cache of the
+# previous decode step belongs to the same epoch: a layer's tables are fully checked on its first call of an
+# epoch, then only _sentinel_current (the first gate_up / down expert) runs until the epoch changes. A new epoch
+# starts with a new cache object, on every generate() call and on a cache reset (a reused static cache). The
+# shortcut also needs moe_ready_epoch's stamp, read at the call, unchanged since the full check: the experts subtree
+# is tracked there, so a module / parameter / buffer registered in it (setattr, as PEFT merges and unloads do), a
+# move (.to / .cuda / .half, which also pops these tables), requires_grad_, a PEFT state method or an optimizer
+# step ends it, even inside a decode step; without that machinery (or under accelerate / FSDP2 hooks) every call is
+# fully checked. A check without an epoch (the experts' eval forward, as in prefill) clears the stamp. Not rechecked
+# inside one generation: a non-first expert's weight swapped by .data assignment, a parameter set to None, or
+# quant_state / tensor surgery in place between two one-token steps. UNSLOTH_GPTOSS_ROUTED_EPOCH=0 checks every
+# call fully.
+_EPOCH_ENABLED = os.environ.get("UNSLOTH_GPTOSS_ROUTED_EPOCH", "1") != "0"
+# Counts per prepare_routed_experts call on built tables: "full" ran _snapshot_current, "sentinel" only the O(1) check.
+ROUTED_EPOCH_STATS = {"full": 0, "sentinel": 0}
+_EPOCH = [0]
+_LAST_CACHE = [None]
+_EPOCH_HOOKS = []
+
+
+def _bump_epoch(*args):
+    _EPOCH[0] += 1
+
+
+def _wrap_epoch_boundary(owner, name):
+    """owner.name, wrapped to start a new decode epoch on entry (generate(), Cache.reset)."""
+    import functools
+    f = owner.__dict__.get(name)
+    if f is None or not callable(f) or getattr(f, "_unsloth_routed_epoch", False):
+        return False
+
+    @functools.wraps(f)
+    def wrapped(*args, **kwargs):
+        _EPOCH[0] += 1
+        return f(*args, **kwargs)
+
+    wrapped._unsloth_routed_epoch = True
+    setattr(owner, name, wrapped)
+    return True
+
+
+def _install_epoch_hooks():
+    """True when every generation boundary starts a new epoch (else the shortcut stays off)."""
+    if _EPOCH_HOOKS:
+        return _EPOCH_HOOKS[0]
+    _EPOCH_HOOKS.append(False)
+    try:
+        from transformers import cache_utils
+        from transformers.generation.utils import GenerationMixin
+        _wrap_epoch_boundary(GenerationMixin, "generate")
+        # Every cache class defining reset (Cache and its layers on transformers 5, StaticCache on 4.x).
+        for obj in vars(cache_utils).values():
+            if isinstance(obj, type) and obj.__module__ == cache_utils.__name__ and "reset" in obj.__dict__:
+                _wrap_epoch_boundary(obj, "reset")
+        _EPOCH_HOOKS[0] = True
+    except Exception:
+        pass
+    return _EPOCH_HOOKS[0]
+
+
+def routed_decode_epoch(cache):
+    """Epoch of a one-token decode step on cache (see _EPOCH): the current one when the previous step used the
+    same cache object, else a new one. None (always fully checked) without a cache."""
+    if cache is None or not _EPOCH_ENABLED or not _install_epoch_hooks():
+        return None
+    last = _LAST_CACHE[0]
+    if last is None or last() is not cache:
+        _EPOCH[0] += 1
+        try:
+            _LAST_CACHE[0] = weakref.ref(cache)
+        except TypeError:
+            _LAST_CACHE[0] = None
+            return None
+    return _EPOCH[0]
+
+
+def _sentinel_current(experts, snap):
+    """The first gate_up and down expert unchanged (module, base layer, weight, address, quant_state): what a
+    move, merge or reload of the experts changes. The O(1) check inside an epoch."""
+    mods = snap["mods"]
+    gate_up, down = experts.gate_up_projs._modules, experts.down_projs._modules
+    n = len(mods[0])
+    if len(gate_up) != n or len(down) != len(mods[1]) or n == 0 or not mods[1]:
+        return False
+    if next(iter(gate_up.values())) is not mods[0][0] or next(iter(down.values())) is not mods[1][0]:
+        return False
+    if snap["wrappers"] and not all(map(is_, map(_get_base, snap["wrappers"][:1] + snap["wrappers"][n:n + 1]),
+                                            snap["wrapped"][:1] + snap["wrapped"][n:n + 1])):
+        return False
+    params, weights, ptrs = snap["params"], snap["weights"], snap["ptrs"]
+    for i in (0, n):
+        w = weights[i]
+        if (
+            params[i].get("weight") is not w or torch._C.TensorBase.data_ptr(w) != ptrs[i]
+            or w.quant_state is not snap["quant_states"][i]
+        ):
+            return False
+    return True
+
+
 def _weights(experts):
     return tuple(getattr(p, "base_layer", p).weight for projs in (experts.gate_up_projs, experts.down_projs) for p in projs)
 
@@ -244,10 +350,23 @@ def _compiled_state(experts):
     return state
 
 
-def prepare_routed_experts(experts):
+def _track(experts):
+    """Track the experts subtree in moe_ready_epoch (registrations and moves there move its stamp; a move pops these
+    tables). False under accelerate / FSDP2 hooks, which swap storage without any hook firing."""
+    try:
+        hooked, _ = _moe_ready.scan(experts)
+    except Exception:
+        return False
+    return not hooked
+
+
+# Eager only, also for its direct callers outside the routed forwards (see _eager_out_of_dynamo).
+@torch.compiler.disable
+def prepare_routed_experts(experts, epoch = None):
     """Build (or validate) the pointer tables for a ModuleList NF4 experts module.
 
-    Eager only (data_ptr is not traceable); returns None when the layout is unsupported."""
+    Eager only (data_ptr is not traceable); returns None when the layout is unsupported. epoch: a
+    routed_decode_epoch() value; tables fully checked in that epoch are only sentinel-checked."""
     gate_up_projs = getattr(experts, "gate_up_projs", None)
     down_projs = getattr(experts, "down_projs", None)
     if gate_up_projs is None or down_projs is None or len(gate_up_projs) == 0:
@@ -256,8 +375,22 @@ def prepare_routed_experts(experts):
     if state is False:
         return None
     try:
-        if isinstance(state, dict) and _snapshot_current(experts, state["snapshot"]):
-            return state
+        if epoch is not None and not _moe_ready.enabled():
+            epoch = None  # no registration / move tracking: full check
+        stamp = _moe_ready.stamp() if epoch is not None else None
+        if isinstance(state, dict):
+            if (
+                epoch is not None and state.get("epoch") == epoch and state.get("stamp") == stamp
+                and _sentinel_current(experts, state["snapshot"])
+            ):
+                ROUTED_EPOCH_STATS["sentinel"] += 1
+                return state
+            ROUTED_EPOCH_STATS["full"] += 1
+            if _snapshot_current(experts, state["snapshot"]):
+                if epoch is not None and not state.get("tracked"):
+                    state["tracked"] = _track(experts)
+                state["epoch"], state["stamp"] = (epoch, stamp) if state.get("tracked") else (None, None)
+                return state
         # Declined keyed by ids/addresses, not references, so a moved model frees its old copy.
         if isinstance(state, tuple) and state == _decline_key(experts):
             return None
@@ -276,8 +409,10 @@ def prepare_routed_experts(experts):
     if gate_up is None or down is None or down["K"] * 2 != gate_up["N"] or gate_up["K"] != down["N"]:
         experts._unsloth_routed_nf4 = _decline_key(experts)
         return None
+    tracked = _track(experts) if epoch is not None else False
     state = {"gate_up": gate_up, "down": down, "key": tuple(snap["ptrs"]), "snapshot": snap,
-             "weights": tuple(snap["weights"])}
+             "weights": tuple(snap["weights"]), "tracked": tracked,
+             "epoch": epoch if tracked else None, "stamp": stamp if tracked else None}
     experts._unsloth_routed_nf4 = state
     return state
 
@@ -356,6 +491,7 @@ def _stacked_lora(projs, name, first, cache):
     return cache["A"], cache["B"], first.scaling[name]
 
 
+@_eager_out_of_dynamo
 def routed_experts_forward(experts, hidden_states, router_indices, routing_weights, _state = None):
     """Routed eval forward for NF4 gpt-oss experts, or None. routing_weights: [T, E] or [T, top_k]."""
     if _routed_disabled():
@@ -449,9 +585,14 @@ def routed_bf16_eligible(experts, hidden_states):
             return False
         if w.dtype == torch.bfloat16 and not _bf16_supported(w.device):
             return False
-    return True
+    # Below sm80 (T4) only one-token decode routes (moe_routed.sub_sm80_devices). Per device, not
+    # sub_sm80_devices(): its first call runs torch.cuda.device_count(), which a cold fullgraph trace rejects.
+    if hidden_states.numel() == hidden_states.shape[-1] or w.device.index is None:
+        return True
+    return _bf16_supported_index(w.device.index)
 
 
+@_eager_out_of_dynamo
 def routed_bf16_forward(experts, hidden_states, router_indices, routing_weights):
     """gpt-oss experts on only the routed experts. routing_weights: [T, E] (dense, zero off
     the picked experts) or [T, top_k]; returns [B, S, H] in hidden_states.dtype."""
@@ -476,9 +617,10 @@ def routed_bf16_forward(experts, hidden_states, router_indices, routing_weights)
     return out.view(shape)
 
 
-def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
+@_eager_out_of_dynamo
+def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS, epoch = None):
     """gpt-oss MLP output from the router and only the routed experts, or None for calls larger
-    than max_slots (token, expert) pairs or experts this path does not cover."""
+    than max_slots (token, expert) pairs or experts this path does not cover. epoch: see prepare_routed_experts."""
     if triton is None or torch.is_grad_enabled() or not hidden_states.is_cuda:
         return None
     if _routed_disabled():
@@ -487,7 +629,7 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
     nf4 = False
     if hasattr(experts, "gate_up_projs"):
         # Built eagerly (data_ptr is not traceable), even on calls too large to route.
-        state = _compiled_state(experts) if torch.compiler.is_compiling() else prepare_routed_experts(experts)
+        state = _compiled_state(experts) if torch.compiler.is_compiling() else prepare_routed_experts(experts, epoch)
         nf4 = isinstance(state, dict)
     if hidden_states.numel() // hidden_states.shape[-1] * getattr(mlp.router, "top_k", 4) > max_slots:
         return None

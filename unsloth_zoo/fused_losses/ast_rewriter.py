@@ -308,15 +308,6 @@ def _is_shift_labels_pop(stmt: ast.stmt, kwargs_name) -> bool:
             and ast.unparse(stmt) == f"shift_labels = {kwargs_name}.pop('shift_labels', labels)")
 
 
-def _find_loss_assign_target(if_block: ast.If, call: ast.Call) -> str | None:
-    for stmt in if_block.body:
-        if isinstance(stmt, ast.Assign) and stmt.value is call and len(stmt.targets) == 1:
-            tgt = stmt.targets[0]
-            if isinstance(tgt, ast.Name):
-                return tgt.id
-    return None
-
-
 def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False) -> TripletCapture | None:
     """`extended` (compiler fallback) adds logit scale, explicit `shift_labels=` and legacy CE shapes."""
     body = fn.body
@@ -662,6 +653,8 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
         if name not in already
     )
     kwargs_unpack = f", **{cap.kwargs_name}" if cap.kwargs_name else ""
+    # fp16: the kernel computes grads in the forward, so it needs the trainer's GradScaler.
+    scaler_kw = ", accelerator_scaler=getattr(self, 'accelerator_scaler', None)"
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
@@ -681,7 +674,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
                 else:
                     {loss} = unsloth_fused_lm_head_loss(
                         {hidden_src}, self.{head_attr}, labels,
-                        vocab_size={vocab}{extra}{scale_extra}{kwargs_unpack},
+                        vocab_size={vocab}{extra}{scale_extra}{scaler_kw}{kwargs_unpack},
                     )
                     {logits} = EMPTY_LOGITS
             else:
@@ -706,7 +699,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
         if cap.logits_bias_src is not None:
             aligned_kw += f", logits_bias={cap.logits_bias_src}"
         fused_call = (
-            f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels{aligned_kw}{scale_extra}{kwargs_unpack})"
+            f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels{aligned_kw}{scale_extra}{scaler_kw}{kwargs_unpack})"
         )
         if cap.kwargs_name:
             # The stock CE block never reads a caller's `shift_labels`; the adapter would.
@@ -719,7 +712,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
         ]
         fused_call = (
             f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels, "
-            f"vocab_size={vocab}{extra}{scale_extra}{kwargs_unpack})"
+            f"vocab_size={vocab}{extra}{scale_extra}{scaler_kw}{kwargs_unpack})"
         )
     fused = [*(ast.unparse(s) for s in cap.fused_pre), fused_call, *loss_casts, f"{logits} = EMPTY_LOGITS"]
     def ind(lines, n):

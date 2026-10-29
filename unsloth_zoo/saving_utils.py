@@ -1071,6 +1071,7 @@ def _merge_and_overwrite_lora(
     use_dequant_base = False,
     biases = None,
     vocab_modules = None,
+    fp8_header_cache = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -1100,6 +1101,7 @@ def _merge_and_overwrite_lora(
             model_class_name, tie_word_embeddings = tie_word_embeddings,
             weight_block_size = weight_block_size,
             biases = biases, vocab_modules = vocab_modules,
+            header_cache = fp8_header_cache,
         )
     pass
 
@@ -1330,14 +1332,6 @@ def _merge_and_overwrite_lora(
 
                 output_key = key
                 action_logged = False
-                # Standard 16-bit tensor
-                W = file.get_tensor(key)
-                W_original_dtype = W.dtype
-                W = bias_overrides.get(key, W)
-
-                if W is None:
-                    continue
-
                 lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
                 lora_stats = converted_lora_weights.get(lora_key, None)
                 # Fallback: handle Gemma4ClippableLinear (.linear.weight -> .weight)
@@ -1358,6 +1352,21 @@ def _merge_and_overwrite_lora(
                         lora_stats = converted_lora_weights.get(lm_head_key[len("model."):], None)
                     if lora_stats is None and not lm_head_key.startswith("model."):
                         lora_stats = converted_lora_weights.get("model." + lm_head_key, None)
+
+                # Nothing replaces it: the shard already holds these exact bytes.
+                if (
+                    lora_stats is None
+                    and key not in bias_overrides
+                    and vocab_overrides.get(lora_key) is None
+                ):
+                    continue
+
+                W = file.get_tensor(key)
+                W_original_dtype = W.dtype
+                W = bias_overrides.get(key, W)
+
+                if W is None:
+                    continue
 
                 W = _apply_vocab_override(W, vocab_overrides, lora_key, lora_stats)
 
@@ -2975,11 +2984,12 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
     W_real = _fp8_dequant_blockwise(W, scale_inv, block_size = weight_block_size)
     return W_real, scale_keys
 
-def _build_cross_shard_fp8_index(save_directory, current_filename):
+def _build_cross_shard_fp8_index(save_directory, current_filename, header_cache = None):
     """{key: (filename, dtype)} for tensors in the OTHER *.safetensors shards (headers only,
     no tensor reads). HF shards a weight and its scale companion independently, so an FP8
     weight and its `*.weight_scale(_inv)` can land in different files; this lets the rewrite
-    find a scale elsewhere and drop a scale whose weight was dequantized elsewhere."""
+    find a scale elsewhere and drop a scale whose weight was dequantized elsewhere.
+    `header_cache` (one export's shard loop) reuses a header while (inode, size, mtime) holds."""
     index = {}
     try:
         siblings = [f for f in os.listdir(save_directory)
@@ -2987,15 +2997,30 @@ def _build_cross_shard_fp8_index(save_directory, current_filename):
     except OSError:
         return index
     for fn in siblings:
-        try:
-            with open(os.path.join(save_directory, fn), "rb") as fp:
-                length = int.from_bytes(fp.read(8), "little")
-                hdr = json.loads(fp.read(length))
-        except Exception:
-            continue
-        for k, meta in hdr.items():
-            if k != "__metadata__" and isinstance(meta, dict):
-                index.setdefault(k, (fn, meta.get("dtype")))
+        path = os.path.join(save_directory, fn)
+        stamp = entries = None
+        if header_cache is not None:
+            try:
+                st = os.stat(path)
+                stamp = (st.st_ino, st.st_size, st.st_mtime_ns)
+            except OSError:
+                stamp = None
+            cached = header_cache.get(fn)
+            if stamp is not None and cached is not None and cached[0] == stamp:
+                entries = cached[1]
+        if entries is None:
+            try:
+                with open(path, "rb") as fp:
+                    length = int.from_bytes(fp.read(8), "little")
+                    hdr = json.loads(fp.read(length))
+            except Exception:
+                continue
+            entries = [(k, meta.get("dtype")) for k, meta in hdr.items()
+                       if k != "__metadata__" and isinstance(meta, dict)]
+            if stamp is not None:
+                header_cache[fn] = (stamp, entries)
+        for k, dtype in entries:
+            index.setdefault(k, (fn, dtype))
     return index
 pass
 
@@ -3085,9 +3110,11 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames, prerewrit
     return removed
 pass
 
-def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None, vocab_modules = None):
+def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None, vocab_modules = None, header_cache = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
+    if header_cache is not None:
+        header_cache.pop(filename, None)  # pre-rewrites (compressed / float32) may have changed it
     filename_original = os.path.join(save_directory, filename)
     _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
@@ -3127,7 +3154,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             )
 
         # FP8 weight/scale pairs can be split across shards, so index the other shards once.
-        cross_shard = _build_cross_shard_fp8_index(save_directory, filename)
+        cross_shard = _build_cross_shard_fp8_index(save_directory, filename, header_cache)
 
         def _load_cross_shard_scale(scale_key):
             entry = cross_shard.get(scale_key)
@@ -3245,6 +3272,8 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
     with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
         temp_filename_safetensors = tmpfile.name
     save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})
+    if header_cache is not None:
+        header_cache.pop(filename, None)
     try:
         os.replace(temp_filename_safetensors, filename_original)
     except OSError as e:
@@ -3886,7 +3915,7 @@ def _copy_export_remote_code(model_name, save_directory, token, model):
 pass
 
 
-def _source_config_model_type(model_name, token = None, commit = None):
+def _source_config_dict(model_name, token = None, commit = None):
     # `commit` pins a moved branch to the loaded revision.
     try:
         if os.path.isdir(str(model_name)):
@@ -3897,10 +3926,56 @@ def _source_config_model_type(model_name, token = None, commit = None):
             path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token,
                                    revision = revision or commit)
         with open(path, "r", encoding = "utf-8") as f:
-            model_type = json.load(f).get("model_type")
+            config = json.load(f)
     except Exception:
         return None
+    return config if isinstance(config, dict) else None
+pass
+
+
+def _source_config_model_type(model_name, token = None, commit = None):
+    model_type = (_source_config_dict(model_name, token, commit) or {}).get("model_type")
     return model_type if isinstance(model_type, str) and model_type else None
+pass
+
+
+# Set by the export itself (vocab carry-over, dtype, quantization), so never taken from the checkpoint.
+_EXPORT_MANAGED_CONFIG_KEYS = frozenset((
+    "vocab_size", "unsloth_vocab_pad_ids", "unsloth_vocab_pad_suppressed_ids",
+    "quantization_config", "transformers_version", "torch_dtype", "dtype",
+))
+
+
+def _overlay_export_managed_keys(target, written):
+    for key, value in written.items():
+        if key in _EXPORT_MANAGED_CONFIG_KEYS:
+            target[key] = value
+        elif isinstance(value, dict) and isinstance(target.get(key), dict):
+            _overlay_export_managed_keys(target[key], value)
+        elif key in target and target[key] == value:
+            # The saved type: transformers 5.20 rejects Ling-3.0-tiny's own `"kda_lower_bound": -5` (int).
+            target[key] = value
+    for key in [k for k in target if k in _EXPORT_MANAGED_CONFIG_KEYS and k not in written]:
+        del target[key]
+pass
+
+
+def _restore_checkpoint_config_keys(config_path, source, config_class):
+    """A built-in class saved a repo-code (auto_map) checkpoint's keys under its own names (bailing_hybrid:
+    `norm_topk_prob` -> `moe_renormalize`, `head_dim` 128 -> 64), but the weights keep the checkpoint's layout
+    and llama.cpp / its code read its keys (#14916): write its config.json back. True if rewritten."""
+    config_path = Path(config_path)
+    if not isinstance(source, dict) or "auto_map" not in source or not config_path.exists(): return False
+    try:
+        written = json.loads(config_path.read_text(encoding = "utf-8"))
+    except Exception:
+        return False
+    aliases = getattr(config_class, "attribute_map", None) or {}
+    # Only when the save lost a checkpoint key to an alias: every other built-in export stays as it was.
+    if not any(alias in source and alias not in written for alias in aliases): return False
+    _overlay_export_managed_keys(source, written)
+    config_path.write_text(json.dumps(source, indent = 2), encoding = "utf-8")
+    return True
 pass
 
 
@@ -3955,7 +4030,15 @@ def _carry_over_vocab_pad_records(base_config, trained_config):
     targets = _text_configs(base_config) or [base_config]
     for key in ("unsloth_vocab_pad_ids", "unsloth_vocab_pad_suppressed_ids"):
         ids = next((getattr(h, key) for h in sources if getattr(h, key, None) is not None), None)
-        if ids is None: continue
+        if ids is None:
+            # Record dropped by training: the base's copy is stale and would make vLLM mask real tokens.
+            for holder in targets + [base_config]:
+                try:
+                    if key in getattr(holder, "__dict__", {}): delattr(holder, key)
+                except Exception: pass
+            pass
+            continue
+        pass
         # The first holder is get_text_config(), which vllm_utils._padded_vocab_ids reads.
         try: setattr(targets[0], key, list(ids))
         except Exception: pass
@@ -4482,6 +4565,20 @@ def _pick_int_scheme(base, schemes, packed_shape, scale_shape, logical_shape, ha
 pass
 
 
+def _read_tensors_by_shard(save_directory, locations, names):
+    """`{name: tensor}` in `names` order, opening each shard once and closing it before the next."""
+    by_shard = {}
+    for name in names:
+        by_shard.setdefault(locations[name], []).append(name)
+    tensors = {}
+    for filename, keys in by_shard.items():
+        with safe_open(os.path.join(save_directory, filename), framework = "pt", device = "cpu") as f:
+            for key in keys:
+                tensors[key] = f.get_tensor(key)
+    return {name: tensors[name] for name in names}
+pass
+
+
 def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
     """All refusals happen here, before any shard is touched; companions in other shards are read up front."""
     locations, shapes, stored_shapes = {}, {}, {}
@@ -4494,11 +4591,7 @@ def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
                 elif key.endswith(".weight_shape"):
                     stored_shapes[key] = tuple(int(x) for x in f.get_tensor(key).tolist())
 
-    def read(key):
-        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
-            return f.get_tensor(key)
-
-    bases, logical, elsewhere = {}, {}, {}
+    bases, logical, elsewhere = {}, {}, []
     for key in sorted(k for k in locations if k.endswith("_packed")):
         base = key[: -len(".weight_packed")]
         if not key.endswith(".weight_packed") or len(shapes[key]) != 2 or base + ".weight_scale" not in locations:
@@ -4521,7 +4614,8 @@ def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
         for suffix in _INT_PACKED_SUFFIXES[1:]:
             companion = base + "." + suffix
             if companion in locations and locations[companion] != locations[key]:
-                elsewhere[companion] = read(companion)
+                elsewhere.append(companion)
+    elsewhere = _read_tensors_by_shard(save_directory, locations, elsewhere)
     return dict(bases = bases, logical = logical, elsewhere = elsewhere)
 pass
 
@@ -4745,15 +4839,11 @@ def _plan_compressed_mxfp4_rewrite(save_directory, filenames, model):
                 f"{(packed_shape[0], packed_shape[1] * 2)}. Nothing was merged."
             )
 
-    def read(key):
-        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
-            return f.get_tensor(key)
-
-    elsewhere = {
-        base + ".weight_scale": read(base + ".weight_scale")
+    elsewhere = _read_tensors_by_shard(save_directory, locations, [
+        base + ".weight_scale"
         for base in packed_bases
         if locations[base + ".weight_scale"] != locations[base + ".weight_packed"]
-    }
+    ])
     return dict(
         stacks = stacks, keys_of = keys_of, shapes = shapes, packed_bases = packed_bases,
         targets = targets, elsewhere = elsewhere, deltas = {},
@@ -4891,6 +4981,49 @@ def _upcast_shard_to_float32(save_directory, filename):
         file_path, os.path.dirname(os.path.abspath(file_path)),
         header_metadata, length_of_header, {}, cast_to = torch.float32,
     )
+pass
+
+
+def _shard_tensor_bytes(file_path):
+    """Bytes of tensor data in one safetensors shard, read from its header."""
+    with open(file_path, "rb") as f:
+        length_of_header = int.from_bytes(f.read(8), "little")
+        header_metadata = json.loads(f.read(length_of_header))
+    return sum(
+        v["data_offsets"][1] - v["data_offsets"][0]
+        for k, v in header_metadata.items()
+        if k != "__metadata__" and isinstance(v, dict) and "data_offsets" in v
+    )
+pass
+
+
+def _set_index_total_size(save_directory, total_size):
+    """Record `total_size` in a copied shard index; returns whether it changed."""
+    index_path = os.path.join(save_directory, "model.safetensors.index.json")
+    if not os.path.isfile(index_path): return False
+    try:
+        with open(index_path, "rb") as f:
+            raw = f.read()
+        # transformers reads the index in the locale encoding, so non-UTF-8 bytes are still valid.
+        data = json.loads(raw.decode("utf-8", errors = "surrogateescape"))
+    except Exception:
+        return False
+    metadata = data.get("metadata") if isinstance(data, dict) else None
+    if not isinstance(metadata, dict) or metadata.get("total_size") == total_size:
+        return False
+    # Rewrite only the number so every other byte stays as copied.
+    pattern = re.compile(rb'("total_size"\s*:\s*)-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?')
+    if len(pattern.findall(raw)) == 1:
+        updated = pattern.sub(lambda m: m.group(1) + str(int(total_size)).encode("ascii"), raw)
+    else:
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        metadata["total_size"] = total_size
+        updated = json.dumps(data, indent = 4).encode("utf-8")
+    _export_index_atomically(index_path, index_path, updated)
+    return True
 pass
 
 
@@ -5376,14 +5509,18 @@ def merge_and_overwrite_lora(
         else:
             _carry_over_vocab_size(base_config, config)
         # Read before saving: an in-place export overwrites the source config.json.
-        source_model_type = None
+        source_model_type = source_config = None
         if _is_remote_code_config(base_config):
             loaded_commit = _trusted_code_commit(model) if _is_export_source_loaded_repo(model_name, model) else None
             source_model_type = _source_config_model_type(model_name, token, loaded_commit)
+        elif getattr(type(base_config), "attribute_map", None):
+            source_config = _source_config_dict(model_name, token)
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
             _restore_source_model_type(Path(save_directory) / "config.json", source_model_type)
             _copy_export_remote_code(model_name, save_directory, token, model)
+        else:
+            _restore_checkpoint_config_keys(Path(save_directory) / "config.json", source_config, type(base_config))
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         if upcast_to_float32:
@@ -5742,11 +5879,13 @@ def merge_and_overwrite_lora(
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("FP8 MoE-expert LoRA detected: dequantizing to 16bit, then merging experts.")
         _prerewrite_fp8_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list)
+        _prerewrite_header_cache = {}
         for _fn in final_safetensors_list:
             _merge_and_overwrite_lora_fp8(
                 save_directory, _fn, defaultdict(lambda: None), output_dtype, _merge_model_class_name,
                 tie_word_embeddings = _merge_tie_word_embeddings,
                 weight_block_size = _merge_weight_block_size,
+                header_cache = _prerewrite_header_cache,
             )
         _drop_resolved_fp8_scales_after_rewrite(save_directory, final_safetensors_list, _prerewrite_fp8_keys)
         # Model is now 16bit on disk; merge expert LoRA via the standard (non-quantized) path.
@@ -5807,6 +5946,8 @@ def merge_and_overwrite_lora(
     _vocab_modules = _untargeted_vocab_modules(
         _merge_base_model, lora_weights, _merge_tie_word_embeddings,
     ) if save_method == "merged_16bit" else {}
+    _widened_total_size = 0
+    _fp8_header_cache = {}
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         if _mxfp4_rewrite is not None:
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
@@ -5830,12 +5971,15 @@ def merge_and_overwrite_lora(
             use_dequant_base = _use_dequant_base,
             biases = biases,
             vocab_modules = _vocab_modules,
+            fp8_header_cache = _fp8_header_cache,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
         device_empty_cache()
 
         file_path = os.path.join(save_directory, filename)
+        if upcast_to_float32 and not regenerate_index:
+            _widened_total_size += _shard_tensor_bytes(file_path)
 
         # --- NEW LOGIC: Build the weight_map BEFORE deleting the file ---
         if regenerate_index and not _fp8_post_cleanup:
@@ -5870,6 +6014,12 @@ def merge_and_overwrite_lora(
                 except FileNotFoundError:
                     pass
     pass
+
+    # A copied index still carries the 16-bit base's total_size.
+    if upcast_to_float32 and not regenerate_index:
+        if _set_index_total_size(save_directory, _widened_total_size) and push_to_hub and low_disk_space_usage:
+            # Low disk mode uploaded the index before the merge; Step 7 does not run.
+            upload_items("model.safetensors.index.json")
 
     # Step 6: Regenerate index for MXFP4 dequantization or shard splitting
     if regenerate_index:
@@ -6671,6 +6821,41 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefix
     return False
 pass
 
+def _build_reversed_key_index(safetensor_keys):
+    """Sorted (reversed key, position) pairs + keys; None unless plain str keys in a list/tuple/set/frozenset (caller keeps the linear scan)."""
+    if type(safetensor_keys) not in (list, tuple, set, frozenset):
+        return None
+    keys = safetensor_keys if type(safetensor_keys) in (list, tuple) else list(safetensor_keys)
+    index = []
+    for position, key in enumerate(keys):
+        if type(key) is not str:
+            return None
+        index.append((key[::-1], position))
+    index.sort()
+    return index, keys
+pass
+
+def _indexed_prefix_candidates(index, keys, k):
+    """Same list, in the same order, as the linear scan in `_infer_prefix_and_remap`."""
+    import bisect
+    candidates = []
+    for suffix in (k + ".weight", k + ".linear.weight"):
+        reversed_suffix = suffix[::-1]
+        start = end = bisect.bisect_left(index, (reversed_suffix,))
+        while end < len(index) and index[end][0].startswith(reversed_suffix):
+            end += 1
+        for position in sorted(position for _, position in index[start:end]):
+            prefix = keys[position][: -len(suffix)]
+            if prefix:
+                candidates.append(prefix)
+    return list(dict.fromkeys(candidates))
+pass
+
+def _component_signature(parts):
+    """A vote needs equal prefix multisets over a shared suffix, so equal full multisets: pairs with different signatures never vote."""
+    return tuple(sorted(p for p in parts if p))
+pass
+
 def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     """Infer missing key prefixes by matching LoRA keys against safetensor keys.
 
@@ -6691,6 +6876,7 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     changed = False
     inferred_prefixes = []  # track prefixes from successful per-key matches
     unmatched_keys = []     # keys that couldn't be matched at all
+    suffix_index, suffix_index_built = None, False
 
     for k, v in lora_weights.items():
         if not isinstance(k, str):
@@ -6702,12 +6888,17 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             continue
         # unique prefix candidates; also accept a .linear.weight shard (Gemma4) so a
         # prefix-add onto it is not dropped.
-        candidates = list(dict.fromkeys(
-            sf_key[: -len(suffix)]
-            for suffix in (k + ".weight", k + ".linear.weight")
-            for sf_key in safetensor_keys
-            if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
-        ))
+        if not suffix_index_built:
+            suffix_index, suffix_index_built = _build_reversed_key_index(safetensor_keys), True
+        if suffix_index is not None and type(k) is str:
+            candidates = _indexed_prefix_candidates(*suffix_index, k)
+        else:
+            candidates = list(dict.fromkeys(
+                sf_key[: -len(suffix)]
+                for suffix in (k + ".weight", k + ".linear.weight")
+                for sf_key in safetensor_keys
+                if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
+            ))
         if len(candidates) == 1:
             remapped[candidates[0] + k] = v
             inferred_prefixes.append(candidates[0])
@@ -6731,15 +6922,17 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             if module_key is None:
                 continue
             sf_parts = module_key.split(".")
+            signature = _component_signature(sf_parts)
             for sl in range(1, min(3, len(sf_parts)) + 1):
-                sf_parts_by_suffix[(sl, tuple(sf_parts[-sl:]))].append(sf_parts)
+                sf_parts_by_suffix[(signature, sl, tuple(sf_parts[-sl:]))].append(sf_parts)
         for k, _ in unmatched_keys:
             if not isinstance(k, str):
                 continue
             k_parts = k.split(".")
+            signature = _component_signature(k_parts)
             seen_sf = set()
             for sl in range(min(3, len(k_parts)), 0, -1):
-                for sf_parts in sf_parts_by_suffix.get((sl, tuple(k_parts[-sl:])), ()):
+                for sf_parts in sf_parts_by_suffix.get((signature, sl, tuple(k_parts[-sl:])), ()):
                     sf_id = tuple(sf_parts)
                     if sf_id in seen_sf:        # process each sf once, at its longest match
                         continue

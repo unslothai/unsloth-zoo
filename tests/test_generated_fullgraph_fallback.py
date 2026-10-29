@@ -43,6 +43,8 @@ import torch
 
 from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
 
+pytestmark = pytest.mark.usefixtures("compile_enabled")
+
 ZOO = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 COMPILER = ZOO / "compiler.py"
 # Not just the compiler: the first pass scanned compiler.py alone and passed while

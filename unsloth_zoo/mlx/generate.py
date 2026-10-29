@@ -163,7 +163,7 @@ class SamplingParams:
 class GenerationDefaults:
     """Batch-wide defaults used when a request does not override a value.
 
-    ``stop_token_ids`` (text models) replaces the tokenizer's EOS set as the stop ids.
+    ``stop_token_ids`` replaces the tokenizer's EOS set as the stop ids.
     """
 
     max_tokens: int = 256
@@ -177,6 +177,7 @@ class GenerationDefaults:
     kv_quant_scheme: str | None = None
     quantized_kv_start: int | None = None
     stop_token_ids: tuple[int, ...] | None = None
+    prefill_step_size: int | None = None  # None: the runtime's own
 
     def __post_init__(self):
         _validate_positive_int(self.max_tokens, "defaults.max_tokens")
@@ -190,6 +191,9 @@ class GenerationDefaults:
         )
         if self.max_kv_size is not None:
             _validate_positive_int(self.max_kv_size, "defaults.max_kv_size")
+        if self.prefill_step_size is not None:
+            _validate_positive_int(self.prefill_step_size, "defaults.prefill_step_size")
+            object.__setattr__(self, "prefill_step_size", int(self.prefill_step_size))
         if self.kv_bits is not None:
             if isinstance(self.kv_bits, bool) or not isinstance(self.kv_bits, Real):
                 raise TypeError("defaults.kv_bits must be a number.")
@@ -243,12 +247,20 @@ class GenerationRequest:
     """One generation request.
 
     Exactly one of ``prompt`` and ``prompt_token_ids`` must be provided, and a
-    vision request with media must use ``prompt``. Rendered prompt strings are
-    encoded as-is; chat templating belongs to the caller. ``image`` (vision models only) accepts a PIL image, an array, or a
+    vision request with ``image`` or ``audio`` must use ``prompt``. Rendered prompt strings are
+    encoded as-is; chat templating belongs to the caller. ``image`` (vision models, and image models
+    loaded through mlx-lm) accepts a PIL image, an array, or a
     str/os.PathLike filesystem path or URL, decoded once before grouping; raw
     bytes and file-like objects are rejected. ``audio`` (vision models only) is
     accepted but decodes one request at a time, since no supported mlx-vlm
     release batches it. At most one of ``image`` and ``audio`` per request.
+
+    A vision prompt given as ``prompt_token_ids`` to ``generate_batch`` or
+    ``stream_batch`` may carry its media prepared: ``vision_inputs`` holds the
+    processor's other outputs for this prompt alone (such as ``pixel_values`` or
+    ``image_grid_thw``), prefilled as given instead of re-encoded. Rows batch
+    together by concatenating them along the first axis; a row with a
+    list-valued input runs alone.
 
     ``logits_processors`` are this row's own ``(tokens, logits) -> logits`` callables,
     run in order on its slice before it draws, and shown the same history on every path
@@ -271,6 +283,7 @@ class GenerationRequest:
     sampling: SamplingParams | None = None
     logits_processors: Sequence[Callable[[Any, Any], Any]] | None = None
     prompt_cache_state: Any | None = None
+    vision_inputs: Mapping[str, Any] | None = None
 
     def __post_init__(self):
         state = self.prompt_cache_state
@@ -352,9 +365,15 @@ def _validated_prompt_ids(request: GenerationRequest, index: int) -> tuple[int, 
     return tuple(int(token) for token in prompt_ids)
 
 
+def _serves_text_images(model) -> bool:
+    """An image model loaded through mlx-lm (see ``FastMLXModel``), whose text batches take images."""
+    return getattr(model, "_unsloth_supports_images", None) is True and not getattr(model, "_is_vlm_model", False)
+
+
 def _validate_text_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
+    takes_images: bool = False,
 ) -> list[GenerationRequest]:
     validated = list(requests)
     for index, request in enumerate(validated):
@@ -382,11 +401,18 @@ def _validate_text_requests(
             request.sampling, SamplingParams
         ):
             raise TypeError(f"requests[{index}].sampling must be SamplingParams.")
-        if request.image is not None or request.audio is not None:
+        if request.audio is not None or (request.image is not None and not takes_images) or request.vision_inputs is not None:
             raise ValueError(
                 f"requests[{index}] includes media, but text models accept "
                 "text prompts only."
             )
+        if request.image is not None and has_ids:
+            raise ValueError(
+                f"requests[{index}] gives token ids with an image; only the "
+                "processor can place image tokens, so send a rendered prompt."
+            )
+        if isinstance(request.image, os.PathLike):
+            validated[index] = replace(validated[index], image=os.fspath(request.image))
         if request.prompt_cache_state is not None:
             raise ValueError(
                 f"requests[{index}] carries a prompt_cache_state, which only a vision "
@@ -415,6 +441,17 @@ def _kv_quant_options(defaults: GenerationDefaults) -> dict:
         for name in _KV_QUANT_CONTROLS
         if getattr(defaults, name) is not None
     }
+
+
+def _prefill_step_option(defaults: GenerationDefaults, constructor = None) -> dict:
+    """``prefill_step_size`` when one was asked for and ``constructor`` (if given) takes it."""
+    if defaults.prefill_step_size is None:
+        return {}
+    if constructor is not None:
+        params = inspect.signature(constructor).parameters
+        if "prefill_step_size" not in params and not any(p.kind is p.VAR_KEYWORD for p in params.values()):
+            return {}
+    return {"prefill_step_size": defaults.prefill_step_size}
 
 
 def _batch_kv_quant_options(defaults: GenerationDefaults) -> dict:
@@ -553,6 +590,8 @@ VLM_TOKEN_ID_PROMPTS = True
 def _validate_vlm_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
+    *,
+    prepared: bool = False,
 ) -> list[GenerationRequest]:
     validated = list(requests)
     for index, request in enumerate(validated):
@@ -564,11 +603,28 @@ def _validate_vlm_requests(
                 f"requests[{index}] must provide exactly one of prompt or "
                 "prompt_token_ids."
             )
+        if request.vision_inputs is not None:
+            if not has_ids:
+                raise ValueError(
+                    f"requests[{index}].vision_inputs belong to a prompt given as "
+                    "prompt_token_ids."
+                )
+            if not prepared:
+                raise ValueError(
+                    f"requests[{index}] gives vision_inputs, which a vision model "
+                    "takes through generate_batch or stream_batch only."
+                )
+            if not isinstance(request.vision_inputs, Mapping) or {"input_ids", "attention_mask"} & set(request.vision_inputs):
+                raise ValueError(
+                    f"requests[{index}].vision_inputs must map the processor's "
+                    "outputs other than input_ids and attention_mask."
+                )
         if has_ids:
             if request.image is not None or request.audio is not None:
                 raise ValueError(
                     f"requests[{index}] gives token ids with media; only the "
-                    "processor can place media tokens, so send a rendered prompt."
+                    "processor can place media tokens, so send a rendered prompt"
+                    + (" or the processor's outputs as vision_inputs." if prepared else ".")
                 )
             validated[index] = replace(
                 request,
@@ -583,6 +639,11 @@ def _validate_vlm_requests(
                 f"requests[{index}] carries both an image and audio; batched "
                 "vision generation takes at most one medium per request."
             )
+        if request.audio is not None and defaults.stop_token_ids is not None:
+            raise ValueError(
+                f"requests[{index}] carries audio, which mlx-vlm decodes on its "
+                "own stopping criteria; omit stop_token_ids."
+            )
         if request.max_tokens is not None:
             _validate_positive_int(request.max_tokens, f"requests[{index}].max_tokens")
         if request.sampling is not None and not isinstance(
@@ -596,12 +657,75 @@ def _validate_vlm_requests(
     return validated
 
 
+def _vision_inputs_layout(inputs):
+    def layout(value):
+        if isinstance(value, (list, tuple)):
+            return "list"
+        shape = tuple(getattr(value, "shape", ()))
+        if not shape:  # batch-wide metadata (an image token id): rows batch only when it agrees
+            return (), value.item() if hasattr(value, "item") else value
+        return shape, str(getattr(value, "dtype", type(value).__name__))
+
+    return tuple(sorted((name, layout(value)) for name, value in (inputs or {}).items()))
+
+
+def _prepared_vlm_inputs(chunk):
+    """A group of prepared prompts as ``prepare_inputs`` returns a batch: their
+    equal-length ids unpadded, each array input joined along the first axis, and
+    each scalar or list input kept as given (the group key makes it agree)."""
+    import mlx.core as mx
+
+    input_ids = mx.array([list(request.prompt_token_ids) for request in chunk])
+    inputs = {"input_ids": input_ids, "attention_mask": mx.ones(input_ids.shape, dtype=mx.int32)}
+    for name, first in (chunk[0].vision_inputs or {}).items():
+        values = [request.vision_inputs[name] for request in chunk]
+        if not getattr(first, "shape", ()):
+            inputs[name] = first
+        else:
+            inputs[name] = mx.concatenate([mx.array(value) for value in values], axis=0)
+    if "images" in inputs:  # as prepare_inputs renames it
+        inputs["pixel_values"] = inputs.pop("images")
+    return inputs
+
+
+class _StopIdsCriteria:
+    """Stops on exactly the given ids; mlx-vlm's criteria can only add to the EOS set."""
+
+    def __init__(self, ids):
+        self.eos_token_ids = list(ids)
+
+    def __call__(self, token) -> bool:
+        return token in self.eos_token_ids
+
+    def add_eos_token_ids(self, ids=None):
+        if ids is not None:
+            self.eos_token_ids.extend([ids] if isinstance(ids, int) else ids)
+
+
+class _Delegate:
+    def __init__(self, target):
+        self._target = target
+
+    def __getattr__(self, name):
+        if name == "_target":
+            raise AttributeError(name)
+        return getattr(self._target, name)
+
+
+def _generation_processor(adapter):
+    """The processor mlx-vlm's generator stops through: with ``stop_token_ids``, a view
+    stopping on those alone, leaving the shared tokenizer's criteria untouched."""
+    processor, stop_ids = adapter.processor, adapter.defaults.stop_token_ids
+    if stop_ids is None:
+        return processor
+    tokenizer = _Delegate(getattr(processor, "tokenizer", processor))
+    tokenizer.stopping_criteria = _StopIdsCriteria(stop_ids)
+    view = _Delegate(processor)
+    view.tokenizer = tokenizer
+    return view
+
+
 def _validate_vlm_defaults(defaults: GenerationDefaults) -> None:
-    if defaults.stop_token_ids is not None:
-        raise ValueError(
-            "stop_token_ids is not supported for batched vision generation; "
-            "mlx-vlm stops on its processor's own criteria."
-        )
     if defaults.prefill_batch_size > defaults.completion_batch_size:
         # An inverted pair never admits anything on mlx-vlm, so generation would
         # hang. mlx-lm normalizes the two, so this is vision-specific.
@@ -1595,6 +1719,45 @@ def _warn_preserving(
         pass
 
 
+def image_prompt_embeddings(model, tokenizer, prompt: str, images, *, add_special_tokens = None):
+    """``(token_ids, input_embeddings)`` of a rendered prompt for an image model loaded through
+    mlx-lm, with the tokenizer returned with it, for ``mlx_lm.stream_generate(..., input_embeddings=)``.
+    ``add_special_tokens=None`` adds them unless the prompt starts with the BOS."""
+    import mlx.core as mx
+    from .loader import _mlx_lm_image_inputs
+
+    processor = getattr(tokenizer, "_unsloth_image_processor", None)
+    if processor is None:
+        raise ValueError("Image prompts need the tokenizer FastMLXModel returned with this model.")
+    inputs = _mlx_lm_image_inputs(
+        tokenizer, processor, list(images), prompt, add_special_tokens=add_special_tokens)
+    ids = [int(token) for token in inputs["input_ids"][0]]
+    embeddings = model.embed_inputs(
+        mx.array(ids), pixel_values=[mx.array(pixels) for pixels in inputs["pixel_values"]])
+    return ids, embeddings
+
+
+def prefill_image_prompt(
+    model, tokenizer, prompt: str, images, cache, *, prefill_step_size: int = 2048, add_special_tokens = None,
+) -> list[int]:
+    """Prefill ``cache`` with all but the last token of an image prompt and return its token ids: mlx-lm's
+    ``BatchGenerator`` takes ids only, so the row joins as ``insert([ids[-1:]], caches=[cache], all_tokens=[ids[:-1]])``."""
+    import mlx.core as mx
+
+    with mx.stream(importlib.import_module("mlx_lm.generate").generation_stream):
+        ids, embeddings = image_prompt_embeddings(
+            model, tokenizer, prompt, images, add_special_tokens=add_special_tokens)
+        processor = tokenizer._unsloth_image_processor
+        # The last position joins as a token, so it must not be an image row.
+        if ids[-1] == tokenizer.convert_tokens_to_ids(processor.image_token):
+            raise ValueError("An image prompt cannot end inside an image.")
+        for start in range(0, len(ids) - 1, prefill_step_size):
+            end = min(start + prefill_step_size, len(ids) - 1)
+            model(mx.array(ids[start:end])[None], cache=cache, input_embeddings=embeddings[None, start:end])
+            mx.eval([entry.state for entry in cache])
+    return ids
+
+
 class _TextBatchSession:
     """One mlx-lm ``BatchGenerator`` with its row set left open."""
 
@@ -1612,6 +1775,7 @@ class _TextBatchSession:
             prefill_batch_size=defaults.prefill_batch_size,
             completion_batch_size=defaults.completion_batch_size,
             max_kv_size=defaults.max_kv_size,
+            **_prefill_step_option(defaults, adapter.batch_generator_type),
         )
         self._row_signature = None
         self._pending: dict[int, _PendingResult] = {}
@@ -1627,7 +1791,10 @@ class _TextBatchSession:
     def add(self, request: GenerationRequest) -> int:
         adapter = self.adapter
         defaults = adapter.defaults
-        prompt = _encode_prompt(adapter.tokenizer, request)
+        if request.image is None:
+            prompt, prefilled, cache = _encode_prompt(adapter.tokenizer, request), [], None
+        else:
+            prompt, prefilled, cache = self._prefill_image_row(request)
         params = request.sampling or defaults.sampling
         sampler = (
             _seeded_sampler(adapter.sample_utils, params)
@@ -1645,6 +1812,7 @@ class _TextBatchSession:
                 max_tokens=[int(request.max_tokens or defaults.max_tokens)],
                 samplers=[sampler],
                 logits_processors=[_text_row_processors(request)],
+                **({} if cache is None else {"caches": [cache], "all_tokens": [prefilled]}),
             )
         except BaseException:
             self.usable = False
@@ -1658,7 +1826,7 @@ class _TextBatchSession:
             state = _PendingResult(
                 detokenizer=_new_detokenizer(adapter.tokenizer),
                 scanner=_StopStringScanner(defaults.stop_strings),
-                prompt_token_count=len(prompt),
+                prompt_token_count=len(prefilled) + len(prompt),
             )
         except BaseException as active_error:
             try:
@@ -1677,6 +1845,30 @@ class _TextBatchSession:
         self._row_of[uid] = row
         self._uid_of[row] = uid
         return row
+
+    def _prefill_image_row(self, request: GenerationRequest) -> tuple[list[int], list[int], list]:
+        """``(last token, prompt before it, cache holding that prompt)`` for an image row."""
+        from mlx_lm.models.cache import make_prompt_cache
+
+        image = request.image
+        if isinstance(image, bytes):
+            raise ValueError(
+                "Batched image generation accepts a PIL image, an array, or a str/os.PathLike "
+                "path or URL; raw bytes are not supported."
+            )
+        if isinstance(image, str):
+            from transformers.image_utils import load_image
+            try:
+                image = load_image(image)
+            except Exception as exc:
+                raise ValueError(f"Could not load the image {image!r} for batched generation.") from exc
+        cache = make_prompt_cache(self.adapter.model, self.adapter.defaults.max_kv_size)
+        ids = prefill_image_prompt(
+            self.adapter.model, self.adapter.tokenizer, request.prompt, [image], cache,
+            prefill_step_size=getattr(self.generator, "prefill_step_size", None) or 2048,
+            add_special_tokens=False,
+        )
+        return ids[-1:], ids[:-1], cache
 
     def cancel(self, row: int) -> bool:
         return self._take_back(row) is not None
@@ -2805,23 +2997,24 @@ class _VLMBatchAdapter:
         # Prompt length is part of the key: preprocessing stacks a group without
         # padding, so mixing lengths raises instead of generating. Grouping by
         # length keeps varied batches working, at the cost of smaller groups.
-        shape = self._image_shape(request.image)
-        tokenizer = getattr(self.processor, "tokenizer", self.processor)
         ids = request.prompt_token_ids
-        width = len(ids) if ids is not None else len(tokenizer.encode(request.prompt))
-        key = (request.image is None, ids is not None, shape, width)
+        if ids is not None:
+            inputs = request.vision_inputs or {}
+            alone = id(request) if any(isinstance(value, (list, tuple)) for value in inputs.values()) else None
+            key = ("ids", _vision_inputs_layout(inputs), len(ids), alone)
+        else:
+            shape = self._image_shape(request.image)
+            tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            key = (request.image is None, shape, len(tokenizer.encode(request.prompt)))
         if self.batches_observable:
             return key
         sampling = request.sampling or self.defaults.sampling
         return (_sampler_key(sampling), *key)
 
     def _prompt_inputs(self, requests: Sequence[GenerationRequest]) -> dict:
-        """``prepare_inputs`` for rows grouped alike; token-id rows are their own input ids."""
+        """``prepare_inputs`` for rows grouped alike; token-id rows are their own input ids and vision inputs."""
         if requests[0].prompt_token_ids is not None:
-            import mlx.core as mx
-
-            input_ids = mx.array([list(request.prompt_token_ids) for request in requests])
-            return {"input_ids": input_ids, "attention_mask": mx.ones(input_ids.shape, dtype=mx.int32)}
+            return _prepared_vlm_inputs(requests)
         images = [request.image for request in requests if request.image is not None]
         return self.prepare_inputs(
             self.processor,
@@ -2949,6 +3142,7 @@ class _VLMBatchAdapter:
             max_tokens=int(request.max_tokens or self.defaults.max_tokens),
             logits_processors=_row_processors(request),
             **_kv_quant_options(self.defaults),
+            **_prefill_step_option(self.defaults),
             sampler=(
                 _seeded_sampler(self.sample_utils, sampling)
                 if _draws_seeded(sampling)
@@ -3055,6 +3249,7 @@ class _VLMBatchAdapter:
         if "compute_logprobs" in self.constructor_params:
             options["compute_logprobs"] = True
         options.update(_batch_kv_quant_options(self.defaults))
+        options.update(_prefill_step_option(self.defaults))
         max_tokens = [
             int(request.max_tokens or self.defaults.max_tokens) for request in chunk
         ]
@@ -3087,7 +3282,7 @@ class _VLMBatchAdapter:
                 }
                 generator = self.generator_type(
                     self.model.language_model,
-                    self.processor,
+                    _generation_processor(self),
                     **options,
                 )
                 token_ids = input_ids.tolist()
@@ -3678,10 +3873,11 @@ class _VLMBatchSession:
             "sampler": self.sampler,
             "compute_logprobs": True,
             **_batch_kv_quant_options(defaults),
+            **_prefill_step_option(defaults),
         }
         generator = adapter.generator_type(
             adapter.model.language_model,
-            adapter.processor,
+            _generation_processor(adapter),
             **{
                 key: value
                 for key, value in options.items()
@@ -3753,7 +3949,8 @@ class _SpeculativeBatchSession:
         self.speculative = speculative
         self.tokenizer = getattr(adapter.processor, "tokenizer", adapter.processor)
         criteria = getattr(self.tokenizer, "stopping_criteria", None)
-        self.stop_tokens = frozenset(getattr(criteria, "eos_token_ids", None) or (ids[0] for ids in _eos_stop_tokens(self.tokenizer)))
+        stop_ids = adapter.defaults.stop_token_ids
+        self.stop_tokens = frozenset(stop_ids) if stop_ids is not None else frozenset(getattr(criteria, "eos_token_ids", None) or (ids[0] for ids in _eos_stop_tokens(self.tokenizer)))
         self.engine = SpeculativeEngine(adapter.model, speculative.controller, speculative.drafter, logprobs = True)
         self._pending: dict[int, _PendingResult] = {}
         # Rows whose prefill drew tokens the next step reports.
@@ -3792,7 +3989,7 @@ class _SpeculativeBatchSession:
         )
         # The engine row keeps the whole prompt, for copies and the drafter; only the forward starts past the prefix.
         with self._embedded(len(pending.prompt) - prefix):
-            admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra)
+            admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra, **_prefill_step_option(adapter.defaults))
         finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
         if not finished:
             try:
@@ -4037,8 +4234,11 @@ class BatchStream:
 
     def add(self, request: GenerationRequest) -> int:
         session = self._require_open()
-        validate = _validate_vlm_requests if self._is_vlm else _validate_text_requests
-        (validated,) = validate([request], session.adapter.defaults)
+        if self._is_vlm:
+            (validated,) = _validate_vlm_requests([request], session.adapter.defaults)
+        else:
+            (validated,) = _validate_text_requests(
+                [request], session.adapter.defaults, _serves_text_images(session.adapter.model))
         from .utils import _validate_mlx_image_input
         _validate_mlx_image_input(session.adapter.model, validated.image is not None)
         return session.add(validated)
@@ -4243,12 +4443,19 @@ def _stream_batch(
         raise TypeError("defaults must be GenerationDefaults.")
     is_vlm = bool(getattr(model, "_is_vlm_model", False))
     validated = (
-        _validate_vlm_requests(requests, defaults)
+        _validate_vlm_requests(requests, defaults, prepared=True)
         if is_vlm
-        else _validate_text_requests(requests, defaults)
+        else _validate_text_requests(requests, defaults, _serves_text_images(model))
     )
     from .utils import _validate_mlx_image_input
-    _validate_mlx_image_input(model, any(request.image is not None for request in validated))
+    _validate_mlx_image_input(model, any(
+        request.image is not None
+        or any(
+            value is not None and (name == "images" or name.startswith("pixel_values"))
+            for name, value in (request.vision_inputs or {}).items()
+        )
+        for request in validated
+    ))
     if is_vlm and (gap := _vlm_quantized_cache_gap(model, defaults)) is not None:
         raise ValueError(gap)
     if any(request.prompt_cache_state is not None for request in validated):
@@ -4361,6 +4568,8 @@ __all__ = [
     "fast_generate",
     "generate_batch",
     "generation_mode",
+    "image_prompt_embeddings",
+    "prefill_image_prompt",
     "row_logits_processors_unavailable_reason",
     "row_prompt_cache_unavailable_reason",
     "row_quantized_prompt_cache_unavailable_reason",

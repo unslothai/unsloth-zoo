@@ -30,7 +30,8 @@ STATIC_WARPS = 32 if not IS_AMD else 16
         for BD in [16, 32, 64, 128]
         for num_warps in NUM_WARPS_AUTOTUNE
     ],
-    key=['D', 'W', 'NB'],
+    # Unsloth: fla PRs #1154 / #1388 drop unread NB so token buckets do not recompile.
+    key=['D', 'W'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -53,7 +54,6 @@ def causal_conv1d_fwd_kernel(
     BT: tl.constexpr,
     BW: tl.constexpr,
     BD: tl.constexpr,
-    NB: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -151,7 +151,8 @@ def causal_conv1d_fwd_kernel(
         for BD in [16, 32, 64, 128]
         for num_warps in [4, 8, 16, 32]
     ],
-    key=['D', 'W', 'NB'],
+    # Unsloth: backport of fla PRs #1154 / #1388.
+    key=['D', 'W'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -183,7 +184,6 @@ def causal_conv1d_bwd_kernel(
     BT: tl.constexpr,
     BW: tl.constexpr,
     BD: tl.constexpr,
-    NB: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,

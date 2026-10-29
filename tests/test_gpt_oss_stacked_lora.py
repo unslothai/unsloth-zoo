@@ -500,13 +500,22 @@ def test_routed_decode_compile_fullgraph_and_cuda_graph_replay():
         ref1 = gr.routed_experts_forward(eu, x, idx, w)
         ref2 = gr.routed_experts_forward(eu, x, idx2, w2)
         assert torch.equal(gr.routed_experts_forward(es, x, idx, w), ref1)
-        torch._dynamo.reset()
-        from torch._dynamo.utils import counters
-        counters.clear()
-        compiled = torch.compile(lambda a, b, c: gr.routed_experts_forward(es, a, b, c), fullgraph = True)
-        torch.testing.assert_close(compiled(x, idx, w), ref1, rtol = 1e-5, atol = 1e-5)
-        torch.testing.assert_close(compiled(x, idx2, w2), ref2, rtol = 1e-5, atol = 1e-5)
-        assert sum(counters["graph_break"].values()) == 0
+        # Inductor compiles no bfloat16 graph below sm80 (SkipFrame: "does not support bfloat16 compilation
+        # natively"), so a T4 has no fullgraph to check here; the CUDA graph replay below still runs.
+        if torch.cuda.get_device_capability(x.device) >= (8, 0):
+            torch._dynamo.reset()
+            from torch._dynamo.utils import counters
+            counters.clear()
+            compiled = torch.compile(lambda a, b, c: gr.routed_experts_forward(es, a, b, c), fullgraph = True)
+            torch.testing.assert_close(compiled(x, idx, w), ref1, rtol = 1e-5, atol = 1e-5)
+            torch.testing.assert_close(compiled(x, idx2, w2), ref2, rtol = 1e-5, atol = 1e-5)
+            assert sum(counters["graph_break"].values()) == 0
+        else:
+            # Without fullgraph the skipped frame runs eagerly and must still give the routed result.
+            torch._dynamo.reset()
+            compiled = torch.compile(lambda a, b, c: gr.routed_experts_forward(es, a, b, c))
+            torch.testing.assert_close(compiled(x, idx, w), ref1, rtol = 1e-5, atol = 1e-5)
+            torch.testing.assert_close(compiled(x, idx2, w2), ref2, rtol = 1e-5, atol = 1e-5)
 
         static = [x.clone(), idx.clone(), w.clone()]
         s = torch.cuda.Stream()
@@ -577,9 +586,6 @@ def _decline_model(case, monkeypatch):
     if case == "loop_path":
         monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "0")
         return build(), 0
-    if case == "compile_disabled":
-        monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
-        return build(), 0
     if case == "bf16_base":
         return build(base = "bf16"), 0
     if case == "no_bf16_backend":
@@ -592,7 +598,7 @@ def _decline_model(case, monkeypatch):
 
 @needs_bf16
 @pytest.mark.parametrize("case", ["dropout", "two_adapters", "dora", "lora_bias", "existing_grads", "frozen_expert",
-                                  "kill_switch", "loop_path", "compile_disabled", "bf16_base", "no_bf16_backend"])
+                                  "kill_switch", "loop_path", "bf16_base", "no_bf16_backend"])
 def test_declines_keep_per_expert_parameters(case, monkeypatch):
     model, expected = _decline_model(case, monkeypatch)
     ref = dict(model.named_parameters())
@@ -602,6 +608,20 @@ def test_declines_keep_per_expert_parameters(case, monkeypatch):
     if expected == 0:
         assert dict(model.named_parameters()).keys() == ref.keys()
         assert all(ref[n] is p for n, p in model.named_parameters())
+
+
+@needs_bf16
+@pytest.mark.parametrize("value", ["1", "partial"])
+def test_compile_disable_still_stacks(value, monkeypatch):
+    """UNSLOTH_COMPILE_DISABLE only skips torch.compile: the grouped path stacks as it does by default."""
+    with _env(UNSLOTH_MOE_STACKED_LORA = "1"):
+        default = build()
+        ML.auto_enable_grouped_moe(default)
+    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", value)
+    with _env(UNSLOTH_MOE_STACKED_LORA = "1"):
+        model = build()
+        ML.auto_enable_grouped_moe(model)
+    assert n_stacked(model) == n_stacked(default) > 0
 
 
 @needs_bf16

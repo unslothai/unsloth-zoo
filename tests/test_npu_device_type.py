@@ -96,6 +96,8 @@ def answers():
     env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_ZOO_DISABLE_GPU_INIT"}
     env["UNSLOTH_ALLOW_CPU"] = "1"
     env["UNSLOTH_DISABLE_PINNED_MEMORY"] = "1"  # stub npu has no pinned allocator
+    # The "none" cell is the refusal; the CPU training fallback has its own matrix.
+    env["UNSLOTH_DISABLE_CPU_FALLBACK"] = "1"
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(_ROOT), env.get("PYTHONPATH")]))
     out = subprocess.run(
         [sys.executable, "-c", _CHILD, *_CELLS],

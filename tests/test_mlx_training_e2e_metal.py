@@ -118,7 +118,7 @@ def test_minicpmv4_7_text_batch_matches_upstream_and_compiles(monkeypatch):
     upstream = getattr(installed, "__wrapped__", installed)
     monkeypatch.setattr(module.Model, "get_input_embeddings", upstream)
     with monkeypatch.context() as changed:
-        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", "0" * 64)
+        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", ("0" * 64,))
         assert loader._minicpmv4_7_text_positions_adapter(module.Model) is upstream
     loader._ensure_minicpmv4_7_text_positions("minicpmv4_7")
     patched = module.Model.get_input_embeddings
@@ -978,15 +978,23 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
     assert plan.prepare_cce_batch(1, batch) is batch
 
 
+# Ternary Bonsai 2 packs, from mlx-vlm and (0.32+) mlx-lm.
+_HADAMARD_PACKS = pytest.mark.parametrize("pack_module", [
+    "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35", "mlx_lm.models.prism_hadamard_qwen35",
+], ids=["mlx_vlm", "mlx_lm"])
+
+
 @metal_only
-def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch):
-    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+@_HADAMARD_PACKS
+def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch, pack_module):
+    pack = pytest.importorskip(pack_module)
+    rotate = getattr(pack, "hadamard_transform", None) or pack.hadamard_rotate
     from unsloth_zoo.mlx import preference
     mx.random.seed(611)
     model = _cce_text_model(2053, 1024, quantized=True)
     head = pack.HadamardQuantizedLinear(1024, 8192, 512)
     head.signs = mx.where(mx.random.uniform(shape=(1024,)) < 0.5, -1.0, 1.0)
-    rotated = pack.hadamard_transform(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
+    rotated = rotate(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
     head.weight, scales, biases = mx.quantize(rotated, group_size=128, bits=2)
     head.scales, head.biases = scales.astype(mx.float16), biases.astype(mx.float16)
     model.lm_head = head
@@ -1875,7 +1883,12 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
         assert capacity < batch[0].shape[0] * (batch[0].shape[1] - 1)
         assert kernel_rows == [capacity] * (2 if reference and kind == "dpo" else 1)
         for want, got in zip(expected[0], actual[0]):
-            assert mx.allclose(want, got, atol=1e-4, rtol=1e-5).item()
+            atol = 1e-4
+            if dtype == "float32" and want.ndim:
+                # rewards/margins subtracts rewards/rejected from rewards/chosen, so it keeps a few
+                # float32 ulps of those sums, which the kernel and the logits round differently.
+                atol += 4 * mx.finfo(mx.float32).eps * mx.abs(want[:2]).max().item()
+            assert mx.allclose(want, got, atol=atol, rtol=1e-5).item()
         # A bfloat16 run accumulates chunks in a different order; the softcap derivative amplifies that.
         rtol = 2e-4 if dtype == "float32" else 2e-2 if head == "softcap" else 5e-3
         for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
@@ -3033,6 +3046,13 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
             del Gemma3Model._kv_sharing_patched
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
+
+
+@metal_only
+def test_gemma3n_compile_patches_recognise_the_installed_language_call():
+    from mlx_vlm.models.gemma3n.language import Gemma3Model
+    import unsloth_zoo.mlx.compile as mc
+    assert mc._gemma3n_language_contract(Gemma3Model.__call__) == "current"
 
 
 @metal_only

@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
         with:
           egress-policy: audit
 
@@ -73,22 +73,22 @@ jobs:
       # One restore for the whole job, from the pip-cache pair below, which also
       # keeps the save on main. It lands in the shared directory ahead of the
       # install step, so every lane reads the wheels of every interpreter from it.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         id: py310
         with:
           python-version: '3.10'
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         id: py311
         with:
           python-version: '3.11'
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         id: py312
         with:
           python-version: '3.12'
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         id: py313
         with:
           python-version: '3.13'
@@ -217,7 +217,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
         with:
           egress-policy: audit
 
@@ -225,7 +225,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -293,6 +293,7 @@ jobs:
         # test_vllm_direct_lora_loading pins the vLLM direct hot-load slot
         # mapping (no GPU, no vLLM needed). test_sft_prepare_dataset_double_bos
         # pins add_special_tokens for text that already carries BOS.
+        # test_compile_cache_concurrency pins the Mega-cache key, save lock and union.
         #
         # The two MoE registry files pin preprocess_weight's layout resolution (#849)
         # and that the weight-preprocessor registry is one dict across the package
@@ -433,6 +434,7 @@ jobs:
         # test_mlx_embedding_guards: sentence-transformers layout shim and pooling-mode map, under the torch shim.
         # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
         # test_top_level_imports_are_declared: every package a zoo module imports at module level is a declared dependency.
+        # test_custom_op_annotations: torch.library.custom_op functions keep real annotations, which torch 2.4 / 2.6 require.
         # test_xpu_device_typed_autocast: nested bnb offset, Gemma3n fp32 regions and unsloth_train autocast follow the accelerator, not "cuda".
         # test_xpu_empty_cache_arms: gradient checkpointing buffers and patch_model_and_tokenizer release cached memory through torch.xpu on XPU.
         # One pytest process per group: MLX export shims replace sys.modules globally,
@@ -450,7 +452,9 @@ jobs:
           behavioral() {
             run_gate behavioral python -m pytest \
               tests/test_ci_cpu_gate_results.py \
+              tests/test_compile_cache_concurrency.py \
               tests/test_top_level_imports_are_declared.py \
+              tests/test_custom_op_annotations.py \
               tests/test_training_utils_use_cache.py \
               tests/test_unsloth_train_scheduler_kwargs.py \
               tests/test_xpu_device_typed_autocast.py \
@@ -461,12 +465,14 @@ jobs:
               tests/test_mlx_incomplete_config.py \
               tests/test_mlx_incomplete_config_vlm.py \
               tests/test_mlx_adam_epsilon.py \
+              tests/test_mlx_group_by_length.py \
               tests/test_mlx_optimizer_torch_parity.py \
               tests/test_hf_xet_fallback.py \
               tests/test_hf_xet_fallback_blob_scoped_redownload.py \
               tests/test_download_helpers_import_without_zoo_init.py \
               tests/test_llama_cpp_install_consent.py \
               tests/test_llama_cpp_consent_platforms.py \
+              tests/test_llama_cpp_subprocess_utf8_encoding.py \
               tests/test_converter_source_staging.py \
               tests/test_get_transformers_model_type_empty.py \
               tests/test_train_on_responses_list_labels.py \
@@ -522,6 +528,7 @@ jobs:
               tests/test_forced_float32_lora_forward_result_dtype.py \
               tests/test_inductor_codegen_fallback.py \
               tests/test_inductor_single_compile_worker.py \
+              tests/test_inductor_cache_dir_kept.py \
               tests/test_eager_fallback_latch.py \
               tests/test_recompile_limit_fallback.py \
               tests/test_checkpoint_compile_mix.py \
@@ -617,7 +624,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
         with:
           egress-policy: audit
 
@@ -625,7 +632,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -690,7 +697,7 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.3,<=0.32.2" "mlx-vlm>=0.4.4,<=0.7.8" &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.3,<=0.32.2" "mlx-vlm>=0.4.4,<=0.7.9" &&
               retry .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
@@ -948,6 +955,18 @@ jobs:
       # gradient regression from #776 and the consumer-binding sweep shipped
       # ungated. They need mlx core plus mlx-lm, not Metal, so they belong here;
       # the Metal-only halves skip and stay the macOS lane's job.
+      - name: tests/test_mlx_qat.py
+        run: >-
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_qat.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/qat.xml"
+
+      - name: Fail if the QAT tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/qat.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the QAT tests skipped"
+
       - name: tests/test_mlx_gated_delta.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta.py -v -rs
 
@@ -1009,7 +1028,7 @@ jobs:
     steps:
       - name: Harden runner (audit)
         # audit (not block): the cells pull arbitrary transformers/TRL/peft pins.
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
         with:
           egress-policy: audit
 
@@ -1017,7 +1036,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -1199,10 +1218,12 @@ jobs:
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_compiler_getsource_tokenerror.py \
+                  tests/test_compiled_module_hash_seed_stable.py \
                   tests/test_fused_ce_coverage.py \
                   tests/test_deepseek_v3_grpo_hidden_states.py \
                   tests/test_moe_hidden_states_wrapper.py \
                   tests/test_aya_vision_logit_scale.py \
+                  tests/test_umt5_transformers5.py \
                   tests/test_vision_utils_grid_helpers_eager.py \
                   tests/test_modeling_local_vision_helpers_eager.py \
                   tests/test_disable_compile_functions_reach_imported_helpers.py \

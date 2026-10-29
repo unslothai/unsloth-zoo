@@ -16,6 +16,8 @@
 
 """MXFP4 (e2m1 nibbles + e8m0 block scales) to bf16 / fp16, matching transformers' convert_moe_packed_tensors; Triton kernel with a torch fallback."""
 
+import os
+
 import torch
 
 __all__ = [
@@ -42,13 +44,27 @@ except Exception:
 # Bounds the torch path's temporaries to ~256 MB (a whole gpt-oss-120b stack would be 8.5 GB).
 _TORCH_CHUNK_BYTES = 256 << 20
 
+# ROCm Triton (gfx11, Triton 3.6) lowers bf16 x bf16 to v_dot2_bf16_bf16(a, b, +0) (flushes subnormals,
+# -0 -> +0) and fp32 multiply then fp16 cast to v_fma_mixlo_f16(a, b, +0) (-0 -> +0). There the kernel
+# multiplies in fp32 and rounds to 16 bits with integer ops instead.
+_IS_HIP = torch.version.hip is not None
+
 # torch < 2.12's ldexp forms 2^e in the input dtype: inf from 2^16 in fp16, and from 2^128 (e8m0 255) in fp32 (0 -> NaN).
 _LDEXP_EXACT = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 12)
 
 
-def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False, out = None):
+def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False, out = None, max_rows = None):
     """Reference: transformers' convert_moe_packed_tensors arithmetic, in row chunks."""
-    work = dtype if _LDEXP_EXACT else torch.float32
+    from unsloth_zoo.utils import device_guard
+
+    # torch.ldexp launches on the current device: operands on another GPU fault without this.
+    with device_guard(blocks):
+        return _mxfp4_dequantize_torch(blocks, scales, dtype, transpose, out, max_rows)
+
+
+def _mxfp4_dequantize_torch(blocks, scales, dtype, transpose, out, max_rows):
+    # float64 holds 2^128; routing it through fp32 would overflow.
+    work = dtype if _LDEXP_EXACT or dtype == torch.float64 else torch.float32
     lut = torch.tensor(_FP4_VALUES, dtype = work, device = blocks.device)
     *prefix, G, B = blocks.shape
     if transpose and not prefix:
@@ -61,7 +77,11 @@ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = F
     scales_in = scales.reshape(R, G)
     # Transposed: row r lands in column r % N of expert r // N; a chunk never crosses an expert.
     dst = buf.view(R // N, G * B * 2, N) if transpose else buf.view(R, G * B * 2)
-    step = max(1, min(N if transpose else R, _TORCH_CHUNK_BYTES // (G * B * 2 * 8)))
+    # Live bytes per value: 8 native; the fp32 detour (float32 output too) also holds ldexp/where outputs and the cast (~18).
+    per_value = 8 if _LDEXP_EXACT or dtype == torch.float64 else 20
+    step = max(1, min(N if transpose else R, _TORCH_CHUNK_BYTES // (G * B * 2 * per_value)))
+    if max_rows is not None:
+        step = max(1, min(step, max_rows))
     r0 = 0
     while r0 < R:
         # Advance to r1, not by step: a chunk cut at an expert edge is shorter.
@@ -73,6 +93,9 @@ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = F
         exponent = (scales_in[r0:r1].to(torch.int32) - 127).unsqueeze(-1)
         if _LDEXP_EXACT:
             piece = torch.ldexp(piece, exponent).to(dtype)
+        elif work == torch.float64:
+            # Old float64 ldexp rounds on CUDA; 2^e from its float64 bits is exact for every e8m0 scale.
+            piece.mul_(((exponent.to(torch.int64) + 1023) << 52).view(torch.float64))
         else:
             # Exact in fp32, then one rounding; 255 as 2^127 then 2.
             piece = torch.ldexp(piece, exponent.clamp(max = 127))
@@ -102,12 +125,39 @@ if _HAS_TRITON:
         return sign * mag
 
     @triton.jit
+    def _f32_to_f16_rne(x):
+        u = x.to(tl.int32, bitcast = True)
+        sign = (u >> 16) & 0x8000
+        a = u & 0x7FFFFFFF
+        c = tl.minimum(a, 0x477FF000)
+        normal = (c + 0xFFF + ((c >> 13) & 1) - 0x38000000) >> 13
+        # Clamped to [1, 31]: lanes >= 2^-14 take `normal` but must not shift by a negative count.
+        shift = tl.minimum(tl.maximum(126 - (a >> 23), 1), 31)
+        m = (a & 0x7FFFFF) | 0x800000
+        q = m >> shift
+        rem = m - (q << shift)
+        half = 1 << (shift - 1)
+        q = q + ((rem > half) | ((rem == half) & ((q & 1) == 1))).to(tl.int32)
+        h = tl.where(a < 0x38800000, q, normal)
+        h = tl.where(a >= 0x477FF000, 0x7C00, h)
+        h = tl.where(a > 0x7F800000, 0x7E00 | ((a >> 13) & 0x3FF), h)
+        return (h | sign).to(tl.uint16).to(tl.float16, bitcast = True)
+
+    @triton.jit
+    def _f32_to_bf16_rne(x):
+        # Matches c10::BFloat16 rounding; NaN -> 0x7FC0 | sign.
+        u = x.to(tl.uint32, bitcast = True)
+        r = (u + 0x7FFF + ((u >> 16) & 1)) >> 16
+        r = tl.where((u & 0x7FFFFFFF) > 0x7F800000, ((u >> 16) & 0x8000) | 0x7FC0, r)
+        return r.to(tl.uint16).to(tl.bfloat16, bitcast = True)
+
+    @triton.jit
     def _mxfp4_dequant_kernel(
         blocks_ptr, scales_ptr, out_ptr, experts_ptr, counts_ptr,
         N, G,
         stride_out_e, stride_out_n, stride_out_k,
         BLOCK_N: tl.constexpr, BLOCK_G: tl.constexpr, USE_EXPERTS: tl.constexpr, USE_COUNTS: tl.constexpr,
-        BF16_BITS: tl.constexpr, LONG_INDEXING: tl.constexpr,
+        BF16_BITS: tl.constexpr, LONG_INDEXING: tl.constexpr, EXACT_ROUND: tl.constexpr,
     ):
         pid_e = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -156,52 +206,115 @@ if _HAS_TRITON:
         else:
             lo = _e2m1_to_f32(packed & 15) * factor[:, :, None] * double[:, :, None]
             hi = _e2m1_to_f32(packed >> 4) * factor[:, :, None] * double[:, :, None]
-        vals = tl.reshape(tl.join(lo, hi), (BLOCK_N, BLOCK_G * 32)).to(out_ptr.dtype.element_ty)
+        vals = tl.reshape(tl.join(lo, hi), (BLOCK_N, BLOCK_G * 32))
+        if EXACT_ROUND and not BF16_BITS:
+            if out_ptr.dtype.element_ty == tl.float16:
+                vals = _f32_to_f16_rne(vals)
+            elif out_ptr.dtype.element_ty == tl.bfloat16:
+                vals = _f32_to_bf16_rne(vals)
+        vals = vals.to(out_ptr.dtype.element_ty)
         offs_k = pid_g * BLOCK_G * 32 + tl.arange(0, BLOCK_G * 32)
         mask = (offs_n[:, None] < N) & (offs_k[None, :] < G * 32)
         out_offs = e * stride_out_e + offs_n[:, None] * stride_out_n + offs_k[None, :] * stride_out_k
         tl.store(out_ptr + out_offs, vals, mask = mask)
 
 
-_KERNEL_FAILED = False
+_KERNEL_FAILED = set()
 _KERNEL_VERIFIED = {}
 
 
+def _kernel_failed():
+    return _exact_round() in _KERNEL_FAILED
+
+
 def _triton_usable(blocks):
-    return _HAS_TRITON and not _KERNEL_FAILED and blocks.is_cuda and blocks.dtype == torch.uint8
+    return _HAS_TRITON and not _kernel_failed() and blocks.is_cuda and blocks.dtype == torch.uint8
 
 
 def _kernel_fail(exception):
-    # A Triton build that cannot compile the kernel (an old ROCm stack) falls back for good.
-    global _KERNEL_FAILED
-    _KERNEL_FAILED = True
+    # Per rounding path: the other variant can still be tried.
+    _KERNEL_FAILED.add(_exact_round())
     import warnings
     warnings.warn(f"Unsloth: fused MXFP4 dequant unavailable ({exception}); using the torch path.")
 
 
+def _tracing():
+    try:
+        if torch.compiler.is_compiling():
+            return True
+        from torch._guards import detect_fake_mode
+        return detect_fake_mode() is not None
+    except Exception:
+        return False
+
+
+def _outside_trace(fn):
+    """``fn`` run for real while a graph is traced: dynamo calls an ``assume_constant_result`` function eagerly and
+    bakes in its result; fake mode is lifted so the self-check's own tensors are real."""
+    def run(*args):
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+        with unset_fake_temporarily():
+            return fn(*args)
+    try:
+        return torch._dynamo.assume_constant_result(run)
+    except Exception:
+        return run
+
+
+# Verdicts reached inside a trace. Never read while tracing (a dict the traced frame read must not change under
+# it), only by the next eager call, which moves them into _KERNEL_VERIFIED.
+_TRACE_VERIFIED = {}
+
+
+def _kernel_verified_in_trace(device, dtype, transpose, exact_round):
+    key = (device, dtype, transpose, exact_round)
+    try:
+        verified = _probe_kernel(device, dtype, transpose)
+    except Exception:
+        verified = False  # the eager call repeats the probe and records the failure
+    _TRACE_VERIFIED[key] = verified
+    return verified
+
+
+_kernel_verified_outside_trace = _outside_trace(_kernel_verified_in_trace)
+
+
+def _probe_kernel(device, dtype, transpose):
+    E, N, G = 2, 131, 9
+    blocks = ((torch.arange(E * N * G * 16, device = device) * 7) % 256).to(torch.uint8).reshape(E, N, G, 16)
+    if dtype == torch.float16:
+        scales = 112 + (torch.arange(E * N * G, device = device) * 5) % 24
+    else:
+        scales = (torch.arange(E * N * G, device = device) * 37) % 255
+    scales = scales.to(torch.uint8).reshape(E, N, G)
+    edges = [0, 127, 254, 255] if dtype != torch.float16 else [0, 127, 135, 255]
+    scales.view(-1)[: len(edges)] = torch.tensor(edges, dtype = torch.uint8)
+    want = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
+    got = _kernel_dequantize(blocks, scales, dtype, transpose, None, None, None)
+    return bool(torch.equal(got.view(torch.uint8), want.view(torch.uint8)))
+
+
 def _kernel_verified(device, dtype, transpose):
-    """Once per (device, dtype, layout): kernel must match the torch reference bit for bit, else torch is used."""
-    key = (str(device), dtype, bool(transpose))
+    """Once per (device, dtype, layout, rounding path): kernel must match the torch reference bit for bit, else torch is used."""
+    key = (str(device), dtype, bool(transpose), _exact_round())
     verified = _KERNEL_VERIFIED.get(key)
     if verified is not None:
         return verified
+    if _tracing():
+        # The probe's torch.equal is data dependent (fullgraph refuses it, e.g. a cold compiled backward): run it
+        # outside the trace, so the traced graph already gets the verdict (the kernel) instead of the reference.
+        return _kernel_verified_outside_trace(*key)
+    if _TRACE_VERIFIED.get(key) is True:
+        _KERNEL_VERIFIED[key] = True
+        return True
     try:
-        E, N, G = 2, 131, 9
-        blocks = ((torch.arange(E * N * G * 16, device = device) * 7) % 256).to(torch.uint8).reshape(E, N, G, 16)
-        if dtype == torch.float16:
-            scales = 112 + (torch.arange(E * N * G, device = device) * 5) % 24
-        else:
-            scales = (torch.arange(E * N * G, device = device) * 37) % 255
-        scales = scales.to(torch.uint8).reshape(E, N, G)
-        edges = [0, 127, 254, 255] if dtype != torch.float16 else [0, 127, 135, 255]
-        scales.view(-1)[: len(edges)] = torch.tensor(edges, dtype = torch.uint8)
-        want = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
-        got = _kernel_dequantize(blocks, scales, dtype, transpose, None, None, None)
-        verified = bool(torch.equal(got.view(torch.uint8), want.view(torch.uint8)))
+        verified = _probe_kernel(device, dtype, transpose)
+    except torch.cuda.OutOfMemoryError:
+        raise  # a full GPU says nothing about the kernel: decide on a later call
     except Exception as exception:
         _kernel_fail(exception)
         verified = False
-    if not verified and not _KERNEL_FAILED:
+    if not verified and not _kernel_failed():
         import warnings
         warnings.warn("Unsloth: fused MXFP4 dequant does not match the reference on this device; using the torch path.")
     _KERNEL_VERIFIED[key] = verified
@@ -210,14 +323,17 @@ def _kernel_verified(device, dtype, transpose):
 
 def mxfp4_kernel_available(device = None, dtype = torch.bfloat16) -> bool:
     """Whether the fused kernel runs, and is exact, for the GPT-OSS transposed layout on ``device``."""
-    if not _HAS_TRITON or _KERNEL_FAILED or not torch.cuda.is_available():
+    if not _HAS_TRITON or _kernel_failed() or not torch.cuda.is_available():
         return False
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
     device = torch.device(device)
     if device.type != "cuda":
         return False
-    return _kernel_verified(device, dtype, True)
+    try:
+        return _kernel_verified(device, dtype, True)
+    except torch.cuda.OutOfMemoryError:
+        return False  # a predicate: no room for the probe now, nothing cached, a later call decides
 
 
 def mxfp4_dequantize(
@@ -241,6 +357,8 @@ def _mxfp4_dequantize(blocks, scales, dtype, transpose, experts, token_counts, o
         return mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose, out = out)
     try:
         return _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, out)
+    except torch.cuda.OutOfMemoryError:
+        raise  # not a kernel failure: keep the kernel, let the caller shrink its chunk
     except Exception as exception:
         _kernel_fail(exception)
         return mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose, out = out)
@@ -277,7 +395,8 @@ def _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, 
     else:
         n_programs_e = E
     # Swept on B200 over gpt-oss-20b shapes: a taller n tile keeps transposed stores coalesced.
-    bf16_bits = dtype == torch.bfloat16
+    exact_round = _exact_round()
+    bf16_bits = dtype == torch.bfloat16 and not exact_round
     if bf16_bits:
         BLOCK_N, BLOCK_G = (128, 4) if transpose else (32, 8)
     else:
@@ -286,12 +405,18 @@ def _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, 
     # int32 offsets only when transposed: untransposed expert-subset dequant ran ~5% slower in int32 (B200).
     long_indexing = not transpose or E * N * K + BLOCK_N * K > 2**31
     _launch(grid, blocks, scales, out, experts, token_counts, N, G, stride_e, stride_n, stride_k,
-            BLOCK_N, BLOCK_G, bf16_bits, long_indexing)
+            BLOCK_N, BLOCK_G, bf16_bits, long_indexing, exact_round)
     return out
 
 
+def _exact_round():
+    # UNSLOTH_MXFP4_EXACT_ROUND=1 / 0 forces the fp32-multiply + integer-rounding path on / off (default: ROCm only).
+    flag = os.environ.get("UNSLOTH_MXFP4_EXACT_ROUND", "")
+    return _IS_HIP if flag == "" else flag == "1"
+
+
 def _launch(grid, blocks, scales, out, experts, token_counts, N, G, stride_e, stride_n, stride_k,
-            BLOCK_N, BLOCK_G, bf16_bits, long_indexing):
+            BLOCK_N, BLOCK_G, bf16_bits, long_indexing, exact_round = False):
     with torch.cuda.device(blocks.device):
         _mxfp4_dequant_kernel[grid](
             blocks, scales, out, experts if experts is not None else blocks,
@@ -300,7 +425,7 @@ def _launch(grid, blocks, scales, out, experts, token_counts, N, G, stride_e, st
             stride_e, stride_n, stride_k,
             BLOCK_N = BLOCK_N, BLOCK_G = BLOCK_G, USE_EXPERTS = experts is not None,
             USE_COUNTS = token_counts is not None,
-            BF16_BITS = bf16_bits, LONG_INDEXING = long_indexing, num_warps = 4,
+            BF16_BITS = bf16_bits, LONG_INDEXING = long_indexing, EXACT_ROUND = exact_round, num_warps = 4,
             enable_fp_fusion = True,
         )
 
