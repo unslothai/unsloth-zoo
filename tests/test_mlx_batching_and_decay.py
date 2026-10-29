@@ -3092,7 +3092,6 @@ def test_gemma4_unified_call_hands_image_token_types_to_the_text_model(monkeypat
     patched = module.Model.__call__
     install()
     assert module.Model.__call__ is patched
-    # The CCE loss forwards token types only where this call does.
     assert _call_forwards_mm_token_type_ids(patched)
 
     def forwarding_upstream(self, input_ids=None, mm_token_type_ids=None, **kwargs):

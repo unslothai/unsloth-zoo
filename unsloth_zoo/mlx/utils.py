@@ -3222,8 +3222,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     return loss_fn
 
 
-# Their text model reads `mm_token_type_ids`; forwarded only where `Model.__call__`
-# forwards it too, so both losses agree (unpatched gemma4_unified drops it).
+# Forwarded only where `Model.__call__` does too, so both losses agree (stock gemma4_unified drops it).
 _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4", "gemma4_unified"})
 
 

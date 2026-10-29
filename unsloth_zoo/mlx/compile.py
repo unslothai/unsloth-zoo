@@ -6116,8 +6116,7 @@ def _install_gemma4_unified_compile_patches():
     if original_call is not None and "mm_token_type_ids" not in _safe_getsource(original_call):
 
         def patched_call(self, input_ids=None, pixel_values=None, mask=None, cache=None, **kwargs):
-            # Upstream's call drops `mm_token_type_ids`, so image tokens missed the
-            # vision overlay that generation (which calls the language model) applies.
+            # Upstream drops `mm_token_type_ids`; generation (calling the LM directly) keeps it.
             features = self.get_input_embeddings(
                 input_ids=input_ids, pixel_values=pixel_values, **kwargs,
             )
@@ -6186,8 +6185,7 @@ def _install_gemma4_compile_patches():
         # Transformers bounds only past keys (kv > q - window): image tokens may look ahead.
         in_window = positions[None] > positions[:, None] - self.window_size
         if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
-            # Generation caches keep upstream's sliding masks (offsets, padding), but its
-            # overlay skips the window and also covers full attention, which stays causal.
+            # Upstream owns offsets/padding; its overlay skips the window and wrongly covers full layers.
             overlaid = original_make_masks(self, h, cache, mm_token_type_ids)
             return [
                 (
