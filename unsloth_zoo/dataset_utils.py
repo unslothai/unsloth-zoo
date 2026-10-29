@@ -2788,8 +2788,10 @@ def sft_prepare_dataset(
     do_prompt_completion = False
     do_messages = False
 
-    # Get correct column names
-    column_names = set(next(iter(dataset)).keys())
+    # Get correct column names. remove_columns takes the ordered list: a list made from the set
+    # follows PYTHONHASHSEED, so each process hashed the tokenizing map to a different cache file.
+    source_column_names = list(next(iter(dataset)).keys())
+    column_names = set(source_column_names)
     used_column_names = ["input_ids"]
     if "attention_mask" in column_names:
         used_column_names.append("attention_mask")
@@ -3075,7 +3077,7 @@ def sft_prepare_dataset(
                 dataset = dataset.map(
                     _batched_rows(_tokenize_pc, _tokenize_pc_rows) if _batch_map else _tokenize_pc,
                     batched=_batch_map,
-                    remove_columns=list(column_names), **map_kwargs,
+                    remove_columns=source_column_names, **map_kwargs,
                 )
             if assistant_only_loss:
                 # Prompt-history assistant turns are no target while completion_mask applies.
@@ -3202,7 +3204,7 @@ def sft_prepare_dataset(
                 dataset = dataset.map(
                     _batched_rows(_tokenize_messages, _tokenize_messages_rows) if _batch_map else _tokenize_messages,
                     batched=_batch_map,
-                    remove_columns=list(column_names), **map_kwargs,
+                    remove_columns=source_column_names, **map_kwargs,
                 )
             if assistant_only_loss:
                 # Truncation can drop every assistant token; such a row has no target.
@@ -3218,7 +3220,7 @@ def sft_prepare_dataset(
             import warnings as _w
             with _w.catch_warnings():
                 _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
-                dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
+                dataset = dataset.map(_tokenize, batched = True, remove_columns = source_column_names, **map_kwargs)
 
         # VLMs need .pad; switch the data collator
         # transformers' collator rebuilds labels from input_ids, dropping assistant masks: keep TRL's for messages.
