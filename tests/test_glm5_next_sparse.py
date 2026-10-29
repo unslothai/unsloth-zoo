@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GLM-5.3-Flash (glm5_next) pooled DSA: exact skip, chunked indexer, flex BlockMask.
-
-CPU: both patched indexer paths select upstream's key sets (padding, holes, cache decode); the
-BlockMask's tables + mask_mod keep exactly those keys; a tiny model's logits and gradients match
-upstream with every path engaged (flex forward on CPU flex, backward through flex semantics
-materialised from the BlockMask, since CPU flex has no backward). GPU: flex vs upstream."""
+"""GLM-5.3-Flash pooled DSA: patched indexer + flex BlockMask vs upstream (CPU; GPU flex)."""
 
 import contextlib
 import importlib
@@ -155,7 +150,6 @@ def _inputs(config, batch, seq, seed = 1):
     return hidden, q_resid
 
 
-# ------------------------------------------------------------------ install
 def test_patch_installs_and_is_idempotent():
     g, m = _patched(), _m()
     attn, idx = m.Glm5NextTextAttention.forward, m.Glm5NextTextIndexer.forward
@@ -165,7 +159,6 @@ def test_patch_installs_and_is_idempotent():
     assert g._is_transformers_function(g._REFERENCE["indexer"])
 
 
-# ------------------------------------------------------------------ indexer selection
 @pytest.mark.parametrize("seq", [40, 79, 80, 95, 300])
 @pytest.mark.parametrize("layout", ["none", "left", "right", "hole"])
 @pytest.mark.parametrize("tail", [True, False])
@@ -176,14 +169,13 @@ def test_indexer_selects_upstream_sets(monkeypatch, seq, layout, tail):
     hidden, q_resid = _inputs(config, 2, seq)
     mask = _mask(2, seq, layout)
     ref = g._REFERENCE["indexer"](idx, hidden, q_resid, mask, None)
-    monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_Q_CHUNK", "16")  # several query chunks
+    monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_Q_CHUNK", "16")
     ours = idx(hidden_states = hidden, q_resid = q_resid, attention_mask = mask, past_key_values = None)
     assert ours.dtype == torch.int32 and ours.shape == ref.shape
     assert torch.equal(_selected(ours, seq), _selected(ref, seq))
     within = seq // KPOOL <= TOPK // KPOOL
     assert _stat("skip_full") == (1 if within else 0)
     assert _stat("indexer_chunked") == (0 if within else 1)
-    # Fixed layout: whole pools in the first index_topk slots.
     pools = ours[..., :TOPK].view(2, seq, -1, KPOOL).long()
     first = pools[..., :1]
     whole = (pools == first + torch.arange(KPOOL)) | ((pools < 0) & (first < 0))
@@ -234,7 +226,7 @@ def test_cached_prefill_then_decode_across_the_budget():
     hidden, q_resid = _inputs(config, 2, total)
     mask = _mask(2, total, "left")
     caches = [DynamicCache(config = config), DynamicCache(config = config)]
-    for cache in caches:  # attention cache layers must exist for get_seq_length / keys
+    for cache in caches:
         cache.update(torch.zeros(2, 1, 0, 32), torch.zeros(2, 1, 0, 0), 0)
     steps = [(0, 60)] + [(i, i + 1) for i in range(60, total)]
     for start, end in steps:
@@ -247,7 +239,6 @@ def test_cached_prefill_then_decode_across_the_budget():
     assert _stat("skip_full") > 0 and _stat("indexer_scored") > 0
 
 
-# ------------------------------------------------------------------ block mask
 def _dense_from_block_mask(block_mask, batch, q_len, kv_len):
     """What flex keeps: full tiles whole, partial tiles through mask_mod, others nothing."""
     tile = sb._TILE
@@ -283,10 +274,8 @@ def test_block_mask_keeps_exactly_the_selection(seq, layout, tail):
     topk = idx(hidden_states = hidden, q_resid = q_resid, attention_mask = mask, past_key_values = None)
     bm = g.glm5_next_block_mask(topk, seq, KPOOL, TOPK, KPOOL - 1 if tail else 0)
     assert torch.equal(_dense_from_block_mask(bm, 2, seq, seq), _selected(topk, seq))
-    # Upstream's dense mask is the same set.
     dense = _selected(g._REFERENCE["indexer"](idx, hidden, q_resid, mask, None), seq)
     assert torch.equal(_dense_from_block_mask(bm, 2, seq, seq), dense)
-    # Sparse in fact: far fewer tiles than causal.
     assert int(bm.full_kv_num_blocks.sum() + bm.kv_num_blocks.sum()) > 0
 
 
@@ -299,7 +288,6 @@ def _flex_semantics(query, key, value, block_mask, scale, score_mod = None):
     return probs @ value
 
 
-# ------------------------------------------------------------------ whole model
 def _model(seed = 0, **kw):
     m = _m()
     torch.manual_seed(seed)
@@ -366,7 +354,6 @@ def test_flex_kill_switch_and_cpu_gate(monkeypatch):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0")
     gates.reset_sparse_attn_stats()
-    # The global kill switch wins over the opt-in.
     assert not gates.sparse_flex_enabled() and not gates.sparse_flex_opted_in("glm5_next")
     with torch.no_grad():
         model(input_ids = ids, attention_mask = mask)
@@ -393,7 +380,6 @@ def test_flex_is_off_by_default(monkeypatch, opt_in):
         model(input_ids = ids, attention_mask = mask)
     assert not gates.sparse_flex_opted_in("glm5_next")
     assert calls == [] and _stat("flex") == 0
-    # The chunked indexer (and the skip below the budget) stay on by default.
     assert _stat("indexer_chunked") + _stat("indexer_scored") == 2
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
     gates.reset_sparse_attn_stats()
@@ -403,9 +389,7 @@ def test_flex_is_off_by_default(monkeypatch, opt_in):
 
 
 def test_flex_failure_does_not_keep_its_tensors_alive(monkeypatch):
-    """A failing flex call (an Inductor compile error, as on torch 2.10 / A100) raised from frames in a
-    reference cycle must not keep that call's tensors allocated until a full gc pass: on GPU that held
-    +25% peak memory over every later step of the dense fallback."""
+    """A flex failure raised from a frame cycle must not keep its tensors alive until a full gc."""
     import gc
     import weakref
     _patched()

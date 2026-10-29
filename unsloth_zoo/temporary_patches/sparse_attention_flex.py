@@ -129,12 +129,8 @@ def _flex_or_none(kind, label, fn, query, key, value, *args):
 
 
 def _release_failure(error):
-    """A failed flex call (typically an Inductor compile error raised deep inside the first call) leaves
-    its traceback frames in reference cycles that hold the call's CUDA tensors: the q / k / v aliases,
-    the probe's autograd graph, the BlockMask tables. Only a full gc pass frees them, which a training
-    loop may not reach for many steps, so every later step ran with that memory still allocated
-    (+25% peak on a GLM-5.3-Flash layer on torch 2.10). Clear the frames of the exception chain and
-    collect once; failures latch per shape class, so this runs once per class."""
+    """A failed flex call's traceback frames hold its CUDA tensors in cycles only a full gc frees
+    (+25% peak on later steps otherwise); clear them and collect once (failures latch per shape class)."""
     seen, stack = set(), [error]
     while stack:
         e = stack.pop()

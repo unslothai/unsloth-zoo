@@ -15,15 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Shared switches and engagement counters for the sparse-attention fast paths
-(DeepSeek-V3.2 / GLM-MoE-DSA / MiniMax-M3 / DeepSeek-V4 / GLM-5.3-Flash).
-
-Switches (environment, read per call):
-- UNSLOTH_SPARSE_ATTN_SKIP_FULL=0: keep the indexer when every key is selected anyway.
-- UNSLOTH_SPARSE_INDEXER_CHUNKED=0: keep upstream's unchunked indexer scoring.
-- UNSLOTH_SPARSE_ATTN_FLEX=0: no flex attention for any family (the dense path above the budget).
-- UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT=1: opt in to GLM-5.3-Flash's flex BlockMask path. It is off by default:
-  on A100 (torch 2.14) its layer step is ~5x slower than dense SDPA for 18-48% less peak memory.
-  UNSLOTH_SPARSE_ATTN_FLEX=0 still turns it off."""
+(DeepSeek-V3.2 / GLM-MoE-DSA / MiniMax-M3 / DeepSeek-V4 / GLM-5.3-Flash)."""
 
 import os
 

@@ -14,26 +14,12 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GLM-5.3-Flash (glm5_next) pooled DSA: exact skip, chunked indexer, flex BlockMask.
+"""GLM-5.3-Flash (glm5_next) pooled DSA: exact skip, chunked indexer, opt-in flex BlockMask.
 
-Upstream scores every complete k-pool (index_kpool tokens, aligned at the row's first valid key)
-with an fp32 [B, S, H_idx, S / kpool] buffer, keeps the top index_topk // kpool pools whose last
-token is visible, appends the query's incomplete tail pool, then expands that into a dense
-[B, S, T] int32 count + bool mask for eager / SDPA (no causal mask besides it).
-
-- Within the budget (T < index_topk + kpool) every complete visible pool is selected: the
-  selection is built without scoring (UNSLOTH_SPARSE_ATTN_SKIP_FULL=0 restores upstream).
-- Above it the pools are scored in query chunks (UNSLOTH_SPARSE_INDEXER_CHUNKED=0 restores upstream).
-- Opt-in only (UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT=1): above the budget on CUDA sm80+ / ROCm, attention
-  runs on flex attention over a BlockMask whose mask_mod reads a [B, S, T / kpool] pool table plus the
-  tail. Off by default: on A100 its layer step was 4.7-5.3x slower than upstream's dense SDPA (4K-32K)
-  for 18-48% less peak memory. Without the opt-in (or with UNSLOTH_SPARSE_ATTN_FLEX=0) attention is
-  upstream's dense mask + SDPA / eager over the patched indexer's selection.
-
-Both patched indexer paths return the same key set per query as upstream in a fixed layout:
-index_topk pool slots (whole pools, -1 padded) then index_kpool - 1 tail slots. The flex path
-reads that layout, so it engages only when the patched indexer produced the indices.
-"""
+Both patched indexer paths return upstream's key set in a fixed layout (index_topk pool slots, -1
+padded, then index_kpool - 1 tail slots); the flex path reads that layout, so it engages only when
+the patched indexer produced the indices. Flex is opt-in (UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT=1):
+on A100 it was ~5x slower than dense SDPA for 18-48% less peak memory."""
 
 __all__ = ["patch_glm5_next_sparse"]
 
@@ -104,13 +90,9 @@ def _predicted_key_len(indexer, q_len, past_key_values):
     return cached.shape[1] + q_len
 
 
-# --------------------------------------------------------------------------------------
-# Indexer
-# --------------------------------------------------------------------------------------
 @torch.no_grad()
 def glm5_next_select(indexer, hidden_states, q_resid, attention_mask, past_key_values, allow_skip = True):
-    """Glm5NextTextIndexer.forward with query-chunked scoring, or no scoring when every complete
-    visible pool is selected anyway. [B, S, index_topk + tail] int32, the pool slots then the tail."""
+    """Chunked Glm5NextTextIndexer.forward (no scoring within the budget); [B, S, index_topk + tail] int32."""
     from unsloth_zoo.flex_attention import sparse_blocks as sb
 
     batch_size, seq_len = hidden_states.shape[:2]
@@ -203,9 +185,6 @@ def unsloth_glm5_next_indexer_forward(self, hidden_states, q_resid, attention_ma
     return select(self, hidden_states, q_resid, attention_mask, past_key_values, skip)
 
 
-# --------------------------------------------------------------------------------------
-# Flex attention
-# --------------------------------------------------------------------------------------
 def _pool_starts(topk_indices, kpool, index_topk):
     """(first token of each selected pool or -1 [B, S, index_topk // kpool], valid, row phase [B])."""
     starts = topk_indices[..., 0:index_topk:kpool].long()
@@ -259,7 +238,6 @@ def glm5_next_block_mask(topk_indices, kv_len, kpool, index_topk, tail):
         tail_base = (tail_ids - offsets).amax(dim = -1).contiguous()
         tail_ids = tail_ids.contiguous()
 
-    # Tile tables from the indices themselves, in query chunks (bounded memory).
     any_tiles = torch.empty(batch, n_q, n_kv, dtype = torch.bool, device = device)
     all_tiles = torch.empty_like(any_tiles)
     rows = max(tile, (sb._SCORE_BUDGET // max(1, batch * (kv_pad + 1))) // tile * tile)
@@ -391,9 +369,6 @@ def unsloth_glm5_next_attention_forward(self, hidden_states, attention_mask, pas
     return attn_output, attn_weights, shared
 
 
-# --------------------------------------------------------------------------------------
-# Install
-# --------------------------------------------------------------------------------------
 def _source(function):
     try:
         return inspect.getsource(inspect.unwrap(function))
