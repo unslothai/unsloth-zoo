@@ -7181,6 +7181,8 @@ class _AudioVersions(NamedTuple):
 # `_ensure_audio_conv_sanitize` cannot repair it: it keys on markers in the
 # sanitize source, and Nemotron's `Model.sanitize` delegates to a module-level
 # function carrying neither.
+#
+# LFM3 Audio / Omni: measured on 0.7.11 against LiquidAI/LFM3-Audio-2B and LFM3-Omni-2B.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4"),
     "gemma4": _AudioVersions("0.6.2"),
@@ -7189,6 +7191,8 @@ _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "qwen3_omni_moe": _AudioVersions("0.6.7"),
     "phi4mm": _AudioVersions("0.4.4"),
     "minicpmo": _AudioVersions("0.4.4"),
+    "lfm3_audio": _AudioVersions("0.7.11"),
+    "lfm3_omni": _AudioVersions("0.7.11"),
 }
 
 # Families probed only on a newer transformers than this package pins, at the
@@ -9134,9 +9138,10 @@ def _processor_vlm_inputs(
         # caller's processor stays as mlx-vlm made it.
         processor = _audio_repaired_processor(processor)
     if truncation:
-        base_kwargs["truncation"] = True
-        if max_seq_length is not None:
-            base_kwargs["max_length"] = max_seq_length
+        base_kwargs.update(_drop_unsupported_processor_kwargs(processor, {
+            "truncation": True,
+            **({} if max_seq_length is None else {"max_length": max_seq_length}),
+        }))
         if audio is not None:
             # `max_length` is a token budget, but transformers' `_merge_kwargs`
             # fans a flat keyword out to *every* modality that declares it, and

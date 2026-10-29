@@ -89,6 +89,15 @@ def test_vlm_detection_requires_a_real_modality(monkeypatch, tmp_path):
     (omni / "config.py").write_text("class ThinkerConfig:\n    vision_config: object\n")
     assert not loader._config_source_has_modality(text)
     assert loader._config_source_has_modality(omni)
+    for name, body, modal in (
+        ("speech", "self.audio_encoder_config = AudioEncoderConfig(**self.encoder)", True),
+        ("cleared", "self.vision_config = None", False),
+    ):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "config.py").write_text(
+            f"class ModelConfig:\n    encoder: dict\n\n    def __post_init__(self):\n        {body}\n"
+        )
+        assert loader._config_source_has_modality(tmp_path / name) is modal
     models = tmp_path / "models"
     models.mkdir()
     static_vlm = models / "static_vlm"
