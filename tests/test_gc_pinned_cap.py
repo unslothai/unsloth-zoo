@@ -23,6 +23,7 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "GC_PINNED_BYTES", 0, raising = False)
     monkeypatch.setattr(gc_module, "GC_PINNED_CAP", None, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
     monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: None, raising = False)
     monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: None, raising = False)
@@ -314,3 +315,202 @@ def test_cap_flush_counts_only_blocks_the_allocator_released(monkeypatch, gc_mod
     # Once the allocator really frees it, the same request fits.
     held["bytes"] = 0
     assert gc_module._reserve_pinned(7000)
+
+
+# torch 2.13+ host allocator settings: above pinned_max_round_threshold_mb (or
+# pinned_max_cached_size_mb) a pinned block is the exact request, and above
+# pinned_max_cached_size_mb a freed block goes back to the OS instead of the cache.
+MIB = 1 << 20
+
+
+@pytest.fixture
+def host_alloc_conf(monkeypatch, gc_module):
+    def set_conf(settings, knobs = True):
+        monkeypatch.setattr(torch._C, "_accelerator_getAllocatorSettings", lambda: settings, raising = False)
+        monkeypatch.setattr(gc_module, "_HOST_ALLOC_KNOBS", knobs, raising = False)
+        monkeypatch.setattr(gc_module, "_HOST_ALLOC_POLICY", (None, None, None), raising = False)
+        monkeypatch.setattr(gc_module, "_WARNED_SHORT_BLOCK", True, raising = False)
+    return set_conf
+
+
+def test_round_threshold_charges_the_exact_request(host_alloc_conf, gc_module):
+    host_alloc_conf("expandable_segments:True,pinned_max_round_threshold_mb:1")
+    assert gc_module._pinned_block_bytes(3 * MIB + 5) == 3 * MIB + 5
+    assert gc_module._pinned_block_bytes(MIB - 7) == MIB      # at or below: still a power of two
+    assert gc_module._pinned_block_bytes(3000) == 4096
+
+
+def test_round_threshold_lets_more_buffers_pin_under_the_cap(monkeypatch, host_alloc_conf, gc_module, pin_requests):
+    host_alloc_conf("pinned_max_round_threshold_mb:1")
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(7 * MIB / (1 << 30)))
+    gc_module._new_host_buffer(3 * MIB // 2, torch.float16)
+    gc_module._new_host_buffer(3 * MIB // 2, torch.float16)
+    assert pin_requests == [True, True]
+    assert gc_module.GC_PINNED_BYTES == 6 * MIB
+
+
+def test_block_above_max_cached_size_is_not_kept_charged(host_alloc_conf, gc_module):
+    host_alloc_conf("pinned_max_cached_size_mb:2")
+    assert gc_module._reserve_pinned(3 * MIB)
+    assert gc_module.GC_PINNED_BYTES == 3 * MIB
+    gc_module._release_pinned(3 * MIB)
+    assert gc_module.GC_PINNED_BYTES == 0 and not any(gc_module._PINNED_CACHED.values())
+    assert gc_module._reserve_pinned(3000)
+    gc_module._release_pinned(3000)
+    assert gc_module.GC_PINNED_BYTES == 4096 and gc_module._PINNED_CACHED == {4096: 1}
+
+
+def test_unset_or_unsupported_settings_keep_power_of_two(host_alloc_conf, gc_module):
+    host_alloc_conf("")
+    assert gc_module._pinned_block_bytes(3 * MIB + 5) == 4 * MIB
+    # torch 2.12 accepts the key but ignores it.
+    host_alloc_conf("pinned_max_round_threshold_mb:1", knobs = False)
+    assert gc_module._pinned_block_bytes(3 * MIB + 5) == 4 * MIB
+
+
+def test_settings_change_is_picked_up(host_alloc_conf, gc_module):
+    host_alloc_conf("pinned_max_round_threshold_mb:1")
+    assert gc_module._pinned_block_bytes(3 * MIB) == 3 * MIB
+    host_alloc_conf("pinned_max_round_threshold_mb:8")
+    assert gc_module._pinned_block_bytes(3 * MIB) == 4 * MIB
+
+
+def test_release_uses_the_block_charged_at_allocation(monkeypatch, host_alloc_conf, gc_module):
+    host_alloc_conf("pinned_max_round_threshold_mb:1")
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(4 * MIB / (1 << 30)))
+    flushes = []
+    monkeypatch.setattr(gc_module, "_empty_host_cache", lambda: flushes.append(1) or False)
+    assert gc_module._reserve_pinned(3 * MIB)       # exact 3 MiB block above the threshold
+    assert gc_module._reserve_pinned(MIB)
+    assert gc_module.GC_PINNED_BYTES == 4 * MIB
+    host_alloc_conf("pinned_max_round_threshold_mb:8")
+    gc_module._release_pinned(3 * MIB)
+    gc_module._release_pinned(MIB)
+    assert gc_module._PINNED_CACHED == {3 * MIB: 1, MIB: 1}
+    assert gc_module.GC_PINNED_BYTES == 4 * MIB and not gc_module._PINNED_LIVE
+    # No cached 4 MiB block: the request must not take the cached-block shortcut past the cap.
+    assert not gc_module._reserve_pinned(4 * MIB)
+    assert flushes and gc_module.GC_PINNED_BYTES == 4 * MIB
+
+
+def test_concurrent_releases_keep_the_cap_bookkeeping_consistent(gc_module, monkeypatch):
+    # Split-model backward releases on autograd worker threads; the read-modify-write over the cap
+    # globals must not lose updates (a lost update leaks charged bytes and offload goes pageable early).
+    import sys, threading
+    MIB = 1 << 20
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        leaked = errors = 0
+        for _ in range(20):
+            gc_module.GC_PINNED_BYTES, gc_module._PINNED_CACHED, gc_module._PINNED_LIVE = 0, {}, {}
+            for _ in range(400): assert gc_module._reserve_pinned(MIB)
+            bad = []
+            def release():
+                for _ in range(200):
+                    try: gc_module._release_pinned(MIB)
+                    except Exception as e: bad.append(e)
+            threads = [threading.Thread(target = release) for _ in range(2)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+            cached = sum(k * v for k, v in gc_module._PINNED_CACHED.items())
+            leaked += (gc_module.GC_PINNED_BYTES - cached) // MIB
+            errors += len(bad)
+    finally:
+        sys.setswitchinterval(old)
+    assert errors == 0
+    assert leaked == 0
+
+
+# torch 2.13+ counted path, against test_gc_pinned_counted's model of torch's CachingHostAllocator.
+from test_gc_pinned_counted import allocator, pin, unpin  # noqa: E402,F401
+
+
+@pytest.fixture
+def counted(monkeypatch, gc_module, allocator):
+    monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_RELEASED", 0, raising = False)
+    monkeypatch.setattr(gc_module, "_WARNED_ABOUT_PINNED_CAP", True, raising = False)
+    return allocator
+
+
+def _auto_cap(monkeypatch, cap_bytes):
+    """Free host RAM worth `cap_bytes` per rank over two local ranks (reserve: 15% of 100 GiB)."""
+    gib = 1 << 30
+    _fake_host(monkeypatch, total_gib = 100, available_gib = 15 + 2 * cap_bytes / gib)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+
+
+def test_freed_baseline_pin_cannot_hide_our_cached_blocks(gc_module, counted):
+    # A user-set cap bounds every pinned byte the allocator holds: with a 6 MiB foreign pin, one of our
+    # 4 MiB blocks released (cached) and the foreign block back to the OS, nothing pins past 10 MiB.
+    fake = counted("pinned_max_cached_size_mb:4", cap_bytes = 10 * MIB)
+    foreign = fake.allocate(6 * MIB)
+    live = [(n, pin(gc_module, fake, n)) for n in (3 * MIB, 3 * MIB)]
+    live = [(n, block) for n, block in live if block]
+    assert live
+    unpin(gc_module, fake, *live.pop())
+    fake.release(foreign)                        # above the cached max: returned to the OS
+    pin(gc_module, fake, 5 * MIB)
+    assert fake.peak <= 10 * MIB
+
+
+@pytest.mark.parametrize("user_cap", [True, False])
+def test_reused_larger_cached_block_cannot_lift_the_cap(monkeypatch, gc_module, counted, user_cap):
+    # Codex 4406863867, torch 2.14: a 3 MiB request reuses a cached 3.5 MiB block, so our own count runs
+    # 0.5 MiB short. Once the 6 MiB foreign pin is gone, 3 + 0.5 MiB more must still respect the cap.
+    if not user_cap: _auto_cap(monkeypatch, 10 * MIB)
+    fake = counted("pinned_max_round_threshold_mb:1", cap_bytes = 10 * MIB if user_cap else None)
+    foreign = fake.allocate(6 * MIB)
+    live = [(n, pin(gc_module, fake, n)) for n in (int(3.5 * MIB), int(3.5 * MIB))]
+    live = [(n, block) for n, block in live if block]
+    unpin(gc_module, fake, *live.pop())
+    live.append((3 * MIB, pin(gc_module, fake, 3 * MIB)))
+    fake.release(foreign)
+    fake.empty_cache()
+    live += [(n, pin(gc_module, fake, n)) for n in (3 * MIB, MIB // 2)]
+    assert fake.held() <= gc_module.GC_PINNED_CAP   # all ours now: 10.5 MiB before the fix
+    assert fake.peak <= gc_module.GC_PINNED_CAP
+    if user_cap: assert gc_module.GC_PINNED_CAP == 10 * MIB
+
+
+def test_auto_cap_is_not_reduced_by_foreign_pins_present_when_computed(monkeypatch, gc_module, counted):
+    # Free RAM already excludes the 6 MiB pinned, so the auto cap adds it back.
+    _auto_cap(monkeypatch, 10 * MIB)
+    fake = counted("pinned_max_round_threshold_mb:1")
+    fake.allocate(6 * MIB)
+    ours = [pin(gc_module, fake, 3 * MIB) for _ in range(4)]
+    assert all(ours[:3]) and ours[3] is None
+    assert gc_module.GC_PINNED_CAP == 16 * MIB and fake.peak == 15 * MIB
+
+
+def test_concurrent_reservations_cannot_spend_the_same_headroom(monkeypatch, gc_module, counted):
+    # Cap 11 MiB, 3 MiB of ours live, 5 MiB pinned by another user since the baseline. A reserves 2 MiB and
+    # stalls before torch pins it; B's 3 MiB must not pass the cap check on the stale count (13 MiB).
+    import threading
+    fake = counted("pinned_max_round_threshold_mb:1", cap_bytes = 11 * MIB)
+    live = gc_module._new_host_buffer(3 * MIB, torch.uint8)
+    fake.allocate(5 * MIB)
+    assert fake.held() == 8 * MIB
+    real_empty = torch.empty                    # the model's pinned allocation
+    inside, go = threading.Event(), threading.Event()
+
+    def stalled_empty(*args, pin_memory = False, **kwargs):
+        if pin_memory and threading.current_thread().name == "A":
+            inside.set()
+            go.wait(10)
+        return real_empty(*args, pin_memory = pin_memory, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", stalled_empty)
+    out = {}
+    a = threading.Thread(target = lambda: out.update(a = gc_module._new_host_buffer(2 * MIB, torch.uint8)), name = "A")
+    b = threading.Thread(target = lambda: out.update(b = gc_module._new_host_buffer(3 * MIB, torch.uint8)), name = "B")
+    a.start()
+    assert inside.wait(10)
+    b.start()
+    b.join(1)                                    # unfixed: B passes the check and pins while A stalls
+    go.set()
+    a.join(10)
+    b.join(10)
+    assert "a" in out and "b" in out and live is not None
+    assert fake.peak <= 11 * MIB

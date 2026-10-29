@@ -26,6 +26,7 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "GC_PINNED_CAP", None, raising = False)
     monkeypatch.setattr(gc_module, "GC_PINNED_BYTES", 0, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)
     return gc_module
 

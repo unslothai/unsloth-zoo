@@ -63,6 +63,21 @@ import inspect
 import torch
 inductor_config_source = inspect.getsource(torch._inductor.config)
 
+
+def _disable_torch_2_9_0_cpp_symbolic_shape_guards():
+    # Only torch 2.9.0 enables C++ symbolic shape guards; they drop a duck-sizing equality, so
+    # Gemma3's prefill-compiled `prepare` is reused for decode and Inductor asserts in generate().
+    if not torch.__version__.startswith("2.9.0"): return False
+    try:
+        import torch._dynamo.config as dynamo_config
+        if not getattr(dynamo_config, "enable_cpp_symbolic_shape_guards", False): return False
+        dynamo_config.enable_cpp_symbolic_shape_guards = False
+        return True
+    except Exception:
+        return False
+pass
+_disable_torch_2_9_0_cpp_symbolic_shape_guards()
+
 def _persistent_tma_matmul_ok():
     # torch 2.12+ guards every GEMM size when Inductor considers its TMA templates
     # (pytorch/pytorch#172925), so a compiled torch._scaled_mm recompiles for each new token count.

@@ -839,4 +839,3 @@ def get_recommended_attn_implementation():
     if is_hip():
         return "sdpa"
     return None
-pass

@@ -1530,6 +1530,9 @@ def _process_param_tokens(param_tokens):
     return new_tokens, replacement
 
 def _rewrite_kwargs_param(source: str, func_name: str):
+    # Superset of the `def <name>` token pair below: a miss (TRL trainer class names) skips tokenize.
+    if re.search(r"def(?:\s|\\|#[^\n]*\n)*" + re.escape(func_name), source) is None:
+        return source, None
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
     except Exception:
@@ -1571,7 +1574,9 @@ def _rewrite_kwargs_param(source: str, func_name: str):
                     param_tokens.append(t)
                     i += 1
 
-                new_param_tokens, renamed_to = _process_param_tokens(param_tokens)
+                new_param_tokens, replacement = _process_param_tokens(param_tokens)
+                if replacement is not None:
+                    renamed_to = replacement
                 out_tokens.extend(new_param_tokens)
                 if i < len(tokens):
                     out_tokens.append(tokens[i])
@@ -1580,6 +1585,9 @@ def _rewrite_kwargs_param(source: str, func_name: str):
         out_tokens.append(tok)
         i += 1
 
+    # untokenize is lossy on some Pythons (whitespace, f-string braces before 3.12.10 / 3.13.2)
+    if renamed_to is None:
+        return source, None
     try:
         new_source = tokenize.untokenize(out_tokens)
     except Exception:
@@ -4368,8 +4376,6 @@ def test_apply_fused_lm_head():
         for f in forwards
     ]
     for name, forward in forwards:
-        # print("=" * 30)
-        # print(name)
         forward, _ = apply_fused_lm_head(forward, name)
         if "NOT_RETURN_LOGITS" not in forward:
             print(f"Failed patching fast CE forward for {name}")
@@ -4377,10 +4383,6 @@ def test_apply_fused_lm_head():
             print(
                 f"Failed patching fast CE forward for {name} since `loss = outputs.loss` exists"
             )
-        # return apply_fused_lm_head(forward, name)
-        # print(apply_fused_lm_head(forward, name))
-        # print("=" * 30)
-    pass
 
 
 pass
@@ -6194,7 +6196,6 @@ def _patch_torch_dtype_modules(
             _install_patched_forward(
                 model_location, module, forward, combined_module
             )
-            pass
         pass
     pass
 
@@ -7718,12 +7719,10 @@ def unsloth_compile_transformers(
                         pass
                 pass
             pass
-        pass
     pass
     return
 
 
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

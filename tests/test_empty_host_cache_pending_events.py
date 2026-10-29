@@ -20,6 +20,7 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "GC_PINNED_BYTES", 0, raising = False)
     monkeypatch.setattr(gc_module, "GC_PINNED_CAP", gc_module._PIN_PER_BLOCK, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)

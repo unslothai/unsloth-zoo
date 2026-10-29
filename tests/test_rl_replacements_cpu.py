@@ -1645,3 +1645,11 @@ def test_warn_unsupported_grpo_options_silent_on_trl_entropy_defaults(caplog):
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
         rr._warn_unsupported_grpo_options(trainer)
     assert caplog.records == []
+
+
+def test_vespo_without_gamma_weights_names_trl_1_0(disable_dynamo):
+    # VESPO (get_gamma_weights) first shipped in TRL 1.0.0 (trl#5199), not 0.26.0.
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("vespo")
+    kwargs.pop("get_gamma_weights")
+    with pytest.raises(Exception, match = r"TRL 1\.0\.0\+"):
+        rr.grpo_compute_loss(ref, new, old, None, input_ids, mask, 0.04, advantages, **kwargs)

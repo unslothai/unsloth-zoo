@@ -116,8 +116,6 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
                 x = left*"\n" + stripped + right*"\n"
                 x = tokenizer(x, add_special_tokens = False).input_ids
                 all_input_ids.append(x)
-            pass
-        pass
     else:
         x = tokenizer(component, add_special_tokens = False).input_ids
         all_input_ids.append(x)
@@ -1946,6 +1944,22 @@ def train_on_responses_only(
         return views
     pass
 
+    # Scan once per split (`_collatable` asks twice); holding the dataset pins its id.
+    _split_views_memo = {}
+    _split_views_uncached = _split_views
+
+    def _split_views(dataset):
+        hit = _split_views_memo.get(id(dataset))
+        if hit is None or hit[0] is not dataset:
+            try:
+                hit = (dataset, _split_views_uncached(dataset), None)
+            except Exception as exc:
+                hit = (dataset, None, exc)
+            _split_views_memo[id(dataset)] = hit
+        if hit[2] is not None: raise hit[2]
+        return hit[1]
+    pass
+
     def _dataset_is_pretokenized(dataset):
         """True when rows carry `input_ids` and nothing but plain text beside them,
         i.e. text tokenized up front where dataset-level masking is correct.
@@ -2663,10 +2677,50 @@ def trl_collator_ignores_labels(collator = None):
     return collator is None or isinstance(collator, _TRLCollator)
 pass
 
+def _chat_template_batches_like_rows(processing_class):
+    # Processors and other backends (mistral-common) may not batch like one call per row.
+    try:
+        from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+    except Exception:
+        return False
+    return isinstance(processing_class, (PreTrainedTokenizer, PreTrainedTokenizerFast))
+pass
+
+
+def _is_conversation(messages):
+    # apply_chat_template reads a list whose first item is a list as a batch.
+    return isinstance(messages, list) and len(messages) != 0 and all(isinstance(m, dict) for m in messages)
+pass
+
+
 def _batched_columns(dataset):
     # Batch columns hold the same Python values as one-row reads only with no output format;
     # an IterableDataset runs lazily in training, so it stays row by row.
     return isinstance(dataset, Dataset) and getattr(dataset, "format", {}).get("type", None) is None
+pass
+
+
+def _check_batch_lengths(batch_rows, *columns):
+    for column in columns:
+        if len(column) != len(batch_rows):
+            raise ValueError("Unsloth: batched chat template returned a different number of rows")
+pass
+
+
+def _batched_rows(tokenize_row, tokenize_rows):
+    # Any error in the batched pass reruns the batch row by row, so the raised error is main's.
+    def tokenize_batch(batch):
+        columns = list(batch.keys())
+        n = len(batch[columns[0]]) if columns else 0
+        rows = [{column: batch[column][i] for column in columns} for i in range(n)]
+        try:
+            results = tokenize_rows(rows)
+        except Exception:
+            results = [tokenize_row(row) for row in rows]
+        if not results:
+            return {}
+        return {key: [result[key] for result in results] for key in results[0]}
+    return tokenize_batch
 pass
 
 
@@ -2893,11 +2947,41 @@ def sft_prepare_dataset(
                 )
             if assistant_only_loss:
                 used_column_names.append("assistant_masks")
+            from unsloth_zoo.dataset_utils import (
+                _chat_template_batches_like_rows, _is_conversation, _batched_rows, _check_batch_lengths,
+            )
+            _batch_map = _batched_columns(dataset)
+            _batch_chat_template = not is_vlm and _chat_template_batches_like_rows(processing_class)
+            _shared_template_kwargs = {}
+            if training_chat_template is not None:
+                _shared_template_kwargs["chat_template"] = training_chat_template
 
         if do_prompt_completion:
             _eos_token = getattr(tokenizer, 'eos_token', None)
 
+            def _pc_completion(example):
+                _completion = example["completion"]
+                if _eos_token and not _completion.endswith(_eos_token):
+                    _completion = _completion + _eos_token
+                return _completion
+
+            def _pc_result(prompt_ids, pc_ids, pc_masks, labels):
+                n_prompt = min(len(prompt_ids), len(pc_ids))
+                completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
+                result = {"input_ids": pc_ids, "completion_mask": completion_mask}
+                if assistant_only_loss:
+                    if marker_masks:
+                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                    else:
+                        result["assistant_masks"] = list(pc_masks)
+                if do_truncation and max_seq_length > 0:
+                    result = {k: v[:max_seq_length] for k, v in result.items()}
+                if _needs_token_type_ids:
+                    result["token_type_ids"] = [0] * len(result["input_ids"])
+                return result
+
             def _tokenize_pc(example):
+                pc_masks = None
                 if _is_conv:
                     template_kwargs = dict(example.get("chat_template_kwargs") or {})
                     if training_chat_template is not None:
@@ -2920,10 +3004,10 @@ def sft_prepare_dataset(
                     if isinstance(pc_processed.get("input_ids", [None])[0], list):
                         pc_processed = {k: v[0] for k, v in pc_processed.items()}
                     pc_ids = pc_processed["input_ids"]
+                    if assistant_only_loss and not marker_masks:
+                        pc_masks = pc_processed["assistant_masks"]
                 else:
-                    _completion = example["completion"]
-                    if _eos_token and not _completion.endswith(_eos_token):
-                        _completion = _completion + _eos_token
+                    _completion = _pc_completion(example)
                     prompt_ids = tokenizer(
                         example["prompt"], add_special_tokens=add_special_tokens,
                     )["input_ids"]
@@ -2931,20 +3015,57 @@ def sft_prepare_dataset(
                         example["prompt"] + _completion,
                         add_special_tokens=add_special_tokens,
                     )["input_ids"]
-                n_prompt = min(len(prompt_ids), len(pc_ids))
-                completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
-                result = {"input_ids": pc_ids, "completion_mask": completion_mask}
-                if assistant_only_loss:
-                    if marker_masks:
-                        labels = response_labels({"input_ids": [pc_ids]})["labels"][0]
-                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                labels = None
+                if assistant_only_loss and marker_masks:
+                    labels = response_labels({"input_ids": [pc_ids]})["labels"][0]
+                return _pc_result(prompt_ids, pc_ids, pc_masks, labels)
+
+            def _tokenize_pc_rows(rows):
+                # Rows with per-row tools / template kwargs go row by row.
+                if _is_conv:
+                    batch_rows = [
+                        i for i, row in enumerate(rows)
+                        if _batch_chat_template and row.get("tools") is None and not row.get("chat_template_kwargs")
+                        and _is_conversation(row["prompt"]) and _is_conversation(row["prompt"] + row["completion"])
+                    ]
+                else:
+                    batch_rows = list(range(len(rows)))
+                results = [None] * len(rows)
+                if batch_rows:
+                    if _is_conv:
+                        prompt_ids = processing_class.apply_chat_template(
+                            [rows[i]["prompt"] for i in batch_rows], tokenize=True,
+                            add_generation_prompt=True, return_dict=False, tools=None,
+                            **_shared_template_kwargs,
+                        )
+                        pc_processed = processing_class.apply_chat_template(
+                            [rows[i]["prompt"] + rows[i]["completion"] for i in batch_rows],
+                            return_dict=True, tokenize=True,
+                            return_assistant_tokens_mask=assistant_only_loss and not marker_masks, tools=None,
+                            **_shared_template_kwargs,
+                        )
+                        pc_ids = pc_processed["input_ids"]
+                        pc_masks = pc_processed["assistant_masks"] if assistant_only_loss and not marker_masks \
+                            else [None] * len(batch_rows)
                     else:
-                        result["assistant_masks"] = list(pc_processed["assistant_masks"])
-                if do_truncation and max_seq_length > 0:
-                    result = {k: v[:max_seq_length] for k, v in result.items()}
-                if _needs_token_type_ids:
-                    result["token_type_ids"] = [0] * len(result["input_ids"])
-                return result
+                        prompt_ids = tokenizer(
+                            [rows[i]["prompt"] for i in batch_rows], add_special_tokens=add_special_tokens,
+                        )["input_ids"]
+                        pc_ids = tokenizer(
+                            [rows[i]["prompt"] + _pc_completion(rows[i]) for i in batch_rows],
+                            add_special_tokens=add_special_tokens,
+                        )["input_ids"]
+                        pc_masks = [None] * len(batch_rows)
+                    _check_batch_lengths(batch_rows, prompt_ids, pc_ids, pc_masks)
+                    labels = [None] * len(batch_rows)
+                    if assistant_only_loss and marker_masks:
+                        labels = response_labels({"input_ids": pc_ids})["labels"]
+                    for j, i in enumerate(batch_rows):
+                        results[i] = _pc_result(prompt_ids[j], pc_ids[j], pc_masks[j], labels[j])
+                for i, row in enumerate(rows):
+                    if results[i] is None:
+                        results[i] = _tokenize_pc(row)
+                return results
 
             if use_desc:
                 map_kwargs["desc"] = 'Unsloth: Tokenizing ["prompt"+"completion"]'
@@ -2952,7 +3073,8 @@ def sft_prepare_dataset(
             with _w.catch_warnings():
                 _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
                 dataset = dataset.map(
-                    _tokenize_pc, batched=False,
+                    _batched_rows(_tokenize_pc, _tokenize_pc_rows) if _batch_map else _tokenize_pc,
+                    batched=_batch_map,
                     remove_columns=list(column_names), **map_kwargs,
                 )
             if assistant_only_loss:
@@ -2985,10 +3107,7 @@ def sft_prepare_dataset(
                 not locals().get("_unsloth_wrapped_packing", False)
             message_cut = slice(-max_seq_length, None) if truncate_messages and \
                 getattr(args, "truncation_mode", "keep_start") == "keep_end" else slice(None, max_seq_length)
-            def _tokenize_messages(example):
-                template_kwargs = dict(example.get("chat_template_kwargs") or {})
-                if training_chat_template is not None:
-                    template_kwargs["chat_template"] = training_chat_template
+            def _clean_messages(example):
                 # Arrow fills missing keys with None, which `is defined` template checks then index.
                 messages = [
                     {k: v for k, v in message.items() if v is not None}
@@ -3002,6 +3121,26 @@ def sft_prepare_dataset(
                         if isinstance(message, dict) and isinstance(message.get("content"), str) else message
                         for message in messages
                     ]
+                return messages
+
+            def _messages_result(input_ids, masks, labels):
+                result = {"input_ids": list(input_ids)}
+                if assistant_only_loss:
+                    if marker_masks:
+                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                    else:
+                        result["assistant_masks"] = list(masks)
+                if truncate_messages:
+                    result = {k: v[message_cut] for k, v in result.items()}
+                if _needs_token_type_ids:
+                    result["token_type_ids"] = [0] * len(result["input_ids"])
+                return result
+
+            def _tokenize_messages(example):
+                template_kwargs = dict(example.get("chat_template_kwargs") or {})
+                if training_chat_template is not None:
+                    template_kwargs["chat_template"] = training_chat_template
+                messages = _clean_messages(example)
                 tools = example.get("tools")
                 if isinstance(tools, str):
                     import json as _json
@@ -3015,28 +3154,54 @@ def sft_prepare_dataset(
                 input_ids = processed["input_ids"]
                 if input_ids and isinstance(input_ids[0], list):
                     input_ids = input_ids[0]
-                result = {"input_ids": list(input_ids)}
+                masks = labels = None
                 if assistant_only_loss:
                     if marker_masks:
-                        labels = response_labels({"input_ids": [result["input_ids"]]})["labels"][0]
-                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                        labels = response_labels({"input_ids": [list(input_ids)]})["labels"][0]
                     else:
                         masks = processed["assistant_masks"]
                         if masks and isinstance(masks[0], list):
                             masks = masks[0]
-                        result["assistant_masks"] = list(masks)
-                if truncate_messages:
-                    result = {k: v[message_cut] for k, v in result.items()}
-                if _needs_token_type_ids:
-                    result["token_type_ids"] = [0] * len(result["input_ids"])
-                return result
+                return _messages_result(input_ids, masks, labels)
+
+            def _tokenize_messages_rows(rows):
+                batch_rows, batch_messages = [], []
+                if _batch_chat_template:
+                    for i, row in enumerate(rows):
+                        if row.get("tools") is None and not row.get("chat_template_kwargs"):
+                            messages = _clean_messages(row)
+                            if _is_conversation(messages):
+                                batch_rows.append(i)
+                                batch_messages.append(messages)
+                results = [None] * len(rows)
+                if batch_rows:
+                    processed = processing_class.apply_chat_template(
+                        batch_messages, tools = None,
+                        tokenize = True, return_dict = True,
+                        return_assistant_tokens_mask = assistant_only_loss and not marker_masks,
+                        **_shared_template_kwargs,
+                    )
+                    input_ids = [list(x) for x in processed["input_ids"]]
+                    masks = processed["assistant_masks"] if assistant_only_loss and not marker_masks \
+                        else [None] * len(batch_rows)
+                    _check_batch_lengths(batch_rows, input_ids, masks)
+                    labels = [None] * len(batch_rows)
+                    if assistant_only_loss and marker_masks:
+                        labels = response_labels({"input_ids": input_ids})["labels"]
+                    for j, i in enumerate(batch_rows):
+                        results[i] = _messages_result(input_ids[j], masks[j], labels[j])
+                for i, row in enumerate(rows):
+                    if results[i] is None:
+                        results[i] = _tokenize_messages(row)
+                return results
 
             if use_desc: map_kwargs["desc"] = 'Unsloth: Tokenizing ["messages"]'
             import warnings as _w
             with _w.catch_warnings():
                 _w.filterwarnings("ignore", message = ".*couldn't be hashed properly.*")
                 dataset = dataset.map(
-                    _tokenize_messages, batched=False,
+                    _batched_rows(_tokenize_messages, _tokenize_messages_rows) if _batch_map else _tokenize_messages,
+                    batched=_batch_map,
                     remove_columns=list(column_names), **map_kwargs,
                 )
             if assistant_only_loss:
@@ -3155,7 +3320,6 @@ def patch_torchcodec_audio_decoder():
         )
     except (ImportError, AttributeError, RuntimeError):
         pass  # torchcodec not available or different datasets version
-pass
 
 
 # Unsloth Zoo - Utilities for Unsloth
