@@ -38,12 +38,12 @@ __all__ = [
     "FUSED_DECODE_CALLS",
 ]
 
-import contextlib
 import os
 
 import torch
 
 from .log import logger
+from .triton_fast_launch import launch as _fast_launch
 
 try:
     import triton
@@ -68,13 +68,6 @@ FUSED_DECODE_CALLS = {"add_rms_norm": 0, "sink_scale_output": 0, "static_cache_u
 _MAX_COLS = 32768
 # aten rounds every multiply before the add that follows it; contracting them into FMAs would not.
 _NO_FMA = {} if _INTERPRET else {"enable_fp_fusion": False}
-
-
-def _on_device(t):
-    # Launch on the tensor's card; entering torch.cuda.device costs host time, so only when needed.
-    if t.is_cuda and t.device.index != torch.cuda.current_device():
-        return torch.cuda.device(t.device)
-    return contextlib.nullcontext()
 
 
 def _disable(error):
@@ -175,13 +168,13 @@ def add_rms_norm(x, residual, weight, eps):
         return y, s
     BLOCK = triton.next_power_of_2(N)
     try:
-        with _on_device(x):
-            _add_rms_norm_kernel[(rows,)](
-                x, x if residual is None else residual, weight, y, s, N, N, N, N, N, float(eps), 1.0 / N,
-                HAS_RES = residual is not None, BLOCK = BLOCK, EXACT = _libdevice is not None,
-                num_warps = 8 if BLOCK >= 4096 else 4,
-                **_NO_FMA,
-            )
+        args = (x, x if residual is None else residual, weight, y, s, N, N, N, N, N, float(eps), 1.0 / N)
+        consts = dict(HAS_RES = residual is not None, BLOCK = BLOCK, EXACT = _libdevice is not None)
+        if _INTERPRET:
+            _add_rms_norm_kernel[(rows,)](*args, **consts, num_warps = 8 if BLOCK >= 4096 else 4)
+        else:
+            _fast_launch(_add_rms_norm_kernel, (rows,), args, consts, x.get_device(),
+                         (y,) if residual is None else (y, s), num_warps = 8 if BLOCK >= 4096 else 4, **_NO_FMA)
     except Exception as e:
         return _disable(e)
     FUSED_DECODE_CALLS["add_rms_norm"] += 1
@@ -208,15 +201,16 @@ def sink_scale_output(attn_output, lse, sinks):
     if not sinks.is_contiguous():
         sinks = sinks.contiguous()
     try:
-        with _on_device(attn_output):
-            _sink_scale_kernel[(n,)](
-                attn_output, lse, sinks, out, H, Q, D,
+        args = (attn_output, lse, sinks, out, H, Q, D,
                 attn_output.stride(0), attn_output.stride(1), attn_output.stride(2),
                 lse.stride(0), lse.stride(1), lse.stride(2),
-                out.stride(0), out.stride(1), out.stride(2),
-                BLOCK_D = triton.next_power_of_2(D), EXACT = _libdevice is not None, num_warps = 1 if D <= 128 else 4,
-                **_NO_FMA,
-            )
+                out.stride(0), out.stride(1), out.stride(2))
+        consts = dict(BLOCK_D = triton.next_power_of_2(D), EXACT = _libdevice is not None)
+        if _INTERPRET:
+            _sink_scale_kernel[(n,)](*args, **consts, num_warps = 1 if D <= 128 else 4)
+        else:
+            _fast_launch(_sink_scale_kernel, (n,), args, consts, attn_output.get_device(), (out,),
+                         num_warps = 1 if D <= 128 else 4, **_NO_FMA)
     except Exception as e:
         return _disable(e)
     FUSED_DECODE_CALLS["sink_scale_output"] += 1
