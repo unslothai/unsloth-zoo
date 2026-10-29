@@ -5912,18 +5912,34 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
     replacement_classes = replacement_classes or {}
     target_names = set()
 
+    def retarget(target):
+        # A flag flip regenerates the compiled module: keep the previous generation's class matched too,
+        # since models built from it are still alive (transformers matches with isinstance, which takes a tuple).
+        targets = target if isinstance(target, tuple) else (target,)
+        out = []
+        for cls in targets:
+            target_names.add(cls.__name__)
+            replacement = replacement_classes.get(cls.__name__)
+            if replacement is None or replacement is cls:
+                out.append(cls)
+                continue
+            out.append(replacement)
+            if cls.__module__ == replacement.__module__ and cls.__module__.startswith("unsloth_compiled_"):
+                out.append(cls)
+        out = tuple(dict.fromkeys(out))
+        return out[0] if len(out) == 1 and not isinstance(target, tuple) else out
+
     def patch_capture_spec(spec):
-        if isinstance(spec, (list, tuple)):
-            patched = [patch_capture_spec(x) for x in spec]
-            return tuple(patched) if isinstance(spec, tuple) else patched
+        if isinstance(spec, list):
+            return [patch_capture_spec(x) for x in spec]
         if isinstance(spec, OutputRecorder) and spec.target_class is not None:
-            target_names.add(spec.target_class.__name__)
-            replacement_class = replacement_classes.get(spec.target_class.__name__)
-            if replacement_class is not None:
-                spec.target_class = replacement_class
-        elif isinstance(spec, type):
-            target_names.add(spec.__name__)
-            return replacement_classes.get(spec.__name__, spec)
+            spec.target_class = retarget(spec.target_class)
+        elif isinstance(spec, type) or (
+            isinstance(spec, tuple) and spec and all(isinstance(c, type) for c in spec)
+        ):
+            return retarget(spec)
+        elif isinstance(spec, tuple):
+            return tuple(patch_capture_spec(x) for x in spec)
         return spec
 
     for item_name in dir(modeling_file):

@@ -247,3 +247,57 @@ def test_lora_layers_keep_their_flag_when_a_later_load_flips_it(tmp_path):
         "kept_before": "199680.0", "kept_after": "199680.0", "created_unused_after": "199680.0",
         "new_after": "inf", "kept_back": "199680.0", "new_back": "199680.0",
     }
+
+
+CAPTURE_SCRIPT = r"""
+import inspect, json, os
+import torch
+from unsloth_zoo.temporary_patches import TEMPORARY_PATCHES
+import unsloth_zoo.compiler as compiler
+
+def run_patches(phase):
+    for patch in TEMPORARY_PATCHES:
+        try:
+            if "phase" in inspect.signature(patch).parameters: patch(phase = phase)
+            else: patch()
+        except Exception: pass
+
+def compile(flag):
+    os.environ["UNSLOTH_FORCE_FLOAT32"] = flag
+    run_patches("pre_compile")
+    compiler.unsloth_compile_transformers("llama")
+    run_patches("post_compile")
+
+from transformers import LlamaConfig
+config = LlamaConfig(vocab_size = 32, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 1,
+                     num_attention_heads = 2, num_key_value_heads = 2, max_position_embeddings = 16)
+config._attn_implementation = "eager"
+compile("0")
+from transformers.models.llama import modeling_llama
+torch.manual_seed(0)
+kept = modeling_llama.LlamaModel(config).eval()
+compile("1")
+ids = torch.tensor([[1, 2, 3, 4]])
+with torch.no_grad():
+    out = kept(input_ids = ids, output_attentions = True)
+print("RESULT " + json.dumps({"attentions": len(out.attentions or ())}))
+"""
+
+
+def test_retained_model_keeps_output_capture_after_a_flip(tmp_path):
+    # Output capture matches modules by class; a flip regenerates the compiled classes, so a model
+    # built before it must still be matched (else output_attentions silently returns nothing).
+    env = dict(
+        os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
+        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_COMPILE_LOCATION = str(tmp_path / "cache"),
+    )
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p)
+    for key in ("UNSLOTH_FORCE_FLOAT32", "UNSLOTH_FORCE_CUSTOM_DTYPE", "UNSLOTH_COMPILE_OVERWRITE"):
+        env.pop(key, None)
+    proc = subprocess.run(
+        [sys.executable, "-c", CAPTURE_SCRIPT],
+        capture_output = True, text = True, timeout = 900, env = env,
+    )
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
+    assert json.loads(lines[-1][len("RESULT "):]) == {"attentions": 1}
