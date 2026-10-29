@@ -1489,7 +1489,7 @@ def test_serial_dataset_num_proc_maps_in_process(requested, seen):
 
     args = SimpleNamespace(dataset_num_proc = requested)
     trainer = _make_cpu_sft_trainer(FakeSFT)(model = None, args = args)
-    assert trainer.seen is seen if seen is None or isinstance(seen, bool) else trainer.seen == seen
+    assert type(trainer.seen) is type(seen) and trainer.seen == seen
     assert args.dataset_num_proc is requested
 
     class Failing(FakeSFT):

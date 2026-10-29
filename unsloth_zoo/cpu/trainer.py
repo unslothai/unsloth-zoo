@@ -247,9 +247,8 @@ def _make_cpu_sft_trainer(base):
                 for key, value in legacy.items():
                     setattr(training_args, _LEGACY_SFT_KWARGS[key], value)
                 normalize_cpu_training_arguments(training_args)
-            # Configs (Studio included) encode "in-process" as dataset_num_proc = 1, and datasets >= 4.1
-            # builds a Pool(1) for it: a forked worker plus a pickled tokenizer per map. Stock TRL hands
-            # the value straight to Dataset.map, so pass None (no pool) for the length of __init__ only.
+            # Configs write in-process as dataset_num_proc = 1, but datasets >= 4.1 builds a Pool(1) for it
+            # (under spawn its child re-imports an unguarded __main__): stock TRL must see None while it maps.
             training_args = kwargs.get("args", args[1] if len(args) > 1 else None)
             num_proc = getattr(training_args, "dataset_num_proc", None)
             serial = isinstance(num_proc, int) and not isinstance(num_proc, bool) and 0 <= num_proc <= 1
