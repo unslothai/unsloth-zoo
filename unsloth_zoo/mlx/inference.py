@@ -6526,7 +6526,7 @@ def _draft_convolution(hidden, dynamic, base, group_size, residual = None):
 def _draft_selector_kernel():
     return mx.fast.metal_kernel(
         name = "unsloth_draft_candidate_walk", input_names = ["pred", "hidden", "succ", "unary", "ids", "anchor"],
-        output_names = ["path"], compile_options = {"math_mode": "safe"}, source = r"""
+        output_names = ["path", "confidence"], compile_options = {"math_mode": "safe"}, source = r"""
             uint b = threadgroup_position_in_grid.x, lane = thread_index_in_simdgroup;
             uint candidate = simdgroup_index_in_threadgroup;
             threadgroup float scores[TOP];
@@ -6549,6 +6549,9 @@ def _draft_selector_kernel():
                     for (uint j = 1; j < TOP; ++j) if (scores[j] > scores[best]) best = j;
                     previous = ids[(b * LENGTH + p) * TOP + best];
                     path[b * LENGTH + p] = previous;
+                    float denominator = 0.0f;
+                    for (uint j = 0; j < TOP; ++j) denominator += exp(scores[j] - scores[best]);
+                    confidence[b * LENGTH + p] = 1.0f / denominator;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
@@ -6569,11 +6572,14 @@ def _draft_selector(selector, previous, hidden, candidates, unary):
     projected = selector.hidden_projection(hidden)
     if projected.dtype != hidden.dtype or projected.shape != (*hidden.shape[:2], pred.weight.shape[1]):
         return None
-    return _draft_selector_kernel()(
+    path, confidence = _draft_selector_kernel()(
         inputs = [pred.weight, projected, succ.weight, unary, candidates, previous[:, 0, 0]],
         template = [("T", hidden.dtype), ("TOP", candidates.shape[-1]), ("LENGTH", hidden.shape[1]), ("RANK", projected.shape[-1])],
         grid = (32 * candidates.shape[-1] * hidden.shape[0], 1, 1), threadgroup = (32 * candidates.shape[-1], 1, 1),
-        output_shapes = [hidden.shape[:2]], output_dtypes = [candidates.dtype])[0]
+        output_shapes = [hidden.shape[:2], hidden.shape[:2]], output_dtypes = [candidates.dtype, mx.float32])
+    if selector.__dict__.get("_unsloth_wants_confidence"):
+        selector.__dict__["_unsloth_confidence"] = confidence
+    return path
 
 
 def _top_candidates(logits, k):
@@ -6590,26 +6596,39 @@ def _top_candidates(logits, k):
     return mx.take_along_axis(index, pick, axis = -1)
 
 
-@mx.compile
-def _candidate_walk(predecessors, hidden, successors, unary, candidates):
-    # Every edge from each candidate at a position to each at the next, then the greedy walk over those tables:
-    # each edge is `CandidateSelector.select`'s own bf16 product and sum.
+def _candidate_scores(predecessors, hidden, successors, unary):
+    # Every edge from each candidate at a position to each at the next: each is `CandidateSelector.select`'s own bf16
+    # product and sum.
     edges = mx.sum((predecessors * hidden[:, :, None])[:, :, :, None] * successors[:, :, None], axis = -1)
-    scores = unary[:, :, None] + edges
-    choice, path = mx.zeros((candidates.shape[0],), mx.int32), []
+    return unary[:, :, None] + edges
+
+
+@mx.compile
+def _candidate_walk(predecessors, hidden, successors, unary, candidates, with_confidence = False):
+    # The greedy walk over the edge tables.
+    scores = _candidate_scores(predecessors, hidden, successors, unary)
+    choice, path, confidence = mx.zeros((candidates.shape[0],), mx.int32), [], []
     for position in range(candidates.shape[1]):
-        selected = mx.argmax(mx.take_along_axis(scores[:, position], choice[:, None, None], axis = 1)[:, 0], axis = -1)
+        row = mx.take_along_axis(scores[:, position], choice[:, None, None], axis = 1)[:, 0]
+        selected = mx.argmax(row, axis = -1)
         path.append(mx.take_along_axis(candidates[:, position], selected[:, None], axis = -1)[:, 0])
+        if with_confidence:
+            confidence.append(mx.take_along_axis(mx.softmax(row.astype(mx.float32), axis = -1), selected[:, None], axis = -1)[:, 0])
         choice = selected.astype(mx.int32)
-    return mx.stack(path, axis = 1)
+    path = mx.stack(path, axis = 1)
+    return (path, mx.stack(confidence, axis = 1)) if with_confidence else path
 
 
 def _selector_walk(selector, previous, hidden, candidates, unary):
-    """The selector's greedy walk."""
+    """The selector's greedy walk; a selector asked for confidences also leaves each drafted position's probability."""
     if (path := _draft_selector(selector, previous, hidden, candidates, unary)) is not None:
         return path
-    return _candidate_walk(selector.predecessor_codebook(previous), selector.hidden_projection(hidden),
-                           selector.successor_codebook(candidates), unary, candidates)
+    tables = (selector.predecessor_codebook(previous), selector.hidden_projection(hidden),
+              selector.successor_codebook(candidates), unary)
+    if selector.__dict__.get("_unsloth_wants_confidence"):
+        path, selector.__dict__["_unsloth_confidence"] = _candidate_walk(*tables, candidates, True)
+        return path
+    return _candidate_walk(*tables, candidates)
 
 
 def _fused_dflash2_serves(module):

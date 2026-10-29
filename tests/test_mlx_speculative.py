@@ -17,7 +17,9 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("mlx.core")
-from unsloth_zoo.mlx.speculative import DraftController, NgramProposer, RoundPlan, RowPlan, RowState, _Ema, _upper
+from unsloth_zoo.mlx.speculative import (
+    DraftController, NgramProposer, RoundPlan, RowPlan, RowState, _Calibration, _CycleCosts, _Ema, _upper,
+)
 
 
 def test_ngram_prefers_longer_then_newer_match():
@@ -226,6 +228,89 @@ def test_timings_resist_one_off_work():
     controller.draft_cost.update({1: _Ema(0.2, 2), 3: _Ema(0.2), 7: _Ema(0.2, 2)})
     rows = [RowState(controller.new_reply())]
     assert [controller._measured_parts(RoundPlan("round", rows = (RowPlan("draft", depth),)), rows) for depth in (1, 3, 7)] == [True, False, False]
+
+
+def test_a_trimmed_round_verifies_the_width_its_drafts_pay_for():
+    controller = DraftController(max_depth = 7, can_copy = False, full_every = 4)
+    def costs(values):
+        curve = controller.cycle_cost[1] = _CycleCosts()
+        for width, seconds in values:  # twice: a width counts once observed twice
+            curve.observe(width, seconds)
+            curve.observe(width, seconds)
+    costs([(w, 1.0 + 0.5 * (w - 1)) for w in range(1, 9)])
+    rows, plan = [RowState(controller.new_reply())], RoundPlan("round", rows = (RowPlan("draft", 7),), split = True, trim = True)
+    width = lambda confidence: controller.trim(plan, rows, [confidence]).width
+    # A doubtful third draft ends the verify before it, confident drafts all verify, doubtful ones keep one; the fourth is a full round.
+    assert [width([0.99, 0.99, 0.2] + [0.99] * 4), width([0.99] * 7), width([0.2] * 7), width([0.2] * 7)] == [3, 8, 1, 8]
+    # When width costs nothing, every draft is worth verifying.
+    costs([(w, 1.0) for w in range(1, 9)])
+    assert width([0.2] * 7) == 8
+    # Accounted, the verified positions calibrate, and the drafting is that of the block drafted, not of the rows verified.
+    controller.record_round(RoundPlan("round", rows = (RowPlan("draft", 3),), split = True, trim = True), rows, [3], seconds = 2.0,
+                            draft_seconds = 0.4, confidences = [[0.9] * 7])
+    assert [len(records) for records in controller.calibration._records] == [1, 1, 1, 0, 0, 0, 0]
+    assert controller.draft_cost[7].value == pytest.approx(0.4) and controller.draft_cost[3].value is None
+    # So is a row's that had no confidences; the fused rounds' hidden drafting is no discount for a round that waited for it.
+    controller.record_round(RoundPlan("round", rows = (RowPlan("draft", 3),), split = True, trim = True), rows, [3], seconds = 2.0,
+                            draft_seconds = 0.6, confidences = [None])
+    assert controller.draft_cost[7].count == 2 and controller.draft_cost[3].value is None
+    costs([(w, 5.0 + 0.1 * (w - 1)) for w in range(1, 9)])
+    assert width([0.99, 0.6] + [0.2] * 5) == 4
+
+
+def test_drafter_confidences_are_calibrated_against_acceptance():
+    import math
+    calibration, rng = _Calibration(3), random.Random(17)
+    offsets = [-0.2, -0.8, -1.3]
+    probability = lambda p, pos: 1 / (1 + math.exp(-0.55 * math.log(p / (1-p)) - offsets[pos]))
+    for _ in range(2400):
+        confidence, accepted = [rng.uniform(0.3, 0.999) for _ in offsets], 0
+        while accepted < 3 and rng.random() < probability(confidence[accepted], accepted):
+            accepted += 1
+        calibration.observe(confidence, 3, accepted)
+    assert len(set(calibration.beta)) == 1
+    for confidence in ([0.4, 0.8, 0.95], [0.95, 0.4, 0.8]):
+        survival, expected = 1.0, 1.0
+        for pos, p in enumerate(confidence):
+            survival *= probability(p, pos)
+            expected += survival
+        assert calibration.expected(confidence) == pytest.approx(expected, abs = 0.09)
+    cold = _Calibration(3)
+    for _ in range(8):
+        cold.observe([0.99, 0.99, 0.99], 3, 0)
+    assert cold.beta[2] == cold.beta[0] < 1.0
+    assert cold.alpha[0] < 0 == cold.alpha[1] == cold.alpha[2]
+    assert cold.expected([0.99] * 3) < 2.0
+    before = [list(r) for r in cold._records]
+    cold.observe([float("nan"), float("inf"), -0.1], 3, 3)
+    assert [list(r) for r in cold._records] == before
+    assert 1 < cold.expected([float("nan"), 1.0, 0.0]) <= 4
+    fresh = _Calibration(2)
+    assert fresh.expected([1.1, 0.9]) == pytest.approx(2.33)
+    assert fresh.expected([0.9, -0.1]) == pytest.approx(2.53)
+
+
+def test_completed_cycle_costs_keep_width_coverage_and_clip_stalls():
+    curve = _CycleCosts()
+    for width, seconds in ((2, 12.0), (8, 24.0), (2, 12.0)):
+        curve.observe(width, seconds)
+    assert not curve.ready
+    curve.observe(8, 24.0)
+    assert curve.ready and curve.seconds(5) == 18.0
+    curve.observe(8, 1e6)
+    assert curve.seconds(8) == pytest.approx(32.0)
+    before = dict(curve.points)
+    for bad in (0, -1, float("nan"), float("inf")):
+        curve.observe(8, bad)
+    assert curve.points == before
+    for _ in range(64):
+        curve.observe(4, 18.0)
+    assert not curve.ready and curve.points == {4: (18.0, 64)}
+    curve.observe(8, 24.0)
+    curve.observe(8, 24.0)
+    assert curve.ready and curve.seconds(6) == 21.0
+    curve.points = {2: (23.0, 2), 4: (21.0, 6), 8: (28.0, 8)}
+    assert [curve.seconds(w) for w in (2, 4, 6, 8)] == [21.5, 21.5, 24.75, 28.0]
 
 
 def test_short_budgets_never_plan_empty_drafts():
@@ -489,7 +574,7 @@ def test_a_context_drafter_drafts_the_next_block_ahead_until_a_push_overtakes_it
     import mlx.core as mx
     from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
     sizes, drafter, row = [], object.__new__(ContextDrafter), ContextRow([])
-    drafter.max_lag, drafter.max_depth = 64, 3
+    drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
     # Each draft encodes its block's anchor and context length.
     drafter._draft = lambda pending, context, cache, size, sampler, dtype: sizes.append(size) or mx.array([[100 * pending + 10 * context.shape[1] + i for i in range(size - 1)]])
     drafter.push(row, [1, 2], mx.zeros((2, 4)))
@@ -505,7 +590,7 @@ def test_a_context_drafter_drafts_from_the_block_that_moves_a_long_backlog_into_
     import mlx.core as mx
     from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
     sizes, drafter, row = [], object.__new__(ContextDrafter), ContextRow([])
-    drafter.max_lag, drafter.max_depth = 64, 3
+    drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
     drafter._draft = lambda pending, context, cache, size, sampler, dtype: sizes.append(size) or mx.array([[100 * pending + 10 * context.shape[1] + i for i in range(size - 1)]])
     drafter.push(row, [1], mx.zeros((63, 4)))
     assert row.ready and row.prefetched is None and not sizes
@@ -519,20 +604,22 @@ def test_a_context_drafter_serves_a_prefetched_block_of_the_requested_depth_unsl
     import mlx.core as mx
     from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
     drafter = object.__new__(ContextDrafter)
-    drafter.max_lag, drafter.max_depth = 64, 3
+    drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
     drafter._draft = lambda pending, context, cache, size, sampler, dtype: mx.arange(size - 1)[None]
     def ready():
         row = ContextRow([])
         drafter.push(row, [1, 2], mx.zeros((2, 4)))
         drafter.prefetch([row])
+        row.prefetched_confidence = mx.full((1, 3), 0.5)
         return row
     row = ready()
-    block = row.prefetched
-    assert drafter.draft([], [row], 3, []) is block
+    block, confidence = row.prefetched, row.prefetched_confidence
+    assert drafter.draft([], [row], 3, []) is block and drafter.confidence == [confidence]
     row = ready()
-    block = row.prefetched
+    block, confidence = row.prefetched, row.prefetched_confidence
     served = drafter.draft([], [row], 2, [])
     assert served is not block and served.tolist() == block[:, :2].tolist()
+    assert drafter.confidence[0] is not confidence and drafter.confidence[0].shape == (1, 2)
     first, second = ready(), ready()
     assert drafter.draft([], [first, second], 3, []).tolist() == [[0, 1, 2], [0, 1, 2]]
 
@@ -569,3 +656,34 @@ def test_drafter_layers_submit_their_output_when_built_in_eval_mode(monkeypatch)
     # Inside a function transformation, where submitting is refused, the layer still returns its output.
     monkeypatch.setattr(inference.mx, "async_eval", lambda *arrays: (_ for _ in ()).throw(ValueError("transform")))
     assert mx.array_equal(model.layers[2](x), expected[2]).item()
+
+
+def test_prepared_plans_preserve_controller_state_and_choices():
+    import copy
+    import pickle
+    controller = DraftController(max_depth = 3, min_window = 3, probe_every = 5, stale_after = 8)
+    controller.trims = True
+    states = [RowState(controller.new_reply(), copy_available = 6), RowState(controller.new_reply())]
+    controller.cycle_cost[2] = curve = _CycleCosts()
+    curve.observe(2, 0.03)
+    curve.observe(2, 0.03)
+    curve.observe(4, 0.04)
+    curve.observe(4, 0.04)
+    baseline, original = copy.deepcopy((controller, states))
+    for index in range(160):
+        before = pickle.dumps((controller, states))
+        prepared = controller.prepare_plan(states)
+        assert pickle.dumps((controller, states)) == before
+        for c, s in ((controller, states), (baseline, original)):
+            c.observe_cycle(RoundPlan("round", rows = (RowPlan("draft", 3),) * 2, trim = True), s, 0.04)
+        actual, expected = controller.plan(states, prepared), baseline.plan(original)
+        assert (actual is prepared.plan) == (prepared.cycle_ready == controller._cycle_ready(states))
+        assert actual == expected
+        assert pickle.dumps((controller, states)) == pickle.dumps((baseline, original))
+        for c, s in ((controller, states), (baseline, original)):
+            if actual.kind == "round":
+                c.record_round(actual, s, [min(r.length, (index + i) % 4) for i, r in enumerate(actual.rows)],
+                               seconds = 0.04, draft_seconds = 0.006)
+            else:
+                c.record_plain(s, actual.length, 0.02 * actual.length, 0.02)
+    assert controller.cycle_cost[2].points[4][1] == 64

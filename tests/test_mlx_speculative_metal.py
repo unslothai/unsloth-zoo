@@ -1899,6 +1899,13 @@ def test_sparse_draft_selection_preserves_canonical_ties_and_call_ownership():
                                                              mx.take_along_axis(values, order, axis = -1), 1.25, ascending = True)
         assert mx.array_equal(ascending(), first)
         assert mx.array_equal(second, dense((ids + 17) % 1024, -values))
+        # A budget asking the selector for confidences gets them from the sparse walk too.
+        selector.__dict__["_unsloth_wants_confidence"] = True
+        assert mx.array_equal(inference._sparse_candidate_walk(selector, hidden, anchors, ids, values, 1.25), first)
+        confidence = selector.__dict__.pop("_unsloth_confidence")
+        assert mx.array_equal(ascending(), first) and mx.array_equal(selector.__dict__.pop("_unsloth_confidence"), confidence)
+        del selector.__dict__["_unsloth_wants_confidence"]
+        assert confidence.shape == (2, 3) and bool(mx.all((confidence > 0) & (confidence <= 1)))
 
 
 def test_a_quantized_drafter_projects_on_the_lane_kernel_unless_switched_off(qwen, monkeypatch):
@@ -2137,13 +2144,17 @@ def test_draft_selector_walks_each_batch_and_position(monkeypatch, dtype):
     candidates = (mx.arange(224).reshape(2, 7, 16) * 17 % 97).astype(mx.uint32)
     unary = mx.random.normal((2, 7, 16), key = mx.random.key(27)).astype(dtype)
     previous = mx.concatenate([mx.broadcast_to(mx.array([3, 29])[:, None, None], (2, 1, 16)), candidates[:, :-1]], axis = 1)
+    selector.__dict__["_unsloth_wants_confidence"] = True
     for sign in (-1, 1):
         changed = mx.concatenate([hidden[:1], hidden[1:] * sign])
-        expected = inference._candidate_walk(selector.predecessor_codebook(previous), selector.hidden_projection(changed),
-            selector.successor_codebook(candidates), unary, candidates)
-        assert mx.array_equal(inference._draft_selector(selector, previous, changed, candidates, unary), expected)
+        expected, confidence = inference._candidate_walk(selector.predecessor_codebook(previous), selector.hidden_projection(changed),
+            selector.successor_codebook(candidates), unary, candidates, True)
+        actual = inference._draft_selector(selector, previous, changed, candidates, unary)
+        assert mx.array_equal(actual, expected)
+        assert mx.allclose(selector.__dict__["_unsloth_confidence"], confidence, atol = 2e-6, rtol = 2 * mx.finfo(dtype).eps)
     selector.predecessor_codebook.weight = mx.zeros_like(selector.predecessor_codebook.weight)
     assert mx.array_equal(inference._draft_selector(selector, previous, hidden, candidates, mx.zeros_like(unary)), candidates[:, :, 0])
+    assert mx.allclose(selector.__dict__["_unsloth_confidence"], mx.full((2, 7), 1 / 16))
 
 
 def test_draft_layer_folds_convolution_residual_and_keeps_context_cache(monkeypatch):
