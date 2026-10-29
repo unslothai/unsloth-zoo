@@ -570,6 +570,64 @@ def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkey
     assert costs == {(m, kind): m + extra[kind] for kind in extra for m in range(1, 17 if kind == "staged" else 9)}
 
 
+def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_kernel(qwen_4bit, monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache, RotatingKVCache, make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.generate import generation_mode
+    (model, _, _), tokens = qwen_4bit, (qwen_4bit[1][0] * 80)[:4100]
+    lm = model.language_model
+    batched = lambda: [ArraysCache(size = 2) if layer.is_linear else BatchKVCache([0]) for layer in lm.model.layers]
+    with generation_mode(model, call = ("batch", "speculative")):
+        # Rows on either side of MLX's decode attention kernel changes; a batch cache's blocks carry a mask array.
+        for prefix, make in [(1018, make_prompt_cache)] + [(prefix, make) for prefix in (1022, 4090)
+                                                           for make in (make_prompt_cache, lambda lm: batched())]:
+            cache = make(lm)
+            mx.eval(lm(mx.array([tokens[:prefix]]), cache = cache).logits)
+            for width in (2, 5, 8):
+                block, run, step = mx.array([tokens[prefix:prefix + width]]), _clone(cache), _clone(cache)
+                out = lm(block, cache = run, speculative_verify = True, capture_layer_ids = [])
+                out.gdn_states.abort()
+                decoded = mx.concatenate([lm(block[:, i:i + 1], cache = step).logits for i in range(width)], axis = 1)
+                assert mx.array_equal(out.logits.view(mx.uint16), decoded.view(mx.uint16)).item(), (prefix, width)
+        # A pair with a sliding window's 2-D mask keeps mlx-vlm's two-row call, which applies it.
+        exact, routed = inference._exact_attention, []
+        monkeypatch.setattr(inference, "_exact_attention", lambda q, *a, **kw: routed.append(q.shape[2]) or exact(q, *a, **kw))
+        for window in (None, 64):
+            routed[:] = []
+            cache = [ArraysCache(size = 2) if layer.is_linear else RotatingKVCache(window) if window else KVCache()
+                     for layer in lm.model.layers]
+            mx.eval(lm(mx.array([tokens[:80]]), cache = cache).logits)
+            lm(mx.array([tokens[80:82]]), cache = cache, speculative_verify = True, capture_layer_ids = []).gdn_states.abort()
+            assert routed == ([] if window else [2] * sum(not layer.is_linear for layer in lm.model.layers)), window
+
+
+@pytest.mark.parametrize("heads, dim", [((24, 4), 256), ((16, 2), 256), ((16, 4), 256), ((16, 2), 128), ((8, 4), 128)])
+def test_a_verify_block_row_has_its_one_row_sdpa_bits_where_the_vector_kernel_changes(heads, dim, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    scale, fused = dim ** -0.5, mx.fast.scaled_dot_product_attention
+    k, v = (mx.random.normal((1, heads[1], 16400, dim), key = mx.random.key(i)).astype(mx.bfloat16) for i in range(2))
+    monkeypatch.setattr(inference._VERIFY_STATE, "serving", True, raising = False)
+    # A dispatch the launch rule mis-models falls back to the one-row calls.
+    monkeypatch.setattr(inference, "_gpu_class", lambda: "unmodelled")
+    [monkeypatch.setattr(inference, f, __import__("functools").lru_cache(getattr(inference, f).__wrapped__)) for f in ("_causal_chunks", "_causal_rows_blocks")]
+    monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
+    one_row = lambda q, last: mx.concatenate([fused(q[:, :, i:i + 1], k[:, :, : last - q.shape[2] + i + 1], v[:, :, : last - q.shape[2] + i + 1], scale = scale) for i in range(q.shape[2])], axis = 2)
+    # Blocks ending around 1024, 4096, 8192 and 16384 keys, where some GPU's vector SDPA launch changes.
+    lasts = (1021, 1023, 1024, 1025, 1030, 2000, 4094, 4097, 5000, 8190, 8193, 8200, 16383, 16386)
+    for last in lasts[::-1] + lasts:   # admissions met in either order
+        for width in (2, 3, 5, 8):
+            q = mx.random.normal((1, heads[0], width, dim), key = mx.random.key(last + width)).astype(mx.bfloat16)
+            out = inference._native_causal_attention(q, k[:, :, :last], v[:, :, :last], scale, None, None, lambda: one_row(q, last))
+            assert mx.array_equal(out.view(mx.uint16), one_row(q, last).view(mx.uint16)).item(), (last, width)
+    # An unmodelled change at a chunk boundary in one block and inside a chunk in the next.
+    monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
+    monkeypatch.setattr(inference, "_exact_attention_kernels", lambda: None)
+    for last in (8195, 8196, 8197):
+        q = mx.random.normal((1, heads[0], 8, dim), key = mx.random.key(last)).astype(mx.bfloat16)
+        out = inference._native_causal_attention(q, k[:, :, :last], v[:, :, :last], scale, None, None, lambda: one_row(q, last))
+        assert mx.array_equal(out.view(mx.uint16), one_row(q, last).view(mx.uint16)).item(), last
+
+
 def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(qwen_4bit, monkeypatch):
     import copy
     import mlx.nn as nn
@@ -606,7 +664,7 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
         with monkeypatch.context() as patch:
             patch.setattr(linear_ops, "_target_verify_quantized_linear", lambda linear, x: None)
             _verified(lm, cache, block, 0)
-        assert not verdicts and _verified(lm, cache, block, 0) and verdicts
+        assert {key[0] for key in verdicts} == {"causal chunks"} and not verdicts.clear() and _verified(lm, cache, block, 0) and verdicts
     assert type(verifier) is native and not any("_unsloth_verify_scopes" in vars(owner) for owner in (verifier, lm))
     with monkeypatch.context() as patch:
         patch.setattr(model, "_unsloth_mlx_distributed_parallel_mode", True, raising = False)
@@ -712,6 +770,7 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, q
         outputs.append(block_fn(*args))
         return outputs[-1]
     monkeypatch.setattr(inference, "_verify_gdn_block", recorded)
+    monkeypatch.setattr(inference, "_native_causal_attention", lambda *args: None)
     monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
     monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
     monkeypatch.setattr(model, "generate", lambda *args, **kwargs: None, raising = False)
@@ -1117,18 +1176,14 @@ def test_long_verify_blocks_read_attention_in_one_pass_and_match_the_native_veri
     from mlx_vlm.models.cache import make_prompt_cache
     from unsloth_zoo.mlx import inference
     model, ids, _ = qwen_4bit
-    lm, block = model.language_model, mx.array([ids[0][24:30]])
+    lm, block = model.language_model, mx.array([ids[0][24:36]])
     cache, prompt = make_prompt_cache(lm), (ids[0] * 64)[:4200]
     lm(mx.array([prompt]), cache = cache, skip_logits = True)
     mx.eval([entry.state for entry in cache])
     native, unscoped = {keep: _verified(lm, cache, block, keep) for keep in (0, 2, 6)}, __import__("copy").copy(lm)
-    attention = lambda: [key for key in served if key[1] == "attention"]
+    attention = lambda: [key for key in served if key[0] == "causal attention"]
     served = _serving(monkeypatch)
     with inference.exact_speculative_verify(model):
-        assert _same(native[0], _verified(lm, cache, block, 0)) and not attention()
-        monkeypatch.setattr(inference, "_EXACT_ATTENTION_MIN_KEYS", 4096)
-        monkeypatch.setattr(inference, "_exact_attention_faster", lambda per_row, fused: True)
-        monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
         # An unscoped copy of the model stays on the one-row calls.
         assert _same(native[0], _verified(unscoped, cache, block, 0)) and not attention()
         assert all(_same(expected, _verified(lm, cache, block, keep)) for keep, expected in native.items())

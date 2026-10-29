@@ -5159,6 +5159,9 @@ _VERIFY_GDN_SOURCE = """
 _VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
 # Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
 _VERIFY_GDN_MAX_ROWS = 16
+# Causal verify rows `_native_causal_attention` takes through fused calls, and in one pass over the KV prefix.
+_NATIVE_CAUSAL_ROWS = 8
+_EXACT_ATTENTION_MAX_ROWS = 32
 # The verifier's own q/k normalization keeps 1e-6; the loader's replacement uses the layer's.
 _VERIFY_QK_EPS = {"abddec205f64acc5": lambda layer: 1e-6,
                   "4fa05fbe449bee52": lambda layer: _NORMALIZE_QK_EPS.get(
@@ -5303,24 +5306,24 @@ _EXACT_ATTENTION_ROWS = """
 
     float qr[2][qk], o[2][qk], m[2], s[2];
     for (int r = 0; r < 2; r++) {
-        const device T* qp = q + b * q_strides[0] + (h * G + g) * q_strides[1] + min(r0 + r, L - 1) * q_strides[2] + lane * qk;
+        const device T* qp = q + b * q_strides[0] + (h * G + g) * q_strides[1] + min(r0 + r, L - 1) * q_strides[2] + lane * qk * q_strides[3];
         for (int j = 0; j < qk; j++) {
-            qr[r][j] = static_cast<float>(scale) * qp[j];
+            qr[r][j] = static_cast<float>(scale) * qp[j * q_strides[3]];
             o[r][j] = 0;
         }
         m[r] = Limits<float>::finite_min;
         s[r] = 0;
     }
 
-    const device T* kp = k + b * k_strides[0] + h * k_strides[1] + block * k_strides[2] + lane * qk;
-    const device T* vp = v + b * v_strides[0] + h * v_strides[1] + block * v_strides[2] + lane * qk;
+    const device T* kp = k + b * k_strides[0] + h * k_strides[1] + block * k_strides[2] + lane * qk * k_strides[3];
+    const device T* vp = v + b * v_strides[0] + h * v_strides[1] + block * v_strides[2] + lane * qk * v_strides[3];
     // The last threadgroup's spare row-pair slots load nothing.
     const int end = r0 < L ? prefix + min(r0 + 2, L) : 0;
     for (int i = block; i < end; i += BLOCKS) {
         float kr[qk], vr[qk];
         for (int j = 0; j < qk; j++) {
-            kr[j] = kp[j];
-            vr[j] = vp[j];
+            kr[j] = kp[j * k_strides[3]];
+            vr[j] = vp[j * v_strides[3]];
         }
         for (int r = 0; r < 2; r++) {
             if (r0 + r < L && i <= prefix + r0 + r) {
@@ -5490,13 +5493,22 @@ def _verify_qmv_rows(native, linears, x):
     return tuple(outs) if len(outs) > 1 else outs[0]
 
 
+def _exact_attention_rows_source():
+    # Unit feature strides take the source as written without them; other views read through their strides.
+    contiguous = _EXACT_ATTENTION_ROWS
+    for name in ("q", "k", "v"):
+        contiguous = contiguous.replace(f" * {name}_strides[3]", "")
+    return ("if (q_strides[3] == 1 && k_strides[3] == 1 && v_strides[3] == 1) {\n"
+            + contiguous + "\n} else {\n" + _EXACT_ATTENTION_ROWS + "\n}")
+
+
 @functools.cache
 def _exact_attention_kernels():
     try:
         if not mx.metal.is_available():
             return None
         return (mx.fast.metal_kernel(name = "unsloth_exact_attention_rows", input_names = ["q", "k", "v", "N", "L", "scale"],
-                                     output_names = ["partials", "sums", "maxs"], source = _EXACT_ATTENTION_ROWS,
+                                     output_names = ["partials", "sums", "maxs"], source = _exact_attention_rows_source(),
                                      ensure_row_contiguous = False),
                 mx.fast.metal_kernel(name = "unsloth_exact_attention_reduce", input_names = ["partials", "sums", "maxs"],
                                      output_names = ["out"], source = _EXACT_ATTENTION_REDUCE))
@@ -5531,8 +5543,93 @@ def _exact_attention_rows(queries, keys, values, scale, blocks):
                   output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
 
 
+def _vector_launch(gqa, rows, keys, dim):
+    """MLX's unmasked vector SDPA launch for `rows` query rows per head: passes, key interleave, one-row GQA kernel."""
+    if not ((_gpu_class() in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)):
+        return 1, 0, False
+    # MLX 0.32.4 gives one-row calls of these shapes a GQA kernel that reduces keys in another order.
+    grouped = rows == 1 and keys >= 8192 and (gqa == 8 and dim in (64, 128) or gqa in (12, 16) and dim == 128)
+    return 2, _vector_blocks(gqa * rows, keys), grouped
+
+
+@functools.lru_cache(maxsize = 64)
+def _causal_chunks(gqa, dim, prefix, length, size, forced):
+    """(start, rows) chunks of at most `size` rows launching their rows' one-row kernel; `forced` only keys the cache."""
+    chunks, start = [], 0
+    while start < length:
+        rows = min(size, length - start)
+        launch = lambda rows, keys: _vector_launch(gqa, rows, prefix + start + keys, dim)
+        while rows > 1 and any(launch(1, row + 1) != launch(rows, rows) for row in range(rows)):
+            rows -= 1
+        chunks.append((start, rows))
+        start += rows
+    return tuple(chunks)
+
+
+@functools.lru_cache(maxsize = 64)
+def _causal_rows_blocks(gqa, dim, prefix, length, forced):
+    """The 2-pass key interleave every row's one-row launch shares, or None; `forced` only keys the cache."""
+    launches = {_vector_launch(gqa, 1, prefix + row + 1, dim) for row in range(length)}
+    (passes, blocks, grouped), = launches if len(launches) == 1 else ((1, 0, False),)
+    return blocks if passes == 2 and not grouped else None
+
+
+def _launched_rows(queries, keys, values, scale, blocks):
+    """`_exact_attention_rows`, evaluated, its threadgroup refitted to any limit MLX quotes; None where it cannot launch."""
+    while True:
+        try:
+            out = _exact_attention_rows(queries, keys, values, scale, blocks)
+            mx.eval(out)
+            return out
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            if not _fit_threadgroup(error, queries.dtype, queries.shape[1] // keys.shape[1]):
+                return None
+
+
+def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row):
+    """A causal verify block, each row with its one-row call's bits: in one pass over the KV prefix where the rows share
+    their one-row launch and MLX's fused SDPA would take several calls, else through those calls; None where the block's
+    shape does not apply. A plan serves once it matched `per_row()`."""
+    if (not getattr(_VERIFY_STATE, "serving", False)
+            or not (cache is None or type(cache) is getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None))
+            or not (mask is None or isinstance(mask, str) and mask == "causal")
+            or not all(isinstance(x, mx.array) and x.ndim == 4 for x in (queries, keys, values))
+            or queries.dtype not in (mx.bfloat16, mx.float16) or not queries.dtype == keys.dtype == values.dtype
+            or not queries.shape[0] == keys.shape[0] == values.shape[0] or keys.shape != values.shape
+            or queries.shape[-1] != keys.shape[-1] or queries.shape[-1] not in (64, 128, 256)
+            or not 2 <= queries.shape[2] <= _EXACT_ATTENTION_MAX_ROWS
+            or keys.shape[2] < queries.shape[2] or keys.shape[1] == 0
+            or queries.shape[1] % keys.shape[1] or queries.shape[1] // keys.shape[1] > 16):
+        return None
+    length, gqa, dim = queries.shape[2], queries.shape[1] // keys.shape[1], queries.shape[-1]
+    prefix, forced = keys.shape[2] - length, os.environ.get("MLX_SDPA_BLOCKS")
+    # The fused kernel serves at most 8 query rows and 32 across a GQA group; each chunk's keys end at its last row,
+    # where the lower-right causal mask aligns. A launch other than a row's own reduces it in another order.
+    chunks = _causal_chunks(gqa, dim, prefix, length, min(8, 32 // gqa), forced)
+    chunked = lambda: mx.concatenate([mx.fast.scaled_dot_product_attention(
+        queries[:, :, start : start + rows], keys[:, :, : prefix + start + rows], values[:, :, : prefix + start + rows],
+        scale = scale, mask = "causal") for start, rows in chunks], axis = 2)
+    # Each fused call reads the whole prefix again; the rows kernel's threadgroups read each key once for all their rows.
+    blocks = _causal_rows_blocks(gqa, dim, prefix, length, forced) if len(chunks) > 1 else None
+    rows_kernel = blocks is not None and _exact_attention_kernels() is not None
+    one_pass = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
+    fits = length <= _NATIVE_CAUSAL_ROWS
+    # MLX's dispatch changes at or just past powers of two: a plan is checked again for each such class of key counts its
+    # chunks' first and last rows fall in, so a dispatch `_vector_launch` does not model falls back.
+    octave = lambda n: (n.bit_length(), (n - 1).bit_length())
+    plan = (queries.shape[:3], keys.shape[1], queries.dtype, dim, forced, *(
+        (rows, octave(prefix + start + 1), octave(prefix + start + rows)) for start, rows in chunks))
+    if rows_kernel and ((key := ("causal attention", blocks, *plan)) in _VERIFY_VERDICTS
+                        or _launched_rows(queries, keys, values, scale, blocks) is not None):
+        return _verify_admitted(key, per_row, one_pass)
+    return _verify_admitted(("causal chunks", *plan), per_row, chunked) if fits else None
+
+
 def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
     """`per_row()`, mlx-vlm's one-row SDPA calls over a causal verify block, read in one pass over the KV prefix where that is faster."""
+    if (output := _native_causal_attention(queries, keys, values, scale, cache, mask, per_row)) is not None:
+        return output
     if (not isinstance(keys, mx.array) or not isinstance(values, mx.array) or isinstance(mask, mx.array)
             or hasattr(cache, "bits") or hasattr(cache, "decode_attention") or queries.ndim != 4
             or queries.dtype not in (mx.bfloat16, mx.float16) or keys.dtype != queries.dtype or values.dtype != queries.dtype
@@ -5723,10 +5820,12 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         return type(f"_ScopedVerify{base.__name__}", (base,), methods)
 
     def block_attention(self, attention, x, mask, cache, position_ids, position_embeddings):
-        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] <= 2
-                or not _bindings_intact(attention_bindings)):
+        # The native two-row call launches for both rows' keys, so pairs the rows below can mask come here.
+        pair = isinstance(mask, str) and mask == "causal" or isinstance(mask, mx.array) and mask.ndim >= 4
+        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] < 2
+                or x.shape[1] == 2 and not pair or not _bindings_intact(attention_bindings)):
             return base._attention(self, attention, x, mask, cache, position_ids, position_embeddings)
-        # The native body for a block wider than two rows, with its one-row SDPA calls handed to `_exact_attention`.
+        # The native body for a wider block, with its one-row SDPA calls handed to `_exact_attention`.
         batch, length, _ = x.shape
         q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
