@@ -860,7 +860,7 @@ class DraftController:
     def observe_cycle(self, plan: RoundPlan, rows: Sequence[RowState], cycle_seconds: float, first_use: bool = False,
                       cold: bool = False) -> None:
         """Account the seconds a finished full-draft ``trim`` round took until the next block it drafted was ready. A ``cold``
-        round drafted its own block too, as a reply's first does, rather than reading one prefetched: that is no width's cost."""
+        round drafted its own block too, as a reply's first does, or read the one that flushed a drafter backlog, as a long prompt's first does: that is no width's cost."""
         if not (self.trims and plan.trim and not first_use and all(row.source == "draft" for row in plan.rows)):
             return
         if not cold and all(state.remaining is None or state.remaining > self.max_depth + 1 for state in rows):
@@ -1401,7 +1401,8 @@ class SpeculativeEngine:
         start, work = time.perf_counter(), first_use_work()
         depth = max((spec.length for spec in plan.rows if spec.source == "draft"), default = 0)
         draft_rows = [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)]
-        cold = plan.trim and any(row is not None and getattr(row, "prefetched", None) is None for row in draft_rows)
+        cold = plan.trim and any(row is not None and (getattr(row, "prefetched", None) is None or getattr(row, "flushed", False))
+                                 for row in draft_rows)
         drafts, draft_seconds, catch_up_seconds, confidences = None, 0.0, 0.0, None
         if depth:
             with mx.stream(self._stream):
@@ -2117,6 +2118,8 @@ class ContextRow:
         self.features: list[mx.array] = []
         self.prefetched: mx.array | None = None
         self.prefetched_confidence: mx.array | None = None
+        # Whether `prefetched` moved a backlog of at least the drafter's `max_lag` rows into the context cache.
+        self.flushed = False
         self.predrafted: list | None = None
 
     @property
@@ -2185,11 +2188,12 @@ class ContextDrafter:
             row.pending, row.predrafted = int(tokens[-1]), None
             return
         # A prefetched block drafted from a context these tokens extend; its own context stays cached.
-        row.pending, row.prefetched, row.prefetched_confidence = int(tokens[-1]), None, None
+        row.pending, row.prefetched, row.prefetched_confidence, row.flushed = int(tokens[-1]), None, None, False
         row.features.append(hidden)
         if sum(len(chunk) for chunk in row.features) >= self.max_lag:
             # The block moving the backlog into the context cache is the next one, so a long prompt drafts at once.
             self.prefetch([row])
+            row.flushed = True
 
     def catch_up(self, cache: list, rows: Sequence[ContextRow | None]) -> int:
         return 0
@@ -2259,6 +2263,7 @@ class ContextDrafter:
                     confidence = row.prefetched_confidence
                     confidence = confidence if confidence.shape[-1] == depth else confidence[:, :depth]
                 row.prefetched = row.prefetched_confidence = None
+                row.flushed = False
             else:
                 block = self._block(row, depth)
                 confidence, row.prefetched_confidence = row.prefetched_confidence, None

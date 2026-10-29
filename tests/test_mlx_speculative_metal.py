@@ -2212,3 +2212,27 @@ def test_draft_projections_keep_their_arrays_and_read_as_their_targets_do(monkey
         assert all(layer[name] is a for name, a in zip(("weight", "scales", "biases"), weights))
         for rows, value in zip((1, 7, 17), reference):
             assert mx.array_equal(layer(hidden[:rows]).view(mx.uint16), value.view(mx.uint16))
+
+
+def test_a_long_prompts_first_round_reads_its_backlog_flush_and_prices_no_width(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx import speculative as S
+    model, ids, _ = qwen_4bit
+    reads, colds = [], []
+    draft, wait = S.ContextDrafter.draft, S.SpeculativeEngine._time_cycle
+    monkeypatch.setattr(S.ContextDrafter, "draft", lambda self, cache, rows, *args: reads.append(
+        [getattr(row, "flushed", None) for row in rows]) or draft(self, cache, rows, *args))
+    monkeypatch.setattr(S.SpeculativeEngine, "_time_cycle", lambda self, *args: colds.append(args[-1]) or wait(self, *args))
+    companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    drafter = S._built(S.ContextDrafter, companion, model.language_model)
+    drafter._selector = companion.candidate_selector
+    drafter._selector.__dict__["_unsloth_wants_confidence"] = True
+    drafter.confidences, drafter.max_lag = True, 16
+    controller = S.DraftController(max_depth = 3, max_copy = 0)
+    controller.plain_cost[1] = S._Ema(0.1, 10)
+    controller.verify_cost[1] = {4: S._Ema(0.1, 10)}
+    assert len(ids[0]) >= drafter.max_lag
+    _run(model, ids[:1], 24, controller, SamplingParams(), drafter = drafter)
+    # The prompt's backlog flush serves the first round, which is cold; later rounds read ordinary prefetched blocks.
+    assert reads[0] == [True] and colds[0] and not any(flags[0] for flags in reads[1:]) and False in colds

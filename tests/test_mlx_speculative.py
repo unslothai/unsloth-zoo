@@ -593,11 +593,11 @@ def test_a_context_drafter_drafts_from_the_block_that_moves_a_long_backlog_into_
     drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
     drafter._draft = lambda pending, context, cache, size, sampler, dtype: sizes.append(size) or mx.array([[100 * pending + 10 * context.shape[1] + i for i in range(size - 1)]])
     drafter.push(row, [1], mx.zeros((63, 4)))
-    assert row.ready and row.prefetched is None and not sizes
+    assert row.ready and row.prefetched is None and not sizes and not row.flushed
     # A prompt past the backlog drafts its first round at once, from the full block that moved it.
     drafter.push(row, [5], mx.zeros((64, 4)))
-    assert row.ready and not row.features and sizes == [4]
-    assert drafter.draft([], [row], 3, []).tolist() == [[1770, 1771, 1772]] and sizes == [4]
+    assert row.ready and not row.features and sizes == [4] and row.flushed
+    assert drafter.draft([], [row], 3, []).tolist() == [[1770, 1771, 1772]] and sizes == [4] and not row.flushed
 
 
 def test_a_context_drafter_serves_a_prefetched_block_of_the_requested_depth_unsliced():
