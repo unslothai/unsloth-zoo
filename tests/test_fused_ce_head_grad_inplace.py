@@ -201,3 +201,38 @@ def test_compiled_autograd_traces_the_backward(dtype):
         loss.backward()
     assert not counters["graph_break"]
     assert torch.equal(w_c.grad, w_e.grad)
+
+
+def test_hook_unpacked_expanded_buffers_are_not_written(monkeypatch):
+    # A saved-tensor hook may unpack an all-zero buffer as an expanded view (values, shape, dtype and
+    # device kept, strides not): writing it in place would hit one element many times.
+    hidden, weight, targets = _inputs(8)
+    targets[:] = -100
+
+    def pack(t):
+        if t.numel() and not t.any():
+            return ("zeros", t.shape, t.dtype, t.device)
+        return t
+
+    def unpack(p):
+        if isinstance(p, tuple):
+            _, shape, dtype, device = p
+            return torch.zeros((), dtype = dtype, device = device).expand(shape)
+        return p
+
+    w = weight.clone().requires_grad_()
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        loss = fl.fused_linear_cross_entropy(hidden.clone().requires_grad_(), w, None, targets,
+                                             divisor = torch.tensor(1.0))
+    (loss * 0.75).backward()
+    assert torch.equal(w.grad, torch.zeros_like(w))
+
+
+def test_create_graph_without_retain_graph_keeps_the_functional_scaler():
+    hidden, weight, targets = _inputs(9, dtype = torch.float32)
+    w = weight.clone().requires_grad_()
+    factor = torch.tensor(0.5, requires_grad = True)
+    gw, = torch.autograd.grad(_loss(hidden, w, targets) * factor, w, create_graph = True, retain_graph = False)
+    w2 = weight.clone().requires_grad_()
+    (_loss(hidden, w2, targets) * 0.5).backward()
+    torch.testing.assert_close(gw.detach(), w2.grad)

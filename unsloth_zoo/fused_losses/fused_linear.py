@@ -1979,10 +1979,15 @@ _KEEP_GRAPH = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", 
 
 def _stored_grad_scaler(s, saved):
     """In place only in eager backward without retain_graph (else a second [V, H] grad coexists with .grad).
-    Compiled autograd traces this backward and cannot trace _KEEP_GRAPH, so it keeps the out-of-place op."""
+    Out of place under compiled autograd (_KEEP_GRAPH is untraceable), create_graph (grad mode records
+    the scaling) and non-contiguous buffers (a saved-tensor hook may unpack an expanded view)."""
     inplace = _OPS.get("scale_rows_inplace")
-    if inplace is not None and _KEEP_GRAPH is not None and not torch.compiler.is_compiling() and all(
-        type(x) is torch.Tensor and not x.requires_grad for x in saved
+    if (
+        inplace is not None
+        and _KEEP_GRAPH is not None
+        and not torch.compiler.is_compiling()
+        and not torch.is_grad_enabled()
+        and all(type(x) is torch.Tensor and not x.requires_grad and x.is_contiguous() for x in saved)
     ):
         try:
             keep = _KEEP_GRAPH()
