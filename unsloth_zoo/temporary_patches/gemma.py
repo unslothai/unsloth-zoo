@@ -186,12 +186,8 @@ def _publish_boundary_helpers(modeling_module):
 pass
 
 
-# The forced float32 set below (embedding, MLP, projector, causal mask) has no
-# generic counterpart, so in one process an fp16 load followed by a bf16 load
-# kept them: the float32 embedding then met bf16 attention ("Expected query,
-# key, and value to have the same dtype"). patch_function re-stashes on every
-# pass, which would record our own forward as the original after pre_compile
-# + post_compile, so these stash once and undo when the flag is "0".
+# Forced float32 patches with no generic counterpart: stash the original once (a re-stash
+# would record our own forward) so a later flag "0" load can undo them.
 def _patch_forced_float32(target_obj, attr_name, new_func, **kwargs):
     stashed = _get_unique_storage_name(target_obj, attr_name) in vars(target_obj)
     return patch_function(target_obj, attr_name, new_func, store_original = not stashed, **kwargs)
