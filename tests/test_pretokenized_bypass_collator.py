@@ -3458,4 +3458,4 @@ def test_a_raw_text_split_is_classified_with_one_column_scan(monkeypatch):
 
     assert len(out.train_dataset) == n
     assert read["source"] == n, read
-    assert read["sampled"] == 16 + 1, read  # one 16-row classifier sample, plus the bypass peek
+    assert read["sampled"] == 16 + 1, read  # 16-row sample + bypass peek

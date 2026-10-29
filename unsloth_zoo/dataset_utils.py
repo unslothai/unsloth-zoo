@@ -1946,8 +1946,7 @@ def train_on_responses_only(
         return views
     pass
 
-    # `_collatable` asks twice per split and the full column scans dominate, so
-    # scan once. The entry holds the dataset, which keeps its id from being reused.
+    # Scan once per split (`_collatable` asks twice); holding the dataset pins its id.
     _split_views_memo = {}
     _split_views_uncached = _split_views
 
