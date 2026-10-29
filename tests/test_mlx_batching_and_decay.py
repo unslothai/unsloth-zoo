@@ -2979,7 +2979,7 @@ def test_nested_text_decoder_qualification_decides_its_parent(parent, decoder):
 
 
 def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch):
-    """Reference overlays vision blocks on sliding layers only, within the window."""
+    """Reference overlays vision blocks on sliding layers only, bounded by the window on past keys."""
     _skip_if_mlx_core_was_replaced()
     from functools import partial
     from types import SimpleNamespace as NS
@@ -3019,7 +3019,7 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
         block = np.cumsum(vision & ~np.pad(vision, ((0, 0), (1, 0)))[:, :-1], axis=1) * vision
         q, k = np.indices((types.shape[1],) * 2)
         same = (block[:, :, None] == block[:, None, :]) & (block[:, :, None] > 0)
-        return (((k <= q) | same) & (abs(q - k) < window))[:, None].tolist()
+        return (((k <= q) | same) & (k > q - window))[:, None].tolist()
 
     h = mx.zeros((2, 6, 1))
     ids = mx.array([[0, 1, 1, 1, 1, 0], [1, 1, 0, 2, 2, 0]])
@@ -3037,11 +3037,16 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
     assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
     prefix = KVCache()
     prefix.update_and_fetch(mx.zeros((2, 1, 3, 1)), mx.zeros((2, 1, 3, 1)))
-    for held in ([KVCache(), None], [prefix, None], [BatchKVCache([1, 0]), None],
+    _, full = arrays(upstream(stack("vision"), h, [KVCache(), None], None))
+    assert arrays(patched(stack("vision"), h, [KVCache(), None], ids)) == [reference(ids), full]
+    q, k = np.indices((6, 6))
+    for held in ([prefix, None], [BatchKVCache([1, 0]), None],
                  [BatchKVCache([1, 0]), BatchKVCache([0, 2])]):
-        sliding, _ = arrays(upstream(stack("vision"), h, held, ids))
+        sliding, _ = upstream(stack("vision"), h, held, ids)
+        if sliding.shape[-2:] == (6, 6):
+            sliding = sliding & mx.array(k > q - 2)
         _, full = arrays(upstream(stack("vision"), h, held, None))
-        assert arrays(patched(stack("vision"), h, held, ids)) == [sliding, full]
+        assert arrays(patched(stack("vision"), h, held, ids)) == [sliding.tolist(), full]
 
 
 def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):

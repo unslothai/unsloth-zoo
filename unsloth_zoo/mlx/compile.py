@@ -6182,16 +6182,23 @@ def _install_gemma4_compile_patches():
             or n <= 1
         ):
             return masks
+        positions = mx.arange(n)
+        # Transformers bounds only past keys (kv > q - window): image tokens may look ahead.
+        in_window = positions[None] > positions[:, None] - self.window_size
         if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
-            # Generation caches keep upstream's sliding masks (offsets, padding);
-            # upstream also overlays full attention, which the reference keeps causal.
+            # Generation caches keep upstream's sliding masks (offsets, padding), but its
+            # overlay skips the window and also covers full attention, which stays causal.
             overlaid = original_make_masks(self, h, cache, mm_token_type_ids)
             return [
-                sliding if layer.layer_type == "sliding_attention" else mask
+                (
+                    sliding & in_window
+                    if isinstance(sliding, mx.array) and sliding.shape[-2:] == (n, n)
+                    else sliding
+                )
+                if layer.layer_type == "sliding_attention"
+                else mask
                 for layer, sliding, mask in zip(self.layers, overlaid, masks)
             ]
-        positions = mx.arange(n)
-        in_window = mx.abs(positions[:, None] - positions[None]) < self.window_size
         sliding = in_window & self._apply_blockwise_bidirectional_overlay(
             language_module.create_causal_mask(n),
             mm_token_type_ids,
