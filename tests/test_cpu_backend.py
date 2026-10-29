@@ -1459,8 +1459,7 @@ print("CPU_SFT_OK", losses)
 def test_cpu_lora_sft_end_to_end(tmp_path, serial_spawn):
     """FastCPUModel + stock TRL SFTTrainer, as notebooks and Studio call them: on_model_resolved,
     SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name; trains and saves the adapter.
-    serial_spawn: an unguarded script file with dataset_num_proc = 1 under spawn (Windows), where a Pool(1)
-    child re-imports __main__ and dies bootstrapping."""
+    serial_spawn: unguarded script, dataset_num_proc = 1, spawn (a Pool(1) child re-imports __main__)."""
     import subprocess
     import sys
     from tokenizers import Tokenizer, models, pre_tokenizers
@@ -1489,8 +1488,7 @@ def test_cpu_lora_sft_end_to_end(tmp_path, serial_spawn):
 
 @pytest.mark.parametrize("requested, seen", [(1, None), (0, None), (None, None), (4, 4), (True, True), (-1, -1)])
 def test_serial_dataset_num_proc_maps_in_process(requested, seen):
-    """datasets >= 4.1 builds a Pool(1) for num_proc = 1, the config layer's serial sentinel: stock TRL
-    must see None while it prepares the dataset, and the caller's config keeps its own value."""
+    """Stock TRL sees None for a serial 0 / 1 during __init__; the caller's config keeps its value."""
     from types import SimpleNamespace
     from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
 
