@@ -276,6 +276,16 @@ def test_helper_never_hands_the_kernel_a_callers_out(lib, kind):
     assert lib.calls[-1][1][6] != buf.data_ptr() and buf._version > version
 
 
+def test_negative_views_decline(lib):
+    layer, qs = _layer()
+    x = torch.randn(1, 1, 128).to(torch.bfloat16)
+    with torch.no_grad():
+        assert Z._bnb_4bit_direct(layer, torch._neg_view(x), qs) is None
+        layer.bias = torch._neg_view(layer.bias)
+        assert Z._bnb_4bit_direct(layer, x, qs) is None
+    assert not lib.calls
+
+
 def test_helper_declines_a_quant_state_without_attributes(lib):
     layer, _ = _layer(bias = False)
     with torch.no_grad():
