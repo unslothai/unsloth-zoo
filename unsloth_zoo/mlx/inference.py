@@ -3415,6 +3415,199 @@ def _routed_down(x, inds, scores, shared, s, w, group_size, bits, mode):
     return _run(launch, list(w), [x, inds, scores, shared, s])
 
 
+_GROUPED_TILE = 2
+_MOE_GROUPED_CHOICES = {}
+
+_GROUPED_MAP = r"""
+  // One thread per expert: its routes, in route order, split into tiles of TILE; tiles laid out by expert.
+  const uint e = thread_index_in_threadgroup;
+  const uint lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  threadgroup uint totals[32];
+  uint count = 0;
+  for (uint r = 0; r < R; ++r) count += uint(inds[r]) == e;
+  const uint tiles = (count + TILE - 1) / TILE;
+  const uint before = simd_prefix_exclusive_sum(tiles);
+  if (lane == 31) totals[sg] = before + tiles;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint offset = before;
+  for (uint j = 0; j < sg; ++j) offset += totals[j];
+  uint live = 0;
+  for (uint j = 0; j < E / 32; ++j) live += totals[j];
+  for (uint t = 0; t < tiles; ++t) {
+    experts[offset + t] = e;
+    counts[offset + t] = min(uint(TILE), count - t * TILE);
+  }
+  uint at = 0;
+  for (uint r = 0; r < R; ++r) {
+    if (uint(inds[r]) == e) {
+      routes[(offset + at / TILE) * TILE + at % TILE] = r;
+      ++at;
+    }
+  }
+  for (uint t = live + e; t < R; t += E) counts[t] = 0;
+"""
+
+_GROUPED_DOT = r"""
+// Each route's dot is the routed kernels' own: lanes accumulate the same K blocks, then simd_sum. A tile's routes
+// share one expert, so each weight block is loaded once for all of them.
+template <typename T, int GS, int BITS, int OUT, int FAST, int ROWS, int P>
+METAL_FUNC void grouped_dot(thread typename Dots<T, GS, BITS, OUT, FAST>::Proj* proj, const device T* x,
+                            thread uint* rr, uint count, int K, int top_k, uint lane,
+                            thread float (&result)[ROWS][P * OUT]) {
+  typedef Dots<T, GS, BITS, OUT, FAST> D;
+  constexpr int V = D::values_per_thread;
+  thread float xt[ROWS][V];
+  thread float sums[ROWS];
+  Terms<float, V, BITS> terms;
+  for (int k = 0; k < K; k += D::block_size) {
+    if (FAST || k + lane * V < K) {
+      UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
+        sums[r] = load_vector<T, float, V, BITS>(x + size_t(rr[r] / top_k) * K + k + lane * V, xt[r]);
+      UNROLL for (int p = 0; p < P; ++p) {
+        UNROLL for (int o = 0; o < OUT; ++o) {
+          terms.load(proj[p].w + o * K * D::lane::bytes_per_pack / D::lane::pack_factor);
+          float scale = proj[p].s[o * (K / GS)];
+          float bias = proj[p].b[o * (K / GS)];
+          UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
+            result[r][p * OUT + o] += scale * terms.dot(xt[r]) + sums[r] * bias;
+        }
+      }
+    }
+    UNROLL for (int p = 0; p < P; ++p) {
+      proj[p].w += D::block_size * D::lane::bytes_per_pack / D::lane::pack_factor;
+      proj[p].s += D::block_size / GS;
+      proj[p].b += D::block_size / GS;
+    }
+  }
+  UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
+    UNROLL for (int i = 0; i < P * OUT; ++i) result[r][i] = simd_sum(result[r][i]);
+}
+"""
+
+_GROUPED_COMBINE = r"""
+  const uint i = thread_position_in_grid.x;
+  if (i >= M * N) return;
+  const uint row = i / N, col = i % N;
+  thread T products[TOP];
+  for (uint j = 0; j < TOP; ++j) products[j] = y[(row * TOP + j) * N + col] * scores[row * TOP + j];
+  out[i] = shared_add(slot_sum<T>(products, 1, TOP), shared[row], s[i]);
+"""
+
+
+def _grouped_projection_source(gate):
+    proj = lambda p, w, s, b: (
+        f"p[{p}] = D::proj((const device uint8_t*){w} + e * {w}_strides[0] * sizeof(*{w}), "
+        f"(const device uint8_t*){s} + e * {s}_strides[0] * sizeof(*{s}), "
+        f"(const device uint8_t*){b} + e * {b}_strides[0] * sizeof(*{b}), K, n0, lane);\n")
+    store = ("T a = T(result[r][o]); T b = T(result[r][OUT + o]); T sig = Sigmoid{}(a); T g = a * sig; y[size_t(rr[r]) * N + n0 + o] = g * b;"
+             if gate else "y[size_t(rr[r]) * N + n0 + o] = T(result[r][o]);")
+    return (
+        "const uint tile = threadgroup_position_in_grid.y;\n"
+        "const uint count = counts[tile];\n"
+        "if (!count) return;\n"
+        "const uint lane = thread_index_in_simdgroup;\n"
+        "const uint n0 = threadgroup_position_in_grid.x * OUT;\n"
+        "const uint e = experts[tile];\n"
+        "thread uint rr[TILE];\n"
+        "UNROLL for (int r = 0; r < TILE; ++r) if (r < count) rr[r] = routes[tile * TILE + r];\n"
+        "typedef Dots<T, GS, BITS, OUT, FAST> D;\n"
+        "typename D::Proj p[P];\n"
+        + proj(0, "wg", "sg", "bg") + (proj(1, "wu", "su", "bu") if gate else "")
+        + "thread float result[TILE][P * OUT] = {};\n"
+        "grouped_dot<T, GS, BITS, OUT, FAST, TILE, P>(p, x, rr, count, K, TOP, lane, result);\n"
+        "UNROLL for (int r = 0; r < TILE; ++r) if (r < count) UNROLL for (int o = 0; o < OUT; ++o) if (lane == o) {\n"
+        + store + "}\n"
+    )
+
+
+@functools.cache
+def _grouped_kernels():
+    try:
+        if not mx.metal.is_available():
+            return None
+        header = _mlx_headers(True) + "#define UNSLOTH_AFFINE 1\n" + _QDOT + _SLOTS + _ROUTED + _GROUPED_DOT
+        projections = tuple(
+            mx.fast.metal_kernel(
+                name = f"unsloth_moe_grouped_{'gate_up' if gate else 'down'}",
+                input_names = [*(["wg", "sg", "bg", "wu", "su", "bu"] if gate else ["wg", "sg", "bg"]),
+                               "x", "experts", "routes", "counts"],
+                output_names = ["y"], header = header, source = _grouped_projection_source(gate),
+                ensure_row_contiguous = False,
+            )
+            for gate in (True, False)
+        )
+        mapping = mx.fast.metal_kernel(name = "unsloth_moe_grouped_map", input_names = ["inds"],
+                                       output_names = ["experts", "routes", "counts"], source = _GROUPED_MAP)
+        combine = mx.fast.metal_kernel(name = "unsloth_moe_grouped_combine", input_names = ["y", "scores", "shared", "s"],
+                                       output_names = ["out"], header = _SLOTS, source = _GROUPED_COMBINE)
+        return mapping, *projections, combine
+    except (AttributeError, OSError, RuntimeError, TypeError):
+        return None
+
+
+def _grouped_routed(x, inds, scores, shared, s, tensors, group_size, bits):
+    """`_routed_down(_routed_gate_up(...))` of affine experts with each expert's routes grouped into tiles, or None.
+
+    Every route keeps the routed kernels' arithmetic; only which routes share a weight read changes, so it serves
+    exactly the calls both routed kernels accept.
+    """
+    kernels = _grouped_kernels()
+    experts, top_k, hidden_width = tensors[0][0].shape[0], inds.shape[-1], tensors[0][0].shape[-2]
+    width, routes = x.shape[-1], inds.size
+    keys = [tuple(map(_key, t)) for t in tensors]
+    if (kernels is None or experts % 32 or experts > 1024
+            or not callable(_gate_up_plan(_key(x), _key(inds), keys[0], keys[1], group_size, bits, "affine"))
+            or not callable(_down_plan(((*inds.shape, hidden_width), x.dtype), _key(inds), _key(scores), _key(shared),
+                                       _key(s), keys[2], group_size, bits, "affine"))):
+        return None
+    mapping, gate_up, down, combine = kernels
+    tile = _GROUPED_TILE
+    owners, routed, counts = mapping(
+        inputs = [inds.reshape(-1)], template = [("R", routes), ("E", experts), ("TILE", tile)],
+        grid = (experts, 1, 1), threadgroup = (experts, 1, 1),
+        output_shapes = [(routes,), (routes * tile,), (routes,)], output_dtypes = [mx.uint32] * 3)
+
+    def project(a, weights, gate):
+        k, n = a.shape[-1], weights[0][0].shape[1]
+        fast = _one_row_kernel("affine", group_size, bits, a.dtype, k, n, *weights[0])
+        per_simd = _GATE_UP_ROWS if gate else _DOWN_ROWS
+        return (gate_up if gate else down)(
+            inputs = [*(t for p in weights for t in p), mx.contiguous(a), owners, routed, counts],
+            template = [("T", a.dtype), ("GS", group_size), ("BITS", bits), ("OUT", per_simd), ("FAST", fast), ("TILE", tile),
+                        ("P", 2 if gate else 1), ("TOP", top_k if gate else 1), ("K", k), ("N", n)],
+            grid = (32 * n // per_simd, routes, 1), threadgroup = (32, 1, 1),
+            output_shapes = [(routes, n)], output_dtypes = [a.dtype])[0]
+
+    y = project(project(x.reshape(-1, width), tensors[:2], True), tensors[2:], False)
+    rows = routes // top_k
+    return combine(inputs = [y, scores, shared, s], template = [("T", x.dtype), ("M", rows), ("N", width), ("TOP", top_k)],
+                   grid = (rows * width, 1, 1), threadgroup = (256, 1, 1),
+                   output_shapes = [s.shape], output_dtypes = [x.dtype])[0]
+
+
+# Sub-millisecond calls jitter and often run a slower mode, which a median hides: average many, less the slowest.
+_GROUPED_RACE_CALLS = 9
+
+
+def _grouped_routed_faster(routed, grouped, clock = time.perf_counter):
+    try:
+        native, candidate = routed(), grouped()
+        if native is None or candidate is None or not _settled(
+                native.dtype == candidate.dtype and bool(mx.array_equal(native, candidate, equal_nan = True))):
+            return False
+        seconds = ([], [])
+        for repeat in range(_GROUPED_RACE_CALLS):
+            for index in ((0, 1) if repeat % 2 == 0 else (1, 0)):
+                mx.synchronize()
+                start = clock()
+                mx.eval((routed, grouped)[index]())
+                seconds[index].append(clock() - start)
+        return sum(sorted(seconds[1])[:-1]) < sum(sorted(seconds[0])[:-1])
+    except (AttributeError, OSError, RuntimeError, TypeError):
+        return False
+
+
 _MOE_UNSORTED_ROUTES = 64
 # The switch layer bodies the routed-expert kernels reimplement besides the gate/up contract's.
 _MOE_ROUTED_FUNCTIONS = {"SwiGLU.__call__": "b6e81906a2a7d4c9", "swiglu": "bc9e3d24f39fe8b1"}
@@ -3477,15 +3670,31 @@ class _RoutedExperts:
             verdict = self.verdicts[x.dtype] = self._verified(x.dtype, inds.shape[-1])
         if not verdict:
             return None
-        return self._run(tensors, x, inds, scores, shared, s)
+        return self._run(tensors, x, inds, scores, shared, s, select = "_unsloth_speculative_call" in block.__dict__)
 
-    def _run(self, tensors, x, inds, scores, shared, s):
+    def _run(self, tensors, x, inds, scores, shared, s, select = False):
         gate, up, down = self.mlp.gate_proj, self.mlp.up_proj, self.mlp.down_proj
-        activations = _routed_gate_up(x, inds, tensors[0], tensors[1], gate.group_size, gate.bits, gate.mode)
-        if activations is None:
-            return None
-        return _routed_down(activations, inds, scores, shared, s, tensors[2],
-                                   down.group_size, down.bits, down.mode)
+
+        def routed():
+            activations = _routed_gate_up(x, inds, tensors[0], tensors[1], gate.group_size, gate.bits, gate.mode)
+            if activations is None:
+                return None
+            return _routed_down(activations, inds, scores, shared, s, tensors[2],
+                                down.group_size, down.bits, down.mode)
+
+        if (select and inds.size > inds.shape[-1] and gate.mode == "affine"
+                and len({(p.group_size, p.bits, p.mode) for p in (gate, up, down)}) == 1):
+            key = (self.base, *map(_key, (x, inds, scores, shared, s)),
+                   tuple(tuple(map(_key, t)) for t in tensors), gate.group_size, gate.bits)
+            grouped = lambda: _grouped_routed(x, inds, scores, shared, s, tensors, gate.group_size, gate.bits)
+            if key not in _MOE_GROUPED_CHOICES:
+                try:
+                    _MOE_GROUPED_CHOICES[key] = _grouped_routed_faster(routed, grouped)
+                except ValueError:  # inside a function transformation, which cannot evaluate; raced later
+                    return routed()
+            if _MOE_GROUPED_CHOICES[key]:
+                return grouped()
+        return routed()
 
     def _verified(self, dtype, top_k):
         mlp = self.mlp

@@ -629,9 +629,15 @@ def _routed(block):
         yield
 
 
-def _expert_block(native, quantization, dtype, widths = (512, 512)):
+@contextlib.contextmanager
+def _routed_speculative(block):
+    with _routed(block), fusion.speculative_call(block):
+        yield
+
+
+def _expert_block(native, quantization, dtype, widths = (512, 512), experts = 32):
     mx.random.seed(23)
-    args = SimpleNamespace(hidden_size = widths[0], moe_intermediate_size = widths[1], num_experts = 32, num_experts_per_tok = 8,
+    args = SimpleNamespace(hidden_size = widths[0], moe_intermediate_size = widths[1], num_experts = experts, num_experts_per_tok = 8,
                            shared_expert_intermediate_size = 512, norm_topk_prob = True)
     block = (vlm_qwen.Qwen3_5MoeSparseMoeBlock if native is vlm_qwen else lm_qwen.Qwen3NextSparseMoeBlock)(args)
     block.set_dtype(dtype)
@@ -670,6 +676,68 @@ def test_routed_experts_run_on_the_decode_kernels_bitwise(native, dtype, quantiz
                 assert bool(gathers) is (routed not in scopes or x.shape[0] == 8)
         assert "_unsloth_moe_routed" not in block.__dict__
 
+
+# 64 experts take the tile map across two simdgroups.
+@pytest.mark.parametrize("quantization, widths, experts", [((8, "affine", 64), (512, 512), 32), ((8, "affine", 64), (512, 512), 64),
+                                                           ((4, "affine", 32), (640, 512), 32), ((4, "affine", 32), (512, 640), 32),
+                                                           ((6, "affine", 32), (640, 640), 32)])
+def test_grouped_routed_experts_serve_bitwise(quantization, widths, experts, monkeypatch):
+    block = _expert_block(vlm_qwen, quantization, mx.bfloat16, widths, experts)
+    xs = [mx.random.normal((rows, 1, widths[0])).astype(mx.bfloat16) for rows in (1, 2, 5, 7)]
+    expected = [block(x) for x in xs]
+    grouped, served = fusion._grouped_routed, []
+    monkeypatch.setattr(fusion, "_grouped_routed", lambda *a: served.append(out := grouped(*a)) or out)
+    monkeypatch.setattr(fusion, "_MOE_ROUTED_VERDICTS", {})
+    monkeypatch.setattr(fusion, "_MOE_GROUPED_CHOICES", {})
+    monkeypatch.setattr(fusion, "_grouped_routed_faster", lambda routed, grouped: True)
+    with _routed(block):   # a plain call keeps its route
+        _identical(block(xs[1]), expected[1])
+        assert not served
+    with _routed_speculative(block):
+        mx.eval(block(xs[0]))  # the first call verifies the kernels against the native experts
+        for x, out in zip(xs, expected):
+            served.clear()
+            _identical(block(x), out)
+            assert [out is not None for out in served] == [True] * (x.shape[0] > 1)
+    # It serves only what the routed kernels do: routing weights in another dtype are refused.
+    mlp = block.switch_mlp
+    tensors = tuple(map(fusion._projection_tensors, (mlp.gate_proj, mlp.up_proj, mlp.down_proj)))
+    x, inds = xs[2], mx.zeros((5, 1, 8), mx.uint32)
+    scores, shared, s = mx.full((5, 1, 8), 0.125, mx.bfloat16), mx.ones((5, 1, 1), mx.bfloat16), mx.zeros((5, 1, widths[0]), mx.bfloat16)
+    args = (mlp.gate_proj.group_size, mlp.gate_proj.bits)
+    routed = fusion._routed_gate_up(x, inds, *tensors[:2], *args, "affine")
+    _identical(grouped(x, inds, scores, shared, s, tensors, *args),
+               fusion._routed_down(routed, inds, scores, shared, s, tensors[2], *args, "affine"))
+    assert grouped(x, inds, scores.astype(mx.float32), shared, s, tensors, *args) is None
+
+
+
+@pytest.mark.parametrize("routed_times, grouped_times, faster", [
+    ((2,) * 9, (1,) * 9, True), ((2,) * 9, (3,) * 9, False), ((2,) * 9, (2,) * 9, False),
+    ((2,) * 9, (1,) * 8 + (100,), True), ((2,) * 9, (1,) * 7 + (100,) * 2, False),
+    ((1,) * 5 + (4,) * 4, (2,) * 9, True), ((2,) * 9, (3,) * 3 + (1,) * 6, True), ((2,) * 9, (0,) + (2,) * 8, True),
+])
+def test_grouped_selection_checks_equality_then_keeps_the_measured_winner(monkeypatch, routed_times, grouped_times, faster):
+    values = mx.array([1, float("nan"), 3], mx.bfloat16)
+    calls, times = [], []
+    assert fusion._GROUPED_RACE_CALLS == len(routed_times) == len(grouped_times)
+    for repeat in range(fusion._GROUPED_RACE_CALLS):
+        for index in ((0, 1) if repeat % 2 == 0 else (1, 0)):
+            duration = (routed_times, grouped_times)[index][repeat]
+            times.extend([10 * len(times), 10 * len(times) + duration])
+    ticks = iter(times)
+    def run(index, different = False):
+        calls.append(index)
+        return values + int(different)
+    assert fusion._grouped_routed_faster(lambda: run(0), lambda: run(1), lambda: next(ticks)) is faster
+    assert calls == [0, 1] + [0, 1, 1, 0] * 4 + [0, 1]
+    calls.clear()
+    assert not fusion._grouped_routed_faster(lambda: run(0), lambda: run(1, True), lambda: pytest.fail("timed before bitwise gate"))
+    assert calls == [0, 1]
+    assert not fusion._grouped_routed_faster(lambda: values, lambda: None)
+    def unavailable():
+        raise RuntimeError("unsupported grouped kernel")
+    assert not fusion._grouped_routed_faster(lambda: values, unavailable)
 
 def test_verify_blocks_run_their_routed_experts_on_the_decode_kernels_bitwise(monkeypatch):
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward as native
