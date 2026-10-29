@@ -4544,6 +4544,44 @@ def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path)
     assert loaded("hello world")["input_ids"] == bare("hello world")["input_ids"]
 
 
+@pytest.mark.parametrize("model_type, declared, expected", [
+    ("mistral", "LlamaTokenizerFast", "TokenizersBackend"),
+    ("bart", "BartTokenizerFast", "RobertaTokenizer"),
+])
+def test_tokenizer_class_disagreeing_with_model_type_keeps_tokenizer_json(
+    tmp_path, model_type, declared, expected,
+):
+    """Mistral Tekken repos declare LlamaTokenizerFast over a ByteLevel tokenizer.json;
+    transformers 5.x LlamaTokenizer rebuilds a SentencePiece decoder over it, so replies
+    stream as raw 'Ġ'/'Ċ' pieces. AutoTokenizer loads TokenizersBackend there instead,
+    and keeps a declared class whenever the model_type registers a specialized one."""
+    import transformers
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    import unsloth_zoo.mlx.loader as loader
+
+    if not hasattr(transformers, "TokenizersBackend"):
+        pytest.skip("transformers 4.x fast classes load tokenizer.json as written")
+    text = "Hello world.\nNext line"
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator([text] * 4, trainers.BpeTrainer(
+        special_tokens=["<unk>", "<s>", "</s>"],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+    ))
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": declared, "bos_token": "<s>", "eos_token": "</s>",
+    }))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+    loaded = loader._load_mlx_tokenizer(tmp_path)
+    ids = backend.encode(text).ids
+    assert type(loaded).__name__ == expected
+    assert loaded.encode(text, add_special_tokens=False) == ids
+    assert loaded.decode(ids) == text
+
+
 def test_model_type_lookup_never_builds_a_model_config(monkeypatch, tmp_path):
     """The recovery above must not reintroduce the validation this fix removes."""
     import transformers

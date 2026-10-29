@@ -1443,6 +1443,7 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     AttributeError or KeyError (Phi-4 multimodal, Nemotron NAS/H, DeepSeek
     V3.2, MiniCPM3) take an otherwise loadable tokenizer down with them.
     """
+    import transformers
     from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
     from transformers.models.auto.tokenization_auto import (
         get_tokenizer_config, tokenizer_class_from_name,
@@ -1461,8 +1462,16 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
         tokenizer_class = tokenizer_class_from_name(class_name.removesuffix("Fast") + "Fast")
         if tokenizer_class is None:
             tokenizer_class = tokenizer_class_from_name(class_name)
-    if tokenizer_class is None and not remote:
-        tokenizer_class = _tokenizer_class_for_model_type(model_path)
+    model_type_class = None if remote else _tokenizer_class_for_model_type(model_path)
+    if tokenizer_class is None:
+        tokenizer_class = model_type_class
+    elif hasattr(transformers, "TokenizersBackend") and getattr(model_type_class, "__name__", None) in (
+        "TokenizersBackend", "PreTrainedTokenizerFast", "PythonBackend", "MistralCommonBackend",
+    ):
+        # As AutoTokenizer in 5.x: a model_type served by a generic backend loads
+        # tokenizer.json as written. Mistral Tekken repos declare LlamaTokenizerFast,
+        # which rebuilds a SentencePiece decoder over their ByteLevel tokenizer.json.
+        tokenizer_class = transformers.TokenizersBackend
     if not remote and (Path(model_path) / "tokenizer.json").is_file():
         if tokenizer_class is None or not issubclass(tokenizer_class, PreTrainedTokenizerFast):
             tokenizer_class = PreTrainedTokenizerFast
