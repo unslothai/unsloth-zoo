@@ -83,6 +83,23 @@ def _hook_active(hook):
     return hook is not None and bool(getattr(hook, "calls", True))
 
 
+_knobs = None
+
+
+def _knobs_set():
+    # Triton's own run path reads these per call; a cached plan would keep a kernel compiled without them.
+    global _knobs
+    if _knobs is None:
+        try:
+            from triton import knobs
+            _knobs = (knobs.compilation, knobs.runtime)
+        except Exception:
+            _knobs = ()
+    if not _knobs:
+        return False
+    return bool(getattr(_knobs[0], "instrumentation_mode", None)) or bool(getattr(_knobs[1], "debug", None))
+
+
 def _hooks_set():
     global _runtime_hooks
     if _runtime_hooks is None:
@@ -114,6 +131,13 @@ def _spec(arg):
 
 
 _BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _poison(t):
+    if t.element_size() in _BITS:
+        t.view(_BITS[t.element_size()]).bitwise_not_()
+    else:
+        t.add_(1)
 
 
 def _same_bits(a, b):
@@ -153,7 +177,10 @@ def launch(kernel, grid, args, constexprs, device, outs, **options):
     before every name in constexprs; constexprs: every remaining argument, in signature order.
     outs: the tensors the kernel writes and never reads (compared on the self-check)."""
     global _ENABLED
-    if not _ENABLED or device < 0 or device != _current_device() or _hooks_set():
+    if (
+        not _ENABLED or device < 0 or device != _current_device() or _hooks_set()
+        or getattr(kernel, "pre_run_hooks", None) or _knobs_set()
+    ):
         return _full_on(kernel, grid, args, constexprs, options, device)
     # id: JITFunction hashes its source cache key (a Python property) on every hash.
     key = (id(kernel), device, *constexprs.values(), *options.items(), *map(_spec, args))
@@ -173,13 +200,18 @@ def launch(kernel, grid, args, constexprs, device, outs, **options):
         if torch.cuda.is_current_stream_capturing():
             return compiled  # the check reads back on the host: leave it to the next eager call
         refs = [t.clone() for t in outs]
-        for t in outs:  # so a launch that writes nothing cannot pass
-            t.fill_(float("nan") if t.is_floating_point() else -1)
+        for t in outs:  # every bit flipped, so an element the launch does not write cannot match the reference
+            _poison(t)
         try:
             _run(entry, grid, device, args)
             ok = all(map(_same_bits, outs, refs))
         except Exception:
-            ok = False
+            # A launcher that takes other arguments: Triton's own path for every kernel, as below.
+            for t, r in zip(outs, refs):
+                t.copy_(r)
+            _ENABLED = False
+            _PLANS.clear()
+            return compiled
         _KERNEL_OK[id(kernel)] = ok
         if not ok:
             for t, r in zip(outs, refs):

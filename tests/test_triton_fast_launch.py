@@ -95,7 +95,7 @@ def test_first_full_then_checked_then_fast(fake_cuda):
     assert k.fast_calls[-1][5:] == (16,)
 
 
-@pytest.mark.parametrize("mode", ["noop", "wrong", "raise"])
+@pytest.mark.parametrize("mode", ["noop", "wrong"])
 def test_failed_self_check_keeps_triton_path(fake_cuda, mode):
     k = _Kernel(mode)
     x = torch.arange(8, dtype = torch.float32)
@@ -105,6 +105,91 @@ def test_failed_self_check_keeps_triton_path(fake_cuda, mode):
         assert torch.equal(out, x * 2 + 3)  # restored to the full launch's result
     assert L._KERNEL_OK[id(k)] is False
     assert len(k.full_calls) == 3 and len(k.fast_calls) == 1 and L.FAST_LAUNCH_STATS["fast"] == 0
+
+
+def test_launcher_error_on_self_check_disables_everything(fake_cuda):
+    k, other = _Kernel("raise"), _Kernel()
+    x = torch.arange(8, dtype = torch.float32)
+    _call(other, x, torch.empty(8))
+    _call(k, x, torch.empty(8))
+    out = torch.empty(8)
+    _call(k, x, out)
+    assert torch.equal(out, x * 2 + 3)
+    assert L._ENABLED is False and not L._PLANS and id(k) not in L._KERNEL_OK
+    # Every kernel is back on Triton's path, not only the one that raised.
+    n_fast = len(other.fast_calls)
+    for _ in range(2):
+        _call(other, x, torch.empty(8))
+    assert len(other.fast_calls) == n_fast
+
+
+def test_noop_launch_fails_check_on_nan_output(fake_cuda):
+    # A NaN poison would equal a NaN reference bit for bit, so a launch writing nothing would pass.
+    k = _Kernel("noop")
+    x = torch.full((8,), float("nan"))
+    for _ in range(3):
+        _call(k, x, torch.empty(8))
+    assert L._KERNEL_OK[id(k)] is False and L.FAST_LAUNCH_STATS["fast"] == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int32, torch.int64, torch.uint8])
+def test_poison_changes_every_element(dtype):
+    t = (torch.arange(-4, 12) if dtype != torch.uint8 else torch.arange(16)).to(dtype)
+    if dtype.is_floating_point:
+        t[0], t[1], t[2] = float("nan"), float("inf"), -0.0
+    ref = t.clone()
+    L._poison(t)
+    assert not (t.view(torch.uint8).view(-1, t.element_size()) == ref.view(torch.uint8).view(-1, t.element_size())).all(1).any()
+
+
+def test_pre_run_hooks_use_triton(fake_cuda):
+    k = _Kernel()
+    k.pre_run_hooks = []
+    x = torch.arange(8, dtype = torch.float32)
+    _call(k, x, torch.empty(8))
+    _call(k, x, torch.empty(8))
+    k.pre_run_hooks.append(lambda *a, **kw: None)  # JITFunction.add_pre_run_hook
+    n_full, n_fast = len(k.full_calls), len(k.fast_calls)
+    for _ in range(3):
+        _call(k, x, torch.empty(8))
+    assert len(k.full_calls) == n_full + 3 and len(k.fast_calls) == n_fast
+
+
+@pytest.mark.parametrize("knob", ["instrumentation_mode", "debug"])
+def test_triton_knobs_use_triton(fake_cuda, monkeypatch, knob):
+    from types import SimpleNamespace
+    compilation = SimpleNamespace(instrumentation_mode = "consan" if knob == "instrumentation_mode" else "")
+    runtime = SimpleNamespace(debug = knob == "debug")
+    k = _Kernel()
+    x = torch.arange(8, dtype = torch.float32)
+    _call(k, x, torch.empty(8))
+    _call(k, x, torch.empty(8))
+    monkeypatch.setattr(L, "_knobs", (compilation, runtime))
+    n_fast = len(k.fast_calls)
+    for _ in range(3):
+        _call(k, x, torch.empty(8))
+    assert len(k.fast_calls) == n_fast
+    monkeypatch.setattr(L, "_knobs", (SimpleNamespace(instrumentation_mode = ""), SimpleNamespace(debug = False)))
+    _call(k, x, torch.empty(8))
+    assert len(k.fast_calls) == n_fast + 1
+
+
+def test_bias_table_revalidates_container(monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_routed as M
+    if M._PTRS_EQUAL is None:
+        pytest.skip("no _tensors_data_ptrs_at_indices_equal in this torch")
+    calls = []
+    monkeypatch.setattr(M, "lora_pointer_table", lambda ws: calls.append(len(ws)) or (torch.tensor([w.data_ptr() for w in ws]), 7))
+    biases = [torch.randn(4) for _ in range(4)]
+    tb = {"bias": biases, "bias_kind": 0}
+    M._bias_args(tb)
+    assert M._bias_args(tb)[0].numel() == 4 and calls == [4]
+    biases.append(torch.randn(4))  # a longer list whose first entries kept their addresses
+    assert M._bias_args(tb)[0].numel() == 5 and calls == [4, 5]
+    del biases[-2:]
+    assert M._bias_args(tb)[0].numel() == 3 and calls == [4, 5, 3]
+    tb["bias"] = tuple(biases)
+    assert M._bias_args(tb)[0].numel() == 3 and calls == [4, 5, 3, 3]
 
 
 def test_launcher_error_after_check_disables_everything(fake_cuda):

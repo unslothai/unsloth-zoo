@@ -495,7 +495,7 @@ def _bias_args(tb):
         # The previous launch's table while every bias keeps its address, dtype and device (one C call,
         # not a data_ptr per expert): what lora_pointer_table would look up again.
         last = tb.get("_bias_last")
-        if last is not None:
+        if last is not None and type(bias) is list and len(bias) == len(last[1]):
             b0 = bias[0]
             if b0.dtype is last[3] and b0.device == last[4] and _PTRS_EQUAL(bias, last[0], last[1]):
                 return last[2]
