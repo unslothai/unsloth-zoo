@@ -628,15 +628,16 @@ def test_vlm_stream_row_left_alone_decodes_bitwise_without_the_single_row_shortc
 
     stock_scope = lambda model: contextlib.nullcontext(model)
     stock, stock_state, stock_extracted = run(stock_scope)
-    # The story decodes alone once the poem ends, and each such step went through the shortcut.
-    assert stock_extracted > 10 and stock_state is not None
+    # The story decodes alone once the poem ends; before mlx-vlm 0.7.11 each such step took the shortcut.
+    shortcut = stock_extracted > 0
+    assert stock_state is not None and (stock_extracted > 10 or not shortcut)
     for again in (False, True):
         scoped, state, scoped_extracted = run(scope)
         assert (scoped.token_ids, scoped.logprobs) == (stock.token_ids, stock.logprobs)
         assert len(state) == len(stock_state)
         assert all(a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(
             mx.contiguous(a).view(mx.uint8), mx.contiguous(b).view(mx.uint8)).item() for a, b in zip(state, stock_state))
-        if disagreement:
+        if disagreement or not shortcut:
             # The disagreeing step is replaced by the shortcut's, which the batch then keeps taking.
             assert scoped_extracted == stock_extracted
         elif again:
@@ -653,7 +654,7 @@ def test_vlm_stream_row_left_alone_decodes_bitwise_without_the_single_row_shortc
             rows[name] = engine.generate_batch(model, processor, [story, short_story], defaults=GenerationDefaults(max_tokens=24))
             rows[name + " extracted"] = len(extracted)
         assert [(r.token_ids, r.logprobs) for r in rows["scoped"]] == [(r.token_ids, r.logprobs) for r in rows["stock"]]
-        assert rows["stock extracted"] > 10 and rows["scoped extracted"] == 0
+        assert (rows["stock extracted"] > 10 or not shortcut) and rows["scoped extracted"] == 0
 
 
 @metal_only
@@ -2129,7 +2130,7 @@ def test_vlm_cache_materialization_reuses_cache_buffers(monkeypatch):
 
 @real_mlx_only
 @pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
-@pytest.mark.parametrize("scope_name", ["nax_quantized_linear", "dense_prefill_linear"])
+@pytest.mark.parametrize("scope_name", ["nax_quantized_linear", "dense_prefill_linear", "ane_prefill_mlp"])
 def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, scope_name):
     from contextlib import contextmanager
     import mlx_lm
@@ -2147,14 +2148,15 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
         yield model
 
     def stream(model, *args, **kwargs):
-        assert entered == [(root, vlm) if scope_name == "nax_quantized_linear" else (root,)]
-        assert "int8_prefill" not in kwargs
+        decision = {"nax_quantized_linear": vlm, "ane_prefill_mlp": not vlm}.get(scope_name)
+        assert entered == [(root, decision) if decision is not None else (root,)]
+        assert "int8_prefill" not in kwargs and "ane_prefill" not in kwargs
         yield types.SimpleNamespace(token = 7)
 
     monkeypatch.setattr(inference, "INFERENCE_SCOPES", [
         entry._replace(enter = scope) if entry.name == scope_name else entry for entry in inference.INFERENCE_SCOPES])
     monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
-    generated = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1, int8_prefill = vlm)
+    generated = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1, int8_prefill = vlm, ane_prefill = not vlm)
     assert generated.tolist() == [[1, 2, 7]]
 
 

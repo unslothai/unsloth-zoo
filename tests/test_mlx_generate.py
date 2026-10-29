@@ -1124,7 +1124,7 @@ def test_audio_requests_reach_the_fallback_through_the_public_entry_point(monkey
         _results(engine.stream_batch(model, object(), request))
     assert collected[0].filename == __file__
     # The at-most-one-media invariant has to survive audio becoming supported.
-    with pytest.raises(ValueError, match="both an image and audio"):
+    with pytest.raises(ValueError, match="audio with other media"):
         engine.generate_batch(model, object(),
                               [GenerationRequest(prompt="p", image=object(), audio="a.wav")])
 
@@ -1602,6 +1602,18 @@ def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     assert session.add(GenerationRequest(prompt = "fg")) == 1
 
 
+@pytest.mark.parametrize("last, reason, kept", [(2, "stop", [1, 3]), (4, "length", [1, 3, 4])])
+def test_a_vision_row_s_events_report_each_sampled_id_once(last, reason, kept):
+    """Including a stop id, which can close the reply's markup for a caller decoding ids itself."""
+    session = _vlm_session()
+    session.add(GenerationRequest(prompt = "ab"))
+    sampled = [(1, None), (3, None), (last, reason)]
+    events = [event for token, finish in sampled for event in session._consume(
+        types.SimpleNamespace(uid = 0, token = token, finish_reason = finish, token_logprob = -0.5))]
+    assert [event.token_ids for event in events] == [(1,), (3,), (last,)]
+    assert events[-1].result.token_ids == kept
+
+
 def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
     session = _vlm_session()
@@ -1614,6 +1626,57 @@ def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
     assert adapter._group_key(rows[0]) != adapter._group_key(GenerationRequest(prompt = "ab"))
     inputs = _VLMBatchAdapter._prompt_inputs(adapter, rows)
     assert [inputs[k].tolist() for k in ("input_ids", "attention_mask")] == [[[1, 2], [3, 4]], [[1, 1]] * 2]
+
+
+def test_a_vision_row_s_clips_reach_the_processor_in_order_and_group_only_with_the_same_clips(monkeypatch):
+    from dataclasses import replace
+    from unsloth_zoo.mlx import generate
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _validate_vlm_requests
+    monkeypatch.setattr(generate, "_vlm_prepares_videos", lambda: True)
+    rows = _validate_vlm_requests([
+        GenerationRequest(prompt = "ab", videos = [pathlib.Path("a.mp4"), "b.mp4"], fps = 0.5),
+        GenerationRequest(prompt = "cd", videos = ["c.mp4"], fps = 0.5),
+    ], GenerationDefaults())
+    assert [row.videos for row in rows] == [("a.mp4", "b.mp4"), ("c.mp4",)]
+    with pytest.raises(ValueError, match = "text models accept text prompts only"):
+        _validate_text_requests([GenerationRequest(prompt = "p", videos = ["a.mp4"])], GenerationDefaults())
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.processor, adapter.batches_observable = types.SimpleNamespace(tokenizer = _CharTokenizer()), True
+    adapter.model, adapter._add_special_tokens = None, lambda: False
+    seen = []
+    adapter.prepare_inputs = lambda processor, **k: seen.append(k) or {}
+    _VLMBatchAdapter._prompt_inputs(adapter, rows)
+    _VLMBatchAdapter._prompt_inputs(adapter, [replace(rows[1], fps = None)])
+    _VLMBatchAdapter._prompt_inputs(adapter, [GenerationRequest(prompt = "ab")])
+    assert (seen[0]["videos"], seen[0]["fps"]) == (["a.mp4", "b.mp4", "c.mp4"], 0.5)
+    assert (seen[1]["videos"], "fps" in seen[1]) == (["c.mp4"], False)
+    assert not {"videos", "fps"} & set(seen[2])
+    key = adapter._group_key
+    assert key(rows[0]) == key(replace(rows[0], prompt = "xy"))
+    for other in (replace(rows[0], videos = ("a.mp4", "c.mp4")), replace(rows[0], fps = 1.0),
+                  GenerationRequest(prompt = "ab")):
+        assert key(rows[0]) != key(other)
+
+
+@pytest.mark.parametrize("request_, error, match", [
+    (GenerationRequest(prompt_token_ids = (1,), videos = ["a.mp4"]), ValueError, "token ids with media"),
+    (GenerationRequest(prompt = "p", videos = ["a.mp4"], audio = "a.wav"), ValueError, "audio with other media"),
+    (GenerationRequest(prompt = "p", videos = "a.mp4"), TypeError, "sequence of clip paths"),
+    (GenerationRequest(prompt = "p", videos = ["a.mp4"], fps = 0), ValueError, "fps must be positive"),
+])
+def test_a_vision_row_s_clips_are_refused_where_no_batch_can_read_them(request_, error, match, monkeypatch):
+    from unsloth_zoo.mlx import generate
+    monkeypatch.setattr(generate, "_vlm_prepares_videos", lambda: True)
+    with pytest.raises(error, match = match):
+        generate._validate_vlm_requests([request_], GenerationDefaults())
+
+
+def test_a_vision_row_s_clips_are_refused_where_prepare_inputs_takes_no_videos(monkeypatch):
+    from unsloth_zoo.mlx import generate
+    monkeypatch.setattr(generate, "_vlm_prepares_videos", lambda: False)
+    with pytest.raises(ValueError, match = "mlx-vlm >= 0.5.0"):
+        generate._validate_vlm_requests([GenerationRequest(prompt = "p", videos = ["a.mp4"])], GenerationDefaults())
+    assert generate._validate_vlm_requests([GenerationRequest(prompt = "p")], GenerationDefaults())
 
 
 def test_a_processor_is_shown_its_own_row_s_history_from_its_own_offset():
@@ -1857,14 +1920,15 @@ def test_inference_scopes_pass_int8_prefill_only_where_registered_and_report_or_
     assert entered == [("first", (None,)), ("exit first", ())]
 
 
-@pytest.mark.parametrize("int8_prefill", [None, True])
-def test_warm_inference_generates_greedily_under_the_int8_decision(int8_prefill):
+@pytest.mark.parametrize("int8_prefill,ane_prefill", [(None, None), (True, False)])
+def test_warm_inference_generates_greedily_under_the_prefill_decisions(int8_prefill, ane_prefill):
     from unsloth_zoo.mlx.inference import warm_inference
 
     calls = []
     warm_inference(types.SimpleNamespace(generate = lambda prompt, **kwargs: calls.append((prompt.tolist(), kwargs))),
-                   int8_prefill = int8_prefill)
-    assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill})]
+                   int8_prefill = int8_prefill, ane_prefill = ane_prefill)
+    assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill,
+                                              "ane_prefill": ane_prefill})]
 
 
 def test_cache_layout_tells_quantized_packings_apart():
@@ -1952,3 +2016,16 @@ def test_single_row_decode_skips_the_shortcut_only_for_an_unpadded_decode_step()
     # The stand-in predicate answers as mlx-vlm's own outside a skipped call.
     assert namespace["_is_single_row_batch_cache"]._unsloth_native is native
     assert namespace["_is_single_row_batch_cache"](row(0)) is True
+
+
+def test_the_videos_probe_reads_the_installed_mlx_vlm():
+    try:
+        utils = importlib.import_module("mlx_vlm.utils")
+    except Exception:
+        pytest.skip("mlx-vlm does not import here")
+    from unsloth_zoo.mlx import generate
+    if isinstance(utils, types.ModuleType) and "mlx_simulation" in (getattr(utils, "__file__", "") or ""):
+        pytest.skip("simulated mlx-vlm")
+    generate._vlm_prepares_videos.cache_clear()
+    takes = "videos" in inspect.signature(utils.prepare_inputs).parameters
+    assert generate._vlm_prepares_videos() is takes
