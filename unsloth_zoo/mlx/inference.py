@@ -1695,7 +1695,9 @@ def _qwen4_decode_plan(language, module):
 def _qwen4_decode_read(forward, module, x):
     native = type(forward)._hyper_connection
     plan = module.__dict__.get("_unsloth_qwen4_decode_plan")
-    if plan is None or x.ndim != 3 or x.size != x.shape[-1] or x.dtype != plan.dtype or x.shape[-1] != plan.width:
+    # Projections Fast Verify holds keep its arithmetic, which verify rows share.
+    if (plan is None or module.input_mix_weight_down.__dict__.get("_unsloth_lane_qmm") or x.ndim != 3
+            or x.size != x.shape[-1] or x.dtype != plan.dtype or x.shape[-1] != plan.width):
         return native(forward, module, x)
     return _qwen4_verified(plan.key, lambda: plan.launch(module, x), lambda: native(forward, module, x),
                            "decode hyper-connection read")
@@ -5283,7 +5285,8 @@ class SpeculativeFamily(NamedTuple):
     `gdn_contract` holds and `gdn_qk_eps(normalize)` gives each layer's q/k epsilon from the forward's normalization.
     `capabilities` maps the further optimizations its arithmetic admits, "attention", "lanes" and
     "invariant_attention" (its one-token decode attention body), to the bodies each pins apart (the lanes' own
-    contract is the kernel's)."""
+    contract is the kernel's); `causal_mask(attention, cache, length)` tells when a verify
+    block's mask array is its causal mask."""
     language: str
     target: str
     module: str
@@ -5297,6 +5300,7 @@ class SpeculativeFamily(NamedTuple):
     gdn_qk_eps: Callable
     gdn_l2: bool = False
     capabilities: dict = {}
+    causal_mask: Callable = None
 
 
 # mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
@@ -5304,6 +5308,21 @@ _VERIFY_FUSED_ROWS = 8
 # Pinned apart, so a drifted attention body leaves only the attention route native.
 _EXACT_ATTENTION_CONTRACT = {"mlx_vlm.models.qwen3_5.speculative_verifier": {
     "Qwen3_5BatchInvariantForward._attention": "0c8e3b361ee34362"}}
+# qwen4_exp attends a dense-regime verify block through `_attention` with the mask `build_mask` gives it.
+_QWEN4_ATTENTION_CONTRACT = {**_EXACT_ATTENTION_CONTRACT, "mlx_vlm.models.qwen4_exp.language": {
+    "QSAKVCache": None, "Qwen4ExpBatchInvariantForward._qsa_attention": "19e3c72333ce7c72",
+    "Qwen4ExpQSAIndexer.from_projected": "df79546e849cb1e1",
+    "Qwen4ExpQSAIndexer.select_from_projected": "379bb821075d65a8", "Qwen4ExpQSAIndexer.build_mask": "b11b51a6551a398c"}}
+
+
+def _qwen4_causal_mask(attention, cache, length):
+    """Whether `build_mask` gave this block the causal mask: one sequence, no row past the indexer's `block_topk`."""
+    qsa = getattr(sys.modules.get("mlx_vlm.models.qwen4_exp.language"), "QSAKVCache", None)
+    indexer, offset = getattr(attention, "indexer", None), getattr(cache, "offset", None)
+    return (qsa is not None and type(cache) is qsa and type(offset) is int and indexer is not None
+            and (offset + length) // indexer.compress_ratio <= indexer.block_topk)
+
+
 _VERIFY_METHODS = ("verify", "__call__", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta", "_attention")
 _VERIFY_LOCK = RLock()
 _VERIFY_VERDICTS = {}
@@ -6265,12 +6284,17 @@ def _launched_rows(queries, keys, values, scale, blocks):
                 return None
 
 
+def _stores_as_kv_cache(cache):
+    native = getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None)
+    return native is not None and getattr(type(cache), "update_and_fetch", None) is native.update_and_fetch
+
+
 def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row):
     """A causal verify block, each row with its one-row call's bits: in one pass over the KV prefix where the rows share
     their one-row launch and MLX's fused SDPA would take several calls, else through those calls; None where the block's
     shape does not apply. Outside Fast Verify a plan serves once it matched `per_row()`."""
     if (not getattr(_VERIFY_STATE, "serving", False) or getattr(_LANE_STATE, "native", False)
-            or not (cache is None or type(cache) is getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None))
+            or not (cache is None or _stores_as_kv_cache(cache))
             or not (mask is None or isinstance(mask, str) and mask == "causal")
             or not all(isinstance(x, mx.array) and x.ndim == 4 for x in (queries, keys, values))
             or queries.dtype not in (mx.bfloat16, mx.float16) or not queries.dtype == keys.dtype == values.dtype
@@ -6535,6 +6559,7 @@ def _exact_verify_class(base, name, *cache_key):
             return base._attention(self, attention, x, mask, cache, position_ids, position_embeddings)
         # The native body for a wider block, with its one-row SDPA calls handed to `_exact_attention`.
         batch, length, _ = x.shape
+        causal = isinstance(mask, mx.array) and family.causal_mask is not None and family.causal_mask(attention, cache, length)
         q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
         tree = getattr(_VERIFY_STATE, "tree", None)
         if tree is not None:
@@ -6551,7 +6576,7 @@ def _exact_verify_class(base, name, *cache_key):
         if tree is not None:
             output = _tree_attention(queries, keys, values, attention.scale, tree)
             return self._linear(attention.o_proj, output.transpose(0, 2, 1, 3).reshape(batch, length, -1) * mx.sigmoid(gate))
-        output = _invariant_attention(queries, keys, values, attention.scale, cache, mask) if invariant else None
+        output = _invariant_attention(queries, keys, values, attention.scale, cache, "causal" if causal else mask) if invariant else None
         if output is None and (length > 1 or padded):
             output = self._helpers()._qwen3_5_left_padded_attention(
                 queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
@@ -6566,7 +6591,7 @@ def _exact_verify_class(base, name, *cache_key):
                     module.slice_kv_sequence(values, prefix + i + 1), cache = cache, scale = attention.scale,
                     mask = mask[..., i : i + 1, : prefix + i + 1] if isinstance(mask, mx.array) and mask.ndim >= 4 else None,
                 ) for i in range(length)], axis = 2)
-            output = _exact_attention(queries, keys, values, attention.scale, cache, mask, per_row)
+            output = _exact_attention(queries, keys, values, attention.scale, cache, "causal" if causal else mask, per_row)
         output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         return self._linear(attention.o_proj, output * mx.sigmoid(gate))
 
@@ -7213,11 +7238,15 @@ def _lane_module_class(base):
 
 @functools.cache
 def _lane_verify_class(base):
+    native = _verifier_native(base)
+    entry = next(family.entry for family in SPECULATIVE_FAMILIES.values()
+                 if getattr(sys.modules.get(family.module), family.forward, None) is native)
+
     def verify(self, language_model, *args, **kwargs):
         outer = getattr(_VERIFY_STATE, "lane", False)
         _VERIFY_STATE.lane = bool(getattr(language_model, "_unsloth_lane_verify_scopes", 0)) and not language_model.training
         try:
-            return base.verify(self, language_model, *args, **kwargs)
+            return getattr(base, entry)(self, language_model, *args, **kwargs)
         finally:
             _VERIFY_STATE.lane = outer
 
@@ -7249,7 +7278,7 @@ def _lane_verify_class(base):
         return not linear.__dict__.get("_unsloth_lane_qmm") and base.can_quantized_head(self, linear)
 
     return type(f"_LaneVerify{base.__name__}", (base,), {
-        "verify": verify, "_linear": linear, "_linears": linears, "_embedding_as_linear": embedding_as_linear,
+        entry: verify, "_linear": linear, "_linears": linears, "_embedding_as_linear": embedding_as_linear,
         "quantized_linear": quantized_linear, "quantized_argmax": quantized_argmax,
         "can_quantized_head": can_quantized_head, "_unsloth_lane_verify_native": base})
 
@@ -7419,8 +7448,8 @@ def _lane_coverage(model, modules):
 
 @contextmanager
 def row_invariant_lane_projections(model, *, _modules = None):
-    """Fast Verify: Qwen3.5 greedy output that does not depend on how many rows a
-    forward carries, so speculative decoding returns its own one-token greedy output. Every affine 2- to 8-bit
+    """Fast Verify, in speculative calls: greedy output that does not depend on how many rows a forward carries, so a
+    speculative generation returns the one-token greedy output of its own arithmetic. Every affine 2- to 8-bit
     projection called with 1 to 32 rows, in decode steps, heads and verify blocks alike, runs on the `matmul.lane_qmm`
     kernel, whose rows do not depend on the call; the exact verifier reproduces one-token decoding for the rest.
 
@@ -7478,7 +7507,7 @@ def _invariant_attention(queries, keys, values, scale, cache, mask):
     cache's rows each attend their keys past their left padding: the keys a row's extracted cache holds."""
     if not attention.invariant_attention_supported(queries, keys, values):
         return None
-    if type(cache) is getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None):
+    if _stores_as_kv_cache(cache):
         causal = isinstance(mask, str) and mask == "causal" or mask is None and queries.shape[2] == 1
         return attention.invariant_attention(queries, keys, values, scale) if causal else None
     batch = getattr(sys.modules.get("mlx_vlm.models.cache"), "BatchKVCache", None)
@@ -9156,7 +9185,8 @@ SPECULATIVE_FAMILIES = {
         module = "mlx_vlm.models.qwen4_exp.language", forward = "Qwen4ExpBatchInvariantForward",
         entry = "__call__", submit_layers = False, contract = _QWEN4_FORWARD_CONTRACT,
         gdn_layer = "Qwen4ExpGatedDeltaNet", gdn_norm = "Qwen4ExpRMSNormGated", gdn_contract = _QWEN4_VERIFY_GDN_CONTRACT,
-        gdn_qk_eps = _qwen4_qk_eps, gdn_l2 = True),
+        gdn_qk_eps = _qwen4_qk_eps, gdn_l2 = True, capabilities = {"attention": _QWEN4_ATTENTION_CONTRACT, "lanes": {}},
+        causal_mask = _qwen4_causal_mask),
 }
 
 

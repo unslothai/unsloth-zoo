@@ -1468,9 +1468,9 @@ def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit
     assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is native and "_unsloth_verify_scopes" not in vars(lm)
     # The first decode step and the verify block each matched on their first layer, then served every other one.
     admitted = [key for key, verdict in inference._VERIFY_VERDICTS.items() if verdict]
-    assert {key[0] for key in admitted} == {(1, 1), (1, 5), "rows alone"}
+    assert {key[0] for key in admitted} == {(1, 1), (1, 5), "rows alone", "causal chunks"}
     assert any(key[0] == "rows alone" and key[2][0] == 1 for key in admitted)
-    assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted if key[0] != "rows alone")
+    assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted if key[0] in ((1, 1), (1, 5)))
     # A drafted target settles its projections' multi-row kernels at load, through the batch-invariant forward too.
     projections = [p for _, p in lm.named_modules() if type(p).__name__ == "QuantizedLinear"]
     for p in projections:
@@ -1540,6 +1540,48 @@ def test_a_qwen4_verify_block_taped_and_fused_commits_what_stock_commits(qwen4, 
         monkeypatch.setattr(inference, "_verify_gdn_fits", lambda *args: fits.append(args) or fit(*args))
         lm(mx.array([[ids[0][24]]]), cache = _clone(cache))
         assert not fits and verify() and len(fits) == linear
+
+
+@pytest.mark.parametrize("flag, prompt", [("0", 40), ("0", 1200), ("1", 1200)])
+def test_a_qwen4_verify_block_attends_and_projects_as_its_decode_steps(qwen4, flag, prompt, monkeypatch):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference, matmul
+    if flag == "1" and not matmul.lane_qmm_available():
+        pytest.skip("the row-invariant mode needs the lane kernel")
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", flag)
+    (model, _), served, lanes, lane_qmm = qwen4, _serving(monkeypatch), [], matmul.lane_qmm
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: lanes.append(args[0].shape[0]) or lane_qmm(*args, **kwargs))
+    lm, tokens = model.language_model, [(7 * i + 3) % 1000 + 2 for i in range(prompt + 6)]
+
+    def prefilled():
+        cache = make_prompt_cache(lm)
+        mx.eval(lm(mx.array([tokens[:prompt]]), cache = cache).logits)
+        return cache
+    with inference.inference_scopes(model, ("speculative",)):
+        cache = prefilled()
+        steps = mx.concatenate([lm(mx.array([[token]]), cache = cache).logits for token in tokens[prompt:]], axis = 1)
+        for _ in range(2):  # a plan's first block checks it, the next is served
+            lanes.clear()
+            *_, transaction, logits = lm.speculative_verify_logits(mx.array([tokens[prompt:]]), prefilled(), lambda x: x)
+            transaction.abort()
+            assert _same([("logits", steps)], [("logits", logits)])
+    # Its dense-regime mask is the causal one, so its attention takes the exact route; the opt-in mode's rows the lanes.
+    assert any("causal" in str(part) for key in served for part in key)
+    assert (max(lanes, default = 0) == 6) == (flag == "1")
+
+
+def test_a_qwen4_mask_is_causal_only_while_no_row_passes_the_indexer_top_k(qwen4):
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
+    from unsloth_zoo.mlx import inference
+    attention = next(layer.self_attn for layer in qwen4[0].language_model.layers if not layer.is_linear)
+    ratio, cache = attention.indexer.compress_ratio, QSAKVCache()
+    budget = attention.indexer.block_topk * ratio
+    for offset, rows, causal in ((budget - 5, 5, True), (budget + ratio - 6, 5, True), (budget + ratio - 5, 5, False), (0, 1, True)):
+        cache.offset = offset
+        assert inference._qwen4_causal_mask(attention, cache, rows) is causal, (offset, rows)
+    padded = BatchQSAKVCache([0])
+    padded.offset = 0
+    assert not inference._qwen4_causal_mask(attention, padded, 2)
 
 
 @pytest.mark.parametrize("scoped", [False, True])
