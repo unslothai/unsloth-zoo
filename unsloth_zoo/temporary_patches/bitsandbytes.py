@@ -210,6 +210,15 @@ def _bnb_direct_tensors(qs):
     return [qs.absmax]
 
 
+def _bnb_direct_meta(qs):
+    # Everything the plan reads besides pointers: an in-place edit of any of these rebuilds it.
+    try:
+        return (qs.shape, qs.blocksize, qs.quant_type, qs.dtype,
+                (qs.state2.blocksize, qs.state2.quant_type) if qs.nested else None)
+    except Exception:
+        return None
+
+
 _PTRS_AT = getattr(torch._C, "_tensors_data_ptrs_at_indices_equal", None)
 
 
@@ -226,36 +235,44 @@ def _ptrs_equal(tensors, ptrs):
 
 
 def _bnb_direct_plan(weight, quant_state):
+    """Pointers and sizes only: holding the tensors would keep their GPU memory after an offload."""
     qs = quant_state
-    if len(qs.shape) != 2 or weight.dtype is not torch.uint8:
+    if len(qs.shape) != 2 or weight.dtype is not torch.uint8 or qs.quant_type not in ("nf4", "fp4"):
         return None
     if qs.nested and (qs.state2 is None or qs.state2.blocksize != 256 or qs.offset is None):
         return None
     tensors = _bnb_direct_tensors(qs)
-    if tensors[0].dtype is not torch.float32:
+    # bitsandbytes converts the offset to fp32 on every call; a cached copy would miss in-place updates.
+    if any(t.dtype is not torch.float32 for t in tensors[:1] + tensors[3:]):
         return None
     device = weight.get_device()
     if any(t.get_device() != device for t in tensors):
         return None  # kernel needs every pointer on one device
-    if qs.nested:
-        # matmul_4bit passes state2.absmax as absmax and the quantized absmax as absmax_8bit.
-        offset = qs.offset.to(dtype = torch.float32)
-        ptrs = (tensors[0].data_ptr(), tensors[1].data_ptr(), tensors[2].data_ptr(), offset.data_ptr())
-    else:
-        offset = None
-        ptrs = (tensors[0].data_ptr(), None, None, None)
-    return (qs, weight.data_ptr(), tensors, [t.data_ptr() for t in tensors], ptrs, offset,
+    ptrs = [t.data_ptr() for t in tensors]
+    # matmul_4bit passes state2.absmax as absmax and the quantized absmax as absmax_8bit.
+    kernel_ptrs = tuple(ptrs) if qs.nested else (ptrs[0], None, None, None)
+    return (qs, weight.data_ptr(), ptrs, kernel_ptrs, _bnb_direct_meta(qs),
             qs.shape[0], qs.shape[1], qs.blocksize, 1 if qs.quant_type == "fp4" else 2, {}, device)
+
+
+_PICKS_MAX = 1024
+_is_wrapped = getattr(getattr(torch._C, "_functorch", None), "is_functorch_wrapped_tensor", None)
+_dispatch_depth = getattr(torch._C, "_len_torch_dispatch_stack", None)
+
+
+def _plain_eager(x):
+    # Raw pointers need real storage: not traced, not a tensor subclass (FakeTensor), not vmap / functorch
+    # wrapped, and no dispatch mode on the stack.
+    if torch.compiler.is_compiling() or torch.jit.is_tracing() or type(x) is not torch.Tensor:
+        return False
+    if _is_wrapped is not None and _is_wrapped(x):
+        return False
+    return _dispatch_depth is None or _dispatch_depth() == 0
 
 
 def _bnb_4bit_direct(self, x, quant_state):
     """bitsandbytes.matmul_4bit(x, weight, bias, quant_state) for inference, or None (the caller runs it)."""
-    if torch.compiler.is_compiling() or not _BNB_DIRECT["on"]:
-        return None
-    ops = _BNB_DIRECT["ops"]
-    if ops is None:
-        ops = _bnb_direct_ops()
-    if ops is False:
+    if not _BNB_DIRECT["on"] or not _plain_eager(x):
         return None
     weight = self.weight
     bias = self.bias
@@ -265,31 +282,40 @@ def _bnb_4bit_direct(self, x, quant_state):
         or (torch.is_grad_enabled() and (x.requires_grad or (bias is not None and bias.requires_grad)))
     ):
         return None
+    ops = _BNB_DIRECT["ops"]
+    if ops is None:
+        ops = _bnb_direct_ops()
+    if ops is False:
+        return None
     plan = self.__dict__.get("_unsloth_bnb_direct")
-    # Rebuilt on requantize, move, or a replaced / recast quant tensor.
-    if plan is None or plan[0] is not quant_state or plan[1] is not None and (
-        plan[1] != weight.data_ptr() or not _ptrs_equal(_bnb_direct_tensors(quant_state), plan[3])
+    meta = _bnb_direct_meta(quant_state)
+    # Rebuilt on requantize, move, a replaced / recast quant tensor, or edited quant metadata.
+    if plan is None or plan[0] is not quant_state or plan[4] != meta or plan[1] is not None and (
+        plan[1] != weight.data_ptr() or not _ptrs_equal(_bnb_direct_tensors(quant_state), plan[2])
     ):
         try:
-            plan = _bnb_direct_plan(weight, quant_state)
+            plan = _bnb_direct_plan(weight, quant_state) if meta is not None else None
         except Exception:
             plan = None
         if plan is None:
-            plan = (quant_state, None)
+            plan = (quant_state, None, None, None, meta)
         self.__dict__["_unsloth_bnb_direct"] = plan
     if plan[1] is None:
         return None
-    _, _, _, _, ptrs, _, N, K, blocksize, quant_type, picks, device = plan
+    _, _, _, ptrs, _, N, K, blocksize, quant_type, picks, device = plan
     if x.shape[-1] != K or device != x.get_device() or (bias is not None and (
         bias.dim() != 1 or bias.get_device() != device
     )):
         return None
     M = x.numel() // K
+    if not (0 < M <= ops._gemm_4bit_custom_max_m) or K % blocksize:
+        return None  # bitsandbytes dequantizes here
     use = picks.get((M, dtype))
     if use is None:
         # Same kernel-vs-dequantize choice as torch.ops.bitsandbytes.gemm_4bit.
-        use = 0 < M <= ops._gemm_4bit_custom_max_m and K % blocksize == 0 and bool(
-            ops._gemm_4bit_use_custom_fn(x.device.index, dtype, M, N, K))
+        use = bool(ops._gemm_4bit_use_custom_fn(x.device.index, dtype, M, N, K))
+        if len(picks) >= _PICKS_MAX:
+            picks.clear()
         picks[(M, dtype)] = use
     if not use:
         return None
@@ -302,7 +328,7 @@ def _bnb_4bit_direct(self, x, quant_state):
         _BNB_DIRECT["fn"][dtype] = fn
     if fn is False:
         return None
-    key = (dtype, ptrs[1] is not None, bias is not None)
+    key = (dtype, ptrs[1] is not None, bias is not None, quant_type)
     checked = _BNB_DIRECT["checked"].get(key)
     if checked is False or checked is None and torch.cuda.is_current_stream_capturing():
         return None  # the check syncs the host

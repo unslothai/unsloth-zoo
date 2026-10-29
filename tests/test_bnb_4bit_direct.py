@@ -16,7 +16,6 @@
 
 """CPU: cgemm_4bit_* args match bitsandbytes' _gemm_4bit_kernel_impl. CUDA: outputs match bitwise."""
 import contextlib
-import types
 from types import SimpleNamespace
 
 import pytest
@@ -61,7 +60,8 @@ def lib(monkeypatch):
     monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
     monkeypatch.setitem(Z._BNB_DIRECT, "fn", {})
     monkeypatch.setitem(Z._BNB_DIRECT, "checked", {
-        (d, n, b): True for d in (torch.bfloat16, torch.float16, torch.float32) for n in (0, 1) for b in (0, 1)})
+        (d, n, b, q): True for d in (torch.bfloat16, torch.float16, torch.float32) for n in (0, 1) for b in (0, 1)
+        for q in (1, 2)})
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(Z, "BNB_4BIT_DIRECT_CALLS", {"direct": 0})
     monkeypatch.setattr(torch.ops.bitsandbytes, "gemm_4bit", SimpleNamespace(default = bops._gemm_4bit_kernel_impl))
@@ -140,7 +140,8 @@ def test_rebuilt_when_quant_tensors_change(lib):
 
 
 @pytest.mark.parametrize("case", ["grad", "bias_grad", "dtype", "compiling", "off", "no_custom", "K", "bias_2d", "fp32_view",
-                                  "not_current_device", "nested_bs", "abi", "weight_elsewhere"])
+                                  "not_current_device", "nested_bs", "abi", "activation_elsewhere",
+                                  "jit_trace", "functorch", "dispatch_mode", "subclass", "fp16_offset", "rows_over_cap"])
 def test_declines(lib, monkeypatch, case):
     layer, qs = _layer(nested = case == "nested_bs")
     x = torch.randn(1, 1, 128).to(torch.bfloat16)
@@ -171,12 +172,72 @@ def test_declines(lib, monkeypatch, case):
         qs.state2.blocksize = 128
     elif case == "abi":
         lib.cgemm_4bit_bf16.argtypes = [None] * 15  # a kernel built with another argument list
-    elif case == "weight_elsewhere":
-        x = types.SimpleNamespace(**{n: getattr(x, n) for n in ("dtype", "shape", "requires_grad", "numel")},
-                                  get_device = lambda: 1)
+    elif case == "activation_elsewhere":
+        x = x.as_subclass(_OnDevice1)
+        monkeypatch.setattr(Z, "_plain_eager", lambda x: True)
+    elif case == "jit_trace":
+        monkeypatch.setattr(torch.jit, "is_tracing", lambda: True)
+    elif case == "functorch":
+        monkeypatch.setattr(Z, "_is_wrapped", lambda x: True)  # vmap / grad transforms
+    elif case == "dispatch_mode":
+        monkeypatch.setattr(Z, "_dispatch_depth", lambda: 1)  # FakeTensorMode and friends
+    elif case == "subclass":
+        x = x.as_subclass(_OnDevice1)
+    elif case == "fp16_offset":
+        layer, qs = _layer(nested = True)
+        qs.offset = qs.offset.half()
+    elif case == "rows_over_cap":
+        monkeypatch.setattr(bops, "_gemm_4bit_custom_max_m", 0)
     with ctx:
         assert Z._bnb_4bit_direct(layer, x, qs) is None
     assert not lib.calls and Z.BNB_4BIT_DIRECT_CALLS["direct"] == 0
+
+
+class _OnDevice1(torch.Tensor):
+    def get_device(self):
+        return 1
+
+
+def test_warm_plan_follows_metadata_edits(lib):
+    layer, qs = _layer(nested = True)
+    x = torch.randn(1, 1, 128).to(torch.bfloat16)
+    with torch.no_grad():
+        Z._bnb_4bit_direct(layer, x, qs)
+        n = len(lib.calls)
+        qs.state2.blocksize = 128  # bitsandbytes raises for this nested blocksize: left to it
+        assert Z._bnb_4bit_direct(layer, x, qs) is None and len(lib.calls) == n
+        qs.state2.blocksize = 256
+        qs.quant_type = "fp4"  # requantized in place, same pointers
+        Z._bnb_4bit_direct(layer, x, qs)
+        assert lib.calls[-1][1][12] == 1
+        qs.shape = torch.Size([32, 128])  # pruned rows, same pointers
+        out = Z._bnb_4bit_direct(layer, x, qs)
+        assert out.shape[-1] == 32 and lib.calls[-1][1][9] == 32
+    # The offset is read in place on every call, never through a cached copy.
+    assert lib.calls[-1][1][5] == qs.offset.data_ptr()
+
+
+def test_plan_keeps_no_tensors_alive(lib):
+    import gc
+    import weakref
+    layer, qs = _layer(nested = True)
+    x = torch.randn(1, 1, 128).to(torch.bfloat16)
+    with torch.no_grad():
+        Z._bnb_4bit_direct(layer, x, qs)
+    old = [weakref.ref(qs.absmax), weakref.ref(qs.state2.absmax), weakref.ref(qs.offset)]
+    # What QuantState.to() does on an offload: new tensors on the same object.
+    qs.absmax, qs.state2.absmax, qs.offset = qs.absmax.clone(), qs.state2.absmax.clone(), qs.offset.clone()
+    gc.collect()
+    assert all(r() is None for r in old)
+
+
+def test_row_picks_stay_bounded(lib, monkeypatch):
+    layer, qs = _layer()
+    monkeypatch.setattr(Z, "_PICKS_MAX", 4)
+    with torch.no_grad():
+        for M in range(1, 12):
+            Z._bnb_4bit_direct(layer, torch.randn(1, M, 128).to(torch.bfloat16), qs)
+    assert len(layer.__dict__["_unsloth_bnb_direct"][9]) <= 4
 
 
 def test_bitsandbytes_api_drift_turns_it_off(lib, monkeypatch):
@@ -201,7 +262,7 @@ def test_first_call_is_checked_against_bitsandbytes(lib, monkeypatch, agree):
     with torch.no_grad():
         out = Z._bnb_4bit_direct(layer, x, qs)
         assert torch.equal(out, ref)
-        assert Z._BNB_DIRECT["checked"][(torch.bfloat16, False, True)] is agree
+        assert Z._BNB_DIRECT["checked"][(torch.bfloat16, False, True, 2)] is agree
         again = Z._bnb_4bit_direct(layer, x, qs)
     assert (again is not None) is agree
     assert Z.BNB_4BIT_DIRECT_CALLS["direct"] == (2 if agree else 0)
@@ -227,7 +288,7 @@ def test_patched_forward_takes_the_direct_path(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "NVIDIA CUDA")
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_cuda_bitwise_against_bitsandbytes(nested, dtype):
+def test_cuda_bitwise_against_bitsandbytes(nested, dtype, monkeypatch):
     Z.patch_bitsandbytes_linear4bit_forward()
     torch.manual_seed(0)
     lin = bnb.nn.Linear4bit(2880, 4096, bias = True, compute_dtype = dtype, quant_type = "nf4",
@@ -238,9 +299,9 @@ def test_cuda_bitwise_against_bitsandbytes(nested, dtype):
     for M in (1, 4, 64):
         x = torch.randn(1, M, 2880, device = "cuda", dtype = dtype)
         with torch.no_grad():
-            Z._BNB_DIRECT["on"] = False
+            monkeypatch.setitem(Z._BNB_DIRECT, "on", False)
             ref = lin(x)
-            Z._BNB_DIRECT["on"] = True
+            monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
             for _ in range(2):
                 out = lin(x)
                 assert torch.equal(out, ref), M
@@ -249,7 +310,7 @@ def test_cuda_bitwise_against_bitsandbytes(nested, dtype):
     lin.cpu().cuda()
     x = torch.randn(1, 1, 2880, device = "cuda", dtype = dtype)
     with torch.no_grad():
-        Z._BNB_DIRECT["on"] = False
+        monkeypatch.setitem(Z._BNB_DIRECT, "on", False)
         ref = lin(x)
-        Z._BNB_DIRECT["on"] = True
+        monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
         assert torch.equal(lin(x), ref)
