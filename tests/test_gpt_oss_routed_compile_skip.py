@@ -110,3 +110,126 @@ def test_routed_forwards_run_their_eager_branch_without_dynamo():
             torch._dynamo.reset()
     for fn in (routed.routed_experts_forward, routed.routed_bf16_forward, routed.routed_mlp_forward):
         assert fn.__wrapped__ is not None  # wrapped with _eager_out_of_dynamo
+
+
+# Behavioural checks on the real forwards: each one's eager branch reaches an untraceable call inside a compiled
+# frame the backend skips (every graph but the tail's is declined, as Inductor declines bfloat16 below sm80). The
+# protected forward runs that branch with Dynamo off; without the protection Dynamo converts the nested frame.
+def _skip_all_but_tail():
+    from torch._dynamo.exc import SkipFrame
+
+    def backend(gm, example_inputs):
+        if "L_y_" in gm.code:
+            return gm.forward
+        raise SkipFrame("graph not compilable here")
+    return backend
+
+
+def _tail(y):
+    return y * 3.25
+
+
+def _untraceable(t):
+    import sys
+
+    sys._getframe()  # Dynamo cannot trace this: reached only on an eager branch
+    return t + 1
+
+
+def _run_skipped(step, *args):
+    import torch._dynamo
+
+    torch._dynamo.reset()
+    try:
+        with torch.no_grad():
+            return torch.compile(step, backend = _skip_all_but_tail(), fullgraph = True)(*args)
+    finally:
+        torch._dynamo.reset()
+
+
+class _EagerProbe:
+    """An attribute read first on a forward's eager branch: a tensor op while traced (a non-empty graph, so the
+    backend sees and skips the frame), an untraceable call when run eagerly."""
+
+    def __init__(self, value):
+        self.t, self.value, self.eager_reads = torch.zeros(1), value, 0
+
+    def read(self):
+        if torch.compiler.is_compiling():
+            self.t.add(0)
+        else:
+            self.eager_reads += 1
+            _untraceable(self.t)
+        return self.value
+
+
+def test_experts_forward_eager_branch_survives_a_skipped_frame():
+    from unsloth_zoo.temporary_patches import gpt_oss_routed as routed
+
+    probe = _EagerProbe(False)
+
+    class Experts(torch.nn.Module):
+        @property
+        def training(self):
+            return probe.read()
+
+        @training.setter
+        def training(self, value):
+            pass
+
+    experts, idx, w = Experts(), torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)
+
+    def step(h):
+        out = routed.routed_experts_forward(experts, h, idx, w)
+        return _tail(h) if out is None else out
+
+    out = _run_skipped(step, torch.ones(2, 4))
+    assert probe.eager_reads == 1  # CPU inputs: the eager branch returns None after reading experts.training
+    assert torch.equal(out, torch.full((2, 4), 3.25))
+
+
+def test_bf16_forward_eager_branch_survives_a_skipped_frame(monkeypatch):
+    import types
+    from unsloth_zoo.temporary_patches import gpt_oss_routed as routed
+
+    T, H, E = 2, 4, 3
+    base = types.SimpleNamespace(hidden_size = H, gate_up_proj = torch.ones(E, H, 8), down_proj = torch.ones(E, 4, H),
+                                 gate_up_proj_bias = None, down_proj_bias = None, alpha = 1.702, limit = 7.0)
+    probe = _EagerProbe(None)
+
+    def lora_terms(experts):
+        probe.read()
+        return base, {}
+
+    monkeypatch.setattr(routed, "_lora_terms", lora_terms)
+    monkeypatch.setattr(routed, "routed_bf16_moe", lambda x, *args, **kwargs: torch.zeros(x.shape[0], H))
+    experts, idx, w = types.SimpleNamespace(), torch.zeros(T, 1, dtype = torch.long), torch.ones(T, 1)
+
+    def step(h):
+        return _tail(routed.routed_bf16_forward(experts, h, idx, w))
+
+    out = _run_skipped(step, torch.ones(T, H))
+    assert probe.eager_reads == 1
+    assert torch.equal(out, torch.zeros(T, H))
+
+
+def test_mlp_forward_eager_branch_survives_a_skipped_frame():
+    from unsloth_zoo.temporary_patches import gpt_oss_routed as routed
+
+    probe = _EagerProbe(False)
+
+    class Hidden:
+        # Stands in for hidden_states: is_cuda is the first attribute the eager branch reads.
+        @property
+        def is_cuda(self):
+            return probe.read()
+
+    mlp, hidden = torch.nn.Module(), Hidden()
+
+    def step(h):
+        out = routed.routed_mlp_forward(mlp, hidden)
+        return _tail(h) if out is None else out
+
+    out = _run_skipped(step, torch.ones(2, 4))
+    assert probe.eager_reads == 1
+    assert torch.equal(out, torch.full((2, 4), 3.25))
