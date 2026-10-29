@@ -1473,6 +1473,7 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     V3.2, MiniCPM3) take an otherwise loadable tokenizer down with them.
     """
     import transformers
+    from packaging.version import Version
     from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
     from transformers.models.auto import tokenization_auto
     from transformers.models.auto.tokenization_auto import (
@@ -1502,6 +1503,13 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
             # As AutoTokenizer in 5.x: a model_type served by a generic backend loads
             # tokenizer.json as written. Mistral Tekken repos declare LlamaTokenizerFast,
             # which rebuilds a SentencePiece decoder over their ByteLevel tokenizer.json.
+            tokenizer_class = transformers.TokenizersBackend
+        elif (
+            Version(transformers.__version__) < Version("5.7.0")
+            and model_type_class.__name__.removesuffix("Fast") != class_name.removesuffix("Fast")
+        ):
+            # Before 5.7 AutoTokenizer loads TokenizersBackend on any mismatch, which is
+            # what keeps e.g. DeepSeek-R1-Distill-Qwen (qwen2 + LlamaTokenizerFast) readable.
             tokenizer_class = transformers.TokenizersBackend
         elif _read_json_file(os.path.join(str(model_path), "config.json")).get("model_type") in getattr(
             tokenization_auto, "MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS", (),

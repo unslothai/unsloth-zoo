@@ -4544,19 +4544,22 @@ def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path)
     assert loaded("hello world")["input_ids"] == bare("hello world")["input_ids"]
 
 
-@pytest.mark.parametrize("model_type, declared, expected, hub_class_known_wrong", [
-    ("mistral", "LlamaTokenizerFast", "TokenizersBackend", False),
-    ("bart", "GPT2TokenizerFast", "GPT2Tokenizer", False),
-    ("gpt2", "LlamaTokenizerFast", "GPT2Tokenizer", True),
+@pytest.mark.parametrize("model_type, declared, expected, expected_before_5_7, hub_class_known_wrong", [
+    ("mistral", "LlamaTokenizerFast", "TokenizersBackend", "TokenizersBackend", False),
+    ("bart", "GPT2TokenizerFast", "GPT2Tokenizer", "TokenizersBackend", False),
+    ("gpt2", "LlamaTokenizerFast", "GPT2Tokenizer", "TokenizersBackend", True),
+    # DeepSeek-R1-Distill-Qwen
+    ("qwen2", "LlamaTokenizerFast", "Qwen2Tokenizer", "TokenizersBackend", True),
 ])
 def test_tokenizer_class_disagreeing_with_model_type_keeps_tokenizer_json(
-    monkeypatch, tmp_path, model_type, declared, expected, hub_class_known_wrong,
+    monkeypatch, tmp_path, model_type, declared, expected, expected_before_5_7, hub_class_known_wrong,
 ):
     """Mistral Tekken repos declare LlamaTokenizerFast over a ByteLevel tokenizer.json;
     transformers 5.x LlamaTokenizer rebuilds a SentencePiece decoder over it, so replies
     stream as raw 'Ġ'/'Ċ' pieces. AutoTokenizer loads TokenizersBackend there instead,
     keeps a declared class whenever the model_type registers a specialized one, and
-    loads that registered class for model types it lists as declaring the wrong one."""
+    loads that registered class for model types it lists as declaring the wrong one.
+    Before 5.7 it loads TokenizersBackend on any mismatch."""
     import transformers
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
     from transformers.models.auto import tokenization_auto
@@ -4564,7 +4567,11 @@ def test_tokenizer_class_disagreeing_with_model_type_keeps_tokenizer_json(
 
     if not hasattr(transformers, "TokenizersBackend"):
         pytest.skip("transformers 4.x fast classes load tokenizer.json as written")
-    if hub_class_known_wrong:
+    from packaging.version import Version
+
+    if Version(transformers.__version__) < Version("5.7.0"):
+        expected = expected_before_5_7
+    elif hub_class_known_wrong:
         # 5.17 lists qwen2 and others with a specialized class; 5.5's list has none.
         monkeypatch.setattr(tokenization_auto, "MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS", {model_type})
     text = "Hello world.\nNext line"
