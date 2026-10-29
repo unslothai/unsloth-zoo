@@ -1158,14 +1158,12 @@ def patch_vllm_graph_capture():
             gc.collect = original_gc_collect
     pass
 
-    def wrap(module, cls_name, tag):
+    def wrap(load, tag):
         try:
-            module = importlib.import_module(module)
-            cls = getattr(module, cls_name)
+            cls, log = load()
             original = cls.capture_model
             # patch_vllm() runs on every fast_inference load: nesting would repeat the cleanup per load.
             if getattr(original, "_unsloth_graph_capture", False): return
-            log = module.logger
             log.info(f"Unsloth: Patching vLLM {tag} graph capture")
 
             @wraps(original)
@@ -1187,10 +1185,18 @@ def patch_vllm_graph_capture():
             print(f"Unsloth: Could not patch vLLM {tag.upper()} graph capture: {e}")
     pass
 
-    wrap("vllm.v1.worker.gpu_model_runner", "GPUModelRunner", "v1")
+    def load_v1():
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
+        return GPUModelRunner, logger
+
+    def load_v0():
+        from vllm.worker.model_runner import GPUModelRunnerBase, logger
+        return GPUModelRunnerBase, logger
+
+    wrap(load_v1, "v1")
     # vLLM v0 is deprecated in vLLM v0.11.0.
     if Version(vllm.__version__) < Version("0.11.0"):
-        wrap("vllm.worker.model_runner", "GPUModelRunnerBase", "v0")
+        wrap(load_v0, "v0")
 pass
 
 
