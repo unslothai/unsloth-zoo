@@ -272,7 +272,7 @@ def test_a_projection_with_more_bits_is_split_and_costed_at_its_own(monkeypatch)
     assert (mx.abs(split - native).max() / mx.abs(native).max()).item() < 0.05
     assert mixed.__dict__[ane._STATE].rest[2].bits == 5
     k = CHANNELS // 2
-    assert ane._split_bytes(mixed, k) - ane._split_bytes(uniform, k) == HIDDEN * (CHANNELS - k) // 8
+    assert ane._split_bytes(mixed, k) == ane._split_bytes(uniform, k) == 3 * 3 * k * HIDDEN   # remainders are views
     ane.release_ane_prefill(model)
 
 
@@ -335,10 +335,9 @@ def test_free_memory_admits_layers_by_their_own_cost(monkeypatch):
     nn.quantize(model, group_size = 64, bits = 4, class_predicate = lambda path, m: hasattr(m, "to_quantized") and (
         {"group_size": 64, "bits": 8} if path.startswith("layers.0") else True))
     model.eval()
-    # the wired cost of int8 gate/up/down rows for 512 channels, plus the GPU's copy of down's other 512 columns and
-    # its scales/biases
+    # the wired cost of int8 gate/up/down rows for 512 channels; the GPU remainders are views of the checkpoint
     four, eight = ane._split_bytes(model.layers[1], 512), ane._split_bytes(model.layers[0], 512)
-    assert four == 3 * 3 * 512 * 256 + 256 * 512 // 2 + 2 * 256 * 8 * 2 and eight == four + 256 * 512 // 2
+    assert four == eight == 3 * 3 * 512 * 256
     for budget, layers in ((four + eight - 1, 1), (four + eight, 2), (min(four, eight) - 1, 0)):
         monkeypatch.setattr(ane, "_memory_budget", lambda: budget)
         status = ane.prepare_ane_prefill(model, tile = TILE, share = 0.5)

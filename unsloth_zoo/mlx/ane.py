@@ -586,10 +586,8 @@ def _program(mlp, k, tile):
 
 def _split_bytes(mlp, k):
     """Memory a split adds to the checkpoint's: what the Neural Engine wires for its int8 weights, outside the process,
-    while prefill runs, and the GPU's copy of down's remaining columns (the gate and up remainders are views)."""
-    down = _projections(mlp)[2]
-    hidden, rest = down.weight.shape[0], _mlp_shape(mlp)[1] - k
-    return _WIRED_FACTOR * 3 * k * hidden + hidden * rest * down.bits // 8 + 2 * hidden * rest // down.group_size * down.scales.itemsize
+    while prefill runs. The GPU remainders are views of the checkpoint's tensors."""
+    return _WIRED_FACTOR * 3 * k * _projections(mlp)[2].weight.shape[0]
 
 
 class _VMStatistics(ctypes.Structure):
@@ -669,8 +667,9 @@ def _remainder(p, rows = None, columns = None):
     if rows is not None:
         weight, scales, biases = weight[rows:], scales[rows:], biases[rows:]
     if columns is not None:
-        weight = mx.contiguous(weight[:, columns * p.bits // 32:])
-        scales, biases = mx.contiguous(scales[:, columns // p.group_size:]), mx.contiguous(biases[:, columns // p.group_size:])
+        # Strided views: the matmul copies them per call, a temporary instead of a resident copy per layer.
+        groups = columns // p.group_size
+        weight, scales, biases = weight[:, columns * p.bits // 32:], scales[:, groups:], biases[:, groups:]
     piece = nn.QuantizedLinear(p.group_size, 1, bias = False, group_size = p.group_size, bits = p.bits)
     piece.weight, piece.scales, piece.biases = weight, scales, biases
     piece.freeze()
