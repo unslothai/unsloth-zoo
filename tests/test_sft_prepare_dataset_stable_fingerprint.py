@@ -25,6 +25,7 @@ import textwrap
 
 import pytest
 
+torch = pytest.importorskip("torch")
 datasets = pytest.importorskip("datasets")
 transformers = pytest.importorskip("transformers")
 
