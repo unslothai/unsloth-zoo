@@ -31,6 +31,7 @@ __all__ = [
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
 from .device_type import DEVICE_TYPE
+from ._gc_passes import collect_garbage
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
@@ -75,7 +76,6 @@ def patch_compiling_bitsandbytes():
                 if not hasattr(layer, "forward"): continue
                 if hasattr(layer.forward, "__wrapped__"): continue
                 layer.forward = torch._disable_dynamo(layer.forward)
-            pass
         pass
     pass
 
@@ -97,7 +97,6 @@ def patch_layernorm(fast_layernorm):
         class Unsloth_LayerNorm(LayerNorm):
             def forward(self, X):
                 return fast_layernorm(self, X)
-            pass
         pass
 
         torch.nn.LayerNorm = Unsloth_LayerNorm
@@ -652,7 +651,6 @@ def patch_model_and_tokenizer(
                 buffer.data = buffer.data.to(buffer._pre_set_compute_dtype)
             elif buffer.dtype == torch.bfloat16:
                 buffer.data = buffer.data.to(torch.float16)
-        pass
     elif correct_dtype == torch.float16:
         # A pre-quantized checkpoint keeps its skipped layers and biases in the bfloat16 it was saved in. On a GPU without bfloat16 (T4) Inductor skips every graph reading one, so a non-reentrant checkpoint recompute stops matching its forward (unsloth#3459).
         # A module pin covers its whole subtree: the pass below moves it with module.to().
@@ -861,10 +859,7 @@ def patch_model_and_tokenizer(
     pass
 
     # Clear deleted GPU items
-    for _ in range(3):
-        gc.collect()
-        if DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
-        else: torch.cuda.empty_cache()
+    collect_garbage(after = torch.xpu.empty_cache if DEVICE_TYPE == "xpu" else torch.cuda.empty_cache)
     return model, tokenizer
 pass
 

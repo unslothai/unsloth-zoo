@@ -109,7 +109,6 @@ def process_return(
             return output_class(**return_dict)
         except Exception as e:
             raise RuntimeError(str(e))
-    pass
 pass
 
 # Get Unpack (Python 3.10 lacks t.Unpack).
@@ -2573,7 +2572,6 @@ def patch_function(
         if UNSLOTH_ENABLE_LOGGING:
             logger.error(f"Unsloth: Failed to patch {target_obj.__name__}.{attr_name}: {e}")
         return False
-    pass
 pass
 
 
@@ -2654,6 +2652,5 @@ def restore_original(
         if UNSLOTH_ENABLE_LOGGING:
             logger.error(f"Unsloth: Failed to restore {attr_name}: {e}")
         return False
-pass
 
 

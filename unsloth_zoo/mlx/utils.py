@@ -3222,8 +3222,16 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     return loss_fn
 
 
-# gemma4_unified shares the text model but its `Model.__call__` drops `mm_token_type_ids`.
-_VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4"})
+# Forwarded only where `Model.__call__` does too, so both losses agree (stock gemma4_unified drops it).
+_VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4", "gemma4_unified"})
+
+
+@lru_cache(maxsize=None)
+def _call_forwards_mm_token_type_ids(call):
+    try:
+        return "mm_token_type_ids" in inspect.getsource(call)
+    except (OSError, TypeError):
+        return False
 
 
 def _drop_pair_token_type_ids(batch_dict, kwargs):
@@ -3409,6 +3417,7 @@ def _vlm_hidden_states(model, batch_dict):
         "mm_token_type_ids" in extra_kwargs
         and _config_get(getattr(model, "config", None), "model_type")
         in _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES
+        and _call_forwards_mm_token_type_ids(getattr(type(model), "__call__", None))
     ):
         backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 
@@ -7172,6 +7181,8 @@ class _AudioVersions(NamedTuple):
 # `_ensure_audio_conv_sanitize` cannot repair it: it keys on markers in the
 # sanitize source, and Nemotron's `Model.sanitize` delegates to a module-level
 # function carrying neither.
+#
+# LFM3 Audio / Omni: measured on 0.7.11 against LiquidAI/LFM3-Audio-2B and LFM3-Omni-2B.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4"),
     "gemma4": _AudioVersions("0.6.2"),
@@ -7180,6 +7191,8 @@ _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "qwen3_omni_moe": _AudioVersions("0.6.7"),
     "phi4mm": _AudioVersions("0.4.4"),
     "minicpmo": _AudioVersions("0.4.4"),
+    "lfm3_audio": _AudioVersions("0.7.11"),
+    "lfm3_omni": _AudioVersions("0.7.11"),
 }
 
 # Families probed only on a newer transformers than this package pins, at the
@@ -9125,9 +9138,10 @@ def _processor_vlm_inputs(
         # caller's processor stays as mlx-vlm made it.
         processor = _audio_repaired_processor(processor)
     if truncation:
-        base_kwargs["truncation"] = True
-        if max_seq_length is not None:
-            base_kwargs["max_length"] = max_seq_length
+        base_kwargs.update(_drop_unsupported_processor_kwargs(processor, {
+            "truncation": True,
+            **({} if max_seq_length is None else {"max_length": max_seq_length}),
+        }))
         if audio is not None:
             # `max_length` is a token budget, but transformers' `_merge_kwargs`
             # fans a flat keyword out to *every* modality that declares it, and

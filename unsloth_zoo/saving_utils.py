@@ -159,7 +159,6 @@ def add_vllm_namespace_skip_module_aliases(skipped_modules):
                 if alias in seen: continue
                 seen.add(alias)
                 aliases.append(alias)
-        pass
     pass
     if not aliases: return skipped_modules
     return list(skipped_modules) + sorted(aliases)
@@ -197,7 +196,6 @@ def add_vllm_fused_skip_module_aliases(skipped_modules):
             if alias in seen: continue
             seen.add(alias)
             aliases.append(alias)
-        pass
     pass
     if not aliases: return skipped_modules
     return list(skipped_modules) + sorted(aliases)
@@ -242,7 +240,6 @@ def drop_skip_module_aliases_that_widen(skipped_modules, aliased, module_names):
                 # Treat that as unsafe and drop the alias.
                 widens = True
             if widens: safe.discard(alias)
-        pass
     pass
     if len(safe) == len(added): return aliased
     return list(skipped_modules) + [alias for alias in added if alias in safe]
@@ -939,7 +936,6 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             elif name in remove_keys: continue
 
             state_dict[name] = param
-        pass
     else:
         state_dict = None
     pass
@@ -3850,11 +3846,12 @@ def _is_export_source_loaded_repo(model_name, model):
 pass
 
 
-def _read_export_base_config(model_name, token, model, source_is_loaded_repo = False):
+def _read_export_base_config(model_name, token, model, source_is_loaded_repo = False, commit = None):
     # Repo code re-runs only for the exact repo (and Hub commit) the load trusted; siblings were never approved.
     from transformers import AutoConfig
     try:
-        return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False)
+        pinned = {"revision": commit} if commit else {}
+        return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False, **pinned)
     except Exception:
         if not (source_is_loaded_repo and _loaded_with_trust_remote_code(model)): raise
         commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
@@ -4042,7 +4039,6 @@ def _carry_over_vocab_pad_records(base_config, trained_config):
         # The first holder is get_text_config(), which vllm_utils._padded_vocab_ids reads.
         try: setattr(targets[0], key, list(ids))
         except Exception: pass
-    pass
 pass
 
 
@@ -4461,7 +4457,7 @@ def _find_quantization_config(config):
 pass
 
 
-def _compressed_tensors_quantization_config(model_name, token = None):
+def _compressed_tensors_quantization_config(model_name, token = None, commit = None):
     config = None
     try:
         if os.path.isdir(str(model_name)):
@@ -4469,7 +4465,8 @@ def _compressed_tensors_quantization_config(model_name, token = None):
         else:
             from huggingface_hub import hf_hub_download
             repo_id, revision = _hub_repo_and_revision(model_name)
-            path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token, revision = revision)
+            path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token,
+                                   revision = revision or commit)
         with open(path, "r", encoding = "utf-8") as f:
             config = json.load(f)
     except Exception:
@@ -4487,9 +4484,9 @@ def _compressed_tensors_quantization_config(model_name, token = None):
 pass
 
 
-def _compressed_packed_format(model_name, token = None):
+def _compressed_packed_format(model_name, token = None, commit = None):
     """``"mxfp4-pack-quantized"`` if every packed group is MXFP4, else the formats found; None if unpacked."""
-    quant = _compressed_tensors_quantization_config(model_name, token)
+    quant = _compressed_tensors_quantization_config(model_name, token, commit)
     if quant is None:
         return None
     top = quant.get("format")
@@ -4504,9 +4501,9 @@ pass
 _INT_PACKED_SUFFIXES = ("weight_packed", "weight_scale", "weight_shape", "weight_zero_point", "weight_g_idx")
 
 
-def _compressed_int_pack_schemes(model_name, token = None):
+def _compressed_int_pack_schemes(model_name, token = None, commit = None):
     """Weight args of every group of an all-``pack-quantized`` checkpoint; RuntimeError if not exactly decodable."""
-    quant = _compressed_tensors_quantization_config(model_name, token) or {}
+    quant = _compressed_tensors_quantization_config(model_name, token, commit) or {}
     refuse = lambda why: RuntimeError(  # noqa: E731
         f"Unsloth: `{model_name}` stores its weights compressed-tensors packed (pack-quantized) "
         f"and {why}, so a merged_16bit export of it is not supported. Nothing was written. Save "
@@ -4565,6 +4562,20 @@ def _pick_int_scheme(base, schemes, packed_shape, scale_shape, logical_shape, ha
 pass
 
 
+def _read_tensors_by_shard(save_directory, locations, names):
+    """`{name: tensor}` in `names` order, opening each shard once and closing it before the next."""
+    by_shard = {}
+    for name in names:
+        by_shard.setdefault(locations[name], []).append(name)
+    tensors = {}
+    for filename, keys in by_shard.items():
+        with safe_open(os.path.join(save_directory, filename), framework = "pt", device = "cpu") as f:
+            for key in keys:
+                tensors[key] = f.get_tensor(key)
+    return {name: tensors[name] for name in names}
+pass
+
+
 def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
     """All refusals happen here, before any shard is touched; companions in other shards are read up front."""
     locations, shapes, stored_shapes = {}, {}, {}
@@ -4577,11 +4588,7 @@ def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
                 elif key.endswith(".weight_shape"):
                     stored_shapes[key] = tuple(int(x) for x in f.get_tensor(key).tolist())
 
-    def read(key):
-        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
-            return f.get_tensor(key)
-
-    bases, logical, elsewhere = {}, {}, {}
+    bases, logical, elsewhere = {}, {}, []
     for key in sorted(k for k in locations if k.endswith("_packed")):
         base = key[: -len(".weight_packed")]
         if not key.endswith(".weight_packed") or len(shapes[key]) != 2 or base + ".weight_scale" not in locations:
@@ -4604,7 +4611,8 @@ def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
         for suffix in _INT_PACKED_SUFFIXES[1:]:
             companion = base + "." + suffix
             if companion in locations and locations[companion] != locations[key]:
-                elsewhere[companion] = read(companion)
+                elsewhere.append(companion)
+    elsewhere = _read_tensors_by_shard(save_directory, locations, elsewhere)
     return dict(bases = bases, logical = logical, elsewhere = elsewhere)
 pass
 
@@ -4828,15 +4836,11 @@ def _plan_compressed_mxfp4_rewrite(save_directory, filenames, model):
                 f"{(packed_shape[0], packed_shape[1] * 2)}. Nothing was merged."
             )
 
-    def read(key):
-        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
-            return f.get_tensor(key)
-
-    elsewhere = {
-        base + ".weight_scale": read(base + ".weight_scale")
+    elsewhere = _read_tensors_by_shard(save_directory, locations, [
+        base + ".weight_scale"
         for base in packed_bases
         if locations[base + ".weight_scale"] != locations[base + ".weight_packed"]
-    }
+    ])
     return dict(
         stacks = stacks, keys_of = keys_of, shapes = shapes, packed_bases = packed_bases,
         targets = targets, elsewhere = elsewhere, deltas = {},
@@ -5465,8 +5469,10 @@ def merge_and_overwrite_lora(
     pass
 
     # Default handle 16 bit merge and save/push
+    # Config reads at the shard commit: same files as the weights, and answered from the Hub cache.
+    _config_commit = None if is_local_path else _hub_revision
     # Before Step 1: an in-place export overwrites the source config.json without its quantization config.
-    _ct_packed_format = _compressed_packed_format(model_name, token) if save_method == "merged_16bit" else None
+    _ct_packed_format = _compressed_packed_format(model_name, token, _config_commit) if save_method == "merged_16bit" else None
     if _ct_packed_format is not None and _ct_packed_format not in ("mxfp4-pack-quantized", "pack-quantized"):
         raise RuntimeError(
             f"Unsloth: `{model_name}` stores its weights compressed-tensors packed "
@@ -5480,7 +5486,7 @@ def merge_and_overwrite_lora(
             f"is stored quantized ({quant_type or _ct_packed_format}). Nothing was merged. Use "
             f"`output_dtype = None` for the default 16-bit merge."
         )
-    _ct_int_schemes = _compressed_int_pack_schemes(model_name, token) if _ct_packed_format == "pack-quantized" else None
+    _ct_int_schemes = _compressed_int_pack_schemes(model_name, token, _config_commit) if _ct_packed_format == "pack-quantized" else None
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
         # `config` is `model.config`, already the nested text config under `text_only = True`,
@@ -5491,6 +5497,7 @@ def merge_and_overwrite_lora(
             base_config = _read_export_base_config(
                 model_name, token, model,
                 source_is_loaded_repo = _is_export_source_loaded_repo(model_name, model),
+                commit = _config_commit,
             )
         except Exception as base_config_error:
             warnings.warn(
@@ -5507,7 +5514,7 @@ def merge_and_overwrite_lora(
             loaded_commit = _trusted_code_commit(model) if _is_export_source_loaded_repo(model_name, model) else None
             source_model_type = _source_config_model_type(model_name, token, loaded_commit)
         elif getattr(type(base_config), "attribute_map", None):
-            source_config = _source_config_dict(model_name, token)
+            source_config = _source_config_dict(model_name, token, _config_commit)
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
             _restore_source_model_type(Path(save_directory) / "config.json", source_model_type)
@@ -6814,6 +6821,41 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefix
     return False
 pass
 
+def _build_reversed_key_index(safetensor_keys):
+    """Sorted (reversed key, position) pairs + keys; None unless plain str keys in a list/tuple/set/frozenset (caller keeps the linear scan)."""
+    if type(safetensor_keys) not in (list, tuple, set, frozenset):
+        return None
+    keys = safetensor_keys if type(safetensor_keys) in (list, tuple) else list(safetensor_keys)
+    index = []
+    for position, key in enumerate(keys):
+        if type(key) is not str:
+            return None
+        index.append((key[::-1], position))
+    index.sort()
+    return index, keys
+pass
+
+def _indexed_prefix_candidates(index, keys, k):
+    """Same list, in the same order, as the linear scan in `_infer_prefix_and_remap`."""
+    import bisect
+    candidates = []
+    for suffix in (k + ".weight", k + ".linear.weight"):
+        reversed_suffix = suffix[::-1]
+        start = end = bisect.bisect_left(index, (reversed_suffix,))
+        while end < len(index) and index[end][0].startswith(reversed_suffix):
+            end += 1
+        for position in sorted(position for _, position in index[start:end]):
+            prefix = keys[position][: -len(suffix)]
+            if prefix:
+                candidates.append(prefix)
+    return list(dict.fromkeys(candidates))
+pass
+
+def _component_signature(parts):
+    """A vote needs equal prefix multisets over a shared suffix, so equal full multisets: pairs with different signatures never vote."""
+    return tuple(sorted(p for p in parts if p))
+pass
+
 def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     """Infer missing key prefixes by matching LoRA keys against safetensor keys.
 
@@ -6834,6 +6876,7 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     changed = False
     inferred_prefixes = []  # track prefixes from successful per-key matches
     unmatched_keys = []     # keys that couldn't be matched at all
+    suffix_index, suffix_index_built = None, False
 
     for k, v in lora_weights.items():
         if not isinstance(k, str):
@@ -6845,12 +6888,17 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             continue
         # unique prefix candidates; also accept a .linear.weight shard (Gemma4) so a
         # prefix-add onto it is not dropped.
-        candidates = list(dict.fromkeys(
-            sf_key[: -len(suffix)]
-            for suffix in (k + ".weight", k + ".linear.weight")
-            for sf_key in safetensor_keys
-            if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
-        ))
+        if not suffix_index_built:
+            suffix_index, suffix_index_built = _build_reversed_key_index(safetensor_keys), True
+        if suffix_index is not None and type(k) is str:
+            candidates = _indexed_prefix_candidates(*suffix_index, k)
+        else:
+            candidates = list(dict.fromkeys(
+                sf_key[: -len(suffix)]
+                for suffix in (k + ".weight", k + ".linear.weight")
+                for sf_key in safetensor_keys
+                if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
+            ))
         if len(candidates) == 1:
             remapped[candidates[0] + k] = v
             inferred_prefixes.append(candidates[0])
@@ -6874,15 +6922,17 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             if module_key is None:
                 continue
             sf_parts = module_key.split(".")
+            signature = _component_signature(sf_parts)
             for sl in range(1, min(3, len(sf_parts)) + 1):
-                sf_parts_by_suffix[(sl, tuple(sf_parts[-sl:]))].append(sf_parts)
+                sf_parts_by_suffix[(signature, sl, tuple(sf_parts[-sl:]))].append(sf_parts)
         for k, _ in unmatched_keys:
             if not isinstance(k, str):
                 continue
             k_parts = k.split(".")
+            signature = _component_signature(k_parts)
             seen_sf = set()
             for sl in range(min(3, len(k_parts)), 0, -1):
-                for sf_parts in sf_parts_by_suffix.get((sl, tuple(k_parts[-sl:])), ()):
+                for sf_parts in sf_parts_by_suffix.get((signature, sl, tuple(k_parts[-sl:])), ()):
                     sf_id = tuple(sf_parts)
                     if sf_id in seen_sf:        # process each sf once, at its longest match
                         continue
@@ -9190,7 +9240,6 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Direct tensor write failed for {output_key}: {e}")
         return False
-pass
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #

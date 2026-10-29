@@ -2707,7 +2707,22 @@ def _config_source_has_modality(package_dir: Path) -> bool:
             }
             if fields.intersection(_VLM_MODALITY_CONFIG_FIELDS):
                 return True
+            # Built in __post_init__, as LFM3-Audio's audio_encoder_config.
+            for item in ast.walk(node):
+                if isinstance(item, ast.Assign) and not (isinstance(item.value, ast.Constant) and item.value.value is None):
+                    for target in item.targets:
+                        if (
+                            isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                            and target.value.id == "self" and _names_modality_config(target.attr)
+                        ):
+                            return True
     return False
+
+
+def _names_modality_config(name: str) -> bool:
+    return name in _VLM_MODALITY_CONFIG_FIELDS or (
+        name.endswith("_config") and ("audio" in name or "vision" in name)
+    )
 
 
 def _build_vlm_model_types():
@@ -3782,6 +3797,27 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
 
     cls.sanitize = patched_sanitize
     _SAFE_TEXT_SANITIZE_PATCHED.add(module_name)
+
+
+def _ensure_qwen3_5_mtp_norm_sanitize() -> None:
+    # mlx-lm < 0.32 adds +1 to norms whenever `mtp.*` keys exist, even on converted
+    # checkpoints (ml-explore/mlx-lm#1623); sanitize drops those keys anyway, so drop them first.
+    try:
+        module = importlib.import_module("mlx_lm.models.qwen3_5")
+    except (Exception, SystemExit):
+        return
+    cls = getattr(module, "TextModel", None)
+    sanitize = getattr(cls, "sanitize", None)
+    if sanitize is None or hasattr(sanitize, "__wrapped__"):
+        return
+    if "has_mtp_weights" not in _safe_getsource(sanitize):
+        return
+
+    @wraps(sanitize)
+    def patched_sanitize(self, weights):
+        return sanitize(self, {k: v for k, v in weights.items() if "mtp." not in k})
+
+    cls.sanitize = patched_sanitize
 
 
 # No installed mlx-vlm wrapper demands more than two.
@@ -10842,6 +10878,7 @@ class FastMLXModel:
                         stacklevel=2,
                     )
             _ensure_safe_text_wrapper_sanitize(model_type)
+            _ensure_qwen3_5_mtp_norm_sanitize()
 
             mlx_load_kwargs = dict(
                 tokenizer_config=extra_kwargs if extra_kwargs else None,

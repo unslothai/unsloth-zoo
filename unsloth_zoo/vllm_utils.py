@@ -513,7 +513,6 @@ if importlib.util.find_spec("vllm") is not None:
         # the install instructions, so leave the rest of this module usable.
         def _apply_4bit_weight(self, layer, x, bias = None):
             raise RuntimeError("Unsloth: `pip install vllm-bnb-plugin` for load_in_4bit.")
-        pass
     elif not hasattr(_vllm_bnb, "apply_bnb_4bit"):
         # Make the compute dtype dynamic instead of forcing torch.bfloat16
         def _apply_4bit_weight(
@@ -566,7 +565,6 @@ if importlib.util.find_spec("vllm") is not None:
                 out += bias
 
             return out
-        pass
     else:
         # Newer vLLM versions have _apply_bnb_4bit
         apply_bnb_4bit = _vllm_bnb.apply_bnb_4bit
@@ -621,10 +619,10 @@ if importlib.util.find_spec("vllm") is not None:
         except:
             # vLLM config refactor: this import isn't backwards compatible.
             from vllm.config.model import logger as vllm_config_logger
-        vllm_config_logger.addFilter(HideLoggingMessage("not supported"))
-        vllm_config_logger.addFilter(HideLoggingMessage("is not tested"))
-        vllm_config_logger.addFilter(HideLoggingMessage("is not fully optimized"))
-        vllm_config_logger.addFilter(HideLoggingMessage("not set"))
+        hidden = {getattr(f, "text", None) for f in vllm_config_logger.filters if isinstance(f, HideLoggingMessage)}
+        for text in ("not supported", "is not tested", "is not fully optimized", "not set"):
+            if text not in hidden:
+                vllm_config_logger.addFilter(HideLoggingMessage(text))
         del vllm_config_logger
     pass
 
@@ -639,7 +637,6 @@ if importlib.util.find_spec("vllm") is not None:
             kwargs["bnb_4bit_compute_dtype"] = _resolve_bnb_compute_dtype(kwargs)
             print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
             super().__init__(*args, **kwargs)
-        pass
     pass
 
     def patch_vllm_compute_dtype(dtype = torch.float16):
@@ -732,7 +729,6 @@ if importlib.util.find_spec("vllm") is not None:
         except:
             pass
         return
-    pass
 else:
     def patch_vllm_bitsandbytes():
         return
@@ -839,7 +835,6 @@ if _bitsandbytes_is_usable():
                 compute_dtype = getattr(torch, compute_dtype)
                 kwargs["compute_dtype"] = compute_dtype
             super().__init__(*args, **kwargs)
-        pass
     pass
 
     def patch_bitsandbytes_quant_state():
@@ -859,7 +854,6 @@ if _bitsandbytes_is_usable():
     def unpatch_bitsandbytes_compute_dtype():
         del os.environ["UNSLOTH_bnb_4bit_compute_dtype"]
         return
-    pass
 else:
     def patch_bitsandbytes_quant_state():
         return
@@ -1034,7 +1028,6 @@ def patch_vllm_enable_sleep_mode():
                         _memcpy(ptr, cpu_ptr, size_in_bytes, handle[0], to_device = True)
                         data.cpu_backup_tensor = None
             pass
-        pass
     pass
 
     def delete_memory():
@@ -1063,6 +1056,9 @@ def patch_vllm_enable_sleep_mode():
     pass
 
     def get_patched_generate(original_generate):
+        # patch_vllm() runs on every load: a nested wrapper would wake_up() once per earlier load.
+        if getattr(original_generate, "_unsloth_wake_on_generate", False):
+            return original_generate
         def check_sleep_mode(self):
             engine = getattr(self, "llm_engine", self)
             return hasattr(engine, "vllm_config") and hasattr(engine.vllm_config, "model_config") and getattr(engine.vllm_config.model_config, "enable_sleep_mode", False)
@@ -1074,6 +1070,7 @@ def patch_vllm_enable_sleep_mode():
             if check_sleep_mode(self):
                 self.wake_up()
             return original_generate(self,*args, **kwargs)
+        new_generate._unsloth_wake_on_generate = True
         return new_generate
     pass
 
@@ -1154,58 +1151,45 @@ def patch_vllm_graph_capture():
             gc.collect = original_gc_collect
     pass
 
-    # Patch vLLM v1
-    try:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
-        logger.info('Unsloth: Patching vLLM v1 graph capture')
-        original_capture_model_v1 = GPUModelRunner.capture_model
-
-        @wraps(original_capture_model_v1)
-        def capture_model_wrapper_v1(self, *args, **kwargs):
-            logger.info("Unsloth: Running patched vLLM v1 `capture_model`.")
-            start_time = time.perf_counter()
-
-            with suppress_gc_collect():
-                result = original_capture_model_v1(self, *args, **kwargs)
-
-            end_time = time.perf_counter()
-            logger.info(
-                "Unsloth: Patched vLLM v1 graph capture finished in %.0f secs.",
-                end_time - start_time
-            )
-            collect_garbage(passes = 2, after = _device_empty_cache)
-            return result
-        pass
-        GPUModelRunner.capture_model = capture_model_wrapper_v1
-    except Exception as e:
-        print(f"Unsloth: Could not patch vLLM V1 graph capture: {e}")
-
-    if Version(vllm.__version__) < Version("0.11.0"):
-        # Also patch vLLM v0. vLLM v0 is deprecated in vLLM v0.11.0 so only do when appropriate.
+    def wrap(load, tag):
         try:
-            from vllm.worker.model_runner import GPUModelRunnerBase, logger
-            logger.info('Unsloth: Patching vLLM v0 graph capture')
-            original_capture_model_v0 = GPUModelRunnerBase.capture_model
+            cls, log = load()
+            original = cls.capture_model
+            # patch_vllm() runs on every fast_inference load: nesting would repeat the cleanup per load.
+            if getattr(original, "_unsloth_graph_capture", False): return
+            log.info(f"Unsloth: Patching vLLM {tag} graph capture")
 
-            @wraps(original_capture_model_v0)
-            def capture_model_wrapper_v0(self, *args, **kwargs):
-                logger.info("Unsloth: Running patched vLLM v0 `capture_model`.")
+            @wraps(original)
+            def capture_model(self, *args, **kwargs):
+                log.info(f"Unsloth: Running patched vLLM {tag} `capture_model`.")
                 start_time = time.perf_counter()
-
                 with suppress_gc_collect():
-                    result = original_capture_model_v0(self, *args, **kwargs)
-
-                end_time = time.perf_counter()
-                logger.info(
-                    "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
-                    end_time - start_time
+                    result = original(self, *args, **kwargs)
+                log.info(
+                    f"Unsloth: Patched vLLM {tag} graph capture finished in %.0f secs.",
+                    time.perf_counter() - start_time,
                 )
                 collect_garbage(passes = 2, after = _device_empty_cache)
                 return result
             pass
-            GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
+            capture_model._unsloth_graph_capture = True
+            cls.capture_model = capture_model
         except Exception as e:
-            print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
+            print(f"Unsloth: Could not patch vLLM {tag.upper()} graph capture: {e}")
+    pass
+
+    def load_v1():
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
+        return GPUModelRunner, logger
+
+    def load_v0():
+        from vllm.worker.model_runner import GPUModelRunnerBase, logger
+        return GPUModelRunnerBase, logger
+
+    wrap(load_v1, "v1")
+    # vLLM v0 is deprecated in vLLM v0.11.0.
+    if Version(vllm.__version__) < Version("0.11.0"):
+        wrap(load_v0, "v0")
 pass
 
 
@@ -1975,7 +1959,6 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     if len(failures) > 0:
         error_message = "\n".join([f"[{key}]\n{str(error)}" for key, error in failures.items()])
         raise RuntimeError(f"Unsloth: Failed comparing state_dict with {len(failures)}: {error_message}")
-    pass
 pass
 
 def _refresh_placeholder_dims(parent, attr_name, weight):
@@ -2450,7 +2433,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             # model.layers.0.* -> model.layers[0].*
             layer_name = re.sub(r"\.([\d]{1,})", lambda x: f"[{x.group(1)}]", layer_name)
             exec(f"new_model.{layer_name} = layer")
-        pass
     pass
 
     set_additional_modules(new_model, quant_state_dict, config)
@@ -5630,10 +5612,9 @@ pass
 @torch.inference_mode
 def save_lora(model, save_directory, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
-    state_dict = model.state_dict()
     dtype = model.get_input_embeddings().weight.dtype
     # Cast LoRA to float16 / bfloat16
-    state_dict = {k:v.to(dtype) for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+    state_dict = {k:v.to(dtype) for k, v in _lora_state_dict(model).items()}
     kwargs["state_dict"] = state_dict
     rank, world_size = _distributed_rank_and_world()
     if world_size <= 1 or kwargs.get("push_to_hub", False):
@@ -6607,7 +6588,6 @@ class _MergedRolloutVerdict:
     def is_valid_for(self, model):
         if tuple(getattr(model, "peft_config", None) or ()) != self.adapters: return False
         return [_merged_rollout_layer_key(module) for module in _merged_rollout_lora_layers(model)] == self.keys
-    pass
 pass
 
 
@@ -6630,7 +6610,6 @@ class _MergedRolloutState(_MergedRolloutVerdict):
         self.engine_ref = _merged_rollout_ref(getattr(model, "vllm_engine", None))
         # Every LoRA layer, folded or not: is_valid_for compares against all of them.
         super().__init__(model, _merged_rollout_lora_layers(model))
-    pass
 pass
 
 
@@ -6653,7 +6632,6 @@ class _MergedLoRARequest:
     pass
     def __repr__(self):
         return f"_MergedLoRARequest(targets = {len(self.state.entries)})"
-    pass
 pass
 
 
@@ -6769,9 +6747,60 @@ def _merged_rollout_targets(model):
 pass
 
 
+def _lora_is_sharded(model):
+    """True when FSDP2 holds the adapters as DTensors. Only True is cached: sharding happens after load."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if model.__dict__.get("_unsloth_lora_is_sharded"): return True
+    # DTensors need a process group, so a single process never walks the parameters.
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return False
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:
+        return False
+    # First adapter decides; avoids walking every parameter on each load_lora.
+    sharded = False
+    for n, p in model.named_parameters():
+        if ".lora_A." in n or ".lora_B." in n:
+            sharded = isinstance(p, DTensor)
+            break
+    if sharded: model.__dict__["_unsloth_lora_is_sharded"] = True
+    return sharded
+pass
+
+
+def _lora_state_dict(model):
+    """Full lora_A / lora_B tensors. Under FSDP2: gathered (collective on every rank), and taken outside
+    inference mode, where FSDP2 state_dict fails with "Cannot set version_counter for inference tensor"."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    def lora_items(state_dict):
+        return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+    if not _lora_is_sharded(model):
+        return lora_items(model.state_dict())
+    from torch.distributed.tensor import DTensor
+    _merged_rollout_log_once(
+        "Unsloth: native FSDP2 gathers the LoRA adapters across ranks for save_lora / load_lora, "
+        "so every rank must call them (a call on rank 0 alone waits for the others)."
+    )
+    with torch.inference_mode(False), torch.no_grad():
+        return {
+            k: (v.full_tensor() if isinstance(v, DTensor) else v).detach()
+            for k, v in lora_items(model.state_dict()).items()
+        }
+pass
+
+
 def prepare_merged_rollout(model):
     # All Unsloth Zoo code licensed under LGPLv3
     if not _merged_rollout_enabled(): return None
+    if _lora_is_sharded(model):
+        # Fold needs whole deltas; vLLM LoRA serves the gathered adapters instead.
+        if getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
+            _merged_rollout_log_once(
+                "Unsloth: merged-weight vLLM rollouts are off under native FSDP2 (sharded adapters); "
+                "vLLM LoRA serves the gathered adapters instead."
+            )
+        return None
     with _MERGED_ROLLOUT_LOCK:
         return _prepare_merged_rollout_locked(model)
 pass
@@ -7361,9 +7390,7 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
     if load_tensors:
         # We extract it directly from the model's state_dict
         peft_config = _live_lora_config(model, save_directory)
-        state_dict = model.state_dict()
-        items = state_dict.items()
-        state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
+        state_dict = {k.replace(".default", ""):v for k, v in _lora_state_dict(model).items()}
         if exclude:
             # Folded into the base weights already: sending them too would apply the delta twice.
             state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}
@@ -8088,5 +8115,3 @@ def test_get_vllm_state_dict():
             raise RuntimeError(f"[{model_name}]\n{error}")
         gc.collect()
         _device_empty_cache()
-    pass
-pass

@@ -207,7 +207,6 @@ def get_peft_regex(
                 only_linear_modules.append(proj)
             else:
                 projection_modules[proj] = j
-        pass
     else:
         assert(type(target_modules) is list)
         only_linear_modules = list(target_modules)
@@ -653,7 +652,6 @@ def requires_grad_for_gradient_checkpointing(model):
                 register(hook, with_kwargs = True)
             else:
                 register(hook)
-        pass
     pass
 
     # Remove all previous forward hooks for gradient checkpointing
@@ -737,7 +735,6 @@ def requires_grad_for_gradient_checkpointing(model):
                 val.requires_grad_(True)
                 return
             pass
-        pass
     pass
 
     def requires_grad_frontend_hook(module, input, output):
@@ -752,6 +749,9 @@ def requires_grad_for_gradient_checkpointing(model):
     def collect_hook_targets():
         hook_targets = OrderedDict()
         fallback_targets = OrderedDict()
+        # id(forward) -> (forward, source): every LoRA weight walks up to the same ancestors.
+        # Holding the function keeps its id from being reused within this call.
+        forward_sources = {}
 
         for name, param in model.named_parameters():
             if not param.requires_grad: continue
@@ -776,8 +776,15 @@ def requires_grad_for_gradient_checkpointing(model):
                 fallback_name   = name_pre
                 fallback_module = module
                 if hasattr(module, "forward"):
-                    try: forward = inspect.getsource(module.forward)
-                    except: continue
+                    forward_function = module.forward
+                    forward_function = getattr(forward_function, "__func__", forward_function)
+                    cached = forward_sources.get(id(forward_function))
+                    if cached is None:
+                        try: source = inspect.getsource(module.forward)
+                        except: source = None
+                        cached = forward_sources[id(forward_function)] = (forward_function, source)
+                    forward = cached[1]
+                    if forward is None: continue
 
                     # Normal self.language_model(...)
                     if f"self.{name_curr}(" in forward:
@@ -910,8 +917,6 @@ def requires_grad_for_gradient_checkpointing(model):
                 )
                 embedding.register_forward_hook(requires_grad_post_hook_eager)
         pass
-    pass
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

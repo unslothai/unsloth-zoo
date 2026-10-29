@@ -2823,7 +2823,7 @@ def test_nested_text_decoder_qualification_decides_its_parent(parent, decoder):
 
 
 def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch):
-    """Reference overlays vision blocks on sliding layers only, within the window."""
+    """Reference overlays vision blocks on sliding layers only, bounded by the window on past keys."""
     _skip_if_mlx_core_was_replaced()
     from functools import partial
     from types import SimpleNamespace as NS
@@ -2863,7 +2863,7 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
         block = np.cumsum(vision & ~np.pad(vision, ((0, 0), (1, 0)))[:, :-1], axis=1) * vision
         q, k = np.indices((types.shape[1],) * 2)
         same = (block[:, :, None] == block[:, None, :]) & (block[:, :, None] > 0)
-        return (((k <= q) | same) & (abs(q - k) < window))[:, None].tolist()
+        return (((k <= q) | same) & (k > q - window))[:, None].tolist()
 
     h = mx.zeros((2, 6, 1))
     ids = mx.array([[0, 1, 1, 1, 1, 0], [1, 1, 0, 2, 2, 0]])
@@ -2881,9 +2881,16 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
     assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
     prefix = KVCache()
     prefix.update_and_fetch(mx.zeros((2, 1, 3, 1)), mx.zeros((2, 1, 3, 1)))
-    for held in ([KVCache(), None], [prefix, None], [BatchKVCache([1, 0]), None]):
-        assert arrays(patched(stack("vision"), h, held, ids)) == arrays(
-            upstream(stack("vision"), h, held, ids))
+    _, full = arrays(upstream(stack("vision"), h, [KVCache(), None], None))
+    assert arrays(patched(stack("vision"), h, [KVCache(), None], ids)) == [reference(ids), full]
+    q, k = np.indices((6, 6))
+    for held in ([prefix, None], [BatchKVCache([1, 0]), None],
+                 [BatchKVCache([1, 0]), BatchKVCache([0, 2])]):
+        sliding, _ = upstream(stack("vision"), h, held, ids)
+        if sliding.shape[-2:] == (6, 6):
+            sliding = sliding & mx.array(k > q - 2)
+        _, full = arrays(upstream(stack("vision"), h, held, None))
+        assert arrays(patched(stack("vision"), h, held, ids)) == [sliding.tolist(), full]
 
 
 def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
@@ -2906,6 +2913,54 @@ def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
     mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
     assert Gemma4TextModel._make_masks is upstream
     assert Gemma4TextModel()._make_masks(None, [None, None]) == ["upstream", "upstream"]
+
+
+def test_gemma4_unified_call_hands_image_token_types_to_the_text_model(monkeypatch):
+    """Upstream's call drops them, so training saw no vision overlay while generation did."""
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+
+    module = pytest.importorskip("mlx_vlm.models.gemma4_unified.gemma4_unified")
+    for name in ("__call__", "_update_chunked_prefill_mode"):
+        monkeypatch.setattr(module.Model, name, getattr(module.Model, name))
+    monkeypatch.setattr(module, "_compact_prefix_rows", getattr(module, "_compact_prefix_rows", None))
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    from unsloth_zoo.mlx.utils import _call_forwards_mm_token_type_ids
+
+    install = mc._runtime_patch_primitive_installers()["gemma4_unified_multimodal_runtime"]
+    stock = module.Model.__call__
+    assert not _call_forwards_mm_token_type_ids(stock)
+    install()
+    patched = module.Model.__call__
+    install()
+    assert module.Model.__call__ is patched
+    assert _call_forwards_mm_token_type_ids(patched)
+
+    def forwarding_upstream(self, input_ids=None, mm_token_type_ids=None, **kwargs):
+        return mm_token_type_ids
+
+    monkeypatch.setattr(module.Model, "__call__", forwarding_upstream)
+    install()
+    assert module.Model.__call__ is forwarding_upstream
+    monkeypatch.setattr(module.Model, "__call__", patched)
+
+    seen = {}
+    model = NS(
+        get_input_embeddings=lambda **kw: seen.update(embed=sorted(kw)) or NS(
+            inputs_embeds="embeds", per_layer_inputs="per_layer"),
+        language_model=lambda *a, **kw: seen.update(lm=(a, kw)) or "out",
+    )
+    types, pair = object(), object()
+    out = patched(model, "ids", "pixels", mask="mask", cache="cache", mm_token_type_ids=types,
+                  token_type_ids=pair, logits_to_keep=1, image_position_ids="pos")
+    assert out == "out"
+    assert seen["embed"] == ["image_position_ids", "input_ids", "logits_to_keep",
+                             "mm_token_type_ids", "pixel_values", "token_type_ids"]
+    assert seen["lm"] == ((None,), dict(
+        cache="cache", inputs_embeds="embeds", mask="mask", per_layer_inputs="per_layer",
+        logits_to_keep=1, mm_token_type_ids=types))
 
 
 def test_cce_only_compile_family_is_refused_on_the_standard_loss():

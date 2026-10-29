@@ -150,7 +150,8 @@ def test_bf16_policy_times_bf16_when_cpu_flags_are_unreadable(monkeypatch):
 
 
 def test_bnb_cpu_4bit_grads_survive_eval_forward():
-    """bitsandbytes repacks Linear4bit weights for its AVX512-BF16 kernel on an eval no-grad forward, which breaks backward; the CPU loader disables that repacking."""
+    """bitsandbytes repacks Linear4bit weights for its AVX512-BF16 kernel on an eval no-grad forward,
+    after which backward is wrong. The CPU loader turns that repacking off; check grads after an eval."""
     from unsloth_zoo.cpu.runtime import cpu_bnb_4bit_supported
     if not cpu_bnb_4bit_supported():
         pytest.skip("no working bitsandbytes CPU 4-bit backend on this host")
@@ -308,7 +309,8 @@ def _tiny_llama():
 
 
 def test_deepcopied_models_run_their_own_weights():
-    """TRL reference models and merged copies are deepcopies; patched forward and generate must run the copy's own weights, not the original's."""
+    """TRL reference models and merged copies are deepcopies; the patched forward and generate must
+    run the copy, not the model they were copied from."""
     import copy
     from unsloth_zoo.cpu.loader import FastCPUModel
     from unsloth_zoo.cpu.ops import patch_chunked_causal_lm_loss
@@ -582,8 +584,8 @@ class _StubTokenizer:
 
 
 def test_reloaded_lora_checkpoint_is_trainable_and_keeps_its_weights(monkeypatch, tmp_path):
-    """FastLanguageModel.from_pretrained on a saved LoRA dir must return a trainable PeftModel with its adapter weights;
-    get_peft_model keeps them and merged_16bit writes a full model."""
+    """FastLanguageModel.from_pretrained("lora_model") must give back a trainable PeftModel with the
+    saved adapter weights; get_peft_model on it keeps them; merged_16bit then writes a full model."""
     import transformers
     from types import SimpleNamespace
     from peft import LoraConfig, PeftModel, get_peft_model
@@ -976,8 +978,8 @@ def test_cpu_fused_lm_head_single_pass_under_bf16_autocast_and_no_grad():
 
 
 def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
-    """TRL 1.x calls _ChunkedLogProbFunction.apply from SFTTrainer.compute_loss; CPU tensors or a missing kernel take
-    the torch path, accelerator tensors keep the kernel."""
+    """TRL 1.x calls `_ChunkedLogProbFunction.apply` from SFTTrainer.compute_loss; CPU tensors (and a
+    missing kernel) take the torch path, accelerator tensors keep the kernel."""
     from types import SimpleNamespace
     from trl.trainer import utils as trl_utils
     from unsloth_zoo.cpu import ops
@@ -1453,9 +1455,11 @@ print("CPU_SFT_OK", losses)
 '''
 
 
-def test_cpu_lora_sft_end_to_end(tmp_path):
-    """FastCPUModel with stock TRL SFTTrainer as notebooks and Studio call them (on_model_resolved,
-    SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name); trains and saves the adapter."""
+@pytest.mark.parametrize("serial_spawn", [False, True])
+def test_cpu_lora_sft_end_to_end(tmp_path, serial_spawn):
+    """FastCPUModel + stock TRL SFTTrainer, as notebooks and Studio call them: on_model_resolved,
+    SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name; trains and saves the adapter.
+    serial_spawn: unguarded script, dataset_num_proc = 1, spawn (a Pool(1) child re-imports __main__)."""
     import subprocess
     import sys
     from tokenizers import Tokenizer, models, pre_tokenizers
@@ -1468,7 +1472,40 @@ def test_cpu_lora_sft_end_to_end(tmp_path):
     PreTrainedTokenizerFast(tokenizer_object = backend, pad_token = "<pad>", eos_token = "</s>",
                             unk_token = "<unk>").save_pretrained(model_dir)
     _tiny_llama().save_pretrained(model_dir)
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", OMP_NUM_THREADS = "2", HF_HUB_OFFLINE = "1")
-    done = subprocess.run([sys.executable, "-c", _CPU_SFT_SCRIPT, str(model_dir), str(tmp_path / "out")],
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", OMP_NUM_THREADS = "2", HF_HUB_OFFLINE = "1",
+               PYTHONPATH = os.pathsep.join(filter(None, [tree, os.environ.get("PYTHONPATH")])))
+    script = ["-c", _CPU_SFT_SCRIPT]
+    if serial_spawn:
+        script = tmp_path / "train.py"
+        script.write_text('import multiprocess\nmultiprocess.set_start_method("spawn", force = True)\n'
+                          + _CPU_SFT_SCRIPT.replace("dataset_num_proc = 2", "dataset_num_proc = 1"))
+        script = [str(script)]
+    done = subprocess.run([sys.executable, *script, str(model_dir), str(tmp_path / "out")],
                           capture_output = True, text = True, timeout = 600, env = env, cwd = str(tmp_path))
     assert done.returncode == 0 and "CPU_SFT_OK" in done.stdout, (done.stdout[-3000:], done.stderr[-5000:])
+
+
+@pytest.mark.parametrize("requested, seen", [(1, None), (0, None), (None, None), (4, 4), (True, True), (-1, -1)])
+def test_serial_dataset_num_proc_maps_in_process(requested, seen):
+    """Stock TRL sees None for a serial 0 / 1 during __init__; the caller's config keeps its value."""
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
+
+    class FakeSFT:
+        def __init__(self, model = None, args = None, **kwargs):
+            self.seen = args.dataset_num_proc
+
+    args = SimpleNamespace(dataset_num_proc = requested)
+    trainer = _make_cpu_sft_trainer(FakeSFT)(model = None, args = args)
+    assert type(trainer.seen) is type(seen) and trainer.seen == seen
+    assert args.dataset_num_proc is requested
+
+    class Failing(FakeSFT):
+        def __init__(self, *a, **k):
+            raise RuntimeError("boom")
+
+    args = SimpleNamespace(dataset_num_proc = 1)
+    with pytest.raises(RuntimeError):
+        _make_cpu_sft_trainer(Failing)(None, args)
+    assert args.dataset_num_proc == 1
