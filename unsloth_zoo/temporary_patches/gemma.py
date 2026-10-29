@@ -18,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
 import os
+import re
 from .common import (
     TEMPORARY_PATCHES,
     torch_compile,
@@ -183,6 +184,18 @@ def _publish_boundary_helpers(modeling_module):
         _to_boundary_dtype      = _to_boundary_dtype,
         _to_forced_output_dtype = _to_forced_output_dtype,
     )
+pass
+
+
+# The Gemma 3 classes are shared by every live Gemma 3 model, and these patches follow
+# UNSLOTH_FORCE_FLOAT32, which each load resets. A load of another family (its types named in
+# UNSLOTH_MODEL_NAME) must not repatch them under a live fp16 or bf16 Gemma 3 model.
+_GEMMA3_FAMILY = re.compile(r"(?<![a-z0-9])(gemma3|gemma3_text|shieldgemma2)(?![a-z0-9])")
+
+
+def _other_family_load():
+    name = os.environ.get("UNSLOTH_MODEL_NAME", "").lower().replace("-", "_")
+    return bool(name) and _GEMMA3_FAMILY.search(name) is None
 pass
 
 
@@ -484,6 +497,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
+    if _other_family_load(): return
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
         _undo_forced_float32("Gemma3Model", "_update_causal_mask")
         _undo_forced_float32("Gemma3ForConditionalGeneration", "_update_causal_mask")
@@ -575,6 +589,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
 
 
 def patch_Gemma3TextScaledWordEmbedding():
+    if _other_family_load(): return
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
         return _undo_forced_float32("Gemma3TextScaledWordEmbedding", "forward")
     try:
@@ -631,6 +646,7 @@ _gemma3_rms_norm_generic = compile_with_eager_fallback(_gemma3_rms_norm_generic,
 
 
 def patch_Gemma3RMSNorm():
+    if _other_family_load(): return
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gemma3.modeling_gemma3
@@ -658,6 +674,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
 
 def patch_Gemma3MLP():
+    if _other_family_load(): return
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
         return _undo_forced_float32("Gemma3MLP", "forward")
     try:
@@ -694,6 +711,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
 def patch_Gemma3MultiModalProjector():
+    if _other_family_load(): return
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
         return _undo_forced_float32("Gemma3MultiModalProjector", "forward")
     try:
@@ -732,6 +750,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3MultiModalProjector)
 
 
 def patch_Gemma3Attention():
+    if _other_family_load(): return
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
         import transformers.models.gemma3.modeling_gemma3
@@ -959,6 +978,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3Attention)
 
 def patch_Gemma3RMSNorm_generic():
     # Must do this since torch.compile cannot trace through def prepare for q_norm, k_norm
+    if _other_family_load(): return
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1": return
     try:
         import transformers.models.gemma3.modeling_gemma3
@@ -985,6 +1005,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm_generic)
 
 def patch_Gemma3Attention_generic():
     # Non float16 forced also has some benefits
+    if _other_family_load(): return
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1": return
     try:
         import transformers.models.gemma3.modeling_gemma3

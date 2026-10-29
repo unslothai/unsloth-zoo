@@ -132,3 +132,56 @@ def test_bf16_then_fp16_still_installs_forced_set():
         assert after["installed"] == forced, flags
         assert after["loss"] == fresh["loss"]
         assert after["grads"] == fresh["grads"]
+
+
+LIVE_SCRIPT = r"""
+import json, os
+import torch
+import transformers
+from transformers import Gemma3ForCausalLM, Gemma3TextConfig
+import unsloth_zoo.temporary_patches.gemma as gemma_patches
+from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
+
+patches = [p for p in TEMPORARY_PATCHES if getattr(p, "__module__", "") == gemma_patches.__name__]
+modeling = transformers.models.gemma3.modeling_gemma3
+def load(model_name, flag):
+    os.environ["UNSLOTH_MODEL_NAME"] = model_name
+    os.environ["UNSLOTH_FORCE_FLOAT32"] = flag
+    for _phase in ("pre_compile", "post_compile"):
+        for patch in patches:
+            patch()
+    return {n: id(getattr(modeling, n).forward) for n in ("Gemma3MLP", "Gemma3RMSNorm", "Gemma3TextScaledWordEmbedding")}
+
+config = Gemma3TextConfig(
+    vocab_size = 128, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 2,
+    num_attention_heads = 2, num_key_value_heads = 1, head_dim = 16, sliding_window = 8,
+    max_position_embeddings = 64,
+)
+config._attn_implementation = "eager"
+fp16 = load("gemma3,gemma3_text,", "1")
+torch.manual_seed(0)
+model = Gemma3ForCausalLM(config).to(torch.float16)
+ids = torch.randint(0, config.vocab_size, (2, 12))
+with torch.no_grad():
+    before = model(input_ids = ids, labels = ids).loss.item()
+other = load("qwen3,_load_in_4bit_", "0")
+with torch.no_grad():
+    after = model(input_ids = ids, labels = ids).loss.item()
+bf16_gemma = load("gemma3,gemma3_text,", "0")
+print("RESULT " + json.dumps({
+    "same_loss": before == after, "kept": other == fp16, "undone_for_gemma3": bf16_gemma != fp16,
+}))
+"""
+
+
+def test_another_family_load_keeps_a_live_gemma3_model_patched():
+    # A bf16 Qwen load (flag "0") after an fp16 Gemma 3 load must not swap the Gemma 3 classes
+    # under the live fp16 model (it turned its loss into NaN); a bf16 Gemma 3 load still undoes them.
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", UNSLOTH_ZOO_DISABLE_GPU_INIT = "1")
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p)
+    for key in ("UNSLOTH_FORCE_FLOAT32", "UNSLOTH_MODEL_NAME"):
+        env.pop(key, None)
+    proc = subprocess.run([sys.executable, "-c", LIVE_SCRIPT], capture_output = True, text = True, timeout = 600, env = env)
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
+    assert json.loads(lines[-1][len("RESULT "):]) == {"same_loss": True, "kept": True, "undone_for_gemma3": True}
