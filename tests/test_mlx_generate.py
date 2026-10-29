@@ -1872,14 +1872,15 @@ def test_inference_scopes_pass_int8_prefill_only_where_registered_and_report_or_
     assert entered == [("first", (None,)), ("exit first", ())]
 
 
-@pytest.mark.parametrize("int8_prefill", [None, True])
-def test_warm_inference_generates_greedily_under_the_int8_decision(int8_prefill):
+@pytest.mark.parametrize("int8_prefill,ane_prefill", [(None, None), (True, False)])
+def test_warm_inference_generates_greedily_under_the_prefill_decisions(int8_prefill, ane_prefill):
     from unsloth_zoo.mlx.inference import warm_inference
 
     calls = []
     warm_inference(types.SimpleNamespace(generate = lambda prompt, **kwargs: calls.append((prompt.tolist(), kwargs))),
-                   int8_prefill = int8_prefill)
-    assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill})]
+                   int8_prefill = int8_prefill, ane_prefill = ane_prefill)
+    assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill,
+                                              "ane_prefill": ane_prefill})]
 
 
 def test_cache_layout_tells_quantized_packings_apart():

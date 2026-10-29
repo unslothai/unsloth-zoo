@@ -47,6 +47,7 @@ import threading
 import time
 import weakref
 from contextlib import contextmanager
+from pathlib import Path
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -479,6 +480,8 @@ _PRESSURE_WARN, _PRESSURE_CRITICAL = 2, 4   # kern.memorystatus_vm_pressure_leve
 _WIRED_FACTOR = 3       # the Neural Engine wires 1.85x (M3 Max) to 2.7x (M5 Pro) a program's int8 weights in prefill
 _BANK_BYTES = 2 << 30   # int8 weights per program; 1-4 GB banks load on M3 Max, and 2 GB ones on M5 Pro
 _STATE = "_unsloth_ane_split"
+_PREPARED = "_unsloth_ane_status"   # the model's last prepare
+_DECISION = "_unsloth_ane_prefill_scope"   # (depth, the outermost scope's decision)
 _CACHE_VERSION = 2      # bump when what calibration times changes, so older entries are not reused
 _CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "unsloth", "mlx_ane_prefill.json")
 _LOCK = threading.RLock()
@@ -495,6 +498,19 @@ class AnePrefillStatus(NamedTuple):
     reason: str = ""
     # System wired memory each program load added, over its int8 weight bytes (median); noisy, so only reported.
     wired_factor: float = 0.0
+    # Why nothing attached: no_neural_engine, not_gpu, no_eligible_mlps, calibration_failed, no_gain, not_enough_memory, load_failed
+    code: str = ""
+
+
+class AnePrefillAvailability(NamedTuple):
+    available: bool
+    # "", no_neural_engine, not_gpu, distributed, timed_out, not_downloaded, no_eligible_mlps; after a prepare its
+    # code, failed or released
+    reason: str
+    layers: int   # MLPs the split takes: eligible ones before a prepare (approximate from a checkpoint), attached after
+
+    def __bool__(self):
+        return self.available
 
 
 class _Worker:
@@ -931,6 +947,20 @@ def _calibrate(model, mlp, tile, surfaces):
     return k / channels, gpu, split_ms, split
 
 
+def _candidates(model):
+    """Unattached eligible SwiGLU MLPs of the most common shape, which share one calibration (a vision tower's stay native)."""
+    mlps = []
+    for _, module in model.named_modules():
+        if module.__dict__.get(_STATE) is None and _projections(module)[0] is not None and _eligible(module):
+            if all(m is not module for m in mlps):
+                mlps.append(module)
+    mlps = [m for m in mlps if _computes_swiglu(m)]
+    if not mlps:
+        return mlps
+    shape = collections.Counter(map(_mlp_shape, mlps)).most_common(1)[0][0]
+    return [m for m in mlps if _mlp_shape(m) == shape]
+
+
 def prepare_ane_prefill(model, *, tile = _TILE, share = None):
     """Compile the Neural Engine half of every eligible dense SwiGLU MLP in `model` and attach it.
 
@@ -939,28 +969,27 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
     than the GPU alone is not attached. Returns an `AnePrefillStatus`; `layers == 0` with a `reason` when nothing was
     attached.
     """
+    status = _prepare(model, tile, share)
+    model.__dict__[_PREPARED] = status
+    return status
+
+
+def _prepare(model, tile, share):
     started = time.perf_counter()
     if not available():
-        return AnePrefillStatus(0, reason = "no Neural Engine runtime")
+        return AnePrefillStatus(0, reason = "no Neural Engine runtime", code = "no_neural_engine")
     if mx.default_device() != mx.gpu:
-        return AnePrefillStatus(0, reason = "the default device is not the GPU")
+        return AnePrefillStatus(0, reason = "the default device is not the GPU", code = "not_gpu")
     if tile % 32:
         raise ValueError("tile must be a multiple of 32 rows")
     # Calibration times, and each split records, the GPU routes a generation would take; a generation's own scopes
     # already hold them.
     with _LOCK, _generation_routes(model):
-        mlps = []
-        for _, module in model.named_modules():
-            if module.__dict__.get(_STATE) is None and _projections(module)[0] is not None and _eligible(module):
-                if all(m is not module for m in mlps):
-                    mlps.append(module)
-        mlps = [m for m in mlps if _computes_swiglu(m)]
+        mlps = _candidates(model)
         if not mlps:
-            return AnePrefillStatus(0, reason = "no dense SwiGLU MLP with affine quantized projections")
-        # The language model's shape: the layers share one calibration and one pair of surfaces, so a vision
-        # tower's MLPs of another width stay native.
-        shape = collections.Counter(map(_mlp_shape, mlps)).most_common(1)[0][0]
-        mlps = [m for m in mlps if _mlp_shape(m) == shape]
+            return AnePrefillStatus(0, reason = "no dense SwiGLU MLP with affine quantized projections",
+                                    code = "no_eligible_mlps")
+        shape = _mlp_shape(mlps[0])
         # Calibrate on the most common quantization: one share serves every layer.
         bits = collections.Counter(_bits(m) for m in mlps).most_common(1)[0][0]
         probe = next(m for m in mlps if _bits(m) == bits)
@@ -976,13 +1005,14 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
             try:
                 share, gpu, split_ms, first = _calibrate(model, probe, tile, surfaces)
             except (AneError, concurrent.futures.TimeoutError) as error:
-                return AnePrefillStatus(0, seconds = time.perf_counter() - started, reason = f"calibration failed: {error}")
+                return AnePrefillStatus(0, seconds = time.perf_counter() - started, reason = f"calibration failed: {error}",
+                                        code = "calibration_failed")
             if split_ms > gpu * (1 - _MIN_GAIN):
                 share = 0.0
             _store_cache(key, {"share": share, "gpu_ms": gpu, "split_ms": split_ms})
         if not share:
             return AnePrefillStatus(0, 0.0, gpu, split_ms, time.perf_counter() - started,
-                                    f"the split ({split_ms:.1f} ms) is not 5% faster than the GPU ({gpu:.1f} ms)")
+                                    f"the split ({split_ms:.1f} ms) is not 5% faster than the GPU ({gpu:.1f} ms)", code = "no_gain")
         free, admitted = _memory_budget(), []
         for mlp in mlps:   # layers may be quantized differently, so each is costed on its own
             free -= _split_bytes(mlp, _aligned(shape[1], share))
@@ -995,7 +1025,8 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
             logger.warning("Neural Engine prefill: free memory admits %d of %d layers", len(admitted), len(mlps))
             mlps = admitted
         if not mlps:
-            return AnePrefillStatus(0, share, gpu, split_ms, time.perf_counter() - started, "not enough free memory")
+            return AnePrefillStatus(0, share, gpu, split_ms, time.perf_counter() - started, "not enough free memory",
+                                    code = "not_enough_memory")
         # A partial tile padded to a full one costs the split's time, so it pays once the GPU would take longer.
         pad_from = min(tile, math.ceil(tile * split_ms / gpu)) if gpu else tile
         k = _aligned(shape[1], share)
@@ -1017,7 +1048,8 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
         banks = {id(b): b for b in (m.__dict__[_STATE].bank for m in attached)}.values()
         loads = [bank.wired / bank.bytes for bank in banks if bank.wired is not None]
         status = AnePrefillStatus(len(attached), share, gpu, split_ms, time.perf_counter() - started,
-                                  wired_factor = float(np.median(loads)) if loads else 0.0)
+                                  wired_factor = float(np.median(loads)) if loads else 0.0,
+                                  code = "" if attached else "load_failed")
         logger.info("Neural Engine prefill: %d layers at a %.0f%% channel share (one-tile MLP %.1f -> %.1f ms), "
                     "prepared in %.1f s; program loads wired %.2fx their int8 weights", status.layers, 100 * share,
                     gpu, split_ms, status.seconds, status.wired_factor)
@@ -1025,26 +1057,102 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
 
 
 def release_ane_prefill(model):
-    """Detach and unload every Neural Engine split in `model`."""
+    """Detach and unload every Neural Engine split in `model`; the next generation with the split on prepares again."""
     with _LOCK:
+        model.__dict__.pop(_PREPARED, None)
+        model.__dict__.pop("_unsloth_ane_prepared", None)
         for _, module in model.named_modules():
             split = module.__dict__.pop(_STATE, None)
             if split is not None:
                 split.close()
 
 
+def ane_prefill_available(model):
+    """Whether `ane_prefill=True` splits any of `model`'s MLPs here: before a prepare, from the runtime, device and eligible
+    MLPs; after one, the layers it attached or why none. It ignores the flag and the env switch, and changes nothing."""
+    if not available():
+        return AnePrefillAvailability(False, "no_neural_engine", 0)
+    if mx.default_device() != mx.gpu:
+        return AnePrefillAvailability(False, "not_gpu", 0)
+    if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+        return AnePrefillAvailability(False, "distributed", 0)
+    if _ABANDONED:   # a timed-out evaluation holds the worker, so no split runs again in this process
+        return AnePrefillAvailability(False, "timed_out", 0)
+    with _LOCK:
+        splits = {id(m): m.__dict__[_STATE] for _, m in model.named_modules() if m.__dict__.get(_STATE) is not None}
+        running = sum(not split.failed for split in splits.values())
+        status = model.__dict__.get(_PREPARED)
+        if splits or status is not None:
+            # Attached layers that all failed, or all since detached by memory pressure or replaced projections
+            reason = "" if running else "failed" if splits else status.code or "released"
+            return AnePrefillAvailability(bool(running), reason, running)
+        layers = len(_candidates(model))
+    return AnePrefillAvailability(bool(layers), "" if layers else "no_eligible_mlps", layers)
+
+
+def ane_prefill_checkpoint_available(model_dir):
+    """`ane_prefill_available` for a downloaded MLX checkpoint, from its config.json and safetensors headers ("not_downloaded"
+    without them). Headers cannot show the activation, gain or free memory, so `layers` counts the MLPs prepare would try."""
+    if not available():
+        return AnePrefillAvailability(False, "no_neural_engine", 0)
+    model_dir = Path(model_dir)
+    shards = list(model_dir.glob("*.safetensors"))
+    if not (model_dir / "config.json").is_file() or not shards:
+        return AnePrefillAvailability(False, "not_downloaded", 0)
+    quantization = json.loads((model_dir / "config.json").read_text()).get("quantization") or {}
+    tensors = {}
+    for shard in shards:
+        with open(shard, "rb") as file:
+            tensors.update(json.loads(file.read(struct.unpack("<Q", file.read(8))[0])))
+
+    def projection(prefix):
+        """(out, in, group size) of an affine quantized linear without bias, else None."""
+        weight, scales = tensors.get(f"{prefix}.weight"), tensors.get(f"{prefix}.scales")
+        # Per-layer settings are keyed by module path, which mlx-vlm also matches without "language_model."
+        layer = next((quantization[key] for key in (prefix, prefix.removeprefix("language_model."))
+                      if key in quantization), quantization)
+        if (weight is None or scales is None or f"{prefix}.biases" not in tensors or f"{prefix}.bias" in tensors
+                or not isinstance(layer, dict) or layer.get("mode", "affine") != "affine"
+                or len(weight["shape"]) != 2):
+            return None
+        rows, columns = weight["shape"][0], weight["shape"][1] * 32 // layer.get("bits", 4)
+        return rows, columns, columns // scales["shape"][-1]
+
+    shapes = collections.Counter()
+    for name in tensors:
+        if not name.endswith(".gate_proj.weight"):
+            continue
+        prefix = name.removesuffix(".gate_proj.weight")
+        gate, up, down = (projection(f"{prefix}.{p}_proj") for p in ("gate", "up", "down"))
+        if (gate and up and down and gate == up and down == (gate[1], gate[0], gate[2])
+                and gate[0] % _ALIGN == 0):
+            shapes[gate[:2]] += 1
+    layers = max(shapes.values(), default = 0)
+    return AnePrefillAvailability(bool(layers), "" if layers else "no_eligible_mlps", layers)
+
+
 @contextmanager
-def ane_prefill_mlp(model, *, _modules = None):
+def ane_prefill_mlp(model, ane_prefill = None, *, _modules = None):
     """Route prefill tiles of the MLPs `prepare_ane_prefill` attached through their Neural Engine split.
 
-    Prepares the model on first entry. A partial tile is padded to a full one when calibration measured that as
-    faster; shorter partial tiles, training and a split that failed keep the native module.
+    `ane_prefill=True`, or `UNSLOTH_MLX_ANE_PREFILL=1` when None, turns it on (approximate: int8 weights); the outermost
+    scope decides, and its first entry on prepares the model. A partial tile is padded when calibration measured that as
+    faster; shorter partial tiles, training and a failed split keep the native module.
     """
-    changed = []
+    changed, tracked = [], hasattr(model, "__dict__")
     try:
         with _LOCK:
-            modules = _modules if _modules is not None else tuple(model.named_modules())
-            if not getattr(model, "_unsloth_ane_prepared", False):
+            depth, outer = getattr(model, "__dict__", {}).get(_DECISION, (0, None))
+            if outer is not None:
+                ane_prefill = outer
+            elif ane_prefill is None:
+                ane_prefill = os.environ.get(OPT_IN, "0") == "1"
+            if tracked:
+                model.__dict__[_DECISION] = (depth + 1, bool(ane_prefill))
+            modules = ()
+            if ane_prefill and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                modules = _modules if _modules is not None else tuple(model.named_modules())
+            if modules and not getattr(model, "_unsloth_ane_prepared", False):
                 model.__dict__["_unsloth_ane_prepared"] = True
                 status = prepare_ane_prefill(model)
                 if not status.layers:
@@ -1068,3 +1176,7 @@ def ane_prefill_mlp(model, *, _modules = None):
                 if not module._unsloth_ane_scopes:
                     module.__class__ = module._unsloth_ane_native
                     module.__dict__.pop("_unsloth_ane_scopes")
+            if tracked:
+                depth, decision = model.__dict__.pop(_DECISION)
+                if depth > 1:
+                    model.__dict__[_DECISION] = (depth - 1, decision)

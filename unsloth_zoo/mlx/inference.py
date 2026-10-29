@@ -46,7 +46,7 @@ import mlx.nn as nn
 import numpy as np
 
 from . import ane, attention, matmul, nax
-from .ane import ane_prefill_mlp
+from .ane import ane_prefill_available, ane_prefill_checkpoint_available, ane_prefill_mlp, release_ane_prefill
 
 
 logger = logging.getLogger(__name__)
@@ -6872,11 +6872,12 @@ def exact_dilated_depthwise_conv(model, *, _modules = None):
 
 class InferenceScope(NamedTuple):
     """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
-    `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
+    `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument."""
     enter: Callable
     serves: frozenset = frozenset()
     opt_in: str = None
     int8_prefill: bool = False
+    ane_prefill: bool = False
 
     @property
     def name(self):
@@ -6889,7 +6890,8 @@ class InferenceScope(NamedTuple):
 
 
 # Outermost first; every generation path (Studio included) enters these. A scope that is not bitwise stock
-# and not measured at least as accurate as stock against an fp32 reference (max and mean error) sets `opt_in`.
+# and not measured at least as accurate as stock against an fp32 reference (max and mean error) sets `opt_in`, or takes
+# a decision that defaults off.
 # Call traits: "batch", "speculative" (drafts verified in blocks), "vision" (mlx-vlm), "audio".
 INFERENCE_SCOPES = [
     InferenceScope(fused_moe_gate_up),
@@ -6899,7 +6901,7 @@ INFERENCE_SCOPES = [
     InferenceScope(fused_moe_routed_experts),
     InferenceScope(nax_quantized_linear, int8_prefill = True),
     InferenceScope(dense_prefill_linear),
-    InferenceScope(ane_prefill_mlp, opt_in = ane.OPT_IN),
+    InferenceScope(ane_prefill_mlp, ane_prefill = True),
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_qsa_attention),
     InferenceScope(fast_qsa_prefill),
@@ -6918,7 +6920,7 @@ INFERENCE_SCOPES = [
 
 
 @contextmanager
-def inference_scopes(model, call = None, *, int8_prefill = None, on_error = None, _modules = None):
+def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = None, on_error = None, _modules = None):
     """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation.
 
     Traits this zoo does not know are ignored. A scope that raises on entry propagates unless `on_error` is
@@ -6931,7 +6933,7 @@ def inference_scopes(model, call = None, *, int8_prefill = None, on_error = None
         for scope in INFERENCE_SCOPES:
             if not scope.admits(call):
                 continue
-            args = (int8_prefill,) if scope.int8_prefill else ()
+            args = (int8_prefill,) if scope.int8_prefill else (ane_prefill,) if scope.ane_prefill else ()
             try:
                 stack.enter_context(scope.enter(model, *args, _modules = modules))
             except Exception as error:
@@ -6944,11 +6946,11 @@ def inference_scopes(model, call = None, *, int8_prefill = None, on_error = None
 _WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17 rows)
 
 
-def warm_inference(model, int8_prefill = None):
+def warm_inference(model, int8_prefill = None, ane_prefill = None):
     """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
     first-use checks; checks keyed by a request's row count still run then."""
     model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
-                   int8_prefill = int8_prefill)
+                   int8_prefill = int8_prefill, ane_prefill = ane_prefill)
     _warm_qmv_rows(model)
     _warm_verify_gdn(model)
 

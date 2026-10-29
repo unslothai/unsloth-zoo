@@ -2141,7 +2141,7 @@ def test_vlm_cache_materialization_reuses_cache_buffers(monkeypatch):
 
 @real_mlx_only
 @pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
-@pytest.mark.parametrize("scope_name", ["nax_quantized_linear", "dense_prefill_linear"])
+@pytest.mark.parametrize("scope_name", ["nax_quantized_linear", "dense_prefill_linear", "ane_prefill_mlp"])
 def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, scope_name):
     from contextlib import contextmanager
     import mlx_lm
@@ -2159,14 +2159,15 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
         yield model
 
     def stream(model, *args, **kwargs):
-        assert entered == [(root, vlm) if scope_name == "nax_quantized_linear" else (root,)]
-        assert "int8_prefill" not in kwargs
+        decision = {"nax_quantized_linear": vlm, "ane_prefill_mlp": not vlm}.get(scope_name)
+        assert entered == [(root, decision) if decision is not None else (root,)]
+        assert "int8_prefill" not in kwargs and "ane_prefill" not in kwargs
         yield types.SimpleNamespace(token = 7)
 
     monkeypatch.setattr(inference, "INFERENCE_SCOPES", [
         entry._replace(enter = scope) if entry.name == scope_name else entry for entry in inference.INFERENCE_SCOPES])
     monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
-    generated = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1, int8_prefill = vlm)
+    generated = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1, int8_prefill = vlm, ane_prefill = not vlm)
     assert generated.tolist() == [[1, 2, 7]]
 
 

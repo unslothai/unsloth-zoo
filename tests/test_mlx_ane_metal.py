@@ -67,6 +67,11 @@ def _model(act = nn.silu, seed = 0, tower = False):
     return model
 
 
+@pytest.fixture(autouse = True)
+def _split_on(monkeypatch):   # a scope without a decision reads the switch
+    monkeypatch.setenv(ane.OPT_IN, "1")
+
+
 def _rows(n, seed = 1):
     return (mx.random.normal((1, n, HIDDEN), key = mx.random.key(seed)) * 0.5).astype(mx.bfloat16)
 
@@ -78,7 +83,6 @@ def _cosine(a, b):
 
 @pytest.fixture
 def prepared(monkeypatch):
-    monkeypatch.setenv(ane.OPT_IN, "1")
     monkeypatch.setattr(ane, "_DOWN_SLAB", 256)   # several down slabs at this size
     model = _model()
     status = ane.prepare_ane_prefill(model, tile = TILE, share = 0.5)
@@ -149,6 +153,7 @@ def test_a_failed_evaluation_falls_back_to_the_gpu_for_good(prepared, monkeypatc
     with ane.ane_prefill_mlp(prepared):
         out, again = prepared.layers[0](x), prepared.layers[0](x)
     assert split.failed and len(calls) == 1
+    assert ane.ane_prefill_available(prepared) == (True, "", 1)   # the failed layer no longer counts
     assert mx.array_equal(out, prepared.layers[0](x)).item() and mx.array_equal(again, out).item()
 
 
@@ -183,6 +188,7 @@ def test_a_timed_out_program_is_never_unloaded_and_stops_every_split(prepared, m
         prepared.layers[0](x)
         out = prepared.layers[1](x)
     assert not calls and not other.failed and mx.array_equal(out, prepared.layers[1](x)).item()
+    assert ane.ane_prefill_available(prepared) == (False, "timed_out", 0)
     ane.release_ane_prefill(prepared)
     assert split.failed and split in ane._ABANDONED
     assert not torn_down and not any(owner._finalizer.real.alive for owner in owners)   # nor at exit
@@ -391,6 +397,7 @@ def test_memory_pressure_releases_layers_from_the_end(level, over_layers, kept, 
         outputs = [mlp(_rows(TILE)) for mlp in order]
     assert [ane._STATE in mlp.__dict__ for mlp in order] == [True] * kept + [False] * (3 - kept)
     assert {id(s) for s in closed} == {id(s) for s in splits[kept:]}
+    assert ane.ane_prefill_available(model) == (bool(kept), "" if kept else "released", kept)
     for mlp, out in zip(order, outputs):   # a released layer's own call already ran natively
         assert mx.array_equal(out, mlp(_rows(TILE))).item() != (ane._STATE in mlp.__dict__)
     warnings = [r for r in caplog.records if "memory pressure" in r.getMessage()]
@@ -400,7 +407,6 @@ def test_memory_pressure_releases_layers_from_the_end(level, over_layers, kept, 
 
 def test_the_split_runs_only_on_the_gpu_route_it_was_tuned_on(monkeypatch, caplog):
     from unsloth_zoo.mlx import inference
-    monkeypatch.setenv(ane.OPT_IN, "1")
     monkeypatch.setattr(inference, "prefill_route",
                         lambda module, rows: "dense" if module.__dict__.get("_unsloth_dense_qmm_scopes") else "stock")
     model = _model()
@@ -470,8 +476,37 @@ def test_a_calibration_split_no_layer_has_memory_for_is_closed(monkeypatch, tmp_
     assert closed == [640]
 
 
-def test_scope_is_opt_in():
-    from unsloth_zoo.mlx.inference import INFERENCE_SCOPES
+def test_the_outermost_scope_decides_and_off_never_prepares(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    model, real = _model(), ane.prepare_ane_prefill
+    monkeypatch.setattr(ane, "prepare_ane_prefill", lambda m: real(m, tile = TILE, share = 0.5))
+    monkeypatch.delenv(ane.OPT_IN, raising = False)
+    with inference.inference_scopes(model):   # off by default
+        assert type(model.layers[0]) is SwiGLU and ane._PREPARED not in model.__dict__
+    monkeypatch.setenv(ane.OPT_IN, "1")
+    with inference.inference_scopes(model, ane_prefill = False), ane.ane_prefill_mlp(model, True):
+        assert type(model.layers[0]) is SwiGLU and ane._PREPARED not in model.__dict__
+    with ane.ane_prefill_mlp(model, True), inference.inference_scopes(model, ane_prefill = False):
+        assert type(model.layers[1]) is not SwiGLU
+    assert type(model.layers[1]) is SwiGLU and ane._DECISION not in model.__dict__
+    ane.release_ane_prefill(model)
 
-    (scope,) = [s for s in INFERENCE_SCOPES if s.enter is ane.ane_prefill_mlp]
-    assert scope.opt_in == ane.OPT_IN
+
+def test_availability_counts_eligible_layers_then_what_prepare_attached(monkeypatch, tmp_path):
+    import json
+    from mlx.utils import tree_flatten
+    model = _model(tower = True)
+    assert ane.ane_prefill_available(model) == (True, "", 2)   # the common shape only
+    monkeypatch.setattr(ane, "_memory_budget", lambda: 0)
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 0
+    assert ane.ane_prefill_available(model) == (False, "not_enough_memory", 0)
+    ane.release_ane_prefill(model)
+    assert ane.ane_prefill_available(model) == (True, "", 2)   # released: judged afresh
+    monkeypatch.undo()
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 2
+    assert ane.ane_prefill_available(model) == (True, "", 2)
+    ane.release_ane_prefill(model)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters())))
+    assert ane.ane_prefill_checkpoint_available(tmp_path) == (False, "not_downloaded", 0)
+    (tmp_path / "config.json").write_text(json.dumps({"quantization": {"group_size": 64, "bits": 4}}))
+    assert ane.ane_prefill_checkpoint_available(tmp_path) == (True, "", 2)

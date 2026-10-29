@@ -1114,7 +1114,7 @@ def _require_evaluable(model):
 
 
 @contextmanager
-def generation_mode(model, int8_prefill = None, call = None):
+def generation_mode(model, int8_prefill = None, call = None, ane_prefill = None):
     """Temporarily switch a model to eval mode and steward global MLX limits.
 
     The outermost context snapshots the process-global memory, cache, and wired
@@ -1141,7 +1141,7 @@ def generation_mode(model, int8_prefill = None, call = None):
         _require_evaluable(model)()
         _GENERATION_MODE_DEPTH += 1
         entered = True
-        with inference_scopes(model, call, int8_prefill = int8_prefill, _modules = modules):
+        with inference_scopes(model, call, int8_prefill = int8_prefill, ane_prefill = ane_prefill, _modules = modules):
             yield model
     except BaseException as exc:
         active_error = exc
