@@ -1530,6 +1530,9 @@ def _process_param_tokens(param_tokens):
     return new_tokens, replacement
 
 def _rewrite_kwargs_param(source: str, func_name: str):
+    # Superset of the `def <name>` token pair below: a miss (TRL trainer class names) skips tokenize.
+    if re.search(r"def(?:\s|\\|#[^\n]*\n)*" + re.escape(func_name), source) is None:
+        return source, None
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
     except Exception:
@@ -1571,7 +1574,9 @@ def _rewrite_kwargs_param(source: str, func_name: str):
                     param_tokens.append(t)
                     i += 1
 
-                new_param_tokens, renamed_to = _process_param_tokens(param_tokens)
+                new_param_tokens, replacement = _process_param_tokens(param_tokens)
+                if replacement is not None:
+                    renamed_to = replacement
                 out_tokens.extend(new_param_tokens)
                 if i < len(tokens):
                     out_tokens.append(tokens[i])
@@ -1580,6 +1585,9 @@ def _rewrite_kwargs_param(source: str, func_name: str):
         out_tokens.append(tok)
         i += 1
 
+    # untokenize is lossy on some Pythons (whitespace, f-string braces before 3.12.10 / 3.13.2)
+    if renamed_to is None:
+        return source, None
     try:
         new_source = tokenize.untokenize(out_tokens)
     except Exception:
