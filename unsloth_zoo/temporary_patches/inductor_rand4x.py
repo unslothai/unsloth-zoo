@@ -27,8 +27,8 @@ the path off unless TORCHINDUCTOR_USE_RAND4X=1; this does the same.
 Gated on the function body (the 1-D check without `use_rand4x`) and on
 `torch._inductor.config` lacking `use_rand4x`, so torch 2.12 and older (no 4x path) and
 2.15+ (fixed) are untouched. A monkeypatch is not part of Inductor's FX graph or AOTAutograd
-cache key, so a tag is added to `torch.compiler.config.cache_key_tag`; without it a warm
-cache keeps serving kernels generated with rand4x.
+cache key, so a tag is added to `torch.compiler.config.cache_key_tag` in every thread; without
+it a warm cache keeps serving kernels generated with rand4x.
 """
 
 import inspect
@@ -49,15 +49,27 @@ def _needs_patch(fn, config):
     return "triton_tensor_ndim() == 1" in source and "use_rand4x" not in source
 
 
+def _with_tag(value, tag):
+    tags = [t for t in (value or "").split(",") if t]
+    return ",".join(tags + [tag]) if tag not in tags else ",".join(tags)
+
+
 def _add_cache_key_tag(tag):
     import torch
 
     config = getattr(torch.compiler, "config", None)
     if config is None or not hasattr(config, "cache_key_tag"):
         return False
-    tags = [t for t in config.cache_key_tag.split(",") if t]
-    if tag not in tags:
-        config.cache_key_tag = ",".join(tags + [tag])
+    # torch 2.12+ keeps config assignments per thread (a ContextVar), so the assignment below is
+    # invisible to a compile on another thread: a reentrant checkpoint's recompute compiles on
+    # autograd's device thread, where the tag would be missing and a warm cache would serve that
+    # graph rand4x kernels while the forward drew tl.rand. The env default is read by every thread
+    # without an assignment of its own.
+    entry = getattr(config, "_config", {}).get("cache_key_tag")
+    if entry is not None and hasattr(entry, "env_value_default"):
+        current = entry.env_value_default
+        entry.env_value_default = _with_tag(current if isinstance(current, str) else entry.default, tag)
+    config.cache_key_tag = _with_tag(config.cache_key_tag, tag)
     return True
 
 

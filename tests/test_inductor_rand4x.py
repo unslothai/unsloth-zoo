@@ -314,3 +314,50 @@ def test_patch_misses_a_warm_fx_graph_cache(tmp_path):
     assert out["after_patch"].get("fxgraph_cache_hit", 0) == 0, out
     assert out["after_patch"].get("fxgraph_cache_miss", 0) >= 1, out
     assert out["after_patch_again"].get("fxgraph_cache_hit", 0) >= 1, out
+
+
+# ---- the tag reaches other threads ---------------------------------------------------------
+# torch keeps config assignments per thread, and a reentrant checkpoint's recompute compiles on
+# autograd's device thread: the tag must be there too, or that compile reads a warm rand4x entry.
+
+THREAD_CACHE = f"""
+import json, threading, importlib.util, torch
+from torch._dynamo.utils import counters
+import torch._inductor.config as ic
+ic.fx_graph_cache = True
+def f(x):
+    return torch.nn.functional.dropout(x, 0.25, True) * 2
+def compile_once():
+    torch._dynamo.reset()
+    counters.clear()
+    torch.compile(f)(torch.ones(64, 64))
+    return dict(counters["inductor"])
+def in_thread(fn):
+    out = {{}}
+    def run():
+        out["tag"] = torch.compiler.config.cache_key_tag
+        if fn is not None:
+            out["counters"] = fn()
+    t = threading.Thread(target = run)
+    t.start()
+    t.join()
+    return out
+warm = compile_once()
+spec = importlib.util.spec_from_file_location("m", {str(PATCH_FILE)!r})
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+assert m.patch_inductor_rand4x()
+other = in_thread(compile_once)
+print(json.dumps({{"main_tag": torch.compiler.config.cache_key_tag, "thread_tag": other["tag"],
+                  "thread_counters": other["counters"]}}))
+"""
+
+
+@pytest.mark.skipif(not AFFECTED, reason = "torch without the unfixed rand4x path")
+def test_cache_key_tag_reaches_other_threads(tmp_path):
+    out = _run(THREAD_CACHE, env = {"TORCHINDUCTOR_CACHE_DIR": str(tmp_path / "inductor"),
+                                    "TORCHINDUCTOR_FX_GRAPH_CACHE": "1"})
+    assert "unsloth/inductor_rand4x_off:pytorch198680" in out["main_tag"].split(",")
+    assert "unsloth/inductor_rand4x_off:pytorch198680" in out["thread_tag"].split(","), out
+    # The warm entry was written before the patch: a compile on another thread must miss it.
+    assert out["thread_counters"].get("fxgraph_cache_hit", 0) == 0, out
+    assert out["thread_counters"].get("fxgraph_cache_miss", 0) >= 1, out
