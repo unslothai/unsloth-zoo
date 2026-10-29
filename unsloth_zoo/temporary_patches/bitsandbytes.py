@@ -237,6 +237,9 @@ def _bnb_direct_plan(weight, quant_state):
     tensors = _bnb_direct_tensors(qs)
     if tensors[0].dtype is not torch.float32:
         return None
+    device = weight.get_device()
+    if any(t.get_device() != device for t in tensors):
+        return None  # the kernel reads every pointer on the activations' device
     if qs.nested:
         # matmul_4bit passes state2.absmax as absmax and the quantized absmax as absmax_8bit.
         offset = qs.offset.to(dtype = torch.float32)
@@ -245,7 +248,7 @@ def _bnb_direct_plan(weight, quant_state):
         offset = None
         ptrs = (tensors[0].data_ptr(), None, None, None)
     return (qs, weight.data_ptr(), tensors, [t.data_ptr() for t in tensors], ptrs, offset,
-            qs.shape[0], qs.shape[1], qs.blocksize, 1 if qs.quant_type == "fp4" else 2, {})
+            qs.shape[0], qs.shape[1], qs.blocksize, 1 if qs.quant_type == "fp4" else 2, {}, device)
 
 
 def _bnb_4bit_direct(self, x, quant_state):
@@ -279,8 +282,10 @@ def _bnb_4bit_direct(self, x, quant_state):
         self.__dict__["_unsloth_bnb_direct"] = plan
     if plan[1] is None:
         return None
-    _, _, _, _, ptrs, _, N, K, blocksize, quant_type, picks = plan
-    if x.shape[-1] != K or (bias is not None and bias.dim() != 1):
+    _, _, _, _, ptrs, _, N, K, blocksize, quant_type, picks, device = plan
+    if x.shape[-1] != K or device != x.get_device() or (bias is not None and (
+        bias.dim() != 1 or bias.get_device() != device
+    )):
         return None
     M = x.numel() // K
     use = picks.get((M, dtype))
@@ -293,7 +298,11 @@ def _bnb_4bit_direct(self, x, quant_state):
         return None
     fn = _BNB_DIRECT["fn"].get(dtype)
     if fn is None:
-        fn = _BNB_DIRECT["fn"][dtype] = getattr(ops.lib, _BNB_DIRECT_FN.get(dtype, ""), None) or False
+        fn = getattr(ops.lib, _BNB_DIRECT_FN.get(dtype, ""), None)
+        # The 14 arguments passed below: a library built with another kernel ABI is left to bitsandbytes.
+        if fn is None or len(getattr(fn, "argtypes", None) or ()) != 14:
+            fn = False
+        _BNB_DIRECT["fn"][dtype] = fn
     if fn is False:
         return None
     key = (dtype, ptrs[1] is not None, bias is not None)

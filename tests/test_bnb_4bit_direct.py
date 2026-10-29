@@ -20,6 +20,7 @@ CPU cases record the arguments of the lib.cgemm_4bit_* call and compare them wit
 own matmul_4bit -> gemm_4bit -> _gemm_4bit_kernel_impl makes; the CUDA case compares outputs bitwise.
 """
 import contextlib
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,7 @@ class _Lib:
     def _rec(self, d):
         def fn(*args):
             self.calls.append((d, args))
+        fn.argtypes = [None] * 14  # bitsandbytes' _setup_ctypes
         return fn
 
 
@@ -87,7 +89,7 @@ def _layer(N = 64, K = 128, dtype = torch.bfloat16, nested = False, bias = True,
         qs = QuantState(absmax = absmax, shape = torch.Size([N, K]), code = code, blocksize = blocksize,
                         quant_type = "nf4", dtype = dtype)
     layer = SimpleNamespace(weight = SimpleNamespace(data = weight, quant_state = qs, dtype = torch.uint8,
-                                                     data_ptr = weight.data_ptr),
+                                                     data_ptr = weight.data_ptr, get_device = weight.get_device),
                             bias = torch.randn(N, generator = g).to(dtype) if bias else None,
                             compute_dtype = dtype, compute_type_is_set = True)
     return layer, qs
@@ -145,7 +147,7 @@ def test_rebuilt_when_quant_tensors_change(lib):
 
 
 @pytest.mark.parametrize("case", ["grad", "bias_grad", "dtype", "compiling", "off", "no_custom", "K", "bias_2d", "fp32_view",
-                                  "not_current_device", "nested_bs"])
+                                  "not_current_device", "nested_bs", "abi", "weight_elsewhere"])
 def test_declines(lib, monkeypatch, case):
     layer, qs = _layer(nested = case == "nested_bs")
     x = torch.randn(1, 1, 128).to(torch.bfloat16)
@@ -174,6 +176,11 @@ def test_declines(lib, monkeypatch, case):
         monkeypatch.setattr(Z, "_on_current_cuda", lambda x: False)
     elif case == "nested_bs":
         qs.state2.blocksize = 128
+    elif case == "abi":
+        lib.cgemm_4bit_bf16.argtypes = [None] * 15  # a kernel built with another argument list
+    elif case == "weight_elsewhere":
+        x = types.SimpleNamespace(**{n: getattr(x, n) for n in ("dtype", "shape", "requires_grad", "numel")},
+                                  get_device = lambda: 1)
     with ctx:
         assert Z._bnb_4bit_direct(layer, x, qs) is None
     assert not lib.calls and Z.BNB_4BIT_DIRECT_CALLS["direct"] == 0
