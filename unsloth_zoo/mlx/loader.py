@@ -1445,6 +1445,7 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     """
     import transformers
     from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
+    from transformers.models.auto import tokenization_auto
     from transformers.models.auto.tokenization_auto import (
         get_tokenizer_config, tokenizer_class_from_name,
     )
@@ -1465,13 +1466,19 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     model_type_class = None if remote else _tokenizer_class_for_model_type(model_path)
     if tokenizer_class is None:
         tokenizer_class = model_type_class
-    elif hasattr(transformers, "TokenizersBackend") and getattr(model_type_class, "__name__", None) in (
-        "TokenizersBackend", "PreTrainedTokenizerFast", "PythonBackend", "MistralCommonBackend",
-    ):
-        # As AutoTokenizer in 5.x: a model_type served by a generic backend loads
-        # tokenizer.json as written. Mistral Tekken repos declare LlamaTokenizerFast,
-        # which rebuilds a SentencePiece decoder over their ByteLevel tokenizer.json.
-        tokenizer_class = transformers.TokenizersBackend
+    elif hasattr(transformers, "TokenizersBackend") and model_type_class is not None:
+        if model_type_class.__name__ in (
+            "TokenizersBackend", "PreTrainedTokenizerFast", "PythonBackend", "MistralCommonBackend",
+        ):
+            # As AutoTokenizer in 5.x: a model_type served by a generic backend loads
+            # tokenizer.json as written. Mistral Tekken repos declare LlamaTokenizerFast,
+            # which rebuilds a SentencePiece decoder over their ByteLevel tokenizer.json.
+            tokenizer_class = transformers.TokenizersBackend
+        elif _read_json_file(os.path.join(str(model_path), "config.json")).get("model_type") in getattr(
+            tokenization_auto, "MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS", (),
+        ):
+            # Model types transformers knows to declare the wrong class on the Hub.
+            tokenizer_class = model_type_class
     if not remote and (Path(model_path) / "tokenizer.json").is_file():
         if tokenizer_class is None or not issubclass(tokenizer_class, PreTrainedTokenizerFast):
             tokenizer_class = PreTrainedTokenizerFast

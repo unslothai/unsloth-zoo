@@ -4544,23 +4544,29 @@ def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path)
     assert loaded("hello world")["input_ids"] == bare("hello world")["input_ids"]
 
 
-@pytest.mark.parametrize("model_type, declared, expected", [
-    ("mistral", "LlamaTokenizerFast", "TokenizersBackend"),
-    ("bart", "BartTokenizerFast", "RobertaTokenizer"),
+@pytest.mark.parametrize("model_type, declared, expected, hub_class_known_wrong", [
+    ("mistral", "LlamaTokenizerFast", "TokenizersBackend", False),
+    ("bart", "GPT2TokenizerFast", "GPT2Tokenizer", False),
+    ("gpt2", "LlamaTokenizerFast", "GPT2Tokenizer", True),
 ])
 def test_tokenizer_class_disagreeing_with_model_type_keeps_tokenizer_json(
-    tmp_path, model_type, declared, expected,
+    monkeypatch, tmp_path, model_type, declared, expected, hub_class_known_wrong,
 ):
     """Mistral Tekken repos declare LlamaTokenizerFast over a ByteLevel tokenizer.json;
     transformers 5.x LlamaTokenizer rebuilds a SentencePiece decoder over it, so replies
     stream as raw 'Ġ'/'Ċ' pieces. AutoTokenizer loads TokenizersBackend there instead,
-    and keeps a declared class whenever the model_type registers a specialized one."""
+    keeps a declared class whenever the model_type registers a specialized one, and
+    loads that registered class for model types it lists as declaring the wrong one."""
     import transformers
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from transformers.models.auto import tokenization_auto
     import unsloth_zoo.mlx.loader as loader
 
     if not hasattr(transformers, "TokenizersBackend"):
         pytest.skip("transformers 4.x fast classes load tokenizer.json as written")
+    if hub_class_known_wrong:
+        # 5.17 lists qwen2 and others with a specialized class; 5.5's list has none.
+        monkeypatch.setattr(tokenization_auto, "MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS", {model_type})
     text = "Hello world.\nNext line"
     backend = Tokenizer(models.BPE())
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
