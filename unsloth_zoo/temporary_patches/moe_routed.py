@@ -61,6 +61,21 @@ except Exception:  # pragma: no cover - no Triton, no routed path
 ACT_GPTOSS, ACT_SILU, ACT_GELU_TANH, ACT_GELU = 0, 1, 2, 3
 
 
+def _eager_out_of_dynamo(fn):
+    """fn inlined while Dynamo traces it, and run with Dynamo off otherwise. When Inductor skips a compiled frame
+    (SkipFrame, e.g. bfloat16 on a T4) the frame runs eagerly but Dynamo still converts every nested frame, and the
+    eager branches here (pointer tables, data_ptr, direct Triton launches) cannot be traced on their own."""
+    eager = torch.compiler.disable(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return fn(*args, **kwargs)
+        return eager(*args, **kwargs)
+    return wrapper
+
+
+
 def _env_int(name, default):
     try:
         return int(os.environ.get(name, default))
@@ -1161,6 +1176,7 @@ def _routed_bf16_moe_fused(x, flat, rw, w_gu, w_dn, b_gu, b_dn, act, interleaved
     return routed_bf16_down_sum(inter, flat, rw, w_dn, b_dn, dn[0], dn[1], None, dn[2], top_k, out_dtype)
 
 
+@_eager_out_of_dynamo
 def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interleaved,
                     gu_lora = (), dn_lora = (), alpha = 1.702, limit = 7.0, out_dtype = None):
     """[T, H] MoE output from only the routed BF16 / FP16 experts."""
@@ -1314,6 +1330,8 @@ def _stacked_key(experts):
     return tuple(key) + biases
 
 
+# Eager only (data_ptr comparisons): also when a compiled frame Inductor skips calls it (see _eager_out_of_dynamo).
+@torch.compiler.disable
 def prepare_stacked_nf4(experts, hidden_dim = None):
     """Eagerly built or revalidated tables for stacked NF4 experts; None when unsupported."""
     state = experts.__dict__.get("_unsloth_routed_moe")
@@ -1599,6 +1617,7 @@ def _bf16_views(experts, hidden_dim):
     return w_gu, w_dn, act, interleaved, one_token
 
 
+@_eager_out_of_dynamo
 def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
     """Experts output from only the routed experts, or None (callers run their usual path)."""
     # Reentrant checkpointing replays under grad through the other path, so skip in training.
