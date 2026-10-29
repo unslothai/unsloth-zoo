@@ -24,6 +24,7 @@ transformers import. Each check runs in a fresh interpreter.
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -85,4 +86,31 @@ def test_dynamo_and_inductor_import_under_the_stub():
         assert torch.allclose(f(torch.ones(3)), torch.ones(3).sin() + 1)
         print("OK", torch.__version__)
     ''')
+    assert proc.returncode == 0 and "OK" in proc.stdout, proc.stdout + proc.stderr[-4000:]
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None or importlib.util.find_spec("transformers") is None,
+    reason = "torch / transformers not installed",
+)
+def test_transformers_model_runs_after_zoo_import_with_stub():
+    # UNSLOTH_ZOO_DISABLE_GPU_INIT=1 takes the same stub path as an MLX host, on any OS.
+    proc = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(f'''
+            import sys
+            sys.path.insert(0, {str(REPO_ROOT)!r})
+            import unsloth_zoo, triton, torch
+            assert "triton_stub" in (getattr(triton, "__file__", "") or ""), triton
+            import torch._dynamo
+            from transformers import AutoConfig, AutoModelForCausalLM, set_seed
+            set_seed(0)
+            cfg = AutoConfig.for_model("llama", hidden_size = 16, intermediate_size = 32,
+                num_hidden_layers = 1, num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 64)
+            out = AutoModelForCausalLM.from_config(cfg)(torch.tensor([[1, 2, 3]])).logits
+            assert out.shape == (1, 3, 64), out.shape
+            print("OK", torch.__version__)
+        ''')],
+        capture_output = True, text = True, timeout = 600,
+        env = {**os.environ, "UNSLOTH_ZOO_DISABLE_GPU_INIT": "1"},
+    )
     assert proc.returncode == 0 and "OK" in proc.stdout, proc.stdout + proc.stderr[-4000:]
