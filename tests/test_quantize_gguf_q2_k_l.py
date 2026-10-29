@@ -69,7 +69,8 @@ def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):  # noqa: D401
     assert '--tensor-type "\\.ffn_down=Q3_K"' in cmd, (
         f'--tensor-type "\\.ffn_down=Q3_K" missing: {cmd!r}'
     )
-    # llama-quantize needs option flags before the positional model paths, so every --tensor-type must come before the input file.
+    # llama-quantize parses option flags before the positional model paths;
+    # the --tensor-type flags must land in the option region.
     first_tt = cmd.index('--tensor-type "\\.ffn_down_exps=Q3_K"')
     assert first_tt < cmd.index("/tmp/in.gguf"), (
         f"--tensor-type must precede positional args: {cmd!r}"
@@ -80,8 +81,13 @@ def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):  # noqa: D401
 
 
 def test_q2_k_l_ffn_down_pattern_order_is_specific_first(monkeypatch):
-    """llama-quantize takes the first --tensor-type regex that matches (std::regex_search in src/llama-quant.cpp);
-    ffn_down_exps must precede ffn_down, else the dense rule absorbs every MoE expert and the override is dead code."""
+    """llama-quantize iterates --tensor-type with first-match-wins
+    (`if (std::regex_search(...)) { ...; break; }` in src/llama-quant.cpp).
+    The more-specific MoE pattern `\\.ffn_down_exps` must therefore appear
+    BEFORE the dense pattern `\\.ffn_down` -- otherwise the dense regex
+    would absorb every MoE expert via its prefix match and the explicit
+    MoE override would be dead code. Asserting the order keeps this
+    invariant from sliding under a future cleanup pass."""
 
     llama_cpp = _load_llama_cpp_module()
     captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
@@ -102,7 +108,8 @@ def test_q2_k_l_ffn_down_pattern_order_is_specific_first(monkeypatch):
     assert moe_idx < dense_idx, (
         f"MoE pattern must come first (first-match-wins): {cmd!r}"
     )
-    # Patterns are layer-agnostic regexes covering every block, so per-layer ids (blk.) must not be enumerated into the command.
+    # Document the invariant that we do NOT enumerate per layer id -- both
+    # patterns are layer-agnostic regexes covering every block.
     assert "blk." not in cmd, f"per-layer enumeration leaked into command: {cmd!r}"
 
 
@@ -132,7 +139,10 @@ def test_q2_k_l_is_case_insensitive(monkeypatch):
 
 
 def test_other_quant_types_are_untouched(monkeypatch):
-    """Non-preset types pass through unchanged: q3_k_l is a real llama.cpp ftype, distinct from q2_k_l, and must reach llama-quantize verbatim."""
+    """Non-preset ftypes traverse the original code path unchanged.
+
+    q3_k_l is a real llama.cpp ftype distinct from q2_k_l and must pass through verbatim.
+    """
 
     llama_cpp = _load_llama_cpp_module()
     captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
@@ -193,7 +203,8 @@ def test_q2_k_l_print_output_path_logs_preset_expansion(capsys, monkeypatch):
 
 
 def test_q2_k_l_error_message_keeps_original_preset_name(monkeypatch):
-    """A llama-quantize failure must name q2_k_l, the preset the user asked for, not the rewritten internal q2_k ftype."""
+    """If llama-quantize fails, the RuntimeError should mention q2_k_l (what the
+    user asked for) rather than q2_k (the rewritten internal ftype)."""
 
     llama_cpp = _load_llama_cpp_module()
 
@@ -336,7 +347,8 @@ def test_imatrix_quant_does_not_log_q2_k_l_preset(tmp_path, capsys, monkeypatch)
 
 
 def test_imatrix_non_path_value_raises_cleanly(monkeypatch):
-    """A non-path imatrix value like True must raise a clear error: os.path.exists treats a bool as file descriptor 1 and would silently emit --imatrix True."""
+    """A non-path value such as True must raise a clear error, not let os.path.exists() treat the
+    bool as file descriptor 1 and silently emit --imatrix "True"."""
 
     llama_cpp = _load_llama_cpp_module()
     _install_fake_subprocess_run(monkeypatch, llama_cpp)

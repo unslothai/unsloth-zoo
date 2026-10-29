@@ -158,14 +158,20 @@ def test_re_may12_ioc_catches_each_literal():
     reason = "Fork 1 (RE_MAY12_IOC integration) not merged yet",
 )
 def test_may12_ioc_caught_by_scan_archive():
-    """The malicious wheel's setup.py must yield a finding that references the May-12 IOC string once RE_MAY12_IOC is wired into check_py_file."""
+    """Once RE_MAY12_IOC is wired into check_py_file (per Fork 1's
+    plan), the malicious wheel's setup.py must produce a finding
+    that explicitly references the May-12 IOC string.
+    """
     findings = sp.scan_archive(
         str(FIXTURES / "malicious_wheel.whl"),
         "malicious_fixture",
     )
-    # Runtime-built IOC literals keep CodeQL py/incomplete-url-substring-sanitization from false-positive on the in
-    # operand, which is scanner evidence, not a URL; this also survives pre-commit reformatting that would detach an
-    # inline lgtm comment.
+    # The IOC literals are built at runtime so CodeQL's
+    # py/incomplete-url-substring-sanitization rule does not false-
+    # positive on the (literal `in` operand) pattern -- the operand is
+    # the scanner's own evidence string, not a URL being sanitized.
+    # Runtime construction also survives pre-commit reformatting that
+    # would otherwise detach an inline lgtm comment from the operator.
     _ioc_host = "git-tanstack." + "com"
     _ioc_drop = "transformers." + "pyz"
     hit = any(
@@ -186,7 +192,13 @@ def test_may12_ioc_caught_by_scan_archive():
 
 
 def test_scan_packages_pip_download_failure_propagates(tmp_path):
-    """A pip download failure must not become a 0-findings exit 0 report; an unresolvable spec must exit 2 with the SCAN INCOMPLETE banner on stderr."""
+    """A pip download failure must not be swallowed into a `0 findings,
+    exit 0` report: an unresolvable spec must make the orchestrator exit 2
+    (scan incomplete) with the SCAN INCOMPLETE banner on stderr.
+
+    The spec name is deliberately long + random so it can't resolve on any
+    real index; even an offline runner gets a clean "could not resolve".
+    """
     script = REPO_ROOT / "scripts" / "scan_packages.py"
     assert script.is_file(), script
     unresolvable = "pkg-that-does-not-exist-0123456789-fork-c-silentfail==0.0.0"

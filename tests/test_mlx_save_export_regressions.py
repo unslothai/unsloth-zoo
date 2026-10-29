@@ -422,7 +422,10 @@ def test_mlx_generate_output_numpy_fallback_without_torch(monkeypatch):
     import numpy as np
     import unsloth_zoo.mlx.loader as loader
 
-    # Broken/missing torch (ImportError/OSError) must fall back to numpy int64 in _mlx_generate_output.
+    # torch is installed here (the sim needs it), so force `import torch` to fail
+    # inside _mlx_generate_output to cover the numpy int64 fallback branch. Test
+    # both a missing torch (ImportError) and an installed-but-broken torch
+    # (OSError) -- the broadened except must degrade to numpy in both cases.
     real_import = builtins.__import__
 
     def failing_import(exc):
@@ -574,8 +577,12 @@ def test_vlm_prompt_patch_preserves_model_specific_media_markers(monkeypatch):
 
 
 def test_vlm_prompt_patch_rebinds_every_loaded_mlx_vlm_alias(monkeypatch):
-    """No loaded mlx-vlm module may keep the original chat-template callable; the hard-coded list covers only entry
-    points, so loaded aliases survive and render multi-turn prompts the old way."""
+    """No loaded mlx-vlm module may keep the original chat-template callable.
+
+    The hard-coded list only force-imports mlx-vlm's entry points, so aliases in
+    modules that are already loaded -- `mlx_vlm` itself re-exports this one --
+    survive the patch and render multi-turn prompts the old way.
+    """
     import mlx_vlm.prompt_utils as prompt_utils
     import unsloth_zoo.mlx.loader as loader
 
@@ -586,7 +593,8 @@ def test_vlm_prompt_patch_rebinds_every_loaded_mlx_vlm_alias(monkeypatch):
     monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
     monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
 
-    # Aliases mlx-vlm really holds: the package and mlx_vlm.trainer.datasets (pulled in by any import).
+    # Aliases mlx-vlm really holds: the package re-export and a submodule that
+    # any `import mlx_vlm` already pulls in through mlx_vlm/trainer/__init__.py.
     aliased = ("mlx_vlm", "mlx_vlm.trainer.datasets")
     for name in aliased:
         module = sys.modules.get(name) or types.ModuleType(name)
@@ -998,7 +1006,8 @@ def test_adapter_bnb_base_remap_defaults_to_mlx_4bit_quantization(
     class StopAdapterLoad(RuntimeError):
         pass
 
-    # from_pretrained's config download forwards allow_patterns, so the fake _download must accept it.
+    # Accept allow_patterns: from_pretrained's config download now forwards it,
+    # so the shim must match the real _download signature.
     def fake_download(model_name, revision=None, allow_patterns=None):
         assert model_name == str(adapter_dir)
         return adapter_dir
@@ -1108,7 +1117,9 @@ def _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils):
         ("vision_tower.weight", "model.vision_tower.weight"),
         ("embed_audio.weight", "model.embed_audio.weight"),
         ("embed_vision.weight", "model.embed_vision.weight"),
-        # Projector shares the encoder's namespace; canonical-name-only converters drop it, so mmproj fails.
+        # The projector shares the encoder's namespace; a converter that takes only the
+        # canonical name drops it, and the mmproj it writes then holds the encoder alone
+        # and is refused at load for the missing projector tensor.
         ("vision_adapter.fc1.weight", "model.vision_adapter.fc1.weight"),
         ("vision_adapter.fc2.weight", "model.vision_adapter.fc2.weight"),
         ("vision_projection.weight", "model.vision_projection.weight"),
@@ -1197,7 +1208,8 @@ _MTP_SHIFTED_KEYS = (
 
 
 class _MtpGatedNormSanitizer:
-    """Shaped like the MTP families: an MTP shard or an unsanitized conv1d marks the source as HF convention, which one tensor cannot show."""
+    """Shaped like the MTP families': an MTP shard or a still-unsanitized
+    conv1d marks the source as HF convention, which one tensor cannot show."""
 
     def __init__(self, src_path):
         self._src_path = str(src_path)
@@ -1292,7 +1304,8 @@ def test_gguf_export_does_not_subtract_a_replayed_offset_twice(tmp_path):
     mx = mutils.mx
 
     class RenamingNormSanitizer:
-        """Renames and shifts; a single-tensor replay recovers the value, so the offset must not apply twice."""
+        """Renames and shifts, so the single-tensor replay recovers the value
+        on its own and the measured offset must not be applied again."""
 
         def __init__(self, src_path):
             self._src_path = str(src_path)
@@ -1332,8 +1345,12 @@ def test_gguf_export_does_not_subtract_a_replayed_offset_twice(tmp_path):
 
 
 class _KeyGatedNormSanitizer:
-    """Shaped like Qwen3.5: the RMSNorm shift is decided by the pre-sanitize key, so it survives an already converted
-    checkpoint; shift is a parameter so tests can tell it from the 1.0 fallback."""
+    """Shaped like the Qwen3.5 family's: the RMSNorm shift is decided by the
+    pre-sanitize key, so it survives a checkpoint that was already converted.
+
+    ``shift`` is parametrized rather than fixed at 1.0 so the tests can tell a
+    measured offset apart from the 1.0 the export falls back to.
+    """
 
     def __init__(self, src_path, shift=1.0):
         self._src_path = str(src_path)
@@ -1371,7 +1388,8 @@ def test_gguf_export_unshifts_an_already_converted_source(tmp_path, source_conve
     if source_convention == "hf":
         _write_weights(mx, src, hf_weights)
     else:
-        # Already sanitized (mlx-community style): reloading shifts nothing, so the measurement is bare.
+        # An mlx-community style checkpoint: already sanitized, so reloading it
+        # shifts nothing and the measurement comes back bare.
         _write_weights(mx, src, model_of(src).sanitize(dict(hf_weights)))
     model = model_of(src)
 
@@ -1391,7 +1409,10 @@ def test_gguf_export_unshifts_an_already_converted_source(tmp_path, source_conve
 
 
 def test_gguf_export_removes_a_measured_offset_that_is_not_one(tmp_path):
-    # Replay must use the measured offset: hardcoded -1 matches only 1.0 shifts; others never export.
+    # The export threads the MEASURED offset into the replay candidates, and a
+    # hardcoded ``- 1`` reproduces every 1.0 case. Pin a shift that is not 1.0:
+    # there the wrong constant makes no candidate round-trip, so the tensor
+    # keeps its MLX name and never reaches the export.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1421,7 +1442,10 @@ def test_gguf_export_removes_a_measured_offset_that_is_not_one(tmp_path):
 
 
 class _SynthesizedScaleSanitizer:
-    """Shaped like mlx-vlm Inkling: creates constant 1-D ones scales the source never held, not an offset."""
+    """Shaped like mlx-vlm's Inkling: the sanitizer CREATES 1-D scale vectors
+    that the source checkpoint never held, filled with ones, under names that
+    are real model parameters. They are constant and non-zero, so a measurement
+    that only looks at its own output reads them as an added offset."""
 
     def __init__(self, src_path):
         self._src_path = str(src_path)
@@ -1442,7 +1466,8 @@ _SWITCH_MLP = "language_model.model.layers.0.mlp.switch_mlp."
 
 
 def test_norm_offsets_ignore_a_sanitizer_created_constant(tmp_path):
-    # A sanitizer-created tensor is not an offset: subtracting it would annihilate a real parameter.
+    # A created tensor is not an offset: nothing in the source was shifted to
+    # produce it, so subtracting it annihilates a real parameter.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1480,7 +1505,8 @@ def test_gguf_export_keeps_sanitizer_created_scales(tmp_path, replay_sanitizers)
 
 
 def test_norm_offsets_ignore_a_non_additive_transform(tmp_path):
-    # A non-additive transform: A_log = -exp(A_log) maps a zeroed probe to -1.0, not an offset.
+    # ``A_log = -exp(A_log)`` maps a zeroed probe to a constant -1.0. Reading
+    # that as an offset would shift a real state-space parameter by +1.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1505,7 +1531,10 @@ def test_norm_offsets_ignore_a_non_additive_transform(tmp_path):
 
 
 def test_norm_offsets_do_not_mutate_the_model(tmp_path):
-    # Sanitizers write to self (phi4mm caches LoRA, gemma3_text drops lm_head); measure on a copy.
+    # Real sanitizers write to ``self``: mlx-vlm's phi4mm caches its LoRA
+    # weights, and mlx-lm's gemma3_text drops the lm_head submodule for a tied
+    # checkpoint. Measuring must not leave the caller holding a model rebuilt
+    # from the all-zero probe.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1536,7 +1565,17 @@ def test_norm_offsets_do_not_mutate_the_model(tmp_path):
 
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16", "float32"])
 def test_already_converted_recovery_is_exact_in_low_precision(tmp_path, dtype_name):
-    # Exact replay match, no tolerance: bf16/fp16 round-trip only fails at |source| 258 and 2050.
+    # The recovery accepts ``tensor - 1.0`` only if replaying the sanitizer
+    # reproduces the stored tensor EXACTLY. ``(t - c) + c == t`` is not a
+    # floating-point identity, but the stored tensor is itself ``source + c`` in
+    # this dtype, and across every finite bfloat16 and float16 value the only
+    # sources that fail are |source| = 258 and 2050. So the exact check is right
+    # and must not be loosened into a tolerance.
+    #
+    # These values span the range the shifting families occupy (the published
+    # Qwen3-Next input_layernorm runs -0.154 to 0.781). Above |source| = 1 the
+    # low bit is gone before Unsloth sees the checkpoint, so the recovery
+    # returns what mlx-lm's load left, which is what inference runs on too.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1545,7 +1584,8 @@ def test_already_converted_recovery_is_exact_in_low_precision(tmp_path, dtype_na
     hf_weights = {"model.language_model.norm.weight": source}
 
     src = tmp_path / "src"
-    # Already sanitized on disk: measurement is empty, so only the replay can recover the shift.
+    # An mlx-community style checkpoint: already sanitized on disk, so the
+    # measurement is empty and only the replay can recover the shift.
     _write_weights(mx, src, _KeyGatedNormSanitizer(src).sanitize(dict(hf_weights)))
     model = _KeyGatedNormSanitizer(src)
     assert mutils._mlx_sanitizer_norm_offsets(model) == {}
@@ -1563,7 +1603,10 @@ def test_already_converted_recovery_is_exact_in_low_precision(tmp_path, dtype_na
 
 @pytest.mark.parametrize("bad", ["nan", "inf"])
 def test_norm_offsets_reject_a_non_finite_constant(tmp_path, bad):
-    # Division by a zeroed weight gives inf/NaN; NaN passes an unguarded spread check as a constant.
+    # The probe hands zeros to a third-party sanitizer, so a division by a
+    # weight it zeroed comes back inf or NaN. NaN fails every comparison, so an
+    # unguarded spread check reads it as a constant and the export writes it
+    # into the real tensor.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1603,7 +1646,9 @@ def test_norm_offsets_reject_a_non_finite_constant(tmp_path, bad):
 
 
 def test_norm_offsets_fail_closed_when_the_model_cannot_be_copied(tmp_path):
-    # Falling back to the live model would sanitize it; failing closed (unmeasurable) is the safe answer.
+    # Falling back to the live instance would sanitize the model this exists to
+    # protect. Unmeasurable is the safe answer: it is what the export did before
+    # any of this landed.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1632,7 +1677,8 @@ def test_norm_offsets_fail_closed_when_the_model_cannot_be_copied(tmp_path):
 
 
 def test_norm_offsets_survive_a_zero_length_tensor(tmp_path):
-    # mx.min refuses zero-size reduces; raising would silently drop all offsets measured alongside.
+    # mx.min refuses a zero-size reduce. Letting that raise would discard every
+    # offset measured alongside it and silently drop the whole correction.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1659,7 +1705,9 @@ def test_norm_offsets_survive_a_zero_length_tensor(tmp_path):
 
 
 def test_norm_offsets_replay_once_when_nothing_is_shifted(tmp_path):
-    # Confirming replay runs only after a shift is found; no-shift sanitizers may dequantize everything.
+    # The confirming replay only runs when the first one found something to
+    # confirm. Sanitizers that shift nothing are the common case, and some of
+    # them dequantize the whole checkpoint on the way through.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1722,7 +1770,8 @@ def test_gguf_save_prepares_the_export_directory_for_every_model(
     assert calls["model"] is model
     assert calls["replay_sanitizers"] is is_vlm
     assert calls["moe_model"] is model
-    # Forward re-laid-out names to the second pass or it re-moves them; adjacent-axis moves self-invert.
+    # The names the first pass re-laid-out reach the second, or it moves those axes
+    # a second time: an adjacent-axis move is its own inverse, so the replay accepts it.
     assert calls["relaid_out"] is calls["source_layouts"]
 
 
@@ -2659,7 +2708,10 @@ def _write_single_gguf(path):
 def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
     monkeypatch, tmp_path, platform_name, install_behavior, expect_macos_helper
 ):
-    """Prebuilt install_llama_cpp() first everywhere; macOS source helper only after its apt-get failure."""
+    """When llama.cpp is missing, the install fallback must try the shared
+    install_llama_cpp() (prebuilt-first) on every platform, and only drop to the
+    macOS cmake+Metal source helper when that prebuilt path hit the apt-get
+    failure that is macOS-specific."""
     import unsloth_zoo.llama_cpp as llama_cpp
     import unsloth_zoo.mlx.utils as mutils
 
@@ -2679,7 +2731,8 @@ def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
     gpu_support_seen = {"value": None}
 
     def fake_check(folder):
-        # First probe fails to force the install fallback; the re-probe after the macOS helper succeeds.
+        # First probe fails (forces the install fallback); the re-probe after the
+        # macOS helper succeeds.
         check_state["n"] += 1
         calls.append("check")
         if check_state["n"] == 1:
@@ -2730,13 +2783,17 @@ def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
     )
 
     assert "install_llama_cpp" in calls
-    # gpu_support=False everywhere: export needs CPU llama-quantize only; macOS Metal uses the helper.
+    # Export only needs the CPU-only llama-quantize, so gpu_support=False on every
+    # platform. On macOS this still resolves the universal unslothai/llama.cpp
+    # Metal bundle (same archive from the CPU selector), and the Metal source build
+    # is handled by the macOS helper below, not by this flag.
     assert gpu_support_seen["value"] is False
     assert ("_install_llama_cpp_macos" in calls) == expect_macos_helper
 
 
 def test_gguf_install_fallback_reraises_non_aptget_runtimeerror(monkeypatch, tmp_path):
-    """A non-apt-get RuntimeError from install_llama_cpp must propagate, not be swallowed by macOS build."""
+    """A non-apt-get RuntimeError from install_llama_cpp must propagate, not get
+    silently swallowed into the macOS source build."""
     import unsloth_zoo.llama_cpp as llama_cpp
     import unsloth_zoo.mlx.utils as mutils
 
@@ -2851,13 +2908,17 @@ def test_push_to_hub_gguf_forwards_export_options(monkeypatch, tmp_path):
 
 
 def test_macos_helper_reclones_non_source_dir(monkeypatch, tmp_path):
-    # Stale prebuilt installs with no CMakeLists.txt must be replaced before the macOS source build.
+    # A stale prebuilt install (binaries + marker, no CMakeLists.txt) left in the
+    # llama.cpp folder must be replaced before the macOS source build, or cmake runs
+    # against a directory with no CMakeLists.txt and the source fallback fails. The
+    # prebuilt-first export path reaches this helper exactly that way on macOS.
     import subprocess
     import unsloth_zoo.mlx.utils as mutils
 
     import unsloth_zoo.llama_cpp as lcpp
 
-    # Deletes only a marked prebuilt install in a safe dir, so UNSLOTH_HOME is anchored at tmp_path.
+    # The helper only deletes a recognised managed prebuilt install (marker present)
+    # that lives in a safe-to-delete location, so anchor UNSLOTH_HOME at tmp_path.
     monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path), raising=False)
 
     folder = tmp_path / "llama.cpp"
@@ -2885,7 +2946,11 @@ def test_macos_helper_reclones_non_source_dir(monkeypatch, tmp_path):
 
 
 def test_macos_helper_refuses_unmanaged_non_source_dir(monkeypatch, tmp_path):
-    # Unmarked non-source dirs (no UNSLOTH_PREBUILT_INFO.json) may hold user files; never wipe them.
+    # A non-source directory that is NOT a recognised Unsloth prebuilt install
+    # (no UNSLOTH_PREBUILT_INFO.json marker) must never be deleted -- a caller may
+    # point UNSLOTH_LLAMA_CPP_PATH at a directory full of their own files. The
+    # helper must raise instead of wiping it, mirroring the generic installer's
+    # _is_safe_to_delete / prebuilt-marker guard.
     import subprocess
     import unsloth_zoo.mlx.utils as mutils
     import unsloth_zoo.llama_cpp as lcpp
@@ -2912,7 +2977,8 @@ def test_macos_helper_refuses_unmanaged_non_source_dir(monkeypatch, tmp_path):
 
 
 def test_macos_helper_keeps_existing_source_tree(monkeypatch, tmp_path):
-    # Source checkouts (CMakeLists.txt) are kept and rebuilt; only non-source dirs get replaced.
+    # A real source checkout (CMakeLists.txt present) is kept and rebuilt, never
+    # re-cloned -- only non-source dirs are replaced.
     import subprocess
     import unsloth_zoo.mlx.utils as mutils
 
@@ -2936,7 +3002,8 @@ def test_macos_helper_keeps_existing_source_tree(monkeypatch, tmp_path):
 
 
 def _stub_gguf_export(monkeypatch, tmp_path):
-    """Stubs llama.cpp and the merge; records merged, quantize (llama-quantize kwargs) and imatrix_bytes."""
+    """Stub llama.cpp and the merge so save_pretrained_gguf runs with no model or binaries, and
+    record "merged", "quantize" (llama-quantize's kwargs) and "imatrix_bytes" into the result."""
     import unsloth_zoo.llama_cpp as llama_cpp
     import unsloth_zoo.mlx.utils as mutils
 
@@ -2989,7 +3056,8 @@ def _export(save_directory, **kwargs):
     model = types.SimpleNamespace(_hf_repo="unsloth/TestModel")
     mutils.save_pretrained_gguf(model, object(), save_directory, **kwargs)
 
-# Both export paths glob save_directory/*.gguf, so a stray copy there gets uploaded and reported.
+# Both export paths glob save_directory/*.gguf, so a copy left there would be uploaded and
+# reported as an exported model.
 @pytest.mark.parametrize(
     "source_name, resolved_name, inside",
     [
@@ -3018,7 +3086,9 @@ def test_the_imatrix_copy_lands_outside_the_export_directory(monkeypatch, tmp_pa
     assert sorted(p.name for p in out.rglob("*.gguf")) == sorted(["TestModel.IQ2_XXS.gguf"] + left_behind)
 
 
-# Caller's imatrix in save_directory is kept, but never reported or uploaded as an export output.
+# The caller's own imatrix may sit in save_directory; we must not delete it, but both the
+# completion summary and push_to_hub_gguf glob save_directory/*.gguf, so it must not be
+# reported or uploaded as though this export had produced it.
 def test_an_imatrix_inside_the_export_directory_is_not_reported_or_uploaded(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -3035,7 +3105,9 @@ def test_an_imatrix_inside_the_export_directory_is_not_reported_or_uploaded(monk
     assert source.exists(), "the caller's file must never be deleted"
 
 
-# Refuse an imatrix named like an output; without the guard the export succeeds while destroying it.
+# An imatrix named like a file the export writes is destroyed by it: convert_to_gguf and
+# llama-quantize overwrite by name, and the intermediate is deleted afterwards. Resolution copies
+# it out first, so without this guard the export SUCCEEDS while eating the caller's input.
 @pytest.mark.parametrize("source_name", ["TestModel.IQ2_XXS.gguf", "TestModel.BF16.gguf"])
 def test_an_imatrix_named_like_an_output_is_refused_before_anything_is_written(
     monkeypatch, tmp_path, source_name
@@ -3075,7 +3147,8 @@ def test_is_same_file_asks_the_filesystem_then_falls_back(tmp_path):
     other.write_bytes(b"Q")
 
     assert mutils._is_same_file(real, str(real))
-    # Symlinks: only the filesystem knows the same file, or the imatrix gets uploaded as a model.
+    # One file, two names: only the filesystem knows. Comparing the strings would miss it, and
+    # the imatrix would be uploaded as a model.
     link = tmp_path / "linked.gguf"
     link.symlink_to(real)
     assert mutils._is_same_file(link, str(real))
@@ -3103,13 +3176,17 @@ def test_a_direct_conversion_drops_the_imatrix_instead_of_resolving_it(
     with pytest.warns(UserWarning, match="ignoring imatrix_file"):
         _export(tmp_path / "out", quantization_method=quantization_method, imatrix_file=True)
 
-    # quant_type is normalized before either check, so BF16 is a direct conversion, not a requantize.
+    # Resolution was reached with None, so no repo lookup happened. quant_type is normalized before
+    # either comparison, so "BF16" is a direct conversion like the others and llama-quantize is not
+    # reached at all -- it no longer degenerates into a BF16 -> BF16 requantize.
     assert seen["arg"] is None
     assert "quantize" not in calls
     assert calls.get("quantize", {}).get("imatrix") is None
 
 
-# Drop guard must agree with the llama-quantize gate, or the imatrix is lost before quantizing.
+# The drop guard predicts whether llama-quantize will run. It has to agree with the condition that
+# actually gates it, or the imatrix is discarded from a run that then goes ahead without one. These
+# spellings differ only in case/whitespace from the intermediate, which llama-quantize accepts.
 @pytest.mark.parametrize("first_conversion", ["Q4_K_M", " q4_k_m ", "q4_k_m"])
 def test_a_case_variant_intermediate_does_not_silently_discard_the_imatrix(
     monkeypatch, tmp_path, first_conversion
@@ -3128,11 +3205,19 @@ def test_a_case_variant_intermediate_does_not_silently_discard_the_imatrix(
             first_conversion=first_conversion, imatrix_file=True,
         )
 
-    # Same quant however spelled: llama-quantize is skipped, so it never runs without the imatrix.
+    # Target and intermediate are the same quant however it is spelled, so the warning is honest:
+    # llama-quantize really is skipped. It must not be reached with the imatrix thrown away.
     assert "quantize" not in calls
 
 
-# llama-quantize --dry-run: iq3_xs needs an imatrix via attn Q/K overrides, despite IQ3_S ftype.
+# Left: needs an imatrix. Right: quantizes without one. Measured, not read off the ftype defaults:
+# `llama-quantize --dry-run <bf16.gguf> /dev/null <quant>` on a real Llama-3.2-1B prints
+# "will require an imatrix!" for exactly the left column.
+#
+# iq3_xs is on the LEFT despite its ftype defaulting to IQ3_S, because the attention Q/K overrides
+# in llama_tensor_get_type_impl promote to IQ3_XXS with no has_imatrix check. A real export fails on
+# blk.0.attn_k.weight -- the first block -- so leaving it off the list buys nothing and costs the
+# user the whole merge and BF16 conversion first, which is the failure this guard exists to prevent.
 @pytest.mark.parametrize(
     "quant, required",
     [(q, True) for q in (
@@ -3162,7 +3247,8 @@ def test_imatrix_only_quants_are_refused_before_the_merge(monkeypatch, tmp_path,
     assert not (tmp_path / "out").exists(), "a refused export must not leave a directory behind"
 
 
-# These quantize without an imatrix, so export must run; any quality warning is llama.cpp's to issue.
+# The counterpart: each of these quantizes without an imatrix, so the export must run rather than
+# be refused. llama.cpp may still warn that quality suffers -- that is its call to make, not ours.
 @pytest.mark.parametrize("quant", ["iq4_xs", "iq4_nl", "iq3_s", "iq3_m", "q2_k", "q4_k_m"])
 def test_quants_not_refused_up_front(monkeypatch, tmp_path, quant):
     calls = _stub_gguf_export(monkeypatch, tmp_path)
@@ -3201,13 +3287,15 @@ def _fake_hub(monkeypatch, tmp_path, upstream_name, hosted_by="unsloth/TestModel
     return seen
 
 
-# Resolve both .dat (classic llama.cpp) and .gguf_file (GGUF, else the Hub lists it as a model).
+# Both upstream spellings must resolve: .dat is the classic llama.cpp format, .gguf_file the
+# GGUF one the Hub would otherwise list as a model.
 @pytest.mark.parametrize(
     "upstream_name, expected_local",
     [
         ("imatrix_unsloth.dat", "imatrix_unsloth.dat"),
         ("imatrix_unsloth.gguf_file", "imatrix_unsloth.gguf"),
-        # Some repos ship imatrix_unsloth.gguf with no .gguf_file guard; llama-quantize reads it the same.
+        # Some repos publish the GGUF imatrix under its plain name, without the .gguf_file guard
+        # (unsloth/Qwen3.8-27B-GGUF does). llama-quantize --imatrix reads it just the same.
         ("imatrix_unsloth.gguf", "imatrix_unsloth.gguf"),
     ],
 )
@@ -3288,7 +3376,8 @@ def test_missing_imatrix_path_is_rejected(tmp_path):
         llama_cpp.resolve_imatrix_file(str(tmp_path / "absent.dat"), dest_dir=str(tmp_path))
 
 
-# Dest_dir already holding the imatrix is used in place; shutil.copyfile would raise SameFileError.
+# resolve_imatrix_file is exported, so a caller may hand it a dest_dir that already holds the file
+# -- Studio does. shutil.copyfile raises SameFileError on that; there is simply nothing to copy.
 def test_an_imatrix_already_in_dest_dir_is_used_in_place(tmp_path):
     import unsloth_zoo.llama_cpp as llama_cpp
 
@@ -3308,7 +3397,8 @@ def test_an_imatrix_already_in_dest_dir_is_used_in_place(tmp_path):
         ("Qwen/Qwen3.5-0.8B", ["unsloth/Qwen3.5-0.8B-GGUF"]),
         ("unsloth/Qwen3.5-0.8B-GGUF", ["unsloth/Qwen3.5-0.8B-GGUF"]),
         (None, []),
-        # Try repo verbatim, then peel markers one at a time to the base; -MTP names a different model.
+        # A repackaged repo is tried verbatim first, then peeled one marker at a time down to the
+        # base the imatrix is published against. -MTP survives: it names a different model.
         ("mlx-community/Llama-3.2-1B-Instruct-4bit",
          ["unsloth/Llama-3.2-1B-Instruct-4bit-GGUF", "unsloth/Llama-3.2-1B-Instruct-GGUF"]),
         ("mlx-community/Qwen3.5-2B-MLX-8bit",
@@ -3324,7 +3414,8 @@ def test_an_imatrix_already_in_dest_dir_is_used_in_place(tmp_path):
         ("unsloth/Qwen3-8B-unsloth-bnb-4bit",
          ["unsloth/Qwen3-8B-unsloth-bnb-4bit-GGUF", "unsloth/Qwen3-8B-unsloth-bnb-GGUF",
           "unsloth/Qwen3-8B-unsloth-GGUF", "unsloth/Qwen3-8B-GGUF"]),
-        # mlx-community writes bit width as -4bit and -4-bit; -4-bit is the form this exporter sees most.
+        # mlx-community publishes the bit width both ways; -4-bit is as common as -4bit and is
+        # what this exporter sees most (e.g. mlx-community/Mistral-7B-Instruct-v0.2-4-bit).
         ("mlx-community/Mistral-7B-Instruct-v0.2-4-bit",
          ["unsloth/Mistral-7B-Instruct-v0.2-4-bit-GGUF", "unsloth/Mistral-7B-Instruct-v0.2-GGUF"]),
         ("mlx-community/Llama-3.2-3B-Instruct-8-bit",
@@ -3359,7 +3450,8 @@ def test_imatrix_repo_candidates_fall_back_to_the_config_name(tmp_path):
         "unsloth/Qwen3.5-0.8B-4bit-GGUF", "unsloth/Qwen3.5-0.8B-GGUF",
     ]
 
-    # A local dir skips _hf_repo; MLX keeps text config as a dict, so _config is the only upstream route.
+    # A local directory skips _hf_repo, and MLX keeps a text config as a dict, so _config is the
+    # only route left to the upstream repo.
     model = types.SimpleNamespace(
         _hf_repo=str(tmp_path), _config={"_name_or_path": "Qwen/Qwen3.5-0.8B"}
     )
@@ -3441,7 +3533,10 @@ def _make_source_tree_with_gguf_py(folder):
 
 
 def test_macos_helper_refuses_pip_install_from_untrusted_checkout(monkeypatch, tmp_path):
-    # pip install <dir> runs its build backend, so only managed or operator-set checkouts are installed.
+    # `pip install <dir>` runs that directory's build backend, so a checkout we
+    # neither manage nor were pointed at must never be installed from. gguf comes
+    # from the package index instead; conversion itself is unaffected either way,
+    # since the converter loads its own sibling gguf-py.
     import unsloth_zoo.llama_cpp as lcpp
 
     monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
@@ -3460,7 +3555,8 @@ def test_macos_helper_refuses_pip_install_from_untrusted_checkout(monkeypatch, t
 
 
 def test_macos_helper_installs_gguf_py_from_managed_checkout(monkeypatch, tmp_path):
-    # Managed ~/.unsloth checkouts still install their in-tree gguf-py to stay in sync with llama.cpp.
+    # The normal path is unchanged: the managed ~/.unsloth checkout still gets its
+    # in-tree gguf-py installed so gguf stays in sync with llama.cpp.
     import unsloth_zoo.llama_cpp as lcpp
 
     home = tmp_path / "unsloth_home"
@@ -3477,7 +3573,8 @@ def test_macos_helper_installs_gguf_py_from_managed_checkout(monkeypatch, tmp_pa
 
 
 def test_macos_helper_installs_gguf_py_from_operator_named_checkout(monkeypatch, tmp_path):
-    # Operator-set UNSLOTH_LLAMA_CPP_PATH is vouched for, so its in-tree gguf-py is still used.
+    # An operator who explicitly points UNSLOTH_LLAMA_CPP_PATH at their own
+    # checkout has vouched for it, so the in-tree gguf-py is still used.
     import unsloth_zoo.llama_cpp as lcpp
 
     monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
@@ -3492,7 +3589,9 @@ def test_macos_helper_installs_gguf_py_from_operator_named_checkout(monkeypatch,
     assert any(str(folder / "gguf-py") in arg for arg in pip_cmds[0]), pip_cmds[0]
 
 
-# Containment check guarding pip install <dir> must be exact, not a naive string-prefix match.
+# `pip install <dir>` runs that directory's build backend, so the containment
+# check that guards it has to be exact. These cover the ways a naive prefix
+# comparison goes wrong.
 
 def _trusted(monkeypatch, folder, home, env_value=None):
     import unsloth_zoo.mlx.utils as mutils
@@ -3513,7 +3612,8 @@ def test_trusted_dir_accepts_managed_checkout(monkeypatch, tmp_path):
 
 
 def test_trusted_dir_rejects_prefix_sibling(monkeypatch, tmp_path):
-    # ~/.unsloth-evil shares a prefix with ~/.unsloth; startswith() without a separator would trust it.
+    # "~/.unsloth-evil" shares a string prefix with "~/.unsloth" but is not inside
+    # it. A startswith() without the separator would trust it.
     home = tmp_path / ".unsloth"
     evil = tmp_path / ".unsloth-evil"
     evil.mkdir(parents=True)
@@ -3522,7 +3622,8 @@ def test_trusted_dir_rejects_prefix_sibling(monkeypatch, tmp_path):
 
 
 def test_trusted_dir_rejects_symlink_escaping_the_managed_root(monkeypatch, tmp_path):
-    # A symlink in ~/.unsloth pointing outside must not launder an untrusted dir into the trusted set.
+    # A symlink sitting inside ~/.unsloth that points out of it must not launder
+    # an untrusted directory into the trusted set.
     home = tmp_path / ".unsloth"
     home.mkdir(parents=True)
     outside = tmp_path / "outside"
@@ -3533,7 +3634,8 @@ def test_trusted_dir_rejects_symlink_escaping_the_managed_root(monkeypatch, tmp_
 
 
 def test_trusted_dir_rejects_cwd_relative_checkout(monkeypatch, tmp_path):
-    # The case the guard exists for: a llama.cpp in the working directory is not vouched for by anyone.
+    # The case the whole guard exists for: a llama.cpp that just happens to be in
+    # the working directory is not something anyone vouched for.
     home = tmp_path / ".unsloth"
     home.mkdir(parents=True)
     cwd = tmp_path / "cwd"
@@ -3558,7 +3660,8 @@ def test_trusted_dir_accepts_operator_named_checkout(monkeypatch, tmp_path):
 
 
 def test_trusted_dir_handles_a_root_trusted_path(monkeypatch, tmp_path):
-    # os.path.join(parent, '') keeps a root parent as '/'; parent + os.sep gives '//' and never matches.
+    # os.path.join(parent, "") keeps a root parent as "/" rather than "//", which
+    # a bare parent + os.sep would produce and never match.
     home = tmp_path / ".unsloth"
     folder = tmp_path / "anywhere"
     # Drive-qualified on Windows: a bare "\\" never contains C:\...
@@ -3567,7 +3670,8 @@ def test_trusted_dir_handles_a_root_trusted_path(monkeypatch, tmp_path):
 
 
 def test_trusted_dir_is_case_insensitive_on_windows_style_paths(monkeypatch):
-    # Only reached on macOS today, but the comparison must not quietly depend on that; drive letter and directory case must not change the verdict.
+    # Only reached on macOS today, but the comparison should not quietly depend on
+    # that. Drive letter and directory case must not change the verdict.
     import ntpath
     import types
     import unsloth_zoo.mlx.utils as mutils
@@ -3592,14 +3696,16 @@ def test_trusted_dir_is_case_insensitive_on_windows_style_paths(monkeypatch):
 
 
 def test_trusted_dir_never_raises_on_bad_input(monkeypatch, tmp_path):
-    # A bad path degrades to untrusted (gguf still comes from the index); it must never raise.
+    # A bad path must degrade to "untrusted" (which still installs gguf from the
+    # index), never take down an export with an unexpected exception.
     home = tmp_path / ".unsloth"
     for bad in ("", None, "/tmp/a\x00b"):
         assert _trusted(monkeypatch, bad, home) is False
 
 
 def test_macos_helper_defaults_to_the_managed_checkout(monkeypatch, tmp_path):
-    # No-arg default is the managed checkout, never a CWD-relative llama.cpp that gets pip installed.
+    # The default used to be a CWD-relative "llama.cpp", so a no-arg call built and
+    # pip installed out of the process working directory.
     import subprocess
     import unsloth_zoo.mlx.utils as mutils
     import unsloth_zoo.llama_cpp as lcpp
