@@ -343,7 +343,6 @@ def test_round_threshold_charges_the_exact_request(host_alloc_conf, gc_module):
 def test_round_threshold_lets_more_buffers_pin_under_the_cap(monkeypatch, host_alloc_conf, gc_module, pin_requests):
     host_alloc_conf("pinned_max_round_threshold_mb:1")
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(7 * MIB / (1 << 30)))
-    # Two 3 MiB slots are 6 MiB really pinned; charged as 4 + 4 MiB the second went pageable.
     gc_module._new_host_buffer(3 * MIB // 2, torch.float16)
     gc_module._new_host_buffer(3 * MIB // 2, torch.float16)
     assert pin_requests == [True, True]
@@ -355,9 +354,7 @@ def test_block_above_max_cached_size_is_not_kept_charged(host_alloc_conf, gc_mod
     assert gc_module._reserve_pinned(3 * MIB)
     assert gc_module.GC_PINNED_BYTES == 3 * MIB
     gc_module._release_pinned(3 * MIB)
-    # torch freed it, so nothing of ours is cached and the bytes are no longer held.
     assert gc_module.GC_PINNED_BYTES == 0 and not any(gc_module._PINNED_CACHED.values())
-    # Small blocks are still rounded and cached.
     assert gc_module._reserve_pinned(3000)
     gc_module._release_pinned(3000)
     assert gc_module.GC_PINNED_BYTES == 4096 and gc_module._PINNED_CACHED == {4096: 1}
@@ -386,7 +383,6 @@ def test_release_uses_the_block_charged_at_allocation(monkeypatch, host_alloc_co
     assert gc_module._reserve_pinned(3 * MIB)       # exact 3 MiB block above the threshold
     assert gc_module._reserve_pinned(MIB)
     assert gc_module.GC_PINNED_BYTES == 4 * MIB
-    # Settings change while both buffers are live: their blocks are still 3 MiB and 1 MiB.
     host_alloc_conf("pinned_max_round_threshold_mb:8")
     gc_module._release_pinned(3 * MIB)
     gc_module._release_pinned(MIB)
@@ -479,8 +475,7 @@ def test_reused_larger_cached_block_cannot_lift_the_cap(monkeypatch, gc_module, 
 
 
 def test_auto_cap_is_not_reduced_by_foreign_pins_present_when_computed(monkeypatch, gc_module, counted):
-    # Free host RAM already excludes the 6 MiB pinned when the cap is computed, so the auto cap adds it back:
-    # the offload still gets its 10 MiB on top.
+    # Free RAM already excludes the 6 MiB pinned, so the auto cap adds it back.
     _auto_cap(monkeypatch, 10 * MIB)
     fake = counted("pinned_max_round_threshold_mb:1")
     fake.allocate(6 * MIB)

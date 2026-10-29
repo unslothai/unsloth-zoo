@@ -187,7 +187,6 @@ def test_released_pending_block_is_flushed_in_per_block_mode(monkeypatch, gc_mod
 
 
 def test_settings_change_while_live_cannot_take_a_phantom_cached_block(gc_module, allocator):
-    # The earlier P2 (release at the allocation-time size), against the allocator's own count.
     fake = allocator("pinned_max_round_threshold_mb:1", cap_bytes = 4 * MIB)
     a = pin(gc_module, fake, 3 * MIB)
     b = pin(gc_module, fake, MIB)
@@ -240,7 +239,6 @@ def test_foreign_pin_between_reservations_counts_against_the_cap(gc_module, allo
     foreign = fake.allocate(6 * MIB)
     assert pin(gc_module, fake, 3 * MIB) is None
     assert fake.held() == pytest.approx(9 * MIB, abs = 64)
-    # Once the foreign block is gone the next offload pins again.
     fake.release(foreign)
     fake.empty_cache()
     assert pin(gc_module, fake, 3 * MIB) is not None
