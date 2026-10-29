@@ -164,9 +164,8 @@ def _packed_weight_without_quant_state_error(module):
     )
 
 
-# Inference 4-bit matmuls call lib.cgemm_4bit_* with the same arguments as bitsandbytes'
-# _gemm_4bit_kernel_impl (identical output, ~50 us less Python per call); the first call per layout is
-# checked bitwise against bitsandbytes.matmul_4bit. UNSLOTH_BNB_4BIT_DIRECT=0 disables.
+# Inference 4-bit matmuls call lib.cgemm_4bit_* with bitsandbytes' _gemm_4bit_kernel_impl arguments; first call
+# per layout is checked bitwise vs bitsandbytes.matmul_4bit. UNSLOTH_BNB_4BIT_DIRECT=0 disables.
 BNB_4BIT_DIRECT_CALLS = {"direct": 0}
 _BNB_DIRECT = {"on": os.environ.get("UNSLOTH_BNB_4BIT_DIRECT", "1") != "0" and torch.version.hip is None,
                "ops": None, "checked": {}, "fn": {}}
@@ -261,8 +260,7 @@ _dispatch_depth = getattr(torch._C, "_len_torch_dispatch_stack", None)
 
 
 def _plain_eager(x):
-    # Raw pointers need real storage: not traced, not a tensor subclass (FakeTensor), not vmap / functorch
-    # wrapped, and no dispatch mode on the stack.
+    # Raw pointers need real storage: no tracing, tensor subclass, vmap / functorch wrapper or dispatch mode.
     if torch.compiler.is_compiling() or torch.jit.is_tracing() or type(x) is not torch.Tensor:
         return False
     if _is_wrapped is not None and _is_wrapped(x):
@@ -289,7 +287,6 @@ def _bnb_4bit_direct(self, x, quant_state):
         return None
     plan = self.__dict__.get("_unsloth_bnb_direct")
     meta = _bnb_direct_meta(quant_state)
-    # Rebuilt on requantize, move, a replaced / recast quant tensor, or edited quant metadata.
     if plan is None or plan[0] is not quant_state or plan[4] != meta or plan[1] is not None and (
         plan[1] != weight.data_ptr() or not _ptrs_equal(_bnb_direct_tensors(quant_state), plan[2])
     ):

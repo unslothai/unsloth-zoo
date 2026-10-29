@@ -213,7 +213,6 @@ def test_warm_plan_follows_metadata_edits(lib):
         qs.shape = torch.Size([32, 128])  # pruned rows, same pointers
         out = Z._bnb_4bit_direct(layer, x, qs)
         assert out.shape[-1] == 32 and lib.calls[-1][1][9] == 32
-    # The offset is read in place on every call, never through a cached copy.
     assert lib.calls[-1][1][5] == qs.offset.data_ptr()
 
 
@@ -225,7 +224,6 @@ def test_plan_keeps_no_tensors_alive(lib):
     with torch.no_grad():
         Z._bnb_4bit_direct(layer, x, qs)
     old = [weakref.ref(qs.absmax), weakref.ref(qs.state2.absmax), weakref.ref(qs.offset)]
-    # What QuantState.to() does on an offload: new tensors on the same object.
     qs.absmax, qs.state2.absmax, qs.offset = qs.absmax.clone(), qs.state2.absmax.clone(), qs.offset.clone()
     gc.collect()
     assert all(r() is None for r in old)
@@ -306,7 +304,6 @@ def test_cuda_bitwise_against_bitsandbytes(nested, dtype, monkeypatch):
                 out = lin(x)
                 assert torch.equal(out, ref), M
     assert Z.BNB_4BIT_DIRECT_CALLS["direct"] > before
-    # Requantized on another device and back: new tensors, same layer.
     lin.cpu().cuda()
     x = torch.randn(1, 1, 2880, device = "cuda", dtype = dtype)
     with torch.no_grad():
