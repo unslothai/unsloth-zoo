@@ -5683,7 +5683,8 @@ pass
 
 
 def compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING=False):
-    # Liquid, Falcon and other Mamba-type models: compiling is disabled on causal_conv1d_fn.
+    # For Liquid, Falcon and other Mamba type models
+    # We disable compiling on them!
     try:
         import causal_conv1d
 
@@ -5898,7 +5899,8 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
 
 def calls_output_capture_target(init, source, target_names):
     """Detect direct calls to submodules targeted by Transformers output hooks."""
-    # A forward decorated with @capture_outputs installs the hooks itself, even when submodules are built indirectly, e.g. via helpers.
+    # A forward decorated with @capture_outputs installs the hooks itself, even
+    # when its captured submodules are built indirectly (e.g. via helpers).
     if re.search(r"^\s*@capture_outputs\b", source, flags=re.MULTILINE):
         return True
     for target_name in target_names:

@@ -382,8 +382,8 @@ if not _SKIP_GPU_INIT:
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
         delete_key("PYTORCH_HIP_ALLOC_CONF")
 
-    # Hides torchao's 'skipping cpp extensions' warning for incompatible torch/torchao versions (e.g. torch 2.7.0 with
-    # torchao 0.14.1); see pytorch/ao issue 2919.
+    # Suppress WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.7.0+cu126 for torchao version 0.14.1
+    # Please see https://github.com/pytorch/ao/issues/2919 for more info
     import logging
     torchao_logger = logging.getLogger("torchao")
     class HideLoggingMessage(logging.Filter):

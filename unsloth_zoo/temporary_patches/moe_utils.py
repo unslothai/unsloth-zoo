@@ -4140,7 +4140,9 @@ def _patched_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs)
 
 
 def _moe_utils_logger():
-    """Logger import is lazy and absolute: this file is also copied into unsloth_compiled_cache and runs as a top-level module with no package for relative imports."""
+    """The shared patch logger, imported lazily and absolutely: this file is also copied
+    into unsloth_compiled_cache and executed there as a top level module, where a
+    relative import has no package to resolve against."""
     try:
         from unsloth_zoo.temporary_patches.common import logger
         return logger
