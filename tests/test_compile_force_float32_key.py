@@ -134,3 +134,47 @@ def test_compiled_cache_written_by_fp16_process_is_regenerated_for_bf16(tmp_path
     shared = tmp_path / "shared"
     assert _forced(_run(["1"], shared)[0]["source"])
     assert _normalized(_run(["0"], shared)[0]["source"]) == _normalized(fresh_bf16)
+
+
+CROSS_SCRIPT = r"""
+import inspect, json, os, sys
+from unsloth_zoo.temporary_patches import TEMPORARY_PATCHES
+import unsloth_zoo.compiler as compiler
+import peft.tuners.lora.layer
+
+def run_patches(phase):
+    for patch in TEMPORARY_PATCHES:
+        try:
+            if "phase" in inspect.signature(patch).parameters: patch(phase = phase)
+            else: patch()
+        except Exception: pass
+
+stamps = []
+for model_type, flag in json.loads(sys.argv[1]):
+    os.environ["UNSLOTH_FORCE_FLOAT32"] = flag
+    run_patches("pre_compile")
+    compiler.unsloth_compile_transformers(model_type)
+    run_patches("post_compile")
+    stamps.append(getattr(peft.tuners.lora.layer.Linear.forward, "_unsloth_force_float32", None))
+print("RESULT " + json.dumps(stamps))
+"""
+
+
+def test_lora_forwards_follow_the_flag_across_model_families(tmp_path):
+    # LoRA forwards are global: llama (0), gemma3 (1), llama (0) must end on the flag-0 forward
+    # even though llama's own compiled module is unchanged and returns early.
+    env = dict(
+        os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
+        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_COMPILE_LOCATION = str(tmp_path / "cache"),
+    )
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p)
+    for key in ("UNSLOTH_FORCE_FLOAT32", "UNSLOTH_FORCE_CUSTOM_DTYPE", "UNSLOTH_COMPILE_OVERWRITE"):
+        env.pop(key, None)
+    sequence = [["llama", "0"], ["gemma3", "1"], ["llama", "0"]]
+    proc = subprocess.run(
+        [sys.executable, "-c", CROSS_SCRIPT, json.dumps(sequence)],
+        capture_output = True, text = True, timeout = 900, env = env,
+    )
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
+    assert json.loads(lines[-1][len("RESULT "):]) == ["0", "1", "0"]

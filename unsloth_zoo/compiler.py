@@ -5311,6 +5311,7 @@ def patch_lora_forwards(torch_compile_options):
             ).unsloth_forward
             forward._unsloth_force_float32 = force_float32
             forward._unsloth_original_forward = original_forward
+            forward._unsloth_torch_compile_options = torch_compile_options
             if integer_input_inline:
                 forward._unsloth_integer_input = True
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
@@ -6208,6 +6209,24 @@ def _patch_torch_dtype_modules(
     pass
 
 
+def _reconcile_lora_forwards():
+    """PEFT's LoRA forwards are global: another model family's load may have rebuilt them under the
+    other UNSLOTH_FORCE_FLOAT32, so an unchanged modeling file still rebuilds stale ones."""
+    force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0")
+    try:
+        layers = get_lora_layer_modules()
+    except Exception:
+        return
+    for function, parent, child in layers:
+        forward = getattr(function, "forward", None)
+        stamped = getattr(forward, "_unsloth_force_float32", None)
+        if stamped is not None and stamped != force_float32:
+            options = getattr(forward, "_unsloth_torch_compile_options", None)
+            if options is not None:
+                patch_lora_forwards(options)
+            return
+
+
 # model_location -> {(dict name or None, key): original}, recorded before the first replacement.
 _MODELING_FILE_ORIGINALS = {}
 # model_location -> _compiled_source_key() of its last pass. Not a module attribute:
@@ -6337,6 +6356,8 @@ def unsloth_compile_transformers(
     module_eager_rewrites = module_forward_eager_rewrites(modeling_file, model_type)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
+        if (not full_disable) and fast_lora_forwards:
+            _reconcile_lora_forwards()
         # Get __UNSLOTH_SUPPORTS_SDPA__
         if hasattr(modeling_file, "__UNSLOTH_SUPPORTS_SDPA__"):
             if supports_sdpa is not None:
