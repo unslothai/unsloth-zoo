@@ -4999,7 +4999,7 @@ def _taped_update(native, with_states):
                                        "states for %s; verify keeps writing every step's state there", key)
                 return stock
             y, final, _ = replay(mask = mask)
-            tapes.append((cache, cache_index, replay, mask))
+            tapes.append((cache, cache_index, replay, mask, False))
             return y, final, mx.broadcast_to(final[:, None], (final.shape[0], steps, *final.shape[1:]))
 
         return cache.update_recurrent(cache_index, length, update)
@@ -5019,9 +5019,14 @@ def _taped_transaction_class(base):
         if counts == {self.length} or counts == {0}:
             return
         # Otherwise stock selected from a stand-in history; the retained state is the replayed prefix.
-        for cache, index, replay, mask in tapes:
+        retained = None
+        for cache, index, replay, mask, folds in tapes:
             rows = [lengths] * replay.args[0].shape[0] if isinstance(lengths, int) else lengths
             cache[index] = replay(mask = _retained_mask(rows, self.length, mask))[1]
+            if folds:  # the next fused block can advance from the replay's own entry instead
+                if retained is None:
+                    retained = mx.array(rows, mx.uint32)
+                cache._unsloth_pending = (cache[index], replay, retained)
 
     def abort(self):
         self.__dict__.pop("_unsloth_tapes", None)
@@ -5156,6 +5161,50 @@ _VERIFY_GDN_SOURCE = """
         }
     }
 """
+# The block after a partly retained one: each row first advances the retained block's entry state over its retained
+# steps, the replay's recurrence with no outputs, and writes that state for this block's own commit to replay from.
+_VERIFY_GDN_PENDING_LOADS = """
+    threadgroup T pending_ks[LMAX * Dk];
+    threadgroup T pending_vs[LMAX * Dv];
+    threadgroup float pending_decay[LMAX];
+    threadgroup T pending_beta[LMAX];
+    const uint P = retained[row];
+    const uint PL = pending_length;
+    for (uint i = tid; i < P * Dk; i += NT) {
+        pending_ks[i] = pending_k[((row * PL + i / Dk) * Hk + hk) * Dk + i % Dk];
+    }
+    for (uint i = tid; i < P * Dv; i += NT) {
+        pending_vs[i] = pending_v[((row * PL + i / Dv) * Hv + hv) * Dv + i % Dv];
+    }
+    if (tid < P) {
+        uint gi = (row * PL + tid) * Hv + hv;
+        PT gate = Add()(static_cast<PT>(pending_a[gi]), static_cast<PT>(dt_bias[hv]));
+        float softplus = static_cast<float>(static_cast<PT>(LogAddExp()(gate, static_cast<PT>(0))));
+        pending_decay[tid] = Exp()(Multiply()(Negative()(Exp()(static_cast<float>(A_log[hv]))), softplus));
+        pending_beta[tid] = Sigmoid()(pending_b[gi]);
+    }
+"""
+_VERIFY_GDN_PENDING_STEPS = """
+        for (uint t = 0; t < P; ++t) {
+            float kv_mem = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] * pending_decay[t];
+                kv_mem += state[i] * pending_ks[t * Dk + lane * 4 + i];
+            }
+            kv_mem = simd_sum(kv_mem);
+            auto delta = (pending_vs[t * Dv + dv] - kv_mem) * pending_beta[t];
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] + pending_ks[t * Dk + lane * 4 + i] * delta;
+            }
+        }
+        auto a_state = advanced + (n * Dv + dv) * Dk + lane * 4;
+        for (int i = 0; i < 4; ++i) {
+            a_state[i] = state[i];
+        }
+"""
+_VERIFY_GDN_FOLD_SOURCE = (
+    _VERIFY_GDN_SOURCE.replace("    threadgroup T beta[LMAX];\n", "    threadgroup T beta[LMAX];" + _VERIFY_GDN_PENDING_LOADS)
+    .replace("        for (uint t = 0; t < L; ++t) {\n", _VERIFY_GDN_PENDING_STEPS[1:] + "        for (uint t = 0; t < L; ++t) {\n"))
 _VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
 # Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
 _VERIFY_GDN_MAX_ROWS = 16
@@ -5176,38 +5225,53 @@ _VERIFY_GDN_CONTRACT = {
     "mlx.nn": {"silu": "78867fdb7e42731c", "softplus": "4d48a9bee57aeadd", "Conv1d.__call__": "e6c4e02415104dd1"},
 }
 _VERIFY_GDN_VERDICTS = {}
+_VERIFY_GDN_FOLDS = {}
 
 
 @functools.cache
-def _verify_gdn_kernel():
+def _verify_gdn_kernel(fold = False):
     try:
         header = mx.metal.is_available() and nax._mlx_kernel_header("unary_ops.h")
         binary = header and nax._mlx_kernel_header("binary_ops.h")
         return binary and mx.fast.metal_kernel(
-            name = "unsloth_gated_delta_verify_block",
+            name = "unsloth_gated_delta_verify_block" + "_folded" * fold,
             input_names = ["conv_input", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight", "q_scale",
-                           "k_scale", "qk_eps", "norm_eps", "state_in", "length"],
-            output_names = ["y", "state_out", "q_out", "k_out", "v_out"], header = header + binary,
-            compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_SOURCE,
+                           "k_scale", "qk_eps", "norm_eps", "state_in", "length",
+                           *(("pending_k", "pending_v", "pending_a", "pending_b", "retained", "pending_length") if fold else ())],
+            output_names = ["y", "state_out", "q_out", "k_out", "v_out", *(("advanced",) if fold else ())],
+            header = header + binary,
+            compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_FOLD_SOURCE if fold else _VERIFY_GDN_SOURCE,
         ) or None
     except (AttributeError, TypeError):
         return None
 
 
-def _verify_gdn_block(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads):
+def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads, pending):
     B, L, value_heads, Dv = z.shape
     Dk, dtype = state.shape[-1], conv_input.dtype
     q_scale, k_scale, qk_norm_eps, norm_eps = _decode_step_scalars(Dk, dtype, qk_eps, eps)
-    return _verify_gdn_kernel()(
+    extra = [state.shape] if pending else []
+    return _verify_gdn_kernel(bool(pending))(
         inputs = [conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, qk_norm_eps, norm_eps,
-                  state, L],
+                  state, L, *pending],
         template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[1]),
                     ("LMAX", _VERIFY_GDN_MAX_ROWS), ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv),
                     ("TY", _VERIFY_GDN_ROWS)],
         grid = (32, _VERIFY_GDN_ROWS, B * value_heads), threadgroup = (32, _VERIFY_GDN_ROWS, 1),
-        output_shapes = [z.shape, state.shape, (B, L, key_heads, Dk), (B, L, key_heads, Dk), z.shape],
-        output_dtypes = [dtype, state.dtype, dtype, dtype, dtype],
+        output_shapes = [z.shape, state.shape, (B, L, key_heads, Dk), (B, L, key_heads, Dk), z.shape, *extra],
+        output_dtypes = [dtype, state.dtype, dtype, dtype, dtype, *(state.dtype for _ in extra)],
     )
+
+
+def _verify_gdn_block(*args):
+    return _verify_gdn_launch(*args, ())
+
+
+def _verify_gdn_folded_block(*args, pending):
+    """`_verify_gdn_block` from the entry state of a block whose retained prefix was not replayed yet, given that
+    block's k, v, a, b and each row's retained count; it also returns the state after that prefix."""
+    k, v, a, b, rows = pending
+    return _verify_gdn_launch(*args, (k, v, a, b, rows, k.shape[1]))
 
 
 def _verify_gdn_fits(layer, inputs, mask, cache):
@@ -5231,9 +5295,35 @@ def _verify_gdn_fits(layer, inputs, mask, cache):
             and all(t.dtype in (mx.float32, mx.bfloat16, mx.float16) for t in (layer.A_log, layer.dt_bias)))
 
 
+def _verify_gdn_folded(key, folded, fused, entry):
+    """`folded()` once `key`'s first fold matched `fused(entry)` and `entry` bit for bit; until then `fused(entry)`
+    and `entry`, which a failed key keeps for good."""
+    verdict = _VERIFY_GDN_FOLDS.get(key)
+    if verdict:
+        return folded()
+    reference = (*fused(entry), entry)
+    if verdict is None:
+        try:
+            verdict = _settled(all(x.dtype == y.dtype and x.shape == y.shape
+                                   and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+                                   for x, y in zip(reference, folded())))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            if str(error).startswith("[metal::Device] Unable to "):
+                _VERIFY_GDN_FOLDS[key] = False
+        else:
+            _VERIFY_GDN_FOLDS[key] = verdict
+            if not verdict:
+                logger.warning("advancing a fused verify block over the retained prefix of the one before differs "
+                               "from replaying that prefix for %s; the replay stays in use there", key)
+    return reference
+
+
 def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
     """The verifier's `_gated_delta` for a block `_verify_gdn_fits` took, its convolution through gated norm fused
-    once a first block matched the stock ops bit for bit; the commit replays the kernel's q/k/v like a taped block's."""
+    once a first block matched the stock ops bit for bit; the commit replays the kernel's q/k/v like a taped block's.
+    A block on a partly retained one's unevaluated replay starts from that block's entry state instead, once a first
+    such block matched."""
     batch, length, _ = inputs.shape
     K, Dv, Hk = layer.conv_kernel_size, layer.head_v_dim, layer.num_k_heads
     mixed_qkv, z, b, a = self._linears((layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a), inputs)
@@ -5244,21 +5334,35 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
     conv_input = mx.concatenate([conv_state, mixed_qkv], axis = 1)
     cache.update_window(0, conv_input, K - 1, lengths = cache.lengths)
     initial, dtype = cache[1], conv_input.dtype
+    pending = cache.__dict__.pop("_unsloth_pending", None)
     key = (length, Hk, layer.num_v_heads, K, dtype, a.dtype, b.dtype, layer.A_log.dtype, layer.dt_bias.dtype,
            getattr(initial, "dtype", None), qk_eps, layer.norm.eps)
     verdict = _VERIFY_GDN_VERDICTS.get(key)
     fits = all(t.dtype == dtype for t in (z, a, b)) and a.shape == b.shape == (batch, length, layer.num_v_heads)
-    fused = lambda state: _verify_gdn_block(
+    block = lambda state: (
         conv_input, layer.conv1d.weight.reshape(layer.conv_dim, K), a, b, layer.A_log, layer.dt_bias, z,
         layer.norm.weight, qk_eps, layer.norm.eps,
         mx.zeros((batch, layer.num_v_heads, Dv, layer.head_k_dim), mx.float32) if state is None else state, Hk)
+    fused = lambda state: _verify_gdn_block(*block(state))
     # A passed check holds the key of the replay its commit relies on.
     if fits and verdict and _TAPE_VERDICTS.get(verdict):
+        fold = None
+        if pending is not None:  # still the state the last commit's replay of this layer's fused block left
+            state, replay, rows = pending
+            _, pending_k, pending_v, pending_a, pending_b, A_log, dt_bias, pending_entry = replay.args
+            if (state is initial and A_log is layer.A_log and dt_bias is layer.dt_bias and pending_k.dtype == dtype
+                    and (pending_a.dtype, pending_b.dtype) == (a.dtype, b.dtype)):
+                fold = (*key, pending_k.shape[1]), lambda: _verify_gdn_folded_block(
+                    *block(pending_entry), pending = (pending_k, pending_v, pending_a, pending_b, rows))
+
         def update(entry, steps):
-            y, final, q, k, v = fused(entry)
+            if fold is not None:
+                y, final, q, k, v, entry = _verify_gdn_folded(*fold, fused, entry)
+            else:
+                y, final, q, k, v = fused(entry)
             replay = functools.partial(with_states, q, k, v, a, b, layer.A_log, layer.dt_bias, entry,
                                        use_kernel = True, state_steps = 0)
-            _VERIFY_STATE.tapes.append((cache, 1, replay, None))
+            _VERIFY_STATE.tapes.append((cache, 1, replay, None, True))
             return y, final, mx.broadcast_to(final[:, None], (batch, steps, *final.shape[1:]))
         output, _ = cache.update_recurrent(1, length, update)
     else:
@@ -7180,8 +7284,8 @@ def warm_inference(model, int8_prefill = None, ane_prefill = None):
 
 def _warm_verify_gdn(model):
     """Build the fused verify block's pipeline for each linear-attention layer shape, and settle each block width's
-    bitwise checks through the verifier for a model a drafter was built for: either would otherwise land in the first
-    speculative replies."""
+    and each pair of widths' bitwise checks through the verifier for a model a drafter was built for: either would
+    otherwise land in the first speculative replies."""
     language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
     if (language is None or os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") == "0" or not hasattr(model, "named_modules")
             or mx.default_device() != mx.gpu or not _verify_gdn_kernel()):
@@ -7213,22 +7317,38 @@ def _settle_verify_gdn(model, language, shapes):
     verifier, caches = getattr(language, "_EXACT_SPECULATIVE_VERIFIER", None), sys.modules.get("mlx_vlm.models.cache")
     served = {id(layer) for _, owner in model.named_modules() if vars(owner).get("_unsloth_verify_scopes")
               for _, layer in owner.named_modules()}
-    if caches is None or not hasattr(type(verifier), "_unsloth_verify_native"):
+    transactions, widths = sys.modules.get("mlx_vlm.speculative.cache_state"), range(3, _VERIFY_GDN_MAX_ROWS + 1)
+    if caches is None or transactions is None or not hasattr(type(verifier), "_unsloth_verify_native"):
         return
     outer = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
+
+    def fresh(layer, dtype, seed):
+        cache, key = caches.ArraysCache(2), mx.random.key(seed)
+        cache[0] = mx.random.normal((1, layer.conv_kernel_size - 1, layer.conv_dim), key = key).astype(dtype)
+        cache[1] = mx.random.normal((1, layer.num_v_heads, layer.head_v_dim, layer.head_k_dim), key = key) * 0.1
+        return cache
+
+    def verified(layer, dtype, cache, length, keep):
+        transaction, key = transactions.start_speculative_cache([cache], length), mx.random.key(length)
+        _VERIFY_STATE.tapes = []
+        mx.eval(verifier._gated_delta(layer, mx.random.normal((1, length, layer.hidden_size), key = key)
+                                      .astype(dtype), None, cache))
+        if keep and _VERIFY_STATE.tapes:
+            transaction.__class__ = _taped_transaction_class(type(transaction))
+            transaction._unsloth_tapes = _VERIFY_STATE.tapes
+        transaction.commit(keep) if keep else transaction.abort()
     try:
         _VERIFY_STATE.serving = True
         for (dtype, *_), layer in shapes.items():
             if id(layer) not in served:
                 continue
-            for length in range(3, _VERIFY_GDN_MAX_ROWS + 1):
-                cache, key = caches.ArraysCache(2), mx.random.key(length)
-                cache[0] = mx.random.normal((1, layer.conv_kernel_size - 1, layer.conv_dim), key = key).astype(dtype)
-                cache[1] = mx.random.normal((1, layer.num_v_heads, layer.head_v_dim, layer.head_k_dim), key = key) * 0.1
-                cache.start_speculation(length)
-                _VERIFY_STATE.tapes = []
-                mx.eval(verifier._gated_delta(layer, mx.random.normal((1, length, layer.hidden_size), key = key)
-                                              .astype(dtype), None, cache))
+            for length in widths:
+                verified(layer, dtype, fresh(layer, dtype, length), length, 0)
+            # Then a block after each partly retained width, which folds that width's replay.
+            for first, length in itertools.product(widths, widths):
+                cache = fresh(layer, dtype, first)
+                verified(layer, dtype, cache, first, 1)
+                verified(layer, dtype, cache, length, 0)
     finally:
         _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer
 

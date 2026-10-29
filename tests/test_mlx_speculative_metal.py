@@ -752,6 +752,65 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         assert set(inference._VERIFY_GDN_VERDICTS.values()) == {False}
 
 
+@pytest.mark.parametrize("width", [3, 5, 16])
+def test_a_fused_block_after_a_partly_retained_one_folds_its_replay_and_matches_unfolded(qwen_4bit, monkeypatch, width):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.speculative import _join
+    model, ids, _ = qwen_4bit
+    lm, cache = model.language_model, None
+    for row, prompt in enumerate([ids[0][:24], ids[0][:17], ids[0][:31]]):
+        entries = make_prompt_cache(lm)
+        mx.eval(lm(mx.array([prompt]), cache = entries).logits)
+        cache = _join(cache, entries, row)
+    blocks = [mx.array([ids[0][start : start + width] for start in (24 + s, 30 + s, 36 + s)]) for s in (0, 7, 14)]
+    keeps = [[1, width - 1, 1 + width // 2], [0, width, 2], [2, 1, width - 1]]
+    layers = sum(layer.is_linear for layer in lm.model.layers)
+    for name in ("_TAPE_VERDICTS", "_VERIFY_GDN_VERDICTS", "_VERIFY_GDN_FOLDS"):
+        monkeypatch.setattr(inference, name, {})
+    fused, folded, block_fn, fold_fn = [], [], inference._verify_gdn_block, inference._verify_gdn_folded_block
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args: fused.append(args) or block_fn(*args))
+    monkeypatch.setattr(inference, "_verify_gdn_folded_block", lambda *args, **kw: folded.append(args) or fold_fn(*args, **kw))
+
+    def round_after(run, block, keep, poison = False):
+        """`block` on `run`, committed at `keep`, against the same block on a copy that cannot fold."""
+        expected = _verified(lm, run, block, keep)
+        for entry in run:
+            if poison and "_unsloth_pending" in vars(entry):  # a fold reads only the replay's inputs
+                state, replay, rows = entry._unsloth_pending
+                entry[1] = state + float("nan")
+                entry._unsloth_pending = (entry[1], replay, rows)
+        calls = len(fused), len(folded)
+        out = lm(block, cache = run, speculative_verify = True, **_captured(lm))
+        out.gdn_states.commit(keep)
+        assert _same(expected, _state(out, run))
+        return len(fused) - calls[0], len(folded) - calls[1]
+
+    with inference.exact_speculative_verify(model):
+        _verified(lm, cache, blocks[0], 0)
+        run, out = _verify_call(lm, cache, blocks[0])
+        out.gdn_states.commit(keeps[0])
+        assert sum("_unsloth_pending" in vars(entry) for entry in run) == layers
+        retained = [entry._unsloth_pending[2] for entry in run if "_unsloth_pending" in vars(entry)]
+        assert len({id(rows) for rows in retained}) == 1 and retained[0].dtype == mx.uint32
+        # A key's first fold is checked against replaying first; every later one folds alone, over any retained rows.
+        assert round_after(run, blocks[1], keeps[1]) == (1, layers)
+        assert list(inference._VERIFY_GDN_FOLDS.values()) == [True]
+        assert round_after(run, blocks[2], keeps[2], poison = True) == (0, layers)
+        assert round_after(run, blocks[0], keeps[0], poison = True) == (0, layers)
+        # A state replaced since the commit does not fold, and its record goes with the next block.
+        mx.eval(lm(blocks[1][:, :1], cache = run).logits)
+        assert round_after(run, blocks[1], keeps[1]) == (layers, 0)
+        assert round_after(run, blocks[2], keeps[0], poison = True) == (0, layers)
+        # A fold that differs from the replay keeps that key on the replay for good.
+        inference._VERIFY_GDN_FOLDS.clear()
+        monkeypatch.setattr(inference, "_verify_gdn_folded_block",
+                            lambda *args, **kw: folded.append(args) or (lambda y, *rest: (y + 1, *rest))(*fold_fn(*args, **kw)))
+        assert round_after(run, blocks[0], keeps[1]) == (layers, 1)
+        assert list(inference._VERIFY_GDN_FOLDS.values()) == [False]
+        assert round_after(run, blocks[1], keeps[2]) == (layers, 0)
+
+
 def _recurrence(rows, steps, heads = 4, width = 128):
     q, k, v = (mx.random.normal((rows, steps, heads, width), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in range(3))
     a, b = (mx.random.normal((rows, steps, heads), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in (3, 4))
@@ -773,6 +832,7 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, q
     monkeypatch.setattr(inference, "_native_causal_attention", lambda *args: None)
     monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
     monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    monkeypatch.setattr(inference, "_VERIFY_GDN_FOLDS", {})
     monkeypatch.setattr(model, "generate", lambda *args, **kwargs: None, raising = False)
     monkeypatch.setattr(model, "_unsloth_speculates", False, raising = False)
     with monkeypatch.context() as patch:
@@ -789,11 +849,18 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, q
         widths = range(3, inference._VERIFY_GDN_MAX_ROWS + 1)
         assert sorted(key[0] for key in inference._VERIFY_GDN_VERDICTS) == list(widths)
         assert all(inference._VERIFY_GDN_VERDICTS.values()) and set(launched) == warmed
+        assert sorted(key[::12] for key in inference._VERIFY_GDN_FOLDS) == [(a, b) for a in widths for b in widths]
+        assert all(inference._VERIFY_GDN_FOLDS.values())
         for width in (3, 8):
             launched.clear()
             work = inference.first_use_work()
             _verified(model.language_model, cache, mx.array([ids[0][24 : 24 + width]]), 0)
             assert inference.first_use_work() == work and set(launched) == warmed
+        run, out = _verify_call(model.language_model, cache, mx.array([ids[0][24:29]]))
+        out.gdn_states.commit(2)
+        work = inference.first_use_work()
+        model.language_model(mx.array([ids[0][26:34]]), cache = run, speculative_verify = True).gdn_states.abort()
+        assert inference.first_use_work() == work
     assert len(warmed) == 1
     # A build the runtime rejects leaves warm-up to the native ops: one attempt per shape, no verdicts.
     builds, errors = [], [RuntimeError("[metal::Device] Unable to build metal library from source")]
