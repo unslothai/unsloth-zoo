@@ -752,6 +752,9 @@ def requires_grad_for_gradient_checkpointing(model):
     def collect_hook_targets():
         hook_targets = OrderedDict()
         fallback_targets = OrderedDict()
+        # id(forward) -> (forward, source): every LoRA weight walks up to the same ancestors.
+        # Holding the function keeps its id from being reused within this call.
+        forward_sources = {}
 
         for name, param in model.named_parameters():
             if not param.requires_grad: continue
@@ -776,8 +779,15 @@ def requires_grad_for_gradient_checkpointing(model):
                 fallback_name   = name_pre
                 fallback_module = module
                 if hasattr(module, "forward"):
-                    try: forward = inspect.getsource(module.forward)
-                    except: continue
+                    forward_function = module.forward
+                    forward_function = getattr(forward_function, "__func__", forward_function)
+                    cached = forward_sources.get(id(forward_function))
+                    if cached is None:
+                        try: source = inspect.getsource(module.forward)
+                        except: source = None
+                        cached = forward_sources[id(forward_function)] = (forward_function, source)
+                    forward = cached[1]
+                    if forward is None: continue
 
                     # Normal self.language_model(...)
                     if f"self.{name_curr}(" in forward:
