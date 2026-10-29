@@ -637,7 +637,7 @@ class _Attached:
     keeps no other layer alive."""
 
     def __init__(self, mlps):
-        self.mlps, self.warned = [weakref.ref(m) for m in mlps], False
+        self.mlps, self.warned, self.rerouted = [weakref.ref(m) for m in mlps], False, False
 
 
 def _relieve(group):
@@ -698,6 +698,7 @@ class _Split:
         mx.eval([p.parameters() for p in self.rest])
         self.sources = tuple((p, p.weight, p.scales, p.biases) for p in (gate, up, down))
         self.failed, self.pad_from, self.group, self.cost = False, tile, None, _split_bytes(mlp, k)
+        self.route = None
 
     def serves(self, mlp):
         """Whether `mlp` still has the projections and quantized tensors this split was built from."""
@@ -748,6 +749,13 @@ def _split_call(base):
         rows = x.size // x.shape[-1]
         if split is None or split.failed or _ABANDONED or self.training or rows < split.pad_from:
             return base.__call__(self, x)
+        if _faster_route(route := _route(self, split.tile), split.route):
+            if not split.group.rerouted:
+                split.group.rerouted = True
+                logger.warning("Neural Engine prefill: the GPU route is %s, faster than the %s the split was tuned "
+                               "on; the native MLP runs until release_ane_prefill and prepare_ane_prefill", route,
+                               split.route)
+            return base.__call__(self, x)
         if split.group is not None:
             _relieve(split.group)
             if self.__dict__.get(_STATE) is not split:
@@ -778,7 +786,7 @@ def _split_class(base):
     return cls
 
 
-def _machine_key(mlp, tile):
+def _machine_key(mlp, tile, route):
     gate, up, down = _projections(mlp)
     try:
         chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output = True, text = True,
@@ -787,7 +795,7 @@ def _machine_key(mlp, tile):
         chip = platform.machine()
     build = platform.mac_ver()[0]
     return (f"{chip}|macOS {build}|mlx {mx.__version__}|{down.weight.shape[0]}x{gate.weight.shape[0]}|"
-            f"q{gate.bits}/{up.bits}/{down.bits}g{gate.group_size}|{gate.scales.dtype}|tile {tile}")
+            f"q{gate.bits}/{up.bits}/{down.bits}g{gate.group_size}|{gate.scales.dtype}|tile {tile}|{route}")
 
 
 def _load_cache():
@@ -824,16 +832,34 @@ def _aligned(channels, share):
     return int(min(max(round(channels * share / _ALIGN), 1), channels // _ALIGN - 1)) * _ALIGN
 
 
+def _route(mlp, tile):
+    from .inference import prefill_route
+
+    return "/".join(prefill_route(p, tile) for p in _projections(mlp))
+
+
+def _faster_route(now, tuned):
+    """Whether a projection now takes a faster route than the one the share was tuned on; a slower one (a retired
+    dense shape, or no route scope held) only lowers the GPU time the split beats."""
+    rank = {"stock": 0, "tiled": 1, "dense": 1, "int8": 2}
+    return any(rank[a] > rank[b] for a, b in zip(now.split("/"), tuned.split("/")))
+
+
+@contextmanager
+def _generation_routes(model):
+    from .inference import dense_prefill_linear, nax_quantized_linear
+
+    with nax_quantized_linear(model), dense_prefill_linear(model):
+        yield
+
+
 def _calibrate(model, mlp, tile, surfaces):
     """(share, GPU ms, split ms, split at that share) for one tile: a tile costs about max(g (1 - s), a s), lowest at
     s = g / (g + a); the chosen share is timed end to end since both units share memory bandwidth."""
-    from .inference import dense_prefill_linear   # the GPU route a generation would take
-
     gate = _projections(mlp)[0]
     channels, hidden = gate.weight.shape[0], gate.scales.shape[1] * gate.group_size
     x = (mx.random.normal((tile, hidden), key = mx.random.key(1)) * 0.5).astype(gate.scales.dtype)
-    with dense_prefill_linear(model, _modules = tuple(mlp.named_modules())):
-        gpu = _median_ms(lambda: mlp(x[None]))
+    gpu = _median_ms(lambda: mlp(x[None]))   # on the GPU route prepare holds
     probe = _Split(mlp, _aligned(channels, 0.5), tile, surfaces)
 
     def neural_engine():
@@ -862,7 +888,9 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
         return AnePrefillStatus(0, reason = "the default device is not the GPU")
     if tile % 32:
         raise ValueError("tile must be a multiple of 32 rows")
-    with _LOCK:
+    # Calibration times, and each split records, the GPU routes a generation would take; a generation's own scopes
+    # already hold them.
+    with _LOCK, _generation_routes(model):
         mlps = []
         for _, module in model.named_modules():
             if module.__dict__.get(_STATE) is None and _projections(module)[0] is not None and _eligible(module):
@@ -879,7 +907,8 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
         bits = collections.Counter(_bits(m) for m in mlps).most_common(1)[0][0]
         probe = next(m for m in mlps if _bits(m) == bits)
         surfaces = _Surfaces(shape[0], tile)
-        key, first = _machine_key(probe, tile), None
+        route = _route(probe, tile)
+        key, first = _machine_key(probe, tile, route), None
         cached = _load_cache().get(key) if share is None else None
         if share is not None:
             gpu = split_ms = 0.0
@@ -918,7 +947,7 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
                 k = _aligned(_projections(mlp)[0].weight.shape[0], share)
                 split = first if first is not None and mlp is probe and first.k == k else None
                 mlp.__dict__[_STATE] = split = split or _Split(mlp, k, tile, surfaces)
-                split.pad_from = pad_from
+                split.pad_from, split.route = pad_from, _route(mlp, tile)
                 attached.append(mlp)
         except AneError as error:
             logger.warning("Neural Engine prefill stopped after %d of %d layers: %s", len(attached), len(mlps), error)

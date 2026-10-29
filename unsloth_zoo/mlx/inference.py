@@ -4654,6 +4654,28 @@ def _dense_prefill_in_scope(module, x):
     return None if bindings is None else _dense_prefill_qmm(module, x, bindings)
 
 
+def prefill_route(module, rows):
+    """The route a `rows`-row call of this quantized linear takes under the scopes it holds now: "int8", "dense",
+    "tiled" or "stock". A route whose first-use check has not run yet counts as taken; one that failed it does not."""
+    d, w, scales = module.__dict__, module["weight"], module["scales"]
+    N, K, dtype = w.shape[0], scales.shape[-1] * module.group_size, scales.dtype
+    low = getattr(module, "_unsloth_nax_int8_prefill_rows", 0)
+    if low and rows >= low and _NAX_INT8_QMM_VERIFIED.get(
+            ("dense", N, K, module.group_size, module.bits, dtype)) is not False:
+        return "int8"
+    if not d.get("_unsloth_dense_qmm_scopes"):
+        return "stock"
+    if (mx.__version__ in _DENSE_QMM_DISPATCH_MLX and rows >= _DENSE_QMM_MIN_ROWS and N != 1
+            and -(-rows // 16) * -(-N // 16) > _DENSE_QMM_MIN_TILES and N * K <= _DENSE_QMM_MAX_WEIGHTS):
+        biases = module.get("biases")
+        family = (N, K, module.bits, module.group_size, module.mode, dtype, w.dtype, dtype,
+                  getattr(biases, "dtype", None))
+        return "stock" if family in _DENSE_QMM_VERIFIED else "dense"
+    if d.get("_unsloth_tiled_qmm") and not N % _TILED_QMM_TILE["BN"] and not _tile_shape_loses(rows, N):
+        return "tiled"
+    return "stock"
+
+
 @functools.cache
 def _dense_qmm_class(*cache_key):
     bindings = _dense_qmm_bindings(*cache_key)

@@ -306,10 +306,10 @@ def test_calibration_runs_on_the_most_common_quantization_and_keys_on_every_proj
     else:   # the probe was not admitted, so its split is closed
         assert not serving and closed == [calibrated[0]]
     ane.release_ane_prefill(model)
-    keys = {ane._machine_key(model.layers[i], TILE) for i in (0, 1, 2, 3)}
+    keys = {ane._machine_key(model.layers[i], TILE, "stock") for i in (0, 1, 2, 3)}
     model.layers[2].up_proj = _projection(5, inputs = HIDDEN, outputs = CHANNELS)
     model.layers[3].gate_proj = _projection(5, inputs = HIDDEN, outputs = CHANNELS)
-    assert len(keys) == 2 and len({ane._machine_key(model.layers[i], TILE) for i in (0, 1, 2, 3)}) == 4
+    assert len(keys) == 2 and len({ane._machine_key(model.layers[i], TILE, r) for i in (0, 1, 2, 3) for r in "ab"}) == 8
 
 
 @pytest.mark.parametrize("split_ms,share", [(9.6, 0.0), (6.0, 0.625)])
@@ -386,6 +386,30 @@ def test_memory_pressure_releases_layers_from_the_end(level, over_layers, kept, 
         assert mx.array_equal(out, mlp(_rows(TILE))).item() != (ane._STATE in mlp.__dict__)
     warnings = [r for r in caplog.records if "memory pressure" in r.getMessage()]
     assert len(warnings) == (0 if level == 1 and kept == 3 else 1)   # the warn-only notice once, not per call
+    ane.release_ane_prefill(model)
+
+
+def test_the_split_runs_only_on_the_gpu_route_it_was_tuned_on(monkeypatch, caplog):
+    from unsloth_zoo.mlx import inference
+    monkeypatch.setenv(ane.OPT_IN, "1")
+    monkeypatch.setattr(inference, "prefill_route",
+                        lambda module, rows: "dense" if module.__dict__.get("_unsloth_dense_qmm_scopes") else "stock")
+    model = _model()
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 2   # outside any scope
+    model.__dict__["_unsloth_ane_prepared"] = True
+    ran, call = [], ane._Split.__call__
+    monkeypatch.setattr(ane._Split, "__call__", lambda self, x: (ran.append(self), call(self, x))[1])
+    def runs(scope):
+        ran.clear()
+        with scope:
+            [mlp(_rows(TILE)) for mlp in model.layers]
+        return len(ran)
+    assert runs(inference.inference_scopes(model)) == 2   # a generation takes the routes prepare read
+    monkeypatch.setattr(inference, "prefill_route", lambda module, rows: "int8" if module.__dict__.get(
+        "_unsloth_dense_qmm_scopes") and module.weight.shape[0] == HIDDEN else "stock")   # down only
+    assert runs(inference.inference_scopes(model)) == runs(inference.inference_scopes(model)) == 0
+    assert runs(ane.ane_prefill_mlp(model)) == 2   # standalone, the projections run stock: slower is fine
+    assert sum("stock/stock/int8, faster than the dense/dense/dense" in r.getMessage() for r in caplog.records) == 1
     ane.release_ane_prefill(model)
 
 
