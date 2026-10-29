@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """The import-time hf_xet 429 log scan, executed alone via ast (no torch import)."""
+import __future__
 import ast
 import os
 import pathlib
@@ -31,7 +32,7 @@ def _load_scanner():
     tree = ast.parse(_INIT.read_text(encoding = "utf-8"))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "has_429_exact_full_read")
     namespace = {"Path": pathlib.Path}
-    exec(compile(ast.fix_missing_locations(ast.Module(body = [node], type_ignores = [])), str(_INIT), "exec"), namespace)
+    exec(compile(ast.fix_missing_locations(ast.Module(body = [node], type_ignores = [])), str(_INIT), "exec", __future__.annotations.compiler_flag, True), namespace)
     return namespace["has_429_exact_full_read"]
 
 
