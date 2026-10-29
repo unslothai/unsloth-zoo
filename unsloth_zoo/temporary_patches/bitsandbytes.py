@@ -164,11 +164,9 @@ def _packed_weight_without_quant_state_error(module):
     )
 
 
-# Inference 4-bit matmuls straight into bitsandbytes' fused kernel. bitsandbytes >= 0.50 reaches
-# lib.cgemm_4bit_* through matmul_4bit -> torch.ops.bitsandbytes.gemm_4bit -> _gemm_4bit_kernel_impl, about
-# 50 us of Python per call on a Colab host (a decode step makes one per projection); the kernel and its
-# arguments are the same here, so the output is too. The first call per dtype and layout is also run
-# through bitsandbytes and must match bit for bit. UNSLOTH_BNB_4BIT_DIRECT=0 turns it off.
+# Inference 4-bit matmuls call lib.cgemm_4bit_* with the same arguments as bitsandbytes'
+# _gemm_4bit_kernel_impl (identical output, ~50 us less Python per call); the first call per layout is
+# checked bitwise against bitsandbytes.matmul_4bit. UNSLOTH_BNB_4BIT_DIRECT=0 disables.
 BNB_4BIT_DIRECT_CALLS = {"direct": 0}
 _BNB_DIRECT = {"on": os.environ.get("UNSLOTH_BNB_4BIT_DIRECT", "1") != "0" and torch.version.hip is None,
                "ops": None, "checked": {}, "fn": {}}
@@ -202,7 +200,7 @@ def _bnb_direct_ops():
 
 
 def _on_current_cuda(x):
-    # bitsandbytes switches to the tensor's device first (multi-GPU device_map): left to it.
+    # Other devices left to bitsandbytes, which switches device first.
     return x.is_cuda and x.get_device() == _cuda_get_device()
 
 
@@ -224,11 +222,10 @@ def _ptrs_equal(tensors, ptrs):
             return _PTRS_AT(tensors, ptrs, _PTRS_IDX[len(tensors)])
         return all(t.data_ptr() == p for t, p in zip(tensors, ptrs))
     except Exception:
-        return False  # a quant tensor set to None: rebuilt, and declined
+        return False
 
 
 def _bnb_direct_plan(weight, quant_state):
-    """The weight-side arguments of _gemm_4bit_kernel_impl for this layer, or None."""
     qs = quant_state
     if len(qs.shape) != 2 or weight.dtype is not torch.uint8:
         return None
@@ -239,7 +236,7 @@ def _bnb_direct_plan(weight, quant_state):
         return None
     device = weight.get_device()
     if any(t.get_device() != device for t in tensors):
-        return None  # the kernel reads every pointer on the activations' device
+        return None  # kernel needs every pointer on one device
     if qs.nested:
         # matmul_4bit passes state2.absmax as absmax and the quantized absmax as absmax_8bit.
         offset = qs.offset.to(dtype = torch.float32)
@@ -269,7 +266,7 @@ def _bnb_4bit_direct(self, x, quant_state):
     ):
         return None
     plan = self.__dict__.get("_unsloth_bnb_direct")
-    # Rebuilt whenever the layer is requantized, moved, or a quant tensor is replaced or recast.
+    # Rebuilt on requantize, move, or a replaced / recast quant tensor.
     if plan is None or plan[0] is not quant_state or plan[1] is not None and (
         plan[1] != weight.data_ptr() or not _ptrs_equal(_bnb_direct_tensors(quant_state), plan[3])
     ):
@@ -290,7 +287,7 @@ def _bnb_4bit_direct(self, x, quant_state):
     M = x.numel() // K
     use = picks.get((M, dtype))
     if use is None:
-        # torch.ops.bitsandbytes.gemm_4bit's own choice between its kernel and dequantize + F.linear.
+        # Same kernel-vs-dequantize choice as torch.ops.bitsandbytes.gemm_4bit.
         use = 0 < M <= ops._gemm_4bit_custom_max_m and K % blocksize == 0 and bool(
             ops._gemm_4bit_use_custom_fn(x.device.index, dtype, M, N, K))
         picks[(M, dtype)] = use
@@ -299,7 +296,7 @@ def _bnb_4bit_direct(self, x, quant_state):
     fn = _BNB_DIRECT["fn"].get(dtype)
     if fn is None:
         fn = getattr(ops.lib, _BNB_DIRECT_FN.get(dtype, ""), None)
-        # The 14 arguments passed below: a library built with another kernel ABI is left to bitsandbytes.
+        # Other kernel ABIs (not 14 args) are left to bitsandbytes.
         if fn is None or len(getattr(fn, "argtypes", None) or ()) != 14:
             fn = False
         _BNB_DIRECT["fn"][dtype] = fn
@@ -308,9 +305,9 @@ def _bnb_4bit_direct(self, x, quant_state):
     key = (dtype, ptrs[1] is not None, bias is not None)
     checked = _BNB_DIRECT["checked"].get(key)
     if checked is False or checked is None and torch.cuda.is_current_stream_capturing():
-        return None  # the check reads back on the host: leave it to an eager call
+        return None  # the check syncs the host
     if bias is not None and bias.dtype is not dtype:
-        bias = bias.to(dtype)  # as the forward below casts it
+        bias = bias.to(dtype)
     A = x.contiguous()
     out = torch.empty((*A.shape[:-1], N), dtype = dtype, device = A.device)
     fn(A.data_ptr(), weight.data_ptr(), ptrs[0], ptrs[1], ptrs[2], ptrs[3], out.data_ptr(),

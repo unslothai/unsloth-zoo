@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The direct bitsandbytes 4-bit inference path in the patched Linear4bit.forward.
-
-CPU cases record the arguments of the lib.cgemm_4bit_* call and compare them with the call bitsandbytes'
-own matmul_4bit -> gemm_4bit -> _gemm_4bit_kernel_impl makes; the CUDA case compares outputs bitwise.
-"""
+"""CPU: cgemm_4bit_* args match bitsandbytes' _gemm_4bit_kernel_impl. CUDA: outputs match bitwise."""
 import contextlib
 import types
 from types import SimpleNamespace
@@ -64,12 +60,10 @@ def lib(monkeypatch):
     monkeypatch.setitem(Z._BNB_DIRECT, "ops", None)
     monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
     monkeypatch.setitem(Z._BNB_DIRECT, "fn", {})
-    # Every layout already checked: the CPU cases look at the kernel arguments, not at outputs.
     monkeypatch.setitem(Z._BNB_DIRECT, "checked", {
         (d, n, b): True for d in (torch.bfloat16, torch.float16, torch.float32) for n in (0, 1) for b in (0, 1)})
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(Z, "BNB_4BIT_DIRECT_CALLS", {"direct": 0})
-    # bitsandbytes' own route for the same call, with its CUDA kernel implementation.
     monkeypatch.setattr(torch.ops.bitsandbytes, "gemm_4bit", SimpleNamespace(default = bops._gemm_4bit_kernel_impl))
     return fake
 
@@ -139,7 +133,6 @@ def test_rebuilt_when_quant_tensors_change(lib):
         qs.state2.absmax = qs.state2.absmax.clone()
         Z._bnb_4bit_direct(layer, x, qs)
         assert lib.calls[-1][1][2] == qs.state2.absmax.data_ptr()
-        # A new weight (requantized layer).
         layer.weight.data = layer.weight.data.clone()
         layer.weight.data_ptr = layer.weight.data.data_ptr
         Z._bnb_4bit_direct(layer, x, qs)
@@ -202,7 +195,6 @@ def test_first_call_is_checked_against_bitsandbytes(lib, monkeypatch, agree):
     monkeypatch.setitem(Z._BNB_DIRECT, "checked", {})
     layer, qs = _layer()
     x = torch.randn(1, 1, 128).to(torch.bfloat16)
-    # The recorder leaves the output as allocated; the reference is that or something else.
     monkeypatch.setattr(torch, "empty", lambda *a, **k: torch.zeros(*a, **k))
     ref = torch.zeros(1, 1, 64, dtype = torch.bfloat16) if agree else torch.ones(1, 1, 64, dtype = torch.bfloat16)
     monkeypatch.setattr(bnb, "matmul_4bit", lambda *a, **k: ref)
@@ -213,7 +205,6 @@ def test_first_call_is_checked_against_bitsandbytes(lib, monkeypatch, agree):
         again = Z._bnb_4bit_direct(layer, x, qs)
     assert (again is not None) is agree
     assert Z.BNB_4BIT_DIRECT_CALLS["direct"] == (2 if agree else 0)
-    # Capture before the check: nothing is launched.
     monkeypatch.setitem(Z._BNB_DIRECT, "checked", {})
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     n = len(lib.calls)
