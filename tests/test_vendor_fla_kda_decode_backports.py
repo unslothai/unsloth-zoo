@@ -37,9 +37,9 @@ _GPU = pytest.mark.skipif(not _gpu_ok(), reason = "needs the vendored fla KDA ke
 
 def test_kda_decode_backports_present():
     code = (VENDORED / "ops" / "kda" / "fused_recurrent.py").read_text()
-    # 1415: eight-value tiles, one warp, three stages.
-    assert "    BV = 8\n" in code and "BV = 32" not in code
-    assert "num_warps=1,\n        num_stages=3," in code
+    # 1415: eight-value tiles, one warp, three stages, except on sm8x / ROCm (slower on A100).
+    assert "BV, decode_warps, decode_stages = _kda_decode_config(v.device)" in code
+    assert "num_warps=decode_warps,\n        num_stages=decode_stages," in code
     # 1416: dense outputs skip the zero fill, packed outputs keep it.
     assert "out = torch.empty_like(v) if cu_seqlens is None else torch.zeros_like(v)" in code
     # 1329 / 1135 / 1571 / 1414.
@@ -156,3 +156,26 @@ def test_kda_decode_matches_fp64_recurrence_subprocess():
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.run([sys.executable, "-c", _DECODE_CHILD], env = env, capture_output = True, text = True, timeout = 1200)
     assert "DECODE_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr[-4000:]}"
+
+
+
+
+@pytest.mark.parametrize("capability, hip, expected", [
+    ((7, 5), None, (8, 1, 3)),     # T4: 2-14% faster with the new tiles
+    ((8, 0), None, (32, 4, 2)),    # A100: 5-10% slower at batch 8-128 with them
+    ((8, 9), None, (32, 4, 2)),
+    ((9, 0), None, (8, 1, 3)),     # upstream measured H200
+    ((10, 0), None, (8, 1, 3)),
+    ((9, 4), "7.0", (32, 4, 2)),   # ROCm keeps the old config
+])
+def test_kda_decode_config_by_arch(monkeypatch, capability, hip, expected):
+    # The vendored module needs fla injected (a CUDA host); the helper only needs torch.
+    import functools
+    import torch
+    source = (VENDORED / "ops" / "kda" / "fused_recurrent.py").read_text(encoding = "utf-8")
+    start = source.index("@functools.lru_cache(maxsize=None)\ndef _kda_decode_config")
+    namespace = {"functools": functools, "torch": torch}
+    exec(source[start:source.index("@torch.compiler.disable\ndef fused_recurrent_kda_fwd(")], namespace)
+    monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: capability)
+    assert namespace["_kda_decode_config"](torch.device("cuda", 0)) == expected

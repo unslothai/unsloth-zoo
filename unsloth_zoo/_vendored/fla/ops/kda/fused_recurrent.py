@@ -7,6 +7,7 @@
 
 # This kernel is modified from the Decode kernel of the vllm gdn/kda model.
 
+import functools
 import warnings
 
 import torch
@@ -236,6 +237,18 @@ def fused_recurrent_kda_fwd_kernel(
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
+@functools.lru_cache(maxsize=None)
+def _kda_decode_config(device):
+    """(BV, num_warps, num_stages) for the KDA decode kernel on `device` (see fla PR #1415)."""
+    if device.type != "cuda" or torch.version.hip:
+        return 32, 4, 2
+    try:
+        major = torch.cuda.get_device_capability(device)[0]
+    except Exception:
+        return 32, 4, 2
+    return (32, 4, 2) if major == 8 else (8, 1, 3)
+
+
 @torch.compiler.disable
 def fused_recurrent_kda_fwd(
     q: torch.Tensor,
@@ -270,8 +283,10 @@ def fused_recurrent_kda_fwd(
     BK = triton.next_power_of_2(K)
     # Unsloth: backported from fla PR #1415. Eight-value tiles with one warp and three
     # stages (the gated delta rule decode kernel's config) instead of BV=32 / 4 warps /
-    # 2 stages: less live state per program and more programs per decode step.
-    BV = 8
+    # 2 stages: less live state per program and more programs per decode step. Measured
+    # 5-10% slower on A100 at batch 8-128 (2-14% faster on T4; upstream measured H200),
+    # so sm8x and ROCm keep the old config.
+    BV, decode_warps, decode_stages = _kda_decode_config(v.device)
 
     # Unsloth: backported from fla PR #1416. Dense calls overwrite every output row, so
     # skip the zero fill; packed calls keep zeros for unused token capacity.
@@ -338,8 +353,8 @@ def fused_recurrent_kda_fwd(
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
         ALLOW_NEG_EIGVAL=allow_neg_eigval,
         STATE_V_FIRST=state_v_first,
-        num_warps=1,
-        num_stages=3,
+        num_warps=decode_warps,
+        num_stages=decode_stages,
     )
 
     return out, final_state

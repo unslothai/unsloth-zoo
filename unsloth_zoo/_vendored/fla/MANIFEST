@@ -222,6 +222,9 @@ modifications =
         * PR #1415: BV 32 -> 8 with 1 warp / 3 stages (the gated delta rule
           decode kernel's config). Upstream, H200 / Triton 3.5: 9-20% lower
           kernel latency on dense decode shapes (B 1-32, H 16-32, K=V=128).
+          Unsloth gates it by device (_kda_decode_config): A100 measured 5-10%
+          slower at batch 8-128, T4 2-14% faster, so sm8x and ROCm keep BV=32 /
+          4 warps / 2 stages.
         * PR #1416: dense calls allocate the output with empty_like instead of
           zeros_like (every row is overwritten); packed calls keep the zero fill.
           Upstream, H200: 4-26% lower latency on the same shapes.
