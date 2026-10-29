@@ -402,6 +402,45 @@ def test_flex_is_off_by_default(monkeypatch, opt_in):
     assert _stat("flex") == 3 and len(calls) == 3
 
 
+def test_flex_failure_does_not_keep_its_tensors_alive(monkeypatch):
+    """A failing flex call (an Inductor compile error, as on torch 2.10 / A100) raised from frames in a
+    reference cycle must not keep that call's tensors allocated until a full gc pass: on GPU that held
+    +25% peak memory over every later step of the dense fallback."""
+    import gc
+    import weakref
+    _patched()
+    model = _model()
+    ids = torch.randint(0, 256, (1, 300))
+    mask = torch.ones(1, 300, dtype = torch.bool)
+    with torch.no_grad(), _upstream():
+        ref = model(input_ids = ids, attention_mask = mask).last_hidden_state
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
+    monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda q: True)
+    held = []
+
+    def failing(query, key, value, block_mask, scale, score_mod = None):
+        workspace = torch.empty(1 << 20)  # stands in for the inputs / buffers a failed compile references
+        held.append(weakref.ref(workspace))
+        try:
+            raise RuntimeError("No valid triton configs")
+        except RuntimeError as inner:
+            error = inner  # frame -> error -> traceback -> frame: a cycle, like Inductor's handlers
+        raise RuntimeError("InductorError") from error
+
+    monkeypatch.setattr(sb, "_flex", failing)
+    gc.collect()
+    gc.disable()
+    try:
+        with torch.no_grad():
+            out = model(input_ids = ids, attention_mask = mask).last_hidden_state
+        alive = sum(r() is not None for r in held)
+    finally:
+        gc.enable()
+    assert len(held) == 1 and alive == 0  # one failure latches the shape class; nothing it allocated survives
+    assert _stat("fallback") == 1 and _stat("flex") == 0
+    torch.testing.assert_close(out, ref, atol = 1e-5, rtol = 1e-5)
+
+
 @pytest.mark.parametrize("compiled", [False, True])
 def test_cpu_flex_forward_matches_upstream(monkeypatch, compiled):
     """Real flex kernels (CPU, forward only) against upstream dense SDPA."""
