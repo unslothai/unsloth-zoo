@@ -280,7 +280,7 @@ def _bnb_4bit_direct(self, x, quant_state):
     if plan[1] is None:
         return None
     _, _, _, _, ptrs, _, N, K, blocksize, quant_type, picks = plan
-    if x.shape[-1] != K or (bias is not None and (bias.dim() != 1 or bias.dtype is not dtype)):
+    if x.shape[-1] != K or (bias is not None and bias.dim() != 1):
         return None
     M = x.numel() // K
     use = picks.get((M, dtype))
@@ -300,6 +300,8 @@ def _bnb_4bit_direct(self, x, quant_state):
     checked = _BNB_DIRECT["checked"].get(key)
     if checked is False or checked is None and torch.cuda.is_current_stream_capturing():
         return None  # the check reads back on the host: leave it to an eager call
+    if bias is not None and bias.dtype is not dtype:
+        bias = bias.to(dtype)  # as the forward below casts it
     A = x.contiguous()
     out = torch.empty((*A.shape[:-1], N), dtype = dtype, device = A.device)
     fn(A.data_ptr(), weight.data_ptr(), ptrs[0], ptrs[1], ptrs[2], ptrs[3], out.data_ptr(),

@@ -93,24 +93,28 @@ def _layer(N = 64, K = 128, dtype = torch.bfloat16, nested = False, bias = True,
     return layer, qs
 
 
-def _strip_out(call):
+def _strip_out(call, bias_copy = False):
     d, args = call
-    return d, args[:6] + (None,) + args[7:]
+    return d, args[:6] + (None, None if bias_copy else args[7]) + args[8:]
 
 
 @pytest.mark.parametrize("nested", [False, True])
-@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.parametrize("bias", [True, False, "fp32"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("M", [1, 4])
 def test_same_kernel_call_as_bitsandbytes(lib, nested, bias, dtype, M):
-    layer, qs = _layer(dtype = dtype, nested = nested, bias = bias)
+    layer, qs = _layer(dtype = dtype, nested = nested, bias = bool(bias))
+    if bias == "fp32":
+        layer.bias = layer.bias.float()  # nn.Linear's default; the forward casts it to the compute dtype
     x = torch.randn(1, M, 128).to(dtype)
     with torch.no_grad():
-        ref = bnb.matmul_4bit(x, layer.weight.data.t(), bias = layer.bias, quant_state = qs)
+        ref_bias = None if layer.bias is None else layer.bias.to(dtype)
+        ref = bnb.matmul_4bit(x, layer.weight.data.t(), bias = ref_bias, quant_state = qs)
         out = Z._bnb_4bit_direct(layer, x, qs)
     assert out is not None and out.shape == ref.shape and out.dtype == ref.dtype
     assert len(lib.calls) == 2
-    assert _strip_out(lib.calls[0]) == _strip_out(lib.calls[1])
+    assert _strip_out(lib.calls[0], bias == "fp32") == _strip_out(lib.calls[1], bias == "fp32")
+    assert (lib.calls[1][1][7] is None) == (not bias)
     assert Z.BNB_4BIT_DIRECT_CALLS["direct"] == 1
 
 
