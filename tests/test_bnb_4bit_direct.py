@@ -238,6 +238,60 @@ def test_row_picks_stay_bounded(lib, monkeypatch):
     assert len(layer.__dict__["_unsloth_bnb_direct"][9]) <= 4
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("M", [1, 4])
+def test_helper_same_kernel_call_as_bitsandbytes(lib, nested, M):
+    # bnb_matmul_4bit_direct: matmul_4bit(x, W.t(), quant_state = qs) without a module, plan on the quant state.
+    layer, qs = _layer(nested = nested, bias = False)
+    weight = layer.weight
+    x = torch.randn(1, M, 128).to(torch.bfloat16)
+    with torch.no_grad():
+        bnb.matmul_4bit(x, weight.data.t(), quant_state = qs)
+        out = Z.bnb_matmul_4bit_direct(x, weight, qs)
+    assert out is not None and out.shape == (1, M, 64) and len(lib.calls) == 2
+    assert _strip_out(lib.calls[0]) == _strip_out(lib.calls[1])
+    assert "_unsloth_bnb_direct" in qs.__dict__ and Z.BNB_4BIT_DIRECT_CALLS["direct"] == 1
+
+
+def test_helper_writes_into_a_matching_out_buffer(lib):
+    layer, qs = _layer(bias = False)
+    x = torch.randn(1, 4, 128).to(torch.bfloat16)
+    with torch.no_grad():
+        buf = torch.empty(1, 4, 64, dtype = torch.bfloat16)
+        assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs, out = buf) is buf
+        assert lib.calls[-1][1][6] == buf.data_ptr()  # the kernel wrote straight into it
+        wide = torch.empty(1, 4, 128, dtype = torch.bfloat16)[..., :64]  # not contiguous: copied into
+        assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs, out = wide) is wide
+        assert lib.calls[-1][1][6] != wide.data_ptr()
+
+
+def test_helper_plan_does_not_keep_the_quant_state_alive(lib):
+    import gc
+    import weakref
+    layer, qs = _layer(bias = False)
+    with torch.no_grad():
+        assert Z.bnb_matmul_4bit_direct(torch.randn(1, 2, 128).to(torch.bfloat16), layer.weight, qs) is not None
+    ref = weakref.ref(qs)
+    del qs, layer
+    gc.disable()
+    try:
+        assert ref() is None  # freed by refcount alone, no cycle through its own plan
+    finally:
+        gc.enable()
+
+
+def test_helper_declines_like_the_forward(lib, monkeypatch):
+    layer, qs = _layer(bias = False)
+    x = torch.randn(1, 2, 128).to(torch.bfloat16)
+    monkeypatch.setitem(Z._BNB_DIRECT, "on", False)
+    with torch.no_grad():
+        assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs) is None
+    monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
+    x.requires_grad_(True)
+    assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs) is None
+    assert not lib.calls
+
+
 def test_bitsandbytes_api_drift_turns_it_off(lib, monkeypatch):
     def changed(A, B, shapeB, absmax, blocksize, quant_type, bias = None, absmax_8bit = None, absmax_code = None,
                 absmax_offset = None, extra = None):
@@ -311,3 +365,25 @@ def test_cuda_bitwise_against_bitsandbytes(nested, dtype, monkeypatch):
         ref = lin(x)
         monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
         assert torch.equal(lin(x), ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "NVIDIA CUDA")
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cuda_helper_bitwise_against_bitsandbytes(nested, dtype):
+    torch.manual_seed(0)
+    lin = bnb.nn.Linear4bit(2048, 3072, bias = False, compute_dtype = dtype, quant_type = "nf4",
+                            compress_statistics = nested).cuda()
+    if Z._bnb_direct_ops() is False:
+        pytest.skip("bitsandbytes without the fused 4-bit GEMM on this build")
+    W, qs = lin.weight, lin.weight.quant_state
+    before = Z.BNB_4BIT_DIRECT_CALLS["direct"]
+    for M in (1, 4, 8, 16):
+        x = torch.randn(M, 1, 2048, device = "cuda", dtype = dtype)
+        with torch.no_grad():
+            ref = bnb.matmul_4bit(x, W.t(), quant_state = qs)
+            for _ in range(2):
+                buf = torch.empty_like(ref)
+                out = Z.bnb_matmul_4bit_direct(x, W, qs, out = buf)
+                assert out is not None and torch.equal(out, ref), M
+    assert Z.BNB_4BIT_DIRECT_CALLS["direct"] > before
