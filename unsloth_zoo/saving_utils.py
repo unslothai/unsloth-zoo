@@ -4500,6 +4500,20 @@ def _pick_int_scheme(base, schemes, packed_shape, scale_shape, logical_shape, ha
 pass
 
 
+def _read_tensors_by_shard(save_directory, locations, names):
+    """`{name: tensor}` in `names` order, opening each shard once and closing it before the next."""
+    by_shard = {}
+    for name in names:
+        by_shard.setdefault(locations[name], []).append(name)
+    tensors = {}
+    for filename, keys in by_shard.items():
+        with safe_open(os.path.join(save_directory, filename), framework = "pt", device = "cpu") as f:
+            for key in keys:
+                tensors[key] = f.get_tensor(key)
+    return {name: tensors[name] for name in names}
+pass
+
+
 def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
     """All refusals happen here, before any shard is touched; companions in other shards are read up front."""
     locations, shapes, stored_shapes = {}, {}, {}
@@ -4512,11 +4526,7 @@ def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
                 elif key.endswith(".weight_shape"):
                     stored_shapes[key] = tuple(int(x) for x in f.get_tensor(key).tolist())
 
-    def read(key):
-        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
-            return f.get_tensor(key)
-
-    bases, logical, elsewhere = {}, {}, {}
+    bases, logical, elsewhere = {}, {}, []
     for key in sorted(k for k in locations if k.endswith("_packed")):
         base = key[: -len(".weight_packed")]
         if not key.endswith(".weight_packed") or len(shapes[key]) != 2 or base + ".weight_scale" not in locations:
@@ -4539,7 +4549,8 @@ def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
         for suffix in _INT_PACKED_SUFFIXES[1:]:
             companion = base + "." + suffix
             if companion in locations and locations[companion] != locations[key]:
-                elsewhere[companion] = read(companion)
+                elsewhere.append(companion)
+    elsewhere = _read_tensors_by_shard(save_directory, locations, elsewhere)
     return dict(bases = bases, logical = logical, elsewhere = elsewhere)
 pass
 
@@ -4763,15 +4774,11 @@ def _plan_compressed_mxfp4_rewrite(save_directory, filenames, model):
                 f"{(packed_shape[0], packed_shape[1] * 2)}. Nothing was merged."
             )
 
-    def read(key):
-        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
-            return f.get_tensor(key)
-
-    elsewhere = {
-        base + ".weight_scale": read(base + ".weight_scale")
+    elsewhere = _read_tensors_by_shard(save_directory, locations, [
+        base + ".weight_scale"
         for base in packed_bases
         if locations[base + ".weight_scale"] != locations[base + ".weight_packed"]
-    }
+    ])
     return dict(
         stacks = stacks, keys_of = keys_of, shapes = shapes, packed_bases = packed_bases,
         targets = targets, elsewhere = elsewhere, deltas = {},
@@ -6732,6 +6739,41 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefix
     return False
 pass
 
+def _build_reversed_key_index(safetensor_keys):
+    """Sorted (reversed key, position) pairs + keys; None unless plain str keys in a list/tuple/set/frozenset (caller keeps the linear scan)."""
+    if type(safetensor_keys) not in (list, tuple, set, frozenset):
+        return None
+    keys = safetensor_keys if type(safetensor_keys) in (list, tuple) else list(safetensor_keys)
+    index = []
+    for position, key in enumerate(keys):
+        if type(key) is not str:
+            return None
+        index.append((key[::-1], position))
+    index.sort()
+    return index, keys
+pass
+
+def _indexed_prefix_candidates(index, keys, k):
+    """Same list, in the same order, as the linear scan in `_infer_prefix_and_remap`."""
+    import bisect
+    candidates = []
+    for suffix in (k + ".weight", k + ".linear.weight"):
+        reversed_suffix = suffix[::-1]
+        start = end = bisect.bisect_left(index, (reversed_suffix,))
+        while end < len(index) and index[end][0].startswith(reversed_suffix):
+            end += 1
+        for position in sorted(position for _, position in index[start:end]):
+            prefix = keys[position][: -len(suffix)]
+            if prefix:
+                candidates.append(prefix)
+    return list(dict.fromkeys(candidates))
+pass
+
+def _component_signature(parts):
+    """A vote needs equal prefix multisets over a shared suffix, so equal full multisets: pairs with different signatures never vote."""
+    return tuple(sorted(p for p in parts if p))
+pass
+
 def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     """Infer missing key prefixes by matching LoRA keys against safetensor keys.
 
@@ -6752,6 +6794,7 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     changed = False
     inferred_prefixes = []  # track prefixes from successful per-key matches
     unmatched_keys = []     # keys that couldn't be matched at all
+    suffix_index, suffix_index_built = None, False
 
     for k, v in lora_weights.items():
         if not isinstance(k, str):
@@ -6763,12 +6806,17 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             continue
         # unique prefix candidates; also accept a .linear.weight shard (Gemma4) so a
         # prefix-add onto it is not dropped.
-        candidates = list(dict.fromkeys(
-            sf_key[: -len(suffix)]
-            for suffix in (k + ".weight", k + ".linear.weight")
-            for sf_key in safetensor_keys
-            if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
-        ))
+        if not suffix_index_built:
+            suffix_index, suffix_index_built = _build_reversed_key_index(safetensor_keys), True
+        if suffix_index is not None and type(k) is str:
+            candidates = _indexed_prefix_candidates(*suffix_index, k)
+        else:
+            candidates = list(dict.fromkeys(
+                sf_key[: -len(suffix)]
+                for suffix in (k + ".weight", k + ".linear.weight")
+                for sf_key in safetensor_keys
+                if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
+            ))
         if len(candidates) == 1:
             remapped[candidates[0] + k] = v
             inferred_prefixes.append(candidates[0])
@@ -6792,15 +6840,17 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             if module_key is None:
                 continue
             sf_parts = module_key.split(".")
+            signature = _component_signature(sf_parts)
             for sl in range(1, min(3, len(sf_parts)) + 1):
-                sf_parts_by_suffix[(sl, tuple(sf_parts[-sl:]))].append(sf_parts)
+                sf_parts_by_suffix[(signature, sl, tuple(sf_parts[-sl:]))].append(sf_parts)
         for k, _ in unmatched_keys:
             if not isinstance(k, str):
                 continue
             k_parts = k.split(".")
+            signature = _component_signature(k_parts)
             seen_sf = set()
             for sl in range(min(3, len(k_parts)), 0, -1):
-                for sf_parts in sf_parts_by_suffix.get((sl, tuple(k_parts[-sl:])), ()):
+                for sf_parts in sf_parts_by_suffix.get((signature, sl, tuple(k_parts[-sl:])), ()):
                     sf_id = tuple(sf_parts)
                     if sf_id in seen_sf:        # process each sf once, at its longest match
                         continue

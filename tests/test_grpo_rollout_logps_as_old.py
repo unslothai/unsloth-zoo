@@ -36,6 +36,13 @@ import torch
 
 import unsloth_zoo.rl_replacements as rr
 
+
+@pytest.fixture(autouse = True)
+def _log_prob_route(monkeypatch):
+    # These stub UnslothEfficientGRPO, the log-prob route; test_grpo_fused_route.py covers the forward-gradient one.
+    import unsloth_zoo.fused_losses.fused_grpo as _fused_grpo
+    monkeypatch.setattr(_fused_grpo, "GRPO_FWD_GRAD", False)
+
 EPS_LOW, EPS_HIGH = 0.2, 0.28
 
 

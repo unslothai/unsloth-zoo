@@ -41,8 +41,11 @@ from .utils import (
     Unpack,
     patch_function_past_key_values,
     dedent,
+    restore_original,
+    _get_unique_storage_name,
 )
 import inspect
+import sys
 
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
@@ -106,6 +109,28 @@ def _publish_boundary_helpers(modeling_module):
         _to_boundary_dtype      = _to_boundary_dtype,
         _to_forced_output_dtype = _to_forced_output_dtype,
     )
+pass
+
+
+# The forced float32 set below (embedding, MLP, projector, causal mask) has no
+# generic counterpart, so in one process an fp16 load followed by a bf16 load
+# kept them: the float32 embedding then met bf16 attention ("Expected query,
+# key, and value to have the same dtype"). patch_function re-stashes on every
+# pass, which would record our own forward as the original after pre_compile
+# + post_compile, so these stash once and undo when the flag is "0".
+def _patch_forced_float32(target_obj, attr_name, new_func, **kwargs):
+    stashed = _get_unique_storage_name(target_obj, attr_name) in vars(target_obj)
+    return patch_function(target_obj, attr_name, new_func, store_original = not stashed, **kwargs)
+pass
+
+
+def _undo_forced_float32(class_name, attr_name):
+    # Not imported means never patched; do not import gemma3 for this.
+    modeling = sys.modules.get("transformers.models.gemma3.modeling_gemma3")
+    target_obj = getattr(modeling, class_name, None)
+    if target_obj is None: return
+    if _get_unique_storage_name(target_obj, attr_name) in vars(target_obj):
+        restore_original(target_obj, attr_name)
 pass
 
 
@@ -385,7 +410,10 @@ TEMPORARY_PATCHES.append(patch_Gemma3Processor)
 
 
 def patch_Gemma3ForConditionalGeneration_causal_mask():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        _undo_forced_float32("Gemma3Model", "_update_causal_mask")
+        _undo_forced_float32("Gemma3ForConditionalGeneration", "_update_causal_mask")
+        return
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3Model
@@ -465,15 +493,16 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
         return causal_mask
     pass
     if hasattr(transformers.models.gemma3.modeling_gemma3, "Gemma3Model"):
-        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3Model, "_update_causal_mask", _update_causal_mask)
+        _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3Model, "_update_causal_mask", _update_causal_mask)
     else:
-        patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration, "_update_causal_mask", _update_causal_mask)
+        _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration, "_update_causal_mask", _update_causal_mask)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_causal_mask)
 
 
 def patch_Gemma3TextScaledWordEmbedding():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return _undo_forced_float32("Gemma3TextScaledWordEmbedding", "forward")
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding
@@ -488,7 +517,7 @@ def patch_Gemma3TextScaledWordEmbedding():
         )
         return input_embeds.to(torch.float32) * self.embed_scale
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
+    _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
@@ -553,7 +582,8 @@ TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
 
 def patch_Gemma3MLP():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return _undo_forced_float32("Gemma3MLP", "forward")
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3MLP
@@ -582,13 +612,14 @@ def patch_Gemma3MLP():
         down_proj_out = self.down_proj(intermediate)
         return down_proj_out
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
+    _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
 def patch_Gemma3MultiModalProjector():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        return _undo_forced_float32("Gemma3MultiModalProjector", "forward")
     try:
         import transformers.models.gemma3.modeling_gemma3
         transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector
@@ -619,7 +650,7 @@ def patch_Gemma3MultiModalProjector():
         projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
         return projected_vision_outputs.type_as(vision_outputs)
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector, "forward", forward)
+    _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3MultiModalProjector)
 

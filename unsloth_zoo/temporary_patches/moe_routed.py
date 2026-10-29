@@ -51,6 +51,8 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 
+from unsloth_zoo.triton_fast_launch import launch as _fast_launch
+
 try:
     import triton
     import triton.language as tl
@@ -59,6 +61,21 @@ except Exception:  # pragma: no cover - no Triton, no routed path
 
 
 ACT_GPTOSS, ACT_SILU, ACT_GELU_TANH, ACT_GELU = 0, 1, 2, 3
+
+
+def _eager_out_of_dynamo(fn):
+    """fn inlined while Dynamo traces it, and run with Dynamo off otherwise. When Inductor skips a compiled frame
+    (SkipFrame, e.g. bfloat16 on a T4) the frame runs eagerly but Dynamo still converts every nested frame, and the
+    eager branches here (pointer tables, data_ptr, direct Triton launches) cannot be traced on their own."""
+    eager = torch.compiler.disable(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return fn(*args, **kwargs)
+        return eager(*args, **kwargs)
+    return wrapper
+
 
 
 def _env_int(name, default):
@@ -468,12 +485,23 @@ def _lora_args(lora, dummy):
     return B, H, float(scaling), B.shape[-1], (B.stride(0), B.stride(1), B.stride(2)), 0
 
 
+_PTRS_EQUAL = getattr(torch._C, "_tensors_data_ptrs_at_indices_equal", None)
+
+
 def _bias_args(tb):
     # Resolved per launch: bitsandbytes recasts Linear4bit.bias into new storage on dtype change.
     bias = tb["bias"]
     if isinstance(bias, (list, tuple)):
+        # Reuse the previous table while every bias keeps address, dtype and device (one C call).
+        last = tb.get("_bias_last")
+        if last is not None and type(bias) is list and len(bias) == len(last[1]):
+            b0 = bias[0]
+            if b0.dtype is last[3] and b0.device == last[4] and _PTRS_EQUAL(bias, last[0], last[1]):
+                return last[2]
         got = lora_pointer_table(bias)
         if got is not None:
+            if _PTRS_EQUAL is not None and type(bias) is list:
+                tb["_bias_last"] = ([b.data_ptr() for b in bias], list(range(len(bias))), got, bias[0].dtype, bias[0].device)
             return got
         return torch.stack([b.float() for b in bias]), 4
     return bias, tb["bias_kind"]
@@ -483,18 +511,18 @@ def _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act = ACT_GPTOSS, inter
     block_k = _block_k(tb["K"], tb["blocksize"])
     B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
     bias, bias_kind = _bias_args(tb)
-    # Triton launches on the current device, not the tensors' (multi-GPU device_map).
-    with torch.cuda.device(x.device):
-        _routed_gate_up_kernel[(idx.numel(), triton.cdiv(tb["N"], 4))](
-            x, idx, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
-            bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
-            float(alpha), float(limit), scaling, bs[0], bs[1], bs[2],
-            TOP_K = top_k, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"], NESTED = tb["nested"],
-            STACKED = tb.get("stacked", False), ACT = act, INTERLEAVED = interleaved,
-            BIAS_KIND = bias_kind, HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
-            LORA_KIND = kind, BLOCK_N = 4, BLOCK_K = block_k, EVEN_K = _even_k(tb["K"], block_k), num_warps = 4,
-            enable_fp_fusion = True,
-        )
+    # Launches on the tensors' device, not the current one (multi-GPU device_map).
+    _fast_launch(
+        _routed_gate_up_kernel, (idx.numel(), triton.cdiv(tb["N"], 4)),
+        (x, idx, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
+         bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
+         float(alpha), float(limit), scaling, bs[0], bs[1], bs[2]),
+        dict(TOP_K = top_k, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"], NESTED = tb["nested"],
+             STACKED = tb.get("stacked", False), ACT = act, INTERLEAVED = interleaved,
+             BIAS_KIND = bias_kind, HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
+             LORA_KIND = kind, BLOCK_N = 4, BLOCK_K = block_k, EVEN_K = _even_k(tb["K"], block_k)),
+        x.get_device(), (out,), num_warps = 4, enable_fp_fusion = True,
+    )
     return out
 
 
@@ -502,17 +530,17 @@ def _down(x, idx, rw, dense_rw, tb, top_k, lora, out):
     block_k = _block_k(tb["K"], tb["blocksize"])
     B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
     bias, bias_kind = _bias_args(tb)
-    with torch.cuda.device(x.device):
-        _routed_down_kernel[(out.shape[0], triton.cdiv(tb["N"], 4))](
-            x, idx, rw, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
-            bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
-            rw.stride(0), scaling, bs[0], bs[1], bs[2],
-            TOP_K = top_k, DENSE_RW = dense_rw, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"],
-            NESTED = tb["nested"], STACKED = tb.get("stacked", False), BIAS_KIND = bias_kind,
-            HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r), LORA_KIND = kind,
-            BLOCK_N = 4, BLOCK_K = block_k, EVEN_K = _even_k(tb["K"], block_k), num_warps = 4,
-            enable_fp_fusion = True,
-        )
+    _fast_launch(
+        _routed_down_kernel, (out.shape[0], triton.cdiv(tb["N"], 4)),
+        (x, idx, rw, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
+         bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
+         rw.stride(0), scaling, bs[0], bs[1], bs[2]),
+        dict(TOP_K = top_k, DENSE_RW = dense_rw, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"],
+             NESTED = tb["nested"], STACKED = tb.get("stacked", False), BIAS_KIND = bias_kind,
+             HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r), LORA_KIND = kind,
+             BLOCK_N = 4, BLOCK_K = block_k, EVEN_K = _even_k(tb["K"], block_k)),
+        x.get_device(), (out,), num_warps = 4, enable_fp_fusion = True,
+    )
     return out
 
 
@@ -850,26 +878,25 @@ def _launch_expert(x, idx, weight, bias, out, row_div, lora_a = None, h_out = No
     E, K = weight.shape[0], weight.shape[1]
     c = _expert_config(P)
     grid = (E, triton.cdiv(N, c["BLOCK_N"]) + (lora_a is not None), S)
-    kw = {}
+    args = (x, idx, weight, bias if bias is not None else weight, out, P, N, K, row_div, x.stride(0),
+            weight.stride(0), weight.stride(1), weight.stride(2), bias.stride(0) if bias is not None else 0)
+    consts = dict(HAS_BIAS = bias is not None, P_PAD = max(16, triton.next_power_of_2(P)),
+                  BLOCK_N = c["BLOCK_N"], BLOCK_K = c["BLOCK_K"], SPLIT_K = S)
     if lora_a is not None:
         # h_out [S, P, r] fp32 split-K partials of x @ lora_a[idx]; lora_a [E, K, r], any strides.
         r = lora_a.shape[2]
-        kw = dict(LORA_A = lora_a, H_OUT = h_out, stride_lae = lora_a.stride(0), stride_lak = lora_a.stride(1),
-                  stride_lar = lora_a.stride(2), HAS_LORA_A = True, R = r,
-                  R_PAD = max(16, triton.next_power_of_2(r)))
-    with torch.cuda.device(x.device):
-        _routed_bf16_expert_kernel[grid](
-            x, idx, weight, bias if bias is not None else weight, out,
-            P, N, K, row_div,
-            x.stride(0),
-            weight.stride(0), weight.stride(1), weight.stride(2),
-            bias.stride(0) if bias is not None else 0,
-            HAS_BIAS = bias is not None,
-            P_PAD = max(16, triton.next_power_of_2(P)),
-            BLOCK_N = c["BLOCK_N"], BLOCK_K = c["BLOCK_K"], SPLIT_K = S,
-            num_warps = c["num_warps"], num_stages = c["num_stages"], **kw,
-            enable_fp_fusion = True,
-        )
+        with torch.cuda.device(x.device):
+            _routed_bf16_expert_kernel[grid](
+                *args, **consts, LORA_A = lora_a, H_OUT = h_out, stride_lae = lora_a.stride(0),
+                stride_lak = lora_a.stride(1), stride_lar = lora_a.stride(2), HAS_LORA_A = True, R = r,
+                R_PAD = max(16, triton.next_power_of_2(r)),
+                num_warps = c["num_warps"], num_stages = c["num_stages"], enable_fp_fusion = True,
+            )
+        return out
+    consts.update(LORA_A = None, H_OUT = None, stride_lae = 0, stride_lak = 0, stride_lar = 0, HAS_LORA_A = False,
+                  R = 1, R_PAD = 16)
+    _fast_launch(_routed_bf16_expert_kernel, grid, args, consts, x.get_device(), (out,),
+                 num_warps = c["num_warps"], num_stages = c["num_stages"], enable_fp_fusion = True)
     return out
 
 
@@ -1059,14 +1086,13 @@ def _gate_up_act_launch(x, idx, weight, bias, lora_a, lora_b, lora_h, scaling, t
     out = torch.empty((P, N // 2), dtype = out_dtype, device = x.device)
     B, Hm, SH, r, bs = _lora_b_args(lora_b, h, part)
     BLOCK, warps = _finalize_block(P, N // 2, 512)
-    with torch.cuda.device(x.device):
-        _bf16_gate_up_finalize_kernel[(P, triton.cdiv(N // 2, BLOCK))](
-            part, idx, B, Hm, out,
-            P, N // 2, float(alpha), float(limit), float(scaling), bs[0], bs[1], bs[2],
-            SPLIT_K = S, ACT = act, INTERLEAVED = interleaved, HAS_LORA = lora_b is not None, SPLIT_H = SH,
-            R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK, num_warps = warps,
-            enable_fp_fusion = True,
-        )
+    _fast_launch(
+        _bf16_gate_up_finalize_kernel, (P, triton.cdiv(N // 2, BLOCK)),
+        (part, idx, B, Hm, out, P, N // 2, float(alpha), float(limit), float(scaling), bs[0], bs[1], bs[2]),
+        dict(SPLIT_K = S, ACT = act, INTERLEAVED = interleaved, HAS_LORA = lora_b is not None, SPLIT_H = SH,
+             R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK),
+        x.get_device(), (out,), num_warps = warps, enable_fp_fusion = True,
+    )
     return out
 
 
@@ -1076,14 +1102,13 @@ def _down_sum_launch(x, idx, rw, weight, bias, lora_a, lora_b, lora_h, scaling, 
     out = torch.empty((P // top_k, N), dtype = out_dtype, device = x.device)
     B, Hm, SH, r, bs = _lora_b_args(lora_b, h, part)
     BLOCK, warps = _finalize_block(P // top_k, N, 1024)
-    with torch.cuda.device(x.device):
-        _bf16_down_finalize_kernel[(P // top_k, triton.cdiv(N, BLOCK))](
-            part, idx, rw, B, Hm, out,
-            P, N, rw.stride(0), float(scaling), bs[0], bs[1], bs[2],
-            TOP_K = top_k, TOP_K_PAD = triton.next_power_of_2(top_k), SPLIT_K = S, HAS_LORA = lora_b is not None,
-            SPLIT_H = SH, R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK, num_warps = warps,
-            enable_fp_fusion = True,
-        )
+    _fast_launch(
+        _bf16_down_finalize_kernel, (P // top_k, triton.cdiv(N, BLOCK)),
+        (part, idx, rw, B, Hm, out, P, N, rw.stride(0), float(scaling), bs[0], bs[1], bs[2]),
+        dict(TOP_K = top_k, TOP_K_PAD = triton.next_power_of_2(top_k), SPLIT_K = S, HAS_LORA = lora_b is not None,
+             SPLIT_H = SH, R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK),
+        x.get_device(), (out,), num_warps = warps, enable_fp_fusion = True,
+    )
     return out
 
 
@@ -1161,6 +1186,7 @@ def _routed_bf16_moe_fused(x, flat, rw, w_gu, w_dn, b_gu, b_dn, act, interleaved
     return routed_bf16_down_sum(inter, flat, rw, w_dn, b_dn, dn[0], dn[1], None, dn[2], top_k, out_dtype)
 
 
+@_eager_out_of_dynamo
 def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interleaved,
                     gu_lora = (), dn_lora = (), alpha = 1.702, limit = 7.0, out_dtype = None):
     """[T, H] MoE output from only the routed BF16 / FP16 experts."""
@@ -1314,6 +1340,8 @@ def _stacked_key(experts):
     return tuple(key) + biases
 
 
+# Eager only (data_ptr comparisons): also when a compiled frame Inductor skips calls it (see _eager_out_of_dynamo).
+@torch.compiler.disable
 def prepare_stacked_nf4(experts, hidden_dim = None):
     """Eagerly built or revalidated tables for stacked NF4 experts; None when unsupported."""
     state = experts.__dict__.get("_unsloth_routed_moe")
@@ -1598,6 +1626,7 @@ def _bf16_views(experts, hidden_dim):
     return w_gu, w_dn, act, interleaved, one_token
 
 
+@_eager_out_of_dynamo
 def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
     """Experts output from only the routed experts, or None (callers run their usual path)."""
     # Reentrant checkpointing replays under grad through the other path, so skip in training.

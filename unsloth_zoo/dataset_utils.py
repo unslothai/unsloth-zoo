@@ -698,6 +698,17 @@ def is_trl_padding_free_collator(collator):
 pass
 
 
+class _KeepUnlistedRows:
+    # Batched with_indices filter predicate: reads no column; a class so it pickles to num_proc workers.
+    def __init__(self, dropped):
+        self.dropped = frozenset(dropped)
+
+    def __call__(self, batch, indices):
+        dropped = self.dropped
+        return [index not in dropped for index in indices]
+pass
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -1228,10 +1239,17 @@ def train_on_responses_only(
         # template at all, so fail clearly instead of returning an empty dataset.
         if len(dropped) == n_before:
             raise _no_training_signal(dataset_name, "")
-        # Drop via filter (Arrow mask), not select(keep_indices): a keep list would be one
-        # Python int per surviving row (GBs on a large corpus). _has_valid_labels is the
-        # exact inverse of `dropped`, so survivors are identical.
-        dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        # filter (Arrow mask), not select(keep_indices): a keep list is one int per surviving row.
+        if getattr(dataset, "_format_type", None) == "custom":
+            # A custom transform can change labels per view: re-read them.
+            dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        else:
+            dataset = dataset.filter(
+                _KeepUnlistedRows(dropped),
+                with_indices = True,
+                batched = True,
+                num_proc = _effective_num_proc(dataset),
+            )
         n_removed = n_before - len(dataset)
         if n_removed > 0:
             print(
@@ -2117,17 +2135,30 @@ def train_on_responses_only(
     if _pads_through_a_processor(getattr(trainer, "data_collator", None)):
         _refuse_packing_that_will_not_happen(trainer.data_collator, None)
 
+    def _mask_split(dataset, dataset_name):
+        # Arrow rows are pyarrow Tables, unreadable here and by a torch DataLoader: return python format.
+        fmt = None if isinstance(dataset, IterableDataset) else getattr(dataset, "format", None)
+        if isinstance(fmt, dict) and fmt.get("type") == "arrow":
+            # `_format_columns`: format["columns"] lists every column when none were selected.
+            dataset = dataset.with_format(
+                None,
+                columns = getattr(dataset, "_format_columns", fmt.get("columns")),
+                output_all_columns = fmt.get("output_all_columns", False),
+            )
+        dataset = _maybe_tokenize_dataset(dataset)
+        if isinstance(dataset, IterableDataset):
+            dataset = dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(dataset), batched = True)
+        else:
+            dataset = dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(dataset))
+        return _filter_fully_masked(dataset, dataset_name)
+    pass
+
     # Map both splits before assigning: a raise on eval must not leave train half-masked for a retry.
     _new_train = _new_eval = None
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-        _new_train = _maybe_tokenize_dataset(trainer.train_dataset)
-        if isinstance(_new_train, IterableDataset):
-            _new_train = _new_train.map(_train_on_responses_only, batch_size = _iterable_batch_size(_new_train), batched = True)
-        else:
-            _new_train = _new_train.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(_new_train))
-        _new_train = _filter_fully_masked(_new_train, "train_dataset")
+        _new_train = _mask_split(trainer.train_dataset, "train_dataset")
     pass
 
     if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
@@ -2139,21 +2170,11 @@ def train_on_responses_only(
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-                value = _maybe_tokenize_dataset(value)
-                if isinstance(value, IterableDataset):
-                    value = value.map(_train_on_responses_only, batch_size = _iterable_batch_size(value), batched = True)
-                else:
-                    value = value.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(value))
-                _new_eval[key] = _filter_fully_masked(value, f"eval_dataset[{key}]")
+                _new_eval[key] = _mask_split(value, f"eval_dataset[{key}]")
         else:
             if not hasattr(trainer.eval_dataset, "map"):
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-            _new_eval = _maybe_tokenize_dataset(trainer.eval_dataset)
-            if isinstance(_new_eval, IterableDataset):
-                _new_eval = _new_eval.map(_train_on_responses_only, batch_size = _iterable_batch_size(_new_eval), batched = True)
-            else:
-                _new_eval = _new_eval.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(_new_eval))
-            _new_eval = _filter_fully_masked(_new_eval, "eval_dataset")
+            _new_eval = _mask_split(trainer.eval_dataset, "eval_dataset")
         pass
     pass
     if _new_train is not None:

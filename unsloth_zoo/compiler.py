@@ -25,6 +25,7 @@ __all__ = [
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import contextlib
+import contextvars
 import hashlib
 import io
 import inspect
@@ -2152,6 +2153,26 @@ pass
 
 
 _RELATIVE_IMPORT = re.compile(r"^(\s*)from (\.+)([A-Za-z_][\w.]*)? import ", flags = re.MULTILINE)
+_TOP_LEVEL_DEF = re.compile(r"^def (\w+)\(", flags = re.MULTILINE)
+
+
+def _items_to_import(functions, new_source, name):
+    """Names in `functions` used by `new_source`, minus `name` and its own top level defs."""
+    defined = None
+    items = []
+    for x in functions:
+        if x not in new_source or x == name:
+            continue
+        # Only ASCII identifiers are exactly what `\w+` captures.
+        if x.isascii() and x.isidentifier():
+            if defined is None:
+                defined = set(_TOP_LEVEL_DEF.findall(new_source))
+            if x in defined:
+                continue
+        elif re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE):
+            continue
+        items.append(x)
+    return items
 
 
 def _absolute_relative_imports(source, model_location):
@@ -2170,6 +2191,43 @@ def _absolute_relative_imports(source, model_location):
         return f"{match.group(1)}from {name} import "
     return _RELATIVE_IMPORT.sub(absolute, source)
 pass
+
+
+_COMPILE_VERSIONS_SCOPE = contextvars.ContextVar(
+    "_unsloth_compile_versions_scope", default=None
+)
+
+
+def _resolve_compile_versions():
+    versions = []
+    for package in ("unsloth_zoo", "unsloth", "transformers", "trl"):
+        try:
+            versions.append(importlib_version(package))
+        except:
+            versions.append("0")
+    return tuple(versions)
+
+
+def _get_compile_versions():
+    versions = _COMPILE_VERSIONS_SCOPE.get()
+    if versions is None:
+        versions = _resolve_compile_versions()
+    return versions
+
+
+def _compile_versions_scope(function):
+    # Per call, not per process: a package upgraded between two compile calls must reach the header.
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        if _COMPILE_VERSIONS_SCOPE.get() is not None:
+            return function(*args, **kwargs)
+        token = _COMPILE_VERSIONS_SCOPE.set(_resolve_compile_versions())
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _COMPILE_VERSIONS_SCOPE.reset(token)
+
+    return wrapper
 
 
 def create_new_function(
@@ -2218,15 +2276,7 @@ def create_new_function(
     pass
 
     # Import items to make the function executable; a same-named method is not a local def
-    items = [
-        x
-        for x in functions
-        if (
-            (x in new_source)
-            and (x != name)
-            and not re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE)
-        )
-    ]
+    items = _items_to_import(functions, new_source, name)
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
@@ -2352,22 +2402,12 @@ def create_new_function(
     new_source = prepend + new_source + append
 
     # Check versioning
-    try:
-        unsloth_zoo_version = importlib_version("unsloth_zoo")
-    except:
-        unsloth_zoo_version = "0"
-    try:
-        unsloth_version = importlib_version("unsloth")
-    except:
-        unsloth_version = "0"
-    try:
-        transformers_version = importlib_version("transformers")
-    except:
-        transformers_version = "0"
-    try:
-        trl_version = importlib_version("trl")
-    except:
-        trl_version = "0"
+    (
+        unsloth_zoo_version,
+        unsloth_version,
+        transformers_version,
+        trl_version,
+    ) = _get_compile_versions()
 
     versioning = (
         '"""\n' + f"{unsloth_zoo_version}\n"
@@ -6136,6 +6176,7 @@ def _patch_torch_dtype_modules(
     pass
 
 
+@_compile_versions_scope
 def unsloth_compile_transformers(
     model_type: str = "llama",
     sdpa_dynamic_mask: bool = True,
@@ -6569,15 +6610,20 @@ def unsloth_compile_transformers(
     # Get functions which are called
     called_functions = []
     for function in functions:
+        # `called` needs `<function>(` and both must match; one match of each is enough.
+        if function + "(" not in full_source:
+            continue
         # Start of text
-        defined = re.findall(
+        defined = re.search(
             r"\bdef[\s]{1,}" + re.escape(function), full_source, flags=re.DOTALL
         )
+        if defined is None:
+            continue
         # Disable self.
-        called = re.findall(
+        called = re.search(
             r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags=re.DOTALL
         )
-        if len(defined) != 0 and len(called) != 0:
+        if called is not None:
             if function_defined_elsewhere(modeling_file, function):
                 continue
             called_functions.append(function)
@@ -6913,7 +6959,9 @@ def unsloth_compile_transformers(
     pass
     # Import allow-list for the generated cache, not a compile list: the emitted
     # classes still reference uncompiled modules and NameError without them.
-    functions += list(bad_torch_modules)
+    # Definition order, not set order: set order follows PYTHONHASHSEED and the
+    # cache file would be rewritten by every new process.
+    functions += [module for module in torch_modules if module in bad_torch_modules]
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
