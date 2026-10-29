@@ -28,6 +28,7 @@ import pytest
 import torch
 
 transformers = pytest.importorskip("transformers")
+from packaging.version import Version  # noqa: E402
 
 
 def _spec(name):
@@ -61,11 +62,28 @@ def _env(monkeypatch):
     gates.reset_sparse_attn_stats()
 
 
+# transformers 5.17 attends over expanded KV states (another source layout): the patch declines there.
+# From 5.21 the layout is the supported one, so a decline is a failure, not a skip.
+_LAYOUT_REQUIRED = Version(transformers.__version__).release[:2] >= (5, 21)
+
+
 def _patched():
     from unsloth_zoo.temporary_patches import glm5_next_sparse_flex as g
     g.patch_glm5_next_sparse()
-    assert "indexer" in g._REFERENCE, "patch did not install on this transformers"
+    if "indexer" not in g._REFERENCE:
+        assert not _LAYOUT_REQUIRED, "patch did not install on this transformers"
+        pytest.skip(f"transformers {transformers.__version__}: glm5_next source layout not supported (no-op)")
     return g
+
+
+def test_unsupported_layout_keeps_upstream():
+    from unsloth_zoo.temporary_patches import glm5_next_sparse_flex as g
+    g.patch_glm5_next_sparse()
+    if "indexer" in g._REFERENCE:
+        pytest.skip("supported layout: the patch installed")
+    m = _m()
+    assert not getattr(m.Glm5NextTextAttention.forward, "_unsloth_sparse_flex", False)
+    assert not getattr(m.Glm5NextTextIndexer.forward, "_unsloth_sparse_flex", False)
 
 
 def _m():
