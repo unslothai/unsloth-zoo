@@ -257,16 +257,30 @@ def test_helper_same_kernel_call_as_bitsandbytes(lib, nested, M):
     assert "_unsloth_bnb_direct" in qs.__dict__ and Z.BNB_4BIT_DIRECT_CALLS["direct"] == 1
 
 
-def test_helper_writes_into_a_matching_out_buffer(lib):
+@pytest.mark.parametrize("kind", ["plain", "strided", "aliases_x", "negative"])
+def test_helper_never_hands_the_kernel_a_callers_out(lib, kind):
     layer, qs = _layer(bias = False)
     x = torch.randn(1, 4, 128).to(torch.bfloat16)
-    with torch.no_grad():
+    if kind == "plain":
         buf = torch.empty(1, 4, 64, dtype = torch.bfloat16)
+    elif kind == "strided":
+        buf = torch.empty(1, 4, 128, dtype = torch.bfloat16)[..., :64]
+    elif kind == "aliases_x":
+        buf = x[..., :64]  # writing here while the kernel reads x would corrupt its input
+    else:
+        buf = torch._neg_view(torch.empty(1, 4, 64, dtype = torch.bfloat16))
+    version = buf._version
+    with torch.no_grad():
         assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs, out = buf) is buf
-        assert lib.calls[-1][1][6] == buf.data_ptr()
-        wide = torch.empty(1, 4, 128, dtype = torch.bfloat16)[..., :64]
-        assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs, out = wide) is wide
-        assert lib.calls[-1][1][6] != wide.data_ptr()
+    # The kernel wrote a fresh buffer that copy_ then moved into out (version bumped, views respected).
+    assert lib.calls[-1][1][6] != buf.data_ptr() and buf._version > version
+
+
+def test_helper_declines_a_quant_state_without_attributes(lib):
+    layer, _ = _layer(bias = False)
+    with torch.no_grad():
+        assert Z.bnb_matmul_4bit_direct(torch.randn(1, 4, 128).to(torch.bfloat16), layer.weight, [1, 2]) is None
+    assert not lib.calls
 
 
 def test_helper_plan_does_not_keep_the_quant_state_alive(lib):
@@ -374,7 +388,8 @@ def test_cuda_bitwise_against_bitsandbytes(nested, dtype, monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "NVIDIA CUDA")
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_cuda_helper_bitwise_against_bitsandbytes(nested, dtype):
+def test_cuda_helper_bitwise_against_bitsandbytes(nested, dtype, monkeypatch):
+    monkeypatch.setitem(Z._BNB_DIRECT, "on", True)  # independent of UNSLOTH_BNB_4BIT_DIRECT in the environment
     torch.manual_seed(0)
     lin = bnb.nn.Linear4bit(2048, 3072, bias = False, compute_dtype = dtype, quant_type = "nf4",
                             compress_statistics = nested).cuda()

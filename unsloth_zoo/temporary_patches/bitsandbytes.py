@@ -281,7 +281,10 @@ _SELF = object()
 
 def bnb_matmul_4bit_direct(x, weight, quant_state, out = None):
     """bitsandbytes.matmul_4bit(x, weight.t(), quant_state = quant_state, out = out) for inference, or None."""
-    return _bnb_4bit_direct_impl(quant_state.__dict__, _SELF, x, weight, None, quant_state, out)
+    cache = getattr(quant_state, "__dict__", None)
+    if cache is None:
+        return None  # e.g. the list form of a quant state
+    return _bnb_4bit_direct_impl(cache, _SELF, x, weight, None, quant_state, out)
 
 
 def _bnb_4bit_direct_impl(cache, ident, x, weight, bias, quant_state, out = None):
@@ -341,14 +344,12 @@ def _bnb_4bit_direct_impl(cache, ident, x, weight, bias, quant_state, out = None
     checked = _BNB_DIRECT["checked"].get(key)
     if checked is False or checked is None and torch.cuda.is_current_stream_capturing():
         return None  # the check syncs the host
-    ok = True
     if bias is not None and bias.dtype is not dtype:
         bias = bias.to(dtype)
     A = x.contiguous()
-    shape = (*A.shape[:-1], N)
-    # The kernel writes rows of N: a caller's buffer only when it is exactly that.
-    res = out if out is not None and out.dtype is dtype and out.is_contiguous() and out.shape == shape \
-        and out.get_device() == device else torch.empty(shape, dtype = dtype, device = A.device)
+    # Always a fresh buffer: a caller's out may overlap the inputs, be a negative / misaligned view or a
+    # wrapper, or need autograd's version bump; copy_ handles all of those, as bitsandbytes does.
+    res = torch.empty((*A.shape[:-1], N), dtype = dtype, device = A.device)
     fn(A.data_ptr(), weight.data_ptr(), ptrs[0], ptrs[1], ptrs[2], ptrs[3], res.data_ptr(),
        bias.data_ptr() if bias is not None else None, M, N, K, blocksize, quant_type, _cuda_raw_stream(A.device.index))
     if checked is None:
@@ -358,12 +359,12 @@ def _bnb_4bit_direct_impl(cache, ident, x, weight, bias, quant_state, out = None
             ref.view(torch.uint8), res.view(torch.uint8))
         _BNB_DIRECT["checked"][key] = ok
         if not ok:
-            res = res.copy_(ref) if res is out else ref
-    if checked or ok:
+            res = ref
+        else:
+            BNB_4BIT_DIRECT_CALLS["direct"] += 1
+    else:
         BNB_4BIT_DIRECT_CALLS["direct"] += 1
-    if out is not None and res is not out:
-        return out.copy_(res)
-    return res
+    return res if out is None else out.copy_(res)
 
 
 def patch_bitsandbytes_linear4bit_forward():
