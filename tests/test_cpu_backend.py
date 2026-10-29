@@ -1476,7 +1476,7 @@ def test_cpu_lora_sft_end_to_end(tmp_path):
     assert done.returncode == 0 and "CPU_SFT_OK" in done.stdout, (done.stdout[-3000:], done.stderr[-5000:])
 
 
-@pytest.mark.parametrize("requested, seen", [(1, None), (0, None), (None, None), (4, 4), (True, True)])
+@pytest.mark.parametrize("requested, seen", [(1, None), (0, None), (None, None), (4, 4), (True, True), (-1, -1)])
 def test_serial_dataset_num_proc_maps_in_process(requested, seen):
     """datasets >= 4.1 builds a Pool(1) for num_proc = 1, the config layer's serial sentinel: stock TRL
     must see None while it prepares the dataset, and the caller's config keeps its own value."""

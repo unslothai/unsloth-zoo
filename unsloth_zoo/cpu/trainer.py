@@ -252,7 +252,7 @@ def _make_cpu_sft_trainer(base):
             # the value straight to Dataset.map, so pass None (no pool) for the length of __init__ only.
             training_args = kwargs.get("args", args[1] if len(args) > 1 else None)
             num_proc = getattr(training_args, "dataset_num_proc", None)
-            serial = isinstance(num_proc, int) and not isinstance(num_proc, bool) and num_proc <= 1
+            serial = isinstance(num_proc, int) and not isinstance(num_proc, bool) and 0 <= num_proc <= 1
             if serial:
                 training_args.dataset_num_proc = None
             try:
