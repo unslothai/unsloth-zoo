@@ -19,6 +19,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import gc
+import time
+import weakref
 
 import pytest
 
@@ -216,6 +219,28 @@ def test_a_failed_calibration_leaves_the_model_native(error, monkeypatch, tmp_pa
     assert all(ane._STATE not in layer.__dict__ for layer in model.layers)
 
 
+def test_a_request_that_failed_on_the_worker_does_not_keep_its_program_loaded(monkeypatch, tmp_path):
+    monkeypatch.setattr(ane, "_CACHE_PATH", str(tmp_path / "cache.json"))
+    programs, init = [], ane._Bank.__init__
+
+    def tracked(self, *args):
+        init(self, *args)
+        programs.append(weakref.ref(self.program))
+
+    def fail(self):
+        raise ane.AneError("injected")
+
+    monkeypatch.setattr(ane._Bank, "__init__", tracked)
+    monkeypatch.setattr(ane._Request, "run", fail)
+    assert "injected" in ane.prepare_ane_prefill(_model(), tile = TILE).reason
+    for _ in range(100):   # the worker drops the job just after it hands back the error
+        gc.collect()
+        if programs and all(ref() is None for ref in programs):
+            break
+        time.sleep(0.01)
+    assert programs and all(ref() is None for ref in programs)
+
+
 @pytest.mark.parametrize("replaced", ["projection", "unquantized", "scales"])
 def test_a_replaced_projection_detaches_the_split(prepared, replaced):
     mlp = prepared.layers[0]
@@ -330,8 +355,11 @@ def test_calibration_takes_the_balanced_share_only_with_a_gain_and_caches_it(spl
     # GPU MLP 10 ms; the Neural Engine 2.5 ms at half the channels balances at 2/3, aligned down to 640 of 1024.
     timings = iter([10.0, 2.5, split_ms])
     monkeypatch.setattr(ane, "_median_ms", lambda function, **_: (function(), next(timings))[1])
+    closed, close = [], ane._Split.close
+    monkeypatch.setattr(ane._Split, "close", lambda self: (closed.append(self), close(self))[1])
     status = ane.prepare_ane_prefill(_model(), tile = TILE)
     assert (status.layers, status.share) == ((2, share) if share else (0, 0.0))
+    assert len(closed) == 1   # the calibration split, with or without a gain
     monkeypatch.setattr(ane, "_median_ms", None)   # a cached decision measures nothing
     model = _model(seed = 3)
     assert ane.prepare_ane_prefill(model, tile = TILE).layers == (2 if share else 0)

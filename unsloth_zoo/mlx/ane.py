@@ -528,6 +528,7 @@ class _Worker:
                     future.set_result(function())
                 except BaseException as error:
                     future.set_exception(error)
+            del function, future   # a finished job would otherwise keep its program loaded until the next one
 
     def run(self, function):
         """`function()` on the worker; raises `concurrent.futures.TimeoutError` after the watchdog."""
@@ -1009,6 +1010,7 @@ def _prepare(model, tile, share):
                                         code = "calibration_failed")
             if split_ms > gpu * (1 - _MIN_GAIN):
                 share = 0.0
+                first.close()
             _store_cache(key, {"share": share, "gpu_ms": gpu, "split_ms": split_ms})
         if not share:
             return AnePrefillStatus(0, 0.0, gpu, split_ms, time.perf_counter() - started,
