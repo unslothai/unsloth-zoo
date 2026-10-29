@@ -14,16 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Optional Triton modules torch probes must stay unimportable under the stub.
+"""Modules stock Triton lacks must stay unimportable under the stub.
 
-torch 2.15 builds ``torch._inductor.config`` with
-``try: from triton._torchtlx_default import DEFAULT_MODE except ImportError``.
-The Apple Silicon / no-GPU-init triton stub resolved every ``triton.*`` name, so
-that probe got a ``_Noop`` back, the config module rejected it, and the failed
-``torch._inductor`` import left ``torch._dynamo`` unimportable for the rest of the
-process: every transformers model, generation or ``set_seed`` import then died
-with ``Could not import module ...``. Each check runs in a fresh interpreter so the
-stub never leaks into this one.
+torch 2.15 probes ``triton._torchtlx_default`` while building
+``torch._inductor.config``; a stubbed answer broke ``torch._dynamo`` and so every
+transformers import. Each check runs in a fresh interpreter.
 """
 
 from __future__ import annotations
@@ -40,8 +35,6 @@ import pytest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 STUB_PATH = REPO_ROOT / "unsloth_zoo" / "stubs" / "triton_stub.py"
 
-# Loads the stub standalone (no unsloth_zoo import) and installs it the way
-# unsloth_zoo/__init__.py does on an MLX host.
 _INJECT = textwrap.dedent(f'''
     import importlib.util, sys
     _spec = importlib.util.spec_from_file_location("_triton_stub_under_test", {str(STUB_PATH)!r})
@@ -61,15 +54,19 @@ def _run(body):
     )
 
 
-def test_the_torchtlx_probe_is_not_stubbed():
-    proc = _run('''
+@pytest.mark.parametrize("stmt", [
+    "from triton._torchtlx_default import DEFAULT_MODE",
+    "import triton.language.extra.tlx",
+    "from triton.language.extra.tlx.inductor import registry",
+])
+def test_absent_modules_raise_import_error(stmt):
+    proc = _run(f'''
         try:
-            from triton._torchtlx_default import DEFAULT_MODE
+            {stmt}
         except ImportError:
             pass
         else:
-            raise SystemExit(f"stub answered the probe with {DEFAULT_MODE!r}")
-        # Everything else keeps resolving to the permissive stub.
+            raise SystemExit("stub answered: {stmt}")
         import triton.language.extra.some_new_module as mod
         assert type(mod).__name__ == "_PermissiveModule", type(mod)
         print("OK")
@@ -79,12 +76,13 @@ def test_the_torchtlx_probe_is_not_stubbed():
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason = "torch not installed")
 def test_dynamo_and_inductor_import_under_the_stub():
-    """The user-facing break: torch._dynamo (pulled in by transformers' masking_utils)
-    must import after the stub is installed."""
     proc = _run('''
         import torch
         import torch._inductor.config
         import torch._dynamo
+        assert torch._inductor.config.triton.tlx_mode is None
+        f = torch.compile(lambda x: x.sin() + 1, backend = "eager")
+        assert torch.allclose(f(torch.ones(3)), torch.ones(3).sin() + 1)
         print("OK", torch.__version__)
     ''')
     assert proc.returncode == 0 and "OK" in proc.stdout, proc.stdout + proc.stderr[-4000:]
