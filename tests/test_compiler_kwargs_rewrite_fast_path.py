@@ -1,6 +1,6 @@
-"""_rewrite_kwargs_param skips the tokenize round trip when no `def <name>` exists and the round trip is the identity."""
+"""_rewrite_kwargs_param skips tokenize when no `def <name>` exists and only returns new text on a rename."""
 
-import io
+import time
 import tokenize
 
 import pytest
@@ -8,27 +8,7 @@ import pytest
 import unsloth_zoo.compiler as compiler
 
 
-def _reference(source, func_name):
-    # The full tokenize -> untokenize path, as before the fast path.
-    saved = compiler._untokenize_round_trips
-    compiler._untokenize_round_trips = lambda source: False
-    try:
-        return compiler._rewrite_kwargs_param(source, func_name)
-    finally:
-        compiler._untokenize_round_trips = saved
-
-
-_CLASS_SOURCE = (
-    "class UnslothSFTTrainer(SFTTrainer):\n"
-    "    def __init__(self, model, args = None, **kwargs):\n"
-    "        x = f\"{{literal}} {model}\"\n"
-    "        y = 1 + \\\n"
-    "            2\n"
-    "        super().__init__(model, args, **kwargs)\n"
-)
-
-
-def test_class_source_does_not_tokenize(monkeypatch):
+def _count_tokenize(monkeypatch):
     calls = []
     real = tokenize.generate_tokens
 
@@ -37,52 +17,67 @@ def test_class_source_does_not_tokenize(monkeypatch):
         return real(readline)
 
     monkeypatch.setattr(compiler.tokenize, "generate_tokens", counting)
-    out = compiler._rewrite_kwargs_param(_CLASS_SOURCE, "UnslothSFTTrainer")
-    assert out == (_CLASS_SOURCE, None)
-    if getattr(compiler, "_untokenize_round_trips", lambda source: True)(_CLASS_SOURCE):
-        assert calls == []
+    return calls
+
+
+_CLASS_SOURCE = (
+    "class UnslothSFTTrainer(SFTTrainer):\n"
+    "    def __init__(self, model, args = None, **kwargs):\n"
+    '        x = f"{{literal}} {model}"\n'
+    "        y = 1 + \\\n"
+    "            2\n"
+    "        super().__init__(model, args, **kwargs)\n"
+)
+
+
+def test_class_source_does_not_tokenize(monkeypatch):
+    calls = _count_tokenize(monkeypatch)
+    assert compiler._rewrite_kwargs_param(_CLASS_SOURCE, "UnslothSFTTrainer") == (_CLASS_SOURCE, None)
+    assert calls == []
 
 
 @pytest.mark.parametrize(
-    "source, name",
+    "source",
     [
-        ("def f(a, kwargs, **kwargs):\n    return a\n", "f"),
-        ("def  f (a, kwargs, **kwargs):\n    return a\n", "f"),
-        ("def \\\nf(a, kwargs, **kwargs):\n    return a\n", "f"),
-        ("async def f(kwargs, **kwargs):\n    pass\n", "f"),
-        ("class A:\n    def f(self, kwargs, **kwargs):\n        pass\n", "f"),
-        ("def g(kwargs, **kwargs):\n    pass\n", "f"),
-        ("def f1(kwargs, **kwargs):\n    pass\n", "f"),
-        ("s = 'def f(kwargs, **kwargs)'\n", "f"),
-        ("def f(a,\tkwargs, **kwargs):\n    pass\n", "f"),
-        ("def f(a, kwargs, **kwargs):\r\n    pass\r\n", "f"),
-        ("x = 1 + \\\n    2\ndef h(**kwargs): pass\n", "f"),
-        ("x = (1 +\n\t2)\n", "f"),
-        ("y = f'{{a}} {b}'\n", "f"),
-        ("z = 1 +\\\n\\\n 2\n", "f"),
-        ("def f(\n    a,\n    kwargs,\n    **kwargs,\n):\n    '''doc'''\n    return a\n", "f"),
-        ("def f(a, kwargs, **kwargs", "f"),
-        ("\u00e9 = 1\ndef f\u0301(kwargs, **kwargs): pass\n", "f"),
-        # No final newline: untokenize below 3.12 drops the trailing spaces, so no fast path.
-        ("x = 1\n   ", "f"),
-        ('x = f"""{{\n#}}{y}"""  ', "f"),
+        "def f(a, kwargs, **kwargs):\n    return a\n",
+        "def  f (a, kwargs, **kwargs):\n    return a\n",
+        "def \\\nf(a, kwargs, **kwargs):\n    return a\n",
+        "def\t\\\r\n f(a, kwargs, **kwargs):\r\n    return a\r\n",
+        "async def f(kwargs, **kwargs):\n    pass\n",
+        "class A:\n    def f(self, kwargs, **kwargs):\n        pass\n",
+        "def f(a,\tkwargs, **kwargs):\n    pass\n",
+        "def f(\n    a,\n    kwargs,\n    **kwargs,\n):\n    '''doc'''\n    return a\n",
     ],
 )
-def test_matches_full_round_trip(source, name):
-    assert compiler._rewrite_kwargs_param(source, name) == _reference(source, name)
+def test_renames(source):
+    new_source, alias = compiler._rewrite_kwargs_param(source, "f")
+    assert alias == "kwargs_"
+    assert "kwargs_" in new_source
 
 
-def test_def_scan_is_linear_on_comment_runs():
-    # A comment branch that can stop at any "#" made the def scan backtrack exponentially.
-    import time
-
-    source = (
-        "def forward(self, hidden_states, **kwargs):\n"
-        "    # see the reference kernel at commit 9a8b7c6d5e4f3a2b1c0def\n"
-        "    " + "#" * 5000 + "\n"
-        "    return self.mlp(hidden_states, **kwargs)\n"
-    )
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def g(kwargs, **kwargs):\n    pass\n",
+        "s = 'def f1(kwargs, **kwargs)'\n",
+        "def f(a, **kwargs):\n    x = f'{{a}} {b}'  \n    y = 1 + \\\n\\\n 2\n",
+        "def f(a, kwargs, **kwargs",
+        "x = 1\n   ",
+        "def forward(self, x, **kwargs):\n    " + "#" * 5000 + "\n    return x\n",
+    ],
+)
+def test_no_rename_returns_source_unchanged(source):
+    # untokenize is not the identity on every Python, so no rename must mean the input back.
     start = time.perf_counter()
-    result = compiler._rewrite_kwargs_param(source, "LlamaMLP")
+    assert compiler._rewrite_kwargs_param(source, "f") == (source, None)
     assert time.perf_counter() - start < 1.0
-    assert result == _reference(source, "LlamaMLP")
+
+
+def test_later_def_without_collision_keeps_alias():
+    source = (
+        "def f(a, kwargs, **kwargs):\n    return kwargs\n"
+        "def f(b, **kwargs):\n    return b\n"
+    )
+    new_source, alias = compiler._rewrite_kwargs_param(source, "f")
+    assert alias == "kwargs_"
+    assert "def f(a, kwargs_, **kwargs)" in new_source

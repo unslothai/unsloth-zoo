@@ -1529,36 +1529,10 @@ def _process_param_tokens(param_tokens):
 
     return new_tokens, replacement
 
-def _untokenize_round_trips(source: str) -> bool:
-    """True only for text this Python's tokenize + untokenize gives back unchanged. Rules out
-    tabs, form feeds, CR, NUL, `\\N{`, backslash-only lines, and on Pythons without the
-    gh-125553 untokenize (3.12 before 3.12.10, 3.13 before 3.13.2) everything from 3.12 on
-    and a space before a backslash continuation below 3.12."""
-    # Below 3.12 untokenize drops trailing spaces when the text has no final newline.
-    if not source.endswith("\n"):
-        return False
-    for unsafe in ("\t", "\f", "\r", "\x00", "\\N{"):
-        if unsafe in source:
-            return False
-    if not hasattr(tokenize.Untokenizer, "add_backslash_continuation"):
-        if sys.version_info >= (3, 12) or " \\\n" in source:
-            return False
-    at = source.find("\\\n")
-    while at != -1:
-        # A line holding only spaces and the backslash: untokenize cannot place it.
-        if not source[source.rfind("\n", 0, at) + 1 : at].strip(" "):
-            return False
-        at = source.find("\\\n", at + 2)
-    return True
-
-
 def _rewrite_kwargs_param(source: str, func_name: str):
-    # No `def <func_name>` (spaces, newlines, comments, continuations between) means no
-    # token below can match, so the result is the untokenize round trip of `source`:
-    # skip it where that round trip is the identity (a class name such as a TRL trainer).
-    if _untokenize_round_trips(source) and re.search(
-        r"def(?:[ \n]|\\\n|#[^\n]*\n)*" + re.escape(func_name) + r"(?!\w)", source
-    ) is None:
+    # Superset of the `def <name>` token pair matched below, so a miss (a TRL trainer class
+    # name) skips the tokenize pass; whitespace, continuations and comments may sit between.
+    if re.search(r"def(?:\s|\\|#[^\n]*\n)*" + re.escape(func_name), source) is None:
         return source, None
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
@@ -1601,7 +1575,9 @@ def _rewrite_kwargs_param(source: str, func_name: str):
                     param_tokens.append(t)
                     i += 1
 
-                new_param_tokens, renamed_to = _process_param_tokens(param_tokens)
+                new_param_tokens, replacement = _process_param_tokens(param_tokens)
+                if replacement is not None:
+                    renamed_to = replacement
                 out_tokens.extend(new_param_tokens)
                 if i < len(tokens):
                     out_tokens.append(tokens[i])
@@ -1610,6 +1586,9 @@ def _rewrite_kwargs_param(source: str, func_name: str):
         out_tokens.append(tok)
         i += 1
 
+    # untokenize is lossy on some Pythons (whitespace, f-string braces before 3.12.10 / 3.13.2)
+    if renamed_to is None:
+        return source, None
     try:
         new_source = tokenize.untokenize(out_tokens)
     except Exception:
