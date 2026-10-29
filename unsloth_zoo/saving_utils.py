@@ -8076,7 +8076,22 @@ def check_local_model_exists(model_path):
         if has_safetensors(path):
             return os.path.abspath(path)  # Return absolute path
 
+    # Offline, the cached snapshot is the only copy: every Hub call on this repo id would raise.
+    snapshot = _offline_cached_snapshot(model_path)
+    if snapshot and has_safetensors(snapshot):
+        return snapshot
     return None
+pass
+
+def _offline_cached_snapshot(model_name):
+    """The cached `main` snapshot directory of `model_name` under HF_HUB_OFFLINE, else None."""
+    try:
+        from huggingface_hub import constants, try_to_load_from_cache
+        if not constants.HF_HUB_OFFLINE or not _is_hub_repo_id(model_name): return None
+        config_path = try_to_load_from_cache(model_name, "config.json")
+        return os.path.dirname(config_path) if isinstance(config_path, str) else None
+    except Exception:
+        return None
 pass
 
 def _is_fp8_quant_config(quant_config):
