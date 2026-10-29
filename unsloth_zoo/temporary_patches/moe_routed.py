@@ -492,8 +492,7 @@ def _bias_args(tb):
     # Resolved per launch: bitsandbytes recasts Linear4bit.bias into new storage on dtype change.
     bias = tb["bias"]
     if isinstance(bias, (list, tuple)):
-        # The previous launch's table while every bias keeps its address, dtype and device (one C call,
-        # not a data_ptr per expert): what lora_pointer_table would look up again.
+        # Reuse the previous table while every bias keeps address, dtype and device (one C call).
         last = tb.get("_bias_last")
         if last is not None and type(bias) is list and len(bias) == len(last[1]):
             b0 = bias[0]
@@ -894,7 +893,6 @@ def _launch_expert(x, idx, weight, bias, out, row_div, lora_a = None, h_out = No
                 num_warps = c["num_warps"], num_stages = c["num_stages"], enable_fp_fusion = True,
             )
         return out
-    # The trailing LoRA arguments at their defaults ride along as fixed values.
     consts.update(LORA_A = None, H_OUT = None, stride_lae = 0, stride_lak = 0, stride_lar = 0, HAS_LORA_A = False,
                   R = 1, R_PAD = 16)
     _fast_launch(_routed_bf16_expert_kernel, grid, args, consts, x.get_device(), (out,),

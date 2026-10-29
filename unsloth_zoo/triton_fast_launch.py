@@ -15,22 +15,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Cached eager Triton launches for small, frequently launched kernels (gpt-oss decode).
 
-JITFunction.run binds and specializes every argument on every call (about 15-30 us of host time for a
-kernel with twenty arguments); at batch 1 decode that is a large share of a token. launch() runs the
-first call of each specialization through Triton and keeps the compiled kernel; later calls with the
-same specialization call its launcher directly. The same compiled binary runs either way.
-
-Specialization key: every constexpr by value, every tensor by dtype and 16 byte alignment, every
-integer by value (bools tagged apart from ints), floats by type, None as None, plus the device and
-the launch options. That is at least as fine as what Triton specializes on, so a hit never runs a
-kernel compiled for other arguments.
-
-Gates, as in temporary_patches/gdn_causal_conv1d.py: Triton 3.6+ (the launcher convention checked
-there), NVIDIA, no profiler launch hooks, tensors on the current device, not inside a CUDA graph
-capture for the first fast launch of a kernel. That first fast launch is checked bitwise against the
-full launch it repeats (outputs only written, never read, by the kernel); a mismatch or an exception
-keeps that kernel (or, on an exception, every kernel) on Triton's own path. The outputs are poisoned
-before the checked launch, so one that writes nothing fails it.
+JITFunction.run re-binds every argument per call (15-30 us host time); launch() keeps the compiled
+kernel from the first call per specialization and calls its launcher directly afterwards. The key is
+at least as fine as Triton's specialization. Each kernel's first fast launch is checked bitwise against
+the full launch (outputs poisoned first); a mismatch or exception falls back to Triton's own path.
 Kill switch: UNSLOTH_TRITON_FAST_LAUNCH=0, read at import.
 """
 
@@ -70,7 +58,6 @@ _ENABLED = (
     and os.environ.get("UNSLOTH_TRITON_FAST_LAUNCH", "1") != "0"
     and _launcher_verified()
 )
-# Engagement counters: "fast" launches through the cached launcher, "full" through Triton.
 FAST_LAUNCH_STATS = {"fast": 0, "full": 0}
 _PLANS = {}  # keyed by id(kernel): the kernels are module globals, never freed
 _PLANS_MAX = 4096
@@ -79,7 +66,7 @@ _runtime_hooks = None
 
 
 def _hook_active(hook):
-    # Triton 3.6+ keeps an always-present HookChain; empty means no profiler hooked in.
+    # Triton 3.6+ always has a HookChain; empty = no profiler.
     return hook is not None and bool(getattr(hook, "calls", True))
 
 
@@ -87,7 +74,7 @@ _knobs = None
 
 
 def _knobs_set():
-    # Triton's own run path reads these per call; a cached plan would keep a kernel compiled without them.
+    # Triton reads these per call; a cached plan would ignore them.
     global _knobs
     if _knobs is None:
         try:
@@ -127,7 +114,7 @@ def _spec(arg):
         return None
     if isinstance(arg, _Tensor):
         return (arg.dtype, not (_Tensor.data_ptr(arg) & 15))
-    return (kind, arg)  # anything else Triton accepts: by value
+    return (kind, arg)
 
 
 _BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
@@ -172,10 +159,8 @@ def _run(entry, grid, device, args):
 
 
 def launch(kernel, grid, args, constexprs, device, outs, **options):
-    """kernel[grid](*args, **constexprs, **options) on device (an index, -1 for CPU tensors; another
-    than the current device gets Triton's own launch inside torch.cuda.device). args: the runtime arguments in signature order,
-    before every name in constexprs; constexprs: every remaining argument, in signature order.
-    outs: the tensors the kernel writes and never reads (compared on the self-check)."""
+    """kernel[grid](*args, **constexprs, **options). device: index, -1 for CPU. constexprs must be the
+    signature arguments after args, in order. outs: tensors written but never read (self-checked)."""
     global _ENABLED
     if (
         not _ENABLED or device < 0 or device != _current_device() or _hooks_set()
@@ -189,7 +174,7 @@ def launch(kernel, grid, args, constexprs, device, outs, **options):
         compiled = _full(kernel, grid, args, constexprs, options)
         names = kernel.arg_names[len(args):]
         if hasattr(compiled, "packed_metadata") and tuple(names) == tuple(constexprs):
-            compiled.run  # loads the module now, so the fast path never does
+            compiled.run  # load the module now, not on the fast path
             if len(_PLANS) >= _PLANS_MAX:
                 _PLANS.pop(next(iter(_PLANS)))
             _PLANS[key] = (compiled, tuple(constexprs.values()))
@@ -198,15 +183,14 @@ def launch(kernel, grid, args, constexprs, device, outs, **options):
     if ok is None:
         compiled = _full(kernel, grid, args, constexprs, options)
         if torch.cuda.is_current_stream_capturing():
-            return compiled  # the check reads back on the host: leave it to the next eager call
+            return compiled  # check syncs to host: defer to an eager call
         refs = [t.clone() for t in outs]
-        for t in outs:  # every bit flipped, so an element the launch does not write cannot match the reference
+        for t in outs:  # flip bits so an unwritten element cannot match
             _poison(t)
         try:
             _run(entry, grid, device, args)
             ok = all(map(_same_bits, outs, refs))
         except Exception:
-            # A launcher that takes other arguments: Triton's own path for every kernel, as below.
             for t, r in zip(outs, refs):
                 t.copy_(r)
             _ENABLED = False
@@ -222,8 +206,7 @@ def launch(kernel, grid, args, constexprs, device, outs, **options):
     try:
         _run(entry, grid, device, args)
     except Exception:
-        # A Triton build whose launcher takes other arguments (it raises while parsing them, before
-        # launching): Triton's own path from now on.
+        # Incompatible launcher signature (raises before launching): disable globally.
         _ENABLED = False
         _PLANS.clear()
         return _full(kernel, grid, args, constexprs, options)

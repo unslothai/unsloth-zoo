@@ -91,7 +91,6 @@ def test_first_full_then_checked_then_fast(fake_cuda):
     # Call 1 full (cached), call 2 full + checked fast launch, calls 3-4 fast only.
     assert len(k.full_calls) == 2 and len(k.fast_calls) == 3
     assert L._KERNEL_OK[id(k)] is True and L.FAST_LAUNCH_STATS["fast"] == 2
-    # The constexpr rides along after the runtime arguments, as Triton passes it.
     assert k.fast_calls[-1][5:] == (16,)
 
 
@@ -210,7 +209,7 @@ def test_specialization_changes_miss(fake_cuda):
     _call(k, x, torch.empty(8))
     _call(k, x, torch.empty(8))
     n_full = len(k.full_calls)
-    # Another int value, a bool where an int was, another constexpr, dtype, alignment: each a new plan.
+    # Each of these changes the specialization: a new plan.
     _call(k, x, torch.empty(8), n = 4)
     _call(k, x, torch.empty(8), n = True)
     _call(k, x, torch.empty(8), block = 32)
