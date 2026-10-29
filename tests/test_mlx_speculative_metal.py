@@ -926,6 +926,22 @@ def _decoded(lm, prompt, steps, block):
     return _state(stepped, cache) + _state(SimpleNamespace(logits = logits, hidden_states = [hidden]), run)
 
 
+def test_only_a_speculative_qwen4_batch_runs_narrow_projections_row_by_row(qwen4, monkeypatch):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    (model, ids), rows, kernel = qwen4, [], inference._verify_rows_alone
+    lm = model.language_model
+    monkeypatch.setattr(inference, "_verify_rows_alone", lambda *a: rows.append(a) or kernel(*a))
+    caches = [make_prompt_cache(lm) for _ in ids[:2]]
+    for cache, prompt in zip(caches, ids):
+        mx.eval(lm(mx.array([prompt[:8]]), cache = cache).logits)
+    for call, served in (((), False), (("speculative",), True)):
+        rows.clear()
+        with inference.inference_scopes(model, call):
+            mx.eval(lm(mx.array([[prompt[8]] for prompt in ids[:2]]), cache = [type(a).merge([a, b]) for a, b in zip(*caches)]).logits)
+        assert bool(rows) == served
+
+
 def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit(qwen4, monkeypatch):
     from mlx_vlm.models.qwen4_exp import language
     from unsloth_zoo.mlx import inference
@@ -933,21 +949,27 @@ def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit
     lm, native = model.language_model, type(language._QWEN4_BATCH_INVARIANT_FORWARD)
     args = (lm, ids[0][:20], ids[0][20:26], ids[0][26:31])
     expected = _decoded(*args)
-    # The scopes a plain, undrafted generation holds.
-    with inference.inference_scopes(model, ()):
+    with inference.inference_scopes(model, ()):   # every generation holds the forward
         assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is not native
+    with inference.inference_scopes(model, ("speculative",)):
         assert _same(expected, _decoded(*args))
     assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is native and "_unsloth_verify_scopes" not in vars(lm)
     # The first decode step and the verify block each matched on their first layer, then served every other one.
     admitted = [key for key, verdict in inference._VERIFY_VERDICTS.items() if verdict]
-    assert {key[0] for key in admitted} == {(1, 1), (1, 5)} and all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted)
+    assert {key[0] for key in admitted} == {(1, 1), (1, 5), "rows alone"}
+    assert any(key[0] == "rows alone" and key[2][0] == 1 for key in admitted)
+    assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted if key[0] != "rows alone")
     # A drafted target settles its projections' multi-row kernels at load, through the batch-invariant forward too.
     projections = [p for _, p in lm.named_modules() if type(p).__name__ == "QuantizedLinear"]
     for p in projections:
         p.__dict__.pop("_unsloth_qmv_rows", None)
-    monkeypatch.setattr(model, "generate", lambda *args, **kwargs: None, raising = False)
+    held = []
+    monkeypatch.setattr(model, "generate", lambda *args, **kwargs: held.append("_unsloth_speculative_call" in vars(lm)), raising = False)
+    inference.warm_inference(model)   # a plain load warms what a plain generation runs
+    assert held == [False] and not any(vars(p).get("_unsloth_qmv_rows") for p in projections)
     monkeypatch.setattr(model, "_unsloth_speculates", True, raising = False)
     inference.warm_inference(model)
+    assert held == [False, True]
     tags = [vars(p).get("_unsloth_qmv_rows") for p in projections]
     assert projections and all(tags) and any(tag[2] for tag in tags)
 

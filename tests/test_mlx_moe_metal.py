@@ -687,13 +687,13 @@ def test_verify_blocks_run_their_routed_experts_on_the_decode_kernels_bitwise(mo
                 gathers.clear()
                 partitions.clear()
                 _identical(verifier._feed_forward(block, x), out)
-                assert len(gathers) == (1 if serving else 4)  # mlx-vlm gathers for the shared gate, then per expert projection
+                assert len(gathers) == (0 if serving else 4)  # mlx-vlm gathers per expert and for the shared gate
                 assert bool(partitions) is not serving  # served blocks route in the fused router's launch
         assert len(fusion._VERIFY_VERDICTS) >= 2 and all(fusion._VERIFY_VERDICTS.values())
         block.switch_mlp.down_proj.unfreeze()
         gathers.clear()
         _identical(verifier._feed_forward(block, xs[0]), expected[0])
-        assert len(gathers) == 4
+        assert len(gathers) == 3
         # A projection swapped for one the kernels were not built for takes the native call as well.
         block.switch_mlp.down_proj = vlm.SwitchLinear(512, 512, 32, bias = False)
         block.switch_mlp.down_proj.set_dtype(mx.bfloat16)

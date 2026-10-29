@@ -35,7 +35,7 @@ import struct
 import sys
 import textwrap
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from threading import RLock, local
 from types import FunctionType
@@ -4822,6 +4822,30 @@ def _verify_admitted(key, native, fused):
     return reference
 
 
+def _verify_gathers(linear, x, eligible):
+    """Whether verification would gather a frozen projection with different rounding from one-row decode."""
+    return (getattr(_VERIFY_STATE, "serving", False) and not getattr(_VERIFY_STATE, "plain_decode", False)
+            and isinstance(linear, nn.QuantizedLinear) and x.ndim == 3 and x.shape[0] * x.shape[1] > 1 and not eligible(linear, x) and not linear.trainable_parameters())
+
+
+def _verify_rows_alone(linear, x):
+    K = x.shape[-1]
+
+    def one_row_calls():
+        return mx.concatenate([linear(row[None]) for row in mx.contiguous(x).reshape(-1, 1, K)]).reshape(*x.shape[:-1], -1)
+
+    def batched():
+        biases = linear.get("biases")
+        y = mx.quantized_matmul(x.reshape(-1, 1, K), linear["weight"][None], scales = linear["scales"][None],
+                                biases = None if biases is None else biases[None], transpose = True,
+                                group_size = linear.group_size, bits = linear.bits, mode = linear.mode)
+        y = y.reshape(*x.shape[:-1], -1)
+        return y + linear["bias"] if "bias" in linear else y
+
+    key = ("rows alone", x.dtype, linear["weight"].shape, linear.bits, linear.group_size, linear.mode, "bias" in linear)
+    return _verify_admitted(key, one_row_calls, batched)
+
+
 def _verify_sliced(project, linears, x, eligible):
     """`project(x)`, over balanced row slices when the block is wider than mlx-vlm's fused verify bound."""
     if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] <= _VERIFY_FUSED_ROWS
@@ -5556,13 +5580,14 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer, outer_tapes
 
     def entered(self, language_model, *args, **kwargs):
-        outer = getattr(_VERIFY_STATE, "serving", False)
+        outer, outer_plain = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "plain_decode", False)
         _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
                                      and not language_model.training and _bindings_intact(bindings))
+        _VERIFY_STATE.plain_decode = "_unsloth_speculative_call" not in language_model.__dict__
         try:
             return native_entry(self, language_model, *args, **kwargs)
         finally:
-            _VERIFY_STATE.serving = outer
+            _VERIFY_STATE.serving, _VERIFY_STATE.plain_decode = outer, outer_plain
 
     def taped_gated_delta(self, layer, inputs, mask, cache):
         if getattr(_VERIFY_STATE, "tapes", None) is None:
@@ -5573,12 +5598,18 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
                 return _verify_gdn(self, layer, inputs, cache, route, kernels.gated_delta_update_with_states, qk_eps)
         return taped(self, layer, inputs, mask, cache)
 
+    def projected(self, linear, x):
+        return _verify_rows_alone(linear, x) if _verify_gathers(linear, x, eligible) else base._linear(self, linear, x)
+
     def sliced_linear(self, linear, x):
-        project = lambda rows: base._linear(self, linear, rows)
+        project = lambda rows: projected(self, linear, rows)
         return _verify_qmv_rows(lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
 
     def sliced_linears(self, linears, x):
-        project = lambda rows: base._linears(self, linears, rows)
+        if all(isinstance(p, (nn.Linear, nn.QuantizedLinear)) for p in linears) and any(_verify_gathers(p, x, eligible) for p in linears):
+            project = lambda rows: tuple(projected(self, p, rows) for p in linears)
+        else:
+            project = lambda rows: base._linears(self, linears, rows)
         return _verify_qmv_rows(lambda: _verify_sliced(project, linears, x, eligible), linears, x)
 
     def submitted_layer(self, *args, **kwargs):
@@ -5710,7 +5741,8 @@ def exact_speculative_verify(model, *, _modules = None):
     instead of keeping every step's state, once replays of a key's first block matched every per-step state bit
     for bit. 4-, 5-, 6- and 8-bit affine projections run every row of a block in one call per eight rows, each row
     with its one-row decode arithmetic, on the same condition; `UNSLOTH_MLX_VERIFY_QMV_ROWS=0` keeps them native.
-    Only verify calls of the
+    Quantized projections mlx-vlm's exact affine kernel refuses (N % 8 or K % 512 off, as a MoE shared-expert gate's)
+    run each row as the one-row call does, which mlx-vlm's gather does not. Only verify calls of the
     language models found here are served; other, training and distributed models, and an mlx-vlm whose verifier
     drifted, keep the native methods.
     """
@@ -6870,11 +6902,34 @@ def exact_dilated_depthwise_conv(model, *, _modules = None):
                         module.__class__ = nn.Conv1d
 
 
+@contextmanager
+def speculative_call(model, *, _modules = None):
+    """Mark the language models and routed-expert blocks of a call that verifies drafts. What pays only there checks the
+    mark, each path bitwise equal to the one it replaces, so a plain generation keeps its own route and cost."""
+    marked = []
+    try:
+        with _VERIFY_LOCK:
+            for _, module in _fusion_modules(model, _modules):
+                state = getattr(module, "__dict__", {})
+                if "_unsloth_moe_routed" in state or "_unsloth_verify_scopes" in state:
+                    state["_unsloth_speculative_call"] = state.get("_unsloth_speculative_call", 0) + 1
+                    marked.append(state)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for state in marked:
+                state["_unsloth_speculative_call"] -= 1
+                if not state["_unsloth_speculative_call"]:
+                    del state["_unsloth_speculative_call"]
+
+
 class InferenceScope(NamedTuple):
-    """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
+    """`serves`: call traits that admit it (empty admits all). `speculative`: entered only by a call naming that trait,
+    which None does not, so a plain generation never pays for it. `opt_in`: env switch that must be "1".
     `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument."""
     enter: Callable
     serves: frozenset = frozenset()
+    speculative: bool = False
     opt_in: str = None
     int8_prefill: bool = False
     ane_prefill: bool = False
@@ -6886,6 +6941,8 @@ class InferenceScope(NamedTuple):
     def admits(self, call):
         if self.opt_in is not None and os.environ.get(self.opt_in) != "1":
             return False
+        if self.speculative:
+            return call is not None and "speculative" in call
         return call is None or not self.serves or not self.serves.isdisjoint(call)
 
 
@@ -6911,6 +6968,7 @@ INFERENCE_SCOPES = [
     # qwen4_exp decodes on the forward its verify blocks run on, so every generation holds this one.
     InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
+    InferenceScope(speculative_call, speculative = True),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
     InferenceScope(fused_decode_attention),
     InferenceScope(exact_ple_row_reads),
@@ -6921,7 +6979,8 @@ INFERENCE_SCOPES = [
 
 @contextmanager
 def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = None, on_error = None, _modules = None):
-    """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation.
+    """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation, short of
+    the scopes only a call naming "speculative" enters.
 
     Traits this zoo does not know are ignored. A scope that raises on entry propagates unless `on_error` is
     given: then `on_error(name, error)` runs and, if it returns, the generation continues without that scope.
@@ -6949,8 +7008,10 @@ _WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17
 def warm_inference(model, int8_prefill = None, ane_prefill = None):
     """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
     first-use checks; checks keyed by a request's row count still run then."""
-    model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
-                   int8_prefill = int8_prefill, ane_prefill = ane_prefill)
+    speculates = getattr(model, "_unsloth_speculates", False)   # set by building a drafter for it
+    with inference_scopes(model, ("speculative",), int8_prefill = int8_prefill, ane_prefill = ane_prefill) if speculates else nullcontext():
+        model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
+                       int8_prefill = int8_prefill, ane_prefill = ane_prefill)
     _warm_qmv_rows(model)
     _warm_verify_gdn(model)
 
