@@ -3785,9 +3785,8 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
 
 
 def _ensure_qwen3_5_mtp_norm_sanitize() -> None:
-    """mlx-lm < 0.32 shifts RMSNorm weights by +1 whenever `mtp.*` keys exist, so a
-    converted checkpoint bundling its MTP head loads with doubled norms
-    (ml-explore/mlx-lm#1623). Sanitize drops those keys anyway; drop them first."""
+    # mlx-lm < 0.32 adds +1 to norms whenever `mtp.*` keys exist, even on converted
+    # checkpoints (ml-explore/mlx-lm#1623); sanitize drops those keys anyway, so drop them first.
     try:
         module = importlib.import_module("mlx_lm.models.qwen3_5")
     except (Exception, SystemExit):
