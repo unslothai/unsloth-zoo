@@ -335,15 +335,32 @@ def test_free_memory_admits_layers_by_their_own_cost(monkeypatch):
     nn.quantize(model, group_size = 64, bits = 4, class_predicate = lambda path, m: hasattr(m, "to_quantized") and (
         {"group_size": 64, "bits": 8} if path.startswith("layers.0") else True))
     model.eval()
-    # int8 gate/up/down rows for 512 channels, plus the GPU's copy of down's other 512 columns and its scales/biases
+    # the wired cost of int8 gate/up/down rows for 512 channels, plus the GPU's copy of down's other 512 columns and
+    # its scales/biases
     four, eight = ane._split_bytes(model.layers[1], 512), ane._split_bytes(model.layers[0], 512)
-    assert four == 3 * 512 * 256 + 256 * 512 // 2 + 2 * 256 * 8 * 2 and eight == four + 256 * 512 // 2
+    assert four == 3 * 3 * 512 * 256 + 256 * 512 // 2 + 2 * 256 * 8 * 2 and eight == four + 256 * 512 // 2
     for budget, layers in ((four + eight - 1, 1), (four + eight, 2), (min(four, eight) - 1, 0)):
         monkeypatch.setattr(ane, "_memory_budget", lambda: budget)
         status = ane.prepare_ane_prefill(model, tile = TILE, share = 0.5)
         assert status.layers == layers and (status.reason == "not enough free memory") == (not layers)
         assert sum(ane._STATE in layer.__dict__ for layer in model.layers) == layers
         ane.release_ane_prefill(model)
+
+
+@pytest.mark.parametrize("readings,factor", [([5, 6.5, 7, 9.5, 1, 10], 2.5), ([None, 1.5, 7, 9.5, 1, 10], 5.75),
+                                             ([None] * 6, 0.0)])
+def test_program_loads_report_the_wired_memory_they_add(readings, factor, monkeypatch):
+    weights = 3 * (CHANNELS // 2) * HIDDEN   # each layer's int8 Neural Engine bytes at share 0.5
+    values = iter([None if r is None else r * weights for r in readings])
+    monkeypatch.setattr(ane, "_wired_bytes", lambda: next(values))
+    model = _model()
+    model.layers.append(SwiGLU())
+    nn.quantize(model.layers[2], group_size = 64, bits = 4)
+    model.layers[2].set_dtype(mx.bfloat16)
+    model.layers[2].eval()
+    status = ane.prepare_ane_prefill(model, tile = TILE, share = 0.5)
+    assert status.layers == 3 and status.wired_factor == pytest.approx(factor)   # the median, not the first or last
+    ane.release_ane_prefill(model)
 
 
 def test_the_budget_is_half_of_what_the_model_leaves(monkeypatch):

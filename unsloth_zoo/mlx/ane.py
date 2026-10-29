@@ -463,6 +463,7 @@ _ACT_SCALE = 1 / 16     # keeps the fp16 activation and its down projection in r
 _MIN_GAIN = 0.05        # below this the split is not worth its approximation
 _WATCHDOG = 5.0         # seconds a Neural Engine evaluation may take before the split is abandoned
 _MEMORY_SHARE = 0.5     # of the memory the model leaves free; the rest stays for the KV cache and activations
+_WIRED_FACTOR = 3       # the Neural Engine wires 1.85x (M3 Max) to 2.7x (M5 Pro) a program's int8 weights in prefill
 _STATE = "_unsloth_ane_split"
 _CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "unsloth", "mlx_ane_prefill.json")
 _LOCK = threading.RLock()
@@ -477,6 +478,8 @@ class AnePrefillStatus(NamedTuple):
     split_ms: float = 0.0
     seconds: float = 0.0
     reason: str = ""
+    # System wired memory each program load added, over its int8 weight bytes (median); noisy, so only reported.
+    wired_factor: float = 0.0
 
 
 class _Worker:
@@ -581,11 +584,27 @@ def _program(mlp, k, tile):
 
 
 def _split_bytes(mlp, k):
-    """Memory a split adds to the checkpoint's: int8 Neural Engine weights, wired outside the process, and the GPU's
-    copy of down's remaining columns (the gate and up remainders are views)."""
+    """Memory a split adds to the checkpoint's: what the Neural Engine wires for its int8 weights, outside the process,
+    while prefill runs, and the GPU's copy of down's remaining columns (the gate and up remainders are views)."""
     down = _projections(mlp)[2]
     hidden, rest = down.weight.shape[0], _mlp_shape(mlp)[1] - k
-    return 3 * k * hidden + hidden * rest * down.bits // 8 + 2 * hidden * rest // down.group_size * down.scales.itemsize
+    return _WIRED_FACTOR * 3 * k * hidden + hidden * rest * down.bits // 8 + 2 * hidden * rest // down.group_size * down.scales.itemsize
+
+
+class _VMStatistics(ctypes.Structure):
+    _fields_ = [("free", ctypes.c_uint32), ("active", ctypes.c_uint32), ("inactive", ctypes.c_uint32),
+                ("wire", ctypes.c_uint32), ("rest", ctypes.c_uint8 * 256)]
+
+
+def _wired_bytes():
+    """System-wide wired memory, where the Neural Engine's buffers show (no process footprint counts them); None when
+    the kernel does not answer."""
+    libc = ctypes.CDLL(None)
+    libc.mach_host_self.restype = ctypes.c_uint32
+    stats, count = _VMStatistics(), ctypes.c_uint32(38)   # HOST_VM_INFO64_COUNT
+    if libc.host_statistics64(libc.mach_host_self(), 4, ctypes.byref(stats), ctypes.byref(count)):   # HOST_VM_INFO64
+        return None
+    return stats.wire * ctypes.c_size_t.in_dll(libc, "vm_kernel_page_size").value
 
 
 def _memory_budget():
@@ -616,7 +635,13 @@ class _Split:
     def __init__(self, mlp, k, tile, surfaces, program = None):
         gate, up, down = _projections(mlp)
         self.k, self.tile, self.hidden, self.surfaces = k, tile, down.weight.shape[0], surfaces
-        self.program = program or Program(*_program(mlp, k, tile))
+        self.wired = None
+        if program is None:
+            source, before = _program(mlp, k, tile), _wired_bytes()
+            program = Program(*source)
+            after = _wired_bytes()
+            self.wired = None if before is None or after is None else after - before
+        self.program = program
         self.request = self.program.request([surfaces.input], [surfaces.output])
         self.rest = (_remainder(gate, rows = k), _remainder(up, rows = k), _remainder(down, columns = k))
         mx.eval([p.parameters() for p in self.rest])
@@ -842,9 +867,13 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
                 attached.append(mlp)
         except AneError as error:
             logger.warning("Neural Engine prefill stopped after %d of %d layers: %s", len(attached), len(mlps), error)
-        status = AnePrefillStatus(len(attached), share, gpu, split_ms, time.perf_counter() - started)
+        loads = [split.wired / (3 * split.k * split.hidden) for split in (m.__dict__[_STATE] for m in attached)
+                 if split.wired is not None]
+        status = AnePrefillStatus(len(attached), share, gpu, split_ms, time.perf_counter() - started,
+                                  wired_factor = float(np.median(loads)) if loads else 0.0)
         logger.info("Neural Engine prefill: %d layers at a %.0f%% channel share (one-tile MLP %.1f -> %.1f ms), "
-                    "prepared in %.1f s", status.layers, 100 * share, gpu, split_ms, status.seconds)
+                    "prepared in %.1f s; program loads wired %.2fx their int8 weights", status.layers, 100 * share,
+                    gpu, split_ms, status.seconds, status.wired_factor)
         return status
 
 
