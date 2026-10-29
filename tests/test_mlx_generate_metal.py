@@ -635,15 +635,16 @@ def test_vlm_stream_row_left_alone_decodes_bitwise_without_the_single_row_shortc
 
     stock_scope = lambda model: contextlib.nullcontext(model)
     stock, stock_state, stock_extracted = run(stock_scope)
-    # The story decodes alone once the poem ends, and each such step went through the shortcut.
-    assert stock_extracted > 10 and stock_state is not None
+    # The story decodes alone once the poem ends; before mlx-vlm 0.7.11 each such step took the shortcut.
+    shortcut = stock_extracted > 0
+    assert stock_state is not None and (stock_extracted > 10 or not shortcut)
     for again in (False, True):
         scoped, state, scoped_extracted = run(scope)
         assert (scoped.token_ids, scoped.logprobs) == (stock.token_ids, stock.logprobs)
         assert len(state) == len(stock_state)
         assert all(a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(
             mx.contiguous(a).view(mx.uint8), mx.contiguous(b).view(mx.uint8)).item() for a, b in zip(state, stock_state))
-        if disagreement:
+        if disagreement or not shortcut:
             # The disagreeing step is replaced by the shortcut's, which the batch then keeps taking.
             assert scoped_extracted == stock_extracted
         elif again:
@@ -661,7 +662,7 @@ def test_vlm_stream_row_left_alone_decodes_bitwise_without_the_single_row_shortc
             rows[name] = engine.generate_batch(model, processor, [story, short_story], defaults=GenerationDefaults(max_tokens=24))
             rows[name + " extracted"] = len(extracted)
         assert [(r.token_ids, r.logprobs) for r in rows["scoped"]] == [(r.token_ids, r.logprobs) for r in rows["stock"]]
-        assert rows["stock extracted"] > 10 and rows["scoped extracted"] == 0
+        assert (rows["stock extracted"] > 10 or not shortcut) and rows["scoped extracted"] == 0
 
 
 @metal_only

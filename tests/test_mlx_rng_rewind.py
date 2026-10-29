@@ -46,7 +46,7 @@ if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
     pytest.skip("mlx.core is the tests/mlx_simulation stub, not real MLX",
                 allow_module_level = True)
 
-from mlx.utils import tree_map                                     # noqa: E402
+from mlx.utils import tree_flatten, tree_map                       # noqa: E402
 
 from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig  # noqa: E402
 from unsloth_zoo.mlx.utils import (                                # noqa: E402
@@ -416,6 +416,58 @@ def test_a_runtime_compile_failure_retries_eagerly_from_the_captured_key(tmp_pat
     assert keys[1] == keys[0]
 
 
+class _HostSyncLM(_TinyLM):
+    """Reads a value back to the host mid-forward, which a compile trace refuses."""
+
+    state = nn.Module.state
+
+    def __call__(self, input_ids):
+        hidden = self.embed(input_ids)
+        if hidden.sum().item() > float("inf"):
+            hidden = -hidden
+        return self.proj(hidden)
+
+
+def test_a_runtime_compile_failure_trains_eagerly_on_the_pre_trace_state(tmp_path):
+    """A failed captured-state trace leaves placeholder arrays in the model and
+    optimizer state; the eager retry must not evaluate them."""
+    model = _HostSyncLM()
+    before = {k: mx.array(v) for k, v in tree_flatten(model.parameters())}
+    trainer = MLXTrainer(
+        model,
+        SimpleNamespace(pad_token_id = 99, eos_token_id = 2),
+        [],
+        args = MLXTrainingConfig(
+            max_steps = 2,
+            gradient_accumulation_steps = 1,
+            learning_rate = 1e-2,
+            compile = True,
+            use_cce = False,
+            gradient_checkpointing = False,
+            cast_norm_output_to_input_dtype = False,
+            max_grad_norm = 0.0,
+            max_grad_leaf_norm = 0.0,
+            disable_memory_limits = True,
+            logging_steps = 2,
+            output_dir = str(tmp_path),
+        ),
+    )
+    trainer._batches = FiniteTextBatchPlan(
+        tuple(_FiniteTextRow(tuple(range(1, 11)), offset = 1, labels = None) for _ in range(2)),
+        ((0,), (1,)),
+        max_seq_length = 64,
+        pad_id = 99,
+    )
+    trainer.save_model = lambda *_args, **_kwargs: None
+
+    result = trainer.train()
+
+    assert result["compile_scope"] == "fallback_eager"
+    after = dict(tree_flatten(model.parameters()))
+    mx.eval(list(after.values()))
+    assert not mx.array_equal(after["proj.weight"], before["proj.weight"])
+
+
 def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
     """The single-process retry is exercised for real above; its DDP twin needs
     a distributed group no unit test can raise, so it is pinned structurally.
@@ -437,14 +489,16 @@ def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
             and node.func.id == name
         ]
 
-    captures = calls_named("_mlx_rng_key")
-    restores = calls_named("_restore_mlx_rng_key")
-    assert len(captures) == 2, (
-        f"expected both compile fallbacks to capture, found {len(captures)}"
-    )
-    assert len(restores) == 2, (
-        f"expected both compile fallbacks to restore, found {len(restores)}"
-    )
+    restores = []
+    for capture, restore in (("_mlx_rng_key", "_restore_mlx_rng_key"),
+                             ("_compile_state_snapshot", "_restore_compile_state")):
+        assert len(calls_named(capture)) == 2, (
+            f"expected both compile fallbacks to call {capture}"
+        )
+        assert len(calls_named(restore)) == 2, (
+            f"expected both compile fallbacks to call {restore}"
+        )
+        restores += calls_named(restore)
 
     parents = {}
     for node in ast.walk(tree):
@@ -464,10 +518,10 @@ def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
         assert recovery, "a restore sits on the happy path, not a recovery branch"
         branch = recovery[0]
         retries = calls_named("step_fn", branch)
-        assert retries, "a recovery branch rewinds the RNG but never retries"
+        assert retries, "a recovery branch rewinds but never retries"
         for retry in retries:
             assert restore.lineno < retry.lineno, (
-                "an eager fallback re-runs the step without rewinding the RNG"
+                "an eager fallback re-runs the step before rewinding"
             )
 
 

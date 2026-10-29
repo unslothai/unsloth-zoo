@@ -598,6 +598,8 @@ from .utils import (
     _preserved_preprocessing_rng,
     _mlx_rng_key,
     _restore_mlx_rng_key,
+    _compile_state_snapshot,
+    _restore_compile_state,
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
@@ -8426,8 +8428,10 @@ class MLXTrainer:
             compile_error = None
             result = None
             rng_state_before = None
+            compile_state_before = ()
             if _ddp_compile_local_grad:
                 rng_state_before = _mlx_rng_key()
+                compile_state_before = _compile_state_snapshot(state)
             try:
                 result = step_fn(batch_data, prev_state, do_update)
                 _eval_local_result(result)
@@ -8457,6 +8461,7 @@ class MLXTrainer:
                         peer=compile_error is None,
                     )
                 _restore_mlx_rng_key(rng_state_before)
+                _restore_compile_state(compile_state_before)
                 _main_print(
                     "Unsloth: mx.compile failed at runtime; "
                     "falling back to eager mode on all DDP ranks."
@@ -8852,8 +8857,10 @@ class MLXTrainer:
                 # The compiled step threads mx.random.state through its
                 # outputs, so an eager retry must resume from the pre-call key.
                 rng_state_before = None
+                compile_state_before = ()
                 if _use_compile and not _ddp_compile_local_grad:
                     rng_state_before = _mlx_rng_key()
+                    compile_state_before = _compile_state_snapshot(state)
                 try:
                     lvalue, toks, stats, grad_accum_state, grad_norm = _step_fn_for_batch(
                         batch_data, grad_accum_state, do_update,
@@ -8882,6 +8889,7 @@ class MLXTrainer:
                         if _eager_refetchable(batches):
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
+                        _restore_compile_state(compile_state_before)
                         state = [
                             model.state, optimizer.state, mx.random.state,
                             *_reference_compile_state,
@@ -8891,6 +8899,8 @@ class MLXTrainer:
                         )
                     else:
                         raise
+                # Held past the step it guards, it would keep the pre-update state alive through eval and saves.
+                compile_state_before = ()
 
             # Accumulate into the PENDING window (this accumulation window's
             # micro-batches). Fold into the COMMITTED window only once the
