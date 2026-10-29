@@ -1946,27 +1946,21 @@ def train_on_responses_only(
         return views
     pass
 
-    # `_collatable` classifies a raw text split twice (pretokenized, then raw
-    # text), and each pass re-sampled the rows and re-read every unlisted string
-    # column. One answer per dataset object for this call: nothing below mutates
-    # a split before the classifiers are done, and the refusal hint is unchanged
-    # because the scans that feed it are the same ones, run once.
+    # `_collatable` asks twice per split and the full column scans dominate, so
+    # scan once. The entry holds the dataset, which keeps its id from being reused.
     _split_views_memo = {}
     _split_views_uncached = _split_views
 
     def _split_views(dataset):
         hit = _split_views_memo.get(id(dataset))
-        # Holding the object pins its id for the life of this call.
-        if hit is not None and hit[0] is dataset:
-            if hit[2] is not None: raise hit[2]
-            return hit[1]
-        try:
-            views = _split_views_uncached(dataset)
-        except Exception as exc:
-            _split_views_memo[id(dataset)] = (dataset, None, exc)
-            raise
-        _split_views_memo[id(dataset)] = (dataset, views, None)
-        return views
+        if hit is None or hit[0] is not dataset:
+            try:
+                hit = (dataset, _split_views_uncached(dataset), None)
+            except Exception as exc:
+                hit = (dataset, None, exc)
+            _split_views_memo[id(dataset)] = hit
+        if hit[2] is not None: raise hit[2]
+        return hit[1]
     pass
 
     def _dataset_is_pretokenized(dataset):

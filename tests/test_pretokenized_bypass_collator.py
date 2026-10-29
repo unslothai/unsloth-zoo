@@ -3431,9 +3431,7 @@ def test_a_repeated_masking_call_keeps_the_dispatcher():
 
 
 def test_a_raw_text_split_is_classified_with_one_column_scan(monkeypatch):
-    """Classifying a raw text split asks "pretokenized?" and then "raw text?".
-    Both read the same sampled rows and unlisted string columns; reading them
-    twice doubled the cost on a large corpus for the same answer."""
+    """The pretokenized and raw text checks share one sample and column scan."""
     n = 3000
     dataset = Dataset.from_dict({
         "text": [f"{INSTRUCTION_PART}hi{RESPONSE_PART}yo"] * n,
