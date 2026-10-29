@@ -12,6 +12,7 @@
 import random
 from collections import Counter
 from math import prod
+from types import SimpleNamespace
 
 import pytest
 
@@ -450,3 +451,27 @@ def test_only_the_verify_forward_is_built_as_a_verify_block():
     engine._verify_forward = lambda lm, inputs, cache: seen.append(marked()) or (type("Out", (), {"logits": None}), None)
     engine._verify(None)
     assert seen == [True] and not marked()
+
+
+@pytest.mark.parametrize("history_only", [True, False])
+def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_allow(history_only, monkeypatch):
+    import contextlib
+
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import EngineRow, SpeculativeEngine, _Row
+
+    processor = lambda tokens, logits: logits
+    processor.history_only = history_only
+    controller = DraftController(max_depth = 1, can_copy = False)
+    rows = [_Row(EngineRow(None, 1, [1, 2], processors = [processor], drafts = drafts), controller) for drafts in (True, False)]
+    assert [row.speculates for row in rows] == [history_only, False]
+    # Pipelining waits for a processor that reads more than the history, not for a row off the draft.
+    queued = []
+    step = lambda inputs, ahead = 0: queued.append(ahead) or (mx.array([3, 3]), None, None)
+    record = SimpleNamespace(record_plain = lambda *_a: None, interrupts_plain = lambda _s: False)
+    # No stream work happens here; the CPU shim implements none.
+    monkeypatch.setattr(mx, "stream", lambda _s: contextlib.nullcontext())
+    engine = _bare_engine(SpeculativeEngine, _step = step, _stream = None, controller = record)
+    engine._rows, engine._states = rows, lambda: []
+    list(engine._plain(3, []))
+    assert (1 in queued) == history_only
