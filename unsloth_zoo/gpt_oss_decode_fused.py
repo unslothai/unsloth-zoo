@@ -49,6 +49,11 @@ from .log import logger
 from .triton_fast_launch import launch as _fast_launch
 
 try:
+    import torch._dynamo.eval_frame as _eval_frame
+except Exception:
+    _eval_frame = None
+
+try:
     import triton
     import triton.language as tl
     HAS_TRITON = True
@@ -366,11 +371,11 @@ def _same(a, b):
 
 
 def _region_eager():
-    # The region runs eagerly (every op rounded) under these, whatever was checked before.
+    # A non-default stance (force_eager) runs the region eagerly even where it checked compiled. Dynamo
+    # disabled or recompiles falling back to eager only affect shapes not compiled yet, which
+    # _check_region sees on their first call.
     try:
-        if torch._dynamo.config.disable:
-            return True
-        return torch._dynamo.eval_frame._stance.stance != "default"
+        return _eval_frame._stance.stance != "default"
     except Exception:
         return False
 

@@ -226,10 +226,7 @@ def test_eager_regions_are_never_replaced(F, monkeypatch):
     region = _Counter(_contiguous_region)
     assert F.rope_decode(*_inputs(), region) is not None
     n = launch.n
-    # A compiled region that would run eagerly now: Dynamo disabled or another stance.
-    monkeypatch.setattr(torch._dynamo.config, "disable", True)
-    assert F.rope_decode(*_inputs(), region) is None
-    monkeypatch.setattr(torch._dynamo.config, "disable", False)
+    # A compiled region that runs eagerly under another stance.
     with torch.compiler.set_stance("force_eager"):
         assert F.rope_decode(*_inputs(), region) is None
     assert launch.n == n
