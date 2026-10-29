@@ -55,7 +55,7 @@ def _stat(kind):
 
 @pytest.fixture(autouse = True)
 def _env(monkeypatch):
-    for name in ("UNSLOTH_SPARSE_ATTN_FLEX", "UNSLOTH_SPARSE_INDEXER_CHUNKED", "UNSLOTH_SPARSE_INDEXER_Q_CHUNK",
+    for name in ("UNSLOTH_SPARSE_ATTN_FLEX", "UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "UNSLOTH_SPARSE_INDEXER_CHUNKED", "UNSLOTH_SPARSE_INDEXER_Q_CHUNK",
                  "UNSLOTH_SPARSE_ATTN_SKIP_FULL", "UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS"):
         monkeypatch.delenv(name, raising = False)
     sb._FAILED.clear()
@@ -334,6 +334,7 @@ def test_tiny_model_logits_and_grads_match_upstream(monkeypatch, seq, attn):
         ref_out, ref_grads = _run(model, ids, mask)
     monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda q: True)
     monkeypatch.setattr(sb, "_flex", _flex_semantics)
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
     monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_Q_CHUNK", "64")
     gates.reset_sparse_attn_stats()
     out, grads = _run(model, ids, mask)
@@ -362,14 +363,43 @@ def test_flex_kill_switch_and_cpu_gate(monkeypatch):
     assert _stat("flex") == 0 and _stat("indexer_chunked") + _stat("indexer_scored") == 2  # CPU: no flex
     monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda q: True)
     monkeypatch.setattr(sb, "_flex", _flex_semantics)
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0")
     gates.reset_sparse_attn_stats()
-    # sparse_flex_device_ok is stubbed, so check the switch the real gate reads.
-    assert not gates.sparse_flex_enabled()
+    # The global kill switch wins over the opt-in.
+    assert not gates.sparse_flex_enabled() and not gates.sparse_flex_opted_in("glm5_next")
+    with torch.no_grad():
+        model(input_ids = ids, attention_mask = mask)
+    assert _stat("flex") == 0
     monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_CHUNKED", "0")
     with torch.no_grad():
         model(input_ids = ids, attention_mask = mask)
     assert _stat("flex") == 0  # no patched layout -> no flex
+
+
+@pytest.mark.parametrize("opt_in", [None, "0", "true"])
+def test_flex_is_off_by_default(monkeypatch, opt_in):
+    """Every gate but the opt-in passes (device stubbed): the default, "0" and anything but "1" stay dense."""
+    _patched()
+    model = _model()
+    if opt_in is not None:
+        monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", opt_in)
+    monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda q: True)
+    calls = []
+    monkeypatch.setattr(sb, "_flex", lambda *a, **k: calls.append(1) or _flex_semantics(*a, **k))
+    ids = torch.randint(0, 256, (1, 300))
+    mask = torch.ones(1, 300, dtype = torch.bool)
+    with torch.no_grad():
+        model(input_ids = ids, attention_mask = mask)
+    assert not gates.sparse_flex_opted_in("glm5_next")
+    assert calls == [] and _stat("flex") == 0
+    # The chunked indexer (and the skip below the budget) stay on by default.
+    assert _stat("indexer_chunked") + _stat("indexer_scored") == 2
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
+    gates.reset_sparse_attn_stats()
+    with torch.no_grad():
+        model(input_ids = ids, attention_mask = mask)
+    assert _stat("flex") == 3 and len(calls) == 3
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -386,6 +416,7 @@ def test_cpu_flex_forward_matches_upstream(monkeypatch, compiled):
             ref = model(input_ids = ids, attention_mask = mask).last_hidden_state
         fn = torch.compile(flex_attention) if compiled else flex_attention
         monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda q: True)
+        monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
         monkeypatch.setattr("unsloth_zoo.flex_attention.utils.flex_attention", fn)
         gates.reset_sparse_attn_stats()
         out = model(input_ids = ids, attention_mask = mask).last_hidden_state

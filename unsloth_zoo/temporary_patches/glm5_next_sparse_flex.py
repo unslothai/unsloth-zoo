@@ -24,8 +24,11 @@ token is visible, appends the query's incomplete tail pool, then expands that in
 - Within the budget (T < index_topk + kpool) every complete visible pool is selected: the
   selection is built without scoring (UNSLOTH_SPARSE_ATTN_SKIP_FULL=0 restores upstream).
 - Above it the pools are scored in query chunks (UNSLOTH_SPARSE_INDEXER_CHUNKED=0 restores upstream).
-- Above it on CUDA sm80+ / ROCm, attention runs on flex attention over a BlockMask whose mask_mod
-  reads a [B, S, T / kpool] pool table plus the tail (UNSLOTH_SPARSE_ATTN_FLEX=0 keeps upstream).
+- Opt-in only (UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT=1): above the budget on CUDA sm80+ / ROCm, attention
+  runs on flex attention over a BlockMask whose mask_mod reads a [B, S, T / kpool] pool table plus the
+  tail. Off by default: on A100 its layer step was 4.7-5.3x slower than upstream's dense SDPA (4K-32K)
+  for 18-48% less peak memory. Without the opt-in (or with UNSLOTH_SPARSE_ATTN_FLEX=0) attention is
+  upstream's dense mask + SDPA / eager over the patched indexer's selection.
 
 Both patched indexer paths return the same key set per query as upstream in a fixed layout:
 index_topk pool slots (whole pools, -1 padded) then index_kpool - 1 tail slots. The flex path
@@ -295,6 +298,8 @@ def glm5_next_flex_eligible(module, query, key, value, kwargs):
     from unsloth_zoo.flex_attention import sparse, sparse_blocks as sb
     from unsloth_zoo.temporary_patches.sparse_attention_flex import _dsa_min_keys
 
+    if not sparse.sparse_flex_opted_in(_FAMILY):
+        return False
     config = module.config
     if config._attn_implementation not in ("eager", "sdpa"):
         return False
@@ -456,7 +461,7 @@ def patch_glm5_next_sparse():
     attn.forward = forward
     indexer.forward = indexer_forward
     if UNSLOTH_ENABLE_LOGGING:
-        logger.info("Unsloth: GLM-5.3-Flash DSA: exact skip within the budget, chunked indexer + flex above it.")
+        logger.info("Unsloth: GLM-5.3-Flash DSA: exact skip within the budget, chunked indexer above it (flex opt-in).")
 
 
 TEMPORARY_PATCHES.append(patch_glm5_next_sparse)
