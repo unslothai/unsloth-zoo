@@ -99,10 +99,8 @@ class _TritonLoader:
                 setattr(parent, parts[1], module)
 
 
-# Packages (and their submodules) stock Triton lacks but torch probes via
-# `try: import ... except ImportError`: they must stay unimportable. torch 2.15 reads
-# `triton._torchtlx_default.DEFAULT_MODE` building torch._inductor.config; a _Noop there
-# fails its config check and takes torch._dynamo down with it.
+# Stock Triton lacks these and torch probes them via `except ImportError` (2.15's inductor
+# config reads triton._torchtlx_default.DEFAULT_MODE): a stubbed answer breaks torch._dynamo.
 _ABSENT_PACKAGES = (
     "triton._torchtlx_default",
     "triton.language.extra.tlx",
@@ -115,7 +113,6 @@ class _TritonFinder(MetaPathFinder):
 
     def find_spec(self, fullname, path, target=None):
         if any(fullname == p or fullname.startswith(p + ".") for p in _ABSENT_PACKAGES):
-            # Stub parents have an empty __path__, so declining ends in ModuleNotFoundError.
             return None
         if fullname == "triton" or fullname.startswith("triton."):
             if fullname not in sys.modules:

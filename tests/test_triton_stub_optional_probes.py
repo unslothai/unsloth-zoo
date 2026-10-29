@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Modules stock Triton lacks must stay unimportable under the stub.
-
-torch 2.15 probes ``triton._torchtlx_default`` while building
-``torch._inductor.config``; a stubbed answer broke ``torch._dynamo`` and so every
-transformers import. Each check runs in a fresh interpreter.
-"""
+"""Modules stock Triton lacks stay unimportable under the stub (torch 2.15 inductor config)."""
 
 from __future__ import annotations
 
