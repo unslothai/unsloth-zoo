@@ -241,6 +241,8 @@ _CERT = textwrap.dedent('''
     import json, sys
     import torch
     from unsloth_zoo import gpt_oss_decode_fused as F
+    # ROCm builds turn the fused decode off at import; the certification logic is checked under the interpreter.
+    F._ENABLED = True
     dev = sys.argv[1]
     REGION = """__REGION__"""
     exec(REGION)
