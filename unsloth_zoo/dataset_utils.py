@@ -2664,8 +2664,7 @@ def trl_collator_ignores_labels(collator = None):
 pass
 
 def _chat_template_batches_like_rows(processing_class):
-    # Plain tokenizers render each conversation of a batch alone and encode the batch with the same
-    # encoder one row uses; processors and other backends (mistral-common) keep one call per row.
+    # Processors and other backends (mistral-common) may not batch like one call per row.
     try:
         from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
     except Exception:
@@ -2675,15 +2674,15 @@ pass
 
 
 def _is_conversation(messages):
-    # apply_chat_template reads a list whose first item is a list as a batch; only lists of message dicts
-    # are batched so every row is seen as exactly one conversation.
+    # apply_chat_template reads a list whose first item is a list as a batch.
     return isinstance(messages, list) and len(messages) != 0 and all(isinstance(m, dict) for m in messages)
 pass
 
 
-def _dataset_has_no_format(dataset):
-    # Batched map hands rows over as columns; with no output format both are plain Python values.
-    return getattr(dataset, "format", {}).get("type", None) is None
+def _batched_columns(dataset):
+    # Batch columns hold the same Python values as one-row reads only with no output format;
+    # an IterableDataset runs lazily in training, so it stays row by row.
+    return isinstance(dataset, Dataset) and getattr(dataset, "format", {}).get("type", None) is None
 pass
 
 
@@ -2695,8 +2694,7 @@ pass
 
 
 def _batched_rows(tokenize_row, tokenize_rows):
-    # datasets.map(batched = True) wrapper over a row tokenizer. Any error in the batched pass reruns the
-    # batch one row at a time, so the error raised (and the row it names) is the row-by-row one.
+    # Any error in the batched pass reruns the batch row by row, so the raised error is main's.
     def tokenize_batch(batch):
         columns = list(batch.keys())
         n = len(batch[columns[0]]) if columns else 0
@@ -2933,13 +2931,12 @@ def sft_prepare_dataset(
                 )
             if assistant_only_loss:
                 used_column_names.append("assistant_masks")
+            # Imported here: unsloth copies this function's source into the compiled trainer module.
             from unsloth_zoo.dataset_utils import (
                 _chat_template_batches_like_rows, _is_conversation, _batched_rows, _check_batch_lengths,
-                _dataset_has_no_format,
+                _batched_columns,
             )
-            # Batches a map-style Dataset only, and only where rows come back as the same Python values as one-row
-            # reads (no output format set). An IterableDataset tokenizes lazily during training: left row by row.
-            _batch_map = isinstance(dataset, Dataset) and _dataset_has_no_format(dataset)
+            _batch_map = _batched_columns(dataset)
             _batch_chat_template = not is_vlm and _chat_template_batches_like_rows(processing_class)
             _shared_template_kwargs = {}
             if training_chat_template is not None:
@@ -3010,8 +3007,7 @@ def sft_prepare_dataset(
                 return _pc_result(prompt_ids, pc_ids, pc_masks, labels)
 
             def _tokenize_pc_rows(rows):
-                # One template render + one tokenizer call per batch for rows the batched API handles exactly as
-                # one row at a time (plain tokenizer, no per-row tools or template kwargs); the rest go row by row.
+                # Rows with per-row tools / template kwargs go row by row.
                 if _is_conv:
                     batch_rows = [
                         i for i, row in enumerate(rows)
@@ -3141,8 +3137,7 @@ def sft_prepare_dataset(
                 return _messages_result(input_ids, masks, labels)
 
             def _tokenize_messages_rows(rows):
-                # One template render + one tokenizer call per batch for rows the batched API handles exactly as
-                # one row at a time (plain tokenizer, no per-row tools or template kwargs); the rest go row by row.
+                # Rows with per-row tools / template kwargs go row by row.
                 batch_rows, batch_messages = [], []
                 if _batch_chat_template:
                     for i, row in enumerate(rows):

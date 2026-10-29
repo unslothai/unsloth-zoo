@@ -36,7 +36,7 @@ def _tokenizer():
     try:
         return transformers.AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
     except Exception as e:  # offline runner
-        pytest.skip(f"cannot load tokenizer: {e}")
+        pytest.skip(reason = f"offline runner, tokenizer download failed: {e}")
 
 
 def _conversation(i):
