@@ -80,3 +80,96 @@ def test_routed_entry_points_run_their_eager_branch_without_dynamo():
     out = torch.compile(lambda h: MR.routed_moe_forward(experts, h, idx, w), backend = "eager", fullgraph = True)(
         torch.ones(2, 4))
     assert out is None
+
+
+def _skip_all_but(name):
+    # Inductor declining every graph but one (bfloat16 below sm80): skipped frames run eagerly while Dynamo still
+    # converts their nested frames, so the run fails if an eager-only branch is reached under Dynamo.
+    from torch._dynamo.exc import SkipFrame
+
+    def backend(gm, example_inputs):
+        if name in gm.code:
+            return gm.forward
+        raise SkipFrame("graph not compilable here")
+    return backend
+
+
+def _tail(y):
+    return y * 3.25
+
+
+def _run_skipped(step, *args):
+    import torch._dynamo
+
+    torch._dynamo.reset()
+    try:
+        with torch.no_grad():
+            return torch.compile(step, backend = _skip_all_but("L_y_"), fullgraph = True)(*args)
+    finally:
+        torch._dynamo.reset()
+
+
+def _untraceable(t):
+    import sys
+
+    sys._getframe()  # Dynamo cannot trace this: reached only on an eager branch
+    return t + 1
+
+
+def test_bf16_moe_eager_branch_survives_a_skipped_frame(monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_routed as MR
+
+    calls = []
+
+    def fused(x, *args):
+        calls.append(1)
+        return _untraceable(torch.zeros(x.shape[0], 4))
+
+    monkeypatch.setattr(MR, "_routed_bf16_moe_fused", fused)
+    monkeypatch.setattr(MR, "routed_fused_enabled", lambda: True)
+    T, H, E = 2, 4, 3
+    idx, rw = torch.zeros(T, 1, dtype = torch.long), torch.ones(T, 1)
+    w_gu, w_dn = torch.ones(E, H, 8), torch.ones(E, 4, H)
+
+    def step(x):
+        return _tail(MR.routed_bf16_moe(x, idx, rw, w_gu, w_dn, None, None, MR.ACT_GPTOSS, True))
+
+    out = _run_skipped(step, torch.ones(T, H))
+    assert calls == [1]  # the eager branch ran
+    assert torch.equal(out, torch.full((T, 4), 3.25))
+
+
+def test_moe_forward_eager_branch_survives_a_skipped_frame():
+    from unsloth_zoo.temporary_patches import moe_routed as MR
+
+    eager_calls = []
+
+    class Experts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("t", torch.zeros(1))
+
+        @property
+        def training(self):
+            # Read first on routed_moe_forward's eager branch; a tensor op keeps the traced frame non-empty.
+            if torch.compiler.is_compiling():
+                self.t.add(0)
+            else:
+                eager_calls.append(1)
+                _untraceable(self.t)
+            return False
+
+        @training.setter
+        def training(self, value):
+            pass
+
+    experts = Experts()
+    idx, w = torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)
+
+    def step(h):
+        out = MR.routed_moe_forward(experts, h, idx, w)
+        return _tail(h) if out is None else out
+
+    out = _run_skipped(step, torch.ones(2, 4))
+    assert eager_calls == [1]  # CPU inputs: the eager branch returns None after reading experts.training
+    assert torch.equal(out, torch.full((2, 4), 3.25))
