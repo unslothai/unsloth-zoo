@@ -95,7 +95,55 @@ def _fp_fusion_values(node, splatted):
     return values
 
 
-def _launch_sites():
+def _params(func):
+    args = func.args
+    names = [a.arg for a in args.posonlyargs + args.args + args.kwonlyargs]
+    names += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
+    return set(names)
+
+
+def _enclosing(tree):
+    """id(node) -> the innermost function holding it, and id(node) -> the `if` tests above it there."""
+    func_of, tests_of = {}, {}
+
+    def visit(node, func, tests):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child, [])
+                continue
+            func_of[id(child)], tests_of[id(child)] = func, tests
+            if isinstance(node, ast.If) and child in node.body:
+                visit(child, func, tests + [node.test])
+            else:
+                visit(child, func, tests)
+
+    visit(tree, None, [])
+    return func_of, tests_of
+
+
+def _options_names(tree):
+    """Names the module's functions collect launch options under (`def launch(..., **options)`)."""
+    return {
+        f.args.kwarg.arg for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.args.kwarg is not None
+    }
+
+
+def _forwards_options(node, func, options):
+    """A launch inside a generic launcher: it splats the options the launcher was called with, so the
+    flag comes from the launcher's callers, which are checked instead. Splatting only constexprs
+    does not count."""
+    return func is not None and any(
+        k.arg is None and isinstance(k.value, ast.Name) and k.value.id in options & _params(func)
+        for k in node.keywords
+    )
+
+
+def _interpreter_only(tests):
+    # TRITON_INTERPRET runs the kernel in Python: nothing is compiled, so there is no fusion to state.
+    return any(isinstance(t, ast.Name) and "INTERPRET" in t.id for t in tests)
+
+
+def _module_trees():
     for path in sorted(ZOO.rglob("*.py")):
         rel = path.relative_to(ZOO).as_posix()
         if "_vendored" in rel:
@@ -103,14 +151,67 @@ def _launch_sites():
         src = path.read_text(encoding = "utf-8")
         if "triton" not in src:
             continue
-        tree = ast.parse(src)
+        yield rel, src, ast.parse(src)
+
+
+def _launcher_entry_points(trees):
+    """{module dotted name: {function}} for functions taking **options in a module whose launches
+    forward options: calling one of them is a launch."""
+    out = {}
+    for rel, _src, tree in trees:
+        func_of, _ = _enclosing(tree)
+        options = _options_names(tree)
+        forwarding = any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript)
+            and _forwards_options(node, func_of.get(id(node)), options)
+            for node in ast.walk(tree)
+        )
+        if forwarding:
+            module = rel[: -len(".py")].replace("/", ".")
+            out[module] = {
+                f.name for f in tree.body if isinstance(f, ast.FunctionDef) and f.args.kwarg is not None
+            }
+    return out
+
+
+def _launcher_aliases(rel, tree, entry_points):
+    """Local names bound to a launcher entry point by `from .module import f [as g]`."""
+    package = rel.split("/")[:-1]
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            base = package[: len(package) - (node.level - 1)] if node.level else []
+            module = ".".join(base + node.module.split(".")) if node.level else node.module.removeprefix("unsloth_zoo.")
+            for alias in node.names:
+                if alias.name in entry_points.get(module, ()):
+                    aliases[alias.asname or alias.name] = alias.name
+    return aliases
+
+
+def _launch_sites():
+    trees = list(_module_trees())
+    entry_points = _launcher_entry_points(trees)
+    for rel, src, tree in trees:
         splats = _kwargs_dicts(tree)
+        func_of, tests_of = _enclosing(tree)
+        options = _options_names(tree)
+        aliases = _launcher_aliases(rel, tree, entry_points)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Subscript):
                 name = ast.get_source_segment(src, node.func.value)
                 if name in _NOT_LAUNCHES.get(rel, ()):
                     continue
-                yield rel, name, node, splats.get(id(node), [])
+                if _forwards_options(node, func_of.get(id(node)), options) or _interpreter_only(
+                    tests_of.get(id(node), [])
+                ):
+                    continue
+            elif isinstance(node.func, ast.Name) and node.func.id in aliases and node.args:
+                name = ast.get_source_segment(src, node.args[0])
+            else:
+                continue
+            yield rel, name, node, splats.get(id(node), [])
 
 
 def test_every_launch_states_fp_fusion():
