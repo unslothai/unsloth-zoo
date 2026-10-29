@@ -572,3 +572,20 @@ def test_pending_blocks_are_kept_for_one_extra_generation_only(monkeypatch, gc_m
     gc_module._reserve_pinned(4096)                     # a third generation would pass 2 x 4096
     assert flushes
     assert gc_module.GC_PINNED_BYTES <= 8192
+
+
+def test_pending_bound_follows_the_whole_live_set(monkeypatch, gc_module):
+    # The bound is two whole live sets, not two blocks: a backward releases every block of the
+    # step, and the next forward re-reserves them while their copies are still queued.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 4096)  # first step done
+    for _ in range(4): assert gc_module._reserve_pinned(4096)  # cached block reused, 3 new ones
+    held["bytes"] = 4 * 4096
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 0)
+    for _ in range(4): gc_module._release_pinned(4096)        # all four copies still queued
+    assert gc_module._PINNED_CACHED == {4096: 4} and gc_module._PINNED_LIVE_PEAK == 4 * 4096
+    for _ in range(4): assert gc_module._reserve_pinned(4096)  # one extra generation: all kept
+    assert flushes == [] and held["bytes"] == gc_module.GC_PINNED_BYTES == 8 * 4096
+    gc_module._release_pinned(4096)
+    gc_module._reserve_pinned(4096)                            # past 2 x the live set: flush
+    assert flushes
