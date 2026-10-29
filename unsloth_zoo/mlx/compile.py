@@ -6112,6 +6112,33 @@ def _install_gemma4_unified_compile_patches():
         setattr(module, "_compact_prefix_rows", _static_shape_prefix_rows)
 
     model_cls = getattr(module, "Model", None)
+    original_call = getattr(model_cls, "__call__", None)
+    if original_call is not None and "mm_token_type_ids" not in _safe_getsource(original_call):
+
+        def patched_call(self, input_ids=None, pixel_values=None, mask=None, cache=None, **kwargs):
+            # Upstream drops `mm_token_type_ids`; generation (calling the LM directly) keeps it.
+            features = self.get_input_embeddings(
+                input_ids=input_ids, pixel_values=pixel_values, **kwargs,
+            )
+            lm_kwargs = {
+                k: kwargs[k]
+                for k in (
+                    "capture_layer_ids", "hidden_sink", "shared_kv_sink", "return_hidden",
+                    "return_shared_kv", "logits_to_keep", "mm_token_type_ids",
+                )
+                if k in kwargs
+            }
+            return self.language_model(
+                None,
+                cache=cache,
+                inputs_embeds=features.inputs_embeds,
+                mask=mask,
+                per_layer_inputs=features.per_layer_inputs,
+                **lm_kwargs,
+            )
+
+        _patch_method(model_cls, "__call__", patched_call)
+
     original_update = getattr(model_cls, "_update_chunked_prefill_mode", None)
     if original_update is None:
         return
@@ -6146,9 +6173,6 @@ def _install_gemma4_compile_patches():
     from .utils import _SharedKVSlot
 
     def patched_make_masks(self, h, cache, mm_token_type_ids=None):
-        # Only generation caches keep upstream's masks.
-        if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
-            return original_make_masks(self, h, cache, mm_token_type_ids)
         masks = original_make_masks(self, h, cache, None)
         n = h.shape[1]
         if (
@@ -6158,7 +6182,21 @@ def _install_gemma4_compile_patches():
         ):
             return masks
         positions = mx.arange(n)
-        in_window = mx.abs(positions[:, None] - positions[None]) < self.window_size
+        # Transformers bounds only past keys (kv > q - window): image tokens may look ahead.
+        in_window = positions[None] > positions[:, None] - self.window_size
+        if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
+            # Upstream owns offsets/padding; its overlay skips the window and wrongly covers full layers.
+            overlaid = original_make_masks(self, h, cache, mm_token_type_ids)
+            return [
+                (
+                    sliding & in_window
+                    if isinstance(sliding, mx.array) and sliding.shape[-2:] == (n, n)
+                    else sliding
+                )
+                if layer.layer_type == "sliding_attention"
+                else mask
+                for layer, sliding, mask in zip(self.layers, overlaid, masks)
+            ]
         sliding = in_window & self._apply_blockwise_bidirectional_overlay(
             language_module.create_causal_mask(n),
             mm_token_type_ids,
@@ -7169,7 +7207,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
         ),
         CompilePatternBundle(
             name="gemma4_unified_multimodal",
-            description="Gemma 4 unified padded-feature compaction and chunked-prefill bookkeeping.",
+            description="Gemma 4 unified padded-feature compaction, chunked-prefill bookkeeping, and image token types handed to the text model.",
             matcher=lambda arch, report: arch == "gemma4_unified",
             primitive_names=(
                 "static_shape_feature_compaction",
@@ -7181,7 +7219,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
         ),
         CompilePatternBundle(
             name="gemma4_vision_masks",
-            description="Gemma 4 vision attention masks for cache-free forwards, built as the reference does without a host read.",
+            description="Gemma 4 vision attention masks as the reference builds them (overlay on sliding layers only), without a host read in cache-free forwards.",
             matcher=lambda arch, report: arch == "gemma4",
             primitive_names=("presence_check_bypass",),
             runtime_primitive_names=("gemma4_vision_masks_runtime",),
