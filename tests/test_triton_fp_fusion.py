@@ -52,6 +52,8 @@ _DELIBERATE_FALSE = {
     # aten rounds every multiply before the add that follows it (_NO_FMA in that module).
     "gpt_oss_decode_fused.py:_add_rms_norm_kernel",
     "gpt_oss_decode_fused.py:_sink_scale_kernel",
+    # Replaces the compiled apply_rotary_pos_emb region and is checked against it bitwise.
+    "gpt_oss_decode_fused.py:_rope_decode_kernel",
 }
 
 
