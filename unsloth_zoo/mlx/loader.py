@@ -1420,9 +1420,14 @@ def _tokenizer_class_for_model_type(model_path):
     eos_token becomes None. The model_type is read as plain JSON and never
     instantiated, so no model config validator runs.
     """
-    from transformers.models.auto.tokenization_auto import (
-        TOKENIZER_MAPPING_NAMES, tokenizer_class_from_name,
-    )
+    from transformers.models.auto.tokenization_auto import tokenizer_class_from_name
+
+    mapped = _model_type_tokenizer_name(model_path)
+    return tokenizer_class_from_name(mapped) if mapped else None
+
+
+def _model_type_tokenizer_name(model_path):
+    from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING_NAMES
 
     model_type = _read_json_file(
         os.path.join(str(model_path), "config.json"),
@@ -1432,7 +1437,7 @@ def _tokenizer_class_for_model_type(model_path):
     mapped = TOKENIZER_MAPPING_NAMES.get(model_type)
     if isinstance(mapped, (list, tuple)):
         mapped = next((item for item in reversed(mapped) if item), None)
-    return tokenizer_class_from_name(mapped) if mapped else None
+    return mapped
 
 
 def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
@@ -1464,7 +1469,16 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     if tokenizer_class is None and not remote:
         tokenizer_class = _tokenizer_class_for_model_type(model_path)
     if not remote and (Path(model_path) / "tokenizer.json").is_file():
-        if tokenizer_class is None or not issubclass(tokenizer_class, PreTrainedTokenizerFast):
+        # transformers 5 AutoTokenizer's rule: a class from another family than
+        # model_type's is a stale hub label, and building it would replace
+        # tokenizer.json's pipeline. 4.x fast classes read tokenizer.json as is.
+        mapped = _model_type_tokenizer_name(model_path)
+        stale = (
+            PreTrainedTokenizerFast.__name__ == "TokenizersBackend"
+            and class_name and mapped
+            and mapped.removesuffix("Fast") != class_name.removesuffix("Fast")
+        )
+        if stale or tokenizer_class is None or not issubclass(tokenizer_class, PreTrainedTokenizerFast):
             tokenizer_class = PreTrainedTokenizerFast
         return tokenizer_class.from_pretrained(model_path, *args, **kwargs)
     # Tokenizer metadata selects the class; model validators have no role here.
