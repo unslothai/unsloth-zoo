@@ -214,6 +214,38 @@ modifications =
       chunk_bwd_kernel_dqkwg 952 -> 773 us, layer fwd+bwd 1.04-1.05x; parity vs an
       fp32 recurrence unchanged. Every other GPU keeps its tile (the branch is not
       reached on Hopper / Blackwell / Ada / Turing / AMD).
+    - Synced ops/kda/fused_recurrent.py (the KDA decode kernel GLM-5.3-Flash,
+      Kimi-Linear and Kimi K3 reach through transformers'
+      recurrent_kimi_delta_attention) to fla 54ab79ec, minus the API-only
+      #1107 (optional A_log) and #1347 (fla.backends dispatch) hunks, each change
+      marked with an inline "Unsloth: backported from fla PR #..." comment:
+        * PR #1415: BV 32 -> 8 with 1 warp / 3 stages (the gated delta rule
+          decode kernel's config). Upstream, H200 / Triton 3.5: 9-20% lower
+          kernel latency on dense decode shapes (B 1-32, H 16-32, K=V=128).
+        * PR #1416: dense calls allocate the output with empty_like instead of
+          zeros_like (every row is overwritten); packed calls keep the zero fill.
+          Upstream, H200: 4-26% lower latency on the same shapes.
+        * PR #1329 (this kernel's hunk): int64 program id, so a decode batch
+          past 2**31 / (HV * K * V) sequences no longer overflows the int32
+          state offsets.
+        * PR #1135: mask the g load for K that is not a power of 2.
+        * PR #1571: empty packed sequences write their final state (a copy of
+          h0, or zeros) instead of leaving it uninitialised.
+        * PR #1414: strided state-index tables, per-token states for indexed
+          out-of-place storage, and no state-pool writeback when
+          output_final_state is off (continuous batching only).
+    - Backported fla PR #1582 in ops/gla/chunk.py (chunk_gla_fwd_kernel_o, the
+      output kernel of chunk_kda's forward): the causal mask is applied in the
+      score load instead of a where() after it. Fixes a CUDA "misaligned
+      address" on GB200 / Triton 3.6 (8-warp BK=BV=64 config); upstream measured
+      the output kernel at 68.3 -> 59.5 us (B 1, T 8192, H 16, K=V=128, GB200).
+      Identical arithmetic.
+    - Backported fla PR #996 in ops/backends/__init__.py (+ find_spec_cached in
+      utils/_compat.py and utils/__init__.py): BaseBackend.is_available() caches
+      its package probe. The dispatch loop calls it on every dispatched call, so
+      chunk_kda's forward and its fused WY backward each re-ran an uncached
+      find_spec("flash_kda") (about 50 us of host time each when flash_kda is
+      not installed).
     - Modified by Unsloth in modules/l2norm.py and modules/fused_norm_gate.py (not
       upstream as of fla 9d478fa), the same change as the #1388 conv backport above:
       NB = cdiv(T, 65536) is dropped from the l2norm_{fwd,bwd}_kernel and
