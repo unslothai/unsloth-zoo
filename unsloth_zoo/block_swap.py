@@ -381,10 +381,18 @@ class BlockSwap:
                 owners.setdefault(id(p), set()).add(li)
         shared = {pid for pid, o in owners.items() if len(o) > 1}
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
-        # No credit for weights already in host RAM: packing holds both copies while it runs.
         sizes = [b.nbytes() for b in self.blocks]
+        # Weights already in host RAM: on Linux the registered arena is pageable and fills block by block as each
+        # original is released, so only a couple of blocks are ever held twice (Flash-Next: 79.5 GiB of host layers
+        # packed with 34.5 GiB still free). Windows commits the whole arena up front, and the chunked fallback
+        # holds both copies, so neither gets the credit.
+        on_host = 0
+        if _can_register() and os.name != "nt":
+            on_host = sum(p.data.nbytes for layer in swapped for _, p in _swappable(layer) if p.device.type == "cpu")
+            on_host = max(0, on_host - 2 * max(sizes, default = 0))
         # The chunked fallback rounds chunks up to powers of two: up to twice the packed bytes.
-        _check_host_fit(sizes, slack = 0 if _can_register() else _chunked_bytes([b.sizes for b in self.blocks]) - sum(sizes))
+        _check_host_fit(sizes, on_host = on_host,
+                        slack = 0 if _can_register() else _chunked_bytes([b.sizes for b in self.blocks]) - sum(sizes))
         homes = {b.home for b in self.blocks if b.home is not None}
         for li, layer in enumerate(layers):
             if li not in self.pos:

@@ -1078,7 +1078,8 @@ def test_block_swap_refuses_host_loaded_layers_without_room_to_pack(monkeypatch)
     import sys, pytest
     if not torch.cuda.is_available():
         return
-    # Host-loaded layers are copied into the packed arena before their originals go: both are resident at once.
+    # The chunked fallback copies host-loaded layers before their originals go: both are resident at once.
+    monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
     blocks[:2].cuda(); blocks[2:].cpu()
     need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
@@ -1086,6 +1087,19 @@ def test_block_swap_refuses_host_loaded_layers_without_room_to_pack(monkeypatch)
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
     with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
         BlockSwap(blocks, 6, device = "cuda")
+
+
+def test_block_swap_credits_host_loaded_layers_when_the_arena_registers_in_place(monkeypatch):
+    import sys, os
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        return
+    # Registered in place, block by block: only about two blocks are ever held twice.
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda(); blocks[2:].cpu()
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda vm: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    BlockSwap(blocks, 6, device = "cuda").remove()
 
 
 def test_host_fit_splits_free_ram_between_local_ranks(monkeypatch):
