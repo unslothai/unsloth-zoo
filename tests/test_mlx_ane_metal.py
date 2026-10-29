@@ -234,16 +234,82 @@ def test_only_swiglu_mlps_are_attached(monkeypatch):
     assert all(ane._STATE not in layer.__dict__ for layer in model.layers)
 
 
-@pytest.mark.parametrize("change", ["training", "mixed_bits"])
+def _projection(bits, group_size = 64, inputs = CHANNELS, outputs = HIDDEN, seed = 5):
+    mx.random.seed(seed)
+    linear = nn.Linear(inputs, outputs, bias = False)
+    linear.set_dtype(mx.bfloat16)
+    return nn.QuantizedLinear.from_linear(linear, group_size = group_size, bits = bits)
+
+
+def _down(bits, group_size = 64):
+    return _projection(bits, group_size)
+
+
+@pytest.mark.parametrize("change", ["training", "mixed_group_size"])
 def test_ineligible_projections_are_not_attached(change):
     model = _model()
     if change == "training":
         model.layers[0].train()
     else:
-        model.layers[0].down_proj = nn.QuantizedLinear(CHANNELS, HIDDEN, bias = False, group_size = 64, bits = 8)
+        model.layers[0].down_proj = _down(4, group_size = 32)
     assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 1
     assert ane._STATE not in model.layers[0].__dict__ and ane._STATE in model.layers[1].__dict__
     ane.release_ane_prefill(model)
+
+
+def test_a_projection_with_more_bits_is_split_and_costed_at_its_own(monkeypatch):
+    monkeypatch.setattr(ane, "_DOWN_SLAB", 256)
+    model = _model()
+    mixed, uniform = model.layers
+    mixed.down_proj = _down(5)   # as mixed-precision checkpoints raise single down projections
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 2
+    model.__dict__["_unsloth_ane_prepared"] = True
+    x = _rows(TILE)
+    native = mixed(x)
+    with ane.ane_prefill_mlp(model):
+        split = mixed(x)
+    assert _cosine(split, native) > 0.999 and not mx.array_equal(split, native).item()
+    assert (mx.abs(split - native).max() / mx.abs(native).max()).item() < 0.05
+    assert mixed.__dict__[ane._STATE].rest[2].bits == 5
+    k = CHANNELS // 2
+    assert ane._split_bytes(mixed, k) - ane._split_bytes(uniform, k) == HIDDEN * (CHANNELS - k) // 8
+    ane.release_ane_prefill(model)
+
+
+@pytest.mark.parametrize("budget_layers", [5, 1])
+def test_calibration_runs_on_the_most_common_quantization_and_keys_on_every_projection(budget_layers, monkeypatch,
+                                                                                         tmp_path):
+    monkeypatch.setattr(ane, "_CACHE_PATH", str(tmp_path / "cache.json"))
+    mx.random.seed(0)
+    model = Model()
+    model.layers += [SwiGLU() for _ in range(3)]
+    model.set_dtype(mx.bfloat16)
+    nn.quantize(model, group_size = 64, bits = 4)
+    model.eval()
+    for end in (0, -1):   # the first layer visited in either order is the minority quantization
+        model.layers[end].down_proj = _down(5)
+    calibrated, closed, close = [], [], ane._Split.close
+
+    def calibrate(m, mlp, tile, surfaces):
+        calibrated.append(ane._Split(mlp, CHANNELS // 2, tile, surfaces))
+        return 0.5, 10.0, 6.0, calibrated[-1]
+
+    monkeypatch.setattr(ane, "_calibrate", calibrate)
+    monkeypatch.setattr(ane._Split, "close", lambda self: (closed.append(self), close(self)))
+    cost = ane._split_bytes(model.layers[0], CHANNELS // 2)   # the dearest layer: every layer fits within it
+    monkeypatch.setattr(ane, "_memory_budget", lambda: budget_layers * cost)
+    assert ane.prepare_ane_prefill(model, tile = TILE).layers == budget_layers
+    assert len(calibrated) == 1
+    serving = [layer for layer in model.layers if layer.__dict__.get(ane._STATE) is calibrated[0]]
+    if budget_layers == 5:   # the calibration split serves the uniform layer it was measured on, and only that one
+        assert len(serving) == 1 and ane._bits(serving[0]) == (4, 4, 4) and not closed
+    else:   # the probe was not admitted, so its split is closed
+        assert not serving and closed == [calibrated[0]]
+    ane.release_ane_prefill(model)
+    keys = {ane._machine_key(model.layers[i], TILE) for i in (0, 1, 2, 3)}
+    model.layers[2].up_proj = _projection(5, inputs = HIDDEN, outputs = CHANNELS)
+    model.layers[3].gate_proj = _projection(5, inputs = HIDDEN, outputs = CHANNELS)
+    assert len(keys) == 2 and len({ane._machine_key(model.layers[i], TILE) for i in (0, 1, 2, 3)}) == 4
 
 
 @pytest.mark.parametrize("split_ms,share", [(9.6, 0.0), (6.0, 0.625)])

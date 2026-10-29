@@ -518,11 +518,16 @@ def _eligible(mlp):
         return False
     if any("bias" in p or getattr(p, "mode", "affine") != "affine" for p in (gate, up, down)):
         return False
-    if len({(p.group_size, p.bits) for p in (gate, up, down)}) != 1:
+    # Bits may differ (mixed-precision checkpoints raise single projections): each is requantized on its own.
+    if len({p.group_size for p in (gate, up, down)}) != 1:
         return False
     channels, hidden = gate.weight.shape[0], gate.scales.shape[1] * gate.group_size
     return (up.weight.shape[0] == channels and down.weight.shape[0] == hidden
             and down.scales.shape[1] * down.group_size == channels and channels % _ALIGN == 0)
+
+
+def _bits(mlp):
+    return tuple(p.bits for p in _projections(mlp))
 
 
 def _mlp_shape(mlp):
@@ -694,7 +699,7 @@ def _split_class(base):
 
 
 def _machine_key(mlp, tile):
-    gate, _, down = _projections(mlp)
+    gate, up, down = _projections(mlp)
     try:
         chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output = True, text = True,
                               timeout = 5).stdout.strip()
@@ -702,7 +707,7 @@ def _machine_key(mlp, tile):
         chip = platform.machine()
     build = platform.mac_ver()[0]
     return (f"{chip}|macOS {build}|mlx {mx.__version__}|{down.weight.shape[0]}x{gate.weight.shape[0]}|"
-            f"q{gate.bits}g{gate.group_size}|{gate.scales.dtype}|tile {tile}")
+            f"q{gate.bits}/{up.bits}/{down.bits}g{gate.group_size}|{gate.scales.dtype}|tile {tile}")
 
 
 def _load_cache():
@@ -766,7 +771,7 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
     """Compile the Neural Engine half of every eligible dense SwiGLU MLP in `model` and attach it.
 
     `share` fixes the fraction of intermediate channels the Neural Engine takes; by default it is calibrated on the
-    first layer and cached per machine, macOS build, MLX version and shape, and a split that is not at least 5% faster
+    first layer of the most common quantization and cached per machine, macOS build, MLX version and shape, and a split that is not at least 5% faster
     than the GPU alone is not attached. Returns an `AnePrefillStatus`; `layers == 0` with a `reason` when nothing was
     attached.
     """
@@ -790,8 +795,11 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
         # tower's MLPs of another width stay native.
         shape = collections.Counter(map(_mlp_shape, mlps)).most_common(1)[0][0]
         mlps = [m for m in mlps if _mlp_shape(m) == shape]
+        # Calibrate on the most common quantization: one share serves every layer.
+        bits = collections.Counter(_bits(m) for m in mlps).most_common(1)[0][0]
+        probe = next(m for m in mlps if _bits(m) == bits)
         surfaces = _Surfaces(shape[0], tile)
-        key, first = _machine_key(mlps[0], tile), None
+        key, first = _machine_key(probe, tile), None
         cached = _load_cache().get(key) if share is None else None
         if share is not None:
             gpu = split_ms = 0.0
@@ -799,7 +807,7 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
             share, gpu, split_ms = cached["share"], cached["gpu_ms"], cached["split_ms"]
         else:
             try:
-                share, gpu, split_ms, first = _calibrate(model, mlps[0], tile, surfaces)
+                share, gpu, split_ms, first = _calibrate(model, probe, tile, surfaces)
             except (AneError, concurrent.futures.TimeoutError) as error:
                 return AnePrefillStatus(0, seconds = time.perf_counter() - started, reason = f"calibration failed: {error}")
             if split_ms > gpu * (1 - _MIN_GAIN):
@@ -816,7 +824,7 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
             admitted.append(mlp)
         if len(admitted) < len(mlps):
             logger.warning("Neural Engine prefill: free memory admits %d of %d layers", len(admitted), len(mlps))
-            if first is not None and not admitted:
+            if first is not None and all(m is not probe for m in admitted):
                 first.close()
                 first = None
             mlps = admitted
@@ -828,7 +836,7 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
         try:
             for mlp in mlps:
                 k = _aligned(_projections(mlp)[0].weight.shape[0], share)
-                split = first if first is not None and mlp is mlps[0] and first.k == k else None
+                split = first if first is not None and mlp is probe and first.k == k else None
                 mlp.__dict__[_STATE] = split = split or _Split(mlp, k, tile, surfaces)
                 split.pad_from = pad_from
                 attached.append(mlp)
