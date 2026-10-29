@@ -4554,12 +4554,8 @@ def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path)
 def test_tokenizer_class_disagreeing_with_model_type_keeps_tokenizer_json(
     monkeypatch, tmp_path, model_type, declared, expected, expected_before_5_7, hub_class_known_wrong,
 ):
-    """Mistral Tekken repos declare LlamaTokenizerFast over a ByteLevel tokenizer.json;
-    transformers 5.x LlamaTokenizer rebuilds a SentencePiece decoder over it, so replies
-    stream as raw 'Ġ'/'Ċ' pieces. AutoTokenizer loads TokenizersBackend there instead,
-    keeps a declared class whenever the model_type registers a specialized one, and
-    loads that registered class for model types it lists as declaring the wrong one.
-    Before 5.7 it loads TokenizersBackend on any mismatch."""
+    """Tekken repos declare LlamaTokenizerFast over a ByteLevel tokenizer.json; LlamaTokenizer
+    would decode raw 'Ġ'/'Ċ' pieces. Mirrors AutoTokenizer's class choice, pre- and post-5.7."""
     import transformers
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
     from transformers.models.auto import tokenization_auto

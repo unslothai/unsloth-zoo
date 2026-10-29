@@ -1449,12 +1449,8 @@ _MISTRAL_TEKKEN_SPLIT_PATTERN = (
 
 
 def _has_wrong_mistral_split(model_path):
-    """Whether a Mistral-family tokenizer.json opens its pre-tokenizer with the wrong split.
-
-    transformers only warns here (``fix_mistral_regex``), and its own repair raises on
-    5.5. Matching the exact pattern leaves SentencePiece Mistral repos alone, which
-    transformers' version-based detection also flags.
-    """
+    """Exact match: transformers' version check also flags SentencePiece Mistral repos,
+    and its own ``fix_mistral_regex`` repair raises on 5.5."""
     model_type = _read_json_file(os.path.join(str(model_path), "config.json")).get("model_type")
     if model_type not in ("mistral", "mistral3", "voxtral", "ministral", "pixtral"):
         return False
@@ -1500,21 +1496,18 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
         if model_type_class.__name__ in (
             "TokenizersBackend", "PreTrainedTokenizerFast", "PythonBackend", "MistralCommonBackend",
         ):
-            # As AutoTokenizer in 5.x: a model_type served by a generic backend loads
-            # tokenizer.json as written. Mistral Tekken repos declare LlamaTokenizerFast,
-            # which rebuilds a SentencePiece decoder over their ByteLevel tokenizer.json.
+            # As AutoTokenizer 5.x. Tekken repos declare LlamaTokenizerFast, which rebuilds
+            # a SentencePiece decoder over their ByteLevel tokenizer.json.
             tokenizer_class = transformers.TokenizersBackend
         elif (
             Version(transformers.__version__) < Version("5.7.0")
             and model_type_class.__name__.removesuffix("Fast") != class_name.removesuffix("Fast")
         ):
-            # Before 5.7 AutoTokenizer loads TokenizersBackend on any mismatch, which is
-            # what keeps e.g. DeepSeek-R1-Distill-Qwen (qwen2 + LlamaTokenizerFast) readable.
+            # Pre-5.7 AutoTokenizer loads TokenizersBackend on any mismatch (DeepSeek-R1-Distill-Qwen).
             tokenizer_class = transformers.TokenizersBackend
         elif _read_json_file(os.path.join(str(model_path), "config.json")).get("model_type") in getattr(
             tokenization_auto, "MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS", (),
         ):
-            # Model types transformers knows to declare the wrong class on the Hub.
             tokenizer_class = model_type_class
     if not remote and (Path(model_path) / "tokenizer.json").is_file():
         if tokenizer_class is None or not issubclass(tokenizer_class, PreTrainedTokenizerFast):
