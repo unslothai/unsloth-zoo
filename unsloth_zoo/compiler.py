@@ -1530,8 +1530,7 @@ def _process_param_tokens(param_tokens):
     return new_tokens, replacement
 
 def _rewrite_kwargs_param(source: str, func_name: str):
-    # Superset of the `def <name>` token pair matched below, so a miss (a TRL trainer class
-    # name) skips the tokenize pass; whitespace, continuations and comments may sit between.
+    # Superset of the `def <name>` token pair below: a miss (TRL trainer class names) skips tokenize.
     if re.search(r"def(?:\s|\\|#[^\n]*\n)*" + re.escape(func_name), source) is None:
         return source, None
     try:
