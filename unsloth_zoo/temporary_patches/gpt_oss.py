@@ -3489,7 +3489,6 @@ def patch_GptOssAttention():
         key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         cos, sin = position_embeddings
-        # One launch instead of the compiled region on decode steps (bit-identical; see gpt_oss_decode_fused).
         rotated = _rope_decode(query_states, key_states, cos, sin, apply_rotary_pos_emb) \
             if _fused_decode_ok(query_states) else None
         if rotated is None:

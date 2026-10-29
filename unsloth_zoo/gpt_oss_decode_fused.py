@@ -19,11 +19,8 @@ Decode at batch 1 is host bound (the GPU is busy 16-45% of a step): every aten o
   add_rms_norm      (x + residual) -> new residual, RMSNorm(x + residual): replaces the residual
                     clone + bf16 add + 9-op fp32 RMSNorm (rms_layernorm_forward) with one kernel.
   sink_scale_output attention * sigmoid(lse - sink), transposed to [B, Q, H, D]: replaces 6 ops.
-  rope_decode       the rotary embedding of q and k for one token, in one launch, instead of entering the
-                    compiled apply_rotary_pos_emb region (a Dynamo frame + guards + 2 Inductor kernels per
-                    layer). Bit-identical to that region: every product of two bf16 / fp16 values is exact in
-                    fp32, so x1 * cos - x2 * sin rounds once whatever the order or contraction, as the
-                    region's fp32 math does. Checked bitwise against the region on its first call per device.
+  rope_decode       one-token rotary embedding of q and k in one launch. Bit-identical to the compiled
+                    region: bf16 / fp16 products are exact in fp32, so each output rounds once either way.
   static_cache_update  one-token update of transformers' StaticLayer / StaticSlidingWindowLayer: the
                     sliding roll + host index tensor (a pageable copy, so a stream sync per layer) +
                     index_put + copy becomes cat + copy; the full layer's arange + add drop out.
@@ -152,7 +149,6 @@ if HAS_TRITON:
         sq_b, sq_h, sk_b, sk_h, sc_b, ss_b, sqo_b, sqo_h, sko_b, sko_h,
         BLOCK: tl.constexpr,
     ):
-        # One program per (row, head) over the q heads, then the k heads.
         pid = tl.program_id(0)
         b = (pid // (HQ + HK)).to(tl.int64)
         h = (pid % (HQ + HK)).to(tl.int64)
@@ -168,7 +164,6 @@ if HAS_TRITON:
             dst = KO + b * sko_b + (h - HQ) * sko_h
         x1 = tl.load(src + cols, mask = ok, other = 0.0).to(tl.float32)
         x2 = tl.load(src + HALF + cols, mask = ok, other = 0.0).to(tl.float32)
-        # transformers' _apply_rotary_emb: cat(x1 * cos - x2 * sin, x2 * cos + x1 * sin).
         tl.store(dst + cols, (x1 * c - x2 * s).to(dst.dtype.element_ty), mask = ok)
         tl.store(dst + HALF + cols, (x2 * c + x1 * s).to(dst.dtype.element_ty), mask = ok)
 
@@ -340,7 +335,6 @@ def static_cache_update(cache, key_states, value_states, layer_idx):
     return keys, values
 
 
-# rope_decode: on until its first call per device fails the bitwise check against the compiled region.
 _ROPE_ENABLED = os.environ.get("UNSLOTH_GPT_OSS_FUSED_ROPE", "1") != "0"
 _ROPE_CHECKED = {}  # (device index, dtype) -> bool
 
@@ -349,7 +343,7 @@ def _rope_launch(q, k, cos, sin):
     B, HQ, _, D = q.shape
     HK = k.shape[1]
     half = D // 2
-    # The layout the compiled region returns (Inductor's contiguous output), so later kernels and guards see the same strides.
+    # Contiguous, like the region's Inductor output, so later guards see the same strides.
     qo = torch.empty((B, HQ, 1, D), dtype = q.dtype, device = q.device)
     ko = torch.empty((B, HK, 1, D), dtype = k.dtype, device = k.device)
     args = (q, k, cos, sin, qo, ko, HQ, HK, half,
@@ -370,10 +364,8 @@ def _same(a, b):
 
 
 def rope_decode(q, k, cos, sin, region):
-    """apply_rotary_pos_emb(q, k, cos, sin) for one token (q [B, Hq, 1, D], k [B, Hk, 1, D], cos / sin
-    [B, 1, D / 2], one bf16 / fp16 dtype) in one launch; None when disabled or not covered (callers then
-    call region). The first call per device also runs region and keeps this path only if both outputs
-    match it bit for bit, layout included (per device and dtype)."""
+    """One-token apply_rotary_pos_emb, or None (caller runs region). First call per (device, dtype) must
+    match region bitwise, layout included."""
     if not (_ENABLED and _ROPE_ENABLED) or torch.jit.is_tracing():
         return None
     if q.dim() != 4 or k.dim() != 4 or cos.dim() != 3 or sin.dim() != 3:
@@ -400,7 +392,7 @@ def rope_decode(q, k, cos, sin, region):
         return _disable(e)
     if checked is None:
         if torch.cuda.is_current_stream_capturing():
-            return None  # the check reads back on the host: leave it to an eager call
+            return None  # the check syncs the host; leave it to an eager call
         ref = region(q, k, cos, sin)
         ok = _same(out[0], ref[0]) and _same(out[1], ref[1])
         _ROPE_CHECKED[key] = ok

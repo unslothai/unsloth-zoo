@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""gpt_oss_decode_fused.rope_decode: the one-token rotary embedding kernel against the compiled
-apply_rotary_pos_emb region it replaces (bitwise), its gates and first-call check, and the decode-loop wiring."""
+"""rope_decode vs the compiled apply_rotary_pos_emb region (bitwise), its gates, and the decode wiring."""
 from __future__ import annotations
 
 import json
@@ -50,7 +49,6 @@ def _run(tmp_path, script, *args, env_extra = None):
 
 
 def _region(q, k, cos, sin):
-    # transformers' gpt-oss apply_rotary_pos_emb (unsqueeze_dim = 1) and _apply_rotary_emb.
     cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
 
     def rotate(x):
@@ -122,7 +120,7 @@ def F(monkeypatch):
     from unsloth_zoo import gpt_oss_decode_fused as F
     monkeypatch.setattr(F, "_ENABLED", True)
     monkeypatch.setattr(F, "_ROPE_ENABLED", True)
-    monkeypatch.setattr(F, "_INTERPRET", True)  # CPU tensors pass the device gate; the launch is stubbed
+    monkeypatch.setattr(F, "_INTERPRET", True)
     monkeypatch.setattr(F, "_ROPE_CHECKED", {})
     monkeypatch.setattr(F, "FUSED_DECODE_CALLS", dict(F.FUSED_DECODE_CALLS, rope_decode = 0))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -157,7 +155,6 @@ def test_first_call_checks_then_trusts(F, monkeypatch):
         out = F.rope_decode(*_inputs(), region)
         assert out is not None
     assert launch.n == 3 and region.n == 1 and F.FUSED_DECODE_CALLS["rope_decode"] == 3
-    # Another dtype is checked on its own.
     F.rope_decode(*_inputs(dtype = torch.bfloat16), region)
     assert region.n == 2 and set(F._ROPE_CHECKED.values()) == {True}
 
@@ -167,7 +164,7 @@ def test_a_mismatch_returns_the_region_and_stays_off(F, monkeypatch, wrong):
     if wrong == "values":
         bad = lambda *a: tuple(t + 1 for t in _contiguous_region(*a))  # noqa: E731
     else:
-        # Same values, another stride on the size-1 token dim (a layout later guards would see).
+        # Same values, different stride.
         bad = lambda *a: tuple(t.as_strided(t.shape, (t.stride(0), t.stride(1), 7, 1)) for t in _contiguous_region(*a))  # noqa: E731
     launch = _Counter(bad)
     region = _Counter(_contiguous_region)
@@ -206,7 +203,7 @@ def test_kill_switch_cpu_tensors_and_capture(F, monkeypatch):
     assert F.rope_decode(*_inputs(), _contiguous_region) is None
     monkeypatch.setattr(F, "_ROPE_ENABLED", True)
     monkeypatch.setattr(F, "_INTERPRET", False)
-    assert F.rope_decode(*_inputs(), _contiguous_region) is None  # CPU tensors outside the interpreter
+    assert F.rope_decode(*_inputs(), _contiguous_region) is None
     assert launch.n == 0
     monkeypatch.setattr(F, "_INTERPRET", True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -220,8 +217,6 @@ def test_launch_failure_disables_and_falls_back(F, monkeypatch):
     assert F.rope_decode(*_inputs(), _contiguous_region) is None and not F._ENABLED
 
 
-# Wiring: the patched gpt-oss attention calls rope_decode on decode steps (one token, no grad) and the
-# region otherwise; with rope_decode's output equal to the region's the generation is unchanged.
 _LOOP = textwrap.dedent('''
     import json, os, sys
     os.environ.setdefault("UNSLOTH_MODEL_NAME", "unsloth/gpt-oss-test")
@@ -271,6 +266,5 @@ def test_decode_loop_calls_rope_decode(tmp_path):
     env = {"UNSLOTH_COMPILE_DISABLE": None, "UNSLOTH_ENABLE_FLEX_ATTENTION": None}
     on = _run(tmp_path, _LOOP, "on", env_extra = env)
     off = _run(tmp_path, _LOOP, "off", env_extra = env)
-    # Every layer of every step (prefill included: rope_decode itself declines more than one token).
     assert on["rope"] >= 6 * 2 and off["rope"] == 0, (on, off)
     assert 1 in on["q_lens"] and on["tokens"] == off["tokens"]
