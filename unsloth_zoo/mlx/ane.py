@@ -463,6 +463,7 @@ _ACT_SCALE = 1 / 16     # keeps the fp16 activation and its down projection in r
 _MIN_GAIN = 0.05        # below this the split is not worth its approximation
 _WATCHDOG = 5.0         # seconds a Neural Engine evaluation may take before the split is abandoned
 _MEMORY_SHARE = 0.5     # of the memory the model leaves free; the rest stays for the KV cache and activations
+_PRESSURE_WARN, _PRESSURE_CRITICAL = 2, 4   # kern.memorystatus_vm_pressure_level
 _WIRED_FACTOR = 3       # the Neural Engine wires 1.85x (M3 Max) to 2.7x (M5 Pro) a program's int8 weights in prefill
 _STATE = "_unsloth_ane_split"
 _CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "unsloth", "mlx_ane_prefill.json")
@@ -596,20 +597,70 @@ class _VMStatistics(ctypes.Structure):
                 ("wire", ctypes.c_uint32), ("rest", ctypes.c_uint8 * 256)]
 
 
+@functools.cache
+def _libc():
+    libc = ctypes.CDLL(None)
+    libc.mach_host_self.restype = ctypes.c_uint32
+    return libc
+
+
 def _wired_bytes():
     """System-wide wired memory, where the Neural Engine's buffers show (no process footprint counts them); None when
     the kernel does not answer."""
-    libc = ctypes.CDLL(None)
-    libc.mach_host_self.restype = ctypes.c_uint32
+    libc = _libc()
     stats, count = _VMStatistics(), ctypes.c_uint32(38)   # HOST_VM_INFO64_COUNT
     if libc.host_statistics64(libc.mach_host_self(), 4, ctypes.byref(stats), ctypes.byref(count)):   # HOST_VM_INFO64
         return None
     return stats.wire * ctypes.c_size_t.in_dll(libc, "vm_kernel_page_size").value
 
 
-def _memory_budget():
+def _pressure_level():
+    """The kernel's memory pressure level (1 normal, 2 warn, 4 critical); 1 when it does not answer."""
+    level, size = ctypes.c_int(1), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+    if _libc().sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(level), ctypes.byref(size), None,
+                            ctypes.c_size_t(0)):
+        return 1
+    return level.value
+
+
+def _working_set():
     info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
-    return int(_MEMORY_SHARE * (0.85 * info["memory_size"] - mx.get_active_memory()))
+    return 0.85 * info["memory_size"]
+
+
+def _memory_budget():
+    return int(_MEMORY_SHARE * (_working_set() - mx.get_active_memory()))
+
+
+class _Attached:
+    """A model's attached MLPs in order, so memory pressure releases from the end. Weak, so an abandoned split
+    keeps no other layer alive."""
+
+    def __init__(self, mlps):
+        self.mlps, self.warned = [weakref.ref(m) for m in mlps], False
+
+
+def _relieve(group):
+    """Release splits from the end of `group` when memory runs short: enough to bring active memory plus what the Neural
+    Engine wires back under the working set, or all of them at critical pressure."""
+    level = _pressure_level()
+    attached = [m for m in map(lambda ref: ref(), group.mlps)
+                if m is not None and getattr(m.__dict__.get(_STATE), "group", None) is group]
+    over = (mx.get_active_memory() - _working_set()
+            + sum(_WIRED_FACTOR * 3 * s.k * s.hidden for s in (m.__dict__[_STATE] for m in attached)))
+    if level < _PRESSURE_CRITICAL and over <= 0:
+        if level >= _PRESSURE_WARN and not group.warned:
+            group.warned = True
+            logger.warning("Neural Engine prefill: memory pressure is elevated; the split keeps its layers")
+        return
+    total, freed, group.warned = len(attached), 0, True
+    while attached and (level >= _PRESSURE_CRITICAL or freed < over):
+        mlp = attached.pop()
+        split = mlp.__dict__.pop(_STATE)
+        freed += split.cost
+        split.close()
+    logger.warning("Neural Engine prefill: memory pressure released %d of %d layers (%.1f GB priced); they use the GPU until "
+                   "prepare_ane_prefill(model) runs again", total - len(attached), total, freed / 2**30)
 
 
 def _remainder(p, rows = None, columns = None):
@@ -646,7 +697,7 @@ class _Split:
         self.rest = (_remainder(gate, rows = k), _remainder(up, rows = k), _remainder(down, columns = k))
         mx.eval([p.parameters() for p in self.rest])
         self.sources = tuple((p, p.weight, p.scales, p.biases) for p in (gate, up, down))
-        self.failed, self.pad_from = False, tile
+        self.failed, self.pad_from, self.group, self.cost = False, tile, None, _split_bytes(mlp, k)
 
     def serves(self, mlp):
         """Whether `mlp` still has the projections and quantized tensors this split was built from."""
@@ -697,6 +748,10 @@ def _split_call(base):
         rows = x.size // x.shape[-1]
         if split is None or split.failed or _ABANDONED or self.training or rows < split.pad_from:
             return base.__call__(self, x)
+        if split.group is not None:
+            _relieve(split.group)
+            if self.__dict__.get(_STATE) is not split:
+                return base.__call__(self, x)
         flat, tiles = x.reshape(rows, x.shape[-1]), rows // split.tile
         tail = rows - tiles * split.tile
         padded = tail >= split.pad_from
@@ -867,6 +922,10 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
                 attached.append(mlp)
         except AneError as error:
             logger.warning("Neural Engine prefill stopped after %d of %d layers: %s", len(attached), len(mlps), error)
+        # One group per model, so a second prepare's layers and the earlier ones share one shortfall.
+        group = _Attached({id(m): m for _, m in model.named_modules() if m.__dict__.get(_STATE) is not None}.values())
+        for mlp in group.mlps:
+            mlp().__dict__[_STATE].group = group
         loads = [split.wired / (3 * split.k * split.hidden) for split in (m.__dict__[_STATE] for m in attached)
                  if split.wired is not None]
         status = AnePrefillStatus(len(attached), share, gpu, split_ms, time.perf_counter() - started,

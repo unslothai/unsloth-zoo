@@ -363,6 +363,32 @@ def test_program_loads_report_the_wired_memory_they_add(readings, factor, monkey
     ane.release_ane_prefill(model)
 
 
+@pytest.mark.parametrize("level,over_layers,kept", [(1, 0, 3), (2, 0, 3), (1, 1.5, 1), (2, 0.5, 2), (4, 0, 0)])
+def test_memory_pressure_releases_layers_from_the_end(level, over_layers, kept, caplog, monkeypatch):
+    model = _model()
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 2
+    model.layers.append(_model(seed = 1).layers[0])   # a second prepare joins the first one's group
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 1
+    model.__dict__["_unsloth_ane_prepared"] = True
+    order = [ref() for ref in model.layers[0].__dict__[ane._STATE].group.mlps]
+    splits, closed, close = [m.__dict__[ane._STATE] for m in order], [], ane._Split.close
+    monkeypatch.setattr(ane._Split, "close", lambda self: (closed.append(self), close(self)))
+    wired = sum(ane._WIRED_FACTOR * 3 * s.k * s.hidden for s in splits)
+    over = int(over_layers * ane._split_bytes(order[0], CHANNELS // 2))
+    monkeypatch.setattr(ane, "_pressure_level", lambda: level)
+    monkeypatch.setattr(ane, "_working_set", lambda: 10**12)
+    monkeypatch.setattr(ane.mx, "get_active_memory", lambda: 10**12 - wired + over)
+    with ane.ane_prefill_mlp(model):
+        outputs = [mlp(_rows(TILE)) for mlp in order]
+    assert [ane._STATE in mlp.__dict__ for mlp in order] == [True] * kept + [False] * (3 - kept)
+    assert closed == splits[kept:][::-1]
+    for mlp, out in zip(order, outputs):   # a released layer's own call already ran natively
+        assert mx.array_equal(out, mlp(_rows(TILE))).item() != (ane._STATE in mlp.__dict__)
+    warnings = [r for r in caplog.records if "memory pressure" in r.getMessage()]
+    assert len(warnings) == (0 if level == 1 and kept == 3 else 1)   # the warn-only notice once, not per call
+    ane.release_ane_prefill(model)
+
+
 def test_the_budget_is_half_of_what_the_model_leaves(monkeypatch):
     monkeypatch.setattr(ane.mx, "device_info", lambda: {"memory_size": 1000})
     monkeypatch.setattr(ane.mx, "get_active_memory", lambda: 250)
