@@ -1474,3 +1474,29 @@ def test_cpu_lora_sft_end_to_end(tmp_path):
     done = subprocess.run([sys.executable, "-c", _CPU_SFT_SCRIPT, str(model_dir), str(tmp_path / "out")],
                           capture_output = True, text = True, timeout = 600, env = env, cwd = str(tmp_path))
     assert done.returncode == 0 and "CPU_SFT_OK" in done.stdout, (done.stdout[-3000:], done.stderr[-5000:])
+
+
+@pytest.mark.parametrize("requested, seen", [(1, None), (0, None), (None, None), (4, 4), (True, True)])
+def test_serial_dataset_num_proc_maps_in_process(requested, seen):
+    """datasets >= 4.1 builds a Pool(1) for num_proc = 1, the config layer's serial sentinel: stock TRL
+    must see None while it prepares the dataset, and the caller's config keeps its own value."""
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
+
+    class FakeSFT:
+        def __init__(self, model = None, args = None, **kwargs):
+            self.seen = args.dataset_num_proc
+
+    args = SimpleNamespace(dataset_num_proc = requested)
+    trainer = _make_cpu_sft_trainer(FakeSFT)(model = None, args = args)
+    assert trainer.seen is seen if seen is None or isinstance(seen, bool) else trainer.seen == seen
+    assert args.dataset_num_proc is requested
+
+    class Failing(FakeSFT):
+        def __init__(self, *a, **k):
+            raise RuntimeError("boom")
+
+    args = SimpleNamespace(dataset_num_proc = 1)
+    with pytest.raises(RuntimeError):
+        _make_cpu_sft_trainer(Failing)(None, args)
+    assert args.dataset_num_proc == 1
