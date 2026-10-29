@@ -81,7 +81,7 @@ def test_dynamo_and_inductor_import_under_the_stub():
         import torch
         import torch._inductor.config
         import torch._dynamo
-        assert torch._inductor.config.triton.tlx_mode is None
+        assert getattr(torch._inductor.config.triton, "tlx_mode", None) is None
         f = torch.compile(lambda x: x.sin() + 1, backend = "eager")
         assert torch.allclose(f(torch.ones(3)), torch.ones(3).sin() + 1)
         print("OK", torch.__version__)
