@@ -341,9 +341,9 @@ def static_cache_update(cache, key_states, value_states, layer_idx):
 
 
 _ROPE_ENABLED = os.environ.get("UNSLOTH_GPT_OSS_FUSED_ROPE", "1") != "0"
-_ROPE_CHECKED = {}  # (region, device, dtype, B, Hq, Hk, D) -> bool
+_ROPE_CHECKED = {}
 _ROPE_CHECKED_MAX = 256
-_ROPE_GEN = {}  # device -> generator for the calibration inputs (the global RNG is never touched)
+_ROPE_GEN = {}  # private generators: the global RNG is never touched
 
 
 def _rope_launch(q, k, cos, sin):
@@ -371,9 +371,7 @@ def _same(a, b):
 
 
 def _region_eager():
-    # A non-default stance (force_eager) runs the region eagerly even where it checked compiled. Dynamo
-    # disabled or recompiles falling back to eager only affect shapes not compiled yet, which
-    # _check_region sees on their first call.
+    # force_eager runs even checked shapes eagerly; Dynamo-disabled / recompile fallbacks hit new shapes, which get checked.
     try:
         return _eval_frame._stance.stance != "default"
     except Exception:
@@ -393,8 +391,7 @@ def _calibrated(t, gen, lo = None):
 
 
 def _check_region(q, k, cos, sin, region):
-    """Kernel vs region, bitwise and layout, on random inputs of this exact shape and layout: a real first
-    token (position 0: sin = 0, cos = 1) cannot tell one rounding from per-op rounding."""
+    """Bitwise kernel vs region on random inputs: position 0 (sin 0, cos 1) cannot tell the roundings apart."""
     dev = q.device
     gen = _ROPE_GEN.get(dev)
     if gen is None:
@@ -408,9 +405,7 @@ def _check_region(q, k, cos, sin, region):
 
 
 def rope_decode(q, k, cos, sin, region):
-    """One-token apply_rotary_pos_emb, or None (caller runs region). region must be torch.compile'd; the
-    first call per region, device, dtype and shape checks the kernel against it bitwise on random
-    inputs (_check_region)."""
+    """One-token apply_rotary_pos_emb, or None (caller runs region, which must be torch.compile'd)."""
     if not (_ENABLED and _ROPE_ENABLED) or torch.jit.is_tracing():
         return None
     if getattr(region, "_torchdynamo_orig_callable", None) is None or _region_eager():
@@ -429,7 +424,7 @@ def rope_decode(q, k, cos, sin, region):
         or not (q.is_cuda or _INTERPRET)
     ):
         return None
-    # Strides follow from these shapes at this call site (view + transpose of fresh projections).
+    # Strides follow from the shapes here (view + transpose of fresh projections).
     key = (region, q.get_device(), dtype, B, HQ, k.shape[1], D)
     checked = _ROPE_CHECKED.get(key)
     if checked is False:

@@ -159,11 +159,10 @@ def test_first_call_checks_then_trusts(F, monkeypatch):
         assert F.rope_decode(*args, region) is not None
     # One check on random inputs (kernel + region once each), then three real launches.
     assert launch.n == 4 and region.n == 1 and F.FUSED_DECODE_CALLS["rope_decode"] == 3
-    # Another dtype, batch or layout is checked again.
     for args in inputs[3:]:
         F.rope_decode(*args, region)
     assert region.n == 3 and len(F._ROPE_CHECKED) == 3 and set(F._ROPE_CHECKED.values()) == {True}
-    assert torch.equal(rng, torch.get_rng_state())  # the calibration inputs come from a private generator
+    assert torch.equal(rng, torch.get_rng_state())
 
 
 @pytest.mark.parametrize("wrong", ["values", "layout"])
@@ -171,7 +170,6 @@ def test_a_mismatch_returns_the_region_and_stays_off(F, monkeypatch, wrong):
     if wrong == "values":
         bad = lambda *a: tuple(t + 1 for t in _contiguous_region(*a))  # noqa: E731
     else:
-        # Same values, different stride.
         bad = lambda *a: tuple(t.as_strided(t.shape, (t.stride(0), t.stride(1), 7, 1)) for t in _contiguous_region(*a))  # noqa: E731
     launch = _Counter(bad)
     region = _Counter(_contiguous_region)
