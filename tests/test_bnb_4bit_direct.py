@@ -22,7 +22,12 @@ import pytest
 import torch
 
 bnb = pytest.importorskip("bitsandbytes")
-bops = pytest.importorskip("bitsandbytes.backends.cuda.ops")
+# Not importorskip: on a CPU-only torch this module raises AttributeError at import
+# (torch._C has no _cuda_getCurrentRawStream), which importorskip lets through as a collection error.
+try:
+    from bitsandbytes.backends.cuda import ops as bops
+except Exception as exc:
+    pytest.skip(f"bitsandbytes CUDA ops do not import here: {exc!r}", allow_module_level = True)
 if not hasattr(bops, "_gemm_4bit_kernel_impl"):
     pytest.skip("bitsandbytes without the fused 4-bit GEMM", allow_module_level = True)
 
