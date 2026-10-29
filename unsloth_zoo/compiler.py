@@ -5221,7 +5221,7 @@ def patch_lora_forwards(torch_compile_options):
                 continue
             variant = getattr(previous_forward, "_unsloth_variants", {}).get(force_float32)
             if variant is not None:
-                _install_lora_forward_variant(function, parent, child, previous_forward, variant)
+                _install_lora_forward_variant(function, previous_forward, variant)
                 success += 1
                 continue
 
@@ -5323,7 +5323,7 @@ def patch_lora_forwards(torch_compile_options):
             if integer_input_inline:
                 forward._unsloth_integer_input = True
             if previous_forward is not None:
-                _install_lora_forward_variant(function, parent, child, previous_forward, forward)
+                _install_lora_forward_variant(function, previous_forward, forward)
                 continue
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
@@ -6220,7 +6220,7 @@ def _patch_torch_dtype_modules(
     pass
 
 
-def _install_lora_forward_variant(function, parent, child, previous_forward, forward):
+def _install_lora_forward_variant(function, previous_forward, forward):
     """Switch PEFT's LoRA class to `forward` without changing the arithmetic of live layers.
 
     Layers created under the previous flag keep their variant (a model loaded earlier must give
@@ -6246,7 +6246,7 @@ def _install_lora_forward_variant(function, parent, child, previous_forward, for
         if hasattr(forward, key):
             setattr(unsloth_forward, key, getattr(forward, key))
     unsloth_forward._unsloth_variants = variants
-    exec(f"{parent}.{child}.forward = unsloth_forward", globals(), locals())
+    function.forward = unsloth_forward
 
 
 def _reconcile_lora_forwards():
