@@ -336,7 +336,9 @@ def static_cache_update(cache, key_states, value_states, layer_idx):
 
 
 _ROPE_ENABLED = os.environ.get("UNSLOTH_GPT_OSS_FUSED_ROPE", "1") != "0"
-_ROPE_CHECKED = {}  # (device index, dtype) -> bool
+_ROPE_CHECKED = {}  # (region, device, dtype, shapes, strides) -> bool
+_ROPE_CHECKED_MAX = 256
+_ROPE_GEN = {}  # device -> generator for the calibration inputs (the global RNG is never touched)
 
 
 def _rope_launch(q, k, cos, sin):
@@ -354,7 +356,7 @@ def _rope_launch(q, k, cos, sin):
     if _INTERPRET:
         _rope_decode_kernel[grid](*args, **consts, num_warps = 1)
     else:
-        _fast_launch(_rope_decode_kernel, grid, args, consts, q.get_device(), (qo, ko), num_warps = 1)
+        _fast_launch(_rope_decode_kernel, grid, args, consts, q.get_device(), (qo, ko), num_warps = 1, **_NO_FMA)
     return qo, ko
 
 
@@ -363,10 +365,50 @@ def _same(a, b):
         a.view(torch.int16), b.view(torch.int16))
 
 
+def _region_eager():
+    # The region runs eagerly (every op rounded) under these, whatever was checked before.
+    try:
+        if torch._dynamo.config.disable:
+            return True
+        return torch._dynamo.eval_frame._stance.stance != "default"
+    except Exception:
+        return False
+
+
+def _capturing(device):
+    if device.type != "cuda":
+        return False
+    with torch.cuda.device(device):  # the operands' device, not the caller's current one
+        return torch.cuda.is_current_stream_capturing()
+
+
+def _calibrated(t, gen, lo = None):
+    c = torch.empty_strided(t.shape, t.stride(), dtype = t.dtype, device = t.device)
+    return c.uniform_(-1.0, 1.0, generator = gen) if lo else c.normal_(generator = gen)
+
+
+def _check_region(q, k, cos, sin, region):
+    """Kernel vs region, bitwise and layout, on random inputs of this exact shape and layout: a real first
+    token (position 0: sin = 0, cos = 1) cannot tell one rounding from per-op rounding."""
+    dev = q.device
+    gen = _ROPE_GEN.get(dev)
+    if gen is None:
+        gen = _ROPE_GEN[dev] = torch.Generator(device = dev)
+    gen.manual_seed(0)
+    qc, kc = _calibrated(q, gen), _calibrated(k, gen)
+    cc, sc = _calibrated(cos, gen, True), _calibrated(sin, gen, True)
+    out = _rope_launch(qc, kc, cc, sc)
+    ref = region(qc, kc, cc, sc)
+    return _same(out[0], ref[0]) and _same(out[1], ref[1])
+
+
 def rope_decode(q, k, cos, sin, region):
-    """One-token apply_rotary_pos_emb, or None (caller runs region). First call per (device, dtype) must
-    match region bitwise, layout included."""
+    """One-token apply_rotary_pos_emb, or None (caller runs region). region must be torch.compile'd; the
+    first call per region, device, dtype, shape and layout checks the kernel against it bitwise on random
+    inputs (_check_region)."""
     if not (_ENABLED and _ROPE_ENABLED) or torch.jit.is_tracing():
+        return None
+    if getattr(region, "_torchdynamo_orig_callable", None) is None or _region_eager():
         return None
     if q.dim() != 4 or k.dim() != 4 or cos.dim() != 3 or sin.dim() != 3:
         return None
@@ -382,22 +424,26 @@ def rope_decode(q, k, cos, sin, region):
         or not (q.is_cuda or _INTERPRET)
     ):
         return None
-    key = (q.get_device(), dtype)
+    key = (region, q.device, dtype, q.shape, k.shape, q.stride(), k.stride(), cos.stride(), sin.stride())
     checked = _ROPE_CHECKED.get(key)
     if checked is False:
         return None
+    if checked is None:
+        if _capturing(q.device):
+            return None  # the check syncs the host: leave it to an eager call
+        try:
+            ok = _check_region(q, k, cos, sin, region)
+        except Exception as e:
+            return _disable(e)
+        if len(_ROPE_CHECKED) >= _ROPE_CHECKED_MAX:
+            _ROPE_CHECKED.clear()
+        _ROPE_CHECKED[key] = ok
+        if not ok:
+            logger.warning("Unsloth: gpt-oss fused rotary embedding differs from the compiled region here, using the region")
+            return None
     try:
         out = _rope_launch(q, k, cos, sin)
     except Exception as e:
         return _disable(e)
-    if checked is None:
-        if torch.cuda.is_current_stream_capturing():
-            return None  # the check syncs the host; leave it to an eager call
-        ref = region(q, k, cos, sin)
-        ok = _same(out[0], ref[0]) and _same(out[1], ref[1])
-        _ROPE_CHECKED[key] = ok
-        if not ok:
-            logger.warning("Unsloth: gpt-oss fused rotary embedding differs from the compiled region here, using the region")
-            return ref
     FUSED_DECODE_CALLS["rope_decode"] += 1
     return out

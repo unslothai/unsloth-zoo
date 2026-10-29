@@ -123,7 +123,7 @@ def F(monkeypatch):
     monkeypatch.setattr(F, "_INTERPRET", True)
     monkeypatch.setattr(F, "_ROPE_CHECKED", {})
     monkeypatch.setattr(F, "FUSED_DECODE_CALLS", dict(F.FUSED_DECODE_CALLS, rope_decode = 0))
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(F, "_capturing", lambda device: False)
     return F
 
 
@@ -135,8 +135,10 @@ def _inputs(B = 2, HQ = 4, HK = 2, D = 16, S = 1, dtype = torch.float16):
 
 
 class _Counter:
+    """A call-counting stand-in for a torch.compile'd region (rope_decode declines plain callables)."""
     def __init__(self, fn):
         self.fn, self.n = fn, 0
+        self._torchdynamo_orig_callable = fn
 
     def __call__(self, *a):
         self.n += 1
@@ -151,12 +153,17 @@ def test_first_call_checks_then_trusts(F, monkeypatch):
     launch = _Counter(_contiguous_region)
     region = _Counter(_contiguous_region)
     monkeypatch.setattr(F, "_rope_launch", launch)
-    for _ in range(3):
-        out = F.rope_decode(*_inputs(), region)
-        assert out is not None
-    assert launch.n == 3 and region.n == 1 and F.FUSED_DECODE_CALLS["rope_decode"] == 3
-    F.rope_decode(*_inputs(dtype = torch.bfloat16), region)
-    assert region.n == 2 and set(F._ROPE_CHECKED.values()) == {True}
+    inputs = [_inputs() for _ in range(3)] + [_inputs(dtype = torch.bfloat16), _inputs(B = 3)]
+    rng = torch.get_rng_state()
+    for args in inputs[:3]:
+        assert F.rope_decode(*args, region) is not None
+    # One check on random inputs (kernel + region once each), then three real launches.
+    assert launch.n == 4 and region.n == 1 and F.FUSED_DECODE_CALLS["rope_decode"] == 3
+    # Another dtype, batch or layout is checked again.
+    for args in inputs[3:]:
+        F.rope_decode(*args, region)
+    assert region.n == 3 and len(F._ROPE_CHECKED) == 3 and set(F._ROPE_CHECKED.values()) == {True}
+    assert torch.equal(rng, torch.get_rng_state())  # the calibration inputs come from a private generator
 
 
 @pytest.mark.parametrize("wrong", ["values", "layout"])
@@ -170,10 +177,9 @@ def test_a_mismatch_returns_the_region_and_stays_off(F, monkeypatch, wrong):
     region = _Counter(_contiguous_region)
     monkeypatch.setattr(F, "_rope_launch", launch)
     args = _inputs()
-    out = F.rope_decode(*args, region)
-    ref = _contiguous_region(*args)
-    assert torch.equal(out[0], ref[0]) and torch.equal(out[1], ref[1])
-    assert F.rope_decode(*args, region) is None and launch.n == 1 and F.FUSED_DECODE_CALLS["rope_decode"] == 0
+    assert F.rope_decode(*args, region) is None
+    assert F.rope_decode(*args, region) is None and launch.n == 1 and region.n == 1
+    assert F.FUSED_DECODE_CALLS["rope_decode"] == 0
 
 
 @pytest.mark.parametrize("case", ["two_tokens", "fp32", "cos_fp32", "cos_shape", "k_batch", "odd_dim", "q_stride"])
@@ -193,28 +199,88 @@ def test_uncovered_inputs_return_none_without_launching(F, monkeypatch, case):
         q, k = q[..., :15], k[..., :15]
     elif case == "q_stride":
         q = q.transpose(2, 3)
-    assert F.rope_decode(q, k, cos, sin, _contiguous_region) is None and launch.n == 0
+    assert F.rope_decode(q, k, cos, sin, _Counter(_contiguous_region)) is None and launch.n == 0
 
 
 def test_kill_switch_cpu_tensors_and_capture(F, monkeypatch):
     launch = _Counter(_contiguous_region)
+    region = _Counter(_contiguous_region)
     monkeypatch.setattr(F, "_rope_launch", launch)
     monkeypatch.setattr(F, "_ROPE_ENABLED", False)
-    assert F.rope_decode(*_inputs(), _contiguous_region) is None
+    assert F.rope_decode(*_inputs(), region) is None
     monkeypatch.setattr(F, "_ROPE_ENABLED", True)
     monkeypatch.setattr(F, "_INTERPRET", False)
-    assert F.rope_decode(*_inputs(), _contiguous_region) is None
-    assert launch.n == 0
+    assert F.rope_decode(*_inputs(), region) is None
     monkeypatch.setattr(F, "_INTERPRET", True)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert F.rope_decode(*_inputs(), _contiguous_region) is None and not F._ROPE_CHECKED
+    # Capture before the check: nothing launched or recorded, the region runs.
+    monkeypatch.setattr(F, "_capturing", lambda device: True)
+    assert F.rope_decode(*_inputs(), region) is None and not F._ROPE_CHECKED
+    assert launch.n == 0 and region.n == 0
+
+
+def test_eager_regions_are_never_replaced(F, monkeypatch):
+    launch = _Counter(_contiguous_region)
+    monkeypatch.setattr(F, "_rope_launch", launch)
+    # Not torch.compile'd (UNSLOTH_COMPILE_DISABLE, or torch.compile refused to wrap it).
+    assert F.rope_decode(*_inputs(), _contiguous_region) is None
+    region = _Counter(_contiguous_region)
+    assert F.rope_decode(*_inputs(), region) is not None
+    n = launch.n
+    # A compiled region that would run eagerly now: Dynamo disabled or another stance.
+    monkeypatch.setattr(torch._dynamo.config, "disable", True)
+    assert F.rope_decode(*_inputs(), region) is None
+    monkeypatch.setattr(torch._dynamo.config, "disable", False)
+    with torch.compiler.set_stance("force_eager"):
+        assert F.rope_decode(*_inputs(), region) is None
+    assert launch.n == n
 
 
 def test_launch_failure_disables_and_falls_back(F, monkeypatch):
     def broken(*a):
         raise RuntimeError("no compiler")
     monkeypatch.setattr(F, "_rope_launch", broken)
-    assert F.rope_decode(*_inputs(), _contiguous_region) is None and not F._ENABLED
+    assert F.rope_decode(*_inputs(), _Counter(_contiguous_region)) is None and not F._ENABLED
+
+
+_CERT = textwrap.dedent('''
+    import json, sys
+    import torch
+    from unsloth_zoo import gpt_oss_decode_fused as F
+    dev = sys.argv[1]
+    REGION = """__REGION__"""
+    exec(REGION)
+    dt = torch.bfloat16 if dev == "cuda" else torch.float16
+    g = torch.Generator().manual_seed(0)
+    q = (torch.randn(2, 1, 8, 64, generator = g) * 4).to(dev, dt).transpose(1, 2)
+    k = (torch.randn(2, 1, 2, 64, generator = g) * 4).to(dev, dt).transpose(1, 2)
+    # Position 0: cos = 1, sin = 0, where any rounding gives the same answer.
+    cos0, sin0 = torch.ones(2, 1, 32, dtype = dt, device = dev), torch.zeros(2, 1, 32, dtype = dt, device = dev)
+    eager = lambda *a: tuple(t.contiguous() for t in _region(*a))
+    eager._torchdynamo_orig_callable = _region  # a compiled region that runs eagerly (every op rounded)
+    res = {"position0_agrees": all(bool(torch.equal(a, b)) for a, b in zip(F._rope_launch(q, k, cos0, sin0), eager(q, k, cos0, sin0)))}
+    res["eager_region_declined"] = F.rope_decode(q, k, cos0, sin0, eager) is None
+    ang = torch.rand(2, 1, 32, generator = g) * 4096
+    cos, sin = ang.cos().to(dev, dt), ang.sin().to(dev, dt)
+    res["eager_differs_later"] = not all(bool(torch.equal(a, b)) for a, b in zip(F._rope_launch(q, k, cos, sin), eager(q, k, cos, sin)))
+    compiled = torch.compile(_region, dynamic = True)
+    out = F.rope_decode(q, k, cos0, sin0, compiled)
+    out2 = F.rope_decode(q, k, cos, sin, compiled)
+    ref2 = compiled(q, k, cos, sin)
+    res["compiled_accepted"] = out is not None and out2 is not None
+    res["compiled_equal"] = out2 is not None and all(bool(torch.equal(a, b)) for a, b in zip(out2, ref2))
+    print("RESULT " + json.dumps(res))
+''')
+
+
+def test_first_token_cannot_certify_an_eager_region(tmp_path):
+    import inspect
+    script = _CERT.replace("__REGION__", textwrap.dedent(inspect.getsource(_region)))
+    if torch.cuda.is_available() and torch.version.hip is None:
+        res = _run(tmp_path, script, "cuda")
+    else:
+        res = _run(tmp_path, script, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
+    assert res["position0_agrees"] and res["eager_differs_later"], res  # the premise
+    assert res["eager_region_declined"] and res["compiled_accepted"] and res["compiled_equal"], res
 
 
 _LOOP = textwrap.dedent('''
