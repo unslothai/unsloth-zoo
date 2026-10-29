@@ -378,12 +378,18 @@ def test_cuda_helper_bitwise_against_bitsandbytes(nested, dtype):
         pytest.skip("bitsandbytes without the fused 4-bit GEMM on this build")
     W, qs = lin.weight, lin.weight.quant_state
     before = Z.BNB_4BIT_DIRECT_CALLS["direct"]
+    expected = 0
     for M in (1, 4, 8, 16):
         x = torch.randn(M, 1, 2048, device = "cuda", dtype = dtype)
+        # Where bitsandbytes' own choice is dequantize + F.linear, the helper leaves it to bitsandbytes.
+        fused = M <= bops._gemm_4bit_custom_max_m and bool(bops._gemm_4bit_use_custom_fn(0, dtype, M, 3072, 2048))
         with torch.no_grad():
             ref = bnb.matmul_4bit(x, W.t(), quant_state = qs)
             for _ in range(2):
                 buf = torch.empty_like(ref)
                 out = Z.bnb_matmul_4bit_direct(x, W, qs, out = buf)
-                assert out is not None and torch.equal(out, ref), M
-    assert Z.BNB_4BIT_DIRECT_CALLS["direct"] > before
+                assert (out is not None) == fused, M
+                if fused:
+                    assert out is buf and torch.equal(out, ref), M
+                    expected += 1
+    assert Z.BNB_4BIT_DIRECT_CALLS["direct"] - before == expected
