@@ -341,7 +341,7 @@ def static_cache_update(cache, key_states, value_states, layer_idx):
 
 
 _ROPE_ENABLED = os.environ.get("UNSLOTH_GPT_OSS_FUSED_ROPE", "1") != "0"
-_ROPE_CHECKED = {}  # (region, device, dtype, shapes, strides) -> bool
+_ROPE_CHECKED = {}  # (region, device, dtype, B, Hq, Hk, D) -> bool
 _ROPE_CHECKED_MAX = 256
 _ROPE_GEN = {}  # device -> generator for the calibration inputs (the global RNG is never touched)
 
@@ -409,7 +409,7 @@ def _check_region(q, k, cos, sin, region):
 
 def rope_decode(q, k, cos, sin, region):
     """One-token apply_rotary_pos_emb, or None (caller runs region). region must be torch.compile'd; the
-    first call per region, device, dtype, shape and layout checks the kernel against it bitwise on random
+    first call per region, device, dtype and shape checks the kernel against it bitwise on random
     inputs (_check_region)."""
     if not (_ENABLED and _ROPE_ENABLED) or torch.jit.is_tracing():
         return None
@@ -429,7 +429,8 @@ def rope_decode(q, k, cos, sin, region):
         or not (q.is_cuda or _INTERPRET)
     ):
         return None
-    key = (region, q.device, dtype, q.shape, k.shape, q.stride(), k.stride(), cos.stride(), sin.stride())
+    # Strides follow from these shapes at this call site (view + transpose of fresh projections).
+    key = (region, q.get_device(), dtype, B, HQ, k.shape[1], D)
     checked = _ROPE_CHECKED.get(key)
     if checked is False:
         return None
