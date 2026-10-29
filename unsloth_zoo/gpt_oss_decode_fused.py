@@ -19,6 +19,11 @@ Decode at batch 1 is host bound (the GPU is busy 16-45% of a step): every aten o
   add_rms_norm      (x + residual) -> new residual, RMSNorm(x + residual): replaces the residual
                     clone + bf16 add + 9-op fp32 RMSNorm (rms_layernorm_forward) with one kernel.
   sink_scale_output attention * sigmoid(lse - sink), transposed to [B, Q, H, D]: replaces 6 ops.
+  rope_decode       the rotary embedding of q and k for one token, in one launch, instead of entering the
+                    compiled apply_rotary_pos_emb region (a Dynamo frame + guards + 2 Inductor kernels per
+                    layer). Bit-identical to that region: every product of two bf16 / fp16 values is exact in
+                    fp32, so x1 * cos - x2 * sin rounds once whatever the order or contraction, as the
+                    region's fp32 math does. Checked bitwise against the region on its first call per device.
   static_cache_update  one-token update of transformers' StaticLayer / StaticSlidingWindowLayer: the
                     sliding roll + host index tensor (a pageable copy, so a stream sync per layer) +
                     index_put + copy becomes cat + copy; the full layer's arange + add drop out.
@@ -35,6 +40,7 @@ __all__ = [
     "add_rms_norm",
     "sink_scale_output",
     "static_cache_update",
+    "rope_decode",
     "FUSED_DECODE_CALLS",
 ]
 
@@ -64,7 +70,7 @@ if HAS_TRITON and not _INTERPRET:
 # NVIDIA only for now: the libdevice exp / rsqrt and rounding were verified on sm75 / sm80 / sm120, not on ROCm.
 _ENABLED = HAS_TRITON and torch.version.hip is None and os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
 # Engagement counters (tests and benchmarks read them).
-FUSED_DECODE_CALLS = {"add_rms_norm": 0, "sink_scale_output": 0, "static_cache_update": 0}
+FUSED_DECODE_CALLS = {"add_rms_norm": 0, "sink_scale_output": 0, "static_cache_update": 0, "rope_decode": 0}
 _MAX_COLS = 32768
 # aten rounds every multiply before the add that follows it; contracting them into FMAs would not.
 _NO_FMA = {} if _INTERPRET else {"enable_fp_fusion": False}
@@ -139,6 +145,32 @@ if HAS_TRITON:
         ok = cols < D
         a = tl.load(A + b * sa_b + h * sa_h + q * sa_q + cols, mask = ok, other = 0.0).to(tl.float32)
         tl.store(OUT + b * so_b + q * so_q + h * so_h + cols, (a * scale).to(OUT.dtype.element_ty), mask = ok)
+
+    @triton.jit
+    def _rope_decode_kernel(
+        Q, K, COS, SIN, QO, KO, HQ, HK, HALF,
+        sq_b, sq_h, sk_b, sk_h, sc_b, ss_b, sqo_b, sqo_h, sko_b, sko_h,
+        BLOCK: tl.constexpr,
+    ):
+        # One program per (row, head) over the q heads, then the k heads.
+        pid = tl.program_id(0)
+        b = (pid // (HQ + HK)).to(tl.int64)
+        h = (pid % (HQ + HK)).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        ok = cols < HALF
+        c = tl.load(COS + b * sc_b + cols, mask = ok, other = 0.0).to(tl.float32)
+        s = tl.load(SIN + b * ss_b + cols, mask = ok, other = 0.0).to(tl.float32)
+        if h < HQ:
+            src = Q + b * sq_b + h * sq_h
+            dst = QO + b * sqo_b + h * sqo_h
+        else:
+            src = K + b * sk_b + (h - HQ) * sk_h
+            dst = KO + b * sko_b + (h - HQ) * sko_h
+        x1 = tl.load(src + cols, mask = ok, other = 0.0).to(tl.float32)
+        x2 = tl.load(src + HALF + cols, mask = ok, other = 0.0).to(tl.float32)
+        # transformers' _apply_rotary_emb: cat(x1 * cos - x2 * sin, x2 * cos + x1 * sin).
+        tl.store(dst + cols, (x1 * c - x2 * s).to(dst.dtype.element_ty), mask = ok)
+        tl.store(dst + HALF + cols, (x2 * c + x1 * s).to(dst.dtype.element_ty), mask = ok)
 
 
 def add_rms_norm(x, residual, weight, eps):
@@ -306,3 +338,74 @@ def static_cache_update(cache, key_states, value_states, layer_idx):
         layer.cumulative_length.add_(1)
     FUSED_DECODE_CALLS["static_cache_update"] += 1
     return keys, values
+
+
+# rope_decode: on until its first call per device fails the bitwise check against the compiled region.
+_ROPE_ENABLED = os.environ.get("UNSLOTH_GPT_OSS_FUSED_ROPE", "1") != "0"
+_ROPE_CHECKED = {}  # (device index, dtype) -> bool
+
+
+def _rope_launch(q, k, cos, sin):
+    B, HQ, _, D = q.shape
+    HK = k.shape[1]
+    half = D // 2
+    # The layout the compiled region returns (Inductor's contiguous output), so later kernels and guards see the same strides.
+    qo = torch.empty((B, HQ, 1, D), dtype = q.dtype, device = q.device)
+    ko = torch.empty((B, HK, 1, D), dtype = k.dtype, device = k.device)
+    args = (q, k, cos, sin, qo, ko, HQ, HK, half,
+            q.stride(0), q.stride(1), k.stride(0), k.stride(1), cos.stride(0), sin.stride(0),
+            qo.stride(0), qo.stride(1), ko.stride(0), ko.stride(1))
+    consts = dict(BLOCK = triton.next_power_of_2(half))
+    grid = (B * (HQ + HK),)
+    if _INTERPRET:
+        _rope_decode_kernel[grid](*args, **consts, num_warps = 1)
+    else:
+        _fast_launch(_rope_decode_kernel, grid, args, consts, q.get_device(), (qo, ko), num_warps = 1)
+    return qo, ko
+
+
+def _same(a, b):
+    return a.shape == b.shape and a.stride() == b.stride() and a.dtype == b.dtype and torch.equal(
+        a.view(torch.int16), b.view(torch.int16))
+
+
+def rope_decode(q, k, cos, sin, region):
+    """apply_rotary_pos_emb(q, k, cos, sin) for one token (q [B, Hq, 1, D], k [B, Hk, 1, D], cos / sin
+    [B, 1, D / 2], one bf16 / fp16 dtype) in one launch; None when disabled or not covered (callers then
+    call region). The first call per device also runs region and keeps this path only if both outputs
+    match it bit for bit, layout included (per device and dtype)."""
+    if not (_ENABLED and _ROPE_ENABLED) or torch.jit.is_tracing():
+        return None
+    if q.dim() != 4 or k.dim() != 4 or cos.dim() != 3 or sin.dim() != 3:
+        return None
+    B, HQ, S, D = q.shape
+    half = D // 2
+    dtype = q.dtype
+    if (
+        S != 1 or k.shape[2] != 1 or k.shape[0] != B or k.shape[3] != D or D != 2 * half or half > 1024
+        or dtype not in (torch.bfloat16, torch.float16) or k.dtype != dtype or cos.dtype != dtype
+        or sin.dtype != dtype or tuple(cos.shape) != (B, 1, half) or tuple(sin.shape) != (B, 1, half)
+        or q.stride(-1) != 1 or k.stride(-1) != 1 or cos.stride(-1) != 1 or sin.stride(-1) != 1
+        or k.device != q.device or cos.device != q.device or sin.device != q.device
+        or not (q.is_cuda or _INTERPRET)
+    ):
+        return None
+    key = (q.get_device(), dtype)
+    checked = _ROPE_CHECKED.get(key)
+    if checked is False:
+        return None
+    try:
+        out = _rope_launch(q, k, cos, sin)
+    except Exception as e:
+        return _disable(e)
+    if checked is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None  # the check reads back on the host: leave it to an eager call
+        ref = region(q, k, cos, sin)
+        ok = _same(out[0], ref[0]) and _same(out[1], ref[1])
+        _ROPE_CHECKED[key] = ok
+        if not ok:
+            logger.warning("Unsloth: gpt-oss fused rotary embedding differs from the compiled region here, using the region")
+            return ref
+    FUSED_DECODE_CALLS["rope_decode"] += 1
+    return out

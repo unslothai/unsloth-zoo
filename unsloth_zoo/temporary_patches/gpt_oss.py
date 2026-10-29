@@ -52,6 +52,7 @@ from .gpt_oss_routed import (
 from unsloth_zoo.gpt_oss_decode_fused import (
     add_rms_norm as _fused_add_rms_norm,
     fused_decode_ok as _fused_decode_ok,
+    rope_decode as _rope_decode,
     static_cache_update as _static_cache_update,
 )
 transformers_version = Version(importlib_version("transformers"))
@@ -3488,7 +3489,12 @@ def patch_GptOssAttention():
         key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # One launch instead of the compiled region on decode steps (bit-identical; see gpt_oss_decode_fused).
+        rotated = _rope_decode(query_states, key_states, cos, sin, apply_rotary_pos_emb) \
+            if _fused_decode_ok(query_states) else None
+        if rotated is None:
+            rotated = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = rotated
         if past_key_value is not None:
             cache_dtype = getattr(past_key_value, "dtype", None)
             if cache_dtype is None and hasattr(past_key_value, "layers"):
