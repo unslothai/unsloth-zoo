@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import os
 import torch
 import torch.nn as nn
 import inspect
@@ -163,6 +164,158 @@ def _packed_weight_without_quant_state_error(module):
     )
 
 
+# Inference 4-bit matmuls straight into bitsandbytes' fused kernel. bitsandbytes >= 0.50 reaches
+# lib.cgemm_4bit_* through matmul_4bit -> torch.ops.bitsandbytes.gemm_4bit -> _gemm_4bit_kernel_impl, about
+# 50 us of Python per call on a Colab host (a decode step makes one per projection); the kernel and its
+# arguments are the same here, so the output is too. The first call per dtype and layout is also run
+# through bitsandbytes and must match bit for bit. UNSLOTH_BNB_4BIT_DIRECT=0 turns it off.
+BNB_4BIT_DIRECT_CALLS = {"direct": 0}
+_BNB_DIRECT = {"on": os.environ.get("UNSLOTH_BNB_4BIT_DIRECT", "1") != "0" and torch.version.hip is None,
+               "ops": None, "checked": {}, "fn": {}}
+_BNB_DIRECT_SIGNATURE = ("A", "B", "shapeB", "absmax", "blocksize", "quant_type", "bias", "absmax_8bit",
+                         "absmax_code", "absmax_offset")
+_BNB_DIRECT_FN = {torch.bfloat16: "cgemm_4bit_bf16", torch.float16: "cgemm_4bit_fp16",
+                  torch.float32: "cgemm_4bit_fp32"}
+_cuda_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+_cuda_get_device = getattr(torch._C, "_cuda_getDevice", None)
+
+
+def _bnb_direct_ops():
+    ops = _BNB_DIRECT["ops"]
+    if ops is None:
+        ops = False
+        try:
+            from bitsandbytes.backends.cuda import ops as bops
+            impl = bops._gemm_4bit_kernel_impl
+            if (
+                tuple(inspect.signature(impl).parameters) == _BNB_DIRECT_SIGNATURE
+                and getattr(bops.lib, "compiled_with_cuda", False)
+                and callable(bops._gemm_4bit_use_custom_fn)
+                and isinstance(bops._gemm_4bit_custom_max_m, int)
+                and _cuda_raw_stream is not None and _cuda_get_device is not None
+            ):
+                ops = bops
+        except Exception:
+            pass
+        _BNB_DIRECT["ops"] = ops
+    return ops
+
+
+def _on_current_cuda(x):
+    # bitsandbytes switches to the tensor's device first (multi-GPU device_map): left to it.
+    return x.is_cuda and x.get_device() == _cuda_get_device()
+
+
+def _bnb_direct_tensors(qs):
+    if qs.nested:
+        return [qs.state2.absmax, qs.absmax, qs.state2.code, qs.offset]
+    return [qs.absmax]
+
+
+_PTRS_AT = getattr(torch._C, "_tensors_data_ptrs_at_indices_equal", None)
+
+
+_PTRS_IDX = {1: [0], 4: [0, 1, 2, 3]}
+
+
+def _ptrs_equal(tensors, ptrs):
+    try:
+        if _PTRS_AT is not None:
+            return _PTRS_AT(tensors, ptrs, _PTRS_IDX[len(tensors)])
+        return all(t.data_ptr() == p for t, p in zip(tensors, ptrs))
+    except Exception:
+        return False  # a quant tensor set to None: rebuilt, and declined
+
+
+def _bnb_direct_plan(weight, quant_state):
+    """The weight-side arguments of _gemm_4bit_kernel_impl for this layer, or None."""
+    qs = quant_state
+    if len(qs.shape) != 2 or weight.dtype is not torch.uint8:
+        return None
+    if qs.nested and (qs.state2 is None or qs.state2.blocksize != 256 or qs.offset is None):
+        return None
+    tensors = _bnb_direct_tensors(qs)
+    if tensors[0].dtype is not torch.float32:
+        return None
+    if qs.nested:
+        # matmul_4bit passes state2.absmax as absmax and the quantized absmax as absmax_8bit.
+        offset = qs.offset.to(dtype = torch.float32)
+        ptrs = (tensors[0].data_ptr(), tensors[1].data_ptr(), tensors[2].data_ptr(), offset.data_ptr())
+    else:
+        offset = None
+        ptrs = (tensors[0].data_ptr(), None, None, None)
+    return (qs, weight.data_ptr(), tensors, [t.data_ptr() for t in tensors], ptrs, offset,
+            qs.shape[0], qs.shape[1], qs.blocksize, 1 if qs.quant_type == "fp4" else 2, {})
+
+
+def _bnb_4bit_direct(self, x, quant_state):
+    """bitsandbytes.matmul_4bit(x, weight, bias, quant_state) for inference, or None (the caller runs it)."""
+    if torch.compiler.is_compiling() or not _BNB_DIRECT["on"]:
+        return None
+    ops = _BNB_DIRECT["ops"]
+    if ops is None:
+        ops = _bnb_direct_ops()
+    if ops is False:
+        return None
+    weight = self.weight
+    bias = self.bias
+    dtype = x.dtype
+    if (
+        dtype is not self.compute_dtype or not _on_current_cuda(x)
+        or (torch.is_grad_enabled() and (x.requires_grad or (bias is not None and bias.requires_grad)))
+    ):
+        return None
+    plan = self.__dict__.get("_unsloth_bnb_direct")
+    # Rebuilt whenever the layer is requantized, moved, or a quant tensor is replaced or recast.
+    if plan is None or plan[0] is not quant_state or plan[1] is not None and (
+        plan[1] != weight.data_ptr() or not _ptrs_equal(_bnb_direct_tensors(quant_state), plan[3])
+    ):
+        try:
+            plan = _bnb_direct_plan(weight, quant_state)
+        except Exception:
+            plan = None
+        if plan is None:
+            plan = (quant_state, None)
+        self.__dict__["_unsloth_bnb_direct"] = plan
+    if plan[1] is None:
+        return None
+    _, _, _, _, ptrs, _, N, K, blocksize, quant_type, picks = plan
+    if x.shape[-1] != K or (bias is not None and (bias.dim() != 1 or bias.dtype is not dtype)):
+        return None
+    M = x.numel() // K
+    use = picks.get((M, dtype))
+    if use is None:
+        # torch.ops.bitsandbytes.gemm_4bit's own choice between its kernel and dequantize + F.linear.
+        use = 0 < M <= ops._gemm_4bit_custom_max_m and K % blocksize == 0 and bool(
+            ops._gemm_4bit_use_custom_fn(x.device.index, dtype, M, N, K))
+        picks[(M, dtype)] = use
+    if not use:
+        return None
+    fn = _BNB_DIRECT["fn"].get(dtype)
+    if fn is None:
+        fn = _BNB_DIRECT["fn"][dtype] = getattr(ops.lib, _BNB_DIRECT_FN.get(dtype, ""), None) or False
+    if fn is False:
+        return None
+    key = (dtype, ptrs[1] is not None, bias is not None)
+    checked = _BNB_DIRECT["checked"].get(key)
+    if checked is False or checked is None and torch.cuda.is_current_stream_capturing():
+        return None  # the check reads back on the host: leave it to an eager call
+    A = x.contiguous()
+    out = torch.empty((*A.shape[:-1], N), dtype = dtype, device = A.device)
+    fn(A.data_ptr(), weight.data_ptr(), ptrs[0], ptrs[1], ptrs[2], ptrs[3], out.data_ptr(),
+       bias.data_ptr() if bias is not None else None, M, N, K, blocksize, quant_type, _cuda_raw_stream(A.device.index))
+    if checked is None:
+        import bitsandbytes
+        ref = bitsandbytes.matmul_4bit(x, weight.data.t(), bias = bias, quant_state = quant_state)
+        ok = ref.shape == out.shape and ref.dtype == out.dtype and torch.equal(
+            ref.view(torch.uint8), out.view(torch.uint8))
+        _BNB_DIRECT["checked"][key] = ok
+        if not ok:
+            return ref
+    BNB_4BIT_DIRECT_CALLS["direct"] += 1
+    return out
+
+
 def patch_bitsandbytes_linear4bit_forward():
     # Fixes torch.compile complaining about multiple things
     try:
@@ -236,6 +389,10 @@ def patch_bitsandbytes_linear4bit_forward():
         if not self.compute_type_is_set:
             self.set_compute_type(x)
             self.compute_type_is_set = True
+
+        out = _bnb_4bit_direct(self, x, quant_state)
+        if out is not None:
+            return out
 
         inp_dtype = x.dtype
         if self.compute_dtype is not None:
