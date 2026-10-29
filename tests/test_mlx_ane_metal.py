@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import gc
+import os
 import time
 import weakref
 
@@ -538,3 +539,15 @@ def test_availability_counts_eligible_layers_then_what_prepare_attached(monkeypa
     assert ane.ane_prefill_checkpoint_available(tmp_path) == (False, "not_downloaded", 0)
     (tmp_path / "config.json").write_text(json.dumps({"quantization": {"group_size": 64, "bits": 4}}))
     assert ane.ane_prefill_checkpoint_available(tmp_path) == (True, "", 2)
+
+
+def test_a_cached_program_keeps_its_directory_after_the_compiling_owner_closes():
+    first, second = _model(seed = 7), _model(seed = 7)
+    assert ane.prepare_ane_prefill(first, tile = TILE, share = 0.5).layers == 2
+    assert ane.prepare_ane_prefill(second, tile = TILE, share = 0.5).layers == 2
+    programs = [m.__dict__[ane._STATE].program for m in (first.layers[0], second.layers[0])]
+    assert programs[1].cached and programs[0].directory == programs[1].directory
+    ane.release_ane_prefill(first)
+    assert os.path.isdir(programs[1].directory), "the second owner's program lost its directory"
+    ane.release_ane_prefill(second)
+    assert not os.path.isdir(programs[1].directory)

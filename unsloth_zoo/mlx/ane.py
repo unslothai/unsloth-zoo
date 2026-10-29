@@ -242,15 +242,11 @@ class Program:
                 raise AneError("the runtime rejected the program description")
             identifier = ctypes.string_at(rt.call(rt.call(model, "hexStringIdentifier"), "UTF8String")).decode()
             self.directory = os.path.join(os.environ.get("TMPDIR", "/tmp"), identifier)
-            self.marker = None
-            self.cached = self._compiled(model)
-            if not self.cached:
-                # A program the runtime compiles here is served from this directory, which identical programs in
-                # other processes share: each marks it, and the last one removes it.
-                with _directory_lock(self.directory):
-                    self.cached = self._compiled(model)
-                    if not self.cached:
-                        self.marker = self._compile(model, mil, weights)
+            # A compiled program is served from this directory, which identical programs in other processes share:
+            # each marks it, cached or not, and the last one removes it.
+            with _directory_lock(self.directory):
+                self.cached = self._compiled(model)
+                self.marker = self._mark() if self.cached else self._compile(model, mil, weights)
             try:
                 self._invoke(model, "loadWithQoS:options:error:", "load")
             except BaseException:
@@ -266,12 +262,17 @@ class Program:
     def _compiled(model):
         return bool(_runtime().call(model, "compiledModelExists", restype = ctypes.c_bool))
 
+    def _mark(self):
+        """This program's owner marker in its directory. Called with the lock held."""
+        marker = os.path.join(self.directory, f".unsloth-{os.getpid()}-{id(self)}")
+        os.makedirs(os.path.join(self.directory, "weights"), exist_ok = True)
+        open(marker, "w").close()
+        return marker
+
     def _compile(self, model, mil, weights):
         """Stage the sources, compile and drop them; returns this program's owner marker. Called with the lock held."""
-        marker = os.path.join(self.directory, f".unsloth-{os.getpid()}-{id(self)}")
+        marker = self._mark()
         sources = (os.path.join(self.directory, "model.mil"), os.path.join(self.directory, "weights", "weight.bin"))
-        os.makedirs(os.path.dirname(sources[1]), exist_ok = True)
-        open(marker, "w").close()
         try:
             with open(sources[0], "w") as file:
                 file.write(mil)
@@ -322,9 +323,13 @@ def _alive(pid):
 def _directory_lock(directory):
     import fcntl  # POSIX only; importing at module level breaks `unsloth_zoo.mlx.inference` on Windows
 
-    with open(f"{directory}.lock", "w") as file:
-        fcntl.flock(file, fcntl.LOCK_EX)
+    # O_NOFOLLOW and no truncation: the lock sits in TMPDIR, which may be the shared /tmp.
+    fd = os.open(f"{directory}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
+    finally:
+        os.close(fd)
 
 
 def _release_directory(directory, marker):
@@ -499,7 +504,8 @@ class AnePrefillStatus(NamedTuple):
     reason: str = ""
     # System wired memory each program load added, over its int8 weight bytes (median); noisy, so only reported.
     wired_factor: float = 0.0
-    # Why nothing attached: no_neural_engine, not_gpu, no_eligible_mlps, calibration_failed, no_gain, not_enough_memory, load_failed
+    # Why nothing attached: no_neural_engine, not_gpu, timed_out, no_eligible_mlps, calibration_failed, no_gain, not_enough_memory,
+    # load_failed, failed
     code: str = ""
 
 
@@ -861,13 +867,21 @@ def _load_cache():
 
 
 def _store_cache(key, entry):
+    """Best effort: an unwritable cache only means the next prepare calibrates again."""
     cache = _load_cache()
     cache[key] = entry
-    os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok = True)
     temporary = f"{_CACHE_PATH}.{os.getpid()}"
-    with open(temporary, "w") as file:
-        json.dump(cache, file, indent = 1, sort_keys = True)
-    os.replace(temporary, _CACHE_PATH)
+    try:
+        os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok = True)
+        with open(temporary, "w") as file:
+            json.dump(cache, file, indent = 1, sort_keys = True)
+        os.replace(temporary, _CACHE_PATH)
+    except OSError as error:
+        logger.warning("Neural Engine prefill: could not store calibration in %s: %s", _CACHE_PATH, error)
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
 
 
 def _median_ms(function, repeats = 7, warm_seconds = 1.0):
@@ -971,7 +985,12 @@ def prepare_ane_prefill(model, *, tile = _TILE, share = None):
     than the GPU alone is not attached. Returns an `AnePrefillStatus`; `layers == 0` with a `reason` when nothing was
     attached.
     """
-    status = _prepare(model, tile, share)
+    started = time.perf_counter()
+    try:
+        status = _prepare(model, tile, share)
+    except AneError as error:   # e.g. no IOSurface for the probe: the GPU keeps every layer
+        logger.warning("Neural Engine prefill: prepare failed: %s", error)
+        status = AnePrefillStatus(0, seconds = time.perf_counter() - started, reason = str(error), code = "failed")
     model.__dict__[_PREPARED] = status
     return status
 
@@ -982,6 +1001,8 @@ def _prepare(model, tile, share):
         return AnePrefillStatus(0, reason = "no Neural Engine runtime", code = "no_neural_engine")
     if mx.default_device() != mx.gpu:
         return AnePrefillStatus(0, reason = "the default device is not the GPU", code = "not_gpu")
+    if _ABANDONED:
+        return AnePrefillStatus(0, reason = "a Neural Engine evaluation timed out in this process", code = "timed_out")
     if tile % 32:
         raise ValueError("tile must be a multiple of 32 rows")
     # Calibration times, and each split records, the GPU routes a generation would take; a generation's own scopes
