@@ -241,7 +241,6 @@ def test_row_picks_stay_bounded(lib, monkeypatch):
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("M", [1, 4])
 def test_helper_same_kernel_call_as_bitsandbytes(lib, nested, M):
-    # bnb_matmul_4bit_direct: matmul_4bit(x, W.t(), quant_state = qs) without a module, plan on the quant state.
     layer, qs = _layer(nested = nested, bias = False)
     weight = layer.weight
     x = torch.randn(1, M, 128).to(torch.bfloat16)
@@ -259,8 +258,8 @@ def test_helper_writes_into_a_matching_out_buffer(lib):
     with torch.no_grad():
         buf = torch.empty(1, 4, 64, dtype = torch.bfloat16)
         assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs, out = buf) is buf
-        assert lib.calls[-1][1][6] == buf.data_ptr()  # the kernel wrote straight into it
-        wide = torch.empty(1, 4, 128, dtype = torch.bfloat16)[..., :64]  # not contiguous: copied into
+        assert lib.calls[-1][1][6] == buf.data_ptr()
+        wide = torch.empty(1, 4, 128, dtype = torch.bfloat16)[..., :64]
         assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs, out = wide) is wide
         assert lib.calls[-1][1][6] != wide.data_ptr()
 
@@ -381,7 +380,6 @@ def test_cuda_helper_bitwise_against_bitsandbytes(nested, dtype):
     expected = 0
     for M in (1, 4, 8, 16):
         x = torch.randn(M, 1, 2048, device = "cuda", dtype = dtype)
-        # Where bitsandbytes' own choice is dequantize + F.linear, the helper leaves it to bitsandbytes.
         fused = M <= bops._gemm_4bit_custom_max_m and bool(bops._gemm_4bit_use_custom_fn(0, dtype, M, 3072, 2048))
         with torch.no_grad():
             ref = bnb.matmul_4bit(x, W.t(), quant_state = qs)

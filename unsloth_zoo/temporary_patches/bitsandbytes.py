@@ -280,9 +280,7 @@ _SELF = object()
 
 
 def bnb_matmul_4bit_direct(x, weight, quant_state, out = None):
-    """bitsandbytes.matmul_4bit(x, weight.t(), quant_state = quant_state, out = out) for inference through the
-    same fused kernel without its Python dispatch, or None when it does not apply (the caller then runs
-    bitsandbytes). weight is the packed uint8 parameter; the plan is cached on quant_state."""
+    """bitsandbytes.matmul_4bit(x, weight.t(), quant_state = quant_state, out = out) for inference, or None."""
     return _bnb_4bit_direct_impl(quant_state.__dict__, _SELF, x, weight, None, quant_state, out)
 
 
