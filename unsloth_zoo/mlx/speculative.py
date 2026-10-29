@@ -1302,7 +1302,9 @@ class SpeculativeDraft:
         first = int(first_token.item())
         yield first, logprobs
         # Before 0.7.11 mlx-vlm's first step showed the processors the last prefilled chunk alone.
-        start = 0 if _history_starts_at_prompt(importlib.import_module("mlx_vlm.generate.ar").generate_step) else max(0, len(prompt) - int(input_ids.size))
+        start = max(0, len(prompt) - int(input_ids.size))
+        if _history_starts_at_prompt(importlib.import_module("mlx_vlm.generate.ar").generate_step):
+            start = 0
         processors = [_shown_from(processor, start) for processor in processors]
         engine = SpeculativeEngine(model, self.controller, self.drafter)
         engine.add(self._started(model, EngineRow(prompt_cache, first, prompt, sampling, max_tokens, processors = processors), last_outputs))

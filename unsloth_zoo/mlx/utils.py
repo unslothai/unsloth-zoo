@@ -11035,12 +11035,8 @@ def _restore_mlx_rng_key(words):
 
 
 def _compile_state_snapshot(tree):
-    """Shallow copies of every dict / list in a compiled step's captured state.
-
-    A captured-state ``mx.compile`` trace that raises leaves its placeholder
-    arrays (and any keys it added) in those containers, and evaluating one
-    later fails with "eval an array without a primitive".
-    """
+    """Shallow copies of every dict / list in a compiled step's captured state: a trace that
+    raises leaves its placeholder arrays (and keys it added) there, which eager eval rejects."""
     snapshot = []
     pending = [tree]
     while pending:
