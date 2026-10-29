@@ -846,7 +846,7 @@ def test_verify_blocks_fold_their_shared_expert_bitwise(monkeypatch):
             assert bool(folds) is folded
 
 
-@pytest.mark.parametrize("change", ["override", "projection", "unverified", "bits", "group", "strided", "tensor_units", "eight_bits"])
+@pytest.mark.parametrize("change", ["override", "projection", "unverified", "bits", "group", "strided", "swapped", "tensor_units", "eight_bits"])
 def test_shared_expert_stays_on_its_own_launches_when_changed(change, monkeypatch):
     block = _fold_block(vlm_qwen, 8 if change == "eight_bits" else 4, 64 if change == "eight_bits" else 32)
     x = mx.random.normal((2, 1, 512)).astype(mx.bfloat16)
@@ -872,6 +872,9 @@ def test_shared_expert_stays_on_its_own_launches_when_changed(change, monkeypatc
     elif change == "strided":
         w = block.shared_expert.down_proj.weight
         block.shared_expert.down_proj.weight = mx.broadcast_to(w[:1], w.shape)
+    elif change == "swapped":
+        block.shared_expert.down_proj.__class__ = fusion._lane_module_class(nn.QuantizedLinear)
+        block.shared_expert.down_proj._unsloth_lane_qmm = False
     mx.eval(block.parameters())
     expected = block(x)
     run = fusion._RoutedExperts._run

@@ -10,6 +10,7 @@
 # see danielhanchen/unsloth-staging-2).
 
 import contextlib
+import itertools
 import json
 from types import SimpleNamespace
 
@@ -1819,6 +1820,115 @@ def test_a_dflash2_drafter_convolves_and_selects_its_drafts_bit_for_bit_in_fewer
     assert conv.prepare(hidden)[0] == "native" and selector.select(hidden, logits, anchors, greedy) == "native"
 
 
+@pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (8, mx.bfloat16), (4, mx.float16), (8, mx.float16)])
+def test_sparse_draft_head_refines_each_shortlisted_row(monkeypatch, bits, dtype):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    readers, lane_qmm = [], matmul.lane_qmm
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: readers.append(kwargs["reader"]) or lane_qmm(*args, **kwargs))
+    for group_size, N in itertools.product((64, 128), (8200, 8224, 16416)):
+        K = 256
+        head = nn.QuantizedLinear(K, N, bias = False, group_size = group_size, bits = bits).eval()
+        head.set_dtype(dtype)
+        weight = mx.dequantize(head.weight, head.scales.astype(mx.float32), head.biases.astype(mx.float32), group_size = group_size, bits = bits)
+        shape = inference._sparse_head_shape(head)
+        hidden = mx.random.normal((2, 3, K), key = mx.random.key(17)).astype(dtype)
+        for sign in (-1, 1):
+            changed = mx.concatenate([hidden[:1], hidden[1:] * sign], axis = 0)
+            ids, values = inference._sparse_head_candidates(head, changed, shape)
+            flat = changed.reshape(-1, K)
+            expected = mx.sum(flat[:, None].astype(mx.float32) * weight[ids].astype(mx.float32), axis = -1)
+            magnitude = mx.sum(mx.abs(flat[:, None].astype(mx.float32) * weight[ids].astype(mx.float32)), axis = -1)
+            assert values.dtype == dtype and mx.all(ids < N)
+            assert mx.all(mx.abs(values.astype(mx.float32) - expected) <= mx.finfo(dtype).eps * mx.abs(expected) + 2e-5 * magnitude)
+            reversed_values = matmul._lane_indexed(flat[::-1], head.weight, head.scales, head.biases, ids[::-1, ::-1], group_size, bits)
+            assert mx.array_equal(reversed_values.view(mx.uint16), values[::-1, ::-1].view(mx.uint16))
+        changed = mx.concatenate([hidden[:1], mx.concatenate([hidden[1:, :, :K // 2], -hidden[1:, :, K // 2:]], axis = -1)])
+        before_ids, before_values = inference._sparse_head_candidates(head, hidden, shape)
+        after_ids, after_values = inference._sparse_head_candidates(head, changed, shape)
+        assert mx.array_equal(before_ids, after_ids) and mx.array_equal(before_values[:3], after_values[:3])
+        assert not mx.array_equal(before_values[3:], after_values[3:])
+    assert set(readers) == {matmul.lane_shortlist_reader(6, bits)}   # chosen by shape
+    assert inference._sparse_head_candidates(head, hidden[:, :1], shape) and readers[-1] == matmul.lane_shortlist_reader(2, bits)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_radix_shortlist_keeps_the_top_columns_and_the_lowest_tied_ones(dtype):
+    from unsloth_zoo.mlx import matmul
+    for N in (520, 8192, 8200, 16400, 70000):
+        base = mx.random.normal((7, N), key = mx.random.key(N)).astype(dtype)
+        signed_zeros = mx.where(mx.arange(N)[None] % 2 == 0, mx.array(0.0, dtype = dtype), mx.array(-0.0, dtype = dtype))
+        rows = [base, mx.round(base * 2) / 2, mx.zeros_like(base), mx.where(mx.arange(N)[None] % 11 == 0, -float("inf"), base),
+                mx.broadcast_to(mx.where(mx.arange(N)[None] < 100, mx.array(1.0, dtype = dtype), signed_zeros), base.shape),
+                mx.where(mx.arange(N)[None] % 5 == 0, mx.array(float("nan"), dtype = dtype), base),
+                mx.where(mx.arange(N)[None] % 7 == 0, mx.array(float("nan"), dtype = dtype),
+                         mx.where(mx.arange(N)[None] % 3 == 0, -float("inf"), base)),
+                mx.where(mx.arange(N)[None] % 10 == 0, base, mx.array(float("nan"), dtype = dtype))]
+        for values in rows:
+            got = matmul.radix_shortlist(values)
+            by_value = mx.argsort(-mx.where(mx.isnan(values), -float("inf"), values).astype(mx.float32), axis = -1)
+            nan_last = mx.argsort(mx.take_along_axis(mx.isnan(values), by_value, axis = -1).astype(mx.int32), axis = -1)
+            order = mx.take_along_axis(by_value, nan_last, axis = -1)[:, :512]
+            assert got.dtype == mx.uint32 and got.shape == (7, 512)
+            assert mx.array_equal(got, mx.sort(order, axis = -1).astype(mx.uint32))
+
+
+def test_sparse_draft_selection_preserves_canonical_ties_and_call_ownership():
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector
+    from unsloth_zoo.mlx import inference
+    selector = CandidateSelector(SimpleNamespace(vocab_size = 1024, hidden_size = 16, selector_rank = 8, selector_top_k = 8))
+    selector.set_dtype(mx.bfloat16)
+    hidden = mx.random.normal((2, 3, 16), key = mx.random.key(11)).astype(mx.bfloat16)
+    ids = (mx.arange(512)[None] + mx.arange(6)[:, None] * 71) % 1024
+    values = (mx.arange(512)[None] % 7 + mx.arange(6)[:, None] % 3).astype(mx.bfloat16)
+    anchors, greedy = mx.array([3, 7]), lambda logits: mx.argmax(logits, axis = -1)
+    def dense(candidate_ids, scores):
+        logits = mx.put_along_axis(mx.full((6, 1024), -float("inf"), mx.bfloat16), candidate_ids, scores * 1.25, axis = -1)
+        return CandidateSelector.select(selector, hidden, logits.reshape(2, 3, 1024), anchors, greedy)
+    for k in (1, 8, 512):
+        selector.top_k = k
+        first = inference._sparse_candidate_walk(selector, hidden, anchors, ids, values, 1.25)
+        second = inference._sparse_candidate_walk(selector, hidden, anchors, (ids + 17) % 1024, -values, 1.25)
+        reverse = inference._sparse_candidate_walk(selector, hidden, anchors, ids[:, ::-1], values[:, ::-1], 1.25)
+        assert mx.array_equal(first, dense(ids, values)) and mx.array_equal(reverse, first)
+        order = mx.argsort(ids, axis = -1)
+        ascending = lambda: inference._sparse_candidate_walk(selector, hidden, anchors, mx.take_along_axis(ids, order, axis = -1),
+                                                             mx.take_along_axis(values, order, axis = -1), 1.25, ascending = True)
+        assert mx.array_equal(ascending(), first)
+        assert mx.array_equal(second, dense((ids + 17) % 1024, -values))
+
+
+def test_a_quantized_drafter_projects_on_the_lane_kernel_unless_switched_off(qwen, monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import generate, inference, matmul, speculative
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, ids), rows, kernel = qwen, [], matmul.lane_qmm
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: rows.append(len(args[0])) or kernel(*args, **kwargs))
+    for switch in ("0", None):
+        monkeypatch.setenv("UNSLOTH_MLX_LANE_QMM", switch) if switch else monkeypatch.delenv("UNSLOTH_MLX_LANE_QMM", raising = False)
+        rows.clear()
+        companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
+        companion.set_dtype(mx.bfloat16)   # as released drafters are
+        nn.quantize(companion, group_size = 64, bits = 4, class_predicate = lambda _, layer: (
+            isinstance(layer, nn.Linear) and layer.weight.shape[-1] % 64 == 0))
+        drafter = speculative._built(speculative.ContextDrafter, companion, model.language_model)
+        quantized = [m for _, m in drafter.model.named_modules() if isinstance(m, nn.QuantizedLinear)]
+        out, drafted, _ = _run(model, ids[:1], 32, _script(("draft", 3), ("draft", 5)), generate.SamplingParams(), drafter = drafter)
+        # Drafts only propose: the output is the target's own whichever kernel drafted them.
+        assert out == [_solo(model, ids[0], 32, generate.SamplingParams())] and all(n for n, _ in drafted.values())
+        on = [m for m in quantized if m.__dict__.get("_unsloth_lane_qmm")]
+        assert (on, rows) == ([], []) if switch else (on == quantized and type(on[0]).__name__.startswith("_Lane") and rows)
+        (head := nn.QuantizedLinear(64, 64, bias = False)).eval().set_dtype(mx.bfloat16)
+        drafter.model.lm_head = head
+        bound = [inference.lane_drafter_head(drafter.model, head) for _ in range(2)]
+        assert (bound, type(drafter.model.lm_head).__name__ != "QuantizedLinear", drafter.model.lm_head.weight is head.weight,
+                type(head)) == ([not switch, False], not switch, True, nn.QuantizedLinear)
+    # The projection returns the kernel's rows, not a native call beside it.
+    x = mx.random.normal((1, 3, on[0].weight.shape[1] * 32 // on[0].bits)).astype(mx.bfloat16)
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: kernel(*args, **kwargs) * 2)
+    assert mx.array_equal(on[0](x).reshape(3, -1), kernel(x.reshape(3, -1), on[0].weight, on[0].scales, on[0].biases, on[0].group_size, on[0].bits) * 2)
+    assert not any(k.startswith("_unsloth_lane") for _, m in model.named_modules() for k in m.__dict__)
 
 
 @pytest.mark.parametrize("repo", ["z-lab/Qwen3.5-4B-DFlash", "incoai/Qwen3.8-27B-DFlash2", "RadixArk/Qwen3.8-27B-DSpark"])
@@ -1850,3 +1960,20 @@ def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_thr
             assert pending == sequence[fed] and (context - reference[fed - len(context) : fed]).abs().mean().item() < 0.5
             assert mx.array_equal(got, drafter.model.draft_block(pending, context[None], fresh, got.shape[-1] + 1, lambda logits: mx.argmax(logits, axis = -1)))
     assert _probe_matches_a_started_row(model, speculative.ContextDrafter(drafter.model, model.language_model, max_lag = 8), ids[0][:40], lambda started: started[0].cache)
+
+
+def test_draft_projections_keep_their_arrays_and_read_as_their_targets_do(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    model = nn.Module()
+    model.layers = [nn.QuantizedLinear(1024, n, bias = False, bits = 4, group_size = 64) for n in (128, 16384)]
+    model.eval().set_dtype(mx.bfloat16)
+    hidden = mx.random.normal((17, 1024), key = mx.random.key(31)).astype(mx.bfloat16)
+    arrays = [(layer.weight, layer.scales, layer.biases) for layer in model.layers]
+    expected = [[matmul.lane_qmm(hidden[:rows], *weights, 64, 4, reader = "slices") for rows in (1, 7, 17)] for weights in arrays]
+    mx.eval(expected)
+    assert inference.lane_drafter_projections(model) == 2
+    for layer, weights, reference in zip(model.layers, arrays, expected):
+        assert all(layer[name] is a for name, a in zip(("weight", "scales", "biases"), weights))
+        for rows, value in zip((1, 7, 17), reference):
+            assert mx.array_equal(layer(hidden[:rows]).view(mx.uint16), value.view(mx.uint16))
