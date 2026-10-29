@@ -3852,7 +3852,6 @@ pass
 
 def _read_export_base_config(model_name, token, model, source_is_loaded_repo = False, commit = None):
     # Repo code re-runs only for the exact repo (and Hub commit) the load trusted; siblings were never approved.
-    # `commit` pins the plain read to the commit the shards come from (a cache hit, no request).
     from transformers import AutoConfig
     try:
         pinned = {"revision": commit} if commit else {}
@@ -5475,8 +5474,7 @@ def merge_and_overwrite_lora(
     pass
 
     # Default handle 16 bit merge and save/push
-    # The commit the shard listing was pinned to, so the config reads below describe the same
-    # files the merge fetches; it is also already in the Hub cache, so they cost no request.
+    # Config reads at the shard commit: same files as the weights, and answered from the Hub cache.
     _config_commit = None if is_local_path else _hub_revision
     # Before Step 1: an in-place export overwrites the source config.json without its quantization config.
     _ct_packed_format = _compressed_packed_format(model_name, token, _config_commit) if save_method == "merged_16bit" else None

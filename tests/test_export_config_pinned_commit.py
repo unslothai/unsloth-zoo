@@ -1,9 +1,4 @@
-"""The merge reads the base config at the Hub commit its shard listing was pinned to.
-
-A config read at `main` after the shards were pinned is a second network round trip per
-read (the pinned file is already in the Hub cache), and after a push mid-export it would
-describe a different commit than the weights.
-"""
+"""The merge reads the base config at the Hub commit its shards are pinned to."""
 import ast
 import inspect
 import json
