@@ -1534,6 +1534,9 @@ def _untokenize_round_trips(source: str) -> bool:
     tabs, form feeds, CR, NUL, `\\N{`, backslash-only lines, and on Pythons without the
     gh-125553 untokenize (3.12 before 3.12.10, 3.13 before 3.13.2) everything from 3.12 on
     and a space before a backslash continuation below 3.12."""
+    # Below 3.12 untokenize drops trailing spaces when the text has no final newline.
+    if not source.endswith("\n"):
+        return False
     for unsafe in ("\t", "\f", "\r", "\x00", "\\N{"):
         if unsafe in source:
             return False
@@ -1554,7 +1557,7 @@ def _rewrite_kwargs_param(source: str, func_name: str):
     # token below can match, so the result is the untokenize round trip of `source`:
     # skip it where that round trip is the identity (a class name such as a TRL trainer).
     if _untokenize_round_trips(source) and re.search(
-        r"def(?:[ \n]|\\\n|#[^\n]*)*" + re.escape(func_name) + r"(?!\w)", source
+        r"def(?:[ \n]|\\\n|#[^\n]*\n)*" + re.escape(func_name) + r"(?!\w)", source
     ) is None:
         return source, None
     try:

@@ -63,7 +63,26 @@ def test_class_source_does_not_tokenize(monkeypatch):
         ("def f(\n    a,\n    kwargs,\n    **kwargs,\n):\n    '''doc'''\n    return a\n", "f"),
         ("def f(a, kwargs, **kwargs", "f"),
         ("\u00e9 = 1\ndef f\u0301(kwargs, **kwargs): pass\n", "f"),
+        # No final newline: untokenize below 3.12 drops the trailing spaces, so no fast path.
+        ("x = 1\n   ", "f"),
+        ('x = f"""{{\n#}}{y}"""  ', "f"),
     ],
 )
 def test_matches_full_round_trip(source, name):
     assert compiler._rewrite_kwargs_param(source, name) == _reference(source, name)
+
+
+def test_def_scan_is_linear_on_comment_runs():
+    # A comment branch that can stop at any "#" made the def scan backtrack exponentially.
+    import time
+
+    source = (
+        "def forward(self, hidden_states, **kwargs):\n"
+        "    # see the reference kernel at commit 9a8b7c6d5e4f3a2b1c0def\n"
+        "    " + "#" * 5000 + "\n"
+        "    return self.mlp(hidden_states, **kwargs)\n"
+    )
+    start = time.perf_counter()
+    result = compiler._rewrite_kwargs_param(source, "LlamaMLP")
+    assert time.perf_counter() - start < 1.0
+    assert result == _reference(source, "LlamaMLP")
