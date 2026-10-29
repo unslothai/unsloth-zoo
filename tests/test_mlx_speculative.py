@@ -483,3 +483,89 @@ def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_a
     engine._rows, engine._states = rows, lambda: []
     list(engine._plain(3, []))
     assert (1 in queued) == history_only
+
+
+def test_a_context_drafter_drafts_the_next_block_ahead_until_a_push_overtakes_it():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    sizes, drafter, row = [], object.__new__(ContextDrafter), ContextRow([])
+    drafter.max_lag, drafter.max_depth = 64, 3
+    # Each draft encodes its block's anchor and context length.
+    drafter._draft = lambda pending, context, cache, size, sampler, dtype: sizes.append(size) or mx.array([[100 * pending + 10 * context.shape[1] + i for i in range(size - 1)]])
+    drafter.push(row, [1, 2], mx.zeros((2, 4)))
+    drafter.prefetch([row, None])
+    assert row.ready and drafter.draft([], [row, None], 2, []).tolist() == [[220, 221], [0, 0]] and sizes == [4] and not row.ready
+    drafter.push(row, [3], mx.zeros((1, 4)))
+    drafter.prefetch([row])
+    drafter.push(row, [4], mx.zeros((1, 4)))
+    assert drafter.draft([], [row], 2, []).tolist() == [[410, 411]] and sizes == [4, 4, 3]
+
+
+def test_a_context_drafter_drafts_from_the_block_that_moves_a_long_backlog_into_its_cache():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    sizes, drafter, row = [], object.__new__(ContextDrafter), ContextRow([])
+    drafter.max_lag, drafter.max_depth = 64, 3
+    drafter._draft = lambda pending, context, cache, size, sampler, dtype: sizes.append(size) or mx.array([[100 * pending + 10 * context.shape[1] + i for i in range(size - 1)]])
+    drafter.push(row, [1], mx.zeros((63, 4)))
+    assert row.ready and row.prefetched is None and not sizes
+    # A prompt past the backlog drafts its first round at once, from the full block that moved it.
+    drafter.push(row, [5], mx.zeros((64, 4)))
+    assert row.ready and not row.features and sizes == [4]
+    assert drafter.draft([], [row], 3, []).tolist() == [[1770, 1771, 1772]] and sizes == [4]
+
+
+def test_a_context_drafter_serves_a_prefetched_block_of_the_requested_depth_unsliced():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    drafter = object.__new__(ContextDrafter)
+    drafter.max_lag, drafter.max_depth = 64, 3
+    drafter._draft = lambda pending, context, cache, size, sampler, dtype: mx.arange(size - 1)[None]
+    def ready():
+        row = ContextRow([])
+        drafter.push(row, [1, 2], mx.zeros((2, 4)))
+        drafter.prefetch([row])
+        return row
+    row = ready()
+    block = row.prefetched
+    assert drafter.draft([], [row], 3, []) is block
+    row = ready()
+    block = row.prefetched
+    served = drafter.draft([], [row], 2, [])
+    assert served is not block and served.tolist() == block[:, :2].tolist()
+    first, second = ready(), ready()
+    assert drafter.draft([], [first, second], 3, []).tolist() == [[0, 1, 2], [0, 1, 2]]
+
+
+def test_drafter_layers_submit_their_output_when_built_in_eval_mode(monkeypatch):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference
+
+    class Layer(nn.Module):
+        def __init__(self, mlp = True):
+            super().__init__()
+            self.self_attn = nn.Linear(4, 4)
+            if mlp:
+                self.mlp = nn.Linear(4, 4)
+
+        def __call__(self, x):
+            return self.mlp(self.self_attn(x)) if hasattr(self, "mlp") else self.self_attn(x)
+
+    model, submitted = nn.Module(), []
+    model.layers = [Layer(), Layer(mlp = False), Layer()]
+    model.eval()
+    monkeypatch.setattr(inference.mx, "async_eval", lambda *arrays: submitted.extend(arrays))
+    x = mx.ones((1, 4))
+    expected = [layer(x) for layer in model.layers]  # before reclassing
+    assert inference.submitted_drafter_layers(model) == 2 and type(model.layers[1]) is Layer
+    outputs = [layer(x) for layer in model.layers]
+    assert all(mx.array_equal(out, want).item() for out, want in zip(outputs, expected))
+    assert len(submitted) == 2 and submitted[0] is outputs[0] and submitted[1] is outputs[2]
+    # Training submits nothing.
+    model.layers[0].train()
+    model.layers[0](x)
+    assert len(submitted) == 2
+    # Inside a function transformation, where submitting is refused, the layer still returns its output.
+    monkeypatch.setattr(inference.mx, "async_eval", lambda *arrays: (_ for _ in ()).throw(ValueError("transform")))
+    assert mx.array_equal(model.layers[2](x), expected[2]).item()

@@ -1189,7 +1189,19 @@ class SpeculativeEngine:
                 drawn = []
                 for i, (row, length) in enumerate(zip(rows, lengths)):
                     drawn.append(row.draw(row.logprobs(logits[i, : length + 1], inputs[i, 1:]), row.emitted))
-            mx.eval([array for pair in drawn for array in pair if array is not None] + ([] if drafts is None else [drafts]))
+            ahead = []
+            if depth and getattr(self.drafter, "predraft_rows", 0):
+                with mx.stream(self._stream):
+                    for i, ((target, _), draft, length) in enumerate(zip(drawn, draft_rows, lengths)):
+                        if draft is not None:
+                            agreed = (inputs[i, 1 : length + 1] == target[:length].astype(inputs.dtype)).astype(mx.int32)
+                            ahead.append((i, mx.cumprod(agreed).sum()))
+                # Ahead of the blocks drafted from them, so the GPU goes from the verify to the next drafts.
+                mx.async_eval([array for pair in drawn for array in pair if array is not None] + [count for _, count in ahead])
+                with mx.stream(self._stream):
+                    ahead = [(i, count) for i, count in ahead if self.drafter.predraft(draft_rows[i], hidden[i], count, drawn[i][0][count])]
+            mx.eval([array for pair in drawn for array in pair if array is not None] + ([] if drafts is None else [drafts])
+                    + [count for _, count in ahead])
             targets = [target.tolist() for target, _ in drawn]
             scores = [None if score is None else score.tolist() for _, score in drawn]
             if depth:
@@ -1204,6 +1216,26 @@ class SpeculativeEngine:
                 while count < len(proposal) and proposal[count] == target[count]:
                     count += 1
                 accepted.append(count)
+            for i, count in ahead:
+                if count.item() != accepted[i]:
+                    self.drafter.discard(draft_rows[i])
+            kept = [0] * len(rows)
+            if depth:
+                accepted_drafts = [min(count, depth - 1) if spec.source == "draft" else 0 for spec, count in zip(plan.rows, accepted)]
+                kept = self.drafter.settle(self.draft_cache, draft_rows, depth - 1, accepted_drafts)
+            emitted = []
+            for i, (row, proposal, target, count) in enumerate(zip(rows, proposals, targets, accepted)):
+                row.draft_n += len(proposal)
+                row.draft_n_accepted += count
+                taken = row.take(proposal[:count] + [target[count]], scores[i])
+                if row.draft is not None and len(taken) > kept[i]:
+                    # A head that kept its accepted draft entries already holds those pairs; record the rest.
+                    self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
+                emitted.append(taken)
+            if hasattr(self.drafter, "prefetch"):
+                with mx.stream(self._stream):
+                    # The next round's drafts run on the GPU while the host commits this one; a copying row is likely to copy again.
+                    self.drafter.prefetch([None if row.finished else draft for row, draft in zip(rows, draft_rows)])
             try:
                 transaction.validate([count + 1 for count in accepted])
             except RuntimeError:
@@ -1223,22 +1255,9 @@ class SpeculativeEngine:
         except BaseException:
             transaction.abort()
             raise
-        kept = [0] * len(rows)
-        if depth:
-            accepted_drafts = [min(count, depth - 1) if spec.source == "draft" else 0 for spec, count in zip(plan.rows, accepted)]
-            kept = self.drafter.settle(self.draft_cache, draft_rows, depth - 1, accepted_drafts)
         # Left lazy, the commit makes the next decode copy whole cache buffers instead of writing in place. A
         # pending fold's replay is the exception: a settled fold reads its inputs instead, so it is left to its consumer.
         mx.async_eval([_committed_eval_state(entry) for entry in [*self.cache, *(self.draft_cache or [])]])
-        emitted = []
-        for i, (row, proposal, target, count) in enumerate(zip(rows, proposals, targets, accepted)):
-            row.draft_n += len(proposal)
-            row.draft_n_accepted += count
-            taken = row.take(proposal[:count] + [target[count]], scores[i])
-            if row.draft is not None and len(taken) > kept[i]:
-                # A head that kept its accepted draft entries already holds those pairs; record the rest.
-                self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
-            emitted.append(taken)
         self.controller.record_round(
             plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds,
             catch_up_seconds = catch_up_seconds, first_use = first_use_work() != work,
@@ -1827,10 +1846,12 @@ class ContextRow:
         self.cache = cache
         self.pending = 0
         self.features: list[mx.array] = []
+        self.prefetched: mx.array | None = None
+        self.predrafted: list | None = None
 
     @property
     def ready(self) -> bool:
-        return bool(self.features)
+        return bool(self.features) or self.prefetched is not None
 
 
 class ContextDrafter:
@@ -1851,6 +1872,9 @@ class ContextDrafter:
         self.max_depth = int(model.config.block_size) - 1
         # The greedy shortcut would bypass an overridden draft_block (DFlash2's selector, DSpark's Markov head).
         self._draft = model.draft_block_greedy if type(model).draft_block is DFlashDraftModel.draft_block else model.draft_block
+        from .inference import predraft_attention
+
+        self.predraft_rows = predraft_attention(model)
 
     @property
     def config(self):
@@ -1872,11 +1896,18 @@ class ContextDrafter:
         return row, []
 
     def push(self, row: ContextRow, tokens: Sequence[int], hidden: mx.array) -> None:
-        row.pending = int(tokens[-1])
+        if row.predrafted is not None:
+            # The predrafted block read exactly these tokens' rows; they join the context it drafted from.
+            for entry in row.predrafted:
+                entry.append(len(tokens))
+            row.pending, row.predrafted = int(tokens[-1]), None
+            return
+        # A prefetched block drafted from a context these tokens extend; its own context stays cached.
+        row.pending, row.prefetched = int(tokens[-1]), None
         row.features.append(hidden)
         if sum(len(chunk) for chunk in row.features) >= self.max_lag:
-            # A discarded one-token block moves the backlog into the context cache.
-            mx.async_eval(self._block(row, 1))
+            # The block moving the backlog into the context cache is the next one, so a long prompt drafts at once.
+            self.prefetch([row])
 
     def catch_up(self, cache: list, rows: Sequence[ContextRow | None]) -> int:
         return 0
@@ -1887,15 +1918,52 @@ class ContextDrafter:
         self._block(row, 1)
         return row.cache
 
+    def _drafted(self, *args) -> mx.array:
+        return self._draft(*args, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
+
     def _block(self, row: ContextRow, depth: int) -> mx.array:
         context, row.features = mx.concatenate(row.features)[None], []
-        return self._draft(row.pending, context, row.cache, depth + 1, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
+        return self._drafted(row.pending, context, row.cache, depth + 1)
+
+    def prefetch(self, rows: Sequence[ContextRow | None]) -> None:
+        """Draft each ready row's next block now; ``draft`` reads it unless a ``push`` comes first."""
+        for row in rows:
+            if row is not None and row.features:
+                row.prefetched = self._block(row, self.max_depth).reshape(1, self.max_depth)
+                mx.async_eval(row.prefetched)
+
+    def predraft(self, row: ContextRow, hidden: mx.array, accepted: mx.array, anchor: mx.array) -> bool:
+        """Prepare ``row``'s next block before its round's acceptance reaches the host: ``hidden`` holds
+        the round's verified rows, of which the round takes the first ``accepted + 1`` (a device scalar), and ``anchor``
+        is the token after them. The next ``push`` appends those rows' context; ``discard`` drops the block instead."""
+        if row.features or row.prefetched is not None or not 0 < hidden.shape[0] <= self.predraft_rows:
+            return False
+        from .inference import PredraftCache
+
+        valid = mx.arange(hidden.shape[0]) <= accepted
+        row.predrafted = [PredraftCache(entry, valid, accepted + 1 + entry.offset) for entry in row.cache]
+        row.prefetched = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, self.max_depth + 1).reshape(1, self.max_depth)
+        mx.async_eval(row.prefetched)
+        return True
+
+    def discard(self, row: ContextRow) -> None:
+        # The next push then records its rows as features, dropping the block.
+        row.predrafted = None
 
     def draft(self, cache: list, rows: Sequence[ContextRow | None], depth: int, target: list) -> mx.array:
-        return mx.concatenate([
-            self._block(row, depth).reshape(1, depth) if row is not None and row.ready else mx.zeros((1, depth), mx.int32)
-            for row in rows
-        ])
+        """Each row's next ``depth`` drafts."""
+        blocks = []
+        for row in rows:
+            if row is None or not row.ready:
+                blocks.append(mx.zeros((1, depth), mx.int32))
+            elif row.prefetched is not None:
+                block = row.prefetched
+                # A slice of a finished block is a kernel the host would wait on, so a block of exactly this depth is used as is.
+                blocks.append(block if block.shape[-1] == depth else block[:, :depth])
+                row.prefetched = None
+            else:
+                blocks.append(self._block(row, depth).reshape(1, depth))
+        return blocks[0] if len(blocks) == 1 else mx.concatenate(blocks)
 
     def settle(self, cache: list, rows: Sequence[ContextRow | None], appended: int, keep: Sequence[int]) -> list[int]:
         return [0] * len(rows)
@@ -1919,9 +1987,12 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
     # Counted before the wrapper binds the target (a bound DFlash drafter holds its embedding and head); ``lazy``
     # factories evaluate nothing mlx-vlm's loader leaves lazy (it converts ModelOpt/compressed-tensors exports eagerly).
     weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
-    from .inference import fused_drafter_ops, lane_drafter_head, lane_drafter_projections, sparse_drafter
+    from .inference import (fused_drafter_layers, fused_drafter_ops, lane_drafter_head, lane_drafter_projections, sparse_drafter,
+                            submitted_drafter_layers)
 
     fused_drafter_ops(model)
+    fused_drafter_layers(model)
+    submitted_drafter_layers(model)
     # Before the wrapper binds the target, whose own projections its generation scopes manage.
     lane_drafter_projections(model.eval())
     drafter = wrapper(model, target, **kwargs)
