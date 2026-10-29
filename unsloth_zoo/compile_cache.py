@@ -769,4 +769,3 @@ def megacache_status():
         "key": _STATE["loaded_key"],
         "root": _cache_root(),
     }
-pass

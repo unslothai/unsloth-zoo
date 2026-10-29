@@ -4368,8 +4368,6 @@ def test_apply_fused_lm_head():
         for f in forwards
     ]
     for name, forward in forwards:
-        # print("=" * 30)
-        # print(name)
         forward, _ = apply_fused_lm_head(forward, name)
         if "NOT_RETURN_LOGITS" not in forward:
             print(f"Failed patching fast CE forward for {name}")
@@ -4377,10 +4375,6 @@ def test_apply_fused_lm_head():
             print(
                 f"Failed patching fast CE forward for {name} since `loss = outputs.loss` exists"
             )
-        # return apply_fused_lm_head(forward, name)
-        # print(apply_fused_lm_head(forward, name))
-        # print("=" * 30)
-    pass
 
 
 pass
@@ -6194,7 +6188,6 @@ def _patch_torch_dtype_modules(
             _install_patched_forward(
                 model_location, module, forward, combined_module
             )
-            pass
         pass
     pass
 
@@ -7718,12 +7711,10 @@ def unsloth_compile_transformers(
                         pass
                 pass
             pass
-        pass
     pass
     return
 
 
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

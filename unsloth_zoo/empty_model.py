@@ -965,7 +965,6 @@ def set_additional_modules(new_model, quant_state_dict, config):
                 f"Unsloth: could not set `{key}` on the model - tried {', '.join(errors)}"
             )
 
-    pass
 pass
 
 _FLOAT8_DTYPES = tuple(
@@ -2548,4 +2547,3 @@ def _extract_muse_glimmer_vision(vllm_internals, state_dict, quant_state_dict, g
         store(adapter.c_fc, "model.vision_adapter.fc1")
         store(adapter.c_proj, "model.vision_adapter.fc2")
     store(getattr(vllm_internals, "vision_projection", None), "model.vision_projection")
-pass

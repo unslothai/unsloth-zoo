@@ -284,7 +284,6 @@ def PatchRLStatistics(algorithm = "grpo_trainer", other_metrics = []):
         return
     pass
     _PatchRLStatistics(all_metrics[algorithm] + other_metrics, algorithm)
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

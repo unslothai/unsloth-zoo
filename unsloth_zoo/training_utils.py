@@ -847,10 +847,8 @@ def unsloth_train(trainer):
     print("Unsloth: Finished training!")
     end_time = time.time()
 
-    # Return stats
     trainer_stats = Trainer_Stats(metrics = {"train_runtime" : end_time - start_time})
     return trainer_stats
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

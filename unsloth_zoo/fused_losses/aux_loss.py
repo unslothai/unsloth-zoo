@@ -202,4 +202,3 @@ def rewrite_aux_loss_ga(source):
     except SyntaxError:
         return source
     return out
-pass
