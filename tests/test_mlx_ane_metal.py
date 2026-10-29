@@ -418,7 +418,20 @@ def test_the_split_runs_only_on_the_gpu_route_it_was_tuned_on(monkeypatch, caplo
         "_unsloth_dense_qmm_scopes") and module.weight.shape[0] == HIDDEN else "stock")   # down only
     assert runs(inference.inference_scopes(model)) == runs(inference.inference_scopes(model)) == 0
     assert runs(ane.ane_prefill_mlp(model)) == 2   # standalone, the projections run stock: slower is fine
-    assert sum("stock/stock/int8, faster than the dense/dense/dense" in r.getMessage() for r in caplog.records) == 1
+    assert sum("stock/stock/int8 and the split was tuned on dense" in r.getMessage() for r in caplog.records) == 1
+    routed = lambda: [bool(p.__dict__.get("_unsloth_dense_qmm_scopes")) for m in model.layers for p in m.__dict__[ane._STATE].rest]
+    scoped = lambda route: lambda module, rows: route if module.__dict__.get("_unsloth_dense_qmm_scopes") else "stock"
+    with inference.inference_scopes(model):   # tuned without int8, the remainders stay stock
+        assert not any(routed())
+    ane.release_ane_prefill(model)
+    monkeypatch.setattr(inference, "prefill_route", scoped("int8"))
+    assert ane.prepare_ane_prefill(model, tile = TILE, share = 0.5).layers == 2   # tuned with int8
+    with inference.inference_scopes(model):   # the remainders take the generation's routes
+        assert all(routed()) and len(routed()) == 6
+    assert runs(inference.inference_scopes(model)) == 2
+    monkeypatch.setattr(inference, "prefill_route", scoped("dense"))   # Int8 Prefill off: slower, yet not what it was tuned on
+    assert runs(inference.inference_scopes(model)) == runs(inference.inference_scopes(model)) == 0
+    assert sum("dense/dense/dense and the split was tuned on int8" in r.getMessage() for r in caplog.records) == 1
     ane.release_ane_prefill(model)
 
 

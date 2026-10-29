@@ -479,6 +479,7 @@ _PRESSURE_WARN, _PRESSURE_CRITICAL = 2, 4   # kern.memorystatus_vm_pressure_leve
 _WIRED_FACTOR = 3       # the Neural Engine wires 1.85x (M3 Max) to 2.7x (M5 Pro) a program's int8 weights in prefill
 _BANK_BYTES = 2 << 30   # int8 weights per program; 1-4 GB banks load on M3 Max, and 2 GB ones on M5 Pro
 _STATE = "_unsloth_ane_split"
+_CACHE_VERSION = 2      # bump when what calibration times changes, so older entries are not reused
 _CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "unsloth", "mlx_ane_prefill.json")
 _LOCK = threading.RLock()
 _CLASSES = {}
@@ -695,7 +696,7 @@ def _remainder(p, rows = None, columns = None):
     piece = nn.QuantizedLinear(p.group_size, 1, bias = False, group_size = p.group_size, bits = p.bits)
     piece.weight, piece.scales, piece.biases = weight, scales, biases
     piece.freeze()
-    return piece
+    return piece.eval()   # the prefill routes skip training modules
 
 
 class _Surfaces:
@@ -785,12 +786,11 @@ def _split_call(base):
         rows = x.size // x.shape[-1]
         if split is None or split.failed or _ABANDONED or self.training or rows < split.pad_from:
             return base.__call__(self, x)
-        if _faster_route(route := _route(self, split.tile), split.route):
+        if _rerouted(route := _route(self, split.tile), split.route):
             if not split.group.rerouted:
                 split.group.rerouted = True
-                logger.warning("Neural Engine prefill: the GPU route is %s, faster than the %s the split was tuned "
-                               "on; the native MLP runs until release_ane_prefill and prepare_ane_prefill", route,
-                               split.route)
+                logger.warning("Neural Engine prefill: the GPU route is %s and the split was tuned on %s; the native "
+                               "MLP runs until release_ane_prefill and prepare_ane_prefill", route, split.route)
             return base.__call__(self, x)
         if split.group is not None:
             _relieve(split.group)
@@ -831,7 +831,7 @@ def _machine_key(mlp, tile, route):
         chip = platform.machine()
     build = platform.mac_ver()[0]
     return (f"{chip}|macOS {build}|mlx {mx.__version__}|{down.weight.shape[0]}x{gate.weight.shape[0]}|"
-            f"q{gate.bits}/{up.bits}/{down.bits}g{gate.group_size}|{gate.scales.dtype}|tile {tile}|{route}")
+            f"q{gate.bits}/{up.bits}/{down.bits}g{gate.group_size}|{gate.scales.dtype}|tile {tile}|{route}|v{_CACHE_VERSION}")
 
 
 def _load_cache():
@@ -874,11 +874,17 @@ def _route(mlp, tile):
     return "/".join(prefill_route(p, tile) for p in _projections(mlp))
 
 
-def _faster_route(now, tuned):
-    """Whether a projection now takes a faster route than the one the share was tuned on; a slower one (a retired
-    dense shape, or no route scope held) only lowers the GPU time the split beats."""
+def _rerouted(now, tuned):
+    """Whether the share no longer fits the GPU routes: a projection now takes a faster route than the one it was tuned
+    on, or Int8 Prefill is off for a share tuned against int8 remainders. A slower route otherwise (a retired dense
+    shape, or no route scope held) only lowers the GPU time the split beats."""
     rank = {"stock": 0, "tiled": 1, "dense": 1, "int8": 2}
-    return any(rank[a] > rank[b] for a, b in zip(now.split("/"), tuned.split("/")))
+    return (any(rank[a] > rank[b] for a, b in zip(now.split("/"), tuned.split("/")))
+            or _int8(tuned) and not _int8(now))
+
+
+def _int8(route):
+    return "int8" in route.split("/")
 
 
 @contextmanager
@@ -886,6 +892,20 @@ def _generation_routes(model):
     from .inference import dense_prefill_linear, nax_quantized_linear
 
     with nax_quantized_linear(model), dense_prefill_linear(model):
+        yield
+
+
+@contextmanager
+def _remainder_routes(model, splits):
+    """With Int8 Prefill on, give the splits' GPU remainders the generation's prefill routes: they are outside the
+    parameter tree, so its scopes never reach them. Off, they stay stock, which measured faster beside dense."""
+    modules = tuple(("", p) for split in splits if _int8(split.route) for p in split.rest)
+    if not modules:
+        yield
+        return
+    from .inference import dense_prefill_linear, nax_quantized_linear
+
+    with nax_quantized_linear(model, _modules = modules), dense_prefill_linear(model, _modules = modules):
         yield
 
 
@@ -905,7 +925,9 @@ def _calibrate(model, mlp, tile, surfaces):
     per_share = _median_ms(neural_engine) / (probe.k / channels)
     k = _aligned(channels, gpu / (gpu + per_share))
     split = probe if k == probe.k else _Split(mlp, k, tile, surfaces)
-    split_ms = _median_ms(lambda: split(x))
+    split.route = _route(mlp, tile)
+    with _remainder_routes(model, [split]):
+        split_ms = _median_ms(lambda: split(x))
     return k / channels, gpu, split_ms, split
 
 
@@ -1036,7 +1058,9 @@ def ane_prefill_mlp(model, *, _modules = None):
                     module.__class__ = _split_class(type(module))
                     module._unsloth_ane_scopes = 1
                 changed.append(module)
-        yield model
+            splits = [m.__dict__[_STATE] for m in changed]
+        with _remainder_routes(model, splits):
+            yield model
     finally:
         with _LOCK:
             for module in changed:
