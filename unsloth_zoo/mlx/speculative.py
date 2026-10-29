@@ -886,9 +886,12 @@ def probe_drafter(target, drafter, length: int) -> list:
     starts from; the drafter evaluates nothing, and the target forward is as lazy as the target's own."""
     from mlx_vlm.models.cache import make_prompt_cache
 
+    from .inference import native_lane_projections
+
     lm = getattr(target, "language_model", target)
-    out = lm(mx.zeros((1, length), mx.int32), cache = make_prompt_cache(lm), **_capture(drafter))
-    return drafter.probe(_features(drafter, out))
+    with native_lane_projections():
+        out = lm(mx.zeros((1, length), mx.int32), cache = make_prompt_cache(lm), **_capture(drafter))
+        return drafter.probe(_features(drafter, out))
 
 
 def _language_call(family: str):
@@ -1916,10 +1919,16 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
     # Counted before the wrapper binds the target (a bound DFlash drafter holds its embedding and head); ``lazy``
     # factories evaluate nothing mlx-vlm's loader leaves lazy (it converts ModelOpt/compressed-tensors exports eagerly).
     weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
-    from .inference import fused_drafter_ops
+    from .inference import fused_drafter_ops, lane_drafter_head, lane_drafter_projections, sparse_drafter
 
     fused_drafter_ops(model)
+    # Before the wrapper binds the target, whose own projections its generation scopes manage.
+    lane_drafter_projections(model.eval())
     drafter = wrapper(model, target, **kwargs)
+    language = getattr(target, "language_model", target)
+    lane_drafter_head(model, getattr(target, "lm_head", None) or getattr(language, "lm_head", None))
+    if isinstance(drafter, ContextDrafter):
+        drafter._draft = sparse_drafter(model, target, drafter._draft)
     drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
     target._unsloth_speculates = True  # so `warm_inference` runs the verify path's first-use checks at load
     return drafter
