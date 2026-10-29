@@ -25,6 +25,7 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_LIVE_PEAK", 0, raising = False)
     monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: None, raising = False)
     monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: None, raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
@@ -558,3 +559,16 @@ def test_pending_cached_block_at_the_cap_still_flushes(monkeypatch, gc_module):
     gc_module._reserve_pinned(4096)
     assert flushes                                       # one more block would pass the cap
     assert gc_module.GC_PINNED_BYTES <= 6000
+
+
+def test_pending_blocks_are_kept_for_one_extra_generation_only(monkeypatch, gc_module):
+    # Far under the cap, but a CPU running several steps ahead must not pin one more block per
+    # step in flight: past two live sets (one live, one queued) the old flush runs again.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    assert gc_module._reserve_pinned(4096)              # second generation: kept, no flush
+    assert flushes == [] and held["bytes"] == 8192
+    assert gc_module._PINNED_CACHED == {4096: 1} and gc_module.GC_PINNED_BYTES == 8192
+    gc_module._release_pinned(4096)                     # its copy is queued too
+    gc_module._reserve_pinned(4096)                     # a third generation would pass 2 x 4096
+    assert flushes
+    assert gc_module.GC_PINNED_BYTES <= 8192

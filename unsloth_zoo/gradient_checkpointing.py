@@ -210,6 +210,11 @@ _PINNED_CACHED = {}         # rounded block bytes -> count released but still ca
 _PINNED_LIVE = {}           # requested bytes -> blocks charged at allocation, still live
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
 _PINNED_RELEASED = 0        # settings mode: blocks released since the last flush (may wait on events)
+# Cap mode keeps a cached block whose last copy is still in flight and pins one more, but only
+# while the pinned total stays within this many times the most bytes we ever had live at once:
+# one extra generation of blocks behind the in-flight copies, not one per step the CPU runs ahead.
+_PENDING_KEEP_FACTOR = 2
+_PINNED_LIVE_PEAK = 0       # most pinned bytes in use at once (charged and not cached)
 
 
 # torch 2.13+ (c10/core/AllocatorConfig.h): above the round threshold / max cached size blocks are exact;
@@ -397,6 +402,13 @@ def _reset_pinned_cap():
     _WARNED_ABOUT_PINNED_CAP = False
 
 
+def _note_pinned_live():
+    """Track the high water mark of our live pinned bytes (cap mode only)."""
+    global _PINNED_LIVE_PEAK
+    live = GC_PINNED_BYTES - sum(k * v for k, v in _PINNED_CACHED.items())
+    if live > _PINNED_LIVE_PEAK: _PINNED_LIVE_PEAK = live
+
+
 def _reserve_pinned_unlocked(nbytes):
     """Count `nbytes` against the pinned cap; False means allocate pageable instead."""
     global GC_PINNED_BYTES, GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _HOST_HELD_BASELINE
@@ -413,16 +425,19 @@ def _reserve_pinned_unlocked(nbytes):
             _charge_live(nbytes, block)
             return True  # the allocator hands back the cached block, already charged
         if GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0:
+            _note_pinned_live()
             held = _host_allocator_held_bytes()
             if _host_cache_reuses_block(block):
                 _charge_live(nbytes, block)
                 return True
             # The probe pinned a new block, now free in the allocator. Usually our cached block is
             # only still queued behind the last backward's copies: keep it ours and charge the new
-            # one when the allocator's real total stays under the cap, instead of flushing every
-            # cached block (a device sync) and pinning them all again. Otherwise flush as before.
+            # one, instead of flushing every cached block (a device sync) and pinning them all
+            # again, while the allocator's real total stays under both the cap and
+            # _PENDING_KEEP_FACTOR live sets. Otherwise flush as before.
             if held is not None and _HOST_HELD_BASELINE is not None and (
-                max(GC_PINNED_BYTES, held - _HOST_HELD_BASELINE) + block <= GC_PINNED_CAP
+                max(GC_PINNED_BYTES, held - _HOST_HELD_BASELINE) + block
+                <= min(GC_PINNED_CAP, _PENDING_KEEP_FACTOR * _PINNED_LIVE_PEAK)
             ):
                 _PINNED_CACHED[block] += 1
                 GC_PINNED_BYTES += block
@@ -459,6 +474,7 @@ def _reserve_pinned_unlocked(nbytes):
         return False
     GC_PINNED_BYTES += block
     _charge_live(nbytes, block)
+    if GC_PINNED_CAP >= 0: _note_pinned_live()
     return True
 
 
