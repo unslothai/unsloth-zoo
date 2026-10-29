@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_vllm() runs on every fast_inference load. The graph capture wrapper is installed once:
-a second load in the same process must not nest another wrapper, which repeated the post-capture
-garbage collection and the log lines once per earlier load."""
+"""patch_vllm() runs on every fast_inference load: its wrappers must not nest per load."""
 
 import gc
 import sys
@@ -95,3 +93,42 @@ def test_capture_replaced_after_patch_is_wrapped_again(monkeypatch):
     assert v1.capture_model is not replaced
     assert v1().capture_model() == "replaced"
     assert len(collects) == 1
+
+
+def test_repeated_sleep_mode_patch_wraps_generate_once(monkeypatch):
+    wakes = []
+
+    class _Engine:
+        def generate(self, *args, **kwargs):
+            return "generated"
+
+        def wake_up(self):
+            wakes.append(1)
+
+    engine_config = types.SimpleNamespace(
+        model_config = types.SimpleNamespace(enable_sleep_mode = True),
+    )
+    LLM = type("LLM", (_Engine,), {"llm_engine": types.SimpleNamespace(vllm_config = engine_config)})
+    AsyncLLMEngine = type("AsyncLLMEngine", (_Engine,), {"vllm_config": engine_config})
+    MemAllocator = type("CuMemAllocator", (), {})
+    def stub(*args, **kwargs): return None
+    monkeypatch.setitem(sys.modules, "vllm.device_allocator", types.ModuleType("vllm.device_allocator"))
+    monkeypatch.setitem(sys.modules, "vllm.device_allocator.cumem", types.SimpleNamespace(
+        CuMemAllocator = MemAllocator, AllocationData = object,
+        unmap_and_release = stub, create_and_map = stub, libcudart = None,
+    ))
+    monkeypatch.setitem(sys.modules, "vllm.utils", types.SimpleNamespace(is_pin_memory_available = stub))
+    monkeypatch.setattr(vllm_utils, "DEVICE_TYPE", "cuda")
+    monkeypatch.setattr(
+        vllm_utils, "vllm", types.SimpleNamespace(LLM = LLM, AsyncLLMEngine = AsyncLLMEngine), raising = False,
+    )
+
+    vllm_utils.patch_vllm_enable_sleep_mode()
+    installed = (LLM.generate, AsyncLLMEngine.generate)
+    for _ in range(3):
+        vllm_utils.patch_vllm_enable_sleep_mode()
+    assert (LLM.generate, AsyncLLMEngine.generate) == installed
+    for cls in (LLM, AsyncLLMEngine):
+        wakes.clear()
+        assert cls().generate() == "generated"
+        assert len(wakes) == 1
