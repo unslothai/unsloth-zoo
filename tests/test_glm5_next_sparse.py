@@ -420,3 +420,23 @@ def test_tiny_model_cached_greedy_decode_across_the_budget():
     for a, b in zip(out.logits, ref.logits):
         torch.testing.assert_close(a, b, atol = 1e-5, rtol = 1e-5)
     assert _stat("skip_full") > 0 and _stat("indexer_scored") > 0
+
+
+def test_static_cache_key_length_is_the_allocation_before_the_first_prefill():
+    # An uninitialized static cache still pools its whole allocation: predicting the prompt length
+    # instead let a short prompt take upstream's indexer while the flex mask read our layout.
+    g = _patched()
+    config = _text_config()
+    idx = _indexer(config)
+
+    class Layer:
+        indexer_keys = None
+        max_cache_len = 300
+
+    class Cache:
+        layers = [Layer()] * (idx.layer_idx + 1)
+
+    assert g._predicted_key_len(idx, 60, Cache()) == 300
+    Layer.max_cache_len = None
+    assert g._predicted_key_len(idx, 60, Cache()) == 60
+    assert g._predicted_key_len(idx, 60, None) == 60

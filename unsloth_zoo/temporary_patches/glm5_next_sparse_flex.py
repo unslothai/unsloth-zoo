@@ -88,13 +88,16 @@ def _predicted_key_len(indexer, q_len, past_key_values):
     if past_key_values is None:
         return q_len
     try:
-        cached = past_key_values.layers[indexer.layer_idx].indexer_keys
+        layer = past_key_values.layers[indexer.layer_idx]
     except Exception:
-        cached = None
+        return q_len
+    cached = getattr(layer, "indexer_keys", None)
+    # Static: the full allocation is pooled, also on the first prefill before the cache exists.
+    max_len = getattr(layer, "max_cache_len", None)
+    if isinstance(max_len, int) and max_len > 0:
+        return max(max_len, q_len)
     if cached is None or cached.dim() < 2:
         return q_len
-    if hasattr(past_key_values.layers[indexer.layer_idx], "max_cache_len"):
-        return cached.shape[1]  # static: the full allocation is pooled
     return cached.shape[1] + q_len
 
 
