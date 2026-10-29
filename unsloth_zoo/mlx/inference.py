@@ -4148,7 +4148,7 @@ def _nax_qmm_classes(route, *cache_key):
         routed = _nax_small_m_qmm(self, x, bindings)
         return nn.QuantizedEmbedding.as_linear(self, x) if routed is None else routed
 
-    _ONE_ROW_STOCK_CALLS.add(linear)   # the small-row routes start at two rows
+    _ONE_ROW_STOCK_CALLS.update((linear, as_linear))   # the small-row routes start at two rows
     return {
         base: type(f"_{route.tag}SmallM{base.__name__}", (base,),
                    {name: method, "_unsloth_nax_qmm_native": base, "_unsloth_nax_qmm_route": route,
@@ -4747,6 +4747,68 @@ def dense_prefill_linear(model, *, _modules = None):
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
                     module.__dict__.pop("_unsloth_tiled_qmm", None)
+
+
+@functools.cache
+def _singleton_quantized_class(base, method, original, *cache_key):
+    bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+    if bindings is None:
+        return None
+
+    def call(self, x):
+        native = getattr(base, method)
+        if (isinstance(x, mx.array) and x.ndim == 3 and x.shape[0] > 1 and x.shape[1] == 1 and not self.training
+                and native is original
+                and isinstance(self.get("weight"), mx.array) and self.weight.ndim == 2
+                and _bindings_intact(bindings)):
+            return mx.concatenate([native(self, x[row:row + 1]) for row in range(x.shape[0])], axis = 0)
+        return native(self, x)
+
+    _ONE_ROW_STOCK_CALLS.add(call)
+    return type(f"_Singleton{base.__name__}", (base,), {method: call, "_unsloth_singleton_native": base})
+
+
+@contextmanager
+def singleton_quantized_decode(model, *, _modules = None):
+    """Keep each request's one-row quantized arithmetic in a speculative call's batched decode and tied verify heads, which
+    its rows must match. A plain batch keeps stock's multi-row call."""
+    changed = []
+    try:
+        with _NAX_QMM_LOCK:
+            if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                seen = set()
+                for _, module in _fusion_modules(model, _modules):
+                    if id(module) in seen:
+                        continue
+                    seen.add(id(module))
+                    base = type(module)
+                    if "_unsloth_singleton_native" in vars(base):
+                        module._unsloth_singleton_scopes += 1
+                        changed.append(module)
+                        continue
+                    stock = (nn.QuantizedEmbedding if isinstance(module, nn.QuantizedEmbedding)
+                             else nn.QuantizedLinear if isinstance(module, nn.QuantizedLinear) else None)
+                    if stock is None or module.training:
+                        continue
+                    method = "as_linear" if stock is nn.QuantizedEmbedding else "__call__"
+                    original = getattr(base, method)
+                    if base is not stock and original not in _ONE_ROW_STOCK_CALLS:
+                        continue
+                    swapped = _singleton_quantized_class(base, method, original,
+                                                        nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
+                    if swapped is not None:
+                        module.__class__ = swapped
+                        module._unsloth_singleton_scopes = 1
+                        changed.append(module)
+        yield model
+    finally:
+        with _NAX_QMM_LOCK:
+            for module in reversed(changed):
+                module._unsloth_singleton_scopes -= 1
+                if not module._unsloth_singleton_scopes:
+                    module.__dict__.pop("_unsloth_singleton_scopes", None)
+                    if "_unsloth_singleton_native" in vars(type(module)):
+                        module.__class__ = type(module)._unsloth_singleton_native
 
 
 # The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
@@ -6958,6 +7020,7 @@ INFERENCE_SCOPES = [
     InferenceScope(fused_moe_routed_experts),
     InferenceScope(nax_quantized_linear, int8_prefill = True),
     InferenceScope(dense_prefill_linear),
+    InferenceScope(singleton_quantized_decode, speculative = True),
     InferenceScope(ane_prefill_mlp, ane_prefill = True),
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_qsa_attention),
