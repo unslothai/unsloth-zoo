@@ -30,6 +30,7 @@ __all__ = [
     "torch_config_is_per_thread",
 ]
 
+import sys
 from contextvars import ContextVar
 
 # ContextVars that cache the config hash / dict per thread (torch >= 2.13).
@@ -67,12 +68,19 @@ def _invalidate_caches(config_module):
             setattr(config_module, attr, ContextVar(f"{module_name}.{attr}", default = default))
 
 
-def _publish(config_module, name, value, force):
+def _publish(config_module, name, value, force, depth = 0):
     entry = _entry(config_module, name)
     if entry is None or not isinstance(getattr(entry, "user_override", None), ContextVar):
         return False
-    if getattr(entry, "alias", None) is not None:
-        return False  # aliases write a module attribute, shared by all threads
+    alias = getattr(entry, "alias", None)
+    if alias is not None:
+        # An alias writes its target: a plain module attribute (shared already) or another
+        # per-thread entry (e.g. dynamo cache_size_limit -> recompile_limit), published there.
+        module_name, _, target = alias.rpartition(".")
+        target_module = sys.modules.get(module_name)
+        if target_module is None or depth > 4:
+            return False
+        return _publish(target_module, target, value, force, depth + 1)
     if force:
         entry.env_value_force = value
     else:

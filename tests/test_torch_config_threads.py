@@ -243,3 +243,19 @@ def test_config_hash_matches_across_threads():
         pytest.skip("torch has no save_config_portable")
     assert _in_thread(inductor_config.save_config_portable) == main
     assert main["memory_planning"] is True
+
+
+@pytest.mark.parametrize(
+    "module, name",
+    [(dynamo_config, "cache_size_limit"), (getattr(torch.compiler, "config", None), "recompile_limit")],
+)
+def test_alias_publishes_its_target(module, name):
+    # cache_size_limit / torch.compiler.config.recompile_limit alias dynamo's per-thread recompile_limit.
+    entry = getattr(module, "_config", {}).get(name)
+    if entry is None or getattr(entry, "alias", None) is None:
+        pytest.skip(f"{name} is not an alias on this torch")
+    set_torch_config(module, name, 1033)
+    assert _in_thread(lambda: getattr(module, name)) == 1033
+    if torch_config_is_per_thread(dynamo_config):
+        set_torch_config(module, name, 1034, force = True)
+        assert _in_thread(lambda: (setattr(dynamo_config, _LIMIT, 64), getattr(module, name))[1]) == 1034
