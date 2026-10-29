@@ -183,3 +183,21 @@ def test_compiled_no_graph_break_and_same_grads():
     w_e = weight.clone().requires_grad_()
     f(hidden.clone().requires_grad_(), w_e, targets).backward()
     assert torch.equal(w_c.grad, w_e.grad)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_compiled_autograd_traces_the_backward(dtype):
+    # Compiled autograd traces the CE backward; the in-place gate must not call the untraceable
+    # keep-graph query there (graph break, or Unsupported under fullgraph).
+    compiled_autograd = pytest.importorskip("torch._dynamo.compiled_autograd")
+    hidden, weight, targets = _inputs(7, dtype = dtype)
+    w_e = weight.clone().requires_grad_()
+    (_loss(hidden.clone().requires_grad_(), w_e, targets) * 0.375).backward()
+    torch._dynamo.reset()
+    counters.clear()
+    w_c = weight.clone().requires_grad_()
+    loss = _loss(hidden.clone().requires_grad_(), w_c, targets) * 0.375
+    with compiled_autograd._enable(torch.compile(backend = "eager", fullgraph = True)):
+        loss.backward()
+    assert not counters["graph_break"]
+    assert torch.equal(w_c.grad, w_e.grad)
