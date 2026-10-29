@@ -31,7 +31,6 @@ import collections
 import concurrent.futures
 import ctypes
 import ctypes.util
-import fcntl
 import functools
 import json
 import logging
@@ -321,6 +320,8 @@ def _alive(pid):
 
 @contextmanager
 def _directory_lock(directory):
+    import fcntl  # POSIX only; importing at module level breaks `unsloth_zoo.mlx.inference` on Windows
+
     with open(f"{directory}.lock", "w") as file:
         fcntl.flock(file, fcntl.LOCK_EX)
         yield
