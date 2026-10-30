@@ -1766,6 +1766,7 @@ if _OPS is None:
         ctx.set_materialize_grads(False)
         ctx.need = inputs[13:16]
         ctx.save_for_backward(grad_h, grad_w, grad_b, inputs[5])
+        ctx.owned = _owned_ptrs((grad_h, grad_w, grad_b))
 
     def _ce_backward(ctx, grad_loss, *_):
         if grad_loss is None:
@@ -1775,7 +1776,7 @@ if _OPS is None:
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
         s = grad_loss.to(acc) / scaling.to(acc)
         need_h, need_w, need_b = ctx.need
-        scale = _stored_grad_scaler(s, (grad_h, grad_w, grad_b))
+        scale = _stored_grad_scaler(s, (grad_h, grad_w, grad_b), ctx)
         out_h = scale(grad_h) if need_h else None
         out_w = scale(grad_w) if need_w else None
         out_b = scale(grad_b) if need_b else None
@@ -1975,14 +1976,37 @@ def _scale_rows_inplace_impl(u, g):
 
 
 _KEEP_GRAPH = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)
+# torch 2.8+. Older torch only gets the address check below.
+_TOP_SAVED_HOOKS = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
 
 
-def _stored_grad_scaler(s, saved):
-    """In place only in eager backward without retain_graph (else a second [V, H] grad coexists with .grad)."""
+def _owned_ptrs(stored):
+    """Addresses of the op's own stored grads, or None when a saved-tensor hook is active: a lossless
+    hook may hand back one buffer for equal tensors (here or in another op), so scaling in place would
+    scale it twice."""
+    if torch.compiler.is_compiling():
+        return None
+    try:
+        if _TOP_SAVED_HOOKS is not None and _TOP_SAVED_HOOKS(True) is not None:
+            return None
+        return tuple(x.data_ptr() for x in stored)
+    except (RuntimeError, TypeError):  # fake / functional tensors have no storage
+        return None
+
+
+def _owns(ctx, saved):
+    # Each stored grad came back as the op's own allocation (no hook swapped or shared it).
+    owned = getattr(ctx, "owned", None)
+    return owned is not None and owned == tuple(x.data_ptr() for x in saved)
+
+
+def _stored_grad_scaler(s, saved, ctx = None):
+    """In place only in eager backward without retain_graph (else a second [V, H] grad coexists with .grad)
+    and only on buffers the op still owns (see _owned_ptrs)."""
     inplace = _OPS.get("scale_rows_inplace")
     if inplace is not None and _KEEP_GRAPH is not None and all(
         type(x) is torch.Tensor and not x.requires_grad for x in saved
-    ):
+    ) and _owns(ctx, saved):
         try:
             keep = _KEEP_GRAPH()
         except RuntimeError:  # not inside a backward pass
@@ -2369,6 +2393,7 @@ if not _OPS.get("jsd_registered", False):
         ctx.set_materialize_grads(False)  # as the CE op
         ctx.need = inputs[17:20]
         ctx.save_for_backward(grad_h, grad_w, grad_b, inputs[8])
+        ctx.owned = _owned_ptrs((grad_h, grad_w, grad_b))
 
     def _jsd_backward(ctx, grad_loss, *_):
         if grad_loss is None:
@@ -2377,7 +2402,7 @@ if not _OPS.get("jsd_registered", False):
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
         s = grad_loss.to(acc) / scaling.to(acc)
         need_h, need_w, need_b = ctx.need
-        scale = _stored_grad_scaler(s, (grad_h, grad_w, grad_b))
+        scale = _stored_grad_scaler(s, (grad_h, grad_w, grad_b), ctx)
         return ((scale(grad_h) if need_h else None, scale(grad_w) if need_w else None,
                  scale(grad_b) if need_b else None) + (None,) * 18)
 

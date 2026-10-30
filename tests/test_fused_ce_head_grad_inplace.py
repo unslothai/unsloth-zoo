@@ -16,6 +16,8 @@
 
 """The fused CE backward scales the stored head gradient in place, so it becomes .grad without a second copy."""
 
+import contextlib
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -183,3 +185,53 @@ def test_compiled_no_graph_break_and_same_grads():
     w_e = weight.clone().requires_grad_()
     f(hidden.clone().requires_grad_(), w_e, targets).backward()
     assert torch.equal(w_c.grad, w_e.grad)
+
+
+def _value_dedup_hooks(keep_original):
+    # Lossless per the saved-tensor hook contract (unpack returns equal values): equal saved tensors
+    # come back as one shared buffer, a clone or the first original.
+    kept = []
+
+    def pack(t):
+        for prior in kept:
+            if prior.shape == t.shape and prior.dtype == t.dtype and torch.equal(prior, t):
+                return prior
+        prior = t if keep_original else t.detach().clone()
+        kept.append(prior)
+        return prior
+
+    return torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t)
+
+
+@pytest.mark.parametrize("keep_original", [False, True])
+def test_hook_shared_buffers_within_one_op_are_not_scaled_twice(keep_original):
+    # Symmetric logits and diagonal targets: the stored hidden and head grads are equal and nonzero.
+    def run(hooks):
+        h = torch.eye(8).requires_grad_()
+        w = torch.eye(8).requires_grad_()
+        with _value_dedup_hooks(keep_original) if hooks else contextlib.nullcontext():
+            loss = fl.fused_linear_cross_entropy(h, w, None, torch.arange(8), divisor = torch.tensor(8.0))
+        (loss * 0.5).backward()
+        return h.grad, w.grad
+
+    want_h, want_w = run(False)
+    assert torch.equal(want_h, want_w) and want_w.any()
+    got_h, got_w = run(True)
+    assert torch.equal(got_h, want_h) and torch.equal(got_w, want_w)
+
+
+@pytest.mark.parametrize("keep_original", [False, True])
+def test_hook_shared_buffers_across_two_losses_are_not_scaled_twice(keep_original):
+    hidden, weight, targets = _inputs(10, dtype = torch.float32)
+
+    def run(hooks):
+        w = weight.clone().requires_grad_()
+        if hooks:
+            with _value_dedup_hooks(keep_original):
+                loss = _loss(hidden, w, targets) * 0.75 + _loss(hidden, w, targets) * 0.25
+        else:
+            loss = _loss(hidden, w, targets) * 0.75 + _loss(hidden, w, targets) * 0.25
+        loss.backward()
+        return w.grad
+
+    torch.testing.assert_close(run(True), run(False))
