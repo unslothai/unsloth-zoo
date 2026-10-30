@@ -23,7 +23,6 @@ import copy
 import os
 import re
 import sys
-import types
 from types import MethodType
 
 import pytest

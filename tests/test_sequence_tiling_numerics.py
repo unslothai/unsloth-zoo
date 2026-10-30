@@ -16,13 +16,11 @@
 """sequence_tiling.tiled_call vs the untiled module: loss, input grad and every parameter grad; CPU only.
 Frozen-input LoRA grads, width-changing projectors, router-logit grads and once-per-backward grad hooks are the cases
 the removed tiled_mlp.TiledMLP got wrong."""
-import functools
 import os
 import sys
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _sequence_tiling_models import (  # noqa: E402

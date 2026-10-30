@@ -223,7 +223,7 @@ def _worker(rank, world, backend, cells, path):
         for c in cells:
             globals()["cell_" + c](rank, world, device, out)
         out["ok"] = True
-    except Exception as e:
+    except Exception:
         import traceback
         out["ok"] = False
         out["error"] = traceback.format_exc()[-3000:]
