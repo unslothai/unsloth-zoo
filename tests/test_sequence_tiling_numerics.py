@@ -301,3 +301,19 @@ def test_offloader_never_sees_tile_views(frozen, monkeypatch):
         res[tiles] = list(seen)
     assert res[0] == res[4], res
     assert all(off == 0 for _, off in res[4])
+
+
+def test_every_tile_is_checked_for_arity_and_rows():
+    x = torch.randn(1, 8, H)
+    calls = []
+
+    def changing_arity(t):
+        calls.append(1)
+        return (t, t[..., :1]) if len(calls) == 1 else (t,)
+    with pytest.raises(ValueError, match = "outputs"):
+        tiled_call(changing_arity, x, n_tiles = 2, needs_rng = False)
+
+    def short_rows(t):
+        return t[:, 1:]  # drops a row: the preallocated output would keep uninitialised memory
+    with pytest.raises(ValueError, match = "rows"):
+        tiled_call(short_rows, x, n_tiles = 2, needs_rng = False)

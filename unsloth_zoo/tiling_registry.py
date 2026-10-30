@@ -396,7 +396,7 @@ def _assemble(outs, output_contract):
 
 def reference_tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = None):
     """Oracle engine: one non-reentrant checkpoint per tile (plain loop without autograd)."""
-    from torch.utils.checkpoint import checkpoint
+    from unsloth_zoo.sequence_tiling import _checkpoint
     xs = torch.tensor_split(x, n_tiles, dim = 0)
     ts = [torch.tensor_split(t, n_tiles, dim = 0) for t in token_args]
     grad = torch.is_grad_enabled()
@@ -404,7 +404,7 @@ def reference_tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_c
     for i, xt in enumerate(xs):
         args = [xt] + [t[i] for t in ts]
         if grad:
-            outs.append(checkpoint(fn, *args, use_reentrant = False, preserve_rng_state = bool(needs_rng)))
+            outs.append(_checkpoint(fn, tuple(args), bool(needs_rng)))
         else:
             outs.append(fn(*args))
     return _assemble(outs, output_contract)
@@ -514,7 +514,17 @@ def _bind(module, fn):
     if fn is None:
         fn = type(module).forward
     if isinstance(fn, types.FunctionType):
-        return MethodType(fn, module)
+        # functools.partial, not MethodType: Dynamo cannot build a bound method while tracing (fullgraph).
+        return functools.partial(fn, module)
+    return fn
+
+
+def _adoptable(fn):
+    """An instance forward as stored in the inner slot. A plain function found on the instance (a lambda, a
+    torch.compile / compiler.disable wrapper) is already bound to its arguments, so it is wrapped to keep _bind
+    from passing the module as an extra first argument."""
+    if isinstance(fn, types.FunctionType):
+        return functools.partial(fn)
     return fn
 
 
@@ -569,7 +579,8 @@ def _run_tiled(module, state, inner, args, n_tiles):
     fn = functools.partial(_tile_fn, module, x.dim() >= 3, tuple(contract), trailing)
     out = get_engine()(
         fn, x2, *token_flat,
-        n_tiles = n_tiles, needs_rng = needs_rng_state(module), output_contract = _engine_contract(contract),
+        n_tiles = n_tiles, needs_rng = module.training or needs_rng_state(module),
+        output_contract = _engine_contract(contract),
     )
     if torch.is_tensor(out):
         return _unflat(out, contract[0], lead)
@@ -641,7 +652,7 @@ def _attach(module, spec, plan, budget_cache):
         if current is not None:
             # An instance forward (mxfp4, grouped MoE, accelerate hook, fused LoRA MLP) is what this module runs.
             prior = d.get("_unsloth_forward")
-            d["_unsloth_forward"] = current
+            d["_unsloth_forward"] = _adoptable(current)
             _unchain(module, _bind(module, prior))
         elif "_unsloth_forward" not in d:
             d["_unsloth_forward"] = type(module).forward
@@ -662,18 +673,22 @@ def _detach(module):
         del d["forward"]
         if inner is not None and inner is not getattr(type(module), "forward", None):
             restored = d["forward"] = _bind(module, inner)
-    _unchain(module, restored or _bind(module, None))
+    # A wrapper installed after tiling (accelerate's _old_forward) goes back to the forward that ran before tiling.
+    _unchain(module, restored or _bind(module, inner))
 
 
 # ----------------------------------------------------------------------------------------------------------------
 # Self-check for opted-in classes
 # ----------------------------------------------------------------------------------------------------------------
 
-_SELF_CHECK = {}
+_SELF_CHECK = weakref.WeakKeyDictionary()
+_MISSING = object()
 
 
 def _compare(want, got, dtype):
     tol = 1e-4 if dtype in (torch.float32, torch.float64, None) else 3e-2
+    if want is None or got is None:
+        return None if want is got else "output structure changed"
     if torch.is_tensor(want) != torch.is_tensor(got):
         return "output structure changed"
     if not torch.is_tensor(want):
@@ -684,8 +699,6 @@ def _compare(want, got, dtype):
             if msg:
                 return msg
         return None
-    if want is None or got is None:
-        return None if want is got else "output structure changed"
     if want.shape != got.shape:
         return f"shape {tuple(got.shape)} != {tuple(want.shape)}"
     if not torch.allclose(want.float(), got.float(), rtol = tol, atol = tol):
@@ -714,7 +727,8 @@ def _contract_for(out, lead):
 
 def _self_check(module, spec, n_tiles = 3):
     """One eager check per class: tiled == untiled on a small row block. Returns (spec or None, reason)."""
-    key = type(module)
+    # Per instance: two instances of one class can differ in config (a sequence-mixing variant, another contract).
+    key = module
     if key in _SELF_CHECK:
         return _SELF_CHECK[key]
     result = (None, "self-check could not run")
@@ -731,6 +745,12 @@ def _self_check(module, spec, n_tiles = 3):
         try:
             g = torch.Generator().manual_seed(1234)
             x = torch.randn(2, 7, hidden, generator = g).to(device = device, dtype = dtype)
+            d = module.__dict__
+            current = d.get("forward")
+            # Probe what the module runs and what _attach will adopt: an instance forward when one is set.
+            slot_was = d.get("_unsloth_forward", _MISSING)
+            if current is not None and not _is_ours(current):
+                d["_unsloth_forward"] = _adoptable(current)
             inner = _inner_forward(module)
             with torch.no_grad():
                 want = inner(x)
@@ -749,6 +769,11 @@ def _self_check(module, spec, n_tiles = 3):
         finally:
             for m, t in flags:
                 m.training = t
+            if current is not None and not _is_ours(current):
+                if slot_was is _MISSING:
+                    d.pop("_unsloth_forward", None)
+                else:
+                    d["_unsloth_forward"] = slot_was
     _SELF_CHECK[key] = result
     return result
 
@@ -913,7 +938,8 @@ def install(model, mode = DEFAULT_MODE, modules = None, *, force = None, verbose
         keep.add(id(module))
         report.tiled.append((name, type(module).__name__, spec.family))
     for _, module in model.named_modules():
-        if id(module) not in keep and is_tiled(module):
+        # "_unsloth_tiling" too: a wrapper installed after tiling (accelerate) hides the tiled forward from is_tiled.
+        if id(module) not in keep and (is_tiled(module) or "_unsloth_tiling" in module.__dict__):
             _detach(module)
     previous = model.__dict__.get("_unsloth_tiling_report")
     model.__dict__["_unsloth_tiling_plan"] = (plan, force)

@@ -203,7 +203,14 @@ def tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = 
                 raise ValueError(f"Unsloth: tiled fn returned {len(outs0)} outputs, output_contract has {len(contract)}.")
             pieces = [[] if c in ("rows", "rows_flat") else None for c in contract]
         outs = tuple(out) if is_tuple else (out,)
+        if isinstance(out, (tuple, list)) != is_tuple or len(outs) != len(contract):
+            raise ValueError(f"Unsloth: tile {i} returned {len(outs)} outputs, the first tile {len(contract)}.")
         for j, (c, o) in enumerate(zip(contract, outs)):
+            if c in ("rows", "rows_flat") and not compiling:
+                want = x_tiles[i].shape[dim]
+                got_rows = o.shape[dim] if c == "rows" else o.shape[0]
+                if got_rows != want:
+                    raise ValueError(f"Unsloth: tiled output {j} of tile {i} has {got_rows} rows, the tile has {want}.")
             if c == "none":
                 if o is not None:
                     raise ValueError(f"Unsloth: tiled output {j} has contract 'none' but is not None.")

@@ -20,6 +20,7 @@ The family tests go only through `patch_tiled_mlp(model, "arctic")`, which exist
 same file run against the old TiledMLP shows which cases it got wrong. CPU only."""
 
 import copy
+import functools
 import os
 import re
 import sys
@@ -225,7 +226,7 @@ class _Holder(torch.nn.Module):
 def _reset_registry(monkeypatch):
     if R is not None:
         R._SELF_CHECK.clear()
-        R.set_engine("reference")
+        R.set_engine("checkpoint")  # the shipped engine
     monkeypatch.delenv("UNSLOTH_TILED_MLP_MODULES", raising = False)
     yield
     if R is not None:
@@ -246,8 +247,8 @@ def test_unknown_class_needs_opt_in_then_self_check(monkeypatch, capsys):
     report = R.install(model, "rows:2")
     assert len(report.tiled) == 2 and all(R.is_tiled(layer.mlp) for layer in model.layers)
     assert "on 2 modules [FooBlock x2]" in capsys.readouterr().out
-    # One eager check per class: the second instance reuses the verdict.
-    assert len(R._SELF_CHECK) == 1
+    # One eager check per instance: a config can differ between instances of one class.
+    assert len(R._SELF_CHECK) == 2
     x = torch.randn(2, 9, 8)
     ref = _Holder(FooBlock)
     ref.load_state_dict(model.state_dict())
@@ -723,3 +724,99 @@ def test_kernel_writing_dx_into_its_input_keeps_tiles_intact(frozen_input):
     torch.testing.assert_close(got[0], want[0])
     if not frozen_input:
         torch.testing.assert_close(got[1], want[1])
+
+
+
+@needs_registry
+@pytest.mark.parametrize("backend", ["aot_eager"])
+def test_installed_module_compiles_fullgraph(backend):
+    # The inner forward is bound with functools.partial: Dynamo cannot build a MethodType while tracing.
+    torch._dynamo.reset()
+    m = type("FooMLP", (_TokenMLP,), {})()
+    ref = copy.deepcopy(m)
+    R.install_module(m, "rows:2")
+    x = torch.randn(1, 8, 8, requires_grad = True)
+    xr = x.detach().clone().requires_grad_()
+    out = torch.compile(m, backend = backend, fullgraph = True)(x)
+    out.sum().backward()
+    ref(xr).sum().backward()
+    torch.testing.assert_close(out, ref(xr.detach()))
+    torch.testing.assert_close(x.grad, xr.grad)
+    torch.testing.assert_close(m.up.weight.grad, ref.up.weight.grad)
+
+
+@needs_registry
+def test_uninstall_under_a_later_wrapper_restores_the_adopted_forward():
+    # accelerate's add_hook_to_module after tiling: forward = wrapper, _old_forward = the tiled forward.
+    m = type("FooMLP", (_TokenMLP,), {})()
+    m.forward = MethodType(lambda self, x: _TokenMLP.forward(self, x) * 3, m)
+    R.install_module(m, "rows:2")
+    m._old_forward = m.forward
+    m.forward = functools.partial(lambda mod, *a: mod._old_forward(*a), m)
+    x = torch.randn(1, 6, 8)
+    torch.testing.assert_close(m(x), _TokenMLP.forward(m, x) * 3)
+    assert R.uninstall(m) == 1
+    torch.testing.assert_close(m(x), _TokenMLP.forward(m, x) * 3)
+
+
+@needs_registry
+def test_reinstall_without_a_wrapped_module_detaches_it():
+    model = _Holder(lambda: type("FooMLP", (_TokenMLP,), {})())
+    R.install(model, "rows:2", verbose = False)
+    mlp = model.layers[0].mlp
+    mlp._old_forward = mlp.forward
+    mlp.forward = functools.partial(lambda mod, *a: mod._old_forward(*a), mlp)
+    R.install(model, "rows:2", modules = ["layers.1.mlp"], verbose = False)
+    assert "_unsloth_tiling" not in mlp.__dict__ and not R._is_ours(mlp.__dict__["_old_forward"])
+
+
+@needs_registry
+def test_adopted_plain_function_forward_gets_no_extra_self():
+    # A lambda / torch.compile wrapper stored on the instance is already bound; adopting it must not add `self`.
+    m = type("FooMLP", (_TokenMLP,), {})()
+    m.forward = lambda x: _TokenMLP.forward(m, x) + 1
+    R.install_module(m, "rows:2")
+    x = torch.randn(1, 6, 8)
+    torch.testing.assert_close(m(x), _TokenMLP.forward(m, x) + 1)
+    R.uninstall(m)
+    torch.testing.assert_close(m(x), _TokenMLP.forward(m, x) + 1)
+
+
+@needs_registry
+def test_self_check_probes_the_instance_forward_and_each_instance(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_TILED_MLP_MODULES", "*.mlp")
+    model = _Holder(FooBlock)
+    mixing = model.layers[1].mlp
+    def mix(self, x):
+        y = _TokenMLP.forward(self, x)
+        return y + y.mean(dim = -2, keepdim = True)
+    mixing.forward = MethodType(mix, mixing)  # this instance mixes tokens; its class does not
+    report = R.install(model, "rows:2", verbose = False)
+    assert [r[0] for r in report.tiled] == ["layers.0.mlp"]
+    assert "self-check failed" in dict((n, r) for n, _, r in report.skipped)["layers.1.mlp"]
+
+
+@needs_registry
+def test_self_check_accepts_matching_none_outputs():
+    assert R._compare((torch.ones(2), None), (torch.ones(2), None), torch.float32) is None
+    assert R._compare(None, torch.ones(2), torch.float32) is not None
+
+
+@needs_registry
+def test_functional_dropout_replays_its_mask():
+    # No nn.Dropout child: the module scan cannot see it, so training mode alone must turn RNG replay on.
+    class FunctionalDropoutMLP(_TokenMLP):
+        def forward(self, x):
+            h = torch.nn.functional.dropout(torch.nn.functional.gelu(self.up(x)), 0.5, self.training)
+            return self.down(h)
+    m = type("FooMLP", (FunctionalDropoutMLP,), {})()
+    ref = copy.deepcopy(m)
+    R.install_module(m, "rows:2")
+    x = torch.randn(1, 8, 8)
+    torch.manual_seed(5)
+    m(x).pow(2).sum().backward()
+    torch.manual_seed(5)
+    # Untiled oracle with the same per-tile RNG consumption: run the tiles by hand.
+    outs = [FunctionalDropoutMLP.forward(ref, t) for t in torch.tensor_split(x, 4, dim = 1)]
+    torch.cat(outs, dim = 1).pow(2).sum().backward()
+    torch.testing.assert_close(m.up.weight.grad, ref.up.weight.grad)
