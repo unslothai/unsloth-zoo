@@ -19,6 +19,7 @@ is_fast_path_available True but Triton fails); ROCm, XPU, MPS, CPU and Ampere+ u
 transformers import needed."""
 
 import ast
+import functools
 import os
 import sys
 import types
@@ -41,7 +42,7 @@ _NAMES = (
 
 
 def _load():
-    ns = {"torch": torch, "os": os}
+    ns = {"torch": torch, "os": os, "functools": functools}
     for node in ast.parse(_SRC).body:
         names = [node.name] if isinstance(node, ast.FunctionDef) else [
             t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
@@ -904,3 +905,49 @@ def test_missing_kernels_wrapper_is_applied_once(env, monkeypatch):
 
 def test_missing_kernels_fallback_is_registered():
     assert "TEMPORARY_PATCHES.append(patch_mamba_kernels_missing_fallback)" in _SRC
+
+
+def _scan_args():
+    return torch.ones(1, 4, 2, 4), torch.full((1, 4, 2), 0.1), -torch.ones(2), torch.ones(1, 4, 1, 2)
+
+
+def test_the_forced_reference_refuses_packed_calls(monkeypatch):
+    # The reference scan ignores seq_idx, so a packed call would mix documents: transformers 5.22+ refuses
+    # it on its own reference path, and the forced reference must keep doing so on every version.
+    hk = pytest.importorskip("transformers.integrations.hub_kernels")
+    if getattr(hk, "use_kernel_func_from_hub_with_fallback", None) is None:
+        pytest.skip("transformers < 5.15 has no use_kernel_func_from_hub_with_fallback")
+    integrations = sys.modules["transformers.integrations"]
+    monkeypatch.setattr(hk, "use_kernel_func_from_hub_with_fallback", hk.use_kernel_func_from_hub_with_fallback)
+    monkeypatch.setattr(integrations, "use_kernel_func_from_hub_with_fallback", hk.use_kernel_func_from_hub_with_fallback)
+    monkeypatch.setitem(sys.modules, "mamba_ssm", None)
+
+    # A modeling module imported before the patch, bound to a mamba_ssm kernel.
+    def kernel(*args, **kwargs):
+        raise AssertionError("the mamba_ssm kernel must not run")
+    kernel.__module__ = "mamba_ssm.ops.triton.ssd_combined"
+    def reference(x, *args, **kwargs):
+        return x.cumsum(1)
+    def bind(fn):
+        @functools.wraps(reference)
+        def bound(*args, **kwargs):
+            return fn(*args, **kwargs)
+        return bound
+    early = types.ModuleType("transformers.models.unsloth_test_mamba.modeling_unsloth_test_mamba")
+    early.mamba2_chunk_scan = bind(kernel)
+    monkeypatch.setitem(sys.modules, early.__name__, early)
+
+    _NS["_bind_mamba_ssm_to_torch_reference"]()
+
+    @hk.use_kernel_func_from_hub_with_fallback("mamba_chunk_scan_combined", "mamba_ssm")
+    def later(x, *args, **kwargs):
+        return x.cumsum(1)
+
+    q, dt, A, B = _scan_args()
+    packed = {"seq_idx": torch.tensor([[0, 0, 1, 1]], dtype = torch.int32)}
+    for fn in (later, early.mamba2_chunk_scan):
+        assert torch.equal(fn(q, dt, A, B, B, chunk_size = 2), q.cumsum(1))
+        with pytest.raises(ValueError, match = "packed sequences"):
+            fn(q, dt, A, B, B, chunk_size = 2, **packed)
+        with pytest.raises(ValueError, match = "packed sequences"):
+            fn(q, dt, A, B, B, chunk_size = 2, cu_seqlens = torch.tensor([0, 2, 4]))

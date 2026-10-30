@@ -1676,11 +1676,24 @@ def _bind_mamba_ssm_to_torch_reference():
     if _original is None:
         return  # transformers < 5.15: gated by is_fast_path_available instead
 
+    def _refuse_packed_calls(torch_function, func_name):
+        # The reference cannot keep packed sequences apart (seq_idx is ignored): refuse them, as transformers 5.22+ does.
+        @functools.wraps(torch_function)
+        def reference(*args, **kwargs):
+            if kwargs.get("cu_seqlens") is not None or kwargs.get("seq_idx") is not None:
+                raise ValueError(
+                    f"Unsloth: `{func_name}` runs its PyTorch reference here (mamba_ssm's kernels cannot run "
+                    f"on this GPU), which can't keep packed sequences apart. Turn off packing / padding-free."
+                )
+            return torch_function(*args, **kwargs)
+        return reference
+
     if not _hub_func_factory_patched(_original, "_unsloth_mamba_ssm_torch"):
         def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
             if package != "mamba_ssm":
                 return _original(func_name, package, internal_path)
             def decorator(torch_function):
+                torch_function = _refuse_packed_calls(torch_function, func_name)
                 try:
                     return _hk.use_kernel_forward_from_hub(func_name)(torch_function)
                 except Exception:
@@ -1716,7 +1729,7 @@ def _bind_mamba_ssm_to_torch_reference():
                     _reference = _reference.__wrapped__
                 if _reference is _fn or str(getattr(_reference, "__module__", "")).startswith("mamba_ssm"):
                     continue
-                setattr(_module, _name, _reference)
+                setattr(_module, _name, _refuse_packed_calls(_reference, _name))
             except Exception:
                 pass
 pass
