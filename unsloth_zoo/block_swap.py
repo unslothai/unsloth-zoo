@@ -237,7 +237,7 @@ def _swappable(module):
 class _Block:
     __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
                  "pending", "layout", "sizes", "src", "empties", "host_buf", "home",
-                 "t_copy", "copy_open", "marks", "mark_open")
+                 "t_copy", "copy_open", "copy_pending", "marks", "mark_open")
 
     def __init__(self, layer, streams, device, shared = ()):
         self.params, self.host, self.devices = [], [], []
@@ -262,6 +262,7 @@ class _Block:
         self.events = {d: torch.cuda.Event(enable_timing = _TIMING) for d in self.sizes}
         self.t_copy = {d: torch.cuda.Event(enable_timing = True) for d in self.sizes} if _TIMING else None
         self.copy_open = False
+        self.copy_pending = []
         # Compute-stream marks: before the wait, after it, after the layer ran.
         self.marks = tuple(torch.cuda.Event(enable_timing = True) for _ in range(3)) if _TIMING else None
         self.mark_open = 0
@@ -300,6 +301,11 @@ class _Block:
         if self.resident:
             return
         bufs, views = slot
+        if self.copy_open:
+            # The last copy is still in flight: keep its events for _harvest_copy, record this one on new ones.
+            self.copy_pending.append((self.t_copy, self.events))
+            self.t_copy = {d: torch.cuda.Event(enable_timing = True) for d in self.sizes}
+            self.events = {d: torch.cuda.Event(enable_timing = True) for d in self.sizes}
         for d, event in self.events.items():
             stream = self.streams[d]
             stream.wait_stream(torch.cuda.current_stream(d))
@@ -546,7 +552,7 @@ class BlockSwap:
     def _fetch(self, block, steal = False):
         if block.resident:
             return
-        if getattr(block, "copy_open", False):
+        if getattr(block, "copy_open", False) or getattr(block, "copy_pending", None):
             self._harvest_copy(block)
         slot = self._acquire(block, steal)
         if slot is not None:
@@ -714,13 +720,25 @@ class BlockSwap:
 
     def _harvest_copy(self, b):
         # Only finished copies are read: query() never blocks the host.
-        if not all(e.query() for e in b.events.values()):
-            return
-        # max(0, ...): HIP can order timestamps of events recorded while a stream sat idle backwards.
-        self._tot["copy_ms"] += sum(max(0.0, b.t_copy[d].elapsed_time(e)) for d, e in b.events.items())
-        self._tot["copies"] += 1
-        self._tot["copy_bytes"] += b.nbytes()
-        b.copy_open = False
+        def done(events):
+            return all(e.query() for e in events.values())
+
+        def add(starts, ends):
+            # max(0, ...): HIP can order timestamps of events recorded while a stream sat idle backwards.
+            self._tot["copy_ms"] += sum(max(0.0, starts[d].elapsed_time(e)) for d, e in ends.items())
+            self._tot["copies"] += 1
+            self._tot["copy_bytes"] += b.nbytes()
+
+        keep = []
+        for starts, ends in getattr(b, "copy_pending", []):
+            if done(ends):
+                add(starts, ends)
+            else:
+                keep.append((starts, ends))
+        b.copy_pending = keep
+        if b.copy_open and done(b.events):
+            add(b.t_copy, b.events)
+            b.copy_open = False
 
     def _harvest_marks(self, b):
         if b.mark_open == 2 and b.marks[2].query():
@@ -731,7 +749,7 @@ class BlockSwap:
 
     def _harvest(self):
         for b in self.blocks:
-            if getattr(b, "copy_open", False):
+            if getattr(b, "copy_open", False) or getattr(b, "copy_pending", None):
                 self._harvest_copy(b)
             if getattr(b, "mark_open", 0) == 2 and b.marks[2].query():
                 self._harvest_marks(b)

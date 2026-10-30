@@ -879,6 +879,28 @@ def test_host_arena_is_registered_portable(monkeypatch):
     del reg
 
 
+def test_harvest_copy_keeps_samples_still_in_flight():
+    import types
+    # CPU: fake events. A refetch queued before the last copy finished must not lose either sample.
+    class Ev:
+        def __init__(self, done, ms = 0.0):
+            self.done, self.ms = done, ms
+        def query(self):
+            return self.done
+        def elapsed_time(self, end):
+            return end.ms
+
+    old = ({"d": Ev(True)}, {"d": Ev(False, 2.0)})
+    b = types.SimpleNamespace(copy_pending = [old], copy_open = True, t_copy = {"d": Ev(True)},
+                              events = {"d": Ev(True, 3.0)}, nbytes = lambda: 10)
+    sw = types.SimpleNamespace(_tot = {"copy_ms": 0.0, "copies": 0, "copy_bytes": 0})
+    BlockSwap._harvest_copy(sw, b)
+    assert sw._tot == {"copy_ms": 3.0, "copies": 1, "copy_bytes": 10} and b.copy_pending == [old]
+    old[1]["d"].done = True
+    BlockSwap._harvest_copy(sw, b)
+    assert sw._tot == {"copy_ms": 5.0, "copies": 2, "copy_bytes": 20} and b.copy_pending == []
+
+
 def test_stats_reports_placement_and_timings_after_a_step():
     if not torch.cuda.is_available():
         return
