@@ -1395,6 +1395,31 @@ def _tokenizer_class_for_model_type(model_path):
     return tokenizer_class_from_name(mapped) if mapped else None
 
 
+# Tekken tokenizer.json conversions shipped Llama-3's split (first) in place of
+# mistral-common's own, tekken.json's "config.pattern" (second).
+_MISTRAL_WRONG_SPLIT_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_MISTRAL_TEKKEN_SPLIT_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+def _has_wrong_mistral_split(model_path):
+    """Exact match: transformers' version check also flags SentencePiece Mistral repos,
+    and its own ``fix_mistral_regex`` repair raises on 5.5."""
+    model_type = _read_json_file(os.path.join(str(model_path), "config.json")).get("model_type")
+    if model_type not in ("mistral", "mistral3", "voxtral", "ministral", "pixtral"):
+        return False
+    pre_tokenizer = _read_json_file(os.path.join(str(model_path), "tokenizer.json")).get("pre_tokenizer") or {}
+    first = (pre_tokenizer.get("pretokenizers") or [{}])[0] if pre_tokenizer.get("type") == "Sequence" else {}
+    pattern = first.get("pattern") or {}
+    return first.get("type") == "Split" and pattern.get("Regex") == _MISTRAL_WRONG_SPLIT_PATTERN
+
+
 def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     """Load a tokenizer without letting AutoTokenizer resolve the model config.
 
@@ -1403,7 +1428,10 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     AttributeError or KeyError (Phi-4 multimodal, Nemotron NAS/H, DeepSeek
     V3.2, MiniCPM3) take an otherwise loadable tokenizer down with them.
     """
+    import transformers
+    from packaging.version import Version
     from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
+    from transformers.models.auto import tokenization_auto
     from transformers.models.auto.tokenization_auto import (
         get_tokenizer_config, tokenizer_class_from_name,
     )
@@ -1420,12 +1448,37 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
         tokenizer_class = tokenizer_class_from_name(class_name.removesuffix("Fast") + "Fast")
         if tokenizer_class is None:
             tokenizer_class = tokenizer_class_from_name(class_name)
-    if tokenizer_class is None and not remote:
-        tokenizer_class = _tokenizer_class_for_model_type(model_path)
+    model_type_class = None if remote else _tokenizer_class_for_model_type(model_path)
+    if tokenizer_class is None:
+        tokenizer_class = model_type_class
+    elif hasattr(transformers, "TokenizersBackend") and model_type_class is not None:
+        if model_type_class.__name__ in (
+            "TokenizersBackend", "PreTrainedTokenizerFast", "PythonBackend", "MistralCommonBackend",
+        ):
+            # As AutoTokenizer 5.x. Tekken repos declare LlamaTokenizerFast, which rebuilds
+            # a SentencePiece decoder over their ByteLevel tokenizer.json.
+            tokenizer_class = transformers.TokenizersBackend
+        elif (
+            Version(transformers.__version__) < Version("5.7.0")
+            and model_type_class.__name__.removesuffix("Fast") != class_name.removesuffix("Fast")
+        ):
+            # Pre-5.7 AutoTokenizer loads TokenizersBackend on any mismatch (DeepSeek-R1-Distill-Qwen).
+            tokenizer_class = transformers.TokenizersBackend
+        elif _read_json_file(os.path.join(str(model_path), "config.json")).get("model_type") in getattr(
+            tokenization_auto, "MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS", (),
+        ):
+            tokenizer_class = model_type_class
     if not remote and (Path(model_path) / "tokenizer.json").is_file():
         if tokenizer_class is None or not issubclass(tokenizer_class, PreTrainedTokenizerFast):
             tokenizer_class = PreTrainedTokenizerFast
-        return tokenizer_class.from_pretrained(model_path, *args, **kwargs)
+        tokenizer = tokenizer_class.from_pretrained(model_path, *args, **kwargs)
+        if "fix_mistral_regex" not in kwargs and _has_wrong_mistral_split(model_path):
+            from tokenizers import Regex, pre_tokenizers
+
+            tokenizer.backend_tokenizer.pre_tokenizer[0] = pre_tokenizers.Split(
+                Regex(_MISTRAL_TEKKEN_SPLIT_PATTERN), behavior="isolated",
+            )
+        return tokenizer
     # Tokenizer metadata selects the class; model validators have no role here.
     if class_name or remote:
         kwargs["config"] = PretrainedConfig()
