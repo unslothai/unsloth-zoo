@@ -200,7 +200,14 @@ def _exact_lpt(device, dtype):
 
 
 def _capturing(x):
-    return x.is_cuda and torch.cuda.is_current_stream_capturing()
+    # is_current_stream_capturing reads the current device's stream: ask on x's device.
+    if not x.is_cuda:
+        return False
+    index = x.device.index
+    if index is None or index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    with torch.cuda.device(index):
+        return torch.cuda.is_current_stream_capturing()
 
 
 def _half_mm_bounded(a, b):
