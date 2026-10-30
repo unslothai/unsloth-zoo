@@ -785,6 +785,12 @@ _REENTRANT_FRAMES = ("forward", "backward")
 # the catch-all below must skip it rather than read it as proof of a region.
 _SEQUENTIAL_FRAME = "checkpoint_sequential"
 
+# torch 2.15 moved the body of `checkpoint` into `_checkpoint_impl`, which takes
+# the same `use_reentrant` and is entered directly by the curried form through
+# `_CheckpointedFunction.__call__`; both mark a region entry like `checkpoint`.
+_ENTRY_FRAMES = ("checkpoint", "_checkpoint_impl")
+_PASS_THROUGH_FRAMES = (_SEQUENTIAL_FRAME, "__call__")
+
 
 def _frame_local(frame, name):
     """One local off a live frame, `_UNKNOWN` when it is not there."""
@@ -829,7 +835,7 @@ def _walk_for_checkpoint_frame():
     while frame is not None:
         if frame.f_code.co_filename == origin:
             name = frame.f_code.co_name
-            if name == _SEQUENTIAL_FRAME:
+            if name in _PASS_THROUGH_FRAMES:
                 pass                            # keep scanning outward
             elif name in _REENTRANT_FRAMES:
                 # `checkpoint_sequential`'s per-segment closure is also called
@@ -837,7 +843,7 @@ def _walk_for_checkpoint_frame():
                 # apart: the autograd Function frames take a `ctx`.
                 if _frame_local(frame, "ctx") is not _UNKNOWN:
                     reentrant += 1
-            elif name == "checkpoint":
+            elif name in _ENTRY_FRAMES:
                 use_reentrant = _frame_local(frame, "use_reentrant")
                 if use_reentrant is False: return True
                 if reentrant: reentrant -= 1
