@@ -675,3 +675,51 @@ def test_two_identical_instances_run_their_own_inner_forward():
     a(x)
     b(x)
     assert seen == ["a", "a", "b", "b"]
+
+
+class _InplaceDXLinear(torch.autograd.Function):
+    """Like Unsloth's fast LoRA MLP with inplace=True: backward writes dX into the forward input's storage."""
+
+    @staticmethod
+    def forward(ctx, X, W):
+        ctx.save_for_backward(X, W)
+        return X @ W.t()
+
+    @staticmethod
+    def backward(ctx, dY):
+        X, W = ctx.saved_tensors
+        dW = dY.reshape(-1, dY.shape[-1]).t() @ X.reshape(-1, X.shape[-1])
+        dX = torch.matmul(dY, W, out = X)
+        return dX, dW
+
+
+@needs_registry
+@pytest.mark.parametrize("frozen_input", [False, True])
+def test_kernel_writing_dx_into_its_input_keeps_tiles_intact(frozen_input):
+    # The fused LoRA MLP overwrites its input with dX in backward. The checkpoint engine saves every tile's input for
+    # recompute, so the tile must own its storage, or the next tile recomputes from dX (version error / wrong grads).
+    torch.manual_seed(0)
+    mlp = torch.nn.Module()
+    mlp.w = torch.nn.Parameter(torch.randn(8, 8) / 3)
+
+    def kernel(self, x):
+        return _InplaceDXLinear.apply(x, self.w)
+
+    ref = copy.deepcopy(mlp)
+    x0 = torch.randn(2, 6, 8)
+    for m, tiled in ((ref, False), (mlp, True)):
+        m.forward = MethodType(kernel, m)
+        if tiled:
+            R.install_module(m, "rows:3", spec = R.TileSpec("Inplace", family = "test"))
+            assert R.is_tiled(m)
+        x = x0.clone().requires_grad_(not frozen_input)
+        h = x * 1.0  # a non-leaf input, as a decoder layer's hidden states
+        out = m(h)
+        (out * torch.arange(out.numel()).reshape(out.shape)).sum().backward()
+        if tiled:
+            got = (m.w.grad.clone(), None if frozen_input else x.grad.clone())
+        else:
+            want = (m.w.grad.clone(), None if frozen_input else x.grad.clone())
+    torch.testing.assert_close(got[0], want[0])
+    if not frozen_input:
+        torch.testing.assert_close(got[1], want[1])
