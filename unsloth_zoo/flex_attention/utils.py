@@ -529,11 +529,9 @@ def _kernel_options_position():
 
 
 def _main_kernel_options(requested, forced_options):
-    """kernel_options that keep a short query off flex_decoding. With no options the compiled call's own memory presets
-    apply; an explicit dict replaces them as it does without the guard (a partial tile override must not be mixed with
-    preset tiles), so it only gains FORCE_USE_FLEX_ATTENTION. torch 2.9 has no BACKEND and only reads
-    FORCE_USE_FLEX_ATTENTION, and 2.10+ rejects BACKEND together with it, so an explicit AUTO or TRITON is replaced by
-    the legacy knob (TRITON asks for the main kernel, so it is forced on). Other named backends chose the kernel."""
+    """kernel_options that keep a short query off flex_decoding. An explicit dict replaces the presets (partial tile
+    overrides must not mix with preset tiles) and only gains FORCE_USE_FLEX_ATTENTION. torch 2.9 has no BACKEND and
+    2.10+ rejects BACKEND with the legacy knob, so AUTO / TRITON become the legacy knob; other backends are kept."""
     if requested is None:
         return dict(forced_options)
     requested = dict(requested)
@@ -548,9 +546,8 @@ def _main_kernel_options(requested, forced_options):
 
 
 def _main_kernel_for_short_queries(flex_attention_fn, forced_options):
-    """flex_attention_fn with the main kernel for queries AUTO would send to flex_decoding (see _main_kernel_options).
-    kernel_options may come positionally or by keyword. No functools.wraps: copying the compiled function's __dict__
-    would hand Dynamo its original callable and skip these options."""
+    """flex_attention_fn with the main kernel for short queries. No functools.wraps: copying the compiled function's
+    __dict__ would hand Dynamo its original callable and skip these options."""
     forced_options = dict(forced_options)
     position = _kernel_options_position()
     def flex_attention(*args, **kwargs):
@@ -569,10 +566,9 @@ def _flex_decoding_unavailable(block_ptr_removed, decode_uses_block_ptr, main_us
     return bool(block_ptr_removed) and decode_uses_block_ptr is True and main_uses_block_ptr is False
 
 
-# Decided at import (no file reads or logging inside traced decode code). When torch's flex_decoding cannot compile
-# against the installed Triton, the failed compile makes Dynamo skip flex_attention for the rest of the process and
-# every later call (prefill too) builds the full score matrix; short queries take the main flex kernel instead, which
-# only helps when that kernel is known not to need block pointers too (torch 2.9+).
+# Decided at import (no file reads inside traced code). A failed flex_decoding compile makes Dynamo skip flex_attention
+# for the whole process, so every later prefill builds the full score matrix; short queries take the main kernel instead
+# when it is known to be free of block pointers (torch 2.9+).
 _TRITON_BLOCK_PTR_REMOVED = bool(HAS_FLEX_ATTENTION) and _triton_block_ptr_removed()
 _DECODE_USES_BLOCK_PTR = _flex_decode_template_uses_block_ptr() if _TRITON_BLOCK_PTR_REMOVED else None
 _MAIN_USES_BLOCK_PTR = _flex_main_template_uses_block_ptr() if _TRITON_BLOCK_PTR_REMOVED else None
@@ -599,8 +595,7 @@ if _TRITON_BLOCK_PTR_REMOVED and (_DECODE_USES_BLOCK_PTR is True or _MAIN_USES_B
             "with much more memory. Install the Triton your torch pins."
         )
 def _guarded_exports(compiled_flex_attention, raw_flex_attention, forced_options):
-    """Both exported callables with the main kernel for short queries. The uncompiled one reaches the same kernel
-    choice inside a caller's torch.compile."""
+    """Both exported callables with the main kernel for short queries."""
     return (
         _main_kernel_for_short_queries(compiled_flex_attention, forced_options),
         _main_kernel_for_short_queries(raw_flex_attention, forced_options),
