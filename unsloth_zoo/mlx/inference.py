@@ -5281,7 +5281,8 @@ _QWEN4_FORWARD_CONTRACT = {
 class SpeculativeFamily(NamedTuple):
     """`language`'s forward object `target`, a `module.forward` entered at `entry` ("verify", or "__call__" when it also
     decodes), served once `contract` holds. `capabilities` maps the further optimizations its arithmetic admits,
-    "attention" and "lanes", to the bodies each pins apart (the lanes' own contract is the kernel's)."""
+    "attention", "lanes" and "invariant_attention" (its one-token decode attention body), to the bodies each pins
+    apart (the lanes' own contract is the kernel's)."""
     language: str
     target: str
     module: str
@@ -6379,7 +6380,9 @@ def _exact_verify_class(base, name, *cache_key):
     def block_attention(self, attention, x, mask, cache, position_ids, position_embeddings):
         # The native two-row call launches for both rows' keys, so pairs the rows below can mask come here.
         pair = isinstance(mask, str) and mask == "causal" or isinstance(mask, mx.array) and mask.ndim >= 4
-        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] < 2
+        # A layer `row_invariant_attention` holds attends one-row blocks as its decode steps do.
+        invariant = _invariant_attention_held(attention)
+        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] < 2 and not invariant
                 or x.shape[1] == 2 and not pair or not _bindings_intact(attention_bindings)):
             return base._attention(self, attention, x, mask, cache, position_ids, position_embeddings)
         # The native body for a wider block, with its one-row SDPA calls handed to `_exact_attention`.
@@ -6387,10 +6390,15 @@ def _exact_verify_class(base, name, *cache_key):
         q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
             q_proj_output, keys, values, cache, position_ids, position_embeddings, mask)
-        if isinstance(mask, str) and mask == "left_padded_decode":
+        padded = isinstance(mask, str) and mask == "left_padded_decode"
+        if padded:
             mask = None
-        output = self._helpers()._qwen3_5_left_padded_attention(
-            queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
+        output = _invariant_attention(queries, keys, values, attention.scale, cache, mask) if invariant else None
+        if output is None and (length > 1 or padded):
+            output = self._helpers()._qwen3_5_left_padded_attention(
+                queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
+        if output is None and length == 1:
+            output = module.scaled_dot_product_attention(queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
         if output is None:
             prefix = module.kv_sequence_length(keys) - length
 
@@ -7008,6 +7016,113 @@ def row_invariant_lane_projections(model, *, _modules = None):
                         owner.__class__ = type(owner)._unsloth_lane_native
                     if owner is verifier:
                         _layer_verifier(verifier, _verifier_native(type(verifier)))
+
+
+# The one-token decode body whose attention `row_invariant_attention` reroutes (verify blocks reach it through the
+# family's "attention" capability), and the batch cache whose rows it attends as the row-wise forward extracts them.
+_INVARIANT_ATTENTION_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.language": {"Qwen3_5Attention.__call__": "f90d80c414d62ac1",
+                                        "_qwen3_5_left_padding_info": "ef87537a11cd4671",
+                                        "_qwen3_5_left_padded_attention": "df12e7fbee9adf0e"},
+    "mlx_vlm.models.cache": {"BatchKVCache.update_and_fetch": "73901e5b680dfb41", "BatchKVCache.extract": "ff095c4fa939e86a",
+                             "BatchKVCache.make_mask": "5a43f29692bfa568"},
+}
+
+
+def _invariant_attention(queries, keys, values, scale, cache, mask):
+    """`attention.invariant_attention` for a KV-cache layer's causal block or lone query row, else None. A batch
+    cache's rows each attend their keys past their left padding: the keys a row's extracted cache holds."""
+    if not attention.invariant_attention_supported(queries, keys, values):
+        return None
+    if type(cache) is getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None):
+        causal = isinstance(mask, str) and mask == "causal" or mask is None and queries.shape[2] == 1
+        return attention.invariant_attention(queries, keys, values, scale) if causal else None
+    batch = getattr(sys.modules.get("mlx_vlm.models.cache"), "BatchKVCache", None)
+    if batch is None or any(getattr(type(cache), name, None) is not getattr(batch, name)
+                            for name in ("update_and_fetch", "extract", "make_mask")):
+        return None
+    pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
+    pads = pads or (sys.modules["mlx_vlm.models.qwen3_5.language"]._qwen3_5_left_padding_info(cache) or ((),))[0]
+    if len(pads) != queries.shape[0] or not 0 <= min(pads) <= max(pads) <= keys.shape[2] - queries.shape[2]:
+        return None
+    if len(set(pads)) == 1:
+        return attention.invariant_attention(queries, keys[:, :, pads[0]:], values[:, :, pads[0]:], scale)
+    return mx.concatenate([attention.invariant_attention(queries[i:i + 1], keys[i:i + 1, :, pad:], values[i:i + 1, :, pad:], scale)
+                           for i, pad in enumerate(pads)], axis = 0)
+
+
+def _invariant_attention_held(module):
+    return module.__dict__.get("_unsloth_invariant_attention", 0) > 0 and _bindings_intact(module._unsloth_invariant_bindings)
+
+
+@functools.cache
+def _invariant_attention_class(base):
+    call = base.__call__
+    helper, padded = call.__globals__["scaled_dot_product_attention"], call.__globals__["_qwen3_5_left_padded_attention"]
+
+    def attend(queries, keys, values, cache, scale, mask, sinks = None, **kwargs):
+        out = None
+        if sinks is None and not kwargs and queries.shape[2] == 1:   # prefill stays stock
+            out = _invariant_attention(queries, keys, values, scale, cache, mask)
+        return helper(queries, keys, values, cache, scale, mask, sinks = sinks, **kwargs) if out is None else out
+
+    def attend_padded(queries, keys, values, *, cache, scale, mask):
+        out = _invariant_attention(queries, keys, values, scale, cache, mask) if queries.shape[2] == 1 else None
+        return padded(queries, keys, values, cache = cache, scale = scale, mask = mask) if out is None else out
+
+    def decode_call(self, *args, **kwargs):
+        if _invariant_attention_held(self) and not self.training:
+            routed = FunctionType(call.__code__, {**call.__globals__, "scaled_dot_product_attention": attend,
+                                                  "_qwen3_5_left_padded_attention": attend_padded},
+                                  call.__name__, call.__defaults__, call.__closure__)
+            routed.__kwdefaults__ = call.__kwdefaults__
+            return routed(self, *args, **kwargs)
+        return call(self, *args, **kwargs)
+
+    return type(f"_InvariantAttention{base.__name__}", (base,), {"__call__": decode_call, "_unsloth_invariant_native": base})
+
+
+@contextmanager
+def row_invariant_attention(model, *, _modules = None):
+    """Opt-in (`UNSLOTH_MLX_FAST_VERIFY=1`), on GPUs with tensor units: the KV-cache attention of one-token
+    decode steps and of the exact verifier's blocks runs on `attention.invariant_attention`, whose rows do not depend
+    on the block, so verify rows stay Fast Verify's one-token decoding while a block reads each key once for all its
+    rows. Not stock's bits (within fp32 reordering of stock attention); prefill stays stock. A subprocess probe gates
+    the kernel; other, training and distributed models keep their methods.
+    """
+    changed = []
+    try:
+        with _VERIFY_LOCK:
+            calls = {}
+            for family in SPECULATIVE_FAMILIES.values():
+                pins = family.capabilities.get("invariant_attention")
+                # Decode and verify switch together: both need every body either side pins.
+                parts = [] if pins is None else [_resolved_bindings(c) for c in (pins, family.contract, family.capabilities["attention"])]
+                if parts and None not in parts:
+                    calls.update((target, sum(parts, [])) for _, name, target in parts[0] if name == "__call__")
+            # Off where the lane projections are (`fast_verify_enabled`).
+            if (calls and _lane_coverage(model, _modules)[3] and _resolved_bindings(_NAX_QMM_CONTRACT) is not None
+                    and nax.kernel_probe_passed(matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available)
+                    and nax.kernel_probe_passed(attention.INVARIANT_PROBE_KEY, attention.__name__, "probe_invariant_attention")):
+                for _, module in _fusion_modules(model, _modules):
+                    if not isinstance(module, nn.Module) or module.training:
+                        continue
+                    if "_unsloth_invariant_native" not in vars(type(module)):
+                        if getattr(type(module), "__call__", None) not in calls:
+                            continue
+                        module.__dict__["_unsloth_invariant_bindings"] = calls[type(module).__call__]
+                        module.__class__ = _invariant_attention_class(type(module))
+                    module._unsloth_invariant_attention = module.__dict__.get("_unsloth_invariant_attention", 0) + 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for module in reversed(changed):
+                module._unsloth_invariant_attention -= 1
+                if not module._unsloth_invariant_attention:
+                    for name in ("_unsloth_invariant_attention", "_unsloth_invariant_bindings"):
+                        module.__dict__.pop(name)
+                    module.__class__ = type(module)._unsloth_invariant_native
 
 
 class _TargetHeadFP32(nn.Module):
@@ -8443,7 +8558,8 @@ SPECULATIVE_FAMILIES = {
         language = "mlx_vlm.models.qwen3_5.language", target = "_EXACT_SPECULATIVE_VERIFIER",
         module = "mlx_vlm.models.qwen3_5.speculative_verifier", forward = "Qwen3_5BatchInvariantForward",
         entry = "verify", submit_layers = True, contract = _EXACT_VERIFY_CONTRACT,
-        capabilities = {"attention": _EXACT_ATTENTION_CONTRACT, "lanes": {}}),
+        capabilities = {"attention": _EXACT_ATTENTION_CONTRACT, "lanes": {},
+                        "invariant_attention": _INVARIANT_ATTENTION_CONTRACT}),
     "qwen4_exp": SpeculativeFamily(
         language = "mlx_vlm.models.qwen4_exp.language", target = "_QWEN4_BATCH_INVARIANT_FORWARD",
         module = "mlx_vlm.models.qwen4_exp.language", forward = "Qwen4ExpBatchInvariantForward",
@@ -8490,6 +8606,7 @@ INFERENCE_SCOPES = [
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(speculative_call, speculative = True),
     InferenceScope(row_invariant_lane_projections, speculative = True, opt_in = _FAST_VERIFY_ENV),
+    InferenceScope(row_invariant_attention, speculative = True, opt_in = _FAST_VERIFY_ENV),
     InferenceScope(target_head_precision, speculative = True, opt_in = _FAST_VERIFY_ENV),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
     InferenceScope(fused_decode_attention),

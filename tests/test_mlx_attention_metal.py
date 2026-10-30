@@ -64,6 +64,8 @@ from unsloth_zoo.mlx.attention import (
     fast_prefill_supported,
     fused_kernel_exists,
     install_quantized_attention,
+    invariant_attention_supported,
+    probe_invariant_attention,
     probe_fast_prefill,
     probe_simd_prefill,
     quantized_sdpa_over,
@@ -749,3 +751,22 @@ def test_qsa_simd_prefill_covers_query_groups_up_to_16(change):
     queries, keys = mx.zeros((B, H, L, D), dtype), mx.zeros((B, KV, 4096, D), dtype)
     covered = change in (None, "group", "topk")
     assert simd_prefill_supported(queries, keys, mx.zeros((B, L, topk), mx.int32), block) == covered
+
+
+def test_invariant_attention_rows_are_their_one_row_calls_and_near_fp32():
+    if not nax.nax_available():
+        pytest.skip("needs the neural accelerators")
+    probe_invariant_attention()
+
+
+@pytest.mark.parametrize("change", [None, "group", "width", "fp16", "dtypes", "rows", "batch", "heads", "values", "dim"])
+def test_invariant_attention_covers_kv_cache_layouts(change):
+    shapes = {"group": (1, 12, 3), "rows": (1, 24, 4, 4), "batch": (2, 24, 4, 4096)}.get(change, (1, 24, 4))
+    B, H, KV, N = (*shapes, 4096)[:4]
+    D = {"width": 128, "dim": 96}.get(change, 256)
+    dtype = mx.float16 if change == "fp16" else mx.bfloat16
+    q = mx.zeros((B, H, 5, D), dtype)
+    k = mx.zeros((B if change != "batch" else 1, KV if change != "heads" else 5, N, D), dtype)
+    v = k.astype(mx.float16) if change == "dtypes" else k[:, :, :-1] if change == "values" else k
+    covered = change in (None, "group", "width", "fp16")
+    assert invariant_attention_supported(q, k, v) == covered

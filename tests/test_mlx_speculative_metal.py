@@ -575,11 +575,12 @@ def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkey
 def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_restore(qwen_4bit, monkeypatch, mixed):
     import copy
     from mlx_vlm.models.qwen3_5 import language, speculative_verifier
-    from unsloth_zoo.mlx import inference, matmul
+    from unsloth_zoo.mlx import inference, matmul, nax
     from unsloth_zoo.mlx.generate import SamplingParams, generation_mode
     if not matmul.lane_qmm_available():
         pytest.skip("the lane kernel needs an Apple GPU")
     (model, ids, cache), rows, kernel = qwen_4bit, [], matmul.lane_qmm
+    invariant = lambda: any(type(m).__name__.startswith("_Invariant") for _, m in model.named_modules())
     verifier, native = language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
     unscoped, block = copy.copy(model.language_model), mx.array([ids[0][24:36]])   # shares the projections
     monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: rows.append((len(args[0]), args[1].shape[0])) or kernel(*args, **kwargs))
@@ -594,12 +595,19 @@ def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_res
         [patch.setenv(*switch) for switch in (("UNSLOTH_MLX_FAST_VERIFY", "1"), ("UNSLOTH_MLX_LANE_QMM", "0"))]
         with generation_mode(model, call = ("batch", "speculative")):
             assert "_unsloth_lane_verify_native" not in vars(type(verifier)) and not inference.fast_verify_enabled()
+            assert not invariant()
     with inference.row_invariant_lane_projections(model):   # also without the exact scope under it, which may nest inside
         assert type(verifier)._unsloth_lane_verify_native is native
         with inference.exact_speculative_verify(model):
             assert type(verifier)._unsloth_lane_verify_native._unsloth_verify_native is native
         assert type(verifier)._unsloth_lane_verify_native is native
     assert type(verifier) is native
+    with inference.row_invariant_attention(model):   # decode attention moves only with the verifier its blocks take
+        assert invariant() == nax.nax_available()
+    with monkeypatch.context() as patch:
+        patch.setattr(native, "_linear", lambda self, *args: None)
+        with inference.row_invariant_attention(model):
+            assert not invariant()
     monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
     assert inference.fast_verify_enabled(model) and not inference.fast_verify_enabled(object())
     with generation_mode(model, call = ("batch", "speculative")):
@@ -648,13 +656,20 @@ def test_row_invariant_lane_projections_verify_rows_equal_one_token_decoding(qwe
             assert mx.array_equal(out.logits.view(mx.uint16), decoded.view(mx.uint16)).item(), width
 
 
-def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_kernel(qwen_4bit, monkeypatch):
+@pytest.mark.parametrize("opt_in", ["1", "0"])
+def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_kernel(qwen_4bit, opt_in, monkeypatch):
     from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache, RotatingKVCache, make_prompt_cache
-    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx import attention, inference, matmul, nax
     from unsloth_zoo.mlx.generate import generation_mode
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
     (model, _, _), tokens = qwen_4bit, (qwen_4bit[1][0] * 80)[:4100]
     lm = model.language_model
     batched = lambda: [ArraysCache(size = 2) if layer.is_linear else BatchKVCache([0]) for layer in lm.model.layers]
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", opt_in)
+    # On tensor units the opt-in attends decode steps and verify blocks of either cache on the invariant kernel.
+    invariant, kernel, widths = opt_in == "1" and nax.nax_available(), attention.invariant_attention, []
+    monkeypatch.setattr(attention, "invariant_attention", lambda q, *a: widths.append(q.shape[2]) or kernel(q, *a))
     with generation_mode(model, call = ("batch", "speculative")):
         # Rows on either side of MLX's decode attention kernel changes; a batch cache's blocks carry a mask array.
         for prefix, make in [(1018, make_prompt_cache)] + [(prefix, make) for prefix in (1022, 4090)
@@ -667,6 +682,15 @@ def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_ker
                 out.gdn_states.abort()
                 decoded = mx.concatenate([lm(block[:, i:i + 1], cache = step).logits for i in range(width)], axis = 1)
                 assert mx.array_equal(out.logits.view(mx.uint16), decoded.view(mx.uint16)).item(), (prefix, width)
+        layers = sum(not layer.is_linear for layer in lm.model.layers)
+        assert sorted(widths) == (sorted(([1] * 75 + [2, 5, 8] * 5) * layers) if invariant else []), widths[:9]
+        if invariant:   # a ragged batch's one-token step: each row attends its own keys, as it decodes alone
+            caches, lengths = [make_prompt_cache(lm) for _ in range(2)], (1018, 1030)
+            for cache, n in zip(caches, lengths):
+                mx.eval(lm(mx.array([tokens[:n]]), cache = cache).logits)
+            alone = mx.concatenate([lm(mx.array([[tokens[n]]]), cache = _clone(c)).logits for c, n in zip(caches, lengths)])
+            both = lm(mx.array([[tokens[n]] for n in lengths]), cache = [type(a).merge([a, b]) for a, b in zip(*caches)]).logits
+            assert mx.array_equal(both.view(mx.uint16), alone.view(mx.uint16)).item()
         # A pair with a sliding window's 2-D mask keeps mlx-vlm's two-row call, which applies it.
         exact, routed = inference._exact_attention, []
         monkeypatch.setattr(inference, "_exact_attention", lambda q, *a, **kw: routed.append(q.shape[2]) or exact(q, *a, **kw))
@@ -676,7 +700,9 @@ def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_ker
                      for layer in lm.model.layers]
             mx.eval(lm(mx.array([tokens[:80]]), cache = cache).logits)
             lm(mx.array([tokens[80:82]]), cache = cache, speculative_verify = True, capture_layer_ids = []).gdn_states.abort()
-            assert routed == ([] if window else [2] * sum(not layer.is_linear for layer in lm.model.layers)), window
+            assert routed == ([] if window or invariant else [2] * layers), window
+    assert not any(type(m).__name__.startswith("_Invariant") or "_unsloth_invariant_attention" in m.__dict__
+                   for _, m in model.named_modules())
 
 
 @pytest.mark.parametrize("heads, dim", [((24, 4), 256), ((16, 2), 256), ((16, 4), 256), ((16, 2), 128), ((8, 4), 128)])
