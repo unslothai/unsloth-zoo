@@ -20,11 +20,6 @@ Nothing in Unsloth Zoo uses it; `unsloth_zoo.tiling_registry` replaces it."""
 
 import os
 import sys
-import math
-from collections import OrderedDict
-from types import MethodType
-import functools
-import weakref
 from fnmatch import fnmatch
 import torch
 from torch.utils.checkpoint import (
@@ -33,7 +28,7 @@ from torch.utils.checkpoint import (
     get_device_states,
 )
 from unsloth_zoo.gradient_checkpointing import set_device_states
-from unsloth_zoo.device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH
+from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
 
 
 __all__ = ["TiledMLP", "torch_amp_custom_fwd", "torch_amp_custom_bwd", "is_custom_module"]
