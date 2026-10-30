@@ -20,6 +20,7 @@ __all__ = [
     "_flex_attention",
     "flex_attention",
     "PREFILL_KERNEL_OPTIONS",
+    "decode_kernel_options",
     "create_block_mask_cached",
     "create_block_mask",
     "compiled_create_block_mask",
@@ -424,3 +425,52 @@ except:
     FLEX_LSE_KWARGS = {"return_lse": True}
     flex_output_and_lse = None
 pass
+
+
+def _triton_block_ptr_removed():
+    # Triton 3.9 (and triton-windows 3.9) turned tl.make_block_ptr into a NotImplementedError.
+    try:
+        import inspect
+        import triton.language.core as _tl_core
+        return "have been removed" in inspect.getsource(_tl_core.make_block_ptr)
+    except Exception:
+        return False
+
+
+def _flex_decode_template_uses_block_ptr():
+    # torch 2.6 - 2.12's flex_decoding template builds block pointers; 2.13+ does not. Read the file, no import.
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec("torch")
+        roots = list(spec.submodule_search_locations or []) if spec is not None else []
+    except Exception:
+        return False
+    for root in roots:
+        for rel in ("_inductor/kernel/flex/templates/flex_decode.py.jinja", "_inductor/kernel/flex_decoding.py"):
+            path = os.path.join(root, *rel.split("/"))
+            if os.path.exists(path):
+                try:
+                    with open(path, encoding = "utf-8") as f:
+                        return "make_block_ptr" in f.read()
+                except Exception:
+                    return False
+    return False
+
+
+# Decided at import (no file reads or logging inside traced decode code). When torch's flex_decoding cannot compile
+# against the installed Triton, the failed compile makes Dynamo skip flex_attention for the rest of the process and
+# every later call (prefill too) builds the full score matrix; one-token queries take the main flex kernel instead.
+FLEX_DECODING_UNAVAILABLE = bool(HAS_FLEX_ATTENTION) and _triton_block_ptr_removed() and _flex_decode_template_uses_block_ptr()
+if FLEX_DECODING_UNAVAILABLE:
+    import triton
+    from unsloth_zoo.log import logger
+    logger.warning(
+        f"Unsloth: Triton {triton.__version__} has no block pointers, which torch {torch.__version__}'s flex_decoding "
+        "needs; one-token decode uses the main flex kernel instead. Install the Triton your torch pins to get "
+        "flex_decoding back."
+    )
+
+
+def decode_kernel_options():
+    """kernel_options for a one-token query: AUTO (flex_decoding) unless it cannot compile here."""
+    return PREFILL_KERNEL_OPTIONS if FLEX_DECODING_UNAVAILABLE else {}
