@@ -1667,6 +1667,30 @@ def test_lane_qmm_covers_affine_2_to_8_bit_weights_on_apple_gpus(monkeypatch):
 
 
 @apple_gpu_only
+@apple_gpu_only
+def test_verify_lane_keeps_a_column_of_zero_codes_under_a_tiny_scale(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference
+
+    # 40 outputs keep the simdgroup-matrix kernel, whose folded code offset leaves such a column a tiny nonzero error.
+    proj = nn.QuantizedLinear(2048, 40, bias = False, group_size = 64, bits = 8).eval()
+    proj.weight = mx.zeros_like(proj.weight)
+    proj.scales = mx.full(proj.scales.shape, -1e-7, mx.bfloat16)
+    proj.biases = mx.zeros(proj.biases.shape, mx.bfloat16)
+    proj.set_dtype(mx.bfloat16)
+    proj._unsloth_lane_qmm = True
+    monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
+    monkeypatch.setattr(inference._VERIFY_STATE, "lane", True, raising = False)
+    bindings = inference._resolved_bindings(inference._NAX_QMM_CONTRACT)
+    offsets = []
+    for rows in (1, 8):
+        block = (mx.random.normal((1, rows, 2048), key = mx.random.key(rows)) * 8).astype(mx.bfloat16)
+        routed = inference._verify_lane(proj, block, bindings)
+        assert routed is not None, rows
+        offsets.append(mx.any(routed != 0).item())
+    assert any(offsets)
+
+
 def test_lane_qmms_keeps_each_weights_bits_on_every_reader():
     from unsloth_zoo.mlx import matmul
 

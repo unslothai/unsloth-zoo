@@ -4267,6 +4267,7 @@ class _SmallRowRoute(NamedTuple):
     takes_blocks: bool   # whether one sequence's [1, T, K] block routes
     state: str = "nax_qmm"
     reader: str = None
+    code_offset: bool = False   # the kernel may fold `s * (sum x (2^bits + q) - 2^bits * sum x)` out of each group
 
     def call(self, suffix, *args):
         kernel = getattr(self.module, self.kernel + suffix)
@@ -4279,7 +4280,7 @@ _NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_N
 _SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
                                  "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
 _LANE_QMM_ROUTE = _SmallRowRoute(matmul, "lane_qmm", "Lane", "row-invariant lane", "UNSLOTH_MLX_LANE_QMM", None,
-                                 ("LANE_QMM_PROBE_KEY", "probe_lane_qmm"), True, "lane_qmm")
+                                 ("LANE_QMM_PROBE_KEY", "probe_lane_qmm"), True, "lane_qmm", code_offset = True)
 
 
 def _small_row_route():
@@ -4289,8 +4290,9 @@ def _small_row_route():
     return _SIMD_QMM_ROUTE if matmul.simd_qmm_available() else None
 
 
-def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
-    """Compare the kernel with stock's fp32 qmv of each row, within fp32 reordering of K products.
+def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed, code_offset = False):
+    """Compare the kernel with stock's fp32 qmv of each row, within fp32 reordering of K products, and with
+    `code_offset` of the kernel's offset terms too.
 
     A batched native call is no reference: its qmm rounds dequantized weights to the input dtype.
     """
@@ -4300,8 +4302,10 @@ def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
                                                  group_size = group_size, bits = bits)
     rows = range(x.shape[0])
     reference = mx.concatenate([row(i, x32, scales32, biases32) for i in rows])
-    # |s q + b| <= |s| q + |b|, so this is a bound on sum_k |x_k w_k|.
-    magnitude = mx.concatenate([row(i, mx.abs(x32), mx.abs(scales32), mx.abs(biases32)) for i in rows])
+    # |s q + b| <= |s| q + |b|, so this is a bound on sum_k |x_k w_k|; a folded offset adds |s| 2^(bits + 1) |x_k|,
+    # which a column of zero codes under a nonzero scale leaves as the whole error.
+    spread = mx.abs(biases32) + (2.0 ** (bits + 1) if code_offset else 0.0) * mx.abs(scales32)
+    magnitude = mx.concatenate([row(i, mx.abs(x32), mx.abs(scales32), spread) for i in rows])
     got = routed.astype(mx.float32)
     bound = mx.finfo(x.dtype).eps * mx.abs(reference) + x.shape[-1] * 2.0 ** -23 * magnitude
     agree = (mx.abs(got - reference) <= bound) | (got == reference) | (mx.isnan(got) & mx.isnan(reference))
@@ -4347,7 +4351,8 @@ def _nax_small_m_qmm(module, x, bindings, route = None, rows = None):
     routed = route.call("", flat, w, scales, biases, group_size, bits)
     if verified is None:
         try:
-            verified = _settled(_nax_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed))
+            verified = _settled(_nax_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed,
+                                                        route.code_offset))
         except (RuntimeError, ValueError) as error:
             _unless_failed_buffer(error)
             return None  # inside a function transformation, which cannot evaluate; checked later
