@@ -144,13 +144,11 @@ def test_non_peft_model_biases_stay_frozen():
 
 
 def test_modules_to_save_bias_not_preserved_on_bias_none():
-    """With bias=none and modules_to_save the module is trainable as a whole, not as a bias decision; with
-    patch_modules_to_save=False bias and weight stay frozen (unsloth issue 2343 review)."""
+    """modules_to_save is trained as a whole, not via the PEFT bias branch."""
     pytest.importorskip("peft")
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.training_utils import prepare_model_for_training
 
-    # gate_proj has a bias and isn't a LoRA target, so PEFT wraps it as a saved module.
     model = get_peft_model(
         _tiny_llama(),
         LoraConfig(
@@ -171,15 +169,12 @@ def test_modules_to_save_bias_not_preserved_on_bias_none():
     )
     params = dict(model.named_parameters())
     assert _trainable_bias_count(model) == 0, "bias='none' must leave all biases frozen"
-    # Saved bias matches its weight (both frozen, not partially trained).
     assert params[saved_bias].requires_grad == params[saved_weight].requires_grad
 
 
 @pytest.mark.parametrize("bias", ["all", "lora_only"])
 def test_peft_trainable_bias_float16_gets_float32_master(bias):
-    """float16: a float16 trainable bias makes the GradScaler raise "Attempting to unscale FP16 gradients"
-    at the first step, so the bias gets a float32 master as LoRA A / B do; the float16 autocast the Trainer
-    runs under casts it back for the matmul."""
+    """float16: trainable biases get float32 masters so the GradScaler can unscale them."""
     pytest.importorskip("peft")
     from unsloth_zoo.training_utils import prepare_model_for_training
 
@@ -197,7 +192,6 @@ def test_peft_trainable_bias_float16_gets_float32_master(bias):
     base_w = next(n for n in params if n.endswith("q_proj.base_layer.weight"))
     assert params[base_w].dtype == torch.float16  # frozen base stays float16
 
-    # One float16 AMP step as the Trainer takes it (accelerate's GradScaler + float16 autocast).
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2)
     scaler = torch.amp.GradScaler("cpu")
     input_ids = torch.randint(0, 64, (2, 8))
@@ -236,8 +230,7 @@ def _trainable_biases(model):
 
 @pytest.mark.parametrize("bias", ["all", "lora_only"])
 def test_float16_bias_master_runs_without_autocast(bias):
-    """eval / generate run outside autocast: the float32 bias master must not reach a float16 matmul
-    ("self and mat2 must have the same dtype"), and must stay the float32 Parameter afterwards."""
+    """eval / generate outside autocast: the float32 master is cast to float16 in forward."""
     pytest.importorskip("peft")
     model = _float16_bias_model(bias)
     masters = _trainable_biases(model)
@@ -329,8 +322,7 @@ def test_float16_bias_master_merges_in_the_model_dtype(tmp_path):
 @pytest.mark.parametrize("bias", ["all", "lora_only"])
 @pytest.mark.parametrize("target", [torch.float32, torch.bfloat16])
 def test_float16_bias_master_follows_a_later_model_cast(bias, target):
-    """model.float() / model.bfloat16() after prepare: the bias hook must follow the module's current dtype,
-    not the float16 captured at install, or a plain forward fails with "self and mat2 must have the same dtype"."""
+    """model.float() / model.bfloat16() after prepare: the cast follows the current dtype."""
     pytest.importorskip("peft")
     model = _float16_bias_model(bias).to(target)
     with torch.no_grad():
@@ -348,8 +340,7 @@ def test_float16_bias_master_merged_then_cast(target):
 
 
 def test_float16_bias_master_runs_under_accelerate_cpu_offload():
-    """Accelerate's offload hook materializes params inside forward, after forward pre-hooks: the cast must be
-    applied at read time, and _parameters must keep a Parameter for set_module_tensor_to_device to rebuild."""
+    """Accelerate offload materializes params after pre-hooks: the cast must still apply."""
     pytest.importorskip("peft")
     accelerate = pytest.importorskip("accelerate")
     model = _float16_bias_model("all").eval()
@@ -364,8 +355,7 @@ def test_float16_bias_master_runs_under_accelerate_cpu_offload():
 
 
 def _replicate_on_cpu(module):
-    """torch.nn.parallel.replicate without CUDA: _replicate_for_data_parallel, then the replicated params set as
-    plain (non-leaf) attributes with _parameters left empty, as DataParallel does."""
+    """torch.nn.parallel.replicate without CUDA keeps the cast on replicas."""
     replica = module._replicate_for_data_parallel()
     replica._former_parameters = {}
     for key, child in module._modules.items():
@@ -381,8 +371,7 @@ def _replicate_on_cpu(module):
 
 
 def test_float16_bias_master_runs_on_data_parallel_replicas():
-    """DataParallel replicas hold the replicated bias as a plain attribute: the replica's forward must still see
-    it in float16, and the gradient must reach the float32 master."""
+    """DataParallel replicas hold the bias as a plain attribute and still see the cast."""
     pytest.importorskip("peft")
     model = _float16_bias_model("all")
     input_ids = torch.randint(0, 64, (1, 5))
@@ -397,8 +386,7 @@ def test_float16_bias_master_runs_on_data_parallel_replicas():
 
 
 def test_float16_bias_master_keeps_state_dict_and_pickles():
-    """state_dict keys and dtypes are unchanged, `.bias` outside forward is the float32 Parameter, and the model
-    survives deepcopy and a torch.save / torch.load round trip."""
+    """state_dict keys and dtypes unchanged; `.bias` outside forward is the float32 Parameter."""
     pytest.importorskip("peft")
     import copy
     import io
@@ -422,8 +410,7 @@ def test_float16_bias_master_keeps_state_dict_and_pickles():
 
 
 class _AttentionNet(torch.nn.Module):
-    """A Linear LoRA target feeding nn.MultiheadAttention, which reads out_proj.bias in
-    F.multi_head_attention_forward without calling out_proj, and its own in_proj_bias / bias_k / bias_v."""
+    """A LoRA target feeding nn.MultiheadAttention, which reads out_proj.bias functionally."""
 
     def __init__(self, add_bias_kv):
         super().__init__()
@@ -440,8 +427,7 @@ class _AttentionNet(torch.nn.Module):
 
 @pytest.mark.parametrize("add_bias_kv", [False, True])
 def test_float16_bias_master_multihead_attention(add_bias_kv):
-    """nn.MultiheadAttention consumes out_proj.bias, in_proj_bias, bias_k and bias_v functionally: all of them must
-    reach the float16 attention in float16, and their gradients must land on the float32 masters."""
+    """nn.MultiheadAttention reads all its biases functionally: all must be cast."""
     pytest.importorskip("peft")
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.training_utils import prepare_model_for_training
@@ -471,8 +457,7 @@ def test_float16_bias_master_multihead_attention(add_bias_kv):
 
 
 def test_float16_bias_master_survives_unmerge_in_forward():
-    """PEFT's Linear.forward unmerges a merged adapter first (under disable_adapter), subtracting the LoRA bias
-    through base_layer.bias.data: that write must reach the float32 master, not a temporary cast."""
+    """PEFT unmerge writes base_layer.bias.data under disable_adapter: it must reach the master."""
     pytest.importorskip("peft")
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.training_utils import prepare_model_for_training
@@ -507,8 +492,7 @@ def test_float16_bias_master_survives_unmerge_in_forward():
 
 
 def test_float16_bias_master_peft_multihead_attention():
-    """PEFT's lora.MultiheadAttention wraps the base attention: the base still marks out_proj's bias as its parent,
-    so a plain float16 forward and backward work with the adapter on the attention itself."""
+    """PEFT's lora.MultiheadAttention: the base attention still casts out_proj's bias."""
     pytest.importorskip("peft")
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.training_utils import prepare_model_for_training
@@ -522,7 +506,6 @@ def test_float16_bias_master_peft_multihead_attention():
         model, use_gradient_checkpointing=False, use_reentrant=False, full_finetuning=False,
     )
     masters = {n: p for n, p in model.named_parameters() if p.requires_grad and "lora_" not in n}
-    # PEFT wraps out_proj in a lora.Linear too; the base attention reads its bias through the wrapper.
     assert any(n.endswith(("out_proj.bias", "out_proj.base_layer.bias")) for n in masters)
     assert {p.dtype for p in masters.values()} == {torch.float32}
     x = torch.randn(2, 3, 16, dtype=torch.float16)
@@ -535,10 +518,7 @@ def test_float16_bias_master_peft_multihead_attention():
 
 
 def test_float16_bias_master_interrupt_does_not_leak_the_cast_model_wide():
-    """always_call forward hooks only run on Exception: a KeyboardInterrupt (Ctrl-C in a notebook) inside one
-    layer's forward leaves the in-forward mark set. That must not turn every other bias in the model into a float16
-    cast outside forward (a non-Parameter for nn.init, `.data` writes, Accelerate's dtype-matching re-materialize),
-    and the next forward clears what the interrupted one left."""
+    """A KeyboardInterrupt mid-forward leaves marks pushed; the next forward clears them."""
     pytest.importorskip("peft")
     model = _float16_bias_model("all")
     layers = model.base_model.model.model.layers
@@ -550,7 +530,6 @@ def test_float16_bias_master_interrupt_does_not_leak_the_cast_model_wide():
     hook.remove()
     other = layers[1].self_attn.q_proj.base_layer
     assert other.bias is other._parameters["bias"] and other.bias.dtype == torch.float32
-    # Training continues: the next step still lands float32 gradients on the masters.
     model(input_ids=torch.randint(0, 64, (1, 5))).logits.float().sum().backward()
     assert other._parameters["bias"].grad.dtype == torch.float32
     assert interrupted.bias is interrupted._parameters["bias"]

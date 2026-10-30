@@ -95,9 +95,7 @@ pass
 
 
 def _bias_compute_dtype(module):
-    """The dtype the module computes in now: its floating weight (a later model.float() / .bfloat16() or a merge
-    moves it; nn.MultiheadAttention's in_proj_weight / q_proj_weight), else bitsandbytes' compute_dtype /
-    quant_state dtype (a packed 4bit / 8bit weight), else float16, the only load dtype that installs the master."""
+    """Live compute dtype: floating weight, else bitsandbytes compute/quant dtype, else float16."""
     weight = None
     for weight_name in ("weight", "in_proj_weight", "q_proj_weight"):
         weight = getattr(module, weight_name, None)
@@ -113,10 +111,7 @@ def _bias_compute_dtype(module):
 
 
 def _float32_bias_master_property(name):
-    """Inside a marked forward (the top of the owner's stack is True), `module.<name>` is the float32 master cast (differentiably) to the compute dtype,
-    resolved at each read: after Accelerate materializes an offloaded bias, and on DataParallel replicas (which
-    keep the replicated bias as a plain attribute). bitsandbytes' in-place `bias.data = ...` downcast lands on the
-    cast. Outside forward, and in _parameters (state_dict, parameters(), optimizers), it is the float32 Parameter."""
+    """In a marked forward, `module.<name>` is the float32 master cast to the compute dtype; elsewhere the master."""
 
     def get(self):
         if name in self._parameters:
@@ -134,8 +129,7 @@ def _float32_bias_master_property(name):
         return master.to(dtype)
 
     def set(self, value):
-        # Reached only for a non-Parameter while the name is not registered (DataParallel replicas): nn.Module
-        # routes Parameters and registered names through _parameters itself.
+        # Only for unregistered non-Parameters (DataParallel replicas).
         self.__dict__[name] = value
 
     def delete(self):
@@ -145,7 +139,6 @@ def _float32_bias_master_property(name):
 
 
 def _float32_bias_master_reduce(self):
-    """__reduce__ via the importable base class, so pickle / torch.save need no generated symbol."""
     getstate = getattr(self, "__getstate__", None)
     state = getstate() if getstate is not None else self.__dict__
     cls = type(self)
@@ -179,15 +172,13 @@ def _float32_bias_master_class(cls, names):
 
 
 def _float32_bias_master_replicate(self):
-    # DataParallel replicas run in parallel threads: each gets its own stack (the shallow __dict__ copy shares it).
+    # Replicas run in parallel threads; the shallow __dict__ copy would share the stack.
     replica = super(type(self), self)._replicate_for_data_parallel()
     replica._unsloth_bias_in_forward = []
     return replica
 
 
 def _owner_stack(module, path):
-    # Resolved per call (DataParallel replicas have their own children); None once a path is gone (merge_and_unload
-    # replaces the PEFT wrapper by its base layer, which keeps its own hooks).
     for part in path.split(".") if path else ():
         module = module._modules.get(part)
         if module is None:
@@ -210,8 +201,7 @@ def _float32_bias_exit_forward(module, args, output):
 
 
 def _float32_bias_reset_stacks(module, args):
-    # always_call forward hooks only run on Exception: a KeyboardInterrupt mid-forward leaves marks pushed. A
-    # top-level forward starts with nothing in flight, so it clears them.
+    # always_call hooks skip KeyboardInterrupt, which would leave marks pushed.
     for in_forward in module._unsloth_bias_stacks:
         in_forward.clear()
 
@@ -234,15 +224,11 @@ def _mark_in_forward(module, path, cast):
 
 
 def _cast_bias_in_forward(model, owner_name, names = ("bias",)):
-    """The cast is a per-class property for each master name, read lazily, not a pre-hook swapping _parameters:
-    pre-hooks run before Accelerate materializes offloaded params, and DataParallel replicas bypass _parameters.
-    Not a parametrization either, which renames state_dict keys. A subclass with the same __name__, so isinstance
-    and name checks still match.
+    """A lazy class property, not a pre-hook (runs before Accelerate materializes offloaded params; DataParallel
+    bypasses _parameters) nor a parametrization (renames state_dict keys).
 
-    Hooks push onto the owner's stack; the property casts while its top is True. The owner pushes True, and so does
-    its nearest non-PEFT ancestor, which may read the bias without calling the owner (nn.MultiheadAttention's
-    out_proj, Mamba's conv1d, DETR's k_linear). PEFT tuner layers in between push False: they call base_layer(x)
-    normally, and their forward writes base_layer.bias.data (unmerge with lora_bias), which must reach the master."""
+    The owner and its nearest non-PEFT ancestor (may read the bias functionally, e.g. MHA out_proj) push True;
+    PEFT layers between push False, since their bias.data writes (unmerge with lora_bias) must reach the master."""
     module = model.get_submodule(owner_name)
     cls = type(module)
     base = cls.__dict__.get("_unsloth_bias_base")
@@ -600,7 +586,7 @@ def prepare_model_for_training(
     # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to
     # requires_grad=True and would all stay trainable on the LoRA path (#2343 review).
     _is_peft_model = hasattr(model, "peft_config")
-    # Read before the loop: the loop reuses `dtype` for each parameter's cast.
+    # The loop reuses `dtype`.
     _loaded_float16 = dtype == torch.float16
     _float32_bias_owners = []
 
@@ -627,12 +613,8 @@ def prepare_model_for_training(
                 # Linear breaks the matmul. modules_to_save is excluded so a saved head
                 # with a frozen weight isn't partially trained via its bias (#2343 review).
                 requires_grad = True
-                # float16 is the exception: the GradScaler refuses float16 gradients ("Attempting to
-                # unscale FP16 gradients"), so the bias gets a float32 master as LoRA A / B do. The
-                # owning module (and its parent, which may read it functionally) sees it cast to float16
-                # in forward, so eval / generate outside autocast still match dtypes.
-                # Only a float16 tensor the owner reads by its own name (bias, in_proj_bias, bias_k, ...): a
-                # ".weight" under a bias-named module (T5's relative_attention_bias) is the owner's own weight.
+                # float16: GradScaler refuses fp16 grads, so use a float32 master cast back in forward.
+                # Skip ".weight" (T5's relative_attention_bias is a weight).
                 if _loaded_float16 and param.dtype == torch.float16 and not name.endswith(".weight"):
                     upcast = True
                     _float32_bias_owners.append(name)
