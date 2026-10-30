@@ -6662,12 +6662,12 @@ def _lora_is_sharded(model):
         from torch.distributed.tensor import DTensor
     except Exception:
         return False
-    # First adapter decides; avoids walking every parameter on each load_lora.
-    sharded = False
-    for n, p in model.named_parameters():
-        if ".lora_A." in n or ".lora_B." in n:
-            sharded = isinstance(p, DTensor)
-            break
+    # Any adapter decides: one left out of FSDP2 (ignored_params) stays a plain tensor beside sharded ones.
+    sharded = any(
+        isinstance(p, DTensor)
+        for n, p in model.named_parameters()
+        if ".lora_A." in n or ".lora_B." in n
+    )
     if sharded: model.__dict__["_unsloth_lora_is_sharded"] = True
     return sharded
 pass
