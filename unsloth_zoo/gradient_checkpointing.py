@@ -60,6 +60,8 @@ __all__ = [
     "non_reentrant_offload_hooks",
     "activation_offloader_for",
     "get_activation_offload_stats",
+    "attention_saving_context_fn",
+    "unsloth_selective_checkpoint_kwargs",
 ]
 
 # Initial buffer sizes for gradient checkpointing
@@ -2419,6 +2421,76 @@ def get_activation_offload_stats(reset = False):
             offloader.stats = _new_offload_stats()
             offloader.stats["kept"] = kept
     return total
+pass
+
+
+# Attention kernels whose outputs (attention output and logsumexp) selective checkpointing keeps, so backward
+# recomputes the projections and MLP of a layer but not its attention.
+_ATTENTION_OP_NAMES = (
+    "_scaled_dot_product_flash_attention",
+    "_scaled_dot_product_efficient_attention",
+    "_scaled_dot_product_cudnn_attention",
+    "_scaled_dot_product_flash_attention_for_cpu",
+    "_scaled_dot_product_fused_attention_overrideable",
+    "_flash_attention_forward",
+    "_efficient_attention_forward",
+)
+_EXTERNAL_ATTENTION_OPS = (
+    ("flash_attn", "_flash_attn_forward"),
+    ("flash_attn", "_flash_attn_varlen_forward"),
+    ("flash_attn_3", "fwd"),
+)
+
+
+def _attention_op_packets():
+    packets = set()
+    for name in _ATTENTION_OP_NAMES:
+        packet = getattr(torch.ops.aten, name, None)
+        if packet is not None: packets.add(packet)
+    for namespace, name in _EXTERNAL_ATTENTION_OPS:
+        try:
+            packets.add(getattr(getattr(torch.ops, namespace), name))
+        except (AttributeError, RuntimeError):
+            pass
+    return packets
+pass
+
+
+def selective_checkpoint_supported():
+    return hasattr(torch.utils.checkpoint, "create_selective_checkpoint_contexts") and \
+        hasattr(torch.utils.checkpoint, "CheckpointPolicy")
+pass
+
+
+def attention_saving_context_fn(extra_ops = ()):
+    """
+    All Unsloth Zoo code licensed under LGPLv3
+    `context_fn` for torch's non-reentrant checkpoint that saves the attention kernels' outputs (the attention
+    output and its logsumexp) and recomputes everything else in backward. `extra_ops` adds op packets or
+    overloads to save as well (custom attention kernels).
+    """
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
+    packets = _attention_op_packets()
+    for op in extra_ops:
+        packets.add(getattr(op, "overloadpacket", op))
+
+    def policy(ctx, op, *args, **kwargs):
+        if getattr(op, "overloadpacket", op) in packets:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+    return create_selective_checkpoint_contexts(policy)
+pass
+
+
+def unsloth_selective_checkpoint_kwargs():
+    """
+    All Unsloth Zoo code licensed under LGPLv3
+    Extra keyword arguments for torch's non-reentrant checkpoint: `context_fn` saving attention outputs when
+    UNSLOTH_GC_SAVE_ATTENTION=1 (off by default), else none. Not valid with use_reentrant=True.
+    """
+    if os.environ.get("UNSLOTH_GC_SAVE_ATTENTION", "0") != "1" or not selective_checkpoint_supported():
+        return {}
+    return {"context_fn": attention_saving_context_fn}
 pass
 
 

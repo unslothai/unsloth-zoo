@@ -726,3 +726,72 @@ def test_budgeted_offload_is_off_by_default(G, fake):
     loss = model(x).square().mean()
     assert offloader.stats["offloaded"] == 3 and offloader.stats["kept"] == 0
     loss.backward()
+
+
+class _Attention(torch.nn.Module):
+    def __init__(self, d = 16, heads = 2):
+        super().__init__()
+        self.heads = heads
+        self.qkv = torch.nn.Linear(d, 3 * d)
+        self.o = torch.nn.Linear(d, d)
+
+    def forward(self, h):
+        b, t, d = h.shape
+        q, k, v = self.qkv(h).view(b, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
+        a = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal = True)
+        return h + self.o(a.transpose(1, 2).reshape(b, t, d))
+
+
+def _attention_runs(G):
+    from torch.utils._python_dispatch import TorchDispatchMode
+    packets = G._attention_op_packets()
+
+    class Count(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+            if func.overloadpacket in packets: self.n += 1
+            return func(*args, **(kwargs or {}))
+    return Count
+
+
+@pytest.mark.skipif(not hasattr(ckpt, "create_selective_checkpoint_contexts"), reason = "torch without selective checkpointing")
+@pytest.mark.parametrize("with_offload", [False, True])
+def test_selective_checkpoint_saves_attention_instead_of_recomputing_it(G, fake, monkeypatch, with_offload):
+    # CPU only: the counting dispatch mode is thread local and CPU backward runs on the calling thread.
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([_Attention() for _ in range(3)])
+    x = _input("cpu", 2, 8, 16)
+    offloader = fake(stream_mode = False)
+    Count = _attention_runs(G)
+
+    def run(context_fn):
+        h = x
+        for layer in layers:
+            kwargs = {} if context_fn is None else {"context_fn": context_fn}
+            with (offloader.hooks() if with_offload else contextlib.nullcontext()):
+                h = ckpt.checkpoint(layer, h, use_reentrant = False, **kwargs)
+        loss = h.square().mean()
+        with Count() as counter:
+            loss.backward()
+        return _grads(layers, x), counter.n
+
+    ref, recomputed = run(None)
+    assert recomputed == 3  # plain checkpointing reruns every layer's attention
+    grads, rerun = run(G.attention_saving_context_fn)
+    assert rerun == 0
+    for a, b in zip(grads, ref):
+        assert torch.allclose(a, b, rtol = 0, atol = 1e-6)
+
+
+def test_selective_checkpoint_kwargs_are_opt_in(G, monkeypatch):
+    monkeypatch.delenv("UNSLOTH_GC_SAVE_ATTENTION", raising = False)
+    assert G.unsloth_selective_checkpoint_kwargs() == {}
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    kwargs = G.unsloth_selective_checkpoint_kwargs()
+    if hasattr(ckpt, "create_selective_checkpoint_contexts"):
+        assert kwargs == {"context_fn": G.attention_saving_context_fn}
+    else:
+        assert kwargs == {}
