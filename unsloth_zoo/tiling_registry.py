@@ -382,6 +382,8 @@ def _merge(parts, contract):
 
 
 def _assemble(outs, output_contract):
+    if output_contract is None:
+        output_contract = ("rows",)
     first = outs[0]
     if torch.is_tensor(first):
         return _merge(outs, output_contract[0])
@@ -391,7 +393,7 @@ def _assemble(outs, output_contract):
     )
 
 
-def reference_tiled_call(fn, x, *token_args, n_tiles, needs_rng, output_contract = ("rows",)):
+def reference_tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = None):
     """Oracle engine: one non-reentrant checkpoint per tile (plain loop without autograd)."""
     from torch.utils.checkpoint import checkpoint
     xs = torch.tensor_split(x, n_tiles, dim = 0)
@@ -539,36 +541,42 @@ def _unflat(o, contract, lead):
     return o.reshape(*lead, o.shape[-1])
 
 
+def _tile_fn(module, feed_3d, contract, trailing, x_tile, *token_tiles):
+    """One tile through the module's inner forward. A module-level function bound with functools.partial (module
+    first, primitive constants after), so the op engine sees every parameter through `module`."""
+    rows = x_tile.shape[0]
+    head = (1, rows) if feed_3d else (rows,)
+    if torch.is_grad_enabled():
+        # Own storage per tile: the fused LoRA MLP writes dX into its input in backward, which would bump the
+        # version of the shared base every other tile's checkpoint saved. Tile-sized and short-lived.
+        x_tile = x_tile.clone()
+    call = [x_tile.reshape(*head, x_tile.shape[-1])]
+    for j, t in enumerate(token_tiles):
+        call.append(t.reshape(*head, *trailing[j]))
+    out = _inner_forward(module)(*call)
+    if torch.is_tensor(out):
+        return _flat(out, contract[0])
+    return tuple(_flat(o, contract[k] if k < len(contract) else "rows") for k, o in enumerate(out))
+
+
+def _engine_contract(contract):
+    # The engine sees 2-D [rows, ...] tiles and outputs, where rows and rows_flat both mean "concatenate rows". Let
+    # it infer the arity then (MoE blocks return a tuple on transformers 4.x and a tensor on 5.x); pass the spec
+    # through when it carries anything else (sum).
+    return None if set(contract) <= {"rows", "rows_flat"} else contract
+
+
 def _run_tiled(module, state, inner, args, n_tiles):
-    spec = state.spec
-    contract = spec.output_contract
+    contract = state.spec.output_contract
     x = args[0]
     lead = x.shape[:-1]
-    feed_3d = x.dim() >= 3
     x2 = x.reshape(-1, x.shape[-1])
-    token_idx = [i for i in spec.token_args if 0 < i < len(args)]
-    trailing = [args[i].shape[len(lead):] for i in token_idx]
-    token_flat = [args[i].reshape(x2.shape[0], -1) for i in token_idx]
-
-    def fn(x_tile, *token_tiles):
-        rows = x_tile.shape[0]
-        head = (1, rows) if feed_3d else (rows,)
-        call = list(args)
-        if torch.is_grad_enabled():
-            # Own storage per tile: the fused LoRA MLP writes dX into its input in backward, which would bump the
-            # version of the shared base every other tile's checkpoint saved. Tile-sized and short-lived.
-            x_tile = x_tile.clone()
-        call[0] = x_tile.reshape(*head, x_tile.shape[-1])
-        for j, i in enumerate(token_idx):
-            call[i] = token_tiles[j].reshape(*head, *trailing[j])
-        out = inner(*call)
-        if torch.is_tensor(out):
-            return _flat(out, contract[0])
-        return tuple(_flat(o, contract[k] if k < len(contract) else "rows") for k, o in enumerate(out))
-
+    trailing = tuple(tuple(a.shape[len(lead):]) for a in args[1:])
+    token_flat = [a.reshape(x2.shape[0], -1) for a in args[1:]]
+    fn = functools.partial(_tile_fn, module, x.dim() >= 3, tuple(contract), trailing)
     out = get_engine()(
         fn, x2, *token_flat,
-        n_tiles = n_tiles, needs_rng = needs_rng_state(module), output_contract = contract,
+        n_tiles = n_tiles, needs_rng = needs_rng_state(module), output_contract = _engine_contract(contract),
     )
     if torch.is_tensor(out):
         return _unflat(out, contract[0], lead)
@@ -582,8 +590,9 @@ def _tiled_forward(self, *args, **kwargs):
         return inner(*args, **kwargs)
     x = args[0]
     lead = x.shape[:-1]
-    for i in state.spec.token_args:
-        if 0 < i < len(args) and (not torch.is_tensor(args[i]) or args[i].shape[:len(lead)] != lead):
+    # Every extra positional argument must be a token argument, in order, with x's leading dims.
+    for i in range(1, len(args)):
+        if i not in state.spec.token_args or not torch.is_tensor(args[i]) or args[i].shape[:len(lead)] != lead:
             return inner(*args)
     rows = math.prod(lead)
     tile_rows = state.tile_rows
