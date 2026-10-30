@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tiny token-local modules shared by the sequence tiling tests."""
 import torch
 import torch.nn.functional as F
 
@@ -39,7 +38,6 @@ class GatedMLP(torch.nn.Module):
 
 
 class TopKMoE(torch.nn.Module):
-    """Qwen2-MoE style token-local top-k block: unpacks [B, S, H], returns (y, router_logits [B*S, E])."""
     def __init__(self, hidden = H, inter = I, n_experts = 4, top_k = 2):
         super().__init__()
         self.top_k = top_k
@@ -55,7 +53,7 @@ class TopKMoE(torch.nn.Module):
         w = (w / w.sum(dim = -1, keepdim = True)).to(x.dtype)
         out = torch.zeros_like(x)
         for e, expert in enumerate(self.experts):
-            mask = (sel == e).to(x.dtype)  # [N, k], dense so it traces without data-dependent shapes
+            mask = (sel == e).to(x.dtype)
             coef = (w * mask).sum(-1, keepdim = True)
             out = out + coef * expert(x)
         return out.reshape(b, s, h), router_logits
@@ -69,7 +67,6 @@ def load_balancing_loss(router_logits, n_experts, top_k):
 
 
 class LoRALinear(torch.nn.Module):
-    """Frozen base + trainable A/B, the PEFT shape without the PEFT dependency."""
     def __init__(self, base, r = 4):
         super().__init__()
         self.base = base

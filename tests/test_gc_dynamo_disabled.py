@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth_gradient_checkpoint stays opaque to Dynamo: under a caller's torch.compile it is one graph break, not a
-traced region that breaks again inside (the decorator once moved to a helper, and breaks went from 1 to 3)."""
+"""unsloth_gradient_checkpoint stays opaque to Dynamo: under a caller's torch.compile it is one graph break, not a"""
 
 import os
 import sys

@@ -44,13 +44,11 @@ def _max_flat_qlen(
     return max_flat_qlen
 pass
 
-# Cached for eager callers; compiled callers use _max_flat_qlen (plain arithmetic, nothing for Dynamo to trace around).
 get_max_flat_qlen = functools.cache(_max_flat_qlen)
 
 
 def _default_target_gb(device = None):
-    # Budget from free memory on the current device, keeping half; None means the current device, never GPU 0, because
-    # under torchrun GPU 0 is the wrong card and opens a CUDA context
+    # Current device, never GPU 0: under torchrun GPU 0 is the wrong card and opens a CUDA context.
     index = None
     if device is not None:
         if not isinstance(device, torch.device):
@@ -59,7 +57,6 @@ def _default_target_gb(device = None):
             return _host_target_gb()
         index = device.index
     if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
-        # torch.cuda.mem_get_info also covers ROCm (PyTorch aliases the cuda API).
         free = torch.cuda.mem_get_info(index)[0]
         return free / 1024 / 1024 / 1024 * 0.5
     if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -80,7 +77,6 @@ def _default_target_gb(device = None):
 pass
 
 def _host_target_gb():
-    # CPU / MPS / unified-memory backends: activations live in host RAM, budget from it.
     try:
         import psutil
         return psutil.virtual_memory().available / 1024 / 1024 / 1024 * 0.5

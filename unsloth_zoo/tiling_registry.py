@@ -16,17 +16,8 @@
 
 """Sequence tiling registry: which modules are token-local, and how their tiled outputs are put back together.
 
-A module is tiled only when it is known to treat every token row independently. Each eligible class has a
-`TileSpec`: which forward arguments carry the token axis and, per output, how the per-tile results combine
-(`rows`: concatenated and reshaped to the input's leading dims, `rows_flat`: already `[rows, ...]`, concatenated,
-`sum`: provably additive scalars, `refuse`: never tiled). Classes that mix tokens (attention, convolution,
-recurrence, pooling, patch merging), capacity-limited MoE and sequence-level aux-loss gates are refused.
-
 The tiled forward lives in the instance `forward`; the forward it tiles lives in `module._unsloth_forward`, so other
-patches (the fused LoRA MLP kernel) write their forward there and it runs inside every tile.
-
-Parallelism (`PARALLEL_RULE`): tiling is per rank and splits only the rows this rank holds.
-"""
+patches (the fused LoRA MLP kernel) write their forward there and it runs inside every tile."""
 
 import functools
 import itertools
@@ -72,8 +63,6 @@ PARALLEL_RULE = (
     "parameters are TP DTensors stay untiled (coverage reason \"tensor parallel\") unless UNSLOTH_TILED_MLP_TP=1."
 )
 
-# `True` / "1": the peak-aware plan, which keeps one tile when tiling would not lower the step peak (short
-# sequences then run at untiled speed). "arctic", "rows:N" and "target[:GB]" always tile.
 DEFAULT_MODE = "auto"
 _MAX_TILES = 4096
 _ENV_MODULES = "UNSLOTH_TILED_MLP_MODULES"
@@ -81,10 +70,6 @@ _ENV_TP = "UNSLOTH_TILED_MLP_TP"
 _OLD_SUFFIXES = (".mlp", ".ffn", ".feed_forward", ".ff", ".densereludense", ".block_sparse_moe")
 _CONTRACTS = ("rows", "rows_flat", "sum", "refuse")
 
-
-# ----------------------------------------------------------------------------------------------------------------
-# Specs and the built-in registry
-# ----------------------------------------------------------------------------------------------------------------
 
 @dataclass(frozen = True)
 class TileSpec:
@@ -125,12 +110,10 @@ _DENSE_NAME = re.compile(r"(mlp|feedforward|feed_forward|ffn|denseactdense|dense
 
 
 def _sequence_mixer(module):
-    """The first class in this subtree that can mix tokens, or None."""
     for m in module.modules():
         if isinstance(m, _SEQ_MIX_TYPES):
             return type(m).__name__
         name = type(m).__name__
-        # transformers' GPT-2 style Conv1D is a linear layer.
         if name == "Conv1D" and type(m).__module__.startswith("transformers"):
             continue
         low = name.lower()
@@ -143,7 +126,6 @@ def _is_dense_mlp(module):
     name = type(module).__name__
     if not _DENSE_NAME.search(name) or "sparse" in name.lower():
         return False
-    # Anything holding experts or a router is an MoE block; those are listed explicitly.
     if hasattr(module, "experts") or hasattr(module, "router"):
         return False
     return True
@@ -160,7 +142,6 @@ def _has_seq_aux_gate(module):
 _ROUTER = ("rows", "rows_flat")
 
 _BUILTINS = [
-    # Refusals first: they win over every rule below.
     TileSpec(
         ("SwitchTransformersSparseMLP", "NllbMoeSparseMLP", "GPTSanJapaneseSparseMLP"),
         family = "capacity-moe",
@@ -188,10 +169,8 @@ _BUILTINS = [
         family = "topk-moe",
     ),
     TileSpec("GptOssMLP", output_contract = _ROUTER, family = "gpt-oss"),
-    # Llama4TextMoe returns flat [rows, H] hidden plus router scores [rows, E].
     TileSpec("Llama4TextMoe", output_contract = ("rows_flat", "rows_flat"), family = "llama4-moe"),
     TileSpec(("NemotronHMLP", "NemotronHMoE", "NemotronHMOE"), family = "nemotron-h"),
-    # Width-changing, token-local projectors.
     TileSpec(
         (
             "LlavaMultiModalProjector", "LlavaNextMultiModalProjector", "LlavaOnevisionMultiModalProjector",
@@ -200,12 +179,10 @@ _BUILTINS = [
         family = "vlm-projector",
     ),
 ]
-# HF dense MLPs (Llama, Mistral, Qwen, Gemma, Phi, Granite, GLM, CLIP / SigLIP, T5 DenseReluDense, ...).
 _DENSE = TileSpec(_is_dense_mlp, family = "dense-mlp")
 
 
 def lookup(module):
-    """The matching TileSpec (a refusal included), or None for an unknown class."""
     for spec in _BUILTINS:
         try:
             if spec.matches(module):
@@ -219,10 +196,6 @@ def lookup(module):
         return _DENSE
     return None
 
-
-# ----------------------------------------------------------------------------------------------------------------
-# Plans
-# ----------------------------------------------------------------------------------------------------------------
 
 @dataclass(frozen = True)
 class TilePlan:
@@ -321,7 +294,7 @@ def _tile_rows(plan, hidden, intermediate, nbytes, budget_gb):
 
 
 def _bucket(rows, tile_rows):
-    # Power-of-two tile count: a compiled caller guards on the bucket, not the length. Never more tiles than rows.
+    # Power-of-two tile count: a compiled caller guards on the bucket, not the length.
     n = 1
     while n < _MAX_TILES and rows > tile_rows * n and n * 2 <= rows:
         n *= 2
@@ -363,7 +336,6 @@ def _infer_intermediate(module, hidden):
 
 
 def _input_width(module):
-    """in_features of the first linear in the subtree (registration order), or None."""
     for m in module.modules():
         v = getattr(m, "in_features", None)
         if isinstance(v, int) and not isinstance(v, bool) and v > 0:
@@ -385,10 +357,6 @@ def _device(module):
     return None
 
 
-# ----------------------------------------------------------------------------------------------------------------
-# Dropout detection (checkpoint recompute must replay masks only when a dropout is live)
-# ----------------------------------------------------------------------------------------------------------------
-
 _DROPOUT_TYPES = (getattr(torch.nn.modules.dropout, "_DropoutNd", torch.nn.Dropout),)
 # Bumped when a submodule is added under a tiled module (PEFT lora_dropout after install).
 _MODULE_TREE_VERSION = [0]
@@ -405,18 +373,15 @@ torch.nn.modules.module.register_module_module_registration_hook(_bump_module_tr
 
 
 def needs_rng_state(module):
-    """True when a dropout in this subtree is live, checked per forward (PEFT adds lora_dropout after install)."""
     if _is_compiling():
         # Weakrefs are unsupported under fullgraph=True; scan directly.
         return any(m.training and m.p > 0 for m in module.modules() if isinstance(m, _DROPOUT_TYPES))
     cached = module.__dict__.get("_unsloth_tiled_dropouts")
-    # id check: a deepcopy carries the cache but its subtree is not tracked yet.
     if cached is None or cached[0] != _MODULE_TREE_VERSION[0] or cached[1] != id(module):
         modules = tuple(module.modules())
         _TRACKED_MODULES.update((id(m), m) for m in modules)
         dropouts = tuple(m for m in modules if isinstance(m, _DROPOUT_TYPES))
         cached = (_MODULE_TREE_VERSION[0], id(module), dropouts)
-        # __dict__, not setattr: these are already children.
         module.__dict__["_unsloth_tiled_dropouts"] = cached
     for m in cached[2]:
         if m.training and m.p > 0:
@@ -424,7 +389,6 @@ def needs_rng_state(module):
     return False
 
 
-# Registry families whose modules draw no random numbers apart from dropout submodules (checked live).
 _DETERMINISTIC_FAMILIES = frozenset({"dense-mlp", "topk-moe", "gpt-oss", "llama4-moe", "nemotron-h", "vlm-projector"})
 # torch.nn classes that never draw random numbers (dropout is checked live; RReLU samples its slope in training).
 _DETERMINISTIC_TORCH_NN = frozenset({
@@ -438,8 +402,7 @@ _DETERMINISTIC_TORCH_NN = frozenset({
 # Library code whose classes may skip the RNG replay: transformers' own models (not remote code, which loads as
 # transformers_modules), PEFT, bitsandbytes layers and Unsloth. Anything else (remote or user code) replays.
 _TRUSTED_LIBRARIES = ("transformers.", "peft.", "bitsandbytes.", "unsloth.", "unsloth_zoo.")
-# Code whose only randomness is a dropout submodule (PEFT's lora_dropout, which the fused LoRA kernels read): its
-# source names dropout, so it is exempt from the source scan below.
+# PEFT's lora_dropout source names dropout but only draws through the live-checked submodule.
 _DROPOUT_ONLY_MODULES = ("peft.", "unsloth.kernels.fast_lora", "bitsandbytes.")
 _RANDOM_SOURCE = re.compile(
     r"dropout|rrelu|\brand|randn|randint|randperm|multinomial|normal_|uniform_|bernoulli|exponential_|poisson|"
@@ -449,9 +412,7 @@ _SOURCE_VERDICT = {}
 
 
 def _code_may_draw_random(fn):
-    """True unless fn's source is readable and names no random op. Bound methods, partials and staticmethods are
-    unwrapped; anything whose source cannot be read counts as random. Calls into helpers are not followed, which is
-    why only trusted library classes may skip the replay at all (_class_is_trusted)."""
+    """True unless fn's source is readable and names no random op. Helpers are not followed, hence the trusted-class gate."""
     while isinstance(fn, functools.partial):
         fn = fn.func
     fn = getattr(fn, "__func__", fn)
@@ -486,9 +447,6 @@ def _class_is_trusted(m):
 
 
 def _subtree_may_draw_random(module):
-    """Conservative: True unless every class in the subtree is trusted library code and every forward this subtree
-    runs (class forwards, instance forwards, the adopted inner forward) is free of random ops other than dropout
-    submodules, which needs_rng_state checks live."""
     for m in module.modules():
         if not _class_is_trusted(m):
             return True
@@ -507,9 +465,7 @@ def _subtree_may_draw_random(module):
 
 
 def needs_rng_replay(module, spec):
-    """Whether a tile must snapshot and replay the RNG. Off only when provably unnecessary: a registry family known
-    to be deterministic, every class in the subtree trusted library code whose forwards are free of random ops, and
-    no live dropout. Forced, opted-in and unknown classes always replay, in training and in eval."""
+    """Off only when provably unnecessary; forced, opted-in and unknown classes always replay, in training and eval."""
     if needs_rng_state(module):
         return True
     if spec is None or spec.family not in _DETERMINISTIC_FAMILIES:
@@ -532,10 +488,6 @@ def _random_verdict(module):
     return cached
 
 
-# ----------------------------------------------------------------------------------------------------------------
-# The tiled forward
-# ----------------------------------------------------------------------------------------------------------------
-
 class _TileState:
     def __init__(self, spec, plan, hidden, intermediate, nbytes, budget_gb):
         self.spec = spec
@@ -545,8 +497,8 @@ class _TileState:
         self.nbytes = nbytes
         self.budget_gb = budget_gb
         self.tile_rows = _tile_rows(plan, hidden, intermediate, nbytes, budget_gb) if hidden else None
-        self.in_width = None  # in_features of the first linear: the input's last dim must match it
-        self.model_stats = None  # (parameter bytes, tiled layers) from install(), for the auto estimator
+        self.in_width = None
+        self.model_stats = None
 
 
 def _bind(module, fn):
@@ -559,9 +511,7 @@ def _bind(module, fn):
 
 
 def _adoptable(fn):
-    """An instance forward as stored in the inner slot. A plain function found on the instance (a lambda, a
-    torch.compile / compiler.disable wrapper) is already bound to its arguments, so it is wrapped to keep _bind
-    from passing the module as an extra first argument."""
+    """A plain function on the instance is already bound; wrap it so _bind does not pass the module again."""
     if isinstance(fn, types.FunctionType):
         return functools.partial(fn)
     return fn
@@ -584,9 +534,6 @@ def _unflat(o, contract, lead):
 
 
 def _tile_fn(module, feed_3d, contract, x_tile):
-    """One tile through the module's inner forward. A module-level function bound with functools.partial (module
-    first, primitive constants after), so a compiled tile body sees every parameter through `module`. The engine
-    hands each checkpointed tile its own copy of its rows (sequence_tiling._owned)."""
     rows = x_tile.shape[0]
     head = (1, rows) if feed_3d else (rows,)
     out = _inner_forward(module)(x_tile.reshape(*head, x_tile.shape[-1]))
@@ -596,9 +543,6 @@ def _tile_fn(module, feed_3d, contract, x_tile):
 
 
 def _engine_contract(contract):
-    # The engine sees 2-D [rows, ...] tiles and outputs, where rows and rows_flat both mean "concatenate rows". Let
-    # it infer the arity then (MoE blocks return a tuple on transformers 4.x and a tensor on 5.x); pass the spec
-    # through when it carries anything else (sum).
     return None if set(contract) <= {"rows", "rows_flat"} else contract
 
 
@@ -609,7 +553,6 @@ def _run_tiled(module, state, x, n_tiles, compile_tile = False):
     fn = functools.partial(_tile_fn, module, x.dim() >= 3, tuple(contract))
     if compile_tile:
         fn = _sequence_tiling._compiled_tile_fn(fn)
-    # Through the module attribute, so a test can wrap the engine.
     out = _sequence_tiling.tiled_call(
         fn, x2,
         n_tiles = n_tiles, needs_rng = needs_rng_replay(module, state.spec),
@@ -628,8 +571,7 @@ def _tiled_forward(self, *args, **kwargs):
     x = args[0]
     lead = x.shape[:-1]
     if state.in_width is not None and x.shape[-1] != state.in_width:
-        # Features are not the last dim (a channel-first input the forward flattens and transposes itself): the
-        # rows of x are not tokens, so tiling them would change the output.
+        # Channel-first input: the rows of x are not tokens, so tiling them would change the output.
         return inner(*args)
     rows = math.prod(lead)
     tile_rows = state.tile_rows
@@ -646,8 +588,6 @@ def _tiled_forward(self, *args, **kwargs):
     if _is_compiling():
         mode = _sequence_tiling._outside_graph_mode()
         if mode != "unroll":
-            # One graph break here (in this class's own copy of _tiled_forward); everything below runs eagerly, so
-            # no further frame is compiled per class.
             return _run_tiled_outside_graph(self, state, x, n_tiles, mode == "compile_tile")
     return _run_tiled(self, state, x, n_tiles)
 
@@ -655,21 +595,13 @@ def _tiled_forward(self, *args, **kwargs):
 _run_tiled_outside_graph = torch.compiler.disable(_run_tiled, recursive = True)
 
 
-# "auto" tiles only when the saving is worth the extra recompute (15-30% step time on G4).
 AUTO_MIN_SAVING_MIB = 512
 AUTO_MIN_SAVING_FRACTION = 0.10
 _AUTO_DECLINED = set()
 
 
 def estimate_tiling_gain(rows, hidden, intermediate, nbytes, n_tiles, param_bytes = 0, n_layers = 1):
-    """(saving, peak) in bytes for one step, estimated per decoder layer.
-
-    The MLP's live intermediates in backward are about 4 x rows x intermediate (gate, up, their product and one
-    gradient); the next largest per-layer transient is attention's q / k / v / output, about 4 x rows x hidden.
-    Tiling lowers the peak only by what the MLP exceeds that by. The step peak is the weights, the per-layer
-    checkpointed hidden states and the largest transient. Fused / chunked losses are assumed to stay below the MLP.
-    Calibrated on G4 measurements: Qwen3-0.6B bs 1 x 16k (no worthwhile gain) and Qwen3-4B bs 4 x 8k (2 GiB).
-    """
+    """(saving, peak) in bytes for one step, per decoder layer. Calibrated on G4: Qwen3-0.6B 1 x 16k, Qwen3-4B 4 x 8k."""
     mlp = 4 * rows * intermediate * nbytes
     other = 4 * rows * hidden * nbytes
     saving = max(0, mlp - max(other, mlp // max(1, n_tiles)))
@@ -698,9 +630,7 @@ _TILED_FORWARDS = {}
 
 
 def _tiled_forward_for(cls):
-    """_tiled_forward with its own code object per module class. Dynamo keeps graphs per code object and guards on
-    the class of `self`, so one function shared by every class would run into the recompile limit (8 by default)
-    on a model with many tiled classes compiled by the caller."""
+    """_tiled_forward with its own code object per class: one shared function hits Dynamo's recompile limit."""
     fn = _TILED_FORWARDS.get(cls)
     if fn is None:
         code = _tiled_forward.__code__.replace(co_name = f"_tiled_forward_{len(_TILED_FORWARDS)}")
@@ -752,7 +682,6 @@ def _attach(module, spec, plan, budget_cache):
     current = d.get("forward")
     if not _is_ours(current):
         if current is not None:
-            # An instance forward (mxfp4, grouped MoE, accelerate hook, fused LoRA MLP) is what this module runs.
             prior = d.get("_unsloth_forward")
             d["_unsloth_forward"] = _adoptable(current)
             _unchain(module, _bind(module, prior))
@@ -766,7 +695,7 @@ def _attach(module, spec, plan, budget_cache):
     budget = _budget(_device(module), budget_cache) if free_budget else 0.0
     state = d["_unsloth_tiling"] = _TileState(spec, plan, hidden, _infer_intermediate(module, hidden), nbytes, budget)
     state.in_width = _input_width(module)
-    _random_verdict(module)  # eager, so a compiled caller can read it
+    _random_verdict(module)
 
 
 def _detach(module):
@@ -779,13 +708,8 @@ def _detach(module):
         del d["forward"]
         if inner is not None and inner is not getattr(type(module), "forward", None):
             restored = d["forward"] = _bind(module, inner)
-    # A wrapper installed after tiling (accelerate's _old_forward) goes back to the forward that ran before tiling.
     _unchain(module, restored or _bind(module, inner))
 
-
-# ----------------------------------------------------------------------------------------------------------------
-# Self-check for opted-in classes
-# ----------------------------------------------------------------------------------------------------------------
 
 _SELF_CHECK = weakref.WeakKeyDictionary()
 _MISSING = object()
@@ -813,7 +737,6 @@ def _compare(want, got, dtype):
 
 
 def _contract_for(out, lead):
-    """Infer an output contract from an untiled forward (opted-in classes only)."""
     def one(o):
         if o is None:
             return "rows"
@@ -832,7 +755,6 @@ def _contract_for(out, lead):
 
 
 def _probed_forward(module):
-    """The forward the module runs untiled: an instance forward when one is set, else the adopted inner forward."""
     d = module.__dict__
     current = d.get("forward")
     if current is not None and not _is_ours(current):
@@ -854,10 +776,8 @@ def _compare_tiled(module, spec, inner, x, hidden, n_tiles, dtype):
 
 
 def _self_check(module, spec, n_tiles = 3):
-    """One eager check per instance and forward: tiled == untiled on a small row block, in eval and in training (with
-    dropout off, and buffers such as batch-norm statistics restored). Returns (spec or None, reason)."""
-    # Per instance: two instances of one class can differ in config (a sequence-mixing variant, another contract).
-    # Keyed on the forward too: a later revalidation may find a different one (a wrapper or kernel installed since).
+    """Tiled == untiled on a small row block, in eval and training; returns (spec or None, reason)."""
+    # Per instance and forward: instances can differ in config, and a later wrapper or kernel changes the forward.
     probed = _probed_forward(module)
     cached = _SELF_CHECK.get(module)
     if cached is not None and cached[0] is probed:
@@ -879,7 +799,6 @@ def _self_check(module, spec, n_tiles = 3):
         try:
             g = torch.Generator().manual_seed(1234)
             x = torch.randn(2, 7, hidden, generator = g).to(device = device, dtype = dtype)
-            # Probe what the module runs and what _attach will adopt: an instance forward when one is set.
             if current is not None and not _is_ours(current):
                 d["_unsloth_forward"] = _adoptable(current)
             inner = _inner_forward(module)
@@ -911,10 +830,6 @@ def _self_check(module, spec, n_tiles = 3):
     return result
 
 
-# ----------------------------------------------------------------------------------------------------------------
-# Selection, install, uninstall
-# ----------------------------------------------------------------------------------------------------------------
-
 def _matches(name, cls_name, patterns):
     low, cls_low = name.lower(), cls_name.lower()
     for p in patterns:
@@ -934,8 +849,8 @@ def _env_patterns():
 @dataclass
 class TilingReport:
     plan: object = None
-    tiled: list = field(default_factory = list)    # (name, class, family)
-    skipped: list = field(default_factory = list)  # (name, class, reason)
+    tiled: list = field(default_factory = list)
+    skipped: list = field(default_factory = list)
 
     @staticmethod
     def _counts(rows, key):
@@ -986,8 +901,7 @@ _TP_MESH_NAMES = ("tp", "tensor", "model")
 
 
 def _tensor_parallel(module):
-    """True when a parameter in this subtree is a tensor-parallel DTensor. A named mesh decides (FSDP2 meshes are
-    dp / dp_shard / dp_replicate); an unnamed mesh counts as TP unless the placements are FSDP2's Shard(0) alone."""
+    """True for a tensor-parallel DTensor parameter; FSDP2 meshes (dp / dp_shard / dp_replicate, Shard(0)) are not TP."""
     if _DTensor is None:
         return False
     for p in module.parameters():
@@ -1005,7 +919,6 @@ def _tensor_parallel(module):
 
 
 def _select(model, plan, extra, force):
-    """(name, module, spec or None, reason) for every candidate; descendants of a candidate are never visited."""
     out = []
     claimed = []
     for name, module in model.named_modules():
@@ -1046,10 +959,7 @@ def _select(model, plan, extra, force):
 
 
 def install(model, mode = DEFAULT_MODE, modules = None, *, force = None, verbose = True):
-    """Tile every eligible module of `model`; idempotent. Returns a TilingReport.
-
-    `mode`: see `parse_mode`; a false-y mode uninstalls. `modules`: only these name / class patterns are tiled.
-    `force`: patterns tiled even when refused or unknown, without the self-check."""
+    """Tile every eligible module of `model`; idempotent. `force` patterns skip the refusal and the self-check."""
     plan = parse_mode(mode)
     if plan is None:
         uninstall(model)

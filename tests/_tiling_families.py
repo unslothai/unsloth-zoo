@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tiny random-weight models per architecture family, built from in-code configs (offline, deterministic)."""
 
 import importlib
 
@@ -32,7 +31,6 @@ _COMMON = dict(
 
 _MOE = dict(num_experts = 4, num_experts_per_tok = 2, moe_intermediate_size = 48)
 
-# family -> (config class, model class, extra config kwargs)
 FAMILIES = {
     "llama": ("LlamaConfig", "LlamaForCausalLM", dict(_COMMON)),
     "qwen3": ("Qwen3Config", "Qwen3ForCausalLM", dict(_COMMON, head_dim = 8)),
@@ -84,7 +82,6 @@ FAMILIES = {
 
 
 def build(family, dtype = torch.float32, seed = 0, **overrides):
-    """A tiny random model of `family`, or None when the installed transformers lacks it."""
     import transformers
     cfg_name, model_name, kwargs = FAMILIES[family]
     cfg_cls = getattr(transformers, cfg_name, None)

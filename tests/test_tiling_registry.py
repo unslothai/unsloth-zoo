@@ -14,10 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Sequence tiling registry: coverage, refusals, self-check, install / uninstall contract, planning and shims.
-
-The family tests go only through `patch_tiled_mlp(model, "arctic")`, which exists before and after the rewrite, so the
-same file run against the old TiledMLP shows which cases it got wrong. CPU only."""
 
 import copy
 import functools
@@ -41,7 +37,7 @@ except ImportError:  # the old implementation has no registry; only the family t
 
 needs_registry = pytest.mark.skipif(R is None, reason = "registry not present")
 
-BATCH, SEQ = 2, 40  # 80 rows against hidden 32: arctic tiles every MLP
+BATCH, SEQ = 2, 40
 
 
 def _tiled(model):
@@ -59,7 +55,6 @@ def _count_inner_calls(module, counter, key):
 
 
 def _mlp_linear_names(model):
-    """Linear layers inside each module the registry would tile (LoRA on MLP only)."""
     probe = copy.deepcopy(model)
     patch_tiled_mlp(probe, "arctic")
     roots = list(_tiled(probe))
@@ -130,7 +125,6 @@ def test_family_tiled_matches_untiled_with_mlp_lora(family):
     if router and getattr(out_ref, "aux_loss", None) is not None:
         torch.testing.assert_close(out_tiled.aux_loss, out_ref.aux_loss)
 
-    # Upstream gradient into every tiled output, router logits included, via the loss.
     loss_ref, loss_tiled = out_ref.loss, out_tiled.loss
     if router and getattr(out_ref, "aux_loss", None) is not None:
         loss_ref = loss_ref + out_ref.aux_loss
@@ -185,10 +179,6 @@ def test_capacity_moe_is_never_tiled():
     torch.testing.assert_close(got, want)
 
 
-# ------------------------------------------------------------------------------------------------------------------
-# Registry-only behaviour
-# ------------------------------------------------------------------------------------------------------------------
-
 class _TokenMLP(torch.nn.Module):
     def __init__(self, h = 8, out = None):
         super().__init__()
@@ -206,7 +196,7 @@ class FooBlock(_TokenMLP):
 class BarBlock(_TokenMLP):
     def forward(self, x):
         y = super().forward(x)
-        return y + y.mean(dim = -2, keepdim = True)  # mixes tokens
+        return y + y.mean(dim = -2, keepdim = True)
 
 
 class _Holder(torch.nn.Module):
@@ -244,7 +234,6 @@ def test_unknown_class_needs_opt_in_then_self_check(monkeypatch, capsys):
     report = R.install(model, "rows:2")
     assert len(report.tiled) == 2 and all(R.is_tiled(layer.mlp) for layer in model.layers)
     assert "on 2 modules [FooBlock x2]" in capsys.readouterr().out
-    # One eager check per instance: a config can differ between instances of one class.
     assert len(R._SELF_CHECK) == 2
     x = torch.randn(2, 9, 8)
     ref = _Holder(FooBlock)
@@ -283,7 +272,6 @@ def test_refusals():
     assert "seq_aux" in R.lookup(DeepseekMoE()).refuse
     assert "sequence-mixing" in R.lookup(pooled).refuse
     assert "Conv1d" in R.lookup(GatedMLP()).refuse
-    # Opt-in does not override a refusal; "!" forces.
     model = torch.nn.Module()
     model.mlp = DeepseekMoE()
     assert not R.install(model, "rows:2:mlp", verbose = False).tiled
@@ -340,7 +328,6 @@ def test_install_is_idempotent_and_uninstall_restores():
 
 @needs_registry
 def test_inner_forward_slot_contract():
-    # llama.py's LoRA-MLP patch writes into _unsloth_forward when present; it must then run inside each tile.
     mlp = type("FooMLP", (_TokenMLP,), {})()
     R.install_module(mlp, "rows:2")
     seen = []
@@ -353,14 +340,12 @@ def test_inner_forward_slot_contract():
     x = torch.randn(1, 8, 8)
     torch.testing.assert_close(mlp(x), _TokenMLP.forward(mlp, x))
     assert seen == [2, 2, 2, 2]
-    # Unbound class forward (what _decline_fused_lora_for_fsdp writes back) also works.
     mlp._unsloth_forward = type(mlp).forward
     torch.testing.assert_close(mlp(x), _TokenMLP.forward(mlp, x))
 
 
 @needs_registry
 def test_instance_forward_is_adopted_and_restored():
-    # mxfp4 binds its forward on the instance; the class forward would skip it.
     mlp = type("FooMLP", (_TokenMLP,), {"forward": lambda self, x: _TokenMLP.forward(self, x) + 1000.0})()
 
     def real(self, x):
@@ -371,7 +356,7 @@ def test_instance_forward_is_adopted_and_restored():
     want = real(mlp, x)
     R.install_module(mlp, "rows:2")
     torch.testing.assert_close(mlp(x), want)
-    R.install_module(mlp, "rows:2")  # re-install keeps it
+    R.install_module(mlp, "rows:2")
     torch.testing.assert_close(mlp(x), want)
     R.uninstall(mlp)
     assert mlp.forward.__func__ is real
@@ -380,13 +365,11 @@ def test_instance_forward_is_adopted_and_restored():
 
 @needs_registry
 def test_grouped_moe_style_chain_does_not_recurse():
-    # enable_grouped_moe after tiling stores the tiled forward as _orig_moe_forward and installs its own; the
-    # revalidation must adopt it without the two calling each other forever.
     mlp = type("FooMLP", (_TokenMLP,), {})()
     R.install_module(mlp, "rows:2")
     mlp._orig_moe_forward = mlp.forward
 
-    def grouped(self, x):  # falls back on CPU, like grouped_moe_forward
+    def grouped(self, x):
         return self._orig_moe_forward(x)
 
     mlp.forward = MethodType(grouped, mlp)
@@ -482,7 +465,6 @@ def test_short_inputs_skip_the_engine(monkeypatch):
 
 @needs_registry
 def test_frozen_input_still_trains_mlp_params():
-    # Old TiledMLP: an input that does not require grad left the MLP's own parameters without gradients.
     mlp = type("FooMLP", (_TokenMLP,), {})()
     ref = copy.deepcopy(mlp)
     R.install_module(mlp, "rows:2")
@@ -522,22 +504,18 @@ def test_parallel_rule_is_documented():
     assert "per rank" in R.PARALLEL_RULE and "Ulysses" in R.PARALLEL_RULE
 
 
-# ------------------------------------------------------------------------------------------------------------------
-# Shims
-# ------------------------------------------------------------------------------------------------------------------
-
 @needs_registry
 def test_tiled_mlp_shims():
     from unsloth_zoo import memory_budget, tiled_mlp
     assert tiled_mlp._default_target_gb is memory_budget._default_target_gb
     assert tiled_mlp._host_target_gb is memory_budget._host_target_gb
     assert tiled_mlp.get_max_flat_qlen is memory_budget.get_max_flat_qlen
-    assert tiled_mlp.TiledMLP is not None  # kept for released Unsloth (test_tiled_mlp_legacy_imports.py)
+    assert tiled_mlp.TiledMLP is not None
     model = _Holder(lambda: type("FooMLP", (_TokenMLP,), {})())
     tiled_mlp.patch_tiled_mlp(model, "target:1")
     assert all(R.is_tiled(layer.mlp) for layer in model.layers)
     assert model.layers[0].mlp.__dict__["_unsloth_tiling"].plan.mode == "target"
-    m = FooBlock()  # unknown class: patch_mlp is an explicit request, so it is tiled
+    m = FooBlock()
     assert tiled_mlp.patch_mlp(m, target_arctic = True) is m and R.is_tiled(m)
 
 
@@ -554,7 +532,6 @@ def test_fused_losses_read_the_budget_from_memory_budget(monkeypatch):
 
 
 class _InplaceDX(torch.autograd.Function):
-    # Like unsloth's LoRA_MLP with inplace=True: dX is written into X's storage in backward.
     @staticmethod
     def forward(ctx, x, w):
         ctx.save_for_backward(x, w)
@@ -600,7 +577,6 @@ def test_install_on_the_module_itself_claims_its_children():
 
 @needs_registry
 def test_module_hooks_run_once_per_call_not_per_tile():
-    # The engine gets the inner forward, never the hooked module: FSDP2's unshard hooks would run per tile.
     mlp = type("FooMLP", (_TokenMLP,), {})()
     R.install_module(mlp, "rows:2")
     pre, post = [], []
@@ -630,7 +606,7 @@ def test_tensor_parallel_modules_are_skipped(monkeypatch, tmp_path):
         report = R.install(holder("tp"), "rows:2", verbose = False)
         assert not report.tiled and report.skipped[0][2].startswith("tensor parallel")
         assert "UNSLOTH_TILED_MLP_TP" in report.line()
-        assert R.install(holder("dp_shard"), "rows:2", verbose = False).tiled  # FSDP2 mesh: tiled
+        assert R.install(holder("dp_shard"), "rows:2", verbose = False).tiled
         monkeypatch.setenv("UNSLOTH_TILED_MLP_TP", "1")
         assert R.install(holder("tp"), "rows:2", verbose = False).tiled
     finally:
@@ -640,7 +616,6 @@ def test_tensor_parallel_modules_are_skipped(monkeypatch, tmp_path):
 
 @needs_registry
 def test_two_identical_instances_run_their_own_inner_forward():
-    # An engine that deduplicates by signature must still run each instance's own slot (LoRA forward, counters).
     a, b = (type("FooMLP", (_TokenMLP,), {})() for _ in range(2))
     b.load_state_dict(a.state_dict())
     seen = []
@@ -654,7 +629,6 @@ def test_two_identical_instances_run_their_own_inner_forward():
 
 
 class _InplaceDXLinear(torch.autograd.Function):
-    """Like Unsloth's fast LoRA MLP with inplace=True: backward writes dX into the forward input's storage."""
 
     @staticmethod
     def forward(ctx, X, W):
@@ -672,8 +646,6 @@ class _InplaceDXLinear(torch.autograd.Function):
 @needs_registry
 @pytest.mark.parametrize("frozen_input", [False, True])
 def test_kernel_writing_dx_into_its_input_keeps_tiles_intact(frozen_input):
-    # The fused LoRA MLP overwrites its input with dX in backward. The checkpoint engine saves every tile's input for
-    # recompute, so the tile must own its storage, or the next tile recomputes from dX (version error / wrong grads).
     torch.manual_seed(0)
     mlp = torch.nn.Module()
     mlp.w = torch.nn.Parameter(torch.randn(8, 8) / 3)
@@ -689,7 +661,7 @@ def test_kernel_writing_dx_into_its_input_keeps_tiles_intact(frozen_input):
             R.install_module(m, "rows:3", spec = R.TileSpec("Inplace", family = "test"))
             assert R.is_tiled(m)
         x = x0.clone().requires_grad_(not frozen_input)
-        h = x * 1.0  # a non-leaf input, as a decoder layer's hidden states
+        h = x * 1.0
         out = m(h)
         (out * torch.arange(out.numel()).reshape(out.shape)).sum().backward()
         if tiled:
@@ -701,11 +673,9 @@ def test_kernel_writing_dx_into_its_input_keeps_tiles_intact(frozen_input):
         torch.testing.assert_close(got[1], want[1])
 
 
-
 @needs_registry
 @pytest.mark.parametrize("backend", ["aot_eager"])
 def test_installed_module_compiles_fullgraph(backend):
-    # The inner forward is bound with functools.partial: Dynamo cannot build a MethodType while tracing.
     torch._dynamo.reset()
     m = type("FooMLP", (_TokenMLP,), {})()
     ref = copy.deepcopy(m)
@@ -722,7 +692,6 @@ def test_installed_module_compiles_fullgraph(backend):
 
 @needs_registry
 def test_uninstall_under_a_later_wrapper_restores_the_adopted_forward():
-    # accelerate's add_hook_to_module after tiling: forward = wrapper, _old_forward = the tiled forward.
     m = type("FooMLP", (_TokenMLP,), {})()
     m.forward = MethodType(lambda self, x: _TokenMLP.forward(self, x) * 3, m)
     R.install_module(m, "rows:2")
@@ -747,7 +716,6 @@ def test_reinstall_without_a_wrapped_module_detaches_it():
 
 @needs_registry
 def test_adopted_plain_function_forward_gets_no_extra_self():
-    # A lambda / torch.compile wrapper stored on the instance is already bound; adopting it must not add `self`.
     m = type("FooMLP", (_TokenMLP,), {})()
     m.forward = lambda x: _TokenMLP.forward(m, x) + 1
     R.install_module(m, "rows:2")
@@ -765,7 +733,7 @@ def test_self_check_probes_the_instance_forward_and_each_instance(monkeypatch):
     def mix(self, x):
         y = _TokenMLP.forward(self, x)
         return y + y.mean(dim = -2, keepdim = True)
-    mixing.forward = MethodType(mix, mixing)  # this instance mixes tokens; its class does not
+    mixing.forward = MethodType(mix, mixing)
     report = R.install(model, "rows:2", verbose = False)
     assert [r[0] for r in report.tiled] == ["layers.0.mlp"]
     assert "self-check failed" in dict((n, r) for n, _, r in report.skipped)["layers.1.mlp"]
@@ -779,7 +747,6 @@ def test_self_check_accepts_matching_none_outputs():
 
 @needs_registry
 def test_functional_dropout_replays_its_mask():
-    # No nn.Dropout child: the module scan cannot see it, so training mode alone must turn RNG replay on.
     class FunctionalDropoutMLP(_TokenMLP):
         def forward(self, x):
             h = torch.nn.functional.dropout(torch.nn.functional.gelu(self.up(x)), 0.5, self.training)
@@ -791,14 +758,12 @@ def test_functional_dropout_replays_its_mask():
     torch.manual_seed(5)
     m(x).pow(2).sum().backward()
     torch.manual_seed(5)
-    # Untiled oracle with the same per-tile RNG consumption: run the tiles by hand.
     outs = [FunctionalDropoutMLP.forward(ref, t) for t in torch.tensor_split(x, 4, dim = 1)]
     torch.cat(outs, dim = 1).pow(2).sum().backward()
     torch.testing.assert_close(m.up.weight.grad, ref.up.weight.grad)
 
 
 class _CleanMLP(torch.nn.Module):
-    """A plain dense MLP (matched by the dense name rule): no random ops in its forward."""
 
     def __init__(self, h = 8, p = 0.0):
         super().__init__()
@@ -833,7 +798,7 @@ def _llama_mlp(act = "silu"):
 
 @needs_registry
 def test_dense_mlp_skips_rng_replay(monkeypatch):
-    m = _llama_mlp()  # transformers' own class, no dropout
+    m = _llama_mlp()
     R.install_module(m, "rows:2")
     assert R.lookup(m).family == "dense-mlp"
     m.train()
@@ -849,16 +814,14 @@ def _noise(h):
 
 
 class _HelperNoiseMLP(_CleanMLP):
-    def forward(self, x):  # draws through a helper the source scan does not follow
+    def forward(self, x):
         return self.down(_noise(torch.nn.functional.gelu(self.up(x))))
 
 
 @needs_registry
 @pytest.mark.parametrize("case", ["rrelu_in_transformers_mlp", "user_mlp_with_helper_noise", "user_mlp_no_random"])
 def test_rng_replay_unless_every_class_is_trusted(monkeypatch, case):
-    # A dense-MLP family match alone is not proof: RReLU is a torch.nn class that samples, and user / remote-code
-    # classes may draw through helpers. Only trusted library classes (transformers, an allowlist of torch.nn, PEFT,
-    # Unsloth) may skip the replay, and skipping it there gives the wrong gradient.
+    # Only trusted library classes may skip the RNG replay (RReLU samples; user code may draw through helpers).
     if case == "rrelu_in_transformers_mlp":
         m = _llama_mlp()
         m.act_fn = torch.nn.RReLU()
@@ -891,12 +854,11 @@ class _RandomBlock(torch.nn.Module):
 
     def forward(self, x):
         h = self.lin(x)
-        return h * torch.rand_like(h)  # random in eval too
+        return h * torch.rand_like(h)
 
 
 @needs_registry
 def test_forced_random_module_replays_in_eval_with_grad(monkeypatch):
-    # RL log-prob passes run eval mode with grad on: a forced / opted-in module must still replay its RNG.
     m = _RandomBlock()
     ref = copy.deepcopy(m)
     R.install_module(m, "rows:2")
@@ -913,7 +875,6 @@ def test_forced_random_module_replays_in_eval_with_grad(monkeypatch):
 
 @needs_registry
 def test_dropout_mlp_replays_and_matches_untiled_bitwise(monkeypatch):
-    # Live nn.Dropout: replay on; the oracle consumes the RNG tile by tile in the same order.
     m = type("FooMLP", (_CleanMLP,), {})(p = 0.5)
     ref = copy.deepcopy(m)
     R.install_module(m, "rows:2")
@@ -934,20 +895,19 @@ def test_dropout_mlp_replays_and_matches_untiled_bitwise(monkeypatch):
 
 @needs_registry
 def test_rng_replay_is_kept_whenever_it_cannot_be_ruled_out(monkeypatch):
-    class JitterMoE(_TokenMLP):  # a known MoE family, but its forward draws router jitter
+    class JitterMoE(_TokenMLP):
         def forward(self, x):
             if self.training:
                 x = x * torch.empty_like(x).uniform_(0.99, 1.01)
             return _TokenMLP.forward(self, x)
     jitter = type("MixtralSparseMoeBlock", (JitterMoE,), {})()
-    unknown = type("Whatever", (_CleanMLP,), {})()  # forced: unknown class
+    unknown = type("Whatever", (_CleanMLP,), {})()
     R.install_module(jitter, "rows:2")
     R.install_module(unknown, "rows:2")
     assert R.lookup(jitter).family == "topk-moe"
     for m in (jitter, unknown):
         m.train()
         assert R.needs_rng_replay(m, m.__dict__["_unsloth_tiling"].spec)
-    # An inner forward whose source cannot be read counts as random.
     clean = _llama_mlp()
     R.install_module(clean, "rows:2")
     clean.train()
@@ -964,15 +924,13 @@ def _pays(saving, peak):
 
 @needs_registry
 def test_auto_estimator_matches_g4_measurements():
-    # G4 (RTX PRO 6000), Unsloth LoRA, bf16. Qwen3-0.6B bs 1 x 16k: tiling lowered the peak by 127 MiB (2445 -> 2318)
-    # for +30% step time. Qwen3-4B bs 4 x 8k: 1979 MiB (14141 -> 12162) for +22%.
+    # G4, Unsloth LoRA, bf16: Qwen3-0.6B 1 x 16k saved 127 MiB for +30% step time; Qwen3-4B 4 x 8k 1979 MiB for +22%.
     saving, peak = R.estimate_tiling_gain(16384, 1024, 3072, 2, 16, param_bytes = int(0.6e9) * 2, n_layers = 28)
     assert not _pays(saving, peak)
-    assert 2000 * 2**20 < peak < 3000 * 2**20  # measured 2445 MiB
+    assert 2000 * 2**20 < peak < 3000 * 2**20
     saving, peak = R.estimate_tiling_gain(32768, 2560, 9728, 2, 8, param_bytes = int(4.0e9) * 2, n_layers = 36)
     assert _pays(saving, peak)
-    assert 1500 * 2**20 < saving < 2500 * 2**20  # measured 1979 MiB
-    # One tile never saves anything.
+    assert 1500 * 2**20 < saving < 2500 * 2**20
     assert R.estimate_tiling_gain(32768, 2560, 9728, 2, 1)[0] == 0
 
 
@@ -982,22 +940,20 @@ def test_auto_keeps_one_tile_when_the_estimate_says_no_gain(monkeypatch, capsys)
     R.install(model, "auto", verbose = False)
     mlp = model.layers[0].mlp
     state = mlp.__dict__["_unsloth_tiling"]
-    state.tile_rows = 2  # the budget alone would tile
+    state.tile_rows = 2
     seen = _spy_engine(monkeypatch)
     x = torch.randn(1, 16, 8)
     mlp(x)
-    assert seen == []  # tiny model: saving far below 512 MiB
+    assert seen == []
     assert "keeps one tile at 16 rows" in capsys.readouterr().out
     monkeypatch.setattr(R, "AUTO_MIN_SAVING_MIB", 0)
     monkeypatch.setattr(R, "AUTO_MIN_SAVING_FRACTION", 0.0)
     mlp(x)
-    assert len(seen) == 1  # once the estimate says it pays, the budget's tiles are used
+    assert len(seen) == 1
 
 
 @pytest.mark.parametrize("frozen_input", [False, True])
 def test_direct_tiled_call_owns_each_tile_input(frozen_input):
-    # The ownership copy lives in the engine's checkpointed body, so the direct tiled_call API is safe for a kernel
-    # that writes dX into its input too (before, only the registry's tile function copied).
     from unsloth_zoo.sequence_tiling import tiled_call
     torch.manual_seed(0)
     w = torch.nn.Parameter(torch.randn(8, 8) / 3)
@@ -1017,8 +973,6 @@ def test_direct_tiled_call_owns_each_tile_input(frozen_input):
 
 
 def test_compiled_tiles_check_row_counts():
-    # Eager tiles checked every output's row count; compiled tiles skipped it, so a rows_flat output with a missing
-    # row per tile came back silently short.
     from unsloth_zoo.sequence_tiling import tiled_call
     lin = torch.nn.Linear(8, 8)
 
@@ -1045,14 +999,12 @@ def test_bare_tensor_output_uses_the_first_contract_entry():
 
 @needs_registry
 def test_revalidation_rechecks_a_module_whose_forward_changed():
-    # The opt-in self-check was cached per instance: after the module's forward changed (a wrapper or a kernel
-    # installed later), revalidation reused the old verdict and tiled a forward that mixes tokens.
     model = _Holder(lambda: FooBlock(), n = 1)
     report = R.install(model, "rows:2", modules = ["FooBlock"])
     assert len(report.tiled) == 1
     mlp = model.layers[0].mlp
     R.uninstall(model)
-    mlp.forward = lambda x: (lambda y: y + y.mean(dim = -2, keepdim = True))(_TokenMLP.forward(mlp, x))  # mixes
+    mlp.forward = lambda x: (lambda y: y + y.mean(dim = -2, keepdim = True))(_TokenMLP.forward(mlp, x))
     report = R.install(model, "rows:2", modules = ["FooBlock"])
     assert not report.tiled and "self-check failed" in report.skipped[0][2]
 
@@ -1060,14 +1012,13 @@ def test_revalidation_rechecks_a_module_whose_forward_changed():
 class _BatchCenter(_TokenMLP):
     def forward(self, x):
         y = super().forward(x)
-        if self.training:  # batch statistics in training only
+        if self.training:
             y = y - y.mean(dim = -2, keepdim = True)
         return y
 
 
 @needs_registry
 def test_batch_statistic_modules_are_not_tiled():
-    # A dense MLP holding a BatchNorm mixes rows through its statistics in training: tiling changed its output.
     class FooMLP(_TokenMLP):
         def __init__(self):
             super().__init__()
@@ -1079,7 +1030,6 @@ def test_batch_statistic_modules_are_not_tiled():
     model = _Holder(lambda: FooMLP(), n = 1)
     report = R.install(model, "rows:2")
     assert not report.tiled and "BatchNorm1d" in report.skipped[0][2]
-    # An opted-in class that uses batch statistics only in training fails the self-check in training mode.
     model = _Holder(lambda: _BatchCenter(), n = 1)
     report = R.install(model, "rows:2", modules = ["_BatchCenter"])
     assert not report.tiled and "training" in report.skipped[0][2]
@@ -1087,7 +1037,6 @@ def test_batch_statistic_modules_are_not_tiled():
 
 @needs_registry
 def test_bare_target_always_tiles(monkeypatch):
-    # "target" without a size used to mean auto, which may keep one tile; it tiles with the free-memory budget.
     plan = R.parse_mode("target")
     assert (plan.mode, plan.target_gb, plan.spelling()) == ("target", 0.0, "target")
     monkeypatch.setattr(R, "_auto_tiling_pays", lambda *a, **k: False)
@@ -1095,7 +1044,7 @@ def test_bare_target_always_tiles(monkeypatch):
     seen = _spy_engine(monkeypatch)
     mlp = _llama_mlp()
     R.install_module(mlp, "target")
-    mlp(torch.randn(1, 512, 8))  # tile rows bottom out at padded_length (128)
+    mlp(torch.randn(1, 512, 8))
     assert len(seen) == 1
 
 
@@ -1112,7 +1061,6 @@ def test_on_spellings_are_not_off(value):
 
 
 class _ChannelFirstMLP(torch.nn.Module):
-    """SegformerMLP-style: [B, C, H, W] in, flattened and transposed inside the forward."""
 
     def __init__(self, c = 8, h = 16):
         super().__init__()
@@ -1124,8 +1072,6 @@ class _ChannelFirstMLP(torch.nn.Module):
 
 @needs_registry
 def test_channel_first_mlps_are_not_tiled():
-    # Features are not the last dim, so the rows of x are not tokens: tiling them failed with a row-count mismatch
-    # (or would change the output when the shapes happen to line up).
     from transformers import SegformerConfig
     from transformers.models.segformer.modeling_segformer import SegformerMLP
     seg = SegformerMLP(SegformerConfig(decoder_hidden_size = 16), input_dim = 8)
@@ -1133,8 +1079,6 @@ def test_channel_first_mlps_are_not_tiled():
     model.mlp = seg
     report = R.install(model, "arctic", verbose = False)
     assert not report.tiled and "channel-first" in report.skipped[0][2]
-    # The structural check: a forced or unknown channel-first module runs untiled when the last dim is not the
-    # first linear's in_features.
     m = type("FooMLP", (_ChannelFirstMLP,), {})()
     x = torch.randn(2, 8, 16, 16)
     want = m(x)
@@ -1144,9 +1088,6 @@ def test_channel_first_mlps_are_not_tiled():
 
 @needs_registry
 def test_bare_true_is_auto_and_short_sequences_run_untiled(monkeypatch):
-    # True / "1" used to force arctic tiles, so a 2k-token step paid the per-tile cost for no memory saving (G4,
-    # Qwen3-0.6B 2k: +24% step time). They now use auto, which keeps one tile when tiling would not pay; arctic,
-    # rows:N and target still tile.
     for value in (True, "1", "true", "on", "yes"):
         assert R.parse_mode(value).mode == "auto"
     seen = _spy_engine(monkeypatch)

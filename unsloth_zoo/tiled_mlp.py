@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Compatibility shims for the old tiled MLP entry points; the implementation is `unsloth_zoo.tiling_registry`."""
 
 from unsloth_zoo.memory_budget import (  # noqa: F401  (re-exported for remote-code saves and external imports)
     _default_target_gb,
@@ -23,8 +22,7 @@ from unsloth_zoo.memory_budget import (  # noqa: F401  (re-exported for remote-c
 )
 from unsloth_zoo.tiling_registry import install as _install, install_module as _install_module, parse_mode
 
-# Released Unsloth versions import these at module level (their DDP patch wraps TiledMLP); the registry does not use
-# them, so an upgraded Unsloth Zoo keeps an older Unsloth importable.
+# Released Unsloth imports these at module level (its DDP patch wraps TiledMLP).
 from unsloth_zoo._legacy_tiled_mlp import (  # noqa: F401
     TiledMLP,
     _mxfp4_instance_forward,
@@ -41,7 +39,6 @@ __all__ = [
 
 
 def patch_tiled_mlp(model, patch_options_str = "arctic", padded_length = 128):
-    """Old spelling of `tiling_registry.install(model, mode)`; same option strings (arctic, target:GB[:modules])."""
     _install(model, parse_mode(patch_options_str, padded_length = padded_length))
     return model
 

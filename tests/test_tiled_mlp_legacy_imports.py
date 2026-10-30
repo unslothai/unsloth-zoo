@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Released Unsloth imports the old TiledMLP names at module level; an upgraded Unsloth Zoo must keep them working.
-
-tests/released_unsloth/_tiled_mlp_ddp.py is unsloth/models/_tiled_mlp_ddp.py as shipped by Unsloth before the
-tiling registry, verbatim."""
+"""Released Unsloth imports the old TiledMLP names at module level; an upgraded Unsloth Zoo must keep them working."""
 
 import os
 import runpy

@@ -14,8 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Compile gate for sequence_tiling: fullgraph=True, 0 graph breaks, recompiles <= tile buckets over 1k..32k rows,
-every tile a checkpoint HOP in the graph, numerics equal to eager (forward and backward); CPU only."""
 import copy
 import functools
 import os
@@ -47,7 +45,6 @@ class _Counter:
 
 
 class Layer(torch.nn.Module):
-    """Pre-norm decoder layer: SDPA attention + tiled MLP, compiled as a whole."""
     def __init__(self, mlp, tiled = True):
         super().__init__()
         self.n1 = torch.nn.RMSNorm(H)
@@ -118,7 +115,6 @@ def _check(cnt, breaks, n_buckets, dynamic):
           f"checkpoint_hops_per_graph={cnt.hops}")
     assert breaks == 0
     assert recompiles <= n_buckets
-    # Every multi-tile graph holds one checkpoint HOP per tile.
     assert max(cnt.hops) >= 2
 
 
@@ -161,8 +157,6 @@ def test_compiled_decoder_layer(backend, dynamic):
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("shim", ["unsloth_checkpoint", "unsloth_offloaded_gradient_checkpoint", "unsloth_gradient_checkpoint"])
 def test_with_unsloth_checkpoint_shim(backend, shim, monkeypatch):
-    # Unsloth replaces torch.utils.checkpoint.checkpoint with a dynamo-disabled reentrant shim; the checkpoint HOP
-    # re-enters it while AOT autograd traces. Still no graph break, and the shim hands the call to torch's own.
     import unsloth_zoo.gradient_checkpointing as gcm
     gcm._capture_pristine_checkpoint_once()
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", getattr(gcm, shim))
@@ -173,7 +167,6 @@ def test_with_unsloth_checkpoint_shim(backend, shim, monkeypatch):
 
 @pytest.mark.parametrize("backend", ["eager", "aot_eager", "inductor"])
 def test_compiled_tiles_recompute(backend):
-    # The partitioner honours the checkpoint tags: a compiled tiled MLP saves ~ its input, not [rows, I] activations.
     torch.manual_seed(0)
     m = lora_mlp(inter = 512)
     x = torch.randn(1, 8192, H)
@@ -199,8 +192,6 @@ def test_compiled_tiles_recompute(backend):
 
 
 class _CompiledExpertMoE(torch.nn.Module):
-    """Eager MoE whose expert math is a separately compiled function, as Unsloth's MoE kernels are: the per-expert
-    token count changes from tile to tile, so Dynamo compiles a static graph first and a dynamic one later."""
 
     def __init__(self, expert_fn, h = 8, e = 4):
         super().__init__()
@@ -221,8 +212,6 @@ class _CompiledExpertMoE(torch.nn.Module):
 
 
 def _expert(x, w):
-    # Token-local values, but the graph reduces over the token axis (as grouped-GEMM bookkeeping does), so the
-    # static and the dynamic graph save different tensors.
     h = x @ w.t()
     g = torch.nn.functional.silu(h) + 0.0 * h.mean(0, keepdim = True)
     return torch.nn.functional.layer_norm(g, (g.shape[-1],)) * h.softmax(-1)
@@ -230,7 +219,6 @@ def _expert(x, w):
 
 @pytest.mark.parametrize("n_tiles", [4, 16])
 def test_inner_compiled_function_recompute_uses_the_same_graph(n_tiles):
-    # Before: "Recomputed values ... have different metadata" / "A different number of tensors was saved" (OLMoE).
     torch._dynamo.reset()
     torch.manual_seed(0)
     m = _CompiledExpertMoE(torch.compile(_expert, backend = "inductor"))
@@ -262,8 +250,6 @@ def _block_with_tiled_mlp(n_tiles):
 
 @pytest.mark.parametrize("mode", ["unsloth_block", "env_break"])
 def test_unsloth_block_compile_does_not_unroll_tiles(mode, monkeypatch):
-    # Inside Unsloth's compiled blocks (fullgraph=False) the tile loop leaves the graph: compile work must not grow
-    # with the tile count. Before, every tile added a checkpoint HOP to the graph (G4: ~1.1 s cold compile per tile).
     import types
     fake = types.ModuleType("unsloth.models._block_compile")
     fake._IN_COMPILED_REGION = [mode == "unsloth_block"]
@@ -292,11 +278,10 @@ def test_unsloth_block_compile_does_not_unroll_tiles(mode, monkeypatch):
         torch.testing.assert_close(x.grad, xr.grad)
         assert hops[0] == 0, hops
         seen[n] = graphs[0]
-    assert len(set(seen.values())) == 1, seen  # same compile work at 4, 16 and 64 tiles
+    assert len(set(seen.values())) == 1, seen
 
 
 def test_user_compile_keeps_the_unrolled_fullgraph(monkeypatch):
-    # Outside Unsloth's blocks a user's compile may be fullgraph=True, where a graph break is an error.
     monkeypatch.delenv("UNSLOTH_TILED_COMPILE", raising = False)
     monkeypatch.delitem(sys.modules, "unsloth.models._block_compile", raising = False)
     torch._dynamo.reset()
@@ -306,7 +291,6 @@ def test_user_compile_keeps_the_unrolled_fullgraph(monkeypatch):
 
 
 def test_compiled_tile_body_is_one_graph_for_every_tile_and_layer(monkeypatch):
-    # compile_tile: the tile loop leaves the caller's graph and every tile of every layer runs one compiled body.
     from torch._dynamo.utils import counters
     from unsloth_zoo import sequence_tiling as ST
 
@@ -329,7 +313,7 @@ def test_compiled_tile_body_is_one_graph_for_every_tile_and_layer(monkeypatch):
         torch.manual_seed(0)
         m = Layers()
         ref = copy.deepcopy(m)
-        x = torch.randn(1, 37, H, requires_grad = True)  # uneven tiles
+        x = torch.randn(1, 37, H, requires_grad = True)
         y = torch.compile(m, backend = "aot_eager")(x)
         y.pow(2).sum().backward()
         h = x.detach().clone().requires_grad_()
@@ -345,31 +329,24 @@ def test_compiled_tile_body_is_one_graph_for_every_tile_and_layer(monkeypatch):
 
 @pytest.mark.parametrize("dynamic", [True, None])
 def test_lengths_inside_one_bucket_share_one_graph(dynamic):
-    # Tile boundaries depend only on ceil(rows / n_tiles): before, tensor_split's boundaries depended on
-    # rows % n_tiles, Dynamo guarded on it and every remainder compiled a new graph (fullgraph=True then hit the
-    # recompile limit). Lengths 2049..4095 all use 4 tiles of 1024 rows.
     m = GatedMLP()
     params = list(m.parameters())
     seqs = [2049, 2050, 2051, 2500, 3001, 3333, 4000, 4093, 4095]
     assert len({_bucket(s, TILE_ROWS) for s in seqs}) == 1
     cnt, breaks, _ = _sweep(_mlp_fn(m), params, "aot_eager", dynamic, seqs = seqs)
     assert breaks == 0
-    # dynamic=None compiles static first, then one dynamic graph. torch < 2.7 turns sym_min into a guard on whether
-    # the last tile is full: at most one more graph per bucket (before: one per remainder, up to n_tiles).
+    # torch < 2.7 turns sym_min into a guard on whether the last tile is full: at most one more graph per bucket.
     old_torch = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 7)
     allowed = (1 if dynamic else 2) + (1 if old_torch else 0)
     assert cnt.inner.frame_count <= allowed, cnt.inner.frame_count
 
 
 def test_many_tiled_classes_stay_under_the_recompile_limit(monkeypatch):
-    # Frames shared by every tiled class (the tiled forward, the compiled tile body) guard on the module class: past
-    # 8 classes Dynamo's default recompile limit sent later layers to eager. Each class now has its own frames, and
-    # the tiling below the one graph break runs eagerly.
     from unsloth_zoo import tiling_registry as R
     monkeypatch.setenv("UNSLOTH_TILED_COMPILE", "compile_tile")
     for name in ("recompile_limit", "cache_size_limit"):
         if hasattr(torch._dynamo.config, name):
-            monkeypatch.setattr(torch._dynamo.config, name, 8)  # stock torch (Unsloth raises it)
+            monkeypatch.setattr(torch._dynamo.config, name, 8)
     torch._dynamo.reset()
     classes = []
     for k in range(10):

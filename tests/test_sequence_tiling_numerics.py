@@ -14,9 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""sequence_tiling.tiled_call vs the untiled module: loss, input grad and every parameter grad; CPU only.
-Frozen-input LoRA grads, width-changing projectors, router-logit grads and once-per-backward grad hooks are the cases
-the removed tiled_mlp.TiledMLP got wrong."""
 import os
 import sys
 import weakref
@@ -86,7 +83,6 @@ def test_dtypes(dtype):
 
 
 def test_fp16_autocast_gradscaler_skip():
-    # GradScaler sees the same inf in the tiled grads and skips the same step.
     torch.manual_seed(0)
     res = []
     for call in (lambda m, x: m(x), _new(4)):
@@ -106,7 +102,6 @@ def test_fp16_autocast_gradscaler_skip():
 
 
 def test_frozen_input_mlp_only_lora():
-    # Layer 0, MLP-only LoRA: the MLP input does not require grad.
     m = lora_mlp()
     x = torch.randn(2, 40, H)
     ref = _run(m, x, lambda m, x: m(x))
@@ -122,7 +117,7 @@ def test_full_ft_and_frozen_base():
 
 def test_width_changing_projector():
     torch.manual_seed(0)
-    m = GatedMLP(hidden = H, inter = 40, out = 24)  # vision projector: H -> 24
+    m = GatedMLP(hidden = H, inter = 40, out = 24)
     x = torch.randn(2, 30, H, requires_grad = True)
     ref = _run(m, x, lambda m, x: m(x))
     new = _run(m, x, _new(4))
@@ -143,7 +138,6 @@ def test_moe_router_logits_and_aux_loss():
     new = _run(m, x, _new(4, output_contract = ("rows", "rows_flat")), _moe_loss)
     _assert_close(ref, new)
     assert new[3][1].shape == ref[3][1].shape == (58, 4)
-    # Inferred contract gives the same.
     _assert_close(ref, _run(m, x, _new(4), _moe_loss))
 
 
@@ -173,7 +167,6 @@ def test_scalar_output_refused_without_contract():
 
 
 def _tiled_plain(m, x, n_tiles):
-    # Same tiles, plain autograd (no checkpoint): the RNG draw order the checkpointed tiles must replay.
     return torch.cat([m(t) for t in torch.tensor_split(x.reshape(1, -1, x.shape[-1]), n_tiles, dim = 1)], 1).reshape(
         *x.shape[:-1], -1)
 
@@ -186,11 +179,10 @@ def test_dropout_rng_parity(needs_rng):
     torch.manual_seed(123); ref = _run(m, x, lambda m, x: _tiled_plain(m, x, 4))
     torch.manual_seed(123)
     new = _run(m, x, lambda m, x: tiled_call(m, x, n_tiles = 4, needs_rng = needs_rng))
-    torch.testing.assert_close(ref[0], new[0])  # forward draws identical masks
+    torch.testing.assert_close(ref[0], new[0])
     if needs_rng:
         _assert_close(ref, new)
     else:
-        # Without the RNG replay the recompute draws fresh masks: the gradients are wrong (proves the test is live).
         assert not torch.allclose(ref[2]["gate_proj.weight"], new[2]["gate_proj.weight"])
 
 
@@ -216,7 +208,7 @@ def test_single_tile_is_direct_call():
         return x * 2
     x = torch.randn(1, 1, H)
     tiled_call(fn, x, n_tiles = 1)
-    tiled_call(fn, x, n_tiles = 8)  # clamped to 1 row
+    tiled_call(fn, x, n_tiles = 8)
     assert all(s is x for s in seen) and len(seen) == 2
 
 
@@ -245,7 +237,7 @@ def test_inside_outer_gradient_checkpointing(gc, monkeypatch):
         pytest.skip("UnslothCheckpointFunction pins host buffers: needs CUDA (run via the GPU correctness test)")
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     m = lora_mlp().to(dev)
-    x = torch.randn(2, 40, H, device = dev, requires_grad = True)  # reentrant GC needs a grad-requiring input (enable_input_require_grads)
+    x = torch.randn(2, 40, H, device = dev, requires_grad = True)
 
     def outer(fn, h):
         if gc == "torch_reentrant":
@@ -253,7 +245,6 @@ def test_inside_outer_gradient_checkpointing(gc, monkeypatch):
         if gc == "unsloth_reentrant":
             from unsloth_zoo.gradient_checkpointing import unsloth_checkpoint, initialize_unsloth_gradient_checkpointing
             initialize_unsloth_gradient_checkpointing(torch.float32)
-            # The shim replaces torch's checkpoint process-wide: the engine must still use the non-reentrant one.
             monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", unsloth_checkpoint)
             return unsloth_checkpoint(fn, h)
         if gc == "torch_nonreentrant":
@@ -280,14 +271,11 @@ def test_bucket():
     assert _bucket(129, 128) == 2
     assert _bucket(1000, 128) == 8
     assert _bucket(3, 128) == 1
-    assert _bucket(10, 1) == 8  # never more tiles than rows
+    assert _bucket(10, 1) == 8
 
 
 @pytest.mark.parametrize("frozen", [False, True])
 def test_offloader_never_sees_tile_views(frozen, monkeypatch):
-    # Non-reentrant GC + offload hooks: the offloader packs the outer checkpoint's inputs only. The tile inputs are saved
-    # inside the outer checkpoint's own hooks (forward) and recompute storage (backward), so they are never offloaded,
-    # and the pack calls are the same as untiled.
     import unsloth_zoo.gradient_checkpointing as gcm
     from torch.utils.checkpoint import checkpoint as torch_ckpt
     off = gcm.NonReentrantActivationOffloader()
@@ -318,14 +306,12 @@ def test_every_tile_is_checked_for_arity_and_rows():
         tiled_call(changing_arity, x, n_tiles = 2, needs_rng = False)
 
     def short_rows(t):
-        return t[:, 1:]  # drops a row: the preallocated output would keep uninitialised memory
+        return t[:, 1:]
     with pytest.raises(ValueError, match = "rows"):
         tiled_call(short_rows, x, n_tiles = 2, needs_rng = False)
 
 
 class _PinOrRebuild(torch.nn.Module):
-    """Like Unsloth's MoE grouped-mm policy: pins an extra tensor inside an outer gradient-checkpoint recompute and
-    rebuilds it otherwise, so the two modes save a different number of tensors for the same values."""
 
     def __init__(self):
         super().__init__()
@@ -335,13 +321,11 @@ class _PinOrRebuild(torch.nn.Module):
         from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
         w = self.w
         if in_gradient_checkpoint_recompute():
-            w = w * torch.ones_like(w)  # an extra saved tensor on this path only
+            w = w * torch.ones_like(w)
         return torch.tanh(x @ w)
 
 
 def test_tile_recompute_sees_the_outer_gc_state_of_its_forward():
-    # Under the outer Unsloth checkpoint, a tile's forward runs inside the outer recompute and its own recompute in
-    # backward; before, the flag differed and backward raised CheckpointError (OLMoE: 23 vs 21 saved tensors).
     from unsloth_zoo.gradient_checkpointing import _gradient_checkpoint_recompute_marker, in_gradient_checkpoint_recompute
     torch.manual_seed(0)
     m = _PinOrRebuild()
@@ -360,8 +344,6 @@ def test_tile_recompute_sees_the_outer_gc_state_of_its_forward():
 
 
 def _reraise(exc):
-    # The shape of the "disable the kernel, but re-raise checkpoint control flow" helpers in the MoE kernels: the
-    # raise puts this frame, whose local holds the exception, on the exception's own traceback (a reference cycle).
     raise exc
 
 
@@ -376,16 +358,14 @@ class _RecomputeKeeper(torch.nn.Module):
         h = torch.relu(x @ self.w)
         self.refs.append(weakref.ref(h))
         try:
-            return h @ self.w2  # the last saved tensors: checkpoint's early stop raises from in here
+            return h @ self.w2
         except Exception as exc:
             _reraise(exc)
 
 
 def test_tile_recompute_is_freed_without_waiting_for_the_cycle_collector():
-    # Checkpoint stops a recompute early by raising once the last saved tensor exists. When that exception passes
-    # through a helper that re-raises it, its traceback is a reference cycle that holds every frame of the recompute,
-    # so each tile's recomputed intermediates lived until the cycle collector ran: on OLMoE the tiles of a layer were
-    # all alive at once and the backward peak was higher than untiled.
+    # Checkpoint's early-stop exception re-raised through a helper made a traceback cycle that kept every tile's
+    # recompute alive: the OLMoE backward peak was higher than untiled.
     import gc
     refs = []
     m = _RecomputeKeeper(refs)

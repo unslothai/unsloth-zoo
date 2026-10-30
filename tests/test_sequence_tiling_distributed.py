@@ -14,9 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""sequence_tiling under DDP, FSDP2 (fully_shard) and TP (DTensor col/row parallel): gradients equal to one process,
-every grad hook once per backward, no per-tile communication beyond the untiled module. CPU gloo by default; run as a
-script under torchrun with SEQ_TILING_BACKEND=nccl for the GPU cells."""
 import json
 import os
 import sys
@@ -33,7 +30,6 @@ N_TILES = 4
 
 
 def install(module):
-    # The plug-in form (as the registry installs it): module.__call__ hooks run once, the inner forward is tiled.
     from types import MethodType
     from unsloth_zoo.sequence_tiling import tiled_call
     inner = type(module).forward.__get__(module)
@@ -42,7 +38,6 @@ def install(module):
 
 
 class Net(torch.nn.Module):
-    """Frozen embedding (layer-0 MLP input does not require grad) -> MLP-only LoRA -> trainable head."""
     def __init__(self, tiled, seed = 0):
         super().__init__()
         torch.manual_seed(seed)
@@ -57,7 +52,6 @@ class Net(torch.nn.Module):
     def forward(self, ids):
         h = self.embed(ids)
         if self.tiled == "new_module_fn":
-            # The module itself as fn: its __call__ hooks (FSDP2 unshard / reshard) run once per tile.
             from unsloth_zoo.sequence_tiling import tiled_call
             h = h + tiled_call(self.mlp, h, n_tiles = N_TILES, needs_rng = False)
         elif self.tiled == "new":
@@ -92,7 +86,6 @@ def _hook_counter(model):
 
 
 class _CommCount:
-    """Counts c10d collectives issued through torch.distributed (DDP buckets, FSDP2 all-gather / reduce-scatter)."""
     NAMES = tuple(k for k in ("all_reduce", "all_gather_into_tensor", "reduce_scatter_tensor", "all_gather",
                               "all_gather_single", "reduce_scatter_single") if hasattr(dist, k))
 
@@ -130,7 +123,7 @@ def cell_ddp(rank, world, device, out):
             return fut.then(lambda f: f.value()[0])
         ddp.register_comm_hook(None, hook)
         fired = _hook_counter(model)
-        for step in range(2):  # step 1 runs on DDP's rebuilt buckets
+        for step in range(2):
             fired.clear()
             model.zero_grad(set_to_none = True)
             ddp(_data(rank).to(device)).backward()
@@ -187,7 +180,6 @@ def cell_tp(rank, world, device, out):
         parallelize_module(m, mesh, {"gate_proj": ColwiseParallel(), "up_proj": ColwiseParallel(),
                                      "down_proj": RowwiseParallel()})
         xi = x.clone().requires_grad_(True)
-        # CommDebugMode's module tracker breaks under checkpoint: count the functional collectives DTensor issues.
         counts, saved = {}, {}
         for k in ("all_reduce", "reduce_scatter_tensor", "all_gather_tensor", "all_to_all_single"):
             real = saved[k] = getattr(funcol, k)
