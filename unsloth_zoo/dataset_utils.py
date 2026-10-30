@@ -2788,8 +2788,7 @@ def sft_prepare_dataset(
     do_prompt_completion = False
     do_messages = False
 
-    # Get correct column names. remove_columns takes the ordered list: a list made from the set
-    # follows PYTHONHASHSEED, so each process hashed the tokenizing map to a different cache file.
+    # remove_columns gets the row's key order: a list of the set follows PYTHONHASHSEED and misses the datasets cache.
     source_column_names = list(next(iter(dataset)).keys())
     column_names = set(source_column_names)
     used_column_names = ["input_ids"]
