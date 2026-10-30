@@ -3588,6 +3588,8 @@ def _grouped_routed(x, inds, scores, shared, s, tensors, group_size, bits):
 
 # Sub-millisecond calls jitter and often run a slower mode, which a median hides: average many, less the slowest.
 _GROUPED_RACE_CALLS = 9
+# Up to this many rows on an M3, grouped tiles cost about 1 ms per forward, yet the race's short calls, timed at low clocks, pick them a third of the time.
+_ROUTED_ROWS_WITHOUT_NAX = 8
 
 
 def _grouped_routed_faster(routed, grouped, clock = time.perf_counter):
@@ -3683,6 +3685,7 @@ class _RoutedExperts:
                                 down.group_size, down.bits, down.mode)
 
         if (select and inds.size > inds.shape[-1] and gate.mode == "affine"
+                and (inds.size > _ROUTED_ROWS_WITHOUT_NAX * inds.shape[-1] or nax._nax_gpu())
                 and len({(p.group_size, p.bits, p.mode) for p in (gate, up, down)}) == 1):
             key = (self.base, *map(_key, (x, inds, scores, shared, s)),
                    tuple(tuple(map(_key, t)) for t in tensors), gate.group_size, gate.bits)
