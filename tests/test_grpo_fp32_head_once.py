@@ -164,7 +164,6 @@ def test_default_scorer_keeps_sharing_the_head_parameter(monkeypatch, train_head
 @pytest.mark.parametrize("autocast_off", ["dtype_none", "disabled", "backward_off"])
 def test_compiled_scorer_without_autocast_shares_one_fp32_head(monkeypatch, autocast_off, train_head):
     # Without autocast the compiled scorer's backward keeps its own fp32 head per call unless the head is pre-cast.
-    # "backward_off": forward autocast on, torch._functorch.config.backward_pass_autocast = "off".
     if autocast_off == "backward_off":
         import torch._functorch.config as _functorch_config
         if not hasattr(_functorch_config, "backward_pass_autocast"):
