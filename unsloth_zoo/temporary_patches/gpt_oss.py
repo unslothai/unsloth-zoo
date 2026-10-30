@@ -3355,6 +3355,35 @@ def patch_GptOssAttention():
 
     pass
 
+    def autograd_eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        # Out-of-place twin of the in-place path: out= matmuls and in-place writes have no backward,
+        # so eval forwards that carry a graph (caller inputs_embeds with grad) come here.
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+        key_states, value_states, attention_mask = _align_kv_to_mask(
+            key_states, value_states, attention_mask
+        )
+        attn_weights = matmul(query, key_states.transpose(2, 3)) * scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+        sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        combined_logits = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1)
+        probs = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        attn_weights = F_dropout(probs[..., :-1], p=dropout, training=module.training)
+        attn_output = matmul(attn_weights.to(value_states.dtype), value_states)
+        return attn_output.transpose(1, 2).contiguous(), None
+
+    pass
+
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
     if False:  # Version(torch.__version__) >= Version("2.10.0"):
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic=None, fullgraph=True)
@@ -3424,7 +3453,13 @@ def patch_GptOssAttention():
             attn_weights = None
         else:
             # Dense mask: UNSLOTH_GPT_OSS_EAGER_INFERENCE=1, CPU, or a caller-built 4D mask.
-            attn_output, attn_weights = eager_attention_forward(
+            # The in-place path has no backward: an eval forward carrying a graph takes the out-of-place one.
+            _needs_grad = torch.is_grad_enabled() and (
+                query_states.requires_grad or key_states.requires_grad
+                or value_states.requires_grad or self.sinks.requires_grad
+            )
+            attention = autograd_eager_attention_forward if _needs_grad else eager_attention_forward
+            attn_output, attn_weights = attention(
                 self,
                 query_states,
                 key_states,

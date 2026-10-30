@@ -63,9 +63,15 @@ with torch.no_grad():
         if 'norm' in n:
             p.add_(1)
 from unsloth_zoo.temporary_patches import gpt_oss as G
+if os.environ.get('_GPT_OSS_TEST_ATTENTION_PATCH') == '1':
+    G.patch_GptOssAttention()
 G.patch_GptOssModel()
 fwd = M.GptOssModel.forward
-res = {'live': getattr(fwd, '__wrapped__', fwd).__module__ == G.__name__}
+attn = M.GptOssAttention.forward
+res = {
+    'live': getattr(fwd, '__wrapped__', fwd).__module__ == G.__name__,
+    'attn_live': getattr(attn, '__wrapped__', attn).__module__ == G.__name__,
+}
 lm.eval()
 ids = torch.tensor([[1, 2, 3]])
 with torch.no_grad():
@@ -81,6 +87,9 @@ res['embeds_out_requires_grad'] = out.requires_grad
 if out.requires_grad:
     out.square().sum().backward()
 res['embeds_grad'] = emb.grad is not None and bool(emb.grad.abs().sum() > 0)
+# The grad-bearing path matches the no-grad (in-place) attention output.
+with torch.no_grad():
+    res['embeds_grad_vs_nograd'] = float((lm(inputs_embeds=emb, use_cache=False).logits - out.detach()).abs().max())
 # A single-token grad-bearing input must not reach the in-place decode fast path.
 emb1 = lm.model.embed_tokens(ids[:, :1]).detach().float().requires_grad_(True)
 try:
@@ -89,6 +98,9 @@ try:
     res['embeds1_grad'] = emb1.grad is not None and bool(emb1.grad.abs().sum() > 0)
 except RuntimeError as e:
     res['embeds1_grad'] = repr(e)[:300]
+# The same embeddings with grad disabled stay on the in-place inference path.
+with torch.no_grad():
+    res['nograd_out_requires_grad'] = lm(inputs_embeds=emb, use_cache=False).logits.requires_grad
 # Embeddings the model makes itself (an input-require-grads hook) are still detached in eval.
 lm.enable_input_require_grads()
 res['ids_out_requires_grad'] = lm(ids, use_cache=False).logits.requires_grad
@@ -96,9 +108,11 @@ print('RESULT ' + json.dumps(res))
 """
 
 
-def test_patched_forward_keeps_cache_default_and_input_grads():
+@pytest.mark.parametrize("attention_patch", [False, True], ids = ["model_patch", "with_attention_patch"])
+def test_patched_forward_keeps_cache_default_and_input_grads(attention_patch):
     pytest.importorskip("transformers.models.gpt_oss.modeling_gpt_oss")
     env = dict(os.environ)
+    env["_GPT_OSS_TEST_ATTENTION_PATCH"] = "1" if attention_patch else "0"
     env["CUDA_VISIBLE_DEVICES"] = ""
     env.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
     env.pop("UNSLOTH_RETURN_HIDDEN_STATES", None)
@@ -112,6 +126,10 @@ def test_patched_forward_keeps_cache_default_and_input_grads():
     )
     res = json.loads(lines[-1][len("RESULT "):])
     assert res["live"], res
+    # The dense eager attention (CPU here) uses out= matmuls that autograd rejects.
+    assert res["attn_live"] is attention_patch, res
+    assert res["embeds_grad_vs_nograd"] < 1e-4, res
+    assert res["nograd_out_requires_grad"] is False, res
     assert res["prefix_has_cache"], res
     assert res["decode_err"] < 1e-4, res
     assert res["embeds_out_requires_grad"] and res["embeds_grad"], res
