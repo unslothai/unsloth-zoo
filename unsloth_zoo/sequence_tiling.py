@@ -23,6 +23,8 @@ not require grad still get parameter gradients, and every output of every tile i
 intermediate activations live at once, in forward and in the backward recompute.
 """
 
+import functools
+
 import torch
 
 __all__ = [
@@ -88,8 +90,29 @@ def _checkpoint(fn, args, preserve_rng_state):
             fn, *args, use_reentrant = False, preserve_rng_state = preserve_rng_state,
         )
     return _torch_checkpoint_fn()(
-        fn, *args, use_reentrant = False, preserve_rng_state = preserve_rng_state,
+        functools.partial(_dynamic_inner_compiles, fn), *args,
+        use_reentrant = False, preserve_rng_state = preserve_rng_state,
     )
+pass
+
+
+def _dynamic_inner_compiles(fn, *args):
+    """Run one eager tile with torch.compile'd code inside it compiling dynamic shapes from the first call.
+
+    Non-reentrant checkpoint matches the tensors a tile saved in forward with the ones its recompute saves. A
+    compiled function inside the tile (Unsloth's MoE experts, whose per-expert token counts change every tile) first
+    compiles a static graph, then, on the next shape, a dynamic one that Dynamo tries first from then on. A tile
+    that ran on the static graph is then recomputed on the dynamic graph, which saves different tensors, and
+    backward fails with "A different number of tensors was saved". Compiling dynamic from the start means a later
+    graph never takes over shapes an earlier one served. Functions compiled with dynamic=False keep one static graph
+    per shape, which is consistent too.
+    """
+    try:
+        patch = torch._dynamo.config.patch(assume_static_by_default = False)
+    except Exception:
+        return fn(*args)
+    with patch:
+        return fn(*args)
 pass
 
 

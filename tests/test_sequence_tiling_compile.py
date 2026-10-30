@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Compile gate for sequence_tiling: fullgraph=True, 0 graph breaks, recompiles <= tile buckets over 1k..32k rows,
 every tile a checkpoint HOP in the graph, numerics equal to eager (forward and backward); CPU only."""
+import copy
 import os
 import sys
 
@@ -192,3 +193,52 @@ def test_compiled_tiles_recompute(backend):
     tiled = saved_bytes(lambda x: tiled_call(m, x, n_tiles = 8, needs_rng = False))
     print(f"{backend}: saved untiled={untiled / 2**20:.2f} MB tiled={tiled / 2**20:.2f} MB")
     assert tiled < 2 * x.numel() * x.element_size() < untiled
+
+
+class _CompiledExpertMoE(torch.nn.Module):
+    """Eager MoE whose expert math is a separately compiled function, as Unsloth's MoE kernels are: the per-expert
+    token count changes from tile to tile, so Dynamo compiles a static graph first and a dynamic one later."""
+
+    def __init__(self, expert_fn, h = 8, e = 4):
+        super().__init__()
+        self.gate = torch.nn.Linear(h, e, bias = False)
+        self.w = torch.nn.Parameter(torch.randn(e, h, h) / 3)
+        self.expert_fn = expert_fn
+
+    def forward(self, x):
+        h = x.reshape(-1, x.shape[-1])
+        sel = self.gate(h).argmax(-1)
+        out = torch.zeros_like(h)
+        for e in range(self.w.shape[0]):
+            idx = (sel == e).nonzero().squeeze(-1)
+            if idx.numel() == 0:
+                continue
+            out = out.index_add(0, idx, self.expert_fn(h[idx], self.w[e]))
+        return out.reshape(x.shape)
+
+
+def _expert(x, w):
+    # Token-local values, but the graph reduces over the token axis (as grouped-GEMM bookkeeping does), so the
+    # static and the dynamic graph save different tensors.
+    h = x @ w.t()
+    g = torch.nn.functional.silu(h) + 0.0 * h.mean(0, keepdim = True)
+    return torch.nn.functional.layer_norm(g, (g.shape[-1],)) * h.softmax(-1)
+
+
+@pytest.mark.parametrize("n_tiles", [4, 16])
+def test_inner_compiled_function_recompute_uses_the_same_graph(n_tiles):
+    # Before: "Recomputed values ... have different metadata" / "A different number of tensors was saved" (OLMoE).
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    m = _CompiledExpertMoE(torch.compile(_expert, backend = "inductor"))
+    ref = copy.deepcopy(m)
+    ref.expert_fn = _expert
+    x = torch.randn(1, 64, 8, requires_grad = True)
+    xr = x.detach().clone().requires_grad_()
+    y = tiled_call(m, x, n_tiles = n_tiles, needs_rng = False)
+    y.pow(2).sum().backward()
+    yr = ref(xr)
+    yr.pow(2).sum().backward()
+    torch.testing.assert_close(y, yr, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(x.grad, xr.grad, rtol = 1e-4, atol = 1e-5)
+    torch.testing.assert_close(m.w.grad, ref.w.grad, rtol = 1e-4, atol = 1e-5)
