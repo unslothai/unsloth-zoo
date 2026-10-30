@@ -338,17 +338,49 @@ def test_triton_probe_does_not_follow_a_working_shim_to_the_removed_stub(monkeyp
         assert U._triton_block_ptr_removed() is False
 
 
-@pytest.fixture
-def S(monkeypatch):
+def _fresh_attention_sink(monkeypatch):
     # attention_sink on any host: CPU-only hosts leave the CUDA-sized flex utils undefined, so stub the missing names.
     stub = types.ModuleType(U.__name__)
     stub.__dict__.update(U.__dict__)
     stub.__getattr__ = lambda name: None
     monkeypatch.setitem(sys.modules, U.__name__, stub)
-    monkeypatch.delitem(sys.modules, "unsloth_zoo.flex_attention.attention_sink", raising = False)
-    module = importlib.import_module("unsloth_zoo.flex_attention.attention_sink")
-    monkeypatch.delitem(sys.modules, "unsloth_zoo.flex_attention.attention_sink")
+    # setitem / setattr record an absent binding too (delitem with raising = False does not), so undo restores both
+    # the sys.modules entry and the package attribute the import rebinds.
+    name = "unsloth_zoo.flex_attention.attention_sink"
+    monkeypatch.setattr(sys.modules["unsloth_zoo.flex_attention"], "attention_sink", None, raising = False)
+    monkeypatch.setitem(sys.modules, name, None)
+    monkeypatch.delitem(sys.modules, name)
+    module = importlib.import_module(name)
+    monkeypatch.delitem(sys.modules, name)
     return module, stub
+
+
+@pytest.fixture
+def S(monkeypatch):
+    return _fresh_attention_sink(monkeypatch)
+
+
+@pytest.mark.parametrize("imported", [True, False])
+def test_the_fresh_attention_sink_import_is_undone(imported):
+    # The re-import rebinds the package attribute as well as sys.modules; undo must restore both, absence included.
+    parent = sys.modules["unsloth_zoo.flex_attention"]
+    name = "unsloth_zoo.flex_attention.attention_sink"
+    missing = object()
+    outer = pytest.MonkeyPatch()
+    if not imported:
+        outer.delitem(sys.modules, name, raising = False)
+        outer.delattr(parent, "attention_sink", raising = False)
+    before = (sys.modules.get(name, missing), vars(parent).get("attention_sink", missing))
+    inner = pytest.MonkeyPatch()
+    try:
+        module, _ = _fresh_attention_sink(inner)
+        assert module is not before[0]
+    finally:
+        inner.undo()
+    try:
+        assert (sys.modules.get(name, missing), vars(parent).get("attention_sink", missing)) == before
+    finally:
+        outer.undo()
 
 
 class _Attn(torch.nn.Module):
