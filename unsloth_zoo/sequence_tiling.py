@@ -24,6 +24,8 @@ intermediate activations live at once, in forward and in the backward recompute.
 """
 
 import functools
+import os
+import sys
 
 import torch
 
@@ -213,6 +215,10 @@ def tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = 
     n_tiles = int(n_tiles)
     if n_tiles <= 1:
         return fn(x, *token_args)
+    if _is_compiling() and _run_tiles_outside_graph():
+        return _tiled_call_eager(
+            fn, x, *token_args, n_tiles = n_tiles, needs_rng = needs_rng, output_contract = output_contract,
+        )
     lead = x.shape[:-1]
     if x.dim() == 2:
         flat, dim = x, 0
@@ -304,6 +310,39 @@ def tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = 
         return tuple(results)
     return results[0]
 pass
+
+
+_ENV_COMPILE = "UNSLOTH_TILED_COMPILE"
+
+
+def _run_tiles_outside_graph():
+    """Whether a compiled caller leaves the tile loop to eager code (one graph break at tiled_call) instead of
+    unrolling one checkpoint per tile into its graph.
+
+    Unrolling costs compile time linear in the tile count (G4: about 1.1 s per tile, 440 s for a cold step at 192k)
+    for a few percent of steady-state speed, so the loop leaves the graph wherever a break is legal: inside
+    Unsloth's per-layer compiled blocks (fullgraph=False). A user's own torch.compile may be fullgraph=True, where a
+    break is an error, so it keeps the unrolled loop. UNSLOTH_TILED_COMPILE = break | unroll forces either.
+    """
+    mode = os.environ.get(_ENV_COMPILE, "auto").strip().lower()
+    if mode == "break":
+        return True
+    if mode == "unroll":
+        return False
+    block = sys.modules.get("unsloth.models._block_compile")
+    flag = getattr(block, "_IN_COMPILED_REGION", None)
+    return bool(flag) and bool(flag[0])
+pass
+
+
+def _tiled_call_eager_impl(fn, x, *token_args, n_tiles, needs_rng, output_contract):
+    return tiled_call(fn, x, *token_args, n_tiles = n_tiles, needs_rng = needs_rng, output_contract = output_contract)
+pass
+
+
+# The eager tile loop runs each tile under the eager checkpoint; code compiled inside a tile compiles with dynamic
+# rows from its first call (_dynamic_inner_compiles), so one graph serves every tile.
+_tiled_call_eager = torch.compiler.disable(_tiled_call_eager_impl, recursive = True)
 
 
 def bucket_tiles(rows, tile_rows, cap = 64):

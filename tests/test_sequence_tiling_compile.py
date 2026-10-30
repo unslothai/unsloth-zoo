@@ -242,3 +242,61 @@ def test_inner_compiled_function_recompute_uses_the_same_graph(n_tiles):
     torch.testing.assert_close(y, yr, rtol = 1e-5, atol = 1e-5)
     torch.testing.assert_close(x.grad, xr.grad, rtol = 1e-4, atol = 1e-5)
     torch.testing.assert_close(m.w.grad, ref.w.grad, rtol = 1e-4, atol = 1e-5)
+
+
+def _block_with_tiled_mlp(n_tiles):
+    m = GatedMLP()
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = m
+
+        def forward(self, h):
+            return h + tiled_call(self.mlp, h * 1.5, n_tiles = n_tiles, needs_rng = False)
+    return Block()
+
+
+@pytest.mark.parametrize("mode", ["unsloth_block", "env_break"])
+def test_unsloth_block_compile_does_not_unroll_tiles(mode, monkeypatch):
+    # Inside Unsloth's compiled blocks (fullgraph=False) the tile loop leaves the graph: compile work must not grow
+    # with the tile count. Before, every tile added a checkpoint HOP to the graph (G4: ~1.1 s cold compile per tile).
+    import types
+    fake = types.ModuleType("unsloth.models._block_compile")
+    fake._IN_COMPILED_REGION = [mode == "unsloth_block"]
+    monkeypatch.setitem(sys.modules, "unsloth.models._block_compile", fake)
+    if mode == "env_break":
+        monkeypatch.setenv("UNSLOTH_TILED_COMPILE", "break")
+    seen = {}
+    for n in (4, 16, 64):
+        torch._dynamo.reset()
+        hops, graphs = [0], [0]
+
+        def backend(gm, example_inputs):
+            graphs[0] += 1
+            hops[0] += sum(1 for node in gm.graph.nodes if "checkpoint" in str(node.target))
+            return gm.forward
+        torch.manual_seed(0)
+        block = _block_with_tiled_mlp(n)
+        ref = copy.deepcopy(block)
+        x = torch.randn(1, 4 * n, H, requires_grad = True)
+        xr = x.detach().clone().requires_grad_()
+        y = torch.compile(block, backend = backend)(x)
+        y.pow(2).sum().backward()
+        yr = ref.mlp(xr * 1.5) + xr
+        yr.pow(2).sum().backward()
+        torch.testing.assert_close(y, yr)
+        torch.testing.assert_close(x.grad, xr.grad)
+        assert hops[0] == 0, hops
+        seen[n] = graphs[0]
+    assert len(set(seen.values())) == 1, seen  # same compile work at 4, 16 and 64 tiles
+
+
+def test_user_compile_keeps_the_unrolled_fullgraph(monkeypatch):
+    # Outside Unsloth's blocks a user's compile may be fullgraph=True, where a graph break is an error.
+    monkeypatch.delenv("UNSLOTH_TILED_COMPILE", raising = False)
+    monkeypatch.delitem(sys.modules, "unsloth.models._block_compile", raising = False)
+    torch._dynamo.reset()
+    block = _block_with_tiled_mlp(4)
+    x = torch.randn(1, 16, H, requires_grad = True)
+    torch.compile(block, backend = "aot_eager", fullgraph = True)(x).sum().backward()
