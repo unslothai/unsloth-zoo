@@ -2863,6 +2863,12 @@ def _nvfp4_bases(keys):
     return {k[: -len(_NVFP4_PACKED_SUFFIX)] for k in keys if isinstance(k, str) and k.endswith(_NVFP4_PACKED_SUFFIX)}
 pass
 
+def _with_nvfp4_dequantized_keys(keys):
+    """`keys` plus `<base>.weight` for each NVFP4 `<base>.weight_packed`: the 16bit merge rewrites
+    the packed tensor to that name, so it backs the module the same way a dense weight does."""
+    return set(keys) | {base + ".weight" for base in _nvfp4_bases(keys)}
+pass
+
 def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None, extra_scale_lookup = None):
     """Dequantize one FP8 weight; return (W_real, [scale_keys to drop]).
 
@@ -7381,6 +7387,8 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
     tokenizer, since `final_safetensors_list` is built after that upload.
     """
     disk_keys, disk_module_shapes = disk or _disk_module_shapes(save_directory, safetensors_list)
+    # The merge dequantizes an NVFP4 <base>.weight_packed to <base>.weight, so judge backing on that name.
+    disk_keys = _with_nvfp4_dequantized_keys(disk_keys)
     unresolved = _unresolved_lora_targets(
         lora_weights,
         disk_keys,
@@ -7468,9 +7476,7 @@ def _unbacked_trained_tensors(lora_weights, shard_keys, model_class_name,
     a bare `lm_head.weight` for it puts an unexpected key in the export.
     """
     # An NVFP4 <base>.weight_packed is rewritten to <base>.weight, so it backs that module too.
-    shard_keys = set(shard_keys) | {
-        k[: -len(_NVFP4_PACKED_SUFFIX)] + ".weight" for k in shard_keys if k.endswith(_NVFP4_PACKED_SUFFIX)
-    }
+    shard_keys = _with_nvfp4_dequantized_keys(shard_keys)
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, shard_keys, model_class_name = model_class_name,
     )
