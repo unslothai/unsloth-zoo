@@ -27,11 +27,12 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _sequence_tiling_models import GatedMLP, TopKMoE, lora_mlp, load_balancing_loss, H  # noqa: E402
-from unsloth_zoo.sequence_tiling import tiled_call, bucket_tiles  # noqa: E402
+from unsloth_zoo.sequence_tiling import tiled_call  # noqa: E402
+from unsloth_zoo.tiling_registry import _bucket  # noqa: E402
 
 TILE_ROWS = 1024
 SEQS = [1000, 1024, 1500, 2048, 3000, 4096, 5000, 8192, 12000, 16384, 20000, 32768]
-N_BUCKETS = len({bucket_tiles(s, TILE_ROWS) for s in SEQS})
+N_BUCKETS = len({_bucket(s, TILE_ROWS) for s in SEQS})
 
 
 class _Counter:
@@ -63,14 +64,14 @@ class Layer(torch.nn.Module):
         x = x + self.o(a.transpose(1, 2).reshape(b, s, H))
         h = self.n2(x)
         if self.tiled:
-            n = bucket_tiles(h.shape[0] * h.shape[1], TILE_ROWS)
+            n = _bucket(h.shape[0] * h.shape[1], TILE_ROWS)
             return x + tiled_call(self.mlp, h, n_tiles = n, needs_rng = False)
         return x + self.mlp(h)
 
 
 def _mlp_fn(m, contract = None):
     def f(x):
-        n = bucket_tiles(x.shape[0] * x.shape[1], TILE_ROWS)
+        n = _bucket(x.shape[0] * x.shape[1], TILE_ROWS)
         return tiled_call(m, x, n_tiles = n, needs_rng = False, output_contract = contract)
     return f
 
@@ -108,7 +109,7 @@ def _sweep(fn, params, backend, dynamic, seqs = SEQS, x_grad = True):
             if b is None: assert a is None
             else: torch.testing.assert_close(a, b, rtol = 1e-4, atol = 1e-5)
     breaks = sum(counters["graph_break"].values())
-    return cnt, breaks, len({bucket_tiles(s, TILE_ROWS) for s in seqs})
+    return cnt, breaks, len({_bucket(s, TILE_ROWS) for s in seqs})
 
 
 def _check(cnt, breaks, n_buckets, dynamic):
@@ -323,7 +324,7 @@ def test_compiled_tile_body_is_one_graph_for_every_tile_and_layer(monkeypatch):
     for mode in ("break", "compile_tile"):
         monkeypatch.setenv("UNSLOTH_TILED_COMPILE", mode)
         torch._dynamo.reset()
-        ST._COMPILED_TILE[0] = None
+        ST._COMPILED_TILES.clear()
         counters.clear()
         torch.manual_seed(0)
         m = Layers()
@@ -340,3 +341,69 @@ def test_compiled_tile_body_is_one_graph_for_every_tile_and_layer(monkeypatch):
         torch.testing.assert_close(x.grad, h.grad)
         graphs[mode] = counters["stats"]["unique_graphs"]
     assert graphs["compile_tile"] - graphs["break"] == 1, graphs
+
+
+@pytest.mark.parametrize("dynamic", [True, None])
+def test_lengths_inside_one_bucket_share_one_graph(dynamic):
+    # Tile boundaries depend only on ceil(rows / n_tiles): before, tensor_split's boundaries depended on
+    # rows % n_tiles, Dynamo guarded on it and every remainder compiled a new graph (fullgraph=True then hit the
+    # recompile limit). Lengths 2049..4095 all use 4 tiles of 1024 rows.
+    m = GatedMLP()
+    params = list(m.parameters())
+    seqs = [2049, 2050, 2051, 2500, 3001, 3333, 4000, 4093, 4095]
+    assert len({_bucket(s, TILE_ROWS) for s in seqs}) == 1
+    cnt, breaks, _ = _sweep(_mlp_fn(m), params, "aot_eager", dynamic, seqs = seqs)
+    assert breaks == 0
+    # dynamic=None compiles static first, then one dynamic graph.
+    assert cnt.inner.frame_count <= (1 if dynamic else 2), cnt.inner.frame_count
+
+
+def test_many_tiled_classes_stay_under_the_recompile_limit(monkeypatch):
+    # Frames shared by every tiled class (the tiled forward, the compiled tile body) guard on the module class: past
+    # 8 classes Dynamo's default recompile limit sent later layers to eager. Each class now has its own frames, and
+    # the tiling below the one graph break runs eagerly.
+    from unsloth_zoo import tiling_registry as R
+    monkeypatch.setenv("UNSLOTH_TILED_COMPILE", "compile_tile")
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(torch._dynamo.config, name):
+            monkeypatch.setattr(torch._dynamo.config, name, 8)  # stock torch (Unsloth raises it)
+    torch._dynamo.reset()
+    classes = []
+    for k in range(10):
+        def fwd(self, x, k = k):
+            return self.d(torch.relu(self.g(x)) + k)
+
+        def init(self):
+            torch.nn.Module.__init__(self)
+            self.g = torch.nn.Linear(H, 2 * H, bias = False)
+            self.d = torch.nn.Linear(2 * H, H, bias = False)
+        classes.append(type(f"Variant{k}MLP", (torch.nn.Module,), {"__init__": init, "forward": fwd}))
+    mods = torch.nn.ModuleList([c() for c in classes])
+    for m in mods:
+        R.install_module(m, "rows:8")
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = mods
+
+        def forward(self, x):
+            for m in self.layers:
+                x = x + m(x)
+            return x
+    model = Model()
+    run = model.forward
+    compiled = torch.compile(model, backend = "aot_eager")
+    x = torch.randn(1, 64, H, requires_grad = True)
+    y = compiled(x)
+    y.sum().backward()
+    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    from unsloth_zoo import sequence_tiling as st
+    frames = [R._tiled_forward, R._run_tiled, st.tiled_call, st._call_tile]
+    frames += list(getattr(R, "_TILED_FORWARDS", {}).values())
+    worst = max(len(_debug_get_cache_entry_list(f.__code__)) for f in frames)
+    assert worst <= 2, f"one frame holds {worst} graphs (limit 8)"
+    xr = x.detach().clone().requires_grad_()
+    torch.testing.assert_close(y, run(xr))
+    for m in mods:
+        R._detach(m)

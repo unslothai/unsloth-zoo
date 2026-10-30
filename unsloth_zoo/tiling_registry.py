@@ -41,7 +41,9 @@ from types import MethodType
 
 import torch
 
+from unsloth_zoo import sequence_tiling as _sequence_tiling
 from unsloth_zoo.memory_budget import _default_target_gb, _max_flat_qlen
+from unsloth_zoo.sequence_tiling import _is_compiling
 
 __all__ = [
     "TileSpec",
@@ -57,8 +59,8 @@ __all__ = [
     "is_tiled",
     "tiled_modules",
     "lookup",
-    "register",
     "needs_rng_state",
+    "is_off",
 ]
 
 PARALLEL_RULE = (
@@ -74,7 +76,6 @@ PARALLEL_RULE = (
 DEFAULT_MODE = "arctic"
 _MAX_TILES = 4096
 _ENV_MODULES = "UNSLOTH_TILED_MLP_MODULES"
-_ENV_ENGINE = "UNSLOTH_TILED_ENGINE"
 _ENV_TP = "UNSLOTH_TILED_MLP_TP"
 _OLD_SUFFIXES = (".mlp", ".ffn", ".feed_forward", ".ff", ".densereludense", ".block_sparse_moe")
 _CONTRACTS = ("rows", "rows_flat", "sum", "refuse")
@@ -86,11 +87,10 @@ _CONTRACTS = ("rows", "rows_flat", "sum", "refuse")
 
 @dataclass(frozen = True)
 class TileSpec:
-    """`selector`: class name, tuple of class names or `predicate(module) -> bool`.
-    `token_args`: positional forward arguments whose leading dims are the token axis (0 is the main input).
+    """`selector`: class name, tuple of class names or `predicate(module) -> bool`. Only the first positional forward
+    argument is tiled; a call with more arguments runs untiled.
     `output_contract`: per output, one of rows / rows_flat / sum / refuse; a bare tensor output uses entry 0."""
     selector: object
-    token_args: tuple = (0,)
     output_contract: tuple = ("rows",)
     family: str = ""
     refuse: str = ""
@@ -115,7 +115,11 @@ _SEQ_MIX_TOKENS = (
     "attention", "attn", "conv", "mamba", "recurren", "rnn", "lstm", "gru", "pool", "shuffle", "merger",
     "mixer", "resampler", "perceiver", "downsample", "upsample", "patchembed", "deltanet", "ssm", "scan", "rotary",
 )
-_SEQ_MIX_TYPES = (torch.nn.modules.conv._ConvNd, torch.nn.RNNBase, torch.nn.MultiheadAttention)
+# Batch and instance norms mix rows through their statistics in training, so a row tile changes their output.
+_SEQ_MIX_TYPES = (
+    torch.nn.modules.conv._ConvNd, torch.nn.RNNBase, torch.nn.MultiheadAttention,
+    torch.nn.modules.batchnorm._BatchNorm, torch.nn.modules.instancenorm._InstanceNorm,
+)
 _DENSE_NAME = re.compile(r"(mlp|feedforward|feed_forward|ffn|denseactdense|densereludense|densegatedactdense)$", re.I)
 
 
@@ -195,23 +199,11 @@ _BUILTINS = [
 ]
 # HF dense MLPs (Llama, Mistral, Qwen, Gemma, Phi, Granite, GLM, CLIP / SigLIP, T5 DenseReluDense, ...).
 _DENSE = TileSpec(_is_dense_mlp, family = "dense-mlp")
-_USER = []
-
-
-def register(spec, first = True):
-    """Add a TileSpec (user entries are checked before the built-ins)."""
-    if not isinstance(spec, TileSpec):
-        raise TypeError("Unsloth: register expects a TileSpec")
-    if first:
-        _USER.insert(0, spec)
-    else:
-        _USER.append(spec)
-    return spec
 
 
 def lookup(module):
     """The matching TileSpec (a refusal included), or None for an unknown class."""
-    for spec in itertools.chain(_USER, _BUILTINS):
+    for spec in _BUILTINS:
         try:
             if spec.matches(module):
                 return spec
@@ -231,7 +223,8 @@ def lookup(module):
 
 @dataclass(frozen = True)
 class TilePlan:
-    """mode: auto (budget from free memory), arctic (tile rows = hidden), rows (fixed), target (fixed GB budget)."""
+    """mode: auto (budget from free memory; one tile when tiling would not pay), arctic (tile rows = hidden), rows
+    (fixed), target (fixed GB budget; target_gb 0 means the free-memory budget, always tiled)."""
     mode: str = DEFAULT_MODE
     rows: int = 0
     target_gb: float = 0.0
@@ -241,7 +234,7 @@ class TilePlan:
     def spelling(self):
         if self.mode == "rows":
             s = f"rows:{self.rows}"
-        elif self.mode == "target":
+        elif self.mode == "target" and self.target_gb > 0:
             s = f"target:{self.target_gb:g}"
         else:
             s = self.mode
@@ -250,18 +243,33 @@ class TilePlan:
         return s
 
 
+_OFF = ("", "0", "false", "off", "no", "none")
+
+
+def is_off(value):
+    """True for every spelling of "tiling off": None, False, 0, "", "0", "false", "off", "no", "none"."""
+    if value is None or value is False:
+        return True
+    if value is True or isinstance(value, TilePlan):
+        return False
+    if isinstance(value, (int, float)):
+        return value == 0
+    return str(value).strip().lower() in _OFF
+
+
 def parse_mode(value, padded_length = 128):
     """`True` / "1" / "arctic" / "auto" / "target" / "target:GB" / "rows:N", each optionally followed by
-    `:pattern,pattern` (only modules matching a pattern are tiled). None, False, "", "0" mean off -> None."""
+    `:pattern,pattern` (only modules matching a pattern are tiled). Off spellings (see `is_off`) -> None.
+
+    "target" without a size tiles with half of free memory as the budget, always; "auto" uses the same budget but
+    keeps one tile when tiling would not lower the step peak enough (see estimate_tiling_gain)."""
     if isinstance(value, TilePlan):
         return value
-    if value is None or value is False:
+    if is_off(value):
         return None
     if value is True:
         value = DEFAULT_MODE
     text = str(value).strip()
-    if text.lower() in ("", "0", "false", "off", "no", "none"):
-        return None
     parts = text.split(":")
     head = parts[0].strip().lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
@@ -274,7 +282,7 @@ def parse_mode(value, padded_length = 128):
     elif head == "auto":
         mode = "auto"
     elif head == "target":
-        mode = "target" if arg else "auto"
+        mode = "target"
         if arg:
             try:
                 target_gb = float(arg)
@@ -302,7 +310,7 @@ def _tile_rows(plan, hidden, intermediate, nbytes, budget_gb):
         return plan.rows
     if plan.mode == "arctic":
         return max(1, int(hidden))
-    gb = plan.target_gb if plan.mode == "target" else budget_gb
+    gb = plan.target_gb if (plan.mode == "target" and plan.target_gb > 0) else budget_gb
     return _max_flat_qlen(
         hd = int(hidden), mlp_size = int(intermediate), nbytes = int(nbytes), target_gb = float(gb),
         padded_length = plan.padded_length,
@@ -366,84 +374,6 @@ def _device(module):
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Engines
-# ----------------------------------------------------------------------------------------------------------------
-
-def _merge(parts, contract):
-    if parts[0] is None:
-        return None
-    if contract == "sum":
-        out = parts[0]
-        for p in parts[1:]:
-            out = out + p
-        return out
-    if contract == "refuse":
-        raise RuntimeError("Unsloth: a refused output reached the tiling engine")
-    return torch.cat(parts, dim = 0)
-
-
-def _assemble(outs, output_contract):
-    if output_contract is None:
-        output_contract = ("rows",)
-    first = outs[0]
-    if torch.is_tensor(first):
-        return _merge(outs, output_contract[0])
-    return tuple(
-        _merge([o[i] for o in outs], output_contract[i] if i < len(output_contract) else "rows")
-        for i in range(len(first))
-    )
-
-
-def reference_tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = None):
-    """Oracle engine: one non-reentrant checkpoint per tile (plain loop without autograd)."""
-    from unsloth_zoo.sequence_tiling import _checkpoint
-    xs = torch.tensor_split(x, n_tiles, dim = 0)
-    ts = [torch.tensor_split(t, n_tiles, dim = 0) for t in token_args]
-    grad = torch.is_grad_enabled()
-    outs = []
-    for i, xt in enumerate(xs):
-        args = [xt] + [t[i] for t in ts]
-        if grad:
-            outs.append(_checkpoint(fn, tuple(args), bool(needs_rng)))
-        else:
-            outs.append(fn(*args))
-    return _assemble(outs, output_contract)
-
-
-# Internal engine selector. "checkpoint" (per-tile non-reentrant checkpoint) is the only shipped engine;
-# "reference" is the plain-loop oracle the tests compare against.
-_ENGINE = [None, None]  # (name, callable)
-
-
-def _resolve_engine(name):
-    name = (name or "auto").strip().lower()
-    if name == "reference":
-        return reference_tiled_call
-    if name in ("auto", "checkpoint"):
-        from unsloth_zoo.sequence_tiling import tiled_call
-        return tiled_call
-    raise ValueError(f"Unsloth: {_ENV_ENGINE} must be auto, checkpoint or reference, got {name!r}")
-
-
-def get_engine():
-    if _ENGINE[1] is None:
-        name = os.environ.get(_ENV_ENGINE, "auto")
-        _ENGINE[0], _ENGINE[1] = name, _resolve_engine(name)
-    return _ENGINE[1]
-
-
-def set_engine(engine):
-    """Name (auto / checkpoint / reference), a `tiled_call` callable, or None to re-read the environment."""
-    if engine is None:
-        _ENGINE[0] = _ENGINE[1] = None
-    elif callable(engine):
-        _ENGINE[0], _ENGINE[1] = getattr(engine, "__name__", "custom"), engine
-    else:
-        _ENGINE[0], _ENGINE[1] = engine, _resolve_engine(engine)
-    return _ENGINE[1]
-
-
-# ----------------------------------------------------------------------------------------------------------------
 # Dropout detection (checkpoint recompute must replay masks only when a dropout is live)
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -459,19 +389,7 @@ def _bump_module_tree_version(module, name, submodule):
     return None
 
 
-try:
-    torch.nn.modules.module.register_module_module_registration_hook(_bump_module_tree_version)
-    _HAS_MODULE_TREE_VERSION = True
-except Exception:
-    _HAS_MODULE_TREE_VERSION = False
-
-try:
-    from torch.compiler import is_compiling as _is_compiling
-except Exception:
-    try:
-        from torch._dynamo import is_compiling as _is_compiling
-    except Exception:
-        _is_compiling = lambda: False
+torch.nn.modules.module.register_module_module_registration_hook(_bump_module_tree_version)
 
 
 def needs_rng_state(module):
@@ -481,8 +399,7 @@ def needs_rng_state(module):
         return any(m.training and m.p > 0 for m in module.modules() if isinstance(m, _DROPOUT_TYPES))
     cached = module.__dict__.get("_unsloth_tiled_dropouts")
     # id check: a deepcopy carries the cache but its subtree is not tracked yet.
-    if cached is None or not _HAS_MODULE_TREE_VERSION or \
-            cached[0] != _MODULE_TREE_VERSION[0] or cached[1] != id(module):
+    if cached is None or cached[0] != _MODULE_TREE_VERSION[0] or cached[1] != id(module):
         modules = tuple(module.modules())
         _TRACKED_MODULES.update((id(m), m) for m in modules)
         dropouts = tuple(m for m in modules if isinstance(m, _DROPOUT_TYPES))
@@ -495,20 +412,34 @@ def needs_rng_state(module):
     return False
 
 
-# Registry families whose modules draw no random numbers apart from nn.Dropout submodules (checked live).
+# Registry families whose modules draw no random numbers apart from dropout submodules (checked live).
 _DETERMINISTIC_FAMILIES = frozenset({"dense-mlp", "topk-moe", "gpt-oss", "llama4-moe", "nemotron-h", "vlm-projector"})
-# Code whose only randomness is an nn.Dropout submodule (PEFT's lora_dropout, which the fused LoRA kernels read).
-_DROPOUT_ONLY_MODULES = ("torch.nn.", "peft.", "unsloth.kernels.fast_lora")
+# torch.nn classes that never draw random numbers (dropout is checked live; RReLU samples its slope in training).
+_DETERMINISTIC_TORCH_NN = frozenset({
+    "Module", "Linear", "Identity", "Bilinear", "LazyLinear", "Embedding", "EmbeddingBag",
+    "ModuleList", "ModuleDict", "Sequential", "ParameterList", "ParameterDict", "Flatten", "Unflatten",
+    "LayerNorm", "RMSNorm", "GroupNorm", "LocalResponseNorm",
+    "ReLU", "ReLU6", "GELU", "SiLU", "Mish", "Tanh", "Sigmoid", "Hardtanh", "Hardswish", "Hardsigmoid", "ELU",
+    "SELU", "CELU", "GLU", "LeakyReLU", "PReLU", "Softplus", "Softsign", "Softshrink", "Hardshrink", "Tanhshrink",
+    "Threshold", "LogSigmoid", "Softmax", "Softmin", "LogSoftmax",
+})
+# Library code whose classes may skip the RNG replay: transformers' own models (not remote code, which loads as
+# transformers_modules), PEFT, bitsandbytes layers and Unsloth. Anything else (remote or user code) replays.
+_TRUSTED_LIBRARIES = ("transformers.", "peft.", "bitsandbytes.", "unsloth.", "unsloth_zoo.")
+# Code whose only randomness is a dropout submodule (PEFT's lora_dropout, which the fused LoRA kernels read): its
+# source names dropout, so it is exempt from the source scan below.
+_DROPOUT_ONLY_MODULES = ("peft.", "unsloth.kernels.fast_lora", "bitsandbytes.")
 _RANDOM_SOURCE = re.compile(
-    r"dropout|\brand|randn|randint|randperm|multinomial|normal_|uniform_|bernoulli|exponential_|poisson|cauchy_|"
-    r"geometric_|log_normal_|jitter|noise|gumbel|torch\.empty_like\(.*\)\.\w+_\("
+    r"dropout|rrelu|\brand|randn|randint|randperm|multinomial|normal_|uniform_|bernoulli|exponential_|poisson|"
+    r"cauchy_|geometric_|log_normal_|jitter|noise|gumbel|torch\.empty_like\(.*\)\.\w+_\("
 )
 _SOURCE_VERDICT = {}
 
 
 def _code_may_draw_random(fn):
     """True unless fn's source is readable and names no random op. Bound methods, partials and staticmethods are
-    unwrapped; anything whose source cannot be read counts as random."""
+    unwrapped; anything whose source cannot be read counts as random. Calls into helpers are not followed, which is
+    why only trusted library classes may skip the replay at all (_class_is_trusted)."""
     while isinstance(fn, functools.partial):
         fn = fn.func
     fn = getattr(fn, "__func__", fn)
@@ -534,14 +465,27 @@ def _code_may_draw_random(fn):
     return verdict
 
 
+def _class_is_trusted(m):
+    cls = type(m)
+    module_name = cls.__module__ or ""
+    if module_name == "torch.nn" or module_name.startswith("torch.nn."):
+        return cls.__name__ in _DETERMINISTIC_TORCH_NN or isinstance(m, _DROPOUT_TYPES)
+    return module_name.startswith(_TRUSTED_LIBRARIES)
+
+
 def _subtree_may_draw_random(module):
-    """Conservative: True when any forward this subtree runs (class forwards, instance forwards, the adopted inner
-    forward) may draw random numbers other than through an nn.Dropout submodule."""
+    """Conservative: True unless every class in the subtree is trusted library code and every forward this subtree
+    runs (class forwards, instance forwards, the adopted inner forward) is free of random ops other than dropout
+    submodules, which needs_rng_state checks live."""
     for m in module.modules():
+        if not _class_is_trusted(m):
+            return True
         if isinstance(m, _DROPOUT_TYPES):
-            continue  # checked live (p > 0 and training) by needs_rng_state
+            continue
         d = m.__dict__
-        candidates = [type(m).forward, d.get("forward"), d.get("_unsloth_forward")]
+        candidates = [d.get("forward"), d.get("_unsloth_forward")]
+        if not type(m).__module__.startswith("torch.nn"):
+            candidates.append(type(m).forward)
         for fn in candidates:
             if fn is None or _is_ours(fn):
                 continue
@@ -551,11 +495,9 @@ def _subtree_may_draw_random(module):
 
 
 def needs_rng_replay(module, spec):
-    """Whether a training tile must snapshot and replay the RNG. Off only when provably unnecessary: a registry
-    family known to be deterministic, every forward in the subtree free of random ops, and no live dropout. Unknown
-    and opted-in classes always replay."""
-    if not module.training:
-        return needs_rng_state(module)
+    """Whether a tile must snapshot and replay the RNG. Off only when provably unnecessary: a registry family known
+    to be deterministic, every class in the subtree trusted library code whose forwards are free of random ops, and
+    no live dropout. Forced, opted-in and unknown classes always replay, in training and in eval."""
     if needs_rng_state(module):
         return True
     if spec is None or spec.family not in _DETERMINISTIC_FAMILIES:
@@ -570,8 +512,8 @@ def needs_rng_replay(module, spec):
 def _random_verdict(module):
     inner = module.__dict__.get("_unsloth_forward")
     cached = module.__dict__.get("_unsloth_tiled_random")
-    if cached is None or not _HAS_MODULE_TREE_VERSION or cached[0] != _MODULE_TREE_VERSION[0] or \
-            cached[1] != id(module) or cached[3] is not inner:
+    if cached is None or cached[0] != _MODULE_TREE_VERSION[0] or cached[1] != id(module) or \
+            cached[3] is not inner:
         _TRACKED_MODULES.update((id(m), m) for m in module.modules())
         cached = (_MODULE_TREE_VERSION[0], id(module), _subtree_may_draw_random(module), inner)
         module.__dict__["_unsloth_tiled_random"] = cached
@@ -628,19 +570,13 @@ def _unflat(o, contract, lead):
     return o.reshape(*lead, o.shape[-1])
 
 
-def _tile_fn(module, feed_3d, contract, trailing, x_tile, *token_tiles):
+def _tile_fn(module, feed_3d, contract, x_tile):
     """One tile through the module's inner forward. A module-level function bound with functools.partial (module
-    first, primitive constants after), so the op engine sees every parameter through `module`."""
+    first, primitive constants after), so a compiled tile body sees every parameter through `module`. The engine
+    hands each checkpointed tile its own copy of its rows (sequence_tiling._owned)."""
     rows = x_tile.shape[0]
     head = (1, rows) if feed_3d else (rows,)
-    if torch.is_grad_enabled():
-        # Own storage per tile: the fused LoRA MLP writes dX into its input in backward, which would bump the
-        # version of the shared base every other tile's checkpoint saved. Tile-sized and short-lived.
-        x_tile = x_tile.clone()
-    call = [x_tile.reshape(*head, x_tile.shape[-1])]
-    for j, t in enumerate(token_tiles):
-        call.append(t.reshape(*head, *trailing[j]))
-    out = _inner_forward(module)(*call)
+    out = _inner_forward(module)(x_tile.reshape(*head, x_tile.shape[-1]))
     if torch.is_tensor(out):
         return _flat(out, contract[0])
     return tuple(_flat(o, contract[k] if k < len(contract) else "rows") for k, o in enumerate(out))
@@ -653,16 +589,16 @@ def _engine_contract(contract):
     return None if set(contract) <= {"rows", "rows_flat"} else contract
 
 
-def _run_tiled(module, state, inner, args, n_tiles):
+def _run_tiled(module, state, x, n_tiles, compile_tile = False):
     contract = state.spec.output_contract
-    x = args[0]
     lead = x.shape[:-1]
     x2 = x.reshape(-1, x.shape[-1])
-    trailing = tuple(tuple(a.shape[len(lead):]) for a in args[1:])
-    token_flat = [a.reshape(x2.shape[0], -1) for a in args[1:]]
-    fn = functools.partial(_tile_fn, module, x.dim() >= 3, tuple(contract), trailing)
-    out = get_engine()(
-        fn, x2, *token_flat,
+    fn = functools.partial(_tile_fn, module, x.dim() >= 3, tuple(contract))
+    if compile_tile:
+        fn = _sequence_tiling._compiled_tile_fn(fn)
+    # Through the module attribute, so a test can wrap the engine.
+    out = _sequence_tiling.tiled_call(
+        fn, x2,
         n_tiles = n_tiles, needs_rng = needs_rng_replay(module, state.spec),
         output_contract = _engine_contract(contract),
     )
@@ -674,14 +610,10 @@ def _run_tiled(module, state, inner, args, n_tiles):
 def _tiled_forward(self, *args, **kwargs):
     inner = _inner_forward(self)
     state = self.__dict__.get("_unsloth_tiling")
-    if state is None or kwargs or not args or not torch.is_tensor(args[0]) or args[0].dim() < 2:
+    if state is None or kwargs or len(args) != 1 or not torch.is_tensor(args[0]) or args[0].dim() < 2:
         return inner(*args, **kwargs)
     x = args[0]
     lead = x.shape[:-1]
-    # Every extra positional argument must be a token argument, in order, with x's leading dims.
-    for i in range(1, len(args)):
-        if i not in state.spec.token_args or not torch.is_tensor(args[i]) or args[i].shape[:len(lead)] != lead:
-            return inner(*args)
     rows = math.prod(lead)
     tile_rows = state.tile_rows
     if tile_rows is None:
@@ -694,7 +626,16 @@ def _tiled_forward(self, *args, **kwargs):
         return inner(*args)
     if state.plan.mode == "auto" and not _auto_tiling_pays(state, rows, x.element_size(), n_tiles):
         return inner(*args)
-    return _run_tiled(self, state, inner, args, n_tiles)
+    if _is_compiling():
+        mode = _sequence_tiling._outside_graph_mode()
+        if mode != "unroll":
+            # One graph break here (in this class's own copy of _tiled_forward); everything below runs eagerly, so
+            # no further frame is compiled per class.
+            return _run_tiled_outside_graph(self, state, x, n_tiles, mode == "compile_tile")
+    return _run_tiled(self, state, x, n_tiles)
+
+
+_run_tiled_outside_graph = torch.compiler.disable(_run_tiled, recursive = True)
 
 
 # "auto" tiles only when the saving is worth the extra recompute (15-30% step time on G4).
@@ -736,8 +677,27 @@ def _auto_tiling_pays(state, rows, nbytes, n_tiles):
     return pays
 
 
+_TILED_FORWARDS = {}
+
+
+def _tiled_forward_for(cls):
+    """_tiled_forward with its own code object per module class. Dynamo keeps graphs per code object and guards on
+    the class of `self`, so one function shared by every class would run into the recompile limit (8 by default)
+    on a model with many tiled classes compiled by the caller."""
+    fn = _TILED_FORWARDS.get(cls)
+    if fn is None:
+        code = _tiled_forward.__code__.replace(co_name = f"_tiled_forward_{len(_TILED_FORWARDS)}")
+        fn = types.FunctionType(code, _tiled_forward.__globals__, code.co_name)
+        fn._unsloth_tiled_forward = True
+        _TILED_FORWARDS[cls] = fn
+    return fn
+
+
+_tiled_forward._unsloth_tiled_forward = True
+
+
 def _is_ours(fn):
-    return getattr(fn, "__func__", None) is _tiled_forward
+    return getattr(getattr(fn, "__func__", None), "_unsloth_tiled_forward", False)
 
 
 def is_tiled(module):
@@ -781,11 +741,12 @@ def _attach(module, spec, plan, budget_cache):
             _unchain(module, _bind(module, prior))
         elif "_unsloth_forward" not in d:
             d["_unsloth_forward"] = type(module).forward
-        d["forward"] = MethodType(_tiled_forward, module)
+        d["forward"] = MethodType(_tiled_forward_for(type(module)), module)
     hidden = _infer_hidden(module)
     dtype = _float_dtype(module)
     nbytes = torch.empty((), dtype = dtype).element_size() if dtype is not None else 2
-    budget = _budget(_device(module), budget_cache) if plan.mode == "auto" else 0.0
+    free_budget = plan.mode == "auto" or (plan.mode == "target" and not plan.target_gb > 0)
+    budget = _budget(_device(module), budget_cache) if free_budget else 0.0
     d["_unsloth_tiling"] = _TileState(spec, plan, hidden, _infer_intermediate(module, hidden), nbytes, budget)
     _random_verdict(module)  # eager, so a compiled caller can read it
 
@@ -852,12 +813,37 @@ def _contract_for(out, lead):
     return ("refuse",)
 
 
+def _probed_forward(module):
+    """The forward the module runs untiled: an instance forward when one is set, else the adopted inner forward."""
+    d = module.__dict__
+    current = d.get("forward")
+    if current is not None and not _is_ours(current):
+        return current
+    return d.get("_unsloth_forward")
+
+
+def _compare_tiled(module, spec, inner, x, hidden, n_tiles, dtype):
+    with torch.no_grad():
+        want = inner(x)
+        if spec is None:
+            spec = TileSpec(type(module).__name__, output_contract = _contract_for(want, x.shape[:-1]), family = "opt-in")
+        if spec.refuse:
+            return spec, f"self-check: {spec.refuse}"
+        state = _TileState(spec, TilePlan(mode = "rows", rows = 1), hidden, hidden, 2, 0.0)
+        got = _run_tiled(module, state, x, n_tiles)
+    msg = _compare(want, got, dtype)
+    return spec, (None if msg is None else f"self-check failed: tiled != untiled ({msg})")
+
+
 def _self_check(module, spec, n_tiles = 3):
-    """One eager check per class: tiled == untiled on a small row block. Returns (spec or None, reason)."""
+    """One eager check per instance and forward: tiled == untiled on a small row block, in eval and in training (with
+    dropout off, and buffers such as batch-norm statistics restored). Returns (spec or None, reason)."""
     # Per instance: two instances of one class can differ in config (a sequence-mixing variant, another contract).
-    key = module
-    if key in _SELF_CHECK:
-        return _SELF_CHECK[key]
+    # Keyed on the forward too: a later revalidation may find a different one (a wrapper or kernel installed since).
+    probed = _probed_forward(module)
+    cached = _SELF_CHECK.get(module)
+    if cached is not None and cached[0] is probed:
+        return cached[1]
     result = (None, "self-check could not run")
     hidden = _infer_hidden(module)
     device = _device(module)
@@ -868,40 +854,42 @@ def _self_check(module, spec, n_tiles = 3):
         result = (None, "self-check: weights are not materialised")
     else:
         flags = [(m, m.training) for m in module.modules()]
-        module.eval()
+        buffers = [(b, b.detach().clone()) for b in module.buffers()]
+        d = module.__dict__
+        current = d.get("forward")
+        slot_was = d.get("_unsloth_forward", _MISSING)
         try:
             g = torch.Generator().manual_seed(1234)
             x = torch.randn(2, 7, hidden, generator = g).to(device = device, dtype = dtype)
-            d = module.__dict__
-            current = d.get("forward")
             # Probe what the module runs and what _attach will adopt: an instance forward when one is set.
-            slot_was = d.get("_unsloth_forward", _MISSING)
             if current is not None and not _is_ours(current):
                 d["_unsloth_forward"] = _adoptable(current)
             inner = _inner_forward(module)
-            with torch.no_grad():
-                want = inner(x)
-                if spec is None:
-                    spec = TileSpec(type(module).__name__, output_contract = _contract_for(want, x.shape[:-1]),
-                                    family = "opt-in")
-                if spec.refuse:
-                    result = (None, f"self-check: {spec.refuse}")
-                else:
-                    state = _TileState(spec, TilePlan(mode = "rows", rows = 1), hidden, hidden, 2, 0.0)
-                    got = _run_tiled(module, state, inner, (x,), n_tiles)
-                    msg = _compare(want, got, dtype)
-                    result = (spec, "") if msg is None else (None, f"self-check failed: tiled != untiled ({msg})")
+            module.eval()
+            spec, msg = _compare_tiled(module, spec, inner, x, hidden, n_tiles, dtype)
+            if msg is None:
+                module.train()
+                for m in module.modules():
+                    if isinstance(m, _DROPOUT_TYPES):
+                        m.eval()
+                spec, msg = _compare_tiled(module, spec, inner, x, hidden, n_tiles, dtype)
+                if msg is not None and not msg.startswith("self-check: "):
+                    msg += " in training mode"
+            result = (spec, "") if msg is None else (None, msg)
         except Exception as e:
             result = (None, f"self-check raised {type(e).__name__}: {str(e)[:120]}")
         finally:
             for m, t in flags:
                 m.training = t
+            with torch.no_grad():
+                for b, saved in buffers:
+                    b.copy_(saved)
             if current is not None and not _is_ours(current):
                 if slot_was is _MISSING:
                     d.pop("_unsloth_forward", None)
                 else:
                     d["_unsloth_forward"] = slot_was
-    _SELF_CHECK[key] = result
+    _SELF_CHECK[module] = (probed, result)
     return result
 
 

@@ -226,11 +226,8 @@ class _Holder(torch.nn.Module):
 def _reset_registry(monkeypatch):
     if R is not None:
         R._SELF_CHECK.clear()
-        R.set_engine("checkpoint")  # the shipped engine
     monkeypatch.delenv("UNSLOTH_TILED_MLP_MODULES", raising = False)
     yield
-    if R is not None:
-        R.set_engine(None)
 
 
 @needs_registry
@@ -431,7 +428,7 @@ def test_deepcopy_runs_the_copy():
     ("1", "arctic", 0, 0.0, ()),
     ("arctic", "arctic", 0, 0.0, ()),
     ("auto", "auto", 0, 0.0, ()),
-    ("target", "auto", 0, 0.0, ()),
+    ("target", "target", 0, 0.0, ()),
     ("target:2.5", "target", 0, 2.5, ()),
     ("target:2:mlp,ffn", "target", 0, 2.0, ("mlp", "ffn")),
     ("arctic::*.mlp", "arctic", 0, 0.0, ("*.mlp",)),
@@ -469,11 +466,13 @@ def test_bucket_is_power_of_two_and_never_exceeds_rows():
 
 
 @needs_registry
-def test_short_inputs_skip_the_engine():
+def test_short_inputs_skip_the_engine(monkeypatch):
+    from unsloth_zoo import sequence_tiling
     mlp = type("FooMLP", (_TokenMLP,), {})()
     R.install_module(mlp, "rows:4")
     calls = []
-    R.set_engine(lambda *a, **k: calls.append(1) or R.reference_tiled_call(*a, **k))
+    real = sequence_tiling.tiled_call
+    monkeypatch.setattr(sequence_tiling, "tiled_call", lambda *a, **k: calls.append(1) or real(*a, **k))
     mlp(torch.randn(1, 1, 8))
     mlp(torch.randn(1, 4, 8))
     assert calls == []
@@ -519,30 +518,6 @@ def test_extra_outputs_receive_gradients():
 
 
 @needs_registry
-def test_engine_selector(monkeypatch):
-    R.set_engine(None)
-    monkeypatch.setenv("UNSLOTH_TILED_ENGINE", "reference")
-    assert R.get_engine() is R.reference_tiled_call
-    R.set_engine(None)
-    monkeypatch.setenv("UNSLOTH_TILED_ENGINE", "bogus")
-    with pytest.raises(ValueError):
-        R.get_engine()
-    R.set_engine(None)
-    monkeypatch.setenv("UNSLOTH_TILED_ENGINE", "op")
-    with pytest.raises(ValueError):
-        R.get_engine()
-    from unsloth_zoo.sequence_tiling import tiled_call
-    for name in ("auto", "checkpoint"):
-        R.set_engine(None)
-        monkeypatch.setenv("UNSLOTH_TILED_ENGINE", name)
-        assert R.get_engine() is tiled_call
-    R.set_engine(None)
-    monkeypatch.delenv("UNSLOTH_TILED_ENGINE")
-    assert R.get_engine() is tiled_call
-    R.set_engine(None)
-
-
-@needs_registry
 def test_parallel_rule_is_documented():
     assert "per rank" in R.PARALLEL_RULE and "Ulysses" in R.PARALLEL_RULE
 
@@ -557,7 +532,7 @@ def test_tiled_mlp_shims():
     assert tiled_mlp._default_target_gb is memory_budget._default_target_gb
     assert tiled_mlp._host_target_gb is memory_budget._host_target_gb
     assert tiled_mlp.get_max_flat_qlen is memory_budget.get_max_flat_qlen
-    assert not hasattr(tiled_mlp, "TiledMLP")
+    assert tiled_mlp.TiledMLP is not None  # kept for released Unsloth (test_tiled_mlp_legacy_imports.py)
     model = _Holder(lambda: type("FooMLP", (_TokenMLP,), {})())
     tiled_mlp.patch_tiled_mlp(model, "target:1")
     assert all(R.is_tiled(layer.mlp) for layer in model.layers)
@@ -836,25 +811,104 @@ class _CleanMLP(torch.nn.Module):
 
 
 def _spy_engine(monkeypatch):
+    from unsloth_zoo import sequence_tiling
     seen = []
-    real = R.get_engine()
+    real = sequence_tiling.tiled_call
 
     def spy(*a, **k):
         seen.append(k["needs_rng"])
         return real(*a, **k)
-    R.set_engine(spy)
+    monkeypatch.setattr(sequence_tiling, "tiled_call", spy)
     return seen
 
 
 @needs_registry
+def _llama_mlp(act = "silu"):
+    from transformers import LlamaConfig
+    from transformers.models.llama.modeling_llama import LlamaMLP
+    return LlamaMLP(LlamaConfig(
+        hidden_size = 8, intermediate_size = 16, hidden_act = act, num_attention_heads = 2, num_key_value_heads = 2,
+    ))
+
+
+@needs_registry
 def test_dense_mlp_skips_rng_replay(monkeypatch):
-    m = type("FooMLP", (_CleanMLP,), {})()  # dropout p = 0
+    m = _llama_mlp()  # transformers' own class, no dropout
     R.install_module(m, "rows:2")
     assert R.lookup(m).family == "dense-mlp"
     m.train()
     seen = _spy_engine(monkeypatch)
     m(torch.randn(1, 8, 8, requires_grad = True)).sum().backward()
-    assert seen == [False]
+    m.eval()
+    m(torch.randn(1, 8, 8, requires_grad = True)).sum().backward()
+    assert seen == [False, False]
+
+
+def _noise(h):
+    return h * (1 + 0.01 * torch.randn_like(h))
+
+
+class _HelperNoiseMLP(_CleanMLP):
+    def forward(self, x):  # draws through a helper the source scan does not follow
+        return self.down(_noise(torch.nn.functional.gelu(self.up(x))))
+
+
+@needs_registry
+@pytest.mark.parametrize("case", ["rrelu_in_transformers_mlp", "user_mlp_with_helper_noise", "user_mlp_no_random"])
+def test_rng_replay_unless_every_class_is_trusted(monkeypatch, case):
+    # A dense-MLP family match alone is not proof: RReLU is a torch.nn class that samples, and user / remote-code
+    # classes may draw through helpers. Only trusted library classes (transformers, an allowlist of torch.nn, PEFT,
+    # Unsloth) may skip the replay, and skipping it there gives the wrong gradient.
+    if case == "rrelu_in_transformers_mlp":
+        m = _llama_mlp()
+        m.act_fn = torch.nn.RReLU()
+    elif case == "user_mlp_with_helper_noise":
+        m = type("FooMLP", (_HelperNoiseMLP,), {})(p = 0.0)
+    else:
+        m = type("FooMLP", (_CleanMLP,), {})(p = 0.0)
+    assert R.lookup(m).family == "dense-mlp"
+    ref = copy.deepcopy(m)
+    R.install_module(m, "rows:2")
+    m.train(); ref.train()
+    seen = _spy_engine(monkeypatch)
+    x = torch.randn(1, 8, 8)
+    torch.manual_seed(5)
+    y = m(x)
+    y.pow(2).sum().backward()
+    torch.manual_seed(5)
+    yr = torch.cat([type(ref).forward(ref, t) for t in torch.tensor_split(x, 4, dim = 1)], dim = 1)
+    yr.pow(2).sum().backward()
+    assert seen == [True]
+    assert torch.equal(y, yr)
+    for (name, a), b in zip(m.named_parameters(), ref.parameters()):
+        assert torch.equal(a.grad, b.grad), name
+
+
+class _RandomBlock(torch.nn.Module):
+    def __init__(self, h = 8):
+        super().__init__()
+        self.lin = torch.nn.Linear(h, h)
+
+    def forward(self, x):
+        h = self.lin(x)
+        return h * torch.rand_like(h)  # random in eval too
+
+
+@needs_registry
+def test_forced_random_module_replays_in_eval_with_grad(monkeypatch):
+    # RL log-prob passes run eval mode with grad on: a forced / opted-in module must still replay its RNG.
+    m = _RandomBlock()
+    ref = copy.deepcopy(m)
+    R.install_module(m, "rows:2")
+    m.eval(); ref.eval()
+    seen = _spy_engine(monkeypatch)
+    x = torch.randn(1, 8, 8)
+    torch.manual_seed(3)
+    m(x).pow(2).sum().backward()
+    torch.manual_seed(3)
+    torch.cat([ref(t) for t in torch.tensor_split(x, 4, dim = 1)], dim = 1).pow(2).sum().backward()
+    assert seen == [True]
+    assert torch.equal(m.lin.weight.grad, ref.lin.weight.grad)
 
 
 @needs_registry
@@ -894,7 +948,7 @@ def test_rng_replay_is_kept_whenever_it_cannot_be_ruled_out(monkeypatch):
         m.train()
         assert R.needs_rng_replay(m, m.__dict__["_unsloth_tiling"].spec)
     # An inner forward whose source cannot be read counts as random.
-    clean = type("FooMLP", (_CleanMLP,), {})()
+    clean = _llama_mlp()
     R.install_module(clean, "rows:2")
     clean.train()
     assert not R.needs_rng_replay(clean, clean.__dict__["_unsloth_tiling"].spec)
@@ -938,3 +992,120 @@ def test_auto_keeps_one_tile_when_the_estimate_says_no_gain(monkeypatch, capsys)
     monkeypatch.setattr(R, "AUTO_MIN_SAVING_FRACTION", 0.0)
     mlp(x)
     assert len(seen) == 1  # once the estimate says it pays, the budget's tiles are used
+
+
+@pytest.mark.parametrize("frozen_input", [False, True])
+def test_direct_tiled_call_owns_each_tile_input(frozen_input):
+    # The ownership copy lives in the engine's checkpointed body, so the direct tiled_call API is safe for a kernel
+    # that writes dX into its input too (before, only the registry's tile function copied).
+    from unsloth_zoo.sequence_tiling import tiled_call
+    torch.manual_seed(0)
+    w = torch.nn.Parameter(torch.randn(8, 8) / 3)
+    x0 = torch.randn(2, 6, 8)
+    grads = []
+    for tiled in (False, True):
+        w.grad = None
+        x = x0.clone().requires_grad_(not frozen_input)
+        h = x * 1.0
+        fn = lambda t: _InplaceDXLinear.apply(t, w)
+        out = tiled_call(fn, h, n_tiles = 3, needs_rng = False) if tiled else fn(h.clone())
+        (out * torch.arange(out.numel()).reshape(out.shape)).sum().backward()
+        grads.append((w.grad.clone(), None if frozen_input else x.grad.clone()))
+    torch.testing.assert_close(grads[1][0], grads[0][0])
+    if not frozen_input:
+        torch.testing.assert_close(grads[1][1], grads[0][1])
+
+
+def test_compiled_tiles_check_row_counts():
+    # Eager tiles checked every output's row count; compiled tiles skipped it, so a rows_flat output with a missing
+    # row per tile came back silently short.
+    from unsloth_zoo.sequence_tiling import tiled_call
+    lin = torch.nn.Linear(8, 8)
+
+    def fn(t):
+        h = lin(t)
+        return h, h.reshape(-1, 8)[:-1]
+
+    def call(x):
+        return tiled_call(fn, x, n_tiles = 2, needs_rng = False, output_contract = ("rows", "rows_flat"))
+    torch._dynamo.reset()
+    with pytest.raises(Exception):
+        torch.compile(call, backend = "aot_eager", fullgraph = True, dynamic = True)(torch.randn(1, 8, 8))
+
+
+def test_bare_tensor_output_uses_the_first_contract_entry():
+    from unsloth_zoo.sequence_tiling import tiled_call
+    lin = torch.nn.Linear(8, 8)
+    x = torch.randn(1, 6, 8, requires_grad = True)
+    y = tiled_call(lin, x, n_tiles = 3, needs_rng = False, output_contract = ("rows", "sum"))
+    torch.testing.assert_close(y, lin(x))
+    with torch.no_grad():
+        torch.testing.assert_close(tiled_call(lin, x, n_tiles = 3, output_contract = ("rows", "sum")), lin(x))
+
+
+@needs_registry
+def test_revalidation_rechecks_a_module_whose_forward_changed():
+    # The opt-in self-check was cached per instance: after the module's forward changed (a wrapper or a kernel
+    # installed later), revalidation reused the old verdict and tiled a forward that mixes tokens.
+    model = _Holder(lambda: FooBlock(), n = 1)
+    report = R.install(model, "rows:2", modules = ["FooBlock"])
+    assert len(report.tiled) == 1
+    mlp = model.layers[0].mlp
+    R.uninstall(model)
+    mlp.forward = lambda x: (lambda y: y + y.mean(dim = -2, keepdim = True))(_TokenMLP.forward(mlp, x))  # mixes
+    report = R.install(model, "rows:2", modules = ["FooBlock"])
+    assert not report.tiled and "self-check failed" in report.skipped[0][2]
+
+
+class _BatchCenter(_TokenMLP):
+    def forward(self, x):
+        y = super().forward(x)
+        if self.training:  # batch statistics in training only
+            y = y - y.mean(dim = -2, keepdim = True)
+        return y
+
+
+@needs_registry
+def test_batch_statistic_modules_are_not_tiled():
+    # A dense MLP holding a BatchNorm mixes rows through its statistics in training: tiling changed its output.
+    class FooMLP(_TokenMLP):
+        def __init__(self):
+            super().__init__()
+            self.bn = torch.nn.BatchNorm1d(8)
+
+        def forward(self, x):
+            y = super().forward(x)
+            return self.bn(y.reshape(-1, 8)).reshape(y.shape)
+    model = _Holder(lambda: FooMLP(), n = 1)
+    report = R.install(model, "rows:2")
+    assert not report.tiled and "BatchNorm1d" in report.skipped[0][2]
+    # An opted-in class that uses batch statistics only in training fails the self-check in training mode.
+    model = _Holder(lambda: _BatchCenter(), n = 1)
+    report = R.install(model, "rows:2", modules = ["_BatchCenter"])
+    assert not report.tiled and "training" in report.skipped[0][2]
+
+
+@needs_registry
+def test_bare_target_always_tiles(monkeypatch):
+    # "target" without a size used to mean auto, which may keep one tile; it tiles with the free-memory budget.
+    plan = R.parse_mode("target")
+    assert (plan.mode, plan.target_gb, plan.spelling()) == ("target", 0.0, "target")
+    monkeypatch.setattr(R, "_auto_tiling_pays", lambda *a, **k: False)
+    monkeypatch.setattr(R, "_default_target_gb", lambda device = None: 1e-6)
+    seen = _spy_engine(monkeypatch)
+    mlp = _llama_mlp()
+    R.install_module(mlp, "target")
+    mlp(torch.randn(1, 512, 8))  # tile rows bottom out at padded_length (128)
+    assert len(seen) == 1
+
+
+@needs_registry
+@pytest.mark.parametrize("value", [None, False, 0, 0.0, "", "0", "false", "OFF", " no ", "None"])
+def test_every_off_spelling_is_off(value):
+    assert R.is_off(value) and R.parse_mode(value) is None
+
+
+@needs_registry
+@pytest.mark.parametrize("value", [True, 1, "1", "arctic", "auto", "target", "rows:4"])
+def test_on_spellings_are_not_off(value):
+    assert not R.is_off(value) and R.parse_mode(value) is not None

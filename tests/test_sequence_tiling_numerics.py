@@ -28,7 +28,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from _sequence_tiling_models import (  # noqa: E402
     GatedMLP, TopKMoE, load_balancing_loss, lora_mlp, grads, H,
 )
-from unsloth_zoo.sequence_tiling import tiled_call, bucket_tiles  # noqa: E402
+from unsloth_zoo.sequence_tiling import tiled_call  # noqa: E402
+from unsloth_zoo.tiling_registry import _bucket  # noqa: E402
 
 TOL = {torch.float32: (1e-5, 1e-6), torch.bfloat16: (2e-2, 2e-2), torch.float16: (2e-3, 2e-3)}
 
@@ -275,10 +276,11 @@ def test_unsloth_shim_installed_frozen_input(monkeypatch):
 
 
 def test_bucket():
-    assert bucket_tiles(100, 128) == 1
-    assert bucket_tiles(129, 128) == 2
-    assert bucket_tiles(1000, 128) == 8
-    assert bucket_tiles(10 ** 7, 128, cap = 64) == 64
+    assert _bucket(100, 128) == 1
+    assert _bucket(129, 128) == 2
+    assert _bucket(1000, 128) == 8
+    assert _bucket(3, 128) == 1
+    assert _bucket(10, 1) == 8  # never more tiles than rows
 
 
 @pytest.mark.parametrize("frozen", [False, True])
