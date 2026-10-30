@@ -30,6 +30,18 @@ import torch
 pytest.importorskip("triton")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _skip_without_cpu_inductor():
+    # CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none.
+    try:
+        from torch._inductor.cpp_builder import get_cpp_compiler
+    except ImportError:
+        return  # older torch: let the run report its own error
+    try:
+        get_cpp_compiler()
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"CPU Inductor has no C++ compiler here ({type(e).__name__}: {e})"[:300])
+
 _SCRIPT = textwrap.dedent('''
     import json, os, sys
     import torch
@@ -251,6 +263,8 @@ def loop_runs(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("gpt_oss_decode_loop")
     dev = "cuda" if torch.cuda.is_available() and torch.version.hip is None else "cpu"
     dtype = "bfloat16" if dev == "cuda" else "float32"
+    if dev == "cpu":
+        _skip_without_cpu_inductor()
     return {
         arm: _run(
             tmp, _LOOP, dev, dtype,
