@@ -249,6 +249,10 @@ def _spawn(world, cells):
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("cell", ["ddp", "fsdp2"])
 def test_gloo(world, cell):
+    if cell == "fsdp2" and not hasattr(getattr(torch, "cpu", None) and torch.cpu.Stream, "record_event"):
+        # fully_shard's all-gather records an event on the CPU stream, which torch < 2.7 lacks; the untiled
+        # reference fails the same way, so there is nothing to compare. The NCCL cells cover FSDP2 there.
+        pytest.skip("FSDP2 on CPU needs torch.cpu.Stream.record_event (torch >= 2.7)")
     res = _spawn(world, [cell])
     print(world, cell, json.dumps({r: v for r, v in res.items()}, default = str))
     for r, v in res.items():
