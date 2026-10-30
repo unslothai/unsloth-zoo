@@ -96,9 +96,13 @@ pass
 
 def _bias_compute_dtype(module):
     """The dtype the module computes in now: its floating weight (a later model.float() / .bfloat16() or a merge
-    moves it), else bitsandbytes' compute_dtype / quant_state dtype (a packed 4bit / 8bit weight), else float16,
-    the only load dtype that installs the master."""
-    weight = getattr(module, "weight", None)
+    moves it; nn.MultiheadAttention's in_proj_weight / q_proj_weight), else bitsandbytes' compute_dtype /
+    quant_state dtype (a packed 4bit / 8bit weight), else float16, the only load dtype that installs the master."""
+    weight = None
+    for weight_name in ("weight", "in_proj_weight", "q_proj_weight"):
+        weight = getattr(module, weight_name, None)
+        if torch.is_tensor(weight):
+            break
     if torch.is_tensor(weight) and weight.is_floating_point() and not hasattr(weight, "quant_state"):
         return weight.dtype
     dtype = getattr(module, "compute_dtype", None)
@@ -108,61 +112,67 @@ def _bias_compute_dtype(module):
     return dtype if isinstance(dtype, torch.dtype) else torch.float16
 
 
-def _float32_bias_master_get(self):
-    """Inside the module's forward, `module.bias` is the float32 master cast (differentiably) to the compute dtype,
+def _float32_bias_master_property(name):
+    """Inside a marked forward, `module.<name>` is the float32 master cast (differentiably) to the compute dtype,
     resolved at each read: after Accelerate materializes an offloaded bias, and on DataParallel replicas (which
     keep the replicated bias as a plain attribute). bitsandbytes' in-place `bias.data = ...` downcast lands on the
     cast. Outside forward, and in _parameters (state_dict, parameters(), optimizers), it is the float32 Parameter."""
-    if "bias" in self._parameters:
-        master = self._parameters["bias"]
-    elif "bias" in self.__dict__:
-        master = self.__dict__["bias"]
-    else:
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'bias'")
-    if master is None or not self._unsloth_bias_in_forward:
-        return master
-    dtype = _bias_compute_dtype(self)
-    if master.dtype == dtype or not master.is_floating_point():
-        return master
-    return master.to(dtype)
 
+    def get(self):
+        if name in self._parameters:
+            master = self._parameters[name]
+        elif name in self.__dict__:
+            master = self.__dict__[name]
+        else:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        if master is None or not self._unsloth_bias_in_forward:
+            return master
+        dtype = _bias_compute_dtype(self)
+        if master.dtype == dtype or not master.is_floating_point():
+            return master
+        return master.to(dtype)
 
-def _float32_bias_master_set(self, value):
-    # Reached only for a non-Parameter while "bias" is not registered (DataParallel replicas): nn.Module routes
-    # Parameters and registered names through _parameters itself.
-    self.__dict__["bias"] = value
+    def set(self, value):
+        # Reached only for a non-Parameter while the name is not registered (DataParallel replicas): nn.Module
+        # routes Parameters and registered names through _parameters itself.
+        self.__dict__[name] = value
 
+    def delete(self):
+        self.__dict__.pop(name, None)
 
-def _float32_bias_master_del(self):
-    self.__dict__.pop("bias", None)
+    return property(get, set, delete)
 
 
 def _float32_bias_master_reduce(self):
     """__reduce__ via the importable base class, so pickle / torch.save need no generated symbol."""
     getstate = getattr(self, "__getstate__", None)
     state = getstate() if getstate is not None else self.__dict__
-    return (_reconstruct_float32_bias_master_module, (type(self)._unsloth_bias_base,), state)
+    cls = type(self)
+    return (_reconstruct_float32_bias_master_module, (cls._unsloth_bias_base, cls._unsloth_bias_names), state)
 
 
-def _reconstruct_float32_bias_master_module(base_cls):
-    cls = _float32_bias_master_class(base_cls)
+def _reconstruct_float32_bias_master_module(base_cls, names = ("bias",)):
+    cls = _float32_bias_master_class(base_cls, names)
     return cls.__new__(cls)
 
 
 _FLOAT32_BIAS_MASTER_CLASSES = {}
 
 
-def _float32_bias_master_class(cls):
-    new_cls = _FLOAT32_BIAS_MASTER_CLASSES.get(cls)
+def _float32_bias_master_class(cls, names):
+    names = tuple(sorted(names))
+    new_cls = _FLOAT32_BIAS_MASTER_CLASSES.get((cls, names))
     if new_cls is None:
-        new_cls = type(cls.__name__, (cls,), {
-            "bias": property(_float32_bias_master_get, _float32_bias_master_set, _float32_bias_master_del),
+        namespace = {name: _float32_bias_master_property(name) for name in names}
+        namespace.update({
             "__module__": cls.__module__,
             "__reduce__": _float32_bias_master_reduce,
             "_unsloth_bias_base": cls,
+            "_unsloth_bias_names": names,
         })
+        new_cls = type(cls.__name__, (cls,), namespace)
         new_cls.__qualname__ = cls.__qualname__ + "WithUnslothFloat32Bias"
-        _FLOAT32_BIAS_MASTER_CLASSES[cls] = new_cls
+        _FLOAT32_BIAS_MASTER_CLASSES[(cls, names)] = new_cls
     return new_cls
 
 
@@ -175,19 +185,32 @@ def _float32_bias_exit_forward(module, args, output):
         module._unsloth_bias_in_forward.pop()
 
 
-def _cast_bias_in_forward(module):
-    """The cast is a per-class `bias` property read lazily, not a pre-hook swapping _parameters["bias"]: pre-hooks
-    run before Accelerate materializes offloaded params, and DataParallel replicas bypass _parameters. Not a
-    parametrization either, which renames state_dict keys. The hooks only mark "in forward" (a list: append / pop
-    are atomic across DataParallel replica threads, which share it). A subclass with the same __name__, so
-    isinstance and name checks still match."""
-    cls = type(module)
-    if "_unsloth_bias_base" in cls.__dict__:
+def _mark_forward(module, in_forward):
+    if "_unsloth_bias_in_forward" in module.__dict__:
         return
-    module._unsloth_bias_in_forward = []
-    module.__class__ = _float32_bias_master_class(cls)
+    module._unsloth_bias_in_forward = in_forward
     module.register_forward_pre_hook(_float32_bias_enter_forward)
     module.register_forward_hook(_float32_bias_exit_forward, always_call = True)
+
+
+def _cast_bias_in_forward(module, names = ("bias",), parent = None, in_forward = None):
+    """The cast is a per-class property for each master name, read lazily, not a pre-hook swapping _parameters:
+    pre-hooks run before Accelerate materializes offloaded params, and DataParallel replicas bypass _parameters.
+    Not a parametrization either, which renames state_dict keys. A subclass with the same __name__, so isinstance
+    and name checks still match. Hooks only mark "in forward", on the owner and on its parent, since parents read
+    a child's bias without calling the child (nn.MultiheadAttention's out_proj, Mamba's conv1d, DETR's k_linear).
+    One list per prepare call: append / pop are atomic across DataParallel replica threads, which share it."""
+    if in_forward is None:
+        in_forward = []
+    cls = type(module)
+    base = cls.__dict__.get("_unsloth_bias_base")
+    if base is not None:
+        names = set(names) | set(cls._unsloth_bias_names)
+        cls = base
+    module.__class__ = _float32_bias_master_class(cls, names)
+    _mark_forward(module, in_forward)
+    if parent is not None:
+        _mark_forward(parent, in_forward)
 
 
 # Autocast subclasses cached by (base_class, compute_dtype) so pickle can resolve them.
@@ -554,11 +577,13 @@ def prepare_model_for_training(
                 requires_grad = True
                 # float16 is the exception: the GradScaler refuses float16 gradients ("Attempting to
                 # unscale FP16 gradients"), so the bias gets a float32 master as LoRA A / B do. The
-                # owning module's forward sees it cast to float16 (a hook), so eval / generate outside
-                # autocast still match dtypes.
-                if _loaded_float16:
+                # owning module (and its parent, which may read it functionally) sees it cast to float16
+                # in forward, so eval / generate outside autocast still match dtypes.
+                # Only a float16 tensor the owner reads by its own name (bias, in_proj_bias, bias_k, ...): a
+                # ".weight" under a bias-named module (T5's relative_attention_bias) is the owner's own weight.
+                if _loaded_float16 and param.dtype == torch.float16 and not name.endswith(".weight"):
                     upcast = True
-                    _float32_bias_owners.append(model.get_submodule(name.rpartition(".")[0]))
+                    _float32_bias_owners.append(name)
                 else:
                     _keep_param_dtype = True
             else:
@@ -600,8 +625,16 @@ def prepare_model_for_training(
                 param.data = param.data.to(torch.float32)
     pass
 
-    for _module in _float32_bias_owners:
-        _cast_bias_in_forward(_module)
+    _owner_names = {}
+    for _name in _float32_bias_owners:
+        _owner, _, _leaf = _name.rpartition(".")
+        _owner_names.setdefault(_owner, set()).add(_leaf)
+    # A second prepare reuses the first call's list, so owners and parents marked then stay in sync.
+    _in_forward = next((_m.__dict__["_unsloth_bias_in_forward"] for _m in model.modules()
+                        if "_unsloth_bias_in_forward" in _m.__dict__), [])
+    for _owner, _names in _owner_names.items():
+        _parent = model.get_submodule(_owner.rpartition(".")[0]) if "." in _owner else model
+        _cast_bias_in_forward(model.get_submodule(_owner), _names, _parent, _in_forward)
 
     # Wrap only if fp32 norms actually exist (our upcast, legacy env, or external policy);
     # gating on presence avoids wrapping a model that has none.

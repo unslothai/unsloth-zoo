@@ -419,3 +419,52 @@ def test_float16_bias_master_keeps_state_dict_and_pickles():
     for clone in (copy.deepcopy(model), torch.load(buffer, weights_only=False)):
         with torch.no_grad():
             torch.testing.assert_close(clone(input_ids=input_ids).logits, expected)
+
+
+class _AttentionNet(torch.nn.Module):
+    """A Linear LoRA target feeding nn.MultiheadAttention, which reads out_proj.bias in
+    F.multi_head_attention_forward without calling out_proj, and its own in_proj_bias / bias_k / bias_v."""
+
+    def __init__(self, add_bias_kv):
+        super().__init__()
+        from transformers import PretrainedConfig
+
+        self.config = PretrainedConfig(torch_dtype=torch.float16)
+        self.fc = torch.nn.Linear(16, 16)
+        self.attn = torch.nn.MultiheadAttention(16, 4, batch_first=True, add_bias_kv=add_bias_kv)
+
+    def forward(self, x):
+        h = self.fc(x)
+        return self.attn(h, h, h, need_weights=False)[0]
+
+
+@pytest.mark.parametrize("add_bias_kv", [False, True])
+def test_float16_bias_master_multihead_attention(add_bias_kv):
+    """nn.MultiheadAttention consumes out_proj.bias, in_proj_bias, bias_k and bias_v functionally: all of them must
+    reach the float16 attention in float16, and their gradients must land on the float32 masters."""
+    pytest.importorskip("peft")
+    from peft import LoraConfig, get_peft_model
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    torch.manual_seed(0)
+    model = get_peft_model(_AttentionNet(add_bias_kv).half(), LoraConfig(r=4, target_modules=["fc"], bias="all"))
+    # PEFT < 0.19 also marks in_proj_bias / bias_k / bias_v ("bias" in name); later only names ending ".bias".
+    peft_biases = {n for n, p in model.named_parameters() if p.requires_grad and "lora_" not in n}
+    prepare_model_for_training(
+        model, use_gradient_checkpointing=False, use_reentrant=False, full_finetuning=False,
+    )
+    masters = {n: p for n, p in model.named_parameters() if p.requires_grad and "lora_" not in n}
+    assert set(masters) == peft_biases
+    assert {"base_model.model.fc.base_layer.bias", "base_model.model.attn.out_proj.bias"} <= peft_biases
+    assert {p.dtype for p in masters.values()} == {torch.float32}
+    x = torch.randn(2, 3, 16, dtype=torch.float16)
+    out = model(x)
+    assert out.dtype == torch.float16
+    out.float().sum().backward()
+    assert all(p.grad is not None and p.grad.dtype == torch.float32 for p in masters.values())
+    attn = model.base_model.model.attn
+    assert attn.in_proj_bias is attn._parameters["in_proj_bias"]
+    assert attn.out_proj.bias is attn.out_proj._parameters["bias"]
+    model.eval()
+    with torch.no_grad():
+        assert model(x).dtype == torch.float16
