@@ -4129,7 +4129,6 @@ class _SpeculativeBatchSession:
             if callable(retire):
                 self.engine.retiring[row] = retire
         elif callable(retire):
-            # Never decoded: it leaves with the cache its prefill filled.
             retire(lambda: list(admitted.cache))
         self._next_row += 1
         self._pending[row] = state

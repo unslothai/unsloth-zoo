@@ -1421,7 +1421,6 @@ def test_a_copies_only_draft_prefills_in_chunks_on_a_target_naming_no_chunking_p
     widths.clear()
     (copies := SpeculativeDraft(_script(("copy", 4), ("plain", 3)))).prepare(ids[0], SamplingParams())
     assert generate(draft_model = copies, draft_kind = copies.draft_kind) == plain and len(ids[0]) > 16 >= max(widths)
-    # A drafter reading the prefill's hidden states keeps mlx-vlm's whole prefill.
     gate = lambda draft: ar._chunked_prefill_enabled(model, input_ids = mx.array([ids[0]]), draft_model = draft, draft_kind = "mtp")
     assert gate(copies) and not gate(SpeculativeDraft(_script(("draft", 3)), object()))
 
@@ -1547,7 +1546,6 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
     del banked[size - 1]
     warm = run({0: resumed})[0]
     assert (warm.cached_token_count, sorted(banked), warm.token_ids) == (size - 9, [size - 9, size - 1], batched[8].token_ids) and warm.draft_tokens > 0
-    # The resumed row hands back its own cache as it leaves: batched, alone, and on its first token.
     run({0: replace(resumed, max_tokens = 1)})
     kv = [(i, entry) for i, entry in enumerate(banked[size - 9]) if hasattr(entry, "keys")]
     assert len(retired) == 3 and kv and all(mx.array_equal(getattr(taken[i], name)[..., : size - 9, :], getattr(entry, name)[..., : size - 9, :]).item()

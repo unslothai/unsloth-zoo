@@ -450,7 +450,6 @@ def test_vlm_stream_rows_hand_their_own_cache_back_as_they_leave():
     states = [_RetiringState(make_prompt_cache(model.language_model), {2048}) for _ in range(3)]
     defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4)
     with BatchStream(model, processor, defaults=defaults) as stream:
-        # The shorter prompt prefills first and decodes on; the other joins behind it and leaves first.
         rows = [stream.add(GenerationRequest(prompt=ask(q, n), max_tokens=m, prompt_cache_state=s))
                 for q, n, m, s in (("Name a colour.", 420, 3, states[0]),
                                    ("Count from one to fifty in words.", 300, 20, states[1]))]

@@ -1589,7 +1589,6 @@ def test_a_vision_row_hands_its_own_cache_back_as_it_leaves(monkeypatch):
     from unsloth_zoo.mlx.generate import _RowPrefill
 
     class Batch:
-        # A lone row's own unmerged entry may have no extract.
         def __init__(self, uids): self.uids, self.prompt_cache = list(uids), [types.SimpleNamespace(extract = lambda i: i), "own"]
         def filter(self, keep): self.uids = [self.uids[i] for i in keep]
 
