@@ -2,9 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Below sm_80 the stacked-expert fallback dequantizes chunks of experts (2 GiB by default) where the tile kernel
-ran before: a chunk that does not fit must shrink, and below one expert use the fused kernel, never OOM. An OOM
-inside the dequant kernel must not turn the kernel off for the process."""
+"""Below sm_80 the stacked-expert fallback dequantizes expert chunks (2 GiB default): a chunk that does not fit shrinks;
+below one expert the fused kernel runs, never OOM; an OOM must not turn the kernel off for the process."""
 
 import contextlib
 import gc
@@ -32,7 +31,7 @@ def sm75(monkeypatch):
         monkeypatch.setitem(mg._AVAILABLE_DTYPE, (str(device), dtype, "tiles"), False)
     monkeypatch.setattr(mse, "_CHUNK_BUDGET", {}, raising = False)
     # An OOM must not leak a disabled dequant kernel into later tests (main sets these on OOM).
-    monkeypatch.setattr(md, "_KERNEL_FAILED", md._KERNEL_FAILED)
+    monkeypatch.setattr(md, "_KERNEL_FAILED", set(md._KERNEL_FAILED))
     monkeypatch.setattr(md, "_KERNEL_VERIFIED", dict(md._KERNEL_VERIFIED))
     return device
 
@@ -130,12 +129,12 @@ def test_backward_chunks_shrink_too(sm75):
 
 def test_oom_in_the_dequant_kernel_keeps_the_kernel(monkeypatch):
     device = torch.device("cuda", torch.cuda.current_device())
-    monkeypatch.setattr(md, "_KERNEL_FAILED", False)
+    monkeypatch.setattr(md, "_KERNEL_FAILED", set())
     monkeypatch.setattr(md, "_KERNEL_VERIFIED", dict(md._KERNEL_VERIFIED))
     blocks = torch.zeros(8, 4096, 128, 16, dtype = torch.uint8, device = device)  # 256 MiB of bf16 out
     scales = torch.full((8, 4096, 128), 127, dtype = torch.uint8, device = device)
     mxfp4_dequantize(blocks[:1], scales[:1], dtype = torch.bfloat16)  # verified + compiled before the cap
-    if md._KERNEL_FAILED or not md._KERNEL_VERIFIED.get((str(device), torch.bfloat16, False)):
+    if md._KERNEL_FAILED or not md._KERNEL_VERIFIED.get((str(device), torch.bfloat16, False, md._exact_round())):
         pytest.skip("the fused dequant kernel does not run on this GPU")
     with _headroom(16, device), pytest.raises(torch.cuda.OutOfMemoryError):
         mxfp4_dequantize(blocks, scales, dtype = torch.bfloat16)
@@ -168,7 +167,7 @@ def test_one_failed_expert_size_does_not_force_smaller_experts_fused(sm75, monke
 
 def test_kernel_available_is_false_not_oom_under_memory_pressure(monkeypatch):
     device = torch.device("cuda", torch.cuda.current_device())
-    monkeypatch.setattr(md, "_KERNEL_FAILED", False)
+    monkeypatch.setattr(md, "_KERNEL_FAILED", set())
     monkeypatch.setattr(md, "_KERNEL_VERIFIED", {})
     real = md._kernel_dequantize
 
@@ -182,4 +181,4 @@ def test_kernel_available_is_false_not_oom_under_memory_pressure(monkeypatch):
         md._kernel_verified(device, torch.bfloat16, True)
     monkeypatch.setattr(md, "_kernel_dequantize", real)
     if md._HAS_TRITON:
-        assert md.mxfp4_kernel_available(device, torch.bfloat16) == md._KERNEL_VERIFIED[(str(device), torch.bfloat16, True)]
+        assert md.mxfp4_kernel_available(device, torch.bfloat16) == md._KERNEL_VERIFIED[(str(device), torch.bfloat16, True, md._exact_round())]

@@ -22,9 +22,8 @@ import warnings
 from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import functools
-# Guarded because tests load this file by path rather than as
-# `unsloth_zoo.temporary_patches.misc`, where a two-level relative import
-# raises "attempted relative import beyond top-level package".
+import contextlib
+# Guarded because tests load this file by path, where a two-level relative import fails with 'attempted relative import beyond top-level package'.
 try:
     from unsloth_zoo.log import logger
 except (ImportError, ValueError):
@@ -603,8 +602,7 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
-# Compiled, `_ignore_causal_mask_sdpa` always refuses, so SDPA loses its `is_causal` kernels.
-# Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
+# Compiled, _ignore_causal_mask_sdpa always refuses, losing SDPA is_causal kernels; plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
 CAUSAL_MASK_SKIP_STATS = {"skipped": 0, "right_padded": 0}
 _SKIP_CAUSAL_MASK_ENV = "UNSLOTH_SKIP_CAUSAL_MASK"
 # Right-padded rows also skip the mask: causal attention hides the pad tail, only pad outputs change.
@@ -695,8 +693,8 @@ _FLASH_SDPA_ACCEPTS_CACHE = {}
 
 
 def _flash_sdpa_accepts(device, dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
-    # Ask torch's own dispatcher: flash also rejects by arch, torch version, dropout and grad
-    # (torch 2.6 has no flash past sm90; sm86 / sm89 / sm120 refuse head_dim > 224 training with dropout).
+    # Ask torch's own dispatcher: flash also rejects by arch, torch version, dropout and grad; torch 2.6 has no flash
+    # past sm90, and sm86 / sm89 / sm120 refuse head_dim > 224 training with dropout.
     key = (str(device), dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad)
     accepts = _FLASH_SDPA_ACCEPTS_CACHE.get(key, None)
     if accepts is not None:
@@ -724,8 +722,8 @@ _EFFICIENT_SDPA_ACCEPTS_CACHE = {}
 
 
 def _efficient_sdpa_accepts_mha(device, dtype, num_heads, head_dim, dropout, requires_grad):
-    # Equal head counts need no enable_gqa, so the mem-efficient kernel also runs a maskless causal
-    # call. transformers < 5 still passes enable_gqa = True there, so both forms must be accepted.
+    # Equal head counts need no enable_gqa, so mem-efficient SDPA also runs a maskless causal call; transformers < 5
+    # still passes enable_gqa = True, so both forms must be accepted.
     key = (str(device), dtype, num_heads, head_dim, dropout, requires_grad)
     accepts = _EFFICIENT_SDPA_ACCEPTS_CACHE.get(key, None)
     if accepts is not None:
@@ -745,8 +743,8 @@ def _efficient_sdpa_accepts_mha(device, dtype, num_heads, head_dim, dropout, req
 
 
 def _flash_sdpa_takes_causal(config, embeds):
-    """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; anything
-    else falls to the math kernel and its [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
+    """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; other kernels fall to
+    math with [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
     if embeds.dtype not in (torch.float16, torch.bfloat16) or not embeds.is_cuda:
         return False
     if torch.version.hip is not None or not torch.backends.cuda.flash_sdp_enabled():
@@ -813,11 +811,9 @@ def _module_spans_devices(module):
 
 
 def _calling_model_spans_devices(max_depth = 8):
-    """True when the module whose forward builds this mask has weights on more than one device.
-
-    A device_map split can put later layers on a GPU (or a shape) flash cannot take, where SDPA
-    without a mask falls back to the math kernel. Cached per module; no calling module found = False.
-    """
+    """True when the module whose forward builds this mask spans several devices: a device_map split can put later
+    layers on a GPU or shape flash cannot take, where maskless SDPA falls to math; cached per module, False if no
+    caller is found."""
     frame = sys._getframe(1)
     for _ in range(max_depth):
         frame = frame.f_back
@@ -960,8 +956,7 @@ def _warm_mask_mod_devices(mask_mod, device):
 
 
 def _patch_block_mask_to():
-    # Inductor cannot lower a device copy inside Flex's mask subgraph, so copy
-    # captured masks when accelerate moves the BlockMask to the next device.
+    # Inductor cannot lower a device copy inside Flex's mask subgraph, so captured masks are copied when accelerate moves the BlockMask to the next device.
     try:
         from torch.nn.attention.flex_attention import BlockMask
     except Exception:
@@ -1022,7 +1017,7 @@ def patch_transformers_masks():
         masking_utils.create_sliding_window_causal_mask,
     )
 
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial"):
         # `_torch_compile` is `noop` here, i.e. torch.compiler.disable: a fullgraph user compile would refuse it.
         compiled_create_causal_mask = original_create_causal_mask
         compiled_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
@@ -1201,8 +1196,7 @@ def patch_sdpa_bool_causal_mask():
     Drop pure causal bool masks (is_causal=True); convert non-pure bool masks to
     float additive bias. Skipped below 2**16 where the bug cannot fire.
     """
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
-        return
+    # No UNSLOTH_COMPILE_DISABLE early return: a correctness fix that compiles nothing.
     try:
         import transformers.integrations.sdpa_attention as sdpa_mod
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -1228,6 +1222,9 @@ def patch_sdpa_bool_causal_mask():
         is_causal = None,
         **kwargs,
     ):
+        # Moonshine's is_causal is a SymBool under dynamic shapes, which SDPA rejects; bool() still breaks, a branch guards.
+        if is_causal is not None:
+            is_causal = True if is_causal else False
         m = attention_mask
 
         # Below 2**16 the Cutlass bool-mask overflow (pytorch/pytorch#162588)
@@ -1536,12 +1533,12 @@ def patch_causal_conv1d_cuda_probe():
             mod._lazy_load_causal_conv1d = _disabled_lazy_load
         if hasattr(mod, "_causal_conv1d_cache"):
             mod._causal_conv1d_cache = (None, None)
-    pass
 pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
-# Kaggle T4, mamba_ssm 2.3.1: Triton 3.2 fails (`map::at`), 3.3 fails (`PassManager::run failed`), 3.4-3.6 train.
+# Kaggle T4 (mamba_ssm 2.3.1): Triton 3.2 fails (map::at) and 3.3 fails (PassManager::run failed), 3.4-3.6 train; V100
+# (sm_70) on Triton 3.6 trains Granite-4.0-H and Falcon-H1 with matching losses (unsloth-zoo 2090).
 _MAMBA_SM75_MIN_TRITON = (3, 4)
 
 
@@ -1562,8 +1559,8 @@ def _mamba_ssm_fast_path_blocker(capability):
         return None
     if forced == "0":
         return "UNSLOTH_MAMBA_PRE_AMPERE_FAST=0 is set"
-    if tuple(capability) < (7, 5):
-        return f"they need compute capability 7.5+ (this GPU is {major}.{minor})"
+    if tuple(capability) < (7, 0):
+        return f"they need compute capability 7.0+ (this GPU is {major}.{minor})"
     try:
         import re as _re
         import triton
@@ -1583,11 +1580,8 @@ pass
 
 
 def _single_mamba_ssm_autotune_config(extra_packages = ()):
-    """Keep one autotune config per mamba_ssm kernel (and per kernel in `extra_packages`).
-
-    Compiling every config before step 1 takes minutes on a T4. Keeps the config
-    mamba_ssm's deterministic mode picks: least shared memory.
-    """
+    """Keep one autotune config per mamba_ssm kernel (and per kernel in `extra_packages`): compiling all configs takes
+    minutes on a T4; keeps the config mamba_ssm's deterministic mode picks (least shared memory)."""
     import sys
     try:
         from triton.runtime.autotuner import Autotuner
@@ -1626,6 +1620,105 @@ def _retrim_mamba_ssm_autotune():
         return _single_mamba_ssm_autotune_config()
     except Exception:
         return 0
+pass
+
+
+def _resolves_to_mamba_ssm(fn):
+    """Whether a transformers 5.15+ `use_kernel_func_from_hub_with_fallback` function is bound to a mamba_ssm callable."""
+    _stack, _seen = [(fn, 0)], set()
+    while _stack:
+        _g, _depth = _stack.pop()
+        if id(_g) in _seen or _depth > 6:
+            continue
+        _seen.add(id(_g))
+        _inner = [getattr(_g, "__wrapped__", None)]
+        for _cell in (getattr(_g, "__closure__", None) or ()):
+            try:
+                _inner.append(_cell.cell_contents)
+            except ValueError:
+                pass
+        for _c in _inner:
+            if not callable(_c):
+                continue
+            if str(getattr(_c, "__module__", None) or "").startswith("mamba_ssm"):
+                return True
+            _stack.append((_c, _depth + 1))
+    return False
+pass
+
+
+def _hub_func_factory_patched(factory, flag):
+    """Whether `flag` is set anywhere along the `__wrapped__` chain of Unsloth's factory wrappers."""
+    for _ in range(8):
+        if factory is None:
+            return False
+        if getattr(factory, flag, False):
+            return True
+        factory = getattr(factory, "__wrapped__", None)
+    return False
+pass
+
+
+def _bind_mamba_ssm_to_torch_reference():
+    """Make transformers 5.15+ take the PyTorch reference for every mamba_ssm function.
+
+    Those versions bind mamba_ssm in `use_kernel_func_from_hub_with_fallback`
+    when the modeling module is imported, asking neither `is_mamba_ssm_available`
+    nor `lazy_load_kernel`, so steps 0 and 1 of the guard never reach them.
+    """
+    import sys
+    try:
+        import transformers.integrations as _integrations
+        from transformers.integrations import hub_kernels as _hk
+    except Exception:
+        return
+    _original = getattr(_hk, "use_kernel_func_from_hub_with_fallback", None)
+    if _original is None:
+        return  # transformers < 5.15: gated by is_fast_path_available instead
+
+    if not _hub_func_factory_patched(_original, "_unsloth_mamba_ssm_torch"):
+        def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
+            if package != "mamba_ssm":
+                return _original(func_name, package, internal_path)
+            def decorator(torch_function):
+                try:
+                    return _hk.use_kernel_forward_from_hub(func_name)(torch_function)
+                except Exception:
+                    return torch_function
+            return decorator
+        use_kernel_func_from_hub_with_fallback._unsloth_mamba_ssm_torch = True
+        use_kernel_func_from_hub_with_fallback.__wrapped__ = _original
+        _hk.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
+        try:
+            setattr(_integrations, "use_kernel_func_from_hub_with_fallback", use_kernel_func_from_hub_with_fallback)
+        except Exception:
+            pass
+    pass
+
+    # Modules imported before this ran already hold the kernel: rebind to the reference it wraps.
+    for _module_name, _module in list(sys.modules.items()):
+        if _module is None:
+            continue
+        if not (_module_name.startswith("transformers.models.") or "unsloth_compiled_module" in _module_name):
+            continue
+        try:
+            _items = list(_module.__dict__.items())
+        except Exception:
+            continue
+        for _name, _fn in _items:
+            if not callable(_fn) or isinstance(_fn, type) or getattr(_fn, "__wrapped__", None) is None:
+                continue
+            try:
+                if not _resolves_to_mamba_ssm(_fn):
+                    continue
+                _reference = _fn
+                while getattr(_reference, "__wrapped__", None) is not None:
+                    _reference = _reference.__wrapped__
+                if _reference is _fn or str(getattr(_reference, "__module__", "")).startswith("mamba_ssm"):
+                    continue
+                setattr(_module, _name, _reference)
+            except Exception:
+                pass
 pass
 
 
@@ -1730,7 +1823,6 @@ def _force_slow_path_on_raising_mamba_mixers():
         except Exception:
             pass
         pass
-    pass
 pass
 
 
@@ -1795,6 +1887,9 @@ def patch_mamba_ssm_pre_ampere_fallback():
 
     # 0b / 0c. Jamba and Zamba raise instead of taking the slow path.
     _force_slow_path_on_raising_mamba_mixers()
+
+    # 0d. transformers 5.15+ binds mamba_ssm at modeling import, past steps 0 and 1.
+    _bind_mamba_ssm_to_torch_reference()
 
     try:
         import mamba_ssm  # noqa: F401
@@ -1939,7 +2034,7 @@ def patch_mamba_fused_split_without_causal_conv1d():
 
     import sys
 
-    if not getattr(_original, "_unsloth_no_causal_conv1d", False):
+    if not _hub_func_factory_patched(_original, "_unsloth_no_causal_conv1d"):
         def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
             if func_name != "mamba_split_conv1d_scan_combined" or package != "mamba_ssm":
                 return _original(func_name, package, internal_path)
@@ -1970,27 +2065,7 @@ def patch_mamba_fused_split_without_causal_conv1d():
             continue
         if _fn is None or getattr(_fn, "_unsloth_no_causal_conv1d", False):
             continue
-        _resolves_to_mamba_ssm = False
-        _stack, _seen = [(_fn, 0)], set()
-        while _stack and not _resolves_to_mamba_ssm:
-            _g, _depth = _stack.pop()
-            if id(_g) in _seen or _depth > 6:
-                continue
-            _seen.add(id(_g))
-            _inner = [getattr(_g, "__wrapped__", None)]
-            for _cell in (getattr(_g, "__closure__", None) or ()):
-                try:
-                    _inner.append(_cell.cell_contents)
-                except ValueError:
-                    pass
-            for _c in _inner:
-                if not callable(_c):
-                    continue
-                if str(getattr(_c, "__module__", None) or "").startswith("mamba_ssm"):
-                    _resolves_to_mamba_ssm = True
-                    break
-                _stack.append((_c, _depth + 1))
-        if not _resolves_to_mamba_ssm:
+        if not _resolves_to_mamba_ssm(_fn):
             continue
         _stub = functools.wraps(_fn)(lambda *a, **k: None)
         _stub._unsloth_no_causal_conv1d = True
@@ -2152,7 +2227,6 @@ def patch_datasets_map_worker_death_retry():
             # num_proc=1 still forks a worker and the kernel can kill it again.
             call_kwargs["num_proc"] = None
             return original_map(self, *call_args, **call_kwargs)
-        pass
     pass
 
     map._unsloth_worker_death_retry = True
@@ -3131,13 +3205,9 @@ _SFT_SHIELDED_INPUT_TYPES = {}
 
 
 def _sft_shielded_inputs(inputs, contents):
-    """A copy of `contents` that silently drops the liger-only forward kwargs.
-
-    The injection happens inside `compute_loss`, on the mapping the caller
-    handed in, so the mapping is the only interception point available. Built
-    from the caller's own mapping type so a `BatchEncoding` stays one, and
-    cached per type so the class is created once rather than per step.
-    """
+    """Copy of contents without the liger-only forward kwargs, built as the caller's own mapping type (a BatchEncoding
+    stays one) and cached per type; compute_loss injects on the mapping the caller passed in, the only interception
+    point."""
     if not isinstance(inputs, Mapping):
         return contents
     cls = type(inputs)
@@ -3172,30 +3242,6 @@ def _sft_logits_are_unusable(logits):
     if isinstance(logits, torch.Tensor) and (logits.numel() == 0 or logits.dim() < 2):
         return True
     return False
-pass
-
-
-def _sft_raised_on_empty_logits(exception):
-    """Decided on the object trl was holding, not on the exception message.
-
-    Which exception comes out depends on which sentinel the model returned and
-    which attribute the installed trl reaches for first:
-
-        EmptyLogits().shape[:-1]      TypeError    ('function' not subscriptable)
-        EmptyLogits()[..., :-1, :]    NotImplementedError
-        torch.empty(0)[..., :-1, :]   IndexError   (too many indices)
-        torch.empty(0).argmax(-1)     RuntimeError
-
-    so a message match fixes one build and misses the next. The failing frame
-    still holds trl's `outputs`, so the question can be asked of the logits
-    themselves: if they are real, this is somebody's genuine bug and it must
-    keep propagating.
-
-    Matched on the local rather than on the frame's name, because the raise can
-    land in a helper trl called and because the enclosing method has been
-    renamed before. The stack starts inside SFTTrainer.compute_loss either way.
-    """
-    return _sft_empty_logits_outputs(exception) is not None
 pass
 
 
@@ -3849,3 +3895,66 @@ def patch_output_collector_for_compiled_submodules():
     cls._unsloth_eager_mirror = True
 pass
 TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
+
+
+@contextlib.contextmanager
+def output_capture_scratch():
+    """Eager wrapper around one compiled decoder-layer call: capture hooks append into empty scratch lists.
+
+    A capture hook traced inside the compiled layer (router_logits for the MoE aux loss) appends to the
+    collector's list, and Dynamo guards on that list's length, which is the layer index: every layer
+    recompiled once and deep MoE models ran into the recompile limit. Inside this context the compiled
+    code reads a mirror whose lists start empty on every call; their items are moved to the real lists
+    afterwards, in call order. hidden_states keeps the real list (its hook reads the length)."""
+    try:
+        from transformers.utils import output_capturing
+        var = output_capturing._active_collector
+    except Exception:
+        yield
+        return
+    state = getattr(var, "__dict__", {})
+    value = state.get("_unsloth_eager_value")
+    if not isinstance(value, dict) or not state.get("_unsloth_eager_single", True) or \
+            getattr(state.get("_unsloth_eager_tls"), "depth", 0) <= 0:
+        yield
+        return
+    keys = [k for k, v in value.items() if type(v) is list and k != "hidden_states"]
+    if not keys:
+        yield
+        return
+    scratch = dict(value)
+    starts = {k: len(value[k]) for k in keys}
+    for k in keys:
+        scratch[k] = []
+    var._unsloth_eager_value = scratch
+    try:
+        yield
+    finally:
+        # A nested set / reset inside the call replaced the mirror: leave theirs.
+        if var.__dict__.get("_unsloth_eager_value") is scratch:
+            var._unsloth_eager_value = value
+        # Inserted where the context began: after a nested reset, later hooks append straight to
+        # value, and the scratch items were captured before them.
+        for k in keys:
+            value[k][starts[k]:starts[k]] = scratch[k]
+pass
+
+
+def patch_HiggsAudioV2Embeddings_autocast_dtype():
+    # CUDA autocast runs sum() in float32, so masked_scatter gets float32 audio beside bf16 text embeddings and raises.
+    try:
+        from transformers.models.higgs_audio_v2.modeling_higgs_audio_v2 import HiggsAudioV2Embeddings
+    except Exception as e:
+        return raise_error("HiggsAudioV2Embeddings", e)
+    original_forward = HiggsAudioV2Embeddings.forward
+    if getattr(original_forward, "_unsloth_patched", False):
+        return
+
+    @functools.wraps(original_forward)
+    def forward(self, input_ids):
+        return original_forward(self, input_ids).to(self.embed_audio_tokens.weight.dtype)
+
+    forward._unsloth_patched = True
+    HiggsAudioV2Embeddings.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_HiggsAudioV2Embeddings_autocast_dtype)

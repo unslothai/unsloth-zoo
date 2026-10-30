@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_GDN_BACKEND=flashqla: opt-in FlashQLA dispatch for chunk_gated_delta_rule.
-
-CPU only: fla and flash_qla are replaced by stand-ins so the routing, the signature
-contract with transformers' kernel-hub wrapper and the fallback are checked anywhere.
-"""
+"""Tests UNSLOTH_GDN_BACKEND=flashqla opt-in routing on CPU: fla and flash_qla are stubbed, checking routing, the kernel-hub signature contract and the fallback."""
 
 import inspect
 import os
@@ -112,8 +108,8 @@ def test_flashqla_routes_eligible_calls_and_falls_back(monkeypatch, fake_env):
 
 
 def test_flashqla_failure_falls_back_once_per_dtype(monkeypatch, fake_env):
-    # fp16 on SM100 passes the verifier but its kernel can fail to compile (TileLang 0.1.12,
-    # nvcc 13.1): that call and later ones of the same dtype go to fla, with one warning.
+    # fp16 on SM100 can pass the verifier yet fail to compile (TileLang 0.1.12, nvcc 13.1); that call and later
+    # same-dtype calls fall back to fla with one warning.
     gdr, _, calls = fake_env
     monkeypatch.setenv("UNSLOTH_GDN_BACKEND", "flashqla")
     _supported_only_when(monkeypatch, lambda q: True)
@@ -143,8 +139,8 @@ def test_flashqla_failure_falls_back_once_per_dtype(monkeypatch, fake_env):
 
 
 def test_flashqla_failure_releases_its_buffers_before_fla(monkeypatch, fake_env):
-    # The fallback must not run inside the except block: the traceback would keep the
-    # failed backend's scratch alive while fla allocates, an avoidable OOM.
+    # The fallback must run outside the except block, since the traceback would keep the failed backend's scratch alive
+    # while fla allocates, causing an avoidable OOM.
     import gc
     import weakref
     torch = pytest.importorskip("torch")

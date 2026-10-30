@@ -34,8 +34,8 @@ import re
 from .log import logger
 from .empty_model import _get_module_attribute
 
-# Leaf names of MoE routers, kept out of the automatically chosen LoRA targets.
-# Not "gate": D-FINE's gateway.gate is a plain projection, so _moe_router_gate_names decides by position.
+# Leaf names of MoE routers, kept out of automatic LoRA targets; not gate, since D-FINE's gateway.gate is a plain
+# projection (_moe_router_gate_names decides by position).
 MOE_ROUTER_MODULES = frozenset((
     "router",
 ))
@@ -57,8 +57,8 @@ def _moe_router_gate_names(model):
     return names
 
 
-# PEFT's _check_lora_target_modules_mamba set, plus nemotron_h_puzzle (Nemotron 3.5 Bolt): its
-# fused Mamba kernel reads out_proj.weight directly, bypassing a LoRA adapter there.
+# PEFT's _check_lora_target_modules_mamba set, plus nemotron_h_puzzle (Nemotron 3.5 Bolt): its fused Mamba kernel reads
+# out_proj.weight directly, bypassing a LoRA adapter.
 MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h", "nemotron_h_puzzle"))
 MAMBA_ONLY_LEAVES = frozenset(("out_proj", "conv1d"))
 # Mamba, Mamba2, Nemotron-H name the mixer `mixer`; Falcon-H1, Bamba, Zamba2 `mamba`.
@@ -199,15 +199,13 @@ def get_peft_regex(
         projection_modules  = {}
         for j, (proj, count) in enumerate(all_linear_modules.items()):
             if proj in MOE_ROUTER_MODULES:
-                # Llama 4's and PhiMoE's routers return a tuple, so PEFT's LoRA
-                # forward reads `result.dtype` off one and the model cannot run.
+                # Llama 4 and PhiMoE routers return a tuple, which breaks PEFT's LoRA forward (it reads result.dtype), so these routers are skipped.
                 continue
             # Seen once = a head (lm_head), unless inside a numbered layer stack (one layer of a kind).
             if count != 1 or proj in _in_layer_stack:
                 only_linear_modules.append(proj)
             else:
                 projection_modules[proj] = j
-        pass
     else:
         assert(type(target_modules) is list)
         only_linear_modules = list(target_modules)
@@ -244,16 +242,12 @@ def get_peft_regex(
     regex_components  = "|".join(regex_components)
 
     match_linear_modules = r"(?:" + "|".join(re.escape(x) for x in only_linear_modules) + r")"
-    # No trailing ".*?" after the linear-module group: PEFT uses re.fullmatch, so ".*?" would let
-    # "...attn.proj_drop" (a Dropout) match ("proj" + ".*?" eating "_drop") -> "Target module
-    # Dropout is not supported". LoRA targets are leaf Linears whose names ARE the group entries,
-    # so ending at the group keeps every real target and drops same-prefix non-linear modules.
-    # "." anchors whole leaf names: bare "proj" matched Nemotron-H's Identity fc1_latent_proj (PEFT rejects it).
+    # No trailing .*? after the linear group: PEFT re.fullmatch would let attn.proj_drop (a Dropout) match; ending at
+    # the group keeps real Linears and drops same-prefix non-Linears; the dot before it anchors leaf names (bare proj
+    # matched Nemotron-H's Identity fc1_latent_proj, which PEFT rejects).
     if regex_model_parts == "":
-        # No vision/language model-part selected (e.g. audio-only finetuning):
-        # the standard matcher would degenerate into matching every attention/mlp
-        # leaf in the model, so make the base inert and rely solely on the
-        # dedicated audio branches added below.
+        # With no vision/language model part selected (e.g. audio-only finetuning), the standard matcher would match
+        # every attention/mlp leaf, so the base is made inert and only the dedicated audio branches below apply.
         regex_matcher = r"(?!x)x"  # never matches
     else:
         regex_matcher = \
@@ -263,11 +257,9 @@ def get_peft_regex(
 
         # Also account for model.layers.0.self_attn/mlp type modules like Qwen
         if finetune_language_layers:
-            # Same shape as the composite branch, so text-only loads reach nested leaves
-            # (mlp.shared_expert.up_proj) and tag-containing components (linear_attn.*).
-            # Routed experts (mlp.experts.<N>.up_proj) stay out, as before: unsloth widens
-            # remote expert blocks to them itself and keeps native ones (Qwen3-MoE on
-            # transformers 4.x) off LoRA on every routed expert.
+            # Like the composite branch, so text-only loads reach nested leaves (mlp.shared_expert.up_proj) and
+            # linear_attn.* components; routed experts (mlp.experts.<N>.up_proj) stay out, since unsloth widens remote
+            # expert blocks itself and keeps native Qwen3-MoE experts (transformers 4.x) off LoRA.
             regex_matcher = r"(?:" + regex_matcher + \
             r")|(?:\bmodel\.layers\.[\d]{1,}(?!.*\.experts\.\d)\..*?(?:" + regex_components + \
             r").*?\.(?:" + match_linear_modules + r"))"
@@ -291,7 +283,6 @@ def get_peft_regex(
     # Leading ".*?"; no trailing ".*?" (a real Linear leaf terminates the match);
     # "(?:\.linear)?" also covers Gemma4ClippableLinear ".linear" children.
     def _scoped(leaves):
-        # Honour an explicit target_modules list when one was provided.
         if target_modules is not None:
             return [x for x in leaves if x in only_linear_modules]
         return leaves
@@ -307,17 +298,9 @@ def get_peft_regex(
     )
 
     def _linear_aware_branches(cores):
-        # For each "core" (a regex that, after a leading ".*?", should fullmatch a
-        # real Linear's dotted module name), emit a branch matching ONLY the actual
-        # nn.Linear -- the bare module and/or the ".linear" child of a
-        # Gemma4ClippableLinear wrapper, whichever genuinely exists in this model.
-        # On Gemma 4 a projection appears in named_modules() as BOTH the wrapper
-        # ("...q_proj", not an nn.Linear) and its inner Linear ("...q_proj.linear").
-        # A blanket optional "(?:\.linear)?" would fullmatch the wrapper too, so PEFT
-        # would try to adapt the unsupported wrapper / double-process the inner
-        # Linear. Deciding per-core against linear_modules (which holds the real
-        # Linear names, including the appended ".linear" children) keeps Gemma 3N's
-        # bare leaves and Gemma 4's ".linear" children both correct.
+        # Branch only on the real nn.Linear per core (bare module or .linear child of a Gemma4ClippableLinear wrapper);
+        # a blanket optional .linear would also match the wrapper and double-process the inner Linear; checking each
+        # core against linear_modules keeps Gemma 3N and Gemma 4 correct.
         out = []
         for core in cores:
             if any(re.fullmatch(r".*?" + core + r"\.linear", name, flags = re.DOTALL) for name in linear_modules):
@@ -328,12 +311,9 @@ def get_peft_regex(
 
     candidate_branches = []
     if finetune_audio_layers and _is_gemma_mm:
-        # conv / *norm leaves are not nn.Linear so they are never candidates. The
-        # conformer attention leaves are gated by finetune_attention_modules; the
-        # feed-forward / lightweight-conv / subsample / output projections (and the
-        # audio projector) are gated by finetune_mlp_modules. A "." is required
-        # before each leaf (the "(?:.*\.)?" segment) so e.g. target_modules=["k_proj"]
-        # does not also match "...relative_k_proj".
+        # conv/norm leaves are not nn.Linear so never candidates; conformer attention leaves follow
+        # finetune_attention_modules; feed-forward, lightweight-conv, subsample and output projections follow
+        # finetune_mlp_modules; a dot before each leaf keeps k_proj from matching relative_k_proj.
         audio_leaves = []
         if finetune_attention_modules:
             audio_leaves += ["q_proj", "k_proj", "v_proj", "relative_k_proj", "pos_proj", "post"]
@@ -361,15 +341,13 @@ def get_peft_regex(
                             for x in _scoped(["linear_1", "linear_2"])]
         candidate_branches += _linear_aware_branches(audio_cores)
     if finetune_vision_layers and finetune_mlp_modules and _is_gemma_mm:
-        # The Gemma vision embedders are flat projection / dense Linears -> like the
-        # audio projector, gate them under the mlp flag (attention-only stays clean).
+        # Gemma vision embedders are flat projection and dense Linears, so gate them under the mlp flag like the audio projector; attention-only stays clean.
         vision_cores = []
         if _scoped(["embedding_projection"]): vision_cores.append(r"\bembed_vision\.embedding_projection")
         if _scoped(["patch_dense"]):          vision_cores.append(r"\bvision_embedder\.patch_dense")
         if _scoped(["input_proj"]):           vision_cores.append(r"\bvision_tower\.patch_embedder\.input_proj")
         candidate_branches += _linear_aware_branches(vision_cores)
-    # _linear_aware_branches already only emits branches that fullmatch a real Linear;
-    # re-filter for safety / to mirror PEFT's own re.fullmatch matcher exactly.
+    # _linear_aware_branches already emits only real Linear matches; this re-filter is for safety and mirrors PEFT's own re.fullmatch matcher exactly.
     extra_branches = [
         branch for branch in candidate_branches
         if any(re.fullmatch(branch, name, flags = re.DOTALL) for name in linear_modules)
@@ -378,13 +356,9 @@ def get_peft_regex(
         regex_matcher = r"(?:" + regex_matcher + r")|" + "|".join(extra_branches)
     pass
 
-    # Fallback only when a vision/language model-part was requested but neither the
-    # base matcher nor the branches above matched anything (e.g. a VLM whose vision
-    # modules are not tagged with vision keywords): drop the model-part requirement.
-    # Never broaden for audio-only (regex_model_parts == ""), which would otherwise
-    # pull in the whole language stack.
-    # fullmatch like PEFT: re.search finds `model.layers.` inside CSM's `depth_decoder.model.layers.`,
-    # which PEFT then rejects ("Target modules ... not found").
+    # Fallback, only for a requested vision/language part with no match (e.g. untagged VLM vision modules), drops the
+    # model-part requirement; never for audio-only, which would pull in the whole language stack; fullmatch since
+    # re.search would match CSM's depth_decoder.model.layers., which PEFT rejects.
     if regex_model_parts != "":
         check = any(re.fullmatch(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
         if not check:
@@ -425,7 +399,6 @@ def get_peft_regex(
         )
     pass
 
-    # Final check to confirm if matches exist
     check = any(re.search(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
     if not check and target_modules is not None:
         raise RuntimeError(
@@ -452,8 +425,7 @@ def get_lora_layer_modules():
     for file in files:
         if file == "__init__.py" or not file.endswith(".py"): continue
         item = f"peft.tuners.lora.{file[:-len('.py')]}"
-        # Skip submodules whose optional backend (bnb/eetq/awq/...) is missing
-        # instead of crashing LoRA-layer discovery.
+        # Skip submodules whose optional backend (bnb/eetq/awq/...) is missing instead of crashing LoRA-layer discovery.
         try:
             exec(f"import {item}", locals(), globals())
         except (ImportError, OSError, ValueError, AttributeError, TypeError) as exception:
@@ -487,14 +459,153 @@ def _outside_compiled_region(root, embeddings):
 pass
 
 
+def _frozen_frontend(module):
+    """The frozen child whose output starts a tower's checkpointed layer loop, else None.
+
+    Matches `h = self.<child>(<first input>, ...)` ahead of `for layer in self.<ModuleList>:` with
+    `layer(h, ...)`, every later assignment to `h` reading `h`. Flipping that output, not the raw
+    audio input, keeps autograd out of the frozen front end (Parakeet / Canary conv subsampling): the
+    same adapter gradients without its activations and input gradients."""
+    import ast, textwrap
+    forward = getattr(type(module), "forward", None)
+    if forward is None or hasattr(forward, "_torchdynamo_orig_callable"):
+        return None
+    if type(module).__module__.startswith("unsloth_compiled_module"):
+        return None
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(forward)))
+    except Exception:
+        return None
+    fn = next((n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if fn is None or len(fn.args.args) < 2:
+        return None
+    first_input = fn.args.args[1].arg
+    # Audio front ends only: a vision patch embedding is one cheap conv, not worth widening the change.
+    if first_input not in ("input_features", "input_values", "audio_mel", "audio_values"):
+        return None
+
+    def self_attr(node):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+            return node.attr
+        return None
+
+    loop_index = None
+    for i, stmt in enumerate(fn.body):
+        if isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
+            it = stmt.iter
+            name = self_attr(it)
+            if isinstance(getattr(module, name or "", None), torch.nn.ModuleList):
+                loop_index = i
+                break
+    if loop_index is None:
+        return None
+    loop = fn.body[loop_index]
+    hidden = child = None
+    for stmt in fn.body[:loop_index]:
+        if (child is None and isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name) and isinstance(stmt.value, ast.Call)
+                and self_attr(stmt.value.func) and stmt.value.args
+                and isinstance(stmt.value.args[0], ast.Name) and stmt.value.args[0].id == first_input):
+            hidden, child = stmt.targets[0].id, self_attr(stmt.value.func)
+            continue
+        for node in ast.walk(stmt):
+            targets = node.targets if isinstance(node, ast.Assign) else \
+                [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else []
+            for target in targets:
+                stores = {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+                if hidden is None or hidden not in stores:
+                    continue
+                value = getattr(node, "value", None)
+                metadata = {
+                    id(n.value) for n in ast.walk(value) if isinstance(n, ast.Attribute)
+                    and n.attr in ("shape", "size", "dtype", "device", "ndim")
+                } if value is not None else set()
+                reads = value is not None and any(
+                    isinstance(n, ast.Name) and n.id == hidden and id(n) not in metadata for n in ast.walk(value)
+                )
+                detaches = value is not None and any(
+                    isinstance(n, ast.Attribute) and n.attr in ("detach", "data", "detach_") for n in ast.walk(value)
+                )
+                if not isinstance(target, ast.Name) or not (reads or isinstance(node, ast.AugAssign)) or detaches:
+                    return None
+    if child is None:
+        return None
+    layer = loop.target.id
+    feeds = any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == layer
+        and n.args and isinstance(n.args[0], ast.Name) and n.args[0].id == hidden
+        for n in ast.walk(loop)
+    )
+    frontend = getattr(module, child, None)
+    if not feeds or not isinstance(frontend, torch.nn.Module):
+        return None
+    params = list(frontend.parameters())
+    if not params or any(p.requires_grad for p in params):
+        return None
+    return frontend
+pass
+
+
+def _freeze_unused_feature_encoders(model):
+    """wav2vec2-style feature encoders (`_requires_grad`, `_freeze_parameters`) flag their input as
+    requiring grad unless frozen, so a frozen conv stack still runs its whole backward. Mark the ones
+    LoRA left frozen as frozen, as `freeze_feature_encoder()` does."""
+    for module in model.modules():
+        if getattr(module, "_requires_grad", None) is not True or not callable(getattr(module, "_freeze_parameters", None)):
+            continue
+        params = list(module.parameters())
+        if params and not any(p.requires_grad for p in params):
+            module._requires_grad = False
+pass
+
+
+def _subsampling_input_to_16bit(module, args, kwargs):
+    """Pre-hook for the FastConformer subsampling (Parakeet, Canary): float32 features to 16 bit.
+
+    Unsloth's conv dtype wrapper casts a conv's input to its weight dtype and the result back to the
+    input's dtype, so float32 input_features kept the frozen conv stack in float32: twice autocast's
+    activation memory. Casting up front is bit identical: every conv already ran in the 16-bit weight
+    dtype, the ReLUs and 0/1 masks between them are exact, and autocast feeds the closing 16-bit Linear
+    the same values. A quantized closing Linear (QLoRA) computes in its input's dtype, so it is skipped.
+    A hook, not a forward patch, so the compiler's view of the forward is unchanged."""
+    layers = getattr(module, "layers", None)
+    weight = getattr(layers[0], "weight", None) if layers is not None and len(layers) else None
+    linear_weight = getattr(getattr(module, "linear", None), "weight", None)
+    if not (
+        isinstance(weight, torch.Tensor) and weight.dtype in (torch.float16, torch.bfloat16)
+        and isinstance(linear_weight, torch.Tensor) and linear_weight.dtype in (torch.float16, torch.bfloat16)
+        and not hasattr(linear_weight, "quant_state")
+    ):
+        return None
+    if args and type(args[0]) is torch.Tensor and args[0].dtype == torch.float32:
+        return (args[0].to(weight.dtype),) + tuple(args[1:]), kwargs
+    features = kwargs.get("input_features")
+    if type(features) is torch.Tensor and features.dtype == torch.float32:
+        return args, {**kwargs, "input_features": features.to(weight.dtype)}
+    return None
+pass
+
+
+def _cast_subsampling_inputs(model):
+    for module in model.modules():
+        if type(module).__name__ != "ParakeetEncoderSubsamplingConv2D":
+            continue
+        for key, hook in list(module._forward_pre_hooks.items()):
+            if getattr(hook, "__name__", "") == "_subsampling_input_to_16bit":
+                del module._forward_pre_hooks[key]
+                getattr(module, "_forward_pre_hooks_with_kwargs", {}).pop(key, None)
+        module.register_forward_pre_hook(_subsampling_input_to_16bit, with_kwargs = True)
+pass
+
+
 def requires_grad_for_gradient_checkpointing(model):
     # All Unsloth Zoo code licensed under LGPLv3
     # Enables requires_grad to make gradient checkpointing work on
     # non language models that don't just use .embed_tokens
     def register_other_hooks(name1, name2, module, _hooks):
         old_hooks = eval(f"module.{_hooks}")
-        # Hooks registered with_kwargs = True (Unsloth's inputs_embeds pre-hook) take (module, args,
-        # kwargs): re-register them the same way, or the next forward calls them with two arguments.
+        # Hooks with with_kwargs = True (Unsloth's inputs_embeds pre-hook) take (module, args, kwargs); re-register them
+        # the same way, or the next forward calls them with two arguments.
         with_kwargs = set(getattr(module, f"{_hooks}_with_kwargs", None) or ())
         other_hooks = []
         for key, value in old_hooks.items():
@@ -514,7 +625,6 @@ def requires_grad_for_gradient_checkpointing(model):
                 register(hook, with_kwargs = True)
             else:
                 register(hook)
-        pass
     pass
 
     # Remove all previous forward hooks for gradient checkpointing
@@ -529,7 +639,6 @@ def requires_grad_for_gradient_checkpointing(model):
         pass
     pass
 
-    # Add post forward hook
     def requires_grad_post_hook(module, input, output):
         type_output = type(output)
         if type_output is torch.Tensor:
@@ -561,8 +670,8 @@ def requires_grad_for_gradient_checkpointing(model):
     pass
 
     def requires_grad_post_hook_eager(module, input, output):
-        # Gemma 3N's multimodal embedder also has an Embedding child but runs compiled, where the flip
-        # is a graph break and needless (its LoRA projection sits right after); Dia's encoder runs eager.
+        # Skipped while compiling: the requires_grad flip is a needless graph break in Gemma 3N's compiled multimodal
+        # embedder (its LoRA projection follows); Dia's encoder runs eager.
         if torch.compiler.is_compiling(): return
         requires_grad_post_hook(module, input, output)
     pass
@@ -598,12 +707,23 @@ def requires_grad_for_gradient_checkpointing(model):
                 val.requires_grad_(True)
                 return
             pass
-        pass
+    pass
+
+    def requires_grad_frontend_hook(module, input, output):
+        if torch.compiler.is_compiling(): return
+        target = output
+        if type(target) in (tuple, list):
+            target = next((x for x in target if type(x) is torch.Tensor), None)
+        if type(target) is torch.Tensor and torch.is_floating_point(target) and torch.is_grad_enabled():
+            target.requires_grad_(True)
     pass
 
     def collect_hook_targets():
         hook_targets = OrderedDict()
         fallback_targets = OrderedDict()
+        # id(forward) -> (forward, source): every LoRA weight walks up to the same ancestors.
+        # Holding the function keeps its id from being reused within this call.
+        forward_sources = {}
 
         for name, param in model.named_parameters():
             if not param.requires_grad: continue
@@ -628,8 +748,15 @@ def requires_grad_for_gradient_checkpointing(model):
                 fallback_name   = name_pre
                 fallback_module = module
                 if hasattr(module, "forward"):
-                    try: forward = inspect.getsource(module.forward)
-                    except: continue
+                    forward_function = module.forward
+                    forward_function = getattr(forward_function, "__func__", forward_function)
+                    cached = forward_sources.get(id(forward_function))
+                    if cached is None:
+                        try: source = inspect.getsource(module.forward)
+                        except: source = None
+                        cached = forward_sources[id(forward_function)] = (forward_function, source)
+                    forward = cached[1]
+                    if forward is None: continue
 
                     # Normal self.language_model(...)
                     if f"self.{name_curr}(" in forward:
@@ -665,6 +792,8 @@ def requires_grad_for_gradient_checkpointing(model):
         return hook_targets, fallback_targets
     pass
 
+    _freeze_unused_feature_encoders(model)
+    _cast_subsampling_inputs(model)
     hook_targets, fallback_targets = collect_hook_targets()
     if len(hook_targets) == 0 and len(fallback_targets) == 0: return
 
@@ -689,7 +818,6 @@ def requires_grad_for_gradient_checkpointing(model):
         logger.info(f"Unsloth: Making `{module_name}` require gradients")
 
         still_need_patching = True
-        # Check if input_embeddings exists
         if hasattr(module, "get_input_embeddings"):
             # Use forward hook after Embedding() is called
             embeddings = None
@@ -725,6 +853,19 @@ def requires_grad_for_gradient_checkpointing(model):
                     )
         pass
 
+        frontend = _frozen_frontend(module) if still_need_patching else None
+        if frontend is not None:
+            register_other_hooks(
+                "requires_grad_frontend_hook",
+                "requires_grad_frontend_hook",
+                frontend,
+                "_forward_hooks",
+            )
+            frontend.register_forward_hook(requires_grad_frontend_hook)
+            logger.info(f"Unsloth: Registered output gradient hook on `{module_name}`'s frozen front end.")
+            still_need_patching = False
+        pass
+
         if still_need_patching:
             # Use forward pre hook before module is called
             register_other_hooks(
@@ -735,8 +876,8 @@ def requires_grad_for_gradient_checkpointing(model):
             )
             module.register_forward_pre_hook(requires_grad_pre_hook, with_kwargs=True)
             logger.info(f"Unsloth: Registered pre-forward gradient hook on `{module_name}`.")
-            # A tower fed only token ids with no get_input_embeddings (Dia's encoder) gives the pre-hook
-            # no float input, so its checkpointed layers would get no gradients: hook its own Embedding.
+            # Tower fed only token ids with no get_input_embeddings (Dia's encoder): the pre-hook gets no float input,
+            # so its checkpointed layers would get no gradients; hook its own Embedding.
             embedding = next((c for c in module.children() if isinstance(c, torch.nn.Embedding)), None)
             if embedding is not None:
                 register_other_hooks(
@@ -747,8 +888,6 @@ def requires_grad_for_gradient_checkpointing(model):
                 )
                 embedding.register_forward_hook(requires_grad_post_hook_eager)
         pass
-    pass
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

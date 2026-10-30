@@ -14,7 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Pre torch 2.14 mem-efficient rejects enable_gqa and flash rejects fp32, so GQA SDPA falls to math; repeat k/v instead.
+# Pre torch 2.14 mem-efficient rejects enable_gqa and flash rejects fp32, so GQA SDPA falls to math; repeat k/v instead,
+# unless SDPA would run the enable_gqa call on cuDNN, which takes GQA natively.
 
 import torch
 
@@ -63,12 +64,43 @@ def _efficient_takes_here(query, key, value, attn_mask, dropout_p, is_causal, en
         return False
 
 
+def _torch_version_at_least(major, minor):
+    try:
+        return tuple(int(x) for x in torch.__version__.split(".")[:2]) >= (major, minor)
+    except Exception:
+        return False
+
+
+# torch 2.8 added the GQA head count check to the cuDNN SDPA gate; 2.5 - 2.7 pass mismatched heads unchecked.
+_CUDNN_GATE_CHECKS_GQA = _torch_version_at_least(2, 8)
+
+
+def _cudnn_takes_gqa(query, key, value, attn_mask, dropout_p, is_causal, scale):
+    if not _CUDNN_GATE_CHECKS_GQA:
+        return False
+    try:
+        if not torch.backends.cuda.cudnn_sdp_enabled():
+            return False
+        from torch.nn.attention import SDPBackend
+        args = (query, key, value, attn_mask, dropout_p, is_causal)
+        # The arch checks read the current device's properties, so ask on the query's card.
+        if query.device.index is not None and query.device.index != torch.cuda.current_device():
+            with torch.cuda.device(query.device):
+                choice = torch._fused_sdp_choice(*args, scale = scale, enable_gqa = True)
+        else:
+            choice = torch._fused_sdp_choice(*args, scale = scale, enable_gqa = True)
+        return choice == int(SDPBackend.CUDNN_ATTENTION)
+    except Exception:
+        return False
+
+
 def make_gqa_sdpa(scaled_dot_product_attention):
     @torch.compiler.disable(recursive = True)
     def gqa_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale, groups):
         if groups != 1 and query.is_cuda and torch.backends.cuda.mem_efficient_sdp_enabled() and \
             not _flash_takes_gqa(query, key, attn_mask, dropout_p) and \
-            not _efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, True):
+            not _efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, True) and \
+            not _cudnn_takes_gqa(query, key, value, attn_mask, dropout_p, is_causal, scale):
             b, h_kv, s_kv, d = key.shape
             key_r = key[:, :, None].expand(b, h_kv, groups, s_kv, d).reshape(b, h_kv * groups, s_kv, d)
             value_r = value[:, :, None].expand(b, h_kv, groups, s_kv, value.shape[-1]).reshape(b, h_kv * groups, s_kv, value.shape[-1])

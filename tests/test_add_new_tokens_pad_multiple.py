@@ -133,8 +133,7 @@ def test_second_call_unsuppresses_the_rows_it_turns_into_tokens(monkeypatch):
 
 
 def test_padding_off_keeps_suppression_it_does_not_own(monkeypatch):
-    # The model's own suppress_tokens may name a spare row a new token now takes: without
-    # padding, add_new_tokens must leave that list exactly as it was.
+    # The model's own suppress_tokens may name a spare row that a new token now takes; without padding, add_new_tokens must leave that list untouched.
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
     model, tokenizer = _load()
     rows = model.get_input_embeddings().weight.shape[0]
@@ -191,8 +190,7 @@ def test_legacy_padded_model_releases_its_rows(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("pad", [None, 64])
 def test_legacy_padded_model_releases_its_rows_when_growing(monkeypatch, tmp_path, pad):
-    # New tokens overflowing the legacy alignment rows grow the embedding: the rows from that
-    # resize must not hide the legacy layout, or the old alignment ids stay suppressed as tokens.
+    # Growing the embedding past legacy alignment rows must not hide the legacy layout, or the old alignment ids stay suppressed after becoming tokens.
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
     model, tokenizer = _load()
     add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
@@ -212,8 +210,7 @@ def test_legacy_padded_model_releases_its_rows_when_growing(monkeypatch, tmp_pat
 
 
 def test_alignment_rows_already_suppressed_are_still_recorded_for_vllm(monkeypatch):
-    # vLLM only biases the recorded rows, so a row the caller already suppressed must be recorded
-    # too; it stays the caller's suppression when it later becomes a token.
+    # vLLM only biases recorded rows, so a row the caller already suppressed must still be recorded; it stays the caller's suppression once it becomes a token.
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
     model, tokenizer = _load()
     n0 = len(tokenizer)
@@ -292,8 +289,8 @@ class _AsyncClient:
 
 
 class _LLMEngine:
-    # vLLM 0.29 LLMEngine.add_request: process_inputs (clones params) or a prebuilt
-    # EngineCoreRequest whose own params win, then n > 1 fan-out, then engine_core.add_request.
+    # vLLM 0.29 LLMEngine.add_request: process_inputs clones the params, or a prebuilt EngineCoreRequest keeps its own;
+    # then n > 1 fan-out, then engine_core.add_request.
     def __init__(self):
         self.engine_core = _Client()
 
@@ -366,8 +363,7 @@ def test_vllm_padded_vocab_biases_prebuilt_engine_core_request():
 
 
 def test_vllm_padded_vocab_biases_async_streaming_chunks():
-    # AsyncLLM streaming input: each chunk's own SamplingParams go through process_inputs and
-    # straight to engine_core.add_request_async, never through AsyncLLM.add_request.
+    # AsyncLLM streaming input: each chunk's SamplingParams go through process_inputs and straight to engine_core.add_request_async, never AsyncLLM.add_request.
     import asyncio
 
     class AsyncLLM:
@@ -419,9 +415,9 @@ class _V0Params:
 
 
 class _V0LLMEngine:
-    # vLLM 0.10.2 V0 LLMEngine: add_request(request_id, prompt, params, ...) rejects requests that
-    # already carry logits_processors, then _add_processed_request(params = ...), which n > 1
-    # children (ParallelSampleSequenceGroup) and _AsyncLLMEngine.add_request_async also call.
+    # vLLM 0.10.2 V0: LLMEngine.add_request rejects requests already carrying logits_processors;
+    # _add_processed_request(params = ...) is called by ParallelSampleSequenceGroup (n > 1) and
+    # _AsyncLLMEngine.add_request_async.
     def __init__(self):
         self.seen = []
 
@@ -518,8 +514,7 @@ def test_return_args_warns_for_padded_vocab(capsys):
 
 
 def test_caller_suppression_kept_after_owned_rows_run_out(monkeypatch):
-    # Once every row Unsloth suppressed has become a token, the remaining alignment row is still
-    # the caller's: the empty ownership record must not fall back to "all rows are ours".
+    # Once all Unsloth-suppressed rows are tokens, the leftover alignment row is the caller's; an empty ownership record must not mean all rows are ours.
     from unsloth_zoo.tokenizer_utils import _round_up_vocab
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
     model, tokenizer = _load()
@@ -541,10 +536,8 @@ def test_caller_suppression_kept_after_owned_rows_run_out(monkeypatch):
     assert sorted(model.generation_config.suppress_tokens) == [7, padded - 1]
 
 
-
 def test_merged_export_config_keeps_vocab_pad_records():
-    # merge_and_overwrite_lora writes the base checkpoint's config with the trained vocab_size:
-    # the alignment-row records must travel with it, or vLLM samples the tokenless rows.
+    # merge_and_overwrite_lora writes the base config with the trained vocab_size, so alignment-row records must travel with it or vLLM samples tokenless rows.
     from transformers import LlamaConfig
     from unsloth_zoo.saving_utils import _carry_over_vocab_size
     from unsloth_zoo.vllm_utils import _padded_vocab_ids
@@ -579,3 +572,143 @@ def test_merged_export_tolerates_an_ambiguous_text_config():
     plain_base, plain = Ambiguous(text_config = SimpleNamespace()), Ambiguous(text_config = SimpleNamespace())
     _carry_over_vocab_pad_records(plain_base, plain)
     assert not hasattr(plain_base.text_config, "unsloth_vocab_pad_ids")
+
+
+class _VllmModel(torch.nn.Module):
+    # A vLLM *ForCausalLM: the runner samples (and verifies drafts) from model.compute_logits.
+    def __init__(self, vocab = 2100):
+        super().__init__()
+        self.vocab = vocab
+
+    def compute_logits(self, hidden_states):
+        logits = torch.zeros(hidden_states.shape[0], self.vocab)
+        logits[:, 1] = 1.0
+        logits[:, IDS[0]] = 200.0
+        return logits
+
+
+def _inproc_llm():
+    # In-process engine: llm_engine.engine_core.engine_core holds the model runner.
+    from types import SimpleNamespace
+    llm = _LLM()
+    runner = SimpleNamespace(model = _VllmModel())
+    llm.llm_engine.engine_core.engine_core = SimpleNamespace(
+        model_executor = SimpleNamespace(driver_worker = SimpleNamespace(model_runner = runner)),
+    )
+    return llm, runner.model
+
+
+def _assert_padded_rows_masked(model, ids = IDS):
+    logits = model.compute_logits(torch.zeros(3, 4))
+    assert torch.isneginf(logits[:, ids]).all()
+    assert int((~torch.isneginf(logits)).sum()) == 3 * (logits.shape[-1] - len(ids))
+    assert logits.argmax(-1).tolist() == [1, 1, 1]
+
+
+def test_vllm_padded_vocab_masked_in_model_under_speculative_decoding(capsys):
+    # logit_bias is refused with speculation, so the target logits are masked instead.
+    llm, model = _inproc_llm()
+    wrap = _vllm_wrapper_ns()["suppress_vllm_padded_vocab"]
+    wrap(llm, IDS, speculative = True)
+    wrap(llm, IDS, speculative = True)
+    _assert_padded_rows_masked(model)
+    llm.generate(["a"], _Params())
+    assert llm.llm_engine.engine_core.seen[0].sampling_params.logit_bias is None
+    assert "stay sampleable" not in capsys.readouterr().out
+    assert llm._unsloth_padded_vocab_bias == (tuple(IDS), float("-inf"))
+
+
+def test_vllm_padded_vocab_masked_in_model_past_the_logit_bias_limit(capsys):
+    big = list(range(900, 2063))
+    llm, model = _inproc_llm()
+    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, big)
+    _assert_padded_rows_masked(model, big)
+    llm.generate(["a"], _Params())
+    assert llm.llm_engine.engine_core.seen[0].sampling_params.logit_bias is None
+    assert "stay sampleable" not in capsys.readouterr().out
+    assert llm._unsloth_padded_vocab_bias == (tuple(big), float("-inf"))
+
+
+def test_vllm_padded_vocab_masked_in_model_when_a_request_overflows_the_limit(capsys):
+    llm, model = _inproc_llm()
+    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, IDS)
+    llm.generate(["a"], _Params({i: 1.0 for i in range(1000)}))
+    assert len(llm.llm_engine.engine_core.seen[0].sampling_params.logit_bias) == 1000
+    _assert_padded_rows_masked(model)
+    assert "stay sampleable" not in capsys.readouterr().out
+
+
+class _ShardedVllmModel(_VllmModel):
+    # TP models that opt in to batch-sharded sampling: the vocab-sharded logits skip compute_logits.
+    def compute_logits_local(self, hidden_states):
+        return _VllmModel.compute_logits(self, hidden_states)
+
+
+def _sampled_logits(runner):
+    # vLLM 0.29 MRV2: compute_logits_local with a BatchSharder, compute_logits otherwise.
+    hidden = torch.zeros(3, 4)
+    if runner.batch_sharder is not None:
+        return runner.model.compute_logits_local(hidden)
+    return runner.model.compute_logits(hidden)
+
+
+def test_vllm_padded_vocab_masked_in_model_turns_off_batch_sharded_sampling(capsys):
+    # The mask does not wrap compute_logits_local, so batch-sharded sampling is switched off.
+    llm, _ = _inproc_llm()
+    runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner
+    runner.model, runner.batch_sharder = _ShardedVllmModel(), object()
+    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, IDS, speculative = True)
+    logits = _sampled_logits(runner)
+    assert torch.isneginf(logits[:, IDS]).all()
+    assert logits.argmax(-1).tolist() == [1, 1, 1]
+    assert "stay sampleable" not in capsys.readouterr().out
+
+
+def test_merged_export_drops_pad_records_training_released(monkeypatch, tmp_path):
+    # Training fills every pad row, so the saved base config's records are stale.
+    from transformers import AutoConfig
+    from unsloth_zoo.saving_utils import _carry_over_vocab_size
+    from unsloth_zoo.vllm_utils import _padded_vocab_ids
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    n1, padded = len(tokenizer), model.get_input_embeddings().weight.shape[0]
+    assert model.config.unsloth_vocab_pad_ids == list(range(n1, padded))
+    model.save_pretrained(tmp_path / "base")
+    tokenizer.save_pretrained(tmp_path / "base")
+
+    model = AutoModelForCausalLM.from_pretrained(tmp_path / "base", torch_dtype = torch.float32)
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path / "base")
+    add_new_tokens(model, tokenizer, new_tokens = [f"<unsloth_b{i}>" for i in range(padded - n1)])
+    assert len(tokenizer) == padded
+    assert not hasattr(model.config, "unsloth_vocab_pad_ids")
+    assert not hasattr(model.config, "unsloth_vocab_pad_suppressed_ids")
+
+    base_config = AutoConfig.from_pretrained(tmp_path / "base")
+    assert base_config.unsloth_vocab_pad_ids == list(range(n1, padded))
+    _carry_over_vocab_size(base_config, model.config)
+    assert base_config.vocab_size == padded
+    assert _padded_vocab_ids(base_config) == []
+    assert not hasattr(base_config, "unsloth_vocab_pad_ids")
+    assert not hasattr(base_config, "unsloth_vocab_pad_suppressed_ids")
+    assert "unsloth_vocab_pad_ids" not in base_config.to_dict()
+
+
+def test_merged_export_keeps_an_empty_ownership_list():
+    # An explicit [] is a record and must replace the base's stale list.
+    from transformers import LlamaConfig
+    from unsloth_zoo.saving_utils import _carry_over_vocab_pad_records
+    base = LlamaConfig(vocab_size = 128)
+    base.unsloth_vocab_pad_ids = list(range(101, 128))
+    base.unsloth_vocab_pad_suppressed_ids = list(range(101, 127))
+    trained = LlamaConfig(vocab_size = 128)
+    trained.unsloth_vocab_pad_ids = [127]
+    trained.unsloth_vocab_pad_suppressed_ids = []
+    _carry_over_vocab_pad_records(base, trained)
+    assert base.unsloth_vocab_pad_ids == [127]
+    assert base.unsloth_vocab_pad_suppressed_ids == []
+    base.unsloth_vocab_pad_suppressed_ids = [101]
+    del trained.unsloth_vocab_pad_suppressed_ids
+    _carry_over_vocab_pad_records(base, trained)
+    assert base.unsloth_vocab_pad_ids == [127]
+    assert not hasattr(base, "unsloth_vocab_pad_suppressed_ids")

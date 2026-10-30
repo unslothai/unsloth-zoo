@@ -1,15 +1,6 @@
-"""Real-renderer regression tests for ``encode_conversations_with_harmony``.
-
-The companion test module ``test_encode_conversations_with_harmony.py`` stubs out the
-entire ``openai_harmony`` library, so it only validates how the encoder *constructs*
-Message objects, never what the real renderer puts into the returned token IDs. These
-tests exercise the genuine ``openai_harmony`` renderer end to end and assert against the
-decoded output.
-
-They are skipped automatically when ``openai_harmony`` is not installed, or when the
-gpt-oss harmony encoding cannot be loaded (e.g. no network to fetch the vocab), so the
-suite stays runnable in hermetic CI while still covering the real behavior locally.
-"""
+"""Real openai_harmony renderer tests for encode_conversations_with_harmony, asserting decoded output; the stubbed
+companion module only checks Message construction. Skipped if harmony or the gpt-oss encoding (vocab fetch) is
+unavailable."""
 
 from __future__ import annotations
 
@@ -40,8 +31,7 @@ def _package_shell(name, path):
 
 @pytest.fixture()
 def gpt_oss_module():
-    # Mirror the import strategy used by the stubbed test module so the submodule can be
-    # imported standalone (without a full unsloth install).
+    # Mirrors the stubbed test module's import strategy so the submodule imports standalone, without a full unsloth install.
     if "unsloth_zoo" in sys.modules or importlib.util.find_spec("unsloth") is not None:
         try:
             module = importlib.import_module(_MODULE_NAME)
@@ -86,10 +76,8 @@ def _decode(messages, gpt_oss_module, **kwargs):
 
 
 def test_renderer_drops_analysis_before_final_by_default(real_encoding):
-    # Characterization of the upstream renderer: with auto_drop_analysis (the default),
-    # an analysis message that precedes a final message in the last assistant turn is
-    # dropped, while disabling auto_drop_analysis keeps it. This is exactly why a
-    # thinking+content turn does not surface reasoning in the default-rendered IDs.
+    # Characterizes upstream: with default auto_drop_analysis, an analysis message before a final one in the last
+    # assistant turn is dropped; disabling it keeps it, so reasoning is absent by default.
     Role = openai_harmony.Role
     Message = openai_harmony.Message
     Conversation = openai_harmony.Conversation
@@ -115,9 +103,8 @@ def test_renderer_drops_analysis_before_final_by_default(real_encoding):
 
 
 def test_thinking_with_content_preserves_answer(real_encoding, gpt_oss_module):
-    # The #246 contract: the visible answer (content) must survive into the encoded
-    # output on the final channel. (Reasoning is dropped by Harmony's default
-    # auto_drop_analysis when a final follows it; that is intended for this render path.)
+    # The issue 246 contract: the content answer must survive on the final channel; Harmony's default auto_drop_analysis
+    # drops reasoning before a final, which is intended.
     decoded = _decode(
         [{"role": "assistant", "thinking": "REASON_SENTINEL", "content": "ANSWER_SENTINEL"}],
         gpt_oss_module,
@@ -126,8 +113,7 @@ def test_thinking_with_content_preserves_answer(real_encoding, gpt_oss_module):
 
 
 def test_thinking_only_preserves_reasoning(real_encoding, gpt_oss_module):
-    # A pure-reasoning turn ends in analysis (no trailing final), so the reasoning is
-    # kept in the rendered output.
+    # A pure-reasoning turn ends in an analysis message with no trailing final, so the reasoning survives rendering.
     decoded = _decode(
         [{"role": "assistant", "thinking": "REASON_SENTINEL"}],
         gpt_oss_module,
@@ -136,8 +122,7 @@ def test_thinking_only_preserves_reasoning(real_encoding, gpt_oss_module):
 
 
 def test_thinking_with_tool_calls_keeps_tool_call(real_encoding, gpt_oss_module):
-    # Regression: a turn with both thinking and a tool call must keep the tool call in
-    # the encoded output (the old unconditional continue dropped it).
+    # Guards against an unconditional continue dropping the tool call of a turn that has both thinking and a tool call.
     decoded = _decode(
         [{
             "role": "assistant",

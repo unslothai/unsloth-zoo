@@ -27,6 +27,11 @@ TRANSFORMERS_5 = Version(importlib_version("transformers")) >= Version("5.0.0")
 def _exact_packed_decode(monkeypatch):
     # These tests pin the exact packed decode; test_mxfp4_ogs_decode.py covers the matmul_ogs one.
     monkeypatch.setenv("UNSLOTH_MXFP4_OGS", "0")
+    # The offload flag is process-wide and an earlier cpu/disk device_map load (tests/test_cpu_backend.py) sets it, so
+    # this fixture resets _LOAD_OFFLOADS to [False]; a test that wants it set must say so.
+    monkeypatch.setattr(mx, "_LOAD_OFFLOADS", [False])
+
+
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 needs_triton = pytest.mark.skipif(not mxd._HAS_TRITON, reason = "needs Triton")
 

@@ -236,8 +236,7 @@ def _env_flag(name, default):
     return os.environ.get(name, default) == "1"
 
 
-# Calling gemm_tuned.fn with a pinned config skips the 18-arg custom op and autotuner key
-# (~0.18 ms -> ~0.03 ms host per call, bit-identical; scripts/sonic_host_profile.py).
+# Calling gemm_tuned.fn with a pinned config skips the 18-arg custom op and autotuner key; bit-identical to the normal call (see scripts/sonic_host_profile.py).
 
 _GEMM_INTERFACE = None
 _CONFIG_CACHE = {}
@@ -444,9 +443,8 @@ def _interleave_columns(tensor):
     return torch.stack((gate, up), dim=-1).reshape(*tensor.shape[:-1], two_i)
 
 
-# concat_layout=("B",) interleaves B's NON-stride-1 dim with no copy, so gate_up must be the
-# K-major view W.transpose(-2, -1) (else the contraction dim is interleaved). preact comes back
-# interleaved: against a chunked reference that reads as rel err sqrt(2), not a bug.
+# concat_layout=("B",) interleaves B's non-stride-1 dim with no copy, so gate_up must be the K-major view
+# W.transpose(-2, -1); preact comes back interleaved, which reads as rel err sqrt(2) but is not a bug.
 
 _CONCAT_SUPPORTED = None
 
@@ -689,9 +687,10 @@ class _SonicGatedGroupedMM(torch.autograd.Function):
 def _is_quantized_source(source):
     """bnb 4-bit / fp8 / any non-plain-float expert weight must not reach sonic."""
     param = source
-    seen = set()
-    while param is not None and id(param) not in seen:
-        seen.add(id(param))
+    # Bounded walk, no id(): id() of a traced parameter guards on its identity (one recompile per layer).
+    for _ in range(16):
+        if param is None:
+            break
         if type(param).__name__ in ("Params4bit", "Params8bit", "Int8Params"):
             return True
         nxt = getattr(param, "base_layer", None)
@@ -711,6 +710,10 @@ def _sonic_eligible(self, hidden_states):
         return False, f"device {hidden_states.device} is not the compute capability sonic was probed on"
     if hidden_states.dtype not in _SUPPORTED_DTYPES:
         return False, f"dtype {hidden_states.dtype} is not bf16/fp16"
+    # Row strides of A, B and D must be 16-byte aligned, else sonic raises "divisible by 8".
+    align = 16 // hidden_states.element_size()
+    if hidden_states.shape[-1] % align != 0:
+        return False, f"hidden size {hidden_states.shape[-1]} is not a multiple of {align}"
     if not (hasattr(self, "gate_up_proj") and hasattr(self, "down_proj")):
         return False, "experts do not use the gate_up_proj/down_proj layout"
     cls = self.__class__.__name__
@@ -743,6 +746,8 @@ def _sonic_eligible(self, hidden_states):
                 return False, f"{name} base dtype {base.dtype} is not bf16/fp16"
             if base.dim() != 3:
                 return False, f"{name} base is not a 3D expert stack"
+            if base.shape[1] % align != 0 or base.shape[2] % align != 0:
+                return False, f"{name} expert dims {tuple(base.shape[1:])} are not multiples of {align}"
     return True, None
 
 
@@ -787,8 +792,8 @@ def forward_sonic_moe(
             _WARNED_FALLBACK.add(reason)
             _log(f"Unsloth: sonic-moe backend falling back: {reason}.")
         # Fallback decided by the operand's device.
-        from .moe_utils import _check_torch_grouped_mm_supported, forward_native_moe_loop
-        if hidden_states.is_cuda and not _check_torch_grouped_mm_supported(hidden_states.device):
+        from .moe_utils import _grouped_mm_supported_on, forward_native_moe_loop
+        if hidden_states.is_cuda and not _grouped_mm_supported_on(hidden_states.device):
             return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
 

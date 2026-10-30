@@ -22,8 +22,7 @@ import pathlib
 
 import pytest
 
-# The probe is a runnable script rather than a package module, so load it by
-# path. It imports only the standard library: no mlx, no checkpoint.
+# Probe is a runnable script, not a package module: load by path; it imports only the stdlib
 _PROBE = pathlib.Path(__file__).with_name("gemma4_audio_version_probe.py")
 _spec = importlib.util.spec_from_file_location("gemma4_audio_version_probe", _PROBE)
 probe = importlib.util.module_from_spec(_spec)
@@ -32,17 +31,8 @@ _spec.loader.exec_module(probe)
 
 @pytest.mark.parametrize("var", ["UNSLOTH_ALLOW_CPU", "UNSLOTH_IS_PRESENT"])
 def test_importing_the_probe_does_not_rewrite_the_environment(monkeypatch, var):
-    """Executing the module must leave these to main().
-
-    Cannot be written as "assert it is absent after the import at the top of
-    this file": conftest sets UNSLOTH_ALLOW_CPU for every session, and
-    `unsloth/__init__.py` sets UNSLOTH_IS_PRESENT on import, so both are
-    normally present for reasons that have nothing to do with the probe. So
-    clear them and re-execute, which is the property that actually matters --
-    `os.environ.setdefault` writes through to the real process environment,
-    and before this change importing the probe from a test set both for the
-    rest of the session.
-    """
+    """Probe import must not set env vars: conftest sets UNSLOTH_ALLOW_CPU and unsloth/__init__.py sets
+    UNSLOTH_IS_PRESENT; os.environ.setdefault writes through to the real process env, so clear them and re-execute"""
     monkeypatch.delenv(var, raising=False)
     _spec.loader.exec_module(importlib.util.module_from_spec(_spec))
     assert var not in os.environ
@@ -54,15 +44,13 @@ def test_importing_the_probe_does_not_rewrite_the_environment(monkeypatch, var):
         # Reproducible machine: repeats agree, so the noise floor is zero.
         ("reproducible_and_connected", [19.3557] * 3, 19.6828, "pass"),
         ("reproducible_and_disconnected", [19.3557] * 3, 19.3557, "same_loss"),
-        # Apple Silicon, measured on macos-14, mlx-vlm 0.6.3: three identical
-        # 440 Hz forwards spread by 0.827, the gap to 1760 Hz was only 1.30.
+        # Apple Silicon (macos-14, mlx-vlm 0.6.3): identical 440 Hz repeats spread 0.827; 1760 Hz gap 1.30
         ("measured_on_metal", [24.8986, 25.4577, 25.7256], 26.1988,
          "below_noise"),
         # Same machine, audio connected: a gap dwarfing the spread still decides.
         ("drifting_but_signal_dwarfs_it", [24.8986, 25.4577, 25.7256], 40.0,
          "pass"),
-        # Two repeats can agree by luck on a drifting machine, putting the floor
-        # back at zero and passing the disconnected case; the third stops that.
+        # Two repeats can agree by luck on a drifting machine, zeroing the noise floor; a third stops that.
         ("two_repeats_agree_by_luck", [19.30, 19.30, 19.81], 19.62,
          "below_noise"),
     ],
@@ -70,17 +58,13 @@ def test_importing_the_probe_does_not_rewrite_the_environment(monkeypatch, var):
 def test_two_tone_verdict(name, repeats, other, expected):
     verdict, detail = probe.two_tone_verdict(repeats, other)
     assert verdict == expected, f"{name}: {detail}"
-    # Every non-pass verdict must have a message, or the caller raises KeyError
-    # instead of reporting. Checked against verdicts really returned.
+    # Every non-pass verdict needs a TWO_TONE_REASONS message, else the caller raises KeyError
     if verdict != "pass":
         assert probe.TWO_TONE_REASONS[verdict]
 
 
 def test_a_gap_exactly_at_the_margin_counts_as_not_clear_of_it():
-    """Built from the same arithmetic the gate uses, so it lands on `<=`.
-
-    Hardcoding the boundary would make this a test of float rounding.
-    """
+    """Boundary built from the gate's arithmetic so it lands on <=; hardcoding it tests float rounding"""
     repeats = [19.0, 19.0, 19.5]
     at_margin = (sum(repeats) / len(repeats)
                  + probe.TWO_TONE_MARGIN * (max(repeats) - min(repeats)))
@@ -101,12 +85,7 @@ def test_the_reported_tone_loss_is_the_mean_of_the_repeats():
 
 
 def test_an_unmeasurable_stage_does_not_fail_the_version():
-    """Metal cannot decide stage 4, and that is not the version's fault.
-
-    Measured: three identical 440 Hz forwards spread further apart than the
-    gap to a different tone. Gating on that would paint every mlx-vlm version
-    red on the only platform this feature ships to.
-    """
+    """Stage 4 is inconclusive on Metal: repeat spread exceeds the tone gap; gating fails all versions"""
     stages = {
         "0_mlx_vlm_alone_loads": {"ok": False},
         "1_zoo_loads_it": {"ok": True},

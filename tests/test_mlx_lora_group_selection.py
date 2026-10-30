@@ -100,8 +100,7 @@ def _adapters(model, prefix=""):
                   if hasattr(module, "lora_a") and name.startswith(prefix))
 
 
-# What each path reads as. The enclosing block outranks the leaf below it, a bare
-# projection names no role, and a `gate` naming what it projects into is an MLP.
+# Roles by path: the enclosing block outranks the leaf below it, a bare projection names no role, and a `gate` naming what it projects into is an MLP.
 _ROLE_CASES = {
     "query_key_value": "attention", "dense": None, "mlp.gate": "gate",
     "attn_pool.mlp.fc1": "mlp", "mlp.dense_h_to_4h": "mlp", "mlp.gate_1": "gate",
@@ -189,8 +188,7 @@ _EMPTY_GROUP_CASES = {
     "unresolved tower": (
         lambda: _vlm(tower_attr="itok_upsampler"), {"train_vision": True},
         ["train_vision=True", "'itok_upsampler'"]),
-    # Refuses after the tower walk matched, so an adapting pass would leave
-    # those adapters behind.
+    # Refuses after the tower walk matched, so an adapting pass would leave those adapters behind.
     "a connector with no linear, beside an adaptable tower": (
         lambda: _vlm(extra=("mm_projector", _build({}))),
         {"finetune_vision_layers": True, "train_projector": True},
@@ -257,9 +255,8 @@ def test_a_flag_that_will_not_train_warns_before_the_model_is_touched(
     assert bool(_adapters(model, adapted)) if adapted else True
 
 
-# A connector nested in the tower is skipped so the projector pass can adapt it
-# once. With that pass switched off there is no second pass, and skipping would
-# drop linears the tower walk used to reach.
+# A nested connector is skipped in the tower walk so the projector pass adapts it once; without that pass, skipping
+# would drop linears the tower walk would otherwise reach.
 @pytest.mark.parametrize("train_projector,adapted_by", [
     (False, "the tower pass"), (True, "its own pass")],
     ids=["projector off", "projector on"])
@@ -276,8 +273,7 @@ def test_a_nested_connector_is_adapted_whichever_pass_owns_it(
 
 
 def test_a_refusal_on_the_defaulted_path_names_no_target_modules():
-    # The canonical list is substituted internally, so quoting it back sends
-    # the caller to change an argument they never passed.
+    # The canonical target list is substituted internally, so quoting it back would send the caller to change an argument they never passed.
     model = _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, 1)}))
     with pytest.raises(ValueError) as excinfo:
         _peft(model, finetune_vision_layers=True)
@@ -291,9 +287,8 @@ def test_a_refusal_on_the_defaulted_path_names_no_target_modules():
     assert "target_modules=['q_proj']" in str(excinfo.value)
 
 
-# Routed experts are selectable, so the pass that adapts them must know the same
-# module types selection does: a mixed tower silently trained only its ordinary
-# linears, and a tower holding nothing else refused as though it were empty.
+# Routed experts are selectable, so the adapting pass must know the same module types as selection; a mixed tower
+# silently trained only its ordinary linears, and a tower holding nothing else refused as though it were empty.
 @pytest.mark.parametrize("mixed", [True, False],
                          ids=["beside ordinary linears", "alone in the tower"])
 def test_a_tower_holding_routed_experts_adapts_them(mixed):
@@ -308,8 +303,7 @@ def test_a_tower_holding_routed_experts_adapts_them(mixed):
     assert ("blocks.0.attn.qkv" in adapted) is mixed
 
 
-# `feed_forward` splits into two tokens, so the joined spelling in the MLP table
-# did not reach it and the whole block lost its role.
+# `feed_forward` splits into two tokens, so the joined spelling in the MLP table did not reach it and the whole block lost its role.
 @pytest.mark.parametrize("block_name,role", [
     ("feed_forward", "mlp"), ("feedforward", "mlp"), ("ffn", "mlp"),
     ("mlp", "mlp"), ("self_attn", "attention")])
@@ -328,8 +322,7 @@ def test_a_block_spelled_feed_forward_is_adapted_by_the_mlp_flag():
         "self_attn.q_proj"]
 
 
-# A role is read per layer, so the same generic name can be attention beside a
-# qkv and MLP beside an fc1. Unioning the layers wrapped it in both.
+# A role is read per layer, so the same generic name can be attention beside a qkv and MLP beside an fc1; unioning the layers wrapped it in both.
 def test_a_role_read_in_one_layer_does_not_reach_another():
     model = _text_model([{"mixer": {"qkv": (HIDDEN, HIDDEN * 3),
                                     "proj": (HIDDEN, HIDDEN)}},
@@ -502,8 +495,7 @@ def test_native_string_message_format_keeps_numbered_images():
     assert output[2]["content"] == "<|image_3|>Compare with <|image_1|>."
 
 
-# An all-caps prefix runs into the next word, so a tower found only by its class
-# name needs the acronym boundary as well as the camelCase one.
+# An all-caps prefix runs into the next word, so a tower found only by its class name needs the acronym boundary as well as the camelCase one.
 @pytest.mark.parametrize("name,expected", [
     ("CLIPVisionModel", {"clip", "vision", "model"}),
     ("SiglipVisionTransformer", {"siglip", "vision", "transformer"}),
@@ -549,8 +541,7 @@ def test_a_root_module_sharing_a_layer_local_name_is_left_alone():
 
 
 def test_every_container_discovery_yields_can_be_written_back_into():
-    # Selection is only useful if the pass that adapts can replace what it
-    # found, so discovery must not name a container the writer cannot mutate.
+    # Selection is only useful if the adapting pass can replace what it found, so discovery must not name a container the writer cannot mutate.
     import mlx.nn as nn
     from unsloth_zoo.mlx.loader import _named_child_modules, _navigate, _set_child
     holder = _build({})
@@ -598,9 +589,8 @@ def _lora_depth(module):
 
 
 def test_a_layer_listed_twice_is_adapted_once():
-    # mlx-vlm's hrm_text lists 2 physical layers over 8 recurrent entries. Adapting
-    # per entry wraps an adapter in an adapter, and _mlx_lora_from_base refuses a
-    # LoRALinear, so the second visit used to raise.
+    # mlx-vlm's hrm_text lists 2 physical layers over 8 recurrent entries; adapting each entry wraps an adapter in an
+    # adapter, which _mlx_lora_from_base refuses for a LoRALinear.
     from unsloth_zoo.mlx.loader import linear_to_lora_layers
     model, physical = _recurrent_stack("AABAB")
     attached = linear_to_lora_layers(
@@ -610,8 +600,7 @@ def test_a_layer_listed_twice_is_adapted_once():
 
 
 def test_a_layer_listed_twice_keeps_every_entry_s_targets():
-    # Deduplicating on first visit alone would drop the second entry's targets,
-    # silently leaving v_proj untrained here.
+    # Deduplicating on first visit alone would drop the second entry's targets, silently leaving v_proj untrained here.
     from mlx_lm.tuner.lora import LoRALinear
     from unsloth_zoo.mlx.loader import linear_to_lora_layers
     model, physical = _recurrent_stack("AA")

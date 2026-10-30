@@ -406,8 +406,8 @@ def test_gradient_checkpointing_recompute_uses_replay(replay):
 
 
 def test_recompute_replays_each_forward_of_a_chunked_loss(replay):
-    # Two equal-shape forwards before one backward, as the padded GRPO chunk loop does: each
-    # checkpoint recompute must replay its own forward's routes, not the last forward's.
+    # Two equal-shape forwards before one backward, as the padded GRPO chunk loop does: each checkpoint recompute
+    # replays its own forward's routes, not the last one.
     sequences = [([5, 6, 7], [30, 31, 32, 33]), ([8, 9, 10], [40, 41, 42, 43])]
     model = _model()
     forced = _forced_rows(model, sequences, shift = 2)
@@ -441,8 +441,7 @@ def _old_weighted_sum_hash(ids):
 
 
 def test_recompute_tells_apart_forwards_whose_routes_hash_alike(replay):
-    # Two different sequences whose first layer natural routes collide under a weighted sum
-    # hash: each checkpoint recompute must still replay its own forward's routes.
+    # Two sequences whose first-layer natural routes collide under a weighted sum hash: each checkpoint recompute must still replay its own forward's routes.
     model = _model()
     batch = torch.randint(1, 64, (256, 7), generator = torch.Generator().manual_seed(749))
     captured = {}
@@ -504,8 +503,8 @@ def test_recompute_keeps_natural_routing_when_forwards_are_ambiguous(replay):
 
 
 def test_recompute_accepts_the_same_expert_set_in_another_order(replay):
-    # Two forwards with identical natural routing whose replays hold the same experts in a
-    # different order: the recompute must still replay them, not fall back to natural routing.
+    # Two forwards with identical natural routing whose replays hold the same experts in another order: recompute must
+    # replay them, not fall back to natural routing.
     model = _model()
     batch = torch.randint(1, 64, (1024, 2), generator = torch.Generator().manual_seed(749))
     captured = {}
@@ -552,8 +551,8 @@ def test_recompute_accepts_the_same_expert_set_in_another_order(replay):
 
 @pytest.mark.parametrize("version, expected", [("0.18.0", False), ("0.20.2", False), ("0.21.0", True), ("0.22.0", True), ("0.31.0", True)])
 def test_engine_args_need_vllm_021_for_hybrid_attention(replay, monkeypatch, version, expected):
-    # vLLM 0.14 to 0.20 index the shared routed experts buffer by slot in a buffer sized for one
-    # KV cache group, so hybrid attention models crash in generate; 0.21 indexes per request.
+    # vLLM 0.14 to 0.20 index the shared routed experts buffer by slot in a buffer sized for one KV cache group, so
+    # hybrid attention crashes in generate; 0.21 indexes per request.
     import importlib.metadata
     monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts"})
     monkeypatch.setattr(importlib.metadata, "version", lambda name: version)
@@ -639,6 +638,66 @@ def test_wrap_vllm_generate_records_and_is_idempotent(replay):
     assert rr.routing_replay_stats()["recorded"] == 1
 
 
+def test_prompt_start_accepts_any_sampling_params_sequence(replay):
+    from collections import UserList
+    routed = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
+    request = SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = routed[2:])])
+    llm = rr.wrap_vllm_generate(SimpleNamespace(generate = lambda prompts, sampling_params = None: [request]))
+    llm.generate([], UserList([SimpleNamespace(routed_experts_prompt_start = 2)]))
+    rows = rr._lookup((3, 4, 5, 6, 7, 8))
+    assert torch.equal(rows[:2].long(), torch.full((2, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[2:5].long(), torch.as_tensor(routed[2:5]).long())
+
+
+@pytest.mark.parametrize("start", [5, 6])
+def test_prompt_start_reuses_routes_of_an_earlier_turn(replay, start):
+    # Multi-turn: turn 2 skips the rows turn 1 already returned (5 rows of its 6 tokens, or all 6).
+    turn1 = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
+    prompt2 = [3, 4, 5, 6, 7, 8, 9, 10]
+    turn2 = (np.arange((10 - 1 - start) * NUM_LAYERS * TOP_K).reshape(-1, NUM_LAYERS, TOP_K) + 3) % NUM_EXPERTS
+    rr.record_routed_experts([SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = turn1)])])
+    def second(ids):
+        return SimpleNamespace(prompt_token_ids = ids, outputs = [SimpleNamespace(token_ids = [11, 12], routed_experts = turn2)])
+
+    # A same-call sibling with an unrouted prefix must not mask turn 1's rows.
+    rr.record_routed_experts([second(prompt2), second(prompt2)], prompt_starts = [start, start])
+    rows = rr._lookup(tuple(prompt2 + [11, 12]))
+    assert torch.equal(rows[:5].long(), torch.as_tensor(turn1).long())
+    if start == 6:
+        # Turn 1 never forwarded its last sampled token and turn 2 skipped it: natural routing.
+        assert torch.equal(rows[5].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[start:9].long(), torch.as_tensor(turn2).long())
+    assert torch.equal(rows[9].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    rr.record_routed_experts([second([1, 2, 3, 4, 5, 6, 7, 8])], prompt_starts = [start])
+    rows = rr._lookup((1, 2, 3, 4, 5, 6, 7, 8, 11, 12))
+    assert torch.equal(rows[:start].long(), torch.full((start, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[start:9].long(), torch.as_tensor(turn2).long())
+
+
+def test_prompt_start_prefix_keeps_conflicts_natural_and_ignores_older_rollouts(replay):
+    def capture(prompt, completion, routed):
+        return SimpleNamespace(prompt_token_ids = prompt, outputs = [SimpleNamespace(token_ids = completion, routed_experts = routed)])
+
+    def rows_of(value, n):
+        return np.stack([np.stack([np.arange(TOP_K) + value] * NUM_LAYERS)] * n) % NUM_EXPERTS
+
+    tail = rows_of(5, 2)
+    # Captures disagreeing on token 1 leave it natural, like _lookup.
+    rr.record_routed_experts([capture([1, 2], [3, 4], np.concatenate([rows_of(0, 1), rows_of(1, 1), rows_of(2, 1)]))])
+    rr.record_routed_experts([capture([1, 2], [3, 4], np.concatenate([rows_of(0, 1), rows_of(3, 1), rows_of(2, 1)]))])
+    rr.record_routed_experts([capture([1, 2, 3, 4, 9], [10], tail)], prompt_starts = [3])
+    rows = rr._lookup((1, 2, 3, 4, 9, 10))
+    assert torch.equal(rows[0].long(), torch.as_tensor(rows_of(0, 1)[0]).long())
+    assert torch.equal(rows[1].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[2].long(), torch.as_tensor(rows_of(2, 1)[0]).long())
+    # After a training forward the policy changed: an older rollout's routes are not reused.
+    rr._STATE.forwarded_since_record = True
+    rr.record_routed_experts([capture([1, 2, 3, 4, 9], [11], tail)], prompt_starts = [3])
+    rows = rr._lookup((1, 2, 3, 4, 9, 11))
+    assert torch.equal(rows[:3].long(), torch.full((3, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[3:5].long(), torch.as_tensor(tail).long())
+
+
 def test_rollout_split_into_many_generate_calls_is_kept_whole(replay):
     # generate_batches splits one rollout into several llm.generate calls before any training forward.
     model = _model()
@@ -714,8 +773,7 @@ def test_generate_without_training_keeps_bounded_routes(replay, monkeypatch):
 
 
 def test_recompute_with_several_same_shape_forwards_keeps_candidate_shapes():
-    # Three recorded forwards of one shape, each routing 5 tokens to 2 experts: the per-candidate
-    # agreement must reduce to one flag per candidate before it meets the per-candidate match.
+    # Three forwards of one shape, each routing 5 tokens to 2 experts: per-candidate agreement must reduce to one flag before the per-candidate match.
     ids2 = torch.randint(0, 8, (5, 2))
     fp = rr._fingerprint(ids2)
     replay = torch.randint(0, 8, (5, 2))

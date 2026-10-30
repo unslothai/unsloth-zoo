@@ -30,8 +30,10 @@ if HAS_FLEX_ATTENTION:
         is_flex_attention_decoding,
         flex_attention_with_sink_decoding,
         flex_attention_add_sinks,
+        flex_attention_with_sink_inference,
         flash_attention_left_padded,
     )
 else:
     old_flex_attention_with_sink = None
     flex_attention_with_sink = None
+    flex_attention_with_sink_inference = None

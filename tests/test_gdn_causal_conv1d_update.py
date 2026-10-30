@@ -60,6 +60,7 @@ def _rel(a, ref):
 @pytest.mark.parametrize("act", ["silu", None])
 def test_matches_reference(B, D, T, W, L, dtype, bias, act):
     x, state, w, b = _inputs(B, D, T, W, L, dtype, bias)
+    state_before = state.clone()  # both updates below advance their cache in place
     ref_state = state.clone()
     ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, act)
     ours = gcc.triton_causal_conv1d_update(x, state, w, b, act)
@@ -69,9 +70,9 @@ def test_matches_reference(B, D, T, W, L, dtype, bias, act):
     if dtype == torch.float32:
         torch.testing.assert_close(ours, ref, rtol = 1e-5, atol = 1e-5)
     else:
-        # Both accumulate in fp32 and round the conv output once; summation order and the SiLU
-        # formula differ by an ulp here and there, so judge both against an fp64 oracle.
-        oracle = gcc.causal_conv1d_update_reference(_to64(x), _to64(state.clone()), _to64(w), _to64(b), act)
+        # Both accumulate in fp32 and round once, but summation order and the SiLU formula differ by an ulp, so both are judged against an fp64 oracle.
+        oracle = gcc.causal_conv1d_update_reference(_to64(x), _to64(state_before), _to64(w), _to64(b), act)
+        assert _rel(ref, oracle) < 5e-3
         assert _rel(ours, ref) < 5e-3
         assert _rel(ours, oracle) <= max(1.25 * _rel(ref, oracle), 1e-3)
         assert (ours == ref).float().mean().item() > 0.7
@@ -189,6 +190,26 @@ def test_cached_launch_matches_reference_over_many_steps(monkeypatch, dtype):
 
 
 @requires_cuda
+def test_update_plan_cache_stays_bounded_over_batch_sizes(monkeypatch):
+    # Batch size and length are in the plan key: a long-running server must not grow it forever.
+    monkeypatch.setattr(gcc, "_update_plans", {})
+    monkeypatch.setattr(gcc, "_fast_launch_mode", None)
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    monkeypatch.setattr(gcc, "_UPDATE_PLANS_MAX", 8, raising = False)
+    sizes = []
+    for B in range(1, 25):
+        x, state, w, b = _inputs(B, 64, 1, 4, 4, torch.bfloat16, True)
+        ref_state = state.clone()
+        ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, "silu")
+        ours = gcc._try_fast_update(x, state, w, b, "silu")
+        assert ours is not None and torch.equal(state, ref_state)
+        assert _rel(ours, ref) < 5e-3
+        sizes.append(len(gcc._update_plans))
+    assert max(sizes) <= 8
+
+
+@requires_cuda
 def test_unaligned_and_uncached_paths(monkeypatch):
     monkeypatch.setattr(gcc, "_update_plans", {})
     monkeypatch.setattr(gcc, "_fast_launch_mode", False)  # a Triton whose launcher did not check out
@@ -250,8 +271,8 @@ def test_counters_untouched_while_tracing(monkeypatch):
 
 
 def test_legacy_module_globals_rebound():
-    # transformers 4.57.6 qwen3_next: module global None unless the package imported, and the
-    # layer copies `causal_conv1d_update or torch_causal_conv1d_update` at __init__.
+    # transformers 4.57.6 qwen3_next: module global is None unless the package is imported; the layer copies
+    # causal_conv1d_update or torch_causal_conv1d_update at __init__.
     legacy = types.ModuleType("transformers.models.qwen3_next.modeling_qwen3_next")
     legacy.causal_conv1d_fn = None
     legacy.causal_conv1d_update = None
@@ -389,8 +410,7 @@ def test_tiny_qwen3_5_cached_decode_matches_full_forward(hub_kernels, monkeypatc
 
 @requires_cuda
 def test_tiny_qwen3_next_cached_decode_matches_full_forward(monkeypatch):
-    # Qwen3-Next on any transformers: 4.57.6 rebinds the module global the layer copies at
-    # __init__, 5.x goes through the hub decorator.
+    # Qwen3-Next on any transformers: 4.57.6 rebinds the module global the layer copies at __init__; 5.x goes through the hub decorator.
     pytest.importorskip("triton")
     modeling = pytest.importorskip("transformers.models.qwen3_next.modeling_qwen3_next")
     from transformers import Qwen3NextConfig, Qwen3NextForCausalLM
@@ -435,9 +455,8 @@ def test_tiny_qwen3_next_cached_decode_matches_full_forward(monkeypatch):
 
 @requires_cuda
 def test_cuda_graph_capture_after_one_warmup(monkeypatch):
-    # One eager decode step builds the plan, so the captured step is the first cached launch. Its
-    # self-check would read a verdict back on the host and invalidate the capture: it must take
-    # the full launch inside the graph and leave the check to the next eager step.
+    # One eager decode step builds the plan; the captured step must take the full launch, since its self-check would
+    # sync the host and break capture; the check moves to the next eager step.
     if not gcc._triton_launcher_verified():
         pytest.skip("cached launcher needs Triton 3.6+")
     monkeypatch.setattr(gcc, "_update_plans", {})

@@ -652,6 +652,11 @@ def chunk_bwd_dv(
     # H100 can have larger block size
     if check_shared_mem('hopper', k.device.index):
         CONST_TILING = 128
+    # Unsloth: backported from fla PR #1514. A100-class (164 KB smem) fits 128-wide tiles
+    # when every loaded tensor is 16-bit (fp32 inputs / fp32 GLA states keep 64).
+    elif check_shared_mem('ampere', k.device.index):
+        is_16bit = all(x.element_size() == 2 for x in (q, k, do, dh) if x is not None)
+        CONST_TILING = 128 if is_16bit else 64
     elif check_shared_mem('ada', k.device.index):
         CONST_TILING = 64
     else:
@@ -708,6 +713,11 @@ def chunk_bwd_dv_local(
     # H100 can have larger block size
     if check_shared_mem('hopper', k.device.index):
         CONST_TILING = 128
+    # Unsloth: backported from fla PR #1514. A100-class (164 KB smem) fits 128-wide tiles
+    # when every loaded tensor is 16-bit (fp32 inputs / fp32 GLA states keep 64).
+    elif check_shared_mem('ampere', k.device.index):
+        is_16bit = all(x.element_size() == 2 for x in (q, k, do, A) if x is not None)
+        CONST_TILING = 128 if is_16bit else 64
     elif check_shared_mem('ada', k.device.index):
         CONST_TILING = 64
     else:
@@ -767,6 +777,11 @@ def chunk_bwd_dqkwg(
 
     if check_shared_mem('hopper', k.device.index):
         CONST_TILING = 128
+    # Unsloth: backported from fla PR #1514. A100-class (164 KB smem) fits 128-wide tiles
+    # when every loaded tensor is 16-bit (fp32 inputs / fp32 GLA states keep 64).
+    elif check_shared_mem('ampere', k.device.index):
+        is_16bit = all(x.element_size() == 2 for x in (q, k, v, do, h, dh, w, dv) if x is not None)
+        CONST_TILING = 128 if is_16bit else 64
     elif check_shared_mem('ada', k.device.index):
         CONST_TILING = 64
     else:

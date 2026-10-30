@@ -78,9 +78,8 @@ def _grads(model):
 
 
 def test_recompute_replays_forwards_with_equal_natural_routes_but_different_replays(replay):
-    # Two different sequences whose first layer routes every token identically, replayed to
-    # different experts: the recompute must replay each forward's own routes, so checkpointed
-    # gradients equal the plain ones.
+    # Two sequences whose first layer routes every token identically but replay to different experts: each recompute
+    # must replay its own forward's routes, so grads equal plain.
     model = _model()
     batch = torch.randint(1, 64, (1024, 2), generator = torch.Generator().manual_seed(749))
     captured = {}
@@ -129,8 +128,7 @@ def test_recompute_replays_forwards_with_equal_natural_routes_but_different_repl
 
 
 def test_nonreentrant_recompute_of_a_natural_forward_adds_no_ops(replay):
-    # No rollout matches, so the forward keeps its natural routing. The non-reentrant checkpoint
-    # recompute must run the same ops, or torch raises a CheckpointError.
+    # With no rollout match the forward keeps natural routing; the non-reentrant checkpoint recompute must run the same ops or torch raises CheckpointError.
     model = _model()
     model.train()
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
@@ -141,8 +139,7 @@ def test_nonreentrant_recompute_of_a_natural_forward_adds_no_ops(replay):
 
 
 def test_unnormalised_router_is_never_read_as_renormalised(replay):
-    # norm_topk_prob=False, but the natural top-k mass is ~1: the weights of forced experts must
-    # stay plain softmax probabilities, not be renormalised to sum to one.
+    # With norm_topk_prob=False the natural top-k mass is ~1, so forced experts' weights must stay plain softmax probabilities, not be renormalised.
     from transformers import Qwen3MoeConfig
 
     config = Qwen3MoeConfig(hidden_size = 4, num_experts = 4, num_experts_per_tok = 2, norm_topk_prob = False)
@@ -160,8 +157,7 @@ def test_unnormalised_router_is_never_read_as_renormalised(replay):
 
 
 def test_compact_moe_rows_map_to_their_decoder_layers(replay):
-    # vLLM 0.21 numbers routed experts by MoE layer only (moe_layer_id), so a model with a dense
-    # first layer returns [tokens, 2, k] for decoder layers 1 and 2.
+    # vLLM 0.21 numbers routed experts by MoE layer only (moe_layer_id): a dense first layer gives [tokens, 2, k] rows for decoder layers 1 and 2.
     model = _model(num_layers = 3, mlp_only_layers = [0])
     prompt, completion = [5, 6, 7], [9, 10, 11]
     ids = prompt + completion
@@ -199,8 +195,7 @@ def test_compact_moe_rows_map_to_their_decoder_layers(replay):
 
 
 def test_input_signature_tells_apart_inputs_with_equal_token_sums():
-    # Zero-centred router inputs (LayerNorm) give every token the same sum, so a sum cannot tell
-    # two forwards apart; the projections must, and must repeat bit for bit on identical inputs.
+    # Every token gets the same sum, so projections must tell forwards apart and repeat bit for bit.
     torch.manual_seed(0)
     a = torch.randn(5, 32)
     a = a - a.mean(-1, keepdim = True)
@@ -225,8 +220,8 @@ def test_input_signature_stays_fp32_under_autocast():
 
 
 def test_softmax_renorm_survives_underflowed_forced_experts():
-    # Forced experts with logits ~200 below the natural top-k underflow in a full-vocab softmax:
-    # gather-then-renormalise gave 0 / 0 = NaN. Softmax over the gathered logits is the same function.
+    # Forced experts with logits ~200 below the natural top-k underflow in a full-vocab softmax, so
+    # gather-then-renormalise gave 0 / 0 = NaN; softmax over gathered logits is the same function.
     logits = torch.tensor([[200.0, 199.0, 0.0, -1.0], [1.0, 2.0, 0.5, -0.3]], requires_grad = True)
     ids = torch.tensor([[2, 3], [1, 2]])
     got = rr._formulas()["softmax_renorm"](logits, ids)
@@ -236,3 +231,79 @@ def test_softmax_renorm_survives_underflowed_forced_experts():
     torch.testing.assert_close(got[1].double(), ref / ref.sum(), rtol = 1e-6, atol = 1e-7)
     got.sum().backward()
     assert torch.isfinite(logits.grad).all()
+
+
+class _TinyTopKRouter(torch.nn.Module):
+    norm_topk_prob = True
+
+    def forward(self, x):
+        logits = x.reshape(-1, 4)
+        w, idx = logits.softmax(-1).topk(2, -1)
+        return logits, w / w.sum(-1, keepdim = True), idx
+
+
+class _TinyBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.router = _TinyTopKRouter()
+
+    def forward(self, x):
+        _, w, idx = self.router(x)
+        return x * (w * (idx.to(w.dtype) + 1)).sum(-1).reshape(x.shape[:-1] + (1,))
+
+
+class _TinyDecoder(torch.nn.Module):
+    def __init__(self, checkpointing):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(300, 4)
+        self.layers = torch.nn.ModuleList([_TinyBlock()])
+        self.gradient_checkpointing = checkpointing
+
+    def forward(self, input_ids = None):
+        x = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant = True) if self.gradient_checkpointing else layer(x)
+        return x
+
+
+class _TinyModel(torch.nn.Module):
+    def __init__(self, checkpointing):
+        super().__init__()
+        self.model = _TinyDecoder(checkpointing)
+
+    def forward(self, input_ids = None):
+        return self.model(input_ids = input_ids)
+
+
+def _many_forwards_grad(n, checkpointing):
+    torch.manual_seed(17)
+    m = _TinyModel(checkpointing)
+    m.train()
+    rr.reset_routing_replay()
+    rr.install_routing_replay(m)
+    requests = []
+    for i in range(n):
+        ids = [2 * i + 1, 2 * i + 2]
+        natural = m.model.embed_tokens(torch.tensor(ids)).topk(2, -1).indices
+        forced = (natural + (i % 3) + 1) % 4
+        out = SimpleNamespace(token_ids = ids[1:], routed_experts = forced[:1, None, :])
+        requests.append(SimpleNamespace(prompt_token_ids = ids[:1], outputs = [out]))
+    rr.record_routed_experts(requests)
+    losses = [m(input_ids = torch.tensor([[2 * i + 1, 2 * i + 2]])).square().mean() for i in range(n)]
+    sum(losses).backward()
+    stats = rr.routing_replay_stats()
+    assert stats["router_calls_replayed"] >= n and stats["router_calls_recomputed"] == (n if checkpointing else 0)
+    return m.model.embed_tokens.weight.grad
+
+
+def test_more_than_64_checkpointed_forwards_before_backward_keep_their_replays(replay):
+    # Each chunk's recompute must find its own forward's replay.
+    plain = _many_forwards_grad(65, checkpointing = False)
+    checkpointed = _many_forwards_grad(65, checkpointing = True)
+    torch.testing.assert_close(checkpointed, plain, rtol = 0, atol = 0)
+
+
+def test_evicting_a_pending_forward_warns(replay, monkeypatch):
+    monkeypatch.setattr(rr, "_MAX_PENDING", 4)
+    with pytest.warns(UserWarning, match = "checkpointed forwards without a backward"):
+        _many_forwards_grad(5, checkpointing = True)

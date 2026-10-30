@@ -91,13 +91,15 @@ def setup(monkeypatch):
     return monkeypatch
 
 
-def _experts(dtype, num_experts = 4, hidden = 16, intermediate = 8):
+def _experts(dtype, num_experts = 4, hidden = 16, intermediate = 16):
     torch.manual_seed(0)
     experts = nn.Module()
     experts.num_experts = num_experts
     experts.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * intermediate, hidden).to(dtype))
     experts.down_proj = nn.Parameter(torch.randn(num_experts, hidden, intermediate).to(dtype))
     experts.act_fn = F.silu
+    # Dims must be multiples of 16, else forward_triton_grouped_gemm routes to the native fallback (ref 2057) and these tests stop reaching the Triton path.
+    assert moe_utils._triton_grouped_gemm_dims_supported(experts, hidden)
     return experts
 
 

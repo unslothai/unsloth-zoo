@@ -22,9 +22,7 @@ __all__ = [
 
 def stateless_init_process_group(master_address, master_port, rank, world_size,
                                  device):
-    """Init NCCL data-plane comms between train processes and vLLM workers via
-    vLLM's `StatelessProcessGroup` (avoids the global torch.distributed group).
-    """
+    """Init NCCL data-plane comms between train and vLLM worker processes via vLLM's StatelessProcessGroup, avoiding the global torch.distributed group."""
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.utils import StatelessProcessGroup
     pg = StatelessProcessGroup.create(host=master_address,
@@ -36,11 +34,7 @@ def stateless_init_process_group(master_address, master_port, rank, world_size,
 
 
 class WorkerExtension:
-    """Mixin for vLLM's worker (compatible with V0 and V1).
-
-    Lives in a separate module; pass its fully qualified name as the
-    `worker_extension_cls` argument.
-    """
+    """Mixin for vLLM's worker (V0 and V1); lives in a separate module, pass its fully qualified name as worker_extension_cls."""
 
     def init_weight_update_group(self, master_address, master_port,
                                  rank_offset, world_size):
@@ -74,11 +68,7 @@ class WorkerExtension:
 
 
 class ColocateWorkerExtension:
-    """Mixin for vLLM's worker in the colocate setting (compatible with V0 and V1).
-
-    Lives in a separate module; pass its fully qualified name as the
-    `worker_extension_cls` argument.
-    """
+    """Colocate-setting mixin for vLLM's worker (V0 and V1); lives in a separate module, pass its fully qualified name as worker_extension_cls."""
 
     def report_device_id(self) -> str:
         from vllm.platforms import current_platform
@@ -92,8 +82,7 @@ class ColocateWorkerExtension:
         for name, handle in handles.items():
             func, args = handle
             list_args = list(args)
-            # Remap to the current device id in case two processes have
-            # different CUDA_VISIBLE_DEVICES.
+            # Remap to the current device id, since two processes can have different CUDA_VISIBLE_DEVICES.
             list_args[6] = device_id
             tensor = func(*list_args)
             weights.append((name, tensor))
@@ -111,7 +100,6 @@ class ColocateWorkerExtension:
             vllm_loras_A .append(v_layer.self_attn.qkv_proj.lora_a_stacked[1])
             vllm_loras_A .append(v_layer.self_attn.qkv_proj.lora_a_stacked[2])
 
-            # parameters.append((name, param))
         torch.cuda.synchronize()
         return vllm_loras_A
 
@@ -128,7 +116,6 @@ class ColocateWorkerExtension:
         data = {}
         vllm_model = self.model_runner.model
         for name, p in vllm_model.named_parameters():
-            # Assumes all training actors hold the full weights (a real setup
-            # may hold a subset and need to all-gather across actors).
+            # Assumes every training actor holds the full weights; a setup holding only a subset would need to all-gather across actors.
             data[name] = reduce_tensor(p.detach())
         return {self.device_uuid: data}

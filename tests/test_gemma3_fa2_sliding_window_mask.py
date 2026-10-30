@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma3 sliding layers keep their window when FA2 hands the patched SDPA forward
-attention_mask=None. Reference: the same forward under "sdpa", where transformers
-builds the 4D sliding mask."""
+"""Gemma3 sliding layers keep their window when FA2 passes attention_mask=None to the patched SDPA forward; the
+reference is the same forward under sdpa, which builds the 4D mask."""
 
 import pytest
 import torch

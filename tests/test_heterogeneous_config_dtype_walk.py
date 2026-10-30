@@ -1,33 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""A heterogeneous config must not kill the dtype walk in patch_model_and_tokenizer.
-
-Observed on real hardware, not constructed here: `unsloth/gemma-4-E2B-it` on
-transformers 5.15.1 with unsloth 2026.8.20 fails to load AT ALL, on a Tesla T4,
-before a single weight is touched:
-
-    File "unsloth_zoo/patching_utils.py", line 467, in __fix_dtype
-        __fix_dtype(getattr(config, key, None))
-    File "transformers/integrations/heterogeneity/configuration_utils.py", line 298
-        raise AmbiguousGlobalPerLayerAttributeError(
-    AmbiguousGlobalPerLayerAttributeError: 'head_dim' is a per-layer attribute
-    and may vary across layers.
-
-`__fix_dtype` walks every key `config.to_dict()` reports, looking for nested
-config objects that carry a dtype. From transformers 5.15, a MatFormer or other
-heterogeneous config raises straight out of `PretrainedConfig.__getattribute__`
-for any attribute that varies per layer -- so a key `to_dict()` itself just
-listed cannot be read back.
-
-The reason it is fatal rather than skipped is a detail worth stating, because
-the code LOOKS defensive: `getattr(config, key, None)` has a default, and a
-default only suppresses `AttributeError`. `AmbiguousGlobalPerLayerAttributeError`
-is not one, so it propagates through the whole load.
-
-Fully synthetic and CPU-only: the failure is a property of attribute access, so
-reproducing it needs neither gemma-4 nor a GPU nor transformers 5.15.
-"""
+"""A heterogeneous config must not kill the dtype walk in patch_model_and_tokenizer: transformers 5.15 raises
+AmbiguousGlobalPerLayerAttributeError, which getattr's default does not catch (seen loading unsloth/gemma-4-E2B-it on
+transformers 5.15.1); CPU-only synthetic test."""
 
 import sys
 import types
@@ -37,18 +13,11 @@ import torch
 
 
 class AmbiguousGlobalPerLayerAttributeError(Exception):
-    """Stands in for the transformers exception. Deliberately NOT an
-    AttributeError, which is the entire reason the original getattr default
-    does not catch it."""
+    """Stands in for the transformers exception; deliberately not an AttributeError, so the getattr default in the walk does not catch it."""
 
 
 class _HeterogeneousConfig:
-    """A config whose to_dict() lists a key that cannot be read back.
-
-    This is the shape transformers 5.15 gives a MatFormer: `head_dim` appears
-    in the serialised dict because it has a global value, and reading it
-    through the attribute path raises because it varies per layer.
-    """
+    """Config whose to_dict() lists head_dim (a transformers 5.15 MatFormer shape): a global value is serialised, but reading it raises because it varies per layer."""
 
     def __init__(self, **kw):
         self._data = dict(kw)
@@ -75,13 +44,7 @@ class _HeterogeneousConfig:
 
 
 def _fix_dtype_walk(config, correct_dtype):
-    """The production walk, extracted so it can be driven without a model.
-
-    Imported from the module rather than copied: a copy would let the two drift
-    and this test would then be guarding a fiction. `patch_model_and_tokenizer`
-    defines `__fix_dtype` as a closure, so the walk is re-expressed here with
-    the SAME structure and the fix is asserted against the real source below.
-    """
+    """Re-expresses the __fix_dtype closure from patch_model_and_tokenizer so it runs without a model; the fix is asserted against the real source separately."""
     if not hasattr(config, "to_dict"):
         return
     for key in config.to_dict():
@@ -96,8 +59,7 @@ def _fix_dtype_walk(config, correct_dtype):
 
 
 def test_the_unfixed_walk_dies_on_a_heterogeneous_config():
-    """The bug, reproduced. Shown first so the fix below is measured against a
-    failure that genuinely happens rather than against nothing."""
+    """Reproduces the bug first, so the fix is measured against a failure that genuinely happens rather than against nothing."""
 
     def unfixed(config, correct_dtype):
         if not hasattr(config, "to_dict"):
@@ -114,18 +76,14 @@ def test_the_unfixed_walk_dies_on_a_heterogeneous_config():
 
 
 def test_the_fixed_walk_survives_and_still_corrects_the_dtype():
-    """Both halves matter. Surviving while silently skipping the dtype would be
-    the same class of bug wearing a different hat: the load would succeed and
-    the model would carry bfloat16 on a card that has no bfloat16."""
+    """The walk must both survive and still correct the dtype: skipping it silently would leave the model in bfloat16 on a card without bfloat16 support."""
     config = _HeterogeneousConfig(head_dim = 256, dtype = torch.bfloat16, num_layers = 4)
     _fix_dtype_walk(config, torch.float16)
     assert config.to_dict()["dtype"] is torch.float16
 
 
 def test_a_nested_config_is_still_reached():
-    """The walk exists to descend. A fix that swallowed too much -- catching
-    around the recursion rather than around the read -- would stop descending
-    at the first awkward key and leave nested dtypes wrong."""
+    """The walk must still descend into nested configs; catching around the recursion instead of the read would stop at the first awkward key."""
     inner = _HeterogeneousConfig(dtype = torch.bfloat16)
     outer = _HeterogeneousConfig(head_dim = 256, vision_config = inner, dtype = torch.bfloat16)
     _fix_dtype_walk(outer, torch.float16)
@@ -141,13 +99,7 @@ def test_an_ordinary_config_is_unaffected():
 
 
 def test_the_production_source_guards_the_read_and_not_the_recursion():
-    """Asserted against the shipped file, because the walk above is a
-    re-expression and a re-expression can be fixed while the product is not.
-
-    Specifically: the try must wrap the `getattr`, and the recursion must sit
-    OUTSIDE it. A try around both would swallow errors raised deeper in the
-    walk, turning a real failure into a silent skip.
-    """
+    """Checks the shipped source, not the re-expression: the try must wrap only the getattr, with the recursion outside it, so deeper errors are not swallowed."""
     import inspect
 
     from unsloth_zoo import patching_utils

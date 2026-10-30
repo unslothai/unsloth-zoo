@@ -14,10 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""requires_grad_for_gradient_checkpointing rebuilds a module's hook dict to drop older requires-grad
-hooks; the hooks it keeps must keep their with_kwargs registration. A pre-hook registered with
-with_kwargs = True (Unsloth's inputs_embeds hook on every PreTrainedModel) re-registered without it is
-called with two arguments on the next forward: TypeError (Qwen3-VL / Qwen3.5 vision towers)."""
+"""requires_grad_for_gradient_checkpointing drops older requires-grad hooks but must keep with_kwargs = True
+registration; re-registering Unsloth's inputs_embeds pre-hook without it makes the next forward raise TypeError
+(Qwen3-VL / Qwen3.5 vision towers)."""
 
 import torch
 

@@ -14,12 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MoE backward without full-size copies, checked against an fp32 per-expert reference.
+"""MoE backward avoids full-size copies, checked against an fp32 per-expert reference: transposed frozen stack passed as
+a view, fp32 bias-grad sums, dW in its own layout."""
 
-1. _GroupedMMRecompute.backward hands the transposed frozen stack to the grouped GEMM as a view.
-2. Trainable expert biases: the gather's backward sums in fp32 (one-hot GEMM) instead of a 16-bit index_add_.
-3. A transposed trainable stack gets dW in its own layout, so AccumulateGrad does not copy it.
-"""
+import contextlib
 
 import pytest
 import torch
@@ -37,6 +35,25 @@ needs_kernel = pytest.mark.skipif(
 )
 DT = torch.bfloat16
 ALPHA, LIMIT = 1.702, 7.0
+
+
+@contextlib.contextmanager
+def _no_blas_workspace():
+    """torch 2.15 binds a fresh cuBLAS workspace per GEMM (no warm-up avoids it); size 0 keeps it out of the peak."""
+    b = torch.backends.cuda
+    if not hasattr(b, "cublaslt_workspace_size"):  # older torch: cached per handle, the warm-up already paid for it
+        yield
+        return
+    old = b.cublas_workspace_size(), b.cublaslt_workspace_size()
+    b.cublaslt_workspace_size(0)
+    b.cublas_workspace_size(0)
+    try:
+        yield
+    finally:
+        b.cublas_workspace_size(old[0])
+        b.cublaslt_workspace_size(old[1])
+
+
 _ENV = ("UNSLOTH_MOE_GROUPED_TRITON", "UNSLOTH_DISABLE_MOE_TRITON", "UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS",
         "UNSLOTH_MOE_RECOMPUTE", "UNSLOTH_MOE_SELECTIVE_DEQUANT")
 
@@ -369,20 +386,48 @@ def test_expert_bias_gather_chunks_bound_one_hot(monkeypatch):
     ids = torch.randint(0, E, (M,), generator = gen).sort().values.cuda()
     bias = (torch.randn(E, D, generator = gen) * 0.02).to("cuda", DT).requires_grad_(True)
     g = torch.randn(M, D, generator = gen).to("cuda", DT)
-    mu._gather_expert_bias(bias, ids).backward(g)  # cuBLAS workspace
+    mu._gather_expert_bias(bias, ids).backward(g)  # cuBLAS workspace (torch < 2.15 caches it per handle)
     bias.grad = None
     out = mu._gather_expert_bias(bias, ids)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.memory_allocated()
-    out.backward(g)
-    torch.cuda.synchronize()
+    with _no_blas_workspace():
+        out.backward(g)
+        torch.cuda.synchronize()
     extra = torch.cuda.max_memory_allocated() - before
     # unchunked: 25 MB (bool + bf16 one-hot); chunked: 5 MB
     assert extra < 8 * 2**20, extra
     want = torch.zeros(E, D, dtype = torch.float64, device = "cuda").index_add_(0, ids, g.double())
     assert bias.grad.dtype == DT
     assert _rel(bias.grad, want) < 4e-3, _rel(bias.grad, want)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks = pytest.mark.skipif(not CUDA, reason = "needs CUDA"))])
+def test_expert_bias_gather_grad_stays_fp32_under_fp16_autocast(device):
+    """fp32 biases under fp16 autocast: the per-expert sum (131072 here) must not round to fp16 and overflow."""
+    E, D, M = 4, 8, 128
+    ids = torch.zeros(M, dtype = torch.long, device = device)
+    bias = torch.zeros(E, D, device = device, requires_grad = True)
+    g = torch.full((M, D), 1024.0, device = device)
+    with torch.autocast(device_type = device, dtype = torch.float16):
+        out = mu._gather_expert_bias(bias, ids)
+        out.backward(g)
+    assert bias.grad.dtype == torch.float32
+    assert torch.isfinite(bias.grad).all(), bias.grad
+    assert torch.equal(bias.grad[0], torch.full((D,), float(M * 1024), device = device))
+    assert torch.equal(bias.grad[1:], torch.zeros(E - 1, D, device = device))
+
+    if device == "cuda":
+        # Compiled backward replays the forward's autocast state ("same_as_forward" on torch 2.11+).
+        torch._dynamo.reset()
+        bias.grad = None
+        f = torch.compile(lambda b, i: mu._gather_expert_bias(b, i).float(), fullgraph = True)
+        with torch.autocast(device_type = device, dtype = torch.float16):
+            out = f(bias, ids)
+        out.backward(g)
+        assert torch.isfinite(bias.grad).all(), bias.grad
+        assert torch.equal(bias.grad[0], torch.full((D,), float(M * 1024), device = device))
 
 
 _BIAS_DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
@@ -482,3 +527,49 @@ def test_expert_bias_gather_long_backward_is_reproducible(path, dtype, monkeypat
         torch._dynamo.reset()
     assert all(torch.equal(grads[0], x) for x in grads[1:])
     assert _rel(grads[0], want) < (1e-3 if dtype == torch.float16 else 5e-3), _rel(grads[0], want)
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids = ["static", "dynamic"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_expert_bias_gather_compiled_upcast_caps_the_fp32_copy(dtype, dynamic, monkeypatch):
+    """Compiled upcast fallback (CPU, ROCm, XPU, CUDA torch < 2.9) caps each fp32 grad copy to one chunk, not rows x
+    width; bias grad is bitwise the eager chunked one."""
+    if not hasattr(torch.library, "custom_op"):
+        pytest.skip("torch.library.custom_op unavailable")
+    monkeypatch.setattr(mu, "_MM_OUT_DTYPE", False, raising = False)
+    E, D = 16, 96
+    monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", 1 << 12)
+    cap = (1 << 12) // max(E, D)
+    upcast_rows = []
+    real_one_hot_mm = mu._one_hot_mm_fp32
+
+    def recording_one_hot_mm(one_hot, grad):
+        # Only real (eager) upcasts count: an in-graph upcast is the uncapped rows x width copy.
+        if grad.dtype != torch.float32 and not torch.compiler.is_compiling():
+            upcast_rows.append(grad.shape[0])
+        return real_one_hot_mm(one_hot, grad)
+
+    monkeypatch.setattr(mu, "_one_hot_mm_fp32", recording_one_hot_mm)
+
+    def f(bias, ids, base):
+        return base + mu._gather_expert_bias(bias, ids)
+
+    def run(fn, M, seed):
+        gen = torch.Generator().manual_seed(seed)
+        ids = torch.randint(0, E, (M,), generator = gen).sort().values
+        g = (torch.randn(M, D, generator = gen) * 64).to(dtype)
+        base = torch.zeros(M, D, dtype = dtype)
+        bias = torch.zeros(E, D, dtype = dtype, requires_grad = True)
+        fn(bias, ids, base).backward(g)
+        return bias.grad
+
+    torch._dynamo.reset()
+    compiled = torch.compile(f, fullgraph = True, dynamic = dynamic)
+    try:
+        for M, seed in ((40 * cap + 7, 0), (23 * cap + 3, 1)):
+            upcast_rows.clear()
+            got = run(compiled, M, seed)
+            assert upcast_rows and max(upcast_rows) <= cap, (cap, upcast_rows[:4])
+            assert torch.equal(got, run(f, M, seed))
+    finally:
+        torch._dynamo.reset()

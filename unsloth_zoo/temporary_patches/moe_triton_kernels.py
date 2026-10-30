@@ -45,6 +45,10 @@ def _probe_triton() -> bool:
         return False
 
 
+# Probed at import: a compiled frame that read _TRITON as None would recompile once a later eager call cached it.
+_TRITON = _probe_triton()
+
+
 def moe_triton_kernels_available(device = None) -> bool:
     global _TRITON
     if _DISABLED_REASON is not None or os.environ.get("UNSLOTH_MOE_TRITON_KERNELS", "1") == "0":
@@ -74,7 +78,11 @@ def _disable(where, exc):
     global _DISABLED_REASON
     # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion.
     if isinstance(exc, _autograd_control_flow_errors()):
-        raise exc
+        try:
+            raise exc
+        finally:
+            # exc's traceback holds this frame: keeping exc here is a cycle that pins the failed call's tensors.
+            del exc
     _DISABLED_REASON = f"{where}: {type(exc).__name__}: {exc}"
     logger.warning(
         "Unsloth: the Triton MoE kernels failed to compile or launch and are disabled "
