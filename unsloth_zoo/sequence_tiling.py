@@ -92,7 +92,7 @@ def _checkpoint(fn, args, preserve_rng_state):
             fn, *args, use_reentrant = False, preserve_rng_state = preserve_rng_state,
         )
     return _torch_checkpoint_fn()(
-        functools.partial(_replay_tile, fn, _gc_recompute_flag()), *args,
+        functools.partial(_replay_tile, fn, _tile_gc_flag()), *args,
         use_reentrant = False, preserve_rng_state = preserve_rng_state,
     )
 pass
@@ -107,20 +107,22 @@ def _gc_tls():
 pass
 
 
-def _gc_recompute_flag():
-    tls = _gc_tls()
-    return None if tls is None else bool(getattr(tls, "active", False))
+def _tile_gc_flag():
+    # Inside a tile, both runs read "not in a checkpoint recompute": a tile's own recompute is immediately followed
+    # by its backward, so the MoE policy's rebuild path costs one tile, while pinning in every tile replay raised the
+    # eager OLMoE 8k peak by 2.5 GiB on G4. None when the flag is unavailable (nothing to pin).
+    return None if _gc_tls() is None else False
 pass
 
 
 def _replay_tile(fn, gc_flag, *args):
-    """One eager tile, with the state that picks code paths inside it pinned to what the tile's forward saw.
+    """One eager tile, with the state that picks code paths inside it the same for the forward and the recompute.
 
     Non-reentrant checkpoint requires the recompute to save the same tensors as the forward. Under Unsloth's outer
     gradient checkpointing, a tile's forward runs inside the outer recompute (in_gradient_checkpoint_recompute() is
     True) but its own recompute runs later in backward (False). Unsloth's MoE kernels read that flag to pin or rebuild
     the dequantized expert stack, which saves a different number of tensors, so backward raised CheckpointError
-    (OLMoE: 23 saved in forward, 21 in recompute). The flag is set to the forward's value for both runs.
+    (OLMoE: 29 saved in forward, 27 in recompute). Both runs see the same value (see _tile_gc_flag).
     """
     tls = _gc_tls() if gc_flag is not None else None
     previous = getattr(tls, "active", False) if tls is not None else None
@@ -215,10 +217,13 @@ def tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = 
     n_tiles = int(n_tiles)
     if n_tiles <= 1:
         return fn(x, *token_args)
-    if _is_compiling() and _run_tiles_outside_graph():
-        return _tiled_call_eager(
-            fn, x, *token_args, n_tiles = n_tiles, needs_rng = needs_rng, output_contract = output_contract,
-        )
+    if _is_compiling():
+        mode = _outside_graph_mode()
+        if mode != "unroll":
+            return _tiled_call_eager(
+                fn, x, *token_args, n_tiles = n_tiles, needs_rng = needs_rng, output_contract = output_contract,
+                compile_tile = mode == "compile_tile",
+            )
     lead = x.shape[:-1]
     if x.dim() == 2:
         flat, dim = x, 0
@@ -315,33 +320,56 @@ pass
 _ENV_COMPILE = "UNSLOTH_TILED_COMPILE"
 
 
-def _run_tiles_outside_graph():
-    """Whether a compiled caller leaves the tile loop to eager code (one graph break at tiled_call) instead of
-    unrolling one checkpoint per tile into its graph.
+def _outside_graph_mode():
+    """How a compiled caller runs the tile loop: "unroll" (one checkpoint per tile inside its graph), "compile_tile"
+    (one graph break at tiled_call; an eager loop runs every tile through one shared compiled tile body) or "break"
+    (the same loop with eager tiles).
 
-    Unrolling costs compile time linear in the tile count (G4: about 1.1 s per tile, 440 s for a cold step at 192k)
-    for a few percent of steady-state speed, so the loop leaves the graph wherever a break is legal: inside
-    Unsloth's per-layer compiled blocks (fullgraph=False). A user's own torch.compile may be fullgraph=True, where a
-    break is an error, so it keeps the unrolled loop. UNSLOTH_TILED_COMPILE = break | unroll forces either.
+    Unrolling costs compile time linear in the tile count (G4: about 1.1 s per tile, 440 s for a cold step at 192k),
+    so inside Unsloth's per-layer compiled blocks (fullgraph=False, where a break is legal) the loop leaves the graph
+    and the tile body is compiled once with dynamic rows, shared by every tile and layer. A user's own
+    torch.compile may be fullgraph=True, where a break is an error, so it keeps the unrolled loop.
+    UNSLOTH_TILED_COMPILE = unroll | compile_tile | break forces a mode.
     """
     mode = os.environ.get(_ENV_COMPILE, "auto").strip().lower()
-    if mode == "break":
-        return True
-    if mode == "unroll":
-        return False
+    if mode in ("unroll", "compile_tile", "break"):
+        return mode
     block = sys.modules.get("unsloth.models._block_compile")
     flag = getattr(block, "_IN_COMPILED_REGION", None)
-    return bool(flag) and bool(flag[0])
+    return "compile_tile" if (bool(flag) and bool(flag[0])) else "unroll"
 pass
 
 
-def _tiled_call_eager_impl(fn, x, *token_args, n_tiles, needs_rng, output_contract):
+def _call_tile(func, *args, **kwargs):
+    return func(*args, **kwargs)
+pass
+
+
+_COMPILED_TILE = [None]
+
+
+def _compiled_tile_fn(fn):
+    """fn with its body run through one torch.compile'd frame shared by every tile and layer. A functools.partial
+    is unpacked so its module argument is a graph input (no per-layer guard on the module's identity)."""
+    if _COMPILED_TILE[0] is None:
+        _COMPILED_TILE[0] = torch.compile(_call_tile, dynamic = True)
+    compiled = _COMPILED_TILE[0]
+    if isinstance(fn, functools.partial):
+        func, bound, keywords = fn.func, fn.args, fn.keywords or {}
+        return lambda *tile_args: compiled(func, *bound, *tile_args, **keywords)
+    return lambda *tile_args: compiled(fn, *tile_args)
+pass
+
+
+def _tiled_call_eager_impl(fn, x, *token_args, n_tiles, needs_rng, output_contract, compile_tile):
+    if compile_tile:
+        fn = _compiled_tile_fn(fn)
     return tiled_call(fn, x, *token_args, n_tiles = n_tiles, needs_rng = needs_rng, output_contract = output_contract)
 pass
 
 
-# The eager tile loop runs each tile under the eager checkpoint; code compiled inside a tile compiles with dynamic
-# rows from its first call (_dynamic_inner_compiles), so one graph serves every tile.
+# Leaves the caller's graph; inside, the tile loop is eager and each tile runs under the eager checkpoint. Code
+# compiled inside a tile compiles with dynamic rows from its first call (_dynamic_inner_compiles).
 _tiled_call_eager = torch.compiler.disable(_tiled_call_eager_impl, recursive = True)
 
 

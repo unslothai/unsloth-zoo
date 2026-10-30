@@ -16,6 +16,7 @@
 """Compile gate for sequence_tiling: fullgraph=True, 0 graph breaks, recompiles <= tile buckets over 1k..32k rows,
 every tile a checkpoint HOP in the graph, numerics equal to eager (forward and backward); CPU only."""
 import copy
+import functools
 import os
 import sys
 
@@ -300,3 +301,41 @@ def test_user_compile_keeps_the_unrolled_fullgraph(monkeypatch):
     block = _block_with_tiled_mlp(4)
     x = torch.randn(1, 16, H, requires_grad = True)
     torch.compile(block, backend = "aot_eager", fullgraph = True)(x).sum().backward()
+
+
+def test_compiled_tile_body_is_one_graph_for_every_tile_and_layer(monkeypatch):
+    # compile_tile: the tile loop leaves the caller's graph and every tile of every layer runs one compiled body.
+    from torch._dynamo.utils import counters
+    from unsloth_zoo import sequence_tiling as ST
+
+    class Layers(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlps = torch.nn.ModuleList([GatedMLP() for _ in range(3)])
+
+        def forward(self, h):
+            for mlp in self.mlps:
+                h = h + tiled_call(functools.partial(GatedMLP.forward, mlp), h, n_tiles = 8, needs_rng = False)
+            return h
+
+    graphs = {}
+    for mode in ("break", "compile_tile"):
+        monkeypatch.setenv("UNSLOTH_TILED_COMPILE", mode)
+        torch._dynamo.reset()
+        ST._COMPILED_TILE[0] = None
+        counters.clear()
+        torch.manual_seed(0)
+        m = Layers()
+        ref = copy.deepcopy(m)
+        x = torch.randn(1, 37, H, requires_grad = True)  # uneven tiles
+        y = torch.compile(m, backend = "aot_eager")(x)
+        y.pow(2).sum().backward()
+        h = x.detach().clone().requires_grad_()
+        yr = h
+        for mlp in ref.mlps:
+            yr = yr + mlp(yr)
+        yr.pow(2).sum().backward()
+        torch.testing.assert_close(y, yr)
+        torch.testing.assert_close(x.grad, h.grad)
+        graphs[mode] = counters["stats"]["unique_graphs"]
+    assert graphs["compile_tile"] - graphs["break"] == 1, graphs
