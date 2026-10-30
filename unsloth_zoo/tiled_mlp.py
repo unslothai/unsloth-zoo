@@ -23,6 +23,16 @@ from unsloth_zoo.memory_budget import (  # noqa: F401  (re-exported for remote-c
 )
 from unsloth_zoo.tiling_registry import install as _install, install_module as _install_module, parse_mode
 
+# Released Unsloth versions import these at module level (their DDP patch wraps TiledMLP); the registry does not use
+# them, so an upgraded Unsloth Zoo keeps an older Unsloth importable.
+from unsloth_zoo._legacy_tiled_mlp import (  # noqa: F401
+    TiledMLP,
+    _mxfp4_instance_forward,
+    is_custom_module,
+    torch_amp_custom_bwd,
+    torch_amp_custom_fwd,
+)
+
 __all__ = [
     "patch_tiled_mlp",
     "patch_mlp",
