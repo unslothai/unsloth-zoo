@@ -3365,8 +3365,7 @@ def patch_GptOssAttention():
         dropout: float = 0.0,
         **kwargs,
     ):
-        # Out-of-place twin of the in-place path: out= matmuls and in-place writes have no backward,
-        # so eval forwards that carry a graph (caller inputs_embeds with grad) come here.
+        # Out-of-place twin of the in-place path, used when an eval forward carries a graph.
         key_states = repeat_kv(key, module.num_key_value_groups)
         value_states = repeat_kv(value, module.num_key_value_groups)
         key_states, value_states, attention_mask = _align_kv_to_mask(
@@ -3453,7 +3452,6 @@ def patch_GptOssAttention():
             attn_weights = None
         else:
             # Dense mask: UNSLOTH_GPT_OSS_EAGER_INFERENCE=1, CPU, or a caller-built 4D mask.
-            # The in-place path has no backward: an eval forward carrying a graph takes the out-of-place one.
             _needs_grad = torch.is_grad_enabled() and (
                 query_states.requires_grad or key_states.requires_grad
                 or value_states.requires_grad or self.sinks.requires_grad
@@ -3851,8 +3849,7 @@ def patch_GptOssModel():
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        # Stock resolves an omitted use_cache from the config; otherwise a manual prefill returns
-        # no cache and the next decode step silently drops the prefix.
+        # Match stock: an omitted use_cache follows the config, else a manual prefill loses its cache.
         if use_cache is None and not self.training:
             use_cache = getattr(self.config, "use_cache", False)
         if use_cache and past_key_values is None:
@@ -3944,8 +3941,7 @@ def patch_GptOssModel():
         _cross_card = getattr(block_swap, "spans_devices", False) or (
             _swap_device is not None and hidden_states.device != _swap_device
         ) or _gpt_oss_layers_span_devices(self.layers, hidden_states.device)
-        # The decode fast path normalizes in place and has no backward: grad-bearing caller embeddings
-        # (eval with grad enabled) take the differentiable layer path instead.
+        # The in-place decode fast path has no backward, so grad-bearing embeddings skip it.
         _needs_grad = torch.is_grad_enabled() and hidden_states.requires_grad
         if (
             not self.training and qlen == 1 and isinstance(attention_mask, dict)
