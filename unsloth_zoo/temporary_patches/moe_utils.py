@@ -2209,6 +2209,9 @@ def moe_compute_dtype(hidden_states):
     return torch.bfloat16
 
 
+_SWAP_VIA_INSTANCE_DICT = _torch_version_tuple() < (2, 6)
+
+
 def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_fn, *args):
     """Temporarily install dequantized weights for one forward call, then restore.
 
@@ -2221,7 +2224,9 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     names = ("gate_up_proj", "down_proj")
     params = experts_module._parameters
     instance_dict = experts_module.__dict__
-    registered = {name: params[name] for name in names if name in params}
+    # torch < 2.6 Dynamo traces the `_parameters` setitem but keeps reading the original Parameters
+    # (wrong output, no grads to the swapped tensors): shadow through __dict__ there (graph-breaks, correct).
+    registered = {} if _SWAP_VIA_INSTANCE_DICT else {name: params[name] for name in names if name in params}
     saved = {name: instance_dict[name] for name in names if name not in registered and name in instance_dict}
     for name, tensor in zip(names, (gate_up_proj, down_proj)):
         if name in registered:

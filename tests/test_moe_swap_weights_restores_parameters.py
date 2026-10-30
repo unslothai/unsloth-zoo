@@ -74,11 +74,50 @@ def test_swap_restores_plain_instance_attributes_and_raises_through():
 
 import pytest
 
+from unsloth_zoo.temporary_patches.moe_utils import _torch_version_tuple
 
+# torch < 2.6 swaps through __dict__ (one graph break) because its Dynamo ignores the `_parameters` swap.
+_FULLGRAPH_SWAP = _torch_version_tuple() >= (2, 6)
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager", "inductor"])
+@pytest.mark.parametrize("fullgraph", [False, True])
+def test_compiled_swap_computes_with_and_backprops_into_the_swapped_weights(backend, fullgraph):
+    # torch 2.4 compiled the `_parameters` swap against the original Parameters: zeros out, no grads.
+    if fullgraph and not _FULLGRAPH_SWAP:
+        pytest.skip("torch < 2.6 swaps through __dict__, which graph-breaks")
+    experts = _Experts()
+    originals = dict(experts._parameters)
+
+    def forward_fn(module, x):
+        return (x @ module.gate_up_proj[0].T).sum() + module.down_proj.sum()
+
+    call = torch.compile(
+        lambda x, gu, dn: swap_moe_weights_for_call(experts, gu, dn, forward_fn, x) * 2,
+        backend = backend,
+        fullgraph = fullgraph,
+    )
+    torch._dynamo.reset()
+    try:
+        x = torch.ones(3, 4)
+        gu = torch.ones(2, 8, 4, requires_grad = True)
+        dn = torch.ones(2, 4, 4, requires_grad = True)
+        out = call(x, gu, dn)
+        assert out.item() == 256.0
+        out.backward()
+        assert gu.grad is not None and gu.grad.sum().item() == 192.0
+        assert dn.grad is not None and dn.grad.sum().item() == 64.0
+        assert all(experts._parameters[n] is p for n, p in originals.items())
+        assert "gate_up_proj" not in experts.__dict__ and "down_proj" not in experts.__dict__
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.skipif(not _FULLGRAPH_SWAP, reason = "torch < 2.6 swaps through __dict__, which graph-breaks")
 @pytest.mark.parametrize("backend", ["eager", "aot_eager"])
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_swap_traces_fullgraph_and_restores_under_compile(backend, dynamic):
-    # fullgraph=True on every supported torch (2.10 rejected the old `__dict__.pop` restore).
+    # fullgraph=True on torch >= 2.6 (2.10 rejected the old `__dict__.pop` restore).
     from torch._dynamo.utils import counters
 
     experts = _Experts()
@@ -118,6 +157,8 @@ def test_swap_traces_fullgraph_and_restores_under_compile(backend, dynamic):
 @pytest.mark.parametrize("fullgraph", [False, True])
 def test_compiled_swap_keeps_parameters_registered(backend, fullgraph):
     # torch 2.12 replayed a traced `__dict__.pop` as DELETE_ATTR, unregistering both expert Parameters.
+    if fullgraph and not _FULLGRAPH_SWAP:
+        pytest.skip("torch < 2.6 swaps through __dict__, which graph-breaks")
     experts = _Experts()
     originals = dict(experts._parameters)
 
