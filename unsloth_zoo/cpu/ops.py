@@ -51,8 +51,8 @@ def _softmax_without_collapse(z, y, keep_logits = False):
 
 
 class _ChunkedLinearCrossEntropy(torch.autograd.Function):
-    """Sums CE(hidden @ weight.T, labels) / divisor without materialising (rows, vocab) logits; grads are formed per
-    chunk in forward, so peak extra memory is one (chunk, vocab) fp32 block."""
+    """Sums CE(hidden @ weight.T, labels) / divisor; grads are formed per chunk in forward, so eager peak extra memory
+    is one (chunk, vocab) fp32 block (compiled runs use a single chunk over all rows)."""
 
     @staticmethod
     def forward(ctx, hidden, weight, labels, divisor, chunk_rows, ignore_index):
@@ -65,8 +65,11 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else None
         grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else None
         total = torch.zeros((), dtype = torch.float32)
-        for start in range(0, rows, chunk_rows):
-            end = min(start + chunk_rows, rows)
+        # A Python range over a symbolic row count pins sequence length under torch.compile (one graph per length;
+        # a mark_dynamic length fails), so compiled runs take one chunk over every row: full logits, no chunk saving.
+        bounds = [(0, rows)] if torch.compiler.is_compiling() else \
+            [(start, min(start + chunk_rows, rows)) for start in range(0, rows, chunk_rows)]
+        for start, end in bounds:
             y = labels[start:end]
             valid = y != ignore_index
             # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.

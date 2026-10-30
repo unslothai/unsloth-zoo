@@ -745,6 +745,7 @@ if _HAS_TRITON:
     def _fl_jsd_stats_kernel(s_ptr, t_ptr, stride, V, stat_ptr, NB, s_scale, s_cap, t_scale, t_cap, inv_t,
                              S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,
                              T_CAP: tl.constexpr, BLOCK: tl.constexpr):
+        # Per block: maxima, sums of exp(x - max), first student argmax js, and both sums without column js.
         row = tl.program_id(0)
         blk = tl.program_id(1)
         cols = blk * BLOCK + tl.arange(0, BLOCK)
@@ -753,51 +754,141 @@ if _HAS_TRITON:
                                S_SCALE, S_CAP, T_SCALE, T_CAP)
         s = tl.where(ok, s, -float("inf"))
         t = tl.where(ok, t, -float("inf"))
-        ms = tl.max(s, 0)
+        ms, js = tl.max(s, 0, return_indices = True, return_indices_tie_break_left = True)
         mt = tl.max(t, 0)
-        ls = tl.sum(tl.exp(s - ms), 0)
-        lt = tl.sum(tl.exp(t - mt), 0)
-        o = stat_ptr + (row.to(tl.int64) * NB + blk) * 4
+        es = tl.exp(s - ms)
+        et = tl.exp(t - mt)
+        off = tl.arange(0, BLOCK) != js
+        ls, lt, s_off, t_off = tl.reduce((es, et, tl.where(off, es, 0.0), tl.where(off, et, 0.0)), 0, _fl_add4)
+        o = stat_ptr + (row.to(tl.int64) * NB + blk) * 7
         tl.store(o, ms)
         tl.store(o + 1, ls)
         tl.store(o + 2, mt)
         tl.store(o + 3, lt)
+        tl.store(o + 4, (blk * BLOCK + js).to(tl.float32))
+        tl.store(o + 5, s_off)
+        tl.store(o + 6, t_off)
 
     @triton.jit
-    def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, lse_ptr, c_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
+    def _fl_add4(a0, a1, a2, a3, b0, b1, b2, b3):
+        return a0 + b0, a1 + b1, a2 + b2, a3 + b3
+
+    @triton.jit
+    def _fl_log1p_neg(x):
+        # log1p(-x) for x in [0, 0.5]: 2 atanh(z), z = -x / (2 - x), |z| <= 1/3 (no libdevice log1p needed).
+        z = -x / (2.0 - x)
+        z2 = z * z
+        poly = 1.0 / 17.0
+        poly = poly * z2 + 1.0 / 15.0
+        poly = poly * z2 + 1.0 / 13.0
+        poly = poly * z2 + 1.0 / 11.0
+        poly = poly * z2 + 1.0 / 9.0
+        poly = poly * z2 + 1.0 / 7.0
+        poly = poly * z2 + 1.0 / 5.0
+        poly = poly * z2 + 1.0 / 3.0
+        return 2.0 * z * (poly * z2 + 1.0)
+
+    @triton.jit
+    def _fl_logaddexp(a, b):
+        mx = tl.maximum(a, b)
+        return mx + tl.log(tl.exp(a - mx) + tl.exp(b - mx))
+
+    @triton.jit
+    def _fl_jsd_pre_kernel(s_ptr, t_ptr, stride, stat_ptr, NB, aux_ptr, beta, log1mb, logb,
+                           s_scale, s_cap, t_scale, t_cap, inv_t, MODE: tl.constexpr, S_SCALE: tl.constexpr,
+                           S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK_NB: tl.constexpr):
+        # Per row: confident x_j - lse rounds to 0 in fp32, so j's terms use log1p(-mass of the others).
+        # aux row: lse_s, lse_t, j, c = d_j, loss term(s) of j, dz_j / (coef inv_t ds).
+        row = tl.program_id(0)
+        b = tl.arange(0, BLOCK_NB)
+        okb = b < NB
+        o = stat_ptr + (row.to(tl.int64) * NB + b) * 7
+        ms = tl.load(o, mask = okb, other = -float("inf"))
+        ls = tl.load(o + 1, mask = okb, other = 0.0)
+        mt = tl.load(o + 2, mask = okb, other = -float("inf"))
+        lt = tl.load(o + 3, mask = okb, other = 0.0)
+        js = tl.load(o + 4, mask = okb, other = 0.0)
+        s_off = tl.load(o + 5, mask = okb, other = 0.0)
+        t_off = tl.load(o + 6, mask = okb, other = 0.0)
+        top_s, jb = tl.max(ms, 0, return_indices = True, return_indices_tie_break_left = True)
+        top_t = tl.max(mt, 0)
+        ws = tl.where(okb, tl.exp(ms - top_s), 0.0)
+        wt = tl.where(okb, tl.exp(mt - top_t), 0.0)
+        at_j = b == jb
+        j = tl.sum(tl.where(at_j, js, 0.0), 0).to(tl.int64)
+        x = tl.load(s_ptr + row.to(tl.int64) * stride + j).to(tl.float32)
+        y = tl.load(t_ptr + row.to(tl.int64) * stride + j).to(tl.float32)
+        x, _ = _fl_transform(x, s_scale, s_cap, S_SCALE, S_CAP)
+        y, _ = _fl_transform(y, t_scale, t_cap, T_SCALE, T_CAP)
+        x = x * inv_t
+        y = y * inv_t
+        # Totals = mass off j + j's exact 1, so no 1 + tiny in-block sum decides p_o / q_o or lse.
+        r_s = tl.sum(tl.where(at_j, s_off, ls) * ws, 0)
+        r_t = tl.sum(tl.where(at_j, t_off, lt) * wt, 0)
+        sum_s = r_s + tl.exp(x - top_s)
+        sum_t = r_t + tl.exp(y - top_t)
+        p_o = r_s / sum_s
+        q_o = r_t / sum_t
+        lse_s = top_s + tl.log(sum_s)
+        lse_t = top_t + tl.log(sum_t)
+        sj = x - lse_s
+        tj = y - lse_t
+        ls_j = tl.where(p_o < 0.5, _fl_log1p_neg(tl.minimum(p_o, 0.5)), sj)
+        lt_j = tl.where(q_o < 0.5, _fl_log1p_neg(tl.minimum(q_o, 0.5)), tj)
+        a = aux_ptr + row.to(tl.int64) * 8
+        tl.store(a, lse_s)
+        tl.store(a + 1, lse_t)
+        tl.store(a + 2, j.to(tl.float32))
+        if MODE == 0:
+            tl.store(a + 3, 0.0)
+            tl.store(a + 4, tl.exp(lt_j) * (lt_j - ls_j))
+            # p_j - q_j: from the masses off j only when both are confident (else they cancel near 1).
+            tl.store(a + 6, tl.where((p_o < 0.5) & (q_o < 0.5), q_o - p_o, tl.exp(sj) - tl.exp(tj)))
+        elif MODE == 1:
+            tl.store(a + 3, sj - tj)
+            tl.store(a + 4, ls_j - lt_j)
+        else:
+            tl.store(a + 3, sj - _fl_logaddexp(sj + log1mb, tj + logb))
+            mix_o = (1.0 - beta) * p_o + beta * q_o
+            m_j = tl.where(mix_o < 0.5, _fl_log1p_neg(tl.minimum(mix_o, 0.5)),
+                           _fl_logaddexp(ls_j + log1mb, lt_j + logb))
+            tl.store(a + 4, tl.exp(lt_j) * (lt_j - m_j))
+            tl.store(a + 5, ls_j - m_j)
+
+    @triton.jit
+    def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, aux_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
                            beta, log1mb, logb, s_scale, s_cap, t_scale, t_cap, inv_t,
                            MODE: tl.constexpr, WRITE_DZ: tl.constexpr, S_SCALE: tl.constexpr,
                            S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr):
-        # MODE 0 (beta = 0): partial loss and, if WRITE_DZ, dz = p - q in one pass; MODE 1 (beta = 1): partial sum p (ls
-        # - lt); MODE 2 (interior): partial sums q (lt - m), p (ls - m).
+        # Sums without j (aux has j's terms). MODE 0: beta 0, sum q (lt - ls), dz = p - q. MODE 1: beta 1,
+        # sum p (d - c), d = ls - lt. MODE 2: interior, sum q (lt - m), sum p (d - c), d = ls - m.
         row = tl.program_id(0)
         blk = tl.program_id(1)
         cols = blk * BLOCK + tl.arange(0, BLOCK)
         ok = cols < V
         s, t, ds = _fl_jsd_load(s_ptr, t_ptr, row, cols, ok, stride, s_scale, s_cap, t_scale, t_cap, inv_t,
                                 S_SCALE, S_CAP, T_SCALE, T_CAP)
-        ls = s - tl.load(lse_ptr + row * 2)
-        lt = t - tl.load(lse_ptr + row * 2 + 1)
+        a = aux_ptr + row.to(tl.int64) * 8
+        ls = s - tl.load(a)
+        lt = t - tl.load(a + 1)
+        off = ok & (cols != tl.load(a + 2).to(tl.int32))
         p = tl.exp(ls)
         q = tl.exp(lt)
         o = part_ptr + (row.to(tl.int64) * NB + blk) * 2
         if MODE == 0:
-            tl.store(o, tl.sum(tl.where(ok, q * (lt - ls), 0.0), 0))
+            tl.store(o, tl.sum(tl.where(off, q * (lt - ls), 0.0), 0))
             if WRITE_DZ:
-                dz = (p - q) * (tl.load(coef_ptr) * inv_t) * ds
+                dz = tl.where(off, p - q, tl.load(a + 6)) * (tl.load(coef_ptr) * inv_t) * ds
                 tl.store(dz_ptr + row.to(tl.int64) * dz_stride + cols, dz.to(dz_ptr.dtype.element_ty), mask = ok)
         elif MODE == 1:
-            tl.store(o, tl.sum(tl.where(ok, p * (ls - lt - tl.load(c_ptr + row)), 0.0), 0))
+            tl.store(o, tl.sum(tl.where(off, p * (ls - lt - tl.load(a + 3)), 0.0), 0))
         else:
-            a = ls + log1mb
-            b = lt + logb
-            mx = tl.maximum(a, b)
-            m = mx + tl.log(tl.exp(a - mx) + tl.exp(b - mx))
-            tl.store(o, tl.sum(tl.where(ok, q * (lt - m), 0.0), 0))
-            tl.store(o + 1, tl.sum(tl.where(ok, p * (ls - m - tl.load(c_ptr + row)), 0.0), 0))
+            m = _fl_logaddexp(ls + log1mb, lt + logb)
+            tl.store(o, tl.sum(tl.where(off, q * (lt - m), 0.0), 0))
+            tl.store(o + 1, tl.sum(tl.where(off, p * (ls - m - tl.load(a + 3)), 0.0), 0))
 
     @triton.jit
-    def _fl_jsd_dz_kernel(s_ptr, t_ptr, stride, V, lse_ptr, c_ptr, rs_ptr, dz_ptr, dz_stride, coef_ptr, scale_g,
+    def _fl_jsd_dz_kernel(s_ptr, t_ptr, stride, V, aux_ptr, rs_ptr, dz_ptr, dz_stride, coef_ptr, scale_g,
                           log1mb, logb, s_scale, s_cap, t_scale, t_cap, inv_t,
                           MODE: tl.constexpr, S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,
                           T_CAP: tl.constexpr, BLOCK: tl.constexpr):
@@ -808,18 +899,16 @@ if _HAS_TRITON:
         ok = cols < V
         s, t, ds = _fl_jsd_load(s_ptr, t_ptr, row, cols, ok, stride, s_scale, s_cap, t_scale, t_cap, inv_t,
                                 S_SCALE, S_CAP, T_SCALE, T_CAP)
-        ls = s - tl.load(lse_ptr + row * 2)
-        lt = t - tl.load(lse_ptr + row * 2 + 1)
+        a = aux_ptr + row.to(tl.int64) * 8
+        ls = s - tl.load(a)
+        lt = t - tl.load(a + 1)
         p = tl.exp(ls)
         if MODE == 1:
             d = ls - lt
         else:
-            a = ls + log1mb
-            b = lt + logb
-            mx = tl.maximum(a, b)
-            d = ls - (mx + tl.log(tl.exp(a - mx) + tl.exp(b - mx)))
-        # d is shifted by its value at the student's argmax (c): the softmax-collapse-safe form of d - sum p d.
-        g = p * ((d - tl.load(c_ptr + row)) - tl.load(rs_ptr + row))
+            d = ls - _fl_logaddexp(ls + log1mb, lt + logb)
+        # d shifted by c = d_j (collapse-safe d - sum p d); j's term is exactly 0, not this d_j - c (an ulp off).
+        g = p * (tl.where(cols == tl.load(a + 2).to(tl.int32), 0.0, d - tl.load(a + 3)) - tl.load(rs_ptr + row))
         dz = g * (tl.load(coef_ptr) * (scale_g * inv_t)) * ds
         tl.store(dz_ptr + row.to(tl.int64) * dz_stride + cols, dz.to(dz_ptr.dtype.element_ty), mask = ok)
 
@@ -2003,11 +2092,18 @@ def _owns(ctx, saved):
 
 def _stored_grad_scaler(s, saved, ctx = None):
     """In place only in eager backward without retain_graph (else a second [V, H] grad coexists with .grad)
-    and only on buffers the op still owns (see _owned_ptrs)."""
+    and only on buffers the op still owns (see _owned_ptrs). Out of place under compiled autograd
+    (_KEEP_GRAPH and data_ptr are untraceable), create_graph (grad mode records the scaling) and
+    non-contiguous buffers (a saved-tensor hook may unpack an expanded view)."""
     inplace = _OPS.get("scale_rows_inplace")
-    if inplace is not None and _KEEP_GRAPH is not None and all(
-        type(x) is torch.Tensor and not x.requires_grad for x in saved
-    ) and _owns(ctx, saved):
+    if (
+        inplace is not None
+        and _KEEP_GRAPH is not None
+        and not torch.compiler.is_compiling()
+        and not torch.is_grad_enabled()
+        and all(type(x) is torch.Tensor and not x.requires_grad and x.is_contiguous() for x in saved)
+        and _owns(ctx, saved)
+    ):
         try:
             keep = _KEEP_GRAPH()
         except RuntimeError:  # not inside a backward pass
@@ -2027,7 +2123,7 @@ CALLS.setdefault("jsd", 0)
 
 
 # Generalized JSD between a trained student head and a frozen teacher head (TRL GKDTrainer.generalized_jsd_loss).
-_JSD_OP = "fused_linear_jsd_v2"
+_JSD_OP = "fused_linear_jsd_v3"
 # Live [rows, vocab] buffers per eager chunk in the statistic dtype; the chunk is sized to this budget.
 _JSD_BUFFERS = 4
 _JSD_CHUNK_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB", 1024) * 1024**2), 1)
@@ -2078,41 +2174,87 @@ def _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, ne
         _dz_t_h(acc_w, dzc, h)
 
 
+def _jsd_peak(l_j, others):
+    """Top-token log-prob as log1p(-others): confident fp32 x_j - lse rounds to 0 and collapses KL / dz. Else l_j."""
+    return torch.where(others < 0.5, torch.log1p(-others), l_j)
+
+
+def _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta):
+    """log((1 - b) p_j + b q_j) of the top token, = log1p(-((1 - b) p_o + b q_o)) on a confident row."""
+    mix_o = (1.0 - beta) * p_o + beta * q_o
+    return torch.where(mix_o < 0.5, torch.log1p(-mix_o),
+                       torch.logaddexp(ls_j + math.log1p(-beta), lt_j + math.log(beta)))
+
+
+def _jsd_peak_dz(ls_j, lt_j, p_o, q_o):
+    """beta 0 top-token dz: q_o - p_o if both confident (p_j - q_j cancels), else direct (q_o - p_o cancels)."""
+    return torch.where((p_o < 0.5) & (q_o < 0.5), q_o - p_o, ls_j.exp() - lt_j.exp())
+
+
 def _jsd_chunk(ls, lt, beta, want_grad):
     """Per-row generalized JSD of log-probs ls (student) / lt (teacher), and d loss / d student logits.
 
     Buffers ls / lt are consumed. Interior beta: m = log((1 - b) p + b q),
-    loss = b KL(q || M) + (1 - b) KL(p || M), dz = (1 - b) (g - p sum g) with g = p (ls - m)."""
+    loss = b KL(q || M) + (1 - b) KL(p || M), dz = (1 - b) (g - p sum g) with g = p (ls - m).
+    beta 0 / 1 take the student's top token j from the mass of the others (_jsd_peak); beta 0 has dz_j = q_o - p_o."""
     if beta == 0.0:
-        q = lt.exp()
+        j = ls.argmax(-1, keepdim = True)
+        ls_j, lt_j = ls.gather(1, j), lt.gather(1, j)
+        q = lt.exp().scatter_(1, j, 0.0)
+        q_o = q.sum(-1, keepdim = True)
         lt.sub_(ls).mul_(q)
-        row = lt.sum(-1)
+        p = ls.exp_().scatter_(1, j, 0.0)
+        p_o = p.sum(-1, keepdim = True)
+        dz_j = _jsd_peak_dz(ls_j, lt_j, p_o, q_o)
+        ls_j, lt_j = _jsd_peak(ls_j, p_o), _jsd_peak(lt_j, q_o)
+        row = lt.sum(-1) + (lt_j.exp() * (lt_j - ls_j)).squeeze(-1)
         if not want_grad:
             return row, None
-        return row, ls.exp_().sub_(q)
+        return row, p.sub_(q).scatter_(1, j, dz_j)
+    # beta 1 / interior: d shifted by c = d_j keeps the gradient a confident d - sum p d rounds away.
+    j = ls.argmax(-1, keepdim = True)
     if beta == 1.0:
+        ls_j, lt_j = ls.gather(1, j), lt.gather(1, j)
         p = ls.exp()
+        p_j = p.gather(1, j)
+        p_o = p.scatter_(1, j, 0.0).sum(-1, keepdim = True)
+        p.scatter_(1, j, p_j)
         ls.sub_(lt)
+        c = ls.gather(1, j)
+        ls.sub_(c)
+        q_o = lt.exp_().scatter_(1, j, 0.0).sum(-1, keepdim = True)
         g = torch.mul(p, ls, out = lt)
-        row = g.sum(-1)
+        rs = g.sum(-1, keepdim = True)
+        ls_j, lt_j = _jsd_peak(ls_j, p_o), _jsd_peak(lt_j, q_o)
+        row = (rs + (ls_j - lt_j)).squeeze(-1)
         if not want_grad:
             return row, None
-        p.mul_(row.unsqueeze(-1))
+        p.mul_(rs)
         return row, g.sub_(p)
+    ls_j, lt_j = ls.gather(1, j), lt.gather(1, j)
     m = torch.add(ls, math.log1p(-beta))
     q = torch.add(lt, math.log(beta))
     torch.logaddexp(m, q, out = m)
     torch.exp(lt, out = q)
+    q_o = q.scatter_(1, j, 0.0).sum(-1, keepdim = True)
     lt.sub_(m).mul_(q)
-    row_t = lt.sum(-1)
+    row_t = lt.sum(-1, keepdim = True)
     m.neg_().add_(ls)
+    c = m.gather(1, j)
+    m.sub_(c)
     p = torch.exp(ls, out = lt)
+    p_j = p.gather(1, j)
+    p_o = p.scatter_(1, j, 0.0).sum(-1, keepdim = True)
+    p.scatter_(1, j, p_j)
     g = torch.mul(p, m, out = q)
-    row_s = g.sum(-1)
-    row = beta * row_t + (1.0 - beta) * row_s
+    rs = g.sum(-1, keepdim = True)
+    ls_j, lt_j = _jsd_peak(ls_j, p_o), _jsd_peak(lt_j, q_o)
+    m_j = _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta)
+    row_t = row_t + lt_j.exp() * (lt_j - m_j)
+    row = (beta * row_t + (1.0 - beta) * (rs + (ls_j - m_j))).squeeze(-1)
     if not want_grad:
         return row, None
-    p.mul_(row_s.unsqueeze(-1))
+    p.mul_(rs)
     return row, g.sub_(p).mul_(1.0 - beta)
 
 
@@ -2132,21 +2274,31 @@ def _jsd_body(s, t, factor, beta: float, inv_t: float, s_scale: float, s_cap: fl
     ls = s - torch.logsumexp(s, dim = -1, keepdim = True)
     lt = t - torch.logsumexp(t, dim = -1, keepdim = True)
     p = torch.exp(ls)
+    # The student's top token j, as _jsd_chunk: its log-probs from the mass of the others, d shifted by d_j.
+    j = ls.argmax(-1, keepdim = True)
+    top = torch.arange(ls.shape[-1], device = ls.device) == j
+    q = torch.exp(lt)
+    p_o = torch.where(top, 0.0, p).sum(-1, keepdim = True)
+    q_o = torch.where(top, 0.0, q).sum(-1, keepdim = True)
+    ls_j, lt_j = _jsd_peak(ls.gather(1, j), p_o), _jsd_peak(lt.gather(1, j), q_o)
     if beta == 0.0:
-        q = torch.exp(lt)
-        row = (q * (lt - ls)).sum(-1)
-        dz = p - q
+        row = torch.where(top, 0.0, q * (lt - ls)).sum(-1) + (lt_j.exp() * (lt_j - ls_j)).squeeze(-1)
+        dz = torch.where(top & (p_o < 0.5) & (q_o < 0.5), q_o - p_o, p - q)
     elif beta == 1.0:
-        g = p * (ls - lt)
-        row = g.sum(-1)
-        dz = g - p * row.unsqueeze(-1)
+        d = ls - lt
+        g = p * torch.where(top, 0.0, d - d.gather(1, j))
+        rs = g.sum(-1, keepdim = True)
+        row = (rs + (ls_j - lt_j)).squeeze(-1)
+        dz = g - p * rs
     else:
         m = torch.logaddexp(ls + math.log1p(-beta), lt + math.log(beta))
-        row_t = (torch.exp(lt) * (lt - m)).sum(-1)
-        g = p * (ls - m)
-        row_s = g.sum(-1)
-        row = beta * row_t + (1.0 - beta) * row_s
-        dz = (1.0 - beta) * (g - p * row_s.unsqueeze(-1))
+        m_j = _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta)
+        row_t = torch.where(top, 0.0, q * (lt - m)).sum(-1, keepdim = True) + lt_j.exp() * (lt_j - m_j)
+        d = ls - m
+        g = p * torch.where(top, 0.0, d - d.gather(1, j))
+        rs = g.sum(-1, keepdim = True)
+        row = (beta * row_t + (1.0 - beta) * (rs + (ls_j - m_j))).squeeze(-1)
+        dz = (1.0 - beta) * (g - p * rs)
     if not want_grad:
         return row, None
     dz = dz * (factor * (inv_t * s_scale))
@@ -2161,7 +2313,7 @@ _JSD_TRITON_ROWS = os.environ.get("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB") is None
 
 
 def _jsd_triton(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
-    """_jsd_body on CUDA with Triton: two (beta = 0) or three passes over the raw fp32 logits, dz written once."""
+    """_jsd_body on CUDA with Triton: two (beta 0) or three passes over raw fp32 logits, dz written once."""
     # Triton launches on the current device: else a head on another card falls back and marks it broken.
     return _launch(s.device, lambda: _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap,
                                                          want_grad, grad_dtype))
@@ -2171,48 +2323,36 @@ def _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap
     R, V = s.shape
     NB = triton.cdiv(V, _JSD_BLOCK)
     flags = dict(S_SCALE = s_scale != 1.0, S_CAP = s_cap != 0.0, T_SCALE = t_scale != 1.0, T_CAP = t_cap != 0.0,
-                 BLOCK = _JSD_BLOCK, num_warps = 8, enable_fp_fusion = True)
+                 num_warps = 8, enable_fp_fusion = True)
     sc = (float(s_scale), float(s_cap) or 1.0, float(t_scale), float(t_cap) or 1.0, float(inv_t))
-    stats = torch.empty((R, NB, 4), device = s.device, dtype = torch.float32)
-    grid = (R, NB)
-    _fl_jsd_stats_kernel[grid](s, t, s.stride(0), V, stats, NB, *sc, **flags)
-    m = stats[..., 0::2]
-    sums = stats[..., 1::2]
-    top = m.amax(1, keepdim = True)
-    lse = (top.squeeze(1) + torch.log((sums * torch.exp(m - top)).sum(1))).contiguous()  # [R, 2] student, teacher
     mode = 0 if beta == 0.0 else (1 if beta == 1.0 else 2)
     log1mb = math.log1p(-beta) if mode == 2 else 0.0
     logb = math.log(beta) if mode == 2 else 0.0
+    stats = torch.empty((R, NB, 7), device = s.device, dtype = torch.float32)
+    aux = torch.empty((R, 8), device = s.device, dtype = torch.float32)
     part = torch.empty((R, NB, 2), device = s.device, dtype = torch.float32)
-    # c = d at the student's argmax; subtracting it avoids fp32 cancellation of d - sum_k p_k d_k when p ~ 1 (softmax collapse), dropping the peak term exactly.
-    c = torch.zeros(R, device = s.device, dtype = torch.float32)
-    if mode != 0:
-        j = s.argmax(-1, keepdim = True)
-        sj = _torch_transform(s.gather(1, j).squeeze(1), s_scale, s_cap)[0] * inv_t - lse[:, 0]
-        tj = _torch_transform(t.gather(1, j).squeeze(1), t_scale, t_cap)[0] * inv_t - lse[:, 1]
-        if mode == 1:
-            c = sj - tj
-        else:
-            c = sj - torch.logaddexp(sj + log1mb, tj + logb)
+    grid = (R, NB)
+    _fl_jsd_stats_kernel[grid](s, t, s.stride(0), V, stats, NB, *sc, BLOCK = _JSD_BLOCK, **flags)
+    _fl_jsd_pre_kernel[(R,)](s, t, s.stride(0), stats, NB, aux, float(beta), log1mb, logb, *sc, MODE = mode,
+                             BLOCK_NB = triton.next_power_of_2(NB), **flags)
     dz = torch.empty((R, V), device = s.device, dtype = grad_dtype) if want_grad else s.new_empty((1, 1))
     factor = factor.reshape(1).to(torch.float32)
-    _fl_jsd_row_kernel[grid](s, t, s.stride(0), V, lse, c, part, NB, dz, dz.stride(0), factor, float(beta), log1mb, logb,
-                             *sc, MODE = mode, WRITE_DZ = want_grad and mode == 0, **flags)
+    _fl_jsd_row_kernel[grid](s, t, s.stride(0), V, aux, part, NB, dz, dz.stride(0), factor, float(beta), log1mb, logb,
+                             *sc, MODE = mode, WRITE_DZ = want_grad and mode == 0, BLOCK = _JSD_BLOCK, **flags)
     if mode == 0:
-        row = part[..., 0].sum(1)
+        row = part[..., 0].sum(1) + aux[:, 4]
     elif mode == 1:
         rs = part[..., 0].sum(1)
-        row = rs + c
+        row = rs + aux[:, 4]
     else:
-        row_t = part[..., 0].sum(1)
         rs = part[..., 1].sum(1)
-        row = beta * row_t + (1.0 - beta) * (rs + c)
+        row = beta * (part[..., 0].sum(1) + aux[:, 4]) + (1.0 - beta) * (rs + aux[:, 5])
     if not want_grad:
         return row, None
     if mode != 0:
-        rs = rs.contiguous()
-        _fl_jsd_dz_kernel[grid](s, t, s.stride(0), V, lse, c, rs, dz, dz.stride(0), factor,
-                                1.0 if mode == 1 else 1.0 - beta, log1mb, logb, *sc, MODE = mode, **flags)
+        _fl_jsd_dz_kernel[grid](s, t, s.stride(0), V, aux, rs.contiguous(), dz, dz.stride(0), factor,
+                                1.0 if mode == 1 else 1.0 - beta, log1mb, logb, *sc, MODE = mode,
+                                BLOCK = _JSD_BLOCK, **flags)
     return row, dz
 
 
