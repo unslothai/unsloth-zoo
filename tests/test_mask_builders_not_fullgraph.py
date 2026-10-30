@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A standalone function that builds attention masks must never be compiled fullgraph.
-
-`flex_attention_mask` does `if not fast_all(attention_mask)` on a 0-dim tensor, so a
-caller captured whole dies with `Unsupported: Data-dependent branching`. The literal
-`create_causal_mask(**mask_kwargs)` used to catch this until transformers added a kwarg
-inside the parens, which is why these pin a call-shaped detector instead.
-"""
+"""Mask builders must never be compiled fullgraph: flex_attention_mask branches on fast_all(attention_mask), which fails
+as Data-dependent branching; matching literal create_causal_mask(**mask_kwargs) broke when a kwarg was added, so a
+call-shaped detector is pinned."""
 
 import inspect
 
@@ -89,10 +85,8 @@ def test_vision_mask_builders_are_not_compiled(model):
 
 
 def test_a_defined_vision_mask_builder_is_always_resolved():
-    """Skipping everything is legitimate only when no modeling file defines one.
-
-    A release that defines the builder under another name would also skip and guard
-    nothing, so the modeling source is asked directly rather than trusting the skips."""
+    """Skipping is legitimate only when no modeling file defines a builder; a builder renamed elsewhere would also skip
+    and guard nothing, so the modeling source is checked directly."""
     defines = []
     for model in _VISION_MASK_MODELS:
         try:
@@ -118,11 +112,8 @@ def test_a_defined_vision_mask_builder_is_always_resolved():
 
 
 def test_a_mask_builder_really_is_uncapturable_fullgraph():
-    """Why the rule exists, not just that it fires.
-
-    Eager first, so a drifted harness fails loudly instead of passing through the
-    `except`. A raise then demands the compiler exclude it; success is allowed and
-    means upstream became traceable."""
+    """Runs eager first so a drifted harness fails loudly; a fullgraph raise then requires the compiler exclusion, while
+    success just means upstream became traceable."""
     torch = pytest.importorskip("torch")
     gemma3 = pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
     builder = getattr(gemma3, "create_masks_for_vision_model", None)
@@ -162,8 +153,7 @@ def test_a_mask_builder_really_is_uncapturable_fullgraph():
         block_sequence_ids=block_sequence_ids,
     )
 
-    # Flex compiles `create_block_mask` internally, so a runner without triton dies
-    # here. That is the runner, not the rule: skip.
+    # Flex compiles create_block_mask internally, so a runner without triton fails here; that is the runner, not the rule, so skip.
     try:
         eager = builder(**kwargs)
     except Exception as exception:
@@ -224,9 +214,8 @@ def test_ordinary_lifted_functions_still_compile(name):
 
 
 def test_disable_compile_functions_outranks_the_mask_rule():
-    """`@torch.compiler.disable` also blocks inlining into a compiled caller, so a
-    mask call inside a DISABLE_COMPILE_FUNCTIONS name must not downgrade it to 'emit
-    bare'. Nothing on the list builds masks today, which is why this needs pinning."""
+    """@torch.compiler.disable also blocks inlining into a compiled caller, so a mask call inside a
+    DISABLE_COMPILE_FUNCTIONS name must not downgrade to 'emit bare'; nothing listed builds masks today."""
     source = inspect.getsource(compiler_module)
 
     # Loop B: skipped for a listed name, so the disable branch below is still reached.

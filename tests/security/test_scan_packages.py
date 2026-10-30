@@ -1,10 +1,4 @@
-"""Regression tests for `scripts/scan_packages.py`.
-
-The scanner's primary entry point (`download_packages`) reaches PyPI;
-to keep the suite offline we exercise it via the module's public
-in-process helpers (`scan_archive`) and assert against the binary
-wheel / sdist fixtures committed under `tests/security/fixtures/`.
-"""
+"""Offline regression tests for scripts/scan_packages.py: scan_archive runs on committed wheel and sdist fixtures, as download_packages reaches PyPI."""
 
 from __future__ import annotations
 
@@ -35,11 +29,7 @@ def test_fixture_files_exist():
 
 
 def test_fixture_bytes_are_deterministic(tmp_path):
-    """Re-running `_build.py` must produce byte-identical archives.
-
-    The build helper pins each member's mtime/uid/gid/mode and sorts members;
-    we rebuild into a temp dir and compare SHA-256 against the committed bytes.
-    """
+    """Rebuilding the fixtures with _build.py must give byte-identical archives, since it pins member mtime, uid, gid and mode and sorts members."""
     # Snapshot committed hashes.
     expected: dict[str, str] = {}
     for name in ("malicious_wheel.whl", "clean_wheel.whl", "malicious_sdist.tar.gz"):
@@ -98,7 +88,6 @@ def test_malicious_wheel_triggers_critical():
     assert findings, "no findings on malicious wheel; scanner regression"
     blockers = _critical_or_high(findings)
     assert blockers, f"no CRITICAL/HIGH findings: {[str(f) for f in findings]}"
-    # At least one finding must reference setup.py.
     assert any("setup.py" in f.filename for f in blockers)
 
 
@@ -230,10 +219,7 @@ def test_scan_packages_pip_download_failure_propagates(tmp_path):
 
 
 def test_archive_corruption_produces_critical_finding(tmp_path):
-    """SF1: a corrupted wheel (truncated bytes) used to be silently
-    skipped by `except Exception: continue` inside iter_archive_files.
-    It must now yield a CRITICAL `archive_corrupted` finding.
-    """
+    """A corrupt wheel must yield a CRITICAL archive_corrupted finding, not be silently skipped by a broad except in iter_archive_files."""
     bad = tmp_path / "broken-0.0.1-py3-none-any.whl"
     bad.write_bytes(b"X")  # 1-byte "wheel" -- not a valid zip container
     findings = sp.scan_archive(str(bad), "broken_fixture")

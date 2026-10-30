@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""sm_12x + release/3.6.x trips ``assert num_stages >= 1`` in opt_flags, so training falls back to bf16
-decodes there. CPU only."""
+"""Native MXFP4 training gate: sm_12x with release/3.6.x trips assert num_stages >= 1 in opt_flags, so training falls back to bf16 decodes there; CPU only."""
 
 import types
 
@@ -322,8 +321,7 @@ def test_matmul_ogs_available_rejects_the_cell_without_probing(monkeypatch):
 
 
 def _overflowing_problem():
-    # x @ W_gate_up = 64 * 2048 = 131072 exactly (bf16 and MXFP4 exact), past fp16's 65504; the bias
-    # cancels it back to small pre-activations, so the right answer is finite and fp16-representable.
+    # x @ W_gate_up = 131072, exact in bf16 and MXFP4 but past fp16's 65504; the bias cancels it to small pre-activations, so the result stays finite in fp16.
     module, _, logits = _problem(seed = 7)
     gen = torch.Generator().manual_seed(8)
     module.gate_up_proj = torch.ones(E, H, 2 * I, dtype = torch.bfloat16)

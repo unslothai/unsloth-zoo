@@ -1,13 +1,6 @@
-"""Expert stack layout on the transformers<5 ModuleList grouped MoE path.
-
-The stack builders return the transposed VIEW of the contiguous [E, N, K] dequantized stack
-(gate_up keeps the per-expert cat(gate, up) interleave), the GEMMs take that view uncopied, and
-_GroupedFrozenMM's backward reads its transpose, the contiguous stack, with no copy. Checked
-bitwise against the copy-based layout (every GEMM weight made contiguous, as the builders did):
-output, dX, router grad and every LoRA grad, on torch._grouped_mm and the Triton generic kernel,
-bf16 / fp16, NF4 / bf16 base, uniform and skewed routing with empty experts, every base policy and
-non-reentrant checkpointing. Also: fullgraph compile, and the readiness-cache key fields.
-"""
+"""transformers<5 ModuleList grouped MoE: builders return a transposed view of the contiguous [E, N, K] stack (gate_up
+is per-expert cat(gate, up)), checked bitwise against the copy layout for outputs, dX, router and LoRA grads, plus
+fullgraph compile"""
 import contextlib
 import os
 
@@ -28,8 +21,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse = True)
 def _fresh_view_probe(monkeypatch):
-    """Re-run moe_utils' view probe here: a flag latched False by an earlier test would keep the
-    copy and make every bitwise check below vacuous."""
+    """Re-runs the view probe: a _TRANSPOSED_VIEW_GROUPED_MM_SAFE flag latched False by an earlier test would keep the copy and make every bitwise check vacuous"""
     from unsloth_zoo.temporary_patches import moe_utils
     monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
     if not moe_utils._transposed_view_grouped_mm_is_safe():
@@ -193,8 +185,7 @@ def test_builders_return_transposed_views(base):
 
 
 def test_gemms_take_views_and_backward_reads_the_stack(monkeypatch):
-    """torch._grouped_mm gets the uncopied view in forward and the contiguous stack in backward;
-    the copy fallback still applies when the view probe says no."""
+    """torch._grouped_mm gets the uncopied view in forward and the contiguous stack in backward; the copy fallback still applies when the view probe says no"""
     from unsloth_zoo.temporary_patches import moe_utils
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "0")
     model, blk = _block("nf4", torch.bfloat16, False, "recompute", "uniform")
@@ -256,8 +247,8 @@ def _engages(blk, x):
 
 @pytest.mark.parametrize("fast", ["1", "0"])
 def test_signature_tracks_lora_rank_change_via_data(fast, monkeypatch):
-    """`.data =` keeps the Parameter, so only the shape shows a new rank on one expert. Per-expert
-    Parameters only: a stacked expert's `weight` is a fresh view, so `.data =` does not reach it."""
+    """Assigning .data keeps the Parameter, so only the shape shows a new LoRA rank on one expert; this works only for
+    per-expert Parameters, since a stacked expert's weight is a fresh view"""
     monkeypatch.setenv("UNSLOTH_MOE_STACKED_LORA", "0")
     monkeypatch.setenv("UNSLOTH_MOE_FAST_READY", fast)
     model, blk = L.build("qwen3")

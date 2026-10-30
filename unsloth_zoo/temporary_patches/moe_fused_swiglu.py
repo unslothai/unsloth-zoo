@@ -494,10 +494,9 @@ def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limi
     if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         return False
     ok = False
-    # The first call is often inside a model forward, e.g. a non-reentrant checkpoint region. The probe's
-    # own graph must not reach the saved-tensor hooks there: they would count its tensors against the
-    # checkpoint (CheckpointError at backward) and its grad would trigger a nested recompute. The
-    # innermost hook pair wins, so identity hooks keep the probe self-contained.
+    # First call may sit in a non-reentrant checkpoint region; identity saved_tensors_hooks (innermost wins) keep the
+    # probe self-contained, since outer hooks would count its tensors (CheckpointError) and its grad would trigger a
+    # nested recompute.
     try:
         hooks = torch.autograd.graph.saved_tensors_hooks(_identity, _identity)
         hooks.__enter__()

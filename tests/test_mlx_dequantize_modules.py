@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Exercise unsloth_zoo.mlx.loader._dequantize_selected_mlx_modules.
-
-Builds a synthetic MLX-style model with one QuantizedLinear submodule,
-runs the dequantize-and-replace helper, and verifies the result is a
-numerically correct nn.Linear with the dequantized weight. Mirrors the
-load_in_4bit=False / selective requantize path: walks named_modules,
-finds QuantizedLinear, calls mx.dequantize with mode='affine', swaps
-in nn.Linear.
-"""
+"""Tests _dequantize_selected_mlx_modules: QuantizedLinear becomes nn.Linear with dequantized weight."""
 
 from __future__ import annotations
 
@@ -37,11 +29,7 @@ def _install_shim():
 
 
 def _make_packed_4bit(values, group_size=8, bits=4):
-    """Pack a flat int list of 4-bit values into uint32 words.
-
-    Returns (packed: int32 tensor of shape (1, n_words),
-             scales: tensor (1, n_groups), biases: tensor (1, n_groups)).
-    """
+    """Pack 4-bit ints into uint32 words; returns int32 packed (1, n_words), scales, biases (1, n_groups)."""
     elements_per_word = 32 // bits
     n = len(values)
     assert n % elements_per_word == 0, "values must align to packing boundary"
@@ -72,7 +60,6 @@ def test_dequantize_selected_mlx_modules_swap():
     bits, group_size = 4, 8
     in_features, out_features = 8, 2
 
-    # Output row 0 = [0,1,2,3,4,5,6,7], output row 1 = [7,6,5,4,3,2,1,0]
     values_row0 = [0, 1, 2, 3, 4, 5, 6, 7]
     values_row1 = [7, 6, 5, 4, 3, 2, 1, 0]
 

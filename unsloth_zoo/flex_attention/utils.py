@@ -51,15 +51,9 @@ try:
     HAS_FLEX_ATTENTION = True
     from torch.nn.attention.flex_attention import _score_mod_signature, _mask_mod_signature
 
-    # Determine kernel_options since low memory GPUs will go out of memory
-    # InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton_tem_fused_0 Required: 65536 Hardware limit:65536 Reducing block sizes or `num_stages` may help.
-    # See https://github.com/pytorch/pytorch/issues/133254#issuecomment-2408710459
-    # https://github.com/pytorch/pytorch/issues/133254#issuecomment-2539969593
-    # Total capacity, like the gpt_oss probe: mem_get_info() would pin a device context at import
-    # time. Integrated parts are the exception, where properties may report only the carve-out.
-    # Properties are read HERE, not inside cuda_total_memory, which answers 0 for a device it
-    # cannot read: a 0 would read as "16GB or less" and leave flex attention on with 32x32 kernel
-    # options, where an unreadable device must keep raising into the except below.
+    # Kernel options depend on VRAM (low-memory OOM, pytorch/pytorch issue 133254); read device properties here, not via
+    # mem_get_info (pins a context at import); integrated parts may show only the carve-out; unreadable devices must
+    # keep raising (cuda_total_memory's 0 reads as 16GB or less).
     from unsloth_zoo.integrated_device import cuda_total_memory
     vram_of_gpu = min(
         cuda_total_memory(i, props = torch.cuda.get_device_properties(i))/1024/1024/1024
@@ -88,8 +82,8 @@ try:
         _flex_attention = functools.partial(_flex_attention, kernel_options = kernel_options)
     pass
     flex_attention = _torch_compile(_flex_attention)
-    # Prefill / training: AUTO sends queries under 128 rows to flex_decoding, which has no valid config once
-    # q_len * GQA group > 128; Dynamo then runs flex eagerly and checkpoint recompute raises CheckpointError.
+    # Prefill/training: AUTO sends queries under 128 rows to flex_decoding, which has no valid config once q_len * GQA
+    # group > 128; Dynamo then runs flex eagerly and checkpoint recompute raises CheckpointError.
     PREFILL_KERNEL_OPTIONS = {**(kernel_options or {}), "FORCE_USE_FLEX_ATTENTION": True}
 
     # torch >= 2.9: return_lse's deprecation warning is a graph break on 2.10; use AuxRequest.
@@ -121,8 +115,8 @@ try:
     _ONE_BLOCK_MISCOMPILE = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 13)
 
     def _compile_block_mask(bsz, head, M, N):
-        # torch 2.10's dynamic create_block_mask graph miscompiles one-block lengths: its block
-        # counts come out 2 instead of 1 and read past the buffer (illegal memory access).
+        # torch 2.10's dynamic create_block_mask miscompiles one-block lengths: block counts come out 2 instead of 1 and
+        # read past the buffer (illegal memory access).
         blk = FLEX_ATTENTION_BLOCK_SIZE
         if not _ONE_BLOCK_MISCOMPILE or (M > blk and N > blk):
             return True
@@ -137,8 +131,7 @@ try:
 
     def _build_block_mask(mask_mod, bsz, head, M, N, device):
         if _compile_block_mask(bsz, head, M, N):
-            # See https://github.com/meta-pytorch/attention-gym/issues/15#issuecomment-2284148665
-            # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
+            # _compile MUST stay on to reduce VRAM, otherwise usage is O(N^2) (meta-pytorch/attention-gym issue 15).
             return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = True)
         return _eager_create_block_mask(mask_mod, bsz, head, M, N, device)
 
@@ -171,8 +164,8 @@ try:
         key = (mask_mod, bsz, head, M, N, dev, torch.is_inference_mode_enabled())
         block_mask = _BLOCK_MASK_CACHE.get(key)
         if block_mask is None:
-            # Masks grow ~quadratically with length: keep only the current shape's masks (one per
-            # mask_mod in the current inference mode, shared by all layers of one forward), freed first.
+            # Masks grow ~quadratically with length, so only the current shape's masks are kept (one per mask_mod and
+            # inference mode, shared by one forward's layers); other shapes are freed first.
             for k in [k for k in _BLOCK_MASK_CACHE if k[1:] != key[1:]]:
                 del _BLOCK_MASK_CACHE[k]
             if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_SIZE:
@@ -259,8 +252,7 @@ try:
               X X X X
             """
             windowed_mask = q_idx - kv_idx < window_size
-            # Official PyTorch attends to 1 extra token
-            # windowed_mask = q_idx - kv_idx <= window_size
+            # Official PyTorch uses q_idx - kv_idx <= window_size, which attends one extra token; this uses strict <.
             return causal_mask & windowed_mask
         sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_{window_size}"
         return sliding_window
@@ -279,13 +271,8 @@ try:
         return sliding_window
 
     def generate_decoding_sliding_window_mask_with_padding(window_size: int, padding_start_idx = None):
-        """
-        We cannot use padding_start_idx[batch_idx] for SWA decoding since
-        assume padding_start_idx=[3406, 4000, 0] and SW=128 then it'll always
-        be masked since the KV size=128.
-
-        Since we set padded tokens = 0 always, we simply return the generic SWA.
-        """
+        """SWA decoding ignores padding_start_idx: with KV size equal to the window, a start like 3406 would mask every
+        key; padded tokens are always 0, so the generic SWA is returned."""
         return generate_sliding_window_mask(window_size)
 
     # For inference see https://pytorch.org/blog/flexattention-for-inference
@@ -340,8 +327,7 @@ try:
                 div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
                 self.offset = qlen_KV - 2 # Minus two since we need the block mask to use the saved offset_tensor
-                # Minus 2 and not -1 since we do pre-incrementing and not post-incrementing
-                # See self.offset += 1
+                # Minus 2, not -1, since offset is pre-incremented (see self.offset += 1), not post-incremented.
                 if self.offset <= -2:
                     # Minimum is -1
                     self.offset = -1
@@ -402,28 +388,23 @@ try:
 
         def __call__(self, key):
             bsz, heads_KV, qlen_KV, dim = key.shape
-            # We increment beforehand to get the correct index since offset_tensor is used
-            #                                    Assume sliding_window=128-1 = 127
-            #                                    offset=126, so offset+1 = 127
+            # Increment beforehand since offset_tensor is the index; e.g. sliding_window = 127 (128 - 1) and offset 126 gives offset + 1 = 127.
             if (self.sliding_window is None) or (self.offset < self.sliding_window):
                 self.offset += 1
                 self.offset_tensor.add_(1)
             elif (self.sliding_window is not None):
-                # Quick return since sliding window mask has the same block mask always
-                # Can only enter here if (self.offset < self.sliding_window) fails
-                # ie the maximum sliding window has been reached already
+                # Quick return: the sliding window block mask is always the same; reached only once offset >=
+                # sliding_window (max sliding window already reached).
                 return self.block_mask_slice
             if self.offset >= self.max_length:
-                # Must be >= since offset=127, max_length=128 means size=127+1=128
-                # since we do zero indexing
+                # Must be >= since offset=127 with max_length=128 means size 128, because indexing is zero based.
                 self.max_length += FLEX_ATTENTION_KV_INCREMENT
                 self.block_mask = compiled_create_block_mask(self.mask_mod, bsz, heads_KV, self.max_length, self.max_length, device = key.device)
                 self.block_size = self.block_mask.BLOCK_SIZE[0]
             block_offset = self.offset // self.block_size
             block_mask_slice = self.block_mask[:, :, block_offset]
             block_mask_slice.mask_mod = self.mask_mod_with_offset
-            # Must set seq_lengths as seen in
-            # https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L80
+            # Must set seq_lengths as in the gpt-fast generate.py (line 80).
             block_mask_slice.seq_lengths = (1, qlen_KV)
             self.block_mask_slice = block_mask_slice
             return block_mask_slice

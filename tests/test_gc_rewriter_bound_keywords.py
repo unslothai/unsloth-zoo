@@ -184,11 +184,8 @@ def _for_loop_body(forward_source):
 
 
 def test_rewriter_two_tuple_entries_declare_no_bound_keyword(monkeypatch):
-    """A 2-tuple entry declares no bound keywords, so no extra keyword appears.
-
-    The layer's own ``**kwargs`` expansion still has to move into the callable:
-    it is a keyword expansion like any other, and leaving it in the argument
-    list hands the layer's runtime keywords to the checkpoint function."""
+    """A 2-tuple entry declares no bound keywords, but the layer's own **kwargs expansion must still move into the
+    callable, or its runtime keywords reach the checkpoint function."""
     forward = _rewrite_toy(monkeypatch, (_TOY_FIND, _TOY_REPLACE))
     assert "sentinel" not in forward
     branch = _for_loop_body(forward).body[0]
@@ -203,8 +200,7 @@ def test_rewriter_two_tuple_entries_declare_no_bound_keyword(monkeypatch):
 
 
 def test_rewriter_leaves_a_kwargless_call_site_alone(monkeypatch):
-    """No ``**kwargs`` at the call site and no declared keyword means no
-    ``functools.partial`` at all - the pre-existing zero-overhead emission."""
+    """Without **kwargs at the call site or a declared keyword, no functools.partial is emitted, keeping the pre-existing zero-overhead emission."""
     forward = _rewrite_toy(
         monkeypatch, (_TOY_FIND, _TOY_REPLACE_NO_KWARGS),
     )
@@ -218,8 +214,7 @@ def test_rewriter_leaves_a_kwargless_call_site_alone(monkeypatch):
 
 @pytest.mark.parametrize("declaration", [("sentinel",), {"sentinel": "sentinel"}])
 def test_rewriter_binds_declared_keyword_into_the_callable(monkeypatch, declaration):
-    """Sequence and mapping spellings both bind the keyword into the callable on
-    the checkpointed branch and pass it directly on the else branch."""
+    """Sequence and mapping spellings both bind the keyword into the callable on the checkpointed branch and pass it directly on the else branch."""
     forward = _rewrite_toy(
         monkeypatch, (_TOY_FIND, _TOY_REPLACE, declaration),
     )
@@ -230,8 +225,7 @@ def test_rewriter_binds_declared_keyword_into_the_callable(monkeypatch, declarat
     checkpointed = branch.body[0].value
     assert isinstance(checkpointed, ast.Call)
     assert ast.unparse(checkpointed.func) == "self._gradient_checkpointing_func"
-    # No keyword may be left on the checkpoint function, not even the layer's own
-    # **kwargs: `Unexpected keyword arguments` the first time a caller passes one.
+    # No keyword may reach the checkpoint function, not even the layer's own **kwargs, or the first caller passing one gets Unexpected keyword arguments.
     assert [kw.arg for kw in checkpointed.keywords] == [], (
         "no keyword may reach _gradient_checkpointing_func; "
         f"got {[kw.arg for kw in checkpointed.keywords]}"
@@ -262,8 +256,7 @@ def test_rewriter_bound_keyword_supports_a_custom_expression(monkeypatch):
 
 
 def test_rewriter_both_branches_call_the_layer_identically(monkeypatch):
-    """The checkpointed and the direct branch must hand the layer the same
-    arguments - the only difference may be the checkpoint indirection."""
+    """The checkpointed and direct branches must hand the layer identical arguments; the only difference may be the checkpoint indirection."""
     forward = _rewrite_toy(monkeypatch, (_TOY_FIND, _TOY_REPLACE, ("sentinel",)))
     branch = _for_loop_body(forward).body[0]
     checkpointed = branch.body[0].value
@@ -280,12 +273,8 @@ def test_rewriter_both_branches_call_the_layer_identically(monkeypatch):
 
 
 def test_rewritten_forward_survives_non_empty_runtime_kwargs(monkeypatch):
-    """Executed proof, not just emitted text.
-
-    With an EMPTY ``**kwargs`` the old emission worked by accident, which is how
-    the leak survived review. Give the forward one real runtime keyword and the
-    reentrant ``torch.utils.checkpoint.checkpoint`` raises ``ValueError:
-    Unexpected keyword arguments`` instead of ever reaching the layer."""
+    """Executed, not just emitted: with an empty **kwargs the old emission only worked by accident; one runtime keyword
+    makes reentrant torch.utils.checkpoint.checkpoint raise 'Unexpected keyword arguments'."""
     forward = _rewrite_toy(monkeypatch, (_TOY_FIND, _TOY_REPLACE, ("sentinel",)))
 
     seen = []
@@ -340,13 +329,9 @@ def test_rewriter_resolves_the_modulelist_layer_class():
 
 
 def test_rewriter_skips_a_replacement_the_layer_cannot_take(monkeypatch):
-    """A replacement entry may declare the parameters the layer must have.
-
-    Two transformers generations spell the Qwen2-VL vision call site
-    identically (4.53.0 - 5.9 and 5.10 - 5.14) but only the first still takes
-    ``rotary_pos_emb``. Injecting it on 5.10 - 5.14 handed the block one
-    positional too many. The text alone cannot tell them apart, so the entry
-    declares the parameter it depends on and is skipped when it is gone."""
+    """A replacement may declare layer parameters it needs: Qwen2-VL call sites read the same in transformers 4.53.0-5.9
+    and 5.10-5.14, but only the first takes rotary_pos_emb; injecting it on 5.10-5.14 passed one positional too many,
+    so the entry is skipped when the parameter is absent."""
     forward = _rewrite_named_toy(
         monkeypatch,
         (_TOY_NAMED_FIND, _TOY_NAMED_REPLACE, None, ("injected",)),
@@ -357,8 +342,7 @@ def test_rewriter_skips_a_replacement_the_layer_cannot_take(monkeypatch):
 
 
 def test_rewriter_applies_a_replacement_the_layer_can_take(monkeypatch):
-    """Control for the test above: the same entry fires when the declared
-    parameter is present, so the guard cannot pass by never applying."""
+    """Control for the test above: the same entry fires when the declared parameter is present, so the guard cannot pass by never applying."""
     forward = _rewrite_named_toy(
         monkeypatch,
         (_TOY_NAMED_FIND, _TOY_NAMED_REPLACE, None, ("extra",)),
@@ -369,9 +353,8 @@ def test_rewriter_applies_a_replacement_the_layer_can_take(monkeypatch):
 
 def test_rewriter_applies_a_guarded_replacement_when_the_layer_is_unresolvable(
         monkeypatch):
-    """The plain toy fills its ModuleList with ``torch.nn.Identity``, which is
-    not a name in the toy's own module. Unresolvable means "behave exactly as
-    before", never "silently stop rewriting"."""
+    """Unresolvable layer names must behave as before, never silently stop rewriting; the toy's ModuleList holds
+    torch.nn.Identity, which is not a name in its module."""
     forward = _rewrite_toy(
         monkeypatch, (_TOY_FIND, _TOY_REPLACE, None, ("nothing_has_this",)),
     )
@@ -380,9 +363,7 @@ def test_rewriter_applies_a_guarded_replacement_when_the_layer_is_unresolvable(
 
 
 def test_qwen2_vl_rotary_entries_declare_the_parameter_they_depend_on():
-    """The shipped entries that re-inject ``rotary_pos_emb`` must be guarded on
-    it; transformers 5.10 - 5.14 spell the call site the same way and dropped
-    the parameter."""
+    """Shipped entries that re-inject rotary_pos_emb must be guarded on it, since transformers 5.10-5.14 spell the call site the same way but dropped the parameter."""
     guarded = [
         entry for entry in compiler.custom_gradient_checkpointing_replacements
         if "rotary_pos_emb=rotary_pos_emb" in entry[1]
@@ -396,10 +377,8 @@ def test_qwen2_vl_rotary_entries_declare_the_parameter_they_depend_on():
 
 
 def test_qwen2_vl_5x_entry_declares_max_seqlen():
-    """The shipped transformers 5.x Qwen2-VL entry must keep max_seqlen rather
-    than drop it, and must remove it from the positional list (otherwise the
-    ``arg=arg`` demotion would push it into a positional slot the block does not
-    have)."""
+    """The shipped transformers 5.x Qwen2-VL entry must keep max_seqlen and remove it from the positional list, else the
+    arg=arg demotion pushes it into a slot the block lacks."""
     entries = compiler.custom_gradient_checkpointing_replacements
     matching = [e for e in entries if "max_seqlen=max_seqlen" in e[0]]
     assert len(matching) == 1, "expected exactly one 5.x max_seqlen entry"
@@ -415,9 +394,7 @@ def test_qwen2_vl_5x_entry_declares_max_seqlen():
 
 
 def test_generated_module_imports_functools():
-    """``functools`` is not in the generated module's license header nor
-    guaranteed to be re-exported by the model module, so create_new_function()
-    must import it whenever the emitted source uses it."""
+    """functools is neither in the generated header nor guaranteed re-exported by the model module, so create_new_function() must import it when the source uses it."""
     source = inspect.getsource(compiler.create_new_function)
     assert '"functools." in new_source' in source
     assert '"import functools\\n"' in source
@@ -435,14 +412,8 @@ def test_bind_checkpoint_kwargs_is_identity_without_kwargs():
 
 
 def test_torch_checkpoint_keywords_covers_every_keyword_only_parameter():
-    """Whatever torch's own ``checkpoint`` declares keyword-only is the
-    checkpoint machinery's, never the block's.
-
-    ``early_stop`` is the concrete miss this pins: torch added it as a per-call
-    keyword and documents it as ignored under ``use_reentrant = True``, which is
-    what the Unsloth shims force. It used to be bound onto the wrapped function,
-    so an ordinary block raised ``TypeError: forward() got an unexpected keyword
-    argument 'early_stop'`` as soon as Unsloth replaced the global symbol."""
+    """torch checkpoint's keyword-only params belong to the checkpoint, not the block: early_stop is ignored under
+    use_reentrant=True (forced by the Unsloth shims), so binding it onto the block raised TypeError."""
     signature = inspect.signature(torch.utils.checkpoint.checkpoint)
     keyword_only = {
         name for name, parameter in signature.parameters.items()
@@ -453,8 +424,7 @@ def test_torch_checkpoint_keywords_covers_every_keyword_only_parameter():
 
 
 def test_bind_checkpoint_kwargs_drops_early_stop(monkeypatch):
-    """End of the same story, executed: a block with no ``early_stop``
-    parameter must survive a caller using torch's documented keyword."""
+    """Executed: a block without an early_stop parameter must survive a caller passing torch's documented early_stop keyword."""
     if "early_stop" not in inspect.signature(torch.utils.checkpoint.checkpoint).parameters:
         pytest.skip("this torch has no per-call early_stop")
 
@@ -482,9 +452,7 @@ def test_bind_checkpoint_kwargs_binds_the_rest():
     "checkpoint_fn", [unsloth_gradient_checkpoint, unsloth_checkpoint],
 )
 def test_checkpoint_shims_deliver_extra_kwargs_to_the_function(checkpoint_fn):
-    """``unsloth_gradient_checkpoint`` used to drop them silently and
-    ``unsloth_checkpoint`` used to raise. Both now behave like torch's
-    non-reentrant checkpoint: the keyword reaches the wrapped function."""
+    """Extra keyword arguments must reach the wrapped function in unsloth_gradient_checkpoint and unsloth_checkpoint, as in torch's non-reentrant checkpoint."""
     if checkpoint_fn is unsloth_checkpoint:
         pytest.importorskip("torch")
         pytest.skip(
@@ -505,17 +473,14 @@ def test_checkpoint_shims_deliver_extra_kwargs_to_the_function(checkpoint_fn):
 
 
 def test_unsloth_checkpoint_binds_instead_of_raising():
-    """Source-level guard for the shim we cannot execute on CPU: the leftover
-    keyword branch must bind, not raise."""
+    """Source-level guard for the shim, which cannot run on CPU: the leftover keyword branch must bind via _bind_checkpoint_kwargs, not raise ValueError."""
     source = inspect.getsource(unsloth_checkpoint)
     assert "_bind_checkpoint_kwargs" in source
     assert "raise ValueError" not in source.split("if kwargs and use_reentrant")[1][:400]
 
 
 def test_unsloth_gradient_checkpointer_accepts_a_bare_tensor_return():
-    """Every modern transformers block returns the tensor itself rather than a
-    1-tuple. The recompute in backward used to insist on a 1-tuple and raised
-    ``too many values to unpack``."""
+    """Modern transformers blocks return a bare tensor, not a 1-tuple; the backward recompute must accept it instead of raising 'too many values to unpack'."""
     def block(x):
         return x * 3
 
@@ -538,19 +503,15 @@ def test_unsloth_gradient_checkpointer_still_accepts_a_one_tuple_return():
     assert torch.allclose(x.grad, torch.full_like(x, 3.0))
 
 
-# Tensor keywords stay visible to autograd. A non-leaf tensor keyword closed over
-# by functools.partial is never an input of the checkpoint autograd.Function, so
-# a shared one dies with "Trying to backward through the graph a second time".
+# Tensor keywords must stay autograd inputs: a non-leaf tensor closed over by functools.partial is not a Function input,
+# so a shared one breaks on second backward.
 
 
 @pytest.fixture
 def cpu_offload_globals(monkeypatch):
-    """Let UnslothCheckpointFunction run on CPU.
-
-    Its module globals are normally seeded by
-    ``initialize_unsloth_gradient_checkpointing()``, which needs pinned memory,
-    streams and a device count. MINIMUM_SIZE above any tensor in these tests
-    keeps the offload branch off, so the plain recompute path runs."""
+    """Lets UnslothCheckpointFunction run on CPU: its globals are normally seeded by
+    initialize_unsloth_gradient_checkpointing() (needs pinned memory, streams, device count); MINIMUM_SIZE keeps
+    offload off."""
     from unsloth_zoo import gradient_checkpointing as gc_module
     for name, value in (
         ("FIRST_PASS", False), ("LAST_GC_INDEX", 0), ("CURRENT_GC_INDEX", 0),
@@ -589,15 +550,8 @@ def test_offloaded_wrapper_matches_torch_checkpoint(cpu_offload_globals, preserv
 
 
 def test_offloaded_wrapper_reinitialises_after_an_unpatch(cpu_offload_globals, monkeypatch):
-    """Buffers left as None by an unpatch must re-initialise, not raise.
-
-    unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS to None rather
-    than emptying it, and prepare_model_for_training calls that unpatch for every
-    use_gradient_checkpointing other than "unsloth". Since installing this shim
-    at all means going through patch_unsloth_gradient_checkpointing after model
-    setup, None is the state it normally finds - and `len(None)` is a TypeError
-    raised before the wrapper does anything else.
-    """
+    """Wrapper must re-initialise CPU_BUFFERS left None by unpatch_unsloth_smart_gradient_checkpointing
+    (prepare_model_for_training calls it for non-'unsloth' modes); len(None) would be a TypeError."""
     gc_module = cpu_offload_globals
     monkeypatch.setattr(gc_module, "CPU_BUFFERS", None, raising = False)
 
@@ -632,8 +586,7 @@ class _SideLayer(torch.nn.Module):
 
 
 def _run_shared_keyword(checkpoint_fn):
-    """Two checkpointed layers fed the same non-leaf tensor keyword, which also
-    contributes to the loss. Returns the gradients."""
+    """Two checkpointed layers fed the same non-leaf tensor keyword, which also feeds the loss; returns the gradients."""
     torch.manual_seed(0)
     layers = torch.nn.ModuleList([_SideLayer(), _SideLayer()])
     torch.manual_seed(1)
@@ -670,8 +623,7 @@ def test_shared_tensor_keyword_matches_the_uncheckpointed_reference(
 
 
 def test_bind_checkpoint_kwargs_routes_differentiable_tensors_positionally():
-    """The tensor keyword becomes a positional input of the checkpoint Function
-    and is put back into keyword position before the block is called."""
+    """The differentiable tensor keyword becomes a positional input of the checkpoint Function and is put back as a keyword before the block is called."""
     def block(x, side = None, flag = None):
         return (x, side, flag)
 
@@ -696,8 +648,7 @@ def test_non_differentiable_tensor_keyword_keeps_the_cheap_partial():
 
 
 def test_reentrant_checkpointer_returns_gradients_for_tensor_args():
-    """Positional tensor args got the same treatment: the recompute ran on the
-    still-attached tensor and the Function returned None for it."""
+    """Positional tensor args are the same case: the recompute ran on the still-attached tensor and the Function returned None as their gradient."""
     def block(hidden_states, side):
         return hidden_states * 2.0 + side
 
@@ -711,11 +662,9 @@ def test_reentrant_checkpointer_returns_gradients_for_tensor_args():
     assert torch.allclose(leaf.grad, torch.full_like(leaf, 6.0))
 
 
-# A frozen first activation next to a differentiable later input.
-# UnslothCheckpointFunction decided "this Function has a gradient to produce" from
-# positional input zero alone, so a frozen input zero reached the early return and
-# the engine got one None where it wanted a gradient per input. torch's own reentrant
-# CheckpointFunction has no such gate: it saves every tensor input unconditionally.
+# UnslothCheckpointFunction decided it had a gradient to produce from positional input zero alone, so a frozen input
+# zero hit the early return and gave one None where a gradient per input was needed; torch's reentrant
+# CheckpointFunction saves every tensor input unconditionally.
 
 
 def _frozen_first_input(checkpoint_fn, as_keyword):
@@ -754,8 +703,7 @@ def test_frozen_first_activation_still_propagates(
 
 def test_frozen_first_activation_matches_torchs_own_reentrant_checkpoint(
         cpu_offload_globals):
-    """The behaviour above is not an Unsloth invention: pristine torch, on the
-    reentrant path these shims force, already propagates here."""
+    """Pristine torch already behaves this way on the reentrant checkpoint path these shims force."""
     pristine = getattr(
         torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None,
     ) or torch.utils.checkpoint.checkpoint

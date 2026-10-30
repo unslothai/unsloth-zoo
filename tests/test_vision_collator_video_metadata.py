@@ -15,8 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""transformers 5 reads a decoded video's rate from video_metadata, not fps= (else 24 fps).
-unslothai/unsloth#3357."""
+"""Video collator passes video_metadata so transformers 5 reads the decoded rate, not fps= (else 24 fps); see unslothai/unsloth 3357."""
 
 import types
 

@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Block gradient checkpointing for any model: diffusers ModelMixin, transformers PreTrainedModel, or a plain nn.Module.
-
-``every_n_blocks`` follows transformers' ``every_n_layers``: 1 checkpoints every block, N checkpoints blocks 0, N, 2N...
-(fewer recomputes, more activation memory). Only torch is imported, so the file also loads on its own (no package init).
-"""
+"""Block gradient checkpointing for diffusers, transformers or plain nn.Module models; every_n_blocks follows
+transformers' every_n_layers (blocks 0, N, 2N); imports only torch."""
 
 import contextlib
 import functools
@@ -66,8 +63,8 @@ def _owner(function):
 
 
 class _TorchCheckpoint:
-    # Looked up per call: Unsloth's LLM shims force reentrant / offloaded recompute, so their stashed pristine one wins.
-    # A class, not a closure: diffusers / transformers store it on the model, which must still pickle.
+    # Looked up per call: Unsloth's LLM shims force reentrant/offloaded recompute, so their stashed pristine checkpoint
+    # wins; a class, since diffusers/transformers store it on the model and it must pickle.
     __slots__ = ("use_reentrant",)
 
     def __init__(self, use_reentrant):
@@ -104,18 +101,15 @@ class _EveryN:
 
 
 def every_n_checkpoint_function(every_n_blocks = 1, use_reentrant = False, checkpoint_function = None):
-    """A ``gradient_checkpointing_func`` that checkpoints every Nth distinct caller in first-call (forward) order.
-
-    Counting callers rather than a class list makes it exact wherever a model routes the function: the SDXL UNet
-    also checkpoints ResnetBlock2D, which its ``_repeated_blocks`` (BasicTransformerBlock only) does not list."""
+    """Checkpoints every Nth distinct caller in first-call order; counting callers rather than a class list also covers
+    blocks like SDXL ResnetBlock2D missing from _repeated_blocks."""
     base = checkpoint_function or _TorchCheckpoint(use_reentrant)
     every_n_blocks = max(1, int(every_n_blocks))
     return base if every_n_blocks == 1 else _EveryN(every_n_blocks, base)
 
 
 def find_repeated_blocks(model):
-    """The model's repeated blocks: its declared ``_repeated_blocks`` / ``_no_split_modules`` classes, else the
-    ModuleList holding the most parameters."""
+    """The repeated blocks: modules whose class is named in _repeated_blocks or _no_split_modules, else the ModuleList holding the most parameters."""
     for attr in ("_repeated_blocks", "_no_split_modules"):
         names = set(getattr(model, attr, None) or ())
         if names:
@@ -150,8 +144,8 @@ def _hooks(block, name):
 
 
 def _recompute_body(block, inner, *args, **kwargs):
-    # Recompute reruns hooks for side effects only, return ignored (saved inputs carry the rewrite); only reads flags
-    # (compiled checkpoints must not write).
+    # Recompute reruns hooks for side effects only; return value ignored (saved inputs carry the rewrite) and only flags
+    # are read, since compiled checkpoints must not write.
     if block.__dict__.get(_FORWARD):
         return inner(*args, **kwargs)
     with_kwargs = block._forward_pre_hooks_with_kwargs
@@ -227,11 +221,9 @@ def _wrap_blocks(model, every_n_blocks, use_reentrant, checkpoint_function):
 
 
 def enable_block_gradient_checkpointing(model, every_n_blocks = 1, use_reentrant = False, checkpoint_function = None):
-    """Turn on gradient checkpointing for ``model``'s repeated blocks; returns the path used ("diffusers",
-    "transformers" or "modules"). Idempotent: a second call replaces the first one's setting.
-
-    Non-reentrant by default: it supports keyword arguments and inputs that do not require grad (frozen bases under
-    LoRA), and reentrant recompute of a bnb 4-bit LoRA linear can hit an illegal memory access on FLUX."""
+    """Checkpoints repeated blocks and returns the path used (diffusers, transformers or modules); idempotent.
+    Non-reentrant by default: supports kwargs and no-grad inputs; reentrant recompute of bnb 4-bit LoRA linears can
+    hit an illegal memory access on FLUX."""
     every_n_blocks = max(1, int(every_n_blocks))
     function = every_n_checkpoint_function(every_n_blocks, use_reentrant, checkpoint_function)
     _stamp_order(model)

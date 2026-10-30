@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_mamba_fused_split_without_causal_conv1d: split path only when causal_conv1d is unusable, patch before or after
-the modeling import. Subprocess per case: stub mamba_ssm failing like the real one, tiny Falcon-H1 on CPU."""
+"""Tests patch_mamba_fused_split_without_causal_conv1d: split path only when causal_conv1d is unusable, patch before or
+after modeling import; subprocess per case, stub mamba_ssm fails like the real one, tiny Falcon-H1 on CPU."""
 
 import json
 import os
@@ -63,8 +63,8 @@ import torch
 src = open(misc, encoding = "utf-8").read()
 ns = {"torch": torch, "importlib": importlib, "functools": functools,
       "logger": logging.getLogger("t")}
-wanted = ("_mamba_fused_split_needs_causal_conv1d_unusable",
-          "patch_mamba_fused_split_without_causal_conv1d")
+wanted = ("_mamba_fused_split_needs_causal_conv1d_unusable", "_resolves_to_mamba_ssm",
+          "_hub_func_factory_patched", "patch_mamba_fused_split_without_causal_conv1d")
 for node in ast.parse(src).body:
     if isinstance(node, ast.FunctionDef) and node.name in wanted:
         exec(ast.get_source_segment(src, node), ns)

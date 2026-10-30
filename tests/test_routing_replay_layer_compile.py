@@ -74,6 +74,13 @@ class _Model(torch.nn.Module):
         return self.model(input_ids)
 
 
+def _addresses(layer_input):
+    if layer_input is None:
+        return None
+    values = layer_input.tolist() if torch.is_tensor(layer_input) else layer_input
+    return tuple(sorted(a for a in values if a != 0))
+
+
 @pytest.mark.parametrize("backend", ["eager", "aot_eager"])
 @pytest.mark.parametrize("fullgraph, dynamic, graph_break", [
     (False, None, False), (False, None, True), (False, True, True), (True, False, False), (True, True, False),
@@ -82,7 +89,7 @@ def test_compiled_layer_with_pre_hook_traces_and_never_sees_old_inputs(replay, m
     seen = []
 
     def recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
-        seen.append(None if layer_input is None else tuple(sorted(layer_input)))
+        seen.append(layer_input)
         return None
 
     monkeypatch.setattr(replay, "_recomputed_routes", recomputed_routes)
@@ -103,11 +110,8 @@ def test_compiled_layer_with_pre_hook_traces_and_never_sees_old_inputs(replay, m
         out.sum().backward()
     assert len(seen) == len(xs)
     for x, addresses in zip(xs, seen):
-        if graph_break:
-            assert addresses == (x.data_ptr(),)
-        else:
-            # One graph: the op writes after the router hook's traced read.
-            assert addresses in (None, (x.data_ptr(),))
+        # This call's runtime addresses, never None or a stale call's.
+        assert _addresses(addresses) == (x.data_ptr(),)
 
 
 @pytest.mark.parametrize("fullgraph", [False, True])
@@ -125,3 +129,66 @@ def test_compiled_layer_still_replays_forced_experts(replay, fullgraph):
     fn = torch.compile(lambda x: layer(x), backend = "eager", fullgraph = fullgraph)
     _, ids = fn(x)
     assert torch.equal(ids.sort(-1).values, forced.sort(-1).values)
+
+
+def _hooked_layer(replay, graph_break = False):
+    model = _Model(graph_break)
+    assert replay.install_routing_replay(model) == 1
+    layer = model.model.layers[0]
+    layer.router._unsloth_replay_formula = "softmax"
+    # Built eagerly, as the first eager forward does: a fullgraph region cannot create a Generator.
+    replay._signature_projection(8, torch.device("cpu"))
+    return layer
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager", "inductor"])
+@pytest.mark.parametrize("graph_break", [False, True])
+def test_compiled_layer_records_this_calls_input_addresses(replay, backend, graph_break):
+    # Runtime addresses must survive tracing with the router hook and Inductor's dead-op removal.
+    layer = _hooked_layer(replay, graph_break)
+    fn = torch.compile(lambda x: layer(x), backend = backend, fullgraph = not graph_break)
+    replay._STATE.in_forward = True
+    xs = []
+    for n in (3, 3, 5):
+        x = torch.randn(n, 8, requires_grad = True)
+        xs.append(x)
+        replay._STATE.current = torch.zeros(n, 1, 2, dtype = torch.long)
+        replay._STATE.record = {}
+        replay._STATE.pending.append(replay._STATE.record)
+        out, _ = fn(x)
+        out.sum().backward()
+        assert _addresses(replay._STATE.record[0][4]) == (x.data_ptr(),)
+
+
+@pytest.mark.parametrize("backend", [None, "eager", "aot_eager", "inductor"])
+@pytest.mark.parametrize("graph_break", [False, True])
+def test_reentrant_recompute_of_identical_inputs_keeps_forced_experts(replay, backend, graph_break):
+    # Identical inputs forced to different experts: only their addresses tell the recomputes apart.
+    from torch.utils.checkpoint import checkpoint
+
+    def run(checkpointing):
+        replay.reset_routing_replay()
+        torch._dynamo.reset()
+        layer = _hooked_layer(replay, graph_break)
+        fn = layer if backend is None else torch.compile(
+            lambda x: layer(x), backend = backend, fullgraph = not graph_break,
+        )
+        xs = [torch.arange(1.0, 9.0).reshape(1, 8).requires_grad_() for _ in range(2)]
+        losses = []
+        for x, forced in zip(xs, ([[0, 1]], [[2, 3]])):
+            replay._STATE.in_forward = True
+            replay._STATE.current = torch.tensor(forced).unsqueeze(1)
+            replay._STATE.record = {}
+            replay._STATE.pending.append(replay._STATE.record)
+            out, ids = checkpoint(fn, x, use_reentrant = True) if checkpointing else fn(x)
+            assert ids.sort(-1).values.tolist() == forced
+            losses.append((out * torch.arange(1.0, 9.0)).sum())
+        replay._STATE.current = None
+        replay._STATE.record = None
+        replay._STATE.in_forward = False
+        sum(losses).backward()
+        return torch.stack([x.grad for x in xs])
+
+    reference = run(checkpointing = False)
+    assert not torch.allclose(reference[0], reference[1])
+    torch.testing.assert_close(run(checkpointing = True), reference, rtol = 0, atol = 0)

@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`create_standalone_class` against a forward wrapped by a function that binds
-the original through a default argument.
-
-`_force_slow_path_on_raising_mamba_mixers` (`temporary_patches/misc.py`) installs
-`def _slow_only(self, *a, __orig = _mixer.forward, **kw)` on Jamba / Zamba mamba
-mixers. Emitted verbatim, `_mixer` is undefined and the compiled module fails to
-import with `NameError`. Fakes run the real patch (extracted by AST), so no
-transformers or GPU is needed; a second group uses the installed transformers.
-"""
+"""Forward wrappers that bind the original through a default argument (Jamba/Zamba slow-path patch) must compile; emitted verbatim, _mixer is undefined."""
 
 import ast
 import importlib
@@ -47,8 +39,7 @@ def _load_patch():
     namespace = {}
     for node in ast.parse(source).body:
         if isinstance(node, ast.FunctionDef) and node.name == "_force_slow_path_on_raising_mamba_mixers":
-            # Keep the real file name and line numbers so `inspect.getsource`
-            # reads the wrapper exactly as the compiler does in production.
+            # Compile with the real file name and line numbers so inspect.getsource reads the wrapper exactly as production does.
             code = compile(ast.Module(body = [node], type_ignores = []), str(MISC), "exec")
             exec(code, namespace)
     assert "_force_slow_path_on_raising_mamba_mixers" in namespace
@@ -66,8 +57,7 @@ CONFIGS = {
     "transformers.models.zamba.configuration_zamba" : "ZambaConfig",
 }
 
-# One mixer with a plain forward (transformers 4.x) and one whose forward sits
-# behind a bare-closure decorator like `@force_accelerate_hooks` (transformers 5.x).
+# Fake mixers: one with a plain forward (transformers 4.x), one behind a bare-closure decorator like @force_accelerate_hooks (transformers 5.x).
 _FAKE_MODELING_SOURCE = """
     import torch
     from torch import nn
@@ -203,8 +193,7 @@ def test_unwrap_prefers_closure_over_defaults():
 
 
 def test_self_contained_renamed_patch_is_kept(tmp_path, monkeypatch):
-    """Negative case: a temporary patch that replaces forward with a renamed,
-    self-contained function (no function default) still ships as is."""
+    """Negative case: a renamed, self-contained forward with no function default is kept as is."""
     modules = _install_fakes(tmp_path, monkeypatch, decorated = False)
     file_name, class_name, module = modules["jamba"]
     cls = getattr(module, class_name)

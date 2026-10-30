@@ -1,17 +1,5 @@
-"""Muse Glimmer sliding layers must route to the banded O(S*w) kernel, and only there.
-
-Muse Glimmer interleaves 39 sliding_attention layers (window 2048) with 13
-full_attention layers, and hands every sliding layer a dense [B, 1, S, S] band
-mask, so each one pays O(S^2) for a 2048 key window. The router in
-``muse_glimmer_banded_attention`` sends exactly those layers to the block-local
-kernel shared with gemma-4 and defers everything else.
-
-These run on CPU (float32, small shapes), so they are real CI coverage rather
-than GPU-only. They pin three things: the gate defers in every case it must,
-the engaged path matches a reference causal+sliding SDPA, and installing the
-router is idempotent across the three passes unsloth makes over
-TEMPORARY_PATCHES without breaking gemma-4's own re-entry guard.
-"""
+"""Muse Glimmer sliding layers route only to the banded O(S*w) kernel shared with gemma-4; CPU tests check deferral,
+SDPA parity, and idempotent install across the three TEMPORARY_PATCHES passes."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -61,8 +49,7 @@ class MuseGlimmerVisionAttention(MuseGlimmerTextAttention):
 
 @pytest.fixture(autouse=True)
 def _clean_router(monkeypatch):
-    """Every test drives the router directly, so give it a known wrapped sdpa and
-    a clean env. The env readers are lru_cache(1), so they need cache_clear()."""
+    """Gives each test a known wrapped sdpa and a clean env; the env readers are lru_cache(1), so cache_clear() must be called on them."""
     monkeypatch.delenv("UNSLOTH_MUSE_GLIMMER_BANDED_SDPA", raising=False)
     monkeypatch.delenv("UNSLOTH_MUSE_GLIMMER_BANDED_FORCE", raising=False)
     mg._enabled.cache_clear()
@@ -105,8 +92,7 @@ def test_registered_in_temporary_patches():
 
 @pytest.mark.parametrize("S", [W, 2 * W, 3 * W - 1])
 def test_defers_below_three_windows(_clean_router, S):
-    """Blocking into (w, 2w) tiles is a measured loss below 2w and break-even at
-    2w, so short-context finetunes must be left completely alone."""
+    """Blocking into (w, 2w) tiles is a measured loss below 2w and break-even at 2w, so short-context finetunes must be left completely alone."""
     out, weights = _route(MuseGlimmerTextAttention(), S)
     assert out == "DEFERRED" and weights is None
     assert len(_clean_router) == 1
@@ -268,14 +254,12 @@ def test_compiled_banded_path_does_not_recompile(_clean_router):
     assert counter.frame_count == 1
 
 def test_patch_is_idempotent():
-    """unsloth applies TEMPORARY_PATCHES three times per process (init,
-    pre_compile, post_compile), so a second install must not stack a wrapper."""
+    """unsloth applies TEMPORARY_PATCHES three times per process (init, pre_compile, post_compile), so a repeat install must not stack a wrapper."""
     registry = _sdpa_registry()
     original = registry["sdpa"]
     prev_box = mg._ORIG_SDPA[0]
 
-    # Importing unsloth already ran TEMPORARY_PATCHES, so start from a known
-    # plain entry rather than from whatever is installed in this process.
+    # Importing unsloth already ran TEMPORARY_PATCHES, so install a known plain sdpa rather than starting from whatever this process has installed.
     def plain_sdpa(module, q, k, v, mask, **kw):
         return "PLAIN", None
 
@@ -293,9 +277,7 @@ def test_patch_is_idempotent():
 
 
 def test_patch_preserves_wrapped_router_sentinels():
-    """gemma-4's router re-entry guard reads its sentinel off the installed sdpa
-    entry only. Once this router wraps it, that sentinel must still be visible,
-    otherwise gemma-4 would wrap itself again on the next pass."""
+    """gemma-4's re-entry guard reads its sentinel only off the installed sdpa entry, so this router must keep that sentinel visible or gemma-4 wraps again."""
     registry = _sdpa_registry()
     original = registry["sdpa"]
     prev_box = mg._ORIG_SDPA[0]
@@ -317,10 +299,8 @@ def test_patch_preserves_wrapped_router_sentinels():
     finally:
         registry["sdpa"] = original
         mg._ORIG_SDPA[0] = prev_box
-        # Put the wrapper's attributes back exactly. Popping the forwarded sentinel stripped the
-        # real one when this process had already chained the wrapper over gemma-4's router, so
-        # the next TEMPORARY_PATCHES pass wrapped gemma-4 around this wrapper and every SDPA
-        # call recursed (muse -> gemma-4 -> muse).
+        # Restore attributes exactly: popping the forwarded sentinel stripped the real sentinel once chained over
+        # gemma-4, so the next pass wrapped gemma-4 and SDPA recursed (muse -> gemma-4 -> muse).
         attrs = vars(mg._sdpa_maybe_muse_glimmer_banded)
         attrs.clear()
         attrs.update(prev_attrs)

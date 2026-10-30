@@ -14,22 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU regression tests for the PR #684 review-fix cluster A.
-
-Covers the trainer/batching/tokenizer findings:
-
-1. _train_inner must not clobber a prebuilt _prepared_batches_include_epochs
-   flag set by train_on_responses_only (double-epoch counting).
-2. _create_labeled_batches must not raise on seed=None with torch_randperm.
-3. train_on_responses_only must only materialize epoch blocks for true
-   epoch-based runs (max_steps <= 0).
-4. SGD weight decay must be coupled into the gradient (HF/PyTorch parity),
-   not applied as AdamW-style decoupled parameter shrink.
-5. _get_processor_tokenizer must not return the low-level Rust backend for
-   HF fast tokenizers (which would break convert_tokens_to_ids / templates).
-
-Runs on Linux via the mlx_simulation torch shim.
-"""
+"""CPU regression tests for review-fix cluster A: trainer batching, SGD weight decay, tokenizer unwrap."""
 
 from __future__ import annotations
 
@@ -120,9 +105,7 @@ def test_thread4_coupled_decay_is_noop_when_disabled():
 
 
 def test_thread4_coupled_sgd_matches_torch_sgd_with_momentum():
-    """End-to-end parity: coupling wd into the grad then stepping MLX-sim SGD
-    (momentum) must equal torch.optim.SGD(weight_decay=wd) on a non-exempt
-    weight. This is what the decoupled shrink got wrong."""
+    """Wd coupled into the grad must match torch.optim.SGD with momentum; decoupled shrink diverged."""
     import mlx.core as mx
     import mlx.optimizers as optim
     from unsloth_zoo.mlx.trainer import MLXTrainer
@@ -163,8 +146,7 @@ def test_thread4_coupled_sgd_matches_torch_sgd_with_momentum():
 
 
 def test_thread4_decoupled_shrink_would_diverge_from_torch_sgd():
-    """Guard the regression itself: the old decoupled shrink does NOT match
-    torch SGD once momentum is involved, so the coupled path is required."""
+    """Guards the regression: the old decoupled shrink diverges from torch SGD once momentum is involved."""
     import mlx.core as mx
     import mlx.optimizers as optim
     from unsloth_zoo.mlx.trainer import MLXTrainer
@@ -381,15 +363,13 @@ def test_thread5_vlm_processor_unwraps_to_inner_tokenizer():
 
     proc = _VlmProcessor()
     result = _get_processor_tokenizer(proc)
-    # VLM processor has no top-level convert_tokens_to_ids and no _tokenizer,
-    # so we fall through to processor.tokenizer.
+    # A VLM processor lacks convert_tokens_to_ids and _tokenizer, so it falls to processor.tokenizer.
     assert result is proc.tokenizer
     assert hasattr(result, "convert_tokens_to_ids")
 
 
 def test_thread5_bare_wrapper_without_hf_api_still_unwraps_tokenizer():
-    """A wrapper that exposes _tokenizer but not the HF API (e.g. an mlx-vlm
-    style processor) still unwraps so downstream lookups keep working."""
+    """A _tokenizer wrapper with no HF API (e.g. an mlx-vlm processor) must still unwrap to the tokenizer."""
     from unsloth_zoo.mlx.utils import _get_processor_tokenizer
 
     inner = _FastTokenizer()
@@ -402,8 +382,7 @@ def test_thread5_bare_wrapper_without_hf_api_still_unwraps_tokenizer():
 
 
 def test_thread5_vlm_ignore_ids_resolve_with_fast_tokenizer():
-    """End-to-end: _get_vlm_ignore_token_ids must reach convert_tokens_to_ids
-    on a fast tokenizer instead of failing against the Rust backend."""
+    """_get_vlm_ignore_token_ids must reach convert_tokens_to_ids on fast tokenizers, not the Rust backend."""
     from unsloth_zoo.mlx.utils import _get_vlm_ignore_token_ids
 
     class _ImageTokenizer(_FastTokenizer):
@@ -425,10 +404,7 @@ def test_thread5_vlm_ignore_ids_resolve_with_fast_tokenizer():
     assert 201 in ids
 
 
-# Thread 5 follow-up: train_on_responses_only must hand the HF masking impl
-# a CALLABLE tokenizer. mlx-lm's TokenizerWrapper proxies attributes via
-# __getattr__ (so hasattr(convert_tokens_to_ids) is True) but defines no
-# __call__, and the HF impl invokes tokenizer(...) directly.
+# The HF masking impl calls tokenizer(...); mlx-lm TokenizerWrapper has no __call__, so unwrap it.
 
 def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
     import unsloth_zoo.dataset_utils as dataset_utils
