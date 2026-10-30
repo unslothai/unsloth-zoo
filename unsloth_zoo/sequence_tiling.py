@@ -301,7 +301,7 @@ def tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = 
                 got_rows = o.shape[dim] if c == "rows" else o.shape[0]
                 if compiling:
                     # A runtime assert, not a guard: the graph stays shared across lengths.
-                    torch._check(got_rows == length, lambda: "Unsloth: a tiled output has a different row count")
+                    torch._check(got_rows == length)  # no message: Dynamo on torch 2.6 cannot trace one
                 elif got_rows != length:
                     raise ValueError(
                         f"Unsloth: tiled output {j} of tile {i} has {got_rows} rows, the tile has {length}."
