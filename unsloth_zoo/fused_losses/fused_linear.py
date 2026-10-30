@@ -1478,7 +1478,17 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
     N, H = hidden.shape
     V = weight.shape[0]
     targets = targets.contiguous()
-    idx, n_keep = _keep_index(targets, None, V, ignore_index)
+    idx, n_keep = _keep_index(targets, None, V, ignore_index, fixed_ok = True)
+    keep = None
+    if n_keep < 0:
+        # Fixed rows: the chunked kernels give a target of -1 zero loss and zero dz; the flash path reads its
+        # target's weight row, so it gets 0 and its outputs are masked below.
+        keep, hidden, flash_targets = _fixed_inputs(idx, hidden, targets)
+        if not targets.dtype.is_signed:
+            targets = targets.long()  # -1 in uint8 is 255, a real class once V > 255
+        targets = torch.where(keep, targets, torch.full_like(targets, -1))
+        idx, n_keep = torch.arange(N, device = targets.device), N
+        CALLS["fixed_rows"] = CALLS.get("fixed_rows", 0) + 1
     f32 = dict(device = device, dtype = torch.float32)
     grad_h = torch.zeros((N, H), device = device, dtype = hidden.dtype) if need_h else hidden.new_empty(0)
     acc_w = None
@@ -1515,7 +1525,8 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
             if need_h and compute_dtype == torch.float16:
                 gscale = 2.0 ** max(math.floor(math.log2(16384.0 / max(abs(scale), 1e-30))), 0)
             with torch.autocast(device.type, enabled = False):
-                _tiled_forward(device, hidden, idx, n_keep, w, full_bias, targets, False, (inv_t, scale, cap),
+                _tiled_forward(device, hidden, idx, n_keep, w, full_bias, targets if keep is None else flash_targets,
+                               False, (inv_t, scale, cap),
                                (False, False, False, False), True, compute_dtype,
                                {"logp": lp_all, "lse": torch.empty(n_keep, **f32)}, -rows, None,
                                grad_h if need_h else None, gscale, -coef if need_h else None)
@@ -1563,6 +1574,10 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
             nll = (1.0 - eps) * (-lp_all.to(acc)) + eps * (lse_all.to(acc) - sum_all.to(acc) * (inv_t / V))
         else:
             nll = -lp_all.to(acc)
+        if keep is not None:
+            nll = torch.where(keep, nll, torch.zeros((), device = device, dtype = acc))
+            if need_h:
+                grad_h.masked_fill_(~keep[:, None], 0)
         loss = (nll.sum() / divisor.to(acc)).float()
     if n_keep > 0 and ratio is not None:
         if need_w:
@@ -2437,8 +2452,18 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
     sd = _stat_dtype(compute_dtype)
     acc = torch.float64 if device.type in ("cuda", "cpu") else torch.float32
     keep = mask.to(device = device, dtype = torch.bool).reshape(-1)
-    idx = keep.nonzero().squeeze(-1)
-    n_keep = int(idx.numel())
+    fixed = _fixed_rows(device)
+    if fixed:
+        # Every row (no nonzero, no host sync). Dropped rows take zero hidden rows (finite logits, no h in the head
+        # gradient); their loss, hidden gradient and bias gradient are masked below.
+        hidden = torch.where(keep[:, None], hidden, torch.zeros((), device = device, dtype = hidden.dtype))
+        t_keep = keep.to(t_hidden.device)
+        t_hidden = torch.where(t_keep[:, None], t_hidden, torch.zeros((), device = t_hidden.device, dtype = t_hidden.dtype))
+        idx, n_keep = torch.arange(N, device = device), N
+        CALLS["fixed_rows"] = CALLS.get("fixed_rows", 0) + 1
+    else:
+        idx = keep.nonzero().squeeze(-1)
+        n_keep = int(idx.numel())
     grad = need_h or need_w or need_b
     grad_h = torch.zeros((N, H), device = device, dtype = hidden.dtype) if need_h else hidden.new_empty(0)
     acc_w = None
@@ -2508,9 +2533,14 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
                     if row.shape[0] != n:
                         row = row[:n]
                         dzc = dzc[:n] if dzc is not None else None
-                    total += row.sum(dtype = acc)
+                    kc = keep[a:b] if fixed else None
+                    total += (row if kc is None else torch.where(kc, row, 0)).sum(dtype = acc)
                     if not grad:
                         continue
+                    if kc is not None:
+                        # Fill, not multiply: a dropped row's dz can be inf (fp16, large scaling), and inf * 0 is NaN
+                        # in the bias sum and in the head gradient (its zero hidden row does not cancel it).
+                        dzc.masked_fill_(~kc[:, None], 0)
                     if need_b:
                         acc_b += dzc.sum(0, dtype = sd)
                     _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, need_w, sd)
@@ -2527,7 +2557,8 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
                 else:
                     dcap = None
                 row, dz = _jsd_chunk(ls, lt, beta, grad)
-                total += row.sum(dtype = acc)
+                kc = keep[a:b] if fixed else None
+                total += (row if kc is None else torch.where(kc, row, 0)).sum(dtype = acc)
                 if not grad:
                     continue
                 factor = coef_dz * (inv_t * s_scale)
@@ -2535,10 +2566,14 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
                 if dcap is not None:
                     dz.mul_(dcap)
                     del dcap
+                if kc is not None:
+                    dz.masked_fill_(~kc[:, None], 0)
                 if need_b:
                     acc_b += dz.sum(0)
                 dzc = dz.to(compute_dtype) if compute_dtype != sd else dz
                 _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, need_w, sd)
+    if fixed and need_h:
+        grad_h.masked_fill_(~keep[:, None], 0)
     loss = (total / divisor.to(acc)).float()
     if ratio is not None:
         if need_w:
@@ -2613,6 +2648,15 @@ def _requires_grad(x):
     return x is not None and x.requires_grad
 
 
+def _f32_scalar(x, f32, first = True):
+    """x (its first element with first) as a 0-dim fp32 tensor on the head's device. A Python number is filled on the
+    device: a CPU tensor copied over is a host sync and cannot be captured in a CUDA graph."""
+    if isinstance(x, (int, float)):
+        return torch.full((), float(x), **f32)
+    x = torch.as_tensor(x).to(**f32)
+    return x.reshape(-1)[:1].reshape(()) if first else x.reshape(())
+
+
 def _head_bias(bias, weight):
     if bias is None:
         return None
@@ -2648,12 +2692,12 @@ def fused_linear_cross_entropy(
     if not 0.0 <= label_smoothing <= 1.0:
         raise ValueError(f"Unsloth: label_smoothing must be between 0.0 and 1.0, got {label_smoothing}.")
     f32 = dict(device = device, dtype = torch.float32)
-    divisor = torch.as_tensor(divisor).to(**f32).reshape(-1)[:1].reshape(())
+    divisor = _f32_scalar(divisor, f32)
     divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
     if scaling is None:
         scaling = torch.ones((), **f32)
     else:
-        scaling = torch.as_tensor(scaling).to(**f32).reshape(())
+        scaling = _f32_scalar(scaling, f32, first = False)
         scaling = torch.where(scaling == 0, torch.ones_like(scaling), scaling)
     if logits_bias is not None:
         # Bart's final_logits_bias is [1, vocab]; a split model may keep it off the head's device.
@@ -2777,12 +2821,12 @@ def fused_linear_jsd(
     if num_items_in_batch is None:
         divisor = keep.sum().to(**f32)
     else:
-        divisor = torch.as_tensor(num_items_in_batch).to(**f32).reshape(-1)[:1].reshape(())
+        divisor = _f32_scalar(num_items_in_batch, f32)
     divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
     if scaling is None:
         scaling = torch.ones((), **f32)
     else:
-        scaling = torch.as_tensor(scaling).to(**f32).reshape(())
+        scaling = _f32_scalar(scaling, f32, first = False)
         scaling = torch.where(scaling == 0, torch.ones_like(scaling), scaling)
     loss = getattr(torch.ops.unsloth_zoo, _JSD_OP)(
         hidden2, student_weight, student_bias, t_hidden2, teacher_weight, teacher_bias, keep, divisor, scaling,
