@@ -324,3 +324,24 @@ def test_float16_bias_master_merges_in_the_model_dtype(tmp_path):
     merged = model.merge_and_unload()
     with torch.no_grad():
         assert merged(input_ids=torch.randint(0, 64, (1, 4))).logits.dtype == torch.float16
+
+
+@pytest.mark.parametrize("bias", ["all", "lora_only"])
+@pytest.mark.parametrize("target", [torch.float32, torch.bfloat16])
+def test_float16_bias_master_follows_a_later_model_cast(bias, target):
+    """model.float() / model.bfloat16() after prepare: the bias hook must follow the module's current dtype,
+    not the float16 captured at install, or a plain forward fails with "self and mat2 must have the same dtype"."""
+    pytest.importorskip("peft")
+    model = _float16_bias_model(bias).to(target)
+    with torch.no_grad():
+        assert model(input_ids=torch.randint(0, 64, (1, 5))).logits.dtype == target
+    assert all(p.dtype == target for p in _trainable_biases(model).values())
+
+
+@pytest.mark.parametrize("target", [torch.float32, torch.bfloat16])
+def test_float16_bias_master_merged_then_cast(target):
+    """The hooks survive merge_and_unload: a merged model cast to float32 / bfloat16 still runs a plain forward."""
+    pytest.importorskip("peft")
+    merged = _float16_bias_model("all").merge_and_unload().to(target)
+    with torch.no_grad():
+        assert merged(input_ids=torch.randint(0, 64, (1, 4))).logits.dtype == target

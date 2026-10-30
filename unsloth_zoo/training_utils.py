@@ -94,13 +94,30 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
 pass
 
 
-def _bias_compute_dtype_pre_hook(dtype, saved, module, args):
-    """Run the module on its float32 bias master cast to the float16 compute dtype: outside autocast a float16
-    Linear rejects a float32 bias, and bitsandbytes Linear4bit would rewrite the master's .data in place. Under
-    autocast the matmul casts the bias the same way. The cast is differentiable: the gradient lands on the master.
-    State lives in the hook (`saved`), not module.__dict__, which older Dynamo cannot trace."""
+def _bias_compute_dtype(module, args):
+    """The dtype the module computes in now: its floating weight (a later model.float() / .bfloat16() or a merge
+    moves it), else the input (bitsandbytes Linear4bit packs its weight, possibly in a float quant_storage, and
+    computes in the input dtype)."""
+    weight = module._parameters.get("weight")
+    if weight is not None and weight.is_floating_point() and not hasattr(weight, "quant_state"):
+        return weight.dtype
+    for arg in args:
+        if torch.is_tensor(arg) and arg.is_floating_point():
+            return arg.dtype
+    return None
+
+
+def _bias_compute_dtype_pre_hook(saved, module, args):
+    """Run the module on its float32 bias master cast to the compute dtype: outside autocast a float16 Linear
+    rejects a float32 bias, and bitsandbytes Linear4bit would rewrite the master's .data in place. Under autocast
+    the matmul casts the bias the same way. The cast is differentiable: the gradient lands on the master. The dtype
+    is read per call, so it is a no-op once the bias already matches. State lives in the hook (`saved`), not
+    module.__dict__, which older Dynamo cannot trace."""
     master = module._parameters.get("bias")
-    if master is None or master.dtype == dtype:
+    if master is None:
+        return
+    dtype = _bias_compute_dtype(module, args)
+    if dtype is None or master.dtype == dtype:
         return
     saved.append(master)
     module._parameters["bias"] = master.to(dtype)
@@ -111,12 +128,12 @@ def _bias_compute_dtype_hook(saved, module, args, output):
         module._parameters["bias"] = saved.pop()
 
 
-def _cast_bias_in_forward(module, dtype):
+def _cast_bias_in_forward(module):
     # Hooks, not a class swap or parametrization: state_dict, merges and kernels reading .bias see the master.
     if any(getattr(hook, "func", None) is _bias_compute_dtype_pre_hook for hook in module._forward_pre_hooks.values()):
         return
     saved = []
-    module.register_forward_pre_hook(functools.partial(_bias_compute_dtype_pre_hook, dtype, saved))
+    module.register_forward_pre_hook(functools.partial(_bias_compute_dtype_pre_hook, saved))
     module.register_forward_hook(functools.partial(_bias_compute_dtype_hook, saved), always_call = True)
 
 
@@ -531,7 +548,7 @@ def prepare_model_for_training(
     pass
 
     for _module in _float32_bias_owners:
-        _cast_bias_in_forward(_module, torch.float16)
+        _cast_bias_in_forward(_module)
 
     # Wrap only if fp32 norms actually exist (our upcast, legacy env, or external policy);
     # gating on presence avoids wrapping a model that has none.
