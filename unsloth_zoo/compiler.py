@@ -6240,7 +6240,9 @@ def _install_lora_forward_variant(function, previous_forward, forward):
     """Switch PEFT's LoRA class to `forward` without changing the arithmetic of live layers.
 
     Layers created under the previous flag keep their variant (a model loaded earlier must give
-    the same results after a later load); layers created later take the new one.
+    the same results after a later load); layers created later take the new one. LoRA layers
+    attached later to a module built before the flip (get_peft_model on the earlier model) take
+    that module's variant, so every live module is stamped, not only the LoRA layers.
     """
     variants = dict(getattr(previous_forward, "_unsloth_variants", None) or {
         previous_forward._unsloth_force_float32: previous_forward,
@@ -6250,11 +6252,17 @@ def _install_lora_forward_variant(function, previous_forward, forward):
     previous_flag = previous_forward._unsloth_force_float32
     # type(), not isinstance: proxies and deprecated objects answer __class__ with errors / warnings.
     for module in gc.get_objects():
-        if issubclass(type(module), function) and "_unsloth_force_float32" not in module.__dict__:
-            module._unsloth_force_float32 = previous_flag
+        if not issubclass(type(module), torch.nn.Module) or "_unsloth_force_float32" in module.__dict__:
+            continue
+        base_layer = module.__dict__.get("_modules", {}).get("base_layer")
+        stamp = getattr(base_layer, "__dict__", {}).get("_unsloth_force_float32", previous_flag)
+        module.__dict__["_unsloth_force_float32"] = stamp
 
     def unsloth_forward(self, x, *args, **kwargs):
-        variant = variants.get(getattr(self, "_unsloth_force_float32", None), forward)
+        stamp = getattr(self, "_unsloth_force_float32", None)
+        if stamp is None:
+            stamp = getattr(getattr(self, "base_layer", None), "_unsloth_force_float32", None)
+        variant = variants.get(stamp, forward)
         return variant(self, x, *args, **kwargs)
 
     for key in ("_unsloth_force_float32", "_unsloth_original_forward",

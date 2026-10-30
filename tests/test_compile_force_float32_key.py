@@ -301,3 +301,76 @@ def test_retained_model_keeps_output_capture_after_a_flip(tmp_path):
     lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
     assert json.loads(lines[-1][len("RESULT "):]) == {"attentions": 1}
+
+
+DELAYED_SCRIPT = r"""
+import inspect, json, os, sys
+import torch
+from unsloth_zoo.temporary_patches import TEMPORARY_PATCHES
+import unsloth_zoo.compiler as compiler
+from peft import LoraConfig
+from peft.tuners.lora.layer import Linear
+
+def run_patches(phase):
+    for patch in TEMPORARY_PATCHES:
+        try:
+            if "phase" in inspect.signature(patch).parameters: patch(phase = phase)
+            else: patch()
+        except Exception: pass
+
+def compile(model_type, flag):
+    os.environ["UNSLOTH_FORCE_FLOAT32"] = flag
+    run_patches("pre_compile")
+    compiler.unsloth_compile_transformers(model_type)
+    run_patches("post_compile")
+
+def base():
+    return torch.nn.Linear(1, 1, bias = False, dtype = torch.bfloat16)
+
+def attach(base):
+    lora = Linear(base, "default", config = LoraConfig(r = 1, lora_alpha = 1), r = 1, lora_alpha = 1)
+    for p in lora.parameters(): p.data.fill_(1)
+    return lora.to(torch.bfloat16)
+
+first, second = json.loads(sys.argv[1])
+x = torch.tensor([[100000.0]], dtype = torch.bfloat16)
+out = {}
+with torch.no_grad():
+    compile(first[0], first[1])
+    kept_base = base()
+    out["fresh_first"] = attach(base())(x).item()
+    compile(second[0], second[1])
+    out["delayed_first"] = attach(kept_base)(x).item()
+    out["fresh_second"] = attach(base())(x).item()
+print("RESULT " + json.dumps({k: str(v) for k, v in out.items()}))
+"""
+
+
+@pytest.mark.parametrize("order", [
+    [["llama", "0"], ["gemma3", "1"]],
+    [["gemma3", "1"], ["llama", "0"]],
+], ids = ["bf16_then_fp16", "fp16_then_bf16"])
+def test_lora_attached_after_a_flip_follows_the_base_layer_flag(tmp_path, order):
+    # Model A loads, model B loads under the other flag, then A gets its adapters (get_peft_model
+    # after a second load): A's new LoRA layers must take A's variant, not the latest one.
+    env = dict(
+        os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
+        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_COMPILE_LOCATION = str(tmp_path / "cache"),
+    )
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p)
+    for key in ("UNSLOTH_FORCE_FLOAT32", "UNSLOTH_FORCE_CUSTOM_DTYPE", "UNSLOTH_COMPILE_OVERWRITE"):
+        env.pop(key, None)
+    proc = subprocess.run(
+        [sys.executable, "-c", DELAYED_SCRIPT, json.dumps(order)],
+        capture_output = True, text = True, timeout = 900, env = env,
+    )
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
+    got = json.loads(lines[-1][len("RESULT "):])
+    # Flag "1" LoRA runs the adapter in float16 (100000 overflows), flag "0" stays bf16 (199680).
+    value = {"0": "199680.0", "1": "inf"}
+    assert got == {
+        "fresh_first": value[order[0][1]],
+        "delayed_first": value[order[0][1]],
+        "fresh_second": value[order[1][1]],
+    }
