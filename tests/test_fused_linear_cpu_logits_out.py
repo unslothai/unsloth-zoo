@@ -51,3 +51,29 @@ def test_cpu_logits_are_not_written_through_a_strided_mm_out(monkeypatch, vocab)
     want = (h.float() @ w.float().t()).half()
     assert out.isfinite().all()
     torch.testing.assert_close(out, want, rtol = 2e-3, atol = 2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_cpu_logits_write_a_dense_destination_through_mm_out(monkeypatch, dtype):
+    dense, fresh = [], []
+    real = torch.mm
+
+    def mm(*args, **kwargs):
+        out = kwargs.get("out")
+        (fresh if out is None else dense).append(None if out is None else out.data_ptr())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "mm", mm)
+    gen = torch.Generator().manual_seed(0)
+    h = (torch.randn(4, 64, generator = gen) * 1e-1).to(dtype)
+    w = torch.randn(128, 64, generator = gen).to(dtype)
+    buf = fl._Buffers(4, 128, h.device, False, dtype)
+    buf.buf.fill_(float("nan"))
+    out = fl._logits_into(h, w, buf.logits(4), False)
+    assert dense == [buf.buf.data_ptr()] and not fresh
+    want = (h.float() @ w.float().t()).to(dtype)
+    torch.testing.assert_close(out, want, rtol = 2e-2, atol = 2e-2)
+
+    with torch.profiler.profile(activities = [torch.profiler.ProfilerActivity.CPU], profile_memory = True) as prof:
+        fl._logits_into(h, w, buf.logits(4), False)
+    assert all(e.self_cpu_memory_usage == 0 for e in prof.key_averages() if e.key == "aten::mm")
