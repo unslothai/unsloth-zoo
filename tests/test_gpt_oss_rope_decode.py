@@ -30,16 +30,12 @@ pytest.importorskip("triton")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _skip_without_cpu_inductor():
+def _skip_without_cpu_compiler(proc):
     # CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none.
-    try:
-        from torch._inductor.cpp_builder import get_cpp_compiler
-    except ImportError:
-        return  # older torch: let the run report its own error
-    try:
-        get_cpp_compiler()
-    except Exception as e:  # noqa: BLE001
-        pytest.skip(f"CPU Inductor has no C++ compiler here ({type(e).__name__}: {e})"[:300])
+    # Judged from the run itself, so a run that never compiles C++ is not skipped.
+    text = proc.stdout + proc.stderr
+    if proc.returncode != 0 and ("InvalidCxxCompiler" in text or "No working C++ compiler found" in text):
+        pytest.skip("CPU Inductor has no C++ compiler here")
 
 
 def _run(tmp_path, script, *args, env_extra = None):
@@ -55,6 +51,7 @@ def _run(tmp_path, script, *args, env_extra = None):
             env[key] = value
     proc = subprocess.run([sys.executable, str(path), *args], capture_output = True, text = True, env = env,
                           timeout = 1500)
+    _skip_without_cpu_compiler(proc)
     line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT ")]
     assert proc.returncode == 0 and line, proc.stdout[-2000:] + proc.stderr[-3000:]
     return json.loads(line[-1][len("RESULT "):])
@@ -110,7 +107,6 @@ def kernel_results(tmp_path_factory):
     script = _KERNEL.replace("__REGION__", textwrap.dedent(inspect.getsource(_region)))
     if torch.cuda.is_available() and torch.version.hip is None:
         return _run(tmp, script, "cuda")
-    _skip_without_cpu_inductor()
     return _run(tmp, script, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
 
 
@@ -288,7 +284,6 @@ def test_first_token_cannot_certify_an_eager_region(tmp_path):
     if torch.cuda.is_available() and torch.version.hip is None:
         res = _run(tmp_path, script, "cuda")
     else:
-        _skip_without_cpu_inductor()
         res = _run(tmp_path, script, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
     assert res["position0_agrees"] and res["eager_differs_later"], res  # the premise
     assert res["eager_region_declined"] and res["compiled_accepted"] and res["compiled_equal"], res
@@ -340,7 +335,6 @@ _LOOP = textwrap.dedent('''
 
 
 def test_decode_loop_calls_rope_decode(tmp_path):
-    _skip_without_cpu_inductor()
     env = {"UNSLOTH_COMPILE_DISABLE": None, "UNSLOTH_ENABLE_FLEX_ATTENTION": None}
     on = _run(tmp_path, _LOOP, "on", env_extra = env)
     off = _run(tmp_path, _LOOP, "off", env_extra = env)
