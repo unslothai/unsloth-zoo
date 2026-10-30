@@ -532,3 +532,25 @@ def test_float16_bias_master_peft_multihead_attention():
     assert all(p.grad is not None and p.grad.dtype == torch.float32 for p in masters.values())
     with torch.no_grad():
         assert model.eval()(x).dtype == torch.float16
+
+
+def test_float16_bias_master_interrupt_does_not_leak_the_cast_model_wide():
+    """always_call forward hooks only run on Exception: a KeyboardInterrupt (Ctrl-C in a notebook) inside one
+    layer's forward leaves the in-forward mark set. That must not turn every other bias in the model into a float16
+    cast outside forward (a non-Parameter for nn.init, `.data` writes, Accelerate's dtype-matching re-materialize),
+    and the next forward clears what the interrupted one left."""
+    pytest.importorskip("peft")
+    model = _float16_bias_model("all")
+    layers = model.base_model.model.model.layers
+    interrupted = layers[0].mlp.down_proj.base_layer
+    hook = interrupted.register_forward_pre_hook(
+        lambda module, args: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        model(input_ids=torch.randint(0, 64, (1, 5)))
+    hook.remove()
+    other = layers[1].self_attn.q_proj.base_layer
+    assert other.bias is other._parameters["bias"] and other.bias.dtype == torch.float32
+    # Training continues: the next step still lands float32 gradients on the masters.
+    model(input_ids=torch.randint(0, 64, (1, 5))).logits.float().sum().backward()
+    assert other._parameters["bias"].grad.dtype == torch.float32
+    assert interrupted.bias is interrupted._parameters["bias"]

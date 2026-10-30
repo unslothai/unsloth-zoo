@@ -209,6 +209,13 @@ def _float32_bias_exit_forward(module, args, output):
             in_forward.pop()
 
 
+def _float32_bias_reset_stacks(module, args):
+    # always_call forward hooks only run on Exception: a KeyboardInterrupt mid-forward leaves marks pushed. A
+    # top-level forward starts with nothing in flight, so it clears them.
+    for in_forward in module._unsloth_bias_stacks:
+        in_forward.clear()
+
+
 def _is_peft_tuner_layer(module):
     try:
         from peft.tuners.tuners_utils import BaseTunerLayer
@@ -676,6 +683,14 @@ def prepare_model_for_training(
         _owner_names.setdefault(_owner, set()).add(_leaf)
     for _owner, _names in _owner_names.items():
         _cast_bias_in_forward(model, _owner, _names)
+    if _owner_names:
+        if "_unsloth_bias_stacks" not in model.__dict__:
+            model._unsloth_bias_stacks = []
+            model.register_forward_pre_hook(_float32_bias_reset_stacks, prepend = True)
+        for _owner in _owner_names:
+            _stack = model.get_submodule(_owner).__dict__["_unsloth_bias_in_forward"]
+            if not any(_s is _stack for _s in model._unsloth_bias_stacks):
+                model._unsloth_bias_stacks.append(_stack)
 
     # Wrap only if fp32 norms actually exist (our upcast, legacy env, or external policy);
     # gating on presence avoids wrapping a model that has none.
