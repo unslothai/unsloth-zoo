@@ -89,6 +89,36 @@ def test_jsd_student_head_grad_buffer_becomes_param_grad(monkeypatch):
     assert torch.equal(ws[0].grad, ws[1].grad)
 
 
+def test_grpo_head_grad_buffer_becomes_param_grad(monkeypatch):
+    from unsloth_zoo.fused_losses import fused_grpo as fg
+
+    ptrs = []
+    impl = fl._OPS["grpo_impl"]
+
+    def spy(*args, **kwargs):
+        out = impl(*args, **kwargs)
+        ptrs.append(out[4].data_ptr())
+        return out
+
+    monkeypatch.setitem(fl._OPS, "grpo_impl", spy)
+    g = torch.Generator().manual_seed(9)
+    hidden = torch.randn(2, 5, H, generator = g)
+    weight = torch.randn(V, H, generator = g) * H ** -0.5
+    tgt = torch.randint(0, V, (2, 5), generator = g)
+    mask = torch.ones(2, 5, dtype = torch.bool)
+    adv = torch.randn(2, generator = g)
+    old = torch.randn(2, 5, generator = g) * 0.1 - 4.0
+    ws = []
+    for retain in (False, True):
+        wi = weight.clone().requires_grad_()
+        loss = fg.fused_linear_grpo_loss(hidden.clone().requires_grad_(), wi, tgt, mask = mask, advantages = adv,
+                                         old_logps = old)[0]
+        (loss * 0.5).backward(retain_graph = retain)
+        ws.append(wi)
+    assert ws[0].grad.data_ptr() == ptrs[0]
+    assert torch.equal(ws[0].grad, ws[1].grad)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("factor", [1.0, 0.375, 3.0])
 def test_inplace_matches_out_of_place_bitwise(dtype, factor):
