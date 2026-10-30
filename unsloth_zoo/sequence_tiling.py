@@ -129,6 +129,8 @@ def _replay_tile(fn, gc_flag, *args):
     if tls is not None:
         tls.active = gc_flag
     try:
+        if getattr(fn, "_unsloth_dynamic_body", False):
+            return fn(*args)
         return _dynamic_inner_compiles(fn, *args)
     finally:
         if tls is not None:
@@ -356,8 +358,12 @@ def _compiled_tile_fn(fn):
     compiled = _COMPILED_TILE[0]
     if isinstance(fn, functools.partial):
         func, bound, keywords = fn.func, fn.args, fn.keywords or {}
-        return lambda *tile_args: compiled(func, *bound, *tile_args, **keywords)
-    return lambda *tile_args: compiled(fn, *tile_args)
+        body = lambda *tile_args: compiled(func, *bound, *tile_args, **keywords)
+    else:
+        body = lambda *tile_args: compiled(fn, *tile_args)
+    # Already dynamic: the per-tile Dynamo config patch in _replay_tile is not needed (it costs ~20 us per call).
+    body._unsloth_dynamic_body = True
+    return body
 pass
 
 
