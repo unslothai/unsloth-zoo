@@ -32,6 +32,10 @@ import _cpu_compiler_skip as probe
     (1, "Traceback (most recent call last):\nValueError: boom", False),
     (0, "", False),
     (0, "warning: InvalidCxxCompiler", False),
+    # A compiler error reported earlier and recovered from does not explain a different final exception.
+    (1, "InductorError: RuntimeError: Compiler: cl is not found.\nfalling back to eager\n"
+        "Traceback (most recent call last):\nAssertionError: tokens differ", False),
+    (1, "W1030 InvalidCxxCompiler while warming up, retrying\nTraceback (most recent call last):\nValueError: boom", False),
 ])
 def test_missing_compiler(returncode, output, missing):
     assert probe.missing_compiler(returncode, output) is missing
@@ -97,7 +101,20 @@ def test_the_probe_reads_its_whole_output(monkeypatch):
         probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), dict(os.environ), ("cpu",))
 
 
-@pytest.mark.parametrize("name", ["TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE", "TORCHDYNAMO_SUPPRESS_ERRORS"])
+def test_a_recovered_compiler_error_before_another_failure_does_not_skip(monkeypatch):
+    calls = _stub_probe(monkeypatch, 1, _CHILD_MISSING)
+    child = _child(1, _CHILD_MISSING + "\nfalling back to eager\nTraceback (most recent call last):\nAssertionError: tokens differ")
+    try:
+        probe.skip_if_cpu_inductor_missing(child, dict(os.environ), ("cpu",))
+    except Skipped as e:
+        pytest.fail(f"an unrelated final failure was skipped: {e}")
+    assert calls == []
+
+
+@pytest.mark.parametrize("name", [
+    "TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE", "TORCHDYNAMO_SUPPRESS_ERRORS", "TORCH_INDUCTOR_INSTALL_GXX",
+    "TORCHINDUCTOR_CPP_WRAPPER", "CC",
+])
 def test_the_probe_cache_tells_compile_switches_apart(monkeypatch, name):
     calls = _stub_probe(monkeypatch, 0, "")
     env = {k: v for k, v in os.environ.items() if k != name}
@@ -107,9 +124,12 @@ def test_the_probe_cache_tells_compile_switches_apart(monkeypatch, name):
 
 
 def test_a_missing_compiler_is_found_by_a_real_probe(monkeypatch):
-    # Windows torch reads CXX as well (get_cpp_compiler: os.environ.get("CXX", "cl")), so this runs everywhere.
+    # No inherited compile switch may stop the probe from reaching the compiler.
     monkeypatch.setattr(probe, "_probes", {})
-    env = {k: v for k, v in os.environ.items() if k.upper() not in probe._KEY_VARS[3:]}
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(probe._KEY_PREFIXES)}
     env["CXX"] = os.path.join(os.sep, "nonexistent", "g++")
-    with pytest.raises(Skipped, match = r"no C\+\+ compiler here"):
-        probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), env, ("cpu",))
+    env.pop("CC", None)
+    returncode, output = probe._probe(env)
+    if returncode == 0:
+        pytest.skip("this torch / platform compiled without the CXX it was given, so there is nothing to classify")
+    assert probe.missing_compiler(returncode, output), output[-2000:]
