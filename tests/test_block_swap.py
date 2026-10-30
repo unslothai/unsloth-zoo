@@ -606,6 +606,29 @@ def test_shared_parameter_stays_on_the_card():
     sw.remove()
 
 
+def test_layer_accelerate_left_on_meta_is_refused_before_anything_is_hooked():
+    import pytest
+    # A model that did not fit at load: accelerate keeps the last layers' weights on meta behind its hooks.
+    layers = nn.ModuleList([nn.Linear(8, 8) for _ in range(2)] + [nn.Linear(8, 8, device = "meta") for _ in range(2)])
+    layers.requires_grad_(False)
+    with pytest.raises(ValueError, match = "offload_layers to from_pretrained"):
+        BlockSwap(layers, [1, 3], device = "cuda")
+    assert all(len(l._forward_pre_hooks) == 0 and len(l._forward_hooks) == 0 for l in layers)
+    assert layers[1].weight.device.type == "cpu" and layers[1].weight.numel() == 64
+
+
+def test_shared_weight_left_on_meta_is_not_refused():
+    if not torch.cuda.is_available():
+        return
+    # Block Swap never manages a weight two layers share, so accelerate keeps serving it.
+    shared = nn.Linear(8, 8, bias = False, device = "meta")
+    layers = nn.ModuleList([nn.Sequential(nn.Linear(8, 8), shared) for _ in range(3)]).requires_grad_(False)
+    sw = BlockSwap(layers, [0, 2], prefetch_depth = 1, device = "cuda")
+    assert shared.weight.device.type == "meta"
+    assert all(id(shared.weight) not in b.index for b in sw.blocks)
+    sw.remove()
+
+
 def test_enter_leave_follow_explicit_indices():
     sw = _scheduler(3, depth = 1)
     sw.indices, sw.pos = [1, 4, 7], {1: 0, 4: 1, 7: 2}
