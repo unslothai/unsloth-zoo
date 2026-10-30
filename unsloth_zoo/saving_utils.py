@@ -6573,6 +6573,31 @@ def _renamings_to_conversion_mapping(transforms):
 pass
 
 
+def _model_classes_named(model_class_name):
+    """The `transformers` class of this name, then any trust_remote_code one. A remote class
+    lives in `transformers_modules`, so a `transformers`-only lookup never sees the model_type
+    its modeling file registered a renaming under, and every LoRA key misses its checkpoint."""
+    import sys
+    classes = []
+    try:
+        module = __import__("transformers", fromlist = [model_class_name])
+        classes.append(getattr(module, model_class_name))
+    except Exception:
+        pass
+    try:
+        from transformers.utils import TRANSFORMERS_DYNAMIC_MODULE_NAME as dynamic_prefix
+    except Exception:
+        dynamic_prefix = "transformers_modules"
+    for name, module in list(sys.modules.items()):
+        if not name.startswith(dynamic_prefix + "."): continue
+        # vars(), not getattr: no lazy-module import side effects.
+        model_class = vars(module).get(model_class_name) if module is not None else None
+        if isinstance(model_class, type) and model_class not in classes:
+            classes.append(model_class)
+    return classes
+pass
+
+
 def _registry_checkpoint_conversion_mapping(model_class_name):
     """The renaming half of the Transformers 5 conversion registry, keyed by class name with a
     `model_type` fallback. Not version-gated: a missing registry or entry yields `{}`, which is
@@ -6582,14 +6607,10 @@ def _registry_checkpoint_conversion_mapping(model_class_name):
     except Exception:
         return {}
     lookups = [model_class_name]
-    try:
-        module = __import__("transformers", fromlist = [model_class_name])
-        model_class = getattr(module, model_class_name)
+    for model_class in _model_classes_named(model_class_name):
         model_type = getattr(getattr(model_class, "config_class", None), "model_type", None)
-        if isinstance(model_type, str) and model_type:
+        if isinstance(model_type, str) and model_type and model_type not in lookups:
             lookups.append(model_type)
-    except Exception:
-        pass
     for lookup in lookups:
         try:
             transforms = get_checkpoint_conversion_mapping(lookup)
@@ -6606,14 +6627,10 @@ def _get_checkpoint_conversion_mapping(model_class_name):
     """A model class's _checkpoint_conversion_mapping ({} if absent), falling back to the
     Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
     checkpoint loses the bridge to its on-disk weights and fails to merge silently (#5290)."""
-    try:
-        module = __import__('transformers', fromlist=[model_class_name])
-        model_class = getattr(module, model_class_name)
+    for model_class in _model_classes_named(model_class_name):
         mapping = getattr(model_class, '_checkpoint_conversion_mapping', {})
-    except (ImportError, AttributeError):
-        mapping = {}
-    if mapping:
-        return mapping
+        if mapping:
+            return mapping
     return _registry_checkpoint_conversion_mapping(model_class_name)
 pass
 
@@ -7372,17 +7389,33 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
         tie_word_embeddings = tie_word_embeddings,
         count_packed_mxfp4 = count_packed_mxfp4,
     )
-    if not unresolved: return unresolved
-
-    # Every report refuses regardless of size: a size threshold would downgrade a genuine 14-module under-merge on a
-    # text encoder to a notice; the env var is the escape hatch.
-    total_lora_modules = sum(
-        1 for key, stats in lora_weights.items()
+    lora_keys = [
+        key for key, stats in lora_weights.items()
         if isinstance(key, str)
         and getattr(stats, "lora_A", None) is not None
         and getattr(stats, "lora_B", None) is not None
-    )
-    message = _format_partial_merge_error(unresolved, model_class_name, total_lora_modules)
+    ]
+    total_lora_modules = len(lora_keys)
+    if unresolved:
+        # Every report refuses regardless of size: a size threshold would downgrade a genuine 14-module under-merge on a
+        # text encoder to a notice; the env var is the escape hatch.
+        message = _format_partial_merge_error(unresolved, model_class_name, total_lora_modules)
+    elif total_lora_modules and disk_keys and not _backed_lora_keys(
+        _convert_lora_keys_to_safetensor_format(lora_weights, disk_keys, model_class_name = model_class_name),
+        disk_keys, tie_word_embeddings, count_packed_mxfp4 = count_packed_mxfp4,
+    ):
+        # A rename the merge cannot see (not a pure prefix deletion) leaves `unresolved` empty too, and the export
+        # would be the base weights reported as a merge.
+        message = (
+            f"Unsloth: Refusing to write a merged model: none of the {total_lora_modules} LoRA module(s) on "
+            f"{model_class_name} matched a weight in this checkpoint (e.g. `{lora_keys[0]}`), so the export would be "
+            "the untouched base weights. The checkpoint likely names its weights differently from the loaded "
+            "model. Please report it at https://github.com/unslothai/unsloth-zoo/issues with your model name, "
+            "your `transformers` version and this message. UNSLOTH_ALLOW_PARTIAL_LORA_MERGE=1 writes it anyway."
+        )
+        unresolved = {("", ""): dict.fromkeys(lora_keys)}
+    else:
+        return unresolved
     if os.environ.get("UNSLOTH_ALLOW_PARTIAL_LORA_MERGE") == "1":
         print(message)
         return unresolved
