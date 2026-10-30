@@ -42,8 +42,7 @@ def _case(chunks_split):
         chunks.append((torch.tensor(ids, device = DEVICE), lo, hi, offs))
     plan = mu._SelectiveDequantPlan(E, x.shape[0], chunks)
     provided = []
-    # Each weight is kept alive with its address: a freed one's address can be handed straight
-    # back to a later contiguous copy, which would then look like the same storage.
+    # Keep each weight alive: a freed weight's address can be reused by a later contiguous copy and look like the same storage.
     kept = []
 
     def provider(experts):

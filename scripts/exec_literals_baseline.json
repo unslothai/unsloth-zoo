@@ -15,6 +15,13 @@
     },
     {
       "file": "unsloth_zoo/compiler.py",
+      "sink": "compile",
+      "digest": "8a046bb13379b63d",
+      "count": 1,
+      "reason": "Syntax-checks PEFT's own LoRA forward (inspect.getsource) after this file swaps in two fixed update lines; the result is discarded and never executed. ast.parse cannot replace it because it accepts a stray `continue` that compile rejects."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
       "sink": "eval",
       "digest": "03e6d133b778a53e",
       "count": 1,

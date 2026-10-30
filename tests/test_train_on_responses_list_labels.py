@@ -14,21 +14,9 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""``train_on_responses_only`` over a dataset that already has a ``labels`` column.
-
-The masking function type-checks ``input_ids`` for tensor-vs-list:
-
-    if type(input_ids_) is torch_Tensor:
-        use_tensors = True
-        input_ids_ = input_ids_.tolist()
-
-but called ``.tolist()`` on ``labels`` unconditionally. Under
-``datasets.map(batched = True)`` a ``labels`` column arrives as a plain list of
-lists, which has no ``.tolist()``, so any dataset already carrying labels raised
-``AttributeError: 'list' object has no attribute 'tolist'``.
-
-CPU-pure and offline: the tokenizer is a local stub, no weights are loaded.
-"""
+"""train_on_responses_only with an existing labels column: labels arrive as plain lists under
+datasets.map(batched=True), so calling .tolist() on them unconditionally raised AttributeError; CPU-only, stub
+tokenizer."""
 
 import pytest
 import torch
@@ -85,8 +73,7 @@ def test_plain_list_labels_do_not_raise():
 
 
 def test_datasets_map_with_existing_labels_column():
-    """End to end through datasets.map(batched=True), which is how the column
-    actually reaches the masking function."""
+    """End to end through datasets.map(batched=True), the path by which the labels column actually reaches the masking function."""
     dataset = Dataset.from_dict(
         {"input_ids": [list(ROW), list(ROW)], "labels": [list(ROW), list(ROW)]}
     )
@@ -112,8 +99,7 @@ def test_tensor_labels_still_supported():
 
 
 def test_existing_labels_are_the_source_of_truth():
-    """When labels are supplied, unmasked positions must be copied from them, not
-    re-read from input_ids."""
+    """When labels are supplied, unmasked positions must be copied from labels, not re-derived from input_ids."""
     sentinel_row = [900, 901, 902, 903, 904, 905]
     masker = _masker()
 
@@ -127,8 +113,7 @@ def test_existing_labels_are_the_source_of_truth():
 
 
 def test_no_labels_column_still_masks_from_input_ids():
-    """Guard the other branch: with no labels column the function builds labels from
-    input_ids as before."""
+    """Guards the other branch: with no labels column, labels are built from input_ids as before."""
     masker = _masker()
 
     out = masker({"input_ids": [list(ROW)]})
@@ -139,19 +124,12 @@ def test_no_labels_column_still_masks_from_input_ids():
 
 
 def test_an_explicit_one_maps_in_process(monkeypatch):
-    """``num_proc = 1`` means "no multiprocessing" to every caller that passes it.
-
-    ``datasets`` >= 4.1 pools for any count >= 1, so forwarding the 1 verbatim
-    built a ``Pool(1)``: one forked child holding a whole tokenizer, on a split
-    over ``_MIN_ROWS_FOR_MULTIPROC`` where the small-split guard no longer
-    applies. That left ``UNSLOTH_DATASET_NUM_PROC=0``, the remedy the
-    dead-worker message recommends, still forking. ``datasets`` 3.x already ran
-    ``1`` in-process, so ``None`` is the encoding that means the same on both.
-    """
+    """num_proc=1 means no multiprocessing and must map to None: datasets >= 4.1 pools any count >= 1, so forwarding 1
+    built a Pool(1) on splits over _MIN_ROWS_FOR_MULTIPROC; UNSLOTH_DATASET_NUM_PROC=0 kept forking; 3.x ran 1
+    in-process."""
     import types
 
-    # Over the 5,000-row threshold: below it the per-split guard already returns
-    # None for an auto request, so this only says something above it.
+    # Over the 5,000-row threshold: below it the per-split guard already returns None for an auto request, so only rows above it test this.
     rows = 5_001
     dataset = Dataset.from_dict({"input_ids": [list(ROW)] * rows})
 
@@ -160,8 +138,7 @@ def test_an_explicit_one_maps_in_process(monkeypatch):
 
     def _spy(self, *args, **kwargs):
         requested.append(kwargs.get("num_proc"))
-        # Run in-process whatever was asked, so the assertion is about the
-        # request rather than about this runner's ability to fork.
+        # Runs in-process whatever was asked, so the assertion checks the request rather than this runner's ability to fork.
         kwargs["num_proc"] = None
         return real_map(self, *args, **kwargs)
 

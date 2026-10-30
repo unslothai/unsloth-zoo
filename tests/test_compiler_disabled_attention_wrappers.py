@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A module whose __init__ builds a compile-disabled attention module must stay eager.
-
-Compiled, it graph-breaks at every call ("Skip inlining torch.compiler.disable()d function"):
-GraniteSpeechConformerBlock (4 per step on the tiny model), Blip2QFormerAttention (12),
-Gemma3nAudioConformerAttention / Gemma3nAudioConformerBlock (6). Its other compiled
-children still compile.
-"""
+"""Must stay eager if it has a compile-disabled attention child: compiled, it graph-breaks each call."""
 
 import ast
 import json

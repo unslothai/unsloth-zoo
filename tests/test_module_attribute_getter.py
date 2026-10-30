@@ -1,20 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`peft_utils` resolved module paths with `eval(f"model.{path}", globals(), ...)`.
-
-The paths come from `model.named_parameters()`, so they are attribute names registered
-on live `nn.Module`s rather than checkpoint keys - but `eval` means the whole path is
-evaluated as Python with `peft_utils`' globals in scope, and `nn.Module.add_module`
-only rejects `""` and names containing `"."`. `_get_module_attribute` is the read
-counterpart of the `_set_module_attribute` walk PR #1083 added, and removes the
-question entirely.
-
-The removed `eval` is kept here as the oracle, the same way
-`test_set_additional_modules_paths.py` keeps the removed `exec`.
-
-CPU-only and network-free.
-"""
+"""Tests _get_module_attribute, the read side of the PR 1083 attribute walk that replaces the peft_utils eval of module
+paths; eval ran them as Python with globals in scope; eval kept as oracle; CPU-only, network-free"""
 
 import pytest
 import torch
@@ -86,8 +74,7 @@ def test_numeric_segments_resolve(path):
     "model.__class__.__init__.__globals__['os']",
 ])
 def test_a_path_component_is_a_name_not_an_expression(path):
-    """The whole point. `eval` ran these; the walk looks each one up as an attribute
-    name and fails, so no call, no subscript and no operator ever executes."""
+    """Path components are looked up as attribute names, so no call, subscript or operator runs where eval would have run them; each path must raise."""
     model = _build_model()
     with pytest.raises((AttributeError, IndexError, KeyError, TypeError, ValueError)):
         _get_module_attribute(model, path)
@@ -119,13 +106,8 @@ def test_round_trip_with_the_setter(path):
 # Bracket components, from the parallel review of PR #1108.
 
 def test_bracket_components_resolve_like_eval():
-    """`peft_utils` rewrites `.0.` to `[0].`, and one of its two call sites can hand
-    back a path whose component still carries the brackets.
-
-    `eval("model.blocks[0]")` indexed that happily; a bare getattr cannot, so the
-    replacement has to understand the same syntax or gradient checkpointing breaks for
-    any model whose forward calls `self.blocks[0](...)` directly.
-    """
+    """peft_utils rewrites .0. to [0] and one call site keeps brackets; a bare getattr cannot index, so name[0] must
+    resolve or gradient checkpointing breaks for models calling self.blocks[0] directly."""
     import torch
     from unsloth_zoo.empty_model import _get_module_attribute
 
@@ -163,11 +145,8 @@ def test_bracket_components_stay_a_name_and_index_walk():
 
 
 def test_a_unicode_named_submodule_resolves():
-    """Python identifiers are not ASCII-only and PyTorch registers them without complaint.
-
-    An ASCII-only pattern for the name part of `name[0]` would fall through to a bare
-    getattr on the whole `层[0]` string and fail, where the removed eval indexed it.
-    """
+    """Python identifiers may be non-ASCII and PyTorch accepts them; an ASCII-only pattern for the name in name[0] would
+    fall through to getattr on the whole 层[0] string and fail."""
     import torch
 
     class Block(torch.nn.Module):

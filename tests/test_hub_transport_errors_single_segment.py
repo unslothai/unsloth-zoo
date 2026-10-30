@@ -14,35 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A transport failure on a single segment id must not be reported as "absent".
-
-The `ValueError` catch that lets `gpt2` answer False on huggingface_hub >= 1.16 must
-not also swallow a genuine connectivity failure.
-
-    1.24.0    `HfFileSystem.resolve_path` starts with `if path.count("/") == 0:
-              raise ValueError("Repository id must be 'namespace/name', ...
-              Single-segment ids ... no longer supported.")`. That guard sits before
-              `parse_hf_uri` and `_repo_and_revision_exist`, so it involves no
-              network I/O and can never be a transport failure.
-    0.36.2    No such guard. `ls("gpt2")` really reaches the Hub (17 entries,
-              safetensors among them), so a failure there can surface as a
-              ValueError subclass.
-
-Measured against a local server answering 200 with a non-JSON body, which is what a
-captive proxy or a mangling middlebox does:
-
-    0.36.2   ls("gpt2")                  requests.exceptions.JSONDecodeError
-    0.36.2   ls("openai-community/gpt2") requests.exceptions.JSONDecodeError
-    1.24.0   ls("gpt2")                  ValueError (the guard, no request sent)
-    1.24.0   ls("openai-community/gpt2") json.JSONDecodeError
-
-Both JSONDecodeError classes are `isinstance(..., ValueError)` but neither is
-`type(e) is ValueError`, which is the first discriminator: only the guard raises the
-bare class. The second is the wording, because the guard is absent at 0.36.2, 1.0.0,
-1.5.0, 1.10.0 and 1.15.0 and first appears at 1.16.0, so across 1.0 - 1.15 a bare
-ValueError can come off a live socket and a `major >= 1` gate reported it as absent.
-The message is byte identical at 1.16.0, 1.20.0, 1.24.0 and 1.25.1.
-"""
+"""A transport failure on a single-segment id must not read as absent: only the huggingface_hub 1.16+ guard raises a
+bare ValueError with its wording; on 1.0-1.15 a bare ValueError can come off a live socket, and on 0.x a transport
+failure can surface as a ValueError subclass."""
 
 import http.server
 import inspect
@@ -63,11 +37,7 @@ except ImportError:      # huggingface_hub < 1.0 has no hf:// URI parser
     HfUriError = None
 
 def _hub_has_single_segment_guard():
-    """Does the installed resolver refuse a slashless id before sending a request?
-
-    Feature detected, because the major number does not answer it: the guard is absent
-    at 0.36.2, 1.0.0, 1.5.0, 1.10.0 and 1.15.0 and first appears at 1.16.0.
-    """
+    """Whether the resolver refuses a slashless id before sending a request; feature-detected, since the major version does not answer it (guard first in 1.16.0)."""
     try:
         source = inspect.getsource(huggingface_hub.HfFileSystem.resolve_path)
     except Exception:
@@ -94,9 +64,7 @@ def _patch_ls(monkeypatch, side_effect):
 
 
 def _requests_json_decode_error():
-    """What requests raises for a non-JSON body (measured on 0.36.2). A ValueError
-    *and* an OSError, but not a FileNotFoundError, so it reaches the ValueError catch
-    rather than the absent set."""
+    """requests JSONDecodeError on a non-JSON body (0.36.2) is a ValueError and OSError but not FileNotFoundError, so it reaches the ValueError catch."""
     return requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0)
 
 
@@ -114,8 +82,7 @@ _SUBCLASS_TRANSPORT_ERRORS = [
 @pytest.mark.parametrize("make_error", _SUBCLASS_TRANSPORT_ERRORS)
 @pytest.mark.parametrize("name", ["gpt2", "bert-base-uncased", "distilgpt2"])
 def test_json_decode_error_on_single_segment_id_raises(monkeypatch, make_error, name):
-    """A proxy mangling the response body is a connectivity problem, and on 0.x it
-    lands on a slashless name. False here is the silent no-op in another hat."""
+    """A proxy mangling the response body is a connectivity failure; on 0.x it lands on a slashless name, so answering False would silently hide it."""
     error = make_error()
     assert isinstance(error, ValueError), "premise: it reaches the ValueError catch"
     _patch_ls(monkeypatch, error)
@@ -139,8 +106,7 @@ def test_json_decode_error_never_answers_false(monkeypatch, make_error):
 def test_determine_base_model_source_propagates_single_segment_transport_error(
     monkeypatch, make_error,
 ):
-    """The caller must never see `(None, ...)`: `merge_and_overwrite_lora` turns that
-    into a merge that writes nothing."""
+    """determine_base_model_source must raise rather than return (None, ...), since merge_and_overwrite_lora turns that into a merge that writes nothing."""
     _patch_ls(monkeypatch, make_error())
     monkeypatch.setattr(saving_utils, "check_local_model_exists", lambda path: None)
     with pytest.raises(RuntimeError):
@@ -149,35 +115,27 @@ def test_determine_base_model_source_propagates_single_segment_transport_error(
 
 @pytest.mark.parametrize("name", ["gpt2", "bert-base-uncased", "distilgpt2"])
 def test_single_segment_rejection_still_reports_absent(monkeypatch, name):
-    """1.16+ cannot address these ids at all, and says so before opening a socket, so
-    it stays False and callers fall through to their local priorities."""
+    """1.16+ rejects these ids before opening a socket, so the check stays False and callers fall through to their local priorities."""
     message = _REJECTION_MESSAGE.replace("gpt2", name)
     _patch_ls(monkeypatch, ValueError(message))
     assert saving_utils.check_hf_model_exists(name) is False
 
 
 def test_single_segment_rejection_is_recognised_by_its_message(monkeypatch):
-    """Recognised on 0.x too, so a backport of the guard would not report a phantom
-    connectivity failure."""
+    """The message is recognised on 0.x too, so a backported guard would not report a phantom connectivity failure."""
     assert saving_utils._is_single_segment_id_rejection("gpt2", ValueError(_REJECTION_MESSAGE))
 
 
 @pytest.mark.parametrize("name", ["hf://gpt2", "hf://bert-base-uncased"])
 def test_a_single_segment_id_wearing_the_uri_scheme_is_still_absent(monkeypatch, name):
-    """`hf://gpt2` is the same unaddressable id with a scheme on it.
-
-    `HfFileSystem` strips the protocol first, so 1.16+ raises the rejection naming the
-    *stripped* `gpt2` (verified on 1.25.1). Counting slashes unstripped sees two,
-    concludes `namespace/name`, and reports the rejection as a connectivity failure,
-    which also stops `determine_base_model_source` reaching its local priorities.
-    """
+    """hf://gpt2 is unaddressable like gpt2; 1.16+ names the stripped id, so counting slashes before stripping would
+    misreport it as a connectivity failure and skip local priorities."""
     _patch_ls(monkeypatch, ValueError(_REJECTION_MESSAGE))
     assert saving_utils.check_hf_model_exists(name) is False
 
 
 def test_the_uri_scheme_does_not_smuggle_a_transport_failure_past_the_check(monkeypatch):
-    """The other direction: stripping the scheme must not start swallowing bare
-    ValueErrors that say nothing about an id rejection."""
+    """Stripping the scheme must not make bare ValueErrors that are not id rejections count as absent; a transport failure must still raise."""
     _patch_ls(monkeypatch, ValueError("Connection reset by peer"))
     with pytest.raises(RuntimeError):
         saving_utils.check_hf_model_exists("hf://gpt2")
@@ -189,14 +147,8 @@ def test_the_uri_scheme_does_not_smuggle_a_transport_failure_past_the_check(monk
     "openai-community/gpt2@refs/pr/1",
 ])
 def test_a_revision_suffix_is_still_addressed_as_a_repo(name):
-    """`namespace/name@revision` is documented HfFileSystem syntax.
-
-    `resolve_path` splits the revision off and resolves the repo; verified on 1.25.1,
-    where `hf://openai-community/gpt2@main` answers repo_id `openai-community/gpt2` at
-    revision `main`. `validate_repo_id` rejects the `@`, so a prefilter consulting it
-    without splitting first calls an existing remote model absent, and `refs/pr/1` also
-    trips the depth rule. These went straight to `ls` before the prefilter existed.
-    """
+    """namespace/name@revision is documented HfFileSystem syntax; validate_repo_id rejects the @ and refs/pr/1 trips the
+    depth rule, so split the revision before any prefilter."""
     assert saving_utils._is_hub_repo_id(name) is True
 
 
@@ -208,18 +160,7 @@ def test_a_revision_suffix_does_not_launder_a_filesystem_path(name):
 
 @pytest.mark.parametrize("name", ["gpt2@main", "hf://gpt2@main", "bert-base-uncased@main"])
 def test_a_single_segment_id_keeps_its_revision(name):
-    """A revision on a canonical single segment id, which an earlier version of the
-    split dropped by requiring exactly one slash.
-
-    The zero-slash branch of `resolve_path` splits `@` too, so this is valid syntax on
-    every release before the 1.16 guard. Verified on 0.36.2:
-
-        resolve_path("gpt2@main")             -> repo_id 'gpt2',              rev 'main'
-        resolve_path("bert-base-uncased@main")-> repo_id 'bert-base-uncased', rev 'main'
-
-    On 1.16+ the id is unaddressable either way, and there the rejection has to be
-    recognised rather than reported as connectivity, which is the cell below.
-    """
+    """A revision on a single-segment id (gpt2@main) must survive the split, which must not require one slash; on 1.16+ its rejection must not read as connectivity."""
     assert saving_utils._is_hub_repo_id(name) is True
 
 
@@ -228,17 +169,7 @@ def test_a_single_segment_id_keeps_its_revision(name):
     "hf://models/openai-community/gpt2@main",
 ])
 def test_an_explicit_typed_model_uri_tracks_what_the_parser_does(name):
-    """Under `hf://`, `models/namespace/name` is unambiguously the typed form.
-
-    Whether it resolves is a property of the installed release, so this asserts the
-    classification *equals the capability* rather than hardcoding either answer:
-
-        1.25.1   resolve_path("models/openai-community/gpt2") -> model openai-community/gpt2
-        0.36.2   resolve_path("models/openai-community/gpt2") -> FileNotFoundError
-
-    Stripping unconditionally would be worse than not stripping: on 0.36.2 that probes
-    `openai-community/gpt2` and answers True for an address that version cannot reach.
-    """
+    """Under hf://, models/namespace/name is the typed form but resolves only on some releases, so classification must equal the probed capability, not always strip."""
     supported = saving_utils._hub_addresses_typed_model_uris()
     assert saving_utils._is_hub_repo_id(name) is supported
 
@@ -250,14 +181,7 @@ def test_an_explicit_typed_model_uri_tracks_what_the_parser_does(name):
 ])
 @pytest.mark.parametrize("capability", [False, True])
 def test_a_bare_models_prefix_stays_a_local_path(monkeypatch, name, capability):
-    """Without the scheme the same string is ambiguous, and the commoner reading wins.
-
-    `models/base/checkpoint-500` is what a Trainer writes; stripping the prefix there
-    turns a local directory into the plausible repo id `base/checkpoint-500` and sends
-    a local base to the Hub. Asserted under both capability answers, because the
-    reading must not depend on the installed release: it once did, and on 1.25.1
-    `test_local_path_is_absent_not_unreachable[three-segment-path]` reached `ls`.
-    """
+    """A bare models/ prefix stays a local path (what a Trainer writes) under both capability answers; stripping it would send a local base to the Hub."""
     monkeypatch.setattr(
         saving_utils, "_hub_addresses_typed_model_uris", lambda: capability,
     )
@@ -265,21 +189,13 @@ def test_a_bare_models_prefix_stays_a_local_path(monkeypatch, name, capability):
 
 
 def test_the_capability_probe_asks_about_the_resolver_not_just_the_parser(monkeypatch):
-    """`parse_hf_uri` mapping the prefix does not mean `resolve_path` reaches it.
-
-    Measured against a repo that exists, `resolve_path("models/openai-community/gpt2")`
-    fails on 0.34.6, 0.36.2 and 1.15.0 and succeeds on 1.16.0, 1.20.0 and 1.25.1.
-    `parse_hf_uri` exists from 1.15, so a parser-only probe claims support on 1.15 that
-    the resolver lacks: with the parser mapping the prefix and the resolver not
-    delegating to it, the answer must be False.
-    """
+    """The probe must ask the resolver, not just parse_hf_uri: models/ resolves only from 1.16.0, though parse_hf_uri
+    exists from 1.15, so a parser-only probe would claim support on 1.15."""
     if "models/" in tuple(getattr(huggingface_hub.constants,
                                   "REPO_TYPES_URL_PREFIXES", {}).values()):
         pytest.skip("this release advertises models/ in the prefix table")
 
-    # The parser is injected on every version, so this cell discriminates whatever is
-    # installed. Against the real `parse_hf_uri` it would be vacuous on 0.x, which is
-    # how the parser-only probe passed review here.
+    # The parser is injected on every version so the cell discriminates whatever is installed; the real parse_hf_uri would be vacuous on 0.x.
     import types
     stub = types.ModuleType("huggingface_hub.utils._hf_uris")
 
@@ -305,8 +221,7 @@ def test_the_capability_probe_asks_about_the_resolver_not_just_the_parser(monkey
     )
 
     def resolver_with_the_parser(self, path, revision = None):
-        # The probe reads the code object, so the name must be referenced for real; a
-        # mention in a comment must not count, and once did.
+        # The capability probe reads the code object, so parse_hf_uri must be referenced for real; a mention in a comment must not count.
         parse_hf_uri  # noqa: F821
         raise AssertionError("never called")
 
@@ -321,9 +236,8 @@ def test_the_capability_probe_asks_about_the_resolver_not_just_the_parser(monkey
     "/models/org/repo", "./models/org/repo", "~/models/org/repo", "models/a/b/c",
 ])
 def test_the_typed_prefix_never_launders_a_path(monkeypatch, name):
-    """With the capability forced on, a path that merely begins with `models` stays a
-    path. `parse_hf_uri` would read `models/a/b/c` as repo `a/b` plus file `c` and
-    `/abs/base` as repo `abs/base`, so the path rules are not delegated to it."""
+    """With the capability forced on, a path that merely starts with models stays a path: parse_hf_uri would read
+    models/a/b/c as repo a/b, so path rules are not delegated to it."""
     monkeypatch.setattr(saving_utils, "_hub_addresses_typed_model_uris", lambda: True)
     assert saving_utils._is_hub_repo_id(name) is False
 
@@ -332,8 +246,7 @@ def test_the_typed_prefix_never_launders_a_path(monkeypatch, name):
     "datasets/stanfordnlp/imdb", "spaces/org/demo", "kernels/org/k",
 ])
 def test_repo_types_that_cannot_be_a_base_model_stay_rejected(monkeypatch, name):
-    """These resolve too, and are rejected deliberately: a dataset, a Space and a
-    kernel cannot be the base model of a LoRA merge."""
+    """Dataset, Space and kernel ids resolve too but are rejected on purpose: none can be the base model of a LoRA merge."""
     monkeypatch.setattr(saving_utils, "_hub_addresses_typed_model_uris", lambda: True)
     assert saving_utils._is_hub_repo_id(name) is False
 
@@ -344,9 +257,7 @@ def test_repo_types_that_cannot_be_a_base_model_stay_rejected(monkeypatch, name)
     pytest.param("hf://gpt2/",                   "gpt2",                  id = "single-segment"),
 ])
 def test_a_trailing_slash_on_an_hf_uri_is_not_depth(given, expected):
-    """`resolve_path` normalizes `hf://org/repo/` to repo id `org/repo` with an empty path
-    in repo, so `ls` addresses the repository and the slash must not read as another
-    segment. Measured on 0.36.2: the error for a missing `hf://org/repo/` names `org/repo`."""
+    """A trailing slash on hf://org/repo/ is not depth: resolve_path normalizes it to repo org/repo with an empty path, so ls addresses the repository."""
     assert saving_utils._as_hub_addressed(given) == expected
     assert saving_utils._is_hub_repo_id(given) is True
 
@@ -357,15 +268,13 @@ def test_a_trailing_slash_on_an_hf_uri_is_not_depth(given, expected):
     "outputs/nested/mymodel/",
 ])
 def test_a_trailing_slash_without_the_scheme_still_reads_as_a_directory(given):
-    """Only an explicit `hf://` makes the slash a Hub root. Bare, a trailing slash is how a
-    directory is written, and stripping it would turn `outputs/mymodel/` into a repo id and
-    send a local base to the Hub."""
+    """Only an explicit hf:// makes a trailing slash a Hub root; bare, it marks a local directory, and stripping it
+    would send outputs/mymodel/ to the Hub as a repo id."""
     assert saving_utils._is_hub_repo_id(given) is False
 
 
 def test_a_root_uri_is_probed_rather_than_reported_absent(monkeypatch):
-    """The regression the depth test could cause: an existing repo answered absent because
-    of a trailing slash, with no Hub round trip to disagree."""
+    """The root hf:// URI must be probed: a depth rule on the trailing slash would report an existing repo absent with no Hub round trip to disagree."""
     seen = []
 
     def fake_ls(self, path, detail = True, **kwargs):
@@ -381,14 +290,9 @@ def test_a_root_uri_is_probed_rather_than_reported_absent(monkeypatch):
 
 @pytest.mark.parametrize("save_method", ["merged_4bit", "forced_merged_4bit", "merged_16bit", None])
 def test_an_at_sign_in_a_local_directory_changes_nothing(monkeypatch, tmp_path, save_method):
-    """The argument the revision split rests on, which nothing else pins.
-
-    Splitting on `@` offers a local `outputs/my@model` to the Hub as repo id
-    `outputs/my`, but that is no different from an ordinary one-slash directory name:
-    `outputs/mymodel` is already a valid `namespace/name` shape, so it was probed both
-    before and after the split. Asserted as an equivalence rather than a fixed outcome,
-    so it survives a change of policy for local bases.
-    """
+    """Splitting on @ offers local outputs/my@model to the Hub as outputs/my, no different from an ordinary one-slash
+    directory, so the outcome must match before and after the split; asserted as an equivalence, so it survives a
+    policy change for local bases."""
     import huggingface_hub as _hub
 
     def _local_nf4(directory):
@@ -422,29 +326,22 @@ def test_an_at_sign_in_a_local_directory_changes_nothing(monkeypatch, tmp_path, 
 
 @pytest.mark.parametrize("name", ["gpt2@main", "hf://gpt2@main"])
 def test_a_revisioned_single_segment_id_is_absent_not_unreachable(monkeypatch, name):
-    """1.25.1 names the whole `gpt2@main` in the rejection, so the classifier must
-    normalise before counting segments or it calls this a transport failure."""
+    """1.25.1 names the whole gpt2@main in its rejection, so the classifier must strip the revision before counting segments or it reads a transport failure."""
     message = _REJECTION_MESSAGE.replace("gpt2", "gpt2@main", 1)
     _patch_ls(monkeypatch, ValueError(message))
     assert saving_utils.check_hf_model_exists(name) is False
 
 
 def test_rejection_message_on_a_namespaced_name_still_raises(monkeypatch):
-    """`namespace/name` is addressable on every supported version, so nothing about it
-    is an id rejection."""
+    """namespace/name is addressable on every supported version, so a rejection message naming it is a real failure and must still raise."""
     _patch_ls(monkeypatch, ValueError(_REJECTION_MESSAGE))
     with pytest.raises(RuntimeError):
         saving_utils.check_hf_model_exists("openai-community/gpt2")
 
 
 def test_a_bare_valueerror_with_no_rejection_wording_always_raises(monkeypatch):
-    """A bare ValueError that does not carry the guard's wording was not raised by the
-    guard, which leaves a transport failure as the only thing it can be.
-
-    A `major >= 1` gate got this wrong across 1.0 - 1.15, where no guard exists and the
-    network IS reached: such a ValueError came off a live socket and was still answered
-    False, so the merge wrote nothing.
-    """
+    """A bare ValueError without the guard's wording must raise: a major >= 1 gate answered False for live-socket
+    ValueErrors on 1.0-1.15, so the merge wrote nothing."""
     _patch_ls(monkeypatch, ValueError("boom"))
     with pytest.raises(RuntimeError) as excinfo:
         saving_utils.check_hf_model_exists("gpt2")
@@ -453,13 +350,8 @@ def test_a_bare_valueerror_with_no_rejection_wording_always_raises(monkeypatch):
 
 
 def test_classification_never_consults_the_installed_version(monkeypatch):
-    """Both answers are decided by the message alone, whatever is installed.
-
-    Pinned by identity too: an earlier implementation asked
-    `huggingface_hub.__version__` and its test recomputed the same expression, so the
-    two agreed with each other rather than with upstream and the 1.0 - 1.15 hole
-    stayed invisible.
-    """
+    """Classification uses the message alone, never huggingface_hub.__version__: a version check hid the 1.0-1.15 gap
+    from a test that recomputed the same expression."""
     _patch_ls(monkeypatch, ValueError(_REJECTION_MESSAGE))
     assert saving_utils.check_hf_model_exists("gpt2") is False
 
@@ -476,16 +368,14 @@ def test_classification_never_consults_the_installed_version(monkeypatch):
 
 @pytest.mark.skipif(HfUriError is None, reason = "huggingface_hub < 1.0 has no HfUriError")
 def test_hf_uri_error_is_still_absent_not_transport(monkeypatch):
-    """HfUriError subclasses ValueError but is an id error, matched by type in the
-    absent set, so it never reaches the transport branch."""
+    """HfUriError subclasses ValueError but is an id error matched by type in the absent set, so it never reaches the transport branch."""
     _patch_ls(monkeypatch, HfUriError("hf://gpt2", "Invalid HF URI 'hf://gpt2'"))
     assert saving_utils.check_hf_model_exists("gpt2") is False
 
 
 @pytest.mark.parametrize("name", ["gpt2", "bert-base-uncased", "distilgpt2"])
 def test_listable_single_segment_id_still_returns_true(monkeypatch, name):
-    """0.36.2 lists `gpt2` happily (17 entries, safetensors among them). The narrowing
-    is in the except branch only, so no True became False."""
+    """A listable single-segment id still returns True: 0.36.2 lists gpt2; the narrowing lives only in the except branch, so no True became False."""
     _patch_ls(monkeypatch, [
         {"name": f"{name}/model.safetensors"},
         {"name": f"{name}/config.json"},
@@ -494,8 +384,7 @@ def test_listable_single_segment_id_still_returns_true(monkeypatch, name):
 
 
 def test_absent_single_segment_id_still_returns_false(monkeypatch):
-    """0.x answers NotImplementedError for a slashless name with no canonical repo
-    behind it. Still absent, still no exception."""
+    """0.x answers NotImplementedError for a slashless name with no canonical repo behind it; that is still absent, with no exception raised."""
     _patch_ls(monkeypatch, NotImplementedError("Access to repositories lists is not implemented."))
     assert saving_utils.check_hf_model_exists("definitely-not-a-real-model-xyz") is False
 
@@ -546,8 +435,7 @@ def garbage_endpoint():
              "so no transport failure can reach that branch on this version",
 )
 def test_real_proxy_failure_on_a_single_segment_id_raises(monkeypatch, garbage_endpoint):
-    """No stubbed exception anywhere: a real socket, a real 200, a real body the
-    client cannot parse."""
+    """No stubbed exception: a real socket, a real 200 and a body the client cannot parse, as a captive proxy would send."""
     base_fs = saving_utils.HfFileSystem
 
     class _PinnedEndpoint(base_fs):

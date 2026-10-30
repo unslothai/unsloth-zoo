@@ -1,20 +1,6 @@
-"""The gpt-oss grouped bnb4bit readiness probe honors both env gates.
-
-GptOssExpertsBnb4bit._grouped_bnb4bit_ready decides whether the grouped
-torch._grouped_mm forward replaces the per-expert loop. It must be:
-
-  * ON by default,
-  * OFF when UNSLOTH_GPTOSS_GROUPED=0 (explicit opt-out of the grouped path),
-  * still ON when UNSLOTH_COMPILE_DISABLE=1 / partial (that switch only skips
-    torch.compile; grouped_qlora_forward is torch.compiler.disable'd anyway).
-
-The probe is self-contained (local imports, reads os.environ directly) so the
-compiler can copy its source into the standalone compiled cache. These are the
-env gates only: the downstream expert/quant_state checks are held True via a
-minimal CPU fake so the gate logic is exercised in isolation. No CUDA compute is
-performed (the fake Params4bit is never quantized), though importing unsloth_zoo
-requires a visible torch accelerator.
-"""
+"""Env gates of GptOssExpertsBnb4bit._grouped_bnb4bit_ready: ON by default, OFF with UNSLOTH_GPTOSS_GROUPED=0, ON with
+UNSLOTH_COMPILE_DISABLE=1/partial; probe stays self-contained (compiler copies its source); no CUDA compute, but
+importing unsloth_zoo needs a torch accelerator."""
 import os
 from types import SimpleNamespace
 
@@ -42,11 +28,7 @@ _NF4_CODE = torch.linspace(-1, 1, 16)
 
 
 def _fake_expert_linear():
-    """A LoRA-free bnb Linear4bit-like expert whose readiness checks all pass.
-
-    The Params4bit is left unquantized on CPU and given a hand-built quant_state
-    so the probe's attribute inspection succeeds without any GPU dequant.
-    """
+    """LoRA-free bnb Linear4bit-like expert passing all readiness checks: Params4bit stays unquantized on CPU with a hand-built quant_state, so no GPU dequant runs."""
     w = Params4bit(
         torch.zeros(4, 32, 64, dtype=torch.bfloat16),
         requires_grad=False,

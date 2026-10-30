@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference = True under plain torchrun (DDP).
-
-vLLM's default executor rendezvouses a private world_size = 1 group over a fresh
-tcp:// port. torchrun exports TORCHELASTIC_USE_AGENT_STORE=True, so that rendezvous
-is a TCPStore client of a server that never exists and engine init hangs. load_vllm
-now joins the torchrun group with vLLM's external_launcher executor instead. CPU only:
-the torchrun cases use gloo and never build an engine.
-"""
+"""fast_inference = True under torchrun (DDP): vLLM's private world_size = 1 tcp:// rendezvous hangs since
+TORCHELASTIC_USE_AGENT_STORE=True makes it a TCPStore client with no server; load_vllm uses external_launcher; CPU
+only, gloo."""
 
 import os
 import pathlib
@@ -221,6 +216,8 @@ def test_split_group_gets_a_device_bound_default_group(monkeypatch, split_group)
     monkeypatch.setattr(dist, "get_rank", lambda: 1)
     monkeypatch.setattr(dist, "get_world_size", lambda: 2)
     monkeypatch.setattr(vu, "get_target_device", lambda index = None: "cuda:1")
+    monkeypatch.setattr(dist, "is_gloo_available", lambda: True)
+    monkeypatch.setattr(dist, "is_nccl_available", lambda: True)
     if split_group is None:
         monkeypatch.delenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", raising = False)
     else:
@@ -231,4 +228,5 @@ def test_split_group_gets_a_device_bound_default_group(monkeypatch, split_group)
         assert calls[0]["device_id"] == vu.torch.device("cuda", 1)
         assert calls[0]["backend"] == "cpu:gloo,cuda:nccl"
     else:
-        assert "device_id" not in calls[0] and calls[0]["backend"] is None
+        # Not device bound, but CPU collectives still need gloo.
+        assert "device_id" not in calls[0] and calls[0]["backend"] == "cpu:gloo,cuda:nccl"

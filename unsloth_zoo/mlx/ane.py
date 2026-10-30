@@ -1,0 +1,1206 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""The Apple Neural Engine through macOS's private AppleNeuralEngine runtime, from ctypes, and the dense SwiGLU
+MLP prefill split it serves.
+
+Programs are MIL text compiled in memory, with fp16 tensors exchanged through IOSurfaces. The runtime is
+undocumented and can change with any macOS release: every entry point here raises `AneError` rather than
+guessing, and `available()` is False wherever the classes this module drives are missing.
+
+The prefill split: the Neural Engine computes intermediate channels [0, k) of each eligible MLP from an int8
+copy of their weights while the GPU computes the rest from the checkpoint's own; the partial outputs are
+summed. Only full tiles of rows take it. The Neural Engine half is approximate, so the split is opt-in through
+`UNSLOTH_MLX_ANE_PREFILL=1`.
+"""
+
+import collections
+import concurrent.futures
+import ctypes
+import ctypes.util
+import functools
+import json
+import logging
+import math
+import os
+import platform
+import queue
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+import weakref
+from contextlib import contextmanager
+from pathlib import Path
+from typing import NamedTuple
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+
+__all__ = ["AneError", "available", "Surface", "Program", "Blob", "Function",
+           "AnePrefillStatus", "prepare_ane_prefill", "release_ane_prefill", "ane_prefill_mlp"]
+
+_FRAMEWORK = "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine"
+_QOS = 21  # user-interactive
+_COMPILE_TRIES = 5
+_WEIGHT_FILE = "@model_path/weights/weight.bin"
+
+
+class AneError(RuntimeError):
+    pass
+
+
+class _Runtime:
+    """ctypes bindings to the Objective-C runtime, IOSurface and the private framework."""
+
+    def __init__(self):
+        objc = ctypes.CDLL(ctypes.util.find_library("objc"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.objc_autoreleasePoolPush.restype = ctypes.c_void_p
+        objc.objc_autoreleasePoolPop.argtypes = [ctypes.c_void_p]
+        self.objc = objc
+        self.send = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+        ctypes.CDLL("/System/Library/Frameworks/Foundation.framework/Foundation")
+        surface = ctypes.CDLL("/System/Library/Frameworks/IOSurface.framework/IOSurface")
+        surface.IOSurfaceCreate.restype = ctypes.c_void_p
+        surface.IOSurfaceCreate.argtypes = [ctypes.c_void_p]
+        surface.IOSurfaceGetBaseAddress.restype = ctypes.c_void_p
+        surface.IOSurfaceGetBaseAddress.argtypes = [ctypes.c_void_p]
+        self.surface = surface
+        foundation = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        foundation.CFRelease.argtypes = [ctypes.c_void_p]
+        self.cf_release = foundation.CFRelease
+        ctypes.CDLL(_FRAMEWORK)
+        self._prototypes = {}
+        self._selectors = {}
+
+    def cls(self, name):
+        found = self.objc.objc_getClass(name.encode())
+        if not found:
+            raise AneError(f"the AppleNeuralEngine runtime has no class {name}")
+        return found
+
+    # A call is cast to its exact prototype: arm64 passes variadic arguments differently.
+    def call(self, receiver, selector, *args, restype = ctypes.c_void_p, argtypes = None):
+        argtypes = tuple(argtypes) if argtypes is not None else (ctypes.c_void_p,) * len(args)
+        function = self._prototypes.get((restype, argtypes))
+        if function is None:
+            function = ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)(self.send)
+            self._prototypes[(restype, argtypes)] = function
+        sel = self._selectors.get(selector)
+        if sel is None:
+            sel = self._selectors[selector] = self.objc.sel_registerName(selector.encode())
+        return function(receiver, sel, *args)
+
+    def pool(self):
+        return _Pool(self.objc)
+
+    def string(self, text):
+        return self.call(self.cls("NSString"), "stringWithUTF8String:", text.encode(), argtypes = [ctypes.c_char_p])
+
+    def number(self, value):
+        return self.call(self.cls("NSNumber"), "numberWithUnsignedLongLong:", value, argtypes = [ctypes.c_ulonglong])
+
+    def data(self, payload):
+        return self.call(self.cls("NSData"), "dataWithBytes:length:", payload, len(payload),
+                         argtypes = [ctypes.c_char_p, ctypes.c_ulong])
+
+    def dictionary(self, pairs):
+        keys = (ctypes.c_void_p * len(pairs))(*(k for k, _ in pairs))
+        values = (ctypes.c_void_p * len(pairs))(*(v for _, v in pairs))
+        return self.call(self.cls("NSDictionary"), "dictionaryWithObjects:forKeys:count:", values, keys, len(pairs),
+                         argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong])
+
+    def array(self, items):
+        values = (ctypes.c_void_p * len(items))(*items)
+        return self.call(self.cls("NSArray"), "arrayWithObjects:count:", values, len(items),
+                         argtypes = [ctypes.c_void_p, ctypes.c_ulong])
+
+    def text(self, obj):
+        if not obj:
+            return "no error object"
+        described = self.call(obj, "description")
+        return ctypes.string_at(self.call(described, "UTF8String")).decode(errors = "replace")
+
+    def retain(self, obj):
+        return self.call(obj, "retain")
+
+    def release(self, obj):
+        self.call(obj, "release", restype = None)
+
+
+class _Pool:
+    def __init__(self, objc):
+        self.objc = objc
+
+    def __enter__(self):
+        self.token = self.objc.objc_autoreleasePoolPush()
+
+    def __exit__(self, *exc):
+        self.objc.objc_autoreleasePoolPop(self.token)
+
+
+@functools.cache
+def _runtime():
+    return _Runtime()
+
+
+@functools.cache
+def available():
+    """True when the private runtime loads and reports a Neural Engine."""
+    if sys.platform != "darwin":   # the framework lives in the dyld shared cache, not at its path on disk
+        return False
+    try:
+        rt = _runtime()
+        for name in ("_ANEInMemoryModelDescriptor", "_ANEInMemoryModel", "_ANERequest", "_ANEIOSurfaceObject"):
+            rt.cls(name)
+        return bool(rt.call(rt.cls("_ANEDeviceInfo"), "hasANE", restype = ctypes.c_bool))
+    except (OSError, AneError):
+        return False
+
+
+class Surface:
+    """An IOSurface the Neural Engine reads or writes, mapped into this process."""
+
+    def __init__(self, nbytes):
+        rt = _runtime()
+        self.nbytes = -(-nbytes // 16384) * 16384
+        with rt.pool():
+            keys = ("kIOSurfaceWidth", "kIOSurfaceHeight", "kIOSurfaceBytesPerElement", "kIOSurfaceBytesPerRow",
+                    "kIOSurfaceAllocSize", "kIOSurfacePixelFormat")
+            values = (self.nbytes, 1, 1, self.nbytes, self.nbytes, 0)
+            properties = rt.dictionary([(ctypes.c_void_p.in_dll(rt.surface, key).value, rt.number(value))
+                                        for key, value in zip(keys, values)])
+            self.ref = rt.surface.IOSurfaceCreate(properties)
+            if not self.ref:
+                raise AneError(f"IOSurfaceCreate failed for {self.nbytes} bytes")
+            self.base = rt.surface.IOSurfaceGetBaseAddress(self.ref)
+            self.handle = rt.retain(rt.call(rt.cls("_ANEIOSurfaceObject"), "objectWithIOSurface:", self.ref))
+        self._finalizer = weakref.finalize(self, _free_surface, self.handle, self.ref)
+
+    def array(self, dtype, shape):
+        """A numpy view of the surface's memory; valid while this Surface is alive."""
+        count = int(np.prod(shape))
+        nbytes = np.dtype(dtype).itemsize * count
+        if nbytes > self.nbytes:
+            raise ValueError(f"{shape} {dtype} needs {nbytes} bytes, the surface holds {self.nbytes}")
+        return np.frombuffer((ctypes.c_char * nbytes).from_address(self.base), dtype, count).reshape(shape)
+
+    def write(self, source):
+        """Copy a C-contiguous buffer (numpy, or an evaluated `mx.array` through `np.asarray`) to the surface."""
+        source = np.asarray(source)
+        if not source.flags.c_contiguous or source.nbytes > self.nbytes:
+            raise ValueError("the source must be C-contiguous and fit the surface")
+        ctypes.memmove(self.base, source.ctypes.data, source.nbytes)
+
+
+def _free_surface(handle, ref):
+    rt = _runtime()
+    rt.release(handle)
+    rt.cf_release(ref)
+
+
+class Program:
+    """A compiled and loaded MIL program.
+
+    The runtime stages a program under `$TMPDIR/<its identifier>` and reads the compiled form from there for as
+    long as it stays loaded, so the directory lives until `close()`; only the MIL and weight sources go after
+    loading.
+    """
+
+    def __init__(self, mil, weights):
+        rt = _runtime()
+        if not available():
+            raise AneError("no Neural Engine runtime on this machine")
+        started = time.perf_counter()
+        with rt.pool():
+            files = rt.dictionary([(rt.string(_WEIGHT_FILE), rt.dictionary([
+                (rt.string("offset"), rt.number(0)), (rt.string("data"), rt.data(weights))]))])
+            descriptor = rt.call(rt.cls("_ANEInMemoryModelDescriptor"), "modelWithMILText:weights:optionsPlist:",
+                                 rt.data(mil.encode()), files, None)
+            model = descriptor and rt.call(rt.cls("_ANEInMemoryModel"), "inMemoryModelWithDescriptor:", descriptor)
+            if not model:
+                raise AneError("the runtime rejected the program description")
+            identifier = ctypes.string_at(rt.call(rt.call(model, "hexStringIdentifier"), "UTF8String")).decode()
+            self.directory = os.path.join(os.environ.get("TMPDIR", "/tmp"), identifier)
+            # A compiled program is served from this directory, which identical programs in other processes share:
+            # each marks it, cached or not, and the last one removes it.
+            with _directory_lock(self.directory):
+                self.cached = self._compiled(model)
+                self.marker = self._mark() if self.cached else self._compile(model, mil, weights)
+            try:
+                self._invoke(model, "loadWithQoS:options:error:", "load")
+            except BaseException:
+                if self.marker is not None:
+                    with _directory_lock(self.directory):
+                        _release_directory(self.directory, self.marker)
+                raise
+            self.model = rt.retain(model)
+        self.seconds = time.perf_counter() - started
+        self._finalizer = weakref.finalize(self, _unload, self.model, self.directory, self.marker)
+
+    @staticmethod
+    def _compiled(model):
+        return bool(_runtime().call(model, "compiledModelExists", restype = ctypes.c_bool))
+
+    def _mark(self):
+        """This program's owner marker in its directory. Called with the lock held."""
+        marker = os.path.join(self.directory, f".unsloth-{os.getpid()}-{id(self)}")
+        os.makedirs(os.path.join(self.directory, "weights"), exist_ok = True)
+        open(marker, "w").close()
+        return marker
+
+    def _compile(self, model, mil, weights):
+        """Stage the sources, compile and drop them; returns this program's owner marker. Called with the lock held."""
+        marker = self._mark()
+        sources = (os.path.join(self.directory, "model.mil"), os.path.join(self.directory, "weights", "weight.bin"))
+        try:
+            with open(sources[0], "w") as file:
+                file.write(mil)
+            with open(sources[1], "wb") as file:
+                file.write(weights)
+            self._invoke(model, "compileWithQoS:options:error:", "compile")
+        except BaseException:
+            _release_directory(self.directory, marker)
+            raise
+        for source in sources:
+            os.remove(source)
+        return marker
+
+    @staticmethod
+    def _invoke(model, selector, what):
+        rt = _runtime()
+        for attempt in range(_COMPILE_TRIES):
+            error = ctypes.c_void_p()
+            if rt.call(model, selector, _QOS, rt.dictionary([]), ctypes.byref(error), restype = ctypes.c_bool,
+                       argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]):
+                return
+            message = rt.text(error.value)
+            # The compiler fails some programs nondeterministically; the same program builds on a retry.
+            if "Compiler internal error" not in message and attempt:
+                break
+            time.sleep(0.2)
+        raise AneError(f"{what} failed: {message}")
+
+    def request(self, inputs, outputs, procedure = 0):
+        """A reusable request binding `inputs` and `outputs` (Surfaces) to procedure `procedure`'s tensors in order."""
+        return _Request(self, inputs, outputs, procedure)
+
+    def close(self):
+        self._finalizer()
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+@contextmanager
+def _directory_lock(directory):
+    import fcntl  # POSIX only; importing at module level breaks `unsloth_zoo.mlx.inference` on Windows
+
+    # O_NOFOLLOW and no truncation: the lock sits in TMPDIR, which may be the shared /tmp.
+    fd = os.open(f"{directory}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _release_directory(directory, marker):
+    """Drop `marker`; remove the directory once no live process marks it. Called with its lock held."""
+    try:
+        os.remove(marker)
+        owners = [name for name in os.listdir(directory) if name.startswith(".unsloth-")]
+    except OSError:
+        return
+    if not any(_alive(int(name.split("-")[1])) for name in owners):
+        shutil.rmtree(directory, ignore_errors = True)
+
+
+def _unload(model, directory, marker):
+    rt = _runtime()
+    error = ctypes.c_void_p()
+    with rt.pool():
+        rt.call(model, "unloadWithQoS:error:", _QOS, ctypes.byref(error), restype = ctypes.c_bool,
+                argtypes = [ctypes.c_uint, ctypes.c_void_p])
+    rt.release(model)
+    if marker is not None:
+        with _directory_lock(directory):
+            _release_directory(directory, marker)
+
+
+class _Request:
+    def __init__(self, program, inputs, outputs, procedure = 0):
+        rt = _runtime()
+        self.program, self.surfaces = program, (tuple(inputs), tuple(outputs))  # kept alive with the request
+        with rt.pool():
+            # Each procedure's tensors are numbered among all of the program's: its own start after the earlier ones'.
+            model = rt.call(program.model, "model")
+            first = [rt.call(rt.call(model, f"{kind}SymbolIndicesForProcedureIndex:", procedure,
+                                     argtypes = [ctypes.c_uint]), "firstIndex", restype = ctypes.c_ulong)
+                     for kind in ("input", "output")]
+            request = rt.call(
+                rt.cls("_ANERequest"),
+                "requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:",
+                rt.array([s.handle for s in inputs]), rt.array([rt.number(first[0] + i) for i in range(len(inputs))]),
+                rt.array([s.handle for s in outputs]), rt.array([rt.number(first[1] + i) for i in range(len(outputs))]),
+                None, None, rt.number(procedure))
+            if not request:
+                raise AneError("the runtime rejected the request")
+            self.handle = rt.retain(request)
+        self._finalizer = weakref.finalize(self, rt.release, self.handle)
+
+    def run(self):
+        """Evaluate once, blocking until the outputs are written. ctypes drops the GIL for the call."""
+        rt = _runtime()
+        error = ctypes.c_void_p()
+        with rt.pool():
+            ok = rt.call(self.program.model, "evaluateWithQoS:options:request:error:", _QOS, rt.dictionary([]),
+                         self.handle, ctypes.byref(error), restype = ctypes.c_bool,
+                         argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p])
+            if not ok:
+                raise AneError(f"evaluate failed: {rt.text(error.value)}")
+
+
+class Blob:
+    """A program's weight file: a 64-byte header, then each tensor after its own 64-byte header, 64-byte aligned."""
+
+    def __init__(self):
+        header = bytearray(64)
+        header[0], header[4] = 1, 2
+        self.chunks, self.size = [bytes(header)], 64
+
+    def add(self, array):
+        """Append a tensor; returns the offset a MIL BLOBFILE reference names."""
+        payload = np.ascontiguousarray(array).tobytes()
+        offset, pad = self.size, -len(payload) % 64
+        self.chunks += [struct.pack("<IIQQ", 0xDEADBEEF, 1, len(payload), offset + 64) + bytes(40), payload, bytes(pad)]
+        self.size += 64 + len(payload) + pad
+        return offset
+
+    def bytes(self):
+        return b"".join(self.chunks)
+
+
+def _shape(*dims):
+    return ", ".join(map(str, dims))
+
+
+class Function:
+    """Builds one MIL function: values are named in order of definition and typed fp16 unless stated."""
+
+    def __init__(self, name, **inputs):
+        self.name, self.inputs, self.lines, self.count = name, inputs, [], 0
+
+    def value(self, type_, expression):
+        self.count += 1
+        name = f"v{self.count}"
+        tag = 'name=string("%s")' % name
+        self.lines.append(f"    {type_} {name} = {expression.format(name = tag)};")
+        return name
+
+    def const(self, type_, literal):
+        return self.value(type_, f"const()[{{name}}, val={type_}({literal})]")
+
+    def op(self, op, shape, **operands):
+        args = ", ".join(f"{key}={value}" for key, value in operands.items())
+        return self.value(f"tensor<fp16, [{_shape(*shape)}]>", f"{op}({args})[{{name}}]")
+
+    def int8_weight(self, blob, codes, scales):
+        """A [rows, cols, 1, 1] fp16 weight stored as int8 `codes` with one fp16 scale per row."""
+        rows, cols = codes.shape
+        codes_at, scales_at = blob.add(codes.astype(np.int8)), blob.add(scales.astype(np.float16))
+        return self.value(
+            f"tensor<fp16, [{_shape(rows, cols, 1, 1)}]>",
+            "constexpr_affine_dequantize()[axis=int32(0), {name}, "
+            f"quantized_data=tensor<int8, [{_shape(rows, cols, 1, 1)}]>(BLOBFILE(path=string(\"{_WEIGHT_FILE}\"), "
+            f"offset=uint64({codes_at}))), scale=tensor<fp16, [{rows}]>(BLOBFILE(path=string(\"{_WEIGHT_FILE}\"), "
+            f"offset=uint64({scales_at}))), zero_point=int8(0)]")
+
+    def conv1x1(self, x, weight, channels, rows):
+        """`weight @ x` for x laid out [1, in_channels, 1, rows]."""
+        if not hasattr(self, "_conv"):
+            self._conv = dict(
+                dilations = self.const("tensor<int32, [2]>", "[1, 1]"), groups = self.const("int32", "1"),
+                pad = self.const("tensor<int32, [4]>", "[0, 0, 0, 0]"), pad_type = self.const("string", '"valid"'),
+                strides = self.const("tensor<int32, [2]>", "[1, 1]"))
+        return self.op("conv", (1, channels, 1, rows), **self._conv, weight = weight, x = x)
+
+    def slice_channels(self, x, start, channels, rows):
+        begin = self.const("tensor<int32, [4]>", f"[0, {start}, 0, 0]")
+        size = self.const("tensor<int32, [4]>", f"[1, {channels}, 1, {rows}]")
+        return self.op("slice_by_size", (1, channels, 1, rows), x = x, begin = begin, size = size)
+
+    def function(self, outputs):
+        arguments = ", ".join(f"{type_} {name}" for name, type_ in self.inputs.items())
+        return (f"  func {self.name}<ios18>({arguments}) {{\n" + "\n".join(self.lines) +
+                f"\n  }} -> ({', '.join(outputs)});\n")
+
+    def program(self, outputs):
+        return mil_program([self.function(outputs)])
+
+
+def mil_program(functions):
+    """A program of several functions; a request selects one by its index, its procedure."""
+    return ('program(1.3)\n[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, '
+            '{"coremlc-version", "3505.4.1"}})]\n{\n' + "".join(functions) + "}\n")
+
+
+logger = logging.getLogger(__name__)
+
+OPT_IN = "UNSLOTH_MLX_ANE_PREFILL"
+_TILE = 2048
+_ALIGN = 128            # channel granularity of the split
+_DOWN_SLAB = 4608       # widest down-projection K the Neural Engine runs at full rate
+_ACT_SCALE = 1 / 16     # keeps the fp16 activation and its down projection in range
+_MIN_GAIN = 0.05        # below this the split is not worth its approximation
+_WATCHDOG = 5.0         # seconds a Neural Engine evaluation may take before the split is abandoned
+_MEMORY_SHARE = 0.5     # of the memory the model leaves free; the rest stays for the KV cache and activations
+_PRESSURE_WARN, _PRESSURE_CRITICAL = 2, 4   # kern.memorystatus_vm_pressure_level
+_WIRED_FACTOR = 3       # the Neural Engine wires 1.85x (M3 Max) to 2.7x (M5 Pro) a program's int8 weights in prefill
+_BANK_BYTES = 2 << 30   # int8 weights per program; 1-4 GB banks load on M3 Max, and 2 GB ones on M5 Pro
+_STATE = "_unsloth_ane_split"
+_PREPARED = "_unsloth_ane_status"   # the model's last prepare
+_DECISION = "_unsloth_ane_prefill_scope"   # (depth, the outermost scope's decision)
+_CACHE_VERSION = 2      # bump when what calibration times changes, so older entries are not reused
+_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "unsloth", "mlx_ane_prefill.json")
+_LOCK = threading.RLock()
+_CLASSES = {}
+_ABANDONED = []
+
+
+class AnePrefillStatus(NamedTuple):
+    layers: int
+    share: float = 0.0
+    gpu_ms: float = 0.0
+    split_ms: float = 0.0
+    seconds: float = 0.0
+    reason: str = ""
+    # System wired memory each program load added, over its int8 weight bytes (median); noisy, so only reported.
+    wired_factor: float = 0.0
+    # Why nothing attached: no_neural_engine, not_gpu, timed_out, no_eligible_mlps, calibration_failed, no_gain, not_enough_memory,
+    # load_failed, failed
+    code: str = ""
+
+
+class AnePrefillAvailability(NamedTuple):
+    available: bool
+    # "", no_neural_engine, not_gpu, distributed, timed_out, not_downloaded, no_eligible_mlps; after a prepare its
+    # code, failed or released
+    reason: str
+    layers: int   # MLPs the split takes: eligible ones before a prepare (approximate from a checkpoint), attached after
+
+    def __bool__(self):
+        return self.available
+
+
+class _Worker:
+    """The thread Neural Engine evaluations run on; a daemon, so a hung evaluation cannot hold up interpreter exit."""
+
+    def __init__(self):
+        self.jobs = queue.SimpleQueue()
+        threading.Thread(target = self._serve, name = "unsloth-ane", daemon = True).start()
+
+    def _serve(self):
+        while True:
+            function, future = self.jobs.get()
+            if future.set_running_or_notify_cancel():
+                try:
+                    future.set_result(function())
+                except BaseException as error:
+                    future.set_exception(error)
+            del function, future   # a finished job would otherwise keep its program loaded until the next one
+
+    def run(self, function):
+        """`function()` on the worker; raises `concurrent.futures.TimeoutError` after the watchdog."""
+        future = concurrent.futures.Future()
+        self.jobs.put((function, future))
+        return future.result(timeout = _WATCHDOG)
+
+
+@functools.cache
+def _worker():
+    return _Worker()
+
+
+def _projections(mlp):
+    return tuple(getattr(mlp, name, None) for name in ("gate_proj", "up_proj", "down_proj"))
+
+
+def _eligible(mlp):
+    gate, up, down = _projections(mlp)
+    # Subclasses too: the dense-prefill and NAX scopes swap the projections' classes while they are entered.
+    if mlp.training or not all(isinstance(p, nn.QuantizedLinear) for p in (gate, up, down)):
+        return False
+    if any("bias" in p or getattr(p, "mode", "affine") != "affine" for p in (gate, up, down)):
+        return False
+    # Bits may differ (mixed-precision checkpoints raise single projections): each is requantized on its own.
+    if len({p.group_size for p in (gate, up, down)}) != 1:
+        return False
+    channels, hidden = gate.weight.shape[0], gate.scales.shape[1] * gate.group_size
+    return (up.weight.shape[0] == channels and down.weight.shape[0] == hidden
+            and down.scales.shape[1] * down.group_size == channels and channels % _ALIGN == 0)
+
+
+def _bits(mlp):
+    return tuple(p.bits for p in _projections(mlp))
+
+
+def _mlp_shape(mlp):
+    gate = _projections(mlp)[0]
+    return gate.scales.shape[1] * gate.group_size, gate.weight.shape[0]
+
+
+def _computes_swiglu(mlp):
+    """The module's own call is exactly down(silu(gate(x)) * up(x)), checked bit for bit on its own projections."""
+    gate, up, down = _projections(mlp)
+    x = mx.random.normal((1, 8, gate.scales.shape[1] * gate.group_size), key = mx.random.key(0)).astype(gate.scales.dtype)
+    return mx.array_equal(mlp(x), down(nn.silu(gate(x)) * up(x))).item()
+
+
+def _dequantized(p):
+    return mx.dequantize(p.weight, p.scales, p.biases, group_size = p.group_size, bits = p.bits).astype(mx.float32)
+
+
+def _int8_rows(w):
+    scales = mx.maximum(mx.abs(w).max(axis = 1), 1e-8) / 127
+    codes = mx.clip(mx.round(w / scales[:, None]), -127, 127).astype(mx.int8)
+    return np.array(codes), np.array(scales.astype(mx.float16))
+
+
+def _down_slabs(k):
+    return next(n for n in range(1, k // _ALIGN + 1) if k % n == 0 and k // n <= _DOWN_SLAB)
+
+
+def _bank_program(layers, tile):
+    """MIL and weights of one program whose procedure i computes layer i's slice, for `layers` [(mlp, k)]."""
+    blob = Blob()
+    return mil_program([_slice(blob, i, mlp, k, tile) for i, (mlp, k) in enumerate(layers)]), blob.bytes()
+
+
+def _slice(blob, index, mlp, k, tile):
+    """Procedure `index` for channels [0, k): down[:, :k] @ (silu(gate[:k] @ x) * up[:k] @ x), x laid out
+    [1, hidden, 1, tile]."""
+    gate, up, down = map(_dequantized, _projections(mlp))
+    hidden = down.shape[0]
+    fn = Function(f"procedure{index:03d}", x = f"tensor<fp16, [1, {hidden}, 1, {tile}]>")
+    gate_up = fn.conv1x1("x", fn.int8_weight(blob, *_int8_rows(mx.concatenate([gate[:k], up[:k]]))), 2 * k, tile)
+    g, u = fn.slice_channels(gate_up, 0, k, tile), fn.slice_channels(gate_up, k, k, tile)
+    shape = (1, k, 1, tile)
+    # silu(g) = g * (1 + tanh(g / 2)) / 2: the Neural Engine's tanh is more accurate than its sigmoid.
+    half = fn.const("fp16", "0.5")
+    sig = fn.op("add", shape, x = fn.op("mul", shape, x = fn.op("tanh", shape, x = fn.op("mul", shape, x = g, y = half)),
+                                        y = half), y = half)
+    scaled_up = fn.op("mul", shape, x = u, y = fn.const("fp16", repr(_ACT_SCALE)))
+    act = fn.op("mul", shape, x = fn.op("mul", shape, x = g, y = sig), y = scaled_up)
+    slabs = _down_slabs(k)
+    width, total = k // slabs, None
+    for i in range(slabs):
+        weight = fn.int8_weight(blob, *_int8_rows(down[:, i * width:(i + 1) * width]))
+        part = fn.conv1x1(fn.slice_channels(act, i * width, width, tile), weight, hidden, tile)
+        total = part if total is None else fn.op("add", (1, hidden, 1, tile), x = total, y = part)
+    y = fn.op("mul", (1, hidden, 1, tile), x = total, y = fn.const("fp16", repr(1 / _ACT_SCALE)))
+    return fn.function([y])
+
+
+def _split_bytes(mlp, k):
+    """Memory a split adds to the checkpoint's: what the Neural Engine wires for its int8 weights, outside the process,
+    while prefill runs. The GPU remainders are views of the checkpoint's tensors."""
+    return _WIRED_FACTOR * 3 * k * _projections(mlp)[2].weight.shape[0]
+
+
+class _VMStatistics(ctypes.Structure):
+    _fields_ = [("free", ctypes.c_uint32), ("active", ctypes.c_uint32), ("inactive", ctypes.c_uint32),
+                ("wire", ctypes.c_uint32), ("rest", ctypes.c_uint8 * 256)]
+
+
+@functools.cache
+def _libc():
+    libc = ctypes.CDLL(None)
+    libc.mach_host_self.restype = ctypes.c_uint32
+    return libc
+
+
+def _wired_bytes():
+    """System-wide wired memory, where the Neural Engine's buffers show (no process footprint counts them); None when
+    the kernel does not answer."""
+    libc = _libc()
+    stats, count = _VMStatistics(), ctypes.c_uint32(38)   # HOST_VM_INFO64_COUNT
+    if libc.host_statistics64(libc.mach_host_self(), 4, ctypes.byref(stats), ctypes.byref(count)):   # HOST_VM_INFO64
+        return None
+    return stats.wire * ctypes.c_size_t.in_dll(libc, "vm_kernel_page_size").value
+
+
+def _pressure_level():
+    """The kernel's memory pressure level (1 normal, 2 warn, 4 critical); 1 when it does not answer."""
+    level, size = ctypes.c_int(1), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+    if _libc().sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(level), ctypes.byref(size), None,
+                            ctypes.c_size_t(0)):
+        return 1
+    return level.value
+
+
+def _working_set():
+    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+    return 0.85 * info["memory_size"]
+
+
+def _memory_budget():
+    return int(_MEMORY_SHARE * (_working_set() - mx.get_active_memory()))
+
+
+class _Attached:
+    """A model's attached MLPs in order, so memory pressure releases from the end. Weak, so an abandoned split
+    keeps no other layer alive."""
+
+    def __init__(self, mlps):
+        self.mlps, self.warned, self.rerouted = [weakref.ref(m) for m in mlps], False, False
+
+
+def _relieve(group):
+    """Release programs from the end of `group` when memory runs short: enough to bring active memory plus what the
+    Neural Engine wires back under the working set, or all of them at critical pressure. Running any procedure wires a
+    whole program, including those of layers that have detached, so programs are what is priced and released."""
+    level = _pressure_level()
+    attached = [m for m in map(lambda ref: ref(), group.mlps)
+                if m is not None and getattr(m.__dict__.get(_STATE), "group", None) is group]
+    banks = {id(s.bank): s.bank for s in (m.__dict__[_STATE] for m in attached)}.values()
+    over = mx.get_active_memory() - _working_set() + sum(_WIRED_FACTOR * bank.bytes for bank in banks)
+    if level < _PRESSURE_CRITICAL and over <= 0:
+        if level >= _PRESSURE_WARN and not group.warned:
+            group.warned = True
+            logger.warning("Neural Engine prefill: memory pressure is elevated; the split keeps its layers")
+        return
+    total, freed, group.warned = len(attached), 0, True
+    while attached and (level >= _PRESSURE_CRITICAL or freed < over):
+        bank = attached[-1].__dict__[_STATE].bank   # with every layer it serves, wherever a later prepare put them
+        for mlp in [m for m in attached if m.__dict__[_STATE].bank is bank]:
+            mlp.__dict__.pop(_STATE).close()
+        attached = [m for m in attached if _STATE in m.__dict__]
+        freed += _WIRED_FACTOR * bank.bytes
+    logger.warning("Neural Engine prefill: memory pressure released %d of %d layers (%.1f GB priced); they use the GPU until "
+                   "prepare_ane_prefill(model) runs again", total - len(attached), total, freed / 2**30)
+
+
+def _remainder(p, rows = None, columns = None):
+    """A QuantizedLinear over rows [rows:] or input columns [columns:] of `p`'s quantized tensors."""
+    weight, scales, biases = p.weight, p.scales, p.biases
+    if rows is not None:
+        weight, scales, biases = weight[rows:], scales[rows:], biases[rows:]
+    if columns is not None:
+        # Strided views: the matmul copies them per call, a temporary instead of a resident copy per layer.
+        groups = columns // p.group_size
+        weight, scales, biases = weight[:, columns * p.bits // 32:], scales[:, groups:], biases[:, groups:]
+    piece = nn.QuantizedLinear(p.group_size, 1, bias = False, group_size = p.group_size, bits = p.bits)
+    piece.weight, piece.scales, piece.biases = weight, scales, biases
+    piece.freeze()
+    return piece.eval()   # the prefill routes skip training modules
+
+
+class _Surfaces:
+    def __init__(self, hidden, tile):
+        self.input, self.output = Surface(hidden * tile * 2), Surface(hidden * tile * 2)
+
+
+class _Bank:
+    """Consecutive layers' slices as the procedures of one program, so a model loads a few programs instead of one per
+    layer (the system loads at most 127). Running any procedure wires the whole program, so it unloads only with the
+    last split that uses it."""
+
+    def __init__(self, layers, tile):
+        source, before = _bank_program(layers, tile), _wired_bytes()
+        self.program = Program(*source)
+        after = _wired_bytes()
+        self.wired = None if before is None or after is None else after - before
+        self.bytes = sum(3 * k * _projections(mlp)[2].weight.shape[0] for mlp, k in layers)
+        self.users = 0
+
+    def release(self):
+        self.users -= 1
+        if not self.users:
+            self.program.close()
+
+
+class _Split:
+    def __init__(self, mlp, k, tile, surfaces, bank = None, procedure = 0):
+        gate, up, down = _projections(mlp)
+        self.k, self.tile, self.hidden, self.surfaces = k, tile, down.weight.shape[0], surfaces
+        self.bank = bank or _Bank([(mlp, k)], tile)
+        self.bank.users += 1
+        self.program = self.bank.program
+        self.request = self.program.request([surfaces.input], [surfaces.output], procedure)
+        self.rest = (_remainder(gate, rows = k), _remainder(up, rows = k), _remainder(down, columns = k))
+        mx.eval([p.parameters() for p in self.rest])
+        self.sources = tuple((p, p.weight, p.scales, p.biases) for p in (gate, up, down))
+        self.failed, self.pad_from, self.group = False, tile, None
+        self.route = None
+
+    def serves(self, mlp):
+        """Whether `mlp` still has the projections and quantized tensors this split was built from."""
+        # The object first: an adapter's replacement may have no quantized tensors at all.
+        return all(p is q and p.weight is w and p.scales is s and p.biases is b
+                   for p, (q, w, s, b) in zip(_projections(mlp), self.sources))
+
+    def close(self):
+        self.bank.release()
+
+    def evaluate(self):
+        """Run the Neural Engine half on the worker. A timed-out evaluation may still be running, so its native objects
+        are never released, not even at exit, and since it holds the worker every split stops."""
+        try:
+            _worker().run(self.request.run)
+        except concurrent.futures.TimeoutError:
+            for owner in (self.program, self.request, self.surfaces.input, self.surfaces.output):
+                owner._finalizer.detach()
+            _ABANDONED.append(self)
+            raise
+
+    def __call__(self, x):
+        """One tile: x [tile, hidden] -> [tile, hidden]."""
+        planes = mx.contiguous(x.T.astype(mx.float16))
+        mx.eval(planes)
+        self.surfaces.input.write(planes)
+        gate, up, down = self.rest
+        y = down(nn.silu(gate(x)) * up(x))
+        mx.async_eval(y)
+        self.evaluate()
+        partial = mx.array(self.surfaces.output.array(np.float16, (self.hidden, self.tile)))
+        if not mx.all(mx.isfinite(partial)).item():
+            raise AneError("the Neural Engine produced a non-finite partial output")
+        return (y.astype(mx.float32) + partial.T.astype(mx.float32)).astype(y.dtype)
+
+
+def _split_call(base):
+    def call(self, x):
+        with _LOCK:   # held from the lookup on, so a release cannot unload the split under this call
+            return routed(self, x)
+
+    def routed(self, x):
+        split = self.__dict__.get(_STATE)
+        if split is not None and not split.serves(self):   # e.g. an adapter replaced a projection
+            self.__dict__.pop(_STATE, None)
+            split.close()
+            split = None
+        rows = x.size // x.shape[-1]
+        if split is None or split.failed or _ABANDONED or self.training or rows < split.pad_from:
+            return base.__call__(self, x)
+        if _rerouted(route := _route(self, split.tile), split.route):
+            if not split.group.rerouted:
+                split.group.rerouted = True
+                logger.warning("Neural Engine prefill: the GPU route is %s and the split was tuned on %s; the native "
+                               "MLP runs until release_ane_prefill and prepare_ane_prefill", route, split.route)
+            return base.__call__(self, x)
+        if split.group is not None:
+            _relieve(split.group)
+            if self.__dict__.get(_STATE) is not split:
+                return base.__call__(self, x)
+        flat, tiles = x.reshape(rows, x.shape[-1]), rows // split.tile
+        tail = rows - tiles * split.tile
+        padded = tail >= split.pad_from
+        try:
+            parts = [split(flat[i * split.tile:(i + 1) * split.tile]) for i in range(tiles)]
+            if padded:   # the MLP is token-local, so zero rows cannot change the tail's own
+                rest = mx.concatenate([flat[tiles * split.tile:], mx.zeros((split.tile - tail, x.shape[-1]), x.dtype)])
+                parts.append(split(rest)[:tail])
+        except (AneError, concurrent.futures.TimeoutError) as error:
+            split.failed = True
+            logger.warning("Neural Engine prefill split failed (%s); this layer uses the GPU from now on", error)
+            return base.__call__(self, x)
+        if tail and not padded:
+            parts.append(base.__call__(self, flat[tiles * split.tile:][None]).reshape(-1, x.shape[-1]))
+        return mx.concatenate(parts).reshape(x.shape)
+    return call
+
+
+def _split_class(base):
+    cls = _CLASSES.get(base)
+    if cls is None:
+        cls = _CLASSES[base] = type(f"_AneSplit{base.__name__}", (base,), {"__call__": _split_call(base)})
+        cls._unsloth_ane_native = base
+    return cls
+
+
+def _machine_key(mlp, tile, route):
+    gate, up, down = _projections(mlp)
+    try:
+        chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output = True, text = True,
+                              timeout = 5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        chip = platform.machine()
+    build = platform.mac_ver()[0]
+    return (f"{chip}|macOS {build}|mlx {mx.__version__}|{down.weight.shape[0]}x{gate.weight.shape[0]}|"
+            f"q{gate.bits}/{up.bits}/{down.bits}g{gate.group_size}|{gate.scales.dtype}|tile {tile}|{route}|v{_CACHE_VERSION}")
+
+
+def _load_cache():
+    try:
+        with open(_CACHE_PATH) as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        return {}
+
+
+def _store_cache(key, entry):
+    """Best effort: an unwritable cache only means the next prepare calibrates again."""
+    cache = _load_cache()
+    cache[key] = entry
+    temporary = f"{_CACHE_PATH}.{os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok = True)
+        with open(temporary, "w") as file:
+            json.dump(cache, file, indent = 1, sort_keys = True)
+        os.replace(temporary, _CACHE_PATH)
+    except OSError as error:
+        logger.warning("Neural Engine prefill: could not store calibration in %s: %s", _CACHE_PATH, error)
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+
+def _median_ms(function, repeats = 7, warm_seconds = 1.0):
+    started = time.perf_counter()
+    while time.perf_counter() - started < warm_seconds:   # an idle GPU needs a moment to reach its clocks
+        mx.eval(function())
+    times = []
+    for _ in range(repeats):
+        started = time.perf_counter()
+        mx.eval(function())
+        times.append(time.perf_counter() - started)
+    return float(np.median(times) * 1e3)
+
+
+def _aligned(channels, share):
+    return int(min(max(round(channels * share / _ALIGN), 1), channels // _ALIGN - 1)) * _ALIGN
+
+
+def _route(mlp, tile):
+    from .inference import prefill_route
+
+    return "/".join(prefill_route(p, tile) for p in _projections(mlp))
+
+
+def _rerouted(now, tuned):
+    """Whether the share no longer fits the GPU routes: a projection now takes a faster route than the one it was tuned
+    on, or Int8 Prefill is off for a share tuned against int8 remainders. A slower route otherwise (a retired dense
+    shape, or no route scope held) only lowers the GPU time the split beats."""
+    rank = {"stock": 0, "tiled": 1, "dense": 1, "int8": 2}
+    return (any(rank[a] > rank[b] for a, b in zip(now.split("/"), tuned.split("/")))
+            or _int8(tuned) and not _int8(now))
+
+
+def _int8(route):
+    return "int8" in route.split("/")
+
+
+@contextmanager
+def _generation_routes(model):
+    from .inference import dense_prefill_linear, nax_quantized_linear
+
+    with nax_quantized_linear(model), dense_prefill_linear(model):
+        yield
+
+
+@contextmanager
+def _remainder_routes(model, splits):
+    """With Int8 Prefill on, give the splits' GPU remainders the generation's prefill routes: they are outside the
+    parameter tree, so its scopes never reach them. Off, they stay stock, which measured faster beside dense."""
+    modules = tuple(("", p) for split in splits if _int8(split.route) for p in split.rest)
+    if not modules:
+        yield
+        return
+    from .inference import dense_prefill_linear, nax_quantized_linear
+
+    with nax_quantized_linear(model, _modules = modules), dense_prefill_linear(model, _modules = modules):
+        yield
+
+
+def _calibrate(model, mlp, tile, surfaces):
+    """(share, GPU ms, split ms, split at that share) for one tile: a tile costs about max(g (1 - s), a s), lowest at
+    s = g / (g + a); the chosen share is timed end to end since both units share memory bandwidth."""
+    gate = _projections(mlp)[0]
+    channels, hidden = gate.weight.shape[0], gate.scales.shape[1] * gate.group_size
+    x = (mx.random.normal((tile, hidden), key = mx.random.key(1)) * 0.5).astype(gate.scales.dtype)
+    gpu = _median_ms(lambda: mlp(x[None]))   # on the GPU route prepare holds
+    probe = _Split(mlp, _aligned(channels, 0.5), tile, surfaces)
+
+    def neural_engine():
+        probe.evaluate()
+        return mx.array(0)
+
+    per_share = _median_ms(neural_engine) / (probe.k / channels)
+    k = _aligned(channels, gpu / (gpu + per_share))
+    split = probe if k == probe.k else _Split(mlp, k, tile, surfaces)
+    split.route = _route(mlp, tile)
+    with _remainder_routes(model, [split]):
+        split_ms = _median_ms(lambda: split(x))
+    return k / channels, gpu, split_ms, split
+
+
+def _candidates(model):
+    """Unattached eligible SwiGLU MLPs of the most common shape, which share one calibration (a vision tower's stay native)."""
+    mlps = []
+    for _, module in model.named_modules():
+        if module.__dict__.get(_STATE) is None and _projections(module)[0] is not None and _eligible(module):
+            if all(m is not module for m in mlps):
+                mlps.append(module)
+    mlps = [m for m in mlps if _computes_swiglu(m)]
+    if not mlps:
+        return mlps
+    shape = collections.Counter(map(_mlp_shape, mlps)).most_common(1)[0][0]
+    return [m for m in mlps if _mlp_shape(m) == shape]
+
+
+def prepare_ane_prefill(model, *, tile = _TILE, share = None):
+    """Compile the Neural Engine half of every eligible dense SwiGLU MLP in `model` and attach it.
+
+    `share` fixes the fraction of intermediate channels the Neural Engine takes; by default it is calibrated on the
+    first layer of the most common quantization and cached per machine, macOS build, MLX version and shape, and a split that is not at least 5% faster
+    than the GPU alone is not attached. Returns an `AnePrefillStatus`; `layers == 0` with a `reason` when nothing was
+    attached.
+    """
+    started = time.perf_counter()
+    try:
+        status = _prepare(model, tile, share)
+    except AneError as error:   # e.g. no IOSurface for the probe: the GPU keeps every layer
+        logger.warning("Neural Engine prefill: prepare failed: %s", error)
+        status = AnePrefillStatus(0, seconds = time.perf_counter() - started, reason = str(error), code = "failed")
+    model.__dict__[_PREPARED] = status
+    return status
+
+
+def _prepare(model, tile, share):
+    started = time.perf_counter()
+    if not available():
+        return AnePrefillStatus(0, reason = "no Neural Engine runtime", code = "no_neural_engine")
+    if mx.default_device() != mx.gpu:
+        return AnePrefillStatus(0, reason = "the default device is not the GPU", code = "not_gpu")
+    if _ABANDONED:
+        return AnePrefillStatus(0, reason = "a Neural Engine evaluation timed out in this process", code = "timed_out")
+    if tile % 32:
+        raise ValueError("tile must be a multiple of 32 rows")
+    # Calibration times, and each split records, the GPU routes a generation would take; a generation's own scopes
+    # already hold them.
+    with _LOCK, _generation_routes(model):
+        mlps = _candidates(model)
+        if not mlps:
+            return AnePrefillStatus(0, reason = "no dense SwiGLU MLP with affine quantized projections",
+                                    code = "no_eligible_mlps")
+        shape = _mlp_shape(mlps[0])
+        # Calibrate on the most common quantization: one share serves every layer.
+        bits = collections.Counter(_bits(m) for m in mlps).most_common(1)[0][0]
+        probe = next(m for m in mlps if _bits(m) == bits)
+        surfaces = _Surfaces(shape[0], tile)
+        route = _route(probe, tile)
+        key, first = _machine_key(probe, tile, route), None
+        cached = _load_cache().get(key) if share is None else None
+        if share is not None:
+            gpu = split_ms = 0.0
+        elif cached is not None:
+            share, gpu, split_ms = cached["share"], cached["gpu_ms"], cached["split_ms"]
+        else:
+            try:
+                share, gpu, split_ms, first = _calibrate(model, probe, tile, surfaces)
+            except (AneError, concurrent.futures.TimeoutError) as error:
+                return AnePrefillStatus(0, seconds = time.perf_counter() - started, reason = f"calibration failed: {error}",
+                                        code = "calibration_failed")
+            if split_ms > gpu * (1 - _MIN_GAIN):
+                share = 0.0
+                first.close()
+            _store_cache(key, {"share": share, "gpu_ms": gpu, "split_ms": split_ms})
+        if not share:
+            return AnePrefillStatus(0, 0.0, gpu, split_ms, time.perf_counter() - started,
+                                    f"the split ({split_ms:.1f} ms) is not 5% faster than the GPU ({gpu:.1f} ms)", code = "no_gain")
+        free, admitted = _memory_budget(), []
+        for mlp in mlps:   # layers may be quantized differently, so each is costed on its own
+            free -= _split_bytes(mlp, _aligned(shape[1], share))
+            if free < 0:
+                break
+            admitted.append(mlp)
+        if first is not None:   # the layers' banks hold their own copy of it
+            first.close()
+        if len(admitted) < len(mlps):
+            logger.warning("Neural Engine prefill: free memory admits %d of %d layers", len(admitted), len(mlps))
+            mlps = admitted
+        if not mlps:
+            return AnePrefillStatus(0, share, gpu, split_ms, time.perf_counter() - started, "not enough free memory",
+                                    code = "not_enough_memory")
+        # A partial tile padded to a full one costs the split's time, so it pays once the GPU would take longer.
+        pad_from = min(tile, math.ceil(tile * split_ms / gpu)) if gpu else tile
+        k = _aligned(shape[1], share)
+        per_bank, attached = max(1, _BANK_BYTES // (3 * k * shape[0])), []
+        try:
+            for start in range(0, len(mlps), per_bank):
+                layers = mlps[start:start + per_bank]
+                bank = _Bank([(mlp, k) for mlp in layers], tile)
+                for procedure, mlp in enumerate(layers):
+                    mlp.__dict__[_STATE] = split = _Split(mlp, k, tile, surfaces, bank, procedure)
+                    split.pad_from, split.route = pad_from, _route(mlp, tile)
+                    attached.append(mlp)
+        except AneError as error:
+            logger.warning("Neural Engine prefill stopped after %d of %d layers: %s", len(attached), len(mlps), error)
+        # One group per model, so a second prepare's layers and the earlier ones share one shortfall.
+        group = _Attached({id(m): m for _, m in model.named_modules() if m.__dict__.get(_STATE) is not None}.values())
+        for mlp in group.mlps:
+            mlp().__dict__[_STATE].group = group
+        banks = {id(b): b for b in (m.__dict__[_STATE].bank for m in attached)}.values()
+        loads = [bank.wired / bank.bytes for bank in banks if bank.wired is not None]
+        status = AnePrefillStatus(len(attached), share, gpu, split_ms, time.perf_counter() - started,
+                                  wired_factor = float(np.median(loads)) if loads else 0.0,
+                                  code = "" if attached else "load_failed")
+        logger.info("Neural Engine prefill: %d layers at a %.0f%% channel share (one-tile MLP %.1f -> %.1f ms), "
+                    "prepared in %.1f s; program loads wired %.2fx their int8 weights", status.layers, 100 * share,
+                    gpu, split_ms, status.seconds, status.wired_factor)
+        return status
+
+
+def release_ane_prefill(model):
+    """Detach and unload every Neural Engine split in `model`; the next generation with the split on prepares again."""
+    with _LOCK:
+        model.__dict__.pop(_PREPARED, None)
+        model.__dict__.pop("_unsloth_ane_prepared", None)
+        for _, module in model.named_modules():
+            split = module.__dict__.pop(_STATE, None)
+            if split is not None:
+                split.close()
+
+
+def ane_prefill_available(model):
+    """Whether `ane_prefill=True` splits any of `model`'s MLPs here: before a prepare, from the runtime, device and eligible
+    MLPs; after one, the layers it attached or why none. It ignores the flag and the env switch, and changes nothing."""
+    if not available():
+        return AnePrefillAvailability(False, "no_neural_engine", 0)
+    if mx.default_device() != mx.gpu:
+        return AnePrefillAvailability(False, "not_gpu", 0)
+    if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+        return AnePrefillAvailability(False, "distributed", 0)
+    if _ABANDONED:   # a timed-out evaluation holds the worker, so no split runs again in this process
+        return AnePrefillAvailability(False, "timed_out", 0)
+    with _LOCK:
+        splits = {id(m): m.__dict__[_STATE] for _, m in model.named_modules() if m.__dict__.get(_STATE) is not None}
+        running = sum(not split.failed for split in splits.values())
+        status = model.__dict__.get(_PREPARED)
+        if splits or status is not None:
+            # Attached layers that all failed, or all since detached by memory pressure or replaced projections
+            reason = "" if running else "failed" if splits else status.code or "released"
+            return AnePrefillAvailability(bool(running), reason, running)
+        layers = len(_candidates(model))
+    return AnePrefillAvailability(bool(layers), "" if layers else "no_eligible_mlps", layers)
+
+
+def ane_prefill_checkpoint_available(model_dir):
+    """`ane_prefill_available` for a downloaded MLX checkpoint, from its config.json and safetensors headers ("not_downloaded"
+    without them). Headers cannot show the activation, gain or free memory, so `layers` counts the MLPs prepare would try."""
+    if not available():
+        return AnePrefillAvailability(False, "no_neural_engine", 0)
+    model_dir = Path(model_dir)
+    shards = list(model_dir.glob("*.safetensors"))
+    if not (model_dir / "config.json").is_file() or not shards:
+        return AnePrefillAvailability(False, "not_downloaded", 0)
+    quantization = json.loads((model_dir / "config.json").read_text()).get("quantization") or {}
+    tensors = {}
+    for shard in shards:
+        with open(shard, "rb") as file:
+            tensors.update(json.loads(file.read(struct.unpack("<Q", file.read(8))[0])))
+
+    def projection(prefix):
+        """(out, in, group size) of an affine quantized linear without bias, else None."""
+        weight, scales = tensors.get(f"{prefix}.weight"), tensors.get(f"{prefix}.scales")
+        # Per-layer settings are keyed by module path, which mlx-vlm also matches without "language_model."
+        layer = next((quantization[key] for key in (prefix, prefix.removeprefix("language_model."))
+                      if key in quantization), quantization)
+        if (weight is None or scales is None or f"{prefix}.biases" not in tensors or f"{prefix}.bias" in tensors
+                or not isinstance(layer, dict) or layer.get("mode", "affine") != "affine"
+                or len(weight["shape"]) != 2):
+            return None
+        rows, columns = weight["shape"][0], weight["shape"][1] * 32 // layer.get("bits", 4)
+        return rows, columns, columns // scales["shape"][-1]
+
+    shapes = collections.Counter()
+    for name in tensors:
+        if not name.endswith(".gate_proj.weight"):
+            continue
+        prefix = name.removesuffix(".gate_proj.weight")
+        gate, up, down = (projection(f"{prefix}.{p}_proj") for p in ("gate", "up", "down"))
+        if (gate and up and down and gate == up and down == (gate[1], gate[0], gate[2])
+                and gate[0] % _ALIGN == 0):
+            shapes[gate[:2]] += 1
+    layers = max(shapes.values(), default = 0)
+    return AnePrefillAvailability(bool(layers), "" if layers else "no_eligible_mlps", layers)
+
+
+@contextmanager
+def ane_prefill_mlp(model, ane_prefill = None, *, _modules = None):
+    """Route prefill tiles of the MLPs `prepare_ane_prefill` attached through their Neural Engine split.
+
+    `ane_prefill=True`, or `UNSLOTH_MLX_ANE_PREFILL=1` when None, turns it on (approximate: int8 weights); the outermost
+    scope decides, and its first entry on prepares the model. A partial tile is padded when calibration measured that as
+    faster; shorter partial tiles, training and a failed split keep the native module.
+    """
+    changed, tracked = [], hasattr(model, "__dict__")
+    try:
+        with _LOCK:
+            depth, outer = getattr(model, "__dict__", {}).get(_DECISION, (0, None))
+            if outer is not None:
+                ane_prefill = outer
+            elif ane_prefill is None:
+                ane_prefill = os.environ.get(OPT_IN, "0") == "1"
+            if tracked:
+                model.__dict__[_DECISION] = (depth + 1, bool(ane_prefill))
+            modules = ()
+            if ane_prefill and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                modules = _modules if _modules is not None else tuple(model.named_modules())
+            if modules and not getattr(model, "_unsloth_ane_prepared", False):
+                model.__dict__["_unsloth_ane_prepared"] = True
+                status = prepare_ane_prefill(model)
+                if not status.layers:
+                    logger.info("Neural Engine prefill is off: %s", status.reason)
+            for _, module in modules:
+                if module.__dict__.get(_STATE) is None or any(module is m for m in changed):
+                    continue
+                if module.__dict__.get("_unsloth_ane_scopes"):
+                    module._unsloth_ane_scopes += 1
+                else:
+                    module.__class__ = _split_class(type(module))
+                    module._unsloth_ane_scopes = 1
+                changed.append(module)
+            splits = [m.__dict__[_STATE] for m in changed]
+        with _remainder_routes(model, splits):
+            yield model
+    finally:
+        with _LOCK:
+            for module in changed:
+                module._unsloth_ane_scopes -= 1
+                if not module._unsloth_ane_scopes:
+                    module.__class__ = module._unsloth_ane_native
+                    module.__dict__.pop("_unsloth_ane_scopes")
+            if tracked:
+                depth, decision = model.__dict__.pop(_DECISION)
+                if depth > 1:
+                    model.__dict__[_DECISION] = (depth - 1, decision)

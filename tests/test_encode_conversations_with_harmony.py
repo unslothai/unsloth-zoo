@@ -239,8 +239,7 @@ _UNSET = object()
 
 @pytest.fixture()
 def harmony_state(gpt_oss_module):
-    # Snapshot and restore the harmony globals so lazy re-import (which rebinds them via
-    # globals().update) cannot leak fake symbols into other tests.
+    # Snapshot and restore the harmony globals: a lazy re-import rebinds them via globals().update and could leak fake symbols into other tests.
     names = list(gpt_oss_module._HARMONY_SYMBOLS) + ["encoding"]
     saved = {name: getattr(gpt_oss_module, name, _UNSET) for name in names}
     try:
@@ -275,8 +274,7 @@ def _fake_harmony_module(load_harmony_encoding, omit = ()):
 
 
 def _simulate_absent_at_import(gpt_oss):
-    # Mimic openai_harmony not being importable when gpt_oss.py was first imported, so the
-    # module-level symbols were never bound (the Colab "install after import" scenario).
+    # Mimics openai_harmony being absent when gpt_oss.py was first imported (the Colab install-after-import case), so module-level symbols stay unbound.
     for name in gpt_oss._HARMONY_SYMBOLS:
         if hasattr(gpt_oss, name):
             delattr(gpt_oss, name)
@@ -417,8 +415,7 @@ def test_encode_conversations_with_harmony_partial_build_lists_missing_symbol(
 
 
 def _encode_and_capture_messages(monkeypatch, gpt_oss, messages):
-    # Run the encoder with the fake harmony stubs and return the per-channel assistant
-    # Message objects that were appended to the conversation (the system message is index 0).
+    # Run the encoder with fake harmony stubs and return the per-channel assistant Messages appended to the conversation; the system message is index 0.
     encoding = _Encoding()
     _install_fake_harmony(monkeypatch, gpt_oss, lambda name: encoding)
     gpt_oss.encode_conversations_with_harmony(messages)
@@ -430,9 +427,8 @@ def test_assistant_thinking_with_content_emits_analysis_and_final(
     monkeypatch,
     gpt_oss_module,
 ):
-    # Core regression for unsloth-zoo#246: the analysis channel must carry the reasoning
-    # from message["thinking"], and the answer in message["content"] must still be emitted
-    # on the final channel rather than dropped.
+    # Core regression for unsloth-zoo issue 246: reasoning from message["thinking"] must go on the analysis channel, and
+    # message["content"] must still be emitted on the final channel.
     messages = [
         {"role": "assistant", "thinking": "let me reason", "content": "the answer"},
     ]
@@ -485,8 +481,8 @@ def test_mixed_multi_turn_preserves_channels_and_branches(
     monkeypatch,
     gpt_oss_module,
 ):
-    # user -> assistant(thinking+content) -> tool -> assistant(final): confirm channel
-    # ordering and that the tool_calls / tool branches stay untouched.
+    # Checks channel ordering across user, assistant (thinking+content), tool and assistant (final) turns, and that the
+    # tool_calls and tool branches stay untouched.
     messages = [
         {"role": "user", "content": "question"},
         {"role": "assistant", "thinking": "reason about it", "content": "first answer"},
@@ -517,8 +513,7 @@ def test_assistant_thinking_with_tool_calls_keeps_both(
     monkeypatch,
     gpt_oss_module,
 ):
-    # An assistant turn carrying BOTH reasoning and a tool call must emit the analysis
-    # message AND the commentary tool call. The tool call must not be dropped.
+    # An assistant turn with both reasoning and a tool call must emit both the analysis message and the commentary tool call; the tool call must not be dropped.
     messages = [
         {
             "role": "assistant",
@@ -543,8 +538,7 @@ def test_assistant_thinking_none_falls_back_to_final(
     monkeypatch,
     gpt_oss_module,
 ):
-    # A nullable "thinking" column materialized as None must not be passed into Harmony.
-    # The turn should fall back to a single final-channel message from content.
+    # A nullable thinking column materialized as None must not reach Harmony; the turn falls back to one final-channel message built from content.
     messages = [
         {"role": "assistant", "thinking": None, "content": "the answer"},
     ]
@@ -577,9 +571,8 @@ def test_assistant_thinking_tool_calls_and_content_keeps_analysis_and_tool_call(
     monkeypatch,
     gpt_oss_module,
 ):
-    # When a turn has thinking, tool_calls and content, tool_calls and content stay
-    # mutually exclusive: the tool call wins (the final answer comes after the tool
-    # result), so we emit analysis + commentary and drop the content for this turn.
+    # tool_calls and content are mutually exclusive: with thinking, tool_calls and content, analysis and commentary are
+    # emitted and content is dropped, since the final answer follows the tool result.
     messages = [
         {
             "role": "assistant",

@@ -14,16 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Per-family description of native MTP / NextN heads (DeepSeek-V3 style).
-
-Every family llama.cpp drafts with shares one composition (src/models/*.cpp `graph_mtp`):
-eh_proj(cat[enorm(embed(x)), hnorm(h)]) -> the target's own decoder block(s) -> head norm
--> lm_head. What differs is data: checkpoint names, which hidden state is fed in and fed
-back, block layout, and whether several heads are chained one per draft step.
-
-Canonical head names (NextNHead.state_dict()): heads.{i}.{eh_proj,enorm,hnorm,shared_head_norm}
-and heads.{i}.block.{j}.<decoder layer names>.
-"""
+"""Per-family native MTP/NextN head data; every llama.cpp-drafted family shares eh_proj(cat[enorm(embed(x)), hnorm(h)])
+-> target's decoder block(s) -> head norm -> lm_head; canonical names
+heads.{i}.{eh_proj,enorm,hnorm,shared_head_norm} and heads.{i}.block.{j}.<layer names>."""
 
 __all__ = [
     "MTPFamily",
@@ -46,8 +39,8 @@ class MTPFamily:
     layer_cls: str
     norm_cls: str
     rotary_cls: str = None       # None = NoPE attention
-    # "layers": model.layers.{N+i}.* (DeepSeek / GLM); "qwen": mtp.fc / mtp.layers.0.*;
-    # "nemotron": mtp.layers.{j}.* sub-blocks of one head.
+    # Checkpoint layout by style: layers = model.layers.{N+i}.* (DeepSeek / GLM), qwen = mtp.fc / mtp.layers.0.*,
+    # nemotron = mtp.layers.{j}.* sub-blocks of one head.
     style: str = "layers"
     count_keys: tuple = ("num_nextn_predict_layers",)
     # "final" = target hidden after the final norm, "last_layer" = before it (step35 / mimo2).
@@ -69,9 +62,8 @@ class MTPFamily:
     config_overrides: tuple = ()     # (attribute, value) set on the head config
     # Per-layer head-count override for sliding MTP layers (Step's per_layer_config).
     sliding_heads_attr: str = None
-    # What llama.cpp does with this family's head, as checked by drafting tiny random models
-    # through convert_hf_to_gguf.py + llama-server draft-mtp: "drafts" (our drafts match),
-    # "partial", "no_graph" (no MTP graph / the converter drops the head), "unverified".
+    # llama.cpp status from drafting tiny random models via convert_hf_to_gguf.py + llama-server draft-mtp: drafts (our
+    # drafts match), partial, no_graph (no MTP graph or converter drops the head), unverified.
     llama_cpp: str = "drafts"
 
     def num_heads(self, config):
@@ -192,9 +184,8 @@ class MTPFamily:
         heads = max(1, self.num_heads(config))
         head_config = copy.deepcopy(config)
         total = n + heads * len(self.blocks)
-        # Per-layer lists (layer_types, mlp_layer_types, indexer_types, swiglu limits, ...) must
-        # cover the MTP layers. transformers truncates them to num_hidden_layers, so the values a
-        # checkpoint's raw config.json gives past it win, then the family's, then a default.
+        # Per-layer lists (layer_types, indexer_types, swiglu limits, ...) must cover the MTP layers: transformers
+        # truncates them to num_hidden_layers, so raw config.json values past it win, then the family's, then a default.
         raw = _raw_config_lists(config)
         for attr, values in list(vars(head_config).items()):
             if not isinstance(values, (list, tuple)) or len(values) != n or not values:
@@ -314,8 +305,7 @@ _register(MTPFamily(
     renames = ((r"mlp\.router\.gate\.", "mlp.gate."), (r"mlp\.expert_bias", "mlp.e_score_correction_bias"),
                (r"mlp\.shared_mlp\.", "mlp.shared_experts.")),
 ))
-# Qwen3.5 / 3.6 train through Qwen35MTPHead (mtp.py); registered here for naming and as the
-# reference the generic engine is tested against.
+# Qwen3.5/3.6 train through Qwen35MTPHead (mtp.py); registered here for naming and as the reference the generic engine is tested against.
 _register(MTPFamily(
     name = "qwen3_5", model_types = ("qwen3_5_text",), module = "qwen3_5",
     layer_cls = "Qwen3_5DecoderLayer", norm_cls = "Qwen3_5RMSNorm", rotary_cls = "Qwen3_5TextRotaryEmbedding",
@@ -342,8 +332,8 @@ _register(MTPFamily(
     renames = ((r"mlp\.e_score_correction_bias", "mlp.gate.e_score_correction_bias"),),
     llama_cpp = "no_graph",
 ))
-# Step-3.5 / 3.7: three chained heads on sliding-window layers with dense MLPs; the trunk feeds
-# and feeds back the pre-norm residual (llama.cpp step35.cpp, vLLM step3p5_mtp.py).
+# Step-3.5/3.7: three chained sliding-window heads with dense MLPs; trunk feeds and feeds back the pre-norm residual
+# (llama.cpp step35.cpp, vLLM step3p5_mtp.py).
 _register(MTPFamily(
     name = "step3p5", model_types = ("step3p5",), module = "step3p7",
     layer_cls = "Step3p7DecoderLayer", norm_cls = "Step3p7RMSNorm", rotary_cls = "Step3p7RotaryEmbedding",
