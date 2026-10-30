@@ -61,13 +61,13 @@ def _offline_cache(monkeypatch, tmp_path, base_dir, with_safetensors = True):
     monkeypatch.setenv("HF_HUB_CACHE", str(cache))
 
 
-def _base(tmp_path):
+def _base(tmp_path, max_shard_size = "5GB"):
     if not H.family_available(FAMILY):
         pytest.skip(f"{FAMILY} unavailable in this transformers")
     H.set_offline_cpu_env()
     spec = H.make_spec(FAMILY)
     base_dir = os.path.join(str(tmp_path), "base")
-    model = H.build_and_save_base(spec, base_dir)
+    model = H.build_and_save_base(spec, base_dir, max_shard_size = max_shard_size)
     peft_model = H.attach_lora(model, spec, "full")
     H.seed_lora(peft_model)
     return peft_model, base_dir
@@ -114,4 +114,33 @@ def test_merged_16bit_from_a_cached_base_offline(monkeypatch, tmp_path):
     H.assert_merge_correct(
         family = FAMILY, base_tensors = H.read_safetensors_dir(base_dir), out_dir = out_dir,
         save_dtype = torch.float32, adapted = adapted,
+    )
+
+
+@pytest.mark.parametrize("keep_index", [True, False])
+def test_a_partially_cached_snapshot_is_not_a_local_base(monkeypatch, tmp_path, keep_index):
+    # An interrupted download leaves some shards in the cache; merging from them drops layers.
+    peft_model, base_dir = _base(tmp_path, max_shard_size = "20KB")
+    _offline_cache(monkeypatch, tmp_path, base_dir)
+    snapshot = tmp_path / "hub" / f"models--{REPO.replace('/', '--')}" / "snapshots" / REVISION
+    shards = sorted(snapshot.glob("model-*-of-*.safetensors"))
+    assert len(shards) > 2
+    shards[len(shards) // 2].unlink()
+    if not keep_index:
+        (snapshot / "model.safetensors.index.json").unlink()
+    assert saving_utils.check_local_model_exists(REPO) is None
+
+    out_dir = os.path.join(str(tmp_path), "merged")
+    with pytest.raises(RuntimeError, match = "could not reach the Hugging Face Hub"):
+        merge_and_overwrite_lora(
+            get_model_name = lambda *a, **k: REPO,
+            model = peft_model,
+            tokenizer = None,
+            save_directory = out_dir,
+            save_method = "merged_16bit",
+            output_dtype = torch.float32,
+            push_to_hub = False,
+        )
+    assert not os.path.isdir(out_dir) or not any(
+        f.endswith(".safetensors") for f in os.listdir(out_dir)
     )

@@ -8078,7 +8078,8 @@ def check_local_model_exists(model_path):
 
     # Offline, the cached snapshot is the only copy: every Hub call on this repo id would raise.
     snapshot = _offline_cached_snapshot(model_path)
-    if snapshot and has_safetensors(snapshot):
+    # The cache keeps whatever files finished downloading, so a snapshot can be missing shards.
+    if snapshot and has_safetensors(snapshot) and _local_snapshot_is_complete(snapshot):
         return snapshot
     return None
 pass
