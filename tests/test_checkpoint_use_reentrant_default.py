@@ -14,15 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins the torch / transformers checkpoint behaviour UnslothCheckpointFunction (UCF) routing depends on.
-
-UCF replaces `torch.utils.checkpoint.CheckpointFunction`, so it only runs on the reentrant path. Two routes reach it:
-- `model._set_gradient_checkpointing()` (training_utils) installs transformers' default `gradient_checkpointing_func`,
-  torch's own `checkpoint` bound at import, called without `use_reentrant`: it relies on torch treating
-  `use_reentrant=None` as reentrant (with a warning, not an error) and looking `CheckpointFunction` up at call time.
-- `gradient_checkpointing_enable()` passes `use_reentrant=False` on transformers 5.x (True on 4.57), so the zoo swaps
-  `transformers.modeling_utils.checkpoint` for `unsloth_checkpoint`, which forces the reentrant path.
-Checked against torch 2.15 `_checkpoint_impl` (None -> warn -> True) and transformers 5.22."""
+"""UnslothCheckpointFunction (UCF) only runs on the reentrant path. Relies on torch treating use_reentrant=None
+as reentrant (warning, not error) and looking CheckpointFunction up at call time (torch 2.15 `_checkpoint_impl`),
+and on unsloth_checkpoint forcing reentrant since transformers 5.x passes use_reentrant=False."""
 
 import warnings
 
@@ -95,8 +89,6 @@ def test_gradient_checkpointing_enable_default_and_the_unsloth_checkpoint_swap(c
     assert (len(counted) > 0) == (major < 5), (transformers.__version__, counted)
 
     counted.clear()
-    # What patch_unsloth_smart_gradient_checkpointing does to transformers; unsloth_checkpoint calls UCF itself,
-    # so point it at the counting stand-in to observe the route.
     monkeypatch.setattr(modeling_utils, "checkpoint", zoo_gc.unsloth_checkpoint)
     monkeypatch.setattr(zoo_gc, "UnslothCheckpointFunction", torch_checkpoint.CheckpointFunction)
     model = _tiny_llama()

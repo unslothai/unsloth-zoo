@@ -311,7 +311,6 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # Have to explicitly set it!
         torch._dynamo.config.suppress_errors = True
     pass
-    # A key this torch lacks raises AttributeError; skip it, but say so when logging is on.
     _log_skips = debug or os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
     from unsloth_zoo.log import logger
     import torch._inductor.config as config
@@ -329,7 +328,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         except Exception as _error:
             if _log_skips: logger.warning(f"Unsloth: Skipped Dynamo `{_try_dynamo_argument}` on torch {torch.__version__}: {_error!r}")
     pass
-    # Re-assert the 2.10-2.14 Inductor correctness workarounds after the writes above.
+    # Must run after the writes above.
     from unsloth_zoo.temporary_patches.common import apply_inductor_correctness_workarounds
     apply_inductor_correctness_workarounds()
     # Must happen before anything compiles.

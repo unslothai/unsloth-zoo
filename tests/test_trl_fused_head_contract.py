@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""TRL 1.17 appends support_ids / score_ids to ChunkedLogProbFunction and unpacks six outputs. The CPU
-dispatch must accept the longer call, pad the torch path to six outputs, and leave calls that use either
-id set on TRL's kernel; the five-output TRL 1.x contract must keep working."""
+"""TRL 1.17 ChunkedLogProbFunction contract (support_ids / score_ids, six outputs) and the older five-output one."""
 
 import pytest
 import torch
@@ -40,7 +38,6 @@ def _inputs():
 
 
 class _Kernel117(torch.autograd.Function):
-    """Signature of TRL 1.17's kernel; records the calls that reach it."""
     calls = []
 
     @staticmethod
@@ -119,7 +116,6 @@ def test_unknown_future_contract_falls_back_to_trl_kernel(monkeypatch):
 
 
 def test_installed_trl_fused_head_runs_on_cpu(monkeypatch):
-    """End to end on the installed TRL: the patched fused head gives TRL's own CPU loss where TRL has one."""
     trl_utils = pytest.importorskip("trl.trainer.utils")
     if not hasattr(trl_utils, "add_fused_lm_head"):
         pytest.skip("TRL without the fused LM head")

@@ -50,9 +50,7 @@ print("RESULT " + json.dumps([Linear4bit.forward.__name__, Linear4bit.forward.__
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs a GPU to load a 4-bit model")
 def test_partial_disable_still_patches_lora_forward(tmp_path):
     pytest.importorskip("transformers.models.gemma4")
-    # A child process: `import unsloth` and from_pretrained patch peft / transformers classes and export
-    # UNSLOTH_MODEL_NAME etc. for good, which broke later tests in a shared session (gpt_oss patches skipped,
-    # peft's Linear4bit.forward replaced, generated gemma4 modules leaving the eager_on_recompile stance).
+    # Child process: importing unsloth patches classes and env for good, breaking later tests in the session.
     script = tmp_path / "child.py"
     script.write_text(_CHILD)
     env = dict(os.environ, UNSLOTH_COMPILE_DISABLE="partial", UNSLOTH_IS_PRESENT="1")

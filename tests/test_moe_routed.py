@@ -780,11 +780,7 @@ def test_tiny_causal_lm_decode_routed_vs_current(kind, use_lora, B, monkeypatch)
         assert (logits - cur).abs().mean() <= 2 * e_cur.mean(), mode
         cos = F.cosine_similarity(logits.flatten(1), ref.flatten(1), dim = -1)
         cos_cur = F.cosine_similarity(cur.flatten(1), ref.flatten(1), dim = -1)
-        # Bound: 1 - cos <= 2 (1 - cos_cur) + 5e-3. Measured on 6400 decode steps (gemma4 + qwen3_moe, 8 seeds x B x
-        # LoRA, routed and grouped, torch 2.14.1 and 2.15, RTX PRO 6000 sm120 + B200): a near-tie router pick that flips
-        # on a last-bit difference moves a step by -6.4e-3 .. +1.5e-2 on any arm and either torch (this case, step 0,
-        # on 2.15), and a step where the current path is itself 7-12% off swings by up to 1.6e-2 with the same picks.
-        # Worst case needs 3.2e-3 on top of 2 (1 - cos_cur); steps with the current path near exact keep ~5e-3.
+        # Measured over 6400 decode steps (torch 2.14.1 / 2.15): near-tie router flips move a step by up to 1.6e-2.
         assert (1 - cos <= 2 * (1 - cos_cur) + 5e-3).all(), (mode, cos.tolist(), cos_cur.tolist())
 
     seen = []

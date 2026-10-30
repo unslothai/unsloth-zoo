@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Triton 3.9 warns once per process when a launch leaves enable_fp_fusion unset, which the vendored fla
-launches do. Injecting the vendored tree ignores that one message; every other warning still escapes."""
+"""Injecting vendored fla ignores only Triton 3.9's enable_fp_fusion-unset warning; others still escape."""
 
 import os
 import pathlib

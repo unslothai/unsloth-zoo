@@ -405,9 +405,7 @@ def _blackwell_import_device(torch_mod):
     return None
 
 
-# Triton 3.9 warns once per process when a launch leaves enable_fp_fusion unset, which every vendored
-# fla launch does (upstream code). Fusion stays on in 3.9 either way. Ignore only that message, not the
-# process-wide TRITON_DEFAULT_FP_FUSION, which would also pin fusion for the user's own kernels on 3.10.
+# Not TRITON_DEFAULT_FP_FUSION: that would also pin fusion for the user's own kernels on Triton 3.10.
 _TRITON_FP_FUSION_DEFAULT_MESSAGE = re.escape(
     "TRITON_DEFAULT_FP_FUSION is unset: defaulting to FP fusion ENABLED"
 )

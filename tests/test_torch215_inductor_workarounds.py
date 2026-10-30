@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch 2.15 fixed two Inductor correctness bugs that 2.10-2.14 still ship: mix-order reductions writing wrong
-norm-weight gradients (2.10-2.14) and rand4x giving correlated CUDA dropout masks, so a reentrant checkpoint's
-recompute differentiates a different mask than its forward applied (2.13, 2.14). Unsloth turns both paths off on
-the affected releases only, and leaves them alone when the user opts back in."""
+"""Inductor mix-order reduction (2.10-2.14) and rand4x dropout (2.13-2.14) are off on those releases only,
+fixed in torch 2.15, and left alone when the user opts back in."""
 
 import os
 import subprocess
@@ -40,7 +38,6 @@ def _has_mix_order():
 
 
 def _codegen_rand():
-    """Generate Inductor's Triton `rand` for a 1D CUDA kernel (no GPU needed: only codegen strings)."""
     from torch._inductor.codegen.triton import TritonKernel, TritonOverrides
     from torch._inductor.virtualized import V
 
@@ -142,7 +139,6 @@ _SKIP_CHILD = textwrap.dedent("""
 
 @pytest.mark.parametrize("logging_on", [True, False])
 def test_skipped_compiler_config_writes_are_logged(logging_on):
-    """A config key this torch lacks used to vanish in a bare `except: pass`; with UNSLOTH_ENABLE_LOGGING it is named."""
     env = dict(os.environ, UNSLOTH_ALLOW_CPU = "1", CUDA_VISIBLE_DEVICES = "",
                UNSLOTH_ENABLE_LOGGING = "1" if logging_on else "0")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

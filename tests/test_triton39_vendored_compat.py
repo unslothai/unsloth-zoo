@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Triton 3.9 (torch 2.15) forward-compat guards for zoo and vendored fla Triton code.
-
-Triton 3.9's Autotuner raises ValueError at decoration time (module import) when ``key`` /
-``reset_to_zero`` / ``restore_value`` name something that is not a kernel argument; older Triton
-silently ignored it. These checks are static, so they also hold on CI hosts with older Triton.
-"""
+"""Triton 3.9 Autotuner raises ValueError at import when key / reset_to_zero / restore_value name a non-argument;
+older Triton ignored it. Static checks, so they hold on older Triton too."""
 
 import ast
 import importlib

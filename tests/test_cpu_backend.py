@@ -1009,8 +1009,6 @@ def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
 
 
 def test_trl_fused_lm_head_dispatch_takes_the_kept_set_contract(monkeypatch):
-    """TRL 1.17 passes support_ids / score_ids after `outputs` and unpacks six outputs: CPU calls without a kept
-    set stay on the torch twin (sixth output None), kept-set calls go to TRL's kernel with every argument."""
     from trl.trainer import utils as trl_utils
     from unsloth_zoo.cpu import ops
     calls = []
@@ -1042,8 +1040,6 @@ def test_trl_fused_lm_head_dispatch_takes_the_kept_set_contract(monkeypatch):
 
 
 def test_trl_fused_forward_on_cpu_matches_trl_kernel(monkeypatch):
-    """The installed TRL's own fused forward (its exact kernel call) through the CPU dispatch, against TRL's kernel
-    where that kernel runs on CPU (TRL 1.17 ships a torch path)."""
     from trl.trainer import utils as trl_utils
     from unsloth_zoo.cpu import ops
     kernel = getattr(trl_utils, "_ChunkedLogProbFunction", None)

@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Inductor combo kernels were off everywhere because they gave incompatible gradient sizes on torch 2.6. They are
-now on from torch 2.10 for the compiled model modules (UNSLOTH_COMBO_KERNELS=0 / 1 overrides). CPU checks: the
-gate, the compiler call site, and a compiled forward + backward with combo kernels on matching eager. CPU Inductor
-emits C++, so this proves the scheduler path and the gradients' sizes, not the Triton combo kernels themselves."""
+"""Combo kernels on from torch 2.10 (incompatible gradient sizes on 2.6). CPU Inductor emits C++, so this proves
+the scheduler path and gradient sizes, not the Triton combo kernels."""
 
 import inspect
 
@@ -65,7 +63,6 @@ def test_combo_kernels_forward_backward_matches_eager():
         return original(self, *args, **kwargs)
 
     def block(x, y, weight, bias):
-        # Independent branches (combo candidates) plus a norm with a trainable weight (odd row count).
         a = torch.nn.functional.silu(x) * 2.0
         b = torch.tanh(y) + bias
         variance = x.float().pow(2).mean(-1, keepdim = True)

@@ -288,16 +288,14 @@ def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size
     return tuple(value if name == "log_probs" or name in outputs else None for name, value in zip(names, result))
 
 
-# Arguments of TRL's ChunkedLogProbFunction.forward (after ctx) that cpu_chunked_log_probs mirrors.
 _TRL_LOGPROB_ARGS = ("hidden", "weight", "bias", "targets", "temperature", "chunk_size",
                      "final_logit_softcapping", "logit_scale", "outputs")
-# Arguments later TRL releases append, with the outputs each adds. TRL 1.17 appends support_ids
-# (no new output) and score_ids (a sixth output, score_log_probs).
+# Appended args -> extra outputs (TRL 1.17).
 _TRL_LOGPROB_EXTRA_ARGS = {"support_ids": 0, "score_ids": 1}
 
 
 def _trl_logprob_contract(kernel):
-    """(argument names after ctx, output count, known) for TRL's fused-head kernel, read from its signature."""
+    """(argument names after ctx, output count, known)."""
     try:
         names = tuple(inspect.signature(kernel.forward).parameters)[1:]
     except (AttributeError, TypeError, ValueError):
@@ -310,8 +308,7 @@ def _trl_logprob_contract(kernel):
 def patch_trl_fused_lm_head():
     """TRL 1.x SFTTrainer always computes loss through a fused LM head whose Triton kernel is None without Triton, so
     CPU training and evaluate() fail; keep it on CUDA/XPU, route other devices to cpu_chunked_log_probs. Idempotent.
-    The kernel's signature sets the contract: TRL 1.17 passes support_ids / score_ids and unpacks six outputs, so the
-    torch path pads its five; calls using either id set, or an unknown contract, stay on TRL's kernel (torch path from 1.17)."""
+    TRL 1.17 unpacks six outputs, so the torch path pads; id-set calls or an unknown contract stay on TRL's kernel."""
     try:
         from trl.trainer import utils as trl_utils
     except Exception:

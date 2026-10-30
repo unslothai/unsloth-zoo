@@ -39,9 +39,7 @@ ALPHA, LIMIT = 1.702, 7.0
 
 @contextlib.contextmanager
 def _no_blas_workspace():
-    """Keep torch's own cuBLAS / cuBLASLt workspace out of a measured peak. torch 2.15 binds a fresh one (32 MiB on
-    sm90+) per GEMM call unless TORCH_CUBLAS_WORKSPACE_CACHE=1, so no warm-up keeps it out of the window; earlier
-    torches cache it per handle. Size 0 makes ATen bind none, so the peak counts only the code under test."""
+    """torch 2.15 binds a fresh cuBLAS workspace per GEMM (no warm-up avoids it); size 0 keeps it out of the peak."""
     b = torch.backends.cuda
     if not hasattr(b, "cublaslt_workspace_size"):  # older torch: cached per handle, the warm-up already paid for it
         yield

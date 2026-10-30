@@ -753,9 +753,7 @@ _REENTRANT_FRAMES = ("forward", "backward")
 # checkpoint_sequential opens no region of its own and runs its LAST segment outside every checkpoint, so the catch-all below must skip it.
 _SEQUENTIAL_FRAME = "checkpoint_sequential"
 
-# torch 2.15 moved the body of `checkpoint` into `_checkpoint_impl`, which takes
-# the same `use_reentrant` and is entered directly by the curried form through
-# `_CheckpointedFunction.__call__`; both mark a region entry like `checkpoint`.
+# torch 2.15 moved `checkpoint`'s body into `_checkpoint_impl`, also entered via `_CheckpointedFunction.__call__`.
 _ENTRY_FRAMES = ("checkpoint", "_checkpoint_impl")
 _PASS_THROUGH_FRAMES = (_SEQUENTIAL_FRAME, "__call__")
 

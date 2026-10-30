@@ -430,8 +430,7 @@ def test_loss_autotune_counts_the_kept_set_logits_twice():
 
 
 def test_default_warning_describes_trl_117_kept_set_scoring(monkeypatch, caplog):
-    # TRL >= 1.17 (TRL #7866) scores over vLLM's kept set when vLLM returns sampling masks, so the
-    # default warning must not claim the full-vocabulary score is what TRL does.
+    # TRL >= 1.17 (TRL #7866) scores over vLLM's kept set when vLLM returns sampling masks.
     monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
     caplog.set_level(logging.WARNING)
     rr.logger.propagate = True

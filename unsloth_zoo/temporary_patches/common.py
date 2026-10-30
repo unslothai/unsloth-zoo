@@ -84,10 +84,8 @@ pass
 
 
 def _mix_order_reduction_is_buggy():
-    """Inductor's mix-order reduction (2.10 to 2.14) silently writes wrong gradients when its
-    outputs are views into one shared buffer or the row count is not a multiple of XBLOCK. It
-    fuses the row and column sums of a norm backward, so it fires when norm weights are trainable
-    (full finetuning, trained norms). Fixed in 2.15. UNSLOTH_MIX_ORDER_REDUCTION=1 keeps it on."""
+    """Mix-order reduction (2.10-2.14, fixed in 2.15) writes wrong trainable-norm gradients.
+    UNSLOTH_MIX_ORDER_REDUCTION=1 keeps it on."""
     if os.environ.get("UNSLOTH_MIX_ORDER_REDUCTION", "0") == "1": return False
     try:
         import torch._inductor.config as inductor_config
@@ -99,11 +97,8 @@ pass
 
 
 def _rand4x_is_buggy():
-    """2.13 and 2.14 generate 1D CUDA dropout through tl.rand4x, which hands groups of 4 adjacent
-    elements the same mask under no_grad. The reentrant checkpoint forward runs under no_grad, so
-    the recompute draws a different mask and the gradients do not match the forward. 2.15 adds
-    config.use_rand4x (off by default); without that switch the path is on. TORCHINDUCTOR_USE_RAND4X=1
-    (the 2.15 opt-in) keeps it."""
+    """2.13 / 2.14 tl.rand4x dropout gives a different mask under no_grad, so a reentrant checkpoint
+    recompute mismatches its forward. 2.15 adds config.use_rand4x (off); TORCHINDUCTOR_USE_RAND4X=1 keeps it."""
     if os.environ.get("TORCHINDUCTOR_USE_RAND4X", "0") == "1": return False
     try:
         import torch._inductor.config as inductor_config
@@ -120,9 +115,7 @@ _never_use_4x_random._unsloth_rand4x_off = True
 
 
 def combo_kernels_supported():
-    """Inductor combo kernels (independent kernels fused horizontally into one launch) gave
-    incompatible gradient sizes on torch 2.6, so they stay off before 2.10. UNSLOTH_COMBO_KERNELS=0 / 1
-    forces them off / on."""
+    """Off before torch 2.10 (incompatible gradient sizes on 2.6). UNSLOTH_COMBO_KERNELS=0 / 1 forces."""
     forced = os.environ.get("UNSLOTH_COMBO_KERNELS", "")
     if forced in ("0", "1"): return forced == "1"
     return _torch_major_minor() >= (2, 10)
@@ -131,8 +124,7 @@ pass
 
 INDUCTOR_CORRECTNESS_CACHE_TAG = "unsloth/inductor-rand4x-off"
 def apply_inductor_correctness_workarounds():
-    """Backport the torch 2.15 fixes for the mix-order reduction and rand4x bugs on the releases
-    that ship them. Returns the names of the workarounds that are active."""
+    """Returns the names of the active workarounds."""
     active = []
     if _mix_order_reduction_is_buggy():
         try:
@@ -147,8 +139,7 @@ def apply_inductor_correctness_workarounds():
             from torch._inductor.codegen.triton import TritonOverrides
             if not getattr(TritonOverrides._can_use_4x_random, "_unsloth_rand4x_off", False):
                 TritonOverrides._can_use_4x_random = staticmethod(_never_use_4x_random)
-            # The FX graph cache key does not see this patch: tag it, or a warm cache keeps
-            # serving kernels generated with rand4x.
+            # The FX graph cache key does not see this patch, so tag it.
             try:
                 import torch.compiler.config as config
             except Exception:
