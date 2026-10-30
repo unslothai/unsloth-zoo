@@ -388,10 +388,8 @@ _EMPTY_CACHE_BYTES_THRESHOLD = 256 * 1024 * 1024
 
 
 def _torch_save_spool(tensor, path, pickle_module, pickle_protocol):
-    # The mxfp4 merge spools each tensor to a temp .pt that only torch.load(mmap = True) in
-    # this process reads back. The CRC32 torch.save computes over every byte (about half
-    # the spool's cost) is never checked there, and torch.load reads files saved without
-    # it (torch >= 2.6 `set_crc32_options`). Older torch keeps computing it.
+    # Skip torch.save's CRC32 (~half the spool cost): only our own mmap load reads it back.
+    # torch < 2.6 has no set_crc32_options, so it keeps the CRC32.
     get_crc32 = getattr(torch.serialization, "get_crc32_options", None)
     set_crc32 = getattr(torch.serialization, "set_crc32_options", None)
     if get_crc32 is None or set_crc32 is None:

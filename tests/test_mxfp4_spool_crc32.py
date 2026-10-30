@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The mxfp4 merge spools each tensor through a temp .pt that only torch.load(mmap=True)
-reads back in the same process. Those spool writes skip torch.save's CRC32, the global
-CRC32 option is restored afterwards (also on error), and the merged shard is byte-identical
-to one spooled with the CRC32 computed."""
+"""mxfp4 spool writes skip CRC32, restore the global option (even on error), and stay byte-identical."""
 
 import hashlib
 import os
