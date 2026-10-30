@@ -980,6 +980,7 @@ class SpeculativeEngine:
         self.cache: list | None = None
         self.draft_cache: list | None = None
         self.round_refusal: str | None = None
+        self.retiring: dict = {}
 
     @property
     def rows(self) -> list[Any]:
@@ -1002,6 +1003,11 @@ class SpeculativeEngine:
         keep = [i for i, row in enumerate(self._rows) if row.uid != uid]
         if len(keep) == len(self._rows):
             raise KeyError(uid)
+        retire = self.retiring.pop(uid, None)
+        if retire is not None:
+            from .generate import _row_cache
+
+            retire(lambda: _row_cache(self.cache, self.rows.index(uid)))
         self._rows = [self._rows[i] for i in keep]
         self.cache = _split(self.cache, keep)
         if self.drafter is not None:
@@ -1337,6 +1343,20 @@ def install_speculative_seam() -> None:
         ar.run_speculative_rounds = _engine_rounds(ar.run_speculative_rounds)
     if getattr(ar.SpeculativePrefill, "unsloth_upstream", None) is None:
         ar.SpeculativePrefill = _prompt_tail_prefill(ar.SpeculativePrefill)
+    gate = getattr(ar, "_chunked_prefill_enabled", None)
+    if callable(gate) and getattr(gate, "unsloth_upstream", None) is None:
+        ar._chunked_prefill_enabled = _copies_chunk_alike(gate)
+
+
+def _copies_chunk_alike(upstream: Callable) -> Callable:
+    # Copies read no hidden states, so they chunk like an undrafted prefill (mlx-vlm prefills drafted prompts whole).
+    def _chunked_prefill_enabled(model, *, draft_model = None, draft_kind = None, **kwargs):
+        if isinstance(draft_model, SpeculativeDraft) and draft_model.drafter is None:
+            draft_model = draft_kind = None
+        return upstream(model, draft_model = draft_model, draft_kind = draft_kind, **kwargs)
+
+    _chunked_prefill_enabled.unsloth_upstream = upstream
+    return _chunked_prefill_enabled
 
 
 def _engine_rounds(upstream: Callable) -> Callable:

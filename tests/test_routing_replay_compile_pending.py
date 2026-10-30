@@ -226,3 +226,68 @@ def test_non_reentrant_natural_forward_with_identical_inputs_keeps_its_own_routi
     assert not torch.equal(want[0], want[1])
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol = 0, atol = 0)
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_early_stopped_recompute_clears_old_forwards(replay, backend, use_reentrant):
+    # Non-reentrant recompute stops early, so the flag must be set at run time or stale forwards
+    # stay pending and, with reused buffers, the next recompute routes naturally (wrong grads).
+    layer = _layer(replay)
+    fn = torch.compile(lambda x: layer(x), backend = backend, fullgraph = True)
+    buffers = [torch.arange(1.0, 9.0).reshape(1, 8) for _ in range(2)]
+    scale = torch.arange(1.0, 9.0)
+    for step in range(3):
+        xs, losses, want = [], [], []
+        for k, buffer in enumerate(buffers):
+            forced = [(step + k) % 8, (step + k + 3) % 8]
+            y = buffer.detach().clone().requires_grad_()
+            weights = y.softmax(-1).gather(-1, torch.tensor([forced]))
+            want.append(torch.autograd.grad((y.sin() * weights.sum(-1, keepdim = True) * scale).sum(), y)[0])
+            x = buffer.detach().requires_grad_()
+            xs.append(x)
+            replay._STATE.in_forward = True
+            replay._STATE.current = torch.tensor([[forced]])
+            if replay._STATE.recomputed:
+                replay._STATE.pending.clear()
+                replay._STATE.recomputed = False
+            replay._STATE.record = {}
+            replay._STATE.pending.append(replay._STATE.record)
+            replay._STATE.has_pending = True
+            out, ids = checkpoint(fn, x, use_reentrant = use_reentrant)
+            replay._STATE.in_forward = False
+            replay._STATE.record = None
+            assert ids.sort(-1).values.tolist() == [sorted(forced)]
+            losses.append((out * scale).sum())
+        replay._STATE.current = None
+        sum(losses).backward()
+        assert replay._STATE.recomputed and len(replay._STATE.pending) == 2, step
+        for x, w in zip(xs, want):
+            torch.testing.assert_close(x.grad, w)
+
+
+@pytest.mark.parametrize("dynamic", [None, True])
+def test_token_count_is_not_specialised(replay, dynamic):
+    # GRPO lengths change every step: a guard on the token count recompiles per length.
+    def run(fn):
+        grads, graphs = [], []
+        for rows in [4, 8, 17, 33, 65, 129, 257, 513, 1025, 8]:
+            x = torch.randn(rows, 8, generator = torch.Generator().manual_seed(rows)).requires_grad_()
+            forced = [[r % 8, (r + 3) % 8] for r in range(rows)]
+            out, ids = _forward(replay, fn, x, forced)
+            assert ids.sort(-1).values.tolist() == [sorted(f) for f in forced]
+            replay._STATE.current = None
+            (out * torch.arange(1.0, 9.0)).sum().backward()
+            grads.append(x.grad)
+            graphs.append(dynamo_utils.counters["stats"]["unique_graphs"])
+        return grads, graphs
+
+    reference, _ = run(_layer(replay))
+    replay.reset_routing_replay()
+    torch._dynamo.reset()
+    dynamo_utils.counters.clear()
+    layer = _layer(replay)
+    grads, graphs = run(torch.compile(lambda x: layer(x), backend = "aot_eager", fullgraph = True, dynamic = dynamic))
+    assert graphs[2:] == [graphs[2]] * (len(graphs) - 2), graphs
+    for got, want in zip(grads, reference):
+        torch.testing.assert_close(got, want, rtol = 0, atol = 0)

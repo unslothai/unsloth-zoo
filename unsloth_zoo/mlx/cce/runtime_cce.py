@@ -31,26 +31,8 @@ __all__ = [
 
 
 def _get_memory_budget() -> int:
-    """Return a per-chunk logit byte budget based on available hardware memory.
-
-    Two considerations in tension:
-      1. Smaller devices need aggressive chunking (more chunks, smaller each)
-         to avoid OOM.
-      2. The MLX scheduler benefits from small chunks regardless of device size
-         — but too many chunks incurs kernel-launch overhead.
-
-    We use 0.1% of the device's recommended working set as the budget, capped
-    at 128 MB and floored at 4 MB.  The cap ensures the scheduler always gets
-    enough granularity (≥16 chunks for 128K vocab at any batch size ≤4), while
-    the hardware scaling ensures small devices chunk even more aggressively.
-
-      M4 Max 128GB → 103 GB recommended → min(103 MB, 128 MB) = 103 MB
-      M3 Pro 36GB  →  27 GB recommended → min(27 MB, 128 MB)  =  27 MB
-      M2 16GB      →  12 GB recommended → min(12 MB, 128 MB)  =  12 MB
-      M1 8GB       →   6 GB recommended → min(6 MB, 128 MB)   =   6 MB
-
-    Falls back to 128 MB if device info is unavailable.
-    """
+    """Per-chunk logit byte budget: 0.1% of the device's recommended working set, floored at 4 MB and capped at 128 MB
+    (128 MB if device info is unavailable); the cap keeps at least 16 chunks for 128K vocab at batch size 4 or less."""
     try:
         import mlx.core as _mx
         info = _mx.device_info()
@@ -81,24 +63,12 @@ def _resolve_chunk_size(
     if _CHUNK_BUDGET is None:
         _CHUNK_BUDGET = _get_memory_budget()
 
-    # Goal: choose chunk_v so the MLX scheduler can free each chunk's logit
-    # tensor before the next chunk is computed, while keeping chunks large
-    # enough for efficient GEMM.
-    #
-    # Strategy: target 16 chunks as the baseline granularity.  The per-chunk
-    # byte budget (derived from hardware memory) caps how large each chunk can
-    # be.  On large-memory devices the cap is ~100 MB; on small devices it
-    # scales down to force more aggressive chunking.
-    #
-    # Constraints:
-    #   - min 2048 vocab entries per chunk  (GEMM efficiency floor)
-    #   - target 16 chunks                 (scheduler granularity sweet spot)
-    #   - per-chunk bytes ≤ hw budget       (adapts to device memory, ≤128 MB)
+    # Choose chunk_v so the MLX scheduler frees each chunk's logits before the next: target 16 chunks, at least 2048
+    # vocab entries each (GEMM floor), within a per-chunk byte budget that adapts to device memory, capped at 128 MB.
 
     min_chunk_v = 2048
     target_chunks = 16
 
-    # Compute chunk_v from target chunk count
     chunk_v = (vocab_size + target_chunks - 1) // target_chunks
 
     # Enforce per-chunk byte limit (adapts to hardware)
@@ -209,8 +179,7 @@ def _target_validity_masks(
 
 
 def _poison_invalid_targets(values: mx.array, invalid: mx.array) -> mx.array:
-    # mx.full (real tensor), not a 0-d scalar: a scalar bakes into the Metal
-    # kernel as the literal token `nan`, which MSL rejects.
+    # mx.full (a real tensor), not a 0-d scalar: a scalar bakes into the Metal kernel as the literal token `nan`, which MSL rejects.
     return mx.where(
         invalid,
         mx.full(values.shape, float("nan"), dtype=values.dtype),
@@ -389,9 +358,8 @@ def _build_forward_update_kernel() -> Callable:
     )
 
 
-# INVARIANT: kernel emits finite lse_out/loss_out for every row (no vocab_size).
-# Callers MUST _poison_invalid_targets on loss and lse before the dlogits kernel,
-# else invalid rows silently get finite wrong gradients.
+# INVARIANT: kernel emits finite lse_out/loss_out for every row (no vocab_size); callers MUST _poison_invalid_targets on
+# loss and lse before the dlogits kernel, else invalid rows silently get finite wrong gradients.
 def _build_forward_update_finalize_kernel() -> Callable:
     source = """
         uint gid = thread_position_in_grid.x;
@@ -1076,14 +1044,9 @@ def _forward_with_hidden_gradient(
     forward_update_finalize_kernel: Callable,
     dlogits_kernel: Callable,
 ) -> tuple[mx.array, mx.array]:
-    """Token losses and each token's loss gradient per unit cotangent.
-
-    With a frozen head the hidden gradient is ``cotangent * (sum_v p_v s'_v w_v -
-    s'_y w_y)``, and the bracket does not depend on the cotangent. It is built here
-    one vocabulary chunk at a time: each chunk's non-target softmax weights are taken
-    against the running normaliser, and the running sum is rescaled as it grows.
-    No vocabulary-wide buffer outlives its chunk, and the backward is a product.
-    """
+    """Token losses and per-unit-cotangent hidden gradients for a frozen head; the bracket is built one vocab chunk at a
+    time against a rescaled running normaliser, so no vocab-wide buffer outlives its chunk; the backward is then a
+    product."""
     n, dim = hidden.shape
     vocab_size = weight.shape[0]
     if n == 0 or len(targets.shape) != 1 or targets.shape[0] != n:
@@ -1098,8 +1061,7 @@ def _forward_with_hidden_gradient(
     targets = targets.astype(mx.int32)
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
-    # A zero loss makes the target column expm1(0) = 0: the target term is added
-    # after the sweep, where p_t - 1 does not cancel.
+    # A zero loss makes the target column expm1(0) = 0; the target term is added after the sweep, where p_t - 1 does not cancel.
     zero_loss = mx.zeros((n,), dtype=mx.float32)
     unit_cotangent = mx.ones((n,), dtype=mx.float32)
     quantization = dict(group_size=group_size, bits=bits, mode=mode)
@@ -1174,8 +1136,7 @@ def _forward_with_hidden_gradient(
     return _poison_invalid_targets(loss, invalid), _poison_invalid_targets(gradient, invalid[:, None])
 
 
-# Requires lse pre-poisoned with NaN for invalid rows: this fallback does not
-# re-check vocab bounds and relies on NaN propagation for the gradient.
+# Requires lse pre-poisoned with NaN for invalid rows: this fallback does not re-check vocab bounds and relies on NaN propagation for the gradient.
 def _fallback_dlogits(
     logits: mx.array,
     lse: mx.array,
@@ -1676,14 +1637,9 @@ def make_chunked_cross_entropy_loss(
     weight_is_frozen: bool = False,
     precompute_hidden_gradient: bool = False,
 ):
-    """Return a standalone CCE loss and a kernel-usage flag.
-
-    Set weight_is_frozen exactly when classifier gradients will not be requested: a
-    trainable head may compute its weight gradient even when wrapped in stop_gradient.
-    precompute_hidden_gradient builds a frozen or quantized head's hidden gradient
-    in the forward (Metal kernels, no label smoothing), which saves backward memory
-    but doubles the cost of a call that is never differentiated.
-    """
+    """Returns loss and kernel flag; weight_is_frozen exactly when no classifier grad is requested (trainable heads may
+    compute grads even under stop_gradient); precompute_hidden_gradient (frozen or quantized heads, Metal, no label
+    smoothing) saves backward memory but doubles cost if never differentiated."""
 
     return make_runtime_cce_loss_fused_finalize(
         ignore_index=ignore_index,

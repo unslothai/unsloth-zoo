@@ -446,8 +446,7 @@ def get_amd_flash_attn_func(device = None):
     Shapes: q/k/v = (batch, seqlen, nheads, headdim), float16 or bfloat16
     Returns: output tensor, same shape as q
     """
-    # No-argument call when device is None: the plain single-device cache keys () and (None,)
-    # apart, so forwarding None would miss the entry the setup gates filled.
+    # Call with no argument when device is None: () and (None,) are separate cache keys, so forwarding None misses the entry the setup gates filled.
     impl = get_amd_attention_implementation() if device is None else get_amd_attention_implementation(device)
     if impl != "amd_aiter":
         return None
@@ -455,13 +454,9 @@ def get_amd_flash_attn_func(device = None):
         import aiter as _aiter
         if hasattr(_aiter, "flash_attn_func"):
             return _aiter.flash_attn_func
-        # FlashAttnFunc is a torch.autograd.Function whose .apply() requires 13+
-        # positional arguments (dropout_p, softmax_scale, causal, window_size,
-        # bias, alibi_slopes, deterministic, return_lse, return_softmax,
-        # is_grad_enabled, ...), see ROCm/aiter:aiter/ops/mha.py.
-        # We cannot safely wrap it without knowing the required defaults for the
-        # installed aiter version.  Return None so callers fall back to SDPA.
-        # (FlashAttnFunc environments should expose flash_attn_func in aiter >= 0.7)
+        # FlashAttnFunc.apply() needs 13+ positional args (ROCm/aiter:aiter/ops/mha.py), so it cannot be wrapped safely
+        # without the defaults for the installed aiter; return None to fall back to SDPA; aiter >= 0.7 should expose
+        # flash_attn_func.
     except Exception:
         pass
     return None
@@ -551,8 +546,8 @@ def get_device_type():
     if _IS_MLX:
         return "mlx"
     if _GPU_INIT_SKIPPED:
-        # BEFORE the hardware probes: `__init__.py` publishes "cpu" unconditionally, so
-        # checking only in the no-accelerator fallback left a CUDA host with both.
+        # Checked before the hardware probes: __init__.py publishes cpu unconditionally, so checking only in the
+        # no-accelerator fallback left a CUDA host with both.
         return "cpu"
     if cpu_backend_forced():
         return "cpu"
@@ -586,8 +581,8 @@ def get_device_type():
     other = None
     if hasattr(torch, "accelerator") and torch.accelerator.is_available():
         other = str(torch.accelerator.current_accelerator())
-    # An active accelerator Unsloth does not drive (hpu, mtia, ...) keeps this error instead of silently
-    # training on CPU. A Mac without MLX ("mps") is the exception: its CPU is the supported path there.
+    # An active accelerator Unsloth does not drive (hpu, mtia, ...) keeps its error instead of training on CPU; a Mac
+    # without MLX (mps) is the exception, where CPU is supported.
     if fallback == "cpu" and other not in (None, "mps"):
         fallback = None
     if fallback is not None:
@@ -637,12 +632,10 @@ def _use_per_device_caches(device_type, device_count):
 pass
 _use_per_device_caches(DEVICE_TYPE, DEVICE_COUNT)
 
-# Check blocksize for 4bit -> 64 for CUDA, 128 for AMD
-# If AMD, we cannot load pre-quantized models for now :(
+# 4bit blocksize is 64 on CUDA and 128 on AMD; AMD cannot load pre-quantized models for now.
 ALLOW_PREQUANTIZED_MODELS : bool = True
 if DEVICE_TYPE == "cpu":
-    # As with DEVICE_COUNT: the two import paths must not disagree. The CPU backend
-    # (unsloth_zoo.cpu) decides bnb-4bit support itself with a real probe.
+    # Keep in step with DEVICE_COUNT so the two import paths do not disagree; unsloth_zoo.cpu decides bnb-4bit support itself with a real probe.
     ALLOW_PREQUANTIZED_MODELS = False
 # HSA_STATUS_ERROR_EXCEPTION checks - sometimes AMD fails for BnB
 ALLOW_BITSANDBYTES : bool = True

@@ -113,7 +113,6 @@ def check_python_modules(code: str):
         def visit_ImportFrom(self, node: ast.ImportFrom):
             nonlocal relative_count
             if (node.level or 0) > 0:
-                # relative import
                 relative_count += 1
             else:
                 if node.module:
@@ -329,15 +328,13 @@ def check_signal_escape_patterns(code: str):
             self.generic_visit(node)
 
         def visit_ExceptHandler(self, node: ast.ExceptHandler):
-            # Only flag exception catching if inside a loop (where it can suppress timeout)
-            # Exception catching outside loops will naturally propagate after the handler
+            # Only flag except handlers inside a loop, where they can suppress the timeout; outside a loop the exception propagates after the handler.
             if self.loop_depth == 0:
                 self.generic_visit(node)
                 return
 
             # Check for bare except or catching TimeoutError/BaseException inside a loop
             if node.type is None:
-                # Bare except:
                 exception_catching.append({
                     "type": "bare_except_in_loop",
                     "line": node.lineno,
@@ -381,11 +378,9 @@ def check_signal_escape_patterns(code: str):
     visitor = SignalEscapeVisitor()
     visitor.visit(tree)
 
-    # Add warning if signal is imported but no specific tampering found
     if visitor.imports_signal and not signal_tampering:
         warnings.append("Code imports 'signal' module - review manually for safety")
 
-    # Determine if code is safe
     is_safe = len(signal_tampering) == 0 and len(exception_catching) == 0
 
     return is_safe, {
@@ -490,14 +485,9 @@ def validate_single_function_source(
 pass
 
 
-# Importable by generated code. Excludes anything reaching the filesystem,
-# network or another process (os, subprocess, socket, ctypes, ...), plus two
-# whose whole module has to go:
-#   string -- Formatter.get_field resolves a dotted runtime string and returns
-#     the object, reaching the real builtins with nothing in the source to
-#     match. str.format fields are checked in _reject_dunder_access instead.
-#   dataclasses -- resolves annotations via sys.modules[cls.__module__], which
-#     cannot work for synthetic globals.
+# Modules generated code may import; excludes filesystem, network and process modules (os, subprocess, socket, ctypes);
+# string (Formatter.get_field reaches real builtins, str.format is checked in _reject_dunder_access); dataclasses
+# (sys.modules lookup fails for synthetic globals).
 _SAFE_IMPORT_MODULES = frozenset({
     "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
     "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
@@ -505,20 +495,9 @@ _SAFE_IMPORT_MODULES = frozenset({
     "typing", "unicodedata",
 })
 
-# Members denied individually, where the module itself is worth keeping.
-# Three reasons, all of them invisible to the AST check:
-#   string-to-object resolvers -- operator.attrgetter walks dunders from a
-#     dotted string (itemgetter takes an index and stays); functools
-#     update_wrapper/wraps copy whatever `assigned` names, so ("__globals__",)
-#     plus a custom __setattr__ yields a real globals dict to index.
-#   evaluators -- typing.get_type_hints runs string annotations, and
-#     ForwardRef/evaluate_forward_ref are the same evaluator made public in
-#     3.14. Denied on every version; 3.13 reaches it only via private
-#     _evaluate, which the private-attribute rule already covers.
-#   mutators -- time.clock_settime(_ns) sets the host clock given the
-#     privilege a root container has. Read-only clocks stay. enum.global_enum
-#     copies members into sys.modules[cls.__module__], which the functional
-#     API lets the caller name (module="builtins").
+# Denied per member, module kept: operator.attrgetter walks dunders from a string; functools wraps/update_wrapper copy
+# assigned names like __globals__; get_type_hints and ForwardRef/evaluate_forward_ref run strings (denied on all
+# versions); clock_settime and enum.global_enum mutate host state.
 _DENIED_MODULE_ATTRS = frozenset({
     "functools.update_wrapper",
     "functools.wraps",
@@ -541,13 +520,9 @@ _SELF_MATCHING_TYPES = frozenset({
     "set", "str", "tuple",
 })
 
-# Attributes that walk the interpreter's own object graph. None of these start
-# with an underscore, and none of them go through a module, so neither the
-# private-attribute rule nor the import allowlist can see them: a running
-# generator reaches gi_frame.f_back.f_back.f_builtins, which is the trusted
-# caller's real builtins, and indexing "__import__" out of it restores
-# everything. Frames, generators, coroutines, async generators and tracebacks
-# all expose the same walk.
+# Interpreter object-graph walks invisible to the private-attribute and import rules: gi_frame.f_back.f_back.f_builtins
+# reaches the real builtins of the trusted caller; indexing __import__ out restores everything; frames, generators,
+# coroutines and tracebacks all expose them.
 _DENIED_ATTR_NAMES = frozenset({
     "ag_await", "ag_code", "ag_frame",
     "cr_await", "cr_code", "cr_frame", "cr_origin",
@@ -560,11 +535,9 @@ _DENIED_ATTR_NAMES = frozenset({
 if sys.version_info >= (3, 14):
     _DENIED_ATTR_NAMES = _DENIED_ATTR_NAMES | {"evaluate"}
 
-# Dunder methods a generated helper class may define. A method name is
-# FunctionDef.name, not a Name or Attribute node, so the walk below cannot see
-# it; without this, generated code defines __setattr__ or __getattr__ and hooks
-# the attribute machinery that copy helpers drive. __init__ and the comparison
-# and arithmetic protocol are ordinary in helper classes, so they stay.
+# Dunders generated helper classes may define; a def name is invisible to the Name and Attribute walk, so without this
+# list generated code could define __setattr__ or __getattr__ and hook copy helpers' attribute machinery; __init__ and
+# comparison/arithmetic dunders stay.
 _ALLOWED_DUNDER_DEFS = frozenset({
     "__abs__", "__add__", "__bool__", "__call__", "__contains__", "__enter__",
     "__eq__", "__exit__", "__float__", "__floordiv__", "__ge__", "__getitem__",
@@ -628,8 +601,7 @@ def _safe_import(name, globals = None, locals = None, fromlist = (), level = 0):
         raise ImportError(f"Import of '{name}' is not allowed in generated code.")
     if fromlist:
         return _SafeModule(importlib.import_module(name), name)
-    # A bare `import a.b` binds `a`, so hand back the root; the facade re-checks
-    # `a.b` when the attribute is reached.
+    # A bare `import a.b` binds `a`, so hand back the root; the facade re-checks `a.b` when the attribute is reached.
     root = name.split(".")[0]
     importlib.import_module(name)
     return _SafeModule(importlib.import_module(root), root)
@@ -650,10 +622,8 @@ def _allowlist_builtins():
         "iter", "len", "list", "map", "max", "min", "next", "oct", "ord", "pow",
         "print", "range", "repr", "reversed", "round", "set", "slice", "sorted",
         "str", "sum", "tuple", "type", "zip",
-        # Class machinery: generated helpers are occasionally written as a
-        # small class. hasattr only ever answers yes or no, and object/super
-        # hand back nothing that is not already reachable, since getting
-        # anywhere from them needs a dunder the AST check rejects.
+        # Class machinery for generated helper classes; hasattr only answers yes or no, and object/super expose nothing
+        # new, since going further needs a dunder the AST check rejects.
         "bytearray", "classmethod", "hasattr", "object", "property",
         "staticmethod", "super",
         # Generated code routinely uses try/except.
@@ -664,9 +634,8 @@ def _allowlist_builtins():
         "ZeroDivisionError",
     )
     exposed = {name: getattr(_py_builtins, name) for name in names}
-    # The comparison and arithmetic dunders allowed below are expected to
-    # return NotImplemented for operands they do not handle, so the singleton
-    # has to be reachable. It is a value, not a capability.
+    # Comparison and arithmetic dunders return NotImplemented for operands they do not handle, so the singleton must be
+    # reachable; it is a value, not a capability.
     exposed["NotImplemented"] = _py_builtins.NotImplemented
     # Required for `class` statements.
     exposed["__build_class__"] = _py_builtins.__build_class__
@@ -676,8 +645,7 @@ def _allowlist_builtins():
 pass
 
 
-# ast.Match* is 3.10+, this module imports on 3.9; an empty tuple makes the
-# isinstance below false.
+# ast.Match* nodes are missing before 3.10 and this module imports on 3.9; an empty tuple makes the isinstance check false.
 _MATCH_CLASS_NODES = tuple(
     node for node in (getattr(ast, "MatchClass", None),) if node is not None
 )
@@ -815,15 +783,13 @@ def _reject_dunder_access(tree):
     """
     bindings = None
     for node in ast.walk(tree):
-        # Definition names are strings on the node, invisible to the Name and
-        # Attribute checks below, so they get their own fail-closed rule.
+        # Definition names are plain strings on the node, invisible to the Name and Attribute checks below, so they get their own fail-closed rule.
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.name.startswith("__") and node.name not in _ALLOWED_DUNDER_DEFS:
                 raise RuntimeError(
                     f"Defining '{node.name}' is not allowed in generated code."
                 )
-        # One underscore for attributes: private ones reach modules and
-        # internals just as well (random._os, ABCMeta._abc_impl).
+        # Attributes starting with one underscore are refused: private ones reach modules and internals (random._os, ABCMeta._abc_impl).
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
@@ -851,15 +817,13 @@ def _reject_dunder_access(tree):
                 raise RuntimeError(
                     "String annotations are not allowed in generated code."
                 )
-        # Two for names: a bare `_` or `_total` local is ordinary and reaches
-        # nothing on its own.
+        # Names starting with two underscores are refused; a bare _ or _total local is ordinary and reaches nothing on its own.
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             raise RuntimeError(
                 f"Name '{node.id}' is not allowed in generated code."
             )
-        # `case object(__class__=x)` is a getattr with no Attribute node anywhere.
-        # kwd_attrs is the only identifier-as-string field that READS an attribute;
-        # every other one merely binds, and the Name rule above refuses the read.
+        # case object(__class__=x) is a getattr with no Attribute node; kwd_attrs is the only identifier field that
+        # reads an attribute, and the Name rule refuses it.
         if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
             if node.patterns and bindings is None:
                 bindings = _bound_names(tree)
@@ -944,9 +908,7 @@ def create_locked_down_function(function, *, builtins_policy: str = "allowlist")
     recursion. Run genuinely untrusted code in a container.
     """
     f = load_single_function(function, builtins_policy = builtins_policy)
-    # Binding to an empty dict is not enough: CPython injects the real builtins
-    # module into any globals mapping without a __builtins__ key, handing back
-    # everything the policy just removed.
+    # An empty dict is not enough: CPython injects the real builtins module into any globals without a __builtins__ key, undoing the policy.
     exposed_builtins = (
         _py_builtins.__dict__ if builtins_policy == "full" else _allowlist_builtins()
     )
@@ -957,9 +919,8 @@ def create_locked_down_function(function, *, builtins_policy: str = "allowlist")
         f.__defaults__,
         f.__closure__,
     )
-    # Assigned rather than passed: the constructor only grew a kwdefaults
-    # parameter recently, but the attribute is writable on every version we
-    # support. Without it `def f(x, *, k = 1)` loses k and raises TypeError.
+    # Assigned because the constructor's kwdefaults parameter is recent, though __kwdefaults__ is writable on all
+    # supported versions; without it, def f(x, *, k = 1) loses k and raises TypeError.
     locked.__kwdefaults__ = f.__kwdefaults__
     # Full builtins can reach signal itself, so only a separate process bounds them.
     if builtins_policy == "full" or _catches_everything(ast.parse(function)):
@@ -1089,8 +1050,7 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
         if strict and not fired:
             now = time.monotonic()
             if now > deadline_at + leeway:
-                # We exceeded wall time but the handler didn't get a chance to run.
-                # This typically means the body spent a long time in non-cooperative C code.
+                # Wall time was exceeded but the handler never ran, typically because the body spent a long time in non-cooperative C code.
                 raise TimeoutError(
                     f"Exceeded time limit ({seconds:g}s) without interrupt; "
                     f"elapsed ≈ {now - start:.3f}s. "
@@ -1126,7 +1086,6 @@ def _run_in_subprocess(func, seconds, args, kwargs, *, start_method="spawn", kil
     child_conn.close()
 
     try:
-        # Wait for result up to 'seconds'
         if parent_conn.poll(seconds):
             kind, payload = parent_conn.recv()
             proc.join()
@@ -1185,7 +1144,7 @@ def _catches_everything(tree):
     return False
 pass
 
-# A fresh interpreter, not a fork: forking a process holding a model costs ~100 ms each way and pins its pages.
+# A fresh interpreter, not a fork: forking a process that holds a model is slow and pins its pages.
 _CATCH_ALL_HELPER = """
 import importlib.util, sys
 from multiprocessing.connection import Connection
@@ -1474,8 +1433,7 @@ def is_port_open(host, port):
         print(f"Socket error: {e}")
         return False
     for family, socktype, proto, _, sockaddr in candidates:
-        # In the try: AF_INET6 without IPv6 raises EAFNOSUPPORT, and raising would
-        # skip a reachable candidate behind it.
+        # AF_INET6 without IPv6 raises EAFNOSUPPORT inside the try; raising there would skip a reachable candidate behind it.
         sock = None
         try:
             sock = socket.socket(family, socktype, proto)
@@ -1514,19 +1472,16 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
         return f"{working_directory}{os.pathsep}{src_path}"
 
 
-# Endpoint -> the Popen we spawned on it. /health says "something is listening",
-# never "mine is". Keyed on (host, port): two children can hold one port on
-# different addresses.
+# Maps endpoint (host, port) to the Popen we spawned there; /health only shows something listens, not that it is ours;
+# two children can hold one port on different addresses.
 _OPENENV_CHILDREN = {}
 
-# Held for every registry access: poll() calls waitpid, which releases the GIL, so
-# iteration can be resized under us and get-poll-pop is check-then-mutate
-# (python/cpython#87664). WNOHANG does not block, so holding it across poll() is cheap.
+# Held on every registry access: poll() calls waitpid, releasing the GIL, so iteration can be resized and get-poll-pop
+# is check-then-mutate (python/cpython#87664); WNOHANG does not block, so holding it across poll() is cheap.
 _OPENENV_CHILDREN_LOCK = threading.Lock()
 
-# Endpoints claimed but not yet spawned onto. The lock makes each operation atomic,
-# not check-then-spawn-then-register: without a claim two launches both find a port
-# closed, both spawn, and the later registration orphans the earlier child.
+# Endpoints claimed but not yet spawned onto; the lock makes each operation atomic, not check-then-spawn-then-register;
+# without a claim two launches both spawn and orphan one child.
 _OPENENV_RESERVED = set()
 
 
@@ -1644,14 +1599,12 @@ def _release_openenv_endpoint(client_host, port, child = None):
 pass
 
 
-# An open port plus a live child is not proof the child opened it: a process taking
-# the endpoint before uvicorn binds satisfies both, and uvicorn does not exit the
-# instant it loses a bind. The child's own announcement is the proof.
+# An open port plus a live child does not prove the child bound it: another process can take the port before uvicorn
+# binds, and uvicorn does not exit the instant it loses a bind; the child's own announcement is the proof.
 _UVICORN_BOUND = ("Uvicorn running on",)
 _UVICORN_BIND_FAILED = ("address already in use", "error while attempting to bind")
-# Trials to wait for that announcement on an already-open port before falling back.
-# Only a reworded startup log gets here, and failing a legitimate launch to close a
-# race is the worse trade.
+# Trials to wait for the uvicorn bound announcement on an already-open port before falling back; only a reworded startup
+# log reaches this, and failing a legitimate launch to close a race is worse.
 _UVICORN_BOUND_GRACE_TRIALS = 300
 
 
@@ -1783,9 +1736,8 @@ def launch_openenv(
         environment = dict(environment)  # Don't mutate original
         environment["PYTHONPATH"] = correct_pythonpath
 
-    # Same family, and never `localhost`: asyncio's create_server sets IPV6_V6ONLY
-    # unconditionally, so a `::` server answers on ::1 and not 127.0.0.1 even on a
-    # dual stack host, and which family `localhost` resolves to is not ours to pick.
+    # Client shares the server's address family, never localhost: asyncio create_server sets IPV6_V6ONLY, so a :: server
+    # answers on ::1 and not 127.0.0.1 even on dual stack hosts.
     client_host = {"0.0.0.0" : "127.0.0.1", "::" : "::1"}.get(host, host)
     localhost = _openenv_url(client_host, port)
     _reap_exited_openenv_children()

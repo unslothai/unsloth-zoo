@@ -45,40 +45,20 @@ __all__ = [
     "kaggle_tmp_redirect",
 ]
 
-# Module level so tests can point these at a scratch tree instead of a real
-# /tmp, which is slow and, on locked down CI machines, forbidden outright.
+# Module level so tests can point these at a scratch tree, since a real /tmp is slow and may be forbidden on locked-down CI machines.
 KAGGLE_TMP = "/tmp"
 KAGGLE_WORKING = "/kaggle/working"
 
 _FALSE = ("0", "false", "no", "off", "")
 _TRUE = ("1", "true", "yes", "on")
 
-# Slack for tokenizer files, the config, llama.cpp's build tree and the
-# filesystem reserve, so a merge does not fail on the last megabyte.
+# Slack for tokenizer files, the config, llama.cpp's build tree and the filesystem reserve, so a merge does not fail on the last megabyte.
 DISK_SLACK_BYTES = 2 * 1024**3
 
 
 def is_kaggle_environment():
-    """True only inside a running Kaggle kernel.
-
-    Needs BOTH `KAGGLE_KERNEL_RUN_TYPE` ("Interactive" or "Batch", set by the
-    kernel runtime) and the `/kaggle/working` directory the image creates.
-
-    Not the previous test, "any env var starting with KAGGLE_": the Kaggle CLI
-    authenticates from `KAGGLE_USERNAME`, `KAGGLE_KEY` and
-    `KAGGLE_CONFIG_DIR`, so anyone who had ever exported those on a laptop or
-    build agent was treated as being inside a kernel and had their tokenizer
-    cache and pushes silently redirected to /tmp on their own machine.
-
-    Requiring both halves closes both directions: a stray KAGGLE_* credential
-    export has no /kaggle/working, and a machine that happens to have a
-    /kaggle/working has no KAGGLE_KERNEL_RUN_TYPE.
-
-    The directory half tests `/kaggle/working` and not `/kaggle` because a
-    real Colab VM does have a `/kaggle` directory, just no `/kaggle/working`.
-    Windows and Mac have neither, and os.path.isdir returns False rather than
-    raising there.
-    """
+    """True only in a running Kaggle kernel: needs both KAGGLE_KERNEL_RUN_TYPE and /kaggle/working; not any KAGGLE_*
+    var, since Kaggle CLI credentials match it; not /kaggle alone, which Colab VMs have."""
     override = os.environ.get("UNSLOTH_IS_KAGGLE", None)
     if override is not None:
         return str(override).strip().lower() in _TRUE
@@ -91,12 +71,7 @@ def is_kaggle_environment():
 
 
 def is_colab_environment():
-    """True when COLAB_* is exported, which Colab does in every kernel.
-
-    Not a trustworthy "is this Colab?" on its own: a real Kaggle kernel
-    exports 10 COLAB_* variables too. Both callers of the flag treat Colab and
-    Kaggle alike, so it only has to mean "hosted notebook" for them.
-    """
+    """True when any COLAB_* env var is set; Kaggle kernels export COLAB_* too, so it only means hosted notebook, which both callers treat alike."""
     for key in os.environ:
         if key.startswith("COLAB_"):
             return True
@@ -104,14 +79,8 @@ def is_colab_environment():
 
 
 def free_bytes(path):
-    """Free bytes on the filesystem holding `path`, or None if unmeasurable.
-
-    None, not 0: 0 reads as a full disk, and every caller blocks when
-    free < needed, so one raising disk_usage() would refuse every export.
-
-    Walks up to the nearest existing ancestor, since sizing a directory we are
-    about to create is the normal case.
-    """
+    """Free bytes on the filesystem holding `path`, or None if unmeasurable; None not 0, since 0 reads as a full disk
+    and blocks every caller; walks up to the nearest existing ancestor."""
     try:
         probe = os.path.abspath(os.path.expanduser(str(path)))
     except Exception:
@@ -133,20 +102,8 @@ def _is_uint8(param):
 
 
 def logical_numel(param, name = ""):
-    """Logical parameter count, which is NOT `numel()` on a quantized weight.
-
-    Two packing schemes each halve the estimate of a 16-bit merge if you
-    believe `numel()`:
-
-    - bitsandbytes packs two 4-bit parameters per uint8 and hangs the real
-      shape off `quant_state`, so a model-wide sum of `numel()` under-counts
-      a 4-bit load by nearly 2x.
-    - MXFP4 (gpt-oss loaded with packed `_blocks` / `_scales`) has no
-      `quant_state` at all: `convert_moe_packed_tensors` expands `..._blocks`
-      from `(..., G, B)` to `(..., G, B * 2)` and consumes `..._scales`. So
-      blocks are worth twice their `numel()`, scales nothing, and they are the
-      MoE experts, i.e. most of the model.
-    """
+    """Logical parameter count, not numel() on quantized weights: bitsandbytes packs two 4-bit params per uint8 (real
+    shape in quant_state); MXFP4 _blocks count 2x and _scales count 0."""
     if name and _is_uint8(param):
         if name.endswith("_scales"):
             return 0
@@ -171,10 +128,7 @@ def logical_numel(param, name = ""):
 
 
 def model_logical_numel(model):
-    """Total logical parameter count, or 0 if it cannot be measured.
-
-    `named_parameters()` first: MXFP4 packing is only identifiable by name.
-    """
+    """Total logical parameter count, or 0 if unmeasurable; iterates named_parameters() since MXFP4 packing is only identifiable by name."""
     try:
         return sum(logical_numel(p, n) for n, p in model.named_parameters())
     except Exception:
@@ -190,10 +144,8 @@ def model_16bit_bytes(model):
     return model_logical_numel(model) * 2
 
 
-# Effective bits per weight of a finished GGUF, including the embedding and
-# output tensors llama.cpp keeps at higher precision. llama.cpp's nominal bpw,
-# rounded up where mixed types make the real figure model dependent:
-# over-estimating costs headroom, under-estimating costs the whole export.
+# Effective GGUF bits per weight, incl. embedding and output tensors kept at higher precision; llama.cpp's nominal bpw
+# rounded up where mixed types make it model dependent, since under-estimating costs the whole export.
 GGUF_BITS_PER_WEIGHT = {
     "f32": 32.0,
     "f16": 16.0,
@@ -240,11 +192,7 @@ GGUF_QUANT_ALIASES = {
 
 
 def gguf_bits_per_weight(quantization_type):
-    """Bits per weight for a GGUF type; an unknown type falls back to q8_0.
-
-    An unknown name is far likelier to be a new large quant than a tiny one,
-    and guessing small is the failure this module exists to stop.
-    """
+    """Bits per weight for a GGUF type; unknown types fall back to q8_0, since guessing small for an unknown quant is the failure this module exists to stop."""
     name = str(quantization_type or "f16").strip().lower()
     name = GGUF_QUANT_ALIASES.get(name, name)
     return GGUF_BITS_PER_WEIGHT.get(name, GGUF_BITS_PER_WEIGHT["q8_0"])
@@ -332,26 +280,9 @@ def kaggle_tmp_redirect(
     what = "export",
     subdirectory = "unsloth_saves",
 ):
-    """Move a default Kaggle save location onto the large /tmp overlay.
-
-    Returns `(directory, message)`. `message` is None when nothing moved, and
-    then `directory` is the input unchanged.
-
-    Deliberately conservative, because silently relocating a directory the
-    caller named would be a worse bug than the disk error it avoids. All of
-    these must hold:
-
-      - we are inside a real Kaggle kernel,
-      - `UNSLOTH_KAGGLE_USE_TMP` is not set to a false value,
-      - the path is RELATIVE, i.e. a name resolved against whatever the
-        working directory happens to be rather than a location the caller
-        chose, and it resolves under /kaggle/working,
-      - /tmp has more room than /kaggle/working, so moving gains something,
-      - /kaggle/working genuinely cannot hold `need_bytes` while /tmp can.
-
-    Set `UNSLOTH_KAGGLE_USE_TMP=1` to move whenever /tmp is roomier, without
-    waiting for /kaggle/working to measure too small.
-    """
+    """Returns (directory, message), unchanged if nothing moves; only relative paths under /kaggle/working, in a Kaggle
+    kernel, unless UNSLOTH_KAGGLE_USE_TMP is false, when /tmp can hold what /kaggle/working cannot; never move a
+    caller-named dir; UNSLOTH_KAGGLE_USE_TMP=1 moves whenever /tmp is roomier."""
     if not is_kaggle_environment():
         return save_directory, None
 
@@ -388,8 +319,7 @@ def kaggle_tmp_redirect(
         if free_working >= need_bytes:
             return save_directory, None
         if free_tmp < need_bytes:
-            # /tmp cannot hold it either, so let the caller's own guard raise
-            # the real error instead of moving files somewhere that fails too.
+            # If /tmp cannot hold it either, keep the caller's path so its own guard raises the real error, not a move that fails too.
             return save_directory, None
 
     relative = os.path.relpath(resolved, working)
