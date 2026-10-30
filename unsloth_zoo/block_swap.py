@@ -449,7 +449,8 @@ class BlockSwap:
                 self.handles.append(layer._register_state_dict_hook(self._state_dict(i)))
             if self._auto:
                 # Unswapped layers below the first swapped one run their backward after its hook: sample them too.
-                for li, layer in enumerate(layers):
+                first = min(self.pos, default = 0)
+                for li, layer in enumerate(layers[:first]):
                     if li not in self.pos:
                         self.handles.append(
                             layer.register_forward_pre_hook(_opaque(self._plain_peak), with_kwargs = True))
@@ -655,6 +656,10 @@ class BlockSwap:
         return _opaque(hook)
 
     def _end_step(self):
+        if self._auto and not self._settled:
+            # Grads accumulated in the layers below the first swapped one are still allocated here.
+            for dv in {b.home for b in self.blocks if b.home is not None}:
+                self._note_peak(dv)
         self._last_peak, self._step_peak = self._step_peak or {}, {}
         self._steps += 1
         if self._steps == 1 and self._tot is not None:
