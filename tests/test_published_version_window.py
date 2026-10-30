@@ -41,8 +41,8 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 TESTED_CEILING = Version("5.17.0")
 
 # Newest torch the matrix was run against, and the exclusive bound that admits it.
-TESTED_TORCH = Version("2.14.0")
-TORCH_BOUND = "<2.15.0"
+TESTED_TORCH = Version("2.15.0")
+TORCH_BOUND = "<2.16.0"
 
 # Floor for every transformers line, since peft declares none: peft 0.18.0 imports GradientCheckpointingLayer from
 # transformers.modeling_layers (4.52.0+); on 4.51.3 import unsloth_zoo.saving_utils raised ModuleNotFoundError though
@@ -482,17 +482,17 @@ def test_the_ceiling_helper_reports_the_tightest_upper_bound() -> None:
 
 
 def test_a_widened_torch_bound_is_rejected_even_though_it_admits_the_tested_release() -> None:
-    """Negative control for exact-bound checks: <2.16.0 still admits the tested 2.14.0, so admission alone passes it,
-    yet it would publish untested torch 2.15.x while TORCH_BOUND says <2.15.0."""
-    widened = SpecifierSet(">=2.4.0,<2.16.0")
+    """Negative control for exact-bound checks: <2.17.0 still admits the tested 2.15.0, so admission alone passes it,
+    yet it would publish untested torch 2.16.x while TORCH_BOUND says <2.16.0."""
+    widened = SpecifierSet(">=2.4.0,<2.17.0")
     assert TESTED_TORCH in widened, "the premise: an admission-only check cannot see this"
     assert _ceiling_bound(widened) != _ceiling_bound(SpecifierSet(TORCH_BOUND))
     assert _ceiling_bound(SpecifierSet(f">=2.4.0,{TORCH_BOUND}")) == _ceiling_bound(SpecifierSet(TORCH_BOUND))
     # The case the version-only comparison could not see: same number, different set.
-    assert _ceiling(SpecifierSet("<=2.15.0")) == _ceiling(SpecifierSet("<2.15.0"))
-    assert _ceiling_bound(SpecifierSet("<=2.15.0")) != _ceiling_bound(SpecifierSet("<2.15.0"))
-    assert Version("2.15.0") in SpecifierSet("<=2.15.0")
-    assert Version("2.15.0") not in SpecifierSet("<2.15.0")
+    assert _ceiling(SpecifierSet("<=2.16.0")) == _ceiling(SpecifierSet("<2.16.0"))
+    assert _ceiling_bound(SpecifierSet("<=2.16.0")) != _ceiling_bound(SpecifierSet("<2.16.0"))
+    assert Version("2.16.0") in SpecifierSet("<=2.16.0")
+    assert Version("2.16.0") not in SpecifierSet("<2.16.0")
 
 
 def test_every_transformers_line_declares_the_floor_that_peft_needs() -> None:
