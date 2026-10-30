@@ -1596,7 +1596,11 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
             _RAISED_INSIDE_CHECKPOINT = True
             _CHECKPOINT_SETTLE_ATTEMPTS = 0
-            raise e
+            try:
+                raise e
+            finally:
+                # e's traceback holds this frame: keeping e here is a cycle that pins the failed call's tensors.
+                del e
         return eager_func(*args, **kwargs)
 
     def _give_up_at_compile_time(e, args, kwargs, marker_before, warning):
@@ -1650,30 +1654,40 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
             _RAISED_INSIDE_CHECKPOINT = True
             _CHECKPOINT_SETTLE_ATTEMPTS = 0
-            raise e
+            try:
+                raise e
+            finally:
+                # e's traceback holds this frame: keeping e here is a cycle that pins the failed call's tensors.
+                del e
         return eager_func(*args, **kwargs)
 
     def _give_up_on_backend(e, args, kwargs, marker_before):
         """Inductor refused to generate code for this region."""
-        return _give_up_at_compile_time(
-            e, args, kwargs, marker_before,
-            f"Unsloth: torch.compile could not generate code for {label}; "
-            f"running it eagerly from here. Training is unaffected apart from "
-            f"speed. ({type(e).__name__})",
-        )
+        try:
+            return _give_up_at_compile_time(
+                e, args, kwargs, marker_before,
+                f"Unsloth: torch.compile could not generate code for {label}; "
+                f"running it eagerly from here. Training is unaffected apart from "
+                f"speed. ({type(e).__name__})",
+            )
+        finally:
+            del e  # same cycle as in _give_up_at_compile_time
 
     def _give_up_on_disabled_hook(e, args, kwargs, marker_before):
         """Dynamo refused to inline one of our own `torch.compiler.disable`d hooks.
 
         Was a bare eager flip: no checkpoint question, no deferral, no record.
         """
-        return _give_up_at_compile_time(
-            e, args, kwargs, marker_before,
-            f"Unsloth: torch.compile hit one of Unsloth's own "
-            f"`torch.compiler.disable`d gradient-checkpointing hooks inside "
-            f"{label}; running it eagerly from here. Training is unaffected "
-            f"apart from speed.",
-        )
+        try:
+            return _give_up_at_compile_time(
+                e, args, kwargs, marker_before,
+                f"Unsloth: torch.compile hit one of Unsloth's own "
+                f"`torch.compiler.disable`d gradient-checkpointing hooks inside "
+                f"{label}; running it eagerly from here. Training is unaffected "
+                f"apart from speed.",
+            )
+        finally:
+            del e  # same cycle as in _give_up_at_compile_time
 
     def _is_backend_refusal_we_handle(e):
         """The gate the wrapper's own backend arm applies, in one place."""
