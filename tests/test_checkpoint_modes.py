@@ -13,36 +13,9 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""What `_in_non_reentrant_checkpoint` answers for each `use_gradient_checkpointing`.
-
-`training_utils.py` accepts exactly three values, and only ONE of them is a
-region this has to defer a mode switch inside:
-
-    "unsloth"  (the default)   False   correct, see below
-    True                       True    the case this work exists for
-    False                      False   nothing is recomputed
-
-The `"unsloth"` answer is the one that looks wrong and is not.
-`Unsloth_Offloaded_Gradient_Checkpointer` is a bare `autograd.Function`: its
-backward recomputes the forward under `enable_grad` and then runs
-`torch.autograd.backward(output, dY)` on that FRESH graph. It never unpacks
-activations a compiled forward stashed, so the two halves cannot disagree and a
-mode flip cannot strand it. Reentrant `torch.utils.checkpoint` is the same shape
-and answers False for the same reason.
-
-Non-reentrant checkpointing is the odd one out: it PACKS saved intermediates in
-the forward via saved-tensor hooks and UNPACKS them in the backward, and those
-two halves are exactly what a mid-step compile-mode flip desynchronises.
-
-None of this was pinned by a test, so a future move of Unsloth's own
-checkpointer toward the pack/unpack model would silently fall outside the guard
-with nothing going red.
-
-Answers checked on torch 2.6.0, 2.7.1, 2.8.0, 2.9.1, 2.10.0, 2.11.0 and 2.12.0,
-identical on every one. 2.6 and 2.7 matter: they predate
-`_top_saved_tensors_default_hooks` and answer via the frame walk, so both halves
-of `_in_non_reentrant_checkpoint` are covered rather than only the fast one.
-"""
+"""Only use_gradient_checkpointing=True is a deferring region (non-reentrant packs in forward, unpacks in backward);
+unsloth and reentrant checkpointing answer False because they re-derive a fresh graph; checked on torch 2.6.0 to
+2.12.0."""
 
 import torch
 import torch.utils.checkpoint as C
@@ -51,8 +24,7 @@ from unsloth_zoo.temporary_patches.utils import _in_non_reentrant_checkpoint
 
 
 class _UnslothShapedCheckpointer(torch.autograd.Function):
-    """The shape of `Unsloth_Offloaded_Gradient_Checkpointer`: save the input,
-    recompute under `enable_grad`, run a fresh backward over the new graph."""
+    """Mirrors Unsloth_Offloaded_Gradient_Checkpointer: saves the input, recomputes under enable_grad, and runs a fresh backward over the new graph."""
 
     @staticmethod
     def forward(ctx, forward_function, hidden_states):
@@ -98,8 +70,7 @@ def test_unsloth_checkpointing_is_not_a_deferring_region():
 
 
 def test_gradient_checkpointing_true_is_a_deferring_region():
-    """Non-reentrant packs in the forward and unpacks in the backward. This is
-    the one the deferral exists for."""
+    """Non-reentrant checkpointing packs in forward and unpacks in backward; this is the region the mode-switch deferral exists for."""
     assert _probe_inside(use_reentrant = False) is True
 
 
@@ -112,9 +83,7 @@ def test_gradient_checkpointing_false_is_not_a_deferring_region():
 
 
 def test_the_unsloth_checkpointer_still_re_derives():
-    """The reason `"unsloth"` is exempt, asserted rather than assumed. If its
-    backward ever stops running a fresh `autograd.backward` over a recomputed
-    graph, the exemption above stops being safe and this goes red first."""
+    """The unsloth checkpointer is exempt only while its backward re-runs autograd.backward over a fresh recomputed graph; this test fails first if that changes."""
     import inspect
 
     from unsloth_zoo.gradient_checkpointing import (
@@ -128,8 +97,7 @@ def test_the_unsloth_checkpointer_still_re_derives():
 
 
 def test_the_three_accepted_values_are_still_the_three_we_cover():
-    """`training_utils` asserts on this set. A fourth value would need its own
-    answer here, so fail rather than let it default."""
+    """training_utils asserts on this set of three; a fourth value needs its own answer here, so the test fails rather than letting it default."""
     import inspect
 
     from unsloth_zoo import training_utils

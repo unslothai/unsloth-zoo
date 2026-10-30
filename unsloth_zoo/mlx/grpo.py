@@ -14,13 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MLX GRPO: completions, rewards, advantages, and the clipped policy objective.
-
-The behaviour mirrors TRL 0.24's ``GRPOTrainer`` as Unsloth patches it on CUDA
-(``unsloth_zoo.rl_replacements.grpo_compute_loss``).
-"""
+"""MLX GRPO completions, rewards, advantages and clipped policy objective; mirrors TRL 0.24's GRPOTrainer as Unsloth
+patches it on CUDA (unsloth_zoo.rl_replacements.grpo_compute_loss)."""
 
 import copy
+import sys
 import warnings
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -33,14 +31,26 @@ import numpy as np
 from . import generate as generate_module
 from .generate import GenerationDefaults, GenerationRequest, SamplingParams
 from .preference import (
-    _chat_template, _make_preference_cce_scorer, _response_mask, _supervised_tokens,
+    _VLM_TOKEN_SPAN_KEYS, _chat_template, _make_preference_cce_scorer, _preference_ids,
+    _preference_logits, _response_mask, _supervised_tokens,
 )
 from .utils import (
+    _RAW_INPUT_IDS_FOR_LABELS,
+    _VLM_POSITION_GENERATING_MODEL_TYPES,
+    _VLM_RELOCATABLE_SIDECAR_KEYS,
+    _VLM_WIDTH_GENERATED_KEYS,
+    _as_numpy_vlm_field,
+    _config_get,
     _finite_batch_schedule,
     _finite_text_pad_width,
-    _model_logits,
+    _get_processor_tokenizer,
     _normalize_mlx_messages,
     _normalize_seed,
+    _prepare_vlm_batch_for_compile,
+    _processor_vlm_inputs,
+    _right_pad_vlm_rows,
+    _to_mx_vlm_batch,
+    _vlm_token_aligned_sidecars,
     encode_mlx_text,
 )
 
@@ -93,10 +103,7 @@ def _is_conversational_prompt(prompt):
 
 
 def cut_completion(token_ids, finish_reason, *, eos_id, pad_id):
-    """TRL's completion: through the first EOS, and whether it was truncated.
-
-    The generation engine leaves the stopping id out of ``token_ids``.
-    """
+    """TRL's completion runs through the first EOS and reports whether it was truncated; the generation engine leaves the stopping id out of token_ids."""
     ids = [int(token) for token in token_ids]
     if finish_reason == "stop" and eos_id is not None:
         ids.append(int(eos_id))
@@ -107,15 +114,16 @@ def cut_completion(token_ids, finish_reason, *, eos_id, pad_id):
 
 
 def reward_prompts_and_completions(prompts, completion_texts):
-    """What TRL hands reward functions: conversational completions become one
-    assistant message, and a prompt ending in an assistant turn gives that turn
-    up as the completion's opening."""
+    """What TRL hands reward functions: conversational completions become one assistant message, and a prompt ending in
+    an assistant turn yields that turn as the completion's opening."""
     if not prompts or not _is_conversational_prompt(prompts[0]):
         return list(prompts), list(completion_texts)
     reward_prompts, completions = [], []
     for prompt, text in zip(prompts, completion_texts):
         prompt = copy.deepcopy(prompt)
         bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+        if isinstance(bootstrap, list):  # an image prompt's text parts; TRL 0.24 fails concatenating them
+            bootstrap = "".join(part.get("text", "") for part in bootstrap if part.get("type") == "text")
         reward_prompts.append(prompt)
         completions.append([{"role": "assistant", "content": bootstrap + text}])
     return reward_prompts, completions
@@ -128,8 +136,7 @@ def reward_function_name(reward_func):
 def calculate_rewards(
     reward_funcs, rows, *, prompts, completions, completion_ids, trainer_state,
 ):
-    """``(len(rows), len(reward_funcs))`` float32 rewards, NaN where a function
-    returned None, called as TRL calls them."""
+    """(len(rows), len(reward_funcs)) float32 rewards, NaN where a function returned None; functions are called as TRL calls them."""
     columns = [
         key for key in rows[0] if key not in ("prompt", "completion", "completion_ids")
     ]
@@ -187,24 +194,23 @@ def group_advantages(rewards_per_func, reward_weights, num_generations, scale_re
 
 
 def completion_logps(model, batch, temperature):
-    """Per-token log probabilities of ``batch[:, 1:]``, on logits divided by the
-    sampling temperature as TRL scores them."""
-    logits = _model_logits(model(batch[:, :-1])).astype(mx.float32)
+    """Per-token log probabilities of the batch's ids after the first, on logits divided by the sampling temperature as TRL scores them."""
+    logits = _preference_logits(model, batch).astype(mx.float32)
     if temperature != 1.0:
         logits = logits / temperature
-    targets = batch[:, 1:]
+    targets = _preference_ids(batch)[:, 1:]
+    # An image placeholder may lie outside the head (Mllama's) or be negative (Phi-3 Vision); none is scored.
+    targets = mx.where((targets >= 0) & (targets < logits.shape[-1]), targets, 0)
     return -nn.losses.cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
 
 
 def grpo_logps(temperature, scorer=None):
-    """``(model, batch, lengths) -> log-probs``: the logits path, or ``scorer``'s
-    runtime CCE, whose own temperature then applies; it scores response positions
-    only, and zero elsewhere."""
+    """(model, batch, lengths) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature; scores response positions only, zero elsewhere."""
     if scorer is None:
         return lambda model, batch, _lengths: completion_logps(model, batch, temperature)
 
     def logps(model, batch, lengths):
-        supervised = _response_mask(batch[:, 1:], lengths) > 0
+        supervised = _response_mask(_preference_ids(batch)[:, 1:], lengths) > 0
         return -scorer(model, batch, supervised, logit_sums=False)[0]
 
     return logps
@@ -254,8 +260,7 @@ def grpo_terms(objective, new, advantages, mask, *, old=None, ref=None):
 
 
 def _reduce(objective, per_token, mask, normalizers):
-    """``k`` times Unsloth's micro-step loss, ``k`` the window's micro-step count (it cancels):
-    the trainer averages micro-step gradients, TRL sums them."""
+    """k times Unsloth's micro-step loss, k the window's micro-step count (it cancels); the trainer averages micro-step gradients while TRL sums them."""
     steps_per_generation, generation_tokens = normalizers[0], normalizers[1]
     masked = per_token * mask
     if objective.loss_type == "grpo":
@@ -300,13 +305,12 @@ def grpo_metric_values(summed):
 
 
 def make_grpo_loss_fn(objective, *, scorer=None):
-    """GRPO loss over a micro-batch ``(tokens, lengths, normalizers, advantages,
-    kept, old_logps, ref_logps)``; ``kept`` zeroes rows TRL masks as truncated."""
+    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps); kept zeroes rows TRL masks as truncated."""
     logps = grpo_logps(objective.temperature, scorer)
 
     def loss_fn(model, batch, lengths, normalizers, advantages, kept, old=None, ref=None):
         new = logps(model, batch, lengths)
-        mask = _response_mask(batch[:, 1:], lengths) * kept[:, None].astype(mx.float32)
+        mask = _response_mask(_preference_ids(batch)[:, 1:], lengths) * kept[:, None].astype(mx.float32)
         per_token, kl, coef_1 = grpo_terms(objective, new, advantages, mask, old=old, ref=ref)
         loss = _reduce(objective, per_token, mask, normalizers)
         return loss, mx.array(1, dtype=mx.int32), grpo_stats(objective, kl, coef_1, advantages, mask)
@@ -336,7 +340,7 @@ def make_grpo_eval_fn(objective, *, scorer=None):
 
     def eval_fn(model, batch, *rest):
         loss, _, stats = loss_fn(model, batch, *rest)
-        return loss, mx.array(batch.shape[0], dtype=mx.int32), stats
+        return loss, mx.array(_preference_ids(batch).shape[0], dtype=mx.int32), stats
 
     eval_fn.__dict__.update(loss_fn.__dict__)
     return eval_fn
@@ -347,9 +351,35 @@ _TEMPLATE_RESERVED_COLUMNS = frozenset((
 ))
 
 
-def render_grpo_prompt(tokenizer, row):
-    """TRL's prompt text; a string column the chat template names is passed to
-    it as a keyword, as Unsloth does."""
+def _grpo_images(row):
+    """A row's images as TRL 0.24 reads them; an image cell may hold one image or a list, as Unsloth allows."""
+    cell = row.get("images") if "images" in row else row.get("image")
+    if cell is None:
+        return ()
+    return tuple(cell) if isinstance(cell, (list, tuple)) else (cell,)
+
+
+def _trl_multimodal_messages(messages, num_images):
+    """TRL 0.24's ``prepare_multimodal_messages``, on a copy."""
+    structured, placed = [], False
+    for message in messages:
+        message = dict(message)
+        if message["role"] not in ("system", "user", "assistant"):
+            raise ValueError(
+                f"Unsloth MLX GRPO: invalid role in message: {message['role']}. "
+                "Expected 'user', 'assistant', or 'system'."
+            )
+        if isinstance(message["content"], str):
+            parts = [{"type": "text", "text": message["content"]}]
+            if message["role"] == "user" and not placed:
+                parts, placed = [{"type": "image"}] * num_images + parts, True
+            message["content"] = parts
+        structured.append(message)
+    return structured
+
+
+def render_grpo_prompt(tokenizer, row, *, num_images=None, processor=None):
+    """TRL's prompt text; a string column the chat template names is passed to it as a keyword; a vision dataset supplies num_images, and a VLM's processor renders."""
     prompt = row["prompt"]
     if not _is_conversational_prompt(prompt):
         if not isinstance(prompt, str):
@@ -357,13 +387,16 @@ def render_grpo_prompt(tokenizer, row):
                 "Unsloth MLX GRPO: a prompt must be a string or a list of chat messages."
             )
         return prompt
-    template = getattr(tokenizer, "chat_template", None)
+    renderer = tokenizer if processor is None else processor
+    template = getattr(renderer, "chat_template", None)
     kwargs = {
         key: value for key, value in row.items()
         if isinstance(value, str) and key not in _TEMPLATE_RESERVED_COLUMNS
         and isinstance(template, str) and key in template
     }
-    messages = _normalize_mlx_messages(prompt, is_vlm=False)
+    if num_images is not None:
+        prompt = _trl_multimodal_messages(prompt, num_images)
+    messages = _normalize_mlx_messages(prompt, is_vlm=processor is not None)
     role = messages[-1].get("role")
     if role == "user":
         mode = {"add_generation_prompt": True}
@@ -374,13 +407,94 @@ def render_grpo_prompt(tokenizer, row):
             "Unsloth MLX GRPO: a conversational prompt must end with a user or "
             "assistant message."
         )
-    return _chat_template(tokenizer, messages, tools=None, kwargs=kwargs, **mode)
+    return _chat_template(
+        renderer, messages, tools=None, kwargs=kwargs, is_vlm=processor is not None, **mode,
+    )
+
+
+def _encode_grpo_prompt(tokenizer, row, processor=None, vision=False):
+    """``(ids, text, images, vision inputs)``: an image prompt through the processor."""
+    images = _grpo_images(row) if vision else ()
+    text = render_grpo_prompt(
+        tokenizer, row, num_images=len(images) if vision else None, processor=processor,
+    )
+    if not images:
+        ids = encode_mlx_text(tokenizer, text, add_special_tokens=False)
+        return tuple(int(token) for token in ids), text, images, None
+    inputs = _processor_vlm_inputs(
+        processor, [text], [list(images)], None, truncation=False, padding_side="right",
+    )
+    ids = tuple(int(token) for token in _as_numpy_vlm_field(inputs, "input_ids")[0])
+    return ids, text, images, {
+        key: value for key, value in inputs.items()
+        if key not in ("input_ids", "attention_mask") and not key.startswith("_unsloth_")
+    }
+
+
+def _grpo_vision_batch(processor, model_config, batch, lengths, media):
+    """Packed rows as one vision batch from the processor's outputs for their media; token-aligned outputs are zero over
+    each completion as TRL extends token_type_ids; image-less rows still form a dict since some vision models take no
+    bare ids."""
+    outputs = {"input_ids": batch}
+    if media is not None and any(images for _, images in media):
+        # Some processors (falcon, deepseek_vl_v2) left-pad whatever side is asked for.
+        outputs = _right_pad_vlm_rows(_processor_vlm_inputs(
+            processor, [text for text, _ in media], [list(images) for _, images in media], None,
+            truncation=False, padding_side="right",
+        ), processor)
+    ids = _as_numpy_vlm_field(outputs, "input_ids")
+    width = batch.shape[1]
+    if any(
+        ids[row, :prompt_length].tolist() != batch[row, :prompt_length].tolist()
+        for row, (prompt_length, _) in enumerate(lengths)
+    ):
+        raise ValueError(
+            "Unsloth MLX GRPO: the processor encodes a prompt differently beside "
+            "others than alone, so its rollouts and scores would see different tokens."
+        )
+    inputs = {
+        "input_ids": batch,
+        "attention_mask": (np.arange(width)[None, :] < lengths[:, 1:]).astype(np.int32),
+    }
+    for name, values in _vlm_token_aligned_sidecars(outputs, ids.shape).items():
+        inputs[name] = np.zeros(batch.shape, dtype=values.dtype)
+        for row, (prompt_length, _) in enumerate(lengths):
+            inputs[name][row, :prompt_length] = values[row, :prompt_length]
+    rebuilt = (
+        _VLM_WIDTH_GENERATED_KEYS
+        if _config_get(model_config, "model_type") in _VLM_POSITION_GENERATING_MODEL_TYPES else ()
+    )
+    for key, value in outputs.items():
+        if (
+            key in ("input_ids", "attention_mask", "labels") or key in _VLM_RELOCATABLE_SIDECAR_KEYS
+            or key in rebuilt or key.startswith("_unsloth_")
+        ):
+            continue
+        shape = getattr(value, "shape", None)
+        if key in _VLM_TOKEN_SPAN_KEYS or (
+            shape is not None and len(shape) >= 2 and tuple(shape[:2]) == ids.shape
+        ):
+            raise NotImplementedError(
+                f"Unsloth MLX GRPO: {type(processor).__name__} returns {key!r} aligned "
+                "with the prompt as it laid it out, which a rollout re-lays. This "
+                "model is not supported for GRPO on image prompts."
+            )
+        inputs[key] = value
+    vision = _to_mx_vlm_batch(inputs)
+    vision.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+    vision = _prepare_vlm_batch_for_compile(vision, model_config)
+    if tuple(vision["input_ids"].shape) != tuple(batch.shape):
+        raise NotImplementedError(
+            "Unsloth MLX GRPO: this model expands its image tokens after the "
+            "processor, which moves the completion. It is not supported for GRPO "
+            "on image prompts."
+        )
+    return vision
 
 
 @dataclass(frozen=True)
 class GRPOSampling:
-    """Rollout sampling as TRL configures it; ``top_k`` / ``min_p`` None switch the
-    filter off, and ``max_tokens`` is the resolved completion length."""
+    """Rollout sampling as TRL configures it; top_k and min_p None switch that filter off, and max_tokens is the resolved completion length."""
 
     max_tokens: int = 256
     temperature: float = 1.0
@@ -414,8 +528,7 @@ class GRPOSampling:
 
 
 def hf_logits_warper(sampling, prompt_ids):
-    """One row's HF sampling processors: repetition penalty over the prompt and
-    what followed it, then temperature, top-k, top-p and min-p."""
+    """HF sampling processors for one row: repetition penalty over the prompt and what followed it, then temperature, top-k, top-p and min-p."""
     # The engine shows a processor its last prompt token onward.
     context = mx.array(list(prompt_ids[:-1]), dtype=mx.int32)
     penalty = float(sampling.repetition_penalty)
@@ -423,9 +536,14 @@ def hf_logits_warper(sampling, prompt_ids):
     def warp(tokens, logits):
         logits = logits.astype(mx.float32)
         if penalty != 1.0:
+            vocab = logits.shape[-1]
             seen = mx.concatenate([context, tokens.astype(mx.int32)])
+            # Placeholders outside the head land on a dropped column.
+            seen = mx.where((seen >= 0) & (seen < vocab), seen, vocab)
+            logits = mx.concatenate([logits, mx.zeros_like(logits[:, :1])], axis=-1)
             picked = logits[:, seen]
             logits[:, seen] = mx.where(picked < 0, picked * penalty, picked / penalty)
+            logits = logits[:, :vocab]
         if sampling.temperature != 1.0:
             logits = logits / sampling.temperature
         removed = mx.array(-float("inf"), mx.float32)
@@ -435,8 +553,7 @@ def hf_logits_warper(sampling, prompt_ids):
             cutoff = mx.sort(logits, axis=-1)[:, kept:kept + 1]
             logits = mx.where(logits < cutoff, removed, logits)
         if sampling.top_p < 1.0:
-            # By sorted position, as HF drops them: a value cutoff keeps every tie.
-            # The most likely token always survives, as HF's min_tokens_to_keep=1.
+            # Drops by sorted position as HF does, since a value cutoff keeps every tie; the most likely token always survives, as HF's min_tokens_to_keep=1.
             order = mx.argsort(logits, axis=-1)
             ordered = mx.take_along_axis(logits, order, axis=-1)
             below = mx.cumsum(mx.softmax(ordered, axis=-1), axis=-1) <= 1 - sampling.top_p
@@ -500,22 +617,26 @@ class _Generation:
     old: list | None
     ref: list | None
     generation_tokens: int
+    media: list | None = None  # (prompt text, images) per row
 
 
 class GRPOBatchPlan:
-    """Finite GRPO schedule: one entry per micro-step, each naming the prompt chunk
-    its generation samples from. A generation covers ``steps_per_generation *
-    num_iterations`` micro-steps counted from ``start_at``, so a resumed run
-    generates at once, as TRL does with an empty buffer."""
+    """Finite GRPO schedule with one entry per micro-step naming its prompt chunk; a generation covers
+    steps_per_generation * num_iterations micro-steps from start_at, so a resumed run generates at once, as TRL does
+    with an empty buffer."""
 
     def __init__(
         self, dataset, tokenizer, prompt_ids, max_tokens, schedule, *, cycle_length,
         num_generations, batch_size, steps_per_generation, num_iterations,
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
+        processor=None, model_config=None, vision=False,
     ):
         self._dataset = dataset
         self._tokenizer = tokenizer
+        self._processor = processor
+        self._model_config = model_config
+        self.vision = vision
         self._prompt_ids = prompt_ids
         self._max_tokens = max_tokens
         self._schedule = schedule
@@ -562,11 +683,9 @@ class GRPOBatchPlan:
         reference_policy=None, rollout_context=None, keep_completions=False, scorer=None,
         step_compiled=None,
     ):
-        """Attach what generating needs: the policy, rewards and the reference.
-        ``trainer_state`` reaches the reward functions and counts the prompt and
-        completion tokens, as TRL's does; ``keep_completions`` holds the latest
-        generation's texts in ``completions``; ``scorer`` is the loss's runtime CCE
-        scorer, so old and reference log-probs are scored as the loss scores."""
+        """Attach the policy, rewards and reference; trainer_state reaches reward functions and counts prompt and
+        completion tokens as TRL does; keep_completions holds the latest texts; scorer is the loss's runtime CCE, so
+        old and reference log-probs are scored as the loss scores."""
         if self.with_reference and reference_policy is None:
             raise ValueError("Unsloth MLX GRPO: this plan scores a reference policy.")
         self._model = model
@@ -622,7 +741,12 @@ class GRPOBatchPlan:
             lengths[row] = (prompt_length, len(sequence))
         return batch, lengths
 
-    def _score(self, scorer, sequences, prompt_lengths):
+    def _inputs(self, batch, lengths, media):
+        if self._processor is None:
+            return mx.array(batch)
+        return _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
+
+    def _score(self, scorer, sequences, prompt_lengths, media):
         values = []
         for start in range(0, len(sequences), self.batch_size):
             chunk = sequences[start:start + self.batch_size]
@@ -630,7 +754,8 @@ class GRPOBatchPlan:
                 chunk, prompt_lengths[start:start + self.batch_size],
                 self._planned(self._width(max(len(sequence) for sequence in chunk))),
             )
-            logps = np.array(scorer(mx.array(batch), mx.array(lengths)), dtype=np.float32)
+            inputs = self._inputs(batch, lengths, None if media is None else media[start:start + self.batch_size])
+            logps = np.array(scorer(inputs, mx.array(lengths)), dtype=np.float32)
             values.extend(logps[row, :len(sequence) - 1] for row, sequence in enumerate(chunk))
         return values
 
@@ -647,9 +772,13 @@ class GRPOBatchPlan:
             prompt for prompt in self._schedule[visit % len(self._schedule)]
             for _ in range(self.num_generations)
         ]
+        read = {prompt: self._dataset[prompt] for prompt in dict.fromkeys(prompts)}
+        # Read again each generation and held only for it: the plan keeps no pixels.
+        encoded = {prompt: self._reencode(prompt, row) for prompt, row in read.items()} if self.vision else {}
         requests = [
             GenerationRequest(
                 prompt_token_ids=self._prompt_ids[prompt],
+                vision_inputs=encoded[prompt][3] if encoded else None,
                 max_tokens=self._max_tokens[prompt],
                 sampling=SamplingParams(temperature=1.0, seed=_derived_seed(self.seed, visit, 0, row)),
                 logits_processors=(
@@ -664,7 +793,7 @@ class GRPOBatchPlan:
         )
         with self._rollout_context():
             results = generate_module.generate_batch(
-                self._model, self._tokenizer, requests, defaults=defaults,
+                self._model, self._processor or self._tokenizer, requests, defaults=defaults,
             )
         cut = [
             cut_completion(result.token_ids, result.finish_reason, eos_id=self.eos_id, pad_id=self.pad_id)
@@ -672,7 +801,7 @@ class GRPOBatchPlan:
         ]
         completion_ids = [ids for ids, _ in cut]
         truncated = np.array([flag for _, flag in cut], dtype=bool)
-        rows = [self._dataset[prompt] for prompt in prompts]
+        rows = [read[prompt] for prompt in prompts]
         texts = [self._decode(ids) for ids in completion_ids]
         lengths = np.array([len(ids) for ids in completion_ids])
         prompt_lengths = np.array([len(self._prompt_ids[prompt]) for prompt in prompts])
@@ -680,9 +809,12 @@ class GRPOBatchPlan:
         if self.counts_tokens:
             self._trainer_state.num_input_tokens_seen += int(prompt_lengths.sum() + lengths.sum())
         self._metrics["num_tokens"] = [self._trainer_state.num_input_tokens_seen]
-        reward_prompts, completions = reward_prompts_and_completions(
-            [row["prompt"] for row in rows], texts,
-        )
+        # TRL's placeholders reach the reward functions: it structures the prompts in place.
+        reward_prompts, completions = reward_prompts_and_completions([
+            _trl_multimodal_messages(read[prompt]["prompt"], len(encoded[prompt][2]))
+            if encoded and _is_conversational_prompt(read[prompt]["prompt"]) else read[prompt]["prompt"]
+            for prompt in prompts
+        ], texts)
         rewards = calculate_rewards(
             self._reward_funcs, rows, prompts=reward_prompts, completions=completions,
             completion_ids=completion_ids, trainer_state=self._trainer_state,
@@ -693,7 +825,8 @@ class GRPOBatchPlan:
         self._record_generation(lengths, truncated, rewards, reward_stats)
         if self._keep_completions:
             self.completions = {
-                "prompt": [self._decode(self._prompt_ids[prompt]) for prompt in prompts],
+                # Phi-3 Vision's negative placeholder ids do not decode.
+                "prompt": [self._decode(i for i in self._prompt_ids[prompt] if i >= 0) for prompt in prompts],
                 "completion": texts,
                 "rewards": {
                     reward_function_name(reward_func): rewards[:, column].tolist()
@@ -702,31 +835,40 @@ class GRPOBatchPlan:
                 "advantage": advantages.tolist(),
             }
         kept = ~truncated if self.mask_truncated_completions else np.ones_like(truncated)
-        # Shuffled before scoring, so each old/reference chunk is one micro-batch at
-        # its own width and a first iteration's ratio is exactly 1 when eager.
+        # Shuffled before scoring so each old/reference chunk is one micro-batch at its own width, and a first iteration's ratio is exactly 1 when eager.
         order = np.random.default_rng(_derived_seed(self.seed, visit, 1)).permutation(len(prompts))
         sequences = [
             tuple(self._prompt_ids[prompts[row]]) + tuple(completion_ids[row]) for row in order
         ]
         prompt_lengths = prompt_lengths[order]
+        media = [encoded[prompts[row]][1:3] for row in order] if encoded else None
         old = ref = None
         if self.with_old_logps:
             old = self._score(
                 lambda batch, lengths: mx.stop_gradient(self._logps(self._model, batch, lengths)),
-                sequences, prompt_lengths,
+                sequences, prompt_lengths, media,
             )
         if self.with_reference:
             ref = self._score(
                 lambda batch, lengths: self._reference_policy.forward(
                     self._model, batch, lengths, response_scorer=self._logps,
                 ),
-                sequences, prompt_lengths,
+                sequences, prompt_lengths, media,
             )
         return _Generation(
             visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
-            generation_tokens=int(lengths.sum()),
+            generation_tokens=int(lengths.sum()), media=media,
         )
+
+    def _reencode(self, prompt, row):
+        encoded = _encode_grpo_prompt(self._tokenizer, row, self._processor, vision=True)
+        if encoded[0] != self._prompt_ids[prompt]:
+            raise ValueError(
+                f"Unsloth MLX GRPO: dataset row {prompt} encodes to a different prompt "
+                "than when the plan was built; its images must keep their size."
+            )
+        return encoded
 
     def _record_generation(self, lengths, truncated, rewards, reward_stats):
         terminated = lengths[~truncated] if (~truncated).any() else np.zeros(1)
@@ -759,17 +901,14 @@ class GRPOBatchPlan:
         self._shape_plan = shape_plan
 
     def _planned(self, width):
-        # Old and reference log-probs are scored at the width the micro-batch
-        # trains at, so a first iteration's ratio stays exactly 1, including
-        # after a compile fallback.
+        # Old and reference log-probs are scored at the width the micro-batch trains at, so a first iteration's ratio
+        # stays exactly 1, including after a compile fallback.
         if self._shape_plan is None:
             return width
         return self._shape_plan.endpoint_for(self.batch_family(0), width)
 
     def materialize(self, index, *, phase=None):
-        """The micro-batch for schedule entry ``index``, at its planned width
-        whatever the ``phase``. Refetching an entry reuses its generation instead
-        of sampling again."""
+        """Micro-batch for schedule entry index at its planned width whatever the phase; refetching an entry reuses its generation instead of sampling again."""
         start = self._generation_start(index)
         if self._current is None or self._current.visit != start:
             self._current = self._generate(start)
@@ -788,8 +927,9 @@ class GRPOBatchPlan:
                 table[offset, :len(values[row])] = values[row]
             return mx.array(table)
 
+        media = None if generation.media is None else generation.media[position:position + self.batch_size]
         return (
-            mx.array(batch), mx.array(lengths),
+            self._inputs(batch, lengths, media), mx.array(lengths),
             mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),
@@ -805,20 +945,33 @@ class GRPOBatchPlan:
         return (self.materialize(index) for index in range(len(self)))
 
 
-def _encode_grpo_prompts(dataset, tokenizer, sampling, max_seq_length, max_prompt_length):
+def _encode_grpo_prompts(
+    dataset, tokenizer, sampling, max_seq_length, max_prompt_length, processor=None, vision=None,
+):
+    """Prompt ids, completion budgets and whether this is a vision dataset: as TRL reads it, an image column in the first row, here also holding an image."""
     if getattr(tokenizer, "eos_token_id", None) is None:
         raise ValueError("Unsloth MLX GRPO: the tokenizer needs an eos_token_id to stop on.")
+    if vision is None:
+        first = dataset[0] if len(dataset) else None
+        vision = processor is not None and isinstance(first, Mapping) and bool({"image", "images"} & set(first))
     prompt_ids, max_tokens = [], []
     long_prompts = capped = 0
+    holds_images = False
     for index in range(len(dataset)):
         row = dataset[index]
         if not isinstance(row, Mapping) or "prompt" not in row:
             raise ValueError(
                 f"Unsloth MLX GRPO: dataset row {index} has no prompt column."
             )
+        if processor is not None and not vision and _grpo_images(row):
+            raise ValueError(
+                f"Unsloth MLX GRPO: dataset row {index} carries images, but the first row has no "
+                "`image` or `images` field, which decides whether a dataset is text or vision. "
+                "Give the first row an `images` field, empty if it has none."
+            )
         # TRL tokenizes prompts with add_special_tokens=False: a chat template supplies its own BOS.
-        text = render_grpo_prompt(tokenizer, row)
-        ids = tuple(int(token) for token in encode_mlx_text(tokenizer, text, add_special_tokens=False))
+        ids, _, images, _ = _encode_grpo_prompt(tokenizer, row, processor, vision)
+        holds_images = holds_images or bool(images)
         if not ids or len(ids) >= max_seq_length:
             raise ValueError(
                 f"Unsloth MLX GRPO: dataset row {index} encodes to a {len(ids)}-token "
@@ -830,6 +983,10 @@ def _encode_grpo_prompts(dataset, tokenizer, sampling, max_seq_length, max_promp
         long_prompts += max_prompt_length is not None and len(ids) > max_prompt_length
         prompt_ids.append(ids)
         max_tokens.append(min(sampling.max_tokens, room))
+    if vision and not holds_images:  # an empty image column: TRL trains such batches as text
+        return _encode_grpo_prompts(
+            dataset, tokenizer, sampling, max_seq_length, max_prompt_length, processor, False,
+        )
     if long_prompts:
         warnings.warn(
             f"Unsloth MLX GRPO: {long_prompts} prompt(s) exceed max_prompt_length="
@@ -844,23 +1001,22 @@ def _encode_grpo_prompts(dataset, tokenizer, sampling, max_seq_length, max_promp
             "their completions are capped to the room left.",
             stacklevel=3,
         )
-    return prompt_ids, max_tokens
+    return prompt_ids, max_tokens, vision
 
 
 def create_grpo_batch_plan(
     dataset, tokenizer, *, num_generations, batch_size, steps_per_generation,
     num_iterations, grad_accum, sampling, max_seq_length, score_temperature=None, scale_rewards="group",
     mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
-    shuffle=True, seed=None, num_batches=None, num_epochs=None,
+    shuffle=True, seed=None, num_batches=None, num_epochs=None, processor=None, model_config=None,
 ):
-    """Encode every prompt once and lay out TRL's RepeatSampler schedule.
-
-    ``batch_size`` counts completions; a generation samples ``batch_size *
-    steps_per_generation`` of them, ``num_generations`` per prompt. Log-probs
-    are scored at ``score_temperature``, the sampling temperature by default.
-    """
-    prompt_ids, max_tokens = _encode_grpo_prompts(
-        dataset, tokenizer, sampling, max_seq_length, max_prompt_length,
+    """Encode prompts once and lay out TRL's RepeatSampler schedule; batch_size counts completions, a generation samples
+    batch_size * steps_per_generation of them, num_generations per prompt; score_temperature defaults to the sampling
+    temperature; a VLM processor replaces tokenizer."""
+    if processor is not None:
+        tokenizer = _get_processor_tokenizer(processor)
+    prompt_ids, max_tokens, vision = _encode_grpo_prompts(
+        dataset, tokenizer, sampling, max_seq_length, max_prompt_length, processor,
     )
     if batch_size * steps_per_generation % num_generations:
         raise ValueError(
@@ -898,6 +1054,7 @@ def create_grpo_batch_plan(
         mask_truncated_completions=mask_truncated_completions,
         with_old_logps=grad_accum % repeats != 0, with_reference=with_reference,
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
+        processor=processor, model_config=model_config, vision=vision,
     )
 
 
@@ -905,13 +1062,14 @@ def create_grpo_batch_plan(
 def create_grpo_eval_plan(
     dataset, tokenizer, *, num_generations, batch_size, sampling, max_seq_length,
     score_temperature=None, scale_rewards="group", mask_truncated_completions=False,
-    with_reference=False, max_prompt_length=None, seed=None,
+    with_reference=False, max_prompt_length=None, seed=None, processor=None, model_config=None,
 ):
-    """TRL's eval RepeatSampler order, one generation per ``batch_size`` completions
-    (the last batch may be short), on a seed stream of its own and without
-    advancing ``num_input_tokens_seen``."""
-    prompt_ids, max_tokens = _encode_grpo_prompts(
-        dataset, tokenizer, sampling, max_seq_length, max_prompt_length,
+    """TRL's eval RepeatSampler order, one generation per batch_size completions (last batch may be short), on its own
+    seed stream without advancing num_input_tokens_seen."""
+    if processor is not None:
+        tokenizer = _get_processor_tokenizer(processor)
+    prompt_ids, max_tokens, vision = _encode_grpo_prompts(
+        dataset, tokenizer, sampling, max_seq_length, max_prompt_length, processor,
     )
     seed = _normalize_seed(seed)
     order = _RepeatSamplerOrder(len(prompt_ids), seed, True)(0)
@@ -926,6 +1084,7 @@ def create_grpo_eval_plan(
         scale_rewards=scale_rewards, mask_truncated_completions=mask_truncated_completions,
         with_old_logps=False, with_reference=with_reference, max_seq_length=max_seq_length,
         seed=_derived_seed(seed, 1), counts_tokens=False,
+        processor=processor, model_config=model_config, vision=vision,
     )
 
 _GENERATION_KWARGS = (
@@ -935,8 +1094,7 @@ _GENERATION_KWARGS = (
 
 
 def grpo_sampling(config):
-    """The rollout sampling a GRPO config asks for; ``generation_kwargs`` override
-    the named fields, as TRL updates its GenerationConfig with them."""
+    """Rollout sampling a GRPO config asks for; generation_kwargs override the named fields, as TRL updates its GenerationConfig with them."""
     kwargs = dict(config.generation_kwargs or {})
     unsupported = sorted(set(kwargs) - set(_GENERATION_KWARGS))
     if unsupported:
@@ -965,15 +1123,81 @@ def grpo_objective(config):
     )
 
 
-def grpo_reward_funcs(reward_funcs):
+def _is_torch_module(func):
+    torch = sys.modules.get("torch")  # a caller holding a torch module has imported torch
+    return torch is not None and isinstance(func, torch.nn.Module)
+
+
+class _RewardModel:
+    """A Hugging Face sequence-classification reward model scored as TRL scores one: logit 0 of each rendered prompt + completion, on the device it was given."""
+
+    def __init__(self, model, tokenizer):
+        if tokenizer is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(model.config._name_or_path)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.pad_token_id
+        self.model, self.tokenizer = model, tokenizer
+        self.__name__ = model.config._name_or_path.split("/")[-1]
+
+    def __call__(self, prompts, completions, **_):
+        import torch
+        # The completion, not the prompt: an assistant-only prompt is empty once its turn moves into the completion.
+        if _is_conversational_prompt(completions[0]):
+            texts = [
+                self.tokenizer.apply_chat_template(prompt + completion, tools=None, tokenize=False)
+                for prompt, completion in zip(prompts, completions)
+            ]
+        else:
+            texts = [prompt + completion for prompt, completion in zip(prompts, completions)]
+        inputs = self.tokenizer(
+            text=texts, return_tensors="pt", padding=True, padding_side="right",
+            add_special_tokens=False,
+        )
+        device = next(self.model.parameters()).device
+        with torch.inference_mode():
+            logits = self.model(**{key: value.to(device) for key, value in inputs.items()}).logits
+        return logits[:, 0].float().tolist()
+
+
+def _load_reward_model(name):
+    try:
+        from transformers import AutoModelForSequenceClassification
+        return AutoModelForSequenceClassification.from_pretrained(name, num_labels=1)
+    except ImportError as error:
+        raise ImportError(
+            f"Unsloth MLX GRPO: reward function {name!r} names a Hugging Face "
+            "sequence-classification model, which needs torch and transformers."
+        ) from error
+
+
+def grpo_reward_funcs(reward_funcs, reward_processing_classes=None):
+    """TRL's reward_funcs: callables, torch reward models, or their ids, each model paired with its entry of reward_processing_classes."""
     funcs = list(reward_funcs) if isinstance(reward_funcs, (list, tuple)) else [reward_funcs]
     if not funcs:
         raise ValueError("Unsloth MLX GRPO: reward_funcs needs at least one reward function.")
-    for func in funcs:
-        if not callable(func) or hasattr(func, "parameters"):
+    if reward_processing_classes is None:
+        tokenizers = [None] * len(funcs)
+    elif isinstance(reward_processing_classes, (list, tuple)):
+        tokenizers = list(reward_processing_classes)
+    else:
+        tokenizers = [reward_processing_classes]
+    if len(tokenizers) != len(funcs):
+        raise ValueError(
+            f"Unsloth MLX GRPO: {len(tokenizers)} reward_processing_classes for "
+            f"{len(funcs)} reward functions."
+        )
+    for index, func in enumerate(funcs):
+        if isinstance(func, str):
+            func = _load_reward_model(func)
+        if _is_torch_module(func):
+            funcs[index] = _RewardModel(func, tokenizers[index])
+        elif not callable(func) or hasattr(func, "parameters"):
             raise ValueError(
-                f"Unsloth MLX GRPO: reward function {func!r} is not a plain callable; "
-                "reward models are not supported."
+                f"Unsloth MLX GRPO: reward function {func!r} is neither a callable nor a "
+                "torch reward model. Wrap an MLX model in a function that returns one "
+                "reward per completion."
             )
     return funcs
 
@@ -1082,8 +1306,7 @@ def resolve_grpo_config(config):
 
 
 def format_completions(sample, step, limit=None):
-    """A plain-text take on TRL's ``print_prompt_completions_sample`` table: the
-    first ``limit`` rows, where TRL draws them at random."""
+    """Plain-text take on TRL's print_prompt_completions_sample table: the first limit rows, where TRL draws them at random."""
     names = list(sample["rewards"])
     count = len(sample["prompt"]) if limit is None else min(int(limit), len(sample["prompt"]))
     lines = [f"Step {step}", " | ".join(("Prompt", "Completion", *names, "Advantage"))]

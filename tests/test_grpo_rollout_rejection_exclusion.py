@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Rollout rejection (UNSLOTH_GRPO_ROLLOUT_RS) removes a rejected token from every loss term.
-
-verl compute_rollout_rejection_mask returns response_mask * keep and the trainer replaces the
-batch response_mask with it, so the policy term and the KL loss both drop rejected tokens. Here a
-rejected token must contribute 0 to the loss and exactly 0 gradient, policy and KL alike, and a
-rejected token whose vLLM IS ratio overflowed to inf must not turn into nan (inf * 0). The loss
-normaliser keeps its documented TRL *_mask convention (rejected tokens stay counted).
-"""
+"""UNSLOTH_GRPO_ROLLOUT_RS drops rejected tokens from every loss term (policy and KL, zero gradient, no nan even if the
+vLLM IS ratio overflowed to inf); the normaliser still counts them, as TRL *_mask does."""
 import math
 
 import pytest
@@ -114,8 +108,8 @@ def _data(seed, rows = 6, cols = 9, scale = 0.2, dtype = torch.float64):
 
 
 def test_overflowed_is_ratio_on_rejected_token_is_not_nan():
-    # Review repro: token_mask with no clip, log ratios [0, 100] in float32. exp(100) = inf and the
-    # rejected token used to become inf * 0 = nan in the loss and in the gradient.
+    # Repro: token_mask with no clip and log ratios [0, 100] in float32; exp(100) overflows to inf, and a rejected token
+    # turned that into inf * 0 = nan in the loss and gradient.
     new = torch.zeros(1, 2, dtype = torch.float32, requires_grad = True)
     old = torch.zeros(1, 2, dtype = torch.float32)
     sampling = torch.tensor([[0.0, -100.0]])
@@ -132,8 +126,7 @@ def test_overflowed_is_ratio_on_rejected_token_is_not_nan():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_rejected_row_carries_no_kl_gradient(dtype):
-    # Review repro: two two-token rows, the first rejected by seq_mean_k3 0.01, zero advantages,
-    # beta 0.1, ref - new = 1. The rejected row used to keep a -0.043 KL gradient per token.
+    # Rejected row (seq_mean_k3 0.01, zero advantages, beta 0.1, ref - new = 1) must carry no KL gradient; a leak once gave -0.043 per token.
     new = torch.zeros(2, 2, dtype = dtype, requires_grad = True)
     ref = torch.ones(2, 2, dtype = dtype)
     old = torch.zeros(2, 2, dtype = dtype)
@@ -206,10 +199,8 @@ def test_default_path_without_rejection_keeps_kl_on_is_masked_tokens():
     assert (new.grad[masked] != 0).all()
 
 
-# Rollout logprobs as pi_old (UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD, verl bypass mode): sampling is
-# dropped, old = rollout. verl compute_policy_loss_bypass_mode still runs
-# compute_rollout_correction_and_rejection_mask with old_log_prob = the current log_prob, so the
-# rejection statistic is on log(pi_theta / pi_rollout) and the rejected tokens leave the loss.
+# With UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD, sampling is dropped and old = rollout; rejection runs on log(pi_theta /
+# pi_rollout) with the current logp as old, as verl bypass mode does; rejected tokens leave the loss.
 
 
 def _run_bypass(ref, new, rollout, mask, adv, beta, rollout_rs, loss_type = "dapo"):
@@ -243,9 +234,8 @@ def _oracle_bypass(ref, new, rollout, mask, adv, beta, parsed, loss_type):
 
 
 def test_bypass_mode_applies_rejection():
-    # Review repro (zoo#1927): new = -2, rollout = -1, advantage 1, token_k1 bounds [0.5, 2]. The
-    # statistic -log(pi_theta / pi_rollout) = 1 > log 2 rejects the token; main ignored the filter
-    # and returned -exp(-1).
+    # Repro unsloth-zoo 1927: token_k1 [0.5, 2] must reject the token whose -log(pi_theta / pi_rollout) = 1 exceeds log
+    # 2; the filter was once ignored, returning -exp(-1).
     new = torch.full((1, 1), -2.0, dtype = torch.float64, requires_grad = True)
     rollout = torch.full((1, 1), -1.0, dtype = torch.float64)
     mask = torch.ones(1, 1, dtype = torch.long)
@@ -292,8 +282,7 @@ def test_bypass_metrics_report_gaps_past_the_loss_clamp():
 
 @pytest.mark.parametrize("as_old", ["0", "1"])
 def test_rollout_rs_warning_follows_bypass_support(monkeypatch, as_old):
-    # Without vLLM IS correction rejection only runs with rollout logps as pi_old, so only the
-    # other case is reported as ignored.
+    # Without the vLLM IS correction, rejection only runs with rollout logps as pi_old, so the ignored warning fires only in the other case.
     import types
     monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_RS", "token_k3")
     monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", as_old)
@@ -308,8 +297,8 @@ def test_rollout_rs_warning_follows_bypass_support(monkeypatch, as_old):
 @pytest.mark.parametrize("options,thresholds", RS)
 @pytest.mark.parametrize("bypass", [False, True])
 def test_reported_kl_leaves_out_rejected_tokens(options, thresholds, bypass):
-    # mean_kl: per-row sum of KL over kept tokens / all completion tokens of that row (the loss
-    # normaliser's count), averaged over the rows that have tokens.
+    # mean_kl: per-row sum of KL over kept tokens divided by all completion tokens of that row (the loss normaliser's
+    # count), averaged over rows that have tokens.
     ref, new, old, sampling, mask, adv = _data(5)
     parsed = rr.grpo_parse_rollout_rs(options, thresholds)
     if bypass:

@@ -23,6 +23,8 @@ from torch._dynamo.utils import counters
 
 import unsloth_zoo.fused_losses.cross_entropy_loss as ce
 
+pytestmark = pytest.mark.usefixtures("compile_enabled")
+
 V, H = 256, 48
 
 

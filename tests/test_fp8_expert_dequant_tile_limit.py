@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A coarse FP8 expert scale derives a Triton tile larger than Triton allows.
-
-weight_dequant_block takes one BLOCK_SIZE and materialises a
-BLOCK_SIZE x BLOCK_SIZE tile, so BLOCK_SIZE is legal only up to 1024. The
-block size is derived from the scale granularity, and a per-expert per-tensor
-scale (p == q == 1) derives BLOCK_SIZE = M. At M = 4096 that is a 16777216
-element tile and the kernel fails to compile, which is how
-mistralai/Mistral-Small-4-119B-2603 raised
-"numel (16777216) exceeds triton maximum tensor numel (1048576)".
-
-The Triton helper must decline those layouts so the caller's vectorized
-fallback answers. Finer scales must keep taking the Triton path unchanged.
-"""
+"""weight_dequant_block tiles BLOCK_SIZE x BLOCK_SIZE, legal only up to 1024; per-tensor expert scales (p == q == 1)
+derive BLOCK_SIZE = M, so the Triton helper must decline them to the vectorized fallback (Mistral-Small-4-119B-2603
+hit numel 16777216 > 1048576); finer scales keep the Triton path."""
 
 from __future__ import annotations
 
@@ -41,12 +31,9 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 
 
 def _needs_the_triton_kernel():
-    """Skip rather than fail when the Triton kernel is not importable: the
-    helper returns None for every input then, so the tests below blame the guard
-    for a missing unsloth dependency. Measured on transformers 4.57.6 with
-    unsloth installed --no-deps: six failures, none about the guard. Inside the
-    test, not a marker, so a GPU-less runner does not import unsloth to decide
-    what the CUDA gate already settled."""
+    """Skip, not fail, when unsloth.kernels.fp8 is not importable: the helper then returns None for every input and
+    blames the guard (transformers 4.57.6, unsloth installed --no-deps); checked inside the test, not as a marker, so
+    GPU-less runners never import unsloth."""
     try:
         from unsloth.kernels.fp8 import weight_dequant_block  # noqa: F401
     except Exception as e:  # noqa: BLE001
@@ -59,12 +46,8 @@ def _weight(E, M, N, device):
 
 @pytest.mark.parametrize("M,N", [(2048, 2048), (4096, 4096), (1088, 1088)])
 def test_per_tensor_expert_scale_declines_instead_of_failing_to_compile(M, N):
-    """p == q == 1 derives BLOCK_SIZE = M; above 1024 the tile is illegal.
-
-    Decided before any kernel launch, so this needs no GPU. 1088 is the first
-    multiple of 64 past the limit, which pins the boundary rather than a round
-    number well clear of it.
-    """
+    """p == q == 1 derives BLOCK_SIZE = M, illegal above 1024; decided before any kernel launch so no GPU is needed;
+    1088 is the first multiple of 64 past the limit, pinning the boundary."""
     limit = F._triton_max_tensor_numel()
     assert M * N > limit
     w = _weight(2, M, N, "cpu")
@@ -77,9 +60,7 @@ def test_per_tensor_expert_scale_declines_instead_of_failing_to_compile(M, N):
 
 @requires_cuda
 def test_a_tile_exactly_at_the_limit_is_still_taken():
-    """1024 x 1024 is exactly the cap, so it is legal and must not be declined.
-    The guard is `>`, and an off-by-one to `>=` would silently cost the fast
-    path here."""
+    """1024 x 1024 is exactly the cap and must not be declined; the guard is `>`, and an off-by-one to `>=` would silently cost the fast path."""
     _needs_the_triton_kernel()
     M = N = 1024
     torch.manual_seed(0)
@@ -92,22 +73,17 @@ def test_a_tile_exactly_at_the_limit_is_still_taken():
 
 
 def test_the_limit_matches_tritons_own():
-    """Read out of Triton rather than compared with our own literal, which was
-    a tautology. The check is in the Python frontend
-    (triton/_utils.validate_block_shape), so a ROCm wheel reports the same
-    value; if one ever did not, this fails here and not on that hardware."""
+    """Reads Triton's limit, not our literal (a tautology); ROCm wheels match via validate_block_shape."""
     triton_language = pytest.importorskip("triton.language")
     theirs = getattr(triton_language, "TRITON_MAX_TENSOR_NUMEL", None)
-    # Not `is None`: with no GPU visible unsloth stubs Triton, and every stub
-    # attribute is a placeholder object rather than a number.
+    # Not `is None`: with no GPU unsloth stubs Triton, and its attributes are placeholder objects.
     if type(theirs) is not int:
         pytest.skip("Triton is stubbed or does not export TRITON_MAX_TENSOR_NUMEL")
     assert F._triton_max_tensor_numel() == theirs
 
 
 def test_the_fallback_is_used_when_triton_cannot_be_read(monkeypatch):
-    """Absent or broken Triton must leave the literal in place rather than
-    raising: the zoo imports on machines with no Triton at all (macOS arm64)."""
+    """Missing or broken Triton must keep the literal, not raise; macOS arm64 has no Triton at all."""
     monkeypatch.setattr(F, "_TRITON_MAX_TENSOR_NUMEL_RESOLVED", None)
 
     real_import_module = importlib.import_module
@@ -124,9 +100,7 @@ def test_the_fallback_is_used_when_triton_cannot_be_read(monkeypatch):
 @requires_cuda
 @pytest.mark.parametrize("block", [128, 256, 512, 1024])
 def test_block_scales_still_take_the_triton_path(block):
-    """Every scale granularity that fits the tile limit must still reach the
-    Triton kernel, so the guard cannot have narrowed the fast path. Returning
-    None here would be a silent demotion to the slower fallback."""
+    """Every scale granularity that fits the tile limit must reach Triton, or it silently falls back."""
     _needs_the_triton_kernel()
     M = N = 2048
     torch.manual_seed(0)
@@ -157,9 +131,7 @@ def test_caller_falls_back_and_returns_correct_values(M, N):
     out = F._dequantize_full_expert_weights(w, s, torch.bfloat16)
     assert out is not None, "no path answered a per-expert per-tensor FP8 scale"
     assert tuple(out.shape) == (E, M, N) and out.dtype == torch.bfloat16
-    # The fallback multiplies in the target dtype, so it rounds once where a
-    # float32 reference rounds twice; compare at bfloat16's own resolution
-    # rather than pinning one multiplication order.
+    # Fallback rounds once (in target dtype), so compare at bfloat16 resolution, not one multiply order.
     expected = w.to(torch.float32) * s.to(torch.float32)
     assert torch.allclose(out.to(torch.float32), expected, rtol=8e-3, atol=1e-8), (
         f"max abs error {(out.to(torch.float32) - expected).abs().max().item()}"
@@ -168,8 +140,7 @@ def test_caller_falls_back_and_returns_correct_values(M, N):
 
 @requires_cuda
 def test_finer_scales_still_go_through_triton_and_agree():
-    """The Triton path must still be taken for a normal 128-block scale, and
-    must agree with the vectorized maths."""
+    """A normal 128-block scale must still take the Triton path and agree with the vectorized maths."""
     _needs_the_triton_kernel()
     torch.manual_seed(0)
     E, M, N, block = 2, 1024, 1024, 128
@@ -185,16 +156,8 @@ def test_finer_scales_still_go_through_triton_and_agree():
 
 
 def test_a_per_expert_scalar_scale_is_broadcast_not_materialized(monkeypatch):
-    """The fallback this guard routes to must not expand an (E, 1, 1) scale to
-    (E, M, N) first. At the cited Mistral layout that second full-size tensor
-    measured an extra 4.00 GiB, which is how an OOM replaces the crash the
-    guard was added to avoid.
-
-    Asserted on the call rather than on peak memory: the caching allocator
-    reuses freed blocks, so a small fixture can expand the scale and still show
-    no rise, which is how the first version of this test passed with the fix
-    reverted.
-    """
+    """Broadcast the (E, 1, 1) scale, never expand to (E, M, N): at the Mistral layout that extra 4.00 GiB turns the
+    crash into an OOM; assert on the call, as allocator reuse hides peak memory."""
     E, M, N = 4, 256, 512
     w = torch.zeros(E, M, N).to(torch.float8_e4m3fn)
     s = torch.full((E, 1, 1), 0.05)

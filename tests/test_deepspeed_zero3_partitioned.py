@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""DeepSpeed ZeRO-3 init partitions every weight at load into a 1-D empty placeholder, the real
-shape in `ds_shape` (unsloth#225). Rebuilding the embedding / lm_head around it asserted 2-D,
-and the untrained-token check reduced over a dimension it no longer has."""
+"""Tests DeepSpeed ZeRO-3 partitioned weights: 1-D empty placeholders with the real shape in ds_shape (unsloth issue
+225); embedding and lm_head rebuilds must not assume 2-D."""
 
 import contextlib
 import enum
@@ -147,8 +146,8 @@ def live_zero3(monkeypatch):
 
 @pytest.mark.parametrize("factory", ["_eager_during_decode", "eager_under_zero3"])
 def test_compiled_regions_run_eager_under_zero3(live_zero3, factory):
-    """Inside torch.compile ZeRO-3's parameter getter returns the empty placeholder, so Unsloth's
-    compiled regions (generated modules, patch_function, temporary patches) run eager under it."""
+    """Under torch.compile ZeRO-3's getter returns the empty placeholder, so Unsloth's compiled regions (generated
+    modules, patch_function, temporary patches) run eager."""
     from unsloth_zoo.temporary_patches import utils
 
     calls = []

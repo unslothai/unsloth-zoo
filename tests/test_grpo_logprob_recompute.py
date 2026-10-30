@@ -14,15 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""chunked_hidden_states_selective_log_softmax_recompute against a float64 full-logits oracle.
-
-Like the plain chunked function, it takes the softmax in float32 whatever the input dtype, so the
-oracle tolerances are float32 ones, and the plain function's own error is the bar to stay under.
-
-The function's source is executed on its own in a namespace holding only torch, os, typing and
-math, the way unsloth copies these helpers into generated trainers, so a hidden dependency on
-rl_replacements module globals fails here.
-"""
+"""chunked_hidden_states_selective_log_softmax_recompute vs float64 oracle; softmax runs in float32 whatever the input
+dtype, so float32 tolerances, with the plain chunked function error as the bar; source runs standalone with only
+torch, os, typing, math."""
 import inspect
 import math
 import os
@@ -185,8 +179,8 @@ def test_frozen_head_and_no_grad():
 
 
 def test_saves_no_logits_for_backward():
-    # The plain chunked function keeps rows x vocab logits per chunk alive for backward; this one
-    # must keep only its inputs plus per-row statistics, whatever the vocabulary.
+    # Unlike the plain chunked function (rows x vocab logits kept per chunk for backward), this one saves only its
+    # inputs and per-row statistics, whatever the vocabulary.
     function = _standalone()
     vocab, hidden, rows = 4096, 8, 64
     head = torch.randn(vocab, hidden, dtype = torch.float64, requires_grad = True)
@@ -201,12 +195,13 @@ def test_saves_no_logits_for_backward():
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         out = function(states, head, index, 4, return_entropy = True)
     assert max(saved) <= vocab * hidden, saved
-    assert sum(saved) <= vocab * hidden + rows * hidden + 4 * rows, saved
+    # Per-row statistics plus the kept-row index and its one-element count.
+    assert sum(saved) <= vocab * hidden + rows * hidden + 5 * rows + 1, saved
     sum(x.sum() for x in out).backward()
 
     saved.clear()
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-        rr.chunked_hidden_states_selective_log_softmax(states, head, index, 4)
+        rr.chunked_hidden_states_selective_log_softmax(states, head, index, 4, fused_linear = False)
     assert sum(saved) >= rows * vocab
 
 
@@ -223,7 +218,10 @@ def test_compiled_kernels_match_eager():
     leaves = [states, head, head_bias]
     results = []
     for function in (eager, compiled):
-        out = function(states, head, index, 3, 0.5, 0.0, 4.0, 0.9, lm_head_bias = head_bias, return_entropy = True)
+        out = function(
+            states, head, index, 3, 0.5, 0.0, 4.0, 0.9, lm_head_bias = head_bias, return_entropy = True,
+            fused_linear = False,
+        )
         results.append(list(out) + list(_grads(out, weights, entropy_weights, leaves)))
     # Engaged, not silently fallen back to eager.
     assert compiled._use_compiled
@@ -233,7 +231,8 @@ def test_compiled_kernels_match_eager():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "half-precision autocast on CUDA")
 @pytest.mark.parametrize("rows, head_dtype", [(49, torch.float32), (300, torch.bfloat16), (17, torch.float16)])
-def test_cuda_autocast_matches_plain_function(rows, head_dtype):
+@pytest.mark.parametrize("fused_linear", [True, False])
+def test_cuda_autocast_matches_plain_function(rows, head_dtype, fused_linear):
     amp = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation = False) else torch.float16
     if head_dtype == torch.bfloat16 and amp != torch.bfloat16:
         pytest.skip("no bfloat16")
@@ -246,31 +245,35 @@ def test_cuda_autocast_matches_plain_function(rows, head_dtype):
     results = []
     for function in (rr.chunked_hidden_states_selective_log_softmax, rr.chunked_hidden_states_selective_log_softmax_recompute):
         with torch.autocast("cuda", dtype = amp):
-            out = function(states, head, index, 16, 0.0, 0.0, 30.0, 0.8)
+            if function is rr.chunked_hidden_states_selective_log_softmax_recompute:
+                out = function(states, head, index, 16, 0.0, 0.0, 30.0, 0.8, fused_linear = fused_linear)
+            else:
+                out = function(states, head, index, 16, 0.0, 0.0, 30.0, 0.8)
         grads = torch.autograd.grad((out * weights).sum(), [states, head])
         results.append([out.float()] + [g.float() for g in grads])
-    assert rr.chunked_hidden_states_selective_log_softmax_recompute._use_compiled
+    if not fused_linear:
+        assert rr.chunked_hidden_states_selective_log_softmax_recompute._use_compiled
     for a, b in zip(*results):
         assert a.shape == b.shape
         assert float((a - b).abs().max() / b.abs().max()) < 1e-2
 
 
 def test_cached_function_survives_a_missing_compiled_flag():
-    # A monkeypatch of _use_compiled on the module function, undone after the autograd function
-    # was cached, deletes the flag; later calls must fall back to the default instead of raising.
+    # A monkeypatch of _use_compiled, undone after the autograd function is cached, deletes the flag; later calls must
+    # fall back to the default instead of raising.
     function = _standalone()
     head, states, _, index, weights, _ = _inputs(rows = 6, bias = False, seed = 3)
-    function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0)
+    function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0, fused_linear = False)
     assert getattr(function, "_autograd_function", None) is not None
     del function._use_compiled
-    out = function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0)
+    out = function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0, fused_linear = False)
     (out * weights).sum().backward()
     assert out.isfinite().all()
 
 
 def _fp16_head_case(function, head_dtype = torch.float16):
-    # Three chunks of two rows; each chunk's head gradient (2 x 1.5 x 32768 = 98304) and the running
-    # sum leave the fp16 range before the last chunk's opposite sign cancels half of it.
+    # Three 2-row chunks: each chunk's head gradient (2 x 1.5 x 32768 = 98304) and the running sum leave the fp16 range
+    # before the last chunk's opposite sign cancels half of it.
     hidden = torch.full((1, 6, 1), 1.5, dtype = torch.float16)
     head = torch.zeros((2, 1), dtype = head_dtype, requires_grad = True)
     index = torch.zeros((1, 6), dtype = torch.long)
@@ -314,8 +317,7 @@ def test_bf16_hidden_grad_with_fp16_head_does_not_overflow():
 
 
 def test_cold_outer_fullgraph_compile():
-    # A fresh process, so nothing has called the function yet: it must build its autograd function
-    # at import, leaving a cold outer torch.compile(fullgraph = True) only the cached function to trace.
+    # Fresh process: the autograd function must be built at import so a cold outer torch.compile(fullgraph = True) has only the cached function to trace.
     import subprocess, sys, textwrap
     script = textwrap.dedent("""
         import torch
@@ -348,8 +350,8 @@ def test_cold_outer_fullgraph_compile():
 
 @pytest.mark.parametrize("compiled", [False, True])
 def test_fp32_head_under_fp16_autocast_does_not_nan(compiled):
-    # fp32 trainable head, fp16 autocast, loss scale 65536, hidden 4, two 512 row chunks with opposite
-    # upstream signs: each fp16 chunk product overflowed to +-inf before the float32 sum, leaving NaN.
+    # fp32 trainable head, fp16 autocast, loss scale 65536, hidden 4, two 512-row chunks with opposite upstream signs:
+    # each fp16 product overflowed to +-inf before the float32 sum, leaving NaN.
     function = _standalone(compiled = compiled)
     rows, hidden_size, vocab = 1024, 8, 64
     sign = torch.ones(rows)

@@ -13,10 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A deepcopied tiled MLP passes itself, not the closure-captured original, to TiledMLP.apply.
-
-Unsloth's DDP shim takes gradients for `mlp_module.parameters()`, so passing the original left the copy without grads.
-"""
+"""A deepcopied tiled MLP must pass itself, not the closure-captured original, to TiledMLP.apply, since the DDP shim
+takes grads for mlp_module.parameters(); the original would leave the copy without grads."""
 import copy
 
 import pytest

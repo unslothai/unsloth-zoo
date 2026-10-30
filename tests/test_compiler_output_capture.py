@@ -108,8 +108,7 @@ def test_ignores_assigned_but_uncalled_target():
 
 
 def test_detects_capture_outputs_decorated_forward():
-    # Targets built indirectly (e.g. Zamba2 get_layers) never match the
-    # assignment regex, but the decorator alone means hooks run inside.
+    # Targets built indirectly (e.g. Zamba2 get_layers) never match the assignment regex; the @capture_outputs decorator alone still makes hooks run inside.
     init = "def __init__(self, config):\n    self.layers = self.get_layers(config)\n"
     source = "@capture_outputs\ndef forward(self, x):\n    return x\n"
     assert calls_output_capture_target(init, source, {"FakeRouter"})

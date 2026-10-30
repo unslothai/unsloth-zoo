@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Device gates must read every visible GPU (or the current one), never device 0 alone.
-
-CPU-only: torch.cuda is spoofed per test. Covers bf16 for GC offload buffers, the
-pre-Turing compile switch, tiled-MLP free memory, the per-device AMD arch / aiter
-caches (set_device switch), the rocminfo mask fallback and the llama.cpp asset target.
-"""
+"""Device gates must read every visible GPU or the current one, never device 0 alone; CPU-only with torch.cuda spoofed,
+covering GC bf16 buffers, pre-Turing compile, tiled-MLP memory, AMD caches, rocminfo masks and llama.cpp assets."""
 import ast
 import importlib.machinery
 import inspect
@@ -128,7 +124,7 @@ def test_visible_cuda_capabilities_partial_scan_keeps_readable_cards(monkeypatch
     assert device_type._visible_cuda_capabilities() == expected
 
 
-# C2: pre-Turing compile switch --------------------------------------------------------
+# C2: pre-Turing LM-head fusion switch --------------------------------------------------------
 
 def _old_cuda_arch_version(caps, current, cuda_caps):
     """Run compiler.py's module-level capability block against spoofed devices."""
@@ -146,15 +142,165 @@ def _old_cuda_arch_version(caps, current, cuda_caps):
     return namespace["OLD_CUDA_ARCH_VERSION"]
 
 
+def _old_cuda_arch_indices(caps, current, cuda_caps):
+    import unsloth_zoo.compiler as compiler
+    tree = ast.parse(inspect.getsource(compiler))
+    block = next(
+        node for node in tree.body
+        if isinstance(node, ast.If) and "OLD_CUDA_ARCH_INDICES" in ast.unparse(node)
+        and "get_device_capability" in ast.unparse(node)
+    )
+    cuda_caps(caps, current)
+    namespace = {"__name__": "unsloth_zoo.compiler", "__package__": "unsloth_zoo",
+                 "torch": torch, "DEVICE_TYPE": "cuda"}
+    exec(compile(ast.Module(body = [block], type_ignores = []), "compiler_block", "exec"), namespace)
+    return namespace["OLD_CUDA_ARCH_INDICES"]
+
+
 @pytest.mark.parametrize("current", [0, 1])
-@pytest.mark.parametrize("caps", [[(8, 0), (6, 1)], [(6, 1), (8, 0)]])
-def test_compile_switch_sees_any_old_device(cuda_caps, caps, current):
-    assert _old_cuda_arch_version(caps, current, cuda_caps) is True
+@pytest.mark.parametrize("caps", [[(8, 0), (6, 1)], [(6, 1), (8, 0)], [(8, 9), (7, 0)]])
+def test_lm_head_fusion_switch_follows_the_current_device(cuda_caps, caps, current):
+    # An idle older card beside the current one must not turn the LM-head fusion off.
+    major, minor = caps[current]
+    assert _old_cuda_arch_version(caps, current, cuda_caps) is ((major <= 7) and (minor < 5))
 
 
 def test_compile_switch_homogeneous_unchanged(cuda_caps):
     assert _old_cuda_arch_version([(8, 0), (8, 0)], 1, cuda_caps) is False
     assert _old_cuda_arch_version([(7, 0)], 0, cuda_caps) is True
+
+
+def test_lm_head_fusion_records_every_old_card(cuda_caps):
+    # sm89 current beside an sm61 card: the rewrite installs and the sm61 index is recorded, so a forward whose LM head lands there skips Inductor and CCE.
+    assert _old_cuda_arch_version([(8, 9), (6, 1)], 0, cuda_caps) is False
+    assert _old_cuda_arch_indices([(8, 9), (6, 1)], 0, cuda_caps) == frozenset({1})
+    assert _old_cuda_arch_indices([(8, 9)], 0, cuda_caps) == frozenset()
+    assert _old_cuda_arch_indices([(8, 0), (8, 0)], 1, cuda_caps) == frozenset()
+
+
+def test_an_unreadable_card_counts_as_old(cuda_caps, monkeypatch):
+    cuda_caps([(8, 9), (8, 9)], 0)
+
+    def capability(device = None):
+        if device == 1:
+            raise RuntimeError("unreadable")
+        return (8, 9)
+
+    import unsloth_zoo.compiler as compiler
+    tree = ast.parse(inspect.getsource(compiler))
+    block = next(
+        node for node in tree.body
+        if isinstance(node, ast.If) and "OLD_CUDA_ARCH_INDICES" in ast.unparse(node)
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    namespace = {"__name__": "unsloth_zoo.compiler", "__package__": "unsloth_zoo",
+                 "torch": torch, "DEVICE_TYPE": "cuda"}
+    exec(compile(ast.Module(body = [block], type_ignores = []), "compiler_block", "exec"), namespace)
+    assert namespace["OLD_CUDA_ARCH_INDICES"] == frozenset({1})
+
+
+def test_lm_head_on_old_cuda_arch_reads_the_weight_device(monkeypatch):
+    import unsloth_zoo.compiler as compiler
+    on = lambda device: types.SimpleNamespace(device = device)
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset({1}))
+    assert compiler.lm_head_on_old_cuda_arch(on(torch.device("cuda", 1))) is True
+    assert compiler.lm_head_on_old_cuda_arch(on(torch.device("cuda", 0))) is False
+    assert compiler.lm_head_on_old_cuda_arch(on(torch.device("cpu"))) is False
+    assert compiler.lm_head_on_old_cuda_arch(None) is False
+    # No old card visible (one-GPU and homogeneous hosts): never true.
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset())
+    assert compiler.lm_head_on_old_cuda_arch(on(torch.device("cuda", 1))) is False
+
+
+def test_the_fused_lm_head_templates_consult_the_head_device():
+    import unsloth_zoo.compiler as compiler
+    templates = [compiler.cross_entropy_replacement_1, compiler.cross_entropy_replacement_2,
+                 compiler.cross_entropy_replacement_3]
+    for template in templates:
+        calls = template.count("loss = unsloth_fused_ce_loss(")
+        assert calls == template.count(
+            "torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),"
+        )
+        assert template.count("(UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY)") == template.count(
+            "(UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight)"
+        )
+        assert calls >= 1
+    assert "from unsloth_zoo.compiler import lm_head_on_old_cuda_arch" in compiler._disabled_sdpa_code
+
+
+
+def _adapter_dispatch(monkeypatch, device, unshard_to = None, **kwargs):
+    """The torch_compile value the shared adapter hands the CE kernel for an LM head on device; unshard_to is the device
+    FSDP2 unshards the weight onto, since CPUOffloadPolicy keeps the shard on CPU."""
+    from unsloth_zoo.fused_losses import forward_adapter as adapter
+    from unsloth_zoo.fused_losses import cross_entropy_loss as ce
+    seen = []
+
+    def spy(**call):
+        bound = inspect.signature(ce.unsloth_fused_ce_loss).bind(**call)
+        bound.apply_defaults()
+        seen.append(bound.arguments["torch_compile"])
+        return 1.0
+
+    monkeypatch.setattr(adapter, "unsloth_fused_ce_loss", spy)
+    def unshard(head):
+        if unshard_to is not None:
+            head.weight = types.SimpleNamespace(device = unshard_to)
+
+    monkeypatch.setattr(adapter, "unsloth_fsdp_unshard", unshard)
+    head = types.SimpleNamespace(weight = types.SimpleNamespace(device = device))
+    adapter.unsloth_fused_lm_head_loss(None, head, None, **kwargs)
+    return seen[0]
+
+
+def test_the_shared_adapter_skips_inductor_for_a_head_on_an_old_card(monkeypatch):
+    # AST-rewritten forwards (GPT-Neo, CLVP) and the import hook call the adapter, not the regex templates, so it must
+    # ask the per-head question; a device_map head on a Pascal card would still ask Inductor for chunked CE.
+    import unsloth_zoo.compiler as compiler
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset({1}))
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 1)) is False
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 1), torch_compile = True) is False
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 0)) is True
+    # An explicit disable is never turned back on.
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 0), torch_compile = False) is False
+    # One-GPU and homogeneous hosts: no old card, the default is untouched.
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset())
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 1)) is True
+
+
+def test_the_shared_adapter_checks_the_head_after_fsdp_unshards_it(monkeypatch):
+    # With FSDP2 CPUOffloadPolicy the sharded head weight sits on CPU until unshard gathers it onto the compute card, so
+    # the device must be asked of the unsharded weight.
+    import unsloth_zoo.compiler as compiler
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset({1}))
+    cpu = torch.device("cpu")
+    assert _adapter_dispatch(monkeypatch, cpu, unshard_to = torch.device("cuda", 1)) is False
+    assert _adapter_dispatch(monkeypatch, cpu, unshard_to = torch.device("cuda", 0)) is True
+
+
+def test_ast_rewritten_lm_head_forwards_go_through_the_guarded_adapter():
+    # Real HF forwards whose fused call the AST rewriter splices must call the adapter, which holds the per-head gate,
+    # not pass their own torch_compile that bypasses it.
+    import importlib
+    import textwrap
+    import unsloth_zoo.compiler as compiler
+    rewritten = []
+    for name, cls_name in [("opt", "OPTForCausalLM"), ("biogpt", "BioGptForCausalLM"),
+                           ("xglm", "XGLMForCausalLM"), ("clvp", "ClvpForCausalLM"),
+                           ("gpt_neo", "GPTNeoForCausalLM")]:
+        try:
+            module = importlib.import_module(f"transformers.models.{name}.modeling_{name}")
+            cls = getattr(module, cls_name)
+            source = textwrap.dedent(inspect.getsource(cls.forward))
+        except Exception:
+            continue
+        new, route, _ = compiler.fused_lm_head_forward(cls_name, cls, cls.__module__, source)
+        if route == "ast":
+            rewritten.append(cls_name)
+            assert "unsloth_fused_lm_head_loss(" in new
+            assert "torch_compile" not in new
+    if not rewritten:
+        pytest.skip("no checked HF forward takes the AST route on this transformers")
 
 
 # Z1: tiled-MLP free memory ------------------------------------------------------------
@@ -256,8 +402,7 @@ def test_aiter_choice_follows_set_device(amd_host):
 
 
 def test_single_hip_device_runs_aiter_discovery_once(monkeypatch):
-    # One HIP device keeps the plain cache: the no-argument setup gate and the flash-attn lookup
-    # must share one get_amd_attention_implementation entry.
+    # One HIP device keeps the plain cache: the no-argument setup gate and the flash-attn lookup must share one get_amd_attention_implementation entry.
     monkeypatch.setattr(device_type, "is_hip", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)

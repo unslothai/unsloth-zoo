@@ -14,25 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_unsloth_get_batch_samples against the batch shape TRL's GRPO trainer produces.
-
-GRPOTrainer passes `data_collator=identity`, so a batch is whatever the sampler
-handed the collator: a LIST of dataset rows, never a mapping. The pre-#1217 gate
-was `"labels" in batch_samples[0]`, and `in` on a list of dicts is simply False,
-so the counting body was skipped and GRPO trained. #1217 rewrote that membership
-test as `batch_samples[0].get("labels")`, which raises
-
-    AttributeError: 'list' object has no attribute 'get'
-
-on every GRPO step, on TRL 0.22.2 and on TRL 1.13.0 alike.
-
-What #1217 bought with `.get` must survive: `in` cannot tell a tensor `labels`
-from a non-tensor one, so a mapping carrying list labels used to enter the try
-and die as RuntimeError. The `.get` plus the `.ndim` probe declines to count it
-instead. Both halves are pinned below.
-
-CPU only, no model downloads.
-"""
+"""GRPO batches are lists of rows (identity collator): the .get check from unsloth-zoo 1217 raised AttributeError on TRL
+0.22.2 and 1.13.0; .get plus .ndim declines non-tensor labels because in cannot tell tensor from non-tensor labels;
+CPU only."""
 
 import inspect
 
@@ -110,11 +94,7 @@ def _call(trainer, batches):
 # ---------------------------------------------------------------------------
 
 def test_grpo_identity_collator_batch_is_a_list_of_dicts():
-    """Pin the shape the rest of this file asserts against, off TRL itself.
-
-    Same on 0.22.x and on 1.x: GRPOTrainer builds with `data_collator=identity`,
-    so the collator returns the sampler's list untouched.
-    """
+    """Pins that GRPOTrainer's data_collator=identity hands the sampler's list of dicts through untouched, the same on TRL 0.22.x and 1.x."""
     trl = pytest.importorskip("trl")
     torch = pytest.importorskip("torch")
     from trl.trainer.grpo_trainer import GRPOTrainer, identity
@@ -133,12 +113,8 @@ def test_grpo_identity_collator_batch_is_a_list_of_dicts():
 
 
 def test_a_list_batch_is_not_countable_and_does_not_raise():
-    """The regression itself.
-
-    On main this raises AttributeError: 'list' object has no attribute 'get',
-    which is what every GRPO user sees. Pre-#1217, `"labels" in batch_samples[0]`
-    was False on a list and the run trained.
-    """
+    """Regression: a list batch raised AttributeError ('list' object has no attribute 'get') on every GRPO step; before
+    unsloth-zoo 1217 the in test was False and training ran."""
     pytest.importorskip("torch")
     batches = [_grpo_rows(), _grpo_rows()]
     samples, count = _call(_fake_trainer(_causal_model()), batches)
@@ -147,8 +123,8 @@ def test_a_list_batch_is_not_countable_and_does_not_raise():
 
 
 def test_a_list_batch_is_not_countable_on_the_widened_route_either():
-    """#1217 widened WHO is eligible to compute_loss_func without **kwargs. Both
-    routes read batch_samples[0] through the same expression, so both crashed."""
+    """unsloth-zoo 1217 widened which trainers may use compute_loss_func without **kwargs; that route reads
+    batch_samples[0] the same way, so it crashed on lists too."""
     pytest.importorskip("torch")
     trainer = _fake_trainer(
         _causal_model(), accepts = False, compute_loss_func = lambda *a, **k: None,
@@ -163,8 +139,7 @@ def test_a_list_batch_is_not_countable_on_the_widened_route_either():
     [{"labels": [0, 1, 2]}],              # a row that does carry the key
 ])
 def test_no_list_batch_shape_reaches_the_counting_body(batch):
-    """`x["labels"]` in the loop would fail on a list exactly as `.get` does, so
-    the guard has to hold for every list, including one whose rows carry labels."""
+    """The guard must hold for every list batch, even rows carrying labels: x['labels'] in the loop would fail on a list just as .get does."""
     pytest.importorskip("torch")
     _, count = _call(_fake_trainer(_causal_model()), [batch])
     assert count is None
@@ -175,8 +150,7 @@ def test_no_list_batch_shape_reaches_the_counting_body(batch):
 # ---------------------------------------------------------------------------
 
 def test_a_mapping_batch_still_counts_exactly_what_it_counted_before():
-    """Control. A normal causal batch is a mapping of tensors and must still be
-    counted, to the same number: 2 rows x 5 shifted targets, minus 3 masked."""
+    """Control: a mapping of tensors must still be counted to the same number: 2 rows x 5 shifted targets minus 3 masked."""
     torch = pytest.importorskip("torch")
     ids = torch.randint(0, 11, (2, 6), generator = torch.Generator().manual_seed(7))
     labels = ids.clone()
@@ -186,27 +160,16 @@ def test_a_mapping_batch_still_counts_exactly_what_it_counted_before():
 
 
 def test_a_mapping_with_non_tensor_labels_declines_instead_of_raising():
-    """Control for what #1217 bought.
-
-    `"labels" in x` is True here, so the pre-#1217 spelling entered the try,
-    `labels[..., 1:]` blew up on a list and the except re-raised it as
-    RuntimeError. The `.get` plus `.ndim` probe declines to count instead.
-
-    Spelling the guard as a membership test again, `"labels" in batch_samples[0]`,
-    turns this test red with RuntimeError while every other test here stays green.
-    """
+    """A mapping with non-tensor labels must be declined, not counted: a 'labels' in guard would enter the try, where
+    labels[..., 1:] fails and is re-raised as RuntimeError; .get plus .ndim declines it."""
     pytest.importorskip("torch")
     _, count = _call(_fake_trainer(_causal_model()), [{"labels": [[1, 2, 3]]}])
     assert count is None, "labels with no .ndim must be declined, not counted"
 
 
 def test_a_mapping_that_is_not_a_dict_subclass_still_counts():
-    """Control for the shape of the guard itself.
-
-    transformers hands collated batches back as BatchEncoding, a UserDict, so
-    `isinstance(x, dict)` is False for it. The guard must ask for a Mapping, or
-    every DataCollatorForLanguageModeling batch silently stops being counted.
-    """
+    """The guard must accept a Mapping, not isinstance dict: transformers BatchEncoding is a UserDict, and rejecting it
+    would silently stop DataCollatorForLanguageModeling batches being counted."""
     torch = pytest.importorskip("torch")
     from transformers.tokenization_utils_base import BatchEncoding
 

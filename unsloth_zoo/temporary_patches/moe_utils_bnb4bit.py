@@ -343,6 +343,10 @@ _LOGGED_BACKENDS = set()
 
 
 def _log_moe_bnb4bit_backend_once(experts_module, message: str):
+    # Not while tracing: Dynamo guards on the set, so the first traced add makes gradient checkpoint recompute pick a
+    # different graph (CheckpointError on first backward).
+    if torch.compiler.is_compiling():
+        return
     key = (id(type(experts_module)), message)
     if key in _LOGGED_BACKENDS:
         return
@@ -753,9 +757,8 @@ pass
 
 
 # ============================================================================
-# PEFT LoRA support for stacked-MoE bnb 4-bit experts.
-# Expose a Params4bit's logical 3-D shape to ParamWrapper and merge/unmerge via a
-# dequant -> add -> requant cycle so merge_and_unload() works on packed 4-bit storage.
+# PEFT LoRA support for stacked-MoE bnb 4-bit experts: exposes the logical 3-D shape to ParamWrapper; merge/unmerge runs
+# dequant, add, requant so merge_and_unload() works on packed storage.
 # ============================================================================
 
 class _ParamShapeProxy:
@@ -776,8 +779,8 @@ class _ParamShapeProxy:
 
     @property
     def dtype(self):
-        # Surface the pre-quant compute dtype so PEFT's `tensor.to(param.dtype)`
-        # casts don't truncate bf16 LoRA deltas to the uint8 packed storage dtype.
+        # Report the pre-quant compute dtype as param.dtype so PEFT's tensor.to(param.dtype) casts do not truncate bf16
+        # LoRA deltas to the uint8 packed storage dtype.
         quant_state = getattr(self._param, "quant_state", None)
         qs_dtype = getattr(quant_state, "dtype", None) if quant_state is not None else None
         if qs_dtype is not None and (qs_dtype.is_floating_point or qs_dtype.is_complex):
@@ -1090,7 +1093,9 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     from copy import deepcopy
 
     class _PerExpertStackDeserialize(ConversionOps):
-        def __init__(self, base_sources, anchored_sources, original_ops):
+        def __init__(self, base_sources, anchored_sources, original_ops, hf_quantizer = None):
+            # transformers >= 5.21 keeps checkpoint dtypes only for converters whose op has `hf_quantizer`.
+            self.hf_quantizer = hf_quantizer
             self.base_sources = base_sources          # e.g. ["mlp.experts.*.gate_proj.weight", ...]
             self.anchored_sources = anchored_sources  # same, "$"-anchored (collection keys)
             self.original_ops = original_ops          # model's ops, for unquantized fallback
@@ -1251,7 +1256,8 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
         them, replicate the model's ops so unquantized checkpoints are untouched.
         """
 
-        def __init__(self, base_source, anchored_source, original_ops):
+        def __init__(self, base_source, anchored_source, original_ops, hf_quantizer = None):
+            self.hf_quantizer = hf_quantizer
             self.base_source = base_source
             self.anchored_source = anchored_source
             self.original_ops = original_ops
@@ -1294,10 +1300,8 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
             # Logical 3D shape for PEFT LoRA's ParamWrapper.get_param.
             if getattr(new_value, "quant_state", None) is not None:
                 new_value._original_shape = new_value.quant_state.shape
-                # Orientation is baked in at quantize time (converters run before
-                # the quant op, so supported saves are always model layout). A
-                # same-rank mismatch means an unsupported checkpoint layout that a
-                # transpose op cannot fix on packed data: fail loudly here.
+                # Orientation is baked in at quantize time (converters run before the quant op, so saves are model
+                # layout); a same-rank mismatch is unsupported and cannot be transposed, so fail loudly.
                 try:
                     expected = tuple(model.get_parameter(full_layer_name).shape)
                 except Exception:
@@ -1321,8 +1325,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     for conv in model_conversions:
         if not isinstance(conv, WeightConverter):
             continue
-        # Single-target only: a twin returns target_patterns[0] alone, so a
-        # many-to-many mapping would leave its remaining targets unloaded.
+        # Single-target only: a twin returns target_patterns[0] alone, so a many-to-many mapping would leave its remaining targets unloaded.
         if len(conv.target_patterns) != 1:
             continue
         target = conv.target_patterns[0]
@@ -1338,7 +1341,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     target_patterns=target,
                     operations=[
                         _PerExpertStackDeserialize(
-                            base_sources, anchored_sources, deepcopy(conv.operations)
+                            base_sources, anchored_sources, deepcopy(conv.operations), hf_quantizer,
                         )
                     ],
                 )
@@ -1347,10 +1350,9 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
             len(conv.source_patterns) == 1
             and conv.source_patterns[0].endswith(("gate_up_proj", "down_proj"))
         ):
-            # Fused passthrough converter (e.g. qwen3_vl_moe's Transpose). The
-            # model converter precedes appended quantizer conversions and matching
-            # stops at the first hit, so without this twin a fused prequantized
-            # checkpoint feeds packed uint8 into the model's ops.
+            # Fused passthrough converter (e.g. qwen3_vl_moe's Transpose): the model converter precedes appended
+            # quantizer conversions and matching stops at the first hit, so without this twin packed uint8 reaches the
+            # model's ops.
             base = conv.source_patterns[0]
             anchored = base + "$"
             aux_sources = [base + suf for suf in _AUX_SUFFIXES]
@@ -1359,7 +1361,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     source_patterns=aux_sources + [anchored],
                     target_patterns=target,
                     operations=[
-                        _FusedExpertDeserialize(base, anchored, deepcopy(conv.operations))
+                        _FusedExpertDeserialize(base, anchored, deepcopy(conv.operations), hf_quantizer)
                     ],
                 )
             )
@@ -1498,7 +1500,7 @@ def patch_bnb4bit_keep_fused_experts():
 pass
 
 
-def _bnb4bit_split_fused_expert_conversions():
+def _bnb4bit_split_fused_expert_conversions(hf_quantizer = None):
     """Block-aligned `inter` splices packed bytes + absmax (bit-exact); else dequantize, concatenate, requantize."""
     from transformers.core_model_loading import WeightConverter, ConversionOps
     from transformers.quantizers.quantizers_utils import get_module_from_name
@@ -1526,7 +1528,9 @@ def _bnb4bit_split_fused_expert_conversions():
         return new_param
 
     class _SplitFusedExpertDeserialize(ConversionOps):
-        def __init__(self, bases, anchored):
+        def __init__(self, bases, anchored, hf_quantizer = None):
+            # Else transformers >= 5.21 (`HfQuantizer.get_new_dtype`) casts the fp32 quant_map / nested_absmax to the model dtype.
+            self.hf_quantizer = hf_quantizer
             self.bases = bases
             self.anchored = anchored
 
@@ -1630,7 +1634,7 @@ def _bnb4bit_split_fused_expert_conversions():
         converters.append(WeightConverter(
             source_patterns = aux + anchored,
             target_patterns = f"experts.{target}",
-            operations = [_SplitFusedExpertDeserialize(bases, anchored)],
+            operations = [_SplitFusedExpertDeserialize(bases, anchored, hf_quantizer)],
         ))
     return converters
 
@@ -1660,7 +1664,7 @@ def patch_bnb4bit_model_conversion_mapping():
                     logger.info(f"Unsloth: per-expert bnb4bit converters unavailable: {e}")
             # Unguarded: a failure must surface, not fall back to initialising packed stacks.
             if _model_keeps_swappable_fused_experts(model):
-                conversions = _bnb4bit_split_fused_expert_conversions() + conversions
+                conversions = _bnb4bit_split_fused_expert_conversions(hf_quantizer) + conversions
         return conversions
 
     patched_get_model_conversion_mapping._unsloth_moe_patched = True

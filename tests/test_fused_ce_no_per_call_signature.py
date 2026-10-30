@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth_fused_ce_loss must not call inspect.signature per call.
-
-Under torch.compile dynamo ignores functools.cache, so a per-call signature lookup is traced
-and graph-breaks every compiled model forward that reaches the fused loss.
-"""
+"""unsloth_fused_ce_loss must not call inspect.signature per call; dynamo ignores functools.cache, so the lookup graph-breaks compiled forwards."""
 import importlib
 
 import pytest

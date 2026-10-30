@@ -318,11 +318,19 @@ def _warm_moe_backend(model) -> None:
         backend_module = sys.modules.get(getattr(backend, "__module__", None) or "", moe_utils)
     except Exception:
         return
+    devices = _expert_devices(model)
     # The package module and the compiled-cache copy each cache their own probe results.
     for module in (moe_utils,) if backend_module is moe_utils else (moe_utils, backend_module):
-        for probe in ("_check_torch_grouped_mm_supported", "_transposed_view_grouped_mm_is_safe"):
+        for probe in ("_check_torch_grouped_mm_supported", "_transposed_view_grouped_mm_is_safe", "select_moe_backend"):
             try:
                 getattr(module, probe)()
+            except Exception:
+                pass
+        # Mixed host: only the GPU models the experts sit on, never a card this process does not use.
+        warm = getattr(module, "_warm_grouped_mm_devices", None)
+        if devices and callable(warm):
+            try:
+                warm(devices)
             except Exception:
                 pass
 
@@ -330,21 +338,29 @@ def _warm_moe_backend(model) -> None:
 _EXPERT_WEIGHT_NAMES = ("gate_up_proj", "down_proj", "w1", "w2", "w3")
 
 
-def _expert_devices(model):
-    # Only the stacked expert weights: a wrapper exposing num_experts (GptOssForCausalLM) must not pull in
-    # the cards holding its embeddings, attention or LM head.
+def _expert_devices(model) -> list:
+    """Accelerator cards holding the stacked expert weights (meta / CPU while still loading: none).
+
+    Only expert stacks: a wrapper exposing num_experts (GptOssForCausalLM) must not pull in the cards
+    holding its embeddings, attention or LM head, nor a dense MLP's down_proj submodule."""
     is_experts = getattr(_moe_utils_module(), "_is_moe_experts_module", None)
-    if is_experts is None:
-        return []
     devices = set()
-    for module in model.modules():
+    try:
+        modules = list(model.modules())
+    except Exception:
+        return []
+    for module in modules:
+        candidates = []
+        params = getattr(module, "_parameters", None) or {}
+        candidates += [params.get(name) for name in _EXPERT_STACK_NAMES]
+        # PEFT parametrize leaves plain tensors; w1/w2/w3 are attributes.
         try:
-            if not is_experts(module):
-                continue
+            if is_experts is not None and is_experts(module):
+                candidates += [getattr(module, name, None) for name in _EXPERT_WEIGHT_NAMES]
         except Exception:
-            continue
-        for name in _EXPERT_WEIGHT_NAMES:
-            device = getattr(getattr(module, name, None), "device", None)
+            pass
+        for weight in candidates:
+            device = getattr(weight, "device", None)
             if isinstance(device, torch.device) and device.type in ("cuda", "xpu") and device.index is not None:
                 devices.add(device)
     return sorted(devices, key = lambda d: (d.type, d.index))
@@ -373,8 +389,8 @@ def warm_moe_probes_on_expert_devices(model) -> None:
         return
     try:
         devices = _expert_devices(model)
-        # One accelerator on the whole host: it is the home card. Count every backend, since one CUDA card
-        # plus one XPU card are each a single device of their type yet the XPU is foreign to a CUDA home.
+        # One accelerator on the host is the home card; count every backend, since one CUDA card plus one XPU card are
+        # each a single device of their type, yet the XPU is foreign to a CUDA home.
         if not devices or _accelerator_count() <= 1:
             return
         moe_utils = _moe_utils_module()
@@ -451,8 +467,7 @@ def _patch_transformers_grouped_mm():
 
 
 def _warm_lazy_lookups():
-    # Filled here, eagerly: a first fill inside a compiled MoE layer guards on the key being absent, so
-    # the next call recompiles every compiled layer once.
+    # Filled here, eagerly: a first fill inside a compiled MoE layer guards on the key being absent, so the next call recompiles every compiled layer once.
     _default_apply_gate_or_none()
     _experts_layout_is_standard_or_none()
     if "moe_utils" not in _LAZY and __name__.rsplit(".", 1)[0] + ".moe_utils" in sys.modules:

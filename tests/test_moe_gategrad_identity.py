@@ -1,12 +1,5 @@
-"""The gate-grad identity must reproduce autograd's routing-weight gradient.
-
-`_MoEGateGradIdentity` derives the routing-weight (gate) gradient from
-``dGate = <A, dA> / gate`` over the pre-down-projection activation instead of
-differentiating the post-down multiply, so the down-projection output never has
-to stay on the autograd tape. The identity is exact for any linear down
-projection; these tests check it in fp32 against plain autograd, with and
-without an additive LoRA term on the down weight.
-"""
+"""Checks _MoEGateGradIdentity: dGate = <A, dA> / gate over the pre-down activation, so the down output need not stay on
+the autograd tape; exact for any linear down projection (fp32, with and without a LoRA term on down)"""
 
 import pytest
 import torch
@@ -29,8 +22,7 @@ def _identity_path(inter, gate, W2, dOut):
     inter = inter.detach().requires_grad_(True)
     gate = gate.detach().requires_grad_(True)
     inter_id = _MoEGateGradIdentity.apply(inter, gate)
-    # The caller multiplies by the detached gate; the gate gradient comes only
-    # from the identity's backward.
+    # The caller multiplies by the detached gate, so the gate gradient comes only from the identity's backward
     out = (inter_id @ W2) * gate.detach().unsqueeze(-1)
     out.backward(dOut)
     return inter.grad, gate.grad
@@ -48,8 +40,7 @@ def test_matches_autograd_fp32(n_tokens, d_inter, d_out):
     g_inter, g_gate = _identity_path(inter, gate, W2, dOut)
 
     torch.testing.assert_close(g_inter, g_inter_ref, rtol=1e-6, atol=1e-6)
-    # dGate reduces over d_inter in a different order than autograd's <Y, dOut>,
-    # so allow fp32 accumulation-order noise.
+    # dGate reduces over d_inter in a different order than autograd's <Y, dOut>, so fp32 accumulation-order noise is allowed
     torch.testing.assert_close(g_gate, g_gate_ref, rtol=5e-4, atol=5e-5)
 
 
@@ -69,9 +60,8 @@ def test_exact_with_lora_down_projection():
 
 
 def test_matches_autograd_with_negative_gate():
-    # Gemma4 folds an unconstrained per_expert_scale into top_k_weights, so the
-    # routing weight can be negative; the identity must divide by the signed
-    # weight rather than clamp it toward a positive floor.
+    # Gemma4 folds an unconstrained per_expert_scale into top_k_weights, so routing weights can be negative; divide by
+    # the signed weight, never clamp toward a positive floor
     torch.manual_seed(2)
     inter = torch.randn(16, 24)
     gate = torch.randn(16) * 0.5
@@ -85,8 +75,7 @@ def test_matches_autograd_with_negative_gate():
 
 
 def test_gate_gradient_skipped_when_router_frozen():
-    # A frozen router (routing weights with requires_grad=False) must not crash
-    # the backward; inter keeps its passthrough gradient, the gate gets none.
+    # A frozen router (routing weights with requires_grad=False) must not crash the backward; inter keeps its passthrough gradient and the gate gets none
     inter = torch.randn(6, 8, requires_grad=True)
     gate = torch.rand(6)
     W2 = torch.randn(8, 5)
@@ -100,10 +89,8 @@ def test_gate_gradient_skipped_when_router_frozen():
 
 
 def test_matches_autograd_with_zero_gate():
-    # A routing weight of exactly zero (or below the floor) must still get its
-    # true gradient <Y, dOut>. The call site sign-floors the gate away from zero
-    # (straight-through) and both the multiply and the identity's divide use the
-    # same floored value, so the floor cancels exactly.
+    # A zero or sub-floor routing weight must still get the true gradient <Y, dOut>; the call site sign-floors the gate
+    # away from zero (straight-through), and multiply and divide share it so the floor cancels
     torch.manual_seed(3)
     inter0 = torch.randn(12, 16)
     gate0 = torch.randn(12) * 0.5
@@ -128,10 +115,9 @@ def test_matches_autograd_with_zero_gate():
 
 
 def test_fp16_gate_floors_in_fp32_without_output_leak():
-    # fp16 routing weights must be floored in fp32 (eps 1e-12), not at fp16's
-    # smallest normal (~6e-5): flooring a masked (zero) route at 6e-5 would leak
-    # eps * |Y| into the output at a magnitude fp16 can represent. Mirrors the
-    # call-site upcast in forward_native_grouped_mm.
+    # fp16 routing weights are floored in fp32 (eps 1e-12), not at fp16's smallest normal (~6e-5), which would leak
+    # eps*|Y| into a masked route's output at a magnitude fp16 can represent; mirrors the call-site upcast in
+    # forward_native_grouped_mm
     torch.manual_seed(5)
     gate16 = torch.rand(8, dtype=torch.float16) * 0.5
     gate16[0] = 0.0
@@ -158,12 +144,8 @@ def test_fp16_gate_floors_in_fp32_without_output_leak():
 
 
 def test_fp16_inter_zero_route_router_gradient_matches_reference():
-    # With fp16 activations, the gradient into the identity is
-    # grad_inter = gate * (W2 @ dOut); a near-zero floored gate makes that product
-    # underflow fp16 to zero before backward runs, so the identity drops the
-    # zero-route router gradient. forward_native_grouped_mm therefore excludes
-    # fp16 inter from the identity and keeps the standard multiply, which recovers
-    # the true <Y, dOut> gradient. This pins both halves of that rationale.
+    # fp16 inter: grad_inter = gate * (W2 @ dOut) underflows for a near-zero floored gate, so the identity drops the
+    # zero-route router gradient; forward_native_grouped_mm keeps the plain multiply
     torch.manual_seed(7)
     inter16 = torch.randn(4, 16, dtype=torch.float16)
     W2 = torch.randn(16, 10, dtype=torch.float16) * 0.1
@@ -173,8 +155,7 @@ def test_fp16_inter_zero_route_router_gradient_matches_reference():
 
     ref = ((inter16.float() @ W2.float()) * dOut.float()).sum(-1)  # true <Y, dOut>
 
-    # Identity path with fp16 inter: the tiny floored gate underflows grad_inter,
-    # so at least one exactly-zero route loses its router gradient.
+    # Identity path with fp16 inter: the tiny floored gate underflows grad_inter, so at least one exactly-zero route loses its router gradient
     gate = gate0.detach().float().requires_grad_(True)
     floored = torch.where(gate >= 0, gate.clamp(min=1e-12), gate.clamp(max=-1e-12))
     safe = gate + (floored - gate).detach()
@@ -182,8 +163,7 @@ def test_fp16_inter_zero_route_router_gradient_matches_reference():
     ((inter_id @ W2) * safe.detach().unsqueeze(-1)).backward(dOut)
     assert (gate.grad[1:] == 0).any()
 
-    # Standard multiply (the fp16 path forward_native_grouped_mm now uses):
-    # every zero route recovers the correct gradient.
+    # Standard multiply (the fp16 path forward_native_grouped_mm now uses): every zero route recovers the correct gradient
     gate_s = gate0.detach().requires_grad_(True)
     ((inter16 @ W2) * gate_s.unsqueeze(-1)).backward(dOut)
     assert (gate_s.grad[1:] != 0).all()
@@ -191,8 +171,7 @@ def test_fp16_inter_zero_route_router_gradient_matches_reference():
 
 
 def test_double_backward_raises():
-    # The identity is only first-order exact; create_graph must fail loudly
-    # instead of returning wrong second derivatives.
+    # The identity is only first-order exact, so create_graph (double backward) must fail loudly instead of returning wrong second derivatives
     inter = torch.randn(4, 6, requires_grad=True)
     gate = torch.rand(4, requires_grad=True) + 0.1
     W2 = torch.randn(6, 3)
@@ -209,8 +188,7 @@ def test_forward_is_identity_and_env_gated(monkeypatch):
     g = torch.rand(5)
     assert torch.equal(_MoEGateGradIdentity.apply(x, g), x)
 
-    # On by default (memory saving); UNSLOTH_MOE_GATEGRAD=0 is the kill-switch.
-    # _moe_gategrad_enabled is lru_cache(1), so clear it after each env change.
+    # On by default (memory saving); UNSLOTH_MOE_GATEGRAD=0 is the kill-switch; _moe_gategrad_enabled is lru_cache(1), so clear it after each env change
     monkeypatch.delenv("UNSLOTH_MOE_GATEGRAD", raising=False)
     _moe_gategrad_enabled.cache_clear()
     assert _moe_gategrad_enabled()

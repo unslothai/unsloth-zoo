@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fused lm_head + CE coverage on the installed transformers against tests/fused_ce_coverage.json.
-
-A class that fused on the closest recorded transformers release must still fuse. Otherwise it trains
-with the full logits tensor and nothing else fails. New classes that do not fuse are reported, not failed.
-"""
+"""Checks fused CE coverage on installed transformers against tests/fused_ce_coverage.json; recorded classes that fused
+must still fuse; new non-fusing classes are reported, not failed."""
 import json
 import os
 import subprocess

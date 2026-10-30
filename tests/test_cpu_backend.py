@@ -234,8 +234,25 @@ def test_cpu_training_arguments_turn_off_packing_and_gpu_optimizers(dtype_policy
     args = SimpleNamespace(use_cpu = False, fp16 = True, bf16 = False, optim = "paged_adamw_8bit",
                            packing = True, eval_packing = True, padding_free = True, dataloader_pin_memory = True)
     normalize_cpu_training_arguments(args)
-    assert args.use_cpu and not args.fp16 and args.optim == "adamw_torch"
+    assert args.use_cpu and not args.fp16 and args.optim == "adamw_torch_fused"
     assert not args.packing and not args.eval_packing and not args.padding_free and not args.dataloader_pin_memory
+
+
+@pytest.mark.parametrize("torch_version, expected", [("2.13.0+cpu", "adamw_torch_fused"), ("2.3.1", "adamw_torch")])
+@pytest.mark.parametrize("optim", ["adamw_torch", "adamw_torch_fused", "adamw_8bit", "paged_adamw_32bit"])
+def test_cpu_training_uses_the_fused_adamw_where_torch_has_it(monkeypatch, optim, torch_version, expected):
+    """transformers defaults to adamw_torch_fused from torch 2.8; torch has fused AdamW on CPU from 2.4."""
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu import trainer
+    monkeypatch.setattr(trainer.torch, "__version__", torch_version)
+    trainer._cpu_adamw.cache_clear()
+    try:
+        args = trainer.normalize_cpu_training_arguments(SimpleNamespace(use_cpu = True, fp16 = False, bf16 = False, optim = optim))
+        assert args.optim == expected
+        args = trainer.normalize_cpu_training_arguments(SimpleNamespace(use_cpu = True, fp16 = False, bf16 = False, optim = "sgd"))
+        assert args.optim == "sgd"
+    finally:
+        trainer._cpu_adamw.cache_clear()
 
 
 def test_moe_models_keep_their_own_loss():
@@ -669,6 +686,29 @@ def test_torch_dtype_alias_is_used_and_not_passed_twice(monkeypatch):
     assert torch.float32 in (seen.get("dtype"), seen.get("torch_dtype"))
 
 
+def test_cpu_4bit_keeps_the_gpu_skip_modules_in_16bit(monkeypatch):
+    """lm_head, MoE routers, Mamba and vision towers stay out of NF4, as SKIP_QUANTIZATION_MODULES does on GPU."""
+    import transformers
+    from unsloth_zoo.cpu import loader
+    from unsloth_zoo.peft_utils import SKIP_QUANTIZATION_MODULES
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_load(name, **k):
+        seen.update(k)
+        raise Stop
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
+    monkeypatch.setattr(loader, "cpu_bnb_4bit_supported", lambda: True)
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_load)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    with pytest.raises(Stop):
+        loader.FastCPUModel.from_pretrained("org/model", load_in_4bit = True)
+    qc = seen["quantization_config"]
+    assert qc.load_in_4bit and list(qc.llm_int8_skip_modules) == list(SKIP_QUANTIZATION_MODULES)
+
+
 def test_fp16_autocast_chunked_loss_keeps_small_gradients_for_the_scaler():
     """Under fp16 autocast the cached hidden gradient must survive until GradScaler's multiplier is applied."""
     from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
@@ -889,6 +929,54 @@ def test_cpu_fused_lm_head_matches_an_fp64_reference(softcap, temperature, scale
     torch.testing.assert_close(w1.grad.double(), w2.grad, rtol = 1e-5, atol = 1e-6)
 
 
+@pytest.mark.parametrize("softcap, temperature, scale, bias", [(None, 1.0, 1.0, False), (30.0, 0.7, 0.5, True)])
+@pytest.mark.parametrize("entropy_weight", [0.0, 0.1])
+def test_cpu_fused_lm_head_frozen_head_single_pass_matches_fp64(softcap, temperature, scale, bias, entropy_weight):
+    """Frozen-head single pass: outputs, extras and d/dhidden (with / without an entropy gradient) vs fp64."""
+    from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
+    torch.manual_seed(0)
+    hidden, weight = torch.randn(37, 16) * 2, torch.randn(101, 16) * 0.3
+    b = torch.randn(101) if bias else None
+    targets = torch.randint(0, 101, (37,))
+    h1 = hidden.clone().requires_grad_(True)
+    ours = cpu_chunked_log_probs(h1, weight, b, targets, temperature, 64, softcap, scale)
+    upstream = torch.randn(37)
+    (-(ours[0] * upstream).sum() + entropy_weight * ours[1].sum()).backward()
+    h2 = hidden.double().requires_grad_(True)
+    z = h2 @ weight.double().t() + (b.double() if b is not None else 0)
+    z = z * scale
+    if softcap is not None:
+        z = softcap * torch.tanh(z / softcap)
+    z = z / temperature
+    logp = torch.log_softmax(z, -1)
+    ref = (logp.gather(-1, targets[:, None]).squeeze(-1), -(logp.exp() * logp).sum(-1),
+           torch.logsumexp(2 * logp, -1), z.mean(-1), z.argmax(-1) == targets)
+    (-(ref[0] * upstream.double()).sum() + entropy_weight * ref[1].sum()).backward()
+    for got, want in zip(ours[:4], ref[:4]):
+        torch.testing.assert_close(got.double(), want, rtol = 1e-5, atol = 1e-5)
+    assert torch.equal(ours[4], ref[4])
+    torch.testing.assert_close(h1.grad.double(), h2.grad, rtol = 1e-5, atol = 1e-6)
+
+
+def test_cpu_fused_lm_head_single_pass_under_bf16_autocast_and_no_grad():
+    """bf16 autocast: gradients close to fp32; under no_grad only the requested outputs come back."""
+    from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
+    torch.manual_seed(0)
+    hidden, weight = torch.randn(64, 32), torch.randn(500, 32) * 0.2
+    targets = torch.randint(0, 500, (64,))
+    h32 = hidden.clone().requires_grad_(True)
+    cpu_chunked_log_probs(h32, weight, None, targets, 1.0, 64)[0].sum().backward()
+    h16 = hidden.clone().requires_grad_(True)
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        lp = cpu_chunked_log_probs(h16, weight, None, targets, 1.0, 64, outputs = ("log_probs",))
+    assert lp[1:] == (None, None, None, None)
+    lp[0].sum().backward()
+    assert (h16.grad - h32.grad).norm() / h32.grad.norm() < 2e-2
+    with torch.no_grad():
+        out = cpu_chunked_log_probs(hidden, weight, None, targets, 1.0, 64, outputs = ("log_probs", "is_top1"))
+    assert out[0].grad_fn is None and out[4].dtype == torch.bool and out[1] is None
+
+
 def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
     """TRL 1.x calls `_ChunkedLogProbFunction.apply` from SFTTrainer.compute_loss; CPU tensors (and a
     missing kernel) take the torch path, accelerator tensors keep the kernel."""
@@ -930,3 +1018,494 @@ def test_cpu_fused_lm_head_with_every_label_masked():
     assert top1.dtype == torch.bool
     (lp.sum() + ent.sum()).backward()
     assert torch.count_nonzero(weight.grad) == 0
+
+
+def test_bf16_stored_frozen_linear_matches_fp32():
+    """Bf16StoredLinear equals fp32 on the same values, returns dX only; a trainable weight keeps its gradient."""
+    from unsloth_zoo.cpu.ops import Bf16StoredLinear
+    torch.manual_seed(0)
+    ref = torch.nn.Linear(16, 8)
+    ref.weight.data = ref.weight.data.bfloat16().float()
+    ref.weight.requires_grad_(False)
+    ref.bias.requires_grad_(False)
+    stored = torch.nn.Linear(16, 8)
+    stored.weight.data = ref.weight.data.bfloat16()
+    stored.bias.data = ref.bias.data.clone()
+    stored.__class__ = Bf16StoredLinear
+    stored.weight.requires_grad_(False)
+    stored.bias.requires_grad_(False)
+    x1, x2 = torch.randn(3, 5, 16, requires_grad = True), None
+    x2 = x1.detach().clone().requires_grad_(True)
+    up = torch.randn(3, 5, 8)
+    (ref(x1) * up).sum().backward()
+    out = stored(x2)
+    (out * up).sum().backward()
+    assert out.dtype == torch.float32 and stored.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(out, ref(x1.detach()))
+    torch.testing.assert_close(x2.grad, x1.grad)
+    assert stored.weight.grad is None
+    stored.weight.requires_grad_(True)
+    stored(torch.randn(2, 16)).sum().backward()
+    assert stored.weight.grad is not None
+    stored.weight.requires_grad_(False)
+    stored.weight.grad = None
+    stored.bias.requires_grad_(True)
+    stored(torch.randn(2, 16)).sum().backward()
+    assert stored.bias.grad is not None and stored.weight.grad is None
+
+
+def test_bf16_storage_leaves_directly_read_projections_alone():
+    """Mamba reads dt_proj.weight directly (no module call); only always-called projections convert."""
+    from unsloth_zoo.cpu.ops import Bf16StoredLinear, store_frozen_linears_in_bf16
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj, self.dt_proj, self.out_proj = (torch.nn.Linear(8, 8) for _ in range(3))
+
+    model = torch.nn.Sequential(Block()).bfloat16()
+    assert store_frozen_linears_in_bf16(model) == 1
+    block = model[0]
+    assert type(block.q_proj) is Bf16StoredLinear and block.q_proj.weight.dtype == torch.bfloat16
+    assert type(block.dt_proj) is torch.nn.Linear and block.dt_proj.weight.dtype == torch.float32
+    assert block.out_proj.weight.dtype == torch.float32
+
+
+def test_store_frozen_linears_in_bf16_keeps_head_and_norms_fp32_and_merges_unrounded():
+    import copy
+    from peft import LoraConfig, get_peft_model
+    from unsloth_zoo.cpu import loader
+    from unsloth_zoo.cpu.ops import Bf16StoredLinear, store_frozen_linears_in_bf16
+    ref = _tiny_llama().bfloat16().float()
+    model = copy.deepcopy(ref).bfloat16()
+    count = store_frozen_linears_in_bf16(model)
+    assert count == 7  # q, k, v, o, gate, up, down; lm_head stays a plain fp32 Linear
+    assert type(model.lm_head) is torch.nn.Linear and model.lm_head.weight.dtype == torch.float32
+    assert model.model.norm.weight.dtype == torch.float32 and model.model.embed_tokens.weight.dtype == torch.float32
+    ids = torch.randint(0, 64, (2, 9))
+    with torch.no_grad():
+        torch.testing.assert_close(model(ids).logits, ref(ids).logits)
+    lora = get_peft_model(model, LoraConfig(r = 4, target_modules = ["q_proj", "v_proj"], init_lora_weights = False))
+    loss = lora(input_ids = ids, labels = ids).loss
+    loss.backward()
+    assert all(p.grad is not None for n, p in lora.named_parameters() if p.requires_grad)
+    merged, _ = loader._merged_copy(lora, "merged_32bit")
+    assert all(p.dtype == torch.float32 for p in merged.parameters())
+    assert not any(type(m) is Bf16StoredLinear and m.weight.dtype == torch.bfloat16 for m in merged.modules())
+    assert lora.base_model.model.model.layers[0].mlp.up_proj.weight.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("env, ckpt_dtype, expected", [("1", torch.bfloat16, torch.bfloat16), ("1", torch.float32, torch.float32),
+                                                       ("0", torch.bfloat16, torch.float32)])
+def test_frozen_bf16_storage_is_opt_in_and_only_for_bf16_checkpoints(monkeypatch, env, ckpt_dtype, expected):
+    import transformers
+    from unsloth_zoo.cpu import loader
+    seen = {}
+
+    def fake_load(name, **k):
+        seen.update(k)
+        return _tiny_llama().to(k.get("dtype", k.get("torch_dtype")))
+    monkeypatch.setenv("UNSLOTH_CPU_FROZEN_BF16", env)
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
+    monkeypatch.setattr(loader, "_checkpoint_dtype", lambda *a, **k: ckpt_dtype)
+    monkeypatch.setattr(loader, "cpu_bf16_supported", lambda: False)
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_load)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    model, _ = loader.FastCPUModel.from_pretrained("org/model", load_in_4bit = False)
+    assert seen.get("dtype", seen.get("torch_dtype")) == expected
+    assert model.lm_head.weight.dtype == torch.float32 and model.model.norm.weight.dtype == torch.float32
+
+
+def test_cpu_compile_without_a_toolchain_trains_eagerly(monkeypatch, capsys):
+    from unsloth_zoo.cpu import loader
+    loader._cpu_compile_unavailable.cache_clear()
+    monkeypatch.setenv("UNSLOTH_CPU_COMPILE", "1")
+
+    def no_compiler(*a, **k):
+        raise RuntimeError("InvalidCxxCompiler: Compiler: cl is not found.")
+    monkeypatch.setattr(torch, "compile", no_compiler)
+    model = _tiny_llama()
+    try:
+        loader.FastCPUModel._prepare(model, False)
+    finally:
+        loader._cpu_compile_unavailable.cache_clear()
+    assert "training eagerly" in capsys.readouterr().out
+    assert not getattr(model, "_unsloth_cpu_compiled", False)
+    assert not hasattr(model.model.layers[0], "_compiled_call_impl") or model.model.layers[0]._compiled_call_impl is None
+
+
+def test_generate_runs_compiled_layers_eagerly(monkeypatch):
+    """Compiled training layers would recompile per layer against a KV cache; generate() forces eager."""
+    from unsloth_zoo.cpu import loader
+    stances = []
+
+    class Stance:
+        def __init__(self, name):
+            stances.append(name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(torch.compiler, "set_stance", Stance, raising = False)
+    model = _tiny_llama()
+    loader.FastCPUModel._attach(model)
+    ids = torch.randint(0, 64, (1, 4))
+    model.generate(input_ids = ids, max_new_tokens = 2, do_sample = False)
+    assert stances == []
+    model.model.layers[0]._compiled_call_impl = model.model.layers[0]._call_impl
+    model.generate(input_ids = ids, max_new_tokens = 2, do_sample = False)
+    assert stances == ["force_eager"]
+
+
+def test_cpu_causal_conv1d_matches_the_grouped_conv_reference():
+    """Values and gradients equal F.conv1d(groups = channels, padding = K - 1)[..., :L], with and without bias."""
+    from unsloth_zoo.cpu.ops import cpu_causal_conv1d
+    torch.manual_seed(0)
+    for bias in (True, False):
+        x = torch.randn(2, 16, 37, dtype = torch.float64, requires_grad = True)
+        w = torch.randn(16, 4, dtype = torch.float64, requires_grad = True)
+        b = torch.randn(16, dtype = torch.float64, requires_grad = True) if bias else None
+        ref = F.silu(F.conv1d(x, w.unsqueeze(1), b, padding = 3, groups = 16)[..., :37])
+        up = torch.randn_like(ref)
+        grads_ref = torch.autograd.grad((ref * up).sum(), [t for t in (x, w, b) if t is not None])
+        out = cpu_causal_conv1d(x, w, b, activation = "silu")
+        grads = torch.autograd.grad((out * up).sum(), [t for t in (x, w, b) if t is not None])
+        torch.testing.assert_close(out, ref)
+        for g, r in zip(grads, grads_ref):
+            torch.testing.assert_close(g, r)
+
+
+def test_causal_conv1d_fallback_is_patched_only_where_it_agrees(monkeypatch):
+    import sys
+    import types
+    from unsloth_zoo.cpu import ops
+    monkeypatch.setattr(torch.backends.mkldnn, "is_available", lambda: False)
+
+    def reference(hidden_states, weight, bias = None, activation = None, **kwargs):
+        out = F.conv1d(hidden_states, weight.unsqueeze(1), bias, padding = weight.shape[-1] - 1,
+                       groups = hidden_states.shape[1])[..., :hidden_states.shape[-1]]
+        return F.silu(out) if activation == "silu" else out
+
+    def other_signature(x, weight, bias = None, activation = None):
+        return x
+
+    good, bad = types.ModuleType("fake_good_modeling"), types.ModuleType("fake_bad_modeling")
+    good.causal_conv1d_fn, bad.causal_conv1d_fn = reference, other_signature
+    good_cls = type("GoodBlock", (torch.nn.Module,), {"__module__": "fake_good_modeling"})
+    bad_cls = type("BadBlock", (torch.nn.Module,), {"__module__": "fake_bad_modeling"})
+    sys.modules["fake_good_modeling"], sys.modules["fake_bad_modeling"] = good, bad
+    try:
+        model = torch.nn.Sequential(good_cls(), bad_cls())
+        assert ops.patch_causal_conv1d_fallback(model) == 1
+        assert good.causal_conv1d_fn is ops.cpu_causal_conv1d and bad.causal_conv1d_fn is other_signature
+        good.causal_conv1d_fn = reference
+        monkeypatch.setattr(torch.backends.mkldnn, "is_available", lambda: True)
+        assert ops.patch_causal_conv1d_fallback(model) == 0 and good.causal_conv1d_fn is reference
+    finally:
+        del sys.modules["fake_good_modeling"], sys.modules["fake_bad_modeling"]
+
+
+def test_cpu_compile_probe_leaves_the_rng_alone(monkeypatch):
+    from unsloth_zoo.cpu import loader
+    loader._cpu_compile_unavailable.cache_clear()
+    monkeypatch.setattr(torch, "compile", lambda fn, **k: fn)
+    try:
+        torch.manual_seed(123)
+        expected = torch.rand(3)
+        torch.manual_seed(123)
+        assert loader._cpu_compile_unavailable() is None
+        torch.testing.assert_close(torch.rand(3), expected)
+    finally:
+        loader._cpu_compile_unavailable.cache_clear()
+
+
+def test_windows_compile_loads_the_msvc_environment(monkeypatch, tmp_path):
+    """Build Tools installed but no Developer Prompt: vswhere -> vcvars64.bat -> PATH / INCLUDE / LIB."""
+    import shutil
+    import subprocess
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu import loader
+    root = tmp_path / "x86"
+    (root / "Microsoft Visual Studio" / "Installer").mkdir(parents = True)
+    (root / "Microsoft Visual Studio" / "Installer" / "vswhere.exe").write_text("")
+    install = tmp_path / "BuildTools"
+    (install / "VC" / "Auxiliary" / "Build").mkdir(parents = True)
+    (install / "VC" / "Auxiliary" / "Build" / "vcvars64.bat").write_text("")
+    monkeypatch.setenv("ProgramFiles(x86)", str(root))
+    monkeypatch.delenv("INCLUDE", raising = False)
+    for key in ("PATH", "LIB", "LIBPATH"):
+        monkeypatch.setenv(key, os.environ.get(key, ""))
+    cl_dir = str(tmp_path / "msvc_bin")
+    state = {"cl": None}
+
+    def fake_run(cmd, **kwargs):
+        if isinstance(cmd, list):
+            return SimpleNamespace(returncode = 0, stdout = str(install) + "\n")
+        state["cl"] = cl_dir
+        listing = f"Path={cl_dir};C:\\Windows\r\nINCLUDE=C:\\VC\\include\r\nLIB=C:\\VC\\lib\r\nOTHER=x\r\n"
+        return SimpleNamespace(returncode = 0, stdout = listing.encode("utf-16-le"))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(shutil, "which", lambda name: state["cl"] and name == "cl" and state["cl"] + "\\cl.exe")
+    assert loader._load_msvc_environment() is True
+    assert os.environ["INCLUDE"] == "C:\\VC\\include" and os.environ["PATH"].startswith(cl_dir)
+    assert os.environ.get("OTHER") != "x"
+
+
+def test_windows_compile_without_build_tools_says_how_to_install(monkeypatch):
+    import sys
+    from unsloth_zoo.cpu import loader
+    loader._cpu_compile_unavailable.cache_clear()
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(loader, "_load_msvc_environment", lambda: False)
+    try:
+        assert "Build Tools" in loader._cpu_compile_unavailable()
+    finally:
+        loader._cpu_compile_unavailable.cache_clear()
+
+
+def _confident_rows(margins, vocab = 1003, hidden_size = 64):
+    """fp64 hidden states whose target logit leads every other class by the given margins."""
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn(vocab, hidden_size, generator = generator, dtype = torch.float64) * 0.1
+    hidden = torch.randn(len(margins), hidden_size, generator = generator, dtype = torch.float64)
+    targets = torch.randint(0, vocab, (len(margins),), generator = generator)
+    for i, margin in enumerate(margins):
+        logits = hidden[i] @ weight.t()
+        others = logits.clone()
+        others[targets[i]] = -math.inf
+        direction = weight[targets[i]] / weight[targets[i]].norm() ** 2
+        hidden[i] += direction * (others.max() - logits[targets[i]] + margin)
+    return hidden, weight, targets
+
+
+@pytest.mark.parametrize("path", ["frozen_head", "trainable_head", "chunked_ce"])
+def test_confident_rows_keep_their_gradient(path):
+    """Softmax collapse (p_t rounds to 1 past a ~16.6 lead). Oracle: fp64 -softplus(lse(others) - z_t); fp64 log_softmax collapses too."""
+    from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy, cpu_chunked_log_probs
+    margins = [0, 5, 17, 20, 30, 50]
+    hidden, weight, targets = _confident_rows(margins)
+    reference_hidden = hidden.clone().requires_grad_(True)
+    logits = reference_hidden @ weight.t()
+    target_logit = logits.gather(-1, targets[:, None]).squeeze(-1)
+    others = torch.logsumexp(logits.scatter(-1, targets[:, None], -math.inf), dim = -1)
+    reference = -F.softplus(others - target_logit)
+    reference.sum().backward()
+
+    h32 = hidden.float().requires_grad_(True)
+    if path == "chunked_ce":
+        labels = torch.cat([targets.new_full((1,), -100), targets])[None]  # position i predicts labels[i + 1]
+        h = h32[None]
+        chunked_linear_cross_entropy(h, weight.float(), labels, num_items_in_batch = 1).backward()
+        grad, log_probs = -h32.grad, None
+    else:
+        w32 = weight.float().requires_grad_(path == "trainable_head")
+        log_probs = cpu_chunked_log_probs(h32, w32, None, targets, 1.0, 64)[0]
+        log_probs.sum().backward()
+        grad = h32.grad
+    rel = (grad.double() - reference_hidden.grad).norm(dim = -1) / reference_hidden.grad.norm(dim = -1)
+    assert float(rel.max()) < 1e-4, rel
+    if log_probs is not None:
+        assert bool((log_probs < 0).all())
+        assert torch.allclose(log_probs.double(), reference.detach(), rtol = 1e-4, atol = 0)
+
+
+@pytest.mark.parametrize("name, resolved", [("org/model", "org/model"), ("org/model-bnb-4bit", "org/model")])
+def test_on_model_resolved_is_reported_and_not_passed_to_the_model(monkeypatch, name, resolved):
+    """Studio passes on_model_resolved (progress + stall watchdog) as on GPU; the model __init__ rejects it."""
+    import transformers
+    from unsloth_zoo.cpu import loader
+    seen, reported = {}, []
+    monkeypatch.delenv("HF_TOKEN", raising = False)  # `seen` holds the token; keep a real one out of failure output
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
+
+    def fake_load(model_name, **k):
+        seen.update(k, name = model_name)
+        return _tiny_llama()
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_load)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    loader.FastCPUModel.from_pretrained(name, load_in_4bit = False, on_model_resolved = reported.append)
+    assert "on_model_resolved" not in seen
+    assert reported == [resolved] == [seen["name"]]
+
+
+def test_on_model_resolved_reports_an_adapter_then_its_base(monkeypatch):
+    """As the GPU loader: the requested adapter repo first, then the base actually fetched."""
+    import transformers
+    from unsloth_zoo.cpu import loader
+    reported = []
+    monkeypatch.delenv("HF_TOKEN", raising = False)
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: ("org/base", None))
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", lambda *a, **k: _tiny_llama())
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    import peft
+    monkeypatch.setattr(peft.PeftModel, "from_pretrained", lambda model, *a, **k: model)
+    loader.FastCPUModel.from_pretrained("org/adapter", load_in_4bit = False, on_model_resolved = reported.append)
+    assert reported == ["org/adapter", "org/base"]
+
+
+def test_sft_config_takes_max_seq_length_as_max_length(monkeypatch, tmp_path):
+    """TRL 0.20 dropped SFTConfig(max_seq_length); Unsloth's GPU SFTConfig, notebooks and Studio still pass it."""
+    import dataclasses
+    from trl import SFTConfig
+    from unsloth_zoo.cpu.trainer import _patch_max_seq_length_alias
+    monkeypatch.setattr(SFTConfig, "__init__", SFTConfig.__init__)
+    _patch_max_seq_length_alias(SFTConfig)
+    fields = SFTConfig.__dataclass_fields__
+    if "max_seq_length" in fields:
+        # TRL < 0.20 still has the field (and maps it itself): left alone.
+        assert not getattr(SFTConfig.__init__, "_unsloth_cpu", False)
+        return
+    default = fields["max_length"].default
+    common = dict(output_dir = str(tmp_path), report_to = [], use_cpu = True, bf16 = False)
+    assert SFTConfig(max_seq_length = 77, **common).max_length == 77
+    assert SFTConfig(max_seq_length = None, **common).max_length == default
+    assert SFTConfig(max_length = 33, **common).max_length == 33
+    # As TRL's own alias did (< 0.20): max_seq_length wins over max_length.
+    assert SFTConfig(max_seq_length = 77, max_length = 33, **common).max_length == 77
+
+    class Subclass(SFTConfig):  # the CPU UnslothTrainingArguments shape
+        def __init__(self, extra = None, *args, **kwargs):
+            self.extra = extra
+            super().__init__(*args, **kwargs)
+    assert Subclass(extra = 1, max_seq_length = 55, **common).max_length == 55
+    _patch_max_seq_length_alias(SFTConfig)  # idempotent
+    assert SFTConfig.__init__.__wrapped__.__qualname__.startswith("SFTConfig.")
+
+    @dataclasses.dataclass
+    class HasField:  # a config that still declares max_seq_length is never touched
+        max_seq_length: int = None
+        max_length: int = None
+    init = HasField.__init__
+    _patch_max_seq_length_alias(HasField)
+    assert HasField.__init__ is init
+
+
+def test_cpu_sft_trainer_pickles_by_reference(monkeypatch):
+    """TRL 0.24 - 1.7's tokenize map closes over the trainer; with dataset_num_proc > 1 the class must pickle by name."""
+    import pickle
+    import dill
+    from trl.trainer import sft_trainer
+    from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
+    base = sft_trainer.SFTTrainer
+    base = base.__mro__[1] if getattr(base, "_unsloth_cpu", False) else base
+    from unsloth_zoo.cpu import trainer as cpu_trainer
+    cls = _make_cpu_sft_trainer(base)
+    monkeypatch.setattr(sft_trainer, "SFTTrainer", cls)
+    monkeypatch.setattr(cpu_trainer, "_CPUSFTTrainer", cls, raising = False)
+    assert pickle.loads(pickle.dumps(cls)) is cls
+    assert dill.loads(dill.dumps(cls)) is cls
+    assert len(dill.dumps(cls)) < 200  # a reference, not the class and its globals by value
+
+
+def test_cpu_sft_trainer_unpickles_as_the_cpu_class_in_a_fresh_process(monkeypatch, tmp_path):
+    """A process that never installed the CPU defaults (spawn worker) must not get stock TRL's SFTTrainer."""
+    import pickle
+    import subprocess
+    import sys
+    from trl.trainer import sft_trainer
+    from unsloth_zoo.cpu import trainer as cpu_trainer
+    from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
+    base = sft_trainer.SFTTrainer
+    base = base.__mro__[1] if getattr(base, "_unsloth_cpu", False) else base
+    cls = _make_cpu_sft_trainer(base)
+    monkeypatch.setattr(sft_trainer, "SFTTrainer", cls)
+    monkeypatch.setattr(cpu_trainer, "_CPUSFTTrainer", cls, raising = False)
+    blob = tmp_path / "cls.pkl"
+    blob.write_bytes(pickle.dumps(cls))
+    script = "import pickle, sys; c = pickle.load(open(sys.argv[1], 'rb')); print('CPU', getattr(c, '_unsloth_cpu', False))"
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "")
+    env.pop("HF_TOKEN", None)
+    done = subprocess.run([sys.executable, "-c", script, str(blob)], capture_output = True, text = True,
+                          timeout = 300, env = env, cwd = str(tmp_path))
+    assert "CPU True" in done.stdout, (done.stdout[-2000:], done.stderr[-3000:])
+
+
+_CPU_SFT_SCRIPT = r'''
+import math, os, sys
+import torch
+from datasets import Dataset
+from unsloth_zoo.cpu import FastCPUModel, install_cpu_training_defaults
+install_cpu_training_defaults()
+from trl import SFTConfig, SFTTrainer
+model_dir, out_dir = sys.argv[1], sys.argv[2]
+resolved = []
+model, tokenizer = FastCPUModel.from_pretrained(model_dir, max_seq_length = 32, load_in_4bit = False,
+                                                dtype = torch.float32, on_model_resolved = resolved.append)
+model = FastCPUModel.get_peft_model(model, r = 4, lora_alpha = 4)
+words = ["add", "one", "two", "three", "is", "the", "sum"]
+rows = [" ".join(words[(i + j) % len(words)] for j in range(8)) for i in range(16)]
+trainer = SFTTrainer(
+    model = model, tokenizer = tokenizer, train_dataset = Dataset.from_dict({"text": rows}),
+    args = SFTConfig(output_dir = out_dir, max_seq_length = 16, dataset_num_proc = 2, max_steps = 3,
+                     per_device_train_batch_size = 4, learning_rate = 5e-3, logging_steps = 1,
+                     report_to = [], save_strategy = "no", optim = "adamw_8bit"),
+)
+assert trainer.args.max_length == 16
+trainer.train()
+losses = [h["loss"] for h in trainer.state.log_history if "loss" in h]
+model.save_pretrained(out_dir)
+assert resolved == [model_dir], resolved
+assert len(losses) == 3 and all(math.isfinite(x) for x in losses), losses
+assert os.path.isfile(os.path.join(out_dir, "adapter_model.safetensors"))
+print("CPU_SFT_OK", losses)
+'''
+
+
+@pytest.mark.parametrize("serial_spawn", [False, True])
+def test_cpu_lora_sft_end_to_end(tmp_path, serial_spawn):
+    """FastCPUModel + stock TRL SFTTrainer, as notebooks and Studio call them: on_model_resolved,
+    SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name; trains and saves the adapter.
+    serial_spawn: unguarded script, dataset_num_proc = 1, spawn (a Pool(1) child re-imports __main__)."""
+    import subprocess
+    import sys
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    words = ["add", "one", "two", "three", "is", "the", "sum"]
+    vocab = {"<pad>": 0, "</s>": 1, "<unk>": 2, **{w: i + 3 for i, w in enumerate(words)}}
+    backend = Tokenizer(models.WordLevel(vocab, unk_token = "<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    model_dir = tmp_path / "model"
+    PreTrainedTokenizerFast(tokenizer_object = backend, pad_token = "<pad>", eos_token = "</s>",
+                            unk_token = "<unk>").save_pretrained(model_dir)
+    _tiny_llama().save_pretrained(model_dir)
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", OMP_NUM_THREADS = "2", HF_HUB_OFFLINE = "1",
+               PYTHONPATH = os.pathsep.join(filter(None, [tree, os.environ.get("PYTHONPATH")])))
+    script = ["-c", _CPU_SFT_SCRIPT]
+    if serial_spawn:
+        script = tmp_path / "train.py"
+        script.write_text('import multiprocess\nmultiprocess.set_start_method("spawn", force = True)\n'
+                          + _CPU_SFT_SCRIPT.replace("dataset_num_proc = 2", "dataset_num_proc = 1"))
+        script = [str(script)]
+    done = subprocess.run([sys.executable, *script, str(model_dir), str(tmp_path / "out")],
+                          capture_output = True, text = True, timeout = 600, env = env, cwd = str(tmp_path))
+    assert done.returncode == 0 and "CPU_SFT_OK" in done.stdout, (done.stdout[-3000:], done.stderr[-5000:])
+
+
+@pytest.mark.parametrize("requested, seen", [(1, None), (0, None), (None, None), (4, 4), (True, True), (-1, -1)])
+def test_serial_dataset_num_proc_maps_in_process(requested, seen):
+    """Stock TRL sees None for a serial 0 / 1 during __init__; the caller's config keeps its value."""
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
+
+    class FakeSFT:
+        def __init__(self, model = None, args = None, **kwargs):
+            self.seen = args.dataset_num_proc
+
+    args = SimpleNamespace(dataset_num_proc = requested)
+    trainer = _make_cpu_sft_trainer(FakeSFT)(model = None, args = args)
+    assert type(trainer.seen) is type(seen) and trainer.seen == seen
+    assert args.dataset_num_proc is requested
+
+    class Failing(FakeSFT):
+        def __init__(self, *a, **k):
+            raise RuntimeError("boom")
+
+    args = SimpleNamespace(dataset_num_proc = 1)
+    with pytest.raises(RuntimeError):
+        _make_cpu_sft_trainer(Failing)(None, args)
+    assert args.dataset_num_proc == 1

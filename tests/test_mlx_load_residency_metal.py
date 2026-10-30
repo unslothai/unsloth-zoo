@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What a load holds. A finished load must own its weights, measured as the memory evaluating them
-allocates, over several layers so evaluating only the first cannot reach the total. An offloaded
-one reads PLE rows and experts from the checkpoint instead, computing the stock modules' outputs
-bit for bit."""
+"""Load residency: finished loads own their weights; offloaded PLE rows and experts stay bit-exact."""
 
 import gc
 import inspect
 import json
 import os
+import re
 import sys
 import threading
 import warnings
@@ -62,8 +60,7 @@ def _lazy_model(tmp_path):
 
 
 def test_runtime_quantization_reads_each_weight_before_its_kernel(tmp_path, monkeypatch):
-    """A quantize kernel evaluated while its source is still being read keeps a GPU command
-    buffer waiting on the disk: by then, reading each source must allocate nothing."""
+    """Each weight is read before its quantize kernel runs, or the GPU command buffer waits on disk; by then reading each source must allocate nothing."""
     quantize, evaluate = mx.quantize, mx.eval
     pending, reads = {}, []
 
@@ -119,6 +116,78 @@ def test_glm5_next_fused_layers_take_their_checkpoint_bits(monkeypatch):
     model = glm.Model.__new__(glm.Model)
     load = lambda *_, **__: [_quantization_for_module_path(quantization, f"language_model.model.layers.3.{p}", model) for p in fused]
     assert _load_mlx_vlm_with_extra_weight_filter("glm", "glm5_next", load, {}) == bits
+
+
+@pytest.mark.parametrize("layout", ["oQ2e", "oQ4e-ngram"])
+def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
+    v41 = pytest.importorskip("mlx_vlm.models.deepseek_v41.deepseek_v41")
+    from mlx_vlm.models.deepseek_v41.config import ModelConfig
+    from mlx_vlm.utils import load_model
+    from unsloth_zoo.mlx.loader import (
+        _ensure_deepseek_v41_omlx_layout, _ensure_native_vlm_weight_names, _global_quant_params, _mlx_vlm_config_override_data,
+    )
+
+    text = dict(vocab_size = 512, hidden_size = 256, moe_intermediate_size = 128, num_hidden_layers = 4, num_attention_heads = 4,
+                head_dim = 64, qk_rope_head_dim = 32, q_lora_rank = 128, o_lora_rank = 64, o_groups = 2, n_routed_experts = 8,
+                num_experts_per_tok = 2, sliding_window = 16, compress_ratios = [0, 2, 1, 1], kv_source_layer_ids = [1, 2],
+                index_source_layer_ids = [1, 2, 3], index_n_heads = 2, index_head_dim = 64, candidate_source_layer_id = 2,
+                engram_layer_ids = [1], engram_num_embeddings = [1024], engram_n_heads = 2, engram_head_dim = 64)
+    config = {"model_type": "deepseek_v41", "text_config": text, "vision_config": {"num_hidden_layers": 1, "hidden_size": 64}}
+    model = v41.Model(ModelConfig.from_dict(json.loads(json.dumps(config))))
+    mx.random.seed(0)
+    model.update(tree_map(lambda value: mx.random.normal(value.shape) * 0.05, model.parameters()))
+    mxfp = layout == "oQ4e-ngram"
+    mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    source_fp8 = lambda path: ".compressor." not in path and not path.endswith(("indexer.wk", "weights_proj"))
+
+    def quantized_as(path, module):
+        if not hasattr(module, "to_quantized") or path.startswith(("vision", "aligner")) or path.endswith(
+            ("head", "embed_tokens", "ffn.gate", "engram.embed", "wo_a")
+        ):
+            return False
+        if ".switch_mlp." in path:
+            return {"group_size": 32, "bits": 4, "mode": "mxfp4"} if mxfp else {"group_size": 64, "bits": 3 if ".layers.3." in path else 2, "mode": "affine"}
+        if path.endswith("engram.wkv"):
+            return mxfp8
+        if mxfp:
+            return mxfp8 if source_fp8(path) else False
+        return {"group_size": 64, "bits": 8, "mode": "affine"}
+
+    specs = {}
+    nn.quantize(model, class_predicate = lambda path, module: specs.setdefault(path, quantized_as(path, module)))
+    params = dict(tree_flatten(model.parameters()))
+    names = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+
+    def omlx(key):
+        key = key.replace("language_model.embed_tokens.", "language_model.embed.").replace(".switch_mlp.", ".experts.")
+        key = re.sub(r"(\.experts|\.shared_experts)\.(\w+_proj)\.", lambda match: f"{match[1]}.{names[match[2]]}.", key)
+        return re.sub(r"^(vision\.blocks\.\d+)\.mlp\.", r"\1.ffn.", key)
+
+    floats = lambda key, value: value.astype(mx.bfloat16) if value.dtype == mx.float32 and "hc_" not in key and "gate.bias" not in key else value
+    stored = {omlx(key): floats(key, value.reshape(-1, value.shape[-1]) if key.endswith("wo_a.weight") else value) for key, value in params.items()}
+    table = "language_model.layers.1.engram.embed."
+    packed = dict(zip(("weight", "scales", "biases"), mx.quantize(stored[table + "weight"], 32, 8 if mxfp else 4, mode = "mxfp8" if mxfp else "affine")))
+    stored.update({table + name: value.view(mx.uint8) if mxfp and name == "weight" else value for name, value in packed.items()})
+    stored["language_model.mtp.0.ffn.experts.w1.weight"] = mx.zeros((8, 128, 64), mx.uint32)  # DSpark stage
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), stored)
+    quantized = {
+        omlx(f"{path}.weight").removesuffix(".weight"):
+            {**spec, "quantize_input": source_fp8(path)} if spec["mode"] == "affine" else {"bits": spec["bits"], "mode": spec["mode"]}
+        for path, spec in specs.items() if spec
+    }
+    quantized["language_model.mtp.0.ffn.experts.w1"] = {"bits": 4, "mode": "mxfp4"}
+    config = _mlx_vlm_config_override_data({**config, "omlx_deepseek_v41": {"version": 1, "quantized_modules": quantized}})
+    experts = {"group_size": 32, "bits": 4, "mode": "mxfp4"} if mxfp else {"group_size": 64, "bits": 2, "mode": "affine"}
+    assert _global_quant_params(config["quantization"]) == experts
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    _ensure_deepseek_v41_omlx_layout("deepseek_v41")
+    _ensure_native_vlm_weight_names("deepseek_v41")
+    loaded = dict(tree_flatten(load_model(tmp_path).parameters()))
+    assert loaded.keys() == params.keys() | {table + name for name in packed}
+    for key, value in loaded.items():  # values too: w1 and w3 share a shape
+        want = packed[key.removeprefix(table)] if key.startswith(table) else floats(key, params[key])
+        want = want.astype(mx.float32) if key.endswith(("ffn.gate.weight", "head.weight")) else want
+        assert value.dtype == want.dtype and mx.array_equal(value, want), key
 
 
 def test_lazy_weights_env_leaves_the_load_lazy(tmp_path, monkeypatch):
@@ -180,8 +249,7 @@ _MLX_PREFIX, _HF_PREFIX = "language_model.model.", "model.language_model."
 
 
 def _lazy_copy(build, directory, layout = _MLX_PREFIX):
-    """``build()``'s model with its weights lazily mapped from ``directory``, saved there once, its
-    ``language_model.model.`` names under ``layout``."""
+    """Returns build()'s model with weights lazily mapped from directory, saved once, names under layout."""
     model = build()
     path = os.path.join(directory, "model.safetensors")
     rename = lambda name, a, b: b + name[len(a):] if name.startswith(a) else name
@@ -224,8 +292,7 @@ def test_offloaded_table_matches_stock(tmp_path, kind, fraction):
     # Checkpoint layouts: Hugging Face's VLM, and a text checkpoint mlx-vlm wraps as its language model.
     layout = {"quantized": _HF_PREFIX, "mxfp4": "model."}.get(kind, _MLX_PREFIX)
     model = _lazy_copy(lambda: _holder(name, module), str(tmp_path), layout)
-    # Repeats, unsorted, and rows on both sides of the held prefix of several shards; the second
-    # lookup mixes rows the first one read with new ones.
+    # Repeats, unsorted rows on both sides of the held prefix of several shards; the second lookup mixes rows already read with new ones.
     rng = np.random.default_rng(0)
     first = rng.integers(0, 480, (3, 41))
     lookups = [mx.array(first), mx.array(np.concatenate([first[:, :20], rng.integers(0, 480, (3, 21))], 1))]
@@ -262,8 +329,7 @@ def test_offloaded_rows_the_page_cache_dropped_are_read_again(tmp_path, monkeypa
             monkeypatch.setattr(zoo_offload, "_in_core", lambda mapped, rows, row_bytes: rows >= 10)
         np.testing.assert_array_equal(_bits(table(ids)), _bits(expected))
     assert reads == [4 * fields, 0, 2 * fields]
-    # More seen rows than the sample: a spread sample of every field checked row by row; all rows when one
-    # was evicted (here late rows of the scales and biases).
+    # More seen rows than the sample: a spread sample of every field checked row by row, or all rows when one was evicted (here late rows of scales and biases).
     table(many)
     for evicted in (False, True):
         checks = []  # (field, rows checked, first row, last row)
@@ -320,8 +386,7 @@ def test_offloaded_floats_get_the_load_cast(tmp_path, cast):
 
 
 def _moe(lib, dims = 512, hidden = 32, scales = mx.bfloat16, eval = True, quantized = True, experts = 64, v41 = False):
-    """One MoE layer of 64 quantized experts, top-4, from mlx-vlm's or mlx-lm's ``SwitchGLU``; 512
-    wide, as mlx-vlm's decode-block kernels require."""
+    """64 quantized experts, top-4, from mlx-vlm or mlx-lm SwitchGLU; 512 wide for mlx-vlm decode kernels."""
     switch_layers = pytest.importorskip(f"mlx_{lib}.models.switch_layers")
     mx.random.seed(0)
     block = nn.Module()
@@ -348,12 +413,9 @@ def _routes(shape, seed, among = 64):
 
 
 def _moe_calls(dtype):
-    # A decode block whose positions route to disjoint experts, so over 8 slots its last chunk holds
-    # one position; then (batch, length, experts routed among): decode, batched decode, decode blocks
-    # (mlx-vlm's block kernels; one position at a time, here on gather_qmm_rhs, once batch x top-k
-    # reaches 64), prefill on the per-route kernel, prefill on gather_qmm_rhs (from exactly 4 routes
-    # per expert), prefill among 12 experts, which a 16-slot table alone would run on gather_qmm_rhs
-    # and 64 experts do not, and a batch's decode blocks under 64 routes.
+    # MoE kernel paths: a disjoint-expert decode block over 8 slots; decode blocks use gather_qmm_rhs once batch x top-k
+    # reaches 64; prefill uses it from exactly 4 routes per expert; prefill among 12 experts uses it in a 16-slot table
+    # but not with 64 experts.
     disjoint = mx.arange(12, dtype = mx.uint32).reshape(1, 3, 4)
     calls = [(mx.random.normal((1, 3, 512), key = mx.random.key(99)).astype(dtype), disjoint)]
     shapes = [(1, 1, 64), (8, 1, 64), (1, 4, 64), (64, 2, 64), (1, 20, 64), (1, 64, 64), (2, 300, 64), (1, 30, 12), (8, 2, 64)]
@@ -367,8 +429,7 @@ def _moe_calls(dtype):
 
 
 def _verifier_steps(glu, x, indices):
-    """mlx-vlm's batch-invariant verifier runs the projections itself, unsorted; then a down
-    projection of another input."""
+    """Mirrors mlx-vlm's batch-invariant verifier: unsorted up/gate projections, then a down projection."""
     x, indices = mx.expand_dims(x.reshape(-1, x.shape[-1]), (-2, -3)), indices.reshape(-1, 4)
     up = glu.up_proj(x, indices, sorted_indices = False)
     gate = glu.gate_proj(x, indices, sorted_indices = False)
@@ -471,16 +532,20 @@ def test_a_request_threads_lazy_output_does_not_fail_the_next(tmp_path):
         np.testing.assert_array_equal(got, _bits(want))
 
 
-@pytest.mark.parametrize("v41", [False, True])
-def test_experts_a_checkpoint_stores_apart(tmp_path, v41):
-    # As GLM-5's: one tensor per expert, which mlx-vlm stacks at load; DeepSeek V4.1's, under reference names.
+@pytest.mark.parametrize("v41, apart", [(False, True), (True, True), (True, False), (False, False)])
+def test_experts_a_checkpoint_stores_under_other_names(tmp_path, v41, apart):
     stock = _moe("vlm" if v41 else "lm", v41 = v41)
     stacked = dict(tree_flatten(stock.parameters()))
     names = {p: (p, n) for p, n in (("gate_proj", "w1"), ("down_proj", "w2"), ("up_proj", "w3"))} if v41 else {}
-    for shard in range(2):  # an expert's tensors may sit in any shard
+    for shard in range(2 if apart else 0):  # an expert's tensors may sit in any shard
         mx.save_safetensors(str(tmp_path / f"model-{shard}.safetensors"), {
             name.replace("switch_mlp.", f"experts.{expert}.").replace(*names.get(name.split(".")[-2], ("", ""))): value[expert]
             for name, value in stacked.items() for expert in range(shard, value.shape[0], 2)
+        })
+    if not apart:
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), {
+            prefix + name.replace("switch_mlp.", "experts.").replace(*names.get(name.split(".")[-2], ("", ""))): value
+            for name, value in stacked.items() for prefix in ("", "language_model.mtp.0.")
         })
     (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 4}))
     model = _moe("vlm" if v41 else "lm", v41 = v41).load_weights(list(stacked.items()))
@@ -730,8 +795,7 @@ def test_slot_readers_kept_are_bounded_in_bytes(monkeypatch):
 
 
 def test_concurrent_offloaded_loads_restore_the_cache_limit(monkeypatch):
-    # Two loads finishing at once must not both take the cap as the first model's: the second
-    # would save the capped limit as the one to restore.
+    # Two loads finishing at once must not both take the cap as the first model's, or the second saves the capped limit as the one to restore.
     import unsloth_zoo.mlx.loader as zoo_loader
 
     state = {"limit": 8 << 30}
@@ -804,8 +868,7 @@ def test_offload_controls_and_refusals(tmp_path):
     offload_experts(model, str(sixty), (60 - 25) / 60)
     assert model.layers[0].switch_mlp._slots.capacity == 25
 
-    # An offloaded load caps MLX's buffer cache at 1 GiB (keeping a lower limit) while it lives;
-    # one that offloads nothing leaves it alone.
+    # An offloaded load caps MLX's buffer cache at 1 GiB (keeping a lower limit) while it lives; a load that offloads nothing leaves it alone.
     previous = mx.set_cache_limit(4 << 30)
     try:
         for limit, capped in ((4 << 30, 1 << 30), (512 << 20, 512 << 20)):
@@ -901,8 +964,8 @@ def _inventory(ple = 30, experts = 64, floor = 2, per_layer = 64):
 
 @pytest.fixture
 def units(monkeypatch):
-    # Sizes in arbitrary units: PLE offload's working memory is 1, an expert offload's 2, no margin;
-    # experts stay resident while 4096 tokens of context (16) fit beside them.
+    # Arbitrary units: PLE offload's working memory is 1, an expert offload's 2, no margin; experts stay resident while
+    # 4096 context tokens (16) fit beside them.
     monkeypatch.setattr(zoo_offload, "_OFFLOAD_CONTEXT", 4096)
     monkeypatch.setattr(zoo_offload, "_PLE_OVERHEAD", 1)
     monkeypatch.setattr(zoo_offload, "_CACHE_CAP", 2)
@@ -975,19 +1038,17 @@ def test_plan_offload_rule(units):
     assert _plan(200) == plan(None, None, 8192, 2048)
     assert _plan(4 + 32 + 94) == plan(None, None, 8192, 2048)
     assert _plan(4 + 32 + 93) == plan(1.0, None, 8192, 2048)
-    # Experts stay resident (65 with PLE offloaded) while 4096 tokens fit beside them, and the
-    # context then takes all that is left.
+    # Experts stay resident (65 with PLE offloaded) while 4096 tokens fit beside them; the context then takes all that is left.
     assert _plan(4 + 65 + 16) == plan(1.0, None, 4096, 2048)
     assert _plan(4 + 65 + 23) == plan(1.0, None, 5888, 2048)
     assert _plan(4 + 65 + 23, _inventory(ple = 4)) == plan(None, None, 5120, 2048)  # the least offload
-    # Short of that, experts pay for 4096 tokens, in whole experts: 80 - 16 - PLE overhead 1 -
-    # expert overhead 2 = 61 of 64 stay at step 2048 (3/2048 per token; 7/4096 at step 4096).
+    # Short of that, experts pay for 4096 tokens in whole experts: 80 - 16 - PLE overhead 1 - expert overhead 2 = 61 of
+    # 64 stay at step 2048 (3/2048 per token; 7/4096 at step 4096).
     assert _plan(4 + 65 + 15) == plan(1.0, 3 / 64, 4096, 2048)
     # Whole experts of 4 units each leave slack the context then takes: 24 - (1 + 4 + 2) = 17 units.
     assert _plan(28, _inventory(per_layer = 16)) == plan(1.0, 15 / 16, 4352, 2048)
     assert _plan(4 + 65 + 15, context = 8192) == plan(1.0, 31 / 64, 8192, 8192)  # a pinned context is kept
-    # 40 units of room: at step 2048, 24 - 3 = 21 stay (43/2048 per token); at 4096, 17 stay
-    # (47/4096: fewer re-read bytes); 8192 is past the context.
+    # 40 units of room: at step 2048, 24 - 3 = 21 stay (43/2048 per token); at 4096, 17 stay (47/4096: fewer re-read bytes); 8192 is past the context.
     assert _plan(44) == plan(1.0, 47 / 64, 4096, 4096)
     assert _plan(44, prefill_step = 2048) == plan(1.0, 43 / 64, 4096, 2048)
     # The context experts pay for stays within the minimum and the ceiling.

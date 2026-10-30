@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""group_by_length on the MLX trainer: HF parity for the ordering helper,
-config resolution, and labeled/unlabeled plan agreement. CPU-only, simulation shim.
-"""
+"""group_by_length on MLX: HF parity for ordering and config; labeled/unlabeled plans agree; CPU-only."""
 
 from __future__ import annotations
 
@@ -25,8 +23,7 @@ import sys
 
 import pytest
 
-# The MLX simulation shim runs on torch; native Apple Silicon installs ship
-# without it, and a collection error there would also stop the _metal companion.
+# Shim runs on torch, which native Apple Silicon installs lack; importorskip avoids stopping _metal.
 torch = pytest.importorskip("torch")
 
 
@@ -420,8 +417,7 @@ def test_streaming_rejects_length_grouping():
 
 
 def test_responses_only_rejects_streaming_grouping_on_a_sized_dataset(monkeypatch):
-    # A sized dataset under streaming=True skips the lazy branch and used to build and cache an eager
-    # length-grouped plan, which train() then returned before its own streaming rejection.
+    # Sized dataset with streaming=True: reject grouping before an eager length-grouped plan is cached.
     import types
 
     import unsloth_zoo.dataset_utils as dataset_utils

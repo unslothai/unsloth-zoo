@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fp16 full finetuning of an MoE on a GPU without bfloat16 (T4, V100), grouped_mm backend.
-
-The expert stacks are float32 masters and the Trainer runs fp16 autocast, so fp16
-activations reach torch._grouped_mm, which autocast does not cast:
-"expected mat1 and mat2 to have the same dtype, but got: c10::Half != float".
-Runs on CPU; equal dtypes (LoRA, bf16) must stay bit-for-bit unchanged.
-"""
+"""fp16 full finetune of an MoE on GPUs without bf16 (T4, V100): fp32 expert masters under fp16 autocast, which does not
+cast torch._grouped_mm inputs, hit a dtype mismatch; equal-dtype paths (LoRA, bf16) must stay bit-for-bit unchanged,
+tested on CPU"""
 
 import pytest
 import torch
@@ -30,8 +26,7 @@ from unsloth_zoo.temporary_patches import moe_utils
 
 @pytest.fixture(autouse = True)
 def native_grouped_mm(monkeypatch):
-    """Take the real torch._grouped_mm on CPU (the probe says no there and the per-group
-    matmul fallback would be cast by CPU autocast, hiding the GPU failure)."""
+    """Use the real torch._grouped_mm on CPU: the probe answers no there, and the per-group matmul fallback would be cast by CPU autocast, hiding the GPU failure"""
     if not hasattr(torch, "_grouped_mm"):
         pytest.skip("torch._grouped_mm unavailable")
     monkeypatch.setattr(moe_utils, "_grouped_mm_supported_on", lambda device: True)
@@ -88,3 +83,39 @@ def test_matching_dtypes_are_bitwise_unchanged(dtype):
     out = moe_utils._grouped_mm_with_backward_fix(x, w.detach(), offsets)
     assert out.dtype == dtype
     assert torch.equal(out, expected)
+
+
+def _compile_counters():
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+    torch._dynamo.reset()
+    counters.clear()
+    return counters
+
+
+@pytest.mark.parametrize("fullgraph", [True, False])
+def test_fp16_activation_meets_fp32_master_compiles(fullgraph):
+    """Compiled fp16 x fp32-master grouped_mm: one graph, no breaks, bitwise equal to eager."""
+    _cpu_half_autocast_or_skip()
+    if moe_utils._GROUPED_MM_FP16_OP is None:
+        pytest.skip("torch.library.custom_op unavailable")
+
+    def step(x, w, offsets):
+        with torch.autocast("cpu", dtype = torch.float16):
+            return moe_utils._grouped_mm_with_backward_fix(x, w, offsets)
+
+    x, w_eager, offsets = _case(torch.float16, torch.float32)
+    ref = step(x, w_eager, offsets)
+    ref.float().sum().backward()
+
+    counters = _compile_counters()
+    _, w, _ = _case(torch.float16, torch.float32)
+    out = torch.compile(step, fullgraph = fullgraph, dynamic = True)(x, w, offsets)
+    out.float().sum().backward()
+    # torch 2.14 reports a failed fp16 trace as "unimplemented", not a graph break.
+    assert sum(counters["graph_break"].values()) == 0
+    assert sum(counters["unimplemented"].values()) == 0
+    assert counters["frames"]["total"] == counters["frames"]["ok"]
+    assert counters["stats"]["unique_graphs"] == 1
+    assert out.dtype == torch.float16 and torch.equal(out, ref)
+    assert w.grad.dtype == torch.float32 and torch.equal(w.grad, w_eager.grad)

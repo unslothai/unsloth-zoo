@@ -40,9 +40,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "unsloth_zoo"
 
-# Imported eagerly by unsloth_zoo/__init__.py, so they must hold on the floor even
-# though the rest of mlx/ is lazy. Package-relative, since mlx/cce/__init__.py shares
-# a file name with mlx/__init__.py but is lazy like the rest of the subpackage.
+# Eagerly imported by unsloth_zoo/__init__.py, so they must work on the floor though the rest of mlx/ is lazy; paths are
+# package-relative since mlx/cce/__init__.py shares a basename.
 MLX_IMPORT_TIME = {"mlx/__init__.py", "mlx/runtime.py"}
 
 
@@ -88,13 +87,8 @@ def signature_annotations(node):
 
 
 def evaluated_annotations(tree):
-    """Annotations Python evaluates, so the future import is what defers them.
-
-    Variable annotations are evaluated at module and class scope only; inside a
-    function body they are never evaluated, so flagging those is a false positive.
-    A class body nested in a function is still class scope, so it goes back to
-    being evaluated. Signature annotations are evaluated wherever their ``def`` is.
-    """
+    """Annotations Python evaluates: variable annotations at module or class scope (also a class nested in a function),
+    and signature annotations wherever their def is; function-body variable annotations are not evaluated."""
     out = []
 
     def walk(node, in_function):
@@ -114,8 +108,7 @@ def evaluated_annotations(tree):
     return out
 
 
-# A `|` between these is a union, not arithmetic: builtin types, `None`, and whatever
-# the module pulled in from typing.
+# A | between these names is a union, not arithmetic: builtin types, None, and whatever the module imported from typing.
 TYPE_ANCHORS = frozenset({
     "str", "int", "float", "bool", "bytes", "bytearray", "complex", "object", "type",
     "list", "dict", "tuple", "set", "frozenset",
@@ -132,11 +125,7 @@ def typing_names(tree):
 
 
 def union_operands(node):
-    """Operands of an ``A | B | C`` chain, or None if any part is not name-shaped.
-
-    ``str``, ``os.PathLike``, ``List[int]``, ``None`` and a ``"ForwardRef"`` string
-    are name-shaped; a call, a set/dict/list display or a number is not.
-    """
+    """Returns the operands of an A | B | C chain, or None if any part is not name-shaped: a call, a set/dict/list display or a number is not."""
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
         left, right = union_operands(node.left), union_operands(node.right)
         return None if left is None or right is None else left + right
@@ -151,13 +140,8 @@ def union_operands(node):
 
 
 def looks_like_a_type_alias(node, known_typing_names):
-    """``PathLike = str | Path`` yes; ``defaults | extra`` and ``re.A | re.M`` no.
-
-    Every operand must be name-shaped and at least one must be a recognisable type.
-    Without that anchor a ``|`` between plain names is far more likely to be a dict
-    merge (PEP 584, valid on 3.9), a set union or flag arithmetic, and failing the
-    gate on those would block code that runs perfectly well on the floor.
-    """
+    """Needs name-shaped operands and one recognisable type (str | Path yes; defaults | extra, re.A | re.M no): a bare |
+    between plain names may be a PEP 584 dict merge valid on 3.9."""
     operands = union_operands(node)
     if not operands:
         return False
@@ -173,14 +157,8 @@ def looks_like_a_type_alias(node, known_typing_names):
 
 
 def evaluated_values(tree):
-    """Expressions that run at import, at module or class scope.
-
-    Type aliases are the case that matters: ``PathLike = str | Path`` raises below
-    3.10 and, unlike an annotation, the future import does not defer it. Decorator
-    expressions and parameter defaults are evaluated the same way, so they belong
-    here too. Control flow is descended into (a branch that runs, runs) but function
-    bodies are not, since those only execute when called.
-    """
+    """Expressions run at import at module or class scope, including type aliases (raise below 3.10 and not deferred by
+    the future import), decorators and defaults; control flow is entered, function bodies not."""
     out = []
     scoped = (ast.If, ast.Try, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor,
               ast.While, ast.ExceptHandler, ast.ClassDef)
@@ -206,11 +184,7 @@ def evaluated_values(tree):
 
 
 def union_nodes(expression):
-    """``BinOp(BitOr)`` nodes in an annotation, skipping ``Literal[...]`` contents.
-
-    ``Literal[re.I | re.M]`` is flag arithmetic over values, evaluates fine on 3.9,
-    and must not be read as a union.
-    """
+    """BitOr nodes in an annotation, skipping Literal[...] contents: Literal[re.I | re.M] is flag arithmetic over values that runs fine on 3.9, not a union."""
     if isinstance(expression, ast.Subscript):
         base = expression.value
         name = getattr(base, "id", None) or getattr(base, "attr", None)
@@ -248,12 +222,8 @@ def test_every_module_parses_on_the_declared_floor():
 
 
 def test_every_module_compiles():
-    """``ast.parse`` accepts things ``compile`` rejects, and only compile runs on import.
-
-    A misplaced ``from __future__ import annotations`` is the case that bites here: it
-    parses, it makes ``has_future_annotations`` suppress the union check, and it still
-    raises SyntaxError on import.
-    """
+    """ast.parse accepts what compile rejects, and only compile runs on import: a misplaced from __future__ import
+    annotations parses, suppresses the union check, yet raises SyntaxError."""
     broken = []
     for path in scoped_files():
         try:
@@ -305,11 +275,8 @@ def _is_floor_version_check(node):
 
 
 def test_vendored_fla_stays_gated_below_310():
-    """Excluding _vendored/fla is sound only while this guard bails out on the floor.
-
-    Asserted structurally, not by grepping: a commented-out or dead-code check would
-    satisfy a text search while the injection went ahead anyway.
-    """
+    """Excluding _vendored/fla is only sound while the guard bails out below Python 3.10; checked structurally, since a
+    commented-out or dead check would still satisfy a text search."""
     path = PACKAGE_ROOT / "temporary_patches" / "fla_vendor.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     guard = next((n for n in ast.walk(tree)
@@ -366,14 +333,9 @@ def strict_patch_calls(tree):
 
 
 def test_modules_with_strict_patches_do_not_defer_annotations():
-    """Deferring annotations is not a safe way to reach the floor in a patching module.
-
-    ``can_safely_patch`` compares ``inspect.signature(...).annotation`` objects directly,
-    with no ``get_type_hints``, so under the default strict match level a stringified
-    annotation never equals the live upstream one. ``patch_function`` then declines the
-    patch and only logs it, which is silent in normal use. Reach the floor with
-    ``typing.Optional`` / ``typing.Union`` in these modules instead.
-    """
+    """Do not defer annotations in patching modules: can_safely_patch compares inspect.signature annotations with no
+    get_type_hints, so a stringified one never matches at the default strict level and patch_function declines with
+    only a log; use typing.Optional or typing.Union."""
     offenders = []
     for path in scoped_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

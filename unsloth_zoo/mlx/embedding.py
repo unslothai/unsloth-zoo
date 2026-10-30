@@ -56,8 +56,7 @@ def l2_normalize(x, eps = 1e-12):
 
 
 def pool(hidden_states, attention_mask, mode = "mean"):
-    """Reduce ``[batch, seq, hidden]`` to ``[batch, hidden]``; must ignore left or right padding.
-    A sequence of modes is concatenated, as sentence-transformers does."""
+    """Reduce [batch, seq, hidden] to [batch, hidden], ignoring left or right padding; a sequence of modes is concatenated as sentence-transformers does."""
     if isinstance(mode, (list, tuple)):
         return mx.concatenate([pool(hidden_states, attention_mask, m) for m in mode], axis = -1)
     if mode not in POOLING_MODES:

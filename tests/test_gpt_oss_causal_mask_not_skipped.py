@@ -14,23 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""gpt-oss inference must never be handed a None causal mask.
-
-`patch_GptOssModel` wraps `create_causal_mask` so that training with flex
-attention skips dense mask creation -- flex builds its own BlockMask and a dense
-one costs O(seq_len^2). The skip used to trigger on `input_embeds.requires_grad`
-alone, which is NOT a training signal: unsloth calls `enable_input_require_grads()`
-on every LoRA-capable load, so embeddings require grad during inference too.
-
-Measured consequence on a B200 before the fix, `unsloth/gpt-oss-20b`, 163 tokens
-of fixed prose: eager attention received `attention_mask=None`, i.e. no causal
-masking at all, and perplexity went from 4.507 to 642.7 (bnb-4bit: 4.936 to
-73.3). Output stayed fluent, so only a perplexity measurement exposed it. The
-patch is skipped entirely under UNSLOTH_COMPILE_DISABLE, which is why the
-uncompiled runs were correct and the compiled ones were not.
-
-CPU-only: the wrapper is pure dispatch logic over a fabricated config.
-"""
+"""gpt-oss inference must never get a None causal mask: the flex-training skip keys on the training flag, not
+requires_grad (enable_input_require_grads() sets it at inference too); the patch is skipped under
+UNSLOTH_COMPILE_DISABLE; CPU-only."""
 import os
 import sys
 import types
@@ -38,9 +24,8 @@ import types
 import pytest
 import torch
 
-# Installing the patch pulls transformers' lazy quantization imports (bitsandbytes.nn
-# among them) into sys.modules. On a runner where they are not already loaded, conftest
-# blames the first test that touched them, so warm them at collection time instead.
+# Installing the patch pulls transformers' lazy quantization imports (bitsandbytes.nn among them) into sys.modules;
+# conftest blames the first test touching them, so warm them at collection time.
 for _warm in ("transformers.models.gpt_oss.modeling_gpt_oss", "bitsandbytes.nn"):
     try:
         __import__(_warm)
@@ -69,8 +54,7 @@ def wrapper(monkeypatch):
         cfg = kwargs.get("config", None)
         if cfg is None:
             cfg = next((a for a in args if hasattr(a, "_attn_implementation")), None)
-        # Record the VALUE at call time: the wrapper restores it afterwards, so
-        # holding the object would only ever show the restored setting.
+        # Record the VALUE at call time: the wrapper restores the setting afterwards, so holding the object would only show the restored value.
         calls.append({
             "kwargs": kwargs,
             "attn_implementation": getattr(cfg, "_attn_implementation", None),
@@ -80,10 +64,8 @@ def wrapper(monkeypatch):
     import transformers.generation.utils as generation_utils
     import transformers.models.gpt_oss.modeling_gpt_oss as modeling
 
-    # The patch writes to three modules and to GptOssModel itself, and creates names
-    # that were not there before, so snapshot every one of them rather than only the
-    # ones this fixture fakes: leaving any behind points a later in-process forward at
-    # `factory`. Re-patching is gated on `__patched_causal_mask__`, so it also has to go.
+    # The patch writes to three modules and GptOssModel, creating new names: snapshot all of them or leftovers point
+    # later forwards at `factory`; re-patching is gated on `__patched_causal_mask__`, so it must go too.
     touched = [
         (masking_utils, "create_causal_mask"),
         (masking_utils, "create_sliding_window_causal_mask"),
@@ -97,8 +79,7 @@ def wrapper(monkeypatch):
     ]
     _MISSING = object()
     snapshot = [(obj, name, getattr(obj, name, _MISSING)) for obj, name in touched]
-    # A class, so read __dict__: getattr would hand back an inherited forward and
-    # restoring it would define one where the class had none.
+    # GptOssModel is a class, so read __dict__: getattr would return an inherited forward, and restoring it would define one where none existed.
     forward_before = modeling.GptOssModel.__dict__.get("forward", _MISSING)
 
     def restore():
@@ -184,8 +165,7 @@ def test_eager_inference_without_grad_gets_a_real_mask(wrapper, flex_installed):
 
 
 def test_flex_training_still_skips_the_dense_mask(wrapper, flex_installed):
-    """Preserved: flex builds its own BlockMask, and a dense mask at long
-    context is the O(seq_len^2) allocation this skip exists to avoid."""
+    """Flex builds its own BlockMask, and a dense mask at long context is the O(seq_len^2) allocation the skip exists to avoid."""
     with torch.enable_grad():
         got = wrapper.fn(
             config = _config("flex_attention", training = True),
@@ -197,9 +177,8 @@ def test_flex_training_still_skips_the_dense_mask(wrapper, flex_installed):
 
 
 def test_eager_config_training_still_skips_when_flex_will_run(wrapper, flex_installed):
-    """forward_function picks flex_attention_with_sink from self.training alone,
-    so an eager _attn_implementation during training still gets flex, and a dense
-    mask would be built and thrown away (unsloth-zoo#1212 review, P1)."""
+    """forward_function picks flex_attention_with_sink from self.training alone, so an eager _attn_implementation in
+    training still gets flex; a dense mask would be built and thrown away (unsloth-zoo issue 1212)."""
     with torch.enable_grad():
         got = wrapper.fn(
             config = _config("eager", training = True),
@@ -222,8 +201,7 @@ def test_training_builds_the_mask_when_the_flex_forward_is_absent(wrapper, flex_
 
 
 def test_flex_training_builds_the_mask_when_the_flex_forward_is_absent(wrapper, flex_absent):
-    """Stock transformers flex attention takes causality from this factory rather than
-    building its own, so a flex config without the patched forward still needs a mask."""
+    """Stock transformers flex attention takes causality from this factory, not its own mask, so a flex config without the patched forward still needs a mask."""
     with torch.enable_grad():
         got = wrapper.fn(
             config = _config("flex_attention", training = True),
@@ -234,8 +212,7 @@ def test_flex_training_builds_the_mask_when_the_flex_forward_is_absent(wrapper, 
 
 
 def test_grad_enabled_inference_gets_a_mask(wrapper, flex_installed):
-    """A plain forward outside no_grad is still inference: the recorded training
-    flag settles it, where the old requires_grad guess could not."""
+    """A plain forward outside no_grad is still inference; the recorded training flag decides it, where the old requires_grad guess could not."""
     with torch.enable_grad():
         got = wrapper.fn(
             config = _config("eager", training = False),
@@ -257,8 +234,7 @@ def test_flex_inference_under_no_grad_builds_the_mask(wrapper, flex_installed):
 
 
 def test_flex_config_is_swapped_to_eager_while_building(wrapper):
-    """A BlockMask cannot be consumed by the eager forward, so the factory must
-    be called with _attn_implementation temporarily set to eager, and restored."""
+    """A BlockMask cannot be consumed by the eager forward, so the factory is called with _attn_implementation temporarily set to eager, then restored."""
     cfg = _config("flex_attention", training = False)
     with torch.no_grad():
         wrapper.fn(config = cfg, input_embeds = _embeds(False), attention_mask = None)
@@ -274,8 +250,7 @@ def test_no_config_still_builds_a_mask(wrapper, flex_absent):
 
 
 def test_fallback_guess_applies_only_without_a_recorded_flag(wrapper, flex_installed):
-    """No flag (no model forward ran): the grad-shaped guess takes over, so a
-    no_grad call still builds and a grad+requires_grad call still skips."""
+    """Without a recorded flag (no model forward ran) the grad-shaped guess applies: no_grad still builds the mask, grad with requires_grad still skips."""
     with torch.no_grad():
         assert wrapper.fn(config = _config("flex_attention"),
                           input_embeds = _embeds(True), attention_mask = None) == "DENSE_MASK"
@@ -293,8 +268,7 @@ def test_positional_embeds_are_recognised(wrapper, flex_installed):
 
 
 def test_model_forward_drops_the_mask_only_when_the_flex_forward_is_installed():
-    """The same drop happens inside zoo's GptOssModel.forward, so it needs the same
-    flag: a bare `if self.training: attention_mask = None` is the defect."""
+    """The same drop happens in zoo's GptOssModel.forward, so it needs the same flag; a bare `if self.training: attention_mask = None` is the defect."""
     import ast
     import inspect
     import textwrap
