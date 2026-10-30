@@ -65,7 +65,14 @@ def _run(*w_flags):
 
 def test_fp_fusion_warning_ignored_under_error_but_others_raise():
     # -W error semantics; the CPU fallback notice of the vendored tree is allowed so it can inject on CPU.
-    out = _run("-W", "error", "-W", "ignore:Triton is not supported on current platform:UserWarning")
+    # A dependency's import-time deprecation (huggingface_hub on HF_HUB_ENABLE_HF_TRANSFER) is not what is
+    # under test; every check below is a UserWarning, which still raises.
+    out = _run(
+        "-W", "error",
+        "-W", "ignore:Triton is not supported on current platform:UserWarning",
+        "-W", "ignore::FutureWarning",
+        "-W", "ignore::DeprecationWarning",
+    )
     lines = dict(line.split(" ", 1) for line in out.stdout.splitlines() if " " in line)
     assert lines.get("fp_fusion") == "silent", out.stdout
     assert lines.get("unrelated") == "raised", out.stdout
