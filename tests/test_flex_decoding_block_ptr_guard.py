@@ -253,7 +253,24 @@ def test_explicit_auto_backend_takes_the_main_kernel_on_every_torch(select, requ
     assert select(seen[0][1]) == "main"
 
 
-@pytest.mark.parametrize("requested", [{"BACKEND": "TRITON"}, {"BACKEND": "FLASH"}, {"BACKEND": "TRITON_DECODE"}])
+@pytest.mark.parametrize("select", [_select_torch_2_9, _select_torch_2_12])
+@pytest.mark.parametrize("requested, expected", [
+    ({"BACKEND": "TRITON"}, {"FORCE_USE_FLEX_ATTENTION": True}),
+    ({"BACKEND": "TRITON", "BLOCK_M": 16}, {"BLOCK_M": 16, "FORCE_USE_FLEX_ATTENTION": True}),
+    ({"BACKEND": "TRITON", "FORCE_USE_FLEX_ATTENTION": False}, {"FORCE_USE_FLEX_ATTENTION": True}),
+])
+def test_named_triton_backend_takes_the_main_kernel_on_every_torch(select, requested, expected):
+    # torch 2.9 has no BACKEND, so a named TRITON would leave short queries on flex_decoding there.
+    seen = []
+    guarded = U._main_kernel_for_short_queries(_strict_flex(seen), {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True})
+    q = torch.randn(1, 2, 1, 8)
+    caller = dict(requested)
+    guarded(q, q, q, kernel_options = caller)
+    assert seen == [(None, expected)] and caller == requested
+    assert select(seen[0][1]) == "main"
+
+
+@pytest.mark.parametrize("requested", [{"BACKEND": "FLASH"}, {"BACKEND": "TRITON_DECODE"}])
 def test_named_backend_is_left_alone(requested):
     seen = []
     guarded = U._main_kernel_for_short_queries(_strict_flex(seen), {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True})
@@ -400,3 +417,28 @@ def test_sparse_flex_takes_the_main_kernel_only_when_flex_decoding_cannot_compil
     q, k = torch.randn(1, 8, 32, 16), torch.randn(1, 8, 128, 16)
     SB._flex(q, k, k.clone(), _block_mask(32, 128), 0.125)
     assert seen == [forced_options if unavailable else "inherited"], seen
+
+
+def test_both_exported_callables_take_the_main_kernel():
+    # The raw _flex_attention export (the uncompiled path in attention_sink) gets the same guard as flex_attention.
+    seen_compiled, seen_raw = [], []
+    forced = {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}
+    compiled, raw = U._guarded_exports(_strict_flex(seen_compiled), _strict_flex(seen_raw), forced)
+    q = torch.randn(1, 2, 1, 8)
+    compiled(q, q, q)
+    raw(q, q, q)
+    assert seen_compiled == seen_raw == [(None, forced)]
+
+
+def test_module_guards_both_exports_when_flex_decoding_cannot_compile():
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(U))
+    guarded = [
+        node for node in tree.body
+        if isinstance(node, ast.If) and "FLEX_DECODING_UNAVAILABLE" in ast.unparse(node.test)
+        and any(isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_guarded_exports" for n in ast.walk(node))
+    ]
+    assert guarded, "the module must route both exports through _guarded_exports"
+    targets = {ast.unparse(t) for n in ast.walk(guarded[0]) if isinstance(n, ast.Assign) for t in n.targets}
+    assert "(flex_attention, _flex_attention)" in targets

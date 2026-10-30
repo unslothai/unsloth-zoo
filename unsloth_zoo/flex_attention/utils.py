@@ -531,14 +531,17 @@ def _kernel_options_position():
 def _main_kernel_options(requested, forced_options):
     """kernel_options that keep a short query off flex_decoding. With no options the compiled call's own memory presets
     apply; an explicit dict replaces them as it does without the guard (a partial tile override must not be mixed with
-    preset tiles), so it only gains FORCE_USE_FLEX_ATTENTION. A named BACKEND other than AUTO chose the kernel itself.
-    An explicit AUTO is dropped: torch 2.9 has no BACKEND and only reads FORCE_USE_FLEX_ATTENTION, and 2.10+ rejects
-    BACKEND together with it."""
+    preset tiles), so it only gains FORCE_USE_FLEX_ATTENTION. torch 2.9 has no BACKEND and only reads
+    FORCE_USE_FLEX_ATTENTION, and 2.10+ rejects BACKEND together with it, so an explicit AUTO or TRITON is replaced by
+    the legacy knob (TRITON asks for the main kernel, so it is forced on). Other named backends chose the kernel."""
     if requested is None:
         return dict(forced_options)
     requested = dict(requested)
-    if requested.get("BACKEND") == "AUTO":
+    backend = requested.get("BACKEND")
+    if backend in ("AUTO", "TRITON"):
         del requested["BACKEND"]
+        if backend == "TRITON":
+            requested["FORCE_USE_FLEX_ATTENTION"] = True
     if "BACKEND" in requested:
         return requested
     return {"FORCE_USE_FLEX_ATTENTION": True, **requested}
@@ -595,8 +598,17 @@ if _TRITON_BLOCK_PTR_REMOVED and (_DECODE_USES_BLOCK_PTR is True or _MAIN_USES_B
             "flex_decoding needs, and its main flex kernel could not be checked, so flex attention may run eagerly "
             "with much more memory. Install the Triton your torch pins."
         )
+def _guarded_exports(compiled_flex_attention, raw_flex_attention, forced_options):
+    """Both exported callables with the main kernel for short queries. The uncompiled one reaches the same kernel
+    choice inside a caller's torch.compile."""
+    return (
+        _main_kernel_for_short_queries(compiled_flex_attention, forced_options),
+        _main_kernel_for_short_queries(raw_flex_attention, forced_options),
+    )
+
+
 if FLEX_DECODING_UNAVAILABLE and flex_attention is not None:
-    flex_attention = _main_kernel_for_short_queries(flex_attention, PREFILL_KERNEL_OPTIONS)
+    flex_attention, _flex_attention = _guarded_exports(flex_attention, _flex_attention, PREFILL_KERNEL_OPTIONS)
 
 
 def decode_kernel_options():
