@@ -998,6 +998,19 @@ def _invariant_kernels():
                                  output_names = ["out"], source = _INVARIANT_REDUCE))
 
 
+def invariant_attention_available():
+    """Whether `invariant_attention` runs here: on tensor units only where NAX is on, else on any Apple GPU."""
+    from . import nax
+    return nax.nax_available() if nax._nax_gpu() else mx.metal.is_available() and nax._gpu_generation() is not None
+
+
+@functools.cache
+def _invariant_frag():
+    # Simdgroup matrices pay for every tile row, and a one-token step's 6-8 query heads fill 8.
+    from .nax import nax_available
+    return 16 if nax_available() else 8
+
+
 def invariant_attention_supported(queries, keys, values):
     """Whether `invariant_attention` covers these `[B, H, L, D]` arrays; keys and values must have unit feature stride."""
     return (all(isinstance(x, mx.array) and x.ndim == 4 for x in (queries, keys, values))
@@ -1012,7 +1025,7 @@ def invariant_attention(queries, keys, values, scale):
     of its own one-row call."""
     B, H, L, D = queries.shape
     kv_heads, N = keys.shape[1], keys.shape[2]
-    G, frag = H // kv_heads, 16
+    G, frag = H // kv_heads, _invariant_frag()
     rows, splits = L * G, -(-N // INVARIANT_KEYS)
     first, second = _invariant_kernels()
     partials, stats = first(

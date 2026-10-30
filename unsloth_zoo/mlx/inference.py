@@ -7084,7 +7084,7 @@ def _invariant_attention_class(base):
 
 @contextmanager
 def row_invariant_attention(model, *, _modules = None):
-    """Opt-in (`UNSLOTH_MLX_FAST_VERIFY=1`), on GPUs with tensor units: the KV-cache attention of one-token
+    """Fast Verify, on Apple GPUs: the KV-cache attention of one-token
     decode steps and of the exact verifier's blocks runs on `attention.invariant_attention`, whose rows do not depend
     on the block, so verify rows stay Fast Verify's one-token decoding while a block reads each key once for all its
     rows. Not stock's bits (within fp32 reordering of stock attention); prefill stays stock. A subprocess probe gates
@@ -7103,7 +7103,8 @@ def row_invariant_attention(model, *, _modules = None):
             # Off where the lane projections are (`fast_verify_enabled`).
             if (calls and _lane_coverage(model, _modules)[3] and _resolved_bindings(_NAX_QMM_CONTRACT) is not None
                     and nax.kernel_probe_passed(matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available)
-                    and nax.kernel_probe_passed(attention.INVARIANT_PROBE_KEY, attention.__name__, "probe_invariant_attention")):
+                    and nax.kernel_probe_passed(attention.INVARIANT_PROBE_KEY, attention.__name__, "probe_invariant_attention",
+                                                attention.invariant_attention_available)):
                 for _, module in _fusion_modules(model, _modules):
                     if not isinstance(module, nn.Module) or module.training:
                         continue

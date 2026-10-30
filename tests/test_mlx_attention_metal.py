@@ -64,6 +64,7 @@ from unsloth_zoo.mlx.attention import (
     fast_prefill_supported,
     fused_kernel_exists,
     install_quantized_attention,
+    invariant_attention_available,
     invariant_attention_supported,
     probe_invariant_attention,
     probe_fast_prefill,
@@ -754,9 +755,19 @@ def test_qsa_simd_prefill_covers_query_groups_up_to_16(change):
 
 
 def test_invariant_attention_rows_are_their_one_row_calls_and_near_fp32():
-    if not nax.nax_available():
-        pytest.skip("needs the neural accelerators")
+    if not invariant_attention_available():
+        pytest.skip("needs an Apple GPU")
     probe_invariant_attention()
+
+
+@pytest.mark.parametrize("tensor_units, nax_on, apple, expected", [
+    (True, True, True, True), (True, False, True, False), (False, False, True, True), (False, False, False, False)])
+def test_invariant_attention_runs_on_apple_gpus_and_honors_the_nax_switch_on_tensor_units(
+        monkeypatch, tensor_units, nax_on, apple, expected):
+    monkeypatch.setattr(nax, "_nax_gpu", lambda: tensor_units)
+    monkeypatch.setattr(nax, "nax_available", lambda: nax_on)
+    monkeypatch.setattr(nax, "_gpu_generation", lambda: 15 if apple else None)
+    assert invariant_attention_available() is expected
 
 
 @pytest.mark.parametrize("change", [None, "group", "width", "fp16", "dtypes", "rows", "batch", "heads", "values", "dim"])

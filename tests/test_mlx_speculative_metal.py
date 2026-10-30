@@ -575,7 +575,7 @@ def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkey
 def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_restore(qwen_4bit, monkeypatch, mixed):
     import copy
     from mlx_vlm.models.qwen3_5 import language, speculative_verifier
-    from unsloth_zoo.mlx import inference, matmul, nax
+    from unsloth_zoo.mlx import attention, inference, matmul
     from unsloth_zoo.mlx.generate import SamplingParams, generation_mode
     if not matmul.lane_qmm_available():
         pytest.skip("the lane kernel needs an Apple GPU")
@@ -603,7 +603,7 @@ def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_res
         assert type(verifier)._unsloth_lane_verify_native is native
     assert type(verifier) is native
     with inference.row_invariant_attention(model):   # decode attention moves only with the verifier its blocks take
-        assert invariant() == nax.nax_available()
+        assert invariant() == attention.invariant_attention_available()
     with monkeypatch.context() as patch:
         patch.setattr(native, "_linear", lambda self, *args: None)
         with inference.row_invariant_attention(model):
@@ -659,7 +659,7 @@ def test_row_invariant_lane_projections_verify_rows_equal_one_token_decoding(qwe
 @pytest.mark.parametrize("opt_in", ["1", "0"])
 def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_kernel(qwen_4bit, opt_in, monkeypatch):
     from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache, RotatingKVCache, make_prompt_cache
-    from unsloth_zoo.mlx import attention, inference, matmul, nax
+    from unsloth_zoo.mlx import attention, inference, matmul
     from unsloth_zoo.mlx.generate import generation_mode
     if not matmul.lane_qmm_available():
         pytest.skip("the lane kernel needs an Apple GPU")
@@ -667,8 +667,7 @@ def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_ker
     lm = model.language_model
     batched = lambda: [ArraysCache(size = 2) if layer.is_linear else BatchKVCache([0]) for layer in lm.model.layers]
     monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", opt_in)
-    # On tensor units the opt-in attends decode steps and verify blocks of either cache on the invariant kernel.
-    invariant, kernel, widths = opt_in == "1" and nax.nax_available(), attention.invariant_attention, []
+    invariant, kernel, widths = opt_in == "1" and attention.invariant_attention_available(), attention.invariant_attention, []
     monkeypatch.setattr(attention, "invariant_attention", lambda q, *a: widths.append(q.shape[2]) or kernel(q, *a))
     with generation_mode(model, call = ("batch", "speculative")):
         # Rows on either side of MLX's decode attention kernel changes; a batch cache's blocks carry a mask array.
