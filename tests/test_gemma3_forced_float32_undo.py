@@ -175,8 +175,7 @@ print("RESULT " + json.dumps({
 
 
 def test_another_family_load_keeps_a_live_gemma3_model_patched():
-    # A bf16 Qwen load (flag "0") after an fp16 Gemma 3 load must not swap the Gemma 3 classes
-    # under the live fp16 model (it turned its loss into NaN); a bf16 Gemma 3 load still undoes them.
+    # A bf16 Qwen load must not unpatch a live fp16 Gemma 3 (loss went NaN); a bf16 Gemma 3 load does.
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", UNSLOTH_ZOO_DISABLE_GPU_INIT = "1")
     env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p)
     for key in ("UNSLOTH_FORCE_FLOAT32", "UNSLOTH_MODEL_NAME"):

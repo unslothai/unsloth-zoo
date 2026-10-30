@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The compiled modeling module and LoRA forwards follow UNSLOTH_FORCE_FLOAT32 in one process.
-
-An fp16 Gemma 3 load sets the flag to "1" and generates
-unsloth_compiled_module_gemma3 with the forced float32 MLP and RMSNorm. A later
-bf16 load in the same process (flag "0") used to return early on
-__UNSLOTH_PATCHED__ and keep running that fp16 module, and patch_lora_forwards
-kept the forced float32 LoRA forward. Each scenario mirrors the
-loader (pre_compile patches, compile, post_compile patches) in its own process.
-"""
+"""Compiled modeling module and LoRA forwards follow UNSLOTH_FORCE_FLOAT32 within one process."""
 
 import json
 import os
@@ -85,8 +77,7 @@ def _run(flags, cache):
 
 
 def _normalized(source):
-    # The modeling-module import list order depends on the module's attribute set
-    # (an unstable argsort), not on the flag; compare it as a set.
+    # Import order is an unstable argsort; compare as a set.
     out = []
     for line in source.splitlines():
         prefix = "from transformers.models.gemma3.modeling_gemma3 import ("
@@ -114,14 +105,11 @@ def test_compiled_module_follows_force_float32_in_process(tmp_path):
 
     p = _run(["1", "1", "0", "0", "1"], tmp_path / "mixed")
     assert all(x["mlp_module"] == "unsloth_compiled_module_gemma3" for x in p)
-    # Same flag: the first pass is reused, not regenerated.
     for i in (1, 3):
         assert p[i]["mlp_id"] == p[i - 1]["mlp_id"] and p[i]["source"] == p[i - 1]["source"]
         assert p[i]["lora_id"] == p[i - 1]["lora_id"]
-    # Flag flips: regenerated, and equal to a fresh process with that flag.
     for i in (2, 4):
         assert p[i]["mlp_id"] != p[i - 1]["mlp_id"] and p[i]["lora_id"] != p[i - 1]["lora_id"]
-    # The LoRA forward bakes the flag in too (forced float32 variant).
     assert lora_bf16 != lora_fp16
     assert p[0]["lora_source"] == lora_fp16 and p[2]["lora_source"] == lora_bf16
     # Flipping back reuses the flag-1 forward built in pass 0 (live layers keep theirs).
@@ -163,8 +151,7 @@ print("RESULT " + json.dumps(stamps))
 
 
 def test_lora_forwards_follow_the_flag_across_model_families(tmp_path):
-    # LoRA forwards are global: llama (0), gemma3 (1), llama (0) must end on the flag-0 forward
-    # even though llama's own compiled module is unchanged and returns early.
+    # LoRA forwards are global: llama's unchanged module must still restore the flag-0 forward.
     env = dict(
         os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
         UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_COMPILE_LOCATION = str(tmp_path / "cache"),
@@ -228,8 +215,7 @@ print("RESULT " + json.dumps({k: str(v) for k, v in out.items()}))
 
 
 def test_lora_layers_keep_their_flag_when_a_later_load_flips_it(tmp_path):
-    # A bf16 model kept alive while an fp16 forced float32 model loads must not change: its LoRA
-    # layers keep the flag-0 forward (199680), layers created under flag 1 take the float16 one (inf).
+    # Live bf16 layers keep flag 0 (199680); layers made under flag 1 overflow (inf).
     env = dict(
         os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
         UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_COMPILE_LOCATION = str(tmp_path / "cache"),
@@ -285,8 +271,7 @@ print("RESULT " + json.dumps({"attentions": len(out.attentions or ())}))
 
 
 def test_retained_model_keeps_output_capture_after_a_flip(tmp_path):
-    # Output capture matches modules by class; a flip regenerates the compiled classes, so a model
-    # built before it must still be matched (else output_attentions silently returns nothing).
+    # Pre-flip models must still match output capture, else output_attentions is silently empty.
     env = dict(
         os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
         UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_COMPILE_LOCATION = str(tmp_path / "cache"),
@@ -351,8 +336,7 @@ print("RESULT " + json.dumps({k: str(v) for k, v in out.items()}))
     [["gemma3", "1"], ["llama", "0"]],
 ], ids = ["bf16_then_fp16", "fp16_then_bf16"])
 def test_lora_attached_after_a_flip_follows_the_base_layer_flag(tmp_path, order):
-    # Model A loads, model B loads under the other flag, then A gets its adapters (get_peft_model
-    # after a second load): A's new LoRA layers must take A's variant, not the latest one.
+    # get_peft_model on A after B loads under the other flag: A's LoRA takes A's variant.
     env = dict(
         os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
         UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_COMPILE_LOCATION = str(tmp_path / "cache"),

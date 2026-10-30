@@ -5913,8 +5913,7 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
     target_names = set()
 
     def retarget(target):
-        # A flag flip regenerates the compiled module: keep the previous generation's class matched too,
-        # since models built from it are still alive (transformers matches with isinstance, which takes a tuple).
+        # Keep matching the previous generation's class: models built from it are still alive.
         targets = target if isinstance(target, tuple) else (target,)
         out = []
         for cls in targets:
@@ -6237,13 +6236,7 @@ def _patch_torch_dtype_modules(
 
 
 def _install_lora_forward_variant(function, previous_forward, forward):
-    """Switch PEFT's LoRA class to `forward` without changing the arithmetic of live layers.
-
-    Layers created under the previous flag keep their variant (a model loaded earlier must give
-    the same results after a later load); layers created later take the new one. LoRA layers
-    attached later to a module built before the flip (get_peft_model on the earlier model) take
-    that module's variant, so every live module is stamped, not only the LoRA layers.
-    """
+    """Switch PEFT's LoRA forward; live layers (and modules, for later get_peft_model) keep their variant."""
     variants = dict(getattr(previous_forward, "_unsloth_variants", None) or {
         previous_forward._unsloth_force_float32: previous_forward,
     })
@@ -6307,12 +6300,7 @@ def _compiled_source_key():
 
 
 def _unpatch_modeling_file(modeling_file):
-    """Undo a compile pass made under another source key, so the next one regenerates.
-
-    The compiled classes replaced the originals in modeling_file, and every source the
-    compiler reads comes from there, so put the originals back and rerun the
-    pre_compile temporary patches against them (they ran on the compiled classes).
-    """
+    """Restore modeling_file originals and rerun pre_compile patches so the next pass regenerates."""
     originals = _MODELING_FILE_ORIGINALS.get(modeling_file.__name__, {})
     for (container, key), value in originals.items():
         try:
@@ -6405,7 +6393,6 @@ def unsloth_compile_transformers(
         return
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())
-    # A pass compiled under another key (an fp16 load before a bf16 one) is redone.
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__") and _MODELING_FILE_KEYS.get(
         model_location, _compiled_source_key()
     ) != _compiled_source_key():
