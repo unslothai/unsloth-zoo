@@ -64,6 +64,19 @@ def _real_trl_jsd():
     return GKDTrainer.generalized_jsd_loss
 
 
+def _real_trl_jsd_batchmean():
+    """Installed TRL's loss when it divides unlabelled inputs by the batch only (>= 0.24); older TRL divides by
+    batch * dim 1."""
+    try:
+        from importlib.metadata import version
+        from packaging.version import Version
+        if Version(version("trl")) < Version("0.24.0"):
+            return None
+    except Exception:
+        return None
+    return _real_trl_jsd()
+
+
 def _transform(z, scale, cap):
     z = z * scale
     if cap:
@@ -188,7 +201,7 @@ def test_unlabelled_3d_divides_by_batch_as_trl(beta):
     wt = torch.randn(V, HT, generator = g) / 3
     hs = torch.randn(2, 3, H, generator = g)
     ht = torch.randn(2, 3, HT, generator = g)
-    fns = [trl_generalized_jsd_loss] + ([_real_trl_jsd()] if _real_trl_jsd() is not None else [])
+    fns = [trl_generalized_jsd_loss] + ([_real_trl_jsd_batchmean()] if _real_trl_jsd_batchmean() is not None else [])
     for fn in fns:
         zs, zt = hs.double() @ w.double().t(), ht.double() @ wt.double().t()
         ref3 = fn(zs, zt, beta = beta)
