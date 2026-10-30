@@ -441,3 +441,39 @@ def test_mean_under_autocast_matches_stock_dtype_and_scaled_backward():
     assert got.dtype == ref.dtype == torch.float32
     (got * 65536.0).backward()
     assert torch.isfinite(logits.grad).all()
+
+
+def _compiled_rows_everywhere(monkeypatch):
+    # The CUDA eager route runs the compiled chunk functions; hand them out on CPU too.
+    import unsloth_zoo.fused_losses.stable_softmax as stable_softmax
+    compiled = {
+        name: torch.compile(fn, dynamic = True, fullgraph = True)
+        for name, fn in (("forward", stable_softmax._rows_forward), ("backward", stable_softmax._rows_backward))
+    }
+    monkeypatch.setattr(stable_softmax, "_rows_impl", lambda logits: (compiled["forward"], compiled["backward"]))
+
+
+@pytest.mark.parametrize("route", ["eager", "compiled_rows", "traced"])
+def test_count_aware_ce_rejects_out_of_range_labels(route, monkeypatch):
+    # Stock F.cross_entropy raises for a label outside [0, V) that is not ignore_index; the compiled chunk takes the
+    # target by a masked sum, so it must not turn such a label into a finite loss and gradient instead.
+    torch._dynamo.reset()
+    if route == "compiled_rows":
+        _compiled_rows_everywhere(monkeypatch)
+    loss_fn = lambda x, t: unsloth_count_aware_cross_entropy(x, t, torch.tensor(1), shift = False)
+    if route == "traced":
+        loss_fn = torch.compile(loss_fn, fullgraph = True, dynamic = True)
+    logits = torch.tensor([[1.0, 2.0, 3.0], [0.5, 0.0, -1.0]])
+    for valid in ([2, 0], [2, -100]):
+        x = logits.clone().requires_grad_()
+        t = torch.tensor(valid)
+        loss_fn(x, t).backward()
+        y = logits.clone().requires_grad_()
+        F.cross_entropy(y, t, reduction = "sum").backward()
+        torch.testing.assert_close(x.grad, y.grad)
+    for bad in (-1, 3, 9):
+        with pytest.raises((IndexError, RuntimeError)):
+            F.cross_entropy(logits, torch.tensor([bad, 0]))
+        with pytest.raises((IndexError, RuntimeError)):
+            x = logits.clone().requires_grad_()
+            loss_fn(x, torch.tensor([bad, 0])).backward()

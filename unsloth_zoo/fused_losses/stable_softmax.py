@@ -216,9 +216,28 @@ class _CrossEntropyRows(torch.autograd.Function):
         return grad, None
 
 
+_ASSERT_ASYNC_MSG = "msg" in torch.ops.aten._assert_async.overloads()
+
+
+def _check_targets(target, keep, vocab_size, ignore_index):
+    # Raise like F.cross_entropy: the compiled chunk takes the target by a masked sum, which would score an
+    # out of range label as a target at the row max. On GPU and when traced a device-side assert (no host sync).
+    bad = keep & ((target < 0) | (target >= vocab_size))
+    if target.is_cuda or torch.compiler.is_compiling():
+        ok = torch.logical_not(bad.any())
+        if _ASSERT_ASYNC_MSG:
+            torch._assert_async(ok, f"Unsloth: cross entropy target out of bounds for a vocabulary of {vocab_size}")
+        else:
+            torch._assert_async(ok)
+    elif bool(bad.any()):
+        raise IndexError(f"Unsloth: cross entropy target {int(target[bad][0])} is out of bounds for a vocabulary "
+                         f"of {vocab_size} (ignore_index = {ignore_index}).")
+
+
 def cross_entropy_rows(logits, target, ignore_index = -100):
     """Per row nll of logits [N, V] (float32, float64 for float64 logits), 0 on ignored rows."""
     keep = target != ignore_index
+    _check_targets(target, keep, logits.shape[-1], ignore_index)
     safe = torch.where(keep, target, torch.zeros_like(target))
     nll = _CrossEntropyRows.apply(logits, safe)
     return torch.where(keep, nll, torch.zeros_like(nll))
