@@ -86,16 +86,31 @@ _CHILD = textwrap.dedent(
 )
 
 
-def _fingerprints(seed):
-    env = dict(os.environ, PYTHONHASHSEED = str(seed))
-    result = subprocess.run(
-        [sys.executable, "-c", _CHILD, TOKENIZER], env = env, capture_output = True, text = True, timeout = 600,
-    )
-    if result.returncode != 0:
-        if "OSError" in result.stderr or "ConnectionError" in result.stderr:
-            pytest.skip(reason = "offline runner, tokenizer download failed")
-        raise AssertionError(result.stderr[-4000:])
-    return json.loads(result.stdout.strip().splitlines()[-1])
+def _fingerprints(seeds):
+    # One child per seed, all at once: one child is ~40 s, so five in a row outrun pytest-timeout on CI.
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CHILD, TOKENIZER],
+            env = dict(os.environ, PYTHONHASHSEED = str(seed)),
+            stdout = subprocess.PIPE, stderr = subprocess.PIPE, text = True,
+        )
+        for seed in seeds
+    ]
+    try:
+        outputs = [child.communicate(timeout = 600) for child in children]
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+    results = []
+    for child, (stdout, stderr) in zip(children, outputs):
+        if child.returncode != 0:
+            if "OSError" in stderr or "ConnectionError" in stderr:
+                pytest.skip(reason = "offline runner, tokenizer download failed")
+            raise AssertionError(stderr[-4000:])
+        results.append(json.loads(stdout.strip().splitlines()[-1]))
+    return results
 
 
 @pytest.fixture(scope = "module")
@@ -105,7 +120,7 @@ def runs():
     except Exception as e:
         pytest.skip(reason = f"offline runner, tokenizer download failed: {e}")
     # Several hash seeds: a set of 3 to 5 column names lists in a seed dependent order.
-    return [_fingerprints(seed) for seed in (1, 2, 3, 4, 5)]
+    return _fingerprints((1, 2, 3, 4, 5))
 
 
 def test_identical_inputs_fingerprint_the_same_in_every_process(runs):
