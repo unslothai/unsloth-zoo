@@ -1106,6 +1106,118 @@ def invariant_attention(queries, keys, values, scale, depth = None, path = None)
                   output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
 
 
+# A DFlash drafter layer's attention: every block row reads the whole held window in place, split as above, then the
+# block's own few keys, those not `valid` left out, and a sink per query head, which only takes probability.
+_DRAFT_TAIL = """
+    constexpr int QK = D / 32;
+    const int h = threadgroup_position_in_grid.x;
+    const int r = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+    const ushort lane = thread_index_in_simdgroup;
+    const int L = q_shape[2], N = k_shape[2], H = q_shape[1];
+    const device T* qp = q + b * q_strides[0] + h * q_strides[1] + r * q_strides[2] + lane * QK * q_strides[3];
+    const device T* kp = k + b * k_strides[0] + (h / G) * k_strides[1] + lane * QK * k_strides[3];
+    const device T* vp = v + b * v_strides[0] + (h / G) * v_strides[1] + lane * QK * v_strides[3];
+    float qr[QK], o[QK], m = SINK ? float(sinks[h]) : numeric_limits<float>::lowest(), e = SINK ? 1.0f : 0.0f;
+    for (int j = 0; j < QK; ++j) {
+        qr[j] = float(scale) * qp[j * q_strides[3]];
+        o[j] = 0.0f;
+    }
+    for (int i = 0; i < N; ++i) {
+        if (!valid[i]) continue;
+        float score = 0.0f;
+        for (int j = 0; j < QK; ++j) score += qr[j] * float(kp[i * k_strides[2] + j * k_strides[3]]);
+        score = simd_sum(score);
+        const float top = max(m, score);
+        const float factor = fast::exp(m - top), weight = fast::exp(score - top);
+        m = top;
+        e = e * factor + weight;
+        for (int j = 0; j < QK; ++j) o[j] = o[j] * factor + weight * float(vp[i * v_strides[2] + j * v_strides[3]]);
+    }
+    const ulong row = (ulong(b) * H + h) * L + r;
+    for (int j = 0; j < QK; ++j) tail[row * D + lane * QK + j] = o[j];
+    if (lane == 0) {
+        tail_stats[row * 2] = m;
+        tail_stats[row * 2 + 1] = e;
+    }
+"""
+# A row's depth then names the end of the window: every split is whole but the last.
+_DRAFT_HEADER = """
+    inline int _invariant_bound(int position) { return position; }
+"""
+DRAFT_PROBE_KEY = "draft_attention:" + hashlib.sha256(
+    (_INVARIANT_SOURCE + _DRAFT_TAIL + _DRAFT_HEADER + _INVARIANT_REDUCE + str(INVARIANT_KEYS)).encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _draft_kernels():
+    from .nax import _QMM_HEADER
+    return (mx.fast.metal_kernel(name = "unsloth_draft_attention", input_names = ["q", "k", "v", "scale", "depth"],
+                                 output_names = ["partials", "stats"], header = _QMM_HEADER + _DRAFT_HEADER,
+                                 source = _INVARIANT_SOURCE, ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_draft_attention_tail", input_names = ["q", "k", "v", "scale", "sinks", "valid"],
+                                 output_names = ["tail", "tail_stats"], source = _DRAFT_TAIL, ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_draft_attention_reduce",
+                                 input_names = ["partials", "stats", "tail", "tail_stats", "depth", "L", "N"],
+                                 output_names = ["out"], header = _DRAFT_HEADER, source = _INVARIANT_REDUCE))
+
+
+@functools.lru_cache(maxsize = None)
+def _draft_depths(rows):
+    depths = mx.full((rows,), rows, mx.int32)
+    mx.eval(depths)
+    return depths
+
+
+def draft_attention_supported(queries, keys, values, block_keys, block_values):
+    return (invariant_attention_supported(queries, keys, values) and keys.shape[0] == 1
+            and block_keys.shape[1:2] == keys.shape[1:2] and block_keys.shape[3] == keys.shape[3]
+            and block_keys.dtype == block_values.dtype == keys.dtype and block_keys.shape == block_values.shape)
+
+
+def draft_attention(queries, keys, values, block_keys, block_values, valid, sinks, scale):
+    """Non-causal attention of `[1, H, L, D]` queries over a held window's `keys` and `values`, read in place, and a
+    block's own, of which only those `valid` count, with one sink per query head. Close to stock's, not its bits."""
+    B, H, L, D = queries.shape
+    kv_heads, N = keys.shape[1], keys.shape[2]
+    G, frag = H // kv_heads, _invariant_frag()
+    rows, splits = L * G, -(-N // INVARIANT_KEYS)
+    first, tail, second = _draft_kernels()
+    depth = _draft_depths(L)
+    queries = mx.contiguous(queries)
+    partials, stats = first(
+        inputs = [queries, keys, values, scale, depth],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("FM", frag), ("S", INVARIANT_KEYS)],
+        grid = (INVARIANT_KEYS * kv_heads, B, splits * -(-rows // frag)), threadgroup = (INVARIANT_KEYS, 1, 1),
+        output_shapes = [(B * kv_heads * rows * splits * D,), (B * kv_heads * rows * splits * 2,)],
+        output_dtypes = [mx.float32, mx.float32])
+    tails, tail_stats = tail(
+        inputs = [queries, block_keys, block_values, scale, _INVARIANT_NO_PATH if sinks is None else sinks.astype(mx.float32), valid],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("SINK", sinks is not None)],
+        grid = (32 * H, L, B), threadgroup = (32, 1, 1),
+        output_shapes = [(B * H * L * D,), (B * H * L * 2,)], output_dtypes = [mx.float32, mx.float32])
+    return second(inputs = [partials, stats, tails, tail_stats, depth, L, N], template = [("T", queries.dtype), ("D", D), ("S", INVARIANT_KEYS)],
+                  grid = (D, B * kv_heads * rows, 1), threadgroup = (D, 1, 1),
+                  output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
+
+
+def probe_draft_attention():
+    """Within 2% of stock attention's largest output, at window ends on both sides of a key split."""
+    H, KV, D, L = 32, 8, 128, 8
+    for dtype in (mx.bfloat16, mx.float16):
+        k, v = (mx.random.normal((1, KV, 1024, D), key = mx.random.key(i)).astype(dtype) for i in (1, 2))
+        block_k, block_v = (mx.random.normal((1, KV, 12, D), key = mx.random.key(i)).astype(dtype) for i in (3, 4))
+        q = mx.random.normal((1, H, L, D), key = mx.random.key(5)).astype(dtype)
+        valid = mx.arange(12) < 10
+        for n, sinks in [(n, sinks) for n in (1, 255, 256, 257, 1024) for sinks in (None, mx.random.normal((H,), key = mx.random.key(6)).astype(dtype))]:
+            got = draft_attention(q, k[:, :, :n], v[:, :, :n], block_k, block_v, valid, sinks, D ** -0.5)
+            mask = mx.concatenate([mx.ones((n,), mx.bool_), valid])
+            want = mx.fast.scaled_dot_product_attention(q, mx.concatenate([k[:, :, :n], block_k], axis = 2), mx.concatenate([v[:, :, :n], block_v], axis = 2),
+                                                        scale = D ** -0.5, mask = mask[None, None, None], sinks = sinks)
+            error = mx.abs((got - want).astype(mx.float32)).max().item()
+            assert error <= 0.02 * mx.abs(want.astype(mx.float32)).max().item(), (n, error)
+
+
 def probe_invariant_attention():
     """Every row of causal blocks, on both sides of key split boundaries and through cache-like views, bit for bit its
     one-row call; each output within 2% of fp32 attention's largest."""
