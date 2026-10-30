@@ -335,12 +335,14 @@ def _infer_intermediate(module, hidden):
     return v or 4 * (hidden or 1)
 
 
-def _input_width(module):
+def _input_widths(module):
+    # Every in_features under the module: PEFT expert LoRA wrappers register before the projection that reads x.
+    widths = set()
     for m in module.modules():
         v = getattr(m, "in_features", None)
         if isinstance(v, int) and not isinstance(v, bool) and v > 0:
-            return v
-    return None
+            widths.add(v)
+    return frozenset(widths) or None
 
 
 def _float_dtype(module):
@@ -497,7 +499,7 @@ class _TileState:
         self.nbytes = nbytes
         self.budget_gb = budget_gb
         self.tile_rows = _tile_rows(plan, hidden, intermediate, nbytes, budget_gb) if hidden else None
-        self.in_width = None
+        self.in_widths = None
         self.model_stats = None
 
 
@@ -570,7 +572,7 @@ def _tiled_forward(self, *args, **kwargs):
         return inner(*args, **kwargs)
     x = args[0]
     lead = x.shape[:-1]
-    if state.in_width is not None and x.shape[-1] != state.in_width:
+    if state.in_widths is not None and x.shape[-1] not in state.in_widths:
         # Channel-first input: the rows of x are not tokens, so tiling them would change the output.
         return inner(*args)
     rows = math.prod(lead)
@@ -694,7 +696,7 @@ def _attach(module, spec, plan, budget_cache):
     free_budget = plan.mode == "auto" or (plan.mode == "target" and not plan.target_gb > 0)
     budget = _budget(_device(module), budget_cache) if free_budget else 0.0
     state = d["_unsloth_tiling"] = _TileState(spec, plan, hidden, _infer_intermediate(module, hidden), nbytes, budget)
-    state.in_width = _input_width(module)
+    state.in_widths = _input_widths(module)
     _random_verdict(module)
 
 

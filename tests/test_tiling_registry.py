@@ -1086,6 +1086,31 @@ def test_channel_first_mlps_are_not_tiled():
     torch.testing.assert_close(m(x), want)
 
 
+class _WrappedExpertsMLP(torch.nn.Module):
+
+    def __init__(self, h = 32, i = 48):
+        super().__init__()
+        # Registered first and reporting the down projection's width, like PEFT's expert ParamWrapper.
+        self.experts = torch.nn.Module()
+        self.experts.in_features = i
+        self.up = torch.nn.Linear(h, i)
+        self.down = torch.nn.Linear(i, h)
+
+    def forward(self, x):
+        return self.down(torch.relu(self.up(x)))
+
+
+@needs_registry
+def test_input_width_guard_ignores_descendant_order(monkeypatch):
+    seen = _spy_engine(monkeypatch)
+    m = type("BarMLP", (_WrappedExpertsMLP,), {})()
+    x = torch.randn(2, 16, 32)
+    want = m(x)
+    R.install_module(m, "rows:2")
+    torch.testing.assert_close(m(x), want)
+    assert len(seen) == 1
+
+
 @needs_registry
 def test_bare_true_is_auto_and_short_sequences_run_untiled(monkeypatch):
     for value in (True, "1", "true", "on", "yes"):
