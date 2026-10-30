@@ -95,7 +95,10 @@ def _host_free(vm):
     # psutil reports the whole host inside a container; the cgroup limit is what gets the job OOM-killed.
     free = vm.available - _host_reserve(vm)
     cgroup = _cgroup_free()
-    return free if cgroup is None else min(free, cgroup)
+    if cgroup is None:
+        return free
+    # Other charged allocations (the dataloader, CUDA's host side) share the limit: keep max(1 GiB, 15%) of it.
+    return min(free, cgroup - max(_PIN_RESERVE_MIN_BYTES // 4, int(cgroup * _PIN_RESERVE_FRACTION)))
 
 
 def _local_world_size():
