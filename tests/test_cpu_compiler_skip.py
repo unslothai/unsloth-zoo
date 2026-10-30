@@ -24,8 +24,8 @@ import pytest
 import _cpu_compiler_skip as skip
 
 
-def _report(*chain):
-    return "PROBE " + json.dumps([list(x) for x in chain]) + "\n"
+def _report(*chain, stage = "compiler"):
+    return "PROBE " + json.dumps({"stage": stage, "chain": [list(x) for x in chain]}) + "\n"
 
 
 @pytest.mark.parametrize("chain", [
@@ -44,8 +44,15 @@ def test_a_missing_compiler_skips(chain, monkeypatch):
     (3, _report(("ImportError", "cannot import name 'InvalidCxxCompiler'"))),  # names it, is not it
     (3, _report(("AssertionError", "InvalidCxxCompiler was expected"))),
     (3, _report(("RuntimeError", "Compiler: cl is not found. Retrying"))),
-    (1, "PROBE " + json.dumps([["InvalidCxxCompiler", ""]])),  # not the probe's own except branch
+    (1, _report(("InvalidCxxCompiler", ""))),  # not the probe's own except branch
+    (3, _report(("InvalidCxxCompiler", ""), stage = "import")),  # Inductor itself is missing
     (3, "PROBE not json"),
+    (3, "PROBE null"),
+    (3, "PROBE 7"),
+    (3, "PROBE " + json.dumps([["InvalidCxxCompiler", ""]])),  # not the report shape
+    (3, "PROBE " + json.dumps({"stage": "compiler", "chain": None})),
+    (3, "PROBE " + json.dumps({"stage": "compiler", "chain": [None, 3, ["InvalidCxxCompiler"], [1, 2]]})),
+    (3, "PROBE " + json.dumps({"stage": "compiler", "chain": [["InvalidCxxCompiler", None]]})),
     (None, ""),  # timed out
 ])
 def test_any_other_probe_result_runs_the_check(result, monkeypatch):
@@ -53,7 +60,7 @@ def test_any_other_probe_result_runs_the_check(result, monkeypatch):
     skip.skip_without_cpu_inductor({})
 
 
-def test_the_probe_is_cached_per_compile_environment(monkeypatch):
+def test_the_probe_is_cached_per_child_environment(monkeypatch):
     calls = []
 
     class _Proc:
@@ -61,16 +68,42 @@ def test_the_probe_is_cached_per_compile_environment(monkeypatch):
 
     monkeypatch.setattr(skip, "_probes", {})
     monkeypatch.setattr(skip.subprocess, "run", lambda *a, **k: calls.append(k["env"]) or _Proc())
-    for env in ({"CXX": "g++"}, {"CXX": "g++", "HOME": "/x"}, {"CXX": "clang++"}, {"CXX": "g++", "TORCH_LOGS": "+x"}):
-        skip.skip_without_cpu_inductor(env)
-    assert [e.get("CXX") for e in calls] == ["g++", "clang++", "g++"], calls
+    envs = ({"CXX": "g++"}, {"CXX": "g++"}, {"CXX": "g++", "HOME": "/x"}, {"CXX": "g++", "TORCH_LOGS": "+x"})
+    for env in envs:
+        skip.skip_without_cpu_inductor(dict(env))
+    # The child receives the whole env, so every distinct env is probed once and an identical one is reused.
+    assert calls == [envs[0], envs[2], envs[3]], calls
+
+
+def _bogus_compiler_env(**extra):
+    # Keep the rest of the env (e.g. TORCHINDUCTOR_CACHE_DIR); only drop the settings that skip compilation.
+    drop = {"TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE", "TORCHDYNAMO_SUPPRESS_ERRORS"}
+    env = {k: v for k, v in os.environ.items() if k.upper() not in drop}
+    env["CXX"] = os.path.join(os.sep, "nonexistent", "cxx-for-test")
+    env.update(extra)
+    return env
+
+
+def _classified(env):
+    pytest.importorskip("torch")
+    returncode, stdout = skip._probe(env)
+    if returncode == 0:
+        pytest.skip("this torch finds a C++ compiler without the configured one, so there is nothing to classify")
+    report = skip._report(stdout)
+    if report is not None and report.get("stage") == "import":
+        pytest.skip(f"no CPU Inductor here: {str(report['chain'])[:300]}")
+    return skip.missing_compiler(returncode, stdout), stdout
 
 
 def test_a_real_probe_with_a_bogus_compiler_skips():
-    pytest.importorskip("torch")
-    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("TORCH")}
-    env["CXX"] = os.path.join(os.sep, "nonexistent", "cxx-for-test")
+    missing, stdout = _classified(_bogus_compiler_env())
+    assert missing, stdout[-2000:]
+
+
+def test_inherited_compile_disable_settings_cannot_hide_a_missing_compiler():
+    # suppress_errors / compile-disable used to let a trivial compile succeed eagerly while the checks still failed.
+    missing, stdout = _classified(_bogus_compiler_env())  # precondition: the bogus compiler is seen as missing
+    assert missing, stdout[-2000:]
+    env = _bogus_compiler_env(TORCHDYNAMO_SUPPRESS_ERRORS = "1", TORCH_COMPILE_DISABLE = "1", TORCHDYNAMO_DISABLE = "1")
     returncode, stdout = skip._probe(env)
-    if returncode == 0:
-        pytest.skip("this torch compiles without the configured C++ compiler, so there is nothing to classify")
-    assert skip.missing_compiler(returncode, stdout), stdout[-2000:]
+    assert skip.missing_compiler(returncode, stdout), (returncode, stdout[-2000:])
