@@ -1435,6 +1435,9 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
     global GC_PREFETCH
     GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
+    global GC_SKIP_RNG_WITHOUT_DROPOUT, GC_RECOMPUTE_CHECK
+    GC_SKIP_RNG_WITHOUT_DROPOUT = os.environ.get("UNSLOTH_GC_SKIP_RNG_WITHOUT_DROPOUT", "0") == "1"
+    GC_RECOMPUTE_CHECK = os.environ.get("UNSLOTH_GC_RECOMPUTE_CHECK", "0").strip().lower()
     _reset_gc_prefetch_state()
     global CPU_BUFFERS
     global CPU_INDEX
@@ -1531,12 +1534,123 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
 pass
 
 
+# Opt-in: skip the CPU + device RNG snapshot (and the fork_rng around the recompute) when the checkpointed
+# module cannot draw random numbers, i.e. no dropout with p > 0 / attention dropout / router jitter is active.
+# The recompute then consumes no randomness either, so results and the global RNG stream are unchanged.
+GC_SKIP_RNG_WITHOUT_DROPOUT = os.environ.get("UNSLOTH_GC_SKIP_RNG_WITHOUT_DROPOUT", "0") == "1"
+# Opt-in debug check: compare every checkpoint's forward outputs with its recompute in backward (catches RNG,
+# graph-mode or MoE routing drift). "1" records and warns, "raise" raises on the first mismatch.
+GC_RECOMPUTE_CHECK = os.environ.get("UNSLOTH_GC_RECOMPUTE_CHECK", "0").strip().lower()
+GC_RNG_STATS = {"skipped": 0, "kept": 0}
+GC_RECOMPUTE_MISMATCHES = []
+_RANDOM_ATTRS = (
+    "attention_dropout", "attn_dropout", "dropout", "dropout_p", "dropout_rate", "dropout_prob",
+    "hidden_dropout", "hidden_dropout_prob", "attention_probs_dropout_prob", "resid_pdrop", "attn_pdrop",
+    "embd_pdrop", "router_jitter_noise", "jitter_noise", "drop_path", "drop_path_rate", "drop_prob",
+)
+_DRAWS_RANDOM = weakref.WeakKeyDictionary()  # module -> {training flag: bool}
+
+
+def _checkpoint_module(function):
+    """The nn.Module a checkpointed callable runs (bound method, functools.partial, keyword binder), or None."""
+    for _ in range(8):
+        if isinstance(function, torch.nn.Module): return function
+        owner = getattr(function, "__self__", None)
+        if isinstance(owner, torch.nn.Module): return owner
+        if isinstance(function, functools.partial):
+            function = function.func
+            continue
+        inner = None
+        for name in ("function", "func", "__wrapped__"):
+            inner = getattr(function, name, None)
+            if inner is not None: break
+        if inner is None: return None
+        function = inner
+    return None
+pass
+
+
+def _scan_draws_random(module):
+    for m in module.modules():
+        if not m.training: continue
+        if isinstance(m, torch.nn.modules.dropout._DropoutNd):
+            if m.p > 0: return True
+            continue
+        attrs = m.__dict__
+        for name in _RANDOM_ATTRS:
+            value = attrs.get(name)
+            if isinstance(value, torch.nn.Module): continue  # a submodule, scanned on its own
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0: return True
+            if callable(value) and not isinstance(value, type): return True  # unknown random callable
+        # Some layers read the rate from their config at call time (F.dropout(p = self.config.attention_dropout)).
+        config = attrs.get("config")
+        if config is not None:
+            for name in _RANDOM_ATTRS:
+                value = getattr(config, name, None)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0: return True
+    return False
+pass
+
+
+def _rng_snapshot_needed(function, module = None):
+    """False only when the flag is on and the module provably draws no random numbers; any doubt keeps it."""
+    if not GC_SKIP_RNG_WITHOUT_DROPOUT: return True
+    if module is None: module = _checkpoint_module(function)
+    if module is None:
+        GC_RNG_STATS["kept"] += 1
+        return True
+    try:
+        cache = _DRAWS_RANDOM.get(module)
+        if cache is None: cache = _DRAWS_RANDOM[module] = {}
+        draws = cache.get(module.training)
+        if draws is None: draws = cache[module.training] = _scan_draws_random(module)
+    except TypeError:
+        draws = _scan_draws_random(module)
+    GC_RNG_STATS["kept" if draws else "skipped"] += 1
+    return draws
+pass
+
+
+def _output_checksum(outputs):
+    """Per output tensor: float64 sum and sum of squares, on the tensor's device (no sync)."""
+    if torch.is_tensor(outputs): outputs = (outputs,)
+    sums = []
+    for out in outputs:
+        if torch.is_tensor(out) and out.is_floating_point() and out.numel():
+            x = out.detach().double()
+            sums.append(torch.stack((x.sum(), x.square().sum())))
+    return sums
+pass
+
+
+def _compare_recompute(ctx, outputs):
+    expected = getattr(ctx, "_fwd_checksum", None)
+    if expected is None: return
+    got = _output_checksum(outputs)
+    same = len(got) == len(expected) and all(
+        a.shape == b.shape and torch.equal(a.to(b.device), b) for a, b in zip(got, expected)
+    )
+    if same: return
+    detail = [(a.tolist(), b.tolist()) for a, b in zip(expected, got)]
+    GC_RECOMPUTE_MISMATCHES.append({"function": repr(getattr(ctx, "run_function", None))[:120], "fwd_vs_recompute": detail})
+    message = (
+        "Unsloth: a gradient checkpoint's recompute differs from its forward "
+        f"(sum, sum of squares per output, forward vs recompute: {detail}). Something in the layer is not "
+        "deterministic across the two runs: RNG, routing, or a graph-mode difference."
+    )
+    if GC_RECOMPUTE_CHECK == "raise": raise RuntimeError(message)
+    warnings.warn(message, stacklevel = 2)
+pass
+
+
 class UnslothCheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
         # All Unsloth Zoo code licensed under LGPLv3
         ctx.run_function = run_function
+        if preserve_rng_state and GC_SKIP_RNG_WITHOUT_DROPOUT and not _rng_snapshot_needed(run_function):
+            preserve_rng_state = False
         ctx.preserve_rng_state = preserve_rng_state
         # Handle autocast enabled for cpu AND gpu.
         cuda_devices = _cuda_tensor_arg_devices(args)
@@ -1738,6 +1852,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
         with torch.no_grad():
             outputs = run_function(*args)
+        if GC_RECOMPUTE_CHECK in ("1", "raise"): ctx._fwd_checksum = _output_checksum(outputs)
 
         if use_gpu_buffer: MAIN_STREAM.wait_stream(EXTRA_STREAM)
         return outputs
@@ -1873,6 +1988,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 outputs = ctx.run_function(*detached_inputs)
             pass
         pass
+        if GC_RECOMPUTE_CHECK in ("1", "raise"): _compare_recompute(ctx, outputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
