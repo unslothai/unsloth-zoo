@@ -986,6 +986,7 @@ def _pristine_for_compiled_checkpoint(use_reentrant, kwargs):
 pass
 
 
+@torch._disable_dynamo
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     pristine = _pristine_for_compiled_checkpoint(use_reentrant, kwargs)
     if pristine is not None:
