@@ -187,6 +187,82 @@ def test_generic_flex_attention_takes_the_main_kernel_when_flex_decoding_cannot_
     assert forced == {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}
 
 
+def _strict_flex(seen):
+    # torch's own signature, so a kernel_options given twice fails as it would there.
+    def fake_flex(query, key, value, score_mod = None, block_mask = None, scale = None, enable_gqa = False,
+                  return_lse = False, kernel_options = None, *, return_aux = None):
+        seen.append((scale, kernel_options))
+        return "out"
+    return fake_flex
+
+
+def test_generic_flex_attention_accepts_kernel_options_positionally():
+    seen = []
+    forced = {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}
+    guarded = U._main_kernel_for_short_queries(_strict_flex(seen), forced)
+    q = torch.randn(1, 2, 1, 8)
+    assert guarded(q, q, q, None, None, 0.5, False, False, {"BLOCK_M": 16}) == "out"
+    assert guarded(q, q, q, None, None, 0.5, False, False, None) == "out"
+    assert guarded(q, q, q, None, None, 0.5, kernel_options = {"BLOCK_N": 8}) == "out"
+    assert guarded(q, q, q) == "out"
+    assert seen == [
+        (0.5, {"BLOCK_M": 16, "FORCE_USE_FLEX_ATTENTION": True}),
+        (0.5, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}),
+        (0.5, {"BLOCK_M": 32, "BLOCK_N": 8, "FORCE_USE_FLEX_ATTENTION": True}),
+        (None, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}),
+    ]
+    with pytest.raises(TypeError):
+        guarded(q, q, q, None, None, 0.5, False, False, {"BLOCK_M": 16}, kernel_options = {"BLOCK_M": 8})
+
+
+def test_kernel_options_position_matches_installed_torch():
+    import inspect
+    from torch.nn.attention.flex_attention import flex_attention as torch_flex
+    assert list(inspect.signature(torch_flex).parameters)[U._kernel_options_position()] == "kernel_options"
+
+
+@pytest.mark.parametrize("requested, expected", [
+    ({"BACKEND": "AUTO"}, {"BLOCK_M": 32, "BACKEND": "TRITON"}),
+    ({"BACKEND": "AUTO", "BLOCK_M": 16}, {"BLOCK_M": 16, "BACKEND": "TRITON"}),
+    ({"BACKEND": "TRITON"}, {"BACKEND": "TRITON"}),
+    ({"BACKEND": "FLASH"}, {"BACKEND": "FLASH"}),
+])
+def test_explicit_auto_backend_takes_the_main_kernel_too(requested, expected):
+    # torch rejects BACKEND together with FORCE_USE_FLEX_ATTENTION, so AUTO becomes TRITON instead.
+    seen = []
+    guarded = U._main_kernel_for_short_queries(_strict_flex(seen), {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True})
+    q = torch.randn(1, 2, 1, 8)
+    guarded(q, q, q, kernel_options = dict(requested))
+    assert seen == [(None, expected)]
+
+
+def test_decode_option_helpers_return_copies(monkeypatch):
+    forced = {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}
+    monkeypatch.setattr(U, "PREFILL_KERNEL_OPTIONS", forced)
+    monkeypatch.setattr(U, "FLEX_DECODING_UNAVAILABLE", True)
+    U.decode_kernel_options()["BLOCK_M"] = 1
+    U.decode_kernel_kwargs()["kernel_options"]["BLOCK_N"] = 1
+    assert forced == {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}
+    assert U.decode_kernel_options() == forced and U.decode_kernel_kwargs() == {"kernel_options": forced}
+
+
+def test_triton_probe_does_not_follow_a_working_shim_to_the_removed_stub(monkeypatch):
+    import functools
+    tl = pytest.importorskip("triton.language")
+    core = pytest.importorskip("triton.language.core")
+    @functools.wraps(_removed)
+    def shim(*args, **kwargs):
+        return _working(*args, **kwargs)
+    monkeypatch.setattr(tl, "make_block_ptr", shim)
+    assert U._triton_block_ptr_removed() is False
+    if hasattr(core, "builtin"):
+        # Triton's own @builtin wrapper around the removed stub still counts as removed.
+        monkeypatch.setattr(tl, "make_block_ptr", core.builtin(_removed))
+        assert U._triton_block_ptr_removed() is True
+        monkeypatch.setattr(tl, "make_block_ptr", functools.wraps(core.builtin(_removed))(shim))
+        assert U._triton_block_ptr_removed() is False
+
+
 @pytest.fixture
 def S(monkeypatch):
     # attention_sink on any host: CPU-only hosts leave the CUDA-sized flex utils undefined, so stub the missing names.

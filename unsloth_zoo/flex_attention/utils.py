@@ -430,19 +430,31 @@ pass
 
 def _triton_block_ptr_removed():
     # Triton 3.9 (and triton-windows 3.9) turned tl.make_block_ptr into a NotImplementedError. Generated kernels call the
-    # public triton.language name, so a shim that restores only that one counts as present.
+    # public triton.language name, so a shim that restores only that one counts as present. Only Triton's own @builtin
+    # wrapper is unwrapped: a working shim made with functools.wraps(old) also points __wrapped__ at the removed stub.
     try:
         import inspect
         import triton.language as _tl
+        import triton.language.core as _core
     except Exception:
         return False
-    make_block_ptr = getattr(_tl, "make_block_ptr", None)
-    if make_block_ptr is None:
+    fn = getattr(_tl, "make_block_ptr", None)
+    if fn is None:
         return True
-    try:
-        return "have been removed" in inspect.getsource(make_block_ptr)
-    except Exception:
-        return False
+    core_file = os.path.abspath(getattr(_core, "__file__", "") or "")
+    for _ in range(8):
+        code = getattr(fn, "__code__", None)
+        if code is None:
+            return False
+        if (code.co_name == "wrapper" and os.path.abspath(code.co_filename) == core_file
+                and getattr(fn, "__wrapped__", None) is not None):
+            fn = fn.__wrapped__
+            continue
+        try:
+            return "have been removed" in inspect.getsource(code)
+        except Exception:
+            return False
+    return False
 
 
 def _torch_template_uses_block_ptr(*candidates):
@@ -493,15 +505,44 @@ def _flex_main_template_uses_block_ptr():
     )
 
 
+def _kernel_options_position():
+    # flex_attention(query, key, value, score_mod, block_mask, scale, enable_gqa, return_lse, kernel_options, *, ...)
+    try:
+        import inspect
+        from torch.nn.attention.flex_attention import flex_attention as _torch_flex_attention
+        return list(inspect.signature(_torch_flex_attention).parameters).index("kernel_options")
+    except Exception:
+        return 8
+
+
+def _main_kernel_options(requested, forced_options):
+    """kernel_options that keep a short query off flex_decoding. A caller's own options stay on top; a named BACKEND
+    other than AUTO chose the kernel itself. An explicit AUTO becomes TRITON, since torch rejects BACKEND together with
+    FORCE_USE_FLEX_ATTENTION."""
+    requested = dict(requested or {})
+    backend = requested.get("BACKEND")
+    if backend is None:
+        return {**forced_options, **requested}
+    if backend == "AUTO":
+        tiles = {k: v for k, v in forced_options.items() if k != "FORCE_USE_FLEX_ATTENTION"}
+        return {**tiles, **requested, "BACKEND": "TRITON"}
+    return requested
+
+
 def _main_kernel_for_short_queries(flex_attention_fn, forced_options):
-    """flex_attention_fn with the main kernel for queries AUTO would send to flex_decoding. A caller's own options are
-    kept on top; one that names a BACKEND chose the kernel itself. No functools.wraps: copying the compiled function's
-    __dict__ would hand Dynamo its original callable and skip these options."""
-    def flex_attention(*args, kernel_options = None, **kwargs):
-        requested = kernel_options or {}
-        if "BACKEND" not in requested:
-            requested = {**forced_options, **requested}
-        return flex_attention_fn(*args, kernel_options = requested, **kwargs)
+    """flex_attention_fn with the main kernel for queries AUTO would send to flex_decoding (see _main_kernel_options).
+    kernel_options may come positionally or by keyword. No functools.wraps: copying the compiled function's __dict__
+    would hand Dynamo its original callable and skip these options."""
+    forced_options = dict(forced_options)
+    position = _kernel_options_position()
+    def flex_attention(*args, **kwargs):
+        if len(args) > position:
+            if "kernel_options" in kwargs:
+                return flex_attention_fn(*args, **kwargs)  # both given: flex_attention raises its own TypeError
+            kwargs["kernel_options"] = args[position]
+            args = args[:position] + args[position + 1:]
+        kwargs["kernel_options"] = _main_kernel_options(kwargs.get("kernel_options"), forced_options)
+        return flex_attention_fn(*args, **kwargs)
     return flex_attention
 
 
@@ -545,10 +586,10 @@ if FLEX_DECODING_UNAVAILABLE and flex_attention is not None:
 
 def decode_kernel_options():
     """kernel_options for a one-token query: AUTO (flex_decoding) unless it cannot compile here."""
-    return PREFILL_KERNEL_OPTIONS if FLEX_DECODING_UNAVAILABLE else {}
+    return dict(PREFILL_KERNEL_OPTIONS) if FLEX_DECODING_UNAVAILABLE else {}
 
 
 def decode_kernel_kwargs():
     """Extra flex_attention kwargs for a query AUTO may send to flex_decoding: none (the compiled flex_attention keeps
     its own tile options) unless flex_decoding cannot compile here."""
-    return {"kernel_options": PREFILL_KERNEL_OPTIONS} if FLEX_DECODING_UNAVAILABLE else {}
+    return {"kernel_options": dict(PREFILL_KERNEL_OPTIONS)} if FLEX_DECODING_UNAVAILABLE else {}
