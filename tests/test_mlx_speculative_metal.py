@@ -2340,6 +2340,34 @@ def test_a_predraft_projects_a_layers_queries_keys_and_values_in_two_launches(qw
     assert mx.array_equal(predraft(), alone).item() and launches == ([2, 3] if tensor else [])   # no further shared launch
 
 
+def test_a_predraft_reads_its_window_in_place_and_attends_as_stock_does(qwen, monkeypatch):
+    from unsloth_zoo.mlx import attention as kernels, inference, speculative
+    if not kernels.invariant_attention_available():
+        pytest.skip("the draft attention kernel needs an Apple GPU")
+    companion = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    drafter = speculative._built(speculative.ContextDrafter, companion, qwen[0].language_model)
+    layer, cache = drafter.model.layers[0].self_attn, drafter.model.make_cache()[0]
+    cache.update_and_fetch(*(mx.random.normal((1, layer.n_kv_heads, 300, layer.head_dim), key = mx.random.key(i)).astype(mx.bfloat16) for i in (1, 2)))
+    K = drafter.config.hidden_size
+    x, context = (mx.random.normal((1, rows, K), key = mx.random.key(rows)).astype(mx.bfloat16) for rows in (4, 3))
+    predraft = lambda: layer(x, context, drafter.model.rope, inference.PredraftCache(
+        cache, mx.array([True, False, True]), mx.array(cache.offset + 3, mx.int32)))
+    assert inference._draft_attention_on()
+    read, kernel, concatenate = [], kernels.draft_attention, mx.concatenate
+    monkeypatch.setattr(kernels, "draft_attention", lambda q, k, *args: read.append(k.shape[2]) or kernel(q, k, *args))
+    got = predraft()
+    assert read == [300]
+    joined = []
+    monkeypatch.setattr(mx, "concatenate", lambda arrays, *args, **kwargs: joined.append(sum(a.shape[2] for a in arrays if a.ndim == 4)) or concatenate(arrays, *args, **kwargs))
+    predraft()
+    assert all(rows < 300 for rows in joined)   # no copy of the window
+    monkeypatch.undo()
+    monkeypatch.setattr(inference, "_draft_attention_on", lambda: False)
+    want = predraft()
+    assert mx.abs((got - want).astype(mx.float32)).max().item() <= 0.02 * mx.abs(want.astype(mx.float32)).max().item()
+
+
 @pytest.mark.parametrize("repo", ["z-lab/Qwen3.5-4B-DFlash", "incoai/Qwen3.8-27B-DFlash2", "RadixArk/Qwen3.8-27B-DSpark"])
 def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_through_the_seam(qwen, repo, monkeypatch):
     from unsloth_zoo.mlx import generate, speculative

@@ -7800,6 +7800,11 @@ def _append_in_place(cache, keys, values) -> bool:
     return True
 
 
+def _draft_attention_on():
+    return nax.kernel_probe_passed(attention.DRAFT_PROBE_KEY, attention.__name__, "probe_draft_attention",
+                                   attention.invariant_attention_available)
+
+
 @functools.cache
 def _predraft_class(base):
     def __call__(self, x, x_ctx, rope, cache, projected_context = None):
@@ -7835,11 +7840,18 @@ def _predraft_class(base):
         old_keys, old_values = cache.history()
         held = 0 if old_keys is None else old_keys.shape[2]
         # Block rows first, so verified rows keep their places whether the block drafts before or after acceptance.
-        keys = mx.concatenate([prop_keys, ctx_keys] if old_keys is None else [old_keys, prop_keys, ctx_keys], axis = 2)
-        values = mx.concatenate([prop_values, ctx_values] if old_values is None else [old_values, prop_values, ctx_values], axis = 2)
-        mask = mx.concatenate([mx.ones((held + L,), mx.bool_), cache.valid])
-        o = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = self.scale, mask = mask[None, None, None],
-                                                 sinks = self.attention_sink_bias)
+        keys = mx.concatenate([prop_keys, ctx_keys], axis = 2)
+        values = mx.concatenate([prop_values, ctx_values], axis = 2)
+        mask = mx.concatenate([mx.ones((L,), mx.bool_), cache.valid])
+        if held and _draft_attention_on() and attention.draft_attention_supported(queries, old_keys, old_values, keys, values):
+            o = attention.draft_attention(queries, old_keys, old_values, keys, values, mask, self.attention_sink_bias, self.scale)
+        else:
+            if held:
+                keys = mx.concatenate([old_keys, keys], axis = 2)
+                values = mx.concatenate([old_values, values], axis = 2)
+                mask = mx.concatenate([mx.ones((held,), mx.bool_), mask])
+            o = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = self.scale, mask = mask[None, None, None],
+                                                     sinks = self.attention_sink_bias)
         if commit:
             cache.append(commit)
         return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
@@ -7866,6 +7878,7 @@ def predraft_attention(model) -> int:
     for attention in attentions:
         attention.__class__ = _predraft_class(module.DFlashAttention)
         attention.__dict__["_unsloth_lane_bindings"] = bindings
+    _draft_attention_on()   # its probe at load, not in a reply's first round
     # Past a sliding layer's window, the native call would trim the rows the predraft masks.
     return min([a.sliding_window - 1 for a in attentions if a.is_sliding] or [1 << 30])
 
