@@ -468,3 +468,67 @@ def test_float16_bias_master_multihead_attention(add_bias_kv):
     model.eval()
     with torch.no_grad():
         assert model(x).dtype == torch.float16
+
+
+def test_float16_bias_master_survives_unmerge_in_forward():
+    """PEFT's Linear.forward unmerges a merged adapter first (under disable_adapter), subtracting the LoRA bias
+    through base_layer.bias.data: that write must reach the float32 master, not a temporary cast."""
+    pytest.importorskip("peft")
+    from peft import LoraConfig, get_peft_model
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    torch.manual_seed(0)
+    try:
+        model = get_peft_model(_tiny_llama(dtype=torch.float16), LoraConfig(
+            r=8, lora_alpha=8, bias="all", lora_bias=True, target_modules=["q_proj", "v_proj"],
+        ))
+    except TypeError:
+        pytest.skip("this PEFT has no lora_bias")
+    prepare_model_for_training(
+        model, use_gradient_checkpointing=False, use_reentrant=False, full_finetuning=False,
+    )
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if "lora_B" in name:
+                param.fill_(0.25)
+    masters = {n: p.detach().clone() for n, p in _trainable_biases(model).items() if "lora_" not in n}
+    input_ids = torch.randint(0, 64, (1, 5))
+    with torch.no_grad():
+        with model.disable_adapter():
+            expected = model(input_ids=input_ids).logits
+        model.base_model.merge_adapter()
+        with model.disable_adapter():
+            out = model(input_ids=input_ids).logits
+    after = _trainable_biases(model)
+    # Merging rounds the float16 base weights (~1e-4); a stuck LoRA bias delta is ~0.2.
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=1e-2)
+    for n, b in masters.items():
+        torch.testing.assert_close(after[n].detach(), b, atol=1e-6, rtol=0)
+
+
+def test_float16_bias_master_peft_multihead_attention():
+    """PEFT's lora.MultiheadAttention wraps the base attention: the base still marks out_proj's bias as its parent,
+    so a plain float16 forward and backward work with the adapter on the attention itself."""
+    pytest.importorskip("peft")
+    from peft import LoraConfig, get_peft_model
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    torch.manual_seed(0)
+    try:
+        model = get_peft_model(_AttentionNet(False).half(), LoraConfig(r=4, target_modules=["attn"], bias="all"))
+    except (ValueError, TypeError):
+        pytest.skip("this PEFT has no LoRA for nn.MultiheadAttention")
+    prepare_model_for_training(
+        model, use_gradient_checkpointing=False, use_reentrant=False, full_finetuning=False,
+    )
+    masters = {n: p for n, p in model.named_parameters() if p.requires_grad and "lora_" not in n}
+    # PEFT wraps out_proj in a lora.Linear too; the base attention reads its bias through the wrapper.
+    assert any(n.endswith(("out_proj.bias", "out_proj.base_layer.bias")) for n in masters)
+    assert {p.dtype for p in masters.values()} == {torch.float32}
+    x = torch.randn(2, 3, 16, dtype=torch.float16)
+    out = model(x)
+    assert out.dtype == torch.float16
+    out.float().sum().backward()
+    assert all(p.grad is not None and p.grad.dtype == torch.float32 for p in masters.values())
+    with torch.no_grad():
+        assert model.eval()(x).dtype == torch.float16
