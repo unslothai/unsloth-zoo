@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The mxfp4 converter import must be resilient: convert_moe_packed_tensors_cpu is injected at
-runtime by Unsloth's mxfp4 patch and is absent from stock transformers, so importing both in one
-statement nulled BOTH names and wrongly tripped the `convert_moe_packed_tensors is None` guard in
-the mxfp4 export path. convert_moe_packed_tensors must survive even when _cpu is missing.
-"""
+"""The mxfp4 converter import must survive a missing convert_moe_packed_tensors_cpu (absent from stock transformers): a
+combined import nulled both names and tripped the is-None guard."""
 import subprocess
 import sys
 import textwrap
@@ -27,12 +24,9 @@ import pytest
 
 
 def test_convert_moe_packed_tensors_survives_missing_cpu_variant():
-    # The mxfp4 integration only exists from transformers ~4.55 (GPT-OSS); on the older
-    # transformers unsloth_zoo still supports (pin floor 4.51.3) the module is absent, so the
-    # subprocess import below would error rather than exercise the resilience. Skip cleanly there.
+    # transformers.integrations.mxfp4 exists only from ~4.55 (GPT-OSS); on older transformers (pin floor 4.51.3) the subprocess import would error, so skip.
     pytest.importorskip("transformers.integrations.mxfp4")
-    # Fresh process WITHOUT importing unsloth first, so convert_moe_packed_tensors_cpu is not
-    # injected: this is exactly the stock-transformers case the combined import broke.
+    # Fresh process without importing unsloth first, so convert_moe_packed_tensors_cpu is not injected: the stock-transformers case the combined import broke.
     code = textwrap.dedent(
         """
         import transformers.integrations.mxfp4 as m

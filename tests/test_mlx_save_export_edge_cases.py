@@ -1,9 +1,5 @@
-"""Edge cases for MLX save / GGUF export beyond the regression suite.
-
-Covers tensor-match ranks, sanitizer proxy replay, the real shard-rewrite
-loop, sidecar and JSON edges, concurrent exports, and converter placement.
-Runs on the tests/mlx_simulation torch shim like the rest of the MLX suite.
-"""
+"""Edge cases for MLX save and GGUF export beyond the regression suite: tensor-match ranks, sanitizer replay, shard
+rewrite, sidecars, concurrent exports; runs on the tests/mlx_simulation shim."""
 
 from __future__ import annotations
 
@@ -17,9 +13,8 @@ import types
 import warnings
 from pathlib import Path, PureWindowsPath
 
-# `os.geteuid` is POSIX-only and these decorators run at collection time, so a
-# bare call takes the whole module out on Windows (tests/test_llama_cpp_prebuilt.py:30
-# guards the same way).
+# os.geteuid is POSIX-only and these decorators run at collection, so a bare call takes the whole module out on Windows;
+# IS_POSIX is the guard, as in tests/test_llama_cpp_prebuilt.py.
 IS_POSIX = os.name == "posix"
 
 
@@ -1003,12 +998,8 @@ def test_merged_save_keeps_quantization_when_not_dequantizing(
 def _gguf_export_scaffold(
     monkeypatch, tmp_path, shards=1, mmproj=False, mmproj_shards=1
 ):
-    """Fake out the GGUF toolchain around the real ``save_pretrained_gguf``.
-
-    ``shards`` > 1 makes the converter write llama.cpp's shard names instead of
-    the requested ``--outfile``, which is what it does past ``--split-max-size``.
-    ``mmproj_shards`` does the same for the vision projector's own ``--outfile``.
-    """
+    """Fakes the GGUF toolchain around real save_pretrained_gguf; shards > 1 makes the converter write llama.cpp shard
+    names instead of --outfile (past --split-max-size); mmproj_shards does the same."""
     import unsloth_zoo.llama_cpp as llama_cpp
     import unsloth_zoo.mlx.utils as mutils
 
@@ -1034,9 +1025,8 @@ def _gguf_export_scaffold(
     def fake_convert_to_gguf(**kwargs):
         calls["convert_kwargs"] = kwargs
         calls["convert_count"] = calls.get("convert_count", 0) + 1
-        # Mirror convert_to_gguf's own naming: a model_name that already ends in
-        # .gguf is the --outfile verbatim, and the projector hangs off the name
-        # with that suffix stripped.
+        # Mirror convert_to_gguf naming: a model_name already ending in .gguf is the --outfile verbatim, and the
+        # projector hangs off the name with that suffix stripped.
         name = kwargs["model_name"]
         if name.endswith(".gguf"):
             stem = name[: -len(".gguf")]
@@ -1067,8 +1057,7 @@ def _gguf_export_scaffold(
     def fake_quantize_gguf(**kwargs):
         calls["quantize_kwargs"] = kwargs
         calls.setdefault("quantize_calls", []).append(kwargs)
-        # llama-quantize reads shard 1 and then every sibling its split.count names,
-        # so a missing sibling is as fatal as a missing input.
+        # llama-quantize reads shard 1 and then every sibling named by split.count, so a missing sibling is as fatal as a missing input.
         source = Path(kwargs["input_gguf"])
         needed = [source]
         split = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", source.name)
@@ -1201,11 +1190,9 @@ def test_gguf_keeps_the_vision_projector_out_of_the_intermediates(
 @pytest.mark.parametrize(
     "repo, stem",
     [
-        # The converter appends ".BF16.gguf" to these, so the model's own name is
-        # free to look like a projector's.
+        # The converter appends .BF16.gguf to these names, so a model's own name can look like a projector's.
         ("org/example-mmproj-model", "example-mmproj-model.BF16"),
-        # A name already ending in .gguf is used verbatim as the --outfile, so the
-        # model file itself is literally named like a projector.
+        # A name already ending in .gguf is used verbatim as the --outfile, so the model file itself is literally named like a projector.
         ("org/example-mmproj.gguf", "example-mmproj"),
     ],
 )
@@ -2161,8 +2148,7 @@ def test_resolve_processor_class_follows_model_remapping(monkeypatch, model_type
     monkeypatch.setitem(
         sys.modules, f"mlx_vlm.models.{module_type}.processing", fake_processing
     )
-    # The alias package does not exist in real mlx-vlm; the permissive shim
-    # would auto-create it, so block those imports to mirror production.
+    # The alias package does not exist in real mlx-vlm and the permissive shim would auto-create it, so block those imports to mirror production.
     monkeypatch.setitem(sys.modules, "mlx_vlm.models.alias_type.processing", None)
     monkeypatch.setitem(
         sys.modules, "mlx_vlm.models.alias_type.processing_alias_type", None
@@ -2230,10 +2216,7 @@ def test_image_processor_rebuild_uses_mlx_vlm_module_class(monkeypatch, tmp_path
 def test_gguf_export_lets_an_incomplete_install_reach_the_staged_resolver(
     monkeypatch, tmp_path
 ):
-    """A shim install missing conversion/ must not be pinned as authoritative.
-
-    Pinning it is what makes the resolver skip staging and abort, which is the
-    pre-split install this change exists to repair."""
+    """An incomplete shim install (missing conversion/) must not be pinned as authoritative, since pinning makes the resolver skip staging and abort."""
     import unsloth_zoo.llama_cpp as llama_cpp
 
     mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)

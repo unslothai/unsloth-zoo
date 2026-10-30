@@ -86,7 +86,7 @@ jobs:
         # ModuleNotFoundError: No module named 'torch'.
         run: |
           python -m pip install --upgrade pip
-          pip install "torch>=2.4.0,<2.15.0"
+          pip install "torch>=2.4.0,<2.16.0"
           pip install -e .[mlx]
           pip install pytest==9.0.3
           # The vision model used by tests/test_mlx_generate_metal.py loads
@@ -107,7 +107,7 @@ jobs:
         # silently remove the very check that is supposed to tell us whether the
         # next release is safe to adopt.
         #
-        # Also past mlx-vlm's <=0.7.9 ceiling (and transformers with it): non-gating.
+        # Also past mlx-vlm's <=0.7.11 ceiling (and transformers with it): non-gating.
         if: matrix.mlx == 'latest'
         run: |
           pip install --upgrade mlx mlx-lm mlx-vlm

@@ -26,10 +26,7 @@ def _mlx_lm_padded_len(max_len, pad_to=32):
 
 
 def _zoo_padded_len(max_len, pad_multiple=32):
-    """Reproduce the in-source rule from create_text_batches so we can
-    assert it stays aligned with mlx-lm without standing up the full
-    tokenizer + dataset pipeline.
-    """
+    """Reproduces the in-source length rule of create_text_batches so tests can check mlx-lm alignment without the full tokenizer and dataset pipeline."""
     return 1 + ((max_len + pad_multiple - 1) // pad_multiple) * pad_multiple
 
 

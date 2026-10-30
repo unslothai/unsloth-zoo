@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Indexer-selected sparse attention as a flex BlockMask instead of a dense [B, H, S, T] mask.
-
-Block indices must reach BlockMask.from_kv_blocks ascending: flex's backward silently
-miscomputes on unsorted lists.
-"""
+"""Indexer-selected sparse attention as a flex BlockMask, not a dense [B, H, S, T] mask; block indices must reach
+BlockMask.from_kv_blocks ascending (flex backward silently miscomputes on unsorted lists)."""
 
 __all__ = [
     "sparse_flex_device_ok",
@@ -49,8 +46,8 @@ def _count(kind, model_type):
 
 
 def _q_ranges(q_len, per_row):
-    """Query chunks for the indexers. One chunk inside torch.compile: a loop whose trip count comes from
-    the sequence length specialises the graph on it (one graph per length, and mark_dynamic fails)."""
+    """Query chunks for the indexers; under torch.compile a single chunk, since a loop over the sequence length
+    specialises one graph per length and mark_dynamic fails."""
     if torch.compiler.is_compiling():
         return [(0, q_len)]
     chunk = _q_chunk(per_row)
@@ -66,9 +63,9 @@ def _wants_attentions(module, kwargs):
 
 
 def in_unsloth_block():
-    """Inside Unsloth's per-decoder-layer compile region (fullgraph=False), where a graph break is legal.
-    _IN_BLOCK is also set while a user's torch.compile (maybe fullgraph=True) inlines the block, so only
-    _IN_COMPILED_REGION counts; an Unsloth without it keeps the model's path in every compile."""
+    """True only inside Unsloth's per-decoder-layer compile region (fullgraph=False, where graph breaks are legal);
+    _IN_BLOCK is also set under a user's fullgraph=True compile, so only _IN_COMPILED_REGION counts; a missing flag
+    keeps the model's path in every compile."""
     block = sys.modules.get("unsloth.models._block_compile")
     flag = getattr(block, "_IN_COMPILED_REGION", None)
     return bool(flag) and bool(flag[0])
@@ -80,8 +77,8 @@ def _compiled_without_break():
 
 
 def _eager_only(name):
-    # Built inside an enclosing compiled graph, the BlockMask tables and the flex call miscompile
-    # (MiniMax: output 95% off, silently). The patched forwards keep the model's own path there.
+    # BlockMask tables and flex calls miscompile silently inside an enclosing compiled graph (MiniMax output 95% off);
+    # patched forwards keep the model path there.
     if torch.compiler.is_compiling():
         raise RuntimeError(f"Unsloth: {name} runs outside torch.compile only.")
 
@@ -99,8 +96,7 @@ def _q_chunk(per_row = 1):
 @functools.lru_cache(maxsize = None)
 def _device_supported(index):
     if torch.version.hip is not None:
-        # ROCm runs the flex paths (checked on gfx1151: parity with the model's path); a failing call
-        # latches the fallback per shape.
+        # ROCm runs the flex paths (checked on gfx1151 for parity with the model path); a failing call latches the fallback per shape.
         return True
     return torch.cuda.get_device_capability(index) >= (8, 0)
 
@@ -145,8 +141,8 @@ def _virtual_kv_heads(query, key, value):
 
 def _flex(query, key, value, block_mask, scale, score_mod = None):
     key, value = _virtual_kv_heads(query, key, value)
-    # Shared dynamic=None compile: the first length keeps a static kernel, much faster than the dynamic one
-    # for fixed-length (packed / padded) training; varying lengths settle on the dynamic kernel.
+    # Shared dynamic=None compile: the first length keeps a static kernel (much faster than dynamic for fixed-length
+    # packed or padded training); varying lengths settle on the dynamic kernel.
     from unsloth_zoo.flex_attention.utils import flex_attention
     return flex_attention(
         query, key, value, score_mod = score_mod, block_mask = block_mask, scale = scale,
@@ -183,8 +179,8 @@ def _pad_to(x, dim, size, value):
 
 
 def _broadcast_mask(mask, batch, q_len, kv_len):
-    """Callers' masks may broadcast over batch, queries or keys ([1|B, 1, 1|S, 1|T]) as upstream allows;
-    padding or chunking a singleton dimension would not broadcast it."""
+    """Callers' masks may broadcast over batch, queries or keys ([1|B, 1, 1|S, 1|T]) as upstream allows; padding or
+    chunking a singleton dimension would not broadcast it."""
     shape = (batch, *mask.shape[1:-2], q_len, kv_len)
     return mask if tuple(mask.shape) == shape else mask.expand(shape)
 
@@ -376,11 +372,9 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
 
 
 def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling, model_type = "dsa"):
-    """Flex attention over top-k AND base mask; returns [B, S, H, D_v].
-
-    The BlockMask is cached on `topk_indices` so GLM's shared layers reuse it within the step. A float mask
-    is additive like upstream's: entries at or below half the dtype minimum (and -inf) are masked, any other
-    nonzero value is added to the score."""
+    """Flex attention over top-k AND base mask, returns [B, S, H, D_v]; the BlockMask is cached on topk_indices so GLM's
+    shared layers reuse it; float mask entries at or below half the dtype minimum (and -inf) are masked, other
+    nonzero values are added to the score."""
     _eager_only("dsa_flex_attention")
     cached = getattr(topk_indices, "_unsloth_dsa_flex", None)
     if cached is not None and cached[0] is attention_mask and cached[1] == key.shape[2]:
@@ -423,8 +417,8 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling,
 
 
 def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_keys):
-    """Flex above the budget (or from `min_keys`, UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS): its memory stays flat where
-    the dense mask path grows with S^2, even where cuDNN SDPA is a little faster (H100, torch 2.14)."""
+    """Flex is used above the budget (or from min_keys, UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS); its memory stays flat where
+    the dense mask grows with S^2, even if cuDNN SDPA is a little faster (H100, torch 2.14)."""
     if module.config._attn_implementation not in ("eager", "sdpa"):
         return False
     budget = int(module.config.index_topk)

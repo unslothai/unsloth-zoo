@@ -130,9 +130,9 @@ def _is_collect(node):
 @pytest.mark.parametrize(
     "name,expected",
     [
-        # graph capture v1 + v0 (2 passes), convert_vllm_to_huggingface, _release_failed_vllm_engine, load_vllm,
-        # _test_get_vllm_state_dict
-        ("vllm_utils.py", [2, 2, 3, 3, 3, 3]),
+        # graph capture (2 passes; one wrapper shared by v1 and v0 since #2221), convert_vllm_to_huggingface,
+        # _release_failed_vllm_engine, load_vllm, _test_get_vllm_state_dict
+        ("vllm_utils.py", [2, 3, 3, 3, 3]),
         ("tokenizer_utils.py", [3, 3]),  # add_new_tokens, fix_untrained_tokens
     ],
 )

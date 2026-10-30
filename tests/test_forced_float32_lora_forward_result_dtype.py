@@ -72,8 +72,7 @@ pytestmark = pytest.mark.skipif(not _half_matmul_supported(), reason = "float16 
 
 @pytest.mark.parametrize("bias", [False, True])
 def test_a_float32_base_result_past_float16_max_stays_finite(bias):
-    # gpt-oss-20b bnb-4bit: an expert down_proj computes in float32 and measured 66794.9
-    # for one token, past float16's 65504.
+    # gpt-oss-20b bnb-4bit: an expert down_proj computes in float32 and measured 66794.9 for one token, past float16's max of 65504.
     lora_forward = _load(compiler.COMPILED_LORA_FORWARD_forced_float32)
     lora_A, lora_B = _adapter(64, 32, 8, bias)
     x = torch.randn(5, 64, dtype = torch.float32)
