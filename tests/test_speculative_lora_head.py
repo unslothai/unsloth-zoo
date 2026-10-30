@@ -183,6 +183,34 @@ def test_dspark_copies_and_scores_with_the_effective_head(tmp_path, monkeypatch)
     assert seen and all(torch.allclose(w, effective) for w in seen)
 
 
+def test_inference_mode_target_seeds_and_trains_a_dspark_drafter(tmp_path):
+    # A target built under torch.inference_mode() holds inference tensors, which have no version counter.
+    from datasets import Dataset
+    from unsloth_zoo.speculative.dspark import DSparkTrainingArguments, Qwen3DSparkDrafter, UnslothDSparkTrainer
+    from unsloth_zoo.speculative.trainer import MTPDataCollator
+
+    with torch.inference_mode():
+        model = _lora_target()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    assert torch.is_inference(_head(model).get_base_layer().weight)
+    effective = effective_lm_head_weight(_head(model))
+    assert effective is effective_lm_head_weight(_head(model))
+    drafter = Qwen3DSparkDrafter.from_target(model, target_layer_ids = [0, 2], mask_token_id = VOCAB - 1,
+                                             num_draft_layers = 1, block_size = 4, num_anchors = 6, markov_rank = 8)
+    assert torch.allclose(drafter.lm_head.weight.detach(), effective.float())
+    gen = torch.Generator().manual_seed(0)
+    rows = [{"input_ids": (ids := torch.randint(0, VOCAB - 1, (n,), generator = gen).tolist()),
+             "labels": [-100] * 4 + ids[4:]} for n in (14, 18)]
+    args = DSparkTrainingArguments(
+        output_dir = str(tmp_path), per_device_train_batch_size = 2, max_steps = 1, learning_rate = 1e-2,
+        save_strategy = "no", report_to = "none", use_cpu = True, dspark_num_anchors = 6, seed = 0,
+    )
+    trainer = UnslothDSparkTrainer(model = drafter, target_model = model, args = args, train_dataset = Dataset.from_list(rows),
+                                   data_collator = MTPDataCollator(pad_token_id = 0))
+    assert torch.isfinite(torch.tensor(trainer.train().training_loss))
+
+
 def test_eagle3_trainer_uses_the_effective_head(tmp_path):
     from unsloth_zoo.speculative.eagle3 import (
         Eagle3TrainingArguments,
