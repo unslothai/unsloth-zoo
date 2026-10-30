@@ -366,6 +366,18 @@ def test_shaped_gives_evicted_expert_weights_their_shape_without_memory():
     assert w.shape == (4, 16, 8)
 
 
+def test_shaped_restores_placeholders_set_before_a_failure():
+    import types, pytest
+    # Runs on CPU: shaped() only touches .data, so a fake block is enough. The second expand fails.
+    a, b = nn.Parameter(torch.empty(0), requires_grad = False), nn.Parameter(torch.empty(0), requires_grad = False)
+    blk = types.SimpleNamespace(resident = False, params = [a, b], empties = [a.data, b.data],
+                                sig = [((4, 16, 8),), ((4, -2),)])
+    with pytest.raises(RuntimeError):
+        with BlockSwap.shaped(types.SimpleNamespace(blocks = [blk])):
+            pass
+    assert a.shape == (0,) and b.shape == (0,)
+
+
 def test_state_dict_follows_weights_renamed_after_install():
     # from_pretrained(offload_layers = N) installs before PEFT wraps each Linear in a base_layer.
     if not torch.cuda.is_available():
