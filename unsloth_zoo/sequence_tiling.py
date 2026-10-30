@@ -90,9 +90,45 @@ def _checkpoint(fn, args, preserve_rng_state):
             fn, *args, use_reentrant = False, preserve_rng_state = preserve_rng_state,
         )
     return _torch_checkpoint_fn()(
-        functools.partial(_dynamic_inner_compiles, fn), *args,
+        functools.partial(_replay_tile, fn, _gc_recompute_flag()), *args,
         use_reentrant = False, preserve_rng_state = preserve_rng_state,
     )
+pass
+
+
+def _gc_tls():
+    try:
+        from unsloth_zoo.gradient_checkpointing import _GC_RECOMPUTE_TLS
+        return _GC_RECOMPUTE_TLS
+    except Exception:
+        return None
+pass
+
+
+def _gc_recompute_flag():
+    tls = _gc_tls()
+    return None if tls is None else bool(getattr(tls, "active", False))
+pass
+
+
+def _replay_tile(fn, gc_flag, *args):
+    """One eager tile, with the state that picks code paths inside it pinned to what the tile's forward saw.
+
+    Non-reentrant checkpoint requires the recompute to save the same tensors as the forward. Under Unsloth's outer
+    gradient checkpointing, a tile's forward runs inside the outer recompute (in_gradient_checkpoint_recompute() is
+    True) but its own recompute runs later in backward (False). Unsloth's MoE kernels read that flag to pin or rebuild
+    the dequantized expert stack, which saves a different number of tensors, so backward raised CheckpointError
+    (OLMoE: 23 saved in forward, 21 in recompute). The flag is set to the forward's value for both runs.
+    """
+    tls = _gc_tls() if gc_flag is not None else None
+    previous = getattr(tls, "active", False) if tls is not None else None
+    if tls is not None:
+        tls.active = gc_flag
+    try:
+        return _dynamic_inner_compiles(fn, *args)
+    finally:
+        if tls is not None:
+            tls.active = previous
 pass
 
 

@@ -317,3 +317,39 @@ def test_every_tile_is_checked_for_arity_and_rows():
         return t[:, 1:]  # drops a row: the preallocated output would keep uninitialised memory
     with pytest.raises(ValueError, match = "rows"):
         tiled_call(short_rows, x, n_tiles = 2, needs_rng = False)
+
+
+class _PinOrRebuild(torch.nn.Module):
+    """Like Unsloth's MoE grouped-mm policy: pins an extra tensor inside an outer gradient-checkpoint recompute and
+    rebuilds it otherwise, so the two modes save a different number of tensors for the same values."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(H, H) / 4)
+
+    def forward(self, x):
+        from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
+        w = self.w
+        if in_gradient_checkpoint_recompute():
+            w = w * torch.ones_like(w)  # an extra saved tensor on this path only
+        return torch.tanh(x @ w)
+
+
+def test_tile_recompute_sees_the_outer_gc_state_of_its_forward():
+    # Under the outer Unsloth checkpoint, a tile's forward runs inside the outer recompute and its own recompute in
+    # backward; before, the flag differed and backward raised CheckpointError (OLMoE: 23 vs 21 saved tensors).
+    from unsloth_zoo.gradient_checkpointing import _gradient_checkpoint_recompute_marker, in_gradient_checkpoint_recompute
+    torch.manual_seed(0)
+    m = _PinOrRebuild()
+    x = torch.randn(2, 12, H, requires_grad = True)
+    with _gradient_checkpoint_recompute_marker():
+        y = tiled_call(m, x, n_tiles = 3, needs_rng = False)
+    assert not in_gradient_checkpoint_recompute()
+    y.pow(2).sum().backward()
+    xr = x.detach().clone().requires_grad_()
+    m2 = _PinOrRebuild()
+    m2.load_state_dict(m.state_dict())
+    m2(xr).pow(2).sum().backward()
+    torch.testing.assert_close(x.grad, xr.grad)
+    torch.testing.assert_close(m.w.grad, m2.w.grad)
+    assert not in_gradient_checkpoint_recompute()
