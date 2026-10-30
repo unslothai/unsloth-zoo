@@ -603,3 +603,21 @@ def test_reinit_drops_the_previous_live_peak(monkeypatch, gc_module):
     gc_module._release_pinned(4096)
     gc_module._reserve_pinned(4096)                     # a third generation flushes again
     assert flushes
+
+
+def test_cached_reuse_after_reinit_records_the_live_peak(monkeypatch, gc_module):
+    # A new model can take every block back from the cache; that live set must still set the bound.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 4096)
+    for _ in range(4): assert gc_module._reserve_pinned(4096)
+    held["bytes"] = 4 * 4096
+    for _ in range(4): gc_module._release_pinned(4096)
+    gc_module._reset_pinned_cap()
+    monkeypatch.setattr(gc_module, "GC_PINNED_CAP", 1 << 20)
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 4 * 4096)  # copies done
+    for _ in range(4): assert gc_module._reserve_pinned(4096)  # all four from the cache
+    assert gc_module._PINNED_LIVE_PEAK == 4 * 4096
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 0)
+    for _ in range(4): gc_module._release_pinned(4096)        # copies queued again
+    assert gc_module._reserve_pinned(4096)                      # second generation: kept
+    assert flushes == []

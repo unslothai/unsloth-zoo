@@ -424,6 +424,7 @@ def _reserve_pinned_unlocked(nbytes):
         # check the event queue; the per block mode re-checks host RAM below instead.
         if free is None or free >= block:
             _charge_live(nbytes, block)
+            if GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0: _note_pinned_live()
             return True  # the allocator hands back the cached block, already charged
         if GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0:
             _note_pinned_live()
