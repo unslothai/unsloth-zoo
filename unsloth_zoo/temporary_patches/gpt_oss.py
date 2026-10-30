@@ -3816,9 +3816,14 @@ def patch_GptOssModel():
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        # Stock resolves an omitted use_cache from the config; otherwise a manual prefill returns
+        # no cache and the next decode step silently drops the prefix.
+        if use_cache is None and not self.training:
+            use_cache = getattr(self.config, "use_cache", False)
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
+        embeds_from_ids = inputs_embeds is None
         if inputs_embeds is None:
             # Account for CPU offloaded embed_tokens
             embed_device = self.embed_tokens.weight.device
@@ -3838,7 +3843,7 @@ def patch_GptOssModel():
                 inputs_embeds = self.embed_tokens(
                     input_ids.to(embed_device, non_blocking = embed_device.type != "cpu")
                 ).to(input_ids.device)
-        if not self.training and inputs_embeds.requires_grad:
+        if not self.training and embeds_from_ids and inputs_embeds.requires_grad:
             # detach, not requires_grad_(False): the embeddings are a non-leaf when an input
             # requires-grad hook or an offloaded copy produced them, and that raises.
             inputs_embeds = inputs_embeds.detach()
