@@ -202,6 +202,15 @@ def _infer_contract(out, tile_ndim, index):
 pass
 
 
+def _sym_min(a, b):
+    # torch.sym_min on two plain ints (static shapes) is not traceable on torch 2.6.
+    return min(a, b) if isinstance(a, int) and isinstance(b, int) else torch.sym_min(a, b)
+
+
+def _sym_max(a, b):
+    return max(a, b) if isinstance(a, int) and isinstance(b, int) else torch.sym_max(a, b)
+
+
 def _tile_bounds(rows, n_tiles, compiling):
     """(start, length) of every tile: ceil(rows / n_tiles) rows each, the last ones shorter.
 
@@ -214,8 +223,8 @@ def _tile_bounds(rows, n_tiles, compiling):
     for i in range(n_tiles):
         start = i * chunk
         if compiling:
-            length = torch.sym_max(0, torch.sym_min(chunk, rows - start))
-            start = torch.sym_min(start, rows)
+            length = _sym_max(0, _sym_min(chunk, rows - start))
+            start = _sym_min(start, rows)
         else:
             length = min(chunk, rows - start)
             if length <= 0:
