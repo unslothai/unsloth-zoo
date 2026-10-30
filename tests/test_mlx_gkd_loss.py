@@ -22,8 +22,7 @@ mx = pytest.importorskip("mlx.core", reason="needs real MLX")
 nn = pytest.importorskip("mlx.nn", reason="needs real MLX")
 optim = pytest.importorskip("mlx.optimizers", reason="needs real MLX")
 
-# The torch shim installs process-wide while another module is being collected, so the
-# imports above can succeed against it; these numerics need real MLX (the mlx-cpu lane).
+# Torch shim installs process-wide during collection, so imports can succeed; numerics need real MLX.
 from mlx_simulation import mlx_is_simulated  # noqa: E402
 
 if mlx_is_simulated():
@@ -95,8 +94,7 @@ def _train(student, teacher_logits, ids, labels, beta, steps=STEPS, chunk_size=D
 
 @pytest.mark.parametrize("beta,direction", [(0.0, "forward"), (0.5, "forward"), (1.0, "reverse")])
 def test_student_moves_toward_teacher(beta, direction):
-    """Loss falls AND the divergence to the teacher falls: reverse KL can lower
-    the loss while forward KL rises."""
+    """Loss and teacher divergence must both fall: reverse KL can lower loss while forward KL rises."""
     teacher_logits, labels, ids = _fixture()
     student = _new_student()
     before = _masked_divergence(student(ids), teacher_logits, labels, direction)

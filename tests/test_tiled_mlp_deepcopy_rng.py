@@ -13,13 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A deepcopy of a tiled MLP decides RNG preservation from its own dropout state (CPU only).
-
-The patched forward is a bound method over a closure that names the patched module. deepcopy
-rebinds `self` to the copy but keeps the closure, so asking the closed over module whether
-dropout is active reads the original: an eval original with a training copy skipped RNG
-preservation and the backward recompute drew different masks.
-"""
+"""Deepcopied tiled MLP decides RNG preservation from its own dropout state; deepcopy keeps the closure over the
+original module, so an eval original with a training copy broke recompute masks; CPU only."""
 import copy
 
 import pytest

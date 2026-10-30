@@ -67,8 +67,8 @@ def _tied_rows():
 
 @pytest.mark.parametrize("top_p", [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
 def test_top_p_cutoff_uses_vllm_float32_threshold(top_p):
-    # vLLM compares the sorted cumsum against `1 - p` with p a float32 tensor. Python's 1.0 - top_p
-    # rounds differently, e.g. ten tied logits at top_p = 0.8 keep 9 in vLLM but 8 with the double.
+    # vLLM compares the sorted cumsum against 1 - p with p a float32 tensor; Python's double 1.0 - top_p rounds
+    # differently: ten tied logits at top_p = 0.8 keep 9 in vLLM, 8 with the double.
     logits = _tied_rows()
     keep = rr._truncated_support_mask(logits, 0, top_p, 0.0)
     for fn in _references():
@@ -96,8 +96,8 @@ def test_pytorch_sampler_bf16_rows_match_vllm(top_k, top_p):
 
 
 def test_triton_sampler_top_k_keeps_exactly_k():
-    # vLLM v0.32.0 Triton (TRITON_INTERPRET=1): 8 logits at 3 and 32 at 2, top_k = 16, keep tokens
-    # 0..15 and token 0 scores -2.392703. The PyTorch sampler keeps all 40 (-2.984274).
+    # With 8 logits at 3 and 32 at 2, vLLM v0.32.0 Triton (TRITON_INTERPRET=1) keeps exactly top_k = 16 tokens (token 0
+    # scores -2.392703); the PyTorch sampler keeps all 40 (-2.984274).
     logits = torch.full((1, 128256), -10.0)
     logits[:, :8] = 3.0
     logits[:, 8:40] = 2.0
@@ -114,8 +114,8 @@ def test_triton_sampler_top_k_keeps_exactly_k():
 
 
 def test_triton_sampler_top_k_at_the_row_minimum_keeps_only_larger_logits():
-    # vLLM v0.32.0 Triton: 4 logits at 0 and 60 at -1, top_k = 8 keep only the 4 (its pivot cannot
-    # drop below the row minimum); one logit at -50 under the tied run restores exactly 8.
+    # vLLM v0.32.0 Triton with 4 logits at 0 and 60 at -1 and top_k = 8 keeps only the 4, since its pivot cannot drop
+    # below the row minimum; one logit at -50 in the tied run restores exactly 8.
     logits = torch.full((1, 64), -1.0)
     logits[:, :4] = 0.0
     assert int(rr._truncated_support_mask(logits, 8, 1.0, 0.0, True).sum()) == 4
@@ -124,9 +124,8 @@ def test_triton_sampler_top_k_at_the_row_minimum_keeps_only_larger_logits():
 
 
 def test_triton_sampler_skips_top_k_with_at_most_k_finite_logits():
-    # vLLM v0.24 - v0.32 Triton masks top-k only when the row has more than top_k finite logits
-    # (`num_finite_total > k`). 4 at 0 and 4 at -1 with the rest -inf and top_k = 8: all 8 stay,
-    # though the 8th logit is the row minimum. With 5 at -1 the row-minimum rule applies again.
+    # vLLM v0.24 - v0.32 Triton masks top-k only when the row has more than top_k finite logits (num_finite_total > k);
+    # otherwise all finite logits stay, even at the row minimum.
     logits = torch.full((1, 64), float("-inf"))
     logits[0, :4] = 0.0
     logits[0, 4:8] = -1.0
@@ -144,8 +143,8 @@ def test_triton_sampler_skips_top_k_with_at_most_k_finite_logits():
 
 
 def test_triton_sampler_keeps_uniform_rows_whole():
-    # vLLM v0.32.0 Triton, monolithic kernel and the CUDA split pipeline alike: 100 equal logits at
-    # top_p = 0.9 keep all 100 (-log 100); the PyTorch sampler keeps 90 (-log 90).
+    # vLLM v0.32.0 Triton, monolithic kernel and CUDA split pipeline alike, keeps all 100 equal logits at top_p = 0.9
+    # (-log 100); the PyTorch sampler keeps 90 (-log 90).
     logits = torch.zeros(1, 100)
     assert int(rr._truncated_support_mask(logits, 0, 0.9, 0.0, True).sum()) == 100
     assert int(rr._truncated_support_mask(logits, 0, 0.9, 0.0).sum()) == 90
@@ -246,9 +245,8 @@ def test_sampler_caveat_is_a_warning_whatever_the_setting(sampler, monkeypatch, 
 
 
 def test_vllm_0_29_small_decode_batch_tie_gives_unit_ratio(sampler):
-    # vLLM 0.17 - 0.29 with Triton: below 8 decode rows apply_top_k_top_p runs its PyTorch sort, which
-    # keeps every logit tied with the top_k-th. One row [2, 1, 1, 0], top_k = 2: identical logits must
-    # give an IS ratio of 1 (#2084's Triton guess gave 1.27).
+    # vLLM 0.17 - 0.29 with Triton, below 8 decode rows apply_top_k_top_p runs its PyTorch sort, keeping every logit
+    # tied with the top_k-th; identical logits must give IS ratio 1 (2084's Triton guess gave 1.27).
     sampler("0.29.0")
     logits = torch.tensor([[2.0, 1.0, 1.0, 0.0]])
     kwargs = rr.grpo_truncated_support_kwargs(_trainer(top_k = 2, top_p = 1.0))
@@ -313,10 +311,9 @@ def _padded_engine_trainer(ids, bias = float("-inf"), **args):
 
 
 def test_engine_suppressed_padded_rows_leave_the_scored_support(sampler):
-    # zoo#1831: 61 real tokens, 64 alignment rows the engine biases to -inf on every request, equal
-    # logits. vLLM adds logit_bias before computing processed logprobs (sampler.py
-    # apply_logits_processors, builtin.py LogitBiasLogitsProcessor: logits += bias), so a rollout
-    # token scores -log(61); the trainer scored -log(125), a ratio of 0.488 with identical weights.
+    # zoo 1831: 61 real tokens and 64 alignment rows the engine biases to -inf; vLLM adds logit_bias before processed
+    # logprobs (apply_logits_processors), so a rollout token scores -log(61), not -log(125): a 0.488 ratio with
+    # identical weights.
     sampler("0.11.2")
     pad = list(range(61, 125))
     logits = torch.zeros(1, 2, 125)

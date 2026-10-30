@@ -14,16 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-Regression guards for upstream-pinned symbols in the MLX / Apple-Silicon /
-accelerator-dispatch lanes of unsloth_zoo.
-
-Each test cites the zoo commit that introduced or repaired the symbol it
-covers, so a future refactor that renames or silently drops the symbol
-fails loudly here. Tests are designed to run on Linux+CUDA via the
-``tests/mlx_simulation`` shim and on Apple Silicon natively; CUDA-only
-APIs are not exercised directly so the suite is CPU-runnable in CI.
-"""
+"""Regression guards for upstream-pinned MLX / Apple-Silicon / accelerator symbols, each citing its zoo commit; run on
+Linux+CUDA via the tests/mlx_simulation shim or natively on Apple Silicon; CPU-runnable in CI"""
 
 from __future__ import annotations
 
@@ -36,33 +28,18 @@ import pytest
 import torch
 
 
-# Covers commits:
-#   - 35dc451 Guard XPU empty_cache call against partial torch.xpu builds
-#   - e08c1df Guard XPU synchronize call against partial torch.xpu builds
-#   - 2564f39 Route GGUF merge cache flushes and MoE expert merges
-#             through active backend (introduced device_empty_cache)
-#   - d631837 Route VLM GGUF mmproj bf16 check through active backend
-#             (introduced device_is_bf16_supported)
-# The existing test_backend_device_helpers.py covers the happy path; this
-# test pins the PARTIAL-BUILD case where torch.xpu.is_available is True
-# but the specific symbol is missing.
+# Pins the partial torch.xpu build case (is_available True, symbol missing) for 35dc451, e08c1df, 2564f39 and d631837;
+# happy path is in test_backend_device_helpers.py.
 
 def test_xpu_partial_build_all_three_helpers_silent_no_op():
-    """All three device_type helpers must no-op (not AttributeError) on a
-    torch.xpu module that lacks synchronize / empty_cache / is_bf16_supported.
-    The hasattr-then-call pattern is the exact regression net for the
-    e08c1df / 35dc451 / d631837 partial-build crashes seen in the GGUF
-    merge and VLM mmproj export paths.
-    """
+    """The three device_type helpers must no-op, not raise AttributeError, on a torch.xpu lacking synchronize /
+    empty_cache / is_bf16_supported; these partial builds crashed GGUF merge and VLM mmproj export (e08c1df, 35dc451,
+    d631837)."""
     from unsloth_zoo import device_type as dt
 
     class PartialXpu:
-        """A torch.xpu that knows is_available but nothing else.
-
-        Reflects the upstream IPEX dev build where torch.xpu.is_available is
-        True but synchronize / empty_cache / is_bf16_supported are not yet
-        wired in. Pre-fix, this raised AttributeError mid-GGUF-export.
-        """
+        """Mimics the upstream IPEX dev build where torch.xpu.is_available is True but synchronize / empty_cache /
+        is_bf16_supported are missing; pre-fix this raised AttributeError mid-GGUF-export."""
         def is_available(self):
             return True
 
@@ -77,22 +54,11 @@ def test_xpu_partial_build_all_three_helpers_silent_no_op():
         assert dt.device_is_bf16_supported() is False
 
 
-# saving_utils._active_merge_device() must take NO positional args and
-# cascade cuda -> xpu -> mps -> cpu.
-# Covers commits:
-#   - fd58aa1 saving_utils: route LoRA merge through accelerator-family probe
-#   - 70b93ad fix(mlx): migrate deprecated mx.metal memory APIs + restore
-#             device-agnostic LoRA merge
-# The pre-fix signature was _active_merge_device(W) which (a) silently
-# dropped MPS, (b) propagated W.device.index across families. This
-# pin asserts the no-arg shape AND the MPS-wins-when-only-mps branch
-# which the previous DEVICE_TYPE_TORCH-only routing dropped.
+# _active_merge_device() takes no args and cascades cuda, xpu, mps, cpu; pre-fix _active_merge_device(W) silently
+# dropped MPS and leaked W.device.index across families (fd58aa1, 70b93ad).
 
 def test_active_merge_device_mps_branch_pinned():
-    """_active_merge_device() returns "mps" on Apple Silicon (no cuda/xpu).
-    This is the exact regression that broke the MLX backend's on-host LoRA
-    merge when the helper still routed through DEVICE_TYPE_TORCH.
-    """
+    """_active_merge_device() must return 'mps' on Apple Silicon with no cuda or xpu; routing through DEVICE_TYPE_TORCH broke the MLX on-host LoRA merge."""
     from unsloth_zoo.saving_utils import _active_merge_device
 
     _active_merge_device.cache_clear()
@@ -136,23 +102,12 @@ class _NullCtx:
     def __exit__(self, *a): return False
 
 
-# MoE-expert _active_merge_device() callsites in saving_utils.py.
-# Covers commits 2564f39 (introduced) and fd58aa1 (refactored to no-arg helper).
-# Pre-fix the five MoE expert helpers fell back to CPU on XPU due to
-# hardcoded .to("cuda", ...).
+# Pre-fix the five MoE expert helpers fell back to CPU on XPU via hardcoded .to('cuda', ...); 2564f39 introduced the routing and fd58aa1 made the helper no-arg.
 
 def test_moe_expert_merges_call_active_merge_device():
-    """The five MoE-expert merge helpers must route their .to(...) calls
-    through _active_merge_device(). A regression to a hardcoded "cuda" or
-    DEVICE_TYPE_TORCH inside any one of them silently drops MPS/XPU
-    placement and was the exact 2564f39 bug class.
-
-    After unsloth-zoo#647 the gate / up wrappers delegate to a unified
-    helper ``_merge_moe_gate_or_up_expert``; the check follows that
-    delegation by inspecting the union of each entry-point's source and
-    the source of any sibling ``_merge_moe_*`` helper it explicitly
-    forwards to.
-    """
+    """Five MoE expert merge helpers must route .to() through _active_merge_device(); hardcoded cuda or
+    DEVICE_TYPE_TORCH drops MPS/XPU (2564f39); after unsloth-zoo 647 gate/up delegate to
+    _merge_moe_gate_or_up_expert, so the check also follows the sibling _merge_moe_* helpers they forward to."""
     import inspect
     import re
     import unsloth_zoo.saving_utils as su
@@ -167,10 +122,8 @@ def test_moe_expert_merges_call_active_merge_device():
     _helper_call_re = re.compile(r"\b(_merge_moe_[A-Za-z0-9_]+)\(")
 
     def _effective_source(name: str, seen: set) -> str:
-        """Return the entry-point's source plus the source of any
-        sibling ``_merge_moe_*`` helper it explicitly forwards to.
-        One-level follow is enough: zoo never chains wrapper -> wrapper
-        -> helper, and the implementations all live in saving_utils."""
+        """Returns the entry point's source plus any sibling _merge_moe_* helper it forwards to; one level is enough
+        since zoo never chains wrapper to wrapper to helper."""
         if name in seen:
             return ""
         seen.add(name)
@@ -203,27 +156,19 @@ def test_moe_expert_merges_call_active_merge_device():
         )
 
 
-# Covers commit 70b93ad fix(mlx): migrate deprecated mx.metal memory APIs +
-# restore device-agnostic LoRA merge.
-# The deprecated form (mx.metal.set_memory_limit / .set_cache_limit)
-# prints a warning every training run. The MLX shim exposes both forms,
-# so this test pins the trainer source.
+# Deprecated mx.metal.set_memory_limit / .set_cache_limit warn every training run; the MLX shim exposes both forms, so
+# the test pins the trainer source (70b93ad).
 
 def test_mlx_trainer_uses_modern_memory_apis_only():
-    """unsloth_zoo.mlx.trainer must call the non-namespaced memory APIs
-    (mx.set_memory_limit, mx.set_cache_limit, mx.set_wired_limit). The
-    namespaced mx.metal.set_* forms are deprecated upstream and reverting
-    to them resurrects the per-run deprecation warning that 70b93ad fixed.
-    """
+    """unsloth_zoo.mlx.trainer must use mx.set_memory_limit / set_cache_limit / set_wired_limit; the deprecated
+    mx.metal.set_* forms bring back the per-run warning fixed in 70b93ad."""
     import importlib.util
     import pathlib
 
     pkg_root = pathlib.Path(
         importlib.util.find_spec("unsloth_zoo").submodule_search_locations[0]
     )
-    # The MLX path was promoted from a flat module (mlx_trainer.py) to a
-    # subpackage (mlx/trainer.py) in e6d8f7f. Accept either layout so the
-    # test survives the rename.
+    # MLX trainer moved from flat mlx_trainer.py to mlx/trainer.py in e6d8f7f; accept either layout so the test survives the rename.
     candidates = [pkg_root / "mlx" / "trainer.py", pkg_root / "mlx_trainer.py"]
     mlx_trainer_path = next((c for c in candidates if c.is_file()), None)
     assert mlx_trainer_path is not None, (
@@ -246,18 +191,12 @@ def test_mlx_trainer_uses_modern_memory_apis_only():
         assert modern in src, f"Expected modern API {modern} missing from {mlx_trainer_path.name}"
 
 
-# Covers commit 2053539 fix(mlx): repair stub injection on Apple Silicon.
-# Sub-bugs:
-#   a. Inverted gate: stubs were inside `if not _SKIP_GPU_INIT:`. Fix
-#      moved them under `if _SKIP_GPU_INIT:`.
-#   b. Wrong function name: install_*_stub vs the real inject_into_sys_modules.
-#   c. _Noop.__call__ silently returned None — fix raises NotImplementedError.
+# Commit 2053539 repaired Apple Silicon stub injection: gate was inverted, install_*_stub name was wrong, and
+# _Noop.__call__ silently returned None instead of raising.
 
 def test_apple_silicon_stub_injection_entrypoints_pinned():
-    """Sub-bugs (a) and (b) of commit 2053539. The init module must gate
-    stub injection on `if _SKIP_GPU_INIT:` (NOT the negated form) and call
-    inject_into_sys_modules (NOT install_*_stub).
-    """
+    """Commit 2053539 sub-bugs (a) and (b): init must gate stub injection on 'if _SKIP_GPU_INIT:' (not the negated form)
+    and call inject_into_sys_modules, not install_*_stub."""
     import importlib.util
     import pathlib
 
@@ -274,8 +213,7 @@ def test_apple_silicon_stub_injection_entrypoints_pinned():
     assert "install_triton_stub" not in src
     assert "install_bitsandbytes_stub" not in src
 
-    # Sub-bug (a): the gate must be positive `if _SKIP_GPU_INIT:` not
-    # `if not _SKIP_GPU_INIT:` around the injection block.
+    # Sub-bug (a): the injection block must sit under positive 'if _SKIP_GPU_INIT:', not the negated 'if not _SKIP_GPU_INIT:' gate.
     assert "if _SKIP_GPU_INIT:" in src, (
         "Apple-Silicon stub-injection gate flipped — regresses commit "
         "2053539 sub-bug (a)."
@@ -283,11 +221,8 @@ def test_apple_silicon_stub_injection_entrypoints_pinned():
 
 
 def test_stub_noop_call_raises_not_returns_none():
-    """Sub-bug (c) of 2053539. _Noop.__call__ must raise NotImplementedError
-    so a stray `bnb.functional.quantize_4bit(weight, ...)` on Apple Silicon
-    crashes loudly rather than silently producing None that corrupts the
-    downstream tensor pipeline. __bool__ and hasattr probes must still work.
-    """
+    """Commit 2053539 sub-bug (c): _Noop.__call__ must raise NotImplementedError, not return None, so a stray bnb call
+    crashes loudly; __bool__ and hasattr must still work."""
     from unsloth_zoo.stubs import triton_stub, bitsandbytes_stub
 
     for mod in (triton_stub, bitsandbytes_stub):
@@ -301,9 +236,7 @@ def test_stub_noop_call_raises_not_returns_none():
             sub()
 
 
-# Reads sys.modules rather than importing either package: both stubs seed sys.modules
-# directly, so an import would surface the regression as an ImportError instead of as a
-# wrong verdict below.
+# Reads sys.modules, not imports: both stubs seed sys.modules, so importing would surface the regression as an ImportError instead of a wrong verdict.
 _GATE_PROBE = """
 import json, sys
 if {hide_bitsandbytes}:
@@ -329,11 +262,8 @@ print(json.dumps({{
 def test_the_stub_gate_shadows_no_real_bitsandbytes_but_always_stubs_triton(
     tmp_path, bitsandbytes_installed,
 ):
-    """Run the real gate in a fresh interpreter and look at what it produced.
-
-    Shadowing a real bitsandbytes made every bnb-quantized checkpoint unloadable. Triton
-    ships no macOS wheel to prefer, so it is stubbed either way.
-    """
+    """Runs the real gate in a fresh interpreter: shadowing a real bitsandbytes makes bnb-quantized checkpoints
+    unloadable; triton is always stubbed (no macOS wheel)."""
     import json
     import os
     import pathlib
@@ -357,8 +287,7 @@ def test_the_stub_gate_shadows_no_real_bitsandbytes_but_always_stubs_triton(
          _GATE_PROBE.format(hide_bitsandbytes = not bitsandbytes_installed)],
         capture_output = True, text = True, env = env, timeout = 300,
     )
-    # No skip on failure: the gate runs during `import unsloth_zoo`, so a crash in the
-    # code under test and an unusable environment produce the same traceback.
+    # No skip on failure: the gate runs during import unsloth_zoo, so a crash in the code under test and a broken environment look the same.
     assert run.returncode == 0, f"gate probe failed:\n{run.stderr[-2000:]}"
     result = json.loads(run.stdout.strip().splitlines()[-1])
 
@@ -385,14 +314,12 @@ def test_real_bitsandbytes_available_distinguishes_a_stub_from_a_real_module():
 
 @pytest.mark.parametrize("installed", [True, False])
 def test_real_bitsandbytes_available_locates_without_importing(installed):
-    """Detection must not import bitsandbytes: that pulls in torch, ~1s, on hosts whose
-    whole reason for skipping GPU init is to avoid it."""
+    """Detection must not import bitsandbytes: importing it pulls in torch, on hosts that skip GPU init precisely to avoid that."""
     import builtins
 
     from unsloth_zoo.stubs import bitsandbytes_stub
 
-    # A real distribution produces a loader-bearing spec; a loaderless one is a namespace
-    # package, which is not an install (see the namespace test below).
+    # A real distribution has a loader-bearing spec; a loaderless spec means a namespace package, which is not an install.
     spec = types.SimpleNamespace(loader = object()) if installed else None
     real_import = builtins.__import__
 
@@ -418,21 +345,14 @@ def test_real_bitsandbytes_available_locates_without_importing(installed):
 
 
 def test_a_namespace_bitsandbytes_directory_is_not_a_real_install(tmp_path):
-    """A bare `bitsandbytes/` directory with no __init__.py -- what a half-removed install
-    leaves on sys.path.
-
-    find_spec answers with a loaderless namespace spec, so treating "found" as "installed"
-    stands aside for a package that imports to nothing, leaving the caller with neither a
-    wheel nor the stub.
-    """
+    """A bare bitsandbytes/ dir with no __init__.py gives a loaderless namespace spec, not an install; treating it as found leaves neither wheel nor stub."""
     from unsloth_zoo.stubs import bitsandbytes_stub
 
     (tmp_path / "bitsandbytes").mkdir()
     saved = {k: v for k, v in sys.modules.items() if k.startswith("bitsandbytes")}
     for k in saved:
         del sys.modules[k]
-    # A regular package later on the path beats a namespace portion, so an installed
-    # wheel on this runner would mask the case under test.
+    # A regular package later on sys.path beats a namespace portion, so an installed wheel on this runner would mask the case under test.
     saved_path = list(sys.path)
     sys.path[:] = [str(tmp_path)] + [p for p in sys.path if "site-packages" not in p]
     try:
@@ -447,8 +367,7 @@ def test_a_namespace_bitsandbytes_directory_is_not_a_real_install(tmp_path):
 
 
 def _mlx_loader():
-    """The MLX loader, or skip: importing it pulls in mlx.core, and this file also runs in
-    the Linux upstream-regression lane, which installs no mlx."""
+    """Returns the MLX loader or skips: importing it pulls in mlx.core, and this file also runs in the Linux upstream lane, which installs no mlx."""
     pytest.importorskip("mlx")
     from unsloth_zoo.mlx import loader
 
@@ -523,9 +442,7 @@ def test_lifting_the_bnb_stub_exposes_the_real_wheel_then_puts_the_stub_back():
         assert sys.modules["bitsandbytes"] is stub, "the stub was not put back"
         assert "bitsandbytes.nn" in sys.modules, "a stub submodule was not put back"
         assert finder in sys.meta_path, "the stub's finder was not put back"
-        # Cached so a second call need not re-import it, which re-registers its torch
-        # operators and raises. Caching the package root alone would leave the operator
-        # submodules to be imported again.
+        # Cache every bitsandbytes submodule, not just the root: re-importing one re-registers its torch operators and raises.
         assert loader._REAL_BITSANDBYTES_MODULES["bitsandbytes"] is real
         assert loader._REAL_BITSANDBYTES_MODULES["bitsandbytes._ops"] is real_ops
 
@@ -536,8 +453,7 @@ def test_lifting_the_bnb_stub_exposes_the_real_wheel_then_puts_the_stub_back():
 
 
 def test_lifting_the_bnb_stub_is_a_no_op_when_no_stub_is_resident():
-    """Evicting a resident real wheel makes the next import re-register its torch
-    operators, which raises."""
+    """Evicting a resident real bitsandbytes wheel makes the next import re-register its torch operators, which raises."""
     loader = _mlx_loader()
 
     real = types.ModuleType("bitsandbytes")
@@ -554,8 +470,7 @@ def test_lifting_the_bnb_stub_is_a_no_op_when_no_stub_is_resident():
             assert sys.meta_path == before_meta, (
                 "meta_path was disturbed with no stub to lift"
             )
-            # A dequant runs for minutes; another thread can install a finder or finish a
-            # submodule import meanwhile.
+            # A dequant runs for minutes, so another thread may install a finder or finish a submodule import meanwhile; the lift must not drop those.
             sys.meta_path.insert(0, late_finder)
             sys.modules["bitsandbytes.functional"] = late_submodule
         assert sys.modules["bitsandbytes"] is real, "the real wheel was evicted on exit"
@@ -571,8 +486,7 @@ def test_lifting_the_bnb_stub_is_a_no_op_when_no_stub_is_resident():
 
 
 def test_lifting_the_bnb_stub_keeps_a_wheel_first_imported_inside_the_block():
-    """The cold path: detection never imports, so a dequant can be the first consumer and
-    a restore that runs anyway drops the wheel the block just imported."""
+    """Cold path: detection never imports, so a dequant can be the first consumer; a restore that runs anyway would drop the wheel the block just imported."""
     loader = _mlx_loader()
 
     real = types.ModuleType("bitsandbytes")
@@ -590,8 +504,7 @@ def test_lifting_the_bnb_stub_keeps_a_wheel_first_imported_inside_the_block():
 
 
 def test_the_dequant_sees_the_real_wheel_not_the_stub(monkeypatch, tmp_path):
-    """The dequant must run inside the lift, not merely have one available: otherwise it
-    imports whatever is resident, which on a stubbed host is the stub."""
+    """The dequant must run inside the lift, not just have one available; otherwise it imports whatever is resident, which on a stubbed host is the stub."""
     import transformers
 
     loader = _mlx_loader()
@@ -613,8 +526,7 @@ def test_the_dequant_sees_the_real_wheel_not_the_stub(monkeypatch, tmp_path):
     class _FakeModelLoader:
         @staticmethod
         def from_pretrained(*a, **k):
-            # Its own key: the dequantization is this call, so a later tokenizer load
-            # seeing the real module must not stand in for it.
+            # Dequantization gets its own key, since it is this call; a later tokenizer load seeing the real module must not stand in for it.
             seen["model_load"] = sys.modules.get("bitsandbytes")
             return _FakeModel()
 
@@ -655,11 +567,7 @@ def test_lifting_the_bnb_stub_restores_after_the_block_raises():
 
 
 def test_lifting_the_bnb_stub_keeps_a_finder_installed_while_the_block_ran():
-    """The stubbed path must leave sys.meta_path alone apart from the stub's own finder.
-
-    The block is a multi-GB dequant running for minutes, so restoring a whole snapshot
-    taken at entry silently drops whatever another thread installed in between.
-    """
+    """Leave sys.meta_path alone except the stub's own finder: restoring an entry snapshot would silently drop finders other threads install during the dequant."""
     loader = _mlx_loader()
 
     stub = types.ModuleType("bitsandbytes")
@@ -681,22 +589,14 @@ def test_lifting_the_bnb_stub_keeps_a_finder_installed_while_the_block_ran():
         assert stub_finder in sys.meta_path, "the stub finder was not put back"
 
 
-# mlx_loader rejects full_finetuning against a pre-quantized repo.
-# Covers commit 7d2bb95 fix(mlx): reject full_finetuning against pre-quantized
-# repos loudly.
-# Without this guard, the CCE backward returns mx.zeros for quantized
-# weight grads, so the user "trains" but most of the model never updates.
+# mlx_loader rejects full_finetuning on pre-quantized repos (7d2bb95): without it the CCE backward returns mx.zeros for
+# quantized weight grads, so most of the model never updates.
 
 def test_get_existing_mlx_quantization_detects_both_keys():
-    """The detection helper must recognise BOTH the 'quantization' (MLX
-    native) and 'quantization_config' (HF style) keys. A regression that
-    only checks one silently re-enables the full_finetuning-on-quantized
-    foot-gun that 7d2bb95 closed.
-    """
-    # Import the helper without triggering the heavy mlx_loader import
-    # chain on the GPU-free harness. We pull the function directly.
-    # Layout was promoted from mlx_loader.py (flat) to mlx/loader.py
-    # (subpackage) in e6d8f7f. Try both so the test survives the rename.
+    """Must detect both 'quantization' (MLX native) and 'quantization_config' (HF style) keys; checking only one
+    re-enables the full_finetuning foot-gun closed by 7d2bb95."""
+    # Reads the file rather than importing it, to avoid the heavy mlx_loader import chain; the layout moved to
+    # mlx/loader.py in e6d8f7f, so both paths are tried.
     import importlib.util
     import pathlib
     pkg_loc = pathlib.Path(
@@ -711,9 +611,7 @@ def test_get_existing_mlx_quantization_detects_both_keys():
     )
     src = loader_path.read_text()
 
-    # The function must check BOTH key names; otherwise repos saved by
-    # mlx-lm (key "quantization") OR by HF transformers ("quantization_config")
-    # slip through the guard.
+    # The function must check both key names, or repos saved by mlx-lm ('quantization') or HF transformers ('quantization_config') slip past the guard.
     assert "config_data.get(\"quantization\"" in src, (
         "_get_existing_mlx_quantization no longer checks 'quantization' "
         "key — regresses commit 7d2bb95."
@@ -724,28 +622,14 @@ def test_get_existing_mlx_quantization_detects_both_keys():
     )
 
 
-# target_modules='all-linear' must collect EVERY nn.Linear name.
-# Covers commit 7f8b0ca fix(mlx): make target_modules='all-linear' actually
-# mean every nn.Linear.
-# Pre-fix, "all-linear" was silently rewritten to None and collapsed to
-# the canonical 7-name list. For Qwen3.5 that dropped the GatedDelta
-# in_proj_* and out_proj from LoRA targeting entirely.
+# target_modules='all-linear' must collect every nn.Linear name (7f8b0ca); pre-fix it was rewritten to None, collapsing
+# to the canonical 7 and dropping GatedDelta in_proj_* and out_proj for Qwen3.5.
 
 def test_collect_all_linear_target_names_finds_qkv_and_moe():
-    """_collect_all_linear_target_names must discover fused-QKV names
-    (qkv_proj), GatedDelta projections (in_proj_a, in_proj_b, in_proj_qkv,
-    in_proj_z, out_proj), vision tower fused linears, and MoE routers /
-    experts — not just the canonical 7. Walks a fake model whose
-    named_modules emits the names we care about so we don't need real MLX.
-    """
-    # Both packages, not just mlx. The helper reaches _mlx_lora_type_specs(), which does
-    # `from mlx_lm.models.switch_layers import ...` and `from mlx_lm.tuner.lora import ...`,
-    # and _collect_all_linear_target_names wraps the whole walk in a blanket
-    # `except Exception: return []` so that LoRA setup never raises. Guarding on mlx alone
-    # therefore let this test RUN against an mlx with no usable mlx_lm beside it, where the
-    # helper returns [] for a missing-dependency reason and the assertion below reports it
-    # as `assert {...} <= set()` -- indistinguishable from the coverage regression this test
-    # exists to catch, and pointing at the wrong file.
+    """_collect_all_linear_target_names must find fused-QKV, GatedDelta projections, vision tower and MoE router/expert
+    linears, not just the canonical 7; walks a fake model's named_modules()."""
+    # Needs both mlx and mlx_lm: the helper's blanket except returns [] when mlx_lm is missing, which would read as a
+    # coverage regression instead of a missing dependency.
     pytest.importorskip("mlx")
     pytest.importorskip("mlx_lm")
     from unsloth_zoo.mlx_loader import _collect_all_linear_target_names, _is_mlx_lora_base
@@ -763,10 +647,7 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
                     "sys.modules by another test cannot exercise the walk")
 
     class FakeQwen3p5:
-        """Minimal model whose named_modules() exposes the leaves that
-        triggered the pre-fix silent collapse. Real mlx.nn.Linear types
-        are required because the helper's isinstance check uses them.
-        """
+        """Minimal model whose named_modules() exposes the leaves that triggered the pre-fix silent collapse; real mlx.nn.Linear is needed for the isinstance check."""
         def named_modules(self):
             yield ("model.layers.0.self_attn.q_proj", nn.Linear(4, 4))
             yield ("model.layers.0.self_attn.k_proj", nn.Linear(4, 4))
@@ -779,8 +660,7 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
             yield ("model.layers.0.gated_delta.in_proj_qkv", nn.Linear(4, 4))
             yield ("model.layers.0.gated_delta.in_proj_z",   nn.Linear(4, 4))
             yield ("model.layers.0.gated_delta.out_proj",    nn.Linear(4, 4))
-            # MoE router + expert — fused QKV — vision tower (numeric leaves
-            # are skipped, the *suffix* name is what gets returned).
+            # MoE router and expert, fused QKV and vision tower leaves; numeric path segments are skipped and the suffix name is what gets returned.
             yield ("model.layers.0.moe.router", nn.Linear(4, 4))
             yield ("model.layers.0.moe.experts.0.w1", nn.Linear(4, 4))
             yield ("vision_tower.layers.0.attn.qkv", nn.Linear(4, 4))
@@ -788,8 +668,7 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
     names = set(_collect_all_linear_target_names(FakeQwen3p5()))
     canonical = {"q_proj", "k_proj", "v_proj", "o_proj",
                  "gate_proj", "up_proj", "down_proj"}
-    # Canonical 7 still resolve. Spelled with a message because the bare form renders as
-    # `assert {...} <= set()`, which says nothing about which of the two failure modes it is.
+    # Canonical 7 must still resolve; an empty result means the walk matched nothing, so check the MLX stack before the targeting logic.
     assert canonical <= names, (
         f"all-linear lost canonical names {sorted(canonical - names)}; got {sorted(names)}. "
         f"An EMPTY result here means the walk matched nothing at all -- check the MLX stack "
@@ -804,25 +683,18 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
     )
 
 
-# Covers commit 46866ce fix(mlx): correct GatedDeltaNet VJP mask handling +
-# actually run it.
-# Pre-fix patched_gated_delta_update fell through to gated_delta_kernel on
-# Metal (the default use_kernel=True branch), making the custom VJP dead code.
+# Covers 46866ce: pre-fix patched_gated_delta_update fell through to gated_delta_kernel on Metal (default use_kernel=True), leaving the custom VJP dead code.
 
 def test_patch_gated_delta_routes_training_through_efficient_path():
-    """Pin the routing predicate in patch_gated_delta. The patched
-    function MUST call gated_delta_ops_efficient when state is None
-    (training entry), even if use_kernel=True and mlx says metal is
-    available. Pre-fix the kernel branch shadowed the custom VJP.
-    """
+    """patch_gated_delta must call gated_delta_ops_efficient when state is None (training entry), even with
+    use_kernel=True on Metal; pre-fix the kernel branch shadowed the custom VJP."""
     import importlib.util
     import pathlib
     pkg_loc = importlib.util.find_spec("unsloth_zoo").submodule_search_locations[0]
     src = (pathlib.Path(pkg_loc) / "gated_delta_vjp.py").read_text()
 
-    # The fix added `is_training_call = state is None` and then the
-    # unconditional `if is_training_call: return gated_delta_ops_efficient(...)`
-    # branch BEFORE the kernel branch. Both must be present.
+    # The fix added is_training_call = state is None and an unconditional early return to gated_delta_ops_efficient
+    # before the kernel branch; both must be present.
     assert "is_training_call" in src, (
         "patch_gated_delta dropped the is_training_call gate; "
         "regresses commit 46866ce — custom VJP becomes dead code under "

@@ -14,16 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fp16 full finetuning of Gemma3-VL / Gemma4-VL on a GPU without bfloat16 (T4, V100).
-
-The forced RMSNorms emit fp16; full finetuning has fp32 weights and no autocast, so these
-consumers died with "expected mat1 and mat2 to have the same dtype ... Half != float":
-  * Gemma3MultiModalProjector: torch.matmul(mm_soft_emb_norm(x), mm_input_projection_weight)
-  * Gemma4ClippableLinear (vision tower q / k / v / o / MLP projections)
-  * Gemma4TextMLP (gate_proj) and the forced Gemma4 text attention (q_proj in, o_proj out)
-  * SDPA in Gemma4VisionAttention: RoPE leaves q / k float32 while v_norm emits fp16
-Runs on CPU; fp16 weights (LoRA) must stay bit-for-bit unchanged.
-"""
+"""fp16 full finetuning on T4/V100 (no bfloat16): forced fp16 RMSNorms broke fp32-weight matmuls, linears and SDPA in
+Gemma3/Gemma4-VL with Half vs float; CPU test; fp16 LoRA weights must stay bit-for-bit unchanged."""
 
 from __future__ import annotations
 
@@ -80,8 +72,7 @@ def forced(monkeypatch):
 
 
 def _apply(patches, name):
-    """Run a zoo patch by name; a tree without it runs stock transformers, so the test shows
-    the real failure there instead of an AttributeError."""
+    """Run a zoo patch by name; if it is missing, stock transformers runs so the real failure shows instead of an AttributeError."""
     patch = getattr(patches, name, None)
     if patch is not None:
         patch()
@@ -195,8 +186,7 @@ def test_gemma4_sdpa_promotes_mixed_qkv_and_leaves_matching_dtypes_alone(monkeyp
 @requires_gemma4
 @pytest.mark.parametrize("autocast", [False, True], ids = ["no_autocast", "autocast"])
 def test_gemma4_text_attention_meets_full_finetune_weights_only_without_autocast(forced, monkeypatch, autocast):
-    # fp32 weights (full finetuning). Without autocast the fp16 norm output meets them; under autocast
-    # (fp16 forced on a bf16 GPU) the Linears cast for themselves, so the inputs stay fp16 as before.
+    # fp32 weights (full finetuning): without autocast the fp16 norm output meets them; under autocast the Linears cast for themselves, so inputs stay fp16.
     monkeypatch.setattr(gemma4.Gemma4TextAttention, "forward", gemma4.Gemma4TextAttention.forward)
     config = Gemma4TextConfig(
         vocab_size = 32, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 2,

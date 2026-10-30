@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DoRA (use_dora=True) merge support in the safetensors merge path.
-
-The dense merge must (1) no longer raise a key-mismatch on a DoRA adapter (the magnitude vector
-is now captured), and (2) produce the same merged weight as PEFT's own DoRA merge. MoE-expert
-DoRA is explicitly refused (fail loud) rather than silently dropping the magnitude.
-"""
+"""DoRA (use_dora=True) merge in the safetensors path: dense merges capture the magnitude and match PEFT's merged
+weight; MoE-expert DoRA is refused loudly rather than silently dropping the magnitude."""
 import copy
 
 import pytest
@@ -82,7 +78,6 @@ def test_dora_merge_matches_peft():
 
     max_abs = (W_uns - W_peft).abs().max().item()
     assert torch.allclose(W_uns, W_peft, atol=1e-4, rtol=1e-4), f"max abs diff {max_abs}"
-    # Sanity: DoRA actually changed the weight vs the plain base.
     assert (W_uns - W0.float()).abs().max().item() > 1e-3
 
 
@@ -123,10 +118,9 @@ def test_dora_on_moe_expert_is_refused():
 
 
 def test_dora_on_embedding_is_refused():
-    """DoRA on an Embedding captures a magnitude but no mergeable lora_A/lora_B (PEFT stores the
-    embedding delta as lora_embedding_A/lora_embedding_B). _merge_lora cannot fold it, so the
-    magnitude would be silently dropped and assert_same_keys (which now ignores magnitude keys)
-    would not catch it. create_lora_statistics must fail loud instead."""
+    """DoRA on an Embedding captures a magnitude but no mergeable lora_A/lora_B (PEFT uses lora_embedding_A/B), so
+    _merge_lora would silently drop it; assert_same_keys ignores magnitude keys, so create_lora_statistics must fail
+    loud."""
     from peft import LoraConfig, get_peft_model
 
     class _WithEmbed(nn.Module):
@@ -147,10 +141,8 @@ def test_dora_on_embedding_is_refused():
 
 
 def test_dora_on_mxfp4_packed_moe_is_refused(monkeypatch, tmp_path):
-    """The MXFP4 packed-MoE rewrite (GPT-OSS gate_up_proj/down_proj) merges experts via
-    _merge_lora directly, not the dense _merge_moe_*_expert helpers, so it must apply the same
-    DoRA refuse. Without it a use_dora adapter on the experts bypasses the guard and _merge_lora
-    fails with an opaque shape error on the 3D expert group instead of the clear message."""
+    """The MXFP4 packed-MoE rewrite merges experts via _merge_lora directly, not the dense helpers, so it must refuse
+    DoRA too; otherwise an opaque 3D shape error replaces the clear message."""
     import unsloth_zoo.saving_utils as su
     from safetensors.torch import save_file
 

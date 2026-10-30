@@ -14,18 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Runtime regression check for the gpt-oss BlockMask leak (PR #690).
-
-The static AST guards live in tests/test_zoo_history_regressions.py. This file
-is the runtime invariant: call the wrapped create_causal_mask with a tiny
-GptOssConfig (_attn_implementation="flex_attention") and assert the return is
-not a BlockMask. Runs in a clean subprocess so torch.compile can be replaced
-with identity BEFORE any unsloth_zoo import (the wrap captures torch.compile at
-load time, and on CPU the compiled wrapper drops kwarg names, masking the real
-invariant with a misleading "missing positional argument" error).
-
-CPU-only; tests/conftest.py's GPU-free harness covers the inner subprocess.
-"""
+"""Runtime check for the gpt-oss BlockMask leak (PR 690): wrapped create_causal_mask must not return a BlockMask; runs
+in a subprocess with torch.compile set to identity before unsloth_zoo import, since the wrap captures torch.compile
+at load time; CPU-only."""
 from __future__ import annotations
 
 _RUNTIME_SUBPROCESS = r"""
@@ -97,11 +88,8 @@ except Exception:
 
 
 def test_pr690_runtime_blockmask_does_not_reach_eager_inference_path():
-    """Runtime invariant: with _attn_implementation='flex_attention' and a
-    non-grad inputs_embeds, the patched create_causal_mask returns a tensor (or
-    None), never a BlockMask. Without PR #690 it returns a BlockMask and
-    gpt-oss generate() crashes (Tensor += BlockMask TypeError).
-    """
+    """Non-grad flex inputs must get a tensor or None from create_causal_mask, never a BlockMask (PR 690); otherwise
+    gpt-oss generate() raises Tensor += BlockMask TypeError."""
     import subprocess
     import sys as _sys
 

@@ -14,20 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GPU-free regression tests for the vLLM >= 0.25.0 LoRA weights-mapper fix.
-
-vLLM 0.25.0 folds the QKV/MLP fusion (q_proj/k_proj/v_proj -> qkv_proj,
-gate/up -> gate_up_proj) into WeightsMapper.orig_to_new_stacked. The LoRA name
-parser calls mapper._map_name which drops the shard id, so the constituent
-projections collapse onto one fused key and collide in the in-memory LoRA tensor
-dict, crashing GRPO fast_inference=True with IndexError during activation.
-
-vllm_lora_worker_manager.py drops the stacked maps while keeping genuine
-renames, via get_unstacked_mapper() on 0.25.0 - 0.28.x, get_rename_mapper()
-from 0.29.0, else clearing the field. These tests drive the real
-WorkerLoRAManager._load_adapter with light fakes (no GPU, no vLLM init) and
-assert which mapper reaches the loader, over both paths and both signatures.
-"""
+"""GPU-free tests for the vLLM >= 0.25.0 LoRA mapper fix: stacked maps collapse fused projections (IndexError in GRPO
+fast_inference); the worker drops stacked maps but keeps renames via get_unstacked_mapper (0.25.0 to 0.28.x),
+get_rename_mapper (0.29.0+), or clears the field."""
 
 import dataclasses
 import types
@@ -83,12 +72,8 @@ class _FakePEFTHelper:
 
 
 def _make_recording_lora_model_cls(record, *, new_signature):
-    """Fake _lora_model_cls whose loaders record the kwargs they receive.
-
-    ``new_signature`` toggles whether the loader exposes ``model_vocab_size``
-    (newer vLLM) so we cover _load_adapter's signature branch without installing
-    multiple vLLM versions.
-    """
+    """Fake _lora_model_cls whose loaders record kwargs; new_signature toggles the model_vocab_size parameter of newer
+    vLLM to cover _load_adapter's signature branch."""
     if new_signature:
         def _loader(lora_model_id, peft_helper, dtype, weights_mapper,
                     tensors=None, lora_dir=None, device=None,
@@ -200,8 +185,7 @@ def test_rename_mapper_wins_when_both_helpers_exist():
 
 
 def test_stacked_field_is_cleared_when_no_helper_exists():
-    # Belt and braces for a third rename: strip orig_to_new_stacked ourselves
-    # and leave every other mapping untouched.
+    # Belt and braces for a third rename: strip orig_to_new_stacked ourselves and leave every other mapping untouched.
     record = {}
     mapper = _FieldOnlyMapper(
         orig_to_new_stacked={".q_proj": (".qkv_proj", "q")},

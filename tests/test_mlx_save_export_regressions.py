@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fast regressions for MLX save/export parity fixes: the contracts behind
-the real save / GGUF export bugs, without downloading or converting models.
-"""
+"""Fast regressions for MLX save/export parity: the contracts behind real save and GGUF export bugs, checked without downloading or converting models."""
 
 from __future__ import annotations
 
@@ -3741,9 +3739,7 @@ def test_macos_helper_defaults_to_the_managed_checkout(monkeypatch, tmp_path):
 
 
 def test_trusted_dir_matches_every_llama_cpp_default_dir_spelling(monkeypatch, tmp_path):
-    # Why nothing changes for real users: save_pretrained_gguf only ever passes
-    # LLAMA_CPP_DEFAULT_DIR, so every spelling of that variable must read as
-    # trusted, or an export quietly stops using the user's own gguf-py.
+    # save_pretrained_gguf passes only LLAMA_CPP_DEFAULT_DIR, so each spelling must read as trusted.
     home = tmp_path / ".unsloth"
     home.mkdir(parents=True)
     custom = tmp_path / "custom" / "llama.cpp"
@@ -4094,12 +4090,7 @@ def test_moe_gguf_export_restores_an_axis_a_sanitizer_moved(tmp_path):
 
 
 def _make_composed_moe_model():
-    """A model whose expert tensors only the two sanitizers together reproduce.
-
-    The outer relocates the MoE block and splits its fused expert tensor, the inner
-    renames what is left inside it, so neither reproduces a saved name alone. Tensors
-    outside the block, reproduced by both, hold the floor.
-    """
+    """Model whose expert tensors only the outer and inner sanitizers reproduce together; neither alone."""
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -4120,8 +4111,7 @@ def _make_composed_moe_model():
             self.checkpoint = {
                 "outer.inner.layers.0.mlp.experts.gate_up_proj":
                     mx.arange(24, dtype=mx.float32).reshape(2, 3, 4),
-                # Untouched by both: otherwise a fragment every name carries would read
-                # as the checkpoint's own shape, which the search will not substitute.
+                # Untouched by both, else a fragment every name carries would read as the checkpoint's own shape.
                 "vision.blocks.0.attn.proj": mx.arange(4, dtype=mx.float32).reshape(2, 2),
                 "vision.blocks.1.attn.proj": mx.arange(4, dtype=mx.float32).reshape(2, 2),
             }
@@ -4135,8 +4125,7 @@ def _make_composed_moe_model():
         def sanitize(self, weights):
             out = {}
             for name, tensor in weights.items():
-                # Both under the checkpoint's namespace: the split is how the relocated
-                # block is stored, not something any tensor with the name gets.
+                # Both live under the checkpoint namespace; the split is how the relocated block is stored.
                 if "outer.inner" in name:
                     name = name.replace("outer.inner", "inner.outer")
                     if "gate_up_proj" in name:
@@ -4167,9 +4156,7 @@ def test_moe_gguf_export_replays_the_sanitizers_a_model_composes(tmp_path):
 
 def test_moe_gguf_export_leaves_a_sanitizer_that_writes_to_itself_as_it_found_it(
         tmp_path):
-    """The export must not change the model it planned against: Gemma 3 ties its head
-    and drops `lm_head` when handed weights without `lm_head.weight`, and the search
-    hands it every spelling of that name."""
+    """Planned model stays unchanged: Gemma 3 drops lm_head when handed weights without lm_head.weight."""
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -4283,8 +4270,7 @@ def test_moe_gguf_export_keeps_a_namespace_a_sanitizer_adds_back(added, rewrites
               "root": "", "container": "model.", "always": "language_model."}[added]
 
     class Model:
-        # Names outside the tower keep each fragment under the ubiquity limit, and no
-        # leaf is one the converter already reads (which a rewrite holds back).
+        # Outside the tower, fragments stay under the ubiquity limit; no leaf is one the converter reads.
         checkpoint = {f"{prefix}layers.0.self_attn.{leaf}.weight": tensor(i)
                       for i, leaf in enumerate(("q_norm", "k_norm", "sinks", "gate", "bias"))}
         checkpoint.update((f"{prefix}layers.0.mlp.experts.{leaf}.weight", tensor(i))
@@ -4353,8 +4339,7 @@ def test_moe_gguf_export_keeps_a_container_drop_when_the_namespace_goes_back(tmp
         def named_modules(self):
             yield "", self
 
-        # Its two literals are the whole vocabulary, so the search reaches the spelling
-        # that drops both and the namespace has to be read back onto it.
+        # Only two literals exist, so the namespace must be read back onto the spelling that drops both.
         def sanitize(self, weights):
             out = {}
             for name, value in weights.items():
@@ -4392,11 +4377,7 @@ def test_moe_gguf_export_reads_a_namespace_back_only_onto_the_names_that_left_it
 
 
 def test_moe_gguf_export_stacks_experts_a_sanitizer_split_one_per_expert(tmp_path):
-    """A split into one tensor per expert, which no pair of parts can propose.
-
-    DBRX names parts by index, so no fragment stands for one. Only `w2` is transposed
-    as well as split, so a recipe proved on the first leaf cannot stand for both.
-    """
+    """DBRX splits per expert by index; only w2 is also transposed, so one leaf can't stand for both."""
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -4482,9 +4463,7 @@ def test_moe_gguf_export_splits_a_tensor_a_sanitizer_fused_from_a_named_group(tm
 
 
 def test_tokenizer_load_bypasses_model_config_and_preserves_sidecars(monkeypatch, tmp_path):
-    """transformers 5.x resolves the model config before tokenizing and only
-    catches ValueError/OSError from it, so a config raising AttributeError or
-    KeyError takes a loadable tokenizer down with it."""
+    """transformers 5.x catches only ValueError/OSError from config, so other errors break tokenizer load."""
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import AutoConfig, PreTrainedTokenizerFast
     import unsloth_zoo.mlx.loader as loader
@@ -4515,16 +4494,12 @@ def test_tokenizer_load_bypasses_model_config_and_preserves_sidecars(monkeypatch
 
 
 def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path):
-    """gpt2 and its relatives declare no tokenizer_class and ship no
-    special_tokens_map.json: bos/eos/unk come from the tokenizer class's
-    __init__ defaults. Loading the bare backend drops them, and an eos_token of
-    None leaves mlx-lm generation with no stop token."""
+    """No tokenizer_class: bos/eos/unk must come from class defaults; a None eos leaves no stop token."""
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
     import unsloth_zoo.mlx.loader as loader
 
-    # gpt2's published shape, built locally: downloading it fails offline, and
-    # this file is a hard gate in the Repo tests (CPU) lane.
+    # gpt2's shape, built locally: downloading fails offline and this file gates the CPU test lane.
     vocab = {"<|endoftext|>": 0, "hello": 1, "Ġworld": 2}
     backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
@@ -4575,9 +4550,7 @@ def test_model_type_lookup_tolerates_missing_config(tmp_path):
 
 
 def test_tokenizer_scope_routes_mlx_lm_and_restores(tmp_path):
-    """mlx_lm.utils.load_tokenizer calls AutoTokenizer.from_pretrained directly,
-    so the scope is the only way to reach it; it must restore on exit and after
-    an exception, and leave other threads alone."""
+    """Only scope reaches mlx_lm from_pretrained; restore on exit and after errors; spare other threads."""
     import threading
     from concurrent.futures import ThreadPoolExecutor
     from transformers import AutoTokenizer
@@ -4627,11 +4600,7 @@ def test_tokenizer_scope_routes_mlx_lm_and_restores(tmp_path):
 
 
 def test_tokenizer_load_never_prompts_for_remote_code(monkeypatch, tmp_path):
-    """transformers reads a missing trust_remote_code as None, and answers None
-    by prompting on stdin for TIME_OUT_REMOTE_CODE seconds. The blank config
-    _load_mlx_tokenizer injects forces has_local_code False, so a remote-code
-    repo lands on that branch: without an explicit default a plain load blocks
-    ~15s on a question nobody asked, in a notebook or a Studio worker."""
+    """Missing trust_remote_code reads as None and blocks on a stdin prompt; pass an explicit value."""
     import unsloth_zoo.mlx.loader as loader
 
     (tmp_path / "tokenizer_config.json").write_text(json.dumps({
@@ -4640,8 +4609,7 @@ def test_tokenizer_load_never_prompts_for_remote_code(monkeypatch, tmp_path):
     }))
     (tmp_path / "tokenization_custom.py").write_text("class RemoteTokenizer: pass\n")
 
-    # Record, never raise: resolve_trust_remote_code catches Exception and
-    # rewrites it into the ValueError the passing path also produces.
+    # Record, never raise: resolve_trust_remote_code catches Exception and rewrites it into ValueError.
     prompts = []
 
     def fake_input(*args, **kwargs):

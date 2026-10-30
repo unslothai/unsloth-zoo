@@ -14,24 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression test for PR #826.
-
-Making convert_moe_packed_tensors survive a missing _cpu variant is not enough on its
-own: when convert_moe_packed_tensors_cpu is absent, the base bound in saving_utils is
-stock transformers' convert_moe_packed_tensors, which already returns the transposed
-GPT-OSS layout (`return out.transpose(1, 2).contiguous()`). saving_utils then applies its
-OWN .transpose(1, 2), so with the stock base the exported mxfp4 weight is DOUBLE
-transposed (dims 1 and 2 swapped) and silently corrupted.
-
-This test runs the real _merge_and_overwrite_lora_mxfp4 converter on a tiny fake mxfp4
-file in two import orderings and asserts they produce byte-identical output:
-
-  * without the Unsloth mxfp4 patch  -> _cpu absent, base is stock (self-transposing)
-  * with the Unsloth mxfp4 patch     -> _cpu present, base is no-self-transpose
-
-Before the fix the first ordering yields shape (E, D, G*B*2) and the second (E, G*B*2, D):
-they differ by a transpose. After the fix both yield the correct (E, G*B*2, D) layout.
-"""
+"""Regression for PR 826: with convert_moe_packed_tensors_cpu absent, stock transformers' self-transposing base plus
+saving_utils' own transpose double-transposes mxfp4 exports; both import orders must match."""
 import os
 import subprocess
 import sys
@@ -94,9 +78,7 @@ def _run(mode, outfile, B):
 # B = 16 is the real MXFP4 block (the GPU fast path); B = 8 takes the generic loop.
 @pytest.mark.parametrize("B", [8, 16])
 def test_mxfp4_export_layout_matches_with_and_without_cpu_variant(B):
-    # transformers.integrations.mxfp4 only exists from ~4.55 (GPT-OSS); on the older
-    # transformers unsloth_zoo still supports (pin floor 4.51.3) the subprocess converter
-    # below cannot run, so skip cleanly rather than error.
+    # transformers.integrations.mxfp4 exists only from ~4.55 (GPT-OSS); older transformers (pin floor 4.51.3) cannot run the subprocess converter, so skip.
     pytest.importorskip("transformers.integrations.mxfp4")
     import torch
     with tempfile.TemporaryDirectory() as d:

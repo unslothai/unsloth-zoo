@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The #6028 backport must fire only for installs whose unsloth lacks the guard.
-
-unsloth's generate forces a static cache, which drops Gemma's bidirectional
-image block overlay at prefill. Current unsloth gates that itself; this shim
-covers older ones by clearing `_supports_static_cache`, the single flag
-unsloth/models/vision.py consults, and must stay out of the way otherwise.
-"""
+"""Backport for issue 6028: unsloth generate forces a static cache, which drops the bidirectional image overlay Gemma
+needs at prefill; clears _supports_static_cache only if unsloth lacks the guard"""
 import sys
 import types
 
@@ -94,8 +89,7 @@ def test_classes_without_the_overlay_are_untouched(fake_gemma, fake_vision):
 
 
 def test_unsloth_not_imported_yet_is_a_no_op(fake_gemma, fake_vision):
-    """At the init phase vision is absent, so the version check cannot be made
-    and the safe answer is to do nothing."""
+    """At init vision is not imported yet, so the version check cannot run and the patch does nothing"""
     sys.modules.pop("unsloth.models.vision", None)
     patch_Gemma4_static_cache_backport(phase="post_compile")
     assert not hasattr(fake_gemma.WithOverlay, "_supports_static_cache")
@@ -109,15 +103,13 @@ def test_only_runs_at_post_compile(fake_gemma, fake_vision, phase):
 
 
 def test_registered_with_a_phase_parameter():
-    """unsloth calls the patch with `phase` only if it declares the parameter,
-    so a rename there would silently make this run at init."""
+    """unsloth passes phase only if the patch declares it, so a rename would silently run this at init."""
     import inspect
     assert "phase" in inspect.signature(patch_Gemma4_static_cache_backport).parameters
 
 
 def test_unsloth_vision_reads_the_flag_we_clear():
-    """Pin the unsloth-side contract: the shim is pointless if that attribute
-    stops being what selects the cache."""
+    """Unsloth vision must still read _supports_static_cache to select the cache, or the shim is moot."""
     vision = pytest.importorskip("unsloth.models.vision")
     src = inspect_source(vision)
     assert "_supports_static_cache" in src

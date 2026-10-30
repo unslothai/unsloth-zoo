@@ -14,18 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU tests for the Gemma-4 vision pooler float16 overflow fix.
-
-The buggy transformers (<= 5.9.x) Gemma4VisionPooler scales by sqrt(hidden_size)
-in the input dtype, so fp16 activations ~2300 overflow to inf (2300 * 33.94 >
-65504) and NaN the loss. The zoo patch runs the pooler in fp32 (matching the
-upstream >= 5.10.1 fixed output up to fp16 rounding), keeps standardization in
-fp32, and casts last_hidden_state back to the encoder dtype (inputs_embeds.dtype)
-in Gemma4VisionModel.forward.
-
-The synthetic classes below mirror the 5.5.0 source shapes so the tests run on
-any installed transformers (including 4.57.6, which has no gemma4).
-"""
+"""Gemma-4 vision pooler fp16 overflow fix: buggy transformers <= 5.9.x scales by sqrt(hidden_size) in input dtype and
+overflows to inf; pooler runs in fp32 (matches upstream >= 5.10.1); last_hidden_state cast back to encoder dtype"""
 
 import types
 
@@ -64,8 +54,7 @@ def make_buggy_classes(standardize=True, model_dtype=torch.float16, return_tuple
                 self.input_proj.weight.copy_(torch.eye(HIDDEN))
 
         def forward(self, pixel_values):
-            # Upstream-like: cast pixels to the weight dtype, then run the real
-            # (autocast-eligible) Linear; the identity weight keeps amax controlled.
+            # Cast to weight dtype, run the real autocast-eligible Linear; identity weight keeps amax controlled
             return self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
 
     class TinyVisionModel(torch.nn.Module):
@@ -167,8 +156,7 @@ def test_patched_standardize_false_casts_back():
     x = fp16_overflow_input()
     out = make_model(TinyVisionModel)(x).last_hidden_state
     assert out.dtype == torch.float16
-    # Upstream >= 5.10.1 standardize=False: fp32 scale then saturating fp16
-    # cast (values past 65504 become inf).
+    # Upstream >= 5.10.1 (standardize=False): fp32 scale, saturating fp16 cast; past 65504 becomes inf
     expected = (x.float() * HIDDEN**0.5).to(torch.float16)
     assert torch.equal(out, expected)
 
@@ -215,9 +203,7 @@ def test_tuple_output_cast():
 
 
 def test_bf16_autocast_over_fp16_weights_untouched():
-    # Under bf16 autocast an fp16-weight input_proj emits bf16 (the true
-    # inputs_embeds dtype); keying on the weight dtype would downcast a
-    # safe bf16 path to fp16.
+    # Under bf16 autocast, fp16-weight input_proj emits bf16; weight-dtype keying would downcast it.
     TinyPooler, TinyVisionModel = make_buggy_classes(standardize=False)
     x = fp16_overflow_input(torch.float32)
     with torch.autocast("cpu", torch.bfloat16):
@@ -330,8 +316,7 @@ def test_wrapper_registered():
 
 
 def test_real_transformers_source_canary():
-    """Drift guard: the installed pooler must be known-buggy or known-fixed;
-    fails loudly when upstream rewrites it so the patterns get refreshed."""
+    """Drift guard: installed pooler must match a known-buggy or known-fixed pattern, else fail loudly."""
     modeling = pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
     pooler_cls = getattr(modeling, "Gemma4VisionPooler", None)
     if pooler_cls is None:
@@ -344,10 +329,8 @@ def test_real_transformers_source_canary():
 
 
 def test_real_transformers_patch_applies_or_skips():
-    """End-to-end on the installed transformers: the public wrapper patches
-    (buggy), skips (fixed), or no-ops (no gemma4). On buggy installs this
-    mutates the process-global classes (shipping behavior); other tests use
-    per-test synthetic classes, so ordering does not matter."""
+    """Wrapper patches buggy installs, skips fixed, no-ops without gemma4; it mutates process-global classes, but other
+    tests use per-test synthetic classes, so ordering does not matter"""
     try:
         import transformers.models.gemma4.modeling_gemma4 as modeling
     except ImportError:

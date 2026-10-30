@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The resized-shard rewrite has two branches (streaming temp file vs low-disk
-in-place save_file): they must produce identical tensors and preserve unchanged
-tensors byte-for-byte while swapping in the resized ones. CPU-only.
-"""
+"""Resized-shard rewrite: the streaming temp-file and low-disk in-place save_file branches must produce identical
+tensors and preserve unchanged tensors byte-for-byte while swapping in the resized ones; CPU-only."""
 
 from __future__ import annotations
 

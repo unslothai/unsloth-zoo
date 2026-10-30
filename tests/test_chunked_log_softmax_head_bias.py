@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GRPO scores hidden states through the output head itself, so a head with a bias (Phi) must add it
-before the logit transforms, and the bias must receive its gradient."""
+"""GRPO scores hidden states through the output head, so a head bias (Phi) must be added before the logit transforms and must receive its gradient."""
 import pytest
 import torch
 

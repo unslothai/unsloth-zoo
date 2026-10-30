@@ -80,8 +80,8 @@ def test_other_custom_ops_still_checked():
 
 
 def test_helper_before_dynamo_import_keeps_compile_working():
-    # Called before anything imported torch._dynamo, the helper must not trigger the runtime_wrappers circular import
-    # (which leaves torch._dynamo half initialised and breaks torch.compile for the process).
+    # Called before torch._dynamo is imported, the helper must not trigger the runtime_wrappers circular import, which
+    # leaves torch._dynamo half initialised and breaks torch.compile.
     path = os.path.join(os.path.dirname(__file__), "..", "unsloth_zoo", "temporary_patches", "common.py")
     code = textwrap.dedent(f"""
         import ast, sys, torch
