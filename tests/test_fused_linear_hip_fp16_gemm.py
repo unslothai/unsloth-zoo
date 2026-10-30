@@ -109,3 +109,27 @@ def test_eager_keeps_small_entries_of_a_scaled_row(capturing):
     assert torch.isfinite(out).all()
     if not capturing:
         torch.testing.assert_close(out.double(), ref, rtol = 1e-6, atol = 0)
+
+
+def test_capturing_queries_the_operand_device(monkeypatch):
+    # A stream capturing on cuda:1 while cuda:0 is current: the check must ask on cuda:1, else the eager branch
+    # reads a host flag mid capture and invalidates it. Device state is simulated, so this runs on CPU.
+    import contextlib
+    from types import SimpleNamespace
+    state = {"device": 0}
+
+    @contextlib.contextmanager
+    def device(index):
+        previous, state["device"] = state["device"], index
+        try:
+            yield
+        finally:
+            state["device"] = previous
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: state["device"])
+    monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: state["device"] == 1)
+    assert fl._capturing(SimpleNamespace(is_cuda = True, device = torch.device("cuda", 1)))
+    assert not fl._capturing(SimpleNamespace(is_cuda = True, device = torch.device("cuda", 0)))
+    assert not fl._capturing(torch.ones(1))
+    assert state["device"] == 0
