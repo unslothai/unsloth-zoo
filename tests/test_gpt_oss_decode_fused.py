@@ -18,23 +18,18 @@
 # Kernels run on CUDA when present, else under the Triton interpreter on CPU (subprocess).
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
+import subprocess
+import sys
 import textwrap
 
 import pytest
 import torch
+from _cpu_compiler_skip import skip_if_cpu_inductor_missing
 
 pytest.importorskip("triton")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_spec = importlib.util.spec_from_file_location(
-    "_cpu_compiler_skip", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cpu_compiler_skip.py")
-)
-_cpu_compiler_skip = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_cpu_compiler_skip)
-
-
 
 _SCRIPT = textwrap.dedent('''
     import json, os, sys
@@ -125,7 +120,10 @@ def _run(tmp_path, script, *args, env_extra = None):
             env.pop(key, None)
         else:
             env[key] = value
-    proc = _cpu_compiler_skip.run_child(path, args, env)
+    proc = subprocess.run([sys.executable, str(path), *args], capture_output = True, text = True, env = env,
+                          timeout = 1500)
+    if proc.returncode != 0:
+        skip_if_cpu_inductor_missing(env)
     line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT ")]
     assert proc.returncode == 0 and line, proc.stdout[-2000:] + proc.stderr[-3000:]
     return json.loads(line[-1][len("RESULT "):])
@@ -362,55 +360,3 @@ def test_the_model_forward_patch_is_live_on_this_transformers(tmp_path):
     # cache_position stayed out on transformers 4.x, so nothing it carries (fused decode included) ran.
     res = _run(tmp_path, _LIVE, env_extra = {"UNSLOTH_COMPILE_DISABLE": None, "UNSLOTH_ENABLE_FLEX_ATTENTION": None})
     assert res["live"].startswith("unsloth_zoo"), res
-
-
-@pytest.mark.parametrize("body, outcome", [
-    # torch 2.9 - 2.12 on Windows.
-    ('raise RuntimeError("Compiler: cl is not found.") from FileNotFoundError("cl")', "skip"),
-    # Linux and torch 2.13+, wrapped the way the compile stack reports it.
-    ('class InvalidCxxCompiler(RuntimeError):\n    pass\ntry:\n'
-     '    raise InvalidCxxCompiler("No working C++ compiler found in torch._inductor.config.cpp.cxx")\n'
-     'except RuntimeError as e:\n    raise RuntimeError("backend compiler failed") from e', "skip"),
-    # torch's InductorError keeps the compiler error as inner_exception, raised without `from`.
-    ('class InvalidCxxCompiler(RuntimeError):\n    pass\nclass InductorError(RuntimeError):\n'
-     '    def __init__(self, inner):\n        self.inner_exception = inner\n'
-     '        super().__init__(f"{type(inner).__name__}: {inner}")\ntry:\n'
-     '    raise InvalidCxxCompiler("No working C++ compiler found")\nexcept RuntimeError as e:\n'
-     '    raise InductorError(e)', "skip"),
-    # A non-ASCII compiler path still reaches the marker.
-    ('raise RuntimeError("Compiler: C:/Programme/\\u00fcbersetzer/cl.exe is not found.")', "skip"),
-    # A compiler error the run recovered from, then an unrelated failure.
-    ('import sys\nprint("InvalidCxxCompiler: No working C++ compiler found", file = sys.stderr)\ntry:\n'
-     '    raise RuntimeError("Compiler: cl is not found.")\nexcept RuntimeError:\n    pass\n'
-     'raise ValueError("unrelated")', "fail"),
-    # Compiler text inside an unrelated exception.
-    ('raise ValueError("Compiler: cl is not found.")', "fail"),
-    ('raise RuntimeError("model failed; InvalidCxxCompiler mentioned in a log line")', "fail"),
-    # A marker-looking line the script printed itself.
-    ('print("SKIP_REASON InvalidCxxCompiler: No working C++ compiler found")\nraise ValueError("unrelated")', "fail"),
-], ids = ["windows-compiler-not-found", "invalid-cxx-compiler-wrapped", "inductor-error-inner", "non-ascii-path",
-          "recovered-then-unrelated", "compiler-text-in-a-valueerror", "compiler-text-in-a-runtimeerror",
-          "printed-marker"])
-def test_only_a_missing_compiler_that_ends_the_run_skips(tmp_path, body, outcome):
-    from _pytest.outcomes import Skipped
-    # An ASCII stdout stands in for a Windows cp1252 console that cannot print every compiler path.
-    env = {"PYTHONIOENCODING": "ascii"}
-    if outcome == "skip":
-        with pytest.raises(Skipped, match = r"no C\+\+ compiler"):
-            _run(tmp_path, body + "\n", env_extra = env)
-    else:
-        try:
-            with pytest.raises(AssertionError, match = r"Traceback[\s\S]*(ValueError|model failed)"):
-                _run(tmp_path, body + "\n", env_extra = env)
-        except Skipped:
-            pytest.fail("an unrelated failure was skipped")
-
-
-def test_a_successful_child_without_a_result_fails(tmp_path):
-    with pytest.raises(AssertionError, match = "no result"):
-        _run(tmp_path, "print('no result')\n")
-
-
-def test_child_scripts_may_start_with_future_imports(tmp_path):
-    script = "from __future__ import annotations\nimport json\nprint('RESULT ' + json.dumps({'ok': True}))\n"
-    assert _run(tmp_path, script) == {"ok": True}

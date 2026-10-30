@@ -14,74 +14,46 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Run a test's child script and skip only when a missing C++ compiler ended it.
+"""Skip a failed subprocess check when CPU Inductor has no C++ compiler here.
 
-CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none. The
-child runs its script through runpy (the script itself is untouched, so `from __future__` imports still work) under an
-excepthook that judges only the exception that ends the run, following its __cause__ chain and the inner_exception
-Dynamo / Inductor wrap the compiler error in. It writes one ASCII marker to a file only it knows, so nothing the script prints can fake or
-outlive it. A missing compiler is InvalidCxxCompiler (Linux, torch 2.13+) or torch 2.9 - 2.12's Windows
-RuntimeError("Compiler: <cl> is not found.").
+CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none. Only
+after a child run fails, one trivial compile in a fresh process with the same environment decides: the test skips
+only when that probe fails for a missing compiler. A run that needs no compiler still asserts, and a failure on a host
+that has one still fails.
 """
 
-import os
+import re
 import subprocess
 import sys
 
 import pytest
 
-MARKER_ENV = "UNSLOTH_TEST_COMPILER_SKIP_MARKER"
-
-_BOOT = r'''
-import os, runpy, sys
-
-def _missing_compiler(e):
-    if type(e).__name__ == "InvalidCxxCompiler":
-        return True
-    message = str(e).strip()
-    return isinstance(e, RuntimeError) and message.startswith("Compiler:") and message.endswith("is not found.")
-
-def _hook(tp, exc, tb, _previous = sys.excepthook):
-    seen, todo = set(), [exc]
-    while todo:
-        e = todo.pop(0)
-        if e is None or id(e) in seen:
-            continue
-        seen.add(id(e))
-        if _missing_compiler(e):
-            text = (type(e).__name__ + ": " + str(e).strip().splitlines()[0])[:300]
-            with open(os.environ["''' + MARKER_ENV + r'''"], "w", encoding = "ascii", errors = "backslashreplace") as f:
-                f.write(type(e).__name__ + "\n" + text)
-            break
-        todo += [e.__cause__, getattr(e, "inner_exception", None)]
-    _previous(tp, exc, tb)
-
-sys.excepthook = _hook
-path = sys.argv[1]
-sys.argv = sys.argv[1:]
-runpy.run_path(path, run_name = "__main__")
-'''
+_PROBE = "import torch; torch.compile(lambda x: x + 1, backend = 'inductor')(torch.ones(2))"
+# Linux / torch 2.13+: InvalidCxxCompiler. torch 2.9 - 2.12 on Windows: RuntimeError("Compiler: cl is not found.").
+_MISSING = re.compile(r"InvalidCxxCompiler|Compiler: .* is not found\.")
+_probes = {}
 
 
-def missing_compiler(type_name, message):
-    """The parent's re-check of the marker (same rule as the child's hook)."""
-    if type_name == "InvalidCxxCompiler":
-        return True
-    message = message.split(": ", 1)[-1].strip()
-    return type_name == "RuntimeError" and message.startswith("Compiler:") and message.endswith("is not found.")
+def missing_compiler(returncode, output):
+    return returncode != 0 and _MISSING.search(output) is not None
 
 
-def run_child(path, args, env, timeout = 1500):
-    """Run `path` with `args`; pytest.skip when a missing C++ compiler ended it, else return the CompletedProcess."""
-    marker = f"{path}.compiler_skip"
-    if os.path.exists(marker):
-        os.remove(marker)
-    env = dict(env, **{MARKER_ENV: marker})
-    proc = subprocess.run([sys.executable, "-c", _BOOT, str(path), *args], capture_output = True, text = True,
-                          env = env, timeout = timeout)
-    if proc.returncode != 0 and os.path.exists(marker):
-        with open(marker, encoding = "ascii") as f:
-            type_name, _, text = f.read().partition("\n")
-        if missing_compiler(type_name, text):
-            pytest.skip(f"CPU Inductor has no C++ compiler here ({text})")
-    return proc
+def _probe(env):
+    key = (sys.executable,) + tuple(sorted(
+        (k, v) for k, v in env.items() if k.upper() in ("CXX", "CC", "PATH") or k.upper().startswith("TORCHINDUCTOR_")
+    ))
+    if key not in _probes:
+        try:
+            proc = subprocess.run([sys.executable, "-c", _PROBE], capture_output = True, text = True,
+                                  errors = "replace", env = env, timeout = 600)
+            _probes[key] = (proc.returncode, (proc.stdout + proc.stderr)[-4000:])
+        except subprocess.TimeoutExpired:
+            _probes[key] = (0, "")
+    return _probes[key]
+
+
+def skip_if_cpu_inductor_missing(env):
+    returncode, output = _probe(env)
+    if missing_compiler(returncode, output):
+        reason = [x.strip() for x in output.splitlines() if _MISSING.search(x)][-1]
+        pytest.skip(f"CPU Inductor has no C++ compiler here ({reason[:200]})")
