@@ -2060,6 +2060,9 @@ def moe_compute_dtype(hidden_states):
     return torch.bfloat16
 
 
+_SWAP_VIA_INSTANCE_DICT = _torch_version_tuple() < (2, 5)
+
+
 def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_fn, *args):
     """Swaps dequantized weights into _parameters for one call and restores them (no __setattr__, so no (de)registration
     or hooks); used by the FP8 and bnb4bit MoE dispatchers."""
@@ -2068,7 +2071,8 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     names = ("gate_up_proj", "down_proj")
     params = experts_module._parameters
     instance_dict = experts_module.__dict__
-    registered = {name: params[name] for name in names if name in params}
+    # torch < 2.5 Dynamo ignores the `_parameters` swap (wrong output, no grads): shadow via __dict__ instead.
+    registered = {} if _SWAP_VIA_INSTANCE_DICT else {name: params[name] for name in names if name in params}
     saved = {name: instance_dict[name] for name in names if name not in registered and name in instance_dict}
     for name, tensor in zip(names, (gate_up_proj, down_proj)):
         if name in registered:
