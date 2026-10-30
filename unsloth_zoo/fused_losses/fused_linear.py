@@ -1976,14 +1976,12 @@ def _scale_rows_inplace_impl(u, g):
 
 
 _KEEP_GRAPH = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)
-# torch 2.8+. Older torch only gets the address check below.
+# torch 2.8+; older torch relies on the address check only.
 _TOP_SAVED_HOOKS = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
 
 
 def _owned_ptrs(stored):
-    """Addresses of the op's own stored grads, or None when a saved-tensor hook is active: a lossless
-    hook may hand back one buffer for equal tensors (here or in another op), so scaling in place would
-    scale it twice."""
+    """None under a saved-tensor hook: it may return one shared buffer for equal tensors, scaled twice in place."""
     if torch.compiler.is_compiling():
         return None
     try:
@@ -1995,7 +1993,6 @@ def _owned_ptrs(stored):
 
 
 def _owns(ctx, saved):
-    # Each stored grad came back as the op's own allocation (no hook swapped or shared it).
     owned = getattr(ctx, "owned", None)
     return owned is not None and owned == tuple(x.data_ptr() for x in saved)
 

@@ -218,8 +218,7 @@ def test_compiled_no_graph_break_and_same_grads():
 
 
 def _value_dedup_hooks(keep_original):
-    # Lossless per the saved-tensor hook contract (unpack returns equal values): equal saved tensors
-    # come back as one shared buffer, a clone or the first original.
+    # Lossless hook that returns one shared buffer for equal saved tensors.
     kept = []
 
     def pack(t):
