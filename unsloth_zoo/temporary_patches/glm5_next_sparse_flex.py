@@ -16,10 +16,8 @@
 
 """GLM-5.3-Flash (glm5_next) pooled DSA: exact skip, chunked indexer, opt-in flex BlockMask.
 
-Both patched indexer paths return upstream's key set in a fixed layout (index_topk pool slots, -1
-padded, then index_kpool - 1 tail slots); the flex path reads that layout, so it engages only when
-the patched indexer produced the indices. Flex is opt-in (UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT=1):
-on A100 it was ~5x slower than dense SDPA for 18-48% less peak memory."""
+Flex reads the patched indexer's fixed layout (index_topk pool slots, -1 padded, then the tail), so it
+engages only on patched indices. Opt-in (UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT=1): ~5x slower than dense on A100."""
 
 __all__ = ["patch_glm5_next_sparse"]
 
@@ -226,7 +224,6 @@ def _pool_starts(topk_indices, kpool, index_topk):
     """(first token of each selected pool or -1 [B, S, index_topk // kpool], valid, row phase [B])."""
     starts = topk_indices[..., 0:index_topk:kpool].long()
     valid = starts >= 0
-    # Every pool of a row starts at first_key + j * kpool: one phase per row.
     phase = torch.where(valid, starts.remainder(kpool), -1).amax(dim = (1, 2)).clamp(min = 0)
     return starts, valid, phase
 

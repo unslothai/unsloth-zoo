@@ -129,8 +129,7 @@ def _flex_or_none(kind, label, fn, query, key, value, *args):
 
 
 def _release_failure(error):
-    """A failed flex call's traceback frames hold its CUDA tensors in cycles only a full gc frees
-    (+25% peak on later steps otherwise); clear them and collect once (failures latch per shape class)."""
+    """Failed flex traceback frames hold CUDA tensors in cycles only a full gc frees (+25% later peak)."""
     seen, stack = set(), [error]
     while stack:
         e = stack.pop()

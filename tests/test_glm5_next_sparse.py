@@ -477,8 +477,7 @@ def test_tiny_model_cached_greedy_decode_across_the_budget():
 
 
 def test_static_cache_key_length_is_the_allocation_before_the_first_prefill():
-    # An uninitialized static cache still pools its whole allocation: predicting the prompt length
-    # instead let a short prompt take upstream's indexer while the flex mask read our layout.
+    # An uninitialized static cache still pools its whole allocation (not the prompt length).
     g = _patched()
     config = _text_config()
     idx = _indexer(config)
@@ -497,8 +496,7 @@ def test_static_cache_key_length_is_the_allocation_before_the_first_prefill():
 
 
 def test_unchunked_upstream_when_scores_fit_free_memory(monkeypatch):
-    # Above the budget, upstream's one-shot scoring is faster than query chunks: it runs whenever its
-    # scores fit a share of free GPU memory; chunks only when they do not (or flex needs our layout).
+    # One-shot scoring (faster) when it fits free memory; chunks otherwise or when flex needs our layout.
     import types
 
     g = _patched()
