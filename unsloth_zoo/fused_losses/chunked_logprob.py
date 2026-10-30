@@ -51,7 +51,7 @@ _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 
 def _default_chunk_gb(device = None):
     try:
-        from unsloth_zoo.tiled_mlp import _default_target_gb
+        from unsloth_zoo.memory_budget import _default_target_gb
 
         free = float(_default_target_gb(device))
     except Exception:
