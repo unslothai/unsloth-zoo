@@ -18,6 +18,7 @@ Frozen-input LoRA grads, width-changing projectors, router-logit grads and once-
 the removed tiled_mlp.TiledMLP got wrong."""
 import os
 import sys
+import weakref
 
 import pytest
 import torch
@@ -353,3 +354,48 @@ def test_tile_recompute_sees_the_outer_gc_state_of_its_forward():
     torch.testing.assert_close(x.grad, xr.grad)
     torch.testing.assert_close(m.w.grad, m2.w.grad)
     assert not in_gradient_checkpoint_recompute()
+
+
+def _reraise(exc):
+    # The shape of the "disable the kernel, but re-raise checkpoint control flow" helpers in the MoE kernels: the
+    # raise puts this frame, whose local holds the exception, on the exception's own traceback (a reference cycle).
+    raise exc
+
+
+class _RecomputeKeeper(torch.nn.Module):
+    def __init__(self, refs):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(H, 4 * H) / H**0.5)
+        self.w2 = torch.nn.Parameter(torch.randn(4 * H, H) / H**0.5)
+        self.refs = refs
+
+    def forward(self, x):
+        h = torch.relu(x @ self.w)
+        self.refs.append(weakref.ref(h))
+        try:
+            return h @ self.w2  # the last saved tensors: checkpoint's early stop raises from in here
+        except Exception as exc:
+            _reraise(exc)
+
+
+def test_tile_recompute_is_freed_without_waiting_for_the_cycle_collector():
+    # Checkpoint stops a recompute early by raising once the last saved tensor exists. When that exception passes
+    # through a helper that re-raises it, its traceback is a reference cycle that holds every frame of the recompute,
+    # so each tile's recomputed intermediates lived until the cycle collector ran: on OLMoE the tiles of a layer were
+    # all alive at once and the backward peak was higher than untiled.
+    import gc
+    refs = []
+    m = _RecomputeKeeper(refs)
+    x = torch.randn(2, 16, H, requires_grad = True)
+    gc.collect()
+    gc.disable()
+    try:
+        y = tiled_call(m, x, n_tiles = 4, needs_rng = False)
+        forward_refs = len(refs)
+        y.sum().backward()
+        recomputed = refs[forward_refs:]
+        assert len(recomputed) == 4
+        alive = sum(r() is not None for r in recomputed)
+    finally:
+        gc.enable()
+    assert alive == 0, f"{alive} of 4 recomputed tiles still alive after backward"

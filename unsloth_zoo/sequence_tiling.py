@@ -132,10 +132,21 @@ def _replay_tile(fn, gc_flag, *args):
         if getattr(fn, "_unsloth_dynamic_body", False):
             return fn(*args)
         return _dynamic_inner_compiles(fn, *args)
+    except BaseException as exc:
+        # Checkpoint ends a recompute early by raising once the last saved tensor exists. Its traceback holds every
+        # frame of the recompute; a helper on the way that re-raises it (`def _disable(exc): raise exc`) makes that a
+        # reference cycle, so the tile's recomputed intermediates outlived its backward until the cycle collector
+        # ran and every tile of a layer was alive at the backward peak. The traceback of this control-flow signal is
+        # never shown, so drop it.
+        if _STOP_RECOMPUTATION is not None and isinstance(exc, _STOP_RECOMPUTATION):
+            exc.__traceback__ = None
+        raise
     finally:
         if tls is not None:
             tls.active = previous
 pass
+
+_STOP_RECOMPUTATION = getattr(torch.utils.checkpoint, "_StopRecomputationError", None)
 
 
 def _dynamic_inner_compiles(fn, *args):
