@@ -49,7 +49,7 @@ _COMPUTE = _FakeStream("compute")
 def G(monkeypatch):
     monkeypatch.setenv("UNSLOTH_ALLOW_CPU", "1")
     for name in ("UNSLOTH_GC_OFFLOAD_BACKEND", "UNSLOTH_GC_STREAM_KEEP_LAST", "UNSLOTH_GC_MAX_INFLIGHT_COPIES",
-                 "UNSLOTH_GC_KEEP_LAST_CHECKPOINTS", "UNSLOTH_GC_PINNED_MAX_GB"):
+                 "UNSLOTH_GC_PINNED_MAX_GB"):
         monkeypatch.delenv(name, raising = False)
     # The scenarios use small tensors: the size floor has its own tests below.
     monkeypatch.setenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", "0")
@@ -570,7 +570,7 @@ def test_varying_shapes(env):
     assert env["G"]._test_ledger["live"] == 0
 
 
-# ---- Eligibility, counters, ownership, budgeted offload, selective checkpointing.
+# ---- Eligibility, counters, ownership.
 
 @pytest.fixture
 def fake(G, monkeypatch):
@@ -690,39 +690,3 @@ def test_owner_forward_pre_hook_separates_pending_forwards(G, fake, monkeypatch)
     l1.backward()
     assert not spy.violations
     assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"] == 6
-
-
-def test_budgeted_offload_keeps_the_last_checkpoints_resident(G, fake, monkeypatch):
-    monkeypatch.setenv("UNSLOTH_GC_KEEP_LAST_CHECKPOINTS", "2")
-    model = _Stack(n = 5)
-    x = _input("cpu", 2, 5, 16)
-    model.hooks = None
-    model(x).square().mean().backward()
-    ref = _grads(model, x)
-    for stream in (False, True):
-        offloader = fake(stream_mode = stream)
-        assert offloader.keep_checkpoints == 2
-        model.hooks = offloader.hooks
-        spy = _Spy(offloader, "step")
-        loss = model(x).square().mean()
-        records = [r() for r in spy.records["step"]]
-        on_device = [r.device_tensor is not None and r.host is None for r in records]
-        assert on_device == [False, False, False, True, True]
-        assert offloader.stats["kept"] == 2 and offloader.stats["offloaded"] == 3
-        loss.backward()
-        _assert_same(_grads(model, x), ref)
-        assert offloader.stats["restored"] == 3  # the kept two never went to the host
-        del records, loss
-        _settle({"backend": "fake"})
-        assert G._test_ledger["live"] == 0
-
-
-def test_budgeted_offload_is_off_by_default(G, fake):
-    offloader = fake(stream_mode = False)
-    assert offloader.keep_checkpoints == 0
-    model = _Stack(n = 3)
-    model.hooks = offloader.hooks
-    x = _input("cpu", 2, 5, 16)
-    loss = model(x).square().mean()
-    assert offloader.stats["offloaded"] == 3 and offloader.stats["kept"] == 0
-    loss.backward()

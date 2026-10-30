@@ -2007,8 +2007,7 @@ class NonReentrantActivationOffloader:
     recomputes. Costs up to one more layer's checkpoint inputs of VRAM each way.
 
     Saved tensors under UNSLOTH_GC_OFFLOAD_MIN_BYTES (default 1 MiB), non-contiguous ones and views
-    that do not own their whole storage stay on the device. UNSLOTH_GC_KEEP_LAST_CHECKPOINTS=K
-    (default 0, off) keeps the inputs of each forward's last K checkpoint calls on the device.
+    that do not own their whole storage stay on the device.
     Records carry their forward's identity: prefetch and keep-last decisions stay inside the
     graph a record belongs to, however forwards and backwards interleave. Give each model its
     own offloader with non_reentrant_offload_hooks(model); `stats` counts tensors and bytes.
@@ -2033,9 +2032,6 @@ class NonReentrantActivationOffloader:
         # Saved tensors under this many bytes stay on the device: their copy is latency bound and they are not
         # what makes the activation footprint. UNSLOTH_GC_OFFLOAD_MIN_BYTES=0 offloads everything.
         self.min_bytes = _env_nonnegative_int("UNSLOTH_GC_OFFLOAD_MIN_BYTES", GC_OFFLOAD_MIN_BYTES)
-        # Budgeted offload (off by default): the inputs of the last K checkpoint calls (hooks() entries) of each
-        # forward stay on the device, since backward needs them first; older ones go to the host.
-        self.keep_checkpoints = _env_nonnegative_int("UNSLOTH_GC_KEEP_LAST_CHECKPOINTS", 0)
         self.inflight = {}
         self.d2h_streams = {}
         self.h2d_streams = {}
@@ -2230,11 +2226,7 @@ class NonReentrantActivationOffloader:
         record.nbytes = nbytes
         order.append(weakref.ref(record))
         x = x.detach()
-        if self.keep_checkpoints > 0:
-            record.device_tensor = x
-            self.stats["kept"] += 1
-            self._offload_outside_window(order, record)
-        elif self.stream_mode and self.keep_last > 0:
+        if self.stream_mode and self.keep_last > 0:
             record.device_tensor = x
             self.stats["kept"] += 1
             if record.index >= self.keep_last:
@@ -2246,21 +2238,6 @@ class NonReentrantActivationOffloader:
         else:
             self._to_host(record, x)
         return record
-    pass
-
-    def _offload_outside_window(self, order, newest):
-        """Budgeted offload: move this forward's kept inputs of checkpoint calls older than the last
-        `keep_checkpoints` ones to the host. Walks back only over records still on the device."""
-        oldest_kept_group = newest.group - self.keep_checkpoints
-        index = newest.index - 1
-        while index >= 0:
-            record = order[index]()
-            index -= 1
-            if record is None or record.group > oldest_kept_group: continue
-            if record.host is not None or record.device_tensor is None or record.unpacked: break
-            self._to_host(record, record.device_tensor)
-            record.device_tensor = None
-            self.stats["kept"] -= 1
     pass
 
     def _prefetch(self, index, order = None):
