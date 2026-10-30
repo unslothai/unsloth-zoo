@@ -76,8 +76,8 @@ import pytest
 
 from unsloth_zoo.temporary_patches.moe_utils import _torch_version_tuple
 
-# torch < 2.6 swaps through __dict__ (one graph break) because its Dynamo ignores the `_parameters` swap.
-_FULLGRAPH_SWAP = _torch_version_tuple() >= (2, 6)
+# torch < 2.5 swaps through __dict__ (one graph break) because its Dynamo ignores the `_parameters` swap.
+_FULLGRAPH_SWAP = _torch_version_tuple() >= (2, 5)
 
 
 @pytest.mark.parametrize("backend", ["eager", "aot_eager", "inductor"])
@@ -85,7 +85,7 @@ _FULLGRAPH_SWAP = _torch_version_tuple() >= (2, 6)
 def test_compiled_swap_computes_with_and_backprops_into_the_swapped_weights(backend, fullgraph):
     # torch 2.4 compiled the `_parameters` swap against the original Parameters: zeros out, no grads.
     if fullgraph and not _FULLGRAPH_SWAP:
-        pytest.skip("torch < 2.6 swaps through __dict__, which graph-breaks")
+        pytest.skip("torch < 2.5 swaps through __dict__, which graph-breaks")
     experts = _Experts()
     originals = dict(experts._parameters)
 
@@ -113,11 +113,11 @@ def test_compiled_swap_computes_with_and_backprops_into_the_swapped_weights(back
         torch._dynamo.reset()
 
 
-@pytest.mark.skipif(not _FULLGRAPH_SWAP, reason = "torch < 2.6 swaps through __dict__, which graph-breaks")
+@pytest.mark.skipif(not _FULLGRAPH_SWAP, reason = "torch < 2.5 swaps through __dict__, which graph-breaks")
 @pytest.mark.parametrize("backend", ["eager", "aot_eager"])
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_swap_traces_fullgraph_and_restores_under_compile(backend, dynamic):
-    # fullgraph=True on torch >= 2.6 (2.10 rejected the old `__dict__.pop` restore).
+    # fullgraph=True on torch >= 2.5 (2.10 rejected the old `__dict__.pop` restore).
     from torch._dynamo.utils import counters
 
     experts = _Experts()
@@ -158,7 +158,7 @@ def test_swap_traces_fullgraph_and_restores_under_compile(backend, dynamic):
 def test_compiled_swap_keeps_parameters_registered(backend, fullgraph):
     # torch 2.12 replayed a traced `__dict__.pop` as DELETE_ATTR, unregistering both expert Parameters.
     if fullgraph and not _FULLGRAPH_SWAP:
-        pytest.skip("torch < 2.6 swaps through __dict__, which graph-breaks")
+        pytest.skip("torch < 2.5 swaps through __dict__, which graph-breaks")
     experts = _Experts()
     originals = dict(experts._parameters)
 
