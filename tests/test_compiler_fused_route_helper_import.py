@@ -91,6 +91,9 @@ def test_compiled_gpt_oss_router_forward_runs(compile_location, monkeypatch):
     # What patch_gpt_oss_compiler_exports puts on the modeling module for the copied source.
     monkeypatch.setattr(modeling, "transformers_version", gpt_oss.transformers_version, raising = False)
     monkeypatch.setattr(modeling, "Version", gpt_oss.Version, raising = False)
+    monkeypatch.setattr(
+        modeling, "_IS_TRANSFORMERS_V5", gpt_oss._IS_TRANSFORMERS_V5, raising = False
+    )
     monkeypatch.delenv("UNSLOTH_MOE_FUSED_ROUTER", raising = False)
 
     source = textwrap.dedent(inspect.getsource(gpt_oss.GptOssTopKRouter.forward))
@@ -108,3 +111,26 @@ def test_compiled_gpt_oss_router_forward_runs(compile_location, monkeypatch):
     expected = router.forward(hidden)
     for a, b in zip(out, expected):
         torch.testing.assert_close(a, b)
+
+
+def test_gpt_oss_router_forward_no_version_call_during_eval(monkeypatch):
+    """Verify GptOssTopKRouter.forward does not invoke Version() in forward."""
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    config = SimpleNamespace(
+        num_experts_per_tok = 2,
+        num_local_experts = 4,
+        hidden_size = 8,
+        torch_dtype = torch.float32,
+        dtype = torch.float32,
+    )
+    router = gpt_oss.GptOssTopKRouter(config)
+    torch.nn.init.normal_(router.linear.weight)
+    hidden = torch.randn(3, 8)
+
+    def _fail_version(*args, **kwargs):
+        raise RuntimeError("Version() should not be called in forward!")
+
+    monkeypatch.setattr(gpt_oss, "Version", _fail_version)
+    out = router.forward(hidden)
+    assert len(out) in (2, 3)

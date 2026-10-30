@@ -57,6 +57,7 @@ from unsloth_zoo.gpt_oss_decode_fused import (
 )
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
+_IS_TRANSFORMERS_V5 = transformers_version >= Version("5.0.0.dev0")
 from .utils import (
     patch_function,
     patch_function_past_key_values,
@@ -1142,6 +1143,7 @@ def patch_gpt_oss_compiler_exports():
     m.dtype_from_config = dtype_from_config
     m.transformers_version = transformers_version
     m.Version = Version
+    m._IS_TRANSFORMERS_V5 = _IS_TRANSFORMERS_V5
 TEMPORARY_PATCHES.append(patch_gpt_oss_compiler_exports)
 
 
@@ -1293,7 +1295,7 @@ class GptOssTopKRouter(nn.Module):
             router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
             router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
         router_scores = torch.zeros_like(router_logits, dtype=router_logits.dtype).scatter_(1, router_indices, router_top_value)
-        if transformers_version >= Version("5.0.0"):
+        if _IS_TRANSFORMERS_V5:
             return router_logits, router_scores, router_indices
         else:
             return router_scores, router_indices
@@ -1575,6 +1577,7 @@ def patch_gpt_oss_bnb4bit():
     m.dtype_from_config    = dtype_from_config
     m.transformers_version = transformers_version
     m.Version              = Version
+    m._IS_TRANSFORMERS_V5  = _IS_TRANSFORMERS_V5
 
     _rebind_gpt_oss_compiled_classes()
     return True
@@ -1673,7 +1676,7 @@ def _is_gpt_oss_4bit_load() -> bool:
 
 
 def _is_transformers_v5() -> bool:
-    return transformers_version >= Version("5.0.0.dev0")
+    return _IS_TRANSFORMERS_V5
 
 
 _GPT_OSS_COMPILED_MODULE = "unsloth_compiled_module_gpt_oss"
