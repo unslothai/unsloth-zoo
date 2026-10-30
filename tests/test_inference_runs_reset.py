@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Every generate() starts its inference count from 0, so decode step 1 still compiles.
-
-The generated logits site switches Dynamo to eager_on_recompile once one inference forward has run.
-A count left at 1 by a max_new_tokens=1 generate made the next generate switch right after its
-prefill, so any decode graph not compiled yet ran eagerly for the whole generate.
-"""
+"""Every generate() restarts the inference count at 0, so decode step 1 still compiles."""
 
 import logging
 import os
@@ -46,7 +41,6 @@ def _current_stance():
 
 
 def _generated_module(body):
-    """The header's stance globals plus a forward whose logits site carries the generated block."""
     header = compiler._license_header
     start = header.index("global INFERENCE_RUNS")
     end = header.index("from unsloth_zoo import DEVICE_TYPE_TORCH")
@@ -72,7 +66,7 @@ def _generated_module(body):
 
 
 def _generate(namespace, prompt_len, max_new_tokens):
-    """What FastBaseModel.for_inference + generate() do: default stance, reset (where zoo has it), forwards."""
+    """Mimics for_inference + generate(): default stance, reset, forwards."""
     torch.compiler.set_stance("default")
     reset = getattr(stance_utils, "unsloth_reset_inference_runs", None)
     if reset is not None:
