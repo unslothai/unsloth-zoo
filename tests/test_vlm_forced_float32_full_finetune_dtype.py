@@ -49,11 +49,14 @@ requires_gemma4 = pytest.mark.skipif(not HAS_GEMMA4, reason = "transformers gemm
 
 
 @pytest.fixture
-def forced(monkeypatch):
+def forced(monkeypatch, request):
     """UNSLOTH_FORCE_FLOAT32 on, compile off, every class forward restored at teardown."""
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
     monkeypatch.setattr(patch_utils, "UNSLOTH_COMPILE_DISABLE", True)
-    monkeypatch.setattr(torch._dynamo.config, "disable", True)
+    # config.patch, not monkeypatch: pytest 9.2's undo deletes a ConfigModule key it cannot see in __dict__.
+    disabled = torch._dynamo.config.patch(disable = True)
+    disabled.__enter__()
+    request.addfinalizer(lambda: disabled.__exit__(None, None, None))
     targets = []
     if HAS_GEMMA3:
         targets += [gemma3.Gemma3RMSNorm, gemma3.Gemma3MultiModalProjector]
