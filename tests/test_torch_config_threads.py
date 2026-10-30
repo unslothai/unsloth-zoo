@@ -65,13 +65,21 @@ def _invalidate(module):
 def _restore_torch_config():
     saved = []
     for module, name in _KEYS:
+        if name not in module._config:
+            continue
         entry = module._config[name]
+        if not hasattr(entry, "user_override"):  # torch < 2.5 keeps raw values in _config
+            saved.append((module, name, None, entry, None, None))
+            continue
         override = entry.user_override
         current = override.get() if isinstance(override, ContextVar) else override
-        saved.append((module, entry, current, entry.env_value_default, entry.env_value_force))
+        saved.append((module, name, entry, current, entry.env_value_default, entry.env_value_force))
     torch._dynamo.reset()
     yield
-    for module, entry, current, env_default, env_force in saved:
+    for module, name, entry, current, env_default, env_force in saved:
+        if entry is None:
+            module._config[name] = current
+            continue
         if isinstance(entry.user_override, ContextVar):
             entry.user_override.set(current)
         else:
