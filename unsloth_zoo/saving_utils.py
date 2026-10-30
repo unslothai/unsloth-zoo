@@ -5735,6 +5735,7 @@ def merge_and_overwrite_lora(
     # Per-shard-invariant: resolve the base model + tie flag once, not per shard.
     _merge_base_model = find_lora_base_model(model)
     _merge_model_class_name = _merge_base_model.__class__.__name__
+    _MERGE_MODEL_CLASSES[_merge_model_class_name] = type(_merge_base_model)
     _merge_tie_word_embeddings = bool(
         getattr(_merge_base_model.config, "tie_word_embeddings", False)
     )
@@ -6573,11 +6574,19 @@ def _renamings_to_conversion_mapping(transforms):
 pass
 
 
+# The class each merge is running on, by name: a same-named remote class another loaded model
+# brought into `transformers_modules` must not lend this merge its renames.
+_MERGE_MODEL_CLASSES = {}
+
+
 def _model_classes_named(model_class_name):
     """The `transformers` class of this name, then any trust_remote_code one. A remote class
     lives in `transformers_modules`, so a `transformers`-only lookup never sees the model_type
     its modeling file registered a renaming under, and every LoRA key misses its checkpoint."""
     import sys
+    exact = _MERGE_MODEL_CLASSES.get(model_class_name)
+    if isinstance(exact, type):
+        return [exact]
     classes = []
     try:
         module = __import__("transformers", fromlist = [model_class_name])

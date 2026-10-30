@@ -184,3 +184,16 @@ def test_adapters_whose_weights_sit_under_another_prefix_refuse(monkeypatch):
     disk = ({k + ".weight" for k in shapes}, shapes)
     with pytest.raises(PartialLoraMergeError, match = "none of the"):
         SU._check_lora_merge_is_complete(None, [], lora, "LlamaForCausalLM", disk = disk)
+
+
+def test_the_merged_class_wins_over_a_same_named_remote_class(remote_class, monkeypatch):
+    """Another trust_remote_code model loaded earlier may define a class of the same name."""
+    model_class, _ = remote_class
+    other_config = type("OtherConfig", (model_class.config_class,), {"model_type": "zoo_test_other"})
+    other = type(_CLASS_NAME, (model_class,), {"config_class": other_config,
+                                               "_checkpoint_conversion_mapping": {r"^other\.": "model."}})
+    module = types.ModuleType("transformers_modules.aaa_other_repo.modeling_other")
+    setattr(module, _CLASS_NAME, other)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setitem(SU._MERGE_MODEL_CLASSES, _CLASS_NAME, model_class)
+    assert SU._get_checkpoint_conversion_mapping(_CLASS_NAME) == {r"^lfm\.body\.": _LIVE_PREFIX}
