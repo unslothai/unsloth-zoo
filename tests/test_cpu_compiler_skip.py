@@ -75,6 +75,22 @@ def test_the_probe_is_cached_per_child_environment(monkeypatch):
     assert calls == [envs[0], envs[2], envs[3]], calls
 
 
+def test_the_probe_cache_ignores_pytest_bookkeeping_and_keys_on_the_cwd(monkeypatch, tmp_path):
+    calls = []
+
+    class _Proc:
+        returncode, stdout = 0, ""
+
+    monkeypatch.setattr(skip, "_probes", {})
+    monkeypatch.setattr(skip.subprocess, "run", lambda *a, **k: calls.append(os.getcwd()) or _Proc())
+    skip.skip_without_cpu_inductor({"CXX": "g++", "PYTEST_CURRENT_TEST": "a (call)"})
+    skip.skip_without_cpu_inductor({"CXX": "g++", "PYTEST_CURRENT_TEST": "b (call)"})
+    assert len(calls) == 1, calls
+    monkeypatch.chdir(tmp_path)
+    skip.skip_without_cpu_inductor({"CXX": "g++", "PYTEST_CURRENT_TEST": "c (call)"})
+    assert len(calls) == 2, calls
+
+
 def _bogus_compiler_env(**extra):
     # Keep the rest of the env (e.g. TORCHINDUCTOR_CACHE_DIR); only drop the settings that skip compilation.
     drop = {"TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE", "TORCHDYNAMO_SUPPRESS_ERRORS"}

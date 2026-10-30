@@ -91,8 +91,9 @@ def missing_compiler(returncode, stdout):
 
 
 def _probe(env):
-    # The child gets the whole env, so any of it can change the result.
-    key = (sys.executable,) + tuple(sorted(env.items()))
+    # The child gets the whole env and this cwd (relative CXX / PATH entries resolve against it), so both are
+    # in the key; pytest's per-test bookkeeping variables are not, so a session probes once.
+    key = (sys.executable, os.getcwd()) + tuple(sorted((k, v) for k, v in env.items() if not k.startswith("PYTEST_")))
     if key not in _probes:
         try:
             proc = subprocess.run([sys.executable, "-c", _PROBE], capture_output = True, text = True,
