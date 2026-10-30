@@ -172,3 +172,43 @@ def test_modules_to_save_bias_not_preserved_on_bias_none():
     assert _trainable_bias_count(model) == 0, "bias='none' must leave all biases frozen"
     # Saved bias matches its weight (both frozen, not partially trained).
     assert params[saved_bias].requires_grad == params[saved_weight].requires_grad
+
+
+@pytest.mark.parametrize("bias", ["all", "lora_only"])
+def test_peft_trainable_bias_float16_gets_float32_master(bias):
+    """float16: a float16 trainable bias makes the GradScaler raise "Attempting to unscale FP16 gradients"
+    at the first step, so the bias gets a float32 master as LoRA A / B do; the float16 autocast the Trainer
+    runs under casts it back for the matmul."""
+    pytest.importorskip("peft")
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    model = _lora(_tiny_llama(dtype=torch.float16), bias=bias)
+    trainable_before = _trainable_bias_count(model)
+    assert trainable_before > 0
+    prepare_model_for_training(
+        model, use_gradient_checkpointing=False, use_reentrant=False,
+        full_finetuning=False,
+    )
+    assert _trainable_bias_count(model) == trainable_before
+    params = dict(model.named_parameters())
+    trainable = {n: p.dtype for n, p in params.items() if p.requires_grad}
+    assert set(trainable.values()) == {torch.float32}, trainable
+    base_w = next(n for n in params if n.endswith("q_proj.base_layer.weight"))
+    assert params[base_w].dtype == torch.float16  # frozen base stays float16
+
+    # One float16 AMP step as the Trainer takes it (accelerate's GradScaler + float16 autocast).
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2)
+    scaler = torch.amp.GradScaler("cpu")
+    input_ids = torch.randint(0, 64, (2, 8))
+    with torch.autocast("cpu", dtype=torch.float16):
+        logits = model(input_ids=input_ids).logits
+    loss = torch.nn.functional.cross_entropy(
+        logits.float().view(-1, logits.size(-1)), input_ids.view(-1))
+    scaler.scale(loss).backward()
+    biases = {n: p.detach().clone() for n, p in params.items()
+              if n.endswith(".bias") and p.requires_grad}
+    scaler.unscale_(opt)
+    scaler.step(opt)
+    scaler.update()
+    moved = [n for n, b in biases.items() if not torch.equal(b, params[n].detach())]
+    assert moved, "no trainable bias was updated"

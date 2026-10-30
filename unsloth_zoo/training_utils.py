@@ -429,6 +429,8 @@ def prepare_model_for_training(
     # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to
     # requires_grad=True and would all stay trainable on the LoRA path (#2343 review).
     _is_peft_model = hasattr(model, "peft_config")
+    # Read before the loop: the loop reuses `dtype` for each parameter's cast.
+    _loaded_float16 = dtype == torch.float16
 
     for name, param in model.named_parameters():
         original_name = name
@@ -453,7 +455,13 @@ def prepare_model_for_training(
                 # Linear breaks the matmul. modules_to_save is excluded so a saved head
                 # with a frozen weight isn't partially trained via its bias (#2343 review).
                 requires_grad = True
-                _keep_param_dtype = True
+                # float16 is the exception: the GradScaler refuses float16 gradients ("Attempting to
+                # unscale FP16 gradients"), so the bias gets a float32 master as LoRA A / B do. The
+                # float16 autocast the Trainer runs under casts it back for the matmul.
+                if _loaded_float16:
+                    upcast = True
+                else:
+                    _keep_param_dtype = True
             else:
                 requires_grad = False
         else:
