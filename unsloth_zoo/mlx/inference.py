@@ -2844,13 +2844,17 @@ struct Terms<U, values_per_thread, 3> {
 template <typename U, int values_per_thread>
 struct Terms<U, values_per_thread, 4> {
   U t[values_per_thread];
+  // Codes as subnormal halves, q * 2^-24: no integer conversion, about 10% of a route's time on M5. With x left
+  // unscaled every product is stock's times 2^-24 exactly, so sums round alike unless a product underflows fp32.
   void load(const device uint8_t* w) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
-      t[4 * i] = ws[i] & 0x000f;
-      t[4 * i + 1] = ws[i] & 0x00f0;
-      t[4 * i + 2] = ws[i] & 0x0f00;
-      t[4 * i + 3] = ws[i] & 0xf000;
+    const device uint* ws = (const device uint*)w;
+    UNROLL for (int i = 0; i < values_per_thread / 8; i++) {
+      const uint v = ws[i];
+      UNROLL for (int m = 0; m < 4; m++) {
+        const half2 c = as_type<half2>((v >> (4 * m)) & 0x000F000Fu);
+        t[8 * i + m] = c.x;
+        t[8 * i + 4 + m] = c.y;
+      }
     }
   }
   U dot(const thread U* x) {
@@ -2944,6 +2948,27 @@ struct Terms<U, values_per_thread, 8> {
     return accum;
   }
 };
+
+// x as `Terms<bits>` reads it; a dot of its 4-bit codes wants `code_unit` on its scale.
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_terms_x(const device T* x, thread U* x_thread) {
+  if constexpr (bits != 4) {
+    return load_vector<T, U, values_per_thread, bits>(x, x_thread);
+  } else {
+    U sum = 0;
+    UNROLL for (int i = 0; i < values_per_thread; i += 4) {
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1];
+      x_thread[i + 2] = x[i + 2];
+      x_thread[i + 3] = x[i + 3];
+    }
+    return sum;
+  }
+}
+
+template <int bits>
+constexpr float code_unit() { return bits == 4 ? 16777216.0f : 1.0f; }
 #else
 template <typename T, int bits, int fast>
 struct Lane {
@@ -3051,7 +3076,7 @@ struct Dots {
     UNROLL for (int o = 0; o < out; o++) {
       terms.load(p.w + o * K_w);
 #ifdef UNSLOTH_AFFINE
-      U s = p.s[o * K_g];
+      U s = p.s[o * K_g] * code_unit<bits>();
       U b = p.b[o * K_g];
       result[o] += s * terms.dot(xt) + sum * b;
 #else
@@ -3071,7 +3096,7 @@ struct Dots {
       // qmv's last block: lanes past K add nothing.
       if (fast || k + lane_id * values_per_thread < K) {
 #ifdef UNSLOTH_AFFINE
-        sum = load_vector<T, U, values_per_thread, bits>(x, xt);
+        sum = load_terms_x<T, U, values_per_thread, bits>(x, xt);
 #else
         load_vector<T, U, values_per_thread>(x, xt);
 #endif
@@ -3463,11 +3488,11 @@ METAL_FUNC void grouped_dot(thread typename Dots<T, GS, BITS, OUT, FAST>::Proj* 
   for (int k = 0; k < K; k += D::block_size) {
     if (FAST || k + lane * V < K) {
       UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
-        sums[r] = load_vector<T, float, V, BITS>(x + size_t(rr[r] / top_k) * K + k + lane * V, xt[r]);
+        sums[r] = load_terms_x<T, float, V, BITS>(x + size_t(rr[r] / top_k) * K + k + lane * V, xt[r]);
       UNROLL for (int p = 0; p < P; ++p) {
         UNROLL for (int o = 0; o < OUT; ++o) {
           terms.load(proj[p].w + o * K * D::lane::bytes_per_pack / D::lane::pack_factor);
-          float scale = proj[p].s[o * (K / GS)];
+          float scale = proj[p].s[o * (K / GS)] * code_unit<BITS>();
           float bias = proj[p].b[o * (K / GS)];
           UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
             result[r][p * OUT + o] += scale * terms.dot(xt[r]) + sums[r] * bias;
