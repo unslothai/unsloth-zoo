@@ -37,6 +37,7 @@ from .utils import (
     flex_attention,
     PREFILL_KERNEL_OPTIONS,
     decode_kernel_options,
+    decode_kernel_kwargs,
     FlexAttentionCache,
     FLEX_LSE_KWARGS,
     flex_output_and_lse,
@@ -280,7 +281,7 @@ def flex_attention_with_sink_decoding(
         score_mod = None, # None needed
         enable_gqa = enable_gqa,
         scale = scale,
-        kernel_options = decode_kernel_options(),
+        **decode_kernel_kwargs(),
         **FLEX_LSE_KWARGS, # log(sum(exp(xi)))
     ))
     return attn_output, logsumexp
