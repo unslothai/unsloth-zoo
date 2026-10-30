@@ -1919,7 +1919,6 @@ def _is_compiling():
 pass
 
 
-# Off by default: no measured win yet, and it would keep short-sequence activations on the device.
 GC_OFFLOAD_MIN_BYTES = 0
 _ALL_OFFLOADERS = weakref.WeakSet()
 
@@ -1951,9 +1950,8 @@ pass
 
 
 class _ForwardOrder(list):
-    """Weak references to one forward's records, in pack order. Each record holds its own forward's order, so a
-    pending backward keeps prefetching inside its own graph after later forwards started new orders, and the
-    offloader keeps only the newest one: an abandoned forward's metadata goes away with its records."""
+    """Weak refs to one forward's records in pack order. Records hold their own order, so the offloader keeps only
+    the newest and an abandoned forward's metadata dies with its records."""
     __slots__ = ("forward_id", "backward_started", "counted", "__weakref__")
 
     def __init__(self, forward_id = 0):
@@ -1970,7 +1968,7 @@ class _OffloadedActivation:
                  "unpacked", "group", "keepalive", "order", "nbytes", "__weakref__")
 
     def __init__(self, device, index, order = None):
-        self.order         = order  # the _ForwardOrder (forward identity) this record belongs to
+        self.order         = order
         self.nbytes        = 0
         self.device        = device
         self.host          = None
@@ -2008,11 +2006,8 @@ class NonReentrantActivationOffloader:
     whose backward comes first, and reloads layer i-1 on a second side stream while layer i
     recomputes. Costs up to one more layer's checkpoint inputs of VRAM each way.
 
-    Saved tensors under UNSLOTH_GC_OFFLOAD_MIN_BYTES (default 0, off) and expanded views (storage smaller
-    than the view) stay on the device.
-    Records carry their forward's identity: prefetch and keep-last decisions stay inside the
-    graph a record belongs to, however forwards and backwards interleave. Give each model its
-    own offloader with non_reentrant_offload_hooks(model); `stats` counts tensors and bytes.
+    Saved tensors under UNSLOTH_GC_OFFLOAD_MIN_BYTES (default 0, off) and expanded views stay on
+    the device. Prefetch and keep-last stay inside the forward a record belongs to.
     """
     def __init__(self, stream_mode = None):
         if stream_mode is None:
@@ -2031,16 +2026,13 @@ class NonReentrantActivationOffloader:
             self.max_inflight = max(0, int(os.environ.get("UNSLOTH_GC_MAX_INFLIGHT_COPIES", default_inflight)))
         except ValueError:
             self.max_inflight = default_inflight
-        # Saved tensors under this many bytes stay on the device: their copy is latency bound and they are not
-        # what makes the activation footprint. Default 0 offloads every size.
         self.min_bytes = _env_nonnegative_int("UNSLOTH_GC_OFFLOAD_MIN_BYTES", GC_OFFLOAD_MIN_BYTES)
         self.inflight = {}
         self.d2h_streams = {}
         self.h2d_streams = {}
-        self.owned = False  # True once attached to a model, whose forward pre-hook starts each forward
+        self.owned = False
         self.forward_id = 0
-        # Weak, so a graph dropped without backward frees its activations. Forward order of the newest forward;
-        # older forwards' orders live on in their records only.
+        # Weak, so a graph dropped without backward frees its activations. Newest forward only.
         self.order = _ForwardOrder(0)
         self.group = 0
         self.stats = _new_offload_stats()
@@ -2056,10 +2048,8 @@ class NonReentrantActivationOffloader:
         self.order.backward_started = bool(value)
 
     def begin_forward(self):
-        """A new forward of the owning model: records packed from here on get a new forward identity. Records of
-        earlier forwards keep theirs, so a backward still pending on them is unaffected."""
         self.forward_id += 1
-        # Counted here for every forward: an empty order (first forward, or every input kept) is not replaced.
+        # Counted here: an empty order is reused, not replaced.
         self.stats["forwards"] += 1
         if len(self.order) or self.order.backward_started:
             self.order = _ForwardOrder(self.forward_id)
@@ -2068,8 +2058,7 @@ class NonReentrantActivationOffloader:
 
     def _current_order(self):
         order = self.order
-        # Without an owner there is no forward pre-hook, so infer the boundary: the first pack after this
-        # forward's backward started, or after its newest record died (the graph was dropped or consumed).
+        # No owner, no pre-hook: a new forward starts after backward began or the newest record died.
         if order.backward_started or (not self.owned and len(order) and order[-1]() is None):
             self.forward_id += 1
             order = self.order = _ForwardOrder(self.forward_id)
@@ -2080,12 +2069,10 @@ class NonReentrantActivationOffloader:
     pass
 
     def _keep_reason(self, x, nbytes):
-        """Why `x` stays on the device instead of being offloaded, or None to offload it."""
         if nbytes < self.min_bytes:
             return "small"
-        # An expanded (broadcast) view reads less storage than its logical size: a host copy would materialise
-        # every repeat, while keeping it holds no more than the storage it already points at. Other views and
-        # non-contiguous tensors are offloaded: the view may be the last owner of a larger allocation.
+        # Expanded views only: a host copy would materialise every repeat. Other views are offloaded, as
+        # they may be the last owner of a larger allocation.
         try:
             storage_bytes = x.untyped_storage().nbytes()
         except Exception:
@@ -2108,8 +2095,7 @@ class NonReentrantActivationOffloader:
         return stream
     pass
 
-    # Device seams: every stream, event and copy goes through these, so the bookkeeping above them runs
-    # unchanged on a fake accelerator in the CPU lifecycle tests.
+    # Device seams, overridden by the CPU lifecycle tests.
     def _on_host(self, x):
         return x.device.type == "cpu"
 
@@ -2304,7 +2290,7 @@ class NonReentrantActivationOffloader:
             return x.to(device, non_blocking = True)
         record = packed
         order = record.order
-        if order is None: order = self.order  # a record built by hand, outside pack()
+        if order is None: order = self.order
         if not order.backward_started: self._drain()
         order.backward_started = True
         record.unpacked = True
@@ -2342,7 +2328,7 @@ pass
 
 
 NONREENTRANT_OFFLOADER = None
-# owner (a model) -> its own offloader. Weak keys: the offloader never refers back to its owner.
+# Weak keys: the offloader never refers back to its owner.
 _OWNED_OFFLOADERS = weakref.WeakKeyDictionary()
 _OWNED_OFFLOADERS_LOCK = threading.Lock()
 
@@ -2353,8 +2339,7 @@ pass
 
 
 def _begin_forward_hook(module, args):
-    # Module level and looked up per call: the model stays picklable, and a copy of it never drives the
-    # original's offloader (it gets its own on first use).
+    # Module level and looked up per call: the model stays picklable and a copy never drives the original's.
     if _is_compiling(): return
     offloader = _OWNED_OFFLOADERS.get(module)
     if offloader is not None: offloader.begin_forward()
@@ -2364,10 +2349,7 @@ pass
 def activation_offloader_for(owner):
     """
     All Unsloth Zoo code licensed under LGPLv3
-    The offloader that belongs to `owner` (usually the model), created on first use. Each model gets its own
-    forward order and counters, so a policy and a reference model (or any two models) never prefetch, keep or
-    reorder each other's saved inputs. When `owner` is an nn.Module its forward pre-hook marks every forward,
-    which keeps several pending forwards of the same model apart.
+    Per-owner offloader, created on first use, so two models never touch each other's saved inputs.
     """
     with _OWNED_OFFLOADERS_LOCK:
         offloader = _OWNED_OFFLOADERS.get(owner)
@@ -2383,8 +2365,7 @@ pass
 
 
 def non_reentrant_offload_hooks(owner = None):
-    """saved_tensors_hooks context that offloads non-reentrant checkpoint inputs to the host.
-    Pass the model as `owner` to give it its own offloader; without one every caller shares the process one."""
+    """saved_tensors_hooks context that offloads non-reentrant checkpoint inputs to the host."""
     if owner is not None:
         return activation_offloader_for(owner).hooks()
     global NONREENTRANT_OFFLOADER
@@ -2399,7 +2380,8 @@ def get_activation_offload_stats(reset = False):
     All Unsloth Zoo code licensed under LGPLv3
     Counters summed over every live non-reentrant offloader: tensors and bytes offloaded / restored, prefetches
     and their hits, and what stayed on the device and why (kept_small, kept_expanded).
-    `reset = True` zeroes them after reading, for per-step deltas in a benchmark.
+    "forwards": owned = every model forward, unowned = once per inferred forward.
+    `reset = True` zeroes them after reading.
     """
     total = _new_offload_stats()
     for offloader in list(_ALL_OFFLOADERS):

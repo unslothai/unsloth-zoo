@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Lifecycle of the non-reentrant activation offloader across odd training schedules.
-
-Every scenario compares gradients bit for bit with plain non-reentrant checkpointing and checks that a graph which is
-finished or abandoned releases its records, host copies and pinned charge. The "fake" backend drives the real
-bookkeeping on CPU (host copies are clones, streams and events are inert); the "cuda" backend is the real class on a
-GPU with real side streams and runs only where a GPU exists.
-"""
+"""Non-reentrant offloader lifecycle: gradients match plain checkpointing bit for bit and finished or abandoned graphs
+release their records. "fake" runs the real bookkeeping on CPU; "cuda" needs a GPU."""
 import contextlib
 import copy
 import gc
@@ -55,7 +50,6 @@ def G(monkeypatch):
     for name in ("UNSLOTH_GC_OFFLOAD_BACKEND", "UNSLOTH_GC_STREAM_KEEP_LAST", "UNSLOTH_GC_MAX_INFLIGHT_COPIES",
                  "UNSLOTH_GC_PINNED_MAX_GB"):
         monkeypatch.delenv(name, raising = False)
-    # The scenarios use small tensors: the size floor has its own tests below.
     monkeypatch.setenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", "0")
     try:
         from unsloth_zoo import gradient_checkpointing as G
@@ -330,7 +324,6 @@ def test_interleaved_models_do_not_touch_each_other(env, order):
     first, second = (la, lb) if order == "AB" else (lb, la)
     first.backward()
     if order == "BA":
-        # B's backward must not have prefetched or moved any of A's still pending records.
         assert not [r for r in _live(spy_a.records["A"]) if r.ready is not None or r.unpacked]
         assert off_a.stats["prefetch_hits"] == 0
     second.backward()
@@ -356,9 +349,7 @@ def test_abandoned_graphs_release_everything(env):
     assert env["G"]._test_ledger["live"] == 0
     if env["backend"] == "fake":
         assert not _live(offloader.host_refs)
-    # 40 dropped forwards of 4 checkpoints must not leave 160 dead entries behind.
     assert len(offloader.order) <= len(model.layers)
-    # And training afterwards is still exact.
     model.hooks = None
     model(x).square().mean().backward()
     ref = _grads(model, x)
@@ -384,7 +375,6 @@ def test_eval_forward_between_forward_and_backward(env, eval_mode):
         out = model(e)
     loss.backward()
     _assert_same(_grads(model, x), ref)
-    # The training backward never prefetched the evaluation graph's records.
     assert not [r for r in _live(spy.records.get("eval", [])) if r.ready is not None]
     assert not spy.violations
     del out
@@ -637,7 +627,6 @@ def test_views_and_non_contiguous_tensors_are_still_offloaded(G, fake, kind):
 
 
 def test_expanded_views_stay_on_device(G, fake):
-    # Storage smaller than the view: a host copy would materialise every repeat.
     offloader = fake(stream_mode = False)
     x = torch.randn(1, 64, requires_grad = True).expand(64, 64)
     packed = offloader.pack(x)
@@ -705,14 +694,12 @@ def test_each_owner_gets_its_own_offloader_and_the_default_is_shared(G, fake, mo
     assert G.activation_offloader_for(a) is G.activation_offloader_for(a)
     assert G.activation_offloader_for(a) is not G.activation_offloader_for(b)
     assert G.activation_offloader_for(a).owned
-    # No owner: one process-wide offloader, as before.
     with G.non_reentrant_offload_hooks():
         pass
     shared = G.NONREENTRANT_OFFLOADER
     with G.non_reentrant_offload_hooks():
         pass
     assert G.NONREENTRANT_OFFLOADER is shared and not shared.owned
-    # The owner's offloader goes away with the owner.
     ref = weakref.ref(G.activation_offloader_for(b))
     del b
     gc.collect()
@@ -735,7 +722,6 @@ def test_owner_forward_pre_hook_separates_pending_forwards(G, fake, monkeypatch)
     assert first[0].order is not second[0].order
     assert [r.index for r in second] == list(range(4))
     l2.backward()
-    # The second forward's backward ended at its own first checkpoint: nothing of the first one was reloaded.
     assert not [r for r in first if r.ready is not None or r.unpacked]
     l1.backward()
     assert not spy.violations
