@@ -285,6 +285,8 @@ def _flex_or_none(module, query, key, attention_mask, scaling):
             raise
         _FAILED[_failure_key(query)] = repr(error)[:500]
         logger.warning(f"Unsloth: DeepSeek-V4 flex attention failed, using eager attention: {error}")
+        from .sparse_attention_flex import _release_failure
+        _release_failure(error)
         return None
 
 
