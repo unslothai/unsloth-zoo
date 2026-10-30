@@ -55,17 +55,32 @@ def test_template_probe_reads_the_installed_decode_template(tmp_path, monkeypatc
 
 _BLOCK_PTR, _DESCRIPTOR = "K_block_ptr = tl.make_block_ptr(", "desc = tl.make_tensor_descriptor("
 
+_T = "_inductor/kernel/flex/templates/"
+
+
+def _templates(decode, **overrides):
+    files = {_T + name + ".py.jinja": _DESCRIPTOR for name in ("flex_attention", "common", "flex_backwards", "utilities")}
+    files[_T + "flex_decode.py.jinja"] = decode
+    for name, text in overrides.items():
+        if text is None:
+            files.pop(_T + name + ".py.jinja")
+        else:
+            files[_T + name + ".py.jinja"] = text
+    return files
+
+
 # Layouts of the real torch releases (pytorch tags): 2.6 - 2.8 keep the main kernel in kernel/flex_attention.py with
 # block pointers; 2.9 - 2.12 move it to templates with tensor descriptors and only flex_decode keeps block pointers.
+# The unknown rows: a 2.12 tree with a main template member missing reads as None, never as free of block pointers.
 _TORCH_LAYOUTS = {
     "2.7": ({"_inductor/kernel/flex_attention.py": _BLOCK_PTR, "_inductor/kernel/flex_decoding.py": _BLOCK_PTR},
             True, True),
-    "2.12": ({"_inductor/kernel/flex/templates/flex_attention.py.jinja": _DESCRIPTOR,
-              "_inductor/kernel/flex/templates/common.py.jinja": _DESCRIPTOR,
-              "_inductor/kernel/flex/templates/flex_decode.py.jinja": _BLOCK_PTR}, True, False),
-    "2.13": ({"_inductor/kernel/flex/templates/flex_attention.py.jinja": _DESCRIPTOR,
-              "_inductor/kernel/flex/templates/common.py.jinja": _DESCRIPTOR,
-              "_inductor/kernel/flex/templates/flex_decode.py.jinja": _DESCRIPTOR}, False, False),
+    "2.12": (_templates(_BLOCK_PTR), True, False),
+    "2.13": (_templates(_DESCRIPTOR), False, False),
+    "2.12-no-common": (_templates(_BLOCK_PTR, common = None), True, None),
+    "2.12-no-backwards": (_templates(_BLOCK_PTR, flex_backwards = None), True, None),
+    "2.12-backwards-block-ptr": (_templates(_BLOCK_PTR, flex_backwards = _BLOCK_PTR), True, True),
+    "empty": ({"_inductor/kernel/other.py": ""}, None, None),
 }
 
 
@@ -79,25 +94,97 @@ def test_template_probes_tell_main_and_decode_kernels_apart(tmp_path, monkeypatc
     assert U._flex_main_template_uses_block_ptr() is main_uses
 
 
-@pytest.mark.parametrize("removed", [True, False])
-def test_triton_probe_sees_removed_block_pointers(monkeypatch, removed):
+def test_unreadable_main_template_is_unknown(tmp_path, monkeypatch):
+    files = _templates(_BLOCK_PTR)
+    spec = _fake_torch_root(tmp_path, None, files)
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: spec if name == "torch" else real(name, *a))
+    import builtins
+    real_open = builtins.open
+
+    def failing_open(path, *a, **k):
+        if str(path).endswith("common.py.jinja"):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", failing_open)
+    assert U._flex_decode_template_uses_block_ptr() is True
+    assert U._flex_main_template_uses_block_ptr() is None
+
+
+@pytest.mark.parametrize("decode, main, expected", [
+    (True, False, True), (True, None, False), (True, True, False), (None, False, False), (False, False, False),
+])
+def test_unknown_template_never_turns_the_workaround_on(decode, main, expected):
+    assert U._flex_decoding_unavailable(True, decode, main) is expected
+    assert U._flex_decoding_unavailable(False, decode, main) is False
+
+
+def _removed(base, shape, strides, offsets, block_shape, order, _semantic = None):
+    raise NotImplementedError("Block pointers have been removed in favor of the tensor descriptor API")
+
+
+def _working(base, shape, strides, offsets, block_shape, order, _semantic = None):
+    return base
+
+
+@pytest.mark.parametrize("public, core_fn, removed", [
+    (_removed, _removed, True),
+    (_working, _working, False),
+    # A shim (SGLang) restores only the public name, which is what generated kernels call.
+    (_working, _removed, False),
+    (_removed, _working, True),
+])
+def test_triton_probe_reads_the_public_make_block_ptr(monkeypatch, public, core_fn, removed):
+    tl = pytest.importorskip("triton.language")
     core = pytest.importorskip("triton.language.core")
-    if removed:
-        def make_block_ptr(base, shape, strides, offsets, block_shape, order, _semantic = None):
-            raise NotImplementedError("Block pointers have been removed in favor of the tensor descriptor API")
-    else:
-        def make_block_ptr(base, shape, strides, offsets, block_shape, order, _semantic = None):
-            return base
-    monkeypatch.setattr(core, "make_block_ptr", make_block_ptr)
+    monkeypatch.setattr(tl, "make_block_ptr", public)
+    monkeypatch.setattr(core, "make_block_ptr", core_fn)
     assert U._triton_block_ptr_removed() is removed
 
 
+def test_triton_without_make_block_ptr_counts_as_removed(monkeypatch):
+    tl = pytest.importorskip("triton.language")
+    monkeypatch.delattr(tl, "make_block_ptr", raising = False)
+    assert U._triton_block_ptr_removed() is True
+
+
 def test_installed_triton_and_torch_agree_with_the_flag():
-    # Forcing the main kernel only helps when the main kernel itself has no block pointers (torch 2.9+).
-    assert U.FLEX_DECODING_UNAVAILABLE == (
-        bool(U.HAS_FLEX_ATTENTION) and U._triton_block_ptr_removed() and U._flex_decode_template_uses_block_ptr()
-        and not U._flex_main_template_uses_block_ptr()
+    # Forcing the main kernel only helps when the main kernel is known to have no block pointers (torch 2.9+).
+    removed = bool(U.HAS_FLEX_ATTENTION) and U._triton_block_ptr_removed()
+    assert U.FLEX_DECODING_UNAVAILABLE == U._flex_decoding_unavailable(
+        removed, U._flex_decode_template_uses_block_ptr(), U._flex_main_template_uses_block_ptr()
     )
+    if U.FLEX_DECODING_UNAVAILABLE:
+        assert U.flex_attention.__name__ == "flex_attention" and U.flex_attention.__qualname__.startswith(
+            "_main_kernel_for_short_queries"
+        )
+
+
+def _recording_call(seen):
+    def fake_flex(*args, kernel_options = None, **kwargs):
+        seen.append((args, kernel_options, kwargs))
+        return "out"
+    return fake_flex
+
+
+@pytest.mark.parametrize("requested, expected", [
+    (None, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}),
+    ({}, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}),
+    ({"BLOCK_M": 16}, {"BLOCK_M": 16, "FORCE_USE_FLEX_ATTENTION": True}),
+    ({"FORCE_USE_FLEX_ATTENTION": False}, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": False}),
+    ({"BACKEND": "TRITON_DECODE"}, {"BACKEND": "TRITON_DECODE"}),
+])
+def test_generic_flex_attention_takes_the_main_kernel_when_flex_decoding_cannot_compile(requested, expected):
+    seen = []
+    forced = {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}
+    guarded = U._main_kernel_for_short_queries(_recording_call(seen), forced)
+    q = torch.randn(1, 2, 1, 8)
+    kwargs = {} if requested is None else {"kernel_options": requested}
+    assert guarded(q, q, q, scale = 0.5, **kwargs) == "out"
+    (args, options, rest), = seen
+    assert options == expected and rest == {"scale": 0.5} and args[0] is q
+    assert forced == {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}
 
 
 @pytest.fixture

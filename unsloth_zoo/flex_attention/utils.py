@@ -429,38 +429,46 @@ pass
 
 
 def _triton_block_ptr_removed():
-    # Triton 3.9 (and triton-windows 3.9) turned tl.make_block_ptr into a NotImplementedError.
+    # Triton 3.9 (and triton-windows 3.9) turned tl.make_block_ptr into a NotImplementedError. Generated kernels call the
+    # public triton.language name, so a shim that restores only that one counts as present.
     try:
         import inspect
-        import triton.language.core as _tl_core
-        return "have been removed" in inspect.getsource(_tl_core.make_block_ptr)
+        import triton.language as _tl
+    except Exception:
+        return False
+    make_block_ptr = getattr(_tl, "make_block_ptr", None)
+    if make_block_ptr is None:
+        return True
+    try:
+        return "have been removed" in inspect.getsource(make_block_ptr)
     except Exception:
         return False
 
 
 def _torch_template_uses_block_ptr(*candidates):
-    # First candidate group present in the installed torch decides; read the files, no import.
+    # First candidate group present in the installed torch decides; read the files, no import. True / False once every
+    # file of that group was read, None when the answer is unknown (no group found, a member missing or unreadable).
     import importlib.util
     try:
         spec = importlib.util.find_spec("torch")
         roots = list(spec.submodule_search_locations or []) if spec is not None else []
     except Exception:
-        return False
+        return None
     for root in roots:
         for group in candidates:
             paths = [os.path.join(root, *rel.split("/")) for rel in group]
             if not os.path.exists(paths[0]):
                 continue
-            try:
-                for path in paths:
-                    if os.path.exists(path):
-                        with open(path, encoding = "utf-8") as f:
-                            if "make_block_ptr" in f.read():
-                                return True
-            except Exception:
-                return False
-            return False
-    return False
+            uses = False
+            for path in paths:
+                try:
+                    with open(path, encoding = "utf-8") as f:
+                        if "make_block_ptr" in f.read():
+                            uses = True
+                except Exception:
+                    return None
+            return uses
+    return None
 
 
 def _flex_decode_template_uses_block_ptr():
@@ -472,22 +480,45 @@ def _flex_decode_template_uses_block_ptr():
 
 
 def _flex_main_template_uses_block_ptr():
-    # The main flex kernel: block pointers up to torch 2.8 (non-TMA path), tensor descriptors from 2.9.
+    # The main flex kernel, forward and backward: block pointers up to torch 2.8 (non-TMA path), tensor descriptors from
+    # 2.9. Every file of the 2.9+ group must be read before it counts as free of block pointers.
     return _torch_template_uses_block_ptr(
-        ("_inductor/kernel/flex/templates/flex_attention.py.jinja", "_inductor/kernel/flex/templates/common.py.jinja"),
+        (
+            "_inductor/kernel/flex/templates/flex_attention.py.jinja",
+            "_inductor/kernel/flex/templates/common.py.jinja",
+            "_inductor/kernel/flex/templates/flex_backwards.py.jinja",
+            "_inductor/kernel/flex/templates/utilities.py.jinja",
+        ),
         ("_inductor/kernel/flex_attention.py",),
     )
+
+
+def _main_kernel_for_short_queries(flex_attention_fn, forced_options):
+    """flex_attention_fn with the main kernel for queries AUTO would send to flex_decoding. A caller's own options are
+    kept on top; one that names a BACKEND chose the kernel itself. No functools.wraps: copying the compiled function's
+    __dict__ would hand Dynamo its original callable and skip these options."""
+    def flex_attention(*args, kernel_options = None, **kwargs):
+        requested = kernel_options or {}
+        if "BACKEND" not in requested:
+            requested = {**forced_options, **requested}
+        return flex_attention_fn(*args, kernel_options = requested, **kwargs)
+    return flex_attention
+
+
+def _flex_decoding_unavailable(block_ptr_removed, decode_uses_block_ptr, main_uses_block_ptr):
+    # An unknown (None) template answer never turns the workaround on.
+    return bool(block_ptr_removed) and decode_uses_block_ptr is True and main_uses_block_ptr is False
 
 
 # Decided at import (no file reads or logging inside traced decode code). When torch's flex_decoding cannot compile
 # against the installed Triton, the failed compile makes Dynamo skip flex_attention for the rest of the process and
 # every later call (prefill too) builds the full score matrix; short queries take the main flex kernel instead, which
-# only helps when that kernel does not need block pointers too (torch 2.9+).
+# only helps when that kernel is known not to need block pointers too (torch 2.9+).
 _TRITON_BLOCK_PTR_REMOVED = bool(HAS_FLEX_ATTENTION) and _triton_block_ptr_removed()
-FLEX_DECODING_UNAVAILABLE = (
-    _TRITON_BLOCK_PTR_REMOVED and _flex_decode_template_uses_block_ptr() and not _flex_main_template_uses_block_ptr()
-)
-if _TRITON_BLOCK_PTR_REMOVED and (FLEX_DECODING_UNAVAILABLE or _flex_decode_template_uses_block_ptr()):
+_DECODE_USES_BLOCK_PTR = _flex_decode_template_uses_block_ptr() if _TRITON_BLOCK_PTR_REMOVED else None
+_MAIN_USES_BLOCK_PTR = _flex_main_template_uses_block_ptr() if _TRITON_BLOCK_PTR_REMOVED else None
+FLEX_DECODING_UNAVAILABLE = _flex_decoding_unavailable(_TRITON_BLOCK_PTR_REMOVED, _DECODE_USES_BLOCK_PTR, _MAIN_USES_BLOCK_PTR)
+if _TRITON_BLOCK_PTR_REMOVED and (_DECODE_USES_BLOCK_PTR is True or _MAIN_USES_BLOCK_PTR is True):
     import triton
     from unsloth_zoo.log import logger
     if FLEX_DECODING_UNAVAILABLE:
@@ -496,12 +527,20 @@ if _TRITON_BLOCK_PTR_REMOVED and (FLEX_DECODING_UNAVAILABLE or _flex_decode_temp
             "flex_decoding needs; short queries use the main flex kernel instead. Install the Triton your torch pins "
             "to get flex_decoding back."
         )
-    else:
+    elif _MAIN_USES_BLOCK_PTR is True:
         logger.warning(
             f"Unsloth: Triton {triton.__version__} has no block pointers, which torch {torch.__version__}'s flex "
             "attention kernels need, so flex attention cannot compile and runs eagerly with much more memory. "
             "Install the Triton your torch pins."
         )
+    else:
+        logger.warning(
+            f"Unsloth: Triton {triton.__version__} has no block pointers, which torch {torch.__version__}'s "
+            "flex_decoding needs, and its main flex kernel could not be checked, so flex attention may run eagerly "
+            "with much more memory. Install the Triton your torch pins."
+        )
+if FLEX_DECODING_UNAVAILABLE and flex_attention is not None:
+    flex_attention = _main_kernel_for_short_queries(flex_attention, PREFILL_KERNEL_OPTIONS)
 
 
 def decode_kernel_options():
