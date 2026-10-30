@@ -7340,6 +7340,39 @@ def _unresolved_lora_targets(lora_weights, disk_keys, disk_module_shapes, model_
 pass
 
 
+def _renamed_lora_counterparts(lora_weights, disk_keys, disk_module_shapes, model_class_name,
+                               tie_word_embeddings = False, count_packed_mxfp4 = True):
+    """When no LoRA target is placed at all, those whose weight still sits in this export under
+    another name: the same trailing path (at least the last three components) and the same shape.
+    An omitted tower has no such tensor, so it stays exempt as in `_unresolved_lora_targets`."""
+    converted = _convert_lora_keys_to_safetensor_format(
+        lora_weights, disk_keys, model_class_name = model_class_name,
+    )
+    if _backed_lora_keys(converted, disk_keys, tie_word_embeddings,
+                         count_packed_mxfp4 = count_packed_mxfp4):
+        return {}
+    tails = defaultdict(list)
+    for module, disk_shape in disk_module_shapes.items():
+        parts = module.split(".")
+        for i in range(len(parts) - 2):
+            tails[".".join(parts[i:])].append((module, tuple(disk_shape)))
+    found = {}
+    for key, lora_stats in converted.items():
+        if not isinstance(key, str): continue
+        if getattr(lora_stats, "lora_A", None) is None: continue
+        if getattr(lora_stats, "lora_B", None) is None: continue
+        shape = _lora_target_logical_shape(lora_stats)
+        if shape is None: continue
+        parts = key.split(".")
+        for i in range(len(parts) - 2):
+            match = next((m for m, sh in tails.get(".".join(parts[i:]), ()) if sh == shape), None)
+            if match is not None:
+                found[key] = match
+                break
+    return found
+pass
+
+
 def _format_partial_merge_error(unresolved, model_class_name, total_lora_modules = 0):
     """The refusal message, naming each unmerged prefix, its share and a worked example."""
     total = sum(len(claimed) for claimed in unresolved.values())
@@ -7400,9 +7433,9 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
         # Every report refuses regardless of size: a size threshold would downgrade a genuine 14-module under-merge on a
         # text encoder to a notice; the env var is the escape hatch.
         message = _format_partial_merge_error(unresolved, model_class_name, total_lora_modules)
-    elif total_lora_modules and disk_keys and not _backed_lora_keys(
-        _convert_lora_keys_to_safetensor_format(lora_weights, disk_keys, model_class_name = model_class_name),
-        disk_keys, tie_word_embeddings, count_packed_mxfp4 = count_packed_mxfp4,
+    elif total_lora_modules and disk_keys and _renamed_lora_counterparts(
+        lora_weights, disk_keys, disk_module_shapes, model_class_name,
+        tie_word_embeddings = tie_word_embeddings, count_packed_mxfp4 = count_packed_mxfp4,
     ):
         # A rename the merge cannot see (not a pure prefix deletion) leaves `unresolved` empty too, and the export
         # would be the base weights reported as a merge.

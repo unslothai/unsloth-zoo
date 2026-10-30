@@ -153,3 +153,34 @@ def test_a_merge_that_places_no_lora_module_refuses(tmp_path, remote_class, monk
     if os.path.isdir(out_dir):
         for key, tensor in H.read_safetensors_dir(out_dir).items():
             assert torch.equal(tensor, base_tensors[key]), f"{key} was rewritten before the refusal"
+
+
+def _lora_weights(entries):
+    import collections
+    weights = collections.defaultdict(lambda: SU.LoraStats(None, None, None, 0))
+    weights.update(entries)
+    return weights
+
+
+def _lora(out_features, in_features):
+    module = torch.nn.Linear(in_features, out_features, bias = False)
+    return SU.LoraStats(module, torch.zeros(2, in_features), torch.zeros(out_features, 2), 1.0)
+
+
+def test_adapters_only_on_an_omitted_tower_still_save(monkeypatch):
+    """Every target in a component the export leaves out: no tensor anywhere to rename to."""
+    monkeypatch.delenv("UNSLOTH_ALLOW_PARTIAL_LORA_MERGE", raising = False)
+    lora = _lora_weights({f"model.vision_tower.layers.{i}.attn.q_proj": _lora(48, 48) for i in range(2)})
+    shapes = {f"model.layers.{i}.self_attn.q_proj": (32, 32) for i in range(2)}
+    disk = ({k + ".weight" for k in shapes}, shapes)
+    assert SU._check_lora_merge_is_complete(None, [], lora, "LlamaForCausalLM", disk = disk) == {}
+
+
+def test_adapters_whose_weights_sit_under_another_prefix_refuse(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_ALLOW_PARTIAL_LORA_MERGE", raising = False)
+    monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})
+    lora = _lora_weights({f"model.layers.{i}.self_attn.q_proj": _lora(32, 32) for i in range(2)})
+    shapes = {f"lfm.body.layers.{i}.self_attn.q_proj": (32, 32) for i in range(2)}
+    disk = ({k + ".weight" for k in shapes}, shapes)
+    with pytest.raises(PartialLoraMergeError, match = "none of the"):
+        SU._check_lora_merge_is_complete(None, [], lora, "LlamaForCausalLM", disk = disk)
