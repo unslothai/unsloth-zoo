@@ -7349,11 +7349,21 @@ def _unresolved_lora_targets(lora_weights, disk_keys, disk_module_shapes, model_
 pass
 
 
+_TOWER_WORDS = ("vision", "visual", "image", "audio", "speech", "encoder", "tower", "projector")
+
+
+def _tower_words(prefix_parts):
+    joined = ".".join(prefix_parts).lower()
+    return frozenset(word for word in _TOWER_WORDS if word in joined)
+pass
+
+
 def _renamed_lora_counterparts(lora_weights, disk_keys, disk_module_shapes, model_class_name,
                                tie_word_embeddings = False, count_packed_mxfp4 = True):
     """When no LoRA target is placed at all, those whose weight still sits in this export under
-    another name: the same trailing path (at least the last three components) and the same shape.
-    An omitted tower has no such tensor, so it stays exempt as in `_unresolved_lora_targets`."""
+    another name: the same trailing path (at least the last three components), the same shape, and
+    a prefix naming the same tower (vision, audio, ...). An omitted tower has no such tensor, so it
+    stays exempt as in `_unresolved_lora_targets`."""
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, disk_keys, model_class_name = model_class_name,
     )
@@ -7374,7 +7384,11 @@ def _renamed_lora_counterparts(lora_weights, disk_keys, disk_module_shapes, mode
         if shape is None: continue
         parts = key.split(".")
         for i in range(len(parts) - 2):
-            match = next((m for m, sh in tails.get(".".join(parts[i:]), ()) if sh == shape), None)
+            towers = _tower_words(parts[:i])
+            match = next((
+                m for m, sh in tails.get(".".join(parts[i:]), ())
+                if sh == shape and _tower_words(m.split(".")[: len(m.split(".")) - len(parts) + i]) == towers
+            ), None)
             if match is not None:
                 found[key] = match
                 break

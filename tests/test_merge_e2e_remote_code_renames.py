@@ -197,3 +197,13 @@ def test_the_merged_class_wins_over_a_same_named_remote_class(remote_class, monk
     monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setitem(SU._MERGE_MODEL_CLASSES, _CLASS_NAME, model_class)
     assert SU._get_checkpoint_conversion_mapping(_CLASS_NAME) == {r"^lfm\.body\.": _LIVE_PREFIX}
+
+
+def test_an_omitted_tower_sharing_names_and_shapes_with_the_text_model_still_saves(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_ALLOW_PARTIAL_LORA_MERGE", raising = False)
+    lora = _lora_weights({
+        f"model.vision_tower.layers.{i}.self_attn.q_proj": _lora(32, 32) for i in range(2)
+    })
+    shapes = {f"model.language_model.layers.{i}.self_attn.q_proj": (32, 32) for i in range(2)}
+    disk = ({k + ".weight" for k in shapes}, shapes)
+    assert SU._check_lora_merge_is_complete(None, [], lora, "LlamaForCausalLM", disk = disk) == {}
