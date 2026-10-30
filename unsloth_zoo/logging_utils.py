@@ -68,8 +68,7 @@ def NotebookProgressCallback_on_train_begin(Trainer_metrics):
         self.first_column = "Epoch" if args.eval_strategy == IntervalStrategy.EPOCH else "Step"
         self.training_loss = 0
         self.last_log = 0
-        # Don't pre-create metric columns; write_line adds them dynamically as
-        # metrics appear, avoiding empty columns for conditional metrics.
+        # Don't pre-create metric columns: write_line adds them as metrics appear, avoiding empty columns for conditional metrics.
         column_names = [self.first_column] + ["Training Loss"]
         if args.eval_strategy != IntervalStrategy.NO:
             column_names.append("Validation Loss")
@@ -80,8 +79,7 @@ pass
 
 
 def NotebookProgressCallback_on_log(Trainer_metrics):
-    # Allowlist of known metrics (pre-extracted from TRL source); only these +
-    # dynamic rewards/* pass through, blocking runtime-injected keys.
+    # Allowlist of metrics pre-extracted from TRL source; only these plus dynamic rewards/* keys pass through, blocking runtime-injected keys.
     set_Trainer_metrics = frozenset(Trainer_metrics)
 
     def _NotebookProgressCallback_on_log(self, args, state, control, logs = None, **kwargs):
@@ -130,8 +128,7 @@ def NotebookTrainingTracker_write_line(Trainer_metrics):
         else:
             columns = self.inner_table[0]
 
-            # Add new columns appearing in values (e.g. per-reward-func metrics
-            # discovered at step > 1), back-filling previous rows.
+            # Add columns discovered in values later (e.g. per-reward-func metrics at step > 1), back-filling previous rows.
             for key in values:
                 if key not in columns:
                     columns.append(key)
@@ -144,7 +141,6 @@ def NotebookTrainingTracker_write_line(Trainer_metrics):
             if len(self.inner_table) > 1:
                 last_values = self.inner_table[-1]
                 if last_values[0] != values[first_column]:
-                    # write new line
                     self.inner_table.append([values[c] if c in values else "" for c in columns])
                 else:
                     # update last line, preserving existing values for missing keys
@@ -188,9 +184,7 @@ def get_trl_metrics():
     filepath = inspect.getfile(trl.trainer)
     filepath = os.path.split(filepath)[0]
 
-    # TRL >= 0.26.0 moved many trainers to trl/experimental/*/, leaving thin
-    # re-export shims in trl/trainer/. Map trainer -> source path, preferring
-    # the experimental (real) file when both exist.
+    # TRL >= 0.26.0 moved trainers to trl/experimental/*/ and left thin re-export shims in trl/trainer/; prefer the experimental file when both exist.
     trl_root = os.path.split(filepath)[0]
     exp_dir = os.path.join(trl_root, "experimental")
     trainer_files = dict()
@@ -235,8 +229,7 @@ def get_trl_metrics():
         stats_f2 = re.findall(r"stats\[mode\]\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         metrics_f = metrics_f + metrics_f2 + stats_f2
 
-        # Filter out prefixes if seen
-        # metrics[f"{prefix}rewards/chosen"]
+        # Filter out prefixes if seen, as in metrics[f"{prefix}rewards/chosen"].
         left_prefix = 'prefix = "eval_" if train_eval == "eval" else ""' in file
         if left_prefix: metrics += metrics_f
 
