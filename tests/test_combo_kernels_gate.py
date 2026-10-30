@@ -80,10 +80,13 @@ def test_combo_kernels_forward_backward_matches_eager():
 
     torch._dynamo.reset()
     Scheduler.create_combo_kernel_nodes = counted
+    import torch._inductor.config as inductor_config
     try:
-        compiled = torch.compile(block, fullgraph = True, dynamic = False, options = options)
-        act = compiled(*inputs)
-        act_grads = torch.autograd.grad(act[0], inputs)
+        # A warm FX graph cache (another test compiled this graph) would skip the scheduler entirely.
+        with inductor_config.patch(force_disable_caches = True):
+            compiled = torch.compile(block, fullgraph = True, dynamic = False, options = options)
+            act = compiled(*inputs)
+            act_grads = torch.autograd.grad(act[0], inputs)
     finally:
         Scheduler.create_combo_kernel_nodes = original
         torch._dynamo.reset()
