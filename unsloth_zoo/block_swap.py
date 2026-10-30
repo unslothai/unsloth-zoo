@@ -342,6 +342,17 @@ def _opaque(hook):
     return disable(hook) if disable is not None else hook
 
 
+def _output_logits(output):
+    out = getattr(output, "logits", None)
+    if isinstance(out, torch.Tensor):
+        return out
+    if isinstance(output, (tuple, list)):
+        # return_dict = False with labels puts the scalar loss first and the logits second.
+        tensors = [t for t in output[:2] if isinstance(t, torch.Tensor)]
+        return max(tensors, key = lambda t: t.numel(), default = None)
+    return output
+
+
 def swap_indices(total, n, placement = "spread"):
     """"spread": evenly spaced, ending at the last layer (each copy hides behind total / n layers); "tail": last n."""
     n = max(0, min(int(n), total))
@@ -827,9 +838,7 @@ class BlockSwap:
         homes = {b.home for b in self.blocks if b.home is not None}
         for dv in homes:
             self._note_peak(dv)
-        out = getattr(output, "logits", None)
-        if not isinstance(out, torch.Tensor):
-            out = output[0] if isinstance(output, (tuple, list)) and output else output
+        out = _output_logits(output)
         node = getattr(out, "grad_fn", None) if isinstance(out, torch.Tensor) else None
         if node is not None:
             # When the output's grad lands, the op that consumed the output (the loss) has just held the output,

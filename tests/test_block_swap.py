@@ -1387,6 +1387,14 @@ def test_auto_depth_peak_includes_unswapped_layers_backward():
     sw.remove()
 
 
+def test_output_peak_reads_the_logits_from_a_tuple_with_the_loss_first():
+    import types
+    logits, loss = torch.zeros(4, 8), torch.zeros(())
+    assert _mod._output_logits((loss, logits)) is logits
+    assert _mod._output_logits((logits,)) is logits
+    assert _mod._output_logits(types.SimpleNamespace(logits = logits)) is logits
+
+
 def test_find_decoder_layers_remembers_the_model_without_holding_it():
     import gc
     model = _HeadModel(8, 2, 16)
