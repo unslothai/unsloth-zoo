@@ -492,3 +492,22 @@ def test_count_aware_ce_rejects_out_of_range_labels(route, monkeypatch):
         with pytest.raises((IndexError, RuntimeError)):
             x = logits.clone().requires_grad_()
             loss_fn(x, torch.tensor([bad, 0])).backward()
+
+
+def test_rows_ce_keeps_a_dynamic_vocab_dim_symbolic():
+    # The label check must not specialise the vocab size: no ConstraintViolationError under mark_dynamic,
+    # and one graph across vocab sizes.
+    from torch._dynamo.testing import CompileCounter
+    from unsloth_zoo.fused_losses.stable_softmax import cross_entropy_rows
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    fn = torch.compile(cross_entropy_rows, backend = counter, fullgraph = True, dynamic = True)
+    try:
+        for vocab in (7, 11):
+            logits = torch.randn(4, vocab)
+            torch._dynamo.mark_dynamic(logits, 1)
+            target = torch.tensor([0, vocab - 1, -100, 2])
+            torch.testing.assert_close(fn(logits, target), cross_entropy_rows(logits, target))
+    finally:
+        torch._dynamo.reset()
+    assert counter.frame_count == 1

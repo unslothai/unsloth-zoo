@@ -225,7 +225,11 @@ def _check_targets(target, keep, vocab_size, ignore_index):
     if target.is_cuda or torch.compiler.is_compiling():
         ok = torch.logical_not(bad.any())
         if _ASSERT_ASYNC_MSG:
-            torch._assert_async(ok, f"Unsloth: cross entropy target out of bounds for a vocabulary of {vocab_size}")
+            # A traced message must not format vocab_size: that specialises a dynamic vocab dim.
+            msg = "Unsloth: cross entropy target out of bounds for the vocabulary"
+            if not torch.compiler.is_compiling():
+                msg = f"{msg} of {vocab_size}"
+            torch._assert_async(ok, msg)
         else:
             torch._assert_async(ok)
     elif bool(bad.any()):
