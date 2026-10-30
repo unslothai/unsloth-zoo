@@ -3909,7 +3909,13 @@ def patch_GptOssModel():
         _cross_card = getattr(block_swap, "spans_devices", False) or (
             _swap_device is not None and hidden_states.device != _swap_device
         ) or _gpt_oss_layers_span_devices(self.layers, hidden_states.device)
-        if not self.training and qlen == 1 and isinstance(attention_mask, dict) and not _cross_card:
+        # The decode fast path normalizes in place and has no backward: grad-bearing caller embeddings
+        # (eval with grad enabled) take the differentiable layer path instead.
+        _needs_grad = torch.is_grad_enabled() and hidden_states.requires_grad
+        if (
+            not self.training and qlen == 1 and isinstance(attention_mask, dict)
+            and not _cross_card and not _needs_grad
+        ):
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
             if not torch.compiler.is_compiling():

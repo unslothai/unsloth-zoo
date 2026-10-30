@@ -81,6 +81,14 @@ res['embeds_out_requires_grad'] = out.requires_grad
 if out.requires_grad:
     out.square().sum().backward()
 res['embeds_grad'] = emb.grad is not None and bool(emb.grad.abs().sum() > 0)
+# A single-token grad-bearing input must not reach the in-place decode fast path.
+emb1 = lm.model.embed_tokens(ids[:, :1]).detach().float().requires_grad_(True)
+try:
+    out1 = lm(inputs_embeds=emb1, use_cache=False).logits
+    out1.square().sum().backward()
+    res['embeds1_grad'] = emb1.grad is not None and bool(emb1.grad.abs().sum() > 0)
+except RuntimeError as e:
+    res['embeds1_grad'] = repr(e)[:300]
 # Embeddings the model makes itself (an input-require-grads hook) are still detached in eval.
 lm.enable_input_require_grads()
 res['ids_out_requires_grad'] = lm(ids, use_cache=False).logits.requires_grad
@@ -107,4 +115,5 @@ def test_patched_forward_keeps_cache_default_and_input_grads():
     assert res["prefix_has_cache"], res
     assert res["decode_err"] < 1e-4, res
     assert res["embeds_out_requires_grad"] and res["embeds_grad"], res
+    assert res["embeds1_grad"] is True, res
     assert res["ids_out_requires_grad"] is False, res
