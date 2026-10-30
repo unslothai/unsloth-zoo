@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression: a mixed Qwen3 prompt batch keeps one visual row per input row.
-
-Runs in a subprocess on purpose. Sibling MLX test modules install the
-tests/mlx_simulation torch shim over `mlx.core` AND `mlx_vlm` for the rest of
-the session, so an in-process version of this check can only skip once any of
-them has run -- which is exactly what happens in the full suite. A subprocess
-gets the real mlx-vlm merger every time, whatever ran before.
-"""
+"""Regression: a mixed Qwen3 prompt batch keeps one visual row per input row; runs in a subprocess because the
+tests/mlx_simulation shim sibling modules install over mlx.core and mlx_vlm persists for the session."""
 
 import subprocess
 import sys
@@ -148,12 +142,8 @@ def test_qwen3_mixed_prompt_batch_survives_a_three_row_unequal_batch():
 
 
 def test_import_regressions_fail_instead_of_reporting_a_skip(tmp_path):
-    """Only an absent optional dependency may skip the isolated run.
-
-    A blanket ``except Exception`` around the imports turns any import-time
-    break in the modules under test into a successful skip, so the regression
-    test above would report success for exactly the failure it exists to catch.
-    """
+    """Only an absent optional dependency may skip the isolated run; a blanket except Exception around the imports would
+    turn an import-time break into a passing skip."""
     import os
 
     shim = tmp_path / "shim"

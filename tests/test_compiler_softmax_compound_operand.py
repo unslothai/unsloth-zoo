@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`higher_precision_softmax` appends `.to(<first argument>.dtype)`: a compound first argument
-(Falcon's `scores + mask`, SLANet's `torch.stack(xs, dim=1)`) must be left as written."""
+"""higher_precision_softmax appends `.to(<first argument>.dtype)`, so compound first arguments (Falcon's `scores +
+mask`, SLANet's `torch.stack(xs, dim=1)`) must be left as written."""
 
 import ast
 

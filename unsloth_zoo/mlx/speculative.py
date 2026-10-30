@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import copy
+import functools
 import gc
 import importlib
+import inspect
 import json
 import os
 import re
@@ -770,9 +772,10 @@ class EngineRow:
     ``cache`` holds the prompt; ``pending`` is the last sampled token, already emitted but not yet
     forwarded; ``emitted`` counts the tokens emitted so far, ``pending`` included, and is the
     position of the next draw. ``hidden`` is the target's last-layer hidden ``[1, N, H]`` at the
-    last N prompt positions, which a drafter starts from. A row speculates only if each of its
-    ``processors`` sets ``history_only = True``: after its first call its output depends only on
-    the ``(tokens, logits)`` it is given, so it can be asked about positions that are then rejected.
+    last N prompt positions, which a drafter starts from. A row speculates only if ``drafts`` and
+    each of its ``processors`` sets ``history_only = True``: after its first call its output depends
+    only on the ``(tokens, logits)`` it is given, so it can be asked about positions that are then
+    rejected.
     """
 
     cache: list
@@ -786,6 +789,7 @@ class EngineRow:
     rope_delta: int = 0
     hidden: Any = None
     uid: Any = None
+    drafts: bool = True
 
 
 @dataclass(frozen = True)
@@ -809,7 +813,8 @@ class _Row:
         self.max_tokens = row.max_tokens
         self.stop_tokens = frozenset(row.stop_tokens)
         self.processors = list(row.processors)
-        self.speculates = all(getattr(processor, "history_only", False) for processor in self.processors)
+        self.history_only = all(getattr(processor, "history_only", False) for processor in self.processors)
+        self.speculates = row.drafts and self.history_only
         self.history = mx.array(self.tokens) if self.processors else None
         self.rope_delta = int(row.rope_delta)
         self.sample = _RowSampler(row.sampling)
@@ -1077,7 +1082,7 @@ class SpeculativeEngine:
     def _plain(self, length: int, states: list[RowState], waiting: Callable[[], bool] | None = None) -> Iterator[list[list[int]]]:
         rows = self._rows
         # A processor that reads more than the history needs each token taken before the next step.
-        pipelined = all(row.speculates for row in rows)
+        pipelined = all(row.history_only for row in rows)
         start = time.perf_counter()
         with mx.stream(self._stream):
             tokens, scores, hidden = self._step(mx.array([[row.pending] for row in rows]))
@@ -1221,6 +1226,14 @@ class SpeculativeEngine:
         return emitted
 
 
+@functools.cache
+def _history_starts_at_prompt(generate_step) -> bool:
+    try:
+        return "tokens = input_ids.flatten()" in inspect.getsource(generate_step)
+    except (OSError, TypeError):
+        return False
+
+
 def _shown_from(processor: Callable, start: int) -> Callable:
     def shown(tokens, logits):
         return processor(tokens[start:], logits)
@@ -1291,8 +1304,10 @@ class SpeculativeDraft:
         prompt, sampling, processors = request
         first = int(first_token.item())
         yield first, logprobs
-        # mlx-vlm's first step showed the processors the last prefilled chunk alone.
+        # Before 0.7.11 mlx-vlm's first step showed the processors the last prefilled chunk alone.
         start = max(0, len(prompt) - int(input_ids.size))
+        if _history_starts_at_prompt(importlib.import_module("mlx_vlm.generate.ar").generate_step):
+            start = 0
         processors = [_shown_from(processor, start) for processor in processors]
         engine = SpeculativeEngine(model, self.controller, self.drafter)
         engine.add(self._started(model, EngineRow(prompt_cache, first, prompt, sampling, max_tokens, processors = processors), last_outputs))

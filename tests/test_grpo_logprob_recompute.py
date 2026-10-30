@@ -14,15 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""chunked_hidden_states_selective_log_softmax_recompute against a float64 full-logits oracle.
-
-Like the plain chunked function, it takes the softmax in float32 whatever the input dtype, so the
-oracle tolerances are float32 ones, and the plain function's own error is the bar to stay under.
-
-The function's source is executed on its own in a namespace holding only torch, os, typing and
-math, the way unsloth copies these helpers into generated trainers, so a hidden dependency on
-rl_replacements module globals fails here.
-"""
+"""chunked_hidden_states_selective_log_softmax_recompute vs float64 oracle; softmax runs in float32 whatever the input
+dtype, so float32 tolerances, with the plain chunked function error as the bar; source runs standalone with only
+torch, os, typing, math."""
 import inspect
 import math
 import os
@@ -185,8 +179,8 @@ def test_frozen_head_and_no_grad():
 
 
 def test_saves_no_logits_for_backward():
-    # The plain chunked function keeps rows x vocab logits per chunk alive for backward; this one
-    # must keep only its inputs plus per-row statistics, whatever the vocabulary.
+    # Unlike the plain chunked function (rows x vocab logits kept per chunk for backward), this one saves only its
+    # inputs and per-row statistics, whatever the vocabulary.
     function = _standalone()
     vocab, hidden, rows = 4096, 8, 64
     head = torch.randn(vocab, hidden, dtype = torch.float64, requires_grad = True)
@@ -265,8 +259,8 @@ def test_cuda_autocast_matches_plain_function(rows, head_dtype, fused_linear):
 
 
 def test_cached_function_survives_a_missing_compiled_flag():
-    # A monkeypatch of _use_compiled on the module function, undone after the autograd function
-    # was cached, deletes the flag; later calls must fall back to the default instead of raising.
+    # A monkeypatch of _use_compiled, undone after the autograd function is cached, deletes the flag; later calls must
+    # fall back to the default instead of raising.
     function = _standalone()
     head, states, _, index, weights, _ = _inputs(rows = 6, bias = False, seed = 3)
     function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0, fused_linear = False)
@@ -278,8 +272,8 @@ def test_cached_function_survives_a_missing_compiled_flag():
 
 
 def _fp16_head_case(function, head_dtype = torch.float16):
-    # Three chunks of two rows; each chunk's head gradient (2 x 1.5 x 32768 = 98304) and the running
-    # sum leave the fp16 range before the last chunk's opposite sign cancels half of it.
+    # Three 2-row chunks: each chunk's head gradient (2 x 1.5 x 32768 = 98304) and the running sum leave the fp16 range
+    # before the last chunk's opposite sign cancels half of it.
     hidden = torch.full((1, 6, 1), 1.5, dtype = torch.float16)
     head = torch.zeros((2, 1), dtype = head_dtype, requires_grad = True)
     index = torch.zeros((1, 6), dtype = torch.long)
@@ -323,8 +317,7 @@ def test_bf16_hidden_grad_with_fp16_head_does_not_overflow():
 
 
 def test_cold_outer_fullgraph_compile():
-    # A fresh process, so nothing has called the function yet: it must build its autograd function
-    # at import, leaving a cold outer torch.compile(fullgraph = True) only the cached function to trace.
+    # Fresh process: the autograd function must be built at import so a cold outer torch.compile(fullgraph = True) has only the cached function to trace.
     import subprocess, sys, textwrap
     script = textwrap.dedent("""
         import torch
@@ -357,8 +350,8 @@ def test_cold_outer_fullgraph_compile():
 
 @pytest.mark.parametrize("compiled", [False, True])
 def test_fp32_head_under_fp16_autocast_does_not_nan(compiled):
-    # fp32 trainable head, fp16 autocast, loss scale 65536, hidden 4, two 512 row chunks with opposite
-    # upstream signs: each fp16 chunk product overflowed to +-inf before the float32 sum, leaving NaN.
+    # fp32 trainable head, fp16 autocast, loss scale 65536, hidden 4, two 512-row chunks with opposite upstream signs:
+    # each fp16 product overflowed to +-inf before the float32 sum, leaving NaN.
     function = _standalone(compiled = compiled)
     rows, hidden_size, vocab = 1024, 8, 64
     sign = torch.ones(rows)

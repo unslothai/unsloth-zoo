@@ -127,8 +127,7 @@ def qwen_4bit():
 
 @pytest.fixture(scope = "module")
 def qwen4():
-    """A small random qwen4_exp quantized like the 4-bit releases, so its decode takes the batch-invariant forward, with
-    their expert and hyper-connection widths, which pick the projections' kernels."""
+    """Random quantized qwen4_exp like the 4-bit releases: decode takes the batch-invariant forward, and its expert and hyper-connection widths pick the kernels."""
     import mlx.nn as nn
     from mlx.utils import tree_map
     from mlx_vlm.models import qwen4_exp
@@ -748,8 +747,7 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, q
         patch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
         inference.warm_inference(model)
         assert len(builds) == 1 and not inference._VERIFY_GDN_VERDICTS
-        # A block evaluated inside a function transformation or under memory pressure is checked on a later one; a
-        # rejected build is not retried.
+        # A block evaluated inside a function transformation or under memory pressure is checked on a later call; a rejected build is not retried.
         block = lambda: _verified(model.language_model, cache, mx.array([ids[0][24 : 27]]), 0)
         with inference.exact_speculative_verify(model):
             for later in (ValueError("[eval] Attempting to eval an array during function transformations"),
@@ -1474,6 +1472,7 @@ def test_eagle3_narrower_than_its_target_drafts_from_the_concatenated_layers_row
 @pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
 def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, monkeypatch, companion):
     from copy import deepcopy
+    from dataclasses import replace
     from mlx_vlm.models.cache import make_prompt_cache
     from unsloth_zoo.mlx.generate import BatchStream, GenerationRequest, SamplingParams
     from unsloth_zoo.mlx.speculative import ContextDrafter, SpeculativeDraft
@@ -1508,7 +1507,8 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
         return results
 
     by_ids = GenerationRequest(prompt_token_ids = tok.encode(texts[0], add_special_tokens = False), max_tokens = 40)
-    batched, alone = run({0: greedy[0], 3: greedy[1], 6: sampled, 7: greedy[2], 8: resumed, 9: by_ids}), run({0: sampled})
+    undrafted = replace(greedy[0], drafts = False)
+    batched, alone = run({0: greedy[0], 3: greedy[1], 6: sampled, 7: greedy[2], 8: resumed, 9: by_ids, 10: undrafted}), run({0: sampled})
     for request, result, expected in zip(greedy, (batched[0], batched[3], batched[7]), upstream):
         n = len(result.token_ids)
         # A stop token ends the reply without joining its text.
@@ -1516,6 +1516,7 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
         assert result.logprobs == pytest.approx([logprobs[token].item() for token, logprobs in expected[:n]], abs = 0.02)
     assert (batched[6].token_ids, batched[6].logprobs) == (alone[0].token_ids, alone[0].logprobs)
     assert batched[9].token_ids == batched[0].token_ids  # a token-id prompt prefills as its rendered twin
+    assert (batched[10].token_ids, batched[10].draft_tokens) == (batched[0].token_ids, 0)
     assert [batched[0].finish_reason, batched[3].finish_reason] == ["length", "stop"]
     assert batched[0].draft_tokens >= batched[0].accepted_draft_tokens > 0
     assert (batched[8].cached_token_count, sorted(banked)) == (0, [size - 9, size - 1])
@@ -1593,8 +1594,7 @@ def test_unquantized_companion_mtp_heads_and_dflash_drafters_load_at_4_bits_unle
         dflash = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
         return speculative.companion_drafter(split, qwen_mtp[0]), speculative._built(speculative.ContextDrafter, dflash, qwen[0].language_model, quantize = True)
     head, dflash = built(None)
-    # A head stored partly quantized keeps its full-precision layers; one read whole out of a model's checkpoint, as
-    # its own head or a companion, stays as stored.
+    # A partly quantized head keeps its full-precision layers; a head read whole from a checkpoint, as its own head or a companion, stays as stored.
     kept, native, whole = (build(path, qwen_mtp[0]) for build, path in ((speculative.companion_drafter, packed), (speculative.native_mtp_drafter, source), (speculative.companion_drafter, source)))
     plain_head, plain_dflash = built("0")
     assert head.model.fc.bits == head.model.layers[0].mlp.up_proj.bits == dflash.model.fc.bits == dflash.model.layers[0].mlp.up_proj.bits == 4

@@ -13,15 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""The converter sources are a second download, and they were unverified.
-
-`_stage_prebuilt_install` checks the sha256 of the BINARY asset.
-`_hydrate_converter_sources` then downloads the source archive separately and
-copies convert_hf_to_gguf.py, conversion/ and gguf-py/ out of it, and those are
-the files the converter subprocess executes. The fork's own
-llama-prebuilt-sha256.json carries an entry for that archive, so there is
-something to check against on the path Unsloth actually uses.
-"""
+"""Tests that the converter source tarball is checked against its sha256 entry in llama-prebuilt-sha256.json, since they run in the converter subprocess."""
 
 import hashlib
 import importlib.util
@@ -78,9 +70,7 @@ def _install(llama_cpp, tmp_path, archive, checksums, monkeypatch, tag = "b1-mix
 def test_a_source_archive_that_fails_its_published_digest_is_refused(
     tmp_path, monkeypatch
 ):
-    """These bytes become the converter. A mismatch has to stop the install, the
-    same way the binary asset's mismatch does, rather than be copied into place.
-    """
+    """A source archive that fails its published sha256 must stop the install like the binary asset does, rather than be copied into place."""
     llama_cpp = _load("llama_cpp_tarball_probe", "unsloth_zoo/llama_cpp.py")
 
     tag = "b1-mix-abc"
@@ -105,9 +95,8 @@ def test_a_matching_source_archive_installs(tmp_path, monkeypatch):
 
 
 def test_a_release_with_no_published_digest_is_refused(tmp_path, monkeypatch):
-    """There is nothing to check these bytes against, and they become the
-    converter, so they are not used: the prebuilt attempt fails instead. The
-    release's own sha256 list is consulted first, in case the caller had none."""
+    """With no published digest, unverified source bytes are not used and the prebuilt attempt fails; the release's own
+    sha256 list is consulted first if the caller had none."""
     llama_cpp = _load("llama_cpp_tarball_nodigest_probe", "unsloth_zoo/llama_cpp.py")
 
     tag = "b1-mix-abc"

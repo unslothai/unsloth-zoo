@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MoE backward without full-size copies, checked against an fp32 per-expert reference.
-
-1. _GroupedMMRecompute.backward hands the transposed frozen stack to the grouped GEMM as a view.
-2. Trainable expert biases: the gather's backward sums in fp32 (one-hot GEMM) instead of a 16-bit index_add_.
-3. A transposed trainable stack gets dW in its own layout, so AccumulateGrad does not copy it.
-"""
+"""MoE backward avoids full-size copies, checked against an fp32 per-expert reference: transposed frozen stack passed as
+a view, fp32 bias-grad sums, dW in its own layout."""
 
 import pytest
 import torch
@@ -514,8 +510,8 @@ def test_expert_bias_gather_long_backward_is_reproducible(path, dtype, monkeypat
 @pytest.mark.parametrize("dynamic", [False, True], ids = ["static", "dynamic"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_expert_bias_gather_compiled_upcast_caps_the_fp32_copy(dtype, dynamic, monkeypatch):
-    """Compiled backward on the upcast fallback (CPU, ROCm, XPU, CUDA torch < 2.9): each fp32 copy of grad stays
-    within one chunk instead of all rows x width, and the bias grad is bitwise the eager chunked one."""
+    """Compiled upcast fallback (CPU, ROCm, XPU, CUDA torch < 2.9) caps each fp32 grad copy to one chunk, not rows x
+    width; bias grad is bitwise the eager chunked one."""
     if not hasattr(torch.library, "custom_op"):
         pytest.skip("torch.library.custom_op unavailable")
     monkeypatch.setattr(mu, "_MM_OUT_DTYPE", False, raising = False)

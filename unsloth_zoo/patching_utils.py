@@ -35,7 +35,6 @@ from ._gc_passes import collect_garbage
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
-# Also disable compiling on bitsandbytes
 def patch_compiling_bitsandbytes():
     # All Unsloth Zoo code licensed under LGPLv3
     os.environ["UNSLOTH_PATCHED"] = "1"
@@ -52,10 +51,8 @@ def patch_compiling_bitsandbytes():
             try:
                 module = importlib.import_module(x)
             except ImportError as e:
-                # Genuinely absent package = the missing module is the target
-                # or one of its parents. Anything else (e.g. a broken
-                # transitive dependency inside an installed package) must
-                # surface its real error, not an install hint.
+                # Only an absent package (the missing module is the target or one of its parents) gets an install hint;
+                # any other ImportError, such as a broken transitive dependency, must surface its real error.
                 missing = getattr(e, "name", "") or ""
                 target_missing = isinstance(e, ModuleNotFoundError) and missing and (
                     x == missing or x.startswith(missing + ".")
@@ -76,14 +73,9 @@ def patch_compiling_bitsandbytes():
                 if not hasattr(layer, "forward"): continue
                 if hasattr(layer.forward, "__wrapped__"): continue
                 layer.forward = torch._disable_dynamo(layer.forward)
-            pass
         pass
     pass
 
-    # import bitsandbytes.autograd._functions
-    # bitsandbytes.autograd._functions.matmul_4bit = torch._disable_dynamo(
-    #     bitsandbytes.autograd._functions.matmul_4bit
-    # )
     return
 pass
 
@@ -98,7 +90,6 @@ def patch_layernorm(fast_layernorm):
         class Unsloth_LayerNorm(LayerNorm):
             def forward(self, X):
                 return fast_layernorm(self, X)
-            pass
         pass
 
         torch.nn.LayerNorm = Unsloth_LayerNorm
@@ -157,8 +148,7 @@ def stop_compiling_weak_dictionary_writes():
 
 
 def patch_dynamo_cleanup_hook_shutdown():
-    # CleanupHook.__call__ reads the global _cleanup_owners from a weakref callback, which at
-    # interpreter exit can run after module globals became None ("'NoneType' ... 'pop'").
+    # CleanupHook.__call__ reads global _cleanup_owners from a weakref callback that can run at exit after globals are None ('NoneType' ... 'pop').
     try:
         import torch._dynamo.utils as dynamo_utils
     except Exception:
@@ -653,7 +643,6 @@ def patch_model_and_tokenizer(
                 buffer.data = buffer.data.to(buffer._pre_set_compute_dtype)
             elif buffer.dtype == torch.bfloat16:
                 buffer.data = buffer.data.to(torch.float16)
-        pass
     elif correct_dtype == torch.float16:
         # A pre-quantized checkpoint keeps its skipped layers and biases in the bfloat16 it was saved in. On a GPU without bfloat16 (T4) Inductor skips every graph reading one, so a non-reentrant checkpoint recompute stops matching its forward (unsloth#3459).
         # A module pin covers its whole subtree: the pass below moves it with module.to().
@@ -1018,8 +1007,7 @@ import inspect
 try:
     import transformers.integrations.bitsandbytes as _transformers_bnb
 except Exception:
-    # Not just ImportError: this transformers module imports bitsandbytes at its own module
-    # scope, and a bitsandbytes mismatched with torch fails its own import with AttributeError.
+    # Catch Exception, not just ImportError: transformers imports bitsandbytes at module scope, and a torch-mismatched bitsandbytes fails with AttributeError.
     _transformers_bnb = None
 if _transformers_bnb is not None and \
     hasattr(_transformers_bnb, "_replace_with_bnb_linear") and \
@@ -1036,8 +1024,7 @@ if _transformers_bnb is not None and \
         raise RuntimeError("Unsloth: Patch for dynamic quantization failed since current_key_name_str does not exist.")
     source = _add_suffix_match_to_bnb_skip(source)
 
-    # Patch recursive calls to mark the parent class, so we can access it
-    # when checking for conversion_mappings
+    # Patch recursive calls to mark the parent class, so it can be reached when checking for conversion_mappings.
     try:
         mark_parent_error = False
         new_source = source.replace(

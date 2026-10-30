@@ -6,19 +6,9 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Regression for unslothai/unsloth#5441.
-
-PreTrainedModel.__init__ resolves loss_type from the class name via regex when
-it isn't a literal LOSS_MAPPING key, so `Qwen3_5ForConditionalGeneration` lands
-on `LOSS_MAPPING["ForConditionalGeneration"]` (aliased, like
-`CsmForConditionalGeneration`, to stock `ForCausalLMLoss`). `patch_loss_functions()`
-only rewrote `LOSS_MAPPING["ForCausalLM"]`, leaving those aliases on the
-un-patched loss that does `logits.float()` and OOMs on <= 24 GB GPUs at large
-vocab sizes.
-
-Pins: every key aliased to ForCausalLMLoss is replaced with the Unsloth kernel;
-keys aliased to other loss types are not; the patch is idempotent.
-"""
+"""Regression for issue 5441: patch_loss_functions must replace every LOSS_MAPPING alias of ForCausalLMLoss (e.g.
+ForConditionalGeneration), not only ForCausalLM; the un-patched loss does logits.float() and OOMs on <=24 GB GPUs;
+other aliases are untouched and the patch is idempotent."""
 
 from __future__ import annotations
 
@@ -37,8 +27,7 @@ def test_loss_mapping_for_conditional_generation_patched():
 
     saved = dict(lu.LOSS_MAPPING)
     try:
-        # A naive cross_entropy stub keeps torch.compile out of the picture and
-        # makes the regression test pure-Python.
+        # A naive cross_entropy stub keeps torch.compile out of the picture so the regression test stays pure Python.
         def _fast_ce(logits, labels, n_items=None, **kw):
             import torch
             return torch.nn.functional.cross_entropy(

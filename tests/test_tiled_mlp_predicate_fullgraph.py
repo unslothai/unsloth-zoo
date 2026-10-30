@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
-"""The tiled MLP dropout predicate must trace under fullgraph=True after the module tree changes.
-
-Eager calls cache the dropout list keyed on a process-wide tree version and track modules in a
-WeakValueDictionary. Refreshing that cache inside a traced region creates weakrefs, which Dynamo
-rejects, so a fullgraph trace failed (and a normal one broke the graph) once any tracked MLP
-gained a child. CPU only.
-"""
+"""Tiled MLP dropout predicate must trace under fullgraph=True after module tree changes; refreshing its
+WeakValueDictionary cache, keyed on a process-wide tree version, creates weakrefs Dynamo rejects in a traced region.
+CPU only."""
 import pytest
 import torch
 

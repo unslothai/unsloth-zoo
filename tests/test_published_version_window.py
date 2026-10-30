@@ -14,24 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The published version window, and every CI lane and gate that mirrors it.
-
-`transformers<=5.5.0` and `torch<2.13.0` were never one line each. The transformers cap
-was two lines here, two more in unsloth's pyproject, and a `CEILING` literal in
-consolidated-tests-ci.yml that fails the build when pyproject moves past it. The torch cap
-was one line plus three workflow `pip install` mirrors. A site left behind after the window
-moves does not go red: the lane runs, passes, and measures a range users no longer get.
-
-The transformers ceiling is the newest release the version matrix was run against. Off
-darwin that is a CUDA question (unsloth #9867 / #10010 / #10017 / #10276, #5355); on
-darwin + arm64 it is also an MLX one, because mlx-vlm 0.6.5 and up require transformers
->= 5.14.0, so the cap decides which mlx-vlm the joint resolution lands on.
-
-So the assertions are that each platform gets one line, that its ceiling is where it is
-supposed to be, that the exclusions survived the rewrite, and that nothing mirroring the
-cap drifted.
-Reads files only: no network, no torch, no transformers install.
-"""
+"""Guards the published window (transformers<=5.5.0, torch<2.13.0) and CI mirrors; consolidated-tests-ci.yml CEILING
+fails when pyproject moves past it; ceiling = newest tested release (CUDA: unsloth issues 9867 / 10010 / 10017 /
+10276, 5355); mlx-vlm 0.6.5+ needs transformers>=5.14.0 on darwin arm64."""
 
 from __future__ import annotations
 
@@ -59,12 +44,9 @@ TESTED_CEILING = Version("5.17.0")
 TESTED_TORCH = Version("2.14.0")
 TORCH_BOUND = "<2.15.0"
 
-# The transformers floor every transformers line must declare. peft declares no transformers floor of
-# its own, and peft 0.18.0 imports `GradientCheckpointingLayer` from
-# `transformers.modeling_layers` at peft/tuners/lora/model.py:26, which first exists in
-# 4.52.0; at 4.51.3 `import unsloth_zoo.saving_utils` raised ModuleNotFoundError after a
-# resolve that satisfied every declared constraint. 4.52.4 and not 4.52.0 because
-# 4.52.0 through 4.52.3 were already rejected by name.
+# Floor for every transformers line, since peft declares none: peft 0.18.0 imports GradientCheckpointingLayer from
+# transformers.modeling_layers (4.52.0+); on 4.51.3 import unsloth_zoo.saving_utils raised ModuleNotFoundError though
+# the resolve passed; 4.52.4 not 4.52.0 as 4.52.0-4.52.3 are REJECTED.
 DECLARED_FLOOR = Version("4.52.4")
 
 # Tested and rejected. A rewrite of the specifier must not drop one.
@@ -73,17 +55,15 @@ REJECTED = (
     "4.55.0", "4.55.1", "4.57.4", "4.57.5", "5.0.0", "5.1.0",
 )
 
-# Lanes that install torch by hand as a copy of the published ceiling. Each has to move
-# when the ceiling does.
+# Lanes that hand-install torch as a copy of the published ceiling; each must move when the ceiling does.
 PUBLISHED_TORCH_MIRRORS = (
     "gemma4-audio-probe.yml",
     "mlx-ci.yml",
     "security-audit.yml",
 )
 
-# Lanes that hold an older torch window deliberately, with the reason. The MLX lanes need
-# the torch / torchvision ABI pair that mlx-cpu was built against, which is a different
-# question from what the package publishes.
+# Lanes that hold an older torch window on purpose: the MLX lanes need the torch / torchvision ABI pair mlx-cpu was
+# built against, a different question from what is published.
 OLDER_TORCH_WINDOW_BY_DESIGN = {
     "consolidated-tests-ci.yml": (
         "the interpreter, repo, MLX and core-drift lanes pin torch>=2.4.0,<2.11.0 for the "
@@ -96,13 +76,9 @@ LINUX_X86 = {"sys_platform": "linux", "platform_machine": "x86_64"}
 
 
 def _requirement_lists() -> dict[str, list[str]]:
-    """{where: [raw requirement, ...]} for the base list and every extra.
-
-    tomllib is 3.11+ and requires-python here is >=3.9, so the import is lazy and older
-    interpreters skip rather than failing to collect, which would red the
-    python-version-collect lane. Same shape as _find_config in
-    tests/test_wheel_top_level_packages.py.
-    """
+    """Returns {where: [raw requirement, ...]} for the base list and every extra; tomllib is 3.11+ but requires-python
+    is >=3.9, so older interpreters skip rather than fail to collect and red the python-version-collect lane. Same
+    shape as _find_config in tests/test_wheel_top_level_packages.py."""
     if sys.version_info < (3, 11):
         pytest.skip("tomllib needs Python 3.11+")
     import tomllib
@@ -138,32 +114,18 @@ def _live(reqs: list[Requirement], environment: dict[str, str]) -> list[Requirem
             if req.marker.evaluate(environment):
                 out.append(req)
         except Exception:
-            # An `extra == ...` clause has no value in a bare environment. The lists here
-            # come straight from pyproject, so nothing carries one; anything that does is
-            # not this test's business.
+            # An extra == marker has no value in a bare environment; these pyproject-sourced lists carry none.
             continue
     return out
 
 
 def _ceiling(spec: SpecifierSet) -> Version:
-    """The version this specifier actually stops at.
-
-    The TIGHTEST upper bound, not the loosest: bounds intersect, so `<=5.17.0,<5.16.0`
-    admits nothing above 5.16.0 and `max` would report 5.17 as the ceiling of a window
-    that excludes the tested release. Ties are broken by exclusivity, since `<5.16.0` is
-    tighter than `<=5.16.0`.
-    """
+    """Returns the tightest upper bound, not the loosest: bounds intersect, so `<=5.17.0,<5.16.0` admits nothing above 5.16.0; ties go to exclusive `<`."""
     return _ceiling_bound(spec)[0]
 
 
 def _ceiling_bound(spec: SpecifierSet) -> tuple[Version, bool]:
-    """The tightest upper bound AND whether it is exclusive.
-
-    `_ceiling` alone cannot answer "is this the exact declared bound", because `<2.15.0`
-    and `<=2.15.0` share a version and admit different release sets: the second lets in a
-    2.15.0 the matrix never ran. Every assertion that compares a bound against a declared
-    one has to compare this pair, not just the version.
-    """
+    """Returns the tightest upper bound and its exclusivity: `<2.15.0` and `<=2.15.0` share a version but admit different releases, so compare both."""
     tops = [(Version(str(s.version)), s.operator == "<") for s in spec if s.operator in ("<=", "<")]
     assert tops, f"no upper bound declared: {spec}"
     return min(tops, key = lambda pair: (pair[0], pair[1]))
@@ -191,9 +153,8 @@ def test_each_platform_caps_transformers_at_the_tested_ceiling() -> None:
     for where, reqs in _transformers_lists().items():
         for platform, environment in (("off darwin", LINUX_X86), ("on darwin + arm64", DARWIN_ARM)):
             spec = _live(reqs, environment)[0].specifier
-            # Admission as well as the ceiling number, because a second upper bound, or an
-            # exclusion naming the tested release, can shut it out while the ceiling still
-            # reads right.
+            # Check admission too, not just the ceiling number: a second upper bound, or an exclusion of the tested
+            # release, can shut it out while the ceiling still reads right.
             assert TESTED_CEILING in spec, (
                 f"{where} declares {spec} {platform}, which does not admit the "
                 f"{TESTED_CEILING} the matrix was run against."
@@ -216,8 +177,7 @@ def test_every_transformers_line_keeps_every_rejected_release_rejected() -> None
 
 
 def test_the_transformers_lines_differ_only_in_their_ceiling() -> None:
-    """If the cap is marker-split again, one line must not quietly grow an exclusion or a
-    floor the other does not have."""
+    """If the cap is marker-split again, the lines may differ only in their ceiling, not by an exclusion or floor only one of them has."""
     for where, reqs in _transformers_lists().items():
         shapes = set()
         for req in reqs:
@@ -244,10 +204,8 @@ def test_the_torch_ceiling_admits_what_the_matrix_ran() -> None:
             f"pyproject.toml bounds torch as {req.specifier}, which excludes the "
             f"{TESTED_TORCH} the matrix was run against."
         )
-        # The EXACT bound, not merely one that admits 2.14.0. Widening <2.15.0 to <2.16.0
-        # still admits the tested release, so an admission-only check would let the package
-        # publish support for a torch 2.15.x nobody ran, with this file still declaring
-        # TORCH_BOUND as <2.15.0.
+        # Compare the exact bound, not just admission: widening <2.15.0 to <2.16.0 still admits the tested 2.14.0, so an
+        # admission-only check would let untested torch 2.15.x ship.
         assert _ceiling_bound(req.specifier) == _ceiling_bound(SpecifierSet(TORCH_BOUND)), (
             f"pyproject.toml bounds torch as {req.specifier}, not the {TORCH_BOUND} this "
             f"file declares. Moving the bound means running the matrix on the newly "
@@ -270,10 +228,8 @@ def _workflow_runs() -> list[tuple[str, str]]:
 
 
 def test_no_workflow_mirror_of_the_torch_bound_drifted() -> None:
-    """Three lanes install torch by hand, before `pip install -e .` can bring it, and each
-    is a copy of the published bound. The remaining lanes hold an OLDER window on purpose
-    and are named, because "it is lower" is otherwise indistinguishable from "it was
-    forgotten", which is the bug this file is about."""
+    """Three lanes install torch by hand before `pip install -e .` and copy the published bound; other lanes hold an
+    older window on purpose and are named, not forgotten."""
     mirrors = {}
     for name, run in _workflow_runs():
         for raw in re.findall(r'"(torch>=[^"]*)"', run):
@@ -296,9 +252,8 @@ def test_no_workflow_mirror_of_the_torch_bound_drifted() -> None:
             f"{name} installs {drifted}, which excludes the {TESTED_TORCH} pyproject now "
             f"admits, so the lane tests a torch users do not get."
         )
-        # A mirror is a copy of the published bound, so it has to stop where the published
-        # bound stops. Admitting 2.14.0 is not the same claim: a lane widened to <2.16.0
-        # would install an untested 2.15.x and still pass the check above.
+        # A mirror copies the published bound, so it must stop where that bound stops; a lane widened to <2.16.0 would
+        # install untested 2.15.x and still pass the check above.
         widened = sorted(
             raw
             for raw in mirrors[name]
@@ -329,9 +284,7 @@ def _gate_constants() -> dict[str, Version]:
 
 
 def test_the_ci_policy_gate_agrees_with_pyproject() -> None:
-    """consolidated-tests-ci.yml fails the build when pyproject declares a higher cap than
-    the gate's literal. That is deliberate, and it means the two have to move together or
-    the MLX job reds on every commit."""
+    """consolidated-tests-ci.yml fails the build when pyproject declares a higher cap than its literal, so both must move together or the MLX job fails every commit."""
     constants = _gate_constants()
     assert set(constants) == {"consolidated-tests-ci.yml"}, (
         f"the inline policy gate is not where this test expects it (found {sorted(constants)}); "
@@ -345,8 +298,7 @@ def test_the_ci_policy_gate_agrees_with_pyproject() -> None:
 
 CONSOLIDATED_CI = WORKFLOWS / "consolidated-tests-ci.yml"
 
-# The stdlib-only resolver inside the core-drift job that turns the
-# `__from_pyproject__` sentinel into a real pip spec.
+# Stdlib-only resolver in the core-drift job that turns the `__from_pyproject__` sentinel into a real pip spec.
 _RESOLVER = re.compile(
     r"resolve\(\)\s*\{\s*\n\s*python - \"\$@\" <<'PY'\n(.*?)\n\s*PY\n",
     re.DOTALL,
@@ -363,15 +315,9 @@ def _sentinel_resolver_source() -> str:
     return textwrap.dedent(match.group(1))
 
 
-# The resolver is stdlib-only but not stdlib-ANY: it imports `tomllib`, which arrived in
-# CPython 3.11. The job that runs it pins 3.12, so the workflow is fine, and
-# `test_the_sentinel_resolver_runs_on_a_python_that_has_tomllib` below is what keeps that
-# true. The tests here run under whatever interpreter pytest was started with, though, and
-# this repository supports 3.10: under it the subprocess died with
-# `ModuleNotFoundError: No module named 'tomllib'` and both tests failed for a reason that
-# had nothing to do with what they assert. Worse, the negative control still entered its
-# `pytest.raises(AssertionError)` and then failed on the message, which is the shape of a
-# test that has quietly stopped testing.
+# Resolver needs tomllib (CPython 3.11+); CI pins 3.12, but these tests run on any pytest interpreter, and on 3.10 the
+# subprocess dies with ModuleNotFoundError: _RESOLVER_NEEDS holds the minimum; a negative control that fails on its
+# message has stopped testing.
 _RESOLVER_NEEDS = (3, 11)
 
 
@@ -407,13 +353,9 @@ requires_tomllib = pytest.mark.skipif(
 
 
 def test_the_sentinel_resolver_runs_on_a_python_that_has_tomllib() -> None:
-    """The job carrying the resolver must pin a python new enough to import `tomllib`.
-
-    Static, so it holds on 3.10 as well, which is where the two tests below cannot run.
-    Without this the skip above would be a hole: someone could drop the job's
-    `python-version` to 3.10 and the only tests that execute the resolver would skip
-    rather than fail.
-    """
+    """The job running the resolver must pin Python new enough for `tomllib`; this static check also holds on 3.10,
+    where the resolver tests cannot run; a 3.10 pin would make the only tests that run the resolver skip rather than
+    fail."""
     source = _sentinel_resolver_source()
     if "tomllib" not in source:
         pytest.skip("the resolver no longer imports tomllib, so there is no floor to hold")
@@ -458,14 +400,7 @@ def _with_second_transformers_line(text: str, marker: str) -> str:
 @requires_tomllib
 @pytest.mark.parametrize("darwin_only_line", [False, True])
 def test_the_ci_sentinel_resolves_to_the_off_darwin_line(tmp_path, darwin_only_line) -> None:
-    """The core-drift lane is Linux, so it has to install the Linux line of the cap.
-
-    If the cap is marker-split again, a resolver that takes whichever line comes first in
-    the file installs the Apple Silicon cap on a Linux runner and the lane silently measures
-    the wrong range, which is the exact failure this whole file exists to prevent. Nothing
-    else in the repo executes this step, so it is executed here, on pyproject as it is and
-    with a darwin-only line added.
-    """
+    """The core-drift lane is Linux, so the resolver must pick the off-darwin cap line even when a darwin-only line comes first; no other test runs this step."""
     text = PYPROJECT.read_text(encoding = "utf-8")
     if darwin_only_line:
         text = _with_second_transformers_line(
@@ -494,11 +429,7 @@ def test_the_ci_sentinel_resolves_to_the_off_darwin_line(tmp_path, darwin_only_l
 
 @requires_tomllib
 def test_the_ci_sentinel_refuses_two_different_off_darwin_specs(tmp_path) -> None:
-    """Negative control, so the test above cannot pass by the resolver doing nothing.
-
-    A second off-darwin transformers line with a DIFFERENT ceiling leaves the lane with two
-    candidates and no rule for choosing, and it has to say so rather than pick one.
-    """
+    """Negative control so the test above cannot pass trivially: two off-darwin transformers lines with different ceilings must be refused, not one picked."""
     widened = _with_second_transformers_line(
         PYPROJECT.read_text(encoding = "utf-8"), "sys_platform != 'darwin'"
     )
@@ -508,8 +439,7 @@ def test_the_ci_sentinel_refuses_two_different_off_darwin_specs(tmp_path) -> Non
 
 
 def test_the_checker_rejects_the_window_that_shipped_the_defect() -> None:
-    """Negative control. Every assertion above is a "nothing found" or "equals" shape, and
-    a checker that has stopped checking reports the same thing."""
+    """Negative control: every assertion above is a nothing-found or equals check, which a checker that has stopped checking would also pass."""
     shipped = SpecifierSet("".join(f"!={v}," for v in REJECTED) + f">={DECLARED_FLOOR},<=5.5.0")
     assert "5.5.0" in shipped
     assert "5.17.0" not in shipped
@@ -518,14 +448,8 @@ def test_the_checker_rejects_the_window_that_shipped_the_defect() -> None:
 
 
 def test_this_file_runs_in_an_executing_ci_step():
-    """A gate nothing executes is not a gate.
-
-    Across `.github/workflows` this file used to be reached only by
-    `pytest tests/ --collect-only`, which proves it imports and nothing else. The
-    assertions above are what stop a cap regression -- the inline gate checks only
-    `general <= CEILING`, so lowering the ceiling passes it while failing here -- and
-    with no executing step that regression merges green.
-    """
+    """Must run in an executing CI step (collect-only proves just imports); the inline gate checks only general <=
+    CEILING, so a lowered ceiling passes it but fails here."""
     import re
     from pathlib import Path
 
@@ -546,13 +470,8 @@ def test_this_file_runs_in_an_executing_ci_step():
 
 
 def test_the_ceiling_helper_reports_the_tightest_upper_bound() -> None:
-    """NEGATIVE CONTROL for `_ceiling`.
-
-    Upper bounds intersect, so the effective ceiling is the tightest one. Taking the
-    loosest reported 5.17 for `<=5.17.0,<5.16.0`, a window that excludes the tested
-    release, and the shape comparison next door strips every upper bound, so nothing else
-    in this file would have caught it.
-    """
+    """Negative control for _ceiling: upper bounds intersect so the tightest wins; reporting 5.17 for <=5.17.0,<5.16.0
+    (which excludes the tested release) is wrong, and nothing else in this file catches it."""
     assert _ceiling(SpecifierSet("<=5.17.0")) == Version("5.17.0")
     assert _ceiling(SpecifierSet(">=4.51.3,<=5.17.0")) == Version("5.17.0")
     assert _ceiling(SpecifierSet("<=5.17.0,<5.16.0")) == Version("5.16.0")
@@ -563,12 +482,8 @@ def test_the_ceiling_helper_reports_the_tightest_upper_bound() -> None:
 
 
 def test_a_widened_torch_bound_is_rejected_even_though_it_admits_the_tested_release() -> None:
-    """NEGATIVE CONTROL for the exact-bound assertions.
-
-    `<2.16.0` still contains the 2.14.0 the matrix ran, so the admission check passes on
-    it. That is the drift this file exists to catch: it would publish support for a torch
-    2.15.x nobody tested while TORCH_BOUND still said <2.15.0.
-    """
+    """Negative control for exact-bound checks: <2.16.0 still admits the tested 2.14.0, so admission alone passes it,
+    yet it would publish untested torch 2.15.x while TORCH_BOUND says <2.15.0."""
     widened = SpecifierSet(">=2.4.0,<2.16.0")
     assert TESTED_TORCH in widened, "the premise: an admission-only check cannot see this"
     assert _ceiling_bound(widened) != _ceiling_bound(SpecifierSet(TORCH_BOUND))
@@ -581,15 +496,8 @@ def test_a_widened_torch_bound_is_rejected_even_though_it_admits_the_tested_rele
 
 
 def test_every_transformers_line_declares_the_floor_that_peft_needs() -> None:
-    """The ceiling is pinned by several assertions above; the floor was pinned by none.
-
-    That asymmetry is not hypothetical. This branch was cut before the floor moved and
-    carried `>=4.51.3` onto a main that had already gone to 4.52.4, so the marker split
-    would have shipped a REGRESSION of the floor while every ceiling assertion stayed
-    green. `test_the_transformers_lines_differ_only_in_their_ceiling` does not catch it
-    either: it only requires the lines to agree with EACH OTHER, and a stale floor is
-    equally stale on all of them.
-    """
+    """Floor needs its own assertion, since no ceiling check covers it: a branch cut before the floor moved carried
+    >=4.51.3 onto a main already at 4.52.4, and lines-agree tests miss it."""
     lists = _transformers_lists()
     assert lists, "no requirement list names transformers"
     wrong = {}
@@ -695,9 +603,8 @@ def test_every_trl_ceiling_is_reachable_under_the_datasets_window() -> None:
 
 
 def test_the_linux_mlx_lane_mirrors_the_published_mlx_lm_pin() -> None:
-    """pyproject's mlx-lm pin is darwin + arm64 only, so the Linux MLX lane repeats it.
-    Without the mirror the lane resolved mlx-lm 0.32.0 (transformers>=5.7.0) once the
-    transformers cap lifted, and tested a stack no Apple Silicon install can reach."""
+    """The Linux MLX lane must repeat pyproject's darwin+arm64-only mlx-lm pin; unmirrored, it resolved mlx-lm 0.32.0
+    (transformers>=5.7.0) after the cap lifted, a stack no Apple Silicon install reaches."""
     published = {
         str(req.specifier)
         for req in _live(_named(_requirement_lists()["dependencies"], "mlx-lm"), DARWIN_ARM)

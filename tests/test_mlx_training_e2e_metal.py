@@ -1,11 +1,6 @@
-"""Real MLX LoRA training smoke on Apple Silicon for the PR 684 trainer rework.
-
-Downloads a tiny 4-bit model (~80MB), runs short FastMLXModel + MLXTrainer
-LoRA fits, and checks losses, gradients-driven progress, and adapter saving.
-Exercises the reworked grad-clip resolution (default leaf-norm path and the
-explicit elementwise path), decoupled weight decay, batching, and both loss
-functions (CCE and baseline).
-"""
+"""Real MLX LoRA training smoke on Apple Silicon for PR 684 with a tiny 4-bit model (~80MB): checks losses,
+gradient-driven progress and adapter saving across grad-clip paths, decoupled weight decay, batching, CCE and
+baseline losses."""
 
 import glob
 import json
@@ -1495,9 +1490,8 @@ def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch
 
         @functools.wraps(fn)
         def wrapper(*fa, **fk):
-            # Arm AFTER the compiled step returns so the next mx.eval is the
-            # unified post-call boundary; a regression moving that eval inside
-            # the fallback try would retry eagerly and fail this test.
+            # Arm after the compiled step returns so the next mx.eval is the unified post-call boundary; moving that
+            # eval into the fallback try would retry eagerly and fail this test.
             result = compiled(*fa, **fk)
             state["step_ran"] = True
             state["armed"] = True
@@ -1516,11 +1510,8 @@ def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch
 
 @metal_only
 def test_lora_plus_ratio_scales_the_lora_b_step(tmp_path):
-    """The LoRA+ ratio must actually scale lora_b's realized step.
-
-    The old gradient pre-scale was an AdamW no-op. lora_b starts at zero, so
-    its final L2 norm is its total movement. Same mechanism as embedding LR.
-    """
+    """The LoRA+ ratio must scale lora_b's realized step: the old gradient pre-scale was an AdamW no-op, and lora_b
+    starts at zero so its final L2 norm is its total movement, same mechanism as embedding LR."""
     import mlx.core as mx
     from mlx.utils import tree_flatten
 
@@ -1544,10 +1535,8 @@ def test_lora_plus_ratio_scales_the_lora_b_step(tmp_path):
 @metal_only
 @pytest.mark.parametrize("nested", [True, False])
 def test_lora_plus_scales_layer_wrapped_lora_b_weight(tmp_path, nested):
-    """mlx-lm may wrap the LoRA halves in nn.Linear children, flattening
-    lora_b to `...lora_b.weight`. The scoped rescale must scale that layout
-    too, both nested (`proj.lora_b.weight`) and root (`lora_b.weight`).
-    """
+    """mlx-lm may wrap LoRA halves in nn.Linear children, so keys read ...lora_b.weight; the scoped rescale must handle
+    nested (proj.lora_b.weight) and root (lora_b.weight) layouts."""
     key = "proj.lora_b.weight" if nested else "lora_b.weight"
 
     def _b_weight_norm(ratio):
@@ -1598,11 +1587,8 @@ def test_lora_plus_scales_layer_wrapped_lora_b_weight(tmp_path, nested):
     )
 
 
-# Warm-starting continued training from a saved adapter: reloading a LoRA/DoRA
-# adapter via FastMLXModel.from_pretrained must freeze the base and leave the
-# adapter parameters trainable, together with any non-adapter tensors the
-# checkpoint itself recorded as trainable. Uses a tiny locally-built Llama so
-# the full_finetuning and DoRA branches stay cheap.
+# Warm-starting from a saved adapter: reloading a LoRA/DoRA adapter via FastMLXModel.from_pretrained must freeze the
+# base and keep adapter parameters trainable, plus any non-adapter tensors the checkpoint recorded as trainable.
 
 
 def _trainable_names(model):
@@ -1618,8 +1604,7 @@ def _tiny_base(path):
     """Write a tiny unquantized HF Llama + tokenizer to ``path``."""
     import torch
     from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
-    # vocab_size matches hf-internal-testing/llama-tokenizer so token ids stay
-    # in range (Metal indexing is unchecked).
+    # vocab_size matches hf-internal-testing/llama-tokenizer so token ids stay in range; Metal indexing is unchecked.
     cfg = LlamaConfig(
         hidden_size=64, intermediate_size=128, num_hidden_layers=2,
         num_attention_heads=4, num_key_value_heads=2, vocab_size=32000,
@@ -1690,8 +1675,7 @@ def test_warm_start_trains_only_adapter(tmp_path):
     model, tok = FastMLXModel.from_pretrained(
         str(adapter), load_in_4bit=False, max_seq_length=64,
     )
-    # A base weight must stay untouched while an adapter tensor must change
-    # (else a no-op run would pass).
+    # A base weight must stay untouched while an adapter tensor must change, else a no-op training run would pass.
     probe_key = "model.layers.0.mlp.down_proj.weight"
     lora_key = next(n for n in _trainable_names(model) if n.endswith("lora_b"))
     params_before = dict(tree_flatten(model.parameters()))
@@ -1727,9 +1711,7 @@ def test_dora_reload_keeps_magnitude_trainable(tmp_path):
                     if type(m).__name__.startswith("DoRA")]
     assert len(dora_modules) > 0
     assert len([n for n in trainable if n.endswith(".m")]) == len(dora_modules)
-    # Exactly the adapter tensors, so no base weight leaks in. (A base parameter
-    # literally named "m" does not exist on this fixture, so that pathological
-    # case is left to follow-up.)
+    # Exactly the adapter tensors, so no base weight leaks in; no base parameter named `m` exists in this fixture, so that case is left to follow-up.
     assert trainable == _adapter_keys(model)
 
 
@@ -1755,9 +1737,7 @@ def test_resume_from_adapter_dir_names_warm_start(tmp_path, prefetch):
     model, tok = FastMLXModel.from_pretrained(
         str(adapter), load_in_4bit=False, max_seq_length=64,
     )
-    # Single-process streaming prefetch reads resume state early, before the
-    # main resume block; that read must not pre-empt the completeness check
-    # with a raw FileNotFoundError for trainer_state.json.
+    # Single-process prefetch reads resume state early; that read must not raise a raw FileNotFoundError for trainer_state.json before the completeness check.
     extra = (
         dict(streaming=True, streaming_prefetch_batches=2) if prefetch else {}
     )
@@ -1770,8 +1750,7 @@ def test_resume_from_adapter_dir_names_warm_start(tmp_path, prefetch):
         model=model, tokenizer=tok,
         train_dataset=[{"text": f"row {i}"} for i in range(6)], args=cfg,
     )
-    # No optimizer_state.safetensors, so resume must fail and name warm-start
-    # rather than silently restarting.
+    # With no optimizer_state.safetensors, resume must fail and name the from_pretrained warm-start rather than silently restarting.
     with pytest.raises(RuntimeError, match="from_pretrained"):
         trainer.train(resume_from_checkpoint=str(adapter))
 
@@ -1885,8 +1864,8 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
         for want, got in zip(expected[0], actual[0]):
             atol = 1e-4
             if dtype == "float32" and want.ndim:
-                # rewards/margins subtracts rewards/rejected from rewards/chosen, so it keeps a few
-                # float32 ulps of those sums, which the kernel and the logits round differently.
+                # rewards/margins subtracts rewards/rejected from rewards/chosen, so it keeps a few float32 ulps of
+                # those sums, which kernel and logits round differently.
                 atol += 4 * mx.finfo(mx.float32).eps * mx.abs(want[:2]).max().item()
             assert mx.allclose(want, got, atol=atol, rtol=1e-5).item()
         # A bfloat16 run accumulates chunks in a different order; the softcap derivative amplifies that.
@@ -2235,13 +2214,9 @@ def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
     from unsloth_zoo.mlx.trainer import MLXTrainer
     from unsloth_zoo.mlx.cce import runtime_cce
 
-    # The 256-row capacity is admitted only when it shares vocabulary chunks with
-    # the half capacity, and that limit is derived from _get_memory_budget(), which
-    # is 0.1% of the device's recommended working set. On a 128 GB machine the limit
-    # is 16384 and the assertion below holds; on an 8 GB M1, the hosted Apple Silicon
-    # runner, the budget is 6 MB, the limit is 768, the 1024-row capacity no longer
-    # fits under it and the assertion reads [1024, 1024] == [256, 256]. Pin the budget
-    # so this tests the admission rule rather than how much memory the runner has.
+    # The 256-row capacity is admitted only when it shares vocab chunks with the half capacity; the limit derives from
+    # _get_memory_budget() (0.1% of the recommended working set); pin _CHUNK_BUDGET so runner memory cannot change the
+    # result.
     monkeypatch.setattr(runtime_cce, "_CHUNK_BUDGET", 128 * 1024 * 1024)
 
     mx.random.seed(412)
@@ -2294,8 +2269,7 @@ def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
 
     expected, dense_rows = totals(dense_fn)
     actual, compact_rows = totals(loss_fn)
-    # The plan admits half the tokens, or 256 once a quantized head raises the
-    # small-capacity limit; either way evaluation must stop projecting all of them.
+    # The plan admits half the tokens, or 256 once a quantized head raises the small-capacity limit; either way evaluation must not project all of them.
     assert dense_rows == [2048] * 2
     assert compact_rows == [256 if quantized else 1024] * 2
     assert len(steps) == 4 and actual[1].item() == expected[1].item()
@@ -2304,11 +2278,9 @@ def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
 
 @metal_only
 def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
-    """Real-runtime contract for planned VLM training: with a qualified
-    compile decision the trainer surveys, installs a width plan, and runs
-    the compiled path over planned widths only; losses and token counts
-    match the unplanned eager run exactly (padded tails are inert), and
-    every compiled input width is an admitted endpoint."""
+    """Real-runtime contract for planned VLM training: with a qualified compile decision it installs a width plan and
+    runs only planned widths, with losses and token counts matching the unplanned eager run exactly (padded tails are
+    inert); every compiled width is an admitted endpoint."""
     import os as _os
     import sys as _sys
     import types
@@ -2322,8 +2294,7 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     from test_mlx_batching_and_decay import _WidthOnlyProcessor as _Proc
 
     class TinyVLM(nn.Module):
-        # Keep the genuine train()/state members: the compiled step threads
-        # model.state, so overriding it would leak traced parameters out.
+        # Keep the genuine train()/state members: the compiled step threads model.state, so overriding it would leak traced parameters out.
         def __init__(self):
             super().__init__()
             self.embed = nn.Embedding(260, 8)
@@ -2461,11 +2432,8 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
 
 @metal_only
 def test_preference_generate_during_eval_samples_through_the_real_engine(tmp_path):
-    """A referenced DPO run samples held-out prompts and keeps training.
-
-    Only a real model reaches the backend's capability probe and streaming
-    detokenizer, so this is the one place the wiring runs unmocked.
-    """
+    """A referenced DPO run samples held-out prompts and keeps training; only a real model reaches the backend
+    capability probe and streaming detokenizer, so the wiring runs unmocked."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
 
@@ -2520,13 +2488,8 @@ def test_preference_generate_during_eval_samples_through_the_real_engine(tmp_pat
 
 @metal_only
 def test_neftune_noise_is_gated_out_of_the_preference_eval_forward(tmp_path):
-    """Evaluation must score the model, not a noised copy of it.
-
-    The gate is the embedding's own training flag, which only a real
-    mlx.nn.Module tree propagates, so nothing short of a real run tells a
-    working gate from an absent one -- and a broken one moves an eval number
-    without failing anything.
-    """
+    """Evaluation must score the model, not a noised copy of it: the gate is the embedding's training flag, which only a
+    real mlx.nn.Module tree propagates, so a broken gate moves eval silently."""
     import mlx.core as mx
     from unsloth_zoo.mlx.trainer import MLXORPOConfig, MLXORPOTrainer
 
@@ -2557,8 +2520,7 @@ def test_neftune_noise_is_gated_out_of_the_preference_eval_forward(tmp_path):
         embed = trainer._neftune_emb
         assert embed is not None, "NEFTune never attached to the embedding"
         noisy, base = type(embed), trainer._neftune_base_cls
-        # Eager, before any transform traces the forward: without this the run
-        # below cannot tell a working gate from an embedding that never noises.
+        # Probe eagerly, before any transform traces the forward; without it the run cannot tell a working gate from an embedding that never noises.
         probe, was_training = mx.array([[1, 2, 3]]), embed.training
         embed.train(True)
         noised.append(
@@ -2597,9 +2559,8 @@ def test_neftune_noise_is_gated_out_of_the_preference_eval_forward(tmp_path):
 
 @metal_only
 def test_every_text_loss_accepts_a_wrapped_model_output():
-    """Text-only VLM loads take the text losses, but mlx-vlm wrappers return a
-    LanguageModelOutput where mlx_lm models return the array. Every loss that
-    feeds a model call to cross-entropy has to accept both."""
+    """Text-only VLM loads take the text losses, but mlx-vlm wraps outputs in LanguageModelOutput where mlx_lm returns
+    the array; every loss feeding cross-entropy must accept both."""
     import mlx.core as mx
 
     from unsloth_zoo.mlx.preference import (
@@ -2626,8 +2587,7 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
     orpo = make_orpo_loss_fn(resolve_preference_objective("orpo", beta=0.1))
     dpo = make_dpo_loss_fn(resolve_preference_objective(
         "dpo", beta=0.1, reference_free=True))
-    # Chosen and rejected rows differ, so an unwrap that reordered the batch
-    # axis would reverse the preference signal instead of comparing equal.
+    # Chosen and rejected rows differ, so an unwrap that reordered the batch axis would reverse the preference signal instead of comparing equal.
     rejected_ids = mx.array([[1, 5, 6, 7]], dtype=mx.int32)
     pair = mx.concatenate([ids, rejected_ids], axis=0)
     pair_lengths = mx.concatenate([lengths, lengths], axis=0)
@@ -2651,8 +2611,7 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
         from_wrapped = call(models[1])[0]
         assert mx.allclose(from_bare, from_wrapped), name
 
-    # The comparisons above only pin the two forms to each other. This pins the
-    # supervised one to a value computed outside the loss.
+    # The comparisons above only pin the two forms to each other; this pins the supervised one to a value computed outside the loss.
     expected = nn.losses.cross_entropy(logits, ids[:, 1:]).mean()
     assert mx.allclose(baseline(wrapped, ids, lengths)[0], expected)
 
@@ -2683,14 +2642,8 @@ def test_cce_loss_precomputes_the_hidden_gradient_only_in_training(monkeypatch):
 @metal_only
 @pytest.mark.parametrize("softcap", (0.0, 20.0), ids=("no-softcap", "softcap"))
 def test_post_head_multiplier_reaches_the_fused_cce_loss(softcap):
-    """A model whose forward scales logits after the head must have that scale
-    reproduced by fused CCE, which rebuilds the logits itself.
-
-    Guards the silent failure mode: without the multiply, CCE softcaps logits
-    that are far too large, so the loss stays plausible while the gradients it
-    produces come from a saturated tanh. The softcap case is the composition
-    that failure needs, so it is exercised too.
-    """
+    """A post-head logit scale must be reproduced by fused CCE, which rebuilds logits itself; without it CCE softcaps
+    oversized logits, so the loss looks plausible but gradients saturate tanh; the softcap case is tested too."""
     from unsloth_zoo.mlx.utils import _get_text_model, make_cce_loss_fn
 
     model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
@@ -2931,32 +2884,17 @@ print(json.dumps({"unshared": peak(unshared), "shared": peak(shared)}))
 
 @metal_only
 def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
-    """Borrowed K/V's cotangent is consumed by the source layer's backward; left
-    to run by that consumer, each borrowing layer keeps its T x T attention
-    cotangents alive until then.
-
-    The peaks are measured in a fresh interpreter. In this process, after the tests
-    before it, Metal's `get_peak_memory() - get_active_memory()` reads low for whole
-    stretches of a run: on repeated full-file runs the unshared peak read exactly
-    182285696 (pinned) or 183564288 (latest) when right, and 116 MB, 151 MB, 2284
-    bytes or negative when not, sometimes on every one of five repeats. Every flake
-    this test has had was such a low unshared reading (runs 35502075009, 36311394738,
-    36377153200). `mx.synchronize()` and `gc.collect()` do not remove them. No reading
-    was ever above the exact value, so each side is taken as the maximum of its
-    repeats, and a reading below the gradients that repeat produced is not kept.
-    """
+    """Borrowed K/V cotangents are consumed by the source layer's backward; left to that consumer, each borrower keeps T
+    x T attention cotangents alive; peaks use a fresh interpreter as Metal's peak-minus-active reads low after other
+    tests, so each side takes the max of repeats."""
     import subprocess
     import sys
     from mlx_vlm.models.gemma4.config import TextConfig
     from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
 
-    # Four interpreters, always: a fresh one can still read low on all five repeats (one
-    # run read unshared 160329148 throughout), low stretches do not cross processes, and
-    # two were not enough (run 39234730657 read unshared at most 150494752 across both,
-    # about 18% under exact). Readings only ever err low, so a ceiling over more
-    # interpreters sits closer to the exact value on BOTH sides. The count is fixed rather
-    # than "until the bound holds", which would give an under-read shared peak repeated
-    # chances to hide a real regression.
+    # Always four interpreters: readings only err low and low stretches do not cross processes, so the max over more
+    # sits nearer exact; two were not enough (about 18% under exact); a fixed count, not repeat-until-bound, avoids
+    # giving an under-read peak chances to hide a real regression.
     readings = {"shared": [], "unshared": []}
     per_run = []
     for _ in range(4):
@@ -3025,9 +2963,7 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
 
     original_call = Gemma3Model.__call__
     _fix_gemma4_kv_sharing(SimpleNamespace(language_model=SimpleNamespace(model=backbone)))
-    # Seven early returns in the shim leave the class unpatched, and an unpatched
-    # class takes the plain checkpoint branch, which is the state this test exists
-    # to reject. Without this the test would pass having proved nothing.
+    # Seven early returns in the shim leave the class unpatched, taking the plain checkpoint branch; without this assert the test would pass vacuously.
     assert "_kv_sharing_patched" in Gemma3Model.__dict__, "the shim did not install"
     try:
         reference = loss_and_grad(backbone)[1]
@@ -3038,10 +2974,9 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
             mlx_utils._unpatch_layer_class_gc(Gemma3nDecoderLayer)
     finally:
         Gemma3Model.__call__ = original_call
-        # Delete only a flag this test set. `del` on an absent attribute raises
-        # from the finally and buries the real failure behind an AttributeError,
-        # and `hasattr` would consume a flag inherited from an earlier patch,
-        # disarming the shim's own idempotence guard for whatever runs next.
+        # Delete only a flag this test set: del on an absent attribute raises AttributeError from the finally and buries
+        # the real failure; hasattr would consume a flag inherited from an earlier patch, disarming the idempotence
+        # guard for later runs.
         if "_kv_sharing_patched" in Gemma3Model.__dict__:
             del Gemma3Model._kv_sharing_patched
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):

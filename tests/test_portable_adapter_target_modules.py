@@ -184,9 +184,7 @@ def test_dropped_names_stop_pefts_v5_moe_conversion_doubling_the_rank():
     # Unsloth's import_fixes wraps it to skip explicit targets; plain PEFT runs the original.
     while hasattr(convert, "__wrapped__"):
         convert = convert.__wrapped__
-    # PEFT 0.19 takes the model_type string; later releases take the model and read its config.
-    # Handing 0.19 the model looks the module up as a model type, finds nothing and converts
-    # nothing, so the doubling below never shows and the test reads a missing call as a fix.
+    # PEFT 0.19 takes a model_type string, so handing it the model converts nothing and reads as a fix.
     takes_model_type = list(inspect.signature(convert).parameters)[1:2] == ["model_type"]
 
     def converted(target_modules):

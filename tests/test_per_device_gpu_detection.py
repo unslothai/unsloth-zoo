@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Device gates must read every visible GPU (or the current one), never device 0 alone.
-
-CPU-only: torch.cuda is spoofed per test. Covers bf16 for GC offload buffers, the
-pre-Turing compile switch, tiled-MLP free memory, the per-device AMD arch / aiter
-caches (set_device switch), the rocminfo mask fallback and the llama.cpp asset target.
-"""
+"""Device gates must read every visible GPU or the current one, never device 0 alone; CPU-only with torch.cuda spoofed,
+covering GC bf16 buffers, pre-Turing compile, tiled-MLP memory, AMD caches, rocminfo masks and llama.cpp assets."""
 import ast
 import importlib.machinery
 import inspect
@@ -175,8 +171,7 @@ def test_compile_switch_homogeneous_unchanged(cuda_caps):
 
 
 def test_lm_head_fusion_records_every_old_card(cuda_caps):
-    # sm89 current beside an sm61 card: the rewrite installs, and the sm61 index is recorded
-    # so a forward whose LM head lands there skips Inductor and CCE.
+    # sm89 current beside an sm61 card: the rewrite installs and the sm61 index is recorded, so a forward whose LM head lands there skips Inductor and CCE.
     assert _old_cuda_arch_version([(8, 9), (6, 1)], 0, cuda_caps) is False
     assert _old_cuda_arch_indices([(8, 9), (6, 1)], 0, cuda_caps) == frozenset({1})
     assert _old_cuda_arch_indices([(8, 9)], 0, cuda_caps) == frozenset()
@@ -235,8 +230,8 @@ def test_the_fused_lm_head_templates_consult_the_head_device():
 
 
 def _adapter_dispatch(monkeypatch, device, unshard_to = None, **kwargs):
-    """torch_compile the shared adapter hands the CE kernel for an LM head on `device`. unshard_to:
-    the device FSDP2's unshard gathers the weight onto (CPUOffloadPolicy keeps the shard on CPU)."""
+    """The torch_compile value the shared adapter hands the CE kernel for an LM head on device; unshard_to is the device
+    FSDP2 unshards the weight onto, since CPUOffloadPolicy keeps the shard on CPU."""
     from unsloth_zoo.fused_losses import forward_adapter as adapter
     from unsloth_zoo.fused_losses import cross_entropy_loss as ce
     seen = []
@@ -259,9 +254,8 @@ def _adapter_dispatch(monkeypatch, device, unshard_to = None, **kwargs):
 
 
 def test_the_shared_adapter_skips_inductor_for_a_head_on_an_old_card(monkeypatch):
-    # AST-rewritten forwards (GPT-Neo, CLVP, ...) and the import hook call the adapter, not the
-    # regex templates: it must ask the same per-head question, or a head a device_map put on a
-    # Pascal card beside the current A100 still asks Inductor for the chunked CE.
+    # AST-rewritten forwards (GPT-Neo, CLVP) and the import hook call the adapter, not the regex templates, so it must
+    # ask the per-head question; a device_map head on a Pascal card would still ask Inductor for chunked CE.
     import unsloth_zoo.compiler as compiler
     monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset({1}))
     assert _adapter_dispatch(monkeypatch, torch.device("cuda", 1)) is False
@@ -275,8 +269,8 @@ def test_the_shared_adapter_skips_inductor_for_a_head_on_an_old_card(monkeypatch
 
 
 def test_the_shared_adapter_checks_the_head_after_fsdp_unshards_it(monkeypatch):
-    # FSDP2 CPUOffloadPolicy: the sharded head weight sits on CPU until unshard gathers it onto the
-    # compute card, so the device question must be asked of the unsharded weight.
+    # With FSDP2 CPUOffloadPolicy the sharded head weight sits on CPU until unshard gathers it onto the compute card, so
+    # the device must be asked of the unsharded weight.
     import unsloth_zoo.compiler as compiler
     monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset({1}))
     cpu = torch.device("cpu")
@@ -285,9 +279,8 @@ def test_the_shared_adapter_checks_the_head_after_fsdp_unshards_it(monkeypatch):
 
 
 def test_ast_rewritten_lm_head_forwards_go_through_the_guarded_adapter():
-    # The route the regex templates cannot take: real HF forwards whose fused call is spliced
-    # by the AST rewriter. It must call the adapter (which holds the per-head gate) and not pass
-    # a torch_compile of its own that would bypass it.
+    # Real HF forwards whose fused call the AST rewriter splices must call the adapter, which holds the per-head gate,
+    # not pass their own torch_compile that bypasses it.
     import importlib
     import textwrap
     import unsloth_zoo.compiler as compiler
@@ -409,8 +402,7 @@ def test_aiter_choice_follows_set_device(amd_host):
 
 
 def test_single_hip_device_runs_aiter_discovery_once(monkeypatch):
-    # One HIP device keeps the plain cache: the no-argument setup gate and the flash-attn lookup
-    # must share one get_amd_attention_implementation entry.
+    # One HIP device keeps the plain cache: the no-argument setup gate and the flash-attn lookup must share one get_amd_attention_implementation entry.
     monkeypatch.setattr(device_type, "is_hip", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)

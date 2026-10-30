@@ -6,28 +6,8 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""The shared-memory gate in `temporary_patches.flex_attention_bwd`.
-
-The patch appends smaller backward configs when the ones Inductor picked cannot fit
-in shared memory. Everything here turns on the estimate that decides WHETHER it
-fires, and the failure mode is one-sided: an over-estimate offers a few candidates
-the autotuner discards, while an under-estimate means the gate stays shut, the
-offending config is handed back untouched, and the compile dies with "No valid
-triton configs".
-
-It stayed shut on exactly the GPUs this patch was written for. The original formula
-scales with num_stages, and it was fitted on an sm8x part whose head_dim >= 128
-entry uses num_stages=2. sm10x, sm11x and sm12x all use num_stages=1 there, which
-halves the estimate: on GB10, head_dim 256 bf16 block 64 was scored 75,776 against a
-102,400 limit and passed, while Triton reported `Required: 114688 Hardware limit:
-101376` and refused it.
-
-Measured, by forcing single configs on GB10 (sm_121, torch 2.14, Triton 3.8) and
-reading Triton's own "Required:": block 64 -> 114,688, block 128 -> 229,376, and
-IDENTICAL for num_stages 1 and 2.
-
-GPU-free: the arithmetic is exercised directly.
-"""
+"""Shared-memory gate in temporary_patches.flex_attention_bwd: its estimate scales with num_stages (fitted on sm8x), so
+sm10x-sm12x at num_stages=1 undercounted, letting GB10 head_dim 256 bf16 block 64 through; tests are GPU-free."""
 
 from __future__ import annotations
 
@@ -49,24 +29,15 @@ def _dtypes():
 
 
 def _staged(block, stages, head_dim, dtype):
-    """The formula this module shipped with, dtype rule included.
-
-    Its rule answers 4 for anything that is not bf16 or fp16, which is four times a
-    float8's real width. Reproduced faithfully rather than corrected, because this is
-    the floor the estimate must not drop below, not a model of the hardware.
-    """
+    """The formula the module shipped with, including its dtype rule: any dtype other than bf16 or fp16 counts as 4
+    bytes, four times a float8. Kept as the floor the estimate must not drop below."""
     size = 2 if dtype in (torch.bfloat16, torch.float16) else 4
     return stages * block * head_dim * size * 2 + flex._SHMEM_OVERHEAD
 
 
 class TestTheEstimateIsNeverLowerThanItWas:
-    """Whatever else changes, no GPU may stop being covered.
-
-    The float8 rows are the ones that caught a real slip: correcting the element width
-    to its true 1 byte dropped the estimate for an fp8 kernel to well under what the
-    shipped formula produced, which would have closed the gate on a case it opens today.
-    Each term now keeps its own dtype rule so the maximum is a floor for every dtype.
-    """
+    """The estimate must never drop below the shipped formula: correcting float8 to 1 byte lowered it and would have
+    closed the gate on a case that opens today, so each term keeps its own dtype rule."""
 
     @pytest.mark.parametrize("block", [16, 32, 64, 128])
     @pytest.mark.parametrize("stages", [1, 2, 3])
@@ -134,11 +105,8 @@ class TestTheLimitIsTheOneTritonEnforces:
 
 
 class TestTheFallbackLadder:
-    """The estimate decides whether to intervene; it does not also decide what survives.
-
-    Inductor catches OutOfResources per candidate and keeps the ones that compile, so
-    offering a config that does not fit costs one discarded candidate.
-    """
+    """The estimate only decides whether to intervene, not what survives: Inductor catches OutOfResources per candidate,
+    so an unfit config costs one discarded candidate."""
 
     class FakeConfig:
         def __init__(self, bm1, bn1, bm2, bn2, num_stages, num_warps):

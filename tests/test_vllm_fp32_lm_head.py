@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_VLLM_FP32_LM_HEAD=1 runs the output head in fp32 on both sides of GRPO.
-
-Trainer: chunked_hidden_states_selective_log_softmax must produce fp32 logits even
-under the bf16 autocast the GRPO loss runs it in, and be unchanged when off.
-vLLM: load_vllm passes hf_overrides head_dtype=float32, only where vLLM honours it
-(LogitsProcessor._apply_head, vLLM >= 0.26.0), and refuses otherwise.
-load_vllm needs a GPU, so the vLLM side is checked on the helpers and the AST.
-"""
+"""UNSLOTH_VLLM_FP32_LM_HEAD=1 runs the output head in fp32 on both GRPO sides: trainer logits stay fp32 under bf16
+autocast and unchanged when off; load_vllm passes hf_overrides head_dtype=float32 only where vLLM honours it
+(LogitsProcessor._apply_head, vLLM >= 0.26.0) and refuses otherwise."""
 
 import ast
 import os
@@ -175,7 +170,7 @@ def test_load_vllm_merges_override_before_arg_filter():
 
 def _fake_vllm_layers(monkeypatch, accepts_linear_method):
     # Mirrors the head_dtype guard of LogitsProcessor._apply_head: vLLM 0.26.0 - 0.28.x accept only
-    # UnquantizedEmbeddingMethod, 0.29.0 also accepts UnquantizedLinearMethod.
+    # UnquantizedEmbeddingMethod; 0.29.0 also accepts UnquantizedLinearMethod.
     class UnquantizedLinearMethod:
         pass
 
@@ -285,8 +280,8 @@ def test_excluded_quant_patch_not_reached_when_off(monkeypatch):
 
 
 def test_return_args_callers_get_no_fp32_head_override():
-    # SyntheticDataKit turns load_vllm(return_args = True) into `vllm serve` flags with str();
-    # vLLM json-parses --hf-overrides, so a dict from this flag would make the server exit.
+    # SyntheticDataKit turns load_vllm(return_args = True) into vllm serve flags with str(); vLLM json-parses
+    # --hf-overrides, so a dict from this flag would make the server exit.
     load_vllm = next(
         n for n in ast.walk(_vllm_utils_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm"
     )

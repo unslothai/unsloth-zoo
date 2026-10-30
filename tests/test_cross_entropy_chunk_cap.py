@@ -1,11 +1,5 @@
-"""Fused cross entropy chunk sizing must stay active on large-memory GPUs.
-
-On a GPU with a very large free pool, half of that pool used to become the
-per-chunk target, which rounds the chunk count down to a single chunk. That
-materializes the full logits and their float32 upcast at once, so at long
-sequence lengths the transient dominates peak memory. The target is capped so
-chunking keeps working regardless of how much memory is free.
-"""
+"""Fused cross entropy chunk sizing stays active on big-memory GPUs: the per-chunk target is capped, since a very large
+free pool would round the chunk count to one, materializing full logits and their float32 upcast."""
 import importlib
 import types
 
@@ -14,14 +8,7 @@ import pytest
 
 @pytest.fixture(autouse = True)
 def _allow_cpu_import(monkeypatch):
-    """Let `_load_module` import on CPU-only CI, where device detection otherwise raises.
-
-    A fixture rather than the module-scope `os.environ.setdefault` this used to be. That
-    ran at COLLECTION, and pytest imports every selected module before running anything, so
-    the flag was not scoped to this file: it stayed on for every test the xdist worker took
-    afterwards. test_allow_cpu_import_driverless.py is about what the import does WITHOUT
-    it, and was deciding that question against a flag this file turned on.
-    """
+    """Sets UNSLOTH_ALLOW_CPU per test via monkeypatch so _load_module imports on CPU-only CI, rather than leaking into later tests on the same xdist worker."""
     monkeypatch.setenv("UNSLOTH_ALLOW_CPU", "1")
 
 
@@ -38,9 +25,8 @@ def _modules():
 
 def _load_module(monkeypatch, free_bytes):
     ce, tiled = _modules()
-    # `_free_target_gb` calls `tiled_mlp._default_target_gb`, so the backend is mocked THERE.
-    # One implementation of "how much memory may this chunk use" is the point; a copy in the
-    # CE module that measured something else would be the bug this fixes, one module over.
+    # _free_target_gb calls tiled_mlp._default_target_gb, so the backend is mocked there; one shared budget
+    # implementation avoids a CE copy that measures something else.
     monkeypatch.setattr(tiled, "DEVICE_TYPE", "cuda", raising=False)
     fake_cuda = types.SimpleNamespace(
         is_available=lambda: True,
@@ -63,8 +49,7 @@ def test_chunk_count_stays_above_one_on_huge_gpu(monkeypatch):
 
 
 def test_cap_effective_in_4_to_8_gib_band(monkeypatch):
-    # 4-8 GiB of float32 logits used to round down to one uncapped chunk
-    # (round(0.5) * 4 == 0 -> max(.., 1) == 1); 65536 x 32768 is exactly 8 GiB.
+    # Guards the 4-8 GiB float32 logits band, where round(0.5) * 4 == 0 rounded down to one uncapped chunk; 65536 x 32768 is exactly 8 GiB.
     huge_free = 180 * 1024 ** 3
     ce = _load_module(monkeypatch, huge_free)
     vocab_size = 65_536
@@ -127,12 +112,8 @@ def test_cap_bounds_target_independent_of_free(monkeypatch):
 
 
 def _no_device_pool(monkeypatch, device_type, host_gb = 64.0):
-    """No device pool to ask, as on CPU, MLX or a torch built without CUDA.
-
-    Only `mem_get_info` and `is_available` are replaced, not the whole `torch.cuda` namespace:
-    `torch.manual_seed` reaches `torch.cuda._is_in_bad_fork`, so a stand-in namespace breaks
-    seeding rather than the thing under test.
-    """
+    """Fakes a device with no memory pool (CPU, MLX, torch built without CUDA) by replacing only mem_get_info and
+    is_available; a stand-in torch.cuda namespace breaks manual_seed, which reaches torch.cuda._is_in_bad_fork."""
     ce, tiled = _modules()
     monkeypatch.setattr(tiled, "DEVICE_TYPE", device_type, raising = False)
 
@@ -156,12 +137,8 @@ def _no_device_pool(monkeypatch, device_type, host_gb = 64.0):
 
 @pytest.mark.parametrize("device_type", ["cpu", "mlx", "cuda"])
 def test_a_machine_with_no_gpu_still_gets_a_chunk_size(monkeypatch, device_type):
-    """`mem_get_info` does not return a number on a torch built without CUDA, it raises.
-
-    Reached through the ordinary forward, so a CPU or Apple Silicon run died inside a memory
-    query rather than on anything it was computing. "cuda" is in the list because a device
-    type naming a GPU on a torch that has none is the same situation.
-    """
+    """mem_get_info raises on a torch built without CUDA, so a CPU or Apple Silicon forward must not die in a memory
+    query; a cuda device type with no GPU counts too."""
     ce = _no_device_pool(monkeypatch, device_type)
     assert ce._free_target_gb() == ce._CE_TARGET_GB_CAP
     assert ce.get_chunk_size(1, 8, 32_000) >= 1
@@ -180,12 +157,7 @@ def test_the_no_gpu_budget_matches_what_a_large_gpu_lands_on(monkeypatch):
 def test_a_small_host_budgets_smaller_chunks_rather_than_assuming_the_cap(
     monkeypatch, device_type
 ):
-    """The activations live in host RAM here, so a machine with little of it must chunk finer.
-
-    Returning the GPU-oriented cap unconditionally lets a chunk's transient approach 4 GiB on
-    a box that does not have it, on top of the model already resident, which is an OOM kill
-    where smaller chunks would have fit.
-    """
+    """Activations live in host RAM on CPU, so a small host must chunk finer; the unconditional 4 GiB GPU cap could OOM where smaller chunks fit."""
     ce = _no_device_pool(monkeypatch, device_type, host_gb = 2.0)
     assert ce._free_target_gb() == pytest.approx(1.0)  # half of 2 GiB available
     small_host = ce.get_chunk_size(1, 8_192, 256_000)
@@ -209,12 +181,7 @@ def test_a_gpu_that_answers_is_still_measured_not_capped_blindly(monkeypatch):
 
 
 def test_the_fused_loss_runs_on_cpu_and_matches_plain_cross_entropy(monkeypatch):
-    """End to end past the memory query, because a number is not the point: the loss is.
-
-    The kernel is ordinary torch, so it computes on CPU once nothing asks a GPU how much
-    memory it has. Checked against `F.cross_entropy` over the same shift, so a fallback that
-    let it run but produced a different loss would fail here rather than pass quietly.
-    """
+    """Runs the fused loss on CPU past the memory query and checks it against F.cross_entropy over the same shift, so a fallback giving a different loss fails here."""
     torch = pytest.importorskip("torch")
     ce = _no_device_pool(monkeypatch, "cpu")
 

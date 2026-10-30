@@ -38,8 +38,7 @@ def test_target_gb_cuda_uses_free_memory():
 
 
 def test_target_gb_xpu_uses_free_memory_not_constant():
-    # Regression: on a small XPU the budget must track free memory, not a fixed
-    # 4 GB that could exceed what is left and OOM the tiler.
+    # Regression: on a small XPU the budget must track free memory, not a fixed 4 GB that could exceed what is left and OOM the tiler.
     fake_cuda = mock.MagicMock()
     fake_cuda.is_available.return_value = False
     fake_xpu = mock.MagicMock()
@@ -52,9 +51,8 @@ def test_target_gb_xpu_uses_free_memory_not_constant():
 
 
 def test_target_gb_xpu_unsupported_uses_bounded_default_not_host():
-    # Some Intel GPUs (Arc B580, Lunar Lake) raise on mem_get_info; must not crash,
-    # and must NOT size from host RAM (activations live on the XPU, not the host,
-    # so a big-RAM/small-VRAM box would still OOM). Use a bounded GPU-safe default.
+    # Some Intel GPUs (Arc B580, Lunar Lake) raise on mem_get_info: must not crash or size from host RAM (activations
+    # live on the XPU, so a big-RAM/small-VRAM box would still OOM); use a bounded GPU-safe default.
     fake_cuda = mock.MagicMock()
     fake_cuda.is_available.return_value = False
     fake_xpu = mock.MagicMock()
