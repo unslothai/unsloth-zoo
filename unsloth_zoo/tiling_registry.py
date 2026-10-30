@@ -59,8 +59,6 @@ __all__ = [
     "tiled_modules",
     "lookup",
     "register",
-    "get_engine",
-    "set_engine",
     "needs_rng_state",
 ]
 
@@ -409,10 +407,8 @@ def reference_tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_c
     return _assemble(outs, output_contract)
 
 
-_ENGINE_MODULES = {
-    "checkpoint": "unsloth_zoo.sequence_tiling",
-    "op": "unsloth_zoo.sequence_tiling_op",
-}
+# Internal engine selector. "checkpoint" (per-tile non-reentrant checkpoint) is the only shipped engine;
+# "reference" is the plain-loop oracle the tests compare against.
 _ENGINE = [None, None]  # (name, callable)
 
 
@@ -420,16 +416,10 @@ def _resolve_engine(name):
     name = (name or "auto").strip().lower()
     if name == "reference":
         return reference_tiled_call
-    if name in _ENGINE_MODULES:
-        return getattr(importlib.import_module(_ENGINE_MODULES[name]), "tiled_call")
-    if name != "auto":
-        raise ValueError(f"Unsloth: {_ENV_ENGINE} must be auto, checkpoint, op or reference, got {name!r}")
-    for module_name in _ENGINE_MODULES.values():
-        try:
-            return getattr(importlib.import_module(module_name), "tiled_call")
-        except (ImportError, AttributeError):
-            continue
-    return reference_tiled_call
+    if name in ("auto", "checkpoint"):
+        from unsloth_zoo.sequence_tiling import tiled_call
+        return tiled_call
+    raise ValueError(f"Unsloth: {_ENV_ENGINE} must be auto, checkpoint or reference, got {name!r}")
 
 
 def get_engine():
@@ -440,7 +430,7 @@ def get_engine():
 
 
 def set_engine(engine):
-    """Name (auto / checkpoint / op / reference), a `tiled_call` callable, or None to re-read the environment."""
+    """Name (auto / checkpoint / reference), a `tiled_call` callable, or None to re-read the environment."""
     if engine is None:
         _ENGINE[0] = _ENGINE[1] = None
     elif callable(engine):

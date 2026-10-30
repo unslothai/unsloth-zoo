@@ -528,8 +528,18 @@ def test_engine_selector(monkeypatch):
     with pytest.raises(ValueError):
         R.get_engine()
     R.set_engine(None)
-    monkeypatch.setenv("UNSLOTH_TILED_ENGINE", "auto")
-    assert callable(R.get_engine())
+    monkeypatch.setenv("UNSLOTH_TILED_ENGINE", "op")
+    with pytest.raises(ValueError):
+        R.get_engine()
+    from unsloth_zoo.sequence_tiling import tiled_call
+    for name in ("auto", "checkpoint"):
+        R.set_engine(None)
+        monkeypatch.setenv("UNSLOTH_TILED_ENGINE", name)
+        assert R.get_engine() is tiled_call
+    R.set_engine(None)
+    monkeypatch.delenv("UNSLOTH_TILED_ENGINE")
+    assert R.get_engine() is tiled_call
+    R.set_engine(None)
 
 
 @needs_registry
