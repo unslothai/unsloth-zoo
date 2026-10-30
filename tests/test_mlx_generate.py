@@ -1613,6 +1613,40 @@ def test_a_vision_row_hands_its_own_cache_back_as_it_leaves(monkeypatch):
     assert handed == [[1, "own"], [0, "own"]] and not session._retiring
 
 
+def test_a_batch_s_last_leaving_row_is_handed_views_of_its_own_buffers(monkeypatch):
+    import numpy as np
+    from unsloth_zoo.mlx.generate import _row_cache
+
+    module = types.ModuleType("fake_mlx_vlm_cache")
+
+    class KVCache:
+        def __init__(self):
+            self.keys = self.values = None
+            self.offset = 0
+
+        def extract(self, index): raise AssertionError("extract copies")
+
+    class BatchKVCache(KVCache):
+        pass
+
+    for cls in (KVCache, BatchKVCache):
+        cls.__module__ = module.__name__
+        setattr(module, cls.__name__, cls)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    buffer = np.arange(2 * 12 * 3).reshape(1, 2, 12, 3)
+    batch = BatchKVCache()
+    batch.keys = batch.values = buffer
+    batch.left_padding, batch._idx = np.array([2]), 9
+    (view,) = _row_cache([batch], 0)
+    assert type(view) is KVCache and view.offset == 7
+    assert np.shares_memory(view.keys, buffer) and (view.keys == buffer[:, :, 2:9]).all()
+    # With rows staying behind, a view would pin the whole batch buffer after filter reallocates theirs.
+    batch.keys = batch.values = np.concatenate([buffer, buffer])
+    batch.left_padding = np.array([2, 0])
+    with pytest.raises(AssertionError, match="extract copies"):
+        _row_cache([batch], 0)
+
+
 def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     """A key only some rows carry cannot be merged into a batch-wide keyword."""
     session = _vlm_session()

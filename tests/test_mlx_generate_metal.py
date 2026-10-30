@@ -470,6 +470,31 @@ def test_vlm_stream_rows_hand_their_own_cache_back_as_they_leave():
                                              for a, b in ((got.keys, kept.keys), (got.values, kept.values)))
 
 
+@real_mlx_only
+def test_a_batch_s_last_leaving_row_hands_its_cache_back_without_a_copy():
+    import gc
+    from mlx_vlm.models.cache import BatchKVCache
+    from unsloth_zoo.mlx.generate import _row_cache
+
+    def copied(rows):
+        cache = BatchKVCache([0] * rows)
+        keys = mx.random.normal((rows, 8, 8192, 64)).astype(mx.float16)
+        cache.update_and_fetch(keys, keys + 1)
+        for _ in range(3):  # decoded past the prompt, so a row's slice is strided
+            cache.update_and_fetch(keys[:, :, :1], keys[:, :, :1])
+        mx.eval(cache.keys, cache.values, cache.offset, cache.left_padding)
+        del keys
+        gc.collect()
+        mx.clear_cache()
+        start = mx.get_active_memory()
+        (taken,) = _row_cache([cache], rows - 1)
+        mx.eval(taken.keys, taken.values)
+        assert mx.array_equal(taken.values, cache.values[rows - 1 : rows, :, : cache._idx]).item()
+        return round((mx.get_active_memory() - start) / (2 * 8 * cache._idx * 64 * 2), 2)
+
+    assert copied(1) == 0 and copied(2) == 1
+
+
 @metal_only
 def test_vlm_stream_rows_resume_from_their_own_quantized_cache_bitwise(monkeypatch):
     from mlx_vlm import load

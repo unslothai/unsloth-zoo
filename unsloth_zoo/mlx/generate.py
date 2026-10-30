@@ -2567,9 +2567,37 @@ def _row_prefill_batch_class(base):
     return RowPrefillBatch
 
 
+def _row_view(entry, index: int):
+    """The last row of an in-order cache as a view of its buffers, which leave with it; else None (``extract`` copies)."""
+    module, name = sys.modules[type(entry).__module__], type(entry).__name__
+    if name == "CacheList":
+        caches = [_row_view(cache, index) for cache in entry.caches]
+        return None if any(cache is None for cache in caches) else module.CacheList(*caches)
+    if getattr(entry, "keys", None) is None or entry.keys.shape[0] != 1:
+        return None
+    if name == "KVCache":
+        view, start, end = module.KVCache(), 0, entry.offset
+    elif name == "BatchKVCache":
+        view, start, end = module.KVCache(), int(entry.left_padding[index].item()), entry._idx
+    elif name == "BatchRotatingKVCache" and not entry.rotated:
+        view, start, end = module.RotatingKVCache(entry.max_size), max(0, int(entry.left_padding[index].item())), entry._idx
+    else:
+        return None
+    view.keys, view.values = (array[index : index + 1, :, start:end] for array in (entry.keys, entry.values))
+    if name == "BatchRotatingKVCache":
+        view.offset, view._idx = int(entry.offset[index].item()), end - start
+    else:
+        view.offset = end - start
+    return view
+
+
 def _row_cache(entries: list, index: int) -> list:
     """Row ``index``'s own entries. A lone row's may be its own unmerged ones, not all with ``extract``."""
-    return [entry.extract(index) if hasattr(entry, "extract") else entry for entry in entries]
+    rows = []
+    for entry in entries:
+        view = _row_view(entry, index)
+        rows.append(view if view is not None else entry.extract(index) if hasattr(entry, "extract") else entry)
+    return rows
 
 
 @functools.lru_cache(maxsize=None)
