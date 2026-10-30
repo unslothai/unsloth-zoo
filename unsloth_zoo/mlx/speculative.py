@@ -980,7 +980,6 @@ class SpeculativeEngine:
         self.cache: list | None = None
         self.draft_cache: list | None = None
         self.round_refusal: str | None = None
-        # uid -> retire(take), called as that row leaves with take() returning its own cache.
         self.retiring: dict = {}
 
     @property
@@ -1350,8 +1349,7 @@ def install_speculative_seam() -> None:
 
 
 def _copies_chunk_alike(upstream: Callable) -> Callable:
-    # mlx-vlm prefills a drafted prompt whole on a target naming no chunking policy, for the hidden states its
-    # drafter reads; copies read none, so they chunk as an undrafted prefill would.
+    # Copies read no hidden states, so they chunk like an undrafted prefill (mlx-vlm prefills drafted prompts whole).
     def _chunked_prefill_enabled(model, *, draft_model = None, draft_kind = None, **kwargs):
         if isinstance(draft_model, SpeculativeDraft) and draft_model.drafter is None:
             draft_model = draft_kind = None
