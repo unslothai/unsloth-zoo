@@ -974,7 +974,20 @@ pass
 
 
 @torch._disable_dynamo
+def _pristine_for_compiled_checkpoint(use_reentrant, kwargs):
+    # torch.compile's checkpoint HOP (tag_activation_checkpoint_impl) re-enters torch.utils.checkpoint.checkpoint while
+    # AOT autograd traces it, with use_reentrant = False and a context_fn; the shims must hand that to torch's own.
+    context_fn = kwargs.get("context_fn")
+    if use_reentrant is False and context_fn is not None and context_fn is not torch.utils.checkpoint.noop_context_fn:
+        return getattr(torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None)
+    return None
+pass
+
+
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
+    pristine = _pristine_for_compiled_checkpoint(use_reentrant, kwargs)
+    if pristine is not None:
+        return pristine(function, *args, use_reentrant = False, **kwargs)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
     return Unsloth_Gradient_Checkpointer.apply(function, *args, *tensor_args)
 pass
@@ -2217,6 +2230,14 @@ def unsloth_checkpoint(
     Returns:
         Output of running :attr:`function` on :attr:`*args`.
     """
+    pristine = _pristine_for_compiled_checkpoint(
+        use_reentrant, dict(kwargs, context_fn = context_fn),
+    )
+    if pristine is not None:
+        return pristine(
+            function, *args, use_reentrant = False, context_fn = context_fn,
+            determinism_check = determinism_check, debug = debug, **kwargs
+        )
     # Force use_reentrant=True so UnslothCheckpointFunction (smart CPU offloading)
     # is always used. This is safe because unsloth_checkpoint is only active when
     # smart GC is patched; when unpatched, the original torch checkpoint is restored.
@@ -2438,6 +2459,9 @@ pass
 @torch._disable_dynamo
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     global CPU_BUFFERS
+    pristine = _pristine_for_compiled_checkpoint(use_reentrant, kwargs)
+    if pristine is not None:
+        return pristine(function, *args, use_reentrant = False, **kwargs)
     # Not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS
     # to None, which is the state this shim normally starts from, and len(None) raises.
     if not CPU_BUFFERS:
