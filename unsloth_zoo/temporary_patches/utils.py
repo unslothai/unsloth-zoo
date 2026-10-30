@@ -753,6 +753,10 @@ _REENTRANT_FRAMES = ("forward", "backward")
 # checkpoint_sequential opens no region of its own and runs its LAST segment outside every checkpoint, so the catch-all below must skip it.
 _SEQUENTIAL_FRAME = "checkpoint_sequential"
 
+# torch 2.15 moved `checkpoint`'s body into `_checkpoint_impl`, also entered via `_CheckpointedFunction.__call__`.
+_ENTRY_FRAMES = ("checkpoint", "_checkpoint_impl")
+_PASS_THROUGH_FRAMES = (_SEQUENTIAL_FRAME, "__call__")
+
 
 def _frame_local(frame, name):
     """One local off a live frame, `_UNKNOWN` when it is not there."""
@@ -797,13 +801,13 @@ def _walk_for_checkpoint_frame():
     while frame is not None:
         if frame.f_code.co_filename == origin:
             name = frame.f_code.co_name
-            if name == _SEQUENTIAL_FRAME:
+            if name in _PASS_THROUGH_FRAMES:
                 pass                            # keep scanning outward
             elif name in _REENTRANT_FRAMES:
                 # checkpoint_sequential's per-segment closure is also named forward here, so only the ctx local tells it from the autograd Function frames.
                 if _frame_local(frame, "ctx") is not _UNKNOWN:
                     reentrant += 1
-            elif name == "checkpoint":
+            elif name in _ENTRY_FRAMES:
                 use_reentrant = _frame_local(frame, "use_reentrant")
                 if use_reentrant is False: return True
                 if reentrant: reentrant -= 1
@@ -1245,7 +1249,9 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
             if isinstance(current, int) and not isinstance(current, bool):
                 try:
                     setattr(_config, name, current + extra)
-                except Exception:
+                except Exception as error:
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.warning(f"Unsloth: Could not raise torch._dynamo.config.{name}: {error!r}")
                     continue
                 # Stack per written value: a scoped patch can repeat a baseline, and one entry merged two debts.
                 _BUMPED_RECOMPILE_LIMITS.setdefault(name, {}).setdefault(
@@ -1308,7 +1314,9 @@ def _restore_recompile_limits():
                 original = baselines[original][-1]
             setattr(_config, name, original)
             restored += 1
-        except Exception:
+        except Exception as error:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: Could not restore torch._dynamo.config.{name}: {error!r}")
             continue
         # Pop only the branch just unwound; clearing the map would erase branches a live config.patch hides.
         for value in chain:

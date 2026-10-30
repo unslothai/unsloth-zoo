@@ -21,6 +21,7 @@ __all__ = [
     "UNSLOTH_COMPILE_DISABLE",
     "UNSLOTH_COMPILE_DISABLE_PARTIAL",
     "get_torch_compile_options",
+    "combo_kernels_supported",
     "is_transformers_v5_moe_quantization_available",
     "logger",
     "torch_compile",
@@ -73,6 +74,89 @@ def _disable_torch_2_9_0_cpp_symbolic_shape_guards():
         return False
 pass
 _disable_torch_2_9_0_cpp_symbolic_shape_guards()
+
+
+def _torch_major_minor():
+    import re
+    found = re.match(r"(\d+)\.(\d+)", torch.__version__)
+    return (int(found.group(1)), int(found.group(2))) if found else (0, 0)
+pass
+
+
+def _mix_order_reduction_is_buggy():
+    """Mix-order reduction (2.10-2.14, fixed in 2.15) writes wrong trainable-norm gradients.
+    UNSLOTH_MIX_ORDER_REDUCTION=1 keeps it on."""
+    if os.environ.get("UNSLOTH_MIX_ORDER_REDUCTION", "0") == "1": return False
+    try:
+        import torch._inductor.config as inductor_config
+    except Exception:
+        return False
+    if not hasattr(getattr(inductor_config, "triton", None), "mix_order_reduction"): return False
+    return (2, 10) <= _torch_major_minor() < (2, 15)
+pass
+
+
+def _rand4x_is_buggy():
+    """2.13 / 2.14 tl.rand4x dropout gives a different mask under no_grad, so a reentrant checkpoint
+    recompute mismatches its forward. 2.15 adds config.use_rand4x (off); TORCHINDUCTOR_USE_RAND4X=1 keeps it."""
+    if os.environ.get("TORCHINDUCTOR_USE_RAND4X", "0") == "1": return False
+    try:
+        import torch._inductor.config as inductor_config
+        from torch._inductor.codegen.triton import TritonOverrides
+    except Exception:
+        return False
+    return hasattr(TritonOverrides, "_can_use_4x_random") and not hasattr(inductor_config, "use_rand4x")
+pass
+
+
+def _never_use_4x_random():
+    return False
+_never_use_4x_random._unsloth_rand4x_off = True
+
+
+def combo_kernels_supported():
+    """Off before torch 2.10 (incompatible gradient sizes on 2.6). UNSLOTH_COMBO_KERNELS=0 / 1 forces."""
+    forced = os.environ.get("UNSLOTH_COMBO_KERNELS", "")
+    if forced in ("0", "1"): return forced == "1"
+    return _torch_major_minor() >= (2, 10)
+pass
+
+
+INDUCTOR_CORRECTNESS_CACHE_TAG = "unsloth/inductor-rand4x-off"
+def apply_inductor_correctness_workarounds():
+    """Returns the names of the active workarounds."""
+    active = []
+    if _mix_order_reduction_is_buggy():
+        try:
+            import torch._inductor.config as inductor_config
+            inductor_config.triton.mix_order_reduction = False
+            active.append("mix_order_reduction")
+        except Exception as error:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: Could not disable Inductor mix-order reduction: {error}")
+    if _rand4x_is_buggy():
+        try:
+            from torch._inductor.codegen.triton import TritonOverrides
+            if not getattr(TritonOverrides._can_use_4x_random, "_unsloth_rand4x_off", False):
+                TritonOverrides._can_use_4x_random = staticmethod(_never_use_4x_random)
+            # The FX graph cache key does not see this patch, so tag it.
+            try:
+                import torch.compiler.config as config
+            except Exception:
+                config = None
+            if config is not None and hasattr(config, "cache_key_tag"):
+                tags = [t for t in config.cache_key_tag.split(",") if t]
+                if INDUCTOR_CORRECTNESS_CACHE_TAG not in tags:
+                    config.cache_key_tag = ",".join(tags + [INDUCTOR_CORRECTNESS_CACHE_TAG])
+            active.append("rand4x")
+        except Exception as error:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: Could not disable Inductor rand4x dropout: {error}")
+    if active and UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: torch {torch.__version__} Inductor correctness workarounds: {', '.join(active)}")
+    return active
+pass
+apply_inductor_correctness_workarounds()
 
 def _persistent_tma_matmul_ok():
     # torch 2.12+ guards every GEMM size when Inductor considers TMA templates (pytorch/pytorch issue 172925), so a
@@ -211,11 +295,19 @@ def get_torch_compile_options(
         "benchmark_combo_kernel"              : True,
         "combo_kernel_foreach_dynamic_shapes" : True,
     }
+    # Options outrank the global config, so carry the 2.10-2.14 correctness workaround here too.
+    if _mix_order_reduction_is_buggy():
+        torch_compile_options["triton.mix_order_reduction"] = False
     final_torch_compile_options = {}
+    dropped = []
     for key, value in torch_compile_options.items():
         splits = key.split(".")
         if all(k in inductor_config_source for k in splits):
             final_torch_compile_options[key] = value
+        else:
+            dropped.append(key)
+    if dropped and UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: torch {torch.__version__} has no Inductor option(s) {dropped}; skipped.")
     return final_torch_compile_options
 pass
 torch_compile_options = get_torch_compile_options(

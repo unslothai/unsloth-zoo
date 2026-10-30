@@ -198,7 +198,7 @@ def _grow_host_buffer(buffer, new_size):
 # torch's CachingHostAllocator rounds each pinned block up to a power of two and keeps
 # freed blocks page-locked in per-size free lists until empty_host_cache (aten/src/ATen/
 # core/CachingHostAllocator.h: PowerOf2Ceil in allocate, free_list_ in free, torch 2.6
-# through 2.14; 2.13+ settings turn both off above a size, see _host_alloc_policy). So
+# through 2.15; 2.13+ settings turn both off above a size, see _host_alloc_policy). So
 # GC_PINNED_BYTES charges rounded blocks; a release moves one into _PINNED_CACHED, and it drops
 # only when torch.cuda.host_memory_stats() shows the allocator holding less.
 # A single local rank has no other ranks to leave RAM for, and a refused pin still stores the

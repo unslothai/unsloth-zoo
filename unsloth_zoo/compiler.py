@@ -75,7 +75,7 @@ from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
-from unsloth_zoo.temporary_patches.common import get_torch_compile_options
+from unsloth_zoo.temporary_patches.common import get_torch_compile_options, combo_kernels_supported
 from .hf_utils import get_transformers_model_type
 
 try:
@@ -6437,7 +6437,7 @@ def unsloth_compile_transformers(
         cudagraphs=cudagraphs,
         coordinate_descent_tuning=UNSLOTH_COMPILE_MAXIMUM,
         logging=UNSLOTH_ENABLE_LOGGING,
-        combo_kernels=False,  # Causes incompatible gradient sizes on 2.6
+        combo_kernels=combo_kernels_supported(),  # Off before torch 2.10: incompatible gradient sizes on 2.6
         group_fusion=True,
         memory_planning=True,
         multi_kernel=False,  # Sometimes fails
