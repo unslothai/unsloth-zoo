@@ -21,6 +21,7 @@ __all__ = [
     "UNSLOTH_COMPILE_DISABLE",
     "UNSLOTH_COMPILE_DISABLE_PARTIAL",
     "get_torch_compile_options",
+    "combo_kernels_supported",
     "is_transformers_v5_moe_quantization_available",
     "logger",
     "torch_compile",
@@ -120,6 +121,16 @@ pass
 def _never_use_4x_random():
     return False
 _never_use_4x_random._unsloth_rand4x_off = True
+
+
+def combo_kernels_supported():
+    """Inductor combo kernels (independent kernels fused horizontally into one launch) gave
+    incompatible gradient sizes on torch 2.6, so they stay off before 2.10. UNSLOTH_COMBO_KERNELS=0 / 1
+    forces them off / on."""
+    forced = os.environ.get("UNSLOTH_COMBO_KERNELS", "")
+    if forced in ("0", "1"): return forced == "1"
+    return _torch_major_minor() >= (2, 10)
+pass
 
 
 INDUCTOR_CORRECTNESS_CACHE_TAG = "unsloth/inductor-rand4x-off"
