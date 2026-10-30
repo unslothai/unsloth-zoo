@@ -316,3 +316,22 @@ def test_cuda_bitwise_against_bitsandbytes(nested, dtype, monkeypatch):
         ref = lin(x)
         monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
         assert torch.equal(lin(x), ref)
+
+
+def test_rows_over_cap_decline_before_the_plan_is_revalidated(lib, monkeypatch):
+    layer, qs = _layer()
+    with torch.no_grad():
+        Z._bnb_4bit_direct(layer, torch.randn(1, 1, 128).to(torch.bfloat16), qs)
+    assert lib.calls
+    seen = []
+    meta = Z._bnb_direct_meta
+    monkeypatch.setattr(Z, "_bnb_direct_meta", lambda q: seen.append("meta") or meta(q))
+    monkeypatch.setattr(Z, "_bnb_direct_plan", lambda *a: seen.append("plan"))
+    monkeypatch.setattr(Z, "_ptrs_equal", lambda *a: seen.append("ptrs"))
+    monkeypatch.setattr(bops, "_gemm_4bit_custom_max_m", 4)
+    with torch.no_grad():
+        assert Z._bnb_4bit_direct(layer, torch.randn(2, 3, 128).to(torch.bfloat16), qs) is None
+    assert seen == []
+    with torch.no_grad():
+        Z._bnb_4bit_direct(layer, torch.randn(1, 4, 128).to(torch.bfloat16), qs)
+    assert "meta" in seen
