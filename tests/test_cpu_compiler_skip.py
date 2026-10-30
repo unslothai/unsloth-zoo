@@ -37,24 +37,79 @@ def test_missing_compiler(returncode, output, missing):
     assert probe.missing_compiler(returncode, output) is missing
 
 
+_CHILD_MISSING = "torch._inductor.exc.InductorError: RuntimeError: Compiler: cl is not found."
+
+
+def _child(returncode, stderr):
+    return subprocess.CompletedProcess(["child"], returncode, "", stderr)
+
+
+def _stub_probe(monkeypatch, returncode, output):
+    monkeypatch.setattr(probe, "_probes", {})
+    calls = []
+
+    def run(*a, **k):
+        calls.append(a)
+        return subprocess.CompletedProcess(a, returncode, output, "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
 @pytest.mark.parametrize("returncode, output, skips", [
     (1, "InductorError: RuntimeError: Compiler: C:/\u00fcbersetzer/cl.exe is not found.", True),
     (1, "RuntimeError: out of memory", False),
     (0, "", False),
 ])
 def test_only_a_probe_that_finds_no_compiler_skips(monkeypatch, returncode, output, skips):
-    monkeypatch.setattr(probe, "_probes", {})
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, returncode, output, ""))
+    _stub_probe(monkeypatch, returncode, output)
     if skips:
         with pytest.raises(Skipped, match = r"no C\+\+ compiler here \(InductorError"):
-            probe.skip_if_cpu_inductor_missing(dict(os.environ))
+            probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), dict(os.environ), ("cpu",))
     else:
-        assert probe.skip_if_cpu_inductor_missing(dict(os.environ)) is None
+        assert probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), dict(os.environ), ("cpu",)) is None
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason = "Inductor uses cl on Windows, whatever CXX says")
-def test_a_missing_compiler_is_found_by_a_real_probe(monkeypatch):
-    monkeypatch.setattr(probe, "_probes", {})
-    env = dict(os.environ, CXX = os.path.join(os.sep, "nonexistent", "g++"))
+def test_an_unrelated_child_failure_fails_on_a_host_without_a_compiler(monkeypatch):
+    # The probe would confirm a missing compiler, but the child failed for another reason: no skip.
+    calls = _stub_probe(monkeypatch, 1, _CHILD_MISSING)
+    child = _child(1, "Traceback (most recent call last):\nAssertionError: tokens differ")
+    assert probe.skip_if_cpu_inductor_missing(child, dict(os.environ), ("cpu",)) is None
+    assert calls == []
+
+
+def test_a_cuda_child_never_skips(monkeypatch):
+    calls = _stub_probe(monkeypatch, 1, _CHILD_MISSING)
+    assert probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), dict(os.environ), ("cuda",)) is None
+    assert calls == []
+
+
+def test_a_passing_child_never_probes(monkeypatch):
+    calls = _stub_probe(monkeypatch, 1, _CHILD_MISSING)
+    assert probe.skip_if_cpu_inductor_missing(_child(0, _CHILD_MISSING), dict(os.environ), ("cpu",)) is None
+    assert calls == []
+
+
+def test_the_probe_reads_its_whole_output(monkeypatch):
+    # A long shutdown tail after the compiler error must not push it out of what is classified.
+    _stub_probe(monkeypatch, 1, _CHILD_MISSING + "\n" + "W1030 shutdown noise\n" * 2000)
     with pytest.raises(Skipped, match = r"no C\+\+ compiler here"):
-        probe.skip_if_cpu_inductor_missing(env)
+        probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), dict(os.environ), ("cpu",))
+
+
+@pytest.mark.parametrize("name", ["TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE", "TORCHDYNAMO_SUPPRESS_ERRORS"])
+def test_the_probe_cache_tells_compile_switches_apart(monkeypatch, name):
+    calls = _stub_probe(monkeypatch, 0, "")
+    env = {k: v for k, v in os.environ.items() if k != name}
+    probe._probe(env)
+    probe._probe(dict(env, **{name: "1"}))
+    assert len(calls) == 2
+
+
+def test_a_missing_compiler_is_found_by_a_real_probe(monkeypatch):
+    # Windows torch reads CXX as well (get_cpp_compiler: os.environ.get("CXX", "cl")), so this runs everywhere.
+    monkeypatch.setattr(probe, "_probes", {})
+    env = {k: v for k, v in os.environ.items() if k.upper() not in probe._KEY_VARS[3:]}
+    env["CXX"] = os.path.join(os.sep, "nonexistent", "g++")
+    with pytest.raises(Skipped, match = r"no C\+\+ compiler here"):
+        probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), env, ("cpu",))
