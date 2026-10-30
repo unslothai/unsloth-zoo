@@ -578,8 +578,17 @@ def fake(G, monkeypatch):
     return _fake_offloader_class(G)
 
 
-def test_small_tensors_stay_on_device_by_default(G, fake, monkeypatch):
+def test_size_floor_is_off_by_default(G, fake, monkeypatch):
     monkeypatch.delenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", raising = False)
+    offloader = fake(stream_mode = False)
+    assert offloader.min_bytes == 0
+    record = offloader.pack(torch.randn(1000, requires_grad = True))  # 4 KB still offloaded
+    assert type(record) is not tuple and record.host is not None
+    assert offloader.stats["kept_small"] == 0 and offloader.stats["offloaded"] == 1
+
+
+def test_small_tensors_stay_on_device_with_a_floor(G, fake, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", str(1 << 20))
     offloader = fake(stream_mode = False)
     assert offloader.min_bytes == 1 << 20
     small = torch.randn(1000, requires_grad = True)                  # 4 KB
@@ -602,7 +611,7 @@ def test_min_bytes_env_override(G, fake, monkeypatch):
     assert type(offloader.pack(torch.randn(1024, requires_grad = True))) is not tuple  # 4096 bytes: offloaded
     assert type(offloader.pack(torch.randn(1023, requires_grad = True))) is tuple
     monkeypatch.setenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", "not a number")
-    assert fake(stream_mode = False).min_bytes == 1 << 20
+    assert fake(stream_mode = False).min_bytes == 0
 
 
 @pytest.mark.parametrize("kind", ["transposed", "expanded", "strided_slice", "prefix_view", "offset_view"])

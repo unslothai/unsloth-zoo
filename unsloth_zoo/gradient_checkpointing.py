@@ -1919,7 +1919,8 @@ def _is_compiling():
 pass
 
 
-GC_OFFLOAD_MIN_BYTES = 1 << 20
+# Off by default: no measured win yet, and it would keep short-sequence activations on the device.
+GC_OFFLOAD_MIN_BYTES = 0
 _ALL_OFFLOADERS = weakref.WeakSet()
 
 
@@ -2006,7 +2007,7 @@ class NonReentrantActivationOffloader:
     whose backward comes first, and reloads layer i-1 on a second side stream while layer i
     recomputes. Costs up to one more layer's checkpoint inputs of VRAM each way.
 
-    Saved tensors under UNSLOTH_GC_OFFLOAD_MIN_BYTES (default 1 MiB), non-contiguous ones and views
+    Saved tensors under UNSLOTH_GC_OFFLOAD_MIN_BYTES (default 0, off), non-contiguous ones and views
     that do not own their whole storage stay on the device.
     Records carry their forward's identity: prefetch and keep-last decisions stay inside the
     graph a record belongs to, however forwards and backwards interleave. Give each model its
@@ -2030,7 +2031,7 @@ class NonReentrantActivationOffloader:
         except ValueError:
             self.max_inflight = default_inflight
         # Saved tensors under this many bytes stay on the device: their copy is latency bound and they are not
-        # what makes the activation footprint. UNSLOTH_GC_OFFLOAD_MIN_BYTES=0 offloads everything.
+        # what makes the activation footprint. Default 0 offloads every size.
         self.min_bytes = _env_nonnegative_int("UNSLOTH_GC_OFFLOAD_MIN_BYTES", GC_OFFLOAD_MIN_BYTES)
         self.inflight = {}
         self.d2h_streams = {}

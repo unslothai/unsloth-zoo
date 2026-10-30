@@ -25,8 +25,6 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)
-    # These cases use sub-MiB activations; the size floor is covered in test_gc_offload_lifecycle.py.
-    monkeypatch.setenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", "0")
     return gc_module
 
 
