@@ -1484,6 +1484,8 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
         # Fixed rows: the chunked kernels give a target of -1 zero loss and zero dz; the flash path reads its
         # target's weight row, so it gets 0 and its outputs are masked below.
         keep, hidden, flash_targets = _fixed_inputs(idx, hidden, targets)
+        if not targets.dtype.is_signed:
+            targets = targets.long()  # -1 in uint8 is 255, a real class once V > 255
         targets = torch.where(keep, targets, torch.full_like(targets, -1))
         idx, n_keep = torch.arange(N, device = targets.device), N
         CALLS["fixed_rows"] = CALLS.get("fixed_rows", 0) + 1

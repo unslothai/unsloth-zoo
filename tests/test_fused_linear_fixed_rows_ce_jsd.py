@@ -329,3 +329,34 @@ def test_jsd_fixed_rows_overflowing_dropped_dz(beta, all_dropped, monkeypatch):
         assert not x.float().isnan().any()
         torch.testing.assert_close(x, r, rtol = 1e-3, atol = 1e-3)
     assert (got[1][~mask] == 0).all()
+
+
+def _ce_uint8_case(fixed, monkeypatch, device):
+    """uint8 labels with ignore_index 255 and V > 255. The CUDA kernels read any integer target; the CPU torch path
+    needs int64 for gather, so on CPU the row op is given its targets widened (what the Triton kernel sees)."""
+    if device == "cpu":
+        row_forward = fl._row_forward
+        monkeypatch.setattr(fl, "_row_forward", lambda d, x, dz, t, *a, **k: row_forward(d, x, dz, t.long(), *a, **k))
+    monkeypatch.setattr(fl, "_FIXED_ROWS", fixed)
+    g = torch.Generator().manual_seed(0)
+    h = torch.randn(4, 16, generator = g).to(device).requires_grad_()
+    w = (torch.randn(300, 16, generator = g) / 4).to(device)
+    b = torch.zeros(300, device = device, requires_grad = True)
+    t = torch.tensor([255, 3, 255, 7], dtype = torch.uint8, device = device)
+    loss = fl.fused_linear_cross_entropy(h, w, b, t, divisor = 1, ignore_index = 255)
+    loss.backward()
+    ref_h = h.detach().double().requires_grad_()
+    ref_b = b.detach().double().requires_grad_()
+    ref = F.cross_entropy(ref_h @ w.double().t() + ref_b, t.long(), ignore_index = 255, reduction = "sum")
+    ref.backward()
+    return loss, b.grad, h.grad, ref, ref_b.grad, ref_h.grad
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("fixed", [False, True])
+def test_ce_fixed_rows_uint8_ignored_labels_match_reference(fixed, device, monkeypatch):
+    # The dropped-row sentinel -1 must stay negative: in uint8 it is 255, a real class when V > 255.
+    loss, gb, gh, ref, ref_b, ref_h = _ce_uint8_case(fixed, monkeypatch, device)
+    torch.testing.assert_close(loss.double().cpu(), ref.detach().cpu(), atol = 1e-4, rtol = 1e-4)
+    torch.testing.assert_close(gb.double().cpu(), ref_b.cpu(), atol = 1e-4, rtol = 1e-4)
+    torch.testing.assert_close(gh.double().cpu(), ref_h.cpu(), atol = 1e-4, rtol = 1e-4)
