@@ -22,7 +22,11 @@ bookkeeping on CPU (host copies are clones, streams and events are inert); the "
 GPU with real side streams and runs only where a GPU exists.
 """
 import contextlib
+import copy
 import gc
+import pickle
+import threading
+import time
 import weakref
 
 import pytest
@@ -593,7 +597,8 @@ def test_small_tensors_stay_on_device_with_a_floor(G, fake, monkeypatch):
     assert offloader.min_bytes == 1 << 20
     small = torch.randn(1000, requires_grad = True)                  # 4 KB
     packed = offloader.pack(small)
-    assert type(packed) is tuple and packed[1] is small
+    assert type(packed) is tuple and packed[0] is None and torch.equal(packed[1], small.detach())
+    assert packed[1].grad_fn is None and not packed[1].requires_grad
     big = torch.randn(1 << 18, requires_grad = True)                 # exactly 1 MiB
     record = offloader.pack(big)
     assert type(record) is not tuple and record.host is not None
@@ -614,26 +619,62 @@ def test_min_bytes_env_override(G, fake, monkeypatch):
     assert fake(stream_mode = False).min_bytes == 0
 
 
-@pytest.mark.parametrize("kind", ["transposed", "expanded", "strided_slice", "prefix_view", "offset_view"])
-def test_non_contiguous_and_aliased_tensors_stay_on_device(G, fake, kind):
+@pytest.mark.parametrize("kind", ["transposed", "strided_slice", "prefix_view", "offset_view"])
+def test_views_and_non_contiguous_tensors_are_still_offloaded(G, fake, kind):
+    # Keeping a view on the device can pin a much larger allocation it is the last owner of: offloaded, as before.
     offloader = fake(stream_mode = False)
     base = torch.randn(64, 64, requires_grad = True)
     x = {
         "transposed": lambda: base.t(),
-        "expanded": lambda: base[:1].expand(64, 64),
         "strided_slice": lambda: base[:, ::2],
         "prefix_view": lambda: base.view(-1)[:1024],
         "offset_view": lambda: base.view(-1)[1024:],
     }[kind]()
+    record = offloader.pack(x)
+    assert type(record) is not tuple and record.host is not None
+    assert offloader.stats["offloaded_bytes"] == x.numel() * x.element_size()
+    assert torch.equal(offloader.unpack(record), x.detach())
+
+
+def test_expanded_views_stay_on_device(G, fake):
+    # Storage smaller than the view: a host copy would materialise every repeat.
+    offloader = fake(stream_mode = False)
+    x = torch.randn(1, 64, requires_grad = True).expand(64, 64)
     packed = offloader.pack(x)
-    assert type(packed) is tuple and packed[1] is x
-    reason = "non_contiguous" if kind in ("transposed", "expanded", "strided_slice") else "aliased"
-    assert offloader.stats["kept_" + reason] == 1
-    assert offloader.stats["kept_" + reason + "_bytes"] == x.numel() * x.element_size()
+    assert type(packed) is tuple and packed[0] is None and torch.equal(packed[1], x.detach())
+    assert offloader.stats["kept_expanded"] == 1
+    assert offloader.stats["kept_expanded_bytes"] == x.numel() * x.element_size()
     assert offloader.stats["offloaded"] == 0 and not offloader.host_refs
-    # A contiguous tensor that owns its whole storage is still offloaded.
-    whole = base.detach().clone().requires_grad_()
-    assert type(offloader.pack(whole)) is not tuple
+
+
+def test_a_kept_saved_output_does_not_keep_its_graph_alive(G, fake, monkeypatch):
+    # exp saves its own output; keeping that tensor itself in the node would make an uncollectable cycle.
+    monkeypatch.setenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", str(1 << 20))
+    offloader = fake(stream_mode = False)
+    x = torch.randn(16, requires_grad = True)
+    with offloader.hooks():
+        y = x.exp()
+    assert offloader.stats["kept_small"] == 1
+    ref = weakref.ref(y)
+    del y
+    gc.collect()
+    assert ref() is None
+    with offloader.hooks():
+        y = x.exp()
+    y.sum().backward()
+    assert torch.allclose(x.grad, x.detach().exp())
+
+
+def test_eager_fallback_restores_are_counted(G, fake):
+    offloader = fake(stream_mode = False)
+    offloader._streamable = lambda x: False
+    model = _Stack(n = 3)
+    model.hooks = offloader.hooks
+    x = _input("cpu", 2, 5, 16)
+    model(x).square().mean().backward()
+    stats = offloader.stats
+    assert stats["offloaded"] == stats["restored"] == 3
+    assert stats["offloaded_bytes"] == stats["restored_bytes"] == 3 * x.numel() * x.element_size()
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -699,3 +740,59 @@ def test_owner_forward_pre_hook_separates_pending_forwards(G, fake, monkeypatch)
     l1.backward()
     assert not spy.violations
     assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"] == 6
+
+
+def _begin_hooks(module):
+    return [h for h in module._forward_pre_hooks.values() if getattr(h, "__name__", "") == "_begin_forward_hook"]
+
+
+def test_an_owned_model_still_pickles(G, fake, monkeypatch):
+    monkeypatch.setattr(G, "_new_activation_offloader", lambda: fake(stream_mode = False))
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    G.activation_offloader_for(model)
+    loaded = pickle.loads(pickle.dumps(model))
+    loaded(torch.randn(2, 4))
+
+
+def test_a_copied_model_does_not_drive_the_original_offloader(G, fake, monkeypatch):
+    monkeypatch.setattr(G, "_new_activation_offloader", lambda: fake(stream_mode = False))
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    original = G.activation_offloader_for(model)
+    clone = copy.deepcopy(model)
+    before = original.forward_id
+    clone(torch.randn(2, 4))
+    assert original.forward_id == before
+    own = G.activation_offloader_for(clone)
+    assert own is not original and len(_begin_hooks(clone)) == 1
+    clone(torch.randn(2, 4))
+    model(torch.randn(2, 4))
+    assert own.forward_id == 1 and original.forward_id == before + 1
+
+
+def test_owner_pre_hook_does_nothing_while_compiling(G, fake, monkeypatch):
+    monkeypatch.setattr(G, "_new_activation_offloader", lambda: fake(stream_mode = False))
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    offloader = G.activation_offloader_for(model)
+    monkeypatch.setattr(G, "_is_compiling", lambda: True)
+    model(torch.randn(2, 4))
+    assert offloader.forward_id == 0
+
+
+def test_concurrent_first_lookups_share_one_offloader(G, fake, monkeypatch):
+    def slow():
+        time.sleep(0.05)
+        return fake(stream_mode = False)
+    monkeypatch.setattr(G, "_new_activation_offloader", slow)
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    found = []
+    threads = [threading.Thread(target = lambda: found.append(G.activation_offloader_for(model))) for _ in range(4)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert len({id(o) for o in found}) == 1 and len(_begin_hooks(model)) == 1
+
+
+def test_stats_reset_zeroes_every_counter(G, fake):
+    offloader = fake(stream_mode = False)
+    offloader.stats["kept"] = 3
+    G.get_activation_offload_stats(reset = True)
+    assert all(v == 0 for v in offloader.stats.values())

@@ -1935,7 +1935,7 @@ pass
 def _new_offload_stats():
     stats = {"pinned": 0, "pageable": 0, "kept": 0, "prefetched": 0, "prefetch_hits": 0, "forwards": 0,
              "offloaded": 0, "offloaded_bytes": 0, "restored": 0, "restored_bytes": 0, "prefetched_bytes": 0}
-    for reason in ("small", "non_contiguous", "aliased"):
+    for reason in ("small", "expanded"):
         stats["kept_" + reason] = 0
         stats["kept_" + reason + "_bytes"] = 0
     return stats
@@ -2007,8 +2007,8 @@ class NonReentrantActivationOffloader:
     whose backward comes first, and reloads layer i-1 on a second side stream while layer i
     recomputes. Costs up to one more layer's checkpoint inputs of VRAM each way.
 
-    Saved tensors under UNSLOTH_GC_OFFLOAD_MIN_BYTES (default 0, off), non-contiguous ones and views
-    that do not own their whole storage stay on the device.
+    Saved tensors under UNSLOTH_GC_OFFLOAD_MIN_BYTES (default 0, off) and expanded views (storage smaller
+    than the view) stay on the device.
     Records carry their forward's identity: prefetch and keep-last decisions stay inside the
     graph a record belongs to, however forwards and backwards interleave. Give each model its
     own offloader with non_reentrant_offload_hooks(model); `stats` counts tensors and bytes.
@@ -2078,16 +2078,15 @@ class NonReentrantActivationOffloader:
         """Why `x` stays on the device instead of being offloaded, or None to offload it."""
         if nbytes < self.min_bytes:
             return "small"
-        if not x.is_contiguous():
-            return "non_contiguous"
-        # A view into a larger allocation (or sharing one with other views): copying it out frees nothing
-        # while the rest of the storage lives, and the host copy would not alias what the device copy did.
+        # An expanded (broadcast) view reads less storage than its logical size: a host copy would materialise
+        # every repeat, while keeping it holds no more than the storage it already points at. Other views and
+        # non-contiguous tensors are offloaded: the view may be the last owner of a larger allocation.
         try:
             storage_bytes = x.untyped_storage().nbytes()
         except Exception:
             return None
-        if x.storage_offset() != 0 or storage_bytes != nbytes:
-            return "aliased"
+        if storage_bytes < nbytes:
+            return "expanded"
         return None
     pass
 
@@ -2217,10 +2216,12 @@ class NonReentrantActivationOffloader:
         reason = self._keep_reason(x, nbytes)
         if reason is not None:
             self._keep(reason, nbytes)
-            return None, x
+            # Detached: an op that saves its own output would otherwise hold itself through its grad_fn.
+            return None, x.detach()
         if not self._streamable(x):
             self._count_offload(nbytes)
-            return x.device, x.to("cpu", non_blocking = True)
+            # The third item marks an eager copy, so unpack counts its restore.
+            return x.device, x.to("cpu", non_blocking = True), nbytes
         order = self._current_order()
         record = _OffloadedActivation(x.device, len(order), order)
         record.group = self.group
@@ -2292,8 +2293,10 @@ class NonReentrantActivationOffloader:
 
     def unpack(self, packed):
         if type(packed) is tuple:
-            device, x = packed
-            return x if device is None else x.to(device, non_blocking = True)
+            device, x = packed[0], packed[1]
+            if device is None: return x
+            if len(packed) == 3: self._count_restore(packed[2])
+            return x.to(device, non_blocking = True)
         record = packed
         order = record.order
         if order is None: order = self.order  # a record built by hand, outside pack()
@@ -2336,6 +2339,7 @@ pass
 NONREENTRANT_OFFLOADER = None
 # owner (a model) -> its own offloader. Weak keys: the offloader never refers back to its owner.
 _OWNED_OFFLOADERS = weakref.WeakKeyDictionary()
+_OWNED_OFFLOADERS_LOCK = threading.Lock()
 
 
 def _new_activation_offloader():
@@ -2343,10 +2347,12 @@ def _new_activation_offloader():
 pass
 
 
-def _begin_forward_hook(offloader):
-    def begin_forward(module, args):
-        offloader.begin_forward()
-    return begin_forward
+def _begin_forward_hook(module, args):
+    # Module level and looked up per call: the model stays picklable, and a copy of it never drives the
+    # original's offloader (it gets its own on first use).
+    if _is_compiling(): return
+    offloader = _OWNED_OFFLOADERS.get(module)
+    if offloader is not None: offloader.begin_forward()
 pass
 
 
@@ -2358,13 +2364,15 @@ def activation_offloader_for(owner):
     reorder each other's saved inputs. When `owner` is an nn.Module its forward pre-hook marks every forward,
     which keeps several pending forwards of the same model apart.
     """
-    offloader = _OWNED_OFFLOADERS.get(owner)
-    if offloader is None:
-        offloader = _new_activation_offloader()
-        offloader.owned = hasattr(owner, "register_forward_pre_hook")
-        if offloader.owned:
-            owner.register_forward_pre_hook(_begin_forward_hook(offloader))
-        _OWNED_OFFLOADERS[owner] = offloader
+    with _OWNED_OFFLOADERS_LOCK:
+        offloader = _OWNED_OFFLOADERS.get(owner)
+        if offloader is None:
+            offloader = _new_activation_offloader()
+            offloader.owned = hasattr(owner, "register_forward_pre_hook")
+            # A copied or unpickled model already carries the hook.
+            if offloader.owned and _begin_forward_hook not in getattr(owner, "_forward_pre_hooks", {}).values():
+                owner.register_forward_pre_hook(_begin_forward_hook)
+            _OWNED_OFFLOADERS[owner] = offloader
     return offloader
 pass
 
@@ -2385,7 +2393,7 @@ def get_activation_offload_stats(reset = False):
     """
     All Unsloth Zoo code licensed under LGPLv3
     Counters summed over every live non-reentrant offloader: tensors and bytes offloaded / restored, prefetches
-    and their hits, and what stayed on the device and why (kept_small, kept_non_contiguous, kept_aliased).
+    and their hits, and what stayed on the device and why (kept_small, kept_expanded).
     `reset = True` zeroes them after reading, for per-step deltas in a benchmark.
     """
     total = _new_offload_stats()
@@ -2393,9 +2401,7 @@ def get_activation_offload_stats(reset = False):
         for key, value in offloader.stats.items():
             total[key] = total.get(key, 0) + value
         if reset:
-            kept = offloader.stats.get("kept", 0)  # a gauge of what sits on the device now, not a counter
             offloader.stats = _new_offload_stats()
-            offloader.stats["kept"] = kept
     return total
 pass
 
