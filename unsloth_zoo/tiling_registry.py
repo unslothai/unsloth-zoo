@@ -64,8 +64,11 @@ __all__ = [
 
 PARALLEL_RULE = (
     "Sequence tiling is per rank: it splits only the rows this rank holds. Under Ulysses context parallel the MLP "
-    "sees the local sequence shard, so tiles are planned on the shard length. DDP, FSDP2 and TP need nothing extra: "
-    "parameters are used normally inside each tile, so their gradients are summed by autograd before any hook fires."
+    "sees the local sequence shard, so tiles are planned on the shard length. DDP and FSDP2 need nothing extra: "
+    "parameters are used normally inside each tile, so their gradients are summed by autograd before any hook fires, "
+    "and the tile function is the inner forward, so module hooks (FSDP2 all-gathers) run once per call, not per "
+    "tile. Tensor parallel is skipped by default: a row-parallel all-reduce would run once per tile, so modules whose "
+    "parameters are TP DTensors stay untiled (coverage reason \"tensor parallel\") unless UNSLOTH_TILED_MLP_TP=1."
 )
 
 # `True` / "1" keep the previous default (tile rows = hidden size).
@@ -73,6 +76,7 @@ DEFAULT_MODE = "arctic"
 _MAX_TILES = 4096
 _ENV_MODULES = "UNSLOTH_TILED_MLP_MODULES"
 _ENV_ENGINE = "UNSLOTH_TILED_ENGINE"
+_ENV_TP = "UNSLOTH_TILED_MLP_TP"
 _OLD_SUFFIXES = (".mlp", ".ffn", ".feed_forward", ".ff", ".densereludense", ".block_sparse_moe")
 _CONTRACTS = ("rows", "rows_flat", "sum", "refuse")
 
@@ -813,6 +817,36 @@ def _is_rank0():
     return True
 
 
+try:
+    from torch.distributed.tensor import DTensor as _DTensor
+except Exception:
+    try:
+        from torch.distributed._tensor import DTensor as _DTensor
+    except Exception:
+        _DTensor = None
+
+_TP_MESH_NAMES = ("tp", "tensor", "model")
+
+
+def _tensor_parallel(module):
+    """True when a parameter in this subtree is a tensor-parallel DTensor. A named mesh decides (FSDP2 meshes are
+    dp / dp_shard / dp_replicate); an unnamed mesh counts as TP unless the placements are FSDP2's Shard(0) alone."""
+    if _DTensor is None:
+        return False
+    for p in module.parameters():
+        if not isinstance(p, _DTensor):
+            continue
+        names = getattr(p.device_mesh, "mesh_dim_names", None)
+        if names:
+            if any(any(t in str(n).lower() for t in _TP_MESH_NAMES) for n in names):
+                return True
+            continue
+        placements = tuple(p.placements)
+        if not all(getattr(pl, "is_shard", lambda *a: False)(0) for pl in placements):
+            return True
+    return False
+
+
 def _select(model, plan, extra, force):
     """(name, module, spec or None, reason) for every candidate; descendants of a candidate are never visited."""
     out = []
@@ -838,6 +872,9 @@ def _select(model, plan, extra, force):
             continue
         if spec is not None and spec.refuse:
             out.append((name, module, None, spec.refuse))
+            continue
+        if os.environ.get(_ENV_TP, "0") != "1" and _tensor_parallel(module):
+            out.append((name, module, None, f"tensor parallel (set {_ENV_TP}=1 to tile anyway)"))
             continue
         if spec is None:
             mixer = _sequence_mixer(module)

@@ -621,3 +621,58 @@ def test_install_on_the_module_itself_claims_its_children():
     mlp.inner = type("BarMLP", (_TokenMLP,), {})()
     report = R.install(mlp, "rows:2", verbose = False)
     assert [r[0] for r in report.tiled] == [""] and not R.is_tiled(mlp.inner)
+
+
+@needs_registry
+def test_module_hooks_run_once_per_call_not_per_tile():
+    # The engine gets the inner forward, never the hooked module: FSDP2's unshard hooks would run per tile.
+    mlp = type("FooMLP", (_TokenMLP,), {})()
+    R.install_module(mlp, "rows:2")
+    pre, post = [], []
+    mlp.register_forward_pre_hook(lambda m, a: pre.append(1))
+    mlp.register_forward_hook(lambda m, a, o: post.append(1))
+    x = torch.randn(1, 8, 8, requires_grad = True)
+    mlp(x).sum().backward()
+    assert pre == [1] and post == [1]
+
+
+@needs_registry
+def test_tensor_parallel_modules_are_skipped(monkeypatch, tmp_path):
+    import torch.distributed as dist
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("needs gloo")
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Replicate, distribute_tensor
+    dist.init_process_group("gloo", init_method = f"file://{tmp_path / 'store'}", rank = 0, world_size = 1)
+    try:
+        def holder(mesh_name):
+            model = _Holder(lambda: type("FooMLP", (_TokenMLP,), {})(), n = 1)
+            mesh = init_device_mesh("cpu", (1,), mesh_dim_names = (mesh_name,))
+            mlp = model.layers[0].mlp
+            for lin in (mlp.up, mlp.down):
+                lin.weight = torch.nn.Parameter(distribute_tensor(lin.weight.data, mesh, [Replicate()]))
+            return model
+        report = R.install(holder("tp"), "rows:2", verbose = False)
+        assert not report.tiled and report.skipped[0][2].startswith("tensor parallel")
+        assert "UNSLOTH_TILED_MLP_TP" in report.line()
+        assert R.install(holder("dp_shard"), "rows:2", verbose = False).tiled  # FSDP2 mesh: tiled
+        monkeypatch.setenv("UNSLOTH_TILED_MLP_TP", "1")
+        assert R.install(holder("tp"), "rows:2", verbose = False).tiled
+    finally:
+        dist.destroy_process_group()
+    assert "UNSLOTH_TILED_MLP_TP" in R.PARALLEL_RULE
+
+
+@needs_registry
+def test_two_identical_instances_run_their_own_inner_forward():
+    # An engine that deduplicates by signature must still run each instance's own slot (LoRA forward, counters).
+    a, b = (type("FooMLP", (_TokenMLP,), {})() for _ in range(2))
+    b.load_state_dict(a.state_dict())
+    seen = []
+    for tag, m in (("a", a), ("b", b)):
+        R.install_module(m, "rows:2")
+        m._unsloth_forward = MethodType(lambda self, x, tag = tag: seen.append(tag) or _TokenMLP.forward(self, x), m)
+    x = torch.randn(1, 4, 8)
+    a(x)
+    b(x)
+    assert seen == ["a", "a", "b", "b"]
