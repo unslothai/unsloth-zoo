@@ -1008,6 +1008,75 @@ def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
     assert ops.patch_trl_fused_lm_head() is False
 
 
+def test_trl_fused_lm_head_dispatch_takes_the_kept_set_contract(monkeypatch):
+    """TRL 1.17 passes support_ids / score_ids after `outputs` and unpacks six outputs: CPU calls without a kept
+    set stay on the torch twin (sixth output None), kept-set calls go to TRL's kernel with every argument."""
+    from trl.trainer import utils as trl_utils
+    from unsloth_zoo.cpu import ops
+    calls = []
+
+    class Kernel117:
+        @staticmethod
+        def forward(ctx, hidden, weight, bias, targets, temperature, chunk_size, final_logit_softcapping = None,
+                    logit_scale = 1.0, outputs = (), support_ids = None, score_ids = None):
+            raise AssertionError
+
+        @staticmethod
+        def apply(hidden, *a, **k):
+            calls.append((a, k))
+            return ("kernel",) * 6
+
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", Kernel117, raising = False)
+    assert ops.patch_trl_fused_lm_head() is True
+    dispatch = trl_utils._ChunkedLogProbFunction
+    torch.manual_seed(0)
+    hidden, weight, targets = torch.randn(9, 8), torch.randn(23, 8), torch.randint(0, 23, (9,))
+    got = dispatch.apply(hidden, weight, None, targets, 0.7, 64, None, 1.0, ("entropy",), None, None)
+    assert len(got) == 6 and got[5] is None and got[2] is None and calls == []
+    logp = torch.log_softmax((hidden.double() @ weight.double().t()) / 0.7, -1)
+    torch.testing.assert_close(got[0].double(), logp.gather(-1, targets[:, None]).squeeze(-1), rtol = 1e-5, atol = 1e-5)
+    ids = torch.zeros(9, 2, dtype = torch.long)
+    assert dispatch.apply(hidden, weight, None, targets, 0.7, 64, None, 1.0, ("entropy",), ids, None)[0] == "kernel"
+    assert dispatch.apply(hidden, weight, None, targets, 0.7, 64, None, 1.0, (), score_ids = ids)[0] == "kernel"
+    assert len(calls) == 2 and calls[1][1]["score_ids"] is ids
+
+
+def test_trl_fused_forward_on_cpu_matches_trl_kernel(monkeypatch):
+    """The installed TRL's own fused forward (its exact kernel call) through the CPU dispatch, against TRL's kernel
+    where that kernel runs on CPU (TRL 1.17 ships a torch path)."""
+    from trl.trainer import utils as trl_utils
+    from unsloth_zoo.cpu import ops
+    kernel = getattr(trl_utils, "_ChunkedLogProbFunction", None)
+    kernel = getattr(kernel, "_kernel", kernel)
+    if kernel is None or not hasattr(trl_utils, "add_fused_lm_head"):
+        pytest.skip("this TRL has no fused lm_head kernel")
+    from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(
+        vocab_size = 37, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 1,
+        num_attention_heads = 2, num_key_value_heads = 2, max_position_embeddings = 32,
+    )).float()
+    input_ids = torch.randint(0, 37, (2, 9))
+    labels = input_ids.clone()
+    labels[0, :3] = -100
+    trl_utils.add_fused_lm_head(model, temperature = 0.7, outputs = ("log_probs", "entropy"))
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", kernel)
+    assert ops.patch_trl_fused_lm_head() is True
+    ours = model(input_ids = input_ids, labels = labels, fused_lm_head = True)
+    ours.loss.backward()
+    ours_grad = model.model.norm.weight.grad.clone()
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", kernel)
+    model.zero_grad()
+    try:
+        ref = model(input_ids = input_ids, labels = labels, fused_lm_head = True)
+        ref.loss.backward()
+    except Exception as exc:  # TRL < 1.17's kernel is Triton only.
+        pytest.skip(f"TRL's kernel does not run on CPU here ({type(exc).__name__})")
+    torch.testing.assert_close(ours.log_probs, ref.log_probs, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(ours.entropy, ref.entropy, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(ours_grad, model.model.norm.weight.grad, rtol = 1e-4, atol = 1e-5)
+
+
 def test_cpu_fused_lm_head_with_every_label_masked():
     """TRL passes hidden_states[mask] / labels[mask], which are empty for a fully masked batch."""
     from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
