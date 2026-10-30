@@ -73,8 +73,7 @@ def is_enabled() -> bool:
 
 
 def register_canonical(forward_hash: str, replacement_forward) -> None:
-    """Register a hand-written canonical forward for a structural hash. Future
-    installs fingerprinting to `forward_hash` use it without the AST rewrite."""
+    """Register a hand-written canonical forward for a structural hash; later installs fingerprinting to forward_hash use it, skipping the AST rewrite."""
     with _REGISTRY_LOCK:
         _CANONICAL_FORWARDS[forward_hash] = replacement_forward
 
@@ -114,8 +113,7 @@ def _transformers_version_ok() -> bool:
 
 
 def _unresolved_globals(code, ns) -> set:
-    """Globals `code` loads (recursively) that resolve in neither `ns` nor
-    builtins. LOAD_GLOBAL only, so locals and attributes are never flagged."""
+    """Globals that code loads (recursively) and that resolve in neither ns nor builtins; only LOAD_GLOBAL counts, so locals and attributes are never flagged."""
     _builtin_names = set(dir(builtins))
     missing, seen, stack = set(), set(), [code]
     while stack:
@@ -171,8 +169,7 @@ _LINEAR_HEAD_ATTRS = {
 
 
 def _is_eligible_class(cls) -> bool:
-    # ForConditionalGeneration uses aligned labels; fused kernel hardcodes
-    # a causal shift, so accept only ForCausalLM.
+    # Accept only ForCausalLM classes: ForConditionalGeneration uses aligned labels, but the fused kernel hardcodes a causal shift.
     name = getattr(cls, "__name__", "")
     if not name.endswith("ForCausalLM"):
         return False
@@ -372,8 +369,7 @@ def install_for_class(cls) -> bool:
 
 
 def install_for_module(module) -> int:
-    """Scan a transformers `modeling_*` module and install where eligible.
-    Returns the number of classes newly patched."""
+    """Scan a transformers `modeling_*` module and install where eligible; returns the number of classes newly patched."""
     if not is_enabled():
         return 0
     if not _transformers_version_ok():
@@ -406,8 +402,7 @@ class _ModelingLoader(importlib.abc.Loader):
     def __init__(self, inner):
         self._inner = inner
 
-    # Defined, not routed through __getattr__: hasattr and mock.patch.object
-    # look these up on the type, which skips __getattr__.
+    # Define get_source and get_code explicitly rather than via __getattr__: hasattr and mock.patch.object look these up on the type, which skips __getattr__.
     def get_source(self, name):
         return self._inner.get_source(name)
 
@@ -460,10 +455,8 @@ class _ModelingFinder(importlib.abc.MetaPathFinder):
 
 
 def install_modeling_import_hook() -> bool:
-    """Register the meta-path finder + scan already-imported modeling modules.
-    Returns True if the hook was installed (or already present); False if the
-    install was skipped (feature disabled, transformers missing, version too
-    old)."""
+    """Register the meta-path finder and scan already-imported modeling modules; True if installed or already present,
+    False if skipped (feature disabled, transformers missing or too old)."""
     global _INSTALL_DONE
     if _INSTALL_DONE:
         return True

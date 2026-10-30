@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Softmax collapse (arXiv 2610.31642): a target leading the logsumexp of the others by more than ~16.6
-nats used to get loss 0 and target gradient 0 from every fused path. Each route is checked against a
-target-excluded fp64 oracle with relative error (fp64 F.cross_entropy itself collapses at ~36.7 nats)."""
+"""Softmax collapse (arXiv 2610.31642): a target leading others by over ~16.6 nats gave loss 0 and grad 0 in fused
+paths; checked vs a target-excluded fp64 oracle (F.cross_entropy fp64 collapses at ~36.7 nats)."""
 
 import math
 
@@ -206,9 +205,8 @@ def test_tie_gradient_and_empty_rows():
 @pytest.mark.parametrize("backend", [None, "aot_eager", "inductor"])
 @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
 def test_tie_gradient_independent_of_clamp_boundary_derivative(backend, label_smoothing):
-    # torch 2.14 made d clamp_min / d clamp_max zero at the bound (was 1), which zeroed the softplus
-    # gradient at x = 0 and with it the whole row gradient at a tie. fp64 oracle: (1 - eps) (p - onehot)
-    # + eps (p - 1 / V).
+    # torch 2.14 made clamp_min / clamp_max derivatives zero at the bound (was 1), zeroing the softplus grad at x = 0
+    # and the row grad at a tie; fp64 oracle: (1 - eps)(p - onehot) + eps(p - 1 / V).
     from unsloth_zoo.fused_losses.stable_softmax import _softplus, smoothed_nll
 
     x = torch.zeros(1, dtype = torch.float64, requires_grad = True)

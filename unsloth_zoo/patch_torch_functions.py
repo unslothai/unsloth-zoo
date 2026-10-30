@@ -62,8 +62,8 @@ def _layer_norm_eager(
             bias=bias,
             eps=eps,
         ).to(input.dtype)
-    # SigLIP norms keep float32 weights under bfloat16 activations and this body runs eagerly when
-    # Dynamo does not compile; CUDA rejects mixed dtypes, so normalise in the wider dtype.
+    # SigLIP norms keep float32 weights under bfloat16 activations; the eager body (no Dynamo compile) must normalise in
+    # the wider dtype, as CUDA rejects mixed dtypes.
     if (
         weight is not None and input.is_floating_point() and weight.is_floating_point()
         and (bias is None or bias.is_floating_point())
@@ -169,10 +169,7 @@ def patch_torch_functions():
     if not hasattr(torch.nn.functional, "_uncompiled_layer_norm"):
         torch.nn.functional._uncompiled_layer_norm = torch.nn.functional.layer_norm
         torch.nn.functional.layer_norm = layer_norm
-    # Don't compile cross_entropy (too many errors; already compiled elsewhere)
-    # if not hasattr(torch.nn.functional, "_uncompiled_cross_entropy"):
-    #     torch.nn.functional._uncompiled_cross_entropy = torch.nn.functional.cross_entropy
-    #     torch.nn.functional.cross_entropy = cross_entropy
+    # Do not compile cross_entropy: it has too many errors and is already compiled elsewhere.
 pass
 
 

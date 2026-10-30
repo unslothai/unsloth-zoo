@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4 attention on flex attention instead of eager (transformers runs V4 eager only).
-
-The additive mask (sliding window + padding, then the compressor's block_bias) becomes a block-sparse
-BlockMask; the sink is applied exactly from the logsumexp:
-softmax([l, s]) @ v == (softmax(l) @ v) * sigmoid(lse(l) - s). Prefill / training only, from a measured
-per-GPU key length (_MIN_KEYS). UNSLOTH_SPARSE_ATTN_FLEX: 0 = eager, 1 = also other sm80+ parts with
->= 160 KB shared memory, unset = measured generations only.
-"""
+"""DeepSeek-V4 attention on flex rather than transformers' eager-only path, for prefill and training above a measured
+key length; sink applied exactly from the logsumexp; eager failures latch per shape; UNSLOTH_SPARSE_ATTN_FLEX=0
+forces eager, 1 adds other sm80+ parts with 160 KB+ shared memory."""
 
 __all__ = ["patch_deepseek_v4_sparse_flex", "DEEPSEEK_V4_FLEX_STATS"]
 
@@ -38,8 +33,7 @@ DEEPSEEK_V4_FLEX_STATS = {"flex": 0, "eager": 0}
 _BLOCK = 128
 # Decode (one query) never benefits; chunked prefill of a few queries over a long cache does.
 _MIN_Q_LEN = 16
-# head_dim 512: 32 x 32 tiles, 8 warps, 1 stage (B200 S 4096: 35 ms vs 205 ms with 4 warps, eager 55 ms);
-# 64-wide tiles fault (misaligned address) at this head dim.
+# Tuned for head_dim 512: 32x32 tiles, 8 warps, 1 stage; 64-wide tiles fault with a misaligned address at this head dim.
 _KERNEL_OPTIONS = {
     "BLOCK_M": 32,
     "BLOCK_N": 32,
@@ -54,10 +48,9 @@ _KERNEL_OPTIONS = {
 }
 # Stride-0 expansion of the single KV head: grouped-query packing (64:1) took 180-210 ms.
 _CSA = "compressed_sparse_attention"
-# Minimum key length (sliding + compressed) from one V4-Flash layer fwd + bwd, eager vs flex:
-# H100 / B200 4096 for every layer type; A100 4096 for HCA / sliding, 8192 for CSA (8-14% slower
-# below). ~101 KB shared-memory cards, T4 and ROCm stay eager. UNSLOTH_SPARSE_ATTN_FLEX_MIN_KEYS=N
-# replaces every threshold.
+# Minimum key length (sliding + compressed) per GPU for flex: H100 and B200 4096 for every layer type; A100 4096 for
+# HCA/sliding, 8192 for CSA (flex is slower below); ~101 KB shared-memory cards, T4 and ROCm stay eager;
+# UNSLOTH_SPARSE_ATTN_FLEX_MIN_KEYS=N replaces every threshold.
 _MIN_KEYS = {
     9: {None: 4096},
     10: {None: 4096},
@@ -68,13 +61,14 @@ _MIN_SHARED_MEMORY = 160 * 1024
 
 _FLEX = None
 _DEVICE_OK = {}
+# _failure_key -> error for shape classes whose flex call or backward probe failed.
+_FAILED = {}
 # Looked up once: find_spec is skipped by dynamo, and the first call can come from inside a compiled graph.
 _HAS_TRITON = importlib.util.find_spec("triton") is not None
 
 
 def _transformers_tested():
-    """Checked on transformers 5.17-5.20; the V4 attention / compressor contract is newer than 5.x's first
-    DeepSeek-V4 release."""
+    """Checked on transformers 5.17 to 5.20; the V4 attention and compressor contract is newer than the first DeepSeek-V4 release, so gate on version 5.17 or later."""
     try:
         import transformers
         from packaging.version import Version
@@ -108,8 +102,8 @@ def _compiled_flex():
     global _FLEX
     if _FLEX is None:
         from torch.nn.attention.flex_attention import flex_attention
-        # dynamic=None: a fixed length (packed / padded runs) keeps a static kernel, 20-30% faster than the
-        # dynamic one (CSA 8192: 129 vs 188 ms on B200); varying lengths settle on dynamic after a few graphs.
+        # dynamic=None keeps a static kernel for fixed lengths (packed or padded runs), faster than the dynamic one;
+        # varying lengths settle on dynamic after a few graphs.
         _FLEX = torch.compile(flex_attention)
     return _FLEX
 
@@ -150,8 +144,8 @@ def _min_keys(module, device, forced):
 
 def _flex_applies(module, query, key, value, attention_mask, dropout, kwargs):
     setting = _flex_setting()
-    # Uncompiled flex attention materialises every score, which is worse than eager.
-    # transformers records attention weights when config.output_attentions is set without passing the kwarg.
+    # Uncompiled flex materialises every score, worse than eager; transformers records attention weights when
+    # config.output_attentions is set even without passing the kwarg.
     output_attentions = kwargs.get("output_attentions")
     if output_attentions is None:
         output_attentions = getattr(getattr(module, "config", None), "output_attentions", False)
@@ -177,6 +171,9 @@ def _flex_applies(module, query, key, value, attention_mask, dropout, kwargs):
         return False
     if attention_mask.shape[0] not in (1, bsz):
         return False
+    # Eager only: a traced lookup would guard on the dict.
+    if not torch.compiler.is_compiling() and _failure_key(query) in _FAILED:
+        return False
     min_keys = _min_keys(module, query.device, setting == "1")
     return min_keys is not None and key.shape[2] >= min_keys
 
@@ -190,9 +187,9 @@ def _pack(selected, num_blocks):
 
 
 def deepseek_v4_block_mask(attention_mask, batch):
-    """(BlockMask, bias or None) over the additive [B|1, 1, S, KV] mask. Entries at or below half the dtype minimum
-    (and -inf) are hard-masked; every other value is added to the score like eager does, so finite custom
-    biases are kept. Whole 128 x 128 tiles with nothing visible are skipped."""
+    """Returns (BlockMask, bias or None) for the additive [B|1, 1, S, KV] mask; entries at or below half the dtype
+    minimum (or -inf) are hard-masked, others are added to the score as eager does; empty 128 x 128 tiles are
+    skipped."""
     from torch.nn.attention.flex_attention import BlockMask
     from unsloth_zoo.flex_attention.sparse import additive_bias_present
 
@@ -202,8 +199,8 @@ def deepseek_v4_block_mask(attention_mask, batch):
     visible = attention_mask[:, 0] > torch.finfo(attention_mask.dtype).min / 2
     table = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK), dtype = torch.bool)
     table[:, :q_len, :kv_len] = visible
-    # transformers' own masks are 0 / min only; reading a bias per score costs 5-15%, so only when present.
-    # Inside a compiled graph the check would be a data-dependent branch, so the bias is always kept there.
+    # transformers' masks are 0 / min only, and reading a bias per score is slow, so it is added only when present;
+    # inside a compiled graph the bias is always kept.
     bias = None
     if torch.compiler.is_compiling() or additive_bias_present(attention_mask[:, 0], visible, "deepseek_v4"):
         bias = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK))
@@ -261,11 +258,35 @@ def deepseek_v4_flex_attention(module, query, key, attention_mask, scaling):
     return out.transpose(1, 2).contiguous()
 
 
+def _failure_key(query):
+    return ("deepseek_v4", query.device.index, query.dtype, query.shape[1], query.shape[-1])
+
+
+def _flex_or_none(module, query, key, attention_mask, scaling):
+    """Flex output, or None after a (latched) failure so the caller runs eager. Not caught while traced."""
+    args = (module, query, key, attention_mask, scaling)
+    if torch.compiler.is_compiling():
+        return deepseek_v4_flex_attention(*args)
+    from unsloth_zoo.flex_attention.sparse import probe_flex_backward
+    try:
+        probe_flex_backward(_failure_key(query), deepseek_v4_flex_attention, args)
+        return deepseek_v4_flex_attention(*args)
+    except Exception as error:
+        # Capture is already invalid and the shape class is not at fault: raise, don't latch.
+        if query.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise
+        _FAILED[_failure_key(query)] = repr(error)[:500]
+        logger.warning(f"Unsloth: DeepSeek-V4 flex attention failed, using eager attention: {error}")
+        return None
+
+
 def _make_attention_forward(original):
     def eager_attention_forward(module, query, key, value, attention_mask, scaling, dropout = 0.0, **kwargs):
         if _flex_applies(module, query, key, value, attention_mask, dropout, kwargs):
-            _count("flex")
-            return deepseek_v4_flex_attention(module, query, key, attention_mask, scaling), None
+            out = _flex_or_none(module, query, key, attention_mask, scaling)
+            if out is not None:
+                _count("flex")
+                return out, None
         _count("eager")
         return original(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
 

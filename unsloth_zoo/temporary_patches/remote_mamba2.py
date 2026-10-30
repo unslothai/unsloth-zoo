@@ -14,11 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Repair remote NemotronH NemotronHMamba2Mixer.torch_forward (the no-mamba_ssm path): the inter-chunk sum must
-reduce the source chunk axis (dim=3; decay_chunk is [b, h, target, source], not transposed), and dt must clamp to
-time_step_limit like the remote fused path, not floor at time_step_min. Remote classes load via
-transformers.dynamic_module_utils.get_class_in_module, so that is hooked. UNSLOTH_REMOTE_MAMBA2_FIX=0 disables.
-"""
+"""Repairs remote NemotronHMamba2Mixer.torch_forward (no mamba_ssm path), hooked via get_class_in_module: the
+inter-chunk sum reduces the source chunk axis (dim=3, decay_chunk is [b, h, target, source]); dt clamps to
+time_step_limit, not time_step_min; UNSLOTH_REMOTE_MAMBA2_FIX=0 disables."""
 
 import functools
 import inspect

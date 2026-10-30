@@ -194,9 +194,7 @@ def test_inherited_contract_has_no_model_name_restriction():
     assert type(model) is OtherRecurrentBlock
 
 def test_overlapping_scopes_keep_the_module_fused_until_the_last_exit():
-    # Generation enters this beside fused_moe_gate_up and Studio enters it again per
-    # request, so two scopes own the same module. Without a count the first exit
-    # restores the native class and the still-open scope silently loses the kernel.
+    # Two scopes (generation, Studio) own one module; without a count the first exit loses the kernel.
     model = _model()
     root = nn.Sequential(model)
     root.eval()
@@ -212,10 +210,8 @@ def test_overlapping_scopes_keep_the_module_fused_until_the_last_exit():
     finally:
         inner.__exit__(None, None, None)
     assert type(model) is native.Qwen3_5GatedDeltaNet
-    # Both stores: nn.Module.__setattr__ routes only mx.array/dict/list/tuple into the
-    # mapping and pops the key there for anything else, so the count and the two class
-    # references live in __dict__. Assert the mapping too, so a value that later starts
-    # landing there cannot leak past the exit unnoticed.
+    # Count and both class references live in __dict__ since nn.Module.__setattr__ diverts only
+    # mx.array/dict/list/tuple; also assert the mapping so a value landing there cannot leak past exit
     leftover = [key for key in (*model.__dict__, *dict.keys(model))
                 if key.startswith("_unsloth_decode")]
     assert leftover == []
@@ -293,8 +289,7 @@ def test_prenorm_layers_hand_the_normalized_residual_on_bitwise(vlm, hidden, mon
     launches, fused = [], decode._fused_add_rms_norm
     monkeypatch.setattr(decode, "_fused_add_rms_norm", lambda *args: launches.append(None) or fused(*args))
 
-    # mlx-vlm 0.7.4's Qwen3.5 decode reads memory it never wrote from two rows on, so its batched
-    # output depends on the allocator's state and cannot be a bitwise reference.
+    # mlx-vlm 0.7.4 Qwen3.5 decode reads unwritten memory with 2+ rows; batched output is not bitwise.
     rows = 1 if vlm else 3
 
     def generate():
@@ -1230,8 +1225,7 @@ def _qsa_attention():
 
 
 def _speculative_rounds(attention, cache):
-    # Rejections that do and do not cross a pooled-block boundary, and a full acceptance. Each round
-    # brings new rows, as a corrected token replaces a rejected draft.
+    # Rejections on and off a pooled-block boundary, plus full acceptance; each round brings new rows.
     x = mx.random.normal((1, 81, 64), key = mx.random.key(9)).astype(mx.bfloat16)
     steps = [attention(x[:, :61], cache = cache), cache.index_block_keys]
     for start, reject in zip(range(61, 81, 4), (3, 1, 0, 2, 3)):

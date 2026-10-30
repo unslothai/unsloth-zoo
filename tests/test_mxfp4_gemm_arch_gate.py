@@ -132,8 +132,8 @@ def test_unindexed_device_resolves_the_current_gpu_for_the_gemv_probe(monkeypatc
 @pytest.mark.parametrize("mode", ["compiling", "capturing"])
 @pytest.mark.parametrize("rows", [17, 2048])
 def test_stacked_experts_on_sm75_keep_the_device_schedule_when_traced(gpu, monkeypatch, mode, rows):
-    # The dequantize fallback reads routing offsets on the host (.tolist()): a graph break, a fullgraph
-    # error and a CUDA graph capture error, so compiled and captured calls keep the device-scheduled kernel.
+    # The dequantize fallback reads routing offsets on the host (.tolist()), which causes a graph break, a fullgraph
+    # error and a CUDA graph capture error; compiled and captured calls keep the device schedule.
     device = gpu((7, 5))
     param = _expert_param(E = 32)
     assert not mse._fused(_rows(rows, device), param, True)

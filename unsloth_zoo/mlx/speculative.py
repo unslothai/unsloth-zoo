@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import copy
+import functools
 import gc
 import importlib
+import inspect
 import json
 import os
 import re
@@ -770,9 +772,10 @@ class EngineRow:
     ``cache`` holds the prompt; ``pending`` is the last sampled token, already emitted but not yet
     forwarded; ``emitted`` counts the tokens emitted so far, ``pending`` included, and is the
     position of the next draw. ``hidden`` is the target's last-layer hidden ``[1, N, H]`` at the
-    last N prompt positions, which a drafter starts from. A row speculates only if each of its
-    ``processors`` sets ``history_only = True``: after its first call its output depends only on
-    the ``(tokens, logits)`` it is given, so it can be asked about positions that are then rejected.
+    last N prompt positions, which a drafter starts from. A row speculates only if ``drafts`` and
+    each of its ``processors`` sets ``history_only = True``: after its first call its output depends
+    only on the ``(tokens, logits)`` it is given, so it can be asked about positions that are then
+    rejected.
     """
 
     cache: list
@@ -786,6 +789,7 @@ class EngineRow:
     rope_delta: int = 0
     hidden: Any = None
     uid: Any = None
+    drafts: bool = True
 
 
 @dataclass(frozen = True)
@@ -809,7 +813,8 @@ class _Row:
         self.max_tokens = row.max_tokens
         self.stop_tokens = frozenset(row.stop_tokens)
         self.processors = list(row.processors)
-        self.speculates = all(getattr(processor, "history_only", False) for processor in self.processors)
+        self.history_only = all(getattr(processor, "history_only", False) for processor in self.processors)
+        self.speculates = row.drafts and self.history_only
         self.history = mx.array(self.tokens) if self.processors else None
         self.rope_delta = int(row.rope_delta)
         self.sample = _RowSampler(row.sampling)
@@ -1077,7 +1082,7 @@ class SpeculativeEngine:
     def _plain(self, length: int, states: list[RowState], waiting: Callable[[], bool] | None = None) -> Iterator[list[list[int]]]:
         rows = self._rows
         # A processor that reads more than the history needs each token taken before the next step.
-        pipelined = all(row.speculates for row in rows)
+        pipelined = all(row.history_only for row in rows)
         start = time.perf_counter()
         with mx.stream(self._stream):
             tokens, scores, hidden = self._step(mx.array([[row.pending] for row in rows]))
@@ -1221,6 +1226,14 @@ class SpeculativeEngine:
         return emitted
 
 
+@functools.cache
+def _history_starts_at_prompt(generate_step) -> bool:
+    try:
+        return "tokens = input_ids.flatten()" in inspect.getsource(generate_step)
+    except (OSError, TypeError):
+        return False
+
+
 def _shown_from(processor: Callable, start: int) -> Callable:
     def shown(tokens, logits):
         return processor(tokens[start:], logits)
@@ -1291,8 +1304,10 @@ class SpeculativeDraft:
         prompt, sampling, processors = request
         first = int(first_token.item())
         yield first, logprobs
-        # mlx-vlm's first step showed the processors the last prefilled chunk alone.
+        # Before 0.7.11 mlx-vlm's first step showed the processors the last prefilled chunk alone.
         start = max(0, len(prompt) - int(input_ids.size))
+        if _history_starts_at_prompt(importlib.import_module("mlx_vlm.generate.ar").generate_step):
+            start = 0
         processors = [_shown_from(processor, start) for processor in processors]
         engine = SpeculativeEngine(model, self.controller, self.drafter)
         engine.add(self._started(model, EngineRow(prompt_cache, first, prompt, sampling, max_tokens, processors = processors), last_outputs))
@@ -1926,10 +1941,22 @@ def _checkpoint_keys(path: Path) -> dict[str, Path]:
     return keys
 
 
+def _omlx_nextn_key(key: str, text_config: dict) -> str | None:
+    """The source name of a nextn MTP tensor omlx stores as ``mtp.<i>.block.*`` (the decoder layer) or ``mtp.<i>.<fusion>``
+    (``eh_proj``/``enorm``/``hnorm``, and ``norm`` for ``shared_head.norm``), for checkpoints whose MTP layers follow the
+    last decoder layer."""
+    match = re.fullmatch(r"mtp\.(\d+)\.(.+)", key)
+    if match is None or not isinstance(text_config.get("num_hidden_layers"), int):
+        return None
+    rest = "shared_head.norm.weight" if match[2] == "norm.weight" else match[2].removeprefix("block.")
+    return f"layers.{text_config['num_hidden_layers'] + int(match[1])}.{rest}"
+
+
 def _native_mtp_head(path: Path) -> tuple | None:
-    """``(splitter, source_config, text_config, prefix, [(file, keys)])`` for a checkpoint's own MTP head, or None. The head
+    """``(splitter, source_config, text_config, rename, [(file, keys)])`` for a checkpoint's own MTP head, or None. The head
     is the splitter's own layout, at the top level or under one ``model.``/``language_model.`` wrapper, where MLX
-    conversions of vision-language checkpoints keep it (``language_model.mtp.*``); ``prefix`` is that wrapper."""
+    conversions of vision-language checkpoints keep it (``language_model.mtp.*``), or the layout omlx converts nextn layers
+    to (``_omlx_nextn_key``), already sanitized; ``rename`` maps a stored key to the splitter's layout."""
     from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
 
     try:
@@ -1941,47 +1968,96 @@ def _native_mtp_head(path: Path) -> tuple | None:
         return None
     text_config = splitter.read_text_config(source_config)
     if selected := list(splitter.iter_selected(path, text_config)):
-        return splitter, source_config, text_config, "", selected
+        return splitter, source_config, text_config, lambda key: key, selected
     nested = {}
     for key, file in _checkpoint_keys(path).items():
         wrapper = re.match(r"(?:(?:model|language_model)\.)+", key)
         parts = wrapper.group().split(".")[:-1] if wrapper else []
-        for prefix in (".".join(parts[:end]) + "." for end in range(1, len(parts) + 1)):
-            if splitter.select_keys(key[len(prefix) :], text_config):
-                nested.setdefault(prefix, {}).setdefault(file, []).append(key)
+        prefixes = [".".join(parts[:end]) + "." for end in range(1, len(parts) + 1)]
+        # The splitter's own layout at the top level is the case ``iter_selected`` covered.
+        for prefix, omlx in [(prefix, omlx) for prefix in (*prefixes, "") for omlx in (False, True) if prefix or omlx]:
+            name = key[len(prefix) :]
+            if (name := _omlx_nextn_key(name, text_config) if omlx else name) and splitter.select_keys(name, text_config):
+                nested.setdefault((prefix, omlx), {}).setdefault(file, []).append(key)
                 break
     if len(nested) != 1:
         return None
-    [(prefix, files)] = nested.items()
+    [((prefix, omlx), files)] = nested.items()
+
+    def rename(key):
+        key = key.removeprefix(prefix)
+        return _omlx_nextn_key(key, text_config) if omlx else key
+
     for name in ("quantization", "quantization_config"):
         if isinstance(source_config.get(name), dict):
             # Per-module overrides name the head's modules under the wrapper too.
             source_config[name] = {key.removeprefix(prefix): value for key, value in source_config[name].items()}
-    return splitter, source_config, text_config, prefix, list(files.items())
+    return splitter, source_config, text_config, rename, list(files.items())
+
+
+_MERGED_ASSISTANT_PREFIX = "language_model.mtp."
+# The assistants omlx merges, each with the mlx-vlm module that builds it; a checkpoint's config never names a module.
+_MERGED_ASSISTANT_MODULES = {
+    "gemma4_assistant": "mlx_vlm.speculative.drafters.gemma4_assistant",
+    "gemma4_unified_assistant": "mlx_vlm.speculative.drafters.gemma4_unified_assistant",
+}
+
+
+def _merged_assistant(path: Path) -> tuple | None:
+    """``(config, [(file, keys)])`` of a Gemma 4 assistant omlx merges into its target's checkpoint: the assistant's own
+    config at ``text_config.mtp_assistant_config``, its weights under ``language_model.mtp.``; or None."""
+    try:
+        config = (json.loads((path / "config.json").read_text()).get("text_config") or {}).get("mtp_assistant_config")
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(config, dict) and config.get("model_type") in _MERGED_ASSISTANT_MODULES):
+        return None
+    files = {}
+    for key, file in _checkpoint_keys(path).items():
+        if key.startswith(_MERGED_ASSISTANT_PREFIX):
+            files.setdefault(file, []).append(key)
+    return (config, list(files.items())) if files else None
 
 
 def has_native_mtp_head(model_path: str | Path) -> bool:
-    """Whether ``native_mtp_drafter`` finds an MTP head in the checkpoint at ``model_path``."""
-    return _native_mtp_head(Path(model_path)) is not None
+    """Whether ``native_mtp_drafter`` finds an MTP head, or a merged Gemma 4 assistant, in the checkpoint at ``model_path``."""
+    return _native_mtp_head(Path(model_path)) is not None or _merged_assistant(Path(model_path)) is not None
 
 
-def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
+def _merged_assistant_drafter(path: Path, target: nn.Module, *, lazy: bool) -> AssistantDrafter | None:
+    merged = _merged_assistant(path)
+    if merged is None:
+        return None
+    config, selected = merged
+    module = importlib.import_module(_MERGED_ASSISTANT_MODULES[config["model_type"]])
+    model = module.Model(module.ModelConfig.from_dict(config))
+    weights = {}
+    for file, keys in selected:
+        shard = mx.load(str(file))
+        weights.update((key.removeprefix(_MERGED_ASSISTANT_PREFIX), shard[key]) for key in keys)
+    # omlx keeps the merged assistant unquantized.
+    model.load_weights(list(model.sanitize(weights).items()), strict = True)
+    return _built(AssistantDrafter, model, target, lazy = lazy)
+
+
+def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | AssistantDrafter | None:
     """A drafter for the target's own MTP head, built in memory from only the MTP tensors of its
-    checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
+    checkpoint as mlx-vlm's MTP splitter would write it, or from a Gemma 4 assistant merged into it
+    (``_merged_assistant``); None when the checkpoint has neither."""
     from mlx_vlm.fp8 import transform_fp8_weights
     from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors
 
     head = _native_mtp_head(Path(model_path))
     if head is None:
-        return None
-    splitter, source_config, text_config, prefix, selected = head
+        return _merged_assistant_drafter(Path(model_path), target, lazy = lazy)
+    splitter, source_config, text_config, rename, selected = head
     module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
     if not hasattr(module, "Model"):
         raise ValueError(f"mlx-vlm has no drafter for {splitter.output_model_type} MTP heads")
     tensors, source_is_mlx = {}, False
     for file, keys in selected:
         source_is_mlx = source_is_mlx or (splitter.supports_mlx_source and _is_mlx_safetensors(file))
-        tensors.update((key.removeprefix(prefix), value) for key, value in splitter.load_shard(file, keys).items())
+        tensors.update((rename(key), value) for key, value in splitter.load_shard(file, keys).items())
     tensors, fp8_quantization = transform_fp8_weights(tensors, source_config)
     if fp8_quantization is not None:
         source_config = {**source_config, "quantization": fp8_quantization}
@@ -1996,17 +2072,22 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool 
         **splitter.extra_config(text_config),
     }
     model = module.Model(module.ModelConfig.from_dict(config))
+
+    def stored(name, layer):
+        # Overrides can name checkpoint paths the splitter renamed (``mtp.fc_embedding``); the packed tensors carry their own widths.
+        if isinstance(quantization.get(name), dict):
+            return quantization[name]
+        if not (hasattr(layer, "to_quantized") and f"{name}.scales" in weights):
+            return False
+        in_dims = layer.weight.shape[-1]
+        return {
+            "group_size": in_dims // weights[f"{name}.scales"].shape[-1],
+            "bits": weights[f"{name}.weight"].shape[-1] * 32 // in_dims,
+            "mode": quantization.get("mode", "affine"),
+        }
+
     if quantization is not None:
-        nn.quantize(
-            model,
-            group_size = quantization["group_size"],
-            bits = quantization["bits"],
-            mode = quantization.get("mode", "affine"),
-            # Some splitters give per-module settings (DeepSeek-V4: MXFP4 experts, MXFP8 projections).
-            class_predicate = lambda name, layer: (
-                quantization[name] if isinstance(quantization.get(name), dict) else hasattr(layer, "to_quantized") and f"{name}.scales" in weights
-            ),
-        )
+        nn.quantize(model, class_predicate = stored)
     model.load_weights(list(weights.items()), strict = True)
     from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
 

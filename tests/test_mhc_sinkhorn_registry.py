@@ -15,11 +15,9 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""Every transformers mHC mixer with the V4 Sinkhorn chain gets the rewrite and the eager fallback.
-
-The registry check scans the installed transformers' modeling files as text, so the next model that
-copies the mixer (GLM-5.3-Flash did, verbatim) fails here instead of compiling stock unnoticed.
-"""
+"""Every transformers mHC mixer with the V4 Sinkhorn chain must get the rewrite and eager fallback; the registry scans
+installed modeling files as text, so a copy (GLM-5.3-Flash did, verbatim) fails here instead of silently compiling
+stock."""
 
 import json
 import os
@@ -219,8 +217,7 @@ def test_glm5_next_stock_mode_compiles_the_unchanged_mixer(tmp_path):
 
 @pytest.mark.parametrize("model_type", sorted(MODULE_FORWARD_SOURCE_REWRITES))
 def test_unrolled_rewrite_publishes_its_helper_on_the_modeling_module(model_type, monkeypatch):
-    # Block compile rebinds a decoder layer's forward to its modeling module's globals, so the helper
-    # the unrolled mixer calls must resolve there, not only in the generated module.
+    # Block compile rebinds a decoder layer's forward to its modeling module's globals, so the unrolled mixer's helper must resolve there too.
     import importlib
 
     from unsloth_zoo.compiler import module_forward_source_rewrites
