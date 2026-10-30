@@ -325,6 +325,47 @@ def test_hub_layer_passes_real_kernels_validation():
     _check_hub_layer_routing(hub_fn)
 
 
+def test_hub_layer_keeps_routing_after_kernelize_fallback():
+    # kernelize with no matching kernel resets the forward to type(layer).forward.
+    from types import MethodType
+
+    def hub_decorator(fn):
+        # transformers 5.20+ wraps the fallback so it rejects seq_idx without the package.
+        def wrapped(*args, seq_idx = None, **kwargs):
+            if seq_idx is not None:
+                raise ValueError("can't keep packed sequences apart without causal_conv1d")
+            return fn(*args, **kwargs)
+        return _fake_kernels_decorator("causal_conv1d_fn")(wrapped)
+
+    hub_fn = gcc._hub_gdn_function(hub_decorator, _hub_conv)
+    hub_fn.forward = MethodType(type(hub_fn).forward, hub_fn)
+    _check_hub_layer_routing(hub_fn)
+
+
+def test_hub_layer_keeps_routing_after_real_model_kernelize():
+    kernels = pytest.importorskip("kernels")
+    hub_kernels = pytest.importorskip("transformers.integrations.hub_kernels")
+    with_fallback = getattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", None)
+    if with_fallback is None:
+        pytest.skip("transformers has no use_kernel_func_from_hub_with_fallback")
+    # The original decorator, not the one the patch installed; a missing package forces the fallback.
+    with_fallback = getattr(with_fallback, "__wrapped__", with_fallback)
+    hub_fn = gcc._hub_gdn_function(with_fallback("causal_conv1d_fn", "unsloth_missing_causal_conv1d"), _hub_conv)
+    if not isinstance(hub_fn, torch.nn.Module):
+        pytest.skip("transformers did not build a kernels layer")
+
+    @kernels.use_kernelized_func(hub_fn)
+    class Layer(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return hub_fn(*args, **kwargs)
+
+    model = Layer()
+    with kernels.use_kernel_mapping({}):
+        kernels.kernelize(model, mode = kernels.Mode.TRAINING, device = "cpu", use_fallback = True)
+    _check_hub_layer_routing(model)
+    _check_hub_layer_routing(hub_fn)
+
+
 def _wide_ids(lengths, labels, dtype, device):
     return torch.repeat_interleave(
         torch.tensor(labels, dtype = torch.int64), torch.tensor(lengths),

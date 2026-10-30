@@ -898,16 +898,20 @@ def _hub_gdn_function(decorator, torch_function):
     names = frozenset(inspect.signature(dispatch).parameters)
 
     if isinstance(hub_fn, torch.nn.Module):
-        # Hub yields a layer (kernel_layer_name on its class): wrap its forward so kernelize can swap it.
-        hub_forward = hub_fn.forward
+        # Hub yields a layer (kernel_layer_name on its class). Route on a subclass, not the instance:
+        # kernelize's fallback resets the instance forward to type(layer).forward, and a mapped
+        # kernel still replaces the instance forward.
+        hub_class = type(hub_fn)
 
-        @functools.wraps(hub_forward)
-        def forward(*args, **kwargs):
-            if kwargs.get("seq_idx") is not None:
-                return dispatch(*args, **{k: v for k, v in kwargs.items() if k in names})
-            return hub_forward(*args, **kwargs)
+        class Func(hub_class):
+            def forward(self, *args, **kwargs):
+                if kwargs.get("seq_idx") is not None:
+                    return dispatch(*args, **{k: v for k, v in kwargs.items() if k in names})
+                return super().forward(*args, **kwargs)
 
-        hub_fn.forward = forward
+        Func.__name__, Func.__qualname__ = hub_class.__name__, hub_class.__qualname__
+        Func.__module__ = hub_class.__module__
+        hub_fn.__class__ = Func
         # Signature checks (Unsloth's packing gate looks for `seq_idx`) see the dispatch, not (*args, **kwargs).
         hub_fn.__signature__ = inspect.signature(dispatch)
         setattr(hub_fn, _MARK, True)
