@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch >= 2.12 keeps config assignments per thread (a ContextVar per entry). A reentrant checkpoint
-recomputes on autograd's device thread, so the grad graph it compiles there, and that graph's lazily
-compiled backward, never saw a value assigned on the main thread. set_torch_config publishes it."""
+"""torch >= 2.12: reentrant checkpoint recompute (and its compiles) on autograd's device thread must see main-thread config."""
 
 import threading
 import uuid
@@ -255,7 +253,6 @@ def test_config_hash_matches_across_threads():
     [(dynamo_config, "cache_size_limit"), (getattr(torch.compiler, "config", None), "recompile_limit")],
 )
 def test_alias_publishes_its_target(module, name):
-    # cache_size_limit / torch.compiler.config.recompile_limit alias dynamo's per-thread recompile_limit.
     entry = getattr(module, "_config", {}).get(name)
     if entry is None or getattr(entry, "alias", None) is None:
         pytest.skip(f"{name} is not an alias on this torch")

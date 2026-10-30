@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch >= 2.12 keeps torch config assignments per thread (ContextVar), so values set at import are
-lost on autograd's device thread (reentrant checkpoint recompute + its compiles). Publish them to all threads."""
+"""torch >= 2.12 config is per thread; publish values so autograd's device thread (checkpoint recompute) sees them."""
 
 __all__ = [
     "set_torch_config",
@@ -52,7 +51,7 @@ def torch_config_is_per_thread(config_module, name = None):
 
 def _invalidate_caches(config_module):
     if hasattr(config_module, "_is_dirty"):
-        config_module._is_dirty = True  # torch 2.12: one shared hash cache
+        config_module._is_dirty = True
     module_name = getattr(config_module, "__name__", "torch_config")
     for attr, default in _CACHE_VARS:
         if isinstance(getattr(config_module, attr, None), ContextVar):
@@ -65,7 +64,6 @@ def _publish(config_module, name, value, force, depth = 0):
         return False
     alias = getattr(entry, "alias", None)
     if alias is not None:
-        # e.g. dynamo cache_size_limit -> recompile_limit: publish on the target entry.
         module_name, _, target = alias.rpartition(".")
         target_module = sys.modules.get(module_name)
         if target_module is None or depth > 4:
@@ -80,16 +78,13 @@ def _publish(config_module, name, value, force, depth = 0):
 
 
 def publish_torch_config(config_module, name, force = False):
-    """Publish this thread's `config_module.name` to every thread; False if already shared or missing.
-
-    force = True also overrides other threads' assignments and `config.patch`."""
+    """Publish `config_module.name` to every thread; force also overrides other threads and `config.patch`."""
     if _entry(config_module, name) is None:
         return False
     return _publish(config_module, name, getattr(config_module, name), force)
 
 
 def set_torch_config(config_module, name, value, force = False):
-    """`setattr(config_module, name, value)` for every thread."""
     setattr(config_module, name, value)
     _publish(config_module, name, value, force)
     return value
