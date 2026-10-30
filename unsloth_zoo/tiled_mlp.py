@@ -29,7 +29,6 @@ from torch.utils.checkpoint import (
     get_device_states,
 )
 from unsloth_zoo.gradient_checkpointing import set_device_states
-import unsloth_zoo.gradient_checkpointing as _gc
 from unsloth_zoo.device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH
 
 __all__ = [
@@ -160,10 +159,6 @@ class TiledMLP(torch.autograd.Function):
 
         if preserve_rng_state is None:
             preserve_rng_state = True
-        # UNSLOTH_GC_SKIP_RNG_WITHOUT_DROPOUT=1: no snapshot when the MLP draws no random numbers.
-        if preserve_rng_state and _gc.GC_SKIP_RNG_WITHOUT_DROPOUT and isinstance(mlp_module, torch.nn.Module) \
-            and not _gc._rng_snapshot_needed(mlp_forward, mlp_module):
-            preserve_rng_state = False
         ctx.preserve_rng_state = bool(preserve_rng_state)
 
         ctx.save_for_backward(x)
