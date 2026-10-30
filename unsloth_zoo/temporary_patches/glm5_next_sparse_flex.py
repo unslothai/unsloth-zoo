@@ -25,6 +25,7 @@ __all__ = ["patch_glm5_next_sparse"]
 
 import importlib.util
 import inspect
+import os
 
 import torch
 import torch.nn.functional as F
@@ -88,6 +89,29 @@ def _predicted_key_len(indexer, q_len, past_key_values):
     if cached is None or cached.dim() < 2:
         return q_len
     return cached.shape[1] + q_len
+
+
+def _unchunked_fits(indexer, hidden_states, past_key_values):
+    """Upstream's one-shot scoring fits a share of free GPU memory (UNSLOTH_SPARSE_INDEXER_UNCHUNKED_FRACTION,
+    default 0.25; 0 always chunks): it is faster than query chunks, which only save memory."""
+    if torch.compiler.is_compiling() or hidden_states.device.type != "cuda":
+        return False
+    try:
+        fraction = float(os.environ.get("UNSLOTH_SPARSE_INDEXER_UNCHUNKED_FRACTION", "0.25"))
+    except ValueError:
+        fraction = 0.25
+    if fraction <= 0:
+        return False
+    batch, seq_len = hidden_states.shape[:2]
+    kv_len = _predicted_key_len(indexer, seq_len, past_key_values)
+    pools = max(1, kv_len // indexer.index_kpool)
+    # fp32 [B, S, H, pools] scores (matmul, scaled, relu'd copies) plus the [B, S, kv] visibility masks.
+    need = batch * seq_len * (3 * 4 * indexer.n_heads * pools + 2 * kv_len)
+    try:
+        free = torch.cuda.mem_get_info(hidden_states.device)[0]
+    except Exception:
+        return False
+    return need <= fraction * free
 
 
 @torch.no_grad()
@@ -175,11 +199,24 @@ _select_outside = torch.compiler.disable(glm5_next_select)
 def unsloth_glm5_next_indexer_forward(self, hidden_states, q_resid, attention_mask, past_key_values):
     from unsloth_zoo.flex_attention import sparse
     from unsloth_zoo.flex_attention import sparse_blocks as sb
-    from unsloth_zoo.temporary_patches.glm5_next_sparse_flex import _REFERENCE, _select_outside, glm5_next_select
+    from unsloth_zoo.temporary_patches.glm5_next_sparse_flex import (
+        _FAMILY,
+        _REFERENCE,
+        _select_outside,
+        _unchunked_fits,
+        glm5_next_select,
+    )
 
     skip, chunked = sparse.sparse_skip_full_enabled(), sparse.sparse_indexer_chunked_enabled()
     below = _predicted_key_len(self, hidden_states.shape[1], past_key_values) < self.index_topk + self.index_kpool
-    if (below and not skip) or (not below and not chunked):
+    if below:
+        upstream = not skip
+    else:
+        # Opt-in flex reads the patched indexer's layout, so it keeps the patched (chunked) path.
+        upstream = not chunked or (
+            not sparse.sparse_flex_opted_in(_FAMILY) and _unchunked_fits(self, hidden_states, past_key_values)
+        )
+    if upstream:
         return _REFERENCE["indexer"](self, hidden_states, q_resid, attention_mask, past_key_values)
     select = _select_outside if torch.compiler.is_compiling() and sb.in_unsloth_block() else glm5_next_select
     return select(self, hidden_states, q_resid, attention_mask, past_key_values, skip)

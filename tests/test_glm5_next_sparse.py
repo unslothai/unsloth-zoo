@@ -494,3 +494,37 @@ def test_static_cache_key_length_is_the_allocation_before_the_first_prefill():
     Layer.max_cache_len = None
     assert g._predicted_key_len(idx, 60, Cache()) == 60
     assert g._predicted_key_len(idx, 60, None) == 60
+
+
+def test_unchunked_upstream_when_scores_fit_free_memory(monkeypatch):
+    # Above the budget, upstream's one-shot scoring is faster than query chunks: it runs whenever its
+    # scores fit a share of free GPU memory; chunks only when they do not (or flex needs our layout).
+    import types
+
+    g = _patched()
+    config = _text_config()
+    idx = _indexer(config)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device = None: (10 << 30, 80 << 30))
+    small = types.SimpleNamespace(shape = (1, 4096, 8), device = torch.device("cuda", 0))
+    large = types.SimpleNamespace(shape = (1, 262144, 8), device = torch.device("cuda", 0))
+    cpu = types.SimpleNamespace(shape = (1, 4096, 8), device = torch.device("cpu"))
+    assert g._unchunked_fits(idx, small, None)
+    assert not g._unchunked_fits(idx, large, None)
+    assert not g._unchunked_fits(idx, cpu, None)
+    monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_UNCHUNKED_FRACTION", "0")
+    assert not g._unchunked_fits(idx, small, None)
+    monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_UNCHUNKED_FRACTION", "bad")
+    assert g._unchunked_fits(idx, small, None)
+
+    seq = 300
+    hidden, q_resid = _inputs(config, 2, seq)
+    mask = _mask(2, seq, "left")
+    calls = []
+    original = g._REFERENCE["indexer"]
+    monkeypatch.setitem(g._REFERENCE, "indexer", lambda *a: calls.append(1) or original(*a))
+    monkeypatch.setattr(g, "_unchunked_fits", lambda *a: True)
+    idx(hidden_states = hidden, q_resid = q_resid, attention_mask = mask, past_key_values = None)
+    assert calls == [1]
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
+    idx(hidden_states = hidden, q_resid = q_resid, attention_mask = mask, past_key_values = None)
+    assert calls == [1]
