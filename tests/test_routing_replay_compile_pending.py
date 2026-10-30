@@ -226,3 +226,43 @@ def test_non_reentrant_natural_forward_with_identical_inputs_keeps_its_own_routi
     assert not torch.equal(want[0], want[1])
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol = 0, atol = 0)
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_early_stopped_recompute_clears_old_forwards(replay, backend, use_reentrant):
+    # A non-reentrant checkpoint stops its recompute once the saved tensors are rebuilt, so a
+    # compiled layer never reaches the end of its graph: the recompute flag must be set at run
+    # time, else old forwards stay pending and, with input buffers reused, make the next step's
+    # recompute ambiguous (natural routing in the recompute, wrong gradients).
+    layer = _layer(replay)
+    fn = torch.compile(lambda x: layer(x), backend = backend, fullgraph = True)
+    buffers = [torch.arange(1.0, 9.0).reshape(1, 8) for _ in range(2)]
+    scale = torch.arange(1.0, 9.0)
+    for step in range(3):
+        xs, losses, want = [], [], []
+        for k, buffer in enumerate(buffers):
+            forced = [(step + k) % 8, (step + k + 3) % 8]
+            y = buffer.detach().clone().requires_grad_()
+            weights = y.softmax(-1).gather(-1, torch.tensor([forced]))
+            want.append(torch.autograd.grad((y.sin() * weights.sum(-1, keepdim = True) * scale).sum(), y)[0])
+            x = buffer.detach().requires_grad_()
+            xs.append(x)
+            replay._STATE.in_forward = True
+            replay._STATE.current = torch.tensor([[forced]])
+            if replay._STATE.recomputed:
+                replay._STATE.pending.clear()
+                replay._STATE.recomputed = False
+            replay._STATE.record = {}
+            replay._STATE.pending.append(replay._STATE.record)
+            replay._STATE.has_pending = True
+            out, ids = checkpoint(fn, x, use_reentrant = use_reentrant)
+            replay._STATE.in_forward = False
+            replay._STATE.record = None
+            assert ids.sort(-1).values.tolist() == [sorted(forced)]
+            losses.append((out * scale).sum())
+        replay._STATE.current = None
+        sum(losses).backward()
+        assert replay._STATE.recomputed and len(replay._STATE.pending) == 2, step
+        for x, w in zip(xs, want):
+            torch.testing.assert_close(x.grad, w)

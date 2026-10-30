@@ -559,6 +559,10 @@ def _recompute_impl(
     ids2: torch.Tensor, signature: typing.Optional[torch.Tensor],
     layer_input: typing.Optional[torch.Tensor], layer_index: int,
 ) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    if _STATE.pending:
+        # Set at run time: a non-reentrant checkpoint stops its recompute early, so the traced
+        # assignment (replayed after the graph) never runs and old forwards would stay pending.
+        _STATE.recomputed = True
     picked = _pick_recorded(layer_index, ids2, signature, layer_input) if _STATE.pending else _NATURAL
     if picked is _NATURAL:
         return _natural_impl(ids2)
