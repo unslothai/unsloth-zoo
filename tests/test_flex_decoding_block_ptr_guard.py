@@ -170,9 +170,10 @@ def _recording_call(seen):
 
 @pytest.mark.parametrize("requested, expected", [
     (None, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}),
-    ({}, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}),
+    # An explicit dict replaces the presets, as the compiled call's functools.partial does without the guard.
+    ({}, {"FORCE_USE_FLEX_ATTENTION": True}),
     ({"BLOCK_M": 16}, {"BLOCK_M": 16, "FORCE_USE_FLEX_ATTENTION": True}),
-    ({"FORCE_USE_FLEX_ATTENTION": False}, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": False}),
+    ({"FORCE_USE_FLEX_ATTENTION": False}, {"FORCE_USE_FLEX_ATTENTION": False}),
     ({"BACKEND": "TRITON_DECODE"}, {"BACKEND": "TRITON_DECODE"}),
 ])
 def test_generic_flex_attention_takes_the_main_kernel_when_flex_decoding_cannot_compile(requested, expected):
@@ -208,7 +209,7 @@ def test_generic_flex_attention_accepts_kernel_options_positionally():
     assert seen == [
         (0.5, {"BLOCK_M": 16, "FORCE_USE_FLEX_ATTENTION": True}),
         (0.5, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}),
-        (0.5, {"BLOCK_M": 32, "BLOCK_N": 8, "FORCE_USE_FLEX_ATTENTION": True}),
+        (0.5, {"BLOCK_N": 8, "FORCE_USE_FLEX_ATTENTION": True}),
         (None, {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}),
     ]
     with pytest.raises(TypeError):
@@ -221,19 +222,56 @@ def test_kernel_options_position_matches_installed_torch():
     assert list(inspect.signature(torch_flex).parameters)[U._kernel_options_position()] == "kernel_options"
 
 
+def _select_torch_2_9(options):
+    # torch 2.9 lowering: no BACKEND; flex_decoding unless FORCE_USE_FLEX_ATTENTION.
+    return "main" if options.get("FORCE_USE_FLEX_ATTENTION", False) else "decode"
+
+
+def _select_torch_2_12(options):
+    # torch 2.10 - 2.12: BACKEND plus the legacy knob is rejected; AUTO picks flex_decoding unless forced.
+    if "BACKEND" in options and options.get("FORCE_USE_FLEX_ATTENTION", False):
+        raise ValueError("BACKEND cannot be combined with legacy FORCE_USE_FLEX_ATTENTION")
+    backend = options.get("BACKEND", "AUTO")
+    if backend == "TRITON_DECODE" or (backend == "AUTO" and not options.get("FORCE_USE_FLEX_ATTENTION", False)):
+        return "decode"
+    return "main"
+
+
+@pytest.mark.parametrize("select", [_select_torch_2_9, _select_torch_2_12])
 @pytest.mark.parametrize("requested, expected", [
-    ({"BACKEND": "AUTO"}, {"BLOCK_M": 32, "BACKEND": "TRITON"}),
-    ({"BACKEND": "AUTO", "BLOCK_M": 16}, {"BLOCK_M": 16, "BACKEND": "TRITON"}),
-    ({"BACKEND": "TRITON"}, {"BACKEND": "TRITON"}),
-    ({"BACKEND": "FLASH"}, {"BACKEND": "FLASH"}),
+    ({"BACKEND": "AUTO"}, {"FORCE_USE_FLEX_ATTENTION": True}),
+    ({"BACKEND": "AUTO", "BLOCK_M": 16}, {"BLOCK_M": 16, "FORCE_USE_FLEX_ATTENTION": True}),
 ])
-def test_explicit_auto_backend_takes_the_main_kernel_too(requested, expected):
-    # torch rejects BACKEND together with FORCE_USE_FLEX_ATTENTION, so AUTO becomes TRITON instead.
+def test_explicit_auto_backend_takes_the_main_kernel_on_every_torch(select, requested, expected):
+    # torch 2.9 ignores BACKEND="TRITON" when choosing flex_decoding, so AUTO is dropped for the legacy knob instead.
+    seen = []
+    guarded = U._main_kernel_for_short_queries(_strict_flex(seen), {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True})
+    q = torch.randn(1, 2, 1, 8)
+    caller = dict(requested)
+    guarded(q, q, q, kernel_options = caller)
+    assert seen == [(None, expected)] and caller == requested
+    assert select(seen[0][1]) == "main"
+
+
+@pytest.mark.parametrize("requested", [{"BACKEND": "TRITON"}, {"BACKEND": "FLASH"}, {"BACKEND": "TRITON_DECODE"}])
+def test_named_backend_is_left_alone(requested):
     seen = []
     guarded = U._main_kernel_for_short_queries(_strict_flex(seen), {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True})
     q = torch.randn(1, 2, 1, 8)
     guarded(q, q, q, kernel_options = dict(requested))
-    assert seen == [(None, expected)]
+    assert seen == [(None, requested)]
+
+
+def test_partial_backward_tile_override_is_not_mixed_with_preset_tiles():
+    # A 32-row preset with a caller's BLOCK_M1 = 64 would pair BLOCK_M1 = 64 with the preset BLOCK_N1 = 32, which the
+    # backward template rejects; without the guard the caller's dict replaced the presets.
+    seen = []
+    forced = {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_M1": 32, "BLOCK_N1": 32, "BLOCK_M2": 32, "BLOCK_N2": 32,
+              "FORCE_USE_FLEX_ATTENTION": True}
+    guarded = U._main_kernel_for_short_queries(_strict_flex(seen), forced)
+    q = torch.randn(1, 2, 1, 8)
+    guarded(q, q, q, kernel_options = {"BLOCK_M1": 64})
+    assert seen == [(None, {"BLOCK_M1": 64, "FORCE_USE_FLEX_ATTENTION": True})]
 
 
 def test_decode_option_helpers_return_copies(monkeypatch):
@@ -244,6 +282,26 @@ def test_decode_option_helpers_return_copies(monkeypatch):
     U.decode_kernel_kwargs()["kernel_options"]["BLOCK_N"] = 1
     assert forced == {"BLOCK_M": 32, "FORCE_USE_FLEX_ATTENTION": True}
     assert U.decode_kernel_options() == forced and U.decode_kernel_kwargs() == {"kernel_options": forced}
+
+
+def _documented_shim(base, shape, strides, offsets, block_shape, order, _semantic = None):
+    """Compatibility implementation: block pointers have been removed upstream, so build one here."""
+    # raise NotImplementedError("Block pointers have been removed") is what upstream does
+    return base
+
+
+def _documented_removed(base, shape, strides, offsets, block_shape, order, _semantic = None):
+    """
+    Block pointers have been removed. Use a tensor descriptor instead.
+    """
+    raise NotImplementedError("Block pointers have been removed in favor of the tensor descriptor API")
+
+
+@pytest.mark.parametrize("fn, removed", [(_documented_shim, False), (_documented_removed, True), (_removed, True)])
+def test_triton_probe_reads_the_raise_not_the_docstring(monkeypatch, fn, removed):
+    tl = pytest.importorskip("triton.language")
+    monkeypatch.setattr(tl, "make_block_ptr", fn)
+    assert U._triton_block_ptr_removed() is removed
 
 
 def test_triton_probe_does_not_follow_a_working_shim_to_the_removed_stub(monkeypatch):

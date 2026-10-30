@@ -451,10 +451,23 @@ def _triton_block_ptr_removed():
             fn = fn.__wrapped__
             continue
         try:
-            return "have been removed" in inspect.getsource(code)
+            return _raises_removed_error(inspect.getsource(code))
         except Exception:
             return False
     return False
+
+
+def _raises_removed_error(source):
+    # Triton 3.9's make_block_ptr is a docstring plus one `raise NotImplementedError("... have been removed ...")`. Only
+    # that statement counts: a working shim may mention the removal in a comment or docstring.
+    import ast
+    import textwrap
+    tree = ast.parse(textwrap.dedent(source))
+    fn = next(n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    body = fn.body[1:] if ast.get_docstring(fn) is not None else fn.body
+    if len(body) != 1 or not isinstance(body[0], ast.Raise) or body[0].exc is None:
+        return False
+    return "have been removed" in ast.unparse(body[0].exc)
 
 
 def _torch_template_uses_block_ptr(*candidates):
@@ -516,17 +529,19 @@ def _kernel_options_position():
 
 
 def _main_kernel_options(requested, forced_options):
-    """kernel_options that keep a short query off flex_decoding. A caller's own options stay on top; a named BACKEND
-    other than AUTO chose the kernel itself. An explicit AUTO becomes TRITON, since torch rejects BACKEND together with
-    FORCE_USE_FLEX_ATTENTION."""
-    requested = dict(requested or {})
-    backend = requested.get("BACKEND")
-    if backend is None:
-        return {**forced_options, **requested}
-    if backend == "AUTO":
-        tiles = {k: v for k, v in forced_options.items() if k != "FORCE_USE_FLEX_ATTENTION"}
-        return {**tiles, **requested, "BACKEND": "TRITON"}
-    return requested
+    """kernel_options that keep a short query off flex_decoding. With no options the compiled call's own memory presets
+    apply; an explicit dict replaces them as it does without the guard (a partial tile override must not be mixed with
+    preset tiles), so it only gains FORCE_USE_FLEX_ATTENTION. A named BACKEND other than AUTO chose the kernel itself.
+    An explicit AUTO is dropped: torch 2.9 has no BACKEND and only reads FORCE_USE_FLEX_ATTENTION, and 2.10+ rejects
+    BACKEND together with it."""
+    if requested is None:
+        return dict(forced_options)
+    requested = dict(requested)
+    if requested.get("BACKEND") == "AUTO":
+        del requested["BACKEND"]
+    if "BACKEND" in requested:
+        return requested
+    return {"FORCE_USE_FLEX_ATTENTION": True, **requested}
 
 
 def _main_kernel_for_short_queries(flex_attention_fn, forced_options):
