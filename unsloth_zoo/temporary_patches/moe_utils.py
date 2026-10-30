@@ -2224,8 +2224,7 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     names = ("gate_up_proj", "down_proj")
     params = experts_module._parameters
     instance_dict = experts_module.__dict__
-    # torch < 2.6 Dynamo traces the `_parameters` setitem but keeps reading the original Parameters
-    # (wrong output, no grads to the swapped tensors): shadow through __dict__ there (graph-breaks, correct).
+    # torch < 2.6 Dynamo ignores the `_parameters` swap (wrong output, no grads): shadow via __dict__ instead.
     registered = {} if _SWAP_VIA_INSTANCE_DICT else {name: params[name] for name in names if name in params}
     saved = {name: instance_dict[name] for name in names if name not in registered and name in instance_dict}
     for name, tensor in zip(names, (gate_up_proj, down_proj)):
