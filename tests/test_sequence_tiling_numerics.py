@@ -14,7 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """sequence_tiling.tiled_call vs the untiled module: loss, input grad and every parameter grad; CPU only.
-The test_old_* cases pin the defects of tiled_mlp.TiledMLP that the new engine fixes (failing-first evidence)."""
+Frozen-input LoRA grads, width-changing projectors, router-logit grads and once-per-backward grad hooks are the cases
+the removed tiled_mlp.TiledMLP got wrong."""
 import functools
 import os
 import sys
@@ -27,14 +28,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 from _sequence_tiling_models import (  # noqa: E402
     GatedMLP, TopKMoE, load_balancing_loss, lora_mlp, grads, H,
 )
-from unsloth_zoo.sequence_tiling import tiled_call, bucket_tiles, plan_tile_rows  # noqa: E402
-from unsloth_zoo.tiled_mlp import TiledMLP  # noqa: E402
+from unsloth_zoo.sequence_tiling import tiled_call, bucket_tiles  # noqa: E402
 
 TOL = {torch.float32: (1e-5, 1e-6), torch.bfloat16: (2e-2, 2e-2), torch.float16: (2e-3, 2e-3)}
-
-
-def _old_tiled(module, x, n_shards, preserve_rng = False):
-    return TiledMLP.apply(module.forward, module, x, preserve_rng, n_shards, None)
 
 
 def _run(module, x, call, loss_fn = None):
@@ -117,18 +113,6 @@ def test_frozen_input_mlp_only_lora():
     _assert_close(ref, _run(m, x, _new(4)))
 
 
-def test_old_frozen_input_gives_no_lora_grads():
-    m = lora_mlp()
-    x = torch.randn(2, 40, H)
-    try:
-        old = _run(m, x, lambda m, x: _old_tiled(m, x, 4))
-    except RuntimeError as e:
-        # Nothing in the graph requires grad: the old Function cannot even backprop.
-        assert "does not require grad" in str(e)
-        return
-    assert all(g is None for k, g in old[2].items() if "lora" in k)
-
-
 def test_full_ft_and_frozen_base():
     for m in (GatedMLP(), lora_mlp()):
         x = torch.randn(3, 21, H, requires_grad = True)
@@ -143,13 +127,6 @@ def test_width_changing_projector():
     new = _run(m, x, _new(4))
     _assert_close(ref, new)
     assert new[3].shape == (2, 30, 24)
-
-
-def test_old_width_changing_projector_breaks():
-    m = GatedMLP(hidden = H, inter = 40, out = 24)
-    x = torch.randn(2, 30, H, requires_grad = True)
-    with pytest.raises(RuntimeError):
-        _run(m, x, lambda m, x: _old_tiled(m, x, 4))
 
 
 def _moe_loss(out, w = 0.37):
@@ -167,19 +144,6 @@ def test_moe_router_logits_and_aux_loss():
     assert new[3][1].shape == ref[3][1].shape == (58, 4)
     # Inferred contract gives the same.
     _assert_close(ref, _run(m, x, _new(4), _moe_loss))
-
-
-def test_old_extra_output_gradients_ignored():
-    torch.manual_seed(0)
-    m = TopKMoE()
-    x = torch.randn(1, 29, H, requires_grad = True)
-    ref = _run(m, x, lambda m, x: m(x), lambda o: (o[1].float() ** 2).mean())
-    assert ref[2]["gate.weight"].abs().sum() > 0
-    try:
-        old = _run(m, x, lambda m, x: _old_tiled(m, x, 4), lambda o: (o[1].float() ** 2).mean())
-    except RuntimeError:
-        return  # router logits [N, E] concatenated on dim -2 do not even line up
-    assert old[2]["gate.weight"] is None or not torch.allclose(old[2]["gate.weight"], ref[2]["gate.weight"])
 
 
 def test_sum_contract_and_token_args():
@@ -266,17 +230,6 @@ def test_param_grad_hooks_fire_once():
     assert fired and all(v == 1 for v in fired.values()), fired
 
 
-def test_old_param_grad_hooks_fire_per_chunk():
-    m = lora_mlp()
-    fired = {}
-    for n, p in m.named_parameters():
-        if p.requires_grad:
-            p.register_post_accumulate_grad_hook(lambda p, n = n: fired.__setitem__(n, fired.get(n, 0) + 1))
-    x = torch.randn(2, 40, H, requires_grad = True)
-    _old_tiled(m, x, 4).pow(2).mean().backward()
-    assert max(fired.values()) == 4, fired
-
-
 def _layer(m, tiles):
     def layer(h):
         h = h * 1.5 + 0.1
@@ -321,16 +274,11 @@ def test_unsloth_shim_installed_frozen_input(monkeypatch):
     _assert_close(_run(m, x, lambda m, x: m(x)), _run(m, x, _new(4)))
 
 
-def test_bucket_and_plan():
+def test_bucket():
     assert bucket_tiles(100, 128) == 1
     assert bucket_tiles(129, 128) == 2
     assert bucket_tiles(1000, 128) == 8
     assert bucket_tiles(10 ** 7, 128, cap = 64) == 64
-    assert plan_tile_rows(4096, 14336, torch.bfloat16, "arctic") == 4096
-    assert plan_tile_rows(4096, 14336, torch.bfloat16, "rows:512") == 512
-    t = plan_tile_rows(4096, 14336, torch.bfloat16, "target:2")
-    assert t % 64 == 0 and t > 64
-    assert plan_tile_rows(4096, 14336, torch.bfloat16, "auto", device = "cpu") >= 64
 
 
 @pytest.mark.parametrize("frozen", [False, True])

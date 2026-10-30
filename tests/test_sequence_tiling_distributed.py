@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """sequence_tiling under DDP, FSDP2 (fully_shard) and TP (DTensor col/row parallel): gradients equal to one process,
 every grad hook once per backward, no per-tile communication beyond the untiled module. CPU gloo by default; run as a
-script under torchrun with SEQ_TILING_BACKEND=nccl for the GPU cells. The old TiledMLP DDP cell pins its defect."""
+script under torchrun with SEQ_TILING_BACKEND=nccl for the GPU cells."""
 import json
 import os
 import sys
@@ -61,9 +61,6 @@ class Net(torch.nn.Module):
             h = h + tiled_call(self.mlp, h, n_tiles = N_TILES, needs_rng = False)
         elif self.tiled == "new":
             h = h + self.mlp(h)
-        elif self.tiled == "old":
-            from unsloth_zoo.tiled_mlp import TiledMLP
-            h = h + TiledMLP.apply(self.mlp.forward, self.mlp, h, False, N_TILES, None)
         else:
             h = h + self.mlp(h)
         return self.head(h).float().pow(2).mean()
@@ -141,19 +138,6 @@ def cell_ddp(rank, world, device, out):
             assert fired and all(v == 1 for v in fired.values()), fired
         res[mode] = {"hooks_max": max(fired.values()), "bucket_allreduces": len(reduces)}
     assert res["new"]["bucket_allreduces"] == res["untiled"]["bucket_allreduces"]
-    # Old engine: per-chunk autograd.backward marks each LoRA param ready N_TILES times, or never (frozen input).
-    model = Net("old").to(device)
-    ddp = DDP(model, device_ids = None if device.type == "cpu" else [device.index])
-    fired = _hook_counter(model)
-    try:
-        ddp(_data(rank).to(device)).backward()
-        lora_ok = all(
-            p.grad is not None and torch.allclose(p.grad, ref[n], rtol = 1e-5, atol = 1e-6)
-            for n, p in model.named_parameters() if "lora" in n
-        )
-        res["old"] = {"error": None, "lora_grads_match": lora_ok, "hooks": fired}
-    except Exception as e:
-        res["old"] = {"error": f"{type(e).__name__}: {str(e)[:160]}"}
     out["ddp"] = res
 
 

@@ -28,7 +28,6 @@ import torch
 
 __all__ = [
     "tiled_call",
-    "plan_tile_rows",
     "bucket_tiles",
 ]
 
@@ -253,53 +252,4 @@ def bucket_tiles(rows, tile_rows, cap = 64):
     while p < n and p < cap:
         p *= 2
     return int(min(p, max(1, int(cap))))
-pass
-
-
-def _budget_helpers():
-    try:
-        from unsloth_zoo.memory_budget import get_max_flat_qlen, _default_target_gb
-    except Exception:
-        from unsloth_zoo.tiled_mlp import get_max_flat_qlen, _default_target_gb
-    return get_max_flat_qlen, _default_target_gb
-pass
-
-
-def plan_tile_rows(hidden, intermediate, dtype, mode = "auto", device = None, padded_length = 64):
-    """
-    Rows per tile, planned outside any compiled region.
-    mode: "auto" (budget from half the free memory on `device`), "arctic" (rows = hidden), "rows:N" or an int,
-    "target:GB" or a float (GB budget).
-    """
-    hidden = int(hidden)
-    if isinstance(intermediate, (list, tuple)):
-        intermediate = intermediate[0]
-    intermediate = int(intermediate) if intermediate else 4 * hidden
-    if isinstance(mode, bool) or mode is None:
-        mode = "auto"
-    if isinstance(mode, int):
-        return max(1, mode)
-    target_gb = None
-    if isinstance(mode, float):
-        target_gb = mode
-    else:
-        m = str(mode).strip().lower()
-        if m in ("arctic", "1", "true"):
-            if m == "arctic":
-                return max(1, hidden)
-            m = "auto"
-        if m.startswith("rows:"):
-            return max(1, int(m.split(":", 1)[1]))
-        if m.startswith("target:"):
-            target_gb = float(m.split(":", 1)[1])
-        elif m != "auto":
-            raise ValueError(f"Unsloth: unknown tile mode {mode!r}; use auto, arctic, rows:N or target:GB.")
-    get_max_flat_qlen, _default_target_gb = _budget_helpers()
-    if target_gb is None:
-        target_gb = _default_target_gb(device)
-    nbytes = torch.empty((), dtype = dtype).element_size() if isinstance(dtype, torch.dtype) else int(dtype)
-    return int(get_max_flat_qlen(
-        hd = hidden, mlp_size = intermediate, nbytes = nbytes,
-        target_gb = float(target_gb), padded_length = padded_length,
-    ))
 pass
