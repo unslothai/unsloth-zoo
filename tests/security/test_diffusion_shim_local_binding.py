@@ -14,18 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The DiffusionGemma shim is a local sidecar, and only local callers may drive it.
-
-Unsloth Studio starts this listener on loopback by itself when a DiffusionGemma
-GGUF is selected, with no credential of any kind. Loopback is not a boundary a
-browser respects: a page the user happens to be visiting can POST to 127.0.0.1
-cross-site with no preflight (a text/plain body is a CORS simple request), and a
-hostname rebound to 127.0.0.1 makes the reply readable as well. These tests pin
-the request binding that closes both, and the ceiling that stops one caller from
-holding the single-sequence decoder's lock for an arbitrary length of time.
-
-Everything here runs against the ASGI app in-process; no socket is opened.
-"""
+"""Pins the Host and Origin checks of the DiffusionGemma shim (no credential; loopback is no boundary against cross-site
+POST or DNS rebinding) and its generation ceiling that stops one caller holding the single-sequence decoder lock;
+in-process, no socket"""
 
 from __future__ import annotations
 
@@ -56,8 +47,7 @@ def client(monkeypatch):
 
     def _generate_visual(server, messages, **kwargs):
         calls.append(kwargs)
-        # The real server closes a turn with STATS. Standing in without them would
-        # quietly make every finish-reason assertion unfailable.
+        # The real server closes each turn with STATS; a stand-in that omits them would make every finish-reason assertion unfailable.
         blocks = kwargs.get("max_blocks", 8)
         on_stats = kwargs.get("on_stats")
         if on_stats is not None:
@@ -98,8 +88,7 @@ def test_a_cross_site_referer_is_refused(client):
 
 
 def test_a_rebound_hostname_is_refused(client):
-    """DNS rebinding is how this listener's replies become readable cross-origin.
-    The attacker's name resolves to 127.0.0.1, so only the Host tells them apart."""
+    """DNS rebinding makes replies readable cross-origin, since the attacker's name resolves to 127.0.0.1; only the Host header tells them apart."""
     for path in ("/health", "/v1/models"):
         response = client.get(path, headers = {"Host": "attacker.example:8123"})
         assert response.status_code == 403, (path, response.text)
@@ -113,8 +102,7 @@ def test_a_rebound_hostname_is_refused(client):
 # --- An ordinary local client keeps working ---
 
 def test_an_unparseable_host_is_refused_not_a_500(client):
-    """Uncaught, `urlsplit` raising is a 500; a host nobody can parse is the one
-    least worth trusting."""
+    """An unparseable Host must be refused with 403: an uncaught urlsplit error would be a 500, and such a host is the one least worth trusting."""
     response = client.post("/v1/chat/completions", json = BODY, headers = {"Host": "[oops]"})
     assert response.status_code == 403, response.text
 
@@ -136,8 +124,7 @@ def test_a_second_origin_header_cannot_ride_behind_a_local_one(client):
 
 @pytest.mark.parametrize("spelling", ["127.1", "2130706433", "0x7f000001"])
 def test_a_short_loopback_spelling_is_still_this_machine(spelling):
-    """`curl http://127.1:8123` is a user reaching their own machine, and a numeric
-    literal cannot be rebound. Studio's host_policy reads them the same way."""
+    """Short loopback spellings such as 127.1 are this machine, since a numeric literal cannot be rebound; Studio's host_policy reads them the same way."""
     assert shim._is_local_name(spelling) is True
     assert shim._is_local_name("1") is False          # 0.0.0.1, not loopback
     assert shim._is_local_name("evil.example") is False
@@ -166,8 +153,7 @@ def test_a_local_page_is_served(client, origin):
 
 
 def test_a_published_listener_still_answers_its_own_name(client, monkeypatch):
-    """--host 0.0.0.0 is the operator publishing this deliberately, so the Host is
-    whatever name they reach it by. The Origin rule still holds."""
+    """With --host 0.0.0.0 the operator publishes the listener on purpose, so any Host name is accepted; the Origin rule still applies."""
     monkeypatch.setitem(shim._STATE, "host", "0.0.0.0")
     response = client.get("/health", headers = {"Host": "workstation.lan:8123"})
     assert response.status_code == 200, response.text
@@ -176,8 +162,7 @@ def test_a_published_listener_still_answers_its_own_name(client, monkeypatch):
 # --- One caller cannot take the decoder for as long as it likes ---
 
 def test_max_tokens_is_clamped(client):
-    """_max_blocks sizes the generation, and the request holds the process-wide
-    lock for the whole of it."""
+    """max_tokens is clamped because _max_blocks sizes the generation and the request holds the process-wide lock for all of it."""
     response = client.post(
         "/v1/chat/completions", json = {**BODY, "max_tokens": 10 ** 9},
     )
@@ -203,8 +188,7 @@ def test_the_ceiling_is_configurable(client, monkeypatch):
 # --- A reply this server cut short does not report a natural stop ---
 
 def test_a_capped_generation_reports_length(client):
-    """Otherwise a truncated answer is indistinguishable from a complete one and the
-    client never runs the continuation it would against any other OpenAI server."""
+    """A capped generation must report finish_reason length, or a truncated answer looks complete and clients skip the continuation they run on other servers."""
     client.calls.clear()
     response = client.post("/v1/chat/completions", json = {**BODY, "max_tokens": 10 ** 9})
     assert response.status_code == 200, response.text
@@ -212,15 +196,13 @@ def test_a_capped_generation_reports_length(client):
 
 
 def test_an_uncapped_generation_still_reports_stop(client):
-    """A request inside the ceiling that ends on its own finished naturally; saying
-    `length` there is the same bug reversed."""
+    """A generation that ends before the ceiling reports stop; reporting length there would be the same bug reversed."""
     response = client.post("/v1/chat/completions", json = BODY)
     assert response.json()["choices"][0]["finish_reason"] == "stop"
 
 
 def test_a_capped_request_that_stops_early_still_reports_stop(client, monkeypatch):
-    """Capped is not truncated: fewer blocks than the ceiling allowed means the
-    ceiling is not what ended it."""
+    """A capped request that stops early reports stop: fewer blocks than the ceiling means the ceiling did not end generation."""
     def _short(server, messages, seed = 3407, max_blocks = 8, on_frame = None,
                on_commit = None, on_stats = None, tools = None):
         if on_stats is not None:
@@ -232,8 +214,7 @@ def test_a_capped_request_that_stops_early_still_reports_stop(client, monkeypatc
 
 
 def test_a_capped_streaming_generation_reports_length(client):
-    """The streaming path emits its own terminal chunk, and a client reading deltas
-    sees only that last finish_reason."""
+    """Streaming emits its own terminal chunk, and delta readers see only its finish_reason, so the capped stream must report length too."""
     response = client.post(
         "/v1/chat/completions", json = {**BODY, "max_tokens": 10 ** 9, "stream": True},
     )

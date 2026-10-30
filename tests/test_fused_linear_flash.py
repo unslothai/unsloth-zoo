@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Flash-style forward gradient (frozen head, vocab tiles): fp64 oracle, never less accurate than the [rows, V]
-chunks it replaces, bit-identical no-grad / frozen / trainable passes, the kill switch, and cross entropy."""
+"""Flash-style frozen-head gradient: no less accurate than [rows, V] chunks; bit-identical passes."""
 
 import pytest
 import torch

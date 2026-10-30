@@ -92,7 +92,6 @@ def test_numeric_index_now_assigned():
     "visual.blocks.x.weight",
 ])
 def test_unresolvable_path_raises(path):
-    """Failures must surface as catchable errors so the caller can report them
-    instead of the old bare `except:` swallowing everything."""
+    """Failures must surface as catchable errors the caller can report, not be swallowed by a bare `except:`."""
     with pytest.raises((AttributeError, IndexError, KeyError, TypeError, ValueError)):
         _set_module_attribute(_build_model(), path, torch.zeros(1))

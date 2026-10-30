@@ -14,38 +14,22 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A packed 4-bit weight with no quant_state must be named, never fed to F.linear.
-
-unsloth #9867, #10010, #10017, #10276. transformers 5.4.0 and 5.5.x discard the
-bitsandbytes quant_state sidecars of pre-quantized composite checkpoints. The
-patched Linear4bit.forward used to treat the resulting ``quant_state is None`` as
-"this layer is simply not quantized" and call ``F.linear`` on the packed [N, 1]
-uint8 buffer, producing
-
-    RuntimeError: mat1 and mat2 shapes cannot be multiplied (8x5120 and 1x15728640)
-
-which reads like a corrupt checkpoint.
-
-CPU only, no GPU, no bitsandbytes CUDA kernels, no network.
-"""
+"""A packed 4-bit weight without quant_state must be named as an error, never fed to F.linear; transformers 5.4.0 and
+5.5.x drop these sidecars (unsloth issues 9867, 10010, 10017, 10276); CPU only."""
 
 from __future__ import annotations
 
 import pytest
 
-# `importorskip`, not a bare import: a torch-less runner turns a bare import into a
-# COLLECTION ERROR, which aborts the session instead of skipping the module.
+# Use importorskip, not a bare import: a torch-less runner turns a bare import into a collection error that aborts the session instead of skipping the module.
 torch = pytest.importorskip("torch")
 
 from unsloth_zoo.temporary_patches import bitsandbytes as bnb_patch
 
 
 class _FakeLinear4bit(torch.nn.Module):
-    """The shape of a Linear4bit after a load that dropped the quant_state.
-
-    Both feature counts are always set: the real class subclasses ``nn.Linear``, so leaving
-    them off fires the guard through a default no real module reaches.
-    """
+    """Fake Linear4bit as left by a load that dropped quant_state; both feature counts are always set, since leaving
+    them off fires the guard via an unreachable default."""
 
     def __init__(self, weight, bias = None, out_features = 5120, in_features = 5120):
         super().__init__()
@@ -64,11 +48,8 @@ def _packed_weight(n_bytes = 8192):
 
 
 def _real_bitsandbytes():
-    """The installed bitsandbytes, or skip.
-
-    ``importorskip`` is not enough: zoo installs `stubs/bitsandbytes_stub.py` under that name,
-    so the import succeeds and every attribute is a permissive no-op the patch cannot patch.
-    """
+    """Real bitsandbytes or skip: importorskip is not enough, as zoo installs `stubs/bitsandbytes_stub.py` under that
+    name, with no-op attributes the patch cannot patch."""
     bitsandbytes = pytest.importorskip("bitsandbytes")
     from unsloth_zoo.stubs.bitsandbytes_stub import real_bitsandbytes_available
     if not real_bitsandbytes_available():
@@ -82,8 +63,8 @@ def _patched_forward():
     bnb_patch.patch_bitsandbytes_linear4bit_forward()
     forward = bitsandbytes.nn.modules.Linear4bit.forward
     forward = getattr(forward, "__wrapped__", forward)
-    # patch_function can decline and return False, which this patch discards; without this
-    # a test would silently exercise upstream bitsandbytes and pass.
+    # patch_function can decline by returning False, which this patch discards; without this assert a test would
+    # silently exercise upstream bitsandbytes and pass.
     assert forward.__module__ == "unsloth_zoo.temporary_patches.bitsandbytes"
     return forward
 
@@ -106,27 +87,23 @@ def test_error_message_names_the_transformers_window_when_installed(monkeypatch)
     monkeypatch.setattr(
         bnb_patch, "_transformers_drops_prequantized_quant_state", lambda: True
     )
-    # Explicitly the no-repair case, so this cannot depend on whether something else in the
-    # session installed the runtime repair. The repair branch is asserted in
-    # tests/test_composite_conversion_rescope.py.
+    # Forces the no-repair case so the result cannot depend on whether another test installed the runtime repair; that
+    # branch is tested in tests/test_composite_conversion_rescope.py.
     monkeypatch.setattr(
         bnb_patch, "_composite_renaming_repair_installed", lambda: False
     )
     message = bnb_patch._packed_weight_without_quant_state_error(_FakeLinear4bit(_packed_weight()))
     assert "5.4.0" in message and "5.5.4" in message
     assert "#45567" in message
-    # Regeneration advice stays conditional on trying a supported transformers first: a
-    # checkpoint whose sidecars really are absent reaches this same branch.
+    # Regeneration advice stays conditional on trying a supported transformers first, since a checkpoint with genuinely absent sidecars reaches the same branch.
     assert "before regenerating anything" in message
     assert "does need rebuilding" in message
-    # 4.57.6 ships no qwen3_5 at all, so it would swap the shape error for an
-    # unrecognised-architecture one. Asserted on the ADVICE: a bare `not in message` also
-    # matches the installed version the message interpolates.
+    # 4.57.6 ships no qwen3_5, so it would swap the shape error for an unrecognised-architecture one; assert on the
+    # advice since a bare `not in message` also matches the version.
     _, _, advice = message.partition("fixed by PR #45567 in 5.6.0.")
     assert advice, "the advice section moved; this assertion no longer reads it"
     assert "4.57" not in advice
-    # The claim about where the state was lost is a version inference, not an
-    # observation of the checkpoint, and must stay hedged.
+    # Where the state was lost is a version inference, not an observation of the checkpoint, so the message must stay hedged.
     assert "most likely" in message
 
 
@@ -200,11 +177,7 @@ def test_unquantized_layer_still_falls_through():
 
 
 def test_a_packed_one_by_one_weight_is_not_mistaken_for_a_scalar_layer():
-    """in_features == out_features == 1 packs to (1, 1), the same shape as unquantized.
-
-    Once the sidecars are lost the weight is a plain Parameter, so `Params4bit` and
-    `bnb_quantized` are both gone; the dtype survives and an unquantized weight is never uint8.
-    """
+    """Without sidecars a packed 1x1 weight is a plain Parameter with the unquantized shape; its uint8 dtype survives, and an unquantized weight is never uint8."""
     forward = _patched_forward()
     packed = _FakeLinear4bit(
         torch.zeros((1, 1), dtype = torch.uint8), out_features = 1, in_features = 1,
@@ -220,11 +193,8 @@ def test_a_packed_one_by_one_weight_is_not_mistaken_for_a_scalar_layer():
 
 @pytest.mark.parametrize("in_features,itemsize", [(2, 1), (4, 2), (8, 4)])
 def test_packed_blob_whose_rows_equal_out_features_is_still_caught(in_features, itemsize):
-    """The arithmetic coincidence a row-count comparison alone misses.
-
-    Packed rows equal ``out_features`` exactly when ``in_features == 2 * itemsize`` (2 uint8,
-    4 fp16/bf16, 8 fp32), so only a real one-input layer may be excused.
-    """
+    """Packed rows equal out_features when in_features == 2 * itemsize (2 uint8, 4 fp16/bf16, 8 fp32), so a row-count
+    check alone misses it; only a real one-input layer is excused."""
     forward = _patched_forward()
     out_features = 16
     packed = torch.zeros((out_features * in_features // (2 * itemsize), 1), dtype = torch.uint8)
@@ -237,19 +207,12 @@ def test_packed_blob_whose_rows_equal_out_features_is_still_caught(in_features, 
 
 
 def test_unquantized_linear4bit_with_one_input_feature_is_not_accused():
-    """A legitimate Linear4bit with in_features == 1 has a (out_features, 1) weight.
-
-    That matches the packed-blob shape test on its own, so the guard also compares
-    against out_features. Without that clause this forward raises instead of
-    returning, which turns a working model into a hard error and tells the user to
-    reinstall transformers over a checkpoint that was never involved.
-    """
+    """A real unquantized Linear4bit with in_features == 1 has a (out_features, 1) weight, so the guard must also
+    compare out_features or it would raise on a working model."""
     bnb = _real_bitsandbytes()
     bnb_patch.patch_bitsandbytes_linear4bit_forward()
     module = bnb.nn.Linear4bit(1, 16)
-    # On CPU bitsandbytes leaves the layer unquantized, which is the state under test.
-    # Pin it, so a future bnb that quantizes here fails loudly instead of quietly
-    # exercising the other branch and passing for the wrong reason.
+    # CPU bitsandbytes leaves the layer unquantized, the tested state; pinned so a future bnb that quantizes here fails loudly, not by passing wrongly.
     assert getattr(module.weight, "quant_state", None) is None
     out = module(torch.randn(4, 1))
     assert tuple(out.shape) == (4, 16)

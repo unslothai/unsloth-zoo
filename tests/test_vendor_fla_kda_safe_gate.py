@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""GLM-5.3-Flash's bounded KDA gates run fla's safe_gate path (with fla #1242 / #1554 backported);
-Kimi-Linear, unbounded configs and unsupported hosts keep safe_gate=False."""
+"""GLM-5.3-Flash's bounded KDA gates use the fla safe_gate path (upstream fla 1242 and 1554 backported); Kimi-Linear,
+unbounded configs and unsupported hosts keep safe_gate=False."""
 
 import importlib.util
 import os
@@ -51,8 +51,7 @@ def test_fla_1242_and_1554_are_backported():
 
 
 def _fake_glm5(monkeypatch, hardware = True):
-    """A glm5_next module whose chunk_kimi_delta_attention closes over ``implementation`` like
-    transformers' kernel-hub fallback wrapper."""
+    """Fake glm5_next module whose chunk_kimi_delta_attention closes over `implementation` like transformers' kernel-hub fallback wrapper."""
     import types
     seen = []
 

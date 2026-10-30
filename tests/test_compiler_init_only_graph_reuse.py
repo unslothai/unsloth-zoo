@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The init-only caller graph is built once per model source and queried per helper.
-Every answer from the shared graph must equal a fresh per-call analysis."""
+"""Checks that the shared init-only caller graph, built once per model source, answers each query the same as a fresh per-call analysis."""
 import ast
 import importlib
 import inspect
