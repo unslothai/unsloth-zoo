@@ -19,9 +19,11 @@
 import pytest
 import torch
 
-S = pytest.importorskip("unsloth_zoo.flex_attention.attention_sink")
-U = pytest.importorskip("unsloth_zoo.flex_attention.utils")
 fa = pytest.importorskip("torch.nn.attention.flex_attention")
+U = pytest.importorskip("unsloth_zoo.flex_attention.utils")
+if not U.HAS_FLEX_ATTENTION:
+    pytest.skip("flex attention is unavailable (no GPU or torch too old)", allow_module_level = True)
+S = pytest.importorskip("unsloth_zoo.flex_attention.attention_sink")
 
 
 class _Attn(torch.nn.Module):

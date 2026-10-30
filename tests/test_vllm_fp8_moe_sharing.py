@@ -121,7 +121,10 @@ def test_16bit_descriptor_unchanged():
     (dict(block = (64, 64)), "weight_block_size"),
     (dict(moe_block = (64, 128), refine = (2, 1)), "refined"),
     (dict(activation = "static"), "activation_scheme"),
-    (dict(scale_dtype = torch.float8_e8m0fnu), "E8M0"),
+    pytest.param(
+        dict(scale_dtype = getattr(torch, "float8_e8m0fnu", None)), "E8M0",
+        marks = pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason = "torch has no float8_e8m0fnu"),
+    ),
     (dict(tp = 2), "tp_size = 2"),
     (dict(ep = 2, use_ep = True), "ep_size = 2"),
     (dict(scale_shape = (E, 1, H // 128)), "scale grid"),
