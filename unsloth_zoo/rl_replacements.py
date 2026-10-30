@@ -3024,11 +3024,18 @@ def grpo_accumulated_loss(
             _devices_without_native_bf16 as _no_native_bf16,
         )
         _fp32_lm_head = _inspect.signature(_projector).parameters["fp32_lm_head"].default
+        try:
+            import torch._functorch.config as _functorch_config
+            # A backward compiled outside autocast saves the scorer's in-graph fp32 cast per call: pre-cast once instead.
+            _backward_autocast_off = getattr(_functorch_config, "backward_pass_autocast", None) == "off"
+        except Exception:
+            _backward_autocast_off = False
         _fp32_precast = _fp32_lm_head and (
             os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1"
             or _scorer_eager or _zero3_training()
             # Without autocast the compiled scorer keeps its fp32 head as given: share one pre-cast copy.
             or trainer._autocast_dtype is None or not getattr(trainer, "_autocast_enabled", True)
+            or _backward_autocast_off
             or (lm_head.dtype == torch.bfloat16 and (lm_head.device.type, lm_head.device.index) in _no_native_bf16())
         )
         _fp32_cache = {}
