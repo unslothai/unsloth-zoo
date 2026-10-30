@@ -682,6 +682,7 @@ def test_routed_experts_run_on_the_decode_kernels_bitwise(native, dtype, quantiz
                                                            ((4, "affine", 32), (640, 512), 32), ((4, "affine", 32), (512, 640), 32),
                                                            ((6, "affine", 32), (640, 640), 32)])
 def test_grouped_routed_experts_serve_bitwise(quantization, widths, experts, monkeypatch):
+    monkeypatch.setattr(fusion.nax, "_nax_gpu", lambda: True)
     block = _expert_block(vlm_qwen, quantization, mx.bfloat16, widths, experts)
     xs = [mx.random.normal((rows, 1, widths[0])).astype(mx.bfloat16) for rows in (1, 2, 5, 7)]
     expected = [block(x) for x in xs]
@@ -710,6 +711,22 @@ def test_grouped_routed_experts_serve_bitwise(quantization, widths, experts, mon
                fusion._routed_down(routed, inds, scores, shared, s, tensors[2], *args, "affine"))
     assert grouped(x, inds, scores.astype(mx.float32), shared, s, tensors, *args) is None
 
+
+
+@pytest.mark.parametrize("tensor_units, rows, raced", [(False, 2, False), (False, 8, False), (False, 9, True), (True, 2, True), (True, 8, True)])
+def test_grouped_tiles_are_raced_only_where_they_can_win(monkeypatch, tensor_units, rows, raced):
+    monkeypatch.setattr(fusion.nax, "_nax_gpu", lambda: tensor_units)
+    block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
+    mlp = block.switch_mlp
+    tensors = tuple(map(fusion._projection_tensors, (mlp.gate_proj, mlp.up_proj, mlp.down_proj)))
+    races = []
+    monkeypatch.setattr(fusion, "_MOE_GROUPED_CHOICES", {})
+    monkeypatch.setattr(fusion, "_grouped_routed_faster", lambda routed, grouped: races.append(True) or False)
+    x = mx.random.normal((rows, 1, 512)).astype(mx.bfloat16)
+    inds = mx.random.randint(0, 32, (rows, 1, 8)).astype(mx.uint32)
+    scores = mx.softmax(mx.random.normal((rows, 1, 8)), axis = -1).astype(mx.bfloat16)
+    mx.eval(fusion._moe_routed_experts(block)._run(tensors, x, inds, scores, mx.ones((rows, 1, 1), mx.bfloat16), mx.zeros_like(x), select = True))
+    assert bool(races) is raced
 
 
 @pytest.mark.parametrize("routed_times, grouped_times, faster", [
