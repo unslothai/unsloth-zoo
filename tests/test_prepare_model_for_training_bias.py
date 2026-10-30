@@ -1,4 +1,5 @@
 """Regression tests: PEFT's bias choice must survive prepare_model_for_training; CPU-only tiny Llama."""
+import os
 import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -212,3 +213,114 @@ def test_peft_trainable_bias_float16_gets_float32_master(bias):
     scaler.update()
     moved = [n for n, b in biases.items() if not torch.equal(b, params[n].detach())]
     assert moved, "no trainable bias was updated"
+
+
+def _float16_bias_model(bias, save_base_to=None):
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    torch.manual_seed(0)
+    model = _tiny_llama(dtype=torch.float16)
+    if save_base_to is not None:
+        model.save_pretrained(save_base_to)
+    model = _lora(model, bias=bias)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing=False, use_reentrant=False,
+        full_finetuning=False,
+    )
+    return model
+
+
+def _trainable_biases(model):
+    return {n: p for n, p in model.named_parameters() if n.endswith(".bias") and p.requires_grad}
+
+
+@pytest.mark.parametrize("bias", ["all", "lora_only"])
+def test_float16_bias_master_runs_without_autocast(bias):
+    """eval / generate run outside autocast: the float32 bias master must not reach a float16 matmul
+    ("self and mat2 must have the same dtype"), and must stay the float32 Parameter afterwards."""
+    pytest.importorskip("peft")
+    model = _float16_bias_model(bias)
+    masters = _trainable_biases(model)
+    assert masters and {p.dtype for p in masters.values()} == {torch.float32}
+    model.eval()
+    input_ids = torch.randint(0, 64, (1, 5))
+    with torch.no_grad():
+        assert model(input_ids=input_ids).logits.dtype == torch.float16
+    out = model.generate(input_ids=input_ids, max_new_tokens=3, do_sample=False)
+    assert out.shape == (1, 8)
+    after = _trainable_biases(model)
+    assert after.keys() == masters.keys()
+    assert all(after[n] is masters[n] for n in masters)
+    assert all(isinstance(p, torch.nn.Parameter) and p.dtype == torch.float32 for p in after.values())
+
+
+def test_float16_bias_master_trains_without_autocast():
+    """A no-autocast float16 step: the bias gradient lands on the float32 master, so the GradScaler unscales it."""
+    pytest.importorskip("peft")
+    model = _float16_bias_model("all")
+    params = _trainable_biases(model)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2)
+    scaler = torch.amp.GradScaler("cpu")
+    input_ids = torch.randint(0, 64, (2, 8))
+    logits = model(input_ids=input_ids).logits
+    loss = torch.nn.functional.cross_entropy(logits.float().view(-1, logits.size(-1)), input_ids.view(-1))
+    scaler.scale(loss).backward()
+    before = {n: p.detach().clone() for n, p in params.items()}
+    assert all(p.grad is not None and p.grad.dtype == torch.float32 for p in params.values())
+    scaler.unscale_(opt)
+    scaler.step(opt)
+    scaler.update()
+    assert any(not torch.equal(before[n], p.detach()) for n, p in params.items())
+
+
+def test_float16_bias_master_compiles():
+    """The cast hook traces in one graph and matches eager."""
+    pytest.importorskip("peft")
+    from torch._dynamo.testing import CompileCounter
+
+    model = _float16_bias_model("all")
+    q_proj = model.base_model.model.model.layers[0].self_attn.q_proj
+    x = torch.randn(2, 3, 16, dtype=torch.float16)
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    try:
+        out = torch.compile(q_proj, backend=counter, fullgraph=True)(x)
+    finally:
+        torch._dynamo.reset()
+    assert counter.frame_count == 1
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out, q_proj(x))
+    out.float().sum().backward()
+    assert q_proj.base_layer.bias.grad.dtype == torch.float32
+
+
+def test_float16_bias_master_merges_in_the_model_dtype(tmp_path):
+    """Merged exports write the trained bias in the float16 save dtype, and PEFT's merge still runs."""
+    pytest.importorskip("peft")
+    from safetensors import safe_open
+    import _merge_e2e_helpers as H
+
+    H.set_offline_cpu_env()
+    base = str(tmp_path / "base")
+    model = _float16_bias_model("all", save_base_to=base)
+    params = _trainable_biases(model)
+    with torch.no_grad():
+        for p in params.values():
+            p.add_(0.25)
+    out = str(tmp_path / "out")
+    H.run_merge(model, base, out, save_dtype=torch.float16)
+    name = next(n for n in params if n.endswith("q_proj.base_layer.bias"))
+    key = name.replace("base_model.model.", "", 1).replace(".base_layer", "")
+    files = [f for f in os.listdir(out) if f.endswith(".safetensors")]
+    found = None
+    for f in files:
+        with safe_open(os.path.join(out, f), "pt") as handle:
+            if key in handle.keys():
+                found = handle.get_tensor(key)
+    assert found is not None, key
+    assert found.dtype == torch.float16
+    torch.testing.assert_close(found, params[name].detach().to(torch.float16))
+
+    merged = model.merge_and_unload()
+    with torch.no_grad():
+        assert merged(input_ids=torch.randint(0, 64, (1, 4))).logits.dtype == torch.float16

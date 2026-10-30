@@ -94,6 +94,32 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
 pass
 
 
+def _bias_compute_dtype_pre_hook(dtype, saved, module, args):
+    """Run the module on its float32 bias master cast to the float16 compute dtype: outside autocast a float16
+    Linear rejects a float32 bias, and bitsandbytes Linear4bit would rewrite the master's .data in place. Under
+    autocast the matmul casts the bias the same way. The cast is differentiable: the gradient lands on the master.
+    State lives in the hook (`saved`), not module.__dict__, which older Dynamo cannot trace."""
+    master = module._parameters.get("bias")
+    if master is None or master.dtype == dtype:
+        return
+    saved.append(master)
+    module._parameters["bias"] = master.to(dtype)
+
+
+def _bias_compute_dtype_hook(saved, module, args, output):
+    if saved:
+        module._parameters["bias"] = saved.pop()
+
+
+def _cast_bias_in_forward(module, dtype):
+    # Hooks, not a class swap or parametrization: state_dict, merges and kernels reading .bias see the master.
+    if any(getattr(hook, "func", None) is _bias_compute_dtype_pre_hook for hook in module._forward_pre_hooks.values()):
+        return
+    saved = []
+    module.register_forward_pre_hook(functools.partial(_bias_compute_dtype_pre_hook, dtype, saved))
+    module.register_forward_hook(functools.partial(_bias_compute_dtype_hook, saved), always_call = True)
+
+
 # Autocast subclasses cached by (base_class, compute_dtype) so pickle can resolve them.
 _BF16_AUTOCAST_SUBCLASSES = {}
 
@@ -431,6 +457,7 @@ def prepare_model_for_training(
     _is_peft_model = hasattr(model, "peft_config")
     # Read before the loop: the loop reuses `dtype` for each parameter's cast.
     _loaded_float16 = dtype == torch.float16
+    _float32_bias_owners = []
 
     for name, param in model.named_parameters():
         original_name = name
@@ -457,9 +484,11 @@ def prepare_model_for_training(
                 requires_grad = True
                 # float16 is the exception: the GradScaler refuses float16 gradients ("Attempting to
                 # unscale FP16 gradients"), so the bias gets a float32 master as LoRA A / B do. The
-                # float16 autocast the Trainer runs under casts it back for the matmul.
+                # owning module's forward sees it cast to float16 (a hook), so eval / generate outside
+                # autocast still match dtypes.
                 if _loaded_float16:
                     upcast = True
+                    _float32_bias_owners.append(model.get_submodule(name.rpartition(".")[0]))
                 else:
                     _keep_param_dtype = True
             else:
@@ -500,6 +529,9 @@ def prepare_model_for_training(
             if param.dtype != torch.float32:
                 param.data = param.data.to(torch.float32)
     pass
+
+    for _module in _float32_bias_owners:
+        _cast_bias_in_forward(_module, torch.float16)
 
     # Wrap only if fp32 norms actually exist (our upcast, legacy env, or external policy);
     # gating on presence avoids wrapping a model that has none.
