@@ -199,8 +199,8 @@ def _max_prefetched_waiting(offloader, monkeypatch):
     peak = [0]
     original = offloader._prefetch
 
-    def counting(index):
-        original(index)
+    def counting(*args):
+        original(*args)
         live = (ref() for ref in offloader.order)
         peak[0] = max(peak[0], sum(1 for r in live if r is not None and r.ready is not None))
 
