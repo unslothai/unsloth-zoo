@@ -18757,7 +18757,12 @@ def push_to_hub_gguf(
         os.path.expanduser(os.fspath(imatrix_file))
         if isinstance(imatrix_file, (str, os.PathLike)) else None,
     )
-    if reported:
+    if reported is not None:
+        # An empty manifest means this export wrote nothing; never fall back to other GGUFs in the folder.
+        if not reported:
+            raise RuntimeError(
+                f"Unsloth: the GGUF export reported no files in {save_directory}, so nothing was pushed to {repo_id}."
+            )
         reported = {os.path.abspath(f) for f in reported}
         gguf_files = [f for f in gguf_files if os.path.abspath(f) in reported]
     for gguf_file in gguf_files:
