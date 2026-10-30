@@ -1355,6 +1355,38 @@ def test_auto_depth_peak_includes_the_model_output():
     sw.remove()
 
 
+def test_auto_depth_peak_includes_unswapped_layers_backward():
+    if not torch.cuda.is_available():
+        return
+
+    class Head(nn.Module):
+        # Trainable and unswapped: its 256 MiB weight grad lands after the first swapped layer's backward hook.
+        def __init__(self):
+            super().__init__()
+            self.big = nn.Parameter(torch.zeros(1 << 26))
+
+        def forward(self, x):
+            return x + self.big[:1].sum() * 0
+
+    torch.manual_seed(0)
+    layers = nn.ModuleList([Head()] + [nn.Linear(256, 256) for _ in range(3)]).cuda()
+    for layer in layers[1:]:
+        layer.requires_grad_(False)
+    sw = BlockSwap(layers, [1, 2, 3], prefetch_depth = "auto", device = "cuda")
+    x = torch.randn(64, 256, device = "cuda", requires_grad = True)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    h = x
+    for layer in layers:
+        h = layer(h)
+    h.sum().backward()
+    true_peak = torch.cuda.max_memory_allocated()
+    k = torch.device("cuda").index or 0
+    # Judged after the whole backward: the head's grad is in the step's peak, not left for the next step.
+    assert sw._steps == 1 and sw._last_peak.get(k, 0) >= 0.9 * true_peak, (sw._last_peak, true_peak)
+    sw.remove()
+
+
 def test_find_decoder_layers_remembers_the_model_without_holding_it():
     import gc
     model = _HeadModel(8, 2, 16)

@@ -447,6 +447,12 @@ class BlockSwap:
                 self.handles.append(layer.register_forward_hook(self._post(i)))
                 # Evicted weights are empty: state_dict must read the host copy.
                 self.handles.append(layer._register_state_dict_hook(self._state_dict(i)))
+            if self._auto:
+                # Unswapped layers below the first swapped one run their backward after its hook: sample them too.
+                for li, layer in enumerate(layers):
+                    if li not in self.pos:
+                        self.handles.append(
+                            layer.register_forward_pre_hook(_opaque(self._plain_peak), with_kwargs = True))
 
             self._pack()
             total = self.host_bytes()
@@ -641,16 +647,39 @@ class BlockSwap:
                 self._note_peak(self.blocks[i].home)
             self._release(self.blocks[i])
             if i == 0:
-                self._last_peak, self._step_peak = self._step_peak or {}, {}
-                self._steps += 1
-                if self._steps == 1 and self._tot is not None:
-                    # Step 1 includes copies armed at install and warmup: windows start after it.
-                    self._harvest()
-                    self._seen, self._adapt_seen = dict(self._tot), dict(self._tot)
-                elif not self._settled:
-                    self._adapt_depth()
-                self._arm(forward = True)
+                if self._auto and not self._settled:
+                    # Unswapped layers below this one still run their backward: judge the step once it is all done.
+                    torch.autograd.Variable._execution_engine.queue_callback(self._end_step)
+                else:
+                    self._end_step()
         return _opaque(hook)
+
+    def _end_step(self):
+        self._last_peak, self._step_peak = self._step_peak or {}, {}
+        self._steps += 1
+        if self._steps == 1 and self._tot is not None:
+            # Step 1 includes copies armed at install and warmup: windows start after it.
+            self._harvest()
+            self._seen, self._adapt_seen = dict(self._tot), dict(self._tot)
+        elif not self._settled:
+            self._adapt_depth()
+        self._arm(forward = True)
+
+    def _plain_peak(self, module, args, kwargs):
+        if not self._auto or self._settled or not torch.is_grad_enabled():
+            return
+        homes = {b.home for b in self.blocks if b.home is not None}
+        for dv in homes:
+            self._note_peak(dv)
+        x = next((a for a in args if isinstance(a, torch.Tensor)), None)
+        if x is None:
+            x = kwargs.get("hidden_states")
+        if isinstance(x, torch.Tensor) and x.requires_grad:
+            def peak(grad):
+                if self._auto and not self._settled:
+                    for dv in homes:
+                        self._note_peak(dv)
+            x.register_hook(_opaque(peak))
 
     def _state_dict(self, i):
         def hook(module, state_dict, prefix, local_metadata):
