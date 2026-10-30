@@ -2768,6 +2768,8 @@ _DOWN_ROWS = 4
 _INPUTS = {
     "gate_up": ("wg", "sg", "bg", "wu", "su", "bu", "x", "inds", "k", "n", "top_k"),
     "down": ("w", "ws", "wb", "x", "inds", "scores", "shared", "s", "k", "n", "top_k"),
+    "gate_up_fold": ("wg", "sg", "bg", "wu", "su", "bu", "cg", "csg", "cbg", "cu", "csu", "cbu", "x", "inds", "k", "n", "top_k", "routes"),
+    "down_fold": ("w", "ws", "wb", "cw", "cs", "cb", "x", "inds", "scores", "shared", "k", "n", "top_k", "routes"),
 }
 
 _QDOT = r"""
@@ -3117,7 +3119,7 @@ struct Dots {
   }
 };
 
-template <typename T, int group_size, int bits, int out, int fast, typename Inds>
+template <typename T, int group_size, int bits, int out, int fast>
 METAL_FUNC void gate_up_rows(
     const device uint8_t* wg,
     const device uint8_t* sg,
@@ -3126,7 +3128,8 @@ METAL_FUNC void gate_up_rows(
     const device uint8_t* su,
     const device uint8_t* bu,
     const device T* x,
-    Inds inds,
+    int64_t e,
+    uint row,
     device T* y,
     ExpertParams p,
     uint3 tid,
@@ -3134,8 +3137,7 @@ METAL_FUNC void gate_up_rows(
   typedef Dots<T, group_size, bits, out, fast> dots;
   const int lane = lid.x;
   const int n0 = tid.x * (2 * out) + lid.y * out;
-  const int64_t e = inds[tid.y];
-  x += size_t(tid.y / p.top_k) * p.K;
+  x += size_t(row) * p.K;
   y += size_t(tid.y) * p.N + n0;
   thread typename dots::U result[2 * out] = {};
   thread typename dots::Proj proj[2] = {
@@ -3154,11 +3156,16 @@ METAL_FUNC void gate_up_rows(
   }
 }
 
-template <typename T, int group_size, int bits, int out, int fast, typename Inds, typename Scores, typename Shared, typename S>
+// With `fold`, a row's top_k routes take one more simdgroup, the shared expert's, whose rows follow the `routes` routes in x.
+template <typename T, int group_size, int bits, int out, int fast, int fold, typename Inds, typename Scores, typename Shared, typename S>
 METAL_FUNC void down_rows(
     const device uint8_t* w,
     const device uint8_t* ws,
     const device uint8_t* wb,
+    const device uint8_t* cw,
+    const device uint8_t* cs,
+    const device uint8_t* cb,
+    size_t routes,
     const device T* x,
     Inds inds,
     Scores scores,
@@ -3174,22 +3181,35 @@ METAL_FUNC void down_rows(
   const int lane = lid.x;
   const int n0 = tid.x * out;
   const size_t route = size_t(tid.y) * p.top_k;
-  for (int slot = lid.y; slot < p.top_k; slot += lsize.y) {
-    const int64_t e = inds[route + slot];
+  for (int slot = lid.y; slot < p.top_k + fold; slot += lsize.y) {
+    const bool common = fold && slot == p.top_k;
+    const T score = common ? T(0) : T(scores[route + slot]);
     thread typename dots::U result[out] = {};
-    thread typename dots::Proj proj = dots::proj(w + e * p.w[0][0], ws + e * p.w[0][1], wb + e * p.w[0][2], p.K, n0, lane);
-    dots::template run<1>(&proj, x + (route + slot) * p.K, p.K, lane, result);
-    const T score = scores[route + slot];
+    thread typename dots::Proj proj;
+    if (common) {
+      proj = dots::proj(cw, cs, cb, p.K, n0, lane);
+      dots::template run<1>(&proj, x + (routes + tid.y) * p.K, p.K, lane, result);
+    } else {
+      const int64_t e = inds[route + slot];
+      proj = dots::proj(w + e * p.w[0][0], ws + e * p.w[0][1], wb + e * p.w[0][2], p.K, n0, lane);
+      dots::template run<1>(&proj, x + (route + slot) * p.K, p.K, lane, result);
+    }
     UNROLL for (int o = 0; o < out; o++) {
       if (lane == o) {
-        products[slot * out + o] = static_cast<T>(result[o]) * score;
+        products[slot * out + o] = common ? static_cast<T>(result[o]) : static_cast<T>(result[o]) * score;
       }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lid.y == 0 && lane < out) {
     const size_t i = size_t(tid.y) * p.N + n0 + lane;
-    y[i] = shared_add(slot_sum<T>(products + lane, out, p.top_k), shared[tid.y], s[i]);
+    T common;
+    if constexpr (fold) {
+      common = products[p.top_k * out + lane];
+    } else {
+      common = s[i];
+    }
+    y[i] = shared_add(slot_sum<T>(products + lane, out, p.top_k), shared[tid.y], common);
   }
 }
 """
@@ -3202,13 +3222,35 @@ _BODIES = {
   gate_up_rows<T, group_size, bits, out, fast>(
       (const device uint8_t*)wg, (const device uint8_t*)sg, (const device uint8_t*)bg,
       (const device uint8_t*)wu, (const device uint8_t*)su, (const device uint8_t*)bu,
-      x, inds, y, p, threadgroup_position_in_grid, thread_position_in_threadgroup);
+      x, inds[threadgroup_position_in_grid.y], threadgroup_position_in_grid.y / top_k, y, p,
+      threadgroup_position_in_grid, thread_position_in_threadgroup);
+""",
+    "gate_up_fold": r"""
+  const ExpertParams p{k, n, top_k, {
+      {wg_strides[0] * int64_t(sizeof(*wg)), sg_strides[0] * int64_t(sizeof(*sg)), bg_strides[0] * int64_t(sizeof(*bg))},
+      {wu_strides[0] * int64_t(sizeof(*wu)), su_strides[0] * int64_t(sizeof(*su)), bu_strides[0] * int64_t(sizeof(*bu))}}};
+  const int route = threadgroup_position_in_grid.y;
+  const bool common = route >= routes;
+  gate_up_rows<T, group_size, bits, out, fast>(
+      common ? (const device uint8_t*)cg : (const device uint8_t*)wg, common ? (const device uint8_t*)csg : (const device uint8_t*)sg,
+      common ? (const device uint8_t*)cbg : (const device uint8_t*)bg, common ? (const device uint8_t*)cu : (const device uint8_t*)wu,
+      common ? (const device uint8_t*)csu : (const device uint8_t*)su, common ? (const device uint8_t*)cbu : (const device uint8_t*)bu,
+      x, common ? 0 : int64_t(inds[route]), common ? route - routes : route / top_k, y, p,
+      threadgroup_position_in_grid, thread_position_in_threadgroup);
 """,
     "down": r"""
   threadgroup T products[31 * out];
   const ExpertParams p{k, n, top_k, {{w_strides[0] * int64_t(sizeof(*w)), ws_strides[0] * int64_t(sizeof(*ws)), wb_strides[0] * int64_t(sizeof(*wb))}, {}}};
-  down_rows<T, group_size, bits, out, fast>(
-      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb, x, inds, scores, shared, s, y, p,
+  down_rows<T, group_size, bits, out, fast, 0>(
+      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb, nullptr, nullptr, nullptr, 0, x, inds, scores, shared, s, y, p,
+      products, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup);
+""",
+    "down_fold": r"""
+  threadgroup T products[32 * out];
+  const ExpertParams p{k, n, top_k, {{w_strides[0] * int64_t(sizeof(*w)), ws_strides[0] * int64_t(sizeof(*ws)), wb_strides[0] * int64_t(sizeof(*wb))}, {}}};
+  down_rows<T, group_size, bits, out, fast, 1>(
+      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb,
+      (const device uint8_t*)cw, (const device uint8_t*)cs, (const device uint8_t*)cb, routes, x, inds, scores, shared, shared, y, p,
       products, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup);
 """,
 }
@@ -3439,6 +3481,74 @@ def _routed_down(x, inds, scores, shared, s, w, group_size, bits, mode):
     launch = _down_plan(*map(_key, (x, inds, scores, shared, s)), tuple(map(_key, w)), group_size, bits, mode)
     return _run(launch, list(w), [x, inds, scores, shared, s])
 
+
+# The shared expert's gate, up and down inside the routed launches, for three fewer launches per block. That pays where
+# launching binds: at 4 bits on GPUs without tensor units, up to this many rows. Where the GPU binds its own launches stay faster.
+_FOLD_GATE_UP_ROWS = 4
+_FOLD_ROWS = 5
+
+
+def _fold_launch(name, dtype, quant, out_rows, owned, shape, grid, threadgroup, k, n, top_k, routes, experts):
+    call = _kernel(name, True)
+    if call is None:
+        return None
+    scalars = [_scalar(k), _scalar(n), _scalar(top_k), _scalar(routes)]
+    args = dict(template = [("T", dtype), ("group_size", quant[0]), ("bits", quant[1]), ("out", out_rows), ("fast", quant[2])],
+                grid = grid, threadgroup = threadgroup, output_shapes = [shape], output_dtypes = [dtype])
+    reachable = min(routes, experts)
+
+    def run(*arrays):
+        return call(inputs = [*(t[:reachable] for t in arrays[:owned]), *arrays[owned : 2 * owned],
+                              *map(mx.contiguous, arrays[2 * owned:]), *scalars], **args)[0]
+
+    return mx.compile(run)
+
+
+@functools.lru_cache(maxsize = 1024)
+def _fold_plan(x, inds, scores, shared, routed, common, group_size, bits):
+    """The gate/up and down launches running a sparse block's routes and shared expert together, or None."""
+    x, inds, scores, shared = _specs((x, inds, scores, shared))
+    gate, up, down = map(_specs, routed)
+    if (x.ndim == 0 or x.dtype not in _HALF or inds.ndim != x.ndim or inds.dtype not in _INDS or x.shape[:-1] != inds.shape[:-1]
+            or scores.shape != inds.shape or scores.dtype != x.dtype or shared.dtype != x.dtype
+            or shared.shape != (*inds.shape[:-1], 1) or not 1 <= inds.shape[-1] < min(_MAX_SLOTS, _MAX_SIMDS)):
+        return None
+    k, top_k, routes = x.shape[-1], inds.shape[-1], math.prod(inds.shape)
+    n, fast = _projection(gate, "affine", group_size, bits, x.dtype, k)
+    h, fast_down = _projection(down, "affine", group_size, bits, x.dtype, n) if n > 0 else (-1, -1)
+    keys = [tuple(t.shape[1:] for t in p) for p in (gate, up, down)]
+    if (n < 0 or h != k or n % (2 * _FOLD_GATE_UP_ROWS) != 0 or h % _DOWN_ROWS != 0 or routes == 0
+            or _projection(up, "affine", group_size, bits, x.dtype, k) != (n, fast)
+            or gate[0].shape[0] != up[0].shape[0] or gate[0].shape[0] != down[0].shape[0]
+            or any(tuple(a[0] for a in c) != key or tuple(a[1] for a in c) != tuple(t.dtype for t in p)
+                   for c, key, p in zip(common, keys, (gate, up, down)))):
+        return None
+    rows, experts = routes // top_k, gate[0].shape[0]
+    quant = (group_size, bits, fast)
+    gate_up = _fold_launch("gate_up_fold", x.dtype, quant, _FOLD_GATE_UP_ROWS, 6, (routes + rows, n),
+                           (32 * n // (2 * _FOLD_GATE_UP_ROWS), 2 * (routes + rows), 1), (32, 2, 1), k, n, top_k, routes, experts)
+    simds = top_k + 1
+    last = _fold_launch("down_fold", x.dtype, (group_size, bits, fast_down), _DOWN_ROWS, 3, (*inds.shape[:-1], h),
+                        (32 * h // _DOWN_ROWS, simds * rows, 1), (32, simds, 1), n, h, top_k, routes, experts)
+    return (gate_up, last) if gate_up is not None and last is not None else None
+
+
+@functools.cache
+def _shared_expert_bindings(cls):
+    """What a stock `down(swiglu(gate(x), up(x)))` shared expert class resolves to, or None."""
+    name = f"{cls.__name__}.__call__"
+    return _resolved_bindings({cls.__module__: {name: "ec6fbfefb1f0b4c0", "swiglu": _MOE_ROUTED_FUNCTIONS["swiglu"]}, **_CONV_SILU_CONTRACT})
+
+
+def _rows_packed(tensor):
+    try:
+        strides = memoryview(tensor).strides
+    except (TypeError, ValueError, BufferError):
+        return False
+    return tensor.ndim == 2 and strides == (tensor.shape[1] * tensor.itemsize, tensor.itemsize)
+
+
+_MOE_FOLD_VERDICTS = {}
 
 _GROUPED_TILE = 2
 _MOE_GROUPED_CHOICES = {}
@@ -3673,7 +3783,7 @@ class _RoutedExperts:
         self.verdicts = {}
         self.layout = (None, False)
 
-    def __call__(self, block, x, inds, scores, shared, s):
+    def _tensors(self, block, x):
         mlp = block.switch_mlp
         if (mlp is not self.mlp or mlp.training or (x.ndim == 3 and 1 < x.shape[1] <= self.decode_block)
                 or not _bindings_intact(self.bindings)):
@@ -3690,7 +3800,11 @@ class _RoutedExperts:
         key = tuple(id(t) for group in tensors for t in group)
         if self.layout[0] != key:
             self.layout = (key, all(_expert_rows_packed(t) for group in tensors for t in group))
-        if not self.layout[1]:
+        return tensors if self.layout[1] else None
+
+    def __call__(self, block, x, inds, scores, shared, s):
+        tensors = self._tensors(block, x)
+        if tensors is None:
             return None
         verdict = self.verdicts.get(x.dtype)
         if verdict is None:
@@ -3698,6 +3812,62 @@ class _RoutedExperts:
         if not verdict:
             return None
         return self._run(tensors, x, inds, scores, shared, s, select = "_unsloth_speculative_call" in block.__dict__)
+
+    def folded(self, block, x, inds, scores, shared):
+        """What `__call__` returns for `s = block.shared_expert(x)`, computed in the routed launches, or None. Only a
+        speculative call folds: its rows are the same bits, and a plain decode keeps stock's launch count."""
+        if "_unsloth_speculative_call" not in block.__dict__:
+            return None
+        expert = getattr(block, "shared_expert", None)
+        tensors = self._tensors(block, x)
+        if (nax._nax_gpu() or tensors is None or inds.size > _FOLD_ROWS * inds.shape[-1] or expert is None or expert.training):
+            return None
+        bindings = _shared_expert_bindings(type(expert))
+        if bindings is None or not _bindings_intact(bindings):
+            return None
+        projections = (expert.gate_proj, expert.up_proj, expert.down_proj)
+        mlp = self.mlp
+        quant = (mlp.gate_proj.group_size, mlp.gate_proj.bits, mlp.gate_proj.mode)
+        if (quant[1] != 4 or quant[2] != "affine" or any(not isinstance(p, nn.QuantizedLinear) or hasattr(type(p), "_unsloth_lane_native") or "bias" in p for p in projections)):
+            return None
+        common = tuple(map(_projection_tensors, projections))
+        if not all(_rows_packed(t) for group in common for t in group):
+            return None
+        signature = (x.dtype, inds.shape[-1], self.base, *(tuple(map(_key, t)) for t in (*tensors, *common)), quant,
+                     *(type(p).__call__ for p in projections))
+        if signature not in _MOE_FOLD_VERDICTS:
+            _MOE_FOLD_VERDICTS[signature] = self._fold_probe(block, tensors, common, x.dtype, inds.shape[-1])
+        return self._fold(tensors, common, x, inds, scores, shared) if _MOE_FOLD_VERDICTS[signature] else None
+
+    def _fold(self, tensors, common, x, inds, scores, shared):
+        gate = self.mlp.gate_proj
+        plan = _fold_plan(*map(_key, (x, inds, scores, shared)), *(tuple(tuple(map(_key, t)) for t in g) for g in (tensors, common)),
+                          gate.group_size, gate.bits)
+        if plan is None:
+            return None
+        activations = plan[0](*tensors[0], *tensors[1], *common[0], *common[1], x, inds)
+        return plan[1](*tensors[2], *common[2], activations, inds, scores, shared)
+
+    def _fold_probe(self, block, tensors, common, dtype, top_k):
+        gate = self.mlp.gate_proj
+        experts, width = gate.weight.shape[0], gate.scales.shape[-1] * gate.group_size
+        for rows in (1, _FOLD_ROWS):
+            kx, ki, kw, kg = mx.random.split(mx.random.key(rows), 4)
+            x = mx.random.normal((rows, 1, width), key = kx).astype(dtype)
+            inds = mx.random.randint(0, experts, (rows, 1, top_k), key = ki).astype(mx.uint32)
+            scores = mx.softmax(mx.random.normal((rows, 1, top_k), key = kw), axis = -1).astype(dtype)
+            shared = mx.sigmoid(mx.random.normal((rows, 1, 1), key = kg)).astype(dtype)
+            fused = self._fold(tensors, common, x, inds, scores, shared)
+            if fused is None:
+                return False
+            y = self.base.__call__(self.mlp, x, inds)
+            s = mx.concatenate([block.shared_expert(x[i : i + 1]) for i in range(rows)])
+            native = (y * scores[..., None]).sum(axis = -2) + shared * s
+            if not _settled(fused.dtype == native.dtype and bool(mx.array_equal(fused, native, equal_nan = True))):
+                logger.warning("the folded shared expert does not reproduce this MLX build's native experts; "
+                               "its own launches stay in use")
+                return False
+        return True
 
     def _run(self, tensors, x, inds, scores, shared, s, select = False):
         gate, up, down = self.mlp.gate_proj, self.mlp.up_proj, self.mlp.down_proj
@@ -3872,6 +4042,10 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
                 return native(self, x)
             routed += (None,)
         inds, scores, shared_scale = routed
+        if shared_scale is not None and experts is not None and inds.size < _MOE_UNSORTED_ROUTES:
+            out = experts.folded(self, x, inds, scores, shared_scale)
+            if out is not None:
+                return out
         shared_y = self.shared_expert(x)
         if gate is not None and shared_scale is None:
             shared_scale = mx.sigmoid(gate)
@@ -6139,8 +6313,11 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
                 scores = mx.take_along_axis(gates, indices, axis = -1)
                 routing = indices, scores / scores.sum(axis = -1, keepdims = True), mx.sigmoid(gate)
             indices, scores, scale = routing
-            shared = self._feed_forward(feed_forward.shared_expert, x)
             rows = (x.shape[0] * x.shape[1], 1, -1)
+            out = experts.folded(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale)))
+            if out is not None:
+                return out.reshape(*x.shape[:2], -1)
+            shared = self._feed_forward(feed_forward.shared_expert, x)
             out = experts(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale, shared)))
             return None if out is None else out.reshape(*x.shape[:2], -1)
 
