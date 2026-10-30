@@ -220,8 +220,7 @@ _ASSERT_ASYNC_MSG = "msg" in torch.ops.aten._assert_async.overloads()
 
 
 def _check_targets(target, keep, vocab_size, ignore_index):
-    # Raise like F.cross_entropy: the compiled chunk takes the target by a masked sum, which would score an
-    # out of range label as a target at the row max. On GPU and when traced a device-side assert (no host sync).
+    # The masked-sum target pick would silently score bad labels; device-side assert on GPU / traced (no sync).
     bad = keep & ((target < 0) | (target >= vocab_size))
     if target.is_cuda or torch.compiler.is_compiling():
         ok = torch.logical_not(bad.any())

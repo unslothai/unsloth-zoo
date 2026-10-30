@@ -455,8 +455,7 @@ def _compiled_rows_everywhere(monkeypatch):
 
 @pytest.mark.parametrize("route", ["eager", "compiled_rows", "traced"])
 def test_count_aware_ce_rejects_out_of_range_labels(route, monkeypatch):
-    # Stock F.cross_entropy raises for a label outside [0, V) that is not ignore_index; the compiled chunk takes the
-    # target by a masked sum, so it must not turn such a label into a finite loss and gradient instead.
+    # Must raise like F.cross_entropy, not turn a label outside [0, V) into a finite loss via the masked sum.
     torch._dynamo.reset()
     if route == "compiled_rows":
         _compiled_rows_everywhere(monkeypatch)
