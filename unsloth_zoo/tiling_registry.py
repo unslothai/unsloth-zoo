@@ -591,6 +591,7 @@ class _TileState:
         self.nbytes = nbytes
         self.budget_gb = budget_gb
         self.tile_rows = _tile_rows(plan, hidden, intermediate, nbytes, budget_gb) if hidden else None
+        self.model_stats = None  # (parameter bytes, tiled layers) from install(), for the auto estimator
 
 
 def _bind(module, fn):
@@ -691,7 +692,48 @@ def _tiled_forward(self, *args, **kwargs):
     n_tiles = _bucket(rows, tile_rows)
     if n_tiles <= 1:
         return inner(*args)
+    if state.plan.mode == "auto" and not _auto_tiling_pays(state, rows, x.element_size(), n_tiles):
+        return inner(*args)
     return _run_tiled(self, state, inner, args, n_tiles)
+
+
+# "auto" tiles only when the saving is worth the extra recompute (15-30% step time on G4).
+AUTO_MIN_SAVING_MIB = 512
+AUTO_MIN_SAVING_FRACTION = 0.10
+_AUTO_DECLINED = set()
+
+
+def estimate_tiling_gain(rows, hidden, intermediate, nbytes, n_tiles, param_bytes = 0, n_layers = 1):
+    """(saving, peak) in bytes for one step, estimated per decoder layer.
+
+    The MLP's live intermediates in backward are about 4 x rows x intermediate (gate, up, their product and one
+    gradient); the next largest per-layer transient is attention's q / k / v / output, about 4 x rows x hidden.
+    Tiling lowers the peak only by what the MLP exceeds that by. The step peak is the weights, the per-layer
+    checkpointed hidden states and the largest transient. Fused / chunked losses are assumed to stay below the MLP.
+    Calibrated on G4 measurements: Qwen3-0.6B bs 1 x 16k (no worthwhile gain) and Qwen3-4B bs 4 x 8k (2 GiB).
+    """
+    mlp = 4 * rows * intermediate * nbytes
+    other = 4 * rows * hidden * nbytes
+    saving = max(0, mlp - max(other, mlp // max(1, n_tiles)))
+    peak = param_bytes + n_layers * rows * hidden * nbytes + max(mlp, other)
+    return saving, peak
+
+
+def _auto_tiling_pays(state, rows, nbytes, n_tiles):
+    param_bytes, n_layers = state.model_stats or (0, 1)
+    intermediate = state.intermediate or 4 * (state.hidden or 1)
+    saving, peak = estimate_tiling_gain(rows, state.hidden or 1, intermediate, nbytes, n_tiles, param_bytes, n_layers)
+    pays = saving >= AUTO_MIN_SAVING_MIB * 2**20 and saving >= AUTO_MIN_SAVING_FRACTION * peak
+    if not pays and not _is_compiling():
+        key = (id(state.model_stats), int(rows))
+        if key not in _AUTO_DECLINED and _is_rank0():
+            _AUTO_DECLINED.add(key)
+            print(
+                f"Unsloth: Tiled MLP (auto) keeps one tile at {int(rows)} rows: estimated saving "
+                f"{saving / 2**20:.0f} MiB of a ~{peak / 2**20:.0f} MiB step peak is too small to pay for the recompute.",
+                flush = True,
+            )
+    return pays
 
 
 def _is_ours(fn):
@@ -1022,6 +1064,12 @@ def install(model, mode = DEFAULT_MODE, modules = None, *, force = None, verbose
         _attach(module, spec, plan, budget_cache)
         keep.add(id(module))
         report.tiled.append((name, type(module).__name__, spec.family))
+    if report.tiled:
+        stats = (sum(p.numel() * p.element_size() for p in model.parameters()), len(report.tiled))
+        for _, module in model.named_modules():
+            st = module.__dict__.get("_unsloth_tiling") if id(module) in keep else None
+            if st is not None:
+                st.model_stats = stats
     for _, module in model.named_modules():
         # "_unsloth_tiling" too: a wrapper installed after tiling (accelerate) hides the tiled forward from is_tiled.
         if id(module) not in keep and (is_tiled(module) or "_unsloth_tiling" in module.__dict__):

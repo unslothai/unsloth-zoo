@@ -902,3 +902,39 @@ def test_rng_replay_is_kept_whenever_it_cannot_be_ruled_out(monkeypatch):
     exec("def opaque(self, x):\n    return x", exec_ns)
     clean._unsloth_forward = MethodType(exec_ns["opaque"], clean)
     assert R.needs_rng_replay(clean, clean.__dict__["_unsloth_tiling"].spec)
+
+
+def _pays(saving, peak):
+    return saving >= R.AUTO_MIN_SAVING_MIB * 2**20 and saving >= R.AUTO_MIN_SAVING_FRACTION * peak
+
+
+@needs_registry
+def test_auto_estimator_matches_g4_measurements():
+    # G4 (RTX PRO 6000), Unsloth LoRA, bf16. Qwen3-0.6B bs 1 x 16k: tiling lowered the peak by 127 MiB (2445 -> 2318)
+    # for +30% step time. Qwen3-4B bs 4 x 8k: 1979 MiB (14141 -> 12162) for +22%.
+    saving, peak = R.estimate_tiling_gain(16384, 1024, 3072, 2, 16, param_bytes = int(0.6e9) * 2, n_layers = 28)
+    assert not _pays(saving, peak)
+    assert 2000 * 2**20 < peak < 3000 * 2**20  # measured 2445 MiB
+    saving, peak = R.estimate_tiling_gain(32768, 2560, 9728, 2, 8, param_bytes = int(4.0e9) * 2, n_layers = 36)
+    assert _pays(saving, peak)
+    assert 1500 * 2**20 < saving < 2500 * 2**20  # measured 1979 MiB
+    # One tile never saves anything.
+    assert R.estimate_tiling_gain(32768, 2560, 9728, 2, 1)[0] == 0
+
+
+@needs_registry
+def test_auto_keeps_one_tile_when_the_estimate_says_no_gain(monkeypatch, capsys):
+    model = _Holder(lambda: type("FooMLP", (_TokenMLP,), {})(), n = 1)
+    R.install(model, "auto", verbose = False)
+    mlp = model.layers[0].mlp
+    state = mlp.__dict__["_unsloth_tiling"]
+    state.tile_rows = 2  # the budget alone would tile
+    seen = _spy_engine(monkeypatch)
+    x = torch.randn(1, 16, 8)
+    mlp(x)
+    assert seen == []  # tiny model: saving far below 512 MiB
+    assert "keeps one tile at 16 rows" in capsys.readouterr().out
+    monkeypatch.setattr(R, "AUTO_MIN_SAVING_MIB", 0)
+    monkeypatch.setattr(R, "AUTO_MIN_SAVING_FRACTION", 0.0)
+    mlp(x)
+    assert len(seen) == 1  # once the estimate says it pays, the budget's tiles are used
