@@ -83,6 +83,21 @@ def _host_reserve(vm):
     return max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
 
 
+def _cgroup_free():
+    try:
+        from .dataset_num_proc import _cgroup_free_bytes
+        return _cgroup_free_bytes()
+    except Exception:
+        return None
+
+
+def _host_free(vm):
+    # psutil reports the whole host inside a container; the cgroup limit is what gets the job OOM-killed.
+    free = vm.available - _host_reserve(vm)
+    cgroup = _cgroup_free()
+    return free if cgroup is None else min(free, cgroup)
+
+
 def _local_world_size():
     try:
         return max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
@@ -95,7 +110,7 @@ def _pin_budget():
     try:
         import psutil
         vm = psutil.virtual_memory()
-        return (vm.available - _host_reserve(vm)) // _local_world_size()
+        return _host_free(vm) // _local_world_size()
     except Exception:
         return 0
 
@@ -111,7 +126,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
         return
     need = sum(sizes) + slack
     # Every local rank reads the same free RAM, so each may only plan for its share, like _pin_budget.
-    avail = (vm.available - _host_reserve(vm)) // _local_world_size() + on_host
+    avail = _host_free(vm) // _local_world_size() + on_host
     if need <= avail:
         return
     fit, used = 0, slack

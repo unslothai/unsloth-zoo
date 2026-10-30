@@ -1113,6 +1113,19 @@ def test_host_fit_splits_free_ram_between_local_ranks(monkeypatch):
         _mod._check_host_fit([_GiB // 2] * 20)
 
 
+def test_host_fit_clamps_to_the_cgroup_limit(monkeypatch):
+    import sys, pytest
+    # A container on a big host: psutil sees 20 GiB free, the cgroup only allows 6 GiB more.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
+    monkeypatch.setattr(_mod, "_cgroup_free", lambda: 6 * _GiB)
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    with pytest.raises(ValueError, match = "At most 12 layers"):
+        _mod._check_host_fit([_GiB // 2] * 20)
+    assert _mod._pin_budget() == 6 * _GiB
+    monkeypatch.setattr(_mod, "_cgroup_free", lambda: None)
+    _mod._check_host_fit([_GiB // 2] * 20)
+
+
 def test_host_fit_is_skipped_without_psutil(monkeypatch):
     import sys
     monkeypatch.setitem(sys.modules, "psutil", None)
