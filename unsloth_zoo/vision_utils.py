@@ -993,7 +993,11 @@ def _data_uri_head(source: str) -> bytes:
     from urllib.parse import unquote_to_bytes
 
     header, _, payload = source.partition(",")
-    if header.lower().endswith(";base64"):
+    # As FFmpeg's data_uri.c: any parameter that case-insensitively prefixes "base64" selects base64.
+    params = header.split(";")[1:]
+    if params and params[-1] == "":
+        params.pop()  # a trailing ';' ends the loop before an empty parameter
+    if any("base64".startswith(p.lower()) for p in params):
         chunk = re.sub(r"\s", "", payload[:256])
         try:
             return base64.b64decode(chunk[: len(chunk) // 4 * 4], validate = False)
