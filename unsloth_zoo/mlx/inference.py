@@ -5333,6 +5333,16 @@ def _verify_gathers(linear, x, eligible):
             and isinstance(linear, nn.QuantizedLinear) and x.ndim == 3 and x.shape[0] * x.shape[1] > 1 and not eligible(linear, x) and not linear.trainable_parameters())
 
 
+def _batched_weights(linear):
+    """A projection's tensors under a batch axis, contiguous once: stock copies such a view at every call."""
+    arrays = (linear["weight"], linear["scales"], linear.get("biases"))
+    held = linear.__dict__.get("_unsloth_batched_weights")
+    if held is None or any(a is not b for a, b in zip(held[0], arrays)):
+        held = (arrays, tuple(None if a is None else mx.contiguous(a[None]) for a in arrays))
+        linear.__dict__["_unsloth_batched_weights"] = held
+    return held[1]
+
+
 def _verify_rows_alone(linear, x):
     K = x.shape[-1]
 
@@ -5340,9 +5350,8 @@ def _verify_rows_alone(linear, x):
         return mx.concatenate([linear(row[None]) for row in mx.contiguous(x).reshape(-1, 1, K)]).reshape(*x.shape[:-1], -1)
 
     def batched():
-        biases = linear.get("biases")
-        y = mx.quantized_matmul(x.reshape(-1, 1, K), linear["weight"][None], scales = linear["scales"][None],
-                                biases = None if biases is None else biases[None], transpose = True,
+        weight, scales, biases = _batched_weights(linear)
+        y = mx.quantized_matmul(x.reshape(-1, 1, K), weight, scales = scales, biases = biases, transpose = True,
                                 group_size = linear.group_size, bits = linear.bits, mode = linear.mode)
         y = y.reshape(*x.shape[:-1], -1)
         return y + linear["bias"] if "bias" in linear else y
