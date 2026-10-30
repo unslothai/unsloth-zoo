@@ -13,13 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""TiledMLP backward with an MLP whose backward writes dX into its input (CPU only).
-
-Unsloth's fused LoRA MLP computes dX with `torch.matmul(..., out = X)`. Under per-block compile the
-tiled MLP input is a compiled region's output: a non-view tensor that requires grad. TiledMLP's
-backward then made no_grad views of it, and AccumulateGrad raised "A view was created in no_grad
-mode and its base ... modified inplace with grad mode enabled".
-"""
+"""TiledMLP backward when the MLP writes dX into its input in place (fused LoRA MLP) and the input is a
+non-view tensor that requires grad (a per-block compiled region's output)."""
 
 import pytest
 import torch
@@ -61,7 +56,6 @@ def _run(tiled, bsz, qlen, hidden):
     if tiled:
         patch_mlp(mlp, target_arctic = True)
     leaf = torch.randn(bsz, qlen, hidden, requires_grad = True)
-    # Non-view, requires grad, has a grad_fn: what a compiled decoder block hands the MLP.
     x = leaf * 1.5
     assert x._base is None and x.grad_fn is not None
     out = mlp(x)

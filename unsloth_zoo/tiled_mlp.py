@@ -197,9 +197,8 @@ class TiledMLP(torch.autograd.Function):
     @torch_amp_custom_bwd
     def backward(ctx, grad_output, *args):
         rng_devices = []
-        # Detach: x_split below is a no_grad view and the fused LoRA MLP backward writes dX into its
-        # input in place. If x itself requires grad (a compiled block's output), AccumulateGrad on
-        # x_split then raises "A view was created in no_grad mode ... modified inplace".
+        # x_split is a no_grad view and the fused LoRA MLP writes dX into it in place; if x requires grad
+        # (a compiled block's output), AccumulateGrad raises "A view was created in no_grad mode".
         x = ctx.saved_tensors[0].detach()
         B, S, H = x.shape
         if ctx.preserve_rng_state and ctx.had_device_in_fwd:
