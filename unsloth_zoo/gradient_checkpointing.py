@@ -1997,16 +1997,48 @@ class NonReentrantActivationOffloader:
     def _stream(self, cache, device_index):
         stream = cache.get(device_index)
         if stream is None:
-            stream = cache[device_index] = _new_extra_stream(device_index)
+            stream = cache[device_index] = self._new_stream(device_index)
         return stream
     pass
+
+    # Device seams: every stream, event and copy goes through these, so the bookkeeping above them runs
+    # unchanged on a fake accelerator in the CPU lifecycle tests.
+    def _on_host(self, x):
+        return x.device.type == "cpu"
+
+    def _streamable(self, x):
+        return DEVICE_TYPE in ("cuda", "hip") and x.device.type == "cuda" and not _is_compiling()
+
+    def _new_stream(self, device_index):
+        return _new_extra_stream(device_index)
+
+    def _current_stream(self, device_index):
+        return torch.cuda.current_stream(device_index)
+
+    def _stream_ctx(self, stream):
+        return torch.cuda.stream(stream)
+
+    def _new_event(self):
+        return torch.cuda.Event()
+
+    def _record_stream(self, x, stream):
+        x.record_stream(stream)
+
+    def _host_copy(self, x, non_blocking = True):
+        return x.to("cpu", non_blocking = non_blocking)
+
+    def _device_copy(self, host, device):
+        return host.to(device, non_blocking = True)
+
+    def _empty_on_device(self, host, device):
+        return torch.empty_like(host, device = device)
 
     def _to_host(self, record, x):
         nbytes = x.numel() * x.element_size()
         if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled():
             with _PINNED_LOCK:  # held through allocation: no double-spent headroom
                 if _reserve_pinned(nbytes) and self._to_pinned(record, x, nbytes): return
-        record.host = x.to("cpu")
+        record.host = self._host_copy(x, non_blocking = False)
         self.stats["pageable"] += 1
     pass
 
@@ -2015,7 +2047,7 @@ class NonReentrantActivationOffloader:
         device_index = x.device.index
         if self.max_inflight == 0:
             try:
-                host = x.to("cpu", non_blocking = True)
+                host = self._host_copy(x)
             except RuntimeError as e:
                 _release_pinned(nbytes)
                 if not _is_host_alloc_oom(e): raise
@@ -2027,14 +2059,14 @@ class NonReentrantActivationOffloader:
         inflight = self.inflight.get(device_index)
         if inflight is None:
             inflight = self.inflight[device_index] = collections.deque()
-        compute = torch.cuda.current_stream(device_index)
+        compute = self._current_stream(device_index)
         self._retire(inflight, compute, self.max_inflight - 1)
         side = self._stream(self.d2h_streams, device_index)
         side.wait_stream(compute)
         try:
-            with torch.cuda.stream(side):
-                host = x.to("cpu", non_blocking = True)
-                copied = torch.cuda.Event()
+            with self._stream_ctx(side):
+                host = self._host_copy(x)
+                copied = self._new_event()
                 copied.record(side)
         except RuntimeError as e:
             _release_pinned(nbytes)
@@ -2043,7 +2075,7 @@ class NonReentrantActivationOffloader:
             return False
         else:
             # Keepalive: x's block must outlive the copy; record_stream is a no-op on its own stream.
-            x.record_stream(compute)
+            self._record_stream(x, compute)
             entry = [x, copied, compute]
             inflight.append(entry)
             record.host, record.copied, record.pinned_bytes, record.keepalive = host, copied, nbytes, entry
@@ -2060,13 +2092,13 @@ class NonReentrantActivationOffloader:
     def _drain(self):
         """Release every keepalive (backward reads the host copies after waiting on them)."""
         for device_index, inflight in self.inflight.items():
-            if inflight: self._retire(inflight, torch.cuda.current_stream(device_index), 0)
+            if inflight: self._retire(inflight, self._current_stream(device_index), 0)
     pass
 
     def pack(self, x):
-        if not x.requires_grad or x.device.type == "cpu":
+        if not x.requires_grad or self._on_host(x):
             return None, x
-        if DEVICE_TYPE not in ("cuda", "hip") or x.device.type != "cuda" or _is_compiling():
+        if not self._streamable(x):
             return x.device, x.to("cpu", non_blocking = True)
         if self.backward_started:
             self.backward_started = False
@@ -2096,19 +2128,19 @@ class NonReentrantActivationOffloader:
         # input of the same checkpoint that was already handed out: reloading it duplicates it.
         if record is None or record.unpacked or record.host is None or record.device_tensor is not None: return
         device_index = record.device.index
-        compute = torch.cuda.current_stream(device_index)
+        compute = self._current_stream(device_index)
         side = self._stream(self.h2d_streams, device_index)
         # Allocated on the compute stream, which consumes it; the side stream waits for
         # that stream's earlier users of the block and for this record's D2H.
         try:
-            x = torch.empty_like(record.host, device = record.device)
+            x = self._empty_on_device(record.host, record.device)
         except torch.cuda.OutOfMemoryError:
             return  # unpack reloads it in place instead
         side.wait_stream(compute)
         if record.copied is not None: side.wait_event(record.copied)
-        with torch.cuda.stream(side):
+        with self._stream_ctx(side):
             x.copy_(record.host, non_blocking = True)
-            ready = torch.cuda.Event()
+            ready = self._new_event()
             ready.record(side)
         # No record_stream: compute waits on `ready` in unpack, or in __del__ if never read.
         record.device_tensor, record.ready, record.ready_stream = x, ready, compute
@@ -2144,19 +2176,19 @@ class NonReentrantActivationOffloader:
         self.backward_started = True
         record.unpacked = True
         device_index = record.device.index
-        compute = torch.cuda.current_stream(device_index)
+        compute = self._current_stream(device_index)
         if record.device_tensor is not None:
             x = record.device_tensor
             if record.ready is not None:
                 compute.wait_event(record.ready)
                 # Consumed on another stream than it was allocated on: its free must wait for this one.
-                if compute != record.ready_stream: x.record_stream(compute)
+                if compute != record.ready_stream: self._record_stream(x, compute)
                 # One shot: a retain_graph rerun reloads from the host copy.
                 record.device_tensor, record.ready, record.ready_stream = None, None, None
                 self.stats["prefetch_hits"] += 1
         else:
             if record.copied is not None: compute.wait_event(record.copied)
-            x = record.host.to(record.device, non_blocking = True)
+            x = self._device_copy(record.host, record.device)
         if self.stream_mode: self._prefetch(self._prefetch_target(record.index, record.group))
         return x
     pass
