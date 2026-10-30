@@ -71,7 +71,7 @@ def test_the_probe_is_cached_per_child_environment(monkeypatch):
     envs = ({"CXX": "g++"}, {"CXX": "g++"}, {"CXX": "g++", "HOME": "/x"}, {"CXX": "g++", "TORCH_LOGS": "+x"})
     for env in envs:
         skip.skip_without_cpu_inductor(dict(env))
-    # The child receives the whole env, so every distinct env is probed once and an identical one is reused.
+    # One probe per distinct env.
     assert calls == [envs[0], envs[2], envs[3]], calls
 
 
@@ -92,7 +92,7 @@ def test_the_probe_cache_ignores_pytest_bookkeeping_and_keys_on_the_cwd(monkeypa
 
 
 def _bogus_compiler_env(**extra):
-    # Keep the rest of the env (e.g. TORCHINDUCTOR_CACHE_DIR); only drop the settings that skip compilation.
+    # Drop only the settings that skip compilation.
     drop = {"TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE", "TORCHDYNAMO_SUPPRESS_ERRORS"}
     env = {k: v for k, v in os.environ.items() if k.upper() not in drop}
     env["CXX"] = os.path.join(os.sep, "nonexistent", "cxx-for-test")
@@ -117,7 +117,7 @@ def test_a_real_probe_with_a_bogus_compiler_skips():
 
 
 def test_inherited_compile_disable_settings_cannot_hide_a_missing_compiler():
-    # suppress_errors / compile-disable used to let a trivial compile succeed eagerly while the checks still failed.
+    # suppress_errors / compile-disable must not hide a missing compiler.
     missing, stdout = _classified(_bogus_compiler_env())  # precondition: the bogus compiler is seen as missing
     assert missing, stdout[-2000:]
     env = _bogus_compiler_env(TORCHDYNAMO_SUPPRESS_ERRORS = "1", TORCH_COMPILE_DISABLE = "1", TORCHDYNAMO_DISABLE = "1")

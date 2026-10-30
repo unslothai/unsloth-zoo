@@ -16,9 +16,7 @@
 
 """Skip the CPU subprocess checks up front when CPU Inductor has no C++ compiler here.
 
-CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none. A
-fresh process asks Inductor for that compiler; the checks skip only when it reports a missing one. The checks
-themselves run unchanged, so no failure of theirs is ever reinterpreted.
+CPU Inductor needs a C++ compiler; AMD Windows boxes often have none. The checks themselves run unchanged.
 """
 
 import json
@@ -29,10 +27,8 @@ import sys
 
 import pytest
 
-# The probe asks Inductor for its C++ compiler directly, so an inherited suppress_errors / compile-disable setting
-# cannot let it pass through an eager fallback; torch without cpp_builder falls back to a trivial compile. It reports
-# its own failure as one JSON line, so torch's hint footers and colours never matter. "stage" is "import" when torch
-# or Inductor itself could not be imported (no CPU Inductor here at all).
+# Asks Inductor for its compiler directly so suppress_errors / compile-disable cannot mask it via eager fallback.
+# Reports failure as one JSON line; "stage" is "import" when torch / Inductor itself is missing.
 _PROBE = r"""
 import json, sys
 stage = "import"
@@ -91,8 +87,7 @@ def missing_compiler(returncode, stdout):
 
 
 def _probe(env):
-    # The child gets the whole env and this cwd (relative CXX / PATH entries resolve against it), so both are
-    # in the key; pytest's per-test bookkeeping variables are not, so a session probes once.
+    # Key on env and cwd (relative CXX / PATH); PYTEST_* excluded so a session probes once.
     key = (sys.executable, os.getcwd()) + tuple(sorted((k, v) for k, v in env.items() if not k.startswith("PYTEST_")))
     if key not in _probes:
         try:
