@@ -1304,7 +1304,9 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
             if isinstance(current, int) and not isinstance(current, bool):
                 try:
                     setattr(_config, name, current + extra)
-                except Exception:
+                except Exception as error:
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.warning(f"Unsloth: Could not raise torch._dynamo.config.{name}: {error!r}")
                     continue
                 # Key the baseline by the value we wrote: only the live value
                 # at restore time says which bump is still standing. A stack per
@@ -1381,7 +1383,9 @@ def _restore_recompile_limits():
                 original = baselines[original][-1]
             setattr(_config, name, original)
             restored += 1
-        except Exception:
+        except Exception as error:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: Could not restore torch._dynamo.config.{name}: {error!r}")
             continue
         # Only the branch just unwound: dropping the whole map also threw away
         # branches a live `config.patch` still hides -- bump 8->24, patch to 2,
