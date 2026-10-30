@@ -242,7 +242,7 @@ def test_fp32_output_gemm_only_where_fast(monkeypatch, fp32_out_gemm):
 
 
 def test_default_chunk_budget_shrinks_with_free_memory(monkeypatch):
-    import unsloth_zoo.tiled_mlp as tm
+    import unsloth_zoo.memory_budget as tm
 
     for free, want in ((0.25, 0.25), (64.0, cl._CHUNK_GB)):
         monkeypatch.setattr(tm, "_default_target_gb", lambda device = None, free = free: free)
@@ -252,7 +252,7 @@ def test_default_chunk_budget_shrinks_with_free_memory(monkeypatch):
 
 def test_default_chunk_budget_is_read_per_call(monkeypatch):
     # A first call before the optimizer states exist must not size later chunks for memory that is gone.
-    import unsloth_zoo.tiled_mlp as tm
+    import unsloth_zoo.memory_budget as tm
 
     free = [64.0]
     monkeypatch.setattr(tm, "_default_target_gb", lambda device = None: free[0])
@@ -274,7 +274,7 @@ def test_fp32_projection_reraises_oom(monkeypatch):
 
 
 def test_chunk_budget_reads_the_head_device(monkeypatch):
-    import unsloth_zoo.tiled_mlp as tm
+    import unsloth_zoo.memory_budget as tm
 
     seen = []
     monkeypatch.setattr(tm, "_default_target_gb", lambda device = None: seen.append(device) or 0.25)

@@ -16,7 +16,7 @@ def _modules():
     """The CE module and the one that owns the memory budget it defers to."""
     try:
         ce = importlib.import_module("unsloth_zoo.fused_losses.cross_entropy_loss")
-        tiled = importlib.import_module("unsloth_zoo.tiled_mlp")
+        tiled = importlib.import_module("unsloth_zoo.memory_budget")
     except ImportError as e:
         # A zoo-only checkout (no `unsloth` installed) makes `unsloth_zoo/__init__` raise first.
         pytest.skip(f"unsloth_zoo import unavailable: {e}")
@@ -25,7 +25,7 @@ def _modules():
 
 def _load_module(monkeypatch, free_bytes):
     ce, tiled = _modules()
-    # _free_target_gb calls tiled_mlp._default_target_gb, so the backend is mocked there; one shared budget
+    # _free_target_gb calls memory_budget._default_target_gb, so the backend is mocked there; one shared budget
     # implementation avoids a CE copy that measures something else.
     monkeypatch.setattr(tiled, "DEVICE_TYPE", "cuda", raising=False)
     fake_cuda = types.SimpleNamespace(
