@@ -495,6 +495,89 @@ def needs_rng_state(module):
     return False
 
 
+# Registry families whose modules draw no random numbers apart from nn.Dropout submodules (checked live).
+_DETERMINISTIC_FAMILIES = frozenset({"dense-mlp", "topk-moe", "gpt-oss", "llama4-moe", "nemotron-h", "vlm-projector"})
+# Code whose only randomness is an nn.Dropout submodule (PEFT's lora_dropout, which the fused LoRA kernels read).
+_DROPOUT_ONLY_MODULES = ("torch.nn.", "peft.", "unsloth.kernels.fast_lora")
+_RANDOM_SOURCE = re.compile(
+    r"dropout|\brand|randn|randint|randperm|multinomial|normal_|uniform_|bernoulli|exponential_|poisson|cauchy_|"
+    r"geometric_|log_normal_|jitter|noise|gumbel|torch\.empty_like\(.*\)\.\w+_\("
+)
+_SOURCE_VERDICT = {}
+
+
+def _code_may_draw_random(fn):
+    """True unless fn's source is readable and names no random op. Bound methods, partials and staticmethods are
+    unwrapped; anything whose source cannot be read counts as random."""
+    while isinstance(fn, functools.partial):
+        fn = fn.func
+    fn = getattr(fn, "__func__", fn)
+    module_name = getattr(fn, "__module__", "") or ""
+    if module_name.startswith(_DROPOUT_ONLY_MODULES):
+        return False
+    key = getattr(fn, "__code__", None) or fn
+    try:
+        hit = _SOURCE_VERDICT.get(key)
+    except TypeError:
+        hit = None
+    if hit is not None:
+        return hit
+    try:
+        import inspect
+        verdict = bool(_RANDOM_SOURCE.search(inspect.getsource(fn)))
+    except Exception:
+        verdict = True
+    try:
+        _SOURCE_VERDICT[key] = verdict
+    except TypeError:
+        pass
+    return verdict
+
+
+def _subtree_may_draw_random(module):
+    """Conservative: True when any forward this subtree runs (class forwards, instance forwards, the adopted inner
+    forward) may draw random numbers other than through an nn.Dropout submodule."""
+    for m in module.modules():
+        if isinstance(m, _DROPOUT_TYPES):
+            continue  # checked live (p > 0 and training) by needs_rng_state
+        d = m.__dict__
+        candidates = [type(m).forward, d.get("forward"), d.get("_unsloth_forward")]
+        for fn in candidates:
+            if fn is None or _is_ours(fn):
+                continue
+            if _code_may_draw_random(fn):
+                return True
+    return False
+
+
+def needs_rng_replay(module, spec):
+    """Whether a training tile must snapshot and replay the RNG. Off only when provably unnecessary: a registry
+    family known to be deterministic, every forward in the subtree free of random ops, and no live dropout. Unknown
+    and opted-in classes always replay."""
+    if not module.training:
+        return needs_rng_state(module)
+    if needs_rng_state(module):
+        return True
+    if spec is None or spec.family not in _DETERMINISTIC_FAMILIES:
+        return True
+    cached = module.__dict__.get("_unsloth_tiled_random")
+    if _is_compiling():
+        # Source inspection cannot run while tracing: use the eager verdict (computed at install), else replay.
+        return True if cached is None else cached[2]
+    return _random_verdict(module)[2]
+
+
+def _random_verdict(module):
+    inner = module.__dict__.get("_unsloth_forward")
+    cached = module.__dict__.get("_unsloth_tiled_random")
+    if cached is None or not _HAS_MODULE_TREE_VERSION or cached[0] != _MODULE_TREE_VERSION[0] or \
+            cached[1] != id(module) or cached[3] is not inner:
+        _TRACKED_MODULES.update((id(m), m) for m in module.modules())
+        cached = (_MODULE_TREE_VERSION[0], id(module), _subtree_may_draw_random(module), inner)
+        module.__dict__["_unsloth_tiled_random"] = cached
+    return cached
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # The tiled forward
 # ----------------------------------------------------------------------------------------------------------------
@@ -579,7 +662,7 @@ def _run_tiled(module, state, inner, args, n_tiles):
     fn = functools.partial(_tile_fn, module, x.dim() >= 3, tuple(contract), trailing)
     out = get_engine()(
         fn, x2, *token_flat,
-        n_tiles = n_tiles, needs_rng = module.training or needs_rng_state(module),
+        n_tiles = n_tiles, needs_rng = needs_rng_replay(module, state.spec),
         output_contract = _engine_contract(contract),
     )
     if torch.is_tensor(out):
@@ -662,12 +745,14 @@ def _attach(module, spec, plan, budget_cache):
     nbytes = torch.empty((), dtype = dtype).element_size() if dtype is not None else 2
     budget = _budget(_device(module), budget_cache) if plan.mode == "auto" else 0.0
     d["_unsloth_tiling"] = _TileState(spec, plan, hidden, _infer_intermediate(module, hidden), nbytes, budget)
+    _random_verdict(module)  # eager, so a compiled caller can read it
 
 
 def _detach(module):
     d = module.__dict__
     inner = d.pop("_unsloth_forward", None)
     d.pop("_unsloth_tiling", None)
+    d.pop("_unsloth_tiled_random", None)
     restored = None
     if _is_ours(d.get("forward")):
         del d["forward"]

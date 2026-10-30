@@ -820,3 +820,85 @@ def test_functional_dropout_replays_its_mask():
     outs = [FunctionalDropoutMLP.forward(ref, t) for t in torch.tensor_split(x, 4, dim = 1)]
     torch.cat(outs, dim = 1).pow(2).sum().backward()
     torch.testing.assert_close(m.up.weight.grad, ref.up.weight.grad)
+
+
+class _CleanMLP(torch.nn.Module):
+    """A plain dense MLP (matched by the dense name rule): no random ops in its forward."""
+
+    def __init__(self, h = 8, p = 0.0):
+        super().__init__()
+        self.up = torch.nn.Linear(h, 2 * h)
+        self.drop = torch.nn.Dropout(p)
+        self.down = torch.nn.Linear(2 * h, h)
+
+    def forward(self, x):
+        return self.down(self.drop(torch.nn.functional.gelu(self.up(x))))
+
+
+def _spy_engine(monkeypatch):
+    seen = []
+    real = R.get_engine()
+
+    def spy(*a, **k):
+        seen.append(k["needs_rng"])
+        return real(*a, **k)
+    R.set_engine(spy)
+    return seen
+
+
+@needs_registry
+def test_dense_mlp_skips_rng_replay(monkeypatch):
+    m = type("FooMLP", (_CleanMLP,), {})()  # dropout p = 0
+    R.install_module(m, "rows:2")
+    assert R.lookup(m).family == "dense-mlp"
+    m.train()
+    seen = _spy_engine(monkeypatch)
+    m(torch.randn(1, 8, 8, requires_grad = True)).sum().backward()
+    assert seen == [False]
+
+
+@needs_registry
+def test_dropout_mlp_replays_and_matches_untiled_bitwise(monkeypatch):
+    # Live nn.Dropout: replay on; the oracle consumes the RNG tile by tile in the same order.
+    m = type("FooMLP", (_CleanMLP,), {})(p = 0.5)
+    ref = copy.deepcopy(m)
+    R.install_module(m, "rows:2")
+    m.train(); ref.train()
+    seen = _spy_engine(monkeypatch)
+    x = torch.randn(1, 8, 8)
+    torch.manual_seed(11)
+    y = m(x)
+    y.pow(2).sum().backward()
+    torch.manual_seed(11)
+    yr = torch.cat([_CleanMLP.forward(ref, t) for t in torch.tensor_split(x, 4, dim = 1)], dim = 1)
+    yr.pow(2).sum().backward()
+    assert seen == [True]
+    assert torch.equal(y, yr)
+    assert torch.equal(m.up.weight.grad, ref.up.weight.grad)
+    assert torch.equal(m.down.weight.grad, ref.down.weight.grad)
+
+
+@needs_registry
+def test_rng_replay_is_kept_whenever_it_cannot_be_ruled_out(monkeypatch):
+    class JitterMoE(_TokenMLP):  # a known MoE family, but its forward draws router jitter
+        def forward(self, x):
+            if self.training:
+                x = x * torch.empty_like(x).uniform_(0.99, 1.01)
+            return _TokenMLP.forward(self, x)
+    jitter = type("MixtralSparseMoeBlock", (JitterMoE,), {})()
+    unknown = type("Whatever", (_CleanMLP,), {})()  # forced: unknown class
+    R.install_module(jitter, "rows:2")
+    R.install_module(unknown, "rows:2")
+    assert R.lookup(jitter).family == "topk-moe"
+    for m in (jitter, unknown):
+        m.train()
+        assert R.needs_rng_replay(m, m.__dict__["_unsloth_tiling"].spec)
+    # An inner forward whose source cannot be read counts as random.
+    clean = type("FooMLP", (_CleanMLP,), {})()
+    R.install_module(clean, "rows:2")
+    clean.train()
+    assert not R.needs_rng_replay(clean, clean.__dict__["_unsloth_tiling"].spec)
+    exec_ns = {}
+    exec("def opaque(self, x):\n    return x", exec_ns)
+    clean._unsloth_forward = MethodType(exec_ns["opaque"], clean)
+    assert R.needs_rng_replay(clean, clean.__dict__["_unsloth_tiling"].spec)
