@@ -16,6 +16,7 @@
 
 """Fused linear CE and log-probs vs an fp64 oracle, the chunked CE, and torch.compile(fullgraph=True)."""
 
+import contextlib
 import os
 
 import numpy
@@ -28,6 +29,25 @@ from unsloth_zoo.fused_losses.fused_linear import fused_linear_cross_entropy, fu
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 TRITON = pytest.mark.skipif(not (torch.cuda.is_available() and fl._HAS_TRITON), reason = "needs CUDA and Triton")
+
+
+@contextlib.contextmanager
+def _no_blas_workspace():
+    """Keep torch's own cuBLAS / cuBLASLt workspace out of a measured peak. torch 2.15 binds a fresh one (32 MiB on
+    sm90+) per GEMM call unless TORCH_CUBLAS_WORKSPACE_CACHE=1, so no warm-up keeps it out of the window; earlier
+    torches cache it per handle. Size 0 makes ATen bind none, so the peak counts only the code under test."""
+    b = torch.backends.cuda
+    if not hasattr(b, "cublaslt_workspace_size"):  # older torch: cached per handle, the warm-up already paid for it
+        yield
+        return
+    old = b.cublas_workspace_size(), b.cublaslt_workspace_size()
+    b.cublaslt_workspace_size(0)
+    b.cublas_workspace_size(0)
+    try:
+        yield
+    finally:
+        b.cublas_workspace_size(old[0])
+        b.cublaslt_workspace_size(old[1])
 
 
 @pytest.fixture(autouse = True)
@@ -926,8 +946,9 @@ def test_trainable_head_long_context_skips_the_rows_accumulator():
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    loss.backward()
-    torch.cuda.synchronize()
+    with _no_blas_workspace():
+        loss.backward()
+        torch.cuda.synchronize()
     extra = torch.cuda.max_memory_allocated() - base
     assert extra < N * H * 4 * 1.75, extra / 2**20
 
