@@ -453,6 +453,20 @@ def _compiled_rows_everywhere(monkeypatch):
     monkeypatch.setattr(stable_softmax, "_rows_impl", lambda logits: (compiled["forward"], compiled["backward"]))
 
 
+def _inductor_keeps_assert_async():
+    def probe(t):
+        torch._assert_async(torch.logical_not((t < 0).any()), "probe")
+        return t + 1
+    torch._dynamo.reset()
+    try:
+        torch.compile(probe, fullgraph = True)(torch.tensor([-1]))
+    except RuntimeError:
+        return True
+    finally:
+        torch._dynamo.reset()
+    return False
+
+
 @pytest.mark.parametrize("route", ["eager", "compiled_rows", "traced"])
 def test_count_aware_ce_rejects_out_of_range_labels(route, monkeypatch):
     # Must raise like F.cross_entropy, not turn a label outside [0, V) into a finite loss via the masked sum.
@@ -461,6 +475,8 @@ def test_count_aware_ce_rejects_out_of_range_labels(route, monkeypatch):
         _compiled_rows_everywhere(monkeypatch)
     loss_fn = lambda x, t: unsloth_count_aware_cross_entropy(x, t, torch.tensor(1), shift = False)
     if route == "traced":
+        if not _inductor_keeps_assert_async():
+            pytest.skip("this torch's Inductor drops torch._assert_async (2.5 / 2.6), so a traced loss cannot raise")
         loss_fn = torch.compile(loss_fn, fullgraph = True, dynamic = True)
     logits = torch.tensor([[1.0, 2.0, 3.0], [0.5, 0.0, -1.0]])
     for valid in ([2, 0], [2, -100]):
