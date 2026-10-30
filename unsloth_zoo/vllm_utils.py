@@ -302,9 +302,8 @@ pass
 def _external_launcher_attempt_agreed(failed, error = None):
     """After an engine attempt that got past vLLM's cross-rank memory check, every rank reports.
 
-    All succeeded: returns. All failed: returns, so each takes load_vllm's usual retry or raise
-    (the failures are symmetric, so the retries meet again in the same collective). Some
-    failed: raises on every rank, since the ranks that started their engine cannot redo it
+    All succeeded: returns. All failed: returns, and load_vllm then agrees on retry or raise
+    (_external_launcher_retry_agreed). Some failed: raises on every rank, since the ranks that started their engine cannot redo it
     and a rank retrying alone would wait in that collective for the rest of the group timeout."""
     import torch.distributed as dist
     group = _external_launcher_world_group()
@@ -317,6 +316,28 @@ def _external_launcher_attempt_agreed(failed, error = None):
         "cross-rank memory check, so every rank stops here together: one rank retrying alone "
         "would wait for the others until the process group times out. Lower "
         "gpu_memory_utilization (or free the busier GPUs) and relaunch."
+    )
+    if error is not None:
+        message += f"\nThis rank's error:\n{error}"
+    raise RuntimeError(message)
+pass
+
+def _external_launcher_retry_agreed(retrying, error = None):
+    """After every rank failed past vLLM's cross-rank memory check: each rank reports whether it is
+    about to retry. All retry: returns. Some stop: the ranks that would retry raise too (the
+    stopping ranks keep raising their own error), since a lone retry would wait in vLLM's memory
+    check until the process group times out."""
+    import torch.distributed as dist
+    group = _external_launcher_world_group()
+    world = dist.get_world_size(group)
+    stopping = world - _all_reduce_int(1 if retrying else 0, dist.ReduceOp.SUM, group)
+    if stopping == 0 or not retrying:
+        return
+    message = (
+        f"Unsloth: vLLM failed to start on every torchrun rank, and {stopping} of {world} ranks "
+        "cannot retry, so every rank stops here together: one rank retrying alone would wait for "
+        "the others until the process group times out. Lower gpu_memory_utilization (or free the "
+        "busier GPUs) and relaunch."
     )
     if error is not None:
         message += f"\nThis rank's error:\n{error}"
@@ -5361,98 +5382,109 @@ def load_vllm(
                 # A terminal raise chains this traceback as __context__: free the engine's frames.
                 traceback.clear_frames(error.__traceback__)
                 error = str(error)
-                if count_reduces and _EXTERNAL_LAUNCHER_MEMORY_REDUCES > reduces_before:
+                agree = count_reduces and _EXTERNAL_LAUNCHER_MEMORY_REDUCES > reduces_before
+                if agree:
                     _external_launcher_attempt_agreed(failed = True, error = error)
-                # `expandable_segments:True` + sleep/standby mode is a deterministic
-                # config clash raised by CuMemAllocator.__init__, not an OOM, and
-                # retrying with a smaller gpu_memory_utilization can never clear it.
-                # Its text mentions PYTORCH_CUDA_ALLOC_CONF (ours) or "memory pool"
-                # (upstream vLLM), so a loose "alloc" / "memory" substring test
-                # reported it as an OOM and sent users to fixes that cannot work.
-                if _is_expandable_segments_error(error):
-                    raise RuntimeError(_expandable_segments_standby_message(error))
-                # Config validation, before any allocation: load once more without it.
-                if engine_args.get("use_replayssm") and _is_vllm_replayssm_refusal(error):
-                    engine_args.pop("use_replayssm")
-                    if replayssm_set_runner:
-                        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
-                        _UNSLOTH_SET_V1_RUNNER = False
-                    print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
-                    continue
-                # A transient race: retry the *identical* load rather than fall
-                # through to the generic "memory" branch below, which would shrink
-                # gpu_memory_utilization and max_num_seqs for the rest of the run
-                # over a failure neither caused. Standby is excluded because
-                # CuMemAllocator is a singleton in this process, so a second load
-                # would stack on the failed attempt's pool. Counted separately from
-                # `trials` so a race followed by a genuine OOM still gets its
-                # shrink-and-retry.
-                if _is_memory_profiling_race_error(error):
-                    race_trials += 1
-                    if race_trials < _MEMORY_PROFILING_RACE_MAX_TRIALS and not unsloth_vllm_standby:
+                # Every rank failed past vLLM's memory MIN, but each picks retry or raise on its own error
+                # and budget: retry only if every rank does, else a lone retry waits in that MIN.
+                retrying = True
+                try:
+                    # `expandable_segments:True` + sleep/standby mode is a deterministic
+                    # config clash raised by CuMemAllocator.__init__, not an OOM, and
+                    # retrying with a smaller gpu_memory_utilization can never clear it.
+                    # Its text mentions PYTORCH_CUDA_ALLOC_CONF (ours) or "memory pool"
+                    # (upstream vLLM), so a loose "alloc" / "memory" substring test
+                    # reported it as an OOM and sent users to fixes that cannot work.
+                    if _is_expandable_segments_error(error):
+                        raise RuntimeError(_expandable_segments_standby_message(error))
+                    # Config validation, before any allocation: load once more without it.
+                    if engine_args.get("use_replayssm") and _is_vllm_replayssm_refusal(error):
+                        engine_args.pop("use_replayssm")
+                        if replayssm_set_runner:
+                            os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                            _UNSLOTH_SET_V1_RUNNER = False
+                        print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
+                        continue
+                    # A transient race: retry the *identical* load rather than fall
+                    # through to the generic "memory" branch below, which would shrink
+                    # gpu_memory_utilization and max_num_seqs for the rest of the run
+                    # over a failure neither caused. Standby is excluded because
+                    # CuMemAllocator is a singleton in this process, so a second load
+                    # would stack on the failed attempt's pool. Counted separately from
+                    # `trials` so a race followed by a genuine OOM still gets its
+                    # shrink-and-retry.
+                    if _is_memory_profiling_race_error(error):
+                        race_trials += 1
+                        if race_trials < _MEMORY_PROFILING_RACE_MAX_TRIALS and not unsloth_vllm_standby:
+                            print(
+                                f"Unsloth: Another process on this GPU freed memory while vLLM was profiling. "
+                                f"Retrying the load unchanged ({race_trials} of {_MEMORY_PROFILING_RACE_MAX_TRIALS}).\n"
+                                f"Error:\n{error}"
+                            )
+                            continue
+                        raise RuntimeError(_memory_profiling_race_message(
+                            error,
+                            trials = race_trials,
+                            unsloth_vllm_standby = unsloth_vllm_standby,
+                        ))
+                    trials += 1
+                    if trials >= 2 or unsloth_vllm_standby:
+                        # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
+                        # We can't do retry because vLLM will fail to load with said error.
+                        if unsloth_vllm_standby and _is_out_of_memory_error(error):
+                            raise MemoryError(
+                                f"Unsloth: Your GPU ran out of memory loading vLLM with standby mode enabled.\n"
+                                f"Your GPU has {total_gb:.1f} GB VRAM with gpu_memory_utilization={gpu_memory_utilization:.3f}.\n"
+                                f"Try one of these fixes:\n"
+                                f"  1. Lower gpu_memory_utilization: model, tokenizer = FastLanguageModel.from_pretrained(..., gpu_memory_utilization=0.6)\n"
+                                f"  2. Disable standby mode: remove os.environ['UNSLOTH_VLLM_STANDBY'] = '1'\n"
+                                f"  3. Use a smaller model or quantization (load_in_4bit=True)\n"
+                                f"Original error: {error}"
+                            )
+                        raise RuntimeError(error)
+
+                    if "gpu_memory_utilization" in error or "memory" in error:
+                        approx_max_num_seqs, max_num_batched_tokens = _shrink_for_memory_retry(
+                            approx_max_num_seqs, max_num_batched_tokens, max_seq_length,
+                            engine_args.get("speculative_config") if enable_lora else None,
+                        )
+                        engine_args["max_num_seqs"] = approx_max_num_seqs
+                        engine_args["max_num_batched_tokens"] = max_num_batched_tokens
+                        engine_args["gpu_memory_utilization"] *= 0.85
                         print(
-                            f"Unsloth: Another process on this GPU freed memory while vLLM was profiling. "
-                            f"Retrying the load unchanged ({race_trials} of {_MEMORY_PROFILING_RACE_MAX_TRIALS}).\n"
+                            f"Unsloth: Retrying vLLM to process {approx_max_num_seqs} sequences and {max_num_batched_tokens} tokens in tandem.\n"\
                             f"Error:\n{error}"
                         )
-                        continue
-                    raise RuntimeError(_memory_profiling_race_message(
-                        error,
-                        trials = race_trials,
-                        unsloth_vllm_standby = unsloth_vllm_standby,
-                    ))
-                trials += 1
-                if trials >= 2 or unsloth_vllm_standby:
-                    # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
-                    # We can't do retry because vLLM will fail to load with said error.
-                    if unsloth_vllm_standby and _is_out_of_memory_error(error):
-                        raise MemoryError(
-                            f"Unsloth: Your GPU ran out of memory loading vLLM with standby mode enabled.\n"
-                            f"Your GPU has {total_gb:.1f} GB VRAM with gpu_memory_utilization={gpu_memory_utilization:.3f}.\n"
-                            f"Try one of these fixes:\n"
-                            f"  1. Lower gpu_memory_utilization: model, tokenizer = FastLanguageModel.from_pretrained(..., gpu_memory_utilization=0.6)\n"
-                            f"  2. Disable standby mode: remove os.environ['UNSLOTH_VLLM_STANDBY'] = '1'\n"
-                            f"  3. Use a smaller model or quantization (load_in_4bit=True)\n"
-                            f"Original error: {error}"
-                        )
-                    raise RuntimeError(error)
-
-                if "gpu_memory_utilization" in error or "memory" in error:
-                    approx_max_num_seqs, max_num_batched_tokens = _shrink_for_memory_retry(
-                        approx_max_num_seqs, max_num_batched_tokens, max_seq_length,
-                        engine_args.get("speculative_config") if enable_lora else None,
-                    )
-                    engine_args["max_num_seqs"] = approx_max_num_seqs
-                    engine_args["max_num_batched_tokens"] = max_num_batched_tokens
-                    engine_args["gpu_memory_utilization"] *= 0.85
-                    print(
-                        f"Unsloth: Retrying vLLM to process {approx_max_num_seqs} sequences and {max_num_batched_tokens} tokens in tandem.\n"\
-                        f"Error:\n{error}"
-                    )
-                else:
-                    # Detect FlashInfer JIT compilation failures due to missing nvcc/ninja
-                    error_lower = error.lower()
-                    if ("could not find nvcc" in error_lower) or \
-                       ("cuda_home" in error_lower and "does not exist" in error_lower):
-                        raise RuntimeError(
-                            f"FlashInfer failed to JIT-compile: nvcc (CUDA compiler) not found.\n"
-                            f"Fix options:\n"
-                            f"  1. Install the CUDA toolkit (nvcc) or set CUDA_HOME to your CUDA installation\n"
-                            f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
-                            f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
-                            f"Original error: {error}"
-                        )
-                    elif ("ninja" in error_lower) and \
-                         ("no such file" in error_lower or "errno 2" in error_lower or "not found" in error_lower):
-                        raise RuntimeError(
-                            f"FlashInfer failed to JIT-compile: ninja (build tool) not found.\n"
-                            f"Fix options:\n"
-                            f"  1. Install ninja: pip install ninja\n"
-                            f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
-                            f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
-                            f"Original error: {error}"
-                        )
-                    raise RuntimeError(error)
+                    else:
+                        # Detect FlashInfer JIT compilation failures due to missing nvcc/ninja
+                        error_lower = error.lower()
+                        if ("could not find nvcc" in error_lower) or \
+                           ("cuda_home" in error_lower and "does not exist" in error_lower):
+                            raise RuntimeError(
+                                f"FlashInfer failed to JIT-compile: nvcc (CUDA compiler) not found.\n"
+                                f"Fix options:\n"
+                                f"  1. Install the CUDA toolkit (nvcc) or set CUDA_HOME to your CUDA installation\n"
+                                f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
+                                f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
+                                f"Original error: {error}"
+                            )
+                        elif ("ninja" in error_lower) and \
+                             ("no such file" in error_lower or "errno 2" in error_lower or "not found" in error_lower):
+                            raise RuntimeError(
+                                f"FlashInfer failed to JIT-compile: ninja (build tool) not found.\n"
+                                f"Fix options:\n"
+                                f"  1. Install ninja: pip install ninja\n"
+                                f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
+                                f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
+                                f"Original error: {error}"
+                            )
+                        raise RuntimeError(error)
+                except BaseException:
+                    retrying = False
+                    raise
+                finally:
+                    if agree:
+                        _external_launcher_retry_agreed(retrying, error)
             finally:
                 # Every failed exit drops the engine's registry roots; its frames were cleared above.
                 if not loaded: _release_failed_vllm_engine(registries_before)
