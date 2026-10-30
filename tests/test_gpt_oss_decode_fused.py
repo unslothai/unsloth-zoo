@@ -33,10 +33,31 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _skip_without_cpu_compiler(proc):
     # CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none.
-    # Judged from the run itself, so a run that never compiles C++ is not skipped.
-    text = proc.stdout + proc.stderr
-    if proc.returncode != 0 and ("InvalidCxxCompiler" in text or "No working C++ compiler found" in text):
-        pytest.skip("CPU Inductor has no C++ compiler here")
+    # Judged from the exception that ended the run (_SKIP_HOOK), so a run that never compiles C++, or one that fails for
+    # another reason after recovering from a compiler error, is not skipped.
+    reasons = [x[len("SKIP_REASON "):] for x in proc.stdout.splitlines() if x.startswith("SKIP_REASON ")]
+    if proc.returncode != 0 and reasons:
+        pytest.skip(f"CPU Inductor has no C++ compiler here ({reasons[-1]})")
+
+
+# Prepended to every child script: marks only the uncaught exception that ends the run, following its __cause__ chain
+# (Dynamo / Inductor wrap the compiler error). InvalidCxxCompiler on Linux and torch 2.13+; torch 2.9 - 2.12 on Windows
+# raise RuntimeError("Compiler: <cl> is not found.").
+_SKIP_HOOK = textwrap.dedent('''
+    import sys as _skip_sys
+    def _skip_hook(tp, exc, tb, _previous = _skip_sys.excepthook):
+        seen, e = set(), exc
+        while e is not None and id(e) not in seen:
+            seen.add(id(e))
+            text = f"{type(e).__name__}: {e}"
+            if ("InvalidCxxCompiler" in text or "No working C++ compiler found" in text
+                    or ("Compiler:" in text and "is not found" in text)):
+                print("SKIP_REASON " + text.splitlines()[0][:300], flush = True)
+                break
+            e = e.__cause__
+        _previous(tp, exc, tb)
+    _skip_sys.excepthook = _skip_hook
+''')
 
 _SCRIPT = textwrap.dedent('''
     import json, os, sys
@@ -117,7 +138,7 @@ _SCRIPT = textwrap.dedent('''
 
 def _run(tmp_path, script, *args, env_extra = None):
     path = tmp_path / "case.py"
-    path.write_text(script)
+    path.write_text(_SKIP_HOOK + script)
     env = dict(os.environ)
     env.setdefault("UNSLOTH_IS_PRESENT", "1")
     env["PYTHONPATH"] = os.pathsep.join(x for x in (_ROOT, env.get("PYTHONPATH")) if x)
@@ -366,3 +387,27 @@ def test_the_model_forward_patch_is_live_on_this_transformers(tmp_path):
     # cache_position stayed out on transformers 4.x, so nothing it carries (fused decode included) ran.
     res = _run(tmp_path, _LIVE, env_extra = {"UNSLOTH_COMPILE_DISABLE": None, "UNSLOTH_ENABLE_FLEX_ATTENTION": None})
     assert res["live"].startswith("unsloth_zoo"), res
+
+
+@pytest.mark.parametrize("body, skipped", [
+    # torch 2.9 - 2.12 on Windows.
+    ('raise RuntimeError("Compiler: cl is not found.") from FileNotFoundError("cl")', True),
+    # Linux and torch 2.13+, wrapped the way the compile stack reports it.
+    ('class InvalidCxxCompiler(RuntimeError):\n    pass\ntry:\n'
+     '    raise InvalidCxxCompiler("No working C++ compiler found in torch._inductor.config.cpp.cxx")\n'
+     'except RuntimeError as e:\n    raise RuntimeError("backend compiler failed") from e', True),
+    # A compiler error the run recovered from, then an unrelated failure.
+    ('import sys\nprint("InvalidCxxCompiler: No working C++ compiler found", file = sys.stderr)\ntry:\n'
+     '    raise RuntimeError("Compiler: cl is not found.")\nexcept RuntimeError:\n    pass\n'
+     'raise ValueError("unrelated")', False),
+], ids = ["windows-compiler-not-found", "invalid-cxx-compiler-wrapped", "recovered-then-unrelated"])
+def test_only_the_error_that_ends_the_run_decides_the_compiler_skip(tmp_path, body, skipped):
+    from _pytest.outcomes import Skipped
+    try:
+        _run(tmp_path, body + "\n")
+    except Skipped:
+        assert skipped, "an unrelated failure was skipped"
+    except AssertionError:
+        assert not skipped, "a missing compiler failed instead of skipping"
+    else:
+        pytest.fail("the child exited 0")
