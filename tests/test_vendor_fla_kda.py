@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Vendored fla serves fla.ops.kda, which glm5_next (GLM-5.3-Flash) and kimi_linear resolve through
-their kernel-hub wrappers, so they train on the Triton kernels without fla installed."""
+"""Vendored fla serves fla.ops.kda for glm5_next (GLM-5.3-Flash) and kimi_linear via kernel-hub wrappers, so both train on Triton kernels without fla installed."""
 
 import importlib
 import importlib.util
@@ -67,8 +66,8 @@ def test_kernel_hub_table_covers_kda():
 
 
 def test_rdna1_forces_kda_wrappers_to_torch(monkeypatch):
-    # transformers 4.57 ships hub_kernels without the fallback decorator, and so never wraps
-    # the KDA kernels; _force_kernel_hub_fallback correctly forces nothing there.
+    # transformers 4.57 ships hub_kernels without the fallback decorator, so it never wraps the KDA kernels;
+    # _force_kernel_hub_fallback correctly forces nothing there.
     if importlib.util.find_spec("transformers.integrations.hub_kernels") is None:
         pytest.skip("transformers without kernel-hub wrappers")
     hub_kernels = importlib.import_module("transformers.integrations.hub_kernels")

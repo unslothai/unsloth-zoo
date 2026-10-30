@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Embedding rows added for a new pad token must be trainable-safe tensors.
-
-`patch_tokenizer` runs under `torch.inference_mode`, so a resize done there used to
-leave the embedding (and a tied lm_head) as inference tensors: eager training then
-failed with "Inference tensors cannot be saved for backward" and torch.compile graph
-broke on every fake tensor call touching them (Moonshine).
-"""
+"""Pad-token embedding rows must be trainable tensors, not inference tensors: patch_tokenizer runs under
+torch.inference_mode, and a resize there broke eager training and torch.compile (Moonshine)."""
 
 import pytest
 

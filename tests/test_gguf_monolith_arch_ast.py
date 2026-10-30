@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Architecture discovery must read the converter, never execute it.
-
-convert_hf_to_gguf.py is downloaded from llama.cpp's master branch at runtime.
-The monolith layout used to import it to read ModelBase._model_classes, which
-executes the freshly downloaded file inside the training process. It is now
-AST-parsed instead, the same way the newer conversion/ package layout already
-is.
-"""
+"""Architecture discovery must AST-parse the converter downloaded from llama.cpp master at runtime; importing it would run that code in the training process."""
 
 from __future__ import annotations
 
@@ -34,8 +27,7 @@ _MODULE = None
 
 
 def _load_llama_cpp_module():
-    """Loaded once per session: re-executing llama_cpp for every test churns
-    global torch state and slows the suite down for no extra coverage."""
+    """Loads llama_cpp once per session, since re-executing it per test churns global torch state and adds no coverage."""
     global _MODULE
     if _MODULE is None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -132,8 +124,7 @@ class ModelBase:
 
 
 def test_statically_initialized_registries_are_harvested():
-    """Some converters seed _model_classes literally instead of decorating; the
-    old import-based introspection saw those entries, so the parser must too."""
+    """Some converters seed _model_classes with literal entries instead of decorators; the AST parser must harvest those too."""
     llama_cpp = _load_llama_cpp_module()
     text, vision = llama_cpp._extract_archs_from_monolith_source(STATIC_REGISTRY.encode())
 
@@ -152,8 +143,7 @@ def test_static_and_decorated_registries_combine():
 
 
 def test_the_repo_monolith_fixture_still_yields_its_arch():
-    """tests/test_convert_hf_to_gguf_patcher.py models a converter of exactly
-    this shape; it must not regress to an empty allowlist."""
+    """tests/test_convert_hf_to_gguf_patcher.py models a converter of this shape; the parser must not regress to an empty allowlist for it."""
     llama_cpp = _load_llama_cpp_module()
     fixture = Path(__file__).with_name("test_convert_hf_to_gguf_patcher.py").read_text()
     start = fixture.index('_MONOLITH = b"""\\\n') + len('_MONOLITH = b"""\\\n')

@@ -50,8 +50,7 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
     """Warn/raise when labels are all -100 (masked), which zeroes the loss."""
     # All Unsloth Zoo code licensed under LGPLv3
     if isinstance(train_dataset, datasets.IterableDataset):
-        # Skip the check since the code below assumes
-        # an indexable dataset
+        # Skip IterableDataset since the checks below assume an indexable dataset.
         return
     
     if len(train_dataset) == 0: return
@@ -92,6 +91,163 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
             )
     pass
 pass
+
+
+def _bias_compute_dtype(module):
+    """Live compute dtype: floating weight, else bitsandbytes compute/quant dtype, else float16."""
+    weight = None
+    for weight_name in ("weight", "in_proj_weight", "q_proj_weight"):
+        weight = getattr(module, weight_name, None)
+        if torch.is_tensor(weight):
+            break
+    if torch.is_tensor(weight) and weight.is_floating_point() and not hasattr(weight, "quant_state"):
+        return weight.dtype
+    dtype = getattr(module, "compute_dtype", None)
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    dtype = getattr(getattr(weight, "quant_state", None), "dtype", None)
+    return dtype if isinstance(dtype, torch.dtype) else torch.float16
+
+
+def _float32_bias_master_property(name):
+    """In a marked forward, `module.<name>` is the float32 master cast to the compute dtype; elsewhere the master."""
+
+    def get(self):
+        if name in self._parameters:
+            master = self._parameters[name]
+        elif name in self.__dict__:
+            master = self.__dict__[name]
+        else:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        in_forward = self._unsloth_bias_in_forward
+        if master is None or not in_forward or not in_forward[-1]:
+            return master
+        dtype = _bias_compute_dtype(self)
+        if master.dtype == dtype or not master.is_floating_point():
+            return master
+        return master.to(dtype)
+
+    def set(self, value):
+        # Only for unregistered non-Parameters (DataParallel replicas).
+        self.__dict__[name] = value
+
+    def delete(self):
+        self.__dict__.pop(name, None)
+
+    return property(get, set, delete)
+
+
+def _float32_bias_master_reduce(self):
+    getstate = getattr(self, "__getstate__", None)
+    state = getstate() if getstate is not None else self.__dict__
+    cls = type(self)
+    return (_reconstruct_float32_bias_master_module, (cls._unsloth_bias_base, cls._unsloth_bias_names), state)
+
+
+def _reconstruct_float32_bias_master_module(base_cls, names = ("bias",)):
+    cls = _float32_bias_master_class(base_cls, names)
+    return cls.__new__(cls)
+
+
+_FLOAT32_BIAS_MASTER_CLASSES = {}
+
+
+def _float32_bias_master_class(cls, names):
+    names = tuple(sorted(names))
+    new_cls = _FLOAT32_BIAS_MASTER_CLASSES.get((cls, names))
+    if new_cls is None:
+        namespace = {name: _float32_bias_master_property(name) for name in names}
+        namespace.update({
+            "__module__": cls.__module__,
+            "__reduce__": _float32_bias_master_reduce,
+            "_replicate_for_data_parallel": _float32_bias_master_replicate,
+            "_unsloth_bias_base": cls,
+            "_unsloth_bias_names": names,
+        })
+        new_cls = type(cls.__name__, (cls,), namespace)
+        new_cls.__qualname__ = cls.__qualname__ + "WithUnslothFloat32Bias"
+        _FLOAT32_BIAS_MASTER_CLASSES[(cls, names)] = new_cls
+    return new_cls
+
+
+def _float32_bias_master_replicate(self):
+    # Replicas run in parallel threads; the shallow __dict__ copy would share the stack.
+    replica = super(type(self), self)._replicate_for_data_parallel()
+    replica._unsloth_bias_in_forward = []
+    return replica
+
+
+def _owner_stack(module, path):
+    for part in path.split(".") if path else ():
+        module = module._modules.get(part)
+        if module is None:
+            return None
+    return module.__dict__.get("_unsloth_bias_in_forward")
+
+
+def _float32_bias_enter_forward(module, args):
+    for path, cast in module._unsloth_bias_marks:
+        in_forward = _owner_stack(module, path)
+        if in_forward is not None:
+            in_forward.append(cast)
+
+
+def _float32_bias_exit_forward(module, args, output):
+    for path, cast in module._unsloth_bias_marks:
+        in_forward = _owner_stack(module, path)
+        if in_forward:
+            in_forward.pop()
+
+
+def _float32_bias_reset_stacks(module, args):
+    # always_call hooks skip KeyboardInterrupt, which would leave marks pushed.
+    for in_forward in module._unsloth_bias_stacks:
+        in_forward.clear()
+
+
+def _is_peft_tuner_layer(module):
+    try:
+        from peft.tuners.tuners_utils import BaseTunerLayer
+    except Exception:
+        return False
+    return isinstance(module, BaseTunerLayer)
+
+
+def _mark_in_forward(module, path, cast):
+    if "_unsloth_bias_marks" not in module.__dict__:
+        module._unsloth_bias_marks = []
+        module.register_forward_pre_hook(_float32_bias_enter_forward)
+        module.register_forward_hook(_float32_bias_exit_forward, always_call = True)
+    if (path, cast) not in module._unsloth_bias_marks:
+        module._unsloth_bias_marks.append((path, cast))
+
+
+def _cast_bias_in_forward(model, owner_name, names = ("bias",)):
+    """A lazy class property, not a pre-hook (runs before Accelerate materializes offloaded params; DataParallel
+    bypasses _parameters) nor a parametrization (renames state_dict keys).
+
+    The owner and its nearest non-PEFT ancestor (may read the bias functionally, e.g. MHA out_proj) push True;
+    PEFT layers between push False, since their bias.data writes (unmerge with lora_bias) must reach the master."""
+    module = model.get_submodule(owner_name)
+    cls = type(module)
+    base = cls.__dict__.get("_unsloth_bias_base")
+    if base is not None:
+        names = set(names) | set(cls._unsloth_bias_names)
+        cls = base
+    module.__class__ = _float32_bias_master_class(cls, names)
+    if "_unsloth_bias_in_forward" not in module.__dict__:
+        module._unsloth_bias_in_forward = []
+    _mark_in_forward(module, "", True)
+    parts = owner_name.split(".") if owner_name else []
+    while parts:
+        parts.pop()
+        ancestor = model.get_submodule(".".join(parts))
+        path = owner_name[len(".".join(parts)):].lstrip(".")
+        if _is_peft_tuner_layer(ancestor):
+            _mark_in_forward(ancestor, path, False)
+            continue
+        _mark_in_forward(ancestor, path, True)
+        break
 
 
 # Autocast subclasses cached by (base_class, compute_dtype) so pickle can resolve them.
@@ -170,8 +326,7 @@ def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
         return cached
 
     if instance_forward:
-        # Per-instance forward unknown at class creation, so this rare path keeps a
-        # generic signature (remove_unused_columns keeps all columns).
+        # Per-instance forward is unknown at class creation, so this rare path keeps a generic signature (remove_unused_columns keeps all columns).
         _wrapped = _bf16_autocast_instance_forward
     else:
         _orig_forward = cls.forward
@@ -183,8 +338,7 @@ def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
                 self, args, kwargs, compute_dtype,
             )
 
-    # Unique name for module-level registration; __name__ stays the base class so
-    # save_pretrained records the base in architectures.
+    # Unique name for module-level registration; __name__ stays the base class so save_pretrained records the base in architectures.
     pickle_name = cls.__name__ + "WithUnslothBf16Autocast"
     module = sys.modules[__name__]
     if hasattr(module, pickle_name) and getattr(module, pickle_name) is not None:
@@ -217,9 +371,8 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
 
     instance_forward = model.__dict__.get("forward")
     if instance_forward is not None:
-        # An instance-level forward shadows a class override, so swapping __class__ alone
-        # would not intercept it; move it off the instance and route via instance_mode so
-        # forward stays a class attribute (picklable/deepcopy-safe).
+        # An instance-level forward shadows the class override, so swapping __class__ alone won't intercept it; move it
+        # off the instance and route via instance_mode so forward stays a class attribute (picklable/deepcopy-safe)
         model._unsloth_autocast_orig_forward = instance_forward
         del model.__dict__["forward"]
         model.__class__ = _make_bf16_autocast_subclass(
@@ -265,10 +418,9 @@ def _iter_configs(config):
                 stack.append(sub)
 
 
-# Marks a config that never had use_cache, as distinct from one holding None.
-# A class, not object(): deepcopy and pickle preserve a class's identity but not
-# an instance's, which broke the `is` check below and wrote this unserializable
-# object into cfg.use_cache (TRL deepcopies a prepared model for its ref model).
+# Marks a config with no use_cache, distinct from None; a class not object() because deepcopy/pickle keep a class's
+# identity but not an instance's, which broke the is check and wrote an unserializable object into cfg.use_cache (TRL
+# deepcopies a prepared model for its ref model)
 class _ABSENT:
     """Marker type; never instantiated."""
 
@@ -287,8 +439,7 @@ def disable_use_cache(model):
     originals = getattr(model, "_unsloth_use_cache_originals", None)
     if originals is None:
         originals = []
-    # Record by identity, not only on the first call: a config first reached
-    # later was disabled but never recorded, so restore could not undo it.
+    # Record by identity, not only on the first call: a config first reached later was disabled but unrecorded, so restore could not undo it.
     recorded = {id(cfg) for cfg, _ in originals}
     for cfg in _iter_configs(config):
         has_use_cache = hasattr(cfg, "use_cache")
@@ -298,9 +449,8 @@ def disable_use_cache(model):
             # first baseline wins; _ABSENT so restore deletes rather than invents
             originals.append((cfg, cfg.use_cache if has_use_cache else _ABSENT))
             recorded.add(id(cfg))
-        # Set it even when absent: transformers 5 sub-configs inherit no default,
-        # so a forward reading self.config.use_cache raises AttributeError
-        # instead (stepfun-ai/Step-3.7-Flash ships exactly such a text config).
+        # Set it even when absent: transformers 5 sub-configs inherit no default, so a forward reading
+        # self.config.use_cache raises AttributeError instead (stepfun-ai/Step-3.7-Flash ships such a text config)
         cfg.use_cache = False
     if originals:
         try:
@@ -380,8 +530,7 @@ def prepare_model_for_training(
         # We need to upcast to float32
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
-        # Full finetuning upcasts weights to float32; sync config dtype so the
-        # KV cache matches and generation avoids a dtype mismatch in index_copy_().
+        # Full finetuning upcasts weights to float32; sync config dtype so the KV cache matches and generation avoids a dtype mismatch in index_copy_().
         if full_finetuning:
             model._unsloth_original_dtype = dtype
             model.config.torch_dtype = torch.float32
@@ -400,8 +549,7 @@ def prepare_model_for_training(
     pass
     # Defer to an external norm dtype policy (_pre_set_compute_dtype); skip those params.
     _externally_managed_param_ids = set()
-    # Also detect norms by owning-module class name (catches custom norms whose param
-    # names lack a token, e.g. Gemma audio tower).
+    # Also detect norms by owning-module class name; catches custom norms whose param names lack a token (e.g. Gemma audio tower).
     _norm_class_re = re.compile(r"(?i)(rms_?norm|layer_?norm)")
     _norm_param_ids = set()
     for _, _module in model.named_modules():
@@ -426,9 +574,11 @@ def prepare_model_for_training(
             or "norm2." in nm
         )
 
-    # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to
-    # requires_grad=True and would all stay trainable on the LoRA path (#2343 review).
+    # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to requires_grad=True and would all stay trainable on the LoRA path (ref 2343 review).
     _is_peft_model = hasattr(model, "peft_config")
+    # The loop reuses `dtype`.
+    _loaded_float16 = dtype == torch.float16
+    _float32_bias_owners = []
 
     for name, param in model.named_parameters():
         original_name = name
@@ -447,18 +597,21 @@ def prepare_model_for_training(
                 requires_grad = True
             elif (_is_peft_model and "bias" in name and param.requires_grad
                     and ".modules_to_save." not in name):
-                # Respect PEFT's bias decision: bias="all"/"lora_only" marks biases
-                # trainable; freezing them here disabled bias training (#2343).
-                # _keep_param_dtype: keep the loaded dtype, since fp32 on a bf16/fp16
-                # Linear breaks the matmul. modules_to_save is excluded so a saved head
-                # with a frozen weight isn't partially trained via its bias (#2343 review).
+                # Respect PEFT's bias setting (bias="all"/"lora_only" mark biases trainable; ref 2343);
+                # _keep_param_dtype keeps the loaded dtype since fp32 breaks the matmul on a bf16/fp16 Linear;
+                # modules_to_save is excluded so a frozen head is not partly trained via its bias (ref 2343 review)
                 requires_grad = True
-                _keep_param_dtype = True
+                # float16: GradScaler refuses fp16 grads, so use a float32 master cast back in forward.
+                # Skip ".weight" (T5's relative_attention_bias is a weight).
+                if _loaded_float16 and param.dtype == torch.float16 and not name.endswith(".weight"):
+                    upcast = True
+                    _float32_bias_owners.append(name)
+                else:
+                    _keep_param_dtype = True
             else:
                 requires_grad = False
         else:
-            # Norms need fp32 for adam writeback (~60% of bf16 norm updates round to
-            # zero otherwise); a prior dangling else on train_lm_head had clobbered this.
+            # Norms need fp32 for Adam writeback (~60% of bf16 norm updates round to zero otherwise); a dangling else on train_lm_head once clobbered it.
             requires_grad = True
             upcast = False
             if (train_layernorms
@@ -467,15 +620,13 @@ def prepare_model_for_training(
                     and not _disable_float32_norm_upcast):
                 upcast = True
         pass
-        # Set training or not
         if requires_grad:
             param.requires_grad_(True)
         else:
             param.requires_grad_(False)
 
-        # Cast storage in place (keeps Parameter identity so tied weights stay tied);
-        # skip externally-managed params (preserve their fp32 cast) and dtype-pinned
-        # params (trainable biases must match their Linear weight).
+        # Cast storage in place to keep Parameter identity so tied weights stay tied; skip externally-managed params
+        # (keep their fp32 cast) and dtype-pinned params (trainable biases must match their Linear weight)
         if (requires_grad
                 and not _keep_param_dtype
                 and id(param) not in _externally_managed_param_ids):
@@ -493,8 +644,22 @@ def prepare_model_for_training(
                 param.data = param.data.to(torch.float32)
     pass
 
-    # Wrap only if fp32 norms actually exist (our upcast, legacy env, or external policy);
-    # gating on presence avoids wrapping a model that has none.
+    _owner_names = {}
+    for _name in _float32_bias_owners:
+        _owner, _, _leaf = _name.rpartition(".")
+        _owner_names.setdefault(_owner, set()).add(_leaf)
+    for _owner, _names in _owner_names.items():
+        _cast_bias_in_forward(model, _owner, _names)
+    if _owner_names:
+        if "_unsloth_bias_stacks" not in model.__dict__:
+            model._unsloth_bias_stacks = []
+            model.register_forward_pre_hook(_float32_bias_reset_stacks, prepend = True)
+        for _owner in _owner_names:
+            _stack = model.get_submodule(_owner).__dict__["_unsloth_bias_in_forward"]
+            if not any(_s is _stack for _s in model._unsloth_bias_stacks):
+                model._unsloth_bias_stacks.append(_stack)
+
+    # Wrap only if fp32 norms exist (our upcast, legacy env, or external policy); gating on presence avoids wrapping a model with none.
     _has_fp32_norms = any(
         _is_norm_parameter(nm, p) and p.dtype == torch.float32
         for nm, p in model.named_parameters()
@@ -543,9 +708,9 @@ def prepare_model_for_training(
             model.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, input, output):
-                # Deliberately NOT guarded on is_compiling() like the peft_utils pre hook:
-                # this is the only thing making a FROZEN embedding's output require grad,
-                # so skipping it would silently starve the adapters of gradients.
+                # Deliberately NOT guarded on is_compiling(), like the peft_utils pre hook: this is the only thing
+                # making a frozen embedding's output require grad, so skipping it would silently starve adapters of
+                # gradients
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass
@@ -582,8 +747,7 @@ pass
 
 
 def get_max_steps(training_args, n_training_samples, train_dataset):
-    # Approximately from https://github.com/huggingface/transformers/blob/main/src/transformers/trainer.py#L2092
-    # Determines batch size, max steps, ga etc
+    # Approximately from transformers trainer.py line 2092; determines batch size, max steps, ga etc.
     if training_args.world_size > 1:
         raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
     pass
@@ -686,7 +850,6 @@ def unsloth_train(trainer):
     total_train_batch_size, max_steps, num_train_epochs = \
         get_max_steps(training_args, n_training_samples, trainer.train_dataset)
 
-    # Get LR scheduler
     lr_scheduler = transformers_get_scheduler(
         name = training_args.lr_scheduler_type,
         optimizer = optimizer,
@@ -701,10 +864,6 @@ def unsloth_train(trainer):
     clip_grad_norm_ = torch.nn.utils.clip_grad_norm_
     bsz = training_args.per_device_train_batch_size
     ga  = training_args.gradient_accumulation_steps
-    # inverse_gradient_accumulation_steps = 1.0 / ga
-    # inverse_gradient_accumulation_steps = \
-    #     torch.FloatTensor([inverse_gradient_accumulation_steps])\
-    #     .to(device = "cuda:0", non_blocking = True)[0]
 
     # Mixed precision scaling
     _amp_device = DEVICE_TYPE_TORCH if DEVICE_TYPE in ("xpu", "npu") else "cuda"
@@ -763,7 +922,6 @@ def unsloth_train(trainer):
         f' "-____-"     Number of trainable parameters = {n_parameters_to_train:,}'
     print(debug_info)
 
-    # Get per epoch counter
     max_iters_per_epoch = math.ceil(n_training_samples / total_train_batch_size)
     leftover_samples = n_training_samples % total_train_batch_size
     # But also consider leftover steps
@@ -771,7 +929,6 @@ def unsloth_train(trainer):
     if leftover_samples == 0: leftover_ga = ga
 
     logging_steps = training_args.logging_steps
-    # Go through each epoch
     start_time = time.time()
     with ProgressBar(total = max_steps, dynamic_ncols = True) as progress_bar:
         for epoch in range(num_train_epochs):
@@ -810,7 +967,6 @@ def unsloth_train(trainer):
 
                     with autocast_context_manager:
                         loss = model(input_ids = input_ids, labels = labels, n_items = n_items).loss
-                        # loss = loss * inverse_gradient_accumulation_steps
                         accumulated_loss += loss.detach().to(train_device)
                     pass
 
@@ -847,10 +1003,8 @@ def unsloth_train(trainer):
     print("Unsloth: Finished training!")
     end_time = time.time()
 
-    # Return stats
     trainer_stats = Trainer_Stats(metrics = {"train_runtime" : end_time - start_time})
     return trainer_stats
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

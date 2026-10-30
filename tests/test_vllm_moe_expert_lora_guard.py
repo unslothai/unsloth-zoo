@@ -13,15 +13,9 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""`load_lora` must refuse only the adapters vLLM would accept and then silently ignore.
-
-vLLM >= 0.12 serves stacked MoE expert LoRA through FusedMoE3DWithLoRA, so "this adapter
-touches experts" is not by itself a reason to refuse. What is: the engine not picking the
-3D wrapper, a rank past the fused kernel's ceiling, bitsandbytes weights, or any adapter
-key that names a module the live engine does not have. These pin the detector, the
-near-misses a substring match would wrongly reject, the capability gate, and the
-name-resolution check.
-"""
+"""load_lora refuses only adapters vLLM would accept and silently ignore: vLLM >= 0.12 serves MoE expert LoRA via
+FusedMoE3DWithLoRA, so refusal is for the engine not picking the 3D wrapper, a rank past the fused ceiling,
+bitsandbytes weights, or an adapter key naming a module the engine lacks."""
 import pytest
 
 from unsloth_zoo.vllm_utils import _is_moe_expert_lora_key
@@ -65,8 +59,7 @@ def test_detector_matches_dotted_segments_not_substrings():
     assert not _is_moe_expert_lora_key("a.expertsb.lora_A.weight")
 
 
-# --- on-disk branch (load_tensors=False): vLLM gets a PATH, so the in-memory check never
-# runs and vLLM silently skips the expert keys it cannot place. -------------------------
+# On-disk branch (load_tensors=False): vLLM gets a PATH, so the in-memory check never runs and vLLM silently skips the expert keys it cannot place.
 import os
 
 import pytest
@@ -122,8 +115,7 @@ def test_non_lora_expert_tensors_are_ignored(tmp_path):
     assert _saved_adapter_expert_lora_keys(str(tmp_path)) == []
 
 
-# --- ".moe.", the Gemma 4 spelling saving_utils.py remaps to ".experts": equally
-# unservable, and "experts" alone missed it. -------------------------------------------
+# The .moe. spelling (Gemma 4, remapped to .experts by saving_utils.py) is equally unservable, and matching on experts alone missed it.
 
 MOE_SPELLING_KEYS = [
     "base_model.model.model.layers.0.moe.gate_up_proj.lora_A.weight",
@@ -144,11 +136,8 @@ def test_moe_spelling_is_still_segment_matched():
     assert not _is_moe_expert_lora_key("base_model.model.model.layers.0.mlp.shared_expert.up_proj.lora_A.weight")
 
 
-# --- parent-qualified names (GraniteMoE) ----------------------------------------------
-# On transformers 4.57 to 5.0 the experts are block_sparse_moe.input_linear / .output_linear,
-# matching neither "experts" nor "moe". Matching them bare would reject the DENSE pair at
-# shared_mlp.input_linear, which GraniteMoeShared carries in the SAME model. Hence
-# (parent, child) matching. ------------------------------------------------------------
+# GraniteMoE experts on transformers 4.57 to 5.0 are block_sparse_moe.input_linear / .output_linear, matching neither
+# experts nor moe; bare matching would reject the dense shared_mlp pair, so match on (parent, child).
 
 GRANITE_EXPERT_KEYS = [
     "base_model.model.model.layers.0.block_sparse_moe.input_linear.lora_A.default.weight",
@@ -208,11 +197,7 @@ def test_moe_spelling_is_caught_on_disk(tmp_path):
     assert len(got) == 1 and ".moe." in got[0]
 
 
-# --- the capability gate: MoE expert LoRA is servable when vLLM picks the 3D wrapper -----
-# vLLM >= 0.12 serves PEFT's target_parameters layout directly through FusedMoE3DWithLoRA,
-# verified end to end on Qwen3.6-35B-A3B (40 wrappers, output moved, and token-for-token
-# identical to a hand-merged checkpoint). So detecting an expert key is not by itself a
-# reason to refuse; the engine's own is_3d_moe_weight is. ---------------------------------
+# vLLM >= 0.12 serves PEFT target_parameters experts via FusedMoE3DWithLoRA, so an expert key alone is no reason to refuse; engine's is_3d_moe_weight decides.
 
 import types
 
@@ -229,11 +214,9 @@ from unsloth_zoo.vllm_utils import (
     _vllm_lora_target_names,
 )
 
-# vLLM is an optional dependency: it is not in pyproject and no CPU CI lane installs it,
-# so importing it at module level made this whole file uncollectable there and took the
-# detector and saved-checkpoint tests above down with it. Skip only the tests that need a
-# real vLLM class, the way tests/test_upstream_signatures.py and friends already do.
-# `pytest.importorskip` is not usable here because it skips the ENTIRE module.
+# vLLM is optional (not in pyproject, no CPU CI lane installs it), so a module-level import made the whole file
+# uncollectable; skip only tests needing a real vLLM class, as tests/test_upstream_signatures.py does, since
+# importorskip would skip the whole module.
 try:
     from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.fused_moe import MoERunner
@@ -277,12 +260,8 @@ def _build_vllm_model(paths, is_3d_moe_weight = True, lora_config = None):
 
 
 def _fake_worker_lora_manager(enable_mixed_moe_lora_format = False, adapter_manager = True):
-    """`runner.lora_manager`, in the shape lora_model_runner_mixin.py builds it.
-
-    `WorkerLoRAManager.__init__` stores `vllm_config.lora_config` on itself, and
-    `create_lora_manager` hangs the `LoRAModelManager` off `_adapter_manager`, which is
-    where the resolved `_enable_mixed_moe_lora_format` lives.
-    """
+    """Fake runner.lora_manager in lora_model_runner_mixin.py's shape: WorkerLoRAManager keeps vllm_config.lora_config,
+    and the resolved _enable_mixed_moe_lora_format lives on _adapter_manager (the LoRAModelManager)."""
     manager = types.SimpleNamespace(
         lora_config = types.SimpleNamespace(
             enable_mixed_moe_lora_format = enable_mixed_moe_lora_format,
@@ -388,14 +367,9 @@ def test_mixed_moe_lora_format_is_refused():
 
 @requires_vllm
 def test_mixed_moe_mode_is_read_off_the_lora_manager_not_the_model():
-    """Qwen3VLMoe and InternS1Pro set is_3d_moe_weight and never assign self.vllm_config.
-
-    Reading the mode off the model therefore answered "not mixed" for exactly the two 3D
-    architectures that lack that incidental attribute, so the stacked adapter was allowed
-    into vLLM's 2D wrapper. Unsloth's LoRARequest never sets is_3d_lora_weight, so vLLM
-    then takes _slice_moe_lora_ep on a 3D adapter and the rollout silently decays to the
-    base experts. The engine's own LoRA manager always carries the config.
-    """
+    """Qwen3VLMoe and InternS1Pro set is_3d_moe_weight but never assign self.vllm_config, so reading the mode off the
+    model put stacked adapters in the 2D wrapper; read it from the LoRA manager; unsloth LoRARequest never sets
+    is_3d_lora_weight, so rollouts decay silently to base experts."""
     vllm_model = _build_vllm_model(QWEN_PATHS, is_3d_moe_weight = True)
     assert not hasattr(vllm_model, "vllm_config")
 
@@ -430,11 +404,9 @@ def test_unreachable_engine_stays_conservative():
     assert reason is not None and "could not be inspected" in reason
 
 
-# --- the name-resolution check, which is what actually catches the silent cases ----------
-# Unsloth's load_tensors path goes through from_lora_tensors, which runs no
-# check_unexpected_modules, and activate_adapter then zeroes unmatched modules at debug
-# level. vLLM's own check compares the LAST path component only (#34186), so Gemma 4's
-# `...layers.N.experts` vs vLLM's `...layers.N.moe.experts` passes it. --------------------
+# vLLM's own check compares only the last path component (ref 34186), so Gemma 4's layers.N.experts passes though vLLM
+# builds layers.N.moe.experts; load_tensors runs no check_unexpected_modules and activate_adapter zeroes unmatched
+# modules at debug level.
 
 GEMMA_PATHS = {
     "language_model.model.layers.0.self_attn.qkv_proj": _FakeLinear,
@@ -514,11 +486,8 @@ def test_peft_max_rank_handles_objects_and_missing_values():
     assert _peft_max_rank(None) is None
 
 
-# --- the wrapped layout, which is what a live enable_lora engine actually looks like -----
-# _create_lora_modules replaces each target with a BaseLayerWithLoRA that HOLDS the
-# LinearBase / MoERunner at `<module>.base_layer`. Walking for LinearBase alone therefore
-# finds `...qkv_proj.base_layer` and never `...qkv_proj`, and every adapter key would be
-# flagged. Both layouts have to resolve. ------------------------------------------------
+# A live enable_lora engine wraps each target in BaseLayerWithLoRA holding LinearBase / MoERunner at
+# <module>.base_layer; walking for LinearBase alone would flag every adapter key, so both layouts must resolve.
 
 WRAPPED_PATHS = {
     "model.layers.0.self_attn.qkv_proj.base_layer": _FakeLinear,
@@ -540,8 +509,7 @@ def test_wrapped_modules_resolve_to_the_adapter_name():
 
 @requires_vllm
 def test_manager_modules_are_preferred_over_the_module_walk():
-    """activate_adapter walks the manager's dict, so a module vLLM declined to wrap is
-    correctly absent from it even though named_modules still reports it."""
+    """activate_adapter walks the manager's dict, so a module vLLM declined to wrap is correctly absent from it even though named_modules still reports it."""
     vllm_model = _build_vllm_model(WRAPPED_PATHS)
     manager = types.SimpleNamespace(
         modules = {"model.layers.0.self_attn.qkv_proj": object()},

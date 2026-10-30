@@ -13,26 +13,9 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Clip and zero only the parameters holding a grad, without walking the module tree per step.
-
-HF Trainer calls `accelerator.clip_grad_norm_(model.parameters(), ...)` and `model.zero_grad()`
-every optimizer step. Both walk every module: a PEFT Qwen3-30B-A3B (217,593 modules, 56,115
-params) spends ~0.25 s per walk. torch's clip_grad_norm_ and Module.zero_grad only touch params
-whose `.grad is not None`, in parameters() order, so filtering a cached `tuple(parameters())` by
-`.grad is not None` at call time is bitwise identical, including frozen params that still hold a
-grad and params unfrozen mid-run.
-
-The tuple is cached per module against a process-wide generation, bumped by torch's global
-parameter / module registration hooks when the target module was in a cached tree (adapter add,
-register_parameter, setattr of a Parameter or Module; not the throwaway ModuleList that
-`self.layers[:n]` builds every forward), by every Trainer.train() call, every
-Accelerator.prepare_model and by bump() (direct `_parameters` edits, e.g. stacked expert LoRA).
-Only flagged models (enable_fast_grad_params,
-called by the Unsloth loaders) take the fast path; clipping only for plain / DDP Accelerators
-(FSDP, DeepSpeed, XLA, Megatron and TP / CP / SP keep Accelerate's own path).
-
-UNSLOTH_FAST_GRAD_PARAMS=0 turns it off (read at every call).
-"""
+"""Clip and zero only params with a grad, skipping the module walk; bitwise identical to torch's clip_grad_norm_ and
+zero_grad; flagged models, clip only with plain/DDP Accelerators; cache invalidated on registration, Trainer.train(),
+prepare_model, bump(); UNSLOTH_FAST_GRAD_PARAMS=0 disables."""
 import functools
 import inspect
 import os
@@ -68,8 +51,8 @@ def _registration_hook(module, name, value):
 
 
 def _flat_params(module):
-    """tuple(module.parameters()) (same walk, dedup and order: torch's _named_members), cached
-    until the next bump. Marks every module of the tree for _registration_hook."""
+    """Cached tuple(module.parameters()), same walk, dedup and order as torch's _named_members; valid until the next
+    bump; marks the tree's modules for _registration_hook."""
     d = module.__dict__
     hit = d.get(_CACHE)
     if hit is not None and hit[0] == _GEN[0]:
@@ -122,8 +105,7 @@ _zero_grad.__name__ = _zero_grad.__qualname__ = "zero_grad"
 
 
 def _flag(module):
-    """Mark `module` (the exact object Trainer calls) for the fast path. Declines a class that
-    overrides zero_grad or the parameter walk."""
+    """Marks the exact module Trainer calls for the fast path; declines a class that overrides zero_grad or the parameter walk."""
     cls, M = type(module), torch.nn.Module
     d = module.__dict__
     for name in ("zero_grad", "parameters", "named_parameters", "_named_members", "named_modules", "modules"):
@@ -258,8 +240,7 @@ def _install():
 
 
 def enable_fast_grad_params(model):
-    """Flag `model` so Trainer's per-step clip / zero_grad skip the module-tree walk. Idempotent;
-    returns True if flagged. Never raises."""
+    """Flags model so Trainer's per-step clip and zero_grad skip the module-tree walk; idempotent, returns True if flagged, never raises."""
     try:
         if not _enabled() or not isinstance(model, torch.nn.Module) or _offloaded(model):
             return False

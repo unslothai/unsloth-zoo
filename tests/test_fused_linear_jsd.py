@@ -161,8 +161,8 @@ def test_peaked_rows_match_fp64(beta):
     lead = torch.tensor([20.0, 40.0, 80.0]).repeat(n // 3)
     peak = torch.randint(0, V, (n,), generator = g)
     hs[torch.arange(n), peak] += lead
-    # Teacher: mildly peaked on the student's token on odd rows, sharply peaked on another token on even rows,
-    # so the true gradient is O(1) (both collapsed onto one token leaves only rounding noise to compare).
+    # Teacher is mildly peaked on the student's token on odd rows and sharply on another token on even rows, so the true
+    # gradient is O(1); both collapsed onto one token leaves only rounding noise.
     ht[torch.arange(1, n, 2), peak[1::2]] += 3.0
     ht[torch.arange(0, n, 2), (peak[::2] + 1) % V] += lead[::2]
     labels = torch.randint(0, V, (n,), generator = g)
@@ -172,12 +172,142 @@ def test_peaked_rows_match_fp64(beta):
     loss.backward()
     torch.testing.assert_close(loss.double(), ref, rtol = 1e-5, atol = 1e-6)
     # Peaked rows have exponentially small true gradients for beta > 0, so compare at the fp32 noise floor of O(1)
-    # logits; the beta = 0 rows keep O(0.1) gradients and must match tightly.
+    # logits; beta = 0 rows keep O(0.1) gradients and must match tightly.
     err = (h.grad.double() - gh).norm(dim = -1)
     assert torch.isfinite(h.grad).all()
     assert (err <= 1e-6 + 1e-5 * gh.norm(dim = -1)).all(), err
     # The collapse symptom: with W = I the hidden gradient is d loss / d logits, which must sum to zero per row.
     assert h.grad.double().sum(-1).abs().max().item() < 1e-6
+
+
+def _confident_same_token(dtype):
+    """Student and teacher both put all but e^-17 .. e^-50 of the mass on the same token (fp32 softmax rounds it to 1)."""
+    g = torch.Generator().manual_seed(13)
+    margins = (17.0, 20.0, 30.0, 50.0)
+    pairs = [(a, b) for a in margins for b in margins if a != b]
+    n = len(pairs)
+    peak = torch.randint(0, V, (n,), generator = g)
+
+    def logits(m):
+        z = -torch.rand(n, V, generator = g) * 2 - torch.tensor(m)[:, None]
+        z[torch.arange(n), peak] = 0.0
+        return z
+
+    zs, zt = logits([a for a, _ in pairs]), logits([b for _, b in pairs])
+    # A top logit of exactly 0 makes x_j - lse exactly 0 on some devices; shifted rows round it to an ulp instead.
+    shift = (torch.rand(n, 1, generator = g) * 10 - 5).round(decimals = 2)
+    rows = [(zs.to(dtype), zt.to(dtype)), ((zs + shift).to(dtype), (zt + shift).to(dtype))]
+    rows.append((torch.tensor([[0.0, -20.0]], dtype = dtype), torch.tensor([[0.0, -30.0]], dtype = dtype)))
+    return rows
+
+
+def _jsd_route(path, monkeypatch):
+    if path == "cpu":
+        return "cpu"
+    if path != "eager" and not fl._HAS_TRITON:
+        pytest.skip("no Triton installed: Triton and Inductor bodies cannot run")
+    if path == "triton":
+        assert fl._use_triton(torch.device("cuda")), "Triton JSD path unavailable"
+    else:
+        monkeypatch.setattr(fl, "_use_triton", lambda device: False)
+    if path == "inductor":
+        assert fl._jsd_compiled(torch.device("cuda")) is not None, "compiled JSD body unavailable"
+    elif path == "eager":
+        monkeypatch.setattr(fl, "_jsd_compiled", lambda device: None)
+    return "cuda"
+
+
+def _exact_jsd(s_row, t_row, beta):
+    """80-digit loss and dz of TRL's generalized_jsd_loss; fp64 collapses past margin ~37, so it cannot referee e^-50."""
+    import mpmath  # a torch dependency (through sympy)
+    mp = mpmath.mp.clone()
+    mp.dps = 80
+    s = [mp.mpf(float(x)) for x in s_row]
+    t = [mp.mpf(float(x)) for x in t_row]
+    zs, zt = mp.fsum(mp.exp(x) for x in s), mp.fsum(mp.exp(x) for x in t)
+    p, q = [mp.exp(x) / zs for x in s], [mp.exp(x) / zt for x in t]
+    lp, lq = [mp.log(x) for x in p], [mp.log(x) for x in q]
+    if beta == 0.0:
+        loss = mp.fsum(b * (c - a) for a, b, c in zip(lp, q, lq))
+        grad = [a - b for a, b in zip(p, q)]
+    else:
+        if beta == 1.0:
+            d = [a - b for a, b in zip(lp, lq)]
+            loss = mp.fsum(a * b for a, b in zip(p, d))
+        else:
+            b_ = mp.mpf(beta)
+            m = [mp.log((1 - b_) * a + b_ * b) for a, b in zip(p, q)]
+            d = [a - b for a, b in zip(lp, m)]
+            loss = (b_ * mp.fsum(a * (b - c) for a, b, c in zip(q, lq, m))
+                    + (1 - b_) * mp.fsum(a * b for a, b in zip(p, d)))
+        sd = mp.fsum(a * b for a, b in zip(p, d))
+        scale = 1 if beta == 1.0 else 1 - mp.mpf(beta)
+        grad = [scale * a * (b - sd) for a, b in zip(p, d)]
+    return torch.tensor(float(loss), dtype = torch.float64), torch.tensor([float(x) for x in grad], dtype = torch.float64)
+
+
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
+def test_exact_jsd_oracle_is_trls_loss(beta):
+    """The 80-digit oracle against TRL's formula in fp64 where fp64 still resolves the rows (margin <= 20)."""
+    zs, zt = _confident_same_token(torch.float64)[1]
+    for i in range(zs.shape[0]):
+        if max(-zs[i].topk(2).values[1].item(), -zt[i].topk(2).values[1].item()) > 23:
+            continue
+        hd = zs[i:i + 1].clone().requires_grad_(True)
+        ref = trl_generalized_jsd_loss(hd, zt[i:i + 1], beta = beta, num_items_in_batch = 1)
+        ref.backward()
+        loss, grad = _exact_jsd(zs[i], zt[i], beta)
+        torch.testing.assert_close(ref.detach(), loss, rtol = 1e-4, atol = 0.0)
+        torch.testing.assert_close(hd.grad[0], grad, rtol = 1e-4, atol = 1e-6 * grad.abs().max().item())
+
+
+@pytest.mark.parametrize("path", ["cpu"] + (["triton", "inductor", "eager"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
+def test_confident_same_token_rows_match_exact(beta, dtype, path, monkeypatch):
+    """Both heads confident on one token: fp32 x_j - lse rounds to 0, which collapsed KL / JSD and the top-token dz."""
+    device = _jsd_route(path, monkeypatch)
+    for zs, zt in _confident_same_token(dtype):
+        w = torch.eye(zs.shape[1], dtype = dtype, device = device)  # logits == hidden
+        for i in range(zs.shape[0]):
+            ref, gref = _exact_jsd(zs[i].float(), zt[i].float(), beta)
+            h = zs[i:i + 1].to(device).clone().requires_grad_(True)
+            loss = fl.fused_linear_jsd(h, w, zt[i:i + 1].to(device), w, beta = beta, num_items_in_batch = 1)
+            loss.backward()
+            assert loss.item() > 0.0, (i, loss.item(), ref.item())
+            torch.testing.assert_close(loss.double().cpu(), ref, rtol = 1e-4, atol = 0.0)
+            err = ((h.grad[0].double().cpu() - gref).norm() / gref.norm()).item()
+            assert err < (1e-4 if dtype == torch.float32 else 1e-2), (i, err)
+
+
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
+def test_confident_same_token_body_matches_exact(beta):
+    """_jsd_body (the compiled CUDA form, run eagerly here) on the same rows, fp32 logits."""
+    for zs, zt in _confident_same_token(torch.float32):
+        row, dz = fl._jsd_body(zs, zt, torch.tensor(1.0), beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+        for i in range(zs.shape[0]):
+            ref, gref = _exact_jsd(zs[i], zt[i], beta)
+            torch.testing.assert_close(row[i].double(), ref, rtol = 1e-4, atol = 0.0)
+            assert ((dz[i].double() - gref).norm() / gref.norm()).item() < 1e-4, i
+
+
+@pytest.mark.parametrize("path", ["body", "chunk", "triton"])
+def test_diffuse_rows_keep_the_direct_beta0_gradient(path):
+    """beta 0 top-token dz = q_o - p_o only on confident rows; on diffuse rows both are near 1 and cancel."""
+    torch.manual_seed(123)
+    s = torch.randn(2, 150000)
+    t = s + 0.001 * torch.randn_like(s)
+    one = torch.tensor(1.0)
+    _, ref = fl._jsd_body(s.double(), t.double(), one.double(), 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float64)
+    if path == "body":
+        _, dz = fl._jsd_body(s, t, one, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    elif path == "chunk":
+        _, dz = fl._jsd_chunk(torch.log_softmax(s, -1), torch.log_softmax(t, -1), 0.0, True)
+    else:
+        if not torch.cuda.is_available() or not fl._use_triton(torch.device("cuda")):
+            pytest.skip("Triton on CUDA")
+        _, dz = fl._jsd_triton(s.cuda(), t.cuda(), one.cuda(), 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    assert (dz.cpu().double() - ref).norm() / ref.norm() < 5e-3
 
 
 def test_fully_masked_is_finite_zero():

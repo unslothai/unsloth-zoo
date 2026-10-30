@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fused MoE router (moe_router_triton): fp64 oracle, eager parity, finite differences, ties,
-extremes, torch.compile (graph breaks / recompiles) and opcheck. CUDA + Triton only."""
+"""Fused MoE router (moe_router_triton) tests vs an fp64 oracle, eager parity, finite differences, ties, extremes, torch.compile and opcheck; CUDA + Triton only."""
 
 import math
 import os
@@ -35,8 +34,8 @@ TOL_G = {torch.float32: 2e-6, torch.bfloat16: 1e-2, torch.float16: 2e-3}
 
 
 def _same_ids(a, b):
-    """Same selected set per row. Order can differ only inside exactly tied values: torch.topk's
-    CUDA sort is not stable, the kernel puts the lower index first (weights are equal there)."""
+    """Same selected set per row; order differs only for exactly tied values (equal weights), since torch.topk's CUDA
+    sort is unstable while the kernel puts the lower index first."""
     return torch.equal(a.sort(-1)[0], b.sort(-1)[0])
 
 

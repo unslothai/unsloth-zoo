@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""vLLM picks FlashInfer GDN prefill by GPU alone; a flashinfer that lacks the keywords
-vLLM passes must route GDN prefill to Triton instead of failing at the first prefill."""
+"""vLLM picks FlashInfer GDN prefill by GPU alone, so a flashinfer lacking the keywords vLLM passes must route GDN prefill to Triton, not fail at first prefill."""
 
 import ast
 import functools

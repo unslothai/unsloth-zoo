@@ -63,10 +63,7 @@ def _equal(a, b):
 def _identical(a, b, nan_payload_may_differ = False):
     assert a.dtype == b.dtype
     if nan_payload_may_differ and mx.issubdtype(a.dtype, mx.floating):
-        # WHICH NaN a poisoned row carries is not stable: the native chain yields bfloat16 0x7FFF
-        # on an M1 and 0x7FC0 on an M3 Max, so no fixed kernel output satisfies a byte comparison
-        # on all hardware. Still exact elsewhere: the NaN positions must match, and every other
-        # byte, every index and every finite weight, still compares bit for bit.
+        # NaN payload bits vary by hardware (bfloat16 0x7FFF on M1, 0x7FC0 on M3 Max), so only NaN positions are compared; all else stays bit-exact.
         assert mx.array_equal(mx.isnan(a), mx.isnan(b)), "the poisoned positions differ"
         quiet = mx.array(float("nan"), dtype = a.dtype)
         a, b = mx.where(mx.isnan(a), quiet, a), mx.where(mx.isnan(b), quiet, b)
@@ -117,8 +114,7 @@ def test_fusion_preserves_outputs_parameters_and_native_class(native, dtype, dim
             native_calls = len(calls)
             calls.clear()
             _equal(model(x, indices), expected)
-            # packing folds the separate gate and up projections into one, except where a short
-            # sequence belongs to an upstream decode path this body does not reimplement
+            # Packing folds gate and up into one projection, except short sequences belonging to an upstream decode path this body does not reimplement.
             assert len(calls) == (native_calls if 1 < x.shape[1] <= decode_block else 2)
         monkeypatch.setattr(native, "_gather_sort", None)  # a rebound switch layer function falls back per call
         calls.clear()
@@ -201,8 +197,7 @@ def _cache_limit():
 
 @pytest.mark.parametrize("native", [lm, vlm])
 def test_packing_retains_nothing_it_replaces(native, monkeypatch):
-    """Cached rather than returned, the replaced arrays are a second copy of the packed half of
-    the model."""
+    """Packing must retain nothing it replaces: replaced arrays cached rather than returned would be a second copy of the packed half of the model."""
     modules = [_model(native) for _ in range(4)]
     root = nn.Sequential(*modules)
     root.eval()
@@ -650,8 +645,7 @@ def _expert_block(native, quantization, dtype, widths = (512, 512)):
 
 @pytest.mark.parametrize("native", [vlm_qwen, lm_qwen])
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-# (hidden, expert) widths: MLX runs qmv for a K its bit width's qmv_fast step does not divide (512 at 4 bits, 256 at 8),
-# here the down projection, gate/up, both, and neither at 8 bits.
+# Widths where MLX runs qmv for a K its bit width's qmv_fast step does not divide (512 at 4 bits, 256 at 8); here down, gate/up, both or neither at 8 bits.
 @pytest.mark.parametrize("quantization, widths", [((8, "affine", 64), (512, 512)), ((4, "affine", 32), (512, 512)), ((4, "mxfp4", 32), (512, 512)),
                                                   ((4, "nvfp4", 16), (512, 512)), ((4, "affine", 32), (512, 640)), ((4, "affine", 32), (640, 512)),
                                                   ((8, "affine", 32), (640, 640)), ((6, "affine", 32), (640, 640)), ((2, "affine", 32), (640, 640)),
@@ -826,9 +820,7 @@ def test_shared_expert_gate_sigmoid_rides_on_the_routing_launch(case, monkeypatc
 
 @pytest.mark.parametrize("native", [vlm_gemma, lm_gemma])
 def test_router_packing_that_fails_partway_leaves_every_module_native(native, monkeypatch):
-    """The router holds the same contract as the gate/up pack, through its own cleanup: it
-    builds a norm scale per Gemma module after swapping the class, so it too can fail with
-    modules already patched."""
+    """Router shares the gate/up pack's cleanup contract; it builds a per-Gemma-module norm scale after the class swap, so it can fail with modules already patched."""
     first, second = _router(native), _router(native)
     root = nn.Sequential(first, second)
     root.eval()
@@ -1012,9 +1004,8 @@ def test_nested_scopes_and_generation_mode_restore():
 
 
 def test_contended_scopes_leave_no_module_patched():
-    # The loader's generate() wrappers enter this scope without the lock generation_mode holds, so
-    # two requests can be in the entry loop at once. Without _MOE_ROUTER_LOCK that stranded the
-    # patched class in 5 of 40 rounds; the switch interval makes it prompt.
+    # generate() wrappers enter this scope without the generation_mode lock, so two requests can race; without
+    # _MOE_ROUTER_LOCK the patched class is stranded; a tiny switch interval exposes it promptly.
     block = _block(lm_qwen)
     base = type(block)
     previous = sys.getswitchinterval()

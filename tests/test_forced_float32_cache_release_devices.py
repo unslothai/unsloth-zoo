@@ -14,24 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression tests for how the forced-float32 pass releases the CUDA cache.
-
-``patch_model_and_tokenizer(..., do_forced_float32=True)`` casts modules in a
-loop and used to call ``torch.cuda.empty_cache()`` once per module. The casts are
-asynchronous and ``empty_cache()`` cudaFrees cached blocks on every device with no
-device guard, while cudaFree only synchronises the current one, so on a model
-split across GPUs blocks on the far card went back to the driver mid-write and a
-CUDA illegal memory access surfaced at a later, unrelated sync.
-
-The release now happens once, after a synchronise of the devices the model itself
-occupies. Taking that set from the model rather than ``torch.cuda.device_count()``
-matters under DDP: one rank per GPU with every GPU visible would otherwise have
-each rank synchronise every card, and ``torch.cuda.synchronize(i)`` initialises a
-CUDA context on device ``i``, costing a few hundred MB per card per rank.
-
-Both tests drive the real function; neither reads the source text of the patch.
-The CPU test fakes a busy 8-GPU host so it stays meaningful on a CPU-only runner.
-"""
+"""Forced-float32 pass calls empty_cache once after syncing only the model's own GPUs (not device_count()): per-module
+calls freed cached blocks on other GPUs mid-write (illegal access later), and syncing unused GPUs creates a CUDA
+context per card (hundreds of MB per rank under DDP)."""
 
 from __future__ import annotations
 
@@ -109,8 +94,7 @@ def test_gpu_model_syncs_its_own_devices_once():
 
     assert set(recorder.synchronised) == expected
     assert len(recorder.synchronised) == len(expected)
-    # One release for the whole pass, not one per module. The trailing gc loop in
-    # patch_model_and_tokenizer adds a fixed three on top, so the count is bounded
-    # by a constant and cannot grow with the model.
+    # One empty_cache for the whole pass; the trailing gc loop in patch_model_and_tokenizer adds a fixed three on top,
+    # so the total (4) is bounded by a constant, not model-sized.
     assert recorder.empty_cache_calls < n_modules
     assert recorder.empty_cache_calls == 4

@@ -14,19 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`check_hf_model_exists` must not report "absent" for a Hub it cannot reach.
-
-The bare `except: return False` around `HfFileSystem(...).ls(...)` mapped a 429, a
-5xx, a DNS or proxy failure, a read timeout and `HF_HUB_OFFLINE` onto "this repo does
-not exist". `determine_base_model_source` then returned `(None, ...)` and
-`merge_and_overwrite_lora` warned and returned None, so `save_pretrained_merged`
-created no output directory at all and only warned about it.
-
-`HfFileSystem` already separates the two: `_raise_file_not_found` (a plain
-FileNotFoundError) is reached only after `_repo_and_revision_exists` catches
-RepositoryNotFoundError / RevisionNotFoundError / HFValidationError, while every
-transport failure propagates out of `ls` untouched.
-"""
+"""check_hf_model_exists must not treat an unreachable Hub (429, 5xx, DNS, timeout, HF_HUB_OFFLINE) as absent; only a
+FileNotFoundError after the repo/revision check means absent."""
 
 import warnings
 
@@ -114,8 +103,7 @@ def test_transport_failure_does_not_return_false(monkeypatch):
 # A genuinely absent or inaccessible repo must still answer False.
 
 _ABSENT_ERRORS = [
-    # What ls actually raises for a missing repo: fsspec converts
-    # RepositoryNotFoundError into a plain FileNotFoundError.
+    # ls raises a plain FileNotFoundError for a missing repo because fsspec converts RepositoryNotFoundError into it.
     pytest.param(
         FileNotFoundError("unslothai/nope (repository not found)"), id = "fsspec-file-not-found",
     ),
@@ -141,18 +129,10 @@ def test_absent_repo_still_returns_false(monkeypatch, error):
         assert saving_utils.check_hf_model_exists("unslothai/definitely-not-a-real-repo") is False
 
 
-# A gated repo answers False like an absent one, but it is not absent, and that
-# difference is the only actionable thing the user has.
+# A gated repo answers False like an absent one, but it is not absent, and that difference is the only actionable thing the user has.
 
 def _ls_gated_the_way_fsspec_delivers_it(monkeypatch):
-    """What a gated repo ACTUALLY looks like coming out of `HfFileSystem.ls`.
-
-    Not a GatedRepoError: `_repo_and_revision_exist` catches
-    `RepositoryNotFoundError` (which GatedRepoError subclasses) and
-    `_raise_file_not_found` re-raises it as `FileNotFoundError(msg) from err`, so the
-    real reason is in `__cause__` and an `except GatedRepoError` handler would never
-    fire. Read off the installed huggingface_hub source, not assumed.
-    """
+    """Via HfFileSystem.ls a gated repo surfaces as FileNotFoundError chained from RepositoryNotFoundError (in __cause__), so except GatedRepoError never fires."""
     def fake_ls(self, path, detail = True, **kwargs):
         try:
             raise GatedRepoError("403 gated repo", response = _response(403))
@@ -162,8 +142,7 @@ def _ls_gated_the_way_fsspec_delivers_it(monkeypatch):
 
 
 def test_gated_repo_says_it_is_gated_rather_than_absent(monkeypatch):
-    """False on purpose, so a local copy still wins, but a gated repo demonstrably
-    exists and reporting it missing sends the user hunting a typo they do not have."""
+    """Answer stays False so a local copy wins, but the warning must say gated: the repo exists, and calling it missing sends users hunting a typo."""
     _ls_gated_the_way_fsspec_delivers_it(monkeypatch)
 
     with pytest.warns(UserWarning) as caught:
@@ -176,8 +155,7 @@ def test_gated_repo_says_it_is_gated_rather_than_absent(monkeypatch):
 
 
 def test_gated_detection_survives_the_fsspec_conversion(monkeypatch):
-    """Pinned so a refactor back to `except GatedRepoError` cannot pass: the type
-    never reaches the handler."""
+    """Guards a refactor back to except GatedRepoError: fsspec converts the type, so it never reaches that handler."""
     assert issubclass(GatedRepoError, RepositoryNotFoundError)
     wrapped = None
     try:

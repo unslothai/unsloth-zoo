@@ -14,16 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Class-valued symbols of the Apple Silicon triton stub.
-
-Unseeded ``triton.*`` attributes come back as ``_Noop`` instances, and an
-instance is not a type, so ``isinstance`` / ``issubclass`` / ``except`` on one
-raises ``TypeError: isinstance() arg 2 must be a type``. torch >= 2.10 imports
-``triton.runtime.jit.JITFunction`` at import time of ``torch.utils.flop_counter``
-and isinstance()s it: with triton truly absent that import fails and torch falls
-back to NoneType, but the stub makes it succeed, so every name real triton
-exposes as a class has to be seeded as a real class.
-"""
+"""Apple Silicon triton stub must seed each real-triton class name as a real class: torch >= 2.10 isinstance()s
+triton.runtime.jit.JITFunction, and a _Noop instance raises TypeError; with triton absent torch falls back to
+NoneType, but the stub's import succeeds."""
 
 from __future__ import annotations
 
@@ -127,9 +120,8 @@ _SUBPROCESS = textwrap.dedent(
 )
 
 
-# inductor's two other class-sensitive uses, verbatim from torch main:
-# triton_compat imports IntelGPUError and triton_heuristics catches it;
-# _interpret_args_grid isinstance()s InterpretedFunction.
+# inductor's two other class-sensitive uses, verbatim from torch main: triton_compat imports IntelGPUError which
+# triton_heuristics catches; _interpret_args_grid isinstance()s InterpretedFunction.
 _INDUCTOR_SUBPROCESS = textwrap.dedent(
     """
     import importlib.util, sys
