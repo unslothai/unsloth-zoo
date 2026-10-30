@@ -4519,6 +4519,109 @@ def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path)
     assert loaded("hello world")["input_ids"] == bare("hello world")["input_ids"]
 
 
+@pytest.mark.parametrize("model_type, declared, expected, expected_before_5_7, hub_class_known_wrong", [
+    ("mistral", "LlamaTokenizerFast", "TokenizersBackend", "TokenizersBackend", False),
+    ("bart", "GPT2TokenizerFast", "GPT2Tokenizer", "TokenizersBackend", False),
+    ("gpt2", "LlamaTokenizerFast", "GPT2Tokenizer", "TokenizersBackend", True),
+    # DeepSeek-R1-Distill-Qwen
+    ("qwen2", "LlamaTokenizerFast", "Qwen2Tokenizer", "TokenizersBackend", True),
+])
+def test_tokenizer_class_disagreeing_with_model_type_keeps_tokenizer_json(
+    monkeypatch, tmp_path, model_type, declared, expected, expected_before_5_7, hub_class_known_wrong,
+):
+    """Tekken repos declare LlamaTokenizerFast over a ByteLevel tokenizer.json; LlamaTokenizer
+    would decode raw 'Ġ'/'Ċ' pieces. Mirrors AutoTokenizer's class choice, pre- and post-5.7."""
+    import transformers
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from transformers.models.auto import tokenization_auto
+    import unsloth_zoo.mlx.loader as loader
+
+    if not hasattr(transformers, "TokenizersBackend"):
+        pytest.skip("transformers 4.x fast classes load tokenizer.json as written")
+    from packaging.version import Version
+
+    if Version(transformers.__version__) < Version("5.7.0"):
+        expected = expected_before_5_7
+    elif hub_class_known_wrong:
+        # 5.17 lists qwen2 and others with a specialized class; 5.5's list has none.
+        monkeypatch.setattr(tokenization_auto, "MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS", {model_type})
+    text = "Hello world.\nNext line"
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator([text] * 4, trainers.BpeTrainer(
+        special_tokens=["<unk>", "<s>", "</s>"],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+    ))
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": declared, "bos_token": "<s>", "eos_token": "</s>",
+    }))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+    loaded = loader._load_mlx_tokenizer(tmp_path)
+    ids = backend.encode(text).ids
+    assert type(loaded).__name__ == expected
+    assert loaded.encode(text, add_special_tokens=False) == ids
+    assert loaded.decode(ids) == text
+
+
+@pytest.mark.parametrize("model_type, kwargs, digits", [
+    ("mistral", {}, ["1", "2", "3", "4", "5"]),
+    ("llama", {}, ["123", "45"]),
+    ("mistral", {"fix_mistral_regex": False}, ["123", "45"]),
+])
+def test_mistral_tokenizer_with_llama3_split_gets_tekken_split(tmp_path, model_type, kwargs, digits):
+    """Tekken tokenizer.json conversions open with Llama-3's split, so digits group in
+    threes where mistral-common splits them one by one; Llama-3 itself keeps it."""
+    from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers, trainers
+    import unsloth_zoo.mlx.loader as loader
+
+    text = "Year 12345 camelCASE"
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.Sequence([
+        pre_tokenizers.Split(Regex(loader._MISTRAL_WRONG_SPLIT_PATTERN), behavior="isolated"),
+        pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+    ])
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator([text] * 4, trainers.BpeTrainer(
+        special_tokens=["<unk>", "<s>", "</s>"],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+    ))
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "PreTrainedTokenizerFast", "bos_token": "<s>", "eos_token": "</s>",
+    }))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+    loaded = loader._load_mlx_tokenizer(tmp_path, **kwargs)
+    pieces = loaded.backend_tokenizer.pre_tokenizer.pre_tokenize_str("12345")
+    assert [piece for piece, _ in pieces] == digits
+    ids = loaded.encode(text, add_special_tokens=False)
+    assert loaded.decode(ids) == text
+
+
+def test_sentencepiece_mistral_tokenizer_keeps_its_pre_tokenizer(tmp_path):
+    """Mistral 7B v0.1-v0.3 ship a Metaspace tokenizer.json; the Tekken split is not theirs."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    import unsloth_zoo.mlx.loader as loader
+
+    text = "Year 12345 camelCASE"
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.Metaspace()
+    backend.decoder = decoders.Metaspace()
+    backend.train_from_iterator([text] * 4, trainers.BpeTrainer(special_tokens=["<unk>", "<s>", "</s>"]))
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "PreTrainedTokenizerFast", "bos_token": "<s>", "eos_token": "</s>",
+    }))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "mistral"}))
+
+    loaded = loader._load_mlx_tokenizer(tmp_path)
+    assert loaded.backend_tokenizer.pre_tokenizer.__class__.__name__ == "Metaspace"
+    assert loaded.encode(text, add_special_tokens=False) == backend.encode(text).ids
+
+
 def test_model_type_lookup_never_builds_a_model_config(monkeypatch, tmp_path):
     """The recovery above must not reintroduce the validation this fix removes."""
     import transformers
