@@ -6963,17 +6963,12 @@ class PredraftCache:
         self.cache, self.valid, self.position, self.rows = cache, valid, position, None
 
     def history(self):
-        # What a multi-row `update_and_fetch` attends over besides the rows it appends.
+        # Every context row the cache holds, in buffer order: the layer attends without a causal mask.
         cache = self.cache
         if cache.keys is None:
             return None, None
-        if not hasattr(cache, "max_size"):
-            return cache.keys[..., : cache.offset, :], cache.values[..., : cache.offset, :]
-        keys, values = cache._temporal_order(cache.keys), cache._temporal_order(cache.values)
-        if self.valid.shape[0] == 0:
-            return keys, values
-        trim = keys.shape[2] - cache.max_size + 1
-        return (cache._trim(trim, keys), cache._trim(trim, values)) if trim > 0 else (keys, values)
+        held = min(cache.offset, cache.keys.shape[2])
+        return cache.keys[..., :held, :], cache.values[..., :held, :]
 
     def append(self, rows: int):
         """Write the first ``rows`` verified rows' keys and values, as the block drafted from them would have."""
@@ -6984,33 +6979,48 @@ class PredraftCache:
 
 
 def _append_in_place(cache, keys, values) -> bool:
-    """A multi-row rotating-cache update written into spare capacity, grown a step at a time as the single-row update
-    grows it, instead of copying the whole window each round; False where the native update must trim or rotate."""
-    # `_idx != offset` only past a full window today; checked since upstream `trim` is not pinned.
-    if (not hasattr(cache, "max_size") or cache.keys is None or cache._idx != cache.offset
-            or cache.offset + keys.shape[2] > cache.max_size or keys.dtype != cache.keys.dtype or values.dtype != cache.values.dtype):
+    """A multi-row rotating-cache update written in place, grown a step at a time as the single-row update grows it and
+    then wrapping as its ring does, instead of copying the whole window each round; False where the native update runs."""
+    size, rows = getattr(cache, "max_size", None), keys.shape[2]
+    if (size is None or cache.keys is None or cache.keep or rows > size
+            or keys.dtype != cache.keys.dtype or values.dtype != cache.values.dtype):
         return False
-    start, end = cache.offset, cache.offset + keys.shape[2]
-    if end > cache.keys.shape[2]:
-        size = min(cache.max_size, max(end, start + cache.step))
-        cache.keys, cache.values = (mx.concatenate([held[..., :start, :], mx.zeros((*held.shape[:2], size - start, held.shape[3]), held.dtype)], axis = 2)
-                                    for held in (cache.keys, cache.values))
-    cache.keys[..., start:end, :] = keys
-    cache.values[..., start:end, :] = values
-    cache.offset = cache._idx = end
+    held = cache.keys.shape[2]
+    if held > size:
+        if cache._idx != held:
+            return False
+        # A native multi-row update's buffer, in temporal order: its newest `size` rows become the ring.
+        cache.keys, cache.values = cache.keys[..., held - size :, :], cache.values[..., held - size :, :]
+        cache._idx = held = size
+    start = cache._idx % size
+    end = start + rows
+    if end > held and held < size:
+        grown = min(size, max(end, start + cache.step))
+        cache.keys, cache.values = (mx.concatenate([b[..., :start, :], mx.zeros((*b.shape[:2], grown - start, b.shape[3]), b.dtype)], axis = 2)
+                                    for b in (cache.keys, cache.values))
+        held = grown
+    first = min(end, held) - start
+    cache.keys[..., start : start + first, :] = keys[..., :first, :]
+    cache.values[..., start : start + first, :] = values[..., :first, :]
+    if first < rows:
+        cache.keys[..., : rows - first, :] = keys[..., first:, :]
+        cache.values[..., : rows - first, :] = values[..., first:, :]
+    cache._idx = start + first if first == rows else rows - first
+    cache.offset += rows
     return True
 
 
 @functools.cache
 def _predraft_class(base):
     def __call__(self, x, x_ctx, rope, cache, projected_context = None):
-        if not isinstance(cache, PredraftCache):
-            if x_ctx.shape[1] or cache.keys is None:
-                return base.__call__(self, x, x_ctx, rope, cache, projected_context)
-            cache = PredraftCache(cache, mx.zeros((0,), mx.bool_), mx.array(cache.offset, mx.int32))
-        # `DFlashAttention.__call__` with the context's keys appended to the cache's only in `PredraftCache.append`.
         B, L, _ = x.shape
-        S = x_ctx.shape[1]
+        S, commit = x_ctx.shape[1], 0
+        if not isinstance(cache, PredraftCache):
+            # The first context, or one past the window, keeps the native trim; later ones append as a predraft's would.
+            if cache.keys is None or S >= (self.sliding_window if self.is_sliding else 1 << 30):
+                return base.__call__(self, x, x_ctx, rope, cache, projected_context)
+            cache, commit = PredraftCache(cache, mx.ones((S,), mx.bool_), mx.array(cache.offset + S, mx.int32)), S
+        # `DFlashAttention.__call__` with the context's keys appended to the cache's only in `PredraftCache.append`.
         bindings = self.__dict__.get("_unsloth_lane_bindings")
         shared = {}
         if bindings is not None and projected_context is None and type(self)._project_kv is base._project_kv and _lane_kernel_on():
@@ -7034,11 +7044,14 @@ def _predraft_class(base):
         cache.rows = ctx_keys, ctx_values
         old_keys, old_values = cache.history()
         held = 0 if old_keys is None else old_keys.shape[2]
-        keys = mx.concatenate([ctx_keys, prop_keys] if old_keys is None else [old_keys, ctx_keys, prop_keys], axis = 2)
-        values = mx.concatenate([ctx_values, prop_values] if old_values is None else [old_values, ctx_values, prop_values], axis = 2)
-        mask = mx.concatenate([mx.ones((held,), mx.bool_), cache.valid, mx.ones((L,), mx.bool_)])
+        # Block rows first, so verified rows keep their places whether the block drafts before or after acceptance.
+        keys = mx.concatenate([prop_keys, ctx_keys] if old_keys is None else [old_keys, prop_keys, ctx_keys], axis = 2)
+        values = mx.concatenate([prop_values, ctx_values] if old_values is None else [old_values, prop_values, ctx_values], axis = 2)
+        mask = mx.concatenate([mx.ones((held + L,), mx.bool_), cache.valid])
         o = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = self.scale, mask = mask[None, None, None],
                                                  sinks = self.attention_sink_bias)
+        if commit:
+            cache.append(commit)
         return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
     return type(f"_Predraft{base.__name__}", (base,), {"__call__": __call__, "_unsloth_predraft_native": base})

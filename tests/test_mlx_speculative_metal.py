@@ -2069,19 +2069,46 @@ def test_a_dflash_block_drafted_before_its_acceptance_is_read_drafts_and_caches_
         assert inference.predraft_attention(drafter.model) > 24
 
 
-def test_predraft_context_rows_append_in_place_a_step_at_a_time_until_the_window_fills():
+def test_a_context_block_projects_only_the_rows_its_sliding_layers_keep(qwen, monkeypatch):
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    model, _ = qwen
+    drafter = speculative._built(ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2", sliding_window = 24), model.language_model, quantize = True)
+    assert drafter.context_rows == 23
+    with monkeypatch.context() as patch:
+        patch.setattr(drafter.model.layers[1].self_attn, "is_sliding", False)
+        assert ContextDrafter(drafter.model, model.language_model).context_rows is None
+    hidden = mx.random.normal((40, len(drafter.config.target_layer_ids) * drafter.config.hidden_size), key = mx.random.key(0)).astype(mx.bfloat16)
+    projected, fc = [], drafter.model.fc
+    monkeypatch.setattr(drafter.model, "fc", lambda x: projected.append(x.shape[1]) or fc(x))
+    rows = []
+    for context_rows in (23, None):
+        drafter.context_rows, row = context_rows, ContextRow(drafter.model.make_cache())
+        drafter.push(row, [5], hidden)
+        rows.append((row, drafter.draft([], [row], drafter.max_depth, [])))
+    (trimmed, got), (full, expected) = rows
+    assert projected == [23, 40] and mx.array_equal(got, expected).item()
+    for a, b in zip(trimmed.cache, full.cache):
+        assert a.offset == b.offset == 40 and all(mx.allclose(x, y, rtol = 2e-2, atol = 2e-2).item() for x, y in zip(a.state, b.state))
+
+
+def test_predraft_context_rows_append_in_place_and_wrap_once_the_window_fills():
     from mlx_vlm.models.cache import RotatingKVCache
     from unsloth_zoo.mlx import inference
     native, ahead = RotatingKVCache(600), RotatingKVCache(600)
-    for i, (rows, size) in enumerate([(5, 5), (3, 261), (300, 308), (200, 564), (40, 564), (40, 600), (100, None)]):
+    steps = [(5, 5), (3, 261), (300, 308), (200, 564), (40, 564), (40, 600), (100, 600), (650, 1249), (7, 600), (590, 600)]
+    for i, (rows, size) in enumerate(steps):
         keys, values = (mx.random.normal((1, 2, rows, 4), key = mx.random.key(2 * i + j)).astype(mx.bfloat16) for j in range(2))
         native.update_and_fetch(keys, values)
         placed = inference._append_in_place(ahead, keys, values)
-        if not placed:   # the first rows, and rows past the window, take the native update
+        if not placed:   # the first rows, and more rows than the window, take the native update
             ahead.update_and_fetch(keys, values)
-        assert placed == (0 < i < 6) and (size is None or ahead.keys.shape[2] == size)
-        assert (ahead.offset, ahead._idx) == (native.offset, native._idx)
-        assert all(mx.array_equal(x, y).item() for x, y in zip(ahead.state, native.state))
+        assert placed == (0 < i and rows <= 600) and ahead.keys.shape[2] == size and ahead.offset == native.offset
+        held = min(ahead.offset, 600)
+        for got, want in ((ahead.keys, native.keys), (ahead.values, native.values)):
+            assert mx.array_equal(ahead._temporal_order(got)[..., -held:, :], native._temporal_order(want)[..., -held:, :]).item()
+        history = inference.PredraftCache(ahead, mx.zeros((0,), mx.bool_), mx.array(0)).history()[0]
+        assert history.shape[2] == min(ahead.offset, size)
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])

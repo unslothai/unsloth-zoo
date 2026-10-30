@@ -1860,6 +1860,7 @@ class ContextDrafter:
     Each row drafts alone with its own caches, whose scalar offsets cannot be batched."""
 
     kind = "dflash"
+    context_rows = None
 
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 512):
         from mlx_vlm.speculative.drafters import DFlashDraftModel
@@ -1875,6 +1876,10 @@ class ContextDrafter:
         from .inference import predraft_attention
 
         self.predraft_rows = predraft_attention(model)
+        # When every layer slides, rows before the widest window would be projected only to be dropped.
+        attentions = [layer.self_attn for layer in model.layers] if self.predraft_rows else []
+        if attentions and all(a.is_sliding for a in attentions):
+            self.context_rows = max(a.sliding_window - 1 for a in attentions)
 
     @property
     def config(self):
@@ -1922,7 +1927,13 @@ class ContextDrafter:
         return self._draft(*args, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
 
     def _block(self, row: ContextRow, depth: int) -> mx.array:
-        context, row.features = mx.concatenate(row.features)[None], []
+        context = (row.features[0] if len(row.features) == 1 else mx.concatenate(row.features))[None]
+        row.features = []
+        if self.context_rows is not None and (skip := context.shape[1] - self.context_rows) > 0:
+            # Their positions still count, as the layers' own trim counts them.
+            context = context[:, skip:]
+            for entry in row.cache:
+                entry.offset += skip
         return self._drafted(row.pending, context, row.cache, depth + 1)
 
     def prefetch(self, rows: Sequence[ContextRow | None]) -> None:
