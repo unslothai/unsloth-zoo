@@ -29,7 +29,18 @@ from fla.utils import (
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 # Unsloth: fla PR #1399 (issue #1327, triton #10590): Blackwell + Triton < 3.8 dv_local races at 8 warps.
-BLACKWELL_8_WARP_RACE = IS_NVIDIA_BLACKWELL and not TRITON_ABOVE_3_8_0
+# IS_NVIDIA_BLACKWELL reads only the device current at import, while these configs and the autotune
+# cache serve every device in the process: a Blackwell card anywhere keeps 8 warps out.
+def _any_visible_blackwell():
+    if not IS_NVIDIA:
+        return False
+    try:
+        return any(torch.cuda.get_device_capability(i)[0] in (10, 12) for i in range(torch.cuda.device_count()))
+    except Exception:
+        return IS_NVIDIA_BLACKWELL
+
+
+BLACKWELL_8_WARP_RACE = (IS_NVIDIA_BLACKWELL or _any_visible_blackwell()) and not TRITON_ABOVE_3_8_0
 CHUNK_BWD_DV_LOCAL_NUM_WARPS = [2, 4] if BLACKWELL_8_WARP_RACE else NUM_WARPS
 
 
