@@ -26,30 +26,24 @@ BLOCKED = [
     ("eval", 'def matmul(A, B):\n    return eval("1+1")\n', NameError),
     ("subprocess", "def matmul(A, B):\n    import subprocess\n    return subprocess.run\n", ImportError),
     ("socket", "def matmul(A, B):\n    import socket\n    return socket.socket()\n", ImportError),
-    # The dunder is a string constant here, so the AST check does not see it.
-    # It fails anyway because getattr is not in the allowlist at all.
+    # The dunder is a string constant, so the AST check misses it; the case still fails because getattr is not in the allowlist at all.
     ("getattr", 'def matmul(A, B):\n    return getattr(A, "__class__")\n', NameError),
-    # Allowlisted modules re-export unsafe ones: random keeps a private handle
-    # on os, and typing keeps sys. random._os is caught statically by the
-    # private-attribute rule; typing.sys is not private, so the facade is what
-    # stops it. Both layers are load bearing.
+    # Allowlisted modules re-export unsafe ones: random keeps a private handle on os and typing keeps sys; the
+    # private-attribute rule catches random._os, but only the facade stops typing.sys. Both are needed.
     ("random._os", 'def matmul(A, B):\n    import random\n    return random._os.system("echo pwned")\n', RuntimeError),
     ("typing.sys", 'def matmul(A, B):\n    import typing\n    return typing.sys.modules["os"].getpid()\n', AttributeError),
-    # attrgetter takes a dotted string, so it walks dunders without the AST
-    # check ever seeing them. The member is denied; operator itself stays.
+    # attrgetter takes a dotted string, so it walks dunders the AST check never sees; the member is denied while operator itself stays allowed.
     ("operator.attrgetter", 'def matmul(A, B):\n    import operator\n    return operator.attrgetter("__class__.__bases__")(1)\n', AttributeError),
     ("operator.methodcaller", 'def matmul(A, B):\n    import operator\n    return operator.methodcaller("__str__")(1)\n', AttributeError),
     ("enum.global_enum", 'def matmul(A, B):\n    import enum\n    return enum.global_enum(enum.IntEnum("Hijack", {"len": 7}, module = "builtins"))\n', AttributeError),
-    # Formatter.get_field resolves a dotted string and returns the object, so
-    # it recovers the real __import__. str.format walks attributes the same way
-    # but only returns text, which is why only this one matters.
+    # Formatter.get_field resolves a dotted string and returns the object, recovering the real __import__; str.format
+    # walks attributes too but only returns text, so only this one matters.
     ("string.Formatter", 'def matmul(A, B):\n    import string\n    q = string.Formatter()\n    return q.get_field("0.get_field.__globals__[__builtins__][__import__]", (q,), {})[0]\n', ImportError),
 ]
 
 
 def test_typing_get_type_hints_is_denied():
-    # Annotations are compiled to strings, and get_type_hints evaluates them,
-    # so this executes without a single dunder appearing in the source.
+    # Annotations are compiled to strings and get_type_hints evaluates them, so this runs without any dunder appearing in the source.
     source = (
         "def matmul(A, B):\n"
         "    import typing\n"
@@ -63,10 +57,8 @@ def test_typing_get_type_hints_is_denied():
 
 
 def test_typing_forward_ref_evaluators_are_denied():
-    # ForwardRef.evaluate and evaluate_forward_ref are the same evaluator, made
-    # public in 3.14. On 3.13 the entry point is the private _evaluate, which
-    # the private-attribute rule already covers, but this package supports 3.14
-    # so the names are denied on every version.
+    # ForwardRef.evaluate and evaluate_forward_ref are one evaluator, made public in 3.14; on 3.13 the private _evaluate
+    # is caught by the private-attribute rule, and this package supports 3.14, so the names are denied on every version.
     for source in (
         'def matmul(A, B):\n    import typing\n    return typing.ForwardRef("1+1")\n',
         'def matmul(A, B):\n    import typing\n    return typing.evaluate_forward_ref\n',
@@ -107,16 +99,14 @@ def test_allowlisted_dotted_submodule_works_both_forms():
 
 
 def test_private_attribute_access_is_rejected():
-    # Single underscore, not two: private attributes reach modules and
-    # internals just as well as dunders do.
+    # Single underscore, not two: private attributes reach modules and internals just as well as dunders do.
     source = "def matmul(A, B):\n    import abc\n    return abc.ABCMeta._abc_impl\n"
     with pytest.raises(RuntimeError):
         create_locked_down_function(source)([], [])
 
 
 def test_underscore_locals_are_still_allowed():
-    # The Name check stays at two underscores, so ordinary throwaway and
-    # private-ish locals keep working.
+    # The Name check stays at two underscores, so ordinary throwaway and private-ish locals keep working.
     source = (
         "def strategy(board):\n"
         "    _total = 0\n"
@@ -149,9 +139,7 @@ def test_rest_of_enum_still_works():
 
 
 def test_operator_itemgetter_still_works():
-    # itemgetter is what generated sorting code actually reaches for, and it
-    # takes an index rather than an attribute path, so only attrgetter and
-    # methodcaller are denied.
+    # itemgetter is what generated sorting code reaches for and takes an index rather than an attribute path, so only attrgetter and methodcaller are denied.
     source = (
         "def strategy(board):\n"
         "    import operator\n"
@@ -201,8 +189,7 @@ def test_positional_defaults_survive_lockdown():
 
 
 def test_keyword_only_defaults_survive_lockdown():
-    # A literal keyword-only default passes validation, so the locked down
-    # function must keep it; otherwise calling it raises TypeError.
+    # A literal keyword-only default passes validation, so the locked down function must keep it; otherwise calling it raises TypeError.
     fn = create_locked_down_function("def strategy(board, *, depth = 3):\n    return depth\n")
     assert fn.__kwdefaults__ == {"depth": 3}
     assert fn([[0]]) == 3
@@ -217,9 +204,8 @@ def test_full_policy_remains_available():
 
 
 def test_dunder_method_definitions_are_denied():
-    # A method name is FunctionDef.name, not a Name or Attribute node, so the
-    # walk cannot see it. Without the fail-closed rule, a custom __setattr__
-    # captures what functools.update_wrapper copies.
+    # A method name is FunctionDef.name, not a Name or Attribute node, so the walk cannot see it; without the
+    # fail-closed rule, a custom __setattr__ captures what functools.update_wrapper copies.
     source = (
         "def matmul(A, B):\n"
         "    import functools\n"
@@ -259,9 +245,8 @@ def test_functools_reduce_still_works():
 
 
 def test_frame_traversal_is_denied():
-    # A running generator reaches gi_frame.f_back.f_back.f_builtins, which is
-    # the trusted caller's real builtins. No module is involved and no name
-    # starts with an underscore, so this needs its own rule.
+    # A running generator reaches gi_frame.f_back.f_back.f_builtins, the trusted caller's real builtins; no module or
+    # underscore name is involved, so it needs its own rule.
     source = (
         "def matmul(A, B):\n"
         "    holder = []\n"

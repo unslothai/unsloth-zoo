@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Training speculative-decoding drafters (native MTP heads) against a frozen target.
-
-Native heads: Qwen3.5 / 3.6 (mtp.Qwen35MTPHead) and every DeepSeek-V3 style NextN family in
-mtp_families (GLM-4.5 / 4.7 / 5, Hunyuan 3, Qwen3-Next, Nemotron-H, Step-3.5 / 3.7, ...).
-Separate drafters: DSpark for Qwen3 (dspark) and EAGLE-3 for targets without MTP (eagle3).
-
-Submodules import transformers lazily so `import unsloth_zoo` stays unchanged.
-"""
+"""Trains speculative-decoding drafters against a frozen target: native MTP heads (mtp.Qwen35MTPHead and DeepSeek-V3
+style NextN families in mtp_families), DSpark for Qwen3 and EAGLE-3 for targets without MTP; transformers is imported
+lazily so `import unsloth_zoo` is unchanged."""
 
 __all__ = [
     "resolve_text_parts",

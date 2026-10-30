@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Routed gpt-oss experts read only the routed experts: poisoning every other expert's
-weights, NF4 bytes / absmax and biases (NaN) leaves the output bit-identical, eager and
-under torch.compile fullgraph, while changing a routed expert changes it."""
+"""Routed gpt-oss experts read only routed experts: NaN-poisoning other experts' weights, NF4 bytes/absmax and biases
+leaves output bit-identical (eager and fullgraph); changing a routed expert changes it."""
 import os
 
 import pytest

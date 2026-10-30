@@ -51,11 +51,7 @@ from scripts import scan_packages as canonical  # noqa: E402
 
 
 def _load_converter_scan():
-    """Load the vendored scanner by path.
-
-    Importing `unsloth_zoo.converter_scan` would run the package's import-time
-    device detection; the module itself needs nothing but the stdlib.
-    """
+    """Loads the vendored scanner by path: importing unsloth_zoo.converter_scan runs the package's import-time device detection; the module needs only stdlib."""
     path = REPO_ROOT / "unsloth_zoo" / "converter_scan.py"
     spec = importlib.util.spec_from_file_location("converter_scan_under_test_pin", path)
     module = importlib.util.module_from_spec(spec)
@@ -114,12 +110,7 @@ def test_no_pattern_is_both_vendored_and_omitted():
 
 
 def test_vendored_set_covers_what_check_py_file_consumes():
-    """The vendored subset is defined as "what check_py_file reads". Pin that.
-
-    Parses the canonical `check_py_file` body for the RE_* names it touches and
-    requires the vendored registry to hold every one of them, so a new pattern
-    wired into the .py checker cannot be quietly skipped on the export path.
-    """
+    """The vendored subset must cover every RE_* name check_py_file reads, parsed from its source, so a new .py pattern cannot be skipped on the export path."""
     import ast
     import inspect
     import textwrap

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth_chunked_logprobs recomputes logits in backward; values and gradients must match an fp64 oracle, and the
-GRPO gradient path routed through it must match the old chunked function."""
+"""unsloth_chunked_logprobs recomputes logits in backward; values and grads must match an fp64 oracle, and its GRPO path must match the old chunked function."""
 import inspect
 
 import pytest

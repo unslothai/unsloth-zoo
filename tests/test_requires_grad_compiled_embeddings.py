@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""When the compiler swaps in the class that calls the input embedding (AST's ASTEmbeddings), the
-requires_grad_ hook must sit on that class's output, outside torch.compile, not inside it."""
+"""Compiler-swapped class that calls the input embedding (AST's ASTEmbeddings): the requires_grad_ hook must sit on its output, outside torch.compile, not inside it."""
 
 import pytest
 import torch

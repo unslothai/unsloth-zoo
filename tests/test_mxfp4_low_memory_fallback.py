@@ -2,9 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Below sm_80 the stacked-expert fallback dequantizes chunks of experts (2 GiB by default) where the tile kernel
-ran before: a chunk that does not fit must shrink, and below one expert use the fused kernel, never OOM. An OOM
-inside the dequant kernel must not turn the kernel off for the process."""
+"""Below sm_80 the stacked-expert fallback dequantizes expert chunks (2 GiB default): a chunk that does not fit shrinks;
+below one expert the fused kernel runs, never OOM; an OOM must not turn the kernel off for the process."""
 
 import contextlib
 import gc

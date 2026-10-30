@@ -1,17 +1,9 @@
-"""Offline regression guard for VLM placeholder-token coverage.
-
-Encodes the media (image / video / audio) placeholder tokens used by the vision and
-omni model families shipped in unslothai/notebooks, and asserts every one is present
-in vlm_tokens so both the CUDA collator (get_padding_tokens_ids) and the MLX loss
-mask them. This is fast and offline; it catches a token being dropped from the lists
-or a new family being added without its tokens. The live per-model id check lives in
-the network sweep (test_notebook_chat_templates.py / manual), this pins the strings.
-"""
+"""Offline guard that image/video/audio placeholder tokens of the vision and omni families in unslothai/notebooks stay
+in vlm_tokens for the CUDA collator and MLX loss mask; live per-model id check is in the network sweep
+(test_notebook_chat_templates.py / manual)."""
 import os, sys, importlib.util
 
-# Load vlm_tokens.py by file path, not `from unsloth_zoo.vlm_tokens import ...`: the latter
-# runs unsloth_zoo/__init__ (ImportError without the `unsloth` package) and breaks collection.
-# vlm_tokens.py is pure data, so loading it in isolation keeps this test hermetic.
+# Load vlm_tokens.py by file path: importing unsloth_zoo runs __init__, which raises ImportError without the unsloth package; the file is pure data.
 def _load_vlm_tokens():
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "unsloth_zoo", "vlm_tokens.py")
@@ -27,8 +19,7 @@ IMAGE_TOKENS, AUDIO_TOKENS, VLM_PLACEHOLDER_TOKENS = (
 
 COVERED = set(IMAGE_TOKENS) | set(AUDIO_TOKENS)
 
-# family -> media placeholder tokens that must never train (verified against the
-# actual tokenizers/configs of these models).
+# family -> media placeholder tokens that must never train; verified against the actual tokenizers and configs of these models.
 EXPECTED = {
     "Llama 3.2 Vision / Phi 3.5": ["<|image|>"],
     "Qwen2-VL / Qwen2.5-VL": ["<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>"],

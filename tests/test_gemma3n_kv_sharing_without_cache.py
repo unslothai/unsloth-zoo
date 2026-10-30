@@ -103,8 +103,7 @@ def _max_relative_error(reference, other):
 
 @pytest.mark.skipif(SHARES_THROUGH_CACHE_ONLY, reason = "only transformers >= 5.6 shares KV by itself")
 def test_without_the_patch_reentrant_checkpointing_drops_shared_kv_gradients(pristine):
-    # The first checkpointed forward stores keys and values with no graph, and the shared layers
-    # are recomputed in backward before their source layer.
+    # The first checkpointed forward stores keys and values with no graph; the shared layers are recomputed in backward before their source layer.
     assert _max_relative_error(_grads(None), _grads(True)) > 0.05
 
 

@@ -134,8 +134,8 @@ def test_multiple_active_adapters_refused(tmp_path):
 
 
 def test_untargeted_layer_keeps_downloaded_weight(tmp_path):
-    # The live base_layer weight can differ from the checkpoint (4-bit packed for QLoRA); a layer the
-    # active adapter does not target must keep the downloaded tensor, not the live one.
+    # The live base_layer weight can differ from the checkpoint (4-bit packed for QLoRA), so an untargeted layer must
+    # keep the downloaded tensor, not the live one.
     set_offline_cpu_env()
     base_dir, out_dir = str(tmp_path / "base"), str(tmp_path / "merged")
     adapters = [
@@ -155,8 +155,8 @@ def test_untargeted_layer_keeps_downloaded_weight(tmp_path):
 
 
 def test_inactive_quantized_saved_module_keeps_downloaded_weight(tmp_path, monkeypatch):
-    # `task` saves no lm_head, so PEFT runs the original module. When that module is quantized its live
-    # weight is packed; the export must keep the downloaded tensor instead.
+    # `task` saves no lm_head, so PEFT runs the original module; when that module is quantized its live weight is
+    # packed, so export must keep the downloaded tensor instead.
     import unsloth_zoo.saving_utils as saving_utils
     set_offline_cpu_env()
     base_dir, out_dir = str(tmp_path / "base"), str(tmp_path / "merged")

@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The Windows ROCm torchao stub must read as absent. Only Windows + ROCm installs it, so these
-exec the stub classes out of utils.py and install the finder by hand, as the guard there does."""
+"""Tests that the Windows ROCm torchao stub reads as absent: its classes are exec'd out of utils.py and the finder
+installed by hand, since only Windows + ROCm installs it."""
 
 import ast
 import importlib

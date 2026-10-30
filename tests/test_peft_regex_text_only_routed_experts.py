@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The text-only decoder branch reaches shared experts but not routed ones.
-
-Routed experts (mlp.experts.<N>.<leaf>) were never a default target on model.layers.N:
-unsloth adds them itself for remote expert blocks and keeps native ones (Qwen3-MoE on
-transformers 4.x) off LoRA on every routed expert, and it only widens when the generated
-regex misses them. Reaching nested leaves for shared experts must not pull them in.
-"""
+"""Text-only branch reaches shared experts but not routed ones (mlp.experts.N.leaf); unsloth adds remote routed experts
+itself, keeps native ones off LoRA (Qwen3-MoE, transformers 4.x), and widens only when the generated regex misses
+them"""
 import re
 
 import pytest

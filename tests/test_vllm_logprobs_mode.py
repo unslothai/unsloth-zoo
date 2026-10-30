@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GRPO's IS ratio and off-policy mask need temperature-scaled sampling logprobs,
-as TRL and verl request. AST-level: load_vllm needs a GPU."""
+"""GRPO's IS ratio and off-policy mask need temperature-scaled sampling logprobs, as TRL and verl request; AST-level checks since load_vllm needs a GPU."""
 
 import ast
 import pathlib

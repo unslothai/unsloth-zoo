@@ -94,8 +94,7 @@ if triton is not None:
         hist_ptr, below_ptr,
         BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,
     ):
-        # Block-major [NB, E + 1]: hist = rows of each expert in this block, below = rows of
-        # smaller experts in this block (the block-local start of each expert's run).
+        # Block-major [NB, E + 1]: hist = rows of each expert in this block; below = rows of smaller experts in this block (block-local run start).
         b = tl.program_id(0)
         idx = b.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         key = _load_keys(ids_ptr, idx, N, K_COLS, stride_row, stride_col, E)
@@ -110,8 +109,8 @@ if triton is not None:
         hist_ptr, below_ptr, counts_ptr, NB, E: tl.constexpr,  # n_experts
         EC: tl.constexpr, BB: tl.constexpr,
     ):
-        # One program per EC experts, carry over the blocks. Rewrites below[b, e] in place to
-        # (rows of e in blocks before b) - (rows of experts < e in block b); counts[e] = total.
+        # One program per EC experts carrying over blocks; rewrites below[b, e] in place to (rows of e in earlier
+        # blocks) - (rows of experts < e in block b); counts[e] = total.
         e = tl.program_id(0) * EC + tl.arange(0, EC)
         cols = e[None, :]
         carry = tl.zeros([EC], dtype = tl.int32)

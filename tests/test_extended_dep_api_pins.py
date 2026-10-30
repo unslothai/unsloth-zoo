@@ -14,17 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Extended upstream-API pins for ``accelerate.*`` / ``safetensors.*``
-/ ``bitsandbytes.*`` / ``triton.*`` / ``datasets.*`` /
-``huggingface_hub.*`` / ``xformers.*`` references in
-``unsloth_zoo/**/*.py`` not already covered by
-``test_upstream_pinned_symbols_*.py`` or
-``test_zoo_source_upstream_refs.py``.
-
-DRIFT-DETECTED framing: each test cites its zoo callsite. Failure ->
-``pytest.fail("DRIFT DETECTED: ...")``; never SKIP when zoo references
-the symbol unconditionally.
-"""
+"""Extra upstream API pins (accelerate, safetensors, bitsandbytes, triton, datasets, huggingface_hub, xformers) for zoo
+callsites; drift fails with DRIFT DETECTED and is never skipped when zoo uses the symbol unconditionally."""
 
 from __future__ import annotations
 
@@ -36,8 +27,7 @@ from typing import Iterable
 import pytest
 
 
-# Shared helpers (intentional copies of test_zoo_source_upstream_refs.py
-# helpers so this file is grep-self-contained).
+# Helpers are intentional copies of test_zoo_source_upstream_refs.py so this file stays grep-self-contained.
 
 
 def _resolve(dotted: str) -> object:
@@ -98,9 +88,8 @@ def _require_module(name: str):
 
 
 def test_accelerate_init_empty_weights_signature_shape():
-    """unsloth_zoo/empty_model.py:238, 322 -- ``with init_empty_weights():``
-    as zero-arg context manager (default include_buffers=None). Pre-3.0
-    flipped this to a required positional; pin the modern shape."""
+    """unsloth_zoo/empty_model.py:238, 322 calls init_empty_weights() zero-arg as a context manager (include_buffers
+    defaults to None); accelerate pre-3.0 made it a required positional."""
     _require_module("accelerate")
     fn = _resolve("accelerate.init_empty_weights")
     sig = inspect.signature(fn)
@@ -122,9 +111,8 @@ def test_accelerate_init_empty_weights_signature_shape():
 
 
 def test_accelerate_init_empty_weights_is_context_manager():
-    """Return value must be a context manager. A regression that flips
-    it to a plain function silently constructs a real-CPU state dict
-    instead of meta tensors and OOMs on Llama-70B-class empty-model builds."""
+    """init_empty_weights() must return a context manager; a plain function would build a real CPU state dict instead of
+    meta tensors and OOM on large empty-model builds."""
     _require_module("accelerate")
     accelerate = importlib.import_module("accelerate")
     cm = accelerate.init_empty_weights()
@@ -139,8 +127,7 @@ def test_accelerate_init_empty_weights_is_context_manager():
 
 
 def test_accelerate_utils_imports_module_surface():
-    """Pin the module-path surface so accelerate.utils restructuring
-    surfaces here, not at zoo import time."""
+    """Pins the accelerate.utils module surface so restructuring fails here rather than at zoo import time."""
     _require_module("accelerate")
     _resolve_all([
         "accelerate.utils",
@@ -152,19 +139,15 @@ def test_accelerate_utils_imports_module_surface():
 
 
 def test_safetensors_safe_open_top_level_exists():
-    """unsloth_zoo/saving_utils.py:153 -- ``from safetensors import
-    safe_open``. Streamed-read entry point for every LoRA save / merge
-    / GGUF export."""
+    """unsloth_zoo/saving_utils.py:153 imports safe_open, the streamed-read entry point for every LoRA save, merge and GGUF export."""
     _resolve("safetensors.safe_open")
 
 
 def test_safetensors_safe_open_signature_shape():
-    """saving_utils.py uses ``safe_open(path, framework='pt',
-    device=...)``. Pin filename-first."""
+    """saving_utils.py calls safe_open(path, framework='pt', device=...), so the filename must stay the first positional argument."""
     _require_module("safetensors")
     safe_open = _resolve("safetensors.safe_open")
-    # ``safe_open`` is a Rust-backed class; either inspect.signature
-    # works OR the class has an __init__ we can probe.
+    # safe_open is a Rust-backed class, so inspect.signature may fail; fall back to probing its __init__.
     try:
         sig = inspect.signature(safe_open)
     except (TypeError, ValueError):
@@ -184,8 +167,7 @@ def test_safetensors_safe_open_signature_shape():
 
 
 def test_safetensors_torch_save_file_top_level():
-    """saving_utils.py:154 -- ``from safetensors.torch import save_file``.
-    Canonical write path for sharded LoRA / merged-model output."""
+    """saving_utils.py:154 imports save_file, the canonical write path for sharded LoRA and merged-model output."""
     _resolve("safetensors.torch.save_file")
 
 
@@ -205,9 +187,7 @@ def test_safetensors_torch_save_file_signature():
 
 
 def test_safetensors_torch_types_mapping_present():
-    """saving_utils.py:512 -- ``SAFETENSORS_DTYPES = safetensors.torch._TYPES``.
-    Fallback silently mis-types BF16/FP8 weights in sharded save; pin
-    the upstream-provided mapping."""
+    """saving_utils.py:512 takes SAFETENSORS_DTYPES from safetensors.torch._TYPES; a fallback mapping would silently mis-type BF16/FP8 weights in sharded saves."""
     _require_module("safetensors")
     st_torch = importlib.import_module("safetensors.torch")
     if not hasattr(st_torch, "_TYPES"):
@@ -228,8 +208,7 @@ def test_safetensors_torch_types_mapping_present():
 
 
 def test_safetensors_torch_load_file_present():
-    """saving_utils.py's shard-merge codepaths call ``safetensors.torch
-    .load_file``. Pin the round-trip needed for delta-LoRA dequant verify."""
+    """saving_utils.py shard-merge codepaths call safetensors.torch.load_file; the round trip is needed for delta-LoRA dequant verification."""
     _require_module("safetensors")
     _resolve("safetensors.torch.load_file")
 
@@ -238,9 +217,7 @@ def test_safetensors_torch_load_file_present():
 
 
 def test_bnb_top_level_import_and_version_attr():
-    """device_type.py:260, saving_utils.py:65, every temporary_patches
-    callsite reads ``bitsandbytes.__version__``. Drives HIP / pre-0.46
-    gate cascades."""
+    """device_type.py:260, saving_utils.py:65 and every temporary_patches callsite read bitsandbytes.__version__, which drives HIP and pre-0.46 gates."""
     bnb = _require_module("bitsandbytes")
     if not hasattr(bnb, "__version__"):
         pytest.fail(
@@ -251,8 +228,7 @@ def test_bnb_top_level_import_and_version_attr():
 
 
 def test_bnb_nn_linear4bit_top_level():
-    """patching_utils.py:309 + saving_utils.py:88 isinstance-check.
-    Both import paths must resolve because zoo reaches both."""
+    """patching_utils.py:309 and saving_utils.py:88 isinstance-check against bitsandbytes Linear4bit; both import paths must resolve because zoo reaches both."""
     _require_module("bitsandbytes")
     _resolve_all([
         "bitsandbytes.nn.Linear4bit",
@@ -261,9 +237,7 @@ def test_bnb_nn_linear4bit_top_level():
 
 
 def test_bnb_linear4bit_constructor_kwargs_preserved():
-    """temporary_patches/bitsandbytes.py + vllm_utils.py:484 pass
-    ``compute_dtype=...``. Regression silently disables
-    UNSLOTH_bnb_4bit_compute_dtype overrides."""
+    """temporary_patches/bitsandbytes.py and vllm_utils.py:484 pass compute_dtype=...; dropping it silently disables UNSLOTH_bnb_4bit_compute_dtype overrides."""
     _require_module("bitsandbytes")
     Linear4bit = _resolve("bitsandbytes.nn.Linear4bit")
     sig = inspect.signature(Linear4bit.__init__)
@@ -276,18 +250,14 @@ def test_bnb_linear4bit_constructor_kwargs_preserved():
 
 
 def test_bnb_nn_modules_params4bit_present():
-    """device_type.py:257 + temporary_patches/bitsandbytes.py:47 import
-    Params4bit. HIP-gate blocksize source-inspection lives on the
-    class' source."""
+    """device_type.py:257 and temporary_patches/bitsandbytes.py:47 import Params4bit; the HIP-gate blocksize source inspection reads the class source."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.nn.modules.Params4bit")
 
 
 def test_bnb_fix_4bit_weight_quant_state_from_module_present():
-    """temporary_patches/bitsandbytes.py:48, 73 -- repacks bnb-weight
-    quant_state after transformers 5.x's ``weight.shape[-1] == 1``
-    deferred-pack path. Rename takes the whole Linear4bit forward
-    replacement down."""
+    """temporary_patches/bitsandbytes.py:48,73 repacks quant_state after transformers 5.x's weight.shape[-1] == 1
+    deferred-pack path; a rename of fix_4bit_weight_quant_state_from_module breaks the Linear4bit forward."""
     _require_module("bitsandbytes")
     _resolve(
         "bitsandbytes.nn.modules.fix_4bit_weight_quant_state_from_module",
@@ -295,9 +265,8 @@ def test_bnb_fix_4bit_weight_quant_state_from_module_present():
 
 
 def test_bnb_matmul_4bit_top_level_and_signature():
-    """temporary_patches/bitsandbytes.py:106,
-    vllm_utils.py:190 -- ``bnb.matmul_4bit`` is the 4-bit GEMM kernel
-    zoo replaces Linear4bit.forward with. Pin ``(A, B, quant_state, bias)``."""
+    """temporary_patches/bitsandbytes.py:106 and vllm_utils.py:190 use bnb.matmul_4bit, the 4-bit GEMM behind the
+    Linear4bit.forward replacement; pin the (A, B, quant_state, bias) signature."""
     _require_module("bitsandbytes")
     matmul_4bit = _resolve("bitsandbytes.matmul_4bit")
     sig = inspect.signature(matmul_4bit)
@@ -313,16 +282,13 @@ def test_bnb_matmul_4bit_top_level_and_signature():
 
 
 def test_bnb_functional_dequantize_4bit_present():
-    """temporary_patches/moe_grouped_modulelist.py:201 -- dequantizes
-    expert weights via dequantize_4bit. Rename takes out MoE-on-bnb training."""
+    """temporary_patches/moe_grouped_modulelist.py:201 dequantizes expert weights via dequantize_4bit; a rename would break MoE-on-bnb training."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.functional.dequantize_4bit")
 
 
 def test_bnb_functional_quantstate_present_and_from_dict():
-    """vllm_utils.py:495 -- monkeys ``QuantState.from_dict`` onto
-    ``bitsandbytes.functional.QuantState``. The classmethod must exist
-    pre-patch so the override is well-formed."""
+    """vllm_utils.py:495 monkeypatches QuantState.from_dict onto bitsandbytes.functional.QuantState, so the classmethod must exist before patching."""
     _require_module("bitsandbytes")
     QuantState = _resolve("bitsandbytes.functional.QuantState")
     if not hasattr(QuantState, "from_dict"):
@@ -334,9 +300,7 @@ def test_bnb_functional_quantstate_present_and_from_dict():
 
 
 def test_bnb_utils_pack_unpack_tensor_dict_present():
-    """vllm_utils.py:421 -- ``pack_dict_to_tensor`` and
-    ``unpack_tensor_to_dict`` are the matched pair the vLLM 4-bit
-    serialization path uses."""
+    """vllm_utils.py:421 uses pack_dict_to_tensor and unpack_tensor_to_dict, the matched pair for the vLLM 4-bit serialization path."""
     _require_module("bitsandbytes")
     _resolve_all([
         "bitsandbytes.utils.pack_dict_to_tensor",
@@ -345,16 +309,13 @@ def test_bnb_utils_pack_unpack_tensor_dict_present():
 
 
 def test_bnb_functional_module_exists():
-    """vllm_utils.py:420 -- ``import bitsandbytes.functional``. 0.50-dev
-    wheels rearranged to ``bnb._functional`` and re-exported under the
-    old name; zoo depends on the re-export."""
+    """vllm_utils.py:420 imports bitsandbytes.functional; 0.50-dev wheels moved it to bnb._functional and re-exported it under the old name, which zoo depends on."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.functional")
 
 
 def test_bnb_nn_modules_module_path_present():
-    """vllm_utils.py:481 -- ``import bitsandbytes.nn.modules`` for
-    in-place class swap (Linear4bit -> custom subclass)."""
+    """vllm_utils.py:481 imports bitsandbytes.nn.modules for an in-place class swap of Linear4bit to a custom subclass."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.nn.modules")
 
@@ -363,8 +324,7 @@ def test_bnb_nn_modules_module_path_present():
 
 
 def test_triton_top_level_version_attr():
-    """compiler.py:95 -- ``Version(triton.__version__) < Version("3.0.0")``.
-    loss_utils.py:24 takes the same dunder."""
+    """compiler.py:95 checks Version(triton.__version__) < Version("3.0.0") and loss_utils.py:24 reads the same dunder."""
     triton_mod = _require_module("triton")
     if not hasattr(triton_mod, "__version__"):
         pytest.fail(
@@ -374,17 +334,13 @@ def test_triton_top_level_version_attr():
 
 
 def test_triton_runtime_autotuner_class_present():
-    """compiler.py:3030 -- ``from triton.runtime.autotuner import
-    Autotuner``. Introspects autotuner-decorated kernels for the
-    compile-rewriter."""
+    """compiler.py:3030 imports triton.runtime.autotuner.Autotuner to introspect autotuner-decorated kernels for the compile rewriter."""
     _require_module("triton")
     _resolve("triton.runtime.autotuner.Autotuner")
 
 
 def test_triton_set_allocator_top_level_present():
-    """temporary_patches/moe_utils.py:217 -- ``triton.set_allocator(
-    persistent_alloc_fn)``. Required for persistent-allocator MoE
-    expert-merge fast path."""
+    """temporary_patches/moe_utils.py:217 calls triton.set_allocator(persistent_alloc_fn), required for the persistent-allocator MoE expert-merge fast path."""
     triton_mod = _require_module("triton")
     if not hasattr(triton_mod, "set_allocator"):
         pytest.fail(
@@ -395,8 +351,7 @@ def test_triton_set_allocator_top_level_present():
 
 
 def test_triton_set_allocator_signature_accepts_one_arg():
-    """A regression to ``set_allocator(name, fn)`` form (proposed in
-    triton 3.x main) breaks the single-arg callsite immediately."""
+    """A set_allocator(name, fn) form (proposed on triton 3.x main) would break the single-argument callsite immediately."""
     triton_mod = _require_module("triton")
     set_alloc = triton_mod.set_allocator
     sig = inspect.signature(set_alloc)
@@ -417,15 +372,13 @@ def test_triton_set_allocator_signature_accepts_one_arg():
 
 
 def test_triton_language_namespace_present():
-    """compiler.py + compiled-cache codegen reference ``triton.language``
-    for ``tl.constexpr``."""
+    """compiler.py and compiled-cache codegen reference triton.language for tl.constexpr."""
     _require_module("triton")
     _resolve("triton.language")
 
 
 def test_triton_jit_decorator_present():
-    """``triton.jit`` is the decorator zoo's MoE / CCE / RoPE kernels
-    depend on at codegen time."""
+    """triton.jit is the decorator the MoE, CCE and RoPE kernels depend on at codegen time."""
     triton_mod = _require_module("triton")
     if not callable(getattr(triton_mod, "jit", None)):
         pytest.fail(
@@ -438,17 +391,14 @@ def test_triton_jit_decorator_present():
 
 
 def test_datasets_load_dataset_top_level():
-    """tokenizer_utils.py + training_utils.py instantiate datasets via
-    ``datasets.load_dataset``."""
+    """tokenizer_utils.py and training_utils.py instantiate datasets via datasets.load_dataset."""
     _require_module("datasets")
     _resolve("datasets.load_dataset")
 
 
 def test_datasets_iterable_dataset_classmethod_for_isinstance():
-    """tokenizer_utils.py:294 + training_utils.py:50 isinstance-check
-    against ``datasets.IterableDataset``. A rename to
-    ``datasets.iterable.IterableDataset`` (proposed in 4.x) silently
-    drops the streaming path."""
+    """tokenizer_utils.py:294 and training_utils.py:50 isinstance-check datasets.IterableDataset; a rename to
+    datasets.iterable.IterableDataset (proposed in 4.x) would silently drop streaming."""
     datasets = _require_module("datasets")
     ID = getattr(datasets, "IterableDataset", None)
     if ID is None:
@@ -466,20 +416,14 @@ def test_datasets_iterable_dataset_classmethod_for_isinstance():
 
 
 def test_datasets_dataset_dict_top_level():
-    """dataset_utils.py walks DatasetDict-shaped train/eval pairs in
-    multi-split SFT via duck-typed ``.column_names``."""
+    """dataset_utils.py walks DatasetDict-shaped train/eval pairs in multi-split SFT via duck-typed .column_names."""
     _require_module("datasets")
     _resolve("datasets.DatasetDict")
 
 
 def test_datasets_torchcodec_audio_decoder_present_or_absent_cleanly():
-    """dataset_utils.py:873 -- ``from datasets.features._torchcodec
-    import AudioDecoder``. Wrapped in try/except so absence is tolerated;
-    if the module IS importable, AudioDecoder must be on it.
-
-    ``torchcodec`` (separate package) is a legitimate optional
-    transitive dep -- CI without audio support won't have it. Treat
-    that environment as importorskip, NOT drift."""
+    """dataset_utils.py:873 imports AudioDecoder from datasets.features._torchcodec inside try/except; if that module
+    imports, AudioDecoder must be on it; a missing torchcodec is not drift."""
     _require_module("datasets")
     spec = importlib.util.find_spec("datasets.features._torchcodec")
     if spec is None:
@@ -516,9 +460,7 @@ def test_datasets_torchcodec_audio_decoder_present_or_absent_cleanly():
 
 
 def test_hf_hub_top_level_save_path_symbols():
-    """saving_utils.py:148-152 -- ``from huggingface_hub import (
-    snapshot_download, hf_hub_download, HfFileSystem,)`` at MODULE TOP
-    LEVEL (no try/except)."""
+    """saving_utils.py:148-152 imports snapshot_download, hf_hub_download and HfFileSystem from huggingface_hub at module top level, with no try/except."""
     _require_module("huggingface_hub")
     _resolve_all([
         "huggingface_hub.snapshot_download",
@@ -528,8 +470,7 @@ def test_hf_hub_top_level_save_path_symbols():
 
 
 def test_hf_hub_hfapi_and_modelcard_top_level():
-    """saving_utils.py:109 + mlx_utils.py:3152, 3195, 3248 -- HfApi and
-    ModelCard referenced unguardedly."""
+    """saving_utils.py:109 and mlx_utils.py:3152, 3195, 3248 reference HfApi and ModelCard without guards."""
     _require_module("huggingface_hub")
     _resolve_all([
         "huggingface_hub.HfApi",
@@ -538,8 +479,7 @@ def test_hf_hub_hfapi_and_modelcard_top_level():
 
 
 def test_hf_hub_hfapi_method_surface():
-    """saving_utils.py + mlx_utils.py call ``HfApi().create_repo /
-    .upload_file / .upload_folder / .create_commit / .file_exists``."""
+    """saving_utils.py and mlx_utils.py call HfApi methods create_repo, upload_file, upload_folder, create_commit and file_exists."""
     _require_module("huggingface_hub")
     HfApi = _resolve("huggingface_hub.HfApi")
     expected = [
@@ -556,9 +496,7 @@ def test_hf_hub_hfapi_method_surface():
 
 
 def test_hf_hub_get_token_top_level_or_utils_fallback():
-    """saving_utils.py:67-73 try-cascade: ``get_token`` from top-level,
-    then huggingface_hub.utils, then huggingface_hub.utils._token. At
-    least one must resolve."""
+    """saving_utils.py:67-73 tries get_token from the top level, then huggingface_hub.utils, then huggingface_hub.utils._token; at least one must resolve."""
     _require_module("huggingface_hub")
     found = False
     for path in (
@@ -581,8 +519,7 @@ def test_hf_hub_get_token_top_level_or_utils_fallback():
 
 
 def test_hf_hub_split_state_dict_into_shards_factory_present_and_callable():
-    """saving_utils.py:1602 -- ``split_state_dict_into_shards_factory``
-    drives the core 5GB-shard path."""
+    """saving_utils.py:1602 uses split_state_dict_into_shards_factory, which drives the core 5GB-shard path."""
     _require_module("huggingface_hub")
     fn = _resolve("huggingface_hub.split_state_dict_into_shards_factory")
     if not callable(fn):
@@ -594,8 +531,7 @@ def test_hf_hub_split_state_dict_into_shards_factory_present_and_callable():
 
 
 def test_hf_hub_get_torch_storage_size_and_id_present():
-    """saving_utils.py:1604-1605 -- underpin the LoRA delta dedup in
-    sharded save."""
+    """saving_utils.py:1604-1605 rely on get_torch_storage_size and get_torch_storage_id for the LoRA delta dedup in sharded save."""
     _require_module("huggingface_hub")
     _resolve_all([
         "huggingface_hub.get_torch_storage_size",
@@ -604,32 +540,26 @@ def test_hf_hub_get_torch_storage_size_and_id_present():
 
 
 def test_hf_hub_serialization_base_parse_size_to_int():
-    """saving_utils.py:1652 -- ``from huggingface_hub.serialization._base
-    import parse_size_to_int``. Private module path; refactor breaks
-    shard-size CLI string parser."""
+    """saving_utils.py:1652 imports parse_size_to_int from a private huggingface_hub.serialization._base path; a refactor breaks the shard-size CLI parser."""
     _require_module("huggingface_hub")
     _resolve("huggingface_hub.serialization._base.parse_size_to_int")
 
 
 def test_hf_hub_errors_local_entry_not_found_error():
-    """saving_utils.py:2365 -- imported INSIDE an except clause to
-    re-classify a download failure."""
+    """saving_utils.py:2365 imports LocalEntryNotFoundError inside an except clause to re-classify a download failure."""
     _require_module("huggingface_hub")
     _resolve("huggingface_hub.errors.LocalEntryNotFoundError")
 
 
 def test_hf_hub_constants_module_path():
-    """``huggingface_hub.constants.HF_HUB_OFFLINE`` is re-injected by
-    fix_huggingface_hub (import_fixes.py). Also covered in
-    test_upstream_import_fixes_drift.py; double-pin so a typo in either
-    test still catches drift."""
+    """huggingface_hub.constants.HF_HUB_OFFLINE is re-injected by fix_huggingface_hub in import_fixes.py; also pinned in
+    test_upstream_import_fixes_drift.py so a typo in either still catches drift."""
     _require_module("huggingface_hub")
     _resolve("huggingface_hub.constants.HF_HUB_OFFLINE")
 
 
 def test_hf_hub_modelcard_load_method():
-    """mlx_utils.py:3195 -- ``ModelCard.load(model_id)`` builds an
-    MLX-derived card by inheriting the source card."""
+    """mlx_utils.py:3195 calls ModelCard.load(model_id) to build an MLX-derived card that inherits the source card."""
     _require_module("huggingface_hub")
     ModelCard = _resolve("huggingface_hub.ModelCard")
     if not hasattr(ModelCard, "load"):
@@ -641,9 +571,7 @@ def test_hf_hub_modelcard_load_method():
 
 
 def test_hf_hub_snapshot_download_signature_local_dir():
-    """saving_utils.py + mlx_utils.py call ``snapshot_download(repo_id,
-    local_dir=...)``. Regression to local_dir_use_symlinks-only would
-    break every Unsloth offline workflow."""
+    """saving_utils.py and mlx_utils.py call snapshot_download(repo_id, local_dir=...); a regression to local_dir_use_symlinks-only would break offline workflows."""
     _require_module("huggingface_hub")
     fn = _resolve("huggingface_hub.snapshot_download")
     sig = inspect.signature(fn)
@@ -656,8 +584,7 @@ def test_hf_hub_snapshot_download_signature_local_dir():
 
 
 def test_hf_hub_hf_hub_download_signature_local_dir_and_repo_id():
-    """saving_utils.py:3088 -- ``hf_hub_download(repo_id=..., filename=...,
-    local_dir=...)``."""
+    """saving_utils.py:3088 calls hf_hub_download(repo_id=..., filename=..., local_dir=...)."""
     _require_module("huggingface_hub")
     fn = _resolve("huggingface_hub.hf_hub_download")
     sig = inspect.signature(fn)
@@ -671,16 +598,12 @@ def test_hf_hub_hf_hub_download_signature_local_dir_and_repo_id():
         )
 
 
-# xformers
-# Zoo has no direct xformers imports; only re-exports if installed.
-# transformers.modeling_utils probes xformers.ops at attention-kernel
-# selection time -- a regression in xformers' module layout silently
-# disables the memory-efficient attention dispatch zoo's patches rely on.
+# xformers: zoo has no direct imports, only re-exports when installed; transformers probes xformers.ops at
+# attention-kernel selection, so a layout regression silently disables memory-efficient attention.
 
 
 def test_xformers_ops_module_present_when_installed():
-    """xformers.ops.memory_efficient_attention is the symbol
-    transformers.modeling_utils probes at attention-kernel selection."""
+    """transformers.modeling_utils probes xformers.ops.memory_efficient_attention at attention-kernel selection."""
     if importlib.util.find_spec("xformers") is None:
         pytest.skip("xformers not installed -- nothing to drift-check.")
     try:
@@ -700,8 +623,7 @@ def test_xformers_ops_module_present_when_installed():
 
 
 def test_xformers_components_module_present_when_installed():
-    """xformers.components is the attention-block factory namespace
-    some transformers vision encoders probe at compile time."""
+    """Some transformers vision encoders probe xformers.components (the attention-block factory namespace) at compile time."""
     if importlib.util.find_spec("xformers") is None:
         pytest.skip("xformers not installed -- nothing to drift-check.")
     spec = importlib.util.find_spec("xformers.components")

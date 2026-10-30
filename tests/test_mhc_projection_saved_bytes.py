@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The eager mHC mixer saves its bf16 input for backward, not the FP32 upcast, bit for bit.
-
-transformers' DeepSeek-V4 / GLM-5.3-Flash mixer runs `input_norm` and the `fn` projection in FP32
-on `hidden_streams.flatten(2).float()`; plain autograd keeps that `[tokens, hc_mult * hidden]`
-FP32 copy (twice the bf16 streams) per mixer site. `MODULE_FORWARD_EAGER_REWRITES` routes the
-two lines through `unsloth_mhc_projection`, which reruns them in backward instead.
-"""
+"""The eager mHC mixer saves its bf16 input for backward, not the FP32 upcast that plain autograd keeps (twice the bf16
+streams per mixer site); MODULE_FORWARD_EAGER_REWRITES routes input_norm and the fn projection through
+unsloth_mhc_projection, which reruns them in backward."""
 
 import importlib
 import inspect

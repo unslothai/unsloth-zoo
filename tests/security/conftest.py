@@ -1,21 +1,5 @@
-"""Shared fixtures for the security regression suite.
-
-The scanner scripts under audit are designed to be offline-safe. Pin
-that invariant by autouse-installing a function-scoped network blocker
-that refuses any non-loopback `socket.connect()` from inside the test
-process. If a future test (or a scanner regression) accidentally tries
-to reach the public internet, pytest fails loudly instead of leaking
-the request.
-
-Scope is intentionally ``function`` rather than ``session``: the swap
-mutates a module-global (``socket.socket``), and a session-scoped swap
-keeps the patch live for every test pytest runs after the first
-security test in the same session -- which silently broke every
-network-using test elsewhere in the tree (e.g.
-``tests/test_upstream_pinned_symbols_transformers.py`` which fetches
-HF modeling source over HTTPS). Per-function setup/teardown costs
-~10us and contains the blast radius to security tests only.
-"""
+"""Shared fixtures for security tests: an autouse, function-scoped network blocker refusing non-loopback
+socket.connect(); function scope because a session-scoped socket.socket swap broke network tests elsewhere."""
 
 from __future__ import annotations
 
@@ -26,8 +10,7 @@ from pathlib import Path
 import pytest
 
 
-# Make `scripts/` importable as a package so tests can grab the scanner
-# constants directly. The repo root sits two levels above this file.
+# Add the repo root to sys.path so scripts/ imports as a package and tests can grab scanner constants (root is two levels above this file).
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -79,14 +62,8 @@ class _BlockedSocket(socket.socket):
 
 @pytest.fixture(scope = "function", autouse = True)
 def network_blocker():
-    """Function-scoped fixture; replaces `socket.socket` with a blocker.
-
-    Yields nothing; the swap is the side effect. Restored at teardown
-    so the *next* test (security or otherwise) sees the real socket.
-    Session scope was a footgun: it leaked the patch into every
-    network-using test in the parent ``tests/`` tree once a single
-    security test ran. See the module docstring for the regression.
-    """
+    """Swaps socket.socket for a blocker and restores it at teardown; function scope because session scope leaked the
+    patch into every network-using test in the parent tests/ tree."""
     original = socket.socket
     socket.socket = _BlockedSocket  # type: ignore[assignment]
     try:

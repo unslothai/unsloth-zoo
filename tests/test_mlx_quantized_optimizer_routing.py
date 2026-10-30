@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Which optimizer names route to the 8-bit path, and what the user is told.
-
-Pure name logic, so this runs under the torch shim on Linux CI instead of skipping.
-The numerics live in test_mlx_quantized_optimizer_state.py (real MLX only), so
-keeping the routing contract here means the gate still executes something.
-"""
+"""Routing of optimizer names to the 8-bit path and its message; runs under the torch shim on Linux CI, numerics live in test_mlx_quantized_optimizer_state.py."""
 
 import pytest
 
@@ -73,8 +68,7 @@ def test_8bit_names_are_advertised_as_supported():
 
 
 def test_description_names_the_one_thing_the_name_does_not():
-    """bitsandbytes' adamw_8bit quantizes both moments; this quantizes one. That
-    is the whole reason to print anything, so it must fit on one line."""
+    """bitsandbytes' adamw_8bit quantizes both moments and this quantizes one; that difference is the reason to print anything, so it must fit one line."""
     from unsloth_zoo.mlx.optimizers_quantized import describe_quantized_optimizer
     message = describe_quantized_optimizer("adamw_8bit")
 

@@ -13,19 +13,9 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Run DiffusionGemma in Unsloth Studio over the GGUF path.
-
-DiffusionGemma is a block-diffusion model, so llama.cpp serves it through a dedicated diffusion runner
-rather than the autoregressive server. This package drives the optimized on-device visual decoder
-(llama-diffusion-gemma-visual-server) and wraps it in an OpenAI-compatible shim so Unsloth can serve it
-as an ordinary llama.cpp / OpenAI-compatible model. The shim streams the committed answer text and a
-self-contained ```html artifact that replays the per-step denoising canvas, which Unsloth auto-renders for
-DiffusionGemma. Autoregressive flows are untouched.
-
-The visual server tokenizes, applies the chat template and detokenizes from the GGUF's own embedded
-tokenizer, so no tokenizer files are needed here. visual_engine imports cleanly; the HTTP shim pulls in
-fastapi/uvicorn only when run, so importing this package stays dependency-light.
-"""
+"""Runs DiffusionGemma in Unsloth Studio over GGUF via llama-diffusion-gemma-visual-server behind an OpenAI-compatible
+shim; no tokenizer files are needed, fastapi/uvicorn load only when the shim runs; autoregressive flows are
+untouched."""
 import os
 
 from .visual_engine import VisualServer, generate_visual, CANVAS

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""LoRA on embed_tokens / lm_head after add_new_tokens: the merged rows past the base
-checkpoint's vocab must be the live base rows plus the delta, not zeros plus the delta."""
+"""LoRA on embed_tokens/lm_head after add_new_tokens: added rows are base rows plus delta, not zeros."""
 
 from __future__ import annotations
 
