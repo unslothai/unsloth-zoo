@@ -431,6 +431,70 @@ def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
         run(GenerationRequest(prompt=pictured, image=image, prompt_cache_state=state(_own_copy(kept[2048]))))
 
 
+class _RetiringState(_RowCacheState):
+    def retire(self, take):
+        self.taken = getattr(self, "taken", []) + [_own_copy(take())]
+
+
+@metal_only
+def test_vlm_stream_rows_hand_their_own_cache_back_as_they_leave():
+    from mlx_vlm import load
+    from mlx_vlm.models.cache import make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import BatchStream, GenerationDefaults, GenerationRequest, row_retire_unavailable_reason
+    model, processor = load(QWEN_VLM_MODEL)
+    model._is_vlm_model = True
+    assert row_retire_unavailable_reason() is None
+    rules = lambda n: " ".join(f"Rule {i}: answer tersely." for i in range(n))  # noqa: E731
+    ask = lambda q, n: apply_chat_template(processor, model.config, f"{q} {rules(n)}", num_images=0)  # noqa: E731
+    states = [_RetiringState(make_prompt_cache(model.language_model), {2048}) for _ in range(3)]
+    defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4)
+    with BatchStream(model, processor, defaults=defaults) as stream:
+        rows = [stream.add(GenerationRequest(prompt=ask(q, n), max_tokens=m, prompt_cache_state=s))
+                for q, n, m, s in (("Name a colour.", 420, 3, states[0]),
+                                   ("Count from one to fifty in words.", 300, 20, states[1]))]
+        finished = []
+        while len(finished) < len(rows):
+            finished += [e.index for e in stream.step() if e.result is not None]
+        assert finished == rows
+        withdrawn = stream.add(GenerationRequest(prompt=ask("Name a city.", 420), prompt_cache_state=states[2]))
+        while not any(e.index == withdrawn for e in stream.step()):
+            pass
+        assert stream.withdraw(withdrawn) is not None
+    for state in states:
+        (taken,) = state.taken
+        attention = [(got, kept) for got, kept in zip(taken, state.kept[2048], strict=True) if hasattr(kept, "keys")]
+        assert attention and all(type(got) is type(kept) for got, kept in zip(taken, state.kept[2048]))
+        for got, kept in attention:
+            assert got.offset > 2048 and all(mx.array_equal(a[..., :2048, :], b[..., :2048, :]).item()
+                                             for a, b in ((got.keys, kept.keys), (got.values, kept.values)))
+
+
+@real_mlx_only
+def test_a_batch_s_last_leaving_row_hands_its_cache_back_without_a_copy():
+    import gc
+    from mlx_vlm.models.cache import BatchKVCache
+    from unsloth_zoo.mlx.generate import _row_cache
+
+    def copied(rows):
+        cache = BatchKVCache([0] * rows)
+        keys = mx.random.normal((rows, 8, 8192, 64)).astype(mx.float16)
+        cache.update_and_fetch(keys, keys + 1)
+        for _ in range(3):  # decoded past the prompt, so a row's slice is strided
+            cache.update_and_fetch(keys[:, :, :1], keys[:, :, :1])
+        mx.eval(cache.keys, cache.values, cache.offset, cache.left_padding)
+        del keys
+        gc.collect()
+        mx.clear_cache()
+        start = mx.get_active_memory()
+        (taken,) = _row_cache([cache], rows - 1)
+        mx.eval(taken.keys, taken.values)
+        assert mx.array_equal(taken.values, cache.values[rows - 1 : rows, :, : cache._idx]).item()
+        return round((mx.get_active_memory() - start) / (2 * 8 * cache._idx * 64 * 2), 2)
+
+    assert copied(1) == 0 and copied(2) == 1
+
+
 @metal_only
 def test_vlm_stream_rows_resume_from_their_own_quantized_cache_bitwise(monkeypatch):
     from mlx_vlm import load

@@ -1403,6 +1403,28 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
     with pytest.raises(RuntimeError, match = "prepare"):
         generate(draft_model = draft, draft_kind = draft.draft_kind)
 
+
+def test_a_copies_only_draft_prefills_in_chunks_on_a_target_naming_no_chunking_policy(qwen, monkeypatch):
+    import importlib
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import SpeculativeDraft, install_speculative_seam
+    ar, (model, ids), lm = importlib.import_module("mlx_vlm.generate.ar"), qwen, type(qwen[0].language_model)
+    monkeypatch.delattr(lm, "chunked_prefill_policy")  # as mlx-vlm's Qwen3 text model, which then prefills a drafted prompt whole
+    [monkeypatch.setattr(ar, name, getattr(ar, name)) for name in ("run_speculative_rounds", "SpeculativePrefill", "_chunked_prefill_enabled")]
+    install_speculative_seam()
+    widths, forward = [], lm.__call__
+    rows = lambda args, kwargs: next(x.shape[1] for x in (*args, kwargs.get("inputs"), kwargs.get("inputs_embeds")) if getattr(x, "ndim", 0) >= 2)
+    monkeypatch.setattr(lm, "__call__", lambda self, *args, **kwargs: widths.append(rows(args, kwargs)) or forward(self, *args, **kwargs))
+    generate = lambda **kwargs: [int(token) for token, _ in ar.generate_step(
+        mx.array([ids[0]]), model, None, None, max_tokens = 32, temperature = 0.0, prefill_step_size = 16, **kwargs)]
+    plain = generate()
+    widths.clear()
+    (copies := SpeculativeDraft(_script(("copy", 4), ("plain", 3)))).prepare(ids[0], SamplingParams())
+    assert generate(draft_model = copies, draft_kind = copies.draft_kind) == plain and len(ids[0]) > 16 >= max(widths)
+    gate = lambda draft: ar._chunked_prefill_enabled(model, input_ids = mx.array([ids[0]]), draft_model = draft, draft_kind = "mtp")
+    assert gate(copies) and not gate(SpeculativeDraft(_script(("draft", 3)), object()))
+
+
 @pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
 def test_a_lazy_drafter_weighs_its_checkpoint_and_holds_a_started_row_without_allocating(request, companion):
     from mlx_vlm.utils import load
@@ -1483,6 +1505,7 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
     banked, size = {}, len(tok.encode(texts[0], add_special_tokens = False))
     state = SimpleNamespace(checkpoint = lambda count, cache: banked.update({count: deepcopy(cache)}))
     state.open = lambda prompt: (deepcopy(banked[max(banked)]) if banked else make_prompt_cache(model.language_model), [size - 9, size - 1])
+    retired, state.retire = [], lambda take: retired.append(take()) or mx.eval([entry.state for entry in retired[-1]])
     resumed = GenerationRequest(prompt = texts[0], max_tokens = 24, prompt_cache_state = state)
     greedy = [GenerationRequest(prompt = texts[0], max_tokens = 40), GenerationRequest(prompt = texts[1], max_tokens = 200)]
     sampled = GenerationRequest(prompt = texts[1], max_tokens = 32, sampling = SamplingParams(temperature = 0.8, top_k = 20, seed = 7))
@@ -1523,6 +1546,10 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
     del banked[size - 1]
     warm = run({0: resumed})[0]
     assert (warm.cached_token_count, sorted(banked), warm.token_ids) == (size - 9, [size - 9, size - 1], batched[8].token_ids) and warm.draft_tokens > 0
+    run({0: replace(resumed, max_tokens = 1)})
+    kv = [(i, entry) for i, entry in enumerate(banked[size - 9]) if hasattr(entry, "keys")]
+    assert len(retired) == 3 and kv and all(mx.array_equal(getattr(taken[i], name)[..., : size - 9, :], getattr(entry, name)[..., : size - 9, :]).item()
+                                             for taken in retired for i, entry in kv for name in ("keys", "values"))
     # Rows that join mid-flight draft from the features their own prefill captured.
     assert not companion or all(batched[row].draft_tokens > 0 for row in (3, 6))
 
