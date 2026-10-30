@@ -887,20 +887,18 @@ def _probe_prefill(attend):
 # Causal attention whose every query row is computed the same way in whatever block it comes, so one-token decode
 # and a speculative verify block give each row the same bits. Keys are split every INVARIANT_KEYS from the first:
 # each split's fp32 softmax partials go out, and a row combines the splits its own keys reach, in split order. A
-# threadgroup serves 16 rows of one KV head (a block's query heads side by side) over one split on the tensor
-# units; its DH simdgroups each take D / DH of the head dim and their partial scores are summed in part order.
-# A key past a row's own gets probability 0, which leaves that row's sums, maximum and output unchanged.
+# threadgroup serves FM rows of one KV head (its query heads' rows, head-major, read in place from a contiguous q)
+# over one split: each of its S / 32 simdgroups scores the rows against 32 keys over the whole head dim on matmul2d,
+# one softmax over the split's scores is shared, and the simdgroups then split the head dim to accumulate P.V.
+# A key past a row's own gets probability 0, which leaves that row's maximum, sum and output unchanged.
 _INVARIANT_SOURCE = """
-    constexpr int BK = 32;
-    constexpr int PD = D / DH;
-    constexpr int QF = PD / 16;
-    constexpr int LQ = D + 8;
-    threadgroup T qs[16 * LQ];
-    threadgroup float sx[DH * 512];
-    threadgroup float px[DH * 512];
-    threadgroup float fx[DH * 16];
+    constexpr int NS = S / 32;
+    constexpr int DP = D / NS >= (FM < 16 ? 16 : 8) ? NS : D / 16;   // matmul2d needs a 16-wide side
+    constexpr int PD = D / DP;
+    constexpr int RS = FM / NS;
+    threadgroup float sp[FM * S];
 
-    const uint part = simdgroup_index_in_threadgroup;
+    const uint s = simdgroup_index_in_threadgroup;
     const ushort lane = thread_index_in_simdgroup;
     const int h = threadgroup_position_in_grid.x;
     const int b = threadgroup_position_in_grid.y;
@@ -908,102 +906,71 @@ _INVARIANT_SOURCE = """
     const int N = k_shape[2];
     const int Hkv = k_shape[1];
     const int splits = (N + S - 1) / S;
-    const int split = threadgroup_position_in_grid.z % splits;
-    const int f0 = threadgroup_position_in_grid.z / splits * 16;
-    const int prefix = N - L;
     const int rows = L * G;
+    const int frags = (rows + FM - 1) / FM;
+    const int split = threadgroup_position_in_grid.z / frags;
+    const int f0 = threadgroup_position_in_grid.z % frags * FM;
     const int k0 = split * S;
-    const int kend = min(k0 + S, prefix + (min(f0 + 16, rows) - 1) / G + 1);
-    if (k0 >= kend) return;
+    int last = 0;
+    for (int f = f0; f < min(f0 + FM, rows); ++f) last = max(last, f % L);
+    if (k0 > N - L + last) return;
 
-    for (int i = part * 32 + lane; i < 16 * D; i += 32 * DH) {
-        const int r = i / D, d = i % D, f = min(f0 + r, rows - 1);
-        qs[r * LQ + d] = f0 + r < rows ? q[b * q_strides[0] + (h * G + f % G) * q_strides[1] + (f / G) * q_strides[2]
-                                           + d * q_strides[3]] : T(0);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const int d0 = part * PD;
-    const int r = lane >> 1, half_ = lane & 1;
-    const int nvis = f0 + r < rows ? prefix + (f0 + r) / G + 1 : 0;
-    constexpr auto qk_desc = matmul2d_descriptor(16, 32, 16, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-    constexpr auto pv_desc = matmul2d_descriptor(16, PD, 16, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto qk_desc = matmul2d_descriptor(FM, 32, D, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto pv_desc = matmul2d_descriptor(FM, PD, S, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<qk_desc, execution_simdgroup> qk_op;
     matmul2d<pv_desc, execution_simdgroup> pv_op;
-    auto qt = tensor(qs, dextents<int, 2>{D, 16}, array<int, 2>{1, LQ});
+    auto qt = tensor((device T*)(q + b * q_strides[0] + h * G * q_strides[1]), dextents<int, 2>{D, rows}, array<int, 2>{1, D});
     auto kt = tensor((device T*)(k + b * k_strides[0] + h * k_strides[1]), dextents<int, 2>{D, N}, array<int, 2>{1, int(k_strides[2])});
     auto vt = tensor((device T*)(v + b * v_strides[0] + h * v_strides[1]), dextents<int, 2>{D, N}, array<int, 2>{1, int(v_strides[2])});
-    threadgroup float* mine_s = sx + part * 512;
-    threadgroup float* mine_p = px + part * 512;
-    auto pt = tensor(mine_p, dextents<int, 2>{32, 16}, array<int, 2>{1, 32});
-    using SC = decltype(qk_op.template get_destination_cooperative_tensor<decltype(qt.slice(0, 0)), decltype(kt.slice(0, 0)), float>());
-    using OC = decltype(pv_op.template get_destination_cooperative_tensor<decltype(pt.slice(0, 0)), decltype(vt.slice(0, 0)), float>());
-    OC o;
-    _Pragma("unroll") for (int i = 0; i < o.get_capacity(); ++i) if (o.is_valid_element(i)) o[i] = 0.0f;
-    float m = -INFINITY, l = 0.0f;
+    auto st = tensor(sp, dextents<int, 2>{S, FM}, array<int, 2>{1, S});
+    auto qf = qt.slice(0, f0);
+    auto kf = kt.slice(0, k0 + int(s) * 32);
+    auto sc = qk_op.template get_destination_cooperative_tensor<decltype(qf), decltype(kf), float>();
+    _Pragma("unroll") for (int i = 0; i < sc.get_capacity(); ++i) if (sc.is_valid_element(i)) sc[i] = 0.0f;
+    qk_op.run(qf, kf, sc);
+    sc.store(tensor(sp + s * 32, dextents<int, 2>{32, FM}, array<int, 2>{1, S}));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int kb = k0; kb < kend; kb += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        SC sc;
-        _Pragma("unroll") for (int i = 0; i < sc.get_capacity(); ++i) if (sc.is_valid_element(i)) sc[i] = 0.0f;
-        _Pragma("unroll") for (int c = 0; c < QF; ++c) {
-            auto qc = qt.slice(d0 + c * 16, 0);
-            auto kc = kt.slice(d0 + c * 16, kb);
-            qk_op.run(qc, kc, sc);
+    // Simdgroup s owns rows s * RS..; lane takes keys lane + 32j. The softmax overwrites the scores with P.
+    _Pragma("unroll") for (int i = 0; i < RS; ++i) {
+        const int r = int(s) * RS + i, f = f0 + r;
+        const int visible = f < rows ? N - L + f % L + 1 - k0 : 0;
+        threadgroup float* row = sp + r * S;
+        float x[S / 32], m = -INFINITY, e = 0.0f;
+        _Pragma("unroll") for (int j = 0; j < S / 32; ++j) {
+            x[j] = j * 32 + lane < visible ? row[j * 32 + lane] * scale : -INFINITY;
+            m = max(m, x[j]);
         }
-        sc.store(tensor(mine_s, dextents<int, 2>{32, 16}, array<int, 2>{1, 32}));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Lane 2r + h takes row r's keys 16h to 16h + 15.
-        float sv[16];
-        _Pragma("unroll") for (int p = 0; p < DH; ++p) {
-            const threadgroup float* theirs = sx + p * 512 + r * 32 + half_ * 16;
-            _Pragma("unroll") for (int j = 0; j < 16; ++j) sv[j] = p == 0 ? theirs[j] : sv[j] + theirs[j];
+        m = simd_max(m);
+        _Pragma("unroll") for (int j = 0; j < S / 32; ++j) {
+            x[j] = x[j] == -INFINITY ? 0.0f : fast::exp(x[j] - m);
+            e += x[j];
+            row[j * 32 + lane] = x[j];
         }
-        float tmax = -INFINITY;
-        _Pragma("unroll") for (int j = 0; j < 16; ++j) {
-            sv[j] = kb + half_ * 16 + j < nvis ? sv[j] * scale : -INFINITY;
-            tmax = max(tmax, sv[j]);
+        e = simd_sum(e);
+        if (lane == 0 && f < rows) {
+            const ulong slot = (ulong((b * Hkv + h) * rows + f)) * splits + split;
+            stats[slot * 2] = m;
+            stats[slot * 2 + 1] = e;
         }
-        tmax = max(tmax, simd_shuffle_xor(tmax, ushort(1)));
-        const float nm = max(m, tmax);
-        const float factor = nm == m ? 1.0f : fast::exp(m - nm);
-        float rs = 0.0f;
-        _Pragma("unroll") for (int j = 0; j < 16; ++j) {
-            sv[j] = sv[j] == -INFINITY ? 0.0f : fast::exp(sv[j] - nm);
-            rs += sv[j];
-            mine_p[r * 32 + half_ * 16 + j] = sv[j];
-        }
-        rs += simd_shuffle_xor(rs, ushort(1));
-        l = l * factor + rs;
-        m = nm;
-        if (half_ == 0) fx[part * 16 + r] = factor;
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd_any(factor != 1.0f)) {
-            _Pragma("unroll") for (int i = 0; i < o.get_capacity(); ++i) {
-                if (o.is_valid_element(i)) o[i] *= fx[part * 16 + o.get_multidimensional_index(i)[1]];
-            }
-        }
-        _Pragma("unroll") for (int c = 0; c < 2; ++c) {
-            auto pc = pt.slice(c * 16, 0);
-            auto vc = vt.slice(d0, kb + c * 16);
-            pv_op.run(pc, vc, o);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
-    const ulong base = (ulong((b * Hkv + h) * rows + f0)) * splits + split;
-    o.store(tensor(partials + base * D + d0, dextents<int, 2>{PD, min(16, rows - f0)}, array<int, 2>{1, splits * D}));
-    if (part == 0 && half_ == 0 && f0 + r < rows) {
-        stats[(base + ulong(r) * splits) * 2] = m;
-        stats[(base + ulong(r) * splits) * 2 + 1] = l;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (int(s) < DP) {
+        auto pf = st.slice(0, 0);
+        auto vf = vt.slice(int(s) * PD, k0);
+        auto o = pv_op.template get_destination_cooperative_tensor<decltype(pf), decltype(vf), float>();
+        _Pragma("unroll") for (int i = 0; i < o.get_capacity(); ++i) if (o.is_valid_element(i)) o[i] = 0.0f;
+        pv_op.run(pf, vf, o);
+        const ulong base = (ulong((b * Hkv + h) * rows + f0)) * splits + split;
+        o.store(tensor(partials + base * D + s * PD, dextents<int, 2>{PD, min(FM, rows - f0)}, array<int, 2>{1, splits * D}));
     }
 """
+# Rows are head-major, (b, KV head, query head of its group, position): `out`'s own row order.
 _INVARIANT_REDUCE = """
     const int d = thread_position_in_threadgroup.x;
     const int row = threadgroup_position_in_grid.y;
-    const int rows = L * G;
     const int splits = (N + S - 1) / S;
-    const int f = row % rows, bh = row / rows;
-    const int used = (N - L + f / G + S) / S;
+    const int used = (N - L + row % L + S) / S;
     const ulong base = ulong(row) * splits;
     float M = -INFINITY;
     for (int s = 0; s < used; ++s) M = max(M, stats[(base + s) * 2]);
@@ -1014,7 +981,7 @@ _INVARIANT_REDUCE = """
         num += w * partials[(base + s) * D + d];
         den += w * stats[(base + s) * 2 + 1];
     }
-    out[((ulong(bh) * G + f % G) * L + f / G) * D + d] = T(num / den);
+    out[ulong(row) * D + d] = T(num / den);
 """
 INVARIANT_KEYS = 256
 INVARIANT_PROBE_KEY = "invariant_attention:" + hashlib.sha256(
@@ -1045,16 +1012,16 @@ def invariant_attention(queries, keys, values, scale):
     of its own one-row call."""
     B, H, L, D = queries.shape
     kv_heads, N = keys.shape[1], keys.shape[2]
-    G, parts = H // kv_heads, min(4, D // 32)
+    G, frag = H // kv_heads, 16
     rows, splits = L * G, -(-N // INVARIANT_KEYS)
     first, second = _invariant_kernels()
     partials, stats = first(
-        inputs = [queries, keys, values, scale],
-        template = [("T", queries.dtype), ("D", D), ("G", G), ("DH", parts), ("S", INVARIANT_KEYS)],
-        grid = (32 * parts * kv_heads, B, splits * -(-rows // 16)), threadgroup = (32 * parts, 1, 1),
+        inputs = [mx.contiguous(queries), keys, values, scale],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("FM", frag), ("S", INVARIANT_KEYS)],
+        grid = (INVARIANT_KEYS * kv_heads, B, splits * -(-rows // frag)), threadgroup = (INVARIANT_KEYS, 1, 1),
         output_shapes = [(B * kv_heads * rows * splits * D,), (B * kv_heads * rows * splits * 2,)],
         output_dtypes = [mx.float32, mx.float32])
-    return second(inputs = [partials, stats, L, N], template = [("T", queries.dtype), ("D", D), ("G", G), ("S", INVARIANT_KEYS)],
+    return second(inputs = [partials, stats, L, N], template = [("T", queries.dtype), ("D", D), ("S", INVARIANT_KEYS)],
                   grid = (D, B * kv_heads * rows, 1), threadgroup = (D, 1, 1),
                   output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
 
