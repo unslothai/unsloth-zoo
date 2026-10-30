@@ -261,7 +261,8 @@ def _bnb_4bit_direct(self, x, quant_state):
     if ops is False:
         return None
     # Row cap before the plan revalidation: prefill over the cap would pay for it only to decline.
-    rows = x.numel() // x.shape[-1] if x.dim() and x.shape[-1] else 0
+    in_features = x.shape[-1]
+    rows = x.numel() // in_features if in_features else 0
     if not (0 < rows <= ops._gemm_4bit_custom_max_m):
         return None  # bitsandbytes dequantizes here
     plan = self.__dict__.get("_unsloth_bnb_direct")
@@ -279,7 +280,7 @@ def _bnb_4bit_direct(self, x, quant_state):
     if plan[1] is None:
         return None
     _, _, _, ptrs, _, N, K, blocksize, quant_type, picks, device = plan
-    if x.shape[-1] != K or device != x.get_device() or (bias is not None and (
+    if in_features != K or device != x.get_device() or (bias is not None and (
         bias.dim() != 1 or bias.get_device() != device
     )):
         return None
