@@ -133,7 +133,8 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
     if need <= avail:
         return
     fit, used = 0, slack
-    for size in sorted(sizes, reverse = True):
+    # Smallest first: the most layers that could fit.
+    for size in sorted(sizes):
         if used + size > avail:
             break
         used, fit = used + size, fit + 1
