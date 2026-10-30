@@ -1727,7 +1727,9 @@ pass
 def grpo_truncated_support_kwargs(trainer):
     """support_* kwargs for the chunked logprob helpers when UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 and
     the vLLM rollouts were truncated, else {}. Opt-in: by default the trainer scores the full vocabulary,
-    as TRL and verl do, so the policy gradient is that of the full-vocabulary log-probability. The kept-set
+    as verl and TRL before 1.17 do, so the policy gradient is that of the full-vocabulary log-probability.
+    TRL 1.17 instead scores over vLLM's kept set when vLLM returns sampling masks (colocate mode, IS
+    correction on, vLLM >= 0.28); Unsloth keeps the full vocabulary unless this is set. The kept-set
     score differentiates log(p(token) / p(kept set)) instead, which is zero where one token is kept.
     Unset, warns once if the truncated vLLM logprobs feed the IS correction or the off-policy mask."""
     if not getattr(trainer, "use_vllm", False):
@@ -1755,7 +1757,8 @@ def grpo_truncated_support_kwargs(trainer):
             logger.warning(
                 f"Unsloth: rollouts sample with {truncation}, so "
                 "vLLM's logprobs are renormalised over the kept tokens while the trainer scores the "
-                "full vocabulary, as TRL does. The importance sampling ratio / off-policy mask then sees a "
+                "full vocabulary (Unsloth's default; TRL 1.17 scores over vLLM's kept set instead when "
+                "vLLM returns sampling masks). The importance sampling ratio / off-policy mask then sees a "
                 "systematic gap of log(kept probability mass) per token. Set "
                 "UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 to score the trainer over the same kept set (this also "
                 "trains the kept-set renormalised policy, whose gradient is zero where one token is kept), "

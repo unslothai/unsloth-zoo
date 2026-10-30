@@ -182,7 +182,7 @@ def test_kill_switch_warns_once_only_when_vllm_logps_are_consumed(monkeypatch, c
 
 @pytest.mark.parametrize("value", [None, "", "auto", "weird"])
 def test_default_scores_the_full_vocabulary_and_warns_once_when_truncated_logps_are_consumed(monkeypatch, caplog, value):
-    # Kept-set scoring is opt-in via UNSLOTH_GRPO_TRUNCATED_SUPPORT=1: by default the full vocabulary is scored like TRL
+    # Kept-set scoring is opt-in via UNSLOTH_GRPO_TRUNCATED_SUPPORT=1: by default the full vocabulary is scored like TRL < 1.17
     # and verl, even for truncated vLLM logprobs feeding IS or the off-policy mask.
     if value is None:
         monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
@@ -427,3 +427,16 @@ def test_loss_autotune_counts_the_kept_set_logits_twice():
     rows_plain, _ = rr.autotune_batch_and_chunks(8, 512, 1024, 151936, 16, None)
     rows_kept, _ = rr.autotune_batch_and_chunks(8, 512, 1024, 151936, 32, None)
     assert rows_kept <= rows_plain
+
+
+def test_default_warning_describes_trl_117_kept_set_scoring(monkeypatch, caplog):
+    # TRL >= 1.17 (TRL #7866) scores over vLLM's kept set when vLLM returns sampling masks, so the
+    # default warning must not claim the full-vocabulary score is what TRL does.
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    caplog.set_level(logging.WARNING)
+    rr.logger.propagate = True
+    assert rr.grpo_truncated_support_kwargs(_trainer(top_p = 0.9)) == {}
+    text = caplog.text
+    assert "as TRL does" not in text
+    assert "TRL 1.17" in text and "kept set" in text
+    assert "as TRL and verl do" not in (rr.grpo_truncated_support_kwargs.__doc__ or "")
