@@ -15,12 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""The GRPO log-softmax helpers compiled their whole chunk loop. A list's length
-cannot be symbolic, so Dynamo specialised on the chunk count torch.chunk returns,
-ceil(T / ceil(T / chunks)), which moves with the token count T: every new count
-recompiled a graph unrolling every chunk (598 s of a 639 s, 60 step GRPO run).
-The chunks are now `chunks` row ranges [i*T//chunks, (i+1)*T//chunks), so the
-traced loop length depends only on `chunks` and the graph count stays flat in T."""
+"""GRPO log-softmax chunk loop uses `chunks` row ranges, not torch.chunk: a list length cannot be symbolic, so Dynamo
+recompiled per torch.chunk count as T changed; now flat in T."""
 import os
 import subprocess
 import sys
@@ -100,8 +96,7 @@ def test_graph_count_does_not_grow_with_the_chunk_count():
     import json
     got = json.loads(line[0][len("RESULT "):])
     for name, res in got.items():
-        # main compiled a graph per distinct chunk count (8 here); now one,
-        # independent of T (2 leaves slack for a respecialisation).
+        # main compiled a graph per distinct chunk count (8 here); now one, independent of T; the bound of 2 leaves slack for a respecialisation.
         assert res["graphs"] <= 2, (name, res)
         assert res["err"] < 1e-4, (name, res)
 

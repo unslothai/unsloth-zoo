@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`scripts/lint_risky_loaders.py` fails CI on a new risky loader call site.
-
-These pin which shapes each rule reports, which it leaves alone, and that the baseline
-cannot be used to smuggle a new call site past it.
-"""
+"""Tests scripts/lint_risky_loaders.py, which fails CI on a new risky loader call site; pins which shapes it flags and that the baseline cannot hide new ones."""
 
 from __future__ import annotations
 

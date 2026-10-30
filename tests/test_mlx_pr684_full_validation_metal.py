@@ -1,21 +1,5 @@
-"""Deep behavioral validation of the PR 684 MLX trainer rework on Apple Silicon.
-
-Complements test_mlx_training_e2e_metal.py (basic text LoRA smoke) with the
-paths that only real Metal training can prove:
-
-1. resume_from_checkpoint determinism: a stop+resume run reproduces the
-   fresh run's losses step for step (validates the #751 resume logic inside
-   the reworked training loop: optimizer state restore, batch fast-forward,
-   LR schedule offset).
-2. train_on_responses_only completion-only training: exact step count for
-   epoch-based runs (pins the epoch double-counting fix) and finite losses
-   through the labeled-batch path.
-3. Epoch-based unlabeled runs: num_train_epochs drives the step count when
-   max_steps is disabled.
-4. SGD with gradient-coupled weight decay end to end.
-5. Real VLM LoRA training: tiny 4-bit SmolVLM through the VLM collation,
-   label masking, CCE loss, and adapter save pipeline.
-"""
+"""Metal end-to-end checks for the PR 684 trainer rework: resume matches fresh-run losses (#751), exact epoch step
+counts (pins the double-count fix), SGD weight decay, and real VLM LoRA training."""
 
 import gc
 import glob
@@ -36,15 +20,12 @@ if not _METAL:
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 
 TEXT_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
-# Qwen2-VL: smallest VLM whose processor resolves cleanly under current
-# transformers (the mlx-community SmolVLM-256M repo ships a preprocessor
-# config AutoImageProcessor cannot map).
+# Qwen2-VL is the smallest VLM whose processor resolves under current transformers; SmolVLM-256M's preprocessor config cannot be mapped by AutoImageProcessor.
 VLM_MODEL = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
 
 
 def _chat_dataset(n=12):
-    # ChatML matches SmolLM-Instruct's template so response masking can
-    # anchor on the literal role markers.
+    # ChatML matches SmolLM-Instruct's template so response masking can anchor on the literal role markers.
     return [
         {
             "text": (
@@ -119,9 +100,7 @@ def test_resume_from_checkpoint_matches_fresh_run(tmp_path):
     assert len(resumed_hist) == 6, f"resumed run logged {len(resumed_hist)} losses"
     _assert_finite(resumed_hist)
 
-    # Restored prefix is the checkpointed history; post-resume steps must
-    # track the fresh run. Same seeds + restored Adam moments mean the only
-    # tolerated difference is float accumulation noise.
+    # Restored prefix is checkpointed history; post-resume losses must track the fresh run, since same seeds and restored Adam moments leave only float noise.
     for i, (a, b) in enumerate(zip(fresh_hist, resumed_hist), start=1):
         assert abs(a - b) <= 1e-5 * max(1.0, abs(a)), (
             f"step {i}: fresh={a!r} resumed={b!r}\n"
@@ -144,8 +123,7 @@ def test_train_on_responses_only_epoch_step_count(tmp_path):
     )
     trainer.train()
     hist = trainer._train_loss_history
-    # 12 samples / bs 2 = 6 batches per epoch, 3 epochs = 18 steps. The
-    # pre-fix epoch double-count produced 54.
+    # 12 samples at batch size 2 is 6 batches per epoch, so 3 epochs must give 18 steps; an epoch double-count bug once produced 54.
     assert len(hist) == 18, f"expected 18 steps, got {len(hist)}"
     _assert_finite(hist)
 
@@ -313,13 +291,7 @@ def _make_vlm_trainer(tmp_path, dataset, **config_overrides):
 
 @metal_only
 def test_vlm_resume_from_checkpoint_matches_fresh_run(tmp_path):
-    """VLM stop+resume reproduces the fresh run's losses step for step.
-
-    Mirrors test_resume_from_checkpoint_matches_fresh_run for a VLM model
-    so the resume code path (optimizer state restore, batch fast-forward,
-    LR schedule offset) is exercised through the multimodal collator and
-    image processor in addition to the text-only path.
-    """
+    """VLM stop+resume must match the fresh run's losses, covering optimizer restore, batch fast-forward and LR offset through the multimodal collator."""
     fresh_dir = tmp_path / "fresh"
     resume_dir = tmp_path / "resume"
 
@@ -357,9 +329,7 @@ def test_vlm_resume_from_checkpoint_matches_fresh_run(tmp_path):
     assert len(resumed_hist) == 6, f"resumed run logged {len(resumed_hist)} losses"
     _assert_finite(resumed_hist)
 
-    # Restored prefix is the checkpointed history; post-resume steps must
-    # track the fresh run. Same seeds + restored Adam moments mean the only
-    # tolerated difference is float accumulation noise.
+    # Restored prefix is checkpointed history; post-resume losses must track the fresh run, since same seeds and restored Adam moments leave only float noise.
     for i, (a, b) in enumerate(zip(fresh_hist, resumed_hist), start=1):
         assert abs(a - b) <= 1e-5 * max(1.0, abs(a)), (
             f"step {i}: fresh={a!r} resumed={b!r}\n"

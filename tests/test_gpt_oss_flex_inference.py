@@ -57,8 +57,8 @@ def _padding(total, device):
 @pytest.mark.parametrize("window", [None, 5])
 @pytest.mark.parametrize("q_len,q_offset,kv_offset,kv_len", _CASES)
 def test_mask_positions_cpu(monkeypatch, form, window, q_len, q_offset, kv_offset, kv_len):
-    # Positions only (any host): the BlockMask must equal causal & window & padding at absolute positions, and must
-    # not alias the offset it was given (StaticLayer passes its live cumulative_length, bumped before attention).
+    # Positions only, on any host: the BlockMask must equal causal & window & padding at absolute positions and not
+    # alias the given offset (StaticLayer passes its live cumulative_length, bumped before attention).
     from torch.nn.attention.flex_attention import create_block_mask, create_mask
     from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
     import unsloth_zoo.flex_attention.utils as U
@@ -135,8 +135,8 @@ def _block_layout(block_mask, T):
                                                     (599, 0, 600), (300, 296, 5), (40, 0, 41)])
 @pytest.mark.parametrize("tensor_offset", [True, False])
 def test_decode_lists_only_reachable_blocks_cpu(monkeypatch, window, q_pos, kv_offset, kv_len, tensor_offset):
-    # Decode on a static cache: kv_length is the cache size, but only blocks up to the query's own slot can hold a
-    # visible key. The listed blocks must cover every visible key (mask_mod only runs inside listed blocks).
+    # Decode on a static cache: kv_length is the cache size, but only blocks up to the query's slot can hold visible
+    # keys; listed blocks must cover them all, since mask_mod runs only inside listed blocks.
     from torch.nn.attention.flex_attention import create_mask
     from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
     import unsloth_zoo.flex_attention.utils as U
@@ -230,8 +230,8 @@ def test_inference_matches_fp32_sink_oracle(window, q_len, q_offset, kv_offset, 
 
     assert out.shape == (B, q_len, H, D)
     assert torch.isfinite(out).all()
-    # q_len 1 runs flex_decoding (exact fp32). Longer queries run the forced flex kernel, which rounds fp32 like
-    # TF32 once the mask_mod reads a captured tensor (stock torch.compile too): ~1e-3 on unit-scale values.
+    # q_len 1 runs flex_decoding (exact fp32); longer queries run the forced flex kernel, which rounds fp32 like TF32
+    # once mask_mod reads a captured tensor (~1e-3 on unit-scale values).
     atol = 2e-5 if q_len == 1 else 4e-3
     torch.testing.assert_close(out.double(), ref, atol = atol, rtol = 1e-4)
     empty = ~allowed.any(-1)

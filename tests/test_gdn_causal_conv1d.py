@@ -233,8 +233,7 @@ def _unpatched_decorator(decorator):
 
 @pytest.fixture(autouse = True)
 def _restore_modeling_modules(monkeypatch):
-    """The patch rebinds every imported target modeling module, not just the one a test asked for;
-    restore them all so the next test (or file) starts from the same state."""
+    """The patch rebinds every imported target modeling module, not just the one a test asks for; restoring all keeps later tests starting from the same state."""
     import sys
     for module_name, module in list(sys.modules.items()):
         if module is None or not module_name.startswith("transformers.models.") or ".modeling_" not in module_name:
@@ -250,8 +249,7 @@ def _real_gdn_modeling(monkeypatch, name = "transformers.models.qwen3_5.modeling
     if getattr(modeling, "causal_conv1d_fn", None) is None or not hasattr(modeling, "use_kernel_func_from_hub_with_fallback"):
         pytest.skip(f"transformers < 5.15 {name}")
     decorator = _unpatched_decorator(modeling.use_kernel_func_from_hub_with_fallback)
-    # Both names: the patch rebinds the decode update too, and a test that leaves it patched
-    # changes what the next test starts from.
+    # Both attributes are rebound: the patch also rebinds the decode update, and a test that leaves it patched changes what the next test starts from.
     for attr in ("causal_conv1d_fn", "causal_conv1d_update"):
         fn = getattr(modeling, attr, None)
         if fn is None:
@@ -567,8 +565,7 @@ def test_mamba_drop_ins_take_the_torch_path_when_autograd_tracks(monkeypatch):
 
 
 def _oracle_seq(x, w, b, seq_idx, act = "silu"):
-    """fp64 per-position oracle with causal_conv1d's packing rules: taps stay in their segment and
-    a padding position (seq_idx < 0) outputs 0."""
+    """fp64 per-position oracle with causal_conv1d's packing rules: taps stay in their segment and seq_idx < 0 padding outputs 0."""
     x, w = x.double(), w.double()
     b = b.double() if b is not None else None
     B, D, T = x.shape
@@ -593,8 +590,7 @@ def _oracle_seq(x, w, b, seq_idx, act = "silu"):
 @requires_cuda
 @pytest.mark.parametrize("wdtype", [torch.float32, torch.bfloat16])
 def test_mamba_drop_ins_keep_the_parameter_dtype(wdtype):
-    # Autocast hands causal_conv1d a bf16 x with the fp32 parameter: no downcast, fp32 accumulate,
-    # output in x's dtype, dW / db in the parameter's dtype (causal_conv1d's DISPATCH_WTYPE).
+    # Autocast gives causal_conv1d bf16 x with fp32 parameter: no downcast, fp32 accumulate, output in x dtype, dW/db in parameter dtype (DISPATCH_WTYPE).
     B, T, D, W = 2, 70, 96, 4
     g = torch.Generator(device = "cuda").manual_seed(0)
     x = torch.randn(B, T, D, device = "cuda", generator = g).to(torch.bfloat16).transpose(1, 2)
@@ -619,8 +615,8 @@ def test_mamba_drop_ins_keep_the_parameter_dtype(wdtype):
 @requires_cuda
 @pytest.mark.parametrize("act", ["silu", None])
 def test_negative_seq_idx_is_padding(act):
-    # causal_conv1d zeroes the output at seq_idx < 0 and never lets a padding tap reach a real
-    # position; the exact gradient of a constant 0 is 0, so padding adds nothing to dx / dW / db.
+    # causal_conv1d zeroes output at seq_idx < 0 and no padding tap reaches a real position; the gradient of that
+    # constant 0 is exact 0, so padding adds nothing to dx, dW, db.
     B, T, D, W = 2, 40, 64, 4
     g = torch.Generator(device = "cuda").manual_seed(1)
     x = torch.randn(B, T, D, device = "cuda", generator = g).to(torch.bfloat16).transpose(1, 2)
@@ -671,9 +667,7 @@ def test_mamba_drop_ins_launch_with_the_fp32_parameter(monkeypatch):
 
 @requires_cuda
 def test_cuda_graph_capture_after_one_warmup(monkeypatch):
-    # The cached launcher's one-time self-check reads a verdict back on the host; inside a CUDA
-    # graph capture that sync invalidates the capture. One eager warm-up builds the plans, so the
-    # captured step is the first cached launch: it must take the full launch and stay capturable.
+    # The launcher's self-check syncs to the host and would invalidate CUDA graph capture; one eager warm-up builds plans so capture takes the full launch.
     if not gcc._triton_launcher_verified():
         pytest.skip("cached launcher needs Triton 3.6+")
     monkeypatch.setattr(gcc, "_conv_plans", {})
@@ -715,8 +709,7 @@ def test_cuda_graph_capture_after_one_warmup(monkeypatch):
 
 @requires_cuda
 def test_wrong_cached_launch_still_caught_after_a_capture(monkeypatch):
-    # Skipping the self-check during capture must not skip it for good: a cached launcher that
-    # writes wrong values is still caught on the first eager cached launch, and the output kept.
+    # Skipping the self-check during capture must not skip it for good: a wrong cached launch is still caught on the first eager cached launch.
     if not gcc._triton_launcher_verified():
         pytest.skip("cached launcher needs Triton 3.6+")
     monkeypatch.setattr(gcc, "_conv_plans", {})
@@ -737,9 +730,7 @@ def test_wrong_cached_launch_still_caught_after_a_capture(monkeypatch):
 @requires_cuda
 @pytest.mark.parametrize("xdtype", [torch.float16, torch.bfloat16])
 def test_mamba_mixed_dtype_preactivation_stays_in_the_parameter_dtype(xdtype):
-    # fp16 x with the fp32 parameter: the torch path (and causal_conv1d) applies SiLU to the fp32
-    # conv output. Narrowing that pre-activation to x's fp16 first turns a finite -360000 into
-    # -inf, and SiLU / its derivative into NaN. bf16 does not overflow here but must agree too.
+    # fp16 x with fp32 parameter: SiLU must see the fp32 pre-activation, as narrowing -360000 to fp16 first gives -inf and SiLU then NaN; bf16 must agree too.
     B, T, D, W = 1, 8, 64, 4
     x = torch.full((B, T, D), -30000.0, device = "cuda", dtype = xdtype).transpose(1, 2)
     w = torch.full((D, W), 3.0, device = "cuda")

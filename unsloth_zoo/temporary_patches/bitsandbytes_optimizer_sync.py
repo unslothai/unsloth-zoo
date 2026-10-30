@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Skip bitsandbytes' per-parameter device sync in non-paged optimizer steps.
-
-The sync came with paged optimizers (bitsandbytes 41a9c70), whose managed-memory prefetch is async.
-Non-paged update kernels launch on the legacy default stream, which torch also uses, so stream order
-already serialises them; the sync only blocks the host (one device drain per LoRA tensor).
-Paged optimizers, non-CUDA params and side streams keep every sync; unknown step shapes are left alone;
-UNSLOTH_BNB_OPTIMIZER_SYNC=1 restores the original step.
-"""
+"""Skips bitsandbytes' per-parameter sync in non-paged steps (the legacy default stream already orders them; the sync
+only blocks the host); paged, non-CUDA and side-stream params keep it; unknown step shapes are left alone;
+UNSLOTH_BNB_OPTIMIZER_SYNC=1 restores the original step."""
 
 import ast
 import inspect
@@ -136,8 +131,8 @@ def _bnb_version_in_window():
 
 
 def _default_stream_on(p):
-    # bitsandbytes launches its optimizer kernels on the legacy default stream (raw handle 0).
-    # Skipping the sync is only order-preserving if torch also runs on it for p's device.
+    # bitsandbytes launches optimizer kernels on the legacy default stream (raw handle 0); skipping the sync preserves
+    # order only if torch also runs on that stream for p's device.
     return p.device.type == "cuda" and torch._C._cuda_getCurrentRawStream(p.device.index) == 0
 
 

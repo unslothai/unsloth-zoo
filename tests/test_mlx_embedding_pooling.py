@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pooling correctness and contrastive-loss behaviour on MLX.
-
-Losses assert positive/negative SEPARATION rises: the synthetic encoder starts collapsed.
-"""
+"""Pooling and contrastive-loss checks on MLX; pos/neg separation must rise from a collapsed start."""
 
 import pytest
 
@@ -25,8 +22,7 @@ mx = pytest.importorskip("mlx.core", reason="MLX is only available on Apple Sili
 nn = pytest.importorskip("mlx.nn", reason="MLX is only available on Apple Silicon")
 optim = pytest.importorskip("mlx.optimizers", reason="MLX is only available on Apple Silicon")
 
-# The torch shim installs process-wide while another module is being collected, so the
-# imports above can succeed against it; these numerics need real MLX (the mlx-cpu lane).
+# Torch shim is installed process-wide during collection, so the imports above can succeed against it; numerics need real MLX (mlx-cpu lane).
 from mlx_simulation import mlx_is_simulated  # noqa: E402
 
 if mlx_is_simulated():

@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_mamba_fused_split_without_causal_conv1d: split path only when causal_conv1d is unusable, patch before or after
-the modeling import. Subprocess per case: stub mamba_ssm failing like the real one, tiny Falcon-H1 on CPU."""
+"""Tests patch_mamba_fused_split_without_causal_conv1d: split path only when causal_conv1d is unusable, patch before or
+after modeling import; subprocess per case, stub mamba_ssm fails like the real one, tiny Falcon-H1 on CPU."""
 
 import json
 import os

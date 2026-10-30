@@ -14,22 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The PrefixGrouper forward needs the same width dispatch as the packed path.
-
-`.logits` carries hidden states only when the forward is the Unsloth generated
-one honouring UNSLOTH_RETURN_HIDDEN_STATES. The packed call site and its
-verifier both dispatch on width; `_pg_grad_forward` handed `.logits` straight to
-`extract_logps`, which always feeds its helper the lm_head matmul signature. A
-forward returning real [T, vocab] logits therefore raised the reduction-dim
-mismatch inside PrefixGrouper, the outer handler untrusted the signature, and
-the whole verify forward was repeated and thrown away on every later step.
-
-The block is exec'd from its own source so the dispatch is exercised, not read.
-
-The second half pins the property the reshape comment in
-chunked_hidden_states_selective_log_softmax protects: a wrong-width caller must
-still fail with a message naming BOTH operands, never be silently reshaped.
-"""
+"""PrefixGrouper's grad forward must dispatch on width like the packed path, or real-vocab logits make the verify
+forward repeat and be discarded every later step; wrong widths must still fail naming both operands."""
 
 import contextlib
 import inspect
@@ -65,11 +51,8 @@ TGT_FLAT = [1, 2, 3, 1, 4, 5]   # flat index of the target token itself
 
 
 class _Model(torch.nn.Module):
-    """`hidden_states = False` ignores UNSLOTH_RETURN_HIDDEN_STATES and returns
-    real [.., vocab] logits; True is the Unsloth generated forward.
-
-    Position-local, so the grouped forward and a per-row forward agree exactly.
-    """
+    """hidden_states=False ignores UNSLOTH_RETURN_HIDDEN_STATES and returns real [.., vocab] logits; True is the Unsloth
+    forward; position-local, so grouped and per-row forwards agree exactly."""
     def __init__(self, hidden_states = False, vocab = VOCAB, hidden = HIDDEN):
         super().__init__()
         torch.manual_seed(0)
@@ -162,8 +145,7 @@ def test_prefix_grouper_forward_still_matches_on_the_hidden_states_path():
 
 
 def test_pg_forward_source_dispatches_on_width():
-    """Both helpers must be reachable from the block: a source that mentions only
-    the matmul helper cannot have a raw-logits branch at all."""
+    """Both helpers must be reachable from the block: a source naming only the matmul helper cannot contain a raw-logits branch at all."""
     src = _pg_forward_source()
     assert "chunked_selective_log_softmax(" in src
     assert "lm_head.shape[1]" in src

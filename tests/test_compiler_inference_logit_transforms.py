@@ -13,18 +13,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""The compiled inference branch must apply the logit transforms.
-
-`compiler.py` emits several forward templates. Each has an `elif labels is
-None:` arm that returns logits straight to the caller, and training arms that
-apply the captured logit scale and softcap. When the inference arm skips those
-transforms the returned distribution is wrong for any model configuring them:
-greedy decoding is unaffected because tanh is monotonic, but sampling,
-logprobs and logit-based scoring are not.
-
-This is a source guard rather than a runtime test, because reaching the
-generated code needs a real checkpoint and a GPU.
-"""
+"""The inference arm must apply logit scale and softcap like training: greedy is unaffected (tanh is monotonic) but sampling and logprobs are not; source guard only."""
 import re
 
 import unsloth_zoo.compiler as compiler_module

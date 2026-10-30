@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""The single compile worker forcing survives patch_torch_compile and the options dict.
-
-``unsloth/_gpu_init.py`` sets TORCHINDUCTOR_COMPILE_THREADS=1 plus the
-UNSLOTH_FORCE_SINGLE_COMPILE_WORKER sentinel on a cgroup pinned GPU, because Inductor's
-compile workers cannot enumerate one and raise "Could not find an active GPU backend".
-Two consumers here used to undo that: patch_torch_compile popped the variable, and
-determine_compile_threads returned the cpu count into the options dict, which outranks it.
-
-CPU only; the tests set and clear both variables themselves.
-"""
+"""unsloth/_gpu_init.py forces TORCHINDUCTOR_COMPILE_THREADS=1 plus UNSLOTH_FORCE_SINGLE_COMPILE_WORKER on cgroup pinned
+GPUs, as compile workers cannot enumerate one; patch_torch_compile and the options dict must not undo it; CPU only."""
 
 from __future__ import annotations
 
@@ -23,12 +15,7 @@ from unsloth_zoo.temporary_patches.common import determine_compile_threads
 
 @pytest.fixture(autouse = True)
 def _clean_env(monkeypatch):
-    """Both variables are process global, so never leak them into another test.
-
-    ``determine_compile_threads`` is ``lru_cache``d, which is correct in
-    production (``_gpu_init`` sets the variable at ``import unsloth``, long
-    before any compile options are built) but means a test must clear the cache
-    to observe the env var at all."""
+    """Both variables are process global, so they are cleared per test; determine_compile_threads is lru_cached and must have its cache cleared to observe them."""
     monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising = False)
     monkeypatch.delenv("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", raising = False)
     determine_compile_threads.cache_clear()
@@ -90,14 +77,8 @@ def test_determine_compile_threads_ignores_other_values(monkeypatch):
 
 
 def test_the_env_var_alone_does_not_force_a_single_worker(monkeypatch):
-    """The regression guard, and the whole reason this is gated on our own
-    sentinel rather than on TORCHINDUCTOR_COMPILE_THREADS.
-
-    vLLM sets TORCHINDUCTOR_COMPILE_THREADS="1" unconditionally at import
-    (vllm/env_override.py). Reading that variable directly would drop every vLLM
-    user on an ordinary host from the auto detected worker count to 1, which is a
-    large and completely silent compile slowdown. Measured before the gate was
-    narrowed: 32 on main, 1 on this branch, with nothing forced."""
+    """Gated on UNSLOTH_FORCE_SINGLE_COMPILE_WORKER, not TORCHINDUCTOR_COMPILE_THREADS, which vLLM sets to 1 at import
+    (vllm/env_override.py) and would silently cut ordinary hosts to one worker."""
     import sys
     monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
     monkeypatch.delenv("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", raising = False)

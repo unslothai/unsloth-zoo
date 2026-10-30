@@ -6,9 +6,7 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Regression pins for past zoo bugs. Each test maps to a SHIPPED fix on
-`main` and catches the bug class if it re-appears (not the fix path itself);
-each cites the commit/PR that introduced the regression."""
+"""Regression pins for past zoo bugs: each test catches its bug class re-appearing on main (not the fix path) and cites the introducing commit or PR."""
 
 from __future__ import annotations
 
@@ -17,11 +15,8 @@ import importlib
 import pytest
 
 
-# Regression: a missing comma in temporary_patches/utils.py `__all__` silently
-# concatenates adjacent string literals ("raise_errorUnpack"), making the
-# public names un-importable under `from ... import *`. No syntax error fires.
-# Source: 2e36f32 fix(temporary_patches/utils): add missing comma in __all__
-# between 'raise_error' and 'Unpack' (#617)
+# A missing comma in temporary_patches/utils.py __all__ silently concatenates literals (raise_errorUnpack), so names
+# fail under `from ... import *` with no syntax error; commit 2e36f32, issue 617.
 
 
 def test_temporary_patches_utils_all_entries_are_valid_attributes():
@@ -42,11 +37,8 @@ def test_temporary_patches_utils_all_entries_are_valid_attributes():
 
 
 def test_temporary_patches_utils_no_concatenated_all_entries():
-    """No `__all__` entry should look like two jammed names (e.g.
-    `raise_errorUnpack`). Heuristic: a name with BOTH a snake_case underscore
-    AND a lowercase->uppercase transition. Pure ALL_CAPS like `KWARGS_TYPE`
-    has no such transition, so it doesn't match.
-    """
+    """No `__all__` entry may be two jammed names like `raise_errorUnpack`: flagged only when a name has both an
+    underscore and a lowercase-to-uppercase transition; pure ALL_CAPS like `KWARGS_TYPE` is not flagged."""
     from unsloth_zoo.temporary_patches import utils
     import re
 
@@ -80,12 +72,9 @@ def test_temporary_patches_utils_known_public_names_present():
         )
 
 
-# Regression: `compiler.higher_precision_softmax` wasn't idempotent -- running
-# it twice appended a duplicate `.to(x.dtype).to(x.dtype)` (the
-# already-rewritten lookahead was missing). The compiler runs on user source
-# mid-training and may re-run (e.g. checkpoint reload), so emitted source must
-# not drift.
-# Source: f98dbbc fix(compiler): make higher_precision_softmax idempotent (#631)
+# higher_precision_softmax must be idempotent: a second run appended a duplicate .to(x.dtype).to(x.dtype) since the
+# rewritten lookahead was missing; it may re-run mid-training (e.g. checkpoint reload), so emitted source must not
+# drift; commit f98dbbc, PR 631.
 
 
 def test_higher_precision_softmax_idempotent():
@@ -128,24 +117,20 @@ def test_higher_precision_softmax_does_not_double_cast():
     )
 
 
-# Regression: backend device helpers must guard against partial torch builds
-# (e.g. `torch.xpu` exists but `torch.xpu.synchronize` raises). Calling
-# device_synchronize / device_empty_cache must not raise on a partial backend.
-# Source: e08c1df (Guard XPU synchronize), 35dc451 (Guard XPU empty_cache).
+# device_synchronize and device_empty_cache must not raise on partial torch backends, e.g. torch.xpu present but
+# torch.xpu.synchronize raising (e08c1df, 35dc451).
 
 
 def test_device_synchronize_tolerates_partial_backend():
     """`device_synchronize()` must not raise on a minimal stub backend."""
     from unsloth_zoo.device_type import device_synchronize
 
-    # On the GPU-free harness this resolves to a stub; the partial-backend
-    # guards live inside the implementation.
+    # On the GPU-free harness this resolves to a stub; the partial-backend guards live inside the implementation.
     device_synchronize()
 
 
 def test_device_type_module_has_expected_helpers():
-    """Pin the public API downstream zoo/unsloth/Unsloth code calls; a rename
-    or removal here breaks consumers silently (AttributeError at train time)."""
+    """Pins the public API that downstream zoo, unsloth and Unsloth code calls; a rename or removal breaks consumers silently with AttributeError at train time."""
     import unsloth_zoo.device_type as dt
 
     expected = [
@@ -158,10 +143,8 @@ def test_device_type_module_has_expected_helpers():
     )
 
 
-# Regression: RL_REPLACEMENTS dict integrity vs the GRPO refactor wave
-# (commits 466334c, 9829ade, 035f...). The dict is rebuilt per definition; a
-# missing `RL_REPLACEMENTS[name] = fn` after a refactor fails silently. Pins
-# the public-API keys (test_rl_replacements_cpu.py covers the IO contract).
+# RL_REPLACEMENTS is rebuilt per definition, so a missing `RL_REPLACEMENTS[name] = fn` after the GRPO refactor fails
+# silently; pins public-API keys (commits 466334c, 9829ade, 035f...); test_rl_replacements_cpu.py covers IO.
 
 
 def test_rl_replacements_registration_survived_grpo_refactor():
@@ -181,13 +164,8 @@ def test_rl_replacements_registration_survived_grpo_refactor():
     )
 
 
-# Regression: gpt-oss inference leaks a flex BlockMask into the eager attention
-# forward. When config._attn_implementation == "flex_attention" the inference
-# path receives a BlockMask and inplace_eager_attention_forward crashes with
-#   TypeError: unsupported operand type(s) for +=: 'Tensor' and 'BlockMask'
-# Two AST guards (one over wrap.return_attention_mask, one over
-# patch_GptOssModel) catch silent deletion of the flex_attention literal.
-# Source: PR #690; latent since commit ef819214 ("Fix Flex").
+# With config._attn_implementation == 'flex_attention' inference passes a BlockMask into eager attention, crashing on +=
+# with TypeError; AST guards on wrap.return_attention_mask and patch_GptOssModel; PR 690, latent since commit ef819214.
 
 
 def test_gpt_oss_wrap_has_flex_attention_inference_guard():
@@ -226,9 +204,8 @@ def test_gpt_oss_wrap_has_flex_attention_inference_guard():
 
 
 def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
-    """The patched GptOssModel.forward body must carry the
-    _attn_implementation == 'flex_attention' guard, independent of wrap's own
-    guard (so removing the forward-level swap can't satisfy this test)."""
+    """Patched GptOssModel.forward needs its own _attn_implementation == 'flex_attention' guard, independent of wrap's,
+    so removing the forward-level swap fails this test."""
     import ast
     import inspect
     from unsloth_zoo.temporary_patches import gpt_oss as _M
@@ -256,20 +233,13 @@ def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
     )
 
 
-# Regression: eager attention shape mismatch when the KV cache is longer than
-# the attention mask's kv dim. transformers 5.x cache pre-allocation hands a
-# full-attention layer more positions than the causal mask covers (e.g. k=161
-# vs a 128-wide mask), so `attn_weights += attention_mask[...]` raises
-# RuntimeError on dim 3. The _align_kv_to_mask helper trims to the shorter
-# length; static check: it exists AND runs in BOTH eager forwards.
-# Source: PR #691.
+# transformers 5.x KV cache pre-allocation can exceed the causal mask width (k=161 vs 128), so attn_weights +=
+# attention_mask raises RuntimeError on dim 3; _align_kv_to_mask trims to the shorter length and must run in both eager
+# forwards; PR 691.
 
 
 def test_gpt_oss_eager_attention_aligns_kv_to_mask():
-    """Both eager forwards must invoke the KV alignment helper. Per-function
-    source-slice check (not a global callsite count) so consolidation into a
-    shared closure still passes if alignment runs on both routes.
-    """
+    """Both eager forwards must call the KV alignment helper; checked per function, not by global callsite count, so a shared closure still passes."""
     import ast
     import inspect
     from unsloth_zoo.temporary_patches import gpt_oss as _M
@@ -307,10 +277,8 @@ def test_gpt_oss_eager_attention_aligns_kv_to_mask():
     )
 
 
-# Regression: patched GptOssModel.forward hard-coded the 4.x mask kwargs
-# ("input_embeds", "cache_position") and blew up on 5.x (renamed to
-# "inputs_embeds", dropped "cache_position"). PR #690 added inspect-driven
-# kwarg filtering to support both; static check that the helper is present.
+# Patched GptOssModel.forward hard-coded 4.x mask kwargs (input_embeds, cache_position) and broke on 5.x (renamed
+# inputs_embeds, dropped cache_position); PR 690 added inspect-driven kwarg filtering for both.
 
 
 def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
@@ -331,22 +299,16 @@ def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
     )
 
 
-# Regression: patch_compiling_bitsandbytes used exec(f"import {x}",
-# globals(), locals()) + eval(x) inside a function. Under PEP 667
-# (Python 3.13+) the locals() snapshot does not persist, so eval raised
-# NameError: name 'peft' is not defined on every model load with
-# bitsandbytes < 0.46.0. Fixed by switching to importlib.import_module +
-# getattr. Source: #710 (issue #311).
-# These tests stub bitsandbytes/peft in sys.modules so they are hermetic:
-# no GPU, no real bitsandbytes install needed.
+# patch_compiling_bitsandbytes used exec plus eval, which raised NameError under PEP 667 (Python 3.13+) with
+# bitsandbytes < 0.46.0; now importlib (source 710, issue 311). Tests stub bitsandbytes and peft in sys.modules, so no
+# GPU is needed.
 
 
 def _install_fake_bnb_and_peft(monkeypatch, bnb_version, with_peft_leaf=True):
     import sys
     import types
 
-    # The function under test sets UNSLOTH_PATCHED=1; setenv registers the key
-    # with monkeypatch so the pre-test state (even absence) is restored.
+    # The function under test sets UNSLOTH_PATCHED=1; monkeypatch.setenv registers the key so the pre-test state, even absence, is restored.
     import os
     monkeypatch.setenv("UNSLOTH_PATCHED", os.environ.get("UNSLOTH_PATCHED", "0"))
 
@@ -396,9 +358,8 @@ def _install_fake_bnb_and_peft(monkeypatch, bnb_version, with_peft_leaf=True):
 
 
 def test_patch_compiling_bitsandbytes_old_bnb_wraps_without_nameerror(monkeypatch):
-    """The #311 bug class: with bitsandbytes < 0.46.0 the patch must run to
-    completion (no NameError from exec/eval namespace loss on Python 3.13+)
-    and dynamo-disable every forward on both target modules."""
+    """Guards issue 311: with bitsandbytes < 0.46.0 the patch must not raise NameError from exec/eval namespace loss on
+    Python 3.13+ and must dynamo-disable every forward on both target modules."""
     from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
 
     bnb_modules, peft_leaf = _install_fake_bnb_and_peft(monkeypatch, "0.45.5")
@@ -430,8 +391,7 @@ def test_patch_compiling_bitsandbytes_idempotent(monkeypatch):
 
 
 def test_patch_compiling_bitsandbytes_new_bnb_is_noop(monkeypatch):
-    """bitsandbytes >= 0.46.0 supports torch.compile: nothing gets wrapped,
-    checked at the exact 0.46.0 boundary."""
+    """bitsandbytes >= 0.46.0 supports torch.compile, so nothing gets wrapped; checked at the exact 0.46.0 boundary."""
     from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
 
     bnb_modules, peft_leaf = _install_fake_bnb_and_peft(monkeypatch, "0.46.0")
@@ -442,8 +402,7 @@ def test_patch_compiling_bitsandbytes_new_bnb_is_noop(monkeypatch):
 
 
 def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
-    """A missing peft leaf must raise the actionable install message with the
-    original ImportError chained, not a bare NameError/ImportError."""
+    """A missing peft leaf must raise the actionable install message with the original ImportError chained, not a bare NameError or ImportError."""
     import pytest
     from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
 
@@ -456,8 +415,8 @@ def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
     )
 
 
-# Gemma-4 E-series KV sharing under use_cache=False / gradient checkpointing
-# (transformers#45242). These lock the zoo fix in and check its invariants on CPU.
+# Gemma-4 E-series KV sharing under use_cache=False and gradient checkpointing (transformers issue 45242); these lock
+# the zoo fix in and check its invariants on CPU.
 def test_gemma4_kv_shared_patches_registered():
     """Both patch functions stay registered AND wire the carrier (not bare return stubs)."""
     import inspect
@@ -489,8 +448,7 @@ def test_gemma4_shared_kv_carrier_semantics():
 
 
 def test_gemma4_capability_gate(monkeypatch):
-    """needs_cache() is True when the attention forward lacks shared_kv_states, False once it
-    has it. Uses a synthetic module, independent of the installed transformers."""
+    """needs_cache() is True while the attention forward lacks shared_kv_states and False once it has it; uses a synthetic module, not the installed transformers."""
     import sys, types, inspect
     from unsloth_zoo.temporary_patches import gemma4 as _M
 
@@ -518,8 +476,7 @@ def test_gemma4_capability_gate(monkeypatch):
 
 
 def test_gemma4_attention_carrier_substitution():
-    """The wrapper supplies the carrier only when past_key_values is None; a real cache and
-    the no-carrier case pass through unchanged."""
+    """The wrapper supplies the carrier only when past_key_values is None; a real cache and the no-carrier case pass through unchanged."""
     from unsloth_zoo.temporary_patches.gemma4 import (
         _make_gemma4_attention_carrier_forward, _Gemma4SharedKVCarrier,
     )
@@ -543,8 +500,7 @@ def test_gemma4_attention_carrier_substitution():
 
 
 def test_gemma4_clear_shared_kv_carrier_releases_kv():
-    """clear drops the pinned K/V and removes the module attr, so a no_grad/eval forward does
-    not hold the carrier alive until the next forward. No-op when there is no carrier."""
+    """clear drops the pinned K/V and removes the module attr so no_grad/eval forwards do not keep the carrier alive; no-op without a carrier."""
     from unsloth_zoo.temporary_patches.gemma4 import (
         _Gemma4SharedKVCarrier, _gemma4_clear_shared_kv_carrier,
     )
@@ -576,9 +532,7 @@ def test_gemma4_clear_shared_kv_carrier_releases_kv():
 
 
 def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
-    """Overrides _gradient_checkpointing_func on checkpointed gemma-4 layers with a NON-reentrant
-    checkpoint, resolving the pristine one past Unsloth's smart-GC shim. Non-checkpointed and
-    non-gemma-4 layers are left untouched."""
+    """Overrides _gradient_checkpointing_func on checkpointed gemma-4 layers with a NON-reentrant pristine checkpoint past Unsloth's smart-GC shim; others untouched."""
     import functools
     import torch.utils.checkpoint as _ckpt
     from unsloth_zoo.temporary_patches import gemma4 as g4
@@ -592,13 +546,11 @@ def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
     def unsloth_offloaded_gradient_checkpoint(function, *args, **kw):
         return "shim2"
     unsloth_offloaded_gradient_checkpoint.__name__ = "unsloth_offloaded_gradient_checkpoint"
-    # Simulate STACKED Unsloth shims: checkpoint and _old_checkpoint are BOTH shims, so
-    # the import-captured pristine is what must be used.
+    # Simulates stacked Unsloth shims where checkpoint and _old_checkpoint are both shims, so the import-captured pristine checkpoint must be used.
     monkeypatch.setattr(_ckpt, "checkpoint", unsloth_checkpoint, raising=False)
     monkeypatch.setattr(_ckpt, "_old_checkpoint", unsloth_offloaded_gradient_checkpoint, raising=False)
     monkeypatch.setattr(g4, "_PRISTINE_TORCH_CHECKPOINT", _pristine, raising=False)
-    # Real GC patching may have stashed a set-once pristine on the live module; clear it so the
-    # import-captured and _old_checkpoint-unwrap paths below are what gets exercised.
+    # Real GC patching may stash a set-once pristine on the live module; clear it so the import-captured and _old_checkpoint-unwrap paths are exercised.
     monkeypatch.delattr(_ckpt, "_unsloth_pristine_checkpoint", raising=False)
 
     Gemma4TextAttention = type("Gemma4TextAttention", (), {})
@@ -654,9 +606,8 @@ def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
 
 
 def test_gemma4_pristine_checkpoint_recovered_via_set_once_capture(monkeypatch):
-    """When gemma4 imports after smart GC stacked on an offloaded shim, neither shim carries a
-    function-level _old_checkpoint and the module-level one points at the first shim. The set-once
-    capture the GC patcher stashes before any shim must still recover the pristine fn."""
+    """Smart GC stacked on an offloaded shim leaves _old_checkpoint pointing at the first shim, so the set-once capture
+    taken before any shim must supply the pristine fn."""
     import torch.utils.checkpoint as _ckpt
     from unsloth_zoo import gradient_checkpointing as gc
     from unsloth_zoo.temporary_patches import gemma4 as g4
@@ -671,8 +622,7 @@ def test_gemma4_pristine_checkpoint_recovered_via_set_once_capture(monkeypatch):
     gc._capture_pristine_checkpoint_once()
     assert getattr(_ckpt, "_unsloth_pristine_checkpoint", None) is real
 
-    # Now stack two shims: module-level _old_checkpoint ends up at the first shim, so unwrapping
-    # it alone would only ever reach a shim.
+    # Stacks two shims: the module-level _old_checkpoint ends at the first shim, so unwrapping it alone would only ever reach a shim.
     def unsloth_offloaded_gradient_checkpoint(*a, **k):
         raise AssertionError("a shim must never be returned as the pristine checkpoint")
     unsloth_offloaded_gradient_checkpoint.__name__ = "unsloth_offloaded_gradient_checkpoint"
@@ -691,8 +641,7 @@ def test_gemma4_pristine_checkpoint_recovered_via_set_once_capture(monkeypatch):
 
 
 def _make_gemma4_fake_model(torch, *, kv_shared, checkpointed):
-    """A stand-in Gemma-4 model: one decoder layer whose self_attn class is named
-    Gemma4TextAttention, with configurable KV sharing and gradient checkpointing flags."""
+    """Stand-in Gemma-4 model with one decoder layer whose self_attn class is named Gemma4TextAttention; KV sharing and checkpointing are configurable."""
     Gemma4TextAttention = type("Gemma4TextAttention", (), {})
 
     class _Layer:
@@ -711,10 +660,9 @@ def _make_gemma4_fake_model(torch, *, kv_shared, checkpointed):
 
 
 def test_gemma4_carrier_rejects_two_forwards_only_when_unsafe():
-    """The module-scoped 5.5.0/5.5.1 carrier cannot serve two live checkpointed graphs, so a
-    second grad-enabled forward before the first's backward must raise -- but ONLY when KV sharing
-    AND gradient checkpointing are both active (else no carrier is re-read in backward). Models
-    without sharing (31B/26B-A4B) or with checkpointing off must keep working with DPO/contrastive."""
+    """Module-scoped 5.5.0/5.5.1 carrier cannot serve two live checkpointed graphs: a second grad-enabled forward before
+    the first backward must raise, only with KV sharing and checkpointing both on; models without sharing
+    (31B/26B-A4B) or with checkpointing off must work with DPO/contrastive."""
     import torch
     import pytest
     from unsloth_zoo.temporary_patches.gemma4 import _make_kv_shared_use_cache_false_safe_forward
@@ -743,8 +691,7 @@ def test_gemma4_carrier_rejects_two_forwards_only_when_unsafe():
     wrapped(m_noshare, x)  # would raise if the marker were armed
     assert getattr(m_noshare, "_unsloth_gemma4_carrier_outstanding", False) is False
 
-    # Safe (KV sharing but checkpointing off): backward uses saved activations, never re-reads
-    # the carrier, so overlapping forwards must NOT raise.
+    # Safe with KV sharing but checkpointing off: backward uses saved activations and never re-reads the carrier, so overlapping forwards must not raise.
     m_nockpt = _make_gemma4_fake_model(torch, kv_shared=True, checkpointed=False)
     wrapped(m_nockpt, x)
     wrapped(m_nockpt, x)
@@ -757,16 +704,13 @@ def test_gemma4_carrier_rejects_two_forwards_only_when_unsafe():
     assert getattr(m_eval, "_unsloth_gemma4_carrier_outstanding", False) is False
 
 
-# Regression: gpt-oss bnb-4bit <-> 16bit compiled-cache mode switch.
-# The compiled gpt_oss module hardcodes the BnB or stock router/experts layout. Reusing a
-# stale BnB-built module for a later 16bit load re-installs the BnB router -> "weights not
-# initialized". patch_gpt_oss_bnb4bit_auto must restore stock classes + invalidate the module
-# when the load is not bnb-4bit, and drop a stale stock module when switching into bnb.
+# Gpt-oss bnb-4bit <-> 16bit compiled-cache switch: a stale BnB module re-installs the BnB router ('weights not
+# initialized'); patch_gpt_oss_bnb4bit_auto must restore stock classes and invalidate on non-bnb4bit loads, and drop
+# stale stock modules when switching into bnb.
 
 
 def test_invalidate_gpt_oss_compiled_module_drops_sys_modules_and_file(tmp_path, monkeypatch):
-    """_invalidate_gpt_oss_compiled_module removes the sys.modules entry and the on-disk .py so
-    the next compile regenerates against the active classes."""
+    """_invalidate_gpt_oss_compiled_module drops the sys.modules entry and the on-disk .py so the next compile regenerates against the active classes."""
     import sys
     import types
     from unsloth_zoo.temporary_patches import gpt_oss as _M
@@ -795,9 +739,8 @@ def test_invalidate_gpt_oss_compiled_module_drops_sys_modules_and_file(tmp_path,
 
 
 def test_gpt_oss_bnb4bit_auto_restores_and_invalidates_on_non_4bit_load():
-    """AST contract: patch_gpt_oss_bnb4bit_auto's non-bnb branch restores stock classes and
-    clears UNSLOTH_GPT_OSS_BNB4BIT_PATCHED, and the function syncs the on-disk module to the
-    current flavor (the sole cache invalidator). Asserted on the AST so it can't be dropped."""
+    """patch_gpt_oss_bnb4bit_auto's non-bnb branch restores stock classes, clears UNSLOTH_GPT_OSS_BNB4BIT_PATCHED and
+    syncs the on-disk module (the sole cache invalidator); asserted on the AST so it cannot be dropped."""
     import ast
     import inspect
     from unsloth_zoo.temporary_patches import gpt_oss as _M
@@ -820,8 +763,8 @@ def test_gpt_oss_bnb4bit_auto_restores_and_invalidates_on_non_4bit_load():
 
 
 def test_sync_gpt_oss_compiled_flavor_drops_cross_process_stale_module(tmp_path, monkeypatch):
-    """In a fresh process the in-process flag is unset, so _sync_gpt_oss_compiled_flavor must
-    invalidate a stale module via the on-disk marker, and be a no-op when the flavor matches."""
+    """A fresh process has no in-process flag, so _sync_gpt_oss_compiled_flavor must drop a stale module via the on-disk
+    marker and be a no-op when the flavor matches."""
     from unsloth_zoo.temporary_patches import gpt_oss as _M
 
     cache_dir = tmp_path / "unsloth_compiled_cache"
@@ -853,8 +796,7 @@ def test_sync_gpt_oss_compiled_flavor_drops_cross_process_stale_module(tmp_path,
 
 
 def test_patch_gpt_oss_auto_does_not_touch_cache_for_non_gpt_loads(tmp_path, monkeypatch):
-    """patch_gpt_oss_bnb4bit_auto runs for every load; loading an unrelated model must not delete
-    a valid gpt-oss cache (the flavor sync is gated on the model being gpt-oss)."""
+    """patch_gpt_oss_bnb4bit_auto runs on every load, so the flavor sync is gated on gpt-oss: an unrelated model must not delete a valid gpt-oss cache."""
     from unsloth_zoo.temporary_patches import gpt_oss as _M
 
     cache_dir = tmp_path / "unsloth_compiled_cache"
