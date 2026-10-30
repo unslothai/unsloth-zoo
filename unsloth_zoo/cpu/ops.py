@@ -65,8 +65,11 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else None
         grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else None
         total = torch.zeros((), dtype = torch.float32)
-        for start in range(0, rows, chunk_rows):
-            end = min(start + chunk_rows, rows)
+        # A Python range over a symbolic row count pins sequence length to a constant under torch.compile (one graph
+        # per length; a mark_dynamic length fails). Compiled: one chunk over every row, the same memory as stock CE.
+        bounds = [(0, rows)] if torch.compiler.is_compiling() else \
+            [(start, min(start + chunk_rows, rows)) for start in range(0, rows, chunk_rows)]
+        for start, end in bounds:
             y = labels[start:end]
             valid = y != ignore_index
             # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
