@@ -166,6 +166,8 @@ _BUILTINS = [
         refuse = "capacity-limited MoE (which tokens are dropped depends on how many share a call)",
     ),
     TileSpec(_has_seq_aux_gate, family = "seq-aux-moe", refuse = "sequence-level aux-loss gate (seq_aux)"),
+    # Channel-first input ([B, C, H, W], flattened and transposed inside the forward): the last dim is not features.
+    TileSpec(("SegformerMLP",), family = "channel-first", refuse = "channel-first input (features are not the last dim)"),
     TileSpec(
         (
             "Gemma3MultiModalProjector", "Mistral3MultiModalProjector", "AyaVisionMultiModalProjector",
@@ -359,6 +361,15 @@ def _infer_intermediate(module, hidden):
     return v or 4 * (hidden or 1)
 
 
+def _input_width(module):
+    """in_features of the first linear in the subtree (registration order), or None."""
+    for m in module.modules():
+        v = getattr(m, "in_features", None)
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+    return None
+
+
 def _float_dtype(module):
     counts = {}
     for t in itertools.chain(module.parameters(), module.buffers()):
@@ -533,6 +544,7 @@ class _TileState:
         self.nbytes = nbytes
         self.budget_gb = budget_gb
         self.tile_rows = _tile_rows(plan, hidden, intermediate, nbytes, budget_gb) if hidden else None
+        self.in_width = None  # in_features of the first linear: the input's last dim must match it
         self.model_stats = None  # (parameter bytes, tiled layers) from install(), for the auto estimator
 
 
@@ -614,6 +626,10 @@ def _tiled_forward(self, *args, **kwargs):
         return inner(*args, **kwargs)
     x = args[0]
     lead = x.shape[:-1]
+    if state.in_width is not None and x.shape[-1] != state.in_width:
+        # Features are not the last dim (a channel-first input the forward flattens and transposes itself): the
+        # rows of x are not tokens, so tiling them would change the output.
+        return inner(*args)
     rows = math.prod(lead)
     tile_rows = state.tile_rows
     if tile_rows is None:
@@ -747,7 +763,8 @@ def _attach(module, spec, plan, budget_cache):
     nbytes = torch.empty((), dtype = dtype).element_size() if dtype is not None else 2
     free_budget = plan.mode == "auto" or (plan.mode == "target" and not plan.target_gb > 0)
     budget = _budget(_device(module), budget_cache) if free_budget else 0.0
-    d["_unsloth_tiling"] = _TileState(spec, plan, hidden, _infer_intermediate(module, hidden), nbytes, budget)
+    state = d["_unsloth_tiling"] = _TileState(spec, plan, hidden, _infer_intermediate(module, hidden), nbytes, budget)
+    state.in_width = _input_width(module)
     _random_verdict(module)  # eager, so a compiled caller can read it
 
 

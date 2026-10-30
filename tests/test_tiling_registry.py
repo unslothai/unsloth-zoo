@@ -1109,3 +1109,34 @@ def test_every_off_spelling_is_off(value):
 @pytest.mark.parametrize("value", [True, 1, "1", "arctic", "auto", "target", "rows:4"])
 def test_on_spellings_are_not_off(value):
     assert not R.is_off(value) and R.parse_mode(value) is not None
+
+
+class _ChannelFirstMLP(torch.nn.Module):
+    """SegformerMLP-style: [B, C, H, W] in, flattened and transposed inside the forward."""
+
+    def __init__(self, c = 8, h = 16):
+        super().__init__()
+        self.proj = torch.nn.Linear(c, h)
+
+    def forward(self, x):
+        return self.proj(x.flatten(2).transpose(1, 2))
+
+
+@needs_registry
+def test_channel_first_mlps_are_not_tiled():
+    # Features are not the last dim, so the rows of x are not tokens: tiling them failed with a row-count mismatch
+    # (or would change the output when the shapes happen to line up).
+    from transformers import SegformerConfig
+    from transformers.models.segformer.modeling_segformer import SegformerMLP
+    seg = SegformerMLP(SegformerConfig(decoder_hidden_size = 16), input_dim = 8)
+    model = torch.nn.Module()
+    model.mlp = seg
+    report = R.install(model, "arctic", verbose = False)
+    assert not report.tiled and "channel-first" in report.skipped[0][2]
+    # The structural check: a forced or unknown channel-first module runs untiled when the last dim is not the
+    # first linear's in_features.
+    m = type("FooMLP", (_ChannelFirstMLP,), {})()
+    x = torch.randn(2, 8, 16, 16)
+    want = m(x)
+    R.install_module(m, "rows:4")
+    torch.testing.assert_close(m(x), want)
