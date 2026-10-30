@@ -127,3 +127,20 @@ def test_mm_into_overlapping_threads_cuda(dtype, monkeypatch):
                                        atol = 1e-2 if dtype == torch.bfloat16 else 1e-3)
     finally:
         setattr(FLAGS, name, old)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_caller_split_k_setting_survives(dtype):
+    name = "allow_bf16_reduced_precision_reduction" if dtype == torch.bfloat16 else "allow_fp16_reduced_precision_reduction"
+    if not hasattr(FLAGS, name + "_split_k"):
+        pytest.skip("torch has no split-K reduction setting")
+    old = (getattr(FLAGS, name), getattr(FLAGS, name + "_split_k"))
+    try:
+        setattr(FLAGS, name, (False, False))
+        with fl._full_precision_reduction(dtype):
+            inside = (getattr(FLAGS, name), getattr(FLAGS, name + "_split_k"))
+        after = (getattr(FLAGS, name), getattr(FLAGS, name + "_split_k"))
+    finally:
+        setattr(FLAGS, name, old)
+    assert inside == (False, False)
+    assert after == (False, False)

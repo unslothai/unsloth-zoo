@@ -1512,7 +1512,11 @@ class _full_precision_reduction:
             users = _FULL_REDUCTION_USERS.setdefault(self.name, [0, None])
             if users[0] == 0:
                 users[1] = getattr(flags, self.name)
-                setattr(flags, self.name, False)
+                split_k = getattr(flags, self.name + "_split_k", None)
+                # Assigning a bool also turns split-K on, so keep the caller's split-K setting with a tuple.
+                if split_k is not None:
+                    users[1] = (users[1], split_k)
+                setattr(flags, self.name, False if split_k is None else (False, split_k))
             users[0] += 1
         return self
 
