@@ -112,8 +112,7 @@ def test_eager_keeps_small_entries_of_a_scaled_row(capturing):
 
 
 def test_capturing_queries_the_operand_device(monkeypatch):
-    # A stream capturing on cuda:1 while cuda:0 is current: the check must ask on cuda:1, else the eager branch
-    # reads a host flag mid capture and invalidates it. Device state is simulated, so this runs on CPU.
+    # Capture on cuda:1 while cuda:0 is current must be detected (simulated devices, runs on CPU).
     import contextlib
     from types import SimpleNamespace
     state = {"device": 0}
