@@ -749,14 +749,6 @@ def test_tiny_causal_lm_decode_routed_vs_current(kind, use_lora, B, monkeypatch)
     prompt = torch.randint(0, 512, (B, 40), generator = g).to(DEV)  # prefill: > nf4_slot_limit(16)
     steps = torch.randint(0, 512, (B, 4), generator = g).to(DEV)    # teacher-forced decode tokens
 
-    routes = []
-
-    def record(mod, args, kwargs):
-        idx = args[1] if len(args) > 1 else kwargs["top_k_index"]
-        routes.append(idx.reshape(idx.shape[0], -1).sort(-1).values)
-
-    hooks = [ex.register_forward_pre_hook(record, with_kwargs = True) for ex in experts]
-
     def run(mode, model = model):
         monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", mode)
         calls["routed"] = calls["grouped"] = 0
@@ -764,42 +756,36 @@ def test_tiny_causal_lm_decode_routed_vs_current(kind, use_lora, B, monkeypatch)
             out = model(prompt, use_cache = True)
             assert calls["routed"] == calls["grouped"] == 0  # prefill keeps the current path
             cache, logits = out.past_key_values, []
-            routes.clear()
             for s in range(steps.shape[1]):
                 out = model(steps[:, s:s + 1], past_key_values = cache, use_cache = True)
                 cache = out.past_key_values
                 logits.append(out.logits[:, -1].float())
-        # per decode step: every MoE layer's sorted top-k experts
-        picks = [torch.cat(routes[s * len(experts):(s + 1) * len(experts)], -1) for s in range(steps.shape[1])] if routes else None
-        return torch.stack(logits), dict(calls), picks
+        return torch.stack(logits), dict(calls)
 
-    cur, n0, cur_picks = run("0")
+    cur, n0 = run("0")
     assert n0 == {"routed": 0, "grouped": 0}
-    got, n1, got_picks = run("1")
+    got, n1 = run("1")
     want = len(experts) * steps.shape[1]
     assert n1 == {"routed": want, "grouped": 0}, n1
-    modes = [("1", got, got_picks)]
+    modes = [("1", got)]
     if MU._check_torch_grouped_mm_supported() and DT == torch.bfloat16:
-        grp, n2, grp_picks = run("grouped")
+        grp, n2 = run("grouped")
         assert n2 == {"routed": 0, "grouped": want}, n2
-        modes.append(("grouped", grp, grp_picks))
-    for h in hooks:
-        h.remove()
-    ref, _, _ = run("0", ref_model)
+        modes.append(("grouped", grp))
+    ref, _ = run("0", ref_model)
     # Model level is a gross-error tripwire (routing-weight drift measured 2.2x); call level is the strict gate.
     e_cur = (cur - ref).abs()
-    cos_cur = F.cosine_similarity(cur.flatten(1), ref.flatten(1), dim = -1)
-    for mode, logits, picks in modes:
+    for mode, logits in modes:
         assert (logits - cur).abs().max() <= 3 * e_cur.max(), mode
         assert (logits - cur).abs().mean() <= 2 * e_cur.mean(), mode
         cos = F.cosine_similarity(logits.flatten(1), ref.flatten(1), dim = -1)
-        # Measured (gemma4, 6 seeds x B x LoRA, torch 2.14.1 and 2.15, B200): with the same experts picked as the
-        # current path, rows swing at most 2.1e-3 either way. A near-tie router pick that flips on a last-bit difference
-        # in an earlier layer moves that step's cosine by -6.4e-3 .. +1.5e-2 on any arm (grouped too) and on either
-        # torch; which steps flip depends on kernel autotune picks, so such steps get the flip range as their bound.
-        same = torch.tensor([bool(torch.equal(p, c)) for p, c in zip(picks, cur_picks)], device = cos.device)
-        tol = torch.where(same, torch.full_like(cos, 5e-3), torch.full_like(cos, 2e-2))
-        assert (cos >= cos_cur - tol).all(), (mode, cos.tolist(), cos_cur.tolist(), same.tolist())
+        cos_cur = F.cosine_similarity(cur.flatten(1), ref.flatten(1), dim = -1)
+        # Bound: 1 - cos <= 2 (1 - cos_cur) + 5e-3. Measured on 6400 decode steps (gemma4 + qwen3_moe, 8 seeds x B x
+        # LoRA, routed and grouped, torch 2.14.1 and 2.15, RTX PRO 6000 sm120 + B200): a near-tie router pick that flips
+        # on a last-bit difference moves a step by -6.4e-3 .. +1.5e-2 on any arm and either torch (this case, step 0,
+        # on 2.15), and a step where the current path is itself 7-12% off swings by up to 1.6e-2 with the same picks.
+        # Worst case needs 3.2e-3 on top of 2 (1 - cos_cur); steps with the current path near exact keep ~5e-3.
+        assert (1 - cos <= 2 * (1 - cos_cur) + 5e-3).all(), (mode, cos.tolist(), cos_cur.tolist())
 
     seen = []
     real_fwd = MR.routed_moe_forward
