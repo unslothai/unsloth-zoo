@@ -33,7 +33,9 @@ __all__ = [
 ]
 
 import os
+import re
 import sys
+import warnings
 import functools
 import inspect
 import threading
@@ -407,6 +409,20 @@ def _blackwell_import_device(torch_mod):
     return None
 
 
+# Triton 3.9 warns once per process when a launch leaves enable_fp_fusion unset, which every vendored
+# fla launch does (upstream code). Fusion stays on in 3.9 either way. Ignore only that message, not the
+# process-wide TRITON_DEFAULT_FP_FUSION, which would also pin fusion for the user's own kernels on 3.10.
+_TRITON_FP_FUSION_DEFAULT_MESSAGE = re.escape(
+    "TRITON_DEFAULT_FP_FUSION is unset: defaulting to FP fusion ENABLED"
+)
+
+
+def _ignore_triton_fp_fusion_default_warning():
+    warnings.filterwarnings(
+        "ignore", message = _TRITON_FP_FUSION_DEFAULT_MESSAGE, category = UserWarning,
+    )
+
+
 def _inject_vendored_fla():
     """Register the vendored tree as ``fla``. Returns ``(injected, replaced_real)``;
     ``replaced_real`` means a real fla was purged."""
@@ -486,6 +502,7 @@ def _inject_vendored_fla():
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: failed injecting vendored fla ({e}); keeping pure-torch path.")
         return False, False
+    _ignore_triton_fp_fusion_default_warning()
     return True, replaced_real
 
 
