@@ -266,3 +266,31 @@ def test_early_stopped_recompute_clears_old_forwards(replay, backend, use_reentr
         assert replay._STATE.recomputed and len(replay._STATE.pending) == 2, step
         for x, w in zip(xs, want):
             torch.testing.assert_close(x.grad, w)
+
+
+@pytest.mark.parametrize("dynamic", [None, True])
+def test_token_count_is_not_specialised(replay, dynamic):
+    # GRPO batches change length every step: the signature's chunk loop must not guard on the
+    # token count, else every new length recompiles until the fullgraph recompile limit.
+    def run(fn):
+        grads, graphs = [], []
+        for rows in [4, 8, 17, 33, 65, 129, 257, 513, 1025, 8]:
+            x = torch.randn(rows, 8, generator = torch.Generator().manual_seed(rows)).requires_grad_()
+            forced = [[r % 8, (r + 3) % 8] for r in range(rows)]
+            out, ids = _forward(replay, fn, x, forced)
+            assert ids.sort(-1).values.tolist() == [sorted(f) for f in forced]
+            replay._STATE.current = None
+            (out * torch.arange(1.0, 9.0)).sum().backward()
+            grads.append(x.grad)
+            graphs.append(dynamo_utils.counters["stats"]["unique_graphs"])
+        return grads, graphs
+
+    reference, _ = run(_layer(replay))
+    replay.reset_routing_replay()
+    torch._dynamo.reset()
+    dynamo_utils.counters.clear()
+    layer = _layer(replay)
+    grads, graphs = run(torch.compile(lambda x: layer(x), backend = "aot_eager", fullgraph = True, dynamic = dynamic))
+    assert graphs[2:] == [graphs[2]] * (len(graphs) - 2), graphs
+    for got, want in zip(grads, reference):
+        torch.testing.assert_close(got, want, rtol = 0, atol = 0)
