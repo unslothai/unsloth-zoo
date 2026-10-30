@@ -345,3 +345,77 @@ def test_float16_bias_master_merged_then_cast(target):
     merged = _float16_bias_model("all").merge_and_unload().to(target)
     with torch.no_grad():
         assert merged(input_ids=torch.randint(0, 64, (1, 4))).logits.dtype == target
+
+
+def test_float16_bias_master_runs_under_accelerate_cpu_offload():
+    """Accelerate's offload hook materializes params inside forward, after forward pre-hooks: the cast must be
+    applied at read time, and _parameters must keep a Parameter for set_module_tensor_to_device to rebuild."""
+    pytest.importorskip("peft")
+    accelerate = pytest.importorskip("accelerate")
+    model = _float16_bias_model("all").eval()
+    input_ids = torch.randint(0, 64, (1, 5))
+    with torch.no_grad():
+        expected = model(input_ids=input_ids).logits
+    accelerate.cpu_offload(model, execution_device=torch.device("cpu"))
+    with torch.no_grad():
+        out = model(input_ids=input_ids).logits
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out, expected)
+
+
+def _replicate_on_cpu(module):
+    """torch.nn.parallel.replicate without CUDA: _replicate_for_data_parallel, then the replicated params set as
+    plain (non-leaf) attributes with _parameters left empty, as DataParallel does."""
+    replica = module._replicate_for_data_parallel()
+    replica._former_parameters = {}
+    for key, child in module._modules.items():
+        setattr(replica, key, None if child is None else _replicate_on_cpu(child))
+    for key, param in module._parameters.items():
+        if param is None:
+            replica._parameters[key] = None
+        else:
+            copy = param.view_as(param)
+            setattr(replica, key, copy)
+            replica._former_parameters[key] = copy
+    return replica
+
+
+def test_float16_bias_master_runs_on_data_parallel_replicas():
+    """DataParallel replicas hold the replicated bias as a plain attribute: the replica's forward must still see
+    it in float16, and the gradient must reach the float32 master."""
+    pytest.importorskip("peft")
+    model = _float16_bias_model("all")
+    input_ids = torch.randint(0, 64, (1, 5))
+    with torch.no_grad():
+        expected = model(input_ids=input_ids).logits
+    out = _replicate_on_cpu(model)(input_ids=input_ids).logits
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out, expected)
+    out.float().sum().backward()
+    masters = _trainable_biases(model)
+    assert all(p.grad is not None and p.grad.dtype == torch.float32 for p in masters.values())
+
+
+def test_float16_bias_master_keeps_state_dict_and_pickles():
+    """state_dict keys and dtypes are unchanged, `.bias` outside forward is the float32 Parameter, and the model
+    survives deepcopy and a torch.save / torch.load round trip."""
+    pytest.importorskip("peft")
+    import copy
+    import io
+
+    plain = _lora(_tiny_llama(dtype=torch.float16), bias="all")
+    model = _float16_bias_model("all")
+    assert list(model.state_dict()) == list(plain.state_dict())
+    q_proj = model.base_model.model.model.layers[0].self_attn.q_proj.base_layer
+    assert type(q_proj).__name__ == "Linear" and isinstance(q_proj, torch.nn.Linear)
+    assert q_proj.bias is q_proj._parameters["bias"] and q_proj.bias.dtype == torch.float32
+    assert {model.state_dict()[n].dtype for n in _trainable_biases(model)} == {torch.float32}
+    input_ids = torch.randint(0, 64, (1, 5))
+    with torch.no_grad():
+        expected = model(input_ids=input_ids).logits
+    buffer = io.BytesIO()
+    torch.save(model, buffer)
+    buffer.seek(0)
+    for clone in (copy.deepcopy(model), torch.load(buffer, weights_only=False)):
+        with torch.no_grad():
+            torch.testing.assert_close(clone(input_ids=input_ids).logits, expected)
