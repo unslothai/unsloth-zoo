@@ -1397,7 +1397,13 @@ _FIXED_ROWS = os.environ.get("UNSLOTH_FUSED_LINEAR_FIXED_ROWS", "0") == "1"
 
 
 def _fixed_rows(device):
-    return _FIXED_ROWS or (device.type == "cuda" and torch.cuda.is_current_stream_capturing())
+    if _FIXED_ROWS or device.type != "cuda":
+        return _FIXED_ROWS
+    # is_current_stream_capturing reads the current device's stream: ask on the operand's device.
+    if device.index is None or device.index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    with torch.cuda.device(device.index):
+        return torch.cuda.is_current_stream_capturing()
 
 
 def _keep_index(targets, mask, vocab_size, ignore_index, fixed_ok = False):

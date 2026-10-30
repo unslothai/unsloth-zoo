@@ -153,3 +153,27 @@ def test_fixed_rows_never_sync_the_host(monkeypatch):
         torch.autograd.grad(lp.sum() + e.sum(), [h, w])
     finally:
         torch.cuda.set_sync_debug_mode(0)
+
+
+def test_fixed_rows_asks_the_operand_device_if_it_is_capturing(monkeypatch):
+    # is_current_stream_capturing reads the current device: an operand on cuda:1 being captured while cuda:0 is
+    # current must still take the fixed rows (compaction's nonzero would invalidate the capture).
+    import contextlib
+    state = {"current": 0}
+
+    @contextlib.contextmanager
+    def device(index):
+        old, state["current"] = state["current"], index
+        try:
+            yield
+        finally:
+            state["current"] = old
+
+    monkeypatch.setattr(fl, "_FIXED_ROWS", False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: state["current"])
+    monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: state["current"] == 1)
+    assert fl._fixed_rows(torch.device("cuda", 1))
+    assert not fl._fixed_rows(torch.device("cuda", 0))
+    assert not fl._fixed_rows(torch.device("cpu"))
+    assert state["current"] == 0
