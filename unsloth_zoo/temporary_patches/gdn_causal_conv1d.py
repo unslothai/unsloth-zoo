@@ -168,8 +168,7 @@ def _build_kernels():
         HAS_BIAS: tl.constexpr,
         HAS_SEQ_IDX: tl.constexpr,
     ):
-        # Pass 1: g = d(loss)/d(pre-activation) through SiLU, once per position (the pre-activation
-        # is recomputed exactly as the forward does), stored channel-last in the input dtype.
+        # Pass 1: SiLU grad g per position (pre-act recomputed), stored channel-last in input dtype.
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
         o_d = i_d * BD + tl.arange(0, BD)
@@ -219,8 +218,7 @@ def _build_kernels():
         HAS_SEQ_IDX: tl.constexpr,
         PAD_NEG: tl.constexpr,
     ):
-        # Pass 2: dx[s] = sum_k w[W - 1 - k] g[s + k]; per-tile dw[j] = sum_t g[t] x[t - (W - 1) + j]
-        # and db = sum_t g[t]; taps never cross a seq_idx boundary.
+        # Pass 2: dx, per-tile dw and db from g; taps never cross a seq_idx boundary.
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
         o_d = i_d * BD + tl.arange(0, BD)
@@ -275,8 +273,7 @@ def _build_kernels():
     return _kernels
 
 
-# (BT, BD, num_warps). The backward is two forward-sized passes (g, then dx / dw / db): one
-# W-tap recompute per position instead of W per tap, 2.3-3.3x faster than the single-pass kernel on a T4.
+# (BT, BD, num_warps); backward is two forward-sized passes with one W-tap recompute per position.
 _FWD_CONFIG = (32, 64, 2)
 _BWD_CONFIG = (32, 64, 2)
 # CUDA caps grid dims 1 and 2 at 65535: T tiles ride dim 1, batch rides dim 2.
@@ -334,12 +331,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
     return dx, dw, db
 
 
-# Training and prefill call the conv once per layer per step with the same shapes, so the Triton
-# launch (specialization + argument binding, ~20-30 us of host time) is cached per shape like the
-# decode update below: key -> (grid, compiled kernel). Same gates: Triton 3.6+ launcher convention,
-# a bitwise self-check per kernel on first use, full launches under profiler hooks, for unaligned
-# pointers (Triton specializes on 16-byte alignment) and off the current device.
-# T is in the key: cap it (FIFO) so variable lengths do not grow it unbounded.
+# Triton 3.6+ cached launches, FIFO-capped: bitwise self-check; unaligned/off-device/profiled go full
 _conv_plans = {}
 _CONV_PLANS_MAX = 256
 _conv_fast_ok = {}
@@ -363,8 +355,7 @@ def _conv_fast_launch(plan, ptrs, ints, consts):
 
 
 def _conv_launch(name, kernel, grid, ptrs, ints, consts, num_warps, outs):
-    """One conv kernel launch, through the cached launcher when it is safe. `outs` are the tensors
-    the kernel writes (and only writes), compared bitwise on the first cached launch."""
+    """Launch conv via cached launcher when safe; write-only outs are bitwise-checked on first launch."""
     aligned = not (functools.reduce(lambda acc, t: acc | t.data_ptr(), ptrs, 0) & 15)
     key = (name, grid, ints, consts, tuple(t.dtype for t in ptrs), ptrs[0].get_device())
     plan = _conv_plans.get(key) if aligned else None
@@ -381,8 +372,7 @@ def _conv_launch(name, kernel, grid, ptrs, ints, consts, num_warps, outs):
     if name not in _conv_fast_ok:
         _conv_full_launch(kernel, grid, ptrs, ints, consts, num_warps)
         if torch.cuda.is_current_stream_capturing():
-            # The self-check reads its verdict back on the host, which invalidates a CUDA graph
-            # capture: keep the full launch and leave the check to the next eager call.
+            # Self-check syncs to host, invalidating CUDA graph capture; defer it to the next eager call.
             return
         refs = [t.clone() for t in outs]
         try:
@@ -441,8 +431,7 @@ def _build_update_kernel():
         HAS_BIAS: tl.constexpr,
         ACTIVATION: tl.constexpr,
     ):
-        # Taps index c = [state (L) | x (T)]: output t sees c[L + t - (W - 1) + i_w], the new
-        # state is c[T:T + L]. Same as the torch path's cat + copy_ + conv1d(padding = 0).
+        # Taps index c=[state|x]: out t reads c[L+t-(W-1)+i_w], new state c[T:T+L]; same as torch path.
         i_d, i_b = tl.program_id(0), tl.program_id(1)
         o_d = i_d * BD + tl.arange(0, BD)
         m_d = o_d < D
@@ -514,8 +503,7 @@ def _hook_active(hook):
 
 
 def triton_causal_conv1d_update(x, conv_state, weight, bias = None, activation = None):
-    """x (B, D, T), conv_state (B, D, L) updated in place, weight (D, W) -> (B, D, T) in x's layout.
-    Always the full Triton launch (specialization + argument binding); the decode path caches it."""
+    """x (B,D,T), conv_state (B,D,L) in place, weight (D,W) -> (B,D,T) in x's layout; uncached launch."""
     return _launch_update(x, conv_state, weight, bias, activation)[0]
 
 
@@ -539,8 +527,7 @@ def _launch_update(x, conv_state, weight, bias, activation, y = None):
     return y, (grid, compiled, ints, ints + tail)
 
 
-# key -> (grid, compiled kernel, runtime ints, runtime ints + constexprs) for repeated decode
-# steps; None = ineligible. Batch size and length are in the key: capped (FIFO) like _conv_plans.
+# Decode plan cache: key -> (grid, kernel, ints, constexprs), None = ineligible; FIFO-capped.
 _update_plans = {}
 _UPDATE_PLANS_MAX = 256
 
@@ -549,14 +536,12 @@ def _remember_update_plan(key, plan):
     if key not in _update_plans and len(_update_plans) >= _UPDATE_PLANS_MAX:
         _update_plans.pop(next(iter(_update_plans)), None)
     _update_plans[key] = plan
-# Which argument list the cached launcher takes on this Triton: None = not checked yet,
-# "all" (every parameter, Triton 3.6+), False = full launches only.
+# Launcher arg list on this Triton: None unchecked, 'all' (every param, 3.6+), False = full only.
 _fast_launch_mode = None
 
 
 def _update_key(x, conv_state, weight, bias, activation):
-    # Everything the eligibility check and Triton's specialization read: shapes, strides, dtypes,
-    # devices and the integer values (==1, %16). Pointer alignment is checked by the caller.
+    # Key: shapes, strides, dtypes, devices, int values (==1, %16); caller checks pointer alignment.
     return (
         x.shape, x.stride(), x.dtype, x.get_device(),
         conv_state.shape, conv_state.stride(), conv_state.dtype, conv_state.get_device(),
@@ -609,12 +594,10 @@ def _triton_launcher_verified():
 
 
 def _check_fast_launch(plan, x, conv_state, weight, bias, activation):
-    """Once per process: launch through the cached launcher and compare with a full launch on
-    copies; pick the argument convention this Triton takes, or keep full launches."""
+    """Once per process: pick cached launcher's arg convention by checking copies; else keep full launches"""
     global _fast_launch_mode
     if not _triton_launcher_verified():
-        # A wrong argument list can fault on the device instead of raising, which no fallback
-        # survives, so only the launcher convention checked on real hardware is tried.
+        # Wrong arg list may fault the device (unrecoverable); only hardware-verified conventions tried
         _fast_launch_mode = False
         return _launch_update(x, conv_state, weight, bias, activation)[0]
     if torch.cuda.is_current_stream_capturing():
@@ -639,8 +622,7 @@ def _check_fast_launch(plan, x, conv_state, weight, bias, activation):
 
 
 def _run_update(x, conv_state, weight, bias, activation):
-    """Triton update for repeated decode steps: one dict lookup on the cached plan, then a direct
-    launcher call (no re-specialization or argument binding). None = use the torch fallback."""
+    """Decode-step update via cached plan: dict lookup, direct launcher call; None = torch fallback."""
     try:
         key = _update_key(x, conv_state, weight, bias, activation)
     except (AttributeError, TypeError):
@@ -798,8 +780,7 @@ def triton_causal_conv1d(x, weight, bias = None, activation = None, seq_idx = No
     """x (B, D, T), weight (D, W), seq_idx (B, T) -> (B, D, T) stored channel-last."""
     if seq_idx is not None:
         seq_idx = _check_seq_idx(x, seq_idx)
-        # Kernels only compare IDs for equality in the loaded dtype: never narrow (0 == 2**32 in
-        # int32); widen the rest (int8/16, uint*) to int64, a bijection for uint64.
+        # IDs compared for equality only: never narrow (0 == 2**32 in int32); widen others to int64.
         if seq_idx.dtype not in (torch.int32, torch.int64):
             seq_idx = seq_idx.to(torch.int64)
         seq_idx = seq_idx.contiguous()
@@ -842,8 +823,7 @@ def _causal_conv1d_any(x, weight, bias = None, activation = None, seq_idx = None
 
 
 def _own_signature(fn):
-    # Else signature follows __wrapped__ (or a __signature__ functools.wraps copied) and the
-    # hub wrapper drops `seq_idx`.
+    # Own signature: else it follows __wrapped__ or copied __signature__, and the hub drops seq_idx.
     fn.__dict__.pop("__signature__", None)
     fn.__signature__ = inspect.signature(fn, follow_wrapped = False)
     return fn
@@ -911,19 +891,14 @@ def _is_gdn_function(torch_function):
 
 
 def _hub_gdn_function(decorator, torch_function):
-    """Hub-decorate the GDN dispatch. transformers >= 5.20 refuses `seq_idx` on its torch path
-    when causal-conv1d is missing, but this dispatch keeps packed rows apart, so packed calls
-    go to it directly; everything else still goes through the hub wrapper."""
+    """transformers 5.20+ rejects seq_idx without causal-conv1d; packed calls bypass the hub wrapper."""
     dispatch = _make_hub_dispatch(torch_function)
     hub_fn = decorator(dispatch)
     # The hub wrapper passes only the implementation's named parameters on.
     names = frozenset(inspect.signature(dispatch).parameters)
 
     if isinstance(hub_fn, torch.nn.Module):
-        # With `kernels` installed the hub decorator turns the function into a layer instance whose
-        # class carries `kernel_layer_name`, which `use_kernelized_func` checks and `kernelize` reads
-        # from `type(fn)`. A plain function wrapper loses both, so route on the instance instead:
-        # the layer stays what transformers registered, and `kernelize` can still swap its forward.
+        # Hub yields a layer (kernel_layer_name on its class): wrap its forward so kernelize can swap it.
         hub_forward = hub_fn.forward
 
         @functools.wraps(hub_forward)
@@ -949,8 +924,7 @@ def _hub_gdn_function(decorator, torch_function):
 
 
 def _hub_gdn_update(decorator, torch_function):
-    """Hub-decorate the GDN update dispatch. With `kernels` installed the result is a layer
-    instance (its class keeps `kernel_layer_name`), which does not inherit the dispatch's mark."""
+    """With kernels installed the hub result is a layer instance that does not inherit the mark."""
     hub_fn = decorator(_make_update_dispatch(torch_function))
     if isinstance(hub_fn, torch.nn.Module):
         setattr(hub_fn, _MARK, True)
@@ -958,8 +932,7 @@ def _hub_gdn_update(decorator, torch_function):
 
 
 def _patch_hub_decorator():
-    """transformers >= 5.15: hook the hub decorator so later-decorated GDN convs
-    (incl. compiled copies) get the Triton dispatch."""
+    """transformers >= 5.15: hook hub decorator so later GDN convs (incl. compiled copies) get Triton."""
     try:
         import transformers.integrations as integrations
         from transformers.integrations import hub_kernels
@@ -1011,8 +984,7 @@ def _rebind_name(module, name, legacy, patched_decorator):
 
 
 def _rebind_module(module, patched_decorator):
-    """Rebind an imported module; True if its conv now dispatches to Triton. Re-decorating
-    also replaces a wrapper that captured a since-disabled package kernel."""
+    """Rebind module's conv to Triton (True if so); re-decorating replaces stale kernel wrappers."""
     names = vars(module)
     if patched_decorator is not None and "use_kernel_func_from_hub_with_fallback" in names:
         module.use_kernel_func_from_hub_with_fallback = patched_decorator
@@ -1046,8 +1018,8 @@ def mamba_causal_conv1d_fwd_function(x, weight, bias, seq_idx, initial_states, f
     w, b = _mamba_conv_operands(x, weight, bias)
     if seq_idx is not None and seq_idx.dtype not in (torch.int32, torch.int64):
         seq_idx = seq_idx.to(torch.int64)
-    # mamba_ssm calls this inside its autograd.Function (grad mode off); a raw launch has no
-    # backward, so anything autograd would track takes the differentiable torch reference.
+    # mamba_ssm calls this inside its autograd.Function (grad mode off); a raw launch has no backward, so tracked inputs
+    # take the differentiable torch reference.
     if _autograd_tracks(x, weight, bias) or not _eligible(x, w, b, activation, seq_idx, mixed_dtypes = True):
         return _causal_conv1d_reference_seq_idx(x, w, b, activation, seq_idx, pad_negative = True)
     GDN_CAUSAL_CONV1D_STATS["mamba_fused_fwd"] += 1

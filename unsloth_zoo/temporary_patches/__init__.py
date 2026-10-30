@@ -68,9 +68,8 @@ from .fp8_uncontained_weights import *
 from .flex_attention_bwd import *
 from .inductor_stride_guard import *
 from .remote_code_vlm import *
-# The eager-fallback recovery hook unsloth calls when a backward dies inside
-# activation checkpointing. Named rather than star-imported: `utils` also
-# exports names this package has never re-exported.
+# Eager-fallback hook unsloth calls when backward dies inside activation checkpointing; imported by name since utils
+# exports names this package never re-exports.
 from .utils import (
     eager_fallback_state,
     force_eager_fallback,
