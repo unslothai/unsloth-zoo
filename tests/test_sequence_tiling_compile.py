@@ -354,8 +354,11 @@ def test_lengths_inside_one_bucket_share_one_graph(dynamic):
     assert len({_bucket(s, TILE_ROWS) for s in seqs}) == 1
     cnt, breaks, _ = _sweep(_mlp_fn(m), params, "aot_eager", dynamic, seqs = seqs)
     assert breaks == 0
-    # dynamic=None compiles static first, then one dynamic graph.
-    assert cnt.inner.frame_count <= (1 if dynamic else 2), cnt.inner.frame_count
+    # dynamic=None compiles static first, then one dynamic graph. torch < 2.7 turns sym_min into a guard on whether
+    # the last tile is full: at most one more graph per bucket (before: one per remainder, up to n_tiles).
+    old_torch = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 7)
+    allowed = (1 if dynamic else 2) + (1 if old_torch else 0)
+    assert cnt.inner.frame_count <= allowed, cnt.inner.frame_count
 
 
 def test_many_tiled_classes_stay_under_the_recompile_limit(monkeypatch):
