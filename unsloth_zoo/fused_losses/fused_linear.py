@@ -1431,7 +1431,8 @@ def _guarded(fn):
             except Exception as e:
                 if type(e).__module__.startswith("torch._dynamo"):
                     raise
-                err = e
+                # Text only: the exception's traceback holds this frame, a cycle that pins its tensors.
+                err = f"{type(e).__name__}: {e}"
         _TRITON_BROKEN.add(device)
         try:
             out = fn(hidden, *args, **kwargs)
@@ -1439,7 +1440,7 @@ def _guarded(fn):
             # Torch fails too: the inputs are at fault.
             _TRITON_BROKEN.discard(device)
             raise
-        warnings.warn(f"Unsloth: fused linear Triton kernel failed on {device} ({type(err).__name__}: {err}); "
+        warnings.warn(f"Unsloth: fused linear Triton kernel failed on {device} ({err}); "
                       f"using the torch path.", stacklevel = 2)
         return out
     return wrapper
@@ -2050,9 +2051,10 @@ def _scale_rows_impl(u, g, dtype, out = None):
             except Exception as e:
                 if type(e).__module__.startswith("torch._dynamo"):
                     raise
-                err = e
+                # Text only: the exception's traceback holds this frame, a cycle that pins its tensors.
+                err = f"{type(e).__name__}: {e}"
         _TRITON_BROKEN.add(u.device)
-        warnings.warn(f"Unsloth: fused linear Triton kernel failed on {u.device} ({type(err).__name__}: {err}); "
+        warnings.warn(f"Unsloth: fused linear Triton kernel failed on {u.device} ({err}); "
                       f"using the torch path.", stacklevel = 2)
     u2, out2 = (u.reshape(-1, 1), out.reshape(-1, 1)) if u.dim() == 1 else (u, out)
     step = 8192
