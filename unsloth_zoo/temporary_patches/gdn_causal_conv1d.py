@@ -118,6 +118,7 @@ def _build_kernels():
         ACTIVATION: tl.constexpr,
         HAS_SEQ_IDX: tl.constexpr,
         PAD_NEG: tl.constexpr,
+        ROUND: tl.constexpr,
     ):
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
@@ -146,9 +147,11 @@ def _build_kernels():
         if HAS_BIAS:
             acc += tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)[None, :]
         if ACTIVATION:
-            # The torch path stores the conv output in the weight's dtype, then SiLU (an fp32
-            # parameter under autocast keeps it fp32: narrowing to x's fp16 overflows to -inf).
-            acc = acc.to(weight.dtype.element_ty).to(tl.float32)
+            # SiLU on the conv output rounded to the wider of x / weight (see _act_dtype).
+            if ROUND == 1:
+                acc = acc.to(weight.dtype.element_ty).to(tl.float32)
+            elif ROUND == 2:
+                acc = acc.to(y.dtype.element_ty).to(tl.float32)
             acc = acc * tl.sigmoid(acc)
         if PAD_NEG:
             # causal_conv1d's rule: padding (seq_idx < 0) outputs 0; it never feeds a real position.
@@ -196,9 +199,9 @@ def _build_kernels():
             dy + tl.cast(i_b, tl.int64) * stride_dy_b + o_t.to(tl.int64)[:, None] * stride_dy_t + o_d64[None, :] * stride_dy_d,
             mask = m, other = 0,
         ).to(tl.float32)
-        pre = acc.to(weight.dtype.element_ty).to(tl.float32)
+        pre = acc.to(g.dtype.element_ty).to(tl.float32)
         sig = tl.sigmoid(pre)
-        # torch's silu_backward stores the gradient in the conv's (the weight's) dtype.
+        # torch's silu_backward stores the gradient in the conv's dtype (g is allocated in it).
         b_g = b_dy * sig * (1 + pre * (1 - sig))
         p_g = g + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
         tl.store(p_g, b_g.to(g.dtype.element_ty), mask = m)
@@ -280,6 +283,12 @@ _BWD_CONFIG = (32, 64, 2)
 _MAX_GRID_YZ = 65535
 
 
+def _act_dtype(x_dtype, w_dtype):
+    # Never narrower than either operand: fp16 weights with fp32 / bf16 x would overflow to -inf
+    # before SiLU (NaN); fp16 with bf16 promotes to fp32, as causal_conv1d's fp32 SiLU does.
+    return torch.promote_types(x_dtype, w_dtype)
+
+
 def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None, pad_negative = False):
     fwd, _ = _build_kernels()
     _BT, _BD, _NUM_WARPS = _FWD_CONFIG
@@ -289,7 +298,13 @@ def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None, pad_negative = 
     grid = ((D + _BD - 1) // _BD, (T + _BT - 1) // _BT, B)
     ptrs = (x_btd, weight, bias if bias is not None else weight, y, seq_idx if seq_idx is not None else weight)
     ints = (T, D, *x_btd.stride())
-    consts = (W, _BT, _BD, bias is not None, activation is not None, seq_idx is not None, pad_negative and seq_idx is not None)
+    act_dtype = _act_dtype(x_btd.dtype, weight.dtype)
+    # 0: fp32, no rounding; 1: the weight's dtype; 2: x's (and y's) dtype.
+    round_to = 1 if act_dtype == weight.dtype else 2 if act_dtype == x_btd.dtype else 0
+    consts = (
+        W, _BT, _BD, bias is not None, activation is not None, seq_idx is not None,
+        pad_negative and seq_idx is not None, round_to,
+    )
     _conv_launch("fwd", fwd, grid, ptrs, ints, consts, _NUM_WARPS, (y,))
     return y
 
@@ -303,7 +318,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
     grid = ((D + _BD - 1) // _BD, NT, B)
     seq_ptr = seq_idx if seq_idx is not None else weight
     if activation is not None:
-        g = torch.empty((B, T, D), dtype = weight.dtype, device = x_btd.device)
+        g = torch.empty((B, T, D), dtype = _act_dtype(x_btd.dtype, weight.dtype), device = x_btd.device)
         _conv_launch(
             "bwd_g", bwd_g, grid,
             (x_btd, weight, bias if bias is not None else weight, dy_btd, g, seq_ptr),
@@ -727,8 +742,9 @@ def causal_conv1d_reference(x, weight, bias = None, activation = None):
     """The transformers torch fallback: x (B, D, T), weight (D, W)."""
     import torch.nn.functional as F
     D, T = x.shape[1], x.shape[2]
+    dtype = _act_dtype(x.dtype, weight.dtype)
     out = F.conv1d(
-        x.to(weight.dtype), weight.unsqueeze(1), bias,
+        x.to(dtype), weight.to(dtype).unsqueeze(1), None if bias is None else bias.to(dtype),
         padding = weight.shape[-1] - 1, groups = D,
     )[:, :, :T]
     if activation is not None:
@@ -864,7 +880,7 @@ def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx, pad_n
         out = out + xp[:, :, j:j + T] * w[:, j].view(1, -1, 1) * same
     if bias is not None:
         out = out + bias.to(acc).view(1, -1, 1)
-    out = out.to(weight.dtype)
+    out = out.to(_act_dtype(x.dtype, weight.dtype))
     if activation is not None:
         out = _act(activation)(out)
     if pad_negative:
