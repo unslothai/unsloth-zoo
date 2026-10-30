@@ -14,21 +14,18 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Weights served from the checkpoint's safetensors on disk instead of from memory.
+"""Serves per-layer embedding tables and quantized MoE experts from checkpoint safetensors on disk; offload_ple replaces
+tables before the load evaluates anything; offloaded bytes never loaded, converted or written; plan_offload prices
+splits from safetensors headers first."""
 
-Per-layer embedding (PLE) tables -- Qwen4-Exp's 128-shard n-gram table, Gemma's per-layer token
-embeddings -- are large, and a call reads a few of their rows. ``offload_ple`` replaces them,
-before the load evaluates anything, with tables that read the rows a call asks for straight from
-the shards. ``offload_experts`` does the same for the routed experts of quantized MoE layers, read
-into a fixed number of slots as calls route to them. The offloaded bytes are never loaded, and
-nothing is converted or written to disk. ``plan_offload`` decides how much of each to offload for a
-load, priced from the safetensors headers before anything is built.
-"""
-
+import contextlib
 import copy
+import ctypes
 import glob
+import inspect
 import json
 import math
+import mmap
 import os
 import re
 import struct
@@ -90,8 +87,7 @@ def _read_all(fd, view, offset):
 
 
 def read_ranges(jobs):
-    """Fill each ``(fd, offset, writable memoryview)``. Positional reads release the GIL, so a batch
-    spread over the pool runs at the storage's queue depth instead of one read at a time."""
+    """Fill each (fd, offset, writable memoryview) job; positional reads release the GIL, so a batch spread over the pool runs at the storage's queue depth."""
 
     def run(part):
         for fd, offset, view in part:
@@ -140,9 +136,8 @@ class CheckpointTensors:
 
 
 def offload_setting(value):
-    """``from_pretrained``'s ``offload``: a callable, kept as given, or ``{"ple": knob, "experts": knob}``,
-    each ``None`` (off), ``"auto"`` or the fraction to offload in (0, 1]. One knob sets both; a dict
-    sets each, a missing part off."""
+    """from_pretrained's offload: a callable kept as given, or a dict {'ple': knob, 'experts': knob} where each knob is
+    None, 'auto' or a fraction in (0, 1]; one knob sets both, a missing key is off."""
     if callable(value):
         return value
     if isinstance(value, dict):
@@ -172,8 +167,7 @@ def _knob(name, value):
 
 
 class _Field:
-    """One checkpoint tensor, read by its leading index (a table row or an expert); or, for experts a
-    checkpoint stores apart, one tensor per expert."""
+    """One checkpoint tensor read by its leading index (a table row or an expert), or one tensor per expert for experts the checkpoint stores apart."""
 
     __slots__ = ("name", "fd", "offset", "row_bytes", "transport", "dtype", "shape", "cast", "map", "apart")
 
@@ -204,11 +198,38 @@ class _Field:
         return array if self.cast is None else array.astype(self.cast)
 
 
+_mincore = None
+# Seen rows of a lookup checked one at a time before checking all of them.
+_RESIDENCY_SAMPLE = 16
+
+
+def _in_core(mapped, rows, row_bytes):
+    """Whether each of ``rows`` of ``mapped`` is in the page cache (all ``True`` without ``mincore``)."""
+    global _mincore
+    if _mincore is None:
+        try:
+            libc = ctypes.CDLL(None, use_errno = True)
+            libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+            _mincore = libc.mincore
+        except (OSError, AttributeError):
+            _mincore = False
+    if not _mincore or not rows.size:
+        return np.ones(rows.size, dtype = bool)
+    start = mapped.ctypes.data + rows * row_bytes
+    end = start + row_bytes - 1
+    first = int(start.min()) // mmap.PAGESIZE * mmap.PAGESIZE
+    pages = np.empty((int(end.max()) - first) // mmap.PAGESIZE + 1, dtype = np.uint8)
+    if _mincore(first, pages.size * mmap.PAGESIZE, pages.ctypes.data) != 0:
+        return np.ones(rows.size, dtype = bool)
+    resident = np.concatenate([[0], np.cumsum(pages & 1)])
+    low, high = (start - first) // mmap.PAGESIZE, (end - first) // mmap.PAGESIZE
+    return resident[high + 1] - resident[low] == high - low + 1
+
+
 class _RowTable:
-    """A ``[rows, ...]`` tensor and its quantization siblings, read by row. The first ``resident``
-    rows are read once at load and held in memory. A row's first lookup reads it with ``pread``,
-    concurrently with the call's other new rows; later lookups gather it from the page cache
-    through a read-only map, which costs no system call per row."""
+    """A [rows, ...] tensor and its quantization siblings, read by row: the first `resident` rows are held in memory, a
+    row's first lookup uses pread, and later lookups gather from the page cache via a read-only map with no syscall
+    per row."""
 
     def __init__(self, store, names, resident, casts):
         self.store = store  # owns the file descriptors
@@ -237,9 +258,19 @@ class _RowTable:
         return rows * sum(field.row_bytes for field in self.fields)
 
     def fill(self, local, buffers, at, jobs):
-        """Put rows ``local`` (unique, all past the held prefix) into ``buffers`` at ``at``: rows
-        read before are copied now, new ones queued on ``jobs``. Returns the new rows."""
+        """Puts rows local (unique, past the held prefix) into buffers at at: rows read earlier and still in the page
+        cache are copied now; the rest are queued on jobs and returned."""
         seen = (self.seen[local >> 3] >> (local & 7).astype(np.uint8)) & 1 == 1
+        if seen.any():
+            # Through the map an evicted row is a page fault taken with the GIL held; a check walks every page its rows
+            # span, so a spread sample is checked row by row before all rows are.
+            rows = local[seen]
+            sample = rows[np.linspace(0, rows.size - 1, min(rows.size, _RESIDENCY_SAMPLE)).astype(np.int64)]
+            if not all(_in_core(field.map, sample[i:i + 1], field.row_bytes)[0] for field in self.fields for i in range(sample.size)):
+                kept = np.ones(rows.size, dtype = bool)
+                for field in self.fields:
+                    kept &= _in_core(field.map, rows, field.row_bytes)
+                seen[np.flatnonzero(seen)[~kept]] = False
         new, new_at = local[~seen], at[~seen].tolist()
         for field, buffer in zip(self.fields, buffers):
             if seen.any():
@@ -261,9 +292,8 @@ def _by_shard(shard):
 
 
 class DiskEmbedding(nn.Module):
-    """Stands in for an ``nn.Embedding`` / ``nn.QuantizedEmbedding`` (one table) or a row-sharded
-    embedding (its shards in row order) whose rows stay on disk. Each looked-up row goes through the
-    same ``dequantize`` as the module it replaces, so the output is that module's, bit for bit."""
+    """Stands in for nn.Embedding or nn.QuantizedEmbedding (or a row-sharded one) with rows left on disk; each row goes
+    through the same dequantize, so output matches the module bit for bit."""
 
     def __init__(self, tables, quantization, dims, normalize_zero):
         super().__init__()
@@ -284,8 +314,7 @@ class DiskEmbedding(nn.Module):
         if unique.size != ids.size or not np.array_equal(unique, ids):
             values = values[mx.array(inverse.reshape(-1).astype(np.int32))]
         if self.normalize_zero:
-            # The stock sharded embedding scatter-adds each shard's rows into zeros, which turns
-            # -0.0 into +0.0; adding zeros reproduces that bit for bit.
+            # The stock sharded embedding scatter-adds rows into zeros, turning -0.0 into +0.0; adding zeros reproduces that bit for bit.
             values = mx.zeros(values.shape, dtype = values.dtype) + values
         return values.reshape(*x.shape, self.dims)
 
@@ -337,8 +366,7 @@ class DiskEmbedding(nn.Module):
         )
 
 
-# (attribute name, module types): Gemma 3n / Gemma 4 per-layer token embeddings, and
-# Qwen4-Exp's row-sharded n-gram table.
+# (attribute name, module types) of PLE sites: Gemma 3n / Gemma 4 per-layer token embeddings, and Qwen4-Exp's row-sharded n-gram table.
 _PLE_SITES = (
     ("embed_tokens_per_layer", ("Embedding", "QuantizedEmbedding")),
     ("ngram_embedding", ("ShardedEmbedding",)),
@@ -354,8 +382,7 @@ def ple_sites(model):
 
 
 def _checkpoint_name(store, name):
-    """The checkpoint's name for a parameter: its MLX name, the Hugging Face layout of it, or, for a
-    text checkpoint mlx-vlm wraps as its language model, the text layout."""
+    """Checkpoint name for a parameter: its MLX name, the Hugging Face layout (text layout for a text checkpoint mlx-vlm wraps), or an `experts.` stack (omlx)."""
     if name in store.specs:
         return name
     prefix = "language_model.model."
@@ -363,6 +390,12 @@ def _checkpoint_name(store, name):
         for alternate in ("model.language_model.", "model."):
             if alternate + name[len(prefix):] in store.specs:
                 return alternate + name[len(prefix):]
+    stacked = re.search(r"\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(\w+)$", name)
+    if stacked is not None:
+        for projection in (stacked[1], _REFERENCE_NAMES[stacked[1]]):
+            alternate = f"{name[:stacked.start()]}.experts.{projection}.{stacked[2]}"
+            if alternate in store.specs:
+                return alternate
     return None
 
 
@@ -433,11 +466,9 @@ def _ple_parts(store, path, module, cast_for):
 
 
 def offload_ple(model, model_dir, fraction, *, cast_dtype = None):
-    """Replace every PLE table of ``model`` with one read from ``model_dir``'s shards, keeping the
-    first ``1 - fraction`` of each table's rows in memory. Must run before anything evaluates the
-    tables. ``cast_dtype`` is the float dtype the load casts parameters to; offloaded float tensors
-    get the cast they would have had as parameters.
-    Returns ``{"tables", "on_disk_bytes", "resident_bytes", "skipped": [(path, reason)]}``."""
+    """Replace every PLE table of model with one read from model_dir's shards, keeping the first 1-fraction of rows
+    resident; must run before anything evaluates them; cast_dtype is the load's float cast, applied to offloaded
+    float tensors too; returns {tables, on_disk_bytes, resident_bytes, skipped}."""
     cast_for = _cast_rule(model, cast_dtype)
     store = CheckpointTensors(model_dir)
     report = {"tables": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}
@@ -469,9 +500,9 @@ def _replace_module(model, path, replacement):
     setattr(parent, keys[-1], replacement)
 
 
-# Routed experts. The slot cache follows oMLX's MoE expert offload (Apache-2.0,
-# omlx/patches/moe_expert_offload.py): contiguous per-layer slot arrays, decayed-frequency
-# eviction, the call's own experts never evicted, and over-capacity calls run expert by expert.
+# Routed experts: the slot cache follows oMLX's MoE expert offload (Apache-2.0, omlx/patches/moe_expert_offload.py) with
+# per-layer slot arrays, decayed-frequency eviction that never evicts the call's own experts, and expert-by-expert runs
+# over capacity.
 
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 # DeepSeek's reference names for them, which DeepSeek V4.1 checkpoints keep.
@@ -481,7 +512,75 @@ _SWITCH_GLUS = ("SwitchGLU", "DeepseekV41SwitchGLU")
 _EXPERT_FIELDS = ("weight", "scales", "biases", "bias")
 # The stock SwitchGLU sorts a call's routes from this many on.
 _SORT_ROUTES = 64
+# Largest single read when a full table reads runs of adjacent experts.
+_RUN_BYTES = 8 << 20
+# The prefill step a wide decoder layer call runs in: mlx-vlm's and mlx-lm's default.
+_PREFILL_STEP = 2048
+
+
+def _deepseek_v4_step_mask(layer, arguments):
+    """DeepSeek V4 builds one sliding-window mask for the whole call; each step rebuilds it from the block's rotating
+    cache, as chunked prefill does; image-token calls are not causal."""
+    if not arguments.get("causal") or arguments.get("position_offset") is not None:
+        return None
+    from mlx_vlm.models.base import create_attention_mask
+    from mlx_vlm.models.cache import CacheList
+
+    cache = arguments["cache"]
+    local = cache[0] if isinstance(cache, CacheList) else cache
+    window = layer.attn.config.sliding_window
+    return lambda h: create_attention_mask(h[:, :, 0, :], local, window_size = window, return_array = True)
+
+
+# Layers with calls wider than a prefill step may run as consecutive steps on their own cache; token axes of
+# token-indexed arguments; either its causal masks or a function (layer, arguments) giving the mask of each step from
+# hidden states (None if not causal); array if a cache asks for arrays.
+_WIDE_LAYERS = {
+    "mlx_vlm.models.qwen4_exp.language.Qwen4ExpDecoderLayer": (
+        {"hidden_states": 1, "input_ids": 1, "position_ids": -1}, (None, "causal")),
+    "mlx_vlm.models.deepseek_v4.language.DeepseekV4Block": ({"h": 1, "input_ids": 1}, _deepseek_v4_step_mask),
+    "mlx_vlm.models.qwen3_5_moe.language.Qwen3_5MoeDecoderLayer": (
+        {"x": 1, "position_ids": -1, "position_embeddings": -2}, (None, "causal")),
+    "mlx_vlm.models.qwen3_vl_moe.language.Qwen3VLMoEDecoderLayer": (
+        {"x": 1, "position_ids": -1, "position_embeddings": -2}, ("causal",)),
+    **{
+        f"{module}.{layer}": ({"x": 1}, masks)
+        for family, layer, masks in (
+            ("qwen3_next", "Qwen3NextDecoderLayer", (None, "causal")), ("qwen3_moe", "Qwen3MoeDecoderLayer", ("causal",)),
+            ("minimax", "MiniMaxDecoderLayer", ("causal",)), ("mixtral", "MixtralDecoderLayer", ("causal",)),
+            ("glm4_moe", "DecoderLayer", ("causal",)), ("deepseek_v3", "DeepseekV3DecoderLayer", ("array",)),
+        )
+        for module in (f"mlx_lm.models.{family}", f"mlx_vlm.models.{family}.language")
+    },
+}
+_table_reader_pool = None
+
+
+def _runs(field, experts):
+    """Runs ``[fd, offset, first expert, count]`` covering the sorted experts; consecutive experts stored back to back in one file merge into one run."""
+    runs = []
+    for expert in experts.tolist():
+        fd, offset = field.location(expert)
+        last = runs[-1] if runs else None
+        if last and last[0] == fd and last[2] + last[3] == expert and last[1] + last[3] * field.row_bytes == offset:
+            last[3] += 1
+        else:
+            runs.append([fd, offset, expert, 1])
+    return runs
+
+
+def _table_reader():
+    """Fills read-ahead tables one at a time (each spreads its reads over the reader pool)."""
+    global _table_reader_pool
+    with _pool_lock:
+        if _table_reader_pool is None:
+            _table_reader_pool = ThreadPoolExecutor(1, thread_name_prefix = "unsloth-offload-table")
+        return _table_reader_pool
+
+
 _SCORE_DECAY, _SCORE_DECAY_EVERY = 0.7, 4
+# Pending outputs a slot table keeps before evaluating them (decode has evaluated them by then).
+_PENDING_READERS, _PENDING_BYTES = 8, 32 << 20
 
 
 def _picks_rhs(rows, routes, experts):
@@ -490,10 +589,8 @@ def _picks_rhs(rows, routes, experts):
 
 
 class _FullTableKernels:
-    """Mixed into a slot table's ``QuantizedSwitchLinear``. MLX chooses a sorted call's kernel from
-    the table size, and the slot table is smaller than the expert table: where the full table gets
-    the per-route kernel, the call runs unsorted, which computes each route alone just as the
-    sorted per-route kernel does."""
+    """Mixed into a slot table's QuantizedSwitchLinear: MLX picks a sorted call's kernel by table size, so a call the
+    full table would run per-route runs unsorted, computing each route alone."""
 
     def __call__(self, x, indices, sorted_indices = False):
         if sorted_indices and not _picks_rhs(x.shape[-2], indices.size, self.full_experts):
@@ -520,8 +617,7 @@ def _slot_projection(projection, arrays, full_experts):
 
 
 class _ExpertSlots:
-    """One layer's experts in ``capacity`` slots. A miss evicts the expert with the lowest decayed
-    routing count (+1 per route, x0.7 every 4 calls) among those the call does not use."""
+    """One layer's experts in capacity slots; a miss evicts the lowest decayed routing count (+1 per route, x0.7 every 4 calls) among experts the call does not use."""
 
     def __init__(self, fields, experts, capacity):
         self.fields = fields  # [(projection, name, _Field)]
@@ -533,6 +629,11 @@ class _ExpertSlots:
         self.map = mx.zeros((experts,), dtype = mx.int32)  # expert -> slot, valid while resident
         # Built here: MLX streams are thread-bound, so a lazy table would fail on any other thread.
         mx.eval(list(self.arrays.values()), self.map)
+        self.views = None if any(field.cast is not None for _, _, field in fields) else [
+            memoryview(self.arrays[projection, name]).cast("B") for projection, name, _ in fields
+        ]
+        # Outputs computed from the slots that may still be pending; evaluated before a read overwrites them.
+        self.readers, self.reader_thread = [], None
         self.slot_of = np.full(experts, -1, dtype = np.int64)
         self.expert_of = np.full(capacity, -1, dtype = np.int64)
         self.score = np.zeros(experts, dtype = np.float32)
@@ -551,22 +652,48 @@ class _ExpertSlots:
             return
         self.misses += missing.size
         slots = self._reserve(missing.size, experts)
-        buffers = [np.empty((missing.size, field.row_bytes), dtype = np.uint8) for _, _, field in self.fields]
-        jobs = [
-            (*field.location(expert), memoryview(buffer[i]))
-            for (_, _, field), buffer in zip(self.fields, buffers)
-            for i, expert in enumerate(missing.tolist())
-        ]
-        read_ranges(jobs)
-        at = mx.array(slots.astype(np.int32))
-        for (projection, name, field), buffer in zip(self.fields, buffers):
-            self.arrays[projection, name][at] = field.to_mx(buffer)
+        if self.views is not None:
+            self._settle_readers()
+            read_ranges([
+                (*field.location(expert), view[slot * field.row_bytes:(slot + 1) * field.row_bytes])
+                for (_, _, field), view in zip(self.fields, self.views)
+                for expert, slot in zip(missing.tolist(), slots.tolist())
+            ])
+        else:
+            buffers = [np.empty((missing.size, field.row_bytes), dtype = np.uint8) for _, _, field in self.fields]
+            read_ranges([
+                (*field.location(expert), memoryview(buffer[i]))
+                for (_, _, field), buffer in zip(self.fields, buffers)
+                for i, expert in enumerate(missing.tolist())
+            ])
+            at = mx.array(slots.astype(np.int32))
+            for (projection, name, field), buffer in zip(self.fields, buffers):
+                self.arrays[projection, name][at] = field.to_mx(buffer)
         self.slot_of[missing] = slots
         self.expert_of[slots] = missing
-        self.map[mx.array(missing.astype(np.int32))] = at
+        # Rebuilt from the host copy, not scattered: a lazy update would tie the next call to this thread's stream.
+        self.map = mx.array(np.maximum(self.slot_of, 0).astype(np.int32))
 
     def slot_indices(self, indices):
         return self.map[indices].astype(indices.dtype)
+
+    def read_by(self, *outputs):
+        """Keep ``outputs`` (slot readers) for the next miss to evaluate; too many or too large: now."""
+        if self.views is None:  # misses scatter into new arrays: nothing pending can see them
+            return
+        if self.reader_thread is not threading.current_thread():
+            self._settle_readers()
+            self.reader_thread = threading.current_thread()
+        self.readers.extend(outputs)
+        large = sum(reader.nbytes for reader in self.readers) > _PENDING_BYTES
+        if large or len(self.readers) > _PENDING_READERS:
+            self._settle_readers()
+
+    def _settle_readers(self):
+        # Another thread's lazy readers cannot be evaluated here (thread-local MLX encoders, >= 0.31.2): drop them.
+        if self.readers and self.reader_thread is threading.current_thread():
+            mx.eval(self.readers)
+        self.readers.clear()
 
     def _reserve(self, count, protected):
         free = np.flatnonzero(self.expert_of < 0)
@@ -579,8 +706,7 @@ class _ExpertSlots:
 
 
 class _GLUPart:
-    """``up_proj`` / ``gate_proj`` / ``activation`` / ``down_proj`` of an ``OffloadSwitchGLU``, for
-    callers that run the GLU's steps themselves (mlx-vlm's batch-invariant verifier)."""
+    """The up_proj, gate_proj, activation or down_proj of an OffloadSwitchGLU, for callers (mlx-vlm's batch-invariant verifier) that run the GLU's steps themselves."""
 
     def __init__(self, owner, name):
         self._owner, self._name = owner, name
@@ -590,17 +716,19 @@ class _GLUPart:
 
 
 class OffloadSwitchGLU(nn.Module):
-    """Stands in for a ``SwitchGLU`` of quantized experts that stay in the checkpoint. A call reads
-    the experts it routes to into the slots, then runs a copy of the original module (kept out of
-    the module tree) on the slots, so the stock code and kernels compute it. A call routing to more
-    experts than the slots hold runs expert by expert, each expert read once (once per position
-    where the stock call runs a decode block position by position)."""
+    """Stands in for a SwitchGLU of quantized experts kept in the checkpoint: a call reads routed experts into slots and
+    runs a copy of the original module on them; over capacity it runs expert by expert, reading each expert once per
+    position where stock runs decode block positions one at a time."""
 
     def __init__(self, glu, slots, experts):
         super().__init__()
         object.__setattr__(self, "_glu", glu)
         object.__setattr__(self, "_slots", slots)
         object.__setattr__(self, "_parts", None)
+        object.__setattr__(self, "_full", None)  # the stock module on a full table, while a wide layer runs
+        object.__setattr__(self, "_ahead", None)  # (future, module) of a table being read ahead
+        object.__setattr__(self, "_next", None)  # the next offloaded layer a wide prefill reaches
+        object.__setattr__(self, "_spare", None)  # a table the previous offloaded layer is done with
         self.experts = experts
         for name in ("up_proj", "gate_proj", "activation", "down_proj"):
             object.__setattr__(self, name, _GLUPart(self, name))
@@ -612,16 +740,117 @@ class OffloadSwitchGLU(nn.Module):
         return glu
 
     def _routes(self, indices):
+        object.__setattr__(self, "_spare", None)
         routes = np.asarray(indices).reshape(-1).astype(np.int64)
         return routes, np.unique(routes)
 
+    def _table(self, spare = None):
+        """The stock module on spare or a new table of all the layer's experts, plus the function filling it (resident
+        experts copied from slots, others read in runs); None when a field is cast at load, since its bytes on disk
+        are then not the table's."""
+        slots = self._slots
+        if any(field.cast is not None for _, _, field in slots.fields):
+            return None
+        arrays = spare
+        if arrays is None:
+            arrays = {key: mx.zeros(shape, dtype = dtype) for key, (shape, dtype) in self._layout().items()}
+            mx.eval(list(arrays.values()))
+        # Taken here: buffers of evaluated arrays, which the filling thread only copies into.
+        views = [
+            (field, memoryview(arrays[projection, name]).cast("B"), memoryview(slots.arrays[projection, name]).cast("B"))
+            for projection, name, field in slots.fields
+        ]
+        held = np.flatnonzero(slots.slot_of >= 0)
+        where, missing = slots.slot_of[held], np.flatnonzero(slots.slot_of < 0)
+
+        def fill():
+            jobs = []
+            for field, table, resident in views:
+                row = field.row_bytes
+                rows = np.frombuffer(table, dtype = np.uint8).reshape(self.experts, row)
+                rows[held] = np.frombuffer(resident, dtype = np.uint8).reshape(-1, row)[where]
+                for fd, offset, first, count in _runs(field, missing):
+                    start, size = first * row, count * row
+                    jobs += [(fd, offset + at, table[start + at:start + min(size, at + _RUN_BYTES)])
+                             for at in range(0, size, _RUN_BYTES)]
+            read_ranges(jobs)
+
+        glu = copy.copy(self._glu)
+        for projection in _PROJECTIONS:
+            linear = copy.copy(getattr(self._glu, projection))
+            for (owner, name), array in arrays.items():
+                if owner == projection:
+                    linear[name] = array
+            setattr(glu, projection, linear)
+        return glu, fill
+
+    def _join_ahead(self):
+        """The module a read-ahead filled, once it is filled; ``None`` when none was started."""
+        ahead = self._ahead
+        if ahead is None:
+            return None
+        object.__setattr__(self, "_ahead", None)
+        ahead[0].result()
+        return ahead[1]
+
+    def _wide(self, read_next):
+        """Run calls on a full table until ``_narrow``, reading the next offloaded layer's ahead."""
+        spare = self._spare
+        object.__setattr__(self, "_spare", None)
+        glu = self._join_ahead()
+        if glu is None:
+            # A pass starts here: an unfitting spare, and any table an aborted pass left further on, go before a new one.
+            layer = self._next
+            while layer is not None:
+                object.__setattr__(layer, "_spare", None)
+                layer._join_ahead()
+                layer = layer._next
+            spare = self._fits(spare)
+            made, spare = self._table(spare), None
+            if made is None:
+                return False
+            glu, fill = made
+            fill()
+        glu.train(self.training)
+        following = self._next
+        if read_next and following is not None and following._ahead is None:
+            spare = following._fits(spare)
+            made = following._table(spare)
+            if made is not None:
+                object.__setattr__(following, "_ahead", (_table_reader().submit(made[1]), made[0]))
+        # Set last: a failure above leaves this layer on its slots.
+        object.__setattr__(self, "_full", glu)
+        return True
+
+    def _layout(self):
+        return {(projection, name): ((self.experts, *field.shape), field.dtype) for projection, name, field in self._slots.fields}
+
+    def _fits(self, spare):
+        if spare is not None and {key: (tuple(array.shape), array.dtype) for key, array in spare.items()} == self._layout():
+            return spare
+        return None
+
+    def _narrow(self):
+        # Every step on the table was evaluated and a fill rewrites every row, so the next layer may refill it.
+        glu = self._full
+        object.__setattr__(self, "_full", None)
+        if glu is not None and self._next is not None:
+            object.__setattr__(self._next, "_spare", {
+                (projection, name): getattr(glu, projection)[name] for projection, name, _ in self._slots.fields})
+
     def __call__(self, x, indices, *weights):
+        if self._full is not None:
+            return self._full(x, indices, *weights)
+        # A read-ahead nothing used must finish before the slots change under its copy.
+        self._join_ahead()
         glu = self._stock()
         routes, experts = self._routes(indices)
         slots = self._slots
         if experts.size <= slots.capacity:
             slots.ensure(routes, experts)
-            return glu(x, slots.slot_indices(indices), *weights)
+            out = glu(x, slots.slot_indices(indices), *weights)
+            slots.read_by(out)
+            return out
         # Over the slots: expert by expert, each route computed as the stock call computes it.
         rows = x.reshape(-1, x.shape[-1])
         token = np.arange(routes.size) // indices.shape[-1]
@@ -645,9 +874,8 @@ class OffloadSwitchGLU(nn.Module):
         return up, gate, activated, glu.down_proj.gather(activated, slots, sort)
 
     def _by_expert(self, row_of_route, routes, run):
-        """``run(experts, rows)`` over every route, expert by expert in chunks the slots can hold, each
-        chunk evaluated before the next is read. ``run`` gets each route's expert and source row and
-        returns per-route outputs; returns each output as ``[routes, dims]`` in route order."""
+        """Runs run(experts, rows) over every route expert by expert in slot-sized chunks, each evaluated before the
+        next is read; outputs come back as [routes, dims] in route order."""
         slots = self._slots
         resident = slots.slot_of[routes] >= 0
         # Resident experts first, so a chunk's misses evict only experts already used.
@@ -666,9 +894,9 @@ class OffloadSwitchGLU(nn.Module):
         return tuple(mx.concatenate(column)[inverse] for column in zip(*outputs))
 
     def _gather_run(self, rows, compute, sort, weights = None):
-        """Chunks as stock gathers, one route per row. ``sort`` keeps a chunk on
-        ``gather_qmm_rhs`` by sorting it and padding it to the slot table's minimum for that kernel.
-        With ``weights`` (``[..., top_k]``), sources are routes and ``compute`` also gets their weights."""
+        """Chunks as stock gathers, one route per row; sort keeps a chunk on gather_qmm_rhs by sorting and padding it to
+        the slot table's minimum for that kernel; with weights ([..., top_k]) sources are routes and compute gets
+        them too."""
         slots = self._slots
         floor = max(16, 4 * slots.capacity)
 
@@ -696,9 +924,9 @@ class OffloadSwitchGLU(nn.Module):
         return run
 
     def _block_run(self, glu, rows, dtype):
-        """Chunks as mlx-vlm decode blocks of the chunk's tokens. Those kernels give a route the same
-        result whatever the block's other positions and routes are, so a token's routes in the chunk
-        make up its position, padded by repeating one of them, at least two positions per block."""
+        """Chunks as mlx-vlm decode blocks of the chunk's tokens; those kernels give a route the same result whatever
+        the block's other positions and routes are, so each token's routes form a position, padded by repeating one,
+        at least two positions per block."""
         slots = self._slots
         from mlx_vlm.models.linear import DECODE_BLOCK_SIZE
 
@@ -725,6 +953,7 @@ class OffloadSwitchGLU(nn.Module):
         return run
 
     def _part(self, name, *args, **kwargs):
+        self._join_ahead()
         glu = self._stock()
         if name == "activation":
             up, gate = args
@@ -746,11 +975,14 @@ class OffloadSwitchGLU(nn.Module):
             slots.ensure(routes, experts)
             index = slots.slot_indices(indices)
             if name != "up_proj":
-                return getattr(glu, name)(x, index, sorted_indices = sorted_indices)
+                out = getattr(glu, name)(x, index, sorted_indices = sorted_indices)
+                slots.read_by(out)
+                return out
             up = glu.up_proj(x, index, sorted_indices = sorted_indices)
             gate = glu.gate_proj(x, index, sorted_indices = sorted_indices)
             activated = glu.activation(up, gate)
             down = glu.down_proj(activated, index, sorted_indices = sorted_indices)
+            slots.read_by(up, gate, down)
         else:
             # Over the slots: one unsorted row per route, as the caller's per-route kernels compute it.
             if sorted_indices:
@@ -772,6 +1004,145 @@ class OffloadSwitchGLU(nn.Module):
         """``(on disk, resident)`` bytes of the experts this stands in for."""
         slots = self._slots
         return self.experts * slots.expert_bytes, sum(array.nbytes for array in slots.arrays.values())
+
+
+def _token_slice(value, axis, start, end):
+    if isinstance(value, tuple):  # rotary (cos, sin)
+        return tuple(_token_slice(part, axis, start, end) for part in value)
+    index = [slice(None)] * value.ndim
+    index[axis] = slice(start, end)
+    return value[tuple(index)]
+
+
+def _cache_mask(cache, rows, as_array = False):
+    if not hasattr(cache, "make_mask"):
+        return None
+    try:
+        return cache.make_mask(rows, return_array = as_array, window_size = None)
+    except TypeError:  # a linear-attention cache, masked as create_ssm_mask does
+        return cache.make_mask(rows)
+
+
+def _is_cache_mask(mask, built):
+    return (
+        isinstance(mask, mx.array) and isinstance(built, mx.array)
+        and mask.shape == built.shape and mask.dtype == built.dtype and mx.array_equal(mask, built).item()
+    )
+
+
+class _WideLayer:
+    """Mixed into a _WIDE_LAYERS decoder layer of a stack with offloaded experts: a call wider than _PREFILL_STEP runs
+    as consecutive steps on the layer's cache, with all its experts read once per call (next layer read ahead) and
+    decode slots left alone."""
+
+    def __call__(self, *args, **kwargs):
+        axes = self._wide_axes
+        first = next(iter(axes))
+        hidden = args[0] if args else kwargs.get(first)
+        if not isinstance(hidden, mx.array) or hidden.ndim < 2 or hidden.shape[0] != 1 or hidden.shape[1] <= _PREFILL_STEP:
+            return self._whole(hidden, args, kwargs)
+        bound = self._wide_signature.bind(self, *args, **kwargs)
+        cache, mask, masks = bound.arguments.get("cache"), bound.arguments.get("mask"), self._wide_masks
+        if callable(masks):
+            step_mask = masks(self, bound.arguments) if cache is not None else None
+            causal = step_mask is not None
+        elif isinstance(mask, mx.array) and _is_cache_mask(mask, _cache_mask(cache, hidden.shape[1], "array" in masks)):
+            step_mask, causal = (lambda h: _cache_mask(cache, h.shape[1], "array" in masks)), True
+        else:
+            # Only the mask the cache itself builds steps: None over a KV cache is full attention.
+            built = _cache_mask(cache, hidden.shape[1]) if hasattr(cache, "make_mask") else mask
+            step_mask = None
+            causal = (mask is None or isinstance(mask, str)) and mask in masks and not isinstance(built, mx.array) and mask == built
+        if cache is None or not causal:
+            return self._whole(hidden, args, kwargs)
+        switch = self._offload_switch
+        table = switch is not None and switch._wide(read_next = True)
+        given = {name: bound.arguments.get(name) for name in axes}
+        capture = getattr(_prefill_capture, "request", None)
+        outputs = []
+        try:
+            for start in range(0, hidden.shape[1], _PREFILL_STEP):
+                for name, axis in axes.items():
+                    if given[name] is not None:
+                        bound.arguments[name] = _token_slice(given[name], axis, start, start + _PREFILL_STEP)
+                if step_mask is not None:
+                    bound.arguments["mask"] = step_mask(bound.arguments[first])
+                output = super().__call__(*bound.args[1:], **bound.kwargs)
+                mx.eval(output, cache.state)
+                outputs.append(output)
+                if capture is not None and min(start + _PREFILL_STEP, hidden.shape[1]) == capture[0]:
+                    capture[2][id(cache)] = capture[1](cache)
+        finally:
+            if table:
+                switch._narrow()
+        return mx.concatenate(outputs, axis = axes[first])
+
+    def _whole(self, hidden, args, kwargs):
+        output = super().__call__(*args, **kwargs)
+        capture = getattr(_prefill_capture, "request", None)
+        if capture is not None and isinstance(hidden, mx.array) and hidden.ndim >= 2 and hidden.shape[1] == capture[0]:
+            cache = self._wide_signature.bind(self, *args, **kwargs).arguments.get("cache")
+            if cache is not None:
+                mx.eval(output, cache.state)
+                capture[2][id(cache)] = capture[1](cache)
+        return output
+
+
+_WIDE_CLASSES = {}
+_prefill_capture = threading.local()
+
+
+def wide_prefill_step(model):
+    """The step every wide single-row prefill call of model runs in, as a prefill chunked at it; None when a layer may
+    run a call whole (unregistered layer, DeepSeek V4 image rows)."""
+    modules = dict(model.named_modules())
+    switches = [module for module in modules.values() if isinstance(module, OffloadSwitchGLU)]
+    wide = {path for path, layer in modules.items() if isinstance(layer, _WideLayer)}
+    stacks = {path.rpartition(".")[0] for path in wide}
+    stacked = {path for path in modules if path.rpartition(".")[0] in stacks and path.rpartition(".")[2].isdigit()}
+    held = {id(modules[path]._offload_switch) for path in wide if not callable(modules[path]._wide_masks)}
+    if not switches or stacked - wide or any(id(switch) not in held for switch in switches):
+        return None
+    return _PREFILL_STEP
+
+
+@contextlib.contextmanager
+def capture_prefill_rows(rows, copy):
+    """Yields {id(cache): copy(cache)}, filled in this thread by each wide layer of a prefill call once its first rows (a multiple of wide_prefill_step) are cached."""
+    captured = {}
+    _prefill_capture.request = (rows, copy, captured)
+    try:
+        yield captured
+    finally:
+        _prefill_capture.request = None
+
+
+def _widen_layers(model, switches):
+    """Gives each _WIDE_LAYERS layer of a stack with switches (path -> OffloadSwitchGLU) its wide calls; chains each offloaded layer to the next for read-ahead."""
+    layers = []
+    for path, layer in model.named_modules():
+        base = type(layer)
+        spec = _WIDE_LAYERS.get(f"{base.__module__}.{base.__qualname__}")
+        if spec is not None:
+            layers.append((path, layer, base, spec, [s for inner, s in switches.items() if inner.startswith(path + ".")]))
+    offloaded = {path.rpartition(".")[0] for path, *_, held in layers if held}
+    stacks = {}
+    for path, layer, base, spec, held in layers:
+        if len(held) > 1 or not held and path.rpartition(".")[0] not in offloaded:
+            continue
+        if base not in _WIDE_CLASSES:
+            _WIDE_CLASSES[base] = type(base.__name__, (_WideLayer, base), {
+                "_wide_axes": spec[0], "_wide_masks": staticmethod(spec[1]) if callable(spec[1]) else spec[1], "_wide_signature": inspect.signature(base.__call__),
+            })
+        layer.__class__ = _WIDE_CLASSES[base]
+        object.__setattr__(layer, "_offload_switch", held[0] if held else None)
+        parent, _, index = path.rpartition(".")
+        if held and index.isdigit():
+            stacks.setdefault(parent, []).append((int(index), held[0]))
+    for stack in stacks.values():
+        stack.sort(key = lambda item: item[0])
+        for (_, switch), (_, following) in zip(stack, stack[1:]):
+            object.__setattr__(switch, "_next", following)
 
 
 def _decode_block(glu, x):
@@ -805,9 +1176,8 @@ def _top_k(model, path):
 
 
 def _expert_tensors(store, path, projection, name, expected):
-    """``(names, None)`` of a stacked expert parameter's per-expert tensors, for a checkpoint that
-    stores each expert apart (mlx-vlm stacks them at load, as for GLM-5), ``(None, reason)`` when they
-    do not match, or ``None`` when the checkpoint has none."""
+    """(names, None) of a stacked expert parameter's per-expert tensors when stored apart (mlx-vlm stacks them at load,
+    as for GLM-5); (None, reason) on mismatch; None if absent."""
     if not path.endswith(".switch_mlp"):
         return None
     base = path[:-len("switch_mlp")] + "experts."
@@ -851,8 +1221,8 @@ def _expert_fields(model, store, path, glu, cast_for):
 
 
 def offloadable(model, model_dir, *, cast_dtype = None):
-    """What ``offload_ple`` / ``offload_experts`` could take from the unevaluated ``model``, at the
-    load's cast: bytes, the experts kept at full offload, and ``ple`` / ``experts``, ``None`` or why not."""
+    """What offload_ple and offload_experts could take from the unevaluated model at the load's cast: bytes, experts
+    kept at full offload, and ple / experts, None or why not."""
     cast_for = _cast_rule(model, cast_dtype)
     store = CheckpointTensors(model_dir)
     loaded = lambda array, cast: array.size * (cast or array.dtype).size
@@ -887,14 +1257,13 @@ def offloadable(model, model_dir, *, cast_dtype = None):
 
 
 def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
-    """Replace every ``SwitchGLU`` of quantized experts in ``model`` with an ``OffloadSwitchGLU``
-    that reads experts from ``model_dir``'s shards into slots for ``1 - fraction`` of each layer's
-    experts, at least ``max(8, top_k)``. Must run before anything evaluates the experts;
-    ``cast_dtype`` as for ``offload_ple``.
-    Returns ``{"layers", "on_disk_bytes", "resident_bytes", "skipped": [(path, reason)]}``."""
+    """Replace every SwitchGLU of quantized experts in model with an OffloadSwitchGLU reading model_dir's shards into
+    slots for 1-fraction of each layer's experts (at least max(8, top_k)); run before any evaluation; cast_dtype as
+    offload_ple; returns {layers, on_disk_bytes, resident_bytes, skipped}."""
     cast_for = _cast_rule(model, cast_dtype)
     store = CheckpointTensors(model_dir)
     report = {"layers": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}
+    replaced = {}
     for path, glu in list(expert_sites(model)):
         experts = glu.up_proj["weight"].shape[0]
         fields, top_k, reason = _expert_fields(model, store, path, glu, cast_for)
@@ -914,10 +1283,12 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
         replacement = OffloadSwitchGLU(stock, slots, experts)
         replacement.train(glu.training)
         _replace_module(model, path, replacement)
+        replaced[path] = replacement
         on_disk, resident = replacement.offload_bytes()
         report["layers"] += 1
         report["on_disk_bytes"] += on_disk
         report["resident_bytes"] += resident
+    _widen_layers(model, replaced)
     return report
 
 
@@ -925,7 +1296,7 @@ OFFLOAD_CONTEXT_STEP = 256
 _PLE_TENSORS = (".embed_tokens_per_layer.", ".ngram_embedding.shards.")
 # Tables mlx-vlm always reads row by row from the checkpoint, never resident: DeepSeek V4.1's Engram.
 _MAPPED_TENSORS = (".engram.embed.",)
-_EXPERT_TENSOR = re.compile(r"\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias|global_scale)$")
+_EXPERT_TENSOR = re.compile(r"\.(?:switch_mlp|experts)\.(gate_proj|up_proj|down_proj|w1|w2|w3)\.(weight|scales|biases|bias|global_scale)$")
 _EXPERT_APART = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj|w1|w2|w3)\.(weight|scales|biases|bias|global_scale)$")
 _FLOAT_BYTES = {"F16": 2, "BF16": 2, "F32": 4, "F64": 8}
 _NESTED_CONFIGS = ("text_config", "thinker_config", "language_config", "llm_config")
@@ -970,16 +1341,15 @@ def _tensors(model_dir, dtype_bytes):
 
 
 def offload_inventory(model_dir, dtype_bytes = None):
-    """``offload.offloadable``'s sizes plus ``total_bytes``, from the safetensors headers alone (floats
-    at ``dtype_bytes`` an element), to price a load before it is made. It counts every quantized
-    ``switch_mlp``, so it can count experts a loaded model keeps; the ``mtp.`` head is never counted."""
+    """offloadable's sizes plus total_bytes, from the safetensors headers alone (floats at dtype_bytes each), to price a
+    load first; may count experts a loaded model keeps, never an MTP head's."""
     total = ple = 0
     layers = {}  # prefix -> [bytes, experts, quantized projections, global scales]
     for name, shape, size in _tensors(model_dir, dtype_bytes):
         if any(part in name for part in _MAPPED_TENSORS):
             continue
         total += size
-        if name.startswith("mtp."):
+        if name.startswith(("mtp.", "language_model.mtp.")):
             continue
         if any(part in name for part in _PLE_TENSORS):
             ple += size
@@ -990,7 +1360,7 @@ def offload_inventory(model_dir, dtype_bytes = None):
             layer = layers.setdefault(name[:(match or apart).start()], [0, 0, set(), False])
             layer[0] += size
             projection, field = match.groups() if match is not None else apart.groups()[1:]
-            if match is not None and name.endswith(".up_proj.weight"):
+            if match is not None and field == "weight":
                 layer[1] = shape[0]
             if apart is not None:
                 layer[1] = max(layer[1], int(apart.group(1)) + 1)
@@ -1033,8 +1403,7 @@ def _expert_overhead(inventory):
 
 
 def offload_footprint(inventory, ple, experts):
-    """What the offloadable PLE tables and experts hold in memory with ``ple`` / ``experts`` offloaded
-    (``None`` for off), working memory included; the rest of the weights stay as they are."""
+    """Memory the offloadable PLE tables and experts hold with ple / experts offloaded (None for off), working memory included; other weights are unchanged."""
     ple_bytes = inventory["ple_bytes"] if inventory["ple"] is None else 0
     held = ple_bytes * (1 - (ple or 0)) + (_PLE_OVERHEAD if ple and ple_bytes else 0)
     if experts and inventory["expert_bytes"]:
@@ -1044,9 +1413,9 @@ def offload_footprint(inventory, ple, experts):
 
 
 def context_bytes(model_dir, tokens, prefill_step = PREFILL_STEPS[0], dtype_bytes = 2):
-    """What ``tokens`` of context cost, from the config: the attention KV cache doubled (the
-    transients that grow with it), a prefill step's logits and a reserve. Fitted above
-    Qwen3.8-Flash-Next's measured peaks (13.7 GiB over the weights at 262K tokens)."""
+    """Bytes for tokens of context, from the config: attention KV cache doubled (with its growing transients), a prefill
+    step's logits and a reserve; fitted above Qwen3.8-Flash-Next's measured peaks (13.7 GiB over the weights at 262K
+    tokens)."""
     config = _text_config(model_dir)
     layers = config.get("num_hidden_layers", 0)
     types = config.get("layer_types")
@@ -1090,15 +1459,9 @@ def plan_offload(
     prefill_step = None,
     offload = "auto",
 ):
-    """The 50/50 rule: context takes at most half of what the resident weights leave of ``budget``
-    less ``SAFETY_MARGIN`` (more only to reach ``minimum``), and the least offload that fits the rest
-    is taken -- none, PLE, then PLE and as many experts as needed. Experts leave memory only when an
-    unpinned context of ``_OFFLOAD_CONTEXT`` tokens (within ``minimum`` and ``ceiling``) does not fit
-    beside them, and then as many as that context needs. With experts offloaded, each prefill step
-    re-reads them, so the step with the fewest offloaded bytes per prompt token is taken.
-    ``context_cost(tokens, step)`` prices the context. A ``context``, ``prefill_step`` or ``offload``
-    part (as ``from_pretrained`` takes it) not ``"auto"`` is kept as given.
-    Returns ``{"ple", "experts", "context", "prefill_step"}``, all ``None`` when nothing fits."""
+    """Context gets at most half of leftover budget less SAFETY_MARGIN, more only to hit minimum; least offload that
+    fits (none, PLE, experts); experts only if _OFFLOAD_CONTEXT tokens do not fit; re-read per prefill step, so
+    fewest offloaded bytes per prompt token; non-auto parts kept; None if none fit."""
     offload = offload_setting(offload)
     ple_offload, expert_offload = offload["ple"], offload["experts"]
     ple_bytes = inventory["ple_bytes"] if inventory["ple"] is None else 0

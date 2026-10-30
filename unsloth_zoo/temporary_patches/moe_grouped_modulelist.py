@@ -55,10 +55,8 @@ __all__ = [
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
-    # The zoo injects a permissive bitsandbytes stub wherever the real package is absent,
-    # macOS arm64 among others, and every attribute of that stub is a placeholder object
-    # rather than a class. `isinstance(x, Params4bit)` against one raises TypeError, so a
-    # non-class Params4bit has to count as no bitsandbytes at all.
+    # The zoo injects a bitsandbytes stub where the package is absent (e.g. macOS arm64); its attributes are placeholder
+    # objects, so isinstance raises TypeError; a non-class Params4bit therefore counts as no bitsandbytes.
     HAS_BNB = isinstance(Params4bit, type)
     if not HAS_BNB:
         Params4bit = None
@@ -112,8 +110,14 @@ try:
 except Exception:
     _triton_grouped_mm = _triton_grouped_mm_wanted = None
 
-# Hot-path helpers are read as module attributes (one lookup per call, no import machinery);
-# monkeypatching moe_utils / gpt_oss_grouped_qlora still reaches them.
+try:
+    from .moe_router_triton import fused_route_or_none as _fused_route_or_none
+except Exception:
+    def _fused_route_or_none(*args, **kwargs):
+        return None
+
+# Hot-path helpers are read as module attributes (one lookup per call, no import machinery); monkeypatching moe_utils /
+# gpt_oss_grouped_qlora still reaches them.
 try:
     from . import moe_utils as _moe_utils
 except Exception:
@@ -140,8 +144,8 @@ def _view_weight_ok(w):
     if w.stride() != (K * N, 1, K) or (K * n) % 16 or (K * N * n) % 16:
         return False
     try:
-        from .moe_utils import _transposed_view_grouped_mm_is_safe
-        return bool(_transposed_view_grouped_mm_is_safe())
+        from .moe_utils import _transposed_view_safe_on
+        return bool(_transposed_view_safe_on(w.device))
     except Exception:
         return False
 
@@ -167,9 +171,8 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
             raise
         if not w.is_contiguous():   # an unaligned view (e.g. storage offset): the copy may pass
             return _grouped_mm_fix(x, w.contiguous(), offs)
-        # Shared with moe_utils, not looped here: a loop tapes every per-group SLICE,
-        # whose shape is the router-decided group size, so non-reentrant checkpointing
-        # aborts the backward. Two callers tape this, so the hazard is reachable.
+        # Shared with moe_utils, not a Python loop: a loop tapes each per-group slice, whose router-decided shape makes
+        # non-reentrant checkpointing abort the backward; two callers tape it, so the hazard is reachable.
         try:
             from .moe_utils import _manual_grouped_mm
         except Exception:
@@ -198,6 +201,9 @@ def _expert_weight(lin, dtype):
 
 def _route_softmax_topk(self, router_logits, top_k):
     """softmax(fp32) -> top_k -> optional renorm (Mixtral has no norm_topk_prob attr -> True)."""
+    fused = _fused_route_or_none(router_logits, top_k, "softmax_topk", bool(getattr(self, "norm_topk_prob", True)))
+    if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1: one Triton launch, same ids / weights / grads
+        return fused
     rw = F.softmax(router_logits, dim=1, dtype=torch.float32)
     rw, sel = torch.topk(rw, top_k, dim=-1)
     if getattr(self, "norm_topk_prob", True):
@@ -205,8 +211,8 @@ def _route_softmax_topk(self, router_logits, top_k):
     return rw, sel
 
 
-# block class name -> (gate, up, down attr names, router fn), one row per model. Blocks with a
-# shared expert (e.g. Qwen2Moe) are absent: it is not part of the routed GEMM.
+# Block class name -> (gate, up, down attr names, router fn), one row per model; blocks with a shared expert (e.g.
+# Qwen2Moe) are absent, as it is not part of the routed GEMM.
 _BLOCK_SPECS = {
     "Qwen3MoeSparseMoeBlock": ("gate_proj", "up_proj", "down_proj", _route_softmax_topk),
     "MixtralSparseMoeBlock":  ("w1",        "w3",      "w2",        _route_softmax_topk),
@@ -333,8 +339,8 @@ def _build_gate_up_stack(experts, spec, dtype, projs = None):
     [E, 2*inter, hidden] stack (the GEMMs take the view, backward its contiguous transpose).
     `projs` is the block's _ExpertProjs (read from `experts` when omitted)."""
     w = _nf4_build_gate_up_stack(experts, spec, dtype, projs)
-    # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot
-    # replay a global-dict update (fullgraph fails), and traced code never takes the NF4 kernel.
+    # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot replay a global-dict update
+    # (fullgraph fails); traced code never takes the NF4 kernel.
     counting = not torch.compiler.is_compiling()
     if w is not None:
         if counting:
@@ -348,8 +354,8 @@ def _build_gate_up_stack(experts, spec, dtype, projs = None):
 def _build_down_stack(experts, spec, dtype, projs = None):
     """[E, inter, hidden]: per expert down^T, a transposed view of the contiguous [E, hidden, inter] stack."""
     w = _nf4_build_down_stack(experts, spec, dtype, projs)
-    # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot
-    # replay a global-dict update (fullgraph fails), and traced code never takes the NF4 kernel.
+    # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot replay a global-dict update
+    # (fullgraph fails); traced code never takes the NF4 kernel.
     counting = not torch.compiler.is_compiling()
     if w is not None:
         if counting:
@@ -377,8 +383,8 @@ def _bnb_build_down_stack(experts, spec, dtype, projs = None):
     return torch.stack([_expert_weight(d, dtype) for d in projs.down], 0).transpose(1, 2)
 
 
-# The gate / up / down projection of every expert, plus the [g0, u0, g1, u1, ...] list the
-# gate_up pointer table reads. Built once per readiness verdict (_block_projs), not per call.
+# Gate / up / down projection of every expert, plus the [g0, u0, g1, u1, ...] list the gate_up pointer table reads;
+# built once per readiness verdict (_block_projs), not per call.
 _ExpertProjs = collections.namedtuple("_ExpertProjs", ("gate", "up", "down", "gate_up"))
 
 
@@ -530,11 +536,9 @@ def _lora_delta(x, offsets, projs, lora, dtype):
     return gmm(h, B, offsets) * scaling
 
 
-# Stacked expert LoRA. PEFT gives every expert its own lora_A / lora_B Parameter (36,864 tensors on
-# Qwen3-30B-A3B), so the optimizer, clipping and autograd pay per tensor. A converted block holds
-# one [E, r, in] / [E, out, r] Parameter per projection, registered on expert 0's lora_A[n] /
-# lora_B[n] as `weight_stack`; every expert's module reads `weight` as its slice (a view, autograd
-# reaches the stack) and still saves / loads PEFT's per-expert `weight` keys.
+# Stacked expert LoRA, since PEFT's per-expert tensors make optimizer, clip and autograd pay per tensor (36,864 on
+# Qwen3-30B-A3B): one [E, r, in] / [E, out, r] Parameter per projection as weight_stack on expert 0; each expert's
+# weight is a view of it, and per-expert weight keys save and load.
 _STACK_NAME = "weight_stack"
 
 
@@ -618,8 +622,8 @@ def _stackable_lora(projs):
                 return None
         if getattr(p, "lora_variant", None) or getattr(p, "lora_bias", {}).get(name, False):
             return None
-        # Dropout > 0 runs the per-expert loop in train mode; a stack would turn an unrouted
-        # expert's None grad into zeros (weight decay / momentum still move it).
+        # Dropout > 0 runs the per-expert loop in train mode: a stack would turn an unrouted expert's None grad into
+        # zeros, which weight decay and momentum still move.
         drop = p.lora_dropout[name] if name in p.lora_dropout else None
         if drop is not None and not isinstance(drop, torch.nn.Identity) and getattr(drop, "p", 0) > 0:
             return None
@@ -883,13 +887,18 @@ def _grouped_state(block, experts, spec, device, dtype):
 def grouped_moe_forward(self, hidden_states: torch.Tensor):
     spec = self._unsloth_moe_spec
     experts = self.experts
-    # Run the original loop unless this is the frozen-base CUDA path in a low-precision dtype
-    # with every expert grouped-ready (CPU/offload, unsupported LoRA, fp32, dtype/device
-    # mismatch fall back).
+    # Grouped path only on the frozen-base CUDA path in bf16 / fp16 with every expert grouped-ready; CPU/offload,
+    # unsupported LoRA, fp32 and dtype/device mismatch fall back.
     if hidden_states.device.type not in ("cuda", "xpu") \
             or hidden_states.dtype not in (torch.bfloat16, torch.float16):
         if not torch.compiler.is_compiling():
             _decline(f"{hidden_states.device.type} {hidden_states.dtype} input")
+        return self._orig_moe_forward(hidden_states)
+    # A block moved after enable_grouped_moe may sit on a GPU model without torch._grouped_mm.
+    from .moe_utils import _grouped_mm_supported_on
+    if not _grouped_mm_supported_on(hidden_states.device):
+        if not torch.compiler.is_compiling():
+            _decline(f"torch._grouped_mm unsupported on {hidden_states.device}")
         return self._orig_moe_forward(hidden_states)
     lora = _grouped_state(self, experts, spec, hidden_states.device, hidden_states.dtype)
     if not isinstance(lora, dict):
@@ -919,15 +928,12 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     rw, sel = spec[3](self, router_logits, top_k)
     rw = rw.to(dtype)
 
-    flat_e = sel.reshape(-1)
     flat_w = rw.reshape(-1)
     tok_of_pair = torch.arange(T, device=dev).repeat_interleave(top_k)
-    # int64 matches what bincount returned, so cumsum is unchanged.
-    counts = _moe_utils.count_tokens_per_expert(flat_e, num_experts, torch.int64)
-    order = torch.argsort(flat_e, stable=True)
+    # Same offsets as the int64 count + cumsum this replaced (counts < 2**31).
+    _, order, offsets = _moe_utils.moe_routing_sort(sel, num_experts)
     sorted_tok = tok_of_pair[order]
     sorted_w = flat_w[order]
-    offsets = torch.cumsum(counts, dim=0).to(torch.int32)
     permuted = hidden_states[sorted_tok]
 
     recompute = getattr(self, "_moe_recompute", False)
@@ -1048,6 +1054,7 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lo
         cache = os.environ.get("UNSLOTH_MOE_GROUPED_CACHE") == "1"
     n = 0
     warmed = False
+    warmed_devices = set()
     for module in model.modules():
         spec = _block_is_eligible(module)
         if spec is None:
@@ -1069,11 +1076,23 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lo
             _decline(f"stacked expert LoRA skipped: {e}", count=False)
         if not warmed:
             warmed = True
-            # The base and LoRA GEMMs (_grouped_mm_fix, moe_utils._grouped_mm_eager) read a one-time
-            # eager probe; run it now, so a compiled first forward does not graph-break on it.
+            # _grouped_mm_fix and moe_utils._grouped_mm_eager read a one-time eager probe; run it now so a compiled first forward does not graph-break on it.
             try:
                 from .moe_utils import _transposed_view_grouped_mm_is_safe
                 _transposed_view_grouped_mm_is_safe()
+            except Exception:
+                pass
+        # Same probe on each other card these experts sit on (device_map="auto" across GPUs); only cards holding experts are probed.
+        try:
+            device = next(module.parameters()).device
+        except Exception:
+            device = None
+        if device is not None and device.type in ("cuda", "xpu") and device not in warmed_devices:
+            warmed_devices.add(device)
+            try:
+                from .moe_utils import _grouped_mm_supported_on, _transposed_view_safe_on
+                _grouped_mm_supported_on(device)
+                _transposed_view_safe_on(device)
             except Exception:
                 pass
     if verbose and n:
@@ -1092,6 +1111,17 @@ def auto_enable_grouped_moe(model):
             enable_grouped_moe(model, verbose=True, stack_lora=True)
     except Exception:
         pass  # optional speedup; never block model loading
+    try:   # stacked experts on another GPU model: probe that card now, not first inside a compiled forward
+        if model is not None and hasattr(model, "modules"):
+            from .moe_experts_interface import warm_moe_probes_on_expert_devices
+            warm_moe_probes_on_expert_devices(model)
+    except Exception:
+        pass
+    try:   # UNSLOTH_MOE_FUSED_ROUTER=1: routers re-created by the compiler
+        from .moe_router_triton import enable_fused_router
+        enable_fused_router(model)
+    except Exception:
+        pass
     try:
         # gpt-oss experts have their own grouped path (no torch._grouped_mm needed on fp16).
         if model is not None and hasattr(model, "modules"):

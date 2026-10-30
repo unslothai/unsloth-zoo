@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The GRPO multimodal key tuple and the chunker both logprob paths share.
-
-unslothai/unsloth#6960: a hard coded list of four keys dropped spatial_shapes, num_tiles
-and image_position_ids, and dropped pixel_values entirely for a model with no
-image_grid_thw, silently recomputing the reference logprobs from the text alone.
-"""
+"""Tests the GRPO multimodal key tuple and chunker shared by both logprob paths; guards unslothai/unsloth 6960, where a
+hard coded four-key list dropped spatial_shapes, num_tiles and image_position_ids, and pixel_values for models
+without image_grid_thw."""
 
 import ast
 import inspect
@@ -164,18 +161,9 @@ def test_gradient_pass_forwards_the_whole_chunk():
 
 
 def test_released_unsloth_can_still_see_num_images_in_this_function():
-    """unsloth 2026.9.4 on PyPI gates multi-image GRPO on a source-text probe:
-
-        _supports_num_images = "num_images" in inspect.signature(grpo_accumulated_loss).parameters
-        if not _supports_num_images:
-            _supports_num_images = "num_images" in inspect.getsource(grpo_accumulated_loss)
-        if not _supports_num_images:
-            raise RuntimeError("Multi-image GRPO requires an unsloth_zoo build ... upgrade unsloth_zoo")
-
-    The two packages ship independently, so a zoo that moves num_images handling out of this
-    function tells every released-unsloth user with two images in a sample to upgrade the zoo
-    they just upgraded. This runs that probe verbatim rather than describing it.
-    """
+    """Released unsloth 2026.9.4 gates multi-image GRPO on num_images in grpo_accumulated_loss's signature or source
+    (else RuntimeError); moving it out would make released users with two images in a sample upgrade the zoo; the
+    test runs that probe verbatim."""
     from unsloth_zoo.rl_replacements import grpo_accumulated_loss
 
     source = inspect.getsource(grpo_accumulated_loss)
@@ -187,9 +175,7 @@ def test_released_unsloth_can_still_see_num_images_in_this_function():
         "grpo_accumulated_loss no longer mentions num_images"
     )
 
-    # The probe above is satisfied by a COMMENT mentioning num_images, which the periodic
-    # comment-reduction pass is entitled to delete. So pin the binding itself: parsed, not
-    # grepped, so the guarantee survives any rewording of the text around it.
+    # The probe above can be satisfied by a comment that mentions num_images, so the binding is checked by parsing the AST rather than grepping the source text.
     tree = ast.parse(textwrap.dedent(source))
     bound = {
         target.id
@@ -204,8 +190,8 @@ def test_released_unsloth_can_still_see_num_images_in_this_function():
     )
 
 
-# The gate that keeps the two logprob passes on the same inputs when the installed unsloth
-# still carries its own hard coded no-grad key list. See grpo_companion_vision_keys.
+# The gate keeping both logprob passes on the same inputs while the installed unsloth still has its own hard coded
+# no-grad key list; see grpo_companion_vision_keys.
 
 import sys
 import types
@@ -227,10 +213,8 @@ _RELEASED_KEYS = (
 
 
 def _install_companion(monkeypatch, tmp_path, body, name = "companion_rl"):
-    """Put a module named like unsloth's under sys.modules with real, readable source.
-
-    inspect.getsource needs a file, so the patcher cannot be built with exec or a lambda.
-    """
+    """Registers a module named like unsloth's in sys.modules with real source on disk, since inspect.getsource needs a
+    file: the patcher cannot be built with exec or a lambda."""
     path = tmp_path / f"{name}.py"
     path.write_text(textwrap.dedent(body))
     module = types.ModuleType(name)
@@ -297,8 +281,7 @@ def test_an_unsloth_that_shares_the_helper_lifts_the_restriction(monkeypatch, tm
 
 
 def test_an_unsloth_that_only_names_the_chunker_also_lifts_it(monkeypatch, tmp_path):
-    """The companion change (unslothai/unsloth#11031) collects the keys in a module level
-    helper and names only grpo_vision_chunks inside the replacement itself."""
+    """Models the companion change, unslothai/unsloth 11031: keys collected in a module level helper, with only grpo_vision_chunks named inside the replacement."""
     _install_companion(
         monkeypatch,
         tmp_path,
@@ -319,15 +302,8 @@ def test_no_companion_in_sys_modules_forwards_everything():
 
 
 def test_an_absent_companion_is_not_memoized(monkeypatch, tmp_path):
-    """The early call must not decide the run.
-
-    Import order is not fixed: this module can be read before unsloth installs its RL
-    replacements, so the first caller can find nothing there. Memoizing that would pin the
-    full tuple for the process, and the restriction could then never be applied to the run
-    that needs it -- the gradient pass would forward keys the released no-grad pass does not,
-    which is the mismatch this whole gate exists to prevent. Like the unreadable case, an
-    absence is a call that came too early and not a fact about the process.
-    """
+    """An early call that runs before unsloth registers its replacements must not memoize the absence, which would pin
+    the full key tuple for the process, so the restriction could never apply to the run that needs it."""
     assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
     assert _rl._GRPO_COMPANION_VISION_KEYS is None
 
@@ -362,14 +338,7 @@ def test_an_absent_companion_is_not_memoized(monkeypatch, tmp_path):
 def test_a_no_grad_pass_this_reader_cannot_parse_does_not_turn_vision_off(
     monkeypatch, tmp_path
 ):
-    """Fail open: a rewritten replacement that names no keys must not be read as naming none
-    of them, which would drop pixel_values and train on the text alone.
-
-    The source here is READABLE and merely unrecognised, which is the opposite case to
-    test_a_companion_whose_source_cannot_be_read_falls_back_to_the_released_keys: there the
-    text cannot be obtained at all, so there is nothing to conclude and the released set is
-    assumed. Here the companion is visibly doing something this reader does not model, and
-    narrowing on that would turn vision off on a guess."""
+    """Fail open: a readable but unrecognised no-grad pass must not be read as naming no keys, which would drop pixel_values and train on the text alone."""
     _install_companion(
         monkeypatch,
         tmp_path,
@@ -386,15 +355,8 @@ def test_a_no_grad_pass_this_reader_cannot_parse_does_not_turn_vision_off(
 def test_a_companion_whose_source_cannot_be_read_falls_back_to_the_released_keys(
     monkeypatch, tmp_path
 ):
-    """Source-stripped, frozen or dynamically wrapped packaging.
-
-    The companion is THERE -- the patcher exists -- and the only thing missing is the ability
-    to see which keys it forwards. Leaving the full tuple there was the unsafe half of that
-    guess: the gradient pass would forward spatial_shapes, num_tiles and the position ids that
-    every released unsloth omits, and the importance ratio and the KL term would then compare
-    two different policies. The released set is the answer for every unsloth that does not
-    carry the companion change, so it is the one an unknown companion gets.
-    """
+    """Companion source unreadable (stripped, frozen or wrapped): fall back to the released keys, since the full tuple
+    would forward keys that released unsloth omits."""
     module = _install_companion(
         monkeypatch,
         tmp_path,
@@ -417,8 +379,7 @@ def test_a_companion_whose_source_cannot_be_read_falls_back_to_the_released_keys
         assert dropped not in shared, dropped
     assert "pixel_values" in shared
 
-    # Not memoized: this is a failure to look, not a fact about the process, so a run that can
-    # read the source afterwards is not stuck with the conservative answer.
+    # Not memoized: a failure to read the source is not a fact about the process, so a later call that can read it is not stuck with the conservative answer.
     assert _rl._GRPO_COMPANION_VISION_KEYS is None
     monkeypatch.undo()
     monkeypatch.setitem(sys.modules, "unsloth.models.rl_replacements", module)
@@ -427,22 +388,15 @@ def test_a_companion_whose_source_cannot_be_read_falls_back_to_the_released_keys
 
 
 def test_the_companion_probe_reads_the_really_installed_unsloth():
-    """Not a mock: whatever unsloth is installed here must be classified, and if it does not
-    share the helper the answer must be a strict subset that still carries pixel_values."""
+    """Not a mock: the really installed unsloth is classified; if it does not share the helper, its keys must be a strict subset that still carries pixel_values."""
     pytest.importorskip("unsloth.models.rl_replacements")
     import unsloth.models.rl_replacements as installed
 
     keys = _rl.grpo_companion_vision_keys()
     patcher = getattr(installed, "grpo_trainer__get_per_token_logps_and_entropies", None)
     assert patcher is not None, "unsloth no longer exposes the no-grad replacement to probe"
-    # The gate's own marker list, not a copy of it. Either name means the companion reads this
-    # module's tuple, and unslothai/unsloth#11031 is chunker-only: it collects the keys in a
-    # module level helper and names only grpo_vision_chunks inside the replacement. Naming one
-    # marker here meant that once that companion was installed production returned all eleven
-    # keys while this test asserted a strict subset, so the integration test failed against
-    # the exact companion it exists to validate. Reusing the constant is right for THIS test,
-    # whose job is only to classify whatever package is installed; the four mock tests above
-    # pin each shape with literal source text, so a wrong constant is still caught there.
+    # Uses the gate's own marker list, not a copy: a copy with a different marker expected a strict subset where
+    # unslothai/unsloth 11031 (chunker-only) returns all eleven keys; the mock tests pin shapes with literal text.
     installed_source = inspect.getsource(patcher)
     shares = any(marker in installed_source for marker in _rl.GRPO_SHARED_HELPER_MARKERS)
     if shares:
@@ -457,8 +411,7 @@ def test_the_gradient_pass_goes_through_the_gate():
     assert "grpo_shared_vision_inputs" in source
 
 
-# Real tensors, because the chunker slices them and the branch under test reads the one it
-# is handed rather than a marker string.
+# Real tensors: the chunker slices them, and the branch under test reads the tensor it is handed rather than a marker string.
 _PIXELS = torch.zeros(1, 4)
 _MASK = torch.ones(1, 4)
 _GRID = torch.tensor([[1, 1, 1]])
@@ -475,18 +428,8 @@ class _ReachedTheVisionBranch(Exception):
 
 
 def _which_branch(monkeypatch, vision_kwargs):
-    """Which arrangement branch `grpo_accumulated_loss` takes for these vision kwargs.
-
-    Observed, not read off the returned mapping. `pixel_values` is a sentinel in the caller as
-    well as a model input: a None there makes the GRADIENT pass recompute max_left_pad,
-    left-pack input_ids and rebuild completion_mask through
-    create_completion_attention_mask, and it also switches the sequence-packing path on. The
-    companion's no-grad pass decides both on its own pixel_values, which is not None. So a
-    gate that blanks the key does not make the two passes agree; it makes them disagree about
-    something worse. Every other test in this file passes by inspecting the dict, which is
-    exactly how that got through, so this one runs the function and reports which branch it
-    took -- each side raises its own sentinel the moment it is reached.
-    """
+    """Reports the branch grpo_accumulated_loss takes by running it: a None pixel_values left-packs input_ids, rebuilds
+    completion_mask and turns on sequence packing."""
     def _no_packing(*_a, **_k):
         raise _TookTheTextBranch
 
@@ -531,9 +474,7 @@ def _which_branch(monkeypatch, vision_kwargs):
 
 
 def test_the_branch_harness_tells_the_two_apart(monkeypatch):
-    """The control for `_which_branch`. A harness that answered "vision" whatever it was given
-    would make the assertion above pass for nothing, which is the failure mode this whole
-    exercise is about."""
+    """Control for _which_branch: a harness that always answered vision would make the branch assertions pass for nothing."""
     assert _which_branch(monkeypatch, {}) == "text"
     assert (
         _which_branch(monkeypatch, {"pixel_values": _PIXELS, "image_grid_thw": _GRID})
@@ -544,15 +485,9 @@ def test_the_branch_harness_tells_the_two_apart(monkeypatch):
 def test_a_companion_without_the_chunker_gets_no_pixels_for_a_gridless_vlm(
     monkeypatch, tmp_path
 ):
-    """Intersecting key NAMES cannot express a shape.
-
-    A companion that does not share the chunker slices the pixels with a loop of its own, and
-    that loop appends None for pixel_values unless image_grid_thw is there to slice them by.
-    For a VLM that carries no grid -- Gemma 3, InternVL, LFM2-VL -- forwarding pixels on the
-    gradient side alone leaves the current policy looking at images the reference policy never
-    saw, so the ratio and the KL term compare two different policies however well the names
-    match.
-    """
+    """Key-name intersection cannot express shape: a companion without the chunker appends None pixels unless
+    image_grid_thw exists, so gridless VLMs (Gemma 3, InternVL, LFM2-VL) must get no pixels on the gradient side
+    alone."""
     _install_companion(
         monkeypatch,
         tmp_path,
@@ -581,29 +516,22 @@ def test_a_companion_without_the_chunker_gets_no_pixels_for_a_gridless_vlm(
         "num_images": [1],
     }
     shared = _rl.grpo_shared_vision_inputs(gridless)
-    # The SENTINEL survives. `grpo_accumulated_loss` reads pixel_values to choose between the
-    # vision branch and the text branch, and the companion chooses on its own pixel_values,
-    # which is a real tensor: it appends None per chunk inside its loop, after the branch is
-    # already decided. Blanking it here would stop the two passes disagreeing about pixels and
-    # start them disagreeing about how the sequences are ARRANGED -- left-packed input_ids, a
-    # rebuilt completion_mask and the packed forward on one side only -- which is the worse
-    # comparison of the two, for exactly the models this is for.
+    # pixel_values must survive as the branch sentinel, since the companion picks its branch on the real tensor;
+    # blanking it makes the passes disagree on arrangement (left-packed input_ids, completion_mask, packed forward).
     assert shared["pixel_values"] is _PIXELS, shared
     assert shared["pixel_attention_mask"] is _MASK, shared
     # What is actually FORWARDED carries no pixels, which is where the companion drops them.
     chunk = _rl.grpo_vision_chunks(shared, 1, 1)[0]
     assert "pixel_values" not in chunk, chunk
     assert "pixel_attention_mask" not in chunk, chunk
-    # Everything the companion DOES forward is still forwarded, or the two passes disagree in
-    # the other direction.
+    # Everything the companion does forward must still be forwarded, or the two passes disagree in the other direction.
     assert shared["image_sizes"] is _SIZES
     assert shared["token_type_ids"] is _TTI
     assert shared["num_images"] == [1]
     assert torch.equal(chunk["image_sizes"], _SIZES)
     assert torch.equal(chunk["token_type_ids"], _TTI)
 
-    # And the branch is observed, not read off the mapping: the gradient pass must still take
-    # the vision branch for this batch, leaving input_ids exactly as the companion has them.
+    # The branch is observed, not read off the mapping: the gradient pass must still take the vision branch, leaving input_ids as the companion has them.
     assert _which_branch(monkeypatch, gridless) == "vision"
 
     # With a grid the companion slices the pixels, so they are forwarded on both sides.
@@ -618,9 +546,8 @@ def test_a_companion_without_the_chunker_gets_no_pixels_for_a_gridless_vlm(
 
 
 def test_a_companion_that_shares_the_chunker_keeps_the_pixels(monkeypatch, tmp_path):
-    """The narrowing is only for a companion that slices with a loop of its own. Where the two
-    passes run the same chunker there is nothing to disagree about, and dropping the pixels
-    there would throw away the whole point of sharing it."""
+    """Narrowing applies only to a companion with its own slicing loop; one that shares the chunker keeps the pixels, as
+    both passes then run the same chunker with nothing to disagree about."""
     _install_companion(
         monkeypatch,
         tmp_path,
@@ -641,15 +568,8 @@ def test_a_companion_that_shares_the_chunker_keeps_the_pixels(monkeypatch, tmp_p
 
 
 def test_a_padded_image_tensor_stays_on_the_sample_axis():
-    """SmolVLM and Idefics pad to the widest sample instead of flattening by image.
-
-    `num_images = [2, 0]` over two samples makes the two readings numerically identical --
-    two image rows, two samples -- and the length comparison alone then sliced a padded
-    tensor by image: with one sample per chunk both of the first sample's rows went to the
-    first chunk and an empty tensor to the second, which is a batch-shape failure at best and
-    pixels attached to the wrong sample at worst. The layouts differ in RANK, which is what
-    the counts cannot express.
-    """
+    """SmolVLM and Idefics pad to the widest sample instead of flattening by image: with num_images = [2, 0] only tensor
+    rank tells the two layouts apart, which counts cannot express."""
     padded = torch.arange(2 * 2 * 3 * 4 * 4).reshape(2, 2, 3, 4, 4)
     sizes = torch.arange(2 * 2 * 2).reshape(2, 2, 2)
     chunks = grpo_vision_chunks(
@@ -669,9 +589,7 @@ def test_a_padded_image_tensor_stays_on_the_sample_axis():
 
 
 def test_a_flattened_image_tensor_is_still_sliced_by_image():
-    """The control. One row per image, [N, C, H, W], with the same counts: here the image
-    axis really is the first one, and slicing by sample would hand the second sample rows
-    that belong to the first."""
+    """Control: a flat one-row-per-image tensor [N, C, H, W] with the same counts must still be sliced by image, not by sample."""
     flat = torch.arange(2 * 3 * 4 * 4).reshape(2, 3, 4, 4)
     sizes = torch.arange(2 * 2).reshape(2, 2)
     chunks = grpo_vision_chunks(
@@ -689,15 +607,8 @@ def test_a_flattened_image_tensor_is_still_sliced_by_image():
 
 
 def test_a_patch_padded_image_tensor_outranks_the_flat_form_and_is_still_sliced_by_image():
-    """LLaVA-NeXT and LLaVA-OneVision pad on the PATCH axis, not the sample axis, so their
-    flattened pixel_values is [n_images, max_patches, C, H, W] -- one row per image, rank 5.
-
-    The rank test exists to tell a padded SAMPLE axis from a flat image axis, and those two
-    are only confusable while the image count equals the sample count. Here three images span
-    two samples, so the length already decides it, and applying the rank test anyway gave the
-    first sample one of its two images, gave the second the image belonging to the first, and
-    never forwarded the third at all.
-    """
+    """LLaVA-NeXT and LLaVA-OneVision pad on the patch axis: rank-5 [n_images, max_patches, C, H, W] is still one row
+    per image, so when the image count differs from the sample count, length decides, not rank."""
     # Row i is filled with i, so a row landing on the wrong sample is visible rather than inferred.
     flat = torch.stack([torch.full((5, 3, 2, 2), float(image)) for image in range(3)])
     sizes = torch.stack([torch.full((2,), float(image)) for image in range(3)])

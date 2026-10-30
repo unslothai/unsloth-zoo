@@ -14,6 +14,13 @@ import unsloth_zoo.mxfp4_stacked_experts as mse
 from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam
 
 
+@pytest.fixture(autouse = True)
+def _fresh_trace_answers(monkeypatch):
+    # A traced test on a real GPU caches a passing in-trace probe that a later test's eager call would reuse.
+    if hasattr(mg, "_TRACE_AVAILABLE"):
+        monkeypatch.setattr(mg, "_TRACE_AVAILABLE", {})
+
+
 @pytest.fixture
 def gpu(monkeypatch):
     """A verified CUDA device 0 of a chosen capability, no GPU needed."""
@@ -120,3 +127,71 @@ def test_unindexed_device_resolves_the_current_gpu_for_the_gemv_probe(monkeypatc
     assert mg.mxfp4_grouped_gemv_available(device, torch.float16)
     current[0] = 1
     assert not mg.mxfp4_grouped_gemv_available(device, torch.float16)
+
+
+@pytest.mark.parametrize("mode", ["compiling", "capturing"])
+@pytest.mark.parametrize("rows", [17, 2048])
+def test_stacked_experts_on_sm75_keep_the_device_schedule_when_traced(gpu, monkeypatch, mode, rows):
+    # The dequantize fallback reads routing offsets on the host (.tolist()), which causes a graph break, a fullgraph
+    # error and a CUDA graph capture error; compiled and captured calls keep the device schedule.
+    device = gpu((7, 5))
+    param = _expert_param(E = 32)
+    assert not mse._fused(_rows(rows, device), param, True)
+    assert not mse._fused(_rows(rows, device), param, False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: mode == "compiling")
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: mode == "capturing")
+    assert mse._fused(_rows(rows, device), param, True)
+    assert mse._fused(_rows(rows, device), param, False)
+
+
+def test_stacked_experts_traced_on_sm75_still_honour_the_off_switch(gpu, monkeypatch):
+    device = gpu((7, 5))
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "0")
+    assert not mse._fused(_rows(2048, device), _expert_param(E = 32), False)
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (12, 0)])
+@pytest.mark.parametrize("traced", [False, True])
+@pytest.mark.parametrize("rows", [1, 17, 2048])
+def test_sm80_and_newer_route_the_same_traced_or_not(gpu, monkeypatch, capability, traced, rows):
+    device = gpu(capability)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: traced)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: traced)
+    for transpose in (True, False):
+        assert mse._fused(_rows(rows, device), _expert_param(E = 32), transpose)
+
+
+@pytest.mark.parametrize("operand,current", [(1, 0), (0, 1), (1, 1)])
+def test_stacked_experts_on_sm75_see_a_capture_on_the_operand_gpu(gpu, monkeypatch, operand, current):
+    gpu((7, 5))
+    monkeypatch.setattr(mg, "_AVAILABLE_DTYPE", {
+        (str(torch.device("cuda", i)), dtype): True for i in (0, 1) for dtype in (torch.float16, torch.bfloat16)
+    })
+    state = {"current": current, "capturing": {operand}}
+
+    class _device:
+        def __init__(self, device):
+            self.index = torch.device(device).index
+
+        def __enter__(self):
+            self.prev, state["current"] = state["current"], self.index
+
+        def __exit__(self, *exc):
+            state["current"] = self.prev
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device", _device)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: state["current"])
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: state["current"] in state["capturing"])
+    param = _expert_param(E = 32)
+    inputs = _rows(2048, torch.device("cuda", operand))
+    assert mse._fused(inputs, param, True)
+    assert mse._fused(inputs, param, False)
+    assert state["current"] == current
+    state["capturing"] = set()
+    assert not mse._fused(inputs, param, True)
+    assert not mse._fused(inputs, param, False)

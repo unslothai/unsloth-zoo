@@ -386,6 +386,15 @@ class CachedAutotuner(Autotuner):
             kw = best_config["kwargs"]
             num_warps = best_config["num_warps"]
             num_stages = best_config["num_stages"]
+            # Unsloth: a cached num_warps the kernel's config list no longer offers (e.g. the 8-warp
+            # configs dropped on Blackwell with Triton < 3.8 for the TMEM tl.dot race) is not used.
+            allowed_warps = {c.num_warps for c in self.configs}
+            if allowed_warps and num_warps not in allowed_warps:
+                logger.debug(
+                    "Ignoring cached config for kernel %s: num_warps=%s is not in %s on this host",
+                    self.kernel_name, num_warps, sorted(allowed_warps),
+                )
+                return
 
             extra = {
                 "num_ctas": best_config["num_ctas"],

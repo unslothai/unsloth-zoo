@@ -343,6 +343,10 @@ _LOGGED_BACKENDS = set()
 
 
 def _log_moe_bnb4bit_backend_once(experts_module, message: str):
+    # Not while tracing: Dynamo guards on the set, so the first traced add makes gradient checkpoint recompute pick a
+    # different graph (CheckpointError on first backward).
+    if torch.compiler.is_compiling():
+        return
     key = (id(type(experts_module)), message)
     if key in _LOGGED_BACKENDS:
         return
@@ -366,7 +370,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
     storage; dequantized copies are temporary.
     """
     from .moe_utils import (
-        select_moe_backend,
+        select_moe_backend_without_sonic,
         forward_native_grouped_mm,
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
@@ -386,7 +390,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 
     # Same recompute-vs-pin policy as forward_native_grouped_mm; recompute keeps the packed Params4bit.
     if (
-        select_moe_backend() == "grouped_mm"
+        select_moe_backend_without_sonic(hidden_states.device) == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)
         and _is_bnb4bit_param(self.down_proj)
         and _moe_recompute_enabled(self.gate_up_proj, dtype=target_dtype)
@@ -400,7 +404,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
     if gate_up_weight is None or down_weight is None:
         return None  # not bnb4bit (mixed state) — fall through to caller
 
-    backend = select_moe_backend()
+    backend = select_moe_backend_without_sonic(hidden_states.device)
     if backend == "grouped_mm":
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-grouped_mm.")
         forward_fn = forward_native_grouped_mm
@@ -431,6 +435,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 _GENERIC_EXPERTS_FORWARD_FILE = ("transformers", "integrations", "moe.py")
 
 # Module global, passed as an argument below: _forward_statically_reads_stash only follows global names the forward calls.
+from . import moe_utils as _moe_utils
 from .moe_utils import get_forward_moe_backend
 
 
@@ -470,12 +475,23 @@ def _experts_layout_is_standard(module: nn.Module) -> bool:
 
 
 def _forward_generic_experts_eagerly(resolve_backend, self, hidden_states, top_k_index, top_k_weights):
-    """Traced by Dynamo, the backend recomputes a different graph under checkpointing (CheckpointError)."""
-    return resolve_backend()(self, hidden_states, top_k_index, top_k_weights)
+    """Kept out of compiled regions: traced there, the backend recomputed a different graph under
+    gradient checkpointing (CheckpointError). Unsloth's per-layer block compile keeps one graph per
+    layer across the recompute, so inside it (UNSLOTH_DECODE_COMPILE set) the backend is traced,
+    resolved ahead of time: the resolver's cache-file checks are not traceable."""
+    backend = None
+    if torch.compiler.is_compiling():
+        backend = _moe_utils._CACHED_FORWARD_MOE_BACKEND
+    if backend is None:
+        backend = resolve_backend()
+    return backend(self, hidden_states, top_k_index, top_k_weights)
 
 
 if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
-    _forward_generic_experts_eagerly = torch.compiler.disable(_forward_generic_experts_eagerly)
+    from .utils import torch_compiler_disable_unless_decode
+    _forward_generic_experts_eagerly = torch_compiler_disable_unless_decode(
+        _forward_generic_experts_eagerly, recursive = True
+    )
 
 
 def _drop_expert_parallel_sentinel(module, top_k_index, top_k_weights):
@@ -508,6 +524,7 @@ def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
 
     forward.__wrapped__ = original_forward
     forward.__doc__ = original_forward.__doc__
+    get_forward_moe_backend()  # resolve eagerly so a traced first call needs no file checks
     # Set only on classes routed here, so every patched family computes as before.
     klass._unsloth_own_apply_gate = _experts_have_own_apply_gate(module)
     klass.forward = forward
@@ -740,9 +757,8 @@ pass
 
 
 # ============================================================================
-# PEFT LoRA support for stacked-MoE bnb 4-bit experts.
-# Expose a Params4bit's logical 3-D shape to ParamWrapper and merge/unmerge via a
-# dequant -> add -> requant cycle so merge_and_unload() works on packed 4-bit storage.
+# PEFT LoRA support for stacked-MoE bnb 4-bit experts: exposes the logical 3-D shape to ParamWrapper; merge/unmerge runs
+# dequant, add, requant so merge_and_unload() works on packed storage.
 # ============================================================================
 
 class _ParamShapeProxy:
@@ -763,8 +779,8 @@ class _ParamShapeProxy:
 
     @property
     def dtype(self):
-        # Surface the pre-quant compute dtype so PEFT's `tensor.to(param.dtype)`
-        # casts don't truncate bf16 LoRA deltas to the uint8 packed storage dtype.
+        # Report the pre-quant compute dtype as param.dtype so PEFT's tensor.to(param.dtype) casts do not truncate bf16
+        # LoRA deltas to the uint8 packed storage dtype.
         quant_state = getattr(self._param, "quant_state", None)
         qs_dtype = getattr(quant_state, "dtype", None) if quant_state is not None else None
         if qs_dtype is not None and (qs_dtype.is_floating_point or qs_dtype.is_complex):
@@ -1077,7 +1093,9 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     from copy import deepcopy
 
     class _PerExpertStackDeserialize(ConversionOps):
-        def __init__(self, base_sources, anchored_sources, original_ops):
+        def __init__(self, base_sources, anchored_sources, original_ops, hf_quantizer = None):
+            # transformers >= 5.21 keeps checkpoint dtypes only for converters whose op has `hf_quantizer`.
+            self.hf_quantizer = hf_quantizer
             self.base_sources = base_sources          # e.g. ["mlp.experts.*.gate_proj.weight", ...]
             self.anchored_sources = anchored_sources  # same, "$"-anchored (collection keys)
             self.original_ops = original_ops          # model's ops, for unquantized fallback
@@ -1238,7 +1256,8 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
         them, replicate the model's ops so unquantized checkpoints are untouched.
         """
 
-        def __init__(self, base_source, anchored_source, original_ops):
+        def __init__(self, base_source, anchored_source, original_ops, hf_quantizer = None):
+            self.hf_quantizer = hf_quantizer
             self.base_source = base_source
             self.anchored_source = anchored_source
             self.original_ops = original_ops
@@ -1281,10 +1300,8 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
             # Logical 3D shape for PEFT LoRA's ParamWrapper.get_param.
             if getattr(new_value, "quant_state", None) is not None:
                 new_value._original_shape = new_value.quant_state.shape
-                # Orientation is baked in at quantize time (converters run before
-                # the quant op, so supported saves are always model layout). A
-                # same-rank mismatch means an unsupported checkpoint layout that a
-                # transpose op cannot fix on packed data: fail loudly here.
+                # Orientation is baked in at quantize time (converters run before the quant op, so saves are model
+                # layout); a same-rank mismatch is unsupported and cannot be transposed, so fail loudly.
                 try:
                     expected = tuple(model.get_parameter(full_layer_name).shape)
                 except Exception:
@@ -1308,8 +1325,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     for conv in model_conversions:
         if not isinstance(conv, WeightConverter):
             continue
-        # Single-target only: a twin returns target_patterns[0] alone, so a
-        # many-to-many mapping would leave its remaining targets unloaded.
+        # Single-target only: a twin returns target_patterns[0] alone, so a many-to-many mapping would leave its remaining targets unloaded.
         if len(conv.target_patterns) != 1:
             continue
         target = conv.target_patterns[0]
@@ -1325,7 +1341,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     target_patterns=target,
                     operations=[
                         _PerExpertStackDeserialize(
-                            base_sources, anchored_sources, deepcopy(conv.operations)
+                            base_sources, anchored_sources, deepcopy(conv.operations), hf_quantizer,
                         )
                     ],
                 )
@@ -1334,10 +1350,9 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
             len(conv.source_patterns) == 1
             and conv.source_patterns[0].endswith(("gate_up_proj", "down_proj"))
         ):
-            # Fused passthrough converter (e.g. qwen3_vl_moe's Transpose). The
-            # model converter precedes appended quantizer conversions and matching
-            # stops at the first hit, so without this twin a fused prequantized
-            # checkpoint feeds packed uint8 into the model's ops.
+            # Fused passthrough converter (e.g. qwen3_vl_moe's Transpose): the model converter precedes appended
+            # quantizer conversions and matching stops at the first hit, so without this twin packed uint8 reaches the
+            # model's ops.
             base = conv.source_patterns[0]
             anchored = base + "$"
             aux_sources = [base + suf for suf in _AUX_SUFFIXES]
@@ -1346,7 +1361,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     source_patterns=aux_sources + [anchored],
                     target_patterns=target,
                     operations=[
-                        _FusedExpertDeserialize(base, anchored, deepcopy(conv.operations))
+                        _FusedExpertDeserialize(base, anchored, deepcopy(conv.operations), hf_quantizer)
                     ],
                 )
             )
@@ -1485,7 +1500,7 @@ def patch_bnb4bit_keep_fused_experts():
 pass
 
 
-def _bnb4bit_split_fused_expert_conversions():
+def _bnb4bit_split_fused_expert_conversions(hf_quantizer = None):
     """Block-aligned `inter` splices packed bytes + absmax (bit-exact); else dequantize, concatenate, requantize."""
     from transformers.core_model_loading import WeightConverter, ConversionOps
     from transformers.quantizers.quantizers_utils import get_module_from_name
@@ -1513,7 +1528,9 @@ def _bnb4bit_split_fused_expert_conversions():
         return new_param
 
     class _SplitFusedExpertDeserialize(ConversionOps):
-        def __init__(self, bases, anchored):
+        def __init__(self, bases, anchored, hf_quantizer = None):
+            # Else transformers >= 5.21 (`HfQuantizer.get_new_dtype`) casts the fp32 quant_map / nested_absmax to the model dtype.
+            self.hf_quantizer = hf_quantizer
             self.bases = bases
             self.anchored = anchored
 
@@ -1617,7 +1634,7 @@ def _bnb4bit_split_fused_expert_conversions():
         converters.append(WeightConverter(
             source_patterns = aux + anchored,
             target_patterns = f"experts.{target}",
-            operations = [_SplitFusedExpertDeserialize(bases, anchored)],
+            operations = [_SplitFusedExpertDeserialize(bases, anchored, hf_quantizer)],
         ))
     return converters
 
@@ -1647,7 +1664,7 @@ def patch_bnb4bit_model_conversion_mapping():
                     logger.info(f"Unsloth: per-expert bnb4bit converters unavailable: {e}")
             # Unguarded: a failure must surface, not fall back to initialising packed stacks.
             if _model_keeps_swappable_fused_experts(model):
-                conversions = _bnb4bit_split_fused_expert_conversions() + conversions
+                conversions = _bnb4bit_split_fused_expert_conversions(hf_quantizer) + conversions
         return conversions
 
     patched_get_model_conversion_mapping._unsloth_moe_patched = True

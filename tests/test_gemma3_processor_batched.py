@@ -1,11 +1,5 @@
-"""Regression test for the Gemma3 batched-processor padding fix.
-
-Batched Gemma3 tokenization used to leave ragged input_ids after the double-BOS strip (the strip
-only shortened the row that still started with [bos, bos], i.e. the longest one), so BatchFeature
-could not stack them. _fix_double_bos_and_pad strips the duplicate BOS on every row and pads all
-sequence fields. Padding follows the HF contract: it honours "do_not_pad"/False, pads list output
-even when return_tensors is None, and targets max_length when padding="max_length".
-"""
+"""Gemma3 batched padding regression: _fix_double_bos_and_pad strips the duplicate BOS on every row and pads all
+sequence fields; follows the HF padding contract for do_not_pad, list output and max_length."""
 from unsloth_zoo.temporary_patches.gemma import _fix_double_bos_and_pad, _resolve_truncation
 
 BOS, PAD, IMG = 2, 0, 99
@@ -62,8 +56,7 @@ def test_max_length_padding():
 
 
 def test_existing_token_type_ids_stripped_in_lockstep():
-    # Tokenizer-provided token_type_ids must be BOS-stripped too, or the row desyncs
-    # when return_mm_token_type_ids is False (True overwrites them anyway).
+    # Tokenizer-provided token_type_ids must be BOS-stripped too, or rows desync when return_mm_token_type_ids is False (True overwrites them anyway).
     text_inputs = {
         "input_ids": [[BOS, BOS, 10, 11], [BOS, BOS, 20]],
         "attention_mask": [[1, 1, 1, 1], [1, 1, 1]],

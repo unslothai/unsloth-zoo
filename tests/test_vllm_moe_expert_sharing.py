@@ -13,12 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""fast_inference on sparse MoE: the training model must ALIAS vLLM's expert weights.
-
-Loading and generating prove nothing here, because generation runs inside vLLM and never
-reads the HF module. These pin storage identity, the layouts that must be refused instead
-of aliased, the router staying a router, and the Gemma 4 adapter rename.
-"""
+"""fast_inference on sparse MoE: the training model must ALIAS vLLM's expert weights, since generation never reads the
+HF module; tests pin storage identity, refused layouts, the router, and the Gemma 4 adapter rename."""
 import sys, os, types
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -178,7 +174,7 @@ def test_gemma4_lora_keys_are_renamed_onto_moe_experts(monkeypatch):
     monkeypatch.setattr(vu, "_get_vllm_model_runner", lambda model: None)
     monkeypatch.setattr(vu, "_get_vllm_lora_model", lambda model, runner = None: types.SimpleNamespace())
     monkeypatch.setattr(vu, "_get_vllm_lora_manager", lambda model, runner = None: None)
-    monkeypatch.setattr(vu, "_vllm_lora_target_names", lambda vllm_model, manager = None: (names, set()))
+    monkeypatch.setattr(vu, "_vllm_lora_target_names", lambda vllm_model, manager = None, lora_config = None: (names, set()))
 
     def resolve(key, mapper):
         key = key.replace("base_model.model.model.language_model.", "language_model.model.")
@@ -206,7 +202,7 @@ def _fake_vllm_targets(monkeypatch, vu, names):
     monkeypatch.setattr(vu, "_get_vllm_model_runner", lambda model: None)
     monkeypatch.setattr(vu, "_get_vllm_lora_model", lambda model, runner = None: types.SimpleNamespace())
     monkeypatch.setattr(vu, "_get_vllm_lora_manager", lambda model, runner = None: None)
-    monkeypatch.setattr(vu, "_vllm_lora_target_names", lambda vllm_model, manager = None: (names, set()))
+    monkeypatch.setattr(vu, "_vllm_lora_target_names", lambda vllm_model, manager = None, lora_config = None: (names, set()))
 
     def resolve(key, mapper):
         key = key.replace("base_model.model.model.language_model.", "language_model.model.")

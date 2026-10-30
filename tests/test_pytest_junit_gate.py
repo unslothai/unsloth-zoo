@@ -1,21 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""
-scripts/pytest_junit_gate.py replaces a second pytest run with a read of the
-first run's JUnit XML, so it has to reach the same verdict the greps did.
-
-The reports here are produced by really running pytest on generated files rather
-than by hand-writing XML: the whole point of the change is that pytest's report
-format, not our idea of it, decides the gate. The malformed cases (empty file,
-truncated XML, wrong root, count mismatch) are written by hand because pytest
-cannot be asked to emit them.
-
-The case worth naming is the module skipped at import -- `pytest.importorskip`
-at module level, which is how every MLX file behaves without the real runtime.
-It exits 0, prints "1 skipped", and pytest records it as ONE testcase carrying
-<skipped>. A gate that only asked "were there failures?" calls that green; both
-policies here refuse it.
-"""
+"""Tests scripts/pytest_junit_gate.py against real pytest JUnit XML and malformed reports, matching the old greps; a
+module-level skip, one testcase with skipped, is refused by both policies."""
 
 from __future__ import annotations
 
@@ -41,8 +27,7 @@ def _load_gate():
 gate = _load_gate()
 
 
-# name -> (source, expected pytest exit status). The statuses are asserted so a
-# future pytest that stops writing a report for one of these shows up here.
+# Maps case name to (source, expected pytest exit status); the status is asserted so a pytest that stops writing a report for one shows up here.
 _SOURCES = {
     "all_pass": ("def test_a():\n    assert True\n\ndef test_b():\n    assert True\n", 0),
     "one_skip": (
@@ -138,11 +123,7 @@ def test_a_report_with_no_tests_fails_every_policy(reports, policy: str) -> None
 
 
 def test_xfail_is_neither_a_skip_nor_a_pass(reports) -> None:
-    """
-    pytest writes an xfail as <skipped type="pytest.xfail"> but summarises it as
-    "xfailed". The greps read the summary, so an xfail neither tripped no-skips
-    nor satisfied one-passed; keep it that way.
-    """
+    """pytest writes an xfail as <skipped type=pytest.xfail> yet summarises it as xfailed; it must trip neither no-skips nor one-passed, as the greps did."""
     counts = gate.read_report(reports["xfail"])
     assert (counts.xfailed, counts.skipped, counts.passed) == (1, 0, 1)
     assert _run(reports["xfail"], "no-skips") == 0
@@ -169,8 +150,7 @@ def test_a_missing_report_fails_rather_than_passing(tmp_path) -> None:
         ("wrong_root", "<coverage line-rate='1'/>"),
         (
             "count_mismatch",
-            # Declares two cases, carries one: a partial write must not be read as
-            # a clean run of the one case that made it to disk.
+            # Declares two cases but writes one: a partial write must not be read as a clean run of the one case that reached disk.
             '<testsuites><testsuite tests="2" errors="0" failures="0" skipped="0">'
             '<testcase classname="t" name="test_a"/></testsuite></testsuites>',
         ),
@@ -204,19 +184,14 @@ def test_unknown_policy_is_rejected() -> None:
 
 
 def test_the_workflow_gates_use_this_script_and_do_not_re_run_pytest() -> None:
-    """
-    The saving is the point: if a gate step ever grows a second pytest
-    invocation of the file it is gating, this change has been undone.
-    """
+    """Gate steps must read the JUnit report rather than re-run pytest on the gated file; a second invocation would undo the saving."""
     yaml = pytest.importorskip("yaml")
     workflow = REPO_ROOT / ".github" / "workflows" / "consolidated-tests-ci.yml"
     doc = yaml.safe_load(workflow.read_text(encoding = "utf-8"))
     steps = doc["jobs"]["mlx-cpu-linux"]["steps"]
 
     gates = [ s for s in steps if (s.get("name") or "").startswith("Fail if") ]
-    # Counted against the reports rather than a fixed number: each new MLX suite adds
-    # one gated pytest step and one gate (#968, #819 and #965 took this from 5 to 8),
-    # and what matters is that every report has exactly one gate reading it.
+    # Counts gates against the reports, not a fixed number: each MLX suite adds a gated step (issues 968, 819, 965), and every report needs exactly one gate.
     assert gates, "no gate steps found in mlx-cpu-linux"
 
     reports_written = {

@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Mllama collation: batches mixing image and text-only rows, and prompt-completion cross_attention_mask.
-
-Hermetic CPU tests with a stub processor that follows MllamaProcessor: it rejects a batch where only
-some rows have images, and emits a per-token cross_attention_mask that is 1 from the image token on.
-"""
+"""Mllama collation of mixed image and text-only batches and prompt-completion cross_attention_mask; the stub processor
+rejects batches where only some rows have images, like MllamaProcessor, and masks from the image token on."""
 
 from __future__ import annotations
 

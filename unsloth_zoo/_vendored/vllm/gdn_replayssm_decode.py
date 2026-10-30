@@ -11,13 +11,27 @@ import triton.language as tl
 
 
 # Modified by Unsloth: the upstream launch-config table (vllm replayssm_config.py,
-# "gdn_decode" entry of vllm-project/vllm#48792) is inlined, since released vLLM has no GDN entry.
-def get_replayssm_config(kernel: str, L: int = 16) -> tuple:
-    """(block_v, num_warps, num_stages, nk) for the GDN ReplaySSM decode kernel."""
-    major, _ = torch.cuda.get_device_capability()
-    if major >= 10:
+# "gdn_decode" entry of vllm-project/vllm#48792) is inlined, since released vLLM has no GDN entry,
+# plus a T4 (sm75) entry 2-25x faster there than (64, 1, 3, 2) (B=1..64). Cached per device.
+_REPLAYSSM_CONFIG_BY_DEVICE = {}
+
+
+def _gdn_decode_config(capability) -> tuple:
+    if capability[0] >= 10:
         return 128, 1, 3, 4
+    if tuple(capability) == (7, 5):
+        return 32, 1, 1, 4
     return 64, 1, 3, 2
+
+
+def get_replayssm_config(kernel: str, L: int = 16, device = None) -> tuple:
+    """(block_v, num_warps, num_stages, nk) for the GDN ReplaySSM decode kernel."""
+    if device is None or device.index is None:
+        return _gdn_decode_config(torch.cuda.get_device_capability(device))
+    cfg = _REPLAYSSM_CONFIG_BY_DEVICE.get(device)
+    if cfg is None:
+        cfg = _REPLAYSSM_CONFIG_BY_DEVICE[device] = _gdn_decode_config(torch.cuda.get_device_capability(device))
+    return cfg
 
 
 @triton.jit
@@ -342,14 +356,15 @@ def fused_recurrent_gated_delta_rule_replayssm(
     max_cache_len = d_cache.shape[2]
 
     # Explicit launch parameters override the defaults for this buffer length.
-    cfg_bv, cfg_nw, cfg_ns, cfg_nk = get_replayssm_config("gdn_decode", L=max_cache_len)
+    cfg_bv, cfg_nw, cfg_ns, cfg_nk = get_replayssm_config("gdn_decode", L=max_cache_len, device=mixed_qkv.device)
     if block_v is None:
         block_v = cfg_bv
     if num_warps is None:
         num_warps = cfg_nw
     if num_stages is None:
         num_stages = cfg_ns
-    if nk is None:
+    nk_from_config = nk is None
+    if nk_from_config:
         nk = cfg_nk
 
     # Cache shape sanity (per state slot): d=(HV, L, V), k=(H, L, K), g=(HV, L).
@@ -376,6 +391,10 @@ def fused_recurrent_gated_delta_rule_replayssm(
         raise ValueError(
             f"Cached decode kernel only supports NK_global=1 (got K={K}, BK={BK})."
         )
+    if nk_from_config:
+        # Modified by Unsloth: fewer K splits for small K, where the table's nk (4 on sm75 and
+        # sm100+) would leave BKT < 16. An explicit nk is still validated as given.
+        nk = max(1, min(nk, BK // 16))
     if BK % nk != 0:
         raise ValueError(f"nk={nk} must divide BK={BK}.")
     BKT = BK // nk

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Long eval calls of GptOssExpertsBnb4bit skip the all-experts dense branch (unsloth#3411),
-through both the bound torch_native_forward and the class body the compiled cache emits."""
+"""Long eval calls of GptOssExpertsBnb4bit skip the all-experts dense branch (unsloth issue 3411), via both torch_native_forward and the compiled class body."""
 import ast
 import inspect
 import os

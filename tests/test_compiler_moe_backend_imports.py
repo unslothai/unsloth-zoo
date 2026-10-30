@@ -36,8 +36,7 @@ def _free_names(source, name):
 
 
 def test_compiled_module_imports_every_name_forward_moe_backend_reads():
-    # The compiler copies forward_moe_backend into unsloth_compiled_module_*.py, where only
-    # the names in its injected `from moe_utils import (...)` block resolve.
+    # The compiler copies forward_moe_backend into unsloth_compiled_module_*.py, where only names in its injected from moe_utils import (...) block resolve.
     compiler = (ROOT / "unsloth_zoo" / "compiler.py").read_text(encoding = "utf-8")
     block = re.search(r'"    from moe_utils import \(\\n"(.*?)"    \)\\n"', compiler, re.S)
     assert block is not None

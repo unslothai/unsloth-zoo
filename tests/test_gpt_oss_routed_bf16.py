@@ -28,6 +28,13 @@ DT = getattr(torch, os.environ.get("UNSLOTH_TEST_DTYPE", "")) if os.environ.get(
     torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16)
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
+SUB_SM80 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8
+
+
+def _needs_16bit_routing(tokens):
+    # Below sm80 (T4) the 16-bit routed kernels take one-token decode only (they lose to grouped_mm above that).
+    if SUB_SM80 and tokens > 1:
+        pytest.skip("below sm80 16-bit routed decode is one-token only")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "Triton kernels need CUDA")
 
 peft = pytest.importorskip("peft")
@@ -132,6 +139,7 @@ def test_routed_gemm_matches_reference(T):
 @pytest.mark.parametrize("lora", [False, True], ids = ["base", "lora"])
 @pytest.mark.parametrize("T", [1, 5])
 def test_routed_forward_matches_effective_weights(lora, T):
+    _needs_16bit_routing(T)
     model, mlp = _toy(lora)
     x = torch.randn(1, T, H, device = "cuda").to(DT)
     idx, wts = _routes(T, 7)
@@ -186,8 +194,7 @@ def test_fullgraph_compile_and_cuda_graph_replay_with_changed_routes(lora):
 
 
 def test_decode_path_applies_expert_lora():
-    """moe_forward_inference_bf16 (the compiled qlen == 1 decode branch) used to unwrap PEFT and
-    read the base expert weights, so generation ignored expert LoRA that training applied."""
+    """moe_forward_inference_bf16's compiled qlen == 1 decode branch must apply expert LoRA; unwrapping PEFT to read base expert weights made generation ignore it."""
     from unsloth_zoo.temporary_patches.gpt_oss import moe_forward_inference_bf16
     model, mlp = _toy(True)
     x = torch.randn(1, 1, H, device = "cuda").to(DT)
@@ -203,6 +210,7 @@ def test_decode_path_applies_expert_lora():
 
 
 def test_param_wrapper_hook_routes_only_at_the_outermost_wrapper():
+    _needs_16bit_routing(3)
     from unsloth_zoo.temporary_patches.moe_utils import _gpt_oss_routed_wrapper_forward
     _, mlp = _toy(lora = True)
     outer = mlp.experts
@@ -224,8 +232,8 @@ def test_param_wrapper_hook_routes_only_at_the_outermost_wrapper():
 @pytest.mark.parametrize("lora", [False, True])
 @pytest.mark.parametrize("B", [1, 3])
 def test_routed_mlp_forward_matches_module_on_batched_decode(monkeypatch, lora, B):
-    """routed_mlp_forward gets [B, 1, H] decode states. The transformers 5 router normalizes its
-    top-k scores with softmax(dim=1), so it has to see [tokens, H], else every pick weighs 1."""
+    """routed_mlp_forward gets [B, 1, H] decode states; transformers 5's router softmaxes top-k scores over dim=1, so it must see [tokens, H] or every pick weighs 1."""
+    _needs_16bit_routing(B)
     from unsloth_zoo.temporary_patches.gpt_oss_routed import routed_mlp_forward
     model, mlp = _toy(lora)
     x = torch.randn(B, 1, H, device = "cuda").to(DT)

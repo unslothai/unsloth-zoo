@@ -29,23 +29,123 @@ ZOO = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
 # Subscript calls that are not Triton launches.
 _NOT_LAUNCHES = {
+    "fused_losses/fused_linear.py": {"_OPS"},
     "temporary_patches/gpt_oss.py": {"self.gate_up_projs", "self.down_projs"},
     "temporary_patches/moe_grouped_modulelist.py": {"spec"},
     "temporary_patches/moe_utils.py": {"registry"},
+    # Custom ops out of the pinned-op tuple, and a weakref read out of a cache entry.
+    "temporary_patches/moe_utils_sonic.py": {"_pinned_ops()", "hit"},
 }
 # Launches that deliberately disable contraction to match an eager reference bit for bit.
 _DELIBERATE_FALSE = {
     "merged_rollout_exact.py:_exact_merge_kernel",
     "temporary_patches/gpt_oss_grouped_qlora.py:_nf4_dequant_stack_kernel",
     "temporary_patches/moe_routed.py:_nf4_select_dequant_kernel",
+    "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel",
+    "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel.fn",
+    "temporary_patches/moe_fused_swiglu.py:_swiglu_fwd_kernel",
+    "temporary_patches/moe_fused_swiglu.py:_swiglu_bwd_kernel",
     "temporary_patches/moe_triton_kernels.py:kernel",
     "temporary_patches/moe_triton_kernels.py:fwd",
     "temporary_patches/moe_triton_kernels.py:bwd_dy",
     "temporary_patches/moe_triton_kernels.py:bwd_dw",
+    # aten rounds every multiply before the add that follows it (_NO_FMA in that module).
+    "gpt_oss_decode_fused.py:_add_rms_norm_kernel",
+    "gpt_oss_decode_fused.py:_sink_scale_kernel",
+    # Replaces the compiled apply_rotary_pos_emb region and is checked against it bitwise.
+    "gpt_oss_decode_fused.py:_rope_decode_kernel",
 }
 
 
-def _launch_sites():
+def _assigned_names(scope_body):
+    return {
+        node.targets[0].id: node.value
+        for node in scope_body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+    }
+
+
+def _kwargs_dicts(tree):
+    """id(launch call) -> the dict(...) / {...} each `**name` it splats was assigned in its function, or at
+    module level (a function-local name wins). `a if cond else b` contributes both branches."""
+    module = _assigned_names(tree.body)
+    out = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        dicts = dict(module)
+        dicts.update(_assigned_names(ast.walk(func)))
+        for node in ast.walk(func):
+            if isinstance(node, ast.Call):
+                splats = [k.value.id for k in node.keywords if k.arg is None and isinstance(k.value, ast.Name)]
+                values = [dicts[n] for n in splats if n in dicts]
+                out[id(node)] = [
+                    branch
+                    for value in values
+                    for branch in ((value.body, value.orelse) if isinstance(value, ast.IfExp) else (value,))
+                ]
+    return out
+
+
+def _fp_fusion_values(node, splatted):
+    values = [k.value for k in node.keywords if k.arg == "enable_fp_fusion"]
+    for value in splatted:
+        if isinstance(value, ast.Call) and getattr(value.func, "id", None) == "dict":
+            values += [k.value for k in value.keywords if k.arg == "enable_fp_fusion"]
+        elif isinstance(value, ast.Dict):
+            values += [v for k, v in zip(value.keys, value.values) if isinstance(k, ast.Constant) and k.value == "enable_fp_fusion"]
+    return values
+
+
+def _params(func):
+    args = func.args
+    names = [a.arg for a in args.posonlyargs + args.args + args.kwonlyargs]
+    names += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
+    return set(names)
+
+
+def _enclosing(tree):
+    """id(node) -> the innermost function holding it, and id(node) -> the `if` tests above it there."""
+    func_of, tests_of = {}, {}
+
+    def visit(node, func, tests):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child, [])
+                continue
+            func_of[id(child)], tests_of[id(child)] = func, tests
+            if isinstance(node, ast.If) and child in node.body:
+                visit(child, func, tests + [node.test])
+            else:
+                visit(child, func, tests)
+
+    visit(tree, None, [])
+    return func_of, tests_of
+
+
+def _options_names(tree):
+    """Names the module's functions collect launch options under (`def launch(..., **options)`)."""
+    return {
+        f.args.kwarg.arg for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.args.kwarg is not None
+    }
+
+
+def _forwards_options(node, func, options):
+    """A launch inside a generic launcher: it splats the options the launcher was called with, so the
+    flag comes from the launcher's callers, which are checked instead. Splatting only constexprs
+    does not count."""
+    return func is not None and any(
+        k.arg is None and isinstance(k.value, ast.Name) and k.value.id in options & _params(func)
+        for k in node.keywords
+    )
+
+
+def _interpreter_only(tests):
+    # TRITON_INTERPRET runs the kernel in Python: nothing is compiled, so there is no fusion to state.
+    return any(isinstance(t, ast.Name) and "INTERPRET" in t.id for t in tests)
+
+
+def _module_trees():
     for path in sorted(ZOO.rglob("*.py")):
         rel = path.relative_to(ZOO).as_posix()
         if "_vendored" in rel:
@@ -53,20 +153,75 @@ def _launch_sites():
         src = path.read_text(encoding = "utf-8")
         if "triton" not in src:
             continue
-        for node in ast.walk(ast.parse(src)):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript):
+        yield rel, src, ast.parse(src)
+
+
+def _launcher_entry_points(trees):
+    """{module dotted name: {function}} for functions taking **options in a module whose launches
+    forward options: calling one of them is a launch."""
+    out = {}
+    for rel, _src, tree in trees:
+        func_of, _ = _enclosing(tree)
+        options = _options_names(tree)
+        forwarding = any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript)
+            and _forwards_options(node, func_of.get(id(node)), options)
+            for node in ast.walk(tree)
+        )
+        if forwarding:
+            module = rel[: -len(".py")].replace("/", ".")
+            out[module] = {
+                f.name for f in tree.body if isinstance(f, ast.FunctionDef) and f.args.kwarg is not None
+            }
+    return out
+
+
+def _launcher_aliases(rel, tree, entry_points):
+    """Local names bound to a launcher entry point by `from .module import f [as g]`."""
+    package = rel.split("/")[:-1]
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            base = package[: len(package) - (node.level - 1)] if node.level else []
+            module = ".".join(base + node.module.split(".")) if node.level else node.module.removeprefix("unsloth_zoo.")
+            for alias in node.names:
+                if alias.name in entry_points.get(module, ()):
+                    aliases[alias.asname or alias.name] = alias.name
+    return aliases
+
+
+def _launch_sites():
+    trees = list(_module_trees())
+    entry_points = _launcher_entry_points(trees)
+    for rel, src, tree in trees:
+        splats = _kwargs_dicts(tree)
+        func_of, tests_of = _enclosing(tree)
+        options = _options_names(tree)
+        aliases = _launcher_aliases(rel, tree, entry_points)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Subscript):
                 name = ast.get_source_segment(src, node.func.value)
                 if name in _NOT_LAUNCHES.get(rel, ()):
                     continue
-                yield rel, name, node
+                if _forwards_options(node, func_of.get(id(node)), options) or _interpreter_only(
+                    tests_of.get(id(node), [])
+                ):
+                    continue
+            elif isinstance(node.func, ast.Name) and node.func.id in aliases and node.args:
+                name = ast.get_source_segment(src, node.args[0])
+            else:
+                continue
+            yield rel, name, node, splats.get(id(node), [])
 
 
 def test_every_launch_states_fp_fusion():
     sites = list(_launch_sites())
-    assert len(sites) >= 20, [(r, n) for r, n, _ in sites]
+    assert len(sites) >= 20, [(r, n) for r, n, _, _ in sites]
     missing, wrong = [], []
-    for rel, name, node in sites:
-        values = [k.value for k in node.keywords if k.arg == "enable_fp_fusion"]
+    for rel, name, node, splatted in sites:
+        values = _fp_fusion_values(node, splatted)
         if not values:
             missing.append(f"{rel}:{node.lineno}:{name}")
             continue

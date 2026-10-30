@@ -76,11 +76,7 @@ def _log_info(message: str):
 
 
 def _warn_without_raising(message):
-    """warnings.warn, except that it cannot be the thing that fails the import.
-
-    install_to_cache() runs at import and simplefilter("error") would turn this
-    into a raise, for a condition already handled by not using the file.
-    """
+    """A warnings.warn that cannot fail the import: install_to_cache() runs at import, where simplefilter('error') would turn the warning into a raise."""
     try:
         warnings.warn(message)
     except Exception:
@@ -97,21 +93,14 @@ def _read_file_bytes(path):
 
 
 def _replace_with_copy(current_file, destination):
-    """Copy over `destination` by replacing the path, not by writing into it.
-
-    shutil.copy() opens the destination, so a read-only one refuses it, and it
-    is not atomic while nothing locks this file and every rank installs it at
-    import. os.replace() needs only the directory and is atomic.
-    """
+    """Use os.replace of a temp file, not shutil.copy: copy opens the destination, which read-only files refuse, and is not atomic across ranks at import."""
     directory = os.path.dirname(destination) or "."
     descriptor, temporary = tempfile.mkstemp(
         prefix = f".{os.path.basename(destination)}.", suffix = ".tmp", dir = directory,
     )
     try:
-        # Through the DESCRIPTOR, not by reopening the name, or the copy and the
-        # mode follow that name somewhere else; this directory is writable by
-        # whoever would plant a copy here. Same shape as
-        # compiler._replace_compiled_cache_file.
+        # Write through the descriptor, not by reopening the name, since this directory is writable by whoever could
+        # plant a copy and redirect the name; same as compiler._replace_compiled_cache_file.
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = None
             with open(current_file, "rb") as source:
@@ -138,12 +127,8 @@ def _replace_with_copy(current_file, destination):
 
 
 def install_to_cache(source_path, destination_filename=None):
-    """Copy a file into unsloth_compiled_cache so compiled modules can use it.
-
-    Returns whether the copy is known to match `source_path`. Runs at import
-    time, so an unwritable directory is not fatal; a destination that exists and
-    does NOT match is reported, since _load_cached_moe_utils_module() execs it.
-    """
+    """Returns whether the cache copy is known to match source_path; an unwritable dir is not fatal, but a mismatched
+    existing file is reported since _load_cached_moe_utils_module() execs it."""
     compile_location = _get_compile_location()
     if not os.path.exists(compile_location):
         try:
@@ -162,18 +147,15 @@ def install_to_cache(source_path, destination_filename=None):
 
     current = _read_file_bytes(current_file)
     if current is not None and _read_file_bytes(destination) == current:
-        # Already installed. This runs on every `import unsloth_zoo`, on every
-        # rank, and copies this whole module, so without the compare the steady
-        # state was replacing a file with an identical copy of itself.
+        # Already installed: this runs on every import of unsloth_zoo on every rank and copies this whole module, so
+        # without the compare each import would overwrite it with an identical copy.
         return True
 
     try:
         _replace_with_copy(current_file, destination)
     except Exception as replace_error:
-        # A directory we cannot add a temp file to can still hold a destination
-        # we can write through, so the plain copy is worth one attempt. It gives
-        # up the atomicity above, so the readback below is what keeps a partial
-        # copy from being used.
+        # If a temp file cannot be made here, a plain copy is still tried to a destination we can write through; it
+        # loses atomicity, so the readback below guards against partial copies.
         try:
             # Writing through a planted symlink would clobber whatever it targets.
             if os.path.islink(destination) or os.path.isdir(destination):
@@ -188,8 +170,7 @@ def install_to_cache(source_path, destination_filename=None):
     current = _read_file_bytes(current_file)
     installed = _read_file_bytes(destination)
     if installed is None or current is None:
-        # Nothing landed, or there is nothing to compare it against. Either way
-        # no compiled module gets to use it.
+        # Returns False when nothing landed or there is nothing to compare against, so no compiled module uses the cache copy.
         return False
     if installed == current:
         return True
@@ -211,12 +192,8 @@ _WARNED_STALE_CACHE = set()
 
 
 def _cached_copy_is_current(cache_file, current_file) -> bool:
-    """Whether the compiled cache holds byte for byte what this module is.
-
-    They diverge when the copy could not be written, leaving an OLDER
-    unsloth_zoo that every caller below would prefer, silently installing that
-    release's patches over this one's. Prefer this module, and say so once.
-    """
+    """Whether the compiled cache holds this module byte for byte; a failed write could leave an older unsloth_zoo that
+    callers would silently install, so this module is preferred and reported once."""
     cached = _read_file_bytes(cache_file)
     current = _read_file_bytes(current_file)
     if cached is None or current is None:
@@ -237,18 +214,14 @@ def _cached_copy_is_current(cache_file, current_file) -> bool:
 
 
 def _remove_cached_bytecode(source_file):
-    """Drop the pyc beside a cache copy we are about to execute.
-
-    The comparison covers the .py only, and CPython runs an unchecked-hash pyc
-    without consulting it, so a pyc we cannot remove means using our own defs.
-    """
+    """Drop the .pyc beside a cache copy before executing it: the byte check covers only the .py, and CPython runs an
+    unchecked-hash pyc unseen, so an undroppable pyc means falling back to our own defs."""
     try:
         bytecode_location = importlib.util.cache_from_source(source_file)
     except NotImplementedError:
         return True
-    # A symlinked `__pycache__` sends this unlink outside the cache. Refusing
-    # costs the cache copy and falls back to our own definitions, which beats
-    # deleting somebody else's file. sys.pycache_prefix is the user's own.
+    # A symlinked __pycache__ would send this unlink outside the cache, so refuse and use our own definitions; skipped
+    # when sys.pycache_prefix is set, as that location is the user's own.
     if not getattr(sys, "pycache_prefix", None):
         try:
             if os.path.islink(os.path.dirname(bytecode_location)):
@@ -265,22 +238,11 @@ def _remove_cached_bytecode(source_file):
 
 
 def cached_copy_is_importable(directory) -> bool:
-    """Whether a generated module may be allowed to import moe_utils from here.
-
-    A path that exists and is not a real directory is never trusted: zipimport
-    is a default sys.path hook, so a ZIP named `unsloth_compiled_cache` passed
-    every isfile check and served moe_utils out of the archive.
-
-    True when there is no copy at all; the caller runs
-    compiler._reject_shadowing_import_candidates first, which refuses a
-    moe_utils package, extension or sourceless pyc. Matching bytes are necessary
-    and NOT sufficient, hence the name: a bare import prefers the pyc, so it is
-    dropped here and one that cannot be dropped means no.
-    """
+    """Never trusts a path that exists but is not a real directory (zipimport); no copy at all is True, but the caller
+    must first run compiler._reject_shadowing_import_candidates; matching bytes are necessary, not sufficient;
+    undroppable pyc means False."""
     try:
-        # Exists but is not a directory, not merely "is not a directory": a path
-        # that does not exist yet imports nothing and stays trusted, which is
-        # what a cache folder looks like before it is created.
+        # Only an existing non-directory is rejected; a missing path imports nothing and stays trusted, as a cache folder does before it is created.
         if os.path.exists(directory) and not os.path.isdir(directory):
             return False
         cache_file = os.path.abspath(os.path.join(directory, "moe_utils.py"))
@@ -305,10 +267,7 @@ def _load_cached_moe_utils_module():
         _CACHED_MOE_UTILS_MODULE = None
         return None
 
-    # The cache copy is only ever a copy of this file, so bytes that differ are
-    # bytes install_to_cache() did not put there, and exec_module() below runs
-    # whatever is in the file. Use this module's own definitions instead, which
-    # is what every caller falls back to anyway.
+    # Differing cache bytes were not put there by install_to_cache(), yet exec_module would run them; return None and use this module's own definitions instead.
     cached_bytes = _read_file_bytes(cache_file)
     if cached_bytes is None or cached_bytes != _read_file_bytes(current_file):
         return None
@@ -345,14 +304,26 @@ def _load_cached_moe_utils_module():
         return None
 
 
+def _select_moe_backend_eagerly(module):
+    # Selecting inside a trace sets a guarded global and recompiles the graph once.
+    if torch.compiler.is_compiling():
+        return
+    try:
+        module.select_moe_backend()
+    except Exception:
+        pass
+
+
 def get_forward_moe_backend():
     """Resolve forward_moe_backend from the compiled cache copy, else the local def."""
     global _CACHED_FORWARD_MOE_BACKEND
     module = _load_cached_moe_utils_module()
     if module is not None and hasattr(module, "forward_moe_backend"):
+        _select_moe_backend_eagerly(module)
         _CACHED_FORWARD_MOE_BACKEND = module.forward_moe_backend
         return _CACHED_FORWARD_MOE_BACKEND
 
+    _select_moe_backend_eagerly(sys.modules[__name__])
     _CACHED_FORWARD_MOE_BACKEND = forward_moe_backend
     return _CACHED_FORWARD_MOE_BACKEND
 
@@ -363,20 +334,35 @@ _assume_constant_result = getattr(torch.compiler, "assume_constant_result", None
     getattr(torch._dynamo, "assume_constant_result", lambda fn: fn)
 
 
+def _match_grouped_mm_dtypes(inputs, weight):
+    """torch._grouped_mm needs equal dtypes and is not on the autocast cast list: cast to the autocast dtype like
+    F.linear (autograd tracked, so fp32 masters keep their grad), else promote to the wider dtype."""
+    if inputs.dtype == weight.dtype or not (inputs.is_floating_point() and weight.is_floating_point()):
+        return inputs, weight
+    device_type = inputs.device.type
+    try:
+        autocast_dtype = (
+            torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type) else None
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        autocast_dtype = None
+    if autocast_dtype in (torch.float16, torch.bfloat16):
+        return inputs.to(autocast_dtype), weight.to(autocast_dtype)
+    dtype = torch.promote_types(inputs.dtype, weight.dtype)
+    return inputs.to(dtype), weight.to(dtype)
+
+
 def _grouped_mm_with_backward_fix(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
-    """Grouped matmul; passes the weight as a transposed view (no copy) when safe.
-
-    Forcing weight.contiguous() copies the frozen base stack (~805 MB for gate_up on Qwen3-30B,
-    ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
-    and a one-time probe confirms the view matches the contiguous copy on this device before we
-    skip the copy; else we keep the copy. Falls back to a per-group matmul when the device has no
-    torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
-    path in forward and backward. Small experts may first take the Triton grouped GEMM.
-    """
+    """Passes the weight as a non-contiguous view when a one-time per-device probe matches the contiguous copy
+    (bit-exact), else keeps the copy; falls back to per-group matmul on a 16-byte stride error or no
+    torch._grouped_mm."""
     if _triton_grouped_mm_wanted(inputs, weight):
         return _triton_grouped_mm(inputs, weight, offsets)
+    if inputs.dtype != weight.dtype:
+        # Cast first so fp16 x fp32 masters reaches the compile-safe fp16 op below.
+        inputs, weight = _match_grouped_mm_dtypes(inputs, weight)
     if (
         inputs.dtype == torch.float16
         and weight.dtype == torch.float16
@@ -388,14 +374,15 @@ def _grouped_mm_with_backward_fix(
 
 
 def _grouped_mm_eager(inputs, weight, offsets):
+    if inputs.dtype != weight.dtype:
+        inputs, weight = _match_grouped_mm_dtypes(inputs, weight)
     inputs = inputs.contiguous()
-    # The Triton backend is picked precisely when the probe says no, yet its separated
-    # LoRA delta still routed here. torch 2.8 hard-raises unless `dprops->major == 9`
-    # (Blas.cpp, sm90_only) and 2.6/2.7 have no `_grouped_mm`, so a LoRA MoE died on
-    # every card but an H100; 2.9 falls back internally. Probe is cached: one read.
+    # Triton is picked when the probe says no, yet the separated LoRA delta still routed here: torch 2.8 hard-raises
+    # unless dprops->major == 9, 2.6/2.7 lack _grouped_mm, so LoRA MoE died off H100; 2.9 falls back internally; probe
+    # is cached.
     if not _grouped_mm_supported_on(inputs.device):
         return _manual_grouped_mm(inputs, weight, offsets)
-    if not _transposed_view_grouped_mm_is_safe():
+    if not _transposed_view_safe_on(inputs.device):
         weight = weight.contiguous()   # view path unproven on this device -> safe copy
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
@@ -413,6 +400,10 @@ def _grouped_mm_eager(inputs, weight, offsets):
 
 def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
     """dW[g] = inputs[g]^T @ grad_output[g] per group, as [G, K, N]; empty groups are zero."""
+    # torch._grouped_mm rejects stride-0 (grad of y.sum()) or unaligned operands, which forced a per-expert loop: a host
+    # sync and a different reduction than the compiled path; contiguous() avoids it.
+    inputs = inputs.contiguous()
+    grad_output = grad_output.contiguous()
     try:
         if _grouped_mm_supported_on(inputs.device):
             return torch._grouped_mm(inputs.transpose(-2, -1), grad_output, offs = offsets).contiguous()
@@ -427,12 +418,22 @@ def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
     return out
 
 
+def _is_transposed_stack(weight):
+    # [E, K, N] view of a contiguous [E, N, K] parameter (HF stores gate_up_proj / down_proj as [E, out, in]).
+    return weight.dim() == 3 and not weight.is_contiguous() and weight.transpose(-2, -1).is_contiguous()
+
+
+def _wgrad_in_weight_layout(wgrad, inputs, grad, offsets, transposed):
+    # dW^T built contiguous and returned as its view: the leaf's layout, so AccumulateGrad does not copy it.
+    if transposed:
+        return wgrad(grad, inputs, offsets).transpose(-2, -1)
+    return wgrad(inputs, grad, offsets)
+
+
 def _register_grouped_mm_fp16_op():
-    """torch._grouped_mm on float16 as an opaque op for compiled callers. The eager kernel takes float16
-    (torch 2.10 - 2.14), but its meta/fake impl rejects it (2.14 accepts only with cuBLASLt grouped GEMM,
-    CUDA 13.3+), so a compiled float16 MoE frame failed to trace and, under suppress_errors, silently ran
-    eagerly. Eager calls and bf16 never reach this op. Registered once per process: the compiled-cache copy of
-    this file reuses the first registration."""
+    """Opaque fp16 torch._grouped_mm op so compiled fp16 MoE frames trace; eager takes fp16 on torch 2.10-2.14, but the
+    meta/fake impl rejects it (2.14 accepts only with cuBLASLt, CUDA 13.3+); eager and bf16 never reach it;
+    registered once per process."""
     if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
         return None
     try:
@@ -460,6 +461,7 @@ def _register_grouped_mm_fp16_op():
         def _setup_context(ctx, inputs, output):
             x, w, offs = inputs
             ctx.save_for_backward(x, w, offs)
+            ctx.w_transposed = _is_transposed_stack(w)
 
         def _backward(ctx, grad):
             x, w, offs = ctx.saved_tensors
@@ -468,7 +470,9 @@ def _register_grouped_mm_fp16_op():
             if ctx.needs_input_grad[0]:
                 gx = torch.ops.unsloth_zoo.grouped_mm_fp16(grad, w.transpose(-2, -1), offs)
             if ctx.needs_input_grad[1]:
-                gw = torch.ops.unsloth_zoo.grouped_mm_fp16_wgrad(x.contiguous(), grad, offs)
+                gw = _wgrad_in_weight_layout(
+                    torch.ops.unsloth_zoo.grouped_mm_fp16_wgrad, x.contiguous(), grad, offs, ctx.w_transposed,
+                )
             return gx, gw, None
 
         grouped_mm_fp16.register_autograd(_backward, setup_context = _setup_context)
@@ -480,15 +484,14 @@ def _register_grouped_mm_fp16_op():
 _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 
-# Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop; one Triton launch beats it for small experts.
-# Measured max average rows per expert per class: "lora" (a dim <= 32), "many" / "few" (>= / < 64 experts),
-# "dw" (base weight grad). sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100 have native grouped GEMMs.
-# sm121 (GB10 / DGX Spark) takes sm120's tiles and limits (1.15x on Qwen3.5-35B-A3B QLoRA, unsloth-zoo#1661).
+# Max avg rows per expert for Triton grouped-MM, per arch; off sm90/sm100 torch._grouped_mm is a per-expert cuBLAS loop
+# that Triton beats for small experts; sm75 has no Triton MMA, sm86 is unmeasured, sm121 follows sm120 (unsloth-zoo
+# issue 1661) except for dw.
 _TRITON_GROUPED_MM_AUTO_ROWS = {
-    (8, 0):  {"lora": -1, "many": 2048, "few": 256, "dw": 128},
-    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
-    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
-    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0},
+    (8, 0):  {"lora": -1, "many": 2048, "few": 512, "dw": 128, "dw_few": 128},
+    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
+    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64,  "dw_few": 64},
+    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
@@ -503,9 +506,9 @@ def _triton_grouped_mm_capability(index):
 
 @_assume_constant_result
 def _triton_grouped_mm_max_rows(index, kind = "lora"):
-    """Row limit for class `kind` on device `index`: 0 = off, -1 = no limit.
-    UNSLOTH_MOE_GROUPED_TRITON=auto|1|0, UNSLOTH_DISABLE_MOE_TRITON=1, UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS.
-    Baked in under torch.compile: an env change after compiling needs torch._dynamo.reset()."""
+    """Row limit for class kind on device index (0 off, -1 no limit), read from UNSLOTH_MOE_GROUPED_TRITON (auto|1|0),
+    UNSLOTH_DISABLE_MOE_TRITON=1 and UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS; baked in under torch.compile, so an env
+    change needs torch._dynamo.reset()."""
     environ = os.environ
     key = (
         index, kind, environ.get("UNSLOTH_MOE_GROUPED_TRITON"), environ.get("UNSLOTH_DISABLE_MOE_TRITON"),
@@ -592,7 +595,8 @@ def _grouped_mm_triton_wgrad_impl(inputs, grad, offsets):
         mg.GENERIC_CALLS["fallback"] += 1
         return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
     E, K, N = offsets.shape[0], inputs.shape[1], grad.shape[1]
-    if min(K, N) > 32 and not _rows_within(_triton_grouped_mm_max_rows(inputs.device.index, "dw"), inputs.shape[0], E):
+    dw_kind = "dw" if E >= 64 else "dw_few"
+    if min(K, N) > 32 and not _rows_within(_triton_grouped_mm_max_rows(inputs.device.index, dw_kind), inputs.shape[0], E):
         # A trainable base stack's dW (full finetuning): cuBLAS beats the Triton reduction at these sizes.
         return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
     return mg.generic_grouped_wgrad(inputs, grad, offsets, E)
@@ -606,6 +610,7 @@ class _GroupedMMTriton(torch.autograd.Function):
         ctx.save_for_backward(
             inputs if ctx.needs_input_grad[1] else None, weight if ctx.needs_input_grad[0] else None, offsets,
         )
+        ctx.w_transposed = _is_transposed_stack(weight)
         return _grouped_mm_triton_impl(inputs, weight, offsets)
 
     @staticmethod
@@ -617,7 +622,7 @@ class _GroupedMMTriton(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             gx = _grouped_mm_triton_impl(grad, w.transpose(-2, -1), offs)
         if ctx.needs_input_grad[1]:
-            gw = _grouped_mm_triton_wgrad_impl(x, grad, offs)
+            gw = _wgrad_in_weight_layout(_grouped_mm_triton_wgrad_impl, x, grad, offs, ctx.w_transposed)
         return gx, gw, None
 
 
@@ -636,10 +641,9 @@ def _triton_grouped_mm(inputs, weight, offsets):
 
 
 def _register_grouped_mm_triton_op():
-    """torch._grouped_mm(inputs [M, K], weight [E, K, N], offs = cumulative int32 ends) on moe_grouped_fp16's
-    Triton kernels, as an opaque op so compiled MoE frames trace it (its autograd.Function does not).
-    Counts come from the offsets on device: no host sync. Rows past offs[-1] are left unwritten, as
-    torch._grouped_mm leaves them. Registered once per process (the compiled-cache copy reuses it)."""
+    """torch._grouped_mm(inputs [M, K], weight [E, K, N], offs = int32 cumulative ends) on moe_grouped_fp16's Triton
+    kernels as an opaque op; counts come from device offsets (no host sync); rows past offs[-1] stay unwritten, as in
+    torch._grouped_mm."""
     if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
         return None
     try:
@@ -667,6 +671,7 @@ def _register_grouped_mm_triton_op():
             x, w, offs = inputs
             # Only what each gradient reads: a frozen base keeps no activation alive for a dW it never takes.
             ctx.save_for_backward(x if w.requires_grad else None, w if x.requires_grad else None, offs)
+            ctx.w_transposed = _is_transposed_stack(w)
 
         def _backward(ctx, grad):
             x, w, offs = ctx.saved_tensors
@@ -676,7 +681,9 @@ def _register_grouped_mm_triton_op():
             if ctx.needs_input_grad[0]:
                 gx = torch.ops.unsloth_zoo.grouped_mm_triton(grad, w.transpose(-2, -1), offs)
             if ctx.needs_input_grad[1]:
-                gw = torch.ops.unsloth_zoo.grouped_mm_triton_wgrad(x, grad, offs)
+                gw = _wgrad_in_weight_layout(
+                    torch.ops.unsloth_zoo.grouped_mm_triton_wgrad, x, grad, offs, ctx.w_transposed,
+                )
             return gx, gw, None
 
         grouped_mm_triton.register_autograd(_backward, setup_context = _setup_context)
@@ -689,12 +696,8 @@ _GROUPED_MM_TRITON_OP = _register_grouped_mm_triton_op()
 
 
 def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
-    """out[s:e] = inputs[s:e] @ weight[g], group by group. No autograd.
-
-    `bounds` is the already-decoded group ends: the signature packs the offsets into
-    its own transfer, so re-reading them here was a second stream synchronization per
-    grouped matmul, over every layer's base and LoRA projections.
-    """
+    """Per-group loop out[s:e] = inputs[s:e] @ weight[g] with no autograd; bounds are pre-decoded group ends, since
+    re-reading offsets would add a second stream sync per grouped matmul."""
     outputs = []
     start = 0
     if bounds is None: bounds = offsets.detach().cpu().tolist()
@@ -707,48 +710,27 @@ def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
     return inputs.new_empty((0, weight.shape[-1]))
 
 
-# Projection strides for the routing signature. A CHECKSUM, not an identity: four
-# projections leave a `hidden - 4` null space, so rows differing within it project
-# alike; an exact identity means copying the whole `[T, hidden]` input, the 512MB
-# transient this file avoids. A swap escapes only by matching ALL of these AND the
-# norm below, each term weighted by the row index.
+# Projection strides for the routing signature: a checksum, not an identity, since four projections leave a hidden - 4
+# null space; an identity would copy the [T, hidden] input (512MB transient); a swap must match every term (each
+# weighted by row index) and the norm.
 _SIGNATURE_STRIDES = (12.9898, 78.233, 43.7585, 96.4271)
 
-# Row 2-norm, carried beside the projections. Not linear in the row, so that null
-# space does not reach it: rows differing within it must also match norms to swap unseen.
+# Row 2-norm carried beside the projections; it is not linear in the row, so the projections' null space does not reach
+# it, and swapped rows must match norms too.
 _SIGNATURE_EXTRA = 1
 
-# Trailing checksum entries of a packed signature, not group boundaries. Named because
-# offsets are read back by slicing it off, and a bare `[:-1]` read checksums as experts.
+# Trailing checksum entries of a packed signature, not group boundaries; named because offsets are sliced off, and a bare [:-1] would read them as experts.
 _SIGNATURE_WIDTH = len(_SIGNATURE_STRIDES) + _SIGNATURE_EXTRA
 
 
 def _routing_signature(inputs, offsets):
-    """Offsets plus an order-sensitive checksum of the expert-sorted rows.
-
-    Offsets are only the routing histogram, so a replay swapping two tokens between
-    equal-sized experts leaves them identical while `inputs` holds a different
-    sequence; the checksum moves with the rows, so the swap is visible. Bit-cast into
-    the offsets vector so the whole thing is one device sync, the one the group loop
-    already pays.
-
-    Rows reduce through a fixed pseudo-random projection, not a sum: a sum ignores
-    WHERE a row's values sit, so `[1, 0]` and `[0, 1]` reduced alike and a swap across
-    an expert boundary went unseen, letting the guard accept gradients from a different
-    routing. The projection derives from the hidden size alone, so forward and
-    recompute build the same one without carrying state.
-
-    The matvec runs in the input's own dtype, not an FP32 copy: upcasting on the way in
-    materialised a whole `[routed_tokens, hidden]` transient, 512MB at 32K by 4096, to
-    produce one number per row -- an OOM risk on exactly the memory-constrained runs
-    this fallback exists for. cuBLAS accumulates a half-precision gemv in FP32 anyway.
-    """
+    """Offsets plus an order-sensitive checksum: a fixed pseudo-random projection of the sorted rows (not a sum) so
+    swaps between equal-sized experts show; it depends only on hidden size, so forward and recompute agree; the
+    matvec runs in the input dtype with no FP32 copy."""
     inputs = inputs.detach()
     hidden = inputs.shape[-1]
-    # Autocast off, explicitly: `mv`/`mm` are on the autocast lower-precision list and
-    # only ONE of the two calls sees it (forward with the caller's autocast live,
-    # backward with it disabled), so FP32 inputs hashed bf16 one side and fp32 the
-    # other and every backward raised the routing error below on unchanged routing.
+    # Autocast explicitly off: mv/mm are on autocast's lower-precision list and only one of forward/backward saw it, so
+    # fp32 inputs hashed differently and backward raised a spurious routing error.
     with torch.autocast(device_type = inputs.device.type, enabled = False):
         weights = torch.linspace(
             1.0, 2.0, hidden, device = inputs.device, dtype = torch.float32)
@@ -757,16 +739,11 @@ def _routing_signature(inputs, offsets):
             _SIGNATURE_STRIDES, device = inputs.device, dtype = torch.float32)
         weights = torch.sin(
             weights.unsqueeze(1) * strides).to(inputs.dtype)
-        # Several projections, not one: a single dot maps each row to one scalar, so
-        # rows orthogonal to it hash like the zero row (`[p[1], -p[0], 0, ...]` and
-        # zeros both give exactly 0) and swapping that pair across an expert boundary
-        # survived the check.
+        # Several projections, not one: a single dot maps rows orthogonal to it to zero like the zero row, letting such swaps across an expert boundary pass.
         rows = (inputs @ weights).float()
-        # Plus the norm, not linear in the row, so the projections' shared null space
-        # does not reach it. `vector_norm` accumulates in fp32 from the input's own
-        # dtype; `(x.float() * x.float()).sum(...)` held three concurrent 512MB
-        # temporaries at the 32K-by-4096 shape this fallback targets. Promoted, not
-        # pinned to fp32: `vector_norm` refuses a dtype that narrows its input.
+        # Norm is not linear, so the projections' null space cannot reach it; vector_norm accumulates in fp32 from the
+        # input dtype, avoiding three concurrent 512MB temporaries of an x.float() product at 32K by 4096; dtype is
+        # promoted, not pinned, since vector_norm rejects narrowing.
         norm = torch.linalg.vector_norm(
             inputs, dim = -1, keepdim = True,
             dtype = torch.promote_types(inputs.dtype, torch.float32))
@@ -782,28 +759,12 @@ def _routing_signature(inputs, offsets):
 
 
 class _ManualGroupedMM(torch.autograd.Function):
-    """The loop above, saving what torch._grouped_mm saves and nothing else.
-
-    A Function rather than plain autograd because the naive loop tapes every per-group
-    SLICE, whose shape is the group size the router decides. Non-reentrant checkpointing
-    replays the forward and compares saved metadata, so any routing difference between
-    the two passes surfaces as
-
-        CheckpointError: Recomputed values ... have different metadata
-        saved: torch.Size([38, 8])  recomputed: torch.Size([39, 8])
-
-    one row apart, in a hundred groups at once. `torch._grouped_mm` never shows that:
-    it is one op saving the whole `[T, K]` input, so a drop-in has to save the same
-    shape-stable set (inputs, weight, offsets) and rebuild the slices in backward.
-
-    This does not make routing deterministic, and does not pretend to: it restores the
-    numerics the fused path already has on an H100.
-    """
+    """Saves only inputs, weight and offsets, not per-group slices, since non-reentrant checkpoint replay raises
+    CheckpointError when routing changes saved shapes; it does not make routing deterministic."""
     @staticmethod
     def forward(ctx, inputs, weight, offsets):
-        # A plain list, NOT a tensor: non-reentrant checkpointing swaps the saved
-        # TENSORS for the replay's, so a saved `offsets` reports the replay's routing,
-        # never the forward's. This copy survives, and backward compares the two.
+        # Stored as a plain list, not a tensor: non-reentrant checkpointing swaps saved tensors for the replay's, so
+        # only this copy keeps the forward's routing for backward to compare.
         ctx.forward_routing = routing = _routing_signature(inputs, offsets)
         ctx.save_for_backward(inputs, weight, offsets)
         with torch.no_grad():
@@ -815,9 +776,8 @@ class _ManualGroupedMM(torch.autograd.Function):
         inputs, weight, offsets = ctx.saved_tensors
         routing = _routing_signature(inputs, offsets)
         if routing != ctx.forward_routing:
-            # Shape-stable saves would let this through silently, and pairing the
-            # original `grad_output` with the replay's partition is a gradient for a
-            # routing that never produced the loss. Louder than CheckpointError.
+            # Raises louder than CheckpointError: shape-stable saves would let a reroute pass silently, and pairing
+            # grad_output with the replay's partition gives a gradient for routing that never made the loss.
             were = ctx.forward_routing[:-_SIGNATURE_WIDTH]
             now = routing[:-_SIGNATURE_WIDTH]
             how = ("the same experts in a different order"
@@ -832,22 +792,14 @@ class _ManualGroupedMM(torch.autograd.Function):
         bounds = routing[:-_SIGNATURE_WIDTH]
         need_x, need_w, _ = ctx.needs_input_grad
         grad_output = grad_output.contiguous()
-        # `backward` runs OUTSIDE the forward's autocast, so `grad_output` can be bf16
-        # while the saved tensors are still fp32 and the first matmul raises. Aligned
-        # by hand, not with `torch.amp.custom_fwd/custom_bwd`, whose `device_type` is
-        # fixed at class definition: this fallback also runs on CPU and XPU.
+        # Backward runs outside the forward's autocast, so grad_output can be bf16 while saved tensors are fp32; dtypes
+        # are aligned by hand since custom_fwd/custom_bwd fix device_type at class definition, and this also runs on CPU
+        # and XPU.
         compute_dtype = grad_output.dtype
         grad_inputs = torch.zeros_like(inputs) if need_x else None
         grad_weight = torch.zeros_like(weight) if need_w else None
-        # Write each group straight into its slice when no cast is due. The assignment
-        # below allocates a temporary and copies it in; `out=` does neither, and there
-        # are two per group -- 256 on a 128-expert layer, 37% of this loop measured.
-        # A cast needs the temporary anyway, and a non-contiguous destination would put
-        # the copy back, so both keep the plain path.
-        # Grad mode first: it is off for an ordinary backward and ON only under
-        # `create_graph = True`, where `out=` raises "functions with out=... arguments
-        # don't support automatic differentiation". The fused path double-backwards
-        # fine, so the fallback has to as well; the plain branch is differentiable.
+        # Writes groups in place via out= only without a cast, with a contiguous destination, and grad mode off, since
+        # out= raises under create_graph=True; the plain path stays differentiable.
         direct = (
             not torch.is_grad_enabled()
             and inputs.dtype == weight.dtype == compute_dtype
@@ -882,28 +834,11 @@ class _ManualGroupedMM(torch.autograd.Function):
 def _manual_grouped_mm(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
-    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps.
-
-    Not compilable, and marked so: group boundaries come off a tensor, so `start < end`
-    is a data-dependent branch Dynamo cannot guard, and a tensorized rewrite is worse
-    (gathering `weight[expert_id]` per row materializes `[T, K, N]`; masking runs every
-    expert over every row). `torch.compiler.disable` makes a compiled caller break
-    cleanly here rather than abort mid-trace; under `fullgraph = True` a break is still
-    fatal, which is what the eager fallback in `temporary_patches/utils.py` is for.
-    """
-    # Grad off means `apply` builds no autograd node, so nothing will ever read the
-    # signature: skip the Function rather than pay a `[T, hidden]` projection per call.
-    # Covers `inference_mode` and `no_grad` alike.
-    #
-    # KNOWN GAP, deliberately not closed here. A REENTRANT checkpoint also runs its
-    # loss-producing forward with grad off and its replay with grad ON, so the replay
-    # compares its own routing against itself and a reroute passes silently. Not
-    # fixable from inside this function: `ctx` cannot cross a reentrant boundary, and a
-    # side channel keyed on the weight fails too because
-    # `_canonical_lora_weights_for_grouped_mm` rebuilds a contiguous tensor per call.
-    # It needs `unsloth_checkpoint` to announce its region and call order. The
-    # non-reentrant path is unaffected: its forward runs with grad on, so the forward
-    # ctx survives and only its SAVED TENSORS are swapped.
+    """Marked torch.compiler.disable because group bounds come from a tensor (a data-dependent start < end branch);
+    under fullgraph=True the break is fatal, so the eager fallback in temporary_patches/utils.py is needed."""
+    # Grad off skips the signature (no autograd node reads it). KNOWN GAP: a reentrant checkpoint runs its forward with
+    # grad off and its replay with grad on, so a reroute passes silently; closing it needs unsloth_checkpoint to
+    # announce its region and call order; non-reentrant is unaffected.
     if not torch.is_grad_enabled():
         return _grouped_matmul_loop(inputs, weight, offsets)
     return _ManualGroupedMM.apply(inputs, weight, offsets)
@@ -913,15 +848,12 @@ if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
     _manual_grouped_mm = torch.compiler.disable(_manual_grouped_mm)
 
 
-# Recompute-in-backward for the frozen base expert GEMM: the dequantized bf16 stack
-# is rebuilt from the 4-bit Params4bit in backward (dX only; the base is frozen and
-# LoRA is a separate additive grouped_mm) instead of being pinned on the tape. Output
-# is unchanged. See _moe_recompute_enabled for the pin-vs-recompute policy.
+# Recomputes the frozen base expert GEMM in backward by rebuilding the bf16 stack from 4-bit Params4bit (dX only; LoRA
+# stays a separate grouped_mm), instead of pinning it on the tape; see _moe_recompute_enabled.
 
 
 def _base_is_recomputable(source) -> bool:
-    """True iff the base expert weight can be rebuilt in backward (frozen and
-    grouped-mm capable). A trainable or unsupported base must use the pinned path."""
+    """True only for a frozen, grouped-mm capable base that can be rebuilt in backward; trainable or unsupported bases must use the pinned path."""
     try:
         if not _should_use_separated_lora():          # merged LoRA folds the delta into base
             return False
@@ -982,11 +914,9 @@ def _moe_recompute_default(prefer_memory: bool = False) -> bool:
 
 
 def _source_pins_large_dequant(source) -> bool:
-    """True iff pinning this base means holding a large dense dequant of a compressed
-    weight (a frozen bnb 4-bit MoE expert). For these the pinned path materializes the
-    full bf16 expert stack, so recompute is the memory-preserving default under
-    gradient checkpointing; a plain bf16/fp16/fp32 base pins its own storage (no
-    extra dequant) and keeps the speed-oriented adaptive policy."""
+    """True for a bnb 4-bit MoE base, where pinning would hold a full dense dequant (recompute is the memory-preserving
+    default under gradient checkpointing); plain bf16/fp16/fp32 bases pin their own storage and keep the adaptive
+    policy."""
     if not (HAS_BNB and Params4bit is not None):
         return False
     try:
@@ -1044,11 +974,9 @@ _MOMENTARY_PIN_FITS_TTL_S = 0.5
 
 
 def _moe_recompute_enabled(source, dtype = None) -> bool:
-    """Whether to recompute the dequantized base stack in backward (True) or pin it
-    for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
-    everything else the pinned eager path is used. A bnb 4-bit base recomputes unless
-    UNSLOTH_MOE_GC_REPLAY_PIN=1 and, inside a gradient-checkpoint replay, the stack fits:
-    the pin then saves a dequant for the same layer's backward but raises peak memory."""
+    """Recompute the dequantized base stack in backward (True) or pin it (False); only frozen grouped-mm bases
+    recompute. bnb 4-bit recomputes unless UNSLOTH_MOE_GC_REPLAY_PIN=1 and the stack fits in a checkpoint replay
+    (pinning then saves a dequant but raises peak memory)."""
     if not _base_is_recomputable(source):
         return False
     override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
@@ -1068,8 +996,7 @@ def _moe_recompute_enabled(source, dtype = None) -> bool:
 
 
 class _GroupedMMRecompute(torch.autograd.Function):
-    """grouped_mm(inputs, W) for a frozen W from weight_provider(): saves only offsets and rebuilds
-    W in backward (dX only) instead of pinning the dense stack."""
+    """grouped_mm(inputs, W) with W from weight_provider(): saves only offsets and rebuilds W in backward (for dX only) instead of pinning the dense stack."""
 
     @staticmethod
     def forward(ctx, inputs, offsets, weight_provider):
@@ -1084,14 +1011,115 @@ class _GroupedMMRecompute(torch.autograd.Function):
         (offsets,) = ctx.saved_tensors
         with torch.no_grad():
             transposed = getattr(ctx.weight_provider, "transposed", None)
-            weight_t = transposed() if transposed is not None else ctx.weight_provider().transpose(-2, -1).contiguous()
+            # The view, not a copy: _grouped_mm_with_backward_fix copies only where the view path is unproven.
+            weight_t = transposed() if transposed is not None else ctx.weight_provider().transpose(-2, -1)
             grad_input = _grouped_mm_with_backward_fix(grad_output.contiguous(), weight_t, offsets)
         return grad_input, None, None
 
 
+_EXPERT_BIAS_ONE_HOT_ELEMENTS = 1 << 24
+
+
+class _ExpertBiasGather(torch.autograd.Function):
+    """Gathers bias by expert id; backward is one-hot(expert_ids) @ grad as one fp32-accumulating GEMM, since a 16-bit
+    index_add_ is CAS-emulated on sm80 and rounds each partial sum."""
+
+    @staticmethod
+    def forward(ctx, bias, expert_ids):
+        ctx.save_for_backward(expert_ids)
+        ctx.num_experts = bias.shape[0]
+        return bias.index_select(0, expert_ids)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (expert_ids,) = ctx.saved_tensors
+        experts = torch.arange(ctx.num_experts, device = expert_ids.device, dtype = expert_ids.dtype).unsqueeze(1)
+        # The one-hot is at most _EXPERT_BIAS_ONE_HOT_ELEMENTS: long contexts go in row chunks, summed in fp32.
+        chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // ctx.num_experts)
+        rows = grad.shape[0]
+        # Autocast off: under fp16 autocast, including compiled backward's same_as_forward, mm rounds the per-expert sum
+        # of fp32 grads to fp16 and overflows past 65504.
+        with torch.autocast(device_type = grad.device.type, enabled = False):
+            if rows <= chunk:
+                return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
+            # GEMMs only (no index_add_ atomics) for reproducibility; fp32 partials, since 16-bit chunk sums can overflow to inf.
+            if torch.compiler.is_compiling():
+                if _EXPERT_BIAS_GRAD_OP is not None and grad.dtype in (torch.float16, torch.bfloat16) \
+                        and not _mm_fp32_out_ok(grad):
+                    # The fallback would upcast all of grad to fp32; running the eager row chunks as an opaque op keeps
+                    # that copy capped without specializing the row count.
+                    return _EXPERT_BIAS_GRAD_OP(expert_ids, grad, ctx.num_experts), None
+                # A loop over symbolic rows would specialize them: one uncapped GEMM instead.
+                return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
+            return _expert_bias_grad_chunked(expert_ids, grad, ctx.num_experts), None
+
+
+def _expert_bias_grad_chunked(expert_ids, grad, num_experts):
+    """one_hot(expert_ids) @ grad in row chunks, summed in fp32; the one-hot and any fp32 grad copy stay capped."""
+    experts = torch.arange(num_experts, device = expert_ids.device, dtype = expert_ids.dtype).unsqueeze(1)
+    chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // num_experts)
+    if not _mm_fp32_out_ok(grad):
+        # The fallback upcasts each grad chunk to fp32: cap that copy too.
+        chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(num_experts, grad.shape[1]))
+    out = torch.zeros(num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
+    with torch.autocast(device_type = grad.device.type, enabled = False):
+        for start in range(0, grad.shape[0], chunk):
+            out += _one_hot_mm_fp32(expert_ids[start : start + chunk].unsqueeze(0) == experts, grad[start : start + chunk])
+    return out.to(grad.dtype)
+
+
+def _register_expert_bias_grad_op():
+    """Opaque op wrapping _expert_bias_grad_chunked for compiled backwards: chunks over the real row count so tracing
+    neither specializes rows nor copies grad to fp32; registered once per process."""
+    if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
+        return None
+    try:
+        return torch.ops.unsloth_zoo.expert_bias_grad.default
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        @torch.library.custom_op("unsloth_zoo::expert_bias_grad", mutates_args = ())
+        def expert_bias_grad(expert_ids: torch.Tensor, grad: torch.Tensor, num_experts: int) -> torch.Tensor:
+            return _expert_bias_grad_chunked(expert_ids, grad, num_experts)
+
+        @expert_bias_grad.register_fake
+        def _(expert_ids, grad, num_experts):
+            return grad.new_empty((num_experts, grad.shape[1]))
+
+        return torch.ops.unsloth_zoo.expert_bias_grad.default
+    except Exception:
+        return None
+
+
+# torch.mm(..., out_dtype = torch.float32): 16-bit inputs, fp32 output (aten::mm.dtype, CUDA only, torch 2.9+).
+_MM_OUT_DTYPE = "dtype" in torch.ops.aten.mm.overloads()
+
+
+def _mm_fp32_out_ok(grad):
+    return _MM_OUT_DTYPE and grad.is_cuda and torch.version.hip is None and grad.dtype in (torch.float16, torch.bfloat16)
+
+
+def _one_hot_mm_fp32(one_hot, grad):
+    """one_hot (bool [E, rows]) @ grad as fp32 [E, D], with no 16-bit rounding of the sum."""
+    if grad.dtype == torch.float32:
+        return one_hot.to(grad.dtype) @ grad
+    if _mm_fp32_out_ok(grad):
+        return torch.mm(one_hot.to(grad.dtype), grad, out_dtype = torch.float32)
+    return one_hot.to(torch.float32) @ grad.float()
+
+
+_EXPERT_BIAS_GRAD_OP = _register_expert_bias_grad_op()
+
+
+def _gather_expert_bias(bias, expert_ids):
+    expert_ids = expert_ids.to(bias.device)
+    if bias.requires_grad and torch.is_grad_enabled() and bias.dim() == 2:
+        return _ExpertBiasGather.apply(bias, expert_ids)
+    return bias.index_select(0, expert_ids)
+
+
 def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
-    """recompute -> rebuild W in backward; else the prior eager grouped_mm.
-    plan (recompute only): rebuild just the planned experts, chunk by chunk."""
+    """With recompute, rebuild W in backward (only the planned experts, chunk by chunk, when a plan is given); otherwise use the eager grouped_mm."""
     if recompute:
         if plan is not None:
             return _GroupedMMSelectiveRecompute.apply(inputs, weight_provider, plan)
@@ -1099,8 +1127,19 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
-# UNSLOTH_MOE_SELECTIVE_DEQUANT=1: dequantize only routed experts. Opt-in because the plan
-# reads token counts on the host (one sync per MoE layer forward; not capturable).
+def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_type, experts_module):
+    """UNSLOTH_MOE_NF4_FUSED grouped GEMM on a frozen NF4 stack; None keeps the dequant path."""
+    if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
+        return None
+    try:
+        from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm
+    except ImportError:
+        return None
+    preprocess = lambda w: preprocess_weight(w, proj_type, hidden_dim, model_type, experts_module = experts_module)
+    return maybe_nf4_grouped_mm(inputs, offsets, source, preprocess)
+
+
+# UNSLOTH_MOE_SELECTIVE_DEQUANT: auto = num_rows experts (sync-free) if rows <= 7/8 E; 1 = exact routed set (one host sync); 0 = full stack.
 SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
 
 
@@ -1121,8 +1160,7 @@ def _selective_dequant_chunk_experts() -> int:
 
 
 def _bnb4bit_expert_split(param):
-    """(E, per-expert shape) when every expert of this Params4bit owns whole packed elements
-    and whole absmax blocks, so a gather of experts is exact."""
+    """(E, per-expert shape) only when every expert owns whole packed elements and whole absmax blocks, so gathering experts is exact; None otherwise."""
     while hasattr(param, "base_layer"):
         param = param.base_layer
     if not (HAS_BNB and isinstance(param, Params4bit)):
@@ -1142,8 +1180,8 @@ def _bnb4bit_expert_split(param):
     return E, tuple(int(x) for x in shape[1:])
 
 
-# Gathered ids are decoded in pieces of at least _SELECTIVE_GATHER_MIN experts and at most 1/8 of
-# the request, so the packed copy stays near 1/32 of the fp16 output without a launch per expert.
+# Gathered ids decode in pieces of at least _SELECTIVE_GATHER_MIN experts and at most 1/8 of the request, keeping the
+# packed copy near 1/32 of the fp16 output without a launch per expert.
 _SELECTIVE_GATHER_PIECES = 8
 _SELECTIVE_GATHER_MIN = 32
 
@@ -1222,19 +1260,22 @@ def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
             dest.copy_(weight.reshape(piece_shape))
         row += k
         del weight, dest
-    SELECTIVE_DEQUANT_STATS["dequant_calls"] += 1
-    SELECTIVE_DEQUANT_STATS["experts_dequantized"] += n
-    SELECTIVE_DEQUANT_STATS["experts_total"] += E
+    if not torch.compiler.is_compiling():   # a traced global write re-traces every call
+        SELECTIVE_DEQUANT_STATS["dequant_calls"] += 1
+        SELECTIVE_DEQUANT_STATS["experts_dequantized"] += n
+        SELECTIVE_DEQUANT_STATS["experts_total"] += E
     return out.to(target_dtype) if target_dtype is not None else out
 
 
 def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
-    """Chunks of experts to dequantize, or None to keep the full-stack path (off, traced,
-    capturing, a source that cannot be split exactly, or nothing to save)."""
-    selective = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "0") == "1"
+    """Expert chunks to dequantize, or None to keep the full-stack path when off, traced, capturing, a source that cannot split exactly, or nothing to save."""
+    mode = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "auto")
+    selective = mode == "1"
     chunk = _selective_dequant_chunk_experts()
     if not selective and chunk == 0:
-        return None
+        if mode == "0":
+            return None
+        return _capped_dequant_plan(sources, num_tokens_per_expert, num_rows)
     if torch.compiler.is_compiling():
         return None
     device = num_tokens_per_expert.device
@@ -1277,23 +1318,63 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
     return _SelectiveDequantPlan(E, num_rows, chunks)
 
 
-def _grouped_mm_slice(inputs, weight, offsets, plan):
-    """_grouped_mm_with_backward_fix for a slice of a planned problem: the Triton choice and
-    its tiles follow the whole (rows, experts) problem, so each group's result matches it."""
+def _capped_dequant_plan(sources, num_tokens_per_expert, num_rows):
+    """Sync-free plan from shapes only: num_rows experts, routed ids ascending, then unrouted padding."""
+    E = int(num_tokens_per_expert.numel())
+    if num_rows <= 0 or 8 * num_rows > 7 * E:
+        return None
+    for source in sources:
+        split = _bnb4bit_expert_split(source)
+        if split is None or split[0] != E:
+            return None
+    counts = num_tokens_per_expert
+    unrouted_last = (counts == 0).to(torch.int64) * E + torch.arange(E, device = counts.device)
+    experts = torch.argsort(unrouted_last)[:num_rows]
+    offsets = torch.cumsum(counts.index_select(0, experts), dim = 0, dtype = torch.int32)
+    if not torch.compiler.is_compiling():
+        SELECTIVE_DEQUANT_STATS["plans"] += 1
+    return _SelectiveDequantPlan(E, num_rows, [(experts, 0, num_rows, offsets)])
+
+
+def _slice_takes_triton(inputs, weight, plan):
     E, K, N = weight.shape
-    if (
+    if not (
         _GROUPED_MM_TRITON_OP is not None
         and inputs.device.type == "cuda"
         and inputs.dtype in (torch.bfloat16, torch.float16)
         and weight.dtype == inputs.dtype
         and _triton_grouped_mm_rows_ok(inputs.device, plan.num_rows, plan.num_experts, K, N)
     ):
+        return False
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+    return mg.triton_grouped_available(inputs.device)
+
+
+def _grouped_mm_slice(inputs, weight, offsets, plan):
+    """Grouped matmul for a slice of a planned problem; the Triton choice and tiles follow the whole (rows, experts) problem so each slice's result matches it."""
+    if _slice_takes_triton(inputs, weight, plan):
         from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
-        if mg.triton_grouped_available(inputs.device):
-            return mg.generic_grouped_mm(
-                inputs.contiguous(), weight, offsets, config_rows = (plan.num_rows, plan.num_experts),
-            )
+        return mg.generic_grouped_mm(
+            inputs.contiguous(), weight, offsets, config_rows = (plan.num_rows, plan.num_experts),
+        )
     return _grouped_mm_eager(inputs, weight, offsets)
+
+
+def _slice_reads_views(inputs, weight, plan):
+    # Views match the copy's bits only on Triton and the sm90/sm100 grouped GEMMs (behind the view probe); a per-expert
+    # cuBLAS loop differs since a transposed operand takes another kernel (T4 fp16 K 5760: 3x max error).
+    if _slice_takes_triton(inputs, weight, plan):
+        return True
+    device = inputs.device
+    if device.type != "cuda" or torch.version.hip is not None:
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _triton_grouped_mm_capability(index)[0] in (9, 10) and _grouped_mm_supported_on(device)
+
+
+def _transposed_for_slice(weight, inputs, plan):
+    weight = weight.transpose(-2, -1)
+    return weight if _slice_reads_views(inputs, weight, plan) else weight.contiguous()
 
 
 def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
@@ -1301,13 +1382,13 @@ def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
         experts, _, _, offsets = plan.chunks[0]
         weight = weight_provider(experts)
         if transpose:
-            weight = weight.transpose(-2, -1).contiguous()
+            weight = _transposed_for_slice(weight, inputs, plan)
         return _grouped_mm_slice(inputs, weight, offsets, plan)
     out = None
     for experts, row_lo, row_hi, offsets in plan.chunks:
         weight = weight_provider(experts)
         if transpose:
-            weight = weight.transpose(-2, -1).contiguous()
+            weight = _transposed_for_slice(weight, inputs, plan)
         rows = inputs[row_lo : row_hi]
         if rows.data_ptr() % 16:
             rows = rows.clone()   # grouped GEMMs want 16-byte aligned operands
@@ -1365,8 +1446,8 @@ def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_modu
 
 
 def _mxfp4_fused_enabled(param, dtype, rows = None) -> bool:
-    """UNSLOTH_MXFP4_FUSED_GEMM: "auto" fused below UNSLOTH_MXFP4_FUSED_MAX_ROWS (192) rows/expert (above, dequant +
-    cuBLAS wins on B200); "1" always, "dequant" never, "0" never plus the legacy decode-slot path."""
+    """UNSLOTH_MXFP4_FUSED_GEMM: auto fuses below UNSLOTH_MXFP4_FUSED_MAX_ROWS (192) rows per expert (dequant plus
+    cuBLAS wins above on B200); 1 always, dequant never, 0 never plus legacy decode path."""
     if dtype != torch.bfloat16 or param.device.type != "cuda":
         return False
     mode = os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto")
@@ -1436,17 +1517,51 @@ _GROUPED_MM_FOREIGN = {}   # (type, index) -> None if same GPU model as the prob
 # (type, index) the process-wide flags were probed on; a later current-device switch must not move it.
 _GROUPED_MM_HOME = None
 _GROUPED_MM_HOME_LOCK = threading.Lock()
+# Every visible accelerator is the home card's model: per-call gates read the process-wide flags.
+_GROUPED_MM_HOMOGENEOUS = False
 
 
 def _grouped_mm_home():
     """Card the process-wide flags describe; locked so concurrent first callers on different cards agree."""
-    global _GROUPED_MM_HOME
+    global _GROUPED_MM_HOME, _GROUPED_MM_HOMOGENEOUS
     if _GROUPED_MM_HOME is None:
         device = _grouped_mm_probe_device()
+        anchored = False
         with _GROUPED_MM_HOME_LOCK:
             if _GROUPED_MM_HOME is None and device is not None and device.index is not None:
                 _GROUPED_MM_HOME = (device.type, device.index)
+                _GROUPED_MM_FOREIGN.setdefault(_GROUPED_MM_HOME, None)
+                anchored = True
+        # Classify other cards now (metadata only) so a traced first use on another card never reaches the
+        # compiler-disabled resolver (graph break / fullgraph error).
+        if anchored:
+            try:
+                count = getattr(torch, device.type).device_count()
+            except Exception:
+                count = 0
+            for i in range(count):
+                if (device.type, i) not in _GROUPED_MM_FOREIGN:
+                    _resolve_grouped_mm_foreign_kind(torch.device(device.type, i), (device.type, i))
+            _GROUPED_MM_HOMOGENEOUS = _grouped_mm_all_cards_alike(device.type, count)
     return torch.device(*_GROUPED_MM_HOME) if _GROUPED_MM_HOME is not None else _grouped_mm_probe_device()
+
+
+def _grouped_mm_all_cards_alike(home_type, count):
+    """Every visible card of the home's type is its model, and no other accelerator type has cards."""
+    if count < 1 or any(_GROUPED_MM_FOREIGN.get((home_type, i), 0) is not None for i in range(count)):
+        return False
+    other = "xpu" if home_type == "cuda" else "cuda"
+    try:
+        backend = getattr(torch, other, None)
+        return not (backend is not None and backend.is_available() and backend.device_count() > 0)
+    except Exception:
+        return False
+
+
+def _grouped_mm_traced_kind(device):
+    # Trace-time lookup, never resolves: None = the home model (or not a GPU), False = never seen eagerly.
+    if device is None or device.type not in ("cuda", "xpu") or device.index is None: return None
+    return _GROUPED_MM_FOREIGN.get((device.type, device.index), False)
 
 
 def _grouped_mm_foreign_kind(device):
@@ -1468,7 +1583,7 @@ def _resolve_grouped_mm_foreign_kind(device, key):
     return kind
 
 
-# Per GPU model other than the current device's: a card the model never uses is never probed.
+# Per GPU model other than the home card's.
 _TORCH_GROUPED_MM_SUPPORTED_BY_KIND = {}
 
 
@@ -1490,9 +1605,50 @@ def _check_torch_grouped_mm_supported(device = None):
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
 
+def _torch_version_tuple():
+    try:
+        return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    except Exception:
+        return (0, 0)
+
+
+# CUDA not ROCm: torch 2.8 hard-raises unless dprops->major == 9 (Blas.cpp sm90_only); 2.9+ sends other archs to
+# _grouped_mm_fallback instead of raising (GroupedBlas.cpp, _grouped_mm_cuda).
+_TORCH_IS_CUDA_BUILD = getattr(torch.version, "hip", None) is None
+_TORCH_GROUPED_MM_SM90_ONLY = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() == (2, 8)
+_TORCH_GROUPED_MM_FALLS_BACK = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() >= (2, 9)
+
+
+def _grouped_mm_falls_back_internally(device_type, kind):
+    """torch serves grouped_mm on unprobed cards on CUDA 2.9+ (natively or via its fallback), and on 2.8 only on sm90;
+    ROCm (some cards crash, unsloth#12391) and XPU make no such promise."""
+    if device_type != "cuda": return False
+    if _TORCH_GROUPED_MM_FALLS_BACK: return True
+    info = kind[1] if isinstance(kind, tuple) and len(kind) == 2 else None
+    return _TORCH_GROUPED_MM_SM90_ONLY and isinstance(info, tuple) and info[1] == 9
+
+
 def _grouped_mm_supported_on(device):
-    if _grouped_mm_foreign_kind(device) is None: return _check_torch_grouped_mm_supported()
+    # Absent symbol (torch 2.6/2.7): the traceable definitive negative, no classification.
+    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE:
+        return _check_torch_grouped_mm_supported()
+    if torch.compiler.is_compiling():
+        return _grouped_mm_supported_while_tracing(device)
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is None:
+        return _check_torch_grouped_mm_supported()
     return _check_torch_grouped_mm_supported(device)
+
+
+def _grouped_mm_supported_while_tracing(device):
+    # Never probes while tracing (graph break or fullgraph error); an unwarmed card takes the home answer only where
+    # torch falls back internally, else the manual loop, which is safe but breaks a fullgraph trace.
+    home = _check_torch_grouped_mm_supported()
+    kind = _grouped_mm_traced_kind(device)
+    if kind is None or _GROUPED_MM_HOMOGENEOUS: return home
+    known = None if kind is False else _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
+    if known is not None: return known
+    return home and _grouped_mm_falls_back_internally(device.type, kind)
 
 
 # Some ROCm GPUs segfault in grouped_mm instead of raising (unsloth#12391): run the kernels in a throwaway interpreter first.
@@ -1549,9 +1705,15 @@ def _run_grouped_mm_crash_probe(device):
     if torch.cuda.device_count() > 1 and not layered:
         # Child sees only this card; HIP indexes into the inherited mask.
         mask = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
+        mask = (mask or "").strip()
+        if len(mask) >= 2 and mask[0] == mask[-1] == '"': mask = mask[1:-1]
         # clr keeps the first of a repeated entry.
         mask = list(dict.fromkeys(m.strip() for m in mask.split(","))) if mask else None
-        if mask is None or index < len(mask):
+        # Only plain ordinals map token -> logical index (UUIDs alias them); PAL (Windows) enumerates in physical order.
+        plain = mask is None or (
+            all(m.isdigit() for m in mask) and (sys.platform != "win32" or mask == sorted(mask, key = int))
+        )
+        if plain and (mask is None or index < len(mask)):
             visible = mask[index] if mask else str(index)
             index, env = 0, dict(os.environ, HIP_VISIBLE_DEVICES = visible, CUDA_VISIBLE_DEVICES = visible)
     # Not multiprocessing: spawn re-imports the caller's __main__.
@@ -1593,6 +1755,9 @@ def _probe_torch_grouped_mm_supported(device = None):
         if supported is None:
             supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
             _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
+            # Same eager region: a traced first use of this model must not break again on the view check.
+            if kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
+                _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = supported and _transposed_view_probe(device)
         return supported
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
@@ -1600,14 +1765,29 @@ def _probe_torch_grouped_mm_supported(device = None):
     device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else None
     if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
-        return False
-
-    _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
+    else:
+        _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
     return _TORCH_GROUPED_MM_SUPPORTED
 
 
-# One-time check that torch._grouped_mm on a transposed bf16 view matches the contiguous copy. Insurance
-# only: pytorch/pytorch#186365 was a usage error (offs must be cumulative group ends), no view miscompute is known.
+def _warm_grouped_mm_devices(devices):
+    """On mixed-GPU hosts only, probe eagerly one card per GPU model among the devices this process uses, so a later
+    trace reads its own answers; never foreign cards (torchrun ranks would pile CUDA contexts onto one card)."""
+    if _GROUPED_MM_HOMOGENEOUS or torch.compiler.is_compiling(): return
+    seen = set()
+    for device in devices:
+        try:
+            if device is None or device.type not in ("cuda", "xpu") or device.index is None: continue
+            kind = _grouped_mm_foreign_kind(device)
+            if kind is None or kind in seen: continue
+            seen.add(kind)
+            _check_torch_grouped_mm_supported(device)
+        except Exception:
+            pass
+
+
+# One-time check that torch._grouped_mm on a transposed bf16 view matches the contiguous copy; insurance only, since
+# pytorch/pytorch issue 186365 was a usage error (offs must be cumulative group ends) and no view miscompute is known.
 _TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
 
 
@@ -1621,14 +1801,40 @@ def _transposed_view_grouped_mm_is_safe():
     return _run_probe_eagerly(_probe_transposed_view_grouped_mm_is_safe)
 
 
-def _probe_transposed_view_grouped_mm_is_safe():
+_TRANSPOSED_VIEW_SAFE_BY_KIND = {}
+
+
+def _transposed_view_safe_on(device):
+    """View probe on `device`'s GPU model; the home model keeps the process-wide flag."""
+    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
+    if torch.compiler.is_compiling():
+        kind = _grouped_mm_traced_kind(device)
+        if kind is None: return _transposed_view_grouped_mm_is_safe()
+        # Unprobed card: the contiguous copy (correct, traceable), never the home card's verdict.
+        return False if kind is False else bool(_TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind, False))
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is None: return _transposed_view_grouped_mm_is_safe()
+    safe = _TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind)
+    if safe is not None: return safe
+    return _run_probe_eagerly(lambda: _probe_transposed_view_grouped_mm_is_safe(device))
+
+
+def _probe_transposed_view_grouped_mm_is_safe(device = None):
     global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is not None:
+        if kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
+            _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = _transposed_view_probe(device)
+        return _TRANSPOSED_VIEW_SAFE_BY_KIND[kind]
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
         return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    _TRANSPOSED_VIEW_GROUPED_MM_SAFE = _transposed_view_probe(_grouped_mm_home())
+    return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
 
+
+def _transposed_view_probe(device):
     safe = False
     try:
-        device = _grouped_mm_probe_device()
         if _TORCH_GROUPED_MM_AVAILABLE and device is not None and _grouped_mm_survives_out_of_process(device):
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
@@ -1655,8 +1861,6 @@ def _probe_transposed_view_grouped_mm_is_safe():
             safe = ok
     except Exception:
         safe = False   # anything unexpected -> keep the safe contiguous copy
-
-    _TRANSPOSED_VIEW_GROUPED_MM_SAFE = safe
     return safe
 
 
@@ -1751,17 +1955,15 @@ _SELECTED_MOE_BACKEND = None
 
 
 def select_moe_backend():
-    """Select MoE backend from UNSLOTH_MOE_BACKEND + availability.
-
-    Choices: "grouped_mm", "unsloth_triton", "native_torch" (default "grouped_mm").
-    """
+    """Selects the MoE backend from UNSLOTH_MOE_BACKEND and availability: grouped_mm, unsloth_triton or native_torch, defaulting to grouped_mm."""
     # This Unsloth Zoo code section is licensed under AGPL3
     global _SELECTED_MOE_BACKEND
     if _SELECTED_MOE_BACKEND is not None:
         return _SELECTED_MOE_BACKEND
     backend = _select_moe_backend()
-    # Chosen while unsloth imports (its Triton kernels cannot load yet): choose again on the next call.
-    if not _unsloth_importing():
+    # Not cached while unsloth imports (its Triton kernels cannot load yet) or in a trace, where the write fails the is
+    # None guard and recompiles the caller once.
+    if not _unsloth_importing() and not torch.compiler.is_compiling():
         _SELECTED_MOE_BACKEND = backend
     return backend
 
@@ -1778,9 +1980,33 @@ def select_moe_backend_for_interleaved_gate_up():
     """select_moe_backend() for interleaved gate_up (GPT-OSS), which Triton cannot run: grouped_mm, not the loop."""
     # This Unsloth Zoo code section is licensed under AGPL3
     backend = select_moe_backend()
-    if backend == "unsloth_triton" and _check_torch_grouped_mm_supported():
+    if backend in ("unsloth_triton", "sonic_moe") and _check_torch_grouped_mm_supported():
         return "grouped_mm"
     return backend
+
+
+def select_moe_backend_without_sonic(device = None):
+    """select_moe_backend() for dispatchers with no sonic route (bnb4bit / FP8 experts): sonic_moe runs as grouped_mm."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    backend = select_moe_backend()
+    if backend == "sonic_moe":
+        # sonic_moe was selected on a card with torch._grouped_mm; on a mixed host the expert's card may lack it.
+        if getattr(device, "type", None) == "cuda" and not _grouped_mm_supported_on(device):
+            return "native_torch"
+        return "grouped_mm"
+    return backend
+
+
+def _check_sonic_moe_available():
+    """Opt-in kernels-community/sonic-moe backend; guarded import."""
+    if os.environ.get("UNSLOTH_DISABLE_MOE_SONIC", "0") == "1":
+        return False
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils_sonic import sonic_moe_available
+        # Probes must not run under Dynamo tracing.
+        return _run_probe_eagerly(sonic_moe_available)
+    except Exception:
+        return False
 
 
 def _select_moe_backend():
@@ -1792,6 +2018,14 @@ def _select_moe_backend():
             return "unsloth_triton"
         if requested == "native_torch":
             return "native_torch"
+        # Opt-in only; still needs torch._grouped_mm for LoRA GEMMs and fallbacks.
+        if (
+            requested == "sonic_moe"
+            and _check_torch_grouped_mm_supported()
+            and _check_sonic_moe_available()
+        ):
+            _log_info("Unsloth: Using MoE backend 'sonic_moe'")
+            return "sonic_moe"
         _log_info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
     if _check_torch_grouped_mm_supported():
@@ -1826,31 +2060,35 @@ def moe_compute_dtype(hidden_states):
     return torch.bfloat16
 
 
-def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_fn, *args):
-    """Temporarily install dequantized weights for one forward call, then restore.
+_SWAP_VIA_INSTANCE_DICT = _torch_version_tuple() < (2, 5)
 
-    Uses object.__setattr__ to bypass nn.Module Parameter (de)registration
-    (re-registers hooks, unnecessary for read-only temp tensors). Used by the
-    FP8 and bnb4bit MoE dispatchers.
-    """
-    # object.__setattr__ writes the instance __dict__, which shadows `_parameters`. Restore by
-    # removing those entries again rather than writing the original Parameter into __dict__: a
-    # Parameter left there hides every later `_parameters[name] = ...` swap, e.g. FSDP2 installing
-    # its sharded / all-gathered parameter around each forward, so the next call would read a
-    # stale, freed all-gather buffer.
+
+def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_fn, *args):
+    """Swaps dequantized weights into _parameters for one call and restores them (no __setattr__, so no (de)registration
+    or hooks); used by the FP8 and bnb4bit MoE dispatchers."""
+    # Swap only _parameters entries: a __dict__ write shadows later FSDP2 swaps (freed buffer); __dict__.pop, del and an
+    # object() sentinel graph-break; dict setitem traces on every torch.
+    names = ("gate_up_proj", "down_proj")
+    params = experts_module._parameters
     instance_dict = experts_module.__dict__
-    missing = object()
-    saved = {name: instance_dict.get(name, missing) for name in ("gate_up_proj", "down_proj")}
-    object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
-    object.__setattr__(experts_module, "down_proj", down_proj)
+    # torch < 2.5 Dynamo ignores the `_parameters` swap (wrong output, no grads): shadow via __dict__ instead.
+    registered = {} if _SWAP_VIA_INSTANCE_DICT else {name: params[name] for name in names if name in params}
+    saved = {name: instance_dict[name] for name in names if name not in registered and name in instance_dict}
+    for name, tensor in zip(names, (gate_up_proj, down_proj)):
+        if name in registered:
+            params[name] = tensor
+        else:
+            object.__setattr__(experts_module, name, tensor)
     try:
         return forward_fn(experts_module, *args)
     finally:
-        for name, value in saved.items():
-            if value is missing:
-                instance_dict.pop(name, None)
+        for name in names:
+            if name in registered:
+                params[name] = registered[name]
+            elif name in saved:
+                instance_dict[name] = saved[name]
             else:
-                instance_dict[name] = value
+                instance_dict.pop(name, None)
 
 
 def forward_moe_backend(
@@ -1903,6 +2141,16 @@ def forward_moe_backend(
             return result
 
     backend = select_moe_backend()
+    if backend == "sonic_moe":
+        # Absolute import: this function is copied into unsloth_compiled_cache.
+        forward_sonic_moe = None
+        try:
+            from unsloth_zoo.temporary_patches.moe_utils_sonic import forward_sonic_moe
+        except ImportError:
+            pass
+        if forward_sonic_moe is not None:
+            return forward_sonic_moe(self, hidden_states, top_k_index, top_k_weights)
+        backend = "grouped_mm"
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
     # Triton kernels assume split gate_up, SiLU, no bias: interleaved GPT-OSS gate_up takes the eager loop.
@@ -1911,9 +2159,7 @@ def forward_moe_backend(
     return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
 
-# Test-only call counter, wired at import time and OFF by default: incrementing a
-# module global is a Dynamo side effect, and leaving it always-on re-traced the
-# compiled MoE block every step (3.6 ms -> 572 ms).
+# Test-only call counter, off by default: incrementing a module global is a Dynamo side effect, and always-on it re-traced the compiled MoE block every step.
 _EXPERT_COUNT_CALLS = [0]
 _COUNT_DEBUG = os.environ.get("UNSLOTH_MOE_COUNT_DEBUG", "0") == "1"
 
@@ -1968,22 +2214,29 @@ else:
     count_tokens_per_expert = _count_tokens_per_expert
 
 
+def moe_routing_sort(top_k_index, num_experts):
+    """(counts int32 [E], stable argsort int64 [N], cumsum(counts) int32 [E]), sync-free; Triton on CUDA."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if _TRITON_ROUTING is not None:
+        return _TRITON_ROUTING(top_k_index, num_experts)
+    flat_experts = top_k_index.reshape(-1)
+    counts = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
+    sorted_indices = flat_experts.argsort(stable=True)
+    return counts, sorted_indices, torch.cumsum(counts, dim=0, dtype=torch.int32)
+
+
+try:
+    from unsloth_zoo.temporary_patches.moe_routing_triton import moe_routing_sort as _TRITON_ROUTING
+except Exception:
+    _TRITON_ROUTING = None
+
+
 @torch.no_grad()
 def _get_routing_indices(selected_experts, num_experts):
-    """Compute token->expert mapping for grouped GEMM.
-
-    Returns (token_counts_by_expert (num_experts,), gather_indices (total_tokens,)).
-    """
+    """Returns token_counts_by_expert of shape (num_experts,) and gather_indices of shape (total_tokens,) for grouped GEMM, from moe_routing_sort."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    flat_experts = selected_experts.view(-1)
-
-    # Sync-free; see count_tokens_per_expert.
-    token_counts_by_expert = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
-
-    # stable=True preserves order within each expert.
-    gather_indices = flat_experts.argsort(stable=True)
-
+    token_counts_by_expert, gather_indices, _ = moe_routing_sort(selected_experts, num_experts)
     return token_counts_by_expert, gather_indices
 
 
@@ -2056,10 +2309,85 @@ def combine_permuted_moe_outputs(
     return combined
 
 
+class _RoutedRowGather(torch.autograd.Function):
+    """Gathers hidden_states[sorted_indices // top_k] with a fixed-order backward, since the default index_put backward
+    lowers to tl.atomic_add (non-reproducible LoRA grads); an unrolled top_k sum miscompiled on torch 2.13 under
+    dynamic shapes, so do not use it."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, hidden_states, sorted_indices, top_k):
+        ctx.save_for_backward(sorted_indices)
+        ctx.num_tokens = hidden_states.shape[0]
+        ctx.top_k = top_k
+        return hidden_states.index_select(0, sorted_indices // top_k)
+
+    @staticmethod
+    def backward(ctx, grad_rows):
+        (sorted_indices,) = ctx.saved_tensors
+        grad = combine_permuted_moe_outputs(grad_rows, sorted_indices, ctx.num_tokens, ctx.top_k)
+        return grad, None, None
+
+
+# Default from top_k 8 (L4: -55% at k 8, +22% at k 4). Env =1: every top_k > 2, =0: never.
+_DETERMINISTIC_GATHER = os.environ.get("UNSLOTH_MOE_DETERMINISTIC_GATHER", "")
+_DETERMINISTIC_GATHER_MIN_TOP_K = {"1": 3, "0": 1 << 30}.get(_DETERMINISTIC_GATHER, 8)
+
+
+def gather_routed_rows(hidden_states, sorted_indices, top_k):
+    """sorted_indices must be the full argsort from moe_routing_sort; eager backward is already reproducible, so it keeps plain indexing."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if (
+        top_k >= _DETERMINISTIC_GATHER_MIN_TOP_K
+        and torch.compiler.is_compiling()
+        and hidden_states.requires_grad
+        and torch.is_grad_enabled()
+        and sorted_indices.numel() == hidden_states.shape[0] * top_k
+    ):
+        return _RoutedRowGather.apply(hidden_states, sorted_indices, top_k)
+    return hidden_states[sorted_indices // top_k]
+
+
 def _silu_and_mul(x):
     """Fused SiLU + element-wise multiply for gate/up projections."""
     gate, up = x.chunk(2, dim=-1)
     return F.silu(gate) * up
+
+
+try:
+    from unsloth_zoo.temporary_patches import moe_fused_swiglu as _MOE_FUSED_SWIGLU
+except Exception:
+    _MOE_FUSED_SWIGLU = None
+
+
+def _act_fn_is_silu(act_fn) -> bool:
+    if act_fn is F.silu:
+        return True
+    # Exact types only: a subclass may override forward.
+    return type(act_fn) is torch.nn.SiLU or type(act_fn).__name__ == "SiLUActivation"
+
+
+def _fused_moe_activation(module, gate_up, interleaved, allow_gptoss = True):
+    """Fused (clamped) SwiGLU over gate_up, or None so the caller runs its bit-identical eager path."""
+    _sw = _MOE_FUSED_SWIGLU
+    if _sw is None or not _sw.fused_swiglu_supported(gate_up):
+        return None
+    # Compiled frames round once, matching Inductor's fusion of the eager expression.
+    eager_rounding = not torch.compiler.is_compiling()
+    alpha, limit = 1.702, 7.0
+    if "GptOssExperts" in module.__class__.__name__:
+        if not allow_gptoss:
+            return None
+        act = _sw.ACT_GPTOSS
+        alpha, limit = float(getattr(module, "alpha", 1.702)), float(getattr(module, "limit", 7.0))
+    else:
+        act_fn = getattr(module, "act_fn", None)
+        if act_fn is not None and callable(act_fn) and not _act_fn_is_silu(act_fn):
+            return None
+        act = _sw.ACT_SILU
+    if eager_rounding and not _sw.fused_swiglu_self_check(gate_up.device, gate_up.dtype, act, interleaved, alpha, limit):
+        return None
+    return _sw.moe_fused_swiglu(gate_up, act, interleaved, alpha, limit, eager_rounding)
 
 
 # Separated LoRA helpers.
@@ -2076,43 +2404,27 @@ def _has_lora_adapters(param) -> bool:
     return len(param.lora_A) > 0
 
 
-# How the flat `num_experts * rank` axis of a fused expert `lora_B` is laid out.
-#
-# PEFT stores a fused MoE expert LoRA as two ordinary Linear weights, lora_A of shape
-# (num_experts * rank, in) and lora_B of shape (out, num_experts * rank), and the two are
-# NOT flattened the same way. lora_A is expert-slowest, `reshape(E, r, in)`. lora_B is
-# expert-FASTEST: `reshape(out, r, E)`, so column j belongs to expert `j % E`. That
-# asymmetry is easy to miss, and it is the whole of this constant's reason to exist.
-#
-# Expert-fastest is what PEFT's own forward (`ParamWrapper.get_delta_factors`) and its
-# merge (`ParamWrapper.get_delta_weight`) both do, unchanged across PEFT 0.18 to 0.21;
-# what vLLM's `_stack_moe_lora_weights` does when it serves the adapter; and what prime-rl
-# writes. It is the only reading any consumer of a saved adapter implements, so it is what
-# the separated forward has to train.
+# Fused expert lora_B: expert-fastest, reshape(out, r, E), so column j is expert j % E (lora_A is expert-slowest,
+# reshape(E, r, in)); PEFT 0.18 to 0.21, vLLM (_stack_moe_lora_weights) and prime-rl all match, so the separated forward
+# must train this.
 LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
 
-# What Unsloth's separated forward read before this fix: expert-SLOWEST, a rank-wide
-# contiguous block of columns per expert. Self-consistent, and understood by nothing else.
-# Kept only so an adapter trained that way can still be read back, see
-# `moe_lora_b_layout()`.
+# Legacy lora_B layout the separated forward read before the fix: expert-slowest, a rank-wide block of columns per
+# expert; self-consistent but understood by no other consumer, kept only to read such adapters back via
+# moe_lora_b_layout().
 LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
 
 _LORA_B_LAYOUTS = (LORA_B_LAYOUT_RANK_MAJOR, LORA_B_LAYOUT_GROUPED_BY_EXPERT)
 
 
 class MoELoRABLayoutError(ValueError):
-    """`UNSLOTH_MOE_LORA_B_LAYOUT` is set to something that is not a layout.
-
-    Its own class because `_extract_lora_from_wrapper` turns every exception into "this
-    wrapper has no LoRA", which would silently drop the adapter and train the base model.
-    A configuration mistake has to be louder than that, so it is re-raised there by type.
-    """
+    """Raised when UNSLOTH_MOE_LORA_B_LAYOUT is not a valid layout; its own type so _extract_lora_from_wrapper re-raises
+    it instead of silently dropping the adapter and training the base model."""
 
 
 def _read_moe_lora_b_layout_from_env() -> str:
-    """`UNSLOTH_MOE_LORA_B_LAYOUT`, validated. Split out so the value can be refreshed into
-    a module global on every eager call, which is what makes the switch visible to a
-    compiled graph."""
+    """Reads and validates UNSLOTH_MOE_LORA_B_LAYOUT; split out so it can be refreshed into a module global on each
+    eager call, making the switch visible to compiled graphs."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     layout = os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
@@ -2179,29 +2491,17 @@ def _resolve_moe_lora_b_layout(layout) -> str:
 
 
 def _moe_lora_b_column_permutation(num_experts, rank_per_expert, device, invert = False):
-    """The column permutation between PEFT's rank-major packing and expert-major order.
-
-    Forward: `out[:, k] = weight_B[:, perm[k]]`. The inverse is the same construction with
-    the two axes swapped, so neither direction needs the other's indices kept around."""
+    """Column permutation between PEFT rank-major packing and expert-major order (forward out[:, k] = weight_B[:,
+    perm[k]]); the inverse swaps the two axes, so neither needs saved indices."""
     total = num_experts * rank_per_expert
     rows, columns = (num_experts, rank_per_expert) if invert else (rank_per_expert, num_experts)
     return torch.arange(total, device = device).view(rows, columns).t().reshape(-1)
 
 
 class _ExpertMajorGroupedOperand(torch.autograd.Function):
-    """`(out, E*rank)` -> `(E, rank, out)` for the grouped GEMM, in ONE materialization.
-
-    Gathering into expert-major column order and then permuting to the operand's shape
-    copies the whole tensor twice per projection, on every expert layer of every step.
-    Transposing to `(E*rank, out)` first makes the gather itself produce the operand: the
-    rows land in expert-major order, `index_select` on dim 0 writes a contiguous result,
-    and the final reshape is free.
-
-    Still a real gather, which is the property the grouped GEMM needs: under rank-major
-    packing the expert axis has stride 1, so a pure view chain lets Inductor elide the
-    copy and hand `aten._grouped_mm` an operand that is neither row nor column major.
-    Still saves nothing for the backward either, since the permutation is recomputed from
-    two integers, which is what non-reentrant checkpointing requires."""
+    """Turns (out, E*rank) into (E, rank, out) in one real gather, since a view chain lets Inductor elide the copy into
+    an operand _grouped_mm rejects; backward saves nothing and rebuilds the permutation from two ints, as
+    non-reentrant checkpointing requires."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     @staticmethod
@@ -2232,21 +2532,8 @@ class _ExpertMajorGroupedOperand(torch.autograd.Function):
 
 
 class _ExpertMajorColumns(torch.autograd.Function):
-    """Reorder `lora_B`'s columns expert-major, saving nothing for the backward.
-
-    `index_select` would do this in one line, but it saves its index tensor, and
-    `torch.utils.checkpoint(use_reentrant = False)` counts every saved tensor and refuses
-    when the recompute saves a different number than the forward. The measuring call in
-    `_patched_param_wrapper_forward` already runs the experts forward a different number
-    of times than the recompute does, so one more saved tensor on the default path is
-    enough to turn that into `CheckpointError`, which is transformers 5's default
-    configuration and Unsloth's own distributed vision path.
-
-    The permutation is fully determined by two integers, so the backward rebuilds the
-    inverse from `ctx` rather than from a saved tensor: nothing is saved, the count is
-    unchanged from the pure-view spelling, and the gradient still reaches `lora_B`.
-    A real gather is also what Inductor cannot fold back into a strided view of the
-    source, which is the other half of why this is not a plain `permute`."""
+    """Reorders lora_B columns expert-major with a real gather that saves no tensors: index_select would save an index,
+    and non-reentrant checkpointing (transformers 5 default) raises CheckpointError on a count mismatch."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     @staticmethod
@@ -2267,17 +2554,8 @@ class _ExpertMajorColumns(torch.autograd.Function):
 
 
 def _moe_lora_b_columns_expert_major(weight_B, num_experts, rank_per_expert, layout):
-    """`lora_B`'s columns reordered so the expert index is slowest, without copying.
-
-    Shared by `unflatten_moe_lora_b` and the grouped-GEMM path so the two cannot disagree
-    about the column order, while each finishes with its OWN single permute into the shape
-    it wants. Doing the reorder here and the permute there is what keeps the copy count at
-    one: composing the two public shapes instead (unflatten, then transpose + contiguous)
-    materialises the tensor twice, which is an extra saved tensor and breaks non-reentrant
-    gradient checkpointing, whose recompute must save exactly what the forward did.
-
-    Returns `weight_B` untouched under grouped-by-expert, where the columns already are
-    expert-slowest."""
+    """Reorders lora_B columns expert-major, shared with unflatten_moe_lora_b so the copy count stays at one
+    (non-reentrant checkpoint recompute must save the same tensors); untouched under grouped_by_expert."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     layout = _resolve_moe_lora_b_layout(layout)
@@ -2294,28 +2572,9 @@ def unflatten_moe_lora_b(
     dim_B: int,
     layout: str = None,
 ) -> torch.Tensor:
-    """`(out, num_experts * rank)` -> `(num_experts, out, rank)`.
-
-    The single place the expert axis of a fused `lora_B` is resolved, so the forward, the
-    merge and any converter cannot drift apart. Both layouts end in `.contiguous()` on a
-    permuted view, so neither is cheaper than the other and the choice is purely one of
-    which convention the stored tensor was written in.
-
-    The rank-major branch regroups the columns with `index_select` before it views them,
-    rather than permuting the expert axis out of a three-way view. The two spell the same
-    tensor, but only the first survives `torch.compile`. Under rank-major packing the
-    expert axis has stride 1 in `weight_B`, so every view that puts experts first leaves
-    BOTH remaining axes with a stride above 1, and `aten._grouped_mm` rejects a `mat_b`
-    that is neither row nor column major. Eager is fine because `.contiguous()` really
-    copies; Inductor folds the whole view chain into one strided read of `weight_B` and
-    picks the source layout, so the copy disappears and the consumer sees
-    `(1, num_experts, num_experts * rank)` and raises `Invalid strides/sizes`. Measured on
-    `gemma-4-26B-A4B-it` (E=128, rank=8, out=1408) and reproduced standalone; the
-    pre-existing grouped-by-expert spelling escaped only because eliding ITS copy happens
-    to leave a legal column-major operand. `index_select` is a real gather that Inductor
-    cannot fold into a view, it keeps the gradient flowing to `lora_B`, and its indices are
-    a permutation, so its `index_add` backward has no duplicate targets to reduce
-    nondeterministically."""
+    """(out, num_experts*rank) to (num_experts, out, rank); rank-major uses index_select, since a view chain lets
+    Inductor elide the copy and hit Invalid strides/sizes in aten._grouped_mm; index_select stays a real gather that
+    keeps gradients flowing to lora_B."""
     weight_B = _moe_lora_b_columns_expert_major(
         weight_B, num_experts, rank_per_expert, layout,
     )
@@ -2328,13 +2587,8 @@ def moe_lora_b_expert_columns(
     rank_per_expert: int,
     layout: str = None,
 ) -> slice:
-    """Which columns of a flat `(out, num_experts * rank)` `lora_B` belong to one expert.
-
-    A `slice`, so indexing with it stays a view. The companion of
-    `unflatten_moe_lora_b` for the merge paths that walk one expert at a time; the two
-    must agree, which is why both live here. `lora_A`'s rows for the same expert are
-    always `expert_idx * rank : (expert_idx + 1) * rank`, in both layouts, and the
-    resulting column order matches that rank order."""
+    """Columns of one expert in a flat (out, num_experts*rank) lora_B, as a slice so indexing stays a view; must agree
+    with unflatten_moe_lora_b. lora_A rows for an expert match in both layouts."""
     layout = _resolve_moe_lora_b_layout(layout)
     if layout == LORA_B_LAYOUT_RANK_MAJOR:
         return slice(expert_idx, num_experts * rank_per_expert, num_experts)
@@ -2351,10 +2605,9 @@ def _canonical_lora_weights_for_grouped_mm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
     first_weight = first_weight.permute(0, 2, 1).contiguous()
-    # (num_experts, rank, out) for X @ first @ second, in ONE copy. Going through
-    # unflatten_moe_lora_b and transposing its result materialises the tensor twice, and
-    # the extra saved tensor makes non-reentrant gradient checkpointing recompute a
-    # different number of tensors than the forward saved.
+    # Builds the second operand as (num_experts, rank, out) in one copy; going through unflatten_moe_lora_b and
+    # transposing copies it twice, and the extra saved tensor makes non-reentrant checkpointing recompute a different
+    # number of tensors than the forward saved.
     second_weight = _ExpertMajorGroupedOperand.apply(
         weight_B, num_experts, rank_per_expert, _resolve_moe_lora_b_layout(None),
     )
@@ -2515,15 +2768,8 @@ def extract_moe_lora_weights_for_grouped_mm(
 def _extract_lora_from_wrapper(
     wrapper, adapter_name: str = "default", experts_module=None
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float, int]]:
-    """Extract LoRA weights from a PEFT ParamWrapper for MoE separated grouped_mm.
-
-    PEFT 3D ParamWrapper gives lora_A: (E*R, in_dim), lora_B: (out_dim, E*R);
-    reshaped to first_weight (E, in_dim, R), second_weight (E, R, out_dim) so
-    delta = X @ first @ second. Handles both standard (E, out, in) Qwen3-MoE and
-    transposed (E, in, out) Qwen3-VL-MoE base weight layouts.
-
-    Returns (first_weight, second_weight, scaling, num_experts) or None.
-    """
+    """Returns (first_weight, second_weight, scaling, num_experts) or None; PEFT lora_A is (E*R, in) and lora_B (out,
+    E*R), handling standard and transposed base layouts."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     try:
@@ -2595,14 +2841,8 @@ _DEQUANTIZE_4BIT_IN_SLICES_MISSING = False  # resolved, and there is none
 
 
 def _get_dequantize_4bit_in_slices():
-    """The sliced 4-bit read, resolved once.
-
-    Absolute, like the dispatcher above and for the same reason: this file is
-    also copied to unsloth_compiled_cache/moe_utils.py and imported as a
-    top-level module, where a relative import of a sibling raises and the
-    caller would quietly put an oversized stack back on the call that aborts.
-    Only the import is guarded; a real failure inside the helper must propagate.
-    """
+    """Absolute import, since this file is also copied to unsloth_compiled_cache where a relative import would raise and
+    quietly restore the oversized full stack; only the import is guarded."""
     global _DEQUANTIZE_4BIT_IN_SLICES, _DEQUANTIZE_4BIT_IN_SLICES_MISSING
     if _DEQUANTIZE_4BIT_IN_SLICES is None and not _DEQUANTIZE_4BIT_IN_SLICES_MISSING:
         try:
@@ -2672,11 +2912,8 @@ def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
 
 
 def _get_lora_wrapper_for_param(experts_module, param_name):
-    """Get the PEFT ParamWrapper for gate_up_proj or down_proj; does not lazily set up wrappers.
-
-    A forward that asks for the wrapper applies that parameter's LoRA itself rather than
-    reading the stash, so finding one counts as a read (see `mark_moe_lora_stash_read`).
-    """
+    """Returns the PEFT ParamWrapper for gate_up_proj or down_proj without setting one up; fetching it counts as a stash
+    read, since the caller applies that LoRA itself."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     wrapper = None
@@ -2704,8 +2941,8 @@ def native_moe_grouped_mm(
 
 
 def _lora_rank_pad_needed(inputs, first_weight) -> bool:
-    """False when both LoRA GEMMs take Triton (masks any K / N, no 16-byte stride rule).
-    rank <= 32 keeps both GEMMs (min(K, N) = rank) in the same "lora" row class."""
+    """False when both LoRA GEMMs take Triton (it masks any K or N, so no 16-byte stride rule); rank <= 32 keeps both in
+    the same lora row class; UNSLOTH_MOE_LORA_PAD_ALWAYS=1 forces True."""
     if inputs is None or first_weight.shape[-1] > 32:
         return True
     if os.environ.get("UNSLOTH_MOE_LORA_PAD_ALWAYS", "0") == "1":
@@ -2721,10 +2958,8 @@ def _lora_rank_pad_needed(inputs, first_weight) -> bool:
 
 
 def _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inputs = None):
-    """Zero-pad the LoRA rank of (E, in, R) / (E, R, out) so torch._grouped_mm gets 16-byte
-    aligned rows (bf16 rank 4 or 6 fell back to the per-expert loop, and aborted compile).
-    Zero columns meet zero rows, so the product is exact. Minimum 8 even for fp32: autocast
-    lowers grouped_mm operands to bf16."""
+    """Zero-pads LoRA rank to 16-byte alignment for torch._grouped_mm (bf16 rank 4 or 6 aborted compile); the product
+    stays exact; minimum 8 even for fp32, since autocast lowers operands to bf16."""
     align = max(8, 16 // first_weight.element_size())
     rank = first_weight.shape[-1]
     pad = (-rank) % align
@@ -2743,10 +2978,8 @@ def _apply_lora_grouped_mm(
     scaling: float,
     grouped_mm_func=native_moe_grouped_mm,
 ) -> torch.Tensor:
-    """Apply LoRA via grouped GEMM: result = ((X @ B) @ A) * scaling.
-
-    inputs (total_tokens, in_dim); lora_B (E, in_dim, R); lora_A (E, R, out_dim).
-    """
+    """Applies LoRA via grouped GEMM as ((X @ B) @ A) * scaling; inputs (total_tokens, in_dim), lora_B (E, in_dim, R),
+    lora_A (E, R, out_dim), all already in native (E, ...) layout."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     lora_B, lora_A = _pad_lora_rank_for_grouped_mm(lora_B, lora_A, inputs)
@@ -2792,18 +3025,20 @@ def get_weight_preprocessor(model_type: str):
     return _weight_preprocessor_registry().get(model_type)
 
 
-def _logical_expert_shape(param):
-    """Return the logical expert shape without dequantizing or materializing.
+_LOGICAL_SHAPE_MAX_DEPTH = 16  # PEFT / quant wrapper chains are a few levels deep
 
-    Resolve PEFT parameters before module wrappers. A recorded logical shape (bnb
-    Params4bit _original_shape, ParameterModule shape_3d) is read directly so a
-    get_param provider is never materialized just to read its shape.
-    """
+
+def _logical_expert_shape(param):
+    """Returns the logical expert shape without dequantizing; resolve PEFT parameters before module wrappers; a recorded
+    shape (bnb _original_shape, ParameterModule shape_3d) is read directly so get_param providers are never
+    materialized."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    seen = set()
-    while param is not None and id(param) not in seen:
-        seen.add(id(param))
+    # Bounded walk, no id(): id() of a traced parameter guards on its identity, so a compiled decoder layer recompiled
+    # once per layer (each owns its expert parameters).
+    for _ in range(_LOGICAL_SHAPE_MAX_DEPTH):
+        if param is None:
+            break
 
         # Recorded logical shape avoids materializing a get_param provider.
         recorded = getattr(param, "_original_shape", None)
@@ -2887,14 +3122,10 @@ def preprocess_weight(
     weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None,
     experts_module=None,
 ):
-    """Convert an expert weight to grouped_mm layout.
-
-    Registered preprocessors take precedence. Square weights use the non-square sibling.
-    """
+    """Converts an expert weight to grouped_mm layout; registered preprocessors take precedence, and square weights use the non-square sibling."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    # Guarded: this runs per projection per MoE forward and again in recompute
-    # backward, and the shipped models pass model_type=None.
+    # Guarded: runs per projection on every MoE forward and again in recompute backward; shipped models pass model_type=None.
     if model_type:
         registry = _weight_preprocessor_registry()
         if model_type in registry:
@@ -2969,8 +3200,7 @@ def _is_gpt_oss_model(model) -> bool:
             name = getattr(config, attr, None)
             if name is None:
                 continue
-            # Match only the final path component so parent directories like
-            # /data/gpt-oss-tests/qwen3-7b do not count as gpt-oss.
+            # Match only the final path component, so parent directories like /data/gpt-oss-tests/qwen3-7b do not count as gpt-oss.
             base = str(name).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
             if "gpt_oss" in _normalize_model_type(base):
                 return True
@@ -2988,8 +3218,7 @@ def _set_gpt_oss_grouped_mm_format_on_experts(module) -> bool:
         return True
     if module.__class__.__name__ != "GptOssExperts":
         return False
-    # Require the gpt-oss (E, in, out) weight signature: gate_up's out dim is
-    # twice down's in dim. Same-named classes with other layouts stay unflagged.
+    # Require the gpt-oss (E, in, out) weight signature, where gate_up's out dim is twice down's in dim; same-named classes with other layouts stay unflagged.
     gate_shape = _get_param_shape_from_module(module, "gate_up_proj")
     down_shape = _get_param_shape_from_module(module, "down_proj")
     if gate_shape is None or down_shape is None:
@@ -3005,14 +3234,8 @@ def _set_gpt_oss_grouped_mm_format_on_experts(module) -> bool:
 
 
 def patch_gpt_oss_grouped_mm_format(model) -> int:
-    """
-    Mark GPT-OSS experts as storing weights in grouped_mm format.
-
-    Stock transformers GPT-OSS experts use (E, in_dim, out_dim) tensors but do
-    not carry Unsloth's `_unsloth_grouped_mm_format` instance flag. Set it on
-    live expert modules so the shared MoE LoRA extractor chooses GPT-OSS
-    ordering instead of the Qwen-style fallback.
-    """
+    """Sets _unsloth_grouped_mm_format on live GPT-OSS experts, whose stock (E, in_dim, out_dim) tensors lack it, so the
+    shared LoRA extractor uses GPT-OSS ordering, not the Qwen fallback."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if model is None or not _is_gpt_oss_model(model):
@@ -3134,21 +3357,15 @@ _get_moe_lora_weights = _extract_lora_from_wrapper
 # adapter cannot be dated from its bytes.
 # ---------------------------------------------------------------------------------------
 
-# Also defined next to the packing helpers by unsloth_zoo#1269; same strings, so the two
-# definitions are interchangeable and either branch can land first.
+# Also defined by unsloth_zoo 1269 with the same strings, so the two definitions are interchangeable and either branch can land first.
 LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
 LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
 
 
 def _process_lora_b_layout() -> str:
-    """Which packing the separated MoE forward uses in THIS process.
-
-    `moe_lora_b_layout()` (unsloth_zoo#1269) is the authority once that fix is in: it
-    reads `UNSLOTH_MOE_LORA_B_LAYOUT` and defaults to PEFT's `rank_major`. It is looked
-    up rather than imported because it lives in this same module, so the two can land in
-    either order. Without it the separated forward is unconditionally grouped by expert,
-    which is what a build predating the packing fix does, so that is the honest answer
-    there."""
+    """Packing the separated MoE forward uses: moe_lora_b_layout() (unsloth_zoo issue 1269; reads
+    UNSLOTH_MOE_LORA_B_LAYOUT, default rank_major) when it exists, looked up at call time; else grouped_by_expert as
+    on pre-fix builds."""
     resolver = globals().get("moe_lora_b_layout")
     if callable(resolver):
         return resolver()
@@ -3156,27 +3373,18 @@ def _process_lora_b_layout() -> str:
 
 
 def _legacy_lora_b_layout_requested() -> bool:
-    """Whether the caller has explicitly declared that the adapters in this process were
-    packed the pre-fix way, by setting `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert`.
-
-    Deliberately the raw environment variable and not `_process_lora_b_layout()`: this
-    gates a patch over PEFT's own `get_delta_weight`, and the packing of a *stored*
-    adapter is a property of the adapter, not of how this process happens to be routing
-    its forwards. Only an explicit statement about provenance may redirect PEFT's merge;
-    an unset variable leaves PEFT's reconstruction, which is the correct one for every
-    adapter trained with the packing fix in place, completely untouched."""
+    """Reads the raw UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert, not _process_lora_b_layout(): only an explicit claim
+    about adapter provenance may redirect PEFT's get_delta_weight; unset keeps PEFT's reconstruction."""
     return os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") == LORA_B_LAYOUT_GROUPED_BY_EXPERT
 
-# The only parameter names the separated forward claims. Anything else on an experts
-# module (the unfused experts.gate_proj / experts.up_proj pair that NemotronH uses, for
-# instance) stays on PEFT's own forward and keeps PEFT's own packing.
+# The separated forward claims only gate_up_proj and down_proj; other experts-module parameters, such as NemotronH's
+# unfused experts.gate_proj / experts.up_proj, stay on PEFT's own forward and packing.
 _SEPARATED_MOE_LORA_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
 
 
 def _wrapper_uses_separated_moe_lora(wrapper, experts_module = None) -> bool:
-    """True when `_patched_param_wrapper_forward` routes this wrapper to the separated
-    MoE forward instead of PEFT's `_activate_lora`. Kept in one place so the forward, the
-    delta reconstruction and the saved layout marker cannot drift apart."""
+    """True when _patched_param_wrapper_forward routes this wrapper to the separated MoE forward rather than PEFT's
+    _activate_lora; kept in one place so forward, delta and layout marker agree."""
     if not _should_use_separated_lora():
         return False
     if getattr(wrapper, "parameter_name", None) not in _SEPARATED_MOE_LORA_PARAMETER_NAMES:
@@ -3193,13 +3401,8 @@ def _wrapper_uses_separated_moe_lora(wrapper, experts_module = None) -> bool:
 
 
 def _wrapper_forward_applies_stash(wrapper, store_attr = None):
-    """The measured verdict for this wrapper's experts forward, or None if unmeasured.
-
-    `_wrapper_uses_separated_moe_lora` answers a structural question, "does the separated
-    forward claim this parameter". `_patched_param_wrapper_forward` then asks a stronger
-    one at run time, "did the forward that actually ran read the stash", and falls back to
-    PEFT when the answer is False. The layout follows the forward that ran, so it has to
-    read the same verdict."""
+    """Measured verdict on whether the experts forward actually read the stash (None if unmeasured); a structural claim
+    is not enough, and the layout must follow the forward that ran."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     parameter_name = getattr(wrapper, "parameter_name", None)
@@ -3221,16 +3424,8 @@ def _wrapper_forward_applies_stash(wrapper, store_attr = None):
 
 
 def _wrapper_has_adapter(wrapper, adapter_name) -> bool:
-    """Whether `adapter_name` has a LoRA on this wrapper at all. A PeftModel can carry a
-    fused expert adapter and a dense adapter side by side, and the fused expert wrappers
-    then exist for the whole model while only one adapter has weights in them, so every
-    layout answer has to be scoped to one adapter or it describes the wrong one.
-
-    `adapter_name = None` asks the weaker question "does this wrapper hold any adapter at
-    all", which is what the unnamed form of `moe_lora_b_layout_for_wrapper` needs. Still
-    a question:
-    `delete_adapter` empties lora_A and leaves the wrapper in place, and claiming a
-    packing for weights that are gone is the same mistake in a smaller form."""
+    """Whether adapter_name has LoRA weights on this wrapper, so layout answers are scoped to one adapter; None asks if
+    any adapter is held (delete_adapter empties lora_A but keeps the wrapper)."""
     lora_A = getattr(wrapper, "lora_A", None)
     if lora_A is None:
         return False
@@ -3243,29 +3438,9 @@ def _wrapper_has_adapter(wrapper, adapter_name) -> bool:
 
 
 def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
-    """Which convention packs `wrapper`'s lora_B columns for `adapter_name`.
-
-    A wrapper the separated MoE forward owns is packed the way that forward packs, which
-    is `_process_lora_b_layout()`: PEFT's `rank_major` with the packing fix in place,
-    `grouped_by_expert` under `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` or on a build
-    predating the fix. Every other wrapper is on PEFT's own forward and is therefore
-    `rank_major`. A single expert (or a wrapper PEFT collapses to a plain Linear) has no
-    packing to get wrong and is reported as rank_major, which is what PEFT's own
-    reconstruction does for it.
-
-    Named for the wrapper on purpose: `moe_lora_b_layout()` is the process-wide setting
-    and takes no arguments, this one answers for one wrapper and one adapter.
-
-    `adapter_name` defaults to "whichever adapter this wrapper holds", which is the old
-    behaviour and is right for a model with one adapter. Name an adapter that has no LoRA
-    on this wrapper and the answer is rank_major, so the caller falls back to PEFT rather
-    than claiming a packing for weights that are not there.
-
-    `wrapper` must be the PEFT ParamWrapper. Hand it anything else, the experts module
-    itself for instance, and the answer is rank_major, because nothing on it says the
-    separated forward claimed a parameter. That reads as a confident "PEFT packed this"
-    when the truth is "cannot tell", so callers that may hold something else have to
-    check for `parameter_name` and `lora_A` first."""
+    """Packing of one wrapper's lora_B for one adapter: separated-forward wrappers use _process_lora_b_layout(), others
+    and single experts are rank_major; any non-ParamWrapper is also rank_major, so check parameter_name and lora_A
+    first."""
     if int(getattr(wrapper, "num_experts", 1) or 1) <= 1:
         return LORA_B_LAYOUT_RANK_MAJOR
     if not _wrapper_has_adapter(wrapper, adapter_name):
@@ -3276,39 +3451,17 @@ def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
             # A compiled-only run never reaches the eager probe.
             verdict = _wrapper_forward_applies_stash(wrapper, _MOE_LORA_COMPILED_VERDICT_ATTR)
         if verdict is False:
-            # The structural test says the separated forward claims this wrapper, but the
-            # forward that actually ran did not read the stash, so `_patched_param_wrapper_forward`
-            # handed the wrapper back to PEFT and PEFT trained it rank-major. That happens
-            # for a stacked-expert family Unsloth does not patch (Olmoe, for one). Believing
-            # the structural answer here would write a grouped_by_expert marker for
-            # rank-major weights, and, under the legacy override, merge them with the wrong
-            # pairing. Only a measured False overrides it; None means "not measured yet",
-            # which is not evidence either way.
+            # Only a measured False overrides the structural test: an unpatched stacked-expert family (Olmoe, for one)
+            # is rank-major, and trusting the structural answer would mislabel it grouped_by_expert or, under the legacy
+            # override, merge it with the wrong pairing; None means not measured yet.
             return LORA_B_LAYOUT_RANK_MAJOR
         return _process_lora_b_layout()
     return LORA_B_LAYOUT_RANK_MAJOR
 
 
-# Did the experts forward actually read the LoRA that ParamWrapper.forward handed it?
-#
-# `_patched_param_wrapper_forward` deliberately does not let PEFT fold the expert LoRA into
-# the stacked expert weight. It stashes the factors on the experts module as
-# `_unsloth_lora_<parameter_name>` and lets the experts forward apply them as a separate
-# grouped GEMM, which is cheaper and keeps the base weight quantized. That is only correct
-# when the forward that runs is one that reads the stash. Unsloth installs such a forward for
-# the MoE families it patches. For a stacked-expert family it does not patch, transformers'
-# own experts forward runs, the stash is written and then deleted unread, and the expert LoRA
-# has no effect on the output at all while requires_grad and the optimizer still report a
-# healthy adapter. `_forward_native_fp8_expert_loop` already refuses rather than train an
-# adapter that nothing reads; this does the same job without having to enumerate the
-# families, by recording the read and asking afterwards.
-#
-# Every stash read goes through `take_moe_lora_stash`, which records the read on the experts
-# module. The wrapper resets the record, calls the base layer, and checks it: an unread stash
-# means this forward does not apply the expert LoRA, so the wrapper redoes the call through
-# PEFT's own `ParamWrapper.forward`, which folds the delta into the weight. The verdict is
-# cached per parameter name against the forward it was measured with, so the double call
-# happens at most once per experts module and never for a family whose forward does read it.
+# The stash is applied as a separate grouped GEMM, correct only if the experts forward reads it; take_moe_lora_stash
+# records reads, and an unread stash silently drops the expert LoRA, so the call is redone via PEFT with the verdict
+# cached per parameter name and forward.
 
 _MOE_LORA_STASH_READ_ATTR = "_unsloth_moe_lora_stash_read"
 _MOE_LORA_STASH_VERDICT_ATTR = "_unsloth_moe_lora_forward_applies"
@@ -3323,13 +3476,8 @@ def moe_lora_stash_name(parameter_name: str) -> str:
 
 
 def _moe_module_dict(module, attr):
-    """Per-module bookkeeping dict for `attr`, created on first use.
-
-    Read through `__dict__` and written with `setattr`: these are plain dicts, so
-    `nn.Module.__setattr__` stores them in the instance `__dict__`, and going straight to
-    `__dict__` on the read path skips `nn.Module.__getattr__` for a value that is never a
-    parameter, buffer or submodule.
-    """
+    """Per-module bookkeeping dict for attr, created on first use; read through __dict__ to skip nn.Module.__getattr__,
+    since these plain dicts are never parameters, buffers or submodules."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     try:
@@ -3346,12 +3494,8 @@ def _moe_module_dict(module, attr):
 
 
 def mark_moe_lora_stash_read(experts_module, parameter_name: str) -> None:
-    """Record that this experts forward applies `parameter_name`'s expert LoRA itself.
-
-    Called by `take_moe_lora_stash` for every stash read, and by
-    `_get_lora_wrapper_for_param` for the forwards that reach past the stash and pull the
-    LoRA straight off the PEFT wrapper (the MXFP4 GPT-OSS experts forward does that).
-    """
+    """Records that this experts forward applies parameter_name's LoRA itself; called on every stash read and by
+    _get_lora_wrapper_for_param when it pulls LoRA off the PEFT wrapper (MXFP4 GPT-OSS does)."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     store = _moe_module_dict(experts_module, _MOE_LORA_STASH_READ_ATTR)
@@ -3360,11 +3504,8 @@ def mark_moe_lora_stash_read(experts_module, parameter_name: str) -> None:
 
 
 def take_moe_lora_stash(experts_module, parameter_name: str):
-    """The stashed LoRA for `parameter_name`, or None, recording that this forward read it.
-
-    Records the read whatever the value is: an attempted read is what proves the forward
-    knows about the stash, and the stash is legitimately absent when no adapter is attached.
-    """
+    """Returns the stashed LoRA for parameter_name or None, always recording the read, since an attempted read is what
+    proves the forward knows about the stash; None is normal with no adapter."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     mark_moe_lora_stash_read(experts_module, parameter_name)
@@ -3386,11 +3527,8 @@ def _resolve_experts_forward(experts_module):
 
 
 def moe_lora_forward_applies_stash(experts_module, parameter_name: str, store_attr = None):
-    """Cached verdict: does this experts forward apply the stashed expert LoRA itself?
-
-    True or False once measured, None when it has not been measured for the forward that is
-    currently installed. Re-patching the forward invalidates the verdict.
-    """
+    """Cached verdict on whether this experts forward applies the stashed LoRA itself: True or False once measured, None
+    until measured for the installed forward; re-patching invalidates it."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     try:
@@ -3459,9 +3597,8 @@ def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None
 
 _STASH_READ_MARKERS = frozenset(("take_moe_lora_stash", "moe_lora_stash_name"))
 
-# How far the scan follows a call before giving up. The installed forwards delegate at most
-# twice (dispatcher -> backend -> helper), and a bound keeps a pathological import graph
-# from turning a cold start into a walk of the whole module tree.
+# Scan depth bound: installed forwards delegate at most twice (dispatcher, backend, helper), and the bound keeps a
+# pathological import graph from making a cold start walk the module tree.
 _STASH_SCAN_MAX_DEPTH = 4
 
 
@@ -3525,15 +3662,15 @@ def _forward_statically_reads_stash(experts_module):
     return _code_reaches_stash(forward)
 
 
-# Dynamo calls this eagerly and bakes in the bool: tracing the scan itself graph-breaks (torch 2.11) or
-# raises under fullgraph once a forward's globals hold an lru_cache wrapper Dynamo cannot getattr through.
+# Dynamo calls this eagerly and bakes in the bool: tracing the scan graph-breaks on torch 2.11, or raises under
+# fullgraph once a forward's globals hold an lru_cache wrapper Dynamo cannot getattr through.
 @_assume_constant_result
 def _code_reaches_stash(forward):
     # This Unsloth Zoo code section is licensed under AGPL3
     code = forward.__code__
-    # (code, shallowest depth) pairs matched by `is`: id() is untraceable on some torch versions,
-    # equality merges same-source functions with different __globals__, and a plain visited set
-    # makes a helper first reached at the depth limit hide its deeper callees (hash-seed dependent).
+    # Visited (code, shallowest depth) pairs matched by is: id() is untraceable on some torch versions, equality merges
+    # same-source functions with other __globals__, and a plain visited set hides deeper callees of a helper first
+    # reached at the depth limit (hash-seed dependent).
     seen_code = []
     pending = [(code, getattr(forward, "__globals__", {}), 0)]
 
@@ -3625,45 +3762,15 @@ def _preserved_rng_for_probe(x):
 # Disabled, not just `is_compiling()`-guarded: fullgraph=False compiles this frame alone, so the guard never cached a verdict.
 @torch.compiler.disable
 def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, args, kwargs) -> bool:
-    """Run one throwaway experts forward under `no_grad` and report whether it read the stash.
-
-    Measured on a separate graph-free call rather than on the call that counts. The call
-    that counts then runs exactly one experts forward, on whichever path the verdict names,
-    and it runs that same single path again on a recompute. That is the property
-    non-reentrant gradient checkpointing requires: it replays the region and refuses, with
-    `CheckpointError: a different number of tensors was saved during the original forward
-    and recomputation`, if the replay does not save what the forward saved. Measuring in
-    band cannot have that property, because the measuring call has to run the forward once
-    to find out and then a second time through PEFT when the answer is no, while the
-    recompute already knows the answer and runs it once. transformers 5 enables gradient
-    checkpointing with `use_reentrant = False` by default
-    (`modeling_utils.py`: `gradient_checkpointing_kwargs = {"use_reentrant": False}`), and
-    Unsloth's own vision path selects it whenever the run is distributed, so that is the
-    common configuration and not a corner.
-
-    `no_grad` and the discarded result are what make this cheap enough to do eagerly: no
-    graph is built, nothing is saved for backward, and it happens once per experts module
-    and parameter for the lifetime of the process. A stash-reading family pays one extra
-    forward on its first step and nothing afterwards; a family that ignores the stash now
-    pays two forwards on its first step where the in-band measurement paid three.
-
-    Returns True, False, or None when the probe itself raised. None caches nothing and
-    leaves the call on the stash path, so the real call raises the real error with the real
-    traceback instead of a second, confusing one from PEFT's fold.
-    """
+    """Measures stash use with one throwaway no_grad forward per module and parameter, so the counted call runs one path
+    that a non-reentrant checkpoint replay matches (transformers 5 defaults to use_reentrant = False); None,
+    uncached, if the probe raised."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if torch.compiler.is_compiling():
-        # Never inside a captured graph. Dynamo has no notion of a one-time measurement: it
-        # traces this whole throwaway forward into the graph alongside the call that counts,
-        # so the compiled region ends up running the experts forward three times on EVERY
-        # invocation, not once during a single warm-up. Measured on PyTorch 2.12 with
-        # fullgraph: six expert einsums in one graph where two are correct.
-        #
-        # None, which is the "no evidence" answer: it caches no verdict and leaves the call
-        # on the stash path, which is exactly what this module did before the probe existed.
-        # An eager forward before or after compilation still establishes the verdict, and the
-        # cached one is consulted before this function is ever called.
+        # Never probe inside a captured graph: Dynamo traces the throwaway forward too (six expert einsums where two are
+        # correct, PyTorch 2.12 fullgraph); None means no evidence and caches nothing; an eager forward before or after
+        # compilation still sets the verdict.
         return None
     lora_data = _extract_lora_from_wrapper(wrapper)
     lora_attr = moe_lora_stash_name(parameter_name)
@@ -3724,35 +3831,9 @@ def _moe_lora_folded_weight(self, param, active):
 def _fold_moe_lora_without_parametrization(
     self, immediate_base_layer, experts_module, parameter_name, x, args, kwargs
 ):
-    """PEFT's fold, arithmetically, with the parametrization left out. None if not doable.
-
-    Same folded weight PEFT would produce, by the same route it would choose (see
-    `_moe_lora_folded_weight`). The difference is only how the base forward gets to see
-    it: PEFT registers a parametrization on the stored parameter,
-    whose `set_` Dynamo rejects as a graph-input mutation, while this swaps the attribute
-    for `W + delta` for the duration of the call and puts the parameter back after.
-    Autograd is unaffected, since the sum is an ordinary op on both tensors.
-
-    Only for the compiled path. Eagerly PEFT's own forward stays in charge, so adapter
-    bookkeeping this does not reproduce (variants, merge state, anything future PEFT does
-    inside `_activate_lora`) is only ever bypassed where the alternative is not running at
-    all. Returns None whenever anything is missing, and the caller then falls through to
-    the stash path rather than losing the call.
-
-    Nested wrappers compose: the wrapper chain is down_proj -> gate_up_proj -> experts and
-    each level folds and restores its own parameter around the next, so both are folded
-    for the innermost forward.
-
-    The swap is done inside `_parameters` and nowhere else. `nn.Module.__getattr__` reads
-    the value straight out of that dict, so a plain tensor placed there is what the forward
-    sees, and the module's `__setattr__`, which would reject a plain tensor where a
-    Parameter is registered, is never involved. The obvious alternative, shadowing the
-    name in the instance `__dict__`, is what this used to do and it does not trace:
-    `experts_module.__dict__` is an unknown type to Dynamo, so removing the shadow in the
-    `finally` raises `Unsupported: Dynamo does not know how to trace method 'pop' of class
-    '<unknown type>'` on torch 2.10, the floor this package supports. That turned the
-    fullgraph compile this function exists to make possible back into a hard error.
-    """
+    """PEFT LoRA fold without the parametrization, compiled path only: swaps W + delta into _parameters rather than
+    __dict__ (fails to trace on torch 2.10), since the PEFT parametrization set_ is a graph-input mutation Dynamo
+    rejects; None when not doable."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     try:
@@ -3766,8 +3847,8 @@ def _fold_moe_lora_without_parametrization(
     if not isinstance(parameters, dict) or parameter_name not in parameters:
         return None
     if parameter_name in experts_module.__dict__:
-        # Something already shadows the registered parameter, so swapping `_parameters`
-        # would not reach the forward. Refuse rather than fold into a value nothing reads.
+        # Refuse if something already shadows the registered parameter: swapping _parameters would not reach the
+        # forward, so folding would feed a value nothing reads.
         return None
     original = parameters[parameter_name]
     folded = _moe_lora_folded_weight(self, original, active)
@@ -3781,10 +3862,8 @@ def _fold_moe_lora_without_parametrization(
         parameters[parameter_name] = original
 
 
-# PEFT names the float8 storage dtypes it must upcast in `peft.utils.UPCAST_DTYPES`. Track
-# that list rather than restating it, so a dtype PEFT adds later is excluded here too, and
-# fall back to resolving the names off torch for PEFT versions that do not export it. Every
-# one of these raises on `param + delta`, including the fnuz pair ROCm uses.
+# Track peft.utils.UPCAST_DTYPES rather than restating it, so a dtype PEFT adds later is covered; every float8 dtype
+# there raises on param + delta, incl. ROCm's fnuz pair; older PEFT falls back to torch names.
 def _resolve_float8_storage_dtypes():
     names = None
     try:
@@ -3856,8 +3935,8 @@ _original_param_wrapper_forward = None
 
 
 def _gpt_oss_routed_wrapper_forward(wrapper, experts_module, x, args, kwargs):
-    """gpt-oss eval decode through the outermost expert ParamWrapper: only the routed experts,
-    with every adapter in the chain applied. None for anything else (callers run as before)."""
+    """gpt-oss eval decode through the outermost expert ParamWrapper, computing only routed experts with every adapter
+    applied; None for anything else so callers run as before."""
     if torch.is_grad_enabled() or type(experts_module).__name__ != "GptOssExperts":
         return None
     if "adapter_names" in kwargs:  # mixed-adapter batch: PEFT's own forward handles or rejects it
@@ -4016,10 +4095,8 @@ _original_param_wrapper_get_delta_weight = None
 
 
 def _grouped_by_expert_delta_weight(wrapper, adapter_name):
-    """PEFT's ParamWrapper.get_delta_weight arithmetic with lora_B read the way the
-    separated MoE forward reads it: (out, num_experts, rank) rather than PEFT's
-    (out, rank, num_experts). Everything else, including which einsum the swapped
-    in/out orientation needs, is PEFT's own."""
+    """PEFT's get_delta_weight arithmetic with lora_B read as (out, num_experts, rank), as the separated MoE forward
+    does, not PEFT's (out, rank, num_experts); the rest is PEFT's own."""
     weight_A = wrapper.lora_A[adapter_name].weight
     weight_B = wrapper.lora_B[adapter_name].weight
     num_experts = int(wrapper.num_experts)
@@ -4037,16 +4114,14 @@ def _grouped_by_expert_delta_weight(wrapper, adapter_name):
 
 
 def _cast_delta_weight_like_param(delta_weight, param):
-    """PEFT's own tail: move the delta to the parameter, and match its dtype unless that
-    dtype is a low precision one PEFT deliberately adds in higher precision (float8 and
-    friends). Probed from PEFT when it publishes the set, so this follows PEFT rather
-    than hardcoding a dtype list that a new release would make wrong."""
+    """Moves the delta to the parameter, matching its dtype unless that dtype is a low-precision one PEFT deliberately
+    computes higher (float8 and friends); the set is probed from PEFT, not hardcoded."""
     try:
         from peft.tuners.lora.layer import ALLOWED_COMPUTE_DTYPES
         allowed = param.dtype in ALLOWED_COMPUTE_DTYPES
     except Exception:
-        # PEFT 0.18 has no such set and casts unconditionally, 0.19.0 onwards do; every dtype
-        # 0.18 accepts for a 3D expert parameter is an ordinary floating point one.
+        # PEFT 0.18 has no ALLOWED_COMPUTE_DTYPES set and casts unconditionally, 0.19.0 onwards do; every dtype 0.18
+        # accepts for a 3D expert parameter is ordinary floating point.
         allowed = param.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
     if allowed:
         return delta_weight.to(param.device, param.dtype)
@@ -4054,21 +4129,9 @@ def _cast_delta_weight_like_param(delta_weight, param):
 
 
 def _patched_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs):
-    """PEFT's `get_delta_weight` for a legacy, grouped-by-expert fused MoE expert LoRA.
-
-    PEFT reconstructs a fused expert delta with lora_B packed rank-major, which is what
-    it trained and what every consumer reads, so by default this does nothing at all and
-    PEFT's own code runs. It only takes over when the caller has explicitly declared that
-    the adapters in this process were packed the pre-fix way, with
-    `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert`; that same variable is what makes the
-    separated forward read them that way (unsloth_zoo#1269), and without this patch the
-    forward and PEFT's `merge_and_unload` / `merge_adapter` / `unmerge` would disagree for
-    exactly the checkpoints that switch exists to support (unsloth#6930).
-
-    Gating on the declaration rather than on "is this wrapper routed to the separated
-    forward" is the point: the packing of a stored adapter is a property of the adapter,
-    and reading it off this process's routing would scramble a correctly packed adapter
-    merged inside an Unsloth process."""
+    """Overrides PEFT get_delta_weight only when UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert declares pre-fix packing
+    (separated forward reads it too); keyed on that, not routing, as packing is per adapter; without it forward and
+    PEFT merges disagree (unsloth issue 6930, unsloth_zoo issue 1269)."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if not _legacy_lora_b_layout_requested():
@@ -4091,18 +4154,15 @@ def _moe_utils_logger():
         return None
 
 
-# The adapter_config.json keys. The flat one is what a converter branches on
-# (unsloth#6930 asks for exactly this key); the nested one carries the detail, because a
-# checkpoint can in principle hold one fused parameter trained through the separated
-# forward and another PEFT kept for itself.
+# adapter_config.json keys: flat lora_B_layout is what a converter branches on (unsloth 6930); nested
+# unsloth_fused_expert_lora carries the detail, since one checkpoint can mix separated-forward and PEFT-kept parameters.
 FUSED_EXPERT_LORA_LAYOUT_KEY = "lora_B_layout"
 FUSED_EXPERT_LORA_DETAIL_KEY = "unsloth_fused_expert_lora"
 
 
 def _default_adapter_name(peft_model) -> str:
-    """The adapter `fused_expert_lora_layout` describes when the caller names none: the
-    model's active one, or PEFT's own default name. Both attributes are properties on
-    some PEFT versions and can raise on a partly built model, so neither is trusted."""
+    """Model's active adapter, else PEFT's default name; active_adapter and active_adapters are read defensively, as
+    some PEFT versions make them properties that raise on a partly built model."""
     # delete_adapter leaves active_adapter a list, and active_adapters is always one.
     for attribute in ("active_adapter", "active_adapters"):
         try:
@@ -4118,19 +4178,9 @@ def _default_adapter_name(peft_model) -> str:
 
 
 def fused_expert_lora_layout(peft_model, adapter_name = None) -> Optional[dict]:
-    """How ONE adapter's fused MoE expert LoRA on `peft_model` packs its lora_A and
-    lora_B, or None when that adapter has no fused expert LoRA at all.
-
-    lora_A is grouped by expert in both stacks. lora_B is the one that differs, and it is
-    reported per PEFT parameter name, since that is what decides whether Unsloth's
-    separated forward or PEFT's own forward owns the wrapper.
-
-    The answer is per adapter because a PeftModel can hold several. A fused expert
-    adapter and a dense adapter side by side share the fused expert wrappers, so a scan
-    that only asks "does this model have a fused expert LoRA anywhere" answers yes for
-    the dense adapter too, and that answer would be written into the dense adapter's own
-    adapter_config.json. `adapter_name` defaults to the model's active adapter, so the
-    single adapter case is unchanged."""
+    """Packing of one adapter's fused expert LoRA, or None; lora_A is expert-grouped in both stacks, lora_B differs and
+    is keyed by PEFT parameter name, which decides whose forward owns the wrapper; per adapter so a dense sibling is
+    not stamped."""
     if adapter_name is None:
         adapter_name = _default_adapter_name(peft_model)
 
@@ -4169,10 +4219,8 @@ def fused_expert_lora_layout(peft_model, adapter_name = None) -> Optional[dict]:
         "parameters": parameters,
     }
     layouts = {entry["lora_B_layout"] for entry in parameters.values()}
-    # The flat key is what a converter branches on, so it is only written when every
-    # fused expert parameter agrees on one of the two real names. "mixed" is a report,
-    # not a layout, and a converter testing `== "grouped_by_expert"` would read it as
-    # rank_major, so it stays in the nested detail where it has to be read deliberately.
+    # Flat lora_B_layout key is written only when every fused expert param agrees on one real layout; 'mixed' stays
+    # nested, since a converter testing for grouped_by_expert would read it as rank_major.
     if len(layouts) == 1:
         layout = layouts.pop()
         if layout in (LORA_B_LAYOUT_GROUPED_BY_EXPERT, LORA_B_LAYOUT_RANK_MAJOR):
@@ -4181,9 +4229,8 @@ def fused_expert_lora_layout(peft_model, adapter_name = None) -> Optional[dict]:
 
 
 def _fused_expert_lora_adapter_config_paths(peft_model, save_directory, selected_adapters):
-    """Where PEFT just wrote an adapter_config.json: the root for `default`, a
-    subdirectory named after any other adapter. Paired with the adapter each file
-    belongs to, because the marker is per adapter."""
+    """Paths of the adapter_config.json files PEFT just wrote: root for default, a subdirectory per other adapter; each
+    is paired with its adapter since the marker is per adapter."""
     if selected_adapters is None:
         try:
             selected_adapters = list(peft_model.peft_config.keys())
@@ -4287,11 +4334,9 @@ def _all_target_names(base_model):
 
 
 def _portable_regex_target_modules(base_model, adapter_name, regex):
-    """Exact regex over the wrapped modules when `regex` also fullmatches `<experts>.gate_proj`.
-
-    Unsloth's get_peft_regex matches `mlp.experts.gate_proj` / `up_proj`, which PEFT's v5 MoE conversion
-    reads as a v4 adapter and doubles gate_up_proj's rank, so plain PEFT fails to load (unsloth#6930).
-    """
+    """Exact regex over wrapped modules when the regex also fullmatches experts.gate_proj (Unsloth's get_peft_regex
+    matches them); PEFT v5 MoE reads that as v4 and doubles gate_up_proj rank, so plain PEFT fails to load (unsloth
+    issue 6930)."""
     import re
     wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
     if not has_param_lora:
@@ -4316,11 +4361,9 @@ def _portable_regex_target_modules(base_model, adapter_name, regex):
 
 
 def portable_lora_target_modules(peft_model, adapter_name, target_modules):
-    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine.
-
-    Gemma 4: LoRA sits on the inner `.linear`; plain PEFT would pick the unsupported wrapper, so write a regex.
-    Fused experts: unmatched gate_proj / up_proj make PEFT's v5 MoE conversion double gate_up_proj's rank; drop them.
-    """
+    """Returns target_modules plain PEFT loads as Unsloth trained, or None if fine; Gemma 4 needs a regex since LoRA
+    sits on the inner .linear, where plain PEFT picks an unsupported wrapper; unmatched fused-expert
+    gate_proj/up_proj are dropped (PEFT v5 doubles gate_up_proj rank)."""
     if not target_modules or not isinstance(target_modules, (str, list, tuple, set)):
         return None
     try:
@@ -4353,8 +4396,7 @@ def portable_lora_target_modules(peft_model, adapter_name, target_modules):
 
 
 def _redirected_patterns(peft_model, adapter_name, patterns):
-    """Add a `(?:key)\\.linear` twin for each rank/alpha pattern key that matched a redirected
-    wrapper, since PEFT fullmatches `(.*\\.)?(key)$` against the inner `.linear` on reload."""
+    """Adds a (?:key) plus literal .linear twin per rank/alpha key matching a redirected wrapper, since PEFT fullmatches the inner .linear on reload."""
     import re
     if not isinstance(patterns, dict) or not patterns:
         return patterns
@@ -4396,18 +4438,9 @@ def write_portable_target_modules(peft_model, save_directory, selected_adapters 
 
 
 def _atomic_write_text(path, text):
-    """Replace `path` with `text`, or leave it exactly as it was.
-
-    Opening the real file "w" truncates it before the first byte is written, so a write
-    that fails part way (a full disk, an erroring network mount) leaves a truncated
-    adapter_config.json behind. `_patched_peft_model_save_pretrained` then swallows the
-    exception and reports a successful save, so the checkpoint is unloadable and nothing
-    says so. Writing a sibling temporary file first means a failure destroys only that
-    file, and `os.replace` is atomic on POSIX and on Windows, so no reader can observe a
-    half-written config either.
-
-    The temporary file is a sibling, not a tempdir entry, because `os.replace` across
-    filesystems raises. It is removed on failure so a failed save leaves no litter."""
+    """Writes a sibling temp file then os.replace (atomic): opening the target with w truncates it, so a failed write
+    leaves an unloadable adapter_config.json the save reports as success; the temp file is a sibling because
+    os.replace fails across filesystems."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     directory = os.path.dirname(path) or "."
@@ -4415,12 +4448,8 @@ def _atomic_write_text(path, text):
         dir = directory, prefix = os.path.basename(path) + ".", suffix = ".tmp",
     )
     try:
-        # mkstemp creates the file 0600 and os.replace keeps the NEW inode's mode, so
-        # without this the config silently drops from (say) 0644 to 0600 on every save
-        # and a checkpoint shared with other users or a serving process stops being
-        # readable, while its weight files stay readable. Carry the existing mode over;
-        # for a config PEFT has not written yet there is nothing to carry, so leave
-        # mkstemp's private mode rather than inventing a laxer one.
+        # os.replace keeps the mode of mkstemp's new 0600 file, so copy the existing config's mode over or a shared
+        # checkpoint becomes unreadable; a config PEFT has not written yet keeps the private mode.
         try:
             os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
         except OSError:
@@ -4443,10 +4472,8 @@ _original_peft_model_save_pretrained = None
 
 
 def _save_pretrained_argument(name, default, args, kwargs):
-    """One of PeftModel.save_pretrained's arguments, whether the caller passed it by
-    keyword or positionally. Resolved against the real signature rather than a copy of
-    it, so a PEFT release that adds an argument cannot silently shift the index. `args`
-    excludes self and save_directory."""
+    """Reads a PeftModel.save_pretrained argument by keyword or position, resolved from the real signature so a new PEFT
+    argument cannot shift the index; args excludes self and save_directory."""
     if name in kwargs:
         return kwargs[name]
     try:
@@ -4463,8 +4490,8 @@ def _save_pretrained_argument(name, default, args, kwargs):
 
 
 def _stamp_fused_expert_lora_layout(peft_model, selected_adapters):
-    """Put the layout in `auto_mapping` too, which PEFT writes with the config itself: the
-    post-save marker write can fail, and a marker-less Unsloth adapter reads as pre-2026.9.6."""
+    """Also stores the layout in auto_mapping, which PEFT writes with the config, since the post-save marker write can
+    fail and a marker-less adapter reads as pre-2026.9.6."""
     try:
         names = selected_adapters or list(peft_model.peft_config.keys())
         for adapter_name in names:
@@ -4481,8 +4508,7 @@ def _stamp_fused_expert_lora_layout(peft_model, selected_adapters):
 
 
 def _patched_peft_model_save_pretrained(self, save_directory, *args, **kwargs):
-    """Add the fused expert layout marker to what PEFT saved. Never fails a save: the
-    adapter itself is already on disk by the time this runs."""
+    """Adds the fused expert layout marker after PEFT's save; never fails the save, since the adapter is already on disk by then."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     _stamp_fused_expert_lora_layout(
@@ -4547,8 +4573,7 @@ def _patch_peft_save_pretrained_for_moe_layout():
     return True
 
 
-# Families whose experts forward read lora_B grouped by expert from #450 to #1269 (2026.9.6);
-# every other family stayed on PEFT's forward, i.e. rank_major.
+# Families whose experts forward read lora_B grouped by expert from 450 to 1269 (2026.9.6); every other family stayed rank_major on PEFT's forward.
 _LEGACY_GROUPED_LORA_B_FAMILIES = frozenset((
     "deepseek_v3", "ernie4_5_moe", "ernie4_5_vl_moe", "gemma4", "glm4_moe", "glm4_moe_lite",
     "gpt_oss", "lfm2_moe", "mixtral", "qwen3_5_moe", "qwen3_moe", "qwen3_next", "qwen3_vl_moe",
@@ -4607,9 +4632,8 @@ def saved_lora_b_layouts(config) -> dict:
 
 
 def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
-    """Repack `adapter_name`'s grouped-by-expert fused expert lora_B into PEFT's rank_major,
-    in place, per `saved_lora_b_layouts(config)`. Lossless: column `e * r + j` moves to
-    `j * num_experts + e`. Returns how many tensors moved."""
+    """Repacks grouped-by-expert lora_B per saved_lora_b_layouts(config) into PEFT rank_major, in place, losslessly
+    (column e*r+j moves to j*num_experts+e); returns how many tensors moved."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     layouts = saved_lora_b_layouts(config)
@@ -4653,9 +4677,8 @@ def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
 
 
 def repack_optimizer_state_for_legacy_lora_b(optimizer) -> Tuple[int, int]:
-    """Move the optimizer state of lora_B tensors `convert_legacy_lora_b` repacked into the
-    same column order; state that cannot be permuted (8-bit blockwise) is dropped and
-    re-initialised on the next step. Returns (moved, reset)."""
+    """Permutes optimizer state of repacked lora_B tensors to match; 8-bit blockwise state cannot be permuted, so it is
+    reset and re-initialised; returns (moved, reset)."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     moved = reset = 0
@@ -4733,8 +4756,7 @@ def _read_adapter_config(model_id, kwargs):
     path = os.path.join(str(model_id), subfolder, "adapter_config.json")
     if not os.path.isfile(path):
         from huggingface_hub import hf_hub_download
-        # The Hub options PEFT was given (cache_dir, local_files_only, ...), so this finds
-        # the same file PEFT just loaded.
+        # Forward the Hub options PEFT was given (cache_dir, local_files_only, ...) so this resolves the same file PEFT just loaded.
         accepted = inspect.signature(hf_hub_download).parameters
         download = {k: v for k, v in kwargs.items() if k in accepted}
         if download.get("token") is None and kwargs.get("use_auth_token") is not None:
@@ -4749,9 +4771,8 @@ def _read_adapter_config(model_id, kwargs):
 
 
 def _patched_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs):
-    """PEFT's load_adapter, then repack a pre-2026.9.6 Unsloth fused expert lora_B into
-    rank_major so the forward, merge and the next save all agree (unsloth#6930). An explicit
-    `UNSLOTH_MOE_LORA_B_LAYOUT` keeps the caller's setting and skips this."""
+    """Runs PEFT load_adapter, then repacks pre-2026.9.6 fused expert lora_B to rank_major so forward, merge and next
+    save agree (unsloth issue 6930); an explicit UNSLOTH_MOE_LORA_B_LAYOUT skips this."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     result = _original_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs)
@@ -4822,8 +4843,8 @@ def patch_param_wrapper_for_moe():
 
         ParamWrapper.forward = _patched_param_wrapper_forward
 
-        # The forward is only half of it: the merge path reads lora_B through
-        # get_delta_weight, which is PEFT's and packs it the other way.
+        # The forward is only half: the merge path reads lora_B through PEFT's ParamWrapper.get_delta_weight, which
+        # packs it the other way, so that is patched as well.
         if not getattr(ParamWrapper.get_delta_weight, "_unsloth_moe_layout_patched", False):
             if _original_param_wrapper_get_delta_weight is None:
                 _original_param_wrapper_get_delta_weight = ParamWrapper.get_delta_weight
@@ -4843,53 +4864,47 @@ def patch_param_wrapper_for_moe():
         return False
 
 
-# Gate gradient via the inner-product identity dGate = <A, dA> / gate, instead of
-# <dOut, Y> which pins the down-projection output Y on the tape solely for that
-# gradient. Output unchanged; on by default to save memory. The runtime gate below
-# still auto-disables it for fp16, down-bias models and frozen routers. Set
-# UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
+# Gate grad via identity dGate = <A, dA> / gate instead of <dOut, Y>, which pins the down output Y on the tape; output
+# unchanged, on by default to save memory, auto-disabled for fp16, down-bias and frozen routers; UNSLOTH_MOE_GATEGRAD=0
+# reverts to the standard <dOut, Y> path.
 
 
 _WEIGHTED_UNPERMUTE = None
 
 
-def weighted_unpermute(*args, **kwargs):
-    """Fused Triton combine, or None so the caller falls back to the eager reduction."""
+def _resolve_weighted_unpermute():
     global _WEIGHTED_UNPERMUTE
     if _WEIGHTED_UNPERMUTE is None:
         try:
             from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
-        except ImportError:
+        except Exception:  # now runs at import too: a broken triton must not fail importing zoo
             _wu = False
         _WEIGHTED_UNPERMUTE = _wu
-    if _WEIGHTED_UNPERMUTE is False:
+    return _WEIGHTED_UNPERMUTE
+
+
+def weighted_unpermute(*args, **kwargs):
+    """Fused Triton combine, or None so the caller falls back to the eager reduction."""
+    if _resolve_weighted_unpermute() is False:
         return None
     return _WEIGHTED_UNPERMUTE(*args, **kwargs)
 
 
+# Resolved at import: a first-call assignment in a compiled MoE block guards on the global being None, recompiling every decoder layer once.
+_resolve_weighted_unpermute()
+
+
 @lru_cache(maxsize=1)
 def _moe_gategrad_enabled() -> bool:
-    """Whether the MoE gate-gradient identity path is active (on by default).
-
-    Cached with maxsize=1 since UNSLOTH_MOE_GATEGRAD is read once per process. Any
-    code or test that toggles the env var at runtime must call
-    _moe_gategrad_enabled.cache_clear() afterwards for the change to take effect.
-    """
+    """Gate-gradient identity path is on by default; UNSLOTH_MOE_GATEGRAD is read once and cached, so code toggling it
+    at runtime must call _moe_gategrad_enabled.cache_clear()."""
     return os.environ.get("UNSLOTH_MOE_GATEGRAD", "1") != "0"
 
 
 class _MoEGateGradIdentity(torch.autograd.Function):
-    """Identity over the pre-down activation ``inter``; backward derives the gate
-    gradient as ``dGate = <inter, dA> / gate`` instead of ``<dOut, Y>``.
-
-    The incoming dA equals ``gate * (dOut @ W2_eff.T)`` for the effective down
-    weight (base + LoRA), so ``<inter, dA> / gate`` is exactly ``<Y, dOut>``
-    without ever materialising Y for the gradient. The caller passes a
-    sign-floored gate and multiplies Y by that same value, so the identity holds
-    for any routing weight, including exact zeros. Exact for any linear down
-    projection; NOT valid with a post-matmul down bias, so callers must
-    disable it when one is present.
-    """
+    """Identity over the pre-down activation; backward gives the gate grad as <inter, dA>/gate instead of <dOut, Y>;
+    exact for any linear down projection and any routing weight, zeros included (caller sign-floors the gate);
+    invalid with a post-matmul down bias, so callers must disable it then."""
 
     @staticmethod
     def forward(ctx, inter, permuted_weights):
@@ -4990,11 +5005,8 @@ def forward_native_grouped_mm(
 
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
-    sorted_indices = torch.argsort(flat_top_k, stable=True)
-    token_indices = sorted_indices // top_k_index.shape[-1]
-    permuted_input = hidden_states[token_indices]
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
+    permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
 
     # Gate + Up projection with optional separated LoRA (default).
     use_separated_lora = _should_use_separated_lora()
@@ -5014,13 +5026,13 @@ def forward_native_grouped_mm(
         )
 
     own_gate_up = None
+    fused_inter = None
     selective_plan = None
     if hasattr(self, "gate_up_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _gate_up_src = self.gate_up_proj
 
-        # Provider re-derives the base weight on demand so Fix 3 can recompute it in
-        # backward instead of pinning it (grouped_mm needs contiguous weights).
+        # Provider re-derives the base weight on demand so Fix 3 can recompute it in backward instead of pinning it; grouped_mm needs contiguous weights.
         def _gate_up_provider(experts=None, _src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
             return preprocess_weight(_get_base_weight(_src, _dt, _n, experts), "gate_up", _h, _mt, experts_module=_mod)
         _gate_up_layout = _mxfp4_expert_layout(_gate_up_src, "gate_up", hidden_dim, model_type, self)
@@ -5030,6 +5042,8 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype), _gate_up_layout,
             )
         else:
+            mm1_out = _nf4_fused_base_mm(permuted_input, offsets, _gate_up_src, "gate_up", hidden_dim, model_type, self)
+        if _gate_up_layout is None and mm1_out is None:
             _recompute = _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype)
             if _recompute:
                 selective_plan = _selective_dequant_plan(
@@ -5088,21 +5102,21 @@ def forward_native_grouped_mm(
             mm1_out = mm1_out + lora_delta * scaling
 
         if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
-            # repeat_interleave without output_size= D2H-syncs. sorted_indices is
-            # already in expert order, so gathering by expert id matches it, sync-free
-            # (74 us -> 8 us host at E=128 x 16384 rows).
+            # repeat_interleave without output_size= forces a D2H sync; sorted_indices is already in expert order, so
+            # gathering by expert id matches it and is sync-free.
             sorted_expert_ids = flat_top_k[sorted_indices]
-            bias_expanded = self.gate_up_proj_bias.index_select(
-                0, sorted_expert_ids.to(self.gate_up_proj_bias.device)
-            )
+            bias_expanded = _gather_expert_bias(self.gate_up_proj_bias, sorted_expert_ids)
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
-        if _gate_up_is_interleaved(self):
+        _interleaved = _gate_up_is_interleaved(self)
+        if _interleaved:
             gate = mm1_out[..., ::2]
             up = mm1_out[..., 1::2]
         else:
             gate, up = mm1_out.chunk(2, dim=-1)
         own_gate_up = mm1_out if _uses_own_apply_gate(self) else None
+        if own_gate_up is None:
+            fused_inter = _fused_moe_activation(self, mm1_out, _interleaved)
 
     elif hasattr(self, "w1") and hasattr(self, "w3"):
         # Separate w1/w3 weights (older models).
@@ -5148,6 +5162,8 @@ def forward_native_grouped_mm(
     # Activation
     if own_gate_up is not None:
         inter = self._apply_gate(own_gate_up)
+    elif fused_inter is not None:
+        inter = fused_inter
     elif "GptOssExperts" in self.__class__.__name__:
         # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
@@ -5162,14 +5178,9 @@ def forward_native_grouped_mm(
     else:
         inter = F.silu(gate) * up
 
-    # Env-gated gate-grad identity; disabled when a down bias exists (identity
-    # assumes a linear down), the router is frozen (nothing to synthesize, and
-    # the Function would needlessly keep inter saved), or inter is float16. For
-    # fp16, the gradient into the identity carries the tiny floored gate as a
-    # factor (grad_inter = gate * (W2 @ dOut)); with a near-zero gate that product
-    # underflows fp16 to 0 before backward runs, dropping the router gradient for
-    # near-zero routes. fp16 therefore keeps the standard multiply (correct
-    # gradient, saves Y); bf16/fp32 hold the tiny value and are unaffected.
+    # Env-gated gate-grad identity; off with a down bias (identity assumes linear down), a frozen router, or fp16 (kept
+    # on the standard multiply, since grad_inter = gate * (W2 @ dOut) underflows to 0 for near-zero gates); bf16/fp32
+    # unaffected.
     _gategrad = (
         _moe_gategrad_enabled()
         and getattr(self, "down_proj_bias", None) is None
@@ -5179,14 +5190,9 @@ def forward_native_grouped_mm(
     permuted_weights = None
     if _gategrad:
         raw_weights = top_k_weights.reshape(-1)[sorted_indices]
-        # Sign-floor the gate away from zero (straight-through, so the synthesized
-        # gradient still reaches top_k_weights). The multiply below and the
-        # identity's divide use the SAME floored value, so they cancel exactly and
-        # the gate gradient <Y, dOut> survives even a routing weight of exactly
-        # zero. An fp16 gate cannot represent eps=1e-12 (its smallest normal is
-        # ~6e-5), so upcast it to float32; inter is non-fp16 here, so the floored
-        # value survives in grad_inter. The forward then changes by at most
-        # 1e-12 * |Y| for |gate| < 1e-12.
+        # Sign-floor the gate away from zero (straight-through to top_k_weights), with the same value in multiply and
+        # identity divide so <Y, dOut> survives a zero weight; fp16 cannot represent eps=1e-12, so upcast to float32;
+        # forward changes by at most 1e-12 * |Y| when |gate| < 1e-12.
         if raw_weights.dtype == torch.float16:
             raw_weights = raw_weights.to(torch.float32)
         eps = 1e-12
@@ -5224,6 +5230,8 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype), _down_layout,
             )
         else:
+            mm2_out = _nf4_fused_base_mm(inter, offsets, _down_src, "down", hidden_dim, model_type, self)
+        if _down_layout is None and mm2_out is None:
             _recompute = _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype)
             mm2_out = _base_grouped_mm(
                 inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None,
@@ -5263,9 +5271,7 @@ def forward_native_grouped_mm(
         if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
             # Capture-safe gather; see gate_up_proj_bias above.
             sorted_expert_ids = flat_top_k[sorted_indices]
-            bias_expanded = self.down_proj_bias.index_select(
-                0, sorted_expert_ids.to(self.down_proj_bias.device)
-            ).to(mm2_out.device)
+            bias_expanded = _gather_expert_bias(self.down_proj_bias, sorted_expert_ids).to(mm2_out.device)
             mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
 
     elif hasattr(self, "w2"):
@@ -5328,6 +5334,64 @@ def _experts_are_input_major(module, name, in_dim) -> bool:
     return getattr(module, name).shape[-1] != in_dim
 
 
+TRITON_MOE_COMPUTE_DTYPE_STATS = {"cast": 0, "kept_fp32": 0}
+
+
+def _triton_moe_compute_dtype(module, hidden_states):
+    """bf16 for float32 activations into bf16 experts (matches autocast); float16 is left alone (overflow)."""
+    if hidden_states.dtype != torch.float32:
+        return hidden_states.dtype
+    for name in ("gate_up_proj", "down_proj"):
+        weight = getattr(module, name, None)
+        if not isinstance(weight, torch.Tensor) or weight.dtype != torch.bfloat16:
+            return hidden_states.dtype
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+        return hidden_states.dtype
+    keep = os.environ.get("UNSLOTH_MOE_TRITON_FP32", "0") == "1"
+    # Eager only: Dynamo would recompile on every counter value.
+    if not torch.compiler.is_compiling():
+        TRITON_MOE_COMPUTE_DTYPE_STATS["kept_fp32" if keep else "cast"] += 1
+    return hidden_states.dtype if keep else torch.bfloat16
+
+
+@torch.compiler.disable
+def _moe_weight_dtype_kwargs(tuner, module, name, dtype, device = None):
+    """Supplies the weight_dtype kwarg when expert weights differ from activations (bf16 W, float32 X); the operands'
+    CUDA device is used since mixed-GPU hosts need configs for that card."""
+    try:
+        parameters = inspect.signature(tuner).parameters
+    except (TypeError, ValueError):
+        return {}
+    kwargs = {}
+    weight = getattr(module, name, None)
+    weight_dtype = getattr(weight, "dtype", None)
+    if weight_dtype in (torch.float32, torch.bfloat16, torch.float16) and weight_dtype != dtype \
+            and "weight_dtype" in parameters:
+        kwargs["weight_dtype"] = weight_dtype
+    # Older unsloth has no device argument and reads the current device.
+    if device is not None and device.type == "cuda" and "device" in parameters:
+        kwargs["device"] = device
+    return kwargs
+
+
+# tl.dot needs tile dims >= 16 and kernels static_assert K % BLOCK_SIZE_K == 0 (N likewise); the tile fitter stops at
+# 16, so non-multiple-of-16 hidden or intermediate sizes cannot compile.
+_TRITON_GROUPED_GEMM_DIM_MULTIPLE = 16
+
+
+def _triton_grouped_gemm_dims_supported(module, hidden_dim) -> bool:
+    try:
+        gate_up = module.gate_up_proj
+        if _experts_are_input_major(module, "gate_up_proj", hidden_dim):
+            intermediate_dim = gate_up.shape[-1] // 2
+        else:
+            intermediate_dim = gate_up.shape[1] // 2
+    except Exception:
+        return True
+    m = _TRITON_GROUPED_GEMM_DIM_MULTIPLE
+    return hidden_dim % m == 0 and intermediate_dim % m == 0
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -5336,6 +5400,12 @@ def forward_triton_grouped_gemm(
 ) -> torch.Tensor:
     """Grouped-GEMM MoE forward via Triton kernels (torch.compile-compatible, mode="max-autotune")."""
     # This Unsloth Zoo code section is licensed under AGPL3
+
+    if not _triton_grouped_gemm_dims_supported(self, hidden_states.shape[-1]):
+        # Toy shapes (hidden_size 8): the same routing on grouped_mm, else the eager loop; neither has the tile limit.
+        if _grouped_mm_supported_on(hidden_states.device):
+            return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+        return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
     from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
     from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
@@ -5373,6 +5443,11 @@ def forward_triton_grouped_gemm(
         num_tokens, hidden_dim = hidden_states.shape
 
     top_k = top_k_index.shape[1]
+    compute_dtype = _triton_moe_compute_dtype(self, hidden_states)
+    # The gate_up GEMM reads X in compute_dtype as plain bf16 training does; a float32 X runs in float32, whose default
+    # tile does not fit L4 shared memory; fp16 and the FP32 flags keep float32; LoRA and routing sum keep the caller's
+    # dtype.
+    gemm_hidden_states = hidden_states if hidden_states.dtype == compute_dtype else hidden_states.to(compute_dtype)
 
     # Cache model dims and kernel configs on first call.
     if self._unsloth_moe_configs is None:
@@ -5387,7 +5462,10 @@ def forward_triton_grouped_gemm(
             hidden_dim=hidden_dim,
             intermediate_dim=intermediate_dim,
             top_k=top_k,
-            dtype=hidden_states.dtype,
+            dtype=gemm_hidden_states.dtype,
+            **_moe_weight_dtype_kwargs(
+                get_or_autotune_moe_kernels, self, "gate_up_proj", gemm_hidden_states.dtype, gemm_hidden_states.device,
+            ),
         )
 
         # Second GEMM: K = intermediate_dim, N = hidden_dim.
@@ -5396,7 +5474,10 @@ def forward_triton_grouped_gemm(
             hidden_dim=intermediate_dim,
             intermediate_dim=hidden_dim // 2 if hidden_dim % 2 == 0 else hidden_dim,
             top_k=top_k,
-            dtype=hidden_states.dtype,
+            dtype=compute_dtype,
+            **_moe_weight_dtype_kwargs(
+                get_or_autotune_moe_kernels, self, "down_proj", compute_dtype, gemm_hidden_states.device,
+            ),
         )
 
         self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)
@@ -5406,10 +5487,8 @@ def forward_triton_grouped_gemm(
     fwd_config_1, bwd_dX_config_1, bwd_dW_config_1 = gemm1_configs
     fwd_config_2, bwd_dX_config_2, bwd_dW_config_2 = gemm2_configs
 
-    token_counts_by_expert, gather_indices = _get_routing_indices(
-        top_k_index, self.num_experts
-    )
-    offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
+    with torch.no_grad():
+        token_counts_by_expert, gather_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
 
     if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
@@ -5418,7 +5497,7 @@ def forward_triton_grouped_gemm(
 
     # First grouped GEMM: gate_up projection.
     first_gemm_output = grouped_gemm(
-        X=hidden_states,
+        X=gemm_hidden_states,
         W=w1,
         m_sizes=token_counts_by_expert,
         topk=top_k,
@@ -5432,14 +5511,13 @@ def forward_triton_grouped_gemm(
         is_first_gemm=True,
     )
 
-    # Separated LoRA for gate_up. grouped_gemm ran permute_x=True so first_gemm_output
-    # is expert-sorted; _apply_lora_grouped_mm wants pre-permuted input, so gather via
-    # gather_indices // top_k (expert-sorted row -> originating token row).
+    # Separated gate_up LoRA: grouped_gemm ran with permute_x=True so first_gemm_output is expert-sorted;
+    # _apply_lora_grouped_mm wants pre-permuted input, gathered via gather_indices // top_k (sorted row to token row).
     if gate_up_lora is not None:
         first_weight, second_weight, scaling = gate_up_lora
         first_weight = first_weight.to(hidden_states.dtype)
         second_weight = second_weight.to(hidden_states.dtype)
-        permuted_hidden = hidden_states[gather_indices // top_k]
+        permuted_hidden = gather_routed_rows(hidden_states, gather_indices, top_k)
         gate_up_lora_delta = _apply_lora_grouped_mm(
             permuted_hidden,
             first_weight,
@@ -5450,9 +5528,17 @@ def forward_triton_grouped_gemm(
         )
         first_gemm_output = first_gemm_output + gate_up_lora_delta
 
+    if first_gemm_output.dtype != compute_dtype:
+        first_gemm_output = first_gemm_output.to(compute_dtype)
+
     # Activation + gate*up.
+    fused_intermediate = None
+    if not _uses_own_apply_gate(self):
+        fused_intermediate = _fused_moe_activation(self, first_gemm_output, False, allow_gptoss = False)
     if _uses_own_apply_gate(self):
         intermediate = self._apply_gate(first_gemm_output)
+    elif fused_intermediate is not None:
+        intermediate = fused_intermediate
     elif hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
@@ -5507,8 +5593,8 @@ def forward_triton_grouped_gemm(
             grouped_mm_func=native_moe_grouped_mm
         )
 
-        # permute_y=True put second_gemm_output in token order; lora_delta is still
-        # expert-sorted, so scatter it rather than adding it row-for-row.
+        # permute_y=True puts second_gemm_output in token order while lora_delta is still expert-sorted, so it is
+        # scattered with index_add_ rather than added row-for-row.
         if lora_delta.dtype == second_gemm_output.dtype:
             second_gemm_output.index_add_(0, gather_indices, lora_delta)
         else:
@@ -5584,11 +5670,14 @@ def forward_native_moe_loop(
             _down_scaling,
         )
 
-    # Expert mask -> which experts have tokens.
+    # Stable sort keeps torch.where(one_hot)'s (slot, token) row order: bit-identical results.
     with torch.no_grad():
-        expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-        expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        n_tokens = top_k_index.shape[0]
+        slot_major = top_k_index.t().reshape(-1)   # position = top_k_pos * n_tokens + token
+        expert_counts, order, _ = moe_routing_sort(slot_major, self.num_experts)
+        routed_token_idx = order % n_tokens
+        routed_top_k_pos = order // n_tokens
+        expert_counts = expert_counts.tolist()
 
     # A declared (E, in, out) layout (_unsloth_grouped_mm_format) wins over the shape test, which a square stack defeats.
     grouped_mm_format = bool(_module_flag(self, "_unsloth_grouped_mm_format", False)) or (
@@ -5600,10 +5689,13 @@ def forward_native_moe_loop(
     is_gpt_oss = "GptOssExperts" in self.__class__.__name__
     own_apply_gate = _uses_own_apply_gate(self)
 
-    for expert_idx_t in expert_hit:
-        expert_idx = expert_idx_t.item()
-
-        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+    row_end = 0
+    for expert_idx, count in enumerate(expert_counts):
+        row_start, row_end = row_end, row_end + count
+        if count == 0:
+            continue
+        token_idx = routed_token_idx[row_start:row_end]
+        top_k_pos = routed_top_k_pos[row_start:row_end]
         current_state = hidden_states[token_idx]
 
         # gate_up projection for this expert ('gate_up_proj' or 'w1'/'w3').

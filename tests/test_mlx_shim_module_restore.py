@@ -14,22 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The mlx shim fixtures must hand the next test file an intact import graph.
-
-test_mlx_preference.py and test_mlx_trainer_internals.py drop every
-unsloth_zoo.mlx.* module so their shim is the one those modules bind against,
-then put the originals back. Restoring sys.modules alone is not enough, and the
-gap is not visible from inside the file that causes it: whoever runs next on the
-same xdist worker pays for it.
-
-#1131 restored sys.modules and stopped there. It fixed the two failures it was
-aimed at and introduced six others -- in test_pr684_review_fixes_a.py,
-test_mlx_text_path_contract.py and test_mlx_distributed_loader.py -- because
-`import unsloth_zoo.mlx.trainer as t` reads parent package attributes while a
-`from unsloth_zoo.mlx.trainer import MLXTrainer` inside the code under test
-reads sys.modules. Nothing asserted the two agreed, so the trade went unnoticed.
-This file asserts it.
-"""
+"""Shim fixtures must restore unsloth_zoo.mlx.* in both sys.modules and parent attributes; restoring only sys.modules (issue 1131) broke six other test files."""
 
 from __future__ import annotations
 
@@ -89,12 +74,7 @@ def test_restore_puts_parent_attributes_back():
 
 
 def test_restore_drops_attributes_for_modules_it_cannot_restore():
-    """A submodule imported only under the shim leaves no dangling attribute.
-
-    Putting nothing back in sys.modules for it while leaving parent.child bound
-    is the same split in reverse: the attribute walk finds a module that no
-    sys.modules lookup can ever reach.
-    """
+    """A submodule imported only under the shim must not stay bound as parent.child with nothing in sys.modules; that split is the same bug in reverse."""
     from mlx_simulation import restore_modules, snapshot_modules
 
     saved = snapshot_modules(_owned)
@@ -117,12 +97,7 @@ def test_restore_drops_attributes_for_modules_it_cannot_restore():
 
 
 def test_the_shim_files_use_the_shared_restore():
-    """Both fixtures must go through restore_modules, not sys.modules.update.
-
-    The bare update is what shipped in #1131. Spelled out here so a future edit
-    that reintroduces it is a failing test rather than six failures in unrelated
-    files one worker over.
-    """
+    """Both shim fixtures must use restore_modules, not sys.modules.update, which shipped in issue 1131 and caused six failures in unrelated files."""
     from pathlib import Path
 
     here = Path(__file__).resolve().parent

@@ -6,24 +6,8 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""PyPI version-sync regression test.
-
-Catches the class of bug where someone bumps `__version__` on a
-release branch, ships a wheel to PyPI, then a subsequent PR
-accidentally REWINDS `__version__` on main below what PyPI
-already serves. The next release would then publish a SMALLER
-version than the previous one, breaking pip's resolver for every
-user who runs `pip install --upgrade unsloth_zoo`.
-
-Invariant pinned: `__version__ on main >= latest published version
-on PyPI`. (Equality is OK -- nothing has changed since the last
-release. Greater-than is OK -- we're preparing the next release.
-Less-than is the bug.)
-
-Networked. Skipped automatically when PyPI is unreachable, but on
-GitHub Actions CI the harden-runner allowlist explicitly includes
-`pypi.org:443`, so the skip should never fire there.
-"""
+"""Checks __version__ on main is >= the latest PyPI release so a rewind cannot ship a smaller version; networked,
+skipped if PyPI is unreachable (CI allowlists pypi.org:443)."""
 
 from __future__ import annotations
 
@@ -41,8 +25,7 @@ PYPI_JSON_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
 
 
 def _parse_version(value: str):
-    """Best-effort PEP 440 parser; uses packaging.version, else a numeric-aware
-    split safe for the simple X.Y.Z[.devN|rcN|postN] shape zoo uses."""
+    """Best-effort PEP 440 parse via packaging.version, else a numeric-aware split safe for the simple X.Y.Z[.devN|rcN|postN] shape zoo uses."""
     try:
         from packaging.version import Version
         return Version(value)
@@ -59,8 +42,7 @@ def _parse_version(value: str):
 
 
 def _get_pypi_latest_version(timeout: float = 10.0):
-    """Fetch unsloth_zoo's latest published version from PyPI's JSON API;
-    returns None on network failure so the test skips rather than fails."""
+    """Fetches unsloth_zoo's latest PyPI version from the JSON API; returns None on network failure so the test skips rather than fails."""
     request = urllib.request.Request(
         PYPI_JSON_URL,
         headers = {"User-Agent": "unsloth-zoo-ci/test_pypi_version_sync"},
@@ -78,9 +60,7 @@ def _get_pypi_latest_version(timeout: float = 10.0):
 
 
 def _get_main_version():
-    """Read `__version__` from unsloth_zoo/__init__.py WITHOUT importing the
-    package: importing on a CI runner without CUDA/XPU/HIP fires device-type
-    detection, so reading the source file directly is safer."""
+    """Reads __version__ from unsloth_zoo/__init__.py without importing the package, since import triggers device detection on runners without CUDA/XPU/HIP."""
     import pathlib
     import re
 
@@ -103,13 +83,7 @@ def _get_main_version():
 
 
 def test_pypi_version_is_not_ahead_of_main():
-    """`__version__` on main MUST be >= latest published version on PyPI.
-
-    If this fails, someone bumped __version__ on a release branch +
-    published to PyPI, but the bump didn't make it back to main.
-    Resolution: cherry-pick the version bump back to main BEFORE
-    the next release.
-    """
+    """Fails when a version bump shipped on a release branch never made it back to main; cherry-pick it to main before the next release."""
     if os.environ.get("UNSLOTH_SKIP_PYPI_VERSION_SYNC"):
         pytest.skip(
             "UNSLOTH_SKIP_PYPI_VERSION_SYNC env var set -- bypassed "
@@ -146,9 +120,7 @@ def test_pypi_version_is_not_ahead_of_main():
 
 
 def test_main_version_string_is_parseable():
-    """The version string in unsloth_zoo/__init__.py must be a valid
-    PEP 440 version. Catches typos / accidental "1.0" without patch.
-    """
+    """Checks the __version__ string in unsloth_zoo/__init__.py parses as PEP 440, catching typos and accidental versions like 1.0 without a patch part."""
     main_version_str = _get_main_version()
     try:
         from packaging.version import Version

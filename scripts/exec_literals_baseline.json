@@ -15,6 +15,13 @@
     },
     {
       "file": "unsloth_zoo/compiler.py",
+      "sink": "compile",
+      "digest": "8a046bb13379b63d",
+      "count": 1,
+      "reason": "Syntax-checks PEFT's own LoRA forward (inspect.getsource) after this file swaps in two fixed update lines; the result is discarded and never executed. ast.parse cannot replace it because it accepts a stray `continue` that compile rejects."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
       "sink": "eval",
       "digest": "03e6d133b778a53e",
       "count": 1,
@@ -446,6 +453,20 @@
       "digest": "32809b4ed10761d5",
       "count": 1,
       "reason": "Executes that compiled torch_forward in the remote module's own namespace; the source is the already-trusted remote method with the two literal substitutions above."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/t5.py",
+      "sink": "compile",
+      "digest": "db03349e3b7fe7de",
+      "count": 1,
+      "reason": "Installs the UMT5ForConditionalGeneration.forward compiled from an AST this file built from transformers source, with one literal test swapped."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/t5.py",
+      "sink": "exec",
+      "digest": "41daf1963df86e7e",
+      "count": 1,
+      "reason": "Installs the UMT5ForConditionalGeneration.forward compiled from an AST this file built from transformers source, with one literal test swapped."
     },
     {
       "file": "unsloth_zoo/vllm_gdn_replayssm.py",

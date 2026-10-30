@@ -13,13 +13,24 @@ from fla.ops.kda.chunk_intra_token_parallel import chunk_kda_fwd_intra_token_par
 from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
+from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.op import exp2, gather
-from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, LONG_INDEXING_THRESHOLD, autotune_cache_kwargs
+from fla.utils import (
+    IS_GATHER_SUPPORTED,
+    IS_NPU,
+    IS_TF32_SUPPORTED,
+    LONG_INDEXING_THRESHOLD,
+    TRITON_ABOVE_3_6_0,
+    autotune_cache_kwargs,
+)
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
 else:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('ieee')
+# Unsloth: backported from fla PR #1554.
+# TF32 rounding makes safe-gate gradient error grow with context length; bf16x3 reduces it and runs faster than TF32.
+SAFE_GATE_DOT_PRECISION = tl.constexpr('bf16x3' if TRITON_ABOVE_3_6_0 and not IS_NPU else 'ieee')
 
 ################################################################################
 # Fused inter + solve_tril kernel: compute off-diagonal Akk and solve in one pass
@@ -421,6 +432,7 @@ def chunk_kda_bwd_kernel_intra(
     NC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     SAFE_GATE: tl.constexpr,
+    GATE_SHIFT: tl.constexpr,
     USE_GATHER: tl.constexpr,
     LONG_INDEXING: tl.constexpr = False,
 ):
@@ -511,12 +523,14 @@ def chunk_kda_bwd_kernel_intra(
     b_q = tl.load(p_q, mask=m_ck, other=0.0)
     b_k = tl.load(p_k, mask=m_ck, other=0.0)
 
+    # Unsloth: backported from fla PR #1242: match the forward anchor (first token of the
+    # block minus a fixed shift) so the diagonal path never reads future gates.
     if SAFE_GATE:
         if USE_GATHER:
-            b_gn = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
+            b_gn = gather(b_g, tl.zeros([1, BK], dtype=tl.int16), axis=0)
         else:
-            p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * HV*K + o_k
-            b_gn = tl.load(p_gn, mask=m_k, other=0)[None, :]
+            b_gn = tl.load(g + i_ti * HV*K + o_k, mask=m_k, other=0)[None, :]
+        b_gn = b_gn - 0.5 * (BC - 1) * GATE_SHIFT
 
         p_dAqk = dAqk + o_c[:, None] * (HV*BT) + (i_i * BC + o_i)[None, :]
         p_dAkk = dAkk + o_c[:, None] * (HV*BT) + (i_i * BC + o_i)[None, :]
@@ -533,8 +547,9 @@ def chunk_kda_bwd_kernel_intra(
         exp_neg_b_g_diag_qk = tl.where(m_j_diag_qk, exp2(-b_g_diag_qk), 0.)
 
         b_k_exp_diag_qk = b_k * exp_neg_b_g_diag_qk
-        b_dq2 += tl.dot(b_dAqk_diag_qk, b_k_exp_diag_qk) * exp_b_g_diag_qk
-        b_dk2 += tl.dot(b_dAkk_diag_qk, b_k_exp_diag_qk) * exp_b_g_diag_qk
+        # Unsloth: backported from fla PR #1554.
+        b_dq2 += tl.dot(b_dAqk_diag_qk, b_k_exp_diag_qk, input_precision=SAFE_GATE_DOT_PRECISION) * exp_b_g_diag_qk
+        b_dk2 += tl.dot(b_dAkk_diag_qk, b_k_exp_diag_qk, input_precision=SAFE_GATE_DOT_PRECISION) * exp_b_g_diag_qk
     else:
         for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
             # [BC]
@@ -609,12 +624,13 @@ def chunk_kda_bwd_kernel_intra(
     p_gkj = g + i_ti * HV*K + o_k
     p_bj = beta + i_ti * HV
 
+    # Unsloth: backported from fla PR #1242: the same anchor for key-side gradients.
     if SAFE_GATE:
         if USE_GATHER:
-            b_gn = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
+            b_gn = gather(b_g, tl.zeros([1, BK], dtype=tl.int16), axis=0)
         else:
-            p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * HV*K + o_k
-            b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
+            b_gn = tl.load(g + i_ti * HV*K + o_k, mask=m_k, other=0).to(tl.float32)[None, :]
+        b_gn = b_gn - 0.5 * (BC - 1) * GATE_SHIFT
         p_q = q + o_c[:, None] * (H*K) + o_k[None, :]
         b_q = tl.load(p_q, mask=m_ck, other=0.0)
         p_b = beta + o_c * HV
@@ -638,8 +654,9 @@ def chunk_kda_bwd_kernel_intra(
         b_q_exp = b_q * exp_b_g_diag_kk
         b_kb_exp = b_k * b_b[:, None] * exp_b_g_diag_kk
 
-        b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp) * exp_neg_b_g_diag_kk
-        b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp) * exp_neg_b_g_diag_kk
+        # Unsloth: backported from fla PR #1554.
+        b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp, input_precision=SAFE_GATE_DOT_PRECISION) * exp_neg_b_g_diag_kk
+        b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp, input_precision=SAFE_GATE_DOT_PRECISION) * exp_neg_b_g_diag_kk
     else:
         for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
             # [BC,]
@@ -703,6 +720,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     BC: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    GATE_SHIFT: tl.constexpr,
     USE_GATHER: tl.constexpr,
     LONG_INDEXING: tl.constexpr = False,
 ):
@@ -747,16 +765,15 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     b_g = tl.load(p_g, mask=m_ck, other=0.0)
     b_beta = tl.load(p_beta, mask=m_c, other=0.0)
 
+    # Unsloth: backported from fla PR #1242: anchor on the block's first (causal) gate shifted
+    # by a fixed amount instead of the middle token's gate, which leaked future gates into
+    # earlier scores through rounding. See chunk_kda_fwd_intra.
     if USE_GATHER:
-        b_gn = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
+        b_gn = gather(b_g, tl.zeros([1, BK], dtype=tl.int16), axis=0)
     else:
-        # caculate offset
-        p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * HV*K + tl.arange(0, BK)
-        b_gn = tl.load(p_gn, mask=tl.arange(0, BK) < K, other=0.0)
-        b_gn = b_gn[None, :]
+        b_gn = tl.load(g + i_ti * HV*K + o_k, mask=m_k, other=0.0)[None, :]
+    b_gn = b_gn - 0.5 * (BC - 1) * GATE_SHIFT
 
-    # current block, keep numerical stability by subtracting the left boundary
-    # less than 85 to avoid overflow in exp2
     b_gm = (b_g - b_gn).to(tl.float32)
 
     b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.)
@@ -809,8 +826,21 @@ def chunk_kda_fwd_intra(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     safe_gate: bool = False,
+    lower_bound: float | None = None,
     disable_recompute: bool = False,
 ):
+    """Compute intra-chunk factors and solve the triangular KDA system.
+
+    Unsloth: backported from fla PR #1242. Bounded log gates in safe_gate keep the
+    diagonal-block exponentials within FP32 range, allowing Tensor Core matmuls, with
+    exp(G_i - G_j) = exp(G_i - C) * exp(C - G_j). fla 0.5.1 took C from the middle token
+    of the 16-token block, which reads future gates for earlier causal scores: C cancels
+    in exact arithmetic, but rounding leaked future gates into them
+    (https://drisspg.github.io/nuggets/KDA-Future-Token-Leakage). C is now the block's
+    first cumulative gate shifted by d = (BC - 1) * s / 2, s = -lower_bound when given
+    here and 2 otherwise (chunk_kda uses 2, as upstream). Forward and backward use the
+    same fixed BC for partial blocks too, so appending tokens cannot move C.
+    """
     B, T, H, K, HV = *k.shape, gk.shape[2]
     BT = chunk_size
     if BT not in (32, 64):
@@ -849,6 +879,7 @@ def chunk_kda_fwd_intra(
             BT=BT,
             BC=BC,
             BK=BK,
+            GATE_SHIFT=(-lower_bound if lower_bound is not None else 2.) * RCP_LN2,
             USE_GATHER=IS_GATHER_SUPPORTED,
             LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > LONG_INDEXING_THRESHOLD,
         )
@@ -917,6 +948,7 @@ def chunk_kda_bwd_intra(
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
     safe_gate: bool = False,
+    lower_bound: float | None = None,
 ):
     B, T, H, K, HV = *k.shape, g.shape[2]
     BT = chunk_size
@@ -960,6 +992,7 @@ def chunk_kda_bwd_intra(
         BK=BK,
         NC=NC,
         SAFE_GATE=safe_gate,
+        GATE_SHIFT=(-lower_bound if lower_bound is not None else 2.) * RCP_LN2,
         USE_GATHER=IS_GATHER_SUPPORTED,
         LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > LONG_INDEXING_THRESHOLD,
     )

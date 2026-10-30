@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dataset supplied image/video URLs must not reach internal addresses.
-
-A VLM dataset row can carry `{"type": "image_url", "image_url": "http://..."}`,
-and the collators resolve it server side through fetch_image()/fetch_video().
-Without a destination check that lets a dataset drive requests from the
-training worker to localhost, the LAN, or the cloud metadata endpoint. Public
-URLs and every local-file form must keep working unchanged.
-"""
+"""Dataset-supplied image/video URLs must not reach localhost, the LAN or cloud metadata via
+fetch_image()/fetch_video(); public URLs and local files must still work."""
 
 from __future__ import annotations
 
@@ -55,8 +49,7 @@ BLOCKED_URLS = [
     "http://127.1/x.png",
     "http://2130706433/x.png",
     "http://user:pass@127.0.0.1/x.png",
-    # RFC 6598 carrier-grade NAT: ipaddress.is_private is False for it on
-    # every Python from 3.9 to 3.13, so the guard needs its own entry.
+    # RFC 6598 carrier-grade NAT: ipaddress.is_private is False for it on every Python from 3.9 to 3.13, so the guard needs its own entry.
     "http://100.64.0.1/x.png",
     "http://224.0.0.1/x.png",
     "http://240.0.0.1/x.png",
@@ -147,8 +140,7 @@ def _fake_session(monkeypatch):
 
 
 def _decoder_must_not_run(monkeypatch):
-    """Backend selection happens before the download now, so the assertion has
-    to sit on the decoder itself rather than on the selector."""
+    """Backend selection happens before the download, so the assertion has to sit on the decoder itself rather than on the selector."""
     def boom(ele):
         raise AssertionError(f"the decoder must not be reached, got {ele['video']!r}")
 
@@ -295,9 +287,7 @@ def test_address_classification_is_explicit(address, blocked):
 
 
 def test_host_resolution_is_not_cached(monkeypatch):
-    """A cached answer would outlive the DNS record it came from, so a host that
-    resolved publicly once would keep passing validation while the connection
-    resolved somewhere else."""
+    """Resolution must not be cached: a host that resolved publicly once would keep passing validation while the connection resolved somewhere else."""
     calls = []
     real = __import__("socket").getaddrinfo
 
@@ -312,15 +302,8 @@ def test_host_resolution_is_not_cached(monkeypatch):
 
 
 def test_an_absolute_name_is_resolved_absolutely(monkeypatch):
-    """A trailing dot is not cosmetic to DNS: it makes the name absolute.
-
-    _normalize_host strips it so a pin matches whichever spelling the client puts
-    on the connection, and resolving that stripped form let a resolver with search
-    domains answer for `cdn.example.<search-domain>` instead. Kubernetes ships
-    ndots:5 by default, so that is the ordinary case there: the guard would then
-    reject a valid public URL whose search-expanded twin is private, or pin the
-    request to an address belonging to a different name.
-    """
+    """A trailing dot makes the name absolute: _normalize_host strips it for pin matching, but the lookup must keep the
+    dot or search domains (ndots:5 on Kubernetes) answer."""
     asked = []
     real = __import__("socket").getaddrinfo
 
@@ -389,6 +372,66 @@ def test_fetch_video_rejects_internal_url_before_touching_a_decoder(monkeypatch,
 
 @pytest.mark.parametrize(
     "url",
+    ["HTTP://127.0.0.1:9/clip.mp4", "Https://169.254.169.254/clip.mp4"],
+)
+def test_fetch_video_guards_upper_case_http_schemes(monkeypatch, no_network, url):
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError):
+        vision_utils.fetch_video({"video": url})
+    assert no_network == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "rtsp://10.0.0.5/stream",
+        "tcp://127.0.0.1:9",
+        "ftp://10.0.0.5/clip.mp4",
+        "smb://host/share/a.mp4",
+        "tcp:127.0.0.1:9",
+        "concat:/tmp/a.mp4|/tmp/b.mp4",
+        "subfile,,start,0,end,0,,:/tmp/a.mp4",
+    ],
+)
+def test_fetch_video_refuses_other_url_schemes_before_a_decoder(monkeypatch, no_network, url):
+    # ffmpeg dials these protocols itself, so they would bypass the guard.
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "unsupported scheme"):
+        vision_utils.fetch_video({"video": url})
+    assert no_network == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "C:\\data\\clip.mp4",
+        "C:/data/clip.mp4",
+        "/data/clip.mp4",
+        "clips/a.mp4",
+        "subfile,clip.mp4",
+        "file://C:/data/clip.mp4",
+        "\\\\?\\C:\\data\\clip.mp4",
+        "\\\\?\\Volume{b75e2c83-0000-0000-0000-602f00000000}\\videos\\clip.mp4",
+        "file:///tmp/clip.mp4",
+        "data:video/mp4;base64,AAAAIGZ0eXBpc29t",
+    ],
+)
+def test_fetch_video_local_paths_still_reach_the_decoder(monkeypatch, no_network, path):
+    seen = []
+
+    def decoder(ele):
+        seen.append(ele["video"])
+        raise RuntimeError("stop after the decoder is reached")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", lambda: "torchvision")
+    monkeypatch.setitem(vision_utils.VIDEO_READER_BACKENDS, "torchvision", decoder)
+    with pytest.raises(RuntimeError, match = "stop after"):
+        vision_utils.fetch_video({"video": path})
+    assert seen and seen[0] == path
+
+
+@pytest.mark.parametrize(
+    "url",
     [
         "http://%31%32%37.0.0.1:8080/x.png",
         "http://127%2e0%2e0%2e1:8080/x.png",
@@ -398,9 +441,7 @@ def test_fetch_video_rejects_internal_url_before_touching_a_decoder(monkeypatch,
     ],
 )
 def test_percent_encoded_authority_is_refused(url, no_network):
-    """urlparse leaves the authority encoded while requests decodes it before
-    connecting, so an encoded host would be checked as an unresolvable name and
-    then fetched from 127.0.0.1."""
+    """urlparse keeps the authority percent-encoded but requests decodes it, so an encoded host would be checked as unresolvable and then fetched from 127.0.0.1."""
     with pytest.raises(ValueError):
         vision_utils.fetch_image({"image": url})
     assert no_network == []
@@ -418,8 +459,8 @@ def test_percent_escapes_in_the_path_are_still_fine(monkeypatch, public_dns):
 
 @pytest.mark.parametrize("value", ["inf", "INF", "nan", "1e400", "-inf", "abc", "0"])
 def test_non_finite_size_limits_do_not_break_every_fetch(monkeypatch, public_dns, value):
-    """float() accepts inf and nan, int() then refuses them, which used to make
-    every remote image raise before its request was issued."""
+    """float() accepts inf and nan but int() refuses them, so non-finite UNSLOTH_MAX_MEDIA_DOWNLOAD_MB values must not
+    make every remote image raise before its request."""
     monkeypatch.setenv("UNSLOTH_MAX_MEDIA_DOWNLOAD_MB", value)
     monkeypatch.setattr(
         vision_utils.requests, "get",
@@ -429,9 +470,7 @@ def test_non_finite_size_limits_do_not_break_every_fetch(monkeypatch, public_dns
 
 
 def test_video_download_is_guarded_not_delegated(monkeypatch, public_dns):
-    """The decoders follow redirects with no way to refuse, so a server that
-    answers our probe cleanly could still bounce them internally. The bytes are
-    fetched here instead and the decoder only ever sees a local file."""
+    """Decoders follow redirects with no way to refuse, so video bytes are fetched here under the guard and the decoder only ever sees a local file."""
     hops = []
 
     def fake_get(url, **kwargs):
@@ -448,8 +487,7 @@ def test_video_download_is_guarded_not_delegated(monkeypatch, public_dns):
 
 
 def test_video_decoder_receives_a_local_file_not_a_url(monkeypatch, public_dns, tmp_path):
-    """Even for a wholly public chain the decoder gets a downloaded file, so a
-    second request it makes cannot be answered differently."""
+    """Even for a wholly public redirect chain the decoder receives a downloaded local file, so it cannot make a second request that is answered differently."""
     seen = {}
     payload = b"\x00\x00\x00\x20ftypisom fake container bytes"
 
@@ -520,15 +558,13 @@ def test_fetch_video_does_not_mutate_the_caller_dict(monkeypatch, public_dns):
 
 
 def test_site_local_ipv6_is_blocked():
-    """fec0::/10 is deprecated but still routed in places, and ipaddress reports
-    it only through is_site_local, not is_private."""
+    """fec0::/10 site-local IPv6 is deprecated but still routed in places, and ipaddress reports it only via is_site_local, not is_private."""
     import ipaddress
     assert vision_utils._is_blocked_ip(ipaddress.ip_address("fec0::1")) is True
 
 
 def test_percent_escapes_in_credentials_are_allowed(monkeypatch, public_dns):
-    """`https://user:p%40ss@example.com/x.png` is a valid authenticated URL that
-    worked before the guard existed; only the host portion is suspect."""
+    """Percent-escapes in credentials, as in user:p%40ss@host, are valid; only the host portion is suspect."""
     seen = []
     monkeypatch.setattr(
         vision_utils.requests, "get",
@@ -556,8 +592,7 @@ def test_unresolvable_host_behind_a_proxy_fails_closed(monkeypatch):
 
 
 def test_unresolvable_host_without_a_proxy_is_left_to_the_client(monkeypatch):
-    """No proxy means the request cannot reach anywhere either, so the HTTP
-    client should report its own error rather than us inventing one."""
+    """With no proxy configured an unresolvable host is left to the HTTP client, which reports its own error rather than the guard inventing one."""
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                 "http_proxy", "https_proxy", "all_proxy"):
         monkeypatch.delenv(var, raising=False)
@@ -565,8 +600,7 @@ def test_unresolvable_host_without_a_proxy_is_left_to_the_client(monkeypatch):
 
 
 def test_one_session_spans_the_whole_redirect_chain(monkeypatch, public_dns, _fake_session):
-    """requests used to carry the cookie jar across hops itself, and
-    signed-cookie CDNs depend on that."""
+    """One requests session must span the whole redirect chain, since signed-cookie CDNs depend on the cookie jar carrying across hops."""
     def fake_get(url, **kwargs):
         if url.endswith("/signed.png"):
             return _FakeResponse(redirect_to="https://cdn.example.com/real.png")
@@ -582,8 +616,7 @@ def test_one_session_spans_the_whole_redirect_chain(monkeypatch, public_dns, _fa
 
 
 def test_video_backend_missing_leaves_no_download(monkeypatch, public_dns, tmp_path):
-    """Backend selection happens before the download, so a machine with no
-    decoder installed does not strand a file."""
+    """Backend selection happens before the download, so a missing decoder backend leaves no downloaded file behind."""
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path), raising=False)
     monkeypatch.setattr(
@@ -610,9 +643,116 @@ def test_video_backend_missing_leaves_no_download(monkeypatch, public_dns, tmp_p
     ],
 )
 def test_backslash_anywhere_in_the_authority_is_refused(url, no_network):
-    """urlparse reads the prefix as userinfo and reports the trailing host,
-    while the client turns the backslash into a path separator and connects to
-    the prefix, so screening only the apparent host misses it."""
+    """urlparse reads the prefix as userinfo and reports the trailing host, but the client treats the backslash as a
+    path separator and dials the prefix, so any backslash in the authority is refused."""
     with pytest.raises(ValueError, match="backslash"):
         vision_utils.fetch_image({"image": url})
     assert no_network == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "\\\\attacker\\share\\clip.mp4",
+        "//attacker/share/clip.mp4",
+        "file://attacker/share/clip.mp4",
+        "file:///%5cattacker/share/clip.mp4",
+        "\\\\?\\UNC\\attacker\\share\\clip.mp4",
+        "\\\\?\\GLOBALROOT\\Device\\Mup\\attacker\\share\\clip.mp4",
+        "\\\\.\\GLOBALROOT\\Device\\LanmanRedirector\\attacker\\share\\clip.mp4",
+    ],
+)
+def test_fetch_video_refuses_network_share_paths(monkeypatch, no_network, path):
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    # Windows would open an SMB connection (and may send credentials) for these.
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "network share"):
+        vision_utils.fetch_video({"video": path})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n",
+        b'<?xml version="1.0"?>\n<!-- ' + b"x" * 4096 + b' -->\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+        b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n",
+        b" " * 70000 + b'<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+        b"\xef\xbb\xbf#EXTM3U\nfile://attacker/share/seg0.ts\n",
+    ],
+    # Short ids: Windows caps PYTEST_CURRENT_TEST at 32767 characters.
+    ids = ["hls", "dash", "ffconcat", "padded_dash", "bom_hls"],
+)
+def test_a_downloaded_playlist_never_reaches_the_decoder(monkeypatch, public_dns, tmp_path, body):
+    # ffmpeg opens a playlist's entries itself; a file:// segment would reach a share on Windows.
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(vision_utils.requests, "get", lambda url, **kwargs: _FakeResponse(body))
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "playlist"):
+        vision_utils.fetch_video({"video": "https://example.com/live.m3u8"})
+    assert not list(tmp_path.glob("unsloth_media_*"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n",
+        b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n",
+        b" " * 4096 + b'<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+    ],
+)
+@pytest.mark.parametrize("encoding", ["base64", "percent"])
+def test_an_inline_data_playlist_never_reaches_the_decoder(monkeypatch, no_network, body, encoding):
+    import base64
+    from urllib.parse import quote_from_bytes
+
+    if encoding == "base64":
+        uri = "data:video/mp4;base64," + base64.b64encode(body).decode()
+    else:
+        uri = "data:video/mp4," + quote_from_bytes(body)
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "playlist"):
+        vision_utils.fetch_video({"video": uri})
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "\\\\wsl$\\Ubuntu\\home\\u\\clip.mp4",
+        "\\\\wsl.localhost\\Ubuntu\\home\\u\\clip.mp4",
+        "file://wsl.localhost/Ubuntu/home/u/clip.mp4",
+        "\\\\?\\UNC\\wsl.localhost\\Ubuntu\\clip.mp4",
+    ],
+)
+def test_wsl_paths_are_local_on_windows(monkeypatch, no_network, path):
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    _reaches_the_decoder(monkeypatch, path)
+
+
+def test_double_slash_paths_are_ordinary_paths_off_windows(monkeypatch, no_network):
+    monkeypatch.setattr(vision_utils, "_WINDOWS", False)
+    _reaches_the_decoder(monkeypatch, "//data/videos/clip.mp4")
+
+
+def test_the_opt_in_allows_a_share_the_owner_trusts(monkeypatch, no_network):
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1"):
+        vision_utils.fetch_video({"video": "\\\\nas\\videos\\clip.mp4"})
+    monkeypatch.setenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", "1")
+    _reaches_the_decoder(monkeypatch, "\\\\nas\\videos\\clip.mp4")
+
+
+def _reaches_the_decoder(monkeypatch, path):
+    seen = []
+
+    def decoder(ele):
+        seen.append(ele["video"])
+        raise RuntimeError("stop after the decoder is reached")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", lambda: "torchvision")
+    monkeypatch.setitem(vision_utils.VIDEO_READER_BACKENDS, "torchvision", decoder)
+    with pytest.raises(RuntimeError, match = "stop after"):
+        vision_utils.fetch_video({"video": path})
+    assert seen and seen[0] == path

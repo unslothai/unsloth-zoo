@@ -12,6 +12,7 @@
 import random
 from collections import Counter
 from math import prod
+from types import SimpleNamespace
 
 import pytest
 
@@ -199,6 +200,34 @@ def test_a_round_running_first_use_work_updates_no_cost_and_is_measured_again():
     assert controller._measured_at == {(1, "round", 3): 6}
 
 
+def test_a_first_use_spike_at_each_width_does_not_pin_a_shallow_width():
+    # 27B 4-bit on flat verify kernels, in plain steps: each width's first block from 3 rows on pays a 7x compile.
+    table, seen, draft = [1.19, 1.29, 1.48, 1.51, 1.53, 1.62, 1.71], set(), [0.85] * 7
+    machine = _Machine()
+    machine.draft = lambda depth: 0.19
+    machine.verify = lambda batch, width: table[width - 2] * (1.0 if width < 3 or width in seen or seen.add(width) else 7.0)
+    choice = _run(DraftController(max_depth = 7, can_copy = False), machine, [(draft, None)], rounds = 800, report = (report := {}))
+    deepest = sum(prod(draft[:k]) for k in range(8)) / (table[-1] + 0.19)
+    assert choice[0][1] >= 6 and report["rate"] >= 0.93 * deepest
+
+
+def test_timings_resist_one_off_work():
+    # The first two keep the faster; later, 100 counts as 2 and 0.1 in full.
+    for samples, value in (((5.0, 1.0, 100.0), 4 / 3), ((1.0, 5.0), 1.0), ((1.0, 1.0, 0.1), 0.7)):
+        timing = _Ema()
+        for sample in samples:
+            timing.update_time(sample, 0.2)
+        assert (timing.value, timing.count) == pytest.approx((value, len(samples)))
+    controller = DraftController(max_depth = 7, can_copy = False)
+    controller.verify_cost[1] = {2: _Ema(1.0, 2), 4: _Ema(1.2, 2), 6: _Ema(9.0), 8: _Ema(1.5)}
+    # A width timed once counts no more than the confirmed widths predict.
+    assert [value for _, value in controller._measured(controller.verify_cost[1])] == pytest.approx([1.0, 1.2, 1.4, 1.5])
+    # And a round at it, or drafting a depth timed once, is timed apart again, so its second sample confirms or replaces it.
+    controller.draft_cost.update({1: _Ema(0.2, 2), 3: _Ema(0.2), 7: _Ema(0.2, 2)})
+    rows = [RowState(controller.new_reply())]
+    assert [controller._measured_parts(RoundPlan("round", rows = (RowPlan("draft", depth),)), rows) for depth in (1, 3, 7)] == [True, False, False]
+
+
 def test_short_budgets_never_plan_empty_drafts():
     controller = DraftController(max_depth = 3, can_copy = False)
     for budgets in ([1], [1, 10], [0, 1]):
@@ -210,8 +239,7 @@ def test_short_budgets_never_plan_empty_drafts():
 
 
 def test_copy_probe_displaces_a_winning_drafter():
-    # Two perfect copy tokens tie a perfect depth-2 draft on tokens and skip its forward, but
-    # the copy prior scores below the drafter, so only a probe can find that out.
+    # Two perfect copy tokens tie a perfect depth-2 draft yet skip its forward, but the copy prior scores below the drafter, so only a probe finds that out.
     controller = DraftController(max_depth = 2, max_copy = 12)
     _run(controller, _Machine(draft_slope = 0.05), [([1.0, 1.0], 1.0)], rounds = 400, copies = 2)
     assert controller.copy_acceptance.count > 1
@@ -290,8 +318,7 @@ def test_a_fresh_loads_first_reply_drafts_on_its_own_accepted_rounds():
 
 @pytest.mark.parametrize("draft, floor", [([1.0], 0.97), ([0.5] * 16, 0.97)])
 def test_wide_batch_settles_on_plain_without_endless_probes(draft, floor):
-    # Plain step 2 and a width-2 verify of 4.3 at B=16: depth 1 is a close loser, probed in
-    # bursts longer than a probe interval; depth 16 leaves sixteen hopeless stale widths.
+    # At B=16 (plain step 2, width-2 verify 4.3) depth 1 is a close loser probed in bursts longer than the probe interval; depth 16 leaves sixteen stale widths.
     step = 2 / 3.25
     machine, report = _Machine(step = step, draft_slope = 0.01 / step, verify_slope = 1.9 / (16 * step)), {}
     controller = DraftController(max_depth = len(draft), can_copy = False, explore_fraction = 0.05)
@@ -307,8 +334,7 @@ def test_each_row_probes_its_own_sources():
 
 
 def test_drafter_recovers_while_plain_wins():
-    # Rejected drafts leave the drafter scored below failing copies while plain wins, yet
-    # perfect drafts become the fastest choice.
+    # Rejected drafts score the drafter below failing copies while plain wins, yet perfect drafts still become the fastest choice.
     controller = DraftController(max_depth = 2, max_copy = 12)
     machine = _Machine(draft_slope = 0.1, overhead = 1.1)
     _run(controller, machine, [([0.0, 0.0], 1e-9)], rounds = 500, copies = 2)
@@ -384,12 +410,7 @@ def _init_attributes(cls) -> set[str]:
 
 
 def _bare_engine(cls, **attrs):
-    """An engine without __init__ (which imports mlx_vlm), every attribute __init__ sets present and off.
-
-    Built by hand, a flag added to __init__ later (#1871's _invariant) is simply missing and the
-    method under test dies with AttributeError instead of taking its default path. Defaulting every
-    __init__ attribute to None keeps the hand-built engine on the plain path whatever flags join.
-    """
+    """Hand-built engine skips __init__ (imports mlx_vlm) and sets each attribute to None, so a flag added later (issue 1871's _invariant) takes its default path."""
     engine = object.__new__(cls)
     for name in _init_attributes(cls):
         setattr(engine, name, None)
@@ -412,8 +433,7 @@ def test_only_the_verify_forward_is_built_as_a_verify_block():
     import importlib
     from unsloth_zoo.mlx.speculative import SpeculativeEngine
 
-    # The module _verify's `from .inference import` resolves, i.e. sys.modules. The package
-    # attribute can be a stale copy after the shim tests purge and restore unsloth_zoo.mlx.
+    # _verify's from .inference import resolves via sys.modules; the package attribute can go stale after shim tests purge and restore unsloth_zoo.mlx.
     inference = importlib.import_module("unsloth_zoo.mlx.inference")
 
     marked = lambda: getattr(inference._VERIFY_STATE, "attention", False)
@@ -422,3 +442,27 @@ def test_only_the_verify_forward_is_built_as_a_verify_block():
     engine._verify_forward = lambda lm, inputs, cache: seen.append(marked()) or (type("Out", (), {"logits": None}), None)
     engine._verify(None)
     assert seen == [True] and not marked()
+
+
+@pytest.mark.parametrize("history_only", [True, False])
+def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_allow(history_only, monkeypatch):
+    import contextlib
+
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import EngineRow, SpeculativeEngine, _Row
+
+    processor = lambda tokens, logits: logits
+    processor.history_only = history_only
+    controller = DraftController(max_depth = 1, can_copy = False)
+    rows = [_Row(EngineRow(None, 1, [1, 2], processors = [processor], drafts = drafts), controller) for drafts in (True, False)]
+    assert [row.speculates for row in rows] == [history_only, False]
+    # Pipelining waits for a processor that reads more than the history, not for a row off the draft.
+    queued = []
+    step = lambda inputs, ahead = 0: queued.append(ahead) or (mx.array([3, 3]), None, None)
+    record = SimpleNamespace(record_plain = lambda *_a: None, interrupts_plain = lambda _s: False)
+    # No stream work happens here; the CPU shim implements none.
+    monkeypatch.setattr(mx, "stream", lambda _s: contextlib.nullcontext())
+    engine = _bare_engine(SpeculativeEngine, _step = step, _stream = None, controller = record)
+    engine._rows, engine._states = rows, lambda: []
+    list(engine._plain(3, []))
+    assert (1 in queued) == history_only

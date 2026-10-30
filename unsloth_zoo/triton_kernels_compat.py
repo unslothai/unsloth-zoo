@@ -14,9 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""OpenAI's triton_kernels for packed MXFP4 experts, across three upstream API generations:
-``matmul_ogs+routing`` (release/3.5.x, vLLM's copy), ``matmul_ogs+ragged`` (``routing.py`` removed in
-30ede52, #8375) and ``matmul+ragged`` (renamed in d8119d5, #8765; no scatter reduction, ``b_mx_scale``)."""
+"""Compat for OpenAI triton_kernels packed MXFP4 experts across three upstream API generations: matmul_ogs+routing
+(release/3.5.x), matmul_ogs+ragged (routing.py removed in 30ede52, ref 8375), matmul+ragged (renamed in d8119d5, ref
+8765; no scatter reduction, b_mx_scale)"""
 
 import contextlib
 import dataclasses
@@ -220,8 +220,8 @@ class TritonKernelsBackend:
                 x, weight, bias, a_ragged_metadata = routing_data.expt_data,
                 precision_config = precision_config, **kwargs,
             )
-        # matmul leaves the k-sum to the caller. As matmul_ogs (split_k = 1): rows in the output dtype, fp32 sum.
-        # torch sums bf16 / fp16 in fp32 and rounds once, so no (tokens, hidden) fp32 temporary is needed.
+        # matmul leaves the k-sum to the caller; as matmul_ogs (split_k = 1) rows are in the output dtype with an fp32
+        # sum; torch sums bf16/fp16 in fp32 and rounds once, so no (tokens, hidden) fp32 temporary is needed
         rows = self.mm.matmul(
             x, weight, bias, a_ragged_metadata = routing_data.expt_data, scatter_indx = scatter_indx.dst_indx,
             precision_config = precision_config, **kwargs,
@@ -357,16 +357,16 @@ def triton_kernels_alias():
 
 
 def convert_layout_shared(tensor_module, tensor, layout, **layout_opts):
-    """``convert_layout`` that skips the copy release/3.7.x makes when ``tensor`` already has ``layout``; that copy
-    duplicates every expert stack and leaks into the CUDA graph pool."""
+    """Wraps convert_layout to skip the copy release/3.7.x makes when tensor already has layout; that copy duplicates
+    every expert stack and leaks into the CUDA graph pool"""
     if not layout_opts and not isinstance(layout, type) and getattr(tensor.storage, "layout", None) == layout:
         return tensor
     return tensor_module.convert_layout(tensor, layout, **layout_opts)
 
 
 def mxfp4_ogs_weight(blocks, scales):
-    """GPT-OSS checkpoint (E, out, in / 32, 16) blocks + (E, out, in / 32) scales -> (weight, PrecisionConfig)
-    for matmul_ogs, with the (E, in, out) logical shape its kernels expect. Copies only when the layout swizzles."""
+    """GPT-OSS checkpoint blocks (E, out, in / 32, 16) and scales (E, out, in / 32) become (weight, PrecisionConfig) for
+    matmul_ogs in (E, in, out) shape; copies only when the layout swizzles"""
     from unsloth_zoo.temporary_patches.gpt_oss import _mxfp4_layout_arguments
     E, N, G, _ = blocks.shape
     with triton_kernels_alias() as tk:
@@ -423,8 +423,7 @@ def _device_capability(device):
 
 
 def native_mxfp4_matmul_ok(device, backend) -> bool:
-    """False on sm_12x (about 100 KB shared memory) with release/3.6.x matmul_ogs+ragged, whose Blackwell tiles
-    trip ``assert num_stages >= 1`` in opt_flags."""
+    """Returns False on sm_12x (about 100 KB shared memory) with release/3.6.x matmul_ogs+ragged, whose Blackwell tiles trip assert num_stages >= 1 in opt_flags."""
     capability = _device_capability(device)
     if capability is None or backend is None:
         return True

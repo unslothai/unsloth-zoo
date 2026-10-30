@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""fix_untrained_tokens must accept any indexable train_dataset (unsloth#2953).
-
-Everything else there needs only len() and [j], so a plain list reached the one line that
-required .map. TRL 1.x rejects a list before the trainer is built, TRL 0.22.x does not.
-The second half pins the decorator: the write-back is in place on a leaf that requires grad,
-so the helper must be defined ABOVE the `@_maybe_inference_mode` line, not between it and
-the function.
-"""
+"""fix_untrained_tokens must accept any indexable train_dataset (unsloth 2953); TRL 1.x rejects a list before the
+trainer is built, TRL 0.22.x does not; the helper must be defined above @_maybe_inference_mode, which the in-place
+write-back on a grad-requiring leaf depends on."""
 
 import itertools
 
@@ -103,8 +98,7 @@ class _Model:
 
 
 def _untrained_model():
-    """Rows 4 and 5 are all zero, so both untrained indicators fire; the weight is a
-    trainable leaf, so the write-back needs inference mode."""
+    """Rows 4 and 5 are all zero so both untrained indicators fire; the weight is a trainable leaf, so the write-back needs inference mode."""
     embedding = torch.nn.Embedding(8, 4)
     with torch.no_grad():
         embedding.weight.fill_(1.0)
@@ -165,8 +159,7 @@ def test_fix_untrained_tokens_end_to_end_on_a_list_dataset():
 
 
 def test_the_undecorated_function_cannot_write_the_rows_back():
-    """The decorator is load-bearing, not cosmetic: outside inference mode the same body
-    fails on a trainable weight, first on .numpy() and then on the write back."""
+    """The inference-mode decorator is load-bearing: outside it the same body fails on the trainable weight, first at .numpy() and then at the write back."""
     model = _untrained_model()
 
     with pytest.raises(RuntimeError, match = "requires grad|in-place operation"):
@@ -200,8 +193,7 @@ def test_count_input_ids_on_an_empty_list_never_calls_the_mapping():
 
 
 def test_the_plain_list_fallback_counts_in_bounded_batches():
-    """One call with the whole dataset is an O(total tokens) transient where `.map` is
-    bounded. Chunking is safe because `mapping` accumulates rather than returning."""
+    """One call on the whole dataset is an O(total tokens) transient, while .map is bounded; chunking is safe because mapping accumulates rather than returns."""
     final_counts, mapping = _counter()
     sizes = []
 

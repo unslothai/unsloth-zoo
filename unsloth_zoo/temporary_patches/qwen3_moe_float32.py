@@ -105,14 +105,12 @@ pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeDecoderLayer_float32)
 
 
-# Clamp bound so a large residual never becomes inf on the cast back. Module-level
-# keeps `torch.finfo` out of the graph.
+# Clamp to the fp16 max so a large residual never becomes inf on the cast back; module-level keeps torch.finfo out of the graph.
 _QWEN3_MOE_FP16_MAX = float(torch.finfo(torch.float16).max)
 
 
-# Every Qwen3-MoE RMSNorm shares this one kernel, so its Dynamo cache holds the product
-# of every axis its guards see. A plain Tensor weight view and a rank 2 input drop the
-# width and rank axes, leaving dtype, grad mode and requires_grad.
+# All Qwen3-MoE RMSNorms share this kernel, so Dynamo's cache holds the product of every axis its guards check; a plain
+# Tensor weight view and a rank-2 input drop the width and rank axes, leaving dtype, grad mode and requires_grad.
 def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -121,8 +119,7 @@ def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
     return torch.clamp(normed_fp32, min = -_QWEN3_MOE_FP16_MAX, max = _QWEN3_MOE_FP16_MAX).to(torch.float16)
 pass
 
-# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
-# this wrapper latches to eager instead of aborting the run.
+# Not a bare decorator: under fullgraph = True cache exhaustion raises, and only this wrapper latches to eager instead of aborting the run.
 _qwen3_moe_rms_norm = compile_with_eager_fallback(_qwen3_moe_rms_norm, "Qwen3MoeRMSNorm.forward")
 
 
@@ -164,7 +161,8 @@ def patch_Qwen3MoeAttention_float32():
     except Exception as e:
         return raise_error("Qwen3MoeAttention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
+    from .sdpa_gqa import make_gqa_sdpa
+    float32_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
 
     def forward(
         self,
@@ -247,15 +245,15 @@ def patch_Qwen3MoeAttention_float32():
             if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
                 attn_mask = attn_mask.to(torch.float32)
             is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
-            attn_output = scaled_dot_product_attention(
+            attn_output = float32_sdpa(
                 query_states,
                 key_states,
                 value_states,
-                attn_mask = attn_mask,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = is_causal,
-                scale = self.scaling,
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                attn_mask,
+                self.attention_dropout if self.training else 0.0,
+                is_causal,
+                self.scaling,
+                getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_output = attn_output.transpose(1, 2)  # (b, h, q, d) -> (b, q, h, d)
 
