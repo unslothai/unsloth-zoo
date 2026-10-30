@@ -22,6 +22,7 @@ __all__ = [
 ]
 
 import functools
+import inspect
 import math
 import os
 import types
@@ -288,10 +289,33 @@ def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size
     return tuple(value if name == "log_probs" or name in outputs else None for name, value in zip(names, result))
 
 
+# Arguments of TRL's ChunkedLogProbFunction.forward (after ctx) that cpu_chunked_log_probs mirrors.
+_TRL_LOGPROB_ARGS = ("hidden", "weight", "bias", "targets", "temperature", "chunk_size",
+                     "final_logit_softcapping", "logit_scale", "outputs")
+# Arguments later TRL releases append, with the outputs each adds. TRL 1.17 appends support_ids
+# (no new output) and score_ids (a sixth output, score_log_probs).
+_TRL_LOGPROB_EXTRA_ARGS = {"support_ids": 0, "score_ids": 1}
+
+
+def _trl_logprob_contract(kernel):
+    """(argument names after ctx, output count, known) for TRL's fused-head kernel, read from its signature."""
+    try:
+        names = tuple(inspect.signature(kernel.forward).parameters)[1:]
+    except (AttributeError, TypeError, ValueError):
+        return _TRL_LOGPROB_ARGS, 5, True  # No kernel (Triton missing) or no readable forward: the 1.x contract.
+    head, extra = names[:len(_TRL_LOGPROB_ARGS)], names[len(_TRL_LOGPROB_ARGS):]
+    known = head == _TRL_LOGPROB_ARGS and all(name in _TRL_LOGPROB_EXTRA_ARGS for name in extra)
+    return names, 5 + sum(_TRL_LOGPROB_EXTRA_ARGS.get(name, 0) for name in extra), known
+
+
 def patch_trl_fused_lm_head():
     """TRL 1.x SFTTrainer always computes its loss through a fused LM head whose kernel is Triton
     (CUDA / XPU only) and is None where Triton is missing, so CPU training and evaluate() fail. Keep
-    the kernel on those devices and route every other device to cpu_chunked_log_probs. Idempotent."""
+    the kernel on those devices and route every other device to cpu_chunked_log_probs. Idempotent.
+
+    The kernel's signature decides the contract: TRL 1.17 passes support_ids / score_ids and unpacks
+    six outputs, so the torch path pads its five, and calls that use either id set, or a contract
+    this code does not know, stay on TRL's kernel (from 1.17 it has a torch path of its own)."""
     try:
         from trl.trainer import utils as trl_utils
     except Exception:
@@ -301,6 +325,7 @@ def patch_trl_fused_lm_head():
     kernel = trl_utils._ChunkedLogProbFunction
     if getattr(kernel, "_unsloth_cpu_dispatch", False):
         return True
+    names, n_outputs, known = _trl_logprob_contract(kernel)
 
     class _DeviceDispatch:
         _unsloth_cpu_dispatch = True
@@ -308,9 +333,17 @@ def patch_trl_fused_lm_head():
 
         @staticmethod
         def apply(hidden, *args, **kwargs):
-            if kernel is not None and hidden.device.type in ("cuda", "xpu"):
+            if kernel is not None and (hidden.device.type in ("cuda", "xpu") or not known):
                 return kernel.apply(hidden, *args, **kwargs)
-            return cpu_chunked_log_probs(hidden, *args, **kwargs)
+            bound = dict(zip(names[1:], args))
+            bound.update(kwargs)
+            if kernel is not None and any(bound.get(name) is not None for name in _TRL_LOGPROB_EXTRA_ARGS):
+                return kernel.apply(hidden, *args, **kwargs)
+            result = cpu_chunked_log_probs(hidden, *args[:len(_TRL_LOGPROB_ARGS) - 1],
+                                           **{k: v for k, v in kwargs.items() if k in _TRL_LOGPROB_ARGS})
+            if isinstance(result, tuple) and len(result) < n_outputs:
+                result = result + (None,) * (n_outputs - len(result))
+            return result
 
     trl_utils._ChunkedLogProbFunction = _DeviceDispatch
     return True
