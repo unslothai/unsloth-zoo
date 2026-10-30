@@ -424,8 +424,8 @@ def test_deepcopy_runs_the_copy():
 
 @needs_registry
 @pytest.mark.parametrize(("value", "mode", "rows", "gb", "mods"), [
-    (True, "arctic", 0, 0.0, ()),
-    ("1", "arctic", 0, 0.0, ()),
+    (True, "auto", 0, 0.0, ()),
+    ("1", "auto", 0, 0.0, ()),
     ("arctic", "arctic", 0, 0.0, ()),
     ("auto", "auto", 0, 0.0, ()),
     ("target", "target", 0, 0.0, ()),
@@ -1140,3 +1140,22 @@ def test_channel_first_mlps_are_not_tiled():
     want = m(x)
     R.install_module(m, "rows:4")
     torch.testing.assert_close(m(x), want)
+
+
+@needs_registry
+def test_bare_true_is_auto_and_short_sequences_run_untiled(monkeypatch):
+    # True / "1" used to force arctic tiles, so a 2k-token step paid the per-tile cost for no memory saving (G4,
+    # Qwen3-0.6B 2k: +24% step time). They now use auto, which keeps one tile when tiling would not pay; arctic,
+    # rows:N and target still tile.
+    for value in (True, "1", "true", "on", "yes"):
+        assert R.parse_mode(value).mode == "auto"
+    seen = _spy_engine(monkeypatch)
+    x = torch.randn(1, 2048, 8)
+    auto = _llama_mlp()
+    R.install_module(auto, True)
+    auto(x)
+    assert seen == []
+    forced = _llama_mlp()
+    R.install_module(forced, "arctic")
+    forced(x)
+    assert len(seen) == 1

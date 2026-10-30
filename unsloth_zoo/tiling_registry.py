@@ -72,8 +72,9 @@ PARALLEL_RULE = (
     "parameters are TP DTensors stay untiled (coverage reason \"tensor parallel\") unless UNSLOTH_TILED_MLP_TP=1."
 )
 
-# `True` / "1" keep the previous default (tile rows = hidden size).
-DEFAULT_MODE = "arctic"
+# `True` / "1": the peak-aware plan, which keeps one tile when tiling would not lower the step peak (short
+# sequences then run at untiled speed). "arctic", "rows:N" and "target[:GB]" always tile.
+DEFAULT_MODE = "auto"
 _MAX_TILES = 4096
 _ENV_MODULES = "UNSLOTH_TILED_MLP_MODULES"
 _ENV_TP = "UNSLOTH_TILED_MLP_TP"
@@ -279,10 +280,10 @@ def parse_mode(value, padded_length = 128):
     if len(parts) > 3:
         raise ValueError(f"Unsloth: cannot parse tiled MLP mode {value!r}")
     rows, target_gb = 0, 0.0
-    if head in ("1", "true", "on", "yes", "arctic"):
-        mode = "arctic"
-    elif head == "auto":
+    if head in ("1", "true", "on", "yes", "auto"):
         mode = "auto"
+    elif head == "arctic":
+        mode = "arctic"
     elif head == "target":
         mode = "target"
         if arg:
