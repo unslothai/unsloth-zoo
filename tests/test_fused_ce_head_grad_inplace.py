@@ -222,6 +222,13 @@ def test_compiled_autograd_traces_the_backward(dtype):
     # Compiled autograd traces the CE backward; the in-place gate must not call the untraceable
     # keep-graph query there (graph break, or Unsupported under fullgraph).
     compiled_autograd = pytest.importorskip("torch._dynamo.compiled_autograd")
+    # torch 2.4 / 2.5 name it enable, 2.6+ _enable.
+    enable = getattr(compiled_autograd, "_enable", None) or getattr(compiled_autograd, "enable", None)
+    if enable is None:
+        pytest.skip("no compiled autograd context manager")
+    if tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 5):
+        # torch 2.4 compiled autograd cannot inline torch.library's autograd backward (skipfiles).
+        pytest.skip("torch 2.4 compiled autograd does not trace torch.library custom op backwards")
     hidden, weight, targets = _inputs(7, dtype = dtype)
     w_e = weight.clone().requires_grad_()
     (_loss(hidden.clone().requires_grad_(), w_e, targets) * 0.375).backward()
@@ -229,7 +236,7 @@ def test_compiled_autograd_traces_the_backward(dtype):
     counters.clear()
     w_c = weight.clone().requires_grad_()
     loss = _loss(hidden.clone().requires_grad_(), w_c, targets) * 0.375
-    with compiled_autograd._enable(torch.compile(backend = "eager", fullgraph = True)):
+    with enable(torch.compile(backend = "eager", fullgraph = True)):
         loss.backward()
     assert not counters["graph_break"]
     assert torch.equal(w_c.grad, w_e.grad)
