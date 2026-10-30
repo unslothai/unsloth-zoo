@@ -742,6 +742,26 @@ def test_owner_forward_pre_hook_separates_pending_forwards(G, fake, monkeypatch)
     assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"] == 6
 
 
+def test_forward_counter_counts_every_forward(G, fake, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", "0")
+    for min_bytes in ("0", str(1 << 30)):  # offloaded, then every saved input kept by the size floor
+        monkeypatch.setenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", min_bytes)
+        monkeypatch.setattr(G, "_new_activation_offloader", lambda: fake(stream_mode = True))
+        model = _Stack(n = 4)
+        offloader = _owned_hooks({"G": G}, model)
+        for step in range(3):
+            model(_input("cpu", 2, 5, 16, seed = step)).square().mean().backward()
+        assert offloader.stats["forwards"] == 3, (min_bytes, offloader.stats["forwards"])
+    monkeypatch.setenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", "0")
+    unowned = fake(stream_mode = False)
+    for step in range(3):
+        x = torch.randn(64, requires_grad = True)
+        record = unowned.pack(x)
+        unowned.backward_started = True
+        unowned.unpack(record)
+    assert unowned.stats["forwards"] == 3
+
+
 def _begin_hooks(module):
     return [h for h in module._forward_pre_hooks.values() if getattr(h, "__name__", "") == "_begin_forward_hook"]
 

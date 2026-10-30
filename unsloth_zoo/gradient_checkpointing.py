@@ -1954,12 +1954,13 @@ class _ForwardOrder(list):
     """Weak references to one forward's records, in pack order. Each record holds its own forward's order, so a
     pending backward keeps prefetching inside its own graph after later forwards started new orders, and the
     offloader keeps only the newest one: an abandoned forward's metadata goes away with its records."""
-    __slots__ = ("forward_id", "backward_started", "__weakref__")
+    __slots__ = ("forward_id", "backward_started", "counted", "__weakref__")
 
     def __init__(self, forward_id = 0):
         super().__init__()
         self.forward_id = forward_id
         self.backward_started = False
+        self.counted = False
 pass
 
 
@@ -2058,9 +2059,11 @@ class NonReentrantActivationOffloader:
         """A new forward of the owning model: records packed from here on get a new forward identity. Records of
         earlier forwards keep theirs, so a backward still pending on them is unaffected."""
         self.forward_id += 1
+        # Counted here for every forward: an empty order (first forward, or every input kept) is not replaced.
+        self.stats["forwards"] += 1
         if len(self.order) or self.order.backward_started:
             self.order = _ForwardOrder(self.forward_id)
-            self.stats["forwards"] += 1
+        self.order.counted = True
     pass
 
     def _current_order(self):
@@ -2070,6 +2073,8 @@ class NonReentrantActivationOffloader:
         if order.backward_started or (not self.owned and len(order) and order[-1]() is None):
             self.forward_id += 1
             order = self.order = _ForwardOrder(self.forward_id)
+        if not order.counted:
+            order.counted = True
             self.stats["forwards"] += 1
         return order
     pass
