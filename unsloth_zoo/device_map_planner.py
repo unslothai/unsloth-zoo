@@ -2630,10 +2630,13 @@ def plan_block_swap(
     )
 
     config = None
+    dropped = []
     if model is None:
         model, hf_quantizer, config = build_meta_model(
             model_name_or_path, trust_remote_code=trust_remote_code, **config_kwargs
         )
+        # As the loader: the table stays in host RAM, so it is neither resident nor swapped.
+        dropped = drop_no_placement_modules(model)
     config = config if config is not None else getattr(model, "config", None)
 
     devices = _usable_devices(max_memory)
@@ -2777,6 +2780,8 @@ def plan_block_swap(
                 if ok_m:
                     n, plan = m, plan_m
                     break
+    if plan is not None and dropped:
+        plan.device_map = unmap_dropped_modules(plan.device_map, model, dropped)
     return BlockSwapPlan(
         layers = n,
         total_layers = L,
