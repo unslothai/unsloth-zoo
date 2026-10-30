@@ -14,122 +14,63 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The no-C++-compiler probe behind the GPT-OSS decode subprocess checks."""
+"""The up-front CPU Inductor probe skips only on a missing C++ compiler."""
 
+import json
 import os
-import subprocess
-import sys
 
 import pytest
-from _pytest.outcomes import Skipped
 
-import _cpu_compiler_skip as probe
+import _cpu_compiler_skip as skip
 
 
-@pytest.mark.parametrize("returncode, output, missing", [
-    (1, "torch._inductor.exc.InductorError: RuntimeError: Compiler: cl is not found.", True),
-    (1, "torch._inductor.exc.InvalidCxxCompiler: No working C++ compiler found in torch._inductor.config.cpp.cxx", True),
-    (1, "Traceback (most recent call last):\nValueError: boom", False),
-    (0, "", False),
-    (0, "warning: InvalidCxxCompiler", False),
-    # A compiler error reported earlier and recovered from does not explain a different final exception.
-    (1, "InductorError: RuntimeError: Compiler: cl is not found.\nfalling back to eager\n"
-        "Traceback (most recent call last):\nAssertionError: tokens differ", False),
-    (1, "W1030 InvalidCxxCompiler while warming up, retrying\nTraceback (most recent call last):\nValueError: boom", False),
+def _report(*chain):
+    return "PROBE " + json.dumps([list(x) for x in chain]) + "\n"
+
+
+@pytest.mark.parametrize("chain", [
+    [("InductorError", "InvalidCxxCompiler: No working C++ compiler found"), ("InvalidCxxCompiler", "No working")],
+    [("BackendCompilerFailed", "backend='inductor' raised:"), ("InvalidCxxCompiler", "No working C++ compiler")],
+    [("InductorError", "RuntimeError: Compiler: cl is not found."), ("RuntimeError", "Compiler: cl is not found.")],
 ])
-def test_missing_compiler(returncode, output, missing):
-    assert probe.missing_compiler(returncode, output) is missing
+def test_a_missing_compiler_skips(chain, monkeypatch):
+    monkeypatch.setattr(skip, "_probe", lambda env: (3, _report(*chain)))
+    with pytest.raises(pytest.skip.Exception, match = "no C\\+\\+ compiler"):
+        skip.skip_without_cpu_inductor({})
 
 
-_CHILD_MISSING = "torch._inductor.exc.InductorError: RuntimeError: Compiler: cl is not found."
+@pytest.mark.parametrize("result", [
+    (0, ""),  # compiles
+    (3, _report(("ImportError", "cannot import name 'InvalidCxxCompiler'"))),  # names it, is not it
+    (3, _report(("AssertionError", "InvalidCxxCompiler was expected"))),
+    (3, _report(("RuntimeError", "Compiler: cl is not found. Retrying"))),
+    (1, "PROBE " + json.dumps([["InvalidCxxCompiler", ""]])),  # not the probe's own except branch
+    (3, "PROBE not json"),
+    (None, ""),  # timed out
+])
+def test_any_other_probe_result_runs_the_check(result, monkeypatch):
+    monkeypatch.setattr(skip, "_probe", lambda env: result)
+    skip.skip_without_cpu_inductor({})
 
 
-def _child(returncode, stderr):
-    return subprocess.CompletedProcess(["child"], returncode, "", stderr)
-
-
-def _stub_probe(monkeypatch, returncode, output):
-    monkeypatch.setattr(probe, "_probes", {})
+def test_the_probe_is_cached_per_compile_environment(monkeypatch):
     calls = []
 
-    def run(*a, **k):
-        calls.append(a)
-        return subprocess.CompletedProcess(a, returncode, output, "")
+    class _Proc:
+        returncode, stdout = 0, ""
 
-    monkeypatch.setattr(subprocess, "run", run)
-    return calls
-
-
-@pytest.mark.parametrize("returncode, output, skips", [
-    (1, "InductorError: RuntimeError: Compiler: C:/\u00fcbersetzer/cl.exe is not found.", True),
-    (1, "RuntimeError: out of memory", False),
-    (0, "", False),
-])
-def test_only_a_probe_that_finds_no_compiler_skips(monkeypatch, returncode, output, skips):
-    _stub_probe(monkeypatch, returncode, output)
-    if skips:
-        with pytest.raises(Skipped, match = r"no C\+\+ compiler here \(InductorError"):
-            probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), dict(os.environ), ("cpu",))
-    else:
-        assert probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), dict(os.environ), ("cpu",)) is None
+    monkeypatch.setattr(skip, "_probes", {})
+    monkeypatch.setattr(skip.subprocess, "run", lambda *a, **k: calls.append(k["env"]) or _Proc())
+    for env in ({"CXX": "g++"}, {"CXX": "g++", "HOME": "/x"}, {"CXX": "clang++"}, {"CXX": "g++", "TORCH_LOGS": "+x"}):
+        skip.skip_without_cpu_inductor(env)
+    assert [e.get("CXX") for e in calls] == ["g++", "clang++", "g++"], calls
 
 
-def test_an_unrelated_child_failure_fails_on_a_host_without_a_compiler(monkeypatch):
-    # The probe would confirm a missing compiler, but the child failed for another reason: no skip.
-    calls = _stub_probe(monkeypatch, 1, _CHILD_MISSING)
-    child = _child(1, "Traceback (most recent call last):\nAssertionError: tokens differ")
-    assert probe.skip_if_cpu_inductor_missing(child, dict(os.environ), ("cpu",)) is None
-    assert calls == []
-
-
-def test_a_cuda_child_never_skips(monkeypatch):
-    calls = _stub_probe(monkeypatch, 1, _CHILD_MISSING)
-    assert probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), dict(os.environ), ("cuda",)) is None
-    assert calls == []
-
-
-def test_a_passing_child_never_probes(monkeypatch):
-    calls = _stub_probe(monkeypatch, 1, _CHILD_MISSING)
-    assert probe.skip_if_cpu_inductor_missing(_child(0, _CHILD_MISSING), dict(os.environ), ("cpu",)) is None
-    assert calls == []
-
-
-def test_the_probe_reads_its_whole_output(monkeypatch):
-    # A long shutdown tail after the compiler error must not push it out of what is classified.
-    _stub_probe(monkeypatch, 1, _CHILD_MISSING + "\n" + "W1030 shutdown noise\n" * 2000)
-    with pytest.raises(Skipped, match = r"no C\+\+ compiler here"):
-        probe.skip_if_cpu_inductor_missing(_child(1, _CHILD_MISSING), dict(os.environ), ("cpu",))
-
-
-def test_a_recovered_compiler_error_before_another_failure_does_not_skip(monkeypatch):
-    calls = _stub_probe(monkeypatch, 1, _CHILD_MISSING)
-    child = _child(1, _CHILD_MISSING + "\nfalling back to eager\nTraceback (most recent call last):\nAssertionError: tokens differ")
-    try:
-        probe.skip_if_cpu_inductor_missing(child, dict(os.environ), ("cpu",))
-    except Skipped as e:
-        pytest.fail(f"an unrelated final failure was skipped: {e}")
-    assert calls == []
-
-
-@pytest.mark.parametrize("name", [
-    "TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE", "TORCHDYNAMO_SUPPRESS_ERRORS", "TORCH_INDUCTOR_INSTALL_GXX",
-    "TORCHINDUCTOR_CPP_WRAPPER", "CC",
-])
-def test_the_probe_cache_tells_compile_switches_apart(monkeypatch, name):
-    calls = _stub_probe(monkeypatch, 0, "")
-    env = {k: v for k, v in os.environ.items() if k != name}
-    probe._probe(env)
-    probe._probe(dict(env, **{name: "1"}))
-    assert len(calls) == 2
-
-
-def test_a_missing_compiler_is_found_by_a_real_probe(monkeypatch):
-    # No inherited compile switch may stop the probe from reaching the compiler.
-    monkeypatch.setattr(probe, "_probes", {})
-    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(probe._KEY_PREFIXES)}
-    env["CXX"] = os.path.join(os.sep, "nonexistent", "g++")
-    env.pop("CC", None)
-    returncode, output = probe._probe(env)
+def test_a_real_probe_with_a_bogus_compiler_skips():
+    pytest.importorskip("torch")
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("TORCH")}
+    env["CXX"] = os.path.join(os.sep, "nonexistent", "cxx-for-test")
+    returncode, stdout = skip._probe(env)
     if returncode == 0:
-        pytest.skip("this torch / platform compiled without the CXX it was given, so there is nothing to classify")
-    assert probe.missing_compiler(returncode, output), output[-2000:]
+        pytest.skip("this torch compiles without the configured C++ compiler, so there is nothing to classify")
+    assert skip.missing_compiler(returncode, stdout), stdout[-2000:]

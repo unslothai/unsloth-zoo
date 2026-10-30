@@ -26,7 +26,7 @@ import textwrap
 
 import pytest
 import torch
-from _cpu_compiler_skip import skip_if_cpu_inductor_missing
+from _cpu_compiler_skip import skip_without_cpu_inductor
 
 pytest.importorskip("triton")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -122,7 +122,6 @@ def _run(tmp_path, script, *args, env_extra = None):
             env[key] = value
     proc = subprocess.run([sys.executable, str(path), *args], capture_output = True, text = True, env = env,
                           timeout = 1500)
-    skip_if_cpu_inductor_missing(proc, env, args)
     line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT ")]
     assert proc.returncode == 0 and line, proc.stdout[-2000:] + proc.stderr[-3000:]
     return json.loads(line[-1][len("RESULT "):])
@@ -253,6 +252,8 @@ def loop_runs(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("gpt_oss_decode_loop")
     dev = "cuda" if torch.cuda.is_available() and torch.version.hip is None else "cpu"
     dtype = "bfloat16" if dev == "cuda" else "float32"
+    if dev == "cpu":
+        skip_without_cpu_inductor()
     return {
         arm: _run(
             tmp, _LOOP, dev, dtype,

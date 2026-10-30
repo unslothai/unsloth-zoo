@@ -25,7 +25,7 @@ import textwrap
 
 import pytest
 import torch
-from _cpu_compiler_skip import skip_if_cpu_inductor_missing
+from _cpu_compiler_skip import skip_without_cpu_inductor
 
 pytest.importorskip("triton")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,7 +44,6 @@ def _run(tmp_path, script, *args, env_extra = None):
             env[key] = value
     proc = subprocess.run([sys.executable, str(path), *args], capture_output = True, text = True, env = env,
                           timeout = 1500)
-    skip_if_cpu_inductor_missing(proc, env, args)
     line = [x for x in proc.stdout.splitlines() if x.startswith("RESULT ")]
     assert proc.returncode == 0 and line, proc.stdout[-2000:] + proc.stderr[-3000:]
     return json.loads(line[-1][len("RESULT "):])
@@ -100,6 +99,7 @@ def kernel_results(tmp_path_factory):
     script = _KERNEL.replace("__REGION__", textwrap.dedent(inspect.getsource(_region)))
     if torch.cuda.is_available() and torch.version.hip is None:
         return _run(tmp, script, "cuda")
+    skip_without_cpu_inductor()
     return _run(tmp, script, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
 
 
@@ -277,6 +277,7 @@ def test_first_token_cannot_certify_an_eager_region(tmp_path):
     if torch.cuda.is_available() and torch.version.hip is None:
         res = _run(tmp_path, script, "cuda")
     else:
+        skip_without_cpu_inductor()
         res = _run(tmp_path, script, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
     assert res["position0_agrees"] and res["eager_differs_later"], res  # the premise
     assert res["eager_region_declined"] and res["compiled_accepted"] and res["compiled_equal"], res
@@ -328,6 +329,7 @@ _LOOP = textwrap.dedent('''
 
 
 def test_decode_loop_calls_rope_decode(tmp_path):
+    skip_without_cpu_inductor()
     env = {"UNSLOTH_COMPILE_DISABLE": None, "UNSLOTH_ENABLE_FLEX_ATTENTION": None}
     on = _run(tmp_path, _LOOP, "on", env_extra = env)
     off = _run(tmp_path, _LOOP, "off", env_extra = env)

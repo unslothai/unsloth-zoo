@@ -14,66 +14,73 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Skip a failed CPU subprocess check when CPU Inductor has no C++ compiler here.
+"""Skip the CPU subprocess checks up front when CPU Inductor has no C++ compiler here.
 
-CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none. A
-failed child run skips only when it did not run on CUDA, the exception that ended it is a missing compiler, and one
-trivial compile in a fresh process with the same environment confirms it. Any other failure still fails.
+CPU Inductor needs a C++ compiler (cl on Windows, g++ / clang++ elsewhere); AMD Windows boxes often have none. One
+trivial compile runs in a fresh process; the checks skip only when it fails with a missing compiler. The checks
+themselves run unchanged, so no failure of theirs is ever reinterpreted.
 """
 
+import json
+import os
 import re
 import subprocess
 import sys
 
 import pytest
 
-_PROBE = "import torch; torch.compile(lambda x: x + 1, backend = 'inductor')(torch.ones(2))"
-# Linux / torch 2.13+: InvalidCxxCompiler. torch 2.9 - 2.12 on Windows: RuntimeError("Compiler: cl is not found.").
-_MISSING = re.compile(r"InvalidCxxCompiler|Compiler: .* is not found\.")
-# The last exception line of a traceback, e.g. "torch._inductor.exc.InductorError: RuntimeError: ...".
-_EXC_LINE = re.compile(r"^[A-Za-z_][\w.]*(Error|Exception|Exit|Interrupt)\b.*")
-# Everything that changes whether the probe compiles, or how it fails.
+# The probe reports its own failure as one JSON line, so torch's hint footers and colours never matter.
+_PROBE = r"""
+import json, sys
+try:
+    import torch
+    torch.compile(lambda x: x + 1)(torch.ones(2))
+except BaseException as e:
+    chain, seen = [], set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        chain.append([type(e).__name__, str(e)])
+        e = e.__cause__ or getattr(e, "inner_exception", None) or e.__context__
+    print("PROBE " + json.dumps(chain))
+    sys.exit(3)
+"""
+# Linux / torch 2.13+: InvalidCxxCompiler, raised directly or wrapped in an InductorError / BackendCompilerFailed.
+# torch 2.9 - 2.12 on Windows: RuntimeError("Compiler: cl is not found.").
+_WINDOWS = re.compile(r"^Compiler: .* is not found\.$")
+# Everything that changes whether the probe compiles.
 _KEY_NAMES = ("CXX", "CC", "PATH")
-_KEY_PREFIXES = ("TORCHINDUCTOR_", "TORCH_INDUCTOR_", "TORCH_COMPILE_", "TORCHDYNAMO_")
+_KEY_PREFIXES = ("TORCH",)
 _probes = {}
 
 
-def _terminal(output):
-    # Only the exception that ended the run counts, not a compiler error that was reported and recovered from.
-    lines = [x.strip() for x in output.splitlines() if x.strip()]
-    for line in reversed(lines):
-        if _EXC_LINE.match(line):
-            return line
-    return lines[-1] if lines else ""
-
-
-def missing_compiler(returncode, output):
-    return returncode != 0 and _MISSING.search(_terminal(output)) is not None
-
-
-def _keyed(name):
-    name = name.upper()
-    return name in _KEY_NAMES or name.startswith(_KEY_PREFIXES)
+def missing_compiler(returncode, stdout):
+    """True only when the probe ran its except branch and an exception in the chain is a missing compiler."""
+    lines = [x for x in (stdout or "").splitlines() if x.startswith("PROBE ")]
+    if returncode != 3 or not lines:
+        return False
+    try:
+        chain = json.loads(lines[-1][len("PROBE "):])
+    except ValueError:
+        return False
+    return any(name == "InvalidCxxCompiler" or (name == "RuntimeError" and _WINDOWS.match(msg.strip()))
+               for name, msg in chain)
 
 
 def _probe(env):
-    key = (sys.executable,) + tuple(sorted((k, v) for k, v in env.items() if _keyed(k)))
+    key = (sys.executable,) + tuple(sorted((k, v) for k, v in env.items()
+                                           if k.upper() in _KEY_NAMES or k.upper().startswith(_KEY_PREFIXES)))
     if key not in _probes:
         try:
             proc = subprocess.run([sys.executable, "-c", _PROBE], capture_output = True, text = True,
                                   errors = "replace", env = env, timeout = 600)
-            _probes[key] = (proc.returncode, proc.stdout + proc.stderr)
+            _probes[key] = (proc.returncode, proc.stdout)
         except subprocess.TimeoutExpired:
-            _probes[key] = (0, "")
+            _probes[key] = (None, "")
     return _probes[key]
 
 
-def skip_if_cpu_inductor_missing(proc, env, args = ()):
-    """Skip only a failed non-CUDA child whose own failure is a missing compiler that a fresh probe confirms."""
-    if proc.returncode == 0 or "cuda" in args:
-        return
-    if not missing_compiler(proc.returncode, (proc.stdout or "") + (proc.stderr or "")):
-        return
-    returncode, output = _probe(env)
-    if missing_compiler(returncode, output):
-        pytest.skip(f"CPU Inductor has no C++ compiler here ({_terminal(output)[:200]})")
+def skip_without_cpu_inductor(env = None):
+    """Skip when a trivial CPU compile fails with a missing C++ compiler; any other result runs the check."""
+    returncode, stdout = _probe(dict(os.environ) if env is None else env)
+    if missing_compiler(returncode, stdout):
+        pytest.skip("CPU Inductor has no C++ compiler here (a trivial torch.compile failed with a missing compiler)")
