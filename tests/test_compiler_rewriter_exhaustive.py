@@ -817,6 +817,9 @@ def test_patching_utils_autograd_engine_call_method_compiled_autograd_enabled_pi
         pytest.skip("AutogradEngineVariable.call_method unavailable")
     old = "torch._dynamo.compiled_autograd.compiled_autograd_enabled"
     new = "torch._dynamo.compiled_autograd.in_compiled_autograd_region"
+    if "call_method" not in vars(cls):
+        # torch 2.15+: call_method is inherited and queue_callback carries the region check; the rewriter skips.
+        src = inspect.getsource(getattr(cls, "queue_callback", lambda: None))
     if old not in src and new not in src and "in_compiled_autograd_region" not in src:
         _drift(
             "unsloth_zoo/patching_utils.py:564-573",

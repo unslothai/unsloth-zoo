@@ -905,9 +905,12 @@ def patch_compiled_autograd():
     # From https://github.com/pytorch/pytorch/pull/135795/files
     try:
         import torch._dynamo.variables.misc
-        fx = torch._dynamo.variables.misc.AutogradEngineVariable.call_method
+        engine_variable = torch._dynamo.variables.misc.AutogradEngineVariable
+        fx = engine_variable.call_method
     except:
         return
+    # torch 2.15 moved queue_callback into its own method (already on the new name) and inherits call_method.
+    if "call_method" not in vars(engine_variable): return
     if fx.__name__ == "unsloth_call_method": return
     source = inspect.getsource(fx)
     if "in_compiled_autograd_region" in source: return
