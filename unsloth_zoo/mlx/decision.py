@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Decision models on MLX: loading, serving, saving and what fine-tuning needs from the model. `MLXDecisionTrainer` is in `trainer`.
-
-`load_decision_model` loads any supported decision model from its source repo. The result answers typed-decision requests
-(`choice` / `score` / `noul`) through `answer`; request validation, prompts, calibration and answers follow llama.cpp's decision
-endpoint, so a model answers the same here as its GGUF does there. A Laya or Julia-1 result also exposes its network (`logits`,
-`set_dtype`, the module tree) for callers that keep prompts and calibration themselves.
-"""
+"""Decision models on MLX: loading, serving and saving; requests (choice/score/noul) are validated and answered as
+llama.cpp's decision endpoint does, so answers match the model's GGUF; MLXDecisionTrainer is in trainer; Laya or
+Julia-1 results expose the network (logits, set_dtype, module tree)."""
 
 import copy
 import contextlib
@@ -282,8 +278,8 @@ def _load_network(folder, compute_dtype):
             module.set_dtype(mx.float32)
     model.eval()
     mx.eval(model.parameters())
-    # eval returns before the command buffer drops the cast's source tensors; wait, then empty the process-wide cache.
-    # The cache is shared with any generation in flight, so drain its streams first, as every other clear here does.
+    # eval returns before the command buffer drops the cast's source tensors, so wait, then clear the process-wide
+    # cache; it is shared, so drain generation streams first.
     from .generate import _drain_generation_streams
 
     _drain_generation_streams(mx)
@@ -471,9 +467,7 @@ class DecisionPipeline:
     temperatures = {}
 
     def answer(self, state, questions, images = None, audio = None):
-        """Answers keyed by question id, and the prompt tokens spent.
-
-        Images are refused unless `reads_images`, and `audio`, an array of base64 data URLs, unless `reads_audio`."""
+        """Answers keyed by question id and the prompt tokens spent; images are refused unless reads_images, and audio (base64 data URLs) unless reads_audio."""
         if state is None:
             raise DecisionRequestError('"state" must be provided')
         parsed = self._parse_questions(questions)
@@ -752,10 +746,8 @@ def _layers_owner(name):
 
 
 def _off_decoder(stem, owners):
-    """Whether an adapter stem names a tower, a projector or the talker, which the prefix `_lora_key` drops would say.
-
-    `owners` are what holds the decoder's layers in this model; a checkpoint stores it as `model` or `language_model`.
-    """
+    """Whether an adapter stem names a tower, projector or talker, which the `_lora_key` prefix drops; `owners` holds
+    the decoder's layers, stored as `model` or `language_model`."""
     from .loader import _OTHER_MODALITY_TOKENS, _STRONG_PROJECTOR_TOKENS, _VISION_ROLE_TOKENS, _role_tokens
 
     prefix = stem.partition("layers.")[0] if "layers." in stem else stem.rpartition(".")[0]
@@ -893,8 +885,7 @@ class _QwenModel(DecisionPipeline):
     def _reads(self, tower, part):
         processor = getattr(self.model, "_processor", None)
         if self._architecture in self._TOWERS:
-            # The layouts and forwards here are those of these architectures, as their references define them.
-            # Without its processor files a model loads with a bare tokenizer in the processor's place.
+            # Layouts and forwards follow each architecture's reference; without processor files a model loads with a bare tokenizer in the processor's place.
             from .utils import _AUDIO_QUALIFIED_FAMILIES, _installed_mlx_vlm_version
 
             owner = self._TOWERS[self._architecture]
@@ -1011,10 +1002,9 @@ class _QwenModel(DecisionPipeline):
         if adapter is not None:
             _merge_lora(self.model, adapter)
         if load_in_4bit:
-            # The loader leaves the embeddings, the output head and the towers in 16-bit for the trainers that
-            # train them. No decision head does, and together they are as large again as the quantized layers.
-            # What a tower read needs keeps its precision: beside the decoder, as the loader tells it, everything but the
-            # modules named for a modality left unread.
+            # The loader keeps embeddings, output head and towers in 16-bit for trainers, which decision heads skip
+            # (together as large again as the quantized layers); only towers for read modalities keep precision, the
+            # rest stay unread.
             from .loader import _OTHER_MODALITY_TOKENS, _VISION_ROLE_TOKENS, _beside_text_decoder, _role_tokens, _text_decoder_paths
 
             read = (_VISION_ROLE_TOKENS if self.reads_images else frozenset()) | (_OTHER_MODALITY_TOKENS if self.reads_audio else frozenset())
@@ -1560,8 +1550,7 @@ class ClefModel(_QwenModel):
     def __init__(self, folder, dtype, base_model, token, load_in_4bit = False):
         decoder = folder
         if (folder / "adapter_config.json").is_file() and not any(folder.glob("model*.safetensors")):
-            # LoRA adapters beside the head. They stay apart from their base, `base_folder`, so that they also sit
-            # on a quantized base and go on training.
+            # LoRA adapters beside the head stay apart from their base_folder, so they also sit on a quantized base and keep training.
             repo, revision = _adapter_base(folder)
             decoder = Path(base_model or repo)
             if not decoder.is_dir():
@@ -1574,8 +1563,7 @@ class ClefModel(_QwenModel):
             _attach_lora(self.model, folder)
         self.head = _load_joint_head(folder)
         self.head_config = _read_json(folder / _CLEF_HEAD_CONFIG)
-        # A fine-tune's per-type temperatures are relative to its head temperature, which is kept apart only when
-        # it could not be folded into the head's weights.
+        # A fine-tune's per-type temperatures are relative to head_temperature, which is kept apart only when it could not be folded into the head's weights.
         saved = _read_json(folder / _CLEF_CONFIG)
         scale = float(saved.get("head_temperature", 1.0))
         self.temperatures = {kind: scale * min(max(float(t), 0.5), 5.0) for kind, t in zip(_TYPES, saved.get("temperature", []))}
@@ -1621,9 +1609,8 @@ class ClefModel(_QwenModel):
         yield "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:", None
 
     def encode(self, state, questions, max_length = None, image_ids = ()):
-        """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end.
-
-        `image_ids`, from `encode_media`, go between the prompt's opening and the state."""
+        """Token ids of the prompt and the (start, end) spans the head reads; a state too long for max_length loses its
+        end; image_ids go between the prompt's opening and the state."""
         pieces = [(self._encode(text), mark) for text, mark in self._pieces(state, questions)]
         pieces[0] = (pieces[0][0] + list(image_ids), None)
         if max_length is not None:
@@ -1734,11 +1721,9 @@ def load_decision_model(folder, compute_dtype = None, *, family = None, subfolde
 
 
 def load_language_model_as_clef(path, compute_dtype = None, *, head_width = None, head_config = None, seed = 3407, token = None, load_in_4bit = False):
-    """Load a plain language model (a local folder or a Hugging Face repo id) with a new joint head, to train as a Clef.
-
-    The head is Clef's, 1024 wide for a decoder with hidden size 3072 or more and 512 otherwise unless `head_width` or a
-    whole `head_config` says otherwise, and starts untrained from `seed`, which reseeds MLX's random state. `load_in_4bit` quantizes the decoder as it loads, to train through LoRA adapters. The result trains and saves like a loaded Clef.
-    """
+    """Load a plain language model with a new untrained joint head to train as a Clef; the head is 1024 wide for hidden
+    size 3072+ (else 512) unless head_width or head_config says otherwise; seed reseeds MLX's random state;
+    load_in_4bit quantizes the decoder for LoRA training."""
     folder = Path(path)
     if not folder.is_dir():
         from huggingface_hub import snapshot_download
@@ -1767,11 +1752,8 @@ def _merged_parameters(model):
 
 
 def save_decision_model(model, folder, source, agent_config = None):
-    """Write `model` as a float16 Laya checkpoint in `folder`, with any LoRA adapters merged into the saved weights.
-
-    `source` is the checkpoint `model` was loaded from: it supplies the encoder config, the tokenizer and
-    the tensors the MLX model does not hold. `agent_config` replaces its `rl_agent_config.json`.
-    """
+    """Write `model` as a float16 Laya checkpoint in `folder` with LoRA adapters merged in; `source` supplies the
+    encoder config, tokenizer and tensors the MLX model lacks; `agent_config` replaces its `rl_agent_config.json`."""
     folder, source = Path(folder), Path(source)
     if agent_config is None:
         agent_config = json.loads((source / "rl_agent_config.json").read_text(encoding = "utf-8"))
@@ -1937,9 +1919,8 @@ def _apart(folder, source):
 
 
 def _clef_head(pipeline, config, exact = False):
-    """The joint head's tensors as they are saved; `config`'s `head_temperature` is folded into them when they can absorb it.
-
-    `exact` is for a checkpoint training resumes from: float32, with nothing folded in."""
+    """The joint head's tensors as saved, with `head_temperature` folded in when they can absorb it; `exact` keeps
+    float32 with nothing folded, for resuming training."""
     head = dict(tree_flatten(pipeline.head.parameters()))
     if exact:
         return {name: value.astype(mx.float32) for name, value in head.items()}
@@ -1969,8 +1950,8 @@ def _commit_clef(pipeline, staging, folder, source, head, config, copied = ("*",
     for item in {item for pattern in copied for item in source.glob(pattern)}:
         if item.is_file() and not item.name.startswith(".") and item.name not in skipped and not (staging / item.name).exists():
             shutil.copyfile(item, staging / item.name)
-    # The head's file makes a folder a checkpoint: an old one goes first and the new one last, so an interrupted
-    # save over an earlier checkpoint never reads as complete.
+    # The head's file makes a folder a checkpoint: it is removed first and written last, so an interrupted save over an
+    # earlier checkpoint never reads as complete.
     (folder / "joint_head.safetensors").unlink(missing_ok = True)
     staged = sorted(staging.iterdir(), key = lambda item: item.name == "joint_head.safetensors")
     for item in staged:
@@ -2045,12 +2026,9 @@ def save_clef_model(pipeline, folder, source, config = None):
 
 
 def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None, config = None, exact = False):
-    """Write a Clef trained through LoRA adapters as those adapters beside its joint head, as PEFT stores them.
-
-    `source` is the checkpoint the decoder was loaded from and `base_model` the name that checkpoint is loaded by (a
-    repo id or a folder), which `load_decision_model` puts the adapters back on. `config` is as for `save_clef_model`.
-    `exact` keeps the head in float32 with no temperature folded in, for a checkpoint training resumes from.
-    """
+    """Write a LoRA-trained Clef as PEFT adapters beside its joint head; `source` is the decoder's checkpoint,
+    `base_model` the repo id or folder load_decision_model puts them back on; `exact` keeps the head float32 with no
+    temperature folded in."""
     (folder, source), decoder, stored = _apart(folder, source), pipeline.model, _stored_tensors(source)
     adapters = [(path, module) for path, module in decoder.named_modules() if "lora_a" in module]
     whole = [path for path, _ in tree_flatten(decoder.trainable_parameters()) if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")]
@@ -2085,11 +2063,8 @@ _ENCODER_LINEARS = ("attn.Wqkv", "attn.Wo", "mlp.Wi", "mlp.Wo")
 
 
 def load_trainable_decision_model(folder, full_finetuning = False, gradient_checkpointing = True):
-    """Load a Laya checkpoint for training.
-
-    A full fine-tune trains every weight in float32. Otherwise the encoder is frozen with float16 matmuls,
-    ready for `add_lora_adapters`, and only the float32 decision head trains.
-    """
+    """Load a Laya checkpoint for training: a full fine-tune trains every weight in float32; otherwise the encoder is
+    frozen with float16 matmuls, ready for add_lora_adapters, and only the float32 head trains."""
     # The trainer works on the network; the loaded pipeline around it only serves requests.
     model = load_decision_model(folder, compute_dtype = mx.float32 if full_finetuning else mx.float16).model
     model.freeze()
@@ -2121,11 +2096,8 @@ def add_lora_adapters(
     target_modules = "all-linear",
     random_state = 3407,
 ):
-    """Add trainable float32 LoRA adapters to the encoder's linear layers.
-
-    `target_modules` selects them as PEFT does: `"all-linear"`, a list of names or dotted suffixes
-    (`"Wqkv"`, `"mlp.Wo"`), or a regular expression matching the whole name (`"layers.0.attn.Wqkv"`).
-    """
+    """Add trainable float32 LoRA adapters to the encoder's linear layers; target_modules selects them as PEFT does:
+    all-linear, a list of names or dotted suffixes such as mlp.Wo, or a regex matching the whole name."""
     from mlx_lm.tuner.lora import LoRALinear
 
     if any(isinstance(module, LoRALinear) for module in model.modules()):
@@ -2171,11 +2143,9 @@ def collate_decisions(items, pad_token_id):
 
 
 def _decision_losses(logits, target, mask, objective = None):
-    """Each decision's loss, and its expected distance from the gold level for the ordinal term.
-
-    `objective` is `(label_smoothing, brier_weight, ordinal_weight)`: cross-entropy against targets smoothed toward
-    uniform over the decision's own options, plus a Brier term. `logits` hold -1e4 where `mask` is off.
-    """
+    """Each decision's loss (cross-entropy with smoothing toward uniform over its options, plus Brier) and its expected
+    distance from the gold level; objective is (label_smoothing, brier_weight, ordinal_weight); logits hold -1e4
+    where mask is off."""
     smoothing, brier, ordinal = objective or (0.0, 0.0, 0.0)
     log_p = nn.log_softmax(logits, axis = -1)
     options = mask.sum(-1, keepdims = True)
@@ -2198,12 +2168,8 @@ def _soft_cross_entropy(model, batch, objective = None):
 
 
 class _LayerwiseStep:
-    """Soft cross-entropy and its gradients, with the encoder run and differentiated one layer at a time.
-
-    One evaluation of the whole graph keeps every layer's temporaries alive until it ends, and MLX's buffer cache then
-    holds that working set once per batch shape. Evaluating at each layer bounds it to a single layer's worth: only
-    layer inputs are kept, and each layer is recomputed for its backward pass, as gradient checkpointing does.
-    """
+    """Soft cross-entropy and gradients with the encoder run and differentiated one layer at a time, bounding MLX's
+    buffer-cache working set; layer inputs are kept and each layer recomputed on backward."""
 
     def __init__(self, model, compile = False, objective = None):
         self.model = model
@@ -2461,13 +2427,9 @@ class ClefNetwork(nn.Module):
 def clef_training_network(
     pipeline, full_finetuning = False, r = 64, lora_alpha = 64, target_modules = "all-linear", gradient_checkpointing = True, origin = None, **lora
 ):
-    """Prepare a loaded Clef pipeline for training and return its `ClefNetwork`.
-
-    The float32 joint head always trains. The decoder trains whole under `full_finetuning`, otherwise through LoRA
-    adapters (`lora` is passed to `FastMLXModel.get_peft_model`); `"all-linear"` means its language layers' projections.
-    A Clef loaded from adapters keeps training those, whatever `r`, `lora_alpha` and `target_modules` say.
-    `origin` is the network's: what lets its checkpoints be written as loadable Clef adapters.
-    """
+    """Prepare a loaded Clef for training, returning its ClefNetwork; the float32 head always trains; the decoder trains
+    whole under full_finetuning, else via LoRA; a Clef loaded from adapters keeps training them whatever r,
+    lora_alpha, target_modules say; origin lets checkpoints be saved as adapters."""
     from .loader import FastMLXModel, _lora_name_matches_target, _mlx_language_layers
     from .utils import _get_text_model, describe_output_head
 
@@ -2518,8 +2480,8 @@ def clef_training_network(
 
 
 def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, reference = None, kl_weight = 0.0, capture = None):
-    """The loss summed over the questions of one record; `ordinal_scale` weighs its score questions' ordinal term and
-    `kl_weight` the divergence of each question's distribution from that of the `reference` logits."""
+    """Loss summed over one record's questions; ordinal_scale weighs score questions' ordinal term and kl_weight the
+    divergence of each distribution from the reference logits' distribution."""
     spans = item["option_spans"]
     logits = _item_logits(network._pipeline, item)
     target = np.zeros((len(spans), logits.shape[0]), np.float32)
@@ -2625,11 +2587,9 @@ def clef_option_keys(pipeline, question):
 
 
 def clef_training_item(pipeline, state, questions, max_length = None, images = None, audio = None):
-    """Tokenize one record as a Clef training item; the caller adds `targets`, a distribution per question over `clef_option_keys`.
-
-    `images` are PIL images or data URLs; with the image parts of a chat-message state they are read as a request's are.
-    `audio` clips are data URLs or decoded `{"array", "sampling_rate"}` clips, mono at 16 kHz.
-    `source` keeps the record, which `permute_fields` encodes again with its questions reordered."""
+    """Tokenize one record as a Clef training item; the caller adds targets over clef_option_keys; images are PIL or
+    data URLs, merged with state image parts as in a request; audio clips are data URLs or decoded {array,
+    sampling_rate} at 16 kHz mono; source keeps the record for permute_fields."""
     parsed = pipeline._parse_questions(questions)
     given = list(images or ())
     urls = _image_urls(state, [image for image in given if isinstance(image, str)])

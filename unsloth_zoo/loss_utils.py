@@ -40,18 +40,9 @@ else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
 
-# unsloth #2491: triton 3.3.0 and 3.3.1 cannot lower cut_cross_entropy's
-# `_cce_lse_forward_kernel` for compute capability 7.5 (T4, RTX 2080 Ti). The TritonGPU to
-# LLVM pass gives up on a `tt.fp_to_fp` and aborts the process:
-#     error: Unsupported conversion from f16 to f16
-#     LLVM ERROR: Unsupported rounding mode for conversion.
-# (triton-lang/triton#6698, closed 2025-07-22.) The range is measured: the kernel was
-# compiled ahead of time for cuda:75 on every release from 3.1.0 to 3.8.0 and only these
-# two abort, for every block size, dot precision and accumulator dtype tried, while the
-# sm_80 control compiles on all of them.
-#
-# Not expressible as a floor: torch pins triton exactly and the oldest supported torch,
-# 2.6.0, requires `triton==3.2.0`.
+# unsloth issue 2491: triton 3.3.0 and 3.3.1 abort lowering cut_cross_entropy's _cce_lse_forward_kernel on sm_75 (T4),
+# other 3.1.0-3.8.0 releases compile; triton-lang/triton issue 6698; no version floor since torch pins triton exactly
+# (torch 2.6.0 requires triton==3.2.0).
 _TRITON_CCE_BROKEN_ON_SM75 = ("3.3.0", "3.4.0")
 
 
@@ -89,8 +80,7 @@ def _triton_miscompiles_cce_on_any_visible_device():
             device_major, device_minor = torch.cuda.get_device_capability(index)
         except Exception:
             continue
-        # `triton_version` passed rather than left to the default, which binds at
-        # definition time and so cannot be substituted by a caller or a test.
+        # triton_version is passed explicitly, since a default binds at definition time and could not be substituted by a caller or a test.
         if _triton_miscompiles_cce_on_sm75(device_major, device_minor, triton_version):
             affected.append((index, device_major, device_minor))
     return affected
@@ -98,16 +88,13 @@ pass
 
 
 if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
-    # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so ask
-    # whether a device is present before asking what it can do. Cut cross
-    # entropy is a Triton GPU kernel and cannot run here regardless, so False is
-    # both the conservative answer and the only correct one.
+    # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE cuda on driverless hosts, so check availability first; CCE is a Triton GPU
+    # kernel that cannot run there anyway, so False is both conservative and the only correct answer.
     HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
-    # Every VISIBLE device, not just the current one: a device_map can place lm_head on
-    # another GPU, so the kernel can run on an sm_75 while device 0 is an sm_80. The
-    # failure aborts the process rather than raising, so be conservative.
+    # Checks every visible device, not just the current one: device_map can put lm_head on an sm_75 GPU while device 0
+    # is sm_80; the failure aborts rather than raises.
     _miscompiling_devices = _triton_miscompiles_cce_on_any_visible_device()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
@@ -242,11 +229,9 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     UnslothForCausalLMLoss._unsloth_fused_loss = UnslothForCausalLMLoss
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
-    # Patch every key still aliased to the stock ForCausalLMLoss. PreTrainedModel
-    # resolves loss_type by regex on the class name, so e.g.
-    # Qwen3_5ForConditionalGeneration / CsmForConditionalGeneration land on keys
-    # pointing at the stock loss; without this sweep they keep the un-patched
-    # loss and OOM via logits.float() at large vocab sizes.
+    # Patch every key still aliased to stock ForCausalLMLoss, since loss_type is matched by class-name regex and
+    # Qwen3_5ForConditionalGeneration / CsmForConditionalGeneration land on those keys; without this sweep they keep the
+    # un-patched loss and OOM via logits.float() at large vocab sizes.
     for _key, _fn in list(LOSS_MAPPING.items()):
         if getattr(_fn, "__name__", "") == "ForCausalLMLoss":
             LOSS_MAPPING[_key] = UnslothForCausalLMLoss
@@ -266,8 +251,7 @@ def post_patch_loss_function(model):
     current_model = model
     while hasattr(current_model, "model"):
         try:
-            # model.loss_function starts as a dict to a loss fx
-            # We invoke it to save it
+            # model.loss_function starts as a dict to a loss fx; it is invoked here once so the resolved loss is saved back on the model.
             current_model.loss_function = current_model.loss_function()
         except:
             # Failed means we already invoked it, and we need args to the loss fx
@@ -332,9 +316,8 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
-# Heads whose labels are not shifted next-token targets, so the counter below cannot
-# describe them. Matched on the top level class name, since the walk below descends
-# into the backbone and would judge the head by the decoder it sits on.
+# Heads whose labels are not shifted next-token targets, so the counter cannot describe them; matched on the top-level
+# class name, since the walk descends into the backbone.
 NON_CAUSAL_HEADS = (
     "ForSequenceClassification",
     "ForTokenClassification",
@@ -342,9 +325,8 @@ NON_CAUSAL_HEADS = (
     "ForMultipleChoice",
 )
 
-# The loss_types that shift labels, snapshotted AT IMPORT: patch_loss_functions() above
-# swaps every causal entry for UnslothForCausalLMLoss, so testing against the live
-# mapping would read False for every causal model once unsloth has loaded.
+# loss_types that shift labels, snapshotted at import: patch_loss_functions() swaps every causal entry for
+# UnslothForCausalLMLoss, so the live mapping would read False for causal models.
 try:
     from transformers.loss.loss_utils import LOSS_MAPPING as _LOSS_MAPPING, ForCausalLMLoss
     CAUSAL_LOSS_TYPES = frozenset(
@@ -384,13 +366,10 @@ pass
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
-# ParallelMode distinguishes DataParallel (scatter/gather from one process)
-# from the faster DistributedDataParallel (one process per device).
+# ParallelMode tells DataParallel (scatter/gather from one process) apart from the faster DistributedDataParallel (one process per device).
 from transformers.training_args import ParallelMode
 
-# Cannot use sadly
-# import torch._dynamo.eval_frame as torch_dynamo_eval_frame
-# torch_compiler_set_stance = torch.compiler.set_stance
+# Cannot use the torch._dynamo.eval_frame import or torch.compiler.set_stance; left commented out.
 
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
@@ -421,11 +400,9 @@ def _normalize_packed_seq_lengths(seq_lengths):
             lengths = torch.as_tensor(seq_lengths, dtype = torch.long)
         if lengths.ndim != 1:
             lengths = lengths.reshape(-1)
-        # Filtering is mandatory (a 0 length duplicates a start, a negative one
-        # corrupts every later cumsum) and must stay inside the try: the mask
-        # lowers to aten.nonzero, which raises DynamicOutputShapeException under
-        # FakeTensorMode and raises under vmap. Escaping into the caller's
-        # `except Exception: raise RuntimeError(...)` kills the run.
+        # Filtering is mandatory (a 0 length duplicates a start, a negative one corrupts later cumsums) and must stay
+        # inside this try: the mask lowers to aten.nonzero, which raises DynamicOutputShapeException under
+        # FakeTensorMode and vmap; escaping into the caller's except kills the run.
         lengths = lengths[lengths > 0]
         if lengths.numel() <= 1: return None
     except Exception:
@@ -491,8 +468,8 @@ def _packed_boundary_targets(packed_seq_lengths, token_count):
     if isinstance(packed_seq_lengths, torch.Tensor) and (
         torch.compiler.is_compiling() or packed_seq_lengths.device.type == "cuda"
     ):
-        # Clamp, not the eager filter (nonzero cannot trace; on CUDA it costs a D2H + H2D sync). Same slots:
-        # a 0 length repeats the previous start, index_fill_ is idempotent, a start at ends[-1] is never kept.
+        # Clamp instead of the eager filter (nonzero cannot trace; on CUDA it costs a D2H + H2D sync); a 0 length
+        # repeats the previous start, index_fill_ is idempotent, and a start at ends[-1] is never kept.
         lengths = packed_seq_lengths.reshape(-1).long().clamp_min(0)
     else:
         lengths = _normalize_packed_seq_lengths(packed_seq_lengths)

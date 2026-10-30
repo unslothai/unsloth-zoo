@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Affine `x @ W^T` on the stock packed weights: small-row 4- and 8-bit qmm for Apple GPUs without stock NAX
-kernels, and multi-row qmv that gives each row its one-row stock bits."""
+"""Affine `x @ W^T` on stock packed weights: small-row 4/8-bit qmm for Apple GPUs without stock NAX kernels, and
+multi-row qmv whose rows match one-row stock calls bit for bit."""
 
 import functools
 import hashlib
@@ -27,14 +27,12 @@ import mlx.core as mx
 from . import nax
 
 
-# From 6 rows, simdgroup matrices on exact `offset + q` operands; each group folds
-# `s * (P - offset * sum(x)) + b * sum(x)` in fp32, stock qmv's factorization.
+# From 6 rows, simdgroup matrices run on exact `offset + q` operands; each group folds `s * (P - offset * sum(x)) + b * sum(x)` in fp32, as stock qmv does.
 _SIMD_QMM_BITS = (4, 8)
 _SIMD_QMM_GROUP_SIZES = (32, 64, 128)
 _SIMD_QMM_MAX_ROWS = 24
 _SIMD_QMM_SIMDGROUPS = 8   # 256 threads: M2 and M3 GPUs cap a threadgroup at 896
-# (operand, its bits' type, the code's shift into them, the offset's bits, in both halves for a 16-bit
-# operand, offset). bf16 cannot hold `256 + q`, so 8-bit codes multiply as fp32.
+# Tuple is (operand, bits type, code shift, offset bits (both halves for 16-bit operands), offset); bf16 cannot hold `256 + q`, so 8-bit codes multiply as fp32.
 _SIMD_QMM_OPERANDS = {
     (4, mx.bfloat16): (mx.bfloat16, mx.uint16, 3, 0x41804180, 16),
     (4, mx.float16): (mx.float16, mx.uint16, 6, 0x4C004C00, 16),
@@ -264,8 +262,8 @@ def probe_simd_qmm():
                 assert error <= 0.02 * mx.abs(native).max().item(), (bits, group_size, M, error)
 
 
-# Rows of affine `x @ W^T` with stock qmv_fast's one-row arithmetic, so each row equals its one-row call bit for bit
-# while each weight is read once per launch, where mlx-vlm's exact verifier re-reads or re-decodes it per row.
+# Rows of affine `x @ W^T` use stock qmv_fast's one-row arithmetic, so each row equals its one-row call bit for bit;
+# each weight is read once per launch, where mlx-vlm's exact verifier re-reads or re-decodes it per row.
 QMV_ROWS_MAX = 8  # rows a simdgroup holds; a staged launch runs up to twice as many in two row groups
 QMV_ROWS_STAGED_MAX = 16
 _QMV_ROWS_BITS = (4, 5, 6, 8)
@@ -297,9 +295,9 @@ _QMV_ROWS_INPUTS = """
     }
 """
 
-# Multiply-add bound on smaller GPUs: a lane decodes its codes once for all rows (half codes are exact) and forms
-# each row's inputs per four outputs, reads them from `qmv_rows_inputs` or stages them per threadgroup. A row count
-# compiles once for all N and K.
+# Multiply-add bound on smaller GPUs: a lane decodes its codes once for all rows (half codes are exact) and forms each
+# row's inputs per four outputs, read from `qmv_rows_inputs` or staged per threadgroup; a row count compiles once for
+# all N and K.
 _QMV_ROWS_SOURCE = """
     constexpr int VPT = (BITS == 4 || BITS == 5) ? 16 : 8;
     constexpr int NP = BITS == 5 ? 24 : (BITS == 6 ? 12 : VPT);
