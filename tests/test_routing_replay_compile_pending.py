@@ -231,10 +231,8 @@ def test_non_reentrant_natural_forward_with_identical_inputs_keeps_its_own_routi
 @pytest.mark.parametrize("use_reentrant", [False, True])
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
 def test_early_stopped_recompute_clears_old_forwards(replay, backend, use_reentrant):
-    # A non-reentrant checkpoint stops its recompute once the saved tensors are rebuilt, so a
-    # compiled layer never reaches the end of its graph: the recompute flag must be set at run
-    # time, else old forwards stay pending and, with input buffers reused, make the next step's
-    # recompute ambiguous (natural routing in the recompute, wrong gradients).
+    # Non-reentrant recompute stops early, so the flag must be set at run time or stale forwards
+    # stay pending and, with reused buffers, the next recompute routes naturally (wrong grads).
     layer = _layer(replay)
     fn = torch.compile(lambda x: layer(x), backend = backend, fullgraph = True)
     buffers = [torch.arange(1.0, 9.0).reshape(1, 8) for _ in range(2)]
@@ -270,8 +268,7 @@ def test_early_stopped_recompute_clears_old_forwards(replay, backend, use_reentr
 
 @pytest.mark.parametrize("dynamic", [None, True])
 def test_token_count_is_not_specialised(replay, dynamic):
-    # GRPO batches change length every step: the signature's chunk loop must not guard on the
-    # token count, else every new length recompiles until the fullgraph recompile limit.
+    # GRPO lengths change every step: a guard on the token count recompiles per length.
     def run(fn):
         grads, graphs = [], []
         for rows in [4, 8, 17, 33, 65, 129, 257, 513, 1025, 8]:

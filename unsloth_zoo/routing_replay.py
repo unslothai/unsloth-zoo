@@ -508,7 +508,7 @@ def _signature_projection(width, device):
 
 
 def _project(x):
-    # Chunked so the fp32 upcast stays bounded for long sequences.
+    # Chunked to bound the fp32 upcast.
     projection = _signature_projection(x.shape[-1], x.device)
     return torch.cat([
         x[a : a + _SIGNATURE_CHUNK].float() @ projection
@@ -517,8 +517,7 @@ def _project(x):
 
 
 def _signature_impl(x: torch.Tensor) -> torch.Tensor:
-    # Opaque in a compiled region: the seeded Generator is untraceable, and the chunk loop over the
-    # token count would specialise it (one recompile per sequence length).
+    # Opaque: the seeded Generator is untraceable and the chunk loop would specialise on token count.
     return _project(x)
 
 
@@ -563,8 +562,7 @@ def _recompute_impl(
     layer_input: typing.Optional[torch.Tensor], layer_index: int,
 ) -> typing.Tuple[torch.Tensor, torch.Tensor]:
     if _STATE.pending:
-        # Set at run time: a non-reentrant checkpoint stops its recompute early, so the traced
-        # assignment (replayed after the graph) never runs and old forwards would stay pending.
+        # Run time: a non-reentrant recompute stops early, so a traced assignment would never run.
         _STATE.recomputed = True
     picked = _pick_recorded(layer_index, ids2, signature, layer_input) if _STATE.pending else _NATURAL
     if picked is _NATURAL:
