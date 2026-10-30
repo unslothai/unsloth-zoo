@@ -101,7 +101,10 @@ _GUARDED = {
 
 
 def test_triton_attributes_resolve_on_installed_triton():
-    pytest.importorskip("triton")
+    triton = pytest.importorskip("triton")
+    if tuple(int(x) for x in triton.__version__.split(".")[:2]) < (3, 6):
+        # Older Triton reaches newer names (triton.knobs, libdevice.fast_tanhf) only behind version checks.
+        pytest.skip(f"forward-compat check targets Triton >= 3.6, found {triton.__version__}")
     missing = set()
     for rel, tree in _trees():
         alias = _triton_aliases(tree)
