@@ -121,7 +121,7 @@ CALLS = {"ce": 0, "logprobs": 0, "logprobs_bwd": 0, "triton": 0, "torch": 0, "ti
 @functools.cache
 def _budget_bytes(device):
     try:
-        from unsloth_zoo.tiled_mlp import _default_target_gb
+        from unsloth_zoo.memory_budget import _default_target_gb
 
         free = float(_default_target_gb(device))
     except Exception:
