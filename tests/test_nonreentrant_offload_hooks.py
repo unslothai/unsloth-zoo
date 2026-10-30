@@ -25,6 +25,8 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)
+    # These cases use sub-MiB activations; the size floor is covered in test_gc_offload_lifecycle.py.
+    monkeypatch.setenv("UNSLOTH_GC_OFFLOAD_MIN_BYTES", "0")
     return gc_module
 
 
@@ -199,8 +201,8 @@ def _max_prefetched_waiting(offloader, monkeypatch):
     peak = [0]
     original = offloader._prefetch
 
-    def counting(index):
-        original(index)
+    def counting(*args):
+        original(*args)
         live = (ref() for ref in offloader.order)
         peak[0] = max(peak[0], sum(1 for r in live if r is not None and r.ready is not None))
 
