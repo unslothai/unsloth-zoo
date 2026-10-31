@@ -5656,6 +5656,23 @@ _VERIFY_GDN_PENDING_STEPS = """
 _VERIFY_GDN_FOLD_SOURCE = (
     _VERIFY_GDN_SOURCE.replace("    threadgroup T beta[LMAX];\n", "    threadgroup T beta[LMAX];" + _VERIFY_GDN_PENDING_LOADS)
     .replace("        for (uint t = 0; t < L; ++t) {\n", _VERIFY_GDN_PENDING_STEPS[1:] + "        for (uint t = 0; t < L; ++t) {\n"))
+# A draft tree's block (`TreeBlock`, row 0 the anchor, rows in preorder): each row's taps follow its path through the
+# conv window and the block, and the recurrence runs on from its parent's state, kept where a row has several children.
+_VERIFY_GDN_TREE_SOURCE = (
+    _VERIFY_GDN_SOURCE.replace(
+        "conv_input[(row * (K - 1 + L) + t + tap) * C + c]",
+        "conv_input[(int(tap) < int(K - 1) - depth[t] ? tap + depth[t] : K - 1 + path[t * path_shape[1] + depth[t] + tap - (K - 1)]) * C + c]")
+    .replace("        for (uint t = 0; t < L; ++t) {\n            float kv_mem = 0.0f;",
+             "        float forks[8][4];\n        for (uint t = 0; t < L; ++t) {\n"
+             "            if (back[t] >= 0) for (int i = 0; i < 4; ++i) state[i] = forks[back[t]][i];\n            float kv_mem = 0.0f;")
+    .replace("                ys[t * Dv + dv] = static_cast<T>(out);\n            }\n",
+             "                ys[t * Dv + dv] = static_cast<T>(out);\n            }\n"
+             "            if (fork[t] >= 0) for (int i = 0; i < 4; ++i) forks[fork[t]][i] = state[i];\n"))
+_VERIFY_GDN_TREE_FOLD_SOURCE = (
+    _VERIFY_GDN_TREE_SOURCE.replace("    threadgroup T beta[LMAX];\n", "    threadgroup T beta[LMAX];" + _VERIFY_GDN_PENDING_LOADS.replace(
+        "    const uint PL = pending_length;\n", "").replace("row * PL + i / Dk", "pending_path[i / Dk]").replace(
+        "row * PL + i / Dv", "pending_path[i / Dv]").replace("row * PL + tid", "pending_path[tid]"))
+    .replace("        float forks[8][4];\n", _VERIFY_GDN_PENDING_STEPS[1:] + "        float forks[8][4];\n"))
 _VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
 # Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
 _VERIFY_GDN_MAX_ROWS = 16
@@ -5697,14 +5714,28 @@ def _verify_gdn_kernel(fold = False):
         return None
 
 
-def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads, pending):
+@functools.cache
+def _verify_gdn_tree_kernel(fold = False):
+    header = nax._mlx_kernel_header("unary_ops.h") + nax._mlx_kernel_header("binary_ops.h")
+    return mx.fast.metal_kernel(
+        name = "unsloth_gated_delta_verify_tree" + "_folded" * fold,
+        input_names = ["conv_input", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight", "q_scale",
+                       "k_scale", "qk_eps", "norm_eps", "state_in", "length", "depth", "path", "fork", "back",
+                       *(("pending_k", "pending_v", "pending_a", "pending_b", "retained", "pending_path") if fold else ())],
+        output_names = ["y", "state_out", "q_out", "k_out", "v_out", *(("advanced",) if fold else ())], header = header,
+        compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_TREE_FOLD_SOURCE if fold else _VERIFY_GDN_TREE_SOURCE)
+
+
+def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads, pending, tree = None):
     B, L, value_heads, Dv = z.shape
     Dk, dtype = state.shape[-1], conv_input.dtype
     q_scale, k_scale, qk_norm_eps, norm_eps = _decode_step_scalars(Dk, dtype, qk_eps, eps)
     extra = [state.shape] if pending else []
-    return _verify_gdn_kernel(bool(pending))(
+    kernel = _verify_gdn_kernel(bool(pending)) if tree is None else _verify_gdn_tree_kernel(bool(pending))
+    rows = [] if tree is None else [tree.depth, tree.path, tree.fork, tree.back]
+    return kernel(
         inputs = [conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, qk_norm_eps, norm_eps,
-                  state, L, *pending],
+                  state, L, *rows, *pending],
         template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[1]),
                     ("LMAX", _VERIFY_GDN_MAX_ROWS), ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv),
                     ("TY", _VERIFY_GDN_ROWS)],
@@ -5714,15 +5745,20 @@ def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight,
     )
 
 
-def _verify_gdn_block(*args):
-    return _verify_gdn_launch(*args, ())
+def _verify_gdn_block(*args, tree = None):
+    return _verify_gdn_launch(*args, (), tree)
 
 
-def _verify_gdn_folded_block(*args, pending):
+def _verify_gdn_folded_block(*args, pending, tree = None):
     """`_verify_gdn_block` from the entry state of a block whose retained prefix was not replayed yet, given that
-    block's k, v, a, b and each row's retained count; it also returns the state after that prefix."""
-    k, v, a, b, rows = pending
-    return _verify_gdn_launch(*args, (k, v, a, b, rows, k.shape[1]))
+    block's k, v, a, b and each row's retained count; it also returns the state after that prefix. Below a draft tree,
+    `pending` also names the block rows the retained path took."""
+    k, v, a, b, rows, *path = pending
+    return _verify_gdn_launch(*args, (k, v, a, b, rows, *(path or [k.shape[1]])), tree)
+
+
+def _tree_attention(queries, keys, values, scale, tree):
+    return attention.invariant_attention(queries, keys, values, scale, tree.depth, tree.path)
 
 
 def _verify_gdn_fits(layer, inputs, mask, cache):
@@ -5786,6 +5822,8 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
     cache.update_window(0, conv_input, K - 1, lengths = cache.lengths)
     initial, dtype = cache[1], conv_input.dtype
     pending = cache.__dict__.pop("_unsloth_pending", None)
+    retained_path = cache.__dict__.pop("_unsloth_pending_path", None)
+    tree = getattr(_VERIFY_STATE, "tree", None)
     key = (length, Hk, layer.num_v_heads, K, dtype, a.dtype, b.dtype, layer.A_log.dtype, layer.dt_bias.dtype,
            getattr(initial, "dtype", None), qk_eps, layer.norm.eps)
     verdict = _VERIFY_GDN_VERDICTS.get(key)
@@ -5794,7 +5832,7 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
         conv_input, layer.conv1d.weight.reshape(layer.conv_dim, K), a, b, layer.A_log, layer.dt_bias, z,
         layer.norm.weight, qk_eps, layer.norm.eps,
         mx.zeros((batch, layer.num_v_heads, Dv, layer.head_k_dim), mx.float32) if state is None else state, Hk)
-    fused = lambda state: _verify_gdn_block(*block(state))
+    fused = lambda state: _verify_gdn_block(*block(state), tree = tree)
     # A passed check holds the key of the replay its commit relies on.
     if fits and verdict and _TAPE_VERDICTS.get(verdict):
         fold = None
@@ -5803,8 +5841,12 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
             _, pending_k, pending_v, pending_a, pending_b, A_log, dt_bias, pending_entry = replay.args
             if (state is initial and A_log is layer.A_log and dt_bias is layer.dt_bias and pending_k.dtype == dtype
                     and (pending_a.dtype, pending_b.dtype) == (a.dtype, b.dtype)):
-                fold = (*key, pending_k.shape[1]), lambda: _verify_gdn_folded_block(
-                    *block(pending_entry), pending = (pending_k, pending_v, pending_a, pending_b, rows))
+                retained = (pending_k, pending_v, pending_a, pending_b, rows)
+                if tree is not None:
+                    # A tree reads the retained rows in place; a chain block reads the replay's own gathered ones.
+                    retained = (*retained[:4], rows, attention._invariant_depths(pending_k.shape[1])) if retained_path is None else (*retained_path[:4], rows, retained_path[4])
+                fold = (*key, retained[0].shape[1], tree is not None), lambda: _verify_gdn_folded_block(
+                    *block(pending_entry), pending = retained, tree = tree)
 
         def update(entry, steps):
             if fold is not None:
@@ -5816,6 +5858,8 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
             _VERIFY_STATE.tapes.append((cache, 1, replay, None, True))
             return y, final, mx.broadcast_to(final[:, None], (batch, steps, *final.shape[1:]))
         output, _ = cache.update_recurrent(1, length, update)
+    elif tree is not None:
+        raise RuntimeError("a draft tree's block needs its width's fused verify block")
     else:
         conv_output = nn.silu(layer.conv1d(conv_input))
         q, k, v = [value.reshape(batch, length, heads, width) for value, heads, width in zip(
@@ -6318,6 +6362,8 @@ def _exact_verify_class(base, name, *cache_key):
             qk_eps = qk_eps_of(layer)
             if qk_eps is not None:
                 return _verify_gdn(self, layer, inputs, cache, route, kernels.gated_delta_update_with_states, qk_eps)
+        if getattr(_VERIFY_STATE, "tree", None) is not None:
+            raise RuntimeError("a draft tree's gated delta layers need the fused verify block")
         return taped(self, layer, inputs, mask, cache)
 
     def projected(self, linear, x):
@@ -6396,11 +6442,21 @@ def _exact_verify_class(base, name, *cache_key):
         # The native body for a wider block, with its one-row SDPA calls handed to `_exact_attention`.
         batch, length, _ = x.shape
         q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
+        tree = getattr(_VERIFY_STATE, "tree", None)
+        if tree is not None:
+            if not invariant or position_embeddings is not None or not isinstance(cache.offset, int):
+                raise RuntimeError("a draft tree attends on `row_invariant_attention` with one row's rotary positions")
+            # Each row at its one-token decode's position: the block's first, any rope delta in it, plus its depth.
+            first = mx.full((3, 1, 1), cache.offset, mx.int32) if position_ids is None else position_ids[..., :1]
+            position_ids = first + tree.depth
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
             q_proj_output, keys, values, cache, position_ids, position_embeddings, mask)
         padded = isinstance(mask, str) and mask == "left_padded_decode"
         if padded:
             mask = None
+        if tree is not None:
+            output = _tree_attention(queries, keys, values, attention.scale, tree)
+            return self._linear(attention.o_proj, output.transpose(0, 2, 1, 3).reshape(batch, length, -1) * mx.sigmoid(gate))
         output = _invariant_attention(queries, keys, values, attention.scale, cache, mask) if invariant else None
         if output is None and (length > 1 or padded):
             output = self._helpers()._qwen3_5_left_padded_attention(
@@ -6743,6 +6799,178 @@ def fused_drafter_ops(model) -> int:
         child.__dict__["_unsloth_fused_bindings"] = bindings
         child.__class__ = _fused_dflash2_class(type(child))
     return len(fused)
+
+
+class TreeBlock(NamedTuple):
+    """A draft tree's rows in preorder, row 0 the anchor: each row's `depth`, its `path` from the anchor (block rows [n, A],
+    itself last, zero padded), the stack slot it keeps its state in for later children (`fork`) and the one it restores its
+    parent's state from (`back`), -1 for none."""
+    depth: mx.array
+    path: mx.array
+    fork: mx.array
+    back: mx.array
+
+
+# One threadgroup grows the tree best first over the selector's lattice: a node's score is the sum of log q along its
+# path, q the softmax over the TOP candidates of (unary + edge from its parent). A child never scores above its
+# parent, so the first n nodes taken are a tree for every n. They go out in preorder, siblings best first, with the order
+# each was taken in (`tree_rank`): a row's first child is the row after it.
+_DRAFT_TREE_KERNEL = r"""
+    constexpr uint CAP = FRONTIER;
+    uint candidate = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    threadgroup float scores[TOP];
+    threadgroup float frontier[CAP * TOP];
+    threadgroup uint entries[CAP * TOP];
+    threadgroup int parents[CAP], tokens[CAP], depths[CAP];
+    threadgroup float totals[CAP];
+    threadgroup uint frontier_size, taken, expand;
+    if (thread_index_in_threadgroup == 0) {
+        frontier_size = 0;
+        taken = 1;
+        expand = 0;
+        parents[0] = -1;
+        tokens[0] = anchor[0];
+        depths[0] = 0;
+        totals[0] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 0; step + 1 < CAP; ++step) {
+        const uint node = expand;
+        const int position = depths[node];
+        const bool grows = position < int(LENGTH) && node < CAP;
+        if (grows) {
+            const uint previous = uint(tokens[node]);
+            const uint token = ids[position * TOP + candidate];
+            float total = 0.0f;
+            for (uint r = lane; r < RANK; r += 32) {
+                total += float(pred[previous * RANK + r]) * float(hidden[position * RANK + r]) * float(succ[token * RANK + r]);
+            }
+            total = simd_sum(total);
+            if (lane == 0) scores[candidate] = float(unary[position * TOP + candidate]) + total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index_in_threadgroup == 0) {
+            if (grows) {
+                float top = scores[0];
+                for (uint j = 1; j < TOP; ++j) top = max(top, scores[j]);
+                float denominator = 0.0f;
+                for (uint j = 0; j < TOP; ++j) denominator += exp(scores[j] - top);
+                const float log_denominator = log(denominator);
+                for (uint j = 0; j < TOP; ++j) {
+                    frontier[frontier_size] = totals[node] + scores[j] - top - log_denominator;
+                    entries[frontier_size] = node | (j << 8) | (uint(position) << 16);
+                    ++frontier_size;
+                }
+            }
+            float best = -INFINITY;
+            uint at = 0;
+            for (uint i = 0; i < frontier_size; ++i) if (frontier[i] > best) { best = frontier[i]; at = i; }
+            const uint entry = entries[at], from = entry & 255u, j = (entry >> 8) & 255u, p = entry >> 16;
+            frontier[at] = -INFINITY;
+            const uint row = taken++;
+            parents[row] = int(from);
+            tokens[row] = int(ids[p * TOP + j]);
+            depths[row] = depths[from] + 1;
+            totals[row] = best;
+            expand = row;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (thread_index_in_threadgroup == 0) {
+        // Preorder; a node's children are those with its index as parent, in taking order.
+        const uint n = CAP;
+        int stack[CAP], rank[CAP], slots[CAP];
+        uint top = 0, out = 0;
+        stack[top++] = 0;
+        int open_forks = 0;
+        for (uint i = 0; i < n; ++i) slots[i] = -1;
+        while (top > 0) {
+            const uint at = uint(stack[--top]);
+            rank[at] = int(out);
+            tree_tokens[out] = tokens[at];
+            tree_rank[out] = int(at);
+            tree_depth[out] = depths[at];
+            tree_parent[out] = at == 0 ? -1 : rank[parents[at]];
+            for (uint d = 0; d < A; ++d) tree_path[out * A + d] = 0;
+            if (at != 0) {
+                const int up = rank[parents[at]];
+                for (int d = 0; d < depths[at]; ++d) tree_path[out * A + d] = tree_path[up * A + d];
+            }
+            tree_path[out * A + depths[at]] = int(out);
+            uint children = 0;
+            for (int child = int(n) - 1; child > int(at); --child) {
+                if (uint(parents[child]) == at) {
+                    stack[top++] = child;
+                    ++children;
+                }
+            }
+            tree_fork[out] = -1;
+            tree_back[out] = -1;
+            if (children > 1) {
+                // The slot stays this node's while its children run, so nested forks stack up.
+                slots[at] = open_forks++;
+                tree_fork[out] = slots[at];
+            }
+            if (at != 0 && out > 0 && tree_parent[out] != int(out) - 1) {
+                tree_back[out] = slots[parents[at]];
+            }
+            ++out;
+        }
+    }
+"""
+_DRAFT_TREE_ACCEPT = r"""
+    // From the anchor into the child whose token is the target's own after its parent, for as long as there is one.
+    uint at = 0, count = 0;
+    for (uint i = 0; i < L; ++i) path[i] = 0;
+    for (uint row = 1; row < L; ++row) {
+        if (parent[row] == int(at) && tokens[row] == target[at]) {
+            path[++count] = int(row);
+            at = row;
+        }
+    }
+    accepted[0] = int(count);
+    accepted[1] = int(at);
+"""
+
+@functools.cache
+def _draft_tree_kernels():
+    return (mx.fast.metal_kernel(
+        name = "unsloth_draft_tree", input_names = ["pred", "hidden", "succ", "unary", "ids", "anchor"],
+        output_names = ["tree_tokens", "tree_depth", "tree_parent", "tree_path", "tree_fork", "tree_back", "tree_rank"],
+        compile_options = {"math_mode": "safe"}, source = _DRAFT_TREE_KERNEL),
+        mx.fast.metal_kernel(name = "unsloth_draft_tree_accept", input_names = ["tokens", "parent", "target", "L"],
+                             output_names = ["path", "accepted"], source = _DRAFT_TREE_ACCEPT))
+
+
+class DraftTree(NamedTuple):
+    """A drafter's best-first tree: `tokens` [n], row 0 the anchor, `parent` [n], the verify's `block`, and the order each
+    row's node was taken in (`rank`): the rows of rank below m are this lattice's tree of m rows."""
+    tokens: mx.array
+    parent: mx.array
+    block: TreeBlock
+    rank: mx.array
+
+
+def draft_tree(selector, hidden, anchor, candidates, unary, rows):
+    """The first `rows` nodes of the best-first tree over a block's candidate lattice, for one drafting row."""
+    projected = selector.hidden_projection(hidden)
+    pred, succ, top = selector.predecessor_codebook.weight, selector.successor_codebook.weight, candidates.shape[-1]
+    length, depth = hidden.shape[1], min(rows - 1, candidates.shape[1])
+    outputs = _draft_tree_kernels()[0](
+        inputs = [pred, projected, succ, unary, candidates, anchor],
+        template = [("TOP", top), ("LENGTH", length), ("RANK", projected.shape[-1]), ("FRONTIER", rows), ("A", depth + 1)],
+        grid = (32 * top, 1, 1), threadgroup = (32 * top, 1, 1),
+        output_shapes = [(rows,), (rows,), (rows,), (rows, depth + 1), (rows,), (rows,), (rows,)],
+        output_dtypes = [mx.int32] * 7)
+    tokens, depths, parents, path, fork, back, rank = outputs
+    return DraftTree(tokens, parents, TreeBlock(depths, path, fork, back), rank)
+
+
+def draft_tree_accept(tree, target):
+    """(path, accepted): the rows the target's own tokens walk from the anchor, zero padded, and [count, last row]."""
+    return tuple(_draft_tree_kernels()[1](
+        inputs = [tree.tokens, tree.parent, target.astype(mx.int32), tree.tokens.size], grid = (1, 1, 1), threadgroup = (1, 1, 1),
+        output_shapes = [tree.tokens.shape, (2,)], output_dtypes = [mx.int32, mx.int32]))
 
 
 _DRAFT_LAYER_CONTRACT = {_DFLASH2: {"DFlash2DecoderLayer.__call__": "c1adba4d305aaa16"}}
@@ -7247,6 +7475,42 @@ def row_invariant_attention(model, *, _modules = None):
                     module.__class__ = type(module)._unsloth_invariant_native
 
 
+# What a tree verify reproduces of the verifier's one-token positions and the caches' speculation records.
+_TREE_VERIFY_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.language": {"Qwen3_5Attention._prepare_projected_qkv": "19c238671719839f"},
+    "mlx_vlm.models.cache": {"ArraysCache.record_speculative_window": "5d1e2ca5ac5b2419",
+                             "ArraysCache.abort_speculation": "b029b95363a7f3ff", "KVCache.trim": "8c4d89141d5ceded"},
+}
+
+
+@contextmanager
+def row_invariant_tree_verify(model, *, _modules = None):
+    """Fast Verify: let speculative rounds of a language model whose attention layers
+    `row_invariant_attention` holds verify best-first draft trees (`tree_verify`), once `warm_speculative_rounds` has
+    checked and timed them. Nothing changes for a round that verifies a chain."""
+    changed = []
+    try:
+        with _VERIFY_LOCK:
+            for family in SPECULATIVE_FAMILIES.values():
+                pins = family.capabilities.get("tree_verify")
+                call = getattr(getattr(sys.modules.get(family.language), "LanguageModel", None), "__call__", None)
+                if pins is None or call is None or _resolved_bindings(pins) is None:
+                    continue
+                modules = list(_fusion_modules(model, _modules))
+                if not any(isinstance(m, nn.Module) and "_unsloth_invariant_attention" in m.__dict__ for _, m in modules):
+                    continue
+                for module in {id(module): module for _, module in modules if getattr(type(module), "__call__", None) is call}.values():
+                    module.__dict__["_unsloth_tree_verify"] = module.__dict__.get("_unsloth_tree_verify", 0) + 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for module in changed:
+                module.__dict__["_unsloth_tree_verify"] -= 1
+                if not module.__dict__["_unsloth_tree_verify"]:
+                    del module.__dict__["_unsloth_tree_verify"]
+
+
 class _TargetHeadFP32(nn.Module):
     def __init__(self, head, bindings):
         super().__init__()
@@ -7441,6 +7705,23 @@ class _SparseDrafter:
         ids, values = _sparse_head_candidates(head, proposed, shape)
         return _sparse_candidate_walk(selector, proposed, anchor, ids, values, multiplier, ascending = True).astype(token_dtype)
 
+    def tree(self, last_bonus, hidden, cache, block_size, rows):
+        """This block's best-first `DraftTree` of `rows` rows."""
+        model, selector = self.model, self.selector
+        length = int(block_size) - 1
+        shape = self.head_shape(1, length, None, hidden)
+        if shape is None:
+            raise RuntimeError("a draft tree needs the sparse head's lane kernel")
+        anchor = mx.array([last_bonus], mx.int32) if isinstance(last_bonus, int) else last_bonus.reshape(-1).astype(mx.int32)
+        masks = mx.full((1, length), int(model.config.mask_token_id), dtype = mx.int32)
+        proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)[:, 1:]
+        ids, values = _sparse_head_candidates(self.head, proposed, shape)
+        values = values * model.config.output_multiplier
+        chosen = mx.argpartition(values, -selector.top_k, axis = -1)[:, -selector.top_k:]
+        candidates = mx.take_along_axis(ids, chosen, axis = -1).reshape(*proposed.shape[:-1], selector.top_k)
+        unary = mx.take_along_axis(values, chosen, axis = -1).reshape(candidates.shape)
+        return draft_tree(selector, proposed, anchor, candidates, unary, rows)
+
 
 def sparse_drafter(model, target, original):
     module = sys.modules.get(_DFLASH2)
@@ -7519,6 +7800,11 @@ def _append_in_place(cache, keys, values) -> bool:
     return True
 
 
+def _draft_attention_on():
+    return nax.kernel_probe_passed(attention.DRAFT_PROBE_KEY, attention.__name__, "probe_draft_attention",
+                                   attention.invariant_attention_available)
+
+
 @functools.cache
 def _predraft_class(base):
     def __call__(self, x, x_ctx, rope, cache, projected_context = None):
@@ -7554,11 +7840,18 @@ def _predraft_class(base):
         old_keys, old_values = cache.history()
         held = 0 if old_keys is None else old_keys.shape[2]
         # Block rows first, so verified rows keep their places whether the block drafts before or after acceptance.
-        keys = mx.concatenate([prop_keys, ctx_keys] if old_keys is None else [old_keys, prop_keys, ctx_keys], axis = 2)
-        values = mx.concatenate([prop_values, ctx_values] if old_values is None else [old_values, prop_values, ctx_values], axis = 2)
-        mask = mx.concatenate([mx.ones((held + L,), mx.bool_), cache.valid])
-        o = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = self.scale, mask = mask[None, None, None],
-                                                 sinks = self.attention_sink_bias)
+        keys = mx.concatenate([prop_keys, ctx_keys], axis = 2)
+        values = mx.concatenate([prop_values, ctx_values], axis = 2)
+        mask = mx.concatenate([mx.ones((L,), mx.bool_), cache.valid])
+        if held and _draft_attention_on() and attention.draft_attention_supported(queries, old_keys, old_values, keys, values):
+            o = attention.draft_attention(queries, old_keys, old_values, keys, values, mask, self.attention_sink_bias, self.scale)
+        else:
+            if held:
+                keys = mx.concatenate([old_keys, keys], axis = 2)
+                values = mx.concatenate([old_values, values], axis = 2)
+                mask = mx.concatenate([mx.ones((held,), mx.bool_), mask])
+            o = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = self.scale, mask = mask[None, None, None],
+                                                     sinks = self.attention_sink_bias)
         if commit:
             cache.append(commit)
         return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
@@ -7585,6 +7878,7 @@ def predraft_attention(model) -> int:
     for attention in attentions:
         attention.__class__ = _predraft_class(module.DFlashAttention)
         attention.__dict__["_unsloth_lane_bindings"] = bindings
+    _draft_attention_on()   # its probe at load, not in a reply's first round
     # Past a sliding layer's window, the native call would trim the rows the predraft masks.
     return min([a.sliding_window - 1 for a in attentions if a.is_sliding] or [1 << 30])
 
@@ -8044,6 +8338,79 @@ def deeper_causal_verify(rows: int):
         yield
     finally:
         _VERIFY_STATE.causal_rows = outer
+
+
+@contextmanager
+def tree_verify(block):
+    """While open, the forward built verifies its block as `block`'s tree: each row is its path's one-token decode."""
+    outer = getattr(_VERIFY_STATE, "tree", None)
+    _VERIFY_STATE.tree = block
+    try:
+        yield
+    finally:
+        _VERIFY_STATE.tree = outer
+
+
+def tree_commit(transaction, caches, path):
+    """Commit block rows `path` (a list from the anchor) of a tree verify: a prefix of the block as any block's, others
+    by moving their keys and values to the front of the block, and leaving each gated delta layer the path's replay, which
+    the next tree block folds in reading the rows where they are."""
+    if path == list(range(len(path))):
+        transaction.commit([len(path)])
+        return
+    rows, tapes = mx.array(path, mx.int32), transaction.__dict__.pop("_unsloth_tapes", ())
+    windows = [cache._speculation["records"][0] for cache, *_ in tapes]
+    transaction.abort()
+    gather = lambda x: mx.take(x, rows, axis = 1)
+    retained = mx.array([len(path)], mx.uint32)
+    for (cache, index, replay, mask, _), (_, source, width) in zip(tapes, windows):
+        q, k, v, a, b, A_log, dt_bias, entry = replay.args
+        path_replay = functools.partial(replay.func, gather(q), gather(k), gather(v), gather(a), gather(b), A_log, dt_bias, entry,
+                                        **replay.keywords)
+        cache[index] = path_replay(mask = mask)[1]
+        cache._unsloth_pending = (cache[index], path_replay, retained)
+        cache._unsloth_pending_path = (k, v, a, b, rows)
+        taps = mx.concatenate([mx.arange(width, dtype = mx.int32), rows + width])[-width:]
+        cache[0] = mx.take(source, taps, axis = 1)
+    for entry in caches:
+        if isinstance(getattr(entry, "offset", None), int) and getattr(entry, "keys", None) is not None:
+            prefix, length = entry.offset, len(path)
+            entry.keys[..., prefix : prefix + length, :] = mx.take(entry.keys, prefix + rows, axis = 2)
+            entry.values[..., prefix : prefix + length, :] = mx.take(entry.values, prefix + rows, axis = 2)
+            entry.offset = prefix + length
+
+
+def tree_verify_matches(engine) -> bool:
+    """Whether, on `engine`'s live caches, a chain-shaped tree verifies as the chain does and a forked tree's rows as their
+    paths' chains do, bit for bit. Every verify here is undone."""
+    pending = engine._rows[0].pending
+    tokens = [pending, (pending + 1) % 1000, (pending + 2) % 1000, (pending + 3) % 1000]
+
+    def verify(rows, block = None):
+        with mx.stream(engine._stream), tree_verify(block) if block is not None else nullcontext():
+            logits, _, transaction = engine._verify(mx.array([rows], mx.int32))
+        try:
+            mx.eval(logits)
+        finally:
+            transaction.abort()
+        return logits[0]
+
+    table = lambda *rows: mx.array([list(row) + [0] * (4 - len(row)) for row in rows], mx.int32)
+    same = lambda x, y: x.dtype == y.dtype and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+    none = mx.full((4,), -1, mx.int32)
+    chain = TreeBlock(mx.arange(4, dtype = mx.int32), table((0,), (0, 1), (0, 1, 2), (0, 1, 2, 3)), none, none)
+    forked = TreeBlock(mx.array([0, 1, 2, 1], mx.int32), table((0,), (0, 1), (0, 1, 2), (0, 3)),
+                       mx.array([0, -1, -1, -1], mx.int32), mx.array([-1, -1, -1, 0], mx.int32))
+    try:
+        straight = verify(tokens)
+        if not same(straight, verify(tokens, chain)):
+            return False
+        tree = verify(tokens, forked)
+        branch = verify([pending, tokens[3], tokens[1]])
+        return same(tree[:3], straight[:3]) and same(tree[3], branch[1])
+    except (RuntimeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return False
 
 
 @contextmanager
@@ -8686,7 +9053,8 @@ SPECULATIVE_FAMILIES = {
         module = "mlx_vlm.models.qwen3_5.speculative_verifier", forward = "Qwen3_5BatchInvariantForward",
         entry = "verify", submit_layers = True, contract = _EXACT_VERIFY_CONTRACT,
         capabilities = {"attention": _EXACT_ATTENTION_CONTRACT, "lanes": {},
-                        "invariant_attention": _INVARIANT_ATTENTION_CONTRACT}),
+                        "invariant_attention": _INVARIANT_ATTENTION_CONTRACT,
+                        "tree_verify": _TREE_VERIFY_CONTRACT}),
     "qwen4_exp": SpeculativeFamily(
         language = "mlx_vlm.models.qwen4_exp.language", target = "_QWEN4_BATCH_INVARIANT_FORWARD",
         module = "mlx_vlm.models.qwen4_exp.language", forward = "Qwen4ExpBatchInvariantForward",
@@ -8720,6 +9088,7 @@ INFERENCE_SCOPES = [
     InferenceScope(speculative_call, speculative = True),
     InferenceScope(row_invariant_lane_projections, speculative = True, fast_verify = True),
     InferenceScope(row_invariant_attention, speculative = True, fast_verify = True),
+    InferenceScope(row_invariant_tree_verify, speculative = True, fast_verify = True),
     InferenceScope(target_head_precision, speculative = True, fast_verify = True),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
     InferenceScope(fused_decode_attention),

@@ -890,7 +890,9 @@ def _probe_prefill(attend):
 # threadgroup serves FM rows of one KV head (its query heads' rows, head-major, read in place from a contiguous q)
 # over one split: each of its S / 32 simdgroups scores the rows against 32 keys over the whole head dim on matmul2d,
 # one softmax over the split's scores is shared, and the simdgroups then split the head dim to accumulate P.V.
-# A key past a row's own gets probability 0, which leaves that row's maximum, sum and output unchanged.
+# A key past a row's own gets probability 0, which leaves that row's maximum, sum and output unchanged. A row reads its
+# last 16 to 47 keys, from a tile boundary set by its own position, one at a time in position order (_INVARIANT_TAIL),
+# so a draft tree's row can read its ancestors there wherever the block holds them.
 _INVARIANT_SOURCE = """
     constexpr int NS = S / 32;
     constexpr int DP = D / NS >= (FM < 16 ? 16 : 8) ? NS : D / 16;   // matmul2d needs a 16-wide side
@@ -911,9 +913,9 @@ _INVARIANT_SOURCE = """
     const int split = threadgroup_position_in_grid.z / frags;
     const int f0 = threadgroup_position_in_grid.z % frags * FM;
     const int k0 = split * S;
-    int last = 0;
-    for (int f = f0; f < min(f0 + FM, rows); ++f) last = max(last, f % L);
-    if (k0 > N - L + last) return;
+    int bound = 0;
+    for (int f = f0; f < min(f0 + FM, rows); ++f) bound = max(bound, _invariant_bound(N - L + depth[f % L]));
+    if (k0 >= bound) return;
 
     constexpr auto qk_desc = matmul2d_descriptor(FM, 32, D, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
     constexpr auto pv_desc = matmul2d_descriptor(FM, PD, S, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -934,7 +936,7 @@ _INVARIANT_SOURCE = """
     // Simdgroup s owns rows s * RS..; lane takes keys lane + 32j. The softmax overwrites the scores with P.
     _Pragma("unroll") for (int i = 0; i < RS; ++i) {
         const int r = int(s) * RS + i, f = f0 + r;
-        const int visible = f < rows ? N - L + f % L + 1 - k0 : 0;
+        const int visible = f < rows ? _invariant_bound(N - L + depth[f % L]) - k0 : 0;
         threadgroup float* row = sp + r * S;
         float x[S / 32], m = -INFINITY, e = 0.0f;
         _Pragma("unroll") for (int j = 0; j < S / 32; ++j) {
@@ -970,9 +972,9 @@ _INVARIANT_REDUCE = """
     const int d = thread_position_in_threadgroup.x;
     const int row = threadgroup_position_in_grid.y;
     const int splits = (N + S - 1) / S;
-    const int used = (N - L + row % L + S) / S;
+    const int used = (_invariant_bound(N - L + depth[row % L]) + S - 1) / S;
     const ulong base = ulong(row) * splits;
-    float M = -INFINITY;
+    float M = tail_stats[row * 2];
     for (int s = 0; s < used; ++s) M = max(M, stats[(base + s) * 2]);
     float num = 0.0f, den = 0.0f;
     for (int s = 0; s < used; ++s) {
@@ -981,21 +983,68 @@ _INVARIANT_REDUCE = """
         num += w * partials[(base + s) * D + d];
         den += w * stats[(base + s) * 2 + 1];
     }
+    const float ms = tail_stats[row * 2];
+    const float w = ms == M ? 1.0f : fast::exp(ms - M);
+    num += w * tail[ulong(row) * D + d];
+    den += w * tail_stats[row * 2 + 1];
     out[ulong(row) * D + d] = T(num / den);
+"""
+# A row's keys past `_invariant_bound` in fp32, one simdgroup per query head: position order, ancestors through `path`
+# (row r's key at depth d is block row path[r * A + d]) when TREE.
+_INVARIANT_TAIL = """
+    constexpr int QK = D / 32;
+    const int h = threadgroup_position_in_grid.x;
+    const int r = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+    const ushort lane = thread_index_in_simdgroup;
+    const int L = q_shape[2], N = k_shape[2], H = q_shape[1];
+    const int P = N - L, last = P + depth[r], A = path_shape[1];
+    const device T* qp = q + b * q_strides[0] + h * q_strides[1] + r * q_strides[2] + lane * QK * q_strides[3];
+    const device T* kp = k + b * k_strides[0] + (h / G) * k_strides[1] + lane * QK * k_strides[3];
+    const device T* vp = v + b * v_strides[0] + (h / G) * v_strides[1] + lane * QK * v_strides[3];
+    float qr[QK], o[QK], m = numeric_limits<float>::lowest(), e = 0.0f;
+    for (int j = 0; j < QK; ++j) {
+        qr[j] = float(scale) * qp[j * q_strides[3]];
+        o[j] = 0.0f;
+    }
+    for (int i = _invariant_bound(last); i <= last; ++i) {
+        const int key = TREE && i >= P ? P + path[r * A + i - P] : i;
+        float score = 0.0f;
+        for (int j = 0; j < QK; ++j) score += qr[j] * float(kp[key * k_strides[2] + j * k_strides[3]]);
+        score = simd_sum(score);
+        const float top = max(m, score);
+        const float factor = fast::exp(m - top), weight = fast::exp(score - top);
+        m = top;
+        e = e * factor + weight;
+        for (int j = 0; j < QK; ++j) o[j] = o[j] * factor + weight * float(vp[key * v_strides[2] + j * v_strides[3]]);
+    }
+    const ulong row = (ulong(b) * H + h) * L + r;
+    for (int j = 0; j < QK; ++j) tail[row * D + lane * QK + j] = o[j];
+    if (lane == 0) {
+        tail_stats[row * 2] = m;
+        tail_stats[row * 2 + 1] = e;
+    }
+"""
+_INVARIANT_HEADER = """
+    inline int _invariant_bound(int position) { return max(position - 15, 0) / 32 * 32; }
 """
 INVARIANT_KEYS = 256
 INVARIANT_PROBE_KEY = "invariant_attention:" + hashlib.sha256(
-    (_INVARIANT_SOURCE + _INVARIANT_REDUCE + str(INVARIANT_KEYS)).encode()).hexdigest()[:12]
+    (_INVARIANT_SOURCE + _INVARIANT_TAIL + _INVARIANT_HEADER + _INVARIANT_REDUCE + str(INVARIANT_KEYS)).encode()).hexdigest()[:12]
 
 
 @functools.cache
 def _invariant_kernels():
     from .nax import _QMM_HEADER
-    return (mx.fast.metal_kernel(name = "unsloth_invariant_attention", input_names = ["q", "k", "v", "scale"],
-                                 output_names = ["partials", "stats"], header = _QMM_HEADER, source = _INVARIANT_SOURCE,
+    return (mx.fast.metal_kernel(name = "unsloth_invariant_attention", input_names = ["q", "k", "v", "scale", "depth"],
+                                 output_names = ["partials", "stats"], header = _QMM_HEADER + _INVARIANT_HEADER,
+                                 source = _INVARIANT_SOURCE, ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_invariant_attention_tail", input_names = ["q", "k", "v", "scale", "depth", "path"],
+                                 output_names = ["tail", "tail_stats"], header = _INVARIANT_HEADER, source = _INVARIANT_TAIL,
                                  ensure_row_contiguous = False),
-            mx.fast.metal_kernel(name = "unsloth_invariant_attention_reduce", input_names = ["partials", "stats", "L", "N"],
-                                 output_names = ["out"], source = _INVARIANT_REDUCE))
+            mx.fast.metal_kernel(name = "unsloth_invariant_attention_reduce",
+                                 input_names = ["partials", "stats", "tail", "tail_stats", "depth", "L", "N"],
+                                 output_names = ["out"], header = _INVARIANT_HEADER, source = _INVARIANT_REDUCE))
 
 
 def invariant_attention_available():
@@ -1020,23 +1069,153 @@ def invariant_attention_supported(queries, keys, values):
             and keys.shape[1] > 0 and queries.shape[1] % keys.shape[1] == 0 and 1 <= queries.shape[2] <= keys.shape[2])
 
 
-def invariant_attention(queries, keys, values, scale):
+@functools.lru_cache(maxsize = None)
+def _invariant_depths(rows):
+    depths = mx.arange(rows, dtype = mx.int32)
+    mx.eval(depths)
+    return depths
+
+
+_INVARIANT_NO_PATH = mx.zeros((1, 1), mx.int32)
+
+
+def invariant_attention(queries, keys, values, scale, depth = None, path = None):
     """Causal attention of a block's last rows over `keys` (row i sees the first N - L + i + 1), each row's bits those
-    of its own one-row call."""
+    of its own one-row call. Given a draft tree's `depth` per row and each row's `path` from the anchor (block rows
+    [L, A]), a row at depth d sees the prefix and its path instead: its bits are its path's chain's."""
     B, H, L, D = queries.shape
     kv_heads, N = keys.shape[1], keys.shape[2]
     G, frag = H // kv_heads, _invariant_frag()
     rows, splits = L * G, -(-N // INVARIANT_KEYS)
-    first, second = _invariant_kernels()
+    first, tail, second = _invariant_kernels()
+    tree = depth is not None
+    depth = depth if tree else _invariant_depths(L)
     partials, stats = first(
-        inputs = [mx.contiguous(queries), keys, values, scale],
+        inputs = [mx.contiguous(queries), keys, values, scale, depth],
         template = [("T", queries.dtype), ("D", D), ("G", G), ("FM", frag), ("S", INVARIANT_KEYS)],
         grid = (INVARIANT_KEYS * kv_heads, B, splits * -(-rows // frag)), threadgroup = (INVARIANT_KEYS, 1, 1),
         output_shapes = [(B * kv_heads * rows * splits * D,), (B * kv_heads * rows * splits * 2,)],
         output_dtypes = [mx.float32, mx.float32])
-    return second(inputs = [partials, stats, L, N], template = [("T", queries.dtype), ("D", D), ("S", INVARIANT_KEYS)],
+    tails, tail_stats = tail(
+        inputs = [queries, keys, values, scale, depth, path if tree else _INVARIANT_NO_PATH],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("TREE", tree)],
+        grid = (32 * H, L, B), threadgroup = (32, 1, 1),
+        output_shapes = [(B * H * L * D,), (B * H * L * 2,)], output_dtypes = [mx.float32, mx.float32])
+    return second(inputs = [partials, stats, tails, tail_stats, depth, L, N], template = [("T", queries.dtype), ("D", D), ("S", INVARIANT_KEYS)],
                   grid = (D, B * kv_heads * rows, 1), threadgroup = (D, 1, 1),
                   output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
+
+
+# A DFlash drafter layer's attention: every block row reads the whole held window in place, split as above, then the
+# block's own few keys, those not `valid` left out, and a sink per query head, which only takes probability.
+_DRAFT_TAIL = """
+    constexpr int QK = D / 32;
+    const int h = threadgroup_position_in_grid.x;
+    const int r = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+    const ushort lane = thread_index_in_simdgroup;
+    const int L = q_shape[2], N = k_shape[2], H = q_shape[1];
+    const device T* qp = q + b * q_strides[0] + h * q_strides[1] + r * q_strides[2] + lane * QK * q_strides[3];
+    const device T* kp = k + b * k_strides[0] + (h / G) * k_strides[1] + lane * QK * k_strides[3];
+    const device T* vp = v + b * v_strides[0] + (h / G) * v_strides[1] + lane * QK * v_strides[3];
+    float qr[QK], o[QK], m = SINK ? float(sinks[h]) : numeric_limits<float>::lowest(), e = SINK ? 1.0f : 0.0f;
+    for (int j = 0; j < QK; ++j) {
+        qr[j] = float(scale) * qp[j * q_strides[3]];
+        o[j] = 0.0f;
+    }
+    for (int i = 0; i < N; ++i) {
+        if (!valid[i]) continue;
+        float score = 0.0f;
+        for (int j = 0; j < QK; ++j) score += qr[j] * float(kp[i * k_strides[2] + j * k_strides[3]]);
+        score = simd_sum(score);
+        const float top = max(m, score);
+        const float factor = fast::exp(m - top), weight = fast::exp(score - top);
+        m = top;
+        e = e * factor + weight;
+        for (int j = 0; j < QK; ++j) o[j] = o[j] * factor + weight * float(vp[i * v_strides[2] + j * v_strides[3]]);
+    }
+    const ulong row = (ulong(b) * H + h) * L + r;
+    for (int j = 0; j < QK; ++j) tail[row * D + lane * QK + j] = o[j];
+    if (lane == 0) {
+        tail_stats[row * 2] = m;
+        tail_stats[row * 2 + 1] = e;
+    }
+"""
+# A row's depth then names the end of the window: every split is whole but the last.
+_DRAFT_HEADER = """
+    inline int _invariant_bound(int position) { return position; }
+"""
+DRAFT_PROBE_KEY = "draft_attention:" + hashlib.sha256(
+    (_INVARIANT_SOURCE + _DRAFT_TAIL + _DRAFT_HEADER + _INVARIANT_REDUCE + str(INVARIANT_KEYS)).encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _draft_kernels():
+    from .nax import _QMM_HEADER
+    return (mx.fast.metal_kernel(name = "unsloth_draft_attention", input_names = ["q", "k", "v", "scale", "depth"],
+                                 output_names = ["partials", "stats"], header = _QMM_HEADER + _DRAFT_HEADER,
+                                 source = _INVARIANT_SOURCE, ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_draft_attention_tail", input_names = ["q", "k", "v", "scale", "sinks", "valid"],
+                                 output_names = ["tail", "tail_stats"], source = _DRAFT_TAIL, ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_draft_attention_reduce",
+                                 input_names = ["partials", "stats", "tail", "tail_stats", "depth", "L", "N"],
+                                 output_names = ["out"], header = _DRAFT_HEADER, source = _INVARIANT_REDUCE))
+
+
+@functools.lru_cache(maxsize = None)
+def _draft_depths(rows):
+    depths = mx.full((rows,), rows, mx.int32)
+    mx.eval(depths)
+    return depths
+
+
+def draft_attention_supported(queries, keys, values, block_keys, block_values):
+    return (invariant_attention_supported(queries, keys, values) and keys.shape[0] == 1
+            and block_keys.shape[1:2] == keys.shape[1:2] and block_keys.shape[3] == keys.shape[3]
+            and block_keys.dtype == block_values.dtype == keys.dtype and block_keys.shape == block_values.shape)
+
+
+def draft_attention(queries, keys, values, block_keys, block_values, valid, sinks, scale):
+    """Non-causal attention of `[1, H, L, D]` queries over a held window's `keys` and `values`, read in place, and a
+    block's own, of which only those `valid` count, with one sink per query head. Close to stock's, not its bits."""
+    B, H, L, D = queries.shape
+    kv_heads, N = keys.shape[1], keys.shape[2]
+    G, frag = H // kv_heads, _invariant_frag()
+    rows, splits = L * G, -(-N // INVARIANT_KEYS)
+    first, tail, second = _draft_kernels()
+    depth = _draft_depths(L)
+    queries = mx.contiguous(queries)
+    partials, stats = first(
+        inputs = [queries, keys, values, scale, depth],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("FM", frag), ("S", INVARIANT_KEYS)],
+        grid = (INVARIANT_KEYS * kv_heads, B, splits * -(-rows // frag)), threadgroup = (INVARIANT_KEYS, 1, 1),
+        output_shapes = [(B * kv_heads * rows * splits * D,), (B * kv_heads * rows * splits * 2,)],
+        output_dtypes = [mx.float32, mx.float32])
+    tails, tail_stats = tail(
+        inputs = [queries, block_keys, block_values, scale, _INVARIANT_NO_PATH if sinks is None else sinks.astype(mx.float32), valid],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("SINK", sinks is not None)],
+        grid = (32 * H, L, B), threadgroup = (32, 1, 1),
+        output_shapes = [(B * H * L * D,), (B * H * L * 2,)], output_dtypes = [mx.float32, mx.float32])
+    return second(inputs = [partials, stats, tails, tail_stats, depth, L, N], template = [("T", queries.dtype), ("D", D), ("S", INVARIANT_KEYS)],
+                  grid = (D, B * kv_heads * rows, 1), threadgroup = (D, 1, 1),
+                  output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
+
+
+def probe_draft_attention():
+    """Within 2% of stock attention's largest output, at window ends on both sides of a key split."""
+    H, KV, D, L = 32, 8, 128, 8
+    for dtype in (mx.bfloat16, mx.float16):
+        k, v = (mx.random.normal((1, KV, 1024, D), key = mx.random.key(i)).astype(dtype) for i in (1, 2))
+        block_k, block_v = (mx.random.normal((1, KV, 12, D), key = mx.random.key(i)).astype(dtype) for i in (3, 4))
+        q = mx.random.normal((1, H, L, D), key = mx.random.key(5)).astype(dtype)
+        valid = mx.arange(12) < 10
+        for n, sinks in [(n, sinks) for n in (1, 255, 256, 257, 1024) for sinks in (None, mx.random.normal((H,), key = mx.random.key(6)).astype(dtype))]:
+            got = draft_attention(q, k[:, :, :n], v[:, :, :n], block_k, block_v, valid, sinks, D ** -0.5)
+            mask = mx.concatenate([mx.ones((n,), mx.bool_), valid])
+            want = mx.fast.scaled_dot_product_attention(q, mx.concatenate([k[:, :, :n], block_k], axis = 2), mx.concatenate([v[:, :, :n], block_v], axis = 2),
+                                                        scale = D ** -0.5, mask = mask[None, None, None], sinks = sinks)
+            error = mx.abs((got - want).astype(mx.float32)).max().item()
+            assert error <= 0.02 * mx.abs(want.astype(mx.float32)).max().item(), (n, error)
 
 
 def probe_invariant_attention():
@@ -1059,3 +1238,19 @@ def probe_invariant_attention():
                 want = mx.softmax(s, axis = -1) @ vf
             error = mx.abs(got[0].astype(mx.float32) - want).max().item()
             assert error <= 0.02 * mx.abs(want).max().item(), (H, KV, D, prefix, L, error)
+        # A tree's rows, across a tile and a split boundary: each its own path's chain, whatever its block holds.
+        parents = [-1, 0, 1, 1, 3, 0, 5, 6]
+        depth, paths = [], []
+        for parent in parents:
+            depth.append(0 if parent < 0 else depth[parent] + 1)
+            paths.append(([] if parent < 0 else paths[parent]) + [len(paths)])
+        A = max(depth) + 1
+        table = mx.array([path + [0] * (A - len(path)) for path in paths], mx.int32)
+        for prefix in (0, 40, 250, 1000):
+            q = mx.random.normal((1, H, len(parents), D), key = mx.random.key(prefix + 7)).astype(dtype)
+            n = prefix + len(parents)
+            got = invariant_attention(q, k[:, :, :n], v[:, :, :n], D ** -0.5, mx.array(depth, mx.int32), table)
+            for row, path in enumerate(paths):
+                order = mx.array(list(range(prefix)) + [prefix + i for i in path])
+                one = invariant_attention(q[:, :, row:row + 1], k[:, :, order], v[:, :, order], D ** -0.5)
+                assert mx.array_equal(one.view(mx.uint16), got[:, :, row:row + 1].view(mx.uint16)).item(), (H, KV, D, prefix, row)

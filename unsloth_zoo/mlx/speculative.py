@@ -135,7 +135,8 @@ class RoundPlan:
     ``split`` asks the engine to evaluate drafts and catch-up before building the verify, so
     the round's components can be timed apart. A nonzero ``controller_depth`` marks a round
     drafted deeper than planned; acceptance learns only through that depth. ``trim`` asks
-    the controller to choose the verified prefix from the drafter's confidences.
+    the controller to choose the verified prefix from the drafter's confidences. A nonzero
+    ``tree`` verifies that many rows of a best-first draft tree in the round's place.
     """
 
     kind: Literal["plain", "round"]
@@ -144,6 +145,7 @@ class RoundPlan:
     split: bool = False
     controller_depth: int = 0
     trim: bool = False
+    tree: int = 0
 
     @property
     def width(self) -> int:
@@ -1061,6 +1063,53 @@ class DraftController:
         self._measured_at[self._identity(plan, bucket)] = self.steps
 
 
+class TreeBudget:
+    """How many rows of a best-first draft tree a round verifies, or a chain instead: the most tokens per second at this
+    Mac's cycle costs measured at load (``{rows: seconds}``, as `warm_speculative_rounds` times them) and the tokens rounds
+    actually emitted. A round of the widest tree holds the narrower trees and the chain of its lattice, so each tells what
+    they would have emitted on the same text: no calibration of the drafter's probabilities, and until enough such
+    rounds are in, or one in ``PROBE_EVERY`` rounds after, a round runs the widest tree."""
+
+    MIN_SAMPLES = 24
+    PROBE_EVERY = 8
+    ALPHA = 1 / 32
+    # A shallower tree or chain, on the trained block's own lattice, accepts this much more than on a deeper block's.
+    TRAINED_BLOCK_GAIN = 1.035
+
+    def __init__(self, tree_costs: dict[int, float], chain_costs: dict[int, float], trained_rows: int = 0):
+        self.tree_costs, self.chain_costs, self.trained_rows = tree_costs, chain_costs, trained_rows
+        self.reset_samples()
+
+    def reset_samples(self) -> None:
+        self.trees = {rows: _Ema() for rows in self.tree_costs}
+        self.chains = {rows: _Ema() for rows in self.chain_costs}
+        self._since_wide = 0
+
+    def observe(self, width: int, ranks: Sequence[int], first_children: int) -> None:
+        """A verify of ``width`` rows took a path whose nodes were taken in the order ``ranks``, its first ``first_children`` the first child of the one before."""
+        if width != max(self.tree_costs):
+            return
+        for rows, emitted in self.trees.items():
+            emitted.update(1 + next((i for i, rank in enumerate(ranks) if rank >= rows), len(ranks)), self.ALPHA)
+        for rows, emitted in self.chains.items():
+            emitted.update(1 + min(first_children, rows - 1), self.ALPHA)
+
+    def _rate(self, emitted: _Ema, cost: float, rows: int) -> float:
+        gain = self.TRAINED_BLOCK_GAIN if rows <= self.trained_rows < max(self.tree_costs) else 1.0
+        return gain * emitted.value / cost
+
+    def choose(self) -> int:
+        """The rows of the next tree; 0 for a chain."""
+        widest = max(self.tree_costs)
+        self._since_wide += 1
+        if self.trees[widest].count < self.MIN_SAMPLES or self._since_wide >= self.PROBE_EVERY:
+            self._since_wide = 0
+            return widest
+        rows = max(self.tree_costs, key = lambda n: self._rate(self.trees[n], self.tree_costs[n], n))
+        chain = max(self._rate(self.chains[w], cost, w) for w, cost in self.chain_costs.items())
+        return rows if self._rate(self.trees[rows], self.tree_costs[rows], rows) >= chain else 0
+
+
 # Speculative decoding engine over an mlx-vlm model: verify rounds and plain windows for B rows.
 
 
@@ -1388,7 +1437,7 @@ class SpeculativeEngine:
         prepared, self._prepared_plan = self._prepared_plan, None
         if self._rounds_allowed():
             plan = self.controller.plan(states) if prepared is None else self.controller.plan(states, prepared)
-            plan = self._extend(plan, states)
+            plan = self._tree_plan(self._extend(plan, states), states)
         else:
             room = min((row.remaining for row in self._rows if row.remaining is not None), default = None)
             plan = RoundPlan("plain", self.controller.max_window if room is None else min(room, self.controller.max_window))
@@ -1456,6 +1505,24 @@ class SpeculativeEngine:
             return plan
         # Without the load's deepened cycle costs a deep block verifies whole: the gate then compares it with the planned depth.
         return replace(plan, rows = (RowPlan("draft", depth),), controller_depth = trained, trim = trims)
+
+    def _tree_plan(self, plan: RoundPlan, states: list[RowState]) -> RoundPlan:
+        budget = getattr(self.drafter, "tree_budget", None)
+        if (budget is None or not self.lm.__dict__.get("_unsloth_tree_verify") or plan.kind != "round" or len(plan.rows) != 1
+                or plan.rows[0].source != "draft" or (plan.split and not plan.trim) or self.controller._reference is not None
+                or self._rows[0].sample.temperature != 0 or self._rows[0].processors):
+            for row in self._rows:
+                if row.draft is not None:
+                    row.draft.tree_rows = 0
+            return plan
+        rows = budget.choose()
+        draft = self._rows[0].draft
+        draft.tree_rows = rows
+        # A block drafted ahead keeps the width it was drafted at; a choice applies from the next block.
+        rows = rows if draft.prefetched_tree is None else draft.prefetched_tree.tokens.size
+        if not rows or states[0].remaining == 1:
+            return plan
+        return replace(plan, tree = rows)
 
     def _observe_extension(self, plan: RoundPlan, states: list[RowState], accepted: Sequence[int]) -> None:
         # A wider verify only repays its rows while rounds keep accepting at least the trained depth; a shorter one ends the run.
@@ -1545,9 +1612,60 @@ class SpeculativeEngine:
         ran = steps - (2 if pipelined else 1)
         self.controller.record_plain(states, steps, end - start, (end - started) / ran if ran > 0 else None)
 
+    def _tree_round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]]:
+        """A round verifying a best-first tree as one block: the emitted tokens are the target's along the branch it agrees with."""
+        from .inference import draft_tree_accept, first_use_work, tree_commit, tree_verify
+
+        row, draft = self._rows[0], self._rows[0].draft
+        start, work = time.perf_counter(), first_use_work()
+        with mx.stream(self._stream):
+            tree = self.drafter.tree(draft, plan.tree)
+            mx.async_eval(tree.tokens)
+        with mx.stream(self._stream), tree_verify(tree.block):
+            logits, hidden, transaction = self._verify(tree.tokens[None])
+        try:
+            with mx.stream(self._stream):
+                target, scores = row.draw(row.logprobs(logits[0]), row.emitted)
+                path, walked = draft_tree_accept(tree, target)
+            mx.async_eval(target, path, walked, *([] if scores is None else [scores]))
+            with mx.stream(self._stream):
+                self.drafter.predraft(draft, mx.take(hidden[0], path, axis = 0), walked[0], target[walked[1]])
+            mx.eval(target, path, walked, tree.rank, *([] if scores is None else [scores]))
+            tokens, count, last = tree.tokens.tolist(), walked[0].item(), walked[1].item()
+            if tokens[0] != row.pending:
+                raise RuntimeError("a draft tree must start from its row's pending token")
+            rows = path.tolist()[: count + 1]
+            target = target.tolist()
+            row.draft_n += plan.tree - 1
+            row.draft_n_accepted += count
+            scores = None if scores is None else [scores[r].item() for r in rows]
+            taken = row.take([tokens[r] for r in rows[1:]] + [target[last]], scores)
+            if taken:
+                with mx.stream(self._stream):
+                    self.drafter.push(draft, taken, mx.take(hidden[0], mx.array(rows[: len(taken)], mx.int32), axis = 0))
+            with mx.stream(self._stream):
+                self.drafter.prefetch([None if row.finished else draft])
+            tree_commit(transaction, self.cache, rows)
+        except BaseException:
+            transaction.abort()
+            raise
+        mx.async_eval([_committed_eval_state(entry) for entry in [*self.cache, *(self.draft_cache or [])]])
+        if self.drafter.tree_budget is not None:
+            ranks = tree.rank.tolist()
+            first_children = next((i for i in range(1, len(rows)) if rows[i] != rows[i - 1] + 1), len(rows)) - 1
+            self.drafter.tree_budget.observe(tree.tokens.size, [ranks[r] for r in rows[1:]], first_children)
+        self.controller.record_round(
+            replace(plan, tree = 0, trim = False, split = False, rows = (RowPlan("draft", plan.tree - 1),),
+                    controller_depth = self.drafter.trained_depth),
+            states, [count], seconds = time.perf_counter() - start, first_use = first_use_work() != work)
+        self._prepare_next_plan()
+        return [taken]
+
     def _round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]] | None:
         from .inference import first_use_work
 
+        if plan.tree:
+            return self._tree_round(plan, states)
         rows, width = self._rows, plan.width
         proposals = [
             row.proposer.propose(row.tokens, spec.length) if spec.source == "copy" else []
@@ -2278,6 +2396,9 @@ class ContextRow:
         self.features: list[mx.array] = []
         self.prefetched: mx.array | None = None
         self.prefetched_confidence: mx.array | None = None
+        # The block a tree round reads, drafted ahead like `prefetched`, for a next round of `tree_rows` rows.
+        self.prefetched_tree = None
+        self.tree_rows = 0
         # Whether `prefetched` moved a backlog of at least the drafter's `max_lag` rows into the context cache.
         self.flushed = False
         self.predrafted: list | None = None
@@ -2286,7 +2407,7 @@ class ContextRow:
 
     @property
     def ready(self) -> bool:
-        return bool(self.features) or self.prefetched is not None
+        return bool(self.features) or self.prefetched is not None or self.prefetched_tree is not None
 
 
 class ContextDrafter:
@@ -2321,7 +2442,7 @@ class ContextDrafter:
         if attentions and all(a.is_sliding for a in attentions):
             self.context_rows = max(a.sliding_window - 1 for a in attentions)
         # DFlash2's selector reports each drafted position's probability, from which the controller trims a round.
-        # Fast Verify's dense rounds verify whole tiles instead.
+        # Fast Verify's dense rounds verify whole tiles or trees instead.
         enabled = not self.fast_verify or any(hasattr(module, "switch_mlp") for _, module in target.named_modules())
         self._selector = getattr(model, "candidate_selector", None) if enabled else None
         if self._selector is not None:
@@ -2332,6 +2453,9 @@ class ContextDrafter:
         self.deepened_costs: tuple[float, dict[int, float]] | None = None
         # Set by `warm_speculative_rounds`: {width: seconds of a copy round}, from the trained block's width to the widest.
         self.copy_costs: dict[int, float] | None = None
+        # Set by `warm_speculative_rounds` where this load's rounds may verify draft trees.
+        self.tree_budget: TreeBudget | None = None
+        self.tree_widths: tuple[int, ...] = ()
 
     @property
     def config(self):
@@ -2361,6 +2485,7 @@ class ContextDrafter:
             return
         # A prefetched block drafted from a context these tokens extend; its own context stays cached.
         row.pending, row.prefetched, row.prefetched_confidence, row.flushed = int(tokens[-1]), None, None, False
+        row.prefetched_tree = None
         row.features.append(hidden)
         if sum(len(chunk) for chunk in row.features) >= self.max_lag:
             # The block moving the backlog into the context cache is the next one, so a long prompt drafts at once.
@@ -2383,7 +2508,7 @@ class ContextDrafter:
         block = self._draft(*args, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
         return block, None if self._selector is None else self._selector.__dict__.pop("_unsloth_confidence", None)
 
-    def _block(self, row: ContextRow, depth: int) -> mx.array:
+    def _context(self, row: ContextRow) -> mx.array:
         if row.features:
             context = (row.features[0] if len(row.features) == 1 else mx.concatenate(row.features))[None]
             row.features = []
@@ -2392,15 +2517,27 @@ class ContextDrafter:
                 context = context[:, skip:]
                 for entry in row.cache:
                     entry.offset += skip
-            if self.extended_depth > self.trained_depth:
-                row.empty_context = mx.zeros((1, 0, context.shape[-1]), context.dtype)
-        else:
-            # A wider request reuses context without appending it twice.
-            context = row.empty_context
-            if context is None:
-                raise RuntimeError("a context block needs committed features")
-        block, row.prefetched_confidence = self._drafted(row.pending, context, row.cache, depth + 1)
+            row.empty_context = mx.zeros((1, 0, context.shape[-1]), context.dtype)
+            return context
+        # A wider request reuses context without appending it twice.
+        if row.empty_context is None:
+            raise RuntimeError("a context block needs committed features")
+        return row.empty_context
+
+    def _block(self, row: ContextRow, depth: int) -> mx.array:
+        block, row.prefetched_confidence = self._drafted(row.pending, self._context(row), row.cache, depth + 1)
         return block
+
+    def tree(self, row: ContextRow, rows: int):
+        """The next `DraftTree` of about ``rows`` rows: one already drafted ahead, whichever width it was drafted at."""
+        tree, row.prefetched_tree = row.prefetched_tree, None
+        row.prefetched = row.prefetched_confidence = None
+        return self._tree(row.pending, self._context(row), row.cache, rows) if tree is None else tree
+
+    def _tree(self, anchor, context: mx.array, cache: list, rows: int):
+        # Rows within the trained block read its lattice, which accepts a little more than a deeper block's first rows.
+        depth = self.trained_depth if rows <= self.trained_depth + 1 else self.extended_depth
+        return self._draft.tree(anchor, context, cache, depth + 1, rows)
 
     def extension_serves(self, row: ContextRow, depth: int) -> bool:
         """Whether a block of ``depth`` drafts for ``row`` now runs on the sparse producer, the only one deeper rounds are
@@ -2417,7 +2554,10 @@ class ContextDrafter:
         """Draft each ready row's next block now, at its last requested depth between the trained and extended depths;
         ``draft`` reads it unless a ``push`` comes first."""
         for row in rows:
-            if row is not None and row.features:
+            if row is not None and row.features and row.tree_rows:
+                row.prefetched_tree = self._tree(row.pending, self._context(row), row.cache, row.tree_rows)
+                mx.async_eval(row.prefetched_tree.tokens)
+            elif row is not None and row.features:
                 depth = self._prepared_depth(row)
                 row.prefetched = self._block(row, depth).reshape(1, depth)
                 mx.async_eval(row.prefetched)
@@ -2426,15 +2566,18 @@ class ContextDrafter:
         """Prepare ``row``'s next block before its round's acceptance reaches the host: ``hidden`` holds
         the round's verified rows, of which the round takes the first ``accepted + 1`` (a device scalar), and ``anchor``
         is the token after them. The next ``push`` appends those rows' context; ``discard`` drops the block instead."""
-        if row.features or row.prefetched is not None or not 0 < hidden.shape[0] <= self.predraft_rows:
+        if row.features or row.prefetched is not None or row.prefetched_tree is not None or not 0 < hidden.shape[0] <= self.predraft_rows:
             return False
         from .inference import PredraftCache
 
         valid = mx.arange(hidden.shape[0]) <= accepted
         row.predrafted = [PredraftCache(entry, valid, accepted + 1 + entry.offset) for entry in row.cache]
         depth = self._prepared_depth(row)
-        if self.extended_depth > self.trained_depth:
-            row.empty_context = mx.zeros((1, 0, hidden.shape[-1]), hidden.dtype)
+        row.empty_context = mx.zeros((1, 0, hidden.shape[-1]), hidden.dtype)
+        if row.tree_rows:
+            row.prefetched_tree = self._tree(anchor.reshape(1), hidden[None], row.predrafted, row.tree_rows)
+            mx.async_eval(row.prefetched_tree.tokens)
+            return True
         block, row.prefetched_confidence = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, depth + 1)
         row.prefetched = block.reshape(1, depth)
         mx.async_eval(row.prefetched)
@@ -2449,9 +2592,12 @@ class ContextDrafter:
         blocks, self.confidence = [], []
         for row in rows:
             confidence = None
+            # A block drafted ahead as a tree took its context in; this block drafts from the same context.
+            stale_tree = row is not None and row.prefetched_tree is not None
             if row is not None:
                 row.requested_depth = depth
-            if row is None or not row.ready:
+                row.prefetched_tree = None
+            if row is None or not (row.ready or stale_tree):
                 blocks.append(mx.zeros((1, depth), mx.int32))
             elif row.prefetched is not None:
                 block = row.prefetched if depth <= row.prefetched.shape[-1] else self._block(row, depth).reshape(1, depth)
@@ -2520,6 +2666,10 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
                     # Rows within the tile cost the same, so a draft round verifies the whole trained block, or the tile.
                     drafter.min_verify_rows = min(drafter.trained_depth + 1, rows)
             drafter.extended_depth = max(drafter.trained_depth, rows - 1)
+            # On a sparse target each row brings its own experts, and a chain trimmed to each lattice's confidences beat
+            # every fixed tree width measured.
+            if not any(hasattr(module, "switch_mlp") for _, module in target.named_modules()):
+                drafter.tree_widths = (drafter.trained_depth + 1, 16) if drafter.extended_depth >= 15 else (drafter.trained_depth + 1,)
         if not lazy and fast_verify_covers(target):
             language.__dict__["_unsloth_warm_drafter"] = weakref.ref(drafter)  # for `warm_speculative_rounds`
     drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
@@ -2528,6 +2678,38 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
 
 
 _WARM_ROUNDS_PROMPT = 64
+
+
+def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
+    """Admit draft trees where their rows match their paths' chains here, and time a cycle at each width they may verify."""
+    from .inference import _unless_failed_buffer, tree_verify_matches
+
+    if not drafter.tree_widths or not engine.lm.__dict__.get("_unsloth_tree_verify") or not tree_verify_matches(engine):
+        return
+    row = engine._rows[0]
+
+    def cycles(plan: RoundPlan) -> float:
+        seconds = []
+        row.draft.tree_rows = plan.tree
+        for _ in range(5):  # The first ones run any first-use work.
+            start = time.perf_counter()
+            engine._round(plan, engine._states())
+            mx.synchronize(engine._stream)
+            seconds.append(time.perf_counter() - start)
+        return min(seconds[2:])
+
+    try:
+        plan = lambda n: RoundPlan("round", rows = (RowPlan("draft", n - 1),), tree = n)
+        trees = {n: cycles(plan(n)) for n in drafter.tree_widths}
+        cycles(plan(drafter.tree_widths[0]))   # A narrower tree folding a wider one's rows is a check of its own.
+    except RuntimeError as error:   # A width whose fused verify block was refused has no tree.
+        _unless_failed_buffer(error)
+        return
+    finally:
+        row.draft.tree_rows = 0
+    trained = drafter.trained_depth
+    chain = cycles(RoundPlan("round", rows = (RowPlan("draft", trained),)))
+    drafter.tree_budget = TreeBudget(trees, {trained + 1: chain}, trained + 1)
 
 
 def warm_speculative_rounds(model) -> None:
@@ -2569,6 +2751,7 @@ def warm_speculative_rounds(model) -> None:
                     return
         if all(map(timed, widths)):
             drafter.copy_costs = {width: verify[width].value for width in widths}
+        _warm_trees(engine, drafter)
         if not drafter.confidences or widest == trained:
             return
 

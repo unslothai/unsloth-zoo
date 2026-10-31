@@ -19,6 +19,7 @@ import pytest
 
 pytest.importorskip("mlx.core")
 from unsloth_zoo.mlx.speculative import (
+    TreeBudget,
     DraftController, NgramProposer, RoundPlan, RowPlan, RowState, SpeculativeEngine, _Calibration, _CycleCosts, _Ema, _upper,
 )
 
@@ -785,3 +786,27 @@ def test_prepared_plans_preserve_controller_state_and_choices():
             else:
                 c.record_plain(s, actual.length, 0.02 * actual.length, 0.02)
     assert controller.cycle_cost[2].points[4][1] == 64
+def test_tree_budget_runs_the_widest_tree_until_measured_then_the_best_rate_and_keeps_probing():
+    budget = TreeBudget({8: 1.0, 16: 1.1}, {8: 1.0}, trained_rows = 8)
+    assert {budget.choose() for _ in range(budget.MIN_SAMPLES)} == {16}
+    # Every path here reached depth 6 within the first 8 rows: 16 rows' price buys nothing. A narrower round moves nothing.
+    for _ in range(budget.MIN_SAMPLES):
+        budget.observe(16, [1, 2, 3, 4, 5, 6], 3)
+    before = budget.trees[16].value
+    budget.observe(8, [1], 1)
+    assert budget.trees[16].value == before
+    picks = [budget.choose() for _ in range(2 * budget.PROBE_EVERY)]
+    assert picks.count(16) == 2 and picks.count(8) == 2 * budget.PROBE_EVERY - 2
+    # Deep paths past rank 8 pay for the rows.
+    for _ in range(4 * budget.MIN_SAMPLES):
+        budget.observe(16, [1, 2, 9, 10, 11, 12, 13, 14], 2)
+    assert budget.trees[16].value > 8 and budget.trees[8].value < 4 and budget.choose() == 16
+    # A chain emits at most its rows; a lattice whose paths are first children, at a dearer tree cycle, runs the chain.
+    budget = TreeBudget({8: 1.1}, {8: 1.0}, trained_rows = 8)
+    for _ in range(budget.MIN_SAMPLES):
+        budget.observe(8, list(range(1, 15)), 14)
+    assert budget.chains[8].value == 8
+    picks = [budget.choose() for _ in range(budget.PROBE_EVERY)]
+    assert picks.count(0) == budget.PROBE_EVERY - 1 and picks.count(8) == 1
+
+
