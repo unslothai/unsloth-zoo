@@ -378,6 +378,15 @@ def test_shaped_restores_placeholders_set_before_a_failure():
     assert a.shape == (0,) and b.shape == (0,)
 
 
+def test_shaped_leaves_a_block_fetched_inside_the_context():
+    import types
+    w = nn.Parameter(torch.empty(0), requires_grad = False)
+    blk = types.SimpleNamespace(resident = False, params = [w], empties = [w.data], sig = [((4, 8),)])
+    with BlockSwap.shaped(types.SimpleNamespace(blocks = [blk])):
+        w.data, blk.resident = torch.ones(4, 8), True  # what a fetch does
+    assert w.shape == (4, 8) and w.sum() == 32
+
+
 def test_state_dict_follows_weights_renamed_after_install():
     # from_pretrained(offload_layers = N) installs before PEFT wraps each Linear in a base_layer.
     if not torch.cuda.is_available():

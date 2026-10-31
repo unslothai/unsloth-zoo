@@ -544,12 +544,14 @@ class BlockSwap:
             for b in self.blocks:
                 if not b.resident:
                     for p, e, sig in zip(b.params, b.empties, b.sig):
-                        held.append((p, e))
+                        held.append((b, p, e))
                         p.data = e.new_zeros(()).expand(sig[0])
             yield
         finally:
-            for p, e in held:
-                p.data = e
+            # A block fetched inside the context holds real weights now: leave it.
+            for b, p, e in held:
+                if not b.resident:
+                    p.data = e
 
     def host_bytes(self):
         return sum(b.nbytes() for b in self.blocks)
