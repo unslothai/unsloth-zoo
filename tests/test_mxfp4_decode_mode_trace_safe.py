@@ -88,3 +88,25 @@ def test_hip_never_probes_the_hardware_convert(monkeypatch, cvt_env):
     monkeypatch.setattr(mg, "_decode_probe_kernel", type("K", (), {"__getitem__": lambda self, grid: launched.append(grid)})())
     assert mg._cvt_ok(0, eager = True) is False
     assert not launched
+
+
+def test_capture_on_either_device_defers_the_probe(monkeypatch):
+    # Capturing on the current GPU or on the operand's GPU: both must defer (the probe syncs).
+    import contextlib
+    monkeypatch.setenv("UNSLOTH_MXFP4_CVT", "1")
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = None: (10, 0))
+    current = {"index": 0}
+
+    @contextlib.contextmanager
+    def device(index):
+        previous, current["index"] = current["index"], index
+        try:
+            yield
+        finally:
+            current["index"] = previous
+
+    monkeypatch.setattr(torch.cuda, "device", device)
+    for capturing in (0, 1):
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda c = capturing: current["index"] == c)
+        assert mg._cvt_ok(1) is None, capturing
