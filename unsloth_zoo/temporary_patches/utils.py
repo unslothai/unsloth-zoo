@@ -51,6 +51,7 @@ import contextlib
 import functools
 import inspect
 import threading
+import sys
 import weakref
 import typing as t
 import torch
@@ -1955,6 +1956,16 @@ def _settle_abandoned_checkpoint_generator():
 UNSLOTH_DECODE_COMPILE = [False]
 # [weakref to an eager stance Unsloth installed (True if torch has none), stance it replaced]
 UNSLOTH_EAGER_STANCE_OWNED = []
+# Shared by all generated modules; reset per generate() or decode step 1 skips compile.
+UNSLOTH_INFERENCE_RUNS = [0]
+
+
+def unsloth_reset_inference_runs():
+    UNSLOTH_INFERENCE_RUNS[0] = 0
+    # Older-zoo modules kept by UNSLOTH_COMPILE_OVERWRITE=0 keep their own INFERENCE_RUNS.
+    for name, module in list(sys.modules.items()):
+        if name.startswith("unsloth_compiled_module_") and type(getattr(module, "INFERENCE_RUNS", None)) is int:
+            module.INFERENCE_RUNS = 0
 
 
 def _owned_stance(entry):
