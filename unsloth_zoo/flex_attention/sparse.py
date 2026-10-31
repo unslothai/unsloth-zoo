@@ -14,7 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Shared switches and engagement counters for the sparse-attention fast paths (DeepSeek-V3.2 / GLM-MoE-DSA / MiniMax-M3 / DeepSeek-V4)."""
+"""Shared switches and engagement counters for the sparse-attention fast paths
+(DeepSeek-V3.2 / GLM-MoE-DSA / MiniMax-M3 / DeepSeek-V4 / GLM-5.3-Flash)."""
 
 import os
 
@@ -24,6 +25,7 @@ __all__ = [
     "SPARSE_ATTN_STATS",
     "sparse_skip_full_enabled",
     "sparse_flex_enabled",
+    "sparse_flex_opted_in",
     "sparse_indexer_chunked_enabled",
     "record_sparse_attn",
     "reset_sparse_attn_stats",
@@ -50,6 +52,11 @@ def sparse_flex_enabled():
     return os.environ.get("UNSLOTH_SPARSE_ATTN_FLEX", "1") != "0"
 
 
+def sparse_flex_opted_in(family):
+    """Opt-in flex paths (slower than dense on the GPUs measured): on only with UNSLOTH_SPARSE_ATTN_FLEX_<FAMILY>=1."""
+    return sparse_flex_enabled() and os.environ.get(f"UNSLOTH_SPARSE_ATTN_FLEX_{family.upper()}", "0") == "1"
+
+
 def sparse_indexer_chunked_enabled():
     """UNSLOTH_SPARSE_INDEXER_CHUNKED=0 keeps upstream's unchunked indexer scoring above the budget."""
     return os.environ.get("UNSLOTH_SPARSE_INDEXER_CHUNKED", "1") != "0"
@@ -67,9 +74,13 @@ def reset_sparse_attn_stats():
 
 
 def additive_bias_present(mask, visible, kind = None):
-    """Whether an additive float mask has finite nonzero entries (flex adds them via score_mod); eager is a host sync;
-    under CUDA graph capture the warm-up answer per kind and shape is reused: a warm-up bias is kept, none seen
-    asserts no bias on device (a finite bias raises), unseen shapes keep it."""
+    """Whether an additive float mask holds finite nonzero entries (not just 0 / masked), which flex adds
+    through a score_mod (5-15% slower). Eager this is a host sync. Under CUDA graph capture a sync invalidates
+    the capture, and flipping the answer would need a kernel compiled during capture, so the eager warm-up's
+    answer for the same caller kind and shape is reused (each kind has its own compiled kernels): a bias in
+    any warm-up call of that kind and shape keeps the bias; with none,
+    no bias is asserted on device at every replay (a finite bias raises instead of being dropped); a shape
+    never run eagerly keeps the bias."""
     key = (kind, mask.device, mask.dtype, tuple(mask.shape))
     if mask.is_cuda and torch.cuda.is_current_stream_capturing():
         if _BIAS_SEEN.get(key) is False:
@@ -89,8 +100,9 @@ def _same(tensor):
 
 
 def probe_flex_backward(key, fn, args):
-    """Runs fwd and bwd once per key on detached aliases so a failing flex backward raises inside the caller's
-    try/except (which latches the dense path), not in loss.backward(); aliases share storage so kernels are reused."""
+    """Run fwd + bwd of `fn(*args)` once per `key` on detached aliases so a failing flex backward raises
+    inside the caller's try / except (latching the dense path) instead of in loss.backward().
+    Aliases share storage / strides, so the real call reuses the compiled kernels."""
     if torch.compiler.is_compiling() or not torch.is_grad_enabled() or key in _BACKWARD_OK:
         return
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
