@@ -968,6 +968,22 @@ def _legacy_update(module):
     return _make_update_dispatch(torch_function)
 
 
+def _hub_layer_torch_function(current):
+    """The torch fallback inside a kernels hub layer (kernels turns a decorated function into a
+    ``Func()`` module whose class forward closes over the transformers wrapper), else None."""
+    if not isinstance(current, torch.nn.Module):
+        return None
+    for cell in getattr(getattr(type(current), "forward", None), "__closure__", None) or ():
+        try:
+            inner = cell.cell_contents
+        except ValueError:
+            continue
+        torch_function = getattr(inner, "__wrapped__", None) if callable(inner) else None
+        if callable(torch_function):
+            return torch_function
+    return None
+
+
 def _rebind_name(module, name, legacy, patched_decorator):
     current = vars(module)[name]
     if current is None:
@@ -976,7 +992,8 @@ def _rebind_name(module, name, legacy, patched_decorator):
         return True
     if _is_marked(current):
         return True
-    torch_function = getattr(current, "__wrapped__", None)
+    # A modeling module imported before the patch holds the kernels layer, which has no __wrapped__.
+    torch_function = getattr(current, "__wrapped__", None) or _hub_layer_torch_function(current)
     if torch_function is None or patched_decorator is None:
         return False
     setattr(module, name, patched_decorator(name, "causal_conv1d")(torch_function))
