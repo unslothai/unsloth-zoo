@@ -847,7 +847,8 @@ def _router_hook(layer_index, compact = None):
 def _input_addresses(tensors):
     # Zero padded to one slot per tensor (static shape); a tensor, not a set, to flow through a graph.
     out = sorted({x.data_ptr() for x in tensors if x.numel() > 0})
-    return torch.tensor(out + [0] * (len(tensors) - len(out)), dtype = torch.int64)
+    # Host metadata read back with tolist(): pin to CPU so a default device cannot move it.
+    return torch.tensor(out + [0] * (len(tensors) - len(out)), dtype = torch.int64, device = "cpu")
 
 
 def _identity_mask(layer_input, recorded):
@@ -856,7 +857,7 @@ def _identity_mask(layer_input, recorded):
     shared = [len(now.intersection(r.tolist())) for r in recorded]
     best = max(shared, default = 0)
     unique = best > 0 and shared.count(best) == 1
-    return torch.tensor([not unique or n == best for n in shared], dtype = torch.bool)
+    return torch.tensor([not unique or n == best for n in shared], dtype = torch.bool, device = "cpu")
 
 
 _CUSTOM_OP_PARAMS = frozenset(inspect.signature(torch.library.custom_op).parameters)
@@ -912,7 +913,7 @@ def _layer_inputs_impl(tensors: typing.List[torch.Tensor]) -> torch.Tensor:
 
 
 def _layer_inputs_fake(tensors):
-    return torch.empty(len(tensors), dtype = torch.int64)
+    return torch.empty(len(tensors), dtype = torch.int64, device = "cpu")
 
 
 def _identity_mask_impl(layer_input: torch.Tensor, recorded: typing.List[torch.Tensor]) -> torch.Tensor:
@@ -920,7 +921,7 @@ def _identity_mask_impl(layer_input: torch.Tensor, recorded: typing.List[torch.T
 
 
 def _identity_mask_fake(layer_input, recorded):
-    return torch.empty(len(recorded), dtype = torch.bool)
+    return torch.empty(len(recorded), dtype = torch.bool, device = "cpu")
 
 
 def _layer_pre_hook(layer_index):
