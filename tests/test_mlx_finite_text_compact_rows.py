@@ -7,7 +7,7 @@ import tracemalloc
 import numpy as np
 import pytest
 
-mx = pytest.importorskip("mlx.core")
+mx = pytest.importorskip("mlx.core", exc_type = ImportError)
 
 from unsloth_zoo.mlx.utils import (  # noqa: E402
     FiniteTextBatchPlan,
