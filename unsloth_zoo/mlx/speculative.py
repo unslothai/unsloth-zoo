@@ -24,10 +24,12 @@ import gc
 import importlib
 import inspect
 import json
+import math
 import os
 import re
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from itertools import combinations
 from pathlib import Path
@@ -36,6 +38,7 @@ from typing import Any, Callable, Iterator, Literal, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_flatten
 
 from .generate import BatchRowRefused, SamplingParams
@@ -128,13 +131,15 @@ class RoundPlan:
     """A plain window of ``length`` steps, or one verify round over ``rows``.
 
     ``split`` asks the engine to evaluate drafts and catch-up before building the verify, so
-    the round's components can be timed apart.
+    the round's components can be timed apart. ``trim`` asks the controller to choose the
+    verified prefix from the drafter's confidences.
     """
 
     kind: Literal["plain", "round"]
     length: int = 0
     rows: tuple[RowPlan, ...] = ()
     split: bool = False
+    trim: bool = False
 
     @property
     def width(self) -> int:
@@ -210,6 +215,123 @@ def _upper(rate: float, samples: int, z: float) -> float:
     return min(1.0, (centre + spread) / (1.0 + z2 / samples))
 
 
+class _CycleCosts:
+    """Recent completed cycles, interpolated through weighted isotonic width means."""
+
+    def __init__(self):
+        self.points = {}
+        self._samples = deque(maxlen = 64)
+
+    def observe(self, width, seconds):
+        if not math.isfinite(seconds) or seconds <= 0:
+            return
+        if self.points.get(width, (0.0, 0))[1] >= 2:
+            # Only against the width's own price: clipped to one extrapolated from other widths, a sample could never correct it.
+            expected = self.seconds(width)
+            seconds = min(max(seconds, 0.5 * expected), 2.0 * expected)
+        self._samples.append((width, seconds))
+        totals = {}
+        for key, value in self._samples:
+            total, count = totals.get(key, (0.0, 0))
+            totals[key] = (total + value, count + 1)
+        self.points = {key: (total / count, count) for key, (total, count) in totals.items()}
+
+    @property
+    def ready(self):
+        return sum(count >= 2 for _, count in self.points.values()) >= 2
+
+    def seconds(self, width):
+        blocks = []
+        for key, (value, count) in sorted(self.points.items()):
+            if count < 2:
+                continue
+            blocks.append(([key], value * count, count))
+            while len(blocks) > 1 and blocks[-2][1] / blocks[-2][2] > blocks[-1][1] / blocks[-1][2]:
+                keys, total, weight = blocks.pop()
+                previous, other, samples = blocks.pop()
+                blocks.append((previous + keys, other + total, samples + weight))
+        points = [(key, total / weight) for keys, total, weight in blocks for key in keys]
+        return DraftController._extrapolate(points, width, 0.0) if points else float("inf")
+
+
+class _Calibration:
+    """Conditional acceptance from shortlist confidence, with one shared slope and positional offsets."""
+
+    _RECORDS = 256
+    _REFIT_EVERY = 8
+
+    def __init__(self, depth: int):
+        self.alpha, self.beta = [0.0] * depth, [1.0] * depth
+        self._records = [deque(maxlen = self._RECORDS) for _ in range(depth)]
+        self._rounds = 0
+
+    @staticmethod
+    def _logit(p: float) -> float:
+        p = min(max(p, 1e-6), 1.0 - 1e-6)
+        return math.log(p / (1.0 - p))
+
+    def expected(self, confidence: Sequence[float]) -> float:
+        expected, reach = 1.0, 1.0
+        for position, p in enumerate(confidence):
+            if not math.isfinite(p) or not 0 <= p <= 1:
+                probability = DraftController._PRIOR_ACCEPTANCE
+            else:
+                z = self.alpha[position] + self.beta[position] * self._logit(p)
+                probability = 1.0 / (1.0 + math.exp(-min(max(z, -30.0), 30.0)))
+            reach *= probability
+            expected += reach
+        return expected
+
+    def observe(self, confidence: Sequence[float], verified: int, accepted: int) -> None:
+        for position in range(min(accepted + 1, verified, len(confidence), len(self._records))):
+            p = confidence[position]
+            if math.isfinite(p) and 0 <= p <= 1:
+                self._records[position].append((self._logit(p), float(position < accepted)))
+        self._rounds += 1
+        if self._rounds % self._REFIT_EVERY == 0 and any(self._records):
+            self.alpha, slope = _logistic_fit(self._records, self.alpha, self.beta[0])
+            self.beta = [slope] * len(self.beta)
+
+
+def _logistic_fit(records, alpha, beta):
+    labels = [(position, x, y) for position, values in enumerate(records) for x, y in values]
+    position, x, y = np.array(labels, np.float64).T
+    position = position.astype(np.intp)
+    theta, prior = np.array([beta, *alpha]), np.array([1.0, *([0.0] * len(alpha))])
+
+    def objective(parameters):
+        z = parameters[0] * x + parameters[1:][position]
+        return np.logaddexp(0.0, z).sum() - (y * z).sum() + 0.5 * np.square(parameters - prior).sum()
+
+    for _ in range(12):
+        z = theta[0] * x + theta[1:][position]
+        p = 1.0 / (1.0 + np.exp(-np.clip(z, -30.0, 30.0)))
+        w, residual = p * (1.0 - p), p - y
+        gradient = theta - prior
+        gradient[0] += (residual * x).sum()
+        gradient[1:] += np.bincount(position, residual, minlength = len(alpha))
+        diagonal = 1.0 + np.bincount(position, w, minlength = len(alpha))
+        cross = np.bincount(position, w * x, minlength = len(alpha))
+        curvature = 1.0 + (w * x * x).sum()
+        slope_step = (gradient[0] - (cross * gradient[1:] / diagonal).sum()) / (curvature - (cross * cross / diagonal).sum())
+        slope_step = min(slope_step, theta[0])
+        step = np.r_[slope_step, (gradient[1:] - cross * slope_step) / diagonal]
+        value, scale = objective(theta), 1.0
+        while scale > 1e-6:
+            candidate = theta - scale * step
+            candidate[0] = max(0.0, candidate[0])
+            if objective(candidate) <= value:
+                break
+            scale *= 0.5
+        else:
+            break
+        movement = np.max(np.abs(candidate - theta))
+        theta = candidate
+        if movement < 1e-6:
+            break
+    return theta[1:].tolist(), float(theta[0])
+
+
 @dataclass
 class RowState:
     """A row as the engine sees it at a round boundary."""
@@ -219,6 +341,16 @@ class RowState:
     copy_available: int = 0
     remaining: int | None = None
     catch_up: int = 0
+
+
+@dataclass
+class _PreparedPlan:
+    controller: Any
+    epoch: int
+    rows: tuple[RowState, ...]
+    cycle_ready: bool
+    plan: RoundPlan
+    changes: dict
 
 
 def _bucket(batch: int) -> int:
@@ -242,6 +374,11 @@ class DraftController:
     extrapolated; close or stale rivals are re-measured on a token clock, each probe only once
     the time it is expected to lose fits ``explore_fraction`` of the time recorded so far.
     ``fixed_depth`` never trades drafting for plain decoding: each row drafts exactly ``max_depth`` (fewer at a reply's end) unless a copy is expected to emit more; only a step where no row can draft or copy decodes plainly.
+
+    With a drafter that reports each drafted position's probability (``trims``), a drafting round
+    drafts at full depth and ``trim`` then verifies the width that maximizes that round's own
+    expected tokens per second, from the calibrated probabilities; every ``full_every``-th such
+    round verifies them all, so deep positions keep calibrating.
     """
 
     def __init__(
@@ -269,6 +406,7 @@ class DraftController:
         max_probe_backoff: int = 2048,
         explore_fraction: float = 0.02,
         fixed_depth: bool = False,
+        full_every: int = 32,
     ):
         self.max_depth = max(0, int(max_depth))
         self.fixed_depth = fixed_depth and self.max_depth > 0
@@ -317,6 +455,13 @@ class DraftController:
         self._probing_sources: dict[int, str] = {}
         self._probe: tuple | None = None
         self._probe_left = 0
+        # Set by an engine whose drafter reports confidences.
+        self.trims = False
+        self.calibration = _Calibration(self.max_depth)
+        self.full_every = full_every
+        self._since_full = 0
+        self.cycle_cost = {}
+        self._plan_epoch = 0
 
     _PRIOR_ACCEPTANCE = 0.7
     # Priors until measured, relative to a plain step: a round pays a sync more than a plain
@@ -330,6 +475,9 @@ class DraftController:
     _EXHAUSTIVE_ROWS = 6
 
     def new_reply(self) -> ReplyStats:
+        if self.trims:
+            # The calibration and cycle costs are the load's; their windows let a past reply's evidence age out.
+            self._since_full = 0
         return ReplyStats(self.draft_acceptance, self.copy_acceptance, self._base_backoff, self.seed_weight)
 
     def _plain_step(self, bucket: int) -> float:
@@ -450,8 +598,30 @@ class DraftController:
     def _identity(plan: RoundPlan, bucket: int) -> tuple:
         return (bucket, "plain") if plan.kind == "plain" else (bucket, "round", plan.width)
 
-    def plan(self, rows: Sequence[RowState]) -> RoundPlan:
+    _PLANNING_FIELDS = ("_warmup", "_stale_gap", "_probing_sources", "_reference", "_next_probe",
+                        "_probe", "_probe_left", "_window", "_current")
+
+    def _cycle_ready(self, rows: Sequence[RowState]) -> bool:
+        cycle = self.cycle_cost.get(len(rows))
+        return cycle is not None and cycle.ready
+
+    def prepare_plan(self, rows: Sequence[RowState]) -> _PreparedPlan:
+        """Choose without publishing probe/window changes while the next draft is running."""
+        planner = copy.copy(self)
+        for name in self._PLANNING_FIELDS:
+            setattr(planner, name, copy.copy(getattr(self, name)))
+        plan = planner.plan(rows)
+        return _PreparedPlan(self, self._plan_epoch, tuple(replace(row) for row in rows), self._cycle_ready(rows),
+                             plan, {name: getattr(planner, name) for name in self._PLANNING_FIELDS})
+
+    def plan(self, rows: Sequence[RowState], prepared: _PreparedPlan | None = None) -> RoundPlan:
         """The next round for these rows, or a plain window."""
+        valid = (prepared is not None and prepared.controller is self and prepared.epoch == self._plan_epoch
+                 and prepared.rows == tuple(rows) and prepared.cycle_ready == self._cycle_ready(rows))
+        self._plan_epoch += 1
+        if valid:
+            self.__dict__.update(prepared.changes)
+            return prepared.plan
         bucket = _bucket(len(rows))
         room = min((state.remaining for state in rows if state.remaining is not None), default = 1 << 30)
         plain = RoundPlan("plain", max(1, min(self._window, room)))
@@ -459,6 +629,9 @@ class DraftController:
         if self.fixed_depth:
             exact = tuple(self._exact_row(state) for state in rows)
             return RoundPlan("round", rows = exact) if any(row.length for row in exact) else RoundPlan("plain", 1)
+        if self.trims and not self._cycle_ready(rows) and all(state.can_draft for state in rows) and room > 1:
+            return RoundPlan("round", rows = tuple(RowPlan("draft", self._cap(state, self.max_depth)) for state in rows),
+                             split = True, trim = True)
         if self._warmup:
             depth = self._warmup[0]
             warmup = tuple(
@@ -487,11 +660,48 @@ class DraftController:
                     break
                 if "draft" not in sources.values():
                     break
+        cycle = self.cycle_cost.get(len(rows))
+        if self.trims and cycle is not None and cycle.ready and not probing and not self._probing_sources and chosen.kind == "round" and all(
+                row.source == "draft" for row in chosen.rows):
+            # Its block is drafted in full either way; the confidences pick the width, and waiting for them times it apart.
+            deepened = tuple(
+                RowPlan("draft", self._cap(state, self.max_depth)) if row.source == "draft" else row
+                for row, state in zip(chosen.rows, rows)
+            )
+            return RoundPlan("round", rows = deepened, split = True, trim = True)
         # A probe's first round re-measures the parts; the rest run fused, as a winner would.
         starting = probing and self._probe_left == self.probe_rounds - 1
         if chosen.kind == "round" and (starting or not self._measured_parts(chosen, rows)):
             chosen = replace(chosen, split = True)
         return self._split_due(chosen)
+
+    def trim(self, plan: RoundPlan, rows: Sequence[RowState], confidences: Sequence[Sequence[float] | None]) -> RoundPlan:
+        """The width to verify of a ``trim`` round, from each row's drafted-position probabilities (None for a row
+        without them: its reply's acceptance stands in)."""
+        cycle = self.cycle_cost.get(len(rows))
+        deepest = max(row.length for row in plan.rows)
+
+        def expected(row, state, confidence, depth):
+            length = min(depth, row.length)
+            if confidence is None:
+                return state.stats.expected(RowPlan("draft", min(length, self.max_depth)))
+            return self.calibration.expected(confidence[:length])
+
+        def rate(depth, seconds):
+            tokens = sum(expected(row, state, confidence, depth) for row, state, confidence in zip(plan.rows, rows, confidences))
+            return tokens / seconds(depth + 1)
+        self._since_full += 1
+        if self._since_full >= self.full_every:
+            self._since_full = 0
+            return plan
+        if cycle is None or not cycle.ready:
+            for width in (deepest + 1, max(1, (deepest + 1) // 2)):
+                if cycle is None or cycle.points.get(width, (0.0, 0))[1] < 2:
+                    return replace(plan, rows = tuple(RowPlan("draft", min(width - 1, row.length)) for row in plan.rows))
+            return plan
+        depth = max(range(deepest + 1), key = lambda depth: rate(depth, cycle.seconds))
+        trimmed = tuple(RowPlan("draft", min(depth, row.length)) for row in plan.rows)
+        return replace(plan, rows = trimmed)
 
     def _exact_row(self, state: RowState) -> RowPlan:
         draft = RowPlan("draft", self._cap(state, self.max_depth)) if state.can_draft else RowPlan()
@@ -635,6 +845,7 @@ class DraftController:
     def record_plain(self, rows: Sequence[RowState], steps: int, seconds: float, step_seconds: float | None = None) -> None:
         if steps <= 0:
             return
+        self._plan_epoch += 1
         bucket = _bucket(len(rows))
         if step_seconds is not None:
             self.plain_cost.setdefault(bucket, _Ema()).update_time(step_seconds, self.cost_alpha)
@@ -646,6 +857,15 @@ class DraftController:
         self._reference = None
         self._measured_at[(bucket, "plain")] = self.steps
 
+    def observe_cycle(self, plan: RoundPlan, rows: Sequence[RowState], cycle_seconds: float, first_use: bool = False,
+                      cold: bool = False) -> None:
+        """Account the seconds a finished full-draft ``trim`` round took until the next block it drafted was ready. A ``cold``
+        round drafted its own block too, as a reply's first does, or read the one that flushed a drafter backlog, as a long prompt's first does: that is no width's cost."""
+        if not (self.trims and plan.trim and not first_use and all(row.source == "draft" for row in plan.rows)):
+            return
+        if not cold and all(state.remaining is None or state.remaining > self.max_depth + 1 for state in rows):
+            self.cycle_cost.setdefault(len(rows), _CycleCosts()).observe(plan.width, cycle_seconds)
+
     def record_round(
         self,
         plan: RoundPlan,
@@ -656,13 +876,17 @@ class DraftController:
         draft_seconds: float = 0.0,
         catch_up_seconds: float = 0.0,
         first_use: bool = False,
+        confidences: Sequence[Sequence[float] | None] | None = None,
+        cycle_seconds: float | None = None,
     ) -> None:
         """Account a finished round; ``accepted[i]`` counts row ``i``'s accepted drafts.
 
         ``seconds`` is the whole round. A split round times its parts apart; a fused round,
         whose drafting overlaps building its verify, measures how much of the drafting it hid.
         A ``first_use`` round, which also ran one-off first-use work, updates no cost and leaves its width unmeasured.
+        A ``trim`` round's ``confidences`` (each row's drafted-position probabilities) calibrate those that were verified.
         """
+        self._plan_epoch += 1
         bucket = _bucket(len(rows))
         alpha = self.acceptance_alpha
         stall_free = None if self._reference is None else min(seconds, self._STALL_RATIO * self.round_seconds(plan, rows))
@@ -691,10 +915,18 @@ class DraftController:
                 stats.probe_at[row.source] = stats.tokens + stats.backoff[row.source]
         self._probing_sources, self._reference = {}, None
         self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
+        for row, count, confidence in zip(plan.rows, accepted, confidences or ()):
+            if row.source == "draft" and confidence is not None:
+                self.calibration.observe(confidence, row.length, max(0, min(int(count), row.length)))
         if first_use:
             return
 
-        depths = [row.length for row in plan.rows if row.source == "draft" and row.length]
+        if cycle_seconds is not None:
+            self.observe_cycle(plan, rows, cycle_seconds)
+
+        # A trimmed row's drafting is that of the full block ``plan`` drafted it as.
+        depths = [self._cap(state, self.max_depth) if plan.trim else row.length
+                  for row, state in zip(plan.rows, rows) if row.source == "draft" and row.length]
         catch_up = sum(state.catch_up for row, state in zip(plan.rows, rows) if row.source == "draft")
         verify = self.verify_cost.setdefault(bucket, {}).setdefault(plan.width, _Ema())
         if plan.split:
@@ -988,12 +1220,15 @@ class SpeculativeEngine:
                            and getattr(drafter, "features", None) is None)
         # Families whose verify forward was measured to commit ragged acceptance correctly.
         self._batch_rounds = self._exact or self._invariant or call is _language_call("gemma4")
+        if getattr(drafter, "confidences", False):
+            controller.trims = True
         self._mrope = hasattr(self.lm, "_rope_deltas")
         self._rows: list[_Row] = []
         self.cache: list | None = None
         self.draft_cache: list | None = None
         self.round_refusal: str | None = None
         self.retiring: dict = {}
+        self._prepared_plan = None
 
     @property
     def rows(self) -> list[Any]:
@@ -1011,6 +1246,7 @@ class SpeculativeEngine:
             self.draft_cache = _join(self.draft_cache, draft_cache, len(self._rows))
         self.cache = _join(self.cache, row.cache, len(self._rows))
         self._rows.append(state)
+        self._prepared_plan = None
 
     def remove(self, uid) -> None:
         keep = [i for i, row in enumerate(self._rows) if row.uid != uid]
@@ -1025,14 +1261,16 @@ class SpeculativeEngine:
         self.cache = _split(self.cache, keep)
         if self.drafter is not None:
             self.draft_cache = _split(self.draft_cache, keep)
+        self._prepared_plan = None
 
     def step(self, waiting: Callable[[], bool] | None = None) -> Iterator[StepOutput]:
         """One round or plain window, each row's tokens as they are decoded. Finished rows leave once it is consumed."""
         if not self._rows:
             return
         states = self._states()
+        prepared, self._prepared_plan = self._prepared_plan, None
         if self._rounds_allowed():
-            plan = self.controller.plan(states)
+            plan = self.controller.plan(states) if prepared is None else self.controller.plan(states, prepared)
         else:
             room = min((row.remaining for row in self._rows if row.remaining is not None), default = None)
             plan = RoundPlan("plain", self.controller.max_window if room is None else min(room, self.controller.max_window))
@@ -1047,15 +1285,24 @@ class SpeculativeEngine:
     def _rounds_allowed(self) -> bool:
         return self.round_refusal is None and (len(self._rows) == 1 or self._batch_rounds)
 
-    def _states(self) -> list[RowState]:
+    def _states(self, snapshot: bool = False) -> list[RowState]:
+        states = []
         for row in self._rows:
-            state = row.state
+            state = replace(row.state) if snapshot else row.state
             state.remaining = row.remaining
             state.copy_available = (
                 len(row.proposer.propose(row.tokens, self.controller.max_copy)) if row.speculates else 0
             )
             state.can_draft = row.draft is not None and row.draft.ready
-        return [row.state for row in self._rows]
+            states.append(state)
+        return states
+
+    def _prepare_next_plan(self) -> None:
+        self._prepared_plan = None
+        if (self.controller.trims and not self.controller.fixed_depth
+                and type(self.controller).plan is DraftController.plan
+                and self.controller._cycle_ready(self._rows) and not any(row.finished for row in self._rows)):
+            self._prepared_plan = self.controller.prepare_plan(self._states(snapshot = True))
 
     def _position_kwargs(self) -> dict:
         if not self._mrope:
@@ -1154,7 +1401,9 @@ class SpeculativeEngine:
         start, work = time.perf_counter(), first_use_work()
         depth = max((spec.length for spec in plan.rows if spec.source == "draft"), default = 0)
         draft_rows = [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)]
-        drafts, draft_seconds, catch_up_seconds = None, 0.0, 0.0
+        cold = plan.trim and any(row is not None and (getattr(row, "prefetched", None) is None or getattr(row, "flushed", False))
+                                 for row in draft_rows)
+        drafts, draft_seconds, catch_up_seconds, confidences = None, 0.0, 0.0, None
         if depth:
             with mx.stream(self._stream):
                 # A round's few pairs replay as drafting; a plain window's backlog is replayed and timed apart.
@@ -1164,15 +1413,22 @@ class SpeculativeEngine:
                     catch_up_seconds = time.perf_counter() - start
                 self.drafter.catch_up(self.draft_cache, draft_rows)
                 drafts = self.drafter.draft(self.draft_cache, draft_rows, depth, self.cache).astype(inputs.dtype)
+                confidence = (getattr(self.drafter, "confidence", None) or [None] * len(rows)) if plan.trim else []
                 if plan.split:
-                    mx.eval(drafts)
+                    mx.eval(drafts, *[array for array in confidence if array is not None])
                     draft_seconds = time.perf_counter() - start - catch_up_seconds
                 else:
                     # The head drafts on the GPU while the host builds the verify graph.
                     mx.async_eval(drafts)
+                if plan.trim:
+                    confidences = [None if array is None else array.tolist()[0] for array in confidence]
+                    plan = self.controller.trim(plan, states, confidences)
+                    width = plan.width
+                    lengths = [spec.length if spec.source == "draft" else len(proposal) for spec, proposal in zip(plan.rows, proposals)]
+                    inputs = inputs[:, :width]
                 columns = mx.arange(width - 1)[None]
                 drafting = mx.array([[spec.length if spec.source == "draft" else 0] for spec in plan.rows])
-                padded = mx.pad(drafts, [(0, 0), (0, width - 1 - depth)])
+                padded = mx.pad(drafts[:, : width - 1], [(0, 0), (0, max(width - 1 - depth, 0))])
                 inputs = mx.concatenate([inputs[:, :1], mx.where(columns < drafting, padded, inputs[:, 1:])], axis = 1)
         entries = list(self.cache)
         with mx.stream(self._stream):
@@ -1255,14 +1511,28 @@ class SpeculativeEngine:
         except BaseException:
             transaction.abort()
             raise
-        # Left lazy, the commit makes the next decode copy whole cache buffers instead of writing in place. A
-        # pending fold's replay is the exception: a settled fold reads its inputs instead, so it is left to its consumer.
-        mx.async_eval([_committed_eval_state(entry) for entry in [*self.cache, *(self.draft_cache or [])]])
+        # A pending replay fold is evaluated by its next verifier.
+        committed = [_committed_eval_state(entry) for entry in [*self.cache, *(self.draft_cache or [])]]
+        mx.async_eval(committed)
+        seconds, first_use = time.perf_counter() - start, first_use_work() != work
         self.controller.record_round(
-            plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds,
-            catch_up_seconds = catch_up_seconds, first_use = first_use_work() != work,
+            plan, states, accepted, seconds = seconds, draft_seconds = draft_seconds,
+            catch_up_seconds = catch_up_seconds, first_use = first_use, confidences = confidences,
         )
+        self._prepare_next_plan()
+        self._time_cycle(plan, states, committed, start, first_use, cold)
         return emitted
+
+    def _time_cycle(self, plan: RoundPlan, states: list[RowState], committed: list, start: float, first_use: bool,
+                    cold: bool = False) -> None:
+        """Wait out the round's committed state and prefetched block; after the bookkeeping, which their drafting hides."""
+        if not self.controller.trims:
+            return
+        mx.eval(committed,
+                *[row.draft.prefetched for row in self._rows if getattr(row.draft, "prefetched", None) is not None],
+                *[row.draft.prefetched_confidence for row in self._rows
+                  if getattr(row.draft, "prefetched_confidence", None) is not None])
+        self.controller.observe_cycle(plan, states, time.perf_counter() - start, first_use, cold)
 
 
 @functools.cache
@@ -1847,6 +2117,9 @@ class ContextRow:
         self.pending = 0
         self.features: list[mx.array] = []
         self.prefetched: mx.array | None = None
+        self.prefetched_confidence: mx.array | None = None
+        # Whether `prefetched` moved a backlog of at least the drafter's `max_lag` rows into the context cache.
+        self.flushed = False
         self.predrafted: list | None = None
 
     @property
@@ -1880,6 +2153,12 @@ class ContextDrafter:
         attentions = [layer.self_attn for layer in model.layers] if self.predraft_rows else []
         if attentions and all(a.is_sliding for a in attentions):
             self.context_rows = max(a.sliding_window - 1 for a in attentions)
+        # DFlash2's selector reports each drafted position's probability, from which the controller trims a round.
+        self._selector = getattr(model, "candidate_selector", None)
+        if self._selector is not None:
+            self._selector.__dict__["_unsloth_wants_confidence"] = True
+        self.confidences = self._selector is not None
+        self.confidence: list[mx.array | None] = []
 
     @property
     def config(self):
@@ -1908,11 +2187,12 @@ class ContextDrafter:
             row.pending, row.predrafted = int(tokens[-1]), None
             return
         # A prefetched block drafted from a context these tokens extend; its own context stays cached.
-        row.pending, row.prefetched = int(tokens[-1]), None
+        row.pending, row.prefetched, row.prefetched_confidence, row.flushed = int(tokens[-1]), None, None, False
         row.features.append(hidden)
         if sum(len(chunk) for chunk in row.features) >= self.max_lag:
             # The block moving the backlog into the context cache is the next one, so a long prompt drafts at once.
             self.prefetch([row])
+            row.flushed = True
 
     def catch_up(self, cache: list, rows: Sequence[ContextRow | None]) -> int:
         return 0
@@ -1923,8 +2203,12 @@ class ContextDrafter:
         self._block(row, 1)
         return row.cache
 
-    def _drafted(self, *args) -> mx.array:
-        return self._draft(*args, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
+    def _drafted(self, *args) -> tuple[mx.array, mx.array | None]:
+        if self._selector is not None:
+            # A draft whose walk leaves none (a native select) must not read an earlier draft's.
+            self._selector.__dict__.pop("_unsloth_confidence", None)
+        block = self._draft(*args, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
+        return block, None if self._selector is None else self._selector.__dict__.pop("_unsloth_confidence", None)
 
     def _block(self, row: ContextRow, depth: int) -> mx.array:
         context = (row.features[0] if len(row.features) == 1 else mx.concatenate(row.features))[None]
@@ -1934,7 +2218,8 @@ class ContextDrafter:
             context = context[:, skip:]
             for entry in row.cache:
                 entry.offset += skip
-        return self._drafted(row.pending, context, row.cache, depth + 1)
+        block, row.prefetched_confidence = self._drafted(row.pending, context, row.cache, depth + 1)
+        return block
 
     def prefetch(self, rows: Sequence[ContextRow | None]) -> None:
         """Draft each ready row's next block now; ``draft`` reads it unless a ``push`` comes first."""
@@ -1953,7 +2238,8 @@ class ContextDrafter:
 
         valid = mx.arange(hidden.shape[0]) <= accepted
         row.predrafted = [PredraftCache(entry, valid, accepted + 1 + entry.offset) for entry in row.cache]
-        row.prefetched = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, self.max_depth + 1).reshape(1, self.max_depth)
+        block, row.prefetched_confidence = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, self.max_depth + 1)
+        row.prefetched = block.reshape(1, self.max_depth)
         mx.async_eval(row.prefetched)
         return True
 
@@ -1962,18 +2248,26 @@ class ContextDrafter:
         row.predrafted = None
 
     def draft(self, cache: list, rows: Sequence[ContextRow | None], depth: int, target: list) -> mx.array:
-        """Each row's next ``depth`` drafts."""
-        blocks = []
+        """Each row's next ``depth`` drafts; ``confidence`` then holds each row's (1, depth) probabilities, or None."""
+        blocks, self.confidence = [], []
         for row in rows:
+            confidence = None
             if row is None or not row.ready:
                 blocks.append(mx.zeros((1, depth), mx.int32))
             elif row.prefetched is not None:
                 block = row.prefetched
                 # A slice of a finished block is a kernel the host would wait on, so a block of exactly this depth is used as is.
                 blocks.append(block if block.shape[-1] == depth else block[:, :depth])
-                row.prefetched = None
+                if row.prefetched_confidence is not None:
+                    confidence = row.prefetched_confidence
+                    confidence = confidence if confidence.shape[-1] == depth else confidence[:, :depth]
+                row.prefetched = row.prefetched_confidence = None
+                row.flushed = False
             else:
-                blocks.append(self._block(row, depth).reshape(1, depth))
+                block = self._block(row, depth)
+                confidence, row.prefetched_confidence = row.prefetched_confidence, None
+                blocks.append(block.reshape(1, depth))
+            self.confidence.append(confidence)
         return blocks[0] if len(blocks) == 1 else mx.concatenate(blocks)
 
     def settle(self, cache: list, rows: Sequence[ContextRow | None], appended: int, keep: Sequence[int]) -> list[int]:
