@@ -1101,13 +1101,14 @@ def _logits_into(h, w, out, fp32_logits):
     V8 = _aligned(w.shape[0])
     parts = ((0, V8), (V8, w.shape[0])) if V8 < w.shape[0] else ((0, V8),)
     for a, b in parts:
+        o = out[:, a:b]
         if fp32_logits:
-            _mm_fp32(h, w[a:b].t(), out = out[:, a:b])
-        elif h.is_cuda:
-            torch.mm(h, w[a:b].t(), out = out[:, a:b])
+            _mm_fp32(h, w[a:b].t(), out = o)
+        elif h.is_cuda or o.stride() == (b - a, 1):
+            torch.mm(h, w[a:b].t(), out = o)
         else:
             # CPU fp16 mm with out= into a strided column slice reads stale contents on avx512_fp16 hosts (torch 2.10, oneDNN): NaN or wrong logits.
-            out[:, a:b].copy_(torch.mm(h, w[a:b].t()))
+            o.copy_(torch.mm(h, w[a:b].t()))
     return out
 
 
