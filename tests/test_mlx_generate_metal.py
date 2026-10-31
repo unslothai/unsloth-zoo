@@ -1630,7 +1630,7 @@ def test_tensor_lane_readers_keep_each_rows_bits_within_fp32_reordering(monkeypa
 
 
 @apple_gpu_only
-def test_inference_scopes_hold_the_row_invariant_opt_in_around_every_scope_they_enter(monkeypatch):
+def test_inference_scopes_hold_fast_verify_around_every_scope_they_enter(monkeypatch):
     from unsloth_zoo.mlx import inference
     head = nn.QuantizedLinear(512, 136, bias = False, group_size = 64, bits = 4)
     head._unsloth_lane_qmm = True
@@ -1642,12 +1642,12 @@ def test_inference_scopes_hold_the_row_invariant_opt_in_around_every_scope_they_
         monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", flag)
         with pytest.raises(RuntimeError, match = "exit"), inference.inference_scopes(model, ("speculative",)):
             with inference.inference_scopes(model, ("speculative",)):
-                held = inference._opt_in_held(inference._FAST_VERIFY_ENV)
+                held = inference._fast_verify_held(model)
                 assert held == (flag == "1") and ("_unsloth_singleton_scopes" in vars(model.proj)) != held
                 assert isinstance(model.lm_head, inference._TargetHeadFP32) == held
-            assert inference._opt_in_held(inference._FAST_VERIFY_ENV) == held
+            assert inference._fast_verify_held(model) == held
             raise RuntimeError("exit")
-        assert not inference._opt_in_held(inference._FAST_VERIFY_ENV)
+        assert not inference._fast_verify_held(model)
         assert type(model.proj) is nn.QuantizedLinear and model.lm_head is head
 
 

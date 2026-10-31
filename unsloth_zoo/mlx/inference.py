@@ -5187,7 +5187,7 @@ def _singleton_quantized_class(base, method, original, *cache_key):
     def call(self, x):
         native = getattr(base, method)
         if (isinstance(x, mx.array) and x.ndim == 3 and x.shape[0] > 1 and x.shape[1] == 1 and not self.training
-                and not _opt_in_held(_FAST_VERIFY_ENV) and native is original
+                and native is original
                 and isinstance(self.get("weight"), mx.array) and self.weight.ndim == 2
                 and _bindings_intact(bindings)):
             return mx.concatenate([native(self, x[row:row + 1]) for row in range(x.shape[0])], axis = 0)
@@ -5204,8 +5204,7 @@ def singleton_quantized_decode(model, *, _modules = None):
     changed = []
     try:
         with _NAX_QMM_LOCK:
-            if (not _opt_in_held(_FAST_VERIFY_ENV)
-                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
+            if not _fast_verify_held(model) and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
                 seen = set()
                 for _, module in _fusion_modules(model, _modules):
                     if id(module) in seen:
@@ -6933,23 +6932,136 @@ def _lane_verify_class(base):
 
 
 _FAST_VERIFY_ENV = "UNSLOTH_MLX_FAST_VERIFY"
+_FAST_VERIFY_PIN = "_unsloth_fast_verify_pin"       # what the model's drafter was built for
+_FAST_VERIFY_SCOPE = "_unsloth_fast_verify_scope"   # (depth, the outermost scope's decision)
 
 
 def _lane_kernel_on():
     return matmul.lane_qmm_available() and os.environ.get(_LANE_QMM_ROUTE.switch, "1") != "0"
 
 
-def fast_verify_enabled(model = None) -> bool:
-    """Whether Fast Verify is asked for and its kernel is on for this GPU, and with `model`, whether
-    it covers it; readable before any generation. A failed kernel probe still keeps the default path."""
-    scope = next((scope for scope in INFERENCE_SCOPES if scope.enter is row_invariant_lane_projections), None)
-    return scope is not None and scope.admits(None) and _lane_kernel_on() and (
-        model is None or fast_verify_covers(model))
+def _fast_verify_state(model):
+    return getattr(getattr(model, "language_model", model), "__dict__", {})
+
+
+def pin_fast_verify(model, fast_verify = None) -> bool:
+    """Settle Fast Verify for `model` until it is reloaded: what an earlier drafter or an open scope decided, else
+    `fast_verify` (`UNSLOTH_MLX_FAST_VERIFY` when None). A drafter's selector, verify floor and warmed costs hold for one
+    decision, so building one pins its target."""
+    pinned = _fast_verify_decision(model, fast_verify)
+    if fast_verify is not None and bool(fast_verify) != pinned:
+        raise ValueError(f"an open scope decided fast_verify = {pinned}; build the drafter outside it")
+    _fast_verify_state(model)[_FAST_VERIFY_PIN] = pinned
+    return pinned
+
+
+def _fast_verify_decision(model, fast_verify = None) -> bool:
+    state = _fast_verify_state(model)
+    pinned = state.get(_FAST_VERIFY_PIN)
+    if pinned is not None:
+        if fast_verify is not None and bool(fast_verify) != pinned:
+            raise ValueError(f"this model's drafter was built with fast_verify = {pinned}; reload it to change that")
+        return pinned
+    outer = state.get(_FAST_VERIFY_SCOPE, (0, None))[1]
+    if outer is not None:
+        return outer
+    return os.environ.get(_FAST_VERIFY_ENV) == "1" if fast_verify is None else bool(fast_verify)
+
+
+def _hold_fast_verify(model, decided):
+    state = _fast_verify_state(model)
+    with _VERIFY_LOCK:
+        state[_FAST_VERIFY_SCOPE] = (state.get(_FAST_VERIFY_SCOPE, (0, None))[0] + 1, decided)
+
+
+def _release_fast_verify(model):
+    state = _fast_verify_state(model)
+    with _VERIFY_LOCK:
+        depth, decided = state.pop(_FAST_VERIFY_SCOPE, (1, None))
+        if depth > 1:
+            state[_FAST_VERIFY_SCOPE] = (depth - 1, decided)
+
+
+def _fast_verify_held(model):
+    return _fast_verify_state(model).get(_FAST_VERIFY_SCOPE, (0, False))[1]
+
+
+def fast_verify_requested(model) -> bool:
+    """Whether `model`'s speculative generations decode under Fast Verify where it covers it and the GPU has its kernel,
+    readable before any generation. A failed kernel probe still keeps the default path."""
+    return _fast_verify_decision(model) and _lane_kernel_on()
+
+
+def fast_verify_enabled(model) -> bool:
+    """`fast_verify_requested`, and Fast Verify covers `model`."""
+    return fast_verify_requested(model) and fast_verify_covers(model)
 
 
 def fast_verify_covers(model) -> bool:
     """Whether Fast Verify covers `model`, whether or not it is asked for."""
     return bool(_lane_coverage(model, None)[3])
+
+
+class FastVerifyStatus(NamedTuple):
+    available: bool
+    # "", no_lane_kernel, distributed, not_downloaded, no_eligible_projections or probe_failed
+    reason: str
+    projections: int   # quantized projections the lane kernel takes; approximate before load
+
+    def __bool__(self):
+        return self.available
+
+
+def _fast_verify_status(projections):
+    if not projections:
+        return FastVerifyStatus(False, "no_eligible_projections", 0)
+    if _resolved_bindings(_NAX_QMM_CONTRACT) is None or not nax.kernel_probe_passed(
+            matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available):
+        return FastVerifyStatus(False, "probe_failed", projections)
+    return FastVerifyStatus(True, "", projections)
+
+
+def fast_verify_available(model):
+    """Whether `fast_verify=True` moves any of `model`'s projections to the lane kernel in a speculative generation here. It ignores the decision and
+    `UNSLOTH_MLX_FAST_VERIFY`, and leaves the model unchanged."""
+    if not _lane_kernel_on():
+        return FastVerifyStatus(False, "no_lane_kernel", 0)
+    if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+        return FastVerifyStatus(False, "distributed", 0)
+    return _fast_verify_status(len(_lane_coverage(model, None)[3]))
+
+
+def fast_verify_checkpoint_available(model_dir):
+    """`fast_verify_available` for the directory of a downloaded MLX checkpoint, judged from its config.json and
+    safetensors headers without loading it: reason "not_downloaded" when either is missing."""
+    if not _lane_kernel_on():
+        return FastVerifyStatus(False, "no_lane_kernel", 0)
+    model_dir = Path(model_dir)
+    shards = list(model_dir.glob("*.safetensors"))
+    if not (model_dir / "config.json").is_file() or not shards:
+        return FastVerifyStatus(False, "not_downloaded", 0)
+    config = json.loads((model_dir / "config.json").read_text())
+    family = SPECULATIVE_FAMILIES.get(str(config.get("model_type")).removesuffix("_moe"))
+    if family is None or "lanes" not in family.capabilities:
+        return FastVerifyStatus(False, "no_eligible_projections", 0)
+    quantization = config.get("quantization") or {}
+    tensors = {}
+    for shard in shards:
+        with open(shard, "rb") as file:
+            tensors.update(json.loads(file.read(struct.unpack("<Q", file.read(8))[0])))
+    projections = 0
+    for name in tensors:
+        prefix = name.removesuffix(".scales")
+        weight = tensors.get(f"{prefix}.weight")
+        if prefix == name or weight is None or f"{prefix}.biases" not in tensors or len(weight["shape"]) != 2:
+            continue
+        layer = next((quantization[key] for key in (prefix, prefix.removeprefix("language_model."))
+                      if key in quantization), quantization)
+        if isinstance(layer, dict):
+            bits = layer.get("bits", 4)
+            projections += matmul.lane_qmm_supported(weight["shape"][0], weight["shape"][1] * 32 // bits,
+                                                     layer.get("group_size", 64), bits, layer.get("mode", "affine"))
+    return _fast_verify_status(projections)
 
 
 def lane_tile_rows(model) -> int:
@@ -7691,7 +7803,7 @@ def _decode_attention(queries, keys, values, scale):
 
 # Query heads per KV head served by default: at 8 (E2B, 26B-A4B, 31B) MLX decodes a lone query on the same
 # vector kernel, so each verify row is the attention a decode step computes. At 4 (E4B) decode stays unfused
-# and the kernel only changes rounding, so it is opt-in with UNSLOTH_MLX_VERIFY_ATTENTION=1. At 16 (12B) the
+# and the kernel only changes rounding, so it waits for Fast Verify. At 16 (12B) the
 # unfused attention is already as fast.
 _VERIFY_ATTENTION_GQA = (8,)
 _VERIFY_ATTENTION_OPT_IN_GQA = (4,)
@@ -7701,9 +7813,8 @@ _VERIFY_ATTENTION_LOCK = RLock()
 _VERIFY_ATTENTION_VERDICTS = {}
 
 
-def _verify_attention_serves(gqa):
-    return gqa in _VERIFY_ATTENTION_GQA or (
-        gqa in _VERIFY_ATTENTION_OPT_IN_GQA and os.environ.get("UNSLOTH_MLX_VERIFY_ATTENTION", "0") == "1")
+def _verify_attention_serves(gqa, fast_verify):
+    return gqa in _VERIFY_ATTENTION_GQA or (gqa in _VERIFY_ATTENTION_OPT_IN_GQA and fast_verify)
 
 
 def _two_pass_keys(keys):
@@ -7834,7 +7945,7 @@ def fused_decode_attention(model, *, _modules = None):
                 module.__class__ = type(module)._unsloth_wide_attention_native
 
 
-def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
+def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache, fast_verify = False):
     """A verify block's head-dim-512 causal attention on MLX's vector kernel, or None for the native call."""
     if not (isinstance(mask, str) and mask == "causal" and (cache is None or type(cache) is kv_cache)
             and queries.ndim == 4 and queries.shape[0] == 1 and keys.shape == values.shape
@@ -7842,7 +7953,7 @@ def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
             and queries.dtype in (mx.bfloat16, mx.float16) and queries.dtype == keys.dtype == values.dtype
             and 2 <= queries.shape[2] <= min(_VERIFY_ATTENTION_ROWS, keys.shape[2])
             and keys.shape[1] and queries.shape[1] % keys.shape[1] == 0
-            and _verify_attention_serves(queries.shape[1] // keys.shape[1])
+            and _verify_attention_serves(queries.shape[1] // keys.shape[1], fast_verify)
             and _two_pass_keys(keys.shape[2] - queries.shape[2] + 1)
             and _vector_attention_kernels() is not None):
         return None
@@ -7894,7 +8005,8 @@ def _verify_attention_class(base):
         return None
 
     def attention(queries, keys, values, cache, scale, mask, sinks = None):
-        out = None if sinks is not None else _verify_attention(queries, keys, values, cache, scale, mask, kv_cache)
+        out = None if sinks is not None else _verify_attention(queries, keys, values, cache, scale, mask, kv_cache,
+                                                               _VERIFY_STATE.attention_fast_verify)
         return native(queries, keys, values, cache = cache, scale = scale, mask = mask) if out is None else out
 
     routed = FunctionType(call.__code__, {**namespace, "scaled_dot_product_attention": attention},
@@ -7904,6 +8016,7 @@ def _verify_attention_class(base):
     def verify_call(self, *args, **kwargs):
         if (getattr(_VERIFY_STATE, "attention", False) and not self.training
                 and namespace.get("scaled_dot_product_attention") is native and _bindings_intact(bindings)):
+            _VERIFY_STATE.attention_fast_verify = self.__dict__.get("_unsloth_verify_attention_fast_verify", False)
             return routed(self, *args, **kwargs)
         return call(self, *args, **kwargs)
 
@@ -7941,7 +8054,7 @@ def fused_verify_attention(model, *, _modules = None):
     step's at long context. Inside `verify_block_attention`, an eligible single-sequence causal block with 8
     query heads per KV head runs on a copy of MLX's own two-pass vector kernel instead, once its first launch
     of that shape matched, row by row and bit for bit, the attention a decode step computes; 4 query heads per
-    KV head join with `UNSLOTH_MLX_VERIFY_ATTENTION=1`. Other calls, training and distributed models keep the
+    KV head join under Fast Verify. Other calls, training and distributed models keep the
     native attention. Instance classes are restored when the context exits.
     """
     changed = []
@@ -7965,6 +8078,7 @@ def fused_verify_attention(model, *, _modules = None):
                     if patched is not None:
                         module.__class__ = patched
                         module._unsloth_verify_attention_scopes = 1
+                        module._unsloth_verify_attention_fast_verify = _fast_verify_held(model)
                         changed.append(module)
         yield model
     finally:
@@ -7975,6 +8089,7 @@ def fused_verify_attention(model, *, _modules = None):
                     module._unsloth_verify_attention_scopes = scopes - 1
                     continue
                 module.__dict__.pop("_unsloth_verify_attention_scopes", None)
+                module.__dict__.pop("_unsloth_verify_attention_fast_verify", None)
                 native = getattr(type(module), "_unsloth_verify_attention_native", None)
                 if native is not None:
                     module.__class__ = native
@@ -8540,15 +8655,17 @@ def speculative_call(model, *, _modules = None):
 
 
 class InferenceScope(NamedTuple):
-    """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1"; while admitted it is
-    held (`_opt_in_held`) for every scope of the same `inference_scopes`.
-    `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument."""
+    """`serves`: call traits that admit it (empty admits all). `speculative`: entered only by a call naming that trait,
+    which None does not, so a plain generation never pays for it. `opt_in`: env switch that must be "1".
+    `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument.
+    `fast_verify`: entered only under the generation's Fast Verify decision."""
     enter: Callable
     serves: frozenset = frozenset()
     speculative: bool = False
     opt_in: str = None
     int8_prefill: bool = False
     ane_prefill: bool = False
+    fast_verify: bool = False
 
     @property
     def name(self):
@@ -8577,20 +8694,6 @@ SPECULATIVE_FAMILIES = {
 }
 
 
-# How many `inference_scopes` hold a scope of each opt-in switch, counted under `_VERIFY_LOCK`: what a scope or kernel
-# that steps aside for an opt-in asks (code outside the scopes asks the scope's admission).
-_HELD_OPT_INS = {}
-
-
-def _opt_in_held(switch):
-    return _HELD_OPT_INS.get(switch, 0) > 0
-
-
-def _release_opt_in(switch):
-    with _VERIFY_LOCK:
-        _HELD_OPT_INS[switch] -= 1
-
-
 # Outermost first; every generation path (Studio included) enters these. A scope that is not bitwise stock
 # and not measured at least as accurate as stock against an fp32 reference (max and mean error) sets `opt_in`, or takes
 # a decision that defaults off.
@@ -8615,9 +8718,9 @@ INFERENCE_SCOPES = [
     InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(speculative_call, speculative = True),
-    InferenceScope(row_invariant_lane_projections, speculative = True, opt_in = _FAST_VERIFY_ENV),
-    InferenceScope(row_invariant_attention, speculative = True, opt_in = _FAST_VERIFY_ENV),
-    InferenceScope(target_head_precision, speculative = True, opt_in = _FAST_VERIFY_ENV),
+    InferenceScope(row_invariant_lane_projections, speculative = True, fast_verify = True),
+    InferenceScope(row_invariant_attention, speculative = True, fast_verify = True),
+    InferenceScope(target_head_precision, speculative = True, fast_verify = True),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
     InferenceScope(fused_decode_attention),
     InferenceScope(exact_ple_row_reads),
@@ -8627,24 +8730,31 @@ INFERENCE_SCOPES = [
 
 
 @contextmanager
-def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = None, on_error = None, _modules = None):
+def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = None, fast_verify = None, on_error = None,
+                     _modules = None):
     """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation, short of
     the scopes only a call naming "speculative" enters.
 
     Traits this zoo does not know are ignored. A scope that raises on entry propagates unless `on_error` is
     given: then `on_error(name, error)` runs and, if it returns, the generation continues without that scope.
+
+    `fast_verify=True`, or `UNSLOTH_MLX_FAST_VERIFY=1` when it is None, runs every speculative speedup that changes
+    decode bits, in a call naming "speculative": its greedy output is within fp32 reordering of stock's, not equal to it.
+    A plain generation stays stock whatever this says. The outermost scope decides,
+    and a model with a drafter keeps what `companion_drafter(fast_verify = ...)` pinned, refusing the opposite request.
+    `fast_verify_available(model)` says whether it takes effect here.
     """
     if call is not None:
         call = frozenset((call,) if isinstance(call, str) else call)
     modules = tuple(_fusion_modules(model, _modules))
-    admitted = [scope for scope in INFERENCE_SCOPES if scope.admits(call)]
+    decided = _fast_verify_decision(model, fast_verify)
     with ExitStack() as stack:
-        # Every admitted opt-in is held before any scope enters, so a scope that steps aside for one sees it.
-        for switch in {scope.opt_in for scope in admitted if scope.opt_in is not None}:
-            with _VERIFY_LOCK:
-                _HELD_OPT_INS[switch] = _HELD_OPT_INS.get(switch, 0) + 1
-            stack.callback(_release_opt_in, switch)
-        for scope in admitted:
+        # Held before any scope enters, so a scope that steps aside for it sees it.
+        _hold_fast_verify(model, decided)
+        stack.callback(_release_fast_verify, model)
+        for scope in INFERENCE_SCOPES:
+            if not scope.admits(call) or (scope.fast_verify and not decided):
+                continue
             args = (int8_prefill,) if scope.int8_prefill else (ane_prefill,) if scope.ane_prefill else ()
             try:
                 stack.enter_context(scope.enter(model, *args, _modules = modules))
@@ -8658,13 +8768,14 @@ def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = N
 _WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17 rows)
 
 
-def warm_inference(model, int8_prefill = None, ane_prefill = None):
+def warm_inference(model, int8_prefill = None, ane_prefill = None, fast_verify = None):
     """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
     first-use checks; checks keyed by a request's row count still run then."""
     speculates = getattr(model, "_unsloth_speculates", False)   # set by building a drafter for it
-    with inference_scopes(model, ("speculative",), int8_prefill = int8_prefill, ane_prefill = ane_prefill) if speculates else nullcontext():
+    with (inference_scopes(model, ("speculative",), int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify)
+          if speculates else nullcontext()):
         model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
-                       int8_prefill = int8_prefill, ane_prefill = ane_prefill)
+                       int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify)
     _warm_qmv_rows(model)
     _warm_verify_gdn(model)
     if speculates:

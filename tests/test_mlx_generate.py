@@ -2022,7 +2022,7 @@ def test_warm_inference_generates_greedily_under_the_prefill_decisions(int8_pref
     warm_inference(types.SimpleNamespace(generate = lambda prompt, **kwargs: calls.append((prompt.tolist(), kwargs))),
                    int8_prefill = int8_prefill, ane_prefill = ane_prefill)
     assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill,
-                                              "ane_prefill": ane_prefill})]
+                                              "ane_prefill": ane_prefill, "fast_verify": None})]
 
 
 def test_cache_layout_tells_quantized_packings_apart():

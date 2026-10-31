@@ -111,7 +111,7 @@ def test_controller_finds_best_depth_including_plain(draft, slope):
 def _deepening_engine(controller, temperature = 0):
     engine = object.__new__(SpeculativeEngine)
     engine._exact, engine.controller, engine._extension_streak = True, controller, True
-    engine.drafter = SimpleNamespace(trained_depth = 7, extended_depth = 15, extension_serves = lambda row, depth: row.serves)
+    engine.drafter = SimpleNamespace(trained_depth = 7, extended_depth = 15, fast_verify = True, extension_serves = lambda row, depth: row.serves)
     engine._rows = [SimpleNamespace(sample = SimpleNamespace(temperature = temperature), processors = [],
                                     draft = SimpleNamespace(serves = True))]
     return engine

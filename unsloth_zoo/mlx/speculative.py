@@ -1444,8 +1444,6 @@ class SpeculativeEngine:
         return deeper_causal_verify(plan.width) if plan.controller_depth else nullcontext()
 
     def _extend(self, plan: RoundPlan, states: list[RowState]) -> RoundPlan:
-        from .inference import fast_verify_enabled
-
         candidate = self._extension_candidate(plan, states)
         if candidate is None or not self._extension_streak:
             return plan
@@ -1454,7 +1452,7 @@ class SpeculativeEngine:
         trims = plan.trim and self.controller.deepened_profile is not None
         if (stats.tokens < 4 * trained or stats.expected(plan.rows[0]) < (trained + 1) / 2
                 or (trims and not self.controller._cycle_ready(states))
-                or not self.controller.deepening_pays(plan, states, retry = fast_verify_enabled())):
+                or not self.controller.deepening_pays(plan, states, retry = self.drafter.fast_verify)):
             return plan
         # Without the load's deepened cycle costs a deep block verifies whole: the gate then compares it with the planned depth.
         return replace(plan, rows = (RowPlan("draft", depth),), controller_depth = trained, trim = trims)
@@ -2298,6 +2296,7 @@ class ContextDrafter:
 
     kind = "dflash"
     context_rows = None
+    fast_verify = False
 
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 512):
         from mlx_vlm.speculative.drafters import DFlashDraftModel
@@ -2313,8 +2312,9 @@ class ContextDrafter:
         self.extended_depth = self.max_depth
         # The greedy shortcut would bypass an overridden draft_block (DFlash2's selector, DSpark's Markov head).
         self._draft = model.draft_block_greedy if type(model).draft_block is DFlashDraftModel.draft_block else model.draft_block
-        from .inference import predraft_attention, fast_verify_enabled
+        from .inference import fast_verify_requested, predraft_attention
 
+        self.fast_verify = fast_verify_requested(target)
         self.predraft_rows = predraft_attention(model)
         # When every layer slides, rows before the widest window would be projected only to be dropped.
         attentions = [layer.self_attn for layer in model.layers] if self.predraft_rows else []
@@ -2322,7 +2322,7 @@ class ContextDrafter:
             self.context_rows = max(a.sliding_window - 1 for a in attentions)
         # DFlash2's selector reports each drafted position's probability, from which the controller trims a round.
         # Fast Verify's dense rounds verify whole tiles instead.
-        enabled = not fast_verify_enabled() or any(hasattr(module, "switch_mlp") for _, module in target.named_modules())
+        enabled = not self.fast_verify or any(hasattr(module, "switch_mlp") for _, module in target.named_modules())
         self._selector = getattr(model, "candidate_selector", None) if enabled else None
         if self._selector is not None:
             self._selector.__dict__["_unsloth_wants_confidence"] = True
@@ -2405,9 +2405,9 @@ class ContextDrafter:
     def extension_serves(self, row: ContextRow, depth: int) -> bool:
         """Whether a block of ``depth`` drafts for ``row`` now runs on the sparse producer, the only one deeper rounds are
         admitted for, under Fast Verify, whose verify cost model they rely on."""
-        from .inference import _SparseDrafter, fast_verify_enabled
+        from .inference import _SparseDrafter
 
-        return (fast_verify_enabled() and isinstance(self._draft, _SparseDrafter)
+        return (self.fast_verify and isinstance(self._draft, _SparseDrafter)
                 and self._draft.head_shape(1, depth, None, row.empty_context) is not None)
 
     def _prepared_depth(self, row: ContextRow) -> int:
@@ -2473,7 +2473,11 @@ class ContextDrafter:
         return [0] * len(rows)
 
 
-def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, quantize: bool = False, **kwargs):
+def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, quantize: bool = False,
+           fast_verify: bool | None = None, **kwargs):
+    from .inference import pin_fast_verify
+
+    pin_fast_verify(target, fast_verify)
     quantized = any(key.endswith(".scales") for key, _ in tree_flatten(model.parameters()))
     if quantize and wrapper in (MTPDrafter, ContextDrafter) and not quantized and (bits := int(os.environ.get("UNSLOTH_MLX_DRAFTER_BITS", "4"))):
         # At 4 bits these drafters accept within ~2% of bf16 at under a third of the memory, and verification keeps
@@ -2504,8 +2508,7 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
     lane_drafter_head(model, getattr(target, "lm_head", None) or getattr(language, "lm_head", None))
     if isinstance(drafter, ContextDrafter):
         drafter._draft = sparse_drafter(model, target, drafter._draft)
-        from .inference import (_SparseDrafter, _VERIFY_GDN_MAX_ROWS, fast_verify_covers,
-                                fast_verify_enabled, lane_tile_rows)
+        from .inference import _SparseDrafter, _VERIFY_GDN_MAX_ROWS, fast_verify_covers, lane_tile_rows
 
         if (isinstance(drafter._draft, _SparseDrafter) and fast_verify_covers(target)
                 and drafter.predraft_rows >= _VERIFY_GDN_MAX_ROWS):
@@ -2513,7 +2516,7 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
             if not any(hasattr(module, "switch_mlp") for _, module in target.named_modules()):
                 # Rows past the tile of most projections pay extra tile multiplies; sparse targets keep the gate alone.
                 rows = min(rows, lane_tile_rows(target))
-                if fast_verify_enabled():
+                if drafter.fast_verify:
                     # Rows within the tile cost the same, so a draft round verifies the whole trained block, or the tile.
                     drafter.min_verify_rows = min(drafter.trained_depth + 1, rows)
             drafter.extended_depth = max(drafter.trained_depth, rows - 1)
@@ -2604,8 +2607,9 @@ def _dense_table(model: nn.Module) -> nn.Module:
     return model
 
 
-def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter | MTPDrafter | HeadDrafter:
-    """A drafter from a separate DFlash, DFlash2, DSpark, EAGLE-3, Gemma 4 assistant or MTP head checkpoint, checked against ``target``."""
+def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, fast_verify: bool | None = None, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter | MTPDrafter | HeadDrafter:
+    """A drafter from a separate DFlash, DFlash2, DSpark, EAGLE-3, Gemma 4 assistant or MTP head checkpoint, checked against ``target``,
+    which keeps ``fast_verify`` (``UNSLOTH_MLX_FAST_VERIFY`` when None) from then on."""
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
     from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
     from mlx_vlm.utils import get_model_path
@@ -2619,8 +2623,9 @@ def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool =
     validate_drafter_compatibility(target, model, kind)
     if kind == "mtp":
         assistant = str(getattr(model.config, "model_type", "")).endswith("_assistant")
-        return _built(AssistantDrafter, _dense_table(model), target, lazy = lazy) if assistant else _head_drafter(model, target, lazy = lazy, quantize = quantize, **kwargs)
-    return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, lazy = lazy, quantize = quantize, **kwargs)
+        return (_built(AssistantDrafter, _dense_table(model), target, lazy = lazy, fast_verify = fast_verify) if assistant
+                else _head_drafter(model, target, lazy = lazy, quantize = quantize, fast_verify = fast_verify, **kwargs))
+    return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, lazy = lazy, quantize = quantize, fast_verify = fast_verify, **kwargs)
 
 
 def _checkpoint_keys(path: Path) -> dict[str, Path]:
@@ -2719,7 +2724,7 @@ def has_native_mtp_head(model_path: str | Path) -> bool:
     return _native_mtp_head(Path(model_path)) is not None or _merged_assistant(Path(model_path)) is not None
 
 
-def _merged_assistant_drafter(path: Path, target: nn.Module, *, lazy: bool) -> AssistantDrafter | None:
+def _merged_assistant_drafter(path: Path, target: nn.Module, *, lazy: bool, fast_verify: bool | None = None) -> AssistantDrafter | None:
     merged = _merged_assistant(path)
     if merged is None:
         return None
@@ -2732,19 +2737,19 @@ def _merged_assistant_drafter(path: Path, target: nn.Module, *, lazy: bool) -> A
         weights.update((key.removeprefix(_MERGED_ASSISTANT_PREFIX), shard[key]) for key in keys)
     # omlx keeps the merged assistant unquantized.
     model.load_weights(list(model.sanitize(weights).items()), strict = True)
-    return _built(AssistantDrafter, model, target, lazy = lazy)
+    return _built(AssistantDrafter, model, target, lazy = lazy, fast_verify = fast_verify)
 
 
-def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | AssistantDrafter | None:
+def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, fast_verify: bool | None = None, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | AssistantDrafter | None:
     """A drafter for the target's own MTP head, built in memory from only the MTP tensors of its
     checkpoint as mlx-vlm's MTP splitter would write it, or from a Gemma 4 assistant merged into it
-    (``_merged_assistant``); None when the checkpoint has neither."""
+    (``_merged_assistant``); None when the checkpoint has neither. ``fast_verify`` as in `companion_drafter`."""
     from mlx_vlm.fp8 import transform_fp8_weights
     from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors
 
     head = _native_mtp_head(Path(model_path))
     if head is None:
-        return _merged_assistant_drafter(Path(model_path), target, lazy = lazy)
+        return _merged_assistant_drafter(Path(model_path), target, lazy = lazy, fast_verify = fast_verify)
     splitter, source_config, text_config, rename, selected = head
     module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
     if not hasattr(module, "Model"):
@@ -2787,5 +2792,5 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool 
     from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
 
     if DRAFTER_KIND_BY_MODEL_TYPE.get(splitter.output_model_type) == "dflash":
-        return _built(ContextDrafter, model, target, lazy = lazy, **kwargs)
-    return _head_drafter(model, target, lazy = lazy, **kwargs)
+        return _built(ContextDrafter, model, target, lazy = lazy, fast_verify = fast_verify, **kwargs)
+    return _head_drafter(model, target, lazy = lazy, fast_verify = fast_verify, **kwargs)
