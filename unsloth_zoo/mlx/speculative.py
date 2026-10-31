@@ -2293,10 +2293,10 @@ class HeadDrafter:
     ``accept_verified_tokens`` replays (token, target hidden) pairs and, with nothing accepted, undoes a
     draft. Heads keep that state on the module, so each reply drafts with its own shallow copy."""
 
-    def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
+    def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128, prompt_tail: int | None = None):
         self.model = model
         self.target = target
-        self.max_lag = self.prompt_tail = max_lag
+        self.max_lag, self.prompt_tail = max_lag, prompt_tail or max_lag
 
     def new_cache(self) -> list:
         return []
@@ -2309,8 +2309,12 @@ class HeadDrafter:
             count = min(int(hidden.shape[1]), len(prompt))
             if hasattr(head, "_next_position"):
                 head._next_position = len(prompt) - count
-            self.push(row, [*prompt[len(prompt) - count + 1 :], pending], hidden[0, -count:])
-            self.catch_up([], [row])
+            tokens, hidden = [*prompt[len(prompt) - count + 1 :], pending], hidden[0, int(hidden.shape[1]) - count :]
+            # A tail longer than max_lag primes in max_lag pieces, as MTPDrafter does; EAGLE-3's whole prompt stays one replay.
+            piece = self.max_lag if self.prompt_tail > self.max_lag else max(count, 1)
+            for begin in range(0, count, piece):
+                self.push(row, tokens[begin : begin + piece], hidden[begin : begin + piece])
+                self.catch_up([], [row])
         return row, []
 
     def push(self, row: HeadRow, tokens: Sequence[int], hidden: mx.array) -> None:
@@ -2778,7 +2782,12 @@ def warm_speculative_rounds(model) -> None:
 def _head_drafter(model: nn.Module, target: nn.Module, **kwargs) -> MTPDrafter | HeadDrafter:
     from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 
-    return _built(MTPDrafter if type(model) is Qwen3_5MTPDraftModel else HeadDrafter, model, target, **kwargs)
+    if type(model) is Qwen3_5MTPDraftModel:
+        return _built(MTPDrafter, model, target, **kwargs)
+    if type(model) is getattr(sys.modules.get("mlx_vlm.speculative.drafters.qwen4_exp_mtp"), "Qwen4ExpMTPDraftModel", None):
+        # On a long prompt, qwen4_exp's head accepts more from the same tail as Qwen3.5's head.
+        kwargs.setdefault("prompt_tail", MTPDrafter.prompt_tail)
+    return _built(HeadDrafter, model, target, **kwargs)
 
 
 def _dense_table(model: nn.Module) -> nn.Module:
