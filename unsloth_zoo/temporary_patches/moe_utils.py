@@ -1748,7 +1748,7 @@ def _grouped_mm_runs_on(device):
 
 
 def _probe_torch_grouped_mm_supported(device = None):
-    global _TORCH_GROUPED_MM_SUPPORTED
+    global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE
     kind = _grouped_mm_foreign_kind(device)
     if kind is not None:
         supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
@@ -1767,6 +1767,9 @@ def _probe_torch_grouped_mm_supported(device = None):
         _TORCH_GROUPED_MM_SUPPORTED = False
     else:
         _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
+    # Answer the view check here so a cold compiled block does not graph-break on it.
+    if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is None:
+        _TRANSPOSED_VIEW_GROUPED_MM_SAFE = _TORCH_GROUPED_MM_SUPPORTED and _transposed_view_probe(device)
     return _TORCH_GROUPED_MM_SUPPORTED
 
 
