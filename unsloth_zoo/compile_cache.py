@@ -394,6 +394,26 @@ def _merge_recorded_artifacts(data):
 pass
 
 
+def _requeue_every_recorded_artifact():
+    """torch's serializer appends one batch per kind on each serialize and its deserialize keeps only the last batch of a
+    kind, so a second save in one process would drop the first save's artifacts; rebuild one batch per kind from every
+    recorded artifact so each save writes the whole set."""
+    try:
+        from torch.compiler._cache import CacheArtifactManager
+        recorded = list(CacheArtifactManager._seen_artifacts)
+        grouped = {}
+        for artifact in recorded:
+            grouped.setdefault(artifact.type(), []).append(artifact)
+        CacheArtifactManager._serializer.clear()
+        CacheArtifactManager._cache_info.clear()
+        CacheArtifactManager._new_cache_artifacts.clear()
+        for artifact_type, items in grouped.items():
+            CacheArtifactManager._new_cache_artifacts[artifact_type] = items
+    except Exception as error:
+        _log(f"artifact requeue skipped ({error})")
+pass
+
+
 def _recorded_identities():
     """Identities torch's artifact manager holds now, or None."""
     try:
@@ -594,6 +614,7 @@ def _save_locked(torch, key, directory, manifest_path):
     # Fold the on-disk bundle into the manager before serializing so a partial run cannot narrow it (union semantics; see _merge_recorded_artifacts).
     _, existing = _read_disk_bundle(directory, manifest_path)
     disk_ids = _merge_recorded_artifacts(existing) if existing is not None else None
+    _requeue_every_recorded_artifact()
     # Always serialize: it also records deferred Dynamo precompile entries.
     result = torch.compiler.save_cache_artifacts()
     if not result or not result[0]:
