@@ -1942,7 +1942,7 @@ def _settle_abandoned_checkpoint_generator():
 UNSLOTH_DECODE_COMPILE = [False]
 # [weakref to an eager stance Unsloth installed (True if torch has none), stance it replaced]
 UNSLOTH_EAGER_STANCE_OWNED = []
-# Shared by all generated modules; reset every generate() or decode skips compile (eager_on_recompile after run 1).
+# Shared by all generated modules; reset per generate() or decode step 1 skips compile.
 UNSLOTH_INFERENCE_RUNS = [0]
 
 

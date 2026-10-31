@@ -66,7 +66,6 @@ def _generated_module(body):
 
 
 def _generate(namespace, prompt_len, max_new_tokens):
-    """Mimics for_inference + generate(): default stance, reset, forwards."""
     torch.compiler.set_stance("default")
     reset = getattr(stance_utils, "unsloth_reset_inference_runs", None)
     if reset is not None:
