@@ -42,6 +42,24 @@ def _merge_on_the_cpu(monkeypatch):
     monkeypatch.setattr(saving_utils, "_active_merge_device", lambda: "cpu")
 
 
+def _reset_hub_sessions():
+    # huggingface_hub 0.x builds one HTTP session per thread and mounts its offline adapter only then, so a
+    # session an earlier test opened online keeps reaching the network after HF_HUB_OFFLINE is turned on. 1.x
+    # checks offline mode per request and has no such cache.
+    from huggingface_hub import utils as hub_utils
+
+    reset = getattr(hub_utils, "reset_sessions", None)
+    if reset is not None:
+        reset()
+
+
+@pytest.fixture(autouse = True)
+def _fresh_hub_sessions():
+    # Also after the test, so an offline session does not leak into the next test in this worker.
+    yield
+    _reset_hub_sessions()
+
+
 def _offline_cache(monkeypatch, tmp_path, base_dir, with_safetensors = True):
     """`base_dir` laid out as the cached `main` snapshot of REPO, with offline mode on."""
     from huggingface_hub import constants
@@ -59,6 +77,7 @@ def _offline_cache(monkeypatch, tmp_path, base_dir, with_safetensors = True):
     monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    _reset_hub_sessions()
 
 
 def _base(tmp_path, max_shard_size = "5GB"):
@@ -115,6 +134,18 @@ def test_merged_16bit_from_a_cached_base_offline(monkeypatch, tmp_path):
         family = FAMILY, base_tensors = H.read_safetensors_dir(base_dir), out_dir = out_dir,
         save_dtype = torch.float32, adapted = adapted,
     )
+
+
+def test_offline_mode_holds_after_an_online_session_was_opened(monkeypatch, tmp_path):
+    # Order independence: a session opened while online (any earlier Hub test in this worker) must not let
+    # the offline checks below reach the network.
+    from huggingface_hub.utils import get_session
+
+    get_session()
+    peft_model, base_dir = _base(tmp_path)
+    _offline_cache(monkeypatch, tmp_path, base_dir)
+    with pytest.raises(RuntimeError, match = "could not reach the Hugging Face Hub"):
+        saving_utils.check_hf_model_exists(REPO)
 
 
 @pytest.mark.parametrize("keep_index", [True, False])
