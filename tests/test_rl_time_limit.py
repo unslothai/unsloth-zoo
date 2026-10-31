@@ -14,10 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""execute_with_time_limit on the RL notebooks' path (unslothai/notebooks#122):
-the decorated function looks safe, so the signal backend is used, and the
-model-written strategy it calls swallows the TimeoutError. Each case runs in a
-subprocess because the bug is a hang."""
+"""Tests execute_with_time_limit on the RL notebooks path (unslothai/notebooks 122): the decorated function looks safe
+so the signal backend is used, and the model-written strategy swallows the TimeoutError; each case runs in a
+subprocess since the bug is a hang."""
 
 import os
 import signal
@@ -379,9 +378,8 @@ def _outer_timer():
 
 
 def _assert_outer_timer_restored(outer):
-    # time_limit puts back whatever ITIMER_REAL was armed before it, less the time
-    # it spent, so the end state is the caller's timer, not (0, 0). pytest-timeout's
-    # signal method arms one around every test (Core zoo runs with PYTEST_TIMEOUT).
+    # time_limit restores the ITIMER_REAL armed before it, minus elapsed time, not (0, 0); pytest-timeout's signal
+    # method arms one per test under PYTEST_TIMEOUT.
     (before_remaining, before_interval), read_at = outer
     remaining, interval = signal.getitimer(signal.ITIMER_REAL)
     elapsed = time.monotonic() - read_at
@@ -389,8 +387,7 @@ def _assert_outer_timer_restored(outer):
         assert (remaining, interval) == (0.0, 0.0)
         return
     assert interval == before_interval
-    # Rearming the caller's original duration would leave this near before_remaining,
-    # extending the caller's deadline by the time spent inside time_limit.
+    # Rearming the caller's original duration would leave the timer near before_remaining, extending the caller's deadline by the time spent inside time_limit.
     assert abs(remaining - (before_remaining - elapsed)) < _RESTORE_TOLERANCE_S, (
         remaining, before_remaining, elapsed,
     )
@@ -456,8 +453,7 @@ def test_an_outer_timer_and_handler_survive_a_timeout():
         assert elapsed >= 0.3
         assert abs(remaining - (100.0 - elapsed)) < _RESTORE_TOLERANCE_S, (remaining, elapsed)
     finally:
-        # Hand pytest-timeout (or whoever armed it) its timer back without the time
-        # this test spent, the same rule the test holds time_limit to.
+        # Hand pytest-timeout (or whoever armed it) its timer back minus the time this test spent, the same rule time_limit is held to.
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, saved_handler)
         if (saved_remaining, saved_interval) != (0.0, 0.0):

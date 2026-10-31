@@ -26,6 +26,7 @@ import textwrap
 
 import pytest
 import torch
+from _cpu_compiler_skip import skip_without_cpu_inductor
 
 pytest.importorskip("triton")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +35,8 @@ _SCRIPT = textwrap.dedent('''
     import json, os, sys
     import torch
     from unsloth_zoo import gpt_oss_decode_fused as F
+    # ROCm builds turn the fused decode off at import; its kernels are still checked under the interpreter.
+    F._ENABLED = True
     dev = sys.argv[1]
     res = {}
     # The Triton interpreter truncates fp32 -> bf16 instead of rounding: bf16 only on a GPU.
@@ -127,7 +130,7 @@ def _run(tmp_path, script, *args, env_extra = None):
 @pytest.fixture(scope = "module")
 def kernels(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("gpt_oss_decode_fused")
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and torch.version.hip is None:
         return _run(tmp, _SCRIPT, "cuda")
     return _run(tmp, _SCRIPT, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
 
@@ -209,6 +212,8 @@ _LOOP = textwrap.dedent('''
             F.FUSED_DECODE_CALLS["add_rms_norm"] += 1
             return h.to(x.dtype), x
         G._fused_add_rms_norm = _stand_in
+        # ROCm builds turn the fused decode off at import; the wiring still follows the kill switch here.
+        F._ENABLED = os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
         G._fused_decode_ok = lambda x: F._ENABLED and not torch.is_grad_enabled()
         # Without a GPU flex_attention reports unavailable and exports no decode helpers; the model
         # patch only imports them (eval on CPU runs eager attention).
@@ -245,8 +250,10 @@ _LOOP = textwrap.dedent('''
 @pytest.fixture(scope = "module")
 def loop_runs(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("gpt_oss_decode_loop")
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = "cuda" if torch.cuda.is_available() and torch.version.hip is None else "cpu"
     dtype = "bfloat16" if dev == "cuda" else "float32"
+    if dev == "cpu":
+        skip_without_cpu_inductor()
     return {
         arm: _run(
             tmp, _LOOP, dev, dtype,
@@ -273,7 +280,7 @@ def test_decode_loop_tokens_and_scores_match_eager(loop_runs):
     fused, eager = loop_runs["fused"], loop_runs["eager"]
     assert fused["tokens"] == eager["tokens"]
     diff = (torch.tensor(fused["scores"]) - torch.tensor(eager["scores"])).abs().max()
-    tol = 1e-4 if not torch.cuda.is_available() else 0.06
+    tol = 1e-4 if not (torch.cuda.is_available() and torch.version.hip is None) else 0.06
     assert diff <= tol, diff
 
 

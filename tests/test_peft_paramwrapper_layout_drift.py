@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""PEFT 3D-ParamWrapper layout drift canary (#5410). Fires if PEFT
-introduces a third layout. CPU only."""
+"""PEFT 3D-ParamWrapper layout drift canary (ref 5410): fails if PEFT introduces a third layout; CPU only."""
 
 from __future__ import annotations
 
@@ -48,14 +47,8 @@ class _ToyExperts(nn.Module):
 
 
 class _ToyMoE(nn.Module):
-    """Nests the fused parameter one level, as real GPT-OSS does.
-
-    PEFT 0.20.0 refuses to target an nn.Parameter on the top-level module
-    (tuners_utils.py, create_and_replace_param). Held flat, this canary raised
-    there and the wrap-failure skip below swallowed it, so it went permanently
-    vacuous on the newest supported PEFT. Real GPT-OSS has the parameter at
-    ...mlp.experts.gate_up_proj, so nesting is also the more faithful fixture.
-    """
+    """Nests the fused parameter one level like GPT-OSS (mlp.experts.gate_up_proj): PEFT 0.20.0 refuses to target an
+    nn.Parameter on the top-level module; a flat fixture raised and the wrap-failure skip hid it."""
     num_experts = NUM_EXPERTS
 
     def __init__(self):
@@ -88,9 +81,8 @@ def test_paramwrapper_lora_shape_is_one_of_two_known_layouts():
     except TypeError:
         pytest.skip("Installed PEFT does not accept target_parameters yet")
 
-    # Not a skip. PEFT has already said it supports target_parameters, so failing
-    # to wrap a correctly nested GPT-OSS-shaped parameter is the drift this test
-    # is for. Skipping here is how it stayed silently dead on PEFT 0.20.0.
+    # Must not skip: PEFT advertises target_parameters, so failing to wrap a correctly nested GPT-OSS-shaped parameter
+    # is the drift; skipping hid it on PEFT 0.20.0.
     peft_model = get_peft_model(base, cfg)
 
     lora_A = lora_B = None

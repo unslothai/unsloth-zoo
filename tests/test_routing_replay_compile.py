@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MoE routing replay: router hooks under torch.compile, probability routers whose forced experts
-underflow. CPU only."""
+"""MoE routing replay under torch.compile: router hooks, and probability routers whose forced experts underflow; runs on CPU only."""
 
 import pytest
 import torch
@@ -93,8 +92,7 @@ def test_underflowed_forced_probabilities_keep_natural_routing(replay):
 
 
 def test_hooked_decoder_inside_compiled_model_does_not_recompile(replay):
-    # An outer torch.compile traces the decoder pre hook too: its forward counter must not
-    # become a guard either.
+    # An outer torch.compile also traces the decoder pre hook: its forward counter must not become a guard either.
     class _Decoder(torch.nn.Module):
         def forward(self, inputs_embeds):
             return inputs_embeds * 2
@@ -116,8 +114,8 @@ def test_hooked_decoder_inside_compiled_model_does_not_recompile(replay):
 
 @pytest.mark.parametrize("far", [90.0, 200.0])
 def test_subnormal_forced_probabilities_keep_natural_routing(replay, far):
-    # Logits ~90 below the natural top-2 give nonzero subnormal fp32 probabilities: renormalising
-    # them gives finite weights but a backward of ~1 / total, which overflows to NaN.
+    # Logits ~90 below the natural top-2 give subnormal fp32 probabilities; renormalising gives finite weights but a
+    # backward of ~1 / total that overflows to NaN.
     replay._STATE.in_forward = True
     replay._STATE.current = torch.tensor([[[2, 3]]])
     router = _ProbsRouter()

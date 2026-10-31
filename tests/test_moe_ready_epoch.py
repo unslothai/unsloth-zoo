@@ -14,15 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""moe_ready_epoch: the grouped MoE readiness verdicts and NF4 pointer tables reused between
-expert-state changes, for the ModuleList blocks (transformers < 5 Qwen3-MoE / Mixtral / OLMoE)
-and gpt-oss NF4 experts.
-
-* Bitwise: outputs, losses and LoRA / input grads over optimizer steps equal UNSLOTH_MOE_FAST_READY=0.
-* Invalidation: after every change below, the fast verdict equals a fresh full check, and the fast
-  forward equals the FAST_READY=0 forward bitwise (a stale pointer table would differ).
-* Steady state: no full check and no table re-key per optimizer step, one lean re-read per block.
-"""
+"""Grouped MoE readiness verdicts and NF4 pointer tables reused across expert-state changes (transformers < 5
+ModuleList, gpt-oss NF4); bitwise equal to UNSLOTH_MOE_FAST_READY=0; verdicts match full checks after changes; steady
+state is one lean re-read per block per step."""
 import contextlib
 import os
 import sys
@@ -38,14 +32,13 @@ from unsloth_zoo.temporary_patches import moe_ready_epoch as RE  # noqa: E402
 from peft import LoraConfig  # noqa: E402
 from unsloth_zoo.temporary_patches import gpt_oss_grouped_qlora as GQ  # noqa: E402
 
-# The NF4 pointer-table stack kernel is CUDA-only (HIP has no libdevice mul_rn): elsewhere the
-# ModuleList path keeps the bitsandbytes builder and never builds `_unsloth_nf4_stack_tables`.
+# NF4 pointer-table stack kernel is CUDA-only (HIP has no libdevice mul_rn); elsewhere the ModuleList path keeps the
+# bitsandbytes builder and never builds _unsloth_nf4_stack_tables.
 NF4_TABLES = torch.cuda.is_available() and GQ.stacked_dequant_available(
     torch.device("cuda", torch.cuda.current_device()))
 needs_nf4_tables = pytest.mark.skipif(not NF4_TABLES, reason = "stacked NF4 dequant kernel is CUDA-only")
 
-# Every case here builds through L.build, so it needs what that module needs: importing it does
-# not carry its module-level skip over to this file.
+# Cases build through L.build, so they need what that module needs; importing it does not carry its module-level skip over to this file.
 pytestmark = L.pytestmark
 
 FAST = "UNSLOTH_MOE_FAST_READY"
@@ -186,8 +179,7 @@ def test_modulelist_bitwise_vs_switch_off(base, stack, ckpt):
 
 @pytest.mark.parametrize("opt", ["adamw", "adamw8bit"])
 def test_modulelist_steady_state_counters(opt):
-    """One lean re-read per block per optimizer step, everything else cheap (forward, checkpoint
-    replay, backward rebuilds); no full check, no table re-key."""
+    """Steady state: one lean re-read per block per optimizer step; forward, checkpoint replay and backward rebuilds stay cheap, with no full check or table re-key."""
     model, blk = _ml("nf4", True)
     blk.train()
     params = [p for p in model.parameters() if p.requires_grad]
@@ -229,8 +221,8 @@ def test_kill_switch_reads_every_expert(monkeypatch):
     assert calls[0] == L.E and set(calls[1:]) == {2}   # one full read, then only the end experts
 
 
-# One test per invalidation path: `change(model, blk)` then the fast verdict / forward must equal
-# the full check's. `grouped`: expected verdict after the change (None: not asserted).
+# One test per invalidation path: after change(model, blk) the fast verdict and forward must equal the full check;
+# grouped is the expected verdict (None: not asserted).
 def _add_and_switch(model, blk):
     model.add_adapter("b", LoraConfig(r = 8, lora_alpha = 16, target_modules = ["gate_proj", "up_proj", "down_proj"]))
     with torch.no_grad():

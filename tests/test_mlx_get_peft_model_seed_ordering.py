@@ -30,13 +30,8 @@ def _get_peft_model_source():
 
 
 def test_seed_immediately_precedes_each_linear_to_lora_layers_call():
-    """Every adapter-constructing call in get_peft_model must be
-    preceded within ~20 lines by `_seed_mlx_random_state`.
-
-    Empirically (probe 39 on Apple Silicon), a far-away seed lets lazy
-    MLX state advances slip in before lora_a init, diverging from mlx-lm
-    CLI; fix is to seed immediately above each LoRA construction.
-    """
+    """Every adapter-constructing call in get_peft_model must be preceded within ~20 lines by _seed_mlx_random_state
+    (seed right above it); farther, lazy MLX state diverges from mlx-lm CLI."""
     src = _get_peft_model_source()
     lines = src.splitlines()
 
@@ -70,9 +65,7 @@ def test_get_peft_model_still_accepts_random_state_arg():
 
 
 def test_no_other_mlx_op_between_seed_and_linear_to_lora_layers():
-    """Only comment lines may sit between the seed call and the
-    linear_to_lora_layers call; anything else risks an mx.eval/random op
-    slipping in later. Enforced as a regex tripwire."""
+    """Only comments may separate the seed call from linear_to_lora_layers; an MLX op could slip in."""
     src = _get_peft_model_source()
     pattern = re.compile(
         r"_seed_mlx_random_state\(random_state\)\s*"

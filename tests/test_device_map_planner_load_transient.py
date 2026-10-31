@@ -34,12 +34,8 @@ from unsloth_zoo.device_map_planner import (
 )
 
 def _has_conversion_mapping() -> bool:
-    """Whether this transformers ships its own conversion_mapping, the one that merges on load.
-
-    On transformers 4.x, unsloth's import fixes put a stand-in module there for peft, built with
-    no __spec__. find_spec raises ValueError on such an entry, which took this whole file down at
-    collection in unsloth's Core zoo job. The stand-in merges nothing, so it counts as absent.
-    """
+    """Whether transformers ships its own conversion_mapping (the one that merges on load); on 4.x a __spec__-less
+    stand-in from unsloth's import fixes makes find_spec raise ValueError, so it counts as absent."""
     module = sys.modules.get("transformers.conversion_mapping")
     if module is not None:
         return getattr(module, "__spec__", None) is not None

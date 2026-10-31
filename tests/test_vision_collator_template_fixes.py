@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Vision collator fixes: Command A Vision marker split by an image, Nemotron Omni pixel lists,
-MiniMax-M3 / Step-3.7 remote processors. Hermetic CPU tests."""
+"""Vision collator fixes: Command A Vision marker split by an image, Nemotron Omni pixel lists, MiniMax-M3 and Step-3.7 remote processors; hermetic CPU tests."""
 
 from __future__ import annotations
 

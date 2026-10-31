@@ -14,9 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fused linear CE / log-probs (torch.library ops, Triton row kernels on GPU) against an fp64 oracle, the chunked CE
-it replaces, and torch.compile(fullgraph=True)."""
+"""Fused linear CE and log-probs vs an fp64 oracle, the chunked CE, and torch.compile(fullgraph=True)."""
 
+import contextlib
 import os
 
 import numpy
@@ -29,6 +29,23 @@ from unsloth_zoo.fused_losses.fused_linear import fused_linear_cross_entropy, fu
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 TRITON = pytest.mark.skipif(not (torch.cuda.is_available() and fl._HAS_TRITON), reason = "needs CUDA and Triton")
+
+
+@contextlib.contextmanager
+def _no_blas_workspace():
+    """torch 2.15 binds a fresh cuBLAS workspace per GEMM (no warm-up avoids it); size 0 keeps it out of the peak."""
+    b = torch.backends.cuda
+    if not hasattr(b, "cublaslt_workspace_size"):  # older torch: cached per handle, the warm-up already paid for it
+        yield
+        return
+    old = b.cublas_workspace_size(), b.cublaslt_workspace_size()
+    b.cublaslt_workspace_size(0)
+    b.cublas_workspace_size(0)
+    try:
+        yield
+    finally:
+        b.cublas_workspace_size(old[0])
+        b.cublaslt_workspace_size(old[1])
 
 
 @pytest.fixture(autouse = True)
@@ -491,8 +508,8 @@ def test_opcheck():
 @pytest.mark.parametrize("V", [4096, 4096 * 3 + 5, 151936])
 @pytest.mark.parametrize("mode", ["0", "1", "2"])
 def test_gpu_accuracy_modes_and_inplace(monkeypatch, V, mode):
-    """Every accuracy mode (fp32 logits + in-place half gradient, half logits + exact target, plain half), with
-    several vocab blocks per row so the in-place gradient overlaps logits other warps still read."""
+    """Every accuracy mode (fp32 logits + in-place half grad; half logits + exact target; plain half), several vocab
+    blocks per row so in-place grad overlaps logits other warps read."""
     monkeypatch.setattr(fl, "_ACCURACY", mode)
     dtype = torch.bfloat16 if _half_ok("cuda") else torch.float16
     N, H = 300, 64
@@ -927,8 +944,9 @@ def test_trainable_head_long_context_skips_the_rows_accumulator():
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    loss.backward()
-    torch.cuda.synchronize()
+    with _no_blas_workspace():
+        loss.backward()
+        torch.cuda.synchronize()
     extra = torch.cuda.max_memory_allocated() - base
     assert extra < N * H * 4 * 1.75, extra / 2**20
 

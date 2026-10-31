@@ -34,8 +34,8 @@ def test_no_block_pointer_calls():
 
 
 def test_autotune_keys_are_kernel_arguments():
-    # triton main rejects an autotune key that is not a kernel argument at import, which
-    # made the whole vendored tree fail to inject (fla #1330 dropped the stale BT key).
+    # triton main rejects an autotune key that is not a kernel argument at import, which broke injection of the whole
+    # vendored tree; upstream fla 1330 dropped the stale BT key.
     bad = []
     for path in sorted(VENDORED.rglob("*.py")):
         for fn in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
@@ -65,8 +65,7 @@ def _free_gib():
         return 0.0
 
 
-# One sequence whose in-sequence offsets (t * H * K) pass 2**31: the full pass must match
-# the same sequence split in two halves chained through the state.
+# One sequence whose in-sequence offsets (t * H * K) pass 2**31; the full pass must match the same sequence run as two halves chained through the state.
 _SUBPROCESS = textwrap.dedent(
     """
     import os
@@ -113,8 +112,8 @@ _SUBPROCESS = textwrap.dedent(
 )
 
 
-# chunk_global_cumsum scans one sequence in a loop: zeros with ones on the last 4 tokens give
-# exact small integers, so the tail past 2**31 elements must read back [1, 2, 3, 4] / [4, 3, 2, 1].
+# chunk_global_cumsum scans one sequence in a loop; zeros with ones on the last 4 tokens give exact small integers, so
+# the tail past 2**31 elements must read back [1, 2, 3, 4] / [4, 3, 2, 1].
 _CUMSUM_SUBPROCESS = textwrap.dedent(
     """
     import os

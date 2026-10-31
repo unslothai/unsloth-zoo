@@ -1,9 +1,4 @@
-"""Tests for resolve_file_uri_to_path and file:// handling in media readers.
-
-Naive `path[7:]` stripping broke file://localhost/... URIs (producing the
-unopenable "localhost/...") and never decoded percent-escapes, so valid URIs
-failed deep inside the video decoder with unrelated errors.
-"""
+"""Tests resolve_file_uri_to_path and file:// handling in media readers: naive path[7:] stripping broke file://localhost/... URIs and never decoded percent-escapes."""
 import pytest
 
 from unsloth_zoo.vision_utils import resolve_file_uri_to_path

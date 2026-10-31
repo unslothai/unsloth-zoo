@@ -1,35 +1,18 @@
-"""End-to-end: train_on_responses_only must actually mask for vision models.
-
-For one representative model per marker style this builds a REAL
-UnslothVisionDataCollator and runs a real image+text example through __call__,
-two ways, asserting the labels are content-exact (assistant response trained, user
-text masked, image/pad tokens masked):
-  (A) constructor:  UnslothVisionDataCollator(..., train_on_responses_only=True, parts)
-  (B) in-place:     bare UnslothVisionDataCollator(model, processor), then
-                    train_on_responses_only(trainer) enables masking on the collator.
-Path (B) is the case where a user keeps the default vision collator and calls
-train_on_responses_only(trainer) separately (most vision notebooks build the bare
-collator).
-
-Network/integration test, OFF by default. Enable with
-    UNSLOTH_TEST_VLM_COLLATOR=1 pytest tests/test_vlm_collator_masking.py
-Processors are fetched config-only; set UNSLOTH_VLM_PROC_CACHE to reuse a cache dir.
-Models that need a newer transformers to load are skipped, not failed.
-"""
+"""Network test, off unless UNSLOTH_TEST_VLM_COLLATOR=1: train_on_responses_only must mask vision labels
+content-exactly, via the collator constructor or in place on a bare collator; models needing newer transformers skip;
+UNSLOTH_VLM_PROC_CACHE sets the cache dir."""
 import os, sys, types, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-# unsloth_zoo is imported lazily inside _check: at module scope its __init__ raises
-# ImportError without the `unsloth` package, breaking collection before the skip gate runs.
+# unsloth_zoo is imported lazily inside _check: its module-scope __init__ raises ImportError without the unsloth package and would break collection.
 
 ENABLED = os.environ.get("UNSLOTH_TEST_VLM_COLLATOR", "") not in ("", "0", "false")
 CACHE = os.environ.get("UNSLOTH_VLM_PROC_CACHE", os.path.join(tempfile.gettempdir(), "unsloth_vlm_proc"))
 ALLOW = ["*.json", "*.jinja", "*.model", "*.txt", "tokenizer*", "merges*", "vocab*"]
 
-# one model per marker style: ChatML, Gemma-3-turn, Gemma-4-turn, Llama-header,
-# Mistral-[INST]. The Gemma-4 / Qwen3.5 entries need a newer transformers and skip
-# (not fail) where it is too old to load them.
+# One model per marker style: ChatML, Gemma-3-turn, Gemma-4-turn, Llama-header, Mistral-[INST]; Gemma-4 and Qwen3.5
+# entries skip, not fail, on too-old transformers.
 MODELS = [
     ("unsloth/Qwen2-VL-2B-Instruct", "<|im_start|>user\n", "<|im_start|>assistant\n"),
     ("unsloth/Qwen3.5-2B", "<|im_start|>user\n", "<|im_start|>assistant\n"),
@@ -47,8 +30,8 @@ def _fetch(repo):
     path = os.path.join(CACHE, repo.replace("/", "__"))
     cached = os.path.isdir(path) and any(f.startswith("tokenizer") for f in os.listdir(path))
     if not cached:
-        # Downloads are opt-in: without the flag an uncached repo raises (-> _check SKIP)
-        # instead of fetching, even if CACHE exists from a prior partial run.
+        # Downloads are opt-in (UNSLOTH_TEST_VLM_COLLATOR=1): an uncached repo raises (-> _check SKIP) instead of
+        # fetching, even if CACHE exists from a partial run.
         if not ENABLED:
             raise RuntimeError(f"{repo} not cached; set UNSLOTH_TEST_VLM_COLLATOR=1 to download")
         from huggingface_hub import snapshot_download
@@ -86,9 +69,8 @@ def _content_exact(collator, proc):
 
 
 def _check(repo, ins, res):
-    # Import inside the try so a zoo-only CI without the `unsloth` package (whose absence makes
-    # unsloth_zoo/__init__ raise ImportError) turns into a SKIP, not a hard error, when run() is
-    # reached via an existing cache dir with the env flag unset.
+    # Import inside the try: without the unsloth package unsloth_zoo/__init__ raises ImportError, which must SKIP (not
+    # error) for a cached run with the flag unset.
     try:
         from transformers import AutoProcessor, AutoConfig
         from unsloth_zoo.vision_utils import UnslothVisionDataCollator

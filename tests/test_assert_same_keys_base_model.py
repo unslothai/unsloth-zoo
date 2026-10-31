@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression test for PR #95.
-
-`assert_same_keys` (called from `create_lora_statistics` when `return_state_dict=True`,
-the default, on every merged_16bit save) resolved the base model with a one-shot
-`model.base_model.model` access. For a PEFT wrapping whose `base_model` object has no
-`.model` attribute (e.g. Phi-3 / Phi-4-mini, where `base_model` is the transformer body
-itself), that access raised `AttributeError` and crashed the save.
-
-`create_lora_statistics` builds the compared `new_state_dict` from
-`find_lora_base_model(model)`, which guards each level. Resolving `inner_model` in
-`assert_same_keys` the same way both avoids the crash and keeps the key comparison
-like-for-like. These tests fail (AttributeError) before the fix and pass after it.
-"""
+"""Regression for PR 95: assert_same_keys must resolve inner_model with the guarded find_lora_base_model walk, since
+model.base_model.model raised AttributeError when base_model has no .model (Phi-3, Phi-4-mini); the same walk keeps
+key comparison like-for-like."""
 import pytest
 import torch
 import torch.nn as nn
@@ -48,8 +38,7 @@ class _BaseNoModel(nn.Module):
 
 
 class _PeftLikeNoInnerModel(nn.Module):
-    """``model.base_model`` exists but ``base_model`` has no ``.model`` -> the old
-    ``model.base_model.model`` access raised AttributeError here."""
+    """model.base_model exists but has no .model attribute, so the old model.base_model.model access raised AttributeError."""
 
     def __init__(self, base):
         super().__init__()

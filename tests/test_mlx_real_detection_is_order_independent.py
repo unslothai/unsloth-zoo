@@ -1,25 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Asking "is mlx importable" is not asking "is this real mlx".
-
-``simulate_mlx_on_torch`` installs process-wide: it puts ``mlx`` in sys.modules and
-a finder in sys.meta_path. One test module calls it while being IMPORTED, and
-collection imports every module in the session, so from that point on
-``importlib.util.find_spec("mlx")`` returns a spec for every module collected
-afterwards -- whether or not it asked for the shim.
-
-A module that gates real-MLX tests on that spec therefore decides what to run based
-on COLLECTION ORDER. That is what happened: test_mlx_gated_delta_vjp.py read
-``find_spec("mlx") is not None`` as "on real MLX", and when a new sibling sorting
-before it (test_mlx_arrays_cache_advance.py, #1127) started installing the shim at
-import, five `requires_real_mlx` tests stopped skipping and ran against a shim where
-``mx.argpartition`` is a ``_Noop``. Alone the file passed; in the suite it failed.
-Nothing was wrong with the new test, and nothing was wrong with the code under test.
-
-``mlx_is_simulated()`` is the question that has an order-independent answer, and
-these pin both halves: that the trap is real, and that no test module falls into it.
-"""
+"""Real-MLX gates must ask mlx_is_simulated(), not find_spec('mlx'): the process-wide shim makes find_spec see mlx for
+every module collected after one installs it; these tests pin the trap and check that no module falls into it."""
 
 from __future__ import annotations
 
@@ -49,12 +32,7 @@ def _find_spec_mlx_calls(tree: ast.AST) -> list[ast.Call]:
 
 
 def _is_install_guard(tree: ast.AST, call: ast.Call) -> bool:
-    """True for ``if find_spec("mlx") is None: simulate_mlx_on_torch()``.
-
-    That spelling is fine and is not what breaks: it only decides whether to INSTALL
-    the shim, and installing when one is already installed is a no-op. The dangerous
-    spelling is the negation, ``is not None``, which is read as "real mlx is here".
-    """
+    """Install guard 'if find_spec('mlx') is None' is safe since re-installing is a no-op; the negated 'is not None' spelling is the dangerous one, read as real mlx."""
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
@@ -98,15 +76,8 @@ def test_real_mlx_is_not_decided_by_find_spec_alone(path: Path):
 
 
 def _in_a_shimmed_process(body: str):
-    """Run ``body`` in a fresh interpreter that has the shim installed.
-
-    Installing it HERE would be wrong on a machine that has real MLX. The shim is
-    process-wide and permanent -- it displaces `mlx` in sys.modules for every test
-    that follows, and mlx-vlm registers an atexit handler calling mx.clear_streams,
-    which then lands on a `_Noop` and prints an ignored exception at interpreter
-    shutdown. On Linux CI nothing notices, because there the shim is all there is.
-    A subprocess is what keeps these checks honest on Apple Silicon.
-    """
+    """Runs body in a subprocess, since the shim is process-wide and permanent and would displace real mlx on Apple
+    Silicon; mlx-vlm's atexit mx.clear_streams then hits a _Noop."""
     import subprocess
     import sys as _sys
 
@@ -125,12 +96,7 @@ def _in_a_shimmed_process(body: str):
 
 
 def test_the_shim_makes_find_spec_lie():
-    """The trap itself, so the rule above keeps its reason when someone reads it.
-
-    If this ever fails because find_spec stops seeing the shim, the guard is
-    obsolete rather than merely unsatisfied, and should be reconsidered, not
-    silenced.
-    """
+    """Pins the find_spec trap itself; if find_spec stops seeing the shim the guard is obsolete and should be reconsidered, not silenced."""
     _in_a_shimmed_process(
         "import importlib.util\n"
         "assert importlib.util.find_spec('mlx') is not None, (\n"
@@ -142,12 +108,7 @@ def test_the_shim_makes_find_spec_lie():
 
 
 def test_the_shim_does_not_implement_the_ops_the_gate_protects():
-    """Why an order-dependent gate is a real failure and not a cosmetic one.
-
-    These are exactly the symbols the five gated-delta VJP tests reached when the
-    gate wrongly said "real MLX". A `_Noop` raises on CALL, not on attribute access,
-    so nothing catches it until the test is already running.
-    """
+    """An order-dependent gate is a real failure: these are the symbols the five gated-delta VJP tests reached, and _Noop raises on call, not on attribute access."""
     _in_a_shimmed_process(
         "import mlx.core as mx\n"
         "for symbol in ('argpartition', 'put_along_axis'):\n"
@@ -162,22 +123,12 @@ def test_the_shim_does_not_implement_the_ops_the_gate_protects():
     )
 
 
-# The same rule, asked of the VALUE rather than of the source.
-#
-# Everything above is syntactic: it proves a module consults mlx_is_simulated(),
-# not that it consults it correctly. `find_spec("mlx") is not None OR not
-# mlx_is_simulated()` satisfies the rule and is still True under the shim, and a
-# gate computed before the module installs its own shim would pass too. So each
-# gate is also EVALUATED, in a subprocess with the shim already up, which is the
-# state a sibling module leaves behind during collection.
+# Source checks are syntactic, so each gate is also evaluated with the shim already up; 'find_spec('mlx') is not None or
+# not mlx_is_simulated()' passes the source rule yet is still True under the shim.
 
 def _gate_assignments(tree: ast.AST) -> set:
-    """Module-level names whose value is derived from a real-mlx probe.
-
-    Three spellings are in use: find_spec("mlx"), mlx_is_simulated(), and reading
-    "mlx_simulation" out of mx.__file__. Anything built from one of those is a gate,
-    whatever it is named -- the suite currently uses _HAS_REAL_MLX, _HAS_MLX and _MLX.
-    """
+    """Module-level names built from a real-mlx probe (find_spec('mlx'), mlx_is_simulated(), or 'mlx_simulation' in
+    mx.__file__) count as gates whatever they are named."""
     def _is_probe(value) -> bool:
         for node in ast.walk(value):
             if isinstance(node, ast.Call):
@@ -256,22 +207,11 @@ def test_a_gate_evaluates_to_false_under_the_shim(path: Path, names: list):
     )
 
 
-# `importorskip` is a third spelling of the same mistake, and the one that got
-# through: the rule above reads find_spec calls, and test_mlx_attention_metal.py
-# had none. It gated on `pytest.importorskip("mlx.core")` succeeding, which the
-# shim satisfies just as happily as find_spec does, and ran 40 tests against a
-# simulation that refuses the operation they are built on.
-#
-# Flagging every importorskip("mlx") module would be wrong: 12 of the 14 are
-# fine, because the shim implements what they use. What separates the two that
-# are not is that they call an operation the shim REFUSES, so that is the
-# question asked here, and the refused set is read off the shim rather than
-# listed, so a new refusal widens this automatically.
+# importorskip('mlx.core') passes on the shim too, so flag only modules calling an op the shim refuses (12 of the 14
+# such modules are fine); the refused set is read off the shim.
 
 
-# `mlx` itself or a submodule of it. `importorskip("mlx_vlm...")` is a different package, and
-# test_mlx_training_e2e_metal.py uses it inside tests that are already Metal-gated: the prefix
-# alone read that as an mlx gate (#1329).
+# Matches importorskip of mlx or its submodules only; mlx_vlm is a different package, and a bare prefix match once read it as an mlx gate (issue 1329).
 _MLX_IMPORTORSKIP = re.compile(r"""importorskip\(\s*["']mlx(?:["']|\.)""")
 
 
@@ -295,11 +235,7 @@ def _shim_refused_ops() -> set:
 
 
 def _consults_the_simulation(source: str) -> bool:
-    """Either spelling of the order-independent question is accepted.
-
-    ``mlx_is_simulated()`` is the helper; test_mlx_quantized_optimizer_state.py
-    open-codes the same check against ``mx.__file__`` and is equally correct.
-    """
+    """Either mlx_is_simulated() or an open-coded mx.__file__ check answers the order-independent question; test_mlx_quantized_optimizer_state.py uses the latter."""
     return "mlx_is_simulated" in source or "mlx_simulation" in source
 
 

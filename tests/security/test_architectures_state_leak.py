@@ -1,17 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Rejecting an architecture must not leave process-wide state changed.
-
-`create_empty_vision_model` replaces `SiglipVisionModel._init_weights` with a no-op so
-meta-device construction skips initialisation, and restores it at the end. A guard that
-raises between those two points would leave every later SigLIP model in the process
-skipping weight init, which is silent and would not show up as an error anywhere near
-the cause. So the architecture check runs before the patch, not after.
-
-CPU-only and network-free: the config is built in memory and rejected before anything
-is constructed.
-"""
+"""Rejection must not leave SiglipVisionModel._init_weights patched; arch check runs before patching."""
 
 from __future__ import annotations
 
@@ -46,8 +36,7 @@ def test_a_rejected_architecture_leaves_init_weights_untouched():
 
 
 def test_the_check_precedes_the_patch_in_the_source():
-    """Pins the ordering the test above relies on, so a later edit cannot silently
-    reintroduce the leak by moving the guard back down."""
+    """Pins the check-before-patch ordering; moving the guard below the patch reintroduces the leak."""
     import inspect
     from unsloth_zoo import empty_model
 
@@ -59,12 +48,7 @@ def test_the_check_precedes_the_patch_in_the_source():
 
 
 def test_cancelling_mid_load_still_restores_init_weights(monkeypatch):
-    """A KeyboardInterrupt during construction must not leave the patch installed.
-
-    `except Exception` does not catch KeyboardInterrupt, and cancelling a cell partway
-    through a load is ordinary notebook behaviour. Without a finally, one cancel leaves
-    every later SigLIP model skipping weight init.
-    """
+    """KeyboardInterrupt mid-load must not leave the patch installed; needs finally, not except Exception."""
     import transformers
     from unsloth_zoo import empty_model
 
