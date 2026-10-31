@@ -2768,6 +2768,8 @@ _DOWN_ROWS = 4
 _INPUTS = {
     "gate_up": ("wg", "sg", "bg", "wu", "su", "bu", "x", "inds", "k", "n", "top_k"),
     "down": ("w", "ws", "wb", "x", "inds", "scores", "shared", "s", "k", "n", "top_k"),
+    "gate_up_fold": ("wg", "sg", "bg", "wu", "su", "bu", "cg", "csg", "cbg", "cu", "csu", "cbu", "x", "inds", "k", "n", "top_k", "routes"),
+    "down_fold": ("w", "ws", "wb", "cw", "cs", "cb", "x", "inds", "scores", "shared", "k", "n", "top_k", "routes"),
 }
 
 _QDOT = r"""
@@ -2844,13 +2846,17 @@ struct Terms<U, values_per_thread, 3> {
 template <typename U, int values_per_thread>
 struct Terms<U, values_per_thread, 4> {
   U t[values_per_thread];
+  // Codes as subnormal halves, q * 2^-24: no integer conversion, about 10% of a route's time on M5. With x left
+  // unscaled every product is stock's times 2^-24 exactly, so sums round alike unless a product underflows fp32.
   void load(const device uint8_t* w) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
-      t[4 * i] = ws[i] & 0x000f;
-      t[4 * i + 1] = ws[i] & 0x00f0;
-      t[4 * i + 2] = ws[i] & 0x0f00;
-      t[4 * i + 3] = ws[i] & 0xf000;
+    const device uint* ws = (const device uint*)w;
+    UNROLL for (int i = 0; i < values_per_thread / 8; i++) {
+      const uint v = ws[i];
+      UNROLL for (int m = 0; m < 4; m++) {
+        const half2 c = as_type<half2>((v >> (4 * m)) & 0x000F000Fu);
+        t[8 * i + m] = c.x;
+        t[8 * i + 4 + m] = c.y;
+      }
     }
   }
   U dot(const thread U* x) {
@@ -2944,6 +2950,27 @@ struct Terms<U, values_per_thread, 8> {
     return accum;
   }
 };
+
+// x as `Terms<bits>` reads it; a dot of its 4-bit codes wants `code_unit` on its scale.
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_terms_x(const device T* x, thread U* x_thread) {
+  if constexpr (bits != 4) {
+    return load_vector<T, U, values_per_thread, bits>(x, x_thread);
+  } else {
+    U sum = 0;
+    UNROLL for (int i = 0; i < values_per_thread; i += 4) {
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1];
+      x_thread[i + 2] = x[i + 2];
+      x_thread[i + 3] = x[i + 3];
+    }
+    return sum;
+  }
+}
+
+template <int bits>
+constexpr float code_unit() { return bits == 4 ? 16777216.0f : 1.0f; }
 #else
 template <typename T, int bits, int fast>
 struct Lane {
@@ -3051,7 +3078,7 @@ struct Dots {
     UNROLL for (int o = 0; o < out; o++) {
       terms.load(p.w + o * K_w);
 #ifdef UNSLOTH_AFFINE
-      U s = p.s[o * K_g];
+      U s = p.s[o * K_g] * code_unit<bits>();
       U b = p.b[o * K_g];
       result[o] += s * terms.dot(xt) + sum * b;
 #else
@@ -3071,7 +3098,7 @@ struct Dots {
       // qmv's last block: lanes past K add nothing.
       if (fast || k + lane_id * values_per_thread < K) {
 #ifdef UNSLOTH_AFFINE
-        sum = load_vector<T, U, values_per_thread, bits>(x, xt);
+        sum = load_terms_x<T, U, values_per_thread, bits>(x, xt);
 #else
         load_vector<T, U, values_per_thread>(x, xt);
 #endif
@@ -3092,7 +3119,7 @@ struct Dots {
   }
 };
 
-template <typename T, int group_size, int bits, int out, int fast, typename Inds>
+template <typename T, int group_size, int bits, int out, int fast>
 METAL_FUNC void gate_up_rows(
     const device uint8_t* wg,
     const device uint8_t* sg,
@@ -3101,7 +3128,8 @@ METAL_FUNC void gate_up_rows(
     const device uint8_t* su,
     const device uint8_t* bu,
     const device T* x,
-    Inds inds,
+    int64_t e,
+    uint row,
     device T* y,
     ExpertParams p,
     uint3 tid,
@@ -3109,8 +3137,7 @@ METAL_FUNC void gate_up_rows(
   typedef Dots<T, group_size, bits, out, fast> dots;
   const int lane = lid.x;
   const int n0 = tid.x * (2 * out) + lid.y * out;
-  const int64_t e = inds[tid.y];
-  x += size_t(tid.y / p.top_k) * p.K;
+  x += size_t(row) * p.K;
   y += size_t(tid.y) * p.N + n0;
   thread typename dots::U result[2 * out] = {};
   thread typename dots::Proj proj[2] = {
@@ -3129,11 +3156,16 @@ METAL_FUNC void gate_up_rows(
   }
 }
 
-template <typename T, int group_size, int bits, int out, int fast, typename Inds, typename Scores, typename Shared, typename S>
+// With `fold`, a row's top_k routes take one more simdgroup, the shared expert's, whose rows follow the `routes` routes in x.
+template <typename T, int group_size, int bits, int out, int fast, int fold, typename Inds, typename Scores, typename Shared, typename S>
 METAL_FUNC void down_rows(
     const device uint8_t* w,
     const device uint8_t* ws,
     const device uint8_t* wb,
+    const device uint8_t* cw,
+    const device uint8_t* cs,
+    const device uint8_t* cb,
+    size_t routes,
     const device T* x,
     Inds inds,
     Scores scores,
@@ -3149,22 +3181,35 @@ METAL_FUNC void down_rows(
   const int lane = lid.x;
   const int n0 = tid.x * out;
   const size_t route = size_t(tid.y) * p.top_k;
-  for (int slot = lid.y; slot < p.top_k; slot += lsize.y) {
-    const int64_t e = inds[route + slot];
+  for (int slot = lid.y; slot < p.top_k + fold; slot += lsize.y) {
+    const bool common = fold && slot == p.top_k;
+    const T score = common ? T(0) : T(scores[route + slot]);
     thread typename dots::U result[out] = {};
-    thread typename dots::Proj proj = dots::proj(w + e * p.w[0][0], ws + e * p.w[0][1], wb + e * p.w[0][2], p.K, n0, lane);
-    dots::template run<1>(&proj, x + (route + slot) * p.K, p.K, lane, result);
-    const T score = scores[route + slot];
+    thread typename dots::Proj proj;
+    if (common) {
+      proj = dots::proj(cw, cs, cb, p.K, n0, lane);
+      dots::template run<1>(&proj, x + (routes + tid.y) * p.K, p.K, lane, result);
+    } else {
+      const int64_t e = inds[route + slot];
+      proj = dots::proj(w + e * p.w[0][0], ws + e * p.w[0][1], wb + e * p.w[0][2], p.K, n0, lane);
+      dots::template run<1>(&proj, x + (route + slot) * p.K, p.K, lane, result);
+    }
     UNROLL for (int o = 0; o < out; o++) {
       if (lane == o) {
-        products[slot * out + o] = static_cast<T>(result[o]) * score;
+        products[slot * out + o] = common ? static_cast<T>(result[o]) : static_cast<T>(result[o]) * score;
       }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lid.y == 0 && lane < out) {
     const size_t i = size_t(tid.y) * p.N + n0 + lane;
-    y[i] = shared_add(slot_sum<T>(products + lane, out, p.top_k), shared[tid.y], s[i]);
+    T common;
+    if constexpr (fold) {
+      common = products[p.top_k * out + lane];
+    } else {
+      common = s[i];
+    }
+    y[i] = shared_add(slot_sum<T>(products + lane, out, p.top_k), shared[tid.y], common);
   }
 }
 """
@@ -3177,13 +3222,35 @@ _BODIES = {
   gate_up_rows<T, group_size, bits, out, fast>(
       (const device uint8_t*)wg, (const device uint8_t*)sg, (const device uint8_t*)bg,
       (const device uint8_t*)wu, (const device uint8_t*)su, (const device uint8_t*)bu,
-      x, inds, y, p, threadgroup_position_in_grid, thread_position_in_threadgroup);
+      x, inds[threadgroup_position_in_grid.y], threadgroup_position_in_grid.y / top_k, y, p,
+      threadgroup_position_in_grid, thread_position_in_threadgroup);
+""",
+    "gate_up_fold": r"""
+  const ExpertParams p{k, n, top_k, {
+      {wg_strides[0] * int64_t(sizeof(*wg)), sg_strides[0] * int64_t(sizeof(*sg)), bg_strides[0] * int64_t(sizeof(*bg))},
+      {wu_strides[0] * int64_t(sizeof(*wu)), su_strides[0] * int64_t(sizeof(*su)), bu_strides[0] * int64_t(sizeof(*bu))}}};
+  const int route = threadgroup_position_in_grid.y;
+  const bool common = route >= routes;
+  gate_up_rows<T, group_size, bits, out, fast>(
+      common ? (const device uint8_t*)cg : (const device uint8_t*)wg, common ? (const device uint8_t*)csg : (const device uint8_t*)sg,
+      common ? (const device uint8_t*)cbg : (const device uint8_t*)bg, common ? (const device uint8_t*)cu : (const device uint8_t*)wu,
+      common ? (const device uint8_t*)csu : (const device uint8_t*)su, common ? (const device uint8_t*)cbu : (const device uint8_t*)bu,
+      x, common ? 0 : int64_t(inds[route]), common ? route - routes : route / top_k, y, p,
+      threadgroup_position_in_grid, thread_position_in_threadgroup);
 """,
     "down": r"""
   threadgroup T products[31 * out];
   const ExpertParams p{k, n, top_k, {{w_strides[0] * int64_t(sizeof(*w)), ws_strides[0] * int64_t(sizeof(*ws)), wb_strides[0] * int64_t(sizeof(*wb))}, {}}};
-  down_rows<T, group_size, bits, out, fast>(
-      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb, x, inds, scores, shared, s, y, p,
+  down_rows<T, group_size, bits, out, fast, 0>(
+      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb, nullptr, nullptr, nullptr, 0, x, inds, scores, shared, s, y, p,
+      products, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup);
+""",
+    "down_fold": r"""
+  threadgroup T products[32 * out];
+  const ExpertParams p{k, n, top_k, {{w_strides[0] * int64_t(sizeof(*w)), ws_strides[0] * int64_t(sizeof(*ws)), wb_strides[0] * int64_t(sizeof(*wb))}, {}}};
+  down_rows<T, group_size, bits, out, fast, 1>(
+      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb,
+      (const device uint8_t*)cw, (const device uint8_t*)cs, (const device uint8_t*)cb, routes, x, inds, scores, shared, shared, y, p,
       products, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup);
 """,
 }
@@ -3415,6 +3482,269 @@ def _routed_down(x, inds, scores, shared, s, w, group_size, bits, mode):
     return _run(launch, list(w), [x, inds, scores, shared, s])
 
 
+# The shared expert's gate, up and down inside the routed launches, for three fewer launches per block. That pays where
+# launching binds: at 4 bits on GPUs without tensor units, up to this many rows. Where the GPU binds its own launches stay faster.
+_FOLD_GATE_UP_ROWS = 4
+_FOLD_ROWS = 5
+
+
+def _fold_launch(name, dtype, quant, out_rows, owned, shape, grid, threadgroup, k, n, top_k, routes, experts):
+    call = _kernel(name, True)
+    if call is None:
+        return None
+    scalars = [_scalar(k), _scalar(n), _scalar(top_k), _scalar(routes)]
+    args = dict(template = [("T", dtype), ("group_size", quant[0]), ("bits", quant[1]), ("out", out_rows), ("fast", quant[2])],
+                grid = grid, threadgroup = threadgroup, output_shapes = [shape], output_dtypes = [dtype])
+    reachable = min(routes, experts)
+
+    def run(*arrays):
+        return call(inputs = [*(t[:reachable] for t in arrays[:owned]), *arrays[owned : 2 * owned],
+                              *map(mx.contiguous, arrays[2 * owned:]), *scalars], **args)[0]
+
+    return mx.compile(run)
+
+
+@functools.lru_cache(maxsize = 1024)
+def _fold_plan(x, inds, scores, shared, routed, common, group_size, bits):
+    """The gate/up and down launches running a sparse block's routes and shared expert together, or None."""
+    x, inds, scores, shared = _specs((x, inds, scores, shared))
+    gate, up, down = map(_specs, routed)
+    if (x.ndim == 0 or x.dtype not in _HALF or inds.ndim != x.ndim or inds.dtype not in _INDS or x.shape[:-1] != inds.shape[:-1]
+            or scores.shape != inds.shape or scores.dtype != x.dtype or shared.dtype != x.dtype
+            or shared.shape != (*inds.shape[:-1], 1) or not 1 <= inds.shape[-1] < min(_MAX_SLOTS, _MAX_SIMDS)):
+        return None
+    k, top_k, routes = x.shape[-1], inds.shape[-1], math.prod(inds.shape)
+    n, fast = _projection(gate, "affine", group_size, bits, x.dtype, k)
+    h, fast_down = _projection(down, "affine", group_size, bits, x.dtype, n) if n > 0 else (-1, -1)
+    keys = [tuple(t.shape[1:] for t in p) for p in (gate, up, down)]
+    if (n < 0 or h != k or n % (2 * _FOLD_GATE_UP_ROWS) != 0 or h % _DOWN_ROWS != 0 or routes == 0
+            or _projection(up, "affine", group_size, bits, x.dtype, k) != (n, fast)
+            or gate[0].shape[0] != up[0].shape[0] or gate[0].shape[0] != down[0].shape[0]
+            or any(tuple(a[0] for a in c) != key or tuple(a[1] for a in c) != tuple(t.dtype for t in p)
+                   for c, key, p in zip(common, keys, (gate, up, down)))):
+        return None
+    rows, experts = routes // top_k, gate[0].shape[0]
+    quant = (group_size, bits, fast)
+    gate_up = _fold_launch("gate_up_fold", x.dtype, quant, _FOLD_GATE_UP_ROWS, 6, (routes + rows, n),
+                           (32 * n // (2 * _FOLD_GATE_UP_ROWS), 2 * (routes + rows), 1), (32, 2, 1), k, n, top_k, routes, experts)
+    simds = top_k + 1
+    last = _fold_launch("down_fold", x.dtype, (group_size, bits, fast_down), _DOWN_ROWS, 3, (*inds.shape[:-1], h),
+                        (32 * h // _DOWN_ROWS, simds * rows, 1), (32, simds, 1), n, h, top_k, routes, experts)
+    return (gate_up, last) if gate_up is not None and last is not None else None
+
+
+@functools.cache
+def _shared_expert_bindings(cls):
+    """What a stock `down(swiglu(gate(x), up(x)))` shared expert class resolves to, or None."""
+    name = f"{cls.__name__}.__call__"
+    return _resolved_bindings({cls.__module__: {name: "ec6fbfefb1f0b4c0", "swiglu": _MOE_ROUTED_FUNCTIONS["swiglu"]}, **_CONV_SILU_CONTRACT})
+
+
+def _rows_packed(tensor):
+    try:
+        strides = memoryview(tensor).strides
+    except (TypeError, ValueError, BufferError):
+        return False
+    return tensor.ndim == 2 and strides == (tensor.shape[1] * tensor.itemsize, tensor.itemsize)
+
+
+_MOE_FOLD_VERDICTS = {}
+
+_GROUPED_TILE = 2
+_MOE_GROUPED_CHOICES = {}
+
+_GROUPED_MAP = r"""
+  // One thread per expert: its routes, in route order, split into tiles of TILE; tiles laid out by expert.
+  const uint e = thread_index_in_threadgroup;
+  const uint lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  threadgroup uint totals[32];
+  uint count = 0;
+  for (uint r = 0; r < R; ++r) count += uint(inds[r]) == e;
+  const uint tiles = (count + TILE - 1) / TILE;
+  const uint before = simd_prefix_exclusive_sum(tiles);
+  if (lane == 31) totals[sg] = before + tiles;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint offset = before;
+  for (uint j = 0; j < sg; ++j) offset += totals[j];
+  uint live = 0;
+  for (uint j = 0; j < E / 32; ++j) live += totals[j];
+  for (uint t = 0; t < tiles; ++t) {
+    experts[offset + t] = e;
+    counts[offset + t] = min(uint(TILE), count - t * TILE);
+  }
+  uint at = 0;
+  for (uint r = 0; r < R; ++r) {
+    if (uint(inds[r]) == e) {
+      routes[(offset + at / TILE) * TILE + at % TILE] = r;
+      ++at;
+    }
+  }
+  for (uint t = live + e; t < R; t += E) counts[t] = 0;
+"""
+
+_GROUPED_DOT = r"""
+// Each route's dot is the routed kernels' own: lanes accumulate the same K blocks, then simd_sum. A tile's routes
+// share one expert, so each weight block is loaded once for all of them.
+template <typename T, int GS, int BITS, int OUT, int FAST, int ROWS, int P>
+METAL_FUNC void grouped_dot(thread typename Dots<T, GS, BITS, OUT, FAST>::Proj* proj, const device T* x,
+                            thread uint* rr, uint count, int K, int top_k, uint lane,
+                            thread float (&result)[ROWS][P * OUT]) {
+  typedef Dots<T, GS, BITS, OUT, FAST> D;
+  constexpr int V = D::values_per_thread;
+  thread float xt[ROWS][V];
+  thread float sums[ROWS];
+  Terms<float, V, BITS> terms;
+  for (int k = 0; k < K; k += D::block_size) {
+    if (FAST || k + lane * V < K) {
+      UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
+        sums[r] = load_terms_x<T, float, V, BITS>(x + size_t(rr[r] / top_k) * K + k + lane * V, xt[r]);
+      UNROLL for (int p = 0; p < P; ++p) {
+        UNROLL for (int o = 0; o < OUT; ++o) {
+          terms.load(proj[p].w + o * K * D::lane::bytes_per_pack / D::lane::pack_factor);
+          float scale = proj[p].s[o * (K / GS)] * code_unit<BITS>();
+          float bias = proj[p].b[o * (K / GS)];
+          UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
+            result[r][p * OUT + o] += scale * terms.dot(xt[r]) + sums[r] * bias;
+        }
+      }
+    }
+    UNROLL for (int p = 0; p < P; ++p) {
+      proj[p].w += D::block_size * D::lane::bytes_per_pack / D::lane::pack_factor;
+      proj[p].s += D::block_size / GS;
+      proj[p].b += D::block_size / GS;
+    }
+  }
+  UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
+    UNROLL for (int i = 0; i < P * OUT; ++i) result[r][i] = simd_sum(result[r][i]);
+}
+"""
+
+_GROUPED_COMBINE = r"""
+  const uint i = thread_position_in_grid.x;
+  if (i >= M * N) return;
+  const uint row = i / N, col = i % N;
+  thread T products[TOP];
+  for (uint j = 0; j < TOP; ++j) products[j] = y[(row * TOP + j) * N + col] * scores[row * TOP + j];
+  out[i] = shared_add(slot_sum<T>(products, 1, TOP), shared[row], s[i]);
+"""
+
+
+def _grouped_projection_source(gate):
+    proj = lambda p, w, s, b: (
+        f"p[{p}] = D::proj((const device uint8_t*){w} + e * {w}_strides[0] * sizeof(*{w}), "
+        f"(const device uint8_t*){s} + e * {s}_strides[0] * sizeof(*{s}), "
+        f"(const device uint8_t*){b} + e * {b}_strides[0] * sizeof(*{b}), K, n0, lane);\n")
+    store = ("T a = T(result[r][o]); T b = T(result[r][OUT + o]); T sig = Sigmoid{}(a); T g = a * sig; y[size_t(rr[r]) * N + n0 + o] = g * b;"
+             if gate else "y[size_t(rr[r]) * N + n0 + o] = T(result[r][o]);")
+    return (
+        "const uint tile = threadgroup_position_in_grid.y;\n"
+        "const uint count = counts[tile];\n"
+        "if (!count) return;\n"
+        "const uint lane = thread_index_in_simdgroup;\n"
+        "const uint n0 = threadgroup_position_in_grid.x * OUT;\n"
+        "const uint e = experts[tile];\n"
+        "thread uint rr[TILE];\n"
+        "UNROLL for (int r = 0; r < TILE; ++r) if (r < count) rr[r] = routes[tile * TILE + r];\n"
+        "typedef Dots<T, GS, BITS, OUT, FAST> D;\n"
+        "typename D::Proj p[P];\n"
+        + proj(0, "wg", "sg", "bg") + (proj(1, "wu", "su", "bu") if gate else "")
+        + "thread float result[TILE][P * OUT] = {};\n"
+        "grouped_dot<T, GS, BITS, OUT, FAST, TILE, P>(p, x, rr, count, K, TOP, lane, result);\n"
+        "UNROLL for (int r = 0; r < TILE; ++r) if (r < count) UNROLL for (int o = 0; o < OUT; ++o) if (lane == o) {\n"
+        + store + "}\n"
+    )
+
+
+@functools.cache
+def _grouped_kernels():
+    try:
+        if not mx.metal.is_available():
+            return None
+        header = _mlx_headers(True) + "#define UNSLOTH_AFFINE 1\n" + _QDOT + _SLOTS + _ROUTED + _GROUPED_DOT
+        projections = tuple(
+            mx.fast.metal_kernel(
+                name = f"unsloth_moe_grouped_{'gate_up' if gate else 'down'}",
+                input_names = [*(["wg", "sg", "bg", "wu", "su", "bu"] if gate else ["wg", "sg", "bg"]),
+                               "x", "experts", "routes", "counts"],
+                output_names = ["y"], header = header, source = _grouped_projection_source(gate),
+                ensure_row_contiguous = False,
+            )
+            for gate in (True, False)
+        )
+        mapping = mx.fast.metal_kernel(name = "unsloth_moe_grouped_map", input_names = ["inds"],
+                                       output_names = ["experts", "routes", "counts"], source = _GROUPED_MAP)
+        combine = mx.fast.metal_kernel(name = "unsloth_moe_grouped_combine", input_names = ["y", "scores", "shared", "s"],
+                                       output_names = ["out"], header = _SLOTS, source = _GROUPED_COMBINE)
+        return mapping, *projections, combine
+    except (AttributeError, OSError, RuntimeError, TypeError):
+        return None
+
+
+def _grouped_routed(x, inds, scores, shared, s, tensors, group_size, bits):
+    """`_routed_down(_routed_gate_up(...))` of affine experts with each expert's routes grouped into tiles, or None.
+
+    Every route keeps the routed kernels' arithmetic; only which routes share a weight read changes, so it serves
+    exactly the calls both routed kernels accept.
+    """
+    kernels = _grouped_kernels()
+    experts, top_k, hidden_width = tensors[0][0].shape[0], inds.shape[-1], tensors[0][0].shape[-2]
+    width, routes = x.shape[-1], inds.size
+    keys = [tuple(map(_key, t)) for t in tensors]
+    if (kernels is None or experts % 32 or experts > 1024
+            or not callable(_gate_up_plan(_key(x), _key(inds), keys[0], keys[1], group_size, bits, "affine"))
+            or not callable(_down_plan(((*inds.shape, hidden_width), x.dtype), _key(inds), _key(scores), _key(shared),
+                                       _key(s), keys[2], group_size, bits, "affine"))):
+        return None
+    mapping, gate_up, down, combine = kernels
+    tile = _GROUPED_TILE
+    owners, routed, counts = mapping(
+        inputs = [inds.reshape(-1)], template = [("R", routes), ("E", experts), ("TILE", tile)],
+        grid = (experts, 1, 1), threadgroup = (experts, 1, 1),
+        output_shapes = [(routes,), (routes * tile,), (routes,)], output_dtypes = [mx.uint32] * 3)
+
+    def project(a, weights, gate):
+        k, n = a.shape[-1], weights[0][0].shape[1]
+        fast = _one_row_kernel("affine", group_size, bits, a.dtype, k, n, *weights[0])
+        per_simd = _GATE_UP_ROWS if gate else _DOWN_ROWS
+        return (gate_up if gate else down)(
+            inputs = [*(t for p in weights for t in p), mx.contiguous(a), owners, routed, counts],
+            template = [("T", a.dtype), ("GS", group_size), ("BITS", bits), ("OUT", per_simd), ("FAST", fast), ("TILE", tile),
+                        ("P", 2 if gate else 1), ("TOP", top_k if gate else 1), ("K", k), ("N", n)],
+            grid = (32 * n // per_simd, routes, 1), threadgroup = (32, 1, 1),
+            output_shapes = [(routes, n)], output_dtypes = [a.dtype])[0]
+
+    y = project(project(x.reshape(-1, width), tensors[:2], True), tensors[2:], False)
+    rows = routes // top_k
+    return combine(inputs = [y, scores, shared, s], template = [("T", x.dtype), ("M", rows), ("N", width), ("TOP", top_k)],
+                   grid = (rows * width, 1, 1), threadgroup = (256, 1, 1),
+                   output_shapes = [s.shape], output_dtypes = [x.dtype])[0]
+
+
+# Sub-millisecond calls jitter and often run a slower mode, which a median hides: average many, less the slowest.
+_GROUPED_RACE_CALLS = 9
+# Up to this many rows on an M3, grouped tiles cost about 1 ms per forward, yet the race's short calls, timed at low clocks, pick them a third of the time.
+_ROUTED_ROWS_WITHOUT_NAX = 8
+
+
+def _grouped_routed_faster(routed, grouped, clock = time.perf_counter):
+    try:
+        native, candidate = routed(), grouped()
+        if native is None or candidate is None or not _settled(
+                native.dtype == candidate.dtype and bool(mx.array_equal(native, candidate, equal_nan = True))):
+            return False
+        seconds = ([], [])
+        for repeat in range(_GROUPED_RACE_CALLS):
+            for index in ((0, 1) if repeat % 2 == 0 else (1, 0)):
+                mx.synchronize()
+                start = clock()
+                mx.eval((routed, grouped)[index]())
+                seconds[index].append(clock() - start)
+        return sum(sorted(seconds[1])[:-1]) < sum(sorted(seconds[0])[:-1])
+    except (AttributeError, OSError, RuntimeError, TypeError):
+        return False
+
+
 _MOE_UNSORTED_ROUTES = 64
 # The switch layer bodies the routed-expert kernels reimplement besides the gate/up contract's.
 _MOE_ROUTED_FUNCTIONS = {"SwiGLU.__call__": "b6e81906a2a7d4c9", "swiglu": "bc9e3d24f39fe8b1"}
@@ -3453,7 +3783,7 @@ class _RoutedExperts:
         self.verdicts = {}
         self.layout = (None, False)
 
-    def __call__(self, block, x, inds, scores, shared, s):
+    def _tensors(self, block, x):
         mlp = block.switch_mlp
         if (mlp is not self.mlp or mlp.training or (x.ndim == 3 and 1 < x.shape[1] <= self.decode_block)
                 or not _bindings_intact(self.bindings)):
@@ -3470,22 +3800,99 @@ class _RoutedExperts:
         key = tuple(id(t) for group in tensors for t in group)
         if self.layout[0] != key:
             self.layout = (key, all(_expert_rows_packed(t) for group in tensors for t in group))
-        if not self.layout[1]:
+        return tensors if self.layout[1] else None
+
+    def __call__(self, block, x, inds, scores, shared, s):
+        tensors = self._tensors(block, x)
+        if tensors is None:
             return None
         verdict = self.verdicts.get(x.dtype)
         if verdict is None:
             verdict = self.verdicts[x.dtype] = self._verified(x.dtype, inds.shape[-1])
         if not verdict:
             return None
-        return self._run(tensors, x, inds, scores, shared, s)
+        return self._run(tensors, x, inds, scores, shared, s, select = "_unsloth_speculative_call" in block.__dict__)
 
-    def _run(self, tensors, x, inds, scores, shared, s):
-        gate, up, down = self.mlp.gate_proj, self.mlp.up_proj, self.mlp.down_proj
-        activations = _routed_gate_up(x, inds, tensors[0], tensors[1], gate.group_size, gate.bits, gate.mode)
-        if activations is None:
+    def folded(self, block, x, inds, scores, shared):
+        """What `__call__` returns for `s = block.shared_expert(x)`, computed in the routed launches, or None. Only a
+        speculative call folds: its rows are the same bits, and a plain decode keeps stock's launch count."""
+        if "_unsloth_speculative_call" not in block.__dict__:
             return None
-        return _routed_down(activations, inds, scores, shared, s, tensors[2],
-                                   down.group_size, down.bits, down.mode)
+        expert = getattr(block, "shared_expert", None)
+        tensors = self._tensors(block, x)
+        if (nax._nax_gpu() or tensors is None or inds.size > _FOLD_ROWS * inds.shape[-1] or expert is None or expert.training):
+            return None
+        bindings = _shared_expert_bindings(type(expert))
+        if bindings is None or not _bindings_intact(bindings):
+            return None
+        projections = (expert.gate_proj, expert.up_proj, expert.down_proj)
+        mlp = self.mlp
+        quant = (mlp.gate_proj.group_size, mlp.gate_proj.bits, mlp.gate_proj.mode)
+        if (quant[1] != 4 or quant[2] != "affine" or any(not isinstance(p, nn.QuantizedLinear) or hasattr(type(p), "_unsloth_lane_native") or "bias" in p for p in projections)):
+            return None
+        common = tuple(map(_projection_tensors, projections))
+        if not all(_rows_packed(t) for group in common for t in group):
+            return None
+        signature = (x.dtype, inds.shape[-1], self.base, *(tuple(map(_key, t)) for t in (*tensors, *common)), quant,
+                     *(type(p).__call__ for p in projections))
+        if signature not in _MOE_FOLD_VERDICTS:
+            _MOE_FOLD_VERDICTS[signature] = self._fold_probe(block, tensors, common, x.dtype, inds.shape[-1])
+        return self._fold(tensors, common, x, inds, scores, shared) if _MOE_FOLD_VERDICTS[signature] else None
+
+    def _fold(self, tensors, common, x, inds, scores, shared):
+        gate = self.mlp.gate_proj
+        plan = _fold_plan(*map(_key, (x, inds, scores, shared)), *(tuple(tuple(map(_key, t)) for t in g) for g in (tensors, common)),
+                          gate.group_size, gate.bits)
+        if plan is None:
+            return None
+        activations = plan[0](*tensors[0], *tensors[1], *common[0], *common[1], x, inds)
+        return plan[1](*tensors[2], *common[2], activations, inds, scores, shared)
+
+    def _fold_probe(self, block, tensors, common, dtype, top_k):
+        gate = self.mlp.gate_proj
+        experts, width = gate.weight.shape[0], gate.scales.shape[-1] * gate.group_size
+        for rows in (1, _FOLD_ROWS):
+            kx, ki, kw, kg = mx.random.split(mx.random.key(rows), 4)
+            x = mx.random.normal((rows, 1, width), key = kx).astype(dtype)
+            inds = mx.random.randint(0, experts, (rows, 1, top_k), key = ki).astype(mx.uint32)
+            scores = mx.softmax(mx.random.normal((rows, 1, top_k), key = kw), axis = -1).astype(dtype)
+            shared = mx.sigmoid(mx.random.normal((rows, 1, 1), key = kg)).astype(dtype)
+            fused = self._fold(tensors, common, x, inds, scores, shared)
+            if fused is None:
+                return False
+            y = self.base.__call__(self.mlp, x, inds)
+            s = mx.concatenate([block.shared_expert(x[i : i + 1]) for i in range(rows)])
+            native = (y * scores[..., None]).sum(axis = -2) + shared * s
+            if not _settled(fused.dtype == native.dtype and bool(mx.array_equal(fused, native, equal_nan = True))):
+                logger.warning("the folded shared expert does not reproduce this MLX build's native experts; "
+                               "its own launches stay in use")
+                return False
+        return True
+
+    def _run(self, tensors, x, inds, scores, shared, s, select = False):
+        gate, up, down = self.mlp.gate_proj, self.mlp.up_proj, self.mlp.down_proj
+
+        def routed():
+            activations = _routed_gate_up(x, inds, tensors[0], tensors[1], gate.group_size, gate.bits, gate.mode)
+            if activations is None:
+                return None
+            return _routed_down(activations, inds, scores, shared, s, tensors[2],
+                                down.group_size, down.bits, down.mode)
+
+        if (select and inds.size > inds.shape[-1] and gate.mode == "affine"
+                and (inds.size > _ROUTED_ROWS_WITHOUT_NAX * inds.shape[-1] or nax._nax_gpu())
+                and len({(p.group_size, p.bits, p.mode) for p in (gate, up, down)}) == 1):
+            key = (self.base, *map(_key, (x, inds, scores, shared, s)),
+                   tuple(tuple(map(_key, t)) for t in tensors), gate.group_size, gate.bits)
+            grouped = lambda: _grouped_routed(x, inds, scores, shared, s, tensors, gate.group_size, gate.bits)
+            if key not in _MOE_GROUPED_CHOICES:
+                try:
+                    _MOE_GROUPED_CHOICES[key] = _grouped_routed_faster(routed, grouped)
+                except ValueError:  # inside a function transformation, which cannot evaluate; raced later
+                    return routed()
+            if _MOE_GROUPED_CHOICES[key]:
+                return grouped()
+        return routed()
 
     def _verified(self, dtype, top_k):
         mlp = self.mlp
@@ -3635,6 +4042,10 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
                 return native(self, x)
             routed += (None,)
         inds, scores, shared_scale = routed
+        if shared_scale is not None and experts is not None and inds.size < _MOE_UNSORTED_ROUTES:
+            out = experts.folded(self, x, inds, scores, shared_scale)
+            if out is not None:
+                return out
         shared_y = self.shared_expert(x)
         if gate is not None and shared_scale is None:
             shared_scale = mx.sigmoid(gate)
@@ -4999,7 +5410,7 @@ def _taped_update(native, with_states):
                                        "states for %s; verify keeps writing every step's state there", key)
                 return stock
             y, final, _ = replay(mask = mask)
-            tapes.append((cache, cache_index, replay, mask))
+            tapes.append((cache, cache_index, replay, mask, False))
             return y, final, mx.broadcast_to(final[:, None], (final.shape[0], steps, *final.shape[1:]))
 
         return cache.update_recurrent(cache_index, length, update)
@@ -5019,9 +5430,14 @@ def _taped_transaction_class(base):
         if counts == {self.length} or counts == {0}:
             return
         # Otherwise stock selected from a stand-in history; the retained state is the replayed prefix.
-        for cache, index, replay, mask in tapes:
+        retained = None
+        for cache, index, replay, mask, folds in tapes:
             rows = [lengths] * replay.args[0].shape[0] if isinstance(lengths, int) else lengths
             cache[index] = replay(mask = _retained_mask(rows, self.length, mask))[1]
+            if folds:  # the next fused block can advance from the replay's own entry instead
+                if retained is None:
+                    retained = mx.array(rows, mx.uint32)
+                cache._unsloth_pending = (cache[index], replay, retained)
 
     def abort(self):
         self.__dict__.pop("_unsloth_tapes", None)
@@ -5156,6 +5572,50 @@ _VERIFY_GDN_SOURCE = """
         }
     }
 """
+# The block after a partly retained one: each row first advances the retained block's entry state over its retained
+# steps, the replay's recurrence with no outputs, and writes that state for this block's own commit to replay from.
+_VERIFY_GDN_PENDING_LOADS = """
+    threadgroup T pending_ks[LMAX * Dk];
+    threadgroup T pending_vs[LMAX * Dv];
+    threadgroup float pending_decay[LMAX];
+    threadgroup T pending_beta[LMAX];
+    const uint P = retained[row];
+    const uint PL = pending_length;
+    for (uint i = tid; i < P * Dk; i += NT) {
+        pending_ks[i] = pending_k[((row * PL + i / Dk) * Hk + hk) * Dk + i % Dk];
+    }
+    for (uint i = tid; i < P * Dv; i += NT) {
+        pending_vs[i] = pending_v[((row * PL + i / Dv) * Hv + hv) * Dv + i % Dv];
+    }
+    if (tid < P) {
+        uint gi = (row * PL + tid) * Hv + hv;
+        PT gate = Add()(static_cast<PT>(pending_a[gi]), static_cast<PT>(dt_bias[hv]));
+        float softplus = static_cast<float>(static_cast<PT>(LogAddExp()(gate, static_cast<PT>(0))));
+        pending_decay[tid] = Exp()(Multiply()(Negative()(Exp()(static_cast<float>(A_log[hv]))), softplus));
+        pending_beta[tid] = Sigmoid()(pending_b[gi]);
+    }
+"""
+_VERIFY_GDN_PENDING_STEPS = """
+        for (uint t = 0; t < P; ++t) {
+            float kv_mem = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] * pending_decay[t];
+                kv_mem += state[i] * pending_ks[t * Dk + lane * 4 + i];
+            }
+            kv_mem = simd_sum(kv_mem);
+            auto delta = (pending_vs[t * Dv + dv] - kv_mem) * pending_beta[t];
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] + pending_ks[t * Dk + lane * 4 + i] * delta;
+            }
+        }
+        auto a_state = advanced + (n * Dv + dv) * Dk + lane * 4;
+        for (int i = 0; i < 4; ++i) {
+            a_state[i] = state[i];
+        }
+"""
+_VERIFY_GDN_FOLD_SOURCE = (
+    _VERIFY_GDN_SOURCE.replace("    threadgroup T beta[LMAX];\n", "    threadgroup T beta[LMAX];" + _VERIFY_GDN_PENDING_LOADS)
+    .replace("        for (uint t = 0; t < L; ++t) {\n", _VERIFY_GDN_PENDING_STEPS[1:] + "        for (uint t = 0; t < L; ++t) {\n"))
 _VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
 # Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
 _VERIFY_GDN_MAX_ROWS = 16
@@ -5176,38 +5636,53 @@ _VERIFY_GDN_CONTRACT = {
     "mlx.nn": {"silu": "78867fdb7e42731c", "softplus": "4d48a9bee57aeadd", "Conv1d.__call__": "e6c4e02415104dd1"},
 }
 _VERIFY_GDN_VERDICTS = {}
+_VERIFY_GDN_FOLDS = {}
 
 
 @functools.cache
-def _verify_gdn_kernel():
+def _verify_gdn_kernel(fold = False):
     try:
         header = mx.metal.is_available() and nax._mlx_kernel_header("unary_ops.h")
         binary = header and nax._mlx_kernel_header("binary_ops.h")
         return binary and mx.fast.metal_kernel(
-            name = "unsloth_gated_delta_verify_block",
+            name = "unsloth_gated_delta_verify_block" + "_folded" * fold,
             input_names = ["conv_input", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight", "q_scale",
-                           "k_scale", "qk_eps", "norm_eps", "state_in", "length"],
-            output_names = ["y", "state_out", "q_out", "k_out", "v_out"], header = header + binary,
-            compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_SOURCE,
+                           "k_scale", "qk_eps", "norm_eps", "state_in", "length",
+                           *(("pending_k", "pending_v", "pending_a", "pending_b", "retained", "pending_length") if fold else ())],
+            output_names = ["y", "state_out", "q_out", "k_out", "v_out", *(("advanced",) if fold else ())],
+            header = header + binary,
+            compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_FOLD_SOURCE if fold else _VERIFY_GDN_SOURCE,
         ) or None
     except (AttributeError, TypeError):
         return None
 
 
-def _verify_gdn_block(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads):
+def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads, pending):
     B, L, value_heads, Dv = z.shape
     Dk, dtype = state.shape[-1], conv_input.dtype
     q_scale, k_scale, qk_norm_eps, norm_eps = _decode_step_scalars(Dk, dtype, qk_eps, eps)
-    return _verify_gdn_kernel()(
+    extra = [state.shape] if pending else []
+    return _verify_gdn_kernel(bool(pending))(
         inputs = [conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, qk_norm_eps, norm_eps,
-                  state, L],
+                  state, L, *pending],
         template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[1]),
                     ("LMAX", _VERIFY_GDN_MAX_ROWS), ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv),
                     ("TY", _VERIFY_GDN_ROWS)],
         grid = (32, _VERIFY_GDN_ROWS, B * value_heads), threadgroup = (32, _VERIFY_GDN_ROWS, 1),
-        output_shapes = [z.shape, state.shape, (B, L, key_heads, Dk), (B, L, key_heads, Dk), z.shape],
-        output_dtypes = [dtype, state.dtype, dtype, dtype, dtype],
+        output_shapes = [z.shape, state.shape, (B, L, key_heads, Dk), (B, L, key_heads, Dk), z.shape, *extra],
+        output_dtypes = [dtype, state.dtype, dtype, dtype, dtype, *(state.dtype for _ in extra)],
     )
+
+
+def _verify_gdn_block(*args):
+    return _verify_gdn_launch(*args, ())
+
+
+def _verify_gdn_folded_block(*args, pending):
+    """`_verify_gdn_block` from the entry state of a block whose retained prefix was not replayed yet, given that
+    block's k, v, a, b and each row's retained count; it also returns the state after that prefix."""
+    k, v, a, b, rows = pending
+    return _verify_gdn_launch(*args, (k, v, a, b, rows, k.shape[1]))
 
 
 def _verify_gdn_fits(layer, inputs, mask, cache):
@@ -5231,9 +5706,35 @@ def _verify_gdn_fits(layer, inputs, mask, cache):
             and all(t.dtype in (mx.float32, mx.bfloat16, mx.float16) for t in (layer.A_log, layer.dt_bias)))
 
 
+def _verify_gdn_folded(key, folded, fused, entry):
+    """`folded()` once `key`'s first fold matched `fused(entry)` and `entry` bit for bit; until then `fused(entry)`
+    and `entry`, which a failed key keeps for good."""
+    verdict = _VERIFY_GDN_FOLDS.get(key)
+    if verdict:
+        return folded()
+    reference = (*fused(entry), entry)
+    if verdict is None:
+        try:
+            verdict = _settled(all(x.dtype == y.dtype and x.shape == y.shape
+                                   and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+                                   for x, y in zip(reference, folded())))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            if str(error).startswith("[metal::Device] Unable to "):
+                _VERIFY_GDN_FOLDS[key] = False
+        else:
+            _VERIFY_GDN_FOLDS[key] = verdict
+            if not verdict:
+                logger.warning("advancing a fused verify block over the retained prefix of the one before differs "
+                               "from replaying that prefix for %s; the replay stays in use there", key)
+    return reference
+
+
 def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
     """The verifier's `_gated_delta` for a block `_verify_gdn_fits` took, its convolution through gated norm fused
-    once a first block matched the stock ops bit for bit; the commit replays the kernel's q/k/v like a taped block's."""
+    once a first block matched the stock ops bit for bit; the commit replays the kernel's q/k/v like a taped block's.
+    A block on a partly retained one's unevaluated replay starts from that block's entry state instead, once a first
+    such block matched."""
     batch, length, _ = inputs.shape
     K, Dv, Hk = layer.conv_kernel_size, layer.head_v_dim, layer.num_k_heads
     mixed_qkv, z, b, a = self._linears((layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a), inputs)
@@ -5244,21 +5745,35 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
     conv_input = mx.concatenate([conv_state, mixed_qkv], axis = 1)
     cache.update_window(0, conv_input, K - 1, lengths = cache.lengths)
     initial, dtype = cache[1], conv_input.dtype
+    pending = cache.__dict__.pop("_unsloth_pending", None)
     key = (length, Hk, layer.num_v_heads, K, dtype, a.dtype, b.dtype, layer.A_log.dtype, layer.dt_bias.dtype,
            getattr(initial, "dtype", None), qk_eps, layer.norm.eps)
     verdict = _VERIFY_GDN_VERDICTS.get(key)
     fits = all(t.dtype == dtype for t in (z, a, b)) and a.shape == b.shape == (batch, length, layer.num_v_heads)
-    fused = lambda state: _verify_gdn_block(
+    block = lambda state: (
         conv_input, layer.conv1d.weight.reshape(layer.conv_dim, K), a, b, layer.A_log, layer.dt_bias, z,
         layer.norm.weight, qk_eps, layer.norm.eps,
         mx.zeros((batch, layer.num_v_heads, Dv, layer.head_k_dim), mx.float32) if state is None else state, Hk)
+    fused = lambda state: _verify_gdn_block(*block(state))
     # A passed check holds the key of the replay its commit relies on.
     if fits and verdict and _TAPE_VERDICTS.get(verdict):
+        fold = None
+        if pending is not None:  # still the state the last commit's replay of this layer's fused block left
+            state, replay, rows = pending
+            _, pending_k, pending_v, pending_a, pending_b, A_log, dt_bias, pending_entry = replay.args
+            if (state is initial and A_log is layer.A_log and dt_bias is layer.dt_bias and pending_k.dtype == dtype
+                    and (pending_a.dtype, pending_b.dtype) == (a.dtype, b.dtype)):
+                fold = (*key, pending_k.shape[1]), lambda: _verify_gdn_folded_block(
+                    *block(pending_entry), pending = (pending_k, pending_v, pending_a, pending_b, rows))
+
         def update(entry, steps):
-            y, final, q, k, v = fused(entry)
+            if fold is not None:
+                y, final, q, k, v, entry = _verify_gdn_folded(*fold, fused, entry)
+            else:
+                y, final, q, k, v = fused(entry)
             replay = functools.partial(with_states, q, k, v, a, b, layer.A_log, layer.dt_bias, entry,
                                        use_kernel = True, state_steps = 0)
-            _VERIFY_STATE.tapes.append((cache, 1, replay, None))
+            _VERIFY_STATE.tapes.append((cache, 1, replay, None, True))
             return y, final, mx.broadcast_to(final[:, None], (batch, steps, *final.shape[1:]))
         output, _ = cache.update_recurrent(1, length, update)
     else:
@@ -5798,8 +6313,11 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
                 scores = mx.take_along_axis(gates, indices, axis = -1)
                 routing = indices, scores / scores.sum(axis = -1, keepdims = True), mx.sigmoid(gate)
             indices, scores, scale = routing
-            shared = self._feed_forward(feed_forward.shared_expert, x)
             rows = (x.shape[0] * x.shape[1], 1, -1)
+            out = experts.folded(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale)))
+            if out is not None:
+                return out.reshape(*x.shape[:2], -1)
+            shared = self._feed_forward(feed_forward.shared_expert, x)
             out = experts(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale, shared)))
             return None if out is None else out.reshape(*x.shape[:2], -1)
 
@@ -7180,8 +7698,8 @@ def warm_inference(model, int8_prefill = None, ane_prefill = None):
 
 def _warm_verify_gdn(model):
     """Build the fused verify block's pipeline for each linear-attention layer shape, and settle each block width's
-    bitwise checks through the verifier for a model a drafter was built for: either would otherwise land in the first
-    speculative replies."""
+    and each pair of widths' bitwise checks through the verifier for a model a drafter was built for: either would
+    otherwise land in the first speculative replies."""
     language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
     if (language is None or os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") == "0" or not hasattr(model, "named_modules")
             or mx.default_device() != mx.gpu or not _verify_gdn_kernel()):
@@ -7213,22 +7731,38 @@ def _settle_verify_gdn(model, language, shapes):
     verifier, caches = getattr(language, "_EXACT_SPECULATIVE_VERIFIER", None), sys.modules.get("mlx_vlm.models.cache")
     served = {id(layer) for _, owner in model.named_modules() if vars(owner).get("_unsloth_verify_scopes")
               for _, layer in owner.named_modules()}
-    if caches is None or not hasattr(type(verifier), "_unsloth_verify_native"):
+    transactions, widths = sys.modules.get("mlx_vlm.speculative.cache_state"), range(3, _VERIFY_GDN_MAX_ROWS + 1)
+    if caches is None or transactions is None or not hasattr(type(verifier), "_unsloth_verify_native"):
         return
     outer = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
+
+    def fresh(layer, dtype, seed):
+        cache, key = caches.ArraysCache(2), mx.random.key(seed)
+        cache[0] = mx.random.normal((1, layer.conv_kernel_size - 1, layer.conv_dim), key = key).astype(dtype)
+        cache[1] = mx.random.normal((1, layer.num_v_heads, layer.head_v_dim, layer.head_k_dim), key = key) * 0.1
+        return cache
+
+    def verified(layer, dtype, cache, length, keep):
+        transaction, key = transactions.start_speculative_cache([cache], length), mx.random.key(length)
+        _VERIFY_STATE.tapes = []
+        mx.eval(verifier._gated_delta(layer, mx.random.normal((1, length, layer.hidden_size), key = key)
+                                      .astype(dtype), None, cache))
+        if keep and _VERIFY_STATE.tapes:
+            transaction.__class__ = _taped_transaction_class(type(transaction))
+            transaction._unsloth_tapes = _VERIFY_STATE.tapes
+        transaction.commit(keep) if keep else transaction.abort()
     try:
         _VERIFY_STATE.serving = True
         for (dtype, *_), layer in shapes.items():
             if id(layer) not in served:
                 continue
-            for length in range(3, _VERIFY_GDN_MAX_ROWS + 1):
-                cache, key = caches.ArraysCache(2), mx.random.key(length)
-                cache[0] = mx.random.normal((1, layer.conv_kernel_size - 1, layer.conv_dim), key = key).astype(dtype)
-                cache[1] = mx.random.normal((1, layer.num_v_heads, layer.head_v_dim, layer.head_k_dim), key = key) * 0.1
-                cache.start_speculation(length)
-                _VERIFY_STATE.tapes = []
-                mx.eval(verifier._gated_delta(layer, mx.random.normal((1, length, layer.hidden_size), key = key)
-                                              .astype(dtype), None, cache))
+            for length in widths:
+                verified(layer, dtype, fresh(layer, dtype, length), length, 0)
+            # Then a block after each partly retained width, which folds that width's replay.
+            for first, length in itertools.product(widths, widths):
+                cache = fresh(layer, dtype, first)
+                verified(layer, dtype, cache, first, 1)
+                verified(layer, dtype, cache, length, 0)
     finally:
         _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer
 

@@ -948,6 +948,16 @@ def _split(batch: list, keep: list[int]) -> list | None:
     return batch
 
 
+def _committed_eval_state(cache):
+    state, pending = cache.state, getattr(cache, "_unsloth_pending", None)
+    if pending is None:
+        return state
+    deferred = pending[0]
+    if isinstance(state, (list, tuple)):
+        return [value for value in state if value is not deferred]
+    return [] if state is deferred else state
+
+
 class SpeculativeEngine:
     """Decodes B rows with the controller's choice each step: a verify round at one width, each
     row verifying its own proposal and committing its own accepted count, or a window of
@@ -1214,8 +1224,9 @@ class SpeculativeEngine:
         if depth:
             accepted_drafts = [min(count, depth - 1) if spec.source == "draft" else 0 for spec, count in zip(plan.rows, accepted)]
             kept = self.drafter.settle(self.draft_cache, draft_rows, depth - 1, accepted_drafts)
-        # Left lazy, the commit makes the next decode copy whole cache buffers instead of writing in place.
-        mx.async_eval([entry.state for entry in [*self.cache, *(self.draft_cache or [])]])
+        # Left lazy, the commit makes the next decode copy whole cache buffers instead of writing in place. A
+        # pending fold's replay is the exception: a settled fold reads its inputs instead, so it is left to its consumer.
+        mx.async_eval([_committed_eval_state(entry) for entry in [*self.cache, *(self.draft_cache or [])]])
         emitted = []
         for i, (row, proposal, target, count) in enumerate(zip(rows, proposals, targets, accepted)):
             row.draft_n += len(proposal)
