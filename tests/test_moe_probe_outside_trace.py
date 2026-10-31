@@ -134,3 +134,50 @@ def test_definitive_negative_does_not_break_a_fullgraph_trace(monkeypatch):
     assert torch.equal(f(torch.zeros(2)), torch.full((2,), -1.0))
     assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is False
     assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is False
+
+
+def test_home_support_probe_also_answers_the_view_check(monkeypatch):
+    # A cold compiled block reaches _transposed_view_safe_on after the backend probe ran at load: answering it in the
+    # same eager region keeps that first trace free of a compiler-disabled call (graph break, fullgraph error).
+    from unsloth_zoo.temporary_patches import moe_utils
+
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", None)
+    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_AVAILABLE", True)
+    monkeypatch.setattr(moe_utils, "_grouped_mm_home", lambda: torch.device("cuda", 0))
+    monkeypatch.setattr(moe_utils, "_grouped_mm_foreign_kind", lambda device: None)
+    monkeypatch.setattr(moe_utils, "_grouped_mm_survives_out_of_process", lambda device: True)
+    monkeypatch.setattr(moe_utils, "_grouped_mm_runs_on", lambda device: True)
+    probed = []
+    monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda device: probed.append(device) or True)
+    assert moe_utils._probe_torch_grouped_mm_supported() is True
+    assert probed == [torch.device("cuda", 0)]
+    assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is True
+
+    def no_second_region(fn):
+        raise AssertionError("second compiler-disabled region")
+
+    monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_second_region)
+    torch._dynamo.reset()
+
+    @torch.compile(fullgraph = True, backend = "eager")
+    def f(x):
+        return x + 1 if moe_utils._transposed_view_grouped_mm_is_safe() else x - 1
+
+    assert torch.equal(f(torch.zeros(2)), torch.ones(2))
+    torch._dynamo.reset()
+
+
+def test_unsupported_home_latches_the_view_check_false(monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_utils
+
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", None)
+    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_AVAILABLE", True)
+    monkeypatch.setattr(moe_utils, "_grouped_mm_home", lambda: torch.device("cuda", 0))
+    monkeypatch.setattr(moe_utils, "_grouped_mm_foreign_kind", lambda device: None)
+    monkeypatch.setattr(moe_utils, "_grouped_mm_survives_out_of_process", lambda device: True)
+    monkeypatch.setattr(moe_utils, "_grouped_mm_runs_on", lambda device: False)
+    monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda device: pytest.fail("view probe on an unsupported card"))
+    assert moe_utils._probe_torch_grouped_mm_supported() is False
+    assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is False
