@@ -2871,8 +2871,9 @@ def grpo_accumulated_loss(
     # input and grpo_compute_loss returns None (not empty) delta/flat_is_ratio.
     # Set by unsloth when UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 skipped the old-policy forward.
     _rollout_logps_as_old = bool(kwargs.pop("rollout_logps_as_old", False))
+    # TRL defaults the correction flag to True without vLLM too, but only applies the ratio with use_vllm.
     _sampling_logps_used = (
-        getattr(trainer, "vllm_importance_sampling_correction", False)
+        (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False))
         or getattr(trainer.args, "off_policy_mask_threshold", None) is not None
         or _rollout_logps_as_old
     )

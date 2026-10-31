@@ -247,7 +247,7 @@ class _Model(torch.nn.Module):
 
 
 def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = True, coef_1 = None, metrics_on = True,
-           unscored = None, entropy_coef = 0.0):
+           unscored = None, entropy_coef = 0.0, mask_threshold = None):
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
     monkeypatch.setenv("UNSLOTH_RETURN_HIDDEN_STATES", "0")
@@ -271,7 +271,7 @@ def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = 
     metrics = {"train": collections.defaultdict(list), "eval": collections.defaultdict(list)}
     trainer = types.SimpleNamespace(
         args = types.SimpleNamespace(
-            unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1, off_policy_mask_threshold = None,
+            unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1, off_policy_mask_threshold = mask_threshold,
             vllm_importance_sampling_mode = "token_truncate",
         ),
         processing_class = types.SimpleNamespace(pad_token_id = 0),
@@ -319,6 +319,14 @@ def test_accumulated_loss_without_the_marker_is_unchanged(monkeypatch):
     torch.testing.assert_close(seen["sampling"], rr.align_logprobs_with_mask(sampling, seen["mask"]))
     seen, _, _, _ = _drive(monkeypatch, False, use_vllm = False, correction = False)
     assert seen["old"] is None and seen["sampling"] is None
+
+
+def test_correction_flag_without_vllm_drops_the_sampling_logps(monkeypatch):
+    # TRL defaults vllm_importance_sampling_correction to True with use_vllm False (e.g. a custom rollout_func).
+    seen, _, _, _ = _drive(monkeypatch, False, use_vllm = False, correction = True)
+    assert seen["sampling"] is None
+    seen, sampling, _, _ = _drive(monkeypatch, False, use_vllm = False, correction = True, mask_threshold = 0.5)
+    torch.testing.assert_close(seen["sampling"], rr.align_logprobs_with_mask(sampling, seen["mask"]))
 
 
 def test_accumulated_loss_reports_the_clipped_ratio(monkeypatch):
