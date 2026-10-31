@@ -260,6 +260,11 @@ def _bnb_4bit_direct(self, x, quant_state):
         ops = _bnb_direct_ops()
     if ops is False:
         return None
+    # Row cap before the plan revalidation: prefill over the cap would pay for it only to decline.
+    in_features = x.shape[-1]
+    rows = x.numel() // in_features if in_features else 0
+    if not (0 < rows <= ops._gemm_4bit_custom_max_m):
+        return None  # bitsandbytes dequantizes here
     plan = self.__dict__.get("_unsloth_bnb_direct")
     meta = _bnb_direct_meta(quant_state)
     if plan is None or plan[0] is not quant_state or plan[4] != meta or plan[1] is not None and (
@@ -275,13 +280,13 @@ def _bnb_4bit_direct(self, x, quant_state):
     if plan[1] is None:
         return None
     _, _, _, ptrs, _, N, K, blocksize, quant_type, picks, device = plan
-    if x.shape[-1] != K or device != x.get_device() or (bias is not None and (
+    if in_features != K or device != x.get_device() or (bias is not None and (
         bias.dim() != 1 or bias.get_device() != device
     )):
         return None
-    M = x.numel() // K
-    if not (0 < M <= ops._gemm_4bit_custom_max_m) or K % blocksize:
-        return None  # bitsandbytes dequantizes here
+    M = rows
+    if K % blocksize:
+        return None
     use = picks.get((M, dtype))
     if use is None:
         # Same kernel-vs-dequantize choice as torch.ops.bitsandbytes.gemm_4bit.
