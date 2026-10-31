@@ -32,6 +32,7 @@ __all__ = [
 import functools
 import math
 import os
+import threading
 import warnings
 import torch
 from typing import Optional
@@ -1657,21 +1658,50 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
         (lpt if exact_lpt else logps.clone(),)
 
 
+_FULL_REDUCTION_LOCK = threading.Lock()
+_FULL_REDUCTION_USERS = {}  # flag name -> [calls inside, value saved by the first]
+
+
+class _full_precision_reduction:
+    """fp32 split-K reductions for half GEMMs. The switch is process-wide, so it is reference counted: a per-call
+    save / restore let concurrent backward threads restore over each other."""
+
+    def __init__(self, dtype):
+        self.name = "allow_bf16_reduced_precision_reduction" if dtype == torch.bfloat16 else \
+            "allow_fp16_reduced_precision_reduction"
+
+    def __enter__(self):
+        flags = torch.backends.cuda.matmul
+        with _FULL_REDUCTION_LOCK:
+            users = _FULL_REDUCTION_USERS.setdefault(self.name, [0, None])
+            if users[0] == 0:
+                users[1] = getattr(flags, self.name)
+                split_k = getattr(flags, self.name + "_split_k", None)
+                # Assigning a bool also turns split-K on, so keep the caller's split-K setting with a tuple.
+                if split_k is not None:
+                    users[1] = (users[1], split_k)
+                setattr(flags, self.name, False if split_k is None else (False, split_k))
+            users[0] += 1
+        return self
+
+    def __exit__(self, *exc):
+        with _FULL_REDUCTION_LOCK:
+            users = _FULL_REDUCTION_USERS[self.name]
+            users[0] -= 1
+            if users[0] == 0:
+                setattr(torch.backends.cuda.matmul, self.name, users[1])
+        return False
+
+
 def _mm_into(out, a, b):
-    """out = a @ b accumulated in fp32 and rounded once to out's dtype (no reduced-precision split-K reduction)."""
+    """out = a @ b accumulated in fp32 and rounded once to out's dtype (no reduced-precision split-K reduction).
+    Not out_dtype=fp32: a [rows, vocab-wide] fp32 buffer + copy costs more traffic than the GEMM."""
     if out.dtype == torch.float32:
         _mm_fp32(a, b, out = out)
         return
     if a.is_cuda and a.dtype == out.dtype == b.dtype and a.dtype in _HALF:
-        flags = torch.backends.cuda.matmul
-        name = "allow_bf16_reduced_precision_reduction" if a.dtype == torch.bfloat16 else \
-            "allow_fp16_reduced_precision_reduction"
-        old = getattr(flags, name)
-        setattr(flags, name, False)
-        try:
+        with _full_precision_reduction(a.dtype):
             torch.mm(a, b, out = out)
-        finally:
-            setattr(flags, name, old)
         return
     out.copy_(_mm_fp32(a, b))
 
