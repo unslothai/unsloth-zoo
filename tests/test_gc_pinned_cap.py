@@ -25,6 +25,7 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_LIVE_PEAK", 0, raising = False)
     monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: None, raising = False)
     monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: None, raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
@@ -511,3 +512,109 @@ def test_concurrent_reservations_cannot_spend_the_same_headroom(monkeypatch, gc_
     b.join(10)
     assert "a" in out and "b" in out and live is not None
     assert fake.peak <= 11 * MIB
+
+
+def _pending_block_setup(monkeypatch, gc_module, cap_bytes):
+    """One 4096 block reserved, released while its copy event is still pending (reads as active)."""
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(cap_bytes / (1 << 30)))
+    held = {"bytes": 0}
+    flushes = []
+    real_empty = torch.empty
+
+    def empty(*args, pin_memory = False, **kwargs):
+        if pin_memory: held["bytes"] += 4096    # the allocator cannot reuse the pending block yet
+        return real_empty(*args, **kwargs)
+
+    def flush():
+        flushes.append(True)
+        return False
+
+    monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: held["bytes"])
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 0)
+    monkeypatch.setattr(gc_module, "_empty_host_cache", flush)
+    assert gc_module._reserve_pinned(4096)
+    held["bytes"] = 4096
+    gc_module._release_pinned(4096)
+    return held, flushes
+
+
+def test_pending_cached_block_under_the_cap_pins_one_more_without_a_flush(monkeypatch, gc_module):
+    # A flush syncs every device and unpins every cached block; under the cap one more block is enough.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    assert gc_module._reserve_pinned(4096)
+    assert flushes == []
+    assert gc_module.GC_PINNED_BYTES == 8192 == held["bytes"]
+    assert gc_module._PINNED_CACHED == {4096: 1}      # the pending block is still ours, reused later
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 4096)  # its copy finished
+    assert gc_module._reserve_pinned(4096)              # the next request takes it, no new pin
+    assert held["bytes"] == 8192 and gc_module.GC_PINNED_BYTES == 8192
+
+
+def test_pending_cached_block_at_the_cap_still_flushes(monkeypatch, gc_module):
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 6000)
+    gc_module._reserve_pinned(4096)
+    assert flushes                                       # one more block would pass the cap
+    assert gc_module.GC_PINNED_BYTES <= 6000
+
+
+def test_pending_blocks_are_kept_for_one_extra_generation_only(monkeypatch, gc_module):
+    # Far under the cap, but a CPU running several steps ahead must not pin one more block per
+    # step in flight: past two live sets (one live, one queued) the old flush runs again.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    assert gc_module._reserve_pinned(4096)              # second generation: kept, no flush
+    assert flushes == [] and held["bytes"] == 8192
+    assert gc_module._PINNED_CACHED == {4096: 1} and gc_module.GC_PINNED_BYTES == 8192
+    gc_module._release_pinned(4096)                     # its copy is queued too
+    gc_module._reserve_pinned(4096)                     # a third generation would pass 2 x 4096
+    assert flushes
+    assert gc_module.GC_PINNED_BYTES <= 8192
+
+
+def test_pending_bound_follows_the_whole_live_set(monkeypatch, gc_module):
+    # The bound is two whole live sets, not two blocks: a backward releases every block of the
+    # step, and the next forward re-reserves them while their copies are still queued.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 4096)  # first step done
+    for _ in range(4): assert gc_module._reserve_pinned(4096)  # cached block reused, 3 new ones
+    held["bytes"] = 4 * 4096
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 0)
+    for _ in range(4): gc_module._release_pinned(4096)        # all four copies still queued
+    assert gc_module._PINNED_CACHED == {4096: 4} and gc_module._PINNED_LIVE_PEAK == 4 * 4096
+    for _ in range(4): assert gc_module._reserve_pinned(4096)  # one extra generation: all kept
+    assert flushes == [] and held["bytes"] == gc_module.GC_PINNED_BYTES == 8 * 4096
+    gc_module._release_pinned(4096)
+    gc_module._reserve_pinned(4096)                            # past 2 x the live set: flush
+    assert flushes
+
+
+def test_reinit_drops_the_previous_live_peak(monkeypatch, gc_module):
+    # A larger model trained earlier in the same process must not widen the next model's bound.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    monkeypatch.setattr(gc_module, "_PINNED_LIVE_PEAK", 1 << 19)
+    gc_module._reset_pinned_cap()
+    assert gc_module._PINNED_LIVE_PEAK == 0
+    monkeypatch.setattr(gc_module, "GC_PINNED_CAP", 1 << 20)  # the next model's cap, computed
+    assert gc_module._reserve_pinned(4096)              # 2 x this model's 4096: kept
+    assert flushes == [] and gc_module._PINNED_LIVE_PEAK == 4096
+    gc_module._release_pinned(4096)
+    gc_module._reserve_pinned(4096)                     # a third generation flushes again
+    assert flushes
+
+
+def test_cached_reuse_after_reinit_records_the_live_peak(monkeypatch, gc_module):
+    # A new model can take every block back from the cache; that live set must still set the bound.
+    held, flushes = _pending_block_setup(monkeypatch, gc_module, 1 << 20)
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 4096)
+    for _ in range(4): assert gc_module._reserve_pinned(4096)
+    held["bytes"] = 4 * 4096
+    for _ in range(4): gc_module._release_pinned(4096)
+    gc_module._reset_pinned_cap()
+    monkeypatch.setattr(gc_module, "GC_PINNED_CAP", 1 << 20)
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 4 * 4096)  # copies done
+    for _ in range(4): assert gc_module._reserve_pinned(4096)  # all four from the cache
+    assert gc_module._PINNED_LIVE_PEAK == 4 * 4096
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 0)
+    for _ in range(4): gc_module._release_pinned(4096)        # copies queued again
+    assert gc_module._reserve_pinned(4096)                      # second generation: kept
+    assert flushes == []
