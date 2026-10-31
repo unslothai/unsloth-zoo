@@ -492,7 +492,8 @@ def test_a_batch_s_last_leaving_row_hands_its_cache_back_without_a_copy():
         assert mx.array_equal(taken.values, cache.values[rows - 1 : rows, :, : cache._idx]).item()
         return round((mx.get_active_memory() - start) / (2 * 8 * cache._idx * 64 * 2), 2)
 
-    assert copied(1) == 0 and copied(2) == 1
+    # The control measures one row copy, but above exactly 1 on some devices (1.25 on the hosted paravirtual GPU).
+    assert copied(1) == 0 and 1 <= copied(2) < 2
 
 
 @metal_only
