@@ -35,7 +35,7 @@ import struct
 import sys
 import textwrap
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from threading import RLock, local
 from types import FunctionType
@@ -4148,7 +4148,7 @@ def _nax_qmm_classes(route, *cache_key):
         routed = _nax_small_m_qmm(self, x, bindings)
         return nn.QuantizedEmbedding.as_linear(self, x) if routed is None else routed
 
-    _ONE_ROW_STOCK_CALLS.add(linear)   # the small-row routes start at two rows
+    _ONE_ROW_STOCK_CALLS.update((linear, as_linear))   # the small-row routes start at two rows
     return {
         base: type(f"_{route.tag}SmallM{base.__name__}", (base,),
                    {name: method, "_unsloth_nax_qmm_native": base, "_unsloth_nax_qmm_route": route,
@@ -4749,6 +4749,68 @@ def dense_prefill_linear(model, *, _modules = None):
                     module.__dict__.pop("_unsloth_tiled_qmm", None)
 
 
+@functools.cache
+def _singleton_quantized_class(base, method, original, *cache_key):
+    bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+    if bindings is None:
+        return None
+
+    def call(self, x):
+        native = getattr(base, method)
+        if (isinstance(x, mx.array) and x.ndim == 3 and x.shape[0] > 1 and x.shape[1] == 1 and not self.training
+                and native is original
+                and isinstance(self.get("weight"), mx.array) and self.weight.ndim == 2
+                and _bindings_intact(bindings)):
+            return mx.concatenate([native(self, x[row:row + 1]) for row in range(x.shape[0])], axis = 0)
+        return native(self, x)
+
+    _ONE_ROW_STOCK_CALLS.add(call)
+    return type(f"_Singleton{base.__name__}", (base,), {method: call, "_unsloth_singleton_native": base})
+
+
+@contextmanager
+def singleton_quantized_decode(model, *, _modules = None):
+    """Keep each request's one-row quantized arithmetic in a speculative call's batched decode and tied verify heads, which
+    its rows must match. A plain batch keeps stock's multi-row call."""
+    changed = []
+    try:
+        with _NAX_QMM_LOCK:
+            if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                seen = set()
+                for _, module in _fusion_modules(model, _modules):
+                    if id(module) in seen:
+                        continue
+                    seen.add(id(module))
+                    base = type(module)
+                    if "_unsloth_singleton_native" in vars(base):
+                        module._unsloth_singleton_scopes += 1
+                        changed.append(module)
+                        continue
+                    stock = (nn.QuantizedEmbedding if isinstance(module, nn.QuantizedEmbedding)
+                             else nn.QuantizedLinear if isinstance(module, nn.QuantizedLinear) else None)
+                    if stock is None or module.training:
+                        continue
+                    method = "as_linear" if stock is nn.QuantizedEmbedding else "__call__"
+                    original = getattr(base, method)
+                    if base is not stock and original not in _ONE_ROW_STOCK_CALLS:
+                        continue
+                    swapped = _singleton_quantized_class(base, method, original,
+                                                        nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
+                    if swapped is not None:
+                        module.__class__ = swapped
+                        module._unsloth_singleton_scopes = 1
+                        changed.append(module)
+        yield model
+    finally:
+        with _NAX_QMM_LOCK:
+            for module in reversed(changed):
+                module._unsloth_singleton_scopes -= 1
+                if not module._unsloth_singleton_scopes:
+                    module.__dict__.pop("_unsloth_singleton_scopes", None)
+                    if "_unsloth_singleton_native" in vars(type(module)):
+                        module.__class__ = type(module)._unsloth_singleton_native
+
+
 # The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
 # 0.7.1 added the verifier's `verify` entry; earlier releases miss it and stay native.
 _EXACT_VERIFY_CONTRACT = {
@@ -4820,6 +4882,30 @@ def _verify_admitted(key, native, fused):
             logger.warning("a verify block differs from mlx-vlm's verifier for %s; the native verifier "
                            "stays in use there", key)
     return reference
+
+
+def _verify_gathers(linear, x, eligible):
+    """Whether verification would gather a frozen projection with different rounding from one-row decode."""
+    return (getattr(_VERIFY_STATE, "serving", False) and not getattr(_VERIFY_STATE, "plain_decode", False)
+            and isinstance(linear, nn.QuantizedLinear) and x.ndim == 3 and x.shape[0] * x.shape[1] > 1 and not eligible(linear, x) and not linear.trainable_parameters())
+
+
+def _verify_rows_alone(linear, x):
+    K = x.shape[-1]
+
+    def one_row_calls():
+        return mx.concatenate([linear(row[None]) for row in mx.contiguous(x).reshape(-1, 1, K)]).reshape(*x.shape[:-1], -1)
+
+    def batched():
+        biases = linear.get("biases")
+        y = mx.quantized_matmul(x.reshape(-1, 1, K), linear["weight"][None], scales = linear["scales"][None],
+                                biases = None if biases is None else biases[None], transpose = True,
+                                group_size = linear.group_size, bits = linear.bits, mode = linear.mode)
+        y = y.reshape(*x.shape[:-1], -1)
+        return y + linear["bias"] if "bias" in linear else y
+
+    key = ("rows alone", x.dtype, linear["weight"].shape, linear.bits, linear.group_size, linear.mode, "bias" in linear)
+    return _verify_admitted(key, one_row_calls, batched)
 
 
 def _verify_sliced(project, linears, x, eligible):
@@ -5073,6 +5159,9 @@ _VERIFY_GDN_SOURCE = """
 _VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
 # Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
 _VERIFY_GDN_MAX_ROWS = 16
+# Causal verify rows `_native_causal_attention` takes through fused calls, and in one pass over the KV prefix.
+_NATIVE_CAUSAL_ROWS = 8
+_EXACT_ATTENTION_MAX_ROWS = 32
 # The verifier's own q/k normalization keeps 1e-6; the loader's replacement uses the layer's.
 _VERIFY_QK_EPS = {"abddec205f64acc5": lambda layer: 1e-6,
                   "4fa05fbe449bee52": lambda layer: _NORMALIZE_QK_EPS.get(
@@ -5217,24 +5306,24 @@ _EXACT_ATTENTION_ROWS = """
 
     float qr[2][qk], o[2][qk], m[2], s[2];
     for (int r = 0; r < 2; r++) {
-        const device T* qp = q + b * q_strides[0] + (h * G + g) * q_strides[1] + min(r0 + r, L - 1) * q_strides[2] + lane * qk;
+        const device T* qp = q + b * q_strides[0] + (h * G + g) * q_strides[1] + min(r0 + r, L - 1) * q_strides[2] + lane * qk * q_strides[3];
         for (int j = 0; j < qk; j++) {
-            qr[r][j] = static_cast<float>(scale) * qp[j];
+            qr[r][j] = static_cast<float>(scale) * qp[j * q_strides[3]];
             o[r][j] = 0;
         }
         m[r] = Limits<float>::finite_min;
         s[r] = 0;
     }
 
-    const device T* kp = k + b * k_strides[0] + h * k_strides[1] + block * k_strides[2] + lane * qk;
-    const device T* vp = v + b * v_strides[0] + h * v_strides[1] + block * v_strides[2] + lane * qk;
+    const device T* kp = k + b * k_strides[0] + h * k_strides[1] + block * k_strides[2] + lane * qk * k_strides[3];
+    const device T* vp = v + b * v_strides[0] + h * v_strides[1] + block * v_strides[2] + lane * qk * v_strides[3];
     // The last threadgroup's spare row-pair slots load nothing.
     const int end = r0 < L ? prefix + min(r0 + 2, L) : 0;
     for (int i = block; i < end; i += BLOCKS) {
         float kr[qk], vr[qk];
         for (int j = 0; j < qk; j++) {
-            kr[j] = kp[j];
-            vr[j] = vp[j];
+            kr[j] = kp[j * k_strides[3]];
+            vr[j] = vp[j * v_strides[3]];
         }
         for (int r = 0; r < 2; r++) {
             if (r0 + r < L && i <= prefix + r0 + r) {
@@ -5404,13 +5493,22 @@ def _verify_qmv_rows(native, linears, x):
     return tuple(outs) if len(outs) > 1 else outs[0]
 
 
+def _exact_attention_rows_source():
+    # Unit feature strides take the source as written without them; other views read through their strides.
+    contiguous = _EXACT_ATTENTION_ROWS
+    for name in ("q", "k", "v"):
+        contiguous = contiguous.replace(f" * {name}_strides[3]", "")
+    return ("if (q_strides[3] == 1 && k_strides[3] == 1 && v_strides[3] == 1) {\n"
+            + contiguous + "\n} else {\n" + _EXACT_ATTENTION_ROWS + "\n}")
+
+
 @functools.cache
 def _exact_attention_kernels():
     try:
         if not mx.metal.is_available():
             return None
         return (mx.fast.metal_kernel(name = "unsloth_exact_attention_rows", input_names = ["q", "k", "v", "N", "L", "scale"],
-                                     output_names = ["partials", "sums", "maxs"], source = _EXACT_ATTENTION_ROWS,
+                                     output_names = ["partials", "sums", "maxs"], source = _exact_attention_rows_source(),
                                      ensure_row_contiguous = False),
                 mx.fast.metal_kernel(name = "unsloth_exact_attention_reduce", input_names = ["partials", "sums", "maxs"],
                                      output_names = ["out"], source = _EXACT_ATTENTION_REDUCE))
@@ -5445,8 +5543,93 @@ def _exact_attention_rows(queries, keys, values, scale, blocks):
                   output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
 
 
+def _vector_launch(gqa, rows, keys, dim):
+    """MLX's unmasked vector SDPA launch for `rows` query rows per head: passes, key interleave, one-row GQA kernel."""
+    if not ((_gpu_class() in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)):
+        return 1, 0, False
+    # MLX 0.32.4 gives one-row calls of these shapes a GQA kernel that reduces keys in another order.
+    grouped = rows == 1 and keys >= 8192 and (gqa == 8 and dim in (64, 128) or gqa in (12, 16) and dim == 128)
+    return 2, _vector_blocks(gqa * rows, keys), grouped
+
+
+@functools.lru_cache(maxsize = 64)
+def _causal_chunks(gqa, dim, prefix, length, size, forced):
+    """(start, rows) chunks of at most `size` rows launching their rows' one-row kernel; `forced` only keys the cache."""
+    chunks, start = [], 0
+    while start < length:
+        rows = min(size, length - start)
+        launch = lambda rows, keys: _vector_launch(gqa, rows, prefix + start + keys, dim)
+        while rows > 1 and any(launch(1, row + 1) != launch(rows, rows) for row in range(rows)):
+            rows -= 1
+        chunks.append((start, rows))
+        start += rows
+    return tuple(chunks)
+
+
+@functools.lru_cache(maxsize = 64)
+def _causal_rows_blocks(gqa, dim, prefix, length, forced):
+    """The 2-pass key interleave every row's one-row launch shares, or None; `forced` only keys the cache."""
+    launches = {_vector_launch(gqa, 1, prefix + row + 1, dim) for row in range(length)}
+    (passes, blocks, grouped), = launches if len(launches) == 1 else ((1, 0, False),)
+    return blocks if passes == 2 and not grouped else None
+
+
+def _launched_rows(queries, keys, values, scale, blocks):
+    """`_exact_attention_rows`, evaluated, its threadgroup refitted to any limit MLX quotes; None where it cannot launch."""
+    while True:
+        try:
+            out = _exact_attention_rows(queries, keys, values, scale, blocks)
+            mx.eval(out)
+            return out
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            if not _fit_threadgroup(error, queries.dtype, queries.shape[1] // keys.shape[1]):
+                return None
+
+
+def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row):
+    """A causal verify block, each row with its one-row call's bits: in one pass over the KV prefix where the rows share
+    their one-row launch and MLX's fused SDPA would take several calls, else through those calls; None where the block's
+    shape does not apply. A plan serves once it matched `per_row()`."""
+    if (not getattr(_VERIFY_STATE, "serving", False)
+            or not (cache is None or type(cache) is getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None))
+            or not (mask is None or isinstance(mask, str) and mask == "causal")
+            or not all(isinstance(x, mx.array) and x.ndim == 4 for x in (queries, keys, values))
+            or queries.dtype not in (mx.bfloat16, mx.float16) or not queries.dtype == keys.dtype == values.dtype
+            or not queries.shape[0] == keys.shape[0] == values.shape[0] or keys.shape != values.shape
+            or queries.shape[-1] != keys.shape[-1] or queries.shape[-1] not in (64, 128, 256)
+            or not 2 <= queries.shape[2] <= _EXACT_ATTENTION_MAX_ROWS
+            or keys.shape[2] < queries.shape[2] or keys.shape[1] == 0
+            or queries.shape[1] % keys.shape[1] or queries.shape[1] // keys.shape[1] > 16):
+        return None
+    length, gqa, dim = queries.shape[2], queries.shape[1] // keys.shape[1], queries.shape[-1]
+    prefix, forced = keys.shape[2] - length, os.environ.get("MLX_SDPA_BLOCKS")
+    # The fused kernel serves at most 8 query rows and 32 across a GQA group; each chunk's keys end at its last row,
+    # where the lower-right causal mask aligns. A launch other than a row's own reduces it in another order.
+    chunks = _causal_chunks(gqa, dim, prefix, length, min(8, 32 // gqa), forced)
+    chunked = lambda: mx.concatenate([mx.fast.scaled_dot_product_attention(
+        queries[:, :, start : start + rows], keys[:, :, : prefix + start + rows], values[:, :, : prefix + start + rows],
+        scale = scale, mask = "causal") for start, rows in chunks], axis = 2)
+    # Each fused call reads the whole prefix again; the rows kernel's threadgroups read each key once for all their rows.
+    blocks = _causal_rows_blocks(gqa, dim, prefix, length, forced) if len(chunks) > 1 else None
+    rows_kernel = blocks is not None and _exact_attention_kernels() is not None
+    one_pass = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
+    fits = length <= _NATIVE_CAUSAL_ROWS
+    # MLX's dispatch changes at or just past powers of two: a plan is checked again for each such class of key counts its
+    # chunks' first and last rows fall in, so a dispatch `_vector_launch` does not model falls back.
+    octave = lambda n: (n.bit_length(), (n - 1).bit_length())
+    plan = (queries.shape[:3], keys.shape[1], queries.dtype, dim, forced, *(
+        (rows, octave(prefix + start + 1), octave(prefix + start + rows)) for start, rows in chunks))
+    if rows_kernel and ((key := ("causal attention", blocks, *plan)) in _VERIFY_VERDICTS
+                        or _launched_rows(queries, keys, values, scale, blocks) is not None):
+        return _verify_admitted(key, per_row, one_pass)
+    return _verify_admitted(("causal chunks", *plan), per_row, chunked) if fits else None
+
+
 def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
     """`per_row()`, mlx-vlm's one-row SDPA calls over a causal verify block, read in one pass over the KV prefix where that is faster."""
+    if (output := _native_causal_attention(queries, keys, values, scale, cache, mask, per_row)) is not None:
+        return output
     if (not isinstance(keys, mx.array) or not isinstance(values, mx.array) or isinstance(mask, mx.array)
             or hasattr(cache, "bits") or hasattr(cache, "decode_attention") or queries.ndim != 4
             or queries.dtype not in (mx.bfloat16, mx.float16) or keys.dtype != queries.dtype or values.dtype != queries.dtype
@@ -5556,13 +5739,14 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer, outer_tapes
 
     def entered(self, language_model, *args, **kwargs):
-        outer = getattr(_VERIFY_STATE, "serving", False)
+        outer, outer_plain = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "plain_decode", False)
         _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
                                      and not language_model.training and _bindings_intact(bindings))
+        _VERIFY_STATE.plain_decode = "_unsloth_speculative_call" not in language_model.__dict__
         try:
             return native_entry(self, language_model, *args, **kwargs)
         finally:
-            _VERIFY_STATE.serving = outer
+            _VERIFY_STATE.serving, _VERIFY_STATE.plain_decode = outer, outer_plain
 
     def taped_gated_delta(self, layer, inputs, mask, cache):
         if getattr(_VERIFY_STATE, "tapes", None) is None:
@@ -5573,12 +5757,18 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
                 return _verify_gdn(self, layer, inputs, cache, route, kernels.gated_delta_update_with_states, qk_eps)
         return taped(self, layer, inputs, mask, cache)
 
+    def projected(self, linear, x):
+        return _verify_rows_alone(linear, x) if _verify_gathers(linear, x, eligible) else base._linear(self, linear, x)
+
     def sliced_linear(self, linear, x):
-        project = lambda rows: base._linear(self, linear, rows)
+        project = lambda rows: projected(self, linear, rows)
         return _verify_qmv_rows(lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
 
     def sliced_linears(self, linears, x):
-        project = lambda rows: base._linears(self, linears, rows)
+        if all(isinstance(p, (nn.Linear, nn.QuantizedLinear)) for p in linears) and any(_verify_gathers(p, x, eligible) for p in linears):
+            project = lambda rows: tuple(projected(self, p, rows) for p in linears)
+        else:
+            project = lambda rows: base._linears(self, linears, rows)
         return _verify_qmv_rows(lambda: _verify_sliced(project, linears, x, eligible), linears, x)
 
     def submitted_layer(self, *args, **kwargs):
@@ -5630,10 +5820,12 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         return type(f"_ScopedVerify{base.__name__}", (base,), methods)
 
     def block_attention(self, attention, x, mask, cache, position_ids, position_embeddings):
-        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] <= 2
-                or not _bindings_intact(attention_bindings)):
+        # The native two-row call launches for both rows' keys, so pairs the rows below can mask come here.
+        pair = isinstance(mask, str) and mask == "causal" or isinstance(mask, mx.array) and mask.ndim >= 4
+        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] < 2
+                or x.shape[1] == 2 and not pair or not _bindings_intact(attention_bindings)):
             return base._attention(self, attention, x, mask, cache, position_ids, position_embeddings)
-        # The native body for a block wider than two rows, with its one-row SDPA calls handed to `_exact_attention`.
+        # The native body for a wider block, with its one-row SDPA calls handed to `_exact_attention`.
         batch, length, _ = x.shape
         q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
@@ -5710,7 +5902,8 @@ def exact_speculative_verify(model, *, _modules = None):
     instead of keeping every step's state, once replays of a key's first block matched every per-step state bit
     for bit. 4-, 5-, 6- and 8-bit affine projections run every row of a block in one call per eight rows, each row
     with its one-row decode arithmetic, on the same condition; `UNSLOTH_MLX_VERIFY_QMV_ROWS=0` keeps them native.
-    Only verify calls of the
+    Quantized projections mlx-vlm's exact affine kernel refuses (N % 8 or K % 512 off, as a MoE shared-expert gate's)
+    run each row as the one-row call does, which mlx-vlm's gather does not. Only verify calls of the
     language models found here are served; other, training and distributed models, and an mlx-vlm whose verifier
     drifted, keep the native methods.
     """
@@ -6870,11 +7063,34 @@ def exact_dilated_depthwise_conv(model, *, _modules = None):
                         module.__class__ = nn.Conv1d
 
 
+@contextmanager
+def speculative_call(model, *, _modules = None):
+    """Mark the language models and routed-expert blocks of a call that verifies drafts. What pays only there checks the
+    mark, each path bitwise equal to the one it replaces, so a plain generation keeps its own route and cost."""
+    marked = []
+    try:
+        with _VERIFY_LOCK:
+            for _, module in _fusion_modules(model, _modules):
+                state = getattr(module, "__dict__", {})
+                if "_unsloth_moe_routed" in state or "_unsloth_verify_scopes" in state:
+                    state["_unsloth_speculative_call"] = state.get("_unsloth_speculative_call", 0) + 1
+                    marked.append(state)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for state in marked:
+                state["_unsloth_speculative_call"] -= 1
+                if not state["_unsloth_speculative_call"]:
+                    del state["_unsloth_speculative_call"]
+
+
 class InferenceScope(NamedTuple):
-    """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
+    """`serves`: call traits that admit it (empty admits all). `speculative`: entered only by a call naming that trait,
+    which None does not, so a plain generation never pays for it. `opt_in`: env switch that must be "1".
     `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument."""
     enter: Callable
     serves: frozenset = frozenset()
+    speculative: bool = False
     opt_in: str = None
     int8_prefill: bool = False
     ane_prefill: bool = False
@@ -6886,6 +7102,8 @@ class InferenceScope(NamedTuple):
     def admits(self, call):
         if self.opt_in is not None and os.environ.get(self.opt_in) != "1":
             return False
+        if self.speculative:
+            return call is not None and "speculative" in call
         return call is None or not self.serves or not self.serves.isdisjoint(call)
 
 
@@ -6901,6 +7119,7 @@ INFERENCE_SCOPES = [
     InferenceScope(fused_moe_routed_experts),
     InferenceScope(nax_quantized_linear, int8_prefill = True),
     InferenceScope(dense_prefill_linear),
+    InferenceScope(singleton_quantized_decode, speculative = True),
     InferenceScope(ane_prefill_mlp, ane_prefill = True),
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_qsa_attention),
@@ -6911,6 +7130,7 @@ INFERENCE_SCOPES = [
     # qwen4_exp decodes on the forward its verify blocks run on, so every generation holds this one.
     InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
+    InferenceScope(speculative_call, speculative = True),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
     InferenceScope(fused_decode_attention),
     InferenceScope(exact_ple_row_reads),
@@ -6921,7 +7141,8 @@ INFERENCE_SCOPES = [
 
 @contextmanager
 def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = None, on_error = None, _modules = None):
-    """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation.
+    """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation, short of
+    the scopes only a call naming "speculative" enters.
 
     Traits this zoo does not know are ignored. A scope that raises on entry propagates unless `on_error` is
     given: then `on_error(name, error)` runs and, if it returns, the generation continues without that scope.
@@ -6949,8 +7170,10 @@ _WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17
 def warm_inference(model, int8_prefill = None, ane_prefill = None):
     """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
     first-use checks; checks keyed by a request's row count still run then."""
-    model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
-                   int8_prefill = int8_prefill, ane_prefill = ane_prefill)
+    speculates = getattr(model, "_unsloth_speculates", False)   # set by building a drafter for it
+    with inference_scopes(model, ("speculative",), int8_prefill = int8_prefill, ane_prefill = ane_prefill) if speculates else nullcontext():
+        model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
+                       int8_prefill = int8_prefill, ane_prefill = ane_prefill)
     _warm_qmv_rows(model)
     _warm_verify_gdn(model)
 
