@@ -58,6 +58,8 @@ WRAPPER_INNER_ATTR = "_unsloth_wrapper_inner"
 # Get only allowed options
 import inspect
 import torch
+# torch 2.4 does not load torch._inductor.config on `import torch`.
+import torch._inductor.config
 inductor_config_source = inspect.getsource(torch._inductor.config)
 
 
