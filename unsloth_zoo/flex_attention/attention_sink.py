@@ -196,12 +196,18 @@ def flex_attention_with_sink(
             if is_training:
                 if has_flex_cache:
                     del self_attn._flex_attention_cache
+                assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
+                padding_start_idx = attention_mask.to(torch.int64).argmax(1).to(query.device)
+                mask_mod = \
+                    generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
+                    if type(sliding_window) is int and sliding_window != 0 else \
+                    generate_causal_mask_with_padding(padding_start_idx)
             else:
                 # Consider left padding as well for prefill
                 assert attention_mask is not None
                 assert attention_mask.dim() == 2, f"Unsloth: Attention_mask has dim = {attention_mask.dim()}"
                 # We must account for left padding
-                padding_start_idx = attention_mask.argmax(1).to(query.device)
+                padding_start_idx = attention_mask.to(torch.int64).argmax(1).to(query.device)
                 do_padding = torch.arange(max(qlen_Q, qlen_KV), device = query.device).repeat((bsz, 1)) < padding_start_idx.unsqueeze(0).T
                 # Padded tokens: Q=1 and K=-inf so Q*K=-inf gives exp=0; Q=K=0 would give Q*K=0 and exp(0)=1, which is wrong.
                 query.transpose(2, 1)[do_padding[:, :qlen_Q ]] = 1
