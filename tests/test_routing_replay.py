@@ -787,3 +787,34 @@ def test_recompute_with_several_same_shape_forwards_keeps_candidate_shapes():
         rr._STATE.pending, rr._STATE.recomputed = saved
     assert forced.shape == (5, 2)
     assert bool(valid.all())
+
+
+def test_prefix_reuse_keeps_a_route_duplicate_captures_disputed():
+    # Two same-call captures of the same tokens disagree on a row: an older capture that agreed with
+    # one of them must not supply that row to a later prompt that reuses the prefix.
+    from types import SimpleNamespace as NS
+    import unsloth_zoo.routing_replay as rr
+
+    def routes(n, pair = (0, 1)):
+        return torch.tensor(pair, dtype = torch.int16).reshape(1, 1, 2).repeat(n, 1, 1)
+
+    def request(prompt, completion, data):
+        return NS(prompt_token_ids = prompt, outputs = [NS(token_ids = completion, routed_experts = data)])
+
+    rr.reset_routing_replay()
+    try:
+        a = routes(3)
+        b = a.clone()
+        b[1] = torch.tensor([2, 3])
+        first = request([1, 2], [3, 4], a)
+        rr.record_routed_experts([first])
+        rr.record_routed_experts([first, request([1, 2], [3, 4], b)])
+        assert rr._lookup((1, 2, 3, 4))[1].tolist() == [[-1, -1]]
+        rr.record_routed_experts([request([1, 2, 3, 4, 5], [6], routes(2, (4, 5)))], prompt_starts = [3])
+        after = rr._lookup((1, 2, 3, 4, 5, 6))
+        assert after[1].tolist() == [[-1, -1]]
+        # Undisputed prefix rows are still reused, and nothing internal leaks out of a lookup.
+        assert after[0].tolist() == [[0, 1]] and after[2].tolist() == [[0, 1]]
+        assert int(after.min()) >= -1
+    finally:
+        rr.reset_routing_replay()
