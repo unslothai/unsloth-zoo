@@ -1399,7 +1399,7 @@ pass
 
 class _CpuSlotLease:
     """One CPU_BUFFERS slot held by an offloaded checkpoint until its backward has read it."""
-    __slots__ = ("index", "epoch", "device", "stream")
+    __slots__ = ("index", "epoch", "device", "stream", "slot")
 
     def __init__(self, device = None, stream = None):
         global _CPU_SLOT_TOP
@@ -1416,6 +1416,7 @@ class _CpuSlotLease:
         if self.index is None:
             self.index = _CPU_SLOT_TOP
             _CPU_SLOT_TOP += 1
+        self.slot = self.index
         self.epoch = _CPU_SLOT_EPOCH
         self.device, self.stream = device, stream
         fence = _SLOT_FENCES.pop(self.index, None)
@@ -1424,6 +1425,11 @@ class _CpuSlotLease:
 
     def release(self, ctx = None):
         index, self.index = self.index, None
+        if index is None and ctx is not None and self.stream is not None and self.epoch == _CPU_SLOT_EPOCH:
+            # A retained graph's next backward reloads the slot again: fence that reload, not the first.
+            holder = _SLOT_HOLDERS.get(self.slot) or _RETAINED_SLOTS.get(self.slot)
+            if holder is not None and holder() is ctx:
+                _SLOT_FENCES[self.slot] = (self.device, self.stream.record_event())
         if index is not None and self.epoch == _CPU_SLOT_EPOCH:
             if self.stream is not None:
                 _SLOT_FENCES[index] = (self.device, self.stream.record_event())

@@ -126,3 +126,47 @@ def test_plain_loop_reuses_the_same_slots(G):
     top = G._CPU_SLOT_TOP
     _run(G, _parse("F0 B0 F1 B1 F2 B2"), True)
     assert G._CPU_SLOT_TOP == top and not G._RETAINED_SLOTS
+
+
+class _RecordingStream:
+    def __init__(self, name):
+        self.name, self.events, self.waits = name, [], []
+    def wait_stream(self, other): pass
+    def wait_event(self, event): self.waits.append(event)
+    def record_event(self):
+        self.events.append((self.name, len(self.events) + 1))
+        return self.events[-1]
+
+
+@pytest.mark.parametrize("lease_between", [False, True])
+def test_retained_rebackward_moves_the_cross_device_fence(G, lease_between):
+    # Another device leasing the slot must wait for the last reload of it, not the first.
+    G._reset_cpu_slots()
+    s0, s1 = _RecordingStream("cuda:0"), _RecordingStream("cuda:1")
+    lease = G._CpuSlotLease(0, s0)
+    slot = lease.index
+
+    class Retained(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            ctx.save_for_backward(x)
+            return x * 2
+        @staticmethod
+        def backward(ctx, grad):
+            ctx.saved_tensors
+            lease.release(ctx)
+            return grad * 2
+
+    y = Retained.apply(torch.ones((), requires_grad = True))
+    y.backward(retain_graph = True)
+    if lease_between:
+        # The retained slot is parked; this lease takes a fresh one.
+        assert G._CpuSlotLease(0, s0).index != slot
+    y.backward()
+    del y
+    gc.collect()
+    other = G._CpuSlotLease(1, s1)
+    assert other.index == slot
+    assert s1.waits == [s0.events[-1]]
+    assert len([e for e in s0.events if e[0] == "cuda:0"]) >= 2
+    other.release()
