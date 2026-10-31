@@ -2236,3 +2236,21 @@ def test_a_long_prompts_first_round_reads_its_backlog_flush_and_prices_no_width(
     _run(model, ids[:1], 24, controller, SamplingParams(), drafter = drafter)
     # The prompt's backlog flush serves the first round, which is cold; later rounds read ordinary prefetched blocks.
     assert reads[0] == [True] and colds[0] and not any(flags[0] for flags in reads[1:]) and False in colds
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_a_drafters_selector_reports_confidences_for_any_target(monkeypatch, moe):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.speculative import ContextDrafter
+    class Head(nn.Module):
+        def bind(self, target):
+            pass
+        def draft_block(self, *args):
+            pass
+    model, target = Head(), nn.Module()
+    model.config = SimpleNamespace(block_size = 8, target_layer_ids = [0])
+    model.candidate_selector = nn.Module()
+    if moe:
+        target.switch_mlp = nn.Module()
+    drafter = ContextDrafter(model, target)
+    assert drafter.confidences and model.candidate_selector.__dict__.get("_unsloth_wants_confidence")

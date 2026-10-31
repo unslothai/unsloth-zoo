@@ -2153,9 +2153,8 @@ class ContextDrafter:
         attentions = [layer.self_attn for layer in model.layers] if self.predraft_rows else []
         if attentions and all(a.is_sliding for a in attentions):
             self.context_rows = max(a.sliding_window - 1 for a in attentions)
-        # DFlash2's selector reports each drafted position's probability, from which the controller trims a sparse target's round.
-        enabled = any(hasattr(module, "switch_mlp") for _, module in target.named_modules())
-        self._selector = getattr(model, "candidate_selector", None) if enabled else None
+        # DFlash2's selector reports each drafted position's probability, from which the controller trims a round.
+        self._selector = getattr(model, "candidate_selector", None)
         if self._selector is not None:
             self._selector.__dict__["_unsloth_wants_confidence"] = True
         self.confidences = self._selector is not None
