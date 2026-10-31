@@ -66,8 +66,7 @@ _QWEN3_MOE_FAMILY = r"(?<![a-z0-9])qwen3_moe(?![a-z0-9])"
 
 
 def _skip_or_undo(class_name):
-    """True when the forced patch must not install now. A flag "0" load of this family first undoes
-    it: the forced forwards cast to float16 and break a bf16 model loaded after an fp16 one."""
+    """True when the forced patch must not install; a flag "0" load of this family undoes it first."""
     if other_family_load(_QWEN3_MOE_FAMILY): return True
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "0": return False
     # Not imported means never patched; do not import qwen3_moe for this.
