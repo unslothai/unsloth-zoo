@@ -2478,3 +2478,24 @@ def restore_original(
         return False
 
 
+# Forced float32 patches follow UNSLOTH_FORCE_FLOAT32, which each load resets, on classes shared by
+# every live model of that family. Stash the original only once (patch_function re-stashes whatever
+# is installed, so a second pass would record our own forward) so a later flag "0" load can undo them.
+def patch_forced_float32(target_obj, attr_name, new_func, **kwargs):
+    stashed = _get_unique_storage_name(target_obj, attr_name) in vars(target_obj)
+    return patch_function(target_obj, attr_name, new_func, store_original = not stashed, **kwargs)
+
+
+def undo_forced_float32(target_obj, attr_name):
+    if target_obj is not None and _get_unique_storage_name(target_obj, attr_name) in vars(target_obj):
+        restore_original(target_obj, attr_name)
+
+
+def other_family_load(family_pattern):
+    """A load whose model types (UNSLOTH_MODEL_NAME) are all another family's must not repatch or undo
+    this family's classes under a live model of it."""
+    import os, re
+    name = os.environ.get("UNSLOTH_MODEL_NAME", "").lower().replace("-", "_")
+    return bool(name) and re.search(family_pattern, name) is None
+
+

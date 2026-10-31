@@ -52,7 +52,13 @@ from .common import (
     unwrap_norm_weight,
     publish_to_modeling_module,
 )
-from .utils import compile_with_eager_fallback, patch_function, raise_error
+from .utils import (
+    compile_with_eager_fallback,
+    other_family_load,
+    patch_forced_float32,
+    raise_error,
+    undo_forced_float32,
+)
 from .gemma import _linear_boundary_dtype, _to_boundary_dtype, _to_forced_output_dtype
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
@@ -272,8 +278,22 @@ def _gemma4_text_variants(class_suffix = None):
         yield module, prefix
 
 
+_GEMMA4_FAMILY = r"(?<![a-z0-9])gemma4"
+
+
+def _gemma4_skip_or_undo(class_suffix):
+    """True when the forced patch must not install; a flag "0" load of this family undoes it first."""
+    if other_family_load(_GEMMA4_FAMILY): return True
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "0": return False
+    for name, prefix in (("gemma4", "Gemma4"), ("gemma4_unified", "Gemma4Unified")):
+        # Not imported means never patched; do not import gemma4 for this.
+        modeling = sys.modules.get(f"transformers.models.{name}.modeling_{name}")
+        undo_forced_float32(getattr(modeling, prefix + class_suffix, None), "forward")
+    return True
+
+
 def patch_Gemma4TextScaledWordEmbedding():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _gemma4_skip_or_undo("TextScaledWordEmbedding"): return
 
     def forward(self, input_ids: torch.Tensor):
         input_embeds = torch.nn.functional.embedding(
@@ -285,7 +305,7 @@ def patch_Gemma4TextScaledWordEmbedding():
         return input_embeds.to(torch.float32) * self.embed_scale.to(torch.float32)
     pass
     for module, prefix in _gemma4_text_variants("TextScaledWordEmbedding"):
-        patch_function(getattr(module, prefix + "TextScaledWordEmbedding"), "forward", forward, fullgraph = True)
+        patch_forced_float32(getattr(module, prefix + "TextScaledWordEmbedding"), "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextScaledWordEmbedding)
 
@@ -319,7 +339,7 @@ _gemma4_rms_norm_unscaled = compile_with_eager_fallback(_gemma4_rms_norm_unscale
 
 
 def patch_Gemma4RMSNorm():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _gemma4_skip_or_undo("RMSNorm"): return
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
         # Gemma4 scales by `weight` directly (no 1.0 + weight) and only when
@@ -344,14 +364,14 @@ def patch_Gemma4RMSNorm():
             _gemma4_rms_norm_scaled = _gemma4_rms_norm_scaled,
             _gemma4_rms_norm_unscaled = _gemma4_rms_norm_unscaled,
         )
-        patch_function(getattr(module, prefix + "RMSNorm"), "forward", forward, match_level = "relaxed")
+        patch_forced_float32(getattr(module, prefix + "RMSNorm"), "forward", forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4RMSNorm)
 
 
 def patch_Gemma4ClippableLinear():
     """Cast the fp16 norm output to the Linear's dtype (fp32 on full finetuning; identity on LoRA)."""
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _gemma4_skip_or_undo("ClippableLinear"): return
     for module, prefix in _gemma4_text_variants("ClippableLinear"):
         publish_to_modeling_module(
             module,
@@ -371,7 +391,7 @@ def patch_Gemma4ClippableLinear():
 
             return hidden_states
         pass
-        patch_function(getattr(module, prefix + "ClippableLinear"), "forward", forward, match_level = "relaxed")
+        patch_forced_float32(getattr(module, prefix + "ClippableLinear"), "forward", forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear)
 
@@ -546,12 +566,12 @@ def _patch_gemma4_text_attention(module, prefix):
     pass
     # force=True: gemma4.py's shared-KV carrier already wraps forward as (self, *args, **kwargs), so a signature check
     # would reject this; the carrier's q/k fp32 vs v fp16 SDPA mismatch is handled inline above.
-    patch_function(getattr(module, prefix + "TextAttention"), "forward", forward, force = True, match_level = "relaxed")
+    patch_forced_float32(getattr(module, prefix + "TextAttention"), "forward", forward, force = True, match_level = "relaxed")
 pass
 
 
 def patch_Gemma4TextAttention():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _gemma4_skip_or_undo("TextAttention"): return
     for module, prefix in _gemma4_text_variants("TextAttention"):
         _patch_gemma4_text_attention(module, prefix)
 pass
