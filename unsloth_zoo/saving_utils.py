@@ -2863,6 +2863,12 @@ def _nvfp4_bases(keys):
     return {k[: -len(_NVFP4_PACKED_SUFFIX)] for k in keys if isinstance(k, str) and k.endswith(_NVFP4_PACKED_SUFFIX)}
 pass
 
+def _with_nvfp4_dequantized_keys(keys):
+    """`keys` plus `<base>.weight` for each NVFP4 `<base>.weight_packed`: the 16bit merge rewrites
+    the packed tensor to that name, so it backs the module the same way a dense weight does."""
+    return set(keys) | {base + ".weight" for base in _nvfp4_bases(keys)}
+pass
+
 def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None, extra_scale_lookup = None):
     """Dequantize one FP8 weight; return (W_real, [scale_keys to drop]).
 
@@ -6602,6 +6608,20 @@ def _registry_checkpoint_conversion_mapping(model_class_name):
 pass
 
 
+# Checkpoint layouts Unsloth's loader renames itself (a key_mapping Transformers does not register), so a
+# merge rereading the original checkpoint can place adapters. Must match unsloth's
+# _QWEN3_ASR_PACKAGE_KEY_MAPPING: Qwen/Qwen3-ASR-0.6B and -1.7B store weights under thinker.*.
+_LOADER_CHECKPOINT_CONVERSION_MAPPINGS = {
+    "Qwen3ASRForConditionalGeneration": {
+        r"^thinker\.audio_tower\.proj1\.": "model.multi_modal_projector.linear_1.",
+        r"^thinker\.audio_tower\.proj2\.": "model.multi_modal_projector.linear_2.",
+        r"^thinker\.audio_tower\.": "model.audio_tower.",
+        r"^thinker\.model\.": "model.language_model.",
+        r"^thinker\.lm_head\.": "lm_head.",
+    },
+}
+
+
 def _get_checkpoint_conversion_mapping(model_class_name):
     """A model class's _checkpoint_conversion_mapping ({} if absent), falling back to the
     Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
@@ -6614,7 +6634,10 @@ def _get_checkpoint_conversion_mapping(model_class_name):
         mapping = {}
     if mapping:
         return mapping
-    return _registry_checkpoint_conversion_mapping(model_class_name)
+    mapping = _registry_checkpoint_conversion_mapping(model_class_name)
+    if mapping:
+        return mapping
+    return dict(_LOADER_CHECKPOINT_CONVERSION_MAPPINGS.get(model_class_name, {}))
 pass
 
 
@@ -7364,6 +7387,8 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
     tokenizer, since `final_safetensors_list` is built after that upload.
     """
     disk_keys, disk_module_shapes = disk or _disk_module_shapes(save_directory, safetensors_list)
+    # The merge dequantizes an NVFP4 <base>.weight_packed to <base>.weight, so judge backing on that name.
+    disk_keys = _with_nvfp4_dequantized_keys(disk_keys)
     unresolved = _unresolved_lora_targets(
         lora_weights,
         disk_keys,
@@ -7372,7 +7397,11 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
         tie_word_embeddings = tie_word_embeddings,
         count_packed_mxfp4 = count_packed_mxfp4,
     )
-    if not unresolved: return unresolved
+    if not unresolved:
+        _refuse_merge_with_no_placed_adapter(
+            lora_weights, disk_keys, model_class_name, tie_word_embeddings, count_packed_mxfp4,
+        )
+        return unresolved
 
     # Every report refuses regardless of size: a size threshold would downgrade a genuine 14-module under-merge on a
     # text encoder to a notice; the env var is the escape hatch.
@@ -7386,6 +7415,39 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
     if os.environ.get("UNSLOTH_ALLOW_PARTIAL_LORA_MERGE") == "1":
         print(message)
         return unresolved
+    raise PartialLoraMergeError(message)
+pass
+
+
+def _refuse_merge_with_no_placed_adapter(lora_weights, disk_keys, model_class_name,
+                                        tie_word_embeddings, count_packed_mxfp4):
+    """Refuse when LoRA-bearing modules exist but none lands on a checkpoint tensor: the count
+    check then compares 0 with 0 and would report a base-weight copy as a trained merge."""
+    # Native mxfp4 saves leave packed experts out of both counts; no staged shard leaves nothing to judge.
+    if not count_packed_mxfp4 or not disk_keys: return
+    trained = [
+        key for key, stats in lora_weights.items()
+        if isinstance(key, str)
+        and getattr(stats, "lora_A", None) is not None
+        and getattr(stats, "lora_B", None) is not None
+    ]
+    if not trained: return
+    converted = _convert_lora_keys_to_safetensor_format(
+        lora_weights, disk_keys, model_class_name = model_class_name,
+    )
+    if _backed_lora_keys(converted, disk_keys, tie_word_embeddings): return
+    message = (
+        f"Unsloth: Refusing to write a merged model. None of the {len(trained)} LoRA module(s) on "
+        f"{model_class_name} (for example {sorted(trained)[0]}) matches a weight in this checkpoint, "
+        "so the export would be the base model with no training in it.\n"
+        "This is usually a key-resolution bug in Unsloth. Please report it at "
+        "https://github.com/unslothai/unsloth-zoo/issues with your model name, your "
+        "`transformers` version and this message.\n"
+        "To write the base weights anyway, set UNSLOTH_ALLOW_PARTIAL_LORA_MERGE=1."
+    )
+    if os.environ.get("UNSLOTH_ALLOW_PARTIAL_LORA_MERGE") == "1":
+        print(message)
+        return
     raise PartialLoraMergeError(message)
 pass
 
@@ -7414,9 +7476,7 @@ def _unbacked_trained_tensors(lora_weights, shard_keys, model_class_name,
     a bare `lm_head.weight` for it puts an unexpected key in the export.
     """
     # An NVFP4 <base>.weight_packed is rewritten to <base>.weight, so it backs that module too.
-    shard_keys = set(shard_keys) | {
-        k[: -len(_NVFP4_PACKED_SUFFIX)] + ".weight" for k in shard_keys if k.endswith(_NVFP4_PACKED_SUFFIX)
-    }
+    shard_keys = _with_nvfp4_dequantized_keys(shard_keys)
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, shard_keys, model_class_name = model_class_name,
     )
