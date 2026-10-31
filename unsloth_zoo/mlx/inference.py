@@ -4255,7 +4255,8 @@ _NAX_SORTED_GATHER_VERIFIED = {}
 
 
 class _SmallRowRoute(NamedTuple):
-    """A small-row kernel, by its module and the prefix its functions share there (resolved at call time)."""
+    """A small-row kernel, by its module and the prefix its functions share there (resolved at call time);
+    its module state lives under `_unsloth_{state}_*`."""
     module: object
     kernel: str
     tag: str
@@ -4264,9 +4265,12 @@ class _SmallRowRoute(NamedTuple):
     gap: str
     probe: tuple
     takes_blocks: bool   # whether one sequence's [1, T, K] block routes
+    state: str = "nax_qmm"
+    reader: str = None
 
     def call(self, suffix, *args):
-        return getattr(self.module, self.kernel + suffix)(*args)
+        kernel = getattr(self.module, self.kernel + suffix)
+        return kernel(*args, reader = self.reader) if self.reader and not suffix else kernel(*args)
 
 
 _NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_NAX_QMM", "small_m_qmm",
@@ -4274,6 +4278,8 @@ _NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_N
 # Leaves single-sequence blocks native: Auto depth drafts those shallow, where a few-row verify gains nothing.
 _SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
                                  "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
+_LANE_QMM_ROUTE = _SmallRowRoute(matmul, "lane_qmm", "Lane", "row-invariant lane", "UNSLOTH_MLX_LANE_QMM", None,
+                                 ("LANE_QMM_PROBE_KEY", "probe_lane_qmm"), True, "lane_qmm")
 
 
 def _small_row_route():
@@ -4302,18 +4308,19 @@ def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
     return bool(mx.all(agree).item())
 
 
-def _nax_small_m_qmm(module, x, bindings):
+def _nax_small_m_qmm(module, x, bindings, route = None, rows = None):
     """The small-row kernel's result for this call, or None when it takes the native call."""
+    route = route or module._unsloth_nax_qmm_route
     # A verified shape for this weight layout skips the checks (they cost more host time than a few rows save).
-    ready = module.__dict__.get("_unsloth_nax_qmm_ready", {}).get(x.shape) if type(x) is mx.array else None
+    ready = module.__dict__.get(f"_unsloth_{route.state}_ready", {}).get(x.shape) if type(x) is mx.array else None
     if ready is not None and not module.training and _bindings_intact(bindings):
         w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
         if (type(w) is type(scales) is type(biases) is mx.array and ready[1] == (
                 x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape,
                 module.group_size, module.bits, module.mode)):
-            return module._unsloth_nax_qmm_route.call("", x.reshape(ready[0], -1), w, scales, biases,
-                                                      module.group_size, module.bits).reshape(*x.shape[:-1], -1)
-    low, high = module._unsloth_nax_qmm_rows
+            return route.call("", x.reshape(ready[0], -1), w, scales, biases,
+                              module.group_size, module.bits).reshape(*x.shape[:-1], -1)
+    low, high = rows or module._unsloth_nax_qmm_rows
     if not isinstance(x, mx.array) or x.ndim < 2 or not x.shape[-1] or not low <= x.size // x.shape[-1] <= high:
         return None
     if module.training or not _bindings_intact(bindings):
@@ -4323,7 +4330,7 @@ def _nax_small_m_qmm(module, x, bindings):
         return None
     N, K = w.shape[0], x.shape[-1]
     M = x.size // K
-    group_size, bits, route = module.group_size, module.bits, module._unsloth_nax_qmm_route
+    group_size, bits = module.group_size, module.bits
     if (not route.call("_supported", N, K, group_size, bits, module.mode)
             or x.dtype not in (mx.bfloat16, mx.float16) or not x.dtype == scales.dtype == biases.dtype
             or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32)
@@ -4332,7 +4339,7 @@ def _nax_small_m_qmm(module, x, bindings):
     # Every kernel variant a call can select is checked on its own first use; a ragged row count
     # selects the bounds-checked one.
     geometry = route.call("_geometry", M, N, K, group_size)
-    key = (N, K, bits, group_size, x.dtype, geometry, M % geometry[0] == 0)
+    key = (route.tag, N, K, bits, group_size, x.dtype, geometry, M % geometry[0] == 0)
     verified = _NAX_QMM_VERIFIED.get(key)
     if verified is False:
         return None
@@ -4344,7 +4351,7 @@ def _nax_small_m_qmm(module, x, bindings):
         except (RuntimeError, ValueError) as error:
             _unless_failed_buffer(error)
             return None  # inside a function transformation, which cannot evaluate; checked later
-        if verified and not any(_NAX_QMM_VERIFIED.values()):
+        if verified and not any(v for k, v in _NAX_QMM_VERIFIED.items() if k[0] == route.tag):
             logger.info("small-batch quantized projections now run on the %s kernel; "
                         "%s=0 keeps the native call", route.label, route.switch)
         _NAX_QMM_VERIFIED[key] = verified
@@ -4354,7 +4361,7 @@ def _nax_small_m_qmm(module, x, bindings):
                            group_size, x.dtype)
     if not verified:
         return None
-    module.__dict__.setdefault("_unsloth_nax_qmm_ready", {})[x.shape] = (
+    module.__dict__.setdefault(f"_unsloth_{route.state}_ready", {})[x.shape] = (
         M, (x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape, group_size, bits,
             module.mode))
     return routed.reshape(*x.shape[:-1], N)
@@ -4604,15 +4611,21 @@ def _nax_switch_classes():
     return classes
 
 
-def _nax_qmm_row_range(module, route):
-    """The rows at which this module's calls take the route's kernel, or None when none ever would."""
+def _nax_qmm_shape(module, route):
+    """The `(N, K)` of this module's weight when the route's kernel covers it, else None."""
     weight = module.get("weight")
     if module.training or not isinstance(weight, mx.array) or weight.ndim != 2 or module.get("biases") is None:
         return None
     N, K = weight.shape[0], weight.shape[1] * 32 // module.bits
-    if not route.call("_supported", N, K, module.group_size, module.bits, module.mode):
+    return (N, K) if route.call("_supported", N, K, module.group_size, module.bits, module.mode) else None
+
+
+def _nax_qmm_row_range(module, route):
+    """The rows at which this module's calls take the route's kernel, or None when none ever would."""
+    shape = _nax_qmm_shape(module, route)
+    if shape is None:
         return None
-    low, high = route.call("_row_range", N, K, module.group_size, module.bits)
+    low, high = route.call("_row_range", *shape, module.group_size, module.bits)
     return (low, high) if low <= high else None
 
 
@@ -6471,6 +6484,98 @@ def _dynamic_convolve(group_size):
     return mx.compile(convolve)
 
 
+@functools.cache
+def _draft_convolution_kernel(residual):
+    return mx.fast.metal_kernel(
+        name = "unsloth_draft_convolution" + "_residual" * residual,
+        input_names = ["hidden", "dynamic", "base", *(["residual"] if residual else [])], output_names = ["out"],
+        ensure_row_contiguous = False, compile_options = {"math_mode": "safe"},
+        source = r"""
+            uint i = thread_position_in_grid.x;
+            uint C = hidden_shape[2], L = hidden_shape[1];
+            if (i >= hidden_shape[0] * L * C) return;
+            uint c = i % C, r = (i / C) % L, b = i / (C * L);
+            T sum = T(0);
+            for (uint t = 0; t < base_shape[0]; ++t) {
+                T v = r < t ? T(0) : hidden[b * hidden_strides[0] + (r - t) * hidden_strides[1] + c * hidden_strides[2]];
+                T k = T(float(base[t * base_strides[0] + c * base_strides[1]])
+                      + float(dynamic[b * dynamic_strides[0] + r * dynamic_strides[1]
+                                    + t * dynamic_strides[2] + (c / GROUP) * dynamic_strides[3]]));
+                T product = T(float(k) * float(v));
+                sum = T(float(sum) + float(product));
+            }
+        """ + ("out[i] = T(float(residual[b * residual_strides[0] + r * residual_strides[1] + c * residual_strides[2]]) + float(sum));"
+                 if residual else "out[i] = sum;"))
+
+
+def _draft_convolution(hidden, dynamic, base, group_size, residual = None):
+    if (mx.default_device() != mx.gpu
+            or hidden.dtype not in _HALF or hidden.ndim != 3 or not hidden.size
+            or group_size <= 0 or hidden.shape[-1] % group_size
+            or dynamic.shape != (*hidden.shape[:2], base.shape[0], hidden.shape[-1] // group_size)
+            or base.shape != (base.shape[0], hidden.shape[-1]) or dynamic.dtype != hidden.dtype or base.dtype != hidden.dtype
+            or residual is not None and (residual.shape != hidden.shape or residual.dtype != hidden.dtype)):
+        return None
+    return _draft_convolution_kernel(residual is not None)(
+        inputs = [hidden, dynamic, base, *([] if residual is None else [residual])],
+        template = [("T", hidden.dtype), ("GROUP", group_size)], grid = (hidden.size, 1, 1),
+        threadgroup = (256, 1, 1), output_shapes = [hidden.shape], output_dtypes = [hidden.dtype])[0]
+
+
+@functools.cache
+def _draft_selector_kernel():
+    return mx.fast.metal_kernel(
+        name = "unsloth_draft_candidate_walk", input_names = ["pred", "hidden", "succ", "unary", "ids", "anchor"],
+        output_names = ["path"], compile_options = {"math_mode": "safe"}, source = r"""
+            uint b = threadgroup_position_in_grid.x, lane = thread_index_in_simdgroup;
+            uint candidate = simdgroup_index_in_threadgroup;
+            threadgroup float scores[TOP];
+            threadgroup uint previous;
+            if (thread_index_in_threadgroup == 0) previous = anchor[b];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint p = 0; p < LENGTH; ++p) {
+                uint token = ids[(b * LENGTH + p) * TOP + candidate];
+                float total = 0.0f;
+                for (uint r = lane; r < RANK; r += 32) {
+                    T a = T(float(pred[previous * RANK + r]) * float(hidden[(b * LENGTH + p) * RANK + r]));
+                    T product = T(float(a) * float(succ[token * RANK + r]));
+                    total += float(product);
+                }
+                total = simd_sum(total);
+                if (lane == 0) scores[candidate] = float(T(float(unary[(b * LENGTH + p) * TOP + candidate]) + float(T(total))));
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (thread_index_in_threadgroup == 0) {
+                    uint best = 0;
+                    for (uint j = 1; j < TOP; ++j) if (scores[j] > scores[best]) best = j;
+                    previous = ids[(b * LENGTH + p) * TOP + best];
+                    path[b * LENGTH + p] = previous;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        """)
+
+
+def _draft_selector(selector, previous, hidden, candidates, unary):
+    pred, succ = selector.predecessor_codebook, selector.successor_codebook
+    if (mx.default_device() != mx.gpu or selector.training or hidden.dtype not in _HALF
+            or hidden.ndim != 3 or candidates.ndim != 3 or candidates.shape[:2] != hidden.shape[:2]
+            or unary.shape != candidates.shape or previous.shape != candidates.shape
+            or not 0 < candidates.shape[-1] <= 32 or not 0 < hidden.shape[1] <= matmul.LANE_QMM_MAX_ROWS
+            or type(pred) is not nn.Embedding or type(succ) is not nn.Embedding
+            or pred.weight.dtype != hidden.dtype or succ.weight.dtype != hidden.dtype
+            or unary.dtype != hidden.dtype or candidates.dtype not in (mx.int32, mx.uint32, mx.int64, mx.uint64)
+            or pred.weight.shape != succ.weight.shape or not 0 < pred.weight.shape[1] <= 1024):
+        return None
+    projected = selector.hidden_projection(hidden)
+    if projected.dtype != hidden.dtype or projected.shape != (*hidden.shape[:2], pred.weight.shape[1]):
+        return None
+    return _draft_selector_kernel()(
+        inputs = [pred.weight, projected, succ.weight, unary, candidates, previous[:, 0, 0]],
+        template = [("T", hidden.dtype), ("TOP", candidates.shape[-1]), ("LENGTH", hidden.shape[1]), ("RANK", projected.shape[-1])],
+        grid = (32 * candidates.shape[-1] * hidden.shape[0], 1, 1), threadgroup = (32 * candidates.shape[-1], 1, 1),
+        output_shapes = [hidden.shape[:2]], output_dtypes = [candidates.dtype])[0]
+
+
 def _top_candidates(logits, k):
     # Metal's argpartition sorts the whole vocabulary; each chunk's top k, then theirs, select the same entries in the
     # same order, as its sort is stable. A vocabulary no chunk divides keeps the one call, which padding could change.
@@ -6499,6 +6604,14 @@ def _candidate_walk(predecessors, hidden, successors, unary, candidates):
     return mx.stack(path, axis = 1)
 
 
+def _selector_walk(selector, previous, hidden, candidates, unary):
+    """The selector's greedy walk."""
+    if (path := _draft_selector(selector, previous, hidden, candidates, unary)) is not None:
+        return path
+    return _candidate_walk(selector.predecessor_codebook(previous), selector.hidden_projection(hidden),
+                           selector.successor_codebook(candidates), unary, candidates)
+
+
 def _fused_dflash2_serves(module):
     # Checked against the native methods on Metal; the CPU's argpartition does not sort.
     return mx.default_device() == mx.gpu and _bindings_intact(module._unsloth_fused_bindings)
@@ -6514,9 +6627,7 @@ def _fused_dflash2_class(base):
             # Position 0 follows the anchor, each later one every candidate before it.
             previous = mx.concatenate([mx.broadcast_to(anchor_ids.reshape(-1, 1, 1), (candidates.shape[0], 1, self.top_k)),
                                        candidates[:, :-1]], axis = 1)
-            return _candidate_walk(self.predecessor_codebook(previous), self.hidden_projection(hidden),
-                                   self.successor_codebook(candidates), mx.take_along_axis(logits, candidates, axis = -1),
-                                   candidates)
+            return _selector_walk(self, previous, hidden, candidates, mx.take_along_axis(logits, candidates, axis = -1))
         return type(f"_Fused{base.__name__}", (base,), {"select": select, "_unsloth_fused_native": base})
 
     def prepare(self, hidden):
@@ -6524,12 +6635,16 @@ def _fused_dflash2_class(base):
             return base.prepare(self, hidden)
         groups = hidden.shape[-1] // self.group_size
         dynamic = self.kernel_projection(hidden).reshape(*hidden.shape[:-1], 2, self.kernel_size, groups)
-        return _dynamic_convolve(self.group_size)(hidden, dynamic[..., 0, :, :], self.base_kernel[0]), dynamic[..., 1, :, :]
+        prepared = None if self.training else _draft_convolution(hidden, dynamic[..., 0, :, :], self.base_kernel[0], self.group_size)
+        if prepared is None:
+            prepared = _dynamic_convolve(self.group_size)(hidden, dynamic[..., 0, :, :], self.base_kernel[0])
+        return prepared, dynamic[..., 1, :, :]
 
     def finish(self, hidden, dynamic):
         if not _fused_dflash2_serves(self):
             return base.finish(self, hidden, dynamic)
-        return _dynamic_convolve(self.group_size)(hidden, dynamic, self.base_kernel[1])
+        result = None if self.training else _draft_convolution(hidden, dynamic, self.base_kernel[1], self.group_size)
+        return _dynamic_convolve(self.group_size)(hidden, dynamic, self.base_kernel[1]) if result is None else result
 
     return type(f"_Fused{base.__name__}", (base,), {"prepare": prepare, "finish": finish, "_unsloth_fused_native": base})
 
@@ -6549,6 +6664,420 @@ def fused_drafter_ops(model) -> int:
     return len(fused)
 
 
+_DRAFT_LAYER_CONTRACT = {_DFLASH2: {"DFlash2DecoderLayer.__call__": "c1adba4d305aaa16"}}
+
+
+@functools.cache
+def _draft_layer_class(base):
+    def call(self, x, x_ctx, rope, cache, projected_context = None):
+        if self.training or not _bindings_intact(self._unsloth_draft_layer_bindings):
+            return base.__call__(self, x, x_ctx, rope, cache, projected_context)
+        def finish(conv, hidden, dynamic, residual):
+            if (not conv.training and type(conv) is _fused_dflash2_class(sys.modules[_DFLASH2].GroupedDynamicCausalConv)
+                    and _fused_dflash2_serves(conv)):
+                out = _draft_convolution(hidden, dynamic, conv.base_kernel[1], conv.group_size, residual)
+                if out is not None:
+                    return out
+            return residual + conv.finish(hidden, dynamic)
+        residual = x
+        x, dynamic = self.attention_conv.prepare(self.input_layernorm(x))
+        x = finish(self.attention_conv, self.self_attn(x, x_ctx, rope, cache, projected_context), dynamic, residual)
+        residual = x
+        x, dynamic = self.mlp_conv.prepare(self.post_attention_layernorm(x))
+        return finish(self.mlp_conv, self.mlp(x), dynamic, residual)
+    return type(f"_FusedDraft{base.__name__}", (base,), {"__call__": call})
+
+
+def fused_drafter_layers(model) -> int:
+    """Fold covered DFlash2 convolution residuals into their layer's kernels; returns covered layers."""
+    module = sys.modules.get(_DFLASH2)
+    bindings = _resolved_bindings(_DRAFT_LAYER_CONTRACT) if module else None
+    if bindings is None:
+        return 0
+    layers = [layer for layer in model.get("layers", []) if type(layer) is module.DFlash2DecoderLayer]
+    for layer in layers:
+        layer.__dict__["_unsloth_draft_layer_bindings"] = bindings
+        layer.__class__ = _draft_layer_class(type(layer))
+    return len(layers)
+
+
+@functools.cache
+def _submitted_drafter_layer_class(base):
+    def call(self, *args, **kwargs):
+        hidden = base.__call__(self, *args, **kwargs)
+        if not self.training and not getattr(_LANE_STATE, "native", False):
+            try:
+                mx.async_eval(hidden)
+            except ValueError:  # not allowed inside a function transformation
+                pass
+        return hidden
+
+    return type(f"_SubmittedDraft{base.__name__}", (base,), {"__call__": call})
+
+
+def submitted_drafter_layers(model) -> int:
+    """Have each of `model.layers` with attention and an MLP submit its output when built in eval mode, so the GPU
+    starts on a draft while the host still builds its later layers; returns how many layers do."""
+    layers = [layer for layer in model.get("layers", []) if hasattr(layer, "self_attn") and hasattr(layer, "mlp")]
+    for layer in layers:
+        layer.__class__ = _submitted_drafter_layer_class(type(layer))
+    return len(layers)
+
+
+_LANE_STATE = local()
+
+
+@contextmanager
+def native_lane_projections():
+    """Keep lane-held projections native for a forward that must evaluate nothing, since the kernel's first call of a
+    shape evaluates it to check it against stock."""
+    outer = getattr(_LANE_STATE, "native", False)
+    _LANE_STATE.native = True
+    try:
+        yield
+    finally:
+        _LANE_STATE.native = outer
+
+
+def _lane_rows(module, x, bindings):
+    """`module`'s projection of x on the lane kernel where `lane_drafter_projections` covers it, or None."""
+    if not module.__dict__.get("_unsloth_lane_qmm") or getattr(_LANE_STATE, "native", False):
+        return None
+    most = matmul.LANE_QMM_MAX_ROWS
+    if isinstance(x, mx.array) and x.ndim > 2 and x.size // x.shape[-1] > most >= x.shape[-2]:
+        # A batch of short blocks, in launches of `most` rows: a row's bits do not depend on its launch.
+        flat = x.reshape(-1, x.shape[-1])
+        parts = [_lane_rows(module, flat[i:i + most], bindings) for i in range(0, flat.shape[0], most)]
+        return None if any(part is None for part in parts) else mx.concatenate(parts).reshape(*x.shape[:-1], -1)
+    y = _nax_small_m_qmm(module, x, bindings, _LANE_QMM_ROUTE, (1, most))
+    return y if y is None or "bias" not in module else y + module["bias"]
+
+
+def _lane_projections(ps, x, bindings):
+    """By index, the projections of `ps` that `matmul.lane_qmms` launches serve, one per reader two or more of them take:
+    covered weights whose calls of x's shape are verified; each output's bits are its own call's."""
+    if (type(x) is not mx.array or x.ndim != 3 or not x.shape[-1] or getattr(_LANE_STATE, "native", False)
+            or not _bindings_intact(bindings) or x.size // x.shape[-1] > matmul.LANE_QMM_MAX_ROWS):
+        return {}
+    K = x.shape[-1]
+    M = x.size // K
+    groups = {}
+    for i, p in enumerate(ps):
+        ready = p.__dict__.get("_unsloth_lane_qmm_ready", {}).get(x.shape) if p.__dict__.get("_unsloth_lane_qmm") else None
+        if ready is None or p.training or "bias" in p:
+            continue
+        w, scales, biases = p.get("weight"), p.get("scales"), p.get("biases")
+        if type(w) is type(scales) is type(biases) is mx.array and ready[1] == (
+                x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape, p.group_size, p.bits, p.mode):
+            reader = matmul.lane_qmms_reader(w.shape[0], K, p.group_size, p.bits, x.dtype)
+            if reader is not None:
+                groups.setdefault((p.group_size, p.bits, reader), []).append((i, (w, scales, biases)))
+    served = {}
+    for (group_size, bits, _), group in groups.items():
+        if len(group) > 1:
+            ys = matmul.lane_qmms(x.reshape(M, K), [weight for _, weight in group], group_size, bits)
+            served.update({i: y.reshape(*x.shape[:-1], -1) for (i, _), y in zip(group, ys)})
+    return served
+
+
+@functools.cache
+def _lane_module_class(base):
+    """`base` with its covered calls of 1 to `LANE_QMM_MAX_ROWS` rows on the lane kernel, or None."""
+    bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+    if bindings is None:
+        return None
+    if issubclass(base, nn.QuantizedEmbedding):
+        def as_linear(self, x):
+            y = _lane_rows(self, x, bindings)
+            return base.as_linear(self, x) if y is None else y
+        methods = {"as_linear": as_linear}
+    else:
+        def call(self, x):
+            y = _lane_rows(self, x, bindings)
+            return base.__call__(self, x) if y is None else y
+        methods = {"__call__": call}
+    return type(f"_Lane{base.__name__}", (base,), {**methods, "_unsloth_lane_native": base})
+
+
+def _lane_kernel_on():
+    return matmul.lane_qmm_available() and os.environ.get(_LANE_QMM_ROUTE.switch, "1") != "0"
+
+
+def lane_drafter_projections(model) -> int:
+    """Run a speculative drafter's covered projections on the `matmul.lane_qmm` kernel from now on; returns how many.
+
+    A drafter only proposes tokens, which verification accepts or rejects, so its rows' fp32 reordering cannot change
+    the output. `UNSLOTH_MLX_LANE_QMM=0` keeps the native calls.
+    """
+    if not _lane_kernel_on():
+        return 0
+    covered = [module for _, module in model.named_modules()
+               if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)) and _nax_qmm_shape(module, _LANE_QMM_ROUTE)
+               and "_unsloth_lane_native" not in vars(type(module))]
+    if (not covered or _resolved_bindings(_NAX_QMM_CONTRACT) is None or not nax.kernel_probe_passed(
+            matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available)):
+        return 0
+    for module in covered:
+        module._unsloth_lane_qmm = True
+        module.__class__ = _lane_module_class(type(module))
+    return len(covered)
+
+
+def lane_drafter_head(model, head) -> bool:
+    """Give a drafter holding `head`, its target's quantized head, its own module over the same arrays on the lane
+    kernel, as its projections are; the target's module keeps its path. Whether it did."""
+    if model.get("lm_head") is not head or not isinstance(head, nn.QuantizedLinear):
+        return False
+    own = copy.copy(head)
+    if "_unsloth_lane_native" in vars(type(own)):
+        own.__class__ = type(own)._unsloth_lane_native
+    if not lane_drafter_projections(own):
+        return False
+    model.lm_head = own
+    return True
+
+
+_SPARSE_DFLASH2_CONTRACT = {_DFLASH2: {
+    "DFlash2DraftModel.draft_block": "412f77b881193fc9",
+    "DFlash2DraftModel._logits": "bb52b6838eb6afe7",
+}}
+
+
+def _sparse_head_shape(head):
+    if (type(head) not in (nn.QuantizedLinear, _lane_module_class(nn.QuantizedLinear))
+            or head.training or "bias" in head or head.bits not in (4, 8) or head.mode != "affine"
+            or head.group_size not in matmul._LANE_GROUP_SIZES):
+        return None
+    w, scales, biases = (head.get(name) for name in ("weight", "scales", "biases"))
+    if not all(isinstance(a, mx.array) and a.ndim == 2 for a in (w, scales, biases)):
+        return None
+    N, K, dtype = w.shape[0], w.shape[1] * 32 // head.bits, scales.dtype
+    if (w.dtype != mx.uint32 or biases.dtype != dtype or scales.shape != (N, K // head.group_size)
+            or biases.shape != scales.shape):
+        return None
+    if (dtype not in (mx.float16, mx.bfloat16) or N <= 512 or K % (2 * head.group_size)
+            or not matmul.lane_qmm_supported(N, K, head.group_size, head.bits, head.mode)):
+        return None
+    return N, K, dtype
+
+
+def _sparse_head_candidates(head, hidden, shape):
+    N, K, dtype = shape
+    flat = hidden.reshape(-1, K).astype(dtype)
+    M, w, scales, biases = flat.shape[0], head.weight, head.scales, head.biases
+    coarse = matmul.lane_qmm(flat, w, scales, biases, head.group_size, head.bits, groups = K // (2 * head.group_size),
+                             reader = matmul.lane_shortlist_reader(M, head.bits))
+    ids = matmul.radix_shortlist(coarse)
+    values = matmul._lane_indexed(flat, w, scales, biases, ids, head.group_size, head.bits)
+    return ids, values
+
+
+def _sparse_candidate_walk(selector, hidden, anchor, ids, values, multiplier, ascending = False):
+    if ascending:
+        values = values * multiplier
+    else:
+        order = mx.argsort(ids, axis = -1)
+        ids, values = mx.take_along_axis(ids, order, axis = -1), mx.take_along_axis(values, order, axis = -1) * multiplier
+    chosen = mx.argpartition(values, -selector.top_k, axis = -1)[:, -selector.top_k:]
+    candidates = mx.take_along_axis(ids, chosen, axis = -1).reshape(*hidden.shape[:-1], selector.top_k)
+    unary = mx.take_along_axis(values, chosen, axis = -1).reshape(candidates.shape)
+    previous = mx.concatenate([mx.broadcast_to(anchor.reshape(-1, 1, 1), (candidates.shape[0], 1, selector.top_k)),
+                               candidates[:, :-1]], axis = 1)
+    return _selector_walk(selector, previous, hidden, candidates, unary)
+
+
+class _SparseDrafter:
+    """A proposal owns its shortlist until the selector consumes it; the head keeps only its weights."""
+
+    def __init__(self, model, target, original, bindings):
+        self.model, self.target, self.original, self.bindings = model, target, original, bindings
+        self.head, self.selector = model.lm_head, model.candidate_selector
+        self.hidden, self.logits, self.select = model._hidden, model._logits, self.selector.select
+
+    def head_shape(self, batch, length, sampler, hidden):
+        """The sparse head's shape when a block of ``batch`` x ``length`` drafts from ``hidden`` runs on the lane kernel;
+        None when `original` answers it."""
+        model, head, selector = self.model, self.head, self.selector
+        multiplier = model.config.output_multiplier
+        if (model.draft_block != self.original or not _lane_kernel_on() or getattr(_LANE_STATE, "native", False)
+                or model.training or model.lm_head is not head or model.candidate_selector is not selector
+                or selector.training or model._hidden != self.hidden or model._logits != self.logits or selector.select != self.select
+                or not _bindings_intact(self.bindings) or not _fused_dflash2_serves(selector)
+                or getattr(self.target, "_unsloth_mlx_distributed_parallel_mode", None)
+                or getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                or callable(getattr(sampler, "sample_proposal", None)) or model.config.final_logit_softcapping is not None
+                or not isinstance(multiplier, (float, int)) or not math.isfinite(multiplier) or multiplier <= 0
+                or not 1 <= selector.top_k <= 512 or not 1 <= batch * length <= matmul.LANE_QMM_MAX_ROWS
+                or not isinstance(hidden, mx.array) or hidden.ndim != 3 or hidden.shape[0] != batch):
+            return None
+        shape = _sparse_head_shape(head)
+        if shape is None or hidden.dtype != shape[2] or model.config.hidden_size != shape[1]:
+            return None
+        return shape
+
+    def __call__(self, last_bonus, hidden, cache, block_size, sampler, token_dtype = mx.int32):
+        model, selector, original = self.model, self.selector, self.model.draft_block
+        length = int(block_size) - 1
+        batch = 1 if isinstance(last_bonus, int) else int(last_bonus.shape[0])
+        shape = self.head_shape(batch, length, sampler, hidden)
+        if shape is None:
+            return original(last_bonus, hidden, cache, block_size, sampler, token_dtype)
+        head, multiplier = self.head, model.config.output_multiplier
+        anchor = (mx.array([last_bonus], dtype = token_dtype) if isinstance(last_bonus, int)
+                  else last_bonus.reshape(-1).astype(token_dtype))
+        masks = mx.full((batch, length), int(model.config.mask_token_id), dtype = token_dtype)
+        proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)[:, 1:]
+        if proposed.shape != (batch, length, shape[1]) or proposed.dtype != shape[2]:
+            return selector.select(proposed, model._logits(proposed), anchor, sampler).astype(token_dtype)
+        ids, values = _sparse_head_candidates(head, proposed, shape)
+        return _sparse_candidate_walk(selector, proposed, anchor, ids, values, multiplier, ascending = True).astype(token_dtype)
+
+
+def sparse_drafter(model, target, original):
+    module = sys.modules.get(_DFLASH2)
+    if (not _lane_kernel_on() or module is None or type(model) is not module.DFlash2DraftModel
+            or type(model.candidate_selector) is not _fused_dflash2_class(module.CandidateSelector)):
+        return original
+    bindings = _resolved_bindings({**_SPARSE_DFLASH2_CONTRACT, **_NAX_QMM_CONTRACT})
+    if bindings is None or not nax.kernel_probe_passed(
+            matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available):
+        return original
+    return _SparseDrafter(model, target, original, bindings)
+
+_DFLASH = "mlx_vlm.speculative.drafters.qwen3_dflash.dflash"
+_PREDRAFT_CONTRACT = {_DFLASH: {"DFlashAttention.__call__": "38d25e361a41e018"}, "mlx_vlm.models.cache": {
+    "KVCache.update_and_fetch": "c169611f253ecb9b",
+    "RotatingKVCache._update_concat": "fa642883e696d809",
+    "RotatingKVCache._update_in_place": "6f3e71619a2f37a3",
+    "RotatingKVCache._temporal_order": "a83d18372d17df76",
+    "RotatingKVCache._trim": "d7e33b6fefc66bde",
+}}
+
+
+class PredraftCache:
+    """Stands in for a DFlash drafter layer's cache while the drafter drafts ahead of its round's acceptance. The
+    layer attends over ``cache``'s context and the round's verified rows, those not ``valid`` (a device mask) left
+    out, with its queries at ``position`` (a device scalar); ``cache`` stays untouched until ``append``."""
+
+    def __init__(self, cache, valid: mx.array, position: mx.array):
+        self.cache, self.valid, self.position, self.rows = cache, valid, position, None
+
+    def history(self):
+        # Every context row the cache holds, in buffer order: the layer attends without a causal mask.
+        cache = self.cache
+        if cache.keys is None:
+            return None, None
+        held = min(cache.offset, cache.keys.shape[2])
+        return cache.keys[..., :held, :], cache.values[..., :held, :]
+
+    def append(self, rows: int):
+        """Write the first ``rows`` verified rows' keys and values, as the block drafted from them would have."""
+        keys, values = self.rows
+        keys, values = keys[:, :, :rows], values[:, :, :rows]
+        if not _append_in_place(self.cache, keys, values):
+            self.cache.update_and_fetch(keys, values)
+
+
+def _append_in_place(cache, keys, values) -> bool:
+    """A multi-row rotating-cache update written in place, grown a step at a time as the single-row update grows it and
+    then wrapping as its ring does, instead of copying the whole window each round; False where the native update runs."""
+    size, rows = getattr(cache, "max_size", None), keys.shape[2]
+    if (size is None or cache.keys is None or cache.keep or rows > size
+            or keys.dtype != cache.keys.dtype or values.dtype != cache.values.dtype):
+        return False
+    held = cache.keys.shape[2]
+    if held > size:
+        if cache._idx != held:
+            return False
+        # A native multi-row update's buffer, in temporal order: its newest `size` rows become the ring.
+        cache.keys, cache.values = cache.keys[..., held - size :, :], cache.values[..., held - size :, :]
+        cache._idx = held = size
+    start = cache._idx % size
+    end = start + rows
+    if end > held and held < size:
+        grown = min(size, max(end, start + cache.step))
+        cache.keys, cache.values = (mx.concatenate([b[..., :start, :], mx.zeros((*b.shape[:2], grown - start, b.shape[3]), b.dtype)], axis = 2)
+                                    for b in (cache.keys, cache.values))
+        held = grown
+    first = min(end, held) - start
+    cache.keys[..., start : start + first, :] = keys[..., :first, :]
+    cache.values[..., start : start + first, :] = values[..., :first, :]
+    if first < rows:
+        cache.keys[..., : rows - first, :] = keys[..., first:, :]
+        cache.values[..., : rows - first, :] = values[..., first:, :]
+    cache._idx = start + first if first == rows else rows - first
+    cache.offset += rows
+    return True
+
+
+@functools.cache
+def _predraft_class(base):
+    def __call__(self, x, x_ctx, rope, cache, projected_context = None):
+        B, L, _ = x.shape
+        S, commit = x_ctx.shape[1], 0
+        if not isinstance(cache, PredraftCache):
+            # The first context, or one past the window, keeps the native trim; later ones append as a predraft's would.
+            if cache.keys is None or S >= (self.sliding_window if self.is_sliding else 1 << 30):
+                return base.__call__(self, x, x_ctx, rope, cache, projected_context)
+            cache, commit = PredraftCache(cache, mx.ones((S,), mx.bool_), mx.array(cache.offset + S, mx.int32)), S
+        # `DFlashAttention.__call__` with the context's keys appended to the cache's only in `PredraftCache.append`.
+        bindings = self.__dict__.get("_unsloth_lane_bindings")
+        shared = {}
+        if bindings is not None and projected_context is None and type(self)._project_kv is base._project_kv and _lane_kernel_on():
+            # The context's keys and values in one launch, the block's queries, keys and values in another.
+            shared = {**{i + 3: y for i, y in _lane_projections((self.k_proj, self.v_proj), x_ctx, bindings).items()},
+                      **_lane_projections((self.q_proj, self.k_proj, self.v_proj), x, bindings)}
+        if len(shared) == 5:
+            queries, prop_keys, prop_values, ctx_keys, ctx_values = (shared[i] for i in range(5))
+        else:
+            queries = self.q_proj(x)
+            ctx_keys, ctx_values = self._project_kv(x_ctx) if projected_context is None else projected_context
+            prop_keys, prop_values = self._project_kv(x)
+        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
+        ctx_keys = self.k_norm(ctx_keys.reshape(B, S, self.n_kv_heads, ctx_keys.shape[-1] // self.n_kv_heads)).transpose(0, 2, 1, 3)
+        ctx_values = ctx_values.reshape(B, S, self.n_kv_heads, ctx_values.shape[-1] // self.n_kv_heads).transpose(0, 2, 1, 3)
+        prop_keys = self.k_norm(prop_keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = rope(queries, offset = cache.position)
+        ctx_keys = rope(ctx_keys, offset = cache.cache.offset)
+        prop_keys = rope(prop_keys, offset = cache.position)
+        cache.rows = ctx_keys, ctx_values
+        old_keys, old_values = cache.history()
+        held = 0 if old_keys is None else old_keys.shape[2]
+        # Block rows first, so verified rows keep their places whether the block drafts before or after acceptance.
+        keys = mx.concatenate([prop_keys, ctx_keys] if old_keys is None else [old_keys, prop_keys, ctx_keys], axis = 2)
+        values = mx.concatenate([prop_values, ctx_values] if old_values is None else [old_values, prop_values, ctx_values], axis = 2)
+        mask = mx.concatenate([mx.ones((held + L,), mx.bool_), cache.valid])
+        o = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = self.scale, mask = mask[None, None, None],
+                                                 sinks = self.attention_sink_bias)
+        if commit:
+            cache.append(commit)
+        return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
+
+    return type(f"_Predraft{base.__name__}", (base,), {"__call__": __call__, "_unsloth_predraft_native": base})
+
+
+def predraft_attention(model) -> int:
+    """Let a DFlash-family drafter draft a block through `PredraftCache`s; returns how many verified rows a block may
+    then read (0 when an attention or cache is not one the predraft reproduces, or upstream changed)."""
+    module = sys.modules.get(_DFLASH)
+    if module is None or _resolved_bindings(_PREDRAFT_CONTRACT) is None:
+        return 0
+    from mlx_vlm.models.cache import KVCache, RotatingKVCache
+
+    attentions = [getattr(layer, "self_attn", None) for layer in getattr(model, "layers", ())]
+    native = [getattr(type(a), "_unsloth_predraft_native", type(a)) for a in attentions]
+    # A causal layer's mask counts positions by key index, which the masked rows would shift.
+    if not attentions or any(base is not module.DFlashAttention or a.is_causal for a, base in zip(attentions, native)):
+        return 0
+    if any(type(cache) not in (KVCache, RotatingKVCache) for cache in model.make_cache()):
+        return 0
+    bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+    for attention in attentions:
+        attention.__class__ = _predraft_class(module.DFlashAttention)
+        attention.__dict__["_unsloth_lane_bindings"] = bindings
+    # Past a sliding layer's window, the native call would trim the rows the predraft masks.
+    return min([a.sliding_window - 1 for a in attentions if a.is_sliding] or [1 << 30])
 
 
 # MLX's sdpa_vector_2pass_1/2 (mlx/backend/metal/kernels/sdpa_vector.h, Copyright © 2024 Apple Inc., MIT),

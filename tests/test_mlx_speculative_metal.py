@@ -10,6 +10,7 @@
 # see danielhanchen/unsloth-staging-2).
 
 import contextlib
+import itertools
 import json
 from types import SimpleNamespace
 
@@ -1736,12 +1737,12 @@ def test_speculative_batch_rows_prefill_on_the_batch_step(qwen, monkeypatch):
     assert seen == [None, 8]
 
 
-def _tiny_companion(model, repo):
+def _tiny_companion(model, repo, **overrides):
     from mlx_vlm.speculative.drafters import dflash2, dspark, qwen3_dflash
     from mlx_vlm.utils import load_config
     config, n = load_config(repo), (text := model.language_model.config.text_config).num_hidden_layers
     config.update(hidden_size = text.hidden_size, vocab_size = text.vocab_size, num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 2,
-                  head_dim = 64, intermediate_size = 256, num_target_layers = n, layer_types = config.get("layer_types", [])[:2])
+                  head_dim = 64, intermediate_size = 256, num_target_layers = n, layer_types = config.get("layer_types", [])[:2], **overrides)
     config["dflash_config"].update(target_layer_ids = [1, n // 2, n - 2], num_target_layers = n, selector_rank = 16, markov_rank = 16)
     module = {"DFlash2DraftModel": dflash2, "DSparkDraftModel": dspark}.get(config["architectures"][0], qwen3_dflash)
     return module.Model(module.ModelConfig.from_dict(config))
@@ -1777,9 +1778,9 @@ def test_a_dflash2_drafter_convolves_and_selects_its_drafts_bit_for_bit_in_fewer
     from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector, GroupedDynamicCausalConv
     from unsloth_zoo.mlx import inference, speculative
     model, _ = qwen
-    ran, convolve, walk = [], inference._dynamic_convolve, inference._candidate_walk
-    monkeypatch.setattr(inference, "_dynamic_convolve", lambda group_size: ran.append("conv") or convolve(group_size))
-    monkeypatch.setattr(inference, "_candidate_walk", lambda *args: ran.append("walk") or walk(*args))
+    ran, convolve, walk = [], inference._draft_convolution, inference._draft_selector
+    monkeypatch.setattr(inference, "_draft_convolution", lambda *args: ran.append("conv") or convolve(*args))
+    monkeypatch.setattr(inference, "_draft_selector", lambda *args: ran.append("walk") or walk(*args))
     companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
     companion.set_dtype(mx.bfloat16)
     drafter = speculative._built(speculative.ContextDrafter, companion, model.language_model, quantize = True)
@@ -1796,6 +1797,9 @@ def test_a_dflash2_drafter_convolves_and_selects_its_drafts_bit_for_bit_in_fewer
     finished, native_finished = conv.finish(hidden, dynamic), GroupedDynamicCausalConv.finish(conv, hidden, native_dynamic)
     assert mx.array_equal(prepared, native) and mx.array_equal(finished, native_finished)
     assert prepared.dtype == native.dtype and finished.dtype == native_finished.dtype and ran == ["conv", "conv"]
+    with monkeypatch.context() as patch:   # a call the kernel refuses takes the compiled convolution, which matches too
+        patch.setattr(inference, "_draft_convolution", lambda *args: None)
+        assert mx.array_equal(conv.prepare(hidden)[0], native) and mx.array_equal(conv.finish(hidden, dynamic), native_finished)
     # Logits on a coarse grid tie often: candidates must come in argpartition's order for the walk to break ties alike.
     logits = (mx.round(mx.random.normal((2, 5, selector.predecessor_codebook.weight.shape[0])) * 2) / 2).astype(mx.bfloat16)
     top, expected = inference._top_candidates(logits, selector.top_k), mx.argpartition(logits, -selector.top_k, axis = -1)[..., -selector.top_k:]
@@ -1819,6 +1823,142 @@ def test_a_dflash2_drafter_convolves_and_selects_its_drafts_bit_for_bit_in_fewer
     assert conv.prepare(hidden)[0] == "native" and selector.select(hidden, logits, anchors, greedy) == "native"
 
 
+@pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (8, mx.bfloat16), (4, mx.float16), (8, mx.float16)])
+def test_sparse_draft_head_refines_each_shortlisted_row(monkeypatch, bits, dtype):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    readers, lane_qmm = [], matmul.lane_qmm
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: readers.append(kwargs["reader"]) or lane_qmm(*args, **kwargs))
+    for group_size, N in itertools.product((64, 128), (8200, 8224, 16416)):
+        K = 256
+        head = nn.QuantizedLinear(K, N, bias = False, group_size = group_size, bits = bits).eval()
+        head.set_dtype(dtype)
+        weight = mx.dequantize(head.weight, head.scales.astype(mx.float32), head.biases.astype(mx.float32), group_size = group_size, bits = bits)
+        shape = inference._sparse_head_shape(head)
+        hidden = mx.random.normal((2, 3, K), key = mx.random.key(17)).astype(dtype)
+        for sign in (-1, 1):
+            changed = mx.concatenate([hidden[:1], hidden[1:] * sign], axis = 0)
+            ids, values = inference._sparse_head_candidates(head, changed, shape)
+            flat = changed.reshape(-1, K)
+            expected = mx.sum(flat[:, None].astype(mx.float32) * weight[ids].astype(mx.float32), axis = -1)
+            magnitude = mx.sum(mx.abs(flat[:, None].astype(mx.float32) * weight[ids].astype(mx.float32)), axis = -1)
+            assert values.dtype == dtype and mx.all(ids < N)
+            assert mx.all(mx.abs(values.astype(mx.float32) - expected) <= mx.finfo(dtype).eps * mx.abs(expected) + 2e-5 * magnitude)
+            reversed_values = matmul._lane_indexed(flat[::-1], head.weight, head.scales, head.biases, ids[::-1, ::-1], group_size, bits)
+            assert mx.array_equal(reversed_values.view(mx.uint16), values[::-1, ::-1].view(mx.uint16))
+        changed = mx.concatenate([hidden[:1], mx.concatenate([hidden[1:, :, :K // 2], -hidden[1:, :, K // 2:]], axis = -1)])
+        before_ids, before_values = inference._sparse_head_candidates(head, hidden, shape)
+        after_ids, after_values = inference._sparse_head_candidates(head, changed, shape)
+        assert mx.array_equal(before_ids, after_ids) and mx.array_equal(before_values[:3], after_values[:3])
+        assert not mx.array_equal(before_values[3:], after_values[3:])
+    assert set(readers) == {matmul.lane_shortlist_reader(6, bits)}   # chosen by shape
+    assert inference._sparse_head_candidates(head, hidden[:, :1], shape) and readers[-1] == matmul.lane_shortlist_reader(2, bits)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_radix_shortlist_keeps_the_top_columns_and_the_lowest_tied_ones(dtype):
+    from unsloth_zoo.mlx import matmul
+    for N in (520, 8192, 8200, 16400, 70000):
+        base = mx.random.normal((7, N), key = mx.random.key(N)).astype(dtype)
+        signed_zeros = mx.where(mx.arange(N)[None] % 2 == 0, mx.array(0.0, dtype = dtype), mx.array(-0.0, dtype = dtype))
+        rows = [base, mx.round(base * 2) / 2, mx.zeros_like(base), mx.where(mx.arange(N)[None] % 11 == 0, -float("inf"), base),
+                mx.broadcast_to(mx.where(mx.arange(N)[None] < 100, mx.array(1.0, dtype = dtype), signed_zeros), base.shape),
+                mx.where(mx.arange(N)[None] % 5 == 0, mx.array(float("nan"), dtype = dtype), base),
+                mx.where(mx.arange(N)[None] % 7 == 0, mx.array(float("nan"), dtype = dtype),
+                         mx.where(mx.arange(N)[None] % 3 == 0, -float("inf"), base)),
+                mx.where(mx.arange(N)[None] % 10 == 0, base, mx.array(float("nan"), dtype = dtype))]
+        for values in rows:
+            got = matmul.radix_shortlist(values)
+            by_value = mx.argsort(-mx.where(mx.isnan(values), -float("inf"), values).astype(mx.float32), axis = -1)
+            nan_last = mx.argsort(mx.take_along_axis(mx.isnan(values), by_value, axis = -1).astype(mx.int32), axis = -1)
+            order = mx.take_along_axis(by_value, nan_last, axis = -1)[:, :512]
+            assert got.dtype == mx.uint32 and got.shape == (7, 512)
+            assert mx.array_equal(got, mx.sort(order, axis = -1).astype(mx.uint32))
+
+
+def test_sparse_draft_selection_preserves_canonical_ties_and_call_ownership():
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector
+    from unsloth_zoo.mlx import inference
+    selector = CandidateSelector(SimpleNamespace(vocab_size = 1024, hidden_size = 16, selector_rank = 8, selector_top_k = 8))
+    selector.set_dtype(mx.bfloat16)
+    hidden = mx.random.normal((2, 3, 16), key = mx.random.key(11)).astype(mx.bfloat16)
+    ids = (mx.arange(512)[None] + mx.arange(6)[:, None] * 71) % 1024
+    values = (mx.arange(512)[None] % 7 + mx.arange(6)[:, None] % 3).astype(mx.bfloat16)
+    anchors, greedy = mx.array([3, 7]), lambda logits: mx.argmax(logits, axis = -1)
+    def dense(candidate_ids, scores):
+        logits = mx.put_along_axis(mx.full((6, 1024), -float("inf"), mx.bfloat16), candidate_ids, scores * 1.25, axis = -1)
+        return CandidateSelector.select(selector, hidden, logits.reshape(2, 3, 1024), anchors, greedy)
+    for k in (1, 8, 512):
+        selector.top_k = k
+        first = inference._sparse_candidate_walk(selector, hidden, anchors, ids, values, 1.25)
+        second = inference._sparse_candidate_walk(selector, hidden, anchors, (ids + 17) % 1024, -values, 1.25)
+        reverse = inference._sparse_candidate_walk(selector, hidden, anchors, ids[:, ::-1], values[:, ::-1], 1.25)
+        assert mx.array_equal(first, dense(ids, values)) and mx.array_equal(reverse, first)
+        order = mx.argsort(ids, axis = -1)
+        ascending = lambda: inference._sparse_candidate_walk(selector, hidden, anchors, mx.take_along_axis(ids, order, axis = -1),
+                                                             mx.take_along_axis(values, order, axis = -1), 1.25, ascending = True)
+        assert mx.array_equal(ascending(), first)
+        assert mx.array_equal(second, dense((ids + 17) % 1024, -values))
+
+
+def test_a_quantized_drafter_projects_on_the_lane_kernel_unless_switched_off(qwen, monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import generate, inference, matmul, speculative
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, ids), rows, kernel = qwen, [], matmul.lane_qmm
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: rows.append(len(args[0])) or kernel(*args, **kwargs))
+    for switch in ("0", None):
+        monkeypatch.setenv("UNSLOTH_MLX_LANE_QMM", switch) if switch else monkeypatch.delenv("UNSLOTH_MLX_LANE_QMM", raising = False)
+        rows.clear()
+        companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
+        companion.set_dtype(mx.bfloat16)   # as released drafters are
+        nn.quantize(companion, group_size = 64, bits = 4, class_predicate = lambda _, layer: (
+            isinstance(layer, nn.Linear) and layer.weight.shape[-1] % 64 == 0))
+        drafter = speculative._built(speculative.ContextDrafter, companion, model.language_model)
+        quantized = [m for _, m in drafter.model.named_modules() if isinstance(m, nn.QuantizedLinear)]
+        out, drafted, _ = _run(model, ids[:1], 32, _script(("draft", 3), ("draft", 5)), generate.SamplingParams(), drafter = drafter)
+        # Drafts only propose: the output is the target's own whichever kernel drafted them.
+        assert out == [_solo(model, ids[0], 32, generate.SamplingParams())] and all(n for n, _ in drafted.values())
+        on = [m for m in quantized if m.__dict__.get("_unsloth_lane_qmm")]
+        assert (on, rows) == ([], []) if switch else (on == quantized and type(on[0]).__name__.startswith("_Lane") and rows)
+        (head := nn.QuantizedLinear(64, 64, bias = False)).eval().set_dtype(mx.bfloat16)
+        drafter.model.lm_head = head
+        bound = [inference.lane_drafter_head(drafter.model, head) for _ in range(2)]
+        assert (bound, type(drafter.model.lm_head).__name__ != "QuantizedLinear", drafter.model.lm_head.weight is head.weight,
+                type(head)) == ([not switch, False], not switch, True, nn.QuantizedLinear)
+    # The projection returns the kernel's rows, not a native call beside it.
+    x = mx.random.normal((1, 3, on[0].weight.shape[1] * 32 // on[0].bits)).astype(mx.bfloat16)
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: kernel(*args, **kwargs) * 2)
+    assert mx.array_equal(on[0](x).reshape(3, -1), kernel(x.reshape(3, -1), on[0].weight, on[0].scales, on[0].biases, on[0].group_size, on[0].bits) * 2)
+    assert not any(k.startswith("_unsloth_lane") for _, m in model.named_modules() for k in m.__dict__)
+
+
+def test_a_predraft_projects_a_layers_queries_keys_and_values_in_two_launches(qwen, monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul, speculative
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    companion = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    nn.quantize(companion, group_size = 64, bits = 4, class_predicate = lambda _, layer: (
+        isinstance(layer, nn.Linear) and layer.weight.shape[-1] % 64 == 0))
+    drafter = speculative._built(speculative.ContextDrafter, companion, qwen[0].language_model)
+    attention, cache = drafter.model.layers[0].self_attn, drafter.model.make_cache()[0]
+    K, kv = attention.q_proj.weight.shape[1] * 8, (1, attention.n_kv_heads, 5, attention.head_dim)
+    cache.update_and_fetch(*(mx.random.normal(kv, key = mx.random.key(i)).astype(mx.bfloat16) for i in (1, 2)))
+    x, context = (mx.random.normal((1, rows, K), key = mx.random.key(rows)).astype(mx.bfloat16) for rows in (4, 3))
+    predraft = lambda: attention(x, context, drafter.model.rope, inference.PredraftCache(
+        cache, mx.array([True, False, True]), mx.array(cache.offset + 3, mx.int32)))
+    launches, qmms = [], matmul.lane_qmms
+    monkeypatch.setattr(matmul, "lane_qmms", lambda x, ws, *args: launches.append(len(ws)) or qmms(x, ws, *args))
+    with monkeypatch.context() as patch:
+        patch.setattr(inference, "_lane_projections", lambda *args: {})
+        alone = predraft()   # each projection on its own, which also verifies its shapes
+    tensor = matmul.lane_qmms_reader(attention.q_proj.weight.shape[0], K, 64, 4, mx.bfloat16) is not None
+    assert mx.array_equal(predraft(), alone).item() and launches == ([2, 3] if tensor else [])
+    monkeypatch.setenv("UNSLOTH_MLX_LANE_QMM", "0")
+    assert mx.array_equal(predraft(), alone).item() and launches == ([2, 3] if tensor else [])   # no further shared launch
 
 
 @pytest.mark.parametrize("repo", ["z-lab/Qwen3.5-4B-DFlash", "incoai/Qwen3.8-27B-DFlash2", "RadixArk/Qwen3.8-27B-DSpark"])
@@ -1826,11 +1966,23 @@ def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_thr
     from unsloth_zoo.mlx import generate, speculative
     (model, ids), ar, SamplingParams = qwen, __import__("mlx_vlm.generate.ar", fromlist = ["ar"]), generate.SamplingParams
     drafter, blocks, rows, sequences = speculative.ContextDrafter(_tiny_companion(model, repo), model.language_model, max_lag = 8), [], [], []
+    # Only the lone row mixes in plain windows: batched ones carry ordinary batched numerics.
+    cases = ((ids[:1], (("draft", 3), ("plain", 9), ("copy", 4), ("draft", 5))), (ids[:2], (("draft", 3), ("copy", 4), ("draft", 5))))
+    # Blocks drafted before their round's acceptance is read keep the output exact.
+    ahead, predrafted = speculative.ContextDrafter(drafter.model, model.language_model, max_lag = 8), []
+    predraft = ahead.predraft
+    ahead.predraft = lambda *args: predrafted.append(got := predraft(*args)) or got
+    for prompts, script in cases:
+        predrafted.clear()
+        assert _run(model, prompts, 48, _script(*script), SamplingParams(), drafter = ahead)[0] == [_solo(model, prompt, 48, SamplingParams()) for prompt in prompts]
+        assert any(predrafted)
+    assert drafter.predraft_rows
+    # Those read every verified row's projection, which stock matmul rounds by row count; the checks below are bitwise.
+    drafter.predraft_rows = 0
     block, start = drafter._block, drafter.start
     drafter._block = lambda row, depth: blocks.append((row, row.pending, mx.concatenate(row.features), got := block(row, depth))) or got
     drafter.start = lambda prompt, hidden, pending: rows.append((started := start(prompt, hidden, pending))[0]) or started
-    # Only the lone row mixes in plain windows: batched ones carry ordinary batched numerics.
-    for prompts, script in ((ids[:1], (("draft", 3), ("plain", 9), ("copy", 4), ("draft", 5))), (ids[:2], (("draft", 3), ("copy", 4), ("draft", 5)))):
+    for prompts, script in cases:
         out, drafted, _ = _run(model, prompts, 48, _script(*script), SamplingParams(), drafter = drafter)
         assert out == [_solo(model, prompt, 48, SamplingParams()) for prompt in prompts] and all(n for n, _ in drafted.values())
         sequences += [[*prompt, *tokens] for prompt, tokens in zip(prompts, out)]
@@ -1850,3 +2002,202 @@ def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_thr
             assert pending == sequence[fed] and (context - reference[fed - len(context) : fed]).abs().mean().item() < 0.5
             assert mx.array_equal(got, drafter.model.draft_block(pending, context[None], fresh, got.shape[-1] + 1, lambda logits: mx.argmax(logits, axis = -1)))
     assert _probe_matches_a_started_row(model, speculative.ContextDrafter(drafter.model, model.language_model, max_lag = 8), ids[0][:40], lambda started: started[0].cache)
+
+
+@pytest.mark.parametrize("initial_rows", [0, 3])
+def test_a_dflash_block_drafted_before_its_acceptance_is_read_drafts_and_caches_as_one_drafted_after(qwen, initial_rows, monkeypatch):
+    import random
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    model, _ = qwen
+    from unsloth_zoo.mlx import inference
+    placed, in_place = [], inference._append_in_place
+    monkeypatch.setattr(inference, "_append_in_place", lambda *args: placed.append(got := in_place(*args)) or got)
+    # A short window, so the rows rotate out of the ring within the test; built as loaded, so its projections round
+    # each row alike however many rows they read.
+    drafter = speculative._built(ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2", sliding_window = 24), model.language_model, quantize = True)
+    assert drafter.predraft_rows == 23
+    mx.random.seed(0)
+    size, rng, (ahead, after) = len(drafter.config.target_layer_ids) * drafter.config.hidden_size, random.Random(0), (ContextRow(drafter.model.make_cache()) for _ in range(2))
+    if initial_rows:
+        for row in (ahead, after):
+            drafter.push(row, [5], mx.ones((initial_rows, size)))
+        assert not drafter.predraft(ahead, mx.ones((3, size)), mx.array(0), mx.array(7))
+        mx.eval(drafter._block(ahead, 1), drafter._block(after, 1))
+    for width in (0, 24):
+        assert not drafter.predraft(ahead, mx.zeros((width, size)), mx.array(0), mx.array(7))
+    for step in range(40):
+        # The round takes `count + 1` of `width` verified rows; rows past them differ in each step.
+        width = rng.choice([1, 3, 5, 8])
+        count, anchor, hidden = rng.randrange(width), rng.randrange(1000), mx.random.normal((width, size))
+        assert drafter.predraft(ahead, hidden, mx.array(count), mx.array(anchor))
+        prefetched = ahead.prefetched
+        assert not drafter.predraft(ahead, hidden, mx.array(count), mx.array(anchor + 1))
+        assert ahead.prefetched is prefetched
+        if step % 10 == 9:
+            # The host's count disagrees with the device's: the block is drafted again from the rows pushed.
+            drafter.discard(ahead)
+            count = (count + 1) % width
+        drafter.push(ahead, [0] * count + [anchor], hidden[: count + 1])
+        drafter.push(after, [0] * count + [anchor], hidden[: count + 1])
+        assert ahead.pending == after.pending == anchor
+        got, expected = drafter.draft([], [ahead], drafter.max_depth, []), drafter.draft([], [after], drafter.max_depth, [])
+        assert mx.array_equal(got, expected), step
+        for a, b in zip(ahead.cache, after.cache):
+            assert a.offset == b.offset and all(x.shape == y.shape and mx.allclose(x, y, atol = 1e-5).item() for x, y in zip(a.state, b.state))
+    assert ahead.cache[0].offset > 24 and any(placed)
+    from types import SimpleNamespace
+    import sys
+    layer = drafter.model.layers[1]
+    for target, attribute, value in ((layer.self_attn, "is_causal", True), (layer, "self_attn", SimpleNamespace(is_causal = False))):
+        with monkeypatch.context() as patch:
+            patch.setattr(target, attribute, value)
+            assert inference.predraft_attention(drafter.model) == 0
+    with monkeypatch.context() as patch:
+        patch.setattr(drafter.model, "make_cache", lambda: [object()])
+        assert inference.predraft_attention(drafter.model) == 0
+    assert inference.predraft_attention(SimpleNamespace(layers = [])) == 0
+    with monkeypatch.context() as patch:
+        patch.delitem(sys.modules, inference._DFLASH)
+        assert inference.predraft_attention(drafter.model) == 0
+    with monkeypatch.context() as patch:
+        patch.setattr(inference, "_resolved_bindings", lambda contract: None)
+        assert inference.predraft_attention(drafter.model) == 0
+    with monkeypatch.context() as patch:
+        for layer in drafter.model.layers:
+            patch.setattr(layer.self_attn, "is_sliding", False)
+        assert inference.predraft_attention(drafter.model) > 24
+
+
+def test_a_context_block_projects_only_the_rows_its_sliding_layers_keep(qwen, monkeypatch):
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    model, _ = qwen
+    drafter = speculative._built(ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2", sliding_window = 24), model.language_model, quantize = True)
+    assert drafter.context_rows == 23
+    with monkeypatch.context() as patch:
+        patch.setattr(drafter.model.layers[1].self_attn, "is_sliding", False)
+        assert ContextDrafter(drafter.model, model.language_model).context_rows is None
+    hidden = mx.random.normal((40, len(drafter.config.target_layer_ids) * drafter.config.hidden_size), key = mx.random.key(0)).astype(mx.bfloat16)
+    projected, fc = [], drafter.model.fc
+    monkeypatch.setattr(drafter.model, "fc", lambda x: projected.append(x.shape[1]) or fc(x))
+    rows = []
+    for context_rows in (23, None):
+        drafter.context_rows, row = context_rows, ContextRow(drafter.model.make_cache())
+        drafter.push(row, [5], hidden)
+        rows.append((row, drafter.draft([], [row], drafter.max_depth, [])))
+    (trimmed, got), (full, expected) = rows
+    assert projected == [23, 40] and mx.array_equal(got, expected).item()
+    for a, b in zip(trimmed.cache, full.cache):
+        assert a.offset == b.offset == 40 and all(mx.allclose(x, y, rtol = 2e-2, atol = 2e-2).item() for x, y in zip(a.state, b.state))
+
+
+def test_predraft_context_rows_append_in_place_and_wrap_once_the_window_fills():
+    from mlx_vlm.models.cache import RotatingKVCache
+    from unsloth_zoo.mlx import inference
+    native, ahead = RotatingKVCache(600), RotatingKVCache(600)
+    steps = [(5, 5), (3, 261), (300, 308), (200, 564), (40, 564), (40, 600), (100, 600), (650, 1249), (7, 600), (590, 600)]
+    for i, (rows, size) in enumerate(steps):
+        keys, values = (mx.random.normal((1, 2, rows, 4), key = mx.random.key(2 * i + j)).astype(mx.bfloat16) for j in range(2))
+        native.update_and_fetch(keys, values)
+        placed = inference._append_in_place(ahead, keys, values)
+        if not placed:   # the first rows, and more rows than the window, take the native update
+            ahead.update_and_fetch(keys, values)
+        assert placed == (0 < i and rows <= 600) and ahead.keys.shape[2] == size and ahead.offset == native.offset
+        held = min(ahead.offset, 600)
+        for got, want in ((ahead.keys, native.keys), (ahead.values, native.values)):
+            assert mx.array_equal(ahead._temporal_order(got)[..., -held:, :], native._temporal_order(want)[..., -held:, :]).item()
+        history = inference.PredraftCache(ahead, mx.zeros((0,), mx.bool_), mx.array(0)).history()[0]
+        assert history.shape[2] == min(ahead.offset, size)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_draft_convolution_reads_strides_and_rounds_before_residual(monkeypatch, dtype):
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import _grouped_dynamic_convolve
+    from unsloth_zoo.mlx import inference
+    hidden = mx.random.normal((4, 9, 128), key = mx.random.key(22)).astype(dtype)[::2, 1::2, ::2]
+    base = mx.random.normal((2, 3, 128), key = mx.random.key(23)).astype(dtype)[1, :, ::2]
+    dynamic = mx.random.normal((4, 9, 2, 3, 8), key = mx.random.key(24)).astype(dtype)[::2, 1::2, 1]
+    residual = mx.random.normal((4, 9, 128), key = mx.random.key(25)).astype(dtype)[::2, 1::2, ::2]
+    for sign in (-1, 1):
+        changed = mx.concatenate([hidden[:1], hidden[1:] * sign])
+        expected = _grouped_dynamic_convolve(changed, dynamic, base, 8)
+        for add in (None, residual):
+            actual = inference._draft_convolution(changed, dynamic, base, 8, add)
+            assert mx.array_equal(actual.view(mx.uint16), (expected if add is None else residual + expected).view(mx.uint16))
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_draft_selector_walks_each_batch_and_position(monkeypatch, dtype):
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector
+    from unsloth_zoo.mlx import inference
+    selector = CandidateSelector(SimpleNamespace(hidden_size = 64, vocab_size = 97, selector_rank = 256, selector_top_k = 16)).eval()
+    selector.set_dtype(dtype)
+    hidden = mx.random.normal((2, 7, 64), key = mx.random.key(26)).astype(dtype)
+    candidates = (mx.arange(224).reshape(2, 7, 16) * 17 % 97).astype(mx.uint32)
+    unary = mx.random.normal((2, 7, 16), key = mx.random.key(27)).astype(dtype)
+    previous = mx.concatenate([mx.broadcast_to(mx.array([3, 29])[:, None, None], (2, 1, 16)), candidates[:, :-1]], axis = 1)
+    for sign in (-1, 1):
+        changed = mx.concatenate([hidden[:1], hidden[1:] * sign])
+        expected = inference._candidate_walk(selector.predecessor_codebook(previous), selector.hidden_projection(changed),
+            selector.successor_codebook(candidates), unary, candidates)
+        assert mx.array_equal(inference._draft_selector(selector, previous, changed, candidates, unary), expected)
+    selector.predecessor_codebook.weight = mx.zeros_like(selector.predecessor_codebook.weight)
+    assert mx.array_equal(inference._draft_selector(selector, previous, hidden, candidates, mx.zeros_like(unary)), candidates[:, :, 0])
+
+
+def test_draft_layer_folds_convolution_residual_and_keeps_context_cache(monkeypatch):
+    import copy
+    import mlx.nn as nn
+    from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+    from unsloth_zoo.mlx import inference, speculative
+    config = DFlash2Config(hidden_size = 128, intermediate_size = 256, num_hidden_layers = 2,
+        num_attention_heads = 4, num_key_value_heads = 2, head_dim = 32, vocab_size = 1024,
+        block_size = 8, mask_token_id = 0, target_layer_ids = [0], num_target_layers = 2,
+        conv_kernel_size = 3, conv_group_size = 32, selector_rank = 16, selector_top_k = 8)
+    model = DFlash2DraftModel(config).eval()
+    model.set_dtype(mx.bfloat16)
+    for layer in model.layers:
+        for conv in (layer.attention_conv, layer.mlp_conv):
+            conv.base_kernel = mx.random.normal(conv.base_kernel.shape).astype(mx.bfloat16)
+    reference = copy.deepcopy(model)
+    target = nn.Module()
+    target.config, target.rollback_speculative_cache = config, lambda *args: None
+    target.embed_tokens, target.lm_head = nn.Embedding(1024, 128), nn.QuantizedLinear(128, 1024, bias = False)
+    target.eval().set_dtype(mx.bfloat16)
+    speculative._built(speculative.ContextDrafter, model, target)
+    folds, convolution = [], inference._draft_convolution
+    def counted(*args, **kwargs):
+        out = convolution(*args, **kwargs)
+        if len(args) == 5 and out is not None: folds.append(args[-1].shape)
+        return out
+    monkeypatch.setattr(inference, "_draft_convolution", counted)
+    actual_cache, expected_cache = model.make_cache(), reference.make_cache()
+    for rows in (5, 3):
+        hidden = mx.random.normal((1, 7, 128), key = mx.random.key(rows)).astype(mx.bfloat16)
+        context = mx.random.normal((1, rows, 128), key = mx.random.key(rows + 1)).astype(mx.bfloat16)
+        actual, expected = hidden, hidden
+        for a, e, ac, ec in zip(model.layers, reference.layers, actual_cache, expected_cache):
+            actual = a(actual, context, model.rope, ac)
+            expected = e(expected, context, reference.rope, ec)
+            assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16))
+            assert ac.offset == ec.offset and mx.array_equal(ac.keys, ec.keys) and mx.array_equal(ac.values, ec.values)
+    assert folds == [(1, 7, 128)] * 8
+
+
+def test_draft_projections_keep_their_arrays_and_read_as_their_targets_do(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    model = nn.Module()
+    model.layers = [nn.QuantizedLinear(1024, n, bias = False, bits = 4, group_size = 64) for n in (128, 16384)]
+    model.eval().set_dtype(mx.bfloat16)
+    hidden = mx.random.normal((17, 1024), key = mx.random.key(31)).astype(mx.bfloat16)
+    arrays = [(layer.weight, layer.scales, layer.biases) for layer in model.layers]
+    expected = [[matmul.lane_qmm(hidden[:rows], *weights, 64, 4, reader = "slices") for rows in (1, 7, 17)] for weights in arrays]
+    mx.eval(expected)
+    assert inference.lane_drafter_projections(model) == 2
+    for layer, weights, reference in zip(model.layers, arrays, expected):
+        assert all(layer[name] is a for name, a in zip(("weight", "scales", "biases"), weights))
+        for rows, value in zip((1, 7, 17), reference):
+            assert mx.array_equal(layer(hidden[:rows]).view(mx.uint16), value.view(mx.uint16))
