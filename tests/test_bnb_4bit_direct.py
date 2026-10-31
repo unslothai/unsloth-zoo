@@ -243,6 +243,83 @@ def test_row_picks_stay_bounded(lib, monkeypatch):
     assert len(layer.__dict__["_unsloth_bnb_direct"][9]) <= 4
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("M", [1, 4])
+def test_helper_same_kernel_call_as_bitsandbytes(lib, nested, M):
+    layer, qs = _layer(nested = nested, bias = False)
+    weight = layer.weight
+    x = torch.randn(1, M, 128).to(torch.bfloat16)
+    with torch.no_grad():
+        bnb.matmul_4bit(x, weight.data.t(), quant_state = qs)
+        out = Z.bnb_matmul_4bit_direct(x, weight, qs)
+    assert out is not None and out.shape == (1, M, 64) and len(lib.calls) == 2
+    assert _strip_out(lib.calls[0]) == _strip_out(lib.calls[1])
+    assert "_unsloth_bnb_direct" in qs.__dict__ and Z.BNB_4BIT_DIRECT_CALLS["direct"] == 1
+
+
+@pytest.mark.parametrize("kind", ["plain", "strided", "aliases_x", "negative"])
+def test_helper_never_hands_the_kernel_a_callers_out(lib, kind):
+    layer, qs = _layer(bias = False)
+    x = torch.randn(1, 4, 128).to(torch.bfloat16)
+    if kind == "plain":
+        buf = torch.empty(1, 4, 64, dtype = torch.bfloat16)
+    elif kind == "strided":
+        buf = torch.empty(1, 4, 128, dtype = torch.bfloat16)[..., :64]
+    elif kind == "aliases_x":
+        buf = x[..., :64]  # writing here while the kernel reads x would corrupt its input
+    else:
+        buf = torch._neg_view(torch.empty(1, 4, 64, dtype = torch.bfloat16))
+    version = buf._version
+    with torch.no_grad():
+        assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs, out = buf) is buf
+    # The kernel wrote a fresh buffer that copy_ then moved into out (version bumped, views respected).
+    assert lib.calls[-1][1][6] != buf.data_ptr() and buf._version > version
+
+
+def test_negative_views_decline(lib):
+    layer, qs = _layer()
+    x = torch.randn(1, 1, 128).to(torch.bfloat16)
+    with torch.no_grad():
+        assert Z._bnb_4bit_direct(layer, torch._neg_view(x), qs) is None
+        layer.bias = torch._neg_view(layer.bias)
+        assert Z._bnb_4bit_direct(layer, x, qs) is None
+    assert not lib.calls
+
+
+def test_helper_declines_a_quant_state_without_attributes(lib):
+    layer, _ = _layer(bias = False)
+    with torch.no_grad():
+        assert Z.bnb_matmul_4bit_direct(torch.randn(1, 4, 128).to(torch.bfloat16), layer.weight, [1, 2]) is None
+    assert not lib.calls
+
+
+def test_helper_plan_does_not_keep_the_quant_state_alive(lib):
+    import gc
+    import weakref
+    layer, qs = _layer(bias = False)
+    with torch.no_grad():
+        assert Z.bnb_matmul_4bit_direct(torch.randn(1, 2, 128).to(torch.bfloat16), layer.weight, qs) is not None
+    ref = weakref.ref(qs)
+    del qs, layer
+    gc.disable()
+    try:
+        assert ref() is None  # freed by refcount alone, no cycle through its own plan
+    finally:
+        gc.enable()
+
+
+def test_helper_declines_like_the_forward(lib, monkeypatch):
+    layer, qs = _layer(bias = False)
+    x = torch.randn(1, 2, 128).to(torch.bfloat16)
+    monkeypatch.setitem(Z._BNB_DIRECT, "on", False)
+    with torch.no_grad():
+        assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs) is None
+    monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
+    x.requires_grad_(True)
+    assert Z.bnb_matmul_4bit_direct(x, layer.weight, qs) is None
+    assert not lib.calls
+
+
 def test_bitsandbytes_api_drift_turns_it_off(lib, monkeypatch):
     def changed(A, B, shapeB, absmax, blocksize, quant_type, bias = None, absmax_8bit = None, absmax_code = None,
                 absmax_offset = None, extra = None):
@@ -316,3 +393,31 @@ def test_cuda_bitwise_against_bitsandbytes(nested, dtype, monkeypatch):
         ref = lin(x)
         monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
         assert torch.equal(lin(x), ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "NVIDIA CUDA")
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cuda_helper_bitwise_against_bitsandbytes(nested, dtype, monkeypatch):
+    monkeypatch.setitem(Z._BNB_DIRECT, "on", True)  # independent of UNSLOTH_BNB_4BIT_DIRECT in the environment
+    torch.manual_seed(0)
+    lin = bnb.nn.Linear4bit(2048, 3072, bias = False, compute_dtype = dtype, quant_type = "nf4",
+                            compress_statistics = nested).cuda()
+    if Z._bnb_direct_ops() is False:
+        pytest.skip("bitsandbytes without the fused 4-bit GEMM on this build")
+    W, qs = lin.weight, lin.weight.quant_state
+    before = Z.BNB_4BIT_DIRECT_CALLS["direct"]
+    expected = 0
+    for M in (1, 4, 8, 16):
+        x = torch.randn(M, 1, 2048, device = "cuda", dtype = dtype)
+        fused = M <= bops._gemm_4bit_custom_max_m and bool(bops._gemm_4bit_use_custom_fn(0, dtype, M, 3072, 2048))
+        with torch.no_grad():
+            ref = bnb.matmul_4bit(x, W.t(), quant_state = qs)
+            for _ in range(2):
+                buf = torch.empty_like(ref)
+                out = Z.bnb_matmul_4bit_direct(x, W, qs, out = buf)
+                assert (out is not None) == fused, M
+                if fused:
+                    assert out is buf and torch.equal(out, ref), M
+                    expected += 1
+    assert Z.BNB_4BIT_DIRECT_CALLS["direct"] - before == expected

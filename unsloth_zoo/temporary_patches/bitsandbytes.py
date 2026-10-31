@@ -236,8 +236,8 @@ _dispatch_depth = getattr(torch._C, "_len_torch_dispatch_stack", None)
 
 def _plain_eager(x):
     # Raw pointers need real storage: no tracing, tensor subclass, vmap / functorch wrapper or dispatch mode.
-    if torch.compiler.is_compiling() or torch.jit.is_tracing() or type(x) is not torch.Tensor:
-        return False
+    if torch.compiler.is_compiling() or torch.jit.is_tracing() or type(x) is not torch.Tensor or x.is_neg():
+        return False  # a negative view's bits are not its values; .contiguous() keeps the lazy sign
     if _is_wrapped is not None and _is_wrapped(x):
         return False
     return _dispatch_depth is None or _dispatch_depth() == 0
@@ -245,13 +245,29 @@ def _plain_eager(x):
 
 def _bnb_4bit_direct(self, x, quant_state):
     """bitsandbytes.matmul_4bit(x, weight, bias, quant_state) for inference, or None (the caller runs it)."""
+    if x.dtype is not self.compute_dtype:
+        return None
+    return _bnb_4bit_direct_impl(self.__dict__, quant_state, x, self.weight, self.bias, quant_state)
+
+
+# Plans cached on the quant state itself: a marker instead of the object, so it holds no reference to itself.
+_SELF = object()
+
+
+def bnb_matmul_4bit_direct(x, weight, quant_state, out = None):
+    """bitsandbytes.matmul_4bit(x, weight.t(), quant_state = quant_state, out = out) for inference, or None."""
+    cache = getattr(quant_state, "__dict__", None)
+    if cache is None:
+        return None  # e.g. the list form of a quant state
+    return _bnb_4bit_direct_impl(cache, _SELF, x, weight, None, quant_state, out)
+
+
+def _bnb_4bit_direct_impl(cache, ident, x, weight, bias, quant_state, out = None):
     if not _BNB_DIRECT["on"] or not _plain_eager(x):
         return None
-    weight = self.weight
-    bias = self.bias
     dtype = x.dtype
     if (
-        dtype is not self.compute_dtype or not _on_current_cuda(x)
+        not _on_current_cuda(x)
         or (torch.is_grad_enabled() and (x.requires_grad or (bias is not None and bias.requires_grad)))
     ):
         return None
@@ -260,23 +276,22 @@ def _bnb_4bit_direct(self, x, quant_state):
         ops = _bnb_direct_ops()
     if ops is False:
         return None
-    plan = self.__dict__.get("_unsloth_bnb_direct")
+    plan = cache.get("_unsloth_bnb_direct")
     meta = _bnb_direct_meta(quant_state)
-    if plan is None or plan[0] is not quant_state or plan[4] != meta or plan[1] is not None and (
+    if plan is None or plan[0] is not ident or plan[4] != meta or plan[1] is not None and (
         plan[1] != weight.data_ptr() or not _ptrs_equal(_bnb_direct_tensors(quant_state), plan[2])
     ):
         try:
             plan = _bnb_direct_plan(weight, quant_state) if meta is not None else None
         except Exception:
             plan = None
-        if plan is None:
-            plan = (quant_state, None, None, None, meta)
-        self.__dict__["_unsloth_bnb_direct"] = plan
+        plan = (ident, None, None, None, meta) if plan is None else (ident, *plan[1:])
+        cache["_unsloth_bnb_direct"] = plan
     if plan[1] is None:
         return None
     _, _, _, ptrs, _, N, K, blocksize, quant_type, picks, device = plan
     if x.shape[-1] != K or device != x.get_device() or (bias is not None and (
-        bias.dim() != 1 or bias.get_device() != device
+        bias.dim() != 1 or bias.get_device() != device or bias.is_neg()
     )):
         return None
     M = x.numel() // K
@@ -307,19 +322,24 @@ def _bnb_4bit_direct(self, x, quant_state):
     if bias is not None and bias.dtype is not dtype:
         bias = bias.to(dtype)
     A = x.contiguous()
-    out = torch.empty((*A.shape[:-1], N), dtype = dtype, device = A.device)
-    fn(A.data_ptr(), weight.data_ptr(), ptrs[0], ptrs[1], ptrs[2], ptrs[3], out.data_ptr(),
+    # Always a fresh buffer: a caller's out may overlap the inputs, be a negative / misaligned view or a
+    # wrapper, or need autograd's version bump; copy_ handles all of those, as bitsandbytes does.
+    res = torch.empty((*A.shape[:-1], N), dtype = dtype, device = A.device)
+    fn(A.data_ptr(), weight.data_ptr(), ptrs[0], ptrs[1], ptrs[2], ptrs[3], res.data_ptr(),
        bias.data_ptr() if bias is not None else None, M, N, K, blocksize, quant_type, _cuda_raw_stream(A.device.index))
     if checked is None:
         import bitsandbytes
         ref = bitsandbytes.matmul_4bit(x, weight.data.t(), bias = bias, quant_state = quant_state)
-        ok = ref.shape == out.shape and ref.dtype == out.dtype and torch.equal(
-            ref.view(torch.uint8), out.view(torch.uint8))
+        ok = ref.shape == res.shape and ref.dtype == res.dtype and torch.equal(
+            ref.view(torch.uint8), res.view(torch.uint8))
         _BNB_DIRECT["checked"][key] = ok
         if not ok:
-            return ref
-    BNB_4BIT_DIRECT_CALLS["direct"] += 1
-    return out
+            res = ref
+        else:
+            BNB_4BIT_DIRECT_CALLS["direct"] += 1
+    else:
+        BNB_4BIT_DIRECT_CALLS["direct"] += 1
+    return res if out is None else out.copy_(res)
 
 
 def patch_bitsandbytes_linear4bit_forward():
