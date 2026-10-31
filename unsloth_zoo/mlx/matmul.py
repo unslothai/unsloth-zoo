@@ -622,17 +622,20 @@ _LANE_SIMDGROUPS = 8
 # A lane holds elements (fm, fn) and (fm, fn + 1) of every 8 x 8 simdgroup matrix: codes at chunk positions
 # j = fn, fn + 1 of its column, x at position j = fm of its rows fn, fn + 1. Each group folds its fp32 product
 # `s * (P - OFFSET * sum(x)) + b * sum(x)` into the row's output.
+_LANE_SIMD_ONE = """
+    const int N = w_shape[0];
+    const uint n0 = threadgroup_position_in_grid.y * (8 * CT);
+"""
 _LANE_SIMD_PROLOGUE = """
     constexpr int G = K / GS;
     constexpr int C8 = GS / 8;
     constexpr bool WIDE = sizeof(O) == 4;
     const int M = x_shape[0];
-    const int N = w_shape[0];
     const uint simd = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const uint fm = ((lane >> 2) & 4) | ((lane >> 1) & 3);
     const uint fn = ((lane >> 1) & 4) | ((lane & 1) << 1);
-    const uint nb = threadgroup_position_in_grid.y * (8 * CT);
+    const uint nb = n0;
     const int mb = int(threadgroup_position_in_grid.z) * (8 * RT);
     const uint g0 = simd * RG / NSG, g1 = (simd + 1) * RG / NSG;
     float2 out[RT][CT];
@@ -1081,7 +1084,7 @@ _LANE_PARTS = """
     int part = 0;
     for (int i = 1; i < PARTS; ++i) part += int(tile >= TILES[i]);
     const int N = NS[part];
-    const uint n0 = (tile - TILES[part]) * 32;
+    const uint n0 = (tile - TILES[part]) * COLUMNS;
 """
 _LANE_TENSOR_BITS = (4, 8)
 _LANE_TENSOR_COLUMNS = 32
@@ -1148,13 +1151,13 @@ def _lane_paired(group_size, bits):
     return bits in (2, 4) and group_size // 4 % (32 // bits) == 0
 
 
-def _lane_parts(Ns):
-    """(header, prelude, weight inputs, outputs) of a tensor-unit launch over weights of `Ns` outputs."""
+def _lane_parts(Ns, columns = _LANE_TENSOR_COLUMNS):
+    """(header, prelude, weight inputs, outputs) of a launch over weights of `Ns` outputs, in column tiles of `columns`."""
     names = ("w", "scales", "biases")
     if len(Ns) == 1:
         return "", None, list(names), ["y"]
-    tiles = [sum(Ns[:i]) // _LANE_TENSOR_COLUMNS for i in range(len(Ns))]
-    header = (_LANE_CONSTANT.format("PARTS", len(Ns), "constant int")
+    tiles = [sum(Ns[:i]) // columns for i in range(len(Ns))]
+    header = (_LANE_CONSTANT.format("PARTS", len(Ns), "constant int") + _LANE_CONSTANT.format("COLUMNS", columns, "constant int")
               + "constexpr constant int TILES[] = {%s};\nconstexpr constant int NS[] = {%s};\n" % (", ".join(map(str, tiles)), ", ".join(map(str, Ns))))
     pick = lambda name: "    %s %s = %s;\n" % ("device Y*" if name == "y" else "const device uint32_t*" if name == "w" else "const device T*",
                                               name, " : ".join(f"part == {i} ? {name}{i}" for i in range(len(Ns) - 1)) + f" : {name}{len(Ns) - 1}")
@@ -1196,10 +1199,20 @@ def _lane_launch(M, N, K, group_size, bits, dtype, *, output_dtype = None, group
     if _lane_tensor_units(N, bits):
         return _lane_tensor_launch(M, (N,), K, group_size, bits, dtype, output_dtype, groups,
                                    reader or _lane_tensor_reader(N, K, group_size, bits, dtype))
+    return _lane_simd_launch(M, (N,), K, group_size, bits, dtype, output_dtype, groups, reader)
+
+
+def _lane_column_tiles(N, group_size, bits):
+    return 4 if _lane_paired(group_size, bits) and N % 32 == 0 and N >= _LANE_WIDE_COLUMNS else 2 if N % 16 == 0 else 1
+
+
+def _lane_simd_launch(M, Ns, K, group_size, bits, dtype, output_dtype, groups, reader):
+    """The simdgroup-matrix kernel of `x @ W^T` for weights of `Ns` outputs each, one launch, every output's bits those
+    of its weight's own launch."""
     # Row and column tiles only regroup independent outputs; the K split, which orders the sums, follows the weight.
     rows = 8 if M <= 8 else 16
     paired = _lane_paired(group_size, bits)
-    column_tiles = 4 if paired and N % 32 == 0 and N >= _LANE_WIDE_COLUMNS else 2 if N % 16 == 0 else 1
+    column_tiles = _lane_column_tiles(Ns[0], group_size, bits)
     simdgroups = min(_LANE_SIMDGROUPS, K // group_size)
     span_bits = group_size // 4 * bits   # a lane's span starts at a multiple of its length: load it this wide
     operand, operand_bits, shift, offset_bits, offset = _lane_operand(bits, dtype)
@@ -1210,16 +1223,18 @@ def _lane_launch(M, N, K, group_size, bits, dtype, *, output_dtype = None, group
     header = (_LANE_PREAMBLE + "".join(_LANE_TYPE.format(*item) for item in types.items())
               + "".join(_LANE_CONSTANT.format(key, value, "int") for key, value in constants.items())
               + _LANE_CONSTANT.format("OFFSET_BITS", f"{offset_bits}u", "uint") + _LANE_CONSTANT.format("OFFSET", f"{offset}.0f", "float"))
+    parts, prelude, weights, outputs = _lane_parts(Ns, 8 * column_tiles)
     loop = _LANE_PAIRED_LOOP if paired else _LANE_GENERIC_LOOP
     two_groups = reader != "slices"
     if two_groups:
         loop = loop.replace(_LANE_GROUP_HEADER, _LANE_TWO_GROUP_HEADER)
     kernel = mx.fast.metal_kernel(name = "_".join(map(str, ("unsloth_lane_qmm", "paired" if paired else "generic", *(["twogroups"] if two_groups else []),
-                                                            *types.values(), *constants.values()))),
-                                  input_names = ["x", "w", "scales", "biases"], output_names = ["y"],
-                                  source = header + _LANE_SIMD_PROLOGUE + loop + _LANE_SIMD_EPILOGUE)
-    return functools.partial(kernel, grid = (32 * simdgroups, N // (8 * column_tiles), -(-M // rows)),
-                             threadgroup = (32 * simdgroups, 1, 1), output_shapes = [(M, N)], output_dtypes = [output_dtype])
+                                                            *types.values(), *constants.values(), *Ns[1:]))),
+                                  input_names = ["x", *weights], output_names = outputs, header = parts,
+                                  source = header + (prelude or _LANE_SIMD_ONE) + _LANE_SIMD_PROLOGUE + loop + _LANE_SIMD_EPILOGUE)
+    return functools.partial(kernel, grid = (32 * simdgroups, sum(Ns) // (8 * column_tiles), -(-M // rows)),
+                             threadgroup = (32 * simdgroups, 1, 1), output_shapes = [(M, N) for N in Ns],
+                             output_dtypes = [output_dtype] * len(Ns))
 
 
 @functools.cache
@@ -1265,10 +1280,16 @@ def lane_qmm(x, w, scales, biases, group_size, bits, *, output_dtype = None, gro
                         reader = reader)(inputs = inputs)[0]
 
 
+@functools.cache
+def _lane_shared_launch(M, Ns, K, group_size, bits, dtype):
+    return _lane_simd_launch(M, Ns, K, group_size, bits, dtype, dtype, K // group_size, None)
+
+
 def lane_qmms_reader(N, K, group_size, bits, dtype):
-    """The tensor-unit reader an `[N, K]` weight's calls take, None off the tensor units; weights of one reader can
-    share a `lane_qmms` launch."""
-    return _lane_tensor_reader(N, K, group_size, bits, dtype) if _lane_tensor_units(N, bits) else None
+    """The reader an `[N, K]` weight's calls take: weights of one reader can share a `lane_qmms` launch."""
+    if _lane_tensor_units(N, bits):
+        return _lane_tensor_reader(N, K, group_size, bits, dtype)
+    return "simd", _lane_column_tiles(N, group_size, bits)
 
 
 def lane_qmms(x, weights, group_size, bits):
@@ -1279,6 +1300,8 @@ def lane_qmms(x, weights, group_size, bits):
     if len(readers) > 1 or None in readers:
         return None
     reader = readers.pop()
+    if isinstance(reader, tuple):
+        return _lane_shared_launch(M, Ns, K, group_size, bits, x.dtype)(inputs = [x, *(a for weight in weights for a in weight)])
     sums = _lane_sums_launch(M, K, group_size, x.dtype, reader == "bias")(inputs = [x])
     return _lane_tensor_launch(M, Ns, K, group_size, bits, x.dtype, x.dtype, K // group_size, reader)(
         inputs = [x, *(a for weight in weights for a in weight), *sums])

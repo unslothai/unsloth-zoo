@@ -1355,8 +1355,9 @@ apple_gpu_only = pytest.mark.skipif(not _apple_gpu(), reason="requires a non-par
 
 
 @apple_gpu_only
-def test_singleton_decode_serves_only_a_call_naming_the_speculative_trait():
+def test_singleton_decode_serves_only_a_call_naming_the_speculative_trait(monkeypatch):
     from unsloth_zoo.mlx import inference
+    monkeypatch.delenv("UNSLOTH_MLX_FAST_VERIFY", raising = False)
     model = nn.Module()
     model.proj = nn.QuantizedLinear(512, 512, bias = False, group_size = 64, bits = 4)
     model.eval()
@@ -1628,6 +1629,28 @@ def test_tensor_lane_readers_keep_each_rows_bits_within_fp32_reordering(monkeypa
     matmul._lane_sums_launch.cache_clear()
 
 
+@apple_gpu_only
+def test_inference_scopes_hold_fast_verify_around_every_scope_they_enter(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    head = nn.QuantizedLinear(512, 136, bias = False, group_size = 64, bits = 4)
+    head._unsloth_lane_qmm = True
+    head.__class__ = inference._lane_module_class(type(head))
+    model = nn.Module()
+    model.proj, model.lm_head = nn.QuantizedLinear(512, 512, bias = False, group_size = 64, bits = 4), head
+    model.eval()
+    for flag in ("0", "1", "1"):
+        monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", flag)
+        with pytest.raises(RuntimeError, match = "exit"), inference.inference_scopes(model, ("speculative",)):
+            with inference.inference_scopes(model, ("speculative",)):
+                held = inference._fast_verify_held(model)
+                assert held == (flag == "1") and ("_unsloth_singleton_scopes" in vars(model.proj)) != held
+                assert isinstance(model.lm_head, inference._TargetHeadFP32) == held
+            assert inference._fast_verify_held(model) == held
+            raise RuntimeError("exit")
+        assert not inference._fast_verify_held(model)
+        assert type(model.proj) is nn.QuantizedLinear and model.lm_head is head
+
+
 def test_lane_qmm_covers_affine_2_to_8_bit_weights_on_apple_gpus(monkeypatch):
     from unsloth_zoo.mlx import matmul, nax
 
@@ -1644,12 +1667,74 @@ def test_lane_qmm_covers_affine_2_to_8_bit_weights_on_apple_gpus(monkeypatch):
 
 
 @apple_gpu_only
+@apple_gpu_only
+def test_verify_lane_keeps_a_column_of_zero_codes_under_a_tiny_scale(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference
+
+    # 40 outputs keep the simdgroup-matrix kernel, whose folded code offset leaves such a column a tiny nonzero error.
+    proj = nn.QuantizedLinear(2048, 40, bias = False, group_size = 64, bits = 8).eval()
+    proj.weight = mx.zeros_like(proj.weight)
+    proj.scales = mx.full(proj.scales.shape, -1e-7, mx.bfloat16)
+    proj.biases = mx.zeros(proj.biases.shape, mx.bfloat16)
+    proj.set_dtype(mx.bfloat16)
+    proj._unsloth_lane_qmm = True
+    monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
+    monkeypatch.setattr(inference._VERIFY_STATE, "lane", True, raising = False)
+    bindings = inference._resolved_bindings(inference._NAX_QMM_CONTRACT)
+    offsets = []
+    for rows in (1, 8):
+        block = (mx.random.normal((1, rows, 2048), key = mx.random.key(rows)) * 8).astype(mx.bfloat16)
+        routed = inference._verify_lane(proj, block, bindings)
+        assert routed is not None, rows
+        offsets.append(mx.any(routed != 0).item())
+    assert any(offsets)
+
+
+@apple_gpu_only
+def test_sibling_lane_projections_share_one_launch_per_reader_with_each_ones_bits(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+
+    # 64 and 96 columns read on the tensor units where there are some; a biased one stays alone.
+    tensor = matmul._lane_tensor_units(64, 4)
+    ps = [nn.QuantizedLinear(512, n, bias = n == 32, group_size = 64, bits = 4) for n in (64, 48, 96, 16, 32)]
+    for p in ps:
+        p.set_dtype(mx.bfloat16)
+        p.eval()._unsloth_lane_qmm = True
+    bindings = inference._resolved_bindings(inference._NAX_QMM_CONTRACT)
+    monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
+    monkeypatch.setattr(inference._VERIFY_STATE, "lane", True, raising = False)
+    x = (mx.random.normal((1, 8, 512), key = mx.random.key(3)) * (1 + mx.arange(8)[:, None] % 3)).astype(mx.bfloat16)
+    assert inference._lane_projections(ps, x, bindings) == {}   # no call of this shape is verified yet
+    alone = [inference._verify_lane(p, x, bindings) for p in ps]
+    launches, qmms = [], matmul.lane_qmms
+    monkeypatch.setattr(matmul, "lane_qmms", lambda x, ws, *args: launches.append([w.shape[0] for w, _, _ in ws]) or qmms(x, ws, *args))
+    shared = inference._verify_lanes(ps, x, bindings)
+    assert launches == ([[64, 96], [48, 16]] if tensor else [[64, 48, 96, 16]]) and sorted(shared) == [0, 1, 2, 3]
+    assert _same_bits([shared[i] for i in sorted(shared)], [alone[i] for i in sorted(shared)])
+    # Each row of a shared launch has its bits alone too; weights of different column tiles share none.
+    rows = qmms(x[0, 2:5], [(p.weight, p.scales, p.biases) for p in ps[1:4:2]], 64, 4)
+    assert _same_bits(rows, [alone[i][0, 2:5] for i in (1, 3)])
+    other = nn.QuantizedLinear(512, 24, bias = False, group_size = 64, bits = 4)
+    assert qmms(x[0, 2:5], [(ps[1].weight, ps[1].scales, ps[1].biases), (other.weight, other.scales, other.biases)], 64, 4) is None
+    if tensor:
+        rows = qmms(x[0, 2:5], [(p.weight, p.scales, p.biases) for p in ps[0:3:2]], 64, 4)
+        assert _same_bits(rows, [alone[i][0, 2:5] for i in (0, 2)])
+        assert qmms(x[0], [(p.weight, p.scales, p.biases) for p in ps[:2]], 64, 4) is None
+    launches.clear()
+    with inference.native_lane_projections():
+        assert inference._verify_lanes(ps, x, bindings) == {}
+    assert inference._verify_lanes(ps, x[:, :3], bindings) == {} and not launches   # a shape not verified
+    monkeypatch.setattr(inference._VERIFY_STATE, "lane", False)
+    assert inference._verify_lanes(ps, x, bindings) == {} and not launches
+
+
+@apple_gpu_only
 def test_lane_qmms_keeps_each_weights_bits_on_every_reader():
     from unsloth_zoo.mlx import matmul
 
-    if not matmul._lane_tensor_units(32, 4):
-        pytest.skip("the shared launch needs tensor units")
-    readers = set()
+    tensor, readers = matmul._lane_tensor_units(32, 4), set()
     for bits, dtype, K, Ns in ((8, mx.bfloat16, 512, (96, 32)), (4, mx.float16, 576, (64, 32)), (4, mx.bfloat16, 256, (16384, 16384))):
         ws = [mx.quantize(mx.random.normal((N, K), key = mx.random.key(N + i)).astype(dtype) * 0.05, group_size = 64, bits = bits)
               for i, N in enumerate(Ns)]
@@ -1657,7 +1742,7 @@ def test_lane_qmms_keeps_each_weights_bits_on_every_reader():
         for rows in (5, 20):
             x = mx.random.normal((rows, K), key = mx.random.key(rows)).astype(dtype)
             assert _same_bits(matmul.lane_qmms(x, ws, 64, bits), [matmul.lane_qmm(x, *w, 64, bits) for w in ws]), (bits, K, rows)
-    assert readers == {"staged", "slices", "bias"}
+    assert readers == ({"staged", "slices", "bias"} if tensor else {("simd", 2), ("simd", 4)})
 
 
 @real_mlx_only

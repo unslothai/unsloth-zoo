@@ -4267,6 +4267,7 @@ class _SmallRowRoute(NamedTuple):
     takes_blocks: bool   # whether one sequence's [1, T, K] block routes
     state: str = "nax_qmm"
     reader: str = None
+    code_offset: bool = False   # the kernel may fold `s * (sum x (2^bits + q) - 2^bits * sum x)` out of each group
 
     def call(self, suffix, *args):
         kernel = getattr(self.module, self.kernel + suffix)
@@ -4279,7 +4280,7 @@ _NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_N
 _SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
                                  "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
 _LANE_QMM_ROUTE = _SmallRowRoute(matmul, "lane_qmm", "Lane", "row-invariant lane", "UNSLOTH_MLX_LANE_QMM", None,
-                                 ("LANE_QMM_PROBE_KEY", "probe_lane_qmm"), True, "lane_qmm")
+                                 ("LANE_QMM_PROBE_KEY", "probe_lane_qmm"), True, "lane_qmm", code_offset = True)
 
 
 def _small_row_route():
@@ -4289,8 +4290,9 @@ def _small_row_route():
     return _SIMD_QMM_ROUTE if matmul.simd_qmm_available() else None
 
 
-def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
-    """Compare the kernel with stock's fp32 qmv of each row, within fp32 reordering of K products.
+def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed, code_offset = False):
+    """Compare the kernel with stock's fp32 qmv of each row, within fp32 reordering of K products, and with
+    `code_offset` of the kernel's offset terms too.
 
     A batched native call is no reference: its qmm rounds dequantized weights to the input dtype.
     """
@@ -4300,8 +4302,10 @@ def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
                                                  group_size = group_size, bits = bits)
     rows = range(x.shape[0])
     reference = mx.concatenate([row(i, x32, scales32, biases32) for i in rows])
-    # |s q + b| <= |s| q + |b|, so this is a bound on sum_k |x_k w_k|.
-    magnitude = mx.concatenate([row(i, mx.abs(x32), mx.abs(scales32), mx.abs(biases32)) for i in rows])
+    # |s q + b| <= |s| q + |b|, so this is a bound on sum_k |x_k w_k|; a folded offset adds |s| 2^(bits + 1) |x_k|,
+    # which a column of zero codes under a nonzero scale leaves as the whole error.
+    spread = mx.abs(biases32) + (2.0 ** (bits + 1) if code_offset else 0.0) * mx.abs(scales32)
+    magnitude = mx.concatenate([row(i, mx.abs(x32), mx.abs(scales32), spread) for i in rows])
     got = routed.astype(mx.float32)
     bound = mx.finfo(x.dtype).eps * mx.abs(reference) + x.shape[-1] * 2.0 ** -23 * magnitude
     agree = (mx.abs(got - reference) <= bound) | (got == reference) | (mx.isnan(got) & mx.isnan(reference))
@@ -4347,7 +4351,8 @@ def _nax_small_m_qmm(module, x, bindings, route = None, rows = None):
     routed = route.call("", flat, w, scales, biases, group_size, bits)
     if verified is None:
         try:
-            verified = _settled(_nax_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed))
+            verified = _settled(_nax_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed,
+                                                        route.code_offset))
         except (RuntimeError, ValueError) as error:
             _unless_failed_buffer(error)
             return None  # inside a function transformation, which cannot evaluate; checked later
@@ -5199,7 +5204,7 @@ def singleton_quantized_decode(model, *, _modules = None):
     changed = []
     try:
         with _NAX_QMM_LOCK:
-            if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+            if not _fast_verify_held(model) and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
                 seen = set()
                 for _, module in _fusion_modules(model, _modules):
                     if id(module) in seen:
@@ -5264,16 +5269,29 @@ _EXACT_VERIFY_CONTRACT = {
 # qwen4_exp runs its decode steps as well as its verify blocks on one batch-invariant forward, entered at
 # `__call__`, whose `_model` already submits each layer. It inherits the Qwen3.5 bodies pinned above.
 _QWEN4_FORWARD_CONTRACT = {
+    **_EXACT_VERIFY_CONTRACT,
     "mlx_vlm.models.qwen4_exp.language": {
         "Qwen4ExpBatchInvariantForward.__call__": "d7a813b4f944d125",
         "Qwen4ExpBatchInvariantForward._layer": "537ce3afba7c9732",
     },
 }
-# (language module, its forward object, the forward's module and class, the entry that serves, wrap `_layer`)
-_QWEN3_5_VERIFIER = ("mlx_vlm.models.qwen3_5.language", "_EXACT_SPECULATIVE_VERIFIER",
-                     "mlx_vlm.models.qwen3_5.speculative_verifier", "Qwen3_5BatchInvariantForward", "verify", True)
-_QWEN4_FORWARD = ("mlx_vlm.models.qwen4_exp.language", "_QWEN4_BATCH_INVARIANT_FORWARD",
-                  "mlx_vlm.models.qwen4_exp.language", "Qwen4ExpBatchInvariantForward", "__call__", False)
+
+
+class SpeculativeFamily(NamedTuple):
+    """`language`'s forward object `target`, a `module.forward` entered at `entry` ("verify", or "__call__" when it also
+    decodes), served once `contract` holds. `capabilities` maps the further optimizations its arithmetic admits,
+    "attention", "lanes" and "invariant_attention" (its one-token decode attention body), to the bodies each pins
+    apart (the lanes' own contract is the kernel's)."""
+    language: str
+    target: str
+    module: str
+    forward: str
+    entry: str
+    submit_layers: bool
+    contract: dict
+    capabilities: dict = {}
+
+
 # mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
 _VERIFY_FUSED_ROWS = 8
 # Pinned apart, so a drifted attention body leaves only the attention route native.
@@ -5314,6 +5332,16 @@ def _verify_gathers(linear, x, eligible):
             and isinstance(linear, nn.QuantizedLinear) and x.ndim == 3 and x.shape[0] * x.shape[1] > 1 and not eligible(linear, x) and not linear.trainable_parameters())
 
 
+def _batched_weights(linear):
+    """A projection's tensors under a batch axis, contiguous once: stock copies such a view at every call."""
+    arrays = (linear["weight"], linear["scales"], linear.get("biases"))
+    held = linear.__dict__.get("_unsloth_batched_weights")
+    if held is None or any(a is not b for a, b in zip(held[0], arrays)):
+        held = (arrays, tuple(None if a is None else mx.contiguous(a[None]) for a in arrays))
+        linear.__dict__["_unsloth_batched_weights"] = held
+    return held[1]
+
+
 def _verify_rows_alone(linear, x):
     K = x.shape[-1]
 
@@ -5321,9 +5349,8 @@ def _verify_rows_alone(linear, x):
         return mx.concatenate([linear(row[None]) for row in mx.contiguous(x).reshape(-1, 1, K)]).reshape(*x.shape[:-1], -1)
 
     def batched():
-        biases = linear.get("biases")
-        y = mx.quantized_matmul(x.reshape(-1, 1, K), linear["weight"][None], scales = linear["scales"][None],
-                                biases = None if biases is None else biases[None], transpose = True,
+        weight, scales, biases = _batched_weights(linear)
+        y = mx.quantized_matmul(x.reshape(-1, 1, K), weight, scales = scales, biases = biases, transpose = True,
                                 group_size = linear.group_size, bits = linear.bits, mode = linear.mode)
         y = y.reshape(*x.shape[:-1], -1)
         return y + linear["bias"] if "bias" in linear else y
@@ -5632,7 +5659,7 @@ _VERIFY_GDN_FOLD_SOURCE = (
 _VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
 # Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
 _VERIFY_GDN_MAX_ROWS = 16
-# Causal verify rows `_native_causal_attention` takes through fused calls, and in one pass over the KV prefix.
+# Causal verify rows `_native_causal_attention` takes outside an engine-deepened round, and in one pass over the KV prefix.
 _NATIVE_CAUSAL_ROWS = 8
 _EXACT_ATTENTION_MAX_ROWS = 32
 # The verifier's own q/k normalization keeps 1e-6; the loader's replacement uses the layer's.
@@ -6118,8 +6145,8 @@ def _launched_rows(queries, keys, values, scale, blocks):
 def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row):
     """A causal verify block, each row with its one-row call's bits: in one pass over the KV prefix where the rows share
     their one-row launch and MLX's fused SDPA would take several calls, else through those calls; None where the block's
-    shape does not apply. A plan serves once it matched `per_row()`."""
-    if (not getattr(_VERIFY_STATE, "serving", False)
+    shape does not apply. Outside Fast Verify a plan serves once it matched `per_row()`."""
+    if (not getattr(_VERIFY_STATE, "serving", False) or getattr(_LANE_STATE, "native", False)
             or not (cache is None or type(cache) is getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None))
             or not (mask is None or isinstance(mask, str) and mask == "causal")
             or not all(isinstance(x, mx.array) and x.ndim == 4 for x in (queries, keys, values))
@@ -6142,7 +6169,14 @@ def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row)
     blocks = _causal_rows_blocks(gqa, dim, prefix, length, forced) if len(chunks) > 1 else None
     rows_kernel = blocks is not None and _exact_attention_kernels() is not None
     one_pass = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
-    fits = length <= _NATIVE_CAUSAL_ROWS
+    fits = length <= getattr(_VERIFY_STATE, "causal_rows", _NATIVE_CAUSAL_ROWS)
+    if getattr(_VERIFY_STATE, "lane", False):
+        if not rows_kernel:
+            return chunked() if fits else None
+        key = (queries.shape[:3], "causal attention", keys.shape[1], queries.dtype, dim, blocks)
+        if key not in _VERIFY_VERDICTS and _launched_rows(queries, keys, values, scale, blocks) is None:
+            return chunked()
+        return _verify_admitted(key, chunked, one_pass)
     # MLX's dispatch changes at or just past powers of two: a plan is checked again for each such class of key counts its
     # chunks' first and last rows fall in, so a dispatch `_vector_launch` does not model falls back.
     octave = lambda n: (n.bit_length(), (n - 1).bit_length())
@@ -6226,9 +6260,10 @@ def _exact_attention_faster(per_row, fused, clock = time.perf_counter):
 
 
 @functools.cache
-def _exact_verify_class(base, entry, submit_layers, *cache_key):
-    contract = _EXACT_VERIFY_CONTRACT if entry == "verify" else {**_EXACT_VERIFY_CONTRACT, **_QWEN4_FORWARD_CONTRACT}
-    bindings = _resolved_bindings(contract)
+def _exact_verify_class(base, name, *cache_key):
+    family = SPECULATIVE_FAMILIES[name]
+    entry = family.entry
+    bindings = _resolved_bindings(family.contract)
     eligible = getattr(sys.modules.get("mlx_vlm.models.quantized_verifier"), "_can_optimized_affine_linear", None)
     if bindings is None or eligible is None:
         return None
@@ -6340,20 +6375,22 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
 
     methods = {entry: verify if entry == "verify" else entered, "_linear": sliced_linear, "_linears": sliced_linears,
                "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base}
-    if submit_layers:
+    if family.submit_layers:
         methods["_layer"] = submitted_layer
     if taped is not None:
         methods["_gated_delta"] = taped_gated_delta
-    attention_bindings = _resolved_bindings(_EXACT_ATTENTION_CONTRACT)
+    pins = family.capabilities.get("attention")
+    attention_bindings = None if pins is None else _resolved_bindings(pins)
     module = sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier")
-    # Qwen3.5's verify blocks only: qwen4_exp's forward also routes its sparse attention through `_attention`.
-    if entry != "verify" or attention_bindings is None or module is None:
+    if attention_bindings is None or module is None:
         return type(f"_ScopedVerify{base.__name__}", (base,), methods)
 
     def block_attention(self, attention, x, mask, cache, position_ids, position_embeddings):
         # The native two-row call launches for both rows' keys, so pairs the rows below can mask come here.
         pair = isinstance(mask, str) and mask == "causal" or isinstance(mask, mx.array) and mask.ndim >= 4
-        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] < 2
+        # A layer `row_invariant_attention` holds attends one-row blocks as its decode steps do.
+        invariant = _invariant_attention_held(attention)
+        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] < 2 and not invariant
                 or x.shape[1] == 2 and not pair or not _bindings_intact(attention_bindings)):
             return base._attention(self, attention, x, mask, cache, position_ids, position_embeddings)
         # The native body for a wider block, with its one-row SDPA calls handed to `_exact_attention`.
@@ -6361,10 +6398,15 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
             q_proj_output, keys, values, cache, position_ids, position_embeddings, mask)
-        if isinstance(mask, str) and mask == "left_padded_decode":
+        padded = isinstance(mask, str) and mask == "left_padded_decode"
+        if padded:
             mask = None
-        output = self._helpers()._qwen3_5_left_padded_attention(
-            queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
+        output = _invariant_attention(queries, keys, values, attention.scale, cache, mask) if invariant else None
+        if output is None and (length > 1 or padded):
+            output = self._helpers()._qwen3_5_left_padded_attention(
+                queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
+        if output is None and length == 1:
+            output = module.scaled_dot_product_attention(queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
         if output is None:
             prefix = module.kv_sequence_length(keys) - length
 
@@ -6383,27 +6425,28 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
 
 @contextmanager
 def _exact_forwards(model, forwards, modules):
-    """Serve each of `forwards` (as `_QWEN3_5_VERIFIER`) for the language models of `model` it belongs to."""
+    """Serve each family of `forwards` (names in `SPECULATIVE_FAMILIES`) for the language models of `model` it belongs to."""
     owners, verifiers = [], []
     try:
         with _VERIFY_LOCK:
             usable = not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and mx.metal.is_available()
-            for language_name, target_name, native_module, native_name, entry, submit in forwards if usable else ():
-                language = sys.modules.get(language_name)
-                native = getattr(sys.modules.get(native_module), native_name, None)
+            for name in forwards if usable else ():
+                family = SPECULATIVE_FAMILIES[name]
+                language = sys.modules.get(family.language)
+                native = getattr(sys.modules.get(family.module), family.forward, None)
                 call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
-                target = getattr(language, target_name, None)
-                if (call is None or native is None
-                        or getattr(type(target), "_unsloth_verify_native", type(target)) is not native):
+                target = getattr(language, family.target, None)
+                if call is None or native is None or _verifier_native(type(target)) is not native:
                     continue
                 # qwen3_5_moe inherits the call; a shared module is yielded once per path.
                 found = {id(module): module for _, module in _fusion_modules(model, modules)
                          if getattr(type(module), "__call__", None) is call}
-                methods = [getattr(native, name, None) for name in _VERIFY_METHODS]
-                patched = _exact_verify_class(native, entry, submit, *methods) if found else None
+                methods = [getattr(native, method, None) for method in _VERIFY_METHODS]
+                patched = _exact_verify_class(native, name, *methods) if found else None
                 if patched is not None:
-                    target.__class__ = patched
                     target._unsloth_verify_scopes = getattr(target, "_unsloth_verify_scopes", 0) + 1
+                    target.__dict__.setdefault("_unsloth_verify_layer", patched)
+                    _layer_verifier(target, native)
                     verifiers.append(target)
                     for module in found.values():
                         module._unsloth_verify_scopes = getattr(module, "_unsloth_verify_scopes", 0) + 1
@@ -6416,7 +6459,26 @@ def _exact_forwards(model, forwards, modules):
                 if not owner._unsloth_verify_scopes:
                     owner.__dict__.pop("_unsloth_verify_scopes", None)
                     if any(owner is verifier for verifier in verifiers):
-                        owner.__class__ = type(owner)._unsloth_verify_native
+                        owner.__dict__.pop("_unsloth_verify_layer", None)
+                        _layer_verifier(owner, _verifier_native(type(owner)))
+
+
+def _verifier_native(cls):
+    """The mlx-vlm class under the verify scopes' layers."""
+    for name in ("_unsloth_lane_verify_native", "_unsloth_verify_native"):
+        cls = vars(cls).get(name, cls)
+    return cls
+
+
+def _layer_verifier(target, native):
+    """The verifier's class from the scopes holding it, so either scope can nest in the other: the exact layer its
+    first scope installed over the native class, then the lane layer on top. Held layers are never re-resolved."""
+    cls = native
+    if getattr(target, "_unsloth_verify_scopes", 0):
+        cls = target._unsloth_verify_layer
+    if getattr(target, "_unsloth_lane_verify_scopes", 0):
+        cls = _lane_verify_class(cls)
+    target.__class__ = cls
 
 
 @contextmanager
@@ -6438,7 +6500,7 @@ def exact_speculative_verify(model, *, _modules = None):
     language models found here are served; other, training and distributed models, and an mlx-vlm whose verifier
     drifted, keep the native methods.
     """
-    with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
+    with _exact_forwards(model, [n for n, f in SPECULATIVE_FAMILIES.items() if f.entry == "verify"], _modules):
         yield model
 
 
@@ -6454,7 +6516,7 @@ def exact_batch_invariant_decode(model, *, _modules = None):
     of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
     forward drifted, keep the native methods.
     """
-    with _exact_forwards(model, (_QWEN4_FORWARD,), _modules):
+    with _exact_forwards(model, [n for n, f in SPECULATIVE_FAMILIES.items() if f.entry != "verify"], _modules):
         yield model
 
 
@@ -6759,7 +6821,7 @@ def native_lane_projections():
 
 
 def _lane_rows(module, x, bindings):
-    """`module`'s projection of x on the lane kernel where `lane_drafter_projections` covers it, or None."""
+    """`module`'s projection of x on the lane kernel where `row_invariant_lane_projections` covers it, or None."""
     if not module.__dict__.get("_unsloth_lane_qmm") or getattr(_LANE_STATE, "native", False):
         return None
     most = matmul.LANE_QMM_MAX_ROWS
@@ -6770,6 +6832,14 @@ def _lane_rows(module, x, bindings):
         return None if any(part is None for part in parts) else mx.concatenate(parts).reshape(*x.shape[:-1], -1)
     y = _nax_small_m_qmm(module, x, bindings, _LANE_QMM_ROUTE, (1, most))
     return y if y is None or "bias" not in module else y + module["bias"]
+
+
+def _verify_lane(p, x, bindings):
+    return _lane_rows(p, x, bindings) if getattr(_VERIFY_STATE, "lane", False) and x.ndim == 3 else None
+
+
+def _verify_lanes(ps, x, bindings):
+    return _lane_projections(ps, x, bindings) if getattr(_VERIFY_STATE, "lane", False) else {}
 
 
 def _lane_projections(ps, x, bindings):
@@ -6818,8 +6888,426 @@ def _lane_module_class(base):
     return type(f"_Lane{base.__name__}", (base,), {**methods, "_unsloth_lane_native": base})
 
 
+@functools.cache
+def _lane_verify_class(base):
+    def verify(self, language_model, *args, **kwargs):
+        outer = getattr(_VERIFY_STATE, "lane", False)
+        _VERIFY_STATE.lane = bool(getattr(language_model, "_unsloth_lane_verify_scopes", 0)) and not language_model.training
+        try:
+            return base.verify(self, language_model, *args, **kwargs)
+        finally:
+            _VERIFY_STATE.lane = outer
+
+    def linear(self, p, x):
+        y = _verify_lane(p, x, self._unsloth_lane_bindings)
+        return base._linear(self, p, x) if y is None else y
+
+    def linears(self, ps, x):
+        shared = _verify_lanes(ps, x, self._unsloth_lane_bindings)
+        ys = [shared[i] if i in shared else _verify_lane(p, x, self._unsloth_lane_bindings) for i, p in enumerate(ps)]
+        if all(y is None for y in ys):
+            return base._linears(self, ps, x)
+        return tuple(base._linear(self, p, x) if y is None else y for p, y in zip(ps, ys))   # the rest as alone
+
+    def embedding_as_linear(self, embedding, x):
+        y = _verify_lane(embedding, x, self._unsloth_lane_bindings)
+        return base._embedding_as_linear(self, embedding, x) if y is None else y
+
+    # mlx-vlm's fused heads read a covered head's codes themselves; declining them leaves its call to the module.
+    def quantized_linear(self, linear, x):
+        return None if linear.__dict__.get("_unsloth_lane_qmm") else base.quantized_linear(self, linear, x)
+
+    def quantized_argmax(self, linear, x, token_mask = None):
+        if linear.__dict__.get("_unsloth_lane_qmm"):
+            return None
+        return base.quantized_argmax(self, linear, x, token_mask = token_mask)
+
+    def can_quantized_head(self, linear):
+        return not linear.__dict__.get("_unsloth_lane_qmm") and base.can_quantized_head(self, linear)
+
+    return type(f"_LaneVerify{base.__name__}", (base,), {
+        "verify": verify, "_linear": linear, "_linears": linears, "_embedding_as_linear": embedding_as_linear,
+        "quantized_linear": quantized_linear, "quantized_argmax": quantized_argmax,
+        "can_quantized_head": can_quantized_head, "_unsloth_lane_verify_native": base})
+
+
+_FAST_VERIFY_ENV = "UNSLOTH_MLX_FAST_VERIFY"
+_FAST_VERIFY_PIN = "_unsloth_fast_verify_pin"       # what the model's drafter was built for
+_FAST_VERIFY_SCOPE = "_unsloth_fast_verify_scope"   # (depth, the outermost scope's decision)
+
+
 def _lane_kernel_on():
     return matmul.lane_qmm_available() and os.environ.get(_LANE_QMM_ROUTE.switch, "1") != "0"
+
+
+def _fast_verify_state(model):
+    return getattr(getattr(model, "language_model", model), "__dict__", {})
+
+
+def pin_fast_verify(model, fast_verify = None) -> bool:
+    """Settle Fast Verify for `model` until it is reloaded: what an earlier drafter or an open scope decided, else
+    `fast_verify` (`UNSLOTH_MLX_FAST_VERIFY` when None). A drafter's selector, verify floor and warmed costs hold for one
+    decision, so building one pins its target."""
+    pinned = _fast_verify_decision(model, fast_verify)
+    if fast_verify is not None and bool(fast_verify) != pinned:
+        raise ValueError(f"an open scope decided fast_verify = {pinned}; build the drafter outside it")
+    _fast_verify_state(model)[_FAST_VERIFY_PIN] = pinned
+    return pinned
+
+
+def _fast_verify_decision(model, fast_verify = None) -> bool:
+    state = _fast_verify_state(model)
+    pinned = state.get(_FAST_VERIFY_PIN)
+    if pinned is not None:
+        if fast_verify is not None and bool(fast_verify) != pinned:
+            raise ValueError(f"this model's drafter was built with fast_verify = {pinned}; reload it to change that")
+        return pinned
+    outer = state.get(_FAST_VERIFY_SCOPE, (0, None))[1]
+    if outer is not None:
+        return outer
+    return os.environ.get(_FAST_VERIFY_ENV) == "1" if fast_verify is None else bool(fast_verify)
+
+
+def _hold_fast_verify(model, decided):
+    state = _fast_verify_state(model)
+    with _VERIFY_LOCK:
+        state[_FAST_VERIFY_SCOPE] = (state.get(_FAST_VERIFY_SCOPE, (0, None))[0] + 1, decided)
+
+
+def _release_fast_verify(model):
+    state = _fast_verify_state(model)
+    with _VERIFY_LOCK:
+        depth, decided = state.pop(_FAST_VERIFY_SCOPE, (1, None))
+        if depth > 1:
+            state[_FAST_VERIFY_SCOPE] = (depth - 1, decided)
+
+
+def _fast_verify_held(model):
+    return _fast_verify_state(model).get(_FAST_VERIFY_SCOPE, (0, False))[1]
+
+
+def fast_verify_requested(model) -> bool:
+    """Whether `model`'s speculative generations decode under Fast Verify where it covers it and the GPU has its kernel,
+    readable before any generation. A failed kernel probe still keeps the default path."""
+    return _fast_verify_decision(model) and _lane_kernel_on()
+
+
+def fast_verify_enabled(model) -> bool:
+    """`fast_verify_requested`, and Fast Verify covers `model`."""
+    return fast_verify_requested(model) and fast_verify_covers(model)
+
+
+def fast_verify_covers(model) -> bool:
+    """Whether Fast Verify covers `model`, whether or not it is asked for."""
+    return bool(_lane_coverage(model, None)[3])
+
+
+class FastVerifyStatus(NamedTuple):
+    available: bool
+    # "", no_lane_kernel, distributed, not_downloaded, no_eligible_projections or probe_failed
+    reason: str
+    projections: int   # quantized projections the lane kernel takes; approximate before load
+
+    def __bool__(self):
+        return self.available
+
+
+def _fast_verify_status(projections):
+    if not projections:
+        return FastVerifyStatus(False, "no_eligible_projections", 0)
+    if _resolved_bindings(_NAX_QMM_CONTRACT) is None or not nax.kernel_probe_passed(
+            matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available):
+        return FastVerifyStatus(False, "probe_failed", projections)
+    return FastVerifyStatus(True, "", projections)
+
+
+def fast_verify_available(model):
+    """Whether `fast_verify=True` moves any of `model`'s projections to the lane kernel in a speculative generation here. It ignores the decision and
+    `UNSLOTH_MLX_FAST_VERIFY`, and leaves the model unchanged."""
+    if not _lane_kernel_on():
+        return FastVerifyStatus(False, "no_lane_kernel", 0)
+    if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+        return FastVerifyStatus(False, "distributed", 0)
+    return _fast_verify_status(len(_lane_coverage(model, None)[3]))
+
+
+def fast_verify_checkpoint_available(model_dir):
+    """`fast_verify_available` for the directory of a downloaded MLX checkpoint, judged from its config.json and
+    safetensors headers without loading it: reason "not_downloaded" when either is missing."""
+    if not _lane_kernel_on():
+        return FastVerifyStatus(False, "no_lane_kernel", 0)
+    model_dir = Path(model_dir)
+    shards = list(model_dir.glob("*.safetensors"))
+    if not (model_dir / "config.json").is_file() or not shards:
+        return FastVerifyStatus(False, "not_downloaded", 0)
+    config = json.loads((model_dir / "config.json").read_text())
+    family = SPECULATIVE_FAMILIES.get(str(config.get("model_type")).removesuffix("_moe"))
+    if family is None or "lanes" not in family.capabilities:
+        return FastVerifyStatus(False, "no_eligible_projections", 0)
+    quantization = config.get("quantization") or {}
+    tensors = {}
+    for shard in shards:
+        with open(shard, "rb") as file:
+            tensors.update(json.loads(file.read(struct.unpack("<Q", file.read(8))[0])))
+    projections = 0
+    for name in tensors:
+        prefix = name.removesuffix(".scales")
+        weight = tensors.get(f"{prefix}.weight")
+        if prefix == name or weight is None or f"{prefix}.biases" not in tensors or len(weight["shape"]) != 2:
+            continue
+        layer = next((quantization[key] for key in (prefix, prefix.removeprefix("language_model."))
+                      if key in quantization), quantization)
+        if isinstance(layer, dict):
+            bits = layer.get("bits", 4)
+            projections += matmul.lane_qmm_supported(weight["shape"][0], weight["shape"][1] * 32 // bits,
+                                                     layer.get("group_size", 64), bits, layer.get("mode", "affine"))
+    return _fast_verify_status(projections)
+
+
+def lane_tile_rows(model) -> int:
+    """The row tile (8 or 16) of the covered quantized weights that hold most of the weight bits; 0 if none."""
+    weight_bits = {8: 0, 16: 0}
+    for module in _lane_coverage(model, None)[3]:
+        if isinstance(module, nn.QuantizedEmbedding):  # a lookup table; a tied head is one matrix, not the bulk
+            continue
+        N, K = _nax_qmm_shape(module, _LANE_QMM_ROUTE)
+        weight_bits[16 if matmul._lane_tensor_units(N, module.bits) else 8] += N * K * module.bits
+    return 0 if not any(weight_bits.values()) else 16 if weight_bits[16] > weight_bits[8] else 8
+
+
+def _lane_coverage(model, modules):
+    if not _lane_kernel_on() or getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+        return None, None, [], []
+    modules = {id(module): module for _, module in _fusion_modules(model, modules)}
+    for family in SPECULATIVE_FAMILIES.values():
+        language = sys.modules.get(family.language)
+        native = getattr(sys.modules.get(family.module), family.forward, None)
+        call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
+        target = getattr(language, family.target, None)
+        if "lanes" not in family.capabilities or call is None or native is None or _verifier_native(type(target)) is not native:
+            continue
+        found = [module for module in modules.values() if getattr(type(module), "__call__", None) is call]
+        if found:
+            covered = [module for module in modules.values() if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+                       and _nax_qmm_shape(module, _LANE_QMM_ROUTE)]
+            return target, native, found, covered
+    return None, None, [], []
+
+
+@contextmanager
+def row_invariant_lane_projections(model, *, _modules = None):
+    """Fast Verify: Qwen3.5 greedy output that does not depend on how many rows a
+    forward carries, so speculative decoding returns its own one-token greedy output. Every affine 2- to 8-bit
+    projection called with 1 to 32 rows, in decode steps, heads and verify blocks alike, runs on the `matmul.lane_qmm`
+    kernel, whose rows do not depend on the call; the exact verifier reproduces one-token decoding for the rest.
+
+    Not stock's bits, so not default decoding's output: a row is within fp32 reordering of stock's products. Each shape
+    is checked against stock on first use and a subprocess probe gates the kernel; `UNSLOTH_MLX_LANE_QMM=0` turns the
+    mode off with it, and other, training and distributed models keep their methods.
+    """
+    owners, verifier = [], None
+    try:
+        with _VERIFY_LOCK:
+            target, native, found, covered = _lane_coverage(model, _modules)
+            if covered:
+                bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+                if bindings is not None and nax.kernel_probe_passed(
+                        matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available):
+                    target.__dict__.setdefault("_unsloth_lane_bindings", bindings)
+                    for owner in [target, *found, *covered]:
+                        owner._unsloth_lane_verify_scopes = getattr(owner, "_unsloth_lane_verify_scopes", 0) + 1
+                        owners.append(owner)
+                    _layer_verifier(target, native)
+                    verifier = target
+                    for module in covered:
+                        module._unsloth_lane_qmm = True
+                        swapped = _lane_module_class(type(module))
+                        if "_unsloth_lane_native" not in vars(type(module)) and swapped is not None:
+                            module.__class__ = swapped
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for owner in owners:
+                owner._unsloth_lane_verify_scopes -= 1
+                if not owner._unsloth_lane_verify_scopes:
+                    for name in ("_unsloth_lane_verify_scopes", "_unsloth_lane_qmm", "_unsloth_lane_qmm_ready",
+                                 "_unsloth_lane_bindings"):
+                        owner.__dict__.pop(name, None)
+                    if "_unsloth_lane_native" in vars(type(owner)):
+                        owner.__class__ = type(owner)._unsloth_lane_native
+                    if owner is verifier:
+                        _layer_verifier(verifier, _verifier_native(type(verifier)))
+
+
+# The one-token decode body whose attention `row_invariant_attention` reroutes (verify blocks reach it through the
+# family's "attention" capability), and the batch cache whose rows it attends as the row-wise forward extracts them.
+_INVARIANT_ATTENTION_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.language": {"Qwen3_5Attention.__call__": "f90d80c414d62ac1",
+                                        "_qwen3_5_left_padding_info": "ef87537a11cd4671",
+                                        "_qwen3_5_left_padded_attention": "df12e7fbee9adf0e"},
+    "mlx_vlm.models.cache": {"BatchKVCache.update_and_fetch": "73901e5b680dfb41", "BatchKVCache.extract": "ff095c4fa939e86a",
+                             "BatchKVCache.make_mask": "5a43f29692bfa568"},
+}
+
+
+def _invariant_attention(queries, keys, values, scale, cache, mask):
+    """`attention.invariant_attention` for a KV-cache layer's causal block or lone query row, else None. A batch
+    cache's rows each attend their keys past their left padding: the keys a row's extracted cache holds."""
+    if not attention.invariant_attention_supported(queries, keys, values):
+        return None
+    if type(cache) is getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None):
+        causal = isinstance(mask, str) and mask == "causal" or mask is None and queries.shape[2] == 1
+        return attention.invariant_attention(queries, keys, values, scale) if causal else None
+    batch = getattr(sys.modules.get("mlx_vlm.models.cache"), "BatchKVCache", None)
+    if batch is None or any(getattr(type(cache), name, None) is not getattr(batch, name)
+                            for name in ("update_and_fetch", "extract", "make_mask")):
+        return None
+    pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
+    pads = pads or (sys.modules["mlx_vlm.models.qwen3_5.language"]._qwen3_5_left_padding_info(cache) or ((),))[0]
+    if len(pads) != queries.shape[0] or not 0 <= min(pads) <= max(pads) <= keys.shape[2] - queries.shape[2]:
+        return None
+    if len(set(pads)) == 1:
+        return attention.invariant_attention(queries, keys[:, :, pads[0]:], values[:, :, pads[0]:], scale)
+    return mx.concatenate([attention.invariant_attention(queries[i:i + 1], keys[i:i + 1, :, pad:], values[i:i + 1, :, pad:], scale)
+                           for i, pad in enumerate(pads)], axis = 0)
+
+
+def _invariant_attention_held(module):
+    return module.__dict__.get("_unsloth_invariant_attention", 0) > 0 and _bindings_intact(module._unsloth_invariant_bindings)
+
+
+@functools.cache
+def _invariant_attention_class(base):
+    call = base.__call__
+    helper, padded = call.__globals__["scaled_dot_product_attention"], call.__globals__["_qwen3_5_left_padded_attention"]
+
+    def attend(queries, keys, values, cache, scale, mask, sinks = None, **kwargs):
+        out = None
+        if sinks is None and not kwargs and queries.shape[2] == 1:   # prefill stays stock
+            out = _invariant_attention(queries, keys, values, scale, cache, mask)
+        return helper(queries, keys, values, cache, scale, mask, sinks = sinks, **kwargs) if out is None else out
+
+    def attend_padded(queries, keys, values, *, cache, scale, mask):
+        out = _invariant_attention(queries, keys, values, scale, cache, mask) if queries.shape[2] == 1 else None
+        return padded(queries, keys, values, cache = cache, scale = scale, mask = mask) if out is None else out
+
+    def decode_call(self, *args, **kwargs):
+        if _invariant_attention_held(self) and not self.training:
+            routed = FunctionType(call.__code__, {**call.__globals__, "scaled_dot_product_attention": attend,
+                                                  "_qwen3_5_left_padded_attention": attend_padded},
+                                  call.__name__, call.__defaults__, call.__closure__)
+            routed.__kwdefaults__ = call.__kwdefaults__
+            return routed(self, *args, **kwargs)
+        return call(self, *args, **kwargs)
+
+    return type(f"_InvariantAttention{base.__name__}", (base,), {"__call__": decode_call, "_unsloth_invariant_native": base})
+
+
+@contextmanager
+def row_invariant_attention(model, *, _modules = None):
+    """Fast Verify, on Apple GPUs: the KV-cache attention of one-token
+    decode steps and of the exact verifier's blocks runs on `attention.invariant_attention`, whose rows do not depend
+    on the block, so verify rows stay Fast Verify's one-token decoding while a block reads each key once for all its
+    rows. Not stock's bits (within fp32 reordering of stock attention); prefill stays stock. A subprocess probe gates
+    the kernel; other, training and distributed models keep their methods.
+    """
+    changed = []
+    try:
+        with _VERIFY_LOCK:
+            calls = {}
+            for family in SPECULATIVE_FAMILIES.values():
+                pins = family.capabilities.get("invariant_attention")
+                # Decode and verify switch together: both need every body either side pins.
+                parts = [] if pins is None else [_resolved_bindings(c) for c in (pins, family.contract, family.capabilities["attention"])]
+                if parts and None not in parts:
+                    calls.update((target, sum(parts, [])) for _, name, target in parts[0] if name == "__call__")
+            # Off where the lane projections are (`fast_verify_enabled`).
+            if (calls and _lane_coverage(model, _modules)[3] and _resolved_bindings(_NAX_QMM_CONTRACT) is not None
+                    and nax.kernel_probe_passed(matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available)
+                    and nax.kernel_probe_passed(attention.INVARIANT_PROBE_KEY, attention.__name__, "probe_invariant_attention",
+                                                attention.invariant_attention_available)):
+                for _, module in _fusion_modules(model, _modules):
+                    if not isinstance(module, nn.Module) or module.training:
+                        continue
+                    if "_unsloth_invariant_native" not in vars(type(module)):
+                        if getattr(type(module), "__call__", None) not in calls:
+                            continue
+                        module.__dict__["_unsloth_invariant_bindings"] = calls[type(module).__call__]
+                        module.__class__ = _invariant_attention_class(type(module))
+                    module._unsloth_invariant_attention = module.__dict__.get("_unsloth_invariant_attention", 0) + 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for module in reversed(changed):
+                module._unsloth_invariant_attention -= 1
+                if not module._unsloth_invariant_attention:
+                    for name in ("_unsloth_invariant_attention", "_unsloth_invariant_bindings"):
+                        module.__dict__.pop(name)
+                    module.__class__ = type(module)._unsloth_invariant_native
+
+
+class _TargetHeadFP32(nn.Module):
+    def __init__(self, head, bindings):
+        super().__init__()
+        self.base_head = head
+        self._training = head.training
+        self._bindings = bindings
+        self._head_type, self._head_call = type(head), type(head).__call__
+        self._layout = (head.group_size, head.bits, head.mode)
+        self._scopes = 0
+
+    def __call__(self, x):
+        p = self.base_head
+        if (os.environ.get(_LANE_QMM_ROUTE.switch, "1") == "0"
+                or p.training or getattr(_LANE_STATE, "native", False) or "bias" in p
+                or type(p) is not self._head_type or type(p).__call__ is not self._head_call
+                or not _bindings_intact(self._bindings) or not isinstance(x, mx.array) or x.ndim < 2
+                or not x.shape[-1] or not 1 <= x.size // x.shape[-1] <= matmul.LANE_QMM_MAX_ROWS
+                or x.dtype not in (mx.bfloat16, mx.float16)
+                or self._layout != (p.group_size, p.bits, p.mode) or not p.__dict__.get("_unsloth_lane_qmm")):
+            return p(x)
+        ready = p.__dict__.get("_unsloth_lane_qmm_ready", {}).get(x.shape)
+        if ready is None:
+            original = p(x)
+            ready = p.__dict__.get("_unsloth_lane_qmm_ready", {}).get(x.shape)
+            if ready is None:
+                return original
+        w, scales, biases = p.get("weight"), p.get("scales"), p.get("biases")
+        if (not all(isinstance(a, mx.array) for a in (w, scales, biases)) or ready[1] != (
+                x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape,
+                p.group_size, p.bits, p.mode)):
+            return p(x)
+        y = matmul.lane_qmm(x.reshape(-1, x.shape[-1]), w, scales, biases, p.group_size, p.bits, output_dtype = mx.float32)
+        return y.reshape(*x.shape[:-1], w.shape[0])
+
+
+@contextmanager
+def target_head_precision(model, *, _modules = None):
+    """Keep small-row target logits in fp32 under Fast Verify; the drafter retains its original head."""
+    owners = []
+    try:
+        with _VERIFY_LOCK:
+            bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+            for _, owner in tuple(_fusion_modules(model, _modules)) if bindings is not None else ():
+                head = owner.get("lm_head") if isinstance(owner, nn.Module) else None
+                if isinstance(head, _TargetHeadFP32):
+                    replacement = head
+                elif (isinstance(head, nn.Module) and not head.training and "bias" not in head
+                      and getattr(head, "bits", None) in (4, 8) and head.__dict__.get("_unsloth_lane_qmm")):
+                    replacement = _TargetHeadFP32(head, bindings)
+                    owner.lm_head = replacement
+                else:
+                    continue
+                replacement._scopes += 1
+                owners.append((owner, replacement))
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for owner, replacement in reversed(owners):
+                replacement._scopes -= 1
+                if not replacement._scopes and owner.get("lm_head") is replacement:
+                    owner.lm_head = replacement.base_head
 
 
 def lane_drafter_projections(model) -> int:
@@ -6845,6 +7333,8 @@ def lane_drafter_projections(model) -> int:
 def lane_drafter_head(model, head) -> bool:
     """Give a drafter holding `head`, its target's quantized head, its own module over the same arrays on the lane
     kernel, as its projections are; the target's module keeps its path. Whether it did."""
+    if model.get("lm_head") is head and isinstance(head, _TargetHeadFP32):
+        model.lm_head = head = head.base_head
     if model.get("lm_head") is not head or not isinstance(head, nn.QuantizedLinear):
         return False
     own = copy.copy(head)
@@ -7313,7 +7803,7 @@ def _decode_attention(queries, keys, values, scale):
 
 # Query heads per KV head served by default: at 8 (E2B, 26B-A4B, 31B) MLX decodes a lone query on the same
 # vector kernel, so each verify row is the attention a decode step computes. At 4 (E4B) decode stays unfused
-# and the kernel only changes rounding, so it is opt-in with UNSLOTH_MLX_VERIFY_ATTENTION=1. At 16 (12B) the
+# and the kernel only changes rounding, so it waits for Fast Verify. At 16 (12B) the
 # unfused attention is already as fast.
 _VERIFY_ATTENTION_GQA = (8,)
 _VERIFY_ATTENTION_OPT_IN_GQA = (4,)
@@ -7323,9 +7813,8 @@ _VERIFY_ATTENTION_LOCK = RLock()
 _VERIFY_ATTENTION_VERDICTS = {}
 
 
-def _verify_attention_serves(gqa):
-    return gqa in _VERIFY_ATTENTION_GQA or (
-        gqa in _VERIFY_ATTENTION_OPT_IN_GQA and os.environ.get("UNSLOTH_MLX_VERIFY_ATTENTION", "0") == "1")
+def _verify_attention_serves(gqa, fast_verify):
+    return gqa in _VERIFY_ATTENTION_GQA or (gqa in _VERIFY_ATTENTION_OPT_IN_GQA and fast_verify)
 
 
 def _two_pass_keys(keys):
@@ -7456,7 +7945,7 @@ def fused_decode_attention(model, *, _modules = None):
                 module.__class__ = type(module)._unsloth_wide_attention_native
 
 
-def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
+def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache, fast_verify = False):
     """A verify block's head-dim-512 causal attention on MLX's vector kernel, or None for the native call."""
     if not (isinstance(mask, str) and mask == "causal" and (cache is None or type(cache) is kv_cache)
             and queries.ndim == 4 and queries.shape[0] == 1 and keys.shape == values.shape
@@ -7464,7 +7953,7 @@ def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
             and queries.dtype in (mx.bfloat16, mx.float16) and queries.dtype == keys.dtype == values.dtype
             and 2 <= queries.shape[2] <= min(_VERIFY_ATTENTION_ROWS, keys.shape[2])
             and keys.shape[1] and queries.shape[1] % keys.shape[1] == 0
-            and _verify_attention_serves(queries.shape[1] // keys.shape[1])
+            and _verify_attention_serves(queries.shape[1] // keys.shape[1], fast_verify)
             and _two_pass_keys(keys.shape[2] - queries.shape[2] + 1)
             and _vector_attention_kernels() is not None):
         return None
@@ -7516,7 +8005,8 @@ def _verify_attention_class(base):
         return None
 
     def attention(queries, keys, values, cache, scale, mask, sinks = None):
-        out = None if sinks is not None else _verify_attention(queries, keys, values, cache, scale, mask, kv_cache)
+        out = None if sinks is not None else _verify_attention(queries, keys, values, cache, scale, mask, kv_cache,
+                                                               _VERIFY_STATE.attention_fast_verify)
         return native(queries, keys, values, cache = cache, scale = scale, mask = mask) if out is None else out
 
     routed = FunctionType(call.__code__, {**namespace, "scaled_dot_product_attention": attention},
@@ -7526,6 +8016,7 @@ def _verify_attention_class(base):
     def verify_call(self, *args, **kwargs):
         if (getattr(_VERIFY_STATE, "attention", False) and not self.training
                 and namespace.get("scaled_dot_product_attention") is native and _bindings_intact(bindings)):
+            _VERIFY_STATE.attention_fast_verify = self.__dict__.get("_unsloth_verify_attention_fast_verify", False)
             return routed(self, *args, **kwargs)
         return call(self, *args, **kwargs)
 
@@ -7545,6 +8036,17 @@ def verify_block_attention():
 
 
 @contextmanager
+def deeper_causal_verify(rows: int):
+    """Admit causal verify blocks of up to ``rows`` query rows to `_native_causal_attention` for the forwards built inside."""
+    outer = getattr(_VERIFY_STATE, "causal_rows", _NATIVE_CAUSAL_ROWS)
+    _VERIFY_STATE.causal_rows = rows
+    try:
+        yield
+    finally:
+        _VERIFY_STATE.causal_rows = outer
+
+
+@contextmanager
 def fused_verify_attention(model, *, _modules = None):
     """Run Gemma 4's head-dim-512 attention for a speculative verify block on MLX's vector kernel.
 
@@ -7552,7 +8054,7 @@ def fused_verify_attention(model, *, _modules = None):
     step's at long context. Inside `verify_block_attention`, an eligible single-sequence causal block with 8
     query heads per KV head runs on a copy of MLX's own two-pass vector kernel instead, once its first launch
     of that shape matched, row by row and bit for bit, the attention a decode step computes; 4 query heads per
-    KV head join with `UNSLOTH_MLX_VERIFY_ATTENTION=1`. Other calls, training and distributed models keep the
+    KV head join under Fast Verify. Other calls, training and distributed models keep the
     native attention. Instance classes are restored when the context exits.
     """
     changed = []
@@ -7576,6 +8078,7 @@ def fused_verify_attention(model, *, _modules = None):
                     if patched is not None:
                         module.__class__ = patched
                         module._unsloth_verify_attention_scopes = 1
+                        module._unsloth_verify_attention_fast_verify = _fast_verify_held(model)
                         changed.append(module)
         yield model
     finally:
@@ -7586,6 +8089,7 @@ def fused_verify_attention(model, *, _modules = None):
                     module._unsloth_verify_attention_scopes = scopes - 1
                     continue
                 module.__dict__.pop("_unsloth_verify_attention_scopes", None)
+                module.__dict__.pop("_unsloth_verify_attention_fast_verify", None)
                 native = getattr(type(module), "_unsloth_verify_attention_native", None)
                 if native is not None:
                     module.__class__ = native
@@ -8153,13 +8657,15 @@ def speculative_call(model, *, _modules = None):
 class InferenceScope(NamedTuple):
     """`serves`: call traits that admit it (empty admits all). `speculative`: entered only by a call naming that trait,
     which None does not, so a plain generation never pays for it. `opt_in`: env switch that must be "1".
-    `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument."""
+    `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument.
+    `fast_verify`: entered only under the generation's Fast Verify decision."""
     enter: Callable
     serves: frozenset = frozenset()
     speculative: bool = False
     opt_in: str = None
     int8_prefill: bool = False
     ane_prefill: bool = False
+    fast_verify: bool = False
 
     @property
     def name(self):
@@ -8171,6 +8677,21 @@ class InferenceScope(NamedTuple):
         if self.speculative:
             return call is not None and "speculative" in call
         return call is None or not self.serves or not self.serves.isdisjoint(call)
+
+
+# The model families the exact speculative scopes serve.
+SPECULATIVE_FAMILIES = {
+    "qwen3_5": SpeculativeFamily(
+        language = "mlx_vlm.models.qwen3_5.language", target = "_EXACT_SPECULATIVE_VERIFIER",
+        module = "mlx_vlm.models.qwen3_5.speculative_verifier", forward = "Qwen3_5BatchInvariantForward",
+        entry = "verify", submit_layers = True, contract = _EXACT_VERIFY_CONTRACT,
+        capabilities = {"attention": _EXACT_ATTENTION_CONTRACT, "lanes": {},
+                        "invariant_attention": _INVARIANT_ATTENTION_CONTRACT}),
+    "qwen4_exp": SpeculativeFamily(
+        language = "mlx_vlm.models.qwen4_exp.language", target = "_QWEN4_BATCH_INVARIANT_FORWARD",
+        module = "mlx_vlm.models.qwen4_exp.language", forward = "Qwen4ExpBatchInvariantForward",
+        entry = "__call__", submit_layers = False, contract = _QWEN4_FORWARD_CONTRACT),
+}
 
 
 # Outermost first; every generation path (Studio included) enters these. A scope that is not bitwise stock
@@ -8197,6 +8718,9 @@ INFERENCE_SCOPES = [
     InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(speculative_call, speculative = True),
+    InferenceScope(row_invariant_lane_projections, speculative = True, fast_verify = True),
+    InferenceScope(row_invariant_attention, speculative = True, fast_verify = True),
+    InferenceScope(target_head_precision, speculative = True, fast_verify = True),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
     InferenceScope(fused_decode_attention),
     InferenceScope(exact_ple_row_reads),
@@ -8206,19 +8730,30 @@ INFERENCE_SCOPES = [
 
 
 @contextmanager
-def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = None, on_error = None, _modules = None):
+def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = None, fast_verify = None, on_error = None,
+                     _modules = None):
     """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation, short of
     the scopes only a call naming "speculative" enters.
 
     Traits this zoo does not know are ignored. A scope that raises on entry propagates unless `on_error` is
     given: then `on_error(name, error)` runs and, if it returns, the generation continues without that scope.
+
+    `fast_verify=True`, or `UNSLOTH_MLX_FAST_VERIFY=1` when it is None, runs every speculative speedup that changes
+    decode bits, in a call naming "speculative": its greedy output is within fp32 reordering of stock's, not equal to it.
+    A plain generation stays stock whatever this says. The outermost scope decides,
+    and a model with a drafter keeps what `companion_drafter(fast_verify = ...)` pinned, refusing the opposite request.
+    `fast_verify_available(model)` says whether it takes effect here.
     """
     if call is not None:
         call = frozenset((call,) if isinstance(call, str) else call)
     modules = tuple(_fusion_modules(model, _modules))
+    decided = _fast_verify_decision(model, fast_verify)
     with ExitStack() as stack:
+        # Held before any scope enters, so a scope that steps aside for it sees it.
+        _hold_fast_verify(model, decided)
+        stack.callback(_release_fast_verify, model)
         for scope in INFERENCE_SCOPES:
-            if not scope.admits(call):
+            if not scope.admits(call) or (scope.fast_verify and not decided):
                 continue
             args = (int8_prefill,) if scope.int8_prefill else (ane_prefill,) if scope.ane_prefill else ()
             try:
@@ -8233,15 +8768,20 @@ def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = N
 _WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17 rows)
 
 
-def warm_inference(model, int8_prefill = None, ane_prefill = None):
+def warm_inference(model, int8_prefill = None, ane_prefill = None, fast_verify = None):
     """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
     first-use checks; checks keyed by a request's row count still run then."""
     speculates = getattr(model, "_unsloth_speculates", False)   # set by building a drafter for it
-    with inference_scopes(model, ("speculative",), int8_prefill = int8_prefill, ane_prefill = ane_prefill) if speculates else nullcontext():
+    with (inference_scopes(model, ("speculative",), int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify)
+          if speculates else nullcontext()):
         model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
-                       int8_prefill = int8_prefill, ane_prefill = ane_prefill)
+                       int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify)
     _warm_qmv_rows(model)
     _warm_verify_gdn(model)
+    if speculates:
+        from .speculative import warm_speculative_rounds
+
+        warm_speculative_rounds(model)
 
 
 def _warm_verify_gdn(model):
