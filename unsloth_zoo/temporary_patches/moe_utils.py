@@ -5449,7 +5449,7 @@ def forward_triton_grouped_gemm(
     # dtype.
     gemm_hidden_states = hidden_states if hidden_states.dtype == compute_dtype else hidden_states.to(compute_dtype)
 
-    # Configs are fit to the operand dtypes and card (shared-memory limits), so re-select after module.to(dtype/device).
+    # Configs depend on operand dtypes and device (shared-memory limits): re-select after module.to().
     configs_key = (
         gemm_hidden_states.dtype,
         compute_dtype,
@@ -5462,7 +5462,7 @@ def forward_triton_grouped_gemm(
     if self._unsloth_moe_configs is not None:
         cached_key = getattr(self, "_unsloth_moe_configs_key", None)
         if cached_key is None:
-            # Configs set by the caller without a key are trusted for the current operands.
+            # Caller-preset configs without a key are trusted.
             self._unsloth_moe_configs_key = configs_key
         elif cached_key != configs_key:
             self._unsloth_moe_configs = None
