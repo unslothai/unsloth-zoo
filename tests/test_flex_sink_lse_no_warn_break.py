@@ -22,7 +22,10 @@ import torch
 fa = pytest.importorskip("torch.nn.attention.flex_attention")
 U = pytest.importorskip("unsloth_zoo.flex_attention.utils")
 if not U.HAS_FLEX_ATTENTION:
-    pytest.skip("flex attention is unavailable (no GPU or torch too old)", allow_module_level = True)
+    if torch.cuda.is_available():
+        # A GPU with torch's flex module must have it enabled: a silent skip would hide a broken probe.
+        raise AssertionError("HAS_FLEX_ATTENTION is False on a CUDA host with torch flex_attention")
+    pytest.skip("flex attention needs a GPU", allow_module_level = True)
 S = pytest.importorskip("unsloth_zoo.flex_attention.attention_sink")
 
 
