@@ -149,6 +149,19 @@ def test_padded_prefill_mask_keeps_batch_only(builds):
 
 @cuda
 @pytest.mark.parametrize("sliding_window", [None, 128])
+def test_padded_training_bool_mask_matches_integer(builds, sliding_window):
+    attn = _attn(sliding_window)
+    mask = torch.ones(2, 384, dtype = torch.bool, device = "cuda")
+    mask[0, :17] = False
+    got = _step(attn, attention_mask = mask)
+    ref = _step(attn, attention_mask = mask.to(torch.int64))
+    assert builds == [(2, None), (2, None)]
+    for a, b in zip(got, ref):
+        assert torch.equal(a, b)
+
+
+@cuda
+@pytest.mark.parametrize("sliding_window", [None, 128])
 def test_broadcast_mask_equals_full_mask(sliding_window):
     utils, _ = _mods()
     mm = utils.generate_sliding_window_mask(sliding_window) if sliding_window else utils.causal_mask
