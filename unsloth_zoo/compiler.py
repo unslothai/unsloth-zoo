@@ -5006,11 +5006,14 @@ torch_is_compiling = torch.compiler.is_compiling
 # compiled block (e.g. the VLM decoder MLP), forward and backward; fixed in 2.10 (unsloth#3271).
 torch_lora_no_compiled_addmm = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 10)
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
-def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
-    # Use result.dtype (bfloat16 from base layer) since x may have been cast to float32
-    # by _cast_input_dtype when autocast is disabled
-    target_dtype = result.dtype
-    xA = dropout(x).to(target_dtype) @ lora_A.weight.to(target_dtype).t()
+def lora_forward(result, lora_A, lora_B, dropout, x, scaling, skip_npu_casts = False):
+    # The NPU fast path keeps the original FP32 weight cast targets. Changing them
+    # to result.dtype also changes the cast/transpose backward path for LoRA B.
+    target_dtype = lora_A.weight.dtype if skip_npu_casts else result.dtype
+    lora_x = dropout(x)
+    if not skip_npu_casts:
+        lora_x = lora_x.to(target_dtype)
+    xA = lora_x @ lora_A.weight.to(target_dtype).t()
     if torch_lora_no_compiled_addmm and torch_is_compiling():
         output = result + scaling * (xA @ lora_B.weight.to(target_dtype).t())
         bias = lora_B.bias
@@ -5079,6 +5082,64 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
 pass
 
 """
+
+
+# Included only in the plain PEFT Linear template, never quantized/variant templates.
+NPU_LORA_CASTS = """
+from peft.tuners.lora.layer import Linear as _UnslothPeftLinear
+
+def _npu_lora_can_skip_casts(layer, x, result, lora_A, lora_B, dropout, adapter):
+    if (
+        type(layer) is not _UnslothPeftLinear
+        or type(x) is not torch.Tensor or type(result) is not torch.Tensor
+        or x.device.type != "npu" or result.device != x.device
+        or x.dtype != torch.bfloat16 or result.dtype != torch.bfloat16
+        or torch_is_compiling() or torch.is_autocast_enabled()
+        or not torch.is_autocast_enabled("npu")
+        or torch.get_autocast_dtype("npu") != torch.bfloat16
+        or layer.disable_adapters or layer.merged or layer.fan_in_fan_out
+        or len(layer.active_adapters) != 1 or adapter in layer.lora_variant
+        or type(layer.base_layer) is not torch.nn.Linear
+        or layer.base_layer.weight.dtype != torch.bfloat16
+        or layer.base_layer.weight.requires_grad
+    ):
+        return False
+    return (
+        type(lora_A) is torch.nn.Linear and type(lora_B) is torch.nn.Linear
+        and lora_A.weight.dtype == lora_B.weight.dtype == torch.float32
+        and lora_A.bias is None and lora_B.bias is None
+        and (type(dropout) is torch.nn.Identity
+             or (type(dropout) is torch.nn.Dropout and dropout.p == 0))
+    )
+"""
+
+
+def _patch_npu_lora_casts(source):
+    # Keep unfamiliar PEFT forwards unchanged. The caller restricts this to plain Linear.
+    cast = (
+        "if not torch.is_autocast_enabled(): result, x = "
+        "result.to(lora_A.weight.dtype), x.to(lora_A.weight.dtype)"
+    )
+    update = "lora_forward(result, lora_A, lora_B, dropout, x, scaling)"
+    if source.count(cast) != 1 or source.count(update) != 1:
+        return source
+    guard = (
+        'not args and not kwargs and x.device.type == "npu" and '
+        "_npu_lora_can_skip_casts(self, x, result, lora_A, lora_B, dropout, active_adapter)"
+    )
+    source = source.replace(
+        cast,
+        f"unsloth_skip_npu_casts = ({guard})\n"
+        + " " * (len(source[: source.index(cast)].rsplit("\n", 1)[-1]))
+        + cast.replace(
+            "if not torch.is_autocast_enabled()",
+            "if not unsloth_skip_npu_casts and not torch.is_autocast_enabled()",
+        ),
+    )
+    return source.replace(
+        update,
+        "lora_forward(result, lora_A, lora_B, dropout, x, scaling, skip_npu_casts = unsloth_skip_npu_casts)",
+    )
 
 
 # Both spellings PEFT uses for the LoRA input cast, as (statement, expression).
@@ -5184,6 +5245,8 @@ pass
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
+    from peft.tuners.lora.layer import Linear as PeftLinear
+
     success = 0
     could_not_replace_modules = []
     force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0")
@@ -5272,6 +5335,11 @@ def patch_lora_forwards(torch_compile_options):
 
             # For 8-bit layers, the base_layer call was already replaced above.
             source = _patch_lora_base_layer_input_cast(source)
+            if function is PeftLinear and force_float32 == "0":
+                npu_source = _patch_npu_lora_casts(source)
+                if npu_source != source:
+                    source = npu_source
+                    compiled_lora_forward += NPU_LORA_CASTS
 
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module.
