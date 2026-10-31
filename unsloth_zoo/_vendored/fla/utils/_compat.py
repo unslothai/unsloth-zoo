@@ -5,7 +5,9 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import functools
 import inspect
+from importlib.util import find_spec
 
 import triton
 from packaging import version as package_version
@@ -24,3 +26,12 @@ TRITON_ABOVE_3_8_0 = package_version.parse(triton.__version__) >= package_versio
 
 SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters
 autotune_cache_kwargs = {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
+
+
+# Unsloth: backported from fla PR #996. BaseBackend.is_available() runs on every dispatched
+# call (the dispatch loop bypasses the cached can_use() to stay traceable), and an uncached
+# find_spec of a missing package (flash_kda for every chunk_kda forward and backward) costs
+# tens of microseconds of host time per call.
+@functools.cache
+def find_spec_cached(name):
+    return find_spec(name)
