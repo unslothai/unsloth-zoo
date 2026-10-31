@@ -1767,7 +1767,7 @@ def _probe_torch_grouped_mm_supported(device = None):
         _TORCH_GROUPED_MM_SUPPORTED = False
     else:
         _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
-    # Same eager region, as for other GPU models: a cold compiled first block must not graph-break on the view check.
+    # Answer the view check here so a cold compiled block does not graph-break on it.
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is None:
         _TRANSPOSED_VIEW_GROUPED_MM_SAFE = _TORCH_GROUPED_MM_SUPPORTED and _transposed_view_probe(device)
     return _TORCH_GROUPED_MM_SUPPORTED

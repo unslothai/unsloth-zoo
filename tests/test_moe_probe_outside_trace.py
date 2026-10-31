@@ -137,8 +137,7 @@ def test_definitive_negative_does_not_break_a_fullgraph_trace(monkeypatch):
 
 
 def test_home_support_probe_also_answers_the_view_check(monkeypatch):
-    # A cold compiled block reaches _transposed_view_safe_on after the backend probe ran at load: answering it in the
-    # same eager region keeps that first trace free of a compiler-disabled call (graph break, fullgraph error).
+    # The view check must be answered in the load-time eager probe, else a cold compiled block graph-breaks on it.
     from unsloth_zoo.temporary_patches import moe_utils
 
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", None)
