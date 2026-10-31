@@ -31,6 +31,9 @@ from unsloth_zoo.tiling_registry import _bucket  # noqa: E402
 TILE_ROWS = 1024
 SEQS = [1000, 1024, 1500, 2048, 3000, 4096, 5000, 8192, 12000, 16384, 20000, 32768]
 N_BUCKETS = len({_bucket(s, TILE_ROWS) for s in SEQS})
+# Inductor builds C++ for every bucket, up to 32 tiles at 32768 rows: minutes per test on a CPU runner. Its
+# recompile, break and hop counts come from the same Dynamo graph as aot_eager's, which sweeps all of SEQS.
+INDUCTOR_SEQS = SEQS[:6]
 
 
 class _Counter:
@@ -121,12 +124,16 @@ def _check(cnt, breaks, n_buckets, dynamic):
 BACKENDS = ["aot_eager", "inductor"]
 
 
+def _seqs(backend):
+    return INDUCTOR_SEQS if backend == "inductor" else SEQS
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dynamic", [None, True])
 def test_dense_mlp(backend, dynamic):
     torch.manual_seed(0)
     m = GatedMLP()
-    _check(*_sweep(_mlp_fn(m), list(m.parameters()), backend, dynamic), dynamic)
+    _check(*_sweep(_mlp_fn(m), list(m.parameters()), backend, dynamic, seqs = _seqs(backend)), dynamic)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -134,7 +141,7 @@ def test_dense_mlp(backend, dynamic):
 def test_frozen_input_lora(backend, dynamic):
     m = lora_mlp()
     params = [p for p in m.parameters() if p.requires_grad]
-    _check(*_sweep(_mlp_fn(m), params, backend, dynamic, x_grad = False), dynamic)
+    _check(*_sweep(_mlp_fn(m), params, backend, dynamic, seqs = _seqs(backend), x_grad = False), dynamic)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
