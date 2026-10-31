@@ -41,6 +41,8 @@ __all__ = [
     "MHC_SINKHORN_REPLACEMENT",
     "MHC_PROJECTION_SOURCE",
     "MHC_PROJECTION_REPLACEMENT",
+    "MHC_PROJECTION_SOURCE_VIEW",
+    "MHC_PROJECTION_REWRITES",
 ]
 
 
@@ -84,6 +86,22 @@ MHC_PROJECTION_REPLACEMENT = (
     "        pre_w, post_w, comb_w = unsloth_mhc_projection(hidden_streams, self.input_norm, self.fn).split(\n"
     "            [hc, hc, hc * hc], dim=-1\n"
     "        )\n"
+)
+
+# transformers 5.21+ layout of the same projection (view instead of flatten, one statement per step).
+MHC_PROJECTION_SOURCE_VIEW = (
+    "        flattened = hidden_streams.view(batch_size, seq_len, -1).float()\n"
+    "        flattened = self.input_norm(flattened)\n"
+    "        # Mix the streams together to infer the weight coefficients\n"
+    "        flattened = F.linear(flattened, self.fn.float())\n"
+    "        # Split the weight coefficients\n"
+    "        pre_w, post_w, comb_w = flattened.split([hc, hc, hc * hc], dim=-1)\n"
+)
+
+# (old, new) pairs tried in order; the first that occurs exactly once is applied.
+MHC_PROJECTION_REWRITES = (
+    (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT),
+    (MHC_PROJECTION_SOURCE_VIEW, MHC_PROJECTION_REPLACEMENT),
 )
 
 

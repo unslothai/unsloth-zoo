@@ -69,6 +69,7 @@ from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_REPLACEMENT,
     MHC_PROJECTION_SOURCE,
     MHC_PROJECTION_REPLACEMENT,
+    MHC_PROJECTION_REWRITES,
     mhc_fast_mode,
 )
 from importlib.metadata import version as importlib_version
@@ -287,25 +288,27 @@ MODULE_FORWARD_SOURCE_REWRITES = {
 }
 
 
-# {model_type: {class: (old, new)}}: forward rewrites applied whether or not the class compiles; the eager mixer saves
-# its FP32 upcast for backward, compiled blocks do not; the helper keeps stock math under torch.compile.
+# {model_type: {class: ((old, new), ...)}}: forward rewrites applied whether or not the class compiles; the eager mixer
+# saves its FP32 upcast for backward, compiled blocks do not; the helper keeps stock math under torch.compile.
+# One (old, new) pair per transformers layout; the first that occurs exactly once is applied.
 MODULE_FORWARD_EAGER_REWRITES = {
-    "deepseek_v4": {"DeepseekV4HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
-    "deepseek_v41": {"DeepseekV41HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
-    "glm5_next": {"Glm5NextTextHyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
+    "deepseek_v4": {"DeepseekV4HyperConnection": MHC_PROJECTION_REWRITES},
+    "deepseek_v41": {"DeepseekV41HyperConnection": MHC_PROJECTION_REWRITES},
+    "glm5_next": {"Glm5NextTextHyperConnection": MHC_PROJECTION_REWRITES},
 }
 
 
 def module_forward_eager_rewrites(modeling_file, model_type):
     """{class: rewritten forward source} for MODULE_FORWARD_EAGER_REWRITES that match exactly once."""
     applicable = {}
-    for name, (old, new) in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}).items():
+    for name, alternatives in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}).items():
         try:
             cls = getattr(modeling_file, name)
             source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
         except Exception:
             continue
-        if source.count(old) == 1:
+        old, new = next(((o, n) for o, n in alternatives if source.count(o) == 1), (None, None))
+        if old is not None:
             applicable[name] = source.replace(old, new)
             if "unsloth_mhc_projection" in new:
                 # Same reason as unsloth_sinkhorn_knopp below: block compile rebinds the forward
