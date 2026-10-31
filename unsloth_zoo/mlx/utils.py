@@ -6033,11 +6033,72 @@ def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
     return _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=pad_id)
 
 
-@dataclass(frozen=True)
+_INT32_MIN = -(2 ** 31)
+_INT32_MAX = 2 ** 31 - 1
+
+
+def _compact_token_row(values):
+    """Store one row of token ids or labels as a read-only int32 array (4 bytes per token instead of a tuple of Python
+    ints); anything that is not a 1-D integer sequence inside int32 keeps the historical tuple(int(x)) form, so
+    materialized batches and overflow errors are unchanged."""
+    wide = None
+    if isinstance(values, (list, tuple)):
+        # np.fromiter applies the same int() coercion per element and is the fastest list path.
+        try:
+            wide = np.fromiter(values, dtype=np.int64, count=len(values))
+        except (TypeError, ValueError, OverflowError):
+            wide = None
+    else:
+        try:
+            array = np.asarray(values)
+        except Exception:
+            array = None
+        if array is not None and array.ndim == 1 and array.dtype.kind in "iu":
+            wide = array
+    if wide is not None and (
+        wide.size == 0
+        or (int(wide.min()) >= _INT32_MIN and int(wide.max()) <= _INT32_MAX)
+    ):
+        compact = wide.astype(np.int32)
+        compact.flags.writeable = False
+        return compact
+    return tuple(int(token) for token in values)
+
+
+def _token_row_key(values):
+    if isinstance(values, np.ndarray):
+        return tuple(values.tolist())
+    return values
+
+
+def _count_supervised_labels(window):
+    """Number of entries != -100 in a label window (tuple or compact int32 array)."""
+    if isinstance(window, np.ndarray):
+        return int(np.count_nonzero(window != -100))
+    return len(window) - window.count(-100)
+
+
+@dataclass(frozen=True, eq=False)
 class _FiniteTextRow:
     input_ids: tuple
     offset: int = 0
     labels: tuple | None = None
+
+    # Compact rows hold numpy arrays, so compare and hash by values (a compact row equals its tuple twin).
+    def _key(self):
+        return (
+            _token_row_key(self.input_ids),
+            self.offset,
+            None if self.labels is None else _token_row_key(self.labels),
+        )
+
+    def __eq__(self, other):
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        return self._key() == other._key()
+
+    def __hash__(self):
+        return hash(self._key())
 
 
 def _finite_text_pad_width(raw_width, *, pad_to_multiple=0, minimum_width=1,
@@ -6243,9 +6304,9 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self._cce_capacities = {}
         if not enabled:
             return
-        # tuple.count scans in C and a schedule revisits rows, so neither the per-label compare nor the repeat visit
-        # reaches Python; label-masked corpora put every token of every row in this window, which is what makes the
-        # difference worth having.
+        # The count scans in C (tuple.count or a numpy compare) and a schedule revisits rows, so neither the per-label
+        # compare nor the repeat visit reaches Python; label-masked corpora put every token of every row in this
+        # window, which is what makes the difference worth having.
         row_counts = {}
 
         def supervised(row_index):
@@ -6257,8 +6318,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
                 if row.labels is None:
                     count = max(0, end - start)
                 else:
-                    window = row.labels[start:end]
-                    count = len(window) - window.count(-100)
+                    count = _count_supervised_labels(row.labels[start:end])
                 row_counts[row_index] = count
             return count
 
@@ -6293,11 +6353,15 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
                 continue
             row = self._rows[row_index]
             end = min(len(row.input_ids), self.max_seq_length, width)
-            selected.extend(
-                batch_row * (width - 1) + position - 1
-                for position in range(max(1, row.offset), end)
-                if row.labels is None or row.labels[position] != -100
-            )
+            start = max(1, row.offset)
+            if end <= start:
+                continue
+            positions = np.arange(start, end, dtype=np.int64)
+            if row.labels is not None:
+                positions = positions[
+                    np.asarray(row.labels[start:end], dtype=np.int64) != -100
+                ]
+            selected.extend((positions + (batch_row * (width - 1) - 1)).tolist())
         indices = np.full(capacity, -1, dtype=np.int32)
         indices[:len(selected)] = selected
         return (*batch, mx.array(indices))
@@ -6385,9 +6449,9 @@ def _finite_text_rows(tokenized, *, with_offsets=False):
             offset = 0
         rows.append(
             _FiniteTextRow(
-                tuple(int(token) for token in input_ids),
+                _compact_token_row(input_ids),
                 int(offset),
-                None if labels is None else tuple(int(token) for token in labels),
+                None if labels is None else _compact_token_row(labels),
             )
         )
     return tuple(rows)
@@ -12206,7 +12270,7 @@ def _create_ordered_text_plan(
         rows = _finite_text_rows(tokenized)
     else:
         rows = tuple(
-            _FiniteTextRow(tuple(int(token) for token in input_ids))
+            _FiniteTextRow(_compact_token_row(input_ids))
             for input_ids in tokenized
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
