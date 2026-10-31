@@ -37,8 +37,7 @@ from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 
 @pytest.fixture(autouse = True, scope = "module")
 def _reset_dynamo():
-    # The kernel's compiled chunk specializes per bias / shift; keep those entries
-    # from counting toward the recompile limit of later test modules.
+    # Reset so bias/shift-specialized compiled chunks don't count toward later modules' recompile limit.
     yield
     torch._dynamo.reset()
 

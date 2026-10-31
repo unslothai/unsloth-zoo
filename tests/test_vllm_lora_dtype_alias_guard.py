@@ -14,34 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The LoRA adapter dtype must never equal the dtype vLLM will hot-load it as.
-
-`load_lora(load_tensors = True)` passes the live training tensors into
-`LoRARequest(lora_tensors = ...)`. vLLM stores `tensor.to(device = None, dtype = ...)`,
-which returns the SAME OBJECT when the dtype already matches, and
-`LoRALayerWeights.optimize()` then runs `lora_b *= scaling` in place. With
-`lora_alpha != r` that multiply lands on the training weights and compounds once per
-generation, silently rotting a GRPO run.
-
-Two things keep that from happening, and only one of them is ours:
-
-  1. vLLM resolves `lora_dtype = "auto"` to the MODEL dtype (bf16 or fp16 here).
-     unsloth never sets `lora_dtype`, so this is always the model dtype.
-  2. `prepare_model_for_training` upcasts every trainable parameter, i.e. exactly the
-     LoRA adapter, to float32.
-
-fp32 != bf16, so `.to(dtype)` allocates a copy and the engine scales its own tensor.
-That is the ONLY reason stock GRPO is safe: the two facts live in different repos,
-neither documents the coupling, and dropping the upcast to save adapter memory looks
-like a free optimisation. It is not, and this test is the tripwire.
-
-Measured on a real engine (Llama-3.2-1B, r=16, 4 generation rounds, vLLM 0.15.1):
-
-    adapter fp32 / lora_dtype bf16   224/224 aliased, 0/448 optimize() hits, 0/224 drifted
-    adapter bf16 / lora_dtype bf16   224/224 aliased, 448/448 hits, 112/224 DRIFTED
-
-CPU only; does not import vLLM or build an engine.
-"""
+"""Adapter dtype must never equal the vLLM hot-load dtype (model dtype, since unsloth never sets lora_dtype); equal
+dtypes alias training weights and optimize() scales them in place when lora_alpha != r; the fp32 upcast prevents
+that, so never drop it to save memory."""
 import pytest
 import torch
 import torch.nn as nn
@@ -67,12 +42,8 @@ class _LoRALinear(nn.Module):
 
 
 class _TinyLoRA(nn.Module):
-    """A frozen base plus a trainable adapter, named the way peft names one.
-
-    The naming is load-bearing: prepare_model_for_training keys the upcast on the
-    substring ".lora_A." WITH the leading dot, so a flat `lora_A.weight` is not
-    upcast and the test would pass for the wrong reason.
-    """
+    """Frozen base plus trainable adapter named as peft names it: the upcast keys on the substring .lora_A. with the
+    leading dot, so a flat lora_A.weight would not be upcast."""
 
     def __init__(self, dtype, d_in = 16, d_out = 12, r = 4):
         super().__init__()
@@ -96,9 +67,7 @@ def _lora_dtypes(model):
 
 
 def _vllm_lora_dtype_for(model_dtype):
-    """What vLLM resolves `lora_dtype = "auto"` to. unsloth never passes lora_dtype,
-    so this is always the model dtype (vllm/config/lora.py: `if self.lora_dtype in
-    (None, "auto"): self.lora_dtype = model_config.dtype`)."""
+    """vLLM resolves lora_dtype None or auto to model_config.dtype (vllm/config/lora.py); unsloth never passes lora_dtype, so this is always the model dtype."""
     return model_dtype
 
 
@@ -107,8 +76,7 @@ def _vllm_lora_dtype_for(model_dtype):
 def test_adapter_dtype_never_matches_the_vllm_hot_load_dtype(
     model_dtype, float32_mixed_precision,
 ):
-    """The invariant. If this fails, `load_lora` starts shipping aliases of the live
-    training weights and GRPO corrupts silently whenever lora_alpha != r."""
+    """The invariant: if this fails, load_lora ships aliases of the live training weights and GRPO corrupts silently whenever lora_alpha != r."""
     model = _TinyLoRA(model_dtype)
     prepare_model_for_training(
         model,
@@ -129,12 +97,8 @@ def test_adapter_dtype_never_matches_the_vllm_hot_load_dtype(
 
 @pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float16])
 def test_adapter_is_upcast_to_float32(model_dtype):
-    """The mechanism, isolated from the mixed-precision default.
-
-    float32_mixed_precision = False is deliberate: with it True the adapter would be
-    fp32 anyway via mixed_precision_dtype, so the test would pass even with the
-    adapter upcast deleted and would pin nothing.
-    """
+    """The upcast alone, isolated from the mixed-precision default: float32_mixed_precision = False is deliberate, since
+    True makes the adapter fp32 via mixed_precision_dtype and the test would pin nothing."""
     model = _TinyLoRA(model_dtype)
     prepare_model_for_training(
         model, use_gradient_checkpointing = False, float32_mixed_precision = False,
@@ -147,17 +111,14 @@ def test_adapter_is_upcast_to_float32(model_dtype):
 
 
 def test_frozen_base_weights_are_not_upcast():
-    """The upcast must stay scoped to trainable params: upcasting the frozen base
-    would blow up memory and is not what protects us here."""
+    """The upcast must stay scoped to trainable params: upcasting the frozen base would blow up memory and is not what protects against aliasing."""
     model = _TinyLoRA(torch.bfloat16)
     prepare_model_for_training(model, use_gradient_checkpointing = False)
     assert model.q_proj.base_layer.weight.dtype == torch.bfloat16
 
 
 def test_aliasing_is_what_the_dtype_gap_prevents():
-    """Why the dtype gap matters at all: `.to()` returns the same object on a match
-    and a fresh one otherwise. This is torch behaviour, asserted so the docstring
-    above cannot quietly go stale."""
+    """Why the dtype gap matters: torch .to() returns the same object on a dtype match and a fresh one otherwise; asserted so the docs cannot quietly go stale."""
     training_weight = torch.randn(8, 4, dtype = torch.float32)
 
     same = training_weight.to(device = None, dtype = torch.float32)

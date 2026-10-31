@@ -1,23 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression tests for the import-time hf_transfer default.
-
-``unsloth_zoo/__init__.py`` turns ``HF_HUB_ENABLE_HF_TRANSFER`` on so downloads
-take the Rust transfer path. On Windows on ARM that path cannot complete a
-download at all: every fetch dies with "an error occurred while downloading
-using hf_transfer", and the identical fetch succeeds once it is off. Measured on
-a ``windows-11-arm`` runner, where disabling it took the same GGUF load from a
-500 to 4/4 passing inference checks.
-
-``sys.platform`` cannot be faked in a child that then imports the package (the
-stdlib reaches for ``_winapi``), which is why the sibling Windows branch in
-``test_alloc_conf_platform_matrix`` is covered by source inspection rather than
-by a real import. These tests go one step further than a string match: the
-detector, its assignment and the enablement block are extracted by AST and
-**executed** against a fake platform, with a fake ``ctypes`` swapped into
-``sys.modules`` so the IsWow64Process2 branch can be driven from Linux.
-"""
+"""Regression tests for the import-time hf_transfer default: unsloth_zoo/__init__.py enables HF_HUB_ENABLE_HF_TRANSFER,
+which fails every download on Windows ARM; the detector, assignment and enablement block are AST-extracted and
+executed against a fake platform and fake ctypes."""
 
 from __future__ import annotations
 
@@ -96,8 +82,7 @@ def _resolve(
     }
     body = [detect, assign, enable]
     code = compile(ast.Module(body = body, type_ignores = []), _INIT, "exec")
-    # The detector does `import ctypes` at call time, so swapping sys.modules is
-    # what lets a Linux box drive the Windows branch.
+    # The detector does import ctypes at call time, so swapping sys.modules is what lets a Linux box drive the Windows branch.
     patched = {"ctypes": ctypes_module} if ctypes_module is not None else {}
     with mock.patch.dict(sys.modules, patched):
         if ctypes_module is None:
@@ -117,11 +102,8 @@ class TestWindowsOnArm:
 
 
 class TestEmulatedX64:
-    """An x64 Python emulated on ARM64 reports AMD64 on Python < 3.12, which reads
-    only PROCESSOR_ARCHITECTURE/ARCHITEW6432 -- and Windows sets the latter for
-    32-bit processes only, so nothing in the env names the host. This is the
-    configuration anyone who installs the default python.org amd64 build on a
-    Windows ARM device lands in, and machine() alone leaves it broken."""
+    """The default python.org amd64 build on Windows ARM reports AMD64 on Python < 3.12 and the env names no host
+    (ARCHITEW6432 is set only for 32-bit), so machine() alone leaves it broken."""
 
     _ARM64 = 0xAA64  # IMAGE_FILE_MACHINE_ARM64
     _AMD64 = 0x8664  # IMAGE_FILE_MACHINE_AMD64
@@ -154,8 +136,7 @@ class TestEmulatedX64:
         assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
 
     def test_windows_without_the_api_does_not_raise(self):
-        # IsWow64Process2 is Windows 10 1709+; older hosts must not blow up at
-        # import, they just keep today's behaviour.
+        # IsWow64Process2 needs Windows 10 1709+; older hosts must not raise at import and keep today's behaviour.
         env = _resolve(
             platform_name = "win32",
             machine = "AMD64",
@@ -169,8 +150,7 @@ class TestEmulatedX64:
         assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
 
     def test_a_native_arm64_host_never_reaches_the_api(self):
-        # machine() already answers, so the ctypes path is not consulted; a
-        # fake that would report AMD64 must not flip the verdict.
+        # machine() already answers, so the ctypes path is not consulted; a fake reporting AMD64 must not flip the verdict.
         env = _resolve(
             platform_name = "win32",
             machine = "ARM64",
@@ -205,8 +185,7 @@ class TestEveryOtherPlatformIsUnchanged:
         assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
 
     def test_x64_windows_stays_enabled_whatever_the_env_says(self):
-        # machine() is the only signal; a leftover PROCESSOR_ARCHITEW6432 must
-        # not drag an x64 box into the guard.
+        # machine() is the only signal; a leftover PROCESSOR_ARCHITEW6432 must not drag an x64 box into the guard.
         env = _resolve(
             platform_name = "win32",
             machine = "AMD64",
@@ -217,8 +196,7 @@ class TestEveryOtherPlatformIsUnchanged:
 
 class TestPrecedence:
     def test_an_explicit_choice_is_never_overridden(self):
-        # Someone who sets it on Windows on ARM keeps it; the guard only chooses
-        # the default.
+        # An explicit HF_HUB_ENABLE_HF_TRANSFER set on Windows on ARM is kept; the guard only chooses the default.
         env = _resolve(
             platform_name = "win32",
             machine = "ARM64",
@@ -243,16 +221,13 @@ class TestPrecedence:
 
 class TestWiring:
     def test_the_guard_is_actually_read_by_the_enablement_block(self):
-        # Executing the statements in isolation proves the logic; this pins that
-        # the block in the file is the one the guard feeds, so the two cannot
-        # drift apart.
+        # Isolated execution proves the logic; this pins that the file's enablement block reads the guard, so the two cannot drift apart.
         _, _, enable = _statements()
         assert "_windows_on_arm" in ast.dump(enable.test)
         assert "_offline_env" in ast.dump(enable.test)
 
     def test_no_later_statement_re_enables_the_variable(self):
-        # Without this, appending one os.environ[...] = "1" anywhere below leaves
-        # every test above green while Windows on ARM is broken again.
+        # Without this, appending os.environ[...] = "1" anywhere below would leave every test green while Windows on ARM is broken again.
         detect, assign, enable = _statements()
         for node in _TREE.body:
             if node in (detect, assign, enable):
@@ -262,16 +237,15 @@ class TestWiring:
             )
 
     def test_the_guard_is_defined_above_the_block_that_reads_it(self):
-        # _statements() collects by node type, not source order, so it would
-        # happily execute an assignment that really sits below its use.
+        # _statements() collects by node type, not source order, so it would happily execute an assignment that really sits below its use.
         detect, assign, enable = _statements()
         assert detect.lineno < assign.lineno < enable.lineno
 
 
 class TestHfTransferNotInstalled:
-    """huggingface_hub < 1.0 refuses every download when the flag is on and the package is
-    missing, which is what failed tests/test_gemma3_processor_token_type_ids.py on the
-    transformers 4.57.6 leg. Leaving the flag off keeps the plain download path working."""
+    """huggingface_hub < 1.0 refuses every download when the flag is on without hf_transfer installed (broke
+    tests/test_gemma3_processor_token_type_ids.py on transformers 4.57.6); leaving the flag off keeps the plain
+    download path working."""
 
     def test_missing_hf_transfer_leaves_the_flag_off(self):
         env = _resolve(platform_name = "linux", machine = "x86_64", environ = {}, hf_transfer_installed = False)
@@ -295,8 +269,7 @@ def _probe():
 
 
 def test_a_spec_less_hf_transfer_stub_reads_as_not_installed(monkeypatch):
-    # find_spec raises ValueError for a sys.modules entry whose __spec__ is None; importing
-    # unsloth_zoo must not fail on a stub a harness put there.
+    # find_spec raises ValueError for a sys.modules entry whose __spec__ is None; importing unsloth_zoo must not fail on such a stub.
     stub = types.ModuleType("hf_transfer")
     stub.__spec__ = None
     monkeypatch.setitem(sys.modules, "hf_transfer", stub)

@@ -1,9 +1,6 @@
-"""Coverage for MLX LoRA adapter save/reload metadata persistence.
-
-Targets the helpers that infer rank/scale/dropout from live MLX LoRA modules
-(_get_mlx_dropout_probability, _infer_mlx_lora_rank, _enrich_mlx_adapter_config)
-and the reload-time wrapper that restores scale/dropout on older mlx-lm wrappers.
-"""
+"""Covers MLX LoRA adapter save/reload metadata: rank/scale/dropout inference (_get_mlx_dropout_probability,
+_infer_mlx_lora_rank, _enrich_mlx_adapter_config) and the reload wrapper that restores scale/dropout on older mlx-lm
+wrappers."""
 
 import os
 import sys
@@ -199,16 +196,14 @@ def test_enrich_does_not_raise_on_module_with_none_tensors():
 
 
 def test_infer_rank_rejects_one_dimensional_lora_b():
-    # Half-built pair: without the guard the raw-array branch returns lora_a's
-    # shape[-1] and persists nonsense rank metadata.
+    # Half-built pair: without the guard the raw-array branch returns lora_a's shape[-1] and persists nonsense rank metadata.
     mlx_utils = _load_utils()
     bad = _FakeLoRAModule((512, 4), (4,))
     assert mlx_utils._infer_mlx_lora_rank(bad) is None
 
 
 def test_normalize_mlx_lora_module_paths_handles_string_input():
-    # Hand-authored adapter_config.json files store a single path as a bare
-    # string; it must be wrapped, not iterated character by character.
+    # Hand-authored adapter_config.json files store a single path as a bare string; it must be wrapped, not iterated character by character.
     _load_utils()
     from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
 
@@ -221,8 +216,7 @@ def test_normalize_mlx_lora_module_paths_handles_string_input():
 
 
 def test_infer_rank_rejects_switch_lora_b_without_expert_prefix():
-    # MoE/Switch lora_a (num_experts, rank, in_dims) paired with a bare 2D
-    # lora_b (out_dims, rank) is malformed, not a plausible rank.
+    # MoE/Switch lora_a (num_experts, rank, in_dims) paired with a bare 2D lora_b (out_dims, rank) is malformed, not a plausible rank.
     mlx_utils = _load_utils()
     bad = _FakeLoRAModule((8, 4, 512), (512, 4))
     assert mlx_utils._infer_mlx_lora_rank(bad) is None
@@ -271,8 +265,7 @@ def test_typeerror_fallback_handles_shim_dropout_with_p_attr():
 
 
 def _trainer_loop_metadata(model):
-    # Mirror MLXTrainer.save_model()'s metadata extraction so the test
-    # tracks the trainer logic without depending on a real MLX runtime.
+    # Mirrors MLXTrainer.save_model()'s metadata extraction so the test tracks the trainer logic without needing a real MLX runtime.
     mlx_utils = _load_utils()
     rank = scale = dropout = None
     for _, m in model.named_modules():
@@ -299,9 +292,7 @@ def _trainer_loop_metadata(model):
 
 
 def test_trainer_metadata_loop_returns_none_when_no_lora_modules():
-    # No LoRA modules means we cannot produce trustworthy rank/scale/dropout.
-    # Returning None lets the caller omit the keys from adapter_config so
-    # reload fails loudly instead of silently scaling with rank=8.
+    # No LoRA modules means no trustworthy rank/scale/dropout: return None so the caller omits them and reload fails loudly, not silently scaling with rank=8.
     model = _FakeModel([
         ("layers.0.q_proj", types.SimpleNamespace()),
     ])
@@ -315,9 +306,7 @@ def test_trainer_metadata_loop_returns_none_when_rank_inference_fails():
 
 
 def test_trainer_metadata_loop_coerces_mxarray_scale_safely():
-    # LoRASwitchLinear stores scale as a per-expert mx.array. float() on a
-    # non-0-D array raises; the trainer loop must coerce via .item() and
-    # fall back to 1.0 if the array is wider than 0-D.
+    # LoRASwitchLinear stores scale as a per-expert mx.array; float() raises on non-0-D arrays, so coerce via .item() and fall back to 1.0 if wider than 0-D.
     class _ZeroDArray:
         def item(self):
             return 2.5
@@ -345,8 +334,7 @@ def test_trainer_metadata_loop_coerces_mxarray_scale_safely():
 
 
 def _build_trainer_adapter_dict(rank, scale, dropout, num_layers, hf_repo=""):
-    # Mirrors the dict-building gate in MLXTrainer.save_model: keys are only
-    # included when their source values are valid, so reload sees no sentinels.
+    # Mirrors the dict-building gate in MLXTrainer.save_model: keys are included only when their source values are valid, so reload sees no sentinels.
     cfg = {
         "fine_tune_type": "lora",
         "peft_type": "LORA",
@@ -363,9 +351,7 @@ def _build_trainer_adapter_dict(rank, scale, dropout, num_layers, hf_repo=""):
 
 
 def test_trainer_adapter_dict_omits_num_layers_sentinel():
-    # _num_layers=None must not land in adapter_config as num_layers=-1
-    # or 0; mlx-lm's load_adapters would slice range(-1) and apply zero
-    # LoRA layers on reload.
+    # _num_layers=None must not be written as num_layers=-1 or 0: mlx-lm's load_adapters would slice range(-1) and apply zero LoRA layers on reload.
     cfg = _build_trainer_adapter_dict(rank=8, scale=1.0, dropout=0.0, num_layers=None)
     assert "num_layers" not in cfg
     cfg2 = _build_trainer_adapter_dict(rank=8, scale=1.0, dropout=0.0, num_layers=0)
@@ -373,8 +359,7 @@ def test_trainer_adapter_dict_omits_num_layers_sentinel():
 
 
 def test_trainer_adapter_dict_omits_rank_when_inference_failed():
-    # No LoRA found -> trainer must NOT write the placeholder rank=8 /
-    # scale=1.0 / dropout=0.0 trio. Reload should fail loud instead.
+    # No LoRA found: the trainer must not write the placeholder rank=8 / scale=1.0 / dropout=0.0 trio, so reload fails loudly instead.
     cfg = _build_trainer_adapter_dict(rank=None, scale=None, dropout=None, num_layers=24)
     assert "rank" not in cfg
     assert "scale" not in cfg
@@ -396,8 +381,7 @@ def test_normalize_mlx_lora_module_paths_handles_dict_input():
 
 
 def test_normalize_mlx_lora_module_paths_handles_pathlike_elements():
-    # pathlib.Path elements must coerce via os.fspath, not be dropped by the
-    # isinstance(p, str) gate.
+    # pathlib.Path elements must coerce via os.fspath, not be dropped by the isinstance(p, str) gate.
     import pathlib
     _load_utils()
     from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
@@ -420,9 +404,7 @@ def test_normalize_mlx_lora_module_paths_handles_bare_pathlike():
 
 
 def test_enrich_mlx_adapter_config_normalizes_dict_explicit_paths():
-    # Save-side normalization must accept the shapes the load side does.
-    # Otherwise vision/projector LoRA topology is silently erased before
-    # it reaches adapter_config.json.
+    # Save-side normalization must accept the same shapes as load; otherwise vision/projector LoRA topology is silently erased before adapter_config.json.
     mlx_utils = _load_utils()
     model = _FakeModel([
         ("layers.0.q_proj", _FakeLoRAModule((512, 4), (4, 512), scale=2.0)),
@@ -454,9 +436,8 @@ def test_enrich_mlx_adapter_config_normalizes_pathlike_explicit_paths():
 
 
 def test_enrich_mlx_adapter_config_coerces_mxarray_scale_without_aborting():
-    # A multi-element mx.array scale used to make float() raise, swallowed by an
-    # outer try/except that dropped unsloth_mlx_lora_module_paths. Enrich must
-    # mirror the trainer-side .item() / fallback-1.0 coercion.
+    # A multi-element mx.array scale makes float() raise; an outer try/except would swallow it and drop
+    # unsloth_mlx_lora_module_paths, so enrich must mirror the trainer's .item() / fallback 1.0 coercion.
     mlx_utils = _load_utils()
 
     class _MultiExpertScale:

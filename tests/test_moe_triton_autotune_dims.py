@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""forward_triton_grouped_gemm must autotune each GEMM at its real N: the autotuner builds a
-(E, 2 * intermediate_dim, hidden_dim) weight, so a doubled argument tunes a BLOCK_SIZE_N that may
-not divide the real N (CompileTimeAssertionFailure at the first real launch)."""
+"""forward_triton_grouped_gemm must autotune each GEMM at its real N: a doubled N can tune a BLOCK_SIZE_N that does not divide it (CompileTimeAssertionFailure)."""
 
 import sys
 import types

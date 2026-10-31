@@ -85,12 +85,8 @@ class TokenizedPreferenceRow:
 
 @dataclass(frozen=True)
 class VisionPreferenceRow(TokenizedPreferenceRow):
-    """A row encoded through a processor; its images belong to the prompt.
-
-    Each branch's arrays pair a processor field name with the values aligned to
-    that branch's kept prompt ids. ``images`` is empty for a text row and a
-    ``PromptImages`` otherwise.
-    """
+    """A row encoded through a processor, its images belonging to the prompt; each branch's arrays pair processor field
+    names with values aligned to its kept prompt ids; images is empty for text rows."""
 
     prompt_text: str = ""
     images: object = ()
@@ -99,14 +95,9 @@ class VisionPreferenceRow(TokenizedPreferenceRow):
 
 
 class PromptImages:
-    """A row's prompt images: read from the dataset again for each batch when it
-    builds its rows afresh, so a decode made for a batch does not outlive it, or
-    else the copies extracted when the row was tokenized.
-
-    ``prompt_ids`` are the processor's prompt ids with these images, which every
-    batch checks, since the row's ids were fixed when it was tokenized;
-    ``digest`` fingerprints the pixels it was tokenized with.
-    """
+    """A row's prompt images: re-read from the dataset per batch so no decode outlives it, else the copies extracted at
+    tokenization; prompt_ids are checked by every batch, since they were fixed at tokenization; digest fingerprints
+    the tokenized pixels."""
 
     __slots__ = ("read", "count", "prompt_ids", "digest")
 
@@ -166,11 +157,7 @@ TRUNCATION_MODES = ("keep_end", "keep_start")
 
 @dataclass(frozen=True)
 class PreferenceLengthPolicy:
-    """Resolved length budget for one preference objective.
-
-    ``kind`` picks the truncation algorithm; DPO's and ORPO's differ, and CPO
-    uses ORPO's.
-    """
+    """Resolved length budget for one preference objective; kind picks the truncation algorithm (DPO and ORPO differ; CPO uses ORPO's)."""
 
     kind: str
     max_length: int
@@ -195,13 +182,9 @@ def _token_budget(value, name):
 
 
 def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=None):
-    """Resolve the four length bounds the way the matching TRL trainer does.
-
-    max_seq_length has no TRL counterpart: it is the width a batch can hold, so
-    it caps max_length, and for ORPO and CPO it can pull max_prompt_length down
-    with it. KTO needs ``tokenizer``: its special tokens decide how far a row can
-    run past max_length.
-    """
+    """Resolves the four length bounds as the matching TRL trainer does; max_seq_length (no TRL counterpart) caps
+    max_length and can pull max_prompt_length down for ORPO and CPO; KTO needs tokenizer, since its special tokens
+    decide how far rows can run past max_length."""
     truncation_mode = getattr(args, "truncation_mode", "keep_end")
     if truncation_mode not in TRUNCATION_MODES:
         raise ValueError(
@@ -276,8 +259,7 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
         before_clamp = max_length
         max_length = limit
         if kind != "dpo" and before_clamp > max_prompt_length >= max_length:
-            # The answer gets max_length minus max_prompt_length, so clamping to the
-            # prompt bound leaves none. A bound the caller set themselves stands.
+            # The answer gets max_length minus max_prompt_length, so clamping to the prompt bound would leave none; a bound the caller set themselves stands.
             max_prompt_length = max(1, max_length // 2)
             warnings.warn(
                 f"Unsloth MLX {name}: max_prompt_length no longer leaves room for "
@@ -285,8 +267,8 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
                 f"{max_prompt_length}.",
                 RuntimeWarning, stacklevel=2,
             )
-    # A config predating max_length carries the default, not a choice, so the same
-    # call now trains on less. No marker means duck-typed, so take the value as meant.
+    # A config predating max_length carries the default, not a choice, so the same call now trains on less; a duck-typed
+    # config with no marker is taken as meant.
     max_length_explicit = getattr(args, "_unsloth_mlx_max_length_explicit", True)
     # CPO and KTO are newer than max_length, so no earlier run had a wider budget.
     if max_seq_length > max_length and not max_length_explicit \
@@ -314,19 +296,15 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
 
 def _kto_carry(tokenizer, append_eos):
     """How far TRL's KTO rows can run past max_length."""
-    # TRL reserves no slot for a leading BOS / trailing EOS but re-adds them after
-    # the cut; without bos_token_id the prompt's BOS slot absorbs the EOS.
+    # TRL reserves no slot for a leading BOS or trailing EOS but re-adds them after the cut; with no bos_token_id, the prompt's BOS slot absorbs the EOS.
     if getattr(tokenizer, "bos_token_id", None) is None:
         return 0
     return 1 + (append_eos and getattr(tokenizer, "eos_token_id", None) is not None)
 
 
 def _truncate_dpo_branch(prompt_ids, response_ids, policy):
-    """Cap the prompt's end and the response's start, then the concatenation.
-
-    DPOTrainer truncates in the forward pass over a prompt-left-, completion-
-    right-padded batch, so each row is contiguous and its batched slice is this one.
-    """
+    """Keeps the prompt's end and the response's start; DPOTrainer truncates a prompt-left, completion-right-padded
+    batch, so each row is contiguous and its slice is this one."""
     if policy.max_prompt_length is not None:
         prompt_ids = prompt_ids[-policy.max_prompt_length:]
     if policy.max_completion_length is not None:
@@ -346,11 +324,8 @@ def _truncate_dpo_branch(prompt_ids, response_ids, policy):
 def _truncate_orpo(
     chosen_prompt, chosen_ids, rejected_prompt, rejected_ids, policy,
 ):
-    """Cap both prompts against the longer response, then cut each answer's tail.
-
-    Mirrors ORPOTrainer, whose answer cut spends the whole prompt budget rather
-    than the prompt's real length.
-    """
+    """Caps both prompts against the longer response, then cuts each answer's tail; mirrors ORPOTrainer, whose answer
+    cut spends the whole prompt budget, not the prompt's real length."""
     longer = max(len(chosen_ids), len(rejected_ids))
     keep = policy.max_prompt_length
 
@@ -399,11 +374,7 @@ def _is_messages(value):
 
 
 def _extract_prompt(chosen, rejected):
-    """Recover the prompt as the common prefix of the two completions.
-
-    Mirrors TRL's extract_prompt, including its stop one element short when the
-    completions never diverge, so a row splits alike on either backend.
-    """
+    """Recovers the prompt as the common prefix of the two completions, mirroring TRL's extract_prompt, including stopping one element short when they never diverge."""
     limit = min(len(chosen), len(rejected))
     if not limit:
         raise ValueError(
@@ -412,8 +383,7 @@ def _extract_prompt(chosen, rejected):
         )
     for index in range(limit):
         if chosen[index] != rejected[index]:
-            # TRL strips a space via chosen[index - 1], which at index 0 wraps to
-            # chosen's LAST character and invents a prompt. Deliberate divergence.
+            # Deliberate divergence from TRL, whose chosen[index - 1] at index 0 wraps to chosen's last character and invents a prompt.
             if index > 0 and chosen[index - 1] == " ":
                 index -= 1
             break
@@ -421,11 +391,8 @@ def _extract_prompt(chosen, rejected):
 
 
 def _maybe_extract_prompt(row):
-    """Fill in a prompt the row leaves implicit in its two completions.
-
-    Also reports whether it was recovered: only an explicit assistant-ended
-    prompt may be a partial turn its completions continue.
-    """
+    """Fills in a prompt the row leaves implicit and reports whether it was recovered; only an explicit assistant-ended
+    prompt may be a partial turn its completions continue."""
     missing = {"chosen", "rejected"} - set(row)
     if missing:
         raise ValueError(
@@ -477,10 +444,8 @@ def _append_to_assistant(prompt, completion):
 def _render_completions(
     tokenizer, row, names, *, extracted=False, is_vlm=False, trl_vision=False,
 ):
-    """Render the prompt and, per completion field in ``names``, the prompt
-    followed by that completion. ``trl_vision`` follows TRL 1.13's vision
-    collators: a tool turn may end the prompt, and a completion never joins
-    an assistant turn that ends it."""
+    """Renders the prompt and each named completion appended to it; trl_vision follows TRL 1.13's vision collators (a
+    tool turn may end the prompt; no completion joins an assistant turn that ends it)."""
     prompt = row["prompt"]
     completions = [row[name] for name in names]
     fields = ("prompt", *names)
@@ -567,11 +532,8 @@ def _shared_prefix(prompt_text, *full_texts):
 
 
 def _emitted_bos_id(tokenizer):
-    """The BOS this tokenizer's add_special_tokens policy actually emits.
-
-    Not ``bos_token_id``: Phi-4-mini declares one it never emits, and forcing that
-    in gives DPO a leading token MLX's SFT and ORPO, and TRL's DPOTrainer, omit.
-    """
+    """The BOS the tokenizer's add_special_tokens policy actually emits, not bos_token_id: Phi-4-mini declares one it
+    never emits, and forcing it in gives DPO a leading token that MLX's SFT, ORPO and TRL's DPOTrainer omit."""
     bos_id = getattr(tokenizer, "bos_token_id", None)
     if bos_id is None:
         return None
@@ -586,14 +548,8 @@ def _encode_dpo_branches(
     tokenizer, prompt_text, chosen_text, rejected_text, *, append_eos,
     encode_prompt=None,
 ):
-    """Tokenize the prompt and each completion apart, as TRL's DPOTrainer does.
-
-    ORPO tokenizes the pair together and folds a merged boundary token back into
-    the completion; DPO never sees the pair, so a mid-token prompt splits there.
-    ``encode_prompt`` encodes the prompt in place of ``tokenizer``, returning its
-    ids and a dict of arrays aligned with them; the returned arrays follow any BOS
-    added here.
-    """
+    """Tokenizes the prompt and each completion apart, as TRL's DPOTrainer does, so a mid-token prompt splits there;
+    encode_prompt encodes the prompt in place of tokenizer; arrays follow any BOS added here."""
     prompt_text = _shared_prefix(prompt_text, chosen_text, rejected_text)
     if encode_prompt is None:
         # No special tokens: a closing EOS would land between prompt and completion.
@@ -623,12 +579,9 @@ def _encode_dpo_branches(
 
 
 def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids, kind):
-    """Refuse an ORPO or CPO row whose two prompt encodings disagree beyond a merge.
-
-    ORPOTrainer.tokenize_row lets only the last prompt token move, since a
-    tokenizer may merge it with the answer's first. Comparing over the overlap and
-    bounding the gap accepts the same rows without relying on zip's strict=.
-    """
+    """Refuses an ORPO or CPO row whose two prompt encodings differ beyond a merge: ORPOTrainer.tokenize_row lets only
+    the last prompt token move (a tokenizer may merge it with the answer's first); compares over the overlap, not
+    zip(strict=)."""
     overlap = min(len(chosen_prompt_ids), len(rejected_prompt_ids))
     different = sum(
         int(a != b) for a, b in zip(
@@ -650,8 +603,7 @@ def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids, kind)
 def _require_preference_fields(row):
     if not isinstance(row, Mapping):
         raise ValueError("Unsloth MLX preference: each dataset row must be a mapping.")
-    # prompt is optional: TRL's DPO, ORPO and CPO all maybe_extract_prompt first, so a
-    # row naming only its completions recovers a prompt instead of being refused.
+    # The prompt is optional: TRL's DPO, ORPO and CPO all run maybe_extract_prompt first, so a row naming only its completions recovers a prompt.
     missing = {"chosen", "rejected"} - set(row)
     if missing:
         raise ValueError(
@@ -661,10 +613,7 @@ def _require_preference_fields(row):
 
 
 def prepare_preference_row(tokenizer, row, *, is_vlm=False):
-    """Validate, recover an implicit prompt, and render, in that order.
-
-    ``is_vlm`` renders through a processor, keeping image parts in the messages.
-    """
+    """Validates, recovers an implicit prompt, then renders, in that order; is_vlm renders through a processor, keeping image parts in the messages."""
     _require_preference_fields(row)
     row, extracted = _maybe_extract_prompt(row)
     return _render_preference_row(
@@ -675,11 +624,8 @@ def prepare_preference_row(tokenizer, row, *, is_vlm=False):
 def tokenize_preference_row(
     tokenizer, row, *, length_policy, append_eos=True, rendered=None,
 ):
-    """Tokenize one row and preserve a shared prompt boundary.
-
-    ``rendered`` reuses a ``prepare_preference_row`` result the caller already has:
-    a chat template may carry state, so two renderings need not agree.
-    """
+    """Tokenizes one row, preserving a shared prompt boundary; rendered reuses a prepare_preference_row result, since a
+    chat template may carry state and two renderings may disagree."""
     prompt_text, chosen_text, rejected_text = (
         prepare_preference_row(tokenizer, row) if rendered is None else rendered
     )
@@ -690,8 +636,7 @@ def tokenize_preference_row(
         )
         rejected_prompt = list(chosen_prompt)
     else:
-        # A recovered prompt lands mid-token often, so step back one token and ask
-        # no more, as build_tokenized_answer does.
+        # A recovered prompt often lands mid-token, so step back one token, as build_tokenized_answer does.
         chosen = _encode_mlx_prompt_completion(
             tokenizer, prompt_text, chosen_text, append_eos=append_eos,
             step_back=True,
@@ -710,8 +655,8 @@ def tokenize_preference_row(
         rejected_prompt = list(rejected.input_ids[:boundaries[1]])
         chosen_response = list(chosen.input_ids[boundaries[0]:])
         rejected_response = list(rejected.input_ids[boundaries[1]:])
-        # Without this two different prefixes reach the loss as one context. On the
-        # resolved boundaries: judging before the clip refuses rows that agree.
+        # Without this check two different prefixes reach the loss as one context; judge on the resolved boundaries,
+        # since judging before the clip refuses rows that agree.
         _reject_diverging_orpo_prompts(
             chosen_prompt, rejected_prompt, length_policy.kind,
         )
@@ -725,8 +670,7 @@ def _truncate_preference_row(
     chosen_prompt, chosen_response, rejected_prompt, rejected_response,
     length_policy,
 ):
-    """Apply the objective's length budget to encoded branches, refusing a row
-    it leaves untrainable."""
+    """Applies the objective's length budget to encoded branches; refuses a row left with no response token in chosen or rejected."""
     if not chosen_response or not rejected_response:
         raise ValueError(
             "Unsloth MLX preference: chosen and rejected must each contain at "
@@ -746,8 +690,8 @@ def _truncate_preference_row(
         rejected_prompt, rejected_response = _truncate_dpo_branch(
             rejected_prompt, rejected_response, length_policy,
         )
-    # A response token needs something before it. ORPO and CPO score each branch, so one
-    # bad branch voids the row; DPO sums and it cancels against the reference.
+    # A response token needs something before it; ORPO and CPO score each branch, so one bad branch voids the row, while
+    # DPO sums them and the bad one cancels against the reference.
     unscoreable = [
         len(prompt) + len(response) < 2 or not response
         for prompt, response in (
@@ -763,8 +707,7 @@ def _truncate_preference_row(
             "max_length or lower max_prompt_length if the length budget cut it "
             "down; otherwise the row itself is too short to train on."
         )
-    # A prompt bound above max_length turns ORPO's answer cut into a tail cut that
-    # can outrun the width, silently masking the response out of the loss.
+    # A prompt bound above max_length turns ORPO's answer cut into a tail cut that can outrun the width, silently masking the response out of the loss.
     kept = max(
         len(chosen_prompt) + len(chosen_response),
         len(rejected_prompt) + len(rejected_response),
@@ -780,14 +723,9 @@ def _truncate_preference_row(
 
 
 def encode_generation_prompt(tokenizer, row, *, max_seq_length, max_new_tokens):
-    """Encode one row's prompt for generation, reserving room for the sample.
-
-    ``max_new_tokens`` comes out of ``max_seq_length`` and the prompt keeps its
-    end. Not ``tokenize_preference_row``'s prompt: that boundary hands a merged
-    prompt/completion token to the response span, and generation has no
-    completion to merge with. Not the generation engine's own encoder either,
-    which omits the special tokens training adds.
-    """
+    """Encodes a row's prompt for generation, reserving max_new_tokens out of max_seq_length and keeping the prompt's
+    end; not tokenize_preference_row's boundary (no completion to merge with) and not the engine's encoder, which
+    omits training's special tokens."""
     # Recover here too, so a row with no prompt column samples what it trains on.
     prompt_text, _, _ = prepare_preference_row(tokenizer, row)
     return encode_generation_prompt_text(
@@ -881,14 +819,9 @@ def tokenize_vision_preference_row(
     processor, row, *, length_policy, append_eos=True, image_size=None,
     media_token_ids=(), rendered=None, image_reader=None,
 ):
-    """Tokenize one row for a vision-language model, as unsloth's CUDA DPO does.
-
-    The processor renders every row and encodes an image row's prompt with its
-    images; completions, and every text-only row, tokenize through its inner
-    tokenizer exactly as on a text model. ``media_token_ids`` are the tokens a
-    truncation may not cut from an image row's prompt. ``image_reader`` returns
-    the row's images again when a batch needs them; without it they are held.
-    """
+    """Tokenizes one row for a vision-language model as unsloth's CUDA DPO does: image prompts via the processor,
+    completions and text rows via its inner tokenizer; media_token_ids are tokens truncation may not cut from an
+    image prompt; image_reader re-reads images per batch, else they are held."""
     tokenizer = _get_processor_tokenizer(processor)
     _require_preference_fields(row)
     row, extracted = _maybe_extract_prompt(row)
@@ -977,8 +910,7 @@ def _repeated_per_branch(value, branches):
     return value
 
 
-# Spans into the prompt as the processor laid it out, which BOS insertion,
-# truncation and padding all move.
+# Span keys hold positions into the prompt as the processor laid it out; BOS insertion, truncation and padding all move them.
 _VLM_TOKEN_SPAN_KEYS = ("image_bound", "audio_bounds")
 
 # Their pixels are a [crops, whole images] pair, each batched along its own axis.
@@ -988,8 +920,7 @@ _PIXEL_COMPONENT_MODEL_TYPES = ("deepseekocr", "deepseekocr_2")
 def _vision_batch(
     processor, model_config, rows, prompt_arrays, ids, lengths, *, same_pixels=False,
 ):
-    """A vision batch dict for packed rows, each branch's rows in turn; ``prompt_arrays``
-    holds each row's prompt arrays per branch."""
+    """A vision batch dict for packed rows with each branch's rows in turn; prompt_arrays holds each row's prompt arrays per branch."""
     branches = len(prompt_arrays[0])
     width = ids.shape[1]
     inputs = {
@@ -1115,8 +1046,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         return self._reference
 
     def set_reference_logps(self, table):
-        """Install ``(rows, 2)`` reference log probabilities, one column per
-        branch: chosen then rejected, or a KTO completion then its KL pair."""
+        """Install (rows, 2) reference log probabilities, one column per branch: chosen then rejected, or a KTO completion then its KL pair."""
         table = np.asarray(table, dtype=np.float32)
         if table.shape != (len(self._rows), 2):
             raise ValueError(
@@ -1144,8 +1074,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         )
 
     def pack(self, rows, width=None):
-        """``rows`` as one padded batch, every row's first branch before any
-        second, with each sequence's ``(prompt length, end)``."""
+        """Packs rows as one padded batch, every row's first branch before any second, with each sequence's (prompt length, end)."""
         if width is None:
             width = self._pack_width(rows)
         branches = [self._branches(row) for row in rows]
@@ -1379,8 +1308,7 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
 
 
 def _window_normalizers(rows, schedule, cycle_length, grad_accum, kind):
-    """Per batch: its window's chosen NLL tokens (0 for an objective without
-    one), rows, and micro-batches."""
+    """Per batch: the window's chosen NLL token count (0 for an objective without one), rows, and micro-batches."""
     values = []
     accum = max(1, int(grad_accum or 1))
 
@@ -1404,12 +1332,8 @@ def _window_normalizers(rows, schedule, cycle_length, grad_accum, kind):
 
 
 def _reads_rows_by_index(dataset):
-    """A Hugging Face ``Dataset`` decoding its own rows, so ``dataset[i]`` builds the
-    i-th iterated row afresh.
-
-    Any other dataset, or a user transform, may hand back stored objects that a
-    caller consumes or closes, so those rows are held.
-    """
+    """A Hugging Face Dataset decodes its own rows, so dataset[i] builds a fresh row; other datasets or transforms may
+    return stored objects that callers consume or close."""
     return all(
         f"{owner.__module__}.{owner.__qualname__}" == "datasets.arrow_dataset.Dataset"
         for owner in (
@@ -1420,11 +1344,8 @@ def _reads_rows_by_index(dataset):
 
 
 def _dataset_image_reader(dataset, formatting_func, row_images):
-    """``index -> row_images(dataset[index])``, reading the row again, or None.
-
-    Only rows straight from Hugging Face's decoding are read again: a
-    formatting_func, like a transform, may return images the caller owns.
-    """
+    """Returns index -> row_images(dataset[index]) to re-read rows, or None; only rows straight from Hugging Face
+    decoding qualify, since a formatting_func may return images the caller owns."""
     if formatting_func is not None or not _reads_rows_by_index(dataset):
         return None
     return lambda index: row_images(dataset[index])
@@ -1455,17 +1376,9 @@ def create_preference_batch_plan(
     image_size=None,
     images_from=None,
 ):
-    """Build the finite preference plan consumed by every objective.
-
-    ``prompt_sink`` receives each row's rendered prompt text as the plan is
-    built, so a caller wanting it does not render the row a second time. A
-    ``processor`` builds a vision plan for a vision-language model, encoding image
-    prompts through it and all other text through its inner tokenizer. Image rows
-    read their images back for each batch instead of holding them when
-    ``images_from``, a ``(dataset, formatting_func)`` pair yielding these rows in
-    order (by default ``dataset`` and ``formatting_func``), is a Hugging Face
-    dataset without a formatting_func.
-    """
+    """Builds the finite preference plan for every objective; prompt_sink receives each row's rendered prompt text; a
+    processor gives a vision plan; image rows re-read images per batch when images_from (default dataset,
+    formatting_func) is a Hugging Face Dataset without formatting_func."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
         media_token_ids = frozenset(_image_truncation_token_ids(
@@ -1595,8 +1508,7 @@ class VisionKTORow(TokenizedKTORow):
     prompt_arrays: tuple = ()
 
 
-# TRL unpairs through datasets.map(batched=True) at its default batch size, so
-# each block of pairs yields its chosen rows, then its rejected rows.
+# TRL unpairs via datasets.map(batched=True) at its default batch size: each block of pairs yields its chosen rows, then its rejected rows (_UNPAIR_BLOCK).
 _UNPAIR_BLOCK = 1000
 
 
@@ -1679,9 +1591,8 @@ def _encode_kto_row(tokenizer, row, *, extracted, processor=None):
 
 
 def _with_trl_image_parts(row):
-    """TRL's vision KTO collator: `image` becomes `images`, and through
-    prepare_multimodal_messages every string content becomes a text part, a prompt
-    placing none of the images getting one image part each ahead of its first
+    """Mirrors TRL's vision KTO collator: image becomes images, string contents become text parts via
+    prepare_multimodal_messages, and a prompt placing none of the images gets one image part each ahead of its first
     user turn's text."""
     if "image" in row:
         image = row["image"]
@@ -1720,8 +1631,7 @@ def _kto_row_is_vision(row, image_size):
 
 
 def _encode_vision_kto_row(processor, row, *, extracted, image_size, image_reader):
-    """TRL's vision KTO collator: the prompt through the processor with its
-    images, the completion as plain text, neither adding special tokens."""
+    """Mirrors TRL's vision KTO collator: the prompt goes through the processor with its images and the completion as plain text, neither adding special tokens."""
     tokenizer = _get_processor_tokenizer(processor)
     row = _with_trl_image_parts(row)
     images = _vision_prompt_images(row, image_size)
@@ -1759,9 +1669,8 @@ def _encode_vision_kto_row(processor, row, *, extracted, image_size, image_reade
 
 
 def _truncate_kto(prompt_ids, answer_ids, policy, *, bos_id, eos_id):
-    """TRL KTOTrainer's _process_tokens for a decoder-only model, including its
-    BOS slot reserved against a None bos_token_id and its answer cut spending the
-    whole prompt bound."""
+    """Mirrors TRL KTOTrainer's _process_tokens for decoder-only models, including its BOS slot reserved against a None
+    bos_token_id and its answer cut spending the whole prompt bound."""
     budget = policy.max_length
     if prompt_ids and prompt_ids[0] != bos_id:
         budget -= 1
@@ -1817,20 +1726,9 @@ def create_kto_batch_plan(
     image_size=None,
     images_from=None,
 ):
-    """Build a finite KTO plan over TRL's unpaired rows, visited in dataset order.
-    ``dataset_order="torch_randperm"`` reorders whole batches each epoch, keeping
-    KL partners together.
-
-    Each row's KL pair joins its prompt to the previous row's completion within
-    ``kl_batch_size`` chunks (TRL's per_device_train_batch_size, for evaluation
-    too). ``prompt_sink`` receives each undesirable row's rendered prompt.
-
-    A ``processor`` builds a vision plan. If the first row, which decides as in
-    TRL, has an ``image`` or ``images`` field or prompt images, every row follows
-    TRL's vision collator: no special tokens added, the whole sequence cut at
-    max_length, KL pairs within each batch, ``images_from`` as for
-    ``create_preference_batch_plan``. Otherwise rows tokenize as on a text model.
-    """
+    """KTO plan over TRL's unpaired rows in dataset order; torch_randperm reorders whole batches keeping KL pairs
+    together; KL pairs stay in kl_batch_size chunks; a processor uses TRL's vision collator only if the first row has
+    images; prompt_sink gets each undesirable row's rendered prompt."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
         image_reader = _dataset_image_reader(
@@ -1969,8 +1867,7 @@ def create_kto_batch_plan(
 
 
 class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
-    """Batches ``(ids, lengths, normalizers, labels[, reference])``: completions,
-    then their KL rows when the loss has a KL term."""
+    """Batches are (ids, lengths, normalizers, labels[, reference]): completions first, then their KL rows when the loss has a KL term."""
 
     __slots__ = ("_with_kl",)
 
@@ -2030,8 +1927,7 @@ class FiniteVisionKTOBatchPlan(VisionPreferenceBatches, FiniteKTOBatchPlan):
 
 
 def warn_kto_weight_balance(labels, desirable_weight, undesirable_weight):
-    """TRL KTOTrainer's warning, from Eq. (8) of the KTO paper, when neither
-    weight lies in the range the label counts recommend."""
+    """TRL KTOTrainer's warning from Eq. (8) of the KTO paper, raised when neither weight lies in the range the label counts recommend."""
     num_desirable = max(sum(bool(label) for label in labels), 1)
     num_undesirable = max(len(labels) - num_desirable, 1)
     if num_desirable == num_undesirable:
@@ -2334,11 +2230,8 @@ def _preference_ids(batch):
 
 
 def _next_token_positions(values, ids, what):
-    """Drop the last position, once the output is known to cover every token.
-
-    A family expanding tokens inside its forward would shift every response
-    position the lengths name, so the scores would silently read other tokens.
-    """
+    """Drop the last position once the output covers every token; a family expanding tokens inside its forward shifts
+    the response positions, so scores would silently read other tokens."""
     if values.shape[1] != ids.shape[1]:
         raise ValueError(
             f"Unsloth MLX preference: this model returned {what} for "
@@ -2366,8 +2259,7 @@ def _preference_hidden(model, batch):
 
 
 def _token_cross_entropy(logits, targets, mask):
-    # An image token may lie past the output head (Mllama's does), so unscored
-    # labels are gathered as token 0, as TRL does.
+    # An image token may lie past the output head (Mllama's does), so unscored labels are gathered as token 0, as TRL does.
     targets = mx.where(mask > 0, targets, 0)
     return nn.losses.cross_entropy(
         logits, targets, reduction="none",
@@ -2620,9 +2512,8 @@ class PreferenceObjective:
                 f"{self.label_smoothing}."
             )
         if self.label_smoothing == 0 and "exo_pair" in self.loss_types:
-            # exo_pair logs label_smoothing, undefined at zero. Floored here at
-            # config time; TRL mutates self.label_smoothing inside exo_pair's own
-            # branch, a state change that leaks into the other losses in the list.
+            # exo_pair logs label_smoothing, undefined at zero, so it is floored at config time; TRL mutates
+            # self.label_smoothing inside exo_pair's branch and the change leaks into other losses.
             object.__setattr__(self, "label_smoothing", 1e-3)
         if "discopop" in self.loss_types and not 0 < self.discopop_tau < math.inf:
             # discopop divides by it, and delta is zero at init, so 0 is NaN.
@@ -2643,8 +2534,7 @@ class PreferenceObjective:
 
     @property
     def length_normalized(self):
-        """TRL divides before any variant runs, so DPO's ipo normalizes the whole
-        list; CPO averages under ipo and simpo."""
+        """TRL divides before any variant runs, so DPO's ipo normalizes the whole list; CPO averages under ipo and simpo."""
         return any(name in ("ipo", "simpo") for name in self.loss_types)
 
     @property
@@ -2817,11 +2707,8 @@ def _scatter_rows(values, indices, size):
 
 
 def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
-    """Each row's logits summed over the vocabulary, one vocabulary chunk at a time.
-
-    Uncapped logits are linear in the head, so their sum projects onto the summed
-    weight rows; a softcap needs the logits themselves.
-    """
+    """Per-row logit sums over the vocabulary, chunked; uncapped logits are linear in the head, so sums project onto
+    summed weight rows; a softcap needs the logits themselves."""
     vocab = weight.shape[0]
     # Without a softcap a chunk holds weight rows, not a row of logits per token.
     step = _resolve_chunk_size(
@@ -2843,12 +2730,9 @@ def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
 
 
 def _make_preference_cce_scorer(model, *, temperature=1.0):
-    """Score preference positions from hidden states through runtime CCE.
-
-    Returns None unless the hidden states are reachable and the head is an
-    unwrapped, bias-free dense or frozen quantized projection. ``temperature``
-    divides the logits; a softcapped head cannot take it through the hidden states.
-    """
+    """Scores preference positions through runtime CCE from hidden states; returns None unless hidden states are
+    reachable and the head is an unwrapped, bias-free dense or frozen quantized projection; a softcapped head cannot
+    take temperature this way."""
     from . import utils
 
     if utils._get_text_backbone(model) is None and not utils._has_direct_hidden_stack(model):
@@ -2876,12 +2760,8 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
                                     **quantization)
 
     def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True):
-        """Token cross entropy and logit sums per position, as float32 grids.
-
-        Cross entropy is zero outside ``supervised``. ``indices`` limits the
-        kernel to those rows, which then also limits the logit sums unless
-        ``every_position``. Without ``logit_sums`` the sums are None.
-        """
+        """Token cross entropy and logit sums per position as float32 grids; cross entropy is zero outside supervised;
+        indices limit the rows, and the sums too unless every_position; without logit_sums the sums are None."""
         targets = _preference_ids(batch)[:, 1:]
         hidden = _preference_hidden(model, batch)
         head = utils._resolve_module_path(model, desc.path)
@@ -2943,8 +2823,7 @@ _SHARED_EVAL_METRICS = (
     "logits/rejected",
 )
 
-# The names TRL logs for these objectives, so a run reads the same on
-# either backend. ORPO adds the three terms its loss decomposes into.
+# Metric names as TRL logs them, so a run reads the same on either backend; ORPO adds the three terms its loss decomposes into.
 PREFERENCE_EVAL_METRICS = {
     "dpo": _SHARED_EVAL_METRICS,
     "orpo": _SHARED_EVAL_METRICS + (
@@ -2954,8 +2833,8 @@ PREFERENCE_EVAL_METRICS = {
 }
 
 
-# An unscaled float16 vocabulary row sum overflows to inf, which the mask then
-# turns into NaN. This is the smallest normal float16, so undoing it is exact.
+# An unscaled float16 vocabulary row sum overflows to inf, which the mask turns into NaN; the scale 2.0 ** -14 is the
+# smallest normal float16, so undoing it is exact.
 _LOGIT_SUM_SCALE = 2.0 ** -14
 
 
@@ -2968,10 +2847,7 @@ def _row_logit_sum(logits):
 
 
 def _masked_logit_sum(logits, mask):
-    """Logit sum over the response positions, and the count it divides by.
-
-    Separate so the eval set's mean is taken over all of its positions at once.
-    """
+    """Returns the logit sum over response positions and its count; kept separate so the eval set's mean spans all its positions at once."""
     kept = mask.sum() * logits.shape[-1]
     return (_row_logit_sum(logits) * mask).sum(), kept
 
@@ -2986,8 +2862,7 @@ _PREFERENCE_DENOMINATOR_NAMES = {
     "cpo": ("chosen_logits", "rejected_logits", "nll_tokens", "pairs"),
 }
 
-# Token means, unlike TRL, which weights per-micro-batch means equally and so
-# reports a number that moves with per_device_train_batch_size.
+# Token-level means, unlike TRL, which weights per-micro-batch means equally so its reported number moves with per_device_train_batch_size.
 _PREFERENCE_TOKEN_DENOMINATORS = {
     "dpo": {
         "logits/chosen": "chosen_logits",
@@ -3036,9 +2911,8 @@ def _preference_stats(
 ):
     """Numerators then denominators, all sums, so a window average is exact."""
     pairs = chosen.shape[0]
-    # TRL is inconsistent between its trainers: DPOTrainer averages its logit
-    # metric over completion positions, ORPOTrainer and CPOTrainer over every
-    # padded position, so those two follow each backend's padding width.
+    # TRL is inconsistent: DPOTrainer averages its logit metric over completion positions, ORPOTrainer and CPOTrainer
+    # over every padded position, so those two follow each backend's padding width.
     if logit_totals is not None:
         chosen_logits, rejected_logits, chosen_count, rejected_count = logit_totals
     elif kind != "dpo":
@@ -3171,8 +3045,7 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
     beta = objective.beta
     chosen, rejected = logps[:pairs], logps[pairs:]
     ref_chosen, ref_rejected = reference[:pairs], reference[pairs:]
-    # TRL adds the rewards once per loss entry, so a two-entry list reports twice
-    # a one-entry list; summed in its order, not scaled by the summed weights.
+    # TRL adds the rewards once per loss entry, so a two-entry list reports twice a one-entry list; summed in its order, not scaled by the summed weights.
     stats = _preference_stats(
         "dpo", logits, mask, logit_totals=logit_totals,
         chosen=chosen, rejected=rejected,
@@ -3192,12 +3065,8 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
 
 
 def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
-    """Score one preference batch as ``(loss, pairs, stats)``.
-
-    ``stats`` holds a numerator per metric in ``PREFERENCE_EVAL_METRICS[kind]``
-    order, then the denominators ``PREFERENCE_EVAL_DENOMINATORS[kind]`` names.
-    Nothing is a per-batch mean, so the eval set averages exactly.
-    """
+    """Scores one batch as (loss, pairs, stats); stats are sums (numerators per PREFERENCE_EVAL_METRICS[kind], then
+    PREFERENCE_EVAL_DENOMINATORS[kind]), never means, so eval averages exactly."""
     _require_reference(objective, reference_policy)
     kind = objective.kind
     beta = objective.beta
@@ -3358,11 +3227,7 @@ def _mark_kto_fn(fn, scorer):
 
 
 def make_kto_loss_fn(objective, *, reference_policy, kl_mean=None, _scorer=None):
-    """Create a KTO loss normalized over the rows of its logical window.
-
-    ``kl_mean`` maps this process's KL estimate to the mean across processes
-    before it is clamped, as TRL gathers it.
-    """
+    """Create a KTO loss normalized over the rows of its logical window; kl_mean averages the KL estimate across processes before it is clamped, as TRL gathers it."""
     _require_kind(objective, "kto")
     _require_reference(objective, reference_policy)
 

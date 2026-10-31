@@ -16,6 +16,8 @@
 
 """The fused CE backward scales the stored head gradient in place, so it becomes .grad without a second copy."""
 
+import contextlib
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -82,6 +84,36 @@ def test_jsd_student_head_grad_buffer_becomes_param_grad(monkeypatch):
         wi = weight.clone().requires_grad_()
         (fl.fused_linear_jsd(hidden.clone().requires_grad_(), wi, t_hidden, t_weight) * 0.5).backward(
             retain_graph = retain)
+        ws.append(wi)
+    assert ws[0].grad.data_ptr() == ptrs[0]
+    assert torch.equal(ws[0].grad, ws[1].grad)
+
+
+def test_grpo_head_grad_buffer_becomes_param_grad(monkeypatch):
+    from unsloth_zoo.fused_losses import fused_grpo as fg
+
+    ptrs = []
+    impl = fl._OPS["grpo_impl"]
+
+    def spy(*args, **kwargs):
+        out = impl(*args, **kwargs)
+        ptrs.append(out[4].data_ptr())
+        return out
+
+    monkeypatch.setitem(fl._OPS, "grpo_impl", spy)
+    g = torch.Generator().manual_seed(9)
+    hidden = torch.randn(2, 5, H, generator = g)
+    weight = torch.randn(V, H, generator = g) * H ** -0.5
+    tgt = torch.randint(0, V, (2, 5), generator = g)
+    mask = torch.ones(2, 5, dtype = torch.bool)
+    adv = torch.randn(2, generator = g)
+    old = torch.randn(2, 5, generator = g) * 0.1 - 4.0
+    ws = []
+    for retain in (False, True):
+        wi = weight.clone().requires_grad_()
+        loss = fg.fused_linear_grpo_loss(hidden.clone().requires_grad_(), wi, tgt, mask = mask, advantages = adv,
+                                         old_logps = old)[0]
+        (loss * 0.5).backward(retain_graph = retain)
         ws.append(wi)
     assert ws[0].grad.data_ptr() == ptrs[0]
     assert torch.equal(ws[0].grad, ws[1].grad)
@@ -183,3 +215,112 @@ def test_compiled_no_graph_break_and_same_grads():
     w_e = weight.clone().requires_grad_()
     f(hidden.clone().requires_grad_(), w_e, targets).backward()
     assert torch.equal(w_c.grad, w_e.grad)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_compiled_autograd_traces_the_backward(dtype):
+    # Compiled autograd traces the CE backward; the in-place gate must not call the untraceable
+    # keep-graph query there (graph break, or Unsupported under fullgraph).
+    compiled_autograd = pytest.importorskip("torch._dynamo.compiled_autograd")
+    # torch 2.4 / 2.5 name it enable, 2.6+ _enable.
+    enable = getattr(compiled_autograd, "_enable", None) or getattr(compiled_autograd, "enable", None)
+    if enable is None:
+        pytest.skip("no compiled autograd context manager")
+    if tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 5):
+        # torch 2.4 compiled autograd cannot inline torch.library's autograd backward (skipfiles).
+        pytest.skip("torch 2.4 compiled autograd does not trace torch.library custom op backwards")
+    hidden, weight, targets = _inputs(7, dtype = dtype)
+    w_e = weight.clone().requires_grad_()
+    (_loss(hidden.clone().requires_grad_(), w_e, targets) * 0.375).backward()
+    torch._dynamo.reset()
+    counters.clear()
+    w_c = weight.clone().requires_grad_()
+    loss = _loss(hidden.clone().requires_grad_(), w_c, targets) * 0.375
+    with enable(torch.compile(backend = "eager", fullgraph = True)):
+        loss.backward()
+    assert not counters["graph_break"]
+    assert torch.equal(w_c.grad, w_e.grad)
+
+
+def test_hook_unpacked_expanded_buffers_are_not_written(monkeypatch):
+    # A saved-tensor hook may unpack an all-zero buffer as an expanded view (values, shape, dtype and
+    # device kept, strides not): writing it in place would hit one element many times.
+    hidden, weight, targets = _inputs(8)
+    targets[:] = -100
+
+    def pack(t):
+        if t.numel() and not t.any():
+            return ("zeros", t.shape, t.dtype, t.device)
+        return t
+
+    def unpack(p):
+        if isinstance(p, tuple):
+            _, shape, dtype, device = p
+            return torch.zeros((), dtype = dtype, device = device).expand(shape)
+        return p
+
+    w = weight.clone().requires_grad_()
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        loss = fl.fused_linear_cross_entropy(hidden.clone().requires_grad_(), w, None, targets,
+                                             divisor = torch.tensor(1.0))
+    (loss * 0.75).backward()
+    assert torch.equal(w.grad, torch.zeros_like(w))
+
+
+def test_create_graph_without_retain_graph_keeps_the_functional_scaler():
+    hidden, weight, targets = _inputs(9, dtype = torch.float32)
+    w = weight.clone().requires_grad_()
+    factor = torch.tensor(0.5, requires_grad = True)
+    gw, = torch.autograd.grad(_loss(hidden, w, targets) * factor, w, create_graph = True, retain_graph = False)
+    w2 = weight.clone().requires_grad_()
+    (_loss(hidden, w2, targets) * 0.5).backward()
+    torch.testing.assert_close(gw.detach(), w2.grad)
+
+
+def _value_dedup_hooks(keep_original):
+    # Lossless hook that returns one shared buffer for equal saved tensors.
+    kept = []
+
+    def pack(t):
+        for prior in kept:
+            if prior.shape == t.shape and prior.dtype == t.dtype and torch.equal(prior, t):
+                return prior
+        prior = t if keep_original else t.detach().clone()
+        kept.append(prior)
+        return prior
+
+    return torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t)
+
+
+@pytest.mark.parametrize("keep_original", [False, True])
+def test_hook_shared_buffers_within_one_op_are_not_scaled_twice(keep_original):
+    # Symmetric logits and diagonal targets: the stored hidden and head grads are equal and nonzero.
+    def run(hooks):
+        h = torch.eye(8).requires_grad_()
+        w = torch.eye(8).requires_grad_()
+        with _value_dedup_hooks(keep_original) if hooks else contextlib.nullcontext():
+            loss = fl.fused_linear_cross_entropy(h, w, None, torch.arange(8), divisor = torch.tensor(8.0))
+        (loss * 0.5).backward()
+        return h.grad, w.grad
+
+    want_h, want_w = run(False)
+    assert torch.equal(want_h, want_w) and want_w.any()
+    got_h, got_w = run(True)
+    assert torch.equal(got_h, want_h) and torch.equal(got_w, want_w)
+
+
+@pytest.mark.parametrize("keep_original", [False, True])
+def test_hook_shared_buffers_across_two_losses_are_not_scaled_twice(keep_original):
+    hidden, weight, targets = _inputs(10, dtype = torch.float32)
+
+    def run(hooks):
+        w = weight.clone().requires_grad_()
+        if hooks:
+            with _value_dedup_hooks(keep_original):
+                loss = _loss(hidden, w, targets) * 0.75 + _loss(hidden, w, targets) * 0.25
+        else:
+            loss = _loss(hidden, w, targets) * 0.75 + _loss(hidden, w, targets) * 0.25
+        loss.backward()
+        return w.grad
+
+    torch.testing.assert_close(run(True), run(False))

@@ -1008,6 +1008,71 @@ def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
     assert ops.patch_trl_fused_lm_head() is False
 
 
+def test_trl_fused_lm_head_dispatch_takes_the_kept_set_contract(monkeypatch):
+    from trl.trainer import utils as trl_utils
+    from unsloth_zoo.cpu import ops
+    calls = []
+
+    class Kernel117:
+        @staticmethod
+        def forward(ctx, hidden, weight, bias, targets, temperature, chunk_size, final_logit_softcapping = None,
+                    logit_scale = 1.0, outputs = (), support_ids = None, score_ids = None):
+            raise AssertionError
+
+        @staticmethod
+        def apply(hidden, *a, **k):
+            calls.append((a, k))
+            return ("kernel",) * 6
+
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", Kernel117, raising = False)
+    assert ops.patch_trl_fused_lm_head() is True
+    dispatch = trl_utils._ChunkedLogProbFunction
+    torch.manual_seed(0)
+    hidden, weight, targets = torch.randn(9, 8), torch.randn(23, 8), torch.randint(0, 23, (9,))
+    got = dispatch.apply(hidden, weight, None, targets, 0.7, 64, None, 1.0, ("entropy",), None, None)
+    assert len(got) == 6 and got[5] is None and got[2] is None and calls == []
+    logp = torch.log_softmax((hidden.double() @ weight.double().t()) / 0.7, -1)
+    torch.testing.assert_close(got[0].double(), logp.gather(-1, targets[:, None]).squeeze(-1), rtol = 1e-5, atol = 1e-5)
+    ids = torch.zeros(9, 2, dtype = torch.long)
+    assert dispatch.apply(hidden, weight, None, targets, 0.7, 64, None, 1.0, ("entropy",), ids, None)[0] == "kernel"
+    assert dispatch.apply(hidden, weight, None, targets, 0.7, 64, None, 1.0, (), score_ids = ids)[0] == "kernel"
+    assert len(calls) == 2 and calls[1][1]["score_ids"] is ids
+
+
+def test_trl_fused_forward_on_cpu_matches_trl_kernel(monkeypatch):
+    from trl.trainer import utils as trl_utils
+    from unsloth_zoo.cpu import ops
+    kernel = getattr(trl_utils, "_ChunkedLogProbFunction", None)
+    kernel = getattr(kernel, "_kernel", kernel)
+    if kernel is None or not hasattr(trl_utils, "add_fused_lm_head"):
+        pytest.skip("this TRL has no fused lm_head kernel")
+    from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(
+        vocab_size = 37, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 1,
+        num_attention_heads = 2, num_key_value_heads = 2, max_position_embeddings = 32,
+    )).float()
+    input_ids = torch.randint(0, 37, (2, 9))
+    labels = input_ids.clone()
+    labels[0, :3] = -100
+    trl_utils.add_fused_lm_head(model, temperature = 0.7, outputs = ("log_probs", "entropy"))
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", kernel)
+    assert ops.patch_trl_fused_lm_head() is True
+    ours = model(input_ids = input_ids, labels = labels, fused_lm_head = True)
+    ours.loss.backward()
+    ours_grad = model.model.norm.weight.grad.clone()
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", kernel)
+    model.zero_grad()
+    try:
+        ref = model(input_ids = input_ids, labels = labels, fused_lm_head = True)
+        ref.loss.backward()
+    except Exception as exc:  # TRL < 1.17's kernel is Triton only.
+        pytest.skip(f"TRL's kernel does not run on CPU here ({type(exc).__name__})")
+    torch.testing.assert_close(ours.log_probs, ref.log_probs, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(ours.entropy, ref.entropy, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(ours_grad, model.model.norm.weight.grad, rtol = 1e-4, atol = 1e-5)
+
+
 def test_cpu_fused_lm_head_with_every_label_masked():
     """TRL passes hidden_states[mask] / labels[mask], which are empty for a fully masked batch."""
     from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
@@ -1455,9 +1520,11 @@ print("CPU_SFT_OK", losses)
 '''
 
 
-def test_cpu_lora_sft_end_to_end(tmp_path):
+@pytest.mark.parametrize("serial_spawn", [False, True])
+def test_cpu_lora_sft_end_to_end(tmp_path, serial_spawn):
     """FastCPUModel + stock TRL SFTTrainer, as notebooks and Studio call them: on_model_resolved,
-    SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name; trains and saves the adapter."""
+    SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name; trains and saves the adapter.
+    serial_spawn: unguarded script, dataset_num_proc = 1, spawn (a Pool(1) child re-imports __main__)."""
     import subprocess
     import sys
     from tokenizers import Tokenizer, models, pre_tokenizers
@@ -1470,7 +1537,40 @@ def test_cpu_lora_sft_end_to_end(tmp_path):
     PreTrainedTokenizerFast(tokenizer_object = backend, pad_token = "<pad>", eos_token = "</s>",
                             unk_token = "<unk>").save_pretrained(model_dir)
     _tiny_llama().save_pretrained(model_dir)
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", OMP_NUM_THREADS = "2", HF_HUB_OFFLINE = "1")
-    done = subprocess.run([sys.executable, "-c", _CPU_SFT_SCRIPT, str(model_dir), str(tmp_path / "out")],
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", OMP_NUM_THREADS = "2", HF_HUB_OFFLINE = "1",
+               PYTHONPATH = os.pathsep.join(filter(None, [tree, os.environ.get("PYTHONPATH")])))
+    script = ["-c", _CPU_SFT_SCRIPT]
+    if serial_spawn:
+        script = tmp_path / "train.py"
+        script.write_text('import multiprocess\nmultiprocess.set_start_method("spawn", force = True)\n'
+                          + _CPU_SFT_SCRIPT.replace("dataset_num_proc = 2", "dataset_num_proc = 1"))
+        script = [str(script)]
+    done = subprocess.run([sys.executable, *script, str(model_dir), str(tmp_path / "out")],
                           capture_output = True, text = True, timeout = 600, env = env, cwd = str(tmp_path))
     assert done.returncode == 0 and "CPU_SFT_OK" in done.stdout, (done.stdout[-3000:], done.stderr[-5000:])
+
+
+@pytest.mark.parametrize("requested, seen", [(1, None), (0, None), (None, None), (4, 4), (True, True), (-1, -1)])
+def test_serial_dataset_num_proc_maps_in_process(requested, seen):
+    """Stock TRL sees None for a serial 0 / 1 during __init__; the caller's config keeps its value."""
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
+
+    class FakeSFT:
+        def __init__(self, model = None, args = None, **kwargs):
+            self.seen = args.dataset_num_proc
+
+    args = SimpleNamespace(dataset_num_proc = requested)
+    trainer = _make_cpu_sft_trainer(FakeSFT)(model = None, args = args)
+    assert type(trainer.seen) is type(seen) and trainer.seen == seen
+    assert args.dataset_num_proc is requested
+
+    class Failing(FakeSFT):
+        def __init__(self, *a, **k):
+            raise RuntimeError("boom")
+
+    args = SimpleNamespace(dataset_num_proc = 1)
+    with pytest.raises(RuntimeError):
+        _make_cpu_sft_trainer(Failing)(None, args)
+    assert args.dataset_num_proc == 1

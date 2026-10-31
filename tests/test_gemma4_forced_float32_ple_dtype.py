@@ -440,8 +440,7 @@ def test_gemma4_ple_compiler_appends_helper_only_when_call_present(tmp_path, mon
 
 
 def test_gemma4_ple_eager_then_compile_share_one_helper_name(tmp_path, monkeypatch):
-    """Guards the fixed bug: compiling AFTER the eager patch must not emit a call to
-    a helper name the generated module never defines (previously a NameError)."""
+    """Compile after the eager patch must not call a helper the generated module never defines (NameError)"""
     from unsloth_zoo import compiler
 
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")

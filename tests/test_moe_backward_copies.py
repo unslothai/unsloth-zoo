@@ -14,12 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MoE backward without full-size copies, checked against an fp32 per-expert reference.
+"""MoE backward avoids full-size copies, checked against an fp32 per-expert reference: transposed frozen stack passed as
+a view, fp32 bias-grad sums, dW in its own layout."""
 
-1. _GroupedMMRecompute.backward hands the transposed frozen stack to the grouped GEMM as a view.
-2. Trainable expert biases: the gather's backward sums in fp32 (one-hot GEMM) instead of a 16-bit index_add_.
-3. A transposed trainable stack gets dW in its own layout, so AccumulateGrad does not copy it.
-"""
+import contextlib
 
 import pytest
 import torch
@@ -37,6 +35,25 @@ needs_kernel = pytest.mark.skipif(
 )
 DT = torch.bfloat16
 ALPHA, LIMIT = 1.702, 7.0
+
+
+@contextlib.contextmanager
+def _no_blas_workspace():
+    """torch 2.15 binds a fresh cuBLAS workspace per GEMM (no warm-up avoids it); size 0 keeps it out of the peak."""
+    b = torch.backends.cuda
+    if not hasattr(b, "cublaslt_workspace_size"):  # older torch: cached per handle, the warm-up already paid for it
+        yield
+        return
+    old = b.cublas_workspace_size(), b.cublaslt_workspace_size()
+    b.cublaslt_workspace_size(0)
+    b.cublas_workspace_size(0)
+    try:
+        yield
+    finally:
+        b.cublas_workspace_size(old[0])
+        b.cublaslt_workspace_size(old[1])
+
+
 _ENV = ("UNSLOTH_MOE_GROUPED_TRITON", "UNSLOTH_DISABLE_MOE_TRITON", "UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS",
         "UNSLOTH_MOE_RECOMPUTE", "UNSLOTH_MOE_SELECTIVE_DEQUANT")
 
@@ -369,14 +386,15 @@ def test_expert_bias_gather_chunks_bound_one_hot(monkeypatch):
     ids = torch.randint(0, E, (M,), generator = gen).sort().values.cuda()
     bias = (torch.randn(E, D, generator = gen) * 0.02).to("cuda", DT).requires_grad_(True)
     g = torch.randn(M, D, generator = gen).to("cuda", DT)
-    mu._gather_expert_bias(bias, ids).backward(g)  # cuBLAS workspace
+    mu._gather_expert_bias(bias, ids).backward(g)  # cuBLAS workspace (torch < 2.15 caches it per handle)
     bias.grad = None
     out = mu._gather_expert_bias(bias, ids)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.memory_allocated()
-    out.backward(g)
-    torch.cuda.synchronize()
+    with _no_blas_workspace():
+        out.backward(g)
+        torch.cuda.synchronize()
     extra = torch.cuda.max_memory_allocated() - before
     # unchunked: 25 MB (bool + bf16 one-hot); chunked: 5 MB
     assert extra < 8 * 2**20, extra
@@ -514,8 +532,8 @@ def test_expert_bias_gather_long_backward_is_reproducible(path, dtype, monkeypat
 @pytest.mark.parametrize("dynamic", [False, True], ids = ["static", "dynamic"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_expert_bias_gather_compiled_upcast_caps_the_fp32_copy(dtype, dynamic, monkeypatch):
-    """Compiled backward on the upcast fallback (CPU, ROCm, XPU, CUDA torch < 2.9): each fp32 copy of grad stays
-    within one chunk instead of all rows x width, and the bias grad is bitwise the eager chunked one."""
+    """Compiled upcast fallback (CPU, ROCm, XPU, CUDA torch < 2.9) caps each fp32 grad copy to one chunk, not rows x
+    width; bias grad is bitwise the eager chunked one."""
     if not hasattr(torch.library, "custom_op"):
         pytest.skip("torch.library.custom_op unavailable")
     monkeypatch.setattr(mu, "_MM_OUT_DTYPE", False, raising = False)

@@ -80,13 +80,8 @@ def _compile_disabled():
 
 
 def _reference(patched, kwargs):
-    """What the unpatched compiled path builds: the original with the skip forced off.
-
-    Compiled, transformers sees is_compiling() and always builds the mask. Under
-    UNSLOTH_COMPILE_DISABLE=1 the wrapper is the stock function, whose own SDPA
-    shortcut returns None for an unpadded causal batch, so the reference reports
-    compiling the same way to get the mask the compiled path would have built.
-    """
+    """Reference mask the compiled path would build: UNSLOTH_SKIP_CAUSAL_MASK forced to 0 and is_compiling() reported
+    True, since under UNSLOTH_COMPILE_DISABLE=1 stock SDPA returns None for unpadded causal batches."""
     import os
     from unittest import mock
     previous = os.environ.get("UNSLOTH_SKIP_CAUSAL_MASK")
@@ -616,8 +611,8 @@ def _flash_rule(capability, torch_2_6):
 @pytest.mark.parametrize("dropout", [0.0, 0.1])
 @pytest.mark.parametrize("grad", [True, False])
 def test_flash_sdpa_check_defers_to_the_dispatcher(monkeypatch, torch_2_6, capability, head_dim, dropout, grad):
-    # Gemma-2B GQA training (head_dim 256, 8:1 heads, dropout 0.1) on sm86 / sm89 must keep the mask:
-    # without it flash refuses and SDPA falls to the quadratic math kernel.
+    # Gemma-2B GQA training (head_dim 256, 8:1 heads, dropout 0.1) on sm86 / sm89 must keep the mask; without it flash
+    # refuses and SDPA falls to the quadratic math kernel.
     import types
     from transformers import GemmaConfig
     monkeypatch.setattr(torch.version, "hip", None)
@@ -657,8 +652,8 @@ def test_flash_sdpa_check_keeps_the_mask_when_the_probe_fails(monkeypatch):
 @pytest.mark.parametrize("efficient", [True, False])
 @pytest.mark.parametrize("efficient_enabled", [True, False])
 def test_mha_rejected_by_flash_runs_maskless_on_the_efficient_kernel(monkeypatch, kv_heads, efficient, efficient_enabled):
-    # sm86 / sm89 / sm120 flash refuses some training shapes. Equal head counts need no enable_gqa,
-    # so mem-efficient SDPA still runs the maskless causal call; GQA would fall to the math kernel.
+    # sm86 / sm89 / sm120 flash refuses some training shapes; equal head counts need no enable_gqa, so mem-efficient
+    # SDPA still runs maskless causal, while GQA would fall to the math kernel.
     import types
     from transformers import LlamaConfig
     monkeypatch.setattr(torch.version, "hip", None)

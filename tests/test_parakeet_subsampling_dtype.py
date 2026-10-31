@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The FastConformer subsampling (Parakeet, Canary) must not run its frozen conv stack on float32
-activations under Unsloth's conv dtype wrapper: same outputs, half the activation memory."""
+"""FastConformer subsampling (Parakeet, Canary) must not run its frozen conv stack on float32 activations under
+Unsloth's conv dtype wrapper: same outputs, half the activation memory."""
 
 import pytest
 import torch

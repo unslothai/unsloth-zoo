@@ -31,7 +31,7 @@ def _allow_cpu_import(monkeypatch):
 def _modules():
     try:
         ce = importlib.import_module("unsloth_zoo.fused_losses.cross_entropy_loss")
-        tiled = importlib.import_module("unsloth_zoo.tiled_mlp")
+        tiled = importlib.import_module("unsloth_zoo.memory_budget")
     except ImportError as e:
         pytest.skip(f"unsloth_zoo import unavailable: {e}")
     return ce, tiled
@@ -159,16 +159,17 @@ def test_fused_ce_budgets_the_lm_head_device(monkeypatch, route):
     assert seen and all(isinstance(d, torch.device) and d == weight.device for d in seen), seen
 
 
-def test_tiled_mlp_budget_follows_the_input_device(monkeypatch):
-    _, tiled = _modules()
+def test_tiled_mlp_budget_follows_the_module_device(monkeypatch):
     import torch
+    from unsloth_zoo import tiling_registry
     seen = []
 
     def record(device = None):
         seen.append(device)
         return 0.001
 
-    monkeypatch.setattr(tiled, "_default_target_gb", record)
+    # Planned at install (outside any compiled region) from the module's own device, never per forward.
+    monkeypatch.setattr(tiling_registry, "_default_target_gb", record)
 
     class MLP(torch.nn.Module):
         def __init__(self):
@@ -180,8 +181,8 @@ def test_tiled_mlp_budget_follows_the_input_device(monkeypatch):
             return self.down(torch.nn.functional.gelu(self.up(x)))
 
     mlp = MLP()
-    tiled.patch_mlp(mlp, target_arctic = False, target_gb = None, padded_length = 8)
+    tiling_registry.install_module(mlp, "auto")
     x = torch.randn(2, 64, 16, requires_grad = True)
     mlp(x).sum().backward()
     mlp(x).sum().backward()
-    assert seen == [x.device], seen
+    assert seen == [mlp.up.weight.device], seen
