@@ -468,6 +468,29 @@ def test_flex_without_tail_selection_keeps_upstream(monkeypatch):
     assert _stat("flex") == 0
 
 
+@pytest.mark.parametrize("attn", ["eager", "sdpa"])
+def test_flex_matches_upstream_on_an_empty_real_selection(monkeypatch, attn):
+    """A mask hole before the first complete pool leaves a real query with no key even with the tail on: the
+    dense mask attends uniformly there, so flex must too."""
+    from torch.nn.attention.flex_attention import flex_attention
+    _patched()
+    model = _model(index_kpool = 16, index_topk = 64, attn = attn)
+    seq = 100
+    ids = torch.randint(0, 256, (2, seq), generator = torch.Generator().manual_seed(5))
+    mask = torch.ones(2, seq, dtype = torch.bool)
+    mask[0, 1] = False
+    with torch.no_grad():
+        with _upstream():
+            ref = model(input_ids = ids, attention_mask = mask).last_hidden_state
+        monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda q: True)
+        monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
+        monkeypatch.setattr("unsloth_zoo.flex_attention.utils.flex_attention", flex_attention)
+        gates.reset_sparse_attn_stats()
+        out = model(input_ids = ids, attention_mask = mask).last_hidden_state
+    assert _stat("flex") == 3
+    torch.testing.assert_close(out[mask], ref[mask], atol = 2e-5, rtol = 1e-4)
+
+
 def test_tiny_model_cached_greedy_decode_across_the_budget():
     """Prefill below the budget (skip), decode past it (scored, one query): same tokens and logits."""
     _patched()

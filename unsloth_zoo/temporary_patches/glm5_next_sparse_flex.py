@@ -231,7 +231,7 @@ def _pool_starts(topk_indices, kpool, index_topk):
     return starts, valid, phase
 
 
-def glm5_next_flex_attention(query, key, value, topk_indices, scaling, kpool, index_topk, tail):
+def glm5_next_flex_attention(query, key, value, topk_indices, scaling, kpool, index_topk, tail, eager = False):
     """Flex attention over exactly the keys in `topk_indices` (pool slots then tail); [B, S, H, D_v]."""
     from unsloth_zoo.flex_attention import sparse_blocks as sb
 
@@ -248,6 +248,14 @@ def glm5_next_flex_attention(query, key, value, topk_indices, scaling, kpool, in
         except Exception:
             pass
     out = sb._flex(query, key, value, block_mask, scaling)
+    if eager:
+        # A query that selected no key (a mask hole before the first complete pool, or padding): eager's mask is
+        # finfo.min across the row, i.e. uniform attention over every key. SDPA returns zeros there, as flex does.
+        empty = (topk_indices < 0).all(dim = -1)
+        mean_v = value.float().mean(dim = 2)
+        if mean_v.shape[1] != out.shape[1]:
+            mean_v = mean_v.repeat_interleave(out.shape[1] // mean_v.shape[1], dim = 1)
+        out = torch.where(empty[:, None, :, None], mean_v[:, :, None, :].to(out.dtype), out)
     _count("flex")
     return out.transpose(1, 2).contiguous()
 
@@ -381,7 +389,7 @@ def unsloth_glm5_next_attention_forward(self, hidden_states, attention_mask, pas
         attn_output = _run_flex(
             _FAMILY, "GLM-5.3-Flash", glm5_next_flex_attention, query_states, key_states, value_states,
             query_states, key_states, value_states, topk_indices, self.scaling,
-            config.index_kpool, config.index_topk, tail,
+            config.index_kpool, config.index_topk, tail, config._attn_implementation == "eager",
         )
         if attn_output is not None:
             attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
