@@ -607,24 +607,28 @@ def requires_grad_for_gradient_checkpointing(model):
         # Hooks with with_kwargs = True (Unsloth's inputs_embeds pre-hook) take (module, args, kwargs); re-register them
         # the same way, or the next forward calls them with two arguments.
         with_kwargs = set(getattr(module, f"{_hooks}_with_kwargs", None) or ())
+        # Forward hooks registered with always_call = True (they run even when forward raises) keep that flag too.
+        always_call = set(getattr(module, f"{_hooks}_always_called", None) or ())
         other_hooks = []
         for key, value in old_hooks.items():
             qualname = getattr(value, "__qualname__", "")
             name     = getattr(value, "__name__", "")
             if name1 in qualname or name2 in qualname: pass
             elif name2 in name or name2 in name: pass
-            else: other_hooks.append((value, key in with_kwargs))
+            else: other_hooks.append((value, key in with_kwargs, key in always_call))
         pass
         # Keep none input requires grad hooks
         exec(f"module.{_hooks} = OrderedDict()")
         if hasattr(module, f"{_hooks}_with_kwargs"):
             getattr(module, f"{_hooks}_with_kwargs").clear()
+        if hasattr(module, f"{_hooks}_always_called"):
+            getattr(module, f"{_hooks}_always_called").clear()
         register = getattr(module, f"register{_hooks[:-1]}")
-        for hook, kwargs_hook in other_hooks:
-            if kwargs_hook:
-                register(hook, with_kwargs = True)
-            else:
-                register(hook)
+        for hook, kwargs_hook, always_hook in other_hooks:
+            options = {}
+            if kwargs_hook: options["with_kwargs"] = True
+            if always_hook: options["always_call"] = True
+            register(hook, **options)
     pass
 
     # Remove all previous forward hooks for gradient checkpointing
