@@ -111,6 +111,20 @@ from safetensors.torch import load_file
 injected = inject_adapter_in_model(cfg, model_class().from_pretrained(CKPT, dtype = torch.float32))
 set_peft_model_state_dict(injected, load_file(os.path.join(ADAPTER, "adapter_model.safetensors")))
 out["injected_max_abs"] = float((logits(injected) - want).abs().max())
+# Failing before: a compiled wrapper's `_orig_mod.` names matched no key, and a hotswap into a lower-rank adapter
+# never converted (orientation was read from the whole shape, rank included).
+small = LoraConfig(r = 2, lora_alpha = 8, target_modules = ["q_proj"], init_lora_weights = False,
+                   target_parameters = ["experts.gate_up_proj", "experts.down_proj"])
+low = get_peft_model(model_class().from_pretrained(CKPT, dtype = torch.float32), small)
+low.save_pretrained(os.path.join(WORK, "low"))
+low = PeftModel.from_pretrained(model_class().from_pretrained(CKPT, dtype = torch.float32), os.path.join(WORK, "low"))
+compiled = torch.compile(low, backend = "eager")
+hotswap_adapter(compiled, ADAPTER, adapter_name = "default")
+# Unsloth's forward reads the factors by shape, so check the merge, which needs PEFT's own layout.
+try:
+    out["compiled_rank_hotswap_max_abs"] = float((logits(low.merge_and_unload()) - want).abs().max())
+except Exception as e:
+    out["compiled_rank_hotswap_max_abs"] = f"{type(e).__name__}: {e}"[:200]
 print(json.dumps(out))
 '''
 
@@ -146,8 +160,8 @@ def test_unsloth_expert_lora_loads_in_vanilla_peft(tmp_path, family):
     assert trained["reload_max_abs"] <= 1e-4, trained
     # Failing before: hotswap grew lora_A / padded lora_B instead of mapping the factors back, and prefixed keys did
     # not match an injected model's module names (size mismatch).
-    for key in ("hotswap_max_abs", "merged_max_abs", "injected_max_abs"):
-        assert trained[key] <= 1e-4, trained
+    for key in ("hotswap_max_abs", "merged_max_abs", "injected_max_abs", "compiled_rank_hotswap_max_abs"):
+        assert isinstance(trained[key], float) and trained[key] <= 1e-4, trained
     loaded = _run(VANILLA_LOAD, family, work, zoo = False)
     assert loaded["vanilla_max_abs"] <= 1e-4, loaded
 

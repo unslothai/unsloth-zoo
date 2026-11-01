@@ -118,6 +118,8 @@ def _swapped_wrappers(model):
 
 
 def _bare(name):
+    while name.startswith("_orig_mod."):  # torch.compile wrappers
+        name = name[len("_orig_mod."):]
     for prefix in ("base_model.model.", "base_model."):
         if name.startswith(prefix):
             return name[len(prefix):]
@@ -168,14 +170,14 @@ def _from_vanilla(model, state_dict, adapter_name):
         lora_A_dict = getattr(wrapper, "lora_A", None)
         if lora_A_dict is None or adapter_name not in lora_A_dict:
             continue
-        lora_A = lora_A_dict[adapter_name]
-        want = tuple(lora_A.weight.shape)
+        # Orientation from lora_A's input dimension only: a hotswap may bring another rank.
+        want_in = lora_A_dict[adapter_name].weight.shape[1]
         for key_a, key_b in _pair_keys(state_dict, module_name):
             a, b = state_dict[key_a], state_dict[key_b]
-            if tuple(a.shape) == want:
+            if a.shape[1] == want_in:
                 continue   # trained under Unsloth before this change, or square
             new_a, new_b = swap_expert_lora_factors(a, b, num_experts)
-            if tuple(new_a.shape) == want:
+            if new_a.shape[1] == want_in:
                 state_dict[key_a], state_dict[key_b] = new_a, new_b
     return state_dict
 
