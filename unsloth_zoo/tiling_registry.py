@@ -480,7 +480,8 @@ def needs_rng_replay(module, spec):
     if _is_compiling():
         # Source inspection cannot run while tracing: use the eager verdict (computed at install) while it still
         # describes this module tree and inner forward, else replay.
-        if cached is None or cached[0] != _MODULE_TREE_VERSION[0] or cached[1] != id(module) or \
+        # No id(module) here: an identity guard per MLP would compile every layer of a class separately.
+        if cached is None or cached[0] != _MODULE_TREE_VERSION[0] or \
                 cached[3] is not module.__dict__.get("_unsloth_forward"):
             return True
         return cached[2]
@@ -676,6 +677,10 @@ def _op_eligible(module, spec, hidden):
         return False
     if not hidden or _DTensor is not None and any(isinstance(p, _DTensor) for p in module.parameters()):
         return False
+    if any(True for _ in module.buffers()):
+        # The op's inputs are x and the trainable parameters: a buffer it reads from the live module has no tensor
+        # dependency in the graph, so an in-place update (QAT observers, scales) could be ordered either side of it.
+        return False
     # The op's output is shaped like its input; the last projection (last direct child with out_features: down_proj,
     # fc2, w2) must map back to the input width. Read statically: running the forward here would show in hooks.
     widths = [m.out_features for m in module.children() if isinstance(getattr(m, "out_features", None), int)]
@@ -720,27 +725,18 @@ def _op_uses_every_parameter(module, hidden):
     params = [p for p in module.parameters() if p.requires_grad]
     if not params:
         return True
-    # Buffers the forward may update (QAT observers, running stats) are put back: the probe must not train them.
-    saved = [(m, name, b.clone()) for m in module.modules() for name, b in m._buffers.items() if b is not None]
     try:
         ref = params[0]
         x = torch.zeros(1, hidden, device = ref.device, dtype = ref.dtype if ref.is_floating_point() else None)
         with torch.enable_grad():
-            y = _inner_forward(module)(x)
+            # Fed as the op feeds its tiles (1, rows, hidden): Unsloth's fused LoRA MLP takes 3-D input only.
+            y = _tile_fn(module, True, ("rows",), x)
             if not torch.is_tensor(y) or not y.requires_grad:
                 return False
             grads = torch.autograd.grad(y.float().sum(), params, allow_unused = True)
         return all(g is not None for g in grads)
     except Exception:
         return False
-    finally:
-        with torch.no_grad():
-            for m, name, b in saved:
-                current = m._buffers.get(name)
-                if current is not None and current.shape == b.shape:
-                    current.copy_(b)
-                else:
-                    m._buffers[name] = b
 
 
 def _op_matches(module, params):

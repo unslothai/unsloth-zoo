@@ -473,7 +473,7 @@ def test_functional_call_substitutions_keep_the_tile_frame_route(in_unsloth_bloc
 
 def test_an_unchanged_mlp_still_takes_the_op(in_unsloth_block, monkeypatch):
     torch.manual_seed(0)
-    mlp = _ScaledMLP()
+    mlp = _LoraMLP()
     R.install_module(mlp, "rows:8")
     seen = _spy_op(monkeypatch)
     _run(_Block(mlp), torch.randn(1, 64, H, requires_grad = True))
@@ -504,6 +504,55 @@ def test_a_stochastic_inner_forward_patched_after_install_replays_rng(in_unsloth
     seen = _spy_op(monkeypatch)
     _run(_Block(mlp), torch.randn(1, 64, H, requires_grad = True))
     assert seen == []
+
+
+def test_blocks_of_one_class_share_a_graph(in_unsloth_block, monkeypatch):
+    # Failing before: the cached RNG verdict compared id(module) while tracing, an identity guard per MLP, so every
+    # layer compiled its own graph (and past the recompile limit ran eager).
+    from torch._dynamo.testing import CompileCounter
+    torch.manual_seed(0)
+    blocks = [_Block(_LoraMLP()) for _ in range(6)]
+    for block in blocks:
+        R.install_module(block.mlp, "rows:8")
+    seen = _spy_op(monkeypatch)
+    counter = CompileCounter()
+    run = torch.compile(lambda block, x: block(x), backend = counter, dynamic = True)
+    for block in blocks:
+        run(block, torch.randn(1, 64, H, requires_grad = True)).sum().backward()
+    assert seen and counter.frame_count == 1
+
+
+def test_a_buffer_updated_between_calls_is_read_in_order(in_unsloth_block):
+    # The op's inputs are x and the trainable parameters: a buffer it reads from the live module has no tensor
+    # dependency, so the compiler may order it against an in-place update. Buffered MLPs keep the per-tile route.
+    torch.manual_seed(0)
+    mlp = _ScaledMLP()
+    R.install_module(mlp, "rows:8")
+    ref = _ScaledMLP()
+    ref.load_state_dict(mlp.state_dict())
+    x = torch.randn(64, H)
+
+    def run(m, x):
+        first = m(x)
+        m.scale.add_(1)
+        return first, m(x)
+    want = run(ref, x)
+    got = torch.compile(run, backend = "aot_eager", dynamic = True)(mlp, x)
+    torch.testing.assert_close(got, want)
+
+
+def test_the_install_probe_feeds_tiles_as_the_op_does(in_unsloth_block):
+    # Failing before: the probe passed a 2-D row, which a 3-D-only inner forward (Unsloth's fused LoRA MLP) rejects,
+    # so the op was declined for it.
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+
+    def three_d_only(self, x):
+        batch, seq_len, hd = x.shape
+        return _LoraMLP.forward(self, x)
+    mlp._unsloth_forward = three_d_only.__get__(mlp)
+    R.install_module(mlp, "rows:8")
+    assert mlp._unsloth_tiling.op_ok
 
 
 def test_backward_recompute_holds_the_module_lock(in_unsloth_block, monkeypatch):
