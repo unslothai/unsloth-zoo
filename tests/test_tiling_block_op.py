@@ -258,3 +258,38 @@ def test_a_width_changing_mlp_keeps_the_tile_frame_route(in_unsloth_block, monke
     y, breaks = _run(mlp, x)
     assert seen == [] and breaks > 0
     torch.testing.assert_close(y, ref(x.detach()))
+
+
+class _TransposedGradMatmul(torch.autograd.Function):
+    """x @ w whose weight gradient comes back transposed in memory, as some mm backwards (fused LoRA) return it."""
+
+    @staticmethod
+    def forward(ctx, x, w):
+        ctx.save_for_backward(x, w)
+        return x @ w
+
+    @staticmethod
+    def backward(ctx, g):
+        x, w = ctx.saved_tensors
+        gw = (g.reshape(-1, g.shape[-1]).t() @ x.reshape(-1, x.shape[-1])).t()
+        assert not gw.is_contiguous()
+        return g @ w.t(), gw
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_a_transposed_parameter_gradient_is_laid_out_like_the_parameter(in_unsloth_block, backend):
+    class FooMLP(_LoraMLP):
+        def forward(self, x):
+            return self.d(F.silu(self.g(x) + _TransposedGradMatmul.apply(x, self.A) @ self.B) * self.u(x))
+    FooMLP.__module__ = "transformers.models.foo.modeling_foo"
+    torch.manual_seed(0)
+    block = _Block(FooMLP())
+    ref = copy.deepcopy(block)
+    R.install_module(block.mlp, "rows:8")
+    x = torch.randn(1, 64, H, requires_grad = True)
+    xr = x.detach().clone().requires_grad_()
+    y, breaks = _run(block, x, backend = backend)
+    _ref(ref, xr)
+    assert breaks == 0
+    for a, b in zip(_grads(block, x), _grads(ref, xr)):
+        torch.testing.assert_close(a, b)

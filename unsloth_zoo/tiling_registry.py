@@ -731,7 +731,12 @@ def _op_backward_impl(x, grad, params, n_tiles, amp = None):
             dx.narrow(0, start, length).copy_(grads[0])
             for k, g in enumerate(grads[1:]):
                 if g is not None:
-                    dparams[k] = g if dparams[k] is None else dparams[k].add_(g)
+                    if dparams[k] is None:
+                        # Laid out like the parameter (the fake kernel's promise): a mm backward can return a
+                        # transposed gradient, which Inductor's stride assert rejects.
+                        dparams[k] = torch.empty_like(own[k]).copy_(g)
+                    else:
+                        dparams[k].add_(g)
     return [dx] + [torch.zeros_like(p) if g is None else g for g, p in zip(dparams, own)]
 
 
