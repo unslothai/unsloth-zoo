@@ -46,8 +46,29 @@ __all__ = [
     "patch_expert_lora_factor_swap",
 ]
 
-# Set on an experts class by the zoo patch that changes how PEFT factors its stacks.
+# Set on an experts class by the zoo patch that changes how PEFT factors its stacks: True when the stacks are
+# stored transposed (any PEFT), "is_transposed" when only the class's is_transposed flag differs (a PEFT that
+# ignores is_transposed, such as 0.18, factors it as vanilla does).
 SWAPPED_FACTORS_FLAG = "_unsloth_expert_lora_factors_swapped"
+_PEFT_READS_IS_TRANSPOSED = []
+
+
+def _peft_reads_is_transposed():
+    if not _PEFT_READS_IS_TRANSPOSED:
+        try:
+            import inspect
+            from peft.tuners.lora.layer import ParamWrapper
+            _PEFT_READS_IS_TRANSPOSED.append("is_transposed" in inspect.getsource(ParamWrapper))
+        except Exception:
+            _PEFT_READS_IS_TRANSPOSED.append(True)
+    return _PEFT_READS_IS_TRANSPOSED[0]
+
+
+def _factors_swapped(experts_class):
+    flag = getattr(experts_class, SWAPPED_FACTORS_FLAG, False)
+    if flag == "is_transposed":
+        return _peft_reads_is_transposed()
+    return bool(flag)
 
 
 def swap_expert_lora_factors(lora_A: torch.Tensor, lora_B: torch.Tensor, num_experts: int):
@@ -88,7 +109,7 @@ def _swapped_wrappers(model):
         if type(module).__name__ != "ParamWrapper":
             continue
         experts = _innermost(module)
-        if not getattr(type(experts), SWAPPED_FACTORS_FLAG, False):
+        if not _factors_swapped(type(experts)):
             continue
         num_experts = _num_experts(experts)
         if num_experts:
@@ -96,25 +117,29 @@ def _swapped_wrappers(model):
     return out
 
 
-def _pair_keys(state_dict, module_name):
-    """lora_A / lora_B key pairs of `module_name` in a PEFT state dict (adapter name present or stripped)."""
-    names = [module_name]
+def _bare(name):
     for prefix in ("base_model.model.", "base_model."):
-        if module_name.startswith(prefix):
-            names.append(module_name[len(prefix):])
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _pair_keys(state_dict, module_name):
+    """lora_A / lora_B key pairs of `module_name` in a PEFT state dict (adapter name present or stripped). Keys and
+    module names are matched without PEFT's `base_model.model.` prefix, which either side may carry (a PeftModel
+    checkpoint loaded into a model from inject_adapter_in_model, or the reverse)."""
+    target = _bare(module_name)
     pairs = []
     for key in state_dict:
-        for name in names:
-            head = f"{name}.lora_A."
-            if not key.startswith(head) or not key.endswith("weight"):
-                continue
-            # The direct child only: a nested wrapper is `name.base_layer.lora_A...`.
-            middle = key[len(head):]
-            if "base_layer" in middle:
-                continue
-            key_b = f"{name}.lora_B.{middle}"
-            if key_b in state_dict:
-                pairs.append((key, key_b))
+        if ".lora_A." not in key or not key.endswith("weight"):
+            continue
+        name, middle = key.split(".lora_A.", 1)
+        # The direct child only: a nested wrapper is `name.base_layer.lora_A...`.
+        if _bare(name) != target or "base_layer" in middle:
+            continue
+        key_b = f"{name}.lora_B.{middle}"
+        if key_b in state_dict:
+            pairs.append((key, key_b))
     return pairs
 
 
@@ -182,17 +207,38 @@ def _wrap_set(original):
     return set_peft_model_state_dict
 
 
+def _wrap_hotswap(original):
+    def hotswap_adapter_from_state_dict(model, state_dict, adapter_name, *args, **kwargs):
+        try:
+            state_dict = _from_vanilla(model, state_dict, adapter_name)
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: hotswapped expert LoRA factors unchanged: {e}")
+        return original(model, state_dict, adapter_name, *args, **kwargs)
+    hotswap_adapter_from_state_dict._unsloth_factor_swap = True
+    hotswap_adapter_from_state_dict.__wrapped__ = original
+    return hotswap_adapter_from_state_dict
+
+
 def patch_expert_lora_factor_swap():
     try:
         import peft.utils.save_and_load as save_and_load
     except Exception:
         return
-    for name, wrap in (("get_peft_model_state_dict", _wrap_get), ("set_peft_model_state_dict", _wrap_set)):
-        original = getattr(save_and_load, name, None)
+    try:
+        import peft.utils.hotswap as hotswap
+    except Exception:
+        hotswap = None
+    for source, name, wrap in (
+        (save_and_load, "get_peft_model_state_dict", _wrap_get),
+        (save_and_load, "set_peft_model_state_dict", _wrap_set),
+        (hotswap, "hotswap_adapter_from_state_dict", _wrap_hotswap),
+    ):
+        original = getattr(source, name, None)
         if original is None or getattr(original, "_unsloth_factor_swap", False):
             continue
         patched = wrap(original)
-        # peft re-exports both (peft, peft.utils, peft.peft_model, peft.mixed_model, ...): rebind every alias.
+        # peft re-exports these (peft, peft.utils, peft.peft_model, peft.mixed_model, ...): rebind every alias.
         for module in list(sys.modules.values()):
             if module is None or not getattr(module, "__name__", "").startswith("peft"):
                 continue

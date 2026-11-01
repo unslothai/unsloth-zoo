@@ -95,7 +95,23 @@ want = logits(model)
 model.save_pretrained(ADAPTER)
 torch.save(want, os.path.join(WORK, "unsloth_logits.pt"))
 fresh = PeftModel.from_pretrained(model_class().from_pretrained(CKPT, dtype = torch.float32), ADAPTER)
-print(json.dumps({"reload_max_abs": float((logits(fresh) - want).abs().max())}))
+out = {"reload_max_abs": float((logits(fresh) - want).abs().max())}
+# Hotswap: load another adapter, then swap the saved one in (peft.utils.hotswap bypasses set_peft_model_state_dict).
+other = get_peft_model(model_class().from_pretrained(CKPT, dtype = torch.float32), cfg)
+other.save_pretrained(os.path.join(WORK, "other"))
+from peft.utils.hotswap import hotswap_adapter
+swapped = PeftModel.from_pretrained(model_class().from_pretrained(CKPT, dtype = torch.float32), os.path.join(WORK, "other"))
+hotswap_adapter(swapped, ADAPTER, adapter_name = "default")
+out["hotswap_max_abs"] = float((logits(swapped) - want).abs().max())
+merged = swapped.merge_and_unload()
+out["merged_max_abs"] = float((logits(merged) - want).abs().max())
+# A PeftModel checkpoint (keys prefixed base_model.model.) loaded into a model from inject_adapter_in_model.
+from peft import inject_adapter_in_model, set_peft_model_state_dict
+from safetensors.torch import load_file
+injected = inject_adapter_in_model(cfg, model_class().from_pretrained(CKPT, dtype = torch.float32))
+set_peft_model_state_dict(injected, load_file(os.path.join(ADAPTER, "adapter_model.safetensors")))
+out["injected_max_abs"] = float((logits(injected) - want).abs().max())
+print(json.dumps(out))
 '''
 
 VANILLA_LOAD = COMMON + r'''
@@ -128,6 +144,10 @@ def test_unsloth_expert_lora_loads_in_vanilla_peft(tmp_path, family):
     _run(VANILLA_SAVE, family, work, zoo = False)
     trained = _run(UNSLOTH_TRAIN, family, work, zoo = True)
     assert trained["reload_max_abs"] <= 1e-4, trained
+    # Failing before: hotswap grew lora_A / padded lora_B instead of mapping the factors back, and prefixed keys did
+    # not match an injected model's module names (size mismatch).
+    for key in ("hotswap_max_abs", "merged_max_abs", "injected_max_abs"):
+        assert trained[key] <= 1e-4, trained
     loaded = _run(VANILLA_LOAD, family, work, zoo = False)
     assert loaded["vanilla_max_abs"] <= 1e-4, loaded
 
@@ -148,3 +168,20 @@ def test_factor_swap_is_an_involution_and_keeps_the_delta():
         b = b.reshape(b.shape[0], R, E).permute(2, 0, 1)
         return b @ a
     torch.testing.assert_close(delta(A2, B2), delta(A, B).transpose(-2, -1))
+
+
+def test_llama4_factors_follow_pefts_is_transposed_support(monkeypatch):
+    # Failing before: PEFT 0.18 ignores is_transposed, so Llama-4 factors already matched vanilla and swapping them
+    # on save broke vanilla loading there. A physically transposed stack (Qwen3-VL-MoE) is swapped on any PEFT.
+    from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
+
+    class Relabelled:
+        _unsloth_expert_lora_factors_swapped = "is_transposed"
+
+    class Transposed:
+        _unsloth_expert_lora_factors_swapped = True
+
+    monkeypatch.setattr(swap, "_PEFT_READS_IS_TRANSPOSED", [False])
+    assert not swap._factors_swapped(Relabelled) and swap._factors_swapped(Transposed)
+    monkeypatch.setattr(swap, "_PEFT_READS_IS_TRANSPOSED", [True])
+    assert swap._factors_swapped(Relabelled) and swap._factors_swapped(Transposed)
