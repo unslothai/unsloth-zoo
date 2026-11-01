@@ -33,6 +33,7 @@ as is on both sides: no real Llama-4 or Qwen3-VL-MoE checkpoint has one.
 
 from __future__ import annotations
 
+import os
 import sys
 
 import torch
@@ -246,16 +247,24 @@ def _wrap_load_adapter(original):
 
         def _load_pretrained_model(*a, **k):
             try:
+                model = k.get("model", self)
+                # Only adapters over the re-laid-out experts need it: everything else keeps transformers' own
+                # path (disk offload indexes the checkpoint files it was given).
+                if not _swapped_wrappers(model):
+                    return cls_load(*a, **k)
                 state_dict = k.get("state_dict")
                 files = list(k.get("checkpoint_files") or [])
-                if state_dict is None and files and all(str(f).endswith(".safetensors") for f in files):
-                    from safetensors.torch import load_file
+                if state_dict is None and files and all(os.path.isfile(str(f)) for f in files):
                     state_dict = {}
                     for f in files:
-                        state_dict.update(load_file(str(f)))
+                        if str(f).endswith(".safetensors"):
+                            from safetensors.torch import load_file
+                            state_dict.update(load_file(str(f)))
+                        else:
+                            state_dict.update(torch.load(str(f), map_location = "cpu", weights_only = True))
                     k = dict(k, checkpoint_files = [])
                 if state_dict is not None:
-                    k = dict(k, state_dict = _from_vanilla(k.get("model", self), state_dict, name))
+                    k = dict(k, state_dict = _from_vanilla(model, state_dict, name))
             except Exception as e:
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.warning(f"Unsloth: loaded expert LoRA factors unchanged: {e}")

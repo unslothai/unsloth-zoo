@@ -115,6 +115,11 @@ out["injected_max_abs"] = float((logits(injected) - want).abs().max())
 direct = model_class().from_pretrained(CKPT, dtype = torch.float32)
 direct.load_adapter(ADAPTER)
 out["load_adapter_max_abs"] = float((logits(direct) - want).abs().max())
+# The same through a .bin adapter (transformers reads those itself too).
+model.save_pretrained(os.path.join(WORK, "adapter_bin"), safe_serialization = False)
+direct_bin = model_class().from_pretrained(CKPT, dtype = torch.float32)
+direct_bin.load_adapter(os.path.join(WORK, "adapter_bin"), use_safetensors = False)
+out["load_adapter_bin_max_abs"] = float((logits(direct_bin) - want).abs().max())
 # Failing before: a compiled wrapper's `_orig_mod.` names matched no key, and a hotswap into a lower-rank adapter
 # never converted (orientation was read from the whole shape, rank included).
 small = LoraConfig(r = 2, lora_alpha = 8, target_modules = ["q_proj"], init_lora_weights = False,
@@ -169,7 +174,7 @@ def test_unsloth_expert_lora_loads_in_vanilla_peft(tmp_path, family, b_layout):
     # Failing before: hotswap grew lora_A / padded lora_B instead of mapping the factors back, and prefixed keys did
     # not match an injected model's module names (size mismatch).
     for key in ("hotswap_max_abs", "merged_max_abs", "injected_max_abs", "compiled_rank_hotswap_max_abs",
-                "load_adapter_max_abs"):
+                "load_adapter_max_abs", "load_adapter_bin_max_abs"):
         assert isinstance(trained[key], float) and trained[key] <= 1e-4, trained
     if b_layout == "grouped_by_expert":
         # Legacy packing is left as trained: vanilla PEFT refuses it by shape (never a silent wrong load).
@@ -213,3 +218,36 @@ def test_llama4_factors_follow_pefts_is_transposed_support(monkeypatch):
     assert not swap._factors_swapped(Relabelled) and swap._factors_swapped(Transposed)
     monkeypatch.setattr(swap, "_PEFT_READS_IS_TRANSPOSED", [True])
     assert swap._factors_swapped(Relabelled) and swap._factors_swapped(Transposed)
+
+
+QWEN3_VL_NATIVE_LAYOUT = r'''
+import json, os, sys, torch
+import transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe as m
+LAYOUT = sys.argv[1]
+if LAYOUT == "hidden_first":
+    # transformers 4.x builds the stacks as (E, H, 2I) / (E, I, H): the layout Unsloth stores.
+    def init(self, config):
+        torch.nn.Module.__init__(self)
+        self.num_experts = config.num_experts
+        self.gate_up_proj = torch.nn.Parameter(torch.empty(config.num_experts, config.hidden_size, 2 * config.moe_intermediate_size))
+        self.down_proj = torch.nn.Parameter(torch.empty(config.num_experts, config.moe_intermediate_size, config.hidden_size))
+    m.Qwen3VLMoeTextExperts.__init__ = init
+import unsloth_zoo
+assert unsloth_zoo.__file__.startswith(os.environ["REPO"]), unsloth_zoo.__file__
+from unsloth_zoo.temporary_patches.qwen3_vl_moe import patch_qwen3_vl_moe
+patch_qwen3_vl_moe()
+patch_qwen3_vl_moe()  # a re-patch must not read Unsloth's own __init__ as transformers'
+print(json.dumps({"swapped": m.Qwen3VLMoeTextExperts.__dict__.get("_unsloth_expert_lora_factors_swapped")}))
+'''
+
+
+@pytest.mark.parametrize("layout, swapped", [("transformers", True), ("hidden_first", False)])
+def test_qwen3_vl_moe_swaps_factors_only_when_transformers_stores_another_layout(tmp_path, layout, swapped):
+    # Failing before: the flag was set unconditionally, so on transformers 4.x (whose own stacks are already
+    # (E, H, 2I)) saves were swapped and vanilla PEFT refused a Qwen3-VL-MoE adapter it loaded before (size mismatch).
+    import transformers
+
+    if int(transformers.__version__.split(".")[0]) < 5 and layout == "transformers":
+        swapped = False  # transformers 4.x itself builds the hidden-first layout
+    got = _run(QWEN3_VL_NATIVE_LAYOUT.replace("sys.argv[1]", repr(layout)), "qwen3_vl_moe", str(tmp_path), zoo = True)
+    assert got == {"swapped": swapped}, got
