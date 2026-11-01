@@ -538,6 +538,10 @@ def test_a_context_drafter_serves_a_prefetched_block_of_the_requested_depth_unsl
 
 
 def test_drafter_layers_submit_their_output_when_built_in_eval_mode(monkeypatch):
+    from mlx_simulation import mlx_is_simulated
+
+    if mlx_is_simulated():
+        pytest.skip("needs real mlx.nn.Module: dict-backed children and the training flag")
     import mlx.core as mx
     import mlx.nn as nn
     from unsloth_zoo.mlx import inference
