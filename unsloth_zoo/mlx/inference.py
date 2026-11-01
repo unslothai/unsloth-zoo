@@ -3482,8 +3482,7 @@ def _routed_down(x, inds, scores, shared, s, w, group_size, bits, mode):
     return _run(launch, list(w), [x, inds, scores, shared, s])
 
 
-# The shared expert's gate, up and down inside the routed launches, for three fewer launches per block. That pays where
-# launching binds: at 4 bits on GPUs without tensor units, up to this many rows. Where the GPU binds its own launches stay faster.
+# Rows up to which the shared expert rides the routed launches: only launch-bound GPUs (4-bit, no tensor units) gain.
 _FOLD_GATE_UP_ROWS = 4
 _FOLD_ROWS = 5
 
@@ -3723,7 +3722,7 @@ def _grouped_routed(x, inds, scores, shared, s, tensors, group_size, bits):
 
 # Sub-millisecond calls jitter and often run a slower mode, which a median hides: average many, less the slowest.
 _GROUPED_RACE_CALLS = 9
-# Up to this many rows on an M3, grouped tiles cost about 1 ms per forward, yet the race's short calls, timed at low clocks, pick them a third of the time.
+# Below this many rows the race's short low-clock calls misjudge grouped tiles.
 _ROUTED_ROWS_WITHOUT_NAX = 8
 
 
