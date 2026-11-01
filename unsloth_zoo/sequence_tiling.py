@@ -308,9 +308,9 @@ _ENV_COMPILE = "UNSLOTH_TILED_COMPILE"
 
 def _outside_graph_mode():
     """"unroll", "op", "compile_tile" or "break" (UNSLOTH_TILED_COMPILE forces one). Unrolling costs ~1.1 s compile per
-    tile on G4 and lets Inductor overlap the tiles' recomputes (most of the saving is lost), so Unsloth's blocks use
-    "op": the tile loop as one opaque graph node (registry modules that qualify; others fall back to "compile_tile",
-    one compiled frame per tile outside the block graph). A user's compile may be fullgraph=True, so it unrolls."""
+    tile and lets Inductor overlap the tiles' recomputes (most of the saving is lost), so Unsloth's blocks use "op":
+    the tile loop as one opaque graph node (registry modules that qualify; others fall back to "compile_tile", one
+    compiled frame per tile outside the block graph). A user's compile may be fullgraph=True, so it unrolls."""
     mode = os.environ.get(_ENV_COMPILE, "auto").strip().lower()
     if mode in ("unroll", "op", "compile_tile", "break"):
         return mode

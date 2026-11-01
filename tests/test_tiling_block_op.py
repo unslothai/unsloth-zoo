@@ -155,7 +155,7 @@ def test_the_op_saves_only_its_input(in_unsloth_block):
 
 
 def test_autocast_matches_eager_tiles(in_unsloth_block, monkeypatch):
-    # Tiling itself changes bf16 rounding (per-tile weight-grad partials), so the reference is the same tiles run eagerly.
+    # Tiling changes bf16 rounding (per-tile weight-grad partials), so the reference is the same tiles run eagerly.
     # bf16 activations under bf16 autocast (Unsloth's 16-bit LoRA): the op keeps the activation dtype.
     torch.manual_seed(0)
     block = _Block(_LoraMLP()).to(torch.bfloat16)
@@ -224,8 +224,8 @@ def test_auto_inside_the_block_tiles_only_when_it_pays(in_unsloth_block, monkeyp
 
 
 def test_shared_adapters_over_different_weights_keep_the_tile_frame_route(in_unsloth_block):
-    # Failing before: two MLPs sharing their adapters but not their frozen weights resolved to one module, so one
-    # ran the other's forward (wrong outputs and gradients). Now neither takes the op; a fully tied copy still does.
+    # Two MLPs sharing their adapters but not their frozen weights must not resolve to one module (one would run the
+    # other's forward). Neither takes the op; a fully tied copy still does.
     torch.manual_seed(0)
     a, b = _LoraMLP(), _LoraMLP()
     b.A, b.B = a.A, a.B
@@ -247,8 +247,7 @@ def test_shared_adapters_over_different_weights_keep_the_tile_frame_route(in_uns
 
 
 def test_parameter_hooks_run_once(in_unsloth_block):
-    # Failing before: the recompute differentiated the real parameters, so a register_hook ran per tile and again on
-    # the op's returned gradient (8 tiles: 9 calls, doubled gradient).
+    # A register_hook on a parameter runs once, on the op's returned gradient, not once per tile as well.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     ref = copy.deepcopy(mlp)
@@ -270,7 +269,7 @@ def test_parameter_hooks_run_once(in_unsloth_block):
 
 
 def test_autocast_to_another_dtype_keeps_the_mlp_output_dtype(in_unsloth_block, monkeypatch):
-    # Failing before: the op allocated its output like the float32 input, so a bf16 autocast MLP returned float32.
+    # The op allocates its output like x, so a float32 input under bf16 autocast must keep the per-tile route.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     R.install_module(mlp, "rows:8")
@@ -339,7 +338,7 @@ def test_a_transposed_parameter_gradient_is_laid_out_like_the_parameter(in_unslo
 
 
 def test_a_deepcopy_of_an_installed_mlp_runs_compiled(in_unsloth_block):
-    # Failing before: the copy carried op_ok but was never registered, so the op could not find its module.
+    # The copy carries op_ok but was never registered with the op, so it must not take it.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     R.install_module(mlp, "rows:8")
@@ -360,8 +359,8 @@ _PartlyUsedMLP.__name__ = _PartlyUsedMLP.__qualname__ = "FooPartlyUsedMLP"
 
 
 def test_an_unused_parameter_keeps_the_tile_frame_route(in_unsloth_block):
-    # Failing before: the op returned zeros for a parameter the forward never uses, so Adam's moments and weight
-    # decay moved it. The install probe now keeps such a module on the per-tile route (None gradient).
+    # The op would return zeros for a parameter the forward never uses (Adam's moments and weight decay still move
+    # it); the install probe keeps such a module on the per-tile route (None gradient).
     torch.manual_seed(0)
     mlp = _PartlyUsedMLP()
     R.install_module(mlp, "rows:8")
@@ -371,7 +370,7 @@ def test_an_unused_parameter_keeps_the_tile_frame_route(in_unsloth_block):
 
 
 def test_saved_tensor_hooks_that_copy_keep_the_module(in_unsloth_block):
-    # Failing before: backward found its module by the saved parameters' storage, which save_on_cpu replaces.
+    # save_on_cpu hands back the saved parameters in new storage, so backward must not find its module by storage.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     ref = copy.deepcopy(mlp)
@@ -385,8 +384,7 @@ def test_saved_tensor_hooks_that_copy_keep_the_module(in_unsloth_block):
 
 
 def test_an_uninstalled_mlp_leaves_the_op_registry(in_unsloth_block):
-    # Failing before: a detached module stayed registered, so a later install sharing its adapters was declined
-    # against a module that no longer tiles.
+    # An uninstalled module leaves the registry, so a later install sharing its adapters is not declined against it.
     torch.manual_seed(0)
     a = _LoraMLP()
     R.install_module(a, "rows:8")
@@ -395,7 +393,7 @@ def test_an_uninstalled_mlp_leaves_the_op_registry(in_unsloth_block):
 
 
 def test_an_installed_mlp_pickles(in_unsloth_block):
-    # Failing before: the op's owner weakref made the tiling state unpicklable (cloudpickle / torch.save of a model).
+    # The op's owner weakref must not make the tiling state unpicklable (cloudpickle / torch.save of a model).
     import pickle
 
     torch.manual_seed(0)
@@ -406,7 +404,7 @@ def test_an_installed_mlp_pickles(in_unsloth_block):
 
 
 def test_the_install_probe_leaves_buffers_alone(in_unsloth_block):
-    # Failing before: the unused-parameter probe ran the MLP on zeros, which reset QAT observer ranges to (0, 0).
+    # The install probe runs the MLP on zeros, which would reset QAT observer ranges to (0, 0).
     torch.manual_seed(0)
     mlp = _LoraMLP()
     mlp.register_buffer("seen", torch.zeros(1))
@@ -421,8 +419,8 @@ def test_the_install_probe_leaves_buffers_alone(in_unsloth_block):
 
 
 def test_functional_call_keeps_the_tile_frame_route(in_unsloth_block):
-    # Failing before: the op read the live module's frozen weight at run time, after functional_call had restored
-    # it, so a replaced frozen projection was silently ignored.
+    # The op reads the live module's weights at run time, after functional_call has restored them, so a replaced
+    # frozen projection would be ignored.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     R.install_module(mlp, "rows:8")
@@ -451,8 +449,8 @@ _ScaledMLP.__name__ = _ScaledMLP.__qualname__ = "FooScaledMLP"
 
 @pytest.mark.parametrize("kind", ["frozen_parameter", "all_parameters", "buffer_only"])
 def test_functional_call_substitutions_keep_the_tile_frame_route(in_unsloth_block, kind):
-    # Failing before: a replacement nn.Parameter or buffer passed the plain-tensor check, so the op ran the live
-    # module after functional_call had restored it (wrong output), or could not find the module (RuntimeError).
+    # A replacement nn.Parameter or buffer would make the op run the live module after functional_call has restored
+    # it (wrong output), or fail to find the module (RuntimeError).
     torch.manual_seed(0)
     mlp = _ScaledMLP() if kind == "buffer_only" else _LoraMLP()
     R.install_module(mlp, "rows:8")
@@ -481,8 +479,8 @@ def test_an_unchanged_mlp_still_takes_the_op(in_unsloth_block, monkeypatch):
 
 
 def test_a_stochastic_child_added_after_install_replays_rng(in_unsloth_block, monkeypatch):
-    # Failing before: inside the compiled block the cached "no RNG" verdict was read without checking the module
-    # tree version, so an RReLU added after install took the op (no RNG replay; backward saw other draws).
+    # The cached "no RNG" verdict must be checked against the module tree version: an RReLU added after install
+    # needs RNG replay, which the op does not do.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     R.install_module(mlp, "rows:8")
@@ -507,8 +505,7 @@ def test_a_stochastic_inner_forward_patched_after_install_replays_rng(in_unsloth
 
 
 def test_blocks_of_one_class_share_a_graph(in_unsloth_block, monkeypatch):
-    # Failing before: the cached RNG verdict compared id(module) while tracing, an identity guard per MLP, so every
-    # layer compiled its own graph (and past the recompile limit ran eager).
+    # Comparing id(module) while tracing would add an identity guard per MLP: every layer would compile its own graph.
     from torch._dynamo.testing import CompileCounter
     torch.manual_seed(0)
     blocks = [_Block(_LoraMLP()) for _ in range(6)]
@@ -542,8 +539,7 @@ def test_a_buffer_updated_between_calls_is_read_in_order(in_unsloth_block):
 
 
 def test_the_install_probe_feeds_tiles_as_the_op_does(in_unsloth_block):
-    # Failing before: the probe passed a 2-D row, which a 3-D-only inner forward (Unsloth's fused LoRA MLP) rejects,
-    # so the op was declined for it.
+    # Unsloth's fused LoRA MLP takes 3-D input only, so the probe must feed a 3-D row or the op is declined.
     torch.manual_seed(0)
     mlp = _LoraMLP()
 
@@ -556,8 +552,7 @@ def test_the_install_probe_feeds_tiles_as_the_op_does(in_unsloth_block):
 
 
 def test_backward_recompute_holds_the_module_lock(in_unsloth_block, monkeypatch):
-    # Two threads backpropagating through one MLP would otherwise interleave the proxy swaps (detached proxies left
-    # bound, zero gradients). The recompute runs under a per-module lock.
+    # Two threads backpropagating through one MLP would interleave the proxy swaps: the recompute holds a module lock.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     R.install_module(mlp, "rows:8")

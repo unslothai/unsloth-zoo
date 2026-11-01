@@ -758,8 +758,7 @@ _ENV_OP_TILE = "UNSLOTH_TILED_OP_TILE"
 
 def _op_tile_body(module):
     """The tile body the op runs: eager by default, or one compiled frame per class (UNSLOTH_TILED_OP_TILE=compiled).
-    G4, Qwen3-0.6B / 1.7B LoRA, 4k-32k: eager was as fast or faster and matched the previous route's peak in every
-    cell; compiled tiles were up to 2% slower and 32 MiB higher at 0.6B 16k."""
+    Eager is the default because compiled tiles were no faster on GPU and sometimes used slightly more memory."""
     fn = functools.partial(_tile_fn, module, True, ("rows",))
     if os.environ.get(_ENV_OP_TILE, "eager").strip().lower() != "compiled":
         return fn
