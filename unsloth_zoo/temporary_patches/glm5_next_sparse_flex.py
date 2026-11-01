@@ -249,8 +249,8 @@ def glm5_next_flex_attention(query, key, value, topk_indices, scaling, kpool, in
             pass
     out = sb._flex(query, key, value, block_mask, scaling)
     if eager:
-        # A query that selected no key (a mask hole before the first complete pool, or padding): eager's mask is
-        # finfo.min across the row, i.e. uniform attention over every key. SDPA returns zeros there, as flex does.
+        # A padded query selects no key: eager's mask is finfo.min across the row, i.e. uniform attention over every
+        # key. SDPA returns zeros there, as flex does. (A real query with no key keeps the call dense, see above.)
         empty = (topk_indices < 0).all(dim = -1)
         mean_v = value.float().mean(dim = 2)
         if mean_v.shape[1] != out.shape[1]:
@@ -258,6 +258,25 @@ def glm5_next_flex_attention(query, key, value, topk_indices, scaling, kpool, in
         out = torch.where(empty[:, None, :, None], mean_v[:, :, None, :].to(out.dtype), out)
     _count("flex")
     return out.transpose(1, 2).contiguous()
+
+
+def _eager_empty_real_query(topk_indices, attention_mask):
+    """A real query with no selected key: eager adds a finite finfo.min to its whole row, so its forward is uniform
+    (fp32 / bf16 only, fp16's min need not saturate) yet softmax still sends Q / K gradients. Flex cannot mirror
+    that, so the call stays dense. One host sync per selection (shared layers reuse it)."""
+    cached = getattr(topk_indices, "_unsloth_glm5_next_empty", None)
+    if cached is None:
+        empty = (topk_indices < 0).all(dim = -1)
+        if torch.is_tensor(attention_mask) and attention_mask.shape == empty.shape:
+            empty = empty & attention_mask.bool()  # padded queries are dropped from the loss
+        cached = bool(empty.any())
+        try:
+            topk_indices._unsloth_glm5_next_empty = cached
+        except Exception:
+            pass
+    if cached:
+        _count("flex_dense_empty")
+    return cached
 
 
 def glm5_next_block_mask(topk_indices, kv_len, kpool, index_topk, tail):
@@ -349,7 +368,7 @@ def glm5_next_flex_eligible(module, query, key, value, kwargs):
 
 def unsloth_glm5_next_attention_forward(self, hidden_states, attention_mask, past_key_values = None, prev_topk_indices = None, **kwargs):
     from unsloth_zoo.temporary_patches.glm5_next_sparse_flex import (
-        _MODELING, glm5_next_flex_attention, glm5_next_flex_eligible,
+        _MODELING, _eager_empty_real_query, glm5_next_flex_attention, glm5_next_flex_eligible,
     )
     from unsloth_zoo.temporary_patches.sparse_attention_flex import _run_flex
 
@@ -383,13 +402,16 @@ def unsloth_glm5_next_attention_forward(self, hidden_states, attention_mask, pas
         topk_indices = prev_topk_indices
     shared = topk_indices if self.next_skip_topk else None
 
-    if glm5_next_flex_eligible(self, query_states, key_states, value_states, kwargs):
+    eager = self.config._attn_implementation == "eager"
+    if glm5_next_flex_eligible(self, query_states, key_states, value_states, kwargs) and not (
+        eager and _eager_empty_real_query(topk_indices, attention_mask)
+    ):
         config = self.config
         tail = config.index_kpool - 1 if config.index_kpool_always_select_tail else 0
         attn_output = _run_flex(
             _FAMILY, "GLM-5.3-Flash", glm5_next_flex_attention, query_states, key_states, value_states,
             query_states, key_states, value_states, topk_indices, self.scaling,
-            config.index_kpool, config.index_topk, tail, config._attn_implementation == "eager",
+            config.index_kpool, config.index_topk, tail, eager,
         )
         if attn_output is not None:
             attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
