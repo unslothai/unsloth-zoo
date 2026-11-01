@@ -51,6 +51,10 @@ pass
 
 
 def _checkpoint(fn, args, preserve_rng_state):
+    # A singleton tail's checkpointed views can break Inductor's backward partitioner
+    # (torch 2.15). Its activations are tiny; keep the owned copy but do not checkpoint it.
+    if _is_compiling() and args[0].numel() <= args[0].shape[-1]:
+        return _owned(fn, *args)
     body = functools.partial(_owned, fn)
     if _is_compiling():
         # Dynamo matches checkpoint by identity, which a shim may have replaced: call its higher order op directly.
