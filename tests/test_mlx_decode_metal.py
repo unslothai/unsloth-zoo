@@ -1593,7 +1593,7 @@ def test_qwen4_decode_read_matches_mlx_vlm_bitwise(dtype, bits, group_size, lowr
 @_needs_qwen4
 @pytest.mark.parametrize("reason", [
     "switch", "body", "patched", "outside", "differs", "aligned", "quad", "child", "override", "linear",
-    "foreign", "late", "rebound", "lora", "dtype", "verified", "relinear"])
+    "foreign", "late", "rebound", "lora", "dtype", "verified", "relinear", "lane"])
 def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
     module = _qwen4_read(lowrank = {"aligned": 512, "quad": 128}.get(reason, 160))
     other, forward = _qwen4_read(), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
@@ -1615,6 +1615,8 @@ def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
             "__call__": lambda self, x: nn.QuantizedLinear.__call__(self, x) * 2})
     elif reason == "linear":
         monkeypatch.setitem(vars(forward), "_linear", lambda linear, h: linear(h) * 2)
+    elif reason == "lane":
+        monkeypatch.setitem(vars(module.input_mix_weight_down), "_unsloth_lane_qmm", True)
     elif reason in ("verified", "relinear"):   # exact_batch_invariant_decode's class already over the forward
         native = type(forward)
         methods = (getattr(native, name, None) for name in decode._VERIFY_METHODS)
@@ -1649,7 +1651,7 @@ def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
             _assert_same(forward._hyper_connection(target, x), expected)
     left = vars(forward).pop("_hyper_connection", None) if reason == "late" else vars(forward).get("_hyper_connection")
     assert left is (foreign if reason in ("foreign", "late") else None)
-    assert hooked == (reason in ("outside", "differs", "late", "dtype", "verified"))
+    assert hooked == (reason in ("outside", "differs", "late", "dtype", "verified", "lane"))
     assert len(log) == {"differs": 2, "verified": 4}.get(reason, 0)
     assert ("differs from the version" in caplog.text) == (reason in ("body", "patched", "rebound"))
     assert caplog.text.count("differs from mlx-vlm's") == (reason == "differs")
