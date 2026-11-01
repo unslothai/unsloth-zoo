@@ -120,8 +120,7 @@ model.save_pretrained(os.path.join(WORK, "adapter_bin"), safe_serialization = Fa
 direct_bin = model_class().from_pretrained(CKPT, dtype = torch.float32)
 direct_bin.load_adapter(os.path.join(WORK, "adapter_bin"), use_safetensors = False)
 out["load_adapter_bin_max_abs"] = float((logits(direct_bin) - want).abs().max())
-# Failing before: a compiled wrapper's `_orig_mod.` names matched no key, and a hotswap into a lower-rank adapter
-# never converted (orientation was read from the whole shape, rank included).
+# A compiled wrapper (`_orig_mod.` names) hotswapped into a lower-rank adapter.
 small = LoraConfig(r = 2, lora_alpha = 8, target_modules = ["q_proj"], init_lora_weights = False,
                    target_parameters = ["experts.gate_up_proj", "experts.down_proj"])
 low = get_peft_model(model_class().from_pretrained(CKPT, dtype = torch.float32), small)
@@ -164,15 +163,11 @@ def _run(code, family, work, zoo, **extra):
 @pytest.mark.parametrize("b_layout", ["rank_major", "grouped_by_expert"])
 @pytest.mark.parametrize("family", ["llama4", "qwen3_vl_moe"])
 def test_unsloth_expert_lora_loads_in_vanilla_peft(tmp_path, family, b_layout):
-    # grouped_by_expert (the legacy lora_B packing, UNSLOTH_MOE_LORA_B_LAYOUT) failing before: the swap read its B as
-    # PEFT's rank-major packing and mixed experts, so vanilla PEFT loaded it silently with wrong logits. Failing
-    # before too: transformers' load_adapter loaded the swapped factors unconverted (size mismatch).
+    # grouped_by_expert is the legacy lora_B packing (UNSLOTH_MOE_LORA_B_LAYOUT): it must never load silently wrong.
     work = str(tmp_path)
     _run(VANILLA_SAVE, family, work, zoo = False)
     trained = _run(UNSLOTH_TRAIN, family, work, zoo = True, UNSLOTH_MOE_LORA_B_LAYOUT = b_layout)
     assert trained["reload_max_abs"] <= 1e-4, trained
-    # Failing before: hotswap grew lora_A / padded lora_B instead of mapping the factors back, and prefixed keys did
-    # not match an injected model's module names (size mismatch).
     for key in ("hotswap_max_abs", "merged_max_abs", "injected_max_abs", "compiled_rank_hotswap_max_abs",
                 "load_adapter_max_abs", "load_adapter_bin_max_abs"):
         assert isinstance(trained[key], float) and trained[key] <= 1e-4, trained
@@ -204,8 +199,8 @@ def test_factor_swap_is_an_involution_and_keeps_the_delta():
 
 
 def test_llama4_factors_follow_pefts_is_transposed_support(monkeypatch):
-    # Failing before: PEFT 0.18 ignores is_transposed, so Llama-4 factors already matched vanilla and swapping them
-    # on save broke vanilla loading there. A physically transposed stack (Qwen3-VL-MoE) is swapped on any PEFT.
+    # PEFT 0.18 ignores is_transposed, so Llama-4 factors already match vanilla there; a physically transposed
+    # stack (Qwen3-VL-MoE) is swapped on any PEFT.
     from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
 
     class Relabelled:
@@ -243,8 +238,7 @@ print(json.dumps({"swapped": m.Qwen3VLMoeTextExperts.__dict__.get("_unsloth_expe
 
 @pytest.mark.parametrize("layout, swapped", [("transformers", True), ("hidden_first", False)])
 def test_qwen3_vl_moe_swaps_factors_only_when_transformers_stores_another_layout(tmp_path, layout, swapped):
-    # Failing before: the flag was set unconditionally, so on transformers 4.x (whose own stacks are already
-    # (E, H, 2I)) saves were swapped and vanilla PEFT refused a Qwen3-VL-MoE adapter it loaded before (size mismatch).
+    # transformers 4.x stacks are already (E, H, 2I), so saves there must not be swapped.
     import transformers
 
     if int(transformers.__version__.split(".")[0]) < 5 and layout == "transformers":
@@ -254,8 +248,7 @@ def test_qwen3_vl_moe_swaps_factors_only_when_transformers_stores_another_layout
 
 
 def test_load_adapter_wrapper_loads_once_and_raises_real_errors(monkeypatch):
-    # Failing before: the wrapped loader ran inside the conversion's try, so a real load error was logged and the
-    # load ran a second time.
+    # A real load error must propagate once, not be retried.
     from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
 
     calls = []
@@ -283,7 +276,7 @@ def test_load_adapter_wrapper_loads_once_and_raises_real_errors(monkeypatch):
 
 
 def test_load_adapter_keeps_the_file_path_when_nothing_converts(monkeypatch):
-    # Failing before: the files were always replaced by an in-memory state dict, which disk offload cannot index.
+    # Disk offload cannot index an in-memory state dict, so unconverted loads keep the checkpoint files.
     from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
 
     kwargs = {"state_dict": None, "checkpoint_files": [__file__]}
@@ -297,8 +290,7 @@ def test_load_adapter_keeps_the_file_path_when_nothing_converts(monkeypatch):
 
 
 def test_load_adapter_under_disk_offload_passes_a_converted_file(monkeypatch, tmp_path):
-    # Failing before: with any module on "disk" the converted factors were dropped (the new save layout then failed
-    # by shape); now they are written to a scratch safetensors file that disk offload can index.
+    # Under disk offload the converted factors go to a scratch safetensors file that disk offload can index.
     import torch
     from safetensors.torch import load_file
     from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
