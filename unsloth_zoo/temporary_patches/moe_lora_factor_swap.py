@@ -85,6 +85,25 @@ def swap_expert_lora_factors(lora_A: torch.Tensor, lora_B: torch.Tensor, num_exp
     return new_A, new_B
 
 
+def _b_grouped_by_expert():
+    """True when the live model reads lora_B with the legacy (out, E, R) packing (UNSLOTH_MOE_LORA_B_LAYOUT)."""
+    try:
+        from .moe_utils import LORA_B_LAYOUT_GROUPED_BY_EXPERT, moe_lora_b_layout
+        return moe_lora_b_layout() == LORA_B_LAYOUT_GROUPED_BY_EXPERT
+    except Exception:
+        return False
+
+
+def _regroup_b(lora_B: torch.Tensor, num_experts: int, to_rank_major: bool):
+    """lora_B between the legacy (out, E, R) packing and PEFT's (out, R, E)."""
+    E = int(num_experts)
+    out, cols = lora_B.shape
+    R = cols // E
+    if to_rank_major:
+        return lora_B.reshape(out, E, R).permute(0, 2, 1).reshape(out, cols).contiguous()
+    return lora_B.reshape(out, R, E).permute(0, 2, 1).reshape(out, cols).contiguous()
+
+
 def _innermost(module):
     while type(module).__name__ == "ParamWrapper":
         module = module.base_layer
@@ -155,6 +174,9 @@ def _to_vanilla(model, state_dict):
             a, b = state_dict[key_a], state_dict[key_b]
             if a.shape[1] == b.shape[0]:
                 continue   # square stack: ambiguous by shape, kept as trained
+            if _b_grouped_by_expert():
+                # The swap assumes PEFT's rank-major B; a legacy-packed B would mix experts.
+                b = _regroup_b(b, num_experts, to_rank_major = True)
             state_dict[key_a], state_dict[key_b] = swap_expert_lora_factors(a, b, num_experts)
     return state_dict
 
@@ -178,6 +200,8 @@ def _from_vanilla(model, state_dict, adapter_name):
                 continue   # trained under Unsloth before this change, or square
             new_a, new_b = swap_expert_lora_factors(a, b, num_experts)
             if new_a.shape[1] == want_in:
+                if _b_grouped_by_expert():
+                    new_b = _regroup_b(new_b, num_experts, to_rank_major = False)
                 state_dict[key_a], state_dict[key_b] = new_a, new_b
     return state_dict
 

@@ -137,12 +137,12 @@ print(json.dumps({"vanilla_max_abs": float((logits(model) - want).abs().max())})
 '''
 
 
-def _run(code, family, work, zoo):
+def _run(code, family, work, zoo, **extra):
     env = {k: v for k, v in os.environ.items() if not k.startswith("UNSLOTH_")}
     env.update(HF_HUB_OFFLINE = "1", OMP_NUM_THREADS = "4", REPO = REPO,
                UNSLOTH_COMPILE_LOCATION = os.path.join(work, "ucc"))
     if zoo:
-        env.update(PYTHONPATH = REPO, UNSLOTH_IS_PRESENT = "1")
+        env.update(PYTHONPATH = REPO, UNSLOTH_IS_PRESENT = "1", **extra)
     else:
         env.pop("PYTHONPATH", None)
     proc = subprocess.run([sys.executable, "-c", textwrap.dedent(code), family, work], env = env, cwd = work,
@@ -152,11 +152,14 @@ def _run(code, family, work, zoo):
     return json.loads(lines[-1]) if lines else {}
 
 
+@pytest.mark.parametrize("b_layout", ["rank_major", "grouped_by_expert"])
 @pytest.mark.parametrize("family", ["llama4", "qwen3_vl_moe"])
-def test_unsloth_expert_lora_loads_in_vanilla_peft(tmp_path, family):
+def test_unsloth_expert_lora_loads_in_vanilla_peft(tmp_path, family, b_layout):
+    # grouped_by_expert (the legacy lora_B packing, UNSLOTH_MOE_LORA_B_LAYOUT) failing before: the swap read its B as
+    # PEFT's rank-major packing and mixed experts, so vanilla PEFT loaded it silently with wrong logits.
     work = str(tmp_path)
     _run(VANILLA_SAVE, family, work, zoo = False)
-    trained = _run(UNSLOTH_TRAIN, family, work, zoo = True)
+    trained = _run(UNSLOTH_TRAIN, family, work, zoo = True, UNSLOTH_MOE_LORA_B_LAYOUT = b_layout)
     assert trained["reload_max_abs"] <= 1e-4, trained
     # Failing before: hotswap grew lora_A / padded lora_B instead of mapping the factors back, and prefixed keys did
     # not match an injected model's module names (size mismatch).
