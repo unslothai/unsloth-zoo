@@ -403,3 +403,18 @@ def test_an_installed_mlp_pickles(in_unsloth_block):
     R.install_module(mlp, "rows:8")
     state = pickle.loads(pickle.dumps(mlp.__dict__["_unsloth_tiling"]))
     assert state.op_owner is None and not state.op_ok
+
+
+def test_the_install_probe_leaves_buffers_alone(in_unsloth_block):
+    # Failing before: the unused-parameter probe ran the MLP on zeros, which reset QAT observer ranges to (0, 0).
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    mlp.register_buffer("seen", torch.zeros(1))
+    forward = mlp.forward
+
+    def counting(x):
+        mlp.seen.add_(1)
+        return forward(x)
+    mlp.forward = counting
+    R.install_module(mlp, "rows:8")
+    assert mlp.seen.item() == 0

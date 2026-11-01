@@ -707,6 +707,8 @@ def _op_uses_every_parameter(module, hidden):
     params = [p for p in module.parameters() if p.requires_grad]
     if not params:
         return True
+    # Buffers the forward may update (QAT observers, running stats) are put back: the probe must not train them.
+    saved = [(m, name, b.clone()) for m in module.modules() for name, b in m._buffers.items() if b is not None]
     try:
         ref = params[0]
         x = torch.zeros(1, hidden, device = ref.device, dtype = ref.dtype if ref.is_floating_point() else None)
@@ -718,6 +720,14 @@ def _op_uses_every_parameter(module, hidden):
         return all(g is not None for g in grads)
     except Exception:
         return False
+    finally:
+        with torch.no_grad():
+            for m, name, b in saved:
+                current = m._buffers.get(name)
+                if current is not None and current.shape == b.shape:
+                    current.copy_(b)
+                else:
+                    m._buffers[name] = b
 
 
 def _op_matches(module, params):
