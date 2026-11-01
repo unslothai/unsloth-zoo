@@ -27,6 +27,7 @@ import os
 import re
 import types
 import typing
+import warnings
 import weakref
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatch
@@ -504,6 +505,7 @@ class _TileState:
         self.in_widths = None
         self.model_stats = None
         self.op_ok = False
+        self.op_owner = None
 
 
 def _bind(module, fn):
@@ -622,6 +624,10 @@ _OP_READY = [None]
 
 def _op_params(module, state):
     if not state.op_ok:
+        return None
+    owner = state.op_owner() if state.op_owner is not None else None
+    if owner is not module:
+        # A deepcopy of an installed module carries the state but was never registered with the op.
         return None
     if needs_rng_replay(module, state.spec):
         return None
@@ -766,6 +772,17 @@ def _op_backward_impl(x, grad, params, n_tiles, amp = None):
                         dparams[k] = torch.empty_like(own[k]).copy_(g)
                     else:
                         dparams[k].add_(g)
+    if any(g is None for g in dparams):
+        # The op must return a tensor per parameter, and a zero gradient still moves Adam's moments and weight
+        # decay: route this module through the per-tile frames from the next trace on (they keep None).
+        state = module.__dict__.get("_unsloth_tiling")
+        if state is not None and state.op_ok:
+            state.op_ok = False
+            warnings.warn(
+                f"Unsloth: tiled {type(module).__name__} has trainable parameters this forward does not use; "
+                "it leaves the tiled op for the per-tile route (this step's unused gradients are zero).",
+                stacklevel = 2,
+            )
     return [dx] + [torch.zeros_like(p) if g is None else g for g, p in zip(dparams, own)]
 
 
@@ -943,6 +960,7 @@ def _attach(module, spec, plan, budget_cache):
                 state.op_ok = False
                 other.__dict__["_unsloth_tiling"].op_ok = False
         if state.op_ok:
+            state.op_owner = weakref.ref(module)
             _OP_MODULES.add(module)
             _OP_VERSION[0] += 1
 

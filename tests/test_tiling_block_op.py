@@ -336,3 +336,40 @@ def test_a_transposed_parameter_gradient_is_laid_out_like_the_parameter(in_unslo
     assert breaks == 0
     for a, b in zip(_grads(block, x), _grads(ref, xr)):
         torch.testing.assert_close(a, b)
+
+
+def test_a_deepcopy_of_an_installed_mlp_runs_compiled(in_unsloth_block):
+    # Failing before: the copy carried op_ok but was never registered, so the op could not find its module.
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    R.install_module(mlp, "rows:8")
+    clone = copy.deepcopy(mlp)
+    x = torch.randn(64, H)
+    got = torch.compile(clone, backend = "aot_eager", dynamic = True)(x)
+    torch.testing.assert_close(got, type(clone).forward(clone, x))
+
+
+class _PartlyUsedMLP(_LoraMLP):
+    def __init__(self):
+        super().__init__()
+        self.unused = torch.nn.Parameter(torch.zeros(4))
+
+
+_PartlyUsedMLP.__module__ = "transformers.models.foo.modeling_foo"
+_PartlyUsedMLP.__name__ = _PartlyUsedMLP.__qualname__ = "FooPartlyUsedMLP"
+
+
+def test_an_unused_parameter_leaves_the_op(in_unsloth_block):
+    # The op returns a tensor per parameter; an unused one gets zeros once, then the module takes the per-tile route
+    # (None gradients, so the optimizer leaves it alone).
+    torch.manual_seed(0)
+    mlp = _PartlyUsedMLP()
+    R.install_module(mlp, "rows:8")
+    block = _Block(mlp)
+    with pytest.warns(UserWarning, match = "does not use"):
+        _run(block, torch.randn(2, 32, H, requires_grad = True))
+    assert not mlp.__dict__["_unsloth_tiling"].op_ok
+    mlp.unused.grad = None
+    torch._dynamo.reset()
+    _run(block, torch.randn(2, 32, H, requires_grad = True))
+    assert mlp.unused.grad is None
