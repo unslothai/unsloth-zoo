@@ -27,7 +27,6 @@ from unsloth_zoo.dataset_utils import _fully_masked_rows_from_arrow, train_on_re
 
 
 def _row_by_row(dataset):
-    # The scan this replaces, verbatim.
     dropped, idx = [], 0
     for batch in dataset.select_columns(["labels"]).iter(batch_size = 1000):
         for labels in batch["labels"]:
@@ -136,8 +135,7 @@ def _mask(dataset):
     try:
         train_on_responses_only(trainer, "<|user|>", "<|assistant|>", tokenizer = _StubTokenizer())
     except ValueError as error:
-        # Torch-formatted variable length rows are fully masked before the scan on main
-        # too; the refusal has to stay the same.
+        # Torch-formatted ragged rows are refused on main too; the refusal must not change.
         return str(error)
     out = trainer.train_dataset.with_format(None)
     return out["input_ids"], out["labels"]

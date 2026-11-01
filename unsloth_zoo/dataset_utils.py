@@ -736,10 +736,7 @@ pass
 _ARROW_LABEL_SCAN_FORMATS = (None, "python", "numpy", "np", "torch", "pt")
 
 def _fully_masked_rows_from_arrow(dataset, batch_size = 10_000):
-    """Indices of rows whose `labels` hold no token other than -100 (None rows kept), read off Arrow.
-
-    Returns None unless `labels` is a flat signed-integer list column without null tokens.
-    """
+    """Fully masked `labels` row indices via Arrow; None unless a flat signed-int list column without null tokens."""
     try:
         import numpy as np
         import pyarrow as pa
