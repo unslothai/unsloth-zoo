@@ -25,6 +25,7 @@ __all__ = [
 
 from typing import Union, Callable, Optional, List, Dict
 import itertools as _itertools
+from bisect import bisect_left as _bisect_left
 import torch
 
 def _iterable_batch_size(dataset, default = 1000):
@@ -877,6 +878,7 @@ def train_on_responses_only(
     if bos_token_id is not None: boundary_first.add(bos_token_id)
     if eos_token_id is not None: boundary_first.add(eos_token_id)
     if message_start: boundary_first.add(message_start[0])
+    inner_stop_ids = tuple(boundary_first | {Q_first})
 
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
@@ -937,9 +939,15 @@ def train_on_responses_only(
                 assert(n == len(old_labels))
             n_minus_1 = n - 1
             j = 0
+            # Plain lists jump in C to the only positions where a step can act; other row types step one by one.
+            is_list = type(input_ids) is list
+            stops = None
 
             spans = []
             while j < n:
+                if is_list:
+                    try: j = input_ids.index(A_first, j)
+                    except ValueError: break
                 if (input_ids[j] == A_first) and \
                     (input_ids[j : (k := j + len_A_must)] == A_must):
 
@@ -957,8 +965,23 @@ def train_on_responses_only(
                     assistant_k = k
 
                     j = assistant_k
+                    if is_list and stops is None:
+                        # Sorted positions of every id the scan below reacts to; j can step back, so bisect, not a cursor.
+                        stops = []
+                        for stop_id in inner_stop_ids:
+                            i = -1
+                            while True:
+                                try: i = input_ids.index(stop_id, i + 1)
+                                except ValueError: break
+                                stops.append(i)
+                        stops.sort()
+                        n_stops = len(stops)
                     # Keep the assistant's EOS, but never span another message/sample.
                     while j < n:
+                        if is_list:
+                            # Between stops a step only does j += 1; the last token always acts.
+                            s = _bisect_left(stops, j)
+                            j = stops[s] if s < n_stops else n_minus_1
                         token = input_ids[j]
                         if token in boundary_first:
                             if token == eos_token_id:
