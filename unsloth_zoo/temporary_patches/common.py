@@ -151,7 +151,7 @@ def apply_inductor_correctness_workarounds():
                 if INDUCTOR_CORRECTNESS_CACHE_TAG not in tags:
                     # Every thread: a reentrant checkpoint recompiles on autograd's device thread (torch >= 2.12
                     # keeps config per thread), where a warm cache would serve rand4x kernels.
-                    from ..torch_config import set_torch_config
+                    from unsloth_zoo.torch_config import set_torch_config
                     set_torch_config(config, "cache_key_tag", ",".join(tags + [INDUCTOR_CORRECTNESS_CACHE_TAG]))
             active.append("rand4x")
         except Exception as error:
