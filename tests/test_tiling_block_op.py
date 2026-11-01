@@ -93,12 +93,12 @@ def _grads(block, x):
 
 def _spy_op(monkeypatch):
     seen = []
-    real = R._op_forward_impl
+    real = R._op_forward_with_token
 
     def spy(x, params, n_tiles, amp = None):
         seen.append(n_tiles)
         return real(x, params, n_tiles, amp)
-    monkeypatch.setattr(R, "_op_forward_impl", spy)
+    monkeypatch.setattr(R, "_op_forward_with_token", spy)
     return seen
 
 
@@ -147,7 +147,7 @@ def test_the_op_saves_only_its_input(in_unsloth_block):
         return t
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
         y = R._run_tiled_op(state, x, params, 8)
-    assert saved == [x.numel()]
+    assert saved == [x.numel(), 1]  # the input and the one-element module token
     y.sum().backward()
     xr = x.detach().clone().requires_grad_()
     mlp.zero_grad(set_to_none = True)
@@ -359,17 +359,35 @@ _PartlyUsedMLP.__module__ = "transformers.models.foo.modeling_foo"
 _PartlyUsedMLP.__name__ = _PartlyUsedMLP.__qualname__ = "FooPartlyUsedMLP"
 
 
-def test_an_unused_parameter_leaves_the_op(in_unsloth_block):
-    # The op returns a tensor per parameter; an unused one gets zeros once, then the module takes the per-tile route
-    # (None gradients, so the optimizer leaves it alone).
+def test_an_unused_parameter_keeps_the_tile_frame_route(in_unsloth_block):
+    # Failing before: the op returned zeros for a parameter the forward never uses, so Adam's moments and weight
+    # decay moved it. The install probe now keeps such a module on the per-tile route (None gradient).
     torch.manual_seed(0)
     mlp = _PartlyUsedMLP()
     R.install_module(mlp, "rows:8")
-    block = _Block(mlp)
-    with pytest.warns(UserWarning, match = "does not use"):
-        _run(block, torch.randn(2, 32, H, requires_grad = True))
     assert not mlp.__dict__["_unsloth_tiling"].op_ok
-    mlp.unused.grad = None
-    torch._dynamo.reset()
-    _run(block, torch.randn(2, 32, H, requires_grad = True))
-    assert mlp.unused.grad is None
+    _run(_Block(mlp), torch.randn(2, 32, H, requires_grad = True))
+    assert mlp.unused.grad is None and mlp.A.grad is not None
+
+
+def test_saved_tensor_hooks_that_copy_keep_the_module(in_unsloth_block):
+    # Failing before: backward found its module by the saved parameters' storage, which save_on_cpu replaces.
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    ref = copy.deepcopy(mlp)
+    R.install_module(mlp, "rows:4")
+    x = torch.randn(64, H)
+    with torch.autograd.graph.save_on_cpu():
+        torch.compile(mlp, backend = "aot_eager", dynamic = True)(x).pow(2).sum().backward()
+    type(ref).forward(ref, x).pow(2).sum().backward()
+    torch.testing.assert_close(mlp.A.grad, ref.A.grad)
+
+
+def test_an_uninstalled_mlp_leaves_the_op_registry(in_unsloth_block):
+    # Failing before: a detached module stayed registered, so a later install sharing its adapters was declined
+    # against a module that no longer tiles.
+    torch.manual_seed(0)
+    a = _LoraMLP()
+    R.install_module(a, "rows:8")
+    R.uninstall_module(a) if hasattr(R, "uninstall_module") else R._detach(a)
+    assert a not in R._OP_MODULES

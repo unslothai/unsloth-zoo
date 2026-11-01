@@ -620,6 +620,20 @@ _OP_MODULES = weakref.WeakSet()
 _OP_BY_PTR = {}
 _OP_VERSION = [0, -1]  # (modules attached, version _OP_BY_PTR was built at)
 _OP_READY = [None]
+# Forward returns a CPU token naming its module; backward resolves the module from it, since saved-tensor hooks
+# (Unsloth's offload, save_on_cpu) may hand back the saved parameters in new storage.
+_OP_TOKENS = {}
+_OP_NEXT_TOKEN = [0]
+
+
+def _op_token(module):
+    token = module.__dict__.get("_unsloth_op_token")
+    if token is None or _OP_TOKENS.get(token, lambda: None)() is not module:
+        token = _OP_NEXT_TOKEN[0]
+        _OP_NEXT_TOKEN[0] += 1
+        _OP_TOKENS[token] = weakref.ref(module)
+        module.__dict__["_unsloth_op_token"] = token
+    return token
 
 
 def _op_params(module, state):
@@ -680,6 +694,26 @@ def _op_module(params):
     return module
 
 
+def _op_uses_every_parameter(module, hidden):
+    """One-row probe at install: the op returns a gradient tensor for every trainable parameter, so a parameter the
+    forward never reaches would get zeros (still moving Adam's moments and weight decay) instead of None. Such a
+    module keeps the per-tile route. A probe that cannot run declines the op too."""
+    params = [p for p in module.parameters() if p.requires_grad]
+    if not params:
+        return True
+    try:
+        ref = params[0]
+        x = torch.zeros(1, hidden, device = ref.device, dtype = ref.dtype if ref.is_floating_point() else None)
+        with torch.enable_grad():
+            y = _inner_forward(module)(x)
+            if not torch.is_tensor(y) or not y.requires_grad:
+                return False
+            grads = torch.autograd.grad(y.float().sum(), params, allow_unused = True)
+        return all(g is not None for g in grads)
+    except Exception:
+        return False
+
+
 def _op_identity(module):
     return tuple((t.device, t.data_ptr()) for t in list(module.parameters()) + list(module.buffers()))
 
@@ -719,6 +753,11 @@ def _op_autocast(x, amp):
 
 
 def _op_forward_impl(x, params, n_tiles, amp = None):
+    out, _ = _op_forward_with_token(x, params, n_tiles, amp)
+    return out
+
+
+def _op_forward_with_token(x, params, n_tiles, amp = None):
     module = _op_module(params)
     body = _op_tile_body(module)
     out = torch.empty_like(x)
@@ -733,7 +772,7 @@ def _op_forward_impl(x, params, n_tiles, amp = None):
                     f"UNSLOTH_TILED_COMPILE=compile_tile to tile this module outside the block graph."
                 )
             out.narrow(0, start, length).copy_(y)
-    return out
+    return out, torch.tensor(_op_token(module), dtype = torch.int64)
 
 
 def _op_proxies(module):
@@ -748,8 +787,11 @@ def _op_proxies(module):
     return [proxies[n] for n in names], _reparametrize_module(module, proxies)
 
 
-def _op_backward_impl(x, grad, params, n_tiles, amp = None):
-    module = _op_module(params)
+def _op_backward_impl(x, grad, params, n_tiles, amp = None, token = None):
+    ref = _OP_TOKENS.get(int(token)) if token is not None else None
+    module = ref() if ref is not None else None
+    if module is None:
+        module = _op_module(params)
     own, swapped = _op_proxies(module)
     body = _op_tile_body(module)
     dx = torch.empty_like(x)
@@ -800,19 +842,21 @@ def _register_op():
     try:
         fwd = custom_op("unsloth_zoo::tiled_rows_fwd", mutates_args = ())(_op_fwd_schema)
         bwd = custom_op("unsloth_zoo::tiled_rows_bwd", mutates_args = ())(_op_bwd_schema)
-        fwd.register_fake(lambda x, params, n_tiles, amp: torch.empty_like(x))
+        fwd.register_fake(
+            lambda x, params, n_tiles, amp: (torch.empty_like(x), torch.empty((), dtype = torch.int64, device = "cpu"))
+        )
         bwd.register_fake(
-            lambda x, grad, params, n_tiles, amp: [torch.empty_like(x)] + [torch.empty_like(p) for p in params]
+            lambda x, grad, params, n_tiles, amp, token: [torch.empty_like(x)] + [torch.empty_like(p) for p in params]
         )
 
         def setup_context(ctx, inputs, output):
             x, params, n_tiles, amp = inputs
             ctx.n_tiles, ctx.amp = n_tiles, amp
-            ctx.save_for_backward(x, *params)
+            ctx.save_for_backward(x, output[1], *params)
 
-        def backward(ctx, grad):
-            x, *params = ctx.saved_tensors
-            grads = bwd(x, grad.contiguous(), params, ctx.n_tiles, ctx.amp)
+        def backward(ctx, grad, _grad_token):
+            x, token, *params = ctx.saved_tensors
+            grads = bwd(x, grad.contiguous(), params, ctx.n_tiles, ctx.amp, token)
             return grads[0], list(grads[1:]), None, None
 
         fwd.register_autograd(backward, setup_context = setup_context)
@@ -824,15 +868,15 @@ def _register_op():
 
 def _op_fwd_schema(
     x: torch.Tensor, params: typing.List[torch.Tensor], n_tiles: int, amp: typing.Optional[torch.dtype],
-) -> torch.Tensor:
-    return _op_forward_impl(x, params, n_tiles, amp)
+) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    return _op_forward_with_token(x, params, n_tiles, amp)
 
 
 def _op_bwd_schema(
     x: torch.Tensor, grad: torch.Tensor, params: typing.List[torch.Tensor], n_tiles: int,
-    amp: typing.Optional[torch.dtype],
+    amp: typing.Optional[torch.dtype], token: torch.Tensor,
 ) -> typing.List[torch.Tensor]:
-    return _op_backward_impl(x, grad, params, n_tiles, amp)
+    return _op_backward_impl(x, grad, params, n_tiles, amp, token)
 
 
 _tiled_rows_fwd = None
@@ -842,7 +886,7 @@ def _run_tiled_op(state, x, params, n_tiles):
     lead = x.shape[:-1]
     device = x.device.type
     amp = torch.get_autocast_dtype(device) if torch.is_autocast_enabled(device) else None
-    y = _tiled_rows_fwd(x.reshape(-1, x.shape[-1]).contiguous(), params, n_tiles, amp)
+    y, _ = _tiled_rows_fwd(x.reshape(-1, x.shape[-1]).contiguous(), params, n_tiles, amp)
     return y.reshape(*lead, y.shape[-1])
 
 
@@ -947,7 +991,7 @@ def _attach(module, spec, plan, budget_cache):
     state = d["_unsloth_tiling"] = _TileState(spec, plan, hidden, _infer_intermediate(module, hidden), nbytes, budget)
     state.in_widths = _input_widths(module)
     _random_verdict(module)
-    state.op_ok = _op_eligible(module, spec, hidden) and _op_ready()
+    state.op_ok = _op_eligible(module, spec, hidden) and _op_ready() and _op_uses_every_parameter(module, hidden)
     if state.op_ok:
         own = [p for p in module.parameters() if p.requires_grad]
         key = (own[0].device, own[0].data_ptr()) if own else None
@@ -967,6 +1011,9 @@ def _attach(module, spec, plan, budget_cache):
 
 def _detach(module):
     d = module.__dict__
+    if module in _OP_MODULES:
+        _OP_MODULES.discard(module)
+        _OP_VERSION[0] += 1
     inner = d.pop("_unsloth_forward", None)
     d.pop("_unsloth_tiling", None)
     d.pop("_unsloth_tiled_random", None)
