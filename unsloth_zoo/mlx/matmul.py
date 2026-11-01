@@ -1094,8 +1094,7 @@ _LANE_WIDE_COLUMNS = 8192   # from here four column tiles per threadgroup read p
 _LANE_PREAMBLE = "#pragma clang fp contract(off)\n"
 _LANE_TYPE, _LANE_CONSTANT = "typedef {1} {0};\n", "constexpr {2} {0} = {1};\n"
 _LANE_METAL_TYPES = {mx.bfloat16: "bfloat16_t", mx.float16: "float16_t", mx.float32: "float"}
-# Unrolling the group loop by two lets more code loads issue ahead of the arithmetic: the same bytes and bits, less DRAM
-# energy per byte on M3. The "slices" reader (the drafter's, and the default path's shortlist's) keeps the one-group loop.
+# The group loop unrolled by two issues code loads ahead of the arithmetic, same bits; the "slices" reader keeps one group.
 _LANE_GROUP_HEADER = "    for (uint g = g0; g < g1; ++g) {"
 _LANE_TWO_GROUP_HEADER = '    _Pragma("clang loop unroll_count(2)")\n' + _LANE_GROUP_HEADER
 assert _LANE_GENERIC_LOOP.count(_LANE_GROUP_HEADER) == _LANE_PAIRED_LOOP.count(_LANE_GROUP_HEADER) == 1
