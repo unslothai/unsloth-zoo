@@ -696,6 +696,75 @@ def test_d1_logits_read_a_records_media(monkeypatch):
     assert seen == ["features-part-a", "features-part-b"]
 
 
+@pytest.mark.parametrize("files, config, expected", [
+    ({"decider_config.json": {}}, {"model_type": "qwen3_5_text"}, "mlx_vlm"),
+    ({}, {"model_type": "decider2"}, "mlx_vlm"),
+    ({}, {"model_type": "laya"}, "mlx_vlm"),
+    ({}, {"model_type": "clef"}, "mlx_vlm"),
+    ({}, {"model_type": "qwen3_5"}, None),
+    ({"joint_head_config.json": {}, "joint_head.safetensors": {}}, {"model_type": "clef"}, "clef"),
+])
+def test_a_prepared_checkpoint_is_read_through_mlx_vlm(tmp_path, files, config, expected):
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    for name, content in files.items():
+        (tmp_path / name).write_text(json.dumps(content))
+    assert decision.detect_family(tmp_path) == expected
+
+
+def _vlm_model(monkeypatch, answers, media = ()):
+    from mlx_vlm import decision as vlm
+
+    seen = {}
+
+    def predict(model, processor, state, questions, **kwargs):
+        seen.update(state = state, questions = questions, **kwargs)
+        return {"answers": answers, "usage": {"input_tokens": 7, "output_tokens": 0}}
+
+    monkeypatch.setattr(vlm, "predict", predict)
+    model = decision._VlmModel.__new__(decision._VlmModel)
+    model.model, model.processor, model.reads_images = None, None, bool(media)
+    return model, seen
+
+
+def test_a_prepared_model_answers_on_this_contract(monkeypatch):
+    pytest.importorskip("mlx_vlm")
+    answers = {
+        "n": {"type": "bool", "value": True, "probability": 0.8},
+        "c": {"type": "choice", "value": "b", "probabilities": {"b": 0.6, "a": 0.4}},
+        "s": {"type": "score", "value": 1.2, "probabilities": {"0": 0.2, "1": 0.4, "2": 0.4}},
+    }
+    model, seen = _vlm_model(monkeypatch, answers)
+    questions = {
+        "n": {"type": "noul", "instructions": "i"},
+        "c": {"type": "choice", "instructions": "i", "criteria": {"a": "first", "b": None}},
+        "s": {"type": "score", "instructions": "i", "criteria": ["l", "m", "h"]},
+    }
+    out = model.answer("state", questions)
+    assert out["usage"]["input_tokens"] == 7 and seen["state"] == "state" and "images" not in seen
+    assert seen["questions"]["c"]["criteria"] == {"a": "first", "b": None} and seen["questions"]["s"]["criteria"] == ["l", "m", "h"]
+    assert out["answers"]["n"]["noul"] == pytest.approx(0.8)
+    # By key, not by the order the model lists them in.
+    assert out["answers"]["c"]["choice"] == "b" and out["answers"]["c"]["probabilities"]["a"] == pytest.approx(0.4)
+    assert out["answers"]["s"]["score"] == pytest.approx(1.2)
+
+
+def test_a_prepared_model_turns_a_refusal_into_a_request_error_and_passes_images(monkeypatch):
+    from mlx_vlm import decision as vlm
+
+    pytest.importorskip("mlx_vlm")
+    model, seen = _vlm_model(monkeypatch, {"n": {"probability": 0.5}}, ("images",))
+    question = model._parse_questions({"n": {"type": "noul", "instructions": "i"}})
+    model._scores("s", question, ["picture"])
+    assert seen["images"] == ["picture"]
+
+    def refuse(*args, **kwargs):
+        raise ValueError("no")
+
+    monkeypatch.setattr(vlm, "predict", refuse)
+    with pytest.raises(DecisionRequestError, match = "no"):
+        model._scores("s", question)
+
+
 def test_d1_media_takes_encoded_and_decoded_alike(monkeypatch):
     media = pytest.importorskip("mlx_vlm.models.d1_lfm3_vl.media")
     seen = []

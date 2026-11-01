@@ -1765,7 +1765,63 @@ class _D1Model(DecisionPipeline):
         return answer
 
 
-FAMILIES = {"laya": _MarkerModel, "lev": _LevModel, "nimble": _NimbleModel, "openjev": _OpenJevModel, "kev": _KevModel, "clef": ClefModel, "d1": _D1Model}
+_VLM_PREPARED = ("decider2", "laya", "clef")
+
+
+class _VlmModel(DecisionPipeline):
+    """A checkpoint prepared for mlx-vlm's own `predict`: Decider, and Laya or Clef with their metadata in config.json.
+    Their source layouts load through `_MarkerModel` and `ClefModel`, which also train."""
+
+    family = "mlx_vlm"
+    sources = ("nativ-community/decider-2b", "Mapika/decider-2b")
+    needs = "config.json naming a prepared model, or decider_config.json beside a Qwen3.5 decoder"
+    _question = _D1Model._question
+
+    @staticmethod
+    def matches(folder):
+        if (folder / "decider_config.json").is_file():
+            return True
+        return (folder / "config.json").is_file() and _read_json(folder / "config.json").get("model_type") in _VLM_PREPARED
+
+    def __init__(self, folder, dtype, base_model = None, token = None):
+        from mlx_vlm.utils import load
+
+        config = _read_json(folder / "config.json")
+        if config.get("model_type") in _VLM_PREPARED:
+            self.model, self.processor = load(str(folder))
+        else:
+            # The published Decider names its decoder qwen3_5_text and keeps its settings apart.
+            prepared = {**config, "model_type": "decider2", "decision_config": _read_json(folder / "decider_config.json")}
+            with tempfile.TemporaryDirectory() as view:
+                for item in folder.iterdir():
+                    if item.name != "config.json":
+                        os.symlink(item.resolve(), Path(view) / item.name)
+                (Path(view) / "config.json").write_text(json.dumps(prepared), encoding = "utf-8")
+                self.model, self.processor = load(view)
+        if dtype is not None:
+            self.model.set_dtype(dtype)
+        self.reads_images = "images" in getattr(self.model, "decision_media", ())
+
+    def _scores(self, state, questions, images = (), audio = ()):
+        from mlx_vlm.decision import predict
+
+        media = {"images": list(images)} if images else {}
+        named = {question.id: self._question(question) for question in questions}
+        try:
+            result = predict(self.model, self.processor, state, named, **media)
+        except DecisionRequestError:
+            raise
+        except ValueError as error:
+            raise DecisionRequestError(str(error)) from error
+        scores = []
+        for question in questions:
+            answer = result["answers"][question.id]
+            probabilities = answer.get("probabilities") or {"true": answer["probability"], "false": 1 - answer["probability"]}
+            scores.append([[math.log(max(float(probabilities[key]), 1e-300)) for key, _ in question.options]])
+        return scores, result["usage"]["input_tokens"]
+
+
+FAMILIES = {"laya": _MarkerModel, "lev": _LevModel, "nimble": _NimbleModel, "openjev": _OpenJevModel, "kev": _KevModel, "clef": ClefModel, "d1": _D1Model, "mlx_vlm": _VlmModel}
 
 
 def detect_family(folder):
