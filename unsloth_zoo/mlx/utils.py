@@ -6038,12 +6038,10 @@ _INT32_MAX = 2 ** 31 - 1
 
 
 def _compact_token_row(values):
-    """Store one row of token ids or labels as a read-only int32 array (4 bytes per token instead of a tuple of Python
-    ints); anything that is not a 1-D integer sequence inside int32 keeps the historical tuple(int(x)) form, so
-    materialized batches and overflow errors are unchanged."""
+    """Read-only int32 array for a 1-D integer row inside int32, else the historical tuple(int(x))."""
     wide = None
     if isinstance(values, (list, tuple)):
-        # np.fromiter applies the same int() coercion per element and is the fastest list path.
+        # fromiter coerces each element like int().
         try:
             wide = np.fromiter(values, dtype=np.int64, count=len(values))
         except (TypeError, ValueError, OverflowError):
@@ -6072,7 +6070,6 @@ def _token_row_key(values):
 
 
 def _count_supervised_labels(window):
-    """Number of entries != -100 in a label window (tuple or compact int32 array)."""
     if isinstance(window, np.ndarray):
         return int(np.count_nonzero(window != -100))
     return len(window) - window.count(-100)
@@ -6084,7 +6081,7 @@ class _FiniteTextRow:
     offset: int = 0
     labels: tuple | None = None
 
-    # Compact rows hold numpy arrays, so compare and hash by values (a compact row equals its tuple twin).
+    # By value: a compact row equals its tuple twin.
     def _key(self):
         return (
             _token_row_key(self.input_ids),
@@ -6304,9 +6301,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self._cce_capacities = {}
         if not enabled:
             return
-        # The count scans in C (tuple.count or a numpy compare) and a schedule revisits rows, so neither the per-label
-        # compare nor the repeat visit reaches Python; label-masked corpora put every token of every row in this
-        # window, which is what makes the difference worth having.
+        # Counted in C and cached per row: label-masked corpora put every token of every row in this window.
         row_counts = {}
 
         def supervised(row_index):

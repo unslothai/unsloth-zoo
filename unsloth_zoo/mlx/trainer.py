@@ -10082,7 +10082,6 @@ def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
         )
     for labels_list in label_batches:
         for row in labels_list:
-            # Compact plan rows hold int32 arrays: all -100 and non-empty is the same test as set(row) == {-100}.
             if isinstance(row, np.ndarray):
                 all_masked = bool(row.size) and bool(np.all(row == -100))
             else:
