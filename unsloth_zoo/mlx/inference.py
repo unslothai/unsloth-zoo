@@ -5200,12 +5200,14 @@ def _singleton_quantized_class(base, method, original, *cache_key):
 @contextmanager
 def singleton_quantized_decode(model, *, _modules = None):
     """Keep each request's one-row quantized arithmetic in a speculative call's batched decode and tied verify heads, which
-    its rows must match. A plain batch keeps stock's multi-row call."""
+    its rows must match. A plain batch keeps stock's multi-row call, and a projection Fast Verify moves to the lane kernel
+    its row-independent one."""
     changed = []
+    lanes = _lane_coverage(model, _modules)[3] if _fast_verify_held(model) else []
     try:
         with _NAX_QMM_LOCK:
-            if not _fast_verify_held(model) and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
-                seen = set()
+            if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                seen = {id(module) for module in lanes} if lanes and _fast_verify_status(len(lanes)) else set()
                 for _, module in _fusion_modules(model, _modules):
                     if id(module) in seen:
                         continue

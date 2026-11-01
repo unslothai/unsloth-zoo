@@ -585,6 +585,7 @@ def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkey
 @pytest.mark.parametrize("mixed", [False, True])
 def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_restore(qwen_4bit, monkeypatch, mixed):
     import copy
+    import mlx.nn as nn
     from mlx_vlm.models.qwen3_5 import language, speculative_verifier
     from unsloth_zoo.mlx import attention, inference, matmul
     from unsloth_zoo.mlx.generate import SamplingParams, generation_mode
@@ -592,6 +593,8 @@ def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_res
         pytest.skip("the lane kernel needs an Apple GPU")
     (model, ids, cache), rows, kernel = qwen_4bit, [], matmul.lane_qmm
     invariant = lambda: any(type(m).__name__.startswith("_Invariant") for _, m in model.named_modules())
+    held = lambda name: [m for _, m in model.named_modules() if name in vars(m)]
+    quantized = lambda: [m for _, m in model.named_modules() if isinstance(m, (nn.QuantizedLinear, nn.QuantizedEmbedding))]
     verifier, native = language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
     unscoped, block = copy.copy(model.language_model), mx.array([ids[0][24:36]])   # shares the projections
     monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: rows.append((len(args[0]), args[1].shape[0])) or kernel(*args, **kwargs))
@@ -607,6 +610,12 @@ def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_res
         with generation_mode(model, call = ("batch", "speculative")):
             assert "_unsloth_lane_verify_native" not in vars(type(verifier)) and not inference.fast_verify_enabled(model)
             assert not invariant()
+            assert len(held("_unsloth_singleton_scopes")) == len(quantized())   # a batch's decode keeps its one-row arithmetic
+    with monkeypatch.context() as patch:   # as it does when the kernel's probe fails
+        patch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
+        patch.setattr(inference.nax, "kernel_probe_passed", lambda *args: False)
+        with generation_mode(model, call = ("batch", "speculative")):
+            assert not held("_unsloth_lane_qmm") and len(held("_unsloth_singleton_scopes")) == len(quantized())
     with inference.row_invariant_lane_projections(model):   # also without the exact scope under it, which may nest inside
         assert type(verifier)._unsloth_lane_verify_native is native
         with inference.exact_speculative_verify(model):
@@ -622,6 +631,9 @@ def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_res
     monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
     assert inference.fast_verify_enabled(model) and not inference.fast_verify_enabled(object())
     with generation_mode(model, call = ("batch", "speculative")):
+        # Every projection decodes a batch row by row: on the kernel, or one row at a time where it stays native.
+        assert held("_unsloth_lane_qmm") and bool(held("_unsloth_singleton_scopes")) == mixed
+        assert all(("_unsloth_lane_qmm" in vars(m)) != ("_unsloth_singleton_scopes" in vars(m)) for m in quantized())
         # Layered over the exact scope's verifier, which keeps serving what lane does not cover, nested or not.
         with inference.exact_speculative_verify(model):
             pass

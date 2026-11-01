@@ -1643,7 +1643,7 @@ def test_inference_scopes_hold_fast_verify_around_every_scope_they_enter(monkeyp
         with pytest.raises(RuntimeError, match = "exit"), inference.inference_scopes(model, ("speculative",)):
             with inference.inference_scopes(model, ("speculative",)):
                 held = inference._fast_verify_held(model)
-                assert held == (flag == "1") and ("_unsloth_singleton_scopes" in vars(model.proj)) != held
+                assert held == (flag == "1") and "_unsloth_singleton_scopes" in vars(model.proj)   # lanes do not cover it
                 assert isinstance(model.lm_head, inference._TargetHeadFP32) == held
             assert inference._fast_verify_held(model) == held
             raise RuntimeError("exit")
