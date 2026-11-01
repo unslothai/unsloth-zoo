@@ -85,23 +85,15 @@ def swap_expert_lora_factors(lora_A: torch.Tensor, lora_B: torch.Tensor, num_exp
     return new_A, new_B
 
 
-def _b_grouped_by_expert():
-    """True when the live model reads lora_B with the legacy (out, E, R) packing (UNSLOTH_MOE_LORA_B_LAYOUT)."""
+def _legacy_grouped(wrapper, adapter_name):
+    """True when this wrapper reads lora_B with the legacy (out, E, R) packing (UNSLOTH_MOE_LORA_B_LAYOUT). Such
+    adapters are left as trained: Unsloth reloads them by their saved layout metadata, vanilla PEFT refuses them by
+    shape as before (no silent mix of experts)."""
     try:
-        from .moe_utils import LORA_B_LAYOUT_GROUPED_BY_EXPERT, moe_lora_b_layout
-        return moe_lora_b_layout() == LORA_B_LAYOUT_GROUPED_BY_EXPERT
+        from .moe_utils import LORA_B_LAYOUT_GROUPED_BY_EXPERT, moe_lora_b_layout_for_wrapper
+        return moe_lora_b_layout_for_wrapper(wrapper, adapter_name) == LORA_B_LAYOUT_GROUPED_BY_EXPERT
     except Exception:
         return False
-
-
-def _regroup_b(lora_B: torch.Tensor, num_experts: int, to_rank_major: bool):
-    """lora_B between the legacy (out, E, R) packing and PEFT's (out, R, E)."""
-    E = int(num_experts)
-    out, cols = lora_B.shape
-    R = cols // E
-    if to_rank_major:
-        return lora_B.reshape(out, E, R).permute(0, 2, 1).reshape(out, cols).contiguous()
-    return lora_B.reshape(out, R, E).permute(0, 2, 1).reshape(out, cols).contiguous()
 
 
 def _innermost(module):
@@ -164,19 +156,19 @@ def _pair_keys(state_dict, module_name):
     return pairs
 
 
-def _to_vanilla(model, state_dict):
+def _to_vanilla(model, state_dict, adapter_name = "default"):
     wrappers = _swapped_wrappers(model)
     if not wrappers:
         return state_dict
+    modules = dict(model.named_modules())
     state_dict = dict(state_dict)
     for module_name, num_experts in wrappers.items():
+        if _legacy_grouped(modules[module_name], adapter_name):
+            continue
         for key_a, key_b in _pair_keys(state_dict, module_name):
             a, b = state_dict[key_a], state_dict[key_b]
             if a.shape[1] == b.shape[0]:
                 continue   # square stack: ambiguous by shape, kept as trained
-            if _b_grouped_by_expert():
-                # The swap assumes PEFT's rank-major B; a legacy-packed B would mix experts.
-                b = _regroup_b(b, num_experts, to_rank_major = True)
             state_dict[key_a], state_dict[key_b] = swap_expert_lora_factors(a, b, num_experts)
     return state_dict
 
@@ -190,7 +182,7 @@ def _from_vanilla(model, state_dict, adapter_name):
     for module_name, num_experts in wrappers.items():
         wrapper = modules[module_name]
         lora_A_dict = getattr(wrapper, "lora_A", None)
-        if lora_A_dict is None or adapter_name not in lora_A_dict:
+        if lora_A_dict is None or adapter_name not in lora_A_dict or _legacy_grouped(wrapper, adapter_name):
             continue
         # Orientation from lora_A's input dimension only: a hotswap may bring another rank.
         want_in = lora_A_dict[adapter_name].weight.shape[1]
@@ -200,8 +192,6 @@ def _from_vanilla(model, state_dict, adapter_name):
                 continue   # trained under Unsloth before this change, or square
             new_a, new_b = swap_expert_lora_factors(a, b, num_experts)
             if new_a.shape[1] == want_in:
-                if _b_grouped_by_expert():
-                    new_b = _regroup_b(new_b, num_experts, to_rank_major = False)
                 state_dict[key_a], state_dict[key_b] = new_a, new_b
     return state_dict
 
@@ -210,7 +200,7 @@ def _wrap_get(original):
     def get_peft_model_state_dict(model, state_dict = None, adapter_name = "default", *args, **kwargs):
         result = original(model, state_dict, adapter_name, *args, **kwargs)
         try:
-            return _to_vanilla(model, result)
+            return _to_vanilla(model, result, adapter_name)
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning(f"Unsloth: kept expert LoRA factors as trained: {e}")
@@ -246,6 +236,53 @@ def _wrap_hotswap(original):
     return hotswap_adapter_from_state_dict
 
 
+def _wrap_load_adapter(original):
+    """transformers 5.x PeftAdapterMixin.load_adapter injects the adapter, then loads its tensors with
+    _load_pretrained_model (not PEFT's set_peft_model_state_dict): convert the factors on that path too."""
+    def load_adapter(self, peft_model_id = None, adapter_name = None, *args, **kwargs):
+        name = adapter_name or "default"
+        cls_load = type(self)._load_pretrained_model
+        had = "_load_pretrained_model" in self.__dict__
+
+        def _load_pretrained_model(*a, **k):
+            try:
+                state_dict = k.get("state_dict")
+                files = list(k.get("checkpoint_files") or [])
+                if state_dict is None and files and all(str(f).endswith(".safetensors") for f in files):
+                    from safetensors.torch import load_file
+                    state_dict = {}
+                    for f in files:
+                        state_dict.update(load_file(str(f)))
+                    k = dict(k, checkpoint_files = [])
+                if state_dict is not None:
+                    k = dict(k, state_dict = _from_vanilla(k.get("model", self), state_dict, name))
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: loaded expert LoRA factors unchanged: {e}")
+            return cls_load(*a, **k)
+
+        self.__dict__["_load_pretrained_model"] = _load_pretrained_model
+        try:
+            return original(self, peft_model_id, adapter_name, *args, **kwargs)
+        finally:
+            if not had:
+                self.__dict__.pop("_load_pretrained_model", None)
+    load_adapter._unsloth_factor_swap = True
+    load_adapter.__wrapped__ = original
+    return load_adapter
+
+
+def _patch_transformers_load_adapter():
+    try:
+        from transformers.integrations.peft import PeftAdapterMixin
+    except Exception:
+        return
+    original = PeftAdapterMixin.__dict__.get("load_adapter")
+    if original is None or getattr(original, "_unsloth_factor_swap", False):
+        return
+    PeftAdapterMixin.load_adapter = _wrap_load_adapter(original)
+
+
 def patch_expert_lora_factor_swap():
     try:
         import peft.utils.save_and_load as save_and_load
@@ -270,6 +307,7 @@ def patch_expert_lora_factor_swap():
                 continue
             if getattr(module, name, None) is original:
                 setattr(module, name, patched)
+    _patch_transformers_load_adapter()
 pass
 
 TEMPORARY_PATCHES.append(patch_expert_lora_factor_swap)

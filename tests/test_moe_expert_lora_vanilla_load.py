@@ -111,6 +111,10 @@ from safetensors.torch import load_file
 injected = inject_adapter_in_model(cfg, model_class().from_pretrained(CKPT, dtype = torch.float32))
 set_peft_model_state_dict(injected, load_file(os.path.join(ADAPTER, "adapter_model.safetensors")))
 out["injected_max_abs"] = float((logits(injected) - want).abs().max())
+# transformers' own load_adapter (5.x loads the tensors itself, not through set_peft_model_state_dict).
+direct = model_class().from_pretrained(CKPT, dtype = torch.float32)
+direct.load_adapter(ADAPTER)
+out["load_adapter_max_abs"] = float((logits(direct) - want).abs().max())
 # Failing before: a compiled wrapper's `_orig_mod.` names matched no key, and a hotswap into a lower-rank adapter
 # never converted (orientation was read from the whole shape, rank included).
 small = LoraConfig(r = 2, lora_alpha = 8, target_modules = ["q_proj"], init_lora_weights = False,
@@ -156,15 +160,22 @@ def _run(code, family, work, zoo, **extra):
 @pytest.mark.parametrize("family", ["llama4", "qwen3_vl_moe"])
 def test_unsloth_expert_lora_loads_in_vanilla_peft(tmp_path, family, b_layout):
     # grouped_by_expert (the legacy lora_B packing, UNSLOTH_MOE_LORA_B_LAYOUT) failing before: the swap read its B as
-    # PEFT's rank-major packing and mixed experts, so vanilla PEFT loaded it silently with wrong logits.
+    # PEFT's rank-major packing and mixed experts, so vanilla PEFT loaded it silently with wrong logits. Failing
+    # before too: transformers' load_adapter loaded the swapped factors unconverted (size mismatch).
     work = str(tmp_path)
     _run(VANILLA_SAVE, family, work, zoo = False)
     trained = _run(UNSLOTH_TRAIN, family, work, zoo = True, UNSLOTH_MOE_LORA_B_LAYOUT = b_layout)
     assert trained["reload_max_abs"] <= 1e-4, trained
     # Failing before: hotswap grew lora_A / padded lora_B instead of mapping the factors back, and prefixed keys did
     # not match an injected model's module names (size mismatch).
-    for key in ("hotswap_max_abs", "merged_max_abs", "injected_max_abs", "compiled_rank_hotswap_max_abs"):
+    for key in ("hotswap_max_abs", "merged_max_abs", "injected_max_abs", "compiled_rank_hotswap_max_abs",
+                "load_adapter_max_abs"):
         assert isinstance(trained[key], float) and trained[key] <= 1e-4, trained
+    if b_layout == "grouped_by_expert":
+        # Legacy packing is left as trained: vanilla PEFT refuses it by shape (never a silent wrong load).
+        with pytest.raises(AssertionError, match = "size mismatch"):
+            _run(VANILLA_LOAD, family, work, zoo = False)
+        return
     loaded = _run(VANILLA_LOAD, family, work, zoo = False)
     assert loaded["vanilla_max_abs"] <= 1e-4, loaded
 
