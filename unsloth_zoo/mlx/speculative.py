@@ -1110,6 +1110,73 @@ class TreeBudget:
         return rows if self._rate(self.trees[rows], self.tree_costs[rows], rows) >= chain else 0
 
 
+class SizedTreeBudget:
+    """Each round's rows on a sparse target, where each row brings its own experts: as many of the round's lattice's best
+    nodes as pay for their rows, from each node's path probability, scaled by how often nodes of its depth were accepted,
+    against each width's cycle as replies measure it. The load's costs, scaled to the reply's context, price the rest."""
+
+    ALPHA = 1 / 32
+    COST_ALPHA = 1 / 8
+    # A gap longer than this many cycles is a reply's start or a plain window, not a width's cycle, unless as many follow it.
+    GAP_CYCLES = 3
+    # Accepted over promised by depth at the start, as measured: deeper nodes promise more than they keep.
+    DEPTH_ACCEPTANCE = (0.9, 0.8, 0.65, 0.55, 0.5)
+    # A round costs about two plain steps.
+    MIN_ROUND_TOKENS = 2.0
+
+    def __init__(self, tree_costs: dict[int, float]):
+        self.load_costs = dict(tree_costs)
+        self.live = {rows: _Ema() for rows in tree_costs}
+        depths = range(1, max(tree_costs))
+        self.accepted = {depth: 0.5 * self.DEPTH_ACCEPTANCE[min(depth, len(self.DEPTH_ACCEPTANCE)) - 1] for depth in depths}
+        self.promised = {depth: 0.5 for depth in depths}
+        self._nodes, self._last, self._gaps, self._reply = (), None, 0, None
+
+    def choose(self) -> int:
+        """The rows to draft, every width being a prefix of the widest."""
+        return max(self.load_costs)
+
+    def yields_to_controller(self, state: RowState, trained: int) -> bool:
+        """Whether this round goes to the controller, which weighs plain windows and copies: its exploration costs about
+        2% on text trees serve well, so only drafts not paying for a round do."""
+        return state.stats.expected(RowPlan("draft", trained)) < self.MIN_ROUND_TOKENS
+
+    def _cost(self, rows: int) -> float:
+        live = self.live[rows]
+        if live.value is not None:
+            return live.value
+        measured = [(entry.value, self.load_costs[width]) for width, entry in self.live.items() if entry.value is not None]
+        return self.load_costs[rows] * (sum(a for a, _ in measured) / sum(b for _, b in measured) if measured else 1.0)
+
+    def size(self, nodes: Sequence[tuple[float, int]]) -> int:
+        """The rows to verify, from each node after the anchor, best first: its path probability and depth."""
+        self._nodes = nodes
+        tokens, best, best_rate = 1.0, min(self.load_costs), 0.0
+        for rows, (probability, depth) in enumerate(nodes, 2):
+            tokens += self.accepted[depth] / self.promised[depth] * probability
+            if rows in self.live and (rate := tokens / self._cost(rows)) > best_rate:
+                best, best_rate = rows, rate
+        return best
+
+    def reply_round(self, reply: ReplyStats) -> None:
+        """A round of ``reply`` is about to be observed: what passed since another reply's round is no cycle, however many replies run one round."""
+        if reply is not self._reply:
+            self._reply, self._last, self._gaps = reply, None, 0
+
+    def observe(self, rows: int, ranks: Sequence[int], end: float) -> None:
+        """A round of the last sized lattice verified ``rows`` rows and walked the nodes taken in the order ``ranks``, by ``end``."""
+        for rank, (probability, depth) in enumerate(self._nodes[: rows - 1], 1):
+            self.accepted[depth] += self.ALPHA * ((rank in ranks) - self.accepted[depth])
+            self.promised[depth] += self.ALPHA * (probability - self.promised[depth])
+        if self._last is not None:
+            if end - self._last < self.GAP_CYCLES * self._cost(rows) or self._gaps >= self.GAP_CYCLES:
+                self.live[rows].update(end - self._last, self.COST_ALPHA)
+                self._gaps = 0
+            else:
+                self._gaps += 1
+        self._last = end
+
+
 # Speculative decoding engine over an mlx-vlm model: verify rounds and plain windows for B rows.
 
 
@@ -1535,6 +1602,7 @@ class SpeculativeEngine:
         budget = getattr(self.drafter, "tree_budget", None)
         # Tree rounds account the drafter's trained depth, so a controller capped below it keeps its chain.
         if (budget is None or self.controller.fixed_depth or self.controller.max_depth < getattr(self.drafter, "trained_depth", 0)
+                or (isinstance(budget, SizedTreeBudget) and budget.yields_to_controller(states[0], self.drafter.trained_depth))
                 or not self.lm.__dict__.get("_unsloth_tree_verify") or plan.kind != "round" or len(plan.rows) != 1
                 or plan.rows[0].source != "draft" or (plan.split and not plan.trim) or self.controller._reference is not None
                 or self._rows[0].sample.temperature != 0 or self._rows[0].processors or _packed_kv(self.cache)):
@@ -1647,6 +1715,14 @@ class SpeculativeEngine:
         start, work = time.perf_counter(), first_use_work()
         with mx.stream(self._stream):
             tree = self.drafter.tree(draft, plan.tree)
+            budget = self.drafter.tree_budget
+            if isinstance(budget, SizedTreeBudget):
+                mx.eval(tree.rank, tree.score, tree.block.depth)
+                nodes = sorted(zip(tree.rank.tolist(), tree.score.tolist(), tree.block.depth.tolist()))[1:]
+                rows = budget.size([(math.exp(score), depth) for _, score, depth in nodes])
+                if rows != tree.tokens.size:
+                    tree = tree.regrow(rows)
+                plan = replace(plan, tree = rows)
             mx.async_eval(tree.tokens)
         with mx.stream(self._stream), tree_verify(tree.block):
             logits, hidden, transaction = self._verify(tree.tokens[None])
@@ -1677,10 +1753,14 @@ class SpeculativeEngine:
             transaction.abort()
             raise
         mx.async_eval([_committed_eval_state(entry) for entry in [*self.cache, *(self.draft_cache or [])]])
-        if self.drafter.tree_budget is not None:
+        if isinstance(budget, SizedTreeBudget):
+            budget.reply_round(states[0].stats)
+            ranks = tree.rank.tolist()
+            budget.observe(tree.tokens.size, {ranks[r] for r in rows[1:]}, time.perf_counter())
+        elif budget is not None:
             ranks = tree.rank.tolist()
             first_children = next((i for i in range(1, len(rows)) if rows[i] != rows[i - 1] + 1), len(rows)) - 1
-            self.drafter.tree_budget.observe(tree.tokens.size, [ranks[r] for r in rows[1:]], first_children)
+            budget.observe(tree.tokens.size, [ranks[r] for r in rows[1:]], first_children)
         self.controller.record_round(
             replace(plan, tree = 0, trim = False, split = False, rows = (RowPlan("draft", plan.tree - 1),),
                     controller_depth = self.drafter.trained_depth),
@@ -2489,8 +2569,9 @@ class ContextDrafter:
         # Set by `warm_speculative_rounds`: {width: seconds of a copy round}, from the trained block's width to the widest.
         self.copy_costs: dict[int, float] | None = None
         # Set by `warm_speculative_rounds` where this load's rounds may verify draft trees.
-        self.tree_budget: TreeBudget | None = None
+        self.tree_budget: TreeBudget | SizedTreeBudget | None = None
         self.tree_widths: tuple[int, ...] = ()
+        self.sized_trees = False
 
     @property
     def config(self):
@@ -2700,10 +2781,12 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
                     # Rows within the tile cost the same, so a draft round verifies the whole trained block, or the tile.
                     drafter.min_verify_rows = min(drafter.trained_depth + 1, rows)
             drafter.extended_depth = max(drafter.trained_depth, rows - 1)
-            # On a sparse target each row brings its own experts, and a chain trimmed to each lattice's confidences beat
-            # every fixed tree width measured.
+            # On a sparse target each row brings its own experts, so each round sizes its tree within the trained block.
             if not any(hasattr(module, "switch_mlp") for _, module in target.named_modules()):
                 drafter.tree_widths = (drafter.trained_depth + 1, 16) if drafter.extended_depth >= 15 else (drafter.trained_depth + 1,)
+            else:
+                drafter.sized_trees = True
+                drafter.tree_widths = tuple(range(_MIN_SIZED_TREE, drafter.trained_depth + 2))
         if not lazy and fast_verify_covers(target):
             language.__dict__["_unsloth_warm_drafter"] = weakref.ref(drafter)  # for `warm_speculative_rounds`
     drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
@@ -2712,6 +2795,7 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
 
 
 _WARM_ROUNDS_PROMPT = 64
+_MIN_SIZED_TREE = 3   # two rows cannot fork, and the fused verify block starts at three
 
 
 def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
@@ -2721,6 +2805,7 @@ def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
     if not drafter.tree_widths or not engine.lm.__dict__.get("_unsloth_tree_verify") or not tree_verify_matches(engine):
         return
     row = engine._rows[0]
+    drafter.tree_budget = None   # A sized budget from an earlier warm-up would resize the widths timed here.
 
     def cycles(plan: RoundPlan) -> float:
         seconds = []
@@ -2742,6 +2827,9 @@ def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
     finally:
         row.draft.tree_rows = 0
     trained = drafter.trained_depth
+    if drafter.sized_trees:
+        drafter.tree_budget = SizedTreeBudget(trees)
+        return
     chain = cycles(RoundPlan("round", rows = (RowPlan("draft", trained),)))
     drafter.tree_budget = TreeBudget(trees, {trained + 1: chain}, trained + 1)
 

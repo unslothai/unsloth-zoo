@@ -7009,6 +7009,7 @@ _DRAFT_TREE_KERNEL = r"""
             rank[at] = int(out);
             tree_tokens[out] = tokens[at];
             tree_rank[out] = int(at);
+            tree_score[out] = totals[at];
             tree_depth[out] = depths[at];
             tree_parent[out] = at == 0 ? -1 : rank[parents[at]];
             for (uint d = 0; d < A; ++d) tree_path[out * A + d] = 0;
@@ -7056,7 +7057,7 @@ _DRAFT_TREE_ACCEPT = r"""
 def _draft_tree_kernels():
     return (mx.fast.metal_kernel(
         name = "unsloth_draft_tree", input_names = ["pred", "hidden", "succ", "unary", "ids", "anchor"],
-        output_names = ["tree_tokens", "tree_depth", "tree_parent", "tree_path", "tree_fork", "tree_back", "tree_rank"],
+        output_names = ["tree_tokens", "tree_depth", "tree_parent", "tree_path", "tree_fork", "tree_back", "tree_rank", "tree_score"],
         compile_options = {"math_mode": "safe"}, source = _DRAFT_TREE_KERNEL),
         mx.fast.metal_kernel(name = "unsloth_draft_tree_accept", input_names = ["tokens", "parent", "target", "L"],
                              output_names = ["path", "accepted"], source = _DRAFT_TREE_ACCEPT))
@@ -7064,26 +7065,30 @@ def _draft_tree_kernels():
 
 class DraftTree(NamedTuple):
     """A drafter's best-first tree: `tokens` [n], row 0 the anchor, `parent` [n], the verify's `block`, and the order each
-    row's node was taken in (`rank`): the rows of rank below m are this lattice's tree of m rows."""
+    row's node was taken in (`rank`): the rows of rank below m are this lattice's tree of m rows. `score` is each row's
+    log probability along its path, and `regrow(m)` is that tree of m rows."""
     tokens: mx.array
     parent: mx.array
     block: TreeBlock
     rank: mx.array
+    score: mx.array = None
+    regrow: Callable = None
 
 
-def draft_tree(selector, hidden, anchor, candidates, unary, rows):
+def draft_tree(selector, hidden, anchor, candidates, unary, rows, projected = None):
     """The first `rows` nodes of the best-first tree over a block's candidate lattice, for one drafting row."""
-    projected = selector.hidden_projection(hidden)
+    projected = selector.hidden_projection(hidden) if projected is None else projected
     pred, succ, top = selector.predecessor_codebook.weight, selector.successor_codebook.weight, candidates.shape[-1]
     length, depth = hidden.shape[1], min(rows - 1, candidates.shape[1])
     outputs = _draft_tree_kernels()[0](
         inputs = [pred, projected, succ, unary, candidates, anchor],
         template = [("TOP", top), ("LENGTH", length), ("RANK", projected.shape[-1]), ("FRONTIER", rows), ("A", depth + 1)],
         grid = (32 * top, 1, 1), threadgroup = (32 * top, 1, 1),
-        output_shapes = [(rows,), (rows,), (rows,), (rows, depth + 1), (rows,), (rows,), (rows,)],
-        output_dtypes = [mx.int32] * 7)
-    tokens, depths, parents, path, fork, back, rank = outputs
-    return DraftTree(tokens, parents, TreeBlock(depths, path, fork, back), rank)
+        output_shapes = [(rows,), (rows,), (rows,), (rows, depth + 1), (rows,), (rows,), (rows,), (rows,)],
+        output_dtypes = [mx.int32] * 7 + [mx.float32])
+    tokens, depths, parents, path, fork, back, rank, score = outputs
+    regrow = lambda width: draft_tree(selector, hidden, anchor, candidates, unary, width, projected)
+    return DraftTree(tokens, parents, TreeBlock(depths, path, fork, back), rank, score, regrow)
 
 
 def draft_tree_accept(tree, target):

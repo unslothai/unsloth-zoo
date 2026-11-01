@@ -10,6 +10,7 @@ import pytest
 
 pytest.importorskip("mlx.core")
 from unsloth_zoo.mlx.speculative import (
+    SizedTreeBudget,
     TreeBudget,
     DraftController, NgramProposer, RoundPlan, RowPlan, RowState, SpeculativeEngine, _Calibration, _CycleCosts, _Ema, _upper,
 )
@@ -847,6 +848,93 @@ def test_tree_budget_runs_the_widest_tree_until_measured_then_the_best_rate_and_
     picks = [budget.choose() for _ in range(budget.PROBE_EVERY)]
     assert picks.count(0) == budget.PROBE_EVERY - 1 and picks.count(8) == 1
 
+
+def test_a_sized_tree_budget_verifies_the_rows_its_lattice_pays_for():
+    budget = SizedTreeBudget({3: 1.0, 4: 1.1, 5: 1.2})
+    assert budget.choose() == 5
+    # Confident nodes pay for every row; hopeless ones for none past the narrowest.
+    assert budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]) == 5
+    assert budget.size([(0.1, 1), (0.01, 2), (0.01, 3), (0.01, 4)]) == 3
+    # Nodes of a depth that keep failing stop being priced at their promise, those of another depth keep theirs.
+    nodes = [(0.9, 1), (0.6, 2), (0.6, 3), (0.6, 4)]
+    assert budget.size(nodes) == 5
+    for cycle in range(256):
+        budget.size(nodes)
+        budget.observe(5, {1}, float(cycle))
+    assert budget.accepted[1] / budget.promised[1] > 1 and budget.accepted[3] / budget.promised[3] < 0.01
+    assert budget.size(nodes) == 3
+    # Live cycles replace the load's price, a long gap is no cycle, and the rest scale with what replies measure.
+    budget = SizedTreeBudget({3: 1.0, 4: 2.0, 5: 3.0})
+    budget.size(nodes)
+    for end in (0.0, 2.0, 100.0):
+        budget.observe(3, set(), end)
+    assert budget.live[3].value == 2.0 and budget._cost(3) == 2.0 and budget._cost(5) == 6.0
+    # Trees of the narrowest width are the floor, even when no wider one is on offer.
+    assert SizedTreeBudget({3: 1.0}).size([(0.0, 1), (0.0, 2)]) == 3
+    assert SizedTreeBudget({3: 1.0, 4: 1.0}).size([(0.9, 1)]) == 3
+    # Cycles that stay far above the load's price are cycles after all.
+    budget = SizedTreeBudget({3: 1.0})
+    for end in (4.0, 8.0, 12.0, 16.0):
+        budget.observe(3, set(), end)
+    assert budget.live[3].value is None
+    budget.observe(3, set(), 20.0)
+    assert budget.live[3].value == 4.0
+    budget.observe(3, set(), 40.0)
+    assert budget.live[3].value == 4.0
+
+
+def test_a_sized_budget_times_no_cycle_across_replies_of_one_round():
+    budget = SizedTreeBudget({3: 1.0})
+    for at in range(6):
+        reply = object()
+        budget.reply_round(reply)
+        budget.observe(3, set(), 60.0 * at)
+    assert budget.live[3].value is None
+    budget.reply_round(reply)
+    budget.observe(3, set(), 300.5)
+    assert budget.live[3].value == 0.5
+    # A reply's long gaps do not count toward the next reply's.
+    budget, first, second = SizedTreeBudget({3: 1.0}), object(), object()
+    budget.reply_round(first)
+    for at in range(4):
+        budget.observe(3, set(), 60.0 * at)
+    budget.reply_round(second)
+    budget.observe(3, set(), 240.0)
+    budget.observe(3, set(), 300.0)
+    assert budget.live[3].value is None
+
+
+def test_a_sized_budget_hands_the_controller_poor_drafts():
+    controller = DraftController(max_depth = 7)
+    controller.trims = True
+
+    def planned(budget, stats):
+        engine = object.__new__(SpeculativeEngine)
+        draft = SimpleNamespace(tree_rows = None, prefetched_tree = None)
+        engine.drafter = SimpleNamespace(trained_depth = 7, tree_budget = budget)
+        engine.lm = SimpleNamespace(_unsloth_tree_verify = True)
+        engine.controller = controller
+        engine.cache = []
+        engine._rows = [SimpleNamespace(draft = draft, sample = SimpleNamespace(temperature = 0), processors = [])]
+        plan = RoundPlan("round", rows = (RowPlan("draft", 7),), split = True, trim = True)
+        return engine._tree_plan(plan, [RowState(stats)]).tree, draft.tree_rows
+
+    def reply(rate):
+        stats = controller.new_reply()
+        for position in range(7):
+            stats.draft[position].value = rate
+            stats.draft_seen[position] = True
+        return stats
+
+    sized, good, poor = SizedTreeBudget({3: 1.0, 8: 1.0}), reply(0.8), reply(0.3)
+    assert good.expected(RowPlan("draft", 7)) > 2 > poor.expected(RowPlan("draft", 7))
+    assert planned(sized, good) == (8, 8) and planned(sized, poor) == (0, 0)
+    # Only a sized budget, whose rounds would otherwise never reach the controller.
+    assert planned(TreeBudget({8: 1.0}, {8: 1.0}), poor) == (8, 8)
+    # Drafts recovering in a later round win the row back.
+    for position in range(7):
+        poor.draft[position].value = 0.8
+    assert planned(sized, poor) == (8, 8)
 
 
 
