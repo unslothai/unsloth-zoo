@@ -2611,6 +2611,8 @@ def test_draft_layer_folds_convolution_residual_and_keeps_context_cache(monkeypa
 def test_draft_projections_keep_their_arrays_and_read_as_their_targets_do(monkeypatch):
     import mlx.nn as nn
     from unsloth_zoo.mlx import inference, matmul
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
     model = nn.Module()
     model.layers = [nn.QuantizedLinear(1024, n, bias = False, bits = 4, group_size = 64) for n in (128, 16384)]
     model.eval().set_dtype(mx.bfloat16)
@@ -2652,7 +2654,10 @@ def test_a_long_prompts_first_round_reads_its_backlog_flush_and_prices_no_width(
 @pytest.mark.parametrize("lane,moe", [(False, False), (False, True), (True, False), (True, True)])
 def test_confidence_budget_skips_only_the_modes_dense_targets(monkeypatch, lane, moe):
     import mlx.nn as nn
+    from unsloth_zoo.mlx import matmul
     from unsloth_zoo.mlx.speculative import ContextDrafter
+    if lane and not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
     monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", str(int(lane)))
     class Head(nn.Module):
         def bind(self, target):

@@ -2151,11 +2151,12 @@ def test_target_head_runs_more_rows_than_one_lane_launch_in_fp32_launches(monkey
     monkeypatch.setattr(inference, "_bindings_intact", lambda bindings: True)
     w, scales, biases = head["weight"], head["scales"], head["biases"]
     signature = (mx.bfloat16, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape, 64, 4, head.mode)
-    head._unsloth_lane_qmm_ready = {(1, rows, 64): (None, signature) for rows in (32, 8)}
+    # A dict attribute on an mlx Module lands in its state, not __dict__, where the head reads admissions.
+    head.__dict__["_unsloth_lane_qmm_ready"] = {(1, rows, 64): (None, signature) for rows in (32, 8)}
     fp32 = inference._TargetHeadFP32(head, ())
     x = mx.ones((2, 20, 64), dtype = mx.bfloat16)
     y = fp32(x)
     assert launches == [32, 8] and y.dtype == mx.float32 and y.shape == (2, 20, 16)
     # A launch shape not yet admitted keeps the whole call on the stock head, never mixed precisions.
-    del head._unsloth_lane_qmm_ready[(1, 8, 64)]
+    del head.__dict__["_unsloth_lane_qmm_ready"][(1, 8, 64)]
     assert fp32(x).dtype == mx.bfloat16
