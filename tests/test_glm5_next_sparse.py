@@ -470,8 +470,8 @@ def test_flex_without_tail_selection_keeps_upstream(monkeypatch):
 
 @pytest.mark.parametrize("attn", ["eager", "sdpa"])
 def test_flex_matches_upstream_on_an_empty_real_selection(monkeypatch, attn):
-    """A mask hole before the first complete pool leaves a real query with no key even with the tail on: the
-    dense mask attends uniformly there, so flex must too."""
+    """A mask hole before the first complete pool leaves a real query with no key even with the tail on: SDPA's
+    dense mask returns zeros there like flex; eager's finfo.min row cannot be mirrored, so eager stays dense."""
     from torch.nn.attention.flex_attention import flex_attention
     _patched()
     model = _model(index_kpool = 16, index_topk = 64, attn = attn)
@@ -487,8 +487,42 @@ def test_flex_matches_upstream_on_an_empty_real_selection(monkeypatch, attn):
         monkeypatch.setattr("unsloth_zoo.flex_attention.utils.flex_attention", flex_attention)
         gates.reset_sparse_attn_stats()
         out = model(input_ids = ids, attention_mask = mask).last_hidden_state
-    assert _stat("flex") == 3
+    assert _stat("flex") == (3 if attn == "sdpa" else 0)
     torch.testing.assert_close(out[mask], ref[mask], atol = 2e-5, rtol = 1e-4)
+
+
+@pytest.mark.parametrize("attn", ["eager", "sdpa"])
+def test_flex_grads_match_upstream_on_an_empty_real_selection(monkeypatch, attn):
+    """Training through an empty real selection: eager's finfo.min row still passes softmax gradients to Q and K
+    (and is not uniform in fp16), so flex on eager must keep that call on the dense path."""
+    _patched()
+    model = _model(index_kpool = 16, index_topk = 64, attn = attn)
+    seq = 300
+    ids = torch.randint(0, 256, (2, seq), generator = torch.Generator().manual_seed(5))
+    mask = torch.ones(2, seq, dtype = torch.bool)
+    mask[0, 1] = False
+    def run():  # summed (not mean) loss: per-parameter gradients are large enough for the tolerances to bite
+        out = model(input_ids = ids, attention_mask = mask).last_hidden_state
+        (out * mask[..., None]).float().pow(2).sum().backward()
+        grads = {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
+        model.zero_grad(set_to_none = True)
+        return out.detach(), grads
+    with _upstream():
+        ref_out, ref_grads = run()
+    monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda q: True)
+    monkeypatch.setattr(sb, "_flex", _flex_semantics)
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
+    gates.reset_sparse_attn_stats()
+    out, grads = run()
+    valid = mask[..., None]
+    torch.testing.assert_close(out * valid, ref_out * valid, atol = 1e-5, rtol = 1e-5)
+    assert ref_grads.keys() == grads.keys()
+    for name in ref_grads:
+        torch.testing.assert_close(grads[name], ref_grads[name], atol = 1e-4, rtol = 1e-4, msg = name)
+    if attn == "sdpa":
+        assert _stat("flex") == 3
+    else:
+        assert _stat("flex") == 0 and _stat("flex_dense_empty") == 3
 
 
 def test_tiny_model_cached_greedy_decode_across_the_budget():
