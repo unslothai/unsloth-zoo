@@ -80,3 +80,23 @@ def test_single_tensor_and_one_tuple_unchanged():
         (x @ w).relu().sum().backward()
         torch.testing.assert_close(gx, x.grad)
         torch.testing.assert_close(gw, w.grad)
+
+
+def test_no_differentiable_output_still_raises():
+    # torch's reentrant checkpoint raises when no recomputed output requires grad, and so did this shim for a single
+    # output; silently returning no gradients would turn that error into a step that trains nothing.
+    import pytest
+
+    def constant(h, w):
+        return torch.ones_like(h) * 1.0
+
+    def constant_pair(h, w):
+        return torch.ones_like(h) * 1.0, torch.zeros_like(h) * 1.0
+
+    for fn in (constant, constant_pair):
+        x = torch.randn(4, 8, requires_grad = True)
+        w = torch.randn(8, 8, requires_grad = True)
+        outs = Unsloth_Gradient_Checkpointer.apply(fn, x, w)
+        outs = outs if isinstance(outs, tuple) else (outs,)
+        with pytest.raises(RuntimeError):
+            sum(o.sum() for o in outs).backward()

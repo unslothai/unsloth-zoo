@@ -832,8 +832,10 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         outputs = output if isinstance(output, tuple) else (output,)
         pairs = [(o, g) for o, g in zip(outputs, dY)
                  if torch.is_tensor(o) and o.requires_grad and g is not None]
-        if pairs:
-            torch.autograd.backward([o for o, _ in pairs], [g for _, g in pairs])
+        if not pairs:
+            # As torch's reentrant checkpoint: nothing to backprop is an error, not a step with no gradients.
+            raise RuntimeError("none of output has requires_grad=True, this checkpoint() is not necessary")
+        torch.autograd.backward([o for o, _ in pairs], [g for _, g in pairs])
         # Gradients for the extra inputs are returned to the engine instead of
         # being left to accumulate as a side effect of the nested backward.
         return (None, hidden_states.grad,) + tuple(
