@@ -429,6 +429,23 @@ def test_the_bare_engine_has_every_attribute_init_sets():
     assert all(getattr(engine, name) is None for name in names)
 
 
+def test_committed_cache_submission_defers_only_a_pending_fold_replay():
+    from unsloth_zoo.mlx.speculative import _committed_eval_state
+
+    class Cache:
+        def __init__(self, state, pending = None):
+            self.state = state
+            if pending is not None:
+                self._unsloth_pending = (pending, object(), object())
+
+    first, replay, last = object(), object(), object()
+    assert _committed_eval_state(Cache([first, replay, last], replay)) == [first, last]
+    assert _committed_eval_state(Cache([first, last], replay)) == [first, last]
+    assert _committed_eval_state(Cache((first, last))) == (first, last)
+    assert _committed_eval_state(Cache(replay, replay)) == []
+    assert _committed_eval_state(Cache(first, replay)) is first
+
+
 def test_only_the_verify_forward_is_built_as_a_verify_block():
     import importlib
     from unsloth_zoo.mlx.speculative import SpeculativeEngine

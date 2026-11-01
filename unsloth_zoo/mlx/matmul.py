@@ -271,27 +271,36 @@ _QMV_ROWS_GROUP_SIZES = (32, 64, 128)
 
 # A row's inputs as the installed MLX's `load_vector` forms them, and `xt`, each code product's factor.
 _QMV_ROWS_INPUTS = """
-    float x_thread[VPT];
-    const float sum = load_vector<T, float, VPT, BITS>(xr, x_thread);
+    float sum = 0;
     float xt[NP];
-    if (BITS == 5) {
+    if (BITS == 4) {  // subnormal half codes take x unscaled
         _Pragma("clang loop unroll(full)")
-        for (int p = 0; p < 2; ++p) {
-            const thread float* v = x_thread + 8 * p;
-            thread float* f = xt + 12 * p;
-            f[0] = v[0]; f[1] = v[1]; f[2] = v[1] * 256.0f; f[3] = v[2]; f[4] = v[3]; f[5] = v[3] * 256.0f;
-            f[6] = v[4]; f[7] = v[4] * 256.0f; f[8] = v[5]; f[9] = v[6]; f[10] = v[6] * 256.0f; f[11] = v[7];
-        }
-    } else if (BITS == 6) {
-        _Pragma("clang loop unroll(full)")
-        for (int p = 0; p < 2; ++p) {
-            const thread float* v = x_thread + 4 * p;
-            thread float* f = xt + 6 * p;
-            f[0] = v[0]; f[1] = v[1]; f[2] = v[1] * 256.0f; f[3] = v[2]; f[4] = v[2] * 256.0f; f[5] = v[3];
+        for (int i = 0; i < VPT; i += 4) {
+            sum += float(xr[i]) + float(xr[i + 1]) + float(xr[i + 2]) + float(xr[i + 3]);
+            xt[i] = xr[i]; xt[i + 1] = xr[i + 1]; xt[i + 2] = xr[i + 2]; xt[i + 3] = xr[i + 3];
         }
     } else {
-        _Pragma("clang loop unroll(full)")
-        for (int j = 0; j < VPT; ++j) xt[j] = x_thread[j];
+        float x_thread[VPT];
+        sum = load_vector<T, float, VPT, BITS>(xr, x_thread);
+        if (BITS == 5) {
+            _Pragma("clang loop unroll(full)")
+            for (int p = 0; p < 2; ++p) {
+                const thread float* v = x_thread + 8 * p;
+                thread float* f = xt + 12 * p;
+                f[0] = v[0]; f[1] = v[1]; f[2] = v[1] * 256.0f; f[3] = v[2]; f[4] = v[3]; f[5] = v[3] * 256.0f;
+                f[6] = v[4]; f[7] = v[4] * 256.0f; f[8] = v[5]; f[9] = v[6]; f[10] = v[6] * 256.0f; f[11] = v[7];
+            }
+        } else if (BITS == 6) {
+            _Pragma("clang loop unroll(full)")
+            for (int p = 0; p < 2; ++p) {
+                const thread float* v = x_thread + 4 * p;
+                thread float* f = xt + 6 * p;
+                f[0] = v[0]; f[1] = v[1]; f[2] = v[1] * 256.0f; f[3] = v[2]; f[4] = v[2] * 256.0f; f[5] = v[3];
+            }
+        } else {
+            _Pragma("clang loop unroll(full)")
+            for (int j = 0; j < VPT; ++j) xt[j] = x_thread[j];
+        }
     }
 """
 
@@ -326,10 +335,15 @@ _QMV_ROWS_SOURCE = """
             const device uint8_t* wl = ws + r * ROW_BYTES;
             if (BITS == 4) {
                 _Pragma("clang loop unroll(full)")
-                for (int p = 0; p < 4; ++p) {
-                    const uint16_t v = ((const device uint16_t*)wl)[p];
-                    code[r][4 * p] = v & 0x000f; code[r][4 * p + 1] = v & 0x00f0;
-                    code[r][4 * p + 2] = v & 0x0f00; code[r][4 * p + 3] = v & 0xf000;
+                for (int p = 0; p < 2; ++p) {
+                    // q * 2^-24 with no integer conversion; products are stock's times 2^-24 unless they underflow fp32.
+                    const uint v = ((const device uint*)wl)[p];
+                    _Pragma("clang loop unroll(full)")
+                    for (int m = 0; m < 4; ++m) {
+                        const half2 c = as_type<half2>((v >> (4 * m)) & 0x000F000Fu);
+                        code[r][8 * p + m] = c.x;
+                        code[r][8 * p + 4 + m] = c.y;
+                    }
                 }
             } else if (BITS == 5) {
                 _Pragma("clang loop unroll(full)")
@@ -351,7 +365,7 @@ _QMV_ROWS_SOURCE = """
                 _Pragma("clang loop unroll(full)")
                 for (int j = 0; j < 8; ++j) code[r][j] = wl[j];
             }
-            s[r] = sc[r * KG];
+            s[r] = BITS == 4 ? float(sc[r * KG]) * 16777216.0f : float(sc[r * KG]);
             b[r] = bs[r * KG];
         }
         _Pragma("clang loop unroll(full)")
