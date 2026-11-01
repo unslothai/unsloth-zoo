@@ -763,7 +763,12 @@ def test_drafter_layers_submit_their_output_when_built_in_eval_mode(monkeypatch)
 
 def test_prepared_plans_preserve_controller_state_and_choices():
     import copy
+    import importlib
     import pickle
+    # Pickle resolves classes through sys.modules, which another module's MLX world may have re-imported since collection.
+    spec = importlib.import_module("unsloth_zoo.mlx.speculative")
+    DraftController, RowState, RoundPlan, RowPlan, _CycleCosts = (
+        spec.DraftController, spec.RowState, spec.RoundPlan, spec.RowPlan, spec._CycleCosts)
     controller = DraftController(max_depth = 3, min_window = 3, probe_every = 5, stale_after = 8)
     controller.trims = True
     states = [RowState(controller.new_reply(), copy_available = 6), RowState(controller.new_reply())]
