@@ -236,14 +236,14 @@ def test_shared_adapters_over_different_weights_keep_the_tile_frame_route(in_uns
     for mlp in (a, b):
         got = torch.compile(mlp, backend = "aot_eager", dynamic = True)(x)
         torch.testing.assert_close(got, type(mlp).forward(mlp, x))
+    # Distinct instances sharing every tensor can still differ in settings (activation, scaling): also declined.
     tied = _LoraMLP()
     tied.g, tied.u, tied.d, tied.A, tied.B = a.g, a.u, a.d, a.A, a.B
     c = _LoraMLP()
-    c.A, c.B = tied.A, tied.B
-    c.g, c.u, c.d = tied.g, tied.u, tied.d
+    c.g, c.u, c.d, c.A, c.B = a.g, a.u, a.d, a.A, a.B
     R.install_module(tied, "rows:8")
     R.install_module(c, "rows:8")
-    assert tied.__dict__["_unsloth_tiling"].op_ok and c.__dict__["_unsloth_tiling"].op_ok
+    assert not tied.__dict__["_unsloth_tiling"].op_ok and not c.__dict__["_unsloth_tiling"].op_ok
 
 
 def test_parameter_hooks_run_once(in_unsloth_block):
@@ -392,3 +392,14 @@ def test_an_uninstalled_mlp_leaves_the_op_registry(in_unsloth_block):
     R.install_module(a, "rows:8")
     R.uninstall_module(a) if hasattr(R, "uninstall_module") else R._detach(a)
     assert a not in R._OP_MODULES
+
+
+def test_an_installed_mlp_pickles(in_unsloth_block):
+    # Failing before: the op's owner weakref made the tiling state unpicklable (cloudpickle / torch.save of a model).
+    import pickle
+
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    R.install_module(mlp, "rows:8")
+    state = pickle.loads(pickle.dumps(mlp.__dict__["_unsloth_tiling"]))
+    assert state.op_owner is None and not state.op_ok

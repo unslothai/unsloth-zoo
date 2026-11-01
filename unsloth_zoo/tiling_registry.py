@@ -507,6 +507,13 @@ class _TileState:
         self.op_ok = False
         self.op_owner = None
 
+    def __getstate__(self):
+        # The owner weakref does not pickle; an unpickled copy is not registered, so it takes the per-tile route.
+        state = dict(self.__dict__)
+        state["op_owner"] = None
+        state["op_ok"] = False
+        return state
+
 
 def _bind(module, fn):
     if fn is None:
@@ -679,9 +686,8 @@ def _op_module(params):
                 groups.setdefault(k, []).append(m)
                 _OP_BY_PTR.setdefault(k, weakref.ref(m))
         for k, members in groups.items():
-            # Interchangeable only if every parameter and buffer is shared (a tied MLP); shared adapters over
-            # different frozen weights would run the wrong module.
-            if len({type(m) for m in members}) > 1 or len({_op_identity(m) for m in members}) > 1:
+            # Distinct MLPs sharing trainable parameters are never interchangeable (install keeps them off the op).
+            if len(members) > 1:
                 _OP_BY_PTR.pop(k, None)
         ref = _OP_BY_PTR.get(key)
         module = ref() if ref is not None else None
@@ -712,10 +718,6 @@ def _op_uses_every_parameter(module, hidden):
         return all(g is not None for g in grads)
     except Exception:
         return False
-
-
-def _op_identity(module):
-    return tuple((t.device, t.data_ptr()) for t in list(module.parameters()) + list(module.buffers()))
 
 
 def _op_matches(module, params):
@@ -997,10 +999,9 @@ def _attach(module, spec, plan, budget_cache):
         key = (own[0].device, own[0].data_ptr()) if own else None
         for other in list(_OP_MODULES):
             mine = [p for p in other.parameters() if p.requires_grad]
-            if mine and (mine[0].device, mine[0].data_ptr()) == key and (
-                type(other) is not type(module) or _op_identity(other) != _op_identity(module)
-            ):
-                # Shared adapters over different frozen weights: the op could not tell them apart.
+            if mine and other is not module and (mine[0].device, mine[0].data_ptr()) == key:
+                # Distinct MLPs sharing trainable parameters: the op finds its module by those parameters and
+                # could run the other one's forward (other weights, or other settings on shared tensors).
                 state.op_ok = False
                 other.__dict__["_unsloth_tiling"].op_ok = False
         if state.op_ok:
