@@ -2244,7 +2244,6 @@ class ContextDrafter:
         return True
 
     def discard(self, row: ContextRow) -> None:
-        # The next push then records its rows as features, dropping the block.
         row.predrafted = None
 
     def draft(self, cache: list, rows: Sequence[ContextRow | None], depth: int, target: list) -> mx.array:
