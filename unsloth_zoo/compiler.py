@@ -1221,7 +1221,7 @@ def higher_precision_softmax(source):
             continue
         # Already float32: the source keeps the probabilities in float32 on purpose (MoE routers such as
         # Gemma-4's take top-k, renormalise and scale them in float32). Casting back to a 16-bit input dtype
-        # here flips near-tied expert choices and moved bf16 Gemma-4 logits 0.5 off transformers.
+        # rounds them before top-k, which can flip near-tied expert choices.
         if dtype is not None and re.fullmatch(r",\s*dtype\s*=\s*torch\.float(32)?\s*", dtype):
             continue
         new = (

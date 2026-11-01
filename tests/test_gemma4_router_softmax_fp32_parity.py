@@ -17,9 +17,9 @@
 """higher_precision_softmax must not downcast a softmax the source already runs in float32.
 
 Gemma-4's router computes `softmax(expert_scores, dim=-1, dtype=torch.float32)` and takes top-k, renormalises and
-applies per_expert_scale in float32. The compiler used to append `.to(expert_scores.dtype)`, so under bf16 the
-routing weights were rounded to bf16 before top-k: FastModel logits moved 0.50 off transformers (transformers' own
-bf16 error vs float32 is 0.02). CPU only, tiny random model built from a config (no download).
+applies per_expert_scale in float32. Appending `.to(expert_scores.dtype)` there rounds the routing weights to bf16
+before top-k, which flips near-tied experts and moves bf16 logits far past transformers' own bf16 error. CPU only,
+tiny random model built from a config (no download).
 """
 
 import inspect
