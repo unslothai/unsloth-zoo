@@ -42,6 +42,7 @@ from .deepseek_v4 import *
 from .sparse_attention import *
 from .deepseek_v4_sparse_flex import *
 from .sparse_attention_flex import *
+from .glm5_next_sparse_flex import *
 from .gemma4_moe import *
 from .lfm2_moe import *
 from .step3p7_moe import *

@@ -387,6 +387,21 @@ import os, shutil, re, functools
 _EMPTY_CACHE_BYTES_THRESHOLD = 256 * 1024 * 1024
 
 
+def _torch_save_spool(tensor, path, pickle_module, pickle_protocol):
+    # Skip torch.save's CRC32 (~half the spool cost): only our own mmap load reads it back.
+    # torch < 2.6 has no set_crc32_options, so it keeps the CRC32.
+    get_crc32 = getattr(torch.serialization, "get_crc32_options", None)
+    set_crc32 = getattr(torch.serialization, "set_crc32_options", None)
+    if get_crc32 is None or set_crc32 is None:
+        return torch.save(tensor, path, pickle_module = pickle_module, pickle_protocol = pickle_protocol)
+    previous = get_crc32()
+    set_crc32(False)
+    try:
+        return torch.save(tensor, path, pickle_module = pickle_module, pickle_protocol = pickle_protocol)
+    finally:
+        set_crc32(previous)
+
+
 @functools.lru_cache(maxsize = 1)
 def _active_merge_device():
     """Pick the active accelerator family for LoRA merge math, cached.
@@ -2727,7 +2742,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
             with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
                 temp_filename = temp_file.name
                 # Save the merged tensor to a unique temp file
-                torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                _torch_save_spool(W.to(output_dtype), temp_filename, pickle, pickle.HIGHEST_PROTOCOL)
                 del W
                 # Load it back as a memory-mapped object. The OS will manage paging this from disk.
                 W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
