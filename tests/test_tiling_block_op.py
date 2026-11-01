@@ -436,6 +436,76 @@ def test_functional_call_keeps_the_tile_frame_route(in_unsloth_block):
     torch.testing.assert_close(got, want)
 
 
+class _ScaledMLP(_LoraMLP):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("scale", torch.ones(()))
+
+    def forward(self, x):
+        return super().forward(x) * self.scale
+
+
+_ScaledMLP.__module__ = "transformers.models.foo.modeling_foo"
+_ScaledMLP.__name__ = _ScaledMLP.__qualname__ = "FooScaledMLP"
+
+
+@pytest.mark.parametrize("kind", ["frozen_parameter", "all_parameters", "buffer_only"])
+def test_functional_call_substitutions_keep_the_tile_frame_route(in_unsloth_block, kind):
+    # Failing before: a replacement nn.Parameter or buffer passed the plain-tensor check, so the op ran the live
+    # module after functional_call had restored it (wrong output), or could not find the module (RuntimeError).
+    torch.manual_seed(0)
+    mlp = _ScaledMLP() if kind == "buffer_only" else _LoraMLP()
+    R.install_module(mlp, "rows:8")
+    x = torch.randn(64, H)
+    if kind == "frozen_parameter":
+        replaced = {"g.weight": torch.nn.Parameter(mlp.g.weight * 3, requires_grad = False)}
+    elif kind == "all_parameters":
+        replaced = dict(_LoraMLP().named_parameters())
+    else:
+        replaced = {"scale": torch.tensor(3.0)}
+
+    def run(x):
+        return torch.func.functional_call(mlp, replaced, (x,))
+    want = run(x)
+    got = torch.compile(run, backend = "aot_eager", dynamic = True)(x)
+    torch.testing.assert_close(got, want)
+
+
+def test_an_unchanged_mlp_still_takes_the_op(in_unsloth_block, monkeypatch):
+    torch.manual_seed(0)
+    mlp = _ScaledMLP()
+    R.install_module(mlp, "rows:8")
+    seen = _spy_op(monkeypatch)
+    _run(_Block(mlp), torch.randn(1, 64, H, requires_grad = True))
+    assert seen
+
+
+def test_a_stochastic_child_added_after_install_replays_rng(in_unsloth_block, monkeypatch):
+    # Failing before: inside the compiled block the cached "no RNG" verdict was read without checking the module
+    # tree version, so an RReLU added after install took the op (no RNG replay; backward saw other draws).
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    R.install_module(mlp, "rows:8")
+    mlp.drop = torch.nn.RReLU(0.05, 0.9)
+    seen = _spy_op(monkeypatch)
+    _run(_Block(mlp), torch.randn(1, 64, H, requires_grad = True))
+    assert seen == []
+    assert mlp._unsloth_tiled_random[2] is True
+
+
+def test_a_stochastic_inner_forward_patched_after_install_replays_rng(in_unsloth_block, monkeypatch):
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    R.install_module(mlp, "rows:8")
+
+    def noisy(self, x):
+        return _LoraMLP.forward(self, F.dropout(x, 0.2, training = True))
+    mlp.__dict__["_unsloth_forward"] = noisy
+    seen = _spy_op(monkeypatch)
+    _run(_Block(mlp), torch.randn(1, 64, H, requires_grad = True))
+    assert seen == []
+
+
 def test_backward_recompute_holds_the_module_lock(in_unsloth_block, monkeypatch):
     # Two threads backpropagating through one MLP would otherwise interleave the proxy swaps (detached proxies left
     # bound, zero gradients). The recompute runs under a per-module lock.

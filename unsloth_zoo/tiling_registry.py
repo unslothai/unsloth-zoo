@@ -478,8 +478,12 @@ def needs_rng_replay(module, spec):
         return True
     cached = module.__dict__.get("_unsloth_tiled_random")
     if _is_compiling():
-        # Source inspection cannot run while tracing: use the eager verdict (computed at install), else replay.
-        return True if cached is None else cached[2]
+        # Source inspection cannot run while tracing: use the eager verdict (computed at install) while it still
+        # describes this module tree and inner forward, else replay.
+        if cached is None or cached[0] != _MODULE_TREE_VERSION[0] or cached[1] != id(module) or \
+                cached[3] is not module.__dict__.get("_unsloth_forward"):
+            return True
+        return cached[2]
     return _random_verdict(module)[2]
 
 
@@ -507,12 +511,14 @@ class _TileState:
         self.model_stats = None
         self.op_ok = False
         self.op_owner = None
+        self.op_tensors = None
 
     def __getstate__(self):
-        # The owner weakref does not pickle; an unpickled copy is not registered, so it takes the per-tile route.
+        # Weakrefs do not pickle; an unpickled copy is not registered, so it takes the per-tile route.
         state = dict(self.__dict__)
         state["op_owner"] = None
         state["op_ok"] = False
+        state["op_tensors"] = None
         return state
 
 
@@ -651,9 +657,11 @@ def _op_params(module, state):
     if owner is not module:
         # A deepcopy of an installed module carries the state but was never registered with the op.
         return None
-    if not all(isinstance(p, torch.nn.Parameter) for p in module.parameters()):
-        # A stateless call (torch.func.functional_call) swapped in plain tensors: the op reads the live module's
-        # weights at run time, after the swap is undone, so keep the per-tile route.
+    refs = state.op_tensors
+    current = list(itertools.chain(module.parameters(), module.buffers()))
+    if refs is None or len(current) != len(refs) or any(t is not r() for t, r in zip(current, refs)):
+        # A stateless call (torch.func.functional_call) or a reassigned weight put other tensors in place: the op
+        # reads the live module's tensors at run time, after the swap is undone, so keep the per-tile route.
         return None
     if needs_rng_replay(module, state.spec):
         return None
@@ -1039,6 +1047,7 @@ def _attach(module, spec, plan, budget_cache):
                 other.__dict__["_unsloth_tiling"].op_ok = False
         if state.op_ok:
             state.op_owner = weakref.ref(module)
+            state.op_tensors = tuple(weakref.ref(t) for t in itertools.chain(module.parameters(), module.buffers()))
             _OP_MODULES.add(module)
             _OP_VERSION[0] += 1
 
