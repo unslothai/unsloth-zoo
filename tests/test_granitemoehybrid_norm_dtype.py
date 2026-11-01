@@ -41,7 +41,7 @@ def _set_stock(monkeypatch):
 
 
 def _apply_granite_patches(monkeypatch):
-    # Every patch this module registers, so the test also runs (and fails) where the norm patch does not exist.
+    # Every patch this module registers, applied through the registry rather than by name.
     _set_stock(monkeypatch)
     monkeypatch.setattr(gm.GraniteMoeHybridDecoderLayer, "forward", gm.GraniteMoeHybridDecoderLayer.forward)
     for fn in TEMPORARY_PATCHES:
