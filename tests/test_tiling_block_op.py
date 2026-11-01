@@ -377,7 +377,8 @@ def test_saved_tensor_hooks_that_copy_keep_the_module(in_unsloth_block):
     ref = copy.deepcopy(mlp)
     R.install_module(mlp, "rows:4")
     x = torch.randn(64, H)
-    with torch.autograd.graph.save_on_cpu():
+    # As save_on_cpu on a GPU: the saved tensors come back as copies.
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: t.clone(), lambda t: t):
         torch.compile(mlp, backend = "aot_eager", dynamic = True)(x).pow(2).sum().backward()
     type(ref).forward(ref, x).pow(2).sum().backward()
     torch.testing.assert_close(mlp.A.grad, ref.A.grad)
