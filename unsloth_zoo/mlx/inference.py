@@ -3741,7 +3741,8 @@ def _grouped_routed_faster(routed, grouped, clock = time.perf_counter):
                 mx.eval((routed, grouped)[index]())
                 seconds[index].append(clock() - start)
         return sum(sorted(seconds[1])[:-1]) < sum(sorted(seconds[0])[:-1])
-    except (AttributeError, OSError, RuntimeError, TypeError):
+    except (AttributeError, OSError, RuntimeError, TypeError) as error:
+        _unless_failed_buffer(error)
         return False
 
 
@@ -8151,15 +8152,15 @@ def speculative_call(model, *, _modules = None):
 
 
 class InferenceScope(NamedTuple):
-    """`serves`: call traits that admit it (empty admits all). `speculative`: entered only by a call naming that trait,
-    which None does not, so a plain generation never pays for it. `opt_in`: env switch that must be "1".
-    `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument."""
+    """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
+    `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument.
+    `speculative`: entered only by a call naming that trait, which None does not. New fields go last: callers build these positionally."""
     enter: Callable
     serves: frozenset = frozenset()
-    speculative: bool = False
     opt_in: str = None
     int8_prefill: bool = False
     ane_prefill: bool = False
+    speculative: bool = False
 
     @property
     def name(self):
