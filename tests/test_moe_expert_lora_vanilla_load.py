@@ -251,3 +251,32 @@ def test_qwen3_vl_moe_swaps_factors_only_when_transformers_stores_another_layout
         swapped = False  # transformers 4.x itself builds the hidden-first layout
     got = _run(QWEN3_VL_NATIVE_LAYOUT.replace("sys.argv[1]", repr(layout)), "qwen3_vl_moe", str(tmp_path), zoo = True)
     assert got == {"swapped": swapped}, got
+
+
+def test_load_adapter_wrapper_loads_once_and_raises_real_errors(monkeypatch):
+    # Failing before: the wrapped loader ran inside the conversion's try, so a real load error was logged and the
+    # load ran a second time.
+    from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
+
+    calls = []
+
+    class _Model:
+        @classmethod
+        def _load_pretrained_model(cls, **kwargs):
+            calls.append(kwargs)
+            raise RuntimeError("real load error")
+
+        def modules(self):
+            return iter(())
+
+        def named_modules(self):
+            return iter(())
+
+    def original(self, peft_model_id = None, adapter_name = None):
+        return self._load_pretrained_model(model = self, state_dict = None, checkpoint_files = [])
+
+    model = _Model()
+    with pytest.raises(RuntimeError, match = "real load error"):
+        swap._wrap_load_adapter(original)(model, "x")
+    assert len(calls) == 1
+    assert "_load_pretrained_model" not in model.__dict__

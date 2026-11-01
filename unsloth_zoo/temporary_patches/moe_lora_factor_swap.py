@@ -237,6 +237,21 @@ def _wrap_hotswap(original):
     return hotswap_adapter_from_state_dict
 
 
+def _converted_load_kwargs(model, kwargs, adapter_name):
+    state_dict = kwargs.get("state_dict")
+    files = list(kwargs.get("checkpoint_files") or [])
+    if state_dict is None and files and all(os.path.isfile(str(f)) for f in files):
+        # transformers' own reader: it keeps the torch.load safety check for .bin files.
+        from transformers.modeling_utils import load_state_dict as _hf_load_state_dict
+        state_dict = {}
+        for f in files:
+            state_dict.update(_hf_load_state_dict(str(f), map_location = "cpu"))
+        kwargs = dict(kwargs, checkpoint_files = None)
+    if state_dict is not None:
+        kwargs = dict(kwargs, state_dict = _from_vanilla(model, state_dict, adapter_name))
+    return kwargs
+
+
 def _wrap_load_adapter(original):
     """transformers 5.x PeftAdapterMixin.load_adapter injects the adapter, then loads its tensors with
     _load_pretrained_model (not PEFT's set_peft_model_state_dict): convert the factors on that path too."""
@@ -246,28 +261,16 @@ def _wrap_load_adapter(original):
         had = "_load_pretrained_model" in self.__dict__
 
         def _load_pretrained_model(*a, **k):
-            try:
-                model = k.get("model", self)
-                # Only adapters over the re-laid-out experts need it: everything else keeps transformers' own
-                # path (disk offload indexes the checkpoint files it was given).
-                if not _swapped_wrappers(model):
-                    return cls_load(*a, **k)
-                state_dict = k.get("state_dict")
-                files = list(k.get("checkpoint_files") or [])
-                if state_dict is None and files and all(os.path.isfile(str(f)) for f in files):
-                    state_dict = {}
-                    for f in files:
-                        if str(f).endswith(".safetensors"):
-                            from safetensors.torch import load_file
-                            state_dict.update(load_file(str(f)))
-                        else:
-                            state_dict.update(torch.load(str(f), map_location = "cpu", weights_only = True))
-                    k = dict(k, checkpoint_files = [])
-                if state_dict is not None:
-                    k = dict(k, state_dict = _from_vanilla(model, state_dict, name))
-            except Exception as e:
-                if UNSLOTH_ENABLE_LOGGING:
-                    logger.warning(f"Unsloth: loaded expert LoRA factors unchanged: {e}")
+            model = k.get("model", self)
+            # Only adapters over the re-laid-out experts need it: everything else keeps transformers' own path
+            # (disk offload indexes the checkpoint files it was given).
+            if _swapped_wrappers(model):
+                try:
+                    k = _converted_load_kwargs(model, k, name)
+                except Exception as e:
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.warning(f"Unsloth: loaded expert LoRA factors unchanged: {e}")
+            # Called once, outside the try: a real load error is raised, not retried.
             return cls_load(*a, **k)
 
         self.__dict__["_load_pretrained_model"] = _load_pretrained_model
