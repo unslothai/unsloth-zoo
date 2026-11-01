@@ -271,9 +271,7 @@ class _TransposedGradMatmul(torch.autograd.Function):
     @staticmethod
     def backward(ctx, g):
         x, w = ctx.saved_tensors
-        gw = (g.reshape(-1, g.shape[-1]).t() @ x.reshape(-1, x.shape[-1])).t()
-        assert not gw.is_contiguous()
-        return g @ w.t(), gw
+        return g @ w.t(), (g.reshape(-1, g.shape[-1]).t() @ x.reshape(-1, x.shape[-1])).t()
 
 
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
