@@ -447,6 +447,27 @@ def test_cpu_flex_forward_matches_upstream(monkeypatch, compiled):
     torch.testing.assert_close(out, ref, atol = 2e-5, rtol = 1e-4)
 
 
+def test_flex_without_tail_selection_keeps_upstream(monkeypatch):
+    """Without tail selection the first queries see no complete pool: eager attends uniformly there,
+    flex would return zeros, so this config stays on the dense path."""
+    from torch.nn.attention.flex_attention import flex_attention
+    _patched()
+    model = _model(index_kpool_always_select_tail = False, attn = "eager")
+    seq = 300
+    ids = torch.randint(0, 256, (2, seq), generator = torch.Generator().manual_seed(5))
+    mask = _mask(2, seq, "none")
+    with torch.no_grad():
+        with _upstream():
+            ref = model(input_ids = ids, attention_mask = mask).last_hidden_state
+        monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda q: True)
+        monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT", "1")
+        monkeypatch.setattr("unsloth_zoo.flex_attention.utils.flex_attention", flex_attention)
+        gates.reset_sparse_attn_stats()
+        out = model(input_ids = ids, attention_mask = mask).last_hidden_state
+    torch.testing.assert_close(out, ref, atol = 2e-5, rtol = 1e-4)
+    assert _stat("flex") == 0
+
+
 def test_tiny_model_cached_greedy_decode_across_the_budget():
     """Prefill below the budget (skip), decode past it (scored, one query): same tokens and logits."""
     _patched()

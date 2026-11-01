@@ -315,6 +315,10 @@ def glm5_next_flex_eligible(module, query, key, value, kwargs):
     config = module.config
     if config._attn_implementation not in ("eager", "sdpa"):
         return False
+    # Without the tail, queries before the first complete pool select no key: the dense mask attends
+    # uniformly there, flex returns zeros.
+    if not config.index_kpool_always_select_tail:
+        return False
     # The layout the mask reads comes from the patched indexer (off with UNSLOTH_SPARSE_INDEXER_CHUNKED=0).
     if not sparse.sparse_indexer_chunked_enabled():
         return False
