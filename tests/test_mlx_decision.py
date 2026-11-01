@@ -423,8 +423,8 @@ def test_an_adapter_on_two_towers_of_the_same_layer_numbers_is_refused(tmp_path)
     (tmp_path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 2}))
     pair = {"lora_A.weight": mx.zeros((2, 4)), "lora_B.weight": mx.zeros((4, 2))}
     decoder, audio = "base_model.model.thinker.model.layers.0.self_attn.q_proj", "base_model.model.thinker.audio_tower.layers.0.self_attn.q_proj"
-    # Together they collapse into one key; alone the tower's would land on the decoder's layer of its number. MiniCPM
-    # names its towers `vpm` and `apm`, which say nothing of what they read.
+    # Decoder and audio-tower paths collapse into one key together; alone, the tower's path would land on the decoder
+    # layer of its number; MiniCPM names its towers vpm and apm, which say nothing of what they read
     towers = (
         (decoder, audio), (audio,), ("base_model.model.thinker.talker.model.layers.1.mlp.up_proj",), ("base_model.model.multi_modal_projector.linear_1",),
         ("base_model.model.apm.encoder.layers.0.self_attn.q_proj",), ("base_model.model.vpm.encoder.layers.0.mlp.fc1",),

@@ -14,17 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Native MTP heads, trainable outside the target model.
-
-Qwen3.5 / Qwen3.6 use the hand-written Qwen35MTPHead below; every other family in
-mtp_families (GLM, DeepSeek, Qwen3-Next, Nemotron-H, Step, ...) uses nextn.NextNHead.
-
-The forward follows llama.cpp's `graph_mtp` (src/models/qwen35.cpp) and its
-`draft-mtp` driver (common/speculative.cpp): MTP position p consumes the target's
-post-`output_norm` hidden of position p-1 and the token at p, and predicts the
-token at p+1. Its KV cache is filled over every target position with those
-pairs, and recursive draft steps feed the head's own normed output back as h.
-"""
+"""Native MTP heads trained outside the target: Qwen3.5/3.6 use Qwen35MTPHead, other mtp_families use nextn.NextNHead;
+position p takes post-output_norm hidden of p-1 and token p, predicts p+1; recursive steps feed back the normed
+output as h (llama.cpp graph_mtp)."""
 
 __all__ = [
     "MTP_PREFIX_RE",
@@ -98,8 +90,7 @@ def mtp_family_name(config):
 
 
 def find_mtp_tensor_names(source, revision = None, config = None):
-    """{full tensor name: shard file} for every MTP tensor in the checkpoint. `config` (the
-    target's) picks the family; read from `source` when omitted."""
+    """Map {full tensor name: shard file} for every MTP tensor in the checkpoint; config (the target's) picks the family, else it is read from source."""
     weight_map, _ = _weight_map(source, revision = revision)
     text = _text_config(config) if config is not None else _source_text_config(source, revision)
     family = _nextn_family(text)
@@ -128,13 +119,9 @@ def _declared_mtp_layers(source, revision = None):
 
 
 def load_mtp_state_dict(source, revision = None, config = None):
-    """Read only the MTP tensors of a checkpoint (transformers drops them on load).
-
-    Returns (state_dict, info). Qwen3.5 names are head-relative (`fc.weight`); other families
-    keep full checkpoint names (info["prefix"] is then ""). Only the shards that hold the head
-    are downloaded or opened. `config` (the target's) picks the family; read from `source`
-    when omitted.
-    """
+    """Read only MTP tensors (transformers drops them on load); returns (state_dict, info); Qwen3.5 names are
+    head-relative (fc.weight), others keep full names (info["prefix"] is empty); only shards holding the head are
+    opened."""
     from safetensors import safe_open
     text = _text_config(config) if config is not None else _source_text_config(source, revision)
     family = _nextn_family(text)
@@ -219,10 +206,7 @@ def _apply_rope(x, cos, sin):
 
 
 class Qwen35MTPHead(nn.Module):
-    """One native Qwen3.5 MTP block; `state_dict()` names equal the checkpoint's minus `mtp.`.
-
-    The token embedding and lm_head are not owned: they are the target's, passed in frozen.
-    """
+    """One native Qwen3.5 MTP block; state_dict() names equal the checkpoint's minus mtp.; embedding and lm_head are the target's, passed in frozen."""
 
     def __init__(self, config):
         super().__init__()
@@ -326,18 +310,9 @@ class Qwen35MTPHead(nn.Module):
         num_steps = 1,
         position_ids = None,
     ):
-        """Teacher-forced recursive drafting over a whole sequence.
-
-        Index p of every step is the chain whose first MTP input is
-        (hidden_final[p-1], x_p) at position p. Step k of that chain sits at
-        position p+k with token x_{p+k} and h = step k-1's output at p, and predicts
-        x_{p+k+1} (= x_{t+k+2} with t = p-1). Step k attends to step 0's keys at
-        positions <= p (llama.cpp fills those from the target's h) plus the chain's
-        own keys of steps 1..k, exactly what the draft loop sees.
-
-        Returns one dict per step: hidden (normed, pre lm_head), labels (-100 where
-        undefined), positions, valid.
-        """
+        """Teacher-forced recursive drafting: chain p starts from (hidden_final[p-1], x_p) at position p; step k sits at
+        p+k with token x_{p+k}, takes step k-1's h, predicts x_{p+k+1}; attends step-0 keys at positions <= p plus
+        its own chain keys; returns per-step dicts."""
         B, S = input_ids.shape
         device = input_ids.device
         if attention_mask is None:
@@ -394,12 +369,8 @@ class Qwen35MTPHead(nn.Module):
         return {"k": None, "v": None}
 
     def draft(self, hidden, token_ids, positions, embed_tokens, cache):
-        """Incremental decode of new MTP positions, appended to `cache` (llama.cpp's MTP KV).
-
-        hidden [B, n, H] is the h paired with each token (target h of the previous
-        position during catch-up, the head's own output while drafting). Returns
-        the normed outputs [B, n, H].
-        """
+        """Incremental MTP decode appended to cache (llama.cpp's MTP KV); hidden [B, n, H] pairs with each token (target
+        h during catch-up, own output while drafting); returns normed [B, n, H]."""
         residual = self._project_inputs(embed_tokens(token_ids).to(self.fc.weight.dtype), hidden.to(self.fc.weight.dtype))
         q, k, v, gate = self._qkv(residual, positions)
         cache["k"] = k if cache["k"] is None else torch.cat([cache["k"], k], dim = 2)
@@ -421,8 +392,7 @@ class Qwen35MTPHead(nn.Module):
 
 
 def _init_unset_parameters(head, std):
-    """MoE experts / router are created with torch.empty / zeros (transformers leaves them to
-    _init_weights); give a random head finite, non-degenerate values."""
+    """MoE experts and router are torch.empty/zeros (transformers leaves them to _init_weights); normal-init them so a random head has finite, non-degenerate values."""
     for name, param in head.named_parameters():
         if name.endswith(("experts.gate_up_proj", "experts.down_proj", "mlp.gate.weight")):
             with torch.no_grad():
@@ -431,11 +401,7 @@ def _init_unset_parameters(head, std):
 
 def build_mtp_head(target_model_or_config, state_dict = None, dtype = None, device = None, strict = True,
                    target_embed = None, target_lm_head = None, ckpt_prefix = None):
-    """Build the MTP head for a target; load `state_dict` (as returned by load_mtp_state_dict).
-
-    target_embed / target_lm_head: the target's matrices, so head-serialized copies equal to
-    them are not held twice.
-    """
+    """Build the MTP head for a target and load state_dict; target_embed / target_lm_head are the target's matrices, so equal head copies are not held twice."""
     config = _text_config(target_model_or_config)
     family = _nextn_family(config)
     if family is not None:

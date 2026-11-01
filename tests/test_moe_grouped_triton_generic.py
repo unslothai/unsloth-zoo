@@ -46,8 +46,8 @@ def _clean_env(monkeypatch):
 
 
 def _skip_unless_forcing_engages():
-    # UNSLOTH_MOE_GROUPED_TRITON=1 is a no-op below sm80 by design (_triton_grouped_mm_policy, test_gate_table): T4 keeps
-    # torch._grouped_mm. Tests asserting the forced kernel engages have nothing to check there.
+    # UNSLOTH_MOE_GROUPED_TRITON=1 is a no-op below sm80 by design (_triton_grouped_mm_policy, test_gate_table): T4
+    # keeps torch._grouped_mm, so forced-engagement tests skip there.
     if torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("forcing the Triton grouped GEMM is off below sm80 by design")
 
@@ -512,8 +512,8 @@ def test_opcheck(dtype):
 @pytest.mark.parametrize("transposed", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_eager_dw_fallback_with_broadcast_grad(dtype, transposed):
-    # sm89's auto table hands every base dW (K, N > 32) to the torch._grouped_mm fallback. The grad of
-    # y.sum() reaches it as a stride-0 expand; dW must still match fp64 (test_opcheck saw it differ under AOT).
+    # sm89's auto table hands every base dW (K, N > 32) to the torch._grouped_mm fallback; the grad of y.sum() arrives
+    # as a stride-0 expand, and dW must still match fp64 (test_opcheck saw it differ under AOT).
     if not MU._grouped_mm_supported_on(torch.device("cuda", torch.cuda.current_device())):
         pytest.skip("torch._grouped_mm unsupported here")
     _mock_cap((8, 9), torch.cuda.current_device())

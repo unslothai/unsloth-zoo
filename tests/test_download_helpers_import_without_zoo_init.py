@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The Hub download helpers import without ``unsloth_zoo``'s package init, and their
-``unsloth_zoo.<module>`` names stay the same module objects."""
+"""Hub download helpers import without unsloth_zoo's package init, and their unsloth_zoo.<module> names stay the same module objects."""
 
 from __future__ import annotations
 
@@ -80,8 +79,7 @@ def test_the_fallback_resolves_its_siblings_inside_the_light_package():
 
 
 def test_the_old_file_still_serves_a_loader_that_executes_it_by_path():
-    """unsloth's _gpu_init loads unsloth_zoo/hf_cache.py from its file, under another name, before
-    importing the package, to redirect a read-only cache ahead of huggingface_hub."""
+    """unsloth's _gpu_init loads unsloth_zoo/hf_cache.py by path under another name before package import, to redirect a read-only cache ahead of huggingface_hub."""
     path = REPO_ROOT / "unsloth_zoo" / "hf_cache.py"
     spec = importlib.util.spec_from_file_location("unsloth_zoo._early_hf_cache", path)
     module = importlib.util.module_from_spec(spec)
@@ -115,9 +113,8 @@ def _imports_a_package(node, stdlib) -> bool:
 
 
 def test_the_package_init_registers_the_old_names_before_anything_heavy():
-    """A late failure of unsloth_zoo/__init__ must still leave unsloth_zoo.hf_cache and
-    unsloth_zoo.hf_xet_tuning in sys.modules: Unsloth's backend and unsloth.dataset_num_proc read
-    them from there when the package itself cannot import."""
+    """A late unsloth_zoo/__init__ failure must still leave unsloth_zoo.hf_cache and unsloth_zoo.hf_xet_tuning in
+    sys.modules, since unsloth's backend and unsloth.dataset_num_proc read them there when the package cannot import."""
     stdlib = getattr(sys, "stdlib_module_names", None)
     if stdlib is None:
         pytest.skip("needs sys.stdlib_module_names (Python 3.10+)")
@@ -140,9 +137,8 @@ def test_the_package_init_registers_the_old_names_before_anything_heavy():
 
 
 def test_the_fallback_file_runs_as_the_spawn_childs_main_module():
-    """``_run_download_attempt`` points ``__main__.__file__`` at hf_xet_fallback.py, so every spawn
-    child first runs that file as ``__mp_main__`` with no parent package; a package-relative import
-    at its top level would crash the child before the download starts."""
+    """_run_download_attempt points __main__.__file__ at hf_xet_fallback.py, so spawn children run it as __mp_main__
+    with no parent package; a relative top-level import crashes the child."""
     from unsloth_zoo_downloads import hf_xet_fallback
 
     loaded = _modules_loaded_by(

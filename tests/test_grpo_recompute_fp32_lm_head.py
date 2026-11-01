@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_VLLM_FP32_LM_HEAD=1 must also reach the recompute projector.
-
-GRPO entropy masking / the entropy bonus and UNSLOTH_GRPO_LOGPROB_RECOMPUTE=1 score the policy
-with chunked_hidden_states_selective_log_softmax_recompute, while old / ref logps come from
-chunked_hidden_states_selective_log_softmax. With the flag on, both have to project in fp32, or
-new and old logps differ by the 16-bit head rounding on identical weights.
-"""
+"""UNSLOTH_VLLM_FP32_LM_HEAD=1 must reach the recompute projector too, else new logps (recompute) and old/ref logps
+(plain) differ by 16-bit head rounding on identical weights."""
 
 import inspect
 import math

@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The zoo MoE routers call _fused_route_or_none on every forward (None unless
-UNSLOTH_MOE_FUSED_ROUTER=1). The compiler copies those forwards into a generated module
-that does not carry the patch module's globals, so the emitted module must import the
-helper itself. Without it gpt-oss training raised NameError on the first step."""
+"""Emitted MoE modules must import _fused_route_or_none, which routers call per forward (None unless
+UNSLOTH_MOE_FUSED_ROUTER=1); copied forwards lack the patch globals."""
 
 import ast
 import inspect

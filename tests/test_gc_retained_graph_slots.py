@@ -2,8 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Regression: in F0 R0 F1 B1 B0 the forward of step 1 overwrote the host slot the retained
-graph of step 0 re-reads, giving wrong grads. Streams are stubbed so this runs on CPU."""
+"""Regression: in F0 R0 F1 B1 B0, step 1's forward overwrote the host slot that step 0's retained graph re-reads, giving
+wrong grads; streams are stubbed so it runs on CPU."""
 import contextlib
 import gc
 

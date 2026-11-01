@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Checkpoints that cannot hand back a single input embedding matrix.
-
-The models are stand-ins reproducing the offending shape: the real ones
-(Qwen3-Omni, stepfun-ai/Step-3.7-Flash) are 30B and larger.
-"""
+"""Checkpoints that cannot return one input embedding matrix; stand-in models reproduce the offending shape since the
+real Qwen3-Omni and stepfun-ai/Step-3.7-Flash are 30B and larger."""
 
 import datasets
 import pytest
@@ -30,8 +27,7 @@ def _config():
 
 @pytest.fixture(scope = "module")
 def tokenizer():
-    """Built locally: a hub tokenizer makes the whole file raise OSError under
-    HF_HUB_OFFLINE=1 instead of testing anything."""
+    """Built locally because a hub tokenizer would raise OSError under HF_HUB_OFFLINE=1 and make the whole file fail instead of testing anything."""
     tokenizers = pytest.importorskip("tokenizers")
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
@@ -114,8 +110,7 @@ class _OnlyOutputIsNone(PreTrainedModel):
 
 
 class _RaisesTypeErrorInsideTheBody(PreTrainedModel):
-    """Callable accessor failing internally, e.g. remote code against the wrong
-    transformers: not a signature we cannot call, so it must propagate."""
+    """Accessor that raises TypeError inside its body (e.g. remote code against the wrong transformers) must propagate, not be treated as an uncallable signature."""
 
     config_class = LlamaConfig
 
@@ -150,8 +145,7 @@ def test_the_shapes_really_are_unanswerable(tokenizer, dataset):
 
 
 class _UnreadableSignature(PreTrainedModel):
-    """Callable, but inspect.signature() raises TypeError on it, the same
-    exception bind() raises for a required argument."""
+    """Callable whose inspect.signature() raises TypeError, the same exception bind() raises for a required argument."""
 
     config_class = LlamaConfig
 
@@ -188,8 +182,7 @@ def test_an_unreadable_signature_counts_as_callable(tokenizer):
 
 
 class _BrokenInputAndUncallableOutput(PreTrainedModel):
-    """The input accessor fails in its body while the output one cannot be
-    called: checking either signature against either failure hides the first."""
+    """Input accessor fails in its body while the output accessor cannot be called; checking either signature against either failure would hide the first error."""
 
     config_class = LlamaConfig
 
@@ -211,16 +204,14 @@ def test_an_uncallable_output_accessor_does_not_mask_a_broken_input_accessor(tok
 
 
 def test_a_type_error_from_inside_the_accessor_still_propagates(tokenizer, dataset):
-    """Catching every TypeError would turn a genuine failure into a run quietly
-    missing its NaN guard, the one outcome worse than the crash."""
+    """Catching every TypeError would let a real failure run silently without its NaN guard, the one outcome worse than the crash."""
     model = _RaisesTypeErrorInsideTheBody(_config())
     with pytest.raises(TypeError, match = "something inside the model went wrong"):
         fix_untrained_tokens(model, tokenizer, dataset)
 
 
 def test_the_skip_is_visible_without_opting_into_logging(caplog, tokenizer, dataset):
-    """The logger sits at WARNING unless UNSLOTH_ENABLE_LOGGING is set, so an
-    info-level line would never reach the user whose run lost the NaN guard."""
+    """The logger is at WARNING unless UNSLOTH_ENABLE_LOGGING is set, so the skip must be logged at warning level or the user never sees it."""
     import logging
 
     from unsloth_zoo.log import logger as package_logger
@@ -243,8 +234,7 @@ def test_an_ordinary_model_is_still_processed(tokenizer, dataset):
 
 
 def test_untrained_tokens_really_are_still_reset(tokenizer):
-    """"Nothing changed" also holds when the pass is skipped for every model,
-    so this one resets genuinely untrained rows instead."""
+    """An unchanged embedding also happens when the pass is skipped for every model, so this test uses genuinely untrained rows that must be reset."""
     config = _config()
     config.tie_word_embeddings = False
     model = AutoModelForCausalLM.from_config(config)

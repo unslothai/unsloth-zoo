@@ -14,22 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Blocking `import flashinfer` for vLLM must not be a one-way door.
-
-Clearing VLLM_ATTENTION_BACKEND / VLLM_USE_FLASHINFER_SAMPLER does not steer vLLM on a
-cu128 runtime image without nvcc or ninja: vLLM picks FlashInfer from its own sm_100
-default backend list and dies JIT compiling trtllm-gen kernels. Hiding the package via
-`sys.modules["flashinfer"] = None` is what makes its `has_flashinfer()` find_spec probe
-report the package absent, so `get_attn_backend_cls` falls through to FLASH_ATTN.
-
-That hide is process wide, so left permanent a session that installs nvcc/ninja
-afterwards could never get FlashInfer back, and the damage would be invisible to
-find_spec itself. Everything below is about the block being exactly reversible, and
-about which statements sit inside the package-presence guard.
-
-No vLLM and no FlashInfer are needed: the package is faked in sys.modules and the
-branch structure is read out of load_vllm as AST.
-"""
+"""Blocking flashinfer import must be reversible (process-wide); clearing VLLM_ATTENTION_BACKEND or
+VLLM_USE_FLASHINFER_SAMPLER does not steer vLLM on cu128 without nvcc or ninja (sm_100 default picks FlashInfer;
+trtllm-gen JIT dies); sys.modules None makes find_spec report absent so FLASH_ATTN wins."""
 
 from __future__ import annotations
 
@@ -93,8 +80,7 @@ def test_unblock_leaves_a_package_that_was_never_imported_absent(monkeypatch):
 
 
 def test_unblock_restores_a_pre_existing_none_entry(monkeypatch):
-    """Someone else's import block is a real sys.modules state, not the same thing as
-    the package being absent, so the unblock has to put it back rather than delete it."""
+    """A pre-existing None entry in sys.modules is someone else's block, not an absent package, so unblock must restore it rather than delete it."""
     monkeypatch.setitem(sys.modules, "flashinfer", None)
     monkeypatch.setattr(vllm_utils, "_UNSLOTH_BLOCKED_FLASHINFER_MODULES", {})
 
@@ -121,8 +107,7 @@ def test_repeated_blocks_keep_the_original_modules(fake_flashinfer):
 
 
 def test_a_blocked_flashinfer_is_invisible_to_the_probe_vllm_uses(fake_flashinfer):
-    """vLLM's `has_flashinfer()` is a `find_spec` call, so blocking the import is what
-    actually stops it selecting the backend."""
+    """vLLM's `has_flashinfer()` is a find_spec call, so blocking the import is what actually stops it selecting the FlashInfer backend."""
     assert importlib.util.find_spec("flashinfer") is not None
     vllm_utils._block_flashinfer_import()
     assert importlib.util.find_spec("flashinfer") is None
@@ -130,8 +115,7 @@ def test_a_blocked_flashinfer_is_invisible_to_the_probe_vllm_uses(fake_flashinfe
 
 
 def _flashinfer_chain():
-    """load_vllm's FlashInfer branch chain as AST: which statements sit inside the
-    find_spec guard is the whole question, so structure rather than substrings."""
+    """load_vllm's FlashInfer branch chain is checked as AST, since which statements sit inside the find_spec guard matters more than substrings."""
     import ast
     import inspect
     import textwrap
@@ -183,12 +167,8 @@ def test_the_unblock_is_conditional_on_the_opt_out_being_clear():
     import textwrap
 
     def _tests_the_opt_out_is_clear(test):
-        """`not _no_flashinfer`, on its own or as one conjunct of an `and` chain.
-
-        The re-probe unblock is additionally gated on there being no live owner of the
-        block (see test_the_reprobe_unblock_also_respects_owners), so insisting on a bare
-        `not _no_flashinfer` here would just forbid that second, narrowing condition.
-        """
+        """Recognises `not _no_flashinfer` as the opt-out test, alone or as an `and` conjunct; the re-probe unblock adds
+        a narrowing owner check (test_the_reprobe_unblock_also_respects_owners)."""
         if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
             return any(_tests_the_opt_out_is_clear(v) for v in test.values)
         return (
@@ -230,9 +210,9 @@ def test_a_preset_opt_out_still_blocks_flashinfer():
 
 
 def test_only_the_import_blocker_is_guarded_on_flashinfer_being_installed():
-    """A forced selection has to be cleared whether or not FlashInfer is installed: vLLM's
-    TopKTopPSampler does an unguarded `from flashinfer import ...`, so an inherited
-    VLLM_USE_FLASHINFER_SAMPLER=1 with the package absent raises instead of falling back."""
+    """Only the import blocker is guarded on FlashInfer being installed: forced env vars must still clear, since an
+    inherited VLLM_USE_FLASHINFER_SAMPLER=1 makes TopKTopPSampler's unguarded import raise when the package is
+    absent."""
     import ast
 
     node = _flashinfer_chain()
@@ -272,8 +252,7 @@ def test_the_default_path_clears_a_forced_selection_too():
 
 
 def test_rocm_is_reached_before_any_blocking():
-    """AMD takes its own path and FlashInfer never applies there, so the HIP branch must
-    stay first in the chain and must not fall into the blocker."""
+    """AMD/HIP takes its own path where FlashInfer never applies, so the HIP branch must stay first in the chain and must not fall into the blocker."""
     import ast
 
     node = _flashinfer_chain()
@@ -285,8 +264,7 @@ def test_rocm_is_reached_before_any_blocking():
 
 
 def test_a_working_toolchain_is_not_blocked():
-    """The probe branch only blocks when nvcc / ninja / libcuda.so are missing. Blocking
-    in the `else` would disable FlashInfer on every healthy host."""
+    """The probe branch blocks only when nvcc, ninja or libcuda.so is missing; blocking in the else would disable FlashInfer on every healthy host."""
     import ast
 
     node = _flashinfer_chain()
@@ -308,8 +286,7 @@ def test_a_working_toolchain_is_not_blocked():
 
 
 def test_the_block_is_not_hoisted_above_the_model_support_check():
-    """`vllm_supports_flashinfer` only rules out this MODEL, and the sampler still wants
-    the package, so that branch must clear env vars and never hide the import."""
+    """`vllm_supports_flashinfer` only rules out this model while the sampler still needs the package, so that branch clears env vars and never hides the import."""
     import ast
 
     node = _flashinfer_chain()
@@ -325,20 +302,15 @@ def test_the_block_is_not_hoisted_above_the_model_support_check():
 
 
 def test_patch_vllm_graph_capture_returns_early_without_vllm(monkeypatch):
-    """It reads `vllm.__version__`, but `vllm` is only bound inside the module-level
-    find_spec guard, so without the guard below this is a bare NameError.
-
-    Both halves of that state have to be faked, otherwise this passes for the wrong
-    reason on a host that does have vLLM: dropping the module global is what makes the
-    version read fail, and blocking the import is what the guard has to catch."""
+    """patch_vllm_graph_capture reads vllm.__version__ and vllm is bound only inside the find_spec guard; both the
+    module global and the import block must be faked or the test passes for the wrong reason."""
     monkeypatch.delattr(vllm_utils, "vllm", raising = False)
     monkeypatch.setitem(sys.modules, "vllm", None)
     assert vllm_utils.patch_vllm_graph_capture() is None
 
 
 def test_load_vllm_raises_an_actionable_import_error_without_vllm(monkeypatch):
-    """Without vLLM, `vllm_version` is an unbound module global and load_vllm used to
-    die with NameError. It now raises ImportError, which is a user visible change."""
+    """Without vLLM, `vllm_version` is an unbound module global, so load_vllm raises an actionable ImportError rather than NameError (user-visible)."""
     monkeypatch.delattr(vllm_utils, "vllm_version", raising = False)
     with pytest.raises(ImportError, match = "vLLM is required"):
         vllm_utils.load_vllm(config = object())

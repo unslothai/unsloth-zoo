@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MLX QAT: the trained forward is exactly what merged_4bit ships; refusals mutate nothing.
-
-Runs on real mlx (CPU or Metal), no downloads: a tiny mlx-lm llama is built in-process.
-"""
+"""MLX QAT: the trained forward is exactly what merged_4bit ships; refusals mutate nothing; runs on real mlx (CPU or Metal) with no downloads."""
 
 import importlib
 import sys

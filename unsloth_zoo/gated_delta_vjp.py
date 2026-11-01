@@ -14,17 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-Memory-efficient custom VJP for GatedDeltaNet (Qwen3.5).
-
-Replaces the T-step Python loop in gated_delta_ops with an mx.custom_function
-that recomputes states during backward instead of keeping all T intermediate
-states in the autograd graph.
-
-Usage:
-    from gated_delta_vjp import patch_gated_delta
-    patch_gated_delta()  # monkey-patches mlx_lm's gated_delta module
-"""
+"""Memory-efficient custom VJP for GatedDeltaNet (Qwen3.5): backward recomputes states instead of keeping all T graph
+states; patch_gated_delta() monkey-patches mlx_lm's gated_delta module."""
 
 from functools import lru_cache
 from typing import NamedTuple, Optional, Tuple
@@ -64,11 +55,7 @@ def gated_delta_ops_efficient(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
-    """Memory-efficient GDN forward+backward via custom VJP.
-
-    Wraps the recurrence in mx.custom_function so backward recomputes states
-    on the fly during BPTT instead of keeping T graph nodes alive.
-    """
+    """Memory-efficient GDN forward+backward via custom VJP: backward recomputes states during BPTT instead of keeping T graph nodes alive."""
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
     if state is None:
@@ -78,8 +65,7 @@ def gated_delta_ops_efficient(
         q = mx.repeat(q, repeat_factor, -2)
         k = mx.repeat(k, repeat_factor, -2)
 
-    # Chunk for checkpointed BPTT: each chunk's forward is recomputed during
-    # backward. Memory: O(num_chunks * state_size) instead of O(T * state_size).
+    # Checkpointed BPTT: each chunk's forward is recomputed in backward; memory is O(num_chunks * state_size) instead of O(T * state_size).
     CHUNK_SIZE = max(1, min(64, T))
     num_chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
 
@@ -106,10 +92,8 @@ def gated_delta_ops_efficient(
         chunk_T = q_c.shape[1]
         _has_mask = mask_chunk is not None and mask_chunk.shape[-1] >= chunk_T
 
-        # Recompute the chunk's RETURNED states (post-mask: where(mask,
-        # state_new, state_prev), so masked steps give states[t+1]==states[t]).
-        # Used only as each step's entry `state_prev`; the y-path backward needs
-        # state_new, recomputed below.
+        # Returned post-mask states, where(mask, state_new, state_prev), so masked steps give states[t+1]==states[t];
+        # used only as each step's state_prev, and the y-path recomputes state_new below.
         states = [state_in]
         s = state_in
         for t in range(chunk_T):
@@ -120,15 +104,9 @@ def gated_delta_ops_efficient(
             )
             states.append(s)
 
-        # BPTT: `d_state` is the cotangent w.r.t. the RETURNED state at the
-        # current step (= input to step t+1). Starts at d_state_out, then
-        # propagates through the recurrence + mask.
-        # Per-step grads are collected in lists and stacked afterwards: each
-        # t is produced exactly once, and mx `.at[:, t].add` scatter-add
-        # reads the update tensor with a wrong batch stride (wrong grads for
-        # every batch row past the first; verified against plain autodiff on
-        # mlx 0.31).
-        # Fixed upstream in ml-explore/mlx#3483, not yet in any release.
+        # BPTT: d_state is the cotangent of the returned state, starting at d_state_out; per-step grads are collected in
+        # lists because mx .at[:, t].add scatter-add gives wrong grads for batch rows past the first on mlx 0.31 (fixed
+        # upstream in ml-explore/mlx 3483, not yet in a release).
         d_q_steps = []
         d_k_steps = []
         d_v_steps = []
@@ -148,8 +126,7 @@ def gated_delta_ops_efficient(
             # Cotangent flowing into step t's output (state_returned).
             d_state_returned = d_state
 
-            # Recompute state_new (pre-mask): y always depends on it, but
-            # states[t+1] equals state_prev when mask=False, so it can't be used.
+            # state_new is recomputed pre-mask since y always depends on it; states[t+1] equals state_prev when mask=False, so it cannot be reused.
             if g_t.ndim == 2:
                 decay = g_t[..., None, None]
             else:
@@ -159,9 +136,8 @@ def gated_delta_ops_efficient(
             delta = (v_t - kv_mem) * beta_t[..., None]
             state_new = state_decayed + k_t[..., None, :] * delta[..., None]
 
-            # Forward: state_returned = where(mask, state_new, state_prev).
-            # Split d_state_returned: to d_state_new when mask=True, passthrough
-            # to d_state_prev when mask=False.
+            # state_returned = where(mask, state_new, state_prev); d_state_returned goes to d_state_new when mask=True
+            # and passes through to d_state_prev when mask=False.
             if _has_mask:
                 m = mask_chunk[:, t]
                 m_exp = mx.expand_dims(m, axis=(1, 2, 3))
@@ -215,7 +191,6 @@ def gated_delta_ops_efficient(
             d_g_steps.append(d_g_t.astype(g_c.dtype))
             d_beta_steps.append(d_beta_t.astype(beta_c.dtype))
 
-            # d_state_prev = recurrence-derived gradient + mask passthrough.
             d_state = d_state_prev_via_recurrence + d_state_prev_passthrough
 
         for steps in (d_q_steps, d_k_steps, d_v_steps, d_g_steps, d_beta_steps):
@@ -239,9 +214,7 @@ def gated_delta_ops_efficient(
         v_c = v[:, t_start:t_end]
         g_c = g[:, t_start:t_end]
         beta_c = beta[:, t_start:t_end]
-        # why: pass per-chunk mask as a primal so chunk-local t maps to the
-        # right timesteps. Closure-captured `mask[:, t]` read mask[:,0:CHUNK]
-        # for every chunk.
+        # Per-chunk mask is passed as a primal so chunk-local t maps to the right timesteps; a closure-captured mask[:,t] read mask[:,0:CHUNK] for every chunk.
         if mask is None:
             mask_c = mx.ones((q_c.shape[0], q_c.shape[1]), dtype=mx.bool_)
         else:
@@ -257,36 +230,27 @@ _WARNED_FOREIGN_GATED_DELTA: set[str] = set()
 
 
 def _is_training_call(state, use_kernel):
-    """An empty cache does not mark a training call -- prefill has one too. Call
-    sites say so with `use_kernel=not self.training`; GLM-5.x's passes neither, so
-    an open training window speaks for it."""
+    """An empty cache does not mark a training call (prefill has one too); callers pass use_kernel=not self.training,
+    but GLM-5.x passes neither, so an open training window decides."""
     if state is not None:
         return False
     if not use_kernel:
         return True
-    # Absolute (test_relative_imports_resolve.py enforces it): custom_object_save
-    # copies this file beside a checkpoint, where `mlx.utils.py` does not exist.
-    # Lazy: this runs once per layer per decode step, so a pure-inference process
-    # should not import `unsloth_zoo.mlx.utils` until a call site is ambiguous.
+    # Absolute import (enforced by test_relative_imports_resolve.py): custom_object_save copies this file beside a
+    # checkpoint, where mlx.utils.py does not exist; lazy since it runs once per layer per decode step, so pure
+    # inference skips unsloth_zoo.mlx.utils unless a call site is ambiguous.
     from unsloth_zoo.mlx.utils import mlx_training_patches_active
     return mlx_training_patches_active()
 
 
 def patch_gated_delta():
-    """Monkey-patch mlx_lm's gated_delta module to use our efficient VJP.
-
-    Consumers (mlx_lm qwen3_5 / qwen3_next / kimi_linear, mlx_vlm qwen3_5)
-    bind ``gated_delta_update`` via ``from .gated_delta import ...`` at import
-    time, so rebinding the source module alone never reaches their call sites.
-    After patching the source, sweep already-imported consumer modules and
-    rebind any stale reference to the original function.
-    """
+    """Monkey-patches mlx_lm's gated_delta source; consumers (mlx_lm qwen3_5 / qwen3_next / kimi_linear, mlx_vlm
+    qwen3_5) bind gated_delta_update at import, so a sweep rebinds stale references."""
     import sys
     try:
         from mlx_lm.models import gated_delta
     except ImportError:
-        # Reachable since layers are matched structurally: an mlx-vlm-defined
-        # gated-delta mixer routes here even where mlx_lm has no such module.
+        # Reachable even where mlx_lm has no gated_delta module: layers match structurally, so an mlx-vlm-defined gated-delta mixer routes here.
         return
 
     if not getattr(gated_delta, "_unsloth_gated_delta_patched", False):
@@ -348,8 +312,7 @@ def patch_gated_delta():
             # Owned by a sibling unsloth patch (patch_gated_delta_vlm); not foreign.
             continue
         if binding is original:
-            # Stale from-import of the function we replaced; rebind it. Anything
-            # else is a foreign implementation (e.g. mlx-vlm >= 0.6's own module).
+            # Stale from-import of the replaced function is rebound; any other binding is a foreign implementation, e.g. mlx-vlm >= 0.6's own module.
             module.gated_delta_update = patched
             rebound.append(name)
         else:
@@ -367,27 +330,15 @@ def patch_gated_delta():
         )
 
 
-# mlx-vlm keeps growing `gated_delta_update` keywords -- 0.6.9 added
-# `lower_bound`, 0.7.1 added `cache`, `cache_index` and `state_steps` -- and its
-# call sites pass the new ones unconditionally, even when they are None. The
-# patches below therefore accept whatever arrives and splat it straight back when
-# they delegate: a keyword the caller supplied is one the installed mlx-vlm
-# accepts, which keeps a single wrapper correct from 0.4.x through 0.7.x without
-# sniffing versions.
+# mlx-vlm 0.6.9 added lower_bound and 0.7.1 added cache, cache_index and state_steps, passed even as None; wrappers
+# accept whatever arrives and forward it, so one wrapper covers 0.4.x-0.7.x without version sniffing.
 _VLM_CACHE_KWARGS = frozenset(("cache", "cache_index", "state_steps"))
 _WARNED_UNKNOWN_GATED_DELTA_KWARGS: set = set()
 
 
 def _vlm_must_delegate(kwargs, honored, where):
-    """Whether these keywords put the call outside what the training branch covers.
-
-    `cache` and `state_steps` give recurrent state and history retention to the
-    cache, which the custom VJP does not own. An unrecognized keyword delegates
-    as well: the training branch recomputes the gate from its own inputs, so
-    silently dropping a future gating modifier would return wrong numbers rather
-    than fail. Delegating is only slower -- the training call sites pass
-    `use_kernel=not self.training`, which lands on the differentiable ops path.
-    """
+    """Delegates when cache or state_steps is set (recurrent state the VJP does not own) or on unknown keywords
+    (silently dropping a gating modifier gives wrong numbers); delegating only costs speed."""
     if kwargs.get("cache") is not None or kwargs.get("state_steps") is not None:
         return True
     unknown = sorted(set(kwargs) - _VLM_CACHE_KWARGS - set(honored))
@@ -419,16 +370,9 @@ def _rebind_vlm_gated_delta_consumers(original, patched):
 
 
 def patch_gated_delta_vlm():
-    """Patch mlx_vlm >= 0.6's own qwen3_5 gated_delta_update.
-
-    That module ships its own copy of the function (calling the
-    non-differentiable gated_delta_kernel directly), so it is a distinct
-    object that patch_gated_delta()'s identity sweep deliberately leaves
-    alone. Patch it with the same training dispatch (fused-kernel VJP,
-    ops fallback), then rebind every consumer holding a reference. Older
-    mlx_vlm (0.4.x - 0.5.x) from-imports mlx_lm's function instead;
-    the sweep in patch_gated_delta() already rebinds those.
-    """
+    """Patches mlx_vlm >= 0.6's own qwen3_5 gated_delta_update (a distinct copy over non-differentiable
+    gated_delta_kernel) that the identity sweep skips; older mlx_vlm 0.4.x-0.5.x imports mlx_lm's, which the sweep
+    rebinds."""
     import sys
     # Importing it here would drag the mlx-vlm model packages into a text-only run.
     if not any(name.startswith("mlx_vlm.models.qwen3_5") for name in sys.modules):
@@ -456,16 +400,14 @@ def patch_gated_delta_vlm():
             )
         return
     try:
-        # Also imported for its side effect: the rebind sweep below only reaches
-        # consumers that are already in sys.modules.
+        # Imported for its side effect: the rebind sweep below only reaches consumers that are already in sys.modules.
         from mlx_vlm.models.qwen3_5 import language as vlm_language
     except ImportError:
         vlm_language = None
     try:
         from mlx_lm.models import gated_delta
     except ImportError:
-        # `compute_g` below still comes from mlx_lm even on 0.6+, which ships its
-        # own copy of the update; without it there is nothing to patch with.
+        # compute_g still comes from mlx_lm even on mlx-vlm 0.6+, which ships its own copy of the update; without mlx_lm there is nothing to patch with.
         return
 
     if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
@@ -495,26 +437,20 @@ def patch_gated_delta_vlm():
     vlm_gated_delta.gated_delta_update = patched_vlm_gated_delta_update
     vlm_gated_delta._unsloth_gated_delta_original = original_update
     vlm_gated_delta._unsloth_gated_delta_patched = True
-    # `language` is not the only consumer: qwen3_5's speculative verifier
-    # from-imports the same function, and qwen4_exp reuses both.
+    # `language` is not the only consumer: qwen3_5's speculative verifier from-imports the same function, and qwen4_exp reuses both.
     _rebind_vlm_gated_delta_consumers(
         original_update, patched_vlm_gated_delta_update,
     )
-    # The sweep matches on identity, so it misses a consumer holding a DIFFERENT copy of the
-    # function than the one just replaced -- which is what importlib.reload on .gated_delta
-    # leaves behind, and what tests/test_qwen35_vjp_metal.py does before calling this. `language`
-    # is the consumer that always exists and the one training runs through, so bind it by name.
+    # The identity sweep misses a consumer holding a different copy, as importlib.reload on .gated_delta leaves
+    # (tests/test_qwen35_vjp_metal.py does this); `language` always exists and training uses it, so bind it by name.
     if vlm_language is not None:
         vlm_language.gated_delta_update = patched_vlm_gated_delta_update
     print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")
 
 
 def patch_gated_delta_vlm_shared():
-    """Patch mlx_vlm's shared gated-delta update, wherever it lives.
-
-    GLM-5.x linear attention binds this rather than the per-model copy
-    `patch_gated_delta_vlm` covers, and never passes `use_kernel=not self.training`,
-    so training would reach the fused Metal kernel, which has no VJP."""
+    """Patches mlx_vlm's shared gated-delta update, wherever it lives (text_models in 0.6.5, models in 0.6.6); GLM-5.x
+    binds it and never passes use_kernel=not self.training, so training would hit the fused Metal kernel (no VJP)."""
     import sys
     # 0.6.5 kept this under `text_models`; 0.6.6 moved it up to `models`.
     vlm_gated_delta = (sys.modules.get("mlx_vlm.models.gated_delta")
@@ -529,8 +465,7 @@ def patch_gated_delta_vlm_shared():
             state=None, mask=None, use_kernel=True, **kwargs):
         if (_vlm_must_delegate(kwargs, ("lower_bound",), "mlx-vlm shared")
                 or not _is_training_call(state, use_kernel)):
-            # Forwarding only what arrived keeps pre-0.6.9 mlx-vlm, which has no
-            # `lower_bound` here, callable through the same wrapper.
+            # Forwarding only the kwargs that arrived keeps pre-0.6.9 mlx-vlm, which has no lower_bound, callable through the same wrapper.
             return original_update(q, k, v, a, b, A_log, dt_bias,
                                    state=state, mask=mask, use_kernel=use_kernel,
                                    **kwargs)
@@ -575,9 +510,8 @@ _KERNEL_CHUNK_MAX = 512
 _KERNEL_CHECKPOINT_BUDGET = 128 << 20
 
 
-# Blocked-sequential thread layout, shared by the three kernels below. mlx-lm
-# gives each state row its own simdgroup; here P = Dk/W threads cover a row
-# inside one, DB rows share a threadgroup, which stages a TB-step block once.
+# Blocked-sequential layout shared by three kernels: P = Dk/W threads cover one state row and DB rows share a
+# threadgroup that stages a TB-step block once; mlx-lm uses one simdgroup per row.
 
 _BLOCKED_TG_MEMORY = 32768   # Metal threadgroup-memory limit
 _BLOCKED_TG_THREADS = 256
@@ -592,9 +526,8 @@ class _BlockedCfg(NamedTuple):
     tb_choices: tuple
 
 
-# Wide segments give the forward more rows per threadgroup and fewer redundant
-# k/q reads; the backward carries three state fragments per thread and replays
-# blocks, so it prefers narrow. First fit wins; forcing agreement costs 1.9x.
+# Wide segments favour the forward (more rows per threadgroup, fewer redundant k/q reads); the backward keeps three
+# state fragments per thread and replays blocks, so it prefers narrow; first fit wins since forcing agreement is slower.
 _BLOCKED_FORWARD_CFGS = (_BlockedCfg(2, 1, 0, 0, 32, (16, 8, 4)),)
 _BLOCKED_BACKWARD_CFGS = (_BlockedCfg(2, 2, 1, 2, 16, (8, 4)),
                           _BlockedCfg(2, 2, 1, 2, 32, (8, 4)))
@@ -1122,9 +1055,8 @@ def _get_blocked_kernels(vectorized=False):
 
 
 def _blocked_layouts(q, g, v):
-    """(forward, backward) layouts, or None if either does not fit -- the backward
-    replays the forward, so a shape needs both. The checkpoint kernel shares the
-    backward's: TB is what its checkpoint boundaries count in."""
+    """Returns (forward, backward) layouts, or None if either does not fit (backward replays forward, so a shape needs
+    both); checkpoint kernel shares the backward's layout; its checkpoint boundaries count in TB."""
     Dk, Dv, vec = q.shape[-1], v.shape[-1], g.ndim == 4
     out = tuple(
         next((lay for cfg in cfgs
@@ -1140,8 +1072,8 @@ def _blocked_shares_q_dtype(q, *others):
 
 
 def gated_delta_blocked_forward(q, k, v, g, beta, state):
-    """Forward half, or None when it does not apply. gated_delta_kernel's unmasked
-    contract: (y [B, T, Hv, Dv] in q.dtype, state_out shaped and typed like state)."""
+    """Forward half, or None when it does not apply; matches gated_delta_kernel's unmasked contract: y [B, T, Hv, Dv] in
+    q.dtype, state_out shaped and typed like state."""
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     layouts = _blocked_layouts(q, g, v)
@@ -1223,8 +1155,7 @@ def gated_delta_kernel_supported(q, g, mask, v=None, k=None) -> bool:
 
 
 def _kernel_chunk_size(B, Hv, Dk, Dv, TB):
-    """Longest chunk whose checkpoints fit the budget, clamped to the length bounds
-    and so overridden by either; n blocks hold n - 1 states."""
+    """Longest chunk whose checkpoints fit the budget, clamped to the length bounds and so overridden by either; n blocks hold n - 1 states."""
     states = _KERNEL_CHECKPOINT_BUDGET // max(1, B * Hv * Dv * Dk * 4)
     return min(_KERNEL_CHUNK_MAX, max(_KERNEL_CHUNK_MIN, (states + 1) * TB))
 

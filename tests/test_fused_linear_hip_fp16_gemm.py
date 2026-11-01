@@ -75,8 +75,7 @@ def test_rows_under_the_bound_are_the_plain_half_gemm():
 
 
 def test_scale_below_fp16_subnormal_keeps_the_row(capturing):
-    # A row bound past ~2^39 needs a scale under fp16's smallest subnormal (2^-24); one fp16 factor would round it to 0
-    # and drop the row. 65504 * 4096 * 4096 = 1.0990e12, finite in the fp32 result.
+    # Row bounds past ~2^39 need scaling: one fp16 factor below 2^-24 rounds to 0 and drops the row.
     a = torch.full((1, 4096), 65504.0, dtype = torch.float16)
     b = torch.full((4096, 1), 4096.0, dtype = torch.float16)
     out = fl._half_mm_bounded(a, b)
@@ -99,9 +98,9 @@ def test_logits_past_half_range_stay_finite(capturing):
 
 
 def test_eager_keeps_small_entries_of_a_scaled_row(capturing):
-    # The bound is worst case: a +-16384 row with a 1e-4 entry trips it although the true result is small. Scaling
-    # the row down would flush that entry below fp16's subnormal range (result 0 instead of 6.55), so eager mode takes
-    # the exact fp32 GEMM. Capture cannot sync, keeps the scaled path, and stays finite.
+    # The bound is worst case: a +-16384 row with a 1e-4 entry trips it though the result is small; scaling the row
+    # would flush that entry below fp16 subnormal range (result 0 instead of 6.55), so eager mode takes the exact fp32
+    # GEMM; capture cannot sync, keeps the scaled path, stays finite.
     a = torch.tensor([[-16384.0, 16384.0, 1e-4, 0, 0, 0, 0, 0]], dtype = torch.float16)
     b = torch.zeros(8, 1, dtype = torch.float16)
     b[2] = 65504.0
@@ -110,3 +109,26 @@ def test_eager_keeps_small_entries_of_a_scaled_row(capturing):
     assert torch.isfinite(out).all()
     if not capturing:
         torch.testing.assert_close(out.double(), ref, rtol = 1e-6, atol = 0)
+
+
+def test_capturing_queries_the_operand_device(monkeypatch):
+    # Capture on cuda:1 while cuda:0 is current must be detected (simulated devices, runs on CPU).
+    import contextlib
+    from types import SimpleNamespace
+    state = {"device": 0}
+
+    @contextlib.contextmanager
+    def device(index):
+        previous, state["device"] = state["device"], index
+        try:
+            yield
+        finally:
+            state["device"] = previous
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: state["device"])
+    monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: state["device"] == 1)
+    assert fl._capturing(SimpleNamespace(is_cuda = True, device = torch.device("cuda", 1)))
+    assert not fl._capturing(SimpleNamespace(is_cuda = True, device = torch.device("cuda", 0)))
+    assert not fl._capturing(torch.ones(1))
+    assert state["device"] == 0

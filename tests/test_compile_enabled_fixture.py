@@ -1,8 +1,5 @@
-"""conftest's compile_enabled turns the kill switch off for one test and puts every frozen flag back.
-
-Run in a fresh interpreter so the zoo modules are first imported inside the fixture, the order in
-which a module could freeze its flags compile-on and keep them after teardown.
-"""
+"""Checks conftest's compile_enabled turns the kill switch off for one test and restores every frozen flag; a fresh
+interpreter makes zoo modules import inside the fixture"""
 
 import os
 import subprocess

@@ -32,9 +32,8 @@ from .moe_utils import (
 
 
 def _make_ernie4_5_moe_lora_extractor():
-    """LoRA extractor for the fused ERNIE 4.5 MoE experts (Ernie4_5_MoeExperts /
-    Ernie4_5_VLMoeMoeExperts). Same 3D layout as Qwen3MoeExperts (gate_up_proj
-    (E, 2*I, H), down_proj (E, H, I)); io-dims read off hidden_dim / intermediate_dim."""
+    """LoRA extractor for fused ERNIE 4.5 MoE experts; same 3D layout as Qwen3MoeExperts: gate_up_proj (E, 2*I, H),
+    down_proj (E, H, I), io-dims read from hidden_dim / intermediate_dim."""
     def _get_ernie4_5_moe_lora_dims(wrapper):
         if wrapper is None or not hasattr(wrapper, "get_base_layer"):
             return None, None
@@ -68,8 +67,7 @@ def _make_ernie4_5_moe_lora_extractor():
     return _ernie4_5_moe_lora_extractor
 
 
-# (modeling module, fused experts class name) for every ERNIE 4.5 MoE variant.
-# Ernie4_5_VLMoe's experts class is named Ernie4_5_VLMoeMoeExperts (double Moe).
+# (modeling module, fused experts class name) pairs for each ERNIE 4.5 MoE variant; the VL experts class is named Ernie4_5_VLMoeMoeExperts (double Moe).
 _ERNIE4_5_MOE_EXPERTS = (
     ("transformers.models.ernie4_5_moe.modeling_ernie4_5_moe", "Ernie4_5_MoeExperts"),
     ("transformers.models.ernie4_5_vl_moe.modeling_ernie4_5_vl_moe", "Ernie4_5_VLMoeMoeExperts"),

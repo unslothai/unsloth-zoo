@@ -1,16 +1,6 @@
-"""Banded (block-local) sliding-window SDPA must match full SDPA + band mask.
-
-`_banded_sdpa_core` computes sliding-window attention in O(S*w) by folding
-w-sized query blocks into the batch dimension, each attending its own and the
-previous key block under a static (w, 2w) mask. These tests compare it against
-full SDPA with the explicit band mask (query i attends keys (i-w, i]) on CPU,
-including GQA and sequence lengths that do not divide the window.
-
-They also cover the unified sliding-window router in gemma4_flash_sliding.py:
-with flash-attn forced unavailable the router must fall back to this banded
-kernel and still match full SDPA + band mask, and UNSLOTH_BANDED_SDPA=1 must
-force the banded kernel even when flash-attn looks present.
-"""
+"""Checks _banded_sdpa_core (block-local O(S*w) sliding-window SDPA) matches full SDPA with the band mask on CPU, incl.
+GQA; the gemma4_flash_sliding router falls back to it without flash-attn, and UNSLOTH_BANDED_SDPA=1 forces it even if
+flash-attn is present."""
 
 import pytest
 import torch
@@ -130,8 +120,7 @@ def test_mask_is_plain_band_detection():
 
 
 def test_mask_is_plain_band_rejects_non_probe_violation():
-    # A band broken at an interior row (a packed-sequence boundary) must be rejected:
-    # the verifier checks every row, not a sampled subset.
+    # A band broken at an interior row (a packed-sequence boundary) must be rejected; the verifier checks every row, not a sampled subset.
     S, w = 128, 32
     packed = _band_mask_full(S, w)[None, None].clone()
     packed[..., 50, 40] = False    # drop an in-band key at a non-probe row
@@ -236,12 +225,7 @@ def test_mask_is_plain_band_inference_tensor_cached_per_window(monkeypatch):
 
 
 class Gemma4SlidingFake:
-    """Minimal stand-in for a Gemma-4 sliding-window attention module.
-
-    The router gates on ``is_sliding``, a class name starting with ``Gemma4`` and
-    ``head_dim <= 256``; this reproduces exactly those attributes so the routing
-    branch can be exercised without loading a real model.
-    """
+    """Stand-in with the attributes the router gates on (is_sliding, class name starting with Gemma4, head_dim <= 256); no real model needed."""
     is_sliding = True
     is_causal = True
     training = False
@@ -253,8 +237,7 @@ class Gemma4SlidingFake:
 
 @pytest.mark.parametrize("with_mask", [False, True])
 def test_router_falls_back_to_banded_without_flash(monkeypatch, with_mask):
-    # Without flash-attn a sliding Gemma-4 plain band must route through
-    # _banded_sdpa_core, never the wrapped SDPA. Runs on CPU regardless of flash-attn.
+    # Without flash-attn, a sliding Gemma-4 plain band must route through _banded_sdpa_core, never the wrapped SDPA; runs on CPU regardless of flash-attn.
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
 
     monkeypatch.setattr(gf, "_HAS_FA2", False)

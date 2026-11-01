@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The MXFP4 kernel self-checks (``torch.equal`` / ``torch.allclose``) are data dependent: the first call of a
-process can come from inside a fullgraph trace (a cold compiled backward decodes the weight), which must not fail
-and must not cache a verdict. Each case runs in a fresh process so nothing is warm."""
+"""MXFP4 kernel self-checks (torch.equal / torch.allclose) may first run inside a fullgraph trace, so they must not fail
+or cache a verdict; each case uses a fresh process."""
 
 import os
 import subprocess

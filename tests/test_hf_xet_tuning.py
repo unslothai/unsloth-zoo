@@ -44,8 +44,8 @@ def _profile(ram_gb: float, cpus: int = 8, free_disk_gb: float = 0) -> tuning.Sy
 @pytest.mark.parametrize(
     "ram_gb, cpus, limit, size, perfile, files, streams",
     [
-        # An eighth of RAM is the budget, a thirty-second a per-file buffer. The shared buffer
-        # reaches for xet-core's 2 GB default: a quarter of it measured 0.73x on an 8 GB laptop.
+        # Budget is an eighth of RAM and per-file buffer a thirty-second; the shared buffer reaches for the 2 GB
+        # default, and a quarter of it measured 0.73x on 8 GB.
         (8, 4, 1 * GB, 500 * MB, 128 * MB, 3, 8),
         # No cliffs: 12 GB sits between the old table's 8 and 16 GB rows and gets a budget to match.
         (12, 4, 1500 * MB, 750 * MB, 128 * MB, 4, 8),
@@ -57,8 +57,7 @@ def _profile(ram_gb: float, cpus: int = 8, free_disk_gb: float = 0) -> tuning.Sy
         (2048, 192, 64 * GB, 16 * GB, 2000 * MB, 24, 124),
         # Cores bound concurrency independently of RAM: 8 cores on a 2 TB box still gets 8 files.
         (2048, 8, 64 * GB, 16 * GB, 2000 * MB, 8, 16),
-        # ...and so does the budget. A 64-core container with 8 GB (CI, or a cgroup-limited pod)
-        # cannot use 64 file buffers out of a 1 GB budget: worse than no tuning on a thin link.
+        # The budget bounds concurrency too: a 64-core container with 8 GB cannot use 64 file buffers from a 1 GB budget, worse than no tuning on a thin link.
         (8, 64, 1 * GB, 500 * MB, 128 * MB, 3, 14),
     ],
 )
@@ -72,11 +71,9 @@ def test_knobs_scale_with_the_machine(ram_gb, cpus, limit, size, perfile, files,
 
 
 def test_a_big_host_lands_on_xet_cores_own_high_performance_numbers():
-    """The point of scaling rather than gating: on the box where HF_XET_HIGH_PERFORMANCE was worth
-    2.55x (16684 vs 6553 Mbit/s), the scaled knobs reach the same buffer sizing that preset uses,
-    without the flag and without discarding the bound on smaller machines. Concurrent FILES is the
-    one number we do not follow: the preset's 100 x 2 GB is 200 GB of per-file buffer against its
-    own 64 GB limit, so most of it can never be allocated."""
+    """Scales buffer sizing to the with_high_performance() numbers by machine size without setting
+    HF_XET_HIGH_PERFORMANCE, keeping the bound on small hosts; concurrent files are not followed, since the preset
+    100 x 2 GB per-file buffer is 200 GB against its 64 GB limit."""
     env = tuning.xet_env_overrides(_profile(2048, cpus = 192))
     preset = {  # xet_runtime/src/config/xet_config.rs, with_high_performance()
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT": str(64 * GB),
@@ -89,8 +86,8 @@ def test_a_big_host_lands_on_xet_cores_own_high_performance_numbers():
 
 
 def test_the_budget_never_promises_more_than_the_disk_can_take():
-    """A 2 TB host with a nearly full disk is not a 2 TB budget: buffering 64 GB of a download that
-    will fail on ENOSPC helps nobody, and the free-space figure is the only signal we have."""
+    """The budget is also capped by free disk space, not just host RAM: buffering 64 GB of a download that fails on
+    ENOSPC helps nobody, and free space is the only signal we have."""
     roomy = tuning.xet_env_overrides(_profile(2048, cpus = 192, free_disk_gb = 8000))
     tight = tuning.xet_env_overrides(_profile(2048, cpus = 192, free_disk_gb = 40))
     assert int(roomy["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
@@ -110,9 +107,7 @@ def test_free_disk_is_measured_for_the_cache_not_the_cwd(monkeypatch, tmp_path):
 
 
 def test_cache_root_follows_hubs_full_precedence(monkeypatch, tmp_path):
-    """A cache moved with XDG_CACHE_HOME or the legacy HUGGINGFACE_HUB_CACHE lives on a different
-    filesystem from ``~``, so measuring the home directory's free space sizes the buffer from a
-    disk the download never writes to."""
+    """A cache moved by XDG_CACHE_HOME or the legacy HUGGINGFACE_HUB_CACHE can sit on another filesystem than ~, so free space must be measured on the cache root."""
     for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME"):
         monkeypatch.delenv(var, raising = False)
 
@@ -132,8 +127,7 @@ def test_cache_root_follows_hubs_full_precedence(monkeypatch, tmp_path):
 
 
 def test_worst_case_buffer_stays_under_the_limit():
-    """size + files*perfile is what hf_xet can hold, so it must not exceed the budget. The stock
-    defaults (2GB + 8*512MB, capped at 8GB) are exactly how an 8GB spike happens."""
+    """size + files*perfile is what hf_xet can hold and must stay under the budget; the stock defaults (2GB + 8*512MB, capped at 8GB) are how an 8GB spike happens."""
     for ram_gb, cpus in ((4, 2), (8, 8), (8, 96), (16, 8), (32, 64), (64, 16), (512, 192), (2048, 192)):
         env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
         worst = (
@@ -143,8 +137,7 @@ def test_worst_case_buffer_stays_under_the_limit():
         )
         limit = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])
         assert worst <= limit, f"{ram_gb}GB: worst case {worst} exceeds limit {limit}"
-        # The bound that matters is proportional, not absolute: never more than a third of the
-        # machine's RAM, so the buffer cannot be the reason a box OOMs.
+        # The bound is proportional, not absolute: the worst case stays under a third of RAM, so the buffer cannot be what OOMs a box.
         assert worst <= ram_gb * GB / 3, f"{ram_gb}GB: worst case {worst} is too much of it"
 
 
@@ -203,9 +196,8 @@ def test_apply_never_overwrites_a_user_setting():
 
 
 def test_a_user_set_high_performance_flag_is_left_alone():
-    """We used to clear it, which is how a machine that had opted in lost 2.55x of its download
-    throughput the moment it imported unsloth_zoo (16684 -> 6553 Mbit/s, measured on a 192-core
-    1996 GiB box). Enabling it is a deliberate act; setdefault applies to it like everything else."""
+    """A user-set HF_XET_HIGH_PERFORMANCE (or HF_XET_HP) is left alone, since enabling it is deliberate; clearing it on
+    import once cost a large throughput loss, and setdefault applies."""
     for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP"):
         env = {var: "1"}
         written = tuning.apply_xet_env(env, profile = _profile(16))
@@ -214,9 +206,8 @@ def test_a_user_set_high_performance_flag_is_left_alone():
 
 
 def test_high_performance_also_stands_our_sizing_down():
-    """Leaving the caps on alongside it is the worst of both: xet-core reads the flag last and
-    voids the LIMIT, but still honours the smaller per-file and concurrency numbers, so the
-    transfer ends up smaller than either choice made cleanly."""
+    """With HF_XET_HIGH_PERFORMANCE set, our caps must also be dropped: xet-core voids the LIMIT but still honours the
+    smaller per-file and concurrency caps, so the result is worse than either."""
     env = {"HF_XET_HIGH_PERFORMANCE": "1"}
     tuning.apply_xet_env(env, profile = _profile(16))
     for key in tuning._CAPS_VOIDED_BY_HIGH_PERFORMANCE:
@@ -225,8 +216,7 @@ def test_high_performance_also_stands_our_sizing_down():
 
 
 def test_force_caps_still_overrides_high_performance(monkeypatch):
-    """The escape hatch for someone who really does want a machine bounded: the flag has to be
-    turned off for the caps to mean anything, so this is the one case that overwrites it."""
+    """UNSLOTH_XET_FORCE_CAPS is the escape hatch: bounding a machine requires the flag off, so it is the one case that overwrites HF_XET_HIGH_PERFORMANCE to 0."""
     monkeypatch.setenv("UNSLOTH_XET_FORCE_CAPS", "1")
     env = {"HF_XET_HIGH_PERFORMANCE": "1"}
     written = tuning.apply_xet_env(env, profile = _profile(16))
@@ -236,9 +226,8 @@ def test_force_caps_still_overrides_high_performance(monkeypatch):
 
 
 def test_a_large_machine_is_not_held_to_a_laptops_buffer():
-    """The table used to flat-line at 24 GB, so a 2 TB server got a 24 GB laptop's 4 GB buffer.
-    Measured, that ran 30% BELOW xet-core's own defaults, because the buffer gates how much can be
-    in flight. The budget must grow with the machine, monotonically and without a cliff."""
+    """The budget must grow monotonically with RAM, without a cliff: a 24 GB flat-line gave a 2 TB server a laptop's 4
+    GB buffer, below xet-core's own defaults, which gate in-flight data."""
     seen = []
     for ram_gb in (8, 16, 32, 128, 512, 2048):
         env = tuning.xet_env_overrides(_profile(ram_gb, cpus = 64))
@@ -250,8 +239,7 @@ def test_a_large_machine_is_not_held_to_a_laptops_buffer():
 
 
 def test_cgroup_limit_beats_the_host_total(monkeypatch, tmp_path):
-    """Inside a container psutil reports the HOST's RAM, which is how a 16GB runner gets an 8GB
-    buffer, so the cgroup ceiling has to win."""
+    """Inside a container psutil reports the HOST's RAM, so the cgroup memory limit must win over it."""
     monkeypatch.setattr(tuning, "_psutil_memory", lambda: (512 * GB, 500 * GB))
     monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: 8 * GB)
     monkeypatch.setattr(tuning, "cgroup_cpu_limit", lambda: 2.0)
@@ -305,12 +293,8 @@ def test_system_profile_is_sane_on_this_machine():
 
 
 def test_a_nested_cgroup_v1_limit_is_found(monkeypatch, tmp_path):
-    """Reading only the v1 controller ROOT is right inside a container (runc bind-mounts the
-    container's own cgroup dir onto /sys/fs/cgroup/<controller>) and wrong elsewhere: a Slurm step at
-    /sys/fs/cgroup/memory/slurm/uid_N/job_N/step_N reads the "unlimited" sentinel at the root, so a
-    32 GB step on a 1 TB node sized its buffer from 1 TB and was OOM killed. Mounts are often
-    combined ("cpu,cpuacct"), so the controller list has to be split rather than matched whole.
-    """
+    """The v1 controller root is only right inside a runc container; under Slurm it shows the unlimited sentinel, so
+    read the nested cgroup and split combined lists like cpu,cpuacct rather than matching them whole."""
     rel = "slurm/uid_2001/job_304876/step_0"
     monkeypatch.setattr(tuning, "_proc_self_cgroup", lambda: [
         "10:memory:/" + rel,
@@ -338,8 +322,7 @@ def test_a_nested_cgroup_v1_limit_is_found(monkeypatch, tmp_path):
 
 
 def test_a_hybrid_cgroup_v2_line_below_the_first_is_still_found(monkeypatch, tmp_path):
-    """Under systemd hybrid mode v1 controller lines share the file, so scanning for "0::" rather
-    than reading line 1 is what makes the v2 read version independent."""
+    """Under systemd hybrid mode v1 controller lines share the same cgroup file, so the 0:: v2 line must be found by scanning rather than reading line 1."""
     monkeypatch.setattr(tuning, "_proc_self_cgroup", lambda: [
         "4:cpu,cpuacct:/user.slice",
         "0::/user.slice/user-1000.slice/session-3.scope",
@@ -353,8 +336,8 @@ def test_a_hybrid_cgroup_v2_line_below_the_first_is_still_found(monkeypatch, tmp
 
 
 def test_fractional_cgroup_cpu_quota_binds(monkeypatch):
-    """Kubernetes "cpu: 500m" arrives as cpu.max "50000 100000" -> 0.5. Requiring >= 1 discarded it
-    and fell back to the host's core count, so a half-core pod opened streams sized for the node."""
+    """A fractional cgroup CPU quota must bind (Kubernetes cpu 500m reads as cpu.max 50000 100000, i.e. 0.5); requiring
+    >= 1 fell back to host cores, sizing streams for the node."""
     monkeypatch.setattr(tuning, "cgroup_cpu_limit", lambda: 0.5)
     profile = tuning.system_profile()
     assert profile.cpu_count == 1
@@ -365,9 +348,8 @@ def test_fractional_cgroup_cpu_quota_binds(monkeypatch):
 
 
 def test_fail_fast_timeouts_are_opt_out():
-    """The shortened Xet timeouts belong in a supervised download child, not process-wide: xet-core
-    reads its config once per process and applies it to uploads and direct huggingface_hub downloads
-    too, neither of which our HTTP ladder can catch."""
+    """Fail-fast Xet timeouts belong only in the supervised download child: xet-core reads its config once per process,
+    so they would also hit uploads and direct hub downloads."""
     supervised = tuning.xet_env_overrides(_profile(16))
     global_env = tuning.xet_env_overrides(_profile(16), fail_fast = False)
 
@@ -391,8 +373,7 @@ def test_apply_xet_env_does_not_shorten_timeouts_process_wide():
     assert child["HF_XET_CLIENT_RETRY_MAX_ATTEMPTS"] == "2"
 
 
-# Real machines Unsloth actually runs on, smallest first. A regression that only shows up on a
-# 2-core Colab or a 0.5-core pod is one nobody here can reproduce, so they are pinned by name.
+# Real machines Unsloth runs on, smallest first; pinned by name since regressions on a 2-core Colab or 0.5-core pod cannot be reproduced otherwise.
 DEVICES = [
     # name,                     RAM GB, cpus, free disk GB
     ("tiny VM",                      2,    2,     8),
@@ -411,9 +392,8 @@ DEVICES = [
 
 @pytest.mark.parametrize("name, ram_gb, cpus, disk_gb", DEVICES, ids = [d[0] for d in DEVICES])
 def test_every_device_stays_within_its_own_means(name, ram_gb, cpus, disk_gb):
-    """One rule per resource, applied to every device we know of. Being generous on a big host is
-    only defensible if the same arithmetic is conservative on a small one, and the small ones are
-    where nobody notices until a user reports an OOM or a stalled download on hotel wifi."""
+    """One sizing rule applies to every device: generosity on big hosts is only defensible if the same arithmetic stays
+    conservative on small ones, where OOMs and stalls go unnoticed."""
     env = tuning.xet_env_overrides(_profile(ram_gb, cpus, disk_gb))
     limit = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])
     size = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"])
@@ -433,9 +413,8 @@ def test_every_device_stays_within_its_own_means(name, ram_gb, cpus, disk_gb):
 
 
 def test_the_smallest_devices_get_the_smallest_numbers():
-    """A 2 GB VM and a fractional-core pod get the smallest allocation we hand out: two files, four
-    streams, and a shared buffer bounded by a sixth of RAM rather than by xet-core's default, which
-    on a 2 GB machine would be the whole machine."""
+    """Small devices (2 GB VM, fractional-core pod) get two files, four streams and a buffer capped at a sixth of RAM,
+    since xet-core's default would take a 2 GB machine whole."""
     for name, ram_gb, cpus, disk_gb in DEVICES[:2]:
         env = tuning.xet_env_overrides(_profile(ram_gb, cpus, disk_gb))
         assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB, name
@@ -445,8 +424,7 @@ def test_the_smallest_devices_get_the_smallest_numbers():
 
 
 def test_only_the_big_hosts_get_the_big_numbers():
-    """The converse, and the point of the change: the devices that can afford xet-core's own
-    high-performance sizing are the only ones that get it."""
+    """Only devices that can afford xet-core's own high-performance sizing receive it; that is the point of the change."""
     big = {
         name for name, ram_gb, cpus, disk_gb in DEVICES
         if int(tuning.xet_env_overrides(_profile(ram_gb, cpus, disk_gb))
@@ -455,10 +433,9 @@ def test_only_the_big_hosts_get_the_big_numbers():
     assert big == {"A100 node", "8xH100 node"}
 
 
-# Every HF_XET_* name xet-core 1.5.x actually reads, filtered to the groups we touch. Regenerate
-# with:  grep -rhno "HF_XET_[A-Z_]\+" <xet-core>/xet_runtime --include=*.rs | cut -d: -f2- | sort -u
-# We used to set HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY, a name xet-core has never had (the real
-# one is HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE, default true): a no-op that read like a setting.
+# Every HF_XET_* name xet-core 1.5.x reads (filtered to the groups we touch), regenerated by grepping its xet_runtime
+# *.rs; HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY was never real, a no-op; the real one is
+# HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE, default true.
 XET_CORE_VARS = frozenset({
     "HF_XET_CACHE",
     "HF_XET_CHUNK_CACHE_SIZE_BYTES",
@@ -498,8 +475,8 @@ def test_we_only_set_variables_xet_core_reads(tmp_path):
 
 
 def test_the_prefetch_floor_never_undercuts_xet_cores_own(tmp_path):
-    """Sizing DOWN from a default is a cap; sizing below it for no reason is just a slower
-    download. Only a machine whose whole budget is smaller than the 1 GB default gets less."""
+    """The prefetch floor never undercuts xet-core's default unless the whole budget is below 1 GB; sizing below the
+    default for no reason only makes downloads slower."""
     for ram_gb, cpus in ((8, 4), (16, 8), (32, 16), (64, 32), (2048, 192)):
         env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
         prefetch = int(env["HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER"])
@@ -511,8 +488,7 @@ def test_the_prefetch_floor_never_undercuts_xet_cores_own(tmp_path):
 
 
 def test_no_module_sets_a_variable_xet_core_does_not_read():
-    """The dead variable was set from unsloth_zoo/__init__.py at import time, not from here, so a
-    check confined to this module would have missed it. Scan the package instead."""
+    """Scans the whole package, since a dead variable was set from unsloth_zoo/__init__.py at import time and a check in this module alone would miss it."""
     import pathlib
     import re
 
@@ -529,24 +505,21 @@ def test_no_module_sets_a_variable_xet_core_does_not_read():
 
 @pytest.mark.parametrize("ram_gb, cpus", [(8, 8), (12.7, 2), (16, 4), (32, 16), (64, 32), (2048, 192)])
 def test_a_machine_that_can_hold_xet_cores_own_buffer_gets_it(ram_gb, cpus):
-    """The rule the small-device regression came down to. Our sizing exists to CAP a machine that
-    needs capping; handing one less than it would have had by doing nothing is not a cap, it is
-    just a slower download. Measured: a quarter of the budget on an 8 GB laptop ran at 0.73x of
-    what shipped before, and restoring this one value took it to 1.45x."""
+    """Sizing exists to cap machines that need it; giving a machine less buffer than it would get by default is just a
+    slower download, not a cap (the small-device regression)."""
     env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
     size = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"])
     limit = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])
     stock = tuning._STOCK_BUFFER_SIZE
-    # Only two things may hold it under stock, and only as far as they reach: half the budget, and
-    # a sixth of RAM. Anything smaller than both of those is a choice, not a constraint.
+    # Only half the budget and a sixth of RAM may hold the buffer under stock, and only as far as they reach; anything smaller is a choice, not a constraint.
     assert size >= min(stock, limit // 2, max(256 * MB, ram_gb * GB / 6)), f"{ram_gb}GB got {size}"
     if limit // 2 >= stock and ram_gb * GB / 6 >= stock:
         assert size >= stock, f"{ram_gb}GB undercut stock: {size}"
 
 
 def test_a_small_container_with_many_cores_still_fits_a_third_of_its_ram():
-    """The budget floor is absolute, so on a 2 GB machine it is half the RAM, and letting cores
-    alone set the file count put 973 MB in flight there. The proportional promise has to win."""
+    """Small containers with many cores must still fit their RAM budget: cores alone setting the file count put 973 MB
+    in flight on a 2 GB box, so the proportional promise must win."""
     for cpus in (2, 8, 64):
         env = tuning.xet_env_overrides(_profile(2, cpus))
         worst = (
@@ -558,10 +531,8 @@ def test_a_small_container_with_many_cores_still_fits_a_third_of_its_ram():
 
 
 def test_the_flag_is_read_the_way_xet_core_reads_it():
-    """xet-core checks HF_XET_HIGH_PERFORMANCE and only falls back to the HF_XET_HP alias when the
-    first is unset (configuration_utils.rs get_high_performance_flag), so an explicit "0" masks the
-    alias. Standing our sizing down over an alias xet-core is ignoring would leave the machine on
-    xet-core's stock constants instead of the ones we sized for it."""
+    """xet-core reads HF_XET_HP only when HF_XET_HIGH_PERFORMANCE is unset (configuration_utils.rs
+    get_high_performance_flag), so an explicit 0 masks it; standing down over it leaves stock constants."""
     masked = {"HF_XET_HIGH_PERFORMANCE": "0", "HF_XET_HP": "1"}
     tuning.apply_xet_env(masked, profile = _profile(16))
     assert "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT" in masked, "sizing stood down for nothing"
@@ -572,9 +543,7 @@ def test_the_flag_is_read_the_way_xet_core_reads_it():
 
 
 def test_a_full_disk_is_not_read_as_an_unmeasured_one():
-    """shutil.disk_usage returning exactly zero free bytes is the case the clamp exists for, so it
-    must not share a sentinel with "we could not measure". A full cache filesystem otherwise kept
-    the whole 64 GB budget while one byte free took it to the floor."""
+    """Zero free bytes (shutil.disk_usage) is a real full disk, not the unmeasured sentinel; else a full cache kept 64 GB while 1 byte free hit the floor."""
     full = tuning.SystemProfile(
         total_ram_bytes = 2048 * GB, available_ram_bytes = 2048 * GB, cpu_count = 192,
         ram_source = "test", cpu_source = "test", free_disk_bytes = 0, disk_source = "/data",
@@ -618,11 +587,7 @@ def _two_volumes(monkeypatch, roomy: str, tight: str) -> None:
 
 
 def test_an_explicit_cache_dir_is_the_disk_that_gets_measured(monkeypatch, tmp_path):
-    """``cache_dir=`` beats every cache environment variable in huggingface_hub
-    (``file_download.py``: ``if cache_dir is None: cache_dir = constants.HF_HUB_CACHE``), so a
-    caller who names one has named the volume the bytes land on. Sizing off the global cache
-    instead promises a 64 GB buffer to a full target disk, and throttles a roomy target to the
-    floor because an unrelated default cache is full."""
+    """cache_dir= beats every cache env var in huggingface_hub (file_download.py), so size from that volume, not the global default cache."""
     roomy = tmp_path / "roomy"
     tight = tmp_path / "tight"
     for directory in (roomy, tight):
@@ -646,10 +611,7 @@ def test_an_explicit_cache_dir_is_the_disk_that_gets_measured(monkeypatch, tmp_p
 
 
 def test_a_process_already_sized_at_import_still_resizes_for_its_destination(monkeypatch, tmp_path):
-    """``apply_xet_env`` is setdefault and ``unsloth_zoo`` sizes itself at import, so by the time a
-    download names its ``cache_dir`` every sizing key is already in the environment and a second
-    apply writes nothing: the download would run on the global cache's numbers. ``resize_for_cache_dir``
-    drops what we seeded so the recompute lands, and leaves anything we did not write alone."""
+    """apply_xet_env is setdefault and unsloth_zoo sizes at import, so a cache_dir apply would write nothing; resize_for_cache_dir drops only keys it seeded."""
     import os as _os
 
     roomy = tmp_path / "roomy"
@@ -683,9 +645,7 @@ def test_a_process_already_sized_at_import_still_resizes_for_its_destination(mon
 
 
 def test_a_throttle_asked_for_by_a_logged_429_survives_the_resize(monkeypatch, tmp_path):
-    """``unsloth_zoo/__init__`` seeds the halved stream ceiling when the Xet logs show a 429. The
-    resize drops what that call wrote, so recomputing on the default terms would hand the child the
-    full ceiling exactly when the account asked for fewer streams."""
+    """A halved stream ceiling seeded by unsloth_zoo/__init__ after a logged 429 must survive the cache_dir resize, not recompute to the full ceiling."""
     import os as _os
 
     key = "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"
@@ -694,8 +654,7 @@ def test_a_throttle_asked_for_by_a_logged_429_survives_the_resize(monkeypatch, t
     for directory in (roomy, tight):
         directory.mkdir()
     _two_volumes(monkeypatch, str(roomy), str(tight))
-    # Pin the cores too: on a 1-2 CPU runner the ceiling is already the floor of 4, so halving it
-    # would be indistinguishable from not halving it.
+    # Pin the cores too: on a 1-2 CPU runner the ceiling is already the floor of 4, so halving it would look the same as not halving it.
     monkeypatch.setattr(_os, "sched_getaffinity", lambda _pid: set(range(16)))
     monkeypatch.setattr(tuning, "cgroup_cpu_limit", lambda: None)
 
@@ -714,8 +673,7 @@ def test_a_throttle_asked_for_by_a_logged_429_survives_the_resize(monkeypatch, t
         > throttled_streams
 
 
-# A fresh cloud VM: nothing in the environment, and no Xet logs to have learned from. Colab and
-# Kaggle look like this on EVERY run, which is what made the old heuristic fail there forever.
+# A fresh cloud VM has no environment and no Xet logs to learn from; Colab and Kaggle look like this on every run, so the old heuristic failed there forever.
 CLOUD_VMS = [
     # name,                RAM GB, cpus, free disk GB
     ("Colab standard",       13.6,    2,   78),
@@ -726,8 +684,7 @@ CLOUD_VMS = [
     ("Paperspace free",      30.0,    8,   50),
 ]
 
-# xet-core's high-performance preset (xet_runtime/src/config/xet_config.rs: with_high_performance
-# is applied AFTER the environment, so it VOIDS whatever we set).
+# xet-core's high-performance preset (xet_runtime/src/config/xet_config.rs) is applied AFTER the environment, so it voids whatever we set.
 _HIGH_PERFORMANCE_CEILING = 64 * GB
 
 
@@ -735,11 +692,8 @@ _HIGH_PERFORMANCE_CEILING = 64 * GB
                          ids = [d[0] for d in CLOUD_VMS])
 def test_a_fresh_cloud_vm_is_never_put_into_high_performance_mode(
         name, ram_gb, cpus, disk_gb, monkeypatch):
-    """The 2026.6.7 regression, pinned: high-performance mode was enabled whenever the local Xet
-    logs held no prior 429. A fresh VM's logs are ALWAYS empty, so every Colab and Kaggle session
-    started with xet-core's 64GB ceiling; a 29.5GB download was OOM-killed on Colab at 11.32GB RSS
-    against 13.61GB of RAM. The flag is what matters rather than our own numbers, because
-    with_high_performance() is applied after the environment and discards them."""
+    """2026.6.7 regression: no prior 429 in Xet logs enabled high performance, and fresh VMs always have empty logs
+    (29.5GB download OOM-killed on Colab); the flag matters since with_high_performance() discards our numbers."""
     for var in (*tuning.XET_HIGH_PERFORMANCE_VARS, "UNSLOTH_XET_FORCE_CAPS"):
         monkeypatch.delenv(var, raising = False)
     env: dict = {}
@@ -756,9 +710,7 @@ def test_a_fresh_cloud_vm_is_never_put_into_high_performance_mode(
                          ids = [d[0] for d in CLOUD_VMS])
 def test_a_fresh_cloud_vm_keeps_its_buffers_inside_its_own_ram(
         name, ram_gb, cpus, disk_gb, monkeypatch):
-    """The consequence the flag test cannot see on its own: whatever route the sizing takes, what
-    hf_xet can hold at once has to stay a modest share of the machine. A quarter is the line --
-    measured peak RSS on Colab was 1.3GB of 13.6GB (10%) once sized, against 11.3GB (83%) before."""
+    """What hf_xet can hold at once must stay a modest share of RAM, a quarter at most; Colab peak RSS fell from 11.3GB (83%) to 1.3GB (10%) once sized."""
     for var in (*tuning.XET_HIGH_PERFORMANCE_VARS, "UNSLOTH_XET_FORCE_CAPS"):
         monkeypatch.delenv(var, raising = False)
     env: dict = {}
@@ -775,9 +727,7 @@ def test_a_fresh_cloud_vm_keeps_its_buffers_inside_its_own_ram(
 
 
 def test_an_empty_xet_log_directory_is_not_read_as_permission_to_go_fast():
-    """The exact inversion that shipped: "no 429 in the logs" was treated as "this machine can take
-    high performance", when on a VM created seconds ago it only means nothing has been tried yet.
-    Absence of evidence has to resolve to the conservative branch."""
+    """No 429 in the logs only means nothing has been tried yet, not that high performance is safe; absence of evidence must take the conservative branch."""
     quiet: dict = {}
     tuning.apply_xet_env(quiet, profile = _profile(13.6, 2, 78))
     throttled: dict = {}

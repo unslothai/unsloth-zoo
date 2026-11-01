@@ -15,15 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""CPU logits are never written by an fp16 torch.mm(out=) into a strided slice of the padded buffer.
-
-_logits_into splits an odd vocab into a multiple of 8 and a tail and wrote each part with
-torch.mm(..., out = buf[:, a:b]). On avx512_fp16 CPUs (torch 2.10, oneDNN) that matmul reads the
-slice's stale contents: the uninitialised buffer gave NaN logits, so NaN hidden gradients in
-test_fused_preference_head_fp16.py, and a zeroed buffer gave wrong ones. The host ISA decides whether
-the bug shows, so these tests pin the call shape instead, and the result against an fp32 oracle
-from a NaN-filled buffer.
-"""
+"""CPU logits must never be written by fp16 torch.mm(out=) into a strided buffer slice: avx512_fp16 (torch 2.10) reads
+stale data; ISA-dependent, so tests pin the call shape."""
 
 import pytest
 import torch

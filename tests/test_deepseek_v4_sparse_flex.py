@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4 attention on flex attention: routing, block mask, and parity with transformers' eager
-attention (fp32 exact-math check, bf16 layers against an fp32 oracle, prefill + decode through the cache)."""
+"""Tests DeepSeek-V4 attention on flex attention: routing, block mask, and parity with transformers' eager attention
+(fp32 exact check, bf16 vs fp32 oracle, prefill and decode)."""
 
 import copy
 
@@ -34,7 +34,7 @@ if Version(transformers.__version__).release < (5, 17):
 from unsloth_zoo.temporary_patches import deepseek_v4_sparse_flex as F4  # noqa: E402
 
 F4.patch_deepseek_v4_sparse_flex()
-# The patch declines (torch < 2.10, no flex BlockMask, changed upstream source); then there is nothing to test.
+# The patch declines on torch < 2.10, without a flex BlockMask, or on changed upstream source; then there is nothing to test.
 if not hasattr(modeling.eager_attention_forward, "_unsloth_original"):
     pytest.skip("the DeepSeek-V4 flex patch did not install here", allow_module_level = True)
 ORIGINAL = modeling.eager_attention_forward._unsloth_original
@@ -71,8 +71,8 @@ class _Attn(torch.nn.Module):
 
 
 def _mask(bsz, q_len, window, compressed, rate, topk, dtype, device, pad = 0, seed = 0):
-    """Additive [B, 1, S, S + C] mask like V4's: sliding window + left padding over tokens, then causal
-    top-k over compressed entries (0 = attend, finfo.min / -inf = masked)."""
+    """Additive [B, 1, S, S + C] mask like V4's: sliding window and left padding over tokens, then causal top-k over
+    compressed entries; 0 attends, finfo.min or -inf masks."""
     g = torch.Generator(device = "cpu").manual_seed(seed)
     q = torch.arange(q_len)[:, None]
     k = torch.arange(q_len)[None]
@@ -219,8 +219,7 @@ def _run(fn, attn, q, kv, mask, grad):
 
 @needs_flex_gpu
 def test_flex_equals_eager_in_float32():
-    """Same math in fp32 (sliding window + padding + top-k compressed entries + sink): only the
-    reduction order differs, including the fully masked rows of the left-padded batch row."""
+    """Same math in fp32 (window, padding, top-k compressed entries, sink): flex and eager differ only in reduction order, including fully masked left-padded rows."""
     attn, q, kv, mask, grad = _function_case(torch.float32)
     scale = q.shape[-1] ** -0.5
     ref = _run(lambda: ORIGINAL(attn, q, kv, kv, mask, scale)[0], attn, q, kv, mask, grad)
@@ -248,8 +247,8 @@ def test_flex_keeps_finite_mask_biases_in_float32():
 
 @needs_flex_gpu
 def test_flex_compiles_fullgraph_with_a_biased_mask():
-    """Inside an enclosing fullgraph compile the bias check must not branch on data; output and dq match
-    eager-called flex. Compiled inference (no_grad) goes to eager instead of failing to lower."""
+    """Inside a fullgraph compile the bias check must not branch on data; output and dq match eager flex; compiled
+    no_grad inference falls back to eager, not a lowering failure."""
     attn, q, kv, mask, _ = _function_case(torch.bfloat16)
     visible = mask > torch.finfo(mask.dtype).min / 2
     mask = torch.where(visible, mask - 0.5, mask)
@@ -350,9 +349,8 @@ def _run_layer(monkeypatch, attn, args, kwargs, dtype, flex, weight):
 
 @needs_flex_gpu
 def test_layers_equal_eager_in_float32(monkeypatch):
-    """Sliding, CSA and HCA layers at the real head count / head dim on a left-padded batch: with the
-    dtype gate opened to fp32, flex and eager agree on the output and every gradient up to reduction
-    order, so the block mask, compressed entries and sink are the same math."""
+    """Sliding, CSA and HCA layers at real head count and dim on a left-padded batch, dtype gate opened to fp32: flex
+    matches eager on output and all grads up to reduction order, covering block mask, compressed entries and sink."""
     model, seen, _, weight = _captured_layers(monkeypatch)
     real_applies = F4._flex_applies
     monkeypatch.setattr(F4, "_flex_applies", lambda module, query, *a: query.is_cuda and real_applies(
@@ -375,8 +373,7 @@ def test_layers_equal_eager_in_float32(monkeypatch):
 
 @needs_flex_gpu
 def test_layers_in_bf16_stay_close_to_an_fp32_oracle(monkeypatch):
-    """The bf16 flex layer is about as far from an fp32 eager oracle as transformers' own bf16 eager
-    layer (a wrong mask or sink would be off by O(1))."""
+    """The bf16 flex layer is about as far from an fp32 eager oracle as transformers' own bf16 eager layer; a wrong mask or sink would be off by O(1)."""
     model, seen, mask, weight = _captured_layers(monkeypatch)
     keep = mask.bool()
     for idx, layer in enumerate(model.model.layers):
@@ -395,8 +392,7 @@ def test_layers_in_bf16_stay_close_to_an_fp32_oracle(monkeypatch):
 
 @needs_flex_gpu
 def test_prefill_on_flex_then_decode_through_the_cache(monkeypatch):
-    """Prefill with a cache engages flex; the following decode steps (q_len 1) stay eager and see the
-    same cache, so logits track the all-eager run."""
+    """Prefill with a cache engages flex; decode steps (q_len 1) stay eager on the same cache, so logits track the all-eager run."""
     model = _tiny_model().to(torch.bfloat16)
     ids = torch.randint(0, 512, (1, 600), device = "cuda")
 
@@ -431,9 +427,8 @@ def test_older_torch_keeps_eager(monkeypatch):
 @needs_flex_gpu
 @pytest.mark.parametrize("rate", [0, 4, 128])
 def test_flex_graphs_stay_bounded_over_lengths(rate):
-    """Sliding (rate 0), CSA (4), HCA (128) masks over varying lengths (incl. non multiples of 128) and
-    batch 1 / 2, fwd + bwd: at most four graphs (the first length static, then dynamic, batch 1 vs > 1), none
-    added per new length after that."""
+    """Sliding (rate 0), CSA (4), HCA (128) masks over varying lengths and batch 1 or 2, fwd and bwd: at most four
+    graphs (first length static, then dynamic; batch 1 vs > 1), none added per new length."""
     import torch._dynamo
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()
@@ -458,9 +453,8 @@ def test_flex_graphs_stay_bounded_over_lengths(rate):
 
 @needs_flex_gpu
 def test_packed_sequences_match_upstream(monkeypatch):
-    """Padding-free packing (position_ids reset per document, no attention_mask). The compressor windows and
-    the compressed-entry causality follow absolute slots, so upstream itself mixes documents: flex must
-    match upstream's packed result (the additive mask is read as is). Then each document alone, fwd + bwd."""
+    """Padding-free packing (position_ids reset, no attention_mask): upstream mixes documents via absolute-slot
+    compressor windows, so flex must match its packed result (additive mask read as is); then each document alone."""
     model = _tiny_model().to(torch.bfloat16)
     docs = [300, 100, 250]
     ids = torch.randint(0, 512, (1, sum(docs)), device = "cuda", generator = torch.Generator("cuda").manual_seed(0))
@@ -508,9 +502,8 @@ print("SHORT_DOC_OK")
 
 @needs_flex_gpu
 def test_short_document_after_longer_ones():
-    """A 100 token document (under one 128 tile) after longer ones, fwd + bwd, fresh process: torch 2.10 sent
-    it to the flex decoding kernel once the compiled flex had gone dynamic, and that failed to lower
-    (S <= BLOCK_M on the 32-wide tiles)."""
+    """A 100-token doc (under one 128 tile) after longer ones: torch 2.10 sent it to the flex decoding kernel once
+    compiled flex went dynamic, and that failed to lower (S <= BLOCK_M, 32-wide tiles)."""
     import os
     import subprocess
     import sys
@@ -522,8 +515,8 @@ def test_short_document_after_longer_ones():
 
 @needs_flex_gpu
 def test_device_probe_traces_without_graph_break():
-    """The first flex check can run inside a compiled graph (empty device cache): the probe must trace
-    whole. importlib's find_spec is skipped by dynamo and broke the graph on torch 2.10."""
+    """The first flex check can run inside a compiled graph with an empty device cache, so the probe must trace whole;
+    dynamo skips importlib find_spec and broke the graph on torch 2.10."""
     import torch._dynamo
     torch._dynamo.reset()
     F4._DEVICE_OK.clear()
@@ -557,8 +550,8 @@ def _capture(fn):
 @needs_flex_gpu
 @pytest.mark.parametrize("finite_bias", [False, True])
 def test_cuda_graph_capture_matches_eager(finite_bias):
-    """The finite-bias check is a host sync; under stream capture it invalidated the capture
-    (cudaErrorStreamCaptureInvalidated). Capturing keeps the bias instead: the replay matches the eager call."""
+    """The finite-bias check is a host sync that invalidates CUDA stream capture (cudaErrorStreamCaptureInvalidated), so
+    capturing keeps the bias; replay matches the eager call."""
     torch.manual_seed(0)
     attn = _Attn(4, "cuda").to(torch.bfloat16)
     q = torch.randn(1, 4, 256, 64, device = "cuda", dtype = torch.bfloat16)
@@ -574,8 +567,8 @@ def test_cuda_graph_capture_matches_eager(finite_bias):
 
 @needs_flex_gpu
 def test_cold_fullgraph_compile_is_one_graph(monkeypatch):
-    """Right after install, a fullgraph dynamic compile of the dispatcher is one graph: the compiled flex
-    callable used to be set lazily inside the trace, and its `_FLEX is None` guard recompiled the next call."""
+    """Right after install a fullgraph dynamic compile is one graph; setting the compiled flex callable lazily inside
+    the trace made its `_FLEX is None` guard recompile the next call."""
     import torch._dynamo
     monkeypatch.setattr(modeling, "eager_attention_forward", ORIGINAL)
     monkeypatch.setattr(F4, "_FLEX", None)

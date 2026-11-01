@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fp16 full finetuning of an MoE on a GPU without bfloat16 (T4, V100), grouped_mm backend.
-
-The expert stacks are float32 masters and the Trainer runs fp16 autocast, so fp16
-activations reach torch._grouped_mm, which autocast does not cast:
-"expected mat1 and mat2 to have the same dtype, but got: c10::Half != float".
-Runs on CPU; equal dtypes (LoRA, bf16) must stay bit-for-bit unchanged.
-"""
+"""fp16 full finetune of an MoE on GPUs without bf16 (T4, V100): fp32 expert masters under fp16 autocast, which does not
+cast torch._grouped_mm inputs, hit a dtype mismatch; equal-dtype paths (LoRA, bf16) must stay bit-for-bit unchanged,
+tested on CPU"""
 
 import pytest
 import torch
@@ -30,8 +26,7 @@ from unsloth_zoo.temporary_patches import moe_utils
 
 @pytest.fixture(autouse = True)
 def native_grouped_mm(monkeypatch):
-    """Take the real torch._grouped_mm on CPU (the probe says no there and the per-group
-    matmul fallback would be cast by CPU autocast, hiding the GPU failure)."""
+    """Use the real torch._grouped_mm on CPU: the probe answers no there, and the per-group matmul fallback would be cast by CPU autocast, hiding the GPU failure"""
     if not hasattr(torch, "_grouped_mm"):
         pytest.skip("torch._grouped_mm unavailable")
     monkeypatch.setattr(moe_utils, "_grouped_mm_supported_on", lambda device: True)

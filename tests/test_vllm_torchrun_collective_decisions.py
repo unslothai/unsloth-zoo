@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference under torchrun: decisions that change which collectives a rank enters are collective.
-
-external_launcher puts every rank's vLLM engine in the job's process group. A rank that drops vLLM
-(an old card) while another keeps it, or a rank retrying its engine alone after vLLM's cross-rank
-memory MIN, leaves the ranks in different collectives until the group timeout. CPU only: gloo.
-"""
+"""fast_inference under torchrun: decisions that change which collectives a rank enters must match on all ranks, since
+external_launcher puts every rank's engine in the job's process group; else ranks sit in different collectives until
+the group timeout; CPU only, gloo."""
 
 import json
 import os

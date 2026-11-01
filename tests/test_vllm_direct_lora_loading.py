@@ -14,17 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for the vLLM direct LoRA hot-load path.
-
-Drives the real `prepare_vllm_lora_loading` / `load_lora_directly` against fake PEFT
-modules and fake vLLM stacked buffers. No GPU, no real vLLM needed.
-
-Asserts the contract:
-  - every projection lands in its own vLLM slot, gate_up slot 1 being up_proj (gate and
-    up share shapes, so the shape asserts alone cannot catch a mis-pairing);
-  - the effective delta each slot carries equals scaling * B @ A;
-  - the destination is scaled, never the training weights.
-"""
+"""Direct LoRA hot-load tests, no GPU: each projection lands in its own vLLM slot with gate_up slot 1 = up_proj (shapes
+alone cannot catch a swap); slot delta equals scaling * B @ A; training weights are never scaled."""
 
 from __future__ import annotations
 
@@ -34,9 +25,8 @@ import pytest
 import torch
 
 
-# Imported at module level on purpose: this file is a CI hard gate needing neither a GPU nor
-# vLLM (tests/conftest.py handles the device probe), so an import failure must fail
-# the gate instead of skipping it.
+# Imported at module level on purpose: this CI hard gate needs neither GPU nor vLLM (tests/conftest.py probes the
+# device), so an import failure must fail, not skip.
 import unsloth_zoo.vllm_utils as vllm_utils
 
 

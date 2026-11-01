@@ -100,9 +100,9 @@ def test_legacy_bonus_of_kept_rows_matches_running_them_alone(loss_type):
 
 
 def _legacy_oracle(entropies, mask, row_weight, coef, num_processes):
-    # fp64 TRL 1.8 / 1.9 cispo / dapo / vespo bonus (grpo_trainer.py `(entropies * effective_mask).sum() /
-    # normalizer`, normalizer = num_items_in_batch / num_processes), with 1 / num_items_in_batch replaced
-    # by the per-row sample_weight. No accumulation or steps_per_generation factor.
+    # fp64 oracle of TRL 1.8/1.9 cispo/dapo/vespo bonus: (entropies * effective_mask).sum() / (num_items_in_batch /
+    # num_processes), per-row sample_weight in place of 1 / num_items_in_batch; no accumulation or steps_per_generation
+    # factor.
     return -coef * (entropies.double() * mask.double() * row_weight.double().unsqueeze(-1)).sum() * num_processes
 
 
@@ -137,8 +137,8 @@ def test_legacy_all_kept_equals_no_exclusion_for_any_spg_ga(loss_type, num_proce
 @pytest.mark.parametrize("prompt_level", [False, True])
 @pytest.mark.parametrize("spg,ga", [(8, 2), (1, 1)])
 def test_legacy_partial_exclusion_matches_fp64_oracle(prompt_level, spg, ga):
-    # sample_weight built like unsloth's _unsloth_grpo_sample_weight: keep / kept tokens, or prompt level
-    # keep / (group tokens * kept groups). The bonus is the kept-token reweighting, independent of SPG / GA.
+    # sample_weight as _unsloth_grpo_sample_weight: keep / kept tokens, or prompt-level keep / (group tokens * kept
+    # groups); the bonus is independent of SPG / GA.
     gen = torch.Generator().manual_seed(11)
     num_generations, groups, length = 2, 4, 5
     rows = num_generations * groups

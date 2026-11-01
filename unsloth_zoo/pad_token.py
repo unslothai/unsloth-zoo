@@ -35,10 +35,8 @@ __all__ = [
     "fix_pad_token",
 ]
 
-# Candidate pad tokens, highest priority first. Entries are matched against each
-# added token by exact-equality OR prefix (families like "<|reserved" cover
-# "<|reserved_special_token_0|>"). A closed candidate (ends with > |> ] )) wins
-# over an open prefix match.
+# Candidate pad tokens, highest priority first; entries match by exact equality or prefix (<|reserved covers
+# <|reserved_special_token_0|>), and a closed candidate (ends with > |> ] )) wins over an open prefix.
 POSSIBLE_RESERVED_TOKENS = (
     "<|finetune_right_pad_id|>",  # Llama-3.1
     "<|finetune_right_pad|>",     # Llama-4
@@ -58,11 +56,10 @@ POSSIBLE_RESERVED_TOKENS = (
     "<unused",                    # PaliGemma
     "<|EOT|>",                    # DeepSeek Prover
     "<|reject-unknown|>",         # Red Note
-    # "<|endofprompt|>",          # Phi-4 mini; commented out, clashes with GPT-OSS
+    # <|endofprompt|> (Phi-4 mini) is left out: it clashes with GPT-OSS.
 )
 
-# Modality pad tokens: pad-named, so valid pads on any model. Appended as
-# last-resort replacement candidates after the curated families above.
+# Modality pad tokens are valid pads on any model, appended as last-resort replacement candidates after the curated families.
 _MODALITY_PAD_TOKENS = (
     "<|vision_pad|>",
     "<|image_pad|>",
@@ -163,8 +160,7 @@ def _classify_bad_pad(inner, vocab_size):
     pad_id, eos_id = getattr(inner, "pad_token_id", None), getattr(inner, "eos_token_id", None)
     if pad_id is not None and eos_id is not None and pad_id == eos_id:
         return "equals_eos"
-    # A pad id past the model's embeddings indexes out of range at runtime; only
-    # checkable once a model/config gives us vocab_size.
+    # A pad id at or past the model's vocab size indexes out of range at runtime; only checkable once a config provides vocab_size.
     if vocab_size is not None and pad_id is not None and pad_id >= vocab_size:
         return "out_of_range"
     return None
@@ -202,9 +198,8 @@ def _config_declared_pad(inner, cfg, eos_token, eos_token_ids, vocab_size):
         return None
     try:
         candidate = convert_ids_to_tokens(pad_token_id)
-        # Require a clean round-trip so we never promote an unknown / unstable id, and
-        # reject the eos token by name as well as by id: a tokenizer that does not expose
-        # eos_token_id would otherwise let a config-declared pad == eos slip through.
+        # Require a clean id/token round-trip so unknown or unstable ids are never promoted; reject the eos token by
+        # name too, since a tokenizer without eos_token_id would let a config-declared pad == eos slip through.
         if candidate is None or candidate == eos_token:
             return None
         if convert_tokens_to_ids(candidate) != pad_token_id:
@@ -270,8 +265,7 @@ def _find_reserved_pad(inner, eos_token, vocab_size, eos_token_ids=frozenset()):
         matches = [a for a in added if a == reserved or a.startswith(reserved)]
         if not matches:
             continue
-        # Prefer a closed token (e.g. "<|reserved_special_token_0|>"); closed tokens
-        # are a subset of matches, so order them first without duplicating.
+        # Prefer closed tokens (e.g. <|reserved_special_token_0|>): they are a subset of the matches, so order them first without duplicating.
         closed = [m for m in matches if m.endswith(_CLOSERS)]
         ordered = closed + [m for m in matches if m not in closed]
         for candidate in ordered:
@@ -280,10 +274,8 @@ def _find_reserved_pad(inner, eos_token, vocab_size, eos_token_ids=frozenset()):
             if _single_token_id(inner, candidate, vocab_size, eos_token_ids) is not None:
                 return candidate
 
-    # Last resort: any pad sentinel (a bracketed "*pad*" token such as <|fim_pad|>)
-    # not in a curated family above. The bracket form in _is_pad_named excludes
-    # ordinary added words like "keypad" / "padding" that would be masked out of
-    # attention and loss if promoted.
+    # Last resort: any bracketed *pad* sentinel (e.g. <|fim_pad|>) outside the curated families; the bracket form in
+    # _is_pad_named excludes words like keypad or padding, which would be masked out of attention and loss.
     for candidate in added:
         if candidate == eos_token or not _is_pad_named(candidate):
             continue
@@ -344,14 +336,11 @@ def fix_pad_token(
     cfg = model_config if model_config is not None else getattr(model, "config", None)
     vocab_size = _text_vocab_size(cfg)
     if type(vocab_size) is not int:
-        # A malformed (e.g. string) vocab_size must not crash a later `id >= vocab_size`
-        # comparison; treat it as unknown and skip range checks.
+        # A malformed vocab_size (e.g. a string) would crash the id >= vocab_size comparison, so treat it as unknown and skip range checks.
         vocab_size = None
     eos_token = getattr(inner, "eos_token", None)
-    # EOS ids used to reject a replacement pad that would alias an EOS: the tokenizer's own
-    # and the model config's (each a scalar or a multi-EOS list). Deliberately NOT the
-    # generation_config stop list, which legitimately lists a valid pad (Qwen's
-    # <|endoftext|>) and must not drive pad selection.
+    # EOS ids that reject an aliasing pad come from the tokenizer and the config, not the generation_config stop list:
+    # it lists valid pads (Qwen's <|endoftext|>) and must not drive pad selection.
     eos_token_ids = _eos_id_set(
         getattr(inner, "eos_token_id", None),
         getattr(cfg, "eos_token_id", None),
@@ -368,9 +357,7 @@ def fix_pad_token(
         new_pad = _unk_fallback(inner, eos_token, vocab_size, eos_token_ids)
 
     if new_pad is None:
-        # Before synthesizing a token and resizing embeddings, honor the model config's
-        # own declared pad id when it is safe (Whisper-large-v3 and any similarly
-        # misconfigured tokenizer). This reuses an existing token, so no resize.
+        # Before synthesizing a pad and resizing embeddings, reuse the config's declared pad id when safe (e.g. Whisper-large-v3); no new token means no resize.
         config_pad = _config_declared_pad(inner, cfg, eos_token, eos_token_ids, vocab_size)
         if config_pad is not None:
             result.update(changed=True, new_pad=config_pad, added=False)

@@ -14,30 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU regression tests for the Gemma3 UNSLOTH_FORCE_FLOAT32 Linear boundary dtype fix.
-
-The forced-float32 Gemma3 patches run RMSNorm / SwiGLU / attention reductions in
-float32 and hand a float16 activation to every Linear. That hard-coded float16
-assumed the projection weights were float16 too: true for LoRA / QLoRA, false for
-full finetuning, which upcasts the trainable weights to float32. A float16
-activation then met a float32 weight and the matmul died with
-"expected mat1 and mat2 to have the same dtype, but got: c10::Half != float"
-(the CPU wording is "m1 and m2", same error).
-
-``_linear_boundary_dtype`` reads the dtype off the projections that actually do
-the multiply and ``_to_boundary_dtype`` moves the activation there, so:
-
-  * float32 projections (full finetuning) no longer crash, and stay in float32;
-  * float16 projections (LoRA / QLoRA) hit an identity branch, so the common path
-    keeps bit-for-bit the numerics it had before the fix;
-  * a bitsandbytes 4bit uint8 weight blob is not floating point, so it falls
-    through to the float16 default that path always used.
-
-Everything here is behavioural: the real patched ``Gemma3MLP`` / ``Gemma3Attention``
-forwards are executed on CPU with real transformers modules built from a tiny real
-Gemma3 text config. No test inspects the source text of the patch. dtype-mismatch
-errors raise on CPU, so no GPU is needed.
-"""
+"""CPU regression tests for the Gemma3 UNSLOTH_FORCE_FLOAT32 boundary dtype: activations follow the float projection
+weight dtype (fp32 full finetune), fp16 fallback for uint8 4bit blobs and unchanged for fp16 LoRA; behavioural, on
+real transformers modules."""
 
 from __future__ import annotations
 
@@ -89,14 +68,7 @@ def _record_input_dtypes(module):
 
 
 def _install(monkeypatch, force_float32, patchers):
-    """Run the real zoo patch bodies against transformers, then undo them.
-
-    ``monkeypatch.setattr(cls, "forward", cls.forward)`` records the pre-patch
-    function so teardown restores it: these patches mutate the global transformers
-    classes and must not leak into other test files. torch.compile is switched off
-    so the assertions see the patched Python itself rather than a Dynamo graph
-    (and so the bitwise test compares against eager arithmetic).
-    """
+    """Installs the real zoo patches with torch.compile off, so tests see eager arithmetic; monkeypatch records each pre-patch forward so teardown restores it."""
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1" if force_float32 else "0")
     monkeypatch.setattr(patch_utils, "UNSLOTH_COMPILE_DISABLE", True)
     monkeypatch.setattr(gemma_patches, "torch_compile", lambda function, *args, **kwargs: function)
@@ -109,8 +81,7 @@ def _install(monkeypatch, force_float32, patchers):
     for patcher in patchers:
         patcher()
 
-    # Guard against a vacuous run: patch_function() silently declines when the
-    # upstream signature drifts, leaving these tests on stock transformers.
+    # Guards against a vacuous run: patch_function() silently declines when the upstream signature drifts, leaving these tests on stock transformers.
     patched = {target for target in targets if target.forward is not before[target]}
     return patched
 
@@ -140,10 +111,7 @@ def generic_patches(monkeypatch):
 
 @requires_gemma3
 def test_forced_float32_mlp_runs_float16_activation_into_float32_projections(forced_float32_patches):
-    """Full finetuning: fp32 MLP weights fed the fp16 activation RMSNorm emits.
-
-    Before the fix ``self.gate_proj(x)`` raised RuntimeError here.
-    """
+    """Full finetuning: fp32 MLP weights fed the fp16 activation RMSNorm emits; before the fix self.gate_proj(x) raised RuntimeError."""
     torch.manual_seed(0)
     mlp = gemma3.Gemma3MLP(_text_config()).to(torch.float32)
     gate_seen = _record_input_dtypes(mlp.gate_proj)
@@ -173,8 +141,7 @@ def test_forced_float32_mlp_float16_weights_are_bitwise_identical_to_pre_fix(for
 
     out = mlp(x)
 
-    # Pre-fix algorithm inline: fp16 projections, fp32 act_fn and product, bare
-    # .to(torch.float16), down_proj.
+    # Pre-fix algorithm inline as the reference: fp16 projections, fp32 act_fn and product, a bare .to(torch.float16) before down_proj.
     gate_proj_out = mlp.gate_proj(x)
     up_proj_out = mlp.up_proj(x)
     gate_proj_fp32 = gate_proj_out.to(torch.float32)
@@ -258,8 +225,7 @@ def test_linear_boundary_dtype_reads_the_first_floating_point_projection_weight(
     bfloat16_module = _Projections(**{name: torch.nn.Linear(4, 4, bias = False, dtype = torch.bfloat16) for name in names})
     assert _linear_boundary_dtype(bfloat16_module, *names) == torch.bfloat16
 
-    # bitsandbytes 4bit keeps the base weight as a packed uint8 blob: not floating
-    # point, so no weight answers and the activation is left alone.
+    # bitsandbytes 4bit keeps the base weight as a packed uint8 blob, not floating point, so no weight answers and the activation is left alone.
     quantized_module = _Projections(**{name: _Projections(weight = torch.zeros(8, 1, dtype = torch.uint8)) for name in names})
     assert _linear_boundary_dtype(quantized_module, *names) is None
 
@@ -283,14 +249,8 @@ _FLOAT8_DTYPES = [
 
 @pytest.mark.parametrize("float8_dtype", _FLOAT8_DTYPES, ids = lambda d: str(d).split(".")[-1])
 def test_a_float8_storage_weight_is_not_read_as_an_activation_dtype(float8_dtype):
-    """`torch.float8_e4m3fn.is_floating_point` is True, so a plain floating-point
-    test hands back float8 and the caller casts the hidden states straight to it.
-
-    transformers' FP8Linear / FbgemmFp8Linear take bfloat16 or float16 in and do
-    their own scaled quantization, so an unscaled cast loses values before the
-    scaling meant to preserve them, and the Q/K norm and SDPA downstream get a
-    dtype they do not support.
-    """
+    """torch.float8_e4m3fn.is_floating_point is True, so a plain floating-point test hands back float8; FP8Linear and
+    FbgemmFp8Linear take bf16 or fp16 and scale themselves, and Q/K norm and SDPA do not support float8."""
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
     fp8_module = _Projections(**{
         name: _Projections(weight = torch.zeros(8, 8).to(float8_dtype)) for name in names
@@ -307,12 +267,7 @@ def test_a_float8_storage_weight_is_not_read_as_an_activation_dtype(float8_dtype
 
 
 def test_a_bfloat16_activation_survives_a_4bit_model():
-    """The generic (non-forced) path installs on 4bit QLoRA with bfloat16
-    activations. Every projection is a uint8 blob there, so nothing answers, and
-    a float16 fallback would narrow bfloat16 to float16 on a forward the
-    unpatched model passed through untouched, costing exactly the exponent range
-    bfloat16 is chosen for.
-    """
+    """The generic path on 4bit QLoRA sees only uint8 blobs, so nothing answers; a float16 fallback would narrow bfloat16 activations and lose their exponent range."""
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
     quantized = _Projections(**{
         name: _Projections(weight = torch.zeros(8, 1, dtype = torch.uint8)) for name in names
@@ -325,14 +280,7 @@ def test_a_bfloat16_activation_survives_a_4bit_model():
 
 
 def test_every_patch_installing_a_boundary_forward_publishes_the_helpers():
-    """The auto-compiler serializes these forwards into unsloth_compiled_cache and
-    resolves their free names by importing from the modeling module. A helper that
-    lives only in the patch module is not importable there, so the generated
-    forward dies with NameError on its first call.
-
-    Read off the source rather than asserted by name, so adding a fourth patch
-    that uses the helpers without publishing them fails here.
-    """
+    """Auto-compiled forwards import their free names from the modeling module or die with NameError, so helpers must be published there; checked by AST."""
     import ast
     import pathlib
 
@@ -360,8 +308,7 @@ def test_every_patch_installing_a_boundary_forward_publishes_the_helpers():
 
 
 def test_the_publish_check_actually_finds_the_patches():
-    """Guard the guard: if the AST walk stopped matching, the test above would
-    pass with an empty offender list and prove nothing."""
+    """Guards the AST publish check itself: if the walk stopped matching the patches, the check above would pass on an empty offender list."""
     import ast
     import pathlib
 
@@ -395,16 +342,8 @@ def test_to_boundary_dtype_casts_to_the_weight_dtype_and_is_identity_when_it_mat
 
 
 class _FakeLinear4bit(torch.nn.Module):
-    """A stand-in for bitsandbytes `Linear4bit`, in the two ways that matter here.
-
-    bitsandbytes stores the base weight as a packed `uint8` blob
-    (`Params4bit(quant_storage=torch.uint8)`), so `_linear_boundary_dtype` finds
-    no floating-point weight and answers None. And its forward ends in
-    `bnb.matmul_4bit(...).to(inp_dtype)`, so the result carries the caller's
-    input dtype straight back out. Together those two facts are what turn a
-    float32 activation at a forced output boundary into a float32 `down_proj` /
-    `o_proj` result, and thus into changed QLoRA forward and gradient dtypes.
-    """
+    """Stand-in for bitsandbytes Linear4bit: its uint8 weight blob gives _linear_boundary_dtype no answer, and forward
+    returns the caller's input dtype, changing QLoRA dtypes."""
 
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -425,11 +364,8 @@ pass
 
 @requires_gemma3
 def test_forced_float32_mlp_downcasts_to_float16_when_4bit_weights_cannot_answer(forced_float32_patches):
-    """4bit QLoRA: no projection weight is floating point, so the boundary dtype
-    is None. The forced output boundary must still fall back to the float16 the
-    bare `.to(torch.float16)` always produced, or `down_proj` receives float32
-    and hands float32 back.
-    """
+    """4bit QLoRA has no floating-point projection weight, so the boundary dtype is None; the forced output must still
+    fall back to float16 or down_proj gets float32."""
     torch.manual_seed(0)
     mlp = gemma3.Gemma3MLP(_text_config()).to(torch.float16)
     _quantize_projections(mlp, ("gate_proj", "up_proj", "down_proj"))
@@ -492,15 +428,7 @@ def test_to_forced_output_dtype_defaults_to_float16_and_is_not_identity_on_none(
 
 
 class _QuantizedWeight(torch.Tensor):
-    """A tensor that carries a `quant_state`, the way `Params4bit` does.
-
-    bitsandbytes only fills `quant_state` in once the parameter has been moved
-    to an accelerator, so a CPU-only test cannot build a real packed weight.
-    What the helper actually reads is just `.dtype` and `.quant_state`, so a
-    tensor subclass carrying both reproduces the case exactly and keeps this
-    test running everywhere. The GPU test below asserts the same thing against
-    a real `Params4bit`.
-    """
+    """Tensor subclass carrying quant_state like Params4bit: bitsandbytes fills quant_state only on an accelerator, and the helper reads just dtype and quant_state."""
 
     quant_state = None
 
@@ -517,17 +445,8 @@ _QUANT_STORAGE_DTYPES = [torch.uint8, torch.bfloat16, torch.float16, torch.float
 @pytest.mark.parametrize("storage_dtype", _QUANT_STORAGE_DTYPES,
                          ids = lambda d: str(d).split(".")[-1])
 def test_a_quantized_weight_never_answers_whatever_its_storage_dtype_is(storage_dtype):
-    """`bnb_4bit_quant_storage` is a public knob, and it is not the compute dtype.
-
-    It defaults to uint8, which is not floating point and so was already
-    skipped. But FSDP can only shard float dtypes, so FSDP-QLoRA users are
-    told to set it to bfloat16, and `vllm_utils` and the bnb MoE loaders plumb
-    the configured value through. Then `Params4bit.weight.dtype` is bfloat16
-    while the tensor is still packed 4bit, and a plain floating-point test
-    reads a storage container as the activation dtype. `Linear4bit` returns
-    the caller's input dtype, so answering here would change QLoRA forward and
-    gradient numerics on a weight that is still quantized.
-    """
+    """bnb_4bit_quant_storage is not the compute dtype: FSDP-QLoRA users set it to bfloat16 while weights stay packed
+    4bit, so a quantized weight must never answer the boundary dtype."""
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
     quantized = _Projections(**{
         name: _Projections(weight = _QuantizedWeight(
@@ -549,14 +468,8 @@ def test_a_quantized_weight_never_answers_whatever_its_storage_dtype_is(storage_
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32],
                          ids = lambda d: str(d).split(".")[-1])
 def test_an_unquantized_weight_still_answers_and_the_skip_is_not_blanket(weight_dtype):
-    """The discriminator, asserted from the other side.
-
-    Skipping quantized weights must key off `quant_state`, not off the dtype.
-    A bfloat16 weight with no `quant_state` is an ordinary LoRA / QLoRA base
-    weight or a bf16 full finetune, and it must still answer, or a float32 full
-    finetune goes back to the "expected mat1 and mat2 to have the same dtype"
-    crash this helper exists to fix.
-    """
+    """Quantized weights are skipped by quant_state, not dtype: an unquantized bfloat16 weight must still answer, or
+    float32 full finetunes hit the mat1/mat2 dtype crash."""
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
     module = _Projections(**{
         name: torch.nn.Linear(4, 4, bias = False, dtype = weight_dtype) for name in names
@@ -574,12 +487,7 @@ def test_an_unquantized_weight_still_answers_and_the_skip_is_not_blanket(weight_
 @pytest.mark.parametrize("storage_dtype", _QUANT_STORAGE_DTYPES,
                          ids = lambda d: str(d).split(".")[-1])
 def test_a_real_bitsandbytes_params4bit_never_answers(storage_dtype):
-    """The same assertion against real bitsandbytes, not a stand-in.
-
-    bitsandbytes quantizes on the move to the accelerator, so this is where a
-    genuine packed `Params4bit` exists and where its dtype really does report
-    the storage container.
-    """
+    """Same check against a real bitsandbytes Params4bit, which quantizes on the move to an accelerator and reports the storage container as its dtype."""
     bnb = pytest.importorskip("bitsandbytes")
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
 

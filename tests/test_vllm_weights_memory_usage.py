@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""load_vllm sizes vLLM's KV cache from a weight estimate. The dense per-layer
-formula ignores MoE experts, so it put Qwen3-30B-A3B at 5 GiB instead of 57 GiB."""
+"""load_vllm sizes the KV cache from a weight estimate; the dense per-layer formula ignores MoE experts, putting Qwen3-30B-A3B at 5 GiB instead of 57 GiB."""
 
 import sys
 import os

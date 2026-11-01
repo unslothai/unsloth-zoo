@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for `finetune_last_n_layers` in FastMLXModel.get_peft_model.
-
-mlx-lm CLI defaults to num_layers=16 (lora.py:56): LoRA on the last 16 blocks
-only. unsloth-zoo historically applied LoRA to ALL layers (HF PEFT/CUDA
-parity). The paths can diverge because extra layers add LoRA modules whose
-lora_a init consumes mx.random state (shifting later-layer init) and change the
-trainable set. `finetune_last_n_layers` opts into mlx-lm semantics; the default
-stays None (all layers).
-"""
+"""finetune_last_n_layers opts into mlx-lm's last-N LoRA; default None keeps LoRA on all layers."""
 
 from __future__ import annotations
 
@@ -49,12 +41,7 @@ def test_get_peft_model_has_finetune_last_n_layers_param():
 
 
 def test_get_peft_model_passes_finetune_last_n_layers_through(monkeypatch):
-    """linear_to_lora_layers receives the right num_layers value.
-
-    Patches the loader's linear_to_lora_layers to record num_layers and
-    runs against a synthetic text model (we assert the passed value, not real
-    side effects).
-    """
+    """linear_to_lora_layers is patched to record the num_layers it gets; the test asserts that value."""
     import unsloth_zoo.mlx.loader as loader_mod
 
     class FakeLayer: pass
@@ -66,8 +53,7 @@ def test_get_peft_model_passes_finetune_last_n_layers_through(monkeypatch):
         _is_vlm_model = False
         def freeze(self): pass
         def unfreeze(self, **kwargs): pass
-        # The trainable-parameter summary at the end of get_peft_model walks
-        # these; empty trees keep the count at 0 without touching the asserts.
+        # The trainable-parameter summary at the end of get_peft_model walks these; empty trees keep the count at 0 without touching the asserts.
         def parameters(self): return {}
         def trainable_parameters(self): return {}
 

@@ -45,8 +45,8 @@ def _need_triton():
 
 
 def _ptxas_fuses_rn_mul_add():
-    # The ptxas-blackwell 12.9 bundled with Triton 3.6 (torch 2.10 / 2.11) contracts mul.rn + add.rn into FFMA2 on
-    # sm_100+ even under --fmad=false; Triton 3.7+ (ptxas 13.x) keeps them apart. One rounding instead of two.
+    # ptxas-blackwell 12.9 (Triton 3.6, torch 2.10/2.11) fuses mul.rn + add.rn into FFMA2 on sm_100+ even under
+    # --fmad=false; Triton 3.7+ (ptxas 13.x) keeps them apart.
     import triton
     version = tuple(int(v) for v in triton.__version__.split(".")[:2])
     return torch.cuda.get_device_capability()[0] >= 10 and version < (3, 7)
@@ -61,8 +61,8 @@ def test_nf4_dequant_matches_bitsandbytes_bitwise(shape, nested, dtype):
     numel = 1
     for s in shape:
         numel *= s
-    # Peak: the weight, or the 4-bit bytes and both decodes, plus bitsandbytes' workspace. The largest shape needs
-    # ~5.5 GB in fp32, so it skips only on a card that is already short (e.g. a shared 15 GB T4), never shrinks.
+    # Peak is the weight, or the 4-bit bytes plus both decodes and the bitsandbytes workspace; the largest shape needs
+    # ~5.5 GB fp32, so it skips only on a short card (e.g. a shared 15 GB T4) and never shrinks.
     need = numel * dtype.itemsize * 2 + numel // 2 + (512 << 20)
     free = torch.cuda.mem_get_info()[0]
     if free < need:
@@ -76,8 +76,7 @@ def test_nf4_dequant_matches_bitsandbytes_bitwise(shape, nested, dtype):
     assert out is not None
     assert out.shape == ref.shape and out.dtype == ref.dtype
     if dtype == torch.float16:
-        # bitsandbytes' fp16 kernel rounds a few elements one ulp differently. Compared in fp32 slices, never a full
-        # fp32 copy of both (4x the fp16 bytes).
+        # bitsandbytes' fp16 kernel rounds a few elements one ulp differently, so compare in fp32 slices, never a full fp32 copy of both (4x the fp16 bytes).
         bound = 2 ** -10 * ref.abs().max().float().item()
         flat_out, flat_ref = out.reshape(-1), ref.reshape(-1)
         step = 1 << 26

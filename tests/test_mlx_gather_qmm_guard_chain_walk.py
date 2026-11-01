@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The gather_qmm guard's chain walk must terminate against a permissive `mx`.
-
-`is_gather_qmm_nax_guard_applied` walks `_unsloth_index_original` until it reads
-None. That terminates for a real mlx function, but a stand-in that answers every
-attribute (the mlx test shim, a Mock) never yields None, and the unbounded walk
-hangs the interpreter rather than failing. This pins the bound.
-"""
+"""Pins the bound on is_gather_qmm_nax_guard_applied's walk of _unsloth_index_original: a permissive stand-in (the mlx
+test shim, a Mock) never yields None, so the walk would hang."""
 
 import threading
 
@@ -62,8 +57,7 @@ def test_guard_chain_walk_terminates_against_a_permissive_mx(monkeypatch):
     def _run():
         result["value"] = mlx_utils.is_gather_qmm_nax_guard_applied()
 
-    # Run off-thread: an unbounded walk does not raise, it never returns, so the
-    # only way to report it as a failure instead of a hung job is to stop waiting.
+    # Runs off-thread: an unbounded walk never returns rather than raising, so joining with a timeout is the only way to report a failure instead of a hang.
     worker = threading.Thread(target = _run, daemon = True)
     worker.start()
     worker.join(timeout = 10)

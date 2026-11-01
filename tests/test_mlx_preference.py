@@ -21,15 +21,9 @@ def _install_shim():
             or any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
         )
 
-    # The unsloth_zoo.mlx.* entries are saved as well as the mlx* ones, because
-    # this fixture drops them and the next importer therefore builds a NEW module
-    # object. Anything that ran earlier in this process and did
-    # `from unsloth_zoo.mlx.utils import ...` at import time keeps the OLD one, so
-    # it and the code under test end up on two copies of the same module globals:
-    # the training window one opens is invisible to the other, and a gated-delta
-    # op quietly takes the cached path instead of the VJP. Serially that never
-    # happens (alphabetical order puts this file last of the pair); under
-    # `-n N --dist loadfile` it depends on which worker draws which file.
+    # Saves unsloth_zoo.mlx.* entries too: dropping them lets the next importer build a new module, so earlier
+    # from-imports keep the old copy and gated-delta takes the cached path, not the VJP; serial runs never hit it, but
+    # under -n N --dist loadfile it depends on the worker.
     from mlx_simulation import (
         restore_modules,
         simulate_mlx_on_torch,
@@ -92,11 +86,7 @@ class CapturingTokenizer(Tokenizer):
 
 
 class SpecialTokenizer(Tokenizer):
-    """Character-level, but its add_special_tokens actually adds a special.
-
-    The tokenizers above accept the flag and ignore it, so nothing they encode
-    can tell an explicit override from the default.
-    """
+    """Character-level, but its add_special_tokens really adds a special token; the other test tokenizers ignore the flag, so overrides are indistinguishable."""
 
     bos_token = "<bos>"
     bos_token_id = 1
@@ -112,12 +102,7 @@ class SpecialTokenizer(Tokenizer):
 
 
 class DeclaredOnlyBosTokenizer(Tokenizer):
-    """Declares a bos_token_id its add_special_tokens never emits.
-
-    Phi-4-mini is the real one: bos_token_id is set, but encoding with
-    add_special_tokens=True produces no BOS, so the model's own convention is
-    to have none. Asking the id alone would put one in for DPO only.
-    """
+    """Declares a bos_token_id that add_special_tokens never emits, as Phi-4-mini does; asking for the id alone would add a BOS for DPO only."""
 
     bos_token = None
     bos_token_id = 7
@@ -130,13 +115,7 @@ class TrailingSpecialTokenizer(SpecialTokenizer):
 
 
 class TemplateScriptTokenizer(Tokenizer):
-    """Renders a row's three texts from a script and merges the given pairs.
-
-    A template can re-render the prompt's final turn once a completion follows
-    it, leaving the prompt no longer a text prefix of one branch or of either,
-    and a merge stops a character prefix from being a token prefix. Scripting
-    the renderings is the smallest fixture that reaches those branches.
-    """
+    """Scripts the three renderings and merges; a template may re-render the prompt's last turn, and a merge can break character-prefix to token-prefix equality."""
 
     def __init__(self, renders, merges=()):
         self.renders = list(renders)
@@ -606,8 +585,7 @@ SCRIPTED_ROW = {
 
 
 def test_orpo_scans_for_the_boundary_only_once_the_prompt_stops_being_a_prefix():
-    # Neither branch still starts with the rendered prompt, so a strict check
-    # would refuse a row that only has to split earlier.
+    # Neither branch still starts with the rendered prompt, so a strict check would refuse a row that only has to split earlier.
     tokenized = tokenize(
         SCRIPTED_ROW, "orpo", append_eos=False, max_length=8, max_prompt_length=4,
         tokenizer=TemplateScriptTokenizer(["abc", "aXY", "aXZ"]),
@@ -661,13 +639,7 @@ def test_the_dpo_prompt_keeps_its_bos_and_gains_no_trailing_special():
 
 
 def test_dpo_adds_no_bos_the_tokenizer_itself_would_not_emit():
-    """A declared bos_token_id is not a promise the tokenizer emits one.
-
-    DPO encodes the prompt with add_special_tokens=False and re-adds the BOS,
-    so reading bos_token_id directly would give DPO a leading token that this
-    tokenizer's SFT and ORPO paths, and TRL's own DPOTrainer, all leave out --
-    the two objectives would then disagree on the same model.
-    """
+    """bos_token_id alone does not mean BOS is emitted; DPO must not re-add a BOS that SFT, ORPO and TRL's DPOTrainer leave out, or the objectives disagree."""
     tokenizer = DeclaredOnlyBosTokenizer()
     rows = {"prompt": "ab", "chosen": "cd", "rejected": "ef"}
     dpo = tokenize(rows, "dpo", tokenizer=tokenizer, append_eos=False,
@@ -839,8 +811,7 @@ def test_dpo_label_smoothing_matches_conservative_formula():
     assert int(weight) == 1
 
 
-# Run from TRL 0.23.1's own dpo_loss, not transcribed. The fourth pair pushes
-# past 1 / beta where hinge clamps; the first three sort out of their order.
+# Run from TRL 0.23.1's own dpo_loss, not transcribed; the fourth pair pushes past 1 / beta where hinge clamps; the first three sort out of their order.
 _DPO_FIXTURE = dict(
     chosen=[-1.0, -2.5, -0.4, -0.2], rejected=[-1.8, -0.6, -2.2, -3.6],
     ref_chosen=[-1.3, -2.0, -0.9, -2.4], ref_rejected=[-1.1, -1.4, -2.6, -1.9],
@@ -2032,8 +2003,7 @@ def test_callback_requested_eval_samples_without_a_step_cadence(
      "smaller than max_seq_length"),
     ({"num_generation_prompts": 0}, True, ValueError,
      "num_generation_prompts must be at least 1"),
-    # The engine validates these itself, and both of its rejections must land at
-    # configuration time rather than at the first evaluation.
+    # The engine validates these itself; both of its rejections must land at configuration time, not at the first evaluation.
     ({"generation_max_tokens": 0}, True, ValueError,
      "generation_max_tokens is invalid"),
     ({"generation_max_tokens": 8.5}, True, TypeError,
@@ -2058,13 +2028,7 @@ def test_generate_during_eval_rejects_a_configuration_it_cannot_honour(
 
 
 def test_generation_prompt_is_the_standalone_encoding_not_the_training_boundary():
-    """A merged seam is prompt when there is no completion to merge with.
-
-    tokenize_preference_row gives that token to the response span so supervision
-    starts after the merge; generation must not inherit that boundary. ORPO is
-    the objective that still merges: DPO tokenizes each completion apart from
-    the prompt, so a seam there simply splits and never needs folding back.
-    """
+    """Generation uses the standalone prompt encoding, not the training boundary; only ORPO merges the seam, since DPO tokenizes completions apart from the prompt."""
     from unsloth_zoo.mlx.preference import (
         encode_generation_prompt, tokenize_preference_row,
     )
@@ -2164,8 +2128,7 @@ def test_unreferenced_objectives_sample_the_policy_only(
         text, expected = encode_generation_prompt(
             Tokenizer(), row, max_seq_length=64, max_new_tokens=56,
         )
-        # Token ids, not text: the engine encodes without special tokens, so
-        # text would drop what training adds. The budget bites at this length.
+        # Token ids, not text: the engine encodes without special tokens, so text would drop what training adds; the budget bites at this length.
         assert request.prompt is None
         assert tuple(request.prompt_token_ids) == expected
         assert len(request.prompt_token_ids) == 64 - 56
@@ -2177,11 +2140,7 @@ def test_unreferenced_objectives_sample_the_policy_only(
 def test_generation_samples_every_split_of_a_dict_eval_dataset(
     tmp_path, monkeypatch,
 ):
-    """A dict of splits is resolved, not iterated as prompts named by key.
-
-    Each split holds more rows than num_generation_prompts, so the per-split cap
-    has to bite for the count to come out right.
-    """
+    """A dict of eval splits is resolved per split, not iterated as keys; each split has more rows than num_generation_prompts, so the per-split cap applies."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
@@ -2200,10 +2159,7 @@ def test_generation_samples_every_split_of_a_dict_eval_dataset(
 
 @pytest.mark.parametrize("eval_steps,expected", [(0, True), (0.5, False), (2, False)])
 def test_sampling_without_a_cadence_says_so(tmp_path, capsys, eval_steps, expected):
-    """No cadence samples nothing, which is worth a word rather than silence.
-
-    eval_steps is an HF interval, so a ratio in (0, 1) is a real cadence.
-    """
+    """With no eval cadence, sampling is skipped and a notice printed; eval_steps is an HF interval, so a ratio in (0, 1) is a real cadence."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
@@ -2237,19 +2193,15 @@ def test_a_reused_trainer_does_not_report_the_previous_run_samples(
 def test_sampling_runs_in_eval_mode_and_restores_training_mode(
     tmp_path, monkeypatch,
 ):
-    """_evaluate restores training mode before sampling starts, so the sampler
-    has to enter eval mode itself or it decodes under NEFTune noise and
-    dropout -- printing text the policy does not actually produce. TRL samples
-    inside its evaluation_loop, in eval mode."""
+    """Sampling enters eval mode itself since _evaluate restores training mode first, as TRL's evaluation_loop does;
+    decoding under NEFTune noise misstates the policy."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
         _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
         args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
     )
-    # The shim's Module.eval() is a no-op with no `training` attribute, so the
-    # observable here is the call order, not the flag. The flag itself is
-    # covered on the Metal lane.
+    # The shim's Module.eval() is a no-op with no `training` attribute, so the observable is call order, not the flag; the Metal lane covers the flag.
     order = []
     _eval, _train = trainer.model.eval, trainer.model.train
     trainer.model.eval = lambda: (order.append("eval"), _eval())[1]
@@ -2267,8 +2219,7 @@ def test_sampling_runs_in_eval_mode_and_restores_training_mode(
 
 
 def test_a_failing_sampler_does_not_take_the_run_down(tmp_path, monkeypatch):
-    """Sampling is a diagnostic. A raise here used to abort training and drop
-    the evaluation that had already succeeded but was not yet logged."""
+    """Sampling is only a diagnostic, so its failure must not abort training or drop an evaluation already computed but not yet logged."""
     from unsloth_zoo.mlx import generate as generate_module
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
@@ -2278,8 +2229,7 @@ def test_a_failing_sampler_does_not_take_the_run_down(tmp_path, monkeypatch):
     )
 
     class Exploding:
-        # Not generate_batch: _run_generation_trainer substitutes its own, so a
-        # failure injected there is overwritten before the sampler ever sees it.
+        # Not generate_batch: _run_generation_trainer substitutes its own, so a failure injected there is overwritten before the sampler sees it.
         def __init__(self, *_args, **_kwargs):
             raise RuntimeError("engine out of memory")
 
@@ -2294,8 +2244,7 @@ def test_a_failing_sampler_does_not_take_the_run_down(tmp_path, monkeypatch):
 
 
 def test_prompt_preparation_runs_inside_the_rng_guard(tmp_path, monkeypatch):
-    """Building the eval batches draws from the shared RNG, so it has to run
-    inside the preservation. Falsified against a run that builds none."""
+    """Building eval batches draws from the shared RNG, so it must run inside the RNG preservation guard."""
     import random
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
@@ -2410,8 +2359,7 @@ def test_the_config_carries_every_objective_field_into_the_run(tmp_path,
 
 
 def test_eval_loss_weights_every_pair_once_across_a_ragged_tail():
-    """Three rows at batch_size 2 leave a one-pair tail. Weighting each batch
-    equally would give that tail the same say as the two pairs before it."""
+    """Eval loss weights each pair once; weighting each batch equally would give a ragged tail the same say as full batches."""
     from unsloth_zoo.mlx.preference import (
         create_preference_batch_plan, make_preference_eval_fn,
         resolve_preference_objective,
@@ -2452,8 +2400,7 @@ def test_the_orpo_logit_sum_is_accumulated_in_float32():
 
 
 def test_a_token_mean_is_taken_over_every_token_not_every_batch():
-    """Two pairs averaging 1 over two tokens then a one-pair tail averaging 10
-    over four is a mean of 7; by-pair weighting gives 4, equal weighting 5.5."""
+    """Token mean spans all tokens: two pairs averaging 1 over two tokens and a tail averaging 10 over four is 7, not 4 (by-pair) or 5.5 (equal batch)."""
     import mlx.core as mx
     from unsloth_zoo.mlx import preference as pref
     from unsloth_zoo.mlx.trainer import MLXTrainer
@@ -2508,8 +2455,7 @@ def test_an_evaluation_that_cannot_be_trusted_is_rejected_before_the_run(
 
 
 def test_the_best_metric_direction_reaches_callbacks_that_read_it(tmp_path):
-    """HF's EarlyStoppingCallback reads args.greater_is_better itself, so an
-    unresolved direction stops a run whose reward accuracy is still climbing."""
+    """HF's EarlyStoppingCallback reads args.greater_is_better directly, so an unresolved direction would stop a run whose reward accuracy is still rising."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
@@ -2521,11 +2467,7 @@ def test_the_best_metric_direction_reaches_callbacks_that_read_it(tmp_path):
 
 
 def test_sampled_text_cannot_drive_the_terminal(tmp_path, monkeypatch, capsys):
-    """Dataset prompts and model completions are untrusted text bound for a
-    terminal, and str.split() leaves ESC/BEL untouched, so an OSC sequence
-    arrived intact and a CSI erase could rewrite the log above it. Falsified
-    against the whitespace-only version: the raw escapes appear in the output.
-    """
+    """Dataset prompts and model completions are untrusted terminal text; str.split() leaves ESC and BEL intact, so raw OSC or CSI escapes must not reach output"""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
@@ -2556,11 +2498,7 @@ def test_sampled_text_cannot_drive_the_terminal(tmp_path, monkeypatch, capsys):
 
 
 def test_a_failing_decode_joins_the_rank_consensus(tmp_path, monkeypatch):
-    """A rank that unwinds never reaches the _distributed_should_stop() call
-    between the two decodes, stranding a healthy peer there, so the failing rank
-    must join a consensus first. Falsified against an unguarded decode: no
-    consensus is joined at all.
-    """
+    """A failing rank must join the _distributed_should_stop() consensus before unwinding, or a healthy peer is stranded at the call between the two decodes."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
@@ -2591,12 +2529,7 @@ def test_a_failing_decode_joins_the_rank_consensus(tmp_path, monkeypatch):
 def test_a_failed_reference_decode_publishes_no_samples(
     tmp_path, monkeypatch, capsys,
 ):
-    """A referenced run that loses its reference half skips the whole set:
-    reference=None is what ORPO and reference-free DPO publish, so the policy
-    half would read as a legitimate policy-only set, after _decode already said
-    it was skipping. Falsified against the unguarded publish: two rows arrive,
-    each with reference None.
-    """
+    """If the reference decode fails, publish no samples: reference=None is what ORPO and reference-free DPO publish, so the policy half would look legitimate."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
 
@@ -2639,9 +2572,7 @@ def test_a_failed_reference_decode_publishes_no_samples(
 
 
 def test_best_model_without_a_cadence_says_so(tmp_path, capsys):
-    """Asking for best-model selection and silently getting none is the worst
-    outcome: _best_step stays None and the restore is skipped. A callback owning
-    the cadence is legitimate, so this is a notice, not a refusal."""
+    """Best-model selection with no eval cadence leaves _best_step None and skips the restore, so a notice is printed; a callback owning the cadence stays legal."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     def _notice(eval_strategy=None, **overrides):
@@ -2665,9 +2596,7 @@ def test_best_model_without_a_cadence_says_so(tmp_path, capsys):
 def test_the_sampling_cadence_notice_understands_an_epoch_strategy(
     tmp_path, capsys,
 ):
-    """eval_strategy="epoch" is a cadence without eval_steps, so reading
-    eval_steps alone called a real cadence "no cadence". Falsified against the
-    eval_steps-only test: the notice prints for the epoch run."""
+    """eval_strategy 'epoch' is a real cadence without eval_steps, so the cadence notice must check the strategy, not only eval_steps."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
@@ -2681,10 +2610,7 @@ def test_the_sampling_cadence_notice_understands_an_epoch_strategy(
 
 
 def test_an_eval_split_is_held_to_the_length_it_declares(tmp_path, monkeypatch):
-    """len() is checked at configuration time but the plan builder iterates to
-    exhaustion, so a split claiming 2 rows and yielding 3 had all 3 scored, and
-    an endless sized iterable would hang. Falsified against the unbounded loop:
-    3 rows are scored and nothing is raised."""
+    """Eval splits are held to their declared len(): the plan builder must stop at that length, not score extra rows or hang on an endless iterable."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     class LyingSplit:
@@ -2711,10 +2637,7 @@ def test_an_eval_split_is_held_to_the_length_it_declares(tmp_path, monkeypatch):
 
 
 def test_a_step_cadence_under_eval_strategy_no_is_no_cadence(tmp_path, capsys):
-    """eval_steps > 0 under eval_strategy="no" evaluates never, so reading
-    eval_steps alone suppressed the notice for the one case it exists to report.
-    Falsified against the eval_steps-only test: nothing prints.
-    """
+    """eval_steps > 0 with eval_strategy 'no' never evaluates, so the cadence notice must check the strategy; reading eval_steps alone suppressed it."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
@@ -2729,9 +2652,7 @@ def test_a_step_cadence_under_eval_strategy_no_is_no_cadence(tmp_path, capsys):
 
 @pytest.mark.parametrize("objective", ["orpo", "dpo"])
 def test_evaluation_accepts_a_wrapped_model_output(objective):
-    """A text-only VLM load takes the preference path, and mlx-vlm wrappers return
-    a LanguageModelOutput where mlx_lm models return the array. Evaluation reads
-    the same forward the training loss does, so it has to accept both."""
+    """mlx-vlm wrappers return a LanguageModelOutput where mlx_lm returns the array; evaluation shares the training loss forward, so it must accept both."""
     from unsloth_zoo.mlx.preference import (
         create_preference_batch_plan, make_preference_eval_fn,
         resolve_preference_objective,
@@ -2838,8 +2759,7 @@ class SpelledSpecialsTokenizer(Tokenizer):
 
 
 @pytest.mark.parametrize("tokenizer,append_eos,expected_max_length,expected", [
-    # A BOS-led prompt and an EOS-ended answer both lose their token to the cut
-    # and get it back, two tokens TRL reserved no room for.
+    # A BOS-led prompt and an EOS-ended answer both lose a token to the cut and get it back, two tokens TRL reserved no room for.
     (SpelledSpecialsTokenizer(), True, 8, (1, *Tokenizer().encode("defgxxxx"), 2)),
     # With no EOS appended only the BOS comes back.
     (SpelledSpecialsTokenizer(), False, 9, (1, *Tokenizer().encode("defgxxxxx"))),
@@ -2976,8 +2896,7 @@ def test_the_kto_loss_is_trls_weighted_row_mean(loss_type, labels):
         resolve_preference_objective)
     objective = resolve_preference_objective(
         "kto", beta=0.5, loss_type=loss_type, desirable_weight=1.5, undesirable_weight=0.7)
-    # TinyModel's logits see one token, so answers starting alike would give the KL
-    # rows the completions' own log probabilities.
+    # TinyModel's logits see one token, so answers starting alike would give the KL rows the completions' own log probabilities.
     dataset = [{"prompt": f"p{i}", "completion": ("a", "bc", "def")[i], "label": label}
                for i, label in enumerate(labels)]
     plan = kto_plan(dataset, with_kl=objective.with_kl)
@@ -3101,8 +3020,7 @@ def test_the_kto_trainer_refuses_a_run_trl_would_not_train(
 
 
 class VisionModel(TinyModel):
-    """Takes the full sequence, the pixels and a mask, as an mlx-vlm model does;
-    token 64 is an image placeholder past the 64-entry output head."""
+    """Takes the full sequence, pixel_values and a mask as an mlx-vlm model does; token 64 is an image placeholder past the 64-entry output head."""
 
     extra = 0
 

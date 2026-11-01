@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for the per-machine Xet verdict.
-
-No test here touches the network: ``probe = False`` exercises the local decision path, and the one
-test that needs a probe result stubs ``_probe_cas_reachable``.
-"""
+"""Tests for the per-machine Xet verdict; none touch the network (probe = False covers the local path, and one test stubs _probe_cas_reachable)."""
 
 from __future__ import annotations
 
@@ -119,11 +115,9 @@ def test_two_failures_demote_and_a_success_recovers(monkeypatch):
 
 
 def test_a_success_racing_a_failure_cannot_fabricate_a_demotion(monkeypatch):
-    """A success RESETS the streak while a failure INCREMENTS it, so from a streak of 1 no serial
-    order reaches the threshold: (fail, ok) ends at 0, (ok, fail) ends at 1. A demotion therefore
-    proves a dropped update, costing a full day on HTTP on a machine where Xet works. The
-    interleaving is forced rather than raced, so this cannot pass by luck of timing.
-    """
+    """A success resets the streak and a failure increments it, so from a streak of 1 no serial order reaches the
+    threshold; a demotion therefore proves a dropped update, costing a day on HTTP where Xet works, so the
+    interleaving is forced, not raced."""
     import threading
 
     health.record_xet_outcome(False, "seed")           # streak = 1
@@ -138,8 +132,7 @@ def test_a_success_racing_a_failure_cannot_fabricate_a_demotion(monkeypatch):
         state = real_read()
         if threading.get_ident() == failure_thread["id"]:
             failure_has_read.set()
-            # Hand the success every chance to slip inside our read-modify-write; under the guard it
-            # cannot, so this simply times out.
+            # Gives the success thread every chance to slip into our read-modify-write; under the guard it cannot, so this wait simply times out.
             success_done.wait(1.0)
         return state
 
@@ -239,8 +232,8 @@ def test_result_is_truthy_like_a_bool(monkeypatch):
 
 
 def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
-    """An HF_ENDPOINT mirror that does not host the probe repo answers 404, which proves the endpoint
-    is REACHABLE. Treating it as "Xet unreachable" pinned every mirror user to HTTP for 24h."""
+    """A 404 from an HF_ENDPOINT mirror that lacks the probe repo proves the endpoint is reachable; treating it as
+    unreachable pinned every mirror user to HTTP for 24h."""
     import urllib.error
     import urllib.request
 
@@ -262,18 +255,14 @@ def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
 
 
 def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
-    """Nothing is sent, so a 401 only means auth was never attempted.
-
-    The 404 test cannot reach this arm: `or` short-circuits before the 401 half is evaluated.
-    `is None` below, not falsiness: the bug this guards returned False, which is falsy too.
-    """
+    """Nothing is sent, so a 401 only means auth was never attempted; the 404 test cannot reach this arm (`or`
+    short-circuits), so assert `is None`, not falsiness, since the bug returned False."""
     import urllib.error
     import urllib.request
 
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
-    # Without a discoverable token this goes vacuous on any CI runner: the old code reached its
-    # inconclusive arm whenever no credential was found.
+    # Without a discoverable token this test goes vacuous on CI, since the inconclusive arm is reached whenever no credential is found.
     monkeypatch.setenv("HF_TOKEN", "hf_dummyTokenForTestsOnly000000000000")
 
     def _raise(*args, **kwargs):
@@ -291,9 +280,7 @@ def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
 
 
 def test_probe_429_is_inconclusive_not_a_demotion(monkeypatch):
-    """Throttling is not evidence that CAS is unreachable, and anonymity invites it: the /api/
-    quota is 500 per 5min shared PER IP against 1,000 per user (huggingface.co/docs/hub/rate-limits).
-    """
+    """A 429 is throttling, not evidence CAS is unreachable; anonymous /api/ calls share a 500-per-5min quota per IP against 1,000 per user (hub rate-limits docs)."""
     import urllib.error
     import urllib.request
 
@@ -333,9 +320,8 @@ def test_probe_403_still_demotes(monkeypatch):
 
 
 def test_an_unprobed_memo_does_not_satisfy_an_explicit_probe(monkeypatch):
-    """The download path calls xet_health(probe=False) every time; memoizing that optimistic default
-    for all callers disarmed the explicit preflight for a minute, on exactly the CAS-blocked machine
-    the probe exists to catch."""
+    """Download calls xet_health(probe=False) every time, so memoizing that optimistic default disarmed the explicit
+    preflight for a minute on the CAS-blocked machines it exists to catch."""
     _big_machine(monkeypatch)
     probes: list[bool] = []
 
@@ -373,8 +359,8 @@ def test_a_real_verdict_still_short_circuits_every_caller(monkeypatch):
 
 
 def test_a_foreign_nodes_verdict_is_ignored(monkeypatch, tmp_path):
-    """HF_HOME is routinely shared across a cluster: without machine scoping, one node with blocked
-    CAS demotes every node for 24h, and no node then starts on Xet to record the clearing success."""
+    """HF_HOME is often shared across a cluster, so verdicts must be machine-scoped: one node with blocked CAS would
+    demote every node for 24h, and none could record a clearing success."""
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 
@@ -409,8 +395,8 @@ def test_the_probe_is_bounded_by_a_wall_clock(monkeypatch):
 
 
 def test_a_peer_nodes_failures_do_not_demote_this_one(monkeypatch, tmp_path):
-    """Shared HF_HOME: scoping only the READ left writes merging streaks across nodes, so a peer's
-    single failure demoted a healthy node on its own first failure."""
+    """On a shared HF_HOME, scoping only the read let writes merge streaks across nodes, so one peer's single failure
+    demoted a healthy node; the write must be scoped too."""
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 

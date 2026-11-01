@@ -14,49 +14,17 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-Patch flex_attention backward shared-memory OOM on constrained GPUs.
-
-On GPUs with limited shared memory per SM (RTX 3090/4090/5090, RTX PRO 6000,
-~100KB), the backward configs can exceed the limit for large head_dims (e.g.
-256 in Gemma3): the default BLOCK=64, num_stages=2 needs ~141KB vs ~101KB.
-
-We intercept backward config selection and add safe fallbacks. Fallbacks are only
-added when a config is estimated to exceed the limit, so a GPU with room to spare
-keeps exactly the configs upstream chose and pays no extra autotune time.
-
-The estimate is the maximum of two formulas, because each was fitted on a different
-GPU and neither generalises on its own:
-    staged ~ num_stages * max_block * head_dim * dtype_size * 2 + OVERHEAD
-    linear ~ 3.5 * max_block * head_dim * dtype_size
-The first was validated on a ~100KB-per-SM sm8x part (141,312 estimated vs 140,800
-actual, BLOCK=64/num_stages=2/head_dim=256). The second was measured on GB10
-(sm_121, torch 2.14, Triton 3.8) by forcing single configs and reading Triton's own
-"Required:": BLOCK 64 -> 114,688 and BLOCK 128 -> 229,376, IDENTICAL for num_stages
-1 and 2. So the requirement is linear in block size and, on that part, independent
-of num_stages.
-
-Taking the maximum matters in both directions. Under-estimating is fatal and silent:
-the gate does not fire, the offending config is returned untouched, and the compile
-dies with "No valid triton configs". Over-estimating only offers configs that
-Inductor discards. So the estimate is deliberately biased high, and it is never
-lower than the original formula, which means every GPU where this patch fires today
-still gets it.
-
-No-op on torch < 2.10 (no FlexBwDConfig).
-"""
+"""flex_attention backward shared-mem OOM: adds configs only when over limit; no-op on torch < 2.10."""
 
 import torch
 
 __all__ = ["patch_flex_attention_bwd_configs"]
 
-# Estimated fixed overhead from Triton runtime + small kernel buffers.
-# Derived empirically: actual_shmem(140800) - formula_base(131072) = 9728 bytes
+# Fixed Triton runtime and buffer overhead; 9728 bytes measured as 140800 actual minus 131072 base.
 _SHMEM_OVERHEAD = 10240  # 10KB, slightly conservative
 
 
-# Measured on GB10 (sm_121) against Triton's reported "Required:", and stage-independent
-# there. See the module docstring for why both this and the staged formula are kept.
+# Linear term measured on GB10 (sm_121) against Triton's Required; stage-independent there.
 _SHMEM_TILE_FACTOR = 3.5
 
 
@@ -70,30 +38,12 @@ def _dtype_size(dtype):
 
 
 def _staged_dtype_size(dtype):
-    """The dtype rule the staged formula was fitted with, kept exactly as it was.
-
-    It answers 4 for anything that is not bf16 or fp16, which includes the float8
-    dtypes -- four times their real width. That is wrong as physics and right as a
-    floor: correcting it here would drop the staged estimate for an fp8 kernel below
-    what this patch has been using, and the whole point of keeping this term is that
-    it can only ever raise the answer.
-    """
+    """Returns 4 for non-bf16/fp16 dtypes (float8 too); kept as a floor that only raises the estimate."""
     return 2 if dtype in (torch.bfloat16, torch.float16) else 4
 
 
 def _estimate_shmem(block_size, num_stages, head_dim, dtype):
-    """Estimate shared memory for a backward config, biased high on purpose.
-
-    The kernel pipelines two tensor loads (qT+dO or kT+vT). How many copies it keeps
-    live is not the same across architectures: on sm8x it scales with num_stages, and
-    on sm_121 it measurably does not. Neither formula is safe alone, so take whichever
-    is larger -- an over-estimate costs a few discarded autotune candidates, while an
-    under-estimate silently returns a config that cannot compile.
-
-    Each term keeps its own dtype rule so the maximum is a true floor over the
-    original: the staged one because it was fitted that way, the linear one because
-    it is the measured relationship and wants the real element width.
-    """
+    """Max of staged/linear shmem formulas; biased high: an underestimate returns an uncompilable config."""
     tile = block_size * head_dim
     staged = num_stages * tile * _staged_dtype_size(dtype) * 2 + _SHMEM_OVERHEAD
     linear = _SHMEM_TILE_FACTOR * tile * _dtype_size(dtype)
@@ -101,13 +51,7 @@ def _estimate_shmem(block_size, num_stages, head_dim, dtype):
 
 
 def _shmem_limit(device):
-    """The limit Triton actually enforces.
-
-    It refuses a kernel on the per-block opt-in maximum, which is SMALLER than the
-    per-SM figure on recent parts (101,376 vs 102,400 on GB10) -- and the 1KB between
-    them is enough to bless a config Triton then rejects. Take the smaller of the two,
-    and tolerate either attribute being absent on older torch.
-    """
+    """Min of per-block opt-in and per-SM smem, since Triton enforces opt-in; tolerates either attr absent"""
     props = torch.cuda.get_device_properties(device)
     limits = [
         getattr(props, name, None)
@@ -118,15 +62,7 @@ def _shmem_limit(device):
 
 
 def _generate_safe_configs(FlexBwDConfig, shmem_limit, head_dim, dtype, worst_block = 0):
-    """Candidates to offer alongside the ones upstream chose.
-
-    Every block strictly smaller than the offending one is offered, rather than only
-    those the estimate blesses. The estimate decides WHETHER to intervene, but it is a
-    model of somebody else's kernel and it should not also decide what survives:
-    Inductor's autotuner catches OutOfResources per candidate and keeps the ones that
-    compile, so offering a config that does not fit costs one discarded candidate,
-    while failing to offer one that does is the whole bug.
-    """
+    """Offer all smaller blocks, not just estimate-approved ones; Inductor drops configs that don't fit."""
     configs = []
     block = worst_block if worst_block else 256
     while block > 16:
@@ -142,10 +78,7 @@ def _generate_safe_configs(FlexBwDConfig, shmem_limit, head_dim, dtype, worst_bl
 
 
 def patch_flex_attention_bwd_configs():
-    """Patch flex_attention backward config selection to avoid shared memory OOM.
-
-    Returns True if the patch was applied, False otherwise.
-    """
+    """Patch flex_attention bwd config selection against shared memory OOM; returns True if applied."""
     try:
         from torch._inductor.template_heuristics.triton import FlexBwDConfig
     except ImportError:
@@ -211,8 +144,7 @@ def patch_flex_attention_bwd_configs():
             patched_get_flex_attn_bwd_configs._unsloth_flex_bwd = True
             return patched_get_flex_attn_bwd_configs
 
-        # Calling this twice would otherwise wrap the wrapper, so every later call
-        # would walk two copies of the same logic.
+        # Skip already-patched methods; a second wrap would make every later call walk the logic twice.
         if getattr(original_method, "_unsloth_flex_bwd", False):
             continue
         cls.get_flex_attn_bwd_configs = make_patched(original_method)

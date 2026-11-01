@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""TRL top_entropy_quantile masking and the fixed entropy bonus against TRL's own _compute_loss.
-
-TRL's GRPOTrainer._compute_loss runs unmodified on a stand-in trainer whose logprob pass returns
-fixed tensors. Unsloth's side is grpo_compute_loss through UnslothEfficientGRPO plus
-UnslothGRPOEntropyBonus, the way grpo_accumulated_loss assembles them. Loss values and the
-gradients reaching the logprobs and the entropies must match in float64.
-"""
+"""Unsloth's top_entropy_quantile mask and entropy bonus (grpo_compute_loss, UnslothGRPOEntropyBonus) must match TRL's
+unmodified _compute_loss in float64: losses and grads."""
 import inspect
 from collections import defaultdict
 from types import SimpleNamespace
@@ -175,8 +170,8 @@ def test_entropy_bonus_matches_trl(case, seed):
 
 @pytest.mark.parametrize("loss_type", ["grpo", "dapo", "cispo", "bnpo"])
 def test_bonus_weights_follow_trl_1_8_and_1_9_for_token_sum_losses(loss_type):
-    # TRL 1.8.0 / 1.9.0 GRPOTrainer._compute_loss, transcribed: cispo / dapo / vespo divided the
-    # entropy sum by the policy normalizer; the rest took the masked mean over the GA steps.
+    # TRL 1.8.0 / 1.9.0 _compute_loss transcribed: cispo / dapo / vespo divide the entropy sum by the policy normalizer;
+    # the rest take the masked mean over GA steps.
     gen = torch.Generator().manual_seed(11)
     mask = (torch.rand(4, 6, generator = gen) > 0.3).long()
     entropy_mask = torch.rand(4, 6, generator = gen) > 0.5

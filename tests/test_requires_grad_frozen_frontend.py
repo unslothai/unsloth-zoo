@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Audio towers fed through a frozen front end (Parakeet / Canary conv subsampling, wav2vec2 feature
-encoder) must not run that front end's backward: the checkpointed layers still get their gradients,
-but the front end's activations and input gradients are never kept."""
+"""Audio towers with a frozen front end (Parakeet / Canary conv subsampling, wav2vec2 feature encoder) must skip its
+backward; checkpointed layers still get gradients, but front-end activations and input gradients are never kept."""
 
 import torch
 import torch.nn as nn

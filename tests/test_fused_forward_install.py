@@ -6,12 +6,7 @@
 # by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Tests for the fused lm_head + cross_entropy auto-installer.
-
-Covers the AST rewriter (matches the canonical HF triplet, declines non-matching
-forwards), install_for_class (env opt-out, patching, _UNMATCHED, idempotency),
-and numerical equivalence of the rewritten forward vs the original.
-"""
+"""AST rewrite of canonical HF forwards, install_for_class opt-out, idempotency, and numeric parity."""
 
 from __future__ import annotations
 
@@ -41,9 +36,7 @@ device = get_device_type()
 gpu_available = device in ("cuda", "xpu")
 
 
-# Empty registries for each test, then the previous contents back. Clearing on the way out
-# dropped the entries for classes patched before this file ran while their rewritten forward
-# stayed, so a later test in the same worker could not install on them again.
+# Empties registries per test, then restores old contents; clearing on exit broke later installs.
 @pytest.fixture
 def fresh_install():
     from unsloth_zoo.fused_losses import forward_install as fi
@@ -115,8 +108,7 @@ def test_ast_rewriter_matches_keyword_form():
         and node.func.attr == "loss_function"
         for node in ast.walk(ast.parse(new_src))
     ) == 1
-    # Labels branch carries the RETURN_LOGITS opt-in; RETURN_HIDDEN_STATES is
-    # absent (handled by the compiled forward in unsloth_zoo/compiler.py).
+    # Labels branch has RETURN_LOGITS opt-in; RETURN_HIDDEN_STATES is handled in unsloth_zoo/compiler.py.
     assert "UNSLOTH_RETURN_LOGITS" in new_src
     assert "UNSLOTH_RETURN_HIDDEN_STATES" not in new_src
 
@@ -152,9 +144,7 @@ def forward(self, input_ids=None, labels=None, **kwargs):
 
 
 def test_ast_rewriter_declines_when_logits_rebound():
-    # Cohere-style `logits = logits * self.logit_scale` between lm_head and
-    # the if-labels block: removing the lm_head call would leave the
-    # rebinding referencing an undefined `logits`. The rewriter must refuse.
+    # Cohere-style logit rescale after lm_head: dropping lm_head call leaves logits undefined; refuse.
     from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
     new_src, cap = rewrite_forward_source(COHERE_REBINDING_SRC)
     assert new_src is None
@@ -178,9 +168,8 @@ def forward(self, input_ids=None, labels=None, **kwargs):
 
 
 def test_ast_rewriter_declines_when_intermediate_touches_logits():
-    # Gemma-style softcap mutates logits between lm_head and the labels-if.
-    # Wholesale rewriting would skip that step and feed un-softcapped logits
-    # to the fused loss; refuse and let the backstop handle it.
+    # Gemma-style softcap mutates logits after lm_head; a wholesale rewrite would skip it and feed uncapped logits to
+    # the fused loss, so refuse; the backstop handles it.
     from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
     new_src, cap = rewrite_forward_source(GEMMA_SOFTCAP_SRC)
     assert new_src is None
@@ -200,9 +189,7 @@ def forward(self, input_ids=None, labels=None, backbone_labels=None, **kwargs):
 
 
 def test_ast_rewriter_declines_when_labels_aliased():
-    # CSM-style: gates on `labels is not None` but passes a different
-    # aliased name to loss_function. Wholesale rewrite would forward the
-    # wrong tensor; refuse.
+    # CSM-style: gates on labels but passes an aliased name to loss_function, so refuse (wrong tensor).
     from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
     new_src, cap = rewrite_forward_source(CSM_ALIASED_LABELS_SRC)
     assert new_src is None
@@ -224,8 +211,7 @@ def forward(self, input_ids=None, labels=None, **kwargs):
 
 
 def test_ast_rewriter_declines_non_trivial_labels_branch():
-    # MoE-style auxiliary loss inside the labels branch would be silently
-    # dropped by a wholesale rewrite. The rewriter must refuse.
+    # MoE auxiliary loss in the labels branch would be silently dropped by a wholesale rewrite; refuse.
     from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
     new_src, cap = rewrite_forward_source(MULTISTMT_LABEL_BRANCH_SRC)
     assert new_src is None
@@ -248,9 +234,7 @@ def forward(self, input_ids=None, labels=None, **kwargs):
 
 
 def test_ast_rewriter_forwards_explicit_extra_kwargs():
-    # Bloom-style: loss_function gets explicit `num_items_in_batch=...` even
-    # though there's no **kwargs unpack. The rewriter must preserve that
-    # kwarg in the call to unsloth_fused_lm_head_loss.
+    # Bloom-style explicit num_items_in_batch kwarg, no **kwargs unpack: the rewrite must preserve it.
     from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
     new_src, cap = rewrite_forward_source(EXTRA_LOSS_KW_SRC)
     assert new_src is not None
@@ -309,9 +293,7 @@ def test_install_skips_ineligible_name(fresh_install, enable_env):
 
 
 def test_install_skips_for_conditional_generation(fresh_install, enable_env):
-    # *ForConditionalGeneration uses aligned labels (seq2seq); the fused
-    # kernel hardcodes a causal shift and would produce off-by-one losses.
-    # Such classes must be skipped.
+    # *ForConditionalGeneration uses aligned labels; the causal-shift kernel is off by one, so skip them.
     cls = _make_synthetic_class(CANONICAL_KW_SRC, name="SyntheticForConditionalGeneration")
     original = cls.forward
     assert fresh_install.install_for_class(cls) is False
@@ -331,10 +313,7 @@ def forward(self, input_ids=None, labels=None, **kwargs):
 
 
 def test_install_skips_composite_head(fresh_install, enable_env):
-    # BigBird-style `self.cls(...)` (BigBirdOnlyMLMHead) is a composite head,
-    # not a Linear; the adapter would crash on `lm_head.weight`. The
-    # installer must reject heads that aren't in the _LINEAR_HEAD_ATTRS
-    # allowlist.
+    # BigBird-style self.cls is a composite head, not a Linear; reject heads outside _LINEAR_HEAD_ATTRS.
     cls = _make_synthetic_class(COMPOSITE_HEAD_SRC, name="SyntheticForCausalLM")
     original = cls.forward
     assert fresh_install.install_for_class(cls) is False
@@ -514,8 +493,7 @@ def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
     ok = fresh_install.install_for_class(cls)
     assert ok is True
 
-    # The instance still binds the old forward (Python attribute lookup hits
-    # the class on call), so we re-fetch from the class.
+    # Calls cls.forward, not the instance: the instance still binds the old forward.
     fused_loss, fused_logits = cls.forward(instance, hidden, labels=labels)
     fused_loss_value = float(fused_loss.detach().cpu().item())
 
@@ -552,9 +530,7 @@ def test_fused_kernel_respects_ignore_index():
 
 
 def test_fused_kernel_accepts_int_n_items():
-    # HF Trainer / gradient accumulation passes a Python int for
-    # num_items_in_batch. The kernel must promote it to a tensor before
-    # the DataParallel .numel()/.ravel() guard.
+    # Trainer passes an int num_items_in_batch; promote to a tensor before the .numel()/.ravel() guard.
     torch = pytest.importorskip("torch")
     if not gpu_available:
         pytest.skip("fused CE kernel requires a CUDA or XPU device")
@@ -574,9 +550,7 @@ def test_fused_kernel_accepts_int_n_items():
 
 def _ce_reference(hidden, lm_head, labels, shift_labels=None, n_items=None,
                   ignore_index=-100, label_smoothing=0.0):
-    """Reference: F.cross_entropy on materialised logits. Mirrors HF
-    ForCausalLMLoss when shift_labels is supplied, otherwise does the
-    canonical causal shift itself."""
+    """F.cross_entropy on materialised logits; mirrors HF ForCausalLMLoss, shifting unless shift_labels."""
     import torch
     logits = torch.nn.functional.linear(hidden, lm_head.weight,
                                         getattr(lm_head, "bias", None))
@@ -630,8 +604,7 @@ def test_adapter_pre_shifted_tensor_matches_F_cross_entropy():
     hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
     lm_head = torch.nn.Linear(H, V, bias=False).to(device).float()
     labels = torch.randint(0, V, (B, T), device=device)
-    # Simulate trl padding_free pre-shifted target: shift labels left by 1,
-    # last position becomes ignore_index. Same shape as logits.
+    # Simulates trl padding_free: labels shifted left by 1, last position -100, same shape as logits.
     shift = torch.full_like(labels, -100)
     shift[..., :-1] = labels[..., 1:]
 
@@ -654,8 +627,7 @@ def test_adapter_shift_labels_false_matches_F_cross_entropy():
     B, T, H, V = 2, 32, 64, 128
     hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
     lm_head = torch.nn.Linear(H, V, bias=False).to(device).float()
-    # Caller hands us labels that are already pre-shifted (the bool=False
-    # contract: do not shift again, treat labels as the target tensor).
+    # Pre-shifted labels with shift False: the kernel must not shift again and uses them as the target.
     target = torch.randint(0, V, (B, T), device=device)
     target[..., -1] = -100  # canonical pre-shift fills last position
     fused = unsloth_fused_lm_head_loss(
@@ -680,8 +652,7 @@ def test_adapter_num_items_in_batch_divides_correctly():
     labels = torch.randint(0, V, (B, T), device=device)
     labels[:, :2] = -100  # pad-like prefix
 
-    # Effective token count after causal shift: only positions where the
-    # shifted target is not ignore_index count.
+    # Token count after causal shift: only positions whose shifted target is not ignore_index count.
     target = torch.full_like(labels, -100)
     target[..., :-1] = labels[..., 1:]
     n_items = int((target != -100).sum().item())
@@ -741,10 +712,7 @@ def _toy_instance(cls, dtype, V=64, H=32):
 def test_rewritten_forward_returns_real_logits_when_env_set(
     fresh_install, enable_env, monkeypatch,
 ):
-    # UNSLOTH_RETURN_LOGITS=1 with labels present: logits slot carries
-    # real lm_head output and loss is computed via self.loss_function on
-    # those materialised logits. Critically, only ONE lm_head matmul
-    # happens (no fused-kernel re-matmul).
+    # With labels, UNSLOTH_RETURN_LOGITS=1: real logits, loss via self.loss_function, one lm_head matmul.
     torch = pytest.importorskip("torch")
     if not gpu_available:
         pytest.skip("requires CUDA or XPU")
@@ -787,9 +755,7 @@ def test_rewritten_forward_returns_real_logits_when_env_set(
 def test_rewritten_forward_default_labels_branch_yields_empty_logits(
     fresh_install, enable_env, monkeypatch,
 ):
-    # Defaults (env var unset): labels branch returns EMPTY_LOGITS so we
-    # don't pay the lm_head matmul on the hot path. Byte-identical to
-    # the pre-PR behaviour.
+    # Env unset: labels branch returns EMPTY_LOGITS, skipping the lm_head matmul on the hot path.
     torch = pytest.importorskip("torch")
     if not gpu_available:
         pytest.skip("requires CUDA or XPU")

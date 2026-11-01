@@ -92,8 +92,8 @@ def _patch_post_init(cls):
 
     @functools.wraps(original)
     def __post_init__(self, *args, **kwargs):
-        # TRL resolves bf16=None to "not fp16" before the base class validates it, so normalise both
-        # before (fp16/optim) and after (TRL's resolved bf16) the original runs.
+        # TRL resolves bf16=None to not-fp16 before the base class validates it, so normalize fp16/optim before the
+        # original runs and TRL's resolved bf16 after it.
         normalize_cpu_training_arguments(self)
         result = original(self, *args, **kwargs)
         if getattr(self, "bf16", False) and not cpu_bf16_supported():
@@ -105,9 +105,9 @@ def _patch_post_init(cls):
 
 
 def _patch_cpu_fp16_accelerator(trainer_cls):
-    """accelerate turns fp16 into a silent fp32 run on CPU (no autocast, no scaler). When
-    normalize_cpu_training_arguments kept fp16 (native fp16, no native bf16), enable CPU autocast
-    and a CPU GradScaler before the model and optimizer are prepared."""
+    """accelerate turns fp16 into a silent fp32 run on CPU (no autocast, no scaler); when
+    normalize_cpu_training_arguments kept fp16 (no native bf16), enable CPU autocast and a CPU GradScaler before the
+    model and optimizer are prepared."""
     original = trainer_cls.create_accelerator_and_postprocess
     if getattr(original, "_unsloth_cpu", False):
         return
@@ -247,7 +247,18 @@ def _make_cpu_sft_trainer(base):
                 for key, value in legacy.items():
                     setattr(training_args, _LEGACY_SFT_KWARGS[key], value)
                 normalize_cpu_training_arguments(training_args)
-            super().__init__(*args, **kwargs)
+            # Configs write in-process as dataset_num_proc = 1, but datasets >= 4.1 builds a Pool(1) for it
+            # (under spawn its child re-imports an unguarded __main__): stock TRL must see None while it maps.
+            training_args = kwargs.get("args", args[1] if len(args) > 1 else None)
+            num_proc = getattr(training_args, "dataset_num_proc", None)
+            serial = isinstance(num_proc, int) and not isinstance(num_proc, bool) and 0 <= num_proc <= 1
+            if serial:
+                training_args.dataset_num_proc = None
+            try:
+                super().__init__(*args, **kwargs)
+            finally:
+                if serial:
+                    training_args.dataset_num_proc = num_proc
 
     # Pickled by reference: by value (TRL's tokenize map, dataset_num_proc > 1) fails on torch config modules.
     SFTTrainer.__module__ = __name__

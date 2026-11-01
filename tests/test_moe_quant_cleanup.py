@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Structural pins for the PR #659 cleanup (not the FP8/bnb4bit kernels):
-
-1. The unused post-load FP8 scale reattach machinery is gone.
-2. _call_with_temporary_moe_weights is unified in moe_utils (removed from
-   moe_utils_fp8 and moe_utils_bnb4bit).
-3. The PEFT bnb4bit MoE merge/unmerge patches live in moe_utils_bnb4bit,
-   not misc.py.
-"""
+"""Structural pins for PR 659 cleanup: unused FP8 scale reattach is gone; _call_with_temporary_moe_weights lives only in
+moe_utils; PEFT bnb4bit MoE patches moved from misc.py to moe_utils_bnb4bit."""
 
 from __future__ import annotations
 
@@ -47,8 +41,7 @@ def test_dead_fp8_reattach_machinery_is_gone():
 
 
 def test_moe_utils_fp8_does_not_open_safetensors_at_load_time():
-    """The deleted reattach path was the only consumer of safetensors /
-    hf_hub_download in moe_utils_fp8; nothing should reopen checkpoint shards."""
+    """moe_utils_fp8 must not open checkpoint shards at load: its only consumer, the deleted reattach path, was the sole user of safetensors and hf_hub_download."""
     from pathlib import Path
     import unsloth_zoo.temporary_patches.moe_utils_fp8 as m
     src = Path(m.__file__).read_text()
@@ -84,8 +77,7 @@ def test_peft_bnb4bit_moe_patches_live_in_moe_utils_bnb4bit():
 
 
 def test_temporary_patches_register_expected_count():
-    """Phase 3 must NOT silently drop a TEMPORARY_PATCHES.append entry.
-    moe_utils_bnb4bit now registers 3 more patches than before."""
+    """Phase 3 must not silently drop a TEMPORARY_PATCHES.append entry: moe_utils_bnb4bit now registers 3 more patches than before."""
     from unsloth_zoo.temporary_patches import moe_utils_bnb4bit
     import inspect
 
@@ -102,8 +94,7 @@ def test_temporary_patches_register_expected_count():
 
 
 def test_transformers_v5_moe_quant_gate_false_without_param_needs_quantization(monkeypatch):
-    """Transformers v4-style Bnb4BitHfQuantizer has no v5 quantization gate.
-    PR #659's v5-only patch set must not register for that API shape."""
+    """A transformers v4-style Bnb4BitHfQuantizer has no v5 quantization gate, so PR 659's v5-only MoE patch set must not register for it."""
     from transformers.quantizers import quantizer_bnb_4bit
     from unsloth_zoo.temporary_patches import common
 

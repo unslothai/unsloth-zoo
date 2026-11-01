@@ -62,8 +62,8 @@ except ImportError:
 
 
 def _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights):
-    """Packed bnb 4-bit experts: dequantize then dispatch. The Triton kernels and the per-expert loop
-    index the stack and cannot read a packed Params4bit; None otherwise."""
+    """Packed bnb 4-bit experts are dequantized then dispatched; Triton kernels and the per-expert loop index the stack
+    and cannot read a packed Params4bit; None otherwise."""
     # This Unsloth Zoo code section is licensed under AGPL3
     if _moe_uses_bnb4bit_expert_weights is None or not _moe_uses_bnb4bit_expert_weights(self):
         return None

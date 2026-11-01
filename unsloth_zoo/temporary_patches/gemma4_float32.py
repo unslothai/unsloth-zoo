@@ -75,10 +75,8 @@ def _unsloth_gemma4_ple_cast_input(module, x):
     dtype = getattr(weight, "dtype", None)
     if dtype is None or not getattr(dtype, "is_floating_point", False):
         return x
-    # Skip sub-2-byte floats (e.g. float8_e4m3fn / float8_e5m2): casting the fp32
-    # carrier down to fp8 destroys it, and fp8 matmul kernels expect a higher
-    # precision input they scale internally. getattr keeps this a no-op on older
-    # torch builds whose dtypes lack `itemsize`.
+    # Skip sub-2-byte floats such as float8 (casting the fp32 carrier to fp8 destroys it; fp8 matmuls scale internally);
+    # getattr keeps older torch dtypes without itemsize a no-op.
     if getattr(dtype, "itemsize", 2) < 2:
         return x
     return x if x.dtype == dtype else x.to(dtype)
@@ -121,15 +119,8 @@ def _is_gemma4_ple_fixed_call(node, attr, argument):
 
 
 def _gemma4_ple_validate(model_cls, method_name, targets):
-    """Classify a PLE method WITHOUT mutating anything.
-
-    Returns (status, payload) where status is one of:
-      "ALREADY"     - marker set, or every boundary is already cast (safe no-op).
-      "PATCH"       - payload carries what is needed to rewrite the method.
-      "DRIFT"       - the method exists but its source shape is unexpected.
-      "UNAVAILABLE" - the class / source cannot be introspected here.
-    payload is None unless status == "PATCH".
-    """
+    """Classifies a PLE method without mutating: ALREADY (marker set or all boundaries cast), PATCH (payload to
+    rewrite), DRIFT (unexpected source shape), UNAVAILABLE (cannot introspect); payload only for PATCH."""
     marker = f"_unsloth_ple_dtype_{method_name}_patched"
     if getattr(model_cls, marker, False):
         return "ALREADY", None
@@ -299,14 +290,12 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextScaledWordEmbedding)
 
 
-# Clamp bound so a large residual never becomes inf on the cast back. Module-level
-# keeps `torch.finfo` out of the graph.
+# Clamp bound so a large residual never becomes inf on the cast back; module-level keeps torch.finfo out of the graph.
 _GEMMA4_FP16_MAX = float(torch.finfo(torch.float16).max)
 
 
-# gemma-4-E2B has 504 RMSNorms sharing this one code object, so its Dynamo cache holds
-# the product of every axis its guards see. A pure tensor kernel instead of a bound
-# method drops three: `with_scale` (own kernel), width (Tensor view) and rank (2D).
+# gemma-4-E2B has 504 RMSNorms sharing one code object, so Dynamo caches the product of guard axes; a pure tensor kernel
+# drops with_scale (own kernel), width (Tensor view) and rank (2D).
 def _gemma4_rms_norm_scaled(hidden_states_2d, weight_1d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -315,8 +304,7 @@ def _gemma4_rms_norm_scaled(hidden_states_2d, weight_1d, eps):
     return torch.clamp(normed_fp32, min = -_GEMMA4_FP16_MAX, max = _GEMMA4_FP16_MAX).to(torch.float16)
 pass
 
-# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
-# this wrapper latches to eager instead of aborting the run.
+# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only this wrapper latches to eager instead of aborting the run.
 _gemma4_rms_norm_scaled = compile_with_eager_fallback(_gemma4_rms_norm_scaled, "Gemma4RMSNorm.forward (scaled)")
 
 
@@ -409,8 +397,7 @@ def _patch_gemma4_text_attention(module, prefix):
         past_key_values = None,
         **kwargs,
     ):
-        # Shared-KV carrier (5.5.0-5.5.1, no native shared_kv_states); a no-op
-        # for 31B / 26B-A4B where num_kv_shared_layers == 0 and no carrier is attached.
+        # Shared-KV carrier for 5.5.0-5.5.1 (no native shared_kv_states); a no-op for 31B / 26B-A4B where num_kv_shared_layers == 0 and no carrier is attached.
         carrier = getattr(self, "_unsloth_shared_kv_carrier", None)
         if carrier is not None and past_key_values is None:
             past_key_values = carrier
@@ -433,9 +420,8 @@ def _patch_gemma4_text_attention(module, prefix):
         query_states = query_states.transpose(1, 2).contiguous()
 
         if self.is_kv_shared_layer and shared_kv_states is not None:
-            # Native shared-KV (5.5.2+): dict keyed by layer_type, read even with a
-            # cache (sliding caches forget past the window). Shared layers define no
-            # k/v projections on these builds, so this branch must win.
+            # Native shared-KV (5.5.2+): dict keyed by layer_type, read even with a cache (sliding caches forget past
+            # the window); shared layers have no k/v projections, so this branch must win.
             key_states, value_states = shared_kv_states[self.layer_type]
             key_states = key_states.to(query_states.device, torch.float32)
             value_states = value_states.to(query_states.device, torch.float32)
@@ -445,8 +431,7 @@ def _patch_gemma4_text_attention(module, prefix):
             value_states = value_states.to(query_states.device, torch.float32)
         else:
             key_states = self.k_proj(hidden_states).view(hidden_shape)
-            # attention_k_eq_v global layers have v_proj is None -> value shares the
-            # raw k_proj output (before k_norm / RoPE rebind key_states below).
+            # attention_k_eq_v global layers have v_proj None, so value shares the raw k_proj output, taken before k_norm and RoPE rebind key_states.
             value_states = self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
 
             key_states = self.k_norm(key_states).to(torch.float32)
@@ -496,10 +481,9 @@ def _patch_gemma4_text_attention(module, prefix):
             )
             attn_output = torch.matmul(attn_weights, v_r).transpose(1, 2)
         elif attention_interface is not None:
-            # Registered backend (flex / flash) owns the mask semantics; pass the
-            # mask exactly as upstream prepared it (FA uses a 2-D padding mask,
-            # flex a BlockMask). Flash kernels need fp16 inputs and accumulate in
-            # float32 internally, so stability is preserved; flex handles fp32.
+            # Registered backend (flex/flash) owns mask semantics: pass the mask as upstream prepared it (2-D padding
+            # for FA, BlockMask for flex); flash kernels need fp16 inputs and accumulate in fp32 so stability holds;
+            # flex handles fp32.
             q, k, v = query_states, key_states, value_states
             if attn_impl != "flex_attention":
                 q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
@@ -560,9 +544,8 @@ def _patch_gemma4_text_attention(module, prefix):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
     pass
-    # force = True: gemma4.py's shared-KV carrier already wrapped forward as
-    # (self, *args, **kwargs); a signature check would reject this replacement (capturing
-    # the carrier's q/k-fp32-vs-v-fp16 SDPA mismatch). Carrier handled inline above, so safe.
+    # force=True: gemma4.py's shared-KV carrier already wraps forward as (self, *args, **kwargs), so a signature check
+    # would reject this; the carrier's q/k fp32 vs v fp16 SDPA mismatch is handled inline above.
     patch_function(getattr(module, prefix + "TextAttention"), "forward", forward, force = True, match_level = "relaxed")
 pass
 

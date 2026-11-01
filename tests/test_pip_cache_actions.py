@@ -14,18 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins the pip-cache restore/save contract for every workflow.
-
-`actions/setup-python`'s built-in `cache: 'pip'` saves from its post-step on
-whatever ref the job ran on, and a cache written on a pull_request ref can only
-be restored by re-runs of that same PR. So every PR writes a copy nobody else
-can read, competing for the 20 GiB budget against main's copy, which every PR
-can read. Measured 2026-08-26: 19.97 of 20 GiB, merged PR #1084 holding 6.6 GiB
-of it. Nothing failed; CI just got slower.
-
-Re-adding `cache: 'pip'` looks right in review -- it is the documented way to
-do this -- which is why it is asserted here instead.
-"""
+"""Pins the pip-cache contract: actions/setup-python's built-in cache: pip must not be used, since a pull_request-ref
+cache is restorable only by that PR and competes with main's 20 GiB budget; re-adding it looks right in review."""
 
 import re
 import fnmatch
@@ -36,8 +26,7 @@ import yaml
 
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-# Both extensions: GitHub runs `.yaml` workflows too, and a `.yml`-only glob would let a
-# writer added in one bypass every check here.
+# GitHub also runs .yaml workflows; a .yml-only glob would let a writer bypass every check.
 WORKFLOWS = sorted(
     p for ext in ("*.yml", "*.yaml") for p in (REPO / ".github" / "workflows").glob(ext)
 )
@@ -61,13 +50,8 @@ def test_workflows_exist():
 
 
 def test_no_builtin_setup_python_pip_cache():
-    """Every step in the repo, including the ones inside composite actions.
-
-    Scanning only workflows left a hole: a composite action may run setup-python
-    itself, and a PR workflow that calls it gets the same post-step writing a
-    PR-scoped cache. The save guard below does not cover it either, because that one
-    filters on the `actions/cache` spellings.
-    """
+    """Checks every step in the repo, including composite actions: a composite may run setup-python whose post-step
+    writes a PR-scoped cache, and the save guard only matches actions/cache spellings."""
     offenders = [
         f"{where}: {step.get('name') or step.get('uses')}"
         for where, step in _cache_writer_steps()
@@ -98,9 +82,7 @@ def test_restore_and_save_are_paired(path):
 
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
 def test_save_is_not_gated_behind_a_failing_step(path):
-    # A composite step with no `if:` is SKIPPED once an earlier step failed, so
-    # the save's own always() covers only what sits between the pair. Anything
-    # that can exit non-zero in there discards a completed install.
+    # Anything between restore and save that can exit non-zero discards a completed install.
     for job, steps in _jobs(path):
         restores, saves = _indices(steps, RESTORE), _indices(steps, SAVE)
         if not restores or not saves:
@@ -134,9 +116,7 @@ def test_restore_inputs_are_well_formed(path):
 
 
 def test_cache_names_are_unique_across_all_jobs():
-    # A shared name is a shared prefix, which is the defect `name` exists to
-    # avoid: the janitor cannot tell two live caches from two generations of one,
-    # and pruning then deletes a live entry.
+    # Shared names share a prefix: the janitor can't tell live caches from stale, so it prunes live ones.
     seen = {}
     for path in WORKFLOWS:
         for job, steps in _jobs(path):
@@ -152,15 +132,7 @@ def test_cache_names_are_unique_across_all_jobs():
 
 
 def test_the_janitor_ranks_the_pip_family():
-    # These keys are `pip-<name>-...`, which matched none of the janitor's
-    # original arms and fell through to `*) continue`. Left that way, every
-    # pyproject.toml edit strands the previous multi-GB entry on main unrankable
-    # -- and once every job uses the restore/save pair nothing writes a
-    # setup-python-* key again, so no pip cache would be pruned at all.
-    #
-    # Asserted by MATCHING a representative key against the arms, not by grepping
-    # for `pip-*)`: that substring already sits inside `setup-python-*-pip-*)`,
-    # so a textual check passes on the broken version and proves nothing.
+    # Pip keys hit *) continue and were never pruned; grep for pip-*) also matches setup-python arms.
     janitor = (REPO / ".github/workflows/cache-janitor.yml").read_text()
     block = re.search(r'case "\$key" in(.+?)\n\s*esac', janitor, re.S)
     assert block, "the janitor's key dispatch moved; this assertion is stale"
@@ -193,25 +165,14 @@ def test_save_runs_on_the_default_branch_only():
     assert "always()" in condition, "a later step failing must not discard a completed install"
 
 
-# --- every cache save, not just the pip pair ------------------------------------------
-#
-# The rule above covers pip-cache-save, the only PR-scoped writer when it was written but
-# not the only possible one. `gemma4-audio-probe.yml` used a bare read-write
-# `actions/cache`, whose post-step saves on whatever ref ran, so a labelled PR wrote a
-# 3.4 GB checkpoint to refs/pull/N/merge that only its own re-runs could restore. The
-# janitor could not reclaim it either: `hf-gemma4-e2b-4bit-v1` has no trailing dependency
-# hash, so generation ranking skips it. Hence a check on the shape, everywhere.
+# Bare read-write actions/cache saves on whatever ref ran (a PR wrote 3.4 GB); check every writer.
 
 _CACHE_WRITERS = ("actions/cache@", "actions/cache/save@")
 
 
 def _uses(step):
-    """A step's `uses`, casefolded: GitHub resolves owner/repo case-insensitively.
-
-    `Actions/Cache/Save@v6` is the same action, so a case-sensitive match let a writer
-    skip every guard. The ref after `@` is case-sensitive but nothing here matches on
-    it, and local `./.github/actions/...` paths are compared raw.
-    """
+    """Casefolds uses since GitHub resolves owner/repo case-insensitively, so Actions/Cache/Save@v6 must match; the ref
+    after @ is not matched on and local paths are compared raw."""
     return str(step.get("uses", "")).casefold()
 
 
@@ -263,9 +224,7 @@ def _balanced(expr):
     return depth == 0
 
 
-# A POSITIVE equality, in either quote style. `!=` must not match: a condition restricting
-# a save to everything EXCEPT main is the exact inversion of the rule, and a substring
-# search for "refs/heads/main" accepts it.
+# Positive == only, either quote style: != inverts the rule, and a substring search would accept it.
 _MAIN_ONLY = re.compile(r"github\.ref\s*==\s*['\"]refs/heads/main['\"]")
 # A whole leaf that is nothing but the equality, in either operand order.
 _LEAF_MAIN = re.compile(
@@ -275,26 +234,14 @@ _LEAF_MAIN = re.compile(
 
 
 def _restricted_to_main(expr):
-    """Whether ``expr`` can only be true on the default branch.
-
-    Evaluated over the whole boolean structure, not just the top level. `||` is how a
-    condition GAINS refs, so an OR restricts only if EVERY branch restricts; `&&` narrows,
-    so an AND restricts if ANY branch does. Parentheses matter: splitting only on
-    top-level `||` accepted `always() && (github.ref == 'refs/heads/main' ||
-    github.event_name == 'pull_request')`, which runs on every PR. Anything negated is
-    refused outright rather than reasoned about, because `!(github.ref ==
-    'refs/heads/main')` contains a positive main equality and is its exact inverse.
-    """
+    """Whether expr can only be true on the default branch: OR restricts only if every branch does, AND if any does;
+    top-level-only splitting accepted an always() && (...) expression that runs on every PR; negations are refused
+    outright, since a negated main equality is its inverse."""
     return _requires(expr, _LEAF_MAIN)
 
 
 def _requires(expr, leaf):
-    """Whether ``expr`` can only be true when a ``leaf``-shaped condition holds.
-
-    The same reading for every guard: an OR restricts only when every branch does, an
-    AND when any branch does, parens are descended, and a `!` outside a `!=` is a
-    negation we refuse to reason about.
-    """
+    """Whether expr implies leaf: OR needs every branch, AND any branch; a bare ! counts as unrestricted."""
     if not expr.strip():
         return False
 
@@ -310,10 +257,7 @@ def _requires(expr, leaf):
             return any(restricted(p) for p in ands)
         if re.search(r"!(?!=)", part):
             return False
-        # The leaf must BE the equality, not contain it. Searching inside accepted
-        # every wrapper that quotes it and inverts it: `(...) == false`, `... != true`,
-        # and `startsWith(..., 'false')`, which is true off main because GitHub casts
-        # the inner boolean to a string. A whitelist ends the class.
+        # The leaf must BE the equality: containing it let (...) == false and startsWith(..., 'false') pass.
         return bool(leaf.fullmatch(part))
 
     return restricted(expr)
@@ -327,9 +271,7 @@ def _requires(expr, leaf):
         ("github.ref != 'refs/heads/main'", False),
         ("github.ref == 'refs/heads/main' || github.event_name == 'pull_request'", False),
         ("", False),
-        # A `||` inside parens is still a `||`. Splitting only the top level read this
-        # as one alternative containing the main equality and accepted it, while it
-        # actually runs on every pull request.
+        # A || inside parens is still a ||; top-level splitting accepted it, but it runs on every PR.
         (
             "always() && (github.ref == 'refs/heads/main' "
             "|| github.event_name == 'pull_request')",
@@ -393,27 +335,15 @@ def test_no_cache_save_reaches_a_pull_request_ref():
     )
 
 
-# (workflow, job, cached path) -> the step id whose success means the directory is
-# populated. Declared, not inferred: the interval below narrows where the producer may
-# sit, but any step there satisfies it, including a deliberate no-op. A save with no
-# entry fails, which is the point -- adding one is a decision.
+# Declared not inferred: (workflow, job, path) -> step id that fills the dir; missing entry fails.
 _EXPECTED_PRODUCER = {
-    # `hf-cache`, not `~/.cache/huggingface`. The default home is where
-    # `huggingface_hub` also writes the token, so caching it persisted a credential
-    # store; the workflow now points HF_HOME at a directory it owns and caches that.
-    # The producer is unchanged: the probe step is still what fills it.
+    # Not ~/.cache/huggingface: huggingface_hub writes the token there, so caching it would persist a credential; HF_HOME points at an owned dir.
     ("gemma4-audio-probe.yml", "probe", "hf-cache"): "probe",
 }
 
 
 def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
-    """A save placed where the restore sits stores an empty directory under the key.
-
-    Splitting a read-write `actions/cache` is exactly where this goes wrong: the
-    read-write form saves from a post-step at the END of the job, so moving to
-    restore/save without also moving the save below the step that fills the directory
-    poisons the key for every later job, which then hits it and finds nothing.
-    """
+    """Saving before the filling step stores an empty dir under the key and poisons it for later jobs."""
     offenders = []
     for path in WORKFLOWS:
         for name, steps in _jobs(path):
@@ -425,14 +355,9 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                 condition = " ".join(str(step.get("if", "")).split())
                 path_saved = str((step.get("with") or {}).get("path", "")).strip()
 
-                # Strictly BETWEEN the restore of the same path and this save. Looser
-                # forms are satisfied by the wrong step: `.outputs.` matched the
-                # restore's own `cache-hit`, and "some earlier .outcome" matches the
-                # restore, so a save moved up beside it passed on an empty directory.
+                # Must sit strictly between the restore and save: looser matches hit the restore's own outputs.
                 key_saved = str((step.get("with") or {}).get("key", "")).strip()
-                # Same key AND same path. Matching on the path alone accepted a restore
-                # whose key had drifted from the save's, so every run would read one key
-                # and write another and the download would never be reused.
+                # Match key AND path: path alone accepted a restore whose key drifted, so the cache is never reused.
                 restore_at = max(
                     (
                         j for j, s in enumerate(steps[:i])
@@ -442,8 +367,7 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                     ),
                     default=None,
                 )
-                # Position -1 accepted a restore sitting BELOW its save, which writes
-                # the entry every run and reads it never.
+                # Restore below its save: entry is written every run and never read; position -1 accepted that.
                 if restore_at is None:
                     offenders.append(
                         f"{label} saves {path_saved!r} under {key_saved!r} with no "
@@ -467,11 +391,7 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                         f"satisfies the interval below while filling nothing"
                     )
                     continue
-                # Mentioning the producer is not requiring it to have SUCCEEDED.
-                # `steps.probe.outcome != 'success'` and
-                # `(steps.probe.outcome == 'success' || always())` both name it and both
-                # save when it failed, writing a half-downloaded tree under a key that
-                # is immutable once created. Read with the same rigour as the ref guard.
+                # Naming the producer doesn't require success: != 'success' and || always() save a partial tree.
                 success = re.compile(
                     rf"steps\.{re.escape(want)}\.outcome\s*==\s*['\"]success['\"]"
                 )

@@ -12,21 +12,9 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A removed PARENT package must read as upstream drift, not a broken dependency.
-
-Both drift suites decide "is this OUR target that vanished, or a dependency of
-it?" from `ModuleNotFoundError.name`. That name is the DEEPEST package that
-could not be found, so removing `transformers/models/siglip/` and then importing
-`transformers.models.siglip.modeling_siglip` reports
-`name == "transformers.models.siglip"` -- neither the full path nor the
-top-level package. Matching only those two read the removal as a broken
-dependency and skipped, so a hard-gate suite could pass with a production patch
-target gone.
-
-The predicate is tested directly rather than through the 23 callers: it is the
-whole decision, and driving it through a caller would need transformers itself
-mutilated on disk.
-"""
+"""A removed PARENT package must read as upstream drift: ModuleNotFoundError.name is the deepest missing package, so
+matching only the full path or top-level name misread the removal as a broken dependency and skipped, letting a hard
+gate pass with the target gone."""
 
 import importlib
 import pathlib
@@ -34,11 +22,8 @@ import sys
 
 import pytest
 
-# By path, not through `tests.`: this repo's `tests/` is not a package, so that
-# name binds to whatever `tests` package is importable instead. Unsloth's own
-# CI runs these files with its repo root on sys.path, and unsloth DOES ship
-# `tests/__init__.py`, so the absolute form resolved to a sibling project's
-# package and the whole module failed to collect.
+# Import by path, not via tests.: this repo's tests/ is not a package, and unsloth itself ships tests/__init__.py, so in
+# CI the absolute form resolved to a sibling project's package and failed collection.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from test_temporary_patches_exhaustive import (  # noqa: E402
@@ -61,11 +46,7 @@ def _module_not_found(name):
 
 
 def test_a_missing_parent_package_really_is_reported_as_the_parent():
-    """Anchors the premise on the live interpreter rather than on a docstring.
-
-    If CPython ever reported the full requested path here, the whole item would
-    be moot -- so this asserts the shape the fix is built on.
-    """
+    """Pins the premise on the live interpreter: ModuleNotFoundError.name is the parent package; if CPython reported the full path, the fix would be moot."""
     with pytest.raises(ModuleNotFoundError) as excinfo:
         importlib.import_module("transformers.models.unsloth_no_such_pkg.modeling_x")
     assert excinfo.value.name == "transformers.models.unsloth_no_such_pkg"
@@ -93,9 +74,8 @@ def test_every_package_prefix_counts_as_the_target(predicate, missing):
 @PREDICATES
 @pytest.mark.parametrize("missing", ["timm", "timm.data", "torchvision"])
 def test_a_broken_dependency_still_does_not_count(predicate, missing):
-    """The regression this predicate exists to prevent: gemma3n's config imports
-    `ImageNetInfo` from timm.data, which a newer timm dropped, and eight tests
-    blamed transformers for classes transformers still ships."""
+    """A broken dependency must not count as drift: gemma3n's config imports ImageNetInfo from timm.data, which newer
+    timm dropped; eight tests blamed transformers for classes it still ships."""
     assert not predicate(_module_not_found(missing), "transformers.models.gemma3n.configuration_gemma3n")
 
 

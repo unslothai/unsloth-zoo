@@ -61,9 +61,8 @@ _DELTA_BLOCK_BYTES = 64 << 20
 
 
 def _check_no_head_bias(lm_head, base_layer):
-    """Speculative losses project with the head weight only. A PEFT head whose base carries a nonzero
-    bias (a folded lora_bias after merging, or a biased head) would lose it: refuse. Checked once per
-    bias version and merge state, so the per-step call does not sync."""
+    """Speculative losses project with the head weight only, so a PEFT head whose base has a nonzero bias (folded
+    lora_bias or biased head) is refused; checked once per bias version and merge state to avoid per-step syncs."""
     bias = getattr(base_layer, "bias", None)
     if bias is None:
         return
@@ -80,16 +79,9 @@ def _check_no_head_bias(lm_head, base_layer):
 
 
 def effective_lm_head_weight(lm_head):
-    """The [V, H] matrix `lm_head(x)` actually multiplies by, for code that projects with a raw weight.
-
-    A plain Linear (or a merged / disabled PEFT LoRA layer) returns `lm_head.weight` itself. An
-    unmerged PEFT LoRA head returns base + sum of its active adapters' scaled deltas (B @ A * scaling), built once
-    without grad and cached until a weight, the active adapters or the merge state changes (the
-    target is frozen, so that is once per run). The sum is accumulated in place in the base dtype,
-    as PEFT's merge does, so the only full-size buffer kept is the result. Heads a weight-only
-    projection cannot express (DoRA and other LoRA variants, lora_bias, a nonzero lm_head bias,
-    a quantized base) raise instead of silently dropping part of the head.
-    """
+    """The [V, H] matrix lm_head(x) multiplies by: lm_head.weight for plain, merged or disabled heads, else base plus
+    scaled LoRA deltas, cached until the weight, adapters or merge state changes; DoRA, lora_bias, a nonzero bias or
+    quantized base raise."""
     lora_A = getattr(lm_head, "lora_A", None)
     get_base_layer = getattr(lm_head, "get_base_layer", None)
     if not isinstance(lora_A, torch.nn.ModuleDict) or not callable(get_base_layer):
@@ -141,8 +133,7 @@ def effective_lm_head_weight(lm_head):
     if cached is not None and cached[0] == key:
         return cached[1]
     with torch.no_grad():
-        # In place in the base dtype (PEFT's merged representation): one result buffer plus one
-        # delta at a time, not several full-size fp32 temporaries.
+        # In place in the base dtype as PEFT's merge does: one result buffer plus one delta at a time, not several full-size fp32 temporaries.
         weight = base_weight.detach().clone()
         # Rows of the [out, in] view; fan_in_fan_out heads store the transpose.
         rows_view = weight.T if getattr(lm_head, "fan_in_fan_out", False) else weight
@@ -230,8 +221,7 @@ def _store(tensor):
 
 @contextlib.contextmanager
 def capture_hidden_states(model, layer_ids = (), final = True, embed = False):
-    """Record the post-norm final hidden state (`"final"`), decoder layer outputs (`i`) and, with
-    `embed`, the embedding output (`"embed"`)."""
+    """Records the post-norm final state under 'final', decoder layer outputs by index, and the embedding output under 'embed' when embed is set."""
     parts = resolve_text_parts(model)
     backbone, layers = parts["backbone"], parts["backbone"].layers
     n_layers = len(layers)
@@ -260,8 +250,8 @@ def capture_hidden_states(model, layer_ids = (), final = True, embed = False):
         norm_fired[0] = False
 
     def backbone_hook(module, args, output):
-        # Fast forwards (e.g. Unsloth's LlamaModel) call the norm functionally, bypassing its
-        # hook; the backbone's returned last_hidden_state is post-norm in both paths.
+        # Fast forwards (e.g. Unsloth's LlamaModel) call the norm functionally and bypass its hook, so the backbone's
+        # last_hidden_state is post-norm in both paths.
         if not norm_fired[0]:
             tensor = _first_tensor(output)
             if tensor is not None:

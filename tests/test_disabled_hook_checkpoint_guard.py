@@ -14,17 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Simulation suite for unsloth-zoo PR #1145.
-
-PR #1145 routes the disabled-hook arm of `_fall_back_to_eager_on_recompile_limit`
-through `_give_up_at_compile_time`, the contract `_give_up_on_backend` already
-had. Before, that arm did `state["eager"] = True; return eager_func(...)`: never
-raised, never touched the global label sets, never restored the marker.
-
-That is shared machinery (every `fullgraph = True` patch here plus 14 sites in
-unsloth core), so the risk is NOT "does the new case work" but "does the old one
-still work". Each test is a before/after pair, hence the `IS_FIX` branches.
-"""
+"""Simulation suite for unsloth-zoo PR 1145, which routes the disabled-hook arm of
+_fall_back_to_eager_on_recompile_limit through _give_up_at_compile_time; before/after pairs (IS_FIX) check the shared
+path still works."""
 
 import sys
 from pathlib import Path
@@ -56,8 +48,7 @@ OLD_DISABLE_MSG = (
 
 @pytest.fixture(autouse=True)
 def _clean_label_state():
-    """The latch is process-global and keyed by label: without this the first
-    fallback starts every later test already eager."""
+    """The latch is process-global and keyed by label; without clearing it, the first fallback makes every later test start already eager."""
     sets = (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
             U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS)
     for s in sets:
@@ -103,8 +94,7 @@ def test_disabled_hook_outside_any_checkpoint_still_falls_back_to_eager():
 
 
 def test_first_call_refusal_inside_checkpoint_still_falls_back():
-    """Nothing compiled was packed by this label, so eager pack + eager recompute
-    agree. Raising would break every first-call user of a checkpointed region."""
+    """Nothing compiled was packed under this label, so eager pack and eager recompute agree; raising would break every first-call user of a checkpointed region."""
     U._PACKED_COMPILED_IN_CHECKPOINT = True   # a region is live
     assert LABEL not in U._COMPILED_OK_LABELS  # but WE never compiled ok
     assert _wrap(_raiser())() == "eager"
@@ -124,9 +114,8 @@ def test_an_unrelated_graph_break_still_raises():
 # R2: the new behaviour, only on the fix tree.
 
 def test_refusal_after_compiling_ok_inside_a_live_region():
-    """The bug. This label compiled fine, so a compiled pack is outstanding and
-    flipping to eager mid-region desynchronises pack and recompute. main returns
-    eager silently (corruption); fix raises, so the step ends honestly."""
+    """Bug: this label compiled ok so a compiled pack is outstanding; flipping to eager mid-region desynchronises pack
+    and recompute (corruption); main returns eager silently, the fix raises."""
     U._COMPILED_OK_LABELS.add(LABEL)
     U._PACKED_COMPILED_IN_CHECKPOINT = True
     w = _wrap(_raiser())
@@ -140,8 +129,7 @@ def test_refusal_after_compiling_ok_inside_a_live_region():
 
 
 def test_fix_records_the_latch_in_the_global_label_sets():
-    """main records nothing, hence the empty latched list in captures taken after
-    this arm fired. fix records it in both sets."""
+    """main records nothing, so captures after this arm fired show an empty latched list; the fix records the latch in both label sets."""
     _wrap(_raiser())()
     if IS_FIX:
         assert LABEL in U._LATCHED_EAGER_LABELS
@@ -151,8 +139,7 @@ def test_fix_records_the_latch_in_the_global_label_sets():
 
 
 def test_a_new_wrapper_with_a_latched_label_starts_eager():
-    """Consequence of recording the latch: a rebuilt wrapper inherits it, as for
-    the codegen arm. Intended, but more un-compilation than before, so pinned."""
+    """Recording the latch means a rebuilt wrapper inherits it, as the codegen arm does; intended, though more un-compilation than before, so pinned."""
     _wrap(_raiser())()
     second = _wrap(lambda *a, **k: "compiled-should-not-run")
     if IS_FIX:
@@ -164,8 +151,7 @@ def test_a_new_wrapper_with_a_latched_label_starts_eager():
 # R3: blast radius. Only THIS label may latch.
 
 def test_only_this_label_latches_not_every_borrower():
-    """Budget exhaustion is process wide and takes other borrowers with it; a
-    compile-time refusal is one region's, so unrelated labels keep compiling."""
+    """Budget exhaustion is process wide and takes other borrowers down; a compile-time refusal is one region's, so unrelated labels keep compiling."""
     other = "SimOther"
     for s in (U._LATCHED_EAGER_LABELS, U._RECENT_EAGER_LABELS):
         s.discard(other)
@@ -183,8 +169,7 @@ def test_only_this_label_latches_not_every_borrower():
 # R4: the marker must be restored, not leaked.
 
 def test_marker_is_restored_to_what_it_was():
-    """The arm captures the marker before the compiled call and puts it back; left
-    set, a later wrapper reads a compiled pack outstanding and ends a fine step."""
+    """The arm captures the marker before the compiled call and restores it; left set, a later wrapper would see a compiled pack outstanding and end a fine step."""
     U._PACKED_COMPILED_IN_CHECKPOINT = False
     _wrap(_raiser())()
     assert U._PACKED_COMPILED_IN_CHECKPOINT is False
@@ -232,14 +217,8 @@ def test_changed_path_has_no_platform_or_device_branch():
 
 
 def test_conservative_when_another_region_packed_compiled_this_step():
-    """The one place the fix is deliberately pessimistic.
-
-    `_PACKED_COMPILED_IN_CHECKPOINT` is global for the step and
-    `_COMPILED_OK_LABELS` sticky for the process, so this label compiling ok plus
-    ANY compiled pack under a checkpoint this step makes the arm raise, even if
-    this wrapper packed nothing here. Same trade `_give_up_on_backend` has always
-    made: ending a probably-fine step is cheap, wrong gradients are not.
-    """
+    """Deliberately pessimistic: a label that compiled ok plus any compiled pack under a checkpoint this step raises,
+    even if this wrapper packed nothing; ending a fine step is cheap, wrong gradients are not."""
     U._COMPILED_OK_LABELS.add(LABEL)          # compiled fine earlier
     U._PACKED_COMPILED_IN_CHECKPOINT = True   # some region packed compiled
     w = _wrap(_raiser())

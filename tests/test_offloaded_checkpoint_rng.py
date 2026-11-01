@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Offloaded checkpointing against the real pinned buffers: the CPU coverage keeps
-MINIMUM_SIZE above every tensor, so the D2H/H2D branch never runs there."""
+"""Offloaded checkpointing against real pinned buffers; CPU coverage keeps MINIMUM_SIZE above every tensor, so the D2H/H2D branch never runs there."""
 import pytest
 import torch
 
@@ -106,8 +105,7 @@ def test_offloaded_preserve_rng_state_false_reaches_the_function(offload_module)
 
 
 def test_offloaded_binds_tensor_keywords_after_the_rng_flag(offload_module):
-    """Reference is eager, not torch: torch's reentrant path rejects keywords
-    outright, which is what _bind_checkpoint_kwargs deliberately replaces."""
+    """Reference is eager, not torch: torch's reentrant checkpoint rejects keyword args outright, which _bind_checkpoint_kwargs deliberately replaces."""
     device = torch.device("cuda")
 
     def run(checkpoint_fn):
@@ -132,8 +130,7 @@ def test_offloaded_binds_tensor_keywords_after_the_rng_flag(offload_module):
 
 
 def test_offloaded_stays_correct_across_repeated_steps(offload_module):
-    """Backward clears FIRST_PASS and sets BACKWARD_PASS, changing which layers
-    offload next forward; one step never reaches that regime."""
+    """Backward clears FIRST_PASS and sets BACKWARD_PASS, changing which layers offload on the next forward; one step never reaches that regime."""
     device = torch.device("cuda")
     checkpoint = offload_module.unsloth_offloaded_gradient_checkpoint
 
@@ -146,9 +143,7 @@ def test_offloaded_stays_correct_across_repeated_steps(offload_module):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_offloaded_replay_keeps_the_forward_dtype(offload_module, dtype):
-    """bf16 buffers used to hand an fp16 (or fp32) activation back converted, so the
-    replay ran in another dtype than the forward and hit a matmul against the
-    layer's own weights (gpt-oss fp16: "mat1 and mat2 must have the same dtype")."""
+    """bf16 staging buffers returned fp16/fp32 activations converted, so the replay matmul failed with 'mat1 and mat2 must have the same dtype' (gpt-oss fp16)."""
     device = torch.device("cuda")
     seen = []
     weight = torch.randn(SHAPE[-1], SHAPE[-1], dtype = dtype, device = device) / 32

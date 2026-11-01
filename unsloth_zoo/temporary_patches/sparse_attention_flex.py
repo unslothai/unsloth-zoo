@@ -14,22 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Long-context sparse attention on flex attention for MiniMax M3 and DSA models.
-
-Above the indexer's selection budget, upstream eager / SDPA expand the selection into a
-dense mask and run dense masked attention. These patches keep the model's own path below
-the budget and run flex attention over a BlockMask built from the selection above it
-(unsloth_zoo.flex_attention.sparse_blocks). The indexers also score queries in chunks so
-their fp32 score buffers stay bounded.
-
-Engaged automatically on CUDA sm80+ / ROCm with Triton, bf16 / fp16, no attention dropout,
-no output_attentions, q_len >= 16, outside an enclosing torch.compile (there the model's own
-path runs). A flex failure (forward or probed backward) latches that shape class to the dense path.
-Kill switches: UNSLOTH_SPARSE_ATTN_FLEX=0, UNSLOTH_SPARSE_INDEXER_CHUNKED=0.
-The patched forwards are installed on transformers >= 5.17 when the installed source matches
-the layout they reimplement (DSA caches expanded K / V on 5.17, the latent on 5.18+);
-otherwise the model is left untouched.
-"""
+"""Flex sparse attention above the indexer budget; needs CUDA sm80+/ROCm with Triton, bf16/fp16, q_len >= 16, no dropout
+or output_attentions, outside torch.compile; failures latch to dense; UNSLOTH_SPARSE_ATTN_FLEX=0 and
+UNSLOTH_SPARSE_INDEXER_CHUNKED=0 disable; transformers >= 5.17."""
 
 __all__ = [
     "patch_minimax_m3_sparse_flex",
@@ -50,8 +37,8 @@ from unsloth_zoo.flex_attention.sparse import probe_flex_backward, sparse_indexe
 
 # family -> modeling module, bound at patch time
 _MODELING = {}
-# family -> indexer forward for calls within the budget (the exact skip, else upstream), and indexer class
-# name -> family. Module level, not class attributes: Unsloth's compiler rebuilds the classes from source.
+# Maps family to its within-budget indexer forward (exact skip, else upstream) and class name to family; module level,
+# since Unsloth's compiler rebuilds the classes from source.
 _INNER_INDEXER = {}
 _DSA_FAMILY = {"DeepseekV32Indexer": "deepseek_v32", "GlmMoeDsaIndexer": "glm_moe_dsa"}
 
@@ -61,11 +48,8 @@ def _modeling(name):
 
 
 def _indexer_base(cls, model_type, skip_forward, skip_installer):
-    """(upstream forward, forward to delegate within-budget calls to), or None.
-
-    The exact skip (sparse_attention.py) is installed first, so within the budget its
-    bitwise-identical path runs whichever patch set loads first; above the budget this module
-    takes over. Its installer only patches an upstream forward, so it no-ops on ours later."""
+    """Returns (upstream forward, forward to delegate within-budget calls to), or None; the exact skip installs first so
+    its bitwise-identical path runs whichever patch loads first, and above the budget this module takes over."""
     skip_installer()
     current = cls.forward
     if current is skip_forward:
@@ -116,8 +100,8 @@ def _flex_or_none(kind, label, fn, query, key, value, *args):
         probe_flex_backward(_sb._failure_key(kind, query, key, value), fn, args)
         return fn(*args)
     except Exception as error:
-        # A failure under CUDA graph capture has already invalidated it: the dense path cannot rescue the
-        # capture, and the shape class is not at fault, so nothing is latched.
+        # Under CUDA graph capture a failure has already invalidated the graph and the dense path cannot rescue it; the
+        # shape class is not at fault, so nothing is latched.
         if query.is_cuda and torch.cuda.is_current_stream_capturing():
             raise
         _sb.record_failure(kind, query, key, value, error)
@@ -125,9 +109,8 @@ def _flex_or_none(kind, label, fn, query, key, value, *args):
         return None
 
 
-# Inside Unsloth's decoder-layer compile the mask build + flex call run outside the graph (one break per
-# layer, like its flex split mode): built inside a larger graph they miscompiled. Within the budget nothing
-# leaves the graph.
+# Inside Unsloth's decoder-layer compile, the mask build and flex call run outside the graph (one break per layer, like
+# its flex split mode), since inside a larger graph they miscompiled; within the budget nothing leaves.
 _flex_or_none_outside = torch.compiler.disable(_flex_or_none)
 _minimax_select_outside = torch.compiler.disable(_sb.minimax_m3_select_blocks)
 _dsa_select_outside = torch.compiler.disable(_sb.dsa_select_topk)

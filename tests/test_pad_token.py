@@ -7,9 +7,8 @@ import os
 
 import pytest
 
-# Load pad_token.py directly from its file so the test stays truly offline: it
-# does not run unsloth_zoo/__init__.py (which pulls the full stack and can fail
-# without the companion unsloth package installed).
+# Load pad_token.py directly from its file so the test stays truly offline; importing unsloth_zoo/__init__.py pulls the
+# full stack and can fail without the companion unsloth package.
 _PAD_TOKEN_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "unsloth_zoo", "pad_token.py",
@@ -39,8 +38,7 @@ class FakeTokenizer:
         self._vocab = dict(vocab)
         self.pad_token = pad_token
         self.eos_token = eos_token
-        # added_tokens_decoder maps id -> AddedToken; tokens in non_special are
-        # ordinary add_tokens() entries (special=False), the rest are special.
+        # added_tokens_decoder maps id to AddedToken; tokens in non_special are ordinary add_tokens() entries (special=False), the rest are special.
         added = added if added is not None else list(vocab)
         non_special = set(non_special)
         self.added_tokens_decoder = {
@@ -127,9 +125,8 @@ def test_pad_equals_eos_picks_distinct_reserved():
 
 @pytest.mark.parametrize("wrapped", [False, True])
 def test_whisper_uses_existing_config_pad_token(wrapped):
-    # Whisper large-v3's tokenizer aliases pad/eos/unk to 50257 while its model
-    # config declares the existing empty token at 50256 as pad. Align to the
-    # config without adding a random token or resizing the vocabulary.
+    # Whisper large-v3's tokenizer aliases pad/eos/unk to 50257 while its config declares the empty token at 50256 as
+    # pad; align to the config without adding a random token or resizing the vocabulary.
     tok = FakeTokenizer(
         {"": 50256, "<|endoftext|>": 50257},
         pad_token="<|endoftext|>",
@@ -207,8 +204,8 @@ def test_whisper_does_not_use_config_pad_when_it_is_in_eos_list():
 
 @pytest.mark.parametrize("is_encoder_decoder", [True, False])
 def test_encoder_decoder_declaring_pad_equal_eos_is_kept(is_encoder_decoder):
-    # Whisper tiny..large-v2 and large-v3-turbo declare pad_token_id == eos_token_id in
-    # their own config, with nothing else to reuse; they must load unchanged (#2726).
+    # Whisper tiny..large-v2 and large-v3-turbo declare pad_token_id == eos_token_id in their config with nothing else
+    # to reuse; they must load unchanged (issue 2726).
     tok = FakeTokenizer({"<|endoftext|>": 50257}, pad_token="<|endoftext|>", eos_token="<|endoftext|>")
     tok.unk_token = "<|endoftext|>"
     cfg = type(
@@ -263,9 +260,8 @@ def test_encoder_decoder_exemption_needs_a_valid_config_declared_alias(pad_id, e
 
 
 def test_config_declared_pad_used_regardless_of_model_type():
-    # The config-declared-pad rescue is model-type agnostic: any model whose config
-    # declares a valid, distinct pad id pointing at an existing token gets it reused,
-    # so a non-string / non-whisper model_type must NOT fall back to adding a token.
+    # The config-declared pad rescue is model-type agnostic: a valid distinct config pad id is reused, so a non-string
+    # or non-whisper model_type must not fall back to adding a token.
     tok = FakeTokenizer(
         {"": 50256, "<|endoftext|>": 50257},
         pad_token="<|endoftext|>",
@@ -290,9 +286,8 @@ def test_config_declared_pad_used_regardless_of_model_type():
 
 
 def test_non_whisper_model_reuses_config_declared_pad():
-    # Generalization: a non-whisper model whose tokenizer aliases pad to eos but whose
-    # config declares a valid distinct pad id (pointing at an existing, non-reserved
-    # token the search families do not recognise) reuses it instead of adding a token.
+    # Non-whisper model: tokenizer aliases pad to eos, so reuse the config's valid distinct pad id (an existing token
+    # the search families do not recognise) instead of adding one.
     tok = FakeTokenizer(
         {"<|end|>": 7, "<extra_0>": 3},
         pad_token="<|end|>",
@@ -317,10 +312,7 @@ def test_non_whisper_model_reuses_config_declared_pad():
 
 
 def test_valid_pad_in_generation_stop_list_is_left_alone():
-    # Qwen2/2.5 regression: the tokenizer pads with <|endoftext|> (a distinct, valid pad)
-    # while its generation config lists that id as a SECONDARY stop token alongside the
-    # real training eos <|im_end|>. A generation stop id is not the training eos, so the
-    # pad must NOT be "healed" - this stays a no-op.
+    # Qwen2/2.5 regression: a valid distinct pad <|endoftext|> that is also a secondary generation stop id (not the training eos <|im_end|>) must not be healed.
     tok = FakeTokenizer(
         {"<|endoftext|>": 151643, "<|im_end|>": 151645, "<|vision_pad|>": 151654},
         pad_token="<|endoftext|>",
@@ -355,9 +347,8 @@ class _NoEosIdTokenizer(FakeTokenizer):
 
 @pytest.mark.parametrize("cls", [FakeTokenizer, _NoEosIdTokenizer])
 def test_config_declared_pad_never_re_aliases_eos(cls):
-    # A config that declares pad == eos must never be honoured - that is the very bug
-    # being repaired. Caught by id normally, and by token name when the tokenizer hides
-    # eos_token_id (where the id check alone would miss it).
+    # A config declaring pad == eos must never be honoured (the bug being repaired); caught by id, or by token name when
+    # the tokenizer hides eos_token_id, where the id check alone would miss it.
     tok = cls({"</s>": 2, "<s>": 1}, pad_token="</s>", eos_token="</s>")
     cfg = type("Cfg", (), {"vocab_size": 100, "pad_token_id": 2})()
 
@@ -432,8 +423,7 @@ def test_zero_token_candidate_does_not_crash():
 
 
 def test_text_model_pad_equals_eos_uses_modality_pad_when_only_option():
-    # Qwen3-Base: pad == eos == <|endoftext|> and only a modality pad available ->
-    # use it instead of adding/raising (the #4104 / Qwen3-GRPO load crash).
+    # Qwen3-Base: pad == eos == <|endoftext|> with only a modality pad available; use it instead of adding or raising (issue 4104: Qwen3-GRPO load crash).
     tok = FakeTokenizer({"<|endoftext|>": 0, "<|vision_pad|>": 5},
                         pad_token="<|endoftext|>", eos_token="<|endoftext|>")
     res = fix_pad_token(tok)
@@ -442,9 +432,8 @@ def test_text_model_pad_equals_eos_uses_modality_pad_when_only_option():
 
 
 def test_out_of_range_pad_is_repicked_when_model_known():
-    # pad looks fine (not eos, not vision) but its id is past the model vocab,
-    # e.g. an earlier model-less swap picked a high-id added token. The
-    # model-aware call must catch it and re-pick an in-range reserved token.
+    # pad is not eos or vision but its id is past the model vocab (e.g. an earlier model-less swap picked a high-id
+    # added token); the model-aware call must re-pick an in-range reserved token.
     vocab = {
         "<|eot_id|>": 0,                       # eos
         "<|reserved_special_token_0|>": 100,   # in-range reserved
@@ -473,8 +462,7 @@ def test_vision_pad_kept_regardless_of_model_type():
 
 
 def test_unk_token_fallback_when_no_reserved():
-    # Llama-2 style: no pad and no reserved-token family, but <unk> exists, so
-    # reuse it rather than hard-failing (matches the original patch_tokenizer).
+    # Llama-2 style: no pad and no reserved-token family, but <unk> exists, so reuse it rather than hard-failing (matches the original patch_tokenizer).
     tok = FakeTokenizer({"<s>": 1, "</s>": 2, "<unk>": 0},
                         pad_token = None, eos_token = "</s>")
     tok.unk_token = "<unk>"
@@ -503,8 +491,7 @@ def test_pad_name_fallback_ignores_bare_word_token():
 
 
 def test_bare_word_pad_name_not_promoted_when_only_option():
-    # pad == eos and the only "*pad*" token is a bare word -> do not promote it;
-    # with allow_add=False the repair defers and leaves pad unchanged.
+    # pad == eos and the only *pad* token is a bare word, so do not promote it; with allow_add=False the repair defers and leaves pad unchanged.
     tok = FakeTokenizer({"<|endoftext|>": 0, "keypad": 5},
                         pad_token = "<|endoftext|>", eos_token = "<|endoftext|>")
     res = fix_pad_token(tok, allow_add = False)
@@ -513,8 +500,7 @@ def test_bare_word_pad_name_not_promoted_when_only_option():
 
 
 def test_non_special_fim_pad_is_eligible():
-    # A pipe-wrapped FIM pad is a valid replacement even when the tokenizer marks it
-    # special=False (Qwen does), since eligibility is by sentinel form, not the flag.
+    # A pipe-wrapped FIM pad is a valid replacement even when the tokenizer marks it special=False (Qwen), since eligibility is by sentinel form, not the flag.
     tok = FakeTokenizer({"<|endoftext|>": 0, "<|fim_pad|>": 6},
                         pad_token = "<|endoftext|>", eos_token = "<|endoftext|>",
                         non_special = ["<|fim_pad|>"])
@@ -523,8 +509,7 @@ def test_non_special_fim_pad_is_eligible():
 
 
 def test_composite_model_text_vocab_size_is_used_for_pad_range():
-    """Sesame CSM: config.vocab_size is the audio codebook (2051) while the text
-    tokenizer holds 128256 ids and declares pad_token_id = 128004."""
+    """Sesame CSM: config.vocab_size is the audio codebook (2051) while the text tokenizer holds 128256 ids and declares pad_token_id = 128004."""
     tok = FakeTokenizer(
         {"<|end_of_text|>": 128001, "<|finetune_right_pad_id|>": 128004},
         pad_token="<|end_of_text|>",

@@ -6,14 +6,9 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Pure planning for bounded ``mx.compile`` signatures.
-
-Finite datasets are planned whole; unsized streams widen onto an endpoint grid
-(anchored at ``max_seq_length`` for text, anchor-free for post-expansion VLM).
-
-The cap here counts application-visible callable signatures. It is not an MLX
-compiler-cache count and is not an estimate of Metal resources.
-"""
+"""Pure planning for bounded mx.compile signatures; finite datasets planned whole, unsized streams widen onto an
+endpoint grid (anchored at max_seq_length for text, anchor-free for post-expansion VLM); the cap counts
+application-visible signatures, not MLX compiler-cache counts or Metal resources."""
 
 from __future__ import annotations
 
@@ -38,8 +33,7 @@ DDP_LOCAL_GRAD_SCOPE = "ddp_local_grad"
 STREAM_GRID_FLOOR_WIDTH = 2
 STREAM_GRID_LINEAR_STEP = 32
 STREAM_GRID_ALIGNMENT = 8
-# Log-uniform mean quadratic overhead (r^2 - 1) / (2 ln r) - 1 = 5.04% at 21/20;
-# exact rationals keep the sequence identical across ranks.
+# Log-uniform mean quadratic overhead (r^2 - 1) / (2 ln r) - 1 is 5.04% at 21/20; exact rationals keep the sequence identical across ranks.
 STREAM_GRID_RATIO = Fraction(21, 20)
 
 
@@ -141,9 +135,7 @@ class StreamShapeGuardReport:
 
 
 class StreamShapeGrid:
-    """Endpoint grid: ``x -> max(x + step, x * ratio)``, published as
-    ``1 + alignment * ceil(x / alignment)``; ``anchor`` terminates it, else it grows lazily.
-    """
+    """Endpoint grid x -> max(x + step, x * ratio), published as 1 + alignment * ceil(x / alignment); anchor terminates it, else it grows lazily."""
 
     __slots__ = ("_anchor", "_ratio", "_carried", "_endpoints", "_closed")
 
@@ -231,11 +223,9 @@ def stream_phase_count(compile_scope, gradient_accumulation_steps):
 
 
 def stream_exact_ceiling(grid, cap, phases_per_endpoint=1, in_flight=0):
-    """Signatures a stream may compile exact before widening; ``None`` widens from the first batch.
-
-    Staging precedes admission, so a synchronous run compiles ceiling + 1 exact
-    signatures; ``in_flight`` covers text prefetch batches staged ahead.
-    """
+    """Exact signatures a stream may compile before widening, None widens from the first batch; staging precedes
+    admission, so a synchronous run compiles ceiling + 1 exact signatures; in_flight covers text prefetch batches
+    staged ahead."""
     cap = int(cap)
     phases = max(1, operator.index(phases_per_endpoint))
     ceiling = min(SMALL_EXACT_SIGNATURE_THRESHOLD, cap // 4)
@@ -861,14 +851,9 @@ def materialize_text_shape_frontier(
 
 
 def select_text_shape_padding_budget(frontier, *, exact_signature_threshold=None):
-    """Select the smallest retained snapshot within both policy budgets.
-
-    ``exact_signature_threshold`` widens the exact fast-path: raw catalogs at
-    or below it stay exact (raw widths, zero padding). It may only widen the
-    default, since the frontier holds no bounded points below it. VLM
-    schedules pass the automatic ceiling because padding there buys no
-    compile reuse.
-    """
+    """Selects the smallest retained snapshot within both budgets; exact_signature_threshold keeps catalogs at or below
+    it exact (no padding) and may only widen the default, since the frontier holds no bounded points below it; VLM
+    passes the automatic ceiling, as padding buys no compile reuse."""
 
     if not isinstance(frontier, TextShapeFrontier):
         raise TypeError("frontier must be a TextShapeFrontier")

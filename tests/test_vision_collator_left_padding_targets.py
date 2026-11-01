@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A left-padded batch must train on the same targets as its rows collated alone
-(batch size 2 == 2 accumulation steps of batch size 1). CPU only, fake processor.
-"""
+"""A left-padded batch must train on the same targets as its rows collated alone (batch size 2 equals 2 accumulation
+steps of batch size 1); CPU only, fake processor."""
 
 import pytest
 import torch

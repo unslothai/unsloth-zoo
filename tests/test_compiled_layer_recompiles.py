@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""One compiled decoder-layer graph serves every layer and every sequence length.
-
-Each case runs 10 layers (own parameters) at 10 different sequence lengths through one compiled
-function and counts Dynamo frames: at most 2 (the first static compile and its dynamic promotion).
-Before the fixes every layer compiled its own graph: id() of a layer's expert parameter
-(ID_MATCH guard), a lazily assigned module global, and the router_logits list length.
-"""
+"""One compiled decoder-layer graph serves every layer and sequence length, capped at 2 Dynamo frames; per-layer
+recompiles came from an id() guard on expert params, a lazy global, and router_logits length."""
 
 import pytest
 import torch

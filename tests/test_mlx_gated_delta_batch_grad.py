@@ -14,29 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Batched gradient-parity regression test for the gated-delta custom VJP.
-
-Guards the fix from #776: the `_chunked_vjp` backward used to accumulate
-per-step gradients with `d_x = d_x.at[:, t].add(...)`. On the MLX 0.31.2 Metal
-backend that scatter-add reads the update with a wrong batch stride, silently
-corrupting `d_q/d_k/d_v/d_g/d_beta` for every batch row past index 0 (only with
-batch size > 1; row 0 stays correct). The fix collects per-step grads in lists,
-reverses them after the reverse-time loop, and `mx.stack`s them.
-
-The committed `test_mlx_gated_delta.py` only checks finite gradients at B = 1, so
-it passes on both the buggy and fixed code. These tests instead pin the custom
-VJP against a plain autodiff reference (`mx.value_and_grad` of the unrolled
-recurrence) at B > 1, which is exactly the failure surface:
-
-  * on Metal, the pre-fix code fails the parity assertion (corrupt rows > 0);
-  * on any backend, a misordered stack (e.g. a dropped `reverse()`) or a
-    reintroduced scatter-add also fails it.
-
-These run against a REAL `mlx` install (Apple Silicon Metal, or Linux CPU/CUDA
-if `mlx` is present); they skip where a real `mlx` is unavailable, including
-under the torch shim that `test_mlx_gated_delta.py` registers into `sys.modules`
-(the shim is detected and rejected). Target runtime is a few seconds.
-"""
+"""Gated-delta VJP grads match autodiff at B>1; issue 776 scatter-add read a wrong batch stride on MLX 0.31.2 Metal,
+corrupting rows past 0; needs real mlx, torch shim rejected."""
 
 from __future__ import annotations
 
@@ -46,17 +25,12 @@ import pytest
 
 try:
     import mlx.core as mx
-    # Require a REAL mlx runtime: reject the torch shim (tests/mlx_simulation),
-    # which test_mlx_gated_delta.py registers into sys.modules. Under the shim
-    # these tests would exercise the custom-function/functorch path instead of
-    # the real Metal/CPU/CUDA backend (and are flaky there), so skip cleanly.
+    # Needs real Metal/CPU/CUDA mlx: the torch shim (tests/mlx_simulation) routes to functorch, so skip.
     _HAS_MLX = "mlx_simulation" not in (getattr(mx, "__file__", "") or "")
 except Exception:
     _HAS_MLX = False
 
-# Import the module under test only when a real mlx is present, and OUTSIDE the
-# guard above: an import-time regression in gated_delta_vjp must fail loudly
-# here rather than be silently swallowed into a skip.
+# Import gated_delta_vjp only with real mlx, outside the guard, so import regressions fail loudly.
 if _HAS_MLX:
     from unsloth_zoo.gated_delta_vjp import gated_delta_ops_efficient, _gated_delta_step
 
@@ -107,12 +81,7 @@ def _make_inputs(B, T, Hk, Dk, Hv, Dv, vectorized_gating, with_mask, identical_r
 
 
 def _plain_reference(q, k, v, g, beta, mask):
-    """Plain unrolled recurrence (autodiff ground truth).
-
-    Mirrors gated_delta_ops_efficient's preprocessing (GQA head repeat + zero
-    initial state) but with no custom VJP and no chunking, so MLX autodiff
-    differentiates it directly.
-    """
+    """Autodiff ground truth: unrolled recurrence, no custom VJP or chunking; GQA repeat and zero state."""
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
     qr, kr = q, k
@@ -145,8 +114,7 @@ def _efficient(q, k, v, g, beta, mask):
 
 
 def _rel_l2(a, b):
-    # Keep the reduction in MLX and sync once: avoids a device-to-host transfer
-    # per gradient tensor.
+    # Keep the reduction in MLX and sync once: avoids a device-to-host transfer per gradient tensor.
     num = sum(mx.sum((x.astype(mx.float32) - y.astype(mx.float32)) ** 2) for x, y in zip(a, b))
     den = sum(mx.sum(y.astype(mx.float32) ** 2) for y in b)
     return ((num ** 0.5) / (den ** 0.5 + 1e-12)).item()
@@ -154,8 +122,7 @@ def _rel_l2(a, b):
 
 _NAMES = ("q", "k", "v", "g", "beta")
 
-# B>1, both gating forms, GQA on/off, single- and multi-chunk (CHUNK_SIZE=min(64,T)),
-# and masked/unmasked.
+# Parity cases cover B>1, both gating forms, GQA on and off, single- and multi-chunk (CHUNK_SIZE=min(64,T)), and masked and unmasked.
 _PARITY_CASES = [
     (B, T, gqa, mask_on, vec)
     for B in (2, 3, 4)
@@ -172,11 +139,7 @@ _PARITY_CASES = [
 @mlx_only
 @pytest.mark.parametrize("B,T,gqa,mask_on,vec", _PARITY_CASES)
 def test_batched_grad_matches_plain_recurrence(B, T, gqa, mask_on, vec):
-    """Custom-VJP gradients must match plain-autodiff gradients for B > 1.
-
-    Pre-#776 on Metal this fails: rows > 0 carry corrupt gradients from the
-    wrong-batch-stride scatter-add.
-    """
+    """Custom-VJP grads match plain autodiff at B > 1; pre-fix scatter-add corrupted rows > 0 on Metal."""
     Hk = 2
     Hv = Hk * (2 if gqa else 1)
     Dk = Dv = 16
@@ -194,11 +157,7 @@ def test_batched_grad_matches_plain_recurrence(B, T, gqa, mask_on, vec):
 @mlx_only
 @pytest.mark.parametrize("gqa,vec", list(itertools.product([False, True], [False, True])))
 def test_identical_rows_give_identical_grads(gqa, vec):
-    """With identical batch rows, every row's gradient must be identical.
-
-    The pre-#776 bug corrupted only rows > 0 (row 0 stayed correct), so identical
-    inputs produced row-dependent gradients; here the per-row spread must be ~0.
-    """
+    """Identical batch rows must give identical grads (spread ~0); pre-fix bug corrupted only rows > 0."""
     B, T = 4, 24
     Hk = 2
     Hv = Hk * (2 if gqa else 1)

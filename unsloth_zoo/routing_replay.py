@@ -507,13 +507,22 @@ def _signature_projection(width, device):
     return projection
 
 
-def _projection_impl(x: torch.Tensor) -> torch.Tensor:
-    # A copy: a custom op may not return a tensor it does not own (the cached projection).
-    return _signature_projection(x.shape[-1], x.device).clone()
+def _project(x):
+    # Chunked to bound the fp32 upcast.
+    projection = _signature_projection(x.shape[-1], x.device)
+    return torch.cat([
+        x[a : a + _SIGNATURE_CHUNK].float() @ projection
+        for a in range(0, x.shape[0], _SIGNATURE_CHUNK)
+    ])
 
 
-def _projection_fake(x):
-    return x.new_empty((x.shape[-1], 2), dtype = torch.float32)
+def _signature_impl(x: torch.Tensor) -> torch.Tensor:
+    # Opaque: the seeded Generator is untraceable and the chunk loop would specialise on token count.
+    return _project(x)
+
+
+def _signature_fake(x):
+    return x.new_empty((x.shape[0], 2), dtype = torch.float32)
 
 
 def _input_signature(args, tokens):
@@ -526,14 +535,7 @@ def _input_signature(args, tokens):
     # Autocast would run the projection in bf16 / fp16 and merge nearby inputs.
     with torch.no_grad(), torch.autocast(device_type = x.device.type, enabled = False):
         x = x.detach().reshape(tokens, -1)
-        # Fullgraph cannot create the seeded Generator: the opaque op builds the projection.
-        projection = _PROJECTION_OP(x) if torch.compiler.is_compiling() \
-            else _signature_projection(x.shape[-1], x.device)
-        # Chunked so the fp32 upcast stays bounded for long sequences.
-        return torch.cat([
-            x[a : a + _SIGNATURE_CHUNK].float() @ projection
-            for a in range(0, tokens, _SIGNATURE_CHUNK)
-        ])
+        return _SIGNATURE_OP(x) if torch.compiler.is_compiling() else _project(x)
 
 
 def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
@@ -559,6 +561,9 @@ def _recompute_impl(
     ids2: torch.Tensor, signature: typing.Optional[torch.Tensor],
     layer_input: typing.Optional[torch.Tensor], layer_index: int,
 ) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    if _STATE.pending:
+        # Run time: a non-reentrant recompute stops early, so a traced assignment would never run.
+        _STATE.recomputed = True
     picked = _pick_recorded(layer_index, ids2, signature, layer_input) if _STATE.pending else _NATURAL
     if picked is _NATURAL:
         return _natural_impl(ids2)
@@ -878,7 +883,7 @@ def _register_op(name, impl, fake):
 
 _LAYER_INPUTS_OP = None
 _IDENTITY_MASK_OP = None
-_PROJECTION_OP = None
+_SIGNATURE_OP = None
 _RECOMPUTE_OP = None
 _NATURAL_OP = None
 
@@ -887,13 +892,13 @@ def _layer_inputs_op():
     # data_ptr() is untraceable and fullgraph forbids breaks: opaque ops, registered eagerly. Returning
     # the addresses lets the router hook read them in-graph (not frozen at trace time) and keeps the op
     # alive. Matching is a second op: no CPU kernels for Inductor to compile inside a GPU graph.
-    global _LAYER_INPUTS_OP, _IDENTITY_MASK_OP, _PROJECTION_OP, _RECOMPUTE_OP, _NATURAL_OP
+    global _LAYER_INPUTS_OP, _IDENTITY_MASK_OP, _SIGNATURE_OP, _RECOMPUTE_OP, _NATURAL_OP
     if _LAYER_INPUTS_OP is None:
         _LAYER_INPUTS_OP = _register_op("routing_replay_input_addresses", _layer_inputs_impl, _layer_inputs_fake)
     if _IDENTITY_MASK_OP is None:
         _IDENTITY_MASK_OP = _register_op("routing_replay_identity_mask", _identity_mask_impl, _identity_mask_fake)
-    if _PROJECTION_OP is None:
-        _PROJECTION_OP = _register_op("routing_replay_signature_projection", _projection_impl, _projection_fake)
+    if _SIGNATURE_OP is None:
+        _SIGNATURE_OP = _register_op("routing_replay_input_signature", _signature_impl, _signature_fake)
     if _RECOMPUTE_OP is None:
         _RECOMPUTE_OP = _register_op("routing_replay_recomputed_routes", _recompute_impl, _recompute_fake)
     if _NATURAL_OP is None:

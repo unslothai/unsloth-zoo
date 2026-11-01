@@ -98,8 +98,7 @@ def _experts(dtype, num_experts = 4, hidden = 16, intermediate = 16):
     experts.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * intermediate, hidden).to(dtype))
     experts.down_proj = nn.Parameter(torch.randn(num_experts, hidden, intermediate).to(dtype))
     experts.act_fn = F.silu
-    # Multiples of 16, or forward_triton_grouped_gemm routes to the native fallback (#2057) and
-    # these tests no longer reach the Triton path they are about.
+    # Dims must be multiples of 16, else forward_triton_grouped_gemm routes to the native fallback (ref 2057) and these tests stop reaching the Triton path.
     assert moe_utils._triton_grouped_gemm_dims_supported(experts, hidden)
     return experts
 

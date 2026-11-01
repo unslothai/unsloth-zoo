@@ -11,18 +11,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
 
-"""End-to-end drift detectors for ``unsloth_zoo/compiler.py``'s dynamic
-code-creation pipeline.
-
-Companion to ``test_upstream_source_patterns.py``. Drives each rewriter
-against real transformers source and asserts the output ``ast.parse``s,
-``compile`` + ``exec``s, and (for named-symbol rewrites) the symbol is gone.
-Also drives ``unsloth_compile_transformers(model_type=X)`` per known model
-type and AST-parses the emitted cache.
-
-CPU-only; drift -> ``pytest.fail("DRIFT DETECTED: ...")``. Model types absent
-from the installed transformers are skipped.
-"""
+"""Drift detectors for unsloth_zoo/compiler.py rewriters on real transformers source; CPU-only, and model types absent from transformers are skipped."""
 
 from __future__ import annotations
 
@@ -42,46 +31,13 @@ compiler = pytest.importorskip("unsloth_zoo.compiler")
 
 @pytest.fixture(autouse = True)
 def _compile_disabled(monkeypatch):
-    """Disable torch.compile so we only exercise the source rewrite + ast.parse.
-
-    A fixture rather than the `os.environ.setdefault` this used to do at module
-    scope. That ran during collection, in every xdist worker, and wrote through
-    to the real process environment for the rest of the session: every module
-    collected after this one, and every subprocess any of them spawn, inherited
-    a compile-disabled environment they never asked for. What saved the suite
-    was that `conftest.py` imports unsloth first, so
-    `temporary_patches/common.py` had already latched the variable's real value
-    at import; if that import ever fails, collection order decides the result
-    instead. Scoped and undone here, the setting reaches only this module.
-    """
+    """Set UNSLOTH_COMPILE_DISABLE via monkeypatch; a module-scope setdefault leaked it into the rest of the session and its subprocesses."""
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
 
 
 @pytest.fixture(autouse = True)
 def _unimport_the_compile_folder(monkeypatch):
-    """Take back out of ``sys.modules`` whatever the compile folder put in.
-
-    Driving ``unsloth_compile_transformers`` writes a generated module and then
-    imports it, and a generated MoE module imports its helpers by bare name --
-    ``moe_utils`` and friends resolve only because the compile folder is on
-    ``sys.path``. Nothing in the installed environment provides that name, so
-    the import IS the swap, and the module it leaves behind outlives the
-    directory it was read from. Every later test in the process that imports it
-    bare then gets a stale copy, and because the generated module swallows that
-    import it loads reporting success with its backend names undefined. That is
-    #1168's failure, arriving here by a second route: it fixed the leak in
-    test_moe_weight_preprocessor_registry_shared.py and added the gate that now
-    catches this one on `Core drift`, where a newer transformers takes the
-    qwen3_moe path that emits the import.
-
-    Keyed on where a module was loaded from rather than on a list of names, so a
-    generated module that starts importing some new helper is covered without
-    anyone remembering to add it here.
-
-    ``monkeypatch`` is requested for its teardown ordering, not for its API:
-    depending on it puts this finalizer ahead of the env being unpatched, so
-    ``get_compile_folder()`` below still resolves the folder the test used.
-    """
+    """Unloads compile-folder modules by load path (1168); requests monkeypatch to run before env unpatch."""
     before = dict(sys.modules)
     try:
         yield
@@ -108,12 +64,7 @@ def _unimport_the_compile_folder(monkeypatch):
 
 
 def _own_torch_nn_forwards():
-    """The ``forward`` each ``torch.nn`` class defines in its own ``__dict__``.
-
-    Read off ``vars(cls)`` rather than ``getattr``, so an inherited forward is
-    not recorded as if the class owned one and then installed on it as a real
-    attribute by the restore below.
-    """
+    """Read from vars(cls), not getattr, so an inherited forward is not recorded as owned and then reinstalled by the restore."""
     try:
         import torch
     except Exception:
@@ -182,22 +133,7 @@ def _restore_torch_nn_forwards():
 
 @pytest.fixture(autouse = True)
 def _restore_unsloth_env():
-    """Undo the ``UNSLOTH_*`` variables the compiler sets on its way through.
-
-    ``monkeypatch`` only knows about what the *test* set. The compiler writes
-    to ``os.environ`` itself, and an audit of what survives teardown found
-    three escaping every drive:
-
-        UNSLOTH_FULLGRAPH                 unset -> '1'
-        UNSLOTH_HIGH_PRECISION_LAYERNORM  unset -> '0'
-        UNSLOTH_RETURN_LOGITS             unset -> '0'
-
-    ``UNSLOTH_FULLGRAPH`` in particular changes how later tests compile, and
-    the module that set it is long gone by then. Restoring the whole
-    ``UNSLOTH_*`` namespace to its snapshot is idempotent with respect to
-    ``monkeypatch``, which puts the same original values back whichever of the
-    two finalizers runs first.
-    """
+    """Restores the whole UNSLOTH_* snapshot: the compiler writes os.environ itself (e.g. UNSLOTH_FULLGRAPH, UNSLOTH_RETURN_LOGITS), which monkeypatch misses."""
     before = {k: v for k, v in os.environ.items() if k.startswith("UNSLOTH_")}
     try:
         yield
@@ -257,8 +193,7 @@ KNOWN_MODEL_TYPES = [
 
 
 def _load_modeling(model_type: str):
-    """Import transformers.models.<model_type>.modeling_<model_type>.
-    Skip on ModuleNotFoundError (env, not drift)."""
+    """Imports transformers.models.<model_type>.modeling_<model_type>; a ModuleNotFoundError skips as an environment issue, not drift."""
     mod_path = f"transformers.models.{model_type}.modeling_{model_type}"
     try:
         return importlib.import_module(mod_path)
@@ -290,8 +225,7 @@ def _assert_parseable(rewritten: str, entry_point: str, *, dedent: bool = False)
 
 
 def _assert_execs(rewritten: str, entry_point: str, *, dedent: bool = False):
-    """compile + exec in a sandbox; only NameError (a dangling identifier)
-    is DRIFT. ImportError / other runtime errors are env, not drift."""
+    """Compiles and execs in a sandbox; only NameError (a dangling identifier) counts as DRIFT, while ImportError and other errors are env."""
     source = textwrap.dedent(rewritten) if dedent else rewritten
     sandbox = {"__name__": "test_compiler_dynamic_exec_sandbox"}
     try:
@@ -352,8 +286,7 @@ def test_higher_precision_sqrt_mean_full_module(gemma3_full_source):
 
 
 def test_fix_rotary_embedding_dtype_passthrough(gemma3_full_source):
-    """Without UNSLOTH_FORCE_CUSTOM_DTYPE the rewriter is a no-op;
-    validate the no-op path doesn't corrupt source."""
+    """Without UNSLOTH_FORCE_CUSTOM_DTYPE the rewriter is a no-op, so the source must come back unchanged."""
     out = compiler.fix_rotary_embedding_dtype(gemma3_full_source)
     _assert_parseable(out, "fix_rotary_embedding_dtype(gemma3)")
     assert out == gemma3_full_source, (
@@ -377,8 +310,7 @@ def test_fix_attention_dtype_consistency_full_module(gemma3_full_source):
 
 
 def test_higher_precision_layernorms_full_module(gemma3_full_source, monkeypatch):
-    """Rewriter mutates os.environ (UNSLOTH_HIGH_PRECISION_LAYERNORM);
-    monkeypatch prevents leak."""
+    """The rewriter sets UNSLOTH_HIGH_PRECISION_LAYERNORM in os.environ; the monkeypatch delenv stops that from leaking out."""
     monkeypatch.delenv("UNSLOTH_HIGH_PRECISION_LAYERNORM", raising=False)
     compiler.higher_precision_layernorms(gemma3_full_source)
     assert "UNSLOTH_HIGH_PRECISION_LAYERNORM" in os.environ, (
@@ -393,9 +325,8 @@ def test_fixup_fused_lm_head_full_module(gemma3_full_source):
 
 
 def test_fixup_fused_lm_head_walrus_dropped():
-    """Pins ``unsloth_zoo/compiler.py:2815-2818`` gemma3n walrus rewrite:
-    ``(final_logit_softcapping := ...)`` -> plain
-    ``.final_logit_softcapping is not None`` check."""
+    """Pins the gemma3n walrus rewrite in unsloth_zoo/compiler.py: the final_logit_softcapping := binding becomes a
+    plain `.final_logit_softcapping is not None` check."""
     src = (
         "def forward(self):\n"
         "    if (final_logit_softcapping := self.config.get_text_config().final_logit_softcapping) is not None:\n"
@@ -485,8 +416,7 @@ def test_apply_fused_lm_head_other_text_models(model_type):
 
 
 def test_patch_gradient_checkpointing_text_decoder(gemma3_mod):
-    """Returns None when upstream uses GradientCheckpointingLayer (modern
-    path, not drift). Otherwise both init + forward must parse."""
+    """Returns None when upstream uses GradientCheckpointingLayer (modern path, not drift); otherwise init and forward must parse."""
     out = compiler.patch_gradient_checkpointing(
         "Gemma3TextModel", gemma3_mod.Gemma3TextModel,
     )
@@ -516,16 +446,14 @@ def test_patch_gradient_checkpointing_layer_caller_text_decoder(gemma3_mod):
 
 
 def test_strip_kw_from_module_calls_text_decoder(gemma3_mod):
-    """Standalone strip_kw_from_module_calls drive (called internally by
-    the GC-layer rewriter to drop kwarg= annotations)."""
+    """Drives strip_kw_from_module_calls directly; the GC-layer rewriter calls it internally to drop kwarg= annotations."""
     fwd_src = inspect.getsource(gemma3_mod.Gemma3TextModel.forward)
     out = compiler.strip_kw_from_module_calls(fwd_src, "self.layers")
     _assert_parseable(out, "strip_kw_from_module_calls(gemma3.layers)", dedent=True)
 
 
 def test_patch_finfo_attention_mask_dtype_mismatch_passthrough(gemma3_mod):
-    """Passthrough on modern transformers source (block not present);
-    still must produce parseable output."""
+    """Passthrough on modern transformers source where the block is absent; the output must still parse."""
     fwd_src = inspect.getsource(gemma3_mod.Gemma3TextModel.forward)
     out = compiler.patch_finfo_attention_mask_dtype_mismatch(
         "Gemma3TextModel", fwd_src,
@@ -555,8 +483,7 @@ def test_patch_moe_routing_weights_cast_qwen3_moe():
 
 
 def test_patch_gradient_accumulation_for_conditional_gen(gemma3_mod):
-    """Returns None when inner classes already accept **kwargs; otherwise
-    rewritten class source must parse."""
+    """Returns None when inner classes already accept **kwargs; otherwise the rewritten class source must parse."""
     out = compiler.patch_gradient_accumulation(
         gemma3_mod, "Gemma3ForConditionalGeneration",
     )
@@ -646,8 +573,7 @@ def test_higher_precision_softmax_inserts_float32_cast():
 
 
 def test_fixup_fused_lm_head_gemma4_flat_logits_dropped():
-    """Pins ``unsloth_zoo/compiler.py:2829-2843`` gemma4
-    flat_logits/flat_labels -> shift_logits/shift_labels rename."""
+    """Pins the gemma4 rename of flat_logits/flat_labels to shift_logits/shift_labels in the fused LM-head fixup."""
     src = (
         "    flat_logits = shift_logits.view(-1, vocab)\n"
         "    flat_labels = shift_labels.view(-1).to(device)\n"
@@ -667,9 +593,7 @@ def test_fixup_fused_lm_head_gemma4_flat_logits_dropped():
 
 
 def test_replace_with_grouped_query_attention_inserts_enable_gqa():
-    """Pins ``unsloth_zoo/compiler.py:304-311`` enable_gqa= insertion;
-    either the kwarg lands or source is unchanged (matcher didn't fire).
-    Output must always be valid Python."""
+    """Pins enable_gqa= insertion: the kwarg lands, or the source is unchanged when the matcher misses; output must always parse."""
     llama = _load_modeling("llama")
     if not hasattr(llama, "LlamaAttention"):
         pytest.skip("LlamaAttention not exposed on installed transformers")
@@ -683,8 +607,7 @@ def test_replace_with_grouped_query_attention_inserts_enable_gqa():
     )
 
 
-# unsloth_compile_transformers(X) emits unsloth_compiled_module_<type>.py
-# (``unsloth_zoo/compiler.py:66-67``).
+# unsloth_compile_transformers(X) emits unsloth_compiled_module_<type>.py, the combined cache these tests parse back.
 
 
 def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
@@ -726,8 +649,7 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
 def test_unsloth_compile_transformers_emits_parseable_cache(
     model_type, monkeypatch,
 ):
-    """Drive the pipeline per model_type + AST-parse the combined cache; any
-    rewriter producing invalid Python surfaces here."""
+    """Drives the pipeline per model_type and AST-parses the combined cache, so any rewriter emitting invalid Python fails here."""
     cache_path = _compile_and_get_cache(model_type, monkeypatch)
 
     if not os.path.isfile(cache_path):
@@ -760,9 +682,7 @@ def test_unsloth_compile_transformers_emits_parseable_cache(
 
 
 def test_smoke_unsloth_compile_transformers_gemma3(monkeypatch):
-    """Smoke: ``unsloth_compile_transformers("gemma3", ...)`` returns valid
-    Python. The real signature (``unsloth_zoo/compiler.py:3116-3143``)
-    rejects trust_remote_code/fast_inference; pass only what it accepts."""
+    """Smoke test that unsloth_compile_transformers on gemma3 returns valid Python; it rejects trust_remote_code and fast_inference, so pass only accepted args."""
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
     monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "1")
     _load_modeling("gemma3")
@@ -808,8 +728,7 @@ def test_smoke_unsloth_compile_transformers_unknown_model_type(monkeypatch):
     )
 
 
-# Constant source blocks exec()'d verbatim by ``create_new_function``
-# (``unsloth_zoo/compiler.py:801-1126``).
+# Constant source blocks that create_new_function exec()s verbatim in unsloth_zoo/compiler.py.
 
 
 @pytest.mark.parametrize(
@@ -824,8 +743,7 @@ def test_smoke_unsloth_compile_transformers_unknown_model_type(monkeypatch):
     ],
 )
 def test_compiler_constant_source_blocks_parse(const_name):
-    """Each constant is a source block exec()'d as-is by compiler.py; must be
-    valid Python (after placeholder substitution where applicable)."""
+    """Each constant is a source block that compiler.py exec()s as-is, so it must parse after placeholder substitution where applicable."""
     block = getattr(compiler, const_name, None)
     if block is None:
         pytest.skip(f"{const_name} not present (renamed?)")

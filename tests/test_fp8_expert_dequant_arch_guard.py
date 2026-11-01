@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FP8 expert dequant must skip the fp8e4nv Triton kernel where unsloth's guard says it cannot compile
-(pre-sm89 CUDA; AMD archs without fp8e4nv on triton < 3.5), falling back to torch dequant."""
+"""FP8 expert dequant skips the fp8e4nv Triton kernel where unsloth's guard says it cannot compile (pre-sm89 CUDA; AMD
+archs without fp8e4nv on triton < 3.5), using torch dequant."""
 
 from __future__ import annotations
 

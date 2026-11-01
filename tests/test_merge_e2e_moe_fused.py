@@ -14,18 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""End-to-end LoRA merge correctness for fused-3D MoE models.
-
-These pack all experts into single 3D params (experts.gate_up_proj/down_proj) with
-grouped LoRA via PEFT target_parameters. The merge slices the adapter per expert and
-applies the delta in the orientation that fits each expert (auto-detected from
-distinct dims, so the #779 narrow-expert transpose bug cannot pass by luck).
-
-gpt_oss runs on transformers 4.57.6 and 5.x. The 5.x-only worry arches (qwen3_5_moe
-= Qwen3.5-35B-A3B, gemma4 = gemma-4-26B-A4B, lfm2_moe = LFM2.5-8B-A1B) skip cleanly
-when a tiny config cannot exercise the fused path; their full-scale merge is covered
-by the real-model sweep + #779.
-"""
+"""Fused 3D MoE experts via grouped LoRA target_parameters: orientation auto-detected from distinct dims (issue 779);
+gpt_oss runs on transformers 4.57.6 and 5.x; 5.x-only arches skip when a tiny config cannot exercise the fused path."""
 
 from __future__ import annotations
 
@@ -53,8 +43,7 @@ FUSED = [
     pytest.param("lfm2_moe", marks=_gated_mark("lfm2_moe")),
 ]
 
-# tiny-config / orchestration errors tolerated (skip) only for gated 5.x families;
-# gpt_oss must never hit these.
+# Tiny-config and orchestration errors skip only gated 5.x families; gpt_oss must never hit them.
 _TOLERATED = ("validate_layer_type", "does not match # of saved modules",
               "could not be instantiated", "is not supported",
               "not found among base keys")
@@ -70,8 +59,7 @@ def _skip_or_raise(family, exc):
 
 @pytest.mark.parametrize("family", FUSED)
 def test_fused_moe_full(family, tmp_path):
-    """Grouped expert LoRA + attention: every fused expert tensor matches the
-    per-expert reference; merge does not fall back."""
+    """Every fused expert tensor matches the per-expert reference, and the merge does not fall back."""
     if not H.family_available(family):
         pytest.skip(f"{family} unavailable")
     H.set_offline_cpu_env()
@@ -102,8 +90,7 @@ def test_fused_moe_full(family, tmp_path):
 
 @pytest.mark.parametrize("family", FUSED)
 def test_fused_moe_attention_only_keeps_experts_byte_identical(family, tmp_path):
-    """No LoRA on the fused experts -> the fused expert tensors stay byte-identical
-    to base (the merge must not rewrite/cast/transpose them)."""
+    """No LoRA on fused experts: those tensors stay byte-identical, not rewritten, cast or transposed."""
     if not H.family_available(family):
         pytest.skip(f"{family} unavailable")
     H.set_offline_cpu_env()

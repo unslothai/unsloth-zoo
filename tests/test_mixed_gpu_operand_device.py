@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Capability decisions follow the operand's GPU on a mixed host (CPU only, devices mocked):
-the Triton MoE caller hands the operands' device to the config picker, and the SDPA mem-efficient
-eligibility check is asked on the query's card, not the current one."""
+"""Capability decisions follow the operand's GPU on mixed hosts (CPU only, devices mocked): the Triton MoE caller passes
+the operands' device to the config picker, and SDPA mem-efficient eligibility is checked on the query's card."""
 
 import contextlib
 import sys

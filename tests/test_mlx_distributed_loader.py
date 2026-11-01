@@ -89,6 +89,15 @@ def test_vlm_detection_requires_a_real_modality(monkeypatch, tmp_path):
     (omni / "config.py").write_text("class ThinkerConfig:\n    vision_config: object\n")
     assert not loader._config_source_has_modality(text)
     assert loader._config_source_has_modality(omni)
+    for name, body, modal in (
+        ("speech", "self.audio_encoder_config = AudioEncoderConfig(**self.encoder)", True),
+        ("cleared", "self.vision_config = None", False),
+    ):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "config.py").write_text(
+            f"class ModelConfig:\n    encoder: dict\n\n    def __post_init__(self):\n        {body}\n"
+        )
+        assert loader._config_source_has_modality(tmp_path / name) is modal
     models = tmp_path / "models"
     models.mkdir()
     static_vlm = models / "static_vlm"
@@ -143,13 +152,7 @@ def test_text_only_vlm_load_stays_on_vlm_path_when_mlx_lm_has_no_model(monkeypat
 
 
 def test_a_model_module_that_exits_at_import_is_a_verdict_not_a_dead_process(monkeypatch):
-    """mlx_lm and mlx-vlm both ship modules that call `exit(1)` at import when an
-    optional dependency is missing -- `mlx_lm/models/olmo.py` does it without
-    ai2-olmo, which no install pulls in. `SystemExit` is not an `Exception`, so
-    catching only that let a routing question take the process down with no
-    traceback. Every one of these imports asks a question whose answer, when the
-    module will not import, is simply "this backend cannot build it".
-    """
+    """mlx_lm/mlx-vlm modules exit(1) at import without an optional dep; SystemExit is not an Exception."""
     import importlib
 
     import unsloth_zoo.mlx.loader as loader
@@ -170,6 +173,67 @@ def test_a_model_module_that_exits_at_import_is_a_verdict_not_a_dead_process(mon
     loader._ensure_safe_text_wrapper_sanitize("olmo")
     config = {"model_type": "olmo", "vision_config": {"hidden_size": 32}}
     assert loader._prefer_vlm_loader_for_text(config, "olmo") is False
+
+
+class _Qwen35TextModel031:
+    # mlx-lm 0.31.3 `qwen3_5.TextModel.sanitize`, minus the tied-embedding pop.
+    def sanitize(self, weights):
+        has_mtp_weights = any("mtp." in k for k in weights)
+        has_unsanitized_conv1d = any(
+            "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
+        )
+        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
+        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        for k, v in weights.items():
+            if "conv1d.weight" in k and v.shape[-1] != 1:
+                weights[k] = v.moveaxis(2, 1)
+            if should_shift_norm_weights and k.endswith(".input_layernorm.weight"):
+                weights[k] = v + 1.0
+        return weights
+
+
+class _Qwen35TextModel032:
+    # mlx-lm 0.32.0, after ml-explore/mlx-lm#1623.
+    def sanitize(self, weights):
+        return {k: v for k, v in weights.items() if "mtp." not in k}
+
+
+@pytest.mark.parametrize("raw_conv", [False, True])
+def test_qwen3_5_mtp_keys_do_not_shift_converted_norms(monkeypatch, raw_conv):
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx import distill
+
+    module = types.ModuleType("mlx_lm.models.qwen3_5")
+    module.TextModel = type("TextModel", (_Qwen35TextModel031,), {})
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.qwen3_5", module)
+    monkeypatch.setattr(loader, "_install_mlx_model_file_guard", lambda: None)
+
+    norm = "model.layers.0.input_layernorm.weight"
+    conv = "model.layers.0.linear_attn.conv1d.weight"
+    weights = {
+        norm: mx.ones((4,)),
+        conv: mx.zeros((8, 1, 4) if raw_conv else (8, 4, 1)),
+        "mtp.layers.0.input_layernorm.weight": mx.zeros((4,)),
+    }
+    loaded = {}
+
+    def load(_path):
+        loaded.update(module.TextModel().sanitize(weights))
+        teacher = types.SimpleNamespace(trainable_parameters=dict)
+        teacher.eval = teacher.freeze = lambda: None
+        return teacher, "tokenizer"
+
+    monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(load=load))
+    distill.load_teacher("teacher")
+    assert set(loaded) == {norm, conv} and loaded[conv].shape == (8, 4, 1)
+    assert mx.array_equal(loaded[norm], mx.full((4,), 2.0 if raw_conv else 1.0))
+    loader._ensure_qwen3_5_mtp_norm_sanitize()
+    assert module.TextModel.sanitize.__wrapped__ is _Qwen35TextModel031.sanitize
+
+    module.TextModel = type("TextModel", (_Qwen35TextModel032,), {})
+    loader._ensure_qwen3_5_mtp_norm_sanitize()
+    assert module.TextModel.sanitize is _Qwen35TextModel032.sanitize
 
 
 def test_apply_mlx_distributed_sharding_modes_and_guards():
@@ -389,8 +453,7 @@ def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatc
 
     def distributed(_name, model_type, *, config_override_data=None, allow_remote_code=None, **_kwargs):
         calls.append((model_type, config_override_data, allow_remote_code))
-        # from_pretrained walks the model's modules for an image path (#1587), so the fake
-        # answers named_modules() the way an mlx.nn.Module with no submodules does.
+        # from_pretrained walks the model's modules for an image path (issue 1587); the fake has none.
         model = types.SimpleNamespace(named_modules=lambda: iter([("", None)]))
         return model, types.SimpleNamespace(
             tokenizer=types.SimpleNamespace(stopping_criteria=object()), detokenizer=object(),
@@ -463,9 +526,13 @@ def test_from_pretrained_uses_distributed_loader(monkeypatch, tmp_path):
         tmp_path,
         {"model_type": "llama"},
     )
+    import unsloth_zoo.mlx.loader as loader
+    norm_patches = []
+    monkeypatch.setattr(loader, "_ensure_qwen3_5_mtp_norm_sanitize", lambda: norm_patches.append(True))
 
     with pytest.warns(UserWarning, match="default load_in_4bit=True"):
         model, tokenizer = FastMLXModel.from_pretrained("fake/repo", text_only=True, tensor_group=group)
 
     assert calls[0][1] is group
     assert model.shard_calls == [group]
+    assert norm_patches == [True]

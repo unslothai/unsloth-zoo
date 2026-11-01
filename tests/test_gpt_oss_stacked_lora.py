@@ -14,16 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Stacked expert LoRA on gpt-oss ModuleList NF4 experts (gate_up_projs / down_projs).
-
-The loader entry point (auto_enable_grouped_moe -> gpt_oss_grouped_qlora.stack_expert_lora) turns
-PEFT's per-expert lora_A / lora_B Parameters into one Parameter per projection list when the
-grouped training path applies (bf16 torch._grouped_mm or the fp16 Triton GEMMs). Checked BITWISE
-against the same model under UNSLOTH_MOE_STACKED_LORA=0: forward, input / LoRA grads (bf16 and
-fp16 grouped paths), torch and bnb 8-bit optimizer steps, merge, adapter switches, routed decode
-(eager, fullgraph compile, CUDA graph replay). Saved adapters keep PEFT's per-expert keys and load
-in a process without Unsloth.
-"""
+"""Stacked expert LoRA (stack_expert_lora via auto_enable_grouped_moe) on gpt-oss NF4 experts, when the bf16 or fp16
+grouped path applies, must match UNSLOTH_MOE_STACKED_LORA=0 bitwise; saved adapters keep PEFT per-expert keys and
+load without Unsloth."""
 import contextlib
 import json
 import os
@@ -294,9 +287,9 @@ def _bnb_state_per_expert(opt, model):
 @pytest.mark.parametrize("mode", [pytest.param("bf16", marks = needs_bf16), pytest.param("fp16", marks = needs_fp16)])
 @pytest.mark.parametrize("optim", ["adamw_torch", "adamw_8bit"])
 def test_optimizer_steps_bitwise(mode, optim):
-    """3 steps: weights equal bitwise, bnb's 8-bit states per expert too. Every per-expert tensor is
-    a whole number of 256-element blocks and >= min_8bit_size (4096): r=16, hidden / inter 256
-    (gpt-oss-20b: 2880 x r is block-aligned for r % 4 == 0)."""
+    """3 optimizer steps must match bitwise, bnb 8-bit states included; per-expert tensors must be whole 256-element
+    blocks and >= min_8bit_size (4096) (r=16, hidden / inter 256; gpt-oss-20b: 2880 x r is block-aligned for r % 4 ==
+    0)."""
     if optim == "adamw_8bit":
         make = lambda ps: bnb.optim.AdamW8bit(ps, lr = 1e-2, weight_decay = 0.01)
     else:

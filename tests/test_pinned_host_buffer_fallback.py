@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Running out of PINNED HOST memory must degrade, not kill the run.
-
-Pinned memory is a third budget, separate from VRAM and system RAM; exhausting it
-surfaces as a bare "CUDA error: out of memory" while nvidia-smi shows the card
-nearly empty. WSL2 caps it near 1-2GB and refuses allocations past a few MB
-(unslothai/unsloth 338, 1552, 1744, 1797); resize_ on an already-pinned buffer is
-the load-bearing call, not the 128KB startup allocation.
-"""
+"""Pinned host memory exhaustion must degrade, not kill the run: WSL2 caps it near 1-2GB and refuses allocations past a
+few MB; resize_ on a pinned buffer is the load-bearing call (unslothai/unsloth 338, 1552, 1744, 1797)."""
 
 import pytest
 import torch
@@ -148,8 +142,7 @@ def test_env_var_skips_pinning_entirely(monkeypatch):
 
 @requires_cuda
 def test_initialisation_survives_a_platform_that_refuses_all_pinning(monkeypatch):
-    """Startup buffers were allocated outside any try, so a host that refuses pinning
-    outright never reached the first training step."""
+    """Startup buffers were allocated outside any try, so a host that refuses pinning outright never reached the first training step."""
     real_empty = torch.empty
 
     def refuse_pinned(*args, **kwargs):
@@ -214,8 +207,7 @@ def test_checkpointed_block_survives_pinned_exhaustion_and_keeps_gradients():
 
 @requires_cuda
 def test_checkpointed_block_survives_a_per_allocation_pinned_cap():
-    """WSL's shape: small pinned allocations succeed, large ones do not, so only the
-    growth path saves the run."""
+    """WSL's shape: small pinned allocations succeed and large ones fail, so only the growth path saves the run."""
     import unittest.mock as mock
 
     CAP = 1 << 20  # 1MB, between the 128KB startup buffers and the 4MB activation
@@ -296,9 +288,8 @@ def test_pageable_buffers_are_not_copied_with_a_non_blocking_claim(monkeypatch):
     assert seen["non_blocking"] is False
 
 
-# The two hot-path copies read a cached flag instead of asking the driver. The cache is
-# only safe while it agrees with the buffer it is attached to, so every test below is
-# really one assertion: no slot may claim to be pinned while its memory is pageable.
+# The hot-path copies read a cached pinned flag instead of asking the driver; that is only safe while it matches its
+# buffer, so no slot may claim pinned while pageable.
 
 def _assert_flags_match_reality(where):
     for i, buffer in enumerate(gc.CPU_BUFFERS):
@@ -327,8 +318,7 @@ def test_new_and_grown_buffers_carry_a_truthful_pinned_flag():
 
 @requires_cuda
 def test_the_cached_flag_is_a_bool_not_a_bound_method():
-    """`x.is_pinned` without the call is a bound method, i.e. always truthy: that would
-    make non_blocking unconditionally True and silently undo the whole fallback."""
+    """x.is_pinned without the call is a bound method, always truthy, which would make non_blocking unconditionally True and silently undo the whole fallback."""
     buffer = gc._new_host_buffer(1024, torch.float16)
     assert type(getattr(buffer, gc.HOST_PINNED_ATTR)) is bool
 
@@ -376,8 +366,7 @@ def test_a_stale_flag_is_caught(monkeypatch):
 
 @requires_cuda
 def test_mid_run_fallback_to_pageable_flips_the_cached_flag(monkeypatch):
-    """Growth can hand back a NEW pageable tensor in place of a pinned one. If the flag
-    does not travel with it, the next copy is async out of pageable memory."""
+    """Growth can return a new pageable tensor in place of a pinned one, so the cached pinned flag must flip too or the next copy runs async from pageable memory."""
     seen = {}
     real_copy, real_resize = torch.Tensor.copy_, torch.Tensor.resize_
 
@@ -411,8 +400,8 @@ def test_mid_run_fallback_to_pageable_flips_the_cached_flag(monkeypatch):
 
 @requires_cuda
 def test_the_hot_path_asks_the_driver_nothing_once_the_buffers_are_warm():
-    """is_pinned() is a cudaPointerGetAttributes query, not a cached flag, and the hot
-    path runs it twice per checkpointed layer per micro batch."""
+    """is_pinned() is a cudaPointerGetAttributes driver query, so the hot path must ask nothing once buffers are warm;
+    it runs twice per checkpointed layer per micro batch."""
     dtype = torch.float16
     gc.initialize_unsloth_gradient_checkpointing(dtype = dtype)
     block = torch.nn.Linear(1024, 1024, device = "cuda", dtype = dtype)
@@ -436,8 +425,7 @@ def test_the_hot_path_asks_the_driver_nothing_once_the_buffers_are_warm():
 
 @requires_cuda
 def test_a_second_model_in_the_same_process_still_warns(capsys):
-    """PINNED_MEMORY_AVAILABLE is re-probed per model, so the warning latch has to be
-    cleared with it or the second model falls back in silence."""
+    """PINNED_MEMORY_AVAILABLE is re-probed per model, so the warning latch must be cleared with it or a second model falls back silently."""
     gc.PINNED_MEMORY_AVAILABLE = True
     gc._WARNED_ABOUT_PINNED_MEMORY = False
     gc._warn_pinned_unavailable("first model")

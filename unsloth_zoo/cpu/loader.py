@@ -480,8 +480,8 @@ _FUSED_PROJECTIONS = {"q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv
 
 
 def _with_fused_projections(target_modules, leaf_names):
-    """Add the fused projection a requested split name maps to, when the model has it and not the split one,
-    so a Llama-style target list does not silently leave Phi-3's Q/K/V and MLP input projections frozen."""
+    """Add the fused projection a split name maps to when the model has it, so a Llama-style target list does not
+    silently leave Phi-3's Q/K/V and MLP input projections frozen."""
     out = list(target_modules)
     for name in target_modules:
         fused = _FUSED_PROJECTIONS.get(name)
@@ -507,8 +507,7 @@ def _adapter_base_model(model_name, token, revision, **hub_kwargs):
 
 
 def _clamp_to_learned_positions(model, max_seq_length):
-    """GPT-2 / OPT style learned position tables cannot be extended here (RoPE models can run past their
-    trained length), so a longer max_seq_length would index past the table during training."""
+    """GPT-2 / OPT learned position tables cannot be extended, so a longer max_seq_length would index past them; RoPE models can run past their trained length."""
     config = getattr(model, "config", None)
     limit = getattr(config, "max_position_embeddings", None) or getattr(config, "n_positions", None)
     if not isinstance(limit, int) or max_seq_length is None or max_seq_length <= limit:
@@ -636,8 +635,8 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
         )
     os.makedirs(save_directory, exist_ok = True)
     merged_directory = os.path.join(save_directory, "merged_16bit")
-    # Stage the merged weights unrounded: the converter casts once to each requested type, instead of
-    # rounding through fp16 / bf16 first (fp16 on a CPU without native bf16 would also clip bf16's range).
+    # Stage merged weights unrounded: the converter casts once per requested type instead of rounding through fp16/bf16
+    # first; fp16 without native bf16 would also clip bf16's range.
     unrounded = [m for m in methods if m in ("f32", "f16")]
     staged, _ = _merged_copy(self, "merged_32bit")
     staged.save_pretrained(merged_directory)

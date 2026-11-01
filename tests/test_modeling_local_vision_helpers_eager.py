@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Grid helpers defined in modeling files need the same eager fallback as vision_utils.
-
-Discover helpers from source, then import only matching modules to probe tracing."""
+"""Grid helpers in modeling files need the same eager fallback as vision_utils; helpers are discovered from source and
+only matching modules are imported to probe tracing."""
 
 import inspect
 import os
@@ -138,10 +137,8 @@ def test_the_sweep_finds_the_known_helpers():
 
 @pytest.mark.parametrize("name", sorted(_HELPERS))
 def test_uncompilable_local_grid_helpers_are_listed(name):
-    """Helpers that fail fullgraph tracing must be listed for eager execution.
-
-    The eager backend isolates Dynamo failures from Inductor and Triton setup.
-    Helpers that become traceable on newer torch versions may remain listed."""
+    """Helpers that fail fullgraph tracing must be listed for eager; the eager backend isolates Dynamo failures from
+    Inductor and Triton setup; newer torch may keep them listed."""
     model_type, _ = _HELPERS[name]
     function = _load(name)
     kwargs = _call_args(function)
@@ -180,9 +177,7 @@ def test_uncompilable_local_grid_helpers_are_listed(name):
     ],
 )
 def test_the_known_offenders_stay_listed(name):
-    """Keep coverage when models are absent or helpers trace on newer torch versions.
-
-    temporal_merge_index fails on torch 2.9.1 but traces on 2.10.0 and 2.13.0."""
+    """Keep coverage when models are absent or helpers trace on newer torch; temporal_merge_index fails on torch 2.9.1 but traces on 2.10.0 and 2.13.0."""
     assert name in DISABLE_COMPILE_FUNCTIONS, (
         f"{name} guards on a value read out of grid_thw.tolist(); dropping it from "
         "DISABLE_COMPILE_FUNCTIONS puts back 'Could not guard on data-dependent "

@@ -41,19 +41,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 SRC = (ROOT / "unsloth_zoo" / "rl_replacements.py").read_text(encoding = "utf-8")
-# One shared parse: nodes from separate parses never compare equal, which would make
-# the containment tests below vacuous.
+# One shared parse: AST nodes from separate parses never compare equal, which would make the containment tests below vacuous.
 TREE = ast.parse(SRC)
 
 
 # the message
 
 def _mismatched_call(fn, torch):
-    """Vocab-wide logits where hidden states are expected, as an unpatched
-    forward returns. `lm_head` is an nn.Parameter, like
-    `get_output_embeddings().weight`, and so is shape-static -- which is why the
-    real report printed a concrete `[1536, 151936]` beside a symbolic `s33`.
-    """
+    """Vocab-wide logits where hidden states are expected, as an unpatched forward returns; lm_head is an nn.Parameter
+    like get_output_embeddings().weight, so shape-static (the real report printed a concrete [1536, 151936] beside a
+    symbolic s33)."""
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     hidden, vocab = 32, 128
     logits  = torch.randn(2, 8, vocab, device = dev, dtype = torch.float32)
@@ -65,8 +62,7 @@ def _mismatched_call(fn, torch):
 
 
 def test_the_width_mismatch_names_both_operands():
-    """A bare `torch._check` names neither operand, and Dynamo rejects a
-    message-carrying one, so the matmul must be left to raise."""
+    """A bare torch._check names neither operand and Dynamo rejects one with a message, so the matmul itself must be left to raise, naming both widths."""
     torch = pytest.importorskip("torch")
     from unsloth_zoo.rl_replacements import (
         chunked_hidden_states_selective_log_softmax as fn,
@@ -82,8 +78,7 @@ def test_the_width_mismatch_names_both_operands():
 # the dispatch
 
 def _packed_block():
-    """The packed call inside `grpo_accumulated_loss`, located by AST so
-    reformatting cannot make this test vacuous."""
+    """Locates the packed call inside grpo_accumulated_loss by AST, so reformatting cannot make the test vacuous."""
     for node in ast.walk(TREE):
         if not isinstance(node, ast.Call):
             continue
@@ -97,8 +92,7 @@ def _packed_block():
 
 
 def _enclosing_width_test(call_node):
-    """The nearest `if` whose test compares a `.shape[-1]` against
-    `lm_head.shape[...]` and which contains `call_node`."""
+    """Returns the nearest if whose test compares a .shape[-1] against lm_head.shape[...] and contains call_node."""
     for node in ast.walk(TREE):
         if not isinstance(node, ast.If):
             continue
@@ -122,8 +116,7 @@ def test_the_packed_call_site_dispatches_on_width():
 
 
 def test_the_packed_fallback_is_the_raw_logits_helper():
-    """Raw logits skip the matmul path entirely: scale and softcapping were
-    already applied by the forward."""
+    """Raw logits skip the matmul path: scale and softcapping were already applied by the forward, so the fallback is the raw-logits helper."""
     call = _packed_block()
     guard = _enclosing_width_test(call)
     assert guard is not None

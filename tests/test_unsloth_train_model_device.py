@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""``unsloth_train`` must feed batches to the device the model's inputs live on. It hard-coded ``cuda:0``, so a
-model on another GPU (or on CPU) got its batches on the wrong device, and a host without CUDA crashed before step 0."""
+"""unsloth_train must feed batches to the model's input device, not a hard-coded cuda:0; otherwise a model on another
+GPU or on CPU gets wrong-device batches and no-CUDA hosts crash before step 0."""
 
 from __future__ import annotations
 
@@ -63,8 +63,7 @@ def test_batches_follow_the_model_device(tmp_path):
 
 
 def test_offloaded_embedding_uses_the_hook_execution_device(tmp_path):
-    # With accelerate offloading the embedding weight is meta between forwards; batches must go to the hook's
-    # execution device, never to meta.
+    # With accelerate offloading the embedding weight is meta between forwards, so batches must go to the hook's execution device, never to meta.
     model = _TinyLM()
     meta_embed = torch.nn.Embedding(16, 8, device = "meta")
     meta_embed._hf_hook = SimpleNamespace(execution_device = torch.device("cpu"))

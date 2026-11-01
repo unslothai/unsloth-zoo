@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`scripts/lint_exec_literals.py` fails CI on a new non-literal exec/eval/compile.
-
-The rule is coarse on purpose, so what these pin is the shape of the coarseness: which
-calls it fires on, which it leaves alone, and that the baseline cannot be used to
-smuggle a new call site past it.
-"""
+"""Tests scripts/lint_exec_literals.py (coarse by design): new non-literal exec/eval/compile fails CI; the baseline must not hide new call sites."""
 
 from __future__ import annotations
 
@@ -114,11 +109,7 @@ _REMEDIES = {
 
 
 def test_the_baseline_matches_the_tree_it_was_recorded_against():
-    """A stale entry silently re-permits whatever lands on that digest next.
-
-    Runs the whole gate, so read its verdict back: reported as one nameless failure, a
-    deleted `exec` sends the contributor looking for a review they do not need.
-    """
+    """A stale baseline entry re-permits whatever later lands on that digest; the failure must name the stale entry, not a nameless gate failure."""
     proc = subprocess.run(
         [sys.executable, str(SCRIPT)], capture_output = True, text = True, cwd = SCRIPT.parents[1]
     )

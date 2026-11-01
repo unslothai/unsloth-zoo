@@ -88,9 +88,8 @@ def test_extract_gdn_layers_raises_when_offsets_underivable():
 
 
 def test_extract_gdn_layers_has_bnb_quant_state_preservation():
-    # Pre-fix: merged in_proj_qkvz stored raw weight slices; BnB prequantized
-    # checkpoints lost quant_state and were rebuilt as plain nn.Linear.
-    # Source-level check (behavioral test needs real BnB).
+    # Merged in_proj_qkvz stored raw weight slices, so BnB prequantized checkpoints lost quant_state and were rebuilt as
+    # plain nn.Linear; source-level check as a behavioral test needs real BnB.
     from unsloth_zoo import empty_model
     src = inspect.getsource(empty_model.extract_gdn_layers)
     assert "bnb_quant_state" in src
@@ -251,8 +250,8 @@ def test_set_dtype_in_config_stores_json_safe_string():
 
 
 def test_gemma4_lora_patch_preserves_signature_for_inspect():
-    # Pre-fix: patched_create_lora_manager(model, *args, **kwargs) hid
-    # vllm_config, breaking _call_create_lora_manager's signature forwarding.
+    # patched_create_lora_manager(model, *args, **kwargs) hid vllm_config and broke _call_create_lora_manager's
+    # signature forwarding; the wrapper must keep the signature for inspect.
     from unsloth_zoo import empty_model
     src = inspect.getsource(empty_model.patch_gemma4_vllm_lora_support)
     assert "@wraps(original_create_lora_manager)" in src
@@ -261,8 +260,7 @@ def test_gemma4_lora_patch_preserves_signature_for_inspect():
 
 
 def test_gemma4_k_eq_v_patch_handles_split_kv_layout():
-    # Pre-fix: only packed self_attn.qkv_proj.weight was searched, so the split
-    # q/k/v_proj Gemma4 layout never got synthetic V quant-state.
+    # Only the packed self_attn.qkv_proj.weight was searched, so the split q/k/v_proj Gemma4 layout never got synthetic V quant-state.
     from unsloth_zoo import empty_model
     src = inspect.getsource(empty_model.patch_gemma4_vllm_k_eq_v_support)
     assert "k_proj.weight" in src and "v_proj.weight" in src
@@ -331,8 +329,7 @@ class _FakeBnBGDN(torch.nn.Module):
 
 
 def test_extract_gdn_layers_emits_bnb_quant_state_for_all_shards():
-    # Pre-fix: extract_gdn_layers() unwrapped Params4bit before reading
-    # `bnb_quant_state` (always None), and in_proj_ba's split emitted none.
+    # extract_gdn_layers() must read bnb_quant_state from Params4bit before unwrapping it (after, it was always None); in_proj_ba's split emitted none.
     from unsloth_zoo.empty_model import extract_gdn_layers
     gdn = _FakeBnBGDN()
     state_dict, quant_state_dict = {}, {}
@@ -368,8 +365,7 @@ def test_gemma4_lora_soft_imports_vllm_v1_worker():
 
 
 def test_conv1d_rebuild_uses_real_channels_and_groups():
-    # Pre-fix: conv1d was treated as a layernorm and rebuilt by weight-swap only, leaving a
-    # placeholder Conv1d(groups=1, kernel_size=1) that crashes on first forward.
+    # conv1d must not be treated as a layernorm: a weight-swap-only rebuild left a placeholder Conv1d(groups=1, kernel_size=1) that crashes on first forward.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
     assert '".conv1d"' in src
@@ -405,8 +401,7 @@ def test_gemma4_layer_types_none_is_guarded():
 
 
 def test_gemma4_k_eq_v_does_not_skip_v_proj_extraction():
-    # Dense Gemma4 split layouts can expose real v_proj weights even when
-    # attention_k_eq_v is true. Do not leave converted HF placeholders behind.
+    # Dense Gemma4 split layouts can expose real v_proj weights even when attention_k_eq_v is true; do not leave converted HF placeholders behind.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils._get_vllm_state_dict)
     v_proj_idx = src.index('get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)')
@@ -563,8 +558,7 @@ def test_set_dtype_in_config_else_branch_picks_correct_field():
 
 
 def test_assert_same_state_dict_ignores_quantstate_entries():
-    # _normalize_state_dict_tensor returns None for non-tensor values (BnB QuantState
-    # dicts) and the loop skips them; previously these raised AttributeError.
+    # _normalize_state_dict_tensor returns None for non-tensor values (BnB QuantState dicts) so the loop skips them instead of raising AttributeError.
     from unsloth_zoo.vllm_utils import assert_same_state_dict
 
     w = torch.randn(4, 4)
@@ -600,8 +594,7 @@ class _FakeGemma4Layer(torch.nn.Module):
 
 
 def test_gemma4_per_layer_extraction_emits_state_dict_entries():
-    # per_layer_input_gate / per_layer_projection must reach state_dict for the
-    # reconstruction templates.
+    # per_layer_input_gate and per_layer_projection must reach state_dict for the reconstruction templates.
     state_dict = {}
 
     def fake_get_state_dict(prefix, kk, sd, module, slice_weights=True):
@@ -675,8 +668,7 @@ def test_set_additional_modules_loads_visual_merger_linear_fc():
 
 
 def test_get_vllm_state_dict_extracts_layernorm_when_layer_lacks_mlp():
-    # Regression: the early `continue` for layers without `mlp` ran before the layernorm
-    # loop, dropping input_layernorm.weight on linear-attn / MoE layers.
+    # Regression: the early `continue` for layers without `mlp` ran before the layernorm loop, dropping input_layernorm.weight on linear-attn / MoE layers.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils._get_vllm_state_dict)
     layernorm_idx = src.index('layer_config[\'layernorms\']')
@@ -688,8 +680,7 @@ def test_get_vllm_state_dict_extracts_layernorm_when_layer_lacks_mlp():
 
 
 def test_finalize_huggingface_model_dtype_propagates_to_replaced_live_config():
-    # Regression: copy_attributes can replace new_model.config with an object whose id()
-    # differs from the input config, so the id-keyed dtype reapply loop missed it.
+    # Regression: copy_attributes can replace new_model.config with an object whose id() differs from the input config, so the id-keyed dtype reapply missed it.
     from unsloth_zoo.empty_model import finalize_huggingface_model
 
     class _LiveCfg:
@@ -717,8 +708,7 @@ def test_finalize_huggingface_model_dtype_propagates_to_replaced_live_config():
 
 
 def test_finalize_huggingface_model_vision_rotary_uses_identity_check():
-    # Regression: comparing the rotary config's __class__ against vision_config's class
-    # misfires when text and vision share a class.
+    # Regression: comparing the rotary config's __class__ against vision_config's class misfires when text and vision configs share a class.
     from unsloth_zoo.empty_model import finalize_huggingface_model
 
     class _SharedCfg:
@@ -770,8 +760,8 @@ def test_finalize_huggingface_model_vision_rotary_uses_identity_check():
 
 
 def test_layer_scalar_keeps_buffer_registration_after_conversion():
-    # Regression: the `if layer_name in quant_state_dict` branch always wrapped the value
-    # in nn.Parameter, moving Gemma4 layer_scalar from _buffers to _parameters.
+    # Regression: the `if layer_name in quant_state_dict` branch always wrapped the value in nn.Parameter, moving Gemma4
+    # layer_scalar from _buffers to _parameters.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
     assert "_buffers" in src
@@ -779,8 +769,7 @@ def test_layer_scalar_keeps_buffer_registration_after_conversion():
 
 
 def test_assert_same_state_dict_uses_tight_tolerance_for_same_dtype():
-    # Regression: assert_same_state_dict applied atol=1e-4/rtol=1e-3
-    # unconditionally, masking extraction errors on same-dtype non-FP8 weights.
+    # Regression: assert_same_state_dict applied atol=1e-4/rtol=1e-3 unconditionally, masking extraction errors on same-dtype non-FP8 weights.
     from unsloth_zoo.vllm_utils import assert_same_state_dict
     a = torch.randn(8, 8, dtype=torch.float32)
     b = a.clone()
@@ -794,16 +783,14 @@ def test_assert_same_state_dict_uses_tight_tolerance_for_same_dtype():
 
 
 def test_conv1d_branch_requires_linear_attn_in_layer_name():
-    # Regression: bare `endswith(".conv1d")` would rebuild any .conv1d as
-    # depthwise; the branch must require a GDN linear_attn or (#1733) a Mamba-2 mixer.
+    # Regression: bare endswith(".conv1d") would rebuild any .conv1d as depthwise; the branch must require a GDN linear_attn or Mamba-2 mixer (issue 1733).
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
     assert 'endswith(".conv1d") and ("linear_attn" in layer_name or ".mixer." in layer_name)' in src
 
 
 def test_gemma4_lora_patch_covers_both_classes():
-    # Regression: only Gemma4ForConditionalGeneration was patched, so
-    # text-only Gemma4ForCausalLM still hit the unsupported-LoRA path.
+    # Regression: only Gemma4ForConditionalGeneration was patched, so text-only Gemma4ForCausalLM still hit the unsupported-LoRA path.
     from unsloth_zoo import empty_model
     src = inspect.getsource(empty_model.patch_gemma4_vllm_lora_support)
     assert "Gemma4ForCausalLM" in src
@@ -811,9 +798,8 @@ def test_gemma4_lora_patch_covers_both_classes():
 
 
 def test_get_model_layer_config_includes_gemma4_top_level_ple_modules():
-    # Regression: top-level Gemma4 PLE modules (embed_tokens_per_layer,
-    # per_layer_model_projection, per_layer_projection_norm) were absent from
-    # extraction tables, leaving them randomly initialized.
+    # Regression: Gemma4 top-level PLE modules (embed_tokens_per_layer, per_layer_model_projection,
+    # per_layer_projection_norm) were absent from extraction tables; they stayed randomly initialized.
     from unsloth_zoo.empty_model import get_model_layer_config
     cfg = get_model_layer_config()
     non_layered = set(cfg["non_layered_components"])
@@ -823,9 +809,8 @@ def test_get_model_layer_config_includes_gemma4_top_level_ple_modules():
 
 
 def test_finalize_non_gemma4_rotary_stays_fp32_through_to_dtype():
-    # Regression: the non-Gemma4 branch skipped float32 rotary restoration after
-    # new_model.to(dtype), downcasting inv_freq / original_inv_freq to bf16/fp16.
-    # quantization_config == {} and bnb_config is None so .to(dtype) runs.
+    # Regression: the non-Gemma4 branch skipped float32 rotary restoration after new_model.to(dtype), downcasting
+    # inv_freq and original_inv_freq to bf16/fp16; quantization_config == {} and bnb_config is None so .to(dtype) runs.
     from unsloth_zoo.empty_model import finalize_huggingface_model
 
     class _Cfg:
@@ -868,9 +853,9 @@ def test_finalize_non_gemma4_rotary_stays_fp32_through_to_dtype():
 
 
 def test_finalize_tolerates_rotary_rebuild_failure_without_crashing():
-    # Regression: rotary_emb.__class__(config=..., device=...) can raise for Gemma4
-    # multimodal rotary when copy_attributes drifts config identity; finalize must catch
-    # it, keep the existing rotary, and float32-lift its buffers.
+    # Regression: rotary_emb.__class__(config=..., device=...) can raise for Gemma4 multimodal rotary when
+    # copy_attributes drifts config identity; finalize must catch it, keep the existing rotary, and float32-lift its
+    # buffers.
     from unsloth_zoo.empty_model import finalize_huggingface_model
 
     class _BadCfg:
@@ -917,8 +902,7 @@ def test_finalize_tolerates_rotary_rebuild_failure_without_crashing():
 
 
 def test_finalize_routes_vision_tower_rotary_to_vision_config_by_module_path():
-    # Regression: id()-based routing drifted after copy_attributes, misrouting vision
-    # rotary through text_config; a module-path fallback covers 'vision_tower'.
+    # Regression: id()-based routing drifted after copy_attributes, misrouting vision rotary through text_config; a module-path fallback covers vision_tower.
     from unsloth_zoo.empty_model import finalize_huggingface_model
 
     class _TextCfg:
@@ -972,8 +956,8 @@ def test_finalize_routes_vision_tower_rotary_to_vision_config_by_module_path():
 
 
 def test_extract_gdn_layers_dequantize_uses_unpacked_midpoint(monkeypatch):
-    # Regression: `mid = ba_weight.shape[0] // 2` was computed on the packed uint8 buffer
-    # then reused to slice the dequantized tensor, giving in_proj_b/a the wrong rows.
+    # Regression: mid = ba_weight.shape[0] // 2 was computed on the packed uint8 buffer then reused to slice the
+    # dequantized tensor, giving in_proj_b/a wrong rows.
     from unsloth_zoo.empty_model import extract_gdn_layers
 
     class _PlainProj(torch.nn.Module):
@@ -1015,8 +999,7 @@ def test_extract_gdn_layers_dequantize_uses_unpacked_midpoint(monkeypatch):
             self.in_proj_qkvz = _PlainProj(
                 2 * self.key_dim + 2 * self.value_dim, self.hidden_size,
             )
-            # Packed length 12 -> packed mid 6. Dequantized shape below is 24 x 1
-            # so the correct mid is 12.
+            # Packed length 12 gives packed mid 6; the dequantized shape (24 x 1) makes the correct mid 12.
             self.in_proj_ba = _BAProj(12)
             self.conv1d = _PlainProj(self.key_dim * 2 + self.value_dim, 4)
             self.dt_bias = torch.nn.Parameter(torch.randn(self.num_v_heads), requires_grad=False)
@@ -1027,15 +1010,10 @@ def test_extract_gdn_layers_dequantize_uses_unpacked_midpoint(monkeypatch):
             )
             self.out_proj = _PlainProj(self.hidden_size, self.value_dim)
 
-    # monkeypatch.setitem, not a bare assignment: these entries have to come back out of
-    # sys.modules when the test ends. The stub carries dequantize_4bit and nothing else,
-    # so while it is installed `from bitsandbytes.functional import QuantState` fails with
-    # "cannot import name 'QuantState' from 'bitsandbytes.functional' (unknown location)",
-    # which is what temporary_patches/moe_utils_bnb4bit.py:735 does at import time: six
-    # tests in test_moe_bnb4bit_per_expert_conversions.py failed that way under
-    # pytest-xdist while passing serially, since this file sorts after them.
-    # setdefault leaked too: on a runner without bitsandbytes it inserted a bare parent
-    # module that shadows the real package for anything installed later in the process.
+    # monkeypatch.setitem restores sys.modules: the stub lacks QuantState, which
+    # temporary_patches/moe_utils_bnb4bit.py:735 imports at import time; six tests in
+    # test_moe_bnb4bit_per_expert_conversions.py failed under pytest-xdist; setdefault leaked a bare module that shadows
+    # the real package.
     if "bitsandbytes" not in sys.modules:
         monkeypatch.setitem(sys.modules, "bitsandbytes", types.ModuleType("bitsandbytes"))
     bnb = sys.modules["bitsandbytes"]
@@ -1060,8 +1038,7 @@ def test_extract_gdn_layers_dequantize_uses_unpacked_midpoint(monkeypatch):
 
 
 def test_lm_head_lookup_uses_exact_name_not_substring():
-    # Regression: `"lm_head" in name` matched e.g. 'lm_head_norm' before the
-    # real 'lm_head'; the fix requires exact match or a .lm_head suffix.
+    # Regression: "lm_head" in name matched lm_head_norm before the real lm_head; the fix requires an exact match or a .lm_head suffix.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils._get_vllm_state_dict)
     assert 'name == "lm_head"' in src
@@ -1073,9 +1050,7 @@ def test_lm_head_lookup_uses_exact_name_not_substring():
 
 
 def test_convert_regex_handles_trailing_digit_parameter_paths():
-    # Pre-fix: `re.sub(r"\.([\d]{1,})\.", ...)` required a trailing dot, so a
-    # trailing-index key like `...embed_tokens_per_layer.0` was not bracketed
-    # and `exec(...)` hit a SyntaxError.
+    # The re.sub bracketing regex required a trailing dot, so a key ending in .0 (embed_tokens_per_layer.0) stayed unbracketed and exec hit SyntaxError.
     import re
     pattern = r"\.([\d]+)(?=\.|$)"
     sub = lambda x: f"[{x.group(1)}]"
@@ -1088,8 +1063,7 @@ def test_convert_regex_handles_trailing_digit_parameter_paths():
 
 
 def test_convert_vllm_to_huggingface_uses_robust_bracket_regex():
-    # The Parameter-assignment path must use the anchor-or-end regex so keys ending in
-    # `.DIGIT` get bracketed. Anchor on the bracketing code, not a comment.
+    # The Parameter-assignment path must use the anchor-or-end regex so keys ending in `.DIGIT` get bracketed; anchor on the bracketing code, not a comment.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
     assert r'r"\.([\d]+)(?=\.|$)"' in src
@@ -1100,8 +1074,7 @@ def test_convert_vllm_to_huggingface_uses_robust_bracket_regex():
 
 
 def test_finalize_rotary_reinit_failure_skips_float32_lift():
-    # Regression: a bare `try/except: pass` on rotary reinit float32-lifted
-    # buffers on the stale rotary; the fix lifts only when reinit succeeds.
+    # Regression: a bare try/except with pass on rotary reinit float32-lifted buffers of the stale rotary; the fix lifts only when reinit succeeds.
     from unsloth_zoo.empty_model import finalize_huggingface_model
 
     class _BadCfg:
@@ -1176,9 +1149,7 @@ def test_load_vllm_routes_gemma4_gate_through_helper():
 
 
 def test_load_vllm_gemma4_patch_runs_after_bnb_autodetect():
-    # Regression: the Gemma4 k_eq_v patch was gated on caller-provided `use_bitsandbytes`
-    # before model-name/quant_method autodetect, so `-bnb-4bit` models with
-    # use_bitsandbytes=False skipped it.
+    # Regression: the Gemma4 k_eq_v patch was gated on caller-provided use_bitsandbytes before model-name/quant_method autodetect; -bnb-4bit models skipped it.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils.load_vllm)
     autodetect_anchor = "use_bitsandbytes = use_bitsandbytes or"
@@ -1212,8 +1183,7 @@ def test_gemma4_bnb_skip_module_aliases_cover_vllm_text_prefixes():
 
 
 def test_patch_gemma4_vllm_lora_support_preserves_embedding_modules():
-    # Regression: `cls.embedding_modules = {}` clobbered the vLLM class's existing
-    # embedding registry, which routes adapters to embedding layers.
+    # Regression: cls.embedding_modules = {} clobbered the vLLM class's existing embedding registry, which routes adapters to embedding layers.
     from unsloth_zoo import empty_model
     src = inspect.getsource(empty_model.patch_gemma4_vllm_lora_support)
     assert 'if not hasattr(cls, "embedding_modules"):' in src
@@ -1225,8 +1195,7 @@ def test_patch_gemma4_vllm_lora_support_preserves_embedding_modules():
 
 
 def test_patch_gemma4_vllm_lora_support_guards_gemma4_mm_import():
-    # Regression: a hard `from vllm...gemma4_mm import ...` crashed with
-    # ModuleNotFoundError on text-only Gemma4 vLLM builds.
+    # Regression: a hard vllm...gemma4_mm import crashed with ModuleNotFoundError on text-only Gemma4 vLLM builds.
     from unsloth_zoo import empty_model
     src = inspect.getsource(empty_model.patch_gemma4_vllm_lora_support)
     mm_line = "from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration"
@@ -1239,8 +1208,7 @@ def test_patch_gemma4_vllm_lora_support_guards_gemma4_mm_import():
 
 
 def test_patch_gemma4_vllm_k_eq_v_support_guards_private_loader_attr():
-    # Regression: hasattr(BitsAndBytesModelLoader._stack_quantization_states, ...) raised
-    # AttributeError when the private method was renamed or absent.
+    # Regression: hasattr(BitsAndBytesModelLoader._stack_quantization_states, ...) raised AttributeError when the private method was renamed or absent.
     from unsloth_zoo import empty_model
     src = inspect.getsource(empty_model.patch_gemma4_vllm_k_eq_v_support)
     assert 'getattr(\n        BitsAndBytesModelLoader, "_stack_quantization_states", None' in src \
@@ -1249,8 +1217,7 @@ def test_patch_gemma4_vllm_k_eq_v_support_guards_private_loader_attr():
 
 
 def test_patch_gemma4_vllm_k_eq_v_support_searches_hf_style_prefix():
-    # Regression: _get_gemma4_k_eq_v_pairs searched only ("language_model.model", "model"),
-    # missing HF-style model.language_model for multimodal Gemma4.
+    # Regression: _get_gemma4_k_eq_v_pairs searched only language_model.model and model, missing HF-style model.language_model for multimodal Gemma4.
     from unsloth_zoo import empty_model
     src = inspect.getsource(empty_model.patch_gemma4_vllm_k_eq_v_support)
     assert '"model.language_model"' in src
@@ -1300,9 +1267,9 @@ def test_patch_gemma4_vllm_lora_support_early_returns_when_no_classes():
     ):
         saved[missing] = _sys.modules.get(missing)
         _sys.modules[missing] = None
-    # Evict any cached copy so the no-classes path runs against a fresh import regardless
-    # of test order. vllm_lora_worker_manager needs vllm.config (not stubbed here), which
-    # only resolves on a real vllm install; the early return must not pull it in.
+    # Evict any cached unsloth_zoo.vllm_lora_worker_manager so the no-classes path runs on a fresh import regardless of
+    # test order; it needs vllm.config (not stubbed here), which only resolves on a real vllm install, so the early
+    # return must not pull it in.
     saved_worker_manager = _sys.modules.pop(
         "unsloth_zoo.vllm_lora_worker_manager", None
     )
@@ -1400,10 +1367,9 @@ def _rotary_stub(init):
 
 
 def test_rotary_pos_emb_reinit_dispatches_on_signature():
-    """transformers 4 and early 5 take a positional dim, later 5 takes the vision config.
-    Passing a dim to the config form raised `'int' object has no attribute
-    'rope_parameters'`, which killed every Qwen2.5-VL / Qwen3-VL / Qwen3.5 fast_inference
-    load on those versions. Dispatch has to follow the signature, not guess."""
+    """transformers 4 and early 5 take a positional dim, later 5 takes the vision config; passing a dim to the config
+    form raised 'int' object has no attribute 'rope_parameters', killing every Qwen2.5-VL/Qwen3-VL/Qwen3.5
+    fast_inference on those versions; dispatch must follow the signature."""
     import torch.nn as nn
     seen = []
 
@@ -1428,9 +1394,8 @@ def test_rotary_pos_emb_reinit_dispatches_on_signature():
 
 
 def test_rotary_pos_emb_reinit_survives_the_5_18_device_kwarg_removal():
-    """`device` on the vision rotary is deprecate_kwarg(version="5.18"), so passing it
-    becomes a TypeError. That would land in the warning branch and silently skip the
-    reinit, so the ctor must be called without it and moved afterwards."""
+    """vision rotary 'device' is deprecate_kwarg(version='5.18'); passing it becomes a TypeError that lands in the
+    warning branch and silently skips the reinit, so call the ctor without it and move afterwards."""
     import torch.nn as nn
     assert "device = target_device" not in _rotary_pos_emb_block(), \
         "device= is removed in transformers 5.18 and must not be passed to the rotary ctor"

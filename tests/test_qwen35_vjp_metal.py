@@ -1,17 +1,5 @@
-"""Metal-only regression tests for unsloth-zoo PR 738.
-
-PR 738 fixes the second crash in unslothai/unsloth#6002:
-``ValueError: [Primitive::vjp] Not implemented for CustomKernel`` raised during
-MLX LoRA training of qwen3_5-family VLMs on Apple Silicon. The non-differentiable
-paths are the GatedDeltaNet custom Metal kernel (``gated_delta_kernel``) and the
-fused MRoPE Metal kernel (``MRoPERotaryEmbedding.apply_rotary`` fused path).
-
-These bugs ONLY manifest on Metal (``mx.metal.is_available()`` and the default
-device is the GPU). On CPU, mlx-vlm already falls back to differentiable ops, so
-every test here is skipped on non-Metal machines with a loud notice.
-
-Target runtime: well under ~2 minutes on an M1.
-"""
+"""Metal-only tests for unsloth-zoo PR 738 (fixes unslothai/unsloth issue 6002): the GatedDeltaNet and fused MRoPE Metal
+kernels have no VJP; skipped when Metal is unavailable."""
 
 import pytest
 
@@ -39,12 +27,8 @@ metal_only = pytest.mark.skipif(not _HAS_METAL, reason=_SKIP_REASON)
 
 
 def _tiny_text_config(full_attention_interval=2):
-    """Tiny qwen3_5 TextConfig.
-
-    full_attention_interval=2 -> layer 0 is linear (GatedDeltaNet), layer 1 is
-    full attention; exercises both the GDN VJP fix and the MRoPE fix in one
-    model. head_dim 128 * partial_rotary_factor 0.25 = 32 = sum([11, 11, 10]).
-    """
+    """Tiny qwen3_5 TextConfig: layer 0 is GatedDeltaNet and layer 1 full attention (full_attention_interval=2);
+    head_dim 128 * partial_rotary_factor 0.25 = 32 = sum([11, 11, 10])."""
     from mlx_vlm.models.qwen3_5.config import TextConfig
 
     return TextConfig(
@@ -85,8 +69,7 @@ def _flatten_grads(grads):
 
 
 def _gdn_inputs(B=2, T=6, Hk=1, Hv=2, Dk=128, Dv=128, seed=0):
-    """Inputs matching mlx-vlm gated_delta_update; Dk=128 so the Metal kernel
-    (which requires Dk a multiple of 32) is actually exercised."""
+    """Inputs match mlx-vlm gated_delta_update; Dk=128 because the Metal kernel needs Dk a multiple of 32 to be exercised."""
     mx.random.seed(seed)
     dt = mx.bfloat16
     q = mx.random.normal((B, T, Hk, Dk)).astype(dt)
@@ -102,8 +85,7 @@ def _gdn_inputs(B=2, T=6, Hk=1, Hv=2, Dk=128, Dv=128, seed=0):
 
 @metal_only
 def test_gated_delta_kernel_grad_raises_without_patch():
-    """Proves the bug exists: differentiating the Metal gated_delta_kernel
-    (use_kernel=True, state=None) raises [Primitive::vjp] CustomKernel."""
+    """Documents the bug: grad through the Metal gated_delta_kernel with use_kernel=True and state=None raises [Primitive::vjp] CustomKernel."""
     import importlib
 
     import mlx_vlm.models.qwen3_5.gated_delta as vlm_gd
@@ -118,8 +100,7 @@ def test_gated_delta_kernel_grad_raises_without_patch():
             q_, k_, v_, a, b, A_log, dt_bias,
             state=None, mask=None, use_kernel=True,
         )
-        # The raw Metal kernel path returns a list of outputs; ops paths
-        # return a tuple or a bare array.
+        # The raw Metal kernel path returns a list of outputs; ops paths return a tuple or a bare array.
         y = out[0] if isinstance(out, (tuple, list)) else out
         return y.astype(mx.float32).sum()
 
@@ -178,8 +159,7 @@ def test_patch_gated_delta_vlm_fixes_grad_and_matches_reference(monkeypatch):
                        rtol=2e-2, atol=2e-2)
 
 
-# (c) MRoPE: fused apply is non-differentiable; flip makes grad work; fused vs
-#     fallback forward match
+# (c) MRoPE: the fused apply is non-differentiable; the _disable_fused_mrope flip makes grad work, and fused and fallback forward outputs must match.
 @metal_only
 def test_disable_fused_mrope_fixes_rotary_grad():
     import mlx_vlm.models.qwen3_5.language as qlang
@@ -206,9 +186,8 @@ def test_disable_fused_mrope_fixes_rotary_grad():
     fused_q, fused_k = rot.apply_rotary(q, k, pos, unsqueeze_dim=1)
     mx.eval(fused_q, fused_k)
 
-    # Pre-flip: grad through fused apply raises the VJP error on mlx releases
-    # whose fused rotary kernel has no VJP. mlx 0.32.0 added one, so only the
-    # message is asserted, not that it raises at all.
+    # Before the flip, grad through fused apply raises the VJP error on mlx releases whose fused rotary kernel has no
+    # VJP; mlx 0.32.0 added one, so only the message is asserted.
     def loss(q_, k_):
         oq, ok = rot.apply_rotary(q_, k_, pos, unsqueeze_dim=1)
         return (oq.astype(mx.float32).sum() + ok.astype(mx.float32).sum())
@@ -260,9 +239,8 @@ def test_end_to_end_training_step_all_patches():
     # Grads alone prove nothing: upstream's ops path differentiates too.
     assert qlang.gated_delta_update.__name__ == "patched_vlm_gated_delta_update"
 
-    # Longer than 8 tokens, as text, preference and GRPO batches are (padded to 1 + 32k): from mlx 0.32.4 the
-    # attention VJP refuses a <= 8 row query, which mlx serves with its vector kernel and which
-    # has no logsumexp for the backward pass.
+    # Inputs longer than 8 tokens (text, preference and GRPO batches are padded to 1 + 32k): from mlx 0.32.4 the
+    # attention VJP refuses a <= 8 row query, which its vector kernel serves without logsumexp for backward.
     inputs = mx.array([list(range(1, 13))])
 
     def loss_fn(m):
@@ -279,8 +257,7 @@ def test_end_to_end_training_step_all_patches():
     assert any(float(mx.abs(g).max()) > 0 for g in flat), "all grads zero"
 
 
-# The elementwise bound divides by each entry's own magnitude plus 1% of the
-# tensor's largest, so a small bad entry cannot hide behind a large one.
+# Elementwise bound divides by each entry's own magnitude plus 1% of the tensor's largest, so a small bad entry cannot hide behind a large one.
 _Y_TOL = {mx.bfloat16: 5e-3, mx.float16: 5e-4, mx.float32: 5e-6}
 _Y_ELEM_TOL = {mx.bfloat16: 8e-3, mx.float16: 1e-3, mx.float32: 2e-5}
 _STATE_TOL = 1e-6
@@ -334,8 +311,7 @@ def _elem_rel(a, b, floor=0.01):
                         / (mx.abs(b) + floor * mx.max(mx.abs(b)))))
 
 
-# (B, T, Hk, Hv, Dk, Dv, dtype, vectorized). Together they exercise every thread
-# prefix and segment width the layout derives, both gatings, all dtypes, a ragged T.
+# Case tuples are (B, T, Hk, Hv, Dk, Dv, dtype, vectorized); together they cover every thread prefix and segment width, both gatings, all dtypes and a ragged T.
 _CASES = [
     (1, 64, 16, 32, 128, 128, mx.bfloat16, False),
     (2, 77, 16, 32, 128, 128, mx.bfloat16, False),
@@ -457,8 +433,8 @@ def test_gradients_match_autodiff_over_the_same_recurrence(case):
 
 @metal_only
 def test_backward_is_causal_and_reaches_non_first_positions():
-    """Perturbing dy at one late step moves d_q only at that step and head, and d_v
-    all the way back from it; the rest sits at the atomic reductions' noise floor."""
+    """Backward is causal: perturbing dy at one late step changes d_q only at that step and head, and d_v back to
+    earlier steps; other positions stay at atomic-reduction noise."""
     import unsloth_zoo.gated_delta_vjp as gdv
 
     q, k, v, g, beta, state = _inputs(1, 40, 4, 8, 128, 128, mx.float32, False)
