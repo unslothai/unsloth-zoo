@@ -39,6 +39,13 @@ def _cpu_fp16_autocast():
         return torch.is_autocast_cpu_enabled() and torch.get_autocast_cpu_dtype() == torch.float16
 
 
+def _cpu_autocast_state():
+    try:
+        return torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu")
+    except TypeError:
+        return torch.is_autocast_cpu_enabled(), torch.get_autocast_cpu_dtype()
+
+
 def _softmax_without_collapse(z, y, keep_logits = False):
     """Returns softmax(z) with target column zeroed, log p_t and shifted z_t, shifting z in place; sums other classes
     apart from exp(0)=1, else p_t rounds to 1 past a ~16.6 lead (softmax collapse, arXiv 2610.31642)."""
@@ -53,8 +60,18 @@ def _softmax_without_collapse(z, y, keep_logits = False):
 
 def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor,
                         chunk_rows: int, ignore_index: int, need_hidden_grad: bool,
-                        need_weight_grad: bool, exact: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                        need_weight_grad: bool, exact: bool, amp: bool,
+                        amp_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Opaque to Dynamo/AOT: the runtime loop keeps logits bounded without specialising symbolic rows.
+    # Compiled graphs run with autocast off, so the caller's CPU autocast is passed in and restored here.
+    with torch.autocast("cpu", dtype = amp_dtype, enabled = amp):
+        return _chunked_ce_forward_loop(
+            hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
+        )
+
+
+def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
+                             need_weight_grad, exact):
     rows = hidden.shape[0]
     grad_dtype = torch.float32 if exact else hidden.dtype
     grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0)
@@ -92,7 +109,7 @@ _chunked_ce_forward = torch.library.custom_op(
 
 @_chunked_ce_forward.register_fake
 def _chunked_ce_forward_fake(hidden, weight, labels, chunk_rows, ignore_index,
-                             need_hidden_grad, need_weight_grad, exact):
+                             need_hidden_grad, need_weight_grad, exact, amp, amp_dtype):
     grad_dtype = torch.float32 if exact else hidden.dtype
     return (
         torch.empty((), dtype = torch.float32),
@@ -113,9 +130,10 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         exact = hidden.dtype == torch.float16 or _cpu_fp16_autocast()
         # The surrounding autograd.Function supplies backward; these are precomputed, non-differentiable buffers.
         compute = _chunked_ce_forward if torch.compiler.is_compiling() else _chunked_ce_forward_impl
+        amp, amp_dtype = _cpu_autocast_state()
         total, grad_hidden, grad_weight = compute(
             hidden.detach(), weight.detach(), labels, chunk_rows, ignore_index,
-            need_hidden_grad, need_weight_grad, exact,
+            need_hidden_grad, need_weight_grad, exact, amp, amp_dtype,
         )
         saved = (grad_hidden, grad_weight)
         # num_items_in_batch == 0 (a fully masked accumulation group): a finite 0, as TRL's clamped divisor gives.

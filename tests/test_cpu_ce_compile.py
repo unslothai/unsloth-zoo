@@ -250,3 +250,36 @@ def test_compiled_ce_bounds_runtime_logits(monkeypatch, explicit_chunk):
     assert shapes, "No runtime logits projection was observed"
     assert max(shape[0] for shape in shapes) <= rows_per_chunk, shapes
     assert sum(counters["graph_break"].values()) == 0
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("train_weight", [False, True])
+def test_compiled_ce_keeps_cpu_autocast(backend, dtype, train_weight):
+    # Compiled graphs run with autocast off; the chunk op must restore the caller's CPU autocast, else a 16-bit
+    # hidden state meets the fp32 head weight unconverted (dtype mismatch).
+    from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    h = torch.randn(1, 9, 8).to(dtype).requires_grad_()
+    w = torch.randn(13, 8).requires_grad_(train_weight)
+    y = torch.randint(13, (1, 9))
+
+    def loss(h, w, y):
+        return chunked_linear_cross_entropy(h, w, y, chunk_rows = 4)
+
+    def run(fn):
+        h.grad = None
+        w.grad = None
+        with torch.autocast("cpu", dtype = dtype):
+            out = fn(h, w, y)
+        out.backward()
+        return out.detach(), h.grad.clone(), None if w.grad is None else w.grad.clone()
+
+    want = run(loss)
+    got = run(torch.compile(loss, fullgraph = True, backend = backend))
+    for a, b in zip(got, want):
+        if b is None:
+            assert a is None
+        else:
+            torch.testing.assert_close(a.float(), b.float(), rtol = 1e-2, atol = 1e-2)
