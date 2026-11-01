@@ -2127,3 +2127,35 @@ def test_the_videos_probe_reads_the_installed_mlx_vlm():
     generate._vlm_prepares_videos.cache_clear()
     takes = "videos" in inspect.signature(utils.prepare_inputs).parameters
     assert generate._vlm_prepares_videos() is takes
+
+
+def test_target_head_runs_more_rows_than_one_lane_launch_in_fp32_launches(monkeypatch):
+    from mlx_simulation import mlx_is_simulated
+
+    if mlx_is_simulated():
+        pytest.skip("needs real mlx.nn.QuantizedLinear")
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+
+    head = nn.QuantizedLinear(64, 16, bias = False, group_size = 64, bits = 4)
+    head.eval()
+    head._unsloth_lane_qmm = True
+    launches = []
+
+    def lane_qmm(x, w, scales, biases, group_size, bits, output_dtype = None):
+        launches.append(x.shape[0])
+        return mx.zeros((x.shape[0], w.shape[0]), dtype = output_dtype)
+
+    monkeypatch.setattr(matmul, "lane_qmm", lane_qmm)
+    monkeypatch.setattr(inference, "_bindings_intact", lambda bindings: True)
+    w, scales, biases = head["weight"], head["scales"], head["biases"]
+    signature = (mx.bfloat16, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape, 64, 4, head.mode)
+    head._unsloth_lane_qmm_ready = {(1, rows, 64): (None, signature) for rows in (32, 8)}
+    fp32 = inference._TargetHeadFP32(head, ())
+    x = mx.ones((2, 20, 64), dtype = mx.bfloat16)
+    y = fp32(x)
+    assert launches == [32, 8] and y.dtype == mx.float32 and y.shape == (2, 20, 16)
+    # A launch shape not yet admitted keeps the whole call on the stock head, never mixed precisions.
+    del head._unsloth_lane_qmm_ready[(1, 8, 64)]
+    assert fp32(x).dtype == mx.bfloat16

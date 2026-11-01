@@ -7266,9 +7266,16 @@ class _TargetHeadFP32(nn.Module):
                 or p.training or getattr(_LANE_STATE, "native", False) or "bias" in p
                 or type(p) is not self._head_type or type(p).__call__ is not self._head_call
                 or not _bindings_intact(self._bindings) or not isinstance(x, mx.array) or x.ndim < 2
-                or not x.shape[-1] or not 1 <= x.size // x.shape[-1] <= matmul.LANE_QMM_MAX_ROWS
-                or x.dtype not in (mx.bfloat16, mx.float16)
+                or not x.shape[-1] or not x.size or x.dtype not in (mx.bfloat16, mx.float16)
                 or self._layout != (p.group_size, p.bits, p.mode) or not p.__dict__.get("_unsloth_lane_qmm")):
+            return p(x)
+        most = matmul.LANE_QMM_MAX_ROWS
+        if x.size // x.shape[-1] > most:
+            # In launches of `most` rows, as `_lane_rows` splits them: a row's bits do not depend on its launch.
+            flat = x.reshape(1, -1, x.shape[-1])
+            parts = [self(flat[:, i : i + most]) for i in range(0, flat.shape[1], most)]
+            if all(part.dtype == mx.float32 for part in parts):
+                return mx.concatenate(parts, axis = 1).reshape(*x.shape[:-1], -1)
             return p(x)
         ready = p.__dict__.get("_unsloth_lane_qmm_ready", {}).get(x.shape)
         if ready is None:
