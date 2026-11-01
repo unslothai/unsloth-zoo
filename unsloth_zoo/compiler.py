@@ -1193,7 +1193,7 @@ pass
 # Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
 def higher_precision_softmax(source):
     """
-    Converts all softmax to float32 for eg:
+    Converts all softmax to float32 (a softmax already given dtype=torch.float32 is left alone) for eg:
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
@@ -1218,6 +1218,11 @@ def higher_precision_softmax(source):
         full_match, matches = item.group(0), item.groups()
         softmax, variable, dim, dtype = matches
         if not _is_single_operand(variable):
+            continue
+        # Already float32: the source keeps the probabilities in float32 on purpose (MoE routers such as
+        # Gemma-4's take top-k, renormalise and scale them in float32). Casting back to a 16-bit input dtype
+        # rounds them before top-k, which can flip near-tied expert choices.
+        if dtype is not None and re.fullmatch(r",\s*dtype\s*=\s*torch\.float(32)?\s*", dtype):
             continue
         new = (
             f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
