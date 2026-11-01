@@ -818,21 +818,24 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
 
     @staticmethod
     @torch_amp_custom_bwd
-    def backward(ctx, dY):
+    def backward(ctx, *dY):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
             output = ctx.forward_function(hidden_states, *recompute_args)
-        # Layers that return a 1-tuple keep unpacking exactly as before. Layers
-        # that return the tensor itself (Qwen2-VL's vision block, and every
-        # transformers block since the tuple returns were retired) used to raise
-        # `ValueError: too many values to unpack` here, because forward() stored
-        # whatever the layer returned while backward() insisted on a 1-tuple.
-        if isinstance(output, tuple):
-            (output,) = output
-        torch.autograd.backward(output, dY)
+        # A layer may return the tensor itself (every transformers block since the tuple
+        # returns were retired), a 1-tuple, or several tensors: patch_gradient_checkpointing()
+        # routes every torch checkpoint call here, e.g. a chunked (log-prob, entropy) pair.
+        # Autograd hands one incoming grad per forward output; backprop the outputs that got one.
+        outputs = output if isinstance(output, tuple) else (output,)
+        pairs = [(o, g) for o, g in zip(outputs, dY)
+                 if torch.is_tensor(o) and o.requires_grad and g is not None]
+        if not pairs:
+            # As torch's reentrant checkpoint: nothing to backprop is an error, not a step with no gradients.
+            raise RuntimeError("none of output has requires_grad=True, this checkpoint() is not necessary")
+        torch.autograd.backward([o for o, _ in pairs], [g for _, g in pairs])
         # Gradients for the extra inputs are returned to the engine instead of
         # being left to accumulate as a side effect of the nested backward.
         return (None, hidden_states.grad,) + tuple(
