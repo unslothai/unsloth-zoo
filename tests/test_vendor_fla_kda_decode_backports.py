@@ -37,7 +37,7 @@ _GPU = pytest.mark.skipif(not _gpu_ok(), reason = "needs the vendored fla KDA ke
 
 def test_kda_decode_backports_present():
     code = (VENDORED / "ops" / "kda" / "fused_recurrent.py").read_text()
-    # 1415: eight-value tiles, one warp, three stages, except on sm8x / ROCm (slower on A100).
+    # 1415: eight-value tiles, one warp, three stages, on T4 / H200 only.
     assert "BV, decode_warps, decode_stages = _kda_decode_config(v.device)" in code
     assert "num_warps=decode_warps,\n        num_stages=decode_stages," in code
     # 1416: dense outputs skip the zero fill, packed outputs keep it.
@@ -165,7 +165,8 @@ def test_kda_decode_matches_fp64_recurrence_subprocess():
     ((8, 0), None, (32, 4, 2)),    # A100: 5-10% slower at batch 8-128 with them
     ((8, 9), None, (32, 4, 2)),
     ((9, 0), None, (8, 1, 3)),     # upstream measured H200
-    ((10, 0), None, (8, 1, 3)),
+    ((10, 0), None, (32, 4, 2)),   # unmeasured: old config
+    ((12, 0), None, (32, 4, 2)),
     ((9, 4), "7.0", (32, 4, 2)),   # ROCm keeps the old config
 ])
 def test_kda_decode_config_by_arch(monkeypatch, capability, hip, expected):

@@ -246,7 +246,9 @@ def _kda_decode_config(device):
         major = torch.cuda.get_device_capability(device)[0]
     except Exception:
         return 32, 4, 2
-    return (32, 4, 2) if major == 8 else (8, 1, 3)
+    # New tiles only where measured: T4 (ours), H200 (fla PR #1415). sm8x is slower with them; sm10x / sm12x
+    # are unmeasured, so they keep the old config.
+    return (8, 1, 3) if major in (7, 9) else (32, 4, 2)
 
 
 @torch.compiler.disable
