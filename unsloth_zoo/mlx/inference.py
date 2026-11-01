@@ -5610,7 +5610,6 @@ def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row)
     chunked = lambda: mx.concatenate([mx.fast.scaled_dot_product_attention(
         queries[:, :, start : start + rows], keys[:, :, : prefix + start + rows], values[:, :, : prefix + start + rows],
         scale = scale, mask = "causal") for start, rows in chunks], axis = 2)
-    # Each fused call reads the whole prefix again; the rows kernel's threadgroups read each key once for all their rows.
     blocks = _causal_rows_blocks(gqa, dim, prefix, length, forced) if len(chunks) > 1 else None
     rows_kernel = blocks is not None and _exact_attention_kernels() is not None
     one_pass = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
@@ -5825,7 +5824,6 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] < 2
                 or x.shape[1] == 2 and not pair or not _bindings_intact(attention_bindings)):
             return base._attention(self, attention, x, mask, cache, position_ids, position_embeddings)
-        # The native body for a wider block, with its one-row SDPA calls handed to `_exact_attention`.
         batch, length, _ = x.shape
         q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
