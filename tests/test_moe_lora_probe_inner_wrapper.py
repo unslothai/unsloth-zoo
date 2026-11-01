@@ -109,10 +109,18 @@ def routed_like_l4(monkeypatch):
                         if getattr(m, "_original_param_wrapper_forward", None) is not None)
         experts = wrapper.get_base_layer()
         saved = {k: experts.__dict__.pop(k) for k in list(experts.__dict__) if k.startswith("_unsloth_lora_")}
+        # The stand-in reaches the experts forward, which records a stash read the real kernel never makes: keep
+        # the read record as it was, else the probe sees a read and the test passes without the fix.
+        reads = experts.__dict__.get(MU._MOE_LORA_STASH_READ_ATTR)
+        reads = dict(reads) if reads is not None else None
         try:
             return original(wrapper, x, router_indices, routing_weights)
         finally:
             experts.__dict__.update(saved)
+            if reads is None:
+                experts.__dict__.pop(MU._MOE_LORA_STASH_READ_ATTR, None)
+            else:
+                experts.__dict__[MU._MOE_LORA_STASH_READ_ATTR] = reads
 
     monkeypatch.setattr(gr, "routed_bf16_eligible", lambda experts, x: not torch.is_grad_enabled())
     monkeypatch.setattr(gr, "routed_bf16_forward", fake_routed)
