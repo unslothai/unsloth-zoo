@@ -112,3 +112,40 @@ def test_forced_float32_full_finetune_matches_vanilla_float32(tmp_path):
         torch.testing.assert_close(got[name], g, rtol = 1e-3, atol = 1e-5 * float(g.abs().max() or 1.0), msg = name)
     assert abs(patched["loss16"] - vanilla["loss"]) < 0.05, patched
     assert patched["eval_dtype"] == "torch.float16", patched
+
+
+INTERLEAVED = COMMON + r'''
+import threading
+import unsloth_zoo
+assert unsloth_zoo.__file__.startswith(os.environ["REPO"]), unsloth_zoo.__file__
+import unsloth_zoo.temporary_patches.qwen3_moe_float32 as patch
+for fn in (patch.patch_Qwen3MoeDecoderLayer_float32, patch.patch_Qwen3MoeRMSNorm_float32,
+           patch.patch_Qwen3MoeAttention_float32):
+    fn()
+m16, m32 = build(torch.float16).eval(), build(torch.float32).eval()
+ready, done, errors = threading.Event(), threading.Event(), {}
+def hold(module, args):  # the fp16 model waits at its final norm while the fp32 model runs every layer
+    ready.set()
+    assert done.wait(60)
+m16.model.norm.register_forward_pre_hook(hold)
+def half():
+    try:
+        with torch.no_grad(): errors["half_dtype"] = str(m16(IDS).logits.dtype)
+    except Exception as e: errors["half"] = str(e)
+def full():
+    try:
+        assert ready.wait(60)
+        with torch.no_grad(): m32(IDS)
+    except Exception as e: errors["float"] = str(e)
+    finally: done.set()
+a, b = threading.Thread(target = half), threading.Thread(target = full)
+a.start(); b.start(); a.join(); b.join()
+print(json.dumps(errors))
+'''
+
+
+def test_float16_and_float32_models_in_two_threads_keep_their_own_norm_dtype(tmp_path):
+    # Failing before: the boundary dtype was one process-wide value, so a float32 model running between an fp16
+    # model's last layer and its final norm made that norm return float32 to the fp16 lm_head ("float != Half").
+    got = _run(INTERLEAVED, str(tmp_path), zoo = True)
+    assert got == {"half_dtype": "torch.float16"}, got

@@ -41,6 +41,7 @@
 # ============================================================================
 
 import os
+import threading
 import torch
 from .common import (
     TEMPORARY_PATCHES,
@@ -58,8 +59,9 @@ from .gemma import _linear_boundary_dtype, _to_boundary_dtype, _to_forced_output
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
 
-# Set by each decoder layer forward (eager): the dtype its projections take when no autocast is active.
-_QWEN3_MOE_BOUNDARY = [None]
+# Set by each decoder layer forward: the dtype its projections take when no autocast is active. Per thread, so a
+# float16 and a float32 Qwen3-MoE running at once never read each other's decision.
+_QWEN3_MOE_BOUNDARY = threading.local()
 
 
 def patch_Qwen3MoeDecoderLayer_float32():
@@ -90,7 +92,7 @@ def patch_Qwen3MoeDecoderLayer_float32():
     ):
         # Projection dtype for this forward (float32 on full finetuning without autocast, else None = fp16 path);
         # read by every Qwen3-MoE RMSNorm that runs after this layer, including the final norm before lm_head.
-        _QWEN3_MOE_BOUNDARY[0] = (
+        _QWEN3_MOE_BOUNDARY.dtype = (
             None if torch.is_autocast_enabled(hidden_states.device.type)
             else _linear_boundary_dtype(self.self_attn, "q_proj")
         )
@@ -177,7 +179,7 @@ def patch_Qwen3MoeRMSNorm_float32():
         # `self` stays in eager, so it never reaches the kernel's guards.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
         kernel = _qwen3_moe_rms_norm
-        if _QWEN3_MOE_BOUNDARY[0] == torch.float32 and not torch.is_autocast_enabled(hidden_states.device.type):
+        if getattr(_QWEN3_MOE_BOUNDARY, "dtype", None) == torch.float32 and not torch.is_autocast_enabled(hidden_states.device.type):
             kernel = _qwen3_moe_rms_norm_float32
         normed = kernel(hidden_states_2d, unwrap_norm_weight(self.weight), self.variance_epsilon)
         return normed.reshape(shape)
