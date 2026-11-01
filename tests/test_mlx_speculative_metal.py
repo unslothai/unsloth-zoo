@@ -608,7 +608,6 @@ def test_a_verify_block_row_has_its_one_row_sdpa_bits_where_the_vector_kernel_ch
     scale, fused = dim ** -0.5, mx.fast.scaled_dot_product_attention
     k, v = (mx.random.normal((1, heads[1], 16400, dim), key = mx.random.key(i)).astype(mx.bfloat16) for i in range(2))
     monkeypatch.setattr(inference._VERIFY_STATE, "serving", True, raising = False)
-    # A dispatch the launch rule mis-models falls back to the one-row calls.
     monkeypatch.setattr(inference, "_gpu_class", lambda: "unmodelled")
     [monkeypatch.setattr(inference, f, __import__("functools").lru_cache(getattr(inference, f).__wrapped__)) for f in ("_causal_chunks", "_causal_rows_blocks")]
     monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
