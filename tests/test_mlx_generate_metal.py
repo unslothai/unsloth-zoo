@@ -1238,6 +1238,7 @@ def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, 
     from unsloth_zoo.mlx import inference, nax
     from unsloth_zoo.mlx.generate import generation_mode
 
+    monkeypatch.setenv("UNSLOTH_MLX_DENSE_PREFILL", "1")
     model = _QuantizedHead()
     calls = []
     kernel = nax.small_m_qmm
@@ -1259,10 +1260,14 @@ def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, 
         patch.setattr(nn.QuantizedLinear, "__call__", functools.wraps(linear_call)(lambda *a: linear_call(*a)))
         with inference.nax_quantized_linear(model):
             assert type(model.proj) is nn.QuantizedLinear
-    with generation_mode(model):
+    with generation_mode(model, call = ("batch", "speculative")):
         with inference.nax_quantized_linear(model):
-            assert [type(m).__name__ for m in (model.embed, model.proj, model.odd)] == [
-                "_NaxSmallMQuantizedEmbedding", "_NaxSmallMQuantizedLinear", "QuantizedLinear"]
+            classes = inference._nax_qmm_classes(inference._NAX_QMM_ROUTE, nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
+            assert [type(m)._unsloth_singleton_native for m in (model.embed, model.proj)] == [
+                classes[nn.QuantizedEmbedding], classes[nn.QuantizedLinear]]
+            assert all(m._unsloth_nax_qmm_scopes > 0 for m in (model.embed, model.proj))
+            assert type(model.odd)._unsloth_singleton_native is inference._dense_qmm_class(nn.QuantizedLinear.__call__)
+            assert model.odd._unsloth_dense_qmm_scopes == 1 and not getattr(model.odd, "_unsloth_nax_qmm_scopes", 0)
         assert type(model.proj) is not nn.QuantizedLinear   # the outer scope still owns it
         for rows, native in natives.items():
             routed = run(rows)
@@ -1278,7 +1283,9 @@ def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, 
         monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: linear_call(self, x) * 0)
         assert not any(mx.any(out).item() for out in run(4)) and not calls   # drifted: native, new body
         monkeypatch.undo()
-    assert (type(model.embed), type(model.proj)) == (nn.QuantizedEmbedding, nn.QuantizedLinear)
+    assert (type(model.embed), type(model.proj), type(model.odd)) == (nn.QuantizedEmbedding, nn.QuantizedLinear, nn.QuantizedLinear)
+    assert not any(name in vars(module) for module in (model.embed, model.proj, model.odd)
+                   for name in ("_unsloth_nax_qmm_scopes", "_unsloth_dense_qmm_scopes", "_unsloth_singleton_scopes"))
     assert "_unsloth_nax_qmm_rows" not in model.proj
 
 
@@ -1345,6 +1352,17 @@ def _apple_gpu():
 
 # simdgroup matrices are only known to lay out their elements this way on Apple's own GPUs.
 apple_gpu_only = pytest.mark.skipif(not _apple_gpu(), reason="requires a non-paravirtual Apple GPU")
+
+
+@apple_gpu_only
+def test_singleton_decode_serves_only_a_call_naming_the_speculative_trait():
+    from unsloth_zoo.mlx import inference
+    model = nn.Module()
+    model.proj = nn.QuantizedLinear(512, 512, bias = False, group_size = 64, bits = 4)
+    model.eval()
+    for call, served in ((None, False), ((), False), (("batch", "vision"), False), (("batch", "speculative"), True)):
+        with inference.inference_scopes(model, call):
+            assert ("_unsloth_singleton_scopes" in vars(model.proj)) == served, call
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
@@ -1586,8 +1604,8 @@ def test_dense_prefill_linear_composes_with_the_nax_scope(monkeypatch):
         assert type(model.wide).__name__ == "_NaxSmallMQuantizedLinear"
         mx.eval(model(x))
         assert not dequantized   # outside the dense scope the NAX-routed linear falls back to the native call
-        with generation_mode(model):
-            assert type(model.wide).__name__ == "_NaxSmallMQuantizedLinear"
+        with generation_mode(model, call = ("batch", "speculative")):
+            assert type(model.wide)._unsloth_singleton_native.__name__ == "_NaxSmallMQuantizedLinear"
             mx.eval(model(x))
             dequantized.clear()
             assert _same_bits(model(x), native) and len(dequantized) == 1
@@ -1648,9 +1666,9 @@ def test_tiled_prefill_takes_what_stock_runs_as_plain_qmm_bit_for_bit(monkeypatc
     seen, quantized_matmul = [], mx.quantized_matmul
     monkeypatch.setattr(mx, "quantized_matmul", lambda a, w, *args, **kwargs: (
         seen.append(a.shape[-2]) if w.shape[0] == 2048 else None, quantized_matmul(a, w, *args, **kwargs))[1])
-    with generation_mode(model):
+    with generation_mode(model, call = ("batch", "speculative")):
         if matmul.simd_qmm_available():   # the small-row class must leave the tile's rows to the dense scope
-            assert type(model.wide).__name__ == "_SimdSmallMQuantizedLinear"
+            assert type(model.wide)._unsloth_singleton_native.__name__ == "_SimdSmallMQuantizedLinear"
             assert model.wide._unsloth_nax_qmm_next == 33 * 512   # a 64-row tile pads no more from 33 rows
         for x, native in zip(xs, natives):
             assert _same_bits(model(x), native)
