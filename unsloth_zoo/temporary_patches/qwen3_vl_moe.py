@@ -254,6 +254,8 @@ def patch_qwen3_vl_moe():
 
         _qwen3_vl_lora_extractor = _make_qwen_moe_lora_extractor()
         transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_vl_lora_extractor)
+        # Transposed storage makes PEFT factor the stacks over swapped dims: saves are rewritten to vanilla's.
+        transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts._unsloth_expert_lora_factors_swapped = True
 
 
         backend = select_moe_backend()
