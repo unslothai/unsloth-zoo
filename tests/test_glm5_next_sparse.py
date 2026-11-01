@@ -516,6 +516,22 @@ def test_static_cache_key_length_is_the_allocation_before_the_first_prefill():
     assert g._predicted_key_len(idx, 60, None) == 60
 
 
+def test_decode_token_skips_the_free_memory_query(monkeypatch):
+    # A decode step's scores are tiny even at long context: no per-layer mem_get_info per token.
+    import types
+
+    g = _patched()
+    idx = _indexer(_text_config())
+    monkeypatch.setattr(g, "_predicted_key_len", lambda *a: 131072)
+
+    def no_query(device = None):
+        raise AssertionError("mem_get_info called for a decode token")
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", no_query)
+    token = types.SimpleNamespace(shape = (1, 1, 8), device = torch.device("cuda", 0))
+    assert g._unchunked_fits(idx, token, None)
+
+
 def test_unchunked_upstream_when_scores_fit_free_memory(monkeypatch):
     # One-shot scoring (faster) when it fits free memory; chunks otherwise or when flex needs our layout.
     import types

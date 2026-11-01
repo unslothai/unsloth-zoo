@@ -34,6 +34,7 @@ from .utils import logger
 _FAMILY = "glm5_next"
 _REFERENCE = {}
 _MODELING = {}
+_UNCHUNKED_ALWAYS_BYTES = 64 << 20
 
 _ATTN_NEEDLES = (
     "k_pass, k_rot = past_key_values.update(k_pass, k_rot, self.layer_idx)",
@@ -105,6 +106,8 @@ def _unchunked_fits(indexer, hidden_states, past_key_values):
     pools = max(1, kv_len // indexer.index_kpool)
     # fp32 [B, S, H, pools] scores (matmul, scaled, relu'd copies) plus the [B, S, kv] visibility masks.
     need = batch * seq_len * (3 * 4 * indexer.n_heads * pools + 2 * kv_len)
+    if need <= _UNCHUNKED_ALWAYS_BYTES:
+        return True  # decode / short chunks: skip the per-layer driver query (about 24 us each)
     try:
         free = torch.cuda.mem_get_info(hidden_states.device)[0]
     except Exception:
