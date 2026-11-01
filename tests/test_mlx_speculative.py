@@ -12,12 +12,16 @@
 import random
 from collections import Counter
 from math import prod
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("mlx.core")
-from unsloth_zoo.mlx.speculative import DraftController, NgramProposer, RoundPlan, RowPlan, RowState, _Ema, _upper
+from unsloth_zoo.mlx.speculative import (
+    TreeBudget,
+    DraftController, NgramProposer, RoundPlan, RowPlan, RowState, SpeculativeEngine, _Calibration, _CycleCosts, _Ema, _upper,
+)
 
 
 def test_ngram_prefers_longer_then_newer_match():
@@ -103,6 +107,97 @@ def test_controller_finds_best_depth_including_plain(draft, slope):
         assert _throughput(choice, draft, machine) >= 0.95 * _throughput(best, draft, machine)
         # Probes and split rounds included, the second half runs near the optimum.
         assert report["rate"] >= 0.9 * _throughput(best, draft, machine)
+
+
+def _deepening_engine(controller, temperature = 0):
+    engine = object.__new__(SpeculativeEngine)
+    engine._exact, engine.controller, engine._extension_streak = True, controller, True
+    engine.drafter = SimpleNamespace(trained_depth = 7, extended_depth = 15, fast_verify = True, extension_serves = lambda row, depth: row.serves)
+    engine._rows = [SimpleNamespace(sample = SimpleNamespace(temperature = temperature), processors = [],
+                                    draft = SimpleNamespace(serves = True))]
+    return engine
+
+
+def test_deeper_rounds_follow_fully_accepted_blocks_within_the_controllers_limits():
+    controller = DraftController(max_depth = 7)
+    state = RowState(controller.new_reply(), remaining = 512)
+    base = RoundPlan("round", rows = (RowPlan("draft", 7),))
+    engine = _deepening_engine(controller)
+    for accepted in (7, 7, 7, 6):
+        controller.record_round(base, [state], [accepted], seconds = 1)
+        engine._observe_extension(base, [state], [accepted])
+    assert engine._extend(base, [state]) is base
+    engine._observe_extension(base, [state], [7])
+    wide = engine._extend(base, [state])
+    assert (controller.max_depth, wide.width, wide.controller_depth) == (7, 16, 7)
+    import importlib
+
+    # The engine's verify scope imports through sys.modules; the package attribute may be a stale MLX world's.
+    inference = importlib.import_module("unsloth_zoo.mlx.inference")
+    narrow = inference._NATIVE_CAUSAL_ROWS
+    for plan, rows in ((RoundPlan("round", rows = (RowPlan("copy", 12),)), narrow), (wide, 16)):
+        with engine._verify_scope(plan):
+            assert getattr(inference._VERIFY_STATE, "causal_rows", narrow) == rows
+    before = state.stats.tokens
+    controller.record_round(wide, [state], [12], seconds = 1)
+    assert state.stats.tokens == before + 13 and 16 not in controller.verify_cost.get(1, {})
+    engine._observe_extension(wide, [state], [12])
+    assert engine._extend(base, [state]).width == 16
+    engine._observe_extension(wide, [state], [3])
+    assert engine._extend(base, [state]) is base
+    engine._observe_extension(RoundPlan("round", rows = (RowPlan("copy", 12),)), [state], [9])
+    assert engine._extend(base, [state]) is base
+
+    engine._extension_streak = True
+    split = replace(base, split = True)
+    assert engine._extend(split, [state]) is split
+    budget = replace(base, split = True, trim = True)
+    deep_budget = engine._extend(budget, [state])
+    assert deep_budget.width == 16 and deep_budget.controller_depth == 7 and not deep_budget.trim
+    assert engine._extend(base, [replace(state, remaining = 10)]).width == 10
+    assert _deepening_engine(DraftController(max_depth = 7, max_copy = 10))._extend(base, [state]).width == 11
+    assert _deepening_engine(DraftController(max_depth = 7, fixed_depth = True))._extend(base, [state]) is base
+    assert _deepening_engine(controller, temperature = 0.7)._extend(base, [state]) is base
+    for refusal in ("_exact", "rows", "processors", "probe", "producer"):
+        refused = _deepening_engine(controller)
+        if refusal == "_exact":
+            refused._exact = False
+        elif refusal == "rows":
+            refused._rows = refused._rows * 2
+        elif refusal == "processors":
+            refused._rows[0].processors = [object()]
+        elif refusal == "producer":
+            refused._rows[0].draft.serves = False
+        else:
+            refused.controller = DraftController(max_depth = 7)
+            refused.controller._reference = 1.0
+        assert refused._extend(base, [state]) is base, refusal
+    poor = RowState(controller.new_reply(), remaining = 512)
+    for _ in range(32):
+        controller.record_round(base, [poor], [0], seconds = 1)
+    assert engine._extend(base, [poor]) is base
+    cold = RowState(controller.new_reply(), remaining = 512)
+    for rate in cold.stats.draft:
+        rate.value = 0.95
+    cold.stats.draft_seen[:] = [True] * 7
+    assert engine._extend(base, [cold]) is base
+    engine._extension_streak = True
+    engine._rows[0].draft.serves = False
+    engine._observe_extension(base, [state], [7])
+    assert not engine._extension_streak
+
+
+def test_copy_candidates_keep_their_load_profile():
+    controller = DraftController(max_depth = 7)
+    controller.copy_profile = {8: 0.01, 12: 1.0}
+    controller.plain_cost[1] = _Ema(0.01, 2)
+    controller.verify_cost[1] = {8: _Ema(0.01, 2)}
+    controller.draft_cost[7] = _Ema(0.002, 2)
+    state = RowState(controller.new_reply(), copy_available = 11)
+    assert controller._round_at(12, [state]).rows == (RowPlan("draft", 7),)
+    state.can_draft = False
+    assert controller._round_at(12, [state]).rows == (RowPlan("copy", 11),)
+    assert controller.round_seconds(controller._round_at(12, [state]), [state]) == 1.0
 
 
 def test_controller_prefers_plain_decoding_over_width_one_rounds():
@@ -226,6 +321,93 @@ def test_timings_resist_one_off_work():
     controller.draft_cost.update({1: _Ema(0.2, 2), 3: _Ema(0.2), 7: _Ema(0.2, 2)})
     rows = [RowState(controller.new_reply())]
     assert [controller._measured_parts(RoundPlan("round", rows = (RowPlan("draft", depth),)), rows) for depth in (1, 3, 7)] == [True, False, False]
+
+
+def test_a_trimmed_round_verifies_the_width_its_drafts_pay_for():
+    controller = DraftController(max_depth = 7, can_copy = False, full_every = 4)
+    def costs(values):
+        curve = controller.cycle_cost[1] = _CycleCosts()
+        for width, seconds in values:  # twice: a width counts once observed twice
+            curve.observe(width, seconds)
+            curve.observe(width, seconds)
+    costs([(w, 1.0 + 0.5 * (w - 1)) for w in range(1, 9)])
+    rows, plan = [RowState(controller.new_reply())], RoundPlan("round", rows = (RowPlan("draft", 7),), split = True, trim = True)
+    width = lambda confidence: controller.trim(plan, rows, [confidence]).width
+    # A doubtful third draft ends the verify before it, confident drafts all verify, doubtful ones keep one; the fourth is a full round.
+    assert [width([0.99, 0.99, 0.2] + [0.99] * 4), width([0.99] * 7), width([0.2] * 7), width([0.2] * 7)] == [3, 8, 1, 8]
+    # When width costs nothing, every draft is worth verifying.
+    costs([(w, 1.0) for w in range(1, 9)])
+    assert width([0.2] * 7) == 8
+    # Accounted, the verified positions calibrate, and the drafting is that of the block drafted, not of the rows verified.
+    controller.record_round(RoundPlan("round", rows = (RowPlan("draft", 3),), split = True, trim = True), rows, [3], seconds = 2.0,
+                            draft_seconds = 0.4, confidences = [[0.9] * 7])
+    assert [len(records) for records in controller.calibration._records] == [1, 1, 1, 0, 0, 0, 0]
+    assert controller.draft_cost[7].value == pytest.approx(0.4) and controller.draft_cost[3].value is None
+    # So is a row's that had no confidences; the fused rounds' hidden drafting is no discount for a round that waited for it.
+    controller.record_round(RoundPlan("round", rows = (RowPlan("draft", 3),), split = True, trim = True), rows, [3], seconds = 2.0,
+                            draft_seconds = 0.6, confidences = [None])
+    assert controller.draft_cost[7].count == 2 and controller.draft_cost[3].value is None
+    costs([(w, 5.0 + 0.1 * (w - 1)) for w in range(1, 9)])
+    assert width([0.99, 0.6] + [0.2] * 5) == 4
+
+
+def test_drafter_confidences_are_calibrated_against_acceptance():
+    import math
+    calibration, rng = _Calibration(3), random.Random(17)
+    offsets = [-0.2, -0.8, -1.3]
+    probability = lambda p, pos: 1 / (1 + math.exp(-0.55 * math.log(p / (1-p)) - offsets[pos]))
+    for _ in range(2400):
+        confidence, accepted = [rng.uniform(0.3, 0.999) for _ in offsets], 0
+        while accepted < 3 and rng.random() < probability(confidence[accepted], accepted):
+            accepted += 1
+        calibration.observe(confidence, 3, accepted)
+    assert len(set(calibration.beta)) == 1
+    for confidence in ([0.4, 0.8, 0.95], [0.95, 0.4, 0.8]):
+        survival, expected = 1.0, 1.0
+        for pos, p in enumerate(confidence):
+            survival *= probability(p, pos)
+            expected += survival
+        assert calibration.expected(confidence) == pytest.approx(expected, abs = 0.09)
+    cold = _Calibration(3)
+    for _ in range(8):
+        cold.observe([0.99, 0.99, 0.99], 3, 0)
+    assert cold.beta[2] == cold.beta[0] < 1.0
+    assert cold.alpha[0] < 0 == cold.alpha[1] == cold.alpha[2]
+    deep = _Calibration(3, 1)
+    for _ in range(8):
+        deep.observe([0.99, 0.99, 0.99], 3, 0)
+    assert deep.alpha[2] == deep.alpha[1] == deep.alpha[0] < 0  # unreached deep positions take the last reached offset
+    assert cold.expected([0.99] * 3) < 2.0
+    before = [list(r) for r in cold._records]
+    cold.observe([float("nan"), float("inf"), -0.1], 3, 3)
+    assert [list(r) for r in cold._records] == before
+    assert 1 < cold.expected([float("nan"), 1.0, 0.0]) <= 4
+    fresh = _Calibration(2)
+    assert fresh.expected([1.1, 0.9]) == pytest.approx(2.33)
+    assert fresh.expected([0.9, -0.1]) == pytest.approx(2.53)
+
+
+def test_completed_cycle_costs_keep_width_coverage_and_clip_stalls():
+    curve = _CycleCosts()
+    for width, seconds in ((2, 12.0), (8, 24.0), (2, 12.0)):
+        curve.observe(width, seconds)
+    assert not curve.ready
+    curve.observe(8, 24.0)
+    assert curve.ready and curve.seconds(5) == 18.0
+    curve.observe(8, 1e6)
+    assert curve.seconds(8) == pytest.approx(32.0)
+    before = dict(curve.points)
+    for bad in (0, -1, float("nan"), float("inf")):
+        curve.observe(8, bad)
+    assert curve.points == before
+    for _ in range(64):
+        curve.observe(4, 18.0)
+    assert not curve.ready and curve.points == {4: (18.0, 64)}
+    curve.observe(8, 24.0)
+    curve.observe(8, 24.0)
+    assert curve.ready and curve.seconds(6) == 21.0
+    curve.points = {2: (23.0, 2), 4: (21.0, 6), 8: (28.0, 8)}
+    assert [curve.seconds(w) for w in (2, 4, 6, 8)] == [21.5, 21.5, 24.75, 28.0]
 
 
 def test_short_budgets_never_plan_empty_drafts():
@@ -429,6 +611,23 @@ def test_the_bare_engine_has_every_attribute_init_sets():
     assert all(getattr(engine, name) is None for name in names)
 
 
+def test_committed_cache_submission_defers_only_a_pending_fold_replay():
+    from unsloth_zoo.mlx.speculative import _committed_eval_state
+
+    class Cache:
+        def __init__(self, state, pending = None):
+            self.state = state
+            if pending is not None:
+                self._unsloth_pending = (pending, object(), object())
+
+    first, replay, last = object(), object(), object()
+    assert _committed_eval_state(Cache([first, replay, last], replay)) == [first, last]
+    assert _committed_eval_state(Cache([first, last], replay)) == [first, last]
+    assert _committed_eval_state(Cache((first, last))) == (first, last)
+    assert _committed_eval_state(Cache(replay, replay)) == []
+    assert _committed_eval_state(Cache(first, replay)) is first
+
+
 def test_only_the_verify_forward_is_built_as_a_verify_block():
     import importlib
     from unsloth_zoo.mlx.speculative import SpeculativeEngine
@@ -466,3 +665,180 @@ def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_a
     engine._rows, engine._states = rows, lambda: []
     list(engine._plain(3, []))
     assert (1 in queued) == history_only
+
+
+def test_a_context_drafter_drafts_the_next_block_ahead_until_a_push_overtakes_it():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    sizes, drafter, row = [], object.__new__(ContextDrafter), ContextRow([])
+    drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
+    drafter.trained_depth = drafter.extended_depth = 3
+    # Each draft encodes its block's anchor and context length.
+    drafter._draft = lambda pending, context, cache, size, sampler, dtype: sizes.append(size) or mx.array([[100 * pending + 10 * context.shape[1] + i for i in range(size - 1)]])
+    drafter.push(row, [1, 2], mx.zeros((2, 4)))
+    drafter.prefetch([row, None])
+    assert row.ready and drafter.draft([], [row, None], 2, []).tolist() == [[220, 221], [0, 0]] and sizes == [4] and not row.ready
+    drafter.push(row, [3], mx.zeros((1, 4)))
+    drafter.prefetch([row])
+    drafter.push(row, [4], mx.zeros((1, 4)))
+    assert drafter.draft([], [row], 2, []).tolist() == [[410, 411]] and sizes == [4, 4, 3]
+
+
+def test_a_context_drafter_drafts_from_the_block_that_moves_a_long_backlog_into_its_cache():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    sizes, drafter, row = [], object.__new__(ContextDrafter), ContextRow([])
+    drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
+    drafter.trained_depth = drafter.extended_depth = 3
+    drafter._draft = lambda pending, context, cache, size, sampler, dtype: sizes.append(size) or mx.array([[100 * pending + 10 * context.shape[1] + i for i in range(size - 1)]])
+    drafter.push(row, [1], mx.zeros((63, 4)))
+    assert row.ready and row.prefetched is None and not sizes and not row.flushed
+    # A prompt past the backlog drafts its first round at once, from the full block that moved it.
+    drafter.push(row, [5], mx.zeros((64, 4)))
+    assert row.ready and not row.features and sizes == [4] and row.flushed
+    assert drafter.draft([], [row], 3, []).tolist() == [[1770, 1771, 1772]] and sizes == [4] and not row.flushed
+
+
+def test_a_context_drafter_serves_a_prefetched_block_of_the_requested_depth_unsliced():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    drafter = object.__new__(ContextDrafter)
+    drafter.max_lag, drafter.max_depth, drafter._selector = 64, 3, None
+    drafter.trained_depth = drafter.extended_depth = 3
+    drafter._draft = lambda pending, context, cache, size, sampler, dtype: mx.arange(size - 1)[None]
+    def ready():
+        row = ContextRow([])
+        drafter.push(row, [1, 2], mx.zeros((2, 4)))
+        drafter.prefetch([row])
+        row.prefetched_confidence = mx.full((1, 3), 0.5)
+        return row
+    row = ready()
+    block, confidence = row.prefetched, row.prefetched_confidence
+    assert drafter.draft([], [row], 3, []) is block and drafter.confidence == [confidence]
+    row = ready()
+    block, confidence = row.prefetched, row.prefetched_confidence
+    served = drafter.draft([], [row], 2, [])
+    assert served is not block and served.tolist() == block[:, :2].tolist()
+    assert drafter.confidence[0] is not confidence and drafter.confidence[0].shape == (1, 2)
+    first, second = ready(), ready()
+    assert drafter.draft([], [first, second], 3, []).tolist() == [[0, 1, 2], [0, 1, 2]]
+
+
+def test_drafter_layers_submit_their_output_when_built_in_eval_mode(monkeypatch):
+    from mlx_simulation import mlx_is_simulated
+
+    if mlx_is_simulated():
+        pytest.skip("needs real mlx.nn.Module: dict-backed children and the training flag")
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference
+
+    class Layer(nn.Module):
+        def __init__(self, mlp = True):
+            super().__init__()
+            self.self_attn = nn.Linear(4, 4)
+            if mlp:
+                self.mlp = nn.Linear(4, 4)
+
+        def __call__(self, x):
+            return self.mlp(self.self_attn(x)) if hasattr(self, "mlp") else self.self_attn(x)
+
+    model, submitted = nn.Module(), []
+    model.layers = [Layer(), Layer(mlp = False), Layer()]
+    model.eval()
+    monkeypatch.setattr(inference.mx, "async_eval", lambda *arrays: submitted.extend(arrays))
+    x = mx.ones((1, 4))
+    expected = [layer(x) for layer in model.layers]  # before reclassing
+    assert inference.submitted_drafter_layers(model) == 2 and type(model.layers[1]) is Layer
+    outputs = [layer(x) for layer in model.layers]
+    assert all(mx.array_equal(out, want).item() for out, want in zip(outputs, expected))
+    assert len(submitted) == 2 and submitted[0] is outputs[0] and submitted[1] is outputs[2]
+    # Training submits nothing.
+    model.layers[0].train()
+    model.layers[0](x)
+    assert len(submitted) == 2
+    # Inside a function transformation, where submitting is refused, the layer still returns its output.
+    monkeypatch.setattr(inference.mx, "async_eval", lambda *arrays: (_ for _ in ()).throw(ValueError("transform")))
+    assert mx.array_equal(model.layers[2](x), expected[2]).item()
+
+
+def test_prepared_plans_preserve_controller_state_and_choices():
+    import copy
+    import importlib
+    import pickle
+    # Pickle resolves classes through sys.modules, which another module's MLX world may have re-imported since collection.
+    spec = importlib.import_module("unsloth_zoo.mlx.speculative")
+    DraftController, RowState, RoundPlan, RowPlan, _CycleCosts = (
+        spec.DraftController, spec.RowState, spec.RoundPlan, spec.RowPlan, spec._CycleCosts)
+    controller = DraftController(max_depth = 3, min_window = 3, probe_every = 5, stale_after = 8)
+    controller.trims = True
+    states = [RowState(controller.new_reply(), copy_available = 6), RowState(controller.new_reply())]
+    controller.cycle_cost[2] = curve = _CycleCosts()
+    curve.observe(2, 0.03)
+    curve.observe(2, 0.03)
+    curve.observe(4, 0.04)
+    curve.observe(4, 0.04)
+    baseline, original = copy.deepcopy((controller, states))
+    for index in range(160):
+        # Reaching a verify floor also changes the warmup list during planning.
+        controller.min_rows = baseline.min_rows = 5 if index < 4 else 0
+        before = pickle.dumps((controller, states))
+        prepared = controller.prepare_plan(states)
+        assert pickle.dumps((controller, states)) == before
+        for c, s in ((controller, states), (baseline, original)):
+            c.observe_cycle(RoundPlan("round", rows = (RowPlan("draft", 3),) * 2, trim = True), s, 0.04)
+        actual, expected = controller.plan(states, prepared), baseline.plan(original)
+        assert (actual is prepared.plan) == (prepared.cycle_ready == controller._cycle_ready(states))
+        assert actual == expected
+        assert pickle.dumps((controller, states)) == pickle.dumps((baseline, original))
+        for c, s in ((controller, states), (baseline, original)):
+            if actual.kind == "round":
+                c.record_round(actual, s, [min(r.length, (index + i) % 4) for i, r in enumerate(actual.rows)],
+                               seconds = 0.04, draft_seconds = 0.006)
+            else:
+                c.record_plain(s, actual.length, 0.02 * actual.length, 0.02)
+    assert controller.cycle_cost[2].points[4][1] == 64
+def test_tree_budget_runs_the_widest_tree_until_measured_then_the_best_rate_and_keeps_probing():
+    budget = TreeBudget({8: 1.0, 16: 1.1}, {8: 1.0}, trained_rows = 8)
+    assert {budget.choose() for _ in range(budget.MIN_SAMPLES)} == {16}
+    # Every path here reached depth 6 within the first 8 rows: 16 rows' price buys nothing. A narrower round moves nothing.
+    for _ in range(budget.MIN_SAMPLES):
+        budget.observe(16, [1, 2, 3, 4, 5, 6], 3)
+    before = budget.trees[16].value
+    budget.observe(8, [1], 1)
+    assert budget.trees[16].value == before
+    picks = [budget.choose() for _ in range(2 * budget.PROBE_EVERY)]
+    assert picks.count(16) == 2 and picks.count(8) == 2 * budget.PROBE_EVERY - 2
+    # Deep paths past rank 8 pay for the rows.
+    for _ in range(4 * budget.MIN_SAMPLES):
+        budget.observe(16, [1, 2, 9, 10, 11, 12, 13, 14], 2)
+    assert budget.trees[16].value > 8 and budget.trees[8].value < 4 and budget.choose() == 16
+    # A chain emits at most its rows; a lattice whose paths are first children, at a dearer tree cycle, runs the chain.
+    budget = TreeBudget({8: 1.1}, {8: 1.0}, trained_rows = 8)
+    for _ in range(budget.MIN_SAMPLES):
+        budget.observe(8, list(range(1, 15)), 14)
+    assert budget.chains[8].value == 8
+    picks = [budget.choose() for _ in range(budget.PROBE_EVERY)]
+    assert picks.count(0) == budget.PROBE_EVERY - 1 and picks.count(8) == 1
+
+
+
+
+def test_a_controller_capped_below_the_drafters_trained_depth_keeps_its_chain():
+    from unsloth_zoo.mlx.speculative import SpeculativeEngine
+
+    def plan_for(controller):
+        engine = object.__new__(SpeculativeEngine)
+        draft = SimpleNamespace(tree_rows = None, prefetched_tree = None)
+        engine.drafter = SimpleNamespace(trained_depth = 7, tree_budget = SimpleNamespace(choose = lambda: 8))
+        engine.lm = SimpleNamespace(_unsloth_tree_verify = True)
+        engine.controller = controller
+        engine._rows = [SimpleNamespace(draft = draft, sample = SimpleNamespace(temperature = 0), processors = [])]
+        plan = RoundPlan("round", rows = (RowPlan("draft", min(7, controller.max_depth)),))
+        return engine._tree_plan(plan, [RowState(controller.new_reply(), remaining = 64)]), draft
+
+    for capped in (DraftController(max_depth = 2, fixed_depth = True), DraftController(max_depth = 2)):
+        plan, draft = plan_for(capped)
+        assert not plan.tree and draft.tree_rows == 0
+    plan, draft = plan_for(DraftController(max_depth = 7))
+    assert plan.tree == 8 and draft.tree_rows == 8

@@ -149,7 +149,10 @@ def apply_inductor_correctness_workarounds():
             if config is not None and hasattr(config, "cache_key_tag"):
                 tags = [t for t in config.cache_key_tag.split(",") if t]
                 if INDUCTOR_CORRECTNESS_CACHE_TAG not in tags:
-                    config.cache_key_tag = ",".join(tags + [INDUCTOR_CORRECTNESS_CACHE_TAG])
+                    # Every thread: a reentrant checkpoint recompiles on autograd's device thread (torch >= 2.12
+                    # keeps config per thread), where a warm cache would serve rand4x kernels.
+                    from unsloth_zoo.torch_config import set_torch_config
+                    set_torch_config(config, "cache_key_tag", ",".join(tags + [INDUCTOR_CORRECTNESS_CACHE_TAG]))
             active.append("rand4x")
         except Exception as error:
             if UNSLOTH_ENABLE_LOGGING:

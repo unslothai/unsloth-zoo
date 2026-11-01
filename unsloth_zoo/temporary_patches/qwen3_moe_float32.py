@@ -41,6 +41,7 @@
 # ============================================================================
 
 import os
+import sys
 import threading
 import torch
 from .common import (
@@ -50,7 +51,13 @@ from .common import (
     unwrap_norm_weight,
     publish_to_modeling_module,
 )
-from .utils import compile_with_eager_fallback, patch_function, raise_error
+from .utils import (
+    compile_with_eager_fallback,
+    other_family_load,
+    patch_forced_float32,
+    raise_error,
+    undo_forced_float32,
+)
 # Full finetuning on a GPU without bfloat16 runs this family in float32 with no autocast, so the fp16 RMSNorm output
 # meets float32 weights: cast at each Linear boundary (identity on the fp16 LoRA path), as gemma4_float32 does.
 from .gemma import _linear_boundary_dtype, _to_boundary_dtype, _to_forced_output_dtype
@@ -64,8 +71,21 @@ _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION
 _QWEN3_MOE_BOUNDARY = threading.local()
 
 
+_QWEN3_MOE_FAMILY = r"(?<![a-z0-9])qwen3_moe(?![a-z0-9])"
+
+
+def _skip_or_undo(class_name):
+    """True when the forced patch must not install; a flag "0" load of this family undoes it first."""
+    if other_family_load(_QWEN3_MOE_FAMILY): return True
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "0": return False
+    # Not imported means never patched; do not import qwen3_moe for this.
+    modeling = sys.modules.get("transformers.models.qwen3_moe.modeling_qwen3_moe")
+    undo_forced_float32(getattr(modeling, class_name, None), "forward")
+    return True
+
+
 def patch_Qwen3MoeDecoderLayer_float32():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _skip_or_undo("Qwen3MoeDecoderLayer"): return
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer
@@ -126,7 +146,7 @@ def patch_Qwen3MoeDecoderLayer_float32():
     pass
     # force = True: guarantee the residual-float32 forward wins even if a wrapper
     # is pre-installed; the layer is not compiled so this stays eager Python.
-    patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer, "forward", forward, force = True, match_level = "relaxed")
+    patch_forced_float32(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer, "forward", forward, force = True, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeDecoderLayer_float32)
 
@@ -158,7 +178,7 @@ _qwen3_moe_rms_norm_float32 = compile_with_eager_fallback(_qwen3_moe_rms_norm_fl
 
 
 def patch_Qwen3MoeRMSNorm_float32():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _skip_or_undo("Qwen3MoeRMSNorm"): return
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
@@ -184,13 +204,13 @@ def patch_Qwen3MoeRMSNorm_float32():
         normed = kernel(hidden_states_2d, unwrap_norm_weight(self.weight), self.variance_epsilon)
         return normed.reshape(shape)
     pass
-    patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm, "forward", forward, match_level = "relaxed")
+    patch_forced_float32(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm, "forward", forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeRMSNorm_float32)
 
 
 def patch_Qwen3MoeAttention_float32():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _skip_or_undo("Qwen3MoeAttention"): return
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
@@ -318,6 +338,6 @@ def patch_Qwen3MoeAttention_float32():
     pass
     # force = True: win over the compiled / dtype-aligned attention forward that
     # unsloth installs (q/k float32 vs v fp16 -> SDPA mismatch otherwise).
-    patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention, "forward", forward, force = True, match_level = "relaxed")
+    patch_forced_float32(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention, "forward", forward, force = True, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeAttention_float32)
