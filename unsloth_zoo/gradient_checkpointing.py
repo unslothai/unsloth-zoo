@@ -578,11 +578,34 @@ def _view_bytes_as(buffer, nbytes, dtype, shape):
     return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
 
 
-# float32 activations (FORCE_FLOAT32 residuals) offload as bfloat16, the same bytes as before, and are
-# cast back to float32 for the recompute. float16 overflows gemma3 residuals (~3e5) and per-row scaled
-# float16 spiked grad norms 20x on a T4 (outlier rows leave small entries subnormal). The dtype restore,
-# not the storage, is what the recompute needs. UNSLOTH_OFFLOAD_FP32=exact keeps the exact float32 bytes.
-FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
+# float32 activations offloaded while autocast is on for their device (FORCE_FLOAT32 residuals under fp16 /
+# bf16 autocast) are stored as bfloat16, the same bytes as before, and cast back to float32 for the
+# recompute. float16 overflows gemma3 residuals (~3e5) and per-row scaled float16 spiked grad norms 20x on a
+# T4 (outlier rows leave small entries subnormal). Without autocast the model trains in true float32, where
+# bf16 storage drifted LoRA grads ~0.1% (up to 4% on one full finetuning param), so those are stored exactly.
+# UNSLOTH_OFFLOAD_FP32=exact always keeps float32, =bf16 always stores bfloat16, unset / auto picks per tensor.
+def _fp32_offload_mode():
+    mode = os.environ.get("UNSLOTH_OFFLOAD_FP32", "auto").strip().lower()
+    if mode in ("exact", "fp32", "float32"): return "exact"
+    if mode in ("bf16", "bfloat16"): return "bf16"
+    return "auto"
+FP32_OFFLOAD_MODE = _fp32_offload_mode()
+FP32_OFFLOAD_EXACT = FP32_OFFLOAD_MODE == "exact"
+
+
+def _autocast_enabled(device_type):
+    try:
+        return torch.is_autocast_enabled(device_type)
+    except TypeError:  # torch < 2.4 has no device argument
+        return torch.is_autocast_cpu_enabled() if device_type == "cpu" else torch.is_autocast_enabled()
+
+
+def _offload_store_dtype(tensor):
+    """Dtype an offloaded activation is stored in; the recompute always gets tensor.dtype back."""
+    dtype = tensor.dtype
+    if dtype != torch.float32 or FP32_OFFLOAD_EXACT: return dtype
+    if FP32_OFFLOAD_MODE == "bf16" or _autocast_enabled(tensor.device.type): return torch.bfloat16
+    return dtype
 
 
 @contextmanager
@@ -1446,8 +1469,9 @@ pass
 
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    global FP32_OFFLOAD_EXACT
-    FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
+    global FP32_OFFLOAD_EXACT, FP32_OFFLOAD_MODE
+    FP32_OFFLOAD_MODE = _fp32_offload_mode()
+    FP32_OFFLOAD_EXACT = FP32_OFFLOAD_MODE == "exact"
     global GC_PREFETCH
     GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
     _reset_gc_prefetch_state()
@@ -1611,8 +1635,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global CURRENT_GC_INDEX
                     CURRENT_GC_INDEX += 1
 
-                    # The cutoff counts stored bytes, so bf16-stored float32 offloads exactly where it always did.
-                    store_dtype = torch.bfloat16 if (arg.dtype == torch.float32 and not FP32_OFFLOAD_EXACT) else arg.dtype
+                    # The cutoff counts stored bytes: bf16-stored float32 (autocast) offloads exactly where it always
+                    # did; exactly stored float32 (no autocast) counts 4 bytes, so 2-4MB activations now offload too.
+                    store_dtype = _offload_store_dtype(arg)
                     new_size = arg.numel() * store_dtype.itemsize
 
                     global MINIMUM_SIZE
