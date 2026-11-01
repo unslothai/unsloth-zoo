@@ -1879,6 +1879,10 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
 
 
 def test_target_head_precision_scope_preserves_shared_heads_training_and_ownership(monkeypatch):
+    from mlx_simulation import mlx_is_simulated
+
+    if mlx_is_simulated():
+        pytest.skip("needs real mlx.nn.Module: dict-backed children and the training flag")
     import mlx.nn as nn
     from unsloth_zoo.mlx import inference
 
