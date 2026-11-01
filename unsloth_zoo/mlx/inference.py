@@ -7531,26 +7531,30 @@ class _TargetHeadFP32(nn.Module):
                 or self._layout != (p.group_size, p.bits, p.mode) or not p.__dict__.get("_unsloth_lane_qmm")):
             return p(x)
         most = matmul.LANE_QMM_MAX_ROWS
-        if x.size // x.shape[-1] > most:
-            # In launches of `most` rows, as `_lane_rows` splits them: a row's bits do not depend on its launch.
-            flat = x.reshape(1, -1, x.shape[-1])
-            parts = [self(flat[:, i : i + most]) for i in range(0, flat.shape[1], most)]
-            if all(part.dtype == mx.float32 for part in parts):
-                return mx.concatenate(parts, axis = 1).reshape(*x.shape[:-1], -1)
-            return p(x)
+        if x.size // x.shape[-1] <= most:
+            return self._served(p, x)[0]
+        # In launches of `most` rows, as `_lane_rows` splits them: a row's bits do not depend on its launch.
+        flat = x.reshape(1, -1, x.shape[-1])
+        parts = [self._served(p, flat[:, i : i + most]) for i in range(0, flat.shape[1], most)]
+        if all(served for _, served in parts):
+            return mx.concatenate([y for y, _ in parts], axis = 1).reshape(*x.shape[:-1], -1)
+        return p(x)
+
+    def _served(self, p, x):
+        """(output, whether the lane kernel produced it): the stock head's until x's shape is admitted."""
         ready = p.__dict__.get("_unsloth_lane_qmm_ready", {}).get(x.shape)
         if ready is None:
             original = p(x)
             ready = p.__dict__.get("_unsloth_lane_qmm_ready", {}).get(x.shape)
             if ready is None:
-                return original
+                return original, False
         w, scales, biases = p.get("weight"), p.get("scales"), p.get("biases")
         if (not all(isinstance(a, mx.array) for a in (w, scales, biases)) or ready[1] != (
                 x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape,
                 p.group_size, p.bits, p.mode)):
-            return p(x)
+            return p(x), False
         y = matmul.lane_qmm(x.reshape(-1, x.shape[-1]), w, scales, biases, p.group_size, p.bits, output_dtype = mx.float32)
-        return y.reshape(*x.shape[:-1], w.shape[0])
+        return y.reshape(*x.shape[:-1], w.shape[0]), True
 
 
 @contextmanager

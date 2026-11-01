@@ -2139,7 +2139,7 @@ def test_target_head_runs_more_rows_than_one_lane_launch_in_fp32_launches(monkey
     from unsloth_zoo.mlx import inference, matmul
 
     head = nn.QuantizedLinear(64, 16, bias = False, group_size = 64, bits = 4)
-    head.eval()
+    head.eval().set_dtype(mx.bfloat16)
     head._unsloth_lane_qmm = True
     launches = []
 
@@ -2159,4 +2159,5 @@ def test_target_head_runs_more_rows_than_one_lane_launch_in_fp32_launches(monkey
     assert launches == [32, 8] and y.dtype == mx.float32 and y.shape == (2, 20, 16)
     # A launch shape not yet admitted keeps the whole call on the stock head, never mixed precisions.
     del head.__dict__["_unsloth_lane_qmm_ready"][(1, 8, 64)]
-    assert fp32(x).dtype == mx.bfloat16
+    launches.clear()
+    assert fp32(x).dtype == mx.bfloat16 and launches == [32]
