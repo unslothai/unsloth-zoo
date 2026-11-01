@@ -294,3 +294,23 @@ def test_load_adapter_keeps_the_file_path_when_nothing_converts(monkeypatch):
     class _Offloaded:
         hf_device_map = {"model.layers.0": "disk"}
     assert swap._converted_load_kwargs(_Offloaded(), dict(kwargs), "default") == kwargs
+
+
+def test_load_adapter_under_disk_offload_passes_a_converted_file(monkeypatch, tmp_path):
+    # Failing before: with any module on "disk" the converted factors were dropped (the new save layout then failed
+    # by shape); now they are written to a scratch safetensors file that disk offload can index.
+    import torch
+    from safetensors.torch import load_file
+    from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
+
+    class _Offloaded:
+        hf_device_map = {"model": "cpu", "lm_head": "disk"}
+
+    src = {"k": torch.ones(2)}
+    monkeypatch.setattr("transformers.modeling_utils.load_state_dict", lambda f, map_location = "cpu": dict(src))
+    monkeypatch.setattr(swap, "_from_vanilla", lambda model, sd, name: {"k": torch.zeros(2)})
+    out = swap._converted_load_kwargs(
+        _Offloaded(), {"state_dict": None, "checkpoint_files": [__file__]}, "default", str(tmp_path)
+    )
+    assert out["state_dict"] is None and len(out["checkpoint_files"]) == 1
+    assert torch.equal(load_file(out["checkpoint_files"][0])["k"], torch.zeros(2))

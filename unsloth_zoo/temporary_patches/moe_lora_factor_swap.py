@@ -237,18 +237,14 @@ def _wrap_hotswap(original):
     return hotswap_adapter_from_state_dict
 
 
-def _converted_load_kwargs(model, kwargs, adapter_name):
+def _converted_load_kwargs(model, kwargs, adapter_name, scratch_dir = None):
     """The load kwargs with converted factors, or the original kwargs when nothing needs converting (the
-    file-backed path stays, which disk offload builds its index from)."""
+    file-backed path stays). Under disk offload, which indexes checkpoint files, the converted factors are written
+    to a safetensors file in `scratch_dir` and passed as the checkpoint instead."""
     state_dict = kwargs.get("state_dict")
     files = list(kwargs.get("checkpoint_files") or [])
     from_files = state_dict is None and files and all(os.path.isfile(str(f)) for f in files)
     if from_files:
-        device_map = getattr(model, "hf_device_map", None) or {}
-        if "disk" in set(device_map.values()):
-            # Converted tensors would need their own offload files: keep transformers' path (an unconverted
-            # adapter then fails by shape, never silently).
-            return kwargs
         # transformers' own reader: it keeps the torch.load safety check for .bin files.
         from transformers.modeling_utils import load_state_dict as _hf_load_state_dict
         state_dict = {}
@@ -259,6 +255,12 @@ def _converted_load_kwargs(model, kwargs, adapter_name):
     converted = _from_vanilla(model, state_dict, adapter_name)
     if all(converted.get(key) is value for key, value in state_dict.items()):
         return kwargs
+    device_map = getattr(model, "hf_device_map", None) or {}
+    if from_files and scratch_dir is not None and "disk" in set(device_map.values()):
+        from safetensors.torch import save_file
+        path = os.path.join(scratch_dir, "adapter_model.safetensors")
+        save_file({key: value.contiguous() for key, value in converted.items()}, path)
+        return dict(kwargs, checkpoint_files = [path])
     kwargs = dict(kwargs, state_dict = converted)
     if from_files:
         kwargs["checkpoint_files"] = None
@@ -279,19 +281,22 @@ def _wrap_load_adapter(original):
             # (disk offload indexes the checkpoint files it was given).
             if _swapped_wrappers(model):
                 try:
-                    k = _converted_load_kwargs(model, k, name)
+                    k = _converted_load_kwargs(model, k, name, scratch.name)
                 except Exception as e:
                     if UNSLOTH_ENABLE_LOGGING:
                         logger.warning(f"Unsloth: loaded expert LoRA factors unchanged: {e}")
             # Called once, outside the try: a real load error is raised, not retried.
             return cls_load(*a, **k)
 
+        import tempfile
+        scratch = tempfile.TemporaryDirectory(prefix = "unsloth_lora_swap_")
         self.__dict__["_load_pretrained_model"] = _load_pretrained_model
         try:
             return original(self, peft_model_id, adapter_name, *args, **kwargs)
         finally:
             if not had:
                 self.__dict__.pop("_load_pretrained_model", None)
+            scratch.cleanup()
     load_adapter._unsloth_factor_swap = True
     load_adapter.__wrapped__ = original
     return load_adapter
