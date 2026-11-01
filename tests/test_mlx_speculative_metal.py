@@ -318,6 +318,90 @@ def test_ragged_rounds_match_each_row_decoded_alone(qwen):
     assert seen == [2, 1] and out == [_solo(model, ids[0], 12, SamplingParams()), _solo(model, ids[1], 3, SamplingParams())]
 
 
+def test_quantized_rows_roll_back_row_by_row_and_match_each_decoded_alone(qwen, monkeypatch):
+    from mlx_vlm.models.cache import BatchQuantizedKVCache
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids = qwen
+    prefill = _prefill
+    def quantized(lm, *a, **k):
+        cache, first, hidden = prefill(lm, *a, **k)
+        return [entry.to_quantized(group_size = 64, bits = 8) if hasattr(entry, "to_quantized") else entry for entry in cache], first, hidden
+    monkeypatch.setitem(globals(), "_prefill", quantized)
+    join, joined = speculative._join, []
+    monkeypatch.setattr(speculative, "_join", lambda *a: (merged := join(*a), joined.extend(map(type, merged)))[0])
+    prepare, ragged = BatchQuantizedKVCache.prepare, []
+    monkeypatch.setattr(BatchQuantizedKVCache, "prepare", lambda cache, **k: (ragged.append(max(k.get("right_padding", (0,)))), prepare(cache, **k))[1])
+    prompts = [*ids, ids[0][3:]]  # a third row joins through extend
+    rows, drafted, _ = _run(model, prompts, 64, _script(("copy", 8), ("plain", 2)), SamplingParams())
+    assert rows == [_solo(model, prompt, 64, SamplingParams()) for prompt in prompts]
+    assert BatchQuantizedKVCache in joined and max(ragged) > 0 and any(accepted > 0 for _, accepted in drafted.values())
+
+
+def _quantized_prefill(monkeypatch):
+    prefill = _prefill
+    def quantized(lm, *a, **k):
+        cache, first, hidden = prefill(lm, *a, **k)
+        return [entry.to_quantized(group_size = 64, bits = 8) if hasattr(entry, "to_quantized") else entry for entry in cache], first, hidden
+    monkeypatch.setitem(globals(), "_prefill", quantized)
+
+
+def test_a_quantized_row_leaves_with_its_own_cache(qwen, monkeypatch):
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.generate import SamplingParams, _row_cache
+    model, ids = qwen
+    _quantized_prefill(monkeypatch)
+    alone = [_prefill(model.language_model, prompt, SamplingParams())[0] for prompt in ids]
+    assert speculative._packed_kv(alone[0]) and not speculative._packed_kv([SimpleNamespace(keys = mx.zeros((1, 1, 1, 1)))])
+    assert all(row is entry for row, entry in zip(_row_cache(alone[0], 0), alone[0]) if hasattr(entry, "keys"))
+    merged = speculative._join(speculative._join(None, alone[0], 0), alone[1], 1)
+    assert all(row.offset == entry.offset for row, entry in zip(_row_cache(merged, 1), alone[1]) if hasattr(entry, "keys"))
+
+
+def test_a_quantized_row_copies_without_a_drafter_that_reads_target_keys(qwen, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import AssistantDrafter
+    class Assistant(AssistantDrafter):
+        def __init__(self):
+            pass
+        def start(self, *a):
+            raise AssertionError("a packed row was given a draft")
+    model, ids = qwen
+    prompt, expected = ids[0], _solo(model, ids[0], 32, SamplingParams())
+    _quantized_prefill(monkeypatch)
+    rows, drafted, _ = _run(model, [prompt], 32, _script(("copy", 8), ("plain", 2)), SamplingParams(), drafter = Assistant())
+    assert rows == [expected] and drafted
+
+
+def test_a_quantized_row_is_refused_where_mlx_vlm_cannot_merge_it(monkeypatch):
+    from mlx_vlm.models.cache import QuantizedKVCache
+    from unsloth_zoo.mlx import generate
+    monkeypatch.delattr(QuantizedKVCache, "prefix_cache_merge")
+    state = SimpleNamespace(open = lambda prompt: ([QuantizedKVCache()], None))
+    with pytest.raises(generate.BatchRowRefused, match = "cannot batch"):
+        generate._SpeculativeBatchSession._resume(None, state, [1], None, None, {})
+
+
+def test_a_row_whose_cache_differs_from_the_batch_is_refused_and_the_batch_continues(qwen, monkeypatch):
+    from dataclasses import replace
+    from unsloth_zoo.mlx import generate
+    from unsloth_zoo.mlx.speculative import SpeculativeDraft
+    model, request = qwen[0], generate.GenerationRequest(prompt = "Name three colours.", max_tokens = 6)
+    monkeypatch.setattr(model, "_is_vlm_model", True, raising = False)
+    admit = SpeculativeDraft.admit
+    def quantized(self, *a, **k):
+        row, logprob = admit(self, *a, **k)
+        return replace(row, cache = [entry.to_quantized(group_size = 64, bits = 8) if hasattr(entry, "to_quantized") else entry for entry in row.cache]), logprob
+    with generate.BatchStream(model, None, speculative = SpeculativeDraft(_rounds_only())) as stream:
+        row = stream.add(request)
+        with monkeypatch.context() as patch:
+            patch.setattr(SpeculativeDraft, "admit", quantized)
+            pytest.raises(generate.BatchRowRefused, stream.add, request)
+        session = stream._session
+        assert session.usable and len(session.engine.rows) == 1
+        assert any(event.index == row and event.result is not None for _ in range(12) for event in stream.iter_step())
+
+
 def test_a_batch_row_settles_on_the_history_its_processor_is_shown():
     from unsloth_zoo.mlx.generate import _sequential_history
     settled = []
@@ -1029,6 +1113,22 @@ def test_a_lone_greedy_row_verifies_draft_trees_and_keeps_its_tokens_and_scores(
         reference += expected
         _scored_reply(model, ids, sampled, 16, sampling = SamplingParams(temperature = 0.5, seed = 3))
     assert not commits
+
+
+def test_a_quantized_row_keeps_its_chain_rounds(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import EngineRow, RoundPlan, RowPlan
+    model, ids, _ = qwen_4bit
+    plan, widths = RoundPlan("round", 4, rows = (RowPlan("draft", 4),)), []
+    monkeypatch.setitem(model.language_model.__dict__, "_unsloth_tree_verify", 1)
+    for _ in range(2):
+        engine, _, _ = _tree_engine(model, monkeypatch)
+        engine.controller.max_depth = engine.drafter.trained_depth
+        cache, first, hidden = _prefill(model.language_model, ids[0], SamplingParams(), (), engine.drafter)
+        engine.add(EngineRow(cache = cache, pending = first, prompt = ids[0], max_tokens = 8, hidden = hidden, uid = 0, sampling = SamplingParams()))
+        widths.append(engine._tree_plan(plan, engine._states()).tree)
+        _quantized_prefill(monkeypatch)
+    assert widths[0] and not widths[1]
 
 
 def test_load_times_the_tree_widths_of_a_target_whose_rows_match_their_paths(qwen_4bit, monkeypatch):

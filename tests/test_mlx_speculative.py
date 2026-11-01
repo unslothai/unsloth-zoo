@@ -833,6 +833,7 @@ def test_a_controller_capped_below_the_drafters_trained_depth_keeps_its_chain():
         engine.drafter = SimpleNamespace(trained_depth = 7, tree_budget = SimpleNamespace(choose = lambda: 8))
         engine.lm = SimpleNamespace(_unsloth_tree_verify = True)
         engine.controller = controller
+        engine.cache = []
         engine._rows = [SimpleNamespace(draft = draft, sample = SimpleNamespace(temperature = 0), processors = [])]
         plan = RoundPlan("round", rows = (RowPlan("draft", min(7, controller.max_depth)),))
         return engine._tree_plan(plan, [RowState(controller.new_reply(), remaining = 64)]), draft
