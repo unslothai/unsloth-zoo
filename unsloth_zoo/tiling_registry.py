@@ -630,7 +630,9 @@ _run_tiled_outside_graph = torch.compiler.disable(_run_tiled, recursive = True)
 # Opaque tiled op: inside Unsloth's compiled block the whole tile loop is one graph node, so the block keeps one graph
 # (no break, no resumed half) and Inductor cannot overlap tiles. Forward runs the tiles under no_grad and saves only
 # x; backward recomputes one tile at a time and differentiates it (the arctic recipe). Dense MLPs with a single rows
-# output, no RNG replay, plain (non-DTensor) trainable parameters and output width == input width only.
+# output, no RNG replay, plain (non-DTensor) trainable parameters and output width == input width only. It reads the
+# MLP's weights from the live module when it runs, so the region must not update them in place around the call
+# (Unsloth's decoder blocks never do).
 _OP_MODULES = weakref.WeakSet()
 _OP_BY_PTR = {}
 _OP_VERSION = [0, -1]  # (modules attached, version _OP_BY_PTR was built at)
@@ -712,8 +714,8 @@ def _op_module(params):
         if module is None or not _op_matches(module, params):
             raise RuntimeError(
                 "Unsloth: tiled MLP op could not tell which module owns its parameters (several MLPs share their "
-                "trainable parameters but not their other weights); set UNSLOTH_TILED_COMPILE=compile_tile to tile "
-                "them outside the block graph."
+                "trainable parameters but not their other weights, or the compiled region updated them in place "
+                "before the call); set UNSLOTH_TILED_COMPILE=compile_tile to tile them outside the block graph."
             )
     return module
 
