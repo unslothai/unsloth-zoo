@@ -48,6 +48,7 @@ from .lfm2_moe import *
 from .step3p7_moe import *
 from .mixtral_moe import *
 from .llama4_moe import *
+from .moe_lora_factor_swap import *
 from .inkling import *
 from .compiled_model_identity import *
 from .bitsandbytes_large_tensors import *
