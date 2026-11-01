@@ -280,3 +280,17 @@ def test_load_adapter_wrapper_loads_once_and_raises_real_errors(monkeypatch):
         swap._wrap_load_adapter(original)(model, "x")
     assert len(calls) == 1
     assert "_load_pretrained_model" not in model.__dict__
+
+
+def test_load_adapter_keeps_the_file_path_when_nothing_converts(monkeypatch):
+    # Failing before: the files were always replaced by an in-memory state dict, which disk offload cannot index.
+    from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
+
+    kwargs = {"state_dict": None, "checkpoint_files": [__file__]}
+    monkeypatch.setattr(swap, "_from_vanilla", lambda model, sd, name: sd)
+    monkeypatch.setattr("transformers.modeling_utils.load_state_dict", lambda f, map_location = "cpu": {"k": 1})
+    assert swap._converted_load_kwargs(object(), dict(kwargs), "default") == kwargs
+
+    class _Offloaded:
+        hf_device_map = {"model.layers.0": "disk"}
+    assert swap._converted_load_kwargs(_Offloaded(), dict(kwargs), "default") == kwargs

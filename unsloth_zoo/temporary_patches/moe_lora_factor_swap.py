@@ -238,17 +238,30 @@ def _wrap_hotswap(original):
 
 
 def _converted_load_kwargs(model, kwargs, adapter_name):
+    """The load kwargs with converted factors, or the original kwargs when nothing needs converting (the
+    file-backed path stays, which disk offload builds its index from)."""
     state_dict = kwargs.get("state_dict")
     files = list(kwargs.get("checkpoint_files") or [])
-    if state_dict is None and files and all(os.path.isfile(str(f)) for f in files):
+    from_files = state_dict is None and files and all(os.path.isfile(str(f)) for f in files)
+    if from_files:
+        device_map = getattr(model, "hf_device_map", None) or {}
+        if "disk" in set(device_map.values()):
+            # Converted tensors would need their own offload files: keep transformers' path (an unconverted
+            # adapter then fails by shape, never silently).
+            return kwargs
         # transformers' own reader: it keeps the torch.load safety check for .bin files.
         from transformers.modeling_utils import load_state_dict as _hf_load_state_dict
         state_dict = {}
         for f in files:
             state_dict.update(_hf_load_state_dict(str(f), map_location = "cpu"))
-        kwargs = dict(kwargs, checkpoint_files = None)
-    if state_dict is not None:
-        kwargs = dict(kwargs, state_dict = _from_vanilla(model, state_dict, adapter_name))
+    if state_dict is None:
+        return kwargs
+    converted = _from_vanilla(model, state_dict, adapter_name)
+    if all(converted.get(key) is value for key, value in state_dict.items()):
+        return kwargs
+    kwargs = dict(kwargs, state_dict = converted)
+    if from_files:
+        kwargs["checkpoint_files"] = None
     return kwargs
 
 
