@@ -578,6 +578,9 @@ def _special_token(config, name):
     return token["content"] if isinstance(token, dict) else token
 
 
+_MARKER_BATCH_TOKENS = 8192
+
+
 class _MarkerModel(DecisionPipeline):
     """Laya and Julia-1: an encoder that scores each option at a mask token placed before it."""
 
@@ -659,16 +662,35 @@ class _MarkerModel(DecisionPipeline):
             ids += option
         return ids + [self.sep_id] + self._encode(_text(state)) + [self.sep_id], markers
 
-    def _score_question(self, state, questions, question):
-        ids, markers = self._prompt(state, question)
-        logits = self.model.logits({
-            "input_ids": np.array([ids]),
-            "attention_mask": np.ones((1, len(ids)), np.int64),
-            "marker_pos": np.array([markers]),
-            "marker_mask": np.ones((1, len(markers)), bool),
-            "qtype": np.array([_TYPES.index(question.type)]),
-        })
-        return [logits[0].tolist()], len(ids)
+    def _score_batch(self, rows):
+        length, options = max(len(ids) for _, ids, _ in rows), max(len(markers) for _, _, markers in rows)
+        batch = {
+            "input_ids": np.zeros((len(rows), length), np.int64),
+            "attention_mask": np.zeros((len(rows), length), np.int64),
+            "marker_pos": np.zeros((len(rows), options), np.int64),
+            "marker_mask": np.zeros((len(rows), options), bool),
+            "qtype": np.array([_TYPES.index(question.type) for question, _, _ in rows]),
+        }
+        for row, (_, ids, markers) in enumerate(rows):
+            batch["input_ids"][row, : len(ids)] = ids
+            batch["attention_mask"][row, : len(ids)] = 1
+            batch["marker_pos"][row, : len(markers)] = markers
+            batch["marker_mask"][row, : len(markers)] = True
+        logits = self.model.logits(batch)
+        return [[logits[row, : len(markers)].tolist()] for row, (_, _, markers) in enumerate(rows)]
+
+    def _scores(self, state, questions):
+        rows = [(question, *self._prompt(state, question)) for question in questions]
+        scores, start = [], 0
+        while start < len(rows):
+            # A batch costs its longest prompt per row, so a long prompt does not pad many short ones past this.
+            end, longest = start + 1, len(rows[start][1])
+            while end < len(rows) and (end - start + 1) * max(longest, len(rows[end][1])) <= _MARKER_BATCH_TOKENS:
+                longest = max(longest, len(rows[end][1]))
+                end += 1
+            scores += self._score_batch(rows[start:end])
+            start = end
+        return scores, sum(len(ids) for _, ids, _ in rows)
 
 
 _UNMERGEABLE = ("use_dora", "use_rslora", "lora_bias", "rank_pattern", "alpha_pattern", "modules_to_save")

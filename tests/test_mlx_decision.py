@@ -765,6 +765,36 @@ def test_a_prepared_model_turns_a_refusal_into_a_request_error_and_passes_images
         model._scores("s", question)
 
 
+def test_laya_reads_a_requests_questions_in_batches_under_a_token_budget(monkeypatch):
+    model = decision._MarkerModel.__new__(decision._MarkerModel)
+    prompts = {"a": ([1, 2, 3], [0]), "b": ([4, 5, 6, 7, 8], [1, 3]), "c": ([9], [0]), "d": ([1] * 3, [0])}
+    batches = []
+
+    def logits(batch):
+        batches.append(batch)
+        # A row's logits say which row and option they are, past the row's own options too.
+        return np.array([[10.0 * row + option for option in range(batch["marker_mask"].shape[1])] for row in range(len(batch["input_ids"]))])
+
+    monkeypatch.setattr(decision._MarkerModel, "_prompt", lambda self, state, question: prompts[question.id])
+    model.__dict__["model"] = types.SimpleNamespace(logits = logits)
+    monkeypatch.setattr(decision, "_MARKER_BATCH_TOKENS", 15)
+    questions = [types.SimpleNamespace(id = name, type = "choice") for name in prompts]
+    scores, tokens = model._scores("s", questions)
+    assert tokens == 12 and [len(batch["input_ids"]) for batch in batches] == [3, 1]
+    first = batches[0]
+    assert first["input_ids"].tolist() == [[1, 2, 3, 0, 0], [4, 5, 6, 7, 8], [9, 0, 0, 0, 0]]
+    assert first["attention_mask"].sum(axis = 1).tolist() == [3, 5, 1]
+    assert first["marker_pos"].tolist() == [[0, 0], [1, 3], [0, 0]]
+    assert first["marker_mask"].tolist() == [[True, False], [True, True], [True, False]]
+    # Each question reads only its own options, and order survives the batches.
+    assert scores == [[[0.0]], [[10.0, 11.0]], [[20.0]], [[0.0]]]
+    # A longer prompt counts against the rows before it, not only the rows after it.
+    prompts.update(a = ([1] * 4, [0]), b = ([1] * 10, [0]))
+    batches.clear()
+    model._scores("s", questions[:2])
+    assert [len(batch["input_ids"]) for batch in batches] == [1, 1]
+
+
 def test_d1_media_takes_encoded_and_decoded_alike(monkeypatch):
     media = pytest.importorskip("mlx_vlm.models.d1_lfm3_vl.media")
     seen = []
