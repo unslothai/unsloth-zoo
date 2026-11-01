@@ -682,18 +682,22 @@ _ENV_OP_TILE = "UNSLOTH_TILED_OP_TILE"
 
 
 def _op_tile_body(module):
-    """The tile body the op runs: one compiled frame per class (as the compile_tile route), or eager."""
+    """The tile body the op runs: eager by default, or one compiled frame per class (UNSLOTH_TILED_OP_TILE=compiled).
+    G4, Qwen3-0.6B / 1.7B LoRA, 4k-32k: eager was as fast or faster and matched the previous route's peak in every
+    cell; compiled tiles were up to 2% slower and 32 MiB higher at 0.6B 16k."""
     fn = functools.partial(_tile_fn, module, True, ("rows",))
-    if os.environ.get(_ENV_OP_TILE, "compiled").strip().lower() == "eager":
+    if os.environ.get(_ENV_OP_TILE, "eager").strip().lower() != "compiled":
         return fn
     return _sequence_tiling._compiled_tile_fn(fn)
 
 
 def _op_autocast(x, amp):
     # Compiled graphs run with autocast off (casts are baked in); the tile body runs eager, so restore the caller's.
+    # No cast cache: a weight cast cached by the no_grad forward would be reused by the backward's recompute and
+    # cut the graph to the weight (zero gradient), the reason torch's checkpoint recomputes uncached too.
     if amp is None:
         return contextlib.nullcontext()
-    return torch.autocast(x.device.type, dtype = amp)
+    return torch.autocast(x.device.type, dtype = amp, cache_enabled = False)
 
 
 def _op_forward_impl(x, params, n_tiles, amp = None):
