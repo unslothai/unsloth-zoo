@@ -822,3 +822,23 @@ def test_tree_budget_runs_the_widest_tree_until_measured_then_the_best_rate_and_
     assert picks.count(0) == budget.PROBE_EVERY - 1 and picks.count(8) == 1
 
 
+
+
+def test_a_controller_capped_below_the_drafters_trained_depth_keeps_its_chain():
+    from unsloth_zoo.mlx.speculative import SpeculativeEngine
+
+    def plan_for(controller):
+        engine = object.__new__(SpeculativeEngine)
+        draft = SimpleNamespace(tree_rows = None, prefetched_tree = None)
+        engine.drafter = SimpleNamespace(trained_depth = 7, tree_budget = SimpleNamespace(choose = lambda: 8))
+        engine.lm = SimpleNamespace(_unsloth_tree_verify = True)
+        engine.controller = controller
+        engine._rows = [SimpleNamespace(draft = draft, sample = SimpleNamespace(temperature = 0), processors = [])]
+        plan = RoundPlan("round", rows = (RowPlan("draft", min(7, controller.max_depth)),))
+        return engine._tree_plan(plan, [RowState(controller.new_reply(), remaining = 64)]), draft
+
+    for capped in (DraftController(max_depth = 2, fixed_depth = True), DraftController(max_depth = 2)):
+        plan, draft = plan_for(capped)
+        assert not plan.tree and draft.tree_rows == 0
+    plan, draft = plan_for(DraftController(max_depth = 7))
+    assert plan.tree == 8 and draft.tree_rows == 8

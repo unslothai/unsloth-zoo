@@ -1508,7 +1508,9 @@ class SpeculativeEngine:
 
     def _tree_plan(self, plan: RoundPlan, states: list[RowState]) -> RoundPlan:
         budget = getattr(self.drafter, "tree_budget", None)
-        if (budget is None or not self.lm.__dict__.get("_unsloth_tree_verify") or plan.kind != "round" or len(plan.rows) != 1
+        # Tree rounds account the drafter's trained depth, so a controller capped below it keeps its chain.
+        if (budget is None or self.controller.fixed_depth or self.controller.max_depth < getattr(self.drafter, "trained_depth", 0)
+                or not self.lm.__dict__.get("_unsloth_tree_verify") or plan.kind != "round" or len(plan.rows) != 1
                 or plan.rows[0].source != "draft" or (plan.split and not plan.trim) or self.controller._reference is not None
                 or self._rows[0].sample.temperature != 0 or self._rows[0].processors):
             for row in self._rows:
