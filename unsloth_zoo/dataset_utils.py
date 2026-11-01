@@ -732,23 +732,19 @@ def is_trl_padding_free_collator(collator):
 pass
 
 
-# Formats whose rows hand back the stored integers unchanged: python lists, numpy
-# arrays, torch tensors. Anything else (a custom transform, pandas) is read as before.
+# Formats whose rows hand back the stored integers unchanged; anything else uses the per-row scan.
 _ARROW_LABEL_SCAN_FORMATS = (None, "python", "numpy", "np", "torch", "pt")
 
 def _fully_masked_rows_from_arrow(dataset, batch_size = 10_000):
-    """Indices of rows whose `labels` hold no token other than -100, read off Arrow.
+    """Indices of rows whose `labels` hold no token other than -100 (None rows kept), read off Arrow.
 
-    Same answer as the per-row `not any(l != -100 for l in labels)` scan, with None
-    rows kept, for a flat signed-integer list column without null tokens. Returns None
-    for anything else, so the caller keeps its row-by-row scan.
+    Returns None unless `labels` is a flat signed-integer list column without null tokens.
     """
     try:
         import numpy as np
         import pyarrow as pa
         fmt = getattr(dataset, "format", None)
         if not isinstance(fmt, dict) or fmt.get("type") not in _ARROW_LABEL_SCAN_FORMATS: return None
-        if getattr(dataset, "_format_type", None) not in _ARROW_LABEL_SCAN_FORMATS: return None
         shown = fmt.get("columns")
         if shown is not None and "labels" not in shown and not fmt.get("output_all_columns", False):
             return None
@@ -766,9 +762,11 @@ def _fully_masked_rows_from_arrow(dataset, batch_size = 10_000):
             offsets = np.asarray(column.offsets, dtype = np.int64)
             first, last = int(offsets[0]), int(offsets[-1])
             kept = np.asarray(values.slice(first, last - first)) != -100
-            counts = np.concatenate(([0], np.cumsum(kept, dtype = np.int64)))
-            counts = counts[offsets[1:] - first] - counts[offsets[:-1] - first]
-            masked = counts == 0
+            # reduceat over non-empty rows only: an empty segment would return its start element.
+            nonempty = offsets[1:] != offsets[:-1]
+            masked = np.ones(n, dtype = bool)
+            if kept.size:
+                masked[nonempty] = ~np.logical_or.reduceat(kept, offsets[:-1][nonempty] - first)
             if column.null_count:
                 masked &= np.asarray(column.is_valid())
             dropped.extend((np.flatnonzero(masked) + start).tolist())
@@ -1298,8 +1296,6 @@ def train_on_responses_only(
         # labels column cheaply first; the common case (0 fully masked) returns as-is.
         n_before = len(dataset)
         # Track only the fully masked rows, so a huge clean corpus builds no per-row list.
-        # The labels were just written by the masking map: read them back as Arrow
-        # offsets and values rather than one Python list per row.
         dropped = _fully_masked_rows_from_arrow(dataset)
         if dropped is None:
             dropped = []
