@@ -214,7 +214,7 @@ def tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = 
         if mode != "unroll":
             return _tiled_call_eager(
                 fn, x, *token_args, n_tiles = n_tiles, needs_rng = needs_rng, output_contract = output_contract,
-                compile_tile = mode == "compile_tile",
+                compile_tile = mode in ("compile_tile", "op"),
             )
     lead = x.shape[:-1]
     if x.dim() == 2:
@@ -307,14 +307,78 @@ _ENV_COMPILE = "UNSLOTH_TILED_COMPILE"
 
 
 def _outside_graph_mode():
-    """"unroll", "compile_tile" or "break" (UNSLOTH_TILED_COMPILE forces one). Unrolling costs ~1.1 s compile per
-    tile on G4, so Unsloth's fullgraph=False blocks leave the graph; a user's compile may be fullgraph=True, so it unrolls."""
+    """"unroll", "op", "compile_tile" or "break" (UNSLOTH_TILED_COMPILE forces one). Unrolling costs ~1.1 s compile per
+    tile on G4 and lets Inductor overlap the tiles' recomputes (most of the saving is lost), so Unsloth's blocks use
+    "op": the tile loop as one opaque graph node (registry modules that qualify; others fall back to "compile_tile",
+    one compiled frame per tile outside the block graph). A user's compile may be fullgraph=True, so it unrolls."""
     mode = os.environ.get(_ENV_COMPILE, "auto").strip().lower()
-    if mode in ("unroll", "compile_tile", "break"):
+    if mode in ("unroll", "op", "compile_tile", "break"):
         return mode
     block = sys.modules.get("unsloth.models._block_compile")
     flag = getattr(block, "_IN_COMPILED_REGION", None)
-    return "compile_tile" if (bool(flag) and bool(flag[0])) else "unroll"
+    return "op" if (bool(flag) and bool(flag[0])) else "unroll"
+pass
+
+
+class _tile_gc_scope:
+    """Every tile reads "not in a checkpoint recompute" (see _replay_tile), forward and backward alike."""
+    __slots__ = ("tls", "previous")
+
+    def __enter__(self):
+        self.tls = _gc_tls()
+        if self.tls is not None:
+            self.previous = getattr(self.tls, "active", False)
+            self.tls.active = False
+        return self
+
+    def __exit__(self, *exc):
+        if self.tls is not None:
+            self.tls.active = self.previous
+        return False
+pass
+
+
+_AUTOGRAD_KEYS = tuple(
+    getattr(torch._C.DispatchKey, k) for k in (
+        "AutogradCPU", "AutogradCUDA", "AutogradXPU", "AutogradMPS", "AutogradPrivateUse1", "ADInplaceOrView",
+    ) if hasattr(torch._C.DispatchKey, k)
+)
+_AUTOCAST_KEYS = tuple(
+    (device, getattr(torch._C.DispatchKey, k)) for device, k in (
+        ("cpu", "AutocastCPU"), ("cuda", "AutocastCUDA"), ("xpu", "AutocastXPU"), ("mps", "AutocastMPS"),
+    ) if hasattr(torch._C.DispatchKey, k)
+)
+
+
+def _autocast_on(device):
+    try:
+        return torch.is_autocast_enabled(device)
+    except TypeError:
+        return torch.is_autocast_cpu_enabled() if device == "cpu" else (device == "cuda" and torch.is_autocast_enabled())
+    except Exception:
+        return False
+
+
+class _autograd_reenabled:
+    """A custom op's kernel runs below autograd and autocast; the tile body must run as it would outside the op (its
+    backward kernel differentiates it), so lift the autograd exclusion and, where the caller enabled autocast, that
+    device's autocast exclusion (an autocast key is excluded by default and casts even when disabled)."""
+    __slots__ = ("guard",)
+
+    def __enter__(self):
+        C = torch._C
+        exclude = C._dispatch_tls_local_exclude_set()
+        for k in _AUTOGRAD_KEYS:
+            exclude = exclude.remove(k)
+        for device, k in _AUTOCAST_KEYS:
+            if _autocast_on(device):
+                exclude = exclude.remove(k)
+        self.guard = C._ForceDispatchKeyGuard(C._dispatch_tls_local_include_set(), exclude)
+        self.guard.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self.guard.__exit__(*exc)
 pass
 
 
