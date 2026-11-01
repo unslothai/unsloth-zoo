@@ -418,3 +418,37 @@ def test_the_install_probe_leaves_buffers_alone(in_unsloth_block):
     mlp.forward = counting
     R.install_module(mlp, "rows:8")
     assert mlp.seen.item() == 0
+
+
+def test_functional_call_keeps_the_tile_frame_route(in_unsloth_block):
+    # Failing before: the op read the live module's frozen weight at run time, after functional_call had restored
+    # it, so a replaced frozen projection was silently ignored.
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    R.install_module(mlp, "rows:8")
+    x = torch.randn(64, H)
+    replaced = {"g.weight": mlp.g.weight * 3}
+
+    def run(x):
+        return torch.func.functional_call(mlp, replaced, (x,))
+    got = torch.compile(run, backend = "aot_eager", dynamic = True)(x)
+    want = torch.func.functional_call(mlp, replaced, (x,), strict = False)
+    torch.testing.assert_close(got, want)
+
+
+def test_backward_recompute_holds_the_module_lock(in_unsloth_block, monkeypatch):
+    # Two threads backpropagating through one MLP would otherwise interleave the proxy swaps (detached proxies left
+    # bound, zero gradients). The recompute runs under a per-module lock.
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    R.install_module(mlp, "rows:8")
+    held = []
+    real = R._op_backward_locked
+
+    def spy(module, *args):
+        held.append(R._op_lock(module).locked())
+        return real(module, *args)
+    monkeypatch.setattr(R, "_op_backward_locked", spy)
+    _run(_Block(mlp), torch.randn(2, 32, H, requires_grad = True))
+    assert held and all(held)
+    assert isinstance(mlp.A, torch.nn.Parameter)

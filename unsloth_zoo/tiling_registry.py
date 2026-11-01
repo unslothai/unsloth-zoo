@@ -25,6 +25,7 @@ import itertools
 import math
 import os
 import re
+import threading
 import types
 import typing
 import warnings
@@ -650,6 +651,10 @@ def _op_params(module, state):
     if owner is not module:
         # A deepcopy of an installed module carries the state but was never registered with the op.
         return None
+    if not all(isinstance(p, torch.nn.Parameter) for p in module.parameters()):
+        # A stateless call (torch.func.functional_call) swapped in plain tensors: the op reads the live module's
+        # weights at run time, after the swap is undone, so keep the per-tile route.
+        return None
     if needs_rng_replay(module, state.spec):
         return None
     params = [p for p in module.parameters() if p.requires_grad]
@@ -799,11 +804,29 @@ def _op_proxies(module):
     return [proxies[n] for n in names], _reparametrize_module(module, proxies)
 
 
+_OP_LOCKS = weakref.WeakKeyDictionary()
+_OP_LOCKS_GUARD = threading.Lock()
+
+
+def _op_lock(module):
+    with _OP_LOCKS_GUARD:
+        lock = _OP_LOCKS.get(module)
+        if lock is None:
+            lock = _OP_LOCKS[module] = threading.Lock()
+    return lock
+
+
 def _op_backward_impl(x, grad, params, n_tiles, amp = None, token = None):
     ref = _OP_TOKENS.get(int(token)) if token is not None else None
     module = ref() if ref is not None else None
     if module is None:
         module = _op_module(params)
+    # The recompute swaps the module's parameters for proxy leaves: one backward per module at a time.
+    with _op_lock(module):
+        return _op_backward_locked(module, x, grad, n_tiles, amp)
+
+
+def _op_backward_locked(module, x, grad, n_tiles, amp):
     own, swapped = _op_proxies(module)
     body = _op_tile_body(module)
     dx = torch.empty_like(x)
