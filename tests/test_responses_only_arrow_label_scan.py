@@ -88,7 +88,7 @@ def test_same_rows_as_the_row_by_row_scan(name, dataset):
         expected = _row_by_row(dataset)
     except ImportError as error:
         # datasets 3.x numpy/torch formatters import torchvision.io.VideoReader, gone from new torchvision.
-        pytest.skip(f"this datasets build cannot read the {name} format here: {error}")
+        pytest.skip(reason = f"this datasets build cannot read the {name} format here: {error}")
     for batch_size in (7, 1000, 10_000):
         got = _fully_masked_rows_from_arrow(dataset, batch_size = batch_size)
         assert got == expected, name
@@ -150,7 +150,7 @@ def test_masked_split_matches_the_row_by_row_scan(monkeypatch, fmt, capsys):
     try:
         dataset[:1]
     except ImportError as error:
-        pytest.skip(f"this datasets build cannot read the {fmt} format here: {error}")
+        pytest.skip(reason = f"this datasets build cannot read the {fmt} format here: {error}")
     calls = []
     real = dataset_utils._fully_masked_rows_from_arrow
     monkeypatch.setattr(dataset_utils, "_fully_masked_rows_from_arrow", lambda d, **k: calls.append(1) or real(d, **k))
