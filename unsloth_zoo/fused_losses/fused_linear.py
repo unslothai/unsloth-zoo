@@ -2071,13 +2071,13 @@ def _scale_rows_inplace_impl(u, g):
 
 
 _KEEP_GRAPH = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)
-# torch 2.8+; older torch relies on the address check only.
+# torch 2.8+; without hook inspection, addresses alone cannot establish ownership.
 _TOP_SAVED_HOOKS = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
 
 
 def _owned_ptrs(stored):
     """None under a saved-tensor hook: it may return one shared buffer for equal tensors, scaled twice in place."""
-    if torch.compiler.is_compiling():
+    if torch.compiler.is_compiling() or _TOP_SAVED_HOOKS is None:
         return None
     try:
         if _TOP_SAVED_HOOKS is not None and _TOP_SAVED_HOOKS(True) is not None:
@@ -2089,7 +2089,14 @@ def _owned_ptrs(stored):
 
 def _owns(ctx, saved):
     owned = getattr(ctx, "owned", None)
-    return owned is not None and owned == tuple(x.data_ptr() for x in saved)
+    if owned is None or owned != tuple(x.data_ptr() for x in saved):
+        return False
+    # Per-tensor hooks can be registered after setup and return the original allocation
+    # shared with another loss. Check at backward time; missing inspection means unsafe.
+    raw = getattr(ctx, "_raw_saved_tensors", ())
+    return len(raw) >= len(saved) and all(
+        getattr(x, "unpack_hook", True) is None for x in raw[:len(saved)]
+    )
 
 
 def _stored_grad_scaler(s, saved, ctx = None):
