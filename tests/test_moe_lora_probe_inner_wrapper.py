@@ -94,6 +94,12 @@ def _outer_lora_grads(model):
 @pytest.fixture
 def routed_like_l4(monkeypatch):
     gr = pytest.importorskip("unsloth_zoo.temporary_patches.gpt_oss_routed")
+    from unsloth_zoo.temporary_patches import gpt_oss as G
+
+    if not G._is_transformers_v5():
+        pytest.skip("the split-LoRA gpt-oss experts forward is transformers 5.x only")
+    # patch_gpt_oss_moe_for_lora (the stash-reading experts forward) installs only for a 16-bit gpt-oss load.
+    monkeypatch.setenv("UNSLOTH_MODEL_NAME", "gpt_oss")
     calls = []
 
     def fake_routed(wrapper, x, router_indices, routing_weights):
