@@ -3741,7 +3741,8 @@ def _grouped_routed_faster(routed, grouped, clock = time.perf_counter):
                 mx.eval((routed, grouped)[index]())
                 seconds[index].append(clock() - start)
         return sum(sorted(seconds[1])[:-1]) < sum(sorted(seconds[0])[:-1])
-    except (AttributeError, OSError, RuntimeError, TypeError):
+    except (AttributeError, OSError, RuntimeError, TypeError) as error:
+        _unless_failed_buffer(error)
         return False
 
 
