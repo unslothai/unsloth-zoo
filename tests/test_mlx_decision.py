@@ -622,3 +622,142 @@ def test_d1_says_when_the_installed_mlx_vlm_lacks_its_engine(tmp_path, monkeypat
 def test_a_plain_lfm3_is_not_a_d1(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm3_omni", "auto_map": {"AutoModel": "modeling_lfm3_omni.Lfm3OmniModel"}}))
     assert decision.detect_family(tmp_path) is None
+
+
+_D1_PROMPT = "mlx_vlm.models.d1_lfm3_vl.prompt"
+
+
+class _D1Tokens:
+    def encode(self, text, add_special_tokens = False):
+        return [ord(character) for character in text]
+
+
+def _d1_trainable(backbone = "lfm3_omni", set_size = 4):
+    import mlx.core as mx
+
+    model = decision._D1Model.__new__(decision._D1Model)
+    model._backbone, model.noul_true_first = backbone, True
+    hidden = mx.array([[float(i), 1.0] for i in range(40)])
+    embed = lambda tokens: mx.stack([tokens.astype(mx.float32), mx.zeros_like(tokens.astype(mx.float32))], axis = -1)
+    engine = types.SimpleNamespace(
+        ask = lambda question: question, set_size = set_size, tokenizer = _D1Tokens(), bos = "", state_style = None, system = None, lead = "",
+        media = types.SimpleNamespace(encode = lambda media: ("", [])),
+    )
+    model.model = types.SimpleNamespace(
+        engine = engine, d1_hidden = lambda ids, state, groups, media: hidden, d1_features = None,
+        language_model = types.SimpleNamespace(model = types.SimpleNamespace(embed_tokens = embed)),
+    )
+    return model
+
+
+def test_d1_item_packs_questions_after_the_state_and_reads_each_at_its_last_token(monkeypatch):
+    prompt = pytest.importorskip(_D1_PROMPT)
+    monkeypatch.setattr(prompt, "prefix_text", lambda tokenizer, state, *_: f"S:{state}\n")
+    monkeypatch.setattr(prompt, "question_header", lambda *_: "Q\n")
+    monkeypatch.setattr(prompt, "suffix_layout", lambda tokenizer, question, lead: (f"{question['instructions']}?", [0]))
+    questions = {"a": {"type": "noul", "instructions": "x"}, "b": {"type": "choice", "instructions": "yy", "criteria": {"k": None, "l": None, "m": None}}}
+    item = decision.d1_training_item(_d1_trainable(), "st", questions)
+    # "S:st\n" is the state, "x?" the first question, then "Q\nyy?" the second.
+    assert item["state_length"] == 5 and item["input_ids"] == [ord(c) for c in "S:st\nx?Q\nyy?"]
+    assert item["groups"] == [-1] * 5 + [1, 1] + [2] * 5
+    assert item["slots"] == [6, 11]
+    assert [len(spans) for spans in item["option_spans"]] == [2, 3]
+    assert item["types"] == [decision._TYPE_IDS.index("noul"), decision._TYPE_IDS.index("choice")]
+    assert "images" not in item
+
+
+def test_d1_item_refuses_more_questions_than_a_row_trained(monkeypatch):
+    pytest.importorskip(_D1_PROMPT)
+    questions = {name: {"type": "noul", "instructions": "x"} for name in "abc"}
+    with pytest.raises(DecisionRequestError, match = "the maximum is 2"):
+        decision.d1_training_item(_d1_trainable(set_size = 2), "st", questions)
+
+
+def test_d1_logits_are_each_options_best_form_at_its_slot(monkeypatch):
+    prompt = pytest.importorskip(_D1_PROMPT)
+    tables = iter([((3, 5), np.array([[0, 1], [1, 1]]), None), ((7, 2), np.array([[1], [0]]), None)])
+    monkeypatch.setattr(prompt, "readout_table", lambda tokenizer, question: next(tables))
+    item = {"input_ids": [0], "state_length": 0, "groups": [1], "slots": [2, 10], "asked": ["first", "second"]}
+    logits = decision._item_logits(_d1_trainable(), item)
+    # hidden[slot] @ embed(token) is slot * token here; each option scores its best form, in option order.
+    assert logits.tolist() == [10.0, 10.0, 20.0, 70.0]
+
+
+def test_d1_logits_read_a_records_media(monkeypatch):
+    prompt = pytest.importorskip(_D1_PROMPT)
+    monkeypatch.setattr(prompt, "readout_table", lambda tokenizer, question: ((1,), np.array([[0]]), None))
+    monkeypatch.setattr(decision, "_d1_media", lambda item: item["images"])
+    pipeline, seen = _d1_trainable(), []
+    hidden = pipeline.model.d1_hidden
+    pipeline.model.engine.media.encode = lambda media: ("", [f"part-{name}" for name in media])
+    pipeline.model.d1_features = lambda part: f"features-{part}"
+    pipeline.model.d1_hidden = lambda ids, state, groups, media: (seen.extend(media), hidden(ids, state, groups, media))[1]
+    decision._item_logits(pipeline, {"images": ["a", "b"], "input_ids": [0], "state_length": 0, "groups": [1], "slots": [1], "asked": ["q"]})
+    assert seen == ["features-part-a", "features-part-b"]
+
+
+def test_d1_media_takes_encoded_and_decoded_alike(monkeypatch):
+    media = pytest.importorskip("mlx_vlm.models.d1_lfm3_vl.media")
+    seen = []
+    monkeypatch.setattr(media, "media_list", lambda items: seen.extend(items) or items)
+    monkeypatch.setattr(decision, "_decode_images", lambda urls: [f"decoded {url}" for url in urls])
+    monkeypatch.setattr(decision, "_decode_audio", lambda urls: [np.ones(4, np.float32) for _ in urls])
+    picture = object()
+    decision._d1_media({"images": ["data:image/png;base64,AA==", picture], "audio": ["data:audio/wav;base64,AA==", {"array": np.zeros(4), "sampling_rate": 16000}]})
+    assert seen[:2] == ["decoded data:image/png;base64,AA==", picture]
+    assert [clip["audio"].tolist() for clip in seen[2:]] == [[1.0] * 4, [0.0] * 4]
+    assert {clip["sampling_rate"] for clip in seen[2:]} == {16000}
+
+
+def test_training_a_d1_answers_without_its_calibration(monkeypatch):
+    monkeypatch.setattr(decision, "_decoder_for_training", lambda *args, **kwargs: None)
+    monkeypatch.setattr(decision, "D1Network", lambda *args: types.SimpleNamespace(train = lambda: None))
+    pipeline = _d1_trainable()
+    pipeline.model.engine.calibration = "released"
+    decision.d1_training_network(pipeline)
+    assert pipeline.model.engine.calibration is None
+
+
+def test_only_lfm3_trains_as_a_d1(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm3"}))
+    with pytest.raises(ValueError, match = "load_language_model_as_clef"):
+        decision.load_language_model_as_d1(tmp_path)
+    with pytest.raises(ValueError, match = "for LFM3 checkpoints"):
+        decision.d1_training_network(_d1_trainable("lfm2_vl"))
+
+
+def test_a_saved_d1_is_read_as_one_and_keeps_no_stale_calibration(tmp_path, monkeypatch):
+    source, out = tmp_path / "source", tmp_path / "out"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "lfm3_omni", "architectures": ["Lfm3OmniForConditionalGeneration"], "tie_word_embeddings": True}))
+    for name in ("calibration.json", "README.md", "tokenizer.json", "processor_config.json"):
+        (source / name).write_text("{}")
+    (source / "model.safetensors").write_bytes(b"stale")
+    monkeypatch.setattr(decision, "_write_merged_shards", lambda decoder, src, staging: (staging / "model.safetensors").write_bytes(b"merged"))
+    pipeline = types.SimpleNamespace(model = None, source = source)
+    out.mkdir()
+    (out / "calibration.json").write_text("{}")
+    decision.save_d1_model(pipeline, out)
+    assert decision.detect_family(out) == "d1"
+    config = json.loads((out / "config.json").read_text())
+    assert config["model_type"] == "lfm3_omni" and config["d1_attention"] == "set" and config["tie_word_embeddings"] is True
+    assert (out / "model.safetensors").read_bytes() == b"merged" and (out / "tokenizer.json").is_file()
+    assert not (out / "calibration.json").exists() and not (out / "README.md").exists()
+    assert sorted(item.name for item in out.iterdir() if item.name.startswith(".")) == []
+    with pytest.raises(ValueError, match = "cannot be saved over"):
+        decision.save_d1_model(pipeline, source)
+    decision.save_d1_model(pipeline, out, temperatures = {"choice": 2.0, "score": 3.0, "noul": 4.0})
+    calibration = pytest.importorskip("mlx_vlm.models.d1_lfm3_vl.calibration")
+    fitted = calibration.Calibration.load(out / "calibration.json")
+    assert fitted.temperatures[calibration.bucket("noul", 2)] == 4.0 and fitted.default == 3.0
+    assert {fitted.temperatures[calibration.bucket("choice", k)] for k in (2, 5, 20, 40)} == {2.0}
+    assert fitted.temperatures.get(calibration.bucket("score", 5), fitted.default) == 3.0
+
+
+def test_a_d1_answer_from_probabilities_is_the_served_one():
+    model = decision._D1Model.__new__(decision._D1Model)
+    model._backbone, model.noul_true_first = "lfm3_omni", True
+    question = {"type": "score", "instructions": "x", "levels": {"0": "a", "1": "b", "2": "c"}}
+    model._parse_questions = lambda questions: [types.SimpleNamespace(type = "score", options = [("0", "a"), ("1", "b"), ("2", "c")])]
+    answer = decision.d1_answer(model, question, {"0": 0.1, "1": 0.2, "2": 0.7})
+    assert answer["score"] == 2.0 and answer["confidence"] == pytest.approx(0.7)
