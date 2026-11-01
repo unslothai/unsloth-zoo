@@ -594,7 +594,12 @@ def _tiled_forward(self, *args, **kwargs):
         mode = _sequence_tiling._outside_graph_mode()
         if mode == "op":
             params = _op_params(self, state)
-            if params is not None:
+            device = x.device.type
+            # The op's output is allocated like x: an autocast dtype other than x's would change the MLP's
+            # output dtype (and double its bytes), so that case keeps the per-tile route.
+            if params is not None and (
+                not torch.is_autocast_enabled(device) or torch.get_autocast_dtype(device) == x.dtype
+            ):
                 return _run_tiled_op(state, x, params, n_tiles)
             mode = "compile_tile"
         if mode != "unroll":
@@ -646,24 +651,31 @@ def _op_module(params):
     if module is None or _OP_VERSION[1] != _OP_VERSION[0] or not _op_matches(module, params):
         _OP_BY_PTR.clear()
         _OP_VERSION[1] = _OP_VERSION[0]
-        classes = {}
+        groups = {}
         for m in list(_OP_MODULES):
             own = [p for p in m.parameters() if p.requires_grad]
             if own:
                 k = (own[0].device, own[0].data_ptr())
-                classes.setdefault(k, set()).add(type(m))
+                groups.setdefault(k, []).append(m)
                 _OP_BY_PTR.setdefault(k, weakref.ref(m))
-        for k, seen in classes.items():
-            if len(seen) > 1:
+        for k, members in groups.items():
+            # Interchangeable only if every parameter and buffer is shared (a tied MLP); shared adapters over
+            # different frozen weights would run the wrong module.
+            if len({type(m) for m in members}) > 1 or len({_op_identity(m) for m in members}) > 1:
                 _OP_BY_PTR.pop(k, None)
         ref = _OP_BY_PTR.get(key)
         module = ref() if ref is not None else None
         if module is None or not _op_matches(module, params):
             raise RuntimeError(
-                "Unsloth: tiled MLP op could not find the module that owns its parameters (modules of different "
-                "classes share them?); set UNSLOTH_TILED_COMPILE=compile_tile to tile them outside the block graph."
+                "Unsloth: tiled MLP op could not tell which module owns its parameters (several MLPs share their "
+                "trainable parameters but not their other weights); set UNSLOTH_TILED_COMPILE=compile_tile to tile "
+                "them outside the block graph."
             )
     return module
+
+
+def _op_identity(module):
+    return tuple((t.device, t.data_ptr()) for t in list(module.parameters()) + list(module.buffers()))
 
 
 def _op_matches(module, params):
@@ -708,23 +720,36 @@ def _op_forward_impl(x, params, n_tiles, amp = None):
             _sequence_tiling._tile_gc_scope():
         for start, length in _op_bounds(x.shape[0], n_tiles):
             y = body(x.narrow(0, start, length))
-            if y.shape != (length, x.shape[1]):
+            if y.shape != (length, x.shape[1]) or y.dtype != x.dtype:
                 raise RuntimeError(
-                    f"Unsloth: tiled MLP op expected a {length} x {x.shape[1]} tile output, got {tuple(y.shape)}; set "
+                    f"Unsloth: tiled MLP op expected a {length} x {x.shape[1]} {x.dtype} tile output, got "
+                    f"{tuple(y.shape)} {y.dtype}; set "
                     f"UNSLOTH_TILED_COMPILE=compile_tile to tile this module outside the block graph."
                 )
             out.narrow(0, start, length).copy_(y)
     return out
 
 
+def _op_proxies(module):
+    """Detached leaves standing in for the trainable parameters during the recompute: hooks registered on the
+    parameters (parameter.register_hook) then run once, on the gradient the op returns, not once per tile."""
+    names = [n for n, p in module.named_parameters() if p.requires_grad]
+    proxies = {n: p.detach().requires_grad_(True) for n, p in module.named_parameters() if p.requires_grad}
+    try:
+        from torch.nn.utils.stateless import _reparametrize_module
+    except Exception:
+        return [p for p in module.parameters() if p.requires_grad], contextlib.nullcontext()
+    return [proxies[n] for n in names], _reparametrize_module(module, proxies)
+
+
 def _op_backward_impl(x, grad, params, n_tiles, amp = None):
     module = _op_module(params)
-    own = [p for p in module.parameters() if p.requires_grad]
+    own, swapped = _op_proxies(module)
     body = _op_tile_body(module)
     dx = torch.empty_like(x)
     dparams = [None] * len(own)
     with torch.enable_grad(), _op_autocast(x, amp), _sequence_tiling._autograd_reenabled(), \
-            _sequence_tiling._tile_gc_scope():
+            _sequence_tiling._tile_gc_scope(), swapped:
         for start, length in _op_bounds(x.shape[0], n_tiles):
             # A fresh leaf per tile: a kernel writing dX into its input (fused LoRA MLP) writes into this copy.
             xt = x.narrow(0, start, length).detach().clone().requires_grad_(True)
@@ -907,8 +932,19 @@ def _attach(module, spec, plan, budget_cache):
     _random_verdict(module)
     state.op_ok = _op_eligible(module, spec, hidden) and _op_ready()
     if state.op_ok:
-        _OP_MODULES.add(module)
-        _OP_VERSION[0] += 1
+        own = [p for p in module.parameters() if p.requires_grad]
+        key = (own[0].device, own[0].data_ptr()) if own else None
+        for other in list(_OP_MODULES):
+            mine = [p for p in other.parameters() if p.requires_grad]
+            if mine and (mine[0].device, mine[0].data_ptr()) == key and (
+                type(other) is not type(module) or _op_identity(other) != _op_identity(module)
+            ):
+                # Shared adapters over different frozen weights: the op could not tell them apart.
+                state.op_ok = False
+                other.__dict__["_unsloth_tiling"].op_ok = False
+        if state.op_ok:
+            _OP_MODULES.add(module)
+            _OP_VERSION[0] += 1
 
 
 def _detach(module):

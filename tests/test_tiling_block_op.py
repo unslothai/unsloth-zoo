@@ -156,12 +156,13 @@ def test_the_op_saves_only_its_input(in_unsloth_block):
 
 def test_autocast_matches_eager_tiles(in_unsloth_block, monkeypatch):
     # Tiling itself changes bf16 rounding (per-tile weight-grad partials), so the reference is the same tiles run eagerly.
+    # bf16 activations under bf16 autocast (Unsloth's 16-bit LoRA): the op keeps the activation dtype.
     torch.manual_seed(0)
-    block = _Block(_LoraMLP())
+    block = _Block(_LoraMLP()).to(torch.bfloat16)
     ref = copy.deepcopy(block)
     R.install_module(block.mlp, "rows:8")
     R.install_module(ref.mlp, "rows:8")
-    x = torch.randn(1, 64, H, requires_grad = True)
+    x = torch.randn(1, 64, H, dtype = torch.bfloat16, requires_grad = True)
     xr = x.detach().clone().requires_grad_()
     seen = []
     real = R._tile_fn
@@ -176,9 +177,10 @@ def test_autocast_matches_eager_tiles(in_unsloth_block, monkeypatch):
     # Compiled graphs run with autocast off; the tile body must still see the caller's autocast.
     assert seen and all(seen)
     assert breaks == 0 and y.dtype == yr.dtype
-    # Inductor fuses the tile body (one bf16 rounding where eager rounds per op): compare at bf16 resolution.
+    # Inductor fuses the tile body (one bf16 rounding where eager rounds per op) and the weights are bf16 too:
+    # compare at a few bf16 ulps (eps 7.8e-3).
     for a, b in zip([y] + _grads(block, x), [yr] + _grads(ref, xr)):
-        assert (a - b).abs().max() <= 1e-2 * b.abs().max()
+        assert (a - b).abs().max() <= 2e-2 * b.abs().max()
 
 
 def test_rng_replay_falls_back_to_the_tile_frames(in_unsloth_block, monkeypatch):
@@ -221,21 +223,64 @@ def test_auto_inside_the_block_tiles_only_when_it_pays(in_unsloth_block, monkeyp
     assert seen == [8] and breaks == 0
 
 
-def test_modules_sharing_parameters_resolve_by_class(in_unsloth_block):
+def test_shared_adapters_over_different_weights_keep_the_tile_frame_route(in_unsloth_block):
+    # Failing before: two MLPs sharing their adapters but not their frozen weights resolved to one module, so one
+    # ran the other's forward (wrong outputs and gradients). Now neither takes the op; a fully tied copy still does.
     torch.manual_seed(0)
-    a = _LoraMLP()
-    b = _LoraMLP()
+    a, b = _LoraMLP(), _LoraMLP()
     b.A, b.B = a.A, a.B
     R.install_module(a, "rows:8")
     R.install_module(b, "rows:8")
+    assert not a.__dict__["_unsloth_tiling"].op_ok and not b.__dict__["_unsloth_tiling"].op_ok
     x = torch.randn(64, H)
-    params = R._op_params(a, a.__dict__["_unsloth_tiling"])
-    R._op_forward_impl(x, params, 8)
-    other = type("BarMLP", (_LoraMLP,), {})()
-    other.A, other.B = a.A, a.B
-    R.install_module(other, "rows:8")
-    with pytest.raises(RuntimeError, match = "could not find the module"):
-        R._op_forward_impl(x, params, 8)
+    for mlp in (a, b):
+        got = torch.compile(mlp, backend = "aot_eager", dynamic = True)(x)
+        torch.testing.assert_close(got, type(mlp).forward(mlp, x))
+    tied = _LoraMLP()
+    tied.g, tied.u, tied.d, tied.A, tied.B = a.g, a.u, a.d, a.A, a.B
+    c = _LoraMLP()
+    c.A, c.B = tied.A, tied.B
+    c.g, c.u, c.d = tied.g, tied.u, tied.d
+    R.install_module(tied, "rows:8")
+    R.install_module(c, "rows:8")
+    assert tied.__dict__["_unsloth_tiling"].op_ok and c.__dict__["_unsloth_tiling"].op_ok
+
+
+def test_parameter_hooks_run_once(in_unsloth_block):
+    # Failing before: the recompute differentiated the real parameters, so a register_hook ran per tile and again on
+    # the op's returned gradient (8 tiles: 9 calls, doubled gradient).
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    ref = copy.deepcopy(mlp)
+    R.install_module(mlp, "rows:8")
+    calls = []
+
+    def hook(g):
+        calls.append(1)
+        return g * 2
+    mlp.A.register_hook(hook)
+    ref.A.register_hook(lambda g: g * 2)
+    block, ref_block = _Block(mlp), _Block(ref)
+    ref_block.o.load_state_dict(block.o.state_dict())
+    x = torch.randn(2, 32, H)
+    _run(block, x.clone().requires_grad_(True))
+    _ref(ref_block, x.clone().requires_grad_(True))
+    assert len(calls) == 1, len(calls)
+    torch.testing.assert_close(mlp.A.grad, ref.A.grad)
+
+
+def test_autocast_to_another_dtype_keeps_the_mlp_output_dtype(in_unsloth_block, monkeypatch):
+    # Failing before: the op allocated its output like the float32 input, so a bf16 autocast MLP returned float32.
+    torch.manual_seed(0)
+    mlp = _LoraMLP()
+    R.install_module(mlp, "rows:8")
+    seen = _spy_op(monkeypatch)
+    x = torch.randn(1, 32, H)
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        want = type(mlp).forward(mlp, x)
+        got = torch.compile(mlp, backend = "aot_eager", dynamic = True)(x)
+    assert got.dtype == want.dtype == torch.bfloat16, (got.dtype, want.dtype)
+    assert not seen  # the per-tile route, not the op
 
 
 def test_a_width_changing_mlp_keeps_the_tile_frame_route(in_unsloth_block, monkeypatch):
