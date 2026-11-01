@@ -129,7 +129,10 @@ def test_deeper_rounds_follow_fully_accepted_blocks_within_the_controllers_limit
     engine._observe_extension(base, [state], [7])
     wide = engine._extend(base, [state])
     assert (controller.max_depth, wide.width, wide.controller_depth) == (7, 16, 7)
-    from unsloth_zoo.mlx import inference
+    import importlib
+
+    # The engine's verify scope imports through sys.modules; the package attribute may be a stale MLX world's.
+    inference = importlib.import_module("unsloth_zoo.mlx.inference")
     narrow = inference._NATIVE_CAUSAL_ROWS
     for plan, rows in ((RoundPlan("round", rows = (RowPlan("copy", 12),)), narrow), (wide, 16)):
         with engine._verify_scope(plan):
