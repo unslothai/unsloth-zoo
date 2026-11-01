@@ -93,7 +93,7 @@ def _stock_nax_kernels():
 
 def nax_available():
     """Whether stock MLX dispatches its NAX kernels here. `UNSLOTH_MLX_NAX=0` turns every route off."""
-    return os.environ.get("UNSLOTH_MLX_NAX", "1") != "0" and _nax_gpu() and _stock_nax_kernels()
+    return _nax_gpu() and _stock_nax_kernels() and os.environ.get("UNSLOTH_MLX_NAX", "1") != "0"
 
 
 class Gap(NamedTuple):

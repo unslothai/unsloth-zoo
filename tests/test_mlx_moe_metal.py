@@ -761,7 +761,7 @@ def test_verify_blocks_run_their_routed_experts_on_the_decode_kernels_bitwise(mo
     block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
     xs = [mx.random.normal(shape).astype(mx.bfloat16) for shape in ((2, 5, 512), (1, 9, 512))]
     expected = [native()._feed_forward(block, x) for x in xs]
-    verifier = fusion._exact_verify_class(native, "verify", True, *(vars(native).get(name) for name in fusion._VERIFY_METHODS))()
+    verifier = fusion._exact_verify_class(native, "qwen3_5", *(vars(native).get(name) for name in fusion._VERIFY_METHODS))()
     monkeypatch.setattr(fusion, "_VERIFY_VERDICTS", {})
     gathers, partitions = _counting_gather_qmm(monkeypatch), _counting_argpartition(monkeypatch)
     with fusion.fused_moe_routed_experts(block):
@@ -834,7 +834,7 @@ def test_verify_blocks_fold_their_shared_expert_bitwise(monkeypatch):
     xs = [mx.random.normal(shape).astype(mx.bfloat16) for shape in ((1, 3, 512), (1, 5, 512), (1, 6, 512))]
     # one-token decoding's bits, which mlx-vlm's own batch forward does not keep at 4 bits
     expected = [mx.concatenate([block(x[:, i : i + 1]) for i in range(x.shape[1])], axis = 1) for x in xs]
-    verifier = fusion._exact_verify_class(native, "verify", True, *(vars(native).get(name) for name in fusion._VERIFY_METHODS))()
+    verifier = fusion._exact_verify_class(native, "qwen3_5", *(vars(native).get(name) for name in fusion._VERIFY_METHODS))()
     monkeypatch.setattr(fusion, "_VERIFY_VERDICTS", {})
     monkeypatch.setattr(fusion._VERIFY_STATE, "serving", True, raising = False)
     folds = _counting_folds(monkeypatch)

@@ -688,8 +688,7 @@ def test_verify_attention_matches_mlx_vector_kernel_and_decode_rows_bitwise(gqa,
     queries, keys, values = _attention_block(gqa, rows, 4500, dtype)
     if gqa == 4:   # decode stays unfused there, so the kernel only serves it when asked
         assert decode._verify_attention(queries, keys, values, None, 1.0, "causal", None) is None
-        monkeypatch.setenv("UNSLOTH_MLX_VERIFY_ATTENTION", "1")
-    out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None)
+    out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None, gqa == 4)
     _equal(out, decode._decode_attention(queries, keys, values, 1.0))
     if gqa == 8:   # unpaired heads: exactly what each decode step computes
         horizon = lambda i: 4500 - rows + i + 1
@@ -780,6 +779,20 @@ def test_verify_scope_serves_only_marked_global_blocks_and_restores(monkeypatch)
             with decode.verify_block_attention():
                 raise RuntimeError("cancel")
     assert type(full) is gemma4.Attention and not decode._VERIFY_STATE.attention
+
+
+def test_four_query_heads_serve_only_under_their_models_fast_verify(monkeypatch):
+    gemma4, layers = _gemma4_attention(gqa = 4)
+    x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    launched, kernel = [], decode._vector_attention
+    monkeypatch.setattr(decode, "_vector_attention", lambda *args: launched.append(args) or kernel(*args))
+    for fast_verify in (False, True):
+        launched.clear()
+        decode._hold_fast_verify(layers, fast_verify)
+        with decode.fused_verify_attention(layers), decode.verify_block_attention():
+            _attend(gemma4, layers.layers[1], x)
+        decode._release_fast_verify(layers)
+        assert bool(launched) == fast_verify
 
 
 def test_verify_scope_keeps_native_when_the_first_launch_differs_from_decode(monkeypatch, caplog):
@@ -1605,7 +1618,7 @@ def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
     elif reason in ("verified", "relinear"):   # exact_batch_invariant_decode's class already over the forward
         native = type(forward)
         methods = (getattr(native, name, None) for name in decode._VERIFY_METHODS)
-        verified = decode._exact_verify_class(native, "__call__", False, *methods)
+        verified = decode._exact_verify_class(native, "qwen4_exp", *methods)
         if reason == "relinear":   # a class under that one decorating its `_linear`
             sliced = verified._linear
             verified = type("Scaled", (verified,), {
