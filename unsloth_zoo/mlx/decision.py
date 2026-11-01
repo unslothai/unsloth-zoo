@@ -464,11 +464,12 @@ class DecisionPipeline:
     noul_true_first = False
     choice_sorted = False
     reads_images = reads_audio = False
+    null_state = False
     temperatures = {}
 
     def answer(self, state, questions, images = None, audio = None):
         """Answers keyed by question id and the prompt tokens spent; images are refused unless reads_images, and audio (base64 data URLs) unless reads_audio."""
-        if state is None:
+        if state is None and not self.null_state:
             raise DecisionRequestError('"state" must be provided')
         parsed = self._parse_questions(questions)
         urls, clips = _image_urls(state, images), _data_urls(audio, "audio", _MAX_AUDIO)
@@ -1663,7 +1664,97 @@ class ClefModel(_QwenModel):
         return [[logits[start:end]] for start, end in zip(bounds, bounds[1:])], len(ids)
 
 
-FAMILIES = {"laya": _MarkerModel, "lev": _LevModel, "nimble": _NimbleModel, "openjev": _OpenJevModel, "kev": _KevModel, "clef": ClefModel}
+_D1_PACKAGES = {"lfm2_vl": "d1", "d1_omni": "d1_omni", "lfm3_vl": "d1_lfm3_vl", "lfm3_omni": "d1_lfm3_omni"}
+
+
+class _D1Model(DecisionPipeline):
+    """LiquidAI d1: mlx-vlm's engines read the model and its calibration; requests and answers are this module's."""
+
+    family = "d1"
+    sources = ("LiquidAI/d1-3B", "LiquidAI/d1-omni-600M", "LiquidAI/d1-2B", "LiquidAI/d1-Omni-2B")
+    needs = "its config.json naming a d1 model"
+    null_state = True
+    reads_images = True
+
+    @staticmethod
+    def matches(folder):
+        config = _read_json(folder / "config.json") if (folder / "config.json").is_file() else {}
+        automodel = str((config.get("auto_map") or {}).get("AutoModel", ""))
+        return config.get("model_type") == "d1_omni" or "D1Model" in (config.get("architectures") or ()) or automodel.endswith("D1Model")
+
+    def __init__(self, folder, dtype, base_model = None, token = None):
+        from importlib.util import find_spec
+
+        from mlx_vlm.utils import load
+
+        self._backbone = _read_json(folder / "config.json").get("model_type")
+        package = _D1_PACKAGES.get(self._backbone)
+        if package is None:
+            raise ValueError(f"Unsloth: {folder} is a d1 model on {self._backbone!r}, which this loader does not know.")
+        if find_spec(f"mlx_vlm.models.{package}") is None:
+            from .utils import _installed_mlx_vlm_version
+
+            raise ValueError(f"Unsloth: this d1 model needs a newer mlx-vlm than {_installed_mlx_vlm_version() or 'the installed one'}.")
+        self.model, self.processor = load(str(folder))
+        if dtype is not None:
+            self.model.set_dtype(dtype)
+        self.reads_audio = self._backbone in ("d1_omni", "lfm3_omni")
+        # As llama.cpp orders them; d1-omni reads a noul false first.
+        self.noul_true_first = self._backbone != "d1_omni"
+
+    def _question(self, question):
+        spec = {"type": question.type, "instructions": _compact(question.instructions)}
+        if question.type == "choice":
+            spec["criteria"] = {key: description if description is None else _compact(description) for key, description in question.options}
+        elif question.type == "score":
+            spec["criteria"] = [_compact(description) for _, description in question.options]
+        elif any(description is not None for _, description in question.options):
+            spec["criteria"] = {key: description if description is None else _compact(description) for key, description in question.options}
+        return spec
+
+    def _read(self, state, questions, images, audio):
+        """Each question's probabilities in the order of its options, and the tokens read."""
+        if self._backbone == "d1_omni":
+            if images and audio:
+                raise DecisionUnsupportedError("this model reads images or audio in a request, not both")
+            if len(audio) > 1:
+                raise DecisionUnsupportedError("this model reads one audio clip in a request")
+            return self.model.probabilities(self.processor, [(state, questions, images or None, audio[0] if audio else None)])[0]
+        if self._backbone == "lfm2_vl":
+            from mlx_vlm.models.d1.prompt import as_question
+
+            return self.model.probabilities(self.processor, state, [as_question(question) for question in questions], images)
+        media = [*images, *({"type": "audio", "audio": clip, "sampling_rate": _AUDIO_RATE} for clip in audio)]
+        return self.model.engine.run([(state, [self.model.engine.ask(question) for question in questions], media)])[0]
+
+    def _scores(self, state, questions, images = (), audio = ()):
+        try:
+            probabilities, tokens = self._read(state, [self._question(question) for question in questions], list(images), list(audio))
+        except DecisionRequestError:
+            raise
+        except ValueError as error:
+            raise DecisionRequestError(str(error)) from error
+        # Scores whose softmax is what the engine answered: its calibration has been applied.
+        return [[[math.log(max(float(p), 1e-300)) for p in row]] for row in probabilities], tokens
+
+    def _format_answer(self, question, variants):
+        answer = super()._format_answer(question, variants)
+        if question.type == "noul" or self._backbone not in ("lfm3_vl", "lfm3_omni"):
+            return answer
+        # On LFM3 a score is its median level and a confidence the answer's probability.
+        probs = list(answer["probabilities"].values())
+        answer["confidence"] = max(probs)
+        if question.type == "score":
+            mass = 0.0
+            for level, p in enumerate(probs):
+                mass += p
+                if mass >= 0.5:
+                    break
+            answer["score"] = float(level)
+        return answer
+
+
+FAMILIES = {"laya": _MarkerModel, "lev": _LevModel, "nimble": _NimbleModel, "openjev": _OpenJevModel, "kev": _KevModel, "clef": ClefModel, "d1": _D1Model}
 
 
 def detect_family(folder):

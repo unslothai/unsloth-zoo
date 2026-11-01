@@ -464,3 +464,161 @@ def test_phi4_multimodal_decoder_weights_map_to_its_bare_and_wrapped_names():
         assert decision._decoder_tensor_name(wrapper, path, stored) == f"model.layers.{layer}.self_attn.qkv_proj.{held}"
         # Its adapter is saved and resumed under the linear's own name, which is what PEFT and the merge read.
         assert decision._adapter_stem(wrapper, path.removesuffix(".weight"), stored) == f"base_model.model.model.layers.{layer}.self_attn.qkv_proj"
+
+
+class _D1Engine:
+    def __init__(self, probabilities):
+        self.probabilities, self.requests = probabilities, []
+
+    def ask(self, question):
+        return question
+
+    def run(self, requests):
+        self.requests += requests
+        return [(self.probabilities, 11)]
+
+
+def _d1(backbone, probabilities):
+    model = decision._D1Model.__new__(decision._D1Model)
+    engine = _D1Engine(probabilities)
+    model._backbone, model.processor = backbone, "processor"
+    model.reads_audio, model.noul_true_first = backbone in ("d1_omni", "lfm3_omni"), backbone != "d1_omni"
+    model.model = types.SimpleNamespace(engine = engine)
+    return model, engine
+
+
+D1_QUESTIONS = {
+    "yes": {"instructions": "i", "type": "noul"},
+    "team": {"instructions": "i", "type": "choice", "criteria": {"b": "second", "a": None}},
+    "level": {"instructions": "i", "type": "score", "criteria": ["low", "mid", "high"]},
+}
+
+
+def test_d1_answers_the_engines_probabilities_on_this_contract():
+    model, engine = _d1("lfm3_vl", [[0.8, 0.2], [0.25, 0.75], [0.1, 0.2, 0.7]])
+    result = model.answer(None, D1_QUESTIONS)
+    answers = result["answers"]
+    assert result["usage"] == {"input_tokens": 11, "output_tokens": 0}
+    # The engine's calibration is applied already, so nothing is read through a temperature again.
+    assert answers["yes"]["noul"] == pytest.approx(0.8)
+    assert answers["team"]["choice"] == "a"
+    assert answers["team"]["probabilities"] == pytest.approx({"b": 0.25, "a": 0.75})
+    assert answers["level"]["score"] == 2.0
+    assert answers["level"]["confidence"] == pytest.approx(0.7)
+    assert answers["team"]["confidence"] == pytest.approx(0.75)
+    state, questions, media = engine.requests[0]
+    assert state is None and media == []
+    # Options keep the caller's order, which is what the probabilities follow.
+    assert questions[1]["criteria"] == {"b": "second", "a": None}
+    assert questions[2]["criteria"] == ["low", "mid", "high"]
+
+
+def test_d1_score_stops_at_the_first_level_past_half_and_lfm2_keeps_the_general_readout():
+    question = {"level": {"instructions": "i", "type": "score", "criteria": ["low", "mid", "high"]}}
+    assert _d1("lfm3_omni", [[0.5, 0.1, 0.4]])[0].answer("s", question)["answers"]["level"]["score"] == 0.0
+    # The median, not the likeliest level.
+    assert _d1("lfm3_omni", [[0.3, 0.3, 0.4]])[0].answer("s", question)["answers"]["level"]["score"] == 1.0
+    answer = _d1("lfm2_vl", None)[0]
+    answer.model = types.SimpleNamespace(probabilities = lambda *_: ([[0.1, 0.2, 0.7]], 5))
+    read = answer.answer("s", question)["answers"]["level"]
+    assert read["score"] == pytest.approx(1.6) and read["confidence"] != pytest.approx(0.7)
+
+
+def test_d1_passes_on_what_true_and_false_mean():
+    model, engine = _d1("lfm3_vl", [[0.5, 0.5]])
+    model.answer("s", {"yes": {"instructions": "i", "type": "noul", "criteria": {"true": "adult", "false": "minor"}}})
+    assert engine.requests[0][1][0]["criteria"] == {"true": "adult", "false": "minor"}
+    model.answer("s", {"yes": {"instructions": "i", "type": "noul"}})
+    assert "criteria" not in engine.requests[1][1][0]
+
+
+def test_d1_omni_reads_a_noul_false_first_and_one_medium():
+    model, _ = _d1("d1_omni", None)
+    seen = []
+
+    def probabilities(processor, requests):
+        seen.extend(requests)
+        return [([[0.3, 0.7]], 5)]
+
+    model.model = types.SimpleNamespace(probabilities = probabilities)
+    question = {"yes": D1_QUESTIONS["yes"]}
+    assert model.answer("s", question)["answers"]["yes"]["noul"] == pytest.approx(0.7)
+    assert seen[0][2:] == (None, None)
+    with pytest.raises(DecisionUnsupportedError, match = "images or audio"):
+        model._read("s", [], ["image"], ["clip"])
+    with pytest.raises(DecisionUnsupportedError, match = "one audio clip"):
+        model._read("s", [], [], ["clip", "clip"])
+
+
+def test_d1_hears_audio_only_on_the_models_that_do():
+    model, engine = _d1("lfm3_omni", [[0.5, 0.5]])
+    clip = np.zeros(4, np.float32)
+    model._read(None, [{"type": "noul", "instructions": "i"}], ["picture"], [clip])
+    media = engine.requests[0][2]
+    assert media[0] == "picture" and media[1]["type"] == "audio" and media[1]["sampling_rate"] == 16000
+    assert _d1("lfm3_vl", [[0.5, 0.5]])[0].reads_audio is False
+
+
+def test_d1_on_lfm2_asks_its_engine_in_the_form_it_reads():
+    pytest.importorskip("mlx_vlm.models.d1.prompt")
+    model, _ = _d1("lfm2_vl", None)
+    seen = []
+
+    def probabilities(processor, state, questions, images):
+        seen.extend(questions)
+        return [[0.8, 0.2]], 5
+
+    model.model = types.SimpleNamespace(probabilities = probabilities)
+    assert model.answer("s", {"yes": D1_QUESTIONS["yes"]})["answers"]["yes"]["noul"] == pytest.approx(0.8)
+    assert seen[0]["criteria"] is None
+
+
+def test_d1_turns_an_engine_refusal_into_a_request_error():
+    model, engine = _d1("lfm3_vl", None)
+    engine.run = lambda requests: (_ for _ in ()).throw(ValueError("no such question"))
+    with pytest.raises(DecisionRequestError, match = "no such question"):
+        model.answer("s", {"yes": D1_QUESTIONS["yes"]})
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "d1_omni"},
+        {"model_type": "lfm3_omni", "architectures": ["D1Model"]},
+        {"model_type": "lfm3_vl", "auto_map": {"AutoModel": "modeling_d1_lfm3_vl.D1Model"}},
+        {"model_type": "lfm2_vl", "auto_map": {"AutoModel": "modeling_d1.D1Model"}},
+    ],
+)
+def test_d1_is_detected_from_its_config(tmp_path, config):
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert decision.detect_family(tmp_path) == "d1"
+
+
+@pytest.mark.parametrize(
+    "backbone, audio, true_first",
+    [("lfm2_vl", False, True), ("d1_omni", True, False), ("lfm3_vl", False, True), ("lfm3_omni", True, True)],
+)
+def test_d1_load_reads_its_abilities_from_the_backbone(tmp_path, monkeypatch, backbone, audio, true_first):
+    mlx_vlm_utils = pytest.importorskip("mlx_vlm.utils")
+    import importlib.util
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": backbone}))
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(mlx_vlm_utils, "load", lambda path: ("model", "processor"))
+    model = decision._D1Model(tmp_path, None)
+    assert (model.reads_audio, model.noul_true_first, model.model) == (audio, true_first, "model")
+
+
+def test_d1_says_when_the_installed_mlx_vlm_lacks_its_engine(tmp_path, monkeypatch):
+    pytest.importorskip("mlx_vlm.utils")
+    import importlib.util
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm3_omni"}))
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(ValueError, match = "needs a newer mlx-vlm"):
+        decision._D1Model(tmp_path, None)
+
+
+def test_a_plain_lfm3_is_not_a_d1(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm3_omni", "auto_map": {"AutoModel": "modeling_lfm3_omni.Lfm3OmniModel"}}))
+    assert decision.detect_family(tmp_path) is None
