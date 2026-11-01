@@ -5464,7 +5464,8 @@ def forward_triton_grouped_gemm(
         if cached_key is None:
             # Caller-preset configs without a key are trusted.
             self._unsloth_moe_configs_key = configs_key
-        elif cached_key != configs_key:
+        elif cached_key != configs_key and not torch.compiler.is_compiling():
+            # The tuner is compiler-disabled: re-select only eagerly; a traced call keeps the last-good configs.
             self._unsloth_moe_configs = None
 
     if self._unsloth_moe_configs is None:
