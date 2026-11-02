@@ -355,7 +355,7 @@ class RowState:
     copy_available: int = 0
     remaining: int | None = None
     catch_up: int = 0
-    folded_replay: bool = False  # Its work is already in draft_cost, unless another row forces synchronous replay.
+    folded_replay: bool = False
 
 
 @dataclass
@@ -1685,7 +1685,6 @@ class SpeculativeEngine:
         finally:
             if completed:
                 end = time.perf_counter()
-                # An early close also waits for the queued tail, beyond the emitted steps.
                 ran = completed - (2 if pipelined and upcoming is None else 1)
                 self.controller.record_plain(states, completed, end - start,
                                              (end - started) / ran if ran > 0 and started is not None else None)

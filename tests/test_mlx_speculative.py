@@ -131,7 +131,6 @@ def test_controller_finds_best_depth_including_plain(draft, slope):
         choice = _run(DraftController(max_depth = 4, can_copy = False), machine, [(draft, None)],
                       rounds = 1500, seed = seed, report = (report := {}))
         assert _throughput(choice, draft, machine) >= 0.95 * _throughput(best, draft, machine)
-        # Probes and split rounds included, the second half runs near the optimum.
         assert report["rate"] >= 0.9 * _throughput(best, draft, machine)
 
 
@@ -438,9 +437,7 @@ def test_timings_resist_one_off_work():
         assert (timing.value, timing.count) == pytest.approx((value, len(samples)))
     controller = DraftController(max_depth = 7, can_copy = False)
     controller.verify_cost[1] = {2: _Ema(1.0, 2), 4: _Ema(1.2, 2), 6: _Ema(9.0), 8: _Ema(1.5)}
-    # A width timed once counts no more than the confirmed widths predict.
     assert [value for _, value in controller._measured(controller.verify_cost[1])] == pytest.approx([1.0, 1.2, 1.4, 1.5])
-    # And a round at it, or drafting a depth timed once, is timed apart again, so its second sample confirms or replaces it.
     controller.draft_cost.update({1: _Ema(0.2, 2), 3: _Ema(0.2), 7: _Ema(0.2, 2)})
     rows = [RowState(controller.new_reply())]
     assert [controller._measured_parts(RoundPlan("round", rows = (RowPlan("draft", depth),)), rows) for depth in (1, 3, 7)] == [True, False, False]
@@ -779,11 +776,9 @@ def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_a
     controller = DraftController(max_depth = 1, can_copy = False)
     rows = [_Row(EngineRow(None, 1, [1, 2], processors = [processor], drafts = drafts), controller) for drafts in (True, False)]
     assert [row.speculates for row in rows] == [history_only, False]
-    # Pipelining waits for a processor that reads more than the history, not for a row off the draft.
     queued = []
     step = lambda inputs, ahead = 0: queued.append(ahead) or (mx.array([3, 3]), None, None)
     record = SimpleNamespace(record_plain = lambda *_a: None, interrupts_plain = lambda _s: False)
-    # No stream work happens here; the CPU shim implements none.
     monkeypatch.setattr(mx, "stream", lambda _s: contextlib.nullcontext())
     engine = _bare_engine(SpeculativeEngine, _step = step, _stream = None, controller = record)
     engine._rows, engine._states = rows, lambda: []
@@ -1128,7 +1123,6 @@ def test_drafter_layers_submit_their_output_when_built_in_eval_mode(monkeypatch)
     outputs = [layer(x) for layer in model.layers]
     assert all(mx.array_equal(out, want).item() for out, want in zip(outputs, expected))
     assert len(submitted) == 2 and submitted[0] is outputs[0] and submitted[1] is outputs[2]
-    # Training submits nothing.
     model.layers[0].train()
     model.layers[0](x)
     assert len(submitted) == 2
