@@ -1048,7 +1048,7 @@ class DraftController:
             # Only a round drafting one depth for every row can attribute its drafting time.
             if depths and len(set(depths)) == 1:
                 self.draft_cost[depths[0]].update_time(draft_seconds / len(depths), self.cost_alpha)
-            if catch_up:
+            if catch_up and catch_up_seconds > 0:
                 self.catch_up_cost.update_time(catch_up_seconds / catch_up, self.cost_alpha)
         else:
             self._since_split += 1
@@ -1637,8 +1637,8 @@ class SpeculativeEngine:
         finally:
             if completed:
                 end = time.perf_counter()
-                # The first pipelined read waits for two steps; close() can end a window at any yield.
-                ran = completed - (2 if pipelined else 1)
+                # An early close also waits for the queued tail, beyond the emitted steps.
+                ran = completed - (2 if pipelined and upcoming is None else 1)
                 self.controller.record_plain(states, completed, end - start,
                                              (end - started) / ran if ran > 0 and started is not None else None)
 

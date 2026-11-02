@@ -180,7 +180,9 @@ def _probe_matches_a_started_row(model, drafter, prompt, held):
     from unsloth_zoo.mlx.speculative import _capture, _features, probe_drafter
     hidden = _features(drafter, (lm := getattr(model, "language_model", model))(mx.array([prompt]), cache = make_prompt_cache(lm), **_capture(drafter)))
     shapes = lambda entries: [(type(entry), getattr(entry, "max_size", None), tuple(a.shape), a.dtype) for entry in entries for a in entry.state if a is not None]
-    return shapes(probe_drafter(model, drafter, len(prompt))) == shapes(held(drafter.start(prompt, hidden, 0))) != []
+    started = drafter.start(prompt, hidden, 0)
+    drafter.catch_up(started[1], [started[0]])
+    return shapes(probe_drafter(model, drafter, len(prompt))) == shapes(held(started)) != []
 
 
 def _prefill(lm, prompt, sampling, processors = (), drafter = None):

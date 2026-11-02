@@ -285,6 +285,20 @@ def test_controller_drafts_alone_but_not_in_a_wide_batch():
     assert [controller.plain_cost[b].value for b in (1, 8)] == pytest.approx([machine.plain(1), machine.plain(8)])
 
 
+def test_folded_replay_is_not_learned_as_a_free_separately_timed_replay():
+    controller = DraftController(max_depth = 2, can_copy = False)
+    plan = RoundPlan("round", rows = (RowPlan("draft", 2),), split = True)
+    state = RowState(controller.new_reply(), catch_up = 2)
+    controller.record_round(plan, [state], [1], seconds = 1.0, draft_seconds = 0.3)
+    assert controller.catch_up_cost.value is None
+    state.catch_up = 12
+    controller.record_round(plan, [state], [1], seconds = 1.0, draft_seconds = 0.3, catch_up_seconds = 0.6)
+    assert controller.catch_up_cost.value == pytest.approx(0.05)
+    state.catch_up = 2
+    controller.record_round(plan, [state], [1], seconds = 1.0, draft_seconds = 0.3)
+    assert controller.catch_up_cost.value == pytest.approx(0.05)
+
+
 def test_a_draft_probe_shrinks_to_the_deepest_depth_the_credit_affords():
     controller = DraftController(max_depth = 8, can_copy = False)
     _run(controller, _Machine(draft_slope = 0.3, verify_slope = 0.3, overhead = 1.7), [([0.5, 0.2] + [0.1] * 6, None)], rounds = 400)
@@ -706,12 +720,25 @@ def test_closing_a_plain_stream_preserves_its_completed_cost_sample(history_only
     row = speculative._Row(speculative.EngineRow(None, 1, [1, 2], processors = [processor]), controller)
     recorded = []
     observer = SimpleNamespace(record_plain = lambda *args: recorded.append(args), interrupts_plain = lambda _s: False)
-    ticks = iter(range(100))
-    monkeypatch.setattr(speculative.time, "perf_counter", lambda: next(ticks))
+    gpu = {"queued": 0, "finished": 0}
+
+    class Tokens:
+        def __getitem__(self, index):
+            return self
+
+        def tolist(self):
+            gpu["finished"] = gpu["queued"]
+            return [3]
+
+    def forward(inputs, ahead = 0):
+        gpu["queued"] += 1
+        return Tokens(), None, None
+
+    monkeypatch.setattr(speculative.time, "perf_counter", lambda: gpu["finished"])
     monkeypatch.setattr(mx, "stream", lambda _s: contextlib.nullcontext())
     monkeypatch.setattr(mx, "async_eval", lambda *_args: None)
     engine = _bare_engine(SpeculativeEngine, _stream = None, controller = observer,
-                         _step = lambda _inputs, ahead = 0: (mx.array([3]), None, None))
+                         _step = forward)
     engine._rows, engine._states = [row], lambda: []
     stream = engine._plain(8, [])
     for _ in range(3):
@@ -719,7 +746,7 @@ def test_closing_a_plain_stream_preserves_its_completed_cost_sample(history_only
     stream.close()
     assert len(recorded) == 1
     assert recorded[0][1] == 3
-    assert recorded[0][2] > 0 and recorded[0][3] > 0
+    assert recorded[0][2] > 0 and recorded[0][3] == 1
     stream.close()
     assert len(recorded) == 1
 
