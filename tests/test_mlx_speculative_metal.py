@@ -231,7 +231,9 @@ def _parity():
 def _head_in_step(engine):
     offset = mx.array(engine.draft_cache[0].offset).reshape(-1).tolist()
     for i, row in enumerate(engine._rows):
-        assert offset[i] == row.draft.position - engine.drafter.dropped.get(id(row.draft), 0)
+        prefix = getattr(row.draft, "prefix", None)
+        pending = len(prefix.tokens) if prefix is not None else 0
+        assert offset[i] == row.draft.position - engine.drafter.dropped.get(id(row.draft), 0) - pending
         assert row.draft.position + len(row.draft.tokens) == len(row.tokens) - 1
 
 
