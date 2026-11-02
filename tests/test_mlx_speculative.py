@@ -308,10 +308,52 @@ def test_folded_replay_does_not_keep_calibrated_drafts_in_split_mode():
     assert controller.plan(states).kind == "round"
     assert not controller.plan(states).split
     states[0].catch_up = 2
+    states[0].folded_replay = True
     assert not controller.plan(states).split
     assert controller.catch_up_cost.value is None
     states[0].catch_up = 12
+    states[0].folded_replay = False
     assert controller.plan(states).split
+
+
+def test_folded_replay_is_included_in_drafting_cost_only_once():
+    controller = DraftController(max_depth = 2, can_copy = False)
+    state = RowState(controller.new_reply(), catch_up = 2)
+    state.folded_replay = True
+    plan = RoundPlan("round", rows = (RowPlan("draft", 2),), split = True)
+    for _ in range(2):
+        controller.record_round(plan, [state], [2], seconds = 1.0, draft_seconds = 0.3)
+    assert controller.round_seconds(plan, [state]) == pytest.approx(1.0)
+
+
+def test_folded_replay_does_not_make_a_profitable_draft_lose_to_plain():
+    controller = DraftController(max_depth = 1, can_copy = False)
+    states = []
+    _run(controller, _Machine(draft_slope = 0.3, verify_slope = 0, overhead = 0.7), [([0.2], None)],
+         rounds = 500, states = states)
+    controller._credit = 0
+    states[0].stats.probe_at["draft"] = states[0].stats.tokens + 1000
+    assert controller.plan(states).kind == "round"
+    states[0].catch_up, states[0].folded_replay = 2, True
+    assert controller.plan(states).kind == "round"
+
+
+@pytest.mark.parametrize("backlogs", [(10,), (10, 2)])
+def test_synchronous_replay_is_not_credited_as_overlapped_drafting(backlogs):
+    controller = DraftController(max_depth = 2, can_copy = False)
+    states = [RowState(controller.new_reply(), catch_up = count) for count in backlogs]
+    for state in states:
+        state.folded_replay = state.catch_up <= controller.max_depth + 1
+    plan = RoundPlan("round", rows = tuple(RowPlan("draft", 2) for _ in states), split = True)
+    replay, drafting = sum(backlogs) * 0.1, len(states) * 0.3
+    seconds = 0.7 + replay + drafting
+    for _ in range(2):
+        controller.record_round(plan, states, [2] * len(states), seconds = seconds,
+                                draft_seconds = drafting, catch_up_seconds = replay)
+    assert controller.round_seconds(plan, states) == pytest.approx(seconds)
+    fused = replace(plan, split = False)
+    controller.record_round(fused, states, [2] * len(states), seconds = seconds, catch_up_seconds = replay)
+    assert controller.round_seconds(fused, states) == pytest.approx(seconds)
 
 
 def test_a_draft_probe_shrinks_to_the_deepest_depth_the_credit_affords():

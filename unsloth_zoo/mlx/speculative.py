@@ -355,6 +355,7 @@ class RowState:
     copy_available: int = 0
     remaining: int | None = None
     catch_up: int = 0
+    folded_replay: bool = False  # Its work is already in draft_cost, unless another row forces synchronous replay.
 
 
 @dataclass
@@ -576,7 +577,11 @@ class DraftController:
     def _row_seconds(self, row: RowPlan, state: RowState) -> float:
         if row.source != "draft":
             return 0.0
-        return self._draft_seconds(row.length) + state.catch_up * self._catch_up_seconds()
+        replay = 0 if state.folded_replay else state.catch_up
+        return self._draft_seconds(row.length) + replay * self._catch_up_seconds()
+
+    def _replay_pairs(self, rows: Sequence[RowState]) -> int:
+        return sum(state.catch_up for state in rows) if any(state.catch_up and not state.folded_replay for state in rows) else 0
 
     def _drafting_paid(self, bucket: int, drafting: float) -> float:
         hidden = self.hidden_drafting.get(bucket)
@@ -584,9 +589,10 @@ class DraftController:
 
     def round_seconds(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
         bucket = _bucket(len(rows))
-        drafting = sum(self._row_seconds(row, state) for row, state in zip(plan.rows, rows))
+        drafting = sum(self._draft_seconds(row.length) for row in plan.rows if row.source == "draft")
+        replay = self._replay_pairs([state for row, state in zip(plan.rows, rows) if row.source == "draft"])
         verify = self._copy_seconds if all(row.source == "copy" for row in plan.rows) else self._verify_seconds
-        return verify(bucket, width or plan.width) + self._drafting_paid(bucket, drafting)
+        return verify(bucket, width or plan.width) + replay * self._catch_up_seconds() + self._drafting_paid(bucket, drafting)
 
     def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None, optimism: float = 0.0) -> float:
         if plan.kind == "plain":
@@ -609,34 +615,39 @@ class DraftController:
             if state.can_draft and depth and depth >= self._cap(state, floor):
                 draft = RowPlan("draft", depth)
                 gain = state.stats.expected(draft) - state.stats.expected(base[i])
-                options.append((gain, self._row_seconds(draft, state), i, draft))
+                cost = self._row_seconds(draft, state)
+                replay = 0.0 if state.folded_replay else state.catch_up * self._catch_up_seconds()
+                options.append((gain, cost, i, draft, cost - replay))
         bucket = _bucket(len(rows))
         tokens = sum(state.stats.expected(row) for row, state in zip(base, rows))
         verify = self._verify_seconds(bucket, width)
-        rate = lambda gain, cost: (tokens + gain) / (verify + self._drafting_paid(bucket, cost))
+        has_replay = any(state.catch_up for state in rows)
         options.sort(key = lambda option: option[0] / option[1], reverse = True)
         if len({option[1] for option in options}) > 1 and len(options) <= self._EXHAUSTIVE_ROWS:
             # Drafting hidden behind the verify makes unequal costs a knapsack; few rows try every set.
             scored = [
-                (sum(option[0] for option in chosen), sum(option[1] for option in chosen), chosen)
+                (sum(option[0] for option in chosen), chosen)
                 for size in range(1, len(options) + 1) for chosen in combinations(options, size)
             ]
         else:
             # Equal costs make the best set of each size its top gains, a prefix of the ratio order;
             # a round needs a drafter when no row copies, and the least harmful lone one may trail.
-            scored, gain, cost = [], 0.0, 0.0
+            scored, gain = [], 0.0
             for size, option in enumerate(options, 1):
-                gain, cost = gain + option[0], cost + option[1]
-                scored.append((gain, cost, options[:size]))
-            scored += [(option[0], option[1], (option,)) for option in options]
+                gain += option[0]
+                scored.append((gain, options[:size]))
+            scored += [(option[0], (option,)) for option in options]
         best = RoundPlan("round", rows = tuple(base))
         best_score = tokens / self._copy_seconds(bucket, width) if best.width > 1 else 0.0
-        for gain, cost, chosen in scored:
-            if rate(gain, cost) > best_score:
+        for gain, chosen in scored:
+            drafting = sum(option[4] for option in chosen)
+            replay = self._replay_pairs([rows[option[2]] for option in chosen]) * self._catch_up_seconds() if has_replay else 0.0
+            rate = (tokens + gain) / (verify + replay + self._drafting_paid(bucket, drafting))
+            if rate > best_score:
                 plan = list(base)
-                for _, _, i, draft in chosen:
+                for _, _, i, draft, _ in chosen:
                     plan[i] = draft
-                best, best_score = RoundPlan("round", rows = tuple(plan)), rate(gain, cost)
+                best, best_score = RoundPlan("round", rows = tuple(plan)), rate
         return best
 
     @staticmethod
@@ -781,7 +792,7 @@ class DraftController:
             if row.source == "draft":
                 if self.draft_cost[row.length].count < 2:
                     return False
-                if state.catch_up > self.max_depth + 1 and self.catch_up_cost.value is None:
+                if state.catch_up and not state.folded_replay and self.catch_up_cost.value is None:
                     return False
         return True
 
@@ -1040,7 +1051,7 @@ class DraftController:
         # A trimmed row's drafting is that of the full block ``plan`` drafted it as.
         depths = [self._cap(state, self.max_depth) if plan.trim else row.length
                   for row, state in zip(plan.rows, rows) if row.source == "draft" and row.length]
-        catch_up = sum(state.catch_up for row, state in zip(plan.rows, rows) if row.source == "draft")
+        catch_up = self._replay_pairs([state for row, state in zip(plan.rows, rows) if row.source == "draft"])
         verify = self.verify_cost.setdefault(bucket, {}).setdefault(plan.width, _Ema())
         if plan.split:
             self._since_split = 0
@@ -1052,7 +1063,7 @@ class DraftController:
                 self.catch_up_cost.update_time(catch_up_seconds / catch_up, self.cost_alpha)
         else:
             self._since_split += 1
-            drafting = sum(self._draft_seconds(depth) for depth in depths) + catch_up * self._catch_up_seconds()
+            drafting = sum(self._draft_seconds(depth) for depth in depths)
             if drafting:
                 hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds + catch_up_seconds, 0.0), drafting)
                 self.hidden_drafting.setdefault(bucket, _Ema()).update(hidden, self.cost_alpha)
@@ -1489,6 +1500,7 @@ class SpeculativeEngine:
             )
             state.can_draft = row.draft is not None and row.draft.ready
             state.catch_up = getattr(row.draft, "pending_pairs", 0)
+            state.folded_replay = state.catch_up <= self.controller.max_depth + 1
             states.append(state)
         return states
 
