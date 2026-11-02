@@ -1601,7 +1601,6 @@ class SpeculativeEngine:
 
     def _plain(self, length: int, states: list[RowState], waiting: Callable[[], bool] | None = None) -> Iterator[list[list[int]]]:
         rows = self._rows
-        # A processor that reads more than the history needs each token taken before the next step.
         pipelined = all(row.history_only for row in rows)
         start = time.perf_counter()
         with mx.stream(self._stream):
@@ -2142,8 +2141,7 @@ class MTPDrafter:
         return self.model.make_cache()
 
     def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[DraftRow, list]:
-        """A row from its prompt, the target hidden ``[1, N, H]`` of its last N prompt positions
-        (or None), and its pending token; returns its state and its head cache."""
+        """Defer the prompt's last ``[1, N, H]`` hidden states until the row first drafts."""
         count = 0 if hidden is None else min(int(hidden.shape[1]), len(prompt))
         prefix = None
         if count:
