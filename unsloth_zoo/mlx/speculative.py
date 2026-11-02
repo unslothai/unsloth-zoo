@@ -1304,6 +1304,10 @@ def _language_call(family: str):
         module = __import__(f"mlx_vlm.models.{family}.language", fromlist = ["LanguageModel"])
     except ImportError:
         return None
+    if family == "qwen3_5":
+        from .generate import _ensure_quantized_decode_mask
+
+        _ensure_quantized_decode_mask(module)
     return module.LanguageModel.__call__
 
 

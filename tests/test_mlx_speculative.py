@@ -15,6 +15,39 @@ from unsloth_zoo.mlx.speculative import (
 )
 
 
+@pytest.mark.parametrize("entrypoint", ["engine", "batch"])
+def test_quantized_decode_keeps_each_rows_padding_mask(entrypoint, monkeypatch):
+    import mlx.core as mx
+    from mlx_vlm.models import cache as caches
+    from mlx_vlm.models.qwen3_5 import language
+    from unsloth_zoo.mlx import generate, speculative
+
+    original = language._create_qwen3_5_attention_mask
+    while getattr(original, "_unsloth_quantized_padding", False):
+        original = original.__wrapped__
+    monkeypatch.setattr(language, "_create_qwen3_5_attention_mask", original)
+    def install():
+        if entrypoint == "engine":
+            return speculative._language_call("qwen3_5")
+        return generate._resolve_vlm_batch_module()
+    install()
+    wrapped = language._create_qwen3_5_attention_mask
+    install()
+    assert language._create_qwen3_5_attention_mask is wrapped
+
+    quantized = caches.BatchQuantizedKVCache([0, 2])
+    keys = mx.ones((2, 1, 4, 64))
+    quantized.update_and_fetch(keys, keys)
+    hidden = mx.zeros((2, 1, 128))
+    mask = language._create_qwen3_5_attention_mask(hidden, quantized)
+    assert isinstance(mask, mx.array)
+    assert mask.tolist() == [[[[True] * 5]], [[[False, False, True, True, True]]]]
+
+    dense = caches.BatchKVCache([0, 2])
+    dense.update_and_fetch(keys, keys)
+    assert language._create_qwen3_5_attention_mask(hidden, dense) == original(hidden, dense)
+
+
 def test_ngram_prefers_longer_then_newer_match():
     prompt = [9, 1, 2, 3, 4, 50, 7, 1, 2, 3, 4, 60, 8, 1, 2, 3, 4, 70]
     proposer = NgramProposer(prompt, min_ngram = 4)

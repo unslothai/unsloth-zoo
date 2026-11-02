@@ -2438,8 +2438,27 @@ def _split_prompt_kwargs_fallback(prompt_kwargs: dict, batch_size: int) -> list[
     return rows
 
 
+def _ensure_quantized_decode_mask(language = None):
+    language = language or sys.modules.get("mlx_vlm.models.qwen3_5.language")
+    original = getattr(language, "_create_qwen3_5_attention_mask", None)
+    if not callable(original) or getattr(original, "_unsloth_quantized_padding", False):
+        return
+
+    @functools.wraps(original)
+    def attention_mask(h, cache):
+        mask = original(h, cache)
+        # Packed attention declines the sentinel fast path and needs the actual padding mask.
+        if isinstance(mask, str) and mask == "left_padded_decode" and hasattr(cache, "bits"):
+            return cache.make_mask(h.shape[1], return_array = True)
+        return mask
+
+    attention_mask._unsloth_quantized_padding = True
+    language._create_qwen3_5_attention_mask = attention_mask
+
+
 def _resolve_vlm_batch_module():
 
+    _ensure_quantized_decode_mask()
     batch_module = _resolve_module_attr(_VLM_BATCH_MODULES, "BatchGenerator")
     if batch_module is None:
         raise _vlm_api_shape_error("no importable module exposes BatchGenerator")
