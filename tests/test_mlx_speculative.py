@@ -806,6 +806,28 @@ def test_closing_a_plain_stream_preserves_its_completed_cost_sample(history_only
     assert len(recorded) == 1
 
 
+@pytest.mark.parametrize("width", [64, 1024, 2048, 2112])
+def test_full_width_draft_projection_uses_the_native_table(width):
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import _ShortlistHead
+
+    if not hasattr(mx.float32, "size"):
+        pytest.skip("CPU simulation lacks MLX dtype metadata")
+
+    class Table:
+        def __contains__(self, name):
+            return name in vars(self)
+
+    table = Table()
+    table.weight = mx.zeros((512, width))
+    model = SimpleNamespace(args = SimpleNamespace(tie_word_embeddings = False), lm_head = table)
+    head = _ShortlistHead.of(model)
+    if width <= 2048:
+        assert head is None
+    else:
+        assert head is not None and head.columns == 2048 and head.nbytes < table.weight.nbytes
+
+
 def test_mtp_defers_prompt_replay_without_losing_ragged_prefixes_or_tail_gaps(monkeypatch):
     import mlx.core as mx
     from unsloth_zoo.mlx.speculative import MTPDrafter

@@ -1907,12 +1907,12 @@ def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
     with exact_speculative_verify(model):
         assert _run(model, ids, 96, _script(("draft", 3), ("copy", 4)), greedy, drafter = _drafter(model))[0] == solo
     assert len(submitted) > 2 * unscoped + len(model.language_model.model.layers)
-    picked, pick = [], _ShortlistHead.__call__
-    monkeypatch.setattr(_ShortlistHead, "__call__", lambda self, hidden: picked.append(self._source is self.table.weight) or pick(self, hidden))
-    (out,), drafted, _ = _run(model, ids[:1], 96, DraftController(max_depth = 4, max_copy = 16), greedy, drafter = _drafter(model))
-    assert out == solo[0] and drafted[0][1] > 0 and picked and all(picked)
     built = _drafter(model)
-    assert built.weight_bytes == sum(a.nbytes for _, a in tree_flatten(built.model.parameters())) + built._shortlist.nbytes
+    assert built._shortlist is None
+    assert built.weight_bytes == sum(a.nbytes for _, a in tree_flatten(built.model.parameters()))
+    monkeypatch.setattr(_ShortlistHead, "prepare", lambda self: pytest.fail("a native head allocated a duplicate table"))
+    (out,), drafted, _ = _run(model, ids[:1], 96, DraftController(max_depth = 4, max_copy = 16), greedy, drafter = built)
+    assert out == solo[0] and drafted[0][1] > 0
 
 
 def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(monkeypatch):
@@ -1932,7 +1932,8 @@ def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(mo
         few = mx.argsort(-coarse, axis = -1)[..., :8]
         best = mx.take_along_axis(few, mx.argmax(mx.take_along_axis(logits, few, axis = -1), axis = -1, keepdims = True), axis = -1)
         assert head(hidden).tolist() == best.squeeze(-1).tolist() != mx.argmax(coarse, axis = -1).tolist()
-    assert (small := speculative._ShortlistHead.of(lm(nn.Linear(64, 512, bias = False), False))).prepare() is None and small.nbytes == sum(a.nbytes for a in small._scan) and speculative._ShortlistHead.of(lm(packed(dense), False)).nbytes == speculative._ShortlistHead.of(lm(dense, False)).nbytes and all(speculative._ShortlistHead.of(lm(uncovered, False)) is None for uncovered in (nn.Linear(192, 512), narrow, packed(narrow), nn.Linear(192, 8, bias = False), nn.QuantizedLinear(192, 512, bias = False, bits = 2)))
+    assert speculative._ShortlistHead.of(lm(packed(dense), False)).nbytes == speculative._ShortlistHead.of(lm(dense, False)).nbytes
+    assert all(speculative._ShortlistHead.of(lm(uncovered, False)) is None for uncovered in (nn.Linear(64, 512, bias = False), nn.Linear(192, 512), narrow, packed(narrow), nn.Linear(192, 8, bias = False), nn.QuantizedLinear(192, 512, bias = False, bits = 2)))
 
 
 @pytest.mark.parametrize("max_lag", [128, 4])

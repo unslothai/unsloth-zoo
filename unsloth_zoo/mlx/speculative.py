@@ -2095,7 +2095,7 @@ class _ShortlistHead:
         # Width and size are the same for a quantized table and for the unquantized stand-in a load is sized from.
         sides = weight if bits is None else table.scales
         width = sides.shape[1] * (1 if bits is None else table.group_size)
-        if width % _SHORTLIST_GROUP:
+        if width <= _SHORTLIST_COLUMNS or width % _SHORTLIST_GROUP:
             return None
         if sides.shape[0] <= _SHORTLIST_KEEP:
             return None
