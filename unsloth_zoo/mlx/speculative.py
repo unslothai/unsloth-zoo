@@ -1636,11 +1636,17 @@ class SpeculativeEngine:
                     if taken and rows[i].draft is not None:
                         self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
                 completed = steps
+                failure = None
                 if not last and not pipelined and settled and not any(row.finished for row in rows):
-                    with mx.stream(self._stream):
-                        upcoming = self._step(tokens[:, None])
-                    mx.async_eval(*(array for array in upcoming if array is not None))
+                    try:
+                        with mx.stream(self._stream):
+                            upcoming = self._step(tokens[:, None])
+                        mx.async_eval(*(array for array in upcoming if array is not None))
+                    except Exception as error:
+                        failure = error
                 yield emitted
+                if failure is not None:
+                    raise failure
                 if last:
                     break
                 if steps == 1:

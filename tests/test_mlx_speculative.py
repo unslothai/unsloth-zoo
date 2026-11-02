@@ -842,6 +842,37 @@ def test_plain_steps_queue_after_settlement_before_yielding_to_the_consumer(sett
     assert len(forwards) == 3
 
 
+def test_a_queued_plain_failure_does_not_drop_the_already_committed_token(monkeypatch):
+    import contextlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx import speculative
+
+    def processor(tokens, logits):
+        return logits
+    processor.settle = lambda tokens: None
+    controller = DraftController(max_depth = 0, can_copy = False)
+    row = speculative._Row(speculative.EngineRow(None, 1, [1, 2], processors = [processor]), controller)
+    calls = []
+    failure = ValueError("next token cannot satisfy the grammar")
+
+    def step(inputs, ahead = 0):
+        calls.append(inputs.tolist())
+        if len(calls) > 1:
+            raise failure
+        return mx.array([4]), None, None
+
+    monkeypatch.setattr(mx, "stream", lambda s: contextlib.nullcontext())
+    observer = SimpleNamespace(record_plain = lambda *a: None, interrupts_plain = lambda s: False)
+    engine = _bare_engine(SpeculativeEngine, _stream = None, controller = observer, _step = step)
+    engine._rows, engine._states = [row], lambda: []
+    stream = engine._plain(3, [])
+    assert next(stream) == [[4]]
+    assert calls == [[[1]], [[4]]]
+    with pytest.raises(ValueError) as raised:
+        next(stream)
+    assert raised.value is failure
+
+
 def test_a_single_cold_plain_sample_is_confirmed_before_comparing_draft_rates():
     controller = DraftController(max_depth = 1, can_copy = False)
     rows = [RowState(controller.new_reply())]
