@@ -45,7 +45,9 @@ def dequantizing_is_smaller(queries, q_keys, q_values, group_size):
     HKV = q_keys[0].shape[-3]
     scores = HQ * L * dtype.size
     copy = HKV * (_row_bytes(q_keys, group_size, dtype) + _row_bytes(q_values, group_size, dtype))
-    return scores > copy
+    padding = forced_padding_row_bytes(q_keys[1].shape[-1] * group_size, q_values[1].shape[-1] * group_size, HKV,
+                                       dtype.size, q_keys[0].shape[-2])
+    return scores > copy + padding
 
 
 # Shapes of the calls mlx fuses, per ScaledDotProductAttention::has_fused_kernel and use_fallback (mlx 0.32.3);
@@ -116,23 +118,59 @@ def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     return _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask)
 
 
-# mlx has a head_dim 256 kernel for any causal call but picks it by default only on NAX or square calls, and otherwise
-# builds `[B, HQ, L, S]` scores. Fewer rows are slower on the kernel; float32 and array masks are long dispatches on it.
-_FORCED_D256_MIN_QUERIES = 64
+# mlx builds `[B, HQ, L, S]` scores for these causal calls by default. Below the floors the scores are small and the
+# default is faster; float32 is a long dispatch.
+_FORCED_MIN_QUERIES = 16
+_FORCED_MIN_KEYS = 8192
+
+
+def _forced_widths(head_dim, value_dim):
+    """The (head_dim, value_dim) a forced call runs at, or None. Zero padding leaves the attention exact."""
+    from .nax import nax_available
+
+    if head_dim == value_dim == 256:
+        return 256, 256
+    if (head_dim, value_dim) == (192, 128):
+        # No 192/128 kernel past 8 queries. NAX runs its head_dim 256 kernel faster than its 192 one; elsewhere the
+        # reverse holds.
+        return (256, 256) if nax_available() else (192, 192)
+    return None
 
 
 def _forces_fused(queries, n_keys, head_dim, value_dim, dtype, mask):
-    return (head_dim == value_dim == 256 and isinstance(mask, str) and mask == "causal"
-            and _FORCED_D256_MIN_QUERIES <= queries.shape[-2] <= n_keys and dtype != mx.float32
-            and mx.metal.is_available() and mx.default_device() == mx.gpu)
+    return (_forced_widths(head_dim, value_dim) is not None and isinstance(mask, str) and mask == "causal"
+            and _FORCED_MIN_QUERIES <= queries.shape[-2] <= n_keys and n_keys >= _FORCED_MIN_KEYS
+            and dtype != mx.float32 and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def forced_padding_row_bytes(head_dim, value_dim, kv_heads, dtype_size, n_keys):
+    """Bytes per cached token a forced call over `n_keys` holds in its padded copies of K and V."""
+    widths = _forced_widths(head_dim, value_dim)
+    if widths is None or dtype_size == 4 or n_keys < _FORCED_MIN_KEYS:
+        return 0
+    copied = (widths[0] if widths[0] != head_dim else 0) + (widths[1] if widths[1] != value_dim else 0)
+    return kv_heads * copied * dtype_size
+
+
+def _pad_width(x, width):
+    return x if x.shape[-1] == width else mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, width - x.shape[-1])])
+
+
+def _blocks_d512_scores(queries, n_keys, head_dim, value_dim, dtype, mask):
+    # mlx's use_blocked_d512: off NAX these calls hold about 256 queries' scores, not all of them.
+    from .nax import nax_available
+
+    return (head_dim == value_dim == 512 and isinstance(mask, str) and mask == "causal"
+            and _SPLIT_MIN_QUERIES <= queries.shape[-2] <= n_keys and dtype != mx.float32
+            and not nax_available() and mx.metal.is_available() and mx.default_device() == mx.gpu)
 
 
 def runtime_fuses(queries, q_keys, q_values, group_size, mask=None):
-    """Whether a loaded model's call runs on a fused kernel: mlx's own choice or the forced head_dim 256 route."""
+    """Whether a loaded model's call avoids building full scores: mlx's own route or a forced one."""
+    route = (queries, q_keys[0].shape[-2], q_keys[1].shape[-1] * group_size, q_values[1].shape[-1] * group_size,
+             _result_dtype(queries, q_keys, q_values), mask)
     return (fused_kernel_exists(queries, q_keys, q_values, group_size, mask)
-            or _forces_fused(queries, q_keys[0].shape[-2], q_keys[1].shape[-1] * group_size,
-                             q_values[1].shape[-1] * group_size,
-                             _result_dtype(queries, q_keys, q_values), mask))
+            or _forces_fused(*route) or _blocks_d512_scores(*route))
 
 
 def fused_sdpa_over(stock):
@@ -144,7 +182,10 @@ def fused_sdpa_over(stock):
         if (sinks is None and not kwargs and q.dtype == k.dtype == v.dtype
                 and _forces_fused(q, k.shape[-2], k.shape[-1], v.shape[-1], q.dtype, mask)
                 and not mlx_training_patches_active()):
-            return stock(q, k, v, scale=scale, mask=mask, force_fused=True)
+            head_dim, value_dim = _forced_widths(k.shape[-1], v.shape[-1])
+            out = stock(_pad_width(q, head_dim), _pad_width(k, head_dim), _pad_width(v, value_dim), scale=scale,
+                        mask=mask, force_fused=True)
+            return out if value_dim == v.shape[-1] else out[..., :v.shape[-1]]
         return stock(q, k, v, scale=scale, mask=mask, sinks=sinks, **kwargs)
     return sdpa
 
