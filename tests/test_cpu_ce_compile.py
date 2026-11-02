@@ -22,14 +22,14 @@ import torch.nn.functional as F
 from torch._dynamo.utils import counters
 
 
-def _inputs(n, masked, seed = 0):
+def _inputs(n, masked, seed = 0, batch = 2):
     torch.manual_seed(seed)
-    hidden = torch.randn(2, n, 8, requires_grad = True)
+    hidden = torch.randn(batch, n, 8, requires_grad = True)
     weight = (torch.randn(13, 8) * 0.3).requires_grad_()
-    labels = torch.randint(0, 13, (2, n))
+    labels = torch.randint(0, 13, (batch, n))
     if masked:
         labels[:, : n // 2] = -100      # prompt tokens
-        labels[1, -1] = -100
+        labels[-1, -1] = -100
     return hidden, weight, labels
 
 
@@ -72,8 +72,27 @@ def test_chunked_ce_compiles_fullgraph_without_breaks(masked, dynamic):
         out.backward()
         _check_against_fp64(out, hidden, weight, labels)
     assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
-    # Chunk loop specialises on row count: at most one graph per length.
-    assert counters["stats"]["unique_graphs"] <= len(set(lengths))
+    assert counters["stats"]["unique_graphs"] <= 1
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("mark", [False, True])
+def test_chunked_ce_does_not_specialise_sequence_length(batch, mark):
+    # A Python range over the row count would pin sequence length: mark_dynamic fails at batch 1 (rows == length)
+    # and fullgraph hits the recompile limit after 8 lengths at any batch size.
+    torch._dynamo.reset()
+    counters.clear()
+    compiled = torch.compile(_loss, fullgraph = True, dynamic = True, backend = "aot_eager")
+    for n in range(9, 9 + 8 * 10, 8):
+        hidden, weight, labels = _inputs(n, masked = True, seed = n, batch = batch)
+        if mark:
+            torch._dynamo.mark_dynamic(hidden, 1)
+            torch._dynamo.mark_dynamic(labels, 1)
+        out = compiled(hidden, weight, labels)
+        out.backward()
+        _check_against_fp64(out, hidden, weight, labels)
+    assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
+    assert counters["stats"]["unique_graphs"] <= 1, counters["stats"]["unique_graphs"]
 
 
 def test_eager_still_skips_masked_rows(monkeypatch):

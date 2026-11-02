@@ -78,7 +78,11 @@ def _disable(where, exc):
     global _DISABLED_REASON
     # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion.
     if isinstance(exc, _autograd_control_flow_errors()):
-        raise exc
+        try:
+            raise exc
+        finally:
+            # exc's traceback holds this frame: keeping exc here is a cycle that pins the failed call's tensors.
+            del exc
     _DISABLED_REASON = f"{where}: {type(exc).__name__}: {exc}"
     logger.warning(
         "Unsloth: the Triton MoE kernels failed to compile or launch and are disabled "

@@ -51,6 +51,7 @@ import contextlib
 import functools
 import inspect
 import threading
+import sys
 import weakref
 import typing as t
 import torch
@@ -753,6 +754,10 @@ _REENTRANT_FRAMES = ("forward", "backward")
 # checkpoint_sequential opens no region of its own and runs its LAST segment outside every checkpoint, so the catch-all below must skip it.
 _SEQUENTIAL_FRAME = "checkpoint_sequential"
 
+# torch 2.15 moved `checkpoint`'s body into `_checkpoint_impl`, also entered via `_CheckpointedFunction.__call__`.
+_ENTRY_FRAMES = ("checkpoint", "_checkpoint_impl")
+_PASS_THROUGH_FRAMES = (_SEQUENTIAL_FRAME, "__call__")
+
 
 def _frame_local(frame, name):
     """One local off a live frame, `_UNKNOWN` when it is not there."""
@@ -797,13 +802,13 @@ def _walk_for_checkpoint_frame():
     while frame is not None:
         if frame.f_code.co_filename == origin:
             name = frame.f_code.co_name
-            if name == _SEQUENTIAL_FRAME:
+            if name in _PASS_THROUGH_FRAMES:
                 pass                            # keep scanning outward
             elif name in _REENTRANT_FRAMES:
                 # checkpoint_sequential's per-segment closure is also named forward here, so only the ctx local tells it from the autograd Function frames.
                 if _frame_local(frame, "ctx") is not _UNKNOWN:
                     reentrant += 1
-            elif name == "checkpoint":
+            elif name in _ENTRY_FRAMES:
                 use_reentrant = _frame_local(frame, "use_reentrant")
                 if use_reentrant is False: return True
                 if reentrant: reentrant -= 1
@@ -1245,7 +1250,9 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
             if isinstance(current, int) and not isinstance(current, bool):
                 try:
                     setattr(_config, name, current + extra)
-                except Exception:
+                except Exception as error:
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.warning(f"Unsloth: Could not raise torch._dynamo.config.{name}: {error!r}")
                     continue
                 # Stack per written value: a scoped patch can repeat a baseline, and one entry merged two debts.
                 _BUMPED_RECOMPILE_LIMITS.setdefault(name, {}).setdefault(
@@ -1308,7 +1315,9 @@ def _restore_recompile_limits():
                 original = baselines[original][-1]
             setattr(_config, name, original)
             restored += 1
-        except Exception:
+        except Exception as error:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: Could not restore torch._dynamo.config.{name}: {error!r}")
             continue
         # Pop only the branch just unwound; clearing the map would erase branches a live config.patch hides.
         for value in chain:
@@ -1588,7 +1597,11 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
             _RAISED_INSIDE_CHECKPOINT = True
             _CHECKPOINT_SETTLE_ATTEMPTS = 0
-            raise e
+            try:
+                raise e
+            finally:
+                # e's traceback holds this frame: keeping e here is a cycle that pins the failed call's tensors.
+                del e
         return eager_func(*args, **kwargs)
 
     def _give_up_at_compile_time(e, args, kwargs, marker_before, warning):
@@ -1642,30 +1655,40 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
             _RAISED_INSIDE_CHECKPOINT = True
             _CHECKPOINT_SETTLE_ATTEMPTS = 0
-            raise e
+            try:
+                raise e
+            finally:
+                # e's traceback holds this frame: keeping e here is a cycle that pins the failed call's tensors.
+                del e
         return eager_func(*args, **kwargs)
 
     def _give_up_on_backend(e, args, kwargs, marker_before):
         """Inductor refused to generate code for this region."""
-        return _give_up_at_compile_time(
-            e, args, kwargs, marker_before,
-            f"Unsloth: torch.compile could not generate code for {label}; "
-            f"running it eagerly from here. Training is unaffected apart from "
-            f"speed. ({type(e).__name__})",
-        )
+        try:
+            return _give_up_at_compile_time(
+                e, args, kwargs, marker_before,
+                f"Unsloth: torch.compile could not generate code for {label}; "
+                f"running it eagerly from here. Training is unaffected apart from "
+                f"speed. ({type(e).__name__})",
+            )
+        finally:
+            del e  # same cycle as in _give_up_at_compile_time
 
     def _give_up_on_disabled_hook(e, args, kwargs, marker_before):
         """Dynamo refused to inline one of our own `torch.compiler.disable`d hooks.
 
         Was a bare eager flip: no checkpoint question, no deferral, no record.
         """
-        return _give_up_at_compile_time(
-            e, args, kwargs, marker_before,
-            f"Unsloth: torch.compile hit one of Unsloth's own "
-            f"`torch.compiler.disable`d gradient-checkpointing hooks inside "
-            f"{label}; running it eagerly from here. Training is unaffected "
-            f"apart from speed.",
-        )
+        try:
+            return _give_up_at_compile_time(
+                e, args, kwargs, marker_before,
+                f"Unsloth: torch.compile hit one of Unsloth's own "
+                f"`torch.compiler.disable`d gradient-checkpointing hooks inside "
+                f"{label}; running it eagerly from here. Training is unaffected "
+                f"apart from speed.",
+            )
+        finally:
+            del e  # same cycle as in _give_up_at_compile_time
 
     def _is_backend_refusal_we_handle(e):
         """The gate the wrapper's own backend arm applies, in one place."""
@@ -1933,6 +1956,16 @@ def _settle_abandoned_checkpoint_generator():
 UNSLOTH_DECODE_COMPILE = [False]
 # [weakref to an eager stance Unsloth installed (True if torch has none), stance it replaced]
 UNSLOTH_EAGER_STANCE_OWNED = []
+# Shared by all generated modules; reset per generate() or decode step 1 skips compile.
+UNSLOTH_INFERENCE_RUNS = [0]
+
+
+def unsloth_reset_inference_runs():
+    UNSLOTH_INFERENCE_RUNS[0] = 0
+    # Older-zoo modules kept by UNSLOTH_COMPILE_OVERWRITE=0 keep their own INFERENCE_RUNS.
+    for name, module in list(sys.modules.items()):
+        if name.startswith("unsloth_compiled_module_") and type(getattr(module, "INFERENCE_RUNS", None)) is int:
+            module.INFERENCE_RUNS = 0
 
 
 def _owned_stance(entry):
@@ -2454,5 +2487,26 @@ def restore_original(
         if UNSLOTH_ENABLE_LOGGING:
             logger.error(f"Unsloth: Failed to restore {attr_name}: {e}")
         return False
+
+
+# Forced float32 patches follow UNSLOTH_FORCE_FLOAT32, which each load resets, on classes shared by
+# every live model of that family. Stash the original only once (patch_function re-stashes whatever
+# is installed, so a second pass would record our own forward) so a later flag "0" load can undo them.
+def patch_forced_float32(target_obj, attr_name, new_func, **kwargs):
+    stashed = _get_unique_storage_name(target_obj, attr_name) in vars(target_obj)
+    return patch_function(target_obj, attr_name, new_func, store_original = not stashed, **kwargs)
+
+
+def undo_forced_float32(target_obj, attr_name):
+    if target_obj is not None and _get_unique_storage_name(target_obj, attr_name) in vars(target_obj):
+        restore_original(target_obj, attr_name)
+
+
+def other_family_load(family_pattern):
+    """A load whose model types (UNSLOTH_MODEL_NAME) are all another family's must not repatch or undo
+    this family's classes under a live model of it."""
+    import os, re
+    name = os.environ.get("UNSLOTH_MODEL_NAME", "").lower().replace("-", "_")
+    return bool(name) and re.search(family_pattern, name) is None
 
 

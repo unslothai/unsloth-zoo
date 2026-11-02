@@ -275,6 +275,9 @@ class GenerationRequest:
     token_count, cache)`` is called with the live cache. A checkpoint fires only where a
     prefill chunk ends; no chunk is reshaped to reach one. Rows decoding together merge
     by cache class, so every row of one batch needs a state building the same layout.
+    Where ``row_retire_unavailable_reason()`` is None, an optional ``retire(take)`` is called
+    as the row leaves decoding; ``take()``, valid only during the call, returns the row's own
+    cache entries.
 
     ``drafts=False`` keeps a row of a speculative batch off the draft: its tokens are the
     target's own, as a reply decoded without speculation draws them. Other batches ignore it.
@@ -939,6 +942,8 @@ def _sequential_history(processor):
         return processor(tokens[state["offset"] :], logits)
 
     _shown.history_only = getattr(processor, "history_only", False)
+    if hasattr(processor, "settle"):
+        _shown.settle = lambda tokens: processor.settle(tokens[state["offset"] :])
     return _shown
 
 
@@ -1141,7 +1146,7 @@ def _require_evaluable(model):
 
 
 @contextmanager
-def generation_mode(model, int8_prefill = None, call = None, ane_prefill = None):
+def generation_mode(model, int8_prefill = None, call = None, ane_prefill = None, fast_verify = None):
     """Temporarily switch a model to eval mode and steward global MLX limits.
 
     The outermost context snapshots the process-global memory, cache, and wired
@@ -1168,7 +1173,8 @@ def generation_mode(model, int8_prefill = None, call = None, ane_prefill = None)
         _require_evaluable(model)()
         _GENERATION_MODE_DEPTH += 1
         entered = True
-        with inference_scopes(model, call, int8_prefill = int8_prefill, ane_prefill = ane_prefill, _modules = modules):
+        with inference_scopes(model, call, int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify,
+                              _modules = modules):
             yield model
     except BaseException as exc:
         active_error = exc
@@ -2432,8 +2438,27 @@ def _split_prompt_kwargs_fallback(prompt_kwargs: dict, batch_size: int) -> list[
     return rows
 
 
+def _ensure_quantized_decode_mask(language = None):
+    language = language or sys.modules.get("mlx_vlm.models.qwen3_5.language")
+    original = getattr(language, "_create_qwen3_5_attention_mask", None)
+    if not callable(original) or getattr(original, "_unsloth_quantized_padding", False):
+        return
+
+    @functools.wraps(original)
+    def attention_mask(h, cache):
+        mask = original(h, cache)
+        # Packed attention declines the sentinel fast path and needs the actual padding mask.
+        if isinstance(mask, str) and mask == "left_padded_decode" and hasattr(cache, "bits"):
+            return cache.make_mask(h.shape[1], return_array = True)
+        return mask
+
+    attention_mask._unsloth_quantized_padding = True
+    language._create_qwen3_5_attention_mask = attention_mask
+
+
 def _resolve_vlm_batch_module():
 
+    _ensure_quantized_decode_mask()
     batch_module = _resolve_module_attr(_VLM_BATCH_MODULES, "BatchGenerator")
     if batch_module is None:
         raise _vlm_api_shape_error("no importable module exposes BatchGenerator")
@@ -2564,6 +2589,60 @@ def _row_prefill_batch_class(base):
     return RowPrefillBatch
 
 
+def _row_view(entry, index: int):
+    """The last row of an in-order cache as a view of its buffers, which leave with it; else None (``extract`` copies)."""
+    module, name = sys.modules[type(entry).__module__], type(entry).__name__
+    if name == "CacheList":
+        caches = [_row_view(cache, index) for cache in entry.caches]
+        return None if any(cache is None for cache in caches) else module.CacheList(*caches)
+    keys = getattr(entry, "keys", None)
+    if keys is None or isinstance(keys, (tuple, list)) or keys.shape[0] != 1:
+        return None
+    if name == "KVCache":
+        view, start, end = module.KVCache(), 0, entry.offset
+    elif name == "BatchKVCache":
+        view, start, end = module.KVCache(), int(entry.left_padding[index].item()), entry._idx
+    elif name == "BatchRotatingKVCache" and not entry.rotated:
+        view, start, end = module.RotatingKVCache(entry.max_size), max(0, int(entry.left_padding[index].item())), entry._idx
+    else:
+        return None
+    view.keys, view.values = (array[index : index + 1, :, start:end] for array in (entry.keys, entry.values))
+    if name == "BatchRotatingKVCache":
+        view.offset, view._idx = int(entry.offset[index].item()), end - start
+    else:
+        view.offset = end - start
+    return view
+
+
+def _row_cache(entries: list, index: int) -> list:
+    """Row ``index``'s own entries. A lone row's may be its own unmerged ones, not all with ``extract``."""
+    rows = []
+    for entry in entries:
+        view = _row_view(entry, index)
+        rows.append(view if view is not None else entry.extract(index) if hasattr(entry, "extract") else entry)
+    return rows
+
+
+@functools.lru_cache(maxsize=None)
+def _retiring_batch_class(base):
+    """``base`` handing leaving rows their cache in ``filter``, where mlx-vlm frees it."""
+
+    class RetiringBatch(base):
+        def filter(self, keep):
+            retiring = getattr(self, "_unsloth_retiring", None)
+            if retiring:
+                kept = set(keep)
+                for index, uid in enumerate(self.uids):
+                    retire = None if index in kept else retiring.pop(uid, None)
+                    if retire is not None:
+                        retire(functools.partial(_row_cache, self.prompt_cache, index))
+            return super().filter(keep)
+
+    RetiringBatch.__name__ = RetiringBatch.__qualname__ = f"Retiring{base.__name__}"
+    RetiringBatch._unsloth_retiring_base = base
+    return RetiringBatch
+
+
 def _quantized_cache_type():
     from mlx_vlm.models.cache import QuantizedKVCache
 
@@ -2665,6 +2744,22 @@ def row_quantized_prompt_cache_unavailable_reason() -> str | None:
         return reason
     if "prefix_cache_merge" not in vars(_quantized_cache_type()):
         return f"{_installed_mlx_vlm_version()} cannot batch a row's own quantized cache"
+    return None
+
+
+def speculative_quantized_rows_unavailable_reason() -> str | None:
+    return row_quantized_prompt_cache_unavailable_reason()
+
+
+def row_retire_unavailable_reason() -> str | None:
+    """Why a batched vision row here cannot hand its own cache back as it leaves the batch."""
+
+    reason = row_prompt_cache_unavailable_reason()
+    if reason is not None:
+        return reason
+    batch_module = _resolve_vlm_batch_module()
+    if not callable(getattr(getattr(batch_module, "GenerationBatch", None), "filter", None)):
+        return f"{_installed_mlx_vlm_version()} drops a leaving row's cache where it cannot be handed back"
     return None
 
 
@@ -3594,6 +3689,7 @@ class _VLMBatchSession:
         self._pending: dict[int, _PendingResult] = {}
         self._row_of: dict[int, int] = {}
         self._uid_of: dict[int, int] = {}
+        self._retiring: dict[int, Callable] = {}
         self._next_row = 0
         self.usable = True
         self._stack = ExitStack()
@@ -3688,6 +3784,9 @@ class _VLMBatchSession:
         self._pending[uid] = state
         self._row_of[uid] = row
         self._uid_of[row] = uid
+        retire = getattr(request.prompt_cache_state, "retire", None)
+        if prefill is not None and callable(retire):
+            self._retiring[uid] = retire
         self.sampler.register(uid, request.sampling or defaults.sampling)
         self._row_signature = _row_signature(
             prompt_kwargs, adapter.padded_prompt_kwargs)
@@ -3833,6 +3932,7 @@ class _VLMBatchSession:
                     "mlx-vlm ended its event stream before every request "
                     "reported a finish reason."
                 )
+            self._hand_back_rows()
             _, events = self._cache_materializer.next()
             if not events:
                 if self.adapter._admission_stalled(self.generator):
@@ -3889,6 +3989,7 @@ class _VLMBatchSession:
             self._pending.clear()
             self._row_of.clear()
             self._uid_of.clear()
+            self._retiring.clear()
             self._stack.close()
 
     def _prepare(self, request: GenerationRequest):
@@ -3967,11 +4068,21 @@ class _VLMBatchSession:
                 return True
         if self.adapter.cancel is None:
             return False
+        self._hand_back_rows()
         return self.adapter.cancel(self.generator, uid) is not False
+
+    def _hand_back_rows(self) -> None:
+        """Arm the decoding batch, which mlx-vlm replaces when it empties, to hand leaving rows back."""
+        batch = getattr(self.generator, "_generation_batch", None)
+        if not self._retiring or not callable(getattr(type(batch), "filter", None)):
+            return
+        batch.__class__ = _retiring_batch_class(getattr(type(batch), "_unsloth_retiring_base", type(batch)))
+        batch._unsloth_retiring = self._retiring
 
     def _retire(self, uid: int):
 
         row = self._row_of.pop(uid, None)
+        self._retiring.pop(uid, None)
         self._pending.pop(uid, None)
         if row is not None:
             self._uid_of.pop(row, None)
@@ -4019,6 +4130,7 @@ class _SpeculativeBatchSession:
         install_speculative_seam()
         self.adapter = adapter
         self.speculative = speculative
+        self._layout = None
         self.tokenizer = getattr(adapter.processor, "tokenizer", adapter.processor)
         criteria = getattr(self.tokenizer, "stopping_criteria", None)
         stop_ids = adapter.defaults.stop_token_ids
@@ -4063,12 +4175,23 @@ class _SpeculativeBatchSession:
         with self._embedded(len(pending.prompt) - prefix):
             admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra, **_prefill_step_option(adapter.defaults))
         finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
+        retire = getattr(request.prompt_cache_state, "retire", None)
         if not finished:
+            layout = _cache_layout(admitted.cache)
+            if self.engine.rows and layout != self._layout:
+                if callable(retire):
+                    retire(lambda: list(admitted.cache))
+                raise BatchRowRefused("This request's prompt cache does not match the layout of the batch's other rows.")
+            self._layout = layout
             try:
                 self.engine.add(admitted)
             except BaseException:
                 self.usable = False
                 raise
+            if callable(retire):
+                self.engine.retiring[row] = retire
+        elif callable(retire):
+            retire(lambda: list(admitted.cache))
         self._next_row += 1
         self._pending[row] = state
         self._drawn[row] = ([admitted.pending], [logprob], finished)
@@ -4082,8 +4205,10 @@ class _SpeculativeBatchSession:
             return 0
         cache, lengths = state.open(list(prompt))
         cache = list(cache)
-        if any(isinstance(entry, _quantized_cache_types()) for entry in cache):
-            raise BatchRowRefused("This request's prompt cache is quantized; speculative batches run on full-precision KV caches.")
+        if any(isinstance(entry, _quantized_cache_types()) and not isinstance(entry, _quantized_cache_type()) for entry in cache):
+            raise BatchRowRefused("This request's prompt cache is TurboQuant; speculative batches run on full-precision or affine-quantized KV caches.")
+        if "prefix_cache_merge" not in vars(_quantized_cache_type()) and any(isinstance(entry, _quantized_cache_type()) for entry in cache):
+            raise BatchRowRefused(f"{_installed_mlx_vlm_version()} cannot batch a row's own quantized cache.")
         prefix = _cache_offset(cache)
         if prefix is None:
             raise BatchRowRefused("This request's prompt cache holds no offset to resume from.")

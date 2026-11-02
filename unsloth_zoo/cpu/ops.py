@@ -22,6 +22,7 @@ __all__ = [
 ]
 
 import functools
+import inspect
 import math
 import os
 import types
@@ -51,8 +52,8 @@ def _softmax_without_collapse(z, y, keep_logits = False):
 
 
 class _ChunkedLinearCrossEntropy(torch.autograd.Function):
-    """Sums CE(hidden @ weight.T, labels) / divisor without materialising (rows, vocab) logits; grads are formed per
-    chunk in forward, so peak extra memory is one (chunk, vocab) fp32 block."""
+    """Sums CE(hidden @ weight.T, labels) / divisor; grads are formed per chunk in forward, so eager peak extra memory
+    is one (chunk, vocab) fp32 block (compiled runs use a single chunk over all rows)."""
 
     @staticmethod
     def forward(ctx, hidden, weight, labels, divisor, chunk_rows, ignore_index):
@@ -65,8 +66,11 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else None
         grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else None
         total = torch.zeros((), dtype = torch.float32)
-        for start in range(0, rows, chunk_rows):
-            end = min(start + chunk_rows, rows)
+        # A Python range over a symbolic row count pins sequence length under torch.compile (one graph per length;
+        # a mark_dynamic length fails), so compiled runs take one chunk over every row: full logits, no chunk saving.
+        bounds = [(0, rows)] if torch.compiler.is_compiling() else \
+            [(start, min(start + chunk_rows, rows)) for start in range(0, rows, chunk_rows)]
+        for start, end in bounds:
             y = labels[start:end]
             valid = y != ignore_index
             # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
@@ -284,9 +288,27 @@ def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size
     return tuple(value if name == "log_probs" or name in outputs else None for name, value in zip(names, result))
 
 
+_TRL_LOGPROB_ARGS = ("hidden", "weight", "bias", "targets", "temperature", "chunk_size",
+                     "final_logit_softcapping", "logit_scale", "outputs")
+# Appended args -> extra outputs (TRL 1.17).
+_TRL_LOGPROB_EXTRA_ARGS = {"support_ids": 0, "score_ids": 1}
+
+
+def _trl_logprob_contract(kernel):
+    """(argument names after ctx, output count, known)."""
+    try:
+        names = tuple(inspect.signature(kernel.forward).parameters)[1:]
+    except (AttributeError, TypeError, ValueError):
+        return _TRL_LOGPROB_ARGS, 5, True  # No kernel (Triton missing) or no readable forward: the 1.x contract.
+    head, extra = names[:len(_TRL_LOGPROB_ARGS)], names[len(_TRL_LOGPROB_ARGS):]
+    known = head == _TRL_LOGPROB_ARGS and all(name in _TRL_LOGPROB_EXTRA_ARGS for name in extra)
+    return names, 5 + sum(_TRL_LOGPROB_EXTRA_ARGS.get(name, 0) for name in extra), known
+
+
 def patch_trl_fused_lm_head():
     """TRL 1.x SFTTrainer always computes loss through a fused LM head whose Triton kernel is None without Triton, so
-    CPU training and evaluate() fail; keep it on CUDA/XPU, route other devices to cpu_chunked_log_probs. Idempotent."""
+    CPU training and evaluate() fail; keep it on CUDA/XPU, route other devices to cpu_chunked_log_probs. Idempotent.
+    TRL 1.17 unpacks six outputs, so the torch path pads; id-set calls or an unknown contract stay on TRL's kernel."""
     try:
         from trl.trainer import utils as trl_utils
     except Exception:
@@ -296,6 +318,7 @@ def patch_trl_fused_lm_head():
     kernel = trl_utils._ChunkedLogProbFunction
     if getattr(kernel, "_unsloth_cpu_dispatch", False):
         return True
+    names, n_outputs, known = _trl_logprob_contract(kernel)
 
     class _DeviceDispatch:
         _unsloth_cpu_dispatch = True
@@ -303,9 +326,17 @@ def patch_trl_fused_lm_head():
 
         @staticmethod
         def apply(hidden, *args, **kwargs):
-            if kernel is not None and hidden.device.type in ("cuda", "xpu"):
+            if kernel is not None and (hidden.device.type in ("cuda", "xpu") or not known):
                 return kernel.apply(hidden, *args, **kwargs)
-            return cpu_chunked_log_probs(hidden, *args, **kwargs)
+            bound = dict(zip(names[1:], args))
+            bound.update(kwargs)
+            if kernel is not None and any(bound.get(name) is not None for name in _TRL_LOGPROB_EXTRA_ARGS):
+                return kernel.apply(hidden, *args, **kwargs)
+            result = cpu_chunked_log_probs(hidden, *args[:len(_TRL_LOGPROB_ARGS) - 1],
+                                           **{k: v for k, v in kwargs.items() if k in _TRL_LOGPROB_ARGS})
+            if isinstance(result, tuple) and len(result) < n_outputs:
+                result = result + (None,) * (n_outputs - len(result))
+            return result
 
     trl_utils._ChunkedLogProbFunction = _DeviceDispatch
     return True

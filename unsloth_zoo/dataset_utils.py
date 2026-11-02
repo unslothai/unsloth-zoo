@@ -732,6 +732,48 @@ def is_trl_padding_free_collator(collator):
 pass
 
 
+# Formats whose rows hand back the stored integers unchanged; anything else uses the per-row scan.
+_ARROW_LABEL_SCAN_FORMATS = (None, "python", "numpy", "np", "torch", "pt")
+
+def _fully_masked_rows_from_arrow(dataset, batch_size = 10_000):
+    """Fully masked `labels` row indices via Arrow; None unless a flat signed-int list column without null tokens."""
+    try:
+        import numpy as np
+        import pyarrow as pa
+        fmt = getattr(dataset, "format", None)
+        if not isinstance(fmt, dict) or fmt.get("type") not in _ARROW_LABEL_SCAN_FORMATS: return None
+        shown = fmt.get("columns")
+        if shown is not None and "labels" not in shown and not fmt.get("output_all_columns", False):
+            return None
+        dropped = []
+        start = 0
+        for table in dataset.select_columns(["labels"]).with_format("arrow").iter(batch_size = batch_size):
+            column = table.column("labels")
+            n = len(column)
+            if n == 0: continue
+            column = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
+            if not (pa.types.is_list(column.type) or pa.types.is_large_list(column.type)): return None
+            if not pa.types.is_signed_integer(column.type.value_type): return None
+            values = column.values
+            if values.null_count: return None
+            offsets = np.asarray(column.offsets, dtype = np.int64)
+            first, last = int(offsets[0]), int(offsets[-1])
+            kept = np.asarray(values.slice(first, last - first)) != -100
+            # reduceat over non-empty rows only: an empty segment would return its start element.
+            nonempty = offsets[1:] != offsets[:-1]
+            masked = np.ones(n, dtype = bool)
+            if kept.size:
+                masked[nonempty] = ~np.logical_or.reduceat(kept, offsets[:-1][nonempty] - first)
+            if column.null_count:
+                masked &= np.asarray(column.is_valid())
+            dropped.extend((np.flatnonzero(masked) + start).tolist())
+            start += n
+        return dropped
+    except Exception:
+        return None
+pass
+
+
 class _KeepUnlistedRows:
     # Batched with_indices filter predicate: reads no column; a class so it pickles to num_proc workers.
     def __init__(self, dropped):
@@ -1251,18 +1293,20 @@ def train_on_responses_only(
         # labels column cheaply first; the common case (0 fully masked) returns as-is.
         n_before = len(dataset)
         # Track only the fully masked rows, so a huge clean corpus builds no per-row list.
-        dropped = []
-        try:
-            idx = 0
-            for batch in dataset.select_columns(["labels"]).iter(batch_size = 1000):
-                for labels in batch["labels"]:
-                    if labels is not None:
-                        if getattr(labels, "tolist", None): labels = labels.tolist()
-                        if not any(l != -100 for l in labels): dropped.append(idx)
-                    idx += 1
-        except Exception:
-            # Datasets with a custom transform may need other columns; fall back.
-            return dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        dropped = _fully_masked_rows_from_arrow(dataset)
+        if dropped is None:
+            dropped = []
+            try:
+                idx = 0
+                for batch in dataset.select_columns(["labels"]).iter(batch_size = 1000):
+                    for labels in batch["labels"]:
+                        if labels is not None:
+                            if getattr(labels, "tolist", None): labels = labels.tolist()
+                            if not any(l != -100 for l in labels): dropped.append(idx)
+                        idx += 1
+            except Exception:
+                # Datasets with a custom transform may need other columns; fall back.
+                return dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
         if not dropped:
             return dataset  # nothing fully masked
         # Most rows masked away across the WHOLE dataset usually means truncation.
@@ -2788,8 +2832,9 @@ def sft_prepare_dataset(
     do_prompt_completion = False
     do_messages = False
 
-    # Get correct column names
-    column_names = set(next(iter(dataset)).keys())
+    # remove_columns gets the row's key order: a list of the set follows PYTHONHASHSEED and misses the datasets cache.
+    source_column_names = list(next(iter(dataset)).keys())
+    column_names = set(source_column_names)
     used_column_names = ["input_ids"]
     if "attention_mask" in column_names:
         used_column_names.append("attention_mask")
@@ -3075,7 +3120,7 @@ def sft_prepare_dataset(
                 dataset = dataset.map(
                     _batched_rows(_tokenize_pc, _tokenize_pc_rows) if _batch_map else _tokenize_pc,
                     batched=_batch_map,
-                    remove_columns=list(column_names), **map_kwargs,
+                    remove_columns=source_column_names, **map_kwargs,
                 )
             if assistant_only_loss:
                 # Prompt-history assistant turns are no target while completion_mask applies.
@@ -3202,7 +3247,7 @@ def sft_prepare_dataset(
                 dataset = dataset.map(
                     _batched_rows(_tokenize_messages, _tokenize_messages_rows) if _batch_map else _tokenize_messages,
                     batched=_batch_map,
-                    remove_columns=list(column_names), **map_kwargs,
+                    remove_columns=source_column_names, **map_kwargs,
                 )
             if assistant_only_loss:
                 # Truncation can drop every assistant token; such a row has no target.
@@ -3218,7 +3263,7 @@ def sft_prepare_dataset(
             import warnings as _w
             with _w.catch_warnings():
                 _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
-                dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
+                dataset = dataset.map(_tokenize, batched = True, remove_columns = source_column_names, **map_kwargs)
 
         # VLMs need .pad; switch the data collator
         # transformers' collator rebuilds labels from input_ids, dropping assistant masks: keep TRL's for messages.

@@ -245,7 +245,7 @@ jobs:
         # removes the need for it entirely.
         run: |
           pip install --index-url https://download.pytorch.org/whl/cpu \
-            "torch>=2.4.0,<2.15.0"
+            "torch>=2.4.0,<2.16.0"
           pip install -e .[core]
 
       - name: Run security regression tests

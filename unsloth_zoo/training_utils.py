@@ -93,6 +93,163 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
 pass
 
 
+def _bias_compute_dtype(module):
+    """Live compute dtype: floating weight, else bitsandbytes compute/quant dtype, else float16."""
+    weight = None
+    for weight_name in ("weight", "in_proj_weight", "q_proj_weight"):
+        weight = getattr(module, weight_name, None)
+        if torch.is_tensor(weight):
+            break
+    if torch.is_tensor(weight) and weight.is_floating_point() and not hasattr(weight, "quant_state"):
+        return weight.dtype
+    dtype = getattr(module, "compute_dtype", None)
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    dtype = getattr(getattr(weight, "quant_state", None), "dtype", None)
+    return dtype if isinstance(dtype, torch.dtype) else torch.float16
+
+
+def _float32_bias_master_property(name):
+    """In a marked forward, `module.<name>` is the float32 master cast to the compute dtype; elsewhere the master."""
+
+    def get(self):
+        if name in self._parameters:
+            master = self._parameters[name]
+        elif name in self.__dict__:
+            master = self.__dict__[name]
+        else:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        in_forward = self._unsloth_bias_in_forward
+        if master is None or not in_forward or not in_forward[-1]:
+            return master
+        dtype = _bias_compute_dtype(self)
+        if master.dtype == dtype or not master.is_floating_point():
+            return master
+        return master.to(dtype)
+
+    def set(self, value):
+        # Only for unregistered non-Parameters (DataParallel replicas).
+        self.__dict__[name] = value
+
+    def delete(self):
+        self.__dict__.pop(name, None)
+
+    return property(get, set, delete)
+
+
+def _float32_bias_master_reduce(self):
+    getstate = getattr(self, "__getstate__", None)
+    state = getstate() if getstate is not None else self.__dict__
+    cls = type(self)
+    return (_reconstruct_float32_bias_master_module, (cls._unsloth_bias_base, cls._unsloth_bias_names), state)
+
+
+def _reconstruct_float32_bias_master_module(base_cls, names = ("bias",)):
+    cls = _float32_bias_master_class(base_cls, names)
+    return cls.__new__(cls)
+
+
+_FLOAT32_BIAS_MASTER_CLASSES = {}
+
+
+def _float32_bias_master_class(cls, names):
+    names = tuple(sorted(names))
+    new_cls = _FLOAT32_BIAS_MASTER_CLASSES.get((cls, names))
+    if new_cls is None:
+        namespace = {name: _float32_bias_master_property(name) for name in names}
+        namespace.update({
+            "__module__": cls.__module__,
+            "__reduce__": _float32_bias_master_reduce,
+            "_replicate_for_data_parallel": _float32_bias_master_replicate,
+            "_unsloth_bias_base": cls,
+            "_unsloth_bias_names": names,
+        })
+        new_cls = type(cls.__name__, (cls,), namespace)
+        new_cls.__qualname__ = cls.__qualname__ + "WithUnslothFloat32Bias"
+        _FLOAT32_BIAS_MASTER_CLASSES[(cls, names)] = new_cls
+    return new_cls
+
+
+def _float32_bias_master_replicate(self):
+    # Replicas run in parallel threads; the shallow __dict__ copy would share the stack.
+    replica = super(type(self), self)._replicate_for_data_parallel()
+    replica._unsloth_bias_in_forward = []
+    return replica
+
+
+def _owner_stack(module, path):
+    for part in path.split(".") if path else ():
+        module = module._modules.get(part)
+        if module is None:
+            return None
+    return module.__dict__.get("_unsloth_bias_in_forward")
+
+
+def _float32_bias_enter_forward(module, args):
+    for path, cast in module._unsloth_bias_marks:
+        in_forward = _owner_stack(module, path)
+        if in_forward is not None:
+            in_forward.append(cast)
+
+
+def _float32_bias_exit_forward(module, args, output):
+    for path, cast in module._unsloth_bias_marks:
+        in_forward = _owner_stack(module, path)
+        if in_forward:
+            in_forward.pop()
+
+
+def _float32_bias_reset_stacks(module, args):
+    # always_call hooks skip KeyboardInterrupt, which would leave marks pushed.
+    for in_forward in module._unsloth_bias_stacks:
+        in_forward.clear()
+
+
+def _is_peft_tuner_layer(module):
+    try:
+        from peft.tuners.tuners_utils import BaseTunerLayer
+    except Exception:
+        return False
+    return isinstance(module, BaseTunerLayer)
+
+
+def _mark_in_forward(module, path, cast):
+    if "_unsloth_bias_marks" not in module.__dict__:
+        module._unsloth_bias_marks = []
+        module.register_forward_pre_hook(_float32_bias_enter_forward)
+        module.register_forward_hook(_float32_bias_exit_forward, always_call = True)
+    if (path, cast) not in module._unsloth_bias_marks:
+        module._unsloth_bias_marks.append((path, cast))
+
+
+def _cast_bias_in_forward(model, owner_name, names = ("bias",)):
+    """A lazy class property, not a pre-hook (runs before Accelerate materializes offloaded params; DataParallel
+    bypasses _parameters) nor a parametrization (renames state_dict keys).
+
+    The owner and its nearest non-PEFT ancestor (may read the bias functionally, e.g. MHA out_proj) push True;
+    PEFT layers between push False, since their bias.data writes (unmerge with lora_bias) must reach the master."""
+    module = model.get_submodule(owner_name)
+    cls = type(module)
+    base = cls.__dict__.get("_unsloth_bias_base")
+    if base is not None:
+        names = set(names) | set(cls._unsloth_bias_names)
+        cls = base
+    module.__class__ = _float32_bias_master_class(cls, names)
+    if "_unsloth_bias_in_forward" not in module.__dict__:
+        module._unsloth_bias_in_forward = []
+    _mark_in_forward(module, "", True)
+    parts = owner_name.split(".") if owner_name else []
+    while parts:
+        parts.pop()
+        ancestor = model.get_submodule(".".join(parts))
+        path = owner_name[len(".".join(parts)):].lstrip(".")
+        if _is_peft_tuner_layer(ancestor):
+            _mark_in_forward(ancestor, path, False)
+            continue
+        _mark_in_forward(ancestor, path, True)
+        break
+
+
 # Autocast subclasses cached by (base_class, compute_dtype) so pickle can resolve them.
 _BF16_AUTOCAST_SUBCLASSES = {}
 
@@ -419,6 +576,9 @@ def prepare_model_for_training(
 
     # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to requires_grad=True and would all stay trainable on the LoRA path (ref 2343 review).
     _is_peft_model = hasattr(model, "peft_config")
+    # The loop reuses `dtype`.
+    _loaded_float16 = dtype == torch.float16
+    _float32_bias_owners = []
 
     for name, param in model.named_parameters():
         original_name = name
@@ -441,7 +601,13 @@ def prepare_model_for_training(
                 # _keep_param_dtype keeps the loaded dtype since fp32 breaks the matmul on a bf16/fp16 Linear;
                 # modules_to_save is excluded so a frozen head is not partly trained via its bias (ref 2343 review)
                 requires_grad = True
-                _keep_param_dtype = True
+                # float16: GradScaler refuses fp16 grads, so use a float32 master cast back in forward.
+                # Skip ".weight" (T5's relative_attention_bias is a weight).
+                if _loaded_float16 and param.dtype == torch.float16 and not name.endswith(".weight"):
+                    upcast = True
+                    _float32_bias_owners.append(name)
+                else:
+                    _keep_param_dtype = True
             else:
                 requires_grad = False
         else:
@@ -477,6 +643,21 @@ def prepare_model_for_training(
             if param.dtype != torch.float32:
                 param.data = param.data.to(torch.float32)
     pass
+
+    _owner_names = {}
+    for _name in _float32_bias_owners:
+        _owner, _, _leaf = _name.rpartition(".")
+        _owner_names.setdefault(_owner, set()).add(_leaf)
+    for _owner, _names in _owner_names.items():
+        _cast_bias_in_forward(model, _owner, _names)
+    if _owner_names:
+        if "_unsloth_bias_stacks" not in model.__dict__:
+            model._unsloth_bias_stacks = []
+            model.register_forward_pre_hook(_float32_bias_reset_stacks, prepend = True)
+        for _owner in _owner_names:
+            _stack = model.get_submodule(_owner).__dict__["_unsloth_bias_in_forward"]
+            if not any(_s is _stack for _s in model._unsloth_bias_stacks):
+                model._unsloth_bias_stacks.append(_stack)
 
     # Wrap only if fp32 norms exist (our upcast, legacy env, or external policy); gating on presence avoids wrapping a model with none.
     _has_fp32_norms = any(

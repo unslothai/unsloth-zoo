@@ -311,10 +311,13 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # Have to explicitly set it!
         torch._dynamo.config.suppress_errors = True
     pass
+    _log_skips = debug or os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+    from unsloth_zoo.log import logger
     import torch._inductor.config as config
     for _try_compile_argument in torch_compile_arguments:
         try:    exec(_try_compile_argument)
-        except: pass
+        except Exception as _error:
+            if _log_skips: logger.warning(f"Unsloth: Skipped Inductor `{_try_compile_argument}` on torch {torch.__version__}: {_error!r}")
     pass
     import torch._dynamo.config as config
     for _try_dynamo_argument in torch_dynamo_arguments:
@@ -322,8 +325,12 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         _key = _try_dynamo_argument.split("=", 1)[0].strip()[len("config."):]
         if getattr(getattr(config, "_config", {}).get(_key), "deprecated", False): continue
         try:    exec(_try_dynamo_argument)
-        except: pass
+        except Exception as _error:
+            if _log_skips: logger.warning(f"Unsloth: Skipped Dynamo `{_try_dynamo_argument}` on torch {torch.__version__}: {_error!r}")
     pass
+    # Must run after the writes above.
+    from unsloth_zoo.temporary_patches.common import apply_inductor_correctness_workarounds
+    apply_inductor_correctness_workarounds()
     # Must happen before anything compiles.
     stop_compiling_weak_dictionary_writes()
 pass
@@ -889,9 +896,12 @@ def patch_compiled_autograd():
     # From https://github.com/pytorch/pytorch/pull/135795/files
     try:
         import torch._dynamo.variables.misc
-        fx = torch._dynamo.variables.misc.AutogradEngineVariable.call_method
+        engine_variable = torch._dynamo.variables.misc.AutogradEngineVariable
+        fx = engine_variable.call_method
     except:
         return
+    # torch 2.15 moved queue_callback into its own method (already on the new name) and inherits call_method.
+    if "call_method" not in vars(engine_variable): return
     if fx.__name__ == "unsloth_call_method": return
     source = inspect.getsource(fx)
     if "in_compiled_autograd_region" in source: return
