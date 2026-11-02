@@ -1199,7 +1199,6 @@ class StepOutput:
 
 
 def _packed_kv(cache: list) -> bool:
-    """Whether a cache holds ``mx.quantize``'s packed keys, which tree verify and a target-KV drafter cannot read."""
     return any(_packed_kv(entry.caches) if hasattr(entry, "caches") else isinstance(getattr(entry, "keys", None), (tuple, list)) for entry in cache)
 
 
@@ -1345,7 +1344,6 @@ def _join(batch: list | None, new: list, size: int) -> list:
 def _batched(rows: list):
     from .generate import _quantized_cache_type
 
-    # mlx-vlm has no merge for a quantized row.
     if isinstance(rows[0], _quantized_cache_type()):
         return rows[0].prefix_cache_merge(rows, [row.offset for row in rows])
     return type(rows[0]).merge(rows)

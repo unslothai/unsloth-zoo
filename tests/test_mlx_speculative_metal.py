@@ -1,13 +1,4 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Pin MLXTrainer's batch padding to match mlx-lm's iterate_batches:
-# `1 + _PAD_MULTIPLE * ceil(L / _PAD_MULTIPLE)`.
-#
-# mlx-lm (mlx_lm/tuner/trainer.py:158) pads to `1 + 32*ceil(max_len/32)`;
-# default_loss then slices [:, :-1] / [:, 1:]. unsloth_zoo's
-# create_text_batches previously dropped the `+1`, leaving the input one
-# token short after the autoregressive shift, which shifted small fixtures
-# into a different convergence basin (probe 31 = 67% vs probe 33-37 = 40-53%,
-# see danielhanchen/unsloth-staging-2).
 
 import contextlib
 import itertools
@@ -227,7 +218,6 @@ def _presence():
 
 
 def _parity():
-    """Settles: favours half the vocabulary by the parity of the reply's token sum, and keeps each committed history it is told."""
     def favour(tokens, logits):
         start = favour.__dict__.setdefault("start", tokens.shape[0])
         if favour.committed:
@@ -423,7 +413,6 @@ def test_a_processor_that_settles_speculates_and_is_told_each_committed_history(
     monkeypatch.setattr(speculative.SpeculativeEngine, "_step", lambda engine, inputs, ahead = 0: plain_ahead.append(ahead) or step(engine, inputs, ahead))
     (out,), drafted, _ = _run(model, ids[:1], 96, _script(("copy", 8), ("plain", 4)), SamplingParams(), processors = {0: [favour := _parity()]})
     assert out == _solo(model, ids[0], 96, SamplingParams(), [_parity()])
-    # A plain window takes each token before the next step, so a settling matcher is never left behind.
     assert plain_ahead and not any(plain_ahead)
     assert drafted[0][1] > 0 and favour.ahead > 1
     committed = favour.committed
