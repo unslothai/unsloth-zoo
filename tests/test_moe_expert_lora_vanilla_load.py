@@ -39,6 +39,8 @@ FAMILY, WORK = sys.argv[1], sys.argv[2]
 CKPT = os.path.join(WORK, "ckpt")
 ADAPTER = os.path.join(WORK, "adapter")
 IDS = torch.randint(2, 256, (2, 12), generator = torch.Generator().manual_seed(0))
+import transformers
+TRANSFORMERS_5 = int(transformers.__version__.split(".")[0]) >= 5
 
 def config():
     if FAMILY == "llama4":
@@ -53,6 +55,8 @@ def config():
         num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 2, head_dim = 16, num_experts = 4,
         num_experts_per_tok = 2, max_position_embeddings = 128, use_cache = False, pad_token_id = 0,
         rope_parameters = {"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [2, 3, 3]})
+    if not TRANSFORMERS_5:  # 4.x reads rope_scaling and rope_theta, not rope_parameters
+        text.update(rope_scaling = {"rope_type": "default", "mrope_section": [2, 3, 3]}, rope_theta = 10000.0)
     vision = dict(depth = 1, hidden_size = 32, intermediate_size = 64, num_heads = 2, out_hidden_size = 64,
         deepstack_visual_indexes = [0], num_position_embeddings = 16)
     return Qwen3VLMoeConfig(text_config = text, vision_config = vision, tie_word_embeddings = False)
@@ -118,7 +122,8 @@ out["load_adapter_max_abs"] = float((logits(direct) - want).abs().max())
 # The same through a .bin adapter (transformers reads those itself too).
 model.save_pretrained(os.path.join(WORK, "adapter_bin"), safe_serialization = False)
 direct_bin = model_class().from_pretrained(CKPT, dtype = torch.float32)
-direct_bin.load_adapter(os.path.join(WORK, "adapter_bin"), use_safetensors = False)
+# 4.x has no use_safetensors here: PEFT's load_peft_weights falls back to the .bin itself.
+direct_bin.load_adapter(os.path.join(WORK, "adapter_bin"), **({"use_safetensors": False} if TRANSFORMERS_5 else {}))
 out["load_adapter_bin_max_abs"] = float((logits(direct_bin) - want).abs().max())
 # A compiled wrapper (`_orig_mod.` names) hotswapped into a lower-rank adapter. PEFT < 0.20 refuses that swap
 # for expert ParamWrappers even without Unsloth (Incompatible shapes), so there is nothing to check there.
@@ -167,6 +172,11 @@ def _run(code, family, work, zoo, **extra):
     return json.loads(lines[-1]) if lines else {}
 
 
+def _transformers_at_least_5():
+    import transformers
+    return int(transformers.__version__.split(".")[0]) >= 5
+
+
 def _peft_at_least_0_20():
     import peft
     from packaging.version import Version
@@ -175,8 +185,14 @@ def _peft_at_least_0_20():
 
 @pytest.mark.parametrize("b_layout", ["rank_major", "grouped_by_expert"])
 @pytest.mark.parametrize("family", ["llama4", "qwen3_vl_moe"])
-def test_unsloth_expert_lora_loads_in_vanilla_peft(tmp_path, family, b_layout):
+def test_unsloth_expert_lora_loads_in_vanilla_peft(request, tmp_path, family, b_layout):
     # grouped_by_expert is the legacy lora_B packing (UNSLOTH_MOE_LORA_B_LAYOUT): it must never load silently wrong.
+    if family == "qwen3_vl_moe" and b_layout == "grouped_by_expert" and not _transformers_at_least_5():
+        # Vanilla PEFT only refuses the legacy packing by shape, and the shapes change only when the save swaps
+        # the factors. transformers 4.x already stores these stacks hidden-first, so nothing is swapped, the
+        # shapes match, and the adapter loads with its experts mixed (~0.6 off in the logits).
+        request.applymarker(pytest.mark.xfail(strict = True, reason = "transformers 4.x: the legacy lora_B "
+            "packing loads silently wrong in vanilla PEFT for Qwen3-VL-MoE"))
     work = str(tmp_path)
     _run(VANILLA_SAVE, family, work, zoo = False)
     trained = _run(UNSLOTH_TRAIN, family, work, zoo = True, UNSLOTH_MOE_LORA_B_LAYOUT = b_layout)
