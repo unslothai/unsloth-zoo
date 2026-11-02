@@ -588,8 +588,9 @@ def test_a_fresh_loads_first_reply_drafts_on_its_own_accepted_rounds():
         state = [RowState(controller.new_reply(), copy_available = copies)]
         for accepted, seconds, drafting in ((3, 1.96 + draft, draft), (1, 1.80, 0.18)):
             controller.record_round(controller.plan(state), state, [accepted], seconds = seconds, draft_seconds = drafting)
-        assert controller.plan(state).kind == "plain"
-        controller.record_plain(state, 8, 8.0, 1.0)
+        for _ in range(2):
+            assert controller.plan(state).kind == "plain"
+            controller.record_plain(state, 4, 4.0, 1.0)
         assert controller.plan(state).rows == (first,)
 
 
@@ -629,7 +630,8 @@ def test_rows_switch_to_drafting_together():
         state.stats.copy.value = 1.0
         state.stats.draft = [_Ema(1.0) for _ in range(4)]
         state.stats.probe_at = {"copy": 1 << 30, "draft": 1 << 30}
-    controller.record_plain(states, 1, 5.0, 5.0)
+    for _ in range(2):
+        controller.record_plain(states, 1, 5.0, 5.0)
     assert [row.source for row in controller.plan(states).rows] == ["draft", "draft"]
     states[1].stats.draft = [_Ema(0.0) for _ in range(4)]
     states[1].copy_available = 0
@@ -804,6 +806,20 @@ def test_closing_a_plain_stream_preserves_its_completed_cost_sample(history_only
     assert recorded[0][2] > 0 and recorded[0][3] == 1
     stream.close()
     assert len(recorded) == 1
+
+
+def test_a_single_cold_plain_sample_is_confirmed_before_comparing_draft_rates():
+    controller = DraftController(max_depth = 1, can_copy = False)
+    rows = [RowState(controller.new_reply())]
+    draft = RoundPlan("round", rows = (RowPlan("draft", 1),), split = True)
+    for _ in range(2):
+        controller.record_round(draft, rows, [1], seconds = 0.045, draft_seconds = 0.005)
+    controller.record_plain(rows, 3, seconds = 0.105, step_seconds = 0.035)
+    assert controller.plain_cost[1].count == 1
+    assert controller.plan(rows).kind == "plain"
+    controller.record_plain(rows, 3, seconds = 0.03, step_seconds = 0.01)
+    assert controller.plain_cost[1].value == pytest.approx(0.01)
+    assert controller.plan(rows).kind == "plain"
 
 
 @pytest.mark.parametrize("width", [64, 1024, 2048, 2112])

@@ -704,7 +704,7 @@ class DraftController:
             )
             if any(row.source == "draft" for row in warmup):
                 return RoundPlan("round", rows = warmup, split = True)
-        if bucket not in self.plain_cost:
+        if bucket not in self.plain_cost or self.plain_cost[bucket].count < 2:
             return RoundPlan("plain", max(1, min(max(self.min_window, 3), room)))  # long enough to time a running step
 
         rounds = {}
