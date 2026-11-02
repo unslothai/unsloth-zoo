@@ -22,7 +22,9 @@ def test_quantized_decode_keeps_each_rows_padding_mask(entrypoint, monkeypatch):
     from mlx_vlm.models.qwen3_5 import language
     from unsloth_zoo.mlx import generate, speculative
 
-    original = language._create_qwen3_5_attention_mask
+    original = getattr(language, "_create_qwen3_5_attention_mask", None)
+    if original is None:
+        pytest.skip("mlx-vlm has no affected Qwen3.5 mask fast path")
     while getattr(original, "_unsloth_quantized_padding", False):
         original = original.__wrapped__
     monkeypatch.setattr(language, "_create_qwen3_5_attention_mask", original)
