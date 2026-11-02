@@ -2130,6 +2130,8 @@ class _ShortlistHead:
         self._scan = tuple(mx.concatenate(column) for column in zip(*parts))
         mx.eval(self._scan)
         self._source = self.table.weight
+        from .inference import _FIRST_USE_WORK
+        _FIRST_USE_WORK[0] += 1
 
     def __call__(self, hidden: mx.array) -> mx.array:
         coarse = mx.quantized_matmul(hidden[..., :self.columns], *self._scan, True, _SHORTLIST_GROUP, _SHORTLIST_BITS)

@@ -909,6 +909,35 @@ def test_full_width_draft_projection_uses_the_native_table(width):
         assert head is not None and head.columns == 2048 and head.nbytes < table.weight.nbytes
 
 
+def test_shortlist_construction_is_not_learned_as_recurring_draft_work(monkeypatch):
+    import importlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import _ShortlistHead
+
+    if not hasattr(mx.float32, "size"):
+        monkeypatch.setattr(mx, "quantize", lambda value, *args: (value, value, value))
+    inference = importlib.import_module("unsloth_zoo.mlx.inference")
+    table = SimpleNamespace(weight = mx.zeros((128, 64)))
+    head = _ShortlistHead(table, 64, 0)
+    controller = DraftController(max_depth = 1, can_copy = False)
+    rows = [RowState(controller.new_reply())]
+    plan = RoundPlan("round", rows = (RowPlan("draft", 1),), split = True)
+    before = inference.first_use_work()
+    head.prepare()
+    controller.record_round(plan, rows, [1], seconds = 0.514, draft_seconds = 0.502,
+                            first_use = inference.first_use_work() != before)
+    assert controller.draft_cost[1].value is None and controller.verify_cost == {}
+    assert inference.first_use_work() == before + 1
+    head.prepare()
+    assert inference.first_use_work() == before + 1
+    controller.record_round(plan, rows, [1], seconds = 0.014, draft_seconds = 0.002)
+    assert controller.draft_cost[1].value == pytest.approx(0.002)
+    assert controller.verify_cost[1][2].value == pytest.approx(0.012)
+    table.weight = mx.ones((128, 64))
+    head.prepare()
+    assert inference.first_use_work() == before + 2
+
+
 def test_mtp_defers_prompt_replay_without_losing_ragged_prefixes_or_tail_gaps(monkeypatch):
     import mlx.core as mx
     from unsloth_zoo.mlx.speculative import MTPDrafter
