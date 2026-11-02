@@ -456,6 +456,7 @@ class DraftController:
         self.verify_cost: dict[int, dict[int, _Ema]] = {}
         self.plain_cost: dict[int, _Ema] = {}
         self.draft_cost = {depth: _Ema() for depth in range(1, self.max_depth + 1)}
+        self.draft_replay_pairs = {depth: 0.0 for depth in self.draft_cost}
         self.catch_up_cost = _Ema()
         self.hidden_drafting: dict[int, _Ema] = {}
         # Rounds the engine drafted past the planned depth: their seconds, emitted tokens, and the tokens the planned depth would have emitted.
@@ -539,8 +540,11 @@ class DraftController:
         anchor = below[-1] if below else above[0]
         return max(anchor[1] + slope * (key - anchor[0]), 1e-9)
 
-    def _measured(self, table: dict[int, _Ema]) -> list[tuple[int, float]]:
+    def _measured(self, table: dict[int, _Ema], replay_pairs: dict[int, float] | None = None) -> list[tuple[int, float]]:
         points = [(key, ema.value) for key, ema in sorted(table.items()) if ema.value is not None]
+        if replay_pairs:
+            replay = self._catch_up_seconds()
+            points = [(key, max(value - replay_pairs.get(key, 0.0) * replay, 1e-9)) for key, value in points]
         once = {key for key, ema in table.items() if ema.value is not None and ema.count < 2}
         if not once or len(once) == len(points):
             return points
@@ -566,7 +570,7 @@ class DraftController:
         return self._verify_seconds(bucket, width)
 
     def _draft_seconds(self, depth: int) -> float:
-        points = self._measured(self.draft_cost)
+        points = self._measured(self.draft_cost, self.draft_replay_pairs)
         slope = self._plain_step(1) * self._DRAFT_SLOPE
         return slope * depth if not points else self._extrapolate(points, depth, slope * 0.1)
 
@@ -577,8 +581,7 @@ class DraftController:
     def _row_seconds(self, row: RowPlan, state: RowState) -> float:
         if row.source != "draft":
             return 0.0
-        replay = 0 if state.folded_replay else state.catch_up
-        return self._draft_seconds(row.length) + replay * self._catch_up_seconds()
+        return self._draft_seconds(row.length) + state.catch_up * self._catch_up_seconds()
 
     def _replay_pairs(self, rows: Sequence[RowState]) -> int:
         return sum(state.catch_up for state in rows) if any(state.catch_up and not state.folded_replay for state in rows) else 0
@@ -590,7 +593,10 @@ class DraftController:
     def round_seconds(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
         bucket = _bucket(len(rows))
         drafting = sum(self._draft_seconds(row.length) for row in plan.rows if row.source == "draft")
-        replay = self._replay_pairs([state for row, state in zip(plan.rows, rows) if row.source == "draft"])
+        draft_rows = [state for row, state in zip(plan.rows, rows) if row.source == "draft"]
+        replay = self._replay_pairs(draft_rows)
+        if not replay:
+            drafting += sum(state.catch_up for state in draft_rows) * self._catch_up_seconds()
         verify = self._copy_seconds if all(row.source == "copy" for row in plan.rows) else self._verify_seconds
         return verify(bucket, width or plan.width) + replay * self._catch_up_seconds() + self._drafting_paid(bucket, drafting)
 
@@ -616,7 +622,7 @@ class DraftController:
                 draft = RowPlan("draft", depth)
                 gain = state.stats.expected(draft) - state.stats.expected(base[i])
                 cost = self._row_seconds(draft, state)
-                replay = 0.0 if state.folded_replay else state.catch_up * self._catch_up_seconds()
+                replay = state.catch_up * self._catch_up_seconds()
                 options.append((gain, cost, i, draft, cost - replay))
         bucket = _bucket(len(rows))
         tokens = sum(state.stats.expected(row) for row, state in zip(base, rows))
@@ -642,6 +648,8 @@ class DraftController:
         for gain, chosen in scored:
             drafting = sum(option[4] for option in chosen)
             replay = self._replay_pairs([rows[option[2]] for option in chosen]) * self._catch_up_seconds() if has_replay else 0.0
+            if has_replay and not replay:
+                drafting += sum(rows[option[2]].catch_up for option in chosen) * self._catch_up_seconds()
             rate = (tokens + gain) / (verify + replay + self._drafting_paid(bucket, drafting))
             if rate > best_score:
                 plan = list(base)
@@ -1051,19 +1059,34 @@ class DraftController:
         # A trimmed row's drafting is that of the full block ``plan`` drafted it as.
         depths = [self._cap(state, self.max_depth) if plan.trim else row.length
                   for row, state in zip(plan.rows, rows) if row.source == "draft" and row.length]
-        catch_up = self._replay_pairs([state for row, state in zip(plan.rows, rows) if row.source == "draft"])
+        draft_rows = [state for row, state in zip(plan.rows, rows) if row.source == "draft"]
+        catch_up = self._replay_pairs(draft_rows)
         verify = self.verify_cost.setdefault(bucket, {}).setdefault(plan.width, _Ema())
         if plan.split:
             self._since_split = 0
             verify.update_time(max(seconds - draft_seconds - catch_up_seconds, 1e-9), self.cost_alpha)
             # Only a round drafting one depth for every row can attribute its drafting time.
             if depths and len(set(depths)) == 1:
-                self.draft_cost[depths[0]].update_time(draft_seconds / len(depths), self.cost_alpha)
+                depth, sample = depths[0], draft_seconds / len(depths)
+                cost = self.draft_cost[depth]
+                pairs = sum(state.catch_up for state in draft_rows) / len(depths) if not catch_up and not catch_up_seconds else 0.0
+                # Replay pairs follow the same minimum/clipping filter as their duration.
+                if cost.count == 1:
+                    if sample < cost.value:
+                        self.draft_replay_pairs[depth] = pairs
+                else:
+                    if cost.count > 1 and sample > 2 * cost.value:
+                        pairs *= 2 * cost.value / sample
+                    rate = max(self.cost_alpha, 1.0 / (cost.count + 1))
+                    self.draft_replay_pairs[depth] += rate * (pairs - self.draft_replay_pairs[depth])
+                cost.update_time(sample, self.cost_alpha)
             if catch_up and catch_up_seconds > 0:
                 self.catch_up_cost.update_time(catch_up_seconds / catch_up, self.cost_alpha)
         else:
             self._since_split += 1
             drafting = sum(self._draft_seconds(depth) for depth in depths)
+            if not catch_up:
+                drafting += sum(state.catch_up for state in draft_rows) * self._catch_up_seconds()
             if drafting:
                 hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds + catch_up_seconds, 0.0), drafting)
                 self.hidden_drafting.setdefault(bucket, _Ema()).update(hidden, self.cost_alpha)
@@ -1639,6 +1662,8 @@ class SpeculativeEngine:
                 failure = None
                 if not last and not pipelined and settled and not any(row.finished for row in rows):
                     try:
+                        if steps == 1:
+                            started = time.perf_counter()
                         with mx.stream(self._stream):
                             upcoming = self._step(tokens[:, None])
                         mx.async_eval(*(array for array in upcoming if array is not None))
@@ -1649,7 +1674,7 @@ class SpeculativeEngine:
                     raise failure
                 if last:
                     break
-                if steps == 1:
+                if steps == 1 and started is None:
                     started = time.perf_counter()
                 if upcoming is None:
                     with mx.stream(self._stream):

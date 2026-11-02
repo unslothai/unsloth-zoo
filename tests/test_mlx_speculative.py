@@ -325,6 +325,33 @@ def test_folded_replay_is_included_in_drafting_cost_only_once():
     assert controller.round_seconds(plan, [state]) == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("backlogs", [(6,), (6, 1)])
+@pytest.mark.parametrize("samples", [((5, 0.012), (5, 0.012)), ((5, 0.012), (2, 0.006)),
+                                    ((2, 0.006), (5, 0.012)), ((2, 0.006), (2, 0.006), (5, 0.012))])
+def test_a_folded_draft_sample_does_not_bill_replay_twice_after_a_backlog(backlogs, samples):
+    controller = DraftController(max_depth = 4, can_copy = False)
+    state = RowState(controller.new_reply(), catch_up = 5, folded_replay = True)
+    controller.catch_up_cost.update_time(0.002, controller.cost_alpha)
+    plan = RoundPlan("round", rows = (RowPlan("draft", 4),), split = True)
+    for pairs, duration in samples:
+        state.catch_up = pairs
+        controller.record_round(plan, [state], [4], seconds = 0.008 + duration, draft_seconds = duration)
+    assert controller.round_seconds(plan, [state]) == pytest.approx(0.010 + 0.002 * state.catch_up)
+    states = [RowState(controller.new_reply(), catch_up = n, folded_replay = n <= 5) for n in backlogs]
+    plan = RoundPlan("round", rows = tuple(RowPlan("draft", 4) for _ in states), split = True)
+    controller.verify_cost[len(states)] = {5: _Ema(0.008 * len(states))}
+    expected = 0.010 * len(states) + 0.002 * sum(backlogs)
+    assert controller.round_seconds(plan, states) == pytest.approx(expected)
+    if len(states) == 1:
+        controller._warmup.clear()
+        controller.plain_cost[1] = _Ema(0.006, 2)
+        controller._credit = 0
+        states[0].stats.draft = [_Ema(1.0, 100) for _ in range(4)]
+        states[0].stats.draft_seen = [True] * 4
+        states[0].stats.probe_at["draft"] = states[0].stats.tokens + 1000
+        assert controller.plan(states).kind == "round"
+
+
 def test_folded_replay_does_not_make_a_profitable_draft_lose_to_plain():
     controller = DraftController(max_depth = 1, can_copy = False)
     states = []
@@ -871,6 +898,46 @@ def test_a_queued_plain_failure_does_not_drop_the_already_committed_token(monkey
     with pytest.raises(ValueError) as raised:
         next(stream)
     assert raised.value is failure
+
+
+def test_settled_plain_cost_includes_gpu_work_overlapped_with_the_first_consumer(monkeypatch):
+    import contextlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx import speculative
+
+    clock, gpu, samples = [0.0], [0.0], []
+    def processor(tokens, logits):
+        return logits
+    processor.settle = lambda tokens: None
+    controller = DraftController(max_depth = 0, can_copy = False)
+    row = speculative._Row(speculative.EngineRow(None, 1, [1, 2], processors = [processor]), controller)
+
+    class Tokens:
+        def __init__(self, ready):
+            self.ready = ready
+
+        def __getitem__(self, index):
+            return self
+
+        def tolist(self):
+            clock[0] = max(clock[0], self.ready)
+            return [3]
+
+    def step(inputs, ahead = 0):
+        gpu[0] = max(clock[0], gpu[0]) + 0.01
+        return Tokens(gpu[0]), None, None
+
+    monkeypatch.setattr(speculative.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(mx, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(mx, "async_eval", lambda *a: None)
+    observer = SimpleNamespace(record_plain = lambda *a: samples.append(a), interrupts_plain = lambda s: False)
+    engine = _bare_engine(SpeculativeEngine, _stream = None, controller = observer, _step = step)
+    engine._rows, engine._states = [row], lambda: []
+    stream = engine._plain(3, [])
+    assert next(stream) == [[3]]
+    clock[0] += 0.01
+    assert list(stream) == [[[3]], [[3]]]
+    assert samples[0][3] == pytest.approx(0.01)
 
 
 def test_a_single_cold_plain_sample_is_confirmed_before_comparing_draft_rates():
