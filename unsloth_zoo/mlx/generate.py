@@ -2729,8 +2729,6 @@ def row_quantized_prompt_cache_unavailable_reason() -> str | None:
 
 
 def speculative_quantized_rows_unavailable_reason() -> str | None:
-    """Why a speculative batch here cannot decode rows with their own affine-quantized caches."""
-
     return row_quantized_prompt_cache_unavailable_reason()
 
 
@@ -4160,7 +4158,6 @@ class _SpeculativeBatchSession:
         finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
         retire = getattr(request.prompt_cache_state, "retire", None)
         if not finished:
-            # Batch extends keep the receiving row's codec, so rows must share it.
             layout = _cache_layout(admitted.cache)
             if self.engine.rows and layout != self._layout:
                 if callable(retire):
