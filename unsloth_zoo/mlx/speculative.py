@@ -1614,6 +1614,7 @@ class SpeculativeEngine:
     def _plain(self, length: int, states: list[RowState], waiting: Callable[[], bool] | None = None) -> Iterator[list[list[int]]]:
         rows = self._rows
         pipelined = all(row.history_only for row in rows)
+        settled = all(row.history_only or len(row.settles) == len(row.processors) for row in rows)
         start = time.perf_counter()
         with mx.stream(self._stream):
             tokens, scores, hidden = self._step(mx.array([[row.pending] for row in rows]))
@@ -1635,6 +1636,10 @@ class SpeculativeEngine:
                     if taken and rows[i].draft is not None:
                         self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
                 completed = steps
+                if not last and not pipelined and settled and not any(row.finished for row in rows):
+                    with mx.stream(self._stream):
+                        upcoming = self._step(tokens[:, None])
+                    mx.async_eval(*(array for array in upcoming if array is not None))
                 yield emitted
                 if last:
                     break

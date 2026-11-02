@@ -808,6 +808,40 @@ def test_closing_a_plain_stream_preserves_its_completed_cost_sample(history_only
     assert len(recorded) == 1
 
 
+@pytest.mark.parametrize("settles", [True, False])
+def test_plain_steps_queue_after_settlement_before_yielding_to_the_consumer(settles, monkeypatch):
+    import contextlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx import speculative
+
+    committed, forwards, queued = [], [], []
+    def processor(tokens, logits):
+        return logits
+    if settles:
+        processor.settle = lambda tokens: committed.append(tokens.tolist())
+    controller = DraftController(max_depth = 0, can_copy = False)
+    row = speculative._Row(speculative.EngineRow(None, 1, [1, 2], processors = [processor], max_tokens = 4), controller)
+    observer = SimpleNamespace(record_plain = lambda *a: None, interrupts_plain = lambda s: False)
+
+    def step(inputs, ahead = 0):
+        assert ahead == 0
+        forwards.append((inputs.tolist(), list(committed)))
+        return mx.array([3 + len(forwards)]), None, None
+
+    monkeypatch.setattr(mx, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(mx, "async_eval", lambda *a: queued.append(len(forwards)))
+    engine = _bare_engine(SpeculativeEngine, _stream = None, controller = observer, _step = step)
+    engine._rows, engine._states = [row], lambda: []
+    stream = engine._plain(3, [])
+    assert next(stream) == [[4]]
+    assert len(forwards) == (2 if settles else 1)
+    if settles:
+        assert forwards[-1] == ([[4]], [[1, 2, 1], [1, 2, 1, 4]])
+        assert queued == [2]
+    assert list(stream) == [[[5]], [[6]]]
+    assert len(forwards) == 3
+
+
 def test_a_single_cold_plain_sample_is_confirmed_before_comparing_draft_rates():
     controller = DraftController(max_depth = 1, can_copy = False)
     rows = [RowState(controller.new_reply())]
