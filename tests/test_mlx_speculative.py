@@ -880,7 +880,14 @@ def test_a_sized_tree_budget_verifies_the_rows_its_lattice_pays_for():
     budget.observe(3, set(), 20.0)
     assert budget.live[3].value == 4.0
     budget.observe(3, set(), 40.0)
-    assert budget.live[3].value == 4.0
+    assert budget.live[3].value == 4.0 and budget.samples[3] == 1
+    # Every width gets measured, often until each has its samples and rarely after; the rest stay the budget's choice.
+    budget, picks = SizedTreeBudget({3: 1.0, 4: 1.0, 5: 1.0}), []
+    for cycle in range(128):
+        picks.append(budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]))
+        budget.observe(picks[-1], {1, 2, 3, 4}, float(cycle))
+    assert [picks[round - 1] for round in range(8, 65, 8)] == [3, 4] * 4 and picks[127] == 3
+    assert {pick for round, pick in enumerate(picks, 1) if round % 8 or round > 64 and round % 64} == {5}
 
 
 def test_a_sized_budget_times_no_cycle_across_replies_of_one_round():

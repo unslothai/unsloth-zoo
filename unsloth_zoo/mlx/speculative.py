@@ -1121,6 +1121,8 @@ class SizedTreeBudget:
     GAP_CYCLES = 3
     # Accepted over promised by depth at the start, as measured: deeper nodes promise more than they keep.
     DEPTH_ACCEPTANCE = (0.9, 0.8, 0.65, 0.55, 0.5)
+    # A width never verified stays priced by the load's noisy timing, so every few rounds verify the least measured one.
+    PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SAMPLES = 8, 64, 4
     # A round costs about two plain steps.
     MIN_ROUND_TOKENS = 2.0
 
@@ -1130,7 +1132,8 @@ class SizedTreeBudget:
         depths = range(1, max(tree_costs))
         self.accepted = {depth: 0.5 * self.DEPTH_ACCEPTANCE[min(depth, len(self.DEPTH_ACCEPTANCE)) - 1] for depth in depths}
         self.promised = {depth: 0.5 for depth in depths}
-        self._nodes, self._last, self._gaps, self._reply = (), None, 0, None
+        self._nodes, self._last, self._gaps, self._rounds, self._reply = (), None, 0, 0, None
+        self.samples = dict.fromkeys(tree_costs, 0)
 
     def choose(self) -> int:
         """The rows to draft, every width being a prefix of the widest."""
@@ -1156,7 +1159,10 @@ class SizedTreeBudget:
             tokens += self.accepted[depth] / self.promised[depth] * probability
             if rows in self.live and (rate := tokens / self._cost(rows)) > best_rate:
                 best, best_rate = rows, rate
-        return best
+        self._rounds += 1
+        stale = min(self.samples, key = self.samples.get)
+        every = self.PROBE_EVERY if self.samples[stale] < self.PROBE_SAMPLES else self.PROBE_SETTLED_EVERY
+        return stale if self._rounds % every == 0 else best
 
     def reply_round(self, reply: ReplyStats) -> None:
         """A round of ``reply`` is about to be observed: what passed since another reply's round is no cycle, however many replies run one round."""
@@ -1171,6 +1177,7 @@ class SizedTreeBudget:
         if self._last is not None:
             if end - self._last < self.GAP_CYCLES * self._cost(rows) or self._gaps >= self.GAP_CYCLES:
                 self.live[rows].update(end - self._last, self.COST_ALPHA)
+                self.samples[rows] += 1
                 self._gaps = 0
             else:
                 self._gaps += 1
