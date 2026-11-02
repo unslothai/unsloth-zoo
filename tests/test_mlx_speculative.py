@@ -1,13 +1,4 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Pin MLXTrainer's batch padding to match mlx-lm's iterate_batches:
-# `1 + _PAD_MULTIPLE * ceil(L / _PAD_MULTIPLE)`.
-#
-# mlx-lm (mlx_lm/tuner/trainer.py:158) pads to `1 + 32*ceil(max_len/32)`;
-# default_loss then slices [:, :-1] / [:, 1:]. unsloth_zoo's
-# create_text_batches previously dropped the `+1`, leaving the input one
-# token short after the autoregressive shift, which shifted small fixtures
-# into a different convergence basin (probe 31 = 67% vs probe 33-37 = 40-53%,
-# see danielhanchen/unsloth-staging-2).
 
 import random
 from collections import Counter
@@ -22,6 +13,41 @@ from unsloth_zoo.mlx.speculative import (
     TreeBudget,
     DraftController, NgramProposer, RoundPlan, RowPlan, RowState, SpeculativeEngine, _Calibration, _CycleCosts, _Ema, _upper,
 )
+
+
+@pytest.mark.parametrize("entrypoint", ["engine", "batch"])
+def test_quantized_decode_keeps_each_rows_padding_mask(entrypoint, monkeypatch):
+    import mlx.core as mx
+    from mlx_vlm.models import cache as caches
+    from mlx_vlm.models.qwen3_5 import language
+    from unsloth_zoo.mlx import generate, speculative
+
+    original = getattr(language, "_create_qwen3_5_attention_mask", None)
+    if original is None:
+        pytest.skip("mlx-vlm has no affected Qwen3.5 mask fast path")
+    while getattr(original, "_unsloth_quantized_padding", False):
+        original = original.__wrapped__
+    monkeypatch.setattr(language, "_create_qwen3_5_attention_mask", original)
+    def install():
+        if entrypoint == "engine":
+            return speculative._language_call("qwen3_5")
+        return generate._resolve_vlm_batch_module()
+    install()
+    wrapped = language._create_qwen3_5_attention_mask
+    install()
+    assert language._create_qwen3_5_attention_mask is wrapped
+
+    quantized = caches.BatchQuantizedKVCache([0, 2])
+    keys = mx.ones((2, 1, 4, 64))
+    quantized.update_and_fetch(keys, keys)
+    hidden = mx.zeros((2, 1, 128))
+    mask = language._create_qwen3_5_attention_mask(hidden, quantized)
+    assert isinstance(mask, mx.array)
+    assert mask.tolist() == [[[[True] * 5]], [[[False, False, True, True, True]]]]
+
+    dense = caches.BatchKVCache([0, 2])
+    dense.update_and_fetch(keys, keys)
+    assert language._create_qwen3_5_attention_mask(hidden, dense) == original(hidden, dense)
 
 
 def test_ngram_prefers_longer_then_newer_match():
@@ -833,6 +859,7 @@ def test_a_controller_capped_below_the_drafters_trained_depth_keeps_its_chain():
         engine.drafter = SimpleNamespace(trained_depth = 7, tree_budget = SimpleNamespace(choose = lambda: 8))
         engine.lm = SimpleNamespace(_unsloth_tree_verify = True)
         engine.controller = controller
+        engine.cache = []
         engine._rows = [SimpleNamespace(draft = draft, sample = SimpleNamespace(temperature = 0), processors = [])]
         plan = RoundPlan("round", rows = (RowPlan("draft", min(7, controller.max_depth)),))
         return engine._tree_plan(plan, [RowState(controller.new_reply(), remaining = 64)]), draft

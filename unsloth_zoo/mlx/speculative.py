@@ -1167,6 +1167,8 @@ class EngineRow:
     last N prompt positions, which a drafter starts from. A row speculates only if ``drafts`` and
     each of its ``processors`` sets ``history_only = True``: after its first call its output depends
     only on the ``(tokens, logits)`` it is given, so it can be asked about positions that are then
+    rejected; or defines ``settle(tokens)``, which is given the row's committed history when the row
+    joins and after every token taken, while its calls may run ahead of it by tokens that are then
     rejected.
     """
 
@@ -1196,6 +1198,10 @@ class StepOutput:
     logprobs: list[float] | None = None
 
 
+def _packed_kv(cache: list) -> bool:
+    return any(_packed_kv(entry.caches) if hasattr(entry, "caches") else isinstance(getattr(entry, "keys", None), (tuple, list)) for entry in cache)
+
+
 class _Row:
     def __init__(self, row: EngineRow, controller: DraftController, scored: bool = False):
         self.uid = row.uid
@@ -1206,8 +1212,10 @@ class _Row:
         self.stop_tokens = frozenset(row.stop_tokens)
         self.processors = list(row.processors)
         self.history_only = all(getattr(processor, "history_only", False) for processor in self.processors)
-        self.speculates = row.drafts and self.history_only
+        self.settles = [processor.settle for processor in self.processors if hasattr(processor, "settle")]
+        self.speculates = row.drafts and all(getattr(processor, "history_only", False) or hasattr(processor, "settle") for processor in self.processors)
         self.history = mx.array(self.tokens) if self.processors else None
+        self.settle()
         self.rope_delta = int(row.rope_delta)
         self.sample = _RowSampler(row.sampling)
         self.proposer = NgramProposer(row.prompt)
@@ -1261,7 +1269,12 @@ class _Row:
                 self.history = mx.concatenate([self.history, mx.array(taken)])
             if self.scores is not None:
                 self.scores.extend(scores[: len(taken)])
+            self.settle()
         return taken
+
+    def settle(self) -> None:
+        for settle in self.settles:
+            settle(self.history)
 
 
 def _capture(drafter) -> dict:
@@ -1291,6 +1304,10 @@ def _language_call(family: str):
         module = __import__(f"mlx_vlm.models.{family}.language", fromlist = ["LanguageModel"])
     except ImportError:
         return None
+    if family == "qwen3_5":
+        from .generate import _ensure_quantized_decode_mask
+
+        _ensure_quantized_decode_mask(module)
     return module.LanguageModel.__call__
 
 
@@ -1322,10 +1339,18 @@ def _join(batch: list | None, new: list, size: int) -> list:
     if not size:
         return list(new)
     if size == 1:
-        return [type(entry).merge([entry, row]) for entry, row in zip(batch, new)]
+        return [_batched([entry, row]) for entry, row in zip(batch, new)]
     for entry, row in zip(batch, new):
-        entry.extend(type(row).merge([row]))
+        entry.extend(_batched([row]))
     return batch
+
+
+def _batched(rows: list):
+    from .generate import _quantized_cache_type
+
+    if isinstance(rows[0], _quantized_cache_type()):
+        return rows[0].prefix_cache_merge(rows, [row.offset for row in rows])
+    return type(rows[0]).merge(rows)
 
 
 def _split(batch: list, keep: list[int]) -> list | None:
@@ -1405,7 +1430,7 @@ class SpeculativeEngine:
             raise ValueError(f"row {row.uid!r} is already in the engine")
         state = _Row(row, self.controller, self.logprobs)
         if self.drafter is not None:
-            if not state.speculates:
+            if not state.speculates or (getattr(self.drafter, "reads_target_kv", False) and _packed_kv(row.cache)):
                 draft_cache = self.drafter.new_cache()
             else:
                 state.draft, draft_cache = self.drafter.start(row.prompt, row.hidden, state.pending)
@@ -1512,7 +1537,7 @@ class SpeculativeEngine:
         if (budget is None or self.controller.fixed_depth or self.controller.max_depth < getattr(self.drafter, "trained_depth", 0)
                 or not self.lm.__dict__.get("_unsloth_tree_verify") or plan.kind != "round" or len(plan.rows) != 1
                 or plan.rows[0].source != "draft" or (plan.split and not plan.trim) or self.controller._reference is not None
-                or self._rows[0].sample.temperature != 0 or self._rows[0].processors):
+                or self._rows[0].sample.temperature != 0 or self._rows[0].processors or _packed_kv(self.cache)):
             for row in self._rows:
                 if row.draft is not None:
                     row.draft.tree_rows = 0
@@ -1828,6 +1853,8 @@ def _shown_from(processor: Callable, start: int) -> Callable:
         return processor(tokens[start:], logits)
 
     shown.history_only = getattr(processor, "history_only", False)
+    if hasattr(processor, "settle"):
+        shown.settle = lambda tokens: processor.settle(tokens[start:])
     return shown
 
 
@@ -2207,6 +2234,8 @@ class AssistantRow:
 class AssistantDrafter:
     """Drafts greedily with a Gemma 4 assistant, which keeps no cache of its own and attends to the
     target's last full- and sliding-attention KV, read from the engine's caches at draft time."""
+
+    reads_target_kv = True
 
     def __init__(self, model: nn.Module, target: nn.Module):
         from mlx_vlm.speculative.drafters.gemma4_assistant import Gemma4AssistantDraftModel
