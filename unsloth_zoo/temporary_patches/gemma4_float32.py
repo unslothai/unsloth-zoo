@@ -640,6 +640,36 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextAttention)
 
 
+def patch_Gemma4TextDecoderLayerBoundary():
+    # The boundary is set at decoder entry, before input_layernorm, from this layer's own projections: the norm then
+    # picks the same kernel in the forward and in a checkpoint recomputation (a value left by the previous layer, or
+    # unset after an inputs_embeds forward that skips the embedding, made them differ: CheckpointError).
+    if other_family_load(_GEMMA4_FAMILY): return
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        # A flag "0" load undoes it, as _gemma4_skip_or_undo does for the stashed patches.
+        for name, prefix in (("gemma4", "Gemma4"), ("gemma4_unified", "Gemma4Unified")):
+            cls = getattr(sys.modules.get(f"transformers.models.{name}.modeling_{name}"), prefix + "TextDecoderLayer", None)
+            if cls is not None and getattr(cls.forward, "_unsloth_gemma4_boundary", False):
+                cls.forward = cls.forward.__wrapped__
+        return
+    for module, prefix in _gemma4_text_variants("TextDecoderLayer"):
+        cls = getattr(module, prefix + "TextDecoderLayer")
+        original = cls.forward
+        if getattr(original, "_unsloth_gemma4_boundary", False):
+            continue
+
+        def forward(self, hidden_states, *args, _unsloth_original = original, **kwargs):
+            _GEMMA4_BOUNDARY.dtype = None if torch.is_autocast_enabled(hidden_states.device.type) else \
+                _linear_boundary_dtype(getattr(self, "self_attn", None), "q_proj")
+            return _unsloth_original(self, hidden_states, *args, **kwargs)
+        pass
+        forward._unsloth_gemma4_boundary = True
+        forward.__wrapped__ = original
+        cls.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4TextDecoderLayerBoundary)
+
+
 def patch_Gemma4UnifiedVisionEmbedder():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "1": return
     try:

@@ -69,6 +69,14 @@ for fn in TEMPORARY_PATCHES:
 import transformers.models.gemma4.modeling_gemma4 as g
 assert "gemma4_float32" in g.Gemma4RMSNorm.forward.__code__.co_filename, "float32 patches not applied"
 res = {}
+# First forward of the process, through inputs_embeds (the embedding never sets the boundary) under non-reentrant
+# checkpointing: the first input_layernorm must pick the same kernel when it is recomputed (else CheckpointError).
+gc_model = build(torch.float32, False)
+gc_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+gc_model.train()
+emb = gc_model.get_input_embeddings()
+embeds = (torch.nn.functional.embedding(IDS, emb.weight) * emb.embed_scale).detach()  # not through the module
+gc_model(inputs_embeds = embeds, labels = IDS).loss.backward()
 for moe in (False, True):
     loss, grads = full_ft(build(torch.float32, moe))
     torch.save(grads, os.path.join(OUT, f"patched_{int(moe)}.pt"))
@@ -130,3 +138,23 @@ def test_gemma4_forced_float32_full_finetune_matches_vanilla_float32(tmp_path):
                                        msg = f"moe={moe} {name}")
         assert abs(p["loss16"] - v["loss"]) < 0.05, (moe, p)
         assert p["eval_dtype"] == "torch.float16", (moe, p)
+
+
+def test_decoder_boundary_patch_is_undone_by_a_flag_off_load(monkeypatch):
+    import pytest
+
+    try:
+        import transformers.models.gemma4.modeling_gemma4 as g
+    except Exception:
+        pytest.skip("transformers without Gemma-4")
+    from unsloth_zoo.temporary_patches import gemma4_float32 as p
+
+    original = g.Gemma4TextDecoderLayer.forward
+    monkeypatch.delenv("UNSLOTH_MODEL_NAME", raising = False)
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    p.patch_Gemma4TextDecoderLayerBoundary()
+    p.patch_Gemma4TextDecoderLayerBoundary()  # idempotent: one wrapper
+    assert g.Gemma4TextDecoderLayer.forward.__wrapped__ is original
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "0")
+    p.patch_Gemma4TextDecoderLayerBoundary()
+    assert g.Gemma4TextDecoderLayer.forward is original
