@@ -781,7 +781,7 @@ class DraftController:
             if row.source == "draft":
                 if self.draft_cost[row.length].count < 2:
                     return False
-                if state.catch_up and self.catch_up_cost.value is None:
+                if state.catch_up > self.max_depth + 1 and self.catch_up_cost.value is None:
                     return False
         return True
 

@@ -299,6 +299,21 @@ def test_folded_replay_is_not_learned_as_a_free_separately_timed_replay():
     assert controller.catch_up_cost.value == pytest.approx(0.05)
 
 
+def test_folded_replay_does_not_keep_calibrated_drafts_in_split_mode():
+    controller = DraftController(max_depth = 2, can_copy = False, split_every = 1000)
+    states = []
+    _run(controller, _Machine(draft_slope = 0.01, verify_slope = 0.01), [([1.0, 1.0], None)],
+         rounds = 100, states = states)
+    controller._since_split = 0
+    assert controller.plan(states).kind == "round"
+    assert not controller.plan(states).split
+    states[0].catch_up = 2
+    assert not controller.plan(states).split
+    assert controller.catch_up_cost.value is None
+    states[0].catch_up = 12
+    assert controller.plan(states).split
+
+
 def test_a_draft_probe_shrinks_to_the_deepest_depth_the_credit_affords():
     controller = DraftController(max_depth = 8, can_copy = False)
     _run(controller, _Machine(draft_slope = 0.3, verify_slope = 0.3, overhead = 1.7), [([0.5, 0.2] + [0.1] * 6, None)], rounds = 400)
