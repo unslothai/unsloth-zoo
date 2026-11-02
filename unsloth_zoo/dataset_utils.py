@@ -178,7 +178,7 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 pass
 
 
-_MARKER_EDGE_PROBES = ("\\", "{", "a", "A", "1", "(", ".", "<", "}", ">")
+_MARKER_EDGE_PROBES = ("\\", "{", "a", "A", "1", "(", ".", "<", "}", ">", "\n")
 
 
 def _stable_marker_edges(component, original, tokenizer):
