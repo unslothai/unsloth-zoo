@@ -268,7 +268,6 @@ def test_controller_copies_only_while_copies_hold():
 
 
 def test_controller_prefers_free_copy_over_costlier_drafter():
-    # The drafter accepts slightly more, but its forward makes the round slower.
     machine = _Machine(draft_slope = 0.8)
     choice = _run(DraftController(max_depth = 4, max_copy = 12), machine, [([0.85] * 4, 0.8)], rounds = 1500)
     assert choice != "plain" and choice[0][0] == "copy"
@@ -432,7 +431,6 @@ def test_a_trimmed_round_verifies_the_width_its_drafts_pay_for():
     width = lambda confidence: controller.trim(plan, rows, [confidence]).width
     # A doubtful third draft ends the verify before it, confident drafts all verify, doubtful ones keep one; the fourth is a full round.
     assert [width([0.99, 0.99, 0.2] + [0.99] * 4), width([0.99] * 7), width([0.2] * 7), width([0.2] * 7)] == [3, 8, 1, 8]
-    # When width costs nothing, every draft is worth verifying.
     costs([(w, 1.0) for w in range(1, 9)])
     assert width([0.2] * 7) == 8
     # Accounted, the verified positions calibrate, and the drafting is that of the block drafted, not of the rows verified.
