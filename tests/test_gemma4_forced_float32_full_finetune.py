@@ -158,3 +158,50 @@ def test_decoder_boundary_patch_is_undone_by_a_flag_off_load(monkeypatch):
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "0")
     p.patch_Gemma4TextDecoderLayerBoundary()
     assert g.Gemma4TextDecoderLayer.forward is original
+
+
+VISION = r'''
+import json, os, sys, torch
+import unsloth_zoo, unsloth_zoo.temporary_patches
+from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
+assert unsloth_zoo.__file__.startswith(os.environ["REPO"]), unsloth_zoo.__file__
+for fn in TEMPORARY_PATCHES:
+    try:
+        fn()
+    except Exception:
+        pass
+import transformers.models.gemma4.modeling_gemma4 as g
+text = g.Gemma4TextConfig(vocab_size = 256, hidden_size = 64, intermediate_size = 48, num_hidden_layers = 2,
+    num_attention_heads = 4, num_key_value_heads = 2, head_dim = 16, global_head_dim = 16, max_position_embeddings = 128,
+    enable_moe_block = False, num_kv_shared_layers = 0, hidden_size_per_layer_input = 0,
+    layer_types = ["sliding_attention", "full_attention"], sliding_window = 64, tie_word_embeddings = False,
+    use_cache = False, pad_token_id = 0, bos_token_id = 1, eos_token_id = 1)
+vision = g.Gemma4VisionConfig(hidden_size = 32, intermediate_size = 64, num_attention_heads = 2, num_key_value_heads = 2,
+    head_dim = 16, num_hidden_layers = 1, patch_size = 2, pooling_kernel_size = 2, standardize = False,
+    position_embedding_size = 8)
+config = g.Gemma4Config(text_config = text, vision_config = vision, audio_config = None, image_token_id = 250,
+    video_token_id = 251, audio_token_id = 252, boi_token_id = 253, eoi_token_id = 254)
+config._attn_implementation = "sdpa"
+torch.manual_seed(0)
+model = g.Gemma4ForConditionalGeneration(config).float().train()
+model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+# Image features before the text embedding: the vision norms run first with no boundary set by the text tower.
+features = model.get_image_features(pixel_values = torch.rand(1, 4, 12),
+    image_position_ids = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]), return_dict = True).pooler_output
+embeddings = model.get_input_embeddings()(torch.tensor([[3, 4, 5, 6]]))
+(sum(f.square().mean() for f in features) + embeddings.square().mean()).backward()
+print(json.dumps({"ok": True}))
+'''
+
+
+def test_gemma4_vision_layers_recompute_with_the_same_norm_kernel(tmp_path):
+    # Failing before: vision encoder layers share Gemma4RMSNorm but never set the boundary, so image features taken
+    # before the text embedding ran fp16 norms, and the checkpoint recomputation (after the embedding set float32) ran
+    # the float32 ones: CheckpointError (77 vs 70 saved tensors).
+    import pytest
+
+    try:
+        import transformers.models.gemma4.modeling_gemma4  # noqa: F401
+    except Exception:
+        pytest.skip("transformers without Gemma-4")
+    assert _run(VISION, str(tmp_path), zoo = True) == {"ok": True}
