@@ -1951,8 +1951,8 @@ def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag, monkey
     (out,), _, _ = _run(model, ids[:1], 128, controller, SamplingParams(), drafter = drafter)
     assert out == _solo(model, ids[0], 128, SamplingParams())
     assert any(drafter.dropped.values()) == (max_lag < 8)
-    # Only a plain window leaves more pairs than a round does: its replay is timed apart from drafting.
-    assert apart[:4] == [max_lag >= 8, False] * 2
+    # The first draft also replays the deferred prompt; later rounds see only generated pairs.
+    assert apart[:4] == [True, False, max_lag >= 8, False]
     # A head that dropped context past max_lag accepts less; a misaligned catch-up would accept next to nothing.
     assert sum(count for count, _ in accepted) >= (0.6 if max_lag >= 8 else 0.5) * sum(length for _, length in accepted)
 
@@ -1961,7 +1961,14 @@ def test_an_mtp_heads_cache_holds_only_target_hidden_pairs_however_its_drafts_fa
     from unsloth_zoo.mlx.generate import SamplingParams
     model, ids = qwen_mtp
     drafter, chunks, compared = _drafter(model, max_lag = 4096), [[]], []
-    push, catch_up, draft = drafter.push, drafter.catch_up, drafter.draft
+    start, push, catch_up, draft = drafter.start, drafter.push, drafter.catch_up, drafter.draft
+    def traced_start(prompt, hidden, pending):
+        result = start(prompt, hidden, pending)
+        if getattr(result[0], "prefix", None) is not None:
+            count = min(hidden.shape[1], len(prompt))
+            chunks[0].insert(0, ([*prompt[len(prompt) - count + 1:], pending], hidden[0, -count:]))
+        return result
+    drafter.start = traced_start
     drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
     drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
     def against_replay(cache, rows, depth, target):

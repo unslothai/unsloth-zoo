@@ -693,6 +693,74 @@ def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_a
     assert (1 in queued) == history_only
 
 
+@pytest.mark.parametrize("history_only", [True, False])
+def test_closing_a_plain_stream_preserves_its_completed_cost_sample(history_only, monkeypatch):
+    import contextlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx import speculative
+
+    def processor(tokens, logits):
+        return logits
+    processor.history_only = history_only
+    controller = DraftController(max_depth = 0, can_copy = False)
+    row = speculative._Row(speculative.EngineRow(None, 1, [1, 2], processors = [processor]), controller)
+    recorded = []
+    observer = SimpleNamespace(record_plain = lambda *args: recorded.append(args), interrupts_plain = lambda _s: False)
+    ticks = iter(range(100))
+    monkeypatch.setattr(speculative.time, "perf_counter", lambda: next(ticks))
+    monkeypatch.setattr(mx, "stream", lambda _s: contextlib.nullcontext())
+    monkeypatch.setattr(mx, "async_eval", lambda *_args: None)
+    engine = _bare_engine(SpeculativeEngine, _stream = None, controller = observer,
+                         _step = lambda _inputs, ahead = 0: (mx.array([3]), None, None))
+    engine._rows, engine._states = [row], lambda: []
+    stream = engine._plain(8, [])
+    for _ in range(3):
+        assert next(stream) == [[3]]
+    stream.close()
+    assert len(recorded) == 1
+    assert recorded[0][1] == 3
+    assert recorded[0][2] > 0 and recorded[0][3] > 0
+    stream.close()
+    assert len(recorded) == 1
+
+
+def test_mtp_defers_prompt_replay_without_losing_ragged_prefixes_or_tail_gaps(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import MTPDrafter
+
+    drafter = object.__new__(MTPDrafter)
+    drafter.max_lag = 2
+    prepared, forwards = [], []
+    drafter._shortlist = SimpleNamespace(prepare = lambda: prepared.append(True))
+    monkeypatch.setattr(drafter, "new_cache", list)
+
+    def forward(cache, tokens, hidden, positions):
+        forwards.append((tokens.tolist(), hidden.tolist(), positions.tolist()))
+        return positions.astype(mx.float32)[..., None]
+
+    monkeypatch.setattr(drafter, "_forward", forward)
+    first, _ = drafter.start([1, 2, 3, 4, 5], mx.arange(5)[None, :, None], 6)
+    second, _ = drafter.start([21, 22, 23], mx.arange(3)[None, :, None], 24)
+    assert not prepared and not forwards
+    assert first.ready and second.ready
+    drafter.push(first, list(range(7, 14)), mx.arange(5, 12)[:, None])
+    assert first.pending_pairs == 7 and second.pending_pairs == 3
+    assert drafter.catch_up([], [first, second]) == 10
+    seen = [[], []]
+    for tokens, hidden, positions in forwards:
+        assert max(map(len, tokens)) <= 2
+        for row in range(2):
+            seen[row].extend((token, h[0], position) for token, h, position in zip(tokens[row], hidden[row], positions[row]) if token)
+    assert seen == [
+        [(2, 0, 0), (3, 1, 1), (4, 2, 2), (5, 3, 3), (6, 4, 4), (12, 10, 10), (13, 11, 11)],
+        [(22, 0, 0), (23, 1, 1), (24, 2, 2)],
+    ]
+    assert first.position == 12 and second.position == 3
+    assert first.last.tolist() == [[[11]]] and second.last.tolist() == [[[2]]]
+    assert first.pending_pairs == second.pending_pairs == 0
+    assert not prepared
+
+
 def test_a_context_drafter_drafts_the_next_block_ahead_until_a_push_overtakes_it():
     import mlx.core as mx
     from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow

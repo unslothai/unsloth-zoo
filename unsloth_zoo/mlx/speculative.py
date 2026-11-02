@@ -1488,6 +1488,7 @@ class SpeculativeEngine:
                 len(row.proposer.propose(row.tokens, self.controller.max_copy)) if row.speculates else 0
             )
             state.can_draft = row.draft is not None and row.draft.ready
+            state.catch_up = getattr(row.draft, "pending_pairs", 0)
             states.append(state)
         return states
 
@@ -1605,39 +1606,42 @@ class SpeculativeEngine:
         start = time.perf_counter()
         with mx.stream(self._stream):
             tokens, scores, hidden = self._step(mx.array([[row.pending] for row in rows]))
-        steps = 0
-        while True:
-            steps += 1
-            # A finished row leaves only between steps, so it ends the window rather than ride it out.
-            last = steps >= length or any(row.finished for row in rows) or (waiting is not None and waiting())
-            upcoming = None
-            if not last and pipelined:
-                with mx.stream(self._stream):
-                    upcoming = self._step(tokens[:, None], ahead = 1)
-                # Scores too: read unqueued, they cost the GPU another round trip per step.
-                mx.async_eval(*(array for array in upcoming if array is not None))
-            scores, emitted = None if scores is None else scores.tolist(), []
-            for i, token in enumerate(tokens.tolist()):
-                taken = rows[i].take([token], scores and scores[i : i + 1])
-                emitted.append(taken)
-                if taken and rows[i].draft is not None:
-                    self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
-            yield emitted
-            if last:
-                break
-            if steps == 1:
-                started = time.perf_counter()
-            if upcoming is None:
-                with mx.stream(self._stream):
-                    upcoming = self._step(tokens[:, None])
-            elif steps > 1 and self.controller.interrupts_plain(self._states()):
-                # The next step is already queued, so it becomes the window's last.
-                length = steps + 1
-            tokens, scores, hidden = upcoming
-        end = time.perf_counter()
-        # Reading a pipelined step's tokens waits for the step queued behind it, so the first read ends two steps in.
-        ran = steps - (2 if pipelined else 1)
-        self.controller.record_plain(states, steps, end - start, (end - started) / ran if ran > 0 else None)
+        steps = completed = 0
+        started = None
+        try:
+            while True:
+                steps += 1
+                last = steps >= length or any(row.finished for row in rows) or (waiting is not None and waiting())
+                upcoming = None
+                if not last and pipelined:
+                    with mx.stream(self._stream):
+                        upcoming = self._step(tokens[:, None], ahead = 1)
+                    mx.async_eval(*(array for array in upcoming if array is not None))
+                scores, emitted = None if scores is None else scores.tolist(), []
+                for i, token in enumerate(tokens.tolist()):
+                    taken = rows[i].take([token], scores and scores[i : i + 1])
+                    emitted.append(taken)
+                    if taken and rows[i].draft is not None:
+                        self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
+                completed = steps
+                yield emitted
+                if last:
+                    break
+                if steps == 1:
+                    started = time.perf_counter()
+                if upcoming is None:
+                    with mx.stream(self._stream):
+                        upcoming = self._step(tokens[:, None])
+                elif steps > 1 and self.controller.interrupts_plain(self._states()):
+                    length = steps + 1
+                tokens, scores, hidden = upcoming
+        finally:
+            if completed:
+                end = time.perf_counter()
+                # The first pipelined read waits for two steps; close() can end a window at any yield.
+                ran = completed - (2 if pipelined else 1)
+                self.controller.record_plain(states, completed, end - start,
+                                             (end - started) / ran if ran > 0 and started is not None else None)
 
     def _tree_round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]]:
         """A round verifying a best-first tree as one block: the emitted tokens are the target's along the branch it agrees with."""
@@ -1711,7 +1715,7 @@ class SpeculativeEngine:
         if depth:
             with mx.stream(self._stream):
                 # A round's few pairs replay as drafting; a plain window's backlog is replayed and timed apart.
-                if max(len(getattr(row, "tokens", ())) for row in draft_rows) > self.controller.max_depth + 1:
+                if max(getattr(row, "pending_pairs", len(getattr(row, "tokens", ()))) for row in draft_rows) > self.controller.max_depth + 1:
                     self.drafter.catch_up(self.draft_cache, draft_rows)
                     mx.synchronize(self._stream)
                     catch_up_seconds = time.perf_counter() - start
@@ -2042,6 +2046,20 @@ class DraftRow:
         return self.last is not None or bool(self.tokens)
 
 
+class _MTPRow(DraftRow):
+    def __init__(self, position: int, prefix: DraftRow | None):
+        super().__init__(position)
+        self.prefix = prefix
+
+    @property
+    def ready(self) -> bool:
+        return self.prefix is not None or super().ready
+
+    @property
+    def pending_pairs(self) -> int:
+        return len(self.tokens) + (len(self.prefix.tokens) if self.prefix is not None else 0)
+
+
 _SHORTLIST_BITS, _SHORTLIST_KEEP, _SHORTLIST_GROUP, _SHORTLIST_CHUNK, _SHORTLIST_COLUMNS = 2, 128, 64, 1 << 14, 2048
 
 
@@ -2126,18 +2144,13 @@ class MTPDrafter:
     def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[DraftRow, list]:
         """A row from its prompt, the target hidden ``[1, N, H]`` of its last N prompt positions
         (or None), and its pending token; returns its state and its head cache."""
-        cache = self.new_cache()
-        if self._shortlist is not None:
-            # Here rather than in the first round, whose time the controller takes as the cost of drafting.
-            self._shortlist.prepare()
         count = 0 if hidden is None else min(int(hidden.shape[1]), len(prompt))
-        row = DraftRow(len(prompt) - count)
-        tokens, hidden = [*prompt[len(prompt) - count + 1 :], pending], None if hidden is None else hidden[0, int(hidden.shape[1]) - count :]
-        # max_lag pairs per replay, so a long prompt never runs the head over all of its positions at once.
-        for begin in range(0, count, self.max_lag):
-            self.push(row, tokens[begin : begin + self.max_lag], hidden[begin : begin + self.max_lag])
-            self.catch_up(cache, [row])
-        return row, cache
+        prefix = None
+        if count:
+            prefix = DraftRow(len(prompt) - count)
+            prefix.tokens = [*prompt[len(prompt) - count + 1 :], pending]
+            prefix.hidden = [hidden[0, int(hidden.shape[1]) - count :]]
+        return _MTPRow(len(prompt), prefix), self.new_cache()
 
     def push(self, row: DraftRow, tokens: Sequence[int], hidden: mx.array) -> None:
         """Record pairs: ``tokens[k]`` follows the position whose target hidden is ``hidden[k]``."""
@@ -2159,6 +2172,28 @@ class MTPDrafter:
 
     def catch_up(self, cache: list, rows: Sequence[DraftRow | None]) -> int:
         """Replay the recorded pairs of ``rows`` (None leaves a row as is); returns how many."""
+        primed = 0
+        while any(getattr(row, "prefix", None) is not None for row in rows):
+            chunks = []
+            for row in rows:
+                prefix = getattr(row, "prefix", None)
+                if prefix is None:
+                    chunks.append(None)
+                    continue
+                count = min(len(prefix.tokens), self.max_lag)
+                chunk = DraftRow(prefix.position)
+                hidden = mx.concatenate(prefix.hidden)
+                chunk.tokens, chunk.hidden = prefix.tokens[:count], [hidden[:count]]
+                prefix.tokens, prefix.hidden = prefix.tokens[count:], [hidden[count:]]
+                prefix.position += count
+                chunks.append(chunk)
+            primed += self._catch_up(cache, chunks)
+            for row, chunk in zip(rows, chunks):
+                if chunk is not None and not row.prefix.tokens:
+                    row.last, row.prefix = chunk.last, None
+        return primed + self._catch_up(cache, rows)
+
+    def _catch_up(self, cache: list, rows: Sequence[DraftRow | None]) -> int:
         lengths = [len(row.tokens) if row is not None else 0 for row in rows]
         width = max(lengths)
         if not width:
@@ -2195,6 +2230,8 @@ class MTPDrafter:
     def draft(self, cache: list, rows: Sequence[DraftRow | None], depth: int, target: list) -> mx.array:
         """``[B, depth]`` greedy drafts; rows the head has not caught up get placeholders.
         Appends ``depth - 1`` entries to every row's cache, which ``settle`` trims."""
+        if self._shortlist is not None:
+            self._shortlist.prepare()
         like = next(row.last for row in rows if row is not None and row.last is not None)
         hidden = mx.concatenate([row.last if row is not None and row.last is not None else mx.zeros_like(like) for row in rows])
         starts = mx.array([row.position if row is not None else 0 for row in rows])[:, None]
