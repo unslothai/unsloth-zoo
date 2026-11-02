@@ -116,6 +116,48 @@ def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     return _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask)
 
 
+# mlx has a head_dim 256 kernel for any causal call but picks it by default only on NAX or square calls, and otherwise
+# builds `[B, HQ, L, S]` scores. Fewer rows are slower on the kernel; float32 and array masks are long dispatches on it.
+_FORCED_D256_MIN_QUERIES = 64
+
+
+def _forces_fused(queries, n_keys, head_dim, value_dim, dtype, mask):
+    return (head_dim == value_dim == 256 and isinstance(mask, str) and mask == "causal"
+            and _FORCED_D256_MIN_QUERIES <= queries.shape[-2] <= n_keys and dtype != mx.float32
+            and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def runtime_fuses(queries, q_keys, q_values, group_size, mask=None):
+    """Whether a loaded model's call runs on a fused kernel: mlx's own choice or the forced head_dim 256 route."""
+    return (fused_kernel_exists(queries, q_keys, q_values, group_size, mask)
+            or _forces_fused(queries, q_keys[0].shape[-2], q_keys[1].shape[-1] * group_size,
+                             q_values[1].shape[-1] * group_size,
+                             _result_dtype(queries, q_keys, q_values), mask))
+
+
+def fused_sdpa_over(stock):
+    """Wrap `mx.fast.scaled_dot_product_attention`; training keeps mlx's own dispatch."""
+    @functools.wraps(stock)
+    def sdpa(q, k, v, *, scale, mask=None, sinks=None, **kwargs):
+        from .utils import mlx_training_patches_active
+
+        if (sinks is None and not kwargs and q.dtype == k.dtype == v.dtype
+                and _forces_fused(q, k.shape[-2], k.shape[-1], v.shape[-1], q.dtype, mask)
+                and not mlx_training_patches_active()):
+            return stock(q, k, v, scale=scale, mask=mask, force_fused=True)
+        return stock(q, k, v, scale=scale, mask=mask, sinks=sinks, **kwargs)
+    return sdpa
+
+
+def install_fused_attention():
+    """Route eligible calls of every runtime onto the fused kernel, idempotently."""
+    stock = mx.fast.scaled_dot_product_attention
+    if not getattr(stock, _FUSED_PATCH_FLAG, False):
+        patched = fused_sdpa_over(stock)
+        setattr(patched, _FUSED_PATCH_FLAG, True)
+        mx.fast.scaled_dot_product_attention = patched
+
+
 def dequantized_sdpa(queries, q_keys, q_values, scale, mask=None, group_size=64, bits=8):
     """Fused SDPA over one dequantized copy; an emptied row averages as in the unfused path, since mlx masks with a finite minimum rather than -inf."""
     dtype = _result_dtype(queries, q_keys, q_values)
@@ -131,7 +173,7 @@ def quantized_sdpa_over(unfused):
                        **kwargs):
         # An argument this wrapper predates has no fused equivalent: delegate, never drop it.
         if (not kwargs
-                and fused_kernel_exists(queries, q_keys, q_values, group_size, mask)
+                and runtime_fuses(queries, q_keys, q_values, group_size, mask)
                 and dequantizing_is_smaller(queries, q_keys, q_values, group_size)):
             return dequantized_sdpa(queries, q_keys, q_values, scale, mask,
                                     group_size=group_size, bits=bits)
@@ -141,6 +183,7 @@ def quantized_sdpa_over(unfused):
 
 
 _PATCH_FLAG = "_unsloth_quantized_attention_patch"
+_FUSED_PATCH_FLAG = "_unsloth_fused_attention_patch"
 
 _PATCH_TARGETS = ("mlx_lm.models.base", "mlx_vlm.models.base")
 
