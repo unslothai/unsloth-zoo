@@ -4874,7 +4874,11 @@ def patch_param_wrapper_for_moe():
         from peft.tuners.lora.layer import ParamWrapper
 
         if _original_param_wrapper_forward is None:
-            _original_param_wrapper_forward = ParamWrapper.forward
+            # Another moe_utils copy (the package, or a cache copy from an earlier UNSLOTH_COMPILE_LOCATION) may have
+            # patched it already: keep PEFT's own forward, or the separated-LoRA forward runs once per copy.
+            current = ParamWrapper.forward
+            _original_param_wrapper_forward = getattr(current, "_unsloth_moe_peft_forward", current)
+        _patched_param_wrapper_forward._unsloth_moe_peft_forward = _original_param_wrapper_forward
 
         ParamWrapper.forward = _patched_param_wrapper_forward
 
