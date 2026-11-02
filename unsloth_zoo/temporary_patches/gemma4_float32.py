@@ -43,6 +43,7 @@ import inspect
 import importlib
 import linecache
 import sys
+import threading
 import torch
 from .common import (
     TEMPORARY_PATCHES,
@@ -292,10 +293,16 @@ def _gemma4_skip_or_undo(class_suffix):
     return True
 
 
+# Set by the embedding (provisional) and by each text attention forward: the dtype the projections take when no autocast
+# is active (float32 on full finetuning, else None or fp16 = the fp16 path). Read by every Gemma-4 RMSNorm after it,
+# including the final norm, whose output goes straight to lm_head with no boundary cast. Per thread, like qwen3_moe_float32._QWEN3_MOE_BOUNDARY.
+_GEMMA4_BOUNDARY = threading.local()
+
+
 def patch_Gemma4TextScaledWordEmbedding():
     if _gemma4_skip_or_undo("TextScaledWordEmbedding"): return
 
-    def forward(self, input_ids: torch.Tensor):
+    def scaled_embedding(self, input_ids: torch.Tensor):
         input_embeds = torch.nn.functional.embedding(
             input_ids,
             weight = self.weight,
@@ -304,8 +311,30 @@ def patch_Gemma4TextScaledWordEmbedding():
         # float32 residual stream (embed_scale ~ sqrt(hidden_size))
         return input_embeds.to(torch.float32) * self.embed_scale.to(torch.float32)
     pass
+    # Compiled through patch_function on a private holder, exactly as the forward itself was before (fullgraph, eager
+    # fallbacks, UNSLOTH_COMPILE_DISABLE), so only the eager boundary write below is new.
+    kernel_holder = type("_Gemma4ScaledEmbeddingKernel", (), {"forward": scaled_embedding})
+    patch_forced_float32(kernel_holder, "forward", scaled_embedding, fullgraph = True)
+    global _gemma4_scaled_embedding_kernel
+    _gemma4_scaled_embedding_kernel = kernel_holder.forward
+
+    def forward(self, input_ids: torch.Tensor):
+        # First op of every forward: a provisional boundary for the norms that run before the first attention (layer 0's
+        # input_layernorm), else they read the previous model's or forward's decision. The embedding follows the
+        # model's dtype (float32 on full finetuning, fp16 on LoRA / QLoRA); each attention then sets the real one.
+        _GEMMA4_BOUNDARY.dtype = None if torch.is_autocast_enabled(input_ids.device.type) else \
+            _linear_boundary_dtype(self, "weight")
+        return _gemma4_scaled_embedding_kernel(self, input_ids)
+    pass
     for module, prefix in _gemma4_text_variants("TextScaledWordEmbedding"):
-        patch_forced_float32(getattr(module, prefix + "TextScaledWordEmbedding"), "forward", forward, fullgraph = True)
+        # Free names for compiled copies rebuilt from source, as for the RMSNorm below.
+        publish_to_modeling_module(
+            module,
+            _gemma4_scaled_embedding_kernel = _gemma4_scaled_embedding_kernel,
+            _linear_boundary_dtype = _linear_boundary_dtype,
+            _GEMMA4_BOUNDARY = _GEMMA4_BOUNDARY,
+        )
+        patch_forced_float32(getattr(module, prefix + "TextScaledWordEmbedding"), "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextScaledWordEmbedding)
 
@@ -338,6 +367,29 @@ pass
 _gemma4_rms_norm_unscaled = compile_with_eager_fallback(_gemma4_rms_norm_unscaled, "Gemma4RMSNorm.forward (unscaled)")
 
 
+# Full finetuning in float32 without autocast: the consumers (projections, lm_head) are float32, so no fp16 clamp / cast.
+def _gemma4_rms_norm_scaled_float32(hidden_states_2d, weight_1d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    return x_fp32 * torch.pow(variance + eps, -0.5) * weight_1d.to(torch.float32)
+pass
+
+_gemma4_rms_norm_scaled_float32 = compile_with_eager_fallback(
+    _gemma4_rms_norm_scaled_float32, "Gemma4RMSNorm.forward (scaled, float32)",
+)
+
+
+def _gemma4_rms_norm_unscaled_float32(hidden_states_2d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    return x_fp32 * torch.pow(variance + eps, -0.5)
+pass
+
+_gemma4_rms_norm_unscaled_float32 = compile_with_eager_fallback(
+    _gemma4_rms_norm_unscaled_float32, "Gemma4RMSNorm.forward (unscaled, float32)",
+)
+
+
 def patch_Gemma4RMSNorm():
     if _gemma4_skip_or_undo("RMSNorm"): return
 
@@ -345,12 +397,16 @@ def patch_Gemma4RMSNorm():
         # Gemma4 scales by `weight` directly (no 1.0 + weight) and only when
         # with_scale. `self` is read in eager, so it never reaches the kernel's guards.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
+        # float32 projections and no autocast (full finetuning): stay float32, else the final norm hands fp16 to a
+        # float32 lm_head ("Half != float"). Every other path keeps the fp16 output.
+        to_float32 = getattr(_GEMMA4_BOUNDARY, "dtype", None) == torch.float32 and \
+            not torch.is_autocast_enabled(hidden_states.device.type)
         if self.with_scale:
-            normed = _gemma4_rms_norm_scaled(
-                hidden_states_2d, unwrap_norm_weight(self.weight), self.eps,
-            )
+            kernel = _gemma4_rms_norm_scaled_float32 if to_float32 else _gemma4_rms_norm_scaled
+            normed = kernel(hidden_states_2d, unwrap_norm_weight(self.weight), self.eps)
         else:
-            normed = _gemma4_rms_norm_unscaled(hidden_states_2d, self.eps)
+            kernel = _gemma4_rms_norm_unscaled_float32 if to_float32 else _gemma4_rms_norm_unscaled
+            normed = kernel(hidden_states_2d, self.eps)
         return normed.reshape(shape)
     pass
     # No `fullgraph`: the kernels are the compiled units; compiling this wrapper too
@@ -363,6 +419,9 @@ def patch_Gemma4RMSNorm():
             unwrap_norm_weight = unwrap_norm_weight,
             _gemma4_rms_norm_scaled = _gemma4_rms_norm_scaled,
             _gemma4_rms_norm_unscaled = _gemma4_rms_norm_unscaled,
+            _gemma4_rms_norm_scaled_float32 = _gemma4_rms_norm_scaled_float32,
+            _gemma4_rms_norm_unscaled_float32 = _gemma4_rms_norm_unscaled_float32,
+            _GEMMA4_BOUNDARY = _GEMMA4_BOUNDARY,
         )
         patch_forced_float32(getattr(module, prefix + "RMSNorm"), "forward", forward, match_level = "relaxed")
 pass
@@ -429,9 +488,12 @@ def _patch_gemma4_text_attention(module, prefix):
         cos = cos.to(torch.float32)
         sin = sin.to(torch.float32)
 
-        # fp16 norm output meets fp32 projections on full finetuning (identity on LoRA).
-        if not torch.is_autocast_enabled(hidden_states.device.type):
-            hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "q_proj"))
+        # fp16 norm output meets fp32 projections on full finetuning (identity on LoRA). The decision is published
+        # for the RMSNorms that run after this layer, the final norm before lm_head included.
+        boundary = None if torch.is_autocast_enabled(hidden_states.device.type) else \
+            _linear_boundary_dtype(self, "q_proj")
+        _GEMMA4_BOUNDARY.dtype = boundary
+        hidden_states = _to_boundary_dtype(hidden_states, boundary)
 
         # q: fp16 proj -> fp16 q_norm -> float32 -> RoPE (float32) -> (b, h, q, d)
         query_states = self.q_proj(hidden_states).view(hidden_shape)
