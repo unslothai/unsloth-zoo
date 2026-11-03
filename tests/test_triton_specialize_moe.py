@@ -9,19 +9,21 @@ import pathlib
 
 import pytest
 
-triton = pytest.importorskip("triton")
-import triton.language as tl
-
-from unsloth_zoo.triton_specialize import jit_any_alignment
-
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
 
 def test_helper_drops_alignment_only():
+    pytest.importorskip("triton")
+    import triton.language as tl
+
+    from unsloth_zoo.triton_specialize import jit_any_alignment
+
     @jit_any_alignment("T")
     def kernel(x_ptr, T, N, BLOCK: tl.constexpr):  # BLOCK: elements per program
         pass
 
+    if not hasattr(kernel, "params"):  # TRITON_INTERPRET=1 returns an InterpretedFunction
+        pytest.skip("interpreted Triton function has no params")
     params = {p.name: p for p in kernel.params}
     if not hasattr(params["T"], "do_not_specialize_on_alignment"):
         pytest.skip("this Triton has no do_not_specialize_on_alignment")
@@ -43,19 +45,34 @@ def test_token_counts_alignment_unspecialized(path):
     found = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name in EXPECTED[path]:
-            (deco,) = node.decorator_list
-            assert isinstance(deco, ast.Call) and deco.func.id == "_jit_any_alignment", node.name
-            name = deco.args[0].value
+            decos = [
+                d for d in node.decorator_list
+                if isinstance(d, ast.Call) and getattr(d.func, "id", "").lstrip("_") == "jit_any_alignment"
+            ]
+            assert len(decos) == 1, node.name
+            name = decos[0].args[0].value
             assert name in [a.arg for a in node.args.args], (node.name, name)
             found[node.name] = name
     assert found == EXPECTED[path]
 
 
 def test_routing_scratch_slices_stay_aligned():
-    source = (ROOT / "temporary_patches/moe_routing_triton.py").read_text(encoding = "utf-8")
-    assert "size = (NB * (E + 1) + 3) // 4 * 4" in source
-    # int32 scratch: every slice offset is a multiple of 4 elements = 16 bytes, for any NB and E.
+    from unsloth_zoo.temporary_patches.moe_routing_triton import _route_scratch
+
+    # The real allocation: every slice 16-byte aligned for any token block count and expert count.
     for NB in range(1, 40):
         for E in (7, 8, 31, 32, 128, 255):
-            size = (NB * (E + 1) + 3) // 4 * 4
-            assert (size * 4) % 16 == 0 and (2 * size * 4) % 16 == 0 and size >= NB * (E + 1)
+            hist, rank_base, starts = _route_scratch(NB, E, "cpu")
+            assert all(t.data_ptr() % 16 == 0 for t in (hist, rank_base, starts)), (NB, E)
+            assert hist.numel() >= NB * (E + 1) and rank_base.numel() >= NB * (E + 1) and starts.numel() == E + 1
+
+
+def test_nf4_grouped_row_counts_unspecialized():
+    tree = ast.parse((ROOT / "temporary_patches/moe_nf4_grouped.py").read_text(encoding = "utf-8"))
+    (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_nf4_grouped_kernel"]
+    (jit,) = [d for d in fn.decorator_list if isinstance(d, ast.Call) and ast.unparse(d.func) == "triton.jit"]
+    (kw,) = [k for k in jit.keywords if k.arg == "do_not_specialize"]
+    assert [e.value for e in kw.value.elts] == ["M", "M_HINT"]
+    # Unused in the body, so not specializing them cannot change the kernel.
+    body = {n.id for stmt in fn.body for n in ast.walk(stmt) if isinstance(n, ast.Name)}
+    assert not body & {"M", "M_HINT"}

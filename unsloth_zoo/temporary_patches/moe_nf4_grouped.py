@@ -157,7 +157,7 @@ if triton is not None:
         return tl.load(ABSMAX + blk, mask = mask, other = 0.0).to(tl.float32)
 
     @triton.autotune(configs = _configs(), key = ["I", "J", "M_HINT", "PAIR"], prune_configs_by = {"early_config_prune": _prune})
-    @triton.jit
+    @triton.jit(do_not_specialize = ["M", "M_HINT"])  # unused in the body: no binary per row count class
     def _nf4_grouped_kernel(
         A, Q, ABSMAX, CODE2, ABSMAX2, OFFSET, CODE, ENDS, C,
         M, M_HINT,

@@ -22,7 +22,8 @@ caller keeps its eager path.
 import os
 import logging
 import torch
-from ..triton_specialize import jit_any_alignment as _jit_any_alignment
+# Absolute: this module is also loaded by path, outside the package.
+from unsloth_zoo.triton_specialize import jit_any_alignment as _jit_any_alignment
 
 __all__ = [
     "moe_triton_kernels_available",

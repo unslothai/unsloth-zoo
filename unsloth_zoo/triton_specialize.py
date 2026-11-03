@@ -30,8 +30,9 @@ except Exception:  # CPU-only installs: kernels are never built
 
 def jit_any_alignment(*names):
     """triton.jit with do_not_specialize_on_alignment = names; plain triton.jit on a Triton without it."""
-    # All Unsloth Zoo code licensed under LGPLv3
     def wrap(fn):
+        if triton is None:
+            return fn
         try:
             return triton.jit(fn, do_not_specialize_on_alignment = list(names))
         except TypeError:  # a Triton without do_not_specialize_on_alignment
