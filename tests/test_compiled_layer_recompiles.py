@@ -186,9 +186,7 @@ def test_scratch_keeps_capture_order_after_a_nested_reset():
 
 @pytest.mark.parametrize("with_owner", [True, False])
 def test_checkpoint_recompute_reuses_the_forward_graph(with_owner):
-    """Gemma-4 E2B vision / audio SFT and vision GRPO: the recompute ran after capture_outputs had reset
-    the collector, failed the forward graph's guard on the mirror, compiled a second graph in backward
-    and raised CheckpointError (saved [280, 2048] vs recomputed [1, 280, 8, 256])."""
+    """Gemma-4 E2B vision/audio: the recompute compiled a second graph in backward and raised CheckpointError."""
     from torch.utils.checkpoint import checkpoint
     from unsloth_zoo.temporary_patches.misc import output_capture_scratch
     var = _collector()
@@ -214,19 +212,19 @@ def test_checkpoint_recompute_reuses_the_forward_graph(with_owner):
     h.sum().backward()
     backward_frames = cc.frame_count - forward_frames
     torch._dynamo.reset()
-    assert len(collected["router_logits"]) == len(layers)  # the recompute appends nothing
+    assert len(collected["router_logits"]) == len(layers)
     assert var.__dict__.get("_unsloth_eager_value") is None
     if with_owner:
         assert backward_frames == 0
     else:
-        assert backward_frames >= 1  # control: the guard failure is real on this torch
+        assert backward_frames >= 1  # control
 
 
 class _HiddenLayer(_Layer):
     def __init__(self, var):
         super().__init__(var)
 
-        def pre_hook(module, args):  # transformers' hidden_states branch: the layer input, once per layer
+        def pre_hook(module, args):
             collected = var.get()
             if collected is not None and "hidden_states" in collected.keys():
                 collected["hidden_states"].append(args[0])
@@ -236,8 +234,7 @@ class _HiddenLayer(_Layer):
 
 @pytest.mark.parametrize("drop_outputs", [False, True])
 def test_checkpoint_recompute_reuses_the_forward_graph_with_hidden_states(drop_outputs):
-    """output_hidden_states=True keeps earlier layers' tensors in the real list, and the compiled layer guards on
-    them: the replay must hand back tensors with the same metadata, not None, also once the outputs are gone."""
+    """The replay must hand back same-metadata tensors for hidden_states, also once they are freed."""
     from torch.utils.checkpoint import checkpoint
     from unsloth_zoo.temporary_patches.misc import output_capture_scratch
     var = _collector()

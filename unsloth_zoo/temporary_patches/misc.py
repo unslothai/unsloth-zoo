@@ -3897,7 +3897,6 @@ pass
 TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
 
 
-# Collector state a compiled decoder layer last saw outside backward, kept on the layer (owner).
 _CAPTURE_SEEN = "_unsloth_capture_seen"
 _CAPTURE_UNSEEN = object()
 
@@ -3911,8 +3910,7 @@ pass
 
 
 class _TensorStandIn:
-    """A collected tensor (an earlier layer's hidden state) seen by a compiled layer. Held weakly, since keeping it
-    would pin every layer's activations until the recompute; the metadata rebuilds an equal-guard tensor if it died."""
+    """Held weakly (keeping it would pin every layer's activations); rebuilt with the same metadata if freed."""
     __slots__ = ("ref", "meta")
 
     def __init__(self, x):
@@ -3946,10 +3944,7 @@ pass
 
 @contextlib.contextmanager
 def _replay_capture_state(var, seen):
-    """A checkpoint recompute runs on the autograd thread after capture_outputs has reset: the mirror
-    is empty and the thread-local depth is unset, so the layer's compiled graph fails its guards and
-    a second graph compiles in backward, whose saved tensors can differ from the forward's
-    (CheckpointError). Show the recompute the collector layout the forward saw; appends are dropped."""
+    """The recompute runs on the autograd thread after capture_outputs reset, so replay the forward's collector layout."""
     if seen is _CAPTURE_UNSEEN:
         yield
         return
@@ -3996,9 +3991,7 @@ def output_capture_scratch(owner = None):
     recompiled once and deep MoE models ran into the recompile limit. Inside this context the compiled
     code reads a mirror whose lists start empty on every call; their items are moved to the real lists
     afterwards, in call order. hidden_states keeps the real list (its hook reads the length).
-
-    With `owner` (the layer), the layout seen outside backward is recorded on it and replayed for a
-    checkpoint recompute, so the recompute reuses the forward's graph."""
+    With `owner`, the layout is recorded on it and replayed for a checkpoint recompute."""
     try:
         from transformers.utils import output_capturing
         var = output_capturing._active_collector
@@ -4014,7 +4007,6 @@ def output_capture_scratch(owner = None):
     depth = getattr(state.get("_unsloth_eager_tls"), "depth", 0)
     if not isinstance(value, dict) or not state.get("_unsloth_eager_single", True) or depth <= 0:
         if owner is not None:
-            # Only a never-set collector is replayable; other states fall back to the context var.
             owner.__dict__[_CAPTURE_SEEN] = None if value is None else _CAPTURE_UNSEEN
         yield
         return
