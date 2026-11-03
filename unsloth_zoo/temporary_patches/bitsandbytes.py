@@ -235,8 +235,7 @@ _dispatch_depth = getattr(torch._C, "_len_torch_dispatch_stack", None)
 
 
 def _plain_eager(x):
-    # Raw pointers need real storage: no tracing, tensor subclass, vmap / functorch wrapper, dispatch mode or lazy
-    # negative view (its bytes hold the unnegated values; .contiguous() keeps the bit).
+    # Raw pointers need real storage: no tracing, tensor subclass, vmap / functorch wrapper, dispatch mode or neg view.
     if torch.compiler.is_compiling() or torch.jit.is_tracing() or type(x) is not torch.Tensor or x.is_neg():
         return False
     if _is_wrapped is not None and _is_wrapped(x):
