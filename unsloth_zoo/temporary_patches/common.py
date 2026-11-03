@@ -480,8 +480,7 @@ else:
 
 
 def compile_mask_builder(function):
-    """Non-fullgraph mask-builder compile that falls back to eager on Inductor codegen failures (torch 2.10 CPU C++ build
-    error on the padded sliding-window / packed causal mask)."""
+    """Compile a mask builder, falling back to eager on Inductor codegen failures (torch 2.10 CPU C++ build error)."""
     compiled = _torch_compile(function, fullgraph = False, dynamic = True)
     if compiled is function:
         return function
@@ -490,8 +489,7 @@ def compile_mask_builder(function):
     if not errors:
         return compiled
     label = getattr(function, "__name__", None) or repr(function)
-    # Own latch, not _fall_back_to_eager_on_recompile_limit: masks are built outside checkpointed layers, so another
-    # region's step-boundary switch to eager must not take them along, and the per-call checkpoint probe is not needed.
+    # Local latch: masks are built outside checkpointed layers, so another region's step-boundary eager switch must not take them along.
     eager = []
 
     @functools.wraps(function)

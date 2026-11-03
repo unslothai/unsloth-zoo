@@ -823,7 +823,6 @@ def test_a_real_error_in_a_mask_builder_still_raises(monkeypatch):
 
 
 def test_a_mask_builder_is_not_flipped_by_another_regions_fallback(monkeypatch):
-    """Masks are built outside checkpointed layers: the step-boundary flip of every registered wrapper must skip them."""
     from unsloth_zoo.temporary_patches import common
 
     monkeypatch.setattr(common.torch, "compile", lambda function, **kwargs: (lambda *a, **k: "compiled"))
