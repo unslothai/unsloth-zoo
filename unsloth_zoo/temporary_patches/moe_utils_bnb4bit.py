@@ -65,6 +65,7 @@ __all__ = [
     "patch_bnb4bit_keep_fused_experts",
     "patch_bnb4bit_dequantize_plain_params",
     "patch_bnb4bit_prequantized_plain_weight_dtype",
+    "patch_bnb8bit_prequantized_plain_weight_dtype",
     "patch_transformers_weight_converter_kwargs",
     "replace_expert_params_with_bnb_params",
     "forward_moe_backend_bnb4bit",
@@ -1729,6 +1730,36 @@ def _cast_unquantized_passthrough(op, input_dict):
     }
 
 
+def _patch_prequantized_plain_weight_dtype(quantizer_cls, deserialize_cls):
+    original_get_new_dtype = getattr(quantizer_cls, "get_new_dtype", None)
+    if original_get_new_dtype is None:
+        return  # transformers < 5.21 casts plain weights itself
+    if not getattr(original_get_new_dtype, "_unsloth_plain_dtype_patched", False):
+
+        def patched_get_new_dtype(self, converter, param, dtype):
+            new_dtype = original_get_new_dtype(self, converter, param, dtype)
+            if new_dtype is None and isinstance(dtype, torch.dtype) and dtype.is_floating_point:
+                for op in getattr(converter, "operations", None) or ():
+                    if isinstance(op, deserialize_cls):
+                        setattr(op, _PLAIN_DTYPE_ATTR, dtype)
+            return new_dtype
+
+        patched_get_new_dtype._unsloth_plain_dtype_patched = True
+        patch_function(quantizer_cls, "get_new_dtype", patched_get_new_dtype, match_level = "relaxed")
+
+    original_convert = deserialize_cls.convert
+    if getattr(original_convert, "_unsloth_plain_dtype_patched", False):
+        return
+
+    def patched_convert(self, input_dict, model = None, full_layer_name = None, **kwargs):
+        lone = len(input_dict) == 1
+        out = original_convert(self, input_dict, model = model, full_layer_name = full_layer_name, **kwargs)
+        return _cast_unquantized_passthrough(self, out) if lone else out
+
+    patched_convert._unsloth_plain_dtype_patched = True
+    patch_function(deserialize_cls, "convert", patched_convert, match_level = "relaxed")
+
+
 def patch_bnb4bit_prequantized_plain_weight_dtype():
     """transformers >= 5.21: unquantized weights of a prequantized bnb 4-bit checkpoint load in the requested dtype.
 
@@ -1739,34 +1770,18 @@ def patch_bnb4bit_prequantized_plain_weight_dtype():
         from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
     except Exception as e:
         return raise_error("transformers.integrations.bitsandbytes.Bnb4bitDeserialize", e)
+    _patch_prequantized_plain_weight_dtype(Bnb4BitHfQuantizer, Bnb4bitDeserialize)
+pass
 
-    original_get_new_dtype = getattr(Bnb4BitHfQuantizer, "get_new_dtype", None)
-    if original_get_new_dtype is None:
-        return  # transformers < 5.21 casts plain weights itself
-    if not getattr(original_get_new_dtype, "_unsloth_plain_dtype_patched", False):
 
-        def patched_get_new_dtype(self, converter, param, dtype):
-            new_dtype = original_get_new_dtype(self, converter, param, dtype)
-            if new_dtype is None and isinstance(dtype, torch.dtype) and dtype.is_floating_point:
-                for op in getattr(converter, "operations", None) or ():
-                    if isinstance(op, Bnb4bitDeserialize):
-                        setattr(op, _PLAIN_DTYPE_ATTR, dtype)
-            return new_dtype
-
-        patched_get_new_dtype._unsloth_plain_dtype_patched = True
-        patch_function(Bnb4BitHfQuantizer, "get_new_dtype", patched_get_new_dtype, match_level = "relaxed")
-
-    original_convert = Bnb4bitDeserialize.convert
-    if getattr(original_convert, "_unsloth_plain_dtype_patched", False):
-        return
-
-    def patched_convert(self, input_dict, model = None, full_layer_name = None, **kwargs):
-        lone = len(input_dict) == 1
-        out = original_convert(self, input_dict, model = model, full_layer_name = full_layer_name, **kwargs)
-        return _cast_unquantized_passthrough(self, out) if lone else out
-
-    patched_convert._unsloth_plain_dtype_patched = True
-    patch_function(Bnb4bitDeserialize, "convert", patched_convert, match_level = "relaxed")
+def patch_bnb8bit_prequantized_plain_weight_dtype():
+    """Same as the 4-bit patch for prequantized bnb 8-bit checkpoints (int8 weight + fp32 SCB untouched)."""
+    try:
+        from transformers.integrations.bitsandbytes import Bnb8bitDeserialize
+        from transformers.quantizers.quantizer_bnb_8bit import Bnb8BitHfQuantizer
+    except Exception as e:
+        return raise_error("transformers.integrations.bitsandbytes.Bnb8bitDeserialize", e)
+    _patch_prequantized_plain_weight_dtype(Bnb8BitHfQuantizer, Bnb8bitDeserialize)
 pass
 
 
@@ -1849,6 +1864,7 @@ def _register_transformers_v5_moe_bnb4bit_patches():
     TEMPORARY_PATCHES.append(patch_bnb4bit_keep_fused_experts)
     TEMPORARY_PATCHES.append(patch_bnb4bit_dequantize_plain_params)
     TEMPORARY_PATCHES.append(patch_bnb4bit_prequantized_plain_weight_dtype)
+    TEMPORARY_PATCHES.append(patch_bnb8bit_prequantized_plain_weight_dtype)
     TEMPORARY_PATCHES.append(patch_transformers_weight_converter_kwargs)
     TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
     TEMPORARY_PATCHES.append(patch_peft_param_wrapper_merge_4bit)
