@@ -3897,35 +3897,114 @@ pass
 TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
 
 
+# Collector state a compiled decoder layer last saw outside backward, kept on the layer (owner).
+_CAPTURE_SEEN = "_unsloth_capture_seen"
+_CAPTURE_UNSEEN = object()
+
+
+def _in_backward():
+    try:
+        return torch._C._current_graph_task_id() != -1
+    except Exception:
+        return False
+pass
+
+
+def _capture_layout(value):
+    # Tensors become None: keeping them would hold every layer's activations until the recompute.
+    return {
+        k: [None if isinstance(x, torch.Tensor) else x for x in v] if type(v) is list else v
+        for k, v in value.items()
+    }
+pass
+
+
 @contextlib.contextmanager
-def output_capture_scratch():
+def _replay_capture_state(var, seen):
+    """A checkpoint recompute runs on the autograd thread after capture_outputs has reset: the mirror
+    is empty and the thread-local depth is unset, so the layer's compiled graph fails its guards and
+    a second graph compiles in backward, whose saved tensors can differ from the forward's
+    (CheckpointError). Show the recompute the collector layout the forward saw; appends are dropped."""
+    if seen is _CAPTURE_UNSEEN:
+        yield
+        return
+    state = var.__dict__
+    missing = object()
+    saved = {k: state.get(k, missing) for k in ("_unsloth_eager_value", "_unsloth_eager_single")}
+    tls = state.get("_unsloth_eager_tls")
+    depth = getattr(tls, "depth", missing) if tls is not None else missing
+    if seen is None:
+        var._unsloth_eager_value = None
+    else:
+        layout, seen_depth = seen
+        if tls is None:
+            import threading
+            tls = state.setdefault("_unsloth_eager_tls", threading.local())
+        var._unsloth_eager_value = {k: list(v) if type(v) is list else v for k, v in layout.items()}
+        var._unsloth_eager_single = True
+        tls.depth = seen_depth
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is missing:
+                state.pop(k, None)
+            else:
+                state[k] = v
+        if tls is not None and seen is not None:
+            if depth is missing:
+                try:
+                    del tls.depth
+                except AttributeError:
+                    pass
+            else:
+                tls.depth = depth
+pass
+
+
+@contextlib.contextmanager
+def output_capture_scratch(owner = None):
     """Eager wrapper around one compiled decoder-layer call: capture hooks append into empty scratch lists.
 
     A capture hook traced inside the compiled layer (router_logits for the MoE aux loss) appends to the
     collector's list, and Dynamo guards on that list's length, which is the layer index: every layer
     recompiled once and deep MoE models ran into the recompile limit. Inside this context the compiled
     code reads a mirror whose lists start empty on every call; their items are moved to the real lists
-    afterwards, in call order. hidden_states keeps the real list (its hook reads the length)."""
+    afterwards, in call order. hidden_states keeps the real list (its hook reads the length).
+
+    With `owner` (the layer), the layout seen outside backward is recorded on it and replayed for a
+    checkpoint recompute, so the recompute reuses the forward's graph."""
     try:
         from transformers.utils import output_capturing
         var = output_capturing._active_collector
     except Exception:
         yield
         return
+    if owner is not None and _in_backward():
+        with _replay_capture_state(var, owner.__dict__.get(_CAPTURE_SEEN, _CAPTURE_UNSEEN)):
+            yield
+        return
     state = getattr(var, "__dict__", {})
     value = state.get("_unsloth_eager_value")
-    if not isinstance(value, dict) or not state.get("_unsloth_eager_single", True) or \
-            getattr(state.get("_unsloth_eager_tls"), "depth", 0) <= 0:
+    depth = getattr(state.get("_unsloth_eager_tls"), "depth", 0)
+    if not isinstance(value, dict) or not state.get("_unsloth_eager_single", True) or depth <= 0:
+        if owner is not None:
+            # Only a never-set collector is replayable; other states fall back to the context var.
+            owner.__dict__[_CAPTURE_SEEN] = None if value is None else _CAPTURE_UNSEEN
         yield
         return
     keys = [k for k, v in value.items() if type(v) is list and k != "hidden_states"]
     if not keys:
+        if owner is not None:
+            owner.__dict__[_CAPTURE_SEEN] = (_capture_layout(value), depth)
         yield
         return
     scratch = dict(value)
     starts = {k: len(value[k]) for k in keys}
     for k in keys:
         scratch[k] = []
+    if owner is not None:
+        owner.__dict__[_CAPTURE_SEEN] = (_capture_layout(scratch), depth)
     var._unsloth_eager_value = scratch
     try:
         yield

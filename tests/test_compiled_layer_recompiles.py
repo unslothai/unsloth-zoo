@@ -182,3 +182,41 @@ def test_scratch_keeps_capture_order_after_a_nested_reset():
                 var.__dict__.pop(k, None)
             else:
                 setattr(var, k, v)
+
+
+@pytest.mark.parametrize("with_owner", [True, False])
+def test_checkpoint_recompute_reuses_the_forward_graph(with_owner):
+    """Gemma-4 E2B vision / audio SFT and vision GRPO: the recompute ran after capture_outputs had reset
+    the collector, failed the forward graph's guard on the mirror, compiled a second graph in backward
+    and raised CheckpointError (saved [280, 2048] vs recomputed [1, 280, 8, 256])."""
+    from torch.utils.checkpoint import checkpoint
+    from unsloth_zoo.temporary_patches.misc import output_capture_scratch
+    var = _collector()
+    layers = [_Layer(var) for _ in range(3)]
+    torch._dynamo.reset()
+    cc = CompileCounter()
+    compiled = torch.compile(_Layer.forward, backend = cc, dynamic = None)
+
+    def block(layer, x):
+        with (output_capture_scratch(owner = layer) if with_owner else output_capture_scratch()):
+            return compiled(layer, x)
+
+    x = torch.randn(2, 7, 8, requires_grad = True)
+    collected = {"router_logits": []}
+    token = var.set(collected)
+    try:
+        h = x
+        for layer in layers:
+            h = checkpoint(block, layer, h, use_reentrant = False)
+    finally:
+        var.reset(token)
+    forward_frames = cc.frame_count
+    h.sum().backward()
+    backward_frames = cc.frame_count - forward_frames
+    torch._dynamo.reset()
+    assert len(collected["router_logits"]) == len(layers)  # the recompute appends nothing
+    assert var.__dict__.get("_unsloth_eager_value") is None
+    if with_owner:
+        assert backward_frames == 0
+    else:
+        assert backward_frames >= 1  # control: the guard failure is real on this torch
