@@ -205,3 +205,42 @@ def test_gemma4_vision_layers_recompute_with_the_same_norm_kernel(tmp_path):
     except Exception:
         pytest.skip("transformers without Gemma-4")
     assert _run(VISION, str(tmp_path), zoo = True) == {"ok": True}
+
+
+SCOPE = r'''
+import json, os, sys, torch
+import unsloth_zoo, unsloth_zoo.temporary_patches
+from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
+for fn in TEMPORARY_PATCHES:
+    try:
+        fn()
+    except Exception:
+        pass
+from unsloth_zoo.temporary_patches import gemma4_float32 as p
+import transformers.models.gemma4.modeling_gemma4 as g
+cfg = g.Gemma4TextConfig(vocab_size = 256, hidden_size = 64, intermediate_size = 48, num_hidden_layers = 2,
+    num_attention_heads = 4, num_key_value_heads = 2, head_dim = 16, global_head_dim = 16, max_position_embeddings = 128,
+    enable_moe_block = False, num_kv_shared_layers = 0, hidden_size_per_layer_input = 0,
+    layer_types = ["sliding_attention", "full_attention"], sliding_window = 64, tie_word_embeddings = False,
+    use_cache = False, pad_token_id = 0, bos_token_id = 1, eos_token_id = 1)
+cfg._attn_implementation = "eager"
+model = g.Gemma4ForCausalLM(cfg).float()
+ids = torch.randint(2, 256, (1, 8))
+model(input_ids = ids, labels = ids).loss.backward()
+model.get_input_embeddings()(ids)  # a standalone embedding call
+# Outside the text model nothing is left behind: a norm feeding an fp16 projector stays fp16.
+print(json.dumps({"after": str(getattr(p._GEMMA4_BOUNDARY, "dtype", None))}))
+'''
+
+
+def test_gemma4_boundary_does_not_leak_past_its_scope(tmp_path):
+    # Failing before: the embedding and each attention wrote the float32 boundary and nothing restored it, so norms
+    # outside the text model (the Unified multimodal embedder, its fp16 embedding_projection) returned float32 and the
+    # projector raised "expected m1 and m2 to have the same dtype, but got: float != c10::Half".
+    import pytest
+
+    try:
+        import transformers.models.gemma4.modeling_gemma4  # noqa: F401
+    except Exception:
+        pytest.skip("transformers without Gemma-4")
+    assert _run(SCOPE, str(tmp_path), zoo = True) == {"after": "None"}

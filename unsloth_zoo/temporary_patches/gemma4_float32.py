@@ -293,16 +293,17 @@ def _gemma4_skip_or_undo(class_suffix):
     return True
 
 
-# Set by the embedding (provisional) and by each text attention forward: the dtype the projections take when no autocast
-# is active (float32 on full finetuning, else None or fp16 = the fp16 path). Read by every Gemma-4 RMSNorm after it,
-# including the final norm, whose output goes straight to lm_head with no boundary cast. Per thread, like qwen3_moe_float32._QWEN3_MOE_BOUNDARY.
+# The dtype the projections take when no autocast is active (float32 on full finetuning, else None or fp16 = the fp16
+# path), scoped: set on entry to the text model, each text decoder layer and each vision encoder layer (and by each
+# text attention), restored on exit. Read by the Gemma-4 RMSNorms inside those scopes, the final norm before lm_head
+# included; norms outside any scope (multimodal embedders, audio) keep the fp16 output. Per thread.
 _GEMMA4_BOUNDARY = threading.local()
 
 
 def patch_Gemma4TextScaledWordEmbedding():
     if _gemma4_skip_or_undo("TextScaledWordEmbedding"): return
 
-    def scaled_embedding(self, input_ids: torch.Tensor):
+    def forward(self, input_ids: torch.Tensor):
         input_embeds = torch.nn.functional.embedding(
             input_ids,
             weight = self.weight,
@@ -311,30 +312,8 @@ def patch_Gemma4TextScaledWordEmbedding():
         # float32 residual stream (embed_scale ~ sqrt(hidden_size))
         return input_embeds.to(torch.float32) * self.embed_scale.to(torch.float32)
     pass
-    # Compiled through patch_function on a private holder, exactly as the forward itself was before (fullgraph, eager
-    # fallbacks, UNSLOTH_COMPILE_DISABLE), so only the eager boundary write below is new.
-    kernel_holder = type("_Gemma4ScaledEmbeddingKernel", (), {"forward": scaled_embedding})
-    patch_forced_float32(kernel_holder, "forward", scaled_embedding, fullgraph = True)
-    global _gemma4_scaled_embedding_kernel
-    _gemma4_scaled_embedding_kernel = kernel_holder.forward
-
-    def forward(self, input_ids: torch.Tensor):
-        # First op of every forward: a provisional boundary for the norms that run before the first attention (layer 0's
-        # input_layernorm), else they read the previous model's or forward's decision. The embedding follows the
-        # model's dtype (float32 on full finetuning, fp16 on LoRA / QLoRA); each attention then sets the real one.
-        _GEMMA4_BOUNDARY.dtype = None if torch.is_autocast_enabled(input_ids.device.type) else \
-            _linear_boundary_dtype(self, "weight")
-        return _gemma4_scaled_embedding_kernel(self, input_ids)
-    pass
     for module, prefix in _gemma4_text_variants("TextScaledWordEmbedding"):
-        # Free names for compiled copies rebuilt from source, as for the RMSNorm below.
-        publish_to_modeling_module(
-            module,
-            _gemma4_scaled_embedding_kernel = _gemma4_scaled_embedding_kernel,
-            _linear_boundary_dtype = _linear_boundary_dtype,
-            _GEMMA4_BOUNDARY = _GEMMA4_BOUNDARY,
-        )
-        patch_forced_float32(getattr(module, prefix + "TextScaledWordEmbedding"), "forward", forward)
+        patch_forced_float32(getattr(module, prefix + "TextScaledWordEmbedding"), "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextScaledWordEmbedding)
 
@@ -648,23 +627,32 @@ def _gemma4_layer_boundary(layer):
     return _linear_boundary_dtype(attn, "q_proj")
 
 
+def _gemma4_model_boundary(model):
+    layers = getattr(model, "layers", None)
+    return _gemma4_layer_boundary(layers[0]) if layers is not None and len(layers) else None
+
+
 def patch_Gemma4TextDecoderLayerBoundary():
-    # The boundary is set at layer entry, before input_layernorm, from this layer's own projections: the norm then
-    # picks the same kernel in the forward and in a checkpoint recomputation (a value left by the previous layer or
-    # by the other tower, or unset after an inputs_embeds forward that skips the embedding, made them differ:
-    # CheckpointError). Text decoder layers and vision encoder layers share Gemma4RMSNorm, so both are covered.
+    # Set at scope entry from the scope's own projections and restored on exit: a norm then picks the same kernel in the
+    # forward and in a checkpoint recomputation, whatever ran before it (another layer, the other tower, an
+    # inputs_embeds forward), and norms outside these scopes never see a float32 left behind (CheckpointError, or a
+    # float32 norm output into an fp16 projector).
     if other_family_load(_GEMMA4_FAMILY): return
-    layers = ("TextDecoderLayer", "VisionEncoderLayer")
+    scopes = (
+        ("TextModel", _gemma4_model_boundary),
+        ("TextDecoderLayer", _gemma4_layer_boundary),
+        ("VisionEncoderLayer", _gemma4_layer_boundary),
+    )
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
         # A flag "0" load undoes it, as _gemma4_skip_or_undo does for the stashed patches.
         for name, prefix in (("gemma4", "Gemma4"), ("gemma4_unified", "Gemma4Unified")):
             modeling = sys.modules.get(f"transformers.models.{name}.modeling_{name}")
-            for suffix in layers:
+            for suffix, _ in scopes:
                 cls = getattr(modeling, prefix + suffix, None)
                 if cls is not None and getattr(cls.forward, "_unsloth_gemma4_boundary", False):
                     cls.forward = cls.forward.__wrapped__
         return
-    for suffix in layers:
+    for suffix, boundary_of in scopes:
         for module, prefix in _gemma4_text_variants():
             cls = getattr(module, prefix + suffix, None)
             if cls is None: continue
@@ -672,10 +660,14 @@ def patch_Gemma4TextDecoderLayerBoundary():
             if getattr(original, "_unsloth_gemma4_boundary", False):
                 continue
 
-            def forward(self, hidden_states, *args, _unsloth_original = original, **kwargs):
-                _GEMMA4_BOUNDARY.dtype = None if torch.is_autocast_enabled(hidden_states.device.type) else \
-                    _gemma4_layer_boundary(self)
-                return _unsloth_original(self, hidden_states, *args, **kwargs)
+            def forward(self, *args, _unsloth_original = original, _unsloth_boundary_of = boundary_of, **kwargs):
+                previous = getattr(_GEMMA4_BOUNDARY, "dtype", None)
+                autocast = torch.is_autocast_enabled("cuda") or torch.is_autocast_enabled("cpu")
+                _GEMMA4_BOUNDARY.dtype = None if autocast else _unsloth_boundary_of(self)
+                try:
+                    return _unsloth_original(self, *args, **kwargs)
+                finally:
+                    _GEMMA4_BOUNDARY.dtype = previous
             pass
             forward._unsloth_gemma4_boundary = True
             forward.__wrapped__ = original
