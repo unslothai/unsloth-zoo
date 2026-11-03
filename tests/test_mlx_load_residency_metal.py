@@ -865,8 +865,11 @@ def _large_moe_language_model(family):
         args = config.ModelConfig(vocab_size = 512, hidden_size = 256, moe_intermediate_size = 64, num_hidden_layers = 6, n_routed_experts = 16, head_dim = 64,
             num_attention_heads = 4, q_lora_rank = 64, qk_rope_head_dim = 32, compress_ratios = [0, 2, 2, 1, 1, 0], kv_source_layer_ids = [1, 3], index_source_layer_ids = [1, 2, 3, 4],
             candidate_source_layer_id = 3, candidate_topk_blocks = 4, candidate_block_size = 8, index_n_heads = 4, index_head_dim = 32, index_topk = 16, o_groups = 2, o_lora_rank = 32,
-            sliding_window = 16, engram_layer_ids = [], engram_num_embeddings = [], image_token_id = 511)
-        return module.LanguageModel(args)
+            sliding_window = 16, engram_layer_ids = [1], engram_num_embeddings = [24832], engram_vocab_size = 4096, engram_n_heads = 2, engram_head_dim = 32,
+            engram_compressed_vocab_size = 512, image_token_id = 511)
+        lm = module.LanguageModel(args)
+        lm.engram_hash = pytest.importorskip("mlx_vlm.models.deepseek_v41.engram").NgramHashState(args, lm.layout, token_map = list(range(512)))
+        return lm
     if family == "glm5_next":
         return module.LanguageModel(config.TextConfig(vocab_size = 512, hidden_size = 256, intermediate_size = 256, moe_intermediate_size = 64, num_hidden_layers = 5, first_k_dense_replace = 1,
             num_attention_heads = 4, num_key_value_heads = 4, n_routed_experts = 16, num_experts_per_tok = 4, kv_lora_rank = 32, q_lora_rank = 64, v_head_dim = 32, qk_nope_head_dim = 32,
@@ -888,14 +891,15 @@ def test_large_moe_layers_prefill_as_chunked_on_full_tables(tmp_path, monkeypatc
     tokens = mx.random.randint(0, 511, (1, 2 * 2048 + 5), key = mx.random.key(3))
     # Hidden states: a wide call's head runs on every row at once, which a chunked prefill's never does.
     forward = (lambda t, c: lm(t, cache = c).logits) if family == "deepseek_v41" else (lambda t, c: lm.model(t, cache = c))
-    copy = lambda c: [_bits(a) if isinstance(a, mx.array) else a for _, a in tree_flatten(c.state)]
+    copy = lambda c: [getattr(c, "offset", None)] + [_bits(a) if isinstance(a, mx.array) else a for _, a in tree_flatten(c.state)]
     expected_cache = lm.make_cache()
     expected = []
     for start in range(0, tokens.shape[1], 2048):
         expected.append(forward(tokens[:, start:start + 2048], expected_cache))
         mx.eval(expected[-1], [c.state for c in expected_cache])
-        if start == 2048:
+        if start in (0, 2048):
             boundary = [copy(c) for c in expected_cache]
+            first = boundary if start == 0 else first
     report = offload_experts(lm, str(tmp_path), 0.75)
     assert report["layers"], report
     cache = lm.make_cache()
@@ -903,12 +907,12 @@ def test_large_moe_layers_prefill_as_chunked_on_full_tables(tmp_path, monkeypatc
     with zoo_offload.capture_prefill_rows(4096, copy) as captured:
         hidden = forward(tokens, cache)
         mx.eval(hidden, [c.state for c in cache])
-    if family != "deepseek_v41":  # each layer's cache at a step boundary, as Studio's 2048-grid prefix reuse keeps it
-        assert list(captured) == [id(c) for c in cache]
-        for got, want in zip(captured.values(), boundary, strict = True):
-            assert all(np.array_equal(a, b) for a, b in zip(got, want, strict = True))
+    # Each layer's cache at a step boundary, as Studio's 2048-grid prefix reuse keeps it (V4.1's one shared cache).
+    assert list(captured) == [id(c) for c in cache]
+    for got, want in zip(captured.values(), boundary, strict = True):
+        assert all(np.array_equal(a, b) for a, b in zip(got, want, strict = True))
     assert all(glu._slots.misses == 0 for glu in switches)  # full tables, the slots untouched
-    assert zoo_offload.wide_prefill_step(lm) == (None if family == "deepseek_v41" else 2048)  # V4.1's cache is shared by its blocks
+    assert zoo_offload.wide_prefill_step(lm) == 2048
     np.testing.assert_array_equal(_bits(hidden), _bits(mx.concatenate(expected, axis = 1)))
     for (_, got), (_, want) in zip(tree_flatten([c.state for c in cache]), tree_flatten([c.state for c in expected_cache]), strict = True):
         np.testing.assert_array_equal(*(_bits(a) if isinstance(a, mx.array) else a for a in (got, want)))
@@ -916,6 +920,16 @@ def test_large_moe_layers_prefill_as_chunked_on_full_tables(tmp_path, monkeypatc
     step = tokens[:, -1:]
     np.testing.assert_array_equal(_bits(forward(step, cache)), _bits(forward(step, expected_cache)))
     assert any(glu._slots.misses for glu in switches)
+    # A call no wider than a step runs whole and fills a request it ends at; then a narrow or wide call on that
+    # reused prefix captures at its own offset.
+    for width in (2048, tokens.shape[1] - 2048):
+        short_cache = lm.make_cache()
+        for want, part in ((first, tokens[:, :2048]), (boundary, tokens[:, 2048:2048 + width])):
+            with zoo_offload.capture_prefill_rows(2048, copy) as short:
+                mx.eval(forward(part, short_cache))
+            assert list(short) == [id(c) for c in short_cache]
+            for got, expect in zip(short.values(), want, strict = True):
+                assert all(np.array_equal(a, b) for a, b in zip(got, expect, strict = True))
     if family == "deepseek_v41":
         assert not hasattr(cache[0], "unsloth_wide_steps")  # no block's steps outlive the call
         # A batch cache, even of one row, runs the call whole, as before these blocks stepped.

@@ -670,8 +670,9 @@ class _DeepseekV41Steps:
         return type(cache).__name__ == "DeepseekV41Cache"
 
     def __init__(self, layer, cache):
-        self.cache, self.offset, self.last = cache, cache.offset, layer.layer_idx == cache.n_layers - 1
-        if layer.layer_idx == 0:
+        self.cache, self.offset, self.layer = cache, cache.offset, layer.layer_idx
+        self.last = self.layer == cache.n_layers - 1
+        if self.layer == 0:
             cache.unsloth_wide_steps = {}
         self.steps = cache.unsloth_wide_steps
 
@@ -688,6 +689,38 @@ class _DeepseekV41Steps:
         self.cache.offset = self.offset
         if self.last:
             del self.cache.unsloth_wide_steps
+
+    @staticmethod
+    def _layer_lists(cache):
+        return [name for name, value in vars(cache).items() if isinstance(value, list) and len(value) == cache.n_layers]
+
+    @staticmethod
+    def _snapshot(cache, offset, lists):
+        snapshot = copy.copy(cache)
+        snapshot.__dict__.pop("unsloth_wide_steps", None)
+        snapshot.__dict__.update(lists, offset = offset)
+        if cache.engram is not None:  # the model hashes a whole call's tokens before its blocks run
+            snapshot.engram = cache.engram[:, :offset]
+        return snapshot
+
+    def capture(self, rows, copy_cache, captured):
+        """Keeps this block's state after its first rows (a step's end); the last block files a copy of the cache a
+        prefill chunked there holds."""
+        # New arrays: a later step writes the cache's buffers in place.
+        held = self.steps.setdefault("captured", {})
+        held[self.layer] = {name: None if (value := getattr(self.cache, name)[self.layer]) is None else mx.contiguous(value)
+                            for name in self._layer_lists(self.cache)}
+        mx.eval(list(held[self.layer].values()))
+        if self.last:
+            lists = {name: [held[layer][name] for layer in range(self.cache.n_layers)] for name in held[self.layer]}
+            captured[id(self.cache)] = copy_cache(self._snapshot(self.cache, self.offset + rows, lists))
+
+    @classmethod
+    def capture_whole(cls, layer, cache, rows):
+        """The cache a call of rows run whole leaves, once its last block ran; None before."""
+        if not cls.steps(cache) or layer.layer_idx != cache.n_layers - 1:
+            return None
+        return cls._snapshot(cache, cache.offset + rows, {name: list(getattr(cache, name)) for name in cls._layer_lists(cache)})
 
 
 # Layers with calls wider than a prefill step may run as consecutive steps on their own cache; token axes of
@@ -1237,7 +1270,10 @@ class _WideLayer:
                 mx.eval(output, cache.state, shared.end(start) if shared is not None else ())
                 outputs.append(output)
                 if capture is not None and min(start + _PREFILL_STEP, hidden.shape[1]) == capture[0]:
-                    capture[2][id(cache)] = capture[1](cache)
+                    if shared is not None:
+                        shared.capture(capture[0], capture[1], capture[2])
+                    else:
+                        capture[2][id(cache)] = capture[1](cache)
         finally:
             if shared is not None:
                 shared.finish()
@@ -1254,7 +1290,10 @@ class _WideLayer:
             cache = self._wide_signature.bind(self, *args, **kwargs).arguments.get("cache")
             if cache is not None:
                 mx.eval(output, cache.state)
-                capture[2][id(cache)] = capture[1](cache)
+                if self._wide_steps is None:
+                    capture[2][id(cache)] = capture[1](cache)
+                elif (snapshot := self._wide_steps.capture_whole(self, cache, hidden.shape[1])) is not None:
+                    capture[2][id(cache)] = capture[1](snapshot)
         return output
 
 
@@ -1264,14 +1303,13 @@ _prefill_capture = threading.local()
 
 def wide_prefill_step(model):
     """The step every wide single-row prefill call of model runs in, as a prefill chunked at it; None when a layer may
-    run a call whole (unregistered layer, DeepSeek V4 image rows) or when one layer's boundary is not a copyable cache
-    (DeepSeek V4.1's shared one)."""
+    run a call whole (unregistered layer, DeepSeek V4 image rows)."""
     modules = dict(model.named_modules())
     switches = [module for module in modules.values() if isinstance(module, OffloadSwitchGLU)]
     wide = {path for path, layer in modules.items() if isinstance(layer, _WideLayer)}
     stacks = {path.rpartition(".")[0] for path in wide}
     stacked = {path for path in modules if path.rpartition(".")[0] in stacks and path.rpartition(".")[2].isdigit()}
-    held = {id(modules[path]._offload_switch) for path in wide if not callable(modules[path]._wide_masks) and modules[path]._wide_steps is None}
+    held = {id(modules[path]._offload_switch) for path in wide if not callable(modules[path]._wide_masks)}
     if not switches or stacked - wide or any(id(switch) not in held for switch in switches):
         return None
     return _PREFILL_STEP
