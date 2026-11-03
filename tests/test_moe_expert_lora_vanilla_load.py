@@ -157,6 +157,25 @@ print(json.dumps({"vanilla_max_abs": float((logits(model) - want).abs().max())})
 '''
 
 
+UNSLOTH_RELOAD = COMMON + r'''
+import unsloth_zoo, unsloth_zoo.temporary_patches
+from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
+assert unsloth_zoo.__file__.startswith(os.environ["REPO"]), unsloth_zoo.__file__
+for fn in TEMPORARY_PATCHES:
+    try:
+        fn()
+    except Exception:
+        pass
+from peft import PeftModel
+from safetensors.torch import load_file
+saved = load_file(os.path.join(ADAPTER, "adapter_model.safetensors"))
+expert_B = sorted({tuple(v.shape) for k, v in saved.items() if ".experts." in k and ".lora_B." in k})
+model = PeftModel.from_pretrained(model_class().from_pretrained(CKPT, dtype = torch.float32), ADAPTER)
+want = torch.load(os.path.join(WORK, "unsloth_logits.pt"))
+print(json.dumps({"reload_max_abs": float((logits(model) - want).abs().max()), "expert_lora_B_shapes": expert_B}))
+'''
+
+
 def _run(code, family, work, zoo, **extra):
     env = {k: v for k, v in os.environ.items() if not k.startswith("UNSLOTH_")}
     env.update(HF_HUB_OFFLINE = "1", OMP_NUM_THREADS = "4", REPO = REPO,
@@ -185,14 +204,10 @@ def _peft_at_least_0_20():
 
 @pytest.mark.parametrize("b_layout", ["rank_major", "grouped_by_expert"])
 @pytest.mark.parametrize("family", ["llama4", "qwen3_vl_moe"])
-def test_unsloth_expert_lora_loads_in_vanilla_peft(request, tmp_path, family, b_layout):
-    # grouped_by_expert is the legacy lora_B packing (UNSLOTH_MOE_LORA_B_LAYOUT): it must never load silently wrong.
-    if family == "qwen3_vl_moe" and b_layout == "grouped_by_expert" and not _transformers_at_least_5():
-        # Vanilla PEFT only refuses the legacy packing by shape, and the shapes change only when the save swaps
-        # the factors. transformers 4.x already stores these stacks hidden-first, so nothing is swapped, the
-        # shapes match, and the adapter loads with its experts mixed (~0.6 off in the logits).
-        request.applymarker(pytest.mark.xfail(strict = True, reason = "transformers 4.x: the legacy lora_B "
-            "packing loads silently wrong in vanilla PEFT for Qwen3-VL-MoE"))
+def test_unsloth_expert_lora_loads_in_vanilla_peft(tmp_path, family, b_layout):
+    # grouped_by_expert is the legacy lora_B packing (UNSLOTH_MOE_LORA_B_LAYOUT): it must never load silently wrong,
+    # on any transformers / PEFT. Its 2D shape is PEFT's, so a factor swap alone does not make vanilla refuse it
+    # (transformers 4.x Qwen3-VL-MoE and PEFT 0.18 Llama-4 swap nothing): lora_B is saved [out, E, R].
     work = str(tmp_path)
     _run(VANILLA_SAVE, family, work, zoo = False)
     trained = _run(UNSLOTH_TRAIN, family, work, zoo = True, UNSLOTH_MOE_LORA_B_LAYOUT = b_layout)
@@ -207,9 +222,13 @@ def test_unsloth_expert_lora_loads_in_vanilla_peft(request, tmp_path, family, b_
     for key in keys:
         assert isinstance(trained[key], float) and trained[key] <= 1e-4, (key, trained)
     if b_layout == "grouped_by_expert":
-        # Legacy packing is left as trained: vanilla PEFT refuses it by shape (never a silent wrong load).
+        # Vanilla PEFT must refuse it by shape (never a silent wrong load). A crash of any other kind fails here.
         with pytest.raises(AssertionError, match = "size mismatch"):
             _run(VANILLA_LOAD, family, work, zoo = False)
+        # Unsloth without the legacy switch reads PEFT's packing, and loads the 3D lora_B into it correctly.
+        reloaded = _run(UNSLOTH_RELOAD, family, work, zoo = True)
+        assert reloaded["reload_max_abs"] <= 1e-4, reloaded
+        assert reloaded["expert_lora_B_shapes"] and all(len(s) == 3 for s in reloaded["expert_lora_B_shapes"]), reloaded
         return
     loaded = _run(VANILLA_LOAD, family, work, zoo = False)
     assert loaded["vanilla_max_abs"] <= 1e-4, loaded
@@ -231,6 +250,40 @@ def test_factor_swap_is_an_involution_and_keeps_the_delta():
         b = b.reshape(b.shape[0], R, E).permute(2, 0, 1)
         return b @ a
     torch.testing.assert_close(delta(A2, B2), delta(A, B).transpose(-2, -1))
+
+
+def test_legacy_grouped_lora_B_saves_3d_and_loads_back_as_trained(monkeypatch):
+    # Column e*R + r of a legacy lora_B is expert e, rank r: [out, E, R] is that packing, refused by vanilla PEFT.
+    import torch
+    from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
+
+    E, R, out = 3, 2, 5
+    grouped = torch.randn(out, E * R)
+
+    class ParamWrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_experts = E
+            self.base_layer = torch.nn.Identity()
+            self.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(E * R, out, bias = False)})
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = ParamWrapper()
+
+    model = Model()
+    state = {"experts.lora_A.weight": torch.randn(E * R, 4), "experts.lora_B.weight": grouped}
+    monkeypatch.setattr(swap, "_legacy_grouped", lambda wrapper, name: True)
+    saved = swap._to_vanilla(model, state, "default")
+    assert saved["experts.lora_B.weight"].shape == (out, E, R)
+    assert torch.equal(saved["experts.lora_B.weight"][:, 1, 0], grouped[:, 1 * R + 0])
+    # Loaded back as the trained bytes whatever the process layout; the marker decides any repack.
+    for legacy in (True, False):
+        monkeypatch.setattr(swap, "_legacy_grouped", lambda wrapper, name, legacy = legacy: legacy)
+        assert torch.equal(swap._from_vanilla(model, saved, "default")["experts.lora_B.weight"], grouped)
+    # PEFT's packing is saved as is.
+    assert swap._to_vanilla(model, state, "default")["experts.lora_B.weight"] is grouped
 
 
 def test_llama4_factors_follow_pefts_is_transposed_support(monkeypatch):
