@@ -367,10 +367,15 @@ def test_shaped_gives_evicted_expert_weights_their_shape_without_memory():
 
 def test_shaped_restores_placeholders_set_before_a_failure():
     import types, pytest
+
+    class FailingSignature:
+        def __getitem__(self, index):
+            raise RuntimeError("shape lookup failed")
+
     a, b = nn.Parameter(torch.empty(0), requires_grad = False), nn.Parameter(torch.empty(0), requires_grad = False)
     blk = types.SimpleNamespace(resident = False, params = [a, b], empties = [a.data, b.data],
-                                sig = [((4, 16, 8),), ((4, -2),)])
-    with pytest.raises(RuntimeError):
+                                sig = [((4, 16, 8),), FailingSignature()])
+    with pytest.raises(RuntimeError, match = "shape lookup failed"):
         with BlockSwap.shaped(types.SimpleNamespace(blocks = [blk])):
             pass
     assert a.shape == (0,) and b.shape == (0,)
