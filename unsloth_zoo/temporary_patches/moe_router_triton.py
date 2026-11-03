@@ -62,9 +62,9 @@ if HAS_TRITON:
     @triton.jit
     def _router_fwd_kernel(
         Z, BIAS, W, IDS, T, E, GS, stride_z, scale, mask_value,
-        K: tl.constexpr, BLOCK_K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,
-        HAS_BIAS: tl.constexpr, N_GROUP: tl.constexpr, TOPK_GROUP: tl.constexpr, BLOCK_G: tl.constexpr,
-        BLOCK_T: tl.constexpr, BLOCK_E: tl.constexpr,
+        K: tl.constexpr, BLOCK_K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,  # top-k / top-k pow2 / 0 softmax, 1 topk-softmax, 2 sigmoid / renorm
+        HAS_BIAS: tl.constexpr, N_GROUP: tl.constexpr, TOPK_GROUP: tl.constexpr, BLOCK_G: tl.constexpr,  # correction bias / expert groups / groups kept / groups pow2
+        BLOCK_T: tl.constexpr, BLOCK_E: tl.constexpr,  # tokens per program / experts pow2
     ):
         pid = tl.program_id(0)
         rows = pid * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -152,8 +152,8 @@ if HAS_TRITON:
     @triton.jit
     def _router_bwd_kernel(
         Z, IDS, DW, DZ, T, E, stride_z, stride_dw, scale,
-        K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,
-        BLOCK_T: tl.constexpr, BLOCK_E: tl.constexpr,
+        K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,  # top-k / router mode / renorm
+        BLOCK_T: tl.constexpr, BLOCK_E: tl.constexpr,  # tokens per program / experts pow2
     ):
         pid = tl.program_id(0)
         rows = pid * BLOCK_T + tl.arange(0, BLOCK_T)
