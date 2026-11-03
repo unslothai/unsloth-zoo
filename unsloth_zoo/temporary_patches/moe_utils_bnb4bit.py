@@ -1761,10 +1761,7 @@ def _patch_prequantized_plain_weight_dtype(quantizer_cls, deserialize_cls):
 
 
 def patch_bnb4bit_prequantized_plain_weight_dtype():
-    """transformers >= 5.21: unquantized weights of a prequantized bnb 4-bit checkpoint load in the requested dtype.
-
-    get_new_dtype cannot tell the plain weight from its fp32 quant stats, so keep its None; the passthrough casts.
-    """
+    """get_new_dtype cannot tell the plain weight from its quant stats, so its None is kept and the lone passthrough casts."""
     try:
         from transformers.integrations.bitsandbytes import Bnb4bitDeserialize
         from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
@@ -1775,7 +1772,6 @@ pass
 
 
 def patch_bnb8bit_prequantized_plain_weight_dtype():
-    """Same as the 4-bit patch for prequantized bnb 8-bit checkpoints (int8 weight + fp32 SCB untouched)."""
     try:
         from transformers.integrations.bitsandbytes import Bnb8bitDeserialize
         from transformers.quantizers.quantizer_bnb_8bit import Bnb8BitHfQuantizer

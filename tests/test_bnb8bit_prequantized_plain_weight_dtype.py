@@ -49,7 +49,6 @@ class _KeepNormsFp32(LlamaForCausalLM):
 
 
 def _checkpoint(root, ckpt_dtype):
-    """Tiny Llama with int8 (weight + SCB) attention; mlp / embed / norms / lm_head unquantized in `ckpt_dtype`."""
     cfg = LlamaConfig(
         vocab_size = 128, hidden_size = 64, intermediate_size = 128, num_hidden_layers = 2,
         num_attention_heads = 4, num_key_value_heads = 2, max_position_embeddings = 64,
@@ -66,7 +65,7 @@ def _checkpoint(root, ckpt_dtype):
         if key.endswith(".weight") and module.rsplit(".", 1)[-1] in ATTN:
             cb, scb, _ = bnb.functional.int8_vectorwise_quant(value.to(ckpt_dtype).float().contiguous())
             out[key] = cb.contiguous()
-            out[f"{module}.SCB"] = scb.float().contiguous()  # Linear8bitLt state-dict layout
+            out[f"{module}.SCB"] = scb.float().contiguous()
             quantized.add(module)
         else:
             out[key] = value.to(ckpt_dtype).contiguous()
@@ -83,7 +82,6 @@ def _checkpoint(root, ckpt_dtype):
 
 
 def _check(model, raw, expected):
-    """Every unquantized floating param / persistent buffer has its expected dtype; int8 data and SCB untouched."""
     n_q = n_plain = 0
     persistent = {n for n, _ in model.named_buffers() if n in model.state_dict()}
     for name, tensor in list(model.named_parameters()) + [
