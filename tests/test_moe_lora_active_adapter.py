@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The separated MoE expert LoRA forward must apply exactly the adapters PEFT would: the active ones that carry LoRA
-on that expert parameter. With several adapters on one model it used to read the first adapter in lora_A whatever
-set_adapter chose, so an inactive adapter's expert LoRA still applied (and an adapter that only targets attention
-picked up another adapter's experts).
-
-One CPU subprocess per case with the zoo patches on: tiny random MoE models built from a config, two adapters per
-model, every switch checked against a model holding only that adapter; both adapters active together are checked
-against PEFT's own merge of both.
-"""
+"""MoE expert LoRA must apply exactly the adapters PEFT would; checked on CPU against PEFT per adapter and merged."""
 
 import json
 import os
@@ -156,7 +148,6 @@ def _run(family, work, compiled):
 @pytest.mark.skipif(not _multi_target_parameter_adapters_supported(), reason = "PEFT < 0.19: one target_parameters adapter per model")
 @pytest.mark.parametrize(
     "family, compiled",
-    # One compiled family keeps the CPU run short.
     [("llama4", False), ("qwen3_moe", False), ("gpt_oss", False), ("qwen3_moe", True)],
     ids = ["llama4", "qwen3_moe", "gpt_oss", "qwen3_moe-compiled"],
 )

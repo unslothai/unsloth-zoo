@@ -2470,9 +2470,7 @@ def _fused_moe_activation(module, gate_up, interleaved, allow_gptoss = True):
 
 
 def _active_lora_adapter_names(wrapper) -> Optional[list]:
-    """The active adapters that hold LoRA on this wrapper, in PEFT's order: exactly the ones PEFT's own forward applies
-    (an adapter that does not target this parameter, or is not active, contributes nothing). None when the wrapper
-    does not say which adapters are active, so callers keep their older choice."""
+    """Active adapters holding LoRA here, in PEFT order; None if the wrapper does not track active adapters."""
     try:
         active = wrapper.active_adapters
     except Exception:
@@ -2863,9 +2861,7 @@ def extract_moe_lora_weights_for_grouped_mm(
 def _extract_lora_from_wrapper(
     wrapper, adapter_name: Optional[str] = None, experts_module=None
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float, int]]:
-    """Returns (first_weight, second_weight, scaling, num_experts) or None; PEFT lora_A is (E*R, in) and lora_B (out,
-    E*R), handling standard and transposed base layouts. adapter_name None means the wrapper's active adapters, as
-    PEFT's forward reads them: none active here gives None, several are summed (_combine_moe_lora_terms)."""
+    """Returns (first_weight, second_weight, scaling, num_experts) or None. adapter_name None = the active adapters."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     try:
@@ -2883,10 +2879,9 @@ def _extract_lora_from_wrapper(
         if adapter_name is None:
             active = _active_lora_adapter_names(wrapper)
             if active is None:
-                # No active-adapter bookkeeping (not a PEFT layer): PEFT's default name, else the only choice there is.
                 adapter_name = "default" if "default" in wrapper.lora_A else next(iter(wrapper.lora_A.keys()))
             elif len(active) == 0:
-                # set_adapter picked an adapter that does not target this parameter; PEFT adds nothing here.
+                # An adapter that does not target this parameter contributes nothing (as in PEFT).
                 return None
             elif len(active) == 1:
                 adapter_name = active[0]
@@ -2900,7 +2895,6 @@ def _extract_lora_from_wrapper(
                 return _combine_moe_lora_terms(terms)
 
         if adapter_name not in wrapper.lora_A:
-            # An adapter this parameter does not carry contributes nothing (PEFT skips it too).
             return None
 
         lora_A_module = wrapper.lora_A[adapter_name]
@@ -2930,23 +2924,18 @@ def _extract_lora_from_wrapper(
             model_name="MoE",
         )
     except (MoELoRABLayoutError, MoELoRAMultiAdapterError):
-        # A misspelled UNSLOTH_MOE_LORA_B_LAYOUT, or active adapters that cannot be summed, must not read as "no
-        # adapter here".
+        # Must not read as "no adapter here".
         raise
     except Exception:
         return None
 
 
 class MoELoRAMultiAdapterError(NotImplementedError):
-    """Raised when several active adapters on one expert parameter cannot be summed into one stash entry; its own type
-    so _extract_lora_from_wrapper re-raises it instead of returning "no adapter"."""
+    """Several active adapters on one expert parameter cannot be summed."""
 
 
 def _combine_moe_lora_terms(terms):
-    """Several active adapters as one stash entry: sum_i s_i * (x A_i) B_i equals x [A_1 | A_2 ...] [s_1 B_1; s_2 B_2
-    ...], so the ranks are concatenated with each scaling folded into its second factor and the scaling becomes 1.
-    Raises when a term is not the per-expert (first [E, in, r], second [E, r, out]) form, since dropping an active
-    adapter silently is the bug this exists to prevent."""
+    """Sum active adapters by concatenating ranks with scaling folded into B; raise rather than drop one."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if len(terms) == 1:
@@ -4177,8 +4166,7 @@ def _patched_param_wrapper_forward(
         if self.merged:
             return immediate_base_layer(x, *args, **kwargs)
 
-        # PEFT applies only the active adapters this parameter carries. With none (set_adapter chose an adapter that
-        # does not target the experts) the base runs untouched, and no probe is spent measuring an empty stash.
+        # No active adapter targets this parameter: base only.
         active = _active_lora_adapter_names(self)
         if active is not None and len(active) == 0:
             return immediate_base_layer(x, *args, **kwargs)
