@@ -749,3 +749,43 @@ def test_mamba_mixed_dtype_preactivation_stays_in_the_parameter_dtype(xdtype):
         assert torch.isfinite(theirs).all()
         assert torch.isfinite(ours).all()
         assert torch.equal(ours, theirs)
+
+
+_REVERSE_MIXED_SCRIPT = r"""
+import json, sys, torch
+from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc
+gcc._conv_launch = lambda name, kernel, grid, ptrs, ints, consts, num_warps, outs: kernel[grid](
+    *(ptrs + ints + consts), num_warps = num_warps,
+)
+out = {"file": gcc.__file__}
+for xdtype in (torch.float32, torch.bfloat16):
+    x = torch.full((1, 8, 64), -30000.0, dtype = xdtype)
+    w = torch.full((64, 4), 3.0, dtype = torch.float16)
+    y = gcc._launch_fwd(x, w, None, "silu")
+    dx, dw, _ = gcc._launch_bwd(x, w, None, torch.ones_like(x), "silu", True, True, False)
+    out[str(xdtype)] = [int(t.isnan().sum() + t.isinf().sum()) for t in (y, dx, dw)]
+print("RESULT " + json.dumps(out))
+"""
+
+
+def test_reverse_mixed_dtype_preactivation_does_not_overflow():
+    # fp16 weights with wider x: rounding the fp32 accumulator to fp16 before SiLU gives -inf, then NaN.
+    pytest.importorskip("triton")
+    import json
+    import subprocess
+    import sys
+    env = dict(os.environ, TRITON_INTERPRET = "1", CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
+    proc = subprocess.run([sys.executable, "-c", _REVERSE_MIXED_SCRIPT], env = env, capture_output = True, text = True)
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    line = next(l for l in proc.stdout.splitlines() if l.startswith("RESULT "))
+    result = json.loads(line[len("RESULT "):])
+    assert result.pop("file") == gcc.__file__
+    assert result == {"torch.float32": [0, 0, 0], "torch.bfloat16": [0, 0, 0]}
+    # The torch references the drop-ins fall back to follow the same rule.
+    for xdtype in (torch.float32, torch.bfloat16):
+        x = torch.full((1, 64, 8), -30000.0, dtype = xdtype)
+        w = torch.full((64, 4), 3.0, dtype = torch.float16)
+        seq_idx = torch.zeros(1, 8, dtype = torch.int64)
+        assert torch.isfinite(gcc.causal_conv1d_reference(x, w, None, "silu")).all()
+        ref = gcc._causal_conv1d_reference_seq_idx(x, w, None, "silu", seq_idx, pad_negative = True)
+        assert torch.isfinite(ref).all()
