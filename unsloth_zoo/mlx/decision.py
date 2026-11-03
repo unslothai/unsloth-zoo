@@ -1715,7 +1715,7 @@ class _D1Model(DecisionPipeline):
 
         from mlx_vlm.utils import load
 
-        self._backbone = _read_json(folder / "config.json").get("model_type")
+        self._backbone, self.source = _read_json(folder / "config.json").get("model_type"), folder
         package = _D1_PACKAGES.get(self._backbone)
         if package is None:
             raise ValueError(f"Unsloth: {folder} is a d1 model on {self._backbone!r}, which this loader does not know.")
@@ -2893,8 +2893,13 @@ def d1_training_item(pipeline, state, questions, images = None, audio = None):
     if len(parsed) > engine.set_size:
         raise DecisionRequestError(f"too many questions for one record, the maximum is {engine.set_size}")
     asked = [engine.ask(pipeline._question(question)) for question in parsed]
-    images, audio = list(images or ()), list(audio or ())
-    item = {"images": images, "audio": audio} if images or audio else {}
+    # Merged with the state's image parts, as a request is served.
+    given = list(images or ())
+    urls = _image_urls(state, [image for image in given if isinstance(image, str)])
+    images, audio = given + urls[sum(isinstance(image, str) for image in given):], list(audio or ())
+    if urls:
+        state = _without_image_parts(state)
+    item ={"images": images, "audio": audio} if images or audio else {}
     markup, _ = engine.media.encode(_d1_media(item)) if item else ("", [])
     prefix = prefix_text(engine.tokenizer, state, engine.bos, engine.state_style, engine.system, markup)
     layouts = [suffix_layout(engine.tokenizer, question, engine.lead) for question in asked]

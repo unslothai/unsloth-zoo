@@ -606,7 +606,7 @@ def test_d1_load_reads_its_abilities_from_the_backbone(tmp_path, monkeypatch, ba
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
     monkeypatch.setattr(mlx_vlm_utils, "load", lambda path: ("model", "processor"))
     model = decision._D1Model(tmp_path, None)
-    assert (model.reads_audio, model.noul_true_first, model.model) == (audio, true_first, "model")
+    assert (model.reads_audio, model.noul_true_first, model.model, model.source) == (audio, true_first, "model", tmp_path)
 
 
 def test_d1_says_when_the_installed_mlx_vlm_lacks_its_engine(tmp_path, monkeypatch):
@@ -664,6 +664,21 @@ def test_d1_item_packs_questions_after_the_state_and_reads_each_at_its_last_toke
     assert [len(spans) for spans in item["option_spans"]] == [2, 3]
     assert item["types"] == [decision._TYPE_IDS.index("noul"), decision._TYPE_IDS.index("choice")]
     assert "images" not in item
+
+
+def test_d1_item_reads_the_states_images_as_a_request_does(monkeypatch):
+    prompt = pytest.importorskip(_D1_PROMPT)
+    seen = []
+    monkeypatch.setattr(prompt, "prefix_text", lambda tokenizer, state, *_: seen.append(state) or "S\n")
+    monkeypatch.setattr(prompt, "question_header", lambda *_: "Q\n")
+    monkeypatch.setattr(prompt, "suffix_layout", lambda tokenizer, question, lead: ("x?", [0]))
+    monkeypatch.setattr(decision, "_d1_media", lambda item: [])
+    url = "data:image/png;base64,AAAA"
+    state = {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": url}}]}]}
+    picture = object()
+    item = decision.d1_training_item(_d1_trainable(), state, {"a": {"type": "noul", "instructions": "x"}}, images = [picture])
+    assert item["images"] == [picture, url]
+    assert seen == [{"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}]
 
 
 def test_d1_item_refuses_more_questions_than_a_row_trained(monkeypatch):
