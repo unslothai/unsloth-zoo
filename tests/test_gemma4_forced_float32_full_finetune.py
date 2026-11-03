@@ -107,7 +107,11 @@ def _run(code, out, zoo):
     env.update(HF_HUB_OFFLINE = "1", OMP_NUM_THREADS = "4", REPO = REPO,
                UNSLOTH_COMPILE_LOCATION = os.path.join(out, "ucc"))
     if zoo:
-        env.update(PYTHONPATH = REPO, UNSLOTH_IS_PRESENT = "1", UNSLOTH_FORCE_FLOAT32 = "1")
+        # A fresh interpreter has none of conftest.py's initialization mocks: configure the CPU import here, as
+        # test_forced_float32_undo_families.py does.
+        env.update(PYTHONPATH = os.pathsep.join(p for p in (REPO, os.environ.get("PYTHONPATH")) if p),
+                   CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", UNSLOTH_ALLOW_CPU = "1",
+                   UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_FORCE_FLOAT32 = "1")
     else:
         env.pop("PYTHONPATH", None)
     proc = subprocess.run([sys.executable, "-c", textwrap.dedent(code), out], env = env, cwd = out,
