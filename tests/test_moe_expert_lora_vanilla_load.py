@@ -455,8 +455,7 @@ def test_load_adapter_under_disk_offload_passes_a_converted_file(monkeypatch, tm
 @pytest.mark.parametrize("file_kind", ["3d", "2d"])
 @pytest.mark.parametrize("family", ["llama4", "qwen3_vl_moe"])
 def test_legacy_adapter_loads_as_trained_on_every_path_with_the_switch_unset(tmp_path, family, file_kind):
-    # The adapter_config.json lora_B_layout marker, not the switch, says the file is grouped_by_expert: transformers'
-    # load_adapter and both hotswaps must repack it as PeftModel.load_adapter does, for 3D files and older 2D ones.
+    # The config marker, not the env switch, drives the repack on every load path, for 3D and older 2D files.
     work = str(tmp_path)
     _run(VANILLA_SAVE, family, work, zoo = False)
     trained = _run(LEGACY_TRAIN, family, work, zoo = True, UNSLOTH_MOE_LORA_B_LAYOUT = "grouped_by_expert")
@@ -471,7 +470,6 @@ def test_legacy_adapter_loads_as_trained_on_every_path_with_the_switch_unset(tmp
 
 
 def test_load_adapter_source_reads_the_adapter_location_across_signatures():
-    # The repack rereads adapter_config.json from where the tensors came from; an in-memory state dict has none.
     from types import SimpleNamespace
     from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
 
@@ -492,7 +490,6 @@ def test_load_adapter_source_reads_the_adapter_location_across_signatures():
     assert swap._load_adapter_source(v5, (None, None), {"peft_config": object(), "adapter_state_dict": {}}) == (None, {})
     model_id, hub = swap._load_adapter_source(v4, (None, "dir", "default", "rev"), {})
     assert model_id == "dir" and hub["revision"] == "rev"
-    # An explicit download_kwargs replaces load_config's (transformers 5.x), and adapter_kwargs still win.
     model_id, hub = swap._load_adapter_source(v5, (None, "org/a"), {
         "load_config": from_config, "download_kwargs": {"subfolder": "saved", "revision": "branch"},
         "adapter_kwargs": {"revision": "pinned"},

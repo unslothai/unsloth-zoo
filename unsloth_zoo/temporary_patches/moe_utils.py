@@ -4806,10 +4806,8 @@ def _read_adapter_config(model_id, kwargs):
 
 
 def repack_legacy_lora_b_after_load(model, model_id, adapter_name, hub_kwargs) -> int:
-    """After an adapter's tensors are loaded, repacks pre-2026.9.6 fused expert lora_B to rank_major per the
-    adapter_config.json marker so forward, merge and next save agree (unsloth issue 6930); an explicit
-    UNSLOTH_MOE_LORA_B_LAYOUT skips this. Every path that loads a file into the wrappers calls it: PeftModel.load_adapter,
-    transformers' load_adapter (hotswap too) and PEFT's hotswap_adapter. Returns how many tensors moved."""
+    """Repack pre-2026.9.6 fused expert lora_B to rank_major per the adapter_config.json marker (unsloth issue 6930);
+    every adapter load path must call it. Explicit UNSLOTH_MOE_LORA_B_LAYOUT skips. Returns tensors moved."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") or model_id is None or not _has_fused_expert_lora(model, adapter_name):
@@ -4836,7 +4834,6 @@ def repack_legacy_lora_b_after_load(model, model_id, adapter_name, hub_kwargs) -
 
 
 def _patched_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs):
-    """Runs PEFT load_adapter, then repack_legacy_lora_b_after_load."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     result = _original_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs)

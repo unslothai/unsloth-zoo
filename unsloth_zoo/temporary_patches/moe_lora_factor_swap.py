@@ -305,8 +305,7 @@ def _converted_load_kwargs(model, kwargs, adapter_name, scratch_dir = None):
 
 
 def _repack_legacy_lora_B(model, model_id, adapter_name, hub_kwargs):
-    """The adapter_config.json lora_B_layout repack PeftModel.load_adapter runs, for the other load paths. Runs after
-    a load that succeeded, so it never raises."""
+    """Legacy lora_B repack for non-PeftModel load paths; never raises (the load already succeeded)."""
     try:
         from .moe_utils import repack_legacy_lora_b_after_load
         repack_legacy_lora_b_after_load(model, model_id, adapter_name, hub_kwargs)
@@ -316,8 +315,7 @@ def _repack_legacy_lora_B(model, model_id, adapter_name, hub_kwargs):
 
 
 def _load_adapter_source(original, args, kwargs):
-    """(adapter dir or repo id, hub kwargs) of a transformers load_adapter call, across the 4.x and 5.x signatures;
-    model id None when the tensors came from an in-memory adapter_state_dict."""
+    """(model_id, hub_kwargs) of a transformers 4.x/5.x load_adapter call; model_id None for an adapter_state_dict."""
     import inspect
     try:
         signature = inspect.signature(original)
@@ -332,7 +330,7 @@ def _load_adapter_source(original, args, kwargs):
         load_config = named.get("load_config")
         model_id = (named.get("peft_model_id") or named.get("pretrained_model_name_or_path")
                     or getattr(load_config, "pretrained_model_name_or_path", None))
-        # As transformers resolves it: an explicit download_kwargs replaces load_config's, then adapter_kwargs override.
+        # Mirrors transformers: explicit download_kwargs replaces load_config's; adapter_kwargs override.
         download = named.get("download_kwargs")
         if download is None:
             download = getattr(load_config, "download_kwargs", None)
@@ -347,8 +345,7 @@ def _load_adapter_source(original, args, kwargs):
 
 def _wrap_load_adapter(original):
     """transformers 5.x PeftAdapterMixin.load_adapter injects the adapter, then loads its tensors with
-    _load_pretrained_model (not PEFT's set_peft_model_state_dict): convert the factors on that path too. Afterwards
-    the legacy lora_B marker repack runs, as PeftModel.load_adapter does (hotswap=True included)."""
+    _load_pretrained_model (not PEFT's set_peft_model_state_dict): convert the factors on that path too, then repack legacy lora_B."""
     def load_adapter(self, peft_model_id = None, adapter_name = None, *args, **kwargs):
         name = adapter_name or "default"
         cls_load = type(self)._load_pretrained_model
@@ -384,7 +381,7 @@ def _wrap_load_adapter(original):
 
 
 def _wrap_hotswap_adapter(original):
-    """PEFT's hotswap_adapter reads the file itself, so the legacy lora_B marker repack runs after it too."""
+    """PEFT's hotswap_adapter reads the file itself, so repack legacy lora_B after it."""
     def hotswap_adapter(model, model_name_or_path, adapter_name, *args, **kwargs):
         result = original(model, model_name_or_path, adapter_name, *args, **kwargs)
         _repack_legacy_lora_B(model, model_name_or_path, adapter_name, kwargs)
