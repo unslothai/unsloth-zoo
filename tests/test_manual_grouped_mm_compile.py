@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The per-group grouped GEMM fallback (CPU, devices or torch builds without torch._grouped_mm) inside a compiled
-frame. With no gradient through it: one opaque op, no graph break, outputs and autocast dtypes as eager. With a gradient:
-the guarded eager path, so a checkpoint replay that routes differently still raises."""
+"""Per-group grouped GEMM fallback under torch.compile: no-grad is one opaque op, grad keeps the guarded eager path."""
 
 import pytest
 import torch
@@ -38,7 +36,7 @@ def _case(dtype, transposed, w_dtype = None):
         w = torch.randn(4, 8, 16, generator = g).to(w_dtype).transpose(-2, -1)
     else:
         w = torch.randn(4, 16, 8, generator = g).to(w_dtype)
-    offsets = torch.tensor([3, 3, 9, 13], dtype = torch.int32)  # one empty group
+    offsets = torch.tensor([3, 3, 9, 13], dtype = torch.int32)
     return x, w, offsets
 
 
@@ -64,7 +62,6 @@ def test_no_grad_call_compiles_without_graph_break(dtype, transposed, backend):
 
 @needs_op
 def test_frozen_experts_compile_without_graph_break():
-    # Grad mode on, but nothing to backpropagate into (frozen experts, no grad on the hidden states).
     x, w, offsets = _case(torch.bfloat16, True)
     assert _breaks(M._grouped_mm_with_backward_fix, x, w, offsets) == (0, 1)
 
@@ -75,7 +72,6 @@ def test_frozen_experts_compile_without_graph_break():
     [(torch.float32, torch.float32), (torch.float32, torch.bfloat16), (torch.float64, torch.float64)],
 )
 def test_autocast_dtype_matches_eager(x_dtype, w_dtype):
-    # Eager matmuls inside the loop autocast (float64 operands excluded); the opaque op must return what they would.
     x, w, offsets = _case(x_dtype, False, w_dtype = w_dtype)
     with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
         want = M._manual_grouped_mm(x, w, offsets)
@@ -88,8 +84,6 @@ def test_autocast_dtype_matches_eager(x_dtype, w_dtype):
 @needs_op
 @pytest.mark.parametrize("backend", ["eager", "aot_eager"])
 def test_compiled_training_keeps_the_routing_guard_under_checkpoint_replay(backend):
-    # A gradient through the call keeps the guarded eager path: its forward routing is a Python list on ctx, which
-    # non-reentrant checkpoint replay cannot swap (a saved tensor would be swapped, hiding the reroute).
     seen = {"n": 0}
 
     def region(x, w):
@@ -123,7 +117,6 @@ def test_compiled_training_matches_eager():
 
 
 def test_eager_call_is_unchanged():
-    # Outside a compiled frame the compile-disabled autograd Function runs, as before.
     x, w, offsets = _case(torch.float32, False)
     x.requires_grad_()
     out = M._manual_grouped_mm(x, w, offsets)
@@ -134,7 +127,6 @@ def test_eager_call_is_unchanged():
 
 @needs_op
 def test_no_grad_op_skips_the_routing_signature(monkeypatch):
-    # Like the eager no-grad call: nothing reads the checksum, so the op must not pay for it.
     x, w, offsets = _case(torch.float32, False)
     calls = []
     real = M._routing_signature
@@ -148,7 +140,7 @@ def test_no_grad_op_skips_the_routing_signature(monkeypatch):
 
 @needs_op
 def test_autocast_casts_only_the_active_experts():
-    # Eager autocasts one matmul per nonempty group; the compiled graph must not convert the whole stack per call.
+    # Casting the whole expert stack per call would be a regression.
     graphs = []
 
     def backend(gm, example_inputs):
@@ -158,7 +150,7 @@ def test_autocast_casts_only_the_active_experts():
     g = torch.Generator().manual_seed(0)
     x = torch.randn(1, 16, generator = g)
     w = torch.randn(8, 16, 8, generator = g)
-    offsets = torch.tensor([0, 0, 1, 1, 1, 1, 1, 1], dtype = torch.int32)  # one token, one active expert
+    offsets = torch.tensor([0, 0, 1, 1, 1, 1, 1, 1], dtype = torch.int32)
     torch._dynamo.reset()
     with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
         got = torch.compile(M._manual_grouped_mm, backend = backend, fullgraph = True)(x, w, offsets)
@@ -172,7 +164,6 @@ def test_autocast_casts_only_the_active_experts():
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
 def test_empty_batch_under_autocast_matches_eager(backend, dynamic):
-    # No matmul runs for zero rows, so eager keeps the input dtype; ops after it must see the same dtype compiled.
     w = torch.randn(4, 16, 8)
 
     def f(x, offsets):

@@ -302,9 +302,7 @@ def test_backward_survives_a_reduced_precision_grad_output(unsupported):
 
 
 def test_it_is_marked_as_not_compilable():
-    """A data-dependent group loop cannot be traced, so its eager call is marked not compilable (tensorized rewrites
-    cost more than they save); compiled frames reach the same loop as an opaque op instead, see
-    test_manual_grouped_mm_compile.py."""
+    """The eager loop is compile-disabled; compiled frames use the opaque op (test_manual_grouped_mm_compile.py)."""
     eager = M._manual_grouped_mm_eager
     assert getattr(eager, "_torchdynamo_disable", False) or \
         "disable" in type(eager).__name__.lower() or \

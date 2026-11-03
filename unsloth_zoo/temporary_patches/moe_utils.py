@@ -859,8 +859,7 @@ def _manual_grouped_mm_dtype(inputs, weight, autocast_dtype):
 
 
 def _register_manual_grouped_mm_op():
-    """The per-group loop as an opaque custom op, so a compiled frame that needs no gradient through it (inference,
-    frozen experts) traces with no graph break. Registered once per process; None without torch.library.custom_op."""
+    """Per-group loop as an opaque custom op so no-grad compiled frames do not graph break; None if unsupported."""
     if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
         return None
     try:
@@ -878,16 +877,15 @@ def _register_manual_grouped_mm_op():
         def manual_grouped_mm(
             inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor, autocast_dtype: Optional[torch.dtype],
         ) -> torch.Tensor:
-            # The caller's autocast re-entered here, so each nonempty group's matmul casts as in eager (float64 kept).
             ctx = (
                 torch.autocast(inputs.device.type, dtype = autocast_dtype)
                 if autocast_dtype is not None else contextlib.nullcontext()
             )
-            with torch.no_grad(), ctx:  # no backward reads a routing signature here, as the eager no-grad call
+            with torch.no_grad(), ctx:
                 out = _grouped_matmul_loop(inputs, weight, offsets)
                 if out.shape[0] != inputs.shape[0]:  # rows past the last group: zero, as torch._grouped_mm
                     out = torch.cat((out, out.new_zeros((inputs.shape[0] - out.shape[0], out.shape[1]))))
-            # With no nonempty group no matmul ran, so the loop kept the input dtype; return the dtype the fake promises.
+            # All-empty groups run no matmul; match the fake's dtype.
             return out.to(_manual_grouped_mm_dtype(inputs, weight, autocast_dtype))
 
         @manual_grouped_mm.register_fake
@@ -913,16 +911,14 @@ def _autocast_dtype(device_type):
 
 
 def _manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-    """Eager, or any call that backpropagates through it: the compile-disabled loop above. Its routing check keeps the
-    forward's routing as a Python list on ctx, which non-reentrant checkpoint replay cannot swap; a compiled op could only
-    save it as a tensor, which replay does swap. A compiled call with no gradient through it: the same loop as one opaque
-    op that re-enters the caller's autocast, so only nonempty groups cast, as in eager."""
+    """Compiled no-grad calls use the opaque op; others use the eager loop, whose ctx-held routing list (not a tensor)
+    survives non-reentrant checkpoint replay, so rerouting still raises."""
     if (
         _MANUAL_GROUPED_MM_OP is not None
         and torch.compiler.is_compiling()
         and not (torch.is_grad_enabled() and (inputs.requires_grad or weight.requires_grad))
     ):
-        if inputs.shape[0] == 0:  # no matmul runs in eager either: empty, in the input dtype
+        if inputs.shape[0] == 0:  # eager keeps the input dtype
             return inputs.new_empty((0, weight.shape[-1]))
         return _MANUAL_GROUPED_MM_OP(inputs, weight, offsets, _autocast_dtype(inputs.device.type))
     return _manual_grouped_mm_eager(inputs, weight, offsets)
