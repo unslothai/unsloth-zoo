@@ -2955,6 +2955,11 @@ def save_d1_model(pipeline, folder, source = None, temperatures = None):
         # config.json makes a folder a d1: it is replaced last, so an interrupted save does not read as complete.
         (folder / "config.json").unlink(missing_ok = True)
         (folder / "calibration.json").unlink(missing_ok = True)
+        # An earlier save's weights in another layout, or another kind of save, would be read beside these.
+        staged = {item.name for item in staging.iterdir()}
+        for item in [*folder.glob("model*.safetensors"), *(folder / name for name in ("model.safetensors.index.json", "joint_head.safetensors", "joint_head_config.json", "adapter_config.json", "adapter_model.safetensors"))]:
+            if item.name not in staged:
+                item.unlink(missing_ok = True)
         for item in sorted(staging.iterdir(), key = lambda item: item.name == "config.json"):
             os.replace(item, folder / item.name)
     finally:

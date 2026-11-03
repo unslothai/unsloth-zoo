@@ -835,8 +835,12 @@ def test_a_saved_d1_is_read_as_one_and_keeps_no_stale_calibration(tmp_path, monk
     monkeypatch.setattr(decision, "_write_merged_shards", lambda decoder, src, staging: (staging / "model.safetensors").write_bytes(b"merged"))
     pipeline = types.SimpleNamespace(model = None, source = source)
     out.mkdir()
-    (out / "calibration.json").write_text("{}")
+    # An earlier save, sharded and as a Clef, over which this one is written.
+    for name in ("calibration.json", "model-00001-of-00002.safetensors", "model.safetensors.index.json", "joint_head.safetensors", "joint_head_config.json"):
+        (out / name).write_text("{}")
     decision.save_d1_model(pipeline, out)
+    assert sorted(item.name for item in out.glob("*.safetensors")) == ["model.safetensors"]
+    assert not (out / "model.safetensors.index.json").exists() and not (out / "joint_head_config.json").exists()
     assert decision.detect_family(out) == "d1"
     config = json.loads((out / "config.json").read_text())
     assert config["model_type"] == "lfm3_omni" and config["d1_attention"] == "set" and config["tie_word_embeddings"] is True
