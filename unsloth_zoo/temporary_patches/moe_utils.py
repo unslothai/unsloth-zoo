@@ -867,9 +867,8 @@ def _register_manual_grouped_mm_op():
     try:
         @torch.library.custom_op("unsloth_zoo::manual_grouped_mm", mutates_args = (), **tags)
         def manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-            with torch.no_grad():
-                routing = _routing_signature(inputs, offsets)
-                out = _grouped_matmul_loop(inputs, weight, offsets, routing[:-_SIGNATURE_WIDTH])
+            with torch.no_grad():  # no backward reads a routing signature here, as the eager no-grad call
+                out = _grouped_matmul_loop(inputs, weight, offsets)
                 if out.shape[0] != inputs.shape[0]:  # rows past the last group: zero, as torch._grouped_mm
                     out = torch.cat((out, out.new_zeros((inputs.shape[0] - out.shape[0], out.shape[1]))))
             return out

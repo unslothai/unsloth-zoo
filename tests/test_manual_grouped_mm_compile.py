@@ -126,3 +126,17 @@ def test_eager_call_is_unchanged():
     assert type(out.grad_fn).__name__.startswith("_ManualGroupedMM")
     with torch.no_grad():
         assert torch.equal(M._manual_grouped_mm(x, w, offsets), M._grouped_matmul_loop(x, w, offsets))
+
+
+@needs_op
+def test_no_grad_op_skips_the_routing_signature(monkeypatch):
+    # Like the eager no-grad call: nothing reads the checksum, so the op must not pay for it.
+    x, w, offsets = _case(torch.float32, False)
+    calls = []
+    real = M._routing_signature
+    monkeypatch.setattr(M, "_routing_signature", lambda *a: calls.append(1) or real(*a))
+    with torch.no_grad():
+        torch._dynamo.reset()
+        got = torch.compile(M._manual_grouped_mm, backend = "aot_eager", fullgraph = True)(x, w, offsets)
+        assert torch.equal(got, M._grouped_matmul_loop(x, w, offsets))
+    assert not calls
