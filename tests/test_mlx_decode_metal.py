@@ -1526,6 +1526,47 @@ def test_ple_reads_skip_resident_tables_drifted_bodies_and_restore(tmp_path, mon
 _needs_qwen4 = pytest.mark.skipif(qwen4 is None, reason = "mlx-vlm without qwen4_exp")
 
 
+def _engram_table(path, rows = 900):
+    engram = pytest.importorskip("mlx_vlm.models.deepseek_v41.engram")
+    source = engram.QuantizedEngramEmbedding(rows, 64, group_size = 32, bits = 4)
+    rng = np.random.default_rng(1)
+    prefix = "language_model.model.layers.1.engram.embed"
+    with mx.stream(mx.cpu):
+        weights = {f"{prefix}.weight": mx.array(rng.integers(0, 1 << 32, (rows, 8), dtype = np.uint32))}
+        for name in ("scales", "biases"):
+            weights[f"{prefix}.{name}"] = mx.array(rng.standard_normal((rows, 2), np.float32)).astype(mx.bfloat16)
+        mx.save_safetensors(str(path / "model.safetensors"), weights)
+    table = engram.OffloadedEngramEmbedding(path, prefix, source)
+    return table, SimpleNamespace(named_modules = lambda: [("engram", SimpleNamespace(embed = table))])
+
+
+def test_engram_reads_read_cold_rows_in_once_a_lookup_and_gather_stock_bytes(tmp_path, monkeypatch):
+    table, model = _engram_table(tmp_path)
+    stock = type(table)
+    ids = np.array([[[7, 400, 7], [899, 3, 400]], [[3, 3, 11], [12, 7, 650]]])  # repeats, as n-gram hashes give
+    expected = table._read_rows(ids)
+    read = _recorded_reads(monkeypatch)
+    monkeypatch.setattr(decode, "_ple_resident", lambda parts: 0.0)
+    with decode.exact_ple_row_reads(model):
+        assert type(table) is not stock
+        got = table._read_rows(ids)
+        # Each distinct row read in once per tensor, before the gather maps it.
+        assert sorted(read) == sorted(memmap[row].tobytes() for memmap in table._arrays.values() for row in np.unique(ids))
+        del read[:]
+        again = table._read_rows(ids[:, :1])  # read in again unless the probe finds the rows in core
+        assert len(read) == 3 * np.unique(ids[:, :1]).size
+        del read[:]
+        monkeypatch.setattr(decode, "_ple_resident", lambda parts: 1.0)
+        cached = table._read_rows(ids)
+        assert read == []
+    assert type(table) is stock
+    raw = lambda a: np.array(a.view(mx.uint16) if a.dtype == mx.bfloat16 else a)
+    for name in expected:
+        assert got[name].dtype == again[name].dtype == expected[name].dtype
+        for result in (got, cached):
+            np.testing.assert_array_equal(raw(result[name]), raw(expected[name]))
+        np.testing.assert_array_equal(raw(again[name]), raw(expected[name])[:, :1])
+
 def _qwen4_hc(combine = True, streams = 4, lowrank = 32, dtype = mx.bfloat16):
     config = SimpleNamespace(hidden_size = 1280, hc_count = streams, hc_lowrank = lowrank, rms_norm_eps = 1e-6)
     module = qwen4.Qwen4ExpGatedResidual(config, use_combine = combine)
