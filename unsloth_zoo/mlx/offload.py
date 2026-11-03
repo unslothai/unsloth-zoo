@@ -660,10 +660,44 @@ def _deepseek_v4_step_mask(layer, arguments):
     return lambda h: create_attention_mask(h[:, :, 0, :], local, window_size = window, return_array = True)
 
 
+class _DeepseekV41Steps:
+    """DeepSeek V4.1's blocks share one cache, which only the model advances, and each hands the next its step's top-k
+    and pools there: each step sets the offset and replays what the previous block left at that step."""
+
+    @staticmethod
+    def steps(cache):
+        # A batch cache's offset is its rows'; its calls run whole, as before these blocks stepped.
+        return type(cache).__name__ == "DeepseekV41Cache"
+
+    def __init__(self, layer, cache):
+        self.cache, self.offset, self.last = cache, cache.offset, layer.layer_idx == cache.n_layers - 1
+        if layer.layer_idx == 0:
+            cache.unsloth_wide_steps = {}
+        self.steps = cache.unsloth_wide_steps
+
+    def begin(self, start):
+        self.cache.offset = self.offset + start
+        for name, value in self.steps.get(start, {}).items():
+            setattr(self.cache, name, value)
+
+    def end(self, start):
+        self.steps[start] = {name: getattr(self.cache, name) for name in self.cache.HANDOFF}
+        return self.steps[start]
+
+    def finish(self):
+        self.cache.offset = self.offset
+        if self.last:
+            del self.cache.unsloth_wide_steps
+
+
 # Layers with calls wider than a prefill step may run as consecutive steps on their own cache; token axes of
 # token-indexed arguments; either its causal masks or a function (layer, arguments) giving the mask of each step from
-# hidden states (None if not causal); array if a cache asks for arrays.
+# hidden states (None if not causal); array if a cache asks for arrays; a class stepping state the layers share, if any.
 _WIDE_LAYERS = {
+    "mlx_vlm.models.deepseek_v41.language.DeepseekV41Block": (
+        {"h": 1, "pre_mix": 1, "image_mask": 1}, (None,), _DeepseekV41Steps),
+    "mlx_vlm.models.glm5_next.language.DecoderLayer": ({"x": 1, "prev_topk_indices": 1}, (None,)),
+    "mlx_vlm.models.minimax_m3_vl.language.MiniMaxDecoderLayer": ({"x": 1, "position_ids": -1}, ("causal",)),
     "mlx_vlm.models.qwen4_exp.language.Qwen4ExpDecoderLayer": (
         {"hidden_states": 1, "input_ids": 1, "position_ids": -1}, (None, "causal")),
     "mlx_vlm.models.deepseek_v4.language.DeepseekV4Block": ({"h": 1, "input_ids": 1}, _deepseek_v4_step_mask),
@@ -1182,12 +1216,13 @@ class _WideLayer:
             built = _cache_mask(cache, hidden.shape[1]) if hasattr(cache, "make_mask") else mask
             step_mask = None
             causal = (mask is None or isinstance(mask, str)) and mask in masks and not isinstance(built, mx.array) and mask == built
-        if cache is None or not causal:
+        if cache is None or not causal or self._wide_steps is not None and not self._wide_steps.steps(cache):
             return self._whole(hidden, args, kwargs)
         switch = self._offload_switch
         table = switch is not None and switch._wide(read_next = True)
         given = {name: bound.arguments.get(name) for name in axes}
         capture = getattr(_prefill_capture, "request", None)
+        shared = self._wide_steps(self, cache) if self._wide_steps is not None else None
         outputs = []
         try:
             for start in range(0, hidden.shape[1], _PREFILL_STEP):
@@ -1196,14 +1231,20 @@ class _WideLayer:
                         bound.arguments[name] = _token_slice(given[name], axis, start, start + _PREFILL_STEP)
                 if step_mask is not None:
                     bound.arguments["mask"] = step_mask(bound.arguments[first])
+                if shared is not None:
+                    shared.begin(start)
                 output = super().__call__(*bound.args[1:], **bound.kwargs)
-                mx.eval(output, cache.state)
+                mx.eval(output, cache.state, shared.end(start) if shared is not None else ())
                 outputs.append(output)
                 if capture is not None and min(start + _PREFILL_STEP, hidden.shape[1]) == capture[0]:
                     capture[2][id(cache)] = capture[1](cache)
         finally:
+            if shared is not None:
+                shared.finish()
             if table:
                 switch._narrow()
+        if isinstance(outputs[0], tuple):  # the token-indexed outputs a layer hands the next
+            return tuple(None if parts[0] is None else mx.concatenate(parts, axis = axes[first]) for parts in zip(*outputs))
         return mx.concatenate(outputs, axis = axes[first])
 
     def _whole(self, hidden, args, kwargs):
@@ -1223,13 +1264,14 @@ _prefill_capture = threading.local()
 
 def wide_prefill_step(model):
     """The step every wide single-row prefill call of model runs in, as a prefill chunked at it; None when a layer may
-    run a call whole (unregistered layer, DeepSeek V4 image rows)."""
+    run a call whole (unregistered layer, DeepSeek V4 image rows) or when one layer's boundary is not a copyable cache
+    (DeepSeek V4.1's shared one)."""
     modules = dict(model.named_modules())
     switches = [module for module in modules.values() if isinstance(module, OffloadSwitchGLU)]
     wide = {path for path, layer in modules.items() if isinstance(layer, _WideLayer)}
     stacks = {path.rpartition(".")[0] for path in wide}
     stacked = {path for path in modules if path.rpartition(".")[0] in stacks and path.rpartition(".")[2].isdigit()}
-    held = {id(modules[path]._offload_switch) for path in wide if not callable(modules[path]._wide_masks)}
+    held = {id(modules[path]._offload_switch) for path in wide if not callable(modules[path]._wide_masks) and modules[path]._wide_steps is None}
     if not switches or stacked - wide or any(id(switch) not in held for switch in switches):
         return None
     return _PREFILL_STEP
@@ -1262,6 +1304,7 @@ def _widen_layers(model, switches):
         if base not in _WIDE_CLASSES:
             _WIDE_CLASSES[base] = type(base.__name__, (_WideLayer, base), {
                 "_wide_axes": spec[0], "_wide_masks": staticmethod(spec[1]) if callable(spec[1]) else spec[1], "_wide_signature": inspect.signature(base.__call__),
+                "_wide_steps": spec[2] if len(spec) > 2 else None,
             })
         layer.__class__ = _WIDE_CLASSES[base]
         object.__setattr__(layer, "_offload_switch", held[0] if held else None)
