@@ -1075,6 +1075,28 @@ def _quantstate_absmax_fp32(qs):
     return qs.absmax.float()
 
 
+def _cast_dense_experts_to_param_dtype(out, model, full_layer_name):
+    """Cast an unquantized expert fallback to the destination param dtype: `hf_quantizer` on the twins makes
+    transformers skip the model-dtype cast (`get_new_dtype` returns None) and `set_param_for_module` never recasts."""
+    if model is None or not full_layer_name:
+        return out
+    module_path, _, param_name = full_layer_name.rpartition(".")
+    try:
+        module = model.get_submodule(module_path) if module_path else model
+    except AttributeError:
+        return out
+    slot = getattr(module, param_name, None)
+    dtype = getattr(slot, "dtype", None)
+    if not isinstance(slot, torch.Tensor) or not dtype.is_floating_point:
+        return out
+    return {
+        key: value.to(dtype)
+        if isinstance(value, torch.Tensor) and value.is_floating_point() and value.dtype != dtype
+        else value
+        for key, value in out.items()
+    }
+
+
 def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     """Quantized twins of the model's per-expert MoE merge converters.
 
@@ -1125,7 +1147,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                         config=config,
                         missing_keys=missing_keys,
                     )
-                return out
+                return _cast_dense_experts_to_param_dtype(out, model, full_layer_name)
 
             input_dict = dict(input_dict)  # avoid mutating the caller's dict
             for key, value in list(input_dict.items()):
@@ -1277,7 +1299,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                         config=config,
                         missing_keys=missing_keys,
                     )
-                return out
+                return _cast_dense_experts_to_param_dtype(out, model, full_layer_name)
 
             input_dict = dict(input_dict)  # avoid mutating the caller's dict
             for key, value in list(input_dict.items()):
@@ -1561,7 +1583,10 @@ def _bnb4bit_split_fused_expert_conversions(hf_quantizer = None):
                         f"Unsloth: {full_layer_name} expects parts of {part_shape}, "
                         f"got {[tuple(p.shape) for p in parts]}"
                     )
-                return {target_patterns[0]: torch.cat([p.reshape(part_shape) for p in parts], dim = -1)}
+                fused = torch.cat([p.reshape(part_shape) for p in parts], dim = -1)
+                if slot.is_floating_point() and fused.is_floating_point():
+                    fused = fused.to(slot.dtype)  # loader cast skipped, see _cast_dense_experts_to_param_dtype
+                return {target_patterns[0]: fused}
 
             states = [_quant_state(input_dict, b, device) for b in self.bases]
             for base, qs in zip(self.bases, states):
