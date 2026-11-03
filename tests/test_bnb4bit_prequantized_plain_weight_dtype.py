@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Unquantized weights of a prequantized bnb-4bit checkpoint must load in the requested dtype.
-
-transformers >= 5.21 registers `Bnb4bitDeserialize` for every `weight` key. An unquantized weight (embeddings,
-lm_head, norms, skipped Linears) reaches it alone and is passed through, and the op's `hf_quantizer` makes
-`HfQuantizer.get_new_dtype` return None, so the weight keeps its checkpoint dtype. transformers 5.17 cast it to
-the requested dtype (or to float32 for `_keep_in_fp32_modules`). A real `from_pretrained` runs on CPU on a tiny
-hand-built prequantized Llama checkpoint."""
+"""Unquantized weights of a prequantized bnb-4bit checkpoint must load in the requested dtype (transformers >= 5.21)."""
 
 from __future__ import annotations
 
@@ -51,7 +45,6 @@ ATTN = ("q_proj", "k_proj", "v_proj", "o_proj")
 @pytest.fixture(scope = "module", autouse = True)
 def _patched():
     mb.patch_bnb4bit_quantizer_weight_conversions()
-    # getattr so the test runs (and fails) on a tree without the fix.
     getattr(mb, "patch_bnb4bit_prequantized_plain_weight_dtype", lambda: None)()
 
 
@@ -146,8 +139,7 @@ def test_keep_in_fp32_modules_stay_float32(tmp_path, ckpt):
 
 
 def test_unquantized_fused_expert_passthrough_loads_in_slot_dtype():
-    """gpt-oss style fused experts with no model converter go through `_ExpertDeserialize`, which passes a
-    lone dense tensor through like `Bnb4bitDeserialize`."""
+    """Fused experts with no model converter pass through `_ExpertDeserialize`."""
 
     class _Model(torch.nn.Module):
         base_model_prefix = ""

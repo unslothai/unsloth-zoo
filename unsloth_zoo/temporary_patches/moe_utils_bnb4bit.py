@@ -1709,13 +1709,11 @@ def patch_bnb4bit_model_conversion_mapping():
 pass
 
 
-# Set by the patched `get_new_dtype` on each Bnb4bitDeserialize of a converter: the dtype the loader picked for
-# the target param (request, `_keep_in_fp32_modules` plan, or the empty param's dtype) before discarding it.
+# Dtype the loader planned for the param, recorded by the patched `get_new_dtype` before it returns None.
 _PLAIN_DTYPE_ATTR = "_unsloth_unquantized_dtype"
 
 
 def _cast_unquantized_passthrough(op, input_dict):
-    """Cast the lone (unquantized) tensor a bnb deserializer passes through to the loader's planned dtype."""
     dtype = getattr(op, _PLAIN_DTYPE_ATTR, None)
     if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
         return input_dict
@@ -1732,13 +1730,9 @@ def _cast_unquantized_passthrough(op, input_dict):
 
 
 def patch_bnb4bit_prequantized_plain_weight_dtype():
-    """Load the unquantized weights of a prequantized bnb 4-bit checkpoint in the requested dtype.
+    """transformers >= 5.21: unquantized weights of a prequantized bnb 4-bit checkpoint load in the requested dtype.
 
-    transformers >= 5.21 registers Bnb4bitDeserialize for every `weight` key, so an unquantized weight
-    (embeddings, lm_head, norms, skipped Linears) reaches it alone and is passed through, while the op's
-    `hf_quantizer` makes `HfQuantizer.get_new_dtype` return None: the weight keeps its checkpoint dtype.
-    5.17 cast it like any plain param. get_new_dtype cannot tell the plain weight from its fp32 quant stats,
-    so keep its None (no cast at materialization) and record the dtype it discarded; the passthrough casts.
+    get_new_dtype cannot tell the plain weight from its fp32 quant stats, so keep its None; the passthrough casts.
     """
     try:
         from transformers.integrations.bitsandbytes import Bnb4bitDeserialize
