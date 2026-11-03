@@ -36,6 +36,8 @@ from .utils import (
     _flex_attention as uncompiled_flex_attention,
     flex_attention,
     PREFILL_KERNEL_OPTIONS,
+    decode_kernel_options,
+    decode_kernel_kwargs,
     FlexAttentionCache,
     FLEX_LSE_KWARGS,
     flex_output_and_lse,
@@ -279,6 +281,7 @@ def flex_attention_with_sink_decoding(
         score_mod = None, # None needed
         enable_gqa = enable_gqa,
         scale = scale,
+        **decode_kernel_kwargs(),
         **FLEX_LSE_KWARGS, # log(sum(exp(xi)))
     ))
     return attn_output, logsumexp
@@ -296,7 +299,7 @@ def flex_attention_with_sink_inference(self_attn, query, key, value, block_mask,
     elif key.shape[-2] < kv_len:
         block_mask = block_mask._adjust(q_len, key.shape[-2])
     # Longer queries can have no valid flex_decoding config (#2100), so they force the main kernel.
-    kwargs = {"kernel_options": {} if query.shape[-2] == 1 else PREFILL_KERNEL_OPTIONS}
+    kwargs = {"kernel_options": decode_kernel_options() if query.shape[-2] == 1 else PREFILL_KERNEL_OPTIONS}
     if query.shape[-2] == 1:
         # Inductor picks flex_decoding only for a static batch: a second batch size makes the batch dim dynamic and pads
         # 1-row queries to BLOCK_M; mark dim 0 static, eager or traced; one recompile per batch size, never per step.

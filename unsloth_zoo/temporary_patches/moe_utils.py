@@ -3759,6 +3759,37 @@ def _preserved_rng_for_probe(x):
                 pass
 
 
+@contextlib.contextmanager
+def _parametrize_cache_untouched():
+    """Drop what the probe adds to torch's parametrization cache.
+
+    An outer wrapper handed to PEFT runs the inner wrapper inside `parametrize.cached()`; the inner wrapper's
+    no_grad probe then read the folded weight first, so the cache kept a tensor without autograd history and the
+    counted forward reused it: right values, None grads for the outer adapter."""
+    try:
+        from torch.nn.utils import parametrize
+        cache = parametrize._cache
+        before = set(cache.keys())
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        for key in [key for key in cache.keys() if key not in before]:
+            cache.pop(key, None)
+
+
+def _mark_inner_expert_wrappers(wrapper):
+    """Every ParamWrapper below `wrapper` sees only part of the adapter chain, so it must never take the routed
+    gpt-oss decode path (_gpt_oss_routed_wrapper_forward)."""
+    inner = getattr(wrapper, "base_layer", None)
+    while inner is not None and hasattr(inner, "base_layer"):
+        if not inner.__dict__.get("_unsloth_inner_expert_wrapper", False):
+            inner._unsloth_inner_expert_wrapper = True
+        inner = inner.base_layer
+
+
 # Disabled, not just `is_compiling()`-guarded: fullgraph=False compiles this frame alone, so the guard never cached a verdict.
 @torch.compiler.disable
 def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, args, kwargs) -> bool:
@@ -3777,8 +3808,12 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
     if lora_data is not None:
         setattr(experts_module, lora_attr, lora_data)
     _reset_moe_lora_stash_read(experts_module, parameter_name)
+    # The probe calls the inner wrapper under no_grad, the one state in which an unmarked inner wrapper takes the
+    # routed gpt-oss decode path (sm80+ CUDA): the experts forward would not run and the verdict would read
+    # "stash unread" for a forward that reads it.
+    _mark_inner_expert_wrappers(wrapper)
     try:
-        with _preserved_rng_for_probe(x):
+        with _preserved_rng_for_probe(x), _parametrize_cache_untouched():
             with torch.no_grad():
                 wrapper.base_layer(x, *args, **kwargs)
     except Exception:
@@ -4839,7 +4874,11 @@ def patch_param_wrapper_for_moe():
         from peft.tuners.lora.layer import ParamWrapper
 
         if _original_param_wrapper_forward is None:
-            _original_param_wrapper_forward = ParamWrapper.forward
+            # Another moe_utils copy (the package, or a cache copy from an earlier UNSLOTH_COMPILE_LOCATION) may have
+            # patched it already: keep PEFT's own forward, or the separated-LoRA forward runs once per copy.
+            current = ParamWrapper.forward
+            _original_param_wrapper_forward = getattr(current, "_unsloth_moe_peft_forward", current)
+        _patched_param_wrapper_forward._unsloth_moe_peft_forward = _original_param_wrapper_forward
 
         ParamWrapper.forward = _patched_param_wrapper_forward
 

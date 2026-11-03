@@ -1878,6 +1878,42 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
             pass
 
 
+def test_target_head_precision_scope_preserves_shared_heads_training_and_ownership(monkeypatch):
+    from mlx_simulation import mlx_is_simulated
+
+    if mlx_is_simulated():
+        pytest.skip("needs real mlx.nn.Module: dict-backed children and the training flag")
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference
+
+    class Head(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bits, self.group_size, self.mode = 4, 64, "affine"
+            self._unsloth_lane_qmm = True
+
+    target, drafter, head = nn.Module(), nn.Module(), Head()
+    target.lm_head = drafter.lm_head = head
+    monkeypatch.setattr(inference, "_resolved_bindings", lambda contract: ())
+    with inference.target_head_precision(target):
+        assert target.lm_head is head and head.training
+    head.eval()
+    first, second = inference.target_head_precision(target), inference.target_head_precision(target)
+    first.__enter__()
+    replacement = target.lm_head
+    second.__enter__()
+    first.__exit__(None, None, None)
+    assert target.lm_head is replacement and replacement.base_head is drafter.lm_head is head
+    assert not replacement.training and not head.training
+    assert tuple(replacement.children()) == ("base_head",)
+    second.__exit__(None, None, None)
+    assert target.lm_head is drafter.lm_head is head
+    foreign = Head()
+    with inference.target_head_precision(target):
+        target.lm_head = foreign
+    assert target.lm_head is foreign and foreign.training
+
+
 def test_every_inference_scope_is_registered_and_every_generation_path_enters_the_registry(monkeypatch):
     # A scope missing from the registry silently leaves every path native.
     import ast
@@ -1990,7 +2026,7 @@ def test_warm_inference_generates_greedily_under_the_prefill_decisions(int8_pref
     warm_inference(types.SimpleNamespace(generate = lambda prompt, **kwargs: calls.append((prompt.tolist(), kwargs))),
                    int8_prefill = int8_prefill, ane_prefill = ane_prefill)
     assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill,
-                                              "ane_prefill": ane_prefill})]
+                                              "ane_prefill": ane_prefill, "fast_verify": None})]
 
 
 def test_cache_layout_tells_quantized_packings_apart():
@@ -2091,3 +2127,37 @@ def test_the_videos_probe_reads_the_installed_mlx_vlm():
     generate._vlm_prepares_videos.cache_clear()
     takes = "videos" in inspect.signature(utils.prepare_inputs).parameters
     assert generate._vlm_prepares_videos() is takes
+
+
+def test_target_head_runs_more_rows_than_one_lane_launch_in_fp32_launches(monkeypatch):
+    from mlx_simulation import mlx_is_simulated
+
+    if mlx_is_simulated():
+        pytest.skip("needs real mlx.nn.QuantizedLinear")
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+
+    head = nn.QuantizedLinear(64, 16, bias = False, group_size = 64, bits = 4)
+    head.eval().set_dtype(mx.bfloat16)
+    head._unsloth_lane_qmm = True
+    launches = []
+
+    def lane_qmm(x, w, scales, biases, group_size, bits, output_dtype = None):
+        launches.append(x.shape[0])
+        return mx.zeros((x.shape[0], w.shape[0]), dtype = output_dtype)
+
+    monkeypatch.setattr(matmul, "lane_qmm", lane_qmm)
+    monkeypatch.setattr(inference, "_bindings_intact", lambda bindings: True)
+    w, scales, biases = head["weight"], head["scales"], head["biases"]
+    signature = (mx.bfloat16, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape, 64, 4, head.mode)
+    # A dict attribute on an mlx Module lands in its state, not __dict__, where the head reads admissions.
+    head.__dict__["_unsloth_lane_qmm_ready"] = {(1, rows, 64): (None, signature) for rows in (32, 8)}
+    fp32 = inference._TargetHeadFP32(head, ())
+    x = mx.ones((2, 20, 64), dtype = mx.bfloat16)
+    y = fp32(x)
+    assert launches == [32, 8] and y.dtype == mx.float32 and y.shape == (2, 20, 16)
+    # A launch shape not yet admitted keeps the whole call on the stock head, never mixed precisions.
+    del head.__dict__["_unsloth_lane_qmm_ready"][(1, 8, 64)]
+    launches.clear()
+    assert fp32(x).dtype == mx.bfloat16 and launches == [32]

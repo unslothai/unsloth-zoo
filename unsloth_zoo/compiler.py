@@ -629,6 +629,7 @@ logger_compiler = logging.getLogger(__name__)
 if UNSLOTH_ENABLE_LOGGING:
     logger_compiler.setLevel(logging.DEBUG)
 
+# Kept for code that reads it; the count itself is UNSLOTH_INFERENCE_RUNS, shared by every generated module.
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
 
@@ -644,6 +645,7 @@ pass
 # The stance is process wide, so whether Unsloth owns it lives in unsloth_zoo, shared by
 # every generated module: inference in one model's module, training in another's.
 from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED, unsloth_claim_eager_stance, unsloth_owns_stance, unsloth_release_stance
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_INFERENCE_RUNS, unsloth_reset_inference_runs
 
 def unsloth_training_stance():
     # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
@@ -652,8 +654,7 @@ def unsloth_training_stance():
     # unless the user chose eager_on_recompile themselves. Every set_stance call installs a
     # fresh stance object, so ours is still active only if the current one `is` it; a user
     # set_stance since then (even to eager_on_recompile again) is theirs and stays.
-    global INFERENCE_RUNS
-    INFERENCE_RUNS = 0
+    UNSLOTH_INFERENCE_RUNS[0] = 0
     if len(UNSLOTH_EAGER_STANCE_OWNED) != 0 and torch_dynamo_eval_frame is not None:
         current = torch_dynamo_eval_frame._stance
         # Ownership is only dropped once ours is reset: a temporary stance scope's exit restores
@@ -1192,7 +1193,7 @@ pass
 # Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
 def higher_precision_softmax(source):
     """
-    Converts all softmax to float32 for eg:
+    Converts all softmax to float32 (a softmax already given dtype=torch.float32 is left alone) for eg:
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
@@ -1217,6 +1218,11 @@ def higher_precision_softmax(source):
         full_match, matches = item.group(0), item.groups()
         softmax, variable, dim, dtype = matches
         if not _is_single_operand(variable):
+            continue
+        # Already float32: the source keeps the probabilities in float32 on purpose (MoE routers such as
+        # Gemma-4's take top-k, renormalise and scale them in float32). Casting back to a 16-bit input dtype
+        # rounds them before top-k, which can flip near-tied expert choices.
+        if dtype is not None and re.fullmatch(r",\s*dtype\s*=\s*torch\.float(32)?\s*", dtype):
             continue
         new = (
             f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
@@ -3438,7 +3444,6 @@ pass
 __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
-    global INFERENCE_RUNS
     # Skipped while tracing (set_stance raises there, and the counter would guard every step)
     # and around a compiled decode step, which eager_on_recompile would otherwise freeze.
     if not torch.compiler.is_compiling() and not UNSLOTH_DECODE_COMPILE[0]:
@@ -3446,7 +3451,7 @@ __DYNAMO__RECOMPILING__ = """
             old_stance = torch_dynamo_eval_frame._stance.stance
         else:
             old_stance = None
-        if old_stance is not None and INFERENCE_RUNS == 1:
+        if old_stance is not None and UNSLOTH_INFERENCE_RUNS[0] == 1:
             # Skip guards and return to eager -> we still need guards!
             # Already eager (another model's inference, or the user's choice): leave that stance
             # object, and so its ownership, as it is. Otherwise switch and claim the new object.
@@ -3463,7 +3468,7 @@ __DYNAMO__RECOMPILING__ = """
                 )
         elif old_stance == "eager_on_recompile":
             pass
-        elif old_stance == "default" and INFERENCE_RUNS > 1:
+        elif old_stance == "default" and UNSLOTH_INFERENCE_RUNS[0] > 1:
             # Reset compiler stance
             torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
             if UNSLOTH_ENABLE_LOGGING:
@@ -3472,8 +3477,8 @@ __DYNAMO__RECOMPILING__ = """
                     f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
                     f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
                 )
-            INFERENCE_RUNS = 0
-        INFERENCE_RUNS += 1
+            UNSLOTH_INFERENCE_RUNS[0] = 0
+        UNSLOTH_INFERENCE_RUNS[0] += 1
 """
 
 # is_compiling() first: Dynamo folds it to True, so traced forwards skip the call.
