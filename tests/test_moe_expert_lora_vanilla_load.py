@@ -492,3 +492,10 @@ def test_load_adapter_source_reads_the_adapter_location_across_signatures():
     assert swap._load_adapter_source(v5, (None, None), {"peft_config": object(), "adapter_state_dict": {}}) == (None, {})
     model_id, hub = swap._load_adapter_source(v4, (None, "dir", "default", "rev"), {})
     assert model_id == "dir" and hub["revision"] == "rev"
+    # An explicit download_kwargs replaces load_config's (transformers 5.x), and adapter_kwargs still win.
+    model_id, hub = swap._load_adapter_source(v5, (None, "org/a"), {
+        "load_config": from_config, "download_kwargs": {"subfolder": "saved", "revision": "branch"},
+        "adapter_kwargs": {"revision": "pinned"},
+    })
+    assert hub["subfolder"] == "saved" and hub["revision"] == "pinned" and "cache_dir" not in hub
+    assert "download_kwargs" not in hub and "load_config" not in hub

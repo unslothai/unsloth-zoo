@@ -332,8 +332,13 @@ def _load_adapter_source(original, args, kwargs):
         load_config = named.get("load_config")
         model_id = (named.get("peft_model_id") or named.get("pretrained_model_name_or_path")
                     or getattr(load_config, "pretrained_model_name_or_path", None))
-        hub_kwargs = dict(getattr(load_config, "download_kwargs", None) or {})
-        hub_kwargs.update({key: value for key, value in named.items() if key != "self" and value is not None})
+        # As transformers resolves it: an explicit download_kwargs replaces load_config's, then adapter_kwargs override.
+        download = named.get("download_kwargs")
+        if download is None:
+            download = getattr(load_config, "download_kwargs", None)
+        hub_kwargs = dict(download or {})
+        nested = ("self", "download_kwargs", "adapter_kwargs", "load_config")
+        hub_kwargs.update({key: value for key, value in named.items() if key not in nested and value is not None})
         hub_kwargs.update(named.get("adapter_kwargs") or {})
         return model_id, hub_kwargs
     except Exception:
