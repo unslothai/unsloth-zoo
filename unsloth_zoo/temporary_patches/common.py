@@ -26,6 +26,7 @@ __all__ = [
     "logger",
     "torch_compile",
     "_torch_compile",
+    "compile_mask_builder",
     "_raw_torch_compile",
     "unwrap_already_compiled",
     "flatten_for_elementwise_norm",
@@ -476,6 +477,20 @@ else:
     _torch_compile = functools.partial(
         _compile_or_fall_back,
     )
+
+
+def compile_mask_builder(function):
+    """`_torch_compile(function, fullgraph = False, dynamic = True)` for the transformers mask builders, falling back to
+    eager when Inductor cannot generate code: Dynamo graph-breaks by itself without fullgraph, but a codegen failure
+    still raises at the first call (torch 2.10 CPU emits C++ for the packed-sequence causal mask that does not build).
+    Only here, not in every non-fullgraph region: the wrapper costs about 5 us a call, once per forward for a mask."""
+    compiled = _torch_compile(function, fullgraph = False, dynamic = True)
+    if compiled is function:
+        return function
+    from .utils import _fall_back_to_eager_on_recompile_limit
+    label = getattr(function, "__qualname__", None) or repr(function)
+    return _fall_back_to_eager_on_recompile_limit(compiled, function, label)
+
 
 def flatten_for_elementwise_norm(hidden_states):
     """``(..., H)`` -> ``((N, H), original_shape)``.

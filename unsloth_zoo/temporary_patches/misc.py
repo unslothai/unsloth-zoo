@@ -29,7 +29,7 @@ try:
 except (ImportError, ValueError):
     import logging
     logger = logging.getLogger("unsloth_zoo.log")
-from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile
+from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile, compile_mask_builder
 from .utils import (
     patch_function,
     process_output_options,
@@ -1022,12 +1022,8 @@ def patch_transformers_masks():
         compiled_create_causal_mask = original_create_causal_mask
         compiled_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
     else:
-        compiled_create_causal_mask = _torch_compile(
-            original_create_causal_mask, fullgraph = False, dynamic = True
-        )
-        compiled_create_sliding_window_causal_mask = _torch_compile(
-            original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
-        )
+        compiled_create_causal_mask = compile_mask_builder(original_create_causal_mask)
+        compiled_create_sliding_window_causal_mask = compile_mask_builder(original_create_sliding_window_causal_mask)
 
     def wrap(f, original, prepared_mask_shortcut = True, maskless_causal = False):
         # `input_embeds` <= 5.1 vs `inputs_embeds` 5.2+ (transformers#43916); `cache_position` gone in 5.9 (#45884): read the signature, not the version.
