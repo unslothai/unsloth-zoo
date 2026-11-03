@@ -144,3 +144,25 @@ def test_no_grad_op_skips_the_routing_signature(monkeypatch):
         got = torch.compile(M._manual_grouped_mm, backend = "aot_eager", fullgraph = True)(x, w, offsets)
         assert torch.equal(got, M._grouped_matmul_loop(x, w, offsets))
     assert not calls
+
+
+@needs_op
+def test_autocast_casts_only_the_active_experts():
+    # Eager autocasts one matmul per nonempty group; the compiled graph must not convert the whole stack per call.
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm.graph)
+        return gm.forward
+
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 16, generator = g)
+    w = torch.randn(8, 16, 8, generator = g)
+    offsets = torch.tensor([0, 0, 1, 1, 1, 1, 1, 1], dtype = torch.int32)  # one token, one active expert
+    torch._dynamo.reset()
+    with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
+        got = torch.compile(M._manual_grouped_mm, backend = backend, fullgraph = True)(x, w, offsets)
+        want = M._manual_grouped_mm(x, w, offsets)
+    assert torch.equal(got, want) and got.dtype == torch.bfloat16
+    casts = [n for graph in graphs for n in graph.nodes if n.op == "call_method" and n.target in ("to", "type")]
+    assert not casts, casts

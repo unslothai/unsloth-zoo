@@ -866,16 +866,26 @@ def _register_manual_grouped_mm_op():
             tags = {"tags": (torch.Tag.cudagraph_unsafe,)}
     try:
         @torch.library.custom_op("unsloth_zoo::manual_grouped_mm", mutates_args = (), **tags)
-        def manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-            with torch.no_grad():  # no backward reads a routing signature here, as the eager no-grad call
+        def manual_grouped_mm(
+            inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor, autocast_dtype: Optional[torch.dtype],
+        ) -> torch.Tensor:
+            # The caller's autocast re-entered here, so each nonempty group's matmul casts as in eager (float64 kept).
+            ctx = (
+                torch.autocast(inputs.device.type, dtype = autocast_dtype)
+                if autocast_dtype is not None else contextlib.nullcontext()
+            )
+            with torch.no_grad(), ctx:  # no backward reads a routing signature here, as the eager no-grad call
                 out = _grouped_matmul_loop(inputs, weight, offsets)
                 if out.shape[0] != inputs.shape[0]:  # rows past the last group: zero, as torch._grouped_mm
                     out = torch.cat((out, out.new_zeros((inputs.shape[0] - out.shape[0], out.shape[1]))))
             return out
 
         @manual_grouped_mm.register_fake
-        def _(inputs, weight, offsets):
-            dtype = torch.promote_types(inputs.dtype, weight.dtype)
+        def _(inputs, weight, offsets, autocast_dtype):
+            def cast(t):
+                return autocast_dtype if autocast_dtype is not None and t.is_floating_point() and \
+                    t.dtype != torch.float64 else t.dtype
+            dtype = torch.promote_types(cast(inputs), cast(weight))
             return inputs.new_empty((inputs.shape[0], weight.shape[-1]), dtype = dtype)
 
         return torch.ops.unsloth_zoo.manual_grouped_mm.default
@@ -899,19 +909,13 @@ def _manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torc
     """Eager, or any call that backpropagates through it: the compile-disabled loop above. Its routing check keeps the
     forward's routing as a Python list on ctx, which non-reentrant checkpoint replay cannot swap; a compiled op could only
     save it as a tensor, which replay does swap. A compiled call with no gradient through it: the same loop as one opaque
-    op, inputs cast to the autocast dtype first as the loop's matmuls would be."""
+    op that re-enters the caller's autocast, so only nonempty groups cast, as in eager."""
     if (
         _MANUAL_GROUPED_MM_OP is not None
         and torch.compiler.is_compiling()
         and not (torch.is_grad_enabled() and (inputs.requires_grad or weight.requires_grad))
     ):
-        dtype = _autocast_dtype(inputs.device.type)
-        if dtype is not None:  # autocast casts floating operands except float64
-            if inputs.is_floating_point() and inputs.dtype != torch.float64:
-                inputs = inputs.to(dtype)
-            if weight.is_floating_point() and weight.dtype != torch.float64:
-                weight = weight.to(dtype)
-        return _MANUAL_GROUPED_MM_OP(inputs, weight, offsets)
+        return _MANUAL_GROUPED_MM_OP(inputs, weight, offsets, _autocast_dtype(inputs.device.type))
     return _manual_grouped_mm_eager(inputs, weight, offsets)
 
 
