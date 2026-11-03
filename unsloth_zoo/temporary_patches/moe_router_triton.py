@@ -37,7 +37,7 @@ import torch
 import torch.nn.functional as F
 
 from .common import TEMPORARY_PATCHES
-from ..triton_specialize import jit_any_alignment as _jit_any_alignment
+from unsloth_zoo.triton_specialize import jit_any_alignment as _jit_any_alignment
 
 try:
     import triton
