@@ -158,9 +158,8 @@ def _pow2(n):
 
 
 def _route_scratch(NB, E, device):
-    """hist, rank_base, starts int32 slices of one buffer. Slice offsets are rounded up to 4 int32 so each stays
-    16-byte aligned: an offset following NB (tokens) changed its pointer alignment class and recompiled four
-    kernels per prefill length."""
+    """hist, rank_base, starts int32 slices of one buffer, offsets rounded up to 4 int32 (16 bytes): an offset
+    following NB (tokens) changed the pointer alignment class and recompiled four kernels per prefill length."""
     size = (NB * (E + 1) + 3) // 4 * 4
     scratch = torch.empty(2 * size + E + 1, dtype = torch.int32, device = device)
     return scratch[:size], scratch[size: 2 * size], scratch[2 * size:]
