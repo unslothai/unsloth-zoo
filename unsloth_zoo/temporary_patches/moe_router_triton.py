@@ -37,6 +37,7 @@ import torch
 import torch.nn.functional as F
 
 from .common import TEMPORARY_PATCHES
+from ..triton_specialize import jit_any_alignment as _jit_any_alignment
 
 try:
     import triton
@@ -58,18 +59,8 @@ def fused_router_enabled():
     return os.environ.get("UNSLOTH_MOE_FUSED_ROUTER", "0") == "1"
 
 
-def _jit_any_alignment(*names):
-    # T is the token count: 1 in bsz 1 decode, anything in prefill. Keep the == 1 specialization, drop the
-    # % 16 one, so a multiple-of-16 prompt does not compile a third binary.
-    def wrap(fn):
-        try:
-            return triton.jit(fn, do_not_specialize_on_alignment = list(names))
-        except TypeError:  # a Triton without do_not_specialize_on_alignment
-            return triton.jit(fn)
-    return wrap
-
-
 if HAS_TRITON:
+    # T: tokens, 1 in bsz 1 decode; == 1 kept, no % 16 binary for multiple-of-16 prompts.
     @_jit_any_alignment("T")
     def _router_fwd_kernel(
         Z, BIAS, W, IDS, T, E, GS, stride_z, scale, mask_value,
@@ -160,6 +151,7 @@ if HAS_TRITON:
         tl.store(W + offs, w, mask = out_ok)
         tl.store(IDS + offs, ids.to(tl.int64), mask = out_ok)
 
+    # T: tokens, 1 in bsz 1 decode; == 1 kept, no % 16 binary for multiple-of-16 prompts.
     @_jit_any_alignment("T")
     def _router_bwd_kernel(
         Z, IDS, DW, DZ, T, E, stride_z, stride_dw, scale,

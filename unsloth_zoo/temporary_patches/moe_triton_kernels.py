@@ -22,6 +22,7 @@ caller keeps its eager path.
 import os
 import logging
 import torch
+from ..triton_specialize import jit_any_alignment as _jit_any_alignment
 
 __all__ = [
     "moe_triton_kernels_available",
@@ -125,7 +126,8 @@ def _kernels():
         # Not offs2 < 2 * n_bytes (int32 wraps for 2**31..2**32 weights) nor offs2 // 2 (~15% slower).
         tl.store(out_ptr + offs2, w, mask = (offs2 - n_bytes) < n_bytes)
 
-    @triton.jit
+    # T / N: tokens / routed slots per call; == 1 kept, no % 16 binary.
+    @_jit_any_alignment("T")
     def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,  # H: hidden size; TOPK: experts per token
                             BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, ROUND_PRODUCT: tl.constexpr):  # BLOCK_T: 8 tokens; BLOCK_H: 512 cols; ROUND_PRODUCT: round w * y to y dtype
         pid_t = tl.program_id(0).to(tl.int64)
@@ -158,7 +160,7 @@ def _kernels():
         tl.store(out_ptr + offs_t[:, None] * H + offs_h[None, :], acc.to(out_ptr.dtype.element_ty),
                  mask = t_mask[:, None] & h_mask[None, :])
 
-    @triton.jit
+    @_jit_any_alignment("N")
     def _combine_bwd_dy_kernel(dout_ptr, sorted_ptr, w_ptr, dy_ptr, N, H: tl.constexpr, TOPK: tl.constexpr,  # H: hidden size; TOPK: experts per token
                                BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):  # BLOCK_T: 16 slots; BLOCK_H: 512 cols
         pid = tl.program_id(0).to(tl.int64)

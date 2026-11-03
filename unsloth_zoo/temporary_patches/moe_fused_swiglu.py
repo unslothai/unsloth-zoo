@@ -38,6 +38,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
+from ..triton_specialize import jit_any_alignment as _jit_any_alignment
 
 try:
     import triton
@@ -224,7 +225,8 @@ if triton is not None:
     def _sigmoid(x):
         return _rcp_rn(1.0 + libdevice.exp(-x))
 
-    @triton.jit
+    # M: rows (tokens x top-k) per call; == 1 kept, no % 16 binary.
+    @_jit_any_alignment("M")
     def _swiglu_fwd_kernel(
         GU, OUT, M, N, s_gm, s_gc, s_om, ALPHA, LIMIT,
         ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # ACT: 1 gpt-oss clamp, else silu; INTERLEAVED: gate / up alternate; ROUND: eager rounding
@@ -247,7 +249,7 @@ if triton is not None:
             y = s * u
         tl.store(OUT + rows[:, None] * s_om + cols[None, :], y.to(DT), mask = mask)
 
-    @triton.jit
+    @_jit_any_alignment("M")
     def _swiglu_bwd_kernel(
         DY, GU, DGU, M, N, s_dm, s_dc, s_gm, s_gc, s_om, ALPHA, LIMIT,
         ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # ACT: 1 gpt-oss clamp, else silu; INTERLEAVED: gate / up alternate; ROUND: eager rounding

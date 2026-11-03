@@ -198,7 +198,9 @@ def _launch(top_k_index, num_experts, single_block_max = None, block = None):
             return counts, out, offsets
         BLOCK = _MULTI_BLOCK if block is None else block
         NB = (N + BLOCK - 1) // BLOCK
-        size = NB * (E + 1)
+        # Rounded up to 4 int32 so rank_base / starts stay 16-byte aligned: an offset that follows NB (tokens)
+        # changed their pointer alignment class and recompiled four kernels per prefill length.
+        size = (NB * (E + 1) + 3) // 4 * 4
         scratch = torch.empty(2 * size + E + 1, dtype = torch.int32, device = device)
         hist, rank_base, starts = scratch[:size], scratch[size: 2 * size], scratch[2 * size:]
         _route_hist_kernel[(NB,)](
