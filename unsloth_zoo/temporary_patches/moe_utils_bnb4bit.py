@@ -1076,12 +1076,8 @@ def _quantstate_absmax_fp32(qs):
 
 
 def _cast_dense_experts_to_param_dtype(out, model, full_layer_name):
-    """Cast an unquantized expert fallback to the destination param dtype.
-
-    The twins carry `hf_quantizer` so transformers >= 5.21 keeps quant metadata in its checkpoint dtype
-    (`HfQuantizer.get_new_dtype` returns None), which also skips the loader's model-dtype cast for dense experts
-    (dynamic-quant skip layers); `set_param_for_module` never recasts. transformers < 5.21 skips it for renamed keys.
-    """
+    """Cast an unquantized expert fallback to the destination param dtype: `hf_quantizer` on the twins makes
+    transformers skip the model-dtype cast (`get_new_dtype` returns None) and `set_param_for_module` never recasts."""
     if model is None or not full_layer_name:
         return out
     module_path, _, param_name = full_layer_name.rpartition(".")
