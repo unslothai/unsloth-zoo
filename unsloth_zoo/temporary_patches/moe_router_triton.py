@@ -58,8 +58,19 @@ def fused_router_enabled():
     return os.environ.get("UNSLOTH_MOE_FUSED_ROUTER", "0") == "1"
 
 
+def _jit_any_alignment(*names):
+    # T is the token count: 1 in bsz 1 decode, anything in prefill. Keep the == 1 specialization, drop the
+    # % 16 one, so a multiple-of-16 prompt does not compile a third binary.
+    def wrap(fn):
+        try:
+            return triton.jit(fn, do_not_specialize_on_alignment = list(names))
+        except TypeError:  # a Triton without do_not_specialize_on_alignment
+            return triton.jit(fn)
+    return wrap
+
+
 if HAS_TRITON:
-    @triton.jit
+    @_jit_any_alignment("T")
     def _router_fwd_kernel(
         Z, BIAS, W, IDS, T, E, GS, stride_z, scale, mask_value,
         K: tl.constexpr, BLOCK_K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,  # K: experts per token; BLOCK_K: pow2 of K; MODE: 0 softmax-topk, 1 topk-softmax, 2 sigmoid; RENORM
@@ -149,7 +160,7 @@ if HAS_TRITON:
         tl.store(W + offs, w, mask = out_ok)
         tl.store(IDS + offs, ids.to(tl.int64), mask = out_ok)
 
-    @triton.jit
+    @_jit_any_alignment("T")
     def _router_bwd_kernel(
         Z, IDS, DW, DZ, T, E, stride_z, stride_dw, scale,
         K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,  # K: experts per token; MODE: 0 softmax-topk, 1 topk-softmax, 2 sigmoid; RENORM: renormalized
