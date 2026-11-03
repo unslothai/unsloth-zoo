@@ -790,7 +790,6 @@ def test_a_recorded_label_is_not_probed_again(monkeypatch):
     )
 
 
-
 def _raising_compile(error):
     def fake_compile(function, **kwargs):
         def compiled(*args, **kw):
@@ -800,8 +799,6 @@ def _raising_compile(error):
 
 
 def test_a_mask_builder_codegen_failure_falls_back_to_eager(monkeypatch):
-    """The causal mask builders compile without fullgraph, where only graph breaks fall back: torch 2.10 CPU Inductor
-    emits C++ for the packed-sequence causal mask that does not build, and the first forward raised."""
     from unsloth_zoo.temporary_patches import common
 
     calls = {"eager": 0}

@@ -480,10 +480,8 @@ else:
 
 
 def compile_mask_builder(function):
-    """`_torch_compile(function, fullgraph = False, dynamic = True)` for the transformers mask builders, falling back to
-    eager when Inductor cannot generate code: Dynamo graph-breaks by itself without fullgraph, but a codegen failure
-    still raises at the first call (torch 2.10 CPU emits C++ for the packed-sequence causal mask that does not build).
-    Only here, not in every non-fullgraph region: the wrapper costs about 5 us a call, once per forward for a mask."""
+    """Non-fullgraph mask-builder compile that falls back to eager on Inductor codegen failures (torch 2.10 CPU C++ build
+    error on the packed causal mask). Not used for every non-fullgraph region: the wrapper costs ~5 us a call."""
     compiled = _torch_compile(function, fullgraph = False, dynamic = True)
     if compiled is function:
         return function
