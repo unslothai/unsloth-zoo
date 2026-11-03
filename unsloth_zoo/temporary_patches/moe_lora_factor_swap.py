@@ -30,13 +30,10 @@ including trainer checkpoints) writes the vanilla factors; set_peft_model_state_
 pair back when its shapes only fit swapped. A square stack (d1 == d2) cannot be told apart by shape, so it is left
 as is on both sides: no real Llama-4 or Qwen3-VL-MoE checkpoint has one.
 
-The legacy lora_B packing (UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert, column e*R + r is expert e) has the same
-[out, R*E] shape as PEFT's (column r*E + e), so no PEFT can tell them apart and every one of them reads it with the
-experts mixed. Converting it to PEFT's packing on save would not help: set_peft_model_state_dict gets bare tensors,
-so a later load in the same legacy process could not tell a converted file from one an older Unsloth wrote. Such a
-lora_B is saved as [out, E, R] instead, which says its packing in its shape: vanilla PEFT (whose lora_B is always the
-2D weight of nn.Linear(R*E, out)) refuses it with a size mismatch on every version, and Unsloth's loaders flatten it
-back to the 2D bytes, whose packing the adapter_config.json lora_B_layout marker still records.
+The legacy lora_B packing (UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert) has PEFT's [out, R*E] shape, so every PEFT
+reads it with experts mixed. It is saved as [out, E, R] so vanilla PEFT refuses it by size; Unsloth flattens it back
+on load and the adapter_config.json lora_B_layout marker records its packing. Repacking to PEFT's layout on save is
+WRONG: set_peft_model_state_dict gets bare tensors, so a legacy process could not tell it from an old Unsloth file.
 """
 
 from __future__ import annotations
@@ -95,8 +92,7 @@ def swap_expert_lora_factors(lora_A: torch.Tensor, lora_B: torch.Tensor, num_exp
 
 
 def _legacy_grouped(wrapper, adapter_name):
-    """True when this wrapper reads lora_B with the legacy (out, E, R) packing (UNSLOTH_MOE_LORA_B_LAYOUT). Its
-    factors are not swapped; lora_B is saved 3D instead (see _to_vanilla)."""
+    """True when this wrapper uses the legacy lora_B packing; saved 3D, never swapped."""
     try:
         from .moe_utils import LORA_B_LAYOUT_GROUPED_BY_EXPERT, moe_lora_b_layout_for_wrapper
         return moe_lora_b_layout_for_wrapper(wrapper, adapter_name) == LORA_B_LAYOUT_GROUPED_BY_EXPERT
@@ -137,7 +133,6 @@ def _swapped_wrappers(model):
 
 
 def _expert_wrappers(model):
-    """{module name: num_experts} for every PEFT ParamWrapper over a multi-expert stack (any family)."""
     out = {}
     for name, module in model.named_modules():
         if type(module).__name__ != "ParamWrapper":
@@ -189,7 +184,6 @@ def _to_vanilla(model, state_dict, adapter_name = "default"):
         for _, key_b in _pair_keys(state_dict, module_name):
             b = state_dict[key_b]
             if b.dim() == 2 and b.shape[1] % num_experts == 0:
-                # Legacy packing: same 2D shape as PEFT's, read wrong by every PEFT. [out, E, R] is refused instead.
                 state_dict[key_b] = b.reshape(b.shape[0], num_experts, b.shape[1] // num_experts)
     for module_name, num_experts in wrappers.items():
         if module_name in legacy:
@@ -203,9 +197,7 @@ def _to_vanilla(model, state_dict, adapter_name = "default"):
 
 
 def _flatten_grouped_lora_B(model, state_dict, adapter_name, experts, modules):
-    """A legacy-packed lora_B saved as [out, E, R] back to the 2D bytes it was trained as. Their packing is then the
-    adapter_config.json marker's business, as for an adapter an older Unsloth saved 2D: kept under
-    UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert, repacked to PEFT's by PeftModel.load_adapter otherwise."""
+    """[out, E, R] lora_B back to trained 2D bytes; the adapter_config marker then decides any repack."""
     for module_name, num_experts in experts.items():
         lora_B_dict = getattr(modules[module_name], "lora_B", None)
         if lora_B_dict is None or adapter_name not in lora_B_dict:
@@ -322,8 +314,7 @@ def _wrap_load_adapter(original):
 
         def _load_pretrained_model(*a, **k):
             model = k.get("model", self)
-            # Only expert adapters need it (re-laid-out experts, or a legacy lora_B saved 3D): everything else
-            # keeps transformers' own path (disk offload indexes the checkpoint files it was given).
+            # Others keep transformers' path (disk offload indexes the checkpoint files it was given).
             if _swapped_wrappers(model) or _expert_wrappers(model):
                 try:
                     k = _converted_load_kwargs(model, k, name, scratch.name)
