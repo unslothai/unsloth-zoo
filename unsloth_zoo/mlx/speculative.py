@@ -355,6 +355,7 @@ class RowState:
     copy_available: int = 0
     remaining: int | None = None
     catch_up: int = 0
+    folded_replay: bool = False
 
 
 @dataclass
@@ -455,6 +456,7 @@ class DraftController:
         self.verify_cost: dict[int, dict[int, _Ema]] = {}
         self.plain_cost: dict[int, _Ema] = {}
         self.draft_cost = {depth: _Ema() for depth in range(1, self.max_depth + 1)}
+        self.draft_replay_pairs = {depth: 0.0 for depth in self.draft_cost}
         self.catch_up_cost = _Ema()
         self.hidden_drafting: dict[int, _Ema] = {}
         # Rounds the engine drafted past the planned depth: their seconds, emitted tokens, and the tokens the planned depth would have emitted.
@@ -538,8 +540,11 @@ class DraftController:
         anchor = below[-1] if below else above[0]
         return max(anchor[1] + slope * (key - anchor[0]), 1e-9)
 
-    def _measured(self, table: dict[int, _Ema]) -> list[tuple[int, float]]:
+    def _measured(self, table: dict[int, _Ema], replay_pairs: dict[int, float] | None = None) -> list[tuple[int, float]]:
         points = [(key, ema.value) for key, ema in sorted(table.items()) if ema.value is not None]
+        if replay_pairs:
+            replay = self._catch_up_seconds()
+            points = [(key, max(value - replay_pairs.get(key, 0.0) * replay, 1e-9)) for key, value in points]
         once = {key for key, ema in table.items() if ema.value is not None and ema.count < 2}
         if not once or len(once) == len(points):
             return points
@@ -565,7 +570,7 @@ class DraftController:
         return self._verify_seconds(bucket, width)
 
     def _draft_seconds(self, depth: int) -> float:
-        points = self._measured(self.draft_cost)
+        points = self._measured(self.draft_cost, self.draft_replay_pairs)
         slope = self._plain_step(1) * self._DRAFT_SLOPE
         return slope * depth if not points else self._extrapolate(points, depth, slope * 0.1)
 
@@ -578,15 +583,22 @@ class DraftController:
             return 0.0
         return self._draft_seconds(row.length) + state.catch_up * self._catch_up_seconds()
 
+    def _replay_pairs(self, rows: Sequence[RowState]) -> int:
+        return sum(state.catch_up for state in rows) if any(state.catch_up and not state.folded_replay for state in rows) else 0
+
     def _drafting_paid(self, bucket: int, drafting: float) -> float:
         hidden = self.hidden_drafting.get(bucket)
         return drafting if hidden is None or hidden.value is None else max(drafting - hidden.value, 0.0)
 
     def round_seconds(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
         bucket = _bucket(len(rows))
-        drafting = sum(self._row_seconds(row, state) for row, state in zip(plan.rows, rows))
+        drafting = sum(self._draft_seconds(row.length) for row in plan.rows if row.source == "draft")
+        draft_rows = [state for row, state in zip(plan.rows, rows) if row.source == "draft"]
+        replay = self._replay_pairs(draft_rows)
+        if not replay:
+            drafting += sum(state.catch_up for state in draft_rows) * self._catch_up_seconds()
         verify = self._copy_seconds if all(row.source == "copy" for row in plan.rows) else self._verify_seconds
-        return verify(bucket, width or plan.width) + self._drafting_paid(bucket, drafting)
+        return verify(bucket, width or plan.width) + replay * self._catch_up_seconds() + self._drafting_paid(bucket, drafting)
 
     def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None, optimism: float = 0.0) -> float:
         if plan.kind == "plain":
@@ -609,34 +621,41 @@ class DraftController:
             if state.can_draft and depth and depth >= self._cap(state, floor):
                 draft = RowPlan("draft", depth)
                 gain = state.stats.expected(draft) - state.stats.expected(base[i])
-                options.append((gain, self._row_seconds(draft, state), i, draft))
+                cost = self._row_seconds(draft, state)
+                replay = state.catch_up * self._catch_up_seconds()
+                options.append((gain, cost, i, draft, cost - replay))
         bucket = _bucket(len(rows))
         tokens = sum(state.stats.expected(row) for row, state in zip(base, rows))
         verify = self._verify_seconds(bucket, width)
-        rate = lambda gain, cost: (tokens + gain) / (verify + self._drafting_paid(bucket, cost))
+        has_replay = any(state.catch_up for state in rows)
         options.sort(key = lambda option: option[0] / option[1], reverse = True)
         if len({option[1] for option in options}) > 1 and len(options) <= self._EXHAUSTIVE_ROWS:
             # Drafting hidden behind the verify makes unequal costs a knapsack; few rows try every set.
             scored = [
-                (sum(option[0] for option in chosen), sum(option[1] for option in chosen), chosen)
+                (sum(option[0] for option in chosen), chosen)
                 for size in range(1, len(options) + 1) for chosen in combinations(options, size)
             ]
         else:
             # Equal costs make the best set of each size its top gains, a prefix of the ratio order;
             # a round needs a drafter when no row copies, and the least harmful lone one may trail.
-            scored, gain, cost = [], 0.0, 0.0
+            scored, gain = [], 0.0
             for size, option in enumerate(options, 1):
-                gain, cost = gain + option[0], cost + option[1]
-                scored.append((gain, cost, options[:size]))
-            scored += [(option[0], option[1], (option,)) for option in options]
+                gain += option[0]
+                scored.append((gain, options[:size]))
+            scored += [(option[0], (option,)) for option in options]
         best = RoundPlan("round", rows = tuple(base))
         best_score = tokens / self._copy_seconds(bucket, width) if best.width > 1 else 0.0
-        for gain, cost, chosen in scored:
-            if rate(gain, cost) > best_score:
+        for gain, chosen in scored:
+            drafting = sum(option[4] for option in chosen)
+            replay = self._replay_pairs([rows[option[2]] for option in chosen]) * self._catch_up_seconds() if has_replay else 0.0
+            if has_replay and not replay:
+                drafting += sum(rows[option[2]].catch_up for option in chosen) * self._catch_up_seconds()
+            rate = (tokens + gain) / (verify + replay + self._drafting_paid(bucket, drafting))
+            if rate > best_score:
                 plan = list(base)
-                for _, _, i, draft in chosen:
+                for _, _, i, draft, _ in chosen:
                     plan[i] = draft
-                best, best_score = RoundPlan("round", rows = tuple(plan)), rate(gain, cost)
+                best, best_score = RoundPlan("round", rows = tuple(plan)), rate
         return best
 
     @staticmethod
@@ -693,7 +712,7 @@ class DraftController:
             )
             if any(row.source == "draft" for row in warmup):
                 return RoundPlan("round", rows = warmup, split = True)
-        if bucket not in self.plain_cost:
+        if bucket not in self.plain_cost or self.plain_cost[bucket].count < 2:
             return RoundPlan("plain", max(1, min(max(self.min_window, 3), room)))  # long enough to time a running step
 
         rounds = {}
@@ -781,7 +800,7 @@ class DraftController:
             if row.source == "draft":
                 if self.draft_cost[row.length].count < 2:
                     return False
-                if state.catch_up and self.catch_up_cost.value is None:
+                if state.catch_up and not state.folded_replay and self.catch_up_cost.value is None:
                     return False
         return True
 
@@ -1040,19 +1059,34 @@ class DraftController:
         # A trimmed row's drafting is that of the full block ``plan`` drafted it as.
         depths = [self._cap(state, self.max_depth) if plan.trim else row.length
                   for row, state in zip(plan.rows, rows) if row.source == "draft" and row.length]
-        catch_up = sum(state.catch_up for row, state in zip(plan.rows, rows) if row.source == "draft")
+        draft_rows = [state for row, state in zip(plan.rows, rows) if row.source == "draft"]
+        catch_up = self._replay_pairs(draft_rows)
         verify = self.verify_cost.setdefault(bucket, {}).setdefault(plan.width, _Ema())
         if plan.split:
             self._since_split = 0
             verify.update_time(max(seconds - draft_seconds - catch_up_seconds, 1e-9), self.cost_alpha)
             # Only a round drafting one depth for every row can attribute its drafting time.
             if depths and len(set(depths)) == 1:
-                self.draft_cost[depths[0]].update_time(draft_seconds / len(depths), self.cost_alpha)
-            if catch_up:
+                depth, sample = depths[0], draft_seconds / len(depths)
+                cost = self.draft_cost[depth]
+                pairs = sum(state.catch_up for state in draft_rows) / len(depths) if not catch_up and not catch_up_seconds else 0.0
+                # Replay pairs follow the same minimum/clipping filter as their duration.
+                if cost.count == 1:
+                    if sample < cost.value:
+                        self.draft_replay_pairs[depth] = pairs
+                else:
+                    if cost.count > 1 and sample > 2 * cost.value:
+                        pairs *= 2 * cost.value / sample
+                    rate = max(self.cost_alpha, 1.0 / (cost.count + 1))
+                    self.draft_replay_pairs[depth] += rate * (pairs - self.draft_replay_pairs[depth])
+                cost.update_time(sample, self.cost_alpha)
+            if catch_up and catch_up_seconds > 0:
                 self.catch_up_cost.update_time(catch_up_seconds / catch_up, self.cost_alpha)
         else:
             self._since_split += 1
-            drafting = sum(self._draft_seconds(depth) for depth in depths) + catch_up * self._catch_up_seconds()
+            drafting = sum(self._draft_seconds(depth) for depth in depths)
+            if not catch_up:
+                drafting += sum(state.catch_up for state in draft_rows) * self._catch_up_seconds()
             if drafting:
                 hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds + catch_up_seconds, 0.0), drafting)
                 self.hidden_drafting.setdefault(bucket, _Ema()).update(hidden, self.cost_alpha)
@@ -1488,6 +1522,8 @@ class SpeculativeEngine:
                 len(row.proposer.propose(row.tokens, self.controller.max_copy)) if row.speculates else 0
             )
             state.can_draft = row.draft is not None and row.draft.ready
+            state.catch_up = getattr(row.draft, "pending_pairs", 0)
+            state.folded_replay = state.catch_up <= self.controller.max_depth + 1
             states.append(state)
         return states
 
@@ -1600,44 +1636,58 @@ class SpeculativeEngine:
 
     def _plain(self, length: int, states: list[RowState], waiting: Callable[[], bool] | None = None) -> Iterator[list[list[int]]]:
         rows = self._rows
-        # A processor that reads more than the history needs each token taken before the next step.
         pipelined = all(row.history_only for row in rows)
+        settled = all(row.history_only or len(row.settles) == len(row.processors) for row in rows)
         start = time.perf_counter()
         with mx.stream(self._stream):
             tokens, scores, hidden = self._step(mx.array([[row.pending] for row in rows]))
-        steps = 0
-        while True:
-            steps += 1
-            # A finished row leaves only between steps, so it ends the window rather than ride it out.
-            last = steps >= length or any(row.finished for row in rows) or (waiting is not None and waiting())
-            upcoming = None
-            if not last and pipelined:
-                with mx.stream(self._stream):
-                    upcoming = self._step(tokens[:, None], ahead = 1)
-                # Scores too: read unqueued, they cost the GPU another round trip per step.
-                mx.async_eval(*(array for array in upcoming if array is not None))
-            scores, emitted = None if scores is None else scores.tolist(), []
-            for i, token in enumerate(tokens.tolist()):
-                taken = rows[i].take([token], scores and scores[i : i + 1])
-                emitted.append(taken)
-                if taken and rows[i].draft is not None:
-                    self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
-            yield emitted
-            if last:
-                break
-            if steps == 1:
-                started = time.perf_counter()
-            if upcoming is None:
-                with mx.stream(self._stream):
-                    upcoming = self._step(tokens[:, None])
-            elif steps > 1 and self.controller.interrupts_plain(self._states()):
-                # The next step is already queued, so it becomes the window's last.
-                length = steps + 1
-            tokens, scores, hidden = upcoming
-        end = time.perf_counter()
-        # Reading a pipelined step's tokens waits for the step queued behind it, so the first read ends two steps in.
-        ran = steps - (2 if pipelined else 1)
-        self.controller.record_plain(states, steps, end - start, (end - started) / ran if ran > 0 else None)
+        steps = completed = 0
+        started = None
+        try:
+            while True:
+                steps += 1
+                last = steps >= length or any(row.finished for row in rows) or (waiting is not None and waiting())
+                upcoming = None
+                if not last and pipelined:
+                    with mx.stream(self._stream):
+                        upcoming = self._step(tokens[:, None], ahead = 1)
+                    mx.async_eval(*(array for array in upcoming if array is not None))
+                scores, emitted = None if scores is None else scores.tolist(), []
+                for i, token in enumerate(tokens.tolist()):
+                    taken = rows[i].take([token], scores and scores[i : i + 1])
+                    emitted.append(taken)
+                    if taken and rows[i].draft is not None:
+                        self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
+                completed = steps
+                failure = None
+                if not last and not pipelined and settled and not any(row.finished for row in rows):
+                    try:
+                        if steps == 1:
+                            started = time.perf_counter()
+                        with mx.stream(self._stream):
+                            upcoming = self._step(tokens[:, None])
+                        mx.async_eval(*(array for array in upcoming if array is not None))
+                    except Exception as error:
+                        failure = error
+                yield emitted
+                if failure is not None:
+                    raise failure
+                if last:
+                    break
+                if steps == 1 and started is None:
+                    started = time.perf_counter()
+                if upcoming is None:
+                    with mx.stream(self._stream):
+                        upcoming = self._step(tokens[:, None])
+                elif steps > 1 and self.controller.interrupts_plain(self._states()):
+                    length = steps + 1
+                tokens, scores, hidden = upcoming
+        finally:
+            if completed:
+                end = time.perf_counter()
+                ran = completed - (2 if pipelined and upcoming is None else 1)
+                self.controller.record_plain(states, completed, end - start,
+                                             (end - started) / ran if ran > 0 and started is not None else None)
 
     def _tree_round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]]:
         """A round verifying a best-first tree as one block: the emitted tokens are the target's along the branch it agrees with."""
@@ -1711,7 +1761,7 @@ class SpeculativeEngine:
         if depth:
             with mx.stream(self._stream):
                 # A round's few pairs replay as drafting; a plain window's backlog is replayed and timed apart.
-                if max(len(getattr(row, "tokens", ())) for row in draft_rows) > self.controller.max_depth + 1:
+                if max(getattr(row, "pending_pairs", len(getattr(row, "tokens", ()))) for row in draft_rows) > self.controller.max_depth + 1:
                     self.drafter.catch_up(self.draft_cache, draft_rows)
                     mx.synchronize(self._stream)
                     catch_up_seconds = time.perf_counter() - start
@@ -2042,6 +2092,20 @@ class DraftRow:
         return self.last is not None or bool(self.tokens)
 
 
+class _MTPRow(DraftRow):
+    def __init__(self, position: int, prefix: DraftRow | None):
+        super().__init__(position)
+        self.prefix = prefix
+
+    @property
+    def ready(self) -> bool:
+        return self.prefix is not None or super().ready
+
+    @property
+    def pending_pairs(self) -> int:
+        return len(self.tokens) + (len(self.prefix.tokens) if self.prefix is not None else 0)
+
+
 _SHORTLIST_BITS, _SHORTLIST_KEEP, _SHORTLIST_GROUP, _SHORTLIST_CHUNK, _SHORTLIST_COLUMNS = 2, 128, 64, 1 << 14, 2048
 
 
@@ -2066,7 +2130,7 @@ class _ShortlistHead:
         # Width and size are the same for a quantized table and for the unquantized stand-in a load is sized from.
         sides = weight if bits is None else table.scales
         width = sides.shape[1] * (1 if bits is None else table.group_size)
-        if width % _SHORTLIST_GROUP:
+        if width <= _SHORTLIST_COLUMNS or width % _SHORTLIST_GROUP:
             return None
         if sides.shape[0] <= _SHORTLIST_KEEP:
             return None
@@ -2090,6 +2154,8 @@ class _ShortlistHead:
         self._scan = tuple(mx.concatenate(column) for column in zip(*parts))
         mx.eval(self._scan)
         self._source = self.table.weight
+        from .inference import _FIRST_USE_WORK
+        _FIRST_USE_WORK[0] += 1
 
     def __call__(self, hidden: mx.array) -> mx.array:
         coarse = mx.quantized_matmul(hidden[..., :self.columns], *self._scan, True, _SHORTLIST_GROUP, _SHORTLIST_BITS)
@@ -2124,20 +2190,14 @@ class MTPDrafter:
         return self.model.make_cache()
 
     def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[DraftRow, list]:
-        """A row from its prompt, the target hidden ``[1, N, H]`` of its last N prompt positions
-        (or None), and its pending token; returns its state and its head cache."""
-        cache = self.new_cache()
-        if self._shortlist is not None:
-            # Here rather than in the first round, whose time the controller takes as the cost of drafting.
-            self._shortlist.prepare()
+        """Defer the prompt's last ``[1, N, H]`` hidden states until the row first drafts."""
         count = 0 if hidden is None else min(int(hidden.shape[1]), len(prompt))
-        row = DraftRow(len(prompt) - count)
-        tokens, hidden = [*prompt[len(prompt) - count + 1 :], pending], None if hidden is None else hidden[0, int(hidden.shape[1]) - count :]
-        # max_lag pairs per replay, so a long prompt never runs the head over all of its positions at once.
-        for begin in range(0, count, self.max_lag):
-            self.push(row, tokens[begin : begin + self.max_lag], hidden[begin : begin + self.max_lag])
-            self.catch_up(cache, [row])
-        return row, cache
+        prefix = None
+        if count:
+            prefix = DraftRow(len(prompt) - count)
+            prefix.tokens = [*prompt[len(prompt) - count + 1 :], pending]
+            prefix.hidden = [hidden[0, int(hidden.shape[1]) - count :]]
+        return _MTPRow(len(prompt), prefix), self.new_cache()
 
     def push(self, row: DraftRow, tokens: Sequence[int], hidden: mx.array) -> None:
         """Record pairs: ``tokens[k]`` follows the position whose target hidden is ``hidden[k]``."""
@@ -2159,6 +2219,28 @@ class MTPDrafter:
 
     def catch_up(self, cache: list, rows: Sequence[DraftRow | None]) -> int:
         """Replay the recorded pairs of ``rows`` (None leaves a row as is); returns how many."""
+        primed = 0
+        while any(getattr(row, "prefix", None) is not None for row in rows):
+            chunks = []
+            for row in rows:
+                prefix = getattr(row, "prefix", None)
+                if prefix is None:
+                    chunks.append(None)
+                    continue
+                count = min(len(prefix.tokens), self.max_lag)
+                chunk = DraftRow(prefix.position)
+                hidden = mx.concatenate(prefix.hidden)
+                chunk.tokens, chunk.hidden = prefix.tokens[:count], [hidden[:count]]
+                prefix.tokens, prefix.hidden = prefix.tokens[count:], [hidden[count:]]
+                prefix.position += count
+                chunks.append(chunk)
+            primed += self._catch_up(cache, chunks)
+            for row, chunk in zip(rows, chunks):
+                if chunk is not None and not row.prefix.tokens:
+                    row.last, row.prefix = chunk.last, None
+        return primed + self._catch_up(cache, rows)
+
+    def _catch_up(self, cache: list, rows: Sequence[DraftRow | None]) -> int:
         lengths = [len(row.tokens) if row is not None else 0 for row in rows]
         width = max(lengths)
         if not width:
@@ -2195,6 +2277,8 @@ class MTPDrafter:
     def draft(self, cache: list, rows: Sequence[DraftRow | None], depth: int, target: list) -> mx.array:
         """``[B, depth]`` greedy drafts; rows the head has not caught up get placeholders.
         Appends ``depth - 1`` entries to every row's cache, which ``settle`` trims."""
+        if self._shortlist is not None:
+            self._shortlist.prepare()
         like = next(row.last for row in rows if row is not None and row.last is not None)
         hidden = mx.concatenate([row.last if row is not None and row.last is not None else mx.zeros_like(like) for row in rows])
         starts = mx.array([row.position if row is not None else 0 for row in rows])[:, None]

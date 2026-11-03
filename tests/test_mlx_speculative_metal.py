@@ -180,7 +180,9 @@ def _probe_matches_a_started_row(model, drafter, prompt, held):
     from unsloth_zoo.mlx.speculative import _capture, _features, probe_drafter
     hidden = _features(drafter, (lm := getattr(model, "language_model", model))(mx.array([prompt]), cache = make_prompt_cache(lm), **_capture(drafter)))
     shapes = lambda entries: [(type(entry), getattr(entry, "max_size", None), tuple(a.shape), a.dtype) for entry in entries for a in entry.state if a is not None]
-    return shapes(probe_drafter(model, drafter, len(prompt))) == shapes(held(drafter.start(prompt, hidden, 0))) != []
+    started = drafter.start(prompt, hidden, 0)
+    drafter.catch_up(started[1], [started[0]])
+    return shapes(probe_drafter(model, drafter, len(prompt))) == shapes(held(started)) != []
 
 
 def _prefill(lm, prompt, sampling, processors = (), drafter = None):
@@ -231,7 +233,9 @@ def _parity():
 def _head_in_step(engine):
     offset = mx.array(engine.draft_cache[0].offset).reshape(-1).tolist()
     for i, row in enumerate(engine._rows):
-        assert offset[i] == row.draft.position - engine.drafter.dropped.get(id(row.draft), 0)
+        prefix = getattr(row.draft, "prefix", None)
+        pending = len(prefix.tokens) if prefix is not None else 0
+        assert offset[i] == row.draft.position - engine.drafter.dropped.get(id(row.draft), 0) - pending
         assert row.draft.position + len(row.draft.tokens) == len(row.tokens) - 1
 
 
@@ -1903,12 +1907,12 @@ def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
     with exact_speculative_verify(model):
         assert _run(model, ids, 96, _script(("draft", 3), ("copy", 4)), greedy, drafter = _drafter(model))[0] == solo
     assert len(submitted) > 2 * unscoped + len(model.language_model.model.layers)
-    picked, pick = [], _ShortlistHead.__call__
-    monkeypatch.setattr(_ShortlistHead, "__call__", lambda self, hidden: picked.append(self._source is self.table.weight) or pick(self, hidden))
-    (out,), drafted, _ = _run(model, ids[:1], 96, DraftController(max_depth = 4, max_copy = 16), greedy, drafter = _drafter(model))
-    assert out == solo[0] and drafted[0][1] > 0 and picked and all(picked)
     built = _drafter(model)
-    assert built.weight_bytes == sum(a.nbytes for _, a in tree_flatten(built.model.parameters())) + built._shortlist.nbytes
+    assert built._shortlist is None
+    assert built.weight_bytes == sum(a.nbytes for _, a in tree_flatten(built.model.parameters()))
+    monkeypatch.setattr(_ShortlistHead, "prepare", lambda self: pytest.fail("a native head allocated a duplicate table"))
+    (out,), drafted, _ = _run(model, ids[:1], 96, DraftController(max_depth = 4, max_copy = 16), greedy, drafter = built)
+    assert out == solo[0] and drafted[0][1] > 0
 
 
 def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(monkeypatch):
@@ -1928,7 +1932,8 @@ def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(mo
         few = mx.argsort(-coarse, axis = -1)[..., :8]
         best = mx.take_along_axis(few, mx.argmax(mx.take_along_axis(logits, few, axis = -1), axis = -1, keepdims = True), axis = -1)
         assert head(hidden).tolist() == best.squeeze(-1).tolist() != mx.argmax(coarse, axis = -1).tolist()
-    assert (small := speculative._ShortlistHead.of(lm(nn.Linear(64, 512, bias = False), False))).prepare() is None and small.nbytes == sum(a.nbytes for a in small._scan) and speculative._ShortlistHead.of(lm(packed(dense), False)).nbytes == speculative._ShortlistHead.of(lm(dense, False)).nbytes and all(speculative._ShortlistHead.of(lm(uncovered, False)) is None for uncovered in (nn.Linear(192, 512), narrow, packed(narrow), nn.Linear(192, 8, bias = False), nn.QuantizedLinear(192, 512, bias = False, bits = 2)))
+    assert speculative._ShortlistHead.of(lm(packed(dense), False)).nbytes == speculative._ShortlistHead.of(lm(dense, False)).nbytes
+    assert all(speculative._ShortlistHead.of(lm(uncovered, False)) is None for uncovered in (nn.Linear(64, 512, bias = False), nn.Linear(192, 512), narrow, packed(narrow), nn.Linear(192, 8, bias = False), nn.QuantizedLinear(192, 512, bias = False, bits = 2)))
 
 
 @pytest.mark.parametrize("max_lag", [128, 4])
@@ -1951,8 +1956,7 @@ def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag, monkey
     (out,), _, _ = _run(model, ids[:1], 128, controller, SamplingParams(), drafter = drafter)
     assert out == _solo(model, ids[0], 128, SamplingParams())
     assert any(drafter.dropped.values()) == (max_lag < 8)
-    # Only a plain window leaves more pairs than a round does: its replay is timed apart from drafting.
-    assert apart[:4] == [max_lag >= 8, False] * 2
+    assert apart[:4] == [True, False, max_lag >= 8, False]
     # A head that dropped context past max_lag accepts less; a misaligned catch-up would accept next to nothing.
     assert sum(count for count, _ in accepted) >= (0.6 if max_lag >= 8 else 0.5) * sum(length for _, length in accepted)
 
@@ -1961,7 +1965,14 @@ def test_an_mtp_heads_cache_holds_only_target_hidden_pairs_however_its_drafts_fa
     from unsloth_zoo.mlx.generate import SamplingParams
     model, ids = qwen_mtp
     drafter, chunks, compared = _drafter(model, max_lag = 4096), [[]], []
-    push, catch_up, draft = drafter.push, drafter.catch_up, drafter.draft
+    start, push, catch_up, draft = drafter.start, drafter.push, drafter.catch_up, drafter.draft
+    def traced_start(prompt, hidden, pending):
+        result = start(prompt, hidden, pending)
+        if getattr(result[0], "prefix", None) is not None:
+            count = min(hidden.shape[1], len(prompt))
+            chunks[0].insert(0, ([*prompt[len(prompt) - count + 1:], pending], hidden[0, -count:]))
+        return result
+    drafter.start = traced_start
     drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
     drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
     def against_replay(cache, rows, depth, target):
