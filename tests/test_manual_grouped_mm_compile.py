@@ -70,15 +70,19 @@ def test_frozen_experts_compile_without_graph_break():
 
 
 @needs_op
-@pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])
-def test_autocast_dtype_matches_eager(w_dtype):
-    # Eager matmuls inside the loop autocast; the opaque op must return what they would.
-    x, w, offsets = _case(torch.float32, False, w_dtype = w_dtype)
+@pytest.mark.parametrize(
+    "x_dtype,w_dtype",
+    [(torch.float32, torch.float32), (torch.float32, torch.bfloat16), (torch.float64, torch.float64)],
+)
+def test_autocast_dtype_matches_eager(x_dtype, w_dtype):
+    # Eager matmuls inside the loop autocast (float64 operands excluded); the opaque op must return what they would.
+    x, w, offsets = _case(x_dtype, False, w_dtype = w_dtype)
     with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
         want = M._manual_grouped_mm(x, w, offsets)
         torch._dynamo.reset()
         got = torch.compile(M._manual_grouped_mm, backend = "aot_eager", fullgraph = True)(x, w, offsets)
-    assert want.dtype == torch.bfloat16 and got.dtype == want.dtype and torch.equal(got, want)
+    expected = torch.float64 if x_dtype == torch.float64 else torch.bfloat16
+    assert want.dtype == expected and got.dtype == want.dtype and torch.equal(got, want)
 
 
 @needs_op

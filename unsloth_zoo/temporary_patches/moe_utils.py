@@ -906,8 +906,11 @@ def _manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torc
         and not (torch.is_grad_enabled() and (inputs.requires_grad or weight.requires_grad))
     ):
         dtype = _autocast_dtype(inputs.device.type)
-        if dtype is not None:
-            inputs, weight = inputs.to(dtype), weight.to(dtype)
+        if dtype is not None:  # autocast casts floating operands except float64
+            if inputs.is_floating_point() and inputs.dtype != torch.float64:
+                inputs = inputs.to(dtype)
+            if weight.is_floating_point() and weight.dtype != torch.float64:
+                weight = weight.to(dtype)
         return _MANUAL_GROUPED_MM_OP(inputs, weight, offsets)
     return _manual_grouped_mm_eager(inputs, weight, offsets)
 
