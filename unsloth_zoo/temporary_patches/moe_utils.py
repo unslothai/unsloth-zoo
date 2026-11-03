@@ -2469,6 +2469,20 @@ def _fused_moe_activation(module, gate_up, interleaved, allow_gptoss = True):
 # Separated LoRA helpers.
 
 
+def _active_lora_adapter_names(wrapper) -> Optional[list]:
+    """Active adapters holding LoRA here, in PEFT order; None if the wrapper does not track active adapters."""
+    try:
+        active = wrapper.active_adapters
+    except Exception:
+        return None
+    if isinstance(active, str):
+        active = [active]
+    if not isinstance(active, (list, tuple)):
+        return None
+    lora_A = wrapper.lora_A
+    return [name for name in active if name in lora_A]
+
+
 def _has_lora_adapters(param) -> bool:
     """Check for active LoRA adapters (PEFT ParamWrapper)."""
     if not hasattr(param, "lora_A") or not hasattr(param, "lora_B"):
@@ -2477,7 +2491,10 @@ def _has_lora_adapters(param) -> bool:
         return False
     if hasattr(param, "merged") and param.merged:
         return False
-    return len(param.lora_A) > 0
+    if len(param.lora_A) == 0:
+        return False
+    active = _active_lora_adapter_names(param)
+    return active is None or len(active) > 0
 
 
 # Fused expert lora_B: expert-fastest, reshape(out, r, E), so column j is expert j % E (lora_A is expert-slowest,
@@ -2842,10 +2859,9 @@ def extract_moe_lora_weights_for_grouped_mm(
 
 
 def _extract_lora_from_wrapper(
-    wrapper, adapter_name: str = "default", experts_module=None
+    wrapper, adapter_name: Optional[str] = None, experts_module=None
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float, int]]:
-    """Returns (first_weight, second_weight, scaling, num_experts) or None; PEFT lora_A is (E*R, in) and lora_B (out,
-    E*R), handling standard and transposed base layouts."""
+    """Returns (first_weight, second_weight, scaling, num_experts) or None. adapter_name None = the active adapters."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     try:
@@ -2860,8 +2876,26 @@ def _extract_lora_from_wrapper(
         if not wrapper.lora_A:
             return None
 
+        if adapter_name is None:
+            active = _active_lora_adapter_names(wrapper)
+            if active is None:
+                adapter_name = "default" if "default" in wrapper.lora_A else next(iter(wrapper.lora_A.keys()))
+            elif len(active) == 0:
+                # An adapter that does not target this parameter contributes nothing (as in PEFT).
+                return None
+            elif len(active) == 1:
+                adapter_name = active[0]
+            else:
+                terms = []
+                for name in active:
+                    term = _extract_lora_from_wrapper(wrapper, name, experts_module=experts_module)
+                    if term is None:
+                        return None
+                    terms.append(term)
+                return _combine_moe_lora_terms(terms)
+
         if adapter_name not in wrapper.lora_A:
-            adapter_name = list(wrapper.lora_A.keys())[0]
+            return None
 
         lora_A_module = wrapper.lora_A[adapter_name]
         lora_B_module = wrapper.lora_B[adapter_name]
@@ -2889,15 +2923,45 @@ def _extract_lora_from_wrapper(
             experts_module=experts_module,
             model_name="MoE",
         )
-    except MoELoRABLayoutError:
-        # A misspelled UNSLOTH_MOE_LORA_B_LAYOUT must not read as "no adapter here".
+    except (MoELoRABLayoutError, MoELoRAMultiAdapterError):
+        # Must not read as "no adapter here".
         raise
     except Exception:
         return None
 
 
+class MoELoRAMultiAdapterError(NotImplementedError):
+    """Several active adapters on one expert parameter cannot be summed."""
+
+
+def _combine_moe_lora_terms(terms):
+    """Sum active adapters by concatenating ranks with scaling folded into B; raise rather than drop one."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if len(terms) == 1:
+        return terms[0]
+    firsts, seconds = [], []
+    for term in terms:
+        first, second, scaling = term[0], term[1], term[2]
+        if (
+            not isinstance(first, torch.Tensor) or not isinstance(second, torch.Tensor)
+            or first.dim() != 3 or second.dim() != 3 or first.shape[2] != second.shape[1]
+            or first.shape[:2] != terms[0][0].shape[:2] or second.shape[0] != terms[0][1].shape[0]
+            or second.shape[2] != terms[0][1].shape[2]
+        ):
+            raise MoELoRAMultiAdapterError(
+                "Unsloth: several active adapters on one MoE expert parameter need per-expert LoRA factors of matching "
+                "shapes; activate one adapter at a time, or set UNSLOTH_MOE_LORA_MERGED=1."
+            )
+        firsts.append(first)
+        seconds.append(second * scaling)
+    result = [torch.cat(firsts, dim = 2), torch.cat(seconds, dim = 1), 1.0]
+    result.extend(terms[0][3:])
+    return tuple(result)
+
+
 def _extract_lora_weights(
-    param, adapter_name: str = "default", num_experts: int = None, experts_module=None
+    param, adapter_name: Optional[str] = None, num_experts: int = None, experts_module=None
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
     """Compat wrapper around _extract_lora_from_wrapper; returns (first, second, scaling)."""
     # This Unsloth Zoo code section is licensed under AGPL3
@@ -4102,6 +4166,11 @@ def _patched_param_wrapper_forward(
         if self.merged:
             return immediate_base_layer(x, *args, **kwargs)
 
+        # No active adapter targets this parameter: base only.
+        active = _active_lora_adapter_names(self)
+        if active is not None and len(active) == 0:
+            return immediate_base_layer(x, *args, **kwargs)
+
         # Ensure wrapper.num_experts is set for LoRA weight reshaping.
         if not hasattr(self, "num_experts"):
             if hasattr(experts_module, "num_experts"):
@@ -4165,7 +4234,9 @@ def _patched_param_wrapper_forward(
 
         # Extract LoRA for this parameter and stash on the experts module
         # (not base_layer): _unsloth_lora_gate_up_proj / _unsloth_lora_down_proj.
-        lora_data = _extract_lora_from_wrapper(self)
+        lora_data = _extract_lora_from_wrapper(
+            self, active[0] if active is not None and len(active) == 1 else None
+        )
 
         if lora_data is not None and param_name:
             lora_attr = moe_lora_stash_name(param_name)
