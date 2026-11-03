@@ -1,4 +1,5 @@
 import contextlib
+import re
 import types
 
 import pytest
@@ -1385,6 +1386,40 @@ def test_nax_quantized_linear_first_use_check_rejects_a_wrong_kernel(monkeypatch
     assert list(inference._NAX_QMM_VERIFIED.values()) == [False]
 
 
+@nax_only
+def test_nax_quantized_linear_builds_a_failing_kernel_once(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model, checks = _QuantizedHead(), []
+
+    def unbuilt(x):   # MLX's own build error, so the refusal matches what MLX raises
+        kernel = mx.fast.metal_kernel(name = "unsloth_unbuildable", input_names = ["x"], output_names = ["out"],
+                                      source = "not metal;")
+        return kernel(inputs = [x], grid = (32, 1, 1), threadgroup = (32, 1, 1), output_shapes = [x.shape],
+                      output_dtypes = [x.dtype])[0]
+
+    def unbuildable(x, *args):
+        checks.append(1)
+        mx.eval(unbuilt(x))
+
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
+    native = model.proj(x := mx.random.normal((3, 512), key = mx.random.key(3)).astype(mx.bfloat16))
+    with inference.nax_quantized_linear(model):   # an input's failed build is not the kernel's
+        with pytest.raises(RuntimeError, match = re.escape(inference._FAILED_BUILD)):
+            mx.eval(model.proj(unbuilt(x)))
+    assert inference._NAX_QMM_VERIFIED == {}
+    monkeypatch.setattr(inference, "_nax_qmm_matches_native", unbuildable)
+    work = inference.first_use_work()
+    with inference.nax_quantized_linear(model):
+        for _ in range(2):
+            assert mx.array_equal(model.proj(x), native).item()
+    assert len(checks) == 1 and list(inference._NAX_QMM_VERIFIED.values()) == [False]
+    assert inference.first_use_work() == work + 1   # the failed compile is first-use cost, not a round's
+
+
 @real_mlx_only
 @pytest.mark.parametrize("blocker", [None, "kill switch", "no NAX", "gap closed", "distributed", "probe failed"])
 def test_nax_quantized_linear_scope_stays_native(monkeypatch, blocker):
@@ -1679,7 +1714,9 @@ def test_tensor_lane_readers_keep_each_rows_bits_within_fp32_reordering(monkeypa
     narrow, runs = "slices" if bits == 4 else "staged", "scales" if bits == 4 else "staged"
     if bits == 8 and dtype == mx.bfloat16:
         narrow = runs = "bias"
-    for (N, K), reader in (((matmul._LANE_TENSOR_WIDE, 1280), wide), ((96, 1280), narrow), ((96, 1216), "slices"),
+    # 256 deep: four groups, so one row's split sums are under 8 elements.
+    for (N, K), reader in (((matmul._LANE_TENSOR_WIDE, 1280), wide), ((matmul._LANE_TENSOR_WIDE, 256), wide),
+                           ((96, 1280), narrow), ((96, 1216), "slices"),
                            ((96, 1536), runs), ((32, 16384), runs)):
         built.clear()
         w, scales, biases = _quantized(N, K, 64, dtype, bits, seed = N + K)
@@ -1822,7 +1859,7 @@ def test_lane_qmms_keeps_each_weights_bits_on_every_reader():
         ws = [mx.quantize(mx.random.normal((N, K), key = mx.random.key(N + i)).astype(dtype) * 0.05, group_size = 64, bits = bits)
               for i, N in enumerate(Ns)]
         readers.add(matmul.lane_qmms_reader(Ns[0], K, 64, bits, dtype))
-        for rows in (5, 20):
+        for rows in (1, 5, 20):   # one row of four groups: split sums under 8 elements
             x = mx.random.normal((rows, K), key = mx.random.key(rows)).astype(dtype)
             assert _same_bits(matmul.lane_qmms(x, ws, 64, bits), [matmul.lane_qmm(x, *w, 64, bits) for w in ws]), (bits, K, rows)
     assert readers == ({"staged", "slices", "bias"} if tensor else {("simd", 2), ("simd", 4)})

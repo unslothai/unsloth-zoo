@@ -164,6 +164,7 @@ def _bindings_intact(bindings):
 
 
 _FAILED_BUFFER = "[METAL] Command buffer execution failed"
+_FAILED_BUILD = "[metal::Device] Unable to build metal library"
 # One-off work run so far: each first-use check settles through `_settled`, and each timing counts one.
 _FIRST_USE_WORK = [0]
 
@@ -5965,11 +5966,23 @@ def _nax_small_m_qmm(module, x, bindings, route = None, rows = None):
     if verified is None:
         _staged_ready()
         try:
+            mx.eval(flat, w, scales, biases)   # an input that fails to build is not this kernel's verdict
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return None
+        try:
             verified = _settled(_nax_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed,
                                                         route.code_offset))
         except (RuntimeError, ValueError) as error:
             _unless_failed_buffer(error)
-            return None  # inside a function transformation, which cannot evaluate; checked later
+            if not str(error).startswith(_FAILED_BUILD):
+                return None  # inside a function transformation, which cannot evaluate; checked later
+            # MLX keeps no failed build, so every later call would compile it again.
+            _FIRST_USE_WORK[0] += 1   # the failed compile was this call's one-off cost
+            logger.warning("the %s small-row quantized matmul does not build for N=%d K=%d %d-bit group %d %s; "
+                           "the native call stays in use", route.label, N, K, bits, group_size, x.dtype)
+            _NAX_QMM_VERIFIED[key] = False
+            return None
         if verified and not any(v for k, v in _NAX_QMM_VERIFIED.items() if k[0] == route.tag):
             logger.info("small-batch quantized projections now run on the %s kernel; "
                         "%s=0 keeps the native call", route.label, route.switch)

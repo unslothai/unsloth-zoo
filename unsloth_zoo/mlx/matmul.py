@@ -1378,7 +1378,8 @@ def _lane_sums_launch(M, K, group_size, dtype, split = False):
                                       _LANE_CONSTANT.format(key, value, "constant int") for key, value in constants.items()),
                                   source = _LANE_PREAMBLE + _LANE_SUMS_SOURCE + _LANE_SUMS_SPLIT * split)
     return functools.partial(kernel, grid = (-(-(K // group_size) // 32) * 32, M, 1), threadgroup = (32, 1, 1),
-                             output_shapes = [(M, K // group_size)] * (3 if split else 1),
+                             # MLX binds an input under 8 elements as `constant`, which the bias reader's `device` cast rejects.
+                             output_shapes = [(max(M, -(-8 // (K // group_size))), K // group_size)] * (3 if split else 1),
                              output_dtypes = [mx.float32, *(dtype,) * (2 * split)])
 
 
