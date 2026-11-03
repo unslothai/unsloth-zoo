@@ -304,9 +304,48 @@ def _converted_load_kwargs(model, kwargs, adapter_name, scratch_dir = None):
     return kwargs
 
 
+def _repack_legacy_lora_B(model, model_id, adapter_name, hub_kwargs):
+    """Legacy lora_B repack for non-PeftModel load paths; never raises (the load already succeeded)."""
+    try:
+        from .moe_utils import repack_legacy_lora_b_after_load
+        repack_legacy_lora_b_after_load(model, model_id, adapter_name, hub_kwargs)
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: did not check the expert LoRA lora_B layout: {e}")
+
+
+def _load_adapter_source(original, args, kwargs):
+    """(model_id, hub_kwargs) of a transformers 4.x/5.x load_adapter call; model_id None for an adapter_state_dict."""
+    import inspect
+    try:
+        signature = inspect.signature(original)
+        named = {}
+        for key, value in signature.bind(*args, **kwargs).arguments.items():
+            if signature.parameters[key].kind is inspect.Parameter.VAR_KEYWORD:
+                named.update(value)
+            else:
+                named[key] = value
+        if named.get("adapter_state_dict") is not None:
+            return None, {}
+        load_config = named.get("load_config")
+        model_id = (named.get("peft_model_id") or named.get("pretrained_model_name_or_path")
+                    or getattr(load_config, "pretrained_model_name_or_path", None))
+        # Mirrors transformers: explicit download_kwargs replaces load_config's; adapter_kwargs override.
+        download = named.get("download_kwargs")
+        if download is None:
+            download = getattr(load_config, "download_kwargs", None)
+        hub_kwargs = dict(download or {})
+        nested = ("self", "download_kwargs", "adapter_kwargs", "load_config")
+        hub_kwargs.update({key: value for key, value in named.items() if key not in nested and value is not None})
+        hub_kwargs.update(named.get("adapter_kwargs") or {})
+        return model_id, hub_kwargs
+    except Exception:
+        return None, {}
+
+
 def _wrap_load_adapter(original):
     """transformers 5.x PeftAdapterMixin.load_adapter injects the adapter, then loads its tensors with
-    _load_pretrained_model (not PEFT's set_peft_model_state_dict): convert the factors on that path too."""
+    _load_pretrained_model (not PEFT's set_peft_model_state_dict): convert the factors on that path too, then repack legacy lora_B."""
     def load_adapter(self, peft_model_id = None, adapter_name = None, *args, **kwargs):
         name = adapter_name or "default"
         cls_load = type(self)._load_pretrained_model
@@ -328,14 +367,28 @@ def _wrap_load_adapter(original):
         scratch = tempfile.TemporaryDirectory(prefix = "unsloth_lora_swap_")
         self.__dict__["_load_pretrained_model"] = _load_pretrained_model
         try:
-            return original(self, peft_model_id, adapter_name, *args, **kwargs)
+            result = original(self, peft_model_id, adapter_name, *args, **kwargs)
         finally:
             if not had:
                 self.__dict__.pop("_load_pretrained_model", None)
             scratch.cleanup()
+        model_id, hub_kwargs = _load_adapter_source(original, (self, peft_model_id, adapter_name, *args), kwargs)
+        _repack_legacy_lora_B(self, model_id, name, hub_kwargs)
+        return result
     load_adapter._unsloth_factor_swap = True
     load_adapter.__wrapped__ = original
     return load_adapter
+
+
+def _wrap_hotswap_adapter(original):
+    """PEFT's hotswap_adapter reads the file itself, so repack legacy lora_B after it."""
+    def hotswap_adapter(model, model_name_or_path, adapter_name, *args, **kwargs):
+        result = original(model, model_name_or_path, adapter_name, *args, **kwargs)
+        _repack_legacy_lora_B(model, model_name_or_path, adapter_name, kwargs)
+        return result
+    hotswap_adapter._unsloth_factor_swap = True
+    hotswap_adapter.__wrapped__ = original
+    return hotswap_adapter
 
 
 def _patch_transformers_load_adapter():
@@ -362,6 +415,7 @@ def patch_expert_lora_factor_swap():
         (save_and_load, "get_peft_model_state_dict", _wrap_get),
         (save_and_load, "set_peft_model_state_dict", _wrap_set),
         (hotswap, "hotswap_adapter_from_state_dict", _wrap_hotswap),
+        (hotswap, "hotswap_adapter", _wrap_hotswap_adapter),
     ):
         original = getattr(source, name, None)
         if original is None or getattr(original, "_unsloth_factor_swap", False):
