@@ -821,3 +821,14 @@ def test_a_real_error_in_a_mask_builder_still_raises(monkeypatch):
     with pytest.raises(ValueError, match = "a real bug"):
         wrapped(1)
 
+
+def test_a_mask_builder_is_not_flipped_by_another_regions_fallback(monkeypatch):
+    """Masks are built outside checkpointed layers: the step-boundary flip of every registered wrapper must skip them."""
+    from unsloth_zoo.temporary_patches import common
+
+    monkeypatch.setattr(common.torch, "compile", lambda function, **kwargs: (lambda *a, **k: "compiled"))
+    wrapped = common.compile_mask_builder(lambda x: "eager")
+    patch_utils._PENDING_EAGER_LABELS.add("another-region")
+    patch_utils.apply_pending_eager_fallbacks()
+    assert wrapped(1) == "compiled"
+

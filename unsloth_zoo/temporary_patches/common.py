@@ -481,13 +481,39 @@ else:
 
 def compile_mask_builder(function):
     """Non-fullgraph mask-builder compile that falls back to eager on Inductor codegen failures (torch 2.10 CPU C++ build
-    error on the packed causal mask). Not used for every non-fullgraph region: the wrapper costs ~5 us a call."""
+    error on the padded sliding-window / packed causal mask)."""
     compiled = _torch_compile(function, fullgraph = False, dynamic = True)
     if compiled is function:
         return function
-    from .utils import _fall_back_to_eager_on_recompile_limit
-    label = getattr(function, "__qualname__", None) or repr(function)
-    return _fall_back_to_eager_on_recompile_limit(compiled, function, label)
+    from .utils import _backend_compile_errors, _is_inductor_codegen_failure, _wants_hard_backend_failure
+    errors = _backend_compile_errors()
+    if not errors:
+        return compiled
+    label = getattr(function, "__name__", None) or repr(function)
+    # Own latch, not _fall_back_to_eager_on_recompile_limit: masks are built outside checkpointed layers, so another
+    # region's step-boundary switch to eager must not take them along, and the per-call checkpoint probe is not needed.
+    eager = []
+
+    @functools.wraps(function)
+    def mask_builder(*args, **kwargs):
+        if eager:
+            return function(*args, **kwargs)
+        if torch.compiler.is_compiling():
+            return compiled(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except errors as e:
+            if _wants_hard_backend_failure() or not _is_inductor_codegen_failure(e):
+                raise
+        eager.append(True)
+        logger.warning(
+            f"Unsloth: torch.compile could not generate code for {label}; running it eagerly from here. "
+            f"Only speed is affected."
+        )
+        return function(*args, **kwargs)
+
+    mask_builder._unsloth_compiled_func = compiled
+    return mask_builder
 
 
 def flatten_for_elementwise_norm(hidden_states):
