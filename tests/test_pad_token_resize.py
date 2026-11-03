@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""fix_pad_token on a real tiny model: a brand-new pad that needed an embedding resize must be kept, not raised.
-
-The tokenizer below ships a pad id one past the 256-row embedding (out of range), the config declares no pad and
-there is no reserved / unk candidate, so the only repair is adding a pad token and growing the embedding. The model and
-the returned tokenizer must then agree: rows >= len(tokenizer), pad id in range, named, and stamped on the config.
-"""
+"""fix_pad_token keeps a new pad that needed an embedding resize: the pad id starts one past the 256 rows with no
+reserved / unk candidate, and afterwards model and tokenizer agree (rows, pad id in range, stamped on the config)."""
 
 import pytest
 
@@ -71,7 +67,6 @@ def test_out_of_range_pad_is_added_and_resized_without_raising(tmp_path, monkeyp
     res = fix_pad_token(tok, model = model)
     assert res["changed"] and res["added"] and res["reason"] == "out_of_range"
     _assert_agree(model, tok, res["new_pad"])
-    # Idempotent: the healed pad is valid now.
     assert fix_pad_token(tok, model = model)["changed"] is False
 
 

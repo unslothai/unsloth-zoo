@@ -422,8 +422,7 @@ def fix_pad_token(
                     _suppress_padded_rows(model, len(inner), target)
             except Exception:
                 pass
-            # A completed resize gave the new pad a row: re-check against it, else the pre-resize check raised and the
-            # caller's fallback reloaded a tokenizer without the pad onto the already resized model.
+            # A completed resize gave the new pad a row; the pre-resize check alone raised after resizing.
             fits = fits or (resized and _fits_embedding_rows(model, inner.pad_token_id, None))
         model_cfg = getattr(model, "config", None)
         if model_cfg is not None:
