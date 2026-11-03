@@ -166,3 +166,16 @@ def test_autocast_casts_only_the_active_experts():
     assert torch.equal(got, want) and got.dtype == torch.bfloat16
     casts = [n for graph in graphs for n in graph.nodes if n.op == "call_method" and n.target in ("to", "type")]
     assert not casts, casts
+
+
+@needs_op
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_empty_batch_under_autocast_matches_eager(backend):
+    x = torch.randn(0, 16)
+    w = torch.randn(4, 16, 8)
+    offsets = torch.zeros(4, dtype = torch.int32)
+    with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
+        want = M._manual_grouped_mm(x, w, offsets)
+        torch._dynamo.reset()
+        got = torch.compile(M._manual_grouped_mm, backend = backend, fullgraph = True)(x, w, offsets)
+    assert got.shape == want.shape and got.dtype == want.dtype

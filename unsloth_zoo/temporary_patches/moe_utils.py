@@ -849,6 +849,15 @@ if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
 _manual_grouped_mm_eager = _manual_grouped_mm
 
 
+def _manual_grouped_mm_dtype(inputs, weight, autocast_dtype):
+    """The dtype the loop's matmuls return: autocast casts floating operands except float64."""
+    def cast(t):
+        if autocast_dtype is not None and t.is_floating_point() and t.dtype != torch.float64:
+            return autocast_dtype
+        return t.dtype
+    return torch.promote_types(cast(inputs), cast(weight))
+
+
 def _register_manual_grouped_mm_op():
     """The per-group loop as an opaque custom op, so a compiled frame that needs no gradient through it (inference,
     frozen experts) traces with no graph break. Registered once per process; None without torch.library.custom_op."""
@@ -878,14 +887,12 @@ def _register_manual_grouped_mm_op():
                 out = _grouped_matmul_loop(inputs, weight, offsets)
                 if out.shape[0] != inputs.shape[0]:  # rows past the last group: zero, as torch._grouped_mm
                     out = torch.cat((out, out.new_zeros((inputs.shape[0] - out.shape[0], out.shape[1]))))
-            return out
+            # With no nonempty group no matmul ran, so the loop kept the input dtype; return the dtype the fake promises.
+            return out.to(_manual_grouped_mm_dtype(inputs, weight, autocast_dtype))
 
         @manual_grouped_mm.register_fake
         def _(inputs, weight, offsets, autocast_dtype):
-            def cast(t):
-                return autocast_dtype if autocast_dtype is not None and t.is_floating_point() and \
-                    t.dtype != torch.float64 else t.dtype
-            dtype = torch.promote_types(cast(inputs), cast(weight))
+            dtype = _manual_grouped_mm_dtype(inputs, weight, autocast_dtype)
             return inputs.new_empty((inputs.shape[0], weight.shape[-1]), dtype = dtype)
 
         return torch.ops.unsloth_zoo.manual_grouped_mm.default
@@ -915,6 +922,8 @@ def _manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torc
         and torch.compiler.is_compiling()
         and not (torch.is_grad_enabled() and (inputs.requires_grad or weight.requires_grad))
     ):
+        if inputs.shape[0] == 0:  # no matmul runs in eager either: empty, in the input dtype
+            return inputs.new_empty((0, weight.shape[-1]))
         return _MANUAL_GROUPED_MM_OP(inputs, weight, offsets, _autocast_dtype(inputs.device.type))
     return _manual_grouped_mm_eager(inputs, weight, offsets)
 
