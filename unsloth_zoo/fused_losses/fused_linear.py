@@ -439,7 +439,7 @@ if _HAS_TRITON:
             tl.store(top1_ptr + row, (best_i == tgt) & valid)
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ("n_rows", "stride_k", "split0",))
     def _fl_partial_kernel(
         x_ptr, x_stride, n_cols, n_rows, split_cols, stride_k, col0, split0, bias_ptr, tgt_ptr, part_ptr,
         inv_t, scale, cap, top_ptr, top_stride,
@@ -530,7 +530,7 @@ if _HAS_TRITON:
             tl.store(p + 5 * stride_k, best)
             tl.store(p + 6 * stride_k, best_i.to(tl.float32))
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ("n_rows", "stride_k",))
     def _fl_combine_kernel(
         x_ptr, x_stride, n_cols, n_rows, n_splits, stride_k, split_cols, part_ptr,
         tgt_ptr, exact_ptr, bias_ptr,
@@ -641,7 +641,7 @@ if _HAS_TRITON:
             tl.store(dz_row + offs, dz.to(dz_ptr.dtype.element_ty), mask = ok)
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ("n_rows", "split0", "stride_k",))
     def _fl_flash_p_kernel(
         x_ptr, x_stride, p_ptr, p_stride, n_cols, n_rows, col0, split0, n_splits, stride_k, part_ptr,
         tgt_ptr, bias_ptr, m_ptr, acc_ptr, acc_stride, H,
@@ -682,7 +682,7 @@ if _HAS_TRITON:
         tl.debug_barrier()
         tl.store(m_ptr + row, m_new)
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ("n_rows", "stride_k",))
     def _fl_flash_u_kernel(
         acc_ptr, acc_stride, w_ptr, w_stride, w_stride_h, u_ptr, u_stride, map_ptr, row0, H, n_rows, stride_k, split_cols,
         part_ptr, tgt_ptr, logp_ptr, lse_ptr, m_ptr, g_ptr,
@@ -718,7 +718,7 @@ if _HAS_TRITON:
             a = tl.load(acc_ptr + row * acc_stride + ho, mask = ok, other = 0.0)
             tl.store(u_ptr + out * u_stride + ho, (ct * w - a * r).to(u_ptr.dtype.element_ty), mask = ok)
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ("n",))
     def _fl_scale_kernel(x_ptr, g_ptr, out_ptr, n, cols, PER_ROW: tl.constexpr, BLOCK: tl.constexpr):
         offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         ok = offs < n
