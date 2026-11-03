@@ -198,7 +198,7 @@ print(json.dumps({"ok": True}))
 
 
 def test_gemma4_vision_layers_recompute_with_the_same_norm_kernel(tmp_path):
-    # Failing before: vision norms ran fp16, then float32 on recomputation: CheckpointError (77 vs 70 saved tensors).
+    # Guards the scoped design: without a vision scope, norms run fp16 then float32 on recomputation (CheckpointError).
     import pytest
 
     try:
