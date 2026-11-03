@@ -176,6 +176,69 @@ print(json.dumps({"reload_max_abs": float((logits(model) - want).abs().max()), "
 '''
 
 
+LEGACY_TRAIN = COMMON + r"""
+import unsloth_zoo, unsloth_zoo.temporary_patches
+from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
+assert unsloth_zoo.__file__.startswith(os.environ["REPO"]), unsloth_zoo.__file__
+assert os.environ["UNSLOTH_MOE_LORA_B_LAYOUT"] == "grouped_by_expert"
+for fn in TEMPORARY_PATCHES:
+    try:
+        fn()
+    except Exception:
+        pass
+from peft import LoraConfig, get_peft_model
+from safetensors.torch import load_file, save_file
+cfg = LoraConfig(r = 4, lora_alpha = 8, target_modules = ["q_proj"], init_lora_weights = False,
+                 target_parameters = ["experts.gate_up_proj", "experts.down_proj"])
+for seed, name in ((1, "adapter"), (2, "other")):
+    torch.manual_seed(seed)
+    model = get_peft_model(model_class().from_pretrained(CKPT, dtype = torch.float32), cfg)
+    torch.save(logits(model), os.path.join(WORK, name + "_logits.pt"))
+    model.save_pretrained(os.path.join(WORK, name))
+# An older zoo wrote the same bytes as 2D [out, R*E].
+import shutil
+shutil.copytree(ADAPTER, ADAPTER + "_2d")
+weights = load_file(os.path.join(ADAPTER, "adapter_model.safetensors"))
+shapes = sorted({tuple(v.shape) for k, v in weights.items() if ".experts." in k and ".lora_B." in k})
+save_file({k: v.reshape(v.shape[0], -1).contiguous() if v.dim() == 3 else v for k, v in weights.items()},
+          os.path.join(ADAPTER + "_2d", "adapter_model.safetensors"))
+marker = json.load(open(os.path.join(ADAPTER, "adapter_config.json"))).get("lora_B_layout")
+print(json.dumps({"expert_lora_B_shapes": shapes, "marker": marker}))
+"""
+
+LEGACY_LOAD_UNSET = COMMON + r"""
+import unsloth_zoo, unsloth_zoo.temporary_patches
+from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
+assert unsloth_zoo.__file__.startswith(os.environ["REPO"]), unsloth_zoo.__file__
+assert "UNSLOTH_MOE_LORA_B_LAYOUT" not in os.environ
+for fn in TEMPORARY_PATCHES:
+    try:
+        fn()
+    except Exception:
+        pass
+from peft import PeftModel
+from peft.utils.hotswap import hotswap_adapter
+SOURCE = ADAPTER + os.environ["LEGACY_SUFFIX"]
+OTHER = os.path.join(WORK, "other")
+want = torch.load(os.path.join(WORK, "adapter_logits.pt"))
+base = lambda: model_class().from_pretrained(CKPT, dtype = torch.float32)
+out = {}
+out["peft_from_pretrained"] = float((logits(PeftModel.from_pretrained(base(), SOURCE)) - want).abs().max())
+direct = base()
+direct.load_adapter(SOURCE)
+out["transformers_load_adapter"] = float((logits(direct) - want).abs().max())
+if TRANSFORMERS_5:
+    swapped = base()
+    swapped.load_adapter(OTHER)
+    swapped.load_adapter(SOURCE, adapter_name = "default", hotswap = True)
+    out["transformers_hotswap"] = float((logits(swapped) - want).abs().max())
+peft_swapped = PeftModel.from_pretrained(base(), OTHER)
+hotswap_adapter(peft_swapped, SOURCE, adapter_name = "default")
+out["peft_hotswap_adapter"] = float((logits(peft_swapped) - want).abs().max())
+print(json.dumps(out))
+"""
+
+
 def _run(code, family, work, zoo, **extra):
     env = {k: v for k, v in os.environ.items() if not k.startswith("UNSLOTH_")}
     env.update(HF_HUB_OFFLINE = "1", OMP_NUM_THREADS = "4", REPO = REPO,
@@ -387,3 +450,45 @@ def test_load_adapter_under_disk_offload_passes_a_converted_file(monkeypatch, tm
     )
     assert out["state_dict"] is None and len(out["checkpoint_files"]) == 1
     assert torch.equal(load_file(out["checkpoint_files"][0])["k"], torch.zeros(2))
+
+
+@pytest.mark.parametrize("file_kind", ["3d", "2d"])
+@pytest.mark.parametrize("family", ["llama4", "qwen3_vl_moe"])
+def test_legacy_adapter_loads_as_trained_on_every_path_with_the_switch_unset(tmp_path, family, file_kind):
+    # The adapter_config.json lora_B_layout marker, not the switch, says the file is grouped_by_expert: transformers'
+    # load_adapter and both hotswaps must repack it as PeftModel.load_adapter does, for 3D files and older 2D ones.
+    work = str(tmp_path)
+    _run(VANILLA_SAVE, family, work, zoo = False)
+    trained = _run(LEGACY_TRAIN, family, work, zoo = True, UNSLOTH_MOE_LORA_B_LAYOUT = "grouped_by_expert")
+    assert trained["marker"] == "grouped_by_expert", trained
+    assert trained["expert_lora_B_shapes"] and all(len(s) == 3 for s in trained["expert_lora_B_shapes"]), trained
+    loaded = _run(LEGACY_LOAD_UNSET, family, work, zoo = True, LEGACY_SUFFIX = "" if file_kind == "3d" else "_2d")
+    keys = ["peft_from_pretrained", "transformers_load_adapter", "peft_hotswap_adapter"]
+    if _transformers_at_least_5():
+        keys.append("transformers_hotswap")
+    for key in keys:
+        assert loaded[key] <= 1e-4, (key, loaded)
+
+
+def test_load_adapter_source_reads_the_adapter_location_across_signatures():
+    # The repack rereads adapter_config.json from where the tensors came from; an in-memory state dict has none.
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
+
+    def v5(self, peft_model_id = None, adapter_name = None, peft_config = None, adapter_state_dict = None,
+           hotswap = "auto", local_files_only = False, adapter_kwargs = None, load_config = None, **kwargs):
+        pass
+
+    def v4(self, peft_model_id = None, adapter_name = None, revision = None, token = None, peft_config = None,
+           adapter_state_dict = None, hotswap = "auto", adapter_kwargs = None):
+        pass
+
+    model_id, hub = swap._load_adapter_source(v5, (None, "org/adapter"), {"adapter_kwargs": {"subfolder": "s"},
+                                              "local_files_only": True, "token": "t"})
+    assert model_id == "org/adapter" and hub["subfolder"] == "s" and hub["local_files_only"] and hub["token"] == "t"
+    from_config = SimpleNamespace(pretrained_model_name_or_path = "org/x", download_kwargs = {"cache_dir": "/c"})
+    model_id, hub = swap._load_adapter_source(v5, (None,), {"load_config": from_config})
+    assert model_id == "org/x" and hub["cache_dir"] == "/c"
+    assert swap._load_adapter_source(v5, (None, None), {"peft_config": object(), "adapter_state_dict": {}}) == (None, {})
+    model_id, hub = swap._load_adapter_source(v4, (None, "dir", "default", "rev"), {})
+    assert model_id == "dir" and hub["revision"] == "rev"
