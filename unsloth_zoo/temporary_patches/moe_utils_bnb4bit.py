@@ -64,6 +64,7 @@ __all__ = [
     "patch_bnb4bit_model_conversion_mapping",
     "patch_bnb4bit_keep_fused_experts",
     "patch_bnb4bit_dequantize_plain_params",
+    "patch_bnb4bit_prequantized_plain_weight_dtype",
     "patch_transformers_weight_converter_kwargs",
     "replace_expert_params_with_bnb_params",
     "forward_moe_backend_bnb4bit",
@@ -988,7 +989,8 @@ def _bnb4bit_expert_weight_conversions(hf_quantizer):
 
         def convert(self, input_dict, model=None, full_layer_name=None, **kwargs):
             if len(input_dict) == 1:
-                return input_dict  # no quant stats collected -> not prequantized
+                # no quant stats collected -> not prequantized
+                return _cast_unquantized_passthrough(self, input_dict)
             input_dict = dict(input_dict)  # avoid mutating the caller's dict
             for key, value in list(input_dict.items()):
                 if isinstance(value, list):
@@ -1707,6 +1709,67 @@ def patch_bnb4bit_model_conversion_mapping():
 pass
 
 
+# Dtype the loader planned for the param, recorded by the patched `get_new_dtype` before it returns None.
+_PLAIN_DTYPE_ATTR = "_unsloth_unquantized_dtype"
+
+
+def _cast_unquantized_passthrough(op, input_dict):
+    dtype = getattr(op, _PLAIN_DTYPE_ATTR, None)
+    if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+        return input_dict
+
+    def cast(value):
+        if isinstance(value, torch.Tensor) and value.is_floating_point() and value.dtype != dtype:
+            return value.to(dtype)
+        return value
+
+    return {
+        key: [cast(v) for v in value] if isinstance(value, list) else cast(value)
+        for key, value in input_dict.items()
+    }
+
+
+def patch_bnb4bit_prequantized_plain_weight_dtype():
+    """transformers >= 5.21: unquantized weights of a prequantized bnb 4-bit checkpoint load in the requested dtype.
+
+    get_new_dtype cannot tell the plain weight from its fp32 quant stats, so keep its None; the passthrough casts.
+    """
+    try:
+        from transformers.integrations.bitsandbytes import Bnb4bitDeserialize
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+    except Exception as e:
+        return raise_error("transformers.integrations.bitsandbytes.Bnb4bitDeserialize", e)
+
+    original_get_new_dtype = getattr(Bnb4BitHfQuantizer, "get_new_dtype", None)
+    if original_get_new_dtype is None:
+        return  # transformers < 5.21 casts plain weights itself
+    if not getattr(original_get_new_dtype, "_unsloth_plain_dtype_patched", False):
+
+        def patched_get_new_dtype(self, converter, param, dtype):
+            new_dtype = original_get_new_dtype(self, converter, param, dtype)
+            if new_dtype is None and isinstance(dtype, torch.dtype) and dtype.is_floating_point:
+                for op in getattr(converter, "operations", None) or ():
+                    if isinstance(op, Bnb4bitDeserialize):
+                        setattr(op, _PLAIN_DTYPE_ATTR, dtype)
+            return new_dtype
+
+        patched_get_new_dtype._unsloth_plain_dtype_patched = True
+        patch_function(Bnb4BitHfQuantizer, "get_new_dtype", patched_get_new_dtype, match_level = "relaxed")
+
+    original_convert = Bnb4bitDeserialize.convert
+    if getattr(original_convert, "_unsloth_plain_dtype_patched", False):
+        return
+
+    def patched_convert(self, input_dict, model = None, full_layer_name = None, **kwargs):
+        lone = len(input_dict) == 1
+        out = original_convert(self, input_dict, model = model, full_layer_name = full_layer_name, **kwargs)
+        return _cast_unquantized_passthrough(self, out) if lone else out
+
+    patched_convert._unsloth_plain_dtype_patched = True
+    patch_function(Bnb4bitDeserialize, "convert", patched_convert, match_level = "relaxed")
+pass
+
+
 def patch_bnb4bit_dequantize_plain_params():
     """Dequantize prequantized Params4bit left on plain nn.Parameter slots.
 
@@ -1785,6 +1848,7 @@ def _register_transformers_v5_moe_bnb4bit_patches():
     TEMPORARY_PATCHES.append(patch_bnb4bit_model_conversion_mapping)
     TEMPORARY_PATCHES.append(patch_bnb4bit_keep_fused_experts)
     TEMPORARY_PATCHES.append(patch_bnb4bit_dequantize_plain_params)
+    TEMPORARY_PATCHES.append(patch_bnb4bit_prequantized_plain_weight_dtype)
     TEMPORARY_PATCHES.append(patch_transformers_weight_converter_kwargs)
     TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
     TEMPORARY_PATCHES.append(patch_peft_param_wrapper_merge_4bit)
