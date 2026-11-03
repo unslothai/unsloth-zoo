@@ -107,8 +107,7 @@ def _run(code, out, zoo):
     env.update(HF_HUB_OFFLINE = "1", OMP_NUM_THREADS = "4", REPO = REPO,
                UNSLOTH_COMPILE_LOCATION = os.path.join(out, "ucc"))
     if zoo:
-        # A fresh interpreter has none of conftest.py's initialization mocks: configure the CPU import here, as
-        # test_forced_float32_undo_families.py does.
+        # A fresh interpreter lacks conftest.py's mocks: configure the CPU import here.
         env.update(PYTHONPATH = os.pathsep.join(p for p in (REPO, os.environ.get("PYTHONPATH")) if p),
                    CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", UNSLOTH_ALLOW_CPU = "1",
                    UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_FORCE_FLOAT32 = "1")
@@ -199,9 +198,7 @@ print(json.dumps({"ok": True}))
 
 
 def test_gemma4_vision_layers_recompute_with_the_same_norm_kernel(tmp_path):
-    # Failing before: vision encoder layers share Gemma4RMSNorm but never set the boundary, so image features taken
-    # before the text embedding ran fp16 norms, and the checkpoint recomputation (after the embedding set float32) ran
-    # the float32 ones: CheckpointError (77 vs 70 saved tensors).
+    # Failing before: vision norms ran fp16, then float32 on recomputation: CheckpointError (77 vs 70 saved tensors).
     import pytest
 
     try:
@@ -238,9 +235,8 @@ print(json.dumps({"after": str(getattr(p._GEMMA4_BOUNDARY, "dtype", None))}))
 
 
 def test_gemma4_boundary_does_not_leak_past_its_scope(tmp_path):
-    # Failing before: the embedding and each attention wrote the float32 boundary and nothing restored it, so norms
-    # outside the text model (the Unified multimodal embedder, its fp16 embedding_projection) returned float32 and the
-    # projector raised "expected m1 and m2 to have the same dtype, but got: float != c10::Half".
+    # Failing before: a stale float32 boundary made the multimodal embedder norm return float32 into its fp16
+    # projector ("expected m1 and m2 to have the same dtype, but got: float != c10::Half").
     import pytest
 
     try:

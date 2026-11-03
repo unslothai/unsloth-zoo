@@ -293,10 +293,8 @@ def _gemma4_skip_or_undo(class_suffix):
     return True
 
 
-# The dtype the projections take when no autocast is active (float32 on full finetuning, else None or fp16 = the fp16
-# path), scoped: set on entry to the text model, each text decoder layer and each vision encoder layer (and by each
-# text attention), restored on exit. Read by the Gemma-4 RMSNorms inside those scopes, the final norm before lm_head
-# included; norms outside any scope (multimodal embedders, audio) keep the fp16 output. Per thread.
+# Per-thread projection dtype without autocast (float32 on full finetuning), set and restored around the text model and
+# each text / vision layer; the RMSNorms inside read it, norms outside (embedders, audio) keep the fp16 output.
 _GEMMA4_BOUNDARY = threading.local()
 
 
@@ -346,7 +344,6 @@ pass
 _gemma4_rms_norm_unscaled = compile_with_eager_fallback(_gemma4_rms_norm_unscaled, "Gemma4RMSNorm.forward (unscaled)")
 
 
-# Full finetuning in float32 without autocast: the consumers (projections, lm_head) are float32, so no fp16 clamp / cast.
 def _gemma4_rms_norm_scaled_float32(hidden_states_2d, weight_1d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -376,8 +373,7 @@ def patch_Gemma4RMSNorm():
         # Gemma4 scales by `weight` directly (no 1.0 + weight) and only when
         # with_scale. `self` is read in eager, so it never reaches the kernel's guards.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
-        # float32 projections and no autocast (full finetuning): stay float32, else the final norm hands fp16 to a
-        # float32 lm_head ("Half != float"). Every other path keeps the fp16 output.
+        # Full finetuning keeps float32, else the final norm hands fp16 to a float32 lm_head ("Half != float").
         to_float32 = getattr(_GEMMA4_BOUNDARY, "dtype", None) == torch.float32 and \
             not torch.is_autocast_enabled(hidden_states.device.type)
         if self.with_scale:
@@ -467,8 +463,7 @@ def _patch_gemma4_text_attention(module, prefix):
         cos = cos.to(torch.float32)
         sin = sin.to(torch.float32)
 
-        # fp16 norm output meets fp32 projections on full finetuning (identity on LoRA). The decision is published
-        # for the RMSNorms that run after this layer, the final norm before lm_head included.
+        # Published for the RMSNorms after this layer: fp16 norm output meets fp32 projections on full finetuning.
         boundary = None if torch.is_autocast_enabled(hidden_states.device.type) else \
             _linear_boundary_dtype(self, "q_proj")
         _GEMMA4_BOUNDARY.dtype = boundary
@@ -633,10 +628,8 @@ def _gemma4_model_boundary(model):
 
 
 def patch_Gemma4TextDecoderLayerBoundary():
-    # Set at scope entry from the scope's own projections and restored on exit: a norm then picks the same kernel in the
-    # forward and in a checkpoint recomputation, whatever ran before it (another layer, the other tower, an
-    # inputs_embeds forward), and norms outside these scopes never see a float32 left behind (CheckpointError, or a
-    # float32 norm output into an fp16 projector).
+    # Scoped to each forward and restored on exit, so a checkpoint recomputation picks the same norm kernel and norms
+    # outside the scopes never see a stale float32 (CheckpointError, or float32 into an fp16 projector).
     if other_family_load(_GEMMA4_FAMILY): return
     scopes = (
         ("TextModel", _gemma4_model_boundary),
