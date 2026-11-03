@@ -537,8 +537,7 @@ class BlockSwap:
 
     @contextmanager
     def shaped(self):
-        """Evicted weights read as empty tensors, but PEFT wraps MoE expert weights by their shape. While this is
-        open they read as zero-stride placeholders of their real shape, on their own card, holding no memory."""
+        """Expose evicted weight shapes to PEFT using zero-stride placeholders."""
         held = []
         try:
             for b in self.blocks:

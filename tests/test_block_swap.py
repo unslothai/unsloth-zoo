@@ -330,7 +330,6 @@ def test_state_dict_substitutes_host_copies_for_evicted_blocks():
 
 
 def test_shaped_gives_evicted_expert_weights_their_shape_without_memory():
-    # PEFT's ParamWrapper reads an expert weight's shape; an evicted one is an empty tensor.
     if not torch.cuda.is_available():
         print("[SKIP] CUDA not available")
         return
@@ -357,7 +356,7 @@ def test_shaped_gives_evicted_expert_weights_their_shape_without_memory():
             import inspect
             kwargs = {}
             if "config" in inspect.signature(ParamWrapper.__init__).parameters:
-                from peft import LoraConfig  # peft >= 0.19 takes the adapter config
+                from peft import LoraConfig
                 kwargs["config"] = LoraConfig(r = 2, lora_alpha = 2)
             pw = ParamWrapper(layers[0], "default", parameter_name = "gate_up_proj", r = 2, lora_alpha = 2, **kwargs)
             assert pw.num_experts == 4
@@ -368,7 +367,6 @@ def test_shaped_gives_evicted_expert_weights_their_shape_without_memory():
 
 def test_shaped_restores_placeholders_set_before_a_failure():
     import types, pytest
-    # Runs on CPU: shaped() only touches .data, so a fake block is enough. The second expand fails.
     a, b = nn.Parameter(torch.empty(0), requires_grad = False), nn.Parameter(torch.empty(0), requires_grad = False)
     blk = types.SimpleNamespace(resident = False, params = [a, b], empties = [a.data, b.data],
                                 sig = [((4, 16, 8),), ((4, -2),)])
@@ -383,7 +381,7 @@ def test_shaped_leaves_a_block_fetched_inside_the_context():
     w = nn.Parameter(torch.empty(0), requires_grad = False)
     blk = types.SimpleNamespace(resident = False, params = [w], empties = [w.data], sig = [((4, 8),)])
     with BlockSwap.shaped(types.SimpleNamespace(blocks = [blk])):
-        w.data, blk.resident = torch.ones(4, 8), True  # what a fetch does
+        w.data, blk.resident = torch.ones(4, 8), True
     assert w.shape == (4, 8) and w.sum() == 32
 
 
