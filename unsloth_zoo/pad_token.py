@@ -401,6 +401,7 @@ def fix_pad_token(
     result.update(changed=True, new_pad=new_pad, added=added)
 
     fits = added and _fits_embedding_rows(model, inner.pad_token_id, vocab_size)
+    resized = False
     if model is not None:
         if added and hasattr(model, "resize_token_embeddings"):
             try:
@@ -417,9 +418,13 @@ def fix_pad_token(
                         for ctx in no_inference:
                             stack.enter_context(ctx)
                         model.resize_token_embeddings(target)
+                    resized = True
                     _suppress_padded_rows(model, len(inner), target)
             except Exception:
                 pass
+            # A completed resize gave the new pad a row: re-check against it, else the pre-resize check raised and the
+            # caller's fallback reloaded a tokenizer without the pad onto the already resized model.
+            fits = fits or (resized and _fits_embedding_rows(model, inner.pad_token_id, None))
         model_cfg = getattr(model, "config", None)
         if model_cfg is not None:
             model_cfg.update({"pad_token_id": inner.pad_token_id})
