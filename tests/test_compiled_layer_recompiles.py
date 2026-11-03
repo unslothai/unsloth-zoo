@@ -220,3 +220,50 @@ def test_checkpoint_recompute_reuses_the_forward_graph(with_owner):
         assert backward_frames == 0
     else:
         assert backward_frames >= 1  # control: the guard failure is real on this torch
+
+
+class _HiddenLayer(_Layer):
+    def __init__(self, var):
+        super().__init__(var)
+
+        def pre_hook(module, args):  # transformers' hidden_states branch: the layer input, once per layer
+            collected = var.get()
+            if collected is not None and "hidden_states" in collected.keys():
+                collected["hidden_states"].append(args[0])
+
+        self.proj.register_forward_pre_hook(pre_hook)
+
+
+@pytest.mark.parametrize("drop_outputs", [False, True])
+def test_checkpoint_recompute_reuses_the_forward_graph_with_hidden_states(drop_outputs):
+    """output_hidden_states=True keeps earlier layers' tensors in the real list, and the compiled layer guards on
+    them: the replay must hand back tensors with the same metadata, not None, also once the outputs are gone."""
+    from torch.utils.checkpoint import checkpoint
+    from unsloth_zoo.temporary_patches.misc import output_capture_scratch
+    var = _collector()
+    layers = [_HiddenLayer(var) for _ in range(3)]
+    torch._dynamo.reset()
+    cc = CompileCounter()
+    compiled = torch.compile(_HiddenLayer.forward, backend = cc, dynamic = None)
+
+    def block(layer, x):
+        with output_capture_scratch(owner = layer):
+            return compiled(layer, x)
+
+    x = torch.randn(2, 7, 8, requires_grad = True)
+    collected = {"router_logits": [], "hidden_states": [x.detach().clone()]}
+    token = var.set(collected)
+    try:
+        h = x
+        for layer in layers:
+            h = checkpoint(block, layer, h, use_reentrant = False)
+    finally:
+        var.reset(token)
+    forward_frames = cc.frame_count
+    if drop_outputs:
+        collected["hidden_states"].clear()
+    h.sum().backward()
+    backward_frames = cc.frame_count - forward_frames
+    torch._dynamo.reset()
+    assert len(collected["router_logits"]) == len(layers)
+    assert backward_frames == 0

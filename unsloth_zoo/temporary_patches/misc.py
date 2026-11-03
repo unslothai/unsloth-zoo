@@ -3910,11 +3910,36 @@ def _in_backward():
 pass
 
 
+class _TensorStandIn:
+    """A collected tensor (an earlier layer's hidden state) seen by a compiled layer. Held weakly, since keeping it
+    would pin every layer's activations until the recompute; the metadata rebuilds an equal-guard tensor if it died."""
+    __slots__ = ("ref", "meta")
+
+    def __init__(self, x):
+        self.ref = weakref.ref(x)
+        self.meta = (tuple(x.shape), tuple(x.stride()), x.dtype, x.device, x.requires_grad)
+
+    def materialize(self):
+        x = self.ref()
+        if x is not None:
+            return x
+        shape, stride, dtype, device, requires_grad = self.meta
+        return torch.empty_strided(shape, stride, dtype = dtype, device = device).requires_grad_(requires_grad)
+pass
+
+
 def _capture_layout(value):
-    # Tensors become None: keeping them would hold every layer's activations until the recompute.
     return {
-        k: [None if isinstance(x, torch.Tensor) else x for x in v] if type(v) is list else v
+        k: [_TensorStandIn(x) if isinstance(x, torch.Tensor) else x for x in v] if type(v) is list else v
         for k, v in value.items()
+    }
+pass
+
+
+def _replayed_value(layout):
+    return {
+        k: [x.materialize() if isinstance(x, _TensorStandIn) else x for x in v] if type(v) is list else v
+        for k, v in layout.items()
     }
 pass
 
@@ -3940,7 +3965,7 @@ def _replay_capture_state(var, seen):
         if tls is None:
             import threading
             tls = state.setdefault("_unsloth_eager_tls", threading.local())
-        var._unsloth_eager_value = {k: list(v) if type(v) is list else v for k, v in layout.items()}
+        var._unsloth_eager_value = _replayed_value(layout)
         var._unsloth_eager_single = True
         tls.depth = seen_depth
     try:
