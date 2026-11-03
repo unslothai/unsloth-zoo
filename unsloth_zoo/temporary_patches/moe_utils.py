@@ -850,16 +850,15 @@ _manual_grouped_mm_eager = _manual_grouped_mm
 
 
 def _register_manual_grouped_mm_op():
-    """The per-group loop as opaque custom ops, so a compiled frame reaching it traces with no graph break (fullgraph
-    works). Same loop and the same _ManualGroupedMM.backward, so the numerics match eager; the routing signature is a
-    saved tensor here, compared in the backward op. Registered once per process; None without torch.library.custom_op."""
+    """The per-group loop as an opaque custom op, so a compiled frame that needs no gradient through it (inference,
+    frozen experts) traces with no graph break. Registered once per process; None without torch.library.custom_op."""
     if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
         return None
     try:
         return torch.ops.unsloth_zoo.manual_grouped_mm.default
     except (AttributeError, RuntimeError):
         pass
-    # Both ops read group bounds on the host (a sync), so a CUDA graph must not capture them.
+    # The op reads group bounds on the host (a sync), so a CUDA graph must not capture it.
     tags = {}
     if hasattr(torch, "Tag") and hasattr(torch.Tag, "cudagraph_unsafe"):
         import inspect
@@ -867,58 +866,19 @@ def _register_manual_grouped_mm_op():
             tags = {"tags": (torch.Tag.cudagraph_unsafe,)}
     try:
         @torch.library.custom_op("unsloth_zoo::manual_grouped_mm", mutates_args = (), **tags)
-        def manual_grouped_mm(
-            inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        def manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
             with torch.no_grad():
                 routing = _routing_signature(inputs, offsets)
                 out = _grouped_matmul_loop(inputs, weight, offsets, routing[:-_SIGNATURE_WIDTH])
                 if out.shape[0] != inputs.shape[0]:  # rows past the last group: zero, as torch._grouped_mm
                     out = torch.cat((out, out.new_zeros((inputs.shape[0] - out.shape[0], out.shape[1]))))
-            return out, torch.tensor(routing, dtype = torch.int64, device = inputs.device)
+            return out
 
         @manual_grouped_mm.register_fake
         def _(inputs, weight, offsets):
-            # dtype of the real loop's matmul (autocast included), from a zero-row one.
-            dtype = torch.matmul(inputs[:0], weight[0]).dtype
-            out = inputs.new_empty((inputs.shape[0], weight.shape[-1]), dtype = dtype)
-            routing = inputs.new_empty((offsets.numel() + _SIGNATURE_WIDTH,), dtype = torch.int64)
-            return out, routing
+            dtype = torch.promote_types(inputs.dtype, weight.dtype)
+            return inputs.new_empty((inputs.shape[0], weight.shape[-1]), dtype = dtype)
 
-        @torch.library.custom_op("unsloth_zoo::manual_grouped_mm_backward", mutates_args = (), **tags)
-        def manual_grouped_mm_backward(
-            grad_output: torch.Tensor, inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor,
-            routing: torch.Tensor, need_x: bool, need_w: bool,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            ctx = type("_Ctx", (), {})()
-            ctx.saved_tensors = (inputs, weight, offsets)
-            ctx.forward_routing = routing.tolist()
-            ctx.needs_input_grad = (need_x, need_w, False)
-            with torch.no_grad():  # as autograd runs a backward without create_graph
-                gx, gw, _ = _ManualGroupedMM.backward(ctx, grad_output)
-            return (
-                gx if gx is not None else inputs.new_empty((0,)),
-                gw if gw is not None else weight.new_empty((0,)),
-            )
-
-        @manual_grouped_mm_backward.register_fake
-        def _(grad_output, inputs, weight, offsets, routing, need_x, need_w):
-            return (
-                torch.empty_like(inputs) if need_x else inputs.new_empty((0,)),
-                torch.empty_like(weight) if need_w else weight.new_empty((0,)),
-            )
-
-        def _setup_context(ctx, inputs, output):
-            x, w, offs = inputs
-            ctx.save_for_backward(x, w, offs, output[1])
-
-        def _backward(ctx, grad, _grad_routing):
-            x, w, offs, routing = ctx.saved_tensors
-            need_x, need_w = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
-            gx, gw = torch.ops.unsloth_zoo.manual_grouped_mm_backward(grad, x, w, offs, routing, need_x, need_w)
-            return (gx if need_x else None), (gw if need_w else None), None
-
-        manual_grouped_mm.register_autograd(_backward, setup_context = _setup_context)
         return torch.ops.unsloth_zoo.manual_grouped_mm.default
     except Exception:
         return None
@@ -927,11 +887,29 @@ def _register_manual_grouped_mm_op():
 _MANUAL_GROUPED_MM_OP = _register_manual_grouped_mm_op()
 
 
+def _autocast_dtype(device_type):
+    try:
+        if torch.is_autocast_enabled(device_type):
+            return torch.get_autocast_dtype(device_type)
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    return None
+
+
 def _manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-    """Eager: the compile-disabled loop above. Inside a compiled frame: the same loop as one opaque op, not a graph
-    break (an unknown device or torch without the op keeps the disabled call)."""
-    if _MANUAL_GROUPED_MM_OP is not None and torch.compiler.is_compiling():
-        return _MANUAL_GROUPED_MM_OP(inputs, weight, offsets)[0]
+    """Eager, or any call that backpropagates through it: the compile-disabled loop above. Its routing check keeps the
+    forward's routing as a Python list on ctx, which non-reentrant checkpoint replay cannot swap; a compiled op could only
+    save it as a tensor, which replay does swap. A compiled call with no gradient through it: the same loop as one opaque
+    op, inputs cast to the autocast dtype first as the loop's matmuls would be."""
+    if (
+        _MANUAL_GROUPED_MM_OP is not None
+        and torch.compiler.is_compiling()
+        and not (torch.is_grad_enabled() and (inputs.requires_grad or weight.requires_grad))
+    ):
+        dtype = _autocast_dtype(inputs.device.type)
+        if dtype is not None:
+            inputs, weight = inputs.to(dtype), weight.to(dtype)
+        return _MANUAL_GROUPED_MM_OP(inputs, weight, offsets)
     return _manual_grouped_mm_eager(inputs, weight, offsets)
 
 

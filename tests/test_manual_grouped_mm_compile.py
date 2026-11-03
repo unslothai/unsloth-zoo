@@ -15,10 +15,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """The per-group grouped GEMM fallback (CPU, devices or torch builds without torch._grouped_mm) inside a compiled
-frame: no graph break, fullgraph traces, and outputs and gradients bit-identical to eager."""
+frame. With no gradient through it: one opaque op, no graph break, outputs and autocast dtypes as eager. With a gradient:
+the guarded eager path, so a checkpoint replay that routes differently still raises."""
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from unsloth_zoo.temporary_patches import moe_utils as M
 
@@ -28,77 +30,98 @@ needs_op = pytest.mark.skipif(
 )
 
 
-def _case(dtype, transposed):
+def _case(dtype, transposed, w_dtype = None):
     g = torch.Generator().manual_seed(0)
-    x = torch.randn(13, 16, generator = g).to(dtype).requires_grad_()
+    x = torch.randn(13, 16, generator = g).to(dtype)
+    w_dtype = w_dtype or dtype
     if transposed:  # HF stores the stacks [E, out, in]; Zoo passes the [E, in, out] view
-        w = torch.randn(4, 8, 16, generator = g).to(dtype).transpose(-2, -1).detach().requires_grad_()
+        w = torch.randn(4, 8, 16, generator = g).to(w_dtype).transpose(-2, -1)
     else:
-        w = torch.randn(4, 16, 8, generator = g).to(dtype).requires_grad_()
+        w = torch.randn(4, 16, 8, generator = g).to(w_dtype)
     offsets = torch.tensor([3, 3, 9, 13], dtype = torch.int32)  # one empty group
     return x, w, offsets
 
 
-def _run(fn, x, w, offsets):
-    x = x.detach().clone().requires_grad_()
-    w = w.detach().clone().requires_grad_()
-    out = fn(x, w, offsets)
-    (out.float() * torch.linspace(-1, 1, out.shape[-1])).sum().backward()
-    return out.detach(), x.grad, w.grad
+def _breaks(fn, *args):
+    torch._dynamo.reset()
+    explained = torch._dynamo.explain(fn)(*args)
+    return explained.graph_break_count, explained.graph_count
 
 
 @needs_op
 @pytest.mark.parametrize("backend", ["eager", "aot_eager"])
 @pytest.mark.parametrize("transposed", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_manual_grouped_mm_compiles_without_graph_break(dtype, transposed, backend):
+def test_no_grad_call_compiles_without_graph_break(dtype, transposed, backend):
     x, w, offsets = _case(dtype, transposed)
-    torch._dynamo.reset()
-    explained = torch._dynamo.explain(M._manual_grouped_mm)(x, w, offsets)
-    assert explained.graph_break_count == 0, [str(b.reason) for b in explained.break_reasons]
-    assert explained.graph_count == 1
-
-    eager = _run(M._manual_grouped_mm, x, w, offsets)
-    torch._dynamo.reset()
-    compiled = _run(torch.compile(M._manual_grouped_mm, backend = backend, fullgraph = True), x, w, offsets)
-    for got, want in zip(compiled, eager):
-        assert got.dtype == want.dtype and got.shape == want.shape and got.stride() == want.stride()
-        assert torch.equal(got, want)
+    with torch.no_grad():
+        assert _breaks(M._manual_grouped_mm, x, w, offsets) == (0, 1)
+        want = M._manual_grouped_mm(x, w, offsets)
+        torch._dynamo.reset()
+        got = torch.compile(M._manual_grouped_mm, backend = backend, fullgraph = True)(x, w, offsets)
+    assert got.dtype == want.dtype and got.shape == want.shape and torch.equal(got, want)
 
 
 @needs_op
-def test_cpu_grouped_mm_fallback_compiles_without_graph_break():
-    # The path MoE LoRA takes on a CPU: Zoo's shared grouped GEMM entry point, base and LoRA alike.
+def test_frozen_experts_compile_without_graph_break():
+    # Grad mode on, but nothing to backpropagate into (frozen experts, no grad on the hidden states).
     x, w, offsets = _case(torch.bfloat16, True)
-    assert not M._grouped_mm_supported_on(x.device)
-    torch._dynamo.reset()
-    explained = torch._dynamo.explain(M._grouped_mm_with_backward_fix)(x, w, offsets)
-    assert explained.graph_break_count == 0, [str(b.reason) for b in explained.break_reasons]
-    eager = _run(M._grouped_mm_with_backward_fix, x, w, offsets)
-    torch._dynamo.reset()
-    fn = torch.compile(M._grouped_mm_with_backward_fix, backend = "aot_eager", fullgraph = True)
-    for got, want in zip(_run(fn, x, w, offsets), eager):
-        assert torch.equal(got, want)
+    assert _breaks(M._grouped_mm_with_backward_fix, x, w, offsets) == (0, 1)
 
 
 @needs_op
-def test_compiled_backward_keeps_the_routing_guard():
-    # The forward's routing signature rides as a saved tensor; a backward seeing other rows must refuse, as eager does.
-    x, w, offsets = _case(torch.float32, False)
-    out, routing = M._MANUAL_GROUPED_MM_OP(x.detach(), w.detach(), offsets)
-    grad = torch.ones_like(out)
-    op = torch.ops.unsloth_zoo.manual_grouped_mm_backward
-    gx, gw = op(grad, x.detach(), w.detach(), offsets, routing, True, True)
-    assert torch.isfinite(gx).all() and torch.isfinite(gw).all()
-    swapped = x.detach().clone()
-    swapped[[0, 12]] = swapped[[12, 0]]
+@pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])
+def test_autocast_dtype_matches_eager(w_dtype):
+    # Eager matmuls inside the loop autocast; the opaque op must return what they would.
+    x, w, offsets = _case(torch.float32, False, w_dtype = w_dtype)
+    with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
+        want = M._manual_grouped_mm(x, w, offsets)
+        torch._dynamo.reset()
+        got = torch.compile(M._manual_grouped_mm, backend = "aot_eager", fullgraph = True)(x, w, offsets)
+    assert want.dtype == torch.bfloat16 and got.dtype == want.dtype and torch.equal(got, want)
+
+
+@needs_op
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_compiled_training_keeps_the_routing_guard_under_checkpoint_replay(backend):
+    # A gradient through the call keeps the guarded eager path: its forward routing is a Python list on ctx, which
+    # non-reentrant checkpoint replay cannot swap (a saved tensor would be swapped, hiding the reroute).
+    seen = {"n": 0}
+
+    def region(x, w):
+        seen["n"] += 1
+        ends = [4, 8, 12] if seen["n"] == 1 else [4, 9, 12]
+        return M._grouped_mm_with_backward_fix(x, w, torch.tensor(ends, dtype = torch.int32))
+
+    torch._dynamo.reset()
+    compiled = torch.compile(region, backend = backend)
+    x = torch.randn(12, 8, requires_grad = True)
+    w = torch.randn(3, 8, 6, requires_grad = True)
+    out = checkpoint(compiled, x, w, use_reentrant = False)
     with pytest.raises(RuntimeError, match = "assigned tokens differently"):
-        op(grad, swapped, w.detach(), offsets, routing, True, True)
+        out.sum().backward()
+
+
+@needs_op
+def test_compiled_training_matches_eager():
+    x, w, offsets = _case(torch.float32, False)
+
+    def run(fn):
+        xi, wi = x.clone().requires_grad_(), w.clone().requires_grad_()
+        out = fn(xi, wi, offsets)
+        (out * torch.linspace(-1, 1, out.shape[-1])).sum().backward()
+        return out.detach(), xi.grad, wi.grad
+
+    eager = run(M._manual_grouped_mm)
+    torch._dynamo.reset()
+    for got, want in zip(run(torch.compile(M._manual_grouped_mm, backend = "aot_eager")), eager):
+        assert torch.equal(got, want)
 
 
 def test_eager_call_is_unchanged():
     # Outside a compiled frame the compile-disabled autograd Function runs, as before.
     x, w, offsets = _case(torch.float32, False)
+    x.requires_grad_()
     out = M._manual_grouped_mm(x, w, offsets)
     assert type(out.grad_fn).__name__.startswith("_ManualGroupedMM")
     with torch.no_grad():
