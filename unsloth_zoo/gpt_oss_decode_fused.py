@@ -103,7 +103,7 @@ if HAS_TRITON:
     @triton.jit
     def _add_rms_norm_kernel(
         X, R, W, Y, S, N, stride_x, stride_r, stride_y, stride_s, eps, inv_n,
-        HAS_RES: tl.constexpr, BLOCK: tl.constexpr, EXACT: tl.constexpr,
+        HAS_RES: tl.constexpr, BLOCK: tl.constexpr, EXACT: tl.constexpr,  # HAS_RES: add residual first; BLOCK: next_pow2(hidden size); EXACT: libdevice rsqrt
     ):
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK)
@@ -128,7 +128,7 @@ if HAS_TRITON:
     def _sink_scale_kernel(
         A, LSE, SINK, OUT, H, Q, D,
         sa_b, sa_h, sa_q, sl_b, sl_h, sl_q, so_b, so_q, so_h,
-        BLOCK_D: tl.constexpr, EXACT: tl.constexpr,
+        BLOCK_D: tl.constexpr, EXACT: tl.constexpr,  # BLOCK_D: next_pow2(head dim); EXACT: libdevice exp + div_rn
     ):
         pid = tl.program_id(0)
         q = pid % Q
@@ -152,7 +152,7 @@ if HAS_TRITON:
     def _rope_decode_kernel(
         Q, K, COS, SIN, QO, KO, HQ, HK, HALF,
         sq_b, sq_h, sk_b, sk_h, sc_b, ss_b, sqo_b, sqo_h, sko_b, sko_h,
-        BLOCK: tl.constexpr,
+        BLOCK: tl.constexpr,  # next_pow2(head_dim // 2)
     ):
         pid = tl.program_id(0)
         b = (pid // (HQ + HK)).to(tl.int64)

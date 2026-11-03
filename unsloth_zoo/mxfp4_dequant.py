@@ -155,8 +155,8 @@ if _HAS_TRITON:
         blocks_ptr, scales_ptr, out_ptr, experts_ptr, counts_ptr,
         N, G,
         stride_out_e, stride_out_n, stride_out_k,
-        BLOCK_N: tl.constexpr, BLOCK_G: tl.constexpr, USE_EXPERTS: tl.constexpr, USE_COUNTS: tl.constexpr,
-        BF16_BITS: tl.constexpr, LONG_INDEXING: tl.constexpr, EXACT_ROUND: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_G: tl.constexpr, USE_EXPERTS: tl.constexpr, USE_COUNTS: tl.constexpr,  # BLOCK_N/G: output rows / 32-col scale groups per program (fixed per transpose / bf16 path); USE_EXPERTS: expert subset; USE_COUNTS: skip 0-token experts
+        BF16_BITS: tl.constexpr, LONG_INDEXING: tl.constexpr, EXACT_ROUND: tl.constexpr,  # BF16_BITS: build bf16 bits directly; LONG_INDEXING: int64 offsets; EXACT_ROUND: fp32 then RNE cast
     ):
         pid_e = tl.program_id(0)
         pid_n = tl.program_id(1)

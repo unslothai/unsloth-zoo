@@ -187,13 +187,13 @@ def moe_swiglu_backward_reference(grad, gate_up, act = ACT_SILU, interleaved = F
 if triton is not None:
 
     @triton.jit
-    def _rnd(x, ROUND: tl.constexpr, DT: tl.constexpr):
+    def _rnd(x, ROUND: tl.constexpr, DT: tl.constexpr):  # ROUND: round each op to DT as eager does; DT: output dtype
         if ROUND:
             return x.to(DT).to(tl.float32)
         return x
 
     @triton.jit
-    def _load_gate_up(GU, rows, cols, mask, s_m, s_c, N, INTERLEAVED: tl.constexpr):
+    def _load_gate_up(GU, rows, cols, mask, s_m, s_c, N, INTERLEAVED: tl.constexpr):  # gate / up alternate columns, else [gate | up] halves
         base = GU + rows[:, None] * s_m
         if INTERLEAVED:
             g_col = cols.to(tl.int64) * 2
@@ -206,7 +206,7 @@ if triton is not None:
         return g, u, g_col, u_col
 
     @triton.jit
-    def _clamp_gptoss(g, u, LIMIT, ROUND: tl.constexpr, DT: tl.constexpr):
+    def _clamp_gptoss(g, u, LIMIT, ROUND: tl.constexpr, DT: tl.constexpr):  # ROUND: round each op to DT as eager does; DT: output dtype
         gc = _rnd(tl.where(g > LIMIT, LIMIT, g), ROUND, DT)
         uc = _rnd(tl.where(u > LIMIT, LIMIT, tl.where(u < -LIMIT, -LIMIT, u)), ROUND, DT)
         return gc, uc
@@ -227,8 +227,8 @@ if triton is not None:
     @triton.jit
     def _swiglu_fwd_kernel(
         GU, OUT, M, N, s_gm, s_gc, s_om, ALPHA, LIMIT,
-        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # ACT: 1 gpt-oss clamp, else silu; INTERLEAVED: gate / up alternate; ROUND: eager rounding
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,  # BLOCK_N: least-padding pow2 col tile from N; BLOCK_M: 2048 // BLOCK_N rows
     ):
         rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -250,9 +250,9 @@ if triton is not None:
     @triton.jit
     def _swiglu_bwd_kernel(
         DY, GU, DGU, M, N, s_dm, s_dc, s_gm, s_gc, s_om, ALPHA, LIMIT,
-        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,
-        G_MAX_INC: tl.constexpr, U_MAX_INC: tl.constexpr, U_MIN_INC: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # ACT: 1 gpt-oss clamp, else silu; INTERLEAVED: gate / up alternate; ROUND: eager rounding
+        G_MAX_INC: tl.constexpr, U_MAX_INC: tl.constexpr, U_MIN_INC: tl.constexpr,  # grad passes at the clamp limit: gate max, up max, up min inclusive
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,  # BLOCK_N: least-padding pow2 col tile from N; BLOCK_M: 2048 // BLOCK_N rows
     ):
         rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)

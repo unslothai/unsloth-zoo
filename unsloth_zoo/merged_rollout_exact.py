@@ -92,7 +92,7 @@ if triton is not None:
         N, K,
         sWe, sWn, sWk, sAe, sAr, sAk, sBe, sBn, sBr,
         scale, mode,
-        R: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        R: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # R: LoRA rank (a.shape[1]); BLOCK_N: 32, BLOCK_K: 128 (fixed tile)
     ):
         pid_n = tl.program_id(0)
         pid_k = tl.program_id(1)

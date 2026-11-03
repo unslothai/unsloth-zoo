@@ -47,7 +47,7 @@ except Exception:
 if _HAS_TRITON:
 
     @triton.jit
-    def _decode_mxfp4_tile(packed, scale, ROWS: tl.constexpr, COLS: tl.constexpr):
+    def _decode_mxfp4_tile(packed, scale, ROWS: tl.constexpr, COLS: tl.constexpr):  # ROWS: tile rows; COLS: decoded bf16 columns (2 per byte)
         """e2m1 bits into bf16 give value * 2^-126 (0.5 on the subnormal 2^-127); 2^(scale - 1) restores it exactly."""
         x0 = ((packed & 0x07) << 6) | ((packed & 0x08) << 12)
         x1 = ((packed & 0x70) << 2) | ((packed & 0x80) << 8)
@@ -172,7 +172,7 @@ if _HAS_TRITON:
         return tl.reshape(tl.join(lo, hi), (R, CB * 2))
 
     @triton.jit
-    def _decode_probe_kernel(blocks_ptr, scales_ptr, out_ptr, CVT: tl.constexpr):
+    def _decode_probe_kernel(blocks_ptr, scales_ptr, out_ptr, CVT: tl.constexpr):  # CVT: probe the hardware e2m1 convert, else the PTX fma decode
         r = tl.program_id(0) * 64 + tl.arange(0, 64)
         packed = tl.load(blocks_ptr + r[:, None] * 16 + tl.arange(0, 16)[None, :])
         scale = tl.load(scales_ptr + r[:, None] + tl.arange(0, 1)[None, :])
@@ -191,7 +191,7 @@ if _HAS_TRITON:
         return f1, f2
 
     @triton.jit
-    def _decode_mxfp4_halves(packed, scale, ROWS: tl.constexpr, BYTES: tl.constexpr):
+    def _decode_mxfp4_halves(packed, scale, ROWS: tl.constexpr, BYTES: tl.constexpr):  # ROWS: tile rows; BYTES: packed bytes per row (one bf16 per nibble half)
         """Low- and high-nibble bf16 tiles, not interleaved (caller pairs them with even / odd columns)."""
         lo = (((packed & 0x07) << 6) | ((packed & 0x08) << 12)).to(tl.uint16).to(tl.bfloat16, bitcast = True)
         hi = (((packed & 0x70) << 2) | ((packed & 0x80) << 8)).to(tl.uint16).to(tl.bfloat16, bitcast = True)
@@ -207,9 +207,9 @@ if _HAS_TRITON:
         x_ptr, blocks_ptr, scales_ptr, out_ptr, counts_ptr, bias_ptr,
         E, R, G, K, N, M,
         stride_xm, stride_om,
-        TRANS_B: tl.constexpr, E_POW2: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-        SPLIT: tl.constexpr, GROUPED: tl.constexpr, HAS_BIAS: tl.constexpr, ASM: tl.constexpr,
+        TRANS_B: tl.constexpr, E_POW2: tl.constexpr,  # TRANS_B: out = x @ P^T (packed rows are n); E_POW2: next_pow2(num experts)
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # BLOCK_M/N/K: tiles from _pick_config / _pick_dense_config, bucketed on rows per expert
+        SPLIT: tl.constexpr, GROUPED: tl.constexpr, HAS_BIAS: tl.constexpr, ASM: tl.constexpr,  # SPLIT: x cols permuted [even|odd] per BLOCK_K; GROUPED: per-expert counts; ASM: decode mode 0/1/2
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -336,7 +336,7 @@ if _HAS_TRITON:
     def _mxfp4_grouped_gemv_kernel(
         x_ptr, blocks_ptr, scales_ptr, out_ptr, counts_ptr,
         E, R, G, stride_xm, stride_om,
-        E_POW2: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ASM: tl.constexpr,
+        E_POW2: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ASM: tl.constexpr,  # E_POW2: next_pow2(experts); BLOCK_N: 32, BLOCK_K: 256 (fixed); ASM: decode mode 0/1/2
     ):
         # out[m] = x[m] @ P[e(m)]^T, one routed row per program: near one row per expert the MMA tiles are latency bound.
         m = tl.program_id(0)
@@ -372,7 +372,7 @@ if _HAS_TRITON:
         tl.store(out_ptr + m * stride_om + offs_n, acc.to(out_ptr.dtype.element_ty), mask = mask_n)
 
     @triton.jit
-    def _decode_only_kernel(blocks_ptr, scales_ptr, out_ptr, RG, ROWS: tl.constexpr, COLS: tl.constexpr):
+    def _decode_only_kernel(blocks_ptr, scales_ptr, out_ptr, RG, ROWS: tl.constexpr, COLS: tl.constexpr):  # ROWS: packed rows per program (32); COLS: decoded cols per program (32, one group)
         pid = tl.program_id(0)
         rows = pid * ROWS + tl.arange(0, ROWS)
         cols_b = tl.program_id(1) * (COLS // 2) + tl.arange(0, COLS // 2)

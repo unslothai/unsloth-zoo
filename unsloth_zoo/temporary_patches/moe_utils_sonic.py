@@ -473,7 +473,7 @@ except Exception:
 if triton is not None:
 
     @triton.jit
-    def _swiglu_bwd_interleaved_kernel(PRE, GRAD, OUT, n_pairs, BLOCK: tl.constexpr):
+    def _swiglu_bwd_interleaved_kernel(PRE, GRAD, OUT, n_pairs, BLOCK: tl.constexpr):  # BLOCK: gate/up pairs per program (1024)
         offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n_pairs
         g = tl.load(PRE + 2 * offs, mask=mask, other=0.0).to(tl.float32)
