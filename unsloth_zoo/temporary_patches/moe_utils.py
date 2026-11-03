@@ -846,6 +846,82 @@ def _manual_grouped_mm(
 
 if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
     _manual_grouped_mm = torch.compiler.disable(_manual_grouped_mm)
+_manual_grouped_mm_eager = _manual_grouped_mm
+
+
+def _manual_grouped_mm_dtype(inputs, weight, autocast_dtype):
+    """The dtype the loop's matmuls return: autocast casts floating operands except float64."""
+    def cast(t):
+        if autocast_dtype is not None and t.is_floating_point() and t.dtype != torch.float64:
+            return autocast_dtype
+        return t.dtype
+    return torch.promote_types(cast(inputs), cast(weight))
+
+
+def _register_manual_grouped_mm_op():
+    """Per-group loop as an opaque custom op so no-grad compiled frames do not graph break; None if unsupported."""
+    if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
+        return None
+    try:
+        return torch.ops.unsloth_zoo.manual_grouped_mm.default
+    except (AttributeError, RuntimeError):
+        pass
+    # The op reads group bounds on the host (a sync), so a CUDA graph must not capture it.
+    tags = {}
+    if hasattr(torch, "Tag") and hasattr(torch.Tag, "cudagraph_unsafe"):
+        import inspect
+        if "tags" in inspect.signature(torch.library.custom_op).parameters:
+            tags = {"tags": (torch.Tag.cudagraph_unsafe,)}
+    try:
+        @torch.library.custom_op("unsloth_zoo::manual_grouped_mm", mutates_args = (), **tags)
+        def manual_grouped_mm(
+            inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor, autocast_dtype: Optional[torch.dtype],
+        ) -> torch.Tensor:
+            ctx = (
+                torch.autocast(inputs.device.type, dtype = autocast_dtype)
+                if autocast_dtype is not None else contextlib.nullcontext()
+            )
+            with torch.no_grad(), ctx:
+                out = _grouped_matmul_loop(inputs, weight, offsets)
+                if out.shape[0] != inputs.shape[0]:  # rows past the last group: zero, as torch._grouped_mm
+                    out = torch.cat((out, out.new_zeros((inputs.shape[0] - out.shape[0], out.shape[1]))))
+            # All-empty groups run no matmul; match the fake's dtype.
+            return out.to(_manual_grouped_mm_dtype(inputs, weight, autocast_dtype))
+
+        @manual_grouped_mm.register_fake
+        def _(inputs, weight, offsets, autocast_dtype):
+            dtype = _manual_grouped_mm_dtype(inputs, weight, autocast_dtype)
+            return inputs.new_empty((inputs.shape[0], weight.shape[-1]), dtype = dtype)
+
+        return torch.ops.unsloth_zoo.manual_grouped_mm.default
+    except Exception:
+        return None
+
+
+_MANUAL_GROUPED_MM_OP = _register_manual_grouped_mm_op()
+
+
+def _autocast_dtype(device_type):
+    try:
+        if torch.is_autocast_enabled(device_type):
+            return torch.get_autocast_dtype(device_type)
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    return None
+
+
+def _manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """Compiled no-grad calls use the opaque op; others use the eager loop, whose ctx-held routing list (not a tensor)
+    survives non-reentrant checkpoint replay, so rerouting still raises."""
+    if (
+        _MANUAL_GROUPED_MM_OP is not None
+        and torch.compiler.is_compiling()
+        and not (torch.is_grad_enabled() and (inputs.requires_grad or weight.requires_grad))
+    ):
+        if inputs.shape[0] == 0:  # eager keeps the input dtype
+            return inputs.new_empty((0, weight.shape[-1]))
+        return _MANUAL_GROUPED_MM_OP(inputs, weight, offsets, _autocast_dtype(inputs.device.type))
+    return _manual_grouped_mm_eager(inputs, weight, offsets)
 
 
 # Recomputes the frozen base expert GEMM in backward by rebuilding the bf16 stack from 4-bit Params4bit (dX only; LoRA
