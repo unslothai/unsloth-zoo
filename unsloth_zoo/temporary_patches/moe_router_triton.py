@@ -59,7 +59,8 @@ def fused_router_enabled():
 
 
 if HAS_TRITON:
-    @triton.jit
+    # T (token count) runtime: no ==1 / %16 variant per decode / prefill / batch size.
+    @triton.jit(do_not_specialize = ["T"])
     def _router_fwd_kernel(
         Z, BIAS, W, IDS, T, E, GS, stride_z, scale, mask_value,
         K: tl.constexpr, BLOCK_K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,
@@ -149,7 +150,8 @@ if HAS_TRITON:
         tl.store(W + offs, w, mask = out_ok)
         tl.store(IDS + offs, ids.to(tl.int64), mask = out_ok)
 
-    @triton.jit
+    # T (token count) runtime: no ==1 / %16 variant per decode / prefill / batch size.
+    @triton.jit(do_not_specialize = ["T"])
     def _router_bwd_kernel(
         Z, IDS, DW, DZ, T, E, stride_z, stride_dw, scale,
         K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,
