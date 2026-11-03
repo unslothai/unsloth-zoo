@@ -627,6 +627,17 @@ def test_mlxs_blocked_head_dim_512_route_counts_as_holding_no_full_scores(L, exp
     assert (peak < scores / 2) is expected
 
 
+@pytest.mark.parametrize("opt_out", ["0", "1"])
+def test_unsloths_nax_opt_out_leaves_mlxs_own_nax_dispatch_in_place(monkeypatch, opt_out):
+    monkeypatch.setattr(nax, "_nax_gpu", lambda: True)
+    monkeypatch.setattr(nax, "_stock_nax_kernels", lambda: True)
+    monkeypatch.setenv("UNSLOTH_MLX_NAX", opt_out)
+    q_keys, q_values = _cache(1, 1, 4096, 512, 8, group_size=32)
+    blocked_only = _queries(1, 16, 1024, 512)
+    assert not runtime_fuses(blocked_only, q_keys, q_values, 32, "causal")
+    assert fused_kernel_exists(_queries(1, 16, 2048, 512), q_keys, q_values, 32, "causal")
+
+
 def test_a_quantized_head_dim_256_prefill_dequantizes_on_the_forced_route(fused_attention):
     q_keys, q_values = _cache(1, 2, 8192, 256, 8, group_size=64)
     queries = _queries(1, 8, 64, 256)

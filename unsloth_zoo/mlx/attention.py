@@ -71,15 +71,21 @@ def _tf32_enabled():
     return _atoi(os.environ.get("MLX_ENABLE_TF32", "1")) != 0
 
 
-def _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
-    from .nax import nax_available
+def _stock_runs_nax():
+    # mlx picks its NAX kernels from the hardware; `UNSLOTH_MLX_NAX=0` turns off only Unsloth's own routes.
+    from . import nax
 
+    return nax.nax_available() or (os.environ.get("UNSLOTH_MLX_NAX") == "0" and nax._nax_gpu()
+                                   and nax._stock_nax_kernels())
+
+
+def _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
     B, HQ, L = queries.shape[0], queries.shape[-3], queries.shape[-2]
     S = q_keys[0].shape[-2]
     causal = isinstance(mask, str) and mask == "causal"
     if causal and L > S:
         return False
-    split = L >= _SPLIT_MIN_QUERIES and (_tf32_enabled() or dtype != mx.float32) and nax_available()
+    split = L >= _SPLIT_MIN_QUERIES and (_tf32_enabled() or dtype != mx.float32) and _stock_runs_nax()
     if head_dim == value_dim == 256:
         if split and (causal or isinstance(mask, mx.array)):
             return True
@@ -126,14 +132,12 @@ _FORCED_MIN_KEYS = 8192
 
 def _forced_widths(head_dim, value_dim):
     """The (head_dim, value_dim) a forced call runs at, or None. Zero padding leaves the attention exact."""
-    from .nax import nax_available
-
     if head_dim == value_dim == 256:
         return 256, 256
     if (head_dim, value_dim) == (192, 128):
         # No 192/128 kernel past 8 queries. NAX runs its head_dim 256 kernel faster than its 192 one; elsewhere the
         # reverse holds.
-        return (256, 256) if nax_available() else (192, 192)
+        return (256, 256) if _stock_runs_nax() else (192, 192)
     return None
 
 
@@ -158,11 +162,9 @@ def _pad_width(x, width):
 
 def _blocks_d512_scores(queries, n_keys, head_dim, value_dim, dtype, mask):
     # mlx's use_blocked_d512: off NAX these calls hold about 256 queries' scores, not all of them.
-    from .nax import nax_available
-
     return (head_dim == value_dim == 512 and isinstance(mask, str) and mask == "causal"
             and _SPLIT_MIN_QUERIES <= queries.shape[-2] <= n_keys and dtype != mx.float32
-            and not nax_available() and mx.metal.is_available() and mx.default_device() == mx.gpu)
+            and not _stock_runs_nax() and mx.metal.is_available() and mx.default_device() == mx.gpu)
 
 
 def runtime_fuses(queries, q_keys, q_values, group_size, mask=None):
