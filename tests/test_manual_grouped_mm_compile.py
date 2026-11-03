@@ -169,13 +169,22 @@ def test_autocast_casts_only_the_active_experts():
 
 
 @needs_op
+@pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
-def test_empty_batch_under_autocast_matches_eager(backend):
-    x = torch.randn(0, 16)
+def test_empty_batch_under_autocast_matches_eager(backend, dynamic):
+    # No matmul runs for zero rows, so eager keeps the input dtype; ops after it must see the same dtype compiled.
     w = torch.randn(4, 16, 8)
-    offsets = torch.zeros(4, dtype = torch.int32)
+
+    def f(x, offsets):
+        y = M._manual_grouped_mm(x, w, offsets)
+        return y * 2, y.dtype == torch.bfloat16
+
+    empty = (torch.randn(0, 16), torch.zeros(4, dtype = torch.int32))
     with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
-        want = M._manual_grouped_mm(x, w, offsets)
+        want, want_bf16 = f(*empty)
         torch._dynamo.reset()
-        got = torch.compile(M._manual_grouped_mm, backend = backend, fullgraph = True)(x, w, offsets)
-    assert got.shape == want.shape and got.dtype == want.dtype
+        fn = torch.compile(f, backend = backend, dynamic = dynamic, fullgraph = True)
+        if dynamic:
+            fn(torch.randn(5, 16), torch.tensor([2, 3, 5, 5], dtype = torch.int32))
+        got, got_bf16 = fn(*empty)
+    assert got.shape == want.shape and got.dtype == want.dtype and got_bf16 == want_bf16
