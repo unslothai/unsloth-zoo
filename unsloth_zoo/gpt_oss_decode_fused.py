@@ -124,7 +124,10 @@ if HAS_TRITON:
         w = tl.load(W + cols, mask = ok, other = 0.0).to(tl.float32)
         tl.store(Y + row * stride_y + cols, (y * w).to(Y.dtype.element_ty), mask = ok)
 
-    @triton.jit
+    # Q (query length: 1 in decode, the prompt length in prefill) and the lse strides it sets only
+    # index scalars: unspecialized, so prefill and decode share one variant. The attention / output
+    # strides keep their % 16 hint (vector loads along D).
+    @triton.jit(do_not_specialize = ["Q", "sl_b", "sl_h", "sl_q"])
     def _sink_scale_kernel(
         A, LSE, SINK, OUT, H, Q, D,
         sa_b, sa_h, sa_q, sl_b, sl_h, sl_q, so_b, so_q, so_h,

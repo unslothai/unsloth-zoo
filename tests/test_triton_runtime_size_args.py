@@ -27,10 +27,15 @@ CASES = {
         "_causal_conv1d_bwd_dxdw_kernel": ("T", "NT"),
     },
     "temporary_patches/moe_fused_swiglu.py": {"_swiglu_fwd_kernel": ("M",), "_swiglu_bwd_kernel": ("M",)},
+    "temporary_patches/moe_nf4_grouped.py": {"_nf4_grouped_kernel": ("M", "M_HINT")},
+    "gpt_oss_decode_fused.py": {"_sink_scale_kernel": ("Q", "sl_b", "sl_h", "sl_q")},
 }
 
 # Sizes that must keep Triton's % 16 hint: they mask a contiguous axis, so dropping it loses vectorised loads.
-KEEP_SPECIALIZED = {"fused_losses/fused_linear.py": {"_fl_scale_kernel": ("n",)}}
+KEEP_SPECIALIZED = {
+    "fused_losses/fused_linear.py": {"_fl_scale_kernel": ("n",)},
+    "gpt_oss_decode_fused.py": {"_sink_scale_kernel": ("D", "sa_b", "sa_h", "sa_q", "so_b", "so_q", "so_h")},
+}
 
 
 def _defs(path):
