@@ -55,7 +55,6 @@ class _BertLayer(nn.Module):
 
 
 class _GitLike(nn.Module):
-    """GitForCausalLM's layout: a vision tower tagged vision_model, a BERT-style decoder at git.encoder.layer.N."""
     def __init__(self, dim = 8, n = 2):
         super().__init__()
         self.git = nn.Module()
