@@ -122,10 +122,8 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
 from .hf_cache import redirect_hf_cache_if_readonly, _active_caches
 redirect_hf_cache_if_readonly()
 
-# Size hf_xet's download buffers from THIS machine's RAM and cores. HF_XET_HIGH_PERFORMANCE=1 (the
-# old default here) raises the reconstruction buffer cap to 64GB and the stream count to 124, the
-# source of the multi-GB RSS spikes. apply_xet_env() turns it off and writes RAM-derived caps
-# instead, leaving user-set variables (a user's own high-performance flag included) untouched.
+# Size hf_xet buffers from this machine's RAM and cores; HF_XET_HIGH_PERFORMANCE=1 (old default here) meant a 64GB
+# buffer cap and multi-GB RSS spikes, so it is turned off unless the user set it.
 # _active_caches mirrors Hub's env layering (XDG_CACHE_HOME included) and returns None entries
 # instead of raising when home is unresolvable.
 from .hf_xet_tuning import apply_xet_env

@@ -297,8 +297,7 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
-# Sizing dropped under a user's high-performance flag. xet-core <= 1.6 applied the preset after env (voiding the caps);
-# >= 1.7 applies env after the preset (XetConfig::new), so any key left here beats the preset's 124/16/4 AC band.
+# Dropped under a user's high-performance flag: xet-core >= 1.7 applies env after the preset, so a kept key beats it.
 _CAPS_VOIDED_BY_HIGH_PERFORMANCE = (
     "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT",
     "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE",
@@ -382,7 +381,7 @@ def xet_env_overrides(
         "HF_XET_CLIENT_RETRY_MAX_DURATION": "30s",
         # The chunk cache only pays off when re-fetching known chunks; upstream default is already 0, pinned so a stray value cannot raise it.
         "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0",
-        # The preset raises the buffers to 64GB; on xet-core <= 1.6 it also overrides every cap above.
+        # The preset raises the buffers to 64GB, voiding the caps above on xet-core <= 1.6.
         "HF_XET_HIGH_PERFORMANCE": "0",
         "HF_XET_HP": "0",
     }
@@ -429,9 +428,8 @@ def apply_xet_env(
 
     ``setdefault`` semantics: a user-set variable is left alone, so a shell's
     ``HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT=16gb`` still wins -- and that now includes
-    ``HF_XET_HIGH_PERFORMANCE``. Enabling it is a deliberate act by someone who knows their machine,
-    so we stand down: drop our sizing (``_CAPS_VOIDED_BY_HIGH_PERFORMANCE``) and leave the flag
-    alone, whichever order the installed xet-core applies preset and environment in. Measured on a 192-core / 1996 GiB box, overriding it cost
+    ``HF_XET_HIGH_PERFORMANCE``, so our sizing (``_CAPS_VOIDED_BY_HIGH_PERFORMANCE``) stands
+    down and the flag is left alone. Measured on a 192-core / 1996 GiB box, overriding it cost
     2.55x download throughput (16684 -> 6553 Mbit/s), to defend RAM that machine was never short of.
     Set ``UNSLOTH_XET_FORCE_CAPS=1`` to get the old behaviour and cap a machine regardless.
 
