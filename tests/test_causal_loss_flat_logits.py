@@ -104,8 +104,7 @@ def test_a_custom_ignore_index_matches_the_stock_loss(patched_loss, flat):
 
 
 def test_a_custom_ignore_index_scores_half_logits_in_float32(patched_loss):
-    # 4000 tokens at nll 20 sum to 80000, past float16's 65504: a half precision sum is inf. bfloat16 keeps 8 mantissa
-    # bits, so it drifts from the float32 stock value by ~1e-3 relative, far above float32 rounding (~1e-7).
+    # 4000 tokens at nll 20 sum to 80000, past float16's 65504.
     stock, unsloth = patched_loss
     tokens, vocab = 4001, 4
     logits = torch.zeros(1, tokens, vocab, dtype = torch.float16)
