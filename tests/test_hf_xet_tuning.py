@@ -206,12 +206,18 @@ def test_a_user_set_high_performance_flag_is_left_alone():
 
 
 def test_high_performance_also_stands_our_sizing_down():
-    """With HF_XET_HIGH_PERFORMANCE set, our caps must also be dropped: xet-core voids the LIMIT but still honours the
-    smaller per-file and concurrency caps, so the result is worse than either."""
-    env = {"HF_XET_HIGH_PERFORMANCE": "1"}
-    tuning.apply_xet_env(env, profile = _profile(16))
-    for key in tuning._CAPS_VOIDED_BY_HIGH_PERFORMANCE:
-        assert key not in env, key
+    """With HF_XET_HIGH_PERFORMANCE set, our sizing must be dropped: xet-core >= 1.7 applies env after the preset, so a
+    written AC band beat the preset's 124/16/4 (unsloth-zoo#2370)."""
+    for fail_fast in (False, True):
+        env = {"HF_XET_HIGH_PERFORMANCE": "1"}
+        tuning.apply_xet_env(env, profile = _profile(16), fail_fast = fail_fast)
+        for key in (
+            *tuning._CAPS_VOIDED_BY_HIGH_PERFORMANCE,
+            "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+            "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
+            "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
+        ):
+            assert key not in env, key
     assert env["HF_XET_CHUNK_CACHE_SIZE_BYTES"] == "0"
 
 
