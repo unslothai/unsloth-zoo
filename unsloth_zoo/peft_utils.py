@@ -362,8 +362,14 @@ def get_peft_regex(
     if regex_model_parts != "":
         check = any(re.fullmatch(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
         if not check:
+            # A part switched off stays out: GIT's decoder has no language tag, so this would re-add its vision tower.
+            disabled_tags = []
+            if not finetune_vision_layers:   disabled_tags += vision_tags
+            if not finetune_language_layers: disabled_tags += language_tags
+            disabled_parts = r"(?!.*(?:" + "|".join(disabled_tags) + r"))" if disabled_tags else ""
             # Frozen audio codecs (CSM / Kyutai Mimi) run under no_grad, so LoRA there never trains.
             regex_matcher = \
+                disabled_parts + \
                 r"(?!(?:.*\.)?(?:codec_model|audio_tokenizer|acoustic_tokenizer|semantic_tokenizer)\.)" + \
                 r".*?(?:" + regex_components + \
                 r").*?\." + match_linear_modules
