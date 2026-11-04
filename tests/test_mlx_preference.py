@@ -2870,6 +2870,36 @@ def test_a_kto_batch_holds_completions_then_kl_rows_and_their_reference(with_kl)
     assert plan[1][4].tolist() == [len(third.sequence)] + ([len(third.kl)] if with_kl else [])
 
 
+def test_kto_compaction_indexes_each_rows_completion_and_kl_positions():
+    from unsloth_zoo.mlx.preference import FiniteKTOBatchPlan, TokenizedKTORow
+
+    rows = [TokenizedKTORow((1,) * (100 + 7 * i), (2,) * (40 + 9 * i), True, (1,) * (90 - i), (3,) * (30 + i))
+            for i in range(2)] + [TokenizedKTORow((), (2,) * 20, False, (), (3,) * 25)]
+    plan = FiniteKTOBatchPlan(rows, [(0, 1, 2)], with_kl=True, normalizers=[(0, 3, 1)], cycle_length=1,
+                              max_seq_length=256, pad_id=0)
+    plan.configure_cce_compaction()
+    *head, reference, completion, kl = plan.prepare_cce_batch(0, plan[0])
+    width = head[0].shape[1]
+    # Each row's own prompt length, and each half's own grid; an empty prompt starts at the first next-token position.
+    steps = lambda spans, width=width: [
+        row * (width - 1) + step - 1 for row, span in enumerate(spans) for step in range(*span)]
+    spans = [(100, 140), (107, 156), (1, 20)], [(90, 120), (89, 120), (1, 25)]
+    assert len(head) == 4 and reference is None and completion.shape == kl.shape == (256,)
+    assert [[i for i in half.tolist() if i >= 0] for half in (completion, kl)] == [steps(half) for half in spans]
+    # The shape plan's endpoint width is planned too.
+    plan.set_shape_plan(types.SimpleNamespace(report=types.SimpleNamespace(action="bucket"),
+                                              endpoint_for=lambda family, raw: raw + 32))
+    plan.configure_cce_compaction()
+    padded = plan.prepare_cce_batch(0, plan.materialize(0, phase="train"))
+    assert padded[0].shape[1] == width + 32 and len(padded) == 7
+    assert [[i for i in half.tolist() if i >= 0] for half in padded[5:]] == [steps(half, width + 32) for half in spans]
+    # A grid with fewer positions than one capacity stays uncompacted.
+    small = FiniteKTOBatchPlan(rows[2:], [(0,)], with_kl=True, normalizers=[(0, 1, 1)], cycle_length=1,
+                               max_seq_length=256, pad_id=0)
+    small.configure_cce_compaction()
+    assert len(small.prepare_cce_batch(0, small[0])) == 4
+
+
 @pytest.mark.parametrize("labels,weights,warns", [
     ([True] * 3 + [False], (1.0, 1.0), True),
     ([True] * 3 + [False], (0.4, 1.0), False),
@@ -3464,6 +3494,25 @@ def test_a_vision_kto_plan_follows_trls_vision_collator():
         plan([kto_vision_row("yes")], max_length=len(prompt))
     with pytest.raises(ValueError, match="row 1 .* decides from the first row"):
         plan([{key: value for key, value in text.items() if key != "images"}, kto_vision_row("yes")])
+
+
+def test_a_surveyed_vision_kto_plan_compacts_like_its_text_layout():
+    # KTO admission sizes a batch by its labels' row count, also once a vision plan appends its surveyed family.
+    from unsloth_zoo.mlx.preference import create_kto_batch_plan
+
+    def admitted(sizes):
+        made = create_kto_batch_plan(
+            [kto_vision_row("y" * size, label=size != 4) for size in sizes], None, batch_size=4, kl_batch_size=4,
+            num_epochs=1, grad_accum=1, length_policy=policy("kto", max_length=160, max_prompt_length=8, max_seq_length=162),  # noqa: E501
+            processor=VisionProcessor(), model_config={})
+        made.configure_cce_compaction()
+        text = list(made._cce_capacities.values())
+        made.ensure_descriptors()
+        made.configure_cce_compaction()
+        assert list(made._cce_capacities.values()) == text and all(len(family) == 6 for family, _ in made._cce_capacities)  # noqa: E501
+        return text
+    # 4 rows of 159 next-token positions: 512 slots per half are under that grid, 768 are not.
+    assert admitted((150, 100, 100, 4)) == [(512, 512)] and admitted((150, 150, 150, 150)) == []
 
 
 def test_a_vision_kto_row_keeps_the_whole_length_budget():

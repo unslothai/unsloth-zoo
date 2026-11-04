@@ -1867,7 +1867,7 @@ def create_kto_batch_plan(
 
 
 class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
-    """Batches are (ids, lengths, normalizers, labels[, reference]): completions first, then their KL rows when the loss has a KL term."""
+    """Batches are (ids, lengths, normalizers, labels[, reference]): completions first, then their KL rows when the loss has a KL term; compaction fills the reference slot (None without one), then each half's indices."""
 
     __slots__ = ("_with_kl",)
 
@@ -1897,11 +1897,52 @@ class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
             ((rows,), "bool"),
         )
 
+    def _scored_steps(self, rows, width, branch):
+        """Each row's scored positions in its branch, as indices into that branch's flattened next-token grid."""
+        for offset, row in enumerate(rows):
+            values, prompt = self._branches(row)[branch]
+            end = min(len(values), width, self.max_seq_length)
+            yield from (offset * (width - 1) + step - 1 for step in range(max(1, prompt), end))
+
     def configure_cce_compaction(self, enabled=True, *, kind="kto"):
+        """One capacity per branch, completions then KL rows, so each pass gathers only its own rows."""
         self._cce_capacities = {}
+        self._cce_kind = kind
+        if not enabled:
+            return
+        counts = {}
+        for index, row_indices in enumerate(self._schedule):
+            family = self.batch_family(index)
+            rows = [self._rows[row_index] for row_index in row_indices]
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                count = [sum(1 for _ in self._scored_steps(rows, width, branch))
+                         for branch in range(1 + self._with_kl)]
+                held = counts.get((family, width), count)
+                counts[family, width] = [max(a, b) for a, b in zip(held, count)]
+        for (family, width), count in counts.items():
+            _kind, _ids, _lengths, _normalizers, ((rows,), _labels), *_surveyed = family
+            capacities = tuple(max(256, ((value + 255) // 256) * 256) for value in count)
+            if all(capacity < rows * (width - 1) for capacity in capacities):
+                self._cce_capacities[family, width] = capacities
 
     def prepare_cce_batch(self, index, batch):
-        return batch
+        """Fill (reference, completion indices, KL indices) after the labels, keeping any later slot."""
+        width = _preference_ids(batch[0]).shape[1]
+        capacities = self._cce_capacities.get((self.batch_family(index), width))
+        if capacities is None:
+            return batch
+        rows = [self._rows[i] for i in self._schedule[index]]
+        arrays = []
+        for branch, capacity in enumerate(capacities):
+            selected = list(self._scored_steps(rows, width, branch))
+            indices = np.full(capacity, -1, dtype=np.int32)
+            indices[:len(selected)] = selected
+            arrays.append(mx.array(indices))
+        arrays += [None] * (2 - len(arrays))
+        return (*batch[:4], batch[4] if len(batch) > 4 else None, *arrays, *batch[7:])
 
     def materialize(self, index, *, phase=None):
         indices = self._schedule[index]
@@ -3150,11 +3191,18 @@ def _kto_supervised_tokens(batch_data):
 
 
 def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
-                scorer=None, reference=None, kl_mean=None, differentiated=True):
-    """Per-row weighted losses and the batch's metric sums."""
+                scorer=None, reference=None, kl_mean=None, differentiated=True,
+                cce_indices=None, kl_indices=None):
+    """Per-row weighted losses and the batch's metric sums; cce_indices and kl_indices compact the completion and KL
+    rows, each over its own grid."""
     rows = labels.shape[0]
     # A vision batch's halves share images only the whole dict carries: one forward.
     whole = isinstance(batch, Mapping)
+    joined = cce_indices
+    if kl_indices is not None:
+        # A forward over both halves lays the KL rows' grid after the completions'.
+        offset = rows * (_preference_ids(batch).shape[1] - 1)
+        joined = mx.concatenate([cce_indices, mx.where(kl_indices >= 0, kl_indices + offset, -1)])
     scored, scored_lengths = (batch, lengths) if whole else (batch[:rows], lengths[:rows])
     targets = _preference_ids(scored)[:, 1:]
     mask = _response_mask(targets, scored_lengths)
@@ -3166,22 +3214,23 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
         logits, ce = _preference_forward(model, scored, mask)
         logit_sums = (_row_logit_sum(logits) * positions).sum(axis=1)
     else:
-        ce, sums = scorer(model, scored, mask > 0, every_position=True, differentiated=differentiated)
+        ce, sums = scorer(model, scored, mask > 0, joined if whole else cce_indices, every_position=True,
+                          differentiated=differentiated)
         logit_sums = (sums * positions).sum(axis=1)
     scored_logps = -(ce * mask).sum(axis=1)
     logps, logit_sums = scored_logps[:rows], logit_sums[:rows]
 
-    def score(model, batch, lengths):
+    def score(model, batch, lengths, indices):
         if scorer is None:
             return _response_logps(model, batch, lengths)
         batch_mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
-        return -(scorer(model, batch, batch_mask > 0, differentiated=False)[0] * batch_mask).sum(axis=1)
+        return -(scorer(model, batch, batch_mask > 0, indices, differentiated=False)[0] * batch_mask).sum(axis=1)
 
     if reference is None:
         reference = reference_policy.forward(
             model, batch, lengths,
             response_scorer=(
-                score if scorer is not None and reference_policy.model is None
+                partial(score, indices=joined) if scorer is not None and reference_policy.model is None
                 else None
             ),
         )
@@ -3191,7 +3240,7 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
     if objective.with_kl:
         # TRL scores KL rows under no_grad: a separate, undifferentiated forward.
         policy_kl = mx.stop_gradient(
-            scored_logps[rows:] if whole else score(model, batch[rows:], lengths[rows:])
+            scored_logps[rows:] if whole else score(model, batch[rows:], lengths[rows:], kl_indices)
         )
         kl = (policy_kl.astype(mx.float32) - reference[rows:]).mean()
         if kl_mean is not None:
@@ -3226,8 +3275,8 @@ def _mark_kto_fn(fn, scorer):
     fn._unsloth_preference_metrics = KTO_METRICS
     fn._unsloth_preference_stats_width = KTO_STATS_WIDTH
     fn._unsloth_preference_report = kto_metric_values
-    # A KTO batch has no chosen/rejected halves to compact.
-    fn._unsloth_cce_compaction = False
+    fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
+    fn._unsloth_cce_kind = "kto"
     fn._unsloth_cce_scorer = scorer
     if scorer is not None:
         fn._unsloth_cce_backend = "runtime-cce"
@@ -3239,11 +3288,11 @@ def make_kto_loss_fn(objective, *, reference_policy, kl_mean=None, _scorer=None)
     _require_kind(objective, "kto")
     _require_reference(objective, reference_policy)
 
-    def loss_fn(model, batch, lengths, normalizers, labels, reference=None):
+    def loss_fn(model, batch, lengths, normalizers, labels, reference=None, cce_indices=None, kl_indices=None):
         losses, stats = _kto_scores(
             model, batch, lengths, labels, objective,
             reference_policy=reference_policy, scorer=_scorer,
-            reference=reference, kl_mean=kl_mean,
+            reference=reference, kl_mean=kl_mean, cce_indices=cce_indices, kl_indices=kl_indices,
         )
         _, window_rows, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * losses.sum() / mx.maximum(
@@ -3263,11 +3312,11 @@ def make_kto_cce_loss_fn(model, objective, *, reference_policy, kl_mean=None):
 
 
 def _make_kto_eval_fn(objective, reference_policy, scorer):
-    def eval_fn(model, batch, lengths, _normalizers, labels, reference=None):
+    def eval_fn(model, batch, lengths, _normalizers, labels, reference=None, cce_indices=None, kl_indices=None):
         losses, stats = _kto_scores(
             model, batch, lengths, labels, objective,
             reference_policy=reference_policy, scorer=scorer, reference=reference,
-            differentiated=False,
+            differentiated=False, cce_indices=cce_indices, kl_indices=kl_indices,
         )
         return losses.mean(), mx.array(labels.shape[0], dtype=mx.int32), stats
 

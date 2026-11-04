@@ -2002,7 +2002,7 @@ def test_kto_cce_scores_hidden_states_like_the_logits(monkeypatch, head, loss_ty
     from mlx_lm.tuner.lora import LoRAEmbedding
     mx.random.seed(941)
     calls, flags = [], []
-    _record_cce_rows(monkeypatch, flags)
+    kernel_rows = _record_cce_rows(monkeypatch, flags)
     model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
                             softcap=0.5 if head == "softcap" else 0.0)
     adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
@@ -2018,14 +2018,18 @@ def test_kto_cce_scores_hidden_states_like_the_logits(monkeypatch, head, loss_ty
     objective = p.resolve_preference_objective("kto", beta=0.2, loss_type=loss_type)
     plan = p.FiniteKTOBatchPlan(rows, [(0, 1, 2, 3)], with_kl=objective.with_kl,
                                 normalizers=[(0, 4, 1)], cycle_length=1, max_seq_length=128, pad_id=0)
+    plan.configure_cce_compaction()
+    compact = plan.prepare_cce_batch(0, plan[0])
     dense = nn.value_and_grad(model, p.make_kto_loss_fn(objective, reference_policy=reference))
     grad = nn.value_and_grad(model, p.make_kto_cce_loss_fn(model, objective, reference_policy=reference))
     mx.eval(expected := dense(model, *plan[0]))
     calls.clear()
     run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
-    mx.eval(actual := run(*plan[0]))
-    # The KL rows and the reference score through the kernel, not the logits.
+    mx.eval(actual := run(*compact))
+    # The KL rows and the reference score through the kernel, not the logits, each on its compacted rows.
     assert "model" not in calls and adapter.scale == 2.0
+    assert compact[0].shape == (4 * (1 + objective.with_kl), 97)
+    assert kernel_rows == [256, 256 * (1 + objective.with_kl)] + [256] * objective.with_kl
     # The policy pass, then the reference and KL passes, which take no gradient.
     assert flags == [True, False, False][:2 + objective.with_kl]
     for want, got in zip(expected[0], actual[0]):
@@ -2037,10 +2041,13 @@ def test_kto_cce_scores_hidden_states_like_the_logits(monkeypatch, head, loss_ty
     calls.clear()
     flags.clear()
     got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=scorer)
-    mx.eval(p.make_preference_eval_fn(objective, reference_policy=reference, model=model)(model, *plan[0]))
+    assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
+    evaluate = p.make_preference_eval_fn(objective, reference_policy=reference, model=model)
+    assert evaluate._unsloth_cce_compaction and evaluate._unsloth_cce_kind == "kto"
+    dense_eval = p.make_preference_eval_fn(objective, reference_policy=reference)(model, *plan[0])
+    assert all(mx.allclose(w, g, atol=1e-4, rtol=1e-5).item() for w, g in zip(dense_eval, evaluate(model, *compact)))
     # Both run while the model trains.
     assert flags and not any(flags)
-    assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
 
 
 
