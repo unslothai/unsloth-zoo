@@ -12,6 +12,7 @@
 # GNU Affero General Public License for more details.
 #
 # You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """requires_grad_for_gradient_checkpointing must keep always_call on the forward hooks it re-registers."""
 
