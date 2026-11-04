@@ -18,6 +18,7 @@
 patches it on CUDA (unsloth_zoo.rl_replacements.grpo_compute_loss)."""
 
 import copy
+import os
 import sys
 import warnings
 from collections.abc import Mapping
@@ -574,14 +575,14 @@ def hf_logits_filter(sampling, logits):
     return logits
 
 
-def _rollout_sampling(sampling, prompt_ids, batched):
+def _rollout_sampling(sampling, prompt_ids, batched, always_float32=False):
     """``(logits processors, logits warp)``: a repetition penalty reads each row's own history, so only a batch
-    without one warps every row at once."""
-    if not sampling.warps:
-        return None, None
+    without one warps every row at once; always_float32 casts unwarped logits to float32 too."""
     if batched and sampling.repetition_penalty == 1.0:
-        return None, lambda logits: hf_logits_filter(sampling, logits.astype(mx.float32))
-    return (hf_logits_warper(sampling, prompt_ids),), None
+        if sampling.warps:
+            return None, lambda logits: hf_logits_filter(sampling, logits.astype(mx.float32))
+        return None, (lambda logits: logits.astype(mx.float32)) if always_float32 else None
+    return ((hf_logits_warper(sampling, prompt_ids),) if sampling.warps else None), None
 
 
 def _kv_bytes_per_token(model):
@@ -674,7 +675,7 @@ class GRPOBatchPlan:
         num_generations, batch_size, steps_per_generation, num_iterations,
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
-        processor=None, model_config=None, vision=False,
+        processor=None, model_config=None, vision=False, rollout_old=False,
     ):
         self._dataset = dataset
         self._tokenizer = tokenizer
@@ -694,6 +695,7 @@ class GRPOBatchPlan:
         self.scale_rewards = scale_rewards
         self.mask_truncated_completions = mask_truncated_completions
         self.with_old_logps = with_old_logps
+        self.rollout_old = rollout_old
         self.with_reference = with_reference
         self.max_seq_length = max_seq_length
         self.seed = seed
@@ -839,7 +841,8 @@ class GRPOBatchPlan:
             len(request.prompt_token_ids) + request.max_tokens for request in requests))
         defaults = GenerationDefaults(
             max_tokens=self.sampling.max_tokens, stop_token_ids=(self.eos_id,),
-            logits_warp=_rollout_sampling(self.sampling, (), text)[1], batched_draws=text,
+            logits_warp=_rollout_sampling(self.sampling, (), text, self.rollout_old)[1], batched_draws=text,
+            logprob_arrays=self.rollout_old,
             token_ids_only=text,  # completions are decoded once, after the cut
             completion_batch_size=rows, share_prompt_prefill=text,
             # Rows of a shared prompt start decoding at once, prefilled already.
@@ -854,6 +857,7 @@ class GRPOBatchPlan:
             for result in results
         ]
         completion_ids = [ids for ids, _ in cut]
+        rollout = self._rollout_logps(prompts, results, completion_ids) if self.rollout_old else None
         truncated = np.array([flag for _, flag in cut], dtype=bool)
         rows = [read[prompt] for prompt in prompts]
         texts = [self._decode(ids) for ids in completion_ids]
@@ -898,7 +902,9 @@ class GRPOBatchPlan:
         media = [encoded[prompts[row]][1:3] for row in order] if encoded else None
         held = {} if encoded else None
         old = ref = None
-        if self.with_old_logps:
+        if rollout is not None:
+            old = [rollout[row] for row in order]
+        elif self.with_old_logps:
             old = self._score(
                 lambda batch, lengths: mx.stop_gradient(self._logps(self._model, batch, lengths)),
                 sequences, prompt_lengths, media, held,
@@ -915,6 +921,17 @@ class GRPOBatchPlan:
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
             generation_tokens=int(lengths.sum()), media=media, vision_inputs=held,
         )
+
+    def _rollout_logps(self, prompts, results, completion_ids):
+        """Old log-probs as the rollout sampled each completion id, zero over the prompt, as scoring lays them out."""
+        mx.eval([result.logprob_array for result in results])
+        rows = []
+        for prompt, result, ids in zip(prompts, results, completion_ids):
+            sampled = np.array(result.logprob_array.astype(mx.float32))
+            if len(sampled) != len(ids):
+                raise RuntimeError("Unsloth MLX GRPO: the rollout's log-probs do not line up with its completion.")
+            rows.append(np.concatenate([np.zeros(len(self._prompt_ids[prompt]) - 1, np.float32), sampled]))
+        return rows
 
     def _reencode(self, prompt, row):
         encoded = _encode_grpo_prompt(self._tokenizer, row, self._processor, vision=True)
@@ -1064,10 +1081,12 @@ def create_grpo_batch_plan(
     num_iterations, grad_accum, sampling, max_seq_length, score_temperature=None, scale_rewards="group",
     mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
     shuffle=True, seed=None, num_batches=None, num_epochs=None, processor=None, model_config=None,
+    rollout_logprobs_as_old=False,
 ):
     """Encode prompts once and lay out TRL's RepeatSampler schedule; batch_size counts completions, a generation samples
     batch_size * steps_per_generation of them, num_generations per prompt; score_temperature defaults to the sampling
-    temperature; a VLM processor replaces tokenizer."""
+    temperature; a VLM processor replaces tokenizer; rollout_logprobs_as_old takes old log-probs from tokenizer-only
+    rollouts sampled unfiltered at the scoring temperature instead of a forward."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
     prompt_ids, max_tokens, vision = _encode_grpo_prompts(
@@ -1094,6 +1113,17 @@ def create_grpo_batch_plan(
         batches_for_epoch, num_batches=num_batches, num_epochs=num_epochs,
         grad_accum=grad_accum,
     )
+    score_temperature = sampling.temperature if score_temperature is None else score_temperature
+    with_old_logps = grad_accum % repeats != 0
+    rollout_old = bool(rollout_logprobs_as_old) and with_old_logps
+    filtered = sampling.top_p < 1.0 or bool(sampling.top_k) or bool(sampling.min_p) or sampling.repetition_penalty != 1.0
+    if rollout_old and (processor is not None or filtered or sampling.temperature != score_temperature):
+        warnings.warn(
+            "Unsloth MLX GRPO: rollout_logprobs_as_old needs tokenizer-only rollouts sampled at the scoring temperature "
+            "with no top-k, top-p, min-p or repetition penalty; old log-probs are scored by a forward instead.",
+            stacklevel=2,
+        )
+        rollout_old = False
     if not cycle_length:
         raise ValueError(
             f"Unsloth MLX GRPO: the dataset has {len(prompt_ids)} prompt(s), fewer "
@@ -1104,12 +1134,11 @@ def create_grpo_batch_plan(
         cycle_length=cycle_length, num_generations=num_generations,
         batch_size=batch_size, steps_per_generation=steps_per_generation,
         num_iterations=num_iterations, sampling=sampling,
-        score_temperature=sampling.temperature if score_temperature is None else score_temperature,
-        scale_rewards=scale_rewards,
+        score_temperature=score_temperature, scale_rewards=scale_rewards,
         mask_truncated_completions=mask_truncated_completions,
-        with_old_logps=grad_accum % repeats != 0, with_reference=with_reference,
+        with_old_logps=with_old_logps, with_reference=with_reference,
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
-        processor=processor, model_config=model_config, vision=vision,
+        processor=processor, model_config=model_config, vision=vision, rollout_old=rollout_old,
     )
 
 
@@ -1304,6 +1333,8 @@ def resolve_grpo_config(config):
             )
     if config.mask_truncated_completions is None:
         config.mask_truncated_completions = False
+    if getattr(config, "rollout_logprobs_as_old", None) is None:
+        config.rollout_logprobs_as_old = os.environ.get("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", "0") == "1"
     if not 0 < config.temperature < 10:
         raise ValueError(
             f"Unsloth MLX GRPO: temperature={config.temperature} must lie between 0 "

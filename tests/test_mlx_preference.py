@@ -3926,6 +3926,27 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     assert calls[0][1].completion_batch_size == 7
 
 
+def test_grpo_old_logps_come_from_the_rollout_only_when_asked_and_sampled_unfiltered_as_scored(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx import generate as generate_module, grpo
+    seen, sampled = [], [-0.5, -0.25, -0.125]  # a stopped row also scores its EOS
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, defaults=None: seen.append(defaults) or [
+        types.SimpleNamespace(token_ids=[1, 1], finish_reason="stop" if row % 2 else "length",
+                              logprob_array=grpo.mx.array(sampled[:2 + row % 2])) for row in range(len(requests))])
+    build = lambda sampling={}, **kwargs: grpo.create_grpo_batch_plan(
+        [{"prompt": "a" * (index + 1)} for index in range(2)], DecodingTokenizer(), num_generations=2, batch_size=2,
+        steps_per_generation=2, num_iterations=2, grad_accum=1, sampling=grpo.GRPOSampling(max_tokens=3, **sampling), max_seq_length=8,
+        shuffle=False, num_batches=4, rollout_logprobs_as_old=True, **kwargs)
+    for case in ({"score_temperature": 0.7}, {"processor": _grpo_vision_processor()}, *({"sampling": dict([filter])} for filter in (("top_k", 1), ("top_p", 0.9), ("min_p", 0.1), ("repetition_penalty", 1.1)))):
+        with pytest.warns(UserWarning, match="scoring temperature"): assert build(**case).rollout_old is False  # noqa: E701
+    (plan := build()).bind(lambda ids: pytest.fail("scored by a forward"), [lambda completions, **_: [0.0] * len(completions)], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
+    for tokens, lengths, *_, old, _ in (plan[0], plan[1]):
+        for row, (start, end) in zip(old.tolist(), lengths.tolist()):
+            assert row[start - 1:end - 1] == sampled[:end - start] and not any(row[:start - 1])
+    assert seen[0].logprob_arrays and seen[0].logits_warp is not None
+    monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", "1")
+    assert _grpo_config(tmp_path).rollout_logprobs_as_old and not _grpo_config(tmp_path, rollout_logprobs_as_old=False).rollout_logprobs_as_old
+
+
 def _grpo_vision_processor():
     processor = VisionProcessor()  # a string content renders apart from a text part, as real templates may
     processor.apply_chat_template = lambda messages, **kwargs: VisionProcessor.apply_chat_template(processor, [
@@ -4212,7 +4233,7 @@ def test_the_grpo_trainer_trains_logs_and_syncs_as_trl(tmp_path, monkeypatch, ca
     assert report.action in ("exact", "bucket") and report.raw_widths == 2  # rungs 32 and 64
     assert logged[0]["reward"] == 2.0 and plans[0]["sampling"].top_k == 7
     # TRL samples at generation_kwargs' temperature but scores at args.temperature.
-    assert (plans[0]["sampling"].temperature, plans[0]["score_temperature"]) == (0.5, 1.0)
+    assert (plans[0]["sampling"].temperature, plans[0]["score_temperature"], plans[0]["rollout_logprobs_as_old"]) == (0.5, 1.0, False)
     assert (plans[0]["scale_rewards"], plans[0]["shuffle"], plans[0]["seed"], plans[0]["with_reference"]) == (
         "batch", False, 5, beta != 0)
 
