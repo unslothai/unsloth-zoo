@@ -106,3 +106,42 @@ def test_conv1d_merge_end_to_end(tmp_path):
         )
         n_adapted += key.endswith((".c_attn.weight", ".c_proj.weight", ".c_fc.weight"))
     assert n_adapted == 4
+
+
+def test_conv1d_bnb_4bit_merge_end_to_end(tmp_path):
+    """bnb loads Conv1D as an (out, in) Linear4bit and PEFT drops fan_in_fan_out, but the checkpoint stays (in, out)."""
+    import _merge_e2e_helpers as H
+    from peft import LoraConfig, get_peft_model
+    from transformers import BitsAndBytesConfig, GPT2Config, GPT2LMHeadModel
+
+    H.set_offline_cpu_env()
+    torch.manual_seed(0)
+    config = GPT2Config(
+        n_embd=64, n_layer=1, n_head=2, vocab_size=64, n_positions=32, bos_token_id=1, eos_token_id=2,
+    )
+    base = GPT2LMHeadModel(config).eval()
+    base_dir, out_dir = str(tmp_path / "base"), str(tmp_path / "out")
+    base.save_pretrained(base_dir)
+    try:
+        q = GPT2LMHeadModel.from_pretrained(
+            base_dir, device_map = "cpu",
+            quantization_config = BitsAndBytesConfig(load_in_4bit = True, bnb_4bit_compute_dtype = torch.float32),
+        )
+    except Exception as e:
+        pytest.skip(f"bitsandbytes 4bit unavailable here: {e}")
+    pm = get_peft_model(q, LoraConfig(r=4, lora_alpha=8, target_modules=["c_attn", "c_proj", "c_fc"]))
+    H.seed_lora(pm)
+    W0 = base.state_dict()
+    expected = {}
+    for name, module in pm.named_modules():
+        if hasattr(module, "lora_A") and "default" in module.lora_A:
+            key = name.replace("base_model.model.", "") + ".weight"
+            delta = module.lora_B["default"].weight @ module.lora_A["default"].weight
+            expected[key] = W0[key] + (delta * module.scaling["default"]).T
+
+    H.run_merge(pm, base_dir, out_dir, save_dtype=torch.float32)
+    got = H.read_safetensors_dir(out_dir)
+    assert len(expected) == 4
+    for key, tensor in expected.items():
+        assert got[key].shape == tensor.shape, key
+        assert torch.allclose(got[key], tensor, atol=1e-5, rtol=1e-5), key

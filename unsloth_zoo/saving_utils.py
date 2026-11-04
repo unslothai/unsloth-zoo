@@ -90,6 +90,7 @@ except:
     pass
 pass
 from transformers.modeling_utils import PushToHubMixin
+from transformers.pytorch_utils import Conv1D
 import json
 import ntpath
 import os
@@ -445,7 +446,7 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
             "https://github.com/unslothai/unsloth-zoo/issues with your model name and this "
             "message."
         )
-    # Conv1D (GPT-2) keeps its weight as (in, out); merge in (out, in) like PEFT and flip back at the end.
+    # Conv1D (GPT-2) checkpoints store (in, out): merge in (out, in) like PEFT and flip back.
     flip = getattr(lora_stats, "fan_in_fan_out", False)
     if flip: W = W.t()
     device = _active_merge_device()
@@ -616,6 +617,12 @@ import inspect
 from tqdm import tqdm as ProgressBar
 from dataclasses import dataclass
 
+def _is_conv1d_layout(module):
+    source = getattr(module, "source_cls", None)
+    return isinstance(module, Conv1D) or (isinstance(source, type) and issubclass(source, Conv1D))
+pass
+
+
 @dataclass
 class LoraStats:
     module : torch.nn.Module
@@ -626,7 +633,7 @@ class LoraStats:
     parameter_name : object = None  # PEFT ParamWrapper target (MoE experts), e.g. "up_proj"
     lora_B_bias : object = None     # PEFT lora_bias=True: lora_B's bias, merged into the base bias
     is_vocab : bool = False         # base layer of the input / output embeddings
-    fan_in_fan_out : bool = False   # PEFT Conv1D (GPT-2) adapter: the base weight is stored (in, out)
+    fan_in_fan_out : bool = False   # checkpoint stores the weight (in, out): Conv1D, incl. bnb-quantized Conv1D
 pass
 
 
@@ -777,6 +784,8 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
         elif name.endswith(".base_layer"):
             lora_weights[name[:-len(".base_layer")]].module = module
+            # bnb loads Conv1D as (out, in) Linear4bit/8bitLt and PEFT then drops fan_in_fan_out; the checkpoint stays (in, out).
+            if _is_conv1d_layout(module): lora_weights[name[:-len(".base_layer")]].fan_in_fan_out = True
             module_count += 1
             remove_keys.add(name)
             remove_keys.add(name[:-len(".base_layer")])
@@ -6455,6 +6464,7 @@ def merge_and_dequantize_lora(
         if type(x) is LoraStats:
             DEQUANTIZED_KEYS.append(name)
             W = dequantize_module_weight(x.module)
+            if x.fan_in_fan_out and not isinstance(x.module, Conv1D): W = W.t()
             W = _merge_lora(W, x, name)
             x = W.to(device = 'cpu', dtype = {str(output_dtype)})
         # Remove memory leak
