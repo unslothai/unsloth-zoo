@@ -865,11 +865,24 @@ def _patch_glm5_next_quantization_aliases(model_type):
         return
 
     def quantization_path_aliases(self, path):
-        path = path[len("language_model."):] if path.startswith("language_model.") else path
         parent, _, name = path.rpartition(".")
-        return [f"{parent}.{_GLM5_NEXT_FUSED[name]}"] if name in _GLM5_NEXT_FUSED else []
+        name = _GLM5_NEXT_FUSED.get(name, name)
+        paths = [f"{parent}.{name}"]
+        if name in ("f_a_proj", "f_b_proj"):  # oQ quants (_omlx_glm5_next_weights)
+            paths.append(f"{parent}.forget_gate.{name}")
+        return [alias for path in paths for alias in (path, path.removeprefix("language_model."))]
 
     model.quantization_path_aliases = quantization_path_aliases
+
+
+def _omlx_glm5_next_weights(weights):
+    """Names of the glm5_next layout omlx vendors (and writes GLM-5.3-Flash oQ quants in) as mlx-vlm's."""
+    renamed = {}
+    for key, value in weights.items():
+        key = re.sub(r"^vision_model\.", "vision_tower.", key).replace(".self_attn.forget_gate.", ".self_attn.")
+        # Already the fused q, k, v short convolution, in MLX's layout.
+        renamed[re.sub(r"\.self_attn\.conv1d\.weight$", ".self_attn.qkv_conv.conv.weight", key)] = value
+    return renamed
 
 
 _DEEPSEEK_REFERENCE_PROJECTIONS = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
@@ -907,12 +920,47 @@ def _omlx_deepseek_v41_quantization(config_data):
     return {**base, **modules}
 
 
-def _ensure_deepseek_v41_omlx_layout(model_type):
-    """Wrap mlx-vlm's deepseek_v41 sanitize to read oQ quants (DSpark stages dropped)."""
-    if model_type != "deepseek_v41":
+def _omlx_deepseek_v41_weights(weights):
+    import mlx.core as mx
+
+    weights = {_omlx_deepseek_v41_name(key): value for key, value in weights.items()}
+    # FP8 Engram table: sanitize packs it only under the source's ``.scale`` name.
+    for key in [key for key in weights if key.endswith(".engram.embed.scales")]:
+        weight = weights.get(key.removesuffix("scales") + "weight")
+        if weight is not None and weight.dtype == mx.uint8:
+            weights[key.removesuffix("s")] = weights.pop(key)
+    return weights
+
+
+def _deepseek_v41_model():
+    from mlx_vlm.models.deepseek_v41.deepseek_v41 import Model
+
+    return Model
+
+
+def _glm5_next_model():
+    from mlx_vlm.models.glm5_next.glm5_next import Model
+
+    return Model
+
+
+# Each family omlx converts: the mlx-vlm Model whose sanitize loads it, and the renames it needs first.
+_OMLX_LAYOUTS = {
+    "deepseek_v41": (_deepseek_v41_model, _omlx_deepseek_v41_weights),
+    "glm5_next": (_glm5_next_model, _omlx_glm5_next_weights),
+}
+
+
+def _ensure_omlx_layout(model_type):
+    """Wrap mlx-vlm's sanitize for ``model_type`` to read omlx's oQ quants. Their ``language_model.mtp.`` tensors
+    (MTP heads, DSpark stages) stay out of the target."""
+    if model_type not in _OMLX_LAYOUTS:
         return
+    # GLM-5.3 oQ quants key their fused layers' bits by module path; loads outside FastMLXModel need the aliases too.
+    _patch_glm5_next_quantization_aliases(model_type)
+    imported, rename = _OMLX_LAYOUTS[model_type]
     try:
-        from mlx_vlm.models.deepseek_v41.deepseek_v41 import Model as model
+        model = imported()
     except Exception:
         return
     if getattr(model.sanitize, "_unsloth_omlx_layout", False):
@@ -920,21 +968,14 @@ def _ensure_deepseek_v41_omlx_layout(model_type):
     original = model.sanitize
 
     def sanitize(self, weights):
-        weights = {
-            _omlx_deepseek_v41_name(key): value for key, value in weights.items()
-            if not key.startswith("language_model.mtp.")
-        }
-        import mlx.core as mx
-
-        # FP8 Engram table: sanitize packs it only under the source's ``.scale`` name.
-        for key in [key for key in weights if key.endswith(".engram.embed.scales")]:
-            weight = weights.get(key.removesuffix("scales") + "weight")
-            if weight is not None and weight.dtype == mx.uint8:
-                weights[key.removesuffix("s")] = weights.pop(key)
-        return original(self, weights)
+        return original(self, rename({key: value for key, value in weights.items() if not key.startswith("language_model.mtp.")}))
 
     sanitize._unsloth_omlx_layout = True
     model.sanitize = sanitize
+
+
+# The name Unsloth Studio releases install the layout by.
+_ensure_deepseek_v41_omlx_layout = _ensure_omlx_layout
 
 
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
@@ -10299,7 +10340,7 @@ class FastMLXModel:
             _ensure_minicpmv4_7_text_positions(model_type)
             _ensure_audio_conv_sanitize(model_type)
             _ensure_qwen3_omni_audio_per_clip(model_type)
-            _ensure_deepseek_v41_omlx_layout(model_type)
+            _ensure_omlx_layout(model_type)
             _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(
