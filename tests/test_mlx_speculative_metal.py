@@ -1220,7 +1220,7 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
             return norm(x)
         with monkeypatch.context() as patch:
             # An unscoped model's verify call made inside a served one stays native, and the served one goes on.
-            patch.setattr(layer, "input_layernorm", nested)
+            patch.setitem(layer, "input_layernorm", nested)   # pytest >= 9.2 setattr undo drops an mlx Module child
             assert _verified(lm, cache, block, 0) and {key[0][1] for key in verdicts} == {12} and not verdicts.clear()
         # Native: an unscoped model, a block inside mlx-vlm's fused bound, training, thawed projections, a drifted binding.
         _verified(unscoped, cache, block, 0)
@@ -2809,7 +2809,7 @@ def test_a_dflash_block_drafted_before_its_acceptance_is_read_drafts_and_caches_
     layer = drafter.model.layers[1]
     for target, attribute, value in ((layer.self_attn, "is_causal", True), (layer, "self_attn", SimpleNamespace(is_causal = False))):
         with monkeypatch.context() as patch:
-            patch.setattr(target, attribute, value)
+            (patch.setitem if attribute in target else patch.setattr)(target, attribute, value)
             assert inference.predraft_attention(drafter.model) == 0
     with monkeypatch.context() as patch:
         patch.setattr(drafter.model, "make_cache", lambda: [object()])
