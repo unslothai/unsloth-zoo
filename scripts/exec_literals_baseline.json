@@ -170,13 +170,6 @@
     {
       "file": "unsloth_zoo/compiler.py",
       "sink": "exec",
-      "digest": "aec8dc650544d15a",
-      "count": 1,
-      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
-    },
-    {
-      "file": "unsloth_zoo/compiler.py",
-      "sink": "exec",
       "digest": "bf2e8c51f0f6c2ed",
       "count": 1,
       "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
@@ -310,13 +303,6 @@
     {
       "file": "unsloth_zoo/peft_utils.py",
       "sink": "eval",
-      "digest": "73be47696e5e4b6b",
-      "count": 1,
-      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
-    },
-    {
-      "file": "unsloth_zoo/peft_utils.py",
-      "sink": "eval",
       "digest": "81cdac2f6f8a2c32",
       "count": 1,
       "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
@@ -325,13 +311,6 @@
       "file": "unsloth_zoo/peft_utils.py",
       "sink": "exec",
       "digest": "45bbd24d7d803e73",
-      "count": 1,
-      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
-    },
-    {
-      "file": "unsloth_zoo/peft_utils.py",
-      "sink": "exec",
-      "digest": "582f1edab6ecc7d8",
       "count": 1,
       "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
     },
