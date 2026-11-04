@@ -32,7 +32,7 @@ from . import generate as generate_module
 from .generate import GenerationDefaults, GenerationRequest, SamplingParams
 from .preference import (
     _VLM_TOKEN_SPAN_KEYS, _chat_template, _make_preference_cce_scorer, _preference_ids,
-    _preference_logits, _response_mask, _supervised_tokens,
+    _preference_logits, _reference_scorer, _response_mask, _supervised_tokens,
 )
 from .utils import (
     _RAW_INPUT_IDS_FOR_LABELS,
@@ -699,8 +699,11 @@ class GRPOBatchPlan:
         self._rollout_context = rollout_context or nullcontext
         self._keep_completions = keep_completions
         self._logps = grpo_logps(self.score_temperature, scorer, differentiated=False)
+        self._reference_logps = grpo_logps(self.score_temperature, _reference_scorer(
+            reference_policy, scorer, temperature=self.score_temperature), differentiated=False)
         if step_compiled is not None:
             self._logps = _scored_as_step(self._logps, step_compiled)
+            self._reference_logps = _scored_as_step(self._reference_logps, step_compiled)
 
     def start_at(self, visit):
         """Count generations from ``visit``, the first micro-step a run fetches."""
@@ -851,7 +854,7 @@ class GRPOBatchPlan:
         if self.with_reference:
             ref = self._score(
                 lambda batch, lengths: self._reference_policy.forward(
-                    self._model, batch, lengths, response_scorer=self._logps,
+                    self._model, batch, lengths, response_scorer=self._reference_logps,
                 ),
                 sequences, prompt_lengths, media,
             )

@@ -2050,6 +2050,42 @@ def test_kto_cce_scores_hidden_states_like_the_logits(monkeypatch, head, loss_ty
     assert flags and not any(flags)
 
 
+@metal_only
+@pytest.mark.parametrize("kind", ["dpo", "kto"])
+def test_a_reference_model_scores_through_its_own_cce_kernel(kind):
+    from unsloth_zoo.mlx import preference as p
+    mx.random.seed(953)
+    calls = []
+    # A dense reference head the policy's quantized kernel could not read.
+    model = _cce_text_model(2053, 64, quantized=True, calls=calls)
+    reference = p.ReferencePolicy(model=_cce_text_model(2053, 64, quantized=False, calls=calls))
+    rows = []
+    for i in range(4):
+        chosen = tuple((j * 7 + i) % 2053 for j in range(301 + i))
+        rejected = tuple((j * 11 + i) % 2053 for j in range(287 + i))
+        rows.append(p.TokenizedPreferenceRow(chosen[:250 + i], chosen[250 + i:], rejected[:251 - i], rejected[251 - i:]))
+    options = dict(normalizers=[(0, 4, 1)], cycle_length=1, max_seq_length=320, pad_id=0)
+    plan = p.FinitePreferenceBatchPlan(rows, [(0, 1, 2, 3)], **options) if kind == "dpo" else p.FiniteKTOBatchPlan([
+        p.TokenizedKTORow(r.chosen_prompt_ids, r.chosen_ids, i % 2 == 0, r.rejected_prompt_ids, r.rejected_ids)
+        for i, r in enumerate(rows)], [(0, 1, 2, 3)], with_kl=True, **options)
+    plan.configure_cce_compaction(kind=kind)
+    objective = p.resolve_preference_objective(kind, beta=0.2, loss_type="sigmoid" if kind == "dpo" else "kto")
+    loss = getattr(p, f"make_{kind}_cce_loss_fn")(model, objective, reference_policy=reference)
+    assert loss._unsloth_cce_reference_scorer not in (None, loss._unsloth_cce_scorer)
+    dense = getattr(p, f"make_{kind}_loss_fn")(objective, reference_policy=reference)
+    expected = nn.value_and_grad(model, dense)(model, *plan[0])
+    mx.eval(expected)
+    calls.clear()
+    actual = nn.value_and_grad(model, loss)(model, *plan.prepare_cce_batch(0, plan[0]))
+    mx.eval(actual)
+    assert "model" not in calls
+    flat = lambda out: [out[0][0], *(value for _, value in tree_flatten(out[1]))]
+    assert all(mx.allclose(want, got, atol=2e-5, rtol=2e-4).item() for want, got in zip(flat(expected), flat(actual)))
+    want = p.precompute_reference_logps(plan, model, reference, batch_size=4)
+    calls.clear()
+    got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=loss._unsloth_cce_reference_scorer)
+    assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
+
 
 @metal_only
 @pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])

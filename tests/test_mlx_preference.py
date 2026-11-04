@@ -1695,6 +1695,99 @@ def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, s
             _run_generation_trainer(trainer, monkeypatch, [])
 
 
+def _owned_scorers(monkeypatch, value=lambda model: 0.0):
+    """Stand-in CCE scorers that remember the model they were built for and score ``value(model)`` per position."""
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference
+
+    def make(model, temperature=1.0):
+        def score(_model, batch, supervised, indices=None, *, differentiated=True, **_):
+            make.calls.append((model, differentiated))
+            ce = supervised.astype(mx.float32) * (value(model) * temperature)
+            return ce, ce * 0.0
+        score.owner, score.vocab, score.compaction = model, 64, False
+        return score
+
+    make.calls = []
+    monkeypatch.setattr(preference, "_make_preference_cce_scorer", make)
+    return make
+
+
+def test_the_trainer_precomputes_a_reference_model_through_its_own_scorer(tmp_path, monkeypatch):
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    _owned_scorers(monkeypatch)
+    owners, precompute = [], trainer_module.precompute_reference_logps
+    monkeypatch.setattr(trainer_module, "precompute_reference_logps", lambda plan, model, policy, **kwargs: (
+        owners.append(kwargs["scorer"].owner), precompute(plan, model, policy, **kwargs))[1])
+    reference = _tiny_model(tail=True)
+    trainer = MLXDPOTrainer(
+        _tiny_model(tail=True), Tokenizer(), rows(3), eval_dataset=rows(2), ref_model=reference,
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, precompute_ref_log_probs=True, generate_during_eval=False, force_use_ref_model=True)))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    # The training and the evaluation tables, each scored by the reference model's own scorer.
+    assert owners == [reference, reference]
+
+
+def test_grpo_scores_a_reference_model_through_its_own_scorer(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import grpo, preference
+
+    policy, reference = TinyModel(), TinyModel()
+    make = _owned_scorers(monkeypatch, lambda model: 1.0 if model is reference else 2.0)
+    plan = types.SimpleNamespace(with_reference=True, score_temperature=0.5)
+    held = preference.ReferencePolicy(model=reference)
+    grpo.GRPOBatchPlan.bind(plan, policy, [], trainer_state=None, reference_policy=held,
+                            scorer=make(policy, temperature=0.5))
+    tokens, lengths = mx.array([[1, 2, 3]]), mx.array([[1, 3]])
+    assert plan._logps(policy, tokens, lengths).tolist() == [[-1.0, -1.0]]
+    # The reference model's own scorer, at the scoring temperature.
+    assert held.forward(policy, tokens, lengths, response_scorer=plan._reference_logps).tolist() == [[-0.5, -0.5]]
+    # Neither pass is differentiated, so neither takes the training kernel.
+    assert make.calls == [(policy, False), (reference, False)]
+
+
+@pytest.mark.parametrize("kind", ["dpo", "kto", "grpo"])
+def test_a_reference_model_scores_live_through_its_own_scorer(tmp_path, monkeypatch, kind):
+    # GRPO's rollout and DPO/KTO evaluation score a separate ref_model through its own scorer, not the policy's or dense.
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer, MLXGRPOTrainer, MLXKTOConfig, MLXKTOTrainer
+
+    make, evaluated = _owned_scorers(monkeypatch), []
+    build = trainer_module.make_preference_eval_fn
+
+    def watched(*args, **kwargs):
+        fn = build(*args, **kwargs)
+
+        def eval_fn(*inner, **options):
+            start = len(make.calls)
+            out = fn(*inner, **options)
+            evaluated.extend(make.calls[start:])
+            return out
+        eval_fn.__dict__.update(fn.__dict__)
+        return eval_fn
+    monkeypatch.setattr(trainer_module, "make_preference_eval_fn", watched)
+    policy, reference = _tiny_model(tail=True), _tiny_model(tail=True)
+    common = dict(compile=False, generate_during_eval=False)
+    if kind == "grpo":
+        monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", make)
+        trainer = MLXGRPOTrainer(policy, DecodingTokenizer(), _grpo_rows(), args=_grpo_config(
+            tmp_path, compile=False, beta=0.04, use_cce=True), reward_funcs=lambda completions, **_: [0.0] * len(completions))
+        trainer.ref_model = reference  # GRPO reads it as an attribute; TRL's GRPOTrainer takes no ref_model
+    elif kind == "dpo":
+        trainer = MLXDPOTrainer(policy, Tokenizer(), rows(3), eval_dataset=rows(2), ref_model=reference,
+                                args=MLXDPOConfig(**_generation_common(tmp_path, force_use_ref_model=True, **common)))
+    else:
+        trainer = MLXKTOTrainer(policy, Tokenizer(), kto_rows(4), eval_dataset=kto_rows(4), ref_model=reference,
+                                args=MLXKTOConfig(**_generation_common(tmp_path, **common)))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    # GRPO scores its reference only in the rollout; evaluation scores it live, each through ref_model's own scorer.
+    scored = make.calls if kind == "grpo" else evaluated
+    assert (reference, False) in scored and all(owner is reference for owner, _ in scored if owner is not policy)
+
+
 @pytest.mark.parametrize("sampling", [False, True])
 def test_the_trainer_precomputes_the_reference_once_per_split(
     tmp_path, monkeypatch, sampling,

@@ -1298,7 +1298,8 @@ class FiniteVisionPreferenceBatchPlan(VisionPreferenceBatches, FinitePreferenceB
 
 
 def precompute_reference_logps(plan, model, reference_policy, *, batch_size, scorer=None):
-    """Precompute reference logps per row of ``plan``; kernels round per chunk shape, so batch like the live forward."""
+    """Precompute reference logps per row of ``plan``; kernels round per chunk shape, so batch like the live forward;
+    ``scorer`` scores the reference's own forward, as a loss's ``_unsloth_cce_reference_scorer`` does."""
     rows = plan.rows
     batch_size = max(1, int(batch_size))
     table = np.zeros((len(rows), 2), dtype=np.float32)
@@ -1312,7 +1313,7 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
             part_lengths = mx.array(lengths[offset * share:(offset + 1) * share])
             options = {}
             # The live forward scores through CCE too; full logits would defeat it.
-            if scorer is not None and reference_policy.model is None:
+            if scorer is not None:
                 mask = _response_mask(_preference_ids(inputs)[:, 1:], part_lengths)
                 options["response_scorer"] = lambda model, batch, _lengths, mask=mask: -(
                     scorer(model, batch, mask > 0, differentiated=False)[0] * mask
@@ -2720,11 +2721,13 @@ def _dpo_pair_loss(objective, terms):
 def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
     _require_kind(objective, "dpo")
     _require_reference(objective, reference_policy)
+    reference_scorer = _reference_scorer(reference_policy, _scorer)
 
     def loss_fn(model, batch, lengths, normalizers, cce_indices=None, reference=None):
         terms, stats = _dpo_scores(
             model, batch, lengths, objective, reference_policy=reference_policy,
             scorer=_scorer, cce_indices=cce_indices, reference=reference,
+            reference_scorer=reference_scorer,
         )
         pair_loss = _dpo_pair_loss(objective, terms)
         _, window_pairs, window_microbatches = normalizers
@@ -2734,6 +2737,7 @@ def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
         return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_cce_reference_scorer = reference_scorer
     loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["dpo"]
     loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["dpo"]
     loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["dpo"]
@@ -2883,6 +2887,14 @@ def _logit_totals(sums, mask, vocab):
     sums = sums * mask
     return (sums[:pairs].sum(), sums[pairs:].sum(),
             mask[:pairs].sum() * vocab, mask[pairs:].sum() * vocab)
+
+
+def _reference_scorer(reference_policy, scorer, **options):
+    """The reference forward's scorer: the policy's own under adapter overrides, else one built for ref_model, whose
+    head need not match; None without a policy scorer."""
+    if scorer is None or reference_policy is None or reference_policy.model is None:
+        return scorer
+    return _make_preference_cce_scorer(reference_policy.model, **options)
 
 
 def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
@@ -3099,7 +3111,7 @@ def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=No
 
 
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
-                scorer=None, cce_indices=None, reference=None, differentiated=True):
+                scorer=None, cce_indices=None, reference=None, differentiated=True, reference_scorer=None):
     """Score one DPO batch; ``reference`` holds precomputed reference log probabilities."""
     pairs = lengths.shape[0] // 2
     logits = logit_totals = None
@@ -3114,9 +3126,9 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
         reference = reference.astype(logps.dtype)
     elif objective.reference_free:
         reference = mx.zeros(logps.shape, dtype=logps.dtype)
-    elif scorer is not None and reference_policy.model is None:
+    elif reference_scorer is not None:
         def response_scorer(model, batch, _lengths):
-            return -(scorer(model, batch, mask > 0, cce_indices, differentiated=False)[0] * mask).sum(axis=1)
+            return -(reference_scorer(model, batch, mask > 0, cce_indices, differentiated=False)[0] * mask).sum(axis=1)
         reference = reference_policy.forward(model, batch, lengths, response_scorer=response_scorer)
     else:
         reference = reference_policy.forward(model, batch, lengths)
@@ -3155,6 +3167,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     scorer = None if model is None else _make_preference_cce_scorer(model)
     if kind == "kto":
         return _make_kto_eval_fn(objective, reference_policy, scorer)
+    reference_scorer = _reference_scorer(reference_policy, scorer)
 
     def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None, reference=None):
         pairs = lengths.shape[0] // 2
@@ -3180,13 +3193,14 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
                 model, batch, lengths, objective,
                 reference_policy=reference_policy,
                 scorer=scorer, cce_indices=cce_indices, reference=reference,
-                differentiated=False,
+                differentiated=False, reference_scorer=reference_scorer,
             )
             loss = _dpo_pair_loss(objective, terms).mean()
         return loss, mx.array(pairs, dtype=mx.int32), stats
 
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
     eval_fn._unsloth_cce_scorer = scorer
+    eval_fn._unsloth_cce_reference_scorer = reference_scorer
     eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
     eval_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH[kind]
     eval_fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
@@ -3227,7 +3241,7 @@ def _kto_supervised_tokens(batch_data):
 
 def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
                 scorer=None, reference=None, kl_mean=None, differentiated=True,
-                cce_indices=None, kl_indices=None, kl_batch=None):
+                cce_indices=None, kl_indices=None, kl_batch=None, reference_scorer=None):
     """Per-row weighted losses and the batch's metric sums; cce_indices and kl_indices compact the completion and KL
     rows, each over its own grid; a vision batch carries its KL rows as kl_batch."""
     rows = labels.shape[0]
@@ -3248,7 +3262,7 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
         logit_sums = (sums * positions).sum(axis=1)
     logps = -(ce * mask).sum(axis=1)
 
-    def score(model, batch, lengths, indices):
+    def score(model, batch, lengths, indices, scorer=scorer):
         if scorer is None:
             return _response_logps(model, batch, lengths)
         batch_mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
@@ -3265,10 +3279,9 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
                 offset = rows * (_preference_ids(batch).shape[1] - 1)
                 joined = mx.concatenate([cce_indices, mx.where(kl_indices >= 0, kl_indices + offset, -1)])
             parts = [(batch, lengths, joined)]
-        own = scorer is not None and reference_policy.model is None
         scored = [
-            reference_policy.forward(model, part, part_lengths,
-                                     response_scorer=partial(score, indices=indices) if own else None)
+            reference_policy.forward(model, part, part_lengths, response_scorer=None if reference_scorer is None
+                                     else partial(score, indices=indices, scorer=reference_scorer))
             for part, part_lengths, indices in parts
         ]
         reference = scored[0] if len(scored) == 1 else mx.concatenate(scored)
@@ -3323,13 +3336,14 @@ def make_kto_loss_fn(objective, *, reference_policy, kl_mean=None, _scorer=None)
     """Create a KTO loss normalized over the rows of its logical window; kl_mean averages the KL estimate across processes before it is clamped, as TRL gathers it."""
     _require_kind(objective, "kto")
     _require_reference(objective, reference_policy)
+    reference_scorer = _reference_scorer(reference_policy, _scorer)
 
     def loss_fn(model, batch, lengths, normalizers, labels, reference=None, cce_indices=None, kl_indices=None,
                 kl_batch=None):
         losses, stats = _kto_scores(
             model, batch, lengths, labels, objective,
             reference_policy=reference_policy, scorer=_scorer, reference=reference, kl_mean=kl_mean,
-            cce_indices=cce_indices, kl_indices=kl_indices, kl_batch=kl_batch,
+            cce_indices=cce_indices, kl_indices=kl_indices, kl_batch=kl_batch, reference_scorer=reference_scorer,
         )
         _, window_rows, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * losses.sum() / mx.maximum(
@@ -3338,6 +3352,7 @@ def make_kto_loss_fn(objective, *, reference_policy, kl_mean=None, _scorer=None)
         return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _kto_supervised_tokens
+    loss_fn._unsloth_cce_reference_scorer = reference_scorer
     return _mark_kto_fn(loss_fn, _scorer)
 
 
@@ -3349,15 +3364,19 @@ def make_kto_cce_loss_fn(model, objective, *, reference_policy, kl_mean=None):
 
 
 def _make_kto_eval_fn(objective, reference_policy, scorer):
+    reference_scorer = _reference_scorer(reference_policy, scorer)
+
     def eval_fn(model, batch, lengths, _normalizers, labels, reference=None, cce_indices=None, kl_indices=None,
                 kl_batch=None):
         losses, stats = _kto_scores(
             model, batch, lengths, labels, objective,
             reference_policy=reference_policy, scorer=scorer, reference=reference,
             differentiated=False, cce_indices=cce_indices, kl_indices=kl_indices, kl_batch=kl_batch,
+            reference_scorer=reference_scorer,
         )
         return losses.mean(), mx.array(labels.shape[0], dtype=mx.int32), stats
 
+    eval_fn._unsloth_cce_reference_scorer = reference_scorer
     return _mark_kto_fn(eval_fn, scorer)
 
 
