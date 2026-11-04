@@ -57,7 +57,7 @@ from .compile import (
     normalize_mlx_patch_mode,
     trace_compile_application,
 )
-from .attention import install_quantized_attention
+from .attention import install_fused_attention, install_quantized_attention
 from .inference import inference_scopes
 
 _vlm_model_types_cache = None
@@ -9263,6 +9263,7 @@ def _remove_scratch_dirs_on_error(load):
 def _finish_load(model, tokenizer):
     """The single exit from a load, so the patch installs after the runtimes the load imports."""
     install_quantized_attention()
+    install_fused_attention()
     # Here rather than in get_peft_model: the trainer and callers freeze loaded models too.
     _fix_missing_no_grad(model)
     # A call, not an if: tests/test_mlx_attention_metal.py keeps this body straight-line so the attention patch above can never sit behind a branch.
