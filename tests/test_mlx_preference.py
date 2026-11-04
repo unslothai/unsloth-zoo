@@ -3720,6 +3720,88 @@ def test_grpo_skips_only_micro_steps_without_gradient(monkeypatch, loss_type, it
     assert options == [True, False, False, False, True, False]
 
 
+def test_grpo_scalerl_weights_follow_unsloth_cuda(monkeypatch):
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOObjective
+    run = lambda rewards, weighting, sizes=(10,), beta=0.0: _grpo_window(monkeypatch, GRPOObjective("dapo", beta, max_completion_length=60), rewards, sizes=sizes, sample_weighting=weighting)  # noqa: E501, E731
+    (plain, score, _), (excluded, rescore, plan) = run([1.0, 1.0, 0.0, 2.0], None, beta=0.04), run([1.0, 1.0, 0.0, 2.0], (True, False), beta=0.04)  # noqa: E501
+    # Half the groups excluded and equal lengths: the rest's gradient, KL included, doubles, exactly 1 / (1 - 0.5).
+    rest = [(*batch[:4], batch[4] * (batch[3] != 0), *batch[5:]) for batch in plain]
+    assert np.allclose(rescore(excluded)[1], 2 * score(rest)[1], rtol=1e-6) and plan.pop_metrics()["frac_reward_zero_std_excluded"] == 0.5  # noqa: E501
+    (plain, score, _), (varied, rescore, _) = run([0.0, 1.0, 3.0, 1.0], None), run([0.0, 1.0, 3.0, 1.0], (True, False))
+    assert all(np.allclose(got, want, rtol=1e-6) for got, want in zip(rescore(varied)[:2], score(plain)[:2]))  # no degenerate group: dapo  # noqa: E501
+    batches = run([0.0, 1.0, 3.0, 1.0], (False, True), sizes=(4, 17, 30, 43))[0]  # group tokens 21 and 73, two groups
+    assert all(np.allclose(np.array(batch[8]), [1 / (2 * (21 if prompt == 130 else 73)) for prompt, _ in batch[1].tolist()]) for batch in batches)  # noqa: E501
+
+
+@pytest.mark.parametrize("opening", [False, True])
+def test_the_grpo_trainer_counts_a_skipped_micro_step_as_a_trained_one(tmp_path, monkeypatch, opening):
+    import numpy as np
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx import generate as generate_module, trainer as trainer_module
+    from unsloth_zoo.mlx.grpo import GRPOBatchPlan
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+    scorer = lambda *args, **kwargs: _dense_scorer(*args, **kwargs)  # noqa: E731
+    scorer.compaction, _dense_scorer.calls, plans, value_and_grad, forwards, rewarded = True, [], [], nn.value_and_grad, [], []
+    # The simulation's tree differs from trainable_parameters(), which skipped zeros follow; one call per micro-step.
+    def graded(model, fn):
+        def run(*args):
+            forwards.append(1)
+            grads = dict(tree_flatten(value_and_grad(model, fn)(*args)[1]))
+            return fn(*args), {k: grads.get(k, mx.zeros_like(v)) for k, v in model.trainable_parameters().items()}
+        return run
+    monkeypatch.setattr(nn, "value_and_grad", graded)
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", lambda model, temperature: scorer)
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, defaults=None: [types.SimpleNamespace(token_ids=[1 + row % 3, 2], finish_reason="length") for row in range(len(requests))])  # noqa: E501
+    for name in ("create_grpo_batch_plan", "create_grpo_eval_plan"):
+        monkeypatch.setattr(trainer_module, name, lambda *a, make=getattr(trainer_module, name), **kw: plans.append(make(*a, **kw)) or plans[-1])  # noqa: E501
+    # Closing: step 1's second micro-step is all zero-advantage, and step 2's both are, which opens a window with no gradient.
+    # Opening: a window spans two generations of two micro-steps, and the first generation is all zero-advantage.
+    reward = lambda completion_ids, answer, trainer_state, **_: [ids[0] * (a == 0 and trainer_state.global_step == 0) for ids, a in zip(completion_ids, answer)]  # noqa: E501, E731
+    if opening:
+        reward = lambda completion_ids, **_: rewarded.append(1) or [ids[0] * (len(rewarded) > 1) for ids in completion_ids]  # noqa: E731
+    shape = dict(gradient_accumulation_steps=4, steps_per_generation=2, max_steps=1) if opening else dict(eval_steps=2)
+
+    def run():
+        rows = [{**row, "prompt": "a" * 150 + row["prompt"]} for row in _grpo_rows()]  # long enough that compaction saves
+        mx.random.seed(0)
+        forwards.clear(), rewarded.clear()
+        updates, trainer = [], MLXGRPOTrainer(_tiny_model(), DecodingTokenizer(), rows, eval_dataset=None if opening else rows[:2], reward_funcs=reward, args=_grpo_config(tmp_path, loss_type="dapo", beta=0.0, loss_aggregation="prompt", use_cce=True, compile=False, shuffle_dataset=False, per_device_eval_batch_size=4, max_seq_length=256, **shape))  # noqa: E501
+        trainer._build_optimizer = lambda _steps: types.SimpleNamespace(learning_rate=mx.array(1e-5), state={}, update=lambda _model, grad: updates.append(np.concatenate([np.array(g).ravel() for _, g in tree_flatten(grad)])))  # noqa: E501
+        trainer.save_model = lambda *_args, **_kwargs: None
+        trainer.train()
+        logged = [entry for entry in trainer.state.log_history if "frac_rows_skipped" in entry]
+        return updates, [entry["loss"] for entry in logged], [entry["frac_rows_skipped"] for entry in logged], len(forwards)
+
+    skipping = run()
+    assert skipping[2] == ([0.5] if opening else [0.5, 1.0]) and skipping[3] == (2 if opening else 1)
+    assert plans[0].sample_weighting[1] and len(plans) == 1 + (not opening) and all(plan._cce_bounds for plan in plans) and all(_dense_scorer.calls)  # noqa: E501
+    monkeypatch.setattr(GRPOBatchPlan, "skipped_stats", lambda self, index: None)
+    full = run()
+    assert full[3] == 4 and len(skipping[0]) == len(full[0]) == 2 - opening and np.abs(full[0][0]).max() > 0 and bool(full[0][-1].any()) == opening  # noqa: E501
+    assert all(np.allclose(a, b, rtol=1e-6, atol=0) for a, b in zip(skipping[0], full[0])) and np.allclose(skipping[1], full[1])  # noqa: E501
+
+
+def test_grpo_scalerl_options_read_unsloth_cuda_environment(monkeypatch):
+    from unsloth_zoo.mlx.grpo import grpo_sample_weighting
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig
+    monkeypatch.setenv("UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE", "1")
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    with pytest.warns(UserWarning) as caught:
+        weighting = grpo_sample_weighting(MLXGRPOConfig(loss_type="dapo"))
+    messages = " ".join(str(warning.message) for warning in caught)
+    assert "UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE=1 sets" in messages and "UNSLOTH_GRPO_TRUNCATED_SUPPORT is not supported" in messages
+    assert weighting == (True, False) and grpo_sample_weighting(MLXGRPOConfig(loss_type="dapo", zero_variance_exclude=False)) is None  # noqa: E501
+    with pytest.warns(UserWarning, match="ignored for loss_type='grpo'"):
+        assert grpo_sample_weighting(MLXGRPOConfig(loss_type="grpo")) is None
+    assert grpo_sample_weighting(MLXGRPOConfig(loss_type="grpo", loss_aggregation="prompt")) == (True, True)
+    monkeypatch.setenv("UNSLOTH_GRPO_LOSS_AGGREGATION", "sequence")
+    with pytest.raises(ValueError, match="UNSLOTH_GRPO_LOSS_AGGREGATION must be 'prompt'"):
+        MLXGRPOConfig()
+
+
 def test_grpo_reward_models_are_scored_as_trl_scores_them(monkeypatch):
     import numpy as np
     import torch

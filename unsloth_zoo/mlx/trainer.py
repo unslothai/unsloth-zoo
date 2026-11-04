@@ -637,6 +637,7 @@ from .grpo import (
     grpo_layout_options,
     grpo_objective,
     grpo_reward_funcs,
+    grpo_sample_weighting,
     grpo_sampling,
     make_grpo_cce_loss_fn,
     make_grpo_eval_fn,
@@ -1613,6 +1614,8 @@ class MLXTrainingConfig:
             "num_completions_to_print",
             "use_vllm",
             "use_liger_loss",
+            "zero_variance_exclude",
+            "loss_aggregation",
             "cpo_alpha",
             "simpo_gamma",
             "alpha",
@@ -1776,6 +1779,9 @@ class MLXGRPOConfig(MLXTrainingConfig):
     num_completions_to_print: int | None = field(default=None, kw_only=True)
     use_vllm: bool = field(default=False, kw_only=True)
     use_liger_loss: bool = field(default=False, kw_only=True)
+    # ScaleRL options; None reads CUDA Unsloth's UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE / UNSLOTH_GRPO_LOSS_AGGREGATION.
+    zero_variance_exclude: bool | None = field(default=None, kw_only=True)
+    loss_aggregation: str | None = field(default=None, kw_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -9822,6 +9828,7 @@ class MLXGRPOTrainer(MLXTrainer):
             **self._grpo_vision_options(), **grpo_layout_options(
                 grpo_objective(args), distributed=getattr(self, "distributed_world_size", 1) > 1,
             ),
+            sample_weighting=grpo_sample_weighting(args),
         )
         # A resumed run generates at once, so its widths are planned from there.
         resume = getattr(self, "_resume_from_checkpoint", None)

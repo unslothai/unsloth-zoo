@@ -19,6 +19,7 @@ patches it on CUDA (unsloth_zoo.rl_replacements.grpo_compute_loss)."""
 
 import copy
 import math
+import os
 import sys
 import warnings
 from collections.abc import Mapping
@@ -194,6 +195,21 @@ def group_advantages(rewards_per_func, reward_weights, num_generations, scale_re
     }
 
 
+def scalerl_sample_weights(rewards, num_generations, lengths, exclude, prompt_level):
+    """Unsloth's ScaleRL per-completion loss weights for one generation, and the fraction of groups excluded: zero-variance
+    exclusion drops groups of equal rewards from the loss and its token count; prompt-level aggregation averages tokens
+    within each group, then over groups."""
+    groups = rewards.reshape(-1, num_generations)
+    keep = ~np.isclose(groups.std(axis=1, ddof=1), 0.0) if exclude else np.ones(len(groups), dtype=bool)
+    rows = np.repeat(keep, num_generations).astype(np.float64)
+    tokens = (lengths * rows).reshape(-1, num_generations).sum(axis=1)
+    if prompt_level:
+        weights = rows / (np.repeat(np.maximum(tokens, 1.0), num_generations) * max(int(keep.sum()), 1))
+    else:
+        weights = rows / max(float(tokens.sum()), 1.0)
+    return weights.astype(np.float32), float(1.0 - keep.mean())
+
+
 def completion_logps(model, batch, temperature):
     """Per-token log probabilities of the batch's ids after the first, on logits divided by the sampling temperature as TRL scores them."""
     logits = _preference_logits(model, batch).astype(mx.float32)
@@ -280,10 +296,13 @@ def grpo_terms(objective, new, advantages, mask, *, old=None, ref=None):
     return per_token, kl, coef_1
 
 
-def _reduce(objective, per_token, mask, normalizers):
-    """k times Unsloth's micro-step loss, k the window's micro-step count (it cancels); the trainer averages micro-step gradients while TRL sums them."""
+def _reduce(objective, per_token, mask, normalizers, weights=None):
+    """k times Unsloth's micro-step loss, k the window's micro-step count (it cancels); the trainer averages micro-step
+    gradients while TRL sums them; sample weights replace every loss type's normalizer, as Unsloth's do."""
     steps_per_generation, generation_tokens = normalizers[0], normalizers[1]
     masked = per_token * mask
+    if weights is not None:
+        return steps_per_generation * (masked * weights[:, None]).sum()
     if objective.loss_type == "grpo":
         return (masked.sum(-1) / mx.maximum(mask.sum(-1), mx.array(1.0))).mean()
     if objective.loss_type == "dr_grpo":
@@ -326,14 +345,16 @@ def grpo_metric_values(summed):
 
 
 def make_grpo_loss_fn(objective, *, scorer=None):
-    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps, cce_indices); kept zeroes rows TRL masks as truncated."""
+    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps, cce_indices, sample weights); kept zeroes rows TRL masks as truncated."""
     logps = grpo_logps(objective.temperature, scorer)
 
-    def loss_fn(model, batch, lengths, normalizers, advantages, kept, old=None, ref=None, cce_indices=None):
+    def loss_fn(
+        model, batch, lengths, normalizers, advantages, kept, old=None, ref=None, cce_indices=None, weights=None,
+    ):
         new = logps(model, batch, lengths, cce_indices)
         mask = _response_mask(_preference_ids(batch)[:, 1:], lengths) * kept[:, None].astype(mx.float32)
         per_token, kl, coef_1 = grpo_terms(objective, new, advantages, mask, old=old, ref=ref)
-        loss = _reduce(objective, per_token, mask, normalizers)
+        loss = _reduce(objective, per_token, mask, normalizers, weights)
         return loss, mx.array(1, dtype=mx.int32), grpo_stats(objective, kl, coef_1, advantages, mask)
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
@@ -648,6 +669,7 @@ class _Generation:
     generation_tokens: int
     media: list | None = None  # (prompt text, images) per row
     skipped: dict | None = None
+    weights: np.ndarray | None = None
 
 
 class GRPOBatchPlan:
@@ -661,7 +683,7 @@ class GRPOBatchPlan:
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
         processor=None, model_config=None, vision=False, group_by_length=False, layout_block=1,
-        skip_zero_advantage=False,
+        skip_zero_advantage=False, sample_weighting=None,
     ):
         self._dataset = dataset
         self._tokenizer = tokenizer
@@ -687,6 +709,7 @@ class GRPOBatchPlan:
         self.counts_tokens = counts_tokens
         self.group_by_length = group_by_length
         self.skip_zero_advantage = skip_zero_advantage
+        self.sample_weighting = sample_weighting
         self._layout_rows = batch_size * layout_block
         self.eos_id = int(tokenizer.eos_token_id)
         pad_id = getattr(tokenizer, "pad_token_id", None)
@@ -872,6 +895,14 @@ class GRPOBatchPlan:
             rewards, self._reward_weights, self.num_generations, self.scale_rewards,
         )
         self._record_generation(lengths, truncated, rewards, reward_stats)
+        kept = ~truncated if self.mask_truncated_completions else np.ones_like(truncated)
+        weights = None
+        if self.sample_weighting is not None:
+            combined = np.nansum(rewards * np.asarray(self._reward_weights, dtype=np.float32)[None, :], axis=1)
+            weights, excluded = scalerl_sample_weights(
+                combined.astype(np.float32), self.num_generations, lengths * kept, *self.sample_weighting,
+            )
+            self._record("frac_reward_zero_std_excluded", excluded)
         if self._keep_completions:
             self.completions = {
                 # Phi-3 Vision's negative placeholder ids do not decode.
@@ -883,7 +914,6 @@ class GRPOBatchPlan:
                 },
                 "advantage": advantages.tolist(),
             }
-        kept = ~truncated if self.mask_truncated_completions else np.ones_like(truncated)
         # Shuffled before scoring so each old/reference chunk is one micro-batch at its own width, and a first iteration's ratio is exactly 1 when eager.
         order = np.random.default_rng(_derived_seed(self.seed, visit, 1)).permutation(len(prompts))
         # Exactly zero, not TRL's zero std: a rounded group mean leaves a tiny advantage that still has gradient.
@@ -923,6 +953,7 @@ class GRPOBatchPlan:
             visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
             generation_tokens=int(lengths.sum()), media=media, skipped=skipped,
+            weights=None if weights is None else weights[order],
         )
 
     def _reencode(self, prompt, row):
@@ -953,11 +984,13 @@ class GRPOBatchPlan:
     def batch_family(self, index):
         rows = self.batch_size
         held = ((rows, "sequence-1"), "float32")
-        return (
-            "grpo_tuple_7", ((rows, "sequence"), "int32"), ((rows, 2), "int32"),
+        # CCE indices are a function of the width, so they name no family of their own.
+        family = (
+            "grpo_tuple", ((rows, "sequence"), "int32"), ((rows, 2), "int32"),
             ((2,), "float32"), ((rows,), "float32"), ((rows,), "int32"),
             held if self.with_old_logps else None, held if self.with_reference else None,
         )
+        return family if self.sample_weighting is None else (*family, ((rows,), "float32"))
 
     def set_shape_plan(self, shape_plan):
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
@@ -1000,6 +1033,8 @@ class GRPOBatchPlan:
             held(generation.old), held(generation.ref),
         )
         indices = self._cce_indices(lengths, width)
+        if generation.weights is not None:
+            return (*materialized, indices, mx.array(generation.weights[position:position + self.batch_size]))
         return materialized if indices is None else (*materialized, indices)
 
     def skipped_stats(self, index):
@@ -1082,12 +1117,12 @@ def create_grpo_batch_plan(
     num_iterations, grad_accum, sampling, max_seq_length, score_temperature=None, scale_rewards="group",
     mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
     shuffle=True, seed=None, num_batches=None, num_epochs=None, processor=None, model_config=None,
-    group_by_length=False, skip_zero_advantage=False,
+    group_by_length=False, skip_zero_advantage=False, sample_weighting=None,
 ):
     """Encode prompts once and lay out TRL's RepeatSampler schedule; batch_size counts completions, a generation samples
     batch_size * steps_per_generation of them, num_generations per prompt; score_temperature defaults to the sampling
     temperature; a VLM processor replaces tokenizer; within each optimizer step group_by_length sorts rows by length and
-    skip_zero_advantage puts zero-advantage rows last."""
+    skip_zero_advantage puts zero-advantage rows last; sample_weighting is grpo_sample_weighting's."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
     prompt_ids, max_tokens, vision = _encode_grpo_prompts(
@@ -1131,7 +1166,7 @@ def create_grpo_batch_plan(
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
         processor=processor, model_config=model_config, vision=vision,
         group_by_length=group_by_length, layout_block=math.gcd(steps_per_generation, grad_accum),
-        skip_zero_advantage=skip_zero_advantage,
+        skip_zero_advantage=skip_zero_advantage, sample_weighting=sample_weighting,
     )
 
 
@@ -1290,6 +1325,56 @@ def grpo_reward_funcs(reward_funcs, reward_processing_classes=None):
     return funcs
 
 
+_SCALERL_LOSS_TYPES = ("bnpo", "dapo")  # token-normalized, so exclusion alone is defined
+
+
+def grpo_sample_weighting(config):
+    """(exclude, prompt_level) for scalerl_sample_weights, or None when the config trains TRL's objective."""
+    prompt_level = config.loss_aggregation == "prompt"
+    return (bool(config.zero_variance_exclude), prompt_level) if config.zero_variance_exclude or prompt_level else None
+
+
+def _resolve_scalerl_options(config):
+    """CUDA Unsloth's ScaleRL environment variables are the fields' defaults; the GRPO flags it reads for vLLM rollouts
+    have no MLX counterpart."""
+    if config.zero_variance_exclude is None:
+        config.zero_variance_exclude = os.environ.get("UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE", "0") == "1"
+        if config.zero_variance_exclude:
+            warnings.warn(
+                "Unsloth MLX GRPO: UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE=1 sets zero_variance_exclude=True, as on CUDA "
+                "Unsloth; set the field to choose explicitly.",
+                stacklevel=4,
+            )
+    if config.loss_aggregation is None:
+        value = os.environ.get("UNSLOTH_GRPO_LOSS_AGGREGATION", "").strip().lower()
+        if value not in ("", "prompt"):
+            raise ValueError(
+                f"Unsloth MLX GRPO: UNSLOTH_GRPO_LOSS_AGGREGATION must be 'prompt' or unset, got {value!r}."
+            )
+        config.loss_aggregation = value or "token"
+        if value:
+            warnings.warn(
+                "Unsloth MLX GRPO: UNSLOTH_GRPO_LOSS_AGGREGATION=prompt sets loss_aggregation='prompt', as on CUDA "
+                "Unsloth; set the field to choose explicitly.",
+                stacklevel=4,
+            )
+    if config.loss_aggregation not in ("token", "prompt"):
+        raise ValueError(
+            f"Unsloth MLX GRPO: loss_aggregation must be 'token' or 'prompt', got {config.loss_aggregation!r}."
+        )
+    alone = config.zero_variance_exclude and config.loss_aggregation == "token"
+    if alone and config.loss_type not in _SCALERL_LOSS_TYPES:
+        warnings.warn(
+            "Unsloth MLX GRPO: zero_variance_exclude alone needs a token-normalized loss_type (bnpo, dapo), as on "
+            f"CUDA Unsloth; it is ignored for loss_type={config.loss_type!r}.",
+            stacklevel=4,
+        )
+        config.zero_variance_exclude = False
+    for name in ("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "UNSLOTH_GRPO_VLLM_IS_MODE"):
+        if os.environ.get(name, "").strip() not in ("", "0"):
+            warnings.warn(f"Unsloth MLX GRPO: {name} is not supported on MLX and is ignored.", stacklevel=4)
+
+
 def resolve_grpo_config(config):
     """CUDA Unsloth's GRPOConfig rewrites, then TRL 0.24's ``__post_init__``."""
     if config.use_vllm:
@@ -1389,6 +1474,7 @@ def resolve_grpo_config(config):
             "Unsloth MLX GRPO: top_entropy_quantile < 1 is ignored, as on CUDA Unsloth.",
             stacklevel=3,
         )
+    _resolve_scalerl_options(config)
     grpo_objective(config)
     grpo_sampling(config)
 
