@@ -221,6 +221,46 @@ def test_compiled_training_state_survives_generation(monkeypatch):
         remove_gradient_checkpointing(model)
 
 
+@real_mlx_only
+def test_batched_draws_keep_each_row_on_its_own_seeded_stream_as_rows_join_and_leave():
+    from unsloth_zoo.mlx.generate import SamplingParams, _BatchedDraws, _seeded_sampler
+
+    generator = types.SimpleNamespace(_generation_batch=types.SimpleNamespace(uids=[]),
+                                      _prompt_batch=types.SimpleNamespace(split=lambda uids: types.SimpleNamespace(uids=uids)))
+    assert _BatchedDraws.serves(generator)
+    draws, params = _BatchedDraws(generator), {uid: SamplingParams(temperature=0.8, seed=uid * 7) for uid in (10, 11, 12)}
+    alone = {uid: _seeded_sampler(None, row) for uid, row in params.items()}
+    for uid, row in params.items():
+        draws.register(uid, row)
+    for uids, admitted in (([10, 11], True), ([10, 11], False), ([10, 11], False), ([12], True), ([10, 11, 12], False),
+                           ([12, 10], False)):
+        draws.release(11) if uids == [12, 10] else None
+        logprobs = mx.random.normal((len(uids), 50))
+        generator._prompt_batch.split(uids) if admitted else setattr(generator._generation_batch, "uids", list(uids))
+        assert draws(logprobs).tolist() == [alone[uid](logprobs[row:row + 1]).item() for row, uid in enumerate(uids)]
+
+
+@metal_only
+@pytest.mark.parametrize("warps", [False, True])
+def test_batched_draws_and_logits_warp_sample_the_tokens_per_row_samplers_do(warps):
+    from mlx_lm import load
+    from unsloth_zoo.mlx.generate import GenerationDefaults, GenerationRequest, SamplingParams, generate_batch
+    from unsloth_zoo.mlx.grpo import GRPOSampling, _rollout_sampling
+
+    model, tokenizer = load(MODEL)
+    sampling = GRPOSampling(temperature=0.8, top_p=0.9, min_p=0.05) if warps else GRPOSampling()
+    prompts = [tokenizer.encode(p, add_special_tokens=False) for p in ("The capital of France is", "Two plus two equals")]
+
+    def tokens(batched):
+        requests = [GenerationRequest(prompt_token_ids=ids, max_tokens=16, sampling=SamplingParams(temperature=1.0, seed=seed),
+                                      logits_processors=_rollout_sampling(sampling, ids, batched)[0])
+                    for seed, ids in enumerate(prompts * 2)]
+        defaults = GenerationDefaults(max_tokens=16, logits_warp=_rollout_sampling(sampling, (), batched)[1], batched_draws=batched)
+        return [result.token_ids for result in generate_batch(model, tokenizer, requests, defaults=defaults)]
+
+    assert tokens(True) == tokens(False)
+
+
 @metal_only
 def test_vlm_batched_generation_is_ordered_and_aligned():
     from PIL import Image

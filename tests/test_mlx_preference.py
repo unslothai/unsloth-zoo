@@ -3743,7 +3743,7 @@ def test_grpo_rewards_advantages_and_reward_inputs_follow_trl():
 def test_grpo_rollout_warper_matches_hf_sampling_processors(settings):
     import torch
     from transformers.generation import logits_process as hf
-    from unsloth_zoo.mlx.grpo import GRPOSampling, hf_logits_warper
+    from unsloth_zoo.mlx.grpo import GRPOSampling, _rollout_sampling, hf_logits_warper
 
     sampling = GRPOSampling(**settings)
     prompt, generated = [5, 1, 5, 7], [2, 9]
@@ -3764,6 +3764,9 @@ def test_grpo_rollout_warper_matches_hf_sampling_processors(settings):
         assert torch.equal(hf_logits_warper(penalized, [placeholder, 1, placeholder])(torch.tensor([placeholder, 2]), scores.clone()), plain)
     tied =hf_logits_warper(GRPOSampling(top_p=0.5), [1])(torch.tensor([1]), torch.tensor([[0.0, 1.0, 1.0, 1.0]]))
     assert torch.isfinite(tied).sum() == 2  # HF keeps two of the three tied logits
+    plain, rows = GRPOSampling(**{**settings, "repetition_penalty": 1.0}), torch.randn(3, 12) * 3
+    batched = _rollout_sampling(plain, (), True)[1](rows[:, None])[:, 0]  # every row at once, shaped as decode logits
+    assert torch.allclose(batched, torch.cat([hf_logits_warper(plain, [1])(torch.tensor([1]), row[None]) for row in rows]))
 
 
 @pytest.mark.parametrize("rows,active,expected", [(16, 0, 32), (64, 0, 48), (64, 640 * 2 * 40, 32), (40, 0, 40)])
@@ -3893,7 +3896,8 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     assert replayed[1:] == [first[0].tolist(), replayed[0]] != [replayed[0]] * 2 and len(calls) == 1
     requests, defaults = calls[0]
     assert defaults.stop_token_ids == (2,) and defaults.token_ids_only and defaults.completion_batch_size == 32 and [r.max_tokens for r in requests] == [3] * 4
-    assert len({r.sampling.seed for r in requests}) == 4 and requests[0].logits_processors and not GRPOSampling().warps
+    assert len({r.sampling.seed for r in requests}) == 4 and not GRPOSampling().warps
+    assert defaults.batched_draws and defaults.logits_warp is not None and requests[0].logits_processors is None
     assert [r.prompt_token_ids for r in requests] == [(14,), (14,), (14, 14), (14, 14)]
     assert seen["ids"] == [[1, 2], [1, 1, 1]] * 2 and seen["completions"][:2] == ["b", "bbb"] and seen["answer"] == [0, 0, 1, 1]  # noqa: E501
     tokens, lengths, normalizers, advantages, kept, old, ref = first

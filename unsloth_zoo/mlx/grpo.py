@@ -544,29 +544,44 @@ def hf_logits_warper(sampling, prompt_ids):
             picked = logits[:, seen]
             logits[:, seen] = mx.where(picked < 0, picked * penalty, picked / penalty)
             logits = logits[:, :vocab]
-        if sampling.temperature != 1.0:
-            logits = logits / sampling.temperature
-        removed = mx.array(-float("inf"), mx.float32)
-        vocab = logits.shape[-1]
-        if sampling.top_k:
-            kept = vocab - min(int(sampling.top_k), vocab)
-            cutoff = mx.sort(logits, axis=-1)[:, kept:kept + 1]
-            logits = mx.where(logits < cutoff, removed, logits)
-        if sampling.top_p < 1.0:
-            # Drops by sorted position as HF does, since a value cutoff keeps every tie; the most likely token always survives, as HF's min_tokens_to_keep=1.
-            order = mx.argsort(logits, axis=-1)
-            ordered = mx.take_along_axis(logits, order, axis=-1)
-            below = mx.cumsum(mx.softmax(ordered, axis=-1), axis=-1) <= 1 - sampling.top_p
-            below = mx.logical_and(below, mx.arange(vocab) < vocab - 1)
-            dropped = mx.take_along_axis(below, mx.argsort(order, axis=-1), axis=-1)
-            logits = mx.where(dropped, removed, logits)
-        if sampling.min_p:
-            probs = mx.softmax(logits, axis=-1)
-            floor = sampling.min_p * mx.max(probs, axis=-1, keepdims=True)
-            logits = mx.where(probs < floor, removed, logits)
-        return logits
+        return hf_logits_filter(sampling, logits)
 
     return warp
+
+
+def hf_logits_filter(sampling, logits):
+    """HF's temperature, top-k, top-p and min-p over the last axis of float32 logits, each row on its own."""
+    if sampling.temperature != 1.0:
+        logits = logits / sampling.temperature
+    removed = mx.array(-float("inf"), mx.float32)
+    vocab = logits.shape[-1]
+    if sampling.top_k:
+        kept = vocab - min(int(sampling.top_k), vocab)
+        cutoff = mx.sort(logits, axis=-1)[..., kept:kept + 1]
+        logits = mx.where(logits < cutoff, removed, logits)
+    if sampling.top_p < 1.0:
+        # Drops by sorted position as HF does, since a value cutoff keeps every tie; the most likely token always survives, as HF's min_tokens_to_keep=1.
+        order = mx.argsort(logits, axis=-1)
+        ordered = mx.take_along_axis(logits, order, axis=-1)
+        below = mx.cumsum(mx.softmax(ordered, axis=-1), axis=-1) <= 1 - sampling.top_p
+        below = mx.logical_and(below, mx.arange(vocab) < vocab - 1)
+        dropped = mx.take_along_axis(below, mx.argsort(order, axis=-1), axis=-1)
+        logits = mx.where(dropped, removed, logits)
+    if sampling.min_p:
+        probs = mx.softmax(logits, axis=-1)
+        floor = sampling.min_p * mx.max(probs, axis=-1, keepdims=True)
+        logits = mx.where(probs < floor, removed, logits)
+    return logits
+
+
+def _rollout_sampling(sampling, prompt_ids, batched):
+    """``(logits processors, logits warp)``: a repetition penalty reads each row's own history, so only a batch
+    without one warps every row at once."""
+    if not sampling.warps:
+        return None, None
+    if batched and sampling.repetition_penalty == 1.0:
+        return None, lambda logits: hf_logits_filter(sampling, logits.astype(mx.float32))
+    return (hf_logits_warper(sampling, prompt_ids),), None
 
 
 def _kv_bytes_per_token(model):
@@ -803,22 +818,21 @@ class GRPOBatchPlan:
         read = {prompt: self._dataset[prompt] for prompt in dict.fromkeys(prompts)}
         # Read again each generation and held only for it: the plan keeps no pixels.
         encoded = {prompt: self._reencode(prompt, row) for prompt, row in read.items()} if self.vision else {}
+        text = self._processor is None
         requests = [
             GenerationRequest(
                 prompt_token_ids=self._prompt_ids[prompt],
                 vision_inputs=encoded[prompt][3] if encoded else None,
                 max_tokens=self._max_tokens[prompt],
                 sampling=SamplingParams(temperature=1.0, seed=_derived_seed(self.seed, visit, 0, row)),
-                logits_processors=(
-                    (hf_logits_warper(self.sampling, self._prompt_ids[prompt]),)
-                    if self.sampling.warps else None
-                ),
+                logits_processors=_rollout_sampling(self.sampling, self._prompt_ids[prompt], text)[0],
             )
             for row, prompt in enumerate(prompts)
         ]
         defaults = GenerationDefaults(
             max_tokens=self.sampling.max_tokens, stop_token_ids=(self.eos_id,),
-            token_ids_only=self._processor is None,  # completions are decoded once, after the cut
+            logits_warp=_rollout_sampling(self.sampling, (), text)[1], batched_draws=text,
+            token_ids_only=text,  # completions are decoded once, after the cut
             completion_batch_size=_rollout_rows(self._model, len(requests), max(
                 len(request.prompt_token_ids) + request.max_tokens for request in requests)),
         )

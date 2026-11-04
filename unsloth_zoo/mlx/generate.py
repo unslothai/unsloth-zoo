@@ -168,6 +168,9 @@ class GenerationDefaults:
     log-prob, leaving results' ``text`` and ``logprobs`` empty; ``logprob_arrays`` puts
     those log-probs, a stopping id's included, in ``GenerationResult.logprob_array`` as
     one device array instead.
+    ``logits_warp`` maps every row's logits at once before they are normalized, for rows
+    without logits processors; ``batched_draws`` draws all rows in one call, each row
+    seeded at one shared temperature with no other filter, from its own key stream.
     """
 
     max_tokens: int = 256
@@ -184,10 +187,14 @@ class GenerationDefaults:
     prefill_step_size: int | None = None  # None: the runtime's own
     token_ids_only: bool = False
     logprob_arrays: bool = False
+    logits_warp: Callable[[Any], Any] | None = None
+    batched_draws: bool = False
 
     def __post_init__(self):
         _validate_positive_int(self.max_tokens, "defaults.max_tokens")
-        for name in ("token_ids_only", "logprob_arrays"):
+        if self.logits_warp is not None and not callable(self.logits_warp):
+            raise TypeError("defaults.logits_warp must be callable.")
+        for name in ("token_ids_only", "logprob_arrays", "batched_draws"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"defaults.{name} must be a bool.")
         _validate_positive_int(
@@ -768,8 +775,9 @@ def _generation_processor(adapter):
 
 
 def _validate_vlm_defaults(defaults: GenerationDefaults) -> None:
-    if defaults.token_ids_only or defaults.logprob_arrays:
-        raise ValueError("token_ids_only and logprob_arrays are served by text batches only.")
+    if defaults.token_ids_only or defaults.logprob_arrays or defaults.batched_draws or defaults.logits_warp:
+        raise ValueError(
+            "token_ids_only, logprob_arrays, logits_warp and batched_draws are served by text batches only.")
     if defaults.prefill_batch_size > defaults.completion_batch_size:
         # An inverted pair never admits anything on mlx-vlm, so generation would
         # hang. mlx-lm normalizes the two, so this is vision-specific.
@@ -981,6 +989,107 @@ def _text_row_processors(request: GenerationRequest) -> list:
     if _mlx_lm_shows_the_prompt():
         return list(request.logits_processors or ())
     return _row_processors(request)
+
+
+def _draw_rows(keys, logprobs, temperature):
+    """Each row's next key and draw, as ``_seeded_sampler`` holding that row's key draws alone: mlx samples one row by
+    inverse CDF, which ``mx.vmap`` does not reproduce."""
+    import mlx.core as mx
+
+    pairs = mx.vmap(mx.random.split)(keys)
+    logits = (logprobs * (1 / temperature)).astype(mx.float32)
+    top = logits.max(axis=-1, keepdims=True)
+    weights = mx.where(mx.isinf(top), (logits == top).astype(mx.float32), mx.exp(logits - top))
+    noise = mx.vmap(lambda key: mx.random.uniform(shape=(1,), key=key))(pairs[:, 1])
+    below = mx.cumsum(weights, axis=-1, inclusive=False) <= noise * weights.sum(axis=-1, keepdims=True)
+    return pairs[:, 0], (below.sum(axis=-1) - 1).astype(mx.uint32)
+
+
+@functools.cache
+def _batched_draws_match() -> bool:
+    import mlx.core as mx
+
+    params = [SamplingParams(temperature=0.7, seed=seed) for seed in (3, 11)]
+    alone = [_seeded_sampler(None, row) for row in params]
+    logprobs = mx.array([[0.0, -1.0, -2.0, -0.5], [-0.5, -0.2, 0.0, -3.0]])
+    keys = mx.stack([mx.random.key(row.seed) for row in params])
+    try:
+        for _ in range(3):
+            keys, drawn = _draw_rows(keys, logprobs, 0.7)
+            if drawn.tolist() != [alone[row](logprobs[row : row + 1]).item() for row in range(2)]:
+                return False
+    except Exception:
+        return False
+    return True
+
+
+class _BatchedDraws:
+    """One sampler for every row of an mlx-lm batch. mlx-lm names no rows, so they are read off the batch drawing: the
+    generation batch, or the one just split off the prompt batch."""
+
+    def __init__(self, generator):
+        self._generator, self._temperature = generator, None
+        self._keys, self._order, self._next, self._admitted = {}, None, None, None
+        prompts = generator._prompt_batch
+        split = prompts.split
+
+        def recording(indices):
+            batch = split(indices)
+            self._admitted = list(batch.uids)
+            return batch
+
+        prompts.split = recording
+
+    @staticmethod
+    def serves(generator) -> bool:
+        rows = getattr(getattr(generator, "_generation_batch", None), "uids", None)
+        split = getattr(getattr(generator, "_prompt_batch", None), "split", None)
+        return isinstance(rows, list) and callable(split) and _batched_draws_match()
+
+    def register(self, uid, params: SamplingParams) -> None:
+        import mlx.core as mx
+
+        if self._temperature not in (None, params.temperature):
+            raise ValueError("batched_draws draws every row at one temperature.")
+        self._temperature = params.temperature
+        self._keys[uid] = mx.random.key(params.seed)
+
+    def release(self, uid) -> None:
+        self._keys.pop(uid, None)
+
+    def __call__(self, logprobs):
+        import mlx.core as mx
+
+        uids, self._admitted = self._admitted or list(self._generator._generation_batch.uids), None
+        if uids == self._order:
+            keys = self._next
+        else:
+            if len(uids) != logprobs.shape[0] or any(uid not in self._keys for uid in uids):
+                raise RuntimeError(
+                    f"mlx-lm drew {logprobs.shape[0]} rows that batched_draws cannot match to its own rows.")
+            for row, uid in enumerate(self._order or ()):
+                if uid in self._keys:
+                    self._keys[uid] = self._next[row]
+            keys = mx.stack([self._keys[uid] for uid in uids])
+        self._next, drawn = _draw_rows(keys, logprobs, self._temperature)
+        self._order = uids
+        return drawn
+
+
+def _require_batched_draw(params: SamplingParams) -> None:
+    if params.seed is None or params.temperature == 0 or 0 < params.top_p < 1 or params.top_k or params.min_p:
+        raise ValueError("batched_draws takes seeded rows sampled at a temperature with no other filter.")
+
+
+class _WarpedLogits(_Delegate):
+    """The model as a batch generator calls it, its logits mapped by ``warp``."""
+
+    def __init__(self, target, warp):
+        super().__init__(target)
+        self._warp = warp
+
+    def __call__(self, *args, **kwargs):
+        return self._warp(self._target(*args, **kwargs))
 
 
 class _PerRowSampler:
@@ -1854,7 +1963,7 @@ class _TextBatchSession:
         self.adapter = adapter
         defaults = adapter.defaults
         self.generator = adapter.batch_generator_type(
-            adapter.model,
+            adapter.model if defaults.logits_warp is None else _WarpedLogits(adapter.model, defaults.logits_warp),
             max_tokens=defaults.max_tokens,
             stop_tokens=(
                 _eos_stop_tokens(adapter.tokenizer)
@@ -1865,6 +1974,10 @@ class _TextBatchSession:
             completion_batch_size=defaults.completion_batch_size,
             max_kv_size=defaults.max_kv_size,
             **_prefill_step_option(defaults, adapter.batch_generator_type),
+        )
+        self._draws = (
+            _BatchedDraws(self.generator)
+            if defaults.batched_draws and _BatchedDraws.serves(self.generator) else None
         )
         self._row_signature = None
         self._pending: dict[int, _PendingResult] = {}
@@ -1885,8 +1998,13 @@ class _TextBatchSession:
         else:
             prompt, prefilled, cache = self._prefill_image_row(request)
         params = request.sampling or defaults.sampling
+        if defaults.logits_warp is not None and request.logits_processors:
+            raise ValueError("A row with logits processors cannot take logits_warp: the order would be ambiguous.")
+        if defaults.batched_draws:
+            _require_batched_draw(params)
         sampler = (
-            _seeded_sampler(adapter.sample_utils, params)
+            self._draws if self._draws is not None
+            else _seeded_sampler(adapter.sample_utils, params)
             if params.seed is not None
             else adapter.make_sampler(
                 temp=params.temperature,
@@ -1912,6 +2030,8 @@ class _TextBatchSession:
                     f"mlx-lm answered a one-prompt insert with {len(uids)} uids."
                 )
             uid = uids[0]
+            if self._draws is not None:
+                self._draws.register(uid, params)
             state = _PendingResult(
                 detokenizer=_NoText() if defaults.token_ids_only else _new_detokenizer(adapter.tokenizer),
                 scanner=_StopStringScanner(defaults.stop_strings),
@@ -2015,6 +2135,8 @@ class _TextBatchSession:
         self._pending.pop(uid, None)
         if row is not None:
             self._uid_of.pop(row, None)
+        if self._draws is not None:
+            self._draws.release(uid)
 
     def _logprob(self, response) -> float | None:
         return None if self.adapter.defaults.token_ids_only else _sampled_logprob(response)
