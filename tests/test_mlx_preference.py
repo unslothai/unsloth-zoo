@@ -3990,6 +3990,9 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
         scored = np.arange(ids.shape[1] - 1)[None, :] < np.array(lengths[:, 1:]) - 1
         assert np.allclose(np.array(rest[3])[scored], np.array(mx.stop_gradient(completion_logps(model, batch, 1.0)))[scored], atol=1e-6)
         assert make_grpo_loss_fn(GRPOObjective(beta=0.0))(model, batch, lengths, *rest[:4])[2][4].item() == 0  # ratio 1
+    held = next(index for index, micro in enumerate(micros) if micro[0].get("pixel_values") is not None)
+    again = plan.materialize(held)[0]
+    assert again is not micros[held][0] and again["pixel_values"] is micros[held][0]["pixel_values"]
     text = plan._inputs(np.array(micros[0][0]["input_ids"]), np.array(micros[0][1]), [("yo", ())] * 2)
     assert text.get("pixel_values") is None and completion_logps(model, text, 1.0).shape[0] == 2  # bare ids fail the stub
     data[2]["prompt"] = user("changed")

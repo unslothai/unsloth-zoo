@@ -661,6 +661,7 @@ class _Generation:
     ref: list | None
     generation_tokens: int
     media: list | None = None  # (prompt text, images) per row
+    vision_inputs: dict | None = None  # (first row, width) -> that micro-batch's vision inputs
 
 
 class GRPOBatchPlan:
@@ -784,20 +785,25 @@ class GRPOBatchPlan:
             lengths[row] = (prompt_length, len(sequence))
         return batch, lengths
 
-    def _inputs(self, batch, lengths, media):
+    def _inputs(self, batch, lengths, media, held=None, key=None):
         if self._processor is None:
             return mx.array(batch)
-        return _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
+        # A micro-batch's processor outputs serve its old and reference scores and every iteration over it.
+        if held is None or key not in held:
+            inputs = _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
+            if held is None:
+                return inputs
+            held[key] = inputs
+        return dict(held[key])
 
-    def _score(self, scorer, sequences, prompt_lengths, media):
+    def _score(self, scorer, sequences, prompt_lengths, media, held=None):
         values = []
         for start in range(0, len(sequences), self.batch_size):
             chunk = sequences[start:start + self.batch_size]
-            batch, lengths = self._pack(
-                chunk, prompt_lengths[start:start + self.batch_size],
-                self._planned(self._width(max(len(sequence) for sequence in chunk))),
-            )
-            inputs = self._inputs(batch, lengths, None if media is None else media[start:start + self.batch_size])
+            width = self._planned(self._width(max(len(sequence) for sequence in chunk)))
+            batch, lengths = self._pack(chunk, prompt_lengths[start:start + self.batch_size], width)
+            inputs = self._inputs(
+                batch, lengths, None if media is None else media[start:start + self.batch_size], held, (start, width))
             logps = np.array(scorer(inputs, mx.array(lengths)), dtype=np.float32)
             values.extend(logps[row, :len(sequence) - 1] for row, sequence in enumerate(chunk))
         return values
@@ -890,23 +896,24 @@ class GRPOBatchPlan:
         ]
         prompt_lengths = prompt_lengths[order]
         media = [encoded[prompts[row]][1:3] for row in order] if encoded else None
+        held = {} if encoded else None
         old = ref = None
         if self.with_old_logps:
             old = self._score(
                 lambda batch, lengths: mx.stop_gradient(self._logps(self._model, batch, lengths)),
-                sequences, prompt_lengths, media,
+                sequences, prompt_lengths, media, held,
             )
         if self.with_reference:
             ref = self._score(
                 lambda batch, lengths: self._reference_policy.forward(
                     self._model, batch, lengths, response_scorer=self._logps,
                 ),
-                sequences, prompt_lengths, media,
+                sequences, prompt_lengths, media, held,
             )
         return _Generation(
             visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
-            generation_tokens=int(lengths.sum()), media=media,
+            generation_tokens=int(lengths.sum()), media=media, vision_inputs=held,
         )
 
     def _reencode(self, prompt, row):
@@ -977,7 +984,7 @@ class GRPOBatchPlan:
 
         media = None if generation.media is None else generation.media[position:position + self.batch_size]
         return (
-            self._inputs(batch, lengths, media), mx.array(lengths),
+            self._inputs(batch, lengths, media, generation.vision_inputs, (position, width)), mx.array(lengths),
             mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),
