@@ -2285,6 +2285,7 @@ def _plan_single_process_text_shapes(
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
     vision_preference = isinstance(batches, VisionPreferenceBatches)
+    vision_grpo = is_vlm and isinstance(batches, GRPOBatchPlan)
     strict = compile_policy.mode == "strict"
     if vision_preference:
         # The vision SFT planner's gates; the trainer reports an unqualified arch.
@@ -2306,11 +2307,19 @@ def _plan_single_process_text_shapes(
             return None, _shape_guard_report(
                 "not_applicable", "compile_ineligible_global_norm", cap,
             ), False, None
-    elif is_vlm and isinstance(batches, GRPOBatchPlan):
-        # Its vision inputs come only with each rollout, so no family is named ahead.
-        return None, _shape_guard_report(
-            "not_applicable", "grpo_vision_eager", cap,
-        ), False, None
+    elif vision_grpo:
+        # A qualified arch on one process, its micro-steps' vision families surveyed ahead of the rollouts; a family that
+        # drifts at runtime falls back to eager rather than aborting, so strict never raises here.
+        if not (
+            compile_policy.mode != "eager"
+            and getattr(vlm_compile_decision, "enabled", False)
+            and distributed_world_size <= 1
+            and batches.ensure_descriptors()
+        ):
+            return None, _shape_guard_report(
+                "not_applicable", "grpo_vision_eager", cap,
+            ), False, None
+        strict = False
     elif is_vlm:
         return _plan_single_process_vlm_shapes(
             batches,
@@ -2418,7 +2427,7 @@ def _plan_single_process_text_shapes(
             frontier,
             # Media families keep their own endpoints, so padding buys no reuse.
             exact_signature_threshold=(
-                AUTOMATIC_TEXT_COMPILE_CEILING if vision_preference else None
+                AUTOMATIC_TEXT_COMPILE_CEILING if vision_preference or vision_grpo else None
             ),
         )
     else:
@@ -5769,6 +5778,8 @@ class MLXTrainer:
                 ),
                 vlm_compile_decision=getattr(self, "_compile_decision", None),
             )
+            if isinstance(batches, GRPOBatchPlan):
+                batches.release_unplanned_descriptors()
         if isinstance(batches, FiniteTextBatchPlan):
             batches.configure_cce_compaction(
                 getattr(loss_fn, "_unsloth_cce_compaction", False),
@@ -8210,6 +8221,21 @@ class MLXTrainer:
                 )
             elif batch_error is not None:
                 raise batch_error
+            _drift = batches.pop_family_drift() if isinstance(batches, GRPOBatchPlan) else None
+            if _drift is not None and _use_compile:
+                # Single process only (the planner admits no other); the batch in hand is already at its planned width.
+                _main_print(
+                    f"Unsloth: a GRPO vision batch left its surveyed compile family ({_drift}); "
+                    "training continues eagerly."
+                )
+                step_fn = _uncompiled_step_fn
+                _use_compile = False
+                _compile_scope = "fallback_eager"
+                _compile_fallback_reason = "grpo_vision_family_drift"
+                state = [
+                    model.state, optimizer.state, mx.random.state,
+                    *_reference_compile_state,
+                ]
 
             # A stream is surveyed only by the one batch the peek looked at, so
             # audio appearing later must be caught here rather than at the

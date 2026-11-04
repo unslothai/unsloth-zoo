@@ -2129,6 +2129,100 @@ def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, v
 
 
 @metal_only
+def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch):
+    """Old log-probs score an image batch as the compiled step does: with a clip range of 1e-7, any other ratio clips."""
+    import random, shutil, types, PIL.Image, mlx_vlm.utils, mlx_vlm.models.qwen3_5 as qwen3_5
+    from huggingface_hub import snapshot_download
+    from unsloth_zoo.mlx import generate as generate_module, trainer as mlx_trainer
+    try:  # a tiny random Qwen3.5 from the real config and processor; the weights are never fetched
+        source = snapshot_download("mlx-community/Qwen3.5-0.8B-4bit", allow_patterns=["*.json", "*.jinja"], local_files_only=True)
+    except Exception:
+        pytest.skip("mlx-community/Qwen3.5-0.8B-4bit's processor files are not cached")
+    shutil.copytree(source, checkpoint := tmp_path / "tiny", ignore=shutil.ignore_patterns("*.index.json", "*.safetensors", "*.bin"))  # noqa: E501
+    config = {k: v for k, v in json.loads((checkpoint / "config.json").read_text()).items() if not k.startswith("quantization")}
+    config["text_config"].update(hidden_size=256, num_hidden_layers=4, layer_types=["linear_attention"] * 3 + ["full_attention"], intermediate_size=512, num_attention_heads=4, num_key_value_heads=2, head_dim=128, linear_num_key_heads=4, linear_num_value_heads=4, linear_key_head_dim=64, linear_value_head_dim=64)  # noqa: E501
+    config["vision_config"].update(depth=2, hidden_size=256, intermediate_size=1024, num_heads=4, out_hidden_size=256)
+    (checkpoint / "config.json").write_text(json.dumps(config))
+    mx.random.seed(5)
+    tiny = qwen3_5.Model(mlx_vlm.utils.update_module_configs(qwen3_5.ModelConfig.from_dict(params := dict(config)), qwen3_5, params, ["text", "vision"]))  # noqa: E501
+    tiny.set_dtype(mx.bfloat16)
+    mx.save_safetensors(str(checkpoint / "model.safetensors"), dict(tree_flatten(tiny.parameters())), {"format": "mlx"})
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: [
+        types.SimpleNamespace(token_ids=[100 + row % 7] * (2 + row % 5), finish_reason="stop") for row in range(len(requests))])
+    rng = random.Random(0)
+    data = [{"prompt": [{"role": "user", "content": " ".join(rng.choice(("apples", "orchard", "market")) for _ in range(3)) + f" Describe the picture in one sentence. Then say {i}."}], "image": PIL.Image.new("RGB", (224, 224), (rng.randint(0, 255), rng.randint(0, 255), 128))} for i in range(2)]  # noqa: E501
+    model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
+    trainer = mlx_trainer.MLXGRPOTrainer(FastMLXModel.get_peft_model(model, r=8, lora_alpha=8, lora_dropout=0, max_seq_length=1024), processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
+        output_dir=str(tmp_path / "out"), max_steps=1, per_device_train_batch_size=4, gradient_accumulation_steps=2, num_generations=4, num_iterations=2, max_completion_length=8, max_seq_length=1024, loss_type="dapo",  # noqa: E501
+        beta=0.0, logging_steps=1, seed=3, compile=True, gradient_checkpointing=False, epsilon=1e-7, epsilon_high=1e-7),
+        reward_funcs=lambda completion_ids, **_: [float(len(c) + sum(c) % 7) for c in completion_ids])
+    assert trainer.train()["compile_scope"] == "full_step"
+    assert [entry["clip_ratio/region_mean"] for entry in trainer.state.log_history if "clip_ratio/region_mean" in entry] == [0.0]
+
+
+@metal_only
+def test_compiled_grpo_scorer_draws_fresh_noise_in_step_with_eager():
+    """Noise in a compiled old or reference forward, such as dropout, is drawn anew and advances the stream as eager."""
+    from unsloth_zoo.mlx import grpo
+    model, batch = nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.5)), mx.ones((2, 8))
+    compiled, eager = (grpo._scored_as_step(lambda model, batch, *_: model(batch), lambda c=c: c) for c in (1, 0))
+    runs = []
+    for score in (compiled, eager):
+        mx.random.seed(0)
+        runs.append([score(model, batch, None), score(model, batch, None)])
+        runs[-1].append(mx.random.state[0])
+        mx.eval(runs[-1])
+    assert not mx.array_equal(runs[0][0], runs[0][1])
+    assert all(mx.array_equal(c, e) for c, e in zip(runs[0][:2], runs[1][:2]))
+    assert mx.array_equal(runs[0][2], runs[1][2])
+
+
+@metal_only
+@pytest.mark.parametrize("beta,lora", [(0.0, True), (0.04, True), (0.04, False)])  # full fine-tune: arrays swap
+def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lora):
+    import shutil, types, numpy as np, PIL.Image, mlx_vlm.utils, mlx_vlm.models.qwen2_5_vl as qwen2_5_vl
+    from huggingface_hub import snapshot_download
+    from unsloth_zoo.mlx import generate as generate_module, grpo, trainer as mlx_trainer
+    try:  # a tiny random Qwen2.5-VL from the real config and processor; the weights are never fetched
+        source = snapshot_download("Qwen/Qwen2.5-VL-3B-Instruct", allow_patterns=["*.json", "*.txt"], local_files_only=True)
+    except Exception:
+        pytest.skip("Qwen/Qwen2.5-VL-3B-Instruct's processor files are not cached")
+    shutil.copytree(source, checkpoint := tmp_path / "tiny", ignore=shutil.ignore_patterns("*.index.json", "*.safetensors", "*.bin"))  # noqa: E501
+    config = {**json.loads((checkpoint / "config.json").read_text()), **dict(hidden_size=128, num_hidden_layers=2, intermediate_size=256, num_attention_heads=1, num_key_value_heads=1)}  # noqa: E501
+    config["vision_config"].update(depth=2, hidden_size=64, intermediate_size=128, num_heads=2, out_hidden_size=128, fullatt_block_indexes=[1])  # noqa: E501
+    (checkpoint / "config.json").write_text(json.dumps(config))
+    tiny = qwen2_5_vl.Model(mlx_vlm.utils.update_module_configs(qwen2_5_vl.ModelConfig.from_dict(params := dict(config)), qwen2_5_vl, params, ["text", "vision"]))  # noqa: E501
+    mx.save_safetensors(str(checkpoint / "model.safetensors"), dict(tree_flatten(tiny.parameters())), {"format": "mlx"})
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: [
+        types.SimpleNamespace(token_ids=[100 + row % 7] * (2 + row % 5), finish_reason="stop") for row in range(len(requests))])
+    data = [{"prompt": [{"role": "user", "content": f"Describe picture {i}."}], "image": PIL.Image.new("RGB", (56, 56 + 28 * (i % 2)), (40 * i, 90, 160))} for i in range(4)]  # noqa: E501
+    gaps, scored_as_step = [], grpo._scored_as_step  # each compiled old or reference forward against the eager one
+    def checked(logps, step_compiled):
+        traced, eager = scored_as_step(logps, step_compiled), scored_as_step(logps, lambda: False)
+        def score(model, *args):
+            out = traced(model, *args)
+            if step_compiled():
+                gaps.append(float(mx.abs(out - eager(model, *args)).max()))
+            return out
+        return score
+    monkeypatch.setattr(grpo, "_scored_as_step", checked)
+    def train(compiled):
+        mx.random.seed(11)
+        model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=256)
+        model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=256) if lora else model
+        trainer = mlx_trainer.MLXGRPOTrainer(model, processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
+            output_dir=str(tmp_path / str(compiled)), max_steps=2 + (beta > 0), per_device_train_batch_size=2, num_generations=2, steps_per_generation=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
+            max_seq_length=256, logging_steps=1, loss_type="grpo", beta=beta, num_iterations=1 + (beta > 0), max_grad_norm=1.0, compile=compiled, shuffle_dataset=False), reward_funcs=lambda completion_ids, **_: [float(len(c)) for c in completion_ids])  # noqa: E501
+        return trainer, trainer.train()
+    (eager, _), (compiled, result) = train(False), train(True)
+    # With a KL term, step 3 scores generation 2's reference against a policy two updates on.
+    assert len(gaps) == (8 if beta else 0) and max(gaps, default=0) <= 1e-5
+    assert result["compile_enabled"] and result["compile_scope"] == "full_step" and compiled._compile_shape_guard_report.action in ("exact", "bucket")  # noqa: E501
+    assert eager._compile_shape_guard_report.reason == "grpo_vision_eager" and min(eager._grad_norm_history) > 0
+    assert np.allclose(eager._train_loss_history, compiled._train_loss_history, atol=1e-5) and np.allclose(eager._grad_norm_history, compiled._grad_norm_history, rtol=1e-3)  # noqa: E501
+
+
+@metal_only
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("labeled", [False, True])
 def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):

@@ -4206,6 +4206,59 @@ def test_grpo_trains_and_evaluates_image_prompts_on_a_vision_language_model(tmp_
     assert {missing for rows, missing in model.forwards if rows == 2} == {False} and len(calls) == 6
 
 
+@pytest.mark.parametrize("drifted", [False, True])
+def test_grpo_vision_family_drift_scores_a_generation_as_it_trains(monkeypatch, drifted):
+    import mlx.core as mx
+    from PIL import Image
+    from unsloth_zoo.mlx import generate as generate_module, compile as compile_module, grpo, trainer
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: [
+        types.SimpleNamespace(token_ids=[1] * (1 + row * 7 % 40), finish_reason="stop") for row in range(len(requests))])
+    monkeypatch.setattr(grpo.GRPOBatchPlan, "_vision_family", lambda self, inputs: (tuple(map(tuple, inputs["pixel_values"].tolist())), True, frozenset()))  # noqa: E501
+    scored = []  # whether each old or reference log-prob forward ran as the compiled step
+    monkeypatch.setattr(grpo, "_scored_as_step", lambda logps, step_compiled: lambda *a: scored.append(step_compiled()) or mx.stop_gradient(logps(*a)))  # noqa: E501
+    data = [{"prompt": [{"role": "user", "content": f"q{i}"}], "image": Image.new("RGB", (4 + i, 4))} for i in range(4)]
+    plan = grpo.create_grpo_batch_plan(data, None, num_generations=2, batch_size=2, steps_per_generation=4, num_iterations=2, grad_accum=4, sampling=grpo.GRPOSampling(max_tokens=40),  # noqa: E501
+                                       max_seq_length=128, shuffle=False, num_batches=8, processor=_grpo_vision_processor(), model_config={}, with_reference=True)  # noqa: E501
+    assert plan.with_old_logps
+    args = trainer.MLXTrainingConfig(max_steps=2, gradient_accumulation_steps=4, max_grad_norm=1.0)
+    report = trainer._plan_single_process_text_shapes(plan, None, args=args, total_steps=2, is_vlm=True, distributed_world_size=1, compile_policy=compile_module.MLXVLMCompilePolicy(), vlm_compile_decision=types.SimpleNamespace(enabled=True))[1]  # noqa: E501
+    assert report.action in ("exact", "bucket")
+    reference = types.SimpleNamespace(forward=lambda model, batch, lengths, response_scorer: response_scorer(model, batch, lengths))  # noqa: E501
+    plan.bind(_VisionLanguageModel(), [lambda completions, **_: [float(len(c)) for c in completions]], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0), reference_policy=reference, step_compiled=lambda: True)  # noqa: E501
+    if drifted:  # the generation's last micro-batch, which trains after the first one is fetched
+        plan._families = tuple(() if index == 3 else family for index, family in enumerate(plan._families))
+    assert plan.materialize(0, phase="single")
+    assert scored
+    # A generation that left its survey trains eagerly, so all its scoring was eager; otherwise all of it compiled.
+    assert set(scored) == {not drifted}
+    drift = plan.pop_family_drift()
+    assert (drift or "").startswith("batch 3: ") is drifted
+
+
+def test_grpo_vision_compile_plans_stable_families_for_verified_arches(monkeypatch):
+    from PIL import Image
+    from unsloth_zoo.mlx import generate as generate_module, compile as compile_module, grpo, trainer
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: [
+        types.SimpleNamespace(token_ids=[1] * (1 + row * 7 % 40), finish_reason="stop") for row in range(len(requests))])
+    surveys, forbidden = [], frozenset({33, 34, 65})  # the shim has no array captures: a family is its pixels in row order
+    monkeypatch.setattr(grpo.GRPOBatchPlan, "_vision_family", lambda self, inputs: surveys.append(1) or (tuple(map(tuple, inputs["pixel_values"].tolist())), True, forbidden))  # noqa: E501
+    data = [{"prompt": [{"role": "user", "content": f"q{i}"}], "image": Image.new("RGB", (4 + i, 4))} for i in range(4)]
+    policy, args = compile_module.MLXVLMCompilePolicy(), trainer.MLXTrainingConfig(max_steps=2, gradient_accumulation_steps=4, max_grad_norm=1.0)
+    for arch, admitted in (("florence2", False), ("qwen2_5_vl", True)):
+        plan = grpo.create_grpo_batch_plan(data, None, num_generations=2, batch_size=2, steps_per_generation=4, num_iterations=1, grad_accum=4, sampling=grpo.GRPOSampling(max_tokens=40),  # noqa: E501
+                                           max_seq_length=128, shuffle=False, num_batches=8, processor=_grpo_vision_processor(), model_config={}, group_by_length=True, skip_zero_advantage=True)  # noqa: E501
+        report = trainer._plan_single_process_text_shapes(plan, None, args=args, total_steps=2, is_vlm=True, distributed_world_size=1, compile_policy=policy, vlm_compile_decision=types.SimpleNamespace(enabled=arch in compile_module._VERIFIED_TRAINING_ARCHES))[1]  # noqa: E501
+        assert (report.action in ("exact", "bucket")) is admitted is (plan._families is not None)
+    assert len(surveys) == 8 and plan.ensure_descriptors() and len(surveys) == 8  # one survey per micro-step, once
+    plan.bind(_VisionLanguageModel(), [lambda completions, **_: [float(len(c)) for c in completions]], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
+    for index in (*range(8), *range(8)):  # each visit trains the family surveyed for it, at a width clear of its extents
+        width = plan.materialize(index, phase="single")[0]["input_ids"].shape[1]
+        assert width in plan.width_rungs(index) and not forbidden & {width, *plan.width_rungs(index)} and plan.pop_family_drift() is None
+    plan._families = ((),) * 8
+    plan.materialize(1, phase="single")
+    assert plan.pop_family_drift().startswith("batch 1: ") and plan.pop_family_drift() is None
+
+
 @pytest.mark.parametrize("overrides,expected,warns", [
     ({}, dict(loss_type="dapo", beta=0.0, mask_truncated_completions=False, epsilon_high=None, scale_rewards="group", per_device_train_batch_size=2, steps_per_generation=4, generation_batch_size=8), None),  # noqa: E501
     ({"beta": 0.04}, dict(loss_type="dapo", beta=0.04, mask_truncated_completions=False, epsilon_high=None), None), ({"loss_type": "bnpo"}, dict(beta=0.001, mask_truncated_completions=False, epsilon_high=None), None),  # noqa: E501
