@@ -865,11 +865,24 @@ def _patch_glm5_next_quantization_aliases(model_type):
         return
 
     def quantization_path_aliases(self, path):
-        path = path[len("language_model."):] if path.startswith("language_model.") else path
         parent, _, name = path.rpartition(".")
-        return [f"{parent}.{_GLM5_NEXT_FUSED[name]}"] if name in _GLM5_NEXT_FUSED else []
+        name = _GLM5_NEXT_FUSED.get(name, name)
+        paths = [f"{parent}.{name}"]
+        if name in ("f_a_proj", "f_b_proj"):  # oQ quants (_omlx_glm5_next_weights)
+            paths.append(f"{parent}.forget_gate.{name}")
+        return [alias for path in paths for alias in (path, path.removeprefix("language_model."))]
 
     model.quantization_path_aliases = quantization_path_aliases
+
+
+def _omlx_glm5_next_weights(weights):
+    """Names of the glm5_next layout omlx vendors (and writes GLM-5.3-Flash oQ quants in) as mlx-vlm's."""
+    renamed = {}
+    for key, value in weights.items():
+        key = re.sub(r"^vision_model\.", "vision_tower.", key).replace(".self_attn.forget_gate.", ".self_attn.")
+        # Already the fused q, k, v short convolution, in MLX's layout.
+        renamed[re.sub(r"\.self_attn\.conv1d\.weight$", ".self_attn.qkv_conv.conv.weight", key)] = value
+    return renamed
 
 
 _DEEPSEEK_REFERENCE_PROJECTIONS = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
@@ -925,9 +938,16 @@ def _deepseek_v41_model():
     return Model
 
 
+def _glm5_next_model():
+    from mlx_vlm.models.glm5_next.glm5_next import Model
+
+    return Model
+
+
 # Each family omlx converts: the mlx-vlm Model whose sanitize loads it, and the renames it needs first.
 _OMLX_LAYOUTS = {
     "deepseek_v41": (_deepseek_v41_model, _omlx_deepseek_v41_weights),
+    "glm5_next": (_glm5_next_model, _omlx_glm5_next_weights),
 }
 
 
@@ -936,6 +956,8 @@ def _ensure_omlx_layout(model_type):
     (MTP heads, DSpark stages) stay out of the target."""
     if model_type not in _OMLX_LAYOUTS:
         return
+    # GLM-5.3 oQ quants key their fused layers' bits by module path; loads outside FastMLXModel need the aliases too.
+    _patch_glm5_next_quantization_aliases(model_type)
     imported, rename = _OMLX_LAYOUTS[model_type]
     try:
         model = imported()
