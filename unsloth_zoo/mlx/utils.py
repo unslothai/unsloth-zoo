@@ -925,6 +925,14 @@ def _detach_integer_arrays(value):
     return _detach_if_index(value)
 
 
+def _traced_writes(written: dict, seen: dict) -> dict:
+    """Entries a layer added or replaced that a checkpoint can return: arrays or tuples / lists of them."""
+    def traced(value):
+        return isinstance(value, mx.array) or (
+            isinstance(value, (tuple, list)) and value and all(isinstance(v, mx.array) for v in value))
+    return {k: v for k, v in written.items() if seen.get(k) is not v and traced(v)}
+
+
 @mx.custom_function
 def _tie_shared_kv_cotangent(x, shared_kv):
     return x, shared_kv
@@ -961,15 +969,31 @@ def _patch_layer_class_for_gc(layer_cls):
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
                     args, kwargs["shared_kv"])
             outer = (args, kwargs)
+            # A layer may write into a dict it shares with later layers (Mistral Large 4's shared K/V); the
+            # checkpoint hands it a copy, so those writes return as traced results and land in the caller's dict.
+            shared = [i for i, a in enumerate(args) if isinstance(a, dict)]
+            wrote = False
 
             def inner_fn(params, *args, **kwargs):
+                nonlocal wrote
                 self.update(params)
                 _carry_window_masks(outer, (args, kwargs))
                 args = tuple(_detach_integer_arrays(a) for a in args)
                 kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
-                return fn(self, *args, **kwargs)
-            return mx.checkpoint(inner_fn)(
+                before = [dict(args[i]) for i in shared]
+                out = fn(self, *args, **kwargs)
+                writes = [_traced_writes(args[i], seen) for i, seen in zip(shared, before)]
+                wrote = any(writes)
+                # Writes go first: mx.checkpoint misaligns cotangents after an output with no gradient (an index).
+                return (writes, out) if wrote else out
+            out = mx.checkpoint(inner_fn)(
                 self.trainable_parameters(), *args, **kwargs)
+            if not wrote:
+                return out
+            writes, out = out
+            for i, written in zip(shared, writes):
+                args[i].update(written)
+            return out
 
         # Shared K/V must cross the checkpoint boundary as a traced argument and traced result; reading it off the slot makes the VJP drop the gradient.
         outer = (args, kwargs)
