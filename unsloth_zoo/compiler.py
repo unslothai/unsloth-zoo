@@ -257,10 +257,6 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
     ],
 }
 
-# Additive mask builders whose result is not handed to SDPA, so the boolean rewrite would corrupt it.
-# LED's Longformer encoder reads `attention_mask < 0` and `attention_mask != 0` off this one.
-BOOL_MASK_UNSAFE_FUNCTIONS = ("_prepare_4d_attention_mask_inverted",)
-
 # Matched rewrites leave DISABLE_COMPILE_MODEL_FUNCTIONS; deepseek_v4 `split` avoids the slice pytorch#198553 miscompiles.
 MODEL_FUNCTION_SOURCE_REWRITES = {
     "deepseek_v4": {
@@ -7517,7 +7513,8 @@ def unsloth_compile_transformers(
             if module in function_source_rewrites:
                 source = source.replace(*function_source_rewrites[module])
 
-            if sdpa_bool_masks and module not in BOOL_MASK_UNSAFE_FUNCTIONS:
+            # Bool masks are only right for SDPA consumers; eager-only models (LED's Longformer) add them.
+            if sdpa_bool_masks and len(scaled_dot_product_attention_modules) != 0:
                 source = convert_attention_masks_to_bool(module, source)
 
             # Fix dict-based attention masks for gpt_oss (transformers 5.x).
