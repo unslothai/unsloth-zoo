@@ -84,13 +84,13 @@ def test_temporary_patches_register_expected_count():
     src = inspect.getsource(moe_utils_bnb4bit)
     # Count is sticky to the file; if Phase 3 forgets the .append, we drop one.
     count = src.count("TEMPORARY_PATCHES.append(")
-    assert count == 11, (
-        f"moe_utils_bnb4bit registers {count} patches; expected 11 "
+    assert count == 12, (
+        f"moe_utils_bnb4bit registers {count} patches; expected 12 "
         "(4 original bnb4bit patches + the 2 PEFT MoE patches relocated from misc.py "
         "+ 3 later bnb4bit conversion patches: weight_conversions, "
         "model_conversion_mapping, dequantize_plain_params "
         "+ keep_fused_experts for fused pre-quantized Llama-4 checkpoints "
-        "+ prequantized_plain_weight_dtype for transformers >= 5.21 plain weights)."
+        "+ prequantized_plain_weight_dtype (4-bit and 8-bit) for transformers >= 5.21 plain weights)."
     )
 
 
@@ -169,6 +169,7 @@ def test_v5_moe_quant_patches_registered_when_capability_exists():
         moe_utils_bnb4bit.patch_transformers_weight_converter_kwargs,
         moe_utils_bnb4bit.patch_peft_param_wrapper_4bit_expert_shape,
         moe_utils_bnb4bit.patch_peft_param_wrapper_merge_4bit,
+        moe_utils_bnb4bit.patch_bnb8bit_prequantized_plain_weight_dtype,
         moe_utils_fp8.patch_fp8_experts_interface,
         moe_utils_fp8.patch_fp8_validate_quantization_for_training,
     }
