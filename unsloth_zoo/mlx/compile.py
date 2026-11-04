@@ -2847,15 +2847,16 @@ def _qwen3_mixed_prompt_batch_adapter(original):
         return original
 
     @wraps(original)
-    def patched(self, sequences):
+    def patched(self, sequences, *args, **kwargs):
         prompt_rows = [sequence[3] for sequence in sequences]
         padded_rows = _pad_qwen3_prompt_rows(prompt_rows)
         if padded_rows is not prompt_rows:
             sequences = [
-                (*sequence[:3], kwargs, *sequence[4:])
-                for sequence, kwargs in zip(sequences, padded_rows)
+                (*sequence[:3], row_kwargs, *sequence[4:])
+                for sequence, row_kwargs in zip(sequences, padded_rows)
             ]
-        batch = original(self, sequences)
+        # mlx-vlm 0.7.12 also passes the rows' APC picks, one per sequence in order.
+        batch = original(self, sequences, *args, **kwargs)
         prompt_kwargs = getattr(batch, "_prompt_kwargs", None)
         if prompt_kwargs is not None:
             visual_mask = prompt_kwargs.get("visual_pos_masks")
