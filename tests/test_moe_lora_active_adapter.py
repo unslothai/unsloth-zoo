@@ -123,13 +123,14 @@ print(json.dumps(out))
 
 
 def _multi_target_parameter_adapters_supported():
-    # PEFT 0.18 refuses a second target_parameters adapter on one model.
+    # PEFT 0.19.1 still refuses a second target_parameters adapter on one model, so read the refusal, not a version.
     try:
-        import peft
-        from packaging.version import Version
+        from pathlib import Path
+
+        import peft.tuners.lora.model as lora_model
     except Exception:
         return False
-    return Version(peft.__version__) >= Version("0.19")
+    return "already other LoRA adapters" not in Path(lora_model.__file__).read_text(encoding = "utf-8")
 
 
 def _run(family, work, compiled):
@@ -145,7 +146,7 @@ def _run(family, work, compiled):
     return json.loads(lines[-1])
 
 
-@pytest.mark.skipif(not _multi_target_parameter_adapters_supported(), reason = "PEFT < 0.19: one target_parameters adapter per model")
+@pytest.mark.skipif(not _multi_target_parameter_adapters_supported(), reason = "this PEFT allows one target_parameters adapter per model")
 @pytest.mark.parametrize(
     "family, compiled",
     [("llama4", False), ("qwen3_moe", False), ("gpt_oss", False), ("qwen3_moe", True)],
