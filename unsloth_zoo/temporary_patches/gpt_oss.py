@@ -30,6 +30,7 @@ import torch.nn.functional as F
 import functools
 import inspect
 from .common import (
+    compile_mask_builder,
     TEMPORARY_PATCHES,
     torch_compile,
     _torch_compile,
@@ -3635,8 +3636,8 @@ def patch_GptOssModel():
     if create_sliding_window_causal_mask is None:
         return raise_error("transformers.masking_utils.create_sliding_window_causal_mask")
     if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
-        transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
-        transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils._old_create_causal_mask = compile_mask_builder(transformers.masking_utils.create_causal_mask)
+        transformers.masking_utils._old_create_sliding_window_causal_mask = compile_mask_builder(transformers.masking_utils.create_sliding_window_causal_mask)
         transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
         transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
         transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
