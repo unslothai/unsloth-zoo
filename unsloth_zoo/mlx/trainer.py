@@ -1221,6 +1221,22 @@ def _validate_label_smoothing(value, is_vlm):
     return eps
 
 
+def _resolve_sft_loss_type(args, *, fused):
+    loss_type = getattr(args, "loss_type", "nll")
+    if loss_type not in ("nll", "dft"):
+        raise ValueError(
+            f"Unsloth MLX: SFT loss_type must be 'nll' or 'dft' (got {loss_type!r})."
+        )
+    if loss_type == "dft" and not fused:
+        raise ValueError(
+            "Unsloth MLX: loss_type='dft' is implemented on the fused CCE text "
+            "loss only; this run uses a vision-language, GKD, label-smoothed or "
+            "standard cross-entropy loss. Use loss_type='nll' or a text model "
+            "with use_cce=True."
+        )
+    return loss_type
+
+
 def _require_complete_resume_checkpoint(resume_from):
     """Reject an incomplete resume dir (a saved adapter dir has only adapters.safetensors) and name the warm-start
     route; every resume read calls it, so the streaming-prefetch early read raises this instead of a raw
@@ -1415,6 +1431,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "gkd_skip_memory_preflight",
     "group_by_length",
     "length_sorted_microbatches",
+    "loss_type",
 )
 
 
@@ -1548,6 +1565,9 @@ class MLXTrainingConfig:
     # Reorders rows only within each accumulation window, longest first, before cutting it into micro-batches; every
     # optimizer step keeps its rows (unlike group_by_length, which reorders the dataset).
     length_sorted_microbatches: bool = True
+    # SFTConfig.loss_type: "nll" or "dft" (fused CCE text path only); preference and RL configs override its default
+    # without kw_only, so the field keeps this positional slot in every subclass.
+    loss_type: str = "nll"
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -1721,7 +1741,7 @@ class MLXDPOConfig(MLXTrainingConfig):
     reference_free: bool = field(default=False, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
     # A DPOConfig collapses a one-entry list back to a string, so both arrive.
-    loss_type: str | list[str] = field(default="sigmoid", kw_only=True)
+    loss_type: str | list[str] = "sigmoid"
     loss_weights: list[float] | None = field(default=None, kw_only=True)
     discopop_tau: float = field(default=0.05, kw_only=True)
     # ref_adapter_name is a saved adapter directory: an MLX model has one unnamed adapter set.
@@ -1751,7 +1771,7 @@ class MLXKTOConfig(MLXTrainingConfig):
     neighbor's completion in the batch; dataset_order="torch_randperm" reorders whole batches."""
 
     beta: float = field(default=0.1, kw_only=True)
-    loss_type: str = field(default="kto", kw_only=True)
+    loss_type: str = "kto"
     desirable_weight: float = field(default=1.0, kw_only=True)
     undesirable_weight: float = field(default=1.0, kw_only=True)
     precompute_ref_log_probs: bool = field(default=False, kw_only=True)
@@ -1787,7 +1807,7 @@ class MLXGRPOConfig(MLXTrainingConfig):
     repetition_penalty: float = field(default=1.0, kw_only=True)
     generation_kwargs: dict | None = field(default=None, kw_only=True)
     beta: float | None = field(default=None, kw_only=True)
-    loss_type: str | None = field(default=None, kw_only=True)
+    loss_type: str | None = None
     epsilon: float = field(default=0.2, kw_only=True)
     epsilon_high: float | None = field(default=None, kw_only=True)
     delta: float | None = field(default=None, kw_only=True)
@@ -1817,7 +1837,7 @@ class MLXCPOConfig(MLXTrainingConfig):
 
     beta: float = field(default=0.1, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
-    loss_type: str = field(default="sigmoid", kw_only=True)
+    loss_type: str = "sigmoid"
     disable_dropout: bool = field(default=True, kw_only=True)
     cpo_alpha: float = field(default=1.0, kw_only=True)
     simpo_gamma: float = field(default=0.5, kw_only=True)
@@ -5602,6 +5622,10 @@ class MLXTrainer:
         label_smoothing = 0.0 if preference_kind else _validate_label_smoothing(
             getattr(args, "label_smoothing_factor", 0.0), is_vlm,
         )
+        sft_loss_type = "nll" if preference_kind else _resolve_sft_loss_type(
+            args, fused=use_cce and not is_vlm and label_smoothing == 0.0
+            and not getattr(args, "teacher_model_name_or_path", None),
+        )
         _vlm_ignore_token_ids = None
 
         if preference_kind:
@@ -5687,8 +5711,12 @@ class MLXTrainer:
                 _main_print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
             if use_cce:
-                loss_fn = make_cce_loss_fn(model, label_smoothing=label_smoothing)
+                loss_fn = make_cce_loss_fn(
+                    model, label_smoothing=label_smoothing, loss_type=sft_loss_type,
+                )
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
+                if sft_loss_type == "dft" and cce_backend != "runtime-cce":
+                    _resolve_sft_loss_type(args, fused=False)
                 if hasattr(loss_fn, "_unsloth_compiled_loss_fn"):
                     _main_print(
                         "Unsloth: LoRA head CCE is available for compiled steps; "

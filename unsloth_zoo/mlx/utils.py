@@ -2145,11 +2145,20 @@ def _runtime_cce_by_mode(**kwargs):
     return lambda model: training if model.training else loss_only
 
 
-def make_cce_loss_fn(model, label_smoothing=0.0):
+def _reduce_token_losses(loss, ntoks, dft):
+    loss = loss.astype(mx.float32)
+    if dft:
+        # TRL's dft_loss: -p.detach() * log p per token, where p = exp(-loss); masked tokens carry loss 0.
+        loss = loss * mx.stop_gradient(mx.exp(-loss))
+    return loss.sum() / _safe_token_denominator(ntoks)
+
+
+def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
     """Chunked cross-entropy loss from hidden states and the LM head weight, avoiding full logit materialization;
     returns (model, batch, lengths, labels=None) -> (loss, ntoks), with targets labels[:,1:] masked by != -100; sets
-    _unsloth_cce_backend for logging."""
+    _unsloth_cce_backend for logging. loss_type="dft" applies only on the runtime-cce backend; fallbacks ignore it."""
     label_smoothing = _normalize_label_smoothing(label_smoothing)
+    dft = loss_type == "dft"
     # Checks topology first (mirrors the VLM factory), then head eligibility, then scale validation, so no positive CCE
     # notice precedes a fallback; backboneless models cannot yield pre-head hidden states, so the full forward is the
     # only faithful loss.
@@ -2272,7 +2281,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             )
             hidden_flat = _rotate_head_input(layer, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
     else:
         _skip_weight_grad = not _is_lm_head_trainable(model)
@@ -2316,7 +2325,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 hidden_flat, targets_flat, cce_indices,
             )
             loss = rt_cce(model)(hidden_flat, w, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"

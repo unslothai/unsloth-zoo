@@ -1013,6 +1013,35 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
     assert plan.prepare_cce_batch(1, batch) is batch
 
 
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_dft_cce_loss_matches_trl_and_leaves_nll_alone(quantized):
+    def trl_dft(model, ids, lengths):
+        steps = mx.arange(1, ids.shape[1])
+        mask = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
+        logps = -nn.losses.cross_entropy(model(ids[:, :-1]).astype(mx.float32), ids[:, 1:], reduction="none")
+        return (-mx.stop_gradient(mx.exp(logps)) * logps * mask).sum() / mask.sum(), mask.sum()
+
+    mx.random.seed(331)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    ids, lengths = mx.random.randint(0, 2053, (2, 65)), mx.array([[0, 65], [3, 40]], dtype=mx.int32)
+    dft = mlx_utils.make_cce_loss_fn(model, loss_type="dft")
+    results = [nn.value_and_grad(model, fn)(model, ids, lengths) for fn in (
+        trl_dft, dft, mlx_utils.make_cce_loss_fn(model), make_baseline_loss_fn(),
+    )]
+    mx.eval(results)
+    (want, want_grad), (got, got_grad), (nll, nll_grad), (dense, dense_grad) = results
+    assert dft._unsloth_cce_backend == "runtime-cce" and got[1].item() == want[1].item()
+    assert got[0].item() == pytest.approx(want[0].item(), rel=1e-4)
+    assert nll[0].item() == pytest.approx(dense[0].item(), rel=1e-4)
+    assert abs(nll[0].item() - got[0].item()) > 1e-3
+    for expected, actual in ((want_grad, got_grad), (dense_grad, nll_grad)):
+        for (name, a), (_, b) in zip(tree_flatten(expected), tree_flatten(actual)):
+            # dft gradients are ~p = 1/V of nll's, so an absolute tolerance must scale with them.
+            scale = mx.abs(a).max().item()
+            assert scale > 0 and mx.allclose(a, b, atol=1e-3 * scale, rtol=1e-3).item(), name
+
+
 # Ternary Bonsai 2 packs, from mlx-vlm and (0.32+) mlx-lm.
 _HADAMARD_PACKS = pytest.mark.parametrize("pack_module", [
     "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35", "mlx_lm.models.prism_hadamard_qwen35",
