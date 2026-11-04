@@ -123,15 +123,14 @@ print(json.dumps(out))
 
 
 def _multi_target_parameter_adapters_supported():
-    # Probed, not read off the version: PEFT 0.18 and 0.19 refuse a second target_parameters adapter on one model.
+    # PEFT 0.19.1 still refuses a second target_parameters adapter on one model, so read the refusal, not a version.
     try:
-        import torch.nn as nn
-        from peft import LoraConfig, get_peft_model
-        model = get_peft_model(nn.Sequential(nn.Linear(4, 4)), LoraConfig(r = 1, target_parameters = ["0.weight"]))
-        model.add_adapter("second", LoraConfig(r = 1, target_parameters = ["0.weight"]))
-        return True
+        from pathlib import Path
+
+        import peft.tuners.lora.model as lora_model
     except Exception:
         return False
+    return "already other LoRA adapters" not in Path(lora_model.__file__).read_text(encoding = "utf-8")
 
 
 def _run(family, work, compiled):
