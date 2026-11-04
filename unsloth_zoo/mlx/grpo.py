@@ -829,12 +829,15 @@ class GRPOBatchPlan:
             )
             for row, prompt in enumerate(prompts)
         ]
+        rows = _rollout_rows(self._model, len(requests), max(
+            len(request.prompt_token_ids) + request.max_tokens for request in requests))
         defaults = GenerationDefaults(
             max_tokens=self.sampling.max_tokens, stop_token_ids=(self.eos_id,),
             logits_warp=_rollout_sampling(self.sampling, (), text)[1], batched_draws=text,
             token_ids_only=text,  # completions are decoded once, after the cut
-            completion_batch_size=_rollout_rows(self._model, len(requests), max(
-                len(request.prompt_token_ids) + request.max_tokens for request in requests)),
+            completion_batch_size=rows, share_prompt_prefill=text,
+            # Rows of a shared prompt start decoding at once, prefilled already.
+            prefill_batch_size=rows if text else GenerationDefaults.prefill_batch_size,
         )
         with self._rollout_context():
             results = generate_module.generate_batch(

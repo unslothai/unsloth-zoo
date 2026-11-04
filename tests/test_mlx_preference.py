@@ -3895,7 +3895,7 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     replayed = [plan[index][0].tolist() for index in (1, 2, 3)]
     assert replayed[1:] == [first[0].tolist(), replayed[0]] != [replayed[0]] * 2 and len(calls) == 1
     requests, defaults = calls[0]
-    assert defaults.stop_token_ids == (2,) and defaults.token_ids_only and defaults.completion_batch_size == 32 and [r.max_tokens for r in requests] == [3] * 4
+    assert defaults.stop_token_ids == (2,) and defaults.token_ids_only and defaults.share_prompt_prefill and defaults.prefill_batch_size == 7 and [r.max_tokens for r in requests] == [3] * 4
     assert len({r.sampling.seed for r in requests}) == 4 and not GRPOSampling().warps
     assert defaults.batched_draws and defaults.logits_warp is not None and requests[0].logits_processors is None
     assert [r.prompt_token_ids for r in requests] == [(14,), (14,), (14, 14), (14, 14)]

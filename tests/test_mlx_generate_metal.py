@@ -351,6 +351,26 @@ def test_batch_rows_prefill_in_the_given_step_and_decode_as_a_single_request_wou
         assert result.token_ids == [int(e.token) for e in sequential(request) if e.finish_reason != "stop"]
 
 
+@metal_only
+def test_rows_sharing_a_prompt_prefill_it_once_and_decode_as_if_each_prefilled_it(monkeypatch):
+    from mlx_lm import load
+    from mlx_lm.sample_utils import make_logits_processors
+    from unsloth_zoo.mlx.generate import GenerationDefaults, GenerationRequest, generate_batch
+    model, tokenizer = load(MODEL)
+    prompts = [tokenizer.encode(p, add_special_tokens=False)[:4] for p in ("The capital of France is", "Two plus two equals")]
+    def run(share):
+        widths, seen, rows = _record_widths(monkeypatch, model), {}, [prompts[0]] * 3 + [prompts[1]] * 3
+        requests = [GenerationRequest(prompt_token_ids=ids, max_tokens=12, logits_processors=[
+            lambda tokens, logits, row=row: seen.setdefault(row, tokens.tolist()) and logits, *make_logits_processors(repetition_penalty=1.3)])
+                    for row, ids in enumerate(rows)]
+        results = generate_batch(model, tokenizer, requests, defaults=GenerationDefaults(  # rows of a prompt join in waves
+            max_tokens=12, share_prompt_prefill=share, prefill_batch_size=2, completion_batch_size=2))
+        monkeypatch.undo()
+        return [result.token_ids for result in results], sum(width > 1 for width in widths), seen == dict(enumerate(rows))
+    (shared, prefills, own), (alone, _, _) = run(True), run(False)
+    assert shared == alone and prefills == 2 and own
+
+
 def _own_copy(value):
     if isinstance(value, mx.array):
         return value + 0

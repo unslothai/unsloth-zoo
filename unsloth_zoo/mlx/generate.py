@@ -171,6 +171,8 @@ class GenerationDefaults:
     ``logits_warp`` maps every row's logits at once before they are normalized, for rows
     without logits processors; ``batched_draws`` draws all rows in one call, each row
     seeded at one shared temperature with no other filter, from its own key stream.
+    ``share_prompt_prefill`` prefills a prompt that several rows of one
+    ``generate_batch`` call share once, and starts each of those rows from that cache.
     """
 
     max_tokens: int = 256
@@ -189,12 +191,13 @@ class GenerationDefaults:
     logprob_arrays: bool = False
     logits_warp: Callable[[Any], Any] | None = None
     batched_draws: bool = False
+    share_prompt_prefill: bool = False
 
     def __post_init__(self):
         _validate_positive_int(self.max_tokens, "defaults.max_tokens")
         if self.logits_warp is not None and not callable(self.logits_warp):
             raise TypeError("defaults.logits_warp must be callable.")
-        for name in ("token_ids_only", "logprob_arrays", "batched_draws"):
+        for name in ("token_ids_only", "logprob_arrays", "batched_draws", "share_prompt_prefill"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"defaults.{name} must be a bool.")
         _validate_positive_int(
@@ -775,9 +778,11 @@ def _generation_processor(adapter):
 
 
 def _validate_vlm_defaults(defaults: GenerationDefaults) -> None:
-    if defaults.token_ids_only or defaults.logprob_arrays or defaults.batched_draws or defaults.logits_warp:
+    if (defaults.token_ids_only or defaults.logprob_arrays or defaults.batched_draws or defaults.logits_warp
+            or defaults.share_prompt_prefill):
         raise ValueError(
-            "token_ids_only, logprob_arrays, logits_warp and batched_draws are served by text batches only.")
+            "token_ids_only, logprob_arrays, logits_warp, batched_draws and share_prompt_prefill are served by text "
+            "batches only.")
     if defaults.prefill_batch_size > defaults.completion_batch_size:
         # An inverted pair never admits anything on mlx-vlm, so generation would
         # hang. mlx-lm normalizes the two, so this is vision-specific.
@@ -1990,10 +1995,12 @@ class _TextBatchSession:
     def rows_in_flight(self) -> int:
         return len(self._pending)
 
-    def add(self, request: GenerationRequest) -> int:
+    def add(self, request: GenerationRequest, prefilled_prompt = None) -> int:
         adapter = self.adapter
         defaults = adapter.defaults
-        if request.image is None:
+        if prefilled_prompt is not None:
+            prompt, prefilled, cache = prefilled_prompt
+        elif request.image is None:
             prompt, prefilled, cache = _encode_prompt(adapter.tokenizer, request), [], None
         else:
             prompt, prefilled, cache = self._prefill_image_row(request)
@@ -2019,7 +2026,8 @@ class _TextBatchSession:
                 max_tokens=[int(request.max_tokens or defaults.max_tokens)],
                 samplers=[sampler],
                 logits_processors=[_text_row_processors(request)],
-                **({} if cache is None else {"caches": [cache], "all_tokens": [prefilled]}),
+                # A row's history list grows as it decodes, so rows sharing a prompt cache never share it.
+                **({} if cache is None else {"caches": [cache], "all_tokens": [list(prefilled)]}),
             )
         except BaseException:
             self.usable = False
@@ -2078,6 +2086,31 @@ class _TextBatchSession:
             add_special_tokens=False,
         )
         return ids[-1:], ids[:-1], cache
+
+    def prefill_shared(self, requests) -> dict:
+        """``(last token, prompt before it, its cache)`` of every text prompt several requests share, prefilled once as
+        a one-row batch prefills it; rows only merge these caches into their batch, never update them."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+
+        counts = {}
+        for request in requests:
+            if request.image is None:
+                key = tuple(_encode_prompt(self.adapter.tokenizer, request))
+                counts[key] = counts.get(key, 0) + 1
+        step = getattr(self.generator, "prefill_step_size", None) or 2048
+        shared = {}
+        with mx.stream(importlib.import_module("mlx_lm.generate").generation_stream):
+            for ids, count in counts.items():
+                if count < 2 or len(ids) < 2:
+                    continue
+                fresh = make_prompt_cache(self.adapter.model, self.adapter.defaults.max_kv_size)
+                cache = [entry.merge([entry]) for entry in fresh]
+                for start in range(0, len(ids) - 1, step):
+                    self.adapter.model(mx.array([ids[start:min(start + step, len(ids) - 1)]]), cache=cache)
+                    mx.eval([entry.state for entry in cache])
+                shared[ids] = (list(ids[-1:]), list(ids[:-1]), [entry.extract(0) for entry in cache])
+        return shared
 
     def cancel(self, row: int) -> bool:
         return self._take_back(row) is not None
@@ -2187,8 +2220,10 @@ class _TextBatchAdapter:
         session = _TextBatchSession(self)
         active_error = None
         try:
+            shared = session.prefill_shared(requests) if self.defaults.share_prompt_prefill else {}
             for request in requests:
-                session.add(request)
+                key = tuple(_encode_prompt(self.tokenizer, request)) if shared and request.image is None else None
+                session.add(request, shared.get(key))
             while session.rows_in_flight:
                 yield from session.step()
         except BaseException as exc:
