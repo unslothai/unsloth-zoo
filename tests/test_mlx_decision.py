@@ -36,6 +36,16 @@ from unsloth_zoo.mlx.decision import (  # noqa: E402
 )
 
 
+def _mlx_vlm(name = "mlx_vlm"):
+    # importorskip alone is not enough: under tests/mlx_simulation every mlx_vlm module imports as an auto-stub.
+    module = pytest.importorskip(name)
+    from mlx_simulation import mlx_is_simulated
+
+    if mlx_is_simulated():
+        pytest.skip("needs the real mlx_vlm, the torch shim is installed")
+    return module
+
+
 class _Scripted(DecisionPipeline):
     def __init__(self, variants, **attributes):
         self.variants = variants
@@ -518,6 +528,7 @@ def test_d1_score_stops_at_the_first_level_past_half_and_lfm2_keeps_the_general_
     assert _d1("lfm3_omni", [[0.5, 0.1, 0.4]])[0].answer("s", question)["answers"]["level"]["score"] == 0.0
     # The median, not the likeliest level.
     assert _d1("lfm3_omni", [[0.3, 0.3, 0.4]])[0].answer("s", question)["answers"]["level"]["score"] == 1.0
+    _mlx_vlm("mlx_vlm.models.d1.prompt")
     answer = _d1("lfm2_vl", None)[0]
     answer.model = types.SimpleNamespace(probabilities = lambda *_: ([[0.1, 0.2, 0.7]], 5))
     read = answer.answer("s", question)["answers"]["level"]
@@ -560,7 +571,7 @@ def test_d1_hears_audio_only_on_the_models_that_do():
 
 
 def test_d1_on_lfm2_asks_its_engine_in_the_form_it_reads():
-    pytest.importorskip("mlx_vlm.models.d1.prompt")
+    _mlx_vlm("mlx_vlm.models.d1.prompt")
     model, _ = _d1("lfm2_vl", None)
     seen = []
 
@@ -599,7 +610,7 @@ def test_d1_is_detected_from_its_config(tmp_path, config):
     [("lfm2_vl", False, True), ("d1_omni", True, False), ("lfm3_vl", False, True), ("lfm3_omni", True, True)],
 )
 def test_d1_load_reads_its_abilities_from_the_backbone(tmp_path, monkeypatch, backbone, audio, true_first):
-    mlx_vlm_utils = pytest.importorskip("mlx_vlm.utils")
+    mlx_vlm_utils = _mlx_vlm("mlx_vlm.utils")
     import importlib.util
 
     (tmp_path / "config.json").write_text(json.dumps({"model_type": backbone}))
@@ -610,7 +621,7 @@ def test_d1_load_reads_its_abilities_from_the_backbone(tmp_path, monkeypatch, ba
 
 
 def test_d1_says_when_the_installed_mlx_vlm_lacks_its_engine(tmp_path, monkeypatch):
-    pytest.importorskip("mlx_vlm.utils")
+    _mlx_vlm("mlx_vlm.utils")
     import importlib.util
 
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm3_omni"}))
@@ -651,7 +662,7 @@ def _d1_trainable(backbone = "lfm3_omni", set_size = 4):
 
 
 def test_d1_item_packs_questions_after_the_state_and_reads_each_at_its_last_token(monkeypatch):
-    prompt = pytest.importorskip(_D1_PROMPT)
+    prompt = _mlx_vlm(_D1_PROMPT)
     monkeypatch.setattr(prompt, "prefix_text", lambda tokenizer, state, *_: f"S:{state}\n")
     monkeypatch.setattr(prompt, "question_header", lambda *_: "Q\n")
     monkeypatch.setattr(prompt, "suffix_layout", lambda tokenizer, question, lead: (f"{question['instructions']}?", [0]))
@@ -667,7 +678,7 @@ def test_d1_item_packs_questions_after_the_state_and_reads_each_at_its_last_toke
 
 
 def test_d1_item_reads_the_states_images_as_a_request_does(monkeypatch):
-    prompt = pytest.importorskip(_D1_PROMPT)
+    prompt = _mlx_vlm(_D1_PROMPT)
     seen = []
     monkeypatch.setattr(prompt, "prefix_text", lambda tokenizer, state, *_: seen.append(state) or "S\n")
     monkeypatch.setattr(prompt, "question_header", lambda *_: "Q\n")
@@ -682,14 +693,14 @@ def test_d1_item_reads_the_states_images_as_a_request_does(monkeypatch):
 
 
 def test_d1_item_refuses_more_questions_than_a_row_trained(monkeypatch):
-    pytest.importorskip(_D1_PROMPT)
+    _mlx_vlm(_D1_PROMPT)
     questions = {name: {"type": "noul", "instructions": "x"} for name in "abc"}
     with pytest.raises(DecisionRequestError, match = "the maximum is 2"):
         decision.d1_training_item(_d1_trainable(set_size = 2), "st", questions)
 
 
 def test_d1_logits_are_each_options_best_form_at_its_slot(monkeypatch):
-    prompt = pytest.importorskip(_D1_PROMPT)
+    prompt = _mlx_vlm(_D1_PROMPT)
     tables = iter([((3, 5), np.array([[0, 1], [1, 1]]), None), ((7, 2), np.array([[1], [0]]), None)])
     monkeypatch.setattr(prompt, "readout_table", lambda tokenizer, question: next(tables))
     item = {"input_ids": [0], "state_length": 0, "groups": [1], "slots": [2, 10], "asked": ["first", "second"]}
@@ -699,7 +710,7 @@ def test_d1_logits_are_each_options_best_form_at_its_slot(monkeypatch):
 
 
 def test_d1_logits_read_a_records_media(monkeypatch):
-    prompt = pytest.importorskip(_D1_PROMPT)
+    prompt = _mlx_vlm(_D1_PROMPT)
     monkeypatch.setattr(prompt, "readout_table", lambda tokenizer, question: ((1,), np.array([[0]]), None))
     monkeypatch.setattr(decision, "_d1_media", lambda item: item["images"])
     pipeline, seen = _d1_trainable(), []
@@ -742,7 +753,7 @@ def _vlm_model(monkeypatch, answers, media = ()):
 
 
 def test_a_prepared_model_answers_on_this_contract(monkeypatch):
-    pytest.importorskip("mlx_vlm")
+    _mlx_vlm()
     answers = {
         "n": {"type": "bool", "value": True, "probability": 0.8},
         "c": {"type": "choice", "value": "b", "probabilities": {"b": 0.6, "a": 0.4}},
@@ -764,9 +775,9 @@ def test_a_prepared_model_answers_on_this_contract(monkeypatch):
 
 
 def test_a_prepared_model_turns_a_refusal_into_a_request_error_and_passes_images(monkeypatch):
+    _mlx_vlm()
     from mlx_vlm import decision as vlm
 
-    pytest.importorskip("mlx_vlm")
     model, seen = _vlm_model(monkeypatch, {"n": {"probability": 0.5}}, ("images",))
     question = model._parse_questions({"n": {"type": "noul", "instructions": "i"}})
     model._scores("s", question, ["picture"])
@@ -811,7 +822,7 @@ def test_laya_reads_a_requests_questions_in_batches_under_a_token_budget(monkeyp
 
 
 def test_d1_media_takes_encoded_and_decoded_alike(monkeypatch):
-    media = pytest.importorskip("mlx_vlm.models.d1_lfm3_vl.media")
+    media = _mlx_vlm("mlx_vlm.models.d1_lfm3_vl.media")
     seen = []
     monkeypatch.setattr(media, "media_list", lambda items: seen.extend(items) or items)
     monkeypatch.setattr(decision, "_decode_images", lambda urls: [f"decoded {url}" for url in urls])
@@ -865,7 +876,7 @@ def test_a_saved_d1_is_read_as_one_and_keeps_no_stale_calibration(tmp_path, monk
     with pytest.raises(ValueError, match = "cannot be saved over"):
         decision.save_d1_model(pipeline, source)
     decision.save_d1_model(pipeline, out, temperatures = {"choice": 2.0, "score": 3.0, "noul": 4.0})
-    calibration = pytest.importorskip("mlx_vlm.models.d1_lfm3_vl.calibration")
+    calibration = _mlx_vlm("mlx_vlm.models.d1_lfm3_vl.calibration")
     fitted = calibration.Calibration.load(out / "calibration.json")
     assert fitted.temperatures[calibration.bucket("noul", 2)] == 4.0 and fitted.default == 3.0
     assert {fitted.temperatures[calibration.bucket("choice", k)] for k in (2, 5, 20, 40)} == {2.0}
