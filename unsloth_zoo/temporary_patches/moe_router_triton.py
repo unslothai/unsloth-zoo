@@ -37,7 +37,6 @@ import torch
 import torch.nn.functional as F
 
 from .common import TEMPORARY_PATCHES
-from unsloth_zoo.triton_specialize import jit_any_alignment as _jit_any_alignment
 
 try:
     import triton
@@ -60,8 +59,8 @@ def fused_router_enabled():
 
 
 if HAS_TRITON:
-    # T: tokens, 1 in bsz 1 decode; == 1 kept, no % 16 binary for multiple-of-16 prompts.
-    @_jit_any_alignment("T")
+    # T (token count) runtime: no ==1 / %16 variant per decode / prefill / batch size.
+    @triton.jit(do_not_specialize = ["T"])
     def _router_fwd_kernel(
         Z, BIAS, W, IDS, T, E, GS, stride_z, scale, mask_value,
         K: tl.constexpr, BLOCK_K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,  # top-k / top-k pow2 / 0 softmax, 1 topk-softmax, 2 sigmoid / renorm
@@ -151,8 +150,8 @@ if HAS_TRITON:
         tl.store(W + offs, w, mask = out_ok)
         tl.store(IDS + offs, ids.to(tl.int64), mask = out_ok)
 
-    # T: tokens, 1 in bsz 1 decode; == 1 kept, no % 16 binary for multiple-of-16 prompts.
-    @_jit_any_alignment("T")
+    # T (token count) runtime: no ==1 / %16 variant per decode / prefill / batch size.
+    @triton.jit(do_not_specialize = ["T"])
     def _router_bwd_kernel(
         Z, IDS, DW, DZ, T, E, stride_z, stride_dw, scale,
         K: tl.constexpr, MODE: tl.constexpr, RENORM: tl.constexpr,  # top-k / router mode / renorm

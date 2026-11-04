@@ -38,7 +38,6 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from unsloth_zoo.triton_specialize import jit_any_alignment as _jit_any_alignment
 
 try:
     import triton
@@ -225,8 +224,8 @@ if triton is not None:
     def _sigmoid(x):
         return _rcp_rn(1.0 + libdevice.exp(-x))
 
-    # M: rows (tokens x top-k) per call; == 1 kept, no % 16 binary.
-    @_jit_any_alignment("M")
+    # M (routed rows) runtime: BLOCK_M already buckets it; no extra %16 / == 1 variant per token count.
+    @triton.jit(do_not_specialize = ["M"])
     def _swiglu_fwd_kernel(
         GU, OUT, M, N, s_gm, s_gc, s_om, ALPHA, LIMIT,
         ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # 1 gpt-oss clamp, else silu / interleaved / eager rounding
@@ -249,7 +248,7 @@ if triton is not None:
             y = s * u
         tl.store(OUT + rows[:, None] * s_om + cols[None, :], y.to(DT), mask = mask)
 
-    @_jit_any_alignment("M")
+    @triton.jit(do_not_specialize = ["M"])
     def _swiglu_bwd_kernel(
         DY, GU, DGU, M, N, s_dm, s_dc, s_gm, s_gc, s_om, ALPHA, LIMIT,
         ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # 1 gpt-oss clamp, else silu / interleaved / eager rounding

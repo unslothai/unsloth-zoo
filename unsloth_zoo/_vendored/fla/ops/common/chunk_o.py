@@ -215,7 +215,7 @@ def chunk_fwd_kernel_o(
     key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G', 'USE_G_GAMMA', 'USE_DW', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['B', 'T'])
 def chunk_bwd_kernel_dqkwg(
     q,
     k,
@@ -233,7 +233,7 @@ def chunk_bwd_kernel_dqkwg(
     cu_seqlens,
     chunk_indices,
     scale,
-    B: tl.constexpr,  # batch size
+    B,  # Unsloth: runtime (do_not_specialize), was constexpr: one compile per batch size
     T,
     H: tl.constexpr,  # heads
     HV: tl.constexpr,  # value heads

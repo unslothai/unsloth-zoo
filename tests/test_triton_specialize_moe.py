@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""Per-call token / row counts of the zoo MoE kernels keep Triton's == 1 binary but no % 16 class, and the routing
+"""Per-call token / row counts of the zoo MoE kernels get no % 16 class (jit_any_alignment keeps == 1, do_not_specialize
+drops both), and the routing
 scratch slices keep a fixed pointer alignment, so a new prefill length or batch size compiles nothing after warm-up
 (w5_recompile G1: these kernels re-specialized with the same constexprs on Kaggle T4)."""
 
@@ -45,14 +46,17 @@ def test_token_counts_alignment_unspecialized(path):
     found = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name in EXPECTED[path]:
-            decos = [
-                d for d in node.decorator_list
-                if isinstance(d, ast.Call) and getattr(d.func, "id", "").lstrip("_") == "jit_any_alignment"
-            ]
-            assert len(decos) == 1, node.name
-            name = decos[0].args[0].value
-            assert name in [a.arg for a in node.args.args], (node.name, name)
-            found[node.name] = name
+            names = []
+            for d in node.decorator_list:
+                if not isinstance(d, ast.Call):
+                    continue
+                if getattr(d.func, "id", "").lstrip("_") == "jit_any_alignment":
+                    names += [a.value for a in d.args]
+                elif ast.unparse(d.func) == "triton.jit":
+                    names += [e.value for k in d.keywords if k.arg == "do_not_specialize" for e in k.value.elts]
+            assert len(names) == 1, (node.name, names)
+            assert names[0] in [a.arg for a in node.args.args], (node.name, names[0])
+            found[node.name] = names[0]
     assert found == EXPECTED[path]
 
 

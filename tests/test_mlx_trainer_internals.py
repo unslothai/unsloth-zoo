@@ -3874,6 +3874,35 @@ def test_compile_discovers_no_archs_under_shim():
     assert isinstance(archs, tuple)
 
 
+def test_compile_scan_lists_architectures_once(monkeypatch, tmp_path):
+    """The scan reads every architecture, so listing them per read made it quadratic."""
+    import sys
+
+    import unsloth_zoo.mlx.compile as mc
+
+    for arch in ("alpha", "beta"):
+        (tmp_path / arch).mkdir()
+        (tmp_path / arch / "__init__.py").write_text(f"# {arch}\n")
+    models = types.SimpleNamespace(__path__ = [str(tmp_path)])
+    monkeypatch.setitem(sys.modules, "mlx_vlm", types.SimpleNamespace(models = models))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models", models)
+    listed = []
+    real_iter_modules = mc.pkgutil.iter_modules
+    monkeypatch.setattr(mc.pkgutil, "iter_modules", lambda paths: listed.append(paths) or real_iter_modules(paths))
+
+    def forget():
+        mc._iter_arch_modules.cache_clear()
+        mc._read_architecture_source.cache_clear()
+
+    forget()
+    try:
+        assert "# alpha" in mc._read_architecture_source("alpha")
+        assert "# beta" in mc._read_architecture_source("beta")
+        assert len(listed) == 1
+    finally:
+        forget()
+
+
 def test_compile_patch_primitives_exist():
     import unsloth_zoo.mlx.compile as mc
     primitives = mc.list_compile_patch_primitives()

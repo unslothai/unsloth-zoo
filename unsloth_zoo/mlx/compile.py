@@ -464,6 +464,7 @@ class CompilePatchabilityReport:
     blockers: tuple[str, ...]
 
 
+@lru_cache(maxsize=1)
 def _iter_arch_modules() -> Iterable[tuple[str, Path]]:
     """Yield installed `mlx_vlm.models.<arch>` package roots, inspecting the installed package rather than a static registry so qualification matches the venv."""
 
