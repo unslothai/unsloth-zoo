@@ -790,6 +790,7 @@ def test_a_recorded_label_is_not_probed_again(monkeypatch):
     )
 
 
+# Patch the module's compile entry, not torch.compile: CI sets UNSLOTH_COMPILE_DISABLE=1, which binds it to a no-op at import.
 def _raising_compile(error):
     def fake_compile(function, **kwargs):
         def compiled(*args, **kw):
@@ -807,7 +808,7 @@ def test_a_mask_builder_codegen_failure_falls_back_to_eager(monkeypatch):
         calls["eager"] += 1
         return x * 2
 
-    monkeypatch.setattr(common.torch, "compile", _raising_compile(_inductor_error("CppCompileError: C++ compile error")))
+    monkeypatch.setattr(common, "_torch_compile", _raising_compile(_inductor_error("CppCompileError: C++ compile error")))
     wrapped = common.compile_mask_builder(create_causal_mask)
     assert [wrapped(21), wrapped(1)] == [42, 2]
     assert calls == {"eager": 2}
@@ -816,7 +817,7 @@ def test_a_mask_builder_codegen_failure_falls_back_to_eager(monkeypatch):
 def test_a_real_error_in_a_mask_builder_still_raises(monkeypatch):
     from unsloth_zoo.temporary_patches import common
 
-    monkeypatch.setattr(common.torch, "compile", _raising_compile(ValueError("a real bug in the model")))
+    monkeypatch.setattr(common, "_torch_compile", _raising_compile(ValueError("a real bug in the model")))
     wrapped = common.compile_mask_builder(lambda x: x)
     with pytest.raises(ValueError, match = "a real bug"):
         wrapped(1)
@@ -825,7 +826,7 @@ def test_a_real_error_in_a_mask_builder_still_raises(monkeypatch):
 def test_a_mask_builder_is_not_flipped_by_another_regions_fallback(monkeypatch):
     from unsloth_zoo.temporary_patches import common
 
-    monkeypatch.setattr(common.torch, "compile", lambda function, **kwargs: (lambda *a, **k: "compiled"))
+    monkeypatch.setattr(common, "_torch_compile", lambda function, **kwargs: (lambda *a, **k: "compiled"))
     wrapped = common.compile_mask_builder(lambda x: "eager")
     patch_utils._PENDING_EAGER_LABELS.add("another-region")
     patch_utils.apply_pending_eager_fallbacks()
