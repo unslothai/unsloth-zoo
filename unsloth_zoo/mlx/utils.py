@@ -956,6 +956,20 @@ def _tie_to_hidden_state(args, shared_kv):
     return (x, *args[1:]), shared_kv
 
 
+_GC_BYPASS_DEPTH = contextvars.ContextVar("unsloth_mlx_gc_bypass_depth", default=0)
+
+
+@contextlib.contextmanager
+def gradient_checkpointing_bypassed():
+    """Checkpointed layers out of training run their own __call__ inside this context; generation enters it."""
+    depth = _GC_BYPASS_DEPTH.get()
+    _GC_BYPASS_DEPTH.set(depth + 1)
+    try:
+        yield
+    finally:
+        _GC_BYPASS_DEPTH.set(depth)
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -963,6 +977,8 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
+        if _GC_BYPASS_DEPTH.get() and not self.training:
+            return fn(self, *args, **kwargs)
         slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
         if slot is None:
             if "shared_kv" in kwargs:

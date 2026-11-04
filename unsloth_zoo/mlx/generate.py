@@ -1152,7 +1152,7 @@ def generation_mode(model, int8_prefill = None, call = None, ane_prefill = None,
     The outermost context snapshots the process-global memory, cache, and wired
     limits. Nested contexts only track their own model flags; the outer context
     restores the limits after all nested generation work completes. Gradient
-    checkpointing patches are intentionally left untouched because they are
+    checkpointing patches stay installed, bypassed by layers out of training, because they are
     class-level and may belong to a live compiled training step. `call` selects
     the inference scopes held, as `inference_scopes` reads it.
     """
@@ -1167,6 +1167,7 @@ def generation_mode(model, int8_prefill = None, call = None, ane_prefill = None,
         if _GENERATION_MODE_DEPTH == 0:
             _GENERATION_LIMIT_SNAPSHOT = _snapshot_metal_limits()
         from .inference import _fusion_modules, inference_scopes
+        from .utils import gradient_checkpointing_bypassed
         # One walk serves the flags and every scope: eval and the scopes leave the module graph alone.
         modules = tuple(_fusion_modules(model, None))
         training_states = _snapshot_training_flags([module for _, module in modules] or [model])
@@ -1174,7 +1175,7 @@ def generation_mode(model, int8_prefill = None, call = None, ane_prefill = None,
         _GENERATION_MODE_DEPTH += 1
         entered = True
         with inference_scopes(model, call, int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify,
-                              _modules = modules):
+                              _modules = modules), gradient_checkpointing_bypassed():
             yield model
     except BaseException as exc:
         active_error = exc

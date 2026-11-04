@@ -166,14 +166,14 @@ def test_batched_greedy_matches_sequential_and_preserves_sampled_ids():
     assert len(smoke) == 2 and all(result.token_ids for result in smoke)
 
 @metal_only
-def test_compiled_training_state_survives_generation():
+def test_compiled_training_state_survives_generation(monkeypatch):
     import mlx.optimizers as optim
     from mlx.utils import tree_flatten
     from unsloth_zoo.mlx.generate import (
         GenerationRequest, SamplingParams, generate_batch,
     )
     from unsloth_zoo.mlx.utils import (
-        apply_gradient_checkpointing, remove_gradient_checkpointing,
+        apply_gradient_checkpointing, gradient_checkpointing_bypassed, remove_gradient_checkpointing,
     )
     model, optimizer = _CompileLM(), optim.SGD(learning_rate=1e-2)
     optimizer.init(model.trainable_parameters())
@@ -202,8 +202,12 @@ def test_compiled_training_state_survives_generation():
             return generate_batch(model, tokenizer, [GenerationRequest(
                 prompt_token_ids=[1, 2], max_tokens=3,
                 sampling=SamplingParams(temperature=0.7))])[0].token_ids
+        real, wrapped = mx.checkpoint, []
+        monkeypatch.setattr(mx, "checkpoint", lambda fn: wrapped.append(fn) or real(fn))
         # Sampling consumes the global RNG stream, so the same seed reproduces.
         result, repeat = [types.SimpleNamespace(token_ids=sample(11))], sample(11)
+        assert not wrapped and model.eval()(x) is not None and len(wrapped) == 1
+        with gradient_checkpointing_bypassed(): assert model.train()(x) is not None and len(wrapped) == 2  # noqa: E701
         assert result[0].token_ids and repeat == result[0].token_ids
         assert snapshot() == state_after_train
         assert (False, True) in model.layers[0].seen_states
