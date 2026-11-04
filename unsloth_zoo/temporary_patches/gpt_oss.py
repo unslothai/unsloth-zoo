@@ -30,6 +30,7 @@ import torch.nn.functional as F
 import functools
 import inspect
 from .common import (
+    compile_mask_builder,
     TEMPORARY_PATCHES,
     torch_compile,
     _torch_compile,
@@ -57,6 +58,8 @@ from unsloth_zoo.gpt_oss_decode_fused import (
 )
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
+# Not "5.0.0.dev0": Version() maps it to 5.0.0.1, which excludes the 5.0.0 release.
+_IS_TRANSFORMERS_V5 = transformers_version >= Version("5.0.0")
 from .utils import (
     patch_function,
     patch_function_past_key_values,
@@ -1142,6 +1145,7 @@ def patch_gpt_oss_compiler_exports():
     m.dtype_from_config = dtype_from_config
     m.transformers_version = transformers_version
     m.Version = Version
+    m._IS_TRANSFORMERS_V5 = _IS_TRANSFORMERS_V5
 TEMPORARY_PATCHES.append(patch_gpt_oss_compiler_exports)
 
 
@@ -1293,7 +1297,7 @@ class GptOssTopKRouter(nn.Module):
             router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
             router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
         router_scores = torch.zeros_like(router_logits, dtype=router_logits.dtype).scatter_(1, router_indices, router_top_value)
-        if transformers_version >= Version("5.0.0"):
+        if _IS_TRANSFORMERS_V5:
             return router_logits, router_scores, router_indices
         else:
             return router_scores, router_indices
@@ -1575,6 +1579,7 @@ def patch_gpt_oss_bnb4bit():
     m.dtype_from_config    = dtype_from_config
     m.transformers_version = transformers_version
     m.Version              = Version
+    m._IS_TRANSFORMERS_V5  = _IS_TRANSFORMERS_V5
 
     _rebind_gpt_oss_compiled_classes()
     return True
@@ -3635,8 +3640,8 @@ def patch_GptOssModel():
     if create_sliding_window_causal_mask is None:
         return raise_error("transformers.masking_utils.create_sliding_window_causal_mask")
     if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
-        transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
-        transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils._old_create_causal_mask = compile_mask_builder(transformers.masking_utils.create_causal_mask)
+        transformers.masking_utils._old_create_sliding_window_causal_mask = compile_mask_builder(transformers.masking_utils.create_sliding_window_causal_mask)
         transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
         transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
         transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask

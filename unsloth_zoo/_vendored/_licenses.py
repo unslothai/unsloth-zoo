@@ -363,6 +363,10 @@ modifications =
       constexpr arguments of the four chunk_{local,global}_cumsum_{scalar,vector}
       kernels (none reads it; the grid carries B * H), so padded batches no
       longer re-tune and recompile per batch size.
+    - Modified by Unsloth in ops/common/chunk_o.py (inline "Unsloth:" comment, not
+      upstream as of fla 9d478fa): chunk_bwd_kernel_dqkwg takes B as a runtime
+      argument in do_not_specialize (it only feeds the dg offset B * T), so the
+      GDN / KDA backward no longer compiles one variant per batch size.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
