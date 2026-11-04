@@ -39,6 +39,11 @@ import pathlib
 from typing import Optional
 from filelock import FileLock
 
+# Precompiled: torch 2.11 Dynamo tracing re.match through re._compile corrupts Python's regex cache.
+_PACKAGE_NAME_RE = re.compile(r'^[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$')
+_VERSION_NUMBER_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+
+
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
     try:
@@ -51,7 +56,7 @@ def Version(version):
         if isinstance(version, str):
             # Treat as a package name (e.g. "trl") if it matches the pattern,
             # else as a literal version string.
-            if re.match(r'^[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$', version):
+            if _PACKAGE_NAME_RE.match(version):
                 try:
                     raw = importlib_version(version)
                     package_name = version
@@ -80,10 +85,10 @@ def Version(version):
                 pass
 
         # First try matching from the start, then search anywhere in the string.
-        match = re.match(r"[0-9]+(?:\.[0-9]+)*", raw)
+        match = _VERSION_NUMBER_RE.match(raw)
         match_at_start = match is not None
         if match is None:
-            match = re.search(r"[0-9]+(?:\.[0-9]+)*", raw)
+            match = _VERSION_NUMBER_RE.search(raw)
             match_at_start = False
         if match is None:
             raise ValueError(f"Invalid version format: {raw}")

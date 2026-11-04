@@ -62,9 +62,12 @@ from unsloth_zoo.mlx.attention import (
     dequantized_sdpa,
     dequantizing_is_smaller,
     fast_prefill_supported,
+    forced_padding_row_bytes,
     fused_kernel_exists,
+    install_fused_attention,
     install_quantized_attention,
     invariant_attention_available,
+    runtime_fuses,
     invariant_attention_supported,
     draft_attention_supported,
     probe_draft_attention,
@@ -297,8 +300,9 @@ def test_fused_kernel_exists_matches_what_the_installed_mlx_fuses(monkeypatch, D
     keys, values = (mx.dequantize(*q, group_size=32, bits=8).astype(queries.dtype)
                     for q in (q_keys, q_values))
     mask = mx.random.uniform(shape=(L, S)) > 0.1 if mask == "bool" else mask
-    sdpa = functools.partial(mx.fast.scaled_dot_product_attention, queries, keys, values,
-                             scale=D ** -0.5, mask=mask)
+    stock = getattr(mx.fast.scaled_dot_product_attention, "__wrapped__",
+                    mx.fast.scaled_dot_product_attention)
+    sdpa = functools.partial(stock, queries, keys, values, scale=D ** -0.5, mask=mask)
     try:
         fused = mx.array_equal(sdpa(force_fused=True), sdpa()).item()
     except ValueError:
@@ -473,6 +477,193 @@ def test_installing_the_patch_redirects_both_runtimes():
                 delattr(module, _PATCH_FLAG)
 
 
+@pytest.fixture
+def fused_attention():
+    stock = mx.fast.scaled_dot_product_attention
+    stock = getattr(stock, "__wrapped__", stock)
+    mx.fast.scaled_dot_product_attention = stock
+    install_fused_attention()
+    yield stock
+    mx.fast.scaled_dot_product_attention = stock
+
+
+def _d256_call(L, S, dtype=mx.bfloat16):
+    q = mx.random.normal((1, 8, L, 256), key=mx.random.key(0)).astype(dtype)
+    k, v = (mx.random.normal((1, 2, S, 256), key=mx.random.key(i)).astype(dtype) for i in (1, 2))
+    return q, k, v
+
+
+def _peak_of(call):
+    mx.synchronize()
+    mx.clear_cache()
+    base = mx.get_active_memory()
+    mx.reset_peak_memory()
+    mx.eval(call())
+    return mx.get_peak_memory() - base
+
+
+@pytest.mark.skipif(nax.nax_available(), reason="NAX fuses these chunks by default")
+def test_long_head_dim_256_prefill_holds_no_scores_and_stays_close_to_fp32(fused_attention):
+    q, k, v = _d256_call(512, 8192)
+    mx.eval(q, k, v)
+    call = lambda sdpa, *a: sdpa(*a, q, k, v, scale=256 ** -0.5, mask="causal")
+    scores = 8 * 512 * 8192 * 2
+    assert _peak_of(lambda: call(fused_attention)) >= scores
+    assert _peak_of(lambda: call(mx.fast.scaled_dot_product_attention)) < scores / 4
+    got = mx.fast.scaled_dot_product_attention(q, k, v, scale=256 ** -0.5, mask="causal")
+    want = fused_attention(*(x.astype(mx.float32) for x in (q, k, v)), scale=256 ** -0.5, mask="causal")
+    assert mx.abs(got.astype(mx.float32) - want).max().item() <= 0.02 * mx.abs(want).max().item()
+
+
+@pytest.mark.parametrize("change", ["queries", "keys", "more_queries_than_keys", "float32", "array_mask", "sinks",
+                                    "head_dim", "training"])
+def test_only_the_measured_call_shape_is_forced(fused_attention, monkeypatch, change):
+    from unsloth_zoo.mlx import utils
+
+    L, S, dtype, mask = 16, 8192, mx.bfloat16, "causal"
+    extra = {}
+    if change == "queries":
+        L = 15
+    elif change == "keys":
+        S = 8191
+    elif change == "more_queries_than_keys":
+        L = 8193
+    elif change == "float32":
+        dtype = mx.float32
+    elif change == "array_mask":
+        mask = mx.ones((L, S), dtype=mx.bool_)
+    elif change == "sinks":
+        extra["sinks"] = mx.zeros((1, 8, 1, 256), dtype=dtype)
+    elif change == "training":
+        monkeypatch.setattr(utils, "mlx_training_patches_active", lambda: True)
+    q, k, v = _d256_call(L, S, dtype)
+    if change == "head_dim":
+        q, k, v = (x[..., :128] for x in (q, k, v))
+    forced = []
+
+    def spy(*a, **kw):
+        forced.append(kw.get("force_fused", False))
+
+    from unsloth_zoo.mlx.attention import fused_sdpa_over
+    fused_sdpa_over(spy)(q, k, v, scale=1.0, mask=mask, **extra)
+    assert forced == [False]
+    q, k, v = _d256_call(16, 8192)
+    fused_sdpa_over(spy)(q, k, v, scale=1.0, mask="causal")
+    assert forced[-1] is (change != "training")
+
+
+@pytest.mark.parametrize("head_dim, value_dim, on_nax, widths", [
+    (256, 256, False, (256, 256)), (256, 256, True, (256, 256)),
+    (192, 128, False, (192, 192)), (192, 128, True, (256, 256)),
+    (512, 512, True, None), (512, 512, False, None),
+    (192, 192, False, None), (192, 192, True, None),
+    (128, 128, False, None), (160, 160, False, None),
+])
+def test_each_width_is_forced_at_the_width_measured_to_help(fused_attention, monkeypatch, head_dim, value_dim, on_nax,
+                                                            widths):
+    monkeypatch.setattr(nax, "nax_available", lambda: on_nax)
+    q = mx.zeros((1, 8, 16, head_dim), dtype=mx.bfloat16)
+    k = mx.zeros((1, 2, 8192, head_dim), dtype=mx.bfloat16)
+    v = mx.zeros((1, 2, 8192, value_dim), dtype=mx.bfloat16)
+    seen = []
+
+    def spy(q, k, v, **kw):
+        seen.append((q.shape[-1], k.shape[-1], v.shape[-1], kw.get("force_fused", False)))
+        return mx.zeros((1, 8, 16, v.shape[-1]), dtype=mx.bfloat16)
+
+    from unsloth_zoo.mlx.attention import fused_sdpa_over
+    out = fused_sdpa_over(spy)(q, k, v, scale=1.0, mask="causal")
+    assert out.shape[-1] == value_dim
+    if widths is None:
+        assert seen == [(head_dim, head_dim, value_dim, False)]
+    else:
+        assert seen == [(widths[0], widths[0], widths[1], True)]
+
+
+def test_the_padded_copies_count_against_dequantizing_and_only_where_a_call_is_forced(monkeypatch):
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    assert forced_padding_row_bytes(192, 128, 2, 2, 8191) == 0
+    # Scores outgrow the 4-bit copy plus V padded to 192, but not the copy plus K and V padded to 256.
+    q_keys, q_values = _cache(1, 64, 8192, 192, 4, group_size=64, Dv=128)
+    queries = _queries(1, 64, 768, 192)
+    assert not dequantizing_is_smaller(queries, q_keys, q_values, 64)
+    monkeypatch.setattr(nax, "nax_available", lambda: False)
+    assert dequantizing_is_smaller(queries, q_keys, q_values, 64)
+
+
+@pytest.mark.parametrize("on_nax", [False, True])
+def test_padded_192_128_prefill_holds_no_scores_and_matches_the_unpadded_attention(fused_attention, monkeypatch,
+                                                                                   on_nax):
+    monkeypatch.setattr(nax, "nax_available", lambda: on_nax)
+    q = mx.random.normal((1, 8, 512, 192), key=mx.random.key(0)).astype(mx.bfloat16)
+    k = mx.random.normal((1, 2, 8192, 192), key=mx.random.key(1)).astype(mx.bfloat16)
+    v = mx.random.normal((1, 2, 8192, 128), key=mx.random.key(2)).astype(mx.bfloat16)
+    mx.eval(q, k, v)
+    scores = 8 * 512 * 8192 * 2
+    call = lambda sdpa, *a: sdpa(*a, q, k, v, scale=192 ** -0.5, mask="causal")
+    assert _peak_of(lambda: call(fused_attention)) >= scores
+    # Only the padded copies of K and V remain, and the zoo reports what they cost.
+    padding = forced_padding_row_bytes(192, 128, 2, 2, 8192) * 8192
+    assert padding == 2 * 8192 * (512 if on_nax else 192) * 2
+    assert _peak_of(lambda: call(mx.fast.scaled_dot_product_attention)) < padding + scores / 8
+    got = call(mx.fast.scaled_dot_product_attention)
+    want = fused_attention(*(x.astype(mx.float32) for x in (q, k, v)), scale=192 ** -0.5, mask="causal")
+    assert got.shape == want.shape
+    assert mx.abs(got.astype(mx.float32) - want).max().item() <= 0.02 * mx.abs(want).max().item()
+
+
+@pytest.mark.parametrize("L, expected", [(1023, False), (1024, True)])
+def test_mlxs_blocked_head_dim_512_route_counts_as_holding_no_full_scores(L, expected):
+    if nax.nax_available():
+        pytest.skip("the blocked route is off-NAX")
+    q_keys, q_values = _cache(1, 1, 4096, 512, 8, group_size=32)
+    queries = _queries(1, 16, L, 512)
+    assert runtime_fuses(queries, q_keys, q_values, 32, "causal") is expected
+    keys, values = (mx.dequantize(*c, group_size=32, bits=8).astype(queries.dtype) for c in (q_keys, q_values))
+    mx.eval(keys, values, queries)
+    scores = 16 * L * 4096 * 2
+    stock = getattr(mx.fast.scaled_dot_product_attention, "__wrapped__", mx.fast.scaled_dot_product_attention)
+    peak = _peak_of(lambda: stock(queries, keys, values, scale=512 ** -0.5, mask="causal"))
+    assert (peak < scores / 2) is expected
+
+
+@pytest.mark.parametrize("opt_out", ["0", "1"])
+def test_unsloths_nax_opt_out_leaves_mlxs_own_nax_dispatch_in_place(monkeypatch, opt_out):
+    monkeypatch.setattr(nax, "_nax_gpu", lambda: True)
+    monkeypatch.setattr(nax, "_stock_nax_kernels", lambda: True)
+    monkeypatch.setenv("UNSLOTH_MLX_NAX", opt_out)
+    q_keys, q_values = _cache(1, 1, 4096, 512, 8, group_size=32)
+    blocked_only = _queries(1, 16, 1024, 512)
+    assert not runtime_fuses(blocked_only, q_keys, q_values, 32, "causal")
+    assert fused_kernel_exists(_queries(1, 16, 2048, 512), q_keys, q_values, 32, "causal")
+
+
+def test_a_quantized_head_dim_256_prefill_dequantizes_on_the_forced_route(fused_attention):
+    q_keys, q_values = _cache(1, 2, 8192, 256, 8, group_size=64)
+    queries = _queries(1, 8, 64, 256)
+    assert runtime_fuses(queries, q_keys, q_values, 64, "causal")
+    assert not runtime_fuses(queries[:, :, :15], q_keys, q_values, 64, "causal")
+    assert not fused_kernel_exists(queries, q_keys, q_values, 64, "causal") or nax.nax_available()
+    never = lambda *a, **kw: pytest.fail("the unfused runtime answered a forced call")
+    # 512 rows: at 64 the copy still costs more than the scores.
+    queries = _queries(1, 8, 512, 256)
+    got = quantized_sdpa_over(never)(queries, q_keys, q_values, 256 ** -0.5, "causal", group_size=64, bits=8)
+    want = dequantized_sdpa(queries, q_keys, q_values, 256 ** -0.5, "causal", group_size=64, bits=8)
+    assert mx.array_equal(got, want).item()
+
+
+def test_the_wrapper_takes_mlxs_own_keywords(fused_attention):
+    q, k, v = _d256_call(1, 4)
+    got = mx.fast.scaled_dot_product_attention(q=q, k=k, v=v, scale=1.0, mask="causal", stream=mx.gpu)
+    assert mx.array_equal(got, fused_attention(q=q, k=k, v=v, scale=1.0, mask="causal")).item()
+
+
+def test_installing_the_fused_route_twice_wraps_once(fused_attention):
+    once = mx.fast.scaled_dot_product_attention
+    install_fused_attention()
+    assert mx.fast.scaled_dot_product_attention is once and once.__wrapped__ is fused_attention
+
+
 def test_every_model_load_path_installs_the_patch():
     """Checked as a shape: every model-returning `return` in `from_pretrained` goes through
     `_finish_load`, since reaching each branch needs repositories this suite lacks."""
@@ -510,8 +701,8 @@ def test_every_model_load_path_installs_the_patch():
     assert isinstance(helper.body[0].value, ast.Constant), "expected a docstring first"
     calls = [stmt.value.func.id for stmt in helper.body[1:-1]
              if isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name)]
-    assert "install_quantized_attention" in calls, \
-        "_finish_load does not install the patch before returning"
+    assert {"install_quantized_attention", "install_fused_attention"} <= set(calls), \
+        "_finish_load does not install the patches before returning"
 
 
 def _sparse_training_case(kind, seed=13):

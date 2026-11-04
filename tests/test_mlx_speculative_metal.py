@@ -1019,6 +1019,10 @@ def test_the_tree_builder_grows_best_first_and_lays_rows_out_in_preorder():
                 if token not in taken:
                     assert score[row] + lq[d][j] <= worst + 1e-4
     assert sorted(tree.rank.tolist()) == list(range(16))
+    assert mx.allclose(tree.score, mx.array(score), atol = 1e-3).item()
+    # A narrower tree of the same lattice is the nodes taken first.
+    by_rank = sorted(zip(tree.rank.tolist(), tokens))
+    assert sorted(tree.regrow(5).tokens.tolist()) == sorted(token for _, token in by_rank[:5])
     # The walk stays on its branch: a later row with the next token elsewhere is not it.
     other = inference.DraftTree(mx.array([9, 5, 6, 7, 7]), mx.array([-1, 0, 0, 2, 1]), None, None)
     path, walked = inference.draft_tree_accept(other, mx.array([6, 0, 7, 7, 0]))
@@ -1051,6 +1055,7 @@ def _tree_engine(model, monkeypatch, rows = 6):
     from unsloth_zoo.mlx import inference, speculative as S
     drafter = _tree_drafter(model)
     engine = S.SpeculativeEngine(model, _script(("draft", 4), ("plain", 3), ("draft", 4), ("copy", 4)), drafter, logprobs = True)
+    engine.controller.max_depth = drafter.trained_depth   # a controller capped below it keeps its chain
     reference, commits, commit = [], [], inference.tree_commit
     drafter._tree = lambda anchor, context, cache, width: _crafted_tree(
         drafter, anchor, reference[engine._rows[0].emitted:], width, context, cache)
@@ -1124,6 +1129,45 @@ def test_a_quantized_row_keeps_its_chain_rounds(qwen_4bit, monkeypatch):
     assert widths[0] and not widths[1]
 
 
+def test_a_tree_round_verifies_the_width_its_budget_sizes_from_its_lattice_and_keeps_the_tokens(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import SizedTreeBudget
+    model, ids, _ = qwen_4bit
+    with _tree_mode(model, monkeypatch):
+        _warm_tree_widths(model.language_model, _prefill(model.language_model, ids[0], SamplingParams())[0], ids[1][:6])
+        expected = _solo(model, ids[0], 72, SamplingParams())
+        engine, reference, commits = _tree_engine(model, monkeypatch)
+        reference += expected
+        budget = SizedTreeBudget({3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0})
+        seen, chosen, widths, size, verify, rows = [], [], iter((3, 6, 4, 5) * 40), budget.size, engine._verify, []
+
+        def sized(nodes):
+            size(nodes)
+            seen.append(nodes)
+            chosen.append(next(widths))
+            return chosen[-1]
+        budget.size = sized
+        observed, observe = [], budget.observe
+        budget.observe = lambda width, ranks, end: observed.append((width, ranks)) or observe(width, ranks, end)
+        replies, reply_round = [], budget.reply_round
+        budget.reply_round = lambda reply: replies.append(reply) or reply_round(reply)
+        engine._verify = lambda inputs: rows.append(inputs.shape[1]) or verify(inputs)
+        budget.yields_to_controller = lambda *args: False   # the script's stats stop short of the raised depth
+        engine.drafter.tree_budget = budget
+        reply, _ = _scored_reply(model, ids, engine, 72)
+    assert reply == expected and len(commits) >= 4 and {3, 4, 5, 6} <= set(chosen)
+    assert len(replies) == len(observed) and all(reply is replies[0] for reply in replies)
+    # Each lattice offers the drafted width's nodes, best first, as probabilities, and each verify carries the width chosen from it.
+    assert all(len(nodes) == 5 and all(a[0] >= b[0] for a, b in zip(nodes, nodes[1:])) for nodes in seen)
+    assert all(0 < probability <= 1 for nodes in seen for probability, _ in nodes)
+    verifies = iter(rows)
+    assert all(width in verifies for width in chosen)
+    # The budget hears each width and the nodes its round walked.
+    assert [width for width, _ in observed] == chosen[:len(observed)] and [len(ranks) for _, ranks in observed] == [len(path) - 1 for path in commits]
+    # A path holds one node of each depth, which ranks into the lattice's order show and rows of the tree would not.
+    assert all(sorted(nodes[rank - 1][1] for rank in ranks) == list(range(1, len(ranks) + 1)) for nodes, (_, ranks) in zip(seen, observed))
+
+
 def test_load_times_the_tree_widths_of_a_target_whose_rows_match_their_paths(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference, speculative as S
     model, _, _ = qwen_4bit
@@ -1143,6 +1187,15 @@ def test_load_times_the_tree_widths_of_a_target_whose_rows_match_their_paths(qwe
     # A chain round after a block drafted ahead as a tree, as these are, still proposes.
     assert budget and drafts and all(mx.any(block != 0).item() for block in drafts)
     assert list(budget.tree_costs) == list(budget.chain_costs) == [8] and min(budget.tree_costs[8], budget.chain_costs[8]) > 0
+    # A target whose rows bring their own experts sizes each round's tree from the widths timed here.
+    drafter.tree_budget, drafter.sized_trees, drafter.tree_widths = None, True, (4, 8)
+    S.warm_speculative_rounds(model)
+    sized = drafter.tree_budget
+    assert isinstance(sized, S.SizedTreeBudget) and list(sized.load_costs) == [4, 8] and min(sized.load_costs.values()) > 0
+    # Warming again times the widths it asks for: the budget it replaces resizes none of them.
+    sized.size = lambda nodes: pytest.fail("an earlier budget resized a timed width")
+    S.warm_speculative_rounds(model)
+    assert drafter.tree_budget is not sized and list(drafter.tree_budget.load_costs) == [4, 8]
 
 
 def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(qwen_4bit, monkeypatch):
@@ -1171,7 +1224,7 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
             return norm(x)
         with monkeypatch.context() as patch:
             # An unscoped model's verify call made inside a served one stays native, and the served one goes on.
-            patch.setattr(layer, "input_layernorm", nested)
+            patch.setitem(layer, "input_layernorm", nested)   # pytest >= 9.2 setattr undo drops an mlx Module child
             assert _verified(lm, cache, block, 0) and {key[0][1] for key in verdicts} == {12} and not verdicts.clear()
         # Native: an unscoped model, a block inside mlx-vlm's fused bound, training, thawed projections, a drifted binding.
         _verified(unscoped, cache, block, 0)
@@ -2767,7 +2820,7 @@ def test_a_dflash_block_drafted_before_its_acceptance_is_read_drafts_and_caches_
     layer = drafter.model.layers[1]
     for target, attribute, value in ((layer.self_attn, "is_causal", True), (layer, "self_attn", SimpleNamespace(is_causal = False))):
         with monkeypatch.context() as patch:
-            patch.setattr(target, attribute, value)
+            (patch.setitem if attribute in target else patch.setattr)(target, attribute, value)
             assert inference.predraft_attention(drafter.model) == 0
     with monkeypatch.context() as patch:
         patch.setattr(drafter.model, "make_cache", lambda: [object()])
