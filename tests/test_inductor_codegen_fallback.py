@@ -788,3 +788,46 @@ def test_a_recorded_label_is_not_probed_again(monkeypatch):
     assert probes["n"] == 1, (
         f"an already-recorded label was probed {probes['n']} times"
     )
+
+
+def _raising_compile(error):
+    def fake_compile(function, **kwargs):
+        def compiled(*args, **kw):
+            raise error
+        return compiled
+    return fake_compile
+
+
+def test_a_mask_builder_codegen_failure_falls_back_to_eager(monkeypatch):
+    from unsloth_zoo.temporary_patches import common
+
+    calls = {"eager": 0}
+
+    def create_causal_mask(x):
+        calls["eager"] += 1
+        return x * 2
+
+    monkeypatch.setattr(common.torch, "compile", _raising_compile(_inductor_error("CppCompileError: C++ compile error")))
+    wrapped = common.compile_mask_builder(create_causal_mask)
+    assert [wrapped(21), wrapped(1)] == [42, 2]
+    assert calls == {"eager": 2}
+
+
+def test_a_real_error_in_a_mask_builder_still_raises(monkeypatch):
+    from unsloth_zoo.temporary_patches import common
+
+    monkeypatch.setattr(common.torch, "compile", _raising_compile(ValueError("a real bug in the model")))
+    wrapped = common.compile_mask_builder(lambda x: x)
+    with pytest.raises(ValueError, match = "a real bug"):
+        wrapped(1)
+
+
+def test_a_mask_builder_is_not_flipped_by_another_regions_fallback(monkeypatch):
+    from unsloth_zoo.temporary_patches import common
+
+    monkeypatch.setattr(common.torch, "compile", lambda function, **kwargs: (lambda *a, **k: "compiled"))
+    wrapped = common.compile_mask_builder(lambda x: "eager")
+    patch_utils._PENDING_EAGER_LABELS.add("another-region")
+    patch_utils.apply_pending_eager_fallbacks()
+    assert wrapped(1) == "compiled"
+

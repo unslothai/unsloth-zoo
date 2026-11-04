@@ -112,13 +112,13 @@ def _build_kernels():
         x, weight, bias, y, seq_idx,
         T, D,
         stride_x_b, stride_x_t, stride_x_d,
-        W: tl.constexpr,
-        BT: tl.constexpr,
-        BD: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
-        ACTIVATION: tl.constexpr,
-        HAS_SEQ_IDX: tl.constexpr,
-        PAD_NEG: tl.constexpr,
+        W: tl.constexpr,  # conv kernel width
+        BT: tl.constexpr,  # block size along T
+        BD: tl.constexpr,  # block size along channels
+        HAS_BIAS: tl.constexpr,  # conv bias
+        ACTIVATION: tl.constexpr,  # silu activation
+        HAS_SEQ_IDX: tl.constexpr,  # packed seq_idx boundaries
+        PAD_NEG: tl.constexpr,  # zero padded positions (seq_idx < 0)
     ):
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
@@ -163,11 +163,11 @@ def _build_kernels():
         T, D,
         stride_x_b, stride_x_t, stride_x_d,
         stride_dy_b, stride_dy_t, stride_dy_d,
-        W: tl.constexpr,
-        BT: tl.constexpr,
-        BD: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
-        HAS_SEQ_IDX: tl.constexpr,
+        W: tl.constexpr,  # conv kernel width
+        BT: tl.constexpr,  # block size along T
+        BD: tl.constexpr,  # block size along channels
+        HAS_BIAS: tl.constexpr,  # conv bias
+        HAS_SEQ_IDX: tl.constexpr,  # packed seq_idx boundaries
     ):
         # Pass 1: SiLU grad g per position (pre-act recomputed), stored channel-last in input dtype.
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -210,14 +210,14 @@ def _build_kernels():
         T, D, NT,
         stride_x_b, stride_x_t, stride_x_d,
         stride_g_b, stride_g_t, stride_g_d,
-        W: tl.constexpr,
-        BT: tl.constexpr,
-        BD: tl.constexpr,
-        NEED_DX: tl.constexpr,
-        NEED_DW: tl.constexpr,
-        NEED_DB: tl.constexpr,
-        HAS_SEQ_IDX: tl.constexpr,
-        PAD_NEG: tl.constexpr,
+        W: tl.constexpr,  # conv kernel width
+        BT: tl.constexpr,  # block size along T
+        BD: tl.constexpr,  # block size along channels
+        NEED_DX: tl.constexpr,  # compute dx
+        NEED_DW: tl.constexpr,  # compute dweight
+        NEED_DB: tl.constexpr,  # compute dbias
+        HAS_SEQ_IDX: tl.constexpr,  # packed seq_idx boundaries
+        PAD_NEG: tl.constexpr,  # zero padded positions (seq_idx < 0)
     ):
         # Pass 2: dx, per-tile dw and db from g; taps never cross a seq_idx boundary.
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -425,12 +425,12 @@ def _build_update_kernel():
         stride_x_b, stride_x_d, stride_x_t,
         stride_s_b, stride_s_d, stride_s_l,
         stride_y_b, stride_y_d, stride_y_t,
-        L: tl.constexpr,
-        LP: tl.constexpr,
-        W: tl.constexpr,
-        BD: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
-        ACTIVATION: tl.constexpr,
+        L: tl.constexpr,  # conv state length
+        LP: tl.constexpr,  # state length pow2
+        W: tl.constexpr,  # conv kernel width
+        BD: tl.constexpr,  # block size along channels
+        HAS_BIAS: tl.constexpr,  # conv bias
+        ACTIVATION: tl.constexpr,  # silu activation
     ):
         # Taps index c=[state|x]: out t reads c[L+t-(W-1)+i_w], new state c[T:T+L]; same as torch path.
         i_d, i_b = tl.program_id(0), tl.program_id(1)

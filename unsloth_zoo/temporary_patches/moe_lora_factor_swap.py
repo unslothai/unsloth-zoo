@@ -29,6 +29,11 @@ map is an entry permutation, its own inverse, and changes no value. get_peft_mod
 including trainer checkpoints) writes the vanilla factors; set_peft_model_state_dict (every load) maps a vanilla
 pair back when its shapes only fit swapped. A square stack (d1 == d2) cannot be told apart by shape, so it is left
 as is on both sides: no real Llama-4 or Qwen3-VL-MoE checkpoint has one.
+
+The legacy lora_B packing (UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert) has PEFT's [out, R*E] shape, so every PEFT
+reads it with experts mixed. It is saved as [out, E, R] so vanilla PEFT refuses it by size; Unsloth flattens it back
+on load and the adapter_config.json lora_B_layout marker records its packing. Repacking to PEFT's layout on save is
+WRONG: set_peft_model_state_dict gets bare tensors, so a legacy process could not tell it from an old Unsloth file.
 """
 
 from __future__ import annotations
@@ -87,9 +92,7 @@ def swap_expert_lora_factors(lora_A: torch.Tensor, lora_B: torch.Tensor, num_exp
 
 
 def _legacy_grouped(wrapper, adapter_name):
-    """True when this wrapper reads lora_B with the legacy (out, E, R) packing (UNSLOTH_MOE_LORA_B_LAYOUT). Such
-    adapters are left as trained: Unsloth reloads them by their saved layout metadata, vanilla PEFT refuses them by
-    shape as before (no silent mix of experts)."""
+    """True when this wrapper uses the legacy lora_B packing; saved 3D, never swapped."""
     try:
         from .moe_utils import LORA_B_LAYOUT_GROUPED_BY_EXPERT, moe_lora_b_layout_for_wrapper
         return moe_lora_b_layout_for_wrapper(wrapper, adapter_name) == LORA_B_LAYOUT_GROUPED_BY_EXPERT
@@ -129,6 +132,17 @@ def _swapped_wrappers(model):
     return out
 
 
+def _expert_wrappers(model):
+    out = {}
+    for name, module in model.named_modules():
+        if type(module).__name__ != "ParamWrapper":
+            continue
+        num_experts = getattr(module, "num_experts", None)
+        if isinstance(num_experts, int) and num_experts > 1:
+            out[name] = num_experts
+    return out
+
+
 def _bare(name):
     while name.startswith("_orig_mod."):  # torch.compile wrappers
         name = name[len("_orig_mod."):]
@@ -159,12 +173,20 @@ def _pair_keys(state_dict, module_name):
 
 def _to_vanilla(model, state_dict, adapter_name = "default"):
     wrappers = _swapped_wrappers(model)
-    if not wrappers:
+    experts = _expert_wrappers(model)
+    if not wrappers and not experts:
         return state_dict
     modules = dict(model.named_modules())
     state_dict = dict(state_dict)
+    legacy = {name for name in experts if _legacy_grouped(modules[name], adapter_name)}
+    for module_name in legacy:
+        num_experts = experts[module_name]
+        for _, key_b in _pair_keys(state_dict, module_name):
+            b = state_dict[key_b]
+            if b.dim() == 2 and b.shape[1] % num_experts == 0:
+                state_dict[key_b] = b.reshape(b.shape[0], num_experts, b.shape[1] // num_experts)
     for module_name, num_experts in wrappers.items():
-        if _legacy_grouped(modules[module_name], adapter_name):
+        if module_name in legacy:
             continue
         for key_a, key_b in _pair_keys(state_dict, module_name):
             a, b = state_dict[key_a], state_dict[key_b]
@@ -174,12 +196,27 @@ def _to_vanilla(model, state_dict, adapter_name = "default"):
     return state_dict
 
 
+def _flatten_grouped_lora_B(model, state_dict, adapter_name, experts, modules):
+    """[out, E, R] lora_B back to trained 2D bytes; the adapter_config marker then decides any repack."""
+    for module_name, num_experts in experts.items():
+        lora_B_dict = getattr(modules[module_name], "lora_B", None)
+        if lora_B_dict is None or adapter_name not in lora_B_dict:
+            continue
+        want_out = lora_B_dict[adapter_name].weight.shape[0]
+        for _, key_b in _pair_keys(state_dict, module_name):
+            b = state_dict[key_b]
+            if b.dim() == 3 and b.shape[0] == want_out and b.shape[1] == num_experts:
+                state_dict[key_b] = b.reshape(b.shape[0], -1)
+    return state_dict
+
+
 def _from_vanilla(model, state_dict, adapter_name):
     wrappers = _swapped_wrappers(model)
-    if not wrappers:
+    experts = _expert_wrappers(model)
+    if not wrappers and not experts:
         return state_dict
     modules = dict(model.named_modules())
-    state_dict = dict(state_dict)
+    state_dict = _flatten_grouped_lora_B(model, dict(state_dict), adapter_name, experts, modules)
     for module_name, num_experts in wrappers.items():
         wrapper = modules[module_name]
         lora_A_dict = getattr(wrapper, "lora_A", None)
@@ -267,9 +304,48 @@ def _converted_load_kwargs(model, kwargs, adapter_name, scratch_dir = None):
     return kwargs
 
 
+def _repack_legacy_lora_B(model, model_id, adapter_name, hub_kwargs):
+    """Legacy lora_B repack for non-PeftModel load paths; never raises (the load already succeeded)."""
+    try:
+        from .moe_utils import repack_legacy_lora_b_after_load
+        repack_legacy_lora_b_after_load(model, model_id, adapter_name, hub_kwargs)
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: did not check the expert LoRA lora_B layout: {e}")
+
+
+def _load_adapter_source(original, args, kwargs):
+    """(model_id, hub_kwargs) of a transformers 4.x/5.x load_adapter call; model_id None for an adapter_state_dict."""
+    import inspect
+    try:
+        signature = inspect.signature(original)
+        named = {}
+        for key, value in signature.bind(*args, **kwargs).arguments.items():
+            if signature.parameters[key].kind is inspect.Parameter.VAR_KEYWORD:
+                named.update(value)
+            else:
+                named[key] = value
+        if named.get("adapter_state_dict") is not None:
+            return None, {}
+        load_config = named.get("load_config")
+        model_id = (named.get("peft_model_id") or named.get("pretrained_model_name_or_path")
+                    or getattr(load_config, "pretrained_model_name_or_path", None))
+        # Mirrors transformers: explicit download_kwargs replaces load_config's; adapter_kwargs override.
+        download = named.get("download_kwargs")
+        if download is None:
+            download = getattr(load_config, "download_kwargs", None)
+        hub_kwargs = dict(download or {})
+        nested = ("self", "download_kwargs", "adapter_kwargs", "load_config")
+        hub_kwargs.update({key: value for key, value in named.items() if key not in nested and value is not None})
+        hub_kwargs.update(named.get("adapter_kwargs") or {})
+        return model_id, hub_kwargs
+    except Exception:
+        return None, {}
+
+
 def _wrap_load_adapter(original):
     """transformers 5.x PeftAdapterMixin.load_adapter injects the adapter, then loads its tensors with
-    _load_pretrained_model (not PEFT's set_peft_model_state_dict): convert the factors on that path too."""
+    _load_pretrained_model (not PEFT's set_peft_model_state_dict): convert the factors on that path too, then repack legacy lora_B."""
     def load_adapter(self, peft_model_id = None, adapter_name = None, *args, **kwargs):
         name = adapter_name or "default"
         cls_load = type(self)._load_pretrained_model
@@ -277,9 +353,8 @@ def _wrap_load_adapter(original):
 
         def _load_pretrained_model(*a, **k):
             model = k.get("model", self)
-            # Only adapters over the re-laid-out experts need it: everything else keeps transformers' own path
-            # (disk offload indexes the checkpoint files it was given).
-            if _swapped_wrappers(model):
+            # Others keep transformers' path (disk offload indexes the checkpoint files it was given).
+            if _swapped_wrappers(model) or _expert_wrappers(model):
                 try:
                     k = _converted_load_kwargs(model, k, name, scratch.name)
                 except Exception as e:
@@ -292,14 +367,28 @@ def _wrap_load_adapter(original):
         scratch = tempfile.TemporaryDirectory(prefix = "unsloth_lora_swap_")
         self.__dict__["_load_pretrained_model"] = _load_pretrained_model
         try:
-            return original(self, peft_model_id, adapter_name, *args, **kwargs)
+            result = original(self, peft_model_id, adapter_name, *args, **kwargs)
         finally:
             if not had:
                 self.__dict__.pop("_load_pretrained_model", None)
             scratch.cleanup()
+        model_id, hub_kwargs = _load_adapter_source(original, (self, peft_model_id, adapter_name, *args), kwargs)
+        _repack_legacy_lora_B(self, model_id, name, hub_kwargs)
+        return result
     load_adapter._unsloth_factor_swap = True
     load_adapter.__wrapped__ = original
     return load_adapter
+
+
+def _wrap_hotswap_adapter(original):
+    """PEFT's hotswap_adapter reads the file itself, so repack legacy lora_B after it."""
+    def hotswap_adapter(model, model_name_or_path, adapter_name, *args, **kwargs):
+        result = original(model, model_name_or_path, adapter_name, *args, **kwargs)
+        _repack_legacy_lora_B(model, model_name_or_path, adapter_name, kwargs)
+        return result
+    hotswap_adapter._unsloth_factor_swap = True
+    hotswap_adapter.__wrapped__ = original
+    return hotswap_adapter
 
 
 def _patch_transformers_load_adapter():
@@ -326,6 +415,7 @@ def patch_expert_lora_factor_swap():
         (save_and_load, "get_peft_model_state_dict", _wrap_get),
         (save_and_load, "set_peft_model_state_dict", _wrap_set),
         (hotswap, "hotswap_adapter_from_state_dict", _wrap_hotswap),
+        (hotswap, "hotswap_adapter", _wrap_hotswap_adapter),
     ):
         original = getattr(source, name, None)
         if original is None or getattr(original, "_unsloth_factor_swap", False):

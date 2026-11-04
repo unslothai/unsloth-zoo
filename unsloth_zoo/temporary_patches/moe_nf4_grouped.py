@@ -134,13 +134,13 @@ if triton is not None:
         return tl.where(b3, x1, x0)
 
     @triton.jit
-    def _code(nib, CODE, LUT: tl.constexpr):
+    def _code(nib, CODE, LUT: tl.constexpr):  # 1 select nf4 code, else table load
         if LUT == 1:
             return _nf4_select(nib, CODE)
         return tl.load(CODE + nib)
 
     @triton.jit
-    def _decode_pairs(q, scale, CODE, W_DT: tl.constexpr, OUT_DT: tl.constexpr, LUT: tl.constexpr):
+    def _decode_pairs(q, scale, CODE, W_DT: tl.constexpr, OUT_DT: tl.constexpr, LUT: tl.constexpr):  # weight dtype / out dtype / nf4 code select
         hi = _code((q >> 4).to(tl.int32), CODE, LUT)
         lo = _code((q & 15).to(tl.int32), CODE, LUT)
         hi = (hi * scale).to(W_DT).to(OUT_DT)
@@ -148,7 +148,7 @@ if triton is not None:
         return hi, lo
 
     @triton.jit
-    def _scale(blk, mask, ABSMAX, CODE2, ABSMAX2, OFFSET, BS2: tl.constexpr, NESTED: tl.constexpr):
+    def _scale(blk, mask, ABSMAX, CODE2, ABSMAX2, OFFSET, BS2: tl.constexpr, NESTED: tl.constexpr):  # nested absmax block / double quant
         if NESTED:
             aq = tl.load(ABSMAX + blk, mask = mask, other = 0).to(tl.int32)
             am2 = tl.load(ABSMAX2 + blk // BS2, mask = mask, other = 0.0).to(tl.float32)
@@ -161,11 +161,11 @@ if triton is not None:
     def _nf4_grouped_kernel(
         A, Q, ABSMAX, CODE2, ABSMAX2, OFFSET, CODE, ENDS, C,
         M, M_HINT,
-        NUM_E: tl.constexpr, E_POW2: tl.constexpr,
-        I: tl.constexpr, J: tl.constexpr, S_I: tl.constexpr, S_J: tl.constexpr,
+        NUM_E: tl.constexpr, E_POW2: tl.constexpr,  # num experts / num experts pow2
+        I: tl.constexpr, J: tl.constexpr, S_I: tl.constexpr, S_J: tl.constexpr,  # weight in / out dims and their strides
         PAIR: tl.constexpr,                 # 1: bytes pair along J, 2: along I, 0: per element
-        BS: tl.constexpr, BS2: tl.constexpr, NESTED: tl.constexpr, W_DT: tl.constexpr,
-        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, LUT: tl.constexpr,
+        BS: tl.constexpr, BS2: tl.constexpr, NESTED: tl.constexpr, W_DT: tl.constexpr,  # nf4 block / nested block / double quant / weight dtype
+        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, LUT: tl.constexpr,  # tile M / N / K, nf4 code select
         MSUB: tl.constexpr,                 # M sub-tiles sharing one decoded weight tile
     ):
         pid = tl.program_id(0)

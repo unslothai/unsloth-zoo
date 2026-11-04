@@ -846,6 +846,82 @@ def _manual_grouped_mm(
 
 if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
     _manual_grouped_mm = torch.compiler.disable(_manual_grouped_mm)
+_manual_grouped_mm_eager = _manual_grouped_mm
+
+
+def _manual_grouped_mm_dtype(inputs, weight, autocast_dtype):
+    """The dtype the loop's matmuls return: autocast casts floating operands except float64."""
+    def cast(t):
+        if autocast_dtype is not None and t.is_floating_point() and t.dtype != torch.float64:
+            return autocast_dtype
+        return t.dtype
+    return torch.promote_types(cast(inputs), cast(weight))
+
+
+def _register_manual_grouped_mm_op():
+    """Per-group loop as an opaque custom op so no-grad compiled frames do not graph break; None if unsupported."""
+    if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
+        return None
+    try:
+        return torch.ops.unsloth_zoo.manual_grouped_mm.default
+    except (AttributeError, RuntimeError):
+        pass
+    # The op reads group bounds on the host (a sync), so a CUDA graph must not capture it.
+    tags = {}
+    if hasattr(torch, "Tag") and hasattr(torch.Tag, "cudagraph_unsafe"):
+        import inspect
+        if "tags" in inspect.signature(torch.library.custom_op).parameters:
+            tags = {"tags": (torch.Tag.cudagraph_unsafe,)}
+    try:
+        @torch.library.custom_op("unsloth_zoo::manual_grouped_mm", mutates_args = (), **tags)
+        def manual_grouped_mm(
+            inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor, autocast_dtype: Optional[torch.dtype],
+        ) -> torch.Tensor:
+            ctx = (
+                torch.autocast(inputs.device.type, dtype = autocast_dtype)
+                if autocast_dtype is not None else contextlib.nullcontext()
+            )
+            with torch.no_grad(), ctx:
+                out = _grouped_matmul_loop(inputs, weight, offsets)
+                if out.shape[0] != inputs.shape[0]:  # rows past the last group: zero, as torch._grouped_mm
+                    out = torch.cat((out, out.new_zeros((inputs.shape[0] - out.shape[0], out.shape[1]))))
+            # All-empty groups run no matmul; match the fake's dtype.
+            return out.to(_manual_grouped_mm_dtype(inputs, weight, autocast_dtype))
+
+        @manual_grouped_mm.register_fake
+        def _(inputs, weight, offsets, autocast_dtype):
+            dtype = _manual_grouped_mm_dtype(inputs, weight, autocast_dtype)
+            return inputs.new_empty((inputs.shape[0], weight.shape[-1]), dtype = dtype)
+
+        return torch.ops.unsloth_zoo.manual_grouped_mm.default
+    except Exception:
+        return None
+
+
+_MANUAL_GROUPED_MM_OP = _register_manual_grouped_mm_op()
+
+
+def _autocast_dtype(device_type):
+    try:
+        if torch.is_autocast_enabled(device_type):
+            return torch.get_autocast_dtype(device_type)
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    return None
+
+
+def _manual_grouped_mm(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """Compiled no-grad calls use the opaque op; others use the eager loop, whose ctx-held routing list (not a tensor)
+    survives non-reentrant checkpoint replay, so rerouting still raises."""
+    if (
+        _MANUAL_GROUPED_MM_OP is not None
+        and torch.compiler.is_compiling()
+        and not (torch.is_grad_enabled() and (inputs.requires_grad or weight.requires_grad))
+    ):
+        if inputs.shape[0] == 0:  # eager keeps the input dtype
+            return inputs.new_empty((0, weight.shape[-1]))
+        return _MANUAL_GROUPED_MM_OP(inputs, weight, offsets, _autocast_dtype(inputs.device.type))
+    return _manual_grouped_mm_eager(inputs, weight, offsets)
 
 
 # Recomputes the frozen base expert GEMM in backward by rebuilding the bf16 stack from 4-bit Params4bit (dX only; LoRA
@@ -2393,6 +2469,20 @@ def _fused_moe_activation(module, gate_up, interleaved, allow_gptoss = True):
 # Separated LoRA helpers.
 
 
+def _active_lora_adapter_names(wrapper) -> Optional[list]:
+    """Active adapters holding LoRA here, in PEFT order; None if the wrapper does not track active adapters."""
+    try:
+        active = wrapper.active_adapters
+    except Exception:
+        return None
+    if isinstance(active, str):
+        active = [active]
+    if not isinstance(active, (list, tuple)):
+        return None
+    lora_A = wrapper.lora_A
+    return [name for name in active if name in lora_A]
+
+
 def _has_lora_adapters(param) -> bool:
     """Check for active LoRA adapters (PEFT ParamWrapper)."""
     if not hasattr(param, "lora_A") or not hasattr(param, "lora_B"):
@@ -2401,7 +2491,10 @@ def _has_lora_adapters(param) -> bool:
         return False
     if hasattr(param, "merged") and param.merged:
         return False
-    return len(param.lora_A) > 0
+    if len(param.lora_A) == 0:
+        return False
+    active = _active_lora_adapter_names(param)
+    return active is None or len(active) > 0
 
 
 # Fused expert lora_B: expert-fastest, reshape(out, r, E), so column j is expert j % E (lora_A is expert-slowest,
@@ -2766,10 +2859,9 @@ def extract_moe_lora_weights_for_grouped_mm(
 
 
 def _extract_lora_from_wrapper(
-    wrapper, adapter_name: str = "default", experts_module=None
+    wrapper, adapter_name: Optional[str] = None, experts_module=None
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float, int]]:
-    """Returns (first_weight, second_weight, scaling, num_experts) or None; PEFT lora_A is (E*R, in) and lora_B (out,
-    E*R), handling standard and transposed base layouts."""
+    """Returns (first_weight, second_weight, scaling, num_experts) or None. adapter_name None = the active adapters."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     try:
@@ -2784,8 +2876,26 @@ def _extract_lora_from_wrapper(
         if not wrapper.lora_A:
             return None
 
+        if adapter_name is None:
+            active = _active_lora_adapter_names(wrapper)
+            if active is None:
+                adapter_name = "default" if "default" in wrapper.lora_A else next(iter(wrapper.lora_A.keys()))
+            elif len(active) == 0:
+                # An adapter that does not target this parameter contributes nothing (as in PEFT).
+                return None
+            elif len(active) == 1:
+                adapter_name = active[0]
+            else:
+                terms = []
+                for name in active:
+                    term = _extract_lora_from_wrapper(wrapper, name, experts_module=experts_module)
+                    if term is None:
+                        return None
+                    terms.append(term)
+                return _combine_moe_lora_terms(terms)
+
         if adapter_name not in wrapper.lora_A:
-            adapter_name = list(wrapper.lora_A.keys())[0]
+            return None
 
         lora_A_module = wrapper.lora_A[adapter_name]
         lora_B_module = wrapper.lora_B[adapter_name]
@@ -2813,15 +2923,45 @@ def _extract_lora_from_wrapper(
             experts_module=experts_module,
             model_name="MoE",
         )
-    except MoELoRABLayoutError:
-        # A misspelled UNSLOTH_MOE_LORA_B_LAYOUT must not read as "no adapter here".
+    except (MoELoRABLayoutError, MoELoRAMultiAdapterError):
+        # Must not read as "no adapter here".
         raise
     except Exception:
         return None
 
 
+class MoELoRAMultiAdapterError(NotImplementedError):
+    """Several active adapters on one expert parameter cannot be summed."""
+
+
+def _combine_moe_lora_terms(terms):
+    """Sum active adapters by concatenating ranks with scaling folded into B; raise rather than drop one."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if len(terms) == 1:
+        return terms[0]
+    firsts, seconds = [], []
+    for term in terms:
+        first, second, scaling = term[0], term[1], term[2]
+        if (
+            not isinstance(first, torch.Tensor) or not isinstance(second, torch.Tensor)
+            or first.dim() != 3 or second.dim() != 3 or first.shape[2] != second.shape[1]
+            or first.shape[:2] != terms[0][0].shape[:2] or second.shape[0] != terms[0][1].shape[0]
+            or second.shape[2] != terms[0][1].shape[2]
+        ):
+            raise MoELoRAMultiAdapterError(
+                "Unsloth: several active adapters on one MoE expert parameter need per-expert LoRA factors of matching "
+                "shapes; activate one adapter at a time, or set UNSLOTH_MOE_LORA_MERGED=1."
+            )
+        firsts.append(first)
+        seconds.append(second * scaling)
+    result = [torch.cat(firsts, dim = 2), torch.cat(seconds, dim = 1), 1.0]
+    result.extend(terms[0][3:])
+    return tuple(result)
+
+
 def _extract_lora_weights(
-    param, adapter_name: str = "default", num_experts: int = None, experts_module=None
+    param, adapter_name: Optional[str] = None, num_experts: int = None, experts_module=None
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
     """Compat wrapper around _extract_lora_from_wrapper; returns (first, second, scaling)."""
     # This Unsloth Zoo code section is licensed under AGPL3
@@ -4026,6 +4166,11 @@ def _patched_param_wrapper_forward(
         if self.merged:
             return immediate_base_layer(x, *args, **kwargs)
 
+        # No active adapter targets this parameter: base only.
+        active = _active_lora_adapter_names(self)
+        if active is not None and len(active) == 0:
+            return immediate_base_layer(x, *args, **kwargs)
+
         # Ensure wrapper.num_experts is set for LoRA weight reshaping.
         if not hasattr(self, "num_experts"):
             if hasattr(experts_module, "num_experts"):
@@ -4089,7 +4234,9 @@ def _patched_param_wrapper_forward(
 
         # Extract LoRA for this parameter and stash on the experts module
         # (not base_layer): _unsloth_lora_gate_up_proj / _unsloth_lora_down_proj.
-        lora_data = _extract_lora_from_wrapper(self)
+        lora_data = _extract_lora_from_wrapper(
+            self, active[0] if active is not None and len(active) == 1 else None
+        )
 
         if lora_data is not None and param_name:
             lora_attr = moe_lora_stash_name(param_name)
@@ -4805,16 +4952,15 @@ def _read_adapter_config(model_id, kwargs):
         return json.load(f)
 
 
-def _patched_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs):
-    """Runs PEFT load_adapter, then repacks pre-2026.9.6 fused expert lora_B to rank_major so forward, merge and next
-    save agree (unsloth issue 6930); an explicit UNSLOTH_MOE_LORA_B_LAYOUT skips this."""
+def repack_legacy_lora_b_after_load(model, model_id, adapter_name, hub_kwargs) -> int:
+    """Repack pre-2026.9.6 fused expert lora_B to rank_major per the adapter_config.json marker (unsloth issue 6930);
+    every adapter load path must call it. Explicit UNSLOTH_MOE_LORA_B_LAYOUT skips. Returns tensors moved."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    result = _original_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs)
-    if os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") or not _has_fused_expert_lora(self, adapter_name):
-        return result
+    if os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") or model_id is None or not _has_fused_expert_lora(model, adapter_name):
+        return 0
     try:
-        converted = convert_legacy_lora_b(self, adapter_name, _read_adapter_config(model_id, kwargs))
+        converted = convert_legacy_lora_b(model, adapter_name, _read_adapter_config(model_id, hub_kwargs))
     except Exception as exception:
         converted = 0
         logger = _moe_utils_logger()
@@ -4831,6 +4977,14 @@ def _patched_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwar
             f"Save it again to update the file (UNSLOTH_MOE_LORA_B_LAYOUT=rank_major loads "
             f"it unchanged)."
         )
+    return converted
+
+
+def _patched_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs):
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    result = _original_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs)
+    repack_legacy_lora_b_after_load(self, model_id, adapter_name, kwargs)
     return result
 
 
