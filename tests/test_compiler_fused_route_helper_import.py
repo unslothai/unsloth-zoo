@@ -114,7 +114,6 @@ def test_compiled_gpt_oss_router_forward_runs(compile_location, monkeypatch):
 
 
 def test_gpt_oss_router_forward_no_version_call_during_eval(monkeypatch):
-    """Verify GptOssTopKRouter.forward does not invoke Version() in forward."""
     from unsloth_zoo.temporary_patches import gpt_oss
 
     config = SimpleNamespace(
