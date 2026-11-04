@@ -143,3 +143,25 @@ def test_gpt_oss_router_v5_flag_matches_installed_transformers():
 
     expected = PkgVersion(version("transformers")).release[0] >= 5
     assert gpt_oss._IS_TRANSFORMERS_V5 is expected
+
+
+def test_version_under_compile_keeps_regex_cache():
+    # Version pattern in re._cache but evicted from re._cache2: the state torch 2.11 mis-replayed.
+    import re
+    from unsloth_zoo.utils import Version
+
+    def fn(x):
+        return x + 1 if Version("5.0.0") >= Version("4.0.0") else x
+
+    pattern = r"[0-9]+(?:\.[0-9]+)*"
+    re.purge()
+    re.match(r"^[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$", "x")
+    re.match(pattern, "1")
+    for i in range(300):
+        re.compile(f"version_cache_filler_{i}_z")
+    torch._dynamo.reset()
+    compiled = torch.compile(fn, backend = "eager", dynamic = True)
+    compiled(torch.ones(2))
+    compiled(torch.ones(3))
+    assert re.match(pattern, "5.0.0").group(0) == "5.0.0"
+    assert str(Version("5.0.0")) == "5.0.0"
