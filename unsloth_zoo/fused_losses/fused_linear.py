@@ -718,7 +718,9 @@ if _HAS_TRITON:
             a = tl.load(acc_ptr + row * acc_stride + ho, mask = ok, other = 0.0)
             tl.store(u_ptr + out * u_stride + ho, (ct * w - a * r).to(u_ptr.dtype.element_ty), mask = ok)
 
-    @triton.jit(do_not_specialize = ("n",))
+    # n stays specialised: it masks the contiguous axis, and without the % 16 hint the loads and stores
+    # lose vectorisation (3-4.5x slower on A100 / RTX PRO 6000). At most 2 variants.
+    @triton.jit
     def _fl_scale_kernel(x_ptr, g_ptr, out_ptr, n, cols, PER_ROW: tl.constexpr, BLOCK: tl.constexpr):  # per-row grad vs scalar / elements per program
         offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         ok = offs < n

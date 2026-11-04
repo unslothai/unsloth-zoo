@@ -19,7 +19,6 @@ CASES = {
         "_fl_combine_kernel": ("n_rows", "stride_k"),
         "_fl_flash_p_kernel": ("n_rows", "split0", "stride_k"),
         "_fl_flash_u_kernel": ("n_rows", "stride_k"),
-        "_fl_scale_kernel": ("n",),
     },
     "merged_rollout_exact.py": {"_exact_merge_kernel": ("mode",)},
     "temporary_patches/gdn_causal_conv1d.py": {
@@ -29,6 +28,9 @@ CASES = {
     },
     "temporary_patches/moe_fused_swiglu.py": {"_swiglu_fwd_kernel": ("M",), "_swiglu_bwd_kernel": ("M",)},
 }
+
+# Sizes that must keep Triton's % 16 hint: they mask a contiguous axis, so dropping it loses vectorised loads.
+KEEP_SPECIALIZED = {"fused_losses/fused_linear.py": {"_fl_scale_kernel": ("n",)}}
 
 
 def _defs(path):
@@ -57,3 +59,12 @@ def test_runtime_sizes_are_not_specialized(rel):
             ann = params[arg].annotation
             assert ann is None or "constexpr" not in ast.unparse(ann), (name, arg)
             assert arg in dns, (name, arg, sorted(dns))
+
+
+@pytest.mark.parametrize("rel", sorted(KEEP_SPECIALIZED))
+def test_vectorised_sizes_keep_their_hint(rel):
+    defs = _defs(ZOO / rel)
+    for name, args in KEEP_SPECIALIZED[rel].items():
+        dns = _do_not_specialize(defs[name])
+        for arg in args:
+            assert arg not in dns, (name, arg)
