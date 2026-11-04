@@ -3640,6 +3640,54 @@ def test_grpo_loss_and_metrics_leave_out_truncated_rows():
     assert np.allclose(np.array(completion_logps(Model(), batch, 0.7)), expected, atol=1e-5)
 
 
+def _dense_scorer(model, batch, supervised, indices=None, *, logit_sums):
+    """The CCE scorer's contract on the logits: zero outside supervised, and outside indices when given."""
+    import mlx.core as mx
+    from unsloth_zoo.mlx.grpo import completion_logps
+    from unsloth_zoo.mlx.preference import _scatter_rows
+    _dense_scorer.calls.append(indices is not None)
+    flat = (-completion_logps(model, batch, 1.0) * supervised).reshape(-1)
+    flat = flat if indices is None else _scatter_rows(mx.take(flat, mx.maximum(indices, 0)), indices, flat.shape[0])
+    return flat.reshape(supervised.shape), None
+
+
+def _grpo_window(monkeypatch, objective, rewards, *, iterations=1, compact=False, sizes=(4, 17, 30, 43), **plan):
+    """One generation's micro-step batches, the summed loss, gradient in the logit scale and stats of some, and the plan."""
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan, make_grpo_loss_fn
+    model = type("Model", (), {"scale": 1.0, "__call__": lambda self, ids: ids.astype(mx.float32)[..., None] * mx.arange(16).astype(mx.float32) * 0.01 * self.scale})()  # noqa: E501
+    reference = types.SimpleNamespace(forward=lambda model, batch, lengths, *, response_scorer: response_scorer(model, batch, lengths) - 0.1)  # noqa: E501
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, defaults=None: [types.SimpleNamespace(token_ids=[3 + row % 5] * sizes[row % len(sizes)], finish_reason="length") for row in range(len(requests))])  # noqa: E501
+    plan = create_grpo_batch_plan([{"prompt": "a" * n} for n in (130, 170, 120, 150)], DecodingTokenizer(), **{"num_generations": 2, "batch_size": 2, "steps_per_generation": 2, "num_iterations": iterations, "grad_accum": 2, "sampling": GRPOSampling(max_tokens=60), "max_seq_length": 256, "with_reference": objective.beta != 0, "shuffle": False, "num_batches": 8, **plan})  # noqa: E501
+    plan.configure_cce_compaction(compact)
+    _dense_scorer.calls = []
+    plan.bind(model, [lambda completion_ids, **_: rewards[:len(completion_ids)]], reference_policy=reference, scorer=_dense_scorer, trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
+    batches, loss_fn = [plan[index] for index in range(plan._repeats)], make_grpo_loss_fn(objective, scorer=_dense_scorer)
+
+    def score(chosen):
+        window = lambda scale: setattr(model, "scale", scale) or sum(loss_fn(model, *batch)[0] for batch in chosen)  # noqa: E731
+        loss = window(mx.array(1.3))
+        stats = sum(loss_fn(model, *batch)[2] for batch in chosen)
+        return [np.array(value) for value in (loss, mx.grad(window)(mx.array(1.3)), stats)]
+
+    return batches, score, plan
+
+
+@pytest.mark.parametrize("loss_type", ["grpo", "bnpo", "dr_grpo", "dapo"])
+@pytest.mark.parametrize("beta,iterations", [(0.0, 1), (0.04, 2)])
+def test_grpo_cce_compaction_matches_the_full_head(monkeypatch, loss_type, beta, iterations):
+    # Catches indices that drop or shift a completion position, and old or reference log-probs scored without them.
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOObjective
+    run = lambda compact: _grpo_window(monkeypatch, GRPOObjective(loss_type, beta, max_completion_length=60), [0.0, 1.0, 3.0, 1.0], iterations=iterations, compact=compact)  # noqa: E501, E731
+    (full, score, _), (compact, compacted, _) = run(False), run(True)
+    assert all(len(batch) == 7 for batch in full) and all(batch[7].shape == (256,) for batch in compact)
+    assert all(_dense_scorer.calls) and bool(_dense_scorer.calls) == (beta != 0)  # old and reference log-probs, scored when generated  # noqa: E501
+    assert all(np.allclose(got, want, rtol=1e-6) for got, want in zip(compacted(compact), score(full)))  # noqa: E501
+
+
 def test_grpo_reward_models_are_scored_as_trl_scores_them(monkeypatch):
     import numpy as np
     import torch

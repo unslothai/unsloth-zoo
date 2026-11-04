@@ -205,25 +205,45 @@ def completion_logps(model, batch, temperature):
 
 
 def grpo_logps(temperature, scorer=None):
-    """(model, batch, lengths) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature; scores response positions only, zero elsewhere."""
+    """(model, batch, lengths, indices=None) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature over the flat positions in indices; zero outside the response."""
     if scorer is None:
-        return lambda model, batch, _lengths: completion_logps(model, batch, temperature)
+        return lambda model, batch, _lengths, _indices=None: completion_logps(model, batch, temperature)
 
-    def logps(model, batch, lengths):
+    def logps(model, batch, lengths, indices=None):
         supervised = _response_mask(_preference_ids(batch)[:, 1:], lengths) > 0
-        return -scorer(model, batch, supervised, logit_sums=False)[0]
+        if indices is None:
+            return -scorer(model, batch, supervised, logit_sums=False)[0]
+        return -scorer(model, batch, supervised, indices, logit_sums=False)[0]
 
     return logps
+
+
+def grpo_cce_capacity(rows, width, min_prompt, max_completion):
+    """Most completion positions a micro-batch at width holds, rounded up to 256 (a pure function of the shape, so no new compile key); None when that saves nothing."""
+    count = rows * max(0, min(width - min_prompt, max_completion))
+    capacity = max(256, -(-count // 256) * 256)
+    return capacity if capacity < rows * (width - 1) else None
+
+
+def grpo_cce_indices(lengths, width, capacity):
+    """Flat ``rows * (width - 1)`` positions predicting completion tokens, padded with -1."""
+    selected = [
+        row * (width - 1) + step - 1
+        for row, (prompt, end) in enumerate(lengths) for step in range(max(1, int(prompt)), int(end))
+    ]
+    indices = np.full(capacity, -1, dtype=np.int32)
+    indices[:len(selected)] = selected
+    return indices
 
 
 def _scored_as_step(logps, step_compiled):
     """Score as the training step's forward, which MLX runs differently under its trace."""
 
-    def traced(model, batch, lengths):
+    def traced(model, batch, lengths, indices=None):
         if step_compiled():
-            run = lambda anchor: (anchor, logps(model, batch, lengths))
+            run = lambda anchor: (anchor, logps(model, batch, lengths, indices))
             return mx.value_and_grad(run)(mx.array(0.0))[0][1]
-        run = lambda: (mx.array(0.0), logps(model, batch, lengths))
+        run = lambda: (mx.array(0.0), logps(model, batch, lengths, indices))
         return nn.value_and_grad(model, run)()[0][1]
 
     return traced
@@ -305,11 +325,11 @@ def grpo_metric_values(summed):
 
 
 def make_grpo_loss_fn(objective, *, scorer=None):
-    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps); kept zeroes rows TRL masks as truncated."""
+    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps, cce_indices); kept zeroes rows TRL masks as truncated."""
     logps = grpo_logps(objective.temperature, scorer)
 
-    def loss_fn(model, batch, lengths, normalizers, advantages, kept, old=None, ref=None):
-        new = logps(model, batch, lengths)
+    def loss_fn(model, batch, lengths, normalizers, advantages, kept, old=None, ref=None, cce_indices=None):
+        new = logps(model, batch, lengths, cce_indices)
         mask = _response_mask(_preference_ids(batch)[:, 1:], lengths) * kept[:, None].astype(mx.float32)
         per_token, kl, coef_1 = grpo_terms(objective, new, advantages, mask, old=old, ref=ref)
         loss = _reduce(objective, per_token, mask, normalizers)
@@ -319,7 +339,7 @@ def make_grpo_loss_fn(objective, *, scorer=None):
     loss_fn._unsloth_preference_metrics = GRPO_LOSS_METRICS
     loss_fn._unsloth_preference_stats_width = GRPO_STATS_WIDTH
     loss_fn._unsloth_preference_report = grpo_metric_values
-    loss_fn._unsloth_cce_compaction = False
+    loss_fn._unsloth_cce_compaction = bool(getattr(scorer, "compaction", False))
     loss_fn._unsloth_grpo_scorer = scorer
     if scorer is not None:
         loss_fn._unsloth_cce_backend = "runtime-cce"
@@ -661,6 +681,7 @@ class GRPOBatchPlan:
         self._current = None
         self._model = None
         self._shape_plan = None
+        self._cce_bounds = None
         self._metrics = {}
         self.completions = None
 
@@ -746,16 +767,27 @@ class GRPOBatchPlan:
             return mx.array(batch)
         return _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
 
+    def configure_cce_compaction(self, enabled=True):
+        self._cce_bounds = (min(map(len, self._prompt_ids)), max(self._max_tokens)) if enabled else None
+
+    def prepare_cce_batch(self, index, batch):
+        """Every fetch, an eager refetch included, already carries the indices old and reference log-probs were scored with."""
+        return batch
+
+    def _cce_indices(self, lengths, width):
+        if self._cce_bounds is None:
+            return None
+        capacity = grpo_cce_capacity(len(lengths), width, *self._cce_bounds)
+        return None if capacity is None else mx.array(grpo_cce_indices(lengths, width, capacity))
+
     def _score(self, scorer, sequences, prompt_lengths, media):
         values = []
         for start in range(0, len(sequences), self.batch_size):
             chunk = sequences[start:start + self.batch_size]
-            batch, lengths = self._pack(
-                chunk, prompt_lengths[start:start + self.batch_size],
-                self._planned(self._width(max(len(sequence) for sequence in chunk))),
-            )
+            width = self._planned(self._width(max(len(sequence) for sequence in chunk)))
+            batch, lengths = self._pack(chunk, prompt_lengths[start:start + self.batch_size], width)
             inputs = self._inputs(batch, lengths, None if media is None else media[start:start + self.batch_size])
-            logps = np.array(scorer(inputs, mx.array(lengths)), dtype=np.float32)
+            logps = np.array(scorer(inputs, mx.array(lengths), self._cce_indices(lengths, width)), dtype=np.float32)
             values.extend(logps[row, :len(sequence) - 1] for row, sequence in enumerate(chunk))
         return values
 
@@ -845,13 +877,14 @@ class GRPOBatchPlan:
         old = ref = None
         if self.with_old_logps:
             old = self._score(
-                lambda batch, lengths: mx.stop_gradient(self._logps(self._model, batch, lengths)),
+                lambda batch, lengths, indices: mx.stop_gradient(self._logps(self._model, batch, lengths, indices)),
                 sequences, prompt_lengths, media,
             )
         if self.with_reference:
             ref = self._score(
-                lambda batch, lengths: self._reference_policy.forward(
-                    self._model, batch, lengths, response_scorer=self._logps,
+                lambda batch, lengths, indices: self._reference_policy.forward(
+                    self._model, batch, lengths,
+                    response_scorer=lambda model, batch, lengths: self._logps(model, batch, lengths, indices),
                 ),
                 sequences, prompt_lengths, media,
             )
@@ -928,13 +961,15 @@ class GRPOBatchPlan:
             return mx.array(table)
 
         media = None if generation.media is None else generation.media[position:position + self.batch_size]
-        return (
+        materialized = (
             self._inputs(batch, lengths, media), mx.array(lengths),
             mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),
             held(generation.old), held(generation.ref),
         )
+        indices = self._cce_indices(lengths, width)
+        return materialized if indices is None else (*materialized, indices)
 
     def __getitem__(self, index):
         return self.materialize(index)

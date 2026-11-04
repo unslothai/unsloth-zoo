@@ -6143,6 +6143,8 @@ class MLXTrainer:
                 batches.configure_cce_compaction(
                     getattr(loss_fn, "_unsloth_cce_compaction", False), kind=preference_kind,
                 )
+            elif isinstance(batches, GRPOBatchPlan):
+                batches.configure_cce_compaction(getattr(loss_fn, "_unsloth_cce_compaction", False))
         # GRPO scores its reference when it generates, outside the compiled step.
         _reference_compile_state = (
             [] if _sampling_reference is None or preference_kind == "grpo"
