@@ -2,10 +2,13 @@
 gradient-driven progress and adapter saving across grad-clip paths, decoupled weight decay, batching, CCE and
 baseline losses."""
 
+import contextlib
 import glob
+import importlib
 import json
 import os
 
+import numpy as np
 import pytest
 
 try:
@@ -3864,3 +3867,109 @@ def test_xing4_0_checkpointed_layers_compile(monkeypatch, request):
     for (name, a), (_, b) in zip(tree_flatten(actual_grad), tree_flatten(expected_grad)):
         assert float(mx.abs(b).max()) > 0, name
         assert mx.allclose(a, b, atol=1e-5, rtol=1e-3).item(), name
+
+
+# Padding-free text SFT matches padded logits, losses and LoRA gradients (fp32, tiny models) and keeps rows apart.
+_PF_COMMON = dict(  # from_dict keeps each family's own fields
+    hidden_size=64, num_hidden_layers=2, intermediate_size=96, num_attention_heads=4, num_key_value_heads=2,
+    head_dim=16, rms_norm_eps=1e-5, vocab_size=97, tie_word_embeddings=False, rope_theta=1e4,
+    max_position_embeddings=512, sliding_window=8, sliding_window_pattern=2, query_pre_attn_scalar=16,
+    linear_num_value_heads=4, linear_num_key_heads=2, linear_key_head_dim=16, linear_value_head_dim=16,
+    linear_conv_kernel_dim=4, num_experts=0, num_experts_per_tok=1, decoder_sparse_step=1,
+    shared_expert_intermediate_size=0, mlp_only_layers=[], moe_intermediate_size=0,
+    partial_rotary_factor=0.5, full_attention_interval=2)
+_PF_LENGTHS = [40, 9, 23, 3]  # row 0 fills the 39-slot span; 74 real tokens, flat capacity 128 of 156 slots
+
+
+def _pf_model(family, lora=False):
+    from mlx_lm.tuner.utils import linear_to_lora_layers
+
+    module = importlib.import_module(f"mlx_lm.models.{family}")
+    mx.random.seed(0)
+    model = module.Model(module.ModelArgs.from_dict({**_PF_COMMON, "model_type": family})).train()
+    if lora:
+        model.freeze()
+        linear_to_lora_layers(model, 2, {"rank": 4, "scale": 2.0, "dropout": 0.0})
+        model.update(tree_map(lambda p: 0.05 * mx.random.normal(p.shape), model.trainable_parameters()))
+    return model
+
+
+def _pf_batches(lengths, labeled=False, shift=0, shifted_row=0):
+    rng, rows = np.random.default_rng(0), []
+    for i, n in enumerate(lengths):
+        ids = (rng.integers(0, 96, n) + (shift if i == shifted_row else 0)) % 96 + 1
+        labels = tuple(np.where(np.arange(n) < 2 * n // 3, -100, ids).tolist()) if labeled else None
+        rows.append(mlx_utils._FiniteTextRow(tuple(ids.tolist()), 5 if i == 1 and not labeled else 0, labels))
+    plan = mlx_utils.FiniteTextBatchPlan(rows, [tuple(range(len(rows)))], max_seq_length=256, pad_id=0)
+    plan.configure_cce_compaction(labeled)
+    assert plan.configure_padding_free() == (1, 1)
+    return plan[0], plan.prepare_cce_batch(0, plan[0])
+
+
+@contextlib.contextmanager
+def _pf_training(model):
+    classes = mlx_utils.install_padding_free(model)
+    mlx_utils.acquire_mlx_training_patches()
+    mlx_utils.apply_gradient_checkpointing(model)
+    try:
+        yield
+    finally:
+        mlx_utils.remove_gradient_checkpointing(model)
+        mlx_utils.release_mlx_training_patches()
+        mlx_utils.remove_padding_free(classes)
+
+
+def _pf_flat_logits(model, flat):
+    with mlx_utils._padding_free_scope(mlx_utils._padding_free_layout(*flat[-1])):
+        return model(flat[0][:, :-1])[0]
+
+
+@metal_only
+@pytest.mark.parametrize("family", ["llama", "qwen3", "gemma3_text", "qwen3_next"])
+def test_padding_free_matches_padded_logits_loss_and_lora_grads(family):
+    model = _pf_model(family, lora=True)
+    padded, flat = _pf_batches(_PF_LENGTHS)
+    loss_fn = mlx_utils.make_padding_free_loss_fn(mlx_utils.make_baseline_loss_fn())
+    params = model.trainable_parameters()
+
+    def step(batch):  # compiled like training; tracing leaves traced parameters on the model
+        out = mx.compile(lambda b: nn.value_and_grad(model, loss_fn)(model, *b))(batch)
+        mx.eval(out)
+        model.update(params)
+        return out
+
+    with _pf_training(model):
+        ref, real = model(padded[0][:, :-1]).reshape(-1, 97)[flat[-1][0]], int(flat[1][0, 1].item()) - 1
+        assert mx.abs(_pf_flat_logits(model, flat)[:real] - ref[:real]).max().item() < 1e-5
+        ((ref_loss, ref_n), ref_grads), ((loss, n), grads) = step(padded), step(flat)
+    assert n.item() == ref_n.item() > 0 and abs(loss.item() - ref_loss.item()) < 1e-5
+    ref_grads = dict(tree_flatten(ref_grads))
+    for name, grad in tree_flatten(grads):
+        assert mx.allclose(grad, ref_grads[name], rtol=1e-4, atol=1e-5).item(), name
+
+
+@metal_only
+def test_cce_compaction_indexes_the_flat_stream():
+    model = _pf_model("llama")
+    padded, flat = _pf_batches([159, 90, 80, 70, 60, 50, 40, 30], labeled=True)
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    assert len(flat) == 5 and loss_fn._unsloth_cce_backend == "runtime-cce"  # flat CCE indices present
+    with _pf_training(model):
+        (ref_loss, ref_n), (loss, n) = (loss_fn(model, *padded),
+                                        mlx_utils.make_padding_free_loss_fn(loss_fn)(model, *flat))
+    assert n.item() == ref_n.item() > 0 and abs(loss.item() - ref_loss.item()) < 1e-5
+
+
+@metal_only
+@pytest.mark.parametrize("family", ["llama", "qwen3_next"])
+def test_rows_stay_independent_in_the_flat_stream(family, monkeypatch):
+    model = _pf_model(family)
+
+    def leak(row, kept):  # rows sit at flat 0:39, 39:48, 48:71, 71:74; only `row`'s tokens differ
+        a, b = (_pf_flat_logits(model, _pf_batches(_PF_LENGTHS, shift=s, shifted_row=row)[1])[kept] for s in (0, 7))
+        return mx.abs(a - b).max().item()
+
+    with _pf_training(model):  # backwards, only a slot collision can leak (row 1 into row 0's last token)
+        assert leak(0, slice(39, 74)) < 1e-6 and leak(1, slice(0, 39)) < 1e-6
+        monkeypatch.setattr(mlx_utils, "_padding_free_mixer_forward", lambda orig, m, x, _, a, k: orig(m, x, *a, **k))
+        assert leak(0, slice(39, 74)) > 1e-3

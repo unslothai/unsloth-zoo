@@ -588,6 +588,9 @@ from .utils import (
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    install_padding_free,
+    remove_padding_free,
+    make_padding_free_loss_fn,
     _get_transformer_layers,
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
@@ -1432,6 +1435,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "group_by_length",
     "length_sorted_microbatches",
     "loss_type",
+    "padding_free",
 )
 
 
@@ -1568,6 +1572,8 @@ class MLXTrainingConfig:
     # SFTConfig.loss_type: "nll" or "dft" (fused CCE text path only); preference and RL configs override its default
     # without kw_only, so the field keeps this positional slot in every subclass.
     loss_type: str = "nll"
+    # TRL SFTConfig.padding_free: text SFT runs per-token modules on the real tokens only; appended LAST.
+    padding_free: bool = False
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -2733,6 +2739,13 @@ class MLXTrainer:
                 "Falling back to packing=False (standard padding)."
             )
             self.args.packing = False
+        # TRL configs may carry None for "unset".
+        self.args.padding_free = bool(getattr(self.args, "padding_free", False))
+        if self.args.padding_free and (self.preference_kind or self._is_vlm):
+            raise NotImplementedError(
+                "Unsloth MLX: padding_free=True is implemented for text SFT only; "
+                "VLM, audio and preference trainers need padding_free=False."
+            )
 
         if (
             not self._is_vlm
@@ -5203,6 +5216,7 @@ class MLXTrainer:
         _training_patches_held = False
         _unfused_projection_modules = []
         _unfused_mrope_modules = []
+        _padding_free_classes = []
         # Save Qwen3-VL vision-block flag so finally restores it (not just False).
         _prev_qwen3_vision_cast = True
         try:
@@ -5496,6 +5510,8 @@ class MLXTrainer:
             # and marks the process as inside a training run.
             acquire_mlx_training_patches()
             _training_patches_held = True
+            if getattr(args, "padding_free", False):
+                _padding_free_classes = install_padding_free(model)
             # Routed by module tree, not model_type: qwen4_exp reuses the Qwen3.5
             # classes under its own name.
             config = getattr(model, "_config", {})
@@ -5578,6 +5594,7 @@ class MLXTrainer:
                     release_mlx_training_patches()
             except Exception:
                 pass
+            remove_padding_free(_padding_free_classes)
             for _module in _unfused_projection_modules:
                 try:
                     _module.fuse_in = True
@@ -5841,6 +5858,20 @@ class MLXTrainer:
         if isinstance(batches, FiniteTextBatchPlan):
             batches.configure_cce_compaction(
                 getattr(loss_fn, "_unsloth_cce_compaction", False),
+            )
+        if getattr(args, "padding_free", False):
+            # Preference trainers were refused in __init__.
+            if (is_vlm or getattr(args, "teacher_model_name_or_path", None)
+                    or distributed_world_size > 1 or not isinstance(batches, FiniteTextBatchPlan)):
+                raise NotImplementedError(
+                    "Unsloth MLX: padding_free=True needs single-process text SFT on a sized "
+                    "dataset; VLM, GKD, distributed and streaming runs need padding_free=False."
+                )
+            _flat_shapes, _all_shapes = batches.configure_padding_free()
+            loss_fn = make_padding_free_loss_fn(loss_fn)
+            _main_print(
+                f"Unsloth: padding-free SFT runs {_flat_shapes} of {_all_shapes} batch shapes on real "
+                "tokens only; the rest stay padded."
             )
         if isinstance(batches, FiniteVLMBatchPlan):
             compaction_report = batches.configure_cce_compaction(
