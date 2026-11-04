@@ -584,6 +584,22 @@ def test_native_window_scope_owns_only_causal_unpadded_masks(fused_attention, mo
     assert [type(layer) for layer in model.layers] == layer_types
 
 
+def test_safe_sdpa_patch_installed_during_training_survives_its_release(monkeypatch):
+    from unsloth_zoo.mlx import compile as patches, utils
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", mx.fast.scaled_dot_product_attention)
+    monkeypatch.setattr(mx.fast, "_unsloth_safe_sdpa_mask_patch", False, raising=False)
+    utils.acquire_mlx_training_patches()
+    try:
+        patches._install_safe_fused_sdpa_mask_patches()
+        safe = mx.fast.scaled_dot_product_attention
+    finally:
+        utils.release_mlx_training_patches()
+    assert mx.fast.scaled_dot_product_attention is safe
+    q = mx.ones((1, 1, 2, 8))
+    out = safe(q, q, q, scale=1.0, mask=mx.array([[-mx.inf, -mx.inf], [0.0, 0.0]]))
+    assert out[0, 0, 0].tolist() == [0.0] * 8
+
+
 @pytest.mark.skipif(nax.nax_available(), reason="NAX fuses these chunks by default")
 def test_long_head_dim_256_prefill_holds_no_scores_and_stays_close_to_fp32(fused_attention):
     q, k, v = _d256_call(512, 8192)
