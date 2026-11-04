@@ -7502,7 +7502,9 @@ _INVARIANT_ATTENTION_CONTRACT = {
     "mlx_vlm.models.qwen3_5.language": {"Qwen3_5Attention.__call__": "f90d80c414d62ac1",
                                         "_qwen3_5_left_padding_info": "ef87537a11cd4671",
                                         "_qwen3_5_left_padded_attention": "df12e7fbee9adf0e"},
-    "mlx_vlm.models.cache": {"BatchKVCache.update_and_fetch": "73901e5b680dfb41", "BatchKVCache.extract": "ff095c4fa939e86a",
+    # mlx-vlm 0.7.12's extract bounds-checks the row and returns an empty cache before the first write; rows slice alike.
+    "mlx_vlm.models.cache": {"BatchKVCache.update_and_fetch": "73901e5b680dfb41",
+                             "BatchKVCache.extract": ("ff095c4fa939e86a", "e98951dd52b8f67c"),
                              "BatchKVCache.make_mask": "5a43f29692bfa568"},
 }
 

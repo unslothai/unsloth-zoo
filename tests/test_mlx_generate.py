@@ -1581,6 +1581,41 @@ def test_a_row_cache_seam_is_read_where_the_release_admits_prompts(tmp_path, met
     assert (generate._row_prefill_surface_gap(module) is None) is open_
 
 
+_EXTRACT_0711 = """\
+class BatchKVCache:
+    def extract(self, idx):
+        cache = KVCache()
+        padding = self.left_padding[idx].item()
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
+        cache.offset = cache.keys.shape[2]
+        return cache
+"""
+# mlx-vlm 0.7.12 bounds-checks the row and returns an empty cache before the first write; rows slice alike.
+_EXTRACT_0712 = _EXTRACT_0711.replace("        padding =", """\
+        batch_size = self.offset.size
+        if idx < 0:
+            idx += batch_size
+        if idx < 0 or idx >= batch_size:
+            raise IndexError("BatchKVCache row index out of range")
+        if self.keys is None:
+            return cache
+        padding =""")
+
+
+@pytest.mark.parametrize("source", [_EXTRACT_0711, _EXTRACT_0712], ids=["0.7.11", "0.7.12"])
+def test_the_row_invariant_attention_contract_takes_each_release_extract(tmp_path, source):
+    from unsloth_zoo.mlx import inference
+
+    path = tmp_path / f"extract_{abs(hash(source))}.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    accepted = inference._INVARIANT_ATTENTION_CONTRACT["mlx_vlm.models.cache"]["BatchKVCache.extract"]
+    assert inference._ast_fingerprint(module.BatchKVCache.extract) in accepted
+
+
 def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
     from unsloth_zoo.mlx.generate import _schedules_prefill
 
