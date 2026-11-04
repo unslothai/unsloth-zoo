@@ -907,12 +907,38 @@ def _omlx_deepseek_v41_quantization(config_data):
     return {**base, **modules}
 
 
-def _ensure_deepseek_v41_omlx_layout(model_type):
-    """Wrap mlx-vlm's deepseek_v41 sanitize to read oQ quants (DSpark stages dropped)."""
-    if model_type != "deepseek_v41":
+def _omlx_deepseek_v41_weights(weights):
+    import mlx.core as mx
+
+    weights = {_omlx_deepseek_v41_name(key): value for key, value in weights.items()}
+    # FP8 Engram table: sanitize packs it only under the source's ``.scale`` name.
+    for key in [key for key in weights if key.endswith(".engram.embed.scales")]:
+        weight = weights.get(key.removesuffix("scales") + "weight")
+        if weight is not None and weight.dtype == mx.uint8:
+            weights[key.removesuffix("s")] = weights.pop(key)
+    return weights
+
+
+def _deepseek_v41_model():
+    from mlx_vlm.models.deepseek_v41.deepseek_v41 import Model
+
+    return Model
+
+
+# Each family omlx converts: the mlx-vlm Model whose sanitize loads it, and the renames it needs first.
+_OMLX_LAYOUTS = {
+    "deepseek_v41": (_deepseek_v41_model, _omlx_deepseek_v41_weights),
+}
+
+
+def _ensure_omlx_layout(model_type):
+    """Wrap mlx-vlm's sanitize for ``model_type`` to read omlx's oQ quants. Their ``language_model.mtp.`` tensors
+    (MTP heads, DSpark stages) stay out of the target."""
+    if model_type not in _OMLX_LAYOUTS:
         return
+    imported, rename = _OMLX_LAYOUTS[model_type]
     try:
-        from mlx_vlm.models.deepseek_v41.deepseek_v41 import Model as model
+        model = imported()
     except Exception:
         return
     if getattr(model.sanitize, "_unsloth_omlx_layout", False):
@@ -920,21 +946,14 @@ def _ensure_deepseek_v41_omlx_layout(model_type):
     original = model.sanitize
 
     def sanitize(self, weights):
-        weights = {
-            _omlx_deepseek_v41_name(key): value for key, value in weights.items()
-            if not key.startswith("language_model.mtp.")
-        }
-        import mlx.core as mx
-
-        # FP8 Engram table: sanitize packs it only under the source's ``.scale`` name.
-        for key in [key for key in weights if key.endswith(".engram.embed.scales")]:
-            weight = weights.get(key.removesuffix("scales") + "weight")
-            if weight is not None and weight.dtype == mx.uint8:
-                weights[key.removesuffix("s")] = weights.pop(key)
-        return original(self, weights)
+        return original(self, rename({key: value for key, value in weights.items() if not key.startswith("language_model.mtp.")}))
 
     sanitize._unsloth_omlx_layout = True
     model.sanitize = sanitize
+
+
+# The name Unsloth Studio releases install the layout by.
+_ensure_deepseek_v41_omlx_layout = _ensure_omlx_layout
 
 
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
@@ -10298,7 +10317,7 @@ class FastMLXModel:
             _ensure_minicpmv4_7_text_positions(model_type)
             _ensure_audio_conv_sanitize(model_type)
             _ensure_qwen3_omni_audio_per_clip(model_type)
-            _ensure_deepseek_v41_omlx_layout(model_type)
+            _ensure_omlx_layout(model_type)
             _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(

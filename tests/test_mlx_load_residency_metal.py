@@ -124,8 +124,11 @@ def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
     from mlx_vlm.models.deepseek_v41.config import ModelConfig
     from mlx_vlm.utils import load_model
     from unsloth_zoo.mlx.loader import (
-        _ensure_deepseek_v41_omlx_layout, _ensure_native_vlm_weight_names, _global_quant_params, _mlx_vlm_config_override_data,
+        _ensure_deepseek_v41_omlx_layout, _ensure_native_vlm_weight_names, _ensure_omlx_layout, _global_quant_params,
+        _mlx_vlm_config_override_data,
     )
+
+    assert _ensure_deepseek_v41_omlx_layout is _ensure_omlx_layout  # as Unsloth Studio releases install it
 
     text = dict(vocab_size = 512, hidden_size = 256, moe_intermediate_size = 128, num_hidden_layers = 4, num_attention_heads = 4,
                 head_dim = 64, qk_rope_head_dim = 32, q_lora_rank = 128, o_lora_rank = 64, o_groups = 2, n_routed_experts = 8,
@@ -180,7 +183,7 @@ def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
     experts = {"group_size": 32, "bits": 4, "mode": "mxfp4"} if mxfp else {"group_size": 64, "bits": 2, "mode": "affine"}
     assert _global_quant_params(config["quantization"]) == experts
     (tmp_path / "config.json").write_text(json.dumps(config))
-    _ensure_deepseek_v41_omlx_layout("deepseek_v41")
+    _ensure_omlx_layout("deepseek_v41")
     _ensure_native_vlm_weight_names("deepseek_v41")
     loaded = dict(tree_flatten(load_model(tmp_path).parameters()))
     assert loaded.keys() == params.keys() | {table + name for name in packed}
