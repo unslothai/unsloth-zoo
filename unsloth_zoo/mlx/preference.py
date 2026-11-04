@@ -1294,7 +1294,7 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
         if scorer is not None and reference_policy.model is None:
             mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
             options["response_scorer"] = lambda model, batch, _lengths: -(
-                scorer(model, batch, mask > 0)[0] * mask
+                scorer(model, batch, mask > 0, differentiated=False)[0] * mask
             ).sum(axis=1)
         logps = reference_policy.forward(model, batch, lengths, **options)
         mx.eval(logps)
@@ -2755,13 +2755,17 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
                             bits=getattr(desc.module, "bits", 4),
                             mode=getattr(desc.module, "mode", "affine"))
     frozen = not utils._is_lm_head_trainable(model)
-    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
-                                    quantized=desc.quantized, weight_is_frozen=frozen,
-                                    **quantization)
+    options = dict(ignore_index=-100, logit_softcap=softcap, quantized=desc.quantized,
+                   weight_is_frozen=frozen, **quantization)
+    by_mode, loss_only = utils._runtime_cce_by_mode(**options), utils._get_runtime_cce(**options)
 
-    def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True):
+    def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True,
+              differentiated):
         """Token cross entropy and logit sums per position as float32 grids; cross entropy is zero outside supervised;
-        indices limit the rows, and the sums too unless every_position; without logit_sums the sums are None."""
+        indices limit the rows, and the sums too unless every_position; without logit_sums the sums are None; every call
+        states differentiated, False for a score no gradient reaches, since a training-mode kernel builds the hidden
+        gradient in its forward."""
+        kernel = by_mode(model) if differentiated else loss_only
         targets = _preference_ids(batch)[:, 1:]
         hidden = _preference_hidden(model, batch)
         head = utils._resolve_module_path(model, desc.path)
@@ -2949,7 +2953,7 @@ def _preference_forward(model, batch, supervised):
     return logits, _token_cross_entropy(logits, _preference_ids(batch)[:, 1:], supervised)
 
 
-def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
+def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None, differentiated=True):
     """Unreduced: training normalizes over its window, evaluation over the batch."""
     ids = _preference_ids(batch)
     pairs = ids.shape[0] // 2
@@ -2963,7 +2967,8 @@ def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
     if scorer is None:
         logits, ce = _preference_forward(model, batch, supervised)
     else:
-        ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True)
+        ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True,
+                          differentiated=differentiated)
         logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
         mask.sum(axis=1), mx.array(1.0),
@@ -2983,7 +2988,7 @@ def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
     return nll_sum, nll_tokens, ratio, stats
 
 
-def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=None):
+def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=None, differentiated=True):
     """Unreduced: training normalizes over its window, evaluation over the batch."""
     pairs = lengths.shape[0] // 2
     logits = logit_totals = None
@@ -2991,7 +2996,8 @@ def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=No
     if scorer is None:
         logits, ce = _preference_forward(model, batch, mask)
     else:
-        ce, sums = scorer(model, batch, mask > 0, cce_indices, every_position=True)
+        ce, sums = scorer(model, batch, mask > 0, cce_indices, every_position=True,
+                          differentiated=differentiated)
         logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
     if objective.length_normalized:
@@ -3017,7 +3023,7 @@ def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=No
 
 
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
-                scorer=None, cce_indices=None, reference=None):
+                scorer=None, cce_indices=None, reference=None, differentiated=True):
     """Score one DPO batch; ``reference`` holds precomputed reference log probabilities."""
     pairs = lengths.shape[0] // 2
     logits = logit_totals = None
@@ -3025,7 +3031,7 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
     if scorer is None:
         logits, ce = _preference_forward(model, batch, mask)
     else:
-        ce, sums = scorer(model, batch, mask > 0, cce_indices)
+        ce, sums = scorer(model, batch, mask > 0, cce_indices, differentiated=differentiated)
         logit_totals = _logit_totals(sums, mask, scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
     if reference is not None:
@@ -3034,7 +3040,7 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
         reference = mx.zeros(logps.shape, dtype=logps.dtype)
     elif scorer is not None and reference_policy.model is None:
         def response_scorer(model, batch, _lengths):
-            return -(scorer(model, batch, mask > 0, cce_indices)[0] * mask).sum(axis=1)
+            return -(scorer(model, batch, mask > 0, cce_indices, differentiated=False)[0] * mask).sum(axis=1)
         reference = reference_policy.forward(model, batch, lengths, response_scorer=response_scorer)
     else:
         reference = reference_policy.forward(model, batch, lengths)
@@ -3079,6 +3085,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
         if kind == "orpo":
             nll_sum, nll_tokens, ratio, stats = _orpo_scores(
                 model, batch, lengths, beta, scorer=scorer, cce_indices=cce_indices,
+                differentiated=False,
             )
             loss = (
                 nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
@@ -3087,7 +3094,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
         elif kind == "cpo":
             nll_sum, nll_tokens, pair_loss, stats = _cpo_scores(
                 model, batch, lengths, objective, scorer=scorer,
-                cce_indices=cce_indices,
+                cce_indices=cce_indices, differentiated=False,
             )
             loss = _cpo_loss(
                 objective, nll_sum, nll_tokens, pair_loss, mx.array(pairs),
@@ -3097,6 +3104,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
                 model, batch, lengths, objective,
                 reference_policy=reference_policy,
                 scorer=scorer, cce_indices=cce_indices, reference=reference,
+                differentiated=False,
             )
             loss = _dpo_pair_loss(objective, terms).mean()
         return loss, mx.array(pairs, dtype=mx.int32), stats
@@ -3142,7 +3150,7 @@ def _kto_supervised_tokens(batch_data):
 
 
 def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
-                scorer=None, reference=None, kl_mean=None):
+                scorer=None, reference=None, kl_mean=None, differentiated=True):
     """Per-row weighted losses and the batch's metric sums."""
     rows = labels.shape[0]
     # A vision batch's halves share images only the whole dict carries: one forward.
@@ -3158,7 +3166,7 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
         logits, ce = _preference_forward(model, scored, mask)
         logit_sums = (_row_logit_sum(logits) * positions).sum(axis=1)
     else:
-        ce, sums = scorer(model, scored, mask > 0, every_position=True)
+        ce, sums = scorer(model, scored, mask > 0, every_position=True, differentiated=differentiated)
         logit_sums = (sums * positions).sum(axis=1)
     scored_logps = -(ce * mask).sum(axis=1)
     logps, logit_sums = scored_logps[:rows], logit_sums[:rows]
@@ -3167,7 +3175,7 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
         if scorer is None:
             return _response_logps(model, batch, lengths)
         batch_mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
-        return -(scorer(model, batch, batch_mask > 0)[0] * batch_mask).sum(axis=1)
+        return -(scorer(model, batch, batch_mask > 0, differentiated=False)[0] * batch_mask).sum(axis=1)
 
     if reference is None:
         reference = reference_policy.forward(
@@ -3259,6 +3267,7 @@ def _make_kto_eval_fn(objective, reference_policy, scorer):
         losses, stats = _kto_scores(
             model, batch, lengths, labels, objective,
             reference_policy=reference_policy, scorer=scorer, reference=reference,
+            differentiated=False,
         )
         return losses.mean(), mx.array(labels.shape[0], dtype=mx.int32), stats
 

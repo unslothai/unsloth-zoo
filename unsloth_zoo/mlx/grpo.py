@@ -204,14 +204,14 @@ def completion_logps(model, batch, temperature):
     return -nn.losses.cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
 
 
-def grpo_logps(temperature, scorer=None):
-    """(model, batch, lengths) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature; scores response positions only, zero elsewhere."""
+def grpo_logps(temperature, scorer=None, *, differentiated):
+    """(model, batch, lengths) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature; scores response positions only, zero elsewhere; differentiated=False keeps the scorer on its loss-only kernel."""
     if scorer is None:
         return lambda model, batch, _lengths: completion_logps(model, batch, temperature)
 
     def logps(model, batch, lengths):
         supervised = _response_mask(_preference_ids(batch)[:, 1:], lengths) > 0
-        return -scorer(model, batch, supervised, logit_sums=False)[0]
+        return -scorer(model, batch, supervised, logit_sums=False, differentiated=differentiated)[0]
 
     return logps
 
@@ -304,9 +304,9 @@ def grpo_metric_values(summed):
     return values
 
 
-def make_grpo_loss_fn(objective, *, scorer=None):
+def make_grpo_loss_fn(objective, *, scorer=None, differentiated=True):
     """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps); kept zeroes rows TRL masks as truncated."""
-    logps = grpo_logps(objective.temperature, scorer)
+    logps = grpo_logps(objective.temperature, scorer, differentiated=differentiated)
 
     def loss_fn(model, batch, lengths, normalizers, advantages, kept, old=None, ref=None):
         new = logps(model, batch, lengths)
@@ -336,7 +336,7 @@ def make_grpo_cce_loss_fn(model, objective):
 
 def make_grpo_eval_fn(objective, *, scorer=None):
     """The GRPO loss of one eval batch, weighted by its rows as HF's ``eval_loss``."""
-    loss_fn = make_grpo_loss_fn(objective, scorer=scorer)
+    loss_fn = make_grpo_loss_fn(objective, scorer=scorer, differentiated=False)
 
     def eval_fn(model, batch, *rest):
         loss, _, stats = loss_fn(model, batch, *rest)
@@ -698,7 +698,7 @@ class GRPOBatchPlan:
         self._trainer_state = trainer_state
         self._rollout_context = rollout_context or nullcontext
         self._keep_completions = keep_completions
-        self._logps = grpo_logps(self.score_temperature, scorer)
+        self._logps = grpo_logps(self.score_temperature, scorer, differentiated=False)
         if step_compiled is not None:
             self._logps = _scored_as_step(self._logps, step_compiled)
 

@@ -1303,7 +1303,7 @@ def test_a_precomputed_reference_scores_through_the_cce_scorer(monkeypatch):
     plan = build_plan(dataset=rows(5), num_batches=3)
     calls = []
 
-    def scorer(model, batch, supervised, indices=None):
+    def scorer(model, batch, supervised, indices=None, **_):
         calls.append(indices)
         ce = batch[:, 1:].astype(mx.float32) * supervised
         return ce, mx.zeros(ce.shape)
@@ -4254,7 +4254,7 @@ def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, 
     from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
 
     built = []  # a CCE scorer scoring 0: any log-prob taken off the logits instead makes kl nonzero
-    monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", lambda model, temperature: built.append(temperature) or (lambda model, batch, supervised, logit_sums: (supervised * 0.0, None)))  # noqa: E501
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", lambda model, temperature: built.append(temperature) or (lambda model, batch, supervised, logit_sums, **_: (supervised * 0.0, None)))  # noqa: E501
 
     modes = []
     monkeypatch.setattr("unsloth_zoo.mlx.grpo._scored_as_step", lambda logps, step_compiled, scored=grpo_module._scored_as_step: scored(logps, lambda: modes.append(step_compiled()) or modes[-1]))  # noqa: E501
