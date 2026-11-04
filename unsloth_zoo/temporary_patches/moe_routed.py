@@ -115,8 +115,8 @@ if triton is not None:
 
     @triton.jit
     def _nf4_dot(W, A, A2, C2, offset, LUT, rows64, rmask, x_chunk, k0, K,
-                 BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,  # BLOCKSIZE / BLOCKSIZE2: NF4 / nested absmax blocks; NESTED: absmax is 8-bit quantized
-                 BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr):  # BLOCK_N: output rows; BLOCK_K: K chunk, pow2 of K in [blocksize, 1024]; EVEN_K: no K tail
+                 BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,  # nf4 block / nested absmax block / double quant
+                 BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr):  # tile out rows / tile K / K % BLOCK_K == 0
         # rows64 index the flat buffer's rows: absmax / state2 blocks are global indices.
         HALF_K: tl.constexpr = BLOCK_K // 2
         NB: tl.constexpr = BLOCK_K // BLOCKSIZE
@@ -138,7 +138,7 @@ if triton is not None:
         return tl.sum(part * a, axis = 1)
 
     @triton.jit
-    def _expert_tables(e, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, NESTED: tl.constexpr, STACKED: tl.constexpr):  # NESTED: absmax is 8-bit quantized; STACKED: one stacked buffer, not pointer tables
+    def _expert_tables(e, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, NESTED: tl.constexpr, STACKED: tl.constexpr):  # double quant / stacked weights vs pointer table
         if STACKED:
             W = W_PTRS
             A = A_PTRS
@@ -163,7 +163,7 @@ if triton is not None:
         return W, A, A2, C2, offset
 
     @triton.jit
-    def _lora_ptr(PTRS, e, LORA_KIND: tl.constexpr):  # LoRA weight pointer table dtype: 1 fp32, 2 bf16, 3 fp16
+    def _lora_ptr(PTRS, e, LORA_KIND: tl.constexpr):  # 0 stacked, 1-3 ptr table fp32/bf16/fp16
         # Expert e's own adapter weight from an int64 table of pointers (1 / 2 / 3: fp32 / bf16 / fp16).
         if LORA_KIND == 2:
             return tl.load(PTRS + e).to(tl.pointer_type(tl.bfloat16))
@@ -174,7 +174,7 @@ if triton is not None:
 
     @triton.jit
     def _lora_b(acc, LORA_B, LORA_H, e, s, rows64, rmask, scaling, stride_be, stride_bn, stride_br,
-                R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr):  # R: LoRA rank; R_PAD: next pow2 of the rank; LORA_KIND: 0 stacked, 1-3 pointer table dtype
+                R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr):  # LoRA rank / rank pow2 / LoRA weight kind
         j = tl.arange(0, R_PAD)
         jmask = j < R
         if LORA_KIND == 0:
@@ -187,7 +187,7 @@ if triton is not None:
         return acc + tl.sum(b.to(tl.float32) * h.to(tl.float32)[None, :], axis = 1) * scaling
 
     @triton.jit
-    def _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND: tl.constexpr):  # 0 none, 1-3 pointer table (fp32 / bf16 / fp16), 4 stacked [E, N]
+    def _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND: tl.constexpr):  # 0 none, 1-3 ptr table, 4 stacked
         # 1 / 2 / 3: pointer table (fp32 / bf16 / fp16), 4: stacked [E, N].
         if BIAS_KIND == 4:
             B = BIAS + e * N
@@ -200,7 +200,7 @@ if triton is not None:
         return tl.load(B + rows64, mask = rmask, other = 0.0).to(tl.float32)
 
     @triton.jit
-    def _gated_act(gate, up, alpha, limit, ACT: tl.constexpr):  # 0 gpt-oss clamp, 1 silu, 2 gelu tanh, 3 gelu
+    def _gated_act(gate, up, alpha, limit, ACT: tl.constexpr):  # 0 gpt-oss, 1 silu, 2 gelu tanh, 3 gelu
         if ACT == 0:
             # gpt-oss: clamp, then (up + 1) * gate * sigmoid(alpha * gate).
             gate = tl.minimum(gate, limit)
@@ -220,10 +220,10 @@ if triton is not None:
     def _routed_gate_up_kernel(
         X, IDX, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, LUT, BIAS, LORA_B, LORA_H, OUT, N, K,
         alpha, limit, scaling, stride_be, stride_bn, stride_br,
-        TOP_K: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,  # TOP_K: experts per token; BLOCKSIZE / BLOCKSIZE2: NF4 / nested absmax blocks; NESTED: nested absmax
-        STACKED: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr,  # STACKED: stacked weight buffer; ACT: gated activation id; INTERLEAVED: gate / up rows alternate
-        BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,  # BIAS_KIND: 0 none, 1-3 table, 4 stacked; HAS_LORA: add LoRA B; R: LoRA rank; R_PAD: pow2 of R
-        LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,  # LORA_KIND: LoRA B layout / dtype; BLOCK_N: 4 rows; BLOCK_K: pow2 of K in [blocksize, 1024]; EVEN_K: no K tail
+        TOP_K: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,  # top-k / nf4 block / nested block / double quant
+        STACKED: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr,  # stacked weights / activation id / gate-up interleaved
+        BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,  # bias kind / LoRA / LoRA rank / rank pow2
+        LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,  # LoRA weight kind / tile N / tile K / K divisible
     ):
         # Each program owns BLOCK_N // 2 intermediate columns; its rows alternate gate, up.
         alpha = alpha.to(tl.float32)
@@ -264,10 +264,10 @@ if triton is not None:
     def _routed_down_kernel(
         X, IDX, RW, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, LUT, BIAS, LORA_B, LORA_H, OUT, N, K,
         RW_STRIDE, scaling, stride_be, stride_bn, stride_br,
-        TOP_K: tl.constexpr, DENSE_RW: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr,  # TOP_K: experts per token; DENSE_RW: routing weights [T, E], else [T, k]; NF4 / nested absmax blocks
-        NESTED: tl.constexpr, STACKED: tl.constexpr, BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr,  # NESTED: nested absmax; STACKED: stacked weight; BIAS_KIND: 0 none, 1-3 table, 4 stacked; HAS_LORA: LoRA B
-        R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr,  # R: LoRA rank; R_PAD: pow2 of R; LORA_KIND: LoRA B layout / dtype; BLOCK_N: 4 output rows
-        BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,  # BLOCK_K: pow2 of K in [blocksize, 1024]; EVEN_K: K % BLOCK_K == 0
+        TOP_K: tl.constexpr, DENSE_RW: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr,  # top-k / dense [T, E] weights / nf4 block / nested block
+        NESTED: tl.constexpr, STACKED: tl.constexpr, BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr,  # double quant / stacked / bias kind / LoRA
+        R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr,  # LoRA rank / rank pow2 / LoRA kind / tile N
+        BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,  # tile K / K % BLOCK_K == 0
     ):
         # Fixed-order top-k sum, one store: no atomics, deterministic.
         t = tl.program_id(0)
@@ -302,8 +302,8 @@ if triton is not None:
         tl.store(OUT + t.to(tl.int64) * N + rows, out.to(OUT.dtype.element_ty), mask = rmask)
 
     @triton.jit
-    def _lora_h_kernel(X, IDX, A_PTRS, OUT, K, ROW_DIV, R: tl.constexpr, LORA_KIND: tl.constexpr,  # R: LoRA rank; LORA_KIND: A pointer table dtype (1-3)
-                       BLOCK_K: tl.constexpr):  # K chunk: pow2 of K in [16, 1024]
+    def _lora_h_kernel(X, IDX, A_PTRS, OUT, K, ROW_DIV, R: tl.constexpr, LORA_KIND: tl.constexpr,  # LoRA rank / LoRA weight kind
+                       BLOCK_K: tl.constexpr):  # tile along K (in features)
         p = tl.program_id(0)
         j = tl.program_id(1)
         e = tl.load(IDX + p).to(tl.int64)
@@ -321,7 +321,7 @@ if triton is not None:
     @triton.jit
     def _routed_lora_a_kernel(
         X, IDX, A, OUT, K, ROW_DIV, stride_x, stride_ae, stride_ak, stride_ar,
-        R: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,  # R: LoRA rank; BLOCK_R: rank cols per program, pow2 1-16 from P * r; BLOCK_K: pow2 of K in [16, 1024]
+        R: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,  # LoRA rank / rank block / tile K
     ):
         # One program per (slot, rank block): decode is latency bound, fan-out beats coalescing.
         p = tl.program_id(0)
@@ -344,8 +344,8 @@ if triton is not None:
     @triton.jit
     def _routed_lora_b_kernel(
         BASE, PREV, H, IDX, B, OUT, N, scaling, stride_base, stride_be, stride_br, stride_bn,
-        HAS_BASE: tl.constexpr, HAS_PREV: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,  # HAS_BASE: add base output; HAS_PREV: add earlier delta; R: LoRA rank; R_PAD: next pow2 of R
-        BLOCK_N: tl.constexpr,  # output cols per program (64 unless forced)
+        HAS_BASE: tl.constexpr, HAS_PREV: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,  # add base / add previous delta / LoRA rank / rank pow2
+        BLOCK_N: tl.constexpr,  # tile along N (out features)
     ):
         # PREV deltas are summed before BASE, as one (x @ A @ B) delta would be.
         p = tl.program_id(0)
@@ -367,7 +367,7 @@ if triton is not None:
     @triton.jit
     def _nf4_select_dequant_kernel(
         Q, OUT, UNIQ, LUT, ABSMAX, CODE2, ABSMAX2, OFFSET, BYTES_PER_EXPERT,
-        BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,  # NF4 / nested absmax blocks; NESTED: nested absmax; BLOCK: 1024 packed bytes per program
+        BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,  # nf4 block / nested block / double quant / bytes per program
     ):
         # Bit-identical to bitsandbytes only with fp fusion off (product, then add, two roundings).
         g = tl.program_id(0)
@@ -399,13 +399,13 @@ if triton is not None:
         stride_xr,
         stride_we, stride_wk, stride_wn,
         stride_be,
-        HAS_BIAS: tl.constexpr,  # add bias[e]
-        P_PAD: tl.constexpr,  # routed slots padded to pow2, min 16 (<= max slots)
-        BLOCK_N: tl.constexpr,  # output cols per tile, config table bucketed on slot count P
-        BLOCK_K: tl.constexpr,  # K chunk, config table bucketed on slot count P
-        SPLIT_K: tl.constexpr,  # K splits: 4 for P <= 64, else 1 (bucketed on P)
+        HAS_BIAS: tl.constexpr,  # expert bias
+        P_PAD: tl.constexpr,  # routed slots pow2
+        BLOCK_N: tl.constexpr,  # tile along N (out features)
+        BLOCK_K: tl.constexpr,  # tile along K (in features)
+        SPLIT_K: tl.constexpr,  # split-K partial count
         LORA_A = None, H_OUT = None, stride_lae = 0, stride_lak = 0, stride_lar = 0,
-        HAS_LORA_A: tl.constexpr = False, R: tl.constexpr = 1, R_PAD: tl.constexpr = 16,  # HAS_LORA_A: extra program computes x @ A[e]; R: LoRA rank; R_PAD: pow2 of R, min 16
+        HAS_LORA_A: tl.constexpr = False, R: tl.constexpr = 1, R_PAD: tl.constexpr = 16,  # fused LoRA A / LoRA rank / rank pow2
     ):
         e = tl.program_id(0)
         nb = tl.program_id(1)
@@ -959,7 +959,7 @@ def _lora_delta(x_slots, idx, terms):
 if triton is not None:
 
     @triton.jit
-    def _lora_h_row(LORA_H, p, P, SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr):  # SPLIT_H: LoRA H split-K partials; R: LoRA rank; R_PAD: pow2 of R, min 2
+    def _lora_h_row(LORA_H, p, P, SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr):  # LoRA H split partials / LoRA rank / rank pow2
         # H[p] as the fixed-order sum of [SPLIT_H, P, R] fp32 partials.
         j = tl.arange(0, R_PAD)
         h = tl.zeros([R_PAD], dtype = tl.float32)
@@ -969,7 +969,7 @@ if triton is not None:
 
     @triton.jit
     def _lora_b_cols(LORA_B, h, e, cols, cmask, stride_lbe, stride_lbr, stride_lbn,
-                     R: tl.constexpr, R_PAD: tl.constexpr):  # R: LoRA rank; R_PAD: next pow2 of the rank
+                     R: tl.constexpr, R_PAD: tl.constexpr):  # LoRA rank / rank pow2
         # sum_j h[j] * B[e, j, cols] in fp32; B any float dtype and strides.
         j = tl.arange(0, R_PAD)
         b = tl.load(LORA_B + e * stride_lbe + j[:, None] * stride_lbr + cols[None, :] * stride_lbn,
@@ -981,8 +981,8 @@ if triton is not None:
         PART, IDX, LORA_B, LORA_H, OUT,
         P, I, alpha, limit, scaling,
         stride_lbe, stride_lbr, stride_lbn,
-        SPLIT_K: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr, HAS_LORA: tl.constexpr,  # SPLIT_K: partials to sum; ACT: gated activation id; INTERLEAVED: gate / up alternate; HAS_LORA
-        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,  # SPLIT_H: LoRA H partials; R: rank; R_PAD: pow2 of R; BLOCK: cols, pow2 16-256 from rows * cols
+        SPLIT_K: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr, HAS_LORA: tl.constexpr,  # split-K partials / activation id / interleaved / LoRA
+        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,  # LoRA H splits / LoRA rank / rank pow2 / cols
     ):
         # Epilogue after the full K reduction (bias is in split 0): fixed-order split-K sum, LoRA B once, act.
         alpha = alpha.to(tl.float32)
@@ -1023,8 +1023,8 @@ if triton is not None:
         PART, IDX, RW, LORA_B, LORA_H, OUT,
         P, N, RW_STRIDE, scaling,
         stride_lbe, stride_lbr, stride_lbn,
-        TOP_K: tl.constexpr, TOP_K_PAD: tl.constexpr, SPLIT_K: tl.constexpr, HAS_LORA: tl.constexpr,  # TOP_K: experts per token; TOP_K_PAD: its pow2; SPLIT_K: partials to sum; HAS_LORA: add LoRA B
-        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,  # SPLIT_H: LoRA H partials; R: rank; R_PAD: pow2 of R; BLOCK: cols, pow2 16-256 from rows * cols
+        TOP_K: tl.constexpr, TOP_K_PAD: tl.constexpr, SPLIT_K: tl.constexpr, HAS_LORA: tl.constexpr,  # top-k / top-k pow2 / split-K partials / LoRA
+        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,  # LoRA H splits / LoRA rank / rank pow2 / cols
     ):
         # Fixed-order fp32 sum, one store: no atomics, deterministic.
         t = tl.program_id(0).to(tl.int64)

@@ -110,7 +110,9 @@ def _run(code, out, zoo):
         # A fresh interpreter lacks conftest.py's mocks: configure the CPU import here.
         env.update(PYTHONPATH = os.pathsep.join(p for p in (REPO, os.environ.get("PYTHONPATH")) if p),
                    CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", UNSLOTH_ALLOW_CPU = "1",
-                   UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_FORCE_FLOAT32 = "1")
+                   UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_FORCE_FLOAT32 = "1",
+                   # CPU Inductor cannot build the compiled causal mask (torch 2.10, transformers 5.22).
+                   TORCHDYNAMO_DISABLE = "1")
     else:
         env.pop("PYTHONPATH", None)
     proc = subprocess.run([sys.executable, "-c", textwrap.dedent(code), out], env = env, cwd = out,
