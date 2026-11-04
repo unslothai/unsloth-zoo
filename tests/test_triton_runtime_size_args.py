@@ -73,3 +73,10 @@ def test_vectorised_sizes_keep_their_hint(rel):
         dns = _do_not_specialize(defs[name])
         for arg in args:
             assert arg not in dns, (name, arg)
+
+
+def test_sink_scale_buckets_decode():
+    # Fully runtime Q was 3-5% slower at decode (T4): ONE_Q (Q == 1) restores the folded pid split.
+    fn = _defs(ZOO / "gpt_oss_decode_fused.py")["_sink_scale_kernel"]
+    ann = {a.arg: a.annotation for a in fn.args.args}["ONE_Q"]
+    assert ann is not None and "constexpr" in ast.unparse(ann)
