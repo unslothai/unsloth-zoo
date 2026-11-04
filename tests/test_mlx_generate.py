@@ -1581,6 +1581,36 @@ def test_a_row_cache_seam_is_read_where_the_release_admits_prompts(tmp_path, met
     assert (generate._row_prefill_surface_gap(module) is None) is open_
 
 
+@pytest.mark.parametrize("steps, chunks", [
+    ((2048, 2048, 2048), [2048, 952]),  # chunks on the checkpoint grid are left alone
+    ((256, 2048, 2048), [256, 1792, 952]),  # mlx-vlm 0.7.12 lifts its 256 cap once peers stop decoding
+    ((4096, 4096), [2048, 952]),
+])
+def test_a_row_prefill_chunk_ends_at_a_checkpoint_it_would_step_over(steps, chunks):
+    from unsloth_zoo.mlx import generate
+
+    class Prompt:
+        def __init__(self, prompt_kwargs, uids, warm_cache=None):
+            self.prefill_step_size, self.prompt_cache, self.left = None, warm_cache, 3000
+
+        def prompt_step(self):
+            n = min(self.prefill_step_size, self.left)
+            self.left -= n
+            return n
+
+    banked = []
+    row = types.SimpleNamespace(reopen=None, cache="cache", prefix=0, lengths={2048, 3000}, quantize=None,
+                                checkpoint=lambda length, cache: banked.append(length))
+    batch = generate._row_prefill_batch_class(Prompt)(prompt_kwargs={generate._ROW_PREFILL_KEY: row}, uids=[0])
+    done = []
+    for step in steps:
+        if batch.left:
+            batch.prefill_step_size = step
+            done.append(batch.prompt_step())
+            assert batch.prefill_step_size == step
+    assert done == chunks and banked == [2048, 3000]
+
+
 _EXTRACT_0711 = """\
 class BatchKVCache:
     def extract(self, idx):
