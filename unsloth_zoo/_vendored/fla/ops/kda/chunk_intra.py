@@ -62,16 +62,16 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    NC: tl.constexpr,
-    BK: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    USE_SAFE_GATE: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    NC: tl.constexpr,  # sub-chunks per chunk
+    BK: tl.constexpr,  # block along K
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    USE_SAFE_GATE: tl.constexpr,  # safe gate mode
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     """
     Fused kernel: compute inter-subchunk Akk + solve_tril in one pass.
@@ -423,18 +423,18 @@ def chunk_kda_bwd_kernel_intra(
     chunk_indices,
     B,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    NC: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    SAFE_GATE: tl.constexpr,
-    GATE_SHIFT: tl.constexpr,
-    USE_GATHER: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    BK: tl.constexpr,  # block along K
+    NC: tl.constexpr,  # sub-chunks per chunk
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    SAFE_GATE: tl.constexpr,  # safe gate mode
+    GATE_SHIFT: tl.constexpr,  # safe-gate log2 shift
+    USE_GATHER: tl.constexpr,  # tl.gather supported
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_kc, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -713,16 +713,16 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    GATE_SHIFT: tl.constexpr,
-    USE_GATHER: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    BK: tl.constexpr,  # block along K
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    GATE_SHIFT: tl.constexpr,  # safe-gate log2 shift
+    USE_GATHER: tl.constexpr,  # tl.gather supported
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_t, i_i, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1), tl.program_id(2)
     i_b, i_hv = i_bh // HV, i_bh % HV

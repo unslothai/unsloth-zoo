@@ -46,34 +46,34 @@ def fused_recurrent_kda_fwd_kernel(
     ssm_state_indices,
     num_accepted_tokens,
     lower_bound,
-    scale: tl.constexpr,
+    scale: tl.constexpr,  # q scale
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    stride_init_state_token: tl.constexpr,
-    stride_final_state_token: tl.constexpr,
-    stride_indices_seq: tl.constexpr,
-    stride_indices_tok: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    stride_init_state_token: tl.constexpr,  # initial state token stride
+    stride_final_state_token: tl.constexpr,  # final state token stride
+    stride_indices_seq: tl.constexpr,  # indices seq stride
+    stride_indices_tok: tl.constexpr,  # indices token stride
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
-    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    IS_CONTINUOUS_BATCHING: tl.constexpr,
-    IS_SPEC_DECODING: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
-    HAS_DT_BIAS: tl.constexpr,
-    USE_GATE_IN_KERNEL: tl.constexpr,
-    USE_LOWER_BOUND: tl.constexpr,
-    APPLY_BETA_SIGMOID: tl.constexpr,
-    ALLOW_NEG_EIGVAL: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
-    num_stages: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,  # l2norm q and k in kernel
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    IS_CONTINUOUS_BATCHING: tl.constexpr,  # state slots via indices
+    IS_SPEC_DECODING: tl.constexpr,  # speculative decode tokens
+    STORE_FINAL_STATE: tl.constexpr,  # write ht
+    HAS_DT_BIAS: tl.constexpr,  # dt bias given
+    USE_GATE_IN_KERNEL: tl.constexpr,  # gate computed in kernel
+    USE_LOWER_BOUND: tl.constexpr,  # gate lower bound given
+    APPLY_BETA_SIGMOID: tl.constexpr,  # sigmoid applied to beta in kernel
+    ALLOW_NEG_EIGVAL: tl.constexpr,  # beta scaled to (0, 2)
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
+    num_stages: tl.constexpr,  # pipeline stages
 ):
     # Unsloth: backported from fla PR #1329 (int64 program id: a decode batch past
     # 2**31 / (HV * K * V) sequences overflowed the int32 state offsets).
