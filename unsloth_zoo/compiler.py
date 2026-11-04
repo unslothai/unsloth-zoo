@@ -759,7 +759,7 @@ _MASK_FREE_ATTENTION = ("sdpa", "flash_attention_2", "flash_attention_3")
 
 
 def make_no_update_causal_mask(original):
-    if hasattr(original, "__wrapped__"):
+    if getattr(original, "_unsloth_no_causal_mask", False):
         return original
 
     @functools.wraps(original)
@@ -768,6 +768,7 @@ def make_no_update_causal_mask(original):
             return None
         return original(self, *args, **kwargs)
 
+    _update_causal_mask._unsloth_no_causal_mask = True
     return _update_causal_mask
 
 
