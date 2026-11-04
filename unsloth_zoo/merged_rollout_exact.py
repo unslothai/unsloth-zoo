@@ -86,7 +86,8 @@ pass
 
 
 if triton is not None:
-    @triton.jit
+    # mode (0 / 1 / 2) is a runtime branch: one compiled variant for every mode, not a separate mode == 1 one.
+    @triton.jit(do_not_specialize = ["mode"])
     def _exact_merge_kernel(
         W, A, B, counts, offsets, idx_out, val_out, checksum,
         N, K,

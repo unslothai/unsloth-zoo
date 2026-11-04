@@ -106,7 +106,8 @@ def _build_kernels():
     import triton
     import triton.language as tl
 
-    @triton.jit
+    # T (sequence length) runtime: no %16 variant per length; varlen vs dense stays the only split.
+    @triton.jit(do_not_specialize = ["T"])
     def _causal_conv1d_fwd_kernel(
         x, weight, bias, y, seq_idx,
         T, D,
@@ -156,7 +157,7 @@ def _build_kernels():
         p_y = y + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
         tl.store(p_y, acc.to(y.dtype.element_ty), mask = (o_t < T)[:, None] & m_d[None, :])
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["T"])
     def _causal_conv1d_bwd_g_kernel(
         x, weight, bias, dy, g, seq_idx,
         T, D,
@@ -203,7 +204,7 @@ def _build_kernels():
         p_g = g + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
         tl.store(p_g, b_g.to(g.dtype.element_ty), mask = m)
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["T", "NT"])
     def _causal_conv1d_bwd_dxdw_kernel(
         x, weight, g, dx, dw, db, seq_idx,
         T, D, NT,
