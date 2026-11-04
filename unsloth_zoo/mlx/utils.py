@@ -543,6 +543,34 @@ def _windowing_pays(q, k, block):
     return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
 
 
+# mlx 0.32.4 trains head dims above 256 fused only on NAX; elsewhere its fallback builds all T x S scores at once.
+_FUSED_TRAINING_HEAD_DIM = 256
+_CHUNKED_ATTENTION_QUERIES = 512
+
+
+def _chunking_bounds_scores(q, v, mask):
+    from .attention import _stock_runs_nax
+
+    return (max(q.shape[-1], v.shape[-1]) > _FUSED_TRAINING_HEAD_DIM and q.shape[-2] > _CHUNKED_ATTENTION_QUERIES
+            and v.shape[-2] >= q.shape[-2] and (mask is None or isinstance(mask, mx.array) or mask == "causal") and not _stock_runs_nax())
+
+
+def _query_chunked_attention(sdpa, q, k, v, scale, mask, block):
+    # Peak grows with T rather than T^2; wrapping chunks in mx.checkpoint measured no lower.
+    T, S = q.shape[-2], k.shape[-2]
+    n = -(-T // block)
+    bounds = [T * i // n for i in range(n + 1)]
+    outputs = []
+    for start, stop in zip(bounds, bounds[1:]):
+        # Causal chunks keep keys only through their last row, where mlx's lower-right causal mask aligns.
+        keys = S - T + stop if isinstance(mask, str) else S
+        rows = mask
+        if isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] == T:
+            rows = mask[..., start:stop, :]
+        outputs.append(sdpa(q[..., start:stop, :], k[..., :keys, :], v[..., :keys, :], scale=scale, mask=rows))
+    return mx.concatenate(outputs, axis=2)
+
+
 def _as_array_mask(q, k, mask):
     T, S = q.shape[-2], k.shape[-2]
     if mask is None:
@@ -565,6 +593,9 @@ def _wrap_training_sdpa(original):
                 block = max(_TRAINING_ATTENTION_BLOCK, window)
                 if _windowing_pays(q, k, block):
                     return _windowed_attention(original, q, k, v, scale, window, block)
+        if (all(value is None for value in kwargs.values()) and mlx_training_patches_active()
+                and _chunking_bounds_scores(q, v, mask)):
+            return _query_chunked_attention(original, q, k, v, scale, mask, _CHUNKED_ATTENTION_QUERIES)
         return original(q, k, v, scale=scale, mask=mask, **kwargs)
 
     wrapper._unsloth_original = original

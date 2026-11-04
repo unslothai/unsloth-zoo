@@ -372,6 +372,97 @@ def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
     assert mlx_utils._windowing_pays(q, k, 512) is pays
 
 
+def _wide_attention_inputs(T, S, dtype=None):
+    mx.random.seed(0)
+    q = mx.random.normal((1, 4, T, 512))
+    k, v = (mx.random.normal((1, 2, S, 512)) for _ in range(2))
+    return tuple(t.astype(dtype) for t in (q, k, v)) if dtype else (q, k, v)
+
+
+def _unfused_attention(q, k, v, *, scale, mask=None):
+    # mlx's own fallback math, with causal aligned to the lower right; kept device-independent (no TF32, no NAX).
+    T, S = q.shape[-2], k.shape[-2]
+    k, v = (mx.repeat(t, q.shape[1] // t.shape[1], axis=1) for t in (k, v))
+    scores = (q * scale) @ k.swapaxes(-1, -2)
+    if isinstance(mask, str):
+        mask = mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
+    if mask is not None:
+        scores = mx.where(mask, scores, -mx.inf) if mask.dtype == mx.bool_ else scores + mask
+    return mx.softmax(scores, axis=-1, precise=True) @ v
+
+
+@metal_only
+@pytest.mark.parametrize("T, S, mask, keys", [
+    (200, 200, "causal", [50, 100, 150, 200]), (200, 224, "causal", [74, 124, 174, 224]),
+    (200, 200, None, [200] * 4), (200, 200, "bool", [200] * 4), (200, 200, "additive", [200] * 4)])
+def test_query_chunked_attention_matches_unfused(T, S, mask, keys):
+    q, k, v = _wide_attention_inputs(T, S)
+    if mask in ("bool", "additive"):
+        keep = (mx.random.uniform(shape=(1, 1, T, S)) > 0.3) | (mx.eye(T, S) > 0)
+        mask = keep if mask == "bool" else mx.where(keep, 0.0, -mx.inf)
+    calls, cot = [], mx.random.normal(q.shape)
+    counted = lambda *a, **kw: calls.append(a[1].shape[-2]) or _unfused_attention(*a, **kw)
+    ref = mx.vjp(lambda q, k, v: _unfused_attention(q, k, v, scale=0.05, mask=mask), [q, k, v], [cot])
+    got = mx.vjp(lambda q, k, v: mlx_utils._query_chunked_attention(counted, q, k, v, 0.05, mask, 64),
+                 [q, k, v], [cot])
+    mx.eval(ref, got)
+    assert calls == keys
+    for a, b in zip((*got[0], *got[1]), (*ref[0], *ref[1])):
+        assert mx.allclose(a, b, atol=2e-5, rtol=1e-4)
+
+
+@metal_only
+@pytest.mark.parametrize("dim, T, S, mask, nax, chunked", [
+    (512, 1024, 1024, "causal", False, True), (512, 1024, 1024, None, False, True),
+    (512, 512, 512, "causal", False, False), (256, 4096, 4096, "causal", False, False),
+    (512, 1024, 1024, "causal", True, False), (512, 1024, 768, "causal", False, False)])
+def test_training_attention_chunks_only_wide_heads_without_nax(monkeypatch, dim, T, S, mask, nax, chunked):
+    from unsloth_zoo.mlx import attention
+
+    monkeypatch.setattr(attention, "_stock_runs_nax", lambda: nax)
+    seen = []
+    sdpa = mlx_utils._wrap_training_sdpa(lambda q, k, v, *, scale, mask=None, **kwargs: seen.append(q.shape[-2]) or q)
+    q, k = mx.zeros((1, 2, T, dim)), mx.zeros((1, 2, S, dim))
+    sdpa(q, k, k, scale=1.0, mask=mask)
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+    try:
+        sdpa(q, k, k, scale=1.0, mask=mask)
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert seen[0] == T and (seen[1:] == [T // 2, T // 2] if chunked else seen[1:] == [T])
+
+
+@metal_only
+def test_query_chunked_attention_bounds_training_memory():
+    from unsloth_zoo.mlx import nax
+
+    if nax.nax_available():
+        pytest.skip("NAX trains head dim 512 fused; the unfused baseline does not exist here")
+    # Short sequences are dominated by the O(T) terms both paths share; at 8k the T^2 scores dominate.
+    q, k, v = _wide_attention_inputs(8192, 8192, mx.bfloat16)
+    mx.eval(q, k, v)
+
+    def run():
+        mx.synchronize()
+        mx.reset_peak_memory()
+        base = mx.get_active_memory()
+        g = mx.grad(lambda q, k, v: mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=0.05, mask="causal").astype(mx.float32).sum(), argnums=(0, 1, 2))(q, k, v)
+        mx.eval(g)
+        return mx.get_peak_memory() - base, g
+
+    unfused, ref = run()
+    mlx_utils.acquire_mlx_training_patches()
+    try:
+        chunked, got = run()
+    finally:
+        mlx_utils.release_mlx_training_patches()
+    assert chunked < 0.65 * unfused, (chunked, unfused)   # measured 0.56 on M3 Max; unchunked is 1.0
+    for a, b in zip(got, ref):
+        a, b = a.astype(mx.float32), b.astype(mx.float32)
+        assert (mx.linalg.norm(a - b) / mx.linalg.norm(b)).item() < 1e-2
+
+
 @metal_only
 def test_training_attention_keeps_the_fused_mask_outside_a_training_context():
     seen = []
