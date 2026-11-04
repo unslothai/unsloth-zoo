@@ -124,8 +124,7 @@ def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     return _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask)
 
 
-# mlx builds `[B, HQ, L, S]` scores for these causal calls by default. Below the floors the scores are small and the
-# default is faster; float32 is a long dispatch.
+# mlx builds full `[B, HQ, L, S]` scores for these causal calls; below the floors that is small and faster.
 _FORCED_MIN_QUERIES = 16
 _FORCED_MIN_KEYS = 8192
 
@@ -135,8 +134,7 @@ def _forced_widths(head_dim, value_dim):
     if head_dim == value_dim == 256:
         return 256, 256
     if (head_dim, value_dim) == (192, 128):
-        # No 192/128 kernel past 8 queries. NAX runs its head_dim 256 kernel faster than its 192 one; elsewhere the
-        # reverse holds.
+        # No 192/128 kernel past 8 queries; NAX runs 256 faster than 192, elsewhere the reverse.
         return (256, 256) if _stock_runs_nax() else (192, 192)
     return None
 
