@@ -127,8 +127,9 @@ if HAS_TRITON:
     # Q (query length: 1 in decode, the prompt length in prefill) and the lse strides it sets only
     # index scalars: unspecialized, so prompt lengths add no == 1 / % 16 variant. ONE_Q buckets decode
     # instead (2 variants, decode and prefill): fully runtime Q was 3-5% slower at decode on T4, the
-    # pid split by Q no longer folding. The attention / output strides keep their % 16 hint.
-    @triton.jit(do_not_specialize = ["Q", "sl_b", "sl_h", "sl_q"])
+    # pid split by Q no longer folding. sl_q (1 for any contiguous lse, so no variant) and the
+    # attention / output strides keep their specialization.
+    @triton.jit(do_not_specialize = ["Q", "sl_b", "sl_h"])
     def _sink_scale_kernel(
         A, LSE, SINK, OUT, H, Q, D,
         sa_b, sa_h, sa_q, sl_b, sl_h, sl_q, so_b, so_q, so_h,
