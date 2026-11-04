@@ -123,13 +123,15 @@ print(json.dumps(out))
 
 
 def _multi_target_parameter_adapters_supported():
-    # PEFT 0.18 refuses a second target_parameters adapter on one model.
+    # Probed, not read off the version: PEFT 0.18 and 0.19 refuse a second target_parameters adapter on one model.
     try:
-        import peft
-        from packaging.version import Version
+        import torch.nn as nn
+        from peft import LoraConfig, get_peft_model
+        model = get_peft_model(nn.Sequential(nn.Linear(4, 4)), LoraConfig(r = 1, target_parameters = ["0.weight"]))
+        model.add_adapter("second", LoraConfig(r = 1, target_parameters = ["0.weight"]))
+        return True
     except Exception:
         return False
-    return Version(peft.__version__) >= Version("0.19")
 
 
 def _run(family, work, compiled):
@@ -145,7 +147,7 @@ def _run(family, work, compiled):
     return json.loads(lines[-1])
 
 
-@pytest.mark.skipif(not _multi_target_parameter_adapters_supported(), reason = "PEFT < 0.19: one target_parameters adapter per model")
+@pytest.mark.skipif(not _multi_target_parameter_adapters_supported(), reason = "this PEFT allows one target_parameters adapter per model")
 @pytest.mark.parametrize(
     "family, compiled",
     [("llama4", False), ("qwen3_moe", False), ("gpt_oss", False), ("qwen3_moe", True)],
