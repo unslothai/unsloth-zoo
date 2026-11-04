@@ -1534,6 +1534,29 @@ def test_a_method_is_read_once_and_never_outlives_its_model(monkeypatch):
     assert generate._keeps_what_it_prepared(Model())
 
 
+_DRAW = "def _sample_with_positions(sampler, logprobs, *, row_ids=None, positions=None): pass\n"
+_HELPER = "def _sample_batch_tokens(logits, sampler, *, positions):\n    return _sample_with_positions(sampler, logits, row_ids=[0], positions={})\n"
+_STEP = "class GenerationBatch:\n    def _step(self):\n        return {}\n"
+
+
+@pytest.mark.parametrize("source, draws", [
+    (_DRAW + _STEP.format("_sample_with_positions(self.sampler, None, row_ids=[0], positions=[1])"), True),
+    # mlx-vlm 0.7.12 draws through a helper; it counts only while both forward the positions.
+    (_DRAW + _HELPER.format("positions") + _STEP.format("_sample_batch_tokens(None, self.sampler, positions=[1])"), True),
+    (_DRAW + _HELPER.format("None") + _STEP.format("_sample_batch_tokens(None, self.sampler, positions=[1])"), False),
+    (_DRAW + _HELPER.format("positions") + _STEP.format("_sample_batch_tokens(None, self.sampler, positions=None)"), False),
+])
+def test_a_batch_draws_by_position_through_the_release_helper(tmp_path, source, draws):
+    from unsloth_zoo.mlx import generate
+
+    path = tmp_path / "batch_shape.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location(f"batch_shape_{abs(hash(source))}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert generate._draws_by_position(module.GenerationBatch, "_step") is draws
+
+
 def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
     from unsloth_zoo.mlx.generate import _schedules_prefill
 

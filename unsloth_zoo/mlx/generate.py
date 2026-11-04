@@ -2197,18 +2197,21 @@ def _function_draws_by_position(function) -> bool:
             else called.id if isinstance(called, ast.Name)
             else None
         )
-        if name != "_sample_with_positions":
-            continue
         given = {keyword.arg: keyword.value for keyword in node.keywords}
-        if not {"row_ids", "positions"}.issubset(given):
+        # mlx-vlm 0.7.12 draws through a module helper that hands the positions on.
+        helper = function.__globals__.get(name) if name == "_sample_batch_tokens" else None
+        if isinstance(helper, types.FunctionType) and _given(given, "positions"):
+            if _function_draws_by_position(helper):
+                return True
             continue
-        if any(
-            isinstance(given[argument], ast.Constant) and given[argument].value is None
-            for argument in ("row_ids", "positions")
-        ):
-            continue
-        return True
+        if name == "_sample_with_positions" and _given(given, "row_ids") and _given(given, "positions"):
+            return True
     return False
+
+
+def _given(keywords: dict, argument: str) -> bool:
+    value = keywords.get(argument)
+    return value is not None and not (isinstance(value, ast.Constant) and value.value is None)
 
 
 def _vlm_batches_observable(batch_module) -> bool:
