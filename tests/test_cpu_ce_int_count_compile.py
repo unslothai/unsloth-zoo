@@ -37,7 +37,6 @@ def _inputs(seed):
 
 @pytest.mark.parametrize("kind", ["int", "tensor"])
 def test_chunked_ce_fullgraph_dynamic_count_matches_eager(kind):
-    # dynamic=True makes a changing Python int a SymInt: float() / math.isnan on it cannot be traced.
     torch._dynamo.reset()
     counters.clear()
     fn = torch.compile(_loss, fullgraph = True, dynamic = True, backend = "aot_eager")
@@ -54,7 +53,6 @@ def test_chunked_ce_fullgraph_dynamic_count_matches_eager(kind):
         torch.testing.assert_close(out, ref, **tol)
         torch.testing.assert_close(grads[0], hidden.grad, **tol)
         torch.testing.assert_close(grads[1], weight.grad, **tol)
-    # Fully ignored accumulation group with a zero count: loss 0 and zero gradient, as in eager.
     hidden = torch.randn(1, 5, 8, requires_grad = True)
     out = fn(hidden, torch.randn(13, 8), torch.full((1, 5), -100), wrap(0))
     out.backward()
