@@ -569,6 +569,34 @@ def hf_logits_warper(sampling, prompt_ids):
     return warp
 
 
+def _kv_bytes_per_token(model):
+    """Every layer's bf16 K and V for one token, from the text config; None when it does not say."""
+    config = getattr(model, "args", None) or getattr(model, "config", None)
+    config = _config_get(config, "text_config", None) or config
+    layers = _config_get(config, "num_hidden_layers")
+    attention_heads = _config_get(config, "num_attention_heads")
+    heads = _config_get(config, "num_key_value_heads") or attention_heads
+    head_dim = _config_get(config, "head_dim") or (
+        _config_get(config, "hidden_size", 0) // attention_heads if attention_heads else None)
+    if not (layers and heads and head_dim):
+        return None
+    return 2 * 2 * int(layers) * int(heads) * int(head_dim)
+
+
+def _rollout_rows(model, rows, tokens):
+    """Rows decoded at once: the whole generation when its KV cache fits half the free working set, never fewer than
+    the engine's default."""
+    floor = GenerationDefaults.completion_batch_size
+    per_token = _kv_bytes_per_token(model) if rows > floor else None
+    if per_token is None:
+        return floor
+    try:
+        free = int(mx.device_info()["max_recommended_working_set_size"]) - int(mx.get_active_memory())
+    except Exception:
+        return floor
+    return max(floor, min(rows, free // 2 // (per_token * tokens)))
+
+
 def _derived_seed(*parts):
     return int(np.random.SeedSequence([int(part) % (2 ** 32) for part in parts])
                .generate_state(1, np.uint64)[0])
@@ -791,6 +819,8 @@ class GRPOBatchPlan:
         defaults = GenerationDefaults(
             max_tokens=self.sampling.max_tokens, stop_token_ids=(self.eos_id,),
             token_ids_only=self._processor is None,  # completions are decoded once, after the cut
+            completion_batch_size=_rollout_rows(self._model, len(requests), max(
+                len(request.prompt_token_ids) + request.max_tokens for request in requests)),
         )
         with self._rollout_context():
             results = generate_module.generate_batch(

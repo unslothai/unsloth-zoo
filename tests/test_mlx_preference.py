@@ -3766,6 +3766,17 @@ def test_grpo_rollout_warper_matches_hf_sampling_processors(settings):
     assert torch.isfinite(tied).sum() == 2  # HF keeps two of the three tied logits
 
 
+@pytest.mark.parametrize("rows,active,expected", [(16, 0, 32), (64, 0, 48), (64, 640 * 2 * 40, 32), (40, 0, 40)])
+def test_grpo_rollouts_decode_the_whole_generation_when_its_cache_fits(monkeypatch, rows, active, expected):
+    from unsloth_zoo.mlx import grpo
+
+    monkeypatch.setattr(grpo.mx, "device_info", lambda: {"max_recommended_working_set_size": 640 * 2 * 48}, raising=False)
+    monkeypatch.setattr(grpo.mx, "get_active_memory", lambda: active, raising=False)
+    config = types.SimpleNamespace(num_hidden_layers=2, num_key_value_heads=2, num_attention_heads=4, hidden_size=16)
+    assert grpo._rollout_rows(types.SimpleNamespace(args=config), rows, 10) == expected  # 640 bytes a row
+    assert grpo._rollout_rows(types.SimpleNamespace(), rows, 10) == 32
+
+
 @pytest.mark.parametrize("bsz,spg,iterations,shuffle", [(4, 2, 1, True), (2, 3, 2, True), (6, 1, 1, False)])
 def test_grpo_plan_order_follows_trl_repeat_sampler(bsz, spg, iterations, shuffle):
     from trl.trainer.utils import RepeatSampler
@@ -3867,6 +3878,7 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
         return [float(ids[-1] == 2) for ids in completion_ids]
 
     monkeypatch.setattr(generate_module, "generate_batch", fake_generate_batch)
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._rollout_rows", lambda model, rows, tokens: 7)
     dataset = [{"prompt": "a" * (index + 1), "answer": index} for index in range(4)]
     with pytest.warns(UserWarning, match="1 prompt"):
         plan = create_grpo_batch_plan(
@@ -3880,7 +3892,7 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     replayed = [plan[index][0].tolist() for index in (1, 2, 3)]
     assert replayed[1:] == [first[0].tolist(), replayed[0]] != [replayed[0]] * 2 and len(calls) == 1
     requests, defaults = calls[0]
-    assert defaults.stop_token_ids == (2,) and defaults.token_ids_only and [r.max_tokens for r in requests] == [3] * 4
+    assert defaults.stop_token_ids == (2,) and defaults.token_ids_only and defaults.completion_batch_size == 32 and [r.max_tokens for r in requests] == [3] * 4
     assert len({r.sampling.seed for r in requests}) == 4 and requests[0].logits_processors and not GRPOSampling().warps
     assert [r.prompt_token_ids for r in requests] == [(14,), (14,), (14, 14), (14, 14)]
     assert seen["ids"] == [[1, 2], [1, 1, 1]] * 2 and seen["completions"][:2] == ["b", "bbb"] and seen["answer"] == [0, 0, 1, 1]  # noqa: E501
@@ -3907,6 +3919,7 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     planned = plan[6]  # an eager fetch, as after a compile fallback
     assert len(calls) == 3 and calls[2][0][0].sampling.seed != calls[1][0][0].sampling.seed and plan.width_rungs(6) == (6,)
     assert planned[0].shape == (2, 8) and planned[5].shape == planned[6].shape == (2, 7) and seen["width"] == 8
+    assert calls[0][1].completion_batch_size == 7
 
 
 def _grpo_vision_processor():
