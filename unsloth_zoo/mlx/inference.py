@@ -4870,6 +4870,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
 _DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"}}
 _DENSE_QMM_LOCK = RLock()
 _DENSE_QMM_VERIFIED = {}
+_STAGED_QMM_VERIFIED = {}
 _DENSE_QMM_MIN_ROWS = 1024
 # MLX's quantized and dense matmuls each split the sum over K for small outputs, by different rules,
 # and then round differently; at or below this many 16x16 output tiles the comparison would mostly fail.
@@ -5028,6 +5029,10 @@ def _dense_prefill_qmm(module, x, bindings):
     N, K, M = w.shape[0], x.shape[-1], x.shape[-2]
     if x.size != M * K:  # MLX reads the row count of a batch from its memory layout
         return None
+    if module.__dict__.get("_unsloth_staged_qmm") and not module.training and _bindings_intact(bindings):
+        staged = _staged_prefill_qmm(module, x, w, scales, biases, M, N, K)
+        if staged is not None:
+            return staged
     if (M < _DENSE_QMM_MIN_ROWS or N == 1 or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
             or N * K > _DENSE_QMM_MAX_WEIGHTS or module.training or not _bindings_intact(bindings)):
         if module.__dict__.get("_unsloth_tiled_qmm"):
@@ -5038,7 +5043,8 @@ def _dense_prefill_qmm(module, x, bindings):
     key = (_dense_qmm_rows(M, N, K), *family)
     verified = _DENSE_QMM_VERIFIED.get(key)
     if verified is False or family in _DENSE_QMM_VERIFIED:   # one differing row count retires the projection shape
-        return None
+        return (_tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings)
+                if module.__dict__.get("_unsloth_tiled_qmm") else None)
     weight = mx.dequantize(w, scales, biases, group_size = group_size, bits = bits, mode = mode).astype(x.dtype)
     dense = x @ weight.T
     if verified is None:
@@ -5054,9 +5060,38 @@ def _dense_prefill_qmm(module, x, bindings):
         if not verified:
             _DENSE_QMM_VERIFIED[family] = False
             logger.warning("the dense prefill matmul differs from the quantized one for N=%d K=%d %d-bit "
-                           "%s group %d %s at %d rows; the native call stays in use",
+                           "%s group %d %s at %d rows; the dense route stays disabled",
                            N, K, bits, mode, group_size, x.dtype, M)
-    return dense if verified else None
+    if verified:
+        return dense
+    return (_tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings)
+            if module.__dict__.get("_unsloth_tiled_qmm") else None)
+
+
+def _staged_prefill_qmm(module, x, w, scales, biases, M, N, K):
+    group_size, bits, mode = module.group_size, module.bits, module.mode
+    if (mx.default_device() != mx.gpu or not matmul.staged_qmm_supported(M, N, K, group_size, bits, mode)
+            or not isinstance(biases, mx.array) or not x.dtype == scales.dtype == biases.dtype
+            or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32)
+            or scales.shape != (N, K // group_size) or biases.shape != scales.shape):
+        return None
+    key = (M, N, K, group_size, bits, x.dtype)
+    verified = _STAGED_QMM_VERIFIED.get(key)
+    if verified is False:
+        return None
+    routed = matmul.differentiable_staged_qmm(group_size, bits)(x.reshape(M, K), w, scales, biases)
+    if verified is None:
+        native = mx.quantized_matmul(x.reshape(M, K), w, scales, biases, transpose = True,
+                                     group_size = group_size, bits = bits)
+        try:
+            verified = _settled(bool(mx.array_equal(routed.view(mx.uint16), native.view(mx.uint16)).item()))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return None
+        _STAGED_QMM_VERIFIED[key] = verified
+        if not verified:
+            logger.warning("staged prefill differs from native for %s; the staged route stays disabled", key)
+    return routed.reshape(*x.shape[:-1], N) if verified else None
 
 
 def _tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings):
@@ -5087,7 +5122,7 @@ def _dense_prefill_in_scope(module, x):
 
 def prefill_route(module, rows):
     """The route a `rows`-row call of this quantized linear takes under the scopes it holds now: "int8", "dense",
-    "tiled" or "stock". A route whose first-use check has not run yet counts as taken; one that failed it does not."""
+    "staged", "tiled" or "stock". A route whose first-use check has not run yet counts as taken; one that failed it does not."""
     d, w, scales = module.__dict__, module["weight"], module["scales"]
     N, K, dtype = w.shape[0], scales.shape[-1] * module.group_size, scales.dtype
     low = getattr(module, "_unsloth_nax_int8_prefill_rows", 0)
@@ -5096,13 +5131,18 @@ def prefill_route(module, rows):
         return "int8"
     if not d.get("_unsloth_dense_qmm_scopes"):
         return "stock"
+    if (d.get("_unsloth_staged_qmm") and matmul.staged_qmm_supported(rows, N, K, module.group_size, module.bits, module.mode)
+            and _STAGED_QMM_VERIFIED.get((rows, N, K, module.group_size, module.bits, dtype)) is not False):
+        return "staged"
     if (mx.__version__ in _DENSE_QMM_DISPATCH_MLX and rows >= _DENSE_QMM_MIN_ROWS and N != 1
             and -(-rows // 16) * -(-N // 16) > _DENSE_QMM_MIN_TILES and N * K <= _DENSE_QMM_MAX_WEIGHTS):
         biases = module.get("biases")
         family = (N, K, module.bits, module.group_size, module.mode, dtype, w.dtype, dtype,
                   getattr(biases, "dtype", None))
-        return "stock" if family in _DENSE_QMM_VERIFIED else "dense"
-    if d.get("_unsloth_tiled_qmm") and not N % _TILED_QMM_TILE["BN"] and not _tile_shape_loses(rows, N):
+        if family not in _DENSE_QMM_VERIFIED:
+            return "dense"
+    if (d.get("_unsloth_tiled_qmm") and module.mode == "affine" and not N % _TILED_QMM_TILE["BN"]
+            and not _tile_shape_loses(rows, N)):
         return "tiled"
     return "stock"
 
@@ -5129,7 +5169,8 @@ def dense_prefill_linear(model, *, _modules = None):
 
     Calls of 1024 or more rows on a large enough output dequantize the weight once and multiply
     densely, bit-identical to the quantized matmul; smaller calls,
-    training, and any shape that fails its first-use comparison keep the native call. A linear the
+    training, and any shape that fails its first-use comparison keep the exact tiled route when eligible,
+    otherwise the native call. A linear the
     NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
     `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
 
@@ -5137,6 +5178,8 @@ def dense_prefill_linear(model, *, _modules = None):
     run that kernel at a 64x32x64 tile instead. It sums K in stock's order, so it is bit-identical by
     construction (checked once per MLX version by a probe, not per shape); `UNSLOTH_MLX_TILED_PREFILL=0`
     turns that off.
+    On NAX GPUs, eligible affine prefill uses staged loads with native accumulation order, checked by a probe
+    and per shape on first use. `UNSLOTH_MLX_STAGED_PREFILL=0` turns this off; native vjps are retained.
     """
     changed = []
     try:
@@ -5146,6 +5189,7 @@ def dense_prefill_linear(model, *, _modules = None):
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 fused = _dense_qmm_class(nn.QuantizedLinear.__call__)
                 tiled = None   # its probe waits for a linear it could serve
+                staged = None
             if fused is not None:
                 seen = set()
                 for _, module in _fusion_modules(model, _modules):
@@ -5162,11 +5206,14 @@ def dense_prefill_linear(model, *, _modules = None):
                     else:
                         if tiled is None:   # before this module changes, so an interrupted probe leaves none behind
                             tiled = _tiled_prefill_enabled()
+                            staged = matmul.staged_qmm_available()
                         if type(module) is nn.QuantizedLinear:
                             module.__class__ = fused
                         module._unsloth_dense_qmm_scopes = 1
                         if tiled:
                             module.__dict__["_unsloth_tiled_qmm"] = True
+                        if staged:
+                            module.__dict__["_unsloth_staged_qmm"] = True
                     changed.append((module, fused))
         yield model
     finally:
@@ -5178,6 +5225,114 @@ def dense_prefill_linear(model, *, _modules = None):
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
                     module.__dict__.pop("_unsloth_tiled_qmm", None)
+                    module.__dict__.pop("_unsloth_staged_qmm", None)
+
+
+_WINDOW_MASK_LOCK = RLock()
+_WINDOW_MASK_MODULE = "mlx_vlm.models.gemma4.language"
+_WINDOW_MASK_CONTRACT = {
+    _WINDOW_MASK_MODULE: {
+        "Gemma4TextModel._make_masks": ("d02d670a2d988a1d", "bc6547b19c9add74"),
+        "Gemma4TextModel.__call__": "bad1bb823b9aa527",
+        "create_attention_mask": "a5e4c86965a3c8dc",
+        "RotatingKVCache.make_mask": "7868d53d8c02ff7c",
+        "RotatingKVCache.update_and_fetch": "7a59166cc2b5aa39",
+        "RotatingKVCache._update_concat": "fa642883e696d809",
+        "RotatingKVCache._trim": "d7e33b6fefc66bde",
+        "RotatingKVCache._temporal_order": "a83d18372d17df76",
+    },
+    "mlx_vlm.models.cache": {"create_causal_mask": "f1b52d364f9131c5"},
+}
+
+
+def _native_window_mask_source_matches(original):
+    """Follow only our known compiler wrapper to a pinned runtime mask builder."""
+    leaf = original
+    seen = set()
+    try:
+        while isinstance(leaf, FunctionType) and _ast_fingerprint(leaf) == "bc6547b19c9add74":
+            if id(leaf) in seen:
+                return False
+            seen.add(id(leaf))
+            cells = dict(zip(leaf.__code__.co_freevars, leaf.__closure__ or ()))
+            leaf = cells["original_make_masks"].cell_contents
+        if not isinstance(leaf, FunctionType):
+            return False
+        return not hasattr(leaf, "__wrapped__") and _ast_fingerprint(leaf) == "d02d670a2d988a1d"
+    except (AttributeError, KeyError, OSError, TypeError, SyntaxError):
+        return False
+
+
+@functools.cache
+def _native_window_class(base, cache_type, *cache_key):
+    original = base._make_masks
+    bindings = _resolved_bindings(_WINDOW_MASK_CONTRACT)
+    if bindings is None or not _native_window_mask_source_matches(original):
+        return None
+
+    @functools.wraps(original)
+    def masks(self, h, cache, mm_token_type_ids = None):
+        if not _bindings_intact(bindings):
+            return base._make_masks(self, h, cache, mm_token_type_ids)
+        result = original(self, h, cache, mm_token_type_ids)
+        if (self.training or mm_token_type_ids is not None or h.ndim != 3 or h.shape[0] != 1
+                or h.shape[1] <= 1 or not attention.native_window_available()):
+            return result
+        window = self.window_size
+        if type(window) is not int or window <= 0:
+            return result
+        rotating = [c for layer, c in zip(self.layers, cache)
+                    if layer.layer_type == "sliding_attention" and c is not None]
+        if (not rotating or any(type(c) is not cache_type or c.keep != 0 or c.max_size != window
+                or type(c.offset) is not int or getattr(c, "left_padding", None) is not None
+                or getattr(c, "right_padding", None) is not None for c in rotating)
+                or any(c.offset != rotating[0].offset for c in rotating[1:])):
+            return result
+        # The pinned builder owns these masks; caller-supplied masks bypass it entirely.
+        return [attention.WindowMask(mask, window) if layer.layer_type == "sliding_attention" else mask
+                for layer, mask in zip(self.layers, result)]
+
+    return type("_NativeWindowTextModel", (base,), {
+        "_make_masks": masks, "_unsloth_window_native": base,
+    })
+
+
+@contextmanager
+def native_window_attention(model, *, _modules = None):
+    """Run unpadded text-only Gemma4 sliding prefill on the native window kernel when available."""
+    changed = []
+    try:
+        runtime = sys.modules.get(_WINDOW_MASK_MODULE)
+        bindings = _resolved_bindings(_WINDOW_MASK_CONTRACT) if runtime is not None else None
+        if bindings is not None and attention.native_window_available():
+            attention.install_fused_attention()
+            base, cache_type = runtime.Gemma4TextModel, runtime.RotatingKVCache
+            patched = _native_window_class(base, cache_type, *(target for _, _, target in bindings))
+            if patched is None:
+                yield model
+                return
+            with _WINDOW_MASK_LOCK:
+                seen = set()
+                for _, module in _fusion_modules(model, _modules):
+                    if id(module) in seen or type(module) not in (base, patched) or module.training:
+                        continue
+                    seen.add(id(module))
+                    state = module.__dict__
+                    if state.get("_unsloth_window_scopes"):
+                        state["_unsloth_window_scopes"] += 1
+                    else:
+                        module.__class__ = patched
+                        state["_unsloth_window_scopes"] = 1
+                    changed.append((module, base, patched))
+        yield model
+    finally:
+        with _WINDOW_MASK_LOCK:
+            for module, base, patched in reversed(changed):
+                module._unsloth_window_scopes -= 1
+                if not module._unsloth_window_scopes:
+                    if type(module) is patched:
+                        module.__class__ = base
+                    del module.__dict__["_unsloth_window_scopes"]
 
 
 @functools.cache
@@ -9218,6 +9373,7 @@ INFERENCE_SCOPES = [
     InferenceScope(fused_moe_routed_experts),
     InferenceScope(nax_quantized_linear, int8_prefill = True),
     InferenceScope(dense_prefill_linear),
+    InferenceScope(native_window_attention),
     InferenceScope(singleton_quantized_decode, speculative = True),
     InferenceScope(ane_prefill_mlp, ane_prefill = True),
     InferenceScope(fused_packed_gated_delta),
