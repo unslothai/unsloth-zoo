@@ -3880,7 +3880,7 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     replayed = [plan[index][0].tolist() for index in (1, 2, 3)]
     assert replayed[1:] == [first[0].tolist(), replayed[0]] != [replayed[0]] * 2 and len(calls) == 1
     requests, defaults = calls[0]
-    assert defaults.stop_token_ids == (2,) and [r.max_tokens for r in requests] == [3] * 4
+    assert defaults.stop_token_ids == (2,) and defaults.token_ids_only and [r.max_tokens for r in requests] == [3] * 4
     assert len({r.sampling.seed for r in requests}) == 4 and requests[0].logits_processors and not GRPOSampling().warps
     assert [r.prompt_token_ids for r in requests] == [(14,), (14,), (14, 14), (14, 14)]
     assert seen["ids"] == [[1, 2], [1, 1, 1]] * 2 and seen["completions"][:2] == ["b", "bbb"] and seen["answer"] == [0, 0, 1, 1]  # noqa: E501

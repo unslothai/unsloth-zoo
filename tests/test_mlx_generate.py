@@ -375,6 +375,32 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
             _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
     assert Generator.instances[-1].closed is True
 
+@pytest.mark.parametrize("finish", ["stop", "length"])
+def test_token_ids_only_rows_skip_text_and_host_reads_and_keep_logprobs_on_device(monkeypatch, finish):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import generate as engine
+    class Generator(_OpenBatchGenerator):
+        def next_generated(self):
+            events = super().next_generated()
+            for event in events:
+                event.token, event.logprobs = self.steps, mx.array([-9.0, -0.1, -0.2, -0.3]) * (event.uid - 100)
+                event.finish_reason = event.finish_reason and finish
+            return events
+    def rows(**defaults):
+        adapter = object.__new__(_TextBatchAdapter)
+        adapter.model, adapter.tokenizer, adapter.batch_generator_type = object(), _CharTokenizer(), Generator
+        adapter.defaults, adapter.make_sampler = GenerationDefaults(**defaults), lambda **_kwargs: None
+        return _results(adapter.stream([GenerationRequest(prompt_token_ids=[9], max_tokens=3)] * 3))
+
+    plain = rows()
+    monkeypatch.setattr(engine, "_sampled_logprob", lambda _: pytest.fail("read on the host"))
+    monkeypatch.setattr(_CharTokenizer, "detokenizer", property(lambda _: pytest.fail("detokenized")))
+    ids_only = rows(token_ids_only=True, logprob_arrays=True)
+    for scale, (ids, text) in enumerate(zip(ids_only, plain), 1):  # each row its own log-probs, a stopping id's too
+        assert (ids.token_ids, ids.text, ids.logprobs, len(text.logprobs), ids.logprob_array.tolist()) == (text.token_ids, "", [], 3 - (finish == "stop"), pytest.approx([-0.1 * scale, -0.2 * scale, -0.3 * scale]))  # noqa: E501
+    with pytest.raises(ValueError, match="token_ids_only"): GenerationDefaults(token_ids_only=True, stop_strings=("x",))  # noqa: E701
+
+
 def test_generation_mode_releases_lock_when_limit_restore_raises(monkeypatch):
     model = types.SimpleNamespace(training=True)
     model.named_modules = lambda: [("", model)]

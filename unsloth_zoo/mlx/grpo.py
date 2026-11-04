@@ -790,6 +790,7 @@ class GRPOBatchPlan:
         ]
         defaults = GenerationDefaults(
             max_tokens=self.sampling.max_tokens, stop_token_ids=(self.eos_id,),
+            token_ids_only=self._processor is None,  # completions are decoded once, after the cut
         )
         with self._rollout_context():
             results = generate_module.generate_batch(

@@ -163,7 +163,11 @@ class SamplingParams:
 class GenerationDefaults:
     """Batch-wide defaults used when a request does not override a value.
 
-    ``stop_token_ids`` replaces the tokenizer's EOS set as the stop ids.
+    ``stop_token_ids`` replaces the tokenizer's EOS set as the stop ids. Text batches
+    only: ``token_ids_only`` skips detokenizing and the host read of every sampled
+    log-prob, leaving results' ``text`` and ``logprobs`` empty; ``logprob_arrays`` puts
+    those log-probs, a stopping id's included, in ``GenerationResult.logprob_array`` as
+    one device array instead.
     """
 
     max_tokens: int = 256
@@ -178,9 +182,14 @@ class GenerationDefaults:
     quantized_kv_start: int | None = None
     stop_token_ids: tuple[int, ...] | None = None
     prefill_step_size: int | None = None  # None: the runtime's own
+    token_ids_only: bool = False
+    logprob_arrays: bool = False
 
     def __post_init__(self):
         _validate_positive_int(self.max_tokens, "defaults.max_tokens")
+        for name in ("token_ids_only", "logprob_arrays"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"defaults.{name} must be a bool.")
         _validate_positive_int(
             self.prefill_batch_size,
             "defaults.prefill_batch_size",
@@ -213,6 +222,8 @@ class GenerationDefaults:
         if not isinstance(self.sampling, SamplingParams):
             raise TypeError("defaults.sampling must be SamplingParams.")
         stops = _normalize_stop_strings(self.stop_strings)
+        if stops and self.token_ids_only:
+            raise ValueError("stop_strings cut decoded text, which token_ids_only does not decode.")
         if self.stop_token_ids is not None:
             try:
                 stop_ids = tuple(self.stop_token_ids)
@@ -328,6 +339,7 @@ class GenerationResult:
     # Speculative decoding: tokens the reply's drafts proposed, and how many the target accepted.
     draft_tokens: int = 0
     accepted_draft_tokens: int = 0
+    logprob_array: Any = None
 
 
 def _validate_positive_int(value: Any, name: str):
@@ -756,6 +768,8 @@ def _generation_processor(adapter):
 
 
 def _validate_vlm_defaults(defaults: GenerationDefaults) -> None:
+    if defaults.token_ids_only or defaults.logprob_arrays:
+        raise ValueError("token_ids_only and logprob_arrays are served by text batches only.")
     if defaults.prefill_batch_size > defaults.completion_batch_size:
         # An inverted pair never admits anything on mlx-vlm, so generation would
         # hang. mlx-lm normalizes the two, so this is vision-specific.
@@ -1574,6 +1588,19 @@ class _DecodeStreamingDetokenizer:
         return segment
 
 
+class _NoText:
+    last_segment = ""
+
+    def reset(self):
+        pass
+
+    def add_token(self, token):
+        pass
+
+    def finalize(self):
+        pass
+
+
 def _new_detokenizer(tokenizer, *, require_independent: bool = False):
     """A detokenizer owned by one sequence.
 
@@ -1630,6 +1657,7 @@ class _PendingResult:
     draft_tokens: int = 0
     accepted_draft_tokens: int = 0
     sampled: list[int] = field(default_factory=list)
+    logprob_values: list = field(default_factory=list)
 
     def release(self) -> str:
         delta = self.text[self.released :]
@@ -1663,14 +1691,17 @@ class _PendingResult:
         self.released = min(self.released, len(self.text))
         self.finish_reason = "stop_string"
 
-    def add_terminal(self, token: int, logprob: float):
+    def add_terminal(self, token: int, logprob: float | None, value = None):
         self.token_ids.append(token)
-        self.logprobs.append(logprob)
+        if logprob is not None:
+            self.logprobs.append(logprob)
+        if value is not None:
+            self.logprob_values.append(value)
         self.sampled.append(token)
         self.detokenizer.add_token(token)
 
-    def append(self, tokenizer, token: int, logprob: float) -> bool:
-        self.add_terminal(token, logprob)
+    def append(self, tokenizer, token: int, logprob: float | None, value = None) -> bool:
+        self.add_terminal(token, logprob, value)
         self.text += self.detokenizer.last_segment
         match = self.scanner.feed(self.text)
         if match is None:
@@ -1703,7 +1734,16 @@ class _PendingResult:
             cached_token_count=self.cached_token_count,
             draft_tokens=self.draft_tokens,
             accepted_draft_tokens=self.accepted_draft_tokens,
+            logprob_array=_stacked(self.logprob_values),
         )
+
+
+def _stacked(values):
+    if not values:
+        return None
+    import mlx.core as mx
+
+    return mx.stack(values)
 
 
 def _encode_prompt(tokenizer, request: GenerationRequest) -> list[int]:
@@ -1873,7 +1913,7 @@ class _TextBatchSession:
                 )
             uid = uids[0]
             state = _PendingResult(
-                detokenizer=_new_detokenizer(adapter.tokenizer),
+                detokenizer=_NoText() if defaults.token_ids_only else _new_detokenizer(adapter.tokenizer),
                 scanner=_StopStringScanner(defaults.stop_strings),
                 prompt_token_count=len(prefilled) + len(prompt),
             )
@@ -1949,11 +1989,23 @@ class _TextBatchSession:
                     "mlx-lm ended its event stream before every request "
                     "reported a finish reason."
                 )
+            values = self._logprob_values(responses) if self.adapter.defaults.logprob_arrays else {}
             for response in responses:
-                yield from self._consume(response)
+                yield from self._consume(response, values.get(response.uid))
         except BaseException:
             self.usable = False
             raise
+
+    def _logprob_values(self, responses) -> dict:
+        """Each live row's sampled log-prob, copied out of the step's vocabulary rows so they can be freed."""
+        import mlx.core as mx
+
+        live = [response for response in responses if response.uid in self._pending]
+        if not live:
+            return {}
+        picked = mx.stack([response.logprobs[int(response.token)] for response in live])
+        mx.async_eval(picked)
+        return {response.uid: picked[row] for row, response in enumerate(live)}
 
     def close(self):
         self.generator.close()
@@ -1964,18 +2016,17 @@ class _TextBatchSession:
         if row is not None:
             self._uid_of.pop(row, None)
 
-    def _consume(self, response) -> Iterator[GenerationEvent]:
+    def _logprob(self, response) -> float | None:
+        return None if self.adapter.defaults.token_ids_only else _sampled_logprob(response)
+
+    def _consume(self, response, value = None) -> Iterator[GenerationEvent]:
         state = self._pending.get(response.uid)
         if state is None:
             return
         row = self._row_of[response.uid]
         finish_reason = response.finish_reason
         if finish_reason is None:
-            stopped = state.append(
-                self.adapter.tokenizer,
-                int(response.token),
-                _sampled_logprob(response),
-            )
+            stopped = state.append(self.adapter.tokenizer, int(response.token), self._logprob(response), value)
             if not stopped:
                 yield from _text_events(row, state)
                 return
@@ -1989,7 +2040,9 @@ class _TextBatchSession:
                 f"{finish_reason!r}."
             )
         if finish_reason == "length":
-            state.add_terminal(int(response.token), _sampled_logprob(response))
+            state.add_terminal(int(response.token), self._logprob(response), value)
+        elif value is not None:
+            state.logprob_values.append(value)
         state.finish(self.adapter.tokenizer, finish_reason, int(response.token))
         yield from _finished_events(row, state, self.adapter.tokenizer)
         self._retire(response.uid)
