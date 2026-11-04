@@ -13,17 +13,12 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 
-"""requires_grad_for_gradient_checkpointing re-registers the forward hooks it keeps; a hook registered with
-always_call = True must stay one, or it stops running when the forward raises (training_utils' float32 bias exit hook
-relies on it to pop its mark)."""
+"""requires_grad_for_gradient_checkpointing must keep always_call on the forward hooks it re-registers."""
 
 import pytest
 import torch
 
 from unsloth_zoo.peft_utils import requires_grad_for_gradient_checkpointing
-
-if "always_call" not in torch.nn.Module.register_forward_hook.__code__.co_varnames:
-    pytest.skip("torch has no always_call forward hooks", allow_module_level = True)
 
 
 class _Block(torch.nn.Module):
@@ -77,4 +72,4 @@ def test_hooks_still_run_after_a_good_forward():
     model, calls = _prepared_model()
     model(torch.randn(2, 4))
     assert calls == {"always": 1, "plain": 1}, calls
-    assert len(model.block._forward_hooks_always_called) <= len(model.block._forward_hooks)
+    assert set(model.block._forward_hooks_always_called) <= set(model.block._forward_hooks)

@@ -603,26 +603,17 @@ def requires_grad_for_gradient_checkpointing(model):
     # Enables requires_grad to make gradient checkpointing work on
     # non language models that don't just use .embed_tokens
     def register_other_hooks(name1, name2, module, _hooks):
-        old_hooks = eval(f"module.{_hooks}")
-        # Hooks with with_kwargs = True (Unsloth's inputs_embeds pre-hook) take (module, args, kwargs); re-register them
-        # the same way, or the next forward calls them with two arguments.
+        # Re-register kept hooks with their with_kwargs / always_call flags (#1881).
         with_kwargs = set(getattr(module, f"{_hooks}_with_kwargs", None) or ())
-        # Forward hooks registered with always_call = True (they run even when forward raises) keep that flag too.
         always_call = set(getattr(module, f"{_hooks}_always_called", None) or ())
         other_hooks = []
-        for key, value in old_hooks.items():
+        for key, value in getattr(module, _hooks).items():
             qualname = getattr(value, "__qualname__", "")
-            name     = getattr(value, "__name__", "")
-            if name1 in qualname or name2 in qualname: pass
-            elif name2 in name or name2 in name: pass
-            else: other_hooks.append((value, key in with_kwargs, key in always_call))
-        pass
-        # Keep none input requires grad hooks
-        exec(f"module.{_hooks} = OrderedDict()")
-        if hasattr(module, f"{_hooks}_with_kwargs"):
-            getattr(module, f"{_hooks}_with_kwargs").clear()
-        if hasattr(module, f"{_hooks}_always_called"):
-            getattr(module, f"{_hooks}_always_called").clear()
+            if name1 in qualname or name2 in qualname or name2 in getattr(value, "__name__", ""): continue
+            other_hooks.append((value, key in with_kwargs, key in always_call))
+        setattr(module, _hooks, OrderedDict())
+        for flags in (f"{_hooks}_with_kwargs", f"{_hooks}_always_called"):
+            if hasattr(module, flags): getattr(module, flags).clear()
         register = getattr(module, f"register{_hooks[:-1]}")
         for hook, kwargs_hook, always_hook in other_hooks:
             options = {}
