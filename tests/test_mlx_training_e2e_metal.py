@@ -2,6 +2,7 @@
 gradient-driven progress and adapter saving across grad-clip paths, decoupled weight decay, batching, CCE and
 baseline losses."""
 
+import contextvars
 import glob
 import json
 import os
@@ -27,6 +28,8 @@ if _METAL:
     import mlx.nn as nn
     import mlx.optimizers as optim
     from mlx.utils import tree_flatten, tree_map
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import inference, matmul
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     from unsloth_zoo.mlx import utils as mlx_utils
@@ -414,6 +417,60 @@ def test_training_attention_differentiates_short_queries_and_sinks(T, mask, sink
     finally:
         mlx_utils.release_mlx_training_patches()
     assert mx.allclose(got, mx.grad(reference)(q), atol=1e-4)
+
+
+@metal_only
+@pytest.mark.parametrize("case,shape,N,bits,routed,value", [
+    ("8bit_batched", (2, 768, 256), 1024, 8, True, 1), ("bias", (1, 1536, 256), 1024, 4, True, 3),
+    ("below_floor", (1, 1535, 256), 1024, 4, False, 0), ("thin", (1, 1536, 256), 1016, 4, False, 0),
+    ("2bit", (1, 1536, 256), 1024, 2, False, 0), ("eval_policy", (1, 1536, 256), 1024, 4, True, 1),
+    ("eval_reference", (1, 1536, 256), 1024, 4, True, 1), ("trainable_scales", (1, 1536, 256), 1024, 4, False, 0),
+    ("at_cap", (1, 1536, 256), 1024, 4, True, 1), ("over_cap", (1, 1536, 256), 1024, 4, False, 0),
+    ("other_context", (1, 1536, 256), 1024, 4, False, 0), ("dense_off", (1, 1536, 2048), 2048, 4, False, 0)])
+def test_training_route_takes_large_frozen_projections(monkeypatch, case, shape, N, bits, routed, value):
+    (*rows, K), calls, native, x = shape, [], nn.QuantizedLinear.__call__, mx.zeros(shape, mx.bfloat16)
+    for target, name in ((matmul, "simd_qmm_available"), (matmul, "_train_dequantize_kernel"),
+                         (matmul.nax, "kernel_probe_passed")):
+        monkeypatch.setattr(target, name, lambda *args: True)
+    monkeypatch.delenv("UNSLOTH_MLX_DENSE_TRAIN_QMM", raising = False)
+    if case == "dense_off":
+        monkeypatch.setenv("UNSLOTH_MLX_DENSE_TRAIN_QMM", "0")
+    monkeypatch.setattr(matmul, "_DENSE_TRAIN_QMM_MAX_WEIGHTS", K * N + {"at_cap": 0, "over_cap": -1}.get(case, 1))
+    monkeypatch.setattr(matmul, "_dense_train_qmm", lambda group_size, bits: lambda x, w, s, b: (
+        calls.append((x.shape, bits)) or mx.ones((x.shape[0], w.shape[0]), x.dtype)))
+    base = nn.QuantizedLinear(K, N, bias = case == "bias", bits = bits)
+    base.set_dtype(mx.bfloat16)
+    base.update({"bias": mx.full((N,), 2, mx.bfloat16)} if case == "bias" else {})
+    base.unfreeze(keys = ["scales"] if case == "trainable_scales" else [])
+    layer = base if case == "eval_reference" else LoRALinear.from_base(base, r = 8)
+    layer.train(case not in ("eval_policy", "eval_reference"))
+    mlx_utils.acquire_mlx_training_patches()
+    try:   # inference contracts on the native call hold while the route is installed
+        assert inference._resolved_bindings(inference._DENSE_QMM_CONTRACT) is not None
+        y = contextvars.Context().run(layer, x) if case == "other_context" else layer(x)
+    finally:
+        mlx_utils.release_mlx_training_patches()
+    assert calls == ([((rows[0] * rows[1], K), bits)] if routed else [])
+    assert mx.array_equal(y, mx.full((*rows, N), value, mx.bfloat16)).item()
+    assert nn.QuantizedLinear.__call__ is native
+
+
+@metal_only
+@pytest.mark.parametrize("bits", [4, 8])
+def test_output_and_input_gradient_are_no_further_from_fp32_than_stock(bits):
+    matmul.probe_dense_train_qmm()   # the GEMM operand is stock's tile, bit for bit
+    w, scales, biases = mx.quantize((mx.random.normal((1536, 1024), key = mx.random.key(bits)) * 0.02).astype(
+        mx.bfloat16), group_size = 64, bits = bits)
+    x, r = (mx.random.normal((640, n), key = mx.random.key(k)).astype(mx.bfloat16) for k, n in ((1, 1024), (2, 1536)))
+    exact = mx.dequantize(w, scales.astype(mx.float32), biases.astype(mx.float32), group_size = 64, bits = bits)
+    want = mx.vjp(lambda x: x @ exact.T, [x.astype(mx.float32)], [r.astype(mx.float32)])
+    errors = {}
+    for name, f in (("stock", lambda x: mx.quantized_matmul(x, w, scales, biases, group_size = 64, bits = bits)),
+                    ("dense", lambda x: matmul._dense_train_qmm(64, bits)(x, w, scales, biases))):
+        (y,), (dx,) = mx.vjp(f, [x], [r])
+        gaps = [mx.abs(got.astype(mx.float32) - ref) for got, ref in zip((y, dx), (want[0][0], want[1][0]))]
+        errors[name] = [value.item() for gap in gaps for value in (gap.max(), gap.mean())]
+    assert all(d <= 1.1 * s for d, s in zip(errors["dense"], errors["stock"])), errors
 
 
 @metal_only

@@ -587,6 +587,32 @@ def _set_mlx_windowed_attention(enabled: bool) -> None:
             setattr(module, attr, original)
 
 
+def _train_qmm_call(native, routes):
+    from . import matmul
+
+    def call(self, x):
+        routed = matmul.call_train_qmm_route(self, x, routes) if mlx_training_patches_active() else None
+        if routed is None:
+            return native(self, x)
+        return routed + self["bias"] if "bias" in self else routed
+
+    # Outside a training context every call is the native one, so contracts pinning the native still hold.
+    call._unsloth_original = call._unsloth_exact_route_of = native
+    return call
+
+
+def _set_mlx_train_qmm(enabled: bool) -> None:
+    current = nn.QuantizedLinear.__call__
+    original = getattr(current, "_unsloth_original", None)
+    if enabled and original is None:
+        from . import matmul
+        routes = matmul.available_train_qmm_routes()
+        if routes:
+            nn.QuantizedLinear.__call__ = _train_qmm_call(current, routes)
+    elif not enabled and original is not None:
+        nn.QuantizedLinear.__call__ = original
+
+
 def acquire_mlx_training_patches() -> None:
     """Reference-counted because the mlx.core patches are process-wide while trainer runs are not, so an inner run must not unpatch an outer one."""
     global _MLX_TRAINING_PATCH_DEPTH
@@ -596,6 +622,7 @@ def acquire_mlx_training_patches() -> None:
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(True)
             _set_mlx_windowed_attention(True)
+            _set_mlx_train_qmm(True)
         _MLX_TRAINING_PATCH_DEPTH += 1
     _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
 
@@ -609,6 +636,7 @@ def release_mlx_training_patches() -> None:
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(False)
             _set_mlx_windowed_attention(False)
+            _set_mlx_train_qmm(False)
     _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
 
 
@@ -626,6 +654,7 @@ def pause_mlx_training_patches() -> bool:
         _MLX_TRAINING_PATCH_DEPTH = 0
         _set_mlx_index_gradient_stop(False)
         _set_mlx_windowed_attention(False)
+        _set_mlx_train_qmm(False)
         return True
 
 
@@ -639,6 +668,7 @@ def resume_mlx_training_patches(paused: bool) -> None:
             if _MLX_TRAINING_PATCH_DEPTH == 0:
                 _set_mlx_index_gradient_stop(True)
                 _set_mlx_windowed_attention(True)
+                _set_mlx_train_qmm(True)
             _MLX_TRAINING_PATCH_DEPTH += 1
     stack = _MLX_TRAINING_PAUSE_STACK.get()
     if stack:
