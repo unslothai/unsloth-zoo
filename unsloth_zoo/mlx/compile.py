@@ -6764,21 +6764,36 @@ def _install_phi4_multimodal_patches():
 
     def patch_siglip_resize(module):
         interpolate_module = importlib.import_module("mlx_vlm.models.interpolate")
+        # mlx-vlm 0.7.12 resizes channels-last with PyTorch's triangle filter, through differentiable ops when training.
+        resize_nhwc = vars(module).get("resize_bilinear_nhwc")
+        takes_training = resize_nhwc is not None and "training" in inspect.signature(resize_nhwc).parameters
 
-        def patched_resize_positional_embeddings(positional_embeddings, spatial_shapes, max_length):
+        def patched_resize_positional_embeddings(positional_embeddings, spatial_shapes, max_length, *, training=False):
             spatial_shapes = _size_pairs_to_tuple(spatial_shapes)
             embed_dim = positional_embeddings.shape[-1]
             source_dtype = positional_embeddings.dtype
-            pos_emb = positional_embeddings.transpose(2, 0, 1)[None, :]
+            if resize_nhwc is None:
+                pos_emb = positional_embeddings.transpose(2, 0, 1)[None, :]
+            else:
+                pos_emb = positional_embeddings[None].astype(mx.float32)
             outputs = []
             for height, width in spatial_shapes:
-                resized = interpolate_module.resize_bilinear(
-                    pos_emb,
-                    (height, width),
-                    align_corners=False,
-                    antialias=True,
-                )
-                resized = resized.reshape(embed_dim, height * width).transpose(1, 0)
+                if resize_nhwc is not None:
+                    resized = resize_nhwc(
+                        pos_emb,
+                        (height, width),
+                        align_corners=False,
+                        antialias=True,
+                        **({"training": training} if takes_training else {}),
+                    ).reshape(height * width, embed_dim)
+                else:
+                    resized = interpolate_module.resize_bilinear(
+                        pos_emb,
+                        (height, width),
+                        align_corners=False,
+                        antialias=True,
+                    )
+                    resized = resized.reshape(embed_dim, height * width).transpose(1, 0)
                 if height * width < max_length:
                     padding = mx.broadcast_to(
                         resized[0:1],
