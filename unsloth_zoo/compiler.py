@@ -754,6 +754,23 @@ def no_update_causal_mask(*args, **kwargs):
     return None
 
 
+# SDPA (is_causal) and flash attention stay causal without a mask; eager / flex would see future tokens.
+_MASK_FREE_ATTENTION = ("sdpa", "flash_attention_2", "flash_attention_3")
+
+
+def make_no_update_causal_mask(original):
+    if hasattr(original, "__wrapped__"):
+        return original
+
+    @functools.wraps(original)
+    def _update_causal_mask(self, *args, **kwargs):
+        if getattr(getattr(self, "config", None), "_attn_implementation", None) in _MASK_FREE_ATTENTION:
+            return None
+        return original(self, *args, **kwargs)
+
+    return _update_causal_mask
+
+
 # Patch SDPA
 def replace_with_grouped_query_attention(module, source):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -7108,18 +7125,8 @@ def unsloth_compile_transformers(
             )
             continue
 
-        # Only SDPA turns a missing mask into is_causal. Eager attention (T5, Bloom, GPT-J) would see the future.
-        if not getattr(source, "_supports_sdpa", False):
-            print(
-                f"Unsloth: Will not remove causal mask for {module} since it does not use SDPA!"
-            )
-            continue
-
-        exec(
-            f"{model_location}.{module}._update_causal_mask = no_update_causal_mask",
-            globals(),
-        )
-        print(f"Unsloth: Removed causal mask for {module} to reduce memory usage.")
+        source._update_causal_mask = make_no_update_causal_mask(source._update_causal_mask)
+        print(f"Unsloth: Removed causal mask for {module} under SDPA / flash attention to reduce memory usage.")
     pass
 
     # Patch LM Head
