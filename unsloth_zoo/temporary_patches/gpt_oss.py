@@ -57,7 +57,8 @@ from unsloth_zoo.gpt_oss_decode_fused import (
 )
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
-_IS_TRANSFORMERS_V5 = transformers_version >= Version("5.0.0.dev0")
+# Not "5.0.0.dev0": Version() maps it to 5.0.0.1, which excludes the 5.0.0 release.
+_IS_TRANSFORMERS_V5 = transformers_version >= Version("5.0.0")
 from .utils import (
     patch_function,
     patch_function_past_key_values,
@@ -1676,7 +1677,7 @@ def _is_gpt_oss_4bit_load() -> bool:
 
 
 def _is_transformers_v5() -> bool:
-    return _IS_TRANSFORMERS_V5
+    return transformers_version >= Version("5.0.0.dev0")
 
 
 _GPT_OSS_COMPILED_MODULE = "unsloth_compiled_module_gpt_oss"

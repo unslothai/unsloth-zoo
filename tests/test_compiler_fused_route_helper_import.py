@@ -133,4 +133,14 @@ def test_gpt_oss_router_forward_no_version_call_during_eval(monkeypatch):
 
     monkeypatch.setattr(gpt_oss, "Version", _fail_version)
     out = router.forward(hidden)
-    assert len(out) in (2, 3)
+    assert len(out) == (3 if gpt_oss._IS_TRANSFORMERS_V5 else 2)
+
+
+def test_gpt_oss_router_v5_flag_matches_installed_transformers():
+    # transformers 5.0.0 GptOssMLP unpacks three values from the router.
+    from importlib.metadata import version
+    from packaging.version import Version as PkgVersion
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    expected = PkgVersion(version("transformers")).release[0] >= 5
+    assert gpt_oss._IS_TRANSFORMERS_V5 is expected
