@@ -464,3 +464,418 @@ def test_phi4_multimodal_decoder_weights_map_to_its_bare_and_wrapped_names():
         assert decision._decoder_tensor_name(wrapper, path, stored) == f"model.layers.{layer}.self_attn.qkv_proj.{held}"
         # Its adapter is saved and resumed under the linear's own name, which is what PEFT and the merge read.
         assert decision._adapter_stem(wrapper, path.removesuffix(".weight"), stored) == f"base_model.model.model.layers.{layer}.self_attn.qkv_proj"
+
+
+class _D1Engine:
+    def __init__(self, probabilities):
+        self.probabilities, self.requests = probabilities, []
+
+    def ask(self, question):
+        return question
+
+    def run(self, requests):
+        self.requests += requests
+        return [(self.probabilities, 11)]
+
+
+def _d1(backbone, probabilities):
+    model = decision._D1Model.__new__(decision._D1Model)
+    engine = _D1Engine(probabilities)
+    model._backbone, model.processor = backbone, "processor"
+    model.reads_audio, model.noul_true_first = backbone in ("d1_omni", "lfm3_omni"), backbone != "d1_omni"
+    model.model = types.SimpleNamespace(engine = engine)
+    return model, engine
+
+
+D1_QUESTIONS = {
+    "yes": {"instructions": "i", "type": "noul"},
+    "team": {"instructions": "i", "type": "choice", "criteria": {"b": "second", "a": None}},
+    "level": {"instructions": "i", "type": "score", "criteria": ["low", "mid", "high"]},
+}
+
+
+def test_d1_answers_the_engines_probabilities_on_this_contract():
+    model, engine = _d1("lfm3_vl", [[0.8, 0.2], [0.25, 0.75], [0.1, 0.2, 0.7]])
+    result = model.answer(None, D1_QUESTIONS)
+    answers = result["answers"]
+    assert result["usage"] == {"input_tokens": 11, "output_tokens": 0}
+    # The engine's calibration is applied already, so nothing is read through a temperature again.
+    assert answers["yes"]["noul"] == pytest.approx(0.8)
+    assert answers["team"]["choice"] == "a"
+    assert answers["team"]["probabilities"] == pytest.approx({"b": 0.25, "a": 0.75})
+    assert answers["level"]["score"] == 2.0
+    assert answers["level"]["confidence"] == pytest.approx(0.7)
+    assert answers["team"]["confidence"] == pytest.approx(0.75)
+    state, questions, media = engine.requests[0]
+    assert state is None and media == []
+    # Options keep the caller's order, which is what the probabilities follow.
+    assert questions[1]["criteria"] == {"b": "second", "a": None}
+    assert questions[2]["criteria"] == ["low", "mid", "high"]
+
+
+def test_d1_score_stops_at_the_first_level_past_half_and_lfm2_keeps_the_general_readout():
+    question = {"level": {"instructions": "i", "type": "score", "criteria": ["low", "mid", "high"]}}
+    assert _d1("lfm3_omni", [[0.5, 0.1, 0.4]])[0].answer("s", question)["answers"]["level"]["score"] == 0.0
+    # The median, not the likeliest level.
+    assert _d1("lfm3_omni", [[0.3, 0.3, 0.4]])[0].answer("s", question)["answers"]["level"]["score"] == 1.0
+    answer = _d1("lfm2_vl", None)[0]
+    answer.model = types.SimpleNamespace(probabilities = lambda *_: ([[0.1, 0.2, 0.7]], 5))
+    read = answer.answer("s", question)["answers"]["level"]
+    assert read["score"] == pytest.approx(1.6) and read["confidence"] != pytest.approx(0.7)
+
+
+def test_d1_passes_on_what_true_and_false_mean():
+    model, engine = _d1("lfm3_vl", [[0.5, 0.5]])
+    model.answer("s", {"yes": {"instructions": "i", "type": "noul", "criteria": {"true": "adult", "false": "minor"}}})
+    assert engine.requests[0][1][0]["criteria"] == {"true": "adult", "false": "minor"}
+    model.answer("s", {"yes": {"instructions": "i", "type": "noul"}})
+    assert "criteria" not in engine.requests[1][1][0]
+
+
+def test_d1_omni_reads_a_noul_false_first_and_one_medium():
+    model, _ = _d1("d1_omni", None)
+    seen = []
+
+    def probabilities(processor, requests):
+        seen.extend(requests)
+        return [([[0.3, 0.7]], 5)]
+
+    model.model = types.SimpleNamespace(probabilities = probabilities)
+    question = {"yes": D1_QUESTIONS["yes"]}
+    assert model.answer("s", question)["answers"]["yes"]["noul"] == pytest.approx(0.7)
+    assert seen[0][2:] == (None, None)
+    with pytest.raises(DecisionUnsupportedError, match = "images or audio"):
+        model._read("s", [], ["image"], ["clip"])
+    with pytest.raises(DecisionUnsupportedError, match = "one audio clip"):
+        model._read("s", [], [], ["clip", "clip"])
+
+
+def test_d1_hears_audio_only_on_the_models_that_do():
+    model, engine = _d1("lfm3_omni", [[0.5, 0.5]])
+    clip = np.zeros(4, np.float32)
+    model._read(None, [{"type": "noul", "instructions": "i"}], ["picture"], [clip])
+    media = engine.requests[0][2]
+    assert media[0] == "picture" and media[1]["type"] == "audio" and media[1]["sampling_rate"] == 16000
+    assert _d1("lfm3_vl", [[0.5, 0.5]])[0].reads_audio is False
+
+
+def test_d1_on_lfm2_asks_its_engine_in_the_form_it_reads():
+    pytest.importorskip("mlx_vlm.models.d1.prompt")
+    model, _ = _d1("lfm2_vl", None)
+    seen = []
+
+    def probabilities(processor, state, questions, images):
+        seen.extend(questions)
+        return [[0.8, 0.2]], 5
+
+    model.model = types.SimpleNamespace(probabilities = probabilities)
+    assert model.answer("s", {"yes": D1_QUESTIONS["yes"]})["answers"]["yes"]["noul"] == pytest.approx(0.8)
+    assert seen[0]["criteria"] is None
+
+
+def test_d1_turns_an_engine_refusal_into_a_request_error():
+    model, engine = _d1("lfm3_vl", None)
+    engine.run = lambda requests: (_ for _ in ()).throw(ValueError("no such question"))
+    with pytest.raises(DecisionRequestError, match = "no such question"):
+        model.answer("s", {"yes": D1_QUESTIONS["yes"]})
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "d1_omni"},
+        {"model_type": "lfm3_omni", "architectures": ["D1Model"]},
+        {"model_type": "lfm3_vl", "auto_map": {"AutoModel": "modeling_d1_lfm3_vl.D1Model"}},
+        {"model_type": "lfm2_vl", "auto_map": {"AutoModel": "modeling_d1.D1Model"}},
+    ],
+)
+def test_d1_is_detected_from_its_config(tmp_path, config):
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert decision.detect_family(tmp_path) == "d1"
+
+
+@pytest.mark.parametrize(
+    "backbone, audio, true_first",
+    [("lfm2_vl", False, True), ("d1_omni", True, False), ("lfm3_vl", False, True), ("lfm3_omni", True, True)],
+)
+def test_d1_load_reads_its_abilities_from_the_backbone(tmp_path, monkeypatch, backbone, audio, true_first):
+    mlx_vlm_utils = pytest.importorskip("mlx_vlm.utils")
+    import importlib.util
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": backbone}))
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(mlx_vlm_utils, "load", lambda path: ("model", "processor"))
+    model = decision._D1Model(tmp_path, None)
+    assert (model.reads_audio, model.noul_true_first, model.model, model.source) == (audio, true_first, "model", tmp_path)
+
+
+def test_d1_says_when_the_installed_mlx_vlm_lacks_its_engine(tmp_path, monkeypatch):
+    pytest.importorskip("mlx_vlm.utils")
+    import importlib.util
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm3_omni"}))
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(ValueError, match = "needs a newer mlx-vlm"):
+        decision._D1Model(tmp_path, None)
+
+
+def test_a_plain_lfm3_is_not_a_d1(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm3_omni", "auto_map": {"AutoModel": "modeling_lfm3_omni.Lfm3OmniModel"}}))
+    assert decision.detect_family(tmp_path) is None
+
+
+_D1_PROMPT = "mlx_vlm.models.d1_lfm3_vl.prompt"
+
+
+class _D1Tokens:
+    def encode(self, text, add_special_tokens = False):
+        return [ord(character) for character in text]
+
+
+def _d1_trainable(backbone = "lfm3_omni", set_size = 4):
+    import mlx.core as mx
+
+    model = decision._D1Model.__new__(decision._D1Model)
+    model._backbone, model.noul_true_first = backbone, True
+    hidden = mx.array([[float(i), 1.0] for i in range(40)])
+    embed = lambda tokens: mx.stack([tokens.astype(mx.float32), mx.zeros_like(tokens.astype(mx.float32))], axis = -1)
+    engine = types.SimpleNamespace(
+        ask = lambda question: question, set_size = set_size, tokenizer = _D1Tokens(), bos = "", state_style = None, system = None, lead = "",
+        media = types.SimpleNamespace(encode = lambda media: ("", [])),
+    )
+    model.model = types.SimpleNamespace(
+        engine = engine, d1_hidden = lambda ids, state, groups, media: hidden, d1_features = None,
+        language_model = types.SimpleNamespace(model = types.SimpleNamespace(embed_tokens = embed)),
+    )
+    return model
+
+
+def test_d1_item_packs_questions_after_the_state_and_reads_each_at_its_last_token(monkeypatch):
+    prompt = pytest.importorskip(_D1_PROMPT)
+    monkeypatch.setattr(prompt, "prefix_text", lambda tokenizer, state, *_: f"S:{state}\n")
+    monkeypatch.setattr(prompt, "question_header", lambda *_: "Q\n")
+    monkeypatch.setattr(prompt, "suffix_layout", lambda tokenizer, question, lead: (f"{question['instructions']}?", [0]))
+    questions = {"a": {"type": "noul", "instructions": "x"}, "b": {"type": "choice", "instructions": "yy", "criteria": {"k": None, "l": None, "m": None}}}
+    item = decision.d1_training_item(_d1_trainable(), "st", questions)
+    # "S:st\n" is the state, "x?" the first question, then "Q\nyy?" the second.
+    assert item["state_length"] == 5 and item["input_ids"] == [ord(c) for c in "S:st\nx?Q\nyy?"]
+    assert item["groups"] == [-1] * 5 + [1, 1] + [2] * 5
+    assert item["slots"] == [6, 11]
+    assert [len(spans) for spans in item["option_spans"]] == [2, 3]
+    assert item["types"] == [decision._TYPE_IDS.index("noul"), decision._TYPE_IDS.index("choice")]
+    assert "images" not in item
+
+
+def test_d1_item_reads_the_states_images_as_a_request_does(monkeypatch):
+    prompt = pytest.importorskip(_D1_PROMPT)
+    seen = []
+    monkeypatch.setattr(prompt, "prefix_text", lambda tokenizer, state, *_: seen.append(state) or "S\n")
+    monkeypatch.setattr(prompt, "question_header", lambda *_: "Q\n")
+    monkeypatch.setattr(prompt, "suffix_layout", lambda tokenizer, question, lead: ("x?", [0]))
+    monkeypatch.setattr(decision, "_d1_media", lambda item: [])
+    url = "data:image/png;base64,AAAA"
+    state = {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": url}}]}]}
+    picture = object()
+    item = decision.d1_training_item(_d1_trainable(), state, {"a": {"type": "noul", "instructions": "x"}}, images = [picture])
+    assert item["images"] == [picture, url]
+    assert seen == [{"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}]
+
+
+def test_d1_item_refuses_more_questions_than_a_row_trained(monkeypatch):
+    pytest.importorskip(_D1_PROMPT)
+    questions = {name: {"type": "noul", "instructions": "x"} for name in "abc"}
+    with pytest.raises(DecisionRequestError, match = "the maximum is 2"):
+        decision.d1_training_item(_d1_trainable(set_size = 2), "st", questions)
+
+
+def test_d1_logits_are_each_options_best_form_at_its_slot(monkeypatch):
+    prompt = pytest.importorskip(_D1_PROMPT)
+    tables = iter([((3, 5), np.array([[0, 1], [1, 1]]), None), ((7, 2), np.array([[1], [0]]), None)])
+    monkeypatch.setattr(prompt, "readout_table", lambda tokenizer, question: next(tables))
+    item = {"input_ids": [0], "state_length": 0, "groups": [1], "slots": [2, 10], "asked": ["first", "second"]}
+    logits = decision._item_logits(_d1_trainable(), item)
+    # hidden[slot] @ embed(token) is slot * token here; each option scores its best form, in option order.
+    assert logits.tolist() == [10.0, 10.0, 20.0, 70.0]
+
+
+def test_d1_logits_read_a_records_media(monkeypatch):
+    prompt = pytest.importorskip(_D1_PROMPT)
+    monkeypatch.setattr(prompt, "readout_table", lambda tokenizer, question: ((1,), np.array([[0]]), None))
+    monkeypatch.setattr(decision, "_d1_media", lambda item: item["images"])
+    pipeline, seen = _d1_trainable(), []
+    hidden = pipeline.model.d1_hidden
+    pipeline.model.engine.media.encode = lambda media: ("", [f"part-{name}" for name in media])
+    pipeline.model.d1_features = lambda part: f"features-{part}"
+    pipeline.model.d1_hidden = lambda ids, state, groups, media: (seen.extend(media), hidden(ids, state, groups, media))[1]
+    decision._item_logits(pipeline, {"images": ["a", "b"], "input_ids": [0], "state_length": 0, "groups": [1], "slots": [1], "asked": ["q"]})
+    assert seen == ["features-part-a", "features-part-b"]
+
+
+@pytest.mark.parametrize("files, config, expected", [
+    ({"decider_config.json": {}}, {"model_type": "qwen3_5_text"}, "mlx_vlm"),
+    ({}, {"model_type": "decider2"}, "mlx_vlm"),
+    ({}, {"model_type": "laya"}, "mlx_vlm"),
+    ({}, {"model_type": "clef"}, "mlx_vlm"),
+    ({}, {"model_type": "qwen3_5"}, None),
+    ({"joint_head_config.json": {}, "joint_head.safetensors": {}}, {"model_type": "clef"}, "clef"),
+])
+def test_a_prepared_checkpoint_is_read_through_mlx_vlm(tmp_path, files, config, expected):
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    for name, content in files.items():
+        (tmp_path / name).write_text(json.dumps(content))
+    assert decision.detect_family(tmp_path) == expected
+
+
+def _vlm_model(monkeypatch, answers, media = ()):
+    from mlx_vlm import decision as vlm
+
+    seen = {}
+
+    def predict(model, processor, state, questions, **kwargs):
+        seen.update(state = state, questions = questions, **kwargs)
+        return {"answers": answers, "usage": {"input_tokens": 7, "output_tokens": 0}}
+
+    monkeypatch.setattr(vlm, "predict", predict)
+    model = decision._VlmModel.__new__(decision._VlmModel)
+    model.model, model.processor, model.reads_images = None, None, bool(media)
+    return model, seen
+
+
+def test_a_prepared_model_answers_on_this_contract(monkeypatch):
+    pytest.importorskip("mlx_vlm")
+    answers = {
+        "n": {"type": "bool", "value": True, "probability": 0.8},
+        "c": {"type": "choice", "value": "b", "probabilities": {"b": 0.6, "a": 0.4}},
+        "s": {"type": "score", "value": 1.2, "probabilities": {"0": 0.2, "1": 0.4, "2": 0.4}},
+    }
+    model, seen = _vlm_model(monkeypatch, answers)
+    questions = {
+        "n": {"type": "noul", "instructions": "i"},
+        "c": {"type": "choice", "instructions": "i", "criteria": {"a": "first", "b": None}},
+        "s": {"type": "score", "instructions": "i", "criteria": ["l", "m", "h"]},
+    }
+    out = model.answer("state", questions)
+    assert out["usage"]["input_tokens"] == 7 and seen["state"] == "state" and "images" not in seen
+    assert seen["questions"]["c"]["criteria"] == {"a": "first", "b": None} and seen["questions"]["s"]["criteria"] == ["l", "m", "h"]
+    assert out["answers"]["n"]["noul"] == pytest.approx(0.8)
+    # By key, not by the order the model lists them in.
+    assert out["answers"]["c"]["choice"] == "b" and out["answers"]["c"]["probabilities"]["a"] == pytest.approx(0.4)
+    assert out["answers"]["s"]["score"] == pytest.approx(1.2)
+
+
+def test_a_prepared_model_turns_a_refusal_into_a_request_error_and_passes_images(monkeypatch):
+    from mlx_vlm import decision as vlm
+
+    pytest.importorskip("mlx_vlm")
+    model, seen = _vlm_model(monkeypatch, {"n": {"probability": 0.5}}, ("images",))
+    question = model._parse_questions({"n": {"type": "noul", "instructions": "i"}})
+    model._scores("s", question, ["picture"])
+    assert seen["images"] == ["picture"]
+
+    def refuse(*args, **kwargs):
+        raise ValueError("no")
+
+    monkeypatch.setattr(vlm, "predict", refuse)
+    with pytest.raises(DecisionRequestError, match = "no"):
+        model._scores("s", question)
+
+
+def test_laya_reads_a_requests_questions_in_batches_under_a_token_budget(monkeypatch):
+    model = decision._MarkerModel.__new__(decision._MarkerModel)
+    prompts = {"a": ([1, 2, 3], [0]), "b": ([4, 5, 6, 7, 8], [1, 3]), "c": ([9], [0]), "d": ([1] * 3, [0])}
+    batches = []
+
+    def logits(batch):
+        batches.append(batch)
+        # A row's logits say which row and option they are, past the row's own options too.
+        return np.array([[10.0 * row + option for option in range(batch["marker_mask"].shape[1])] for row in range(len(batch["input_ids"]))])
+
+    monkeypatch.setattr(decision._MarkerModel, "_prompt", lambda self, state, question: prompts[question.id])
+    model.__dict__["model"] = types.SimpleNamespace(logits = logits)
+    monkeypatch.setattr(decision, "_MARKER_BATCH_TOKENS", 15)
+    questions = [types.SimpleNamespace(id = name, type = "choice") for name in prompts]
+    scores, tokens = model._scores("s", questions)
+    assert tokens == 12 and [len(batch["input_ids"]) for batch in batches] == [3, 1]
+    first = batches[0]
+    assert first["input_ids"].tolist() == [[1, 2, 3, 0, 0], [4, 5, 6, 7, 8], [9, 0, 0, 0, 0]]
+    assert first["attention_mask"].sum(axis = 1).tolist() == [3, 5, 1]
+    assert first["marker_pos"].tolist() == [[0, 0], [1, 3], [0, 0]]
+    assert first["marker_mask"].tolist() == [[True, False], [True, True], [True, False]]
+    # Each question reads only its own options, and order survives the batches.
+    assert scores == [[[0.0]], [[10.0, 11.0]], [[20.0]], [[0.0]]]
+    # A longer prompt counts against the rows before it, not only the rows after it.
+    prompts.update(a = ([1] * 4, [0]), b = ([1] * 10, [0]))
+    batches.clear()
+    model._scores("s", questions[:2])
+    assert [len(batch["input_ids"]) for batch in batches] == [1, 1]
+
+
+def test_d1_media_takes_encoded_and_decoded_alike(monkeypatch):
+    media = pytest.importorskip("mlx_vlm.models.d1_lfm3_vl.media")
+    seen = []
+    monkeypatch.setattr(media, "media_list", lambda items: seen.extend(items) or items)
+    monkeypatch.setattr(decision, "_decode_images", lambda urls: [f"decoded {url}" for url in urls])
+    monkeypatch.setattr(decision, "_decode_audio", lambda urls: [np.ones(4, np.float32) for _ in urls])
+    picture = object()
+    decision._d1_media({"images": ["data:image/png;base64,AA==", picture], "audio": ["data:audio/wav;base64,AA==", {"array": np.zeros(4), "sampling_rate": 16000}]})
+    assert seen[:2] == ["decoded data:image/png;base64,AA==", picture]
+    assert [clip["audio"].tolist() for clip in seen[2:]] == [[1.0] * 4, [0.0] * 4]
+    assert {clip["sampling_rate"] for clip in seen[2:]} == {16000}
+
+
+def test_training_a_d1_answers_without_its_calibration(monkeypatch):
+    monkeypatch.setattr(decision, "_decoder_for_training", lambda *args, **kwargs: None)
+    monkeypatch.setattr(decision, "D1Network", lambda *args: types.SimpleNamespace(train = lambda: None))
+    pipeline = _d1_trainable()
+    pipeline.model.engine.calibration = "released"
+    decision.d1_training_network(pipeline)
+    assert pipeline.model.engine.calibration is None
+
+
+def test_only_lfm3_trains_as_a_d1(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm3"}))
+    with pytest.raises(ValueError, match = "load_language_model_as_clef"):
+        decision.load_language_model_as_d1(tmp_path)
+    with pytest.raises(ValueError, match = "for LFM3 checkpoints"):
+        decision.d1_training_network(_d1_trainable("lfm2_vl"))
+
+
+def test_a_saved_d1_is_read_as_one_and_keeps_no_stale_calibration(tmp_path, monkeypatch):
+    source, out = tmp_path / "source", tmp_path / "out"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "lfm3_omni", "architectures": ["Lfm3OmniForConditionalGeneration"], "tie_word_embeddings": True}))
+    for name in ("calibration.json", "README.md", "tokenizer.json", "processor_config.json"):
+        (source / name).write_text("{}")
+    (source / "model.safetensors").write_bytes(b"stale")
+    monkeypatch.setattr(decision, "_write_merged_shards", lambda decoder, src, staging: (staging / "model.safetensors").write_bytes(b"merged"))
+    pipeline = types.SimpleNamespace(model = None, source = source)
+    out.mkdir()
+    # An earlier save, sharded and as a Clef, over which this one is written.
+    for name in ("calibration.json", "model-00001-of-00002.safetensors", "model.safetensors.index.json", "joint_head.safetensors", "joint_head_config.json"):
+        (out / name).write_text("{}")
+    decision.save_d1_model(pipeline, out)
+    assert sorted(item.name for item in out.glob("*.safetensors")) == ["model.safetensors"]
+    assert not (out / "model.safetensors.index.json").exists() and not (out / "joint_head_config.json").exists()
+    assert decision.detect_family(out) == "d1"
+    config = json.loads((out / "config.json").read_text())
+    assert config["model_type"] == "lfm3_omni" and config["d1_attention"] == "set" and config["tie_word_embeddings"] is True
+    assert (out / "model.safetensors").read_bytes() == b"merged" and (out / "tokenizer.json").is_file()
+    assert not (out / "calibration.json").exists() and not (out / "README.md").exists()
+    assert sorted(item.name for item in out.iterdir() if item.name.startswith(".")) == []
+    with pytest.raises(ValueError, match = "cannot be saved over"):
+        decision.save_d1_model(pipeline, source)
+    decision.save_d1_model(pipeline, out, temperatures = {"choice": 2.0, "score": 3.0, "noul": 4.0})
+    calibration = pytest.importorskip("mlx_vlm.models.d1_lfm3_vl.calibration")
+    fitted = calibration.Calibration.load(out / "calibration.json")
+    assert fitted.temperatures[calibration.bucket("noul", 2)] == 4.0 and fitted.default == 3.0
+    assert {fitted.temperatures[calibration.bucket("choice", k)] for k in (2, 5, 20, 40)} == {2.0}
+    assert fitted.temperatures.get(calibration.bucket("score", 5), fitted.default) == 3.0
+
+
+def test_a_d1_answer_from_probabilities_is_the_served_one():
+    model = decision._D1Model.__new__(decision._D1Model)
+    model._backbone, model.noul_true_first = "lfm3_omni", True
+    question = {"type": "score", "instructions": "x", "levels": {"0": "a", "1": "b", "2": "c"}}
+    model._parse_questions = lambda questions: [types.SimpleNamespace(type = "score", options = [("0", "a"), ("1", "b"), ("2", "c")])]
+    answer = decision.d1_answer(model, question, {"0": 0.1, "1": 0.2, "2": 0.7})
+    assert answer["score"] == 2.0 and answer["confidence"] == pytest.approx(0.7)
