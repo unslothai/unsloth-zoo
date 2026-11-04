@@ -2354,6 +2354,13 @@ def _masked_correct(logits, targets, mask):
     return hits.astype(mx.float32).sum()
 
 
+def _row_contiguous_cross_entropy(logits, targets, **kwargs):
+    # mlx 0.32.4's fused cross-entropy VJP races on non-row-contiguous logits (ml-explore/mlx#4686). A flatten round
+    # trip copies sequence- or vocab-sliced logits and is free for row-contiguous ones; mx.contiguous would also copy a
+    # row-contiguous slice out of its larger buffer.
+    return nn.losses.cross_entropy(logits.reshape(-1).reshape(logits.shape), targets, **kwargs)
+
+
 def make_baseline_loss_fn(label_smoothing=0.0):
     """Standard cross-entropy over full LM-head logits, used when use_cce=False; returns (model, batch, lengths,
     labels=None) -> (loss, ntoks); with label_smoothing=0 the labels=None branch is byte-identical to
@@ -2966,7 +2973,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
-        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
+        ce = _row_contiguous_cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
         if return_correct:

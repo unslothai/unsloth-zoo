@@ -49,6 +49,7 @@ from .utils import (
     _prepare_vlm_batch_for_compile,
     _processor_vlm_inputs,
     _right_pad_vlm_rows,
+    _row_contiguous_cross_entropy,
     _to_mx_vlm_batch,
     _vlm_token_aligned_sidecars,
     encode_mlx_text,
@@ -201,7 +202,7 @@ def completion_logps(model, batch, temperature):
     targets = _preference_ids(batch)[:, 1:]
     # An image placeholder may lie outside the head (Mllama's) or be negative (Phi-3 Vision); none is scored.
     targets = mx.where((targets >= 0) & (targets < logits.shape[-1]), targets, 0)
-    return -nn.losses.cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
+    return -_row_contiguous_cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
 
 
 def grpo_logps(temperature, scorer=None):
