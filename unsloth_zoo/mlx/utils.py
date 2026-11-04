@@ -6179,6 +6179,27 @@ class _FiniteVisitMixin:
             int(index) for index in rng.permutation(len(self._schedule))
         )
 
+    # The original cut stays available until the shape planner settles on one, since sorting can add compiled shapes.
+    def install_length_sorted_windows(self, schedule, widths=None):
+        self._window_sort_layouts = {
+            False: (self._schedule, self._widths),
+            True: (
+                tuple(tuple(batch) for batch in schedule),
+                None if widths is None else tuple(int(x) for x in widths),
+            ),
+        }
+        self.use_length_sorted_windows(True)
+
+    @property
+    def has_window_sort_choice(self):
+        return getattr(self, "_window_sort_layouts", None) is not None
+
+    def use_length_sorted_windows(self, enabled):
+        self._schedule, self._widths = self._window_sort_layouts[bool(enabled)]
+
+    def settle_window_sort(self):
+        self._window_sort_layouts = None
+
 
 class FiniteTextBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite text schedule with on-demand MLX materialization."""
@@ -6198,6 +6219,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         "_visit_epoch_cache",
         "_cycle_length",
         "_cce_capacities",
+        "_window_sort_layouts",
     )
 
     def __init__(
@@ -6225,6 +6247,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self.label_dtype = np.dtype(label_dtype)
         self._shape_plan = None
         self._cce_capacities = {}
+        self._window_sort_layouts = None
         self._visit_policy = str(visit_policy)
         # Seed normalized eagerly so visits never depend on ambient RNG state; a plan rebuilt in a fresh process on resume derives identical visits.
         self._visit_seed = (
@@ -12116,6 +12139,30 @@ def _finite_batch_schedule(
     return tuple(schedule), cycle_length
 
 
+def _length_sorted_windows(schedule, row_length, grad_accum, cycle_length=None):
+    """Re-cut each accumulation window's rows longest first into micro-batches of the original sizes; windows restart
+    at every cycle_length boundary, as the trainer's epoch-final update does, so each optimizer step keeps its rows."""
+    schedule = tuple(tuple(batch) for batch in schedule)
+    accum = max(1, int(grad_accum or 1))
+    if accum == 1:
+        return schedule
+    block = max(1, int(cycle_length or len(schedule) or 1))
+    result = list(schedule)
+    for block_start in range(0, len(schedule), block):
+        block_end = min(block_start + block, len(schedule))
+        for start in range(block_start, block_end, accum):
+            window = schedule[start:min(start + accum, block_end)]
+            rows = sorted(
+                (row for batch in window for row in batch),
+                key=lambda row: (row is None, 0 if row is None else -row_length(row)),
+            )
+            offset = 0
+            for position, batch in enumerate(window):
+                result[start + position] = tuple(rows[offset:offset + len(batch)])
+                offset += len(batch)
+    return tuple(result)
+
+
 def _text_row_length(row):
     if isinstance(row, (tuple, list)) and row and isinstance(row[0], (tuple, list)):
         return len(row[0])
@@ -12176,6 +12223,7 @@ def _create_ordered_text_plan(
     completion_only_loss=None,
     assistant_only_loss=False,
     comm_group=None,
+    length_sorted_windows=False,
 ):
     """Build a text batch plan over an explicit dataset order, mirroring CUDA's sampler stream without changing mlx-lm
     batching; under DDP, comm_group expands to global micro-batches and returns this rank's slice."""
@@ -12296,7 +12344,7 @@ def _create_ordered_text_plan(
             for input_ids in tokenized
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
-    return FiniteTextBatchPlan(
+    plan = FiniteTextBatchPlan(
         rows,
         schedule,
         cycle_length=cycle_length,
@@ -12304,6 +12352,14 @@ def _create_ordered_text_plan(
         pad_id=0 if pad_id is None else int(pad_id),
         minimum_width=2,
     )
+    if length_sorted_windows:
+        plan.install_length_sorted_windows(_length_sorted_windows(
+            schedule,
+            lambda index: _text_row_length(tokenized[index]),
+            grad_accum,
+            cycle_length,
+        ))
+    return plan
 
 
 def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
