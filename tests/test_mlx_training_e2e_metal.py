@@ -2805,8 +2805,17 @@ def test_gather_qmm_reroutes_only_when_defective(defective, monkeypatch, raw_gat
 def test_gather_qmm_guard_install(monkeypatch, raw_gather_qmm):
     """The guard must end up beneath the index-stop wrapper, even mid-training."""
     monkeypatch.setenv("UNSLOTH_MLX_GATHER_QMM_GUARD", "0")
+    monkeypatch.setattr(mx, "__version__", "0.32.2")
     assert mlx_utils.apply_gather_qmm_nax_guard() is False
     monkeypatch.delenv("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    monkeypatch.setattr(mx, "__version__", "0.32.3")
+    assert mlx_utils.apply_gather_qmm_nax_guard() is False
+    assert mx.gather_qmm is raw_gather_qmm
+    monkeypatch.setenv("UNSLOTH_MLX_GATHER_QMM_GUARD", "1")
+    assert mlx_utils.apply_gather_qmm_nax_guard() is True
+    monkeypatch.setattr(mx, "gather_qmm", raw_gather_qmm)
+    monkeypatch.delenv("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    monkeypatch.setattr(mx, "__version__", "0.32.2")
     mlx_utils.acquire_mlx_training_patches()
     try:
         assert mlx_utils.apply_gather_qmm_nax_guard() is True

@@ -650,9 +650,9 @@ def mlx_training_patches_active() -> bool:
     return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
 
 
-# Sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue 3887, open), rows
-# past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a probe measures corruption;
-# kill switch UNSLOTH_MLX_GATHER_QMM_GUARD=0.
+# Before mlx 0.32.3, sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue
+# 3887, fixed by 4009), rows past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a
+# probe measures corruption; UNSLOTH_MLX_GATHER_QMM_GUARD=0 or 1 overrides the version gate.
 _MLX_MAX_SORTED_ROWS = 32768
 _MLX_CANARY_ERROR_LIMIT = 1.0
 _MLX_K_REMAINDER = "k_remainder"
@@ -848,7 +848,8 @@ def is_gather_qmm_nax_guard_applied() -> bool:
 def apply_gather_qmm_nax_guard() -> bool:
     """Idempotent and thread-safe; installed under the index-stop wrapper, which removes itself by inspecting mx and would be stranded by anything on top."""
     global _MLX_GATHER_QMM_ORIGINAL
-    if os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD", "1") == "0":
+    setting = os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    if setting == "0" or (setting is None and _Version(mx.__version__) >= _Version("0.32.3")):
         return False
     with _MLX_INDEX_GRADIENT_LOCK:
         if is_gather_qmm_nax_guard_applied():
