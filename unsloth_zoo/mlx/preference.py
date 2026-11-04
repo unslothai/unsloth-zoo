@@ -918,23 +918,13 @@ _PIXEL_COMPONENT_MODEL_TYPES = ("deepseekocr", "deepseekocr_2")
 
 
 def _vision_batch(
-    processor, model_config, rows, prompt_arrays, ids, lengths, *, same_pixels=False,
+    processor, model_config, rows, prompt_arrays, ids, lengths, *, same_pixels=False, split=False,
 ):
-    """A vision batch dict for packed rows with each branch's rows in turn; prompt_arrays holds each row's prompt arrays per branch."""
+    """A vision batch dict for packed rows with each branch's rows in turn; prompt_arrays holds each row's prompt arrays
+    per branch; split returns one dict per branch, all from one processor call."""
     branches = len(prompt_arrays[0])
-    width = ids.shape[1]
-    inputs = {
-        "input_ids": ids,
-        "attention_mask": (np.arange(width)[None, :] < lengths[:, 1:]).astype(np.int32),
-    }
-    for offset, branch_arrays in enumerate(prompt_arrays):
-        for branch, arrays in enumerate(branch_arrays):
-            output_row = offset + branch * len(rows)
-            for name, values in arrays:
-                if name not in inputs:
-                    inputs[name] = np.zeros(ids.shape, dtype=np.int32)
-                values = values[:width]
-                inputs[name][output_row, :len(values)] = values
+    model_type = _config_get(model_config, "model_type")
+    media = {}
     if any(row.images for row in rows):
         outputs = _processor_vlm_inputs(
             processor, [row.prompt_text for row in rows],
@@ -954,7 +944,6 @@ def _vision_batch(
                 "same size for a row on every read; a random resize or crop "
                 "changes it."
             )
-        model_type = _config_get(model_config, "model_type")
         rebuilt = (
             _VLM_WIDTH_GENERATED_KEYS
             if model_type in _VLM_POSITION_GENERATING_MODEL_TYPES
@@ -978,23 +967,48 @@ def _vision_batch(
                     "preference batching re-lays. This model is not supported "
                     "for preference training on image rows."
                 )
+            media[key] = value
+
+    def build(part):
+        part_ids = ids if len(part) == branches else np.concatenate(
+            [ids[branch * len(rows):(branch + 1) * len(rows)] for branch in part])
+        part_lengths = lengths if len(part) == branches else np.concatenate(
+            [lengths[branch * len(rows):(branch + 1) * len(rows)] for branch in part])
+        width = part_ids.shape[1]
+        inputs = {
+            "input_ids": part_ids,
+            "attention_mask": (np.arange(width)[None, :] < part_lengths[:, 1:]).astype(np.int32),
+        }
+        for offset, branch_arrays in enumerate(prompt_arrays):
+            for slot, branch in enumerate(part):
+                output_row = offset + slot * len(rows)
+                for name, values in branch_arrays[branch]:
+                    if name not in inputs:
+                        inputs[name] = np.zeros(part_ids.shape, dtype=np.int32)
+                    values = values[:width]
+                    inputs[name][output_row, :len(values)] = values
+        for key, value in media.items():
             if (
                 key in ("images", "pixel_values") and isinstance(value, (list, tuple))
                 and model_type in _PIXEL_COMPONENT_MODEL_TYPES
             ):
-                inputs[key] = [_repeated_per_branch(part, branches) for part in value]
+                inputs[key] = [_repeated_per_branch(piece, len(part)) for piece in value]
             else:
-                inputs[key] = _repeated_per_branch(value, branches)
-    batch = _to_mx_vlm_batch(inputs)
-    batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
-    batch = _prepare_vlm_batch_for_compile(batch, model_config)
-    if tuple(batch["input_ids"].shape) != tuple(ids.shape):
-        raise NotImplementedError(
-            "Unsloth MLX preference: this model expands its image tokens after "
-            "the processor, which moves the response spans. It is not supported "
-            "for preference training on image rows."
-        )
-    return batch
+                inputs[key] = _repeated_per_branch(value, len(part))
+        batch = _to_mx_vlm_batch(inputs)
+        batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+        batch = _prepare_vlm_batch_for_compile(batch, model_config)
+        if tuple(batch["input_ids"].shape) != tuple(part_ids.shape):
+            raise NotImplementedError(
+                "Unsloth MLX preference: this model expands its image tokens after "
+                "the processor, which moves the response spans. It is not supported "
+                "for preference training on image rows."
+            )
+        return batch
+
+    if split:
+        return [build((branch,)) for branch in range(branches)]
+    return build(tuple(range(branches)))
 
 
 class FinitePreferenceBatchPlan(_FiniteVisitMixin):
@@ -1190,6 +1204,10 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         """The model input for packed rows; a vision plan returns a batch dict."""
         return mx.array(batch)
 
+    def _scored_inputs(self, rows, batch, lengths, *, reference=False):
+        """The inputs packed rows are scored from, each over its own share of the rows in turn."""
+        return [self._inputs(rows, batch, lengths, reference=reference)]
+
 
 class VisionPreferenceBatches:
     """Vision inputs for a preference plan's batches; a mixin, as those plans declare slots."""
@@ -1287,16 +1305,20 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
     for start in range(0, len(rows), batch_size):
         chunk = rows[start:start + batch_size]
         batch, lengths = plan.pack(chunk)
-        batch = plan._inputs(chunk, batch, lengths, reference=True)
-        lengths = mx.array(lengths)
-        options = {}
-        # The live forward scores through CCE too; full logits would defeat it.
-        if scorer is not None and reference_policy.model is None:
-            mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
-            options["response_scorer"] = lambda model, batch, _lengths: -(
-                scorer(model, batch, mask > 0, differentiated=False)[0] * mask
-            ).sum(axis=1)
-        logps = reference_policy.forward(model, batch, lengths, **options)
+        parts = plan._scored_inputs(chunk, batch, lengths, reference=True)
+        share = len(lengths) // len(parts)
+        logps = []
+        for offset, inputs in enumerate(parts):
+            part_lengths = mx.array(lengths[offset * share:(offset + 1) * share])
+            options = {}
+            # The live forward scores through CCE too; full logits would defeat it.
+            if scorer is not None and reference_policy.model is None:
+                mask = _response_mask(_preference_ids(inputs)[:, 1:], part_lengths)
+                options["response_scorer"] = lambda model, batch, _lengths, mask=mask: -(
+                    scorer(model, batch, mask > 0, differentiated=False)[0] * mask
+                ).sum(axis=1)
+            logps.append(reference_policy.forward(model, inputs, part_lengths, **options))
+        logps = logps[0] if len(logps) == 1 else mx.concatenate(logps)
         mx.eval(logps)
         values = np.asarray(logps.tolist(), dtype=np.float32)
         # A plan whose rows carry one sequence each leaves the second column zero.
@@ -1867,7 +1889,7 @@ def create_kto_batch_plan(
 
 
 class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
-    """Batches are (ids, lengths, normalizers, labels[, reference]): completions first, then their KL rows when the loss has a KL term; compaction fills the reference slot (None without one), then each half's indices."""
+    """Batches are (ids, lengths, normalizers, labels[, reference]): completions first, then their KL rows when the loss has a KL term; compaction fills the reference slot (None without one), then each half's indices; FiniteVisionKTOBatchPlan lays out its own."""
 
     __slots__ = ("_with_kl",)
 
@@ -1948,23 +1970,36 @@ class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
         indices = self._schedule[index]
         rows = [self._rows[item] for item in indices]
         batch, lengths = self.pack(rows, self._materialized_width(index, phase))
+        inputs, *kl = self._scored_inputs(rows, batch, lengths)
         materialized = (
-            self._inputs(rows, batch, lengths), mx.array(lengths),
+            inputs, mx.array(lengths),
             mx.array(self._normalizers[index], dtype=mx.int32),
             mx.array([row.label for row in rows]),
         )
-        if self._reference is None:
-            return materialized
-        return materialized + (self._held_reference(indices),)
+        reference = None if self._reference is None else self._held_reference(indices)
+        if kl:
+            return materialized + (reference, None, None, *kl)
+        return materialized if reference is None else materialized + (reference,)
 
 
 class FiniteVisionKTOBatchPlan(VisionPreferenceBatches, FiniteKTOBatchPlan):
-    """KTO plan whose batches carry the processor's vision inputs."""
+    """KTO plan whose batches carry the processor's vision inputs; the KL rows come as their own dict, after the
+    compaction slots, so the policy scores them in a forward of their own."""
 
     __slots__ = _VISION_PLAN_SLOTS
 
     def _prompt_arrays(self, row):
         return (row.prompt_arrays,) * len(self._branches(row))
+
+    def _scored_inputs(self, rows, batch, lengths, *, reference=False):
+        return _vision_batch(
+            self._processor, self._model_config, rows,
+            [self._prompt_arrays(row) for row in rows], batch, lengths,
+            same_pixels=reference or self._reference is not None, split=True,
+        )
+
+    def _inputs(self, rows, batch, lengths, *, reference=False):
+        return self._scored_inputs(rows, batch, lengths, reference=reference)[0]
 
 
 def warn_kto_weight_balance(labels, desirable_weight, undesirable_weight):
@@ -3192,33 +3227,26 @@ def _kto_supervised_tokens(batch_data):
 
 def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
                 scorer=None, reference=None, kl_mean=None, differentiated=True,
-                cce_indices=None, kl_indices=None):
+                cce_indices=None, kl_indices=None, kl_batch=None):
     """Per-row weighted losses and the batch's metric sums; cce_indices and kl_indices compact the completion and KL
-    rows, each over its own grid."""
+    rows, each over its own grid; a vision batch carries its KL rows as kl_batch."""
     rows = labels.shape[0]
-    # A vision batch's halves share images only the whole dict carries: one forward.
-    whole = isinstance(batch, Mapping)
-    joined = cce_indices
-    if kl_indices is not None:
-        # A forward over both halves lays the KL rows' grid after the completions'.
-        offset = rows * (_preference_ids(batch).shape[1] - 1)
-        joined = mx.concatenate([cce_indices, mx.where(kl_indices >= 0, kl_indices + offset, -1)])
-    scored, scored_lengths = (batch, lengths) if whole else (batch[:rows], lengths[:rows])
-    targets = _preference_ids(scored)[:, 1:]
-    mask = _response_mask(targets, scored_lengths)
+    vision = isinstance(batch, Mapping)
+    completion, kl_rows = (batch, kl_batch) if vision else (batch[:rows], batch[rows:])
+    targets = _preference_ids(completion)[:, 1:]
+    mask = _response_mask(targets, lengths[:rows])
     # Real-token positions only; TRL's sum also counts its collator's padding.
     positions = (
-        mx.arange(1, targets.shape[1] + 1) < scored_lengths[:, 1:]
+        mx.arange(1, targets.shape[1] + 1) < lengths[:rows, 1:]
     ).astype(mx.float32)
     if scorer is None:
-        logits, ce = _preference_forward(model, scored, mask)
+        logits, ce = _preference_forward(model, completion, mask)
         logit_sums = (_row_logit_sum(logits) * positions).sum(axis=1)
     else:
-        ce, sums = scorer(model, scored, mask > 0, joined if whole else cce_indices, every_position=True,
+        ce, sums = scorer(model, completion, mask > 0, cce_indices, every_position=True,
                           differentiated=differentiated)
         logit_sums = (sums * positions).sum(axis=1)
-    scored_logps = -(ce * mask).sum(axis=1)
-    logps, logit_sums = scored_logps[:rows], logit_sums[:rows]
+    logps = -(ce * mask).sum(axis=1)
 
     def score(model, batch, lengths, indices):
         if scorer is None:
@@ -3227,21 +3255,29 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
         return -(scorer(model, batch, batch_mask > 0, indices, differentiated=False)[0] * batch_mask).sum(axis=1)
 
     if reference is None:
-        reference = reference_policy.forward(
-            model, batch, lengths,
-            response_scorer=(
-                partial(score, indices=joined) if scorer is not None and reference_policy.model is None
-                else None
-            ),
-        )
+        if vision:
+            parts = [(completion, lengths[:rows], cce_indices)]
+            parts += [(kl_rows, lengths[rows:], kl_indices)] if objective.with_kl else []
+        else:
+            joined = cce_indices
+            if kl_indices is not None:
+                # One forward over both halves lays the KL rows' grid after the completions'.
+                offset = rows * (_preference_ids(batch).shape[1] - 1)
+                joined = mx.concatenate([cce_indices, mx.where(kl_indices >= 0, kl_indices + offset, -1)])
+            parts = [(batch, lengths, joined)]
+        own = scorer is not None and reference_policy.model is None
+        scored = [
+            reference_policy.forward(model, part, part_lengths,
+                                     response_scorer=partial(score, indices=indices) if own else None)
+            for part, part_lengths, indices in parts
+        ]
+        reference = scored[0] if len(scored) == 1 else mx.concatenate(scored)
     reference = reference.astype(mx.float32)
     zero = mx.array(0.0, mx.float32)
     kl = zero
     if objective.with_kl:
         # TRL scores KL rows under no_grad: a separate, undifferentiated forward.
-        policy_kl = mx.stop_gradient(
-            scored_logps[rows:] if whole else score(model, batch[rows:], lengths[rows:], kl_indices)
-        )
+        policy_kl = mx.stop_gradient(score(model, kl_rows, lengths[rows:], kl_indices))
         kl = (policy_kl.astype(mx.float32) - reference[rows:]).mean()
         if kl_mean is not None:
             kl = kl_mean(kl)
@@ -3288,11 +3324,12 @@ def make_kto_loss_fn(objective, *, reference_policy, kl_mean=None, _scorer=None)
     _require_kind(objective, "kto")
     _require_reference(objective, reference_policy)
 
-    def loss_fn(model, batch, lengths, normalizers, labels, reference=None, cce_indices=None, kl_indices=None):
+    def loss_fn(model, batch, lengths, normalizers, labels, reference=None, cce_indices=None, kl_indices=None,
+                kl_batch=None):
         losses, stats = _kto_scores(
             model, batch, lengths, labels, objective,
-            reference_policy=reference_policy, scorer=_scorer,
-            reference=reference, kl_mean=kl_mean, cce_indices=cce_indices, kl_indices=kl_indices,
+            reference_policy=reference_policy, scorer=_scorer, reference=reference, kl_mean=kl_mean,
+            cce_indices=cce_indices, kl_indices=kl_indices, kl_batch=kl_batch,
         )
         _, window_rows, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * losses.sum() / mx.maximum(
@@ -3312,11 +3349,12 @@ def make_kto_cce_loss_fn(model, objective, *, reference_policy, kl_mean=None):
 
 
 def _make_kto_eval_fn(objective, reference_policy, scorer):
-    def eval_fn(model, batch, lengths, _normalizers, labels, reference=None, cce_indices=None, kl_indices=None):
+    def eval_fn(model, batch, lengths, _normalizers, labels, reference=None, cce_indices=None, kl_indices=None,
+                kl_batch=None):
         losses, stats = _kto_scores(
             model, batch, lengths, labels, objective,
             reference_policy=reference_policy, scorer=scorer, reference=reference,
-            differentiated=False, cce_indices=cce_indices, kl_indices=kl_indices,
+            differentiated=False, cce_indices=cce_indices, kl_indices=kl_indices, kl_batch=kl_batch,
         )
         return losses.mean(), mx.array(labels.shape[0], dtype=mx.int32), stats
 

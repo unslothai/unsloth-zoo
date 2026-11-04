@@ -3475,9 +3475,12 @@ def test_a_vision_kto_plan_follows_trls_vision_collator():
     # KL pairs roll within the batch, not within kl_batch_size chunks.
     assert [row.kl for row in made.rows] == [
         prompt + answers[2][:3], encode("q") + answers[0], prompt + answers[1][:3]]
-    batch, _, _, labels = made[0]
-    assert batch["pixel_values"].tolist() == [[4.0]] * 4 and labels.tolist() == [True, False, False]
-    assert [sum(row) for row in batch["token_type_ids"].tolist()] == [2, 0, 2, 2, 0, 2]
+    batch, _, _, labels, *_, kl = made[0]
+    # The KL rows share their row's prompt and images, in a dict of their own.
+    assert batch["pixel_values"].tolist() == kl["pixel_values"].tolist() == [[4.0]] * 2
+    assert labels.tolist() == [True, False, False]
+    assert [sum(row) for part in (batch, kl) for row in part["token_type_ids"].tolist()] == [2, 0, 2, 2, 0, 2]
+    assert [ids[:len(row.kl)] for ids, row in zip(kl["input_ids"].tolist(), made.rows)] == [list(row.kl) for row in made.rows]
     single = plan([{**text, "image": kto_vision_row("")["images"][0], "prompt": "<img>q"}], with_kl=False)
     assert single.rows[0].prompt_ids == (60, 61, *encode("q")) and single[0][0]["pixel_values"].size
     turns = plan([{**kto_vision_row("yes"), "prompt": [{"role": "user", "content": "hi"}, *tail]} for tail in (  # as TRL 1.13
@@ -3488,7 +3491,7 @@ def test_a_vision_kto_plan_follows_trls_vision_collator():
     parts = _with_trl_image_parts({**kto_vision_row("yes"), "prompt": [{"role": "system", "content": "s"}, *({"role": "user", "content": t} for t in ("hi", "u"))]})
     assert [m["content"] for m in parts["prompt"] + parts["completion"]] == [
         [text_part("s")], [{"type": "image"}, text_part("hi")], [text_part("u")], [text_part("yes")]]
-    scorer = types.SimpleNamespace(forward=lambda _, batch, n: mx.full(n.shape[:1], float("pixel_values" in batch)))
+    scorer = types.SimpleNamespace(forward=lambda _, batch, n: mx.full(batch["input_ids"].shape[:1], float("pixel_values" in batch)))
     assert precompute_reference_logps(made, None, scorer, batch_size=3).tolist() == [[1, 1]] * 3
     with pytest.raises(ValueError, match="row 0 .* no completion token"):
         plan([kto_vision_row("yes")], max_length=len(prompt))
@@ -3535,7 +3538,7 @@ def test_a_vision_kto_row_keeps_the_whole_length_budget():
     assert build([{"prompt": "q", "completion": "a", "label": True}]).rows[0].completion_ids
 
 
-def test_a_vision_kto_batch_scores_its_kl_rows_in_the_same_forward():
+def test_a_vision_kto_batch_scores_its_kl_rows_in_their_own_forward():
     import numpy as np
     import mlx.core as mx
     from unsloth_zoo.mlx.preference import (
@@ -3550,30 +3553,42 @@ def test_a_vision_kto_batch_scores_its_kl_rows_in_the_same_forward():
         def __call__(self, tokens):
             return super().__call__(tokens) * self.scale
 
-    models = [(Scaled(), type("ScaledVision", (VisionModel, Scaled), {})()) for _ in range(2)]
+    sizes = []
+
+    class ScaledVision(VisionModel, Scaled):
+        def __call__(self, tokens, *args, **kwargs):
+            sizes.append(tokens.shape[0])
+            return super().__call__(tokens, *args, **kwargs)
+
+    models = [(Scaled(), ScaledVision()) for _ in range(2)]
     for text, vision in models:
         vision.embedding, vision.output = text.embedding, text.output
 
-    def run(side, batch):
+    def run(side, batch, *kl):
         policy, reference = (pair[side] for pair in models)
-        fn = make_kto_loss_fn(objective, reference_policy=ReferencePolicy(model=reference))
+        # Shifted so the clamp keeps the raw KL estimate in the stats.
+        fn = make_kto_loss_fn(objective, reference_policy=ReferencePolicy(model=reference), kl_mean=lambda kl: kl + 100)
 
         def loss(scale):
             policy.scale = scale
-            return fn(policy, batch, *rest)[0]
+            return fn(policy, batch, *rest, *kl)[0]
 
         # The KL rows add nothing to the gradient, as under TRL's no_grad.
         gradient = mx.grad(loss)(mx.array(1.5))
         policy.scale = 1.5
-        return [*fn(policy, batch, *rest)[::2], gradient]
+        return [*fn(policy, batch, *rest, *kl)[::2], gradient]
 
-    text, vision = run(0, ids), run(1, {"input_ids": ids, "pixel_values": "pixels"})
+    half = lambda rows: {"input_ids": rows, "pixel_values": "pixels"}
+    text, vision = run(0, ids), run(1, half(ids[:3]), None, None, None, half(ids[3:]))
+    # Policy and reference forwards alike see one half at a time.
+    assert sizes and set(sizes) == {3}
     for expected, got in zip(text, vision):
         assert np.allclose(np.asarray(got.tolist()), np.asarray(expected.tolist()), rtol=1e-5)
     assert float(text[-1]) != 0
 
 
-def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypatch, tmp_path):
+@pytest.mark.parametrize("mode, seen", [("all", 132), ("non_padding", 94)])
+def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypatch, tmp_path, mode, seen):
     from mlx_vlm import prompt_utils
     from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
     monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_a, **_k: None, raising=False)
@@ -3590,9 +3605,12 @@ def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
         Model(), VisionProcessor(), [kto_vision_row("yes"), kto_vision_row("no", False)],
         eval_dataset=split, args=MLXKTOConfig(**_generation_common(
             tmp_path, generate_during_eval=False, precompute_ref_log_probs=True)))
+    run.args.include_num_input_tokens_seen = mode
     assert _run_generation_trainer(run, monkeypatch, [])["train_steps"] == 1
-    # Training, evaluation, and the reference precomputed for each; the rest are probes.
-    assert sum(Model.pixels) == 4 and [reader is not None for reader in readers] == [False, True]
+    # Both halves' rows count, as when one dict held them: 2 x 2 x 33 positions, 94 of them not padding.
+    assert run.state.num_input_tokens_seen == seen
+    # Training, evaluation, and the reference precomputed for each, the KL rows in forwards of their own; the rest are probes.
+    assert sum(Model.pixels) == 8 and [reader is not None for reader in readers] == [False, True]
 
 
 def test_cpo_trains_and_evaluates_text_rows_on_a_vision_language_model(monkeypatch, tmp_path):
