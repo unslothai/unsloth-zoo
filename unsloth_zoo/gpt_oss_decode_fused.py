@@ -124,17 +124,13 @@ if HAS_TRITON:
         w = tl.load(W + cols, mask = ok, other = 0.0).to(tl.float32)
         tl.store(Y + row * stride_y + cols, (y * w).to(Y.dtype.element_ty), mask = ok)
 
-    # Q (query length: 1 in decode, the prompt length in prefill) and the lse strides it sets only
-    # index scalars: unspecialized, so prompt lengths add no == 1 / % 16 variant. ONE_Q buckets decode
-    # instead (2 variants, decode and prefill): fully runtime Q was 3-5% slower at decode on T4, the
-    # pid split by Q no longer folding. sl_q (1 for any contiguous lse, so no variant) and the
-    # attention / output strides keep their specialization.
+    # Fully runtime Q was 3-5% slower at decode (T4), so ONE_Q buckets it. sl_q stays specialized: always 1 for contiguous lse.
     @triton.jit(do_not_specialize = ["Q", "sl_b", "sl_h"])
     def _sink_scale_kernel(
         A, LSE, SINK, OUT, H, Q, D,
         sa_b, sa_h, sa_q, sl_b, sl_h, sl_q, so_b, so_q, so_h,
         BLOCK_D: tl.constexpr, EXACT: tl.constexpr,  # pow2 hd / exact libdevice exp + div_rn
-        ONE_Q: tl.constexpr,  # Q == 1 (decode): a 2-value bucket of the query length
+        ONE_Q: tl.constexpr,  # Q == 1 (decode)
     ):
         pid = tl.program_id(0)
         if ONE_Q:
