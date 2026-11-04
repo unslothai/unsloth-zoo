@@ -2706,8 +2706,10 @@ def _row_prefill_seam():
 def _row_prefill_surface_gap(batch_module) -> str | None:
     version = _installed_mlx_vlm_version()
     try:
+        generator = batch_module.BatchGenerator
         params = inspect.signature(batch_module.PromptProcessingBatch.__init__).parameters
-        admission = inspect.getsource(batch_module.BatchGenerator._next)
+        # mlx-vlm 0.7.12 admits prompts in `_prefill_step`, which replaced `_next`.
+        admission = inspect.getsource(getattr(generator, "_prefill_step", None) or generator._next)
     except (AttributeError, TypeError, ValueError, OSError):
         return f"{version} exposes no prompt batch a row's own cache can enter"
     helpers = ("_is_sequence_aligned_prompt_kwarg", "_slice_sequence_aligned_prompt_kwarg")

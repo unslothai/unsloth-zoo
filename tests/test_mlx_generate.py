@@ -1557,6 +1557,30 @@ def test_a_batch_draws_by_position_through_the_release_helper(tmp_path, source, 
     assert generate._draws_by_position(module.GenerationBatch, "_step") is draws
 
 
+_ADMIT = (
+    "def _is_sequence_aligned_prompt_kwarg(): pass\ndef _slice_sequence_aligned_prompt_kwarg(): pass\n"
+    "class PromptProcessingBatch:\n    def __init__(self, warm_cache=None): pass\n"
+    "class BatchGenerator:\n    def {}(self):\n        return {}('PromptProcessingBatch', None)\n"
+)
+
+
+@pytest.mark.parametrize("method, override, open_", [
+    ("_next", "_generate_module_override", True),
+    # mlx-vlm 0.7.12 admits prompts in `_prefill_step` and has no `_next`.
+    ("_prefill_step", "_generate_module_override", True),
+    ("_prefill_step", "getattr", False),
+])
+def test_a_row_cache_seam_is_read_where_the_release_admits_prompts(tmp_path, method, override, open_):
+    from unsloth_zoo.mlx import generate
+
+    path = tmp_path / f"admit_{method}_{override}.py"
+    path.write_text(_ADMIT.format(method, override))
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert (generate._row_prefill_surface_gap(module) is None) is open_
+
+
 def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
     from unsloth_zoo.mlx.generate import _schedules_prefill
 
