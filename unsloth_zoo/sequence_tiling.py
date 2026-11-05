@@ -67,12 +67,10 @@ pass
 
 
 def _block_inline_flag():
-    """UNSLOTH_DECODE_COMPILE, set by block compile and read by MoE expert forwards; recomputes run outside the block."""
-    try:
-        from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
-        return UNSLOTH_DECODE_COMPILE
-    except Exception:
-        return None
+    """UNSLOTH_DECODE_COMPILE, set by block compile and read by MoE expert forwards; recomputes run outside the block.
+    Looked up, never imported: importing temporary_patches inside a tile's forward patches its recompute (CPU backend
+    tiled Qwen3 MLP CheckpointError). The block compile imports it before setting the flag."""
+    return getattr(sys.modules.get("unsloth_zoo.temporary_patches.utils"), "UNSLOTH_DECODE_COMPILE", None)
 pass
 
 
@@ -413,7 +411,7 @@ pass
 _COMPILED_TILES = {}
 # Tile frames Dynamo cannot compile whole; eager from then on.
 _EAGER_TILES = set()
-# A fullgraph frame past the recompile limit raises FailOnRecompileLimitHit, a plain Exception (torch 2.6 to 2.15).
+# A fullgraph frame past the recompile limit raises FailOnRecompileLimitHit, a plain Exception (torch 2.9 to 2.15).
 _TRACE_ERRORS = (torch._dynamo.exc.TorchDynamoException,) + tuple(
     e for e in (getattr(torch._dynamo.exc, "FailOnRecompileLimitHit", None),) if isinstance(e, type)
 )

@@ -230,3 +230,34 @@ def _past_the_recompile_limit(train):
     if train:
         for a, b in zip(mlp.parameters(), ref.parameters()):
             torch.testing.assert_close(a.grad, b.grad)
+
+
+class _RefuseTemporaryPatches:
+    """A meta path finder recording (and refusing) any import of unsloth_zoo.temporary_patches.*."""
+
+    def __init__(self):
+        self.seen = []
+
+    def find_spec(self, name, path = None, target = None):
+        if name.startswith("unsloth_zoo.temporary_patches"):
+            self.seen.append(name)
+            raise ImportError(f"refused: {name}")
+        return None
+
+
+def test_a_tile_does_not_import_temporary_patches(monkeypatch):
+    # The CPU backend never loads temporary_patches. Importing it from inside the first tile's forward applied its
+    # patches between that forward and its recompute: CheckpointError (unsloth's tiled Qwen3 MLP on CPU, 54 vs 53).
+    for name in [m for m in sys.modules if m.startswith("unsloth_zoo.temporary_patches")]:
+        monkeypatch.delitem(sys.modules, name)
+    finder = _RefuseTemporaryPatches()
+    monkeypatch.setattr(sys, "meta_path", [finder] + sys.meta_path)
+    torch.manual_seed(0)
+    mlp = GatedMLP()
+    ref = copy.deepcopy(mlp)
+    x = torch.randn(1, 37, H, requires_grad = True)
+    ST.tiled_call(mlp, x, n_tiles = 4, needs_rng = False).pow(2).sum().backward()
+    assert finder.seen == [], finder.seen
+    xr = x.detach().clone().requires_grad_()
+    ref(xr).pow(2).sum().backward()
+    torch.testing.assert_close(x.grad, xr.grad)
