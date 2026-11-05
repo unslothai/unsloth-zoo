@@ -670,12 +670,27 @@ class _RepeatSamplerOrder:
         return self._orders[epoch]
 
 
-def grpo_row_layout(order, block, key):
+def grpo_row_layout(order, block, key, classes=None):
     """order with each run of block rows stably sorted by key; a block is the rows of micro-steps that always share an
     optimizer step, so every step trains the same rows."""
-    return np.concatenate([
-        sorted(order[start:start + block], key=key) for start in range(0, len(order), block)
-    ]).astype(order.dtype)
+    if classes is None:
+        return np.concatenate([
+            sorted(order[start:start + block], key=key) for start in range(0, len(order), block)
+        ]).astype(order.dtype)
+    laid = order.copy()
+    for start in range(0, len(order), block):
+        chunk = order[start:start + block]
+        for kind in dict.fromkeys(classes[row] for row in chunk):
+            positions = [start + i for i, row in enumerate(chunk) if classes[row] == kind]
+            laid[positions] = sorted(order[positions], key=key)
+    return laid
+
+
+def _media_class(prompt, images):
+    # Images alike in type, size and mode come out of the processor in the same shapes; others stay with their prompt.
+    shapes = tuple((type(image).__name__, getattr(image, "shape", None) or getattr(image, "size", None),
+                    getattr(image, "mode", None)) for image in images)
+    return ("prompt", prompt) if any(shape is None for _, shape, _ in shapes) else shapes
 
 
 @dataclass
@@ -827,7 +842,7 @@ class GRPOBatchPlan:
 
     def ensure_descriptors(self):
         """Survey every entry's vision family for a compiled run, one processor call per micro-step at a prompt-only
-        placeholder width; rows then keep their seeded order, which fixes each micro-step's images ahead of sampling.
+        placeholder width over the seeded rows, which layouts later exchange only for rows with matching images.
         False when a family cannot be planned."""
         if self._families is not None:
             return True
@@ -1023,11 +1038,14 @@ class GRPOBatchPlan:
         order = self._shuffled(visit, len(prompts))
         # Exactly zero, not TRL's zero std: a rounded group mean leaves a tiny advantage that still has gradient.
         dead = (advantages == 0) & self.skip_zero_advantage
-        # A compiled vision run keeps the seeded order its families were surveyed in.
-        if (self.group_by_length or self.skip_zero_advantage) and self._families is None:
+        if self.group_by_length or self.skip_zero_advantage:
+            # A compiled vision run moves a row only into a position whose row had images alike: its families hold.
+            classes = None if self._families is None else [
+                _media_class(prompt, encoded[prompt][2] if encoded else ()) for prompt in prompts
+            ]
             order = grpo_row_layout(order, self._layout_rows, lambda row: (
                 dead[row], prompt_lengths[row] + lengths[row] if self.group_by_length else 0,
-            ))
+            ), classes)
         skipped = {}
         if self.skip_zero_advantage:
             # The loss's stats for such rows: no KL, no clipping, and their masked completion lengths.
