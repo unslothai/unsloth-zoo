@@ -2079,6 +2079,56 @@ def test_grpo_cce_scores_like_the_logits(head):
 
 
 @metal_only
+@pytest.mark.parametrize("vision", [False, True])
+def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, vision):
+    """Old log-probs of an image batch the rollout already ran equal the step's own, frozen tower or trained: Gemma 4's
+    vision attention is an mx.compile helper that traced inputs bypass, so the scorer and the step must trace the same
+    arrays, the trainable parameters."""
+    import shutil, types, PIL.Image, mlx_vlm.utils, mlx_vlm.models.gemma4 as gemma4
+    from huggingface_hub import snapshot_download
+    from unsloth_zoo.mlx import generate as generate_module, grpo, trainer as mlx_trainer
+    try:  # a tiny random Gemma 4 from the real config and processor; the weights are never fetched
+        source = snapshot_download("mlx-community/gemma-4-e2b-it-4bit", allow_patterns=["*.json", "*.jinja"], local_files_only=True)
+    except Exception:
+        pytest.skip("mlx-community/gemma-4-e2b-it-4bit's processor files are not cached")
+    shutil.copytree(source, checkpoint := tmp_path / "tiny", ignore=shutil.ignore_patterns("*.index.json", "*.safetensors", "*.bin"))  # noqa: E501
+    config = {k: v for k, v in json.loads((checkpoint / "config.json").read_text()).items() if not k.startswith("quantization")}
+    config["text_config"].update(hidden_size=64, num_hidden_layers=2, layer_types=["sliding_attention", "full_attention"], intermediate_size=128, num_attention_heads=2, head_dim=32, global_head_dim=32, hidden_size_per_layer_input=8, num_kv_shared_layers=0)  # noqa: E501
+    config.update(audio_config=None)
+    config["vision_config"].update(hidden_size=64, num_hidden_layers=1, intermediate_size=128, num_attention_heads=1, num_key_value_heads=1)  # noqa: E501
+    (checkpoint / "config.json").write_text(json.dumps(config))
+    mx.random.seed(5)
+    tiny = gemma4.Model(mlx_vlm.utils.update_module_configs(gemma4.ModelConfig.from_dict(params := dict(config)), gemma4, params, ["text", "vision"]))  # noqa: E501
+    tiny.set_dtype(mx.bfloat16)
+    mx.save_safetensors(str(checkpoint / "model.safetensors"), dict(tree_flatten(tiny.parameters())), {"format": "mlx"})
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: [
+        types.SimpleNamespace(token_ids=[100 + row % 7] * (2 + row % 5), finish_reason="stop") for row in range(len(requests))])
+    scored, terms, pairs = grpo._scored_as_step, grpo.grpo_terms, []
+
+    def rolled_out(logps, step_compiled):
+        score = scored(logps, step_compiled)
+
+        def run(model, batch, *rest):
+            mx.eval(grpo.completion_logps(model, batch, 1.0))  # the rollout's forward of this batch, without gradients
+            return score(model, batch, *rest)
+        return run
+    monkeypatch.setattr(grpo, "_scored_as_step", rolled_out)
+    monkeypatch.setattr(grpo, "grpo_terms", lambda objective, new, advantages, mask, *, old=None, ref=None: pairs.append(
+        (mx.stop_gradient(new), old, mask)) or terms(objective, new, advantages, mask, old=old, ref=ref))
+    model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
+    data = [{"prompt": [{"role": "user", "content": f"Describe picture {i}."}], "image": PIL.Image.new("RGB", (64, 64), (60 * i, 90, 160))} for i in range(2)]  # noqa: E501
+    model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=1024, finetune_vision_layers=vision)
+    assert any(key.startswith("vision_tower") for key, _ in tree_flatten(model.trainable_parameters())) is vision
+    trainer = mlx_trainer.MLXGRPOTrainer(model, processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
+        output_dir=str(tmp_path / "out"), max_steps=1, per_device_train_batch_size=2, num_generations=2, num_iterations=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
+        max_seq_length=1024, logging_steps=1, loss_type="dapo", beta=0.0, compile=False, shuffle_dataset=False), reward_funcs=lambda completion_ids, **_: [float(len(c)) for c in completion_ids])  # noqa: E501
+    trainer.train()
+    assert len(pairs) == 2 and all(old is not None for _, old, _ in pairs)
+    for new, old, mask in pairs:
+        assert mx.array_equal(mx.where(mask > 0, new, 0), mx.where(mask > 0, old, 0)).item()
+
+
+@metal_only
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("labeled", [False, True])
 def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):
@@ -3066,7 +3116,8 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
 def test_gemma3n_compile_patches_recognise_the_installed_language_call():
     from mlx_vlm.models.gemma3n.language import Gemma3Model
     import unsloth_zoo.mlx.compile as mc
-    assert mc._gemma3n_language_contract(Gemma3Model.__call__) == "current"
+    # The class's own source: a loaded model's compile patches replace __call__ process-wide.
+    assert mc._gemma3n_language_contract(Gemma3Model) == "current"
 
 
 @metal_only

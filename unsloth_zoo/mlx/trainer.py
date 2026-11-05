@@ -6178,13 +6178,7 @@ class MLXTrainer:
                 step_compiled=lambda: _use_compile,
             )
 
-        # Build loss+grad function — returns ((loss, ntoks), grads)
-        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
         _compiled_loss_fn = getattr(loss_fn, "_unsloth_compiled_loss_fn", None)
-        _compiled_loss_and_grad_fn = (
-            nn.value_and_grad(model, _compiled_loss_fn)
-            if _compiled_loss_fn is not None else None
-        )
 
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
@@ -6448,13 +6442,15 @@ class MLXTrainer:
 
         def _loss_and_grad(batch_data):
             compute = (
-                _compiled_loss_and_grad_fn
-                if _use_compile and _compiled_loss_and_grad_fn is not None
-                else loss_and_grad_fn
+                _compiled_loss_fn
+                if _use_compile and _compiled_loss_fn is not None
+                else loss_fn
             )
-            if isinstance(batch_data, dict):
-                return compute(model, batch_data)
-            return compute(model, *batch_data)
+            batch = (batch_data,) if isinstance(batch_data, dict) else batch_data
+            # Only trainable parameters are traced: any array argument, the model's frozen weights or the batch, would
+            # make mx.compile helpers in a frozen vision tower (Gemma 4's attention) skip their cached graphs, unlike
+            # GRPO's old log-probs.
+            return nn.value_and_grad(model, lambda: compute(model, *batch))()
 
         def _accumulate_weighted_grad(grad, toks_f, prev_state):
             """Accumulate token-weighted grads without distributed collectives."""
