@@ -18,6 +18,7 @@
 patches it on CUDA (unsloth_zoo.rl_replacements.grpo_compute_loss)."""
 
 import copy
+import hashlib
 import math
 import os
 import sys
@@ -686,11 +687,36 @@ def grpo_row_layout(order, block, key, classes=None):
     return laid
 
 
-def _media_class(prompt, images):
+def _image_class(prompt, images):
     # Images alike in type, size and mode come out of the processor in the same shapes; others stay with their prompt.
     shapes = tuple((type(image).__name__, getattr(image, "shape", None) or getattr(image, "size", None),
                     getattr(image, "mode", None)) for image in images)
     return ("prompt", prompt) if any(shape is None for _, shape, _ in shapes) else shapes
+
+
+def _media_signature(inputs, length):
+    """One prompt's processor outputs as a batch's compile family sees them: array shapes and dtypes, integer values
+    (grids, sizes) and other metadata, without token-aligned outputs, which batches rebuild; None if unkeyable."""
+    def key(value):
+        if isinstance(value, (list, tuple)):
+            return tuple(key(item) for item in value)
+        if isinstance(value, Mapping):
+            return tuple(sorted((name, key(item)) for name, item in value.items()))
+        if not hasattr(value, "shape"):
+            return value
+        shape, dtype = tuple(int(size) for size in value.shape), str(value.dtype)
+        exact = "int" in dtype or "bool" in dtype
+        return shape, dtype, hashlib.blake2b(np.asarray(value).tobytes(), digest_size=8).digest() if exact else None
+    skipped = {"labels", *_VLM_RELOCATABLE_SIDECAR_KEYS, *_VLM_WIDTH_GENERATED_KEYS}
+    try:
+        signature = tuple(sorted(
+            (name, key(value)) for name, value in inputs.items()
+            if name not in skipped and tuple(getattr(value, "shape", ())) != (1, length)
+        ))
+        hash(signature)
+    except TypeError:
+        return None
+    return signature
 
 
 @dataclass
@@ -719,9 +745,10 @@ class GRPOBatchPlan:
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
         processor=None, model_config=None, vision=False, group_by_length=False, layout_block=1,
-        skip_zero_advantage=False, sample_weighting=None,
+        skip_zero_advantage=False, sample_weighting=None, media_signatures=None,
     ):
         self._dataset = dataset
+        self._media_signatures = media_signatures
         self._tokenizer = tokenizer
         self._processor = processor
         self._model_config = model_config
@@ -827,6 +854,13 @@ class GRPOBatchPlan:
         while self._families is not None and width in self._forbidden:
             width += 1
         return width
+
+    def _media_class(self, prompt, images):
+        # Equal output signatures give a batch's family its same per-row shapes, unless batches record image token positions.
+        if _config_get(self._model_config, "model_type") == "phi3_v":
+            return ("prompt", prompt)
+        signature = None if self._media_signatures is None else self._media_signatures[prompt]
+        return _image_class(prompt, images) if signature is None else ("outputs", signature)
 
     def _generation_prompts(self, visit):
         return [prompt for prompt in self._schedule[visit % len(self._schedule)] for _ in range(self.num_generations)]
@@ -1041,7 +1075,7 @@ class GRPOBatchPlan:
         if self.group_by_length or self.skip_zero_advantage:
             # A compiled vision run moves a row only into a position whose row had images alike: its families hold.
             classes = None if self._families is None else [
-                _media_class(prompt, encoded[prompt][2] if encoded else ()) for prompt in prompts
+                self._media_class(prompt, encoded[prompt][2] if encoded else ()) for prompt in prompts
             ]
             order = grpo_row_layout(order, self._layout_rows, lambda row: (
                 dead[row], prompt_lengths[row] + lengths[row] if self.group_by_length else 0,
@@ -1199,7 +1233,7 @@ def _encode_grpo_prompts(
     if vision is None:
         first = dataset[0] if len(dataset) else None
         vision = processor is not None and isinstance(first, Mapping) and bool({"image", "images"} & set(first))
-    prompt_ids, max_tokens = [], []
+    prompt_ids, max_tokens, signatures = [], [], []
     long_prompts = capped = 0
     holds_images = False
     for index in range(len(dataset)):
@@ -1215,7 +1249,8 @@ def _encode_grpo_prompts(
                 "Give the first row an `images` field, empty if it has none."
             )
         # TRL tokenizes prompts with add_special_tokens=False: a chat template supplies its own BOS.
-        ids, _, images, _ = _encode_grpo_prompt(tokenizer, row, processor, vision)
+        ids, _, images, inputs = _encode_grpo_prompt(tokenizer, row, processor, vision)
+        signatures.append(None if inputs is None else _media_signature(inputs, len(ids)))
         holds_images = holds_images or bool(images)
         if not ids or len(ids) >= max_seq_length:
             raise ValueError(
@@ -1246,7 +1281,7 @@ def _encode_grpo_prompts(
             "their completions are capped to the room left.",
             stacklevel=3,
         )
-    return prompt_ids, max_tokens, vision
+    return prompt_ids, max_tokens, vision, signatures
 
 
 def create_grpo_batch_plan(
@@ -1262,7 +1297,7 @@ def create_grpo_batch_plan(
     skip_zero_advantage puts zero-advantage rows last; sample_weighting is grpo_sample_weighting's."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
-    prompt_ids, max_tokens, vision = _encode_grpo_prompts(
+    prompt_ids, max_tokens, vision, signatures = _encode_grpo_prompts(
         dataset, tokenizer, sampling, max_seq_length, max_prompt_length, processor,
     )
     if batch_size * steps_per_generation % num_generations:
@@ -1303,7 +1338,7 @@ def create_grpo_batch_plan(
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
         processor=processor, model_config=model_config, vision=vision,
         group_by_length=group_by_length, layout_block=math.gcd(steps_per_generation, grad_accum),
-        skip_zero_advantage=skip_zero_advantage, sample_weighting=sample_weighting,
+        skip_zero_advantage=skip_zero_advantage, sample_weighting=sample_weighting, media_signatures=signatures,
     )
 
 
@@ -1317,7 +1352,7 @@ def create_grpo_eval_plan(
     seed stream without advancing num_input_tokens_seen."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
-    prompt_ids, max_tokens, vision = _encode_grpo_prompts(
+    prompt_ids, max_tokens, vision, _ = _encode_grpo_prompts(
         dataset, tokenizer, sampling, max_seq_length, max_prompt_length, processor,
     )
     seed = _normalize_seed(seed)

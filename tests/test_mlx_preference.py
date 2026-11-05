@@ -4240,22 +4240,28 @@ def test_grpo_vision_compile_plans_stable_families_for_verified_arches(monkeypat
     from unsloth_zoo.mlx import generate as generate_module, compile as compile_module, grpo, trainer
     monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: [
         types.SimpleNamespace(token_ids=[1] * (1 + row * 7 % 40), finish_reason="stop") for row in range(len(requests))])
-    surveys, forbidden = [], frozenset({33, 34, 65})  # the shim has no array captures: a family is its pixels in row order
-    monkeypatch.setattr(grpo.GRPOBatchPlan, "_vision_family", lambda self, inputs: surveys.append(1) or (tuple(map(tuple, inputs["pixel_values"].tolist())), True, forbidden))  # noqa: E501
-    data = [{"prompt": [{"role": "user", "content": f"q{i}"}], "image": Image.new("RGB", (4 + i % 2, 4))} for i in range(4)]
+    import numpy as np
+    gridded = _grpo_vision_processor()  # a patch grid of width // 2, so two raw sizes share each grid
+    gridded.__class__ = type("Gridded", (VisionProcessor,), {"__call__": lambda self, *a, **k: (lambda out: {**out, "image_grid_thw": np.array([[1, int(p[0]) // 2, 1] for p in out["pixel_values"]])})(VisionProcessor.__call__(self, *a, **k))})  # noqa: E501
+    surveys, forbidden = [], frozenset({33, 34, 65})  # the shim has no array captures: a family is pixel shapes and grids in row order
+    monkeypatch.setattr(grpo.GRPOBatchPlan, "_vision_family", lambda self, inputs: surveys.append(1) or ((tuple(inputs["pixel_values"].shape), repr(getattr(inputs["image_grid_thw"], "tolist", lambda: inputs["image_grid_thw"])())), True, forbidden))  # noqa: E501
+    data = [{"prompt": [{"role": "user", "content": f"q{i}"}], "image": Image.new("RGB", (4 + i, 4))} for i in range(4)]
     policy, args = compile_module.MLXVLMCompilePolicy(), trainer.MLXTrainingConfig(max_steps=2, gradient_accumulation_steps=4, max_grad_norm=1.0)
     build = lambda rows: grpo.create_grpo_batch_plan(rows, None, num_generations=2, batch_size=2, steps_per_generation=4, num_iterations=1, grad_accum=4, sampling=grpo.GRPOSampling(max_tokens=40),  # noqa: E501, E731
-                                                     max_seq_length=128, shuffle=False, num_batches=8, processor=_grpo_vision_processor(), model_config={}, group_by_length=True, skip_zero_advantage=True)  # noqa: E501
+                                                     max_seq_length=128, shuffle=False, num_batches=8, processor=gridded, model_config={}, group_by_length=True, skip_zero_advantage=True)  # noqa: E501
     shapes = lambda plan, arch: trainer._plan_single_process_text_shapes(plan, None, args=args, total_steps=2, is_vlm=True, distributed_world_size=1, compile_policy=policy, vlm_compile_decision=types.SimpleNamespace(enabled=arch in compile_module._VERIFIED_TRAINING_ARCHES))[1]  # noqa: E501, E731
     reward, state = [lambda prompts, completions, **_: [float(len(c)) * ("q0" not in str(p)) for p, c in zip(prompts, completions)]], types.SimpleNamespace(num_input_tokens_seen=0)  # noqa: E501
     for arch, admitted in (("florence2", False), ("qwen2_5_vl", True)):
         plan = build(data)
         assert (shapes(plan, arch).action in ("exact", "bucket")) is admitted is (plan._families is not None)
     assert len(surveys) == 8 and plan.ensure_descriptors() and len(surveys) == 8  # one survey per micro-step, once
-    eager, compiled = build(same := [{**row, "image": Image.new("RGB", (5, 4))} for row in data]), build(same)
+    eager, compiled = build(same := [{**row, "image": Image.new("RGB", (4 + i % 2, 4))} for i, row in enumerate(data)]), build(same)
     for each in (eager, compiled, plan):
         each.bind(_VisionLanguageModel(), reward, trainer_state=state)
     assert shapes(compiled, "qwen2_5_vl").action in ("exact", "bucket") and eager.materialize(0) and compiled.materialize(0) and eager._current.sequences == compiled._current.sequences and eager._current.skipped.keys() == compiled._current.skipped.keys() != set()  # alike images: eager's layout, dead rows skipped  # noqa: E501
+    alike = compiled._media_class(0, [same[0]["image"]]) == compiled._media_class(1, [same[1]["image"]])
+    compiled._media_signatures = None  # outputs unavailable: raw sizes class apart
+    assert alike and compiled._media_class(0, [same[0]["image"]]) != compiled._media_class(1, [same[1]["image"]])
     for index in (*range(8), *range(8)):  # each visit trains the family surveyed for it, at a width clear of its extents
         width = plan.materialize(index, phase="single")[0]["input_ids"].shape[1]
         assert width in plan.width_rungs(index) and not forbidden & {width, *plan.width_rungs(index)} and plan.pop_family_drift() is None
