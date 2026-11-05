@@ -6673,6 +6673,30 @@ def _lora_is_sharded(model):
 pass
 
 
+def _lora_modules_state_dict(model):
+    """model.state_dict() restricted to the lora_A / lora_B subtrees, keys and values unchanged.
+
+    The full state_dict runs every base layer's _save_to_state_dict on each rollout step; for a
+    bitsandbytes Linear4bit that packs its QuantState (a nested offset.item() GPU sync and a few
+    small tensors per layer) only for the result to be filtered away. Calling state_dict on each
+    lora_A.<name> / lora_B.<name> module keeps their own hooks (stacked MoE LoRA rewrites its
+    weight_stack into per-expert keys there) while skipping the base weights."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not isinstance(model, torch.nn.Module): return model.state_dict()
+    out = OrderedDict()
+    roots = []
+    for name, module in model.named_modules(remove_duplicate = False):
+        if not (".lora_A." in name + "." or ".lora_B." in name + "."):
+            continue
+        # Children of an already collected subtree come out of its own state_dict call.
+        if any(name.startswith(r + ".") for r in roots[-1:]):
+            continue
+        roots.append(name)
+        module.state_dict(destination = out, prefix = name + ".")
+    return out
+pass
+
+
 def _lora_state_dict(model):
     """Full lora_A / lora_B tensors. Under FSDP2: gathered (collective on every rank), and taken outside
     inference mode, where FSDP2 state_dict fails with "Cannot set version_counter for inference tensor"."""
@@ -6680,7 +6704,7 @@ def _lora_state_dict(model):
     def lora_items(state_dict):
         return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
     if not _lora_is_sharded(model):
-        return lora_items(model.state_dict())
+        return lora_items(_lora_modules_state_dict(model))
     from torch.distributed.tensor import DTensor
     _merged_rollout_log_once(
         "Unsloth: native FSDP2 gathers the LoRA adapters across ranks for save_lora / load_lora, "
