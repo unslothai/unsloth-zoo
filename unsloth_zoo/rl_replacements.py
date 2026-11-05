@@ -787,8 +787,8 @@ def align_logprobs_with_mask(
 ) -> torch.Tensor:
     """Align a log probability tensor with a given attention mask.
 
-    Row b's values start at its first nonzero mask column (column 0 for an all-zero row); every other column holds
-    pad_value. One gather over fixed shapes: boolean selections would each read their size on the host."""
+    Row b starts at its first nonzero mask column (0 if none); other columns hold pad_value. A gather, not boolean
+    selections, so no host sync."""
 
     device = logprob_tensor.device
     logprob_seq_len = logprob_tensor.shape[1]
@@ -799,7 +799,6 @@ def align_logprobs_with_mask(
 
     left_pad_counts = torch.argmax(attention_mask, dim=1)
 
-    # Source column of each destination column; out of [0, logprob_seq_len) is padding.
     src = torch.arange(mask_seq_len, device=device).unsqueeze(0) - left_pad_counts.unsqueeze(1)
     valid = (src >= 0) & (src < logprob_seq_len)
     aligned = logprob_tensor.gather(1, src.clamp(0, logprob_seq_len - 1))

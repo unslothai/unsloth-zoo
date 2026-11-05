@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""align_logprobs_with_mask: bit for bit the boolean-selection scatter it replaces (left padding, holes, all-zero
-rows, narrower and wider masks, int / bool tool masks, NaN / -inf / -0.0 values), with fixed shapes only, so it
-compiles as one graph with no data-dependent op."""
+"""align_logprobs_with_mask: bit for bit the boolean-selection scatter it replaced, with no data-dependent sizes."""
 
 from __future__ import annotations
 
@@ -27,7 +25,6 @@ from unsloth_zoo.rl_replacements import align_completion_tool_mask, align_logpro
 
 
 def _boolean_select_reference(logprob_tensor, attention_mask, pad_value = 0.0):
-    # The previous implementation, verbatim.
     device = logprob_tensor.device
     batch_size, logprob_seq_len = logprob_tensor.shape
     mask_seq_len = attention_mask.shape[1]
@@ -80,7 +77,6 @@ def test_align_matches_boolean_selection_bit_for_bit(name, logps, mask, pad):
     got = align_logprobs_with_mask(logps, mask, pad)
     assert got.dtype == expected.dtype and got.shape == expected.shape and got.device == expected.device
     if got.is_floating_point():
-        # Bit patterns: NaN payloads and -0.0 included.
         view = {torch.float32: torch.int32, torch.float64: torch.int64, torch.bfloat16: torch.int16}[got.dtype]
         assert torch.equal(got.view(view), expected.view(view))
     else:
@@ -104,8 +100,7 @@ def test_align_completion_tool_mask_unchanged():
 
 
 def test_align_compiles_as_one_graph_with_no_data_dependent_sizes():
-    # A boolean selection has a data-dependent size: Dynamo either cannot capture it or captures an unbacked size
-    # (on CUDA, a read of that size back to the host). The gather has none.
+    # Boolean selections give unbacked sizes (a host read on CUDA).
     from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 
     graphs = []

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The PyAV fallback of _read_video_torchvision samples while reading: only the kept frames are converted to RGB, and
-the result is bit for bit the full read indexed by the same frame indices (ranges, fps / nframes settings, seeks)."""
+"""PyAV video fallback: only sampled frames become RGB; output equals the full read indexed the same way."""
 
 import tracemalloc
 
@@ -42,7 +41,6 @@ def clip(tmp_path_factory):
         stream.width = stream.height = SIDE
         stream.pix_fmt = "yuv420p"
         for i in range(N_FRAMES):
-            # Distinct content per frame, so a wrong frame index cannot compare equal.
             image = rng.integers(0, 256, (SIDE, SIDE, 3), dtype = np.uint8)
             image[: 8, : 8] = i * 4
             frame = av.VideoFrame.from_ndarray(image, format = "rgb24")
@@ -58,12 +56,11 @@ def fallback(monkeypatch):
     def read_video(*args, **kwargs):
         raise TypeError(PYAV_19_ERROR)
 
-    # raising = False: torchvision 0.26+ has no read_video at all.
+    # torchvision 0.26+ has no read_video.
     monkeypatch.setattr(vision_utils.io, "read_video", read_video, raising = False)
 
 
 def _full_read_then_sample(ele):
-    # The previous route: every frame in range as RGB, then the same sampling as _read_video_torchvision.
     video, info = vision_utils._read_video_pyav(ele["video"], ele.get("video_start", 0.0), ele.get("video_end", None))
     total = video.size(0)
     nframes = vision_utils.smart_nframes(ele, total_frames = total, video_fps = info["video_fps"])
@@ -136,12 +133,11 @@ def test_only_the_sampled_frames_are_converted_to_rgb(fallback, clip, monkeypatc
     monkeypatch.setattr(av, "open", lambda *a, **k: _CountingContainer(real_open(*a, **k), counter))
     video, _ = vision_utils._read_video_torchvision({"video": clip, "nframes": 8})
     assert video.shape[0] == 8
-    # One RGB conversion per kept frame; the full read converted all N_FRAMES.
     assert counter[0] == 8, counter[0]
 
 
 def test_peak_rgb_host_memory_is_the_sampled_frames(fallback, clip):
-    # numpy reports its buffers to tracemalloc: the RGB frame list and the stacked array of the full read.
+    # numpy buffers are visible to tracemalloc.
     tracemalloc.start()
     try:
         tracemalloc.reset_peak()

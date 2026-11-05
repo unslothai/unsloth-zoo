@@ -1505,8 +1505,7 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
             # half(coef) per row is a 0.4% bf16 scale error: buffer takes a power of two, fp32 the rest.
             pow2 = torch.exp2(torch.round(torch.log2(coef)))
             ratio, coef = coef / pow2, pow2
-        # Off CUDA a half dH GEMM multiplies fp32 copies of its operands (_mm_fp32): copy the head once per call, not
-        # once per row chunk. Same bits; the copy each chunk made is held through the loop instead.
+        # Off CUDA _mm_fp32 upcasts both operands: copy the head once, not per chunk (same bits).
         w_dh = w.float() if need_h and not w.is_cuda and compute_dtype in _HALF and n_chunked > R else w
         with torch.autocast(device.type, enabled = False):
             for a in range(0, n_chunked, R):

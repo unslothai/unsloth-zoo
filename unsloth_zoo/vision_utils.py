@@ -705,10 +705,8 @@ def _read_video_pyav(
     What torchvision.io.read_video(pts_unit="sec", output_format="TCHW") returns, for PyAV
     builds that torchvision can no longer open.
 
-    With `sample(total_frames, video_fps) -> indices`, only those frames are converted to RGB and
-    returned (video[indices] of the full read, bit for bit), and info also holds "total_frames": decoded
-    frames wait in their native pixel format until the count is known, instead of every frame being
-    held as RGB, stacked and copied again before sampling.
+    With `sample(total_frames, video_fps) -> indices`, only those frames become RGB (decoded frames wait
+    in their native format until the count is known) and info adds "total_frames".
     """
     import av
     import numpy as np
@@ -774,7 +772,6 @@ def _read_video_torchvision(
         # removed, so every read fails before decoding. Decode the same range with PyAV directly.
         if "metadata_errors" not in str(exc):
             raise
-        # Sampled while reading: only the kept frames are converted to RGB.
         video, info = _read_video_pyav(
             video_path, ele.get("video_start", 0.0), ele.get("video_end", None),
             sample=lambda total_frames, video_fps: _sample_frame_indices(ele, total_frames, video_fps),

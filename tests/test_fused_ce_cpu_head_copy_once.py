@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fused CE off CUDA, half inputs: the dH GEMMs multiply an fp32 copy of the head made once per call, not once per
-row chunk; loss and hidden gradient still match an fp64 reference."""
+"""Fused CE off CUDA, half inputs: one fp32 head copy per call, not per row chunk."""
 
 from __future__ import annotations
 
@@ -27,7 +26,6 @@ from unsloth_zoo.fused_losses import fused_linear as fl
 
 
 class _HeadCopies(TorchDispatchMode):
-    # fp32 copies read from the head's storage (whole head or a vocab slice), in head-sized units.
     def __init__(self, w):
         super().__init__()
         self.ptr, self.numel, self.elements = w.untyped_storage().data_ptr(), w.numel(), 0
@@ -53,7 +51,7 @@ def _impl_args(h, w, t, rows, need_h = True):
 @pytest.mark.parametrize("rows", [64, 100])
 def test_head_copied_to_fp32_once_per_call(dtype, rows):
     torch.manual_seed(0)
-    N, H, V = 512, 64, 1003  # V not a multiple of 8: the aligned split takes two GEMMs per chunk
+    N, H, V = 512, 64, 1003  # not a multiple of 8: two GEMMs per chunk
     h = (torch.randn(N, H) * 0.5).to(dtype)
     w = (torch.randn(V, H) * 0.5).to(dtype)
     t = torch.randint(0, V, (N,))
@@ -64,7 +62,6 @@ def test_head_copied_to_fp32_once_per_call(dtype, rows):
     assert n_chunks > 1
     assert copies.count == 1, (copies.count, n_chunks)
 
-    # fp64 reference of the same mean CE and its hidden gradient.
     h64 = h.double().requires_grad_(True)
     keep = t != -100
     ref = torch.nn.functional.cross_entropy(h64 @ w.double().t(), t, ignore_index = -100, reduction = "sum") / keep.sum()
