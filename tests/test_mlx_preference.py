@@ -3981,7 +3981,7 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
 
     calls, seen, reads = [], {}, []
     monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: calls.append(
-        (processor, requests)) or [types.SimpleNamespace(token_ids=[1] * (1 + row % 3), finish_reason="stop") for row in range(len(requests))])
+        (processor, requests, model, defaults)) or [types.SimpleNamespace(token_ids=[1] * (1 + row % 3), finish_reason="stop") for row in range(len(requests))])
     Rows = type("Rows", (list,), {"__getitem__": lambda self, index: reads.append(index) or list.__getitem__(self, index)})
     user = lambda text: [{"role": "user", "content": text}]
     image = lambda width: Image.new("RGB", (width, 4))
@@ -3992,6 +3992,7 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
         rows, None, num_generations=2, batch_size=2, steps_per_generation=3, num_iterations=1, grad_accum=1,
         sampling=GRPOSampling(max_tokens=3), max_seq_length=64, shuffle=False, num_batches=3, processor=processor, model_config={})
     plan, model = build(data), _VisionLanguageModel()
+    model.language_model, model.config = types.SimpleNamespace(named_modules=lambda: []), {"model_type": "gemma4"}
     assert plan._prompt_ids[:2] == [tuple(encode("<user>") + [60, 61] + encode("hi<assistant>")), tuple(encode("<user>yo<assistant>"))]
     plan.bind(model, [lambda prompts, completions, **_: seen.update(prompts=prompts) or [float(len(c)) for c in completions]],
               trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))
@@ -4021,6 +4022,9 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
         plan.materialize(3)
     blank = build([{"prompt": user("yo"), "images": []}] * 3)
     assert blank.vision is False and blank._prompt_ids[0] == tuple(encode("<user>!yo<assistant>"))
+    blank.bind(model, [lambda completions, **_: [0.0] * len(completions)], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))
+    blank.materialize(0)
+    assert calls[-1][2]._target is model.language_model and calls[-1][0] is processor.tokenizer and calls[-1][3].token_ids_only and calls[0][2] is model
     assert completion_logps(model, {"input_ids": mx.array([[1, 64, 2]])}, 1.0).shape == (1, 2)  # a placeholder past the head
     # Phi-3 Vision's processor places images as negative ids, which a tokenizer cannot decode.
     phi3 = _grpo_vision_processor()

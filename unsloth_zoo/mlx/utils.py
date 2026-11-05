@@ -1214,6 +1214,20 @@ class _SharedKVSlot:
         return self.keys, self.values
 
 
+# RoPE class names whose mlx-lm/mlx-vlm implementations rotate by position alone. Others pick their frequencies from the
+# forward's length or the batch's largest offset (dynamic NTK, longrope's short/long switch). A name cannot vouch for an
+# arbitrary model's own class, so callers gate on model type first.
+_POSITION_ONLY_ROPES = frozenset((
+    "RoPE", "EagerRoPE", "Llama3RoPE", "YarnRoPE", "ProportionalRoPE", "MRoPERotaryEmbedding", "Qwen3_5RotaryEmbedding",
+))
+
+
+def _length_dependent_ropes(backbone):
+    """RoPE classes in backbone not known to rotate by position alone."""
+    names = {type(module).__name__ for _, module in backbone.named_modules()}
+    return sorted(name for name in names if ("RoPE" in name or "Rotary" in name) and name not in _POSITION_ONLY_ROPES)
+
+
 # Language models that scale token embeddings by sqrt(hidden_size) on the ids path only, so multimodal forwards lose the
 # scale; gemma3 is absent because _run_hidden_stack, its route, already compensates.
 _VLM_EMBED_SCALE_FAMILIES = frozenset({"gemma3n_text"})

@@ -826,7 +826,9 @@ class GRPOBatchPlan:
         read = {prompt: self._dataset[prompt] for prompt in dict.fromkeys(prompts)}
         # Read again each generation and held only for it: the plan keeps no pixels.
         encoded = {prompt: self._reencode(prompt, row) for prompt, row in read.items()} if self.vision else {}
-        text = self._processor is None
+        images = any(inputs is not None for *_, inputs in encoded.values())
+        engine = None if images else generate_module.text_engine_model(self._model)
+        text = engine is not None
         requests = [
             GenerationRequest(
                 prompt_token_ids=self._prompt_ids[prompt],
@@ -850,7 +852,9 @@ class GRPOBatchPlan:
         )
         with self._rollout_context():
             results = generate_module.generate_batch(
-                self._model, self._processor or self._tokenizer, requests, defaults=defaults,
+                engine or self._model,
+                (getattr(self._processor, "tokenizer", self._processor) if text else self._processor) or self._tokenizer,
+                requests, defaults=defaults,
             )
         cut = [
             cut_completion(result.token_ids, result.finish_reason, eos_id=self.eos_id, pad_id=self.pad_id)

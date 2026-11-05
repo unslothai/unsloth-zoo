@@ -1097,6 +1097,31 @@ class _WarpedLogits(_Delegate):
         return self._warp(self._target(*args, **kwargs))
 
 
+_PER_ROW_VERIFIED_MODEL_TYPES = frozenset(("gemma4",))
+
+
+class _LanguageModelLogits(_Delegate):
+    _is_vlm_model = False
+
+    def __call__(self, *args, **kwargs):
+        output = self._target(*args, **kwargs)
+        return getattr(output, "logits", output)
+
+
+def text_engine_model(model):
+    """Text-engine model for image-less rows; a vision model's language model only if verified per-row, else None."""
+    from .utils import _length_dependent_ropes
+
+    if not getattr(model, "_is_vlm_model", False):
+        return model
+    config = getattr(model, "config", None)
+    model_type = config.get("model_type") if isinstance(config, Mapping) else getattr(config, "model_type", None)
+    language = getattr(model, "language_model", None)
+    if language is None or model_type not in _PER_ROW_VERIFIED_MODEL_TYPES or _length_dependent_ropes(language):
+        return None
+    return _LanguageModelLogits(language)
+
+
 class _PerRowSampler:
 
     def __init__(self, params, *, sample_utils_module, make_sampler):

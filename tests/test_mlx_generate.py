@@ -588,6 +588,17 @@ def test_a_prompt_cache_state_is_taken_only_by_a_vision_stream_row():
         list(_stream_batch(vlm, object(), [GenerationRequest(prompt="a", prompt_cache_state=state)]))
 
 
+def test_vision_text_engine_is_the_language_model_only_for_verified_types_with_position_only_ropes():
+    from unsloth_zoo.mlx import generate as engine
+    assert engine._LanguageModelLogits(lambda *_, **__: types.SimpleNamespace(logits=7))() == 7
+    for model_type, rope, routed in (("gemma4", "RoPE", True), ("gemma4", "ProportionalRoPE", True), ("jina_vlm", "RoPE", False),
+                                     ("qwen3_5", "Qwen3_5RotaryEmbedding", False), ("gemma4", "SuScaledRoPE", False),
+                                     ("gemma4", "DynamicNTKScalingRoPE", False), ("gemma4", "DynamicRotaryEmbedding", False)):
+        language = types.SimpleNamespace(named_modules=lambda rope=rope: [("rope", type(rope, (), {})())])
+        config = {"model_type": model_type} if rope == "RoPE" else types.SimpleNamespace(model_type=model_type)
+        assert (engine.text_engine_model(types.SimpleNamespace(_is_vlm_model=True, language_model=language, config=config)) is not None) == routed
+
+
 def test_prompt_kwargs_fallback_splits_mrope_on_the_batch_axis():
     # MRoPE position_ids are [3, batch, sequence], so splitting on axis 0 would hand every row the same rope section.
     from unsloth_zoo.mlx.generate import _split_prompt_kwargs_fallback
