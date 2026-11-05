@@ -158,3 +158,36 @@ def test_a_checkpointed_tile_keeps_its_side_when_the_body_falls_back_later(monke
     y.sum().backward()
     for _, fwd, rec in frames:
         assert fwd == rec and not any(fwd), (fwd, rec)
+
+
+class _InlineFlagMLP(GatedMLP):
+    """Branches on UNSLOTH_DECODE_COMPILE as the bnb 4-bit expert forwards do: the two sides save different tensors."""
+
+    def forward(self, x):
+        from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
+        if not UNSLOTH_DECODE_COMPILE[0]:
+            x = x.exp().log()
+        return super().forward(x)
+
+
+def test_a_tile_checkpointed_inside_a_block_recomputes_with_the_blocks_inline_flag():
+    # Unsloth's block compile sets UNSLOTH_DECODE_COMPILE while a block runs; the tile recomputes in backward, after the
+    # block returned. Unpinned, the recompute took the other branch: CheckpointError (OLMoE-1B-7B 4-bit, T4).
+    from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
+    torch.manual_seed(0)
+    mlp = _InlineFlagMLP()
+    ref = copy.deepcopy(mlp)
+    x = torch.randn(1, 37, H, requires_grad = True)
+    UNSLOTH_DECODE_COMPILE[0] = True
+    try:
+        y = ST._tiled_call_eager(mlp, x, n_tiles = 4, needs_rng = False, output_contract = None, compile_tile = False)
+        xr = x.detach().clone().requires_grad_()
+        yr = ref(xr)
+    finally:
+        UNSLOTH_DECODE_COMPILE[0] = False
+    y.pow(2).sum().backward()
+    yr.pow(2).sum().backward()
+    assert UNSLOTH_DECODE_COMPILE[0] is False
+    torch.testing.assert_close(x.grad, xr.grad)
+    for a, b in zip(mlp.parameters(), ref.parameters()):
+        torch.testing.assert_close(a.grad, b.grad)

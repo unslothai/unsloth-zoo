@@ -57,10 +57,24 @@ def _checkpoint(fn, args, preserve_rng_state):
         return _tag_activation_checkpoint(
             body, *args, use_reentrant = False, preserve_rng_state = preserve_rng_state,
         )
+    flag = _block_inline_flag()
     return _torch_checkpoint_fn()(
-        functools.partial(_replay_tile, body, _tile_gc_flag(), choice = [None]), *args,
+        functools.partial(_replay_tile, body, _tile_gc_flag(), choice = [None],
+                          inline = None if flag is None else flag[0]), *args,
         use_reentrant = False, preserve_rng_state = preserve_rng_state,
     )
+pass
+
+
+def _block_inline_flag():
+    """UNSLOTH_DECODE_COMPILE: Unsloth's block compile sets it while a block runs, and the MoE expert forwards (bnb 4-bit
+    experts) read it to choose between tracing inline and a torch.compiler.disable'd call. A tile checkpointed inside a
+    block recomputes in backward, outside it, so the recompute must see the forward's value."""
+    try:
+        from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
+        return UNSLOTH_DECODE_COMPILE
+    except Exception:
+        return None
 pass
 
 
@@ -80,14 +94,20 @@ def _tile_gc_flag():
 pass
 
 
-def _replay_tile(fn, gc_flag, *args, choice = None):
+def _replay_tile(fn, gc_flag, *args, choice = None, inline = None):
     """One eager tile whose forward and recompute read the same in_gradient_checkpoint_recompute() value: Unsloth's
     MoE kernels save a different tensor count per value, which raised CheckpointError (OLMoE: 29 vs 27). `choice`
-    pins a compiled tile body's side (compiled or eager, see _TileBody) for the recompute."""
+    pins a compiled tile body's side (compiled or eager, see _TileBody) for the recompute, `inline` the forward's
+    UNSLOTH_DECODE_COMPILE value (_block_inline_flag; OLMoE-1B-7B 4-bit under block compile saved a dequantized
+    expert weight in forward and the LoRA expert stacks in the recompute)."""
     tls = _gc_tls() if gc_flag is not None else None
     previous = getattr(tls, "active", False) if tls is not None else None
     if tls is not None:
         tls.active = gc_flag
+    flag = _block_inline_flag() if inline is not None else None
+    inline_previous = flag[0] if flag is not None else None
+    if flag is not None:
+        flag[0] = inline
     try:
         body = fn.args[0] if isinstance(fn, functools.partial) and fn.func is _owned and fn.args else None
         if isinstance(body, _TileBody):
@@ -105,6 +125,8 @@ def _replay_tile(fn, gc_flag, *args, choice = None):
     finally:
         if tls is not None:
             tls.active = previous
+        if flag is not None:
+            flag[0] = inline_previous
 pass
 
 _STOP_RECOMPUTATION = getattr(torch.utils.checkpoint, "_StopRecomputationError", None)
