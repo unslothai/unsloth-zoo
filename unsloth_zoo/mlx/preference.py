@@ -53,6 +53,8 @@ from .utils import (
     _vlm_family_divergence,
     _vlm_forward_logits,
     _vlm_hidden_states,
+    _vlm_image_encoder,
+    _vlm_image_features,
     _vlm_media_bytes_digest,
     _vlm_pipeline_disposable_keys,
     _vlm_token_aligned_sidecars,
@@ -916,6 +918,9 @@ _VLM_TOKEN_SPAN_KEYS = ("image_bound", "audio_bounds")
 # Their pixels are a [crops, whole images] pair, each batched along its own axis.
 _PIXEL_COMPONENT_MODEL_TYPES = ("deepseekocr", "deepseekocr_2")
 
+# How many times a vision batch's processor outputs repeat, one copy per branch.
+_IMAGE_COPIES = "_unsloth_image_copies"
+
 
 def _vision_batch(
     processor, model_config, rows, prompt_arrays, ids, lengths, *, same_pixels=False, split=False,
@@ -1004,11 +1009,44 @@ def _vision_batch(
                 "the processor, which moves the response spans. It is not supported "
                 "for preference training on image rows."
             )
+        if len(part) > 1 and "pixel_values" in batch:
+            batch[_IMAGE_COPIES] = len(part)
         return batch
 
     if split:
         return [build((branch,)) for branch in range(branches)]
     return build(tuple(range(branches)))
+
+
+def _with_image_features(model, batch, *, stop_gradient=False, encode_single_copy=False):
+    """The batch with its image features from one tower run over one copy of its images; in one forward the gradient
+    sums over the tiled copies as over each. A batch of one copy is encoded only when ``stop_gradient`` (features
+    other passes read too) or ``encode_single_copy`` asks for it."""
+    if not isinstance(batch, Mapping) or "cached_image_features" in batch:
+        return batch
+    copies = batch.get(_IMAGE_COPIES, 1)
+    features = _vlm_image_features(model, batch, copies) if copies > 1 or stop_gradient or encode_single_copy else None
+    if features is None:
+        return batch
+    return {**batch, "cached_image_features": mx.stop_gradient(features) if stop_gradient else features}
+
+
+def _with_features_of(source, batch):
+    """``batch`` reading ``source``'s image features without gradient: a split vision batch's dicts hold the same images."""
+    features = source.get("cached_image_features") if isinstance(source, Mapping) else None
+    if features is None or not isinstance(batch, Mapping) or "cached_image_features" in batch:
+        return batch
+    return {**batch, "cached_image_features": mx.stop_gradient(features)}
+
+
+def _shares_image_features(model, batch, reference_policy):
+    """Whether one tower run serves the policy and its reference: a frozen tower the reference scores unchanged."""
+    encoder = isinstance(batch, Mapping) and batch.get("pixel_values") is not None and _vlm_image_encoder(model)
+    return bool(
+        encoder and reference_policy is not None and reference_policy.model is None
+        and not any(mlx.utils.tree_flatten(module.trainable_parameters()) for module in encoder.modules)
+        and reference_policy.leaves_untouched(encoder.module_ids)
+    )
 
 
 class FinitePreferenceBatchPlan(_FiniteVisitMixin):
@@ -2229,6 +2267,11 @@ class ReferencePolicy:
             for module, enabled in zip(self.neftune_modules, noise):
                 module._neftune_noise_enabled = enabled
 
+    def leaves_untouched(self, module_ids):
+        touched = {id(module) for module, _ in self.scales + self.targets}
+        touched.update(map(id, self.neftune_modules))
+        return touched.isdisjoint(module_ids)
+
     def forward(self, model, batch, lengths, *, response_scorer=None):
         scorer = _response_logps if response_scorer is None else response_scorer
         with self.activate(model) as reference:
@@ -2322,7 +2365,8 @@ def _preference_logits(model, batch):
     """Logits predicting each next token, for every position but the last."""
     if isinstance(batch, Mapping):
         return _next_token_positions(
-            _vlm_forward_logits(model, batch), batch["input_ids"], "logits",
+            _vlm_forward_logits(model, _with_image_features(model, batch)),
+            batch["input_ids"], "logits",
         )
     return _model_logits(model(batch[:, :-1]))
 
@@ -2330,7 +2374,8 @@ def _preference_logits(model, batch):
 def _preference_hidden(model, batch):
     if isinstance(batch, Mapping):
         return _next_token_positions(
-            _vlm_hidden_states(model, batch), batch["input_ids"], "hidden states",
+            _vlm_hidden_states(model, _with_image_features(model, batch)),
+            batch["input_ids"], "hidden states",
         )
     return _forward_text_hidden_states(model, batch[:, :-1])
 
@@ -3113,6 +3158,8 @@ def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=No
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
                 scorer=None, cce_indices=None, reference=None, differentiated=True, reference_scorer=None):
     """Score one DPO batch; ``reference`` holds precomputed reference log probabilities."""
+    if reference is None and not objective.reference_free and _shares_image_features(model, batch, reference_policy):
+        batch = _with_image_features(model, batch, stop_gradient=True)
     pairs = lengths.shape[0] // 2
     logits = logit_totals = None
     mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
@@ -3247,6 +3294,12 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
     rows = labels.shape[0]
     vision = isinstance(batch, Mapping)
     completion, kl_rows = (batch, kl_batch) if vision else (batch[:rows], batch[rows:])
+    if reference is None and _shares_image_features(model, completion, reference_policy):
+        completion = _with_image_features(model, completion, stop_gradient=True)
+        kl_rows = _with_features_of(completion, kl_rows)
+    # The policy's KL forward reads the features of its completion forward.
+    policy = _with_image_features(model, completion, encode_single_copy=True) if objective.with_kl else completion
+    policy_kl = _with_features_of(policy, kl_rows)
     targets = _preference_ids(completion)[:, 1:]
     mask = _response_mask(targets, lengths[:rows])
     # Real-token positions only; TRL's sum also counts its collator's padding.
@@ -3254,10 +3307,10 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
         mx.arange(1, targets.shape[1] + 1) < lengths[:rows, 1:]
     ).astype(mx.float32)
     if scorer is None:
-        logits, ce = _preference_forward(model, completion, mask)
+        logits, ce = _preference_forward(model, policy, mask)
         logit_sums = (_row_logit_sum(logits) * positions).sum(axis=1)
     else:
-        ce, sums = scorer(model, completion, mask > 0, cce_indices, every_position=True,
+        ce, sums = scorer(model, policy, mask > 0, cce_indices, every_position=True,
                           differentiated=differentiated)
         logit_sums = (sums * positions).sum(axis=1)
     logps = -(ce * mask).sum(axis=1)
@@ -3290,8 +3343,8 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
     kl = zero
     if objective.with_kl:
         # TRL scores KL rows under no_grad: a separate, undifferentiated forward.
-        policy_kl = mx.stop_gradient(score(model, kl_rows, lengths[rows:], kl_indices))
-        kl = (policy_kl.astype(mx.float32) - reference[rows:]).mean()
+        kl_logps = mx.stop_gradient(score(model, policy_kl, lengths[rows:], kl_indices))
+        kl = (kl_logps.astype(mx.float32) - reference[rows:]).mean()
         if kl_mean is not None:
             kl = kl_mean(kl)
         kl = mx.stop_gradient(mx.maximum(kl, zero))

@@ -3321,7 +3321,7 @@ def test_a_vision_plan_repeats_the_pixels_for_both_branches():
     assert text.chosen == tokenize_preference_row(
         Tokenizer(), text_row, length_policy=policy()).chosen
     assert batch["input_ids"][1, :len(text.chosen)].tolist() == list(text.chosen)
-    assert batch["pixel_values"].tolist() == [[4.0], [4.0]]
+    assert batch["pixel_values"].tolist() == [[4.0], [4.0]] and batch["_unsloth_image_copies"] == 2
     types = batch["token_type_ids"].tolist()
     assert types[0][:21] == types[2][:21] == list(image.chosen_prompt_arrays[0][1])
     assert not any(types[1] + types[3])
