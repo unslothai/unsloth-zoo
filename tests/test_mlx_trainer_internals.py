@@ -3456,13 +3456,16 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
             "_unsloth_qwen3_visual_width": mx.array([6, 9], dtype=mx.int32),
         },
     )
+    built = []
     apc = mc._qwen3_mixed_prompt_batch_adapter(
-        lambda _self, _sequences: apc_batch
+        lambda _self, _sequences, picks=None: built.append(picks) or apc_batch
     )
     assert apc(
         object(),
         [(None, None, None, visual_row), (None, None, None, text_row)],
     )._prompt_kwargs["_unsloth_qwen3_visual_width"].tolist() == [9, 9]
+    apc(object(), [(None, None, None, text_row)], picks=["pick"])
+    assert built == [None, ["pick"]]
     apc_masks, apc_embeds = mc._qwen3_visual_window(
         mx.array([[0, 0, 0, 0], [1, 1, 0, 0]], dtype=mx.bool_),
         mx.array([[[[10]], [[0]]], [[[20]], [[21]]]]),

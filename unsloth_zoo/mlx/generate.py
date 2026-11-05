@@ -272,8 +272,8 @@ class GenerationRequest:
     ``open(token_ids)`` is handed the prepared prompt and returns ``(cache,
     checkpoint_lengths)``: the cache the row prefills into, whose ``offset`` tokens are
     reused rather than prefilled, and the prompt lengths at which ``checkpoint(
-    token_count, cache)`` is called with the live cache. A checkpoint fires only where a
-    prefill chunk ends; no chunk is reshaped to reach one. Rows decoding together merge
+    token_count, cache)`` is called with the live cache. A checkpoint fires where a
+    prefill chunk ends; a chunk that would step over one, without ending on another, ends at it. Rows decoding together merge
     by cache class, so every row of one batch needs a state building the same layout.
     Where ``row_retire_unavailable_reason()`` is None, an optional ``retire(take)`` is called
     as the row leaves decoding; ``take()``, valid only during the call, returns the row's own
@@ -2197,18 +2197,21 @@ def _function_draws_by_position(function) -> bool:
             else called.id if isinstance(called, ast.Name)
             else None
         )
-        if name != "_sample_with_positions":
-            continue
         given = {keyword.arg: keyword.value for keyword in node.keywords}
-        if not {"row_ids", "positions"}.issubset(given):
+        # mlx-vlm 0.7.12 draws through a module helper that hands the positions on.
+        helper = function.__globals__.get(name) if name == "_sample_batch_tokens" else None
+        if isinstance(helper, types.FunctionType) and _given(given, "positions"):
+            if _function_draws_by_position(helper):
+                return True
             continue
-        if any(
-            isinstance(given[argument], ast.Constant) and given[argument].value is None
-            for argument in ("row_ids", "positions")
-        ):
-            continue
-        return True
+        if name == "_sample_with_positions" and _given(given, "row_ids") and _given(given, "positions"):
+            return True
     return False
+
+
+def _given(keywords: dict, argument: str) -> bool:
+    value = keywords.get(argument)
+    return value is not None and not (isinstance(value, ast.Constant) and value.value is None)
 
 
 def _vlm_batches_observable(batch_module) -> bool:
@@ -2502,6 +2505,7 @@ class _RowPrefill:
     lengths: frozenset[int]
     quantize: Callable[[list], None] | None = None
     reopen: Callable[[dict], dict] | None = None
+    step: int | None = None
 
 
 def _slice_row_inputs(batch_module, prompt_kwargs: dict, length: int, start: int) -> dict:
@@ -2565,8 +2569,26 @@ def _row_prefill_batch_class(base):
             self._unsloth_done = 0 if row is None else row.prefix
 
         def prompt_step(self):
-            processed = super().prompt_step()
             row = self._unsloth_row
+            given = step = getattr(self, "prefill_step_size", None)
+            if row is not None and step:
+                # mlx-vlm 0.7.12 shrinks chunks to 256 while peers decode; a row's own cache keeps the configured
+                # chunks, so its checkpoints match a cold prefill bitwise.
+                step = row.step or step
+                done = self._unsloth_done
+                embeds = getattr(self, "_inputs_embeds", None)
+                end = done + (step if embeds is None else min(step, embeds.shape[1] - 1))
+                # Split only a chunk ending on no checkpoint: dense policies stay whole.
+                if end not in row.lengths:
+                    step = min([length - done for length in row.lengths if done < length < end], default=step)
+            if step == given:
+                processed = super().prompt_step()
+            else:
+                self.prefill_step_size = step
+                try:
+                    processed = super().prompt_step()
+                finally:
+                    self.prefill_step_size = given
             if processed and row is not None:
                 if row.quantize is not None:
                     row.quantize(self.prompt_cache)
@@ -2703,8 +2725,10 @@ def _row_prefill_seam():
 def _row_prefill_surface_gap(batch_module) -> str | None:
     version = _installed_mlx_vlm_version()
     try:
+        generator = batch_module.BatchGenerator
         params = inspect.signature(batch_module.PromptProcessingBatch.__init__).parameters
-        admission = inspect.getsource(batch_module.BatchGenerator._next)
+        # mlx-vlm 0.7.12 admits prompts in `_prefill_step`, which replaced `_next`.
+        admission = inspect.getsource(getattr(generator, "_prefill_step", None) or generator._next)
     except (AttributeError, TypeError, ValueError, OSError):
         return f"{version} exposes no prompt batch a row's own cache can enter"
     helpers = ("_is_sequence_aligned_prompt_kwarg", "_slice_sequence_aligned_prompt_kwarg")
@@ -3867,6 +3891,7 @@ class _VLMBatchSession:
             checkpoint = functools.partial(self._bank, state),
             lengths = frozenset(int(length) for length in lengths) if addressed else frozenset(),
             quantize = quantize,
+            step = getattr(self.generator, "prefill_step_size", None),
         )
 
     def _bank(self, state, token_count: int, cache: list) -> None:
@@ -3957,6 +3982,8 @@ class _VLMBatchSession:
             return
         best = min(live, key = lambda batch: (parks(batch) < cap, left[id(batch)]), default = None)
         queued = generator._unprocessed_sequences
+        # mlx-vlm 0.7.12 queues in arrival order (earlier releases sorted by length), and admits queued[0].
+        queued.sort(key = _queued_tokens_left)
         # mlx-vlm admits by the rows decoding alone, so parked rows must still fit.
         room = cap - len(generator._generation_batch) - len(live)
         if queued and room > 0 and (

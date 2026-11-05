@@ -3827,6 +3827,31 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
     assert _phi4mm_token_ids({"audio_token_index": 11}) == (expected[0], 11)
 
 
+def test_phi4mm_position_resize_matches_the_installed_release():
+    import textwrap
+
+    from unsloth_zoo.mlx import compile as patches
+
+    vision = pytest.importorskip("mlx_vlm.models.phi4mm.vision")
+    patches._install_phi4_multimodal_patches()
+    # The release's own body, rebuilt from source since the class now holds the compile-safe one.
+    namespace = dict(vars(vision))
+    exec(textwrap.dedent(inspect.getsource(vision.VisionEmbeddings)), namespace)
+    native = namespace["VisionEmbeddings"].resize_positional_embeddings
+    patched = vision.VisionEmbeddings.resize_positional_embeddings
+    table = mx.random.normal((8, 8, 4), key=mx.random.key(0)).astype(mx.bfloat16)
+    shapes = [(3, 5), (6, 2)]
+    trains = "training" in inspect.signature(native).parameters
+    for options in ({"training": False}, {"training": True}) if trains else ({},):
+        expected = native(table, mx.array(shapes), 20, **options)
+        assert mx.array_equal(patched(table, shapes, 20, **options), expected).item()
+    if trains:
+        grad = mx.grad(lambda t: patched(t, shapes, 20, training=True).sum())(table.astype(mx.float32))
+        assert float(mx.abs(grad).sum()) > 0
+    else:
+        assert mx.array_equal(patched(table, shapes, 20, training=True), patched(table, shapes, 20)).item()
+
+
 def test_phi4mm_switches_to_its_speech_weights_under_lora_adapters():
     from types import SimpleNamespace
 

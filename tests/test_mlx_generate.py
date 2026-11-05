@@ -1534,6 +1534,149 @@ def test_a_method_is_read_once_and_never_outlives_its_model(monkeypatch):
     assert generate._keeps_what_it_prepared(Model())
 
 
+_DRAW = "def _sample_with_positions(sampler, logprobs, *, row_ids=None, positions=None): pass\n"
+_HELPER = "def _sample_batch_tokens(logits, sampler, *, positions):\n    return _sample_with_positions(sampler, logits, row_ids=[0], positions={})\n"
+_STEP = "class GenerationBatch:\n    def _step(self):\n        return {}\n"
+
+
+@pytest.mark.parametrize("source, draws", [
+    (_DRAW + _STEP.format("_sample_with_positions(self.sampler, None, row_ids=[0], positions=[1])"), True),
+    (_DRAW + _HELPER.format("positions") + _STEP.format("_sample_batch_tokens(None, self.sampler, positions=[1])"), True),
+    (_DRAW + _HELPER.format("None") + _STEP.format("_sample_batch_tokens(None, self.sampler, positions=[1])"), False),
+    (_DRAW + _HELPER.format("positions") + _STEP.format("_sample_batch_tokens(None, self.sampler, positions=None)"), False),
+])
+def test_a_batch_draws_by_position_through_the_release_helper(tmp_path, source, draws):
+    from unsloth_zoo.mlx import generate
+
+    path = tmp_path / "batch_shape.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location(f"batch_shape_{abs(hash(source))}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert generate._draws_by_position(module.GenerationBatch, "_step") is draws
+
+
+_ADMIT = (
+    "def _is_sequence_aligned_prompt_kwarg(): pass\ndef _slice_sequence_aligned_prompt_kwarg(): pass\n"
+    "class PromptProcessingBatch:\n    def __init__(self, warm_cache=None): pass\n"
+    "class BatchGenerator:\n    def {}(self):\n        return {}('PromptProcessingBatch', None)\n"
+)
+
+
+@pytest.mark.parametrize("method, override, open_", [
+    ("_next", "_generate_module_override", True),
+    ("_prefill_step", "_generate_module_override", True),
+    ("_prefill_step", "getattr", False),
+])
+def test_a_row_cache_seam_is_read_where_the_release_admits_prompts(tmp_path, method, override, open_):
+    from unsloth_zoo.mlx import generate
+
+    path = tmp_path / f"admit_{method}_{override}.py"
+    path.write_text(_ADMIT.format(method, override))
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert (generate._row_prefill_surface_gap(module) is None) is open_
+
+
+@pytest.mark.parametrize("steps, chunks", [
+    ((2048, 2048, 2048), [2048, 952]),  # chunks on the checkpoint grid are left alone
+    ((256, 2048, 2048), [256, 1792, 952]),  # mlx-vlm 0.7.12 lifts its 256 cap once peers stop decoding
+    ((4096, 4096), [2048, 952]),
+])
+def test_a_row_prefill_chunk_ends_at_a_checkpoint_it_would_step_over(steps, chunks):
+    from unsloth_zoo.mlx import generate
+
+    class Prompt:
+        def __init__(self, prompt_kwargs, uids, warm_cache=None):
+            self.prefill_step_size, self.prompt_cache, self.left = None, warm_cache, 3000
+
+        def prompt_step(self):
+            n = min(self.prefill_step_size, self.left)
+            self.left -= n
+            return n
+
+    banked = []
+    row = types.SimpleNamespace(reopen=None, cache="cache", prefix=0, lengths={2048, 3000}, quantize=None, step=None,
+                                checkpoint=lambda length, cache: banked.append(length))
+    batch = generate._row_prefill_batch_class(Prompt)(prompt_kwargs={generate._ROW_PREFILL_KEY: row}, uids=[0])
+    done = []
+    for step in steps:
+        if batch.left:
+            batch.prefill_step_size = step
+            done.append(batch.prompt_step())
+            assert batch.prefill_step_size == step
+    assert done == chunks and banked == [2048, 3000]
+
+
+@pytest.mark.parametrize("lengths, pinned, chunks", [
+    (range(1, 3001), None, [256, 2048, 695]),  # dense: every chunk end is a checkpoint, so none is split
+    ({2048, 2999}, None, [256, 1792, 951]),
+    # A configured step outlasts mlx-vlm 0.7.12's 256 resize while peers decode.
+    ({2048, 2999}, 2048, [2048, 951]),
+])
+def test_a_row_prefill_chunk_ending_on_a_checkpoint_is_left_whole(lengths, pinned, chunks):
+    from unsloth_zoo.mlx import generate
+
+    class Prompt:  # mlx-vlm's sizing: min(step, remaining - 1), the last token held back
+        def __init__(self, prompt_kwargs, uids, warm_cache=None):
+            self.prefill_step_size, self.prompt_cache = None, warm_cache
+            self._inputs_embeds = types.SimpleNamespace(shape=(1, 3000))
+
+        def prompt_step(self):
+            left = self._inputs_embeds.shape[1]
+            n = min(self.prefill_step_size, left - 1)
+            self._inputs_embeds = types.SimpleNamespace(shape=(1, left - n))
+            return n
+
+    banked = []
+    row = types.SimpleNamespace(reopen=None, cache="cache", prefix=0, lengths=lengths, quantize=None, step=pinned,
+                                checkpoint=lambda length, cache: banked.append(length))
+    batch = generate._row_prefill_batch_class(Prompt)(prompt_kwargs={generate._ROW_PREFILL_KEY: row}, uids=[0])
+    done = []
+    for step in (256, 2048, 2048):
+        if batch._inputs_embeds.shape[1] > 1:
+            batch.prefill_step_size = step
+            done.append(batch.prompt_step())
+            assert batch.prefill_step_size == step
+    ends = [sum(chunks[:i + 1]) for i in range(len(chunks))]
+    assert done == chunks and banked == [end for end in ends if end in lengths]
+
+
+_EXTRACT_0711 = """\
+class BatchKVCache:
+    def extract(self, idx):
+        cache = KVCache()
+        padding = self.left_padding[idx].item()
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
+        cache.offset = cache.keys.shape[2]
+        return cache
+"""
+_EXTRACT_0712 = _EXTRACT_0711.replace("        padding =", """\
+        batch_size = self.offset.size
+        if idx < 0:
+            idx += batch_size
+        if idx < 0 or idx >= batch_size:
+            raise IndexError("BatchKVCache row index out of range")
+        if self.keys is None:
+            return cache
+        padding =""")
+
+
+@pytest.mark.parametrize("source", [_EXTRACT_0711, _EXTRACT_0712], ids=["0.7.11", "0.7.12"])
+def test_the_row_invariant_attention_contract_takes_each_release_extract(tmp_path, source):
+    from unsloth_zoo.mlx import inference
+
+    path = tmp_path / f"extract_{abs(hash(source))}.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    accepted = inference._INVARIANT_ATTENTION_CONTRACT["mlx_vlm.models.cache"]["BatchKVCache.extract"]
+    assert inference._ast_fingerprint(module.BatchKVCache.extract) in accepted
+
+
 def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
     from unsloth_zoo.mlx.generate import _schedules_prefill
 
@@ -1553,6 +1696,12 @@ def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
     assert not _schedules_prefill(gen, GenerationDefaults(prefill_batch_size = 2))
     session._schedule_prefill()
     assert (gen._prompt_batch, session._parked) == (None, [long])  # mlx-vlm admits the short row
+    # mlx-vlm 0.7.12 queues rows as they arrive; the shortest still goes first.
+    gen._prompt_batch, session._parked = None, []
+    gen._unprocessed_sequences = [queued(4, 5000), queued(5, 20, columns = 300), queued(1, 100)]
+    session._schedule_prefill()
+    assert [sequence[0] for sequence in gen._unprocessed_sequences] == [1, 5, 4]
+    gen._prompt_batch, session._parked, gen._unprocessed_sequences = None, [long], [queued(1, 100)]
     gen._prompt_batch, gen._unprocessed_sequences = short, []
     session._schedule_prefill()
     assert gen._prompt_batch is short
