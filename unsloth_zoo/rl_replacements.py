@@ -785,37 +785,24 @@ def align_logprobs_with_mask(
     attention_mask: torch.Tensor,
     pad_value: float = 0.0
 ) -> torch.Tensor:
-    """Align a log probability tensor with a given attention mask."""
+    """Align a log probability tensor with a given attention mask.
+
+    Row b starts at its first nonzero mask column (0 if none); other columns hold pad_value. A gather, not boolean
+    selections, so no host sync."""
 
     device = logprob_tensor.device
-    batch_size, logprob_seq_len = logprob_tensor.shape
+    logprob_seq_len = logprob_tensor.shape[1]
     mask_seq_len = attention_mask.shape[1]
 
-    padded_logprobs = torch.full(
-        attention_mask.shape,
-        fill_value=pad_value,
-        dtype=logprob_tensor.dtype,
-        device=device
-    )
+    if logprob_seq_len == 0:
+        return torch.full(attention_mask.shape, fill_value=pad_value, dtype=logprob_tensor.dtype, device=device)
 
     left_pad_counts = torch.argmax(attention_mask, dim=1)
 
-    cols = torch.arange(logprob_seq_len, device=device)
-
-
-    dest_indices = left_pad_counts.unsqueeze(1) + cols
-
-    # Destination row indices, shape [batch_size, logprob_seq_len].
-    row_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(dest_indices)
-
-    # Keep only in-bounds destinations, then scatter via advanced indexing.
-    valid_mask = dest_indices < mask_seq_len
-    valid_rows = row_indices[valid_mask]
-    valid_cols = dest_indices[valid_mask]
-    valid_vals = logprob_tensor[valid_mask]
-    padded_logprobs[valid_rows, valid_cols] = valid_vals
-
-    return padded_logprobs
+    src = torch.arange(mask_seq_len, device=device).unsqueeze(0) - left_pad_counts.unsqueeze(1)
+    valid = (src >= 0) & (src < logprob_seq_len)
+    aligned = logprob_tensor.gather(1, src.clamp(0, logprob_seq_len - 1))
+    return aligned.masked_fill(~valid, pad_value)
 
 RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
