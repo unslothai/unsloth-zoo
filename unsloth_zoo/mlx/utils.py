@@ -608,6 +608,23 @@ def _fp32_attention(sdpa, q, k, v, scale, mask):
     return out.astype(q.dtype)
 
 
+# Vision head dims of the Qwen3-VL family (Qwen3.5 64, Qwen3-VL 72 and 80), all fused by mlx from 9 queries.
+_FP32_VISION_HEAD_DIMS = frozenset((64, 72, 80))
+
+
+def fused_vision_attention(q, k, v, *, scale):
+    """Mask-free fused SDPA for a vision chunk whose fallback is an explicit fp32 softmax: fp32 inputs inside a
+    training step, the stock fused forward outside one. Returns None, so the caller keeps its explicit path, when mlx
+    would not fuse the call, off the GPU, and under UNSLOTH_MLX_FP32_TRAIN_ATTENTION=0."""
+    if not _fp32_attention_routes(q, k, v, None, _FP32_VISION_HEAD_DIMS):
+        return None
+    sdpa = mx.fast.scaled_dot_product_attention
+    sdpa = getattr(sdpa, "_unsloth_original", sdpa)
+    if mlx_training_patches_active():
+        return _fp32_attention(sdpa, q, k, v, scale, None)
+    return sdpa(q, k, v, scale=scale)
+
+
 def _wrap_training_sdpa(original):
     @wraps(original)
     def wrapper(q, k, v, *, scale, mask=None, **kwargs):

@@ -173,6 +173,92 @@ def test_qwen3_vl_pos_embed_interpolation_with_quantized_table():
 
 
 @metal_only
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_qwen3_vl_vision_attention_trains_on_fp32_fused_attention(monkeypatch, dtype):
+    import numpy as np
+    from mlx_vlm.models.qwen3_vl.vision import Attention
+    from unsloth_zoo.mlx import compile as mc
+
+    mc._install_qwen3_family_compile_patches()
+    lengths, heads, dim = [200, 8, 9, 176], 4, 72   # 8 patches is the largest chunk mlx would not fuse
+    mx.random.seed(0)
+    layer = Attention(heads * dim, num_heads=heads)
+    layer.qkv.weight = layer.qkv.weight * 4   # peaked scores
+    dt = getattr(mx, dtype)
+    layer.set_dtype(dt)   # the float32 reference starts from the same rounded weights and inputs
+    x, cot = (mx.random.normal((sum(lengths), heads * dim)).astype(dt) for _ in range(2))
+    cu_seqlens, freqs = mx.array(np.cumsum([0, *lengths])), mx.zeros((sum(lengths), dim // 2))
+
+    def dx(dt, training=False):
+        layer.set_dtype(dt)
+        if training:
+            mlx_utils.acquire_mlx_training_patches()
+        try:
+            grad = mx.grad(lambda x: (layer(x, cu_seqlens, freqs) * cot.astype(dt)).astype(mx.float32).sum())(
+                x.astype(dt))
+            mx.eval(grad)
+        finally:
+            if training:
+                mlx_utils.release_mlx_training_patches()
+        return _f64(grad)
+
+    def explicit(q, k, v, *, scale, mask=None, **kwargs):   # the formula this patch used for every chunk
+        return _explicit_fp32_softmax(q, k, v, scale, mask)
+
+    monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    stock, seen = mx.fast.scaled_dot_product_attention, []
+    ref = dx(mx.float32)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", explicit)
+    old = dx(dt)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention",
+                        lambda q, *a, **kw: seen.append(q.dtype) or stock(q, *a, **kw))
+    new = dx(dt, training=True)
+    assert seen == [mx.float32] * 3   # the 8-patch chunk stays explicit
+    assert _rel(new, ref) <= 1.1 * _rel(old, ref)
+    monkeypatch.setenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", "0")
+    killed = dx(dt, training=True)
+    assert seen == [mx.float32] * 3   # the kill switch keeps every chunk on the explicit path
+    assert _rel(killed, ref) <= 1.1 * _rel(old, ref)
+
+
+@metal_only
+def test_qwen3_vl_vision_forward_does_not_depend_on_freeze_state(monkeypatch):
+    # A separately loaded reference is frozen while the policy tower trains; equal weights must score equally.
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models.qwen3_vl.config import VisionConfig
+    from mlx_vlm.models.qwen3_vl.vision import VisionModel
+    from unsloth_zoo.mlx import compile as mc
+
+    mc._install_qwen3_family_compile_patches()
+    mx.random.seed(0)
+    config = VisionConfig(depth=2, hidden_size=288, intermediate_size=576, out_hidden_size=64, num_heads=4,
+                          num_position_embeddings=64)
+    policy, reference = VisionModel(config), VisionModel(config)
+    reference.update(policy.parameters())
+    for tower in (policy, reference):
+        tower.set_dtype(mx.bfloat16)
+        tower.freeze()
+    policy.blocks[0].attn.qkv.unfreeze()
+    assert tree_flatten(policy.trainable_parameters()) and not tree_flatten(reference.trainable_parameters())
+    pixels, grid = mx.random.normal((256, 3 * 2 * 14 * 14)).astype(mx.bfloat16), mx.array([[1, 16, 16]])
+    stock, seen = mx.fast.scaled_dot_product_attention, []
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention",
+                        lambda q, *a, **kw: seen[-1].append(q.dtype) or stock(q, *a, **kw))
+    out = []
+    mlx_utils.acquire_mlx_training_patches()
+    try:
+        for tower in (policy, reference):
+            seen.append([])
+            out.append(tower(pixels, grid)[0])
+        mx.eval(out)
+    finally:
+        mlx_utils.release_mlx_training_patches()
+    # Same kernels, not just equal outputs: stock and fp32-input forwards can round alike on one GPU and not another.
+    assert seen[0] == seen[1] == [mx.float32] * 2
+    assert mx.array_equal(out[0], out[1]).item()
+
+
+@metal_only
 @pytest.mark.parametrize("static", [False, True])
 def test_native_vlm_names_preserve_source_remaps_and_transforms(monkeypatch, static):
     import inspect
@@ -568,7 +654,7 @@ def _attention_inputs(dtype, T, S, dim, heads, peak, seed):
 
 @metal_only
 @pytest.mark.parametrize("peak", [1.0, 4.0])
-@pytest.mark.parametrize("dim, mask", [(64, "causal"), (128, "causal")])
+@pytest.mark.parametrize("dim, mask", [(64, "causal"), (128, "causal"), (72, None)])   # 72: a vision chunk
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_fp32_training_attention_matches_explicit_softmax_against_float64(dtype, dim, mask, peak):
     from unsloth_zoo.mlx import attention
@@ -669,6 +755,38 @@ def test_fp32_training_attention_routes_only_fused_training_calls(monkeypatch, c
         mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
     assert out.dtype == dt
     assert seen == [(mx.float32 if routed else dt,) * 3]
+
+
+@metal_only
+@pytest.mark.parametrize("case, route", [
+    ({}, "fp32"), ({"dim": 64}, "fp32"), ({"dim": 80, "dtype": "float16"}, "fp32"), ({"T": 9}, "fp32"),
+    ({"T": 8}, None), ({"dim": 128}, None), ({"dtype": "float32"}, None), ({"env": "0"}, None),
+    ({"device": "cpu"}, None), ({"training": False}, "stock")])
+def test_fused_vision_attention_falls_back_to_explicit_when_mlx_would_not_fuse(monkeypatch, case, route):
+    spec = {"T": 128, "dim": 72, "dtype": "bfloat16", "env": None, "device": "gpu", "training": True, **case}
+    if spec["env"] is None:
+        monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    else:
+        monkeypatch.setenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", spec["env"])
+    seen = []
+
+    def original(q, k, v, *, scale, mask=None, **kwargs):
+        seen.append(q.dtype)
+        return mx.zeros(q.shape, q.dtype)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", original)
+    dt = getattr(mx, spec["dtype"])
+    q = mx.zeros((4, spec["T"], spec["dim"]), dt)[None]
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(int(spec["training"]))
+    device = mx.default_device()
+    mx.set_default_device(getattr(mx, spec["device"]))
+    try:
+        out = mlx_utils.fused_vision_attention(q, q, q, scale=0.1)
+    finally:
+        mx.set_default_device(device)
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert seen == {"fp32": [mx.float32], "stock": [dt], None: []}[route]
+    assert out is None if route is None else out.dtype == dt
 
 
 @metal_only
