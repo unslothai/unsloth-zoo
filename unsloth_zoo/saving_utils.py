@@ -7877,8 +7877,11 @@ def _hub_index_subfolder_shards(model_name, root_listing, token = None, revision
     names = {os.path.basename(x["name"]) for x in root_listing}
     if any(n.endswith(".safetensors") for n in names) or "model.safetensors.index.json" not in names:
         return {}
+    # `hf://org/repo` and `org/repo@rev` list fine but are not repo ids to hf_hub_download.
+    repo_id, address_revision = _hub_repo_and_revision(model_name)
+    revision = revision or address_revision
     index_path = hf_hub_download(
-        repo_id = model_name, filename = "model.safetensors.index.json", token = token, revision = revision,
+        repo_id = repo_id, filename = "model.safetensors.index.json", token = token, revision = revision,
     )
     try:
         with open(index_path, "r", encoding = "utf-8") as f:
@@ -7889,7 +7892,7 @@ def _hub_index_subfolder_shards(model_name, root_listing, token = None, revision
     fs = HfFileSystem(token = token)
     sizes = {}
     for folder in sorted({posixpath.dirname(s) for s in shards}):
-        for x in fs.ls(f"{model_name}/{folder}", detail = True, revision = revision):
+        for x in fs.ls(f"{repo_id}/{folder}", detail = True, revision = revision):
             name = f"{folder}/{os.path.basename(x['name'])}"
             if name in shards: sizes[name] = x["size"]
     # A shard the index names but the repo lacks would fail the merge part way.

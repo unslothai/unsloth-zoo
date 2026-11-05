@@ -67,7 +67,9 @@ def _fake_hub(monkeypatch, root):
             pass
 
         def ls(self, name, detail = True, **k):
-            rel = name[len(REPO):].strip("/")
+            bare = name[len("hf://"):] if name.startswith("hf://") else name
+            assert bare.startswith(REPO), name
+            rel = bare[len(REPO):].partition("/")[2] if "/" in bare[len(REPO):] else ""
             folder = os.path.join(root, rel)
             if not os.path.isdir(folder):
                 raise FileNotFoundError(name)
@@ -85,6 +87,7 @@ def _fake_hub(monkeypatch, root):
                 shutil.copyfile(src, os.path.join(local_dir, f))
 
     def _hf_hub(repo_id = None, filename = None, local_dir = None, **k):
+        assert repo_id == REPO, repo_id  # a bare repo id, never an hf:// or @rev address
         if not os.path.isfile(os.path.join(root, filename)):
             raise FileNotFoundError(filename)
         if local_dir is None:
@@ -110,6 +113,14 @@ def test_hub_repo_with_only_subfolder_shards_exists(monkeypatch, tmp_path):
                                 **{s: b"x" for s in _SHARDS}})
     _fake_hub(monkeypatch, str(tmp_path))
     assert S.check_hf_model_exists(REPO) is True
+
+
+@pytest.mark.parametrize("address", [f"hf://{REPO}", f"{REPO}@main"])
+def test_hub_address_forms_find_subfolder_shards(monkeypatch, tmp_path, address):
+    _write_tree(str(tmp_path), {"config.json": b"{}", "model.safetensors.index.json": _cosmos3_index(_SHARDS),
+                                **{s: b"x" for s in _SHARDS}})
+    _fake_hub(monkeypatch, str(tmp_path))
+    assert S.check_hf_model_exists(address) is True
 
 
 def test_hub_index_naming_a_missing_subfolder_shard_is_not_a_base(monkeypatch, tmp_path):
