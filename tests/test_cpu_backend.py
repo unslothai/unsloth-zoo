@@ -531,7 +531,7 @@ def test_for_training_and_get_peft_model_keep_every_n_layers():
     assert flags() == [True, False, True, False]
     FastCPUModel.for_training(model, use_gradient_checkpointing = True)
     assert flags() == [True, False, True, False]
-    FastCPUModel._prepare(model, "unsloth")  # what get_peft_model runs on the already checkpointed model
+    FastCPUModel._prepare(model, "unsloth")
     assert flags() == [True, False, True, False]
     FastCPUModel.for_training(model, use_gradient_checkpointing = False)
     assert not model.is_gradient_checkpointing
@@ -540,8 +540,7 @@ def test_for_training_and_get_peft_model_keep_every_n_layers():
 
 
 def test_for_training_and_get_peft_model_switch_reentrant_checkpointing():
-    # transformers < 5 enables reentrant checkpointing by default: an explicit True still means Unsloth's non-reentrant
-    # setup, or a LoRA model whose inputs do not require grad fails in backward.
+    # transformers < 5 defaults to reentrant, which fails backward when LoRA inputs do not require grad.
     from transformers import LlamaConfig, LlamaForCausalLM
     from unsloth_zoo.cpu.loader import FastCPUModel
     def reentrant():

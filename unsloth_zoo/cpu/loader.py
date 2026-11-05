@@ -156,8 +156,7 @@ def _cpu_compile_unavailable():
 
 
 def _non_reentrant_checkpointing_on(model):
-    # Re-enabling would drop every_n_layers' selection, so keep checkpointing that is already the non-reentrant
-    # kind enable sets; reentrant (transformers < 5 default) or an unknown function is switched as before.
+    # Re-enabling would drop an every_n_layers selection; reentrant or unknown funcs still get switched.
     if not getattr(model, "is_gradient_checkpointing", False):
         return False
     funcs = [m.__dict__["_gradient_checkpointing_func"] for m in model.modules() if "_gradient_checkpointing_func" in m.__dict__]
