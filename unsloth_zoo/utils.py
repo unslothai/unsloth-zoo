@@ -38,6 +38,108 @@ import re
 import pathlib
 from typing import Optional
 from filelock import FileLock
+import ast
+import inspect
+import sys
+
+
+_CLASS_SOURCE_DECORATOR = re.compile(
+    r"[ \t]*@[A-Za-z_][\w.]*"
+    r"(\((?:[^()\[\]{}#'\"\\\n]|\"[^\"\\\n]*\"|'[^'\\\n]*')*\))?"
+    r"[ \t]*\r?\n?$"
+)
+
+
+def _indent_of(line):
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _class_source(cls):
+    """inspect.getsource(cls), without the whole-module ast.parse Python < 3.13 does per call.
+
+    Finds the unique `class <Name>` line plus its single-line decorators and returns
+    inspect.getblock from there; anything ambiguous falls back to inspect.getsource.
+    """
+    if sys.version_info >= (3, 13):
+        return inspect.getsource(cls)
+    try:
+        name = cls.__name__
+        if (
+            not isinstance(cls, type)
+            or cls.__qualname__ != name
+            or hasattr(cls, "__wrapped__")
+        ):
+            return inspect.getsource(cls)
+        module = sys.modules.get(cls.__module__)
+        if module is None or not getattr(module, "__file__", None):
+            return inspect.getsource(cls)
+        # Same linecache read inspect.findsource(cls) does; a module needs no parse.
+        lines, _ = inspect.findsource(module)
+        pattern = re.compile(r"[ \t]*class\s+" + re.escape(name) + r"\b")
+        hits = [i for i, line in enumerate(lines) if pattern.match(line)]
+        if len(hits) != 1:
+            return inspect.getsource(cls)
+        start = hits[0]
+        indent = lines[start][: _indent_of(lines[start])]
+        # Single-line decorators at the class's indentation directly above the class line.
+        while (
+            start > 0
+            and lines[start - 1].startswith(indent)
+            and _indent_of(lines[start - 1]) == len(indent)
+            and _CLASS_SOURCE_DECORATOR.match(lines[start - 1])
+        ):
+            start -= 1
+        # Anything not consumed above must be complete statements, else a multi-line or
+        # blank/comment-separated decorator may still belong to the class. Parse only the
+        # region back to a line at the class's indentation where it compiles (a few steps
+        # up at most); a shallower line first means the class opens its block.
+        prev = start
+        for attempt in range(8):
+            prev -= 1
+            while prev >= 0 and (
+                not lines[prev].strip() or lines[prev].lstrip(" \t").startswith("#")
+                or _indent_of(lines[prev]) > len(indent)
+            ):
+                prev -= 1
+            if prev < 0 or _indent_of(lines[prev]) < len(indent):
+                # Nothing above compiled as complete statements, or the shallower line is not
+                # the block header (`try:`, `if ...:`) the class would open.
+                if attempt or (prev >= 0 and not lines[prev].split("#", 1)[0].rstrip().endswith(":")):
+                    return inspect.getsource(cls)
+                break
+            if not lines[prev].startswith(indent):
+                return inspect.getsource(cls)
+            if lines[prev].lstrip(" \t").startswith("@"):
+                return inspect.getsource(cls)
+            region = [line[len(indent):] if line.startswith(indent) else line for line in lines[prev:start]]
+            try:
+                compile("".join(region), "<unsloth_class_source>", "exec", ast.PyCF_ONLY_AST)
+                break
+            except SyntaxError:
+                continue
+        else:
+            return inspect.getsource(cls)
+        block = inspect.getblock(lines[start:])
+        end = start + len(block)
+        # Methods defined in this file must lie inside the block found, and at least one must
+        # exist: a lone match could otherwise be `class <Name>` text inside a string.
+        filename = inspect.getsourcefile(cls)
+        verified = False
+        for value in vars(cls).values():
+            func = getattr(value, "__func__", value)
+            if callable(func) and hasattr(func, "__wrapped__"):
+                func = inspect.unwrap(func)
+            code = getattr(func, "__code__", None)
+            if code is None or code.co_filename != filename:
+                continue
+            if not (start < code.co_firstlineno <= end):
+                return inspect.getsource(cls)
+            verified = True
+        if not verified:
+            return inspect.getsource(cls)
+        return "".join(block)
+    except Exception:
+        return inspect.getsource(cls)
 
 # Precompiled: torch 2.11 Dynamo tracing re.match through re._compile corrupts Python's regex cache.
 _PACKAGE_NAME_RE = re.compile(r'^[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$')
