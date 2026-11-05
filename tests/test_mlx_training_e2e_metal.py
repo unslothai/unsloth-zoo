@@ -2059,6 +2059,64 @@ def test_grpo_skipped_micro_step_opens_a_window_as_a_zero_gradient(tmp_path, mon
     assert all(mx.array_equal(value, trained[1][key]).item() for key, value in skipped[1].items())
 
 
+def _kept_old_logps_match_scored(monkeypatch, train, rtol=0.0, atol=0.0):
+    """train() with every old log-prob scored by a forward of its own, then with first passes' kept: the same old
+    log-probs wherever the second has them, bitwise, and the same losses and model within tolerance. Which deferred."""
+    import numpy as np
+    from unsloth_zoo.mlx import grpo
+    olds, runs, materialize = [], [], grpo.GRPOBatchPlan.materialize
+    monkeypatch.setattr(grpo.GRPOBatchPlan, "materialize", lambda self, index, **kw: (
+        lambda out: olds[-1].append(out[5]) or out)(materialize(self, index, **kw)))
+    for scored in ("1", "0"):
+        monkeypatch.setenv("UNSLOTH_GRPO_SCORE_OLD_LOGPS", scored)
+        olds.append([])
+        trainer = train()
+        runs.append((trainer._train_loss_history, dict(tree_flatten(trainer.model.parameters()))))
+    (scored, kept), ((losses, params), (again, retrained)) = olds, runs
+    known = [flag.item() for _, flag in kept]
+    assert len(scored) == len(kept) and not any(isinstance(old, tuple) for old in scored)
+    assert all(np.array_equal(table, old) for (table, _), flag, old in zip(kept, known, scored) if flag)
+    assert np.allclose(losses, again, rtol=rtol, atol=0) and all(mx.allclose(value, retrained[key], rtol=rtol, atol=atol).item() for key, value in params.items())  # noqa: E501
+    return [not flag for flag in known]
+
+
+@metal_only
+@pytest.mark.parametrize("iterations,spg,accum,beta,compiled,prefix,dead,deferred", [
+    (2, 2, 2, 0.0, False, False, False, [1, 1, 0, 0]), (2, 2, 2, 0.04, True, False, False, [1, 1, 0, 0]),
+    (3, 4, 2, 0.0, True, False, False, [1, 1] + [0] * 10), (1, 2, 1, 0.0, True, False, False, [1, 0]),
+    (2, 2, 2, 0.0, True, True, False, [1, 1, 0, 0]),
+    (2, 2, 2, 0.0, True, False, True, [1, 0, 0, 0]),  # each generation's second group has no advantage: skipped
+])
+def test_grpo_first_passes_keep_the_old_log_probs_a_forward_scores(tmp_path, monkeypatch, iterations, spg, accum, beta, compiled, prefix, dead, deferred):  # noqa: E501
+    import types
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
+    from unsloth_zoo.mlx import generate as generate_module, grpo
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig, MLXGRPOTrainer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(snapshot_download("Qwen/Qwen3-0.6B", allow_patterns=["*.json", "*.txt"], local_files_only=True))  # noqa: E501
+    except Exception:
+        pytest.skip("Qwen/Qwen3-0.6B's tokenizer is not cached")
+    Qwen3ForCausalLM(Qwen3Config(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=16, vocab_size=len(tokenizer), tie_word_embeddings=True)).save_pretrained(tmp_path / "tiny")  # noqa: E501
+    tokenizer.save_pretrained(tmp_path / "tiny")
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, defaults=None: [
+        types.SimpleNamespace(token_ids=[100 + row % 3] * (1 + row % 4) + [7], finish_reason="stop") for row in range(len(requests))])  # noqa: E501
+
+    def train():
+        model, tok = FastMLXModel.from_pretrained(str(tmp_path / "tiny"), load_in_4bit=False, max_seq_length=128)
+        model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, lora_dropout=0, max_seq_length=128)
+        trainer = MLXGRPOTrainer(model, tok, [{"prompt": "apples " * 40 * prefix + f"Count apples {i}."} for i in range(8)], reward_funcs=lambda prompts, completion_ids, **_: [0.0 if dead and p.endswith(("1.", "3.", "5.", "7.")) else float(len(c) + c[0]) for p, c in zip(prompts, completion_ids)], args=MLXGRPOConfig(  # noqa: E501
+            output_dir=str(tmp_path / "run"), max_steps=2 * spg * iterations // accum, per_device_train_batch_size=2, num_generations=2, steps_per_generation=spg, gradient_accumulation_steps=accum, num_iterations=iterations,  # noqa: E501
+            max_completion_length=6, max_seq_length=128, prefix_grouper=prefix, loss_type="dapo", beta=beta, learning_rate=1e-3, lr_scheduler_type="constant", warmup_steps=0,  # noqa: E501
+            logging_steps=1, seed=0, compile=compiled, shuffle_dataset=False))
+        trainer.train()
+        return trainer
+    shared, prefix_ids = [], grpo.GRPOBatchPlan._prefix_ids
+    monkeypatch.setattr(grpo.GRPOBatchPlan, "_prefix_ids", lambda *a: shared.append(prefix_ids(*a)) or shared[-1])
+    assert _kept_old_logps_match_scored(monkeypatch, train) == [bool(d) for d in deferred] * 2
+    assert {ids is not None for ids in shared} == {prefix}
+
+
 @metal_only
 @pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
 def test_grpo_cce_scores_like_the_logits(head):
@@ -2115,16 +2173,21 @@ def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, v
     monkeypatch.setattr(grpo, "_scored_as_step", rolled_out)
     monkeypatch.setattr(grpo, "grpo_terms", lambda objective, new, advantages, mask, *, old=None, ref=None: pairs.append(
         (mx.stop_gradient(new), old, mask)) or terms(objective, new, advantages, mask, old=old, ref=ref))
-    model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
     data = [{"prompt": [{"role": "user", "content": f"Describe picture {i}."}], "image": PIL.Image.new("RGB", (64, 64), (60 * i, 90, 160))} for i in range(2)]  # noqa: E501
-    model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=1024, finetune_vision_layers=vision)
-    assert any(key.startswith("vision_tower") for key, _ in tree_flatten(model.trainable_parameters())) is vision
-    trainer = mlx_trainer.MLXGRPOTrainer(model, processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
-        output_dir=str(tmp_path / "out"), max_steps=1, per_device_train_batch_size=2, num_generations=2, num_iterations=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
-        max_seq_length=1024, logging_steps=1, loss_type="dapo", beta=0.0, compile=False, shuffle_dataset=False), reward_funcs=lambda completion_ids, **_: [float(len(c)) for c in completion_ids])  # noqa: E501
-    trainer.train()
-    assert len(pairs) == 2 and all(old is not None for _, old, _ in pairs)
-    for new, old, mask in pairs:
+
+    def train():
+        model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
+        model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=1024, finetune_vision_layers=vision)
+        assert any(key.startswith("vision_tower") for key, _ in tree_flatten(model.trainable_parameters())) is vision
+        trainer = mlx_trainer.MLXGRPOTrainer(model, processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
+            output_dir=str(tmp_path / "out"), max_steps=2, per_device_train_batch_size=2, num_generations=2, num_iterations=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
+            max_seq_length=1024, logging_steps=1, loss_type="dapo", beta=0.0, compile=False, shuffle_dataset=False), reward_funcs=lambda completion_ids, **_: [float(len(c)) for c in completion_ids])  # noqa: E501
+        trainer.train()
+        return trainer
+    assert _kept_old_logps_match_scored(monkeypatch, train) == [True, True, False, False]
+    # The scored run's first pass: its own forward's log-probs.
+    assert len(pairs) == 8 and all(old is not None for _, old, _ in pairs)
+    for new, old, mask in pairs[:2]:
         assert mx.array_equal(mx.where(mask > 0, new, 0), mx.where(mask > 0, old, 0)).item()
 
 
@@ -2154,15 +2217,22 @@ def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch, rec
         types.SimpleNamespace(token_ids=[100 + row % 7] * (2 + row % 5), finish_reason="stop") for row in range(len(requests))])
     rng = random.Random(0)
     data = [{"prompt": [{"role": "user", "content": " ".join(rng.choice(("apples", "orchard", "market")) for _ in range(3)) + f" Describe the picture in one sentence. Then say {i}."}], "image": PIL.Image.new("RGB", (224, 224), (rng.randint(0, 255), rng.randint(0, 255), 128))} for i in range(2)]  # noqa: E501
-    model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
-    trainer = mlx_trainer.MLXGRPOTrainer(FastMLXModel.get_peft_model(model, r=8, lora_alpha=8, lora_dropout=0, max_seq_length=1024), processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
-        output_dir=str(tmp_path / "out"), max_steps=1, per_device_train_batch_size=4, gradient_accumulation_steps=2, num_generations=4, num_iterations=2, max_completion_length=8, max_seq_length=1024, loss_type="dapo",  # noqa: E501
-        beta=0.0, logging_steps=1, seed=3, compile=True, gradient_checkpointing=False, epsilon=1e-7, epsilon_high=1e-7, prefix_grouper=refused),  # noqa: E501
-        reward_funcs=lambda completion_ids, **_: [float(len(c) + sum(c) % 7) for c in completion_ids])
-    assert trainer.train()["compile_scope"] == "full_step"
+    trainers = []
+
+    def train():
+        model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
+        trainers.append(mlx_trainer.MLXGRPOTrainer(FastMLXModel.get_peft_model(model, r=8, lora_alpha=8, lora_dropout=0, max_seq_length=1024), processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
+            output_dir=str(tmp_path / "out"), max_steps=2, per_device_train_batch_size=4, gradient_accumulation_steps=2, num_generations=4, num_iterations=2, max_completion_length=8, max_seq_length=1024, loss_type="dapo",  # noqa: E501
+            beta=0.0, logging_steps=1, seed=3, compile=True, gradient_checkpointing=False, epsilon=1e-7, epsilon_high=1e-7, prefix_grouper=refused),  # noqa: E501
+            reward_funcs=lambda completion_ids, **_: [float(len(c) + sum(c) % 7) for c in completion_ids]))
+        assert trainers[-1].train()["compile_scope"] == "full_step"
+        return trainers[-1]
+    # Two runs scored alike already differ by ~1e-6 here, compiled.
+    assert _kept_old_logps_match_scored(monkeypatch, train, rtol=1e-4, atol=1e-6) == [True, True, False, False]
     # A refused model keeps compiled vision steps under prefix_grouper.
     assert any("prefix_grouper is off, since model_type" in str(w.message) for w in recwarn) == refused
-    assert [entry["clip_ratio/region_mean"] for entry in trainer.state.log_history if "clip_ratio/region_mean" in entry] == [0.0]
+    # The first pass of the run whose old log-probs a compiled forward scored.
+    assert [entry["clip_ratio/region_mean"] for entry in trainers[0].state.log_history if "clip_ratio/region_mean" in entry][0] == 0.0  # noqa: E501
 
 
 @metal_only
@@ -2206,8 +2276,8 @@ def test_compiled_grpo_scorer_falls_back_to_eager_when_compile_fails(monkeypatch
 
 
 @metal_only
-@pytest.mark.parametrize("beta,lora", [(0.0, True), (0.04, True), (0.04, False)])  # full fine-tune: arrays swap
-def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lora):
+@pytest.mark.parametrize("beta,lora,score_old", [(0.0, True, False), (0.04, True, False), (0.04, True, True), (0.04, False, False)])  # full fine-tune: arrays swap  # noqa: E501
+def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lora, score_old):
     import shutil, types, numpy as np, PIL.Image, mlx_vlm.utils, mlx_vlm.models.qwen2_5_vl as qwen2_5_vl
     from huggingface_hub import snapshot_download
     from unsloth_zoo.mlx import generate as generate_module, grpo, trainer as mlx_trainer
@@ -2242,9 +2312,10 @@ def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lor
             output_dir=str(tmp_path / str(compiled)), max_steps=2 + (beta > 0), per_device_train_batch_size=2, num_generations=2, steps_per_generation=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
             max_seq_length=256, logging_steps=1, loss_type="grpo", beta=beta, num_iterations=1 + (beta > 0), max_grad_norm=1.0, compile=compiled, shuffle_dataset=False), reward_funcs=lambda prompts, completion_ids, **_: [float(len(c)) * (str(p).count("picture 1") + str(p).count("picture 3")) for p, c in zip(prompts, completion_ids)])  # noqa: E501
         return trainer, trainer.train()
+    monkeypatch.setenv("UNSLOTH_GRPO_SCORE_OLD_LOGPS", str(int(score_old)))
     (eager, _), (compiled, result) = train(False), train(True)
-    # With a KL term, step 3 scores generation 2's reference against a policy two updates on.
-    assert len(gaps) == (8 if beta else 0) and max(gaps, default=0) <= 1e-5
+    # With a KL term, step 3 scores generation 2's reference two updates on; old log-probs are scored only when asked.
+    assert len(gaps) == ((8 if score_old else 4) if beta else 0) and max(gaps, default=0) <= 1e-5
     assert result["compile_enabled"] and result["compile_scope"] == "full_step" and compiled._compile_shape_guard_report.action in ("exact", "bucket")  # noqa: E501
     eager_generations = [entry["frac_generations_eager"] for entry in compiled.state.log_history if "frac_generations_eager" in entry]  # noqa: E501
     # One generation trains eagerly and one compiled; a KL term keeps zero-advantage rows, so every generation compiles.

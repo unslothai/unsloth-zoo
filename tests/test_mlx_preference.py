@@ -3651,8 +3651,9 @@ def _dense_scorer(model, batch, supervised, indices=None, *, logit_sums, hidden=
     return flat.reshape(supervised.shape), None
 
 
-def _grpo_window(monkeypatch, objective, rewards, *, iterations=1, compact=False, sizes=(4, 17, 30, 43), **plan):
-    """One generation's micro-step batches, the summed loss, gradient in the logit scale and stats of some, and the plan."""
+def _grpo_window(monkeypatch, objective, rewards, *, iterations=1, compact=False, sizes=(4, 17, 30, 43), keep=False, **plan):  # noqa: E501
+    """One generation's micro-step batches, the summed loss, gradient in the logit scale and stats of some, and the plan;
+    keep hands each run micro-step's log-probs back as the trainer does."""
     import numpy as np
     import mlx.core as mx
     from unsloth_zoo.mlx import generate as generate_module
@@ -3664,7 +3665,11 @@ def _grpo_window(monkeypatch, objective, rewards, *, iterations=1, compact=False
     plan.configure_cce_compaction(compact)
     _dense_scorer.calls = []
     plan.bind(model, [lambda completion_ids, **_: rewards[:len(completion_ids)]], reference_policy=reference, scorer=_dense_scorer, trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
-    batches, loss_fn = [plan[index] for index in range(plan._repeats)], make_grpo_loss_fn(objective, scorer=_dense_scorer)
+    batches, loss_fn = [], make_grpo_loss_fn(objective, scorer=_dense_scorer)
+    for index in range(plan._repeats):
+        batches.append(plan[index])
+        if keep and plan.skipped_stats(index) is None:
+            plan.keep_old_logps(index, make_grpo_loss_fn(objective, scorer=_dense_scorer, report_logps=True)(model, *batches[-1])[2][1])  # noqa: E501
 
     def score(chosen):
         window = lambda scale: setattr(model, "scale", scale) or sum(loss_fn(model, *batch)[0] for batch in chosen)  # noqa: E731
@@ -3718,6 +3723,83 @@ def test_grpo_skips_only_micro_steps_without_gradient(monkeypatch, loss_type, it
         assert np.array_equal(plan.skipped_stats(start + 1), rescore([skipping[start + 1]])[2]) and np.abs(got[1]) > 0
     options = [grpo_layout_options(GRPOObjective(name, beta), distributed=name == "dr_grpo")["skip_zero_advantage"] for name, beta in (("grpo", 0.0), ("bnpo", 0.0), ("dapo", 0.04), ("grpo", 0.04), ("dapo", 0.0), ("dr_grpo", 0.0))]  # noqa: E501
     assert options == [True, False, False, False, True, False]
+
+
+def test_grpo_first_passes_leave_old_log_probs_unknown_until_kept(monkeypatch):
+    from unsloth_zoo.mlx.grpo import GRPOObjective
+    objective = GRPOObjective("dapo", 0.0, max_completion_length=60)
+    batches, _, plan = _grpo_window(monkeypatch, objective, [0.0, 1.0, 3.0, 1.0], grad_accum=1, first_pass_old_logps=True)
+    assert plan.needs_step_logps is False and [batch[5][1].item() for batch in batches] == [False, True]
+    with pytest.raises(RuntimeError, match="were not kept"):
+        _grpo_window(monkeypatch, objective, [0.0, 1.0, 3.0, 1.0], iterations=2, first_pass_old_logps=True)
+    with pytest.raises(RuntimeError, match="not the current one"):
+        plan.keep_old_logps(2, batches[0][5][0])
+
+
+def test_grpo_skipped_first_pass_micro_steps_keep_their_zero_old_log_probs(monkeypatch):
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOObjective
+    run = lambda kept: _grpo_window(monkeypatch, GRPOObjective("dapo", 0.0, max_completion_length=60), [1.0, 1.0, 0.01, 3.0], iterations=2, group_by_length=True, skip_zero_advantage=True, first_pass_old_logps=kept, keep=kept)  # noqa: E501, E731
+    (kept, _, plan), (scored, _, _) = run(True), run(False)
+    assert plan.needs_step_logps and [index for index in range(4) if plan.skipped_stats(index) is not None] == [1, 3]
+    assert [batch[5][1].item() for batch in kept] == [False, True, True, True]
+    assert all(np.allclose(np.array(got[5][0]), np.array(want[5]), rtol=1e-6, atol=0) for got, want in zip(kept[2:], scored[2:]))  # noqa: E501
+    assert not np.array(kept[3][5][0]).any()
+
+
+@pytest.mark.parametrize("spg,iterations,accum", [(4, 2, 6), (3, 2, 4), (2, 2, 2), (4, 3, 2), (2, 1, 3), (2, 4, 12)])
+def test_grpo_first_pass_micro_steps_precede_every_update_the_trainer_applies(spg, iterations, accum):
+    # Updates as the trainer applies them: a full window, an epoch's or the run's last micro-step, resumed after any.
+    # Two slots precede an update when (3, 2, 4) opens a generation mid-window or (4, 2, 6) resumes before a flush.
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan
+    plan = create_grpo_batch_plan([{"prompt": "a" * 5}] * 6, DecodingTokenizer(), num_generations=2, batch_size=2, steps_per_generation=spg, num_iterations=iterations, grad_accum=accum, sampling=GRPOSampling(max_tokens=8), max_seq_length=64, shuffle=False, num_epochs=5, first_pass_old_logps=True)  # noqa: E501
+    epoch, total = plan.cycle_length, len(plan)
+
+    def updates(origin):  # the trainer's: a window fills, an epoch ends, or the run does
+        done, filled = [], 0
+        for step in range(origin, total):
+            filled += 1
+            if filled == accum or (step + 1) % epoch == 0 or step + 1 == total:
+                done.append(step)
+                filled = 0
+        return done
+
+    def slots_before_an_update(origin):
+        plan.start_at(origin)
+        after = updates(origin)
+        starts = sorted({plan._generation_start(step) for step in range(origin, total - spg + 1)})
+        return [min(spg, next(u for u in after if u >= start) - start + 1) for start in starts]
+
+    counts = [count for origin in [0] + [u + 1 for u in updates(0)[:-1]] for count in slots_before_an_update(origin)]
+    assert min(spg, plan._first_pass_slots) == min(counts) > 0
+
+
+def test_grpo_old_log_probs_not_yet_known_are_the_steps_own():
+    import math
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx.grpo import GRPOObjective, completion_logps, make_grpo_loss_fn
+
+    class Model:
+        scale = 1.0
+
+        def __call__(self, ids):
+            ids = ids.astype(mx.float32) * self.scale
+            return mx.stack([ids * 0.1, -ids * 0.3, ids * 0], axis=-1)
+
+    objective, model, unknown = GRPOObjective("dapo", beta=0.0, temperature=0.7), Model(), mx.full((2, 3), float("nan"))
+    loss_fn, reporting = make_grpo_loss_fn(objective), make_grpo_loss_fn(objective, report_logps=True)
+    batch = (mx.array([[1, 2, 0, 1], [2, 1, 1, 0]]), mx.array([[1, 4], [1, 3]]), mx.array([2.0, 5.0]), mx.array([1.0, -1.0]), mx.array([1, 1]))  # noqa: E501
+
+    def run(*old):
+        loss = lambda scale: setattr(model, "scale", scale) or loss_fn(model, *batch, *old)[0]  # noqa: E731
+        return loss(mx.array(1.3)).item(), mx.grad(loss)(mx.array(1.3)).item()
+
+    on_policy = run()
+    assert on_policy[1] != 0 and run((unknown, mx.array(False))) == on_policy
+    assert math.isnan(run((unknown, mx.array(True)))[0])  # a scored NaN surfaces
+    stats, logps = reporting(model, *batch)[2]
+    assert np.array_equal(stats, loss_fn(model, *batch)[2]) and np.allclose(logps, completion_logps(model, batch[0], 0.7), atol=1e-6)  # noqa: E501
 
 
 def test_grpo_scalerl_weights_follow_unsloth_cuda(monkeypatch):

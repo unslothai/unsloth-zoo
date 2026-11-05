@@ -335,6 +335,8 @@ def grpo_terms(objective, new, advantages, mask, *, old=None, ref=None):
     keep = mask > 0
     zero = mx.array(0.0, mx.float32)
     new = mx.where(keep, new, zero)
+    if isinstance(old, tuple):  # old log-probs not yet known are the step's own: no update separates them
+        old = mx.where(old[1], old[0], mx.stop_gradient(new))
     old = None if old is None else mx.where(keep, old, zero)
     ref = None if ref is None else mx.where(keep, ref, zero)
     advantages = advantages[:, None]
@@ -402,8 +404,8 @@ def grpo_metric_values(summed):
     return values
 
 
-def make_grpo_loss_fn(objective, *, scorer=None):
-    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps, cce_indices, sample weights, shared prompt ids); kept zeroes rows TRL masks as truncated."""
+def make_grpo_loss_fn(objective, *, scorer=None, report_logps=False):
+    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps or (them, whether they are known), ref_logps, cce_indices, sample weights, shared prompt ids); kept zeroes rows TRL masks as truncated; report_logps pairs the stats with the per-token log-probs."""
     logps = grpo_logps(objective.temperature, scorer)
 
     def loss_fn(
@@ -414,7 +416,8 @@ def make_grpo_loss_fn(objective, *, scorer=None):
         mask = _response_mask(_preference_ids(batch)[:, 1:], lengths) * kept[:, None].astype(mx.float32)
         per_token, kl, coef_1 = grpo_terms(objective, new, advantages, mask, old=old, ref=ref)
         loss = _reduce(objective, per_token, mask, normalizers, weights)
-        return loss, mx.array(1, dtype=mx.int32), grpo_stats(objective, kl, coef_1, advantages, mask)
+        stats = grpo_stats(objective, kl, coef_1, advantages, mask)
+        return loss, mx.array(1, dtype=mx.int32), (stats, mx.stop_gradient(new)) if report_logps else stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
     loss_fn._unsloth_preference_metrics = GRPO_LOSS_METRICS
@@ -427,11 +430,11 @@ def make_grpo_loss_fn(objective, *, scorer=None):
     return loss_fn
 
 
-def make_grpo_cce_loss_fn(model, objective):
+def make_grpo_cce_loss_fn(model, objective, *, report_logps=False):
     """The GRPO loss scored through runtime CCE when the head allows it."""
     return make_grpo_loss_fn(objective, scorer=_make_preference_cce_scorer(
         model, temperature=objective.temperature,
-    ))
+    ), report_logps=report_logps)
 
 
 
@@ -784,8 +787,10 @@ class GRPOBatchPlan:
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
         processor=None, model_config=None, vision=False, group_by_length=False, layout_block=1,
         skip_zero_advantage=False, sample_weighting=None, media_signatures=None, prefix_grouping=False,
+        first_pass_slots=0,
     ):
         self._dataset = dataset
+        self._first_pass_slots = first_pass_slots
         self._media_signatures = media_signatures
         self._tokenizer = tokenizer
         self._processor = processor
@@ -1032,12 +1037,34 @@ class GRPOBatchPlan:
                 return None
         return self._inputs(batch[::size, :shared], np.full((groups, 2), shared, dtype=np.int32), media)
 
-    def _score(self, scorer, visit, sequences, prompt_lengths, media, skipped=()):
+    @property
+    def needs_step_logps(self):
+        """Whether the trainer must hand each step's log-probs to keep_old_logps: a later iteration reads them."""
+        return self._first_pass_slots > 0 and self._repeats > self.steps_per_generation
+
+    def keep_old_logps(self, index, logps):
+        """Keep a micro-step's own log-probs as its slot's old ones if the plan left them unscored."""
+        generation = self._current
+        if generation is None or generation.old is None or generation.visit != self._generation_start(index):
+            raise RuntimeError(f"Unsloth MLX GRPO: micro-step {index}'s generation is not the current one.")
+        position = ((index - generation.visit) % self.steps_per_generation) * self.batch_size
+        rows = range(position, min(position + self.batch_size, len(generation.sequences)))
+        # Deferral and keeping are per slot, so a slot's rows are all known or all not.
+        if generation.old[position] is not None:
+            return
+        logps = np.array(logps, dtype=np.float32)
+        for offset, row in enumerate(rows):
+            generation.old[row] = logps[offset, :len(generation.sequences[row]) - 1]
+
+    def _score(self, scorer, visit, sequences, prompt_lengths, media, skipped=(), deferred=0):
         values = []
         for start in range(0, len(sequences), self.batch_size):
             chunk = sequences[start:start + self.batch_size]
             if start // self.batch_size in skipped:
                 values.extend(np.zeros(len(sequence) - 1, dtype=np.float32) for sequence in chunk)
+                continue
+            if start // self.batch_size < deferred:
+                values.extend([None] * len(chunk))
                 continue
             inputs, lengths, width, prefix = self._slot_inputs(visit, start, chunk, prompt_lengths, media)
             logps = np.array(
@@ -1199,7 +1226,7 @@ class GRPOBatchPlan:
                     lambda batch, lengths, indices, prefix: mx.stop_gradient(
                         self._logps(self._model, batch, lengths, indices, prefix)
                     ),
-                    visit, sequences, prompt_lengths, media, skipped,
+                    visit, sequences, prompt_lengths, media, skipped, self._first_pass_slots,
                 )
             if self.with_reference:
                 ref = self._score(
@@ -1250,7 +1277,8 @@ class GRPOBatchPlan:
         family = (
             "grpo_tuple", ((rows, "sequence"), "int32"), ((rows, 2), "int32"),
             ((2,), "float32"), ((rows,), "float32"), ((rows,), "int32"),
-            held if self.with_old_logps else None, held if self.with_reference else None,
+            ((held, ((), "bool")) if self._first_pass_slots else held) if self.with_old_logps else None,
+            held if self.with_reference else None,
         )
         if self.sample_weighting is not None:
             family = (*family, ((rows,), "float32"))
@@ -1287,8 +1315,15 @@ class GRPOBatchPlan:
                 return None
             table = np.zeros((len(sequences), width - 1), dtype=np.float32)
             for offset, row in enumerate(rows):
-                table[offset, :len(values[row])] = values[row]
+                if values[row] is not None:
+                    table[offset, :len(values[row])] = values[row]
+                elif index - start >= self.steps_per_generation:
+                    raise RuntimeError("Unsloth MLX GRPO: a first pass's log-probs were not kept as the old ones.")
             return mx.array(table)
+
+        old = held(generation.old)
+        if old is not None and self._first_pass_slots:
+            old = (old, mx.array(generation.old[position] is not None))
 
         media = None if generation.media is None else generation.media[position:position + self.batch_size]
         # The shared prompt carries each group's images, so the rows' own batch skips the processor.
@@ -1298,7 +1333,7 @@ class GRPOBatchPlan:
             mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),
-            held(generation.old), held(generation.ref),
+            old, held(generation.ref),
         )
         if self._families is not None and phase is not None and self._family_drift is None and not generation.eager:
             divergence = _vlm_family_divergence(self._families[index], self._vision_family(materialized[0])[0])
@@ -1400,12 +1435,15 @@ def create_grpo_batch_plan(
     mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
     shuffle=True, seed=None, num_batches=None, num_epochs=None, processor=None, model_config=None,
     group_by_length=False, skip_zero_advantage=False, sample_weighting=None, prefix_grouping=False,
+    first_pass_old_logps=False,
 ):
     """Encode prompts once and lay out TRL's RepeatSampler schedule; batch_size counts completions, a generation samples
     batch_size * steps_per_generation of them, num_generations per prompt; score_temperature defaults to the sampling
     temperature; a VLM processor replaces tokenizer; within each optimizer step group_by_length sorts rows by length and
     skip_zero_advantage puts zero-advantage rows last; sample_weighting is grpo_sample_weighting's; prefix_grouping
-    (grpo_prefix_grouping's) lays out whole groups per micro-batch and runs each shared prompt once."""
+    (grpo_prefix_grouping's) lays out whole groups per micro-batch and runs each shared prompt once;
+    first_pass_old_logps leaves micro-steps that train before their generation's first update unscored, for a caller
+    that hands their own log-probs back (keep_old_logps)."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
     prompt_ids, max_tokens, vision, signatures = _encode_grpo_prompts(
@@ -1418,6 +1456,10 @@ def create_grpo_batch_plan(
         )
     chunk = batch_size * steps_per_generation // num_generations
     repeats = steps_per_generation * num_iterations
+    with_old_logps = grad_accum % repeats != 0
+    # Accumulation windows restart with generations (at the start, a resume, each epoch), so a generation opens a
+    # multiple of gcd(repeats, grad_accum) micro-steps into its window, and that many of its micro-steps precede an update.
+    first_pass = math.gcd(repeats, grad_accum) if first_pass_old_logps and with_old_logps else 0
     order = _RepeatSamplerOrder(len(prompt_ids), _normalize_seed(seed), shuffle)
 
     def batches_for_epoch(epoch):
@@ -1445,12 +1487,12 @@ def create_grpo_batch_plan(
         score_temperature=sampling.temperature if score_temperature is None else score_temperature,
         scale_rewards=scale_rewards,
         mask_truncated_completions=mask_truncated_completions,
-        with_old_logps=grad_accum % repeats != 0, with_reference=with_reference,
+        with_old_logps=with_old_logps, with_reference=with_reference,
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
         processor=processor, model_config=model_config, vision=vision,
         group_by_length=group_by_length, layout_block=math.gcd(steps_per_generation, grad_accum),
         skip_zero_advantage=skip_zero_advantage, sample_weighting=sample_weighting, media_signatures=signatures,
-        prefix_grouping=prefix_grouping,
+        prefix_grouping=prefix_grouping, first_pass_slots=first_pass,
     )
 
 

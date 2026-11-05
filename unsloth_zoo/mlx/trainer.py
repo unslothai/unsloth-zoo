@@ -6058,6 +6058,7 @@ class MLXTrainer:
 
         _sampling_reference = None
         preference_eval_fn = None
+        _returns_step_logps = False
         if preference_kind:
             if preference_kind == "orpo":
                 objective = resolve_preference_objective("orpo", beta=args.beta)
@@ -6096,8 +6097,9 @@ class MLXTrainer:
                 reference_policy, provenance = _reference
                 self._preference_reference_provenance = {**provenance, "objective": "grpo"}
                 _sampling_reference = reference_policy
-                loss_fn = (make_grpo_cce_loss_fn(model, objective)
-                           if args.use_cce else make_grpo_loss_fn(objective))
+                _returns_step_logps = batches.needs_step_logps
+                loss_fn = (make_grpo_cce_loss_fn(model, objective, report_logps=_returns_step_logps)
+                           if args.use_cce else make_grpo_loss_fn(objective, report_logps=_returns_step_logps))
                 use_cce = hasattr(loss_fn, "_unsloth_cce_backend")
                 _main_print(
                     f"Unsloth: Using GRPO loss (beta={objective.beta}, "
@@ -8446,6 +8448,10 @@ class MLXTrainer:
                 # Held past the step it guards, it would keep the pre-update state alive through eval and saves.
                 compile_state_before = ()
 
+            _step_logps = None
+            if _returns_step_logps and _grpo_skip is None:  # the step's own log-probs, which a first pass keeps as old
+                stats, _step_logps = stats
+
             # Accumulate into the PENDING window (this accumulation window's
             # micro-batches). Fold into the COMMITTED window only once the
             # optimizer step for the window has been applied (do_update), so a
@@ -8508,6 +8514,8 @@ class MLXTrainer:
                 eval_targets.append(grad_accum_state[1])
             if grad_norm is not None:
                 eval_targets.append(grad_norm)
+            if _step_logps is not None:
+                eval_targets.append(_step_logps)
             if _layer_prefix is not None:
                 _async_eval_by_layer(
                     model.trainable_parameters() if grad_accum_state is None
@@ -8515,6 +8523,8 @@ class MLXTrainer:
                     _layer_prefix,
                 )
             mx.eval(*eval_targets)
+            if _step_logps is not None:
+                batches.keep_old_logps(scheduled_index, _step_logps)
             global_toks = self._distributed_all_sum(supervised_toks, stream=mx.cpu)
             mx.eval(global_toks)
             if int(global_toks.item()) == 0:
@@ -9861,6 +9871,8 @@ class MLXGRPOTrainer(MLXTrainer):
                 announced=vars(self).setdefault("_grpo_prefix_announced", set()),
                 hint=self.is_main_process,
             ),
+            # =1 scores every old log-prob in a forward of its own, whose dropout or NEFTune noise moves a first ratio off 1.
+            first_pass_old_logps=os.environ.get("UNSLOTH_GRPO_SCORE_OLD_LOGPS", "0") != "1",
         )
         # A resumed run generates at once, so its widths are planned from there.
         resume = getattr(self, "_resume_from_checkpoint", None)
