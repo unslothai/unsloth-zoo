@@ -245,7 +245,7 @@ def test_batched_draws_keep_each_row_on_its_own_seeded_stream_as_rows_join_and_l
 def test_batched_draws_and_logits_warp_sample_the_tokens_per_row_samplers_do(warps):
     from mlx_lm import load
     from unsloth_zoo.mlx.generate import GenerationDefaults, GenerationRequest, SamplingParams, generate_batch
-    from unsloth_zoo.mlx.grpo import GRPOSampling, _rollout_sampling
+    from unsloth_zoo.mlx.grpo import GRPOSampling, _rollout_sampling, hf_logits_warper
 
     model, tokenizer = load(MODEL)
     sampling = GRPOSampling(temperature=0.8, top_p=0.9, min_p=0.05) if warps else GRPOSampling()
@@ -253,9 +253,9 @@ def test_batched_draws_and_logits_warp_sample_the_tokens_per_row_samplers_do(war
 
     def tokens(batched):
         requests = [GenerationRequest(prompt_token_ids=ids, max_tokens=16, sampling=SamplingParams(temperature=1.0, seed=seed),
-                                      logits_processors=_rollout_sampling(sampling, ids, batched)[0])
+                                      logits_processors=None if batched else (hf_logits_warper(sampling, ids),) if sampling.warps else None)
                     for seed, ids in enumerate(prompts * 2)]
-        defaults = GenerationDefaults(max_tokens=16, logits_warp=_rollout_sampling(sampling, (), batched)[1], batched_draws=batched)
+        defaults = GenerationDefaults(max_tokens=16, logits_warp=_rollout_sampling(sampling, ())[1] if batched else None, batched_draws=batched)
         return [result.token_ids for result in generate_batch(model, tokenizer, requests, defaults=defaults)]
 
     assert tokens(True) == tokens(False)

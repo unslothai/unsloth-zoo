@@ -662,6 +662,36 @@ def test_vlm_adapter_isolates_detokenizers_and_reads_scalar_logprobs():
     assert [(r.token_ids, r.text) for r in results] == [
         ([1], "hello "), ([4], "tailSTOPsuffix")] and results[0].logprobs == [-0.5]
     assert [r.prompt_token_count for r in results] == [37, 37]
+    adapter.defaults = GenerationDefaults(token_ids_only=True)
+    stub = _vlm_stub(True, events=[[(0, 1, None)], [(0, 3, "stop")]])(object(), object())
+    assert [(r.token_ids, r.text, r.logprobs) for r in _results(adapter._drive(stub, [0], [0], {}))] == [([1], "", [])]
+
+
+def test_vlm_rows_given_one_prompt_embed_it_once_and_fan_it_out(monkeypatch):
+    import numpy as np
+    from unsloth_zoo.mlx import generate as engine
+    seen, warp = {}, lambda logprobs: logprobs + 1
+    monkeypatch.setattr(engine, "_batched_draws_match", lambda: True)
+    adapter = engine._VLMBatchAdapter.__new__(engine._VLMBatchAdapter)
+    adapter.defaults = GenerationDefaults(token_ids_only=True, batched_draws=True, share_prompt_prefill=True, logits_warp=warp)
+    adapter.per_row_prompt_kwargs, adapter.constructor_params = True, {"sampler", "compute_logprobs"}
+    adapter.processor, adapter.sample_utils, adapter.make_sampler = types.SimpleNamespace(tokenizer=_CriteriaTokenizer()), None, lambda **k: None
+    adapter._wired_limit, adapter._chunked_prefill_kwargs = contextlib.nullcontext, lambda **kw: {}
+    adapter._split_prompt_kwargs = lambda kw, n: [{"row": row} for row in range(n)]
+    adapter._drive = lambda generator, uids, indices, kw, sampler, **k: seen.update(sampler=sampler, counts=k) or iter(())
+    adapter.model = types.SimpleNamespace(config=None, language_model=None, get_input_embeddings=lambda ids, pixels, **k: (
+        seen.update(embed=(ids.tolist(), pixels.tolist())), types.SimpleNamespace(to_dict=dict))[1])
+    adapter.generator_type = lambda *a, **k: types.SimpleNamespace(insert=lambda ids, max_tokens, prompt_kwargs: (
+        seen.update(ctor=k, insert=(ids, prompt_kwargs)), list(range(len(ids))))[1])
+    shared, other = {"pixel_values": np.full((1, 2), 7)}, {"pixel_values": np.full((1, 2), 8)}
+    list(adapter._run_chunk([GenerationRequest(prompt_token_ids=(1, 2), vision_inputs=inputs, sampling=SamplingParams(
+        temperature=1.0, seed=seed)) for seed, inputs in enumerate((shared, other, shared))], [0, 1, 2]))
+    assert seen["embed"] == ([[1, 2], [1, 2]], [[7, 7], [8, 8]]) and seen["insert"][0] == [[1, 2]] * 3
+    assert seen["insert"][1] == [{"row": 0}, {"row": 1}, {"row": 0}] and seen["insert"][1][0] is not seen["insert"][1][2]
+    assert seen["ctor"]["compute_logprobs"] is False and seen["sampler"]._warp is warp and seen["sampler"]._keys is not None
+    seen["sampler"]._keys.draw = lambda uids, logprobs: (uids, logprobs)  # the keyed draw itself is covered on Metal
+    uids, drawn = seen["sampler"](np.zeros((3, 4)))
+    assert uids == [0, 1, 2] and (drawn == 1).all()
 
 
 def test_vlm_chunking_respects_release_capabilities():

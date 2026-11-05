@@ -575,14 +575,14 @@ def hf_logits_filter(sampling, logits):
     return logits
 
 
-def _rollout_sampling(sampling, prompt_ids, batched, always_float32=False):
+def _rollout_sampling(sampling, prompt_ids, always_float32=False):
     """``(logits processors, logits warp)``: a repetition penalty reads each row's own history, so only a batch
     without one warps every row at once; always_float32 casts unwarped logits to float32 too."""
-    if batched and sampling.repetition_penalty == 1.0:
+    if sampling.repetition_penalty == 1.0:
         if sampling.warps:
             return None, lambda logits: hf_logits_filter(sampling, logits.astype(mx.float32))
         return None, (lambda logits: logits.astype(mx.float32)) if always_float32 else None
-    return ((hf_logits_warper(sampling, prompt_ids),) if sampling.warps else None), None
+    return (hf_logits_warper(sampling, prompt_ids),), None
 
 
 def _kv_bytes_per_token(model):
@@ -835,7 +835,7 @@ class GRPOBatchPlan:
                 vision_inputs=encoded[prompt][3] if encoded else None,
                 max_tokens=self._max_tokens[prompt],
                 sampling=SamplingParams(temperature=1.0, seed=_derived_seed(self.seed, visit, 0, row)),
-                logits_processors=_rollout_sampling(self.sampling, self._prompt_ids[prompt], text)[0],
+                logits_processors=_rollout_sampling(self.sampling, self._prompt_ids[prompt])[0],
             )
             for row, prompt in enumerate(prompts)
         ]
@@ -843,10 +843,10 @@ class GRPOBatchPlan:
             len(request.prompt_token_ids) + request.max_tokens for request in requests))
         defaults = GenerationDefaults(
             max_tokens=self.sampling.max_tokens, stop_token_ids=(self.eos_id,),
-            logits_warp=_rollout_sampling(self.sampling, (), text, self.rollout_old)[1], batched_draws=text,
+            logits_warp=_rollout_sampling(self.sampling, (), self.rollout_old)[1], batched_draws=True,
             logprob_arrays=self.rollout_old,
-            token_ids_only=text,  # completions are decoded once, after the cut
-            completion_batch_size=rows, share_prompt_prefill=text,
+            token_ids_only=True,  # completions are decoded once, after the cut
+            completion_batch_size=rows, share_prompt_prefill=True,
             # Rows of a shared prompt start decoding at once, prefilled already.
             prefill_batch_size=rows if text else GenerationDefaults.prefill_batch_size,
         )

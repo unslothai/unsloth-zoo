@@ -3765,7 +3765,7 @@ def test_grpo_rollout_warper_matches_hf_sampling_processors(settings):
     tied =hf_logits_warper(GRPOSampling(top_p=0.5), [1])(torch.tensor([1]), torch.tensor([[0.0, 1.0, 1.0, 1.0]]))
     assert torch.isfinite(tied).sum() == 2  # HF keeps two of the three tied logits
     plain, rows = GRPOSampling(**{**settings, "repetition_penalty": 1.0}), torch.randn(3, 12) * 3
-    batched = _rollout_sampling(plain, (), True)[1](rows[:, None])[:, 0]  # every row at once, shaped as decode logits
+    batched = _rollout_sampling(plain, ())[1](rows[:, None])[:, 0]  # every row at once, shaped as decode logits
     assert torch.allclose(batched, torch.cat([hf_logits_warper(plain, [1])(torch.tensor([1]), row[None]) for row in rows]))
 
 
@@ -3999,6 +3999,7 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
     reads.clear()
     micros = [plan.materialize(index) for index in range(3)]
     assert reads == [0, 1, 2] and calls[0][0] is processor  # one read per prompt, none retained
+    assert calls[0][3].token_ids_only and calls[0][3].batched_draws and calls[0][3].share_prompt_prefill
     assert [None if r.vision_inputs is None else r.vision_inputs["pixel_values"].tolist() for r in calls[0][1][::2]] == [[[4.0]], None, [[6.0], [8.0]]]
     parts = lambda count, text: [{"role": "user", "content": [{"type": "image"}] * count + [{"type": "text", "text": text}]}]
     assert seen["prompts"][::2] == [parts(1, "hi"), parts(0, "yo"), parts(2, "ok")]  # TRL's placeholders reach rewards
