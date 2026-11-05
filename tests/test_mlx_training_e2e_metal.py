@@ -2212,12 +2212,15 @@ def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lor
         model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=256) if lora else model
         trainer = mlx_trainer.MLXGRPOTrainer(model, processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
             output_dir=str(tmp_path / str(compiled)), max_steps=2 + (beta > 0), per_device_train_batch_size=2, num_generations=2, steps_per_generation=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
-            max_seq_length=256, logging_steps=1, loss_type="grpo", beta=beta, num_iterations=1 + (beta > 0), max_grad_norm=1.0, compile=compiled, shuffle_dataset=False), reward_funcs=lambda completion_ids, **_: [float(len(c)) for c in completion_ids])  # noqa: E501
+            max_seq_length=256, logging_steps=1, loss_type="grpo", beta=beta, num_iterations=1 + (beta > 0), max_grad_norm=1.0, compile=compiled, shuffle_dataset=False), reward_funcs=lambda prompts, completion_ids, **_: [float(len(c)) * (str(p).count("picture 1") + str(p).count("picture 3")) for p, c in zip(prompts, completion_ids)])  # noqa: E501
         return trainer, trainer.train()
     (eager, _), (compiled, result) = train(False), train(True)
     # With a KL term, step 3 scores generation 2's reference against a policy two updates on.
     assert len(gaps) == (8 if beta else 0) and max(gaps, default=0) <= 1e-5
     assert result["compile_enabled"] and result["compile_scope"] == "full_step" and compiled._compile_shape_guard_report.action in ("exact", "bucket")  # noqa: E501
+    eager_generations = [entry["frac_generations_eager"] for entry in compiled.state.log_history if "frac_generations_eager" in entry]  # noqa: E501
+    # One generation trains eagerly and one compiled; a KL term keeps zero-advantage rows, so every generation compiles.
+    assert {0.0, 1.0} <= set(eager_generations) if not beta else set(eager_generations) == {0.0}
     assert eager._compile_shape_guard_report.reason == "grpo_vision_eager" and min(eager._grad_norm_history) > 0
     assert np.allclose(eager._train_loss_history, compiled._train_loss_history, atol=1e-5) and np.allclose(eager._grad_norm_history, compiled._grad_norm_history, rtol=1e-3)  # noqa: E501
 

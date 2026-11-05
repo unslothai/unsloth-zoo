@@ -8210,6 +8210,7 @@ class MLXTrainer:
                         )
                     elif isinstance(batches, GRPOBatchPlan):
                         _grpo_skip = batches.skipped_stats(scheduled_index)
+                        _stream_eager_batch = _use_compile and batches.runs_eager(scheduled_index)
                     batch_idx += 1
             except BaseException as e:
                 batch_error = e

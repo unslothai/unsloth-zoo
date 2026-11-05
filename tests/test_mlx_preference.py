@@ -4231,6 +4231,8 @@ def test_grpo_vision_family_drift_scores_a_generation_as_it_trains(monkeypatch, 
     assert scored
     # A generation that left its survey trains eagerly, so all its scoring was eager; otherwise all of it compiled.
     assert set(scored) == {not drifted}
+    assert plan.materialize(3, phase="single")
+    assert plan.runs_eager(0) is plan.runs_eager(3) is drifted
     drift = plan.pop_family_drift()
     assert (drift or "").startswith("batch 3: ") is drifted
 
@@ -4250,15 +4252,18 @@ def test_grpo_vision_compile_plans_stable_families_for_verified_arches(monkeypat
     build = lambda rows: grpo.create_grpo_batch_plan(rows, None, num_generations=2, batch_size=2, steps_per_generation=4, num_iterations=1, grad_accum=4, sampling=grpo.GRPOSampling(max_tokens=40),  # noqa: E501, E731
                                                      max_seq_length=128, shuffle=False, num_batches=8, processor=gridded, model_config={}, group_by_length=True, skip_zero_advantage=True)  # noqa: E501
     shapes = lambda plan, arch: trainer._plan_single_process_text_shapes(plan, None, args=args, total_steps=2, is_vlm=True, distributed_world_size=1, compile_policy=policy, vlm_compile_decision=types.SimpleNamespace(enabled=arch in compile_module._VERIFIED_TRAINING_ARCHES))[1]  # noqa: E501, E731
-    reward, state = [lambda prompts, completions, **_: [float(len(c)) * ("q0" not in str(p)) for p, c in zip(prompts, completions)]], types.SimpleNamespace(num_input_tokens_seen=0)  # noqa: E501
+    reward, state = [lambda prompts, completion_ids, **_: [float(len(c)) * ("q0" not in str(p)) for p, c in zip(prompts, completion_ids)]], types.SimpleNamespace(num_input_tokens_seen=0)  # noqa: E501
     for arch, admitted in (("florence2", False), ("qwen2_5_vl", True)):
         plan = build(data)
         assert (shapes(plan, arch).action in ("exact", "bucket")) is admitted is (plan._families is not None)
     assert len(surveys) == 8 and plan.ensure_descriptors() and len(surveys) == 8  # one survey per micro-step, once
     eager, compiled = build(same := [{**row, "image": Image.new("RGB", (4 + i % 2, 4))} for i, row in enumerate(data)]), build(same)
-    for each in (eager, compiled, plan):
+    loose, apart = build(alone := [{**row, "image": Image.new("RGB", (4 + 2 * bool(i), 4))} for i, row in enumerate(data)]), build(alone)
+    for each in (eager, compiled, plan, loose, apart):
         each.bind(_VisionLanguageModel(), reward, trainer_state=state)
-    assert shapes(compiled, "qwen2_5_vl").action in ("exact", "bucket") and eager.materialize(0) and compiled.materialize(0) and eager._current.sequences == compiled._current.sequences and eager._current.skipped.keys() == compiled._current.skipped.keys() != set()  # alike images: eager's layout, dead rows skipped  # noqa: E501
+    assert shapes(apart, "qwen2_5_vl").action in ("exact", "bucket") and loose.materialize(0) and apart.materialize(0, phase="single") and apart.runs_eager(0) and not loose.runs_eager(0)  # noqa: E501
+    assert apart._current.sequences == loose._current.sequences and apart._current.skipped.keys() == loose._current.skipped.keys() != set() and apart.pop_family_drift() is None  # noqa: E501
+    assert shapes(compiled, "qwen2_5_vl").action in ("exact", "bucket") and eager.materialize(0) and compiled.materialize(0) and eager._current.sequences == compiled._current.sequences and eager._current.skipped.keys() == compiled._current.skipped.keys() != set() and not compiled.runs_eager(0)  # alike images: eager's layout, dead rows skipped  # noqa: E501
     alike = compiled._media_class(0, [same[0]["image"]]) == compiled._media_class(1, [same[1]["image"]])
     compiled._media_signatures = None  # outputs unavailable: raw sizes class apart
     assert alike and compiled._media_class(0, [same[0]["image"]]) != compiled._media_class(1, [same[1]["image"]])

@@ -732,6 +732,7 @@ class _Generation:
     media: list | None = None  # (prompt text, images) per row
     skipped: dict | None = None
     weights: np.ndarray | None = None
+    eager: bool = False
 
 
 class GRPOBatchPlan:
@@ -785,6 +786,7 @@ class GRPOBatchPlan:
         self._families = None  # per schedule entry, once a compiled vision run surveys them
         self._forbidden = frozenset()
         self._family_drift = None
+        self._eager_generation = False
         self._metrics = {}
         self.completions = None
 
@@ -825,7 +827,7 @@ class GRPOBatchPlan:
         self._logps = grpo_logps(self.score_temperature, scorer)
         self._step_compiled = step_compiled or (lambda: False)
         if step_compiled is not None:
-            self._logps = _scored_as_step(self._logps, lambda: step_compiled() and self._family_drift is None)
+            self._logps = _scored_as_step(self._logps, lambda: step_compiled() and not self._eager_generation)
 
     def start_at(self, visit):
         """Count generations from ``visit``, the first micro-step a run fetches."""
@@ -1072,14 +1074,19 @@ class GRPOBatchPlan:
         order = self._shuffled(visit, len(prompts))
         # Exactly zero, not TRL's zero std: a rounded group mean leaves a tiny advantage that still has gradient.
         dead = (advantages == 0) & self.skip_zero_advantage
+        eager = False
         if self.group_by_length or self.skip_zero_advantage:
-            # A compiled vision run moves a row only into a position whose row had images alike: its families hold.
-            classes = None if self._families is None else [
-                self._media_class(prompt, encoded[prompt][2] if encoded else ()) for prompt in prompts
-            ]
-            order = grpo_row_layout(order, self._layout_rows, lambda row: (
-                dead[row], prompt_lengths[row] + lengths[row] if self.group_by_length else 0,
-            ), classes)
+            key = lambda row: (dead[row], prompt_lengths[row] + lengths[row] if self.group_by_length else 0)  # noqa: E731
+            free = grpo_row_layout(order, self._layout_rows, key)
+            if self._families is None:
+                order = free
+            else:
+                # Rows move only between alike images, so families hold; a generation that skips less this way trains eagerly.
+                classes = [self._media_class(prompt, encoded[prompt][2] if encoded else ()) for prompt in prompts]
+                by_class = grpo_row_layout(order, self._layout_rows, key, classes)
+                dead_steps = lambda rows: dead[rows].reshape(-1, self.batch_size).all(axis=1).sum()  # noqa: E731
+                eager = bool(dead_steps(free) > dead_steps(by_class))
+                order = free if eager else by_class
         skipped = {}
         if self.skip_zero_advantage:
             # The loss's stats for such rows: no KL, no clipping, and their masked completion lengths.
@@ -1093,30 +1100,37 @@ class GRPOBatchPlan:
         ]
         prompt_lengths = prompt_lengths[order]
         media = [encoded[prompts[row]][1:3] for row in order] if encoded else None
-        if self._families is not None and self._step_compiled() and (self.with_old_logps or self.with_reference):
+        if self._families is not None:
             # A family that left its survey trains eagerly, so its old and reference log-probs are scored eagerly too.
-            self._family_drift = self._family_drift or self._generation_family_drift(
-                visit, sequences, prompt_lengths, media,
-            )
+            if not eager and self._step_compiled() and (self.with_old_logps or self.with_reference):
+                self._family_drift = self._family_drift or self._generation_family_drift(
+                    visit, sequences, prompt_lengths, media,
+                )
+                eager = self._family_drift is not None
+            self._record("frac_generations_eager", eager)
         old = ref = None
-        if self.with_old_logps:
-            old = self._score(
-                lambda batch, lengths, indices: mx.stop_gradient(self._logps(self._model, batch, lengths, indices)),
-                visit, sequences, prompt_lengths, media, skipped,
-            )
-        if self.with_reference:
-            ref = self._score(
-                lambda batch, lengths, indices: self._reference_policy.forward(
-                    self._model, batch, lengths,
-                    response_scorer=lambda model, batch, lengths: self._logps(model, batch, lengths, indices),
-                ),
-                visit, sequences, prompt_lengths, media,
-            )
+        self._eager_generation = eager
+        try:
+            if self.with_old_logps:
+                old = self._score(
+                    lambda batch, lengths, indices: mx.stop_gradient(self._logps(self._model, batch, lengths, indices)),
+                    visit, sequences, prompt_lengths, media, skipped,
+                )
+            if self.with_reference:
+                ref = self._score(
+                    lambda batch, lengths, indices: self._reference_policy.forward(
+                        self._model, batch, lengths,
+                        response_scorer=lambda model, batch, lengths: self._logps(model, batch, lengths, indices),
+                    ),
+                    visit, sequences, prompt_lengths, media,
+                )
+        finally:
+            self._eager_generation = False
         return _Generation(
             visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
             generation_tokens=int(lengths.sum()), media=media, skipped=skipped,
-            weights=None if weights is None else weights[order],
+            weights=None if weights is None else weights[order], eager=eager,
         )
 
     def _reencode(self, prompt, row):
@@ -1199,7 +1213,7 @@ class GRPOBatchPlan:
             mx.array(generation.kept[position:position + self.batch_size]),
             held(generation.old), held(generation.ref),
         )
-        if self._families is not None and phase is not None and self._family_drift is None:
+        if self._families is not None and phase is not None and self._family_drift is None and not generation.eager:
             divergence = _vlm_family_divergence(self._families[index], self._vision_family(materialized[0])[0])
             if divergence is not None:
                 self._family_drift = f"batch {index}: {divergence}"
@@ -1207,6 +1221,11 @@ class GRPOBatchPlan:
         if generation.weights is not None:
             return (*materialized, indices, mx.array(generation.weights[position:position + self.batch_size]))
         return materialized if indices is None else (*materialized, indices)
+
+    def runs_eager(self, index):
+        """Whether a compiled run trains this micro-step eagerly: its generation laid out freely or drifted."""
+        generation = self._current
+        return generation is not None and generation.visit == self._generation_start(index) and generation.eager
 
     def skipped_stats(self, index):
         """Stats of a materialized micro-step whose rows all have advantage exactly 0, which the trainer counts unrun."""
