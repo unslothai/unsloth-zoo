@@ -1936,6 +1936,7 @@ def _install_safe_fused_sdpa_mask_patches():
 
     # why: no @mx.compile — already reached from inside step_fn; nesting
     # mx.compile around **kwargs corrupts VLM gradients.
+    @wraps(original_fast_sdpa)
     def safe_scaled_dot_product_attention(q, k, v, scale=1.0, mask=None, **kwargs):
         row_all_masked = None
         if mask is not None and hasattr(mask, "dtype") and mx.issubdtype(mask.dtype, mx.floating):
@@ -1961,6 +1962,8 @@ def _install_safe_fused_sdpa_mask_patches():
             )
         return out
 
+    # wraps copies the training wrapper's teardown marker, whose release would drop this wrapper.
+    safe_scaled_dot_product_attention.__dict__.pop("_unsloth_original", None)
     fast_ns.scaled_dot_product_attention = safe_scaled_dot_product_attention
     fast_ns._unsloth_safe_sdpa_mask_patch = True
 

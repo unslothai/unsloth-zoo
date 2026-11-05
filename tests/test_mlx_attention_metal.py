@@ -502,6 +502,104 @@ def _peak_of(call):
     return mx.get_peak_memory() - base
 
 
+@pytest.mark.parametrize("L,S", [(2048, 2048), (2047, 2558)])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_native_window_dispatch_matches_or_improves_fp32(fused_attention, monkeypatch, L, S, dtype):
+    from unsloth_zoo.mlx import attention
+    if "window_size" not in (fused_attention.__doc__ or "") or not mx.metal.is_available():
+        pytest.skip("requires MLX native window support")
+    calls = []
+    def spy(*args, **kwargs): calls.append(kwargs); return fused_attention(*args, **kwargs)
+    spy.__doc__ = fused_attention.__doc__
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", attention.fused_sdpa_over(spy))
+    q, k, v = _d256_call(L, S, dtype)
+    rows, cols = (mx.arange(L) + S - L)[:, None], mx.arange(S)[None, :]
+    mask = (cols <= rows) & (cols > rows - 512)
+    ordinary = fused_attention(q, k, v, scale=1.0, mask=mask)
+    got = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=attention.WindowMask(mask, 512))
+    assert calls[-1]["mask"] == "causal" and calls[-1]["window_size"] == 512 and calls[-1]["force_fused"] is True
+    keys, values = (mx.repeat(x.astype(mx.float32), 4, axis=1) for x in (k, v))
+    scores = q.astype(mx.float32) @ keys.swapaxes(-1, -2)
+    ref = mx.softmax(mx.where(mask, scores, -mx.inf), axis=-1, precise=True) @ values
+    for reduce in (mx.max, mx.mean):
+        assert reduce(mx.abs(got.astype(mx.float32) - ref)).item() <= reduce(mx.abs(ordinary.astype(mx.float32) - ref)).item()
+    last = fused_attention(q[..., -1:, :], k, v, scale=1.0, mask=mask[..., -1:, :])
+    trimmed = mx.fast.scaled_dot_product_attention(q[..., -1:, :], k, v, scale=1.0, mask=attention.WindowMask(mask, 512))
+    assert calls[-1]["mask"].shape == (1, S) and mx.array_equal(trimmed.view(mx.uint16), last.view(mx.uint16)).item()
+    grad = lambda m: mx.grad(lambda x: mx.fast.scaled_dot_product_attention(x, k, v, scale=1.0, mask=m).astype(mx.float32).sum())(q)
+    via_window = grad(attention.WindowMask(mask, 512))
+    assert calls[-1]["mask"] is mask and mx.array_equal(via_window.view(mx.uint16), grad(mask).view(mx.uint16)).item()
+    from unsloth_zoo.mlx import utils
+    monkeypatch.setattr(utils, "mlx_training_patches_active", lambda: True)
+    mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=attention.WindowMask(mask, 512))
+    assert calls[-1]["mask"] is mask
+    monkeypatch.setattr(utils, "mlx_training_patches_active", lambda: False)
+    monkeypatch.setenv("UNSLOTH_MLX_NATIVE_WINDOW", "0")
+    restored = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=attention.WindowMask(mask, 512))
+    assert calls[-1]["mask"] is mask and mx.array_equal(restored.view(mx.uint16), ordinary.view(mx.uint16)).item()
+
+
+@pytest.mark.parametrize("guard", [None, "vision", "padding", "keep", "offset", "training", "old_runtime", "binding",
+                                   "wrapped_builder", "sourceless_builder"])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_native_window_scope_owns_only_causal_unpadded_masks(fused_attention, monkeypatch, guard, compiled):
+    from unsloth_zoo.mlx import attention, inference
+    from mlx_vlm.models.gemma4.language import Gemma4TextModel, TextConfig, RotatingKVCache, KVCache
+    if "window_size" not in (fused_attention.__doc__ or "") or not mx.metal.is_available():
+        pytest.skip("requires MLX native window support")
+    stock, scope = Gemma4TextModel._make_masks, {}
+    if guard == "wrapped_builder":
+        monkeypatch.setattr(Gemma4TextModel, "_make_masks", functools.wraps(stock)(lambda *args: stock(*args)))
+    elif guard == "sourceless_builder":
+        exec("def masks(*args): return stock(*args)", {"stock": stock}, scope)
+        monkeypatch.setattr(Gemma4TextModel, "_make_masks", scope["masks"])
+    if compiled:
+        from unsloth_zoo.mlx import compile as patches
+        monkeypatch.setattr(Gemma4TextModel, "_make_masks", Gemma4TextModel._make_masks)
+        monkeypatch.setattr(patches, "_PATCHED_ARCHES", set(patches._PATCHED_ARCHES))
+        monkeypatch.setattr(patches, "_PATCH_BINDINGS", set(patches._PATCH_BINDINGS))
+        patches._install_gemma4_compile_patches()
+        monkeypatch.setattr(mx.fast, "_unsloth_safe_sdpa_mask_patch", False, raising=False)
+        patches._install_safe_fused_sdpa_mask_patches()
+    model = Gemma4TextModel(TextConfig(hidden_size=16, intermediate_size=32, num_hidden_layers=4,
+        num_attention_heads=1, num_key_value_heads=1, vocab_size=32, hidden_size_per_layer_input=0,
+        num_kv_shared_layers=1, layer_types=["sliding_attention", "full_attention", "sliding_attention", "sliding_attention"]))
+    model.train(guard == "training")
+    cache = [RotatingKVCache(512), KVCache(), RotatingKVCache(512), None]
+    if guard in ("padding", "keep", "offset"):
+        setattr(cache[2], {"padding": "left_padding", "keep": "keep", "offset": "offset"}[guard], 1)
+    if guard == "old_runtime":
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", lambda *args, **kwargs: fused_attention(*args, **kwargs))
+    h, layer_types = mx.zeros((1, 1024, 16)), [type(layer) for layer in model.layers]
+    with inference.native_window_attention(model), inference.native_window_attention(model):
+        if guard == "binding":
+            monkeypatch.setattr(Gemma4TextModel, "_make_masks", lambda *args, **kwargs: [None] * 4)
+        masks = model._make_masks(h, cache, mx.zeros((1, 1024), mx.int32) if guard == "vision" else None)
+        assert [isinstance(m, attention.WindowMask) for m in masks] == ([True, False, True, True] if guard is None else [False] * 4)
+        assert guard != "binding" or masks == [None] * 4
+        assert guard is not None or all(m.window == 512 and mx.array_equal(m.original, want).item()
+                                        for m, want in zip(masks, stock(model, h, cache)) if isinstance(m, attention.WindowMask))
+        assert [type(layer) for layer in model.layers] == layer_types
+    assert type(model) is Gemma4TextModel and "_unsloth_window_scopes" not in model.__dict__
+    assert [type(layer) for layer in model.layers] == layer_types
+
+
+def test_safe_sdpa_patch_installed_during_training_survives_its_release(monkeypatch):
+    from unsloth_zoo.mlx import compile as patches, utils
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", mx.fast.scaled_dot_product_attention)
+    monkeypatch.setattr(mx.fast, "_unsloth_safe_sdpa_mask_patch", False, raising=False)
+    utils.acquire_mlx_training_patches()
+    try:
+        patches._install_safe_fused_sdpa_mask_patches()
+        safe = mx.fast.scaled_dot_product_attention
+    finally:
+        utils.release_mlx_training_patches()
+    assert mx.fast.scaled_dot_product_attention is safe
+    q = mx.ones((1, 1, 2, 8))
+    out = safe(q, q, q, scale=1.0, mask=mx.array([[-mx.inf, -mx.inf], [0.0, 0.0]]))
+    assert out[0, 0, 0].tolist() == [0.0] * 8
+
+
 @pytest.mark.skipif(nax.nax_available(), reason="NAX fuses these chunks by default")
 def test_long_head_dim_256_prefill_holds_no_scores_and_stays_close_to_fp32(fused_attention):
     q, k, v = _d256_call(512, 8192)
