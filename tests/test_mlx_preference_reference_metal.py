@@ -243,8 +243,9 @@ def test_vision_preference_reuses_image_features_exactly(tower, objective, monke
         "neftune": dict(scales=[(text, 0.0)], neftune_modules=[vision]),
         "ref_model": dict(model=_tiny_gemma4_vlm(1)),
     }.get(tower, dict(scales=[(text, 0.0)]))
+    policy = preference.ReferencePolicy(**reference)
     fn = getattr(preference, f"make_{objective}_loss_fn")(preference.resolve_preference_objective(objective, beta=0.1, loss_type=(
-        "kto" if objective == "kto" else "sigmoid")), reference_policy=preference.ReferencePolicy(**reference))
+        "kto" if objective == "kto" else "sigmoid")), reference_policy=policy)
     args = [mx.array(value) for value in ([[6, 8]] * 4, [0, 2, 1], [True, False])][:2 + (objective == "kto")]
     if objective == "dpo":
         # One copy's features repeated for both branches, one row per image token.
@@ -252,19 +253,29 @@ def test_vision_preference_reuses_image_features_exactly(tower, objective, monke
         assert tiled.shape[-2] == (batch["input_ids"] == 500).sum().item() == 16 and mx.array_equal(tiled[:, :8], tiled[:, 8:]).item()
     rows, call = [], type(model.vision_tower).__call__
     monkeypatch.setattr(type(model.vision_tower), "__call__", lambda self, x, *a, **k: rows.append(len(x)) or call(self, x, *a, **k))
+    # A KTO precompute scores the same split dicts, one chunk of two rows.
+    plan = types.SimpleNamespace(rows=[0, 1], pack=lambda chunk: (None, [[6, 8]] * 4), set_reference_logps=lambda table: None,
+                                 _scored_inputs=lambda *_a, **_k: [batch, kl["kl_batch"]])
 
     def step():
         rows.clear()
         loss, grads = nn.value_and_grad(model, lambda: fn(model, batch, *args, **kl)[0])()
         mx.eval(loss, grads)
-        return types.SimpleNamespace(loss=loss, grads=dict(mlx.utils.tree_flatten(grads)), tower_rows=sum(rows))
+        tower_rows = sum(rows)
+        rows.clear()
+        table = mx.array(preference.precompute_reference_logps(plan, model, policy, batch_size=2)) if kl else None
+        return types.SimpleNamespace(loss=loss, grads=dict(mlx.utils.tree_flatten(grads)), tower_rows=tower_rows,
+                                     precompute_rows=sum(rows), table=table)
 
     reused = step()
     monkeypatch.setattr(utils, "_VLM_IMAGE_ENCODERS", {})
     recomputed = step()
     assert "cached_image_features" not in {**batch, **kl.get("kl_batch", {})}
-    # Today every forward runs the tower: 4 forwards x 2 images. KTO's policy KL forward reads its completion's features.
-    assert recomputed.tower_rows == 8 and reused.tower_rows == (2 if tower == "frozen" else 4 if objective == "dpo" else 6)
+    # Today every forward runs the tower: 4 forwards x 2 images. KTO's KL forwards read their completion's features.
+    assert recomputed.tower_rows == 8 and reused.tower_rows == (2 if tower == "frozen" else 4)
+    if kl:
+        assert recomputed.precompute_rows == 4 and reused.precompute_rows == 2
+        assert mx.allclose(reused.table, recomputed.table, rtol=1e-6, atol=0).item()
     assert abs(recomputed.loss.item() - (0.6931472 if objective == "dpo" else 0.5)) > 1e-3
     assert reused.grads.keys() == recomputed.grads.keys()
     assert mx.allclose(reused.loss, recomputed.loss, rtol=1e-6, atol=0).item() and all(

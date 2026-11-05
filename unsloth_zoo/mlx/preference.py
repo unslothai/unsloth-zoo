@@ -1049,6 +1049,25 @@ def _shares_image_features(model, batch, reference_policy):
     )
 
 
+def _reference_logps(reference_policy, model, parts):
+    """Reference logps per ``(batch, lengths, response_scorer)`` part; vision parts holding the same images, as a split
+    vision batch's dicts do, read one tower run under the reference's weights."""
+    reference_model = getattr(reference_policy, "model", None)
+    if len(parts) < 2 or not isinstance(parts[0][0], Mapping) or _vlm_image_encoder(
+        model if reference_model is None else reference_model
+    ) is None:
+        return [
+            reference_policy.forward(model, batch, lengths, **({} if scorer is None else {"response_scorer": scorer}))
+            for batch, lengths, scorer in parts
+        ]
+    with reference_policy.activate(model) as reference:
+        first = _with_image_features(reference, parts[0][0], stop_gradient=True)
+        return [
+            mx.stop_gradient((_response_logps if scorer is None else scorer)(reference, _with_features_of(first, batch), lengths))
+            for batch, lengths, scorer in parts
+        ]
+
+
 class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     """CPU-backed preference schedule with lazy MLX materialization."""
 
@@ -1346,17 +1365,18 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
         batch, lengths = plan.pack(chunk)
         parts = plan._scored_inputs(chunk, batch, lengths, reference=True)
         share = len(lengths) // len(parts)
-        logps = []
+        scored = []
         for offset, inputs in enumerate(parts):
             part_lengths = mx.array(lengths[offset * share:(offset + 1) * share])
-            options = {}
+            response_scorer = None
             # The live forward scores through CCE too; full logits would defeat it.
             if scorer is not None:
                 mask = _response_mask(_preference_ids(inputs)[:, 1:], part_lengths)
-                options["response_scorer"] = lambda model, batch, _lengths, mask=mask: -(
+                response_scorer = lambda model, batch, _lengths, mask=mask: -(
                     scorer(model, batch, mask > 0, differentiated=False)[0] * mask
                 ).sum(axis=1)
-            logps.append(reference_policy.forward(model, inputs, part_lengths, **options))
+            scored.append((inputs, part_lengths, response_scorer))
+        logps = _reference_logps(reference_policy, model, scored)
         logps = logps[0] if len(logps) == 1 else mx.concatenate(logps)
         mx.eval(logps)
         values = np.asarray(logps.tolist(), dtype=np.float32)
@@ -3296,7 +3316,6 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
     completion, kl_rows = (batch, kl_batch) if vision else (batch[:rows], batch[rows:])
     if reference is None and _shares_image_features(model, completion, reference_policy):
         completion = _with_image_features(model, completion, stop_gradient=True)
-        kl_rows = _with_features_of(completion, kl_rows)
     # The policy's KL forward reads the features of its completion forward.
     policy = _with_image_features(model, completion, encode_single_copy=True) if objective.with_kl else completion
     policy_kl = _with_features_of(policy, kl_rows)
@@ -3332,11 +3351,10 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
                 offset = rows * (_preference_ids(batch).shape[1] - 1)
                 joined = mx.concatenate([cce_indices, mx.where(kl_indices >= 0, kl_indices + offset, -1)])
             parts = [(batch, lengths, joined)]
-        scored = [
-            reference_policy.forward(model, part, part_lengths, response_scorer=None if reference_scorer is None
-                                     else partial(score, indices=indices, scorer=reference_scorer))
+        scored = _reference_logps(reference_policy, model, [
+            (part, part_lengths, None if reference_scorer is None else partial(score, indices=indices, scorer=reference_scorer))
             for part, part_lengths, indices in parts
-        ]
+        ])
         reference = scored[0] if len(scored) == 1 else mx.concatenate(scored)
     reference = reference.astype(mx.float32)
     zero = mx.array(0.0, mx.float32)
