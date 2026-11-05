@@ -2759,11 +2759,12 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
                                     quantized=desc.quantized, weight_is_frozen=frozen,
                                     **quantization)
 
-    def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True):
+    def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True, hidden=None):
         """Token cross entropy and logit sums per position as float32 grids; cross entropy is zero outside supervised;
-        indices limit the rows, and the sums too unless every_position; without logit_sums the sums are None."""
+        indices limit the rows, and the sums too unless every_position; without logit_sums the sums are None; hidden
+        replaces the model's hidden states."""
         targets = _preference_ids(batch)[:, 1:]
-        hidden = _preference_hidden(model, batch)
+        hidden = _preference_hidden(model, batch) if hidden is None else hidden
         head = utils._resolve_module_path(model, desc.path)
         # Before compaction: the logit sums below may read every row.
         hidden = utils._rotate_head_input(head, hidden.reshape((-1, hidden.shape[-1])))

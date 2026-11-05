@@ -2249,6 +2249,65 @@ def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lor
 
 
 @metal_only
+@pytest.mark.parametrize("family,checkpointed,compiled", [("llama", False, True), ("llama", True, False), ("qwen2", True, True), ("qwen3", False, False)])  # noqa: E501
+def test_grpo_shared_prefix_matches_each_row_alone(monkeypatch, family, checkpointed, compiled):
+    # Catches missing or shifted prompt K/V, a prefix past the last prompt token, lost prompt or checkpoint gradients.
+    import importlib
+    from types import SimpleNamespace
+    import numpy as np
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import grpo as g
+    from unsloth_zoo.mlx.preference import _make_preference_cce_scorer
+    mod, rng, size = importlib.import_module(f"mlx_lm.models.{family}"), np.random.default_rng(5), 3
+    monkeypatch.setattr(g, "_shared_prefix_hidden", lambda *a, f=g._shared_prefix_hidden: forwards.append(1) or f(*a))
+    forwards = []
+    mx.random.seed(3)
+    model = mod.Model(mod.ModelArgs.from_dict(dict(model_type=family, hidden_size=64, num_hidden_layers=2, intermediate_size=96, num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=301, rope_theta=10000.0, max_position_embeddings=512, head_dim=16, tie_word_embeddings=family == "qwen2")))  # noqa: E501
+    model.freeze()
+    for layer in model.model.layers:
+        for name in ("q_proj", "k_proj", "v_proj"):
+            setattr(layer.self_attn, name, adapter := LoRALinear.from_base(getattr(layer.self_attn, name), r=4, scale=2.0))
+            adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.05
+    mx.eval(model.parameters())
+    # A 64-token prompt shares 32 tokens: its 64th predicts the first completion token.
+    rows = [prompt + rng.integers(3, 301, n).tolist() for prompt in (rng.integers(3, 301, p).tolist() for p in (64, 77)) for n in rng.integers(5, 40, size)]  # noqa: E501
+    lengths = np.array([[64 if index < size else 77, len(row)] for index, row in enumerate(rows)], dtype=np.int32)
+    packed = np.zeros((len(rows), 128), dtype=np.int32)
+    for index, row in enumerate(rows):
+        packed[index, :len(row)] = row
+    prefix = g.GRPOBatchPlan._prefix_ids(SimpleNamespace(_prefix=True, num_generations=size, _prefix_tokr=1.0), packed, lengths)  # noqa: E501
+    assert prefix.shape == (2, 32)
+    logps, weights = g.grpo_logps(0.7, _make_preference_cce_scorer(model, temperature=0.7)), mx.array(rng.normal(size=(len(rows), 127)).astype(np.float32))  # noqa: E501
+
+    def each_row(model):
+        values = [logps(model, mx.array([row]), mx.array(lengths[index:index + 1]))[0] for index, row in enumerate(rows)]
+        return sum((value * weights[index, :value.shape[0]]).sum() for index, value in enumerate(values)), values
+
+    def shared(model, batch, lengths, indices, prefix, weights):
+        values = logps(model, batch, lengths, indices, prefix)
+        return (values * weights).sum(), values
+
+    mx.eval(alone := nn.value_and_grad(model, each_row)(model))
+    if checkpointed:
+        mlx_utils.apply_gradient_checkpointing(model)
+    try:
+        run = lambda *b: nn.value_and_grad(model, shared)(model, *b)  # noqa: E731
+        run = mx.compile(run, inputs=model.state, outputs=model.state) if compiled else run
+        batch = (mx.array(packed), mx.array(lengths), mx.array(g.grpo_cce_indices(lengths.tolist(), 128, 512)), prefix)
+        mx.eval(together := run(*batch, weights), scored := g._scored_as_step(logps, lambda: compiled)(model, *batch))
+    finally:
+        mlx_utils.remove_gradient_checkpointing(model)
+    (total, values), grads = together
+    # Old log-probs through the step's own (shared) forward, so a first ratio is exactly 1.
+    assert len(forwards) == 2 and mx.array_equal(scored, values).item()
+    assert abs(total.item() - alone[0][0].item()) < 1e-4
+    for index, value in enumerate(alone[0][1]):
+        assert mx.allclose(values[index, :value.shape[0]], value, atol=1e-5).item() and not values[index, value.shape[0]:].any().item()  # noqa: E501
+    for (name, want), (_, got) in zip(tree_flatten(alone[1]), tree_flatten(grads)):
+        assert mx.abs(want).max().item() > 0 and mx.allclose(got, want, atol=1e-5, rtol=1e-4).item(), name
+
+
+@metal_only
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("labeled", [False, True])
 def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):

@@ -636,6 +636,7 @@ from .grpo import (
     format_completions,
     grpo_layout_options,
     grpo_objective,
+    grpo_prefix_grouping,
     grpo_reward_funcs,
     grpo_sample_weighting,
     grpo_sampling,
@@ -1616,6 +1617,7 @@ class MLXTrainingConfig:
             "use_liger_loss",
             "zero_variance_exclude",
             "loss_aggregation",
+            "prefix_grouper",
             "cpo_alpha",
             "simpo_gamma",
             "alpha",
@@ -1782,6 +1784,8 @@ class MLXGRPOConfig(MLXTrainingConfig):
     # ScaleRL options; None reads CUDA Unsloth's UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE / UNSLOTH_GRPO_LOSS_AGGREGATION.
     zero_variance_exclude: bool | None = field(default=None, kw_only=True)
     loss_aggregation: str | None = field(default=None, kw_only=True)
+    # Shared-prompt training forward (CUDA Unsloth's PrefixGrouper); None reads UNSLOTH_GRPO_PREFIX_GROUPER, off if unset.
+    prefix_grouper: bool | None = field(default=None, kw_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -9852,6 +9856,11 @@ class MLXGRPOTrainer(MLXTrainer):
                 grpo_objective(args), distributed=getattr(self, "distributed_world_size", 1) > 1,
             ),
             sample_weighting=grpo_sample_weighting(args),
+            prefix_grouping=grpo_prefix_grouping(
+                args, distributed=getattr(self, "distributed_world_size", 1) > 1, model=self.model,
+                announced=vars(self).setdefault("_grpo_prefix_announced", set()),
+                hint=self.is_main_process,
+            ),
         )
         # A resumed run generates at once, so its widths are planned from there.
         resume = getattr(self, "_resume_from_checkpoint", None)
