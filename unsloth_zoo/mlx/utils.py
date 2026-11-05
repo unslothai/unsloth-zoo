@@ -578,6 +578,36 @@ def _as_array_mask(q, k, mask):
     return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
 
 
+# mlx 0.32.4's fused SDPA VJP keeps its S/P/dS tiles in the input dtype, so bf16/fp16 gradients lose to an explicit
+# fp32 softmax; given fp32 inputs, the same fused forward and blocked VJP run in fp32.
+# Below 2047 queries (a 2048-token sequence after the label shift) or above D128, the fp32 copies cost more than
+# mlx's unfused path, so those causal calls keep the stock kernels.
+_FP32_CAUSAL_HEAD_DIMS = frozenset((64, 128))
+_FP32_CAUSAL_MIN_QUERIES = 2047
+
+
+def _fp32_runs_stock_kernels():
+    # NAX GPUs run fp32 attention on their NAX kernels only under TF32; otherwise the fp32 forward and VJP GEMMs cost
+    # more than the unfused path at D128, and the forward no longer rounds like the stock one.
+    from .attention import _stock_runs_nax, _tf32_enabled
+
+    return _tf32_enabled() or not _stock_runs_nax()
+
+
+def _fp32_attention_routes(q, k, v, mask, head_dims):
+    D, T = k.shape[-1], q.shape[-2]
+    return (os.environ.get("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", "1") != "0"
+            and q.dtype == k.dtype == v.dtype and q.dtype in (mx.bfloat16, mx.float16) and T > 8
+            and D == v.shape[-1] and D in head_dims
+            and (mask is None or isinstance(mask, str) and mask == "causal" and T <= k.shape[-2])
+            and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def _fp32_attention(sdpa, q, k, v, scale, mask):
+    out = sdpa(q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32), scale=scale, mask=mask)
+    return out.astype(q.dtype)
+
+
 def _wrap_training_sdpa(original):
     @wraps(original)
     def wrapper(q, k, v, *, scale, mask=None, **kwargs):
@@ -593,6 +623,11 @@ def _wrap_training_sdpa(original):
                 block = max(_TRAINING_ATTENTION_BLOCK, window)
                 if _windowing_pays(q, k, block):
                     return _windowed_attention(original, q, k, v, scale, window, block)
+        # Disjoint by head dim, so each call takes at most one: D64/D128 fp32 route, D > 256 query chunks, else stock.
+        if (all(value is None for value in kwargs.values()) and isinstance(mask, str) and mask == "causal"
+                and T >= _FP32_CAUSAL_MIN_QUERIES and mlx_training_patches_active()
+                and _fp32_attention_routes(q, k, v, mask, _FP32_CAUSAL_HEAD_DIMS) and _fp32_runs_stock_kernels()):
+            return _fp32_attention(original, q, k, v, scale, mask)
         if (all(value is None for value in kwargs.values()) and mlx_training_patches_active()
                 and _chunking_bounds_scores(q, v, mask)):
             return _query_chunked_attention(original, q, k, v, scale, mask, _CHUNKED_ATTENTION_QUERIES)

@@ -507,6 +507,195 @@ def test_training_attention_differentiates_short_queries_and_sinks(T, mask, sink
     assert mx.allclose(got, mx.grad(reference)(q), atol=1e-4)
 
 
+def _causal(T, S):
+    return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
+
+
+def _attention_f64(q, k, v, do, scale, causal):
+    """float64 attention and its analytic backward from the rounded inputs; kv heads serve their query group."""
+    import numpy as np
+    G = q.shape[1] // k.shape[1]
+    k, v = np.repeat(k, G, axis=1), np.repeat(v, G, axis=1)
+    s = scale * q @ k.swapaxes(-1, -2)
+    if causal:
+        s = np.where(np.array(_causal(*s.shape[-2:])), s, -np.inf)
+    p = np.exp(s - s.max(-1, keepdims=True))
+    p /= p.sum(-1, keepdims=True)
+    dp = do @ v.swapaxes(-1, -2)
+    ds = p * (dp - (dp * p).sum(-1, keepdims=True))
+    fold = lambda g: g.reshape(g.shape[0], -1, G, *g.shape[2:]).sum(2)
+    return [p @ v, scale * ds @ k, fold(scale * ds.swapaxes(-1, -2) @ q), fold(p.swapaxes(-1, -2) @ do)]
+
+
+def _explicit_fp32_softmax(q, k, v, scale, mask):
+    G = q.shape[1] // k.shape[1]
+    k, v = mx.repeat(k, G, axis=1), mx.repeat(v, G, axis=1)
+    scores = (q.astype(mx.float32) @ k.astype(mx.float32).swapaxes(-1, -2)) * scale
+    if mask == "causal":
+        scores = mx.where(_causal(*scores.shape[-2:]), scores, -mx.inf)
+    return mx.softmax(scores, axis=-1).astype(q.dtype) @ v
+
+
+def _f64(t):
+    import numpy as np
+    return np.array(t.astype(mx.float32)).astype(np.float64)
+
+
+def _attention_vjp(attend, q, k, v, do, training=False):
+    if training:
+        mlx_utils.acquire_mlx_training_patches()
+    try:
+        (out,), grads = mx.vjp(attend, [q, k, v], [do])
+        mx.eval(out, grads)
+    finally:
+        if training:
+            mlx_utils.release_mlx_training_patches()
+    return [_f64(t) for t in (out, *grads)]
+
+
+def _rel(x, ref):
+    import numpy as np
+    return np.linalg.norm(x - ref) / np.linalg.norm(ref)
+
+
+def _attention_inputs(dtype, T, S, dim, heads, peak, seed):
+    import numpy as np
+    rng, dt = np.random.default_rng(seed), getattr(mx, dtype)
+    shapes = (((1, heads, T, dim), peak), ((1, heads // 2, S, dim), peak), ((1, heads // 2, S, dim), 1.0),
+              ((1, heads, T, dim), 1.0))
+    return [mx.array(rng.standard_normal(shape) * spread, mx.float32).astype(dt) for shape, spread in shapes]
+
+
+@metal_only
+@pytest.mark.parametrize("peak", [1.0, 4.0])
+@pytest.mark.parametrize("dim, mask", [(64, "causal"), (128, "causal")])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_fp32_training_attention_matches_explicit_softmax_against_float64(dtype, dim, mask, peak):
+    from unsloth_zoo.mlx import attention
+
+    # Under TF32, NAX GEMMs truncate fp32 operands to fp16's 10 mantissa bits, twice the error of explicit's rounding.
+    bound = 1.5 if dtype == "float16" and attention._stock_runs_nax() and attention._tf32_enabled() else 1.1
+    scale = dim ** -0.5
+    q, k, v, do = _attention_inputs(dtype, 160, 160, dim, 4, peak, dim)
+    ref = _attention_f64(*map(_f64, (q, k, v, do)), scale, mask == "causal")
+    explicit = _attention_vjp(lambda *a: _explicit_fp32_softmax(*a, scale, mask), q, k, v, do)
+    attend = lambda *a: mlx_utils._fp32_attention(mx.fast.scaled_dot_product_attention, *a, scale, mask)
+    routed = _attention_vjp(attend, q, k, v, do, training=True)
+    for name, got, want, base in zip(("out", "dq", "dk", "dv"), routed, ref, explicit):
+        assert _rel(got, want) <= bound * _rel(base, want), name
+
+
+@metal_only
+@pytest.mark.parametrize("prefix", [0, 40])
+def test_fp32_training_attention_matches_float64_past_the_first_vjp_tile(prefix):
+    # mlx's blocked VJP tiles queries and keys by 1024; a key prefix moves the causal diagonal off the tile corners.
+    T, S, scale, mask = 2100, 2100 + prefix, 0.125, "causal"
+    q, k, v, do = _attention_inputs("bfloat16", T, S, 64, 2, 4.0, prefix)
+    ref = _attention_f64(*map(_f64, (q, k, v, do)), scale, mask == "causal")
+    explicit = _attention_vjp(lambda *a: _explicit_fp32_softmax(*a, scale, mask), q, k, v, do)
+    attend = lambda *a: mlx_utils._fp32_attention(mx.fast.scaled_dot_product_attention, *a, scale, mask)
+    routed = _attention_vjp(attend, q, k, v, do, training=True)
+    for name, got, want, base in zip(("out", "dq", "dk", "dv"), routed, ref, explicit):
+        for rows in (slice(0, 1024), slice(1024, 2048), slice(2048, None)):
+            assert _rel(got[..., rows, :], want[..., rows, :]) <= 1.1 * _rel(base[..., rows, :], want[..., rows, :]), (
+                name, rows)
+
+
+@metal_only
+@pytest.mark.parametrize("peak", [1.0, 8.0])
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_fp32_training_attention_forward_is_bitwise_stock(monkeypatch, dtype, dim, peak):
+    # Stored references are scored at whatever width they were packed to, so the route may differ from the policy's;
+    # only the backward may change across the 2047-query floor. Without TF32 a NAX GPU runs fp32 attention on other
+    # kernels, which round differently, so the route is off there.
+    from unsloth_zoo.mlx import attention
+
+    monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    sdpa = mx.fast.scaled_dot_product_attention
+    sdpa = getattr(sdpa, "_unsloth_original", sdpa)
+    seen = []
+
+    def original(q, k, v, **kwargs):
+        seen.append(q.dtype)
+        return sdpa(q, k, v, **kwargs)
+
+    q, k, v, _ = _attention_inputs(dtype, 2047, 2047, dim, 4, peak, dim)
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+    try:
+        routed = mlx_utils._wrap_training_sdpa(original)(q, k, v, scale=dim ** -0.5, mask="causal")
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    stock = sdpa(q, k, v, scale=dim ** -0.5, mask="causal")
+    assert seen == [mx.float32 if attention._tf32_enabled() or not attention._stock_runs_nax() else q.dtype]
+    assert routed.dtype == stock.dtype and mx.array_equal(routed, stock).item()
+
+
+@metal_only
+@pytest.mark.parametrize("case, routed", [
+    ({}, True), ({"dim": 64, "dtype": "float16", "T": 2047, "S": 2047}, True), ({"T": 2046, "S": 2046}, False),
+    ({"dim": 256}, False),
+    ({"mask": None}, False), ({"value_dim": 64}, False),
+    ({"dtype": "float32"}, False), ({"S": 2000}, False), ({"S": 2100}, True), ({"mask": "array"}, False),
+    ({"sinks": True}, False), ({"training": False}, False), ({"env": "0"}, False),
+    ({"nax": True}, True), ({"tf32": False}, True), ({"nax": True, "tf32": False}, False)])
+def test_fp32_training_attention_routes_only_fused_training_calls(monkeypatch, case, routed):
+    from unsloth_zoo.mlx import attention
+
+    spec = {"T": 2048, "S": 2048, "dim": 128, "value_dim": None, "dtype": "bfloat16", "mask": "causal",
+            "sinks": False, "training": True, "env": None, "nax": False, "tf32": True, **case}
+    monkeypatch.setattr(attention, "_stock_runs_nax", lambda: spec["nax"])
+    monkeypatch.setattr(attention, "_tf32_enabled", lambda: spec["tf32"])
+    if spec["env"] is None:
+        monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    else:
+        monkeypatch.setenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", spec["env"])
+    seen = []
+
+    def original(q, k, v, *, scale, mask=None, **kwargs):
+        seen.append((q.dtype, k.dtype, v.dtype))
+        return mx.zeros((*q.shape[:-1], v.shape[-1]), q.dtype)
+
+    dt, T, S = getattr(mx, spec["dtype"]), spec["T"], spec["S"]
+    q, k = mx.zeros((1, 4, T, spec["dim"]), dt), mx.zeros((1, 2, S, spec["dim"]), dt)
+    v = mx.zeros((1, 2, S, spec["value_dim"] or spec["dim"]), dt)
+    mask = mx.ones((T, S), mx.bool_) if spec["mask"] == "array" else spec["mask"]
+    extra = {"sinks": mx.zeros((4,), dt)} if spec["sinks"] else {}
+    attend = mlx_utils._wrap_training_sdpa(original)
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(int(spec["training"]))
+    try:
+        out = attend(q, k, v, scale=0.1, mask=mask, **extra)
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert out.dtype == dt
+    assert seen == [(mx.float32 if routed else dt,) * 3]
+
+
+@metal_only
+@pytest.mark.parametrize("dim, T, calls", [
+    (128, 2047, [(2047, mx.float32)]), (128, 2046, [(2046, mx.bfloat16)]), (64, 2047, [(2047, mx.float32)]),
+    (256, 2047, [(2047, mx.bfloat16)]), (512, 2047, [(511, mx.bfloat16)] + [(512, mx.bfloat16)] * 3)])
+def test_training_attention_takes_exactly_one_route(monkeypatch, dim, T, calls):
+    from unsloth_zoo.mlx import attention
+
+    monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    monkeypatch.setattr(attention, "_stock_runs_nax", lambda: False)
+    seen = []
+
+    def original(q, k, v, *, scale, mask=None, **kwargs):
+        seen.append((q.shape[-2], q.dtype))
+        return mx.zeros((*q.shape[:-1], v.shape[-1]), q.dtype)
+
+    q, k = mx.zeros((1, 4, T, dim), mx.bfloat16), mx.zeros((1, 2, T, dim), mx.bfloat16)
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+    try:
+        out = mlx_utils._wrap_training_sdpa(original)(q, k, k, scale=0.1, mask="causal")
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert out.shape == q.shape and out.dtype == mx.bfloat16
+    assert seen == calls
+
+
 @metal_only
 @pytest.mark.parametrize("family", ["gemma4", "gemma3n"])
 @pytest.mark.parametrize("T", [2048, 5200])
