@@ -516,6 +516,29 @@ def test_for_training_switches_gradient_checkpointing_only_when_asked():
     assert not model.is_gradient_checkpointing
 
 
+def test_for_training_and_get_peft_model_keep_every_n_layers():
+    import inspect
+    from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedModel
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    if "every_n_layers" not in inspect.signature(PreTrainedModel.gradient_checkpointing_enable).parameters:
+        pytest.skip("every_n_layers is a gradient_checkpointing_enable argument from transformers 5.17")
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(vocab_size = 64, hidden_size = 32, intermediate_size = 64,
+                                         num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 4,
+                                         max_position_embeddings = 32))
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False}, every_n_layers = 2)
+    flags = lambda: [layer.gradient_checkpointing for layer in model.model.layers]  # noqa: E731
+    assert flags() == [True, False, True, False]
+    FastCPUModel.for_training(model, use_gradient_checkpointing = True)
+    assert flags() == [True, False, True, False]
+    FastCPUModel._prepare(model, "unsloth")  # what get_peft_model runs on the already checkpointed model
+    assert flags() == [True, False, True, False]
+    FastCPUModel.for_training(model, use_gradient_checkpointing = False)
+    assert not model.is_gradient_checkpointing
+    FastCPUModel.for_training(model, use_gradient_checkpointing = True)
+    assert flags() == [True, True, True, True]
+
+
 def test_zero_item_batch_gives_zero_gradients_not_nan():
     from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
     hidden = torch.randn(2, 4, 8, requires_grad = True)

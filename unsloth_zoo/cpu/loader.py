@@ -352,7 +352,8 @@ class FastCPUModel:
 
     @staticmethod
     def _prepare(model, use_gradient_checkpointing):
-        if use_gradient_checkpointing in (True, "unsloth"):
+        # Already on (from_pretrained, then get_peft_model): re-enabling would drop every_n_layers' selection.
+        if use_gradient_checkpointing in (True, "unsloth") and not getattr(model, "is_gradient_checkpointing", False):
             # "unsloth" offloads activations to host RAM on GPUs; on CPU they already live there,
             # so it is plain recomputation.
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
@@ -449,7 +450,9 @@ class FastCPUModel:
         # None keeps whatever from_pretrained / get_peft_model set up; an explicit value switches it.
         if use_gradient_checkpointing is not None and hasattr(model, "gradient_checkpointing_enable"):
             if use_gradient_checkpointing:
-                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+                # Already on: re-enabling would checkpoint every layer again, dropping every_n_layers' selection.
+                if not getattr(model, "is_gradient_checkpointing", False):
+                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
             elif getattr(model, "is_gradient_checkpointing", False):
                 model.gradient_checkpointing_disable()
         return model
