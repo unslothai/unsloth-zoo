@@ -2242,6 +2242,11 @@ def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
     assert actual[0][0].item() == pytest.approx(expected[0][0].item(), abs=2e-5)
     for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
         assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+    # dft reduction on the runtime vision CCE path.
+    hidden, target, n = forward(model, batch)
+    token = nn.losses.cross_entropy(model.lm_head(hidden).astype(mx.float32), mx.maximum(target, 0), reduction="none") * (target != -100)
+    dft = mlx_utils.make_vlm_cce_loss_fn(model, loss_type="dft")(model, batch)[0]
+    assert dft.item() == pytest.approx((token * mx.exp(-token)).sum().item() / n.item(), rel=1e-4)
 
 
 @metal_only
@@ -3133,6 +3138,7 @@ def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatc
     assert mlx_utils._get_backbone_embed_kwarg(model.model) is None
     loss = mlx_utils.make_vlm_cce_loss_fn(model)
     assert loss._unsloth_cce_backend == "runtime-cce"
+    assert mlx_utils.make_vlm_cce_loss_fn(model, loss_type="dft")._unsloth_cce_backend == "baseline-fallback"
     baseline = mlx_utils.make_vlm_baseline_loss_fn(model)
     for pixels in (None, mx.ones((2, 3, 64)), None):
         batch = dict(input_ids=mx.array([[2, 3, 4], [7, 6, 5]]), **{media_key: pixels})

@@ -4233,10 +4233,11 @@ def _vlm_positions_for_compile(batch_dict, config):
     return batch_dict
 
 
-def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
+def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, loss_type="nll"):
     """CCE loss over pre-lm_head hidden states from get_input_embeddings() merged embeddings, with baseline loss as
     fallback; assistant_token_id > 0 enables completion-only training, masking tokens before its first occurrence;
-    returns (model, batch_dict) -> (loss, ntoks)."""
+    returns (model, batch_dict) -> (loss, ntoks). loss_type="dft" applies only on the runtime-cce backend."""
+    dft = loss_type == "dft"
     def _marked_vlm_baseline():
         loss_fn = make_vlm_baseline_loss_fn(
             model,
@@ -4269,6 +4270,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         backbone is not None and _get_backbone_embed_kwarg(backbone) is None
         and _get_encoder_decoder_backbone(model) is None
     )
+    if dft and token_ids_only:
+        # Media batches on this backbone score through the baseline loss, which has no DFT weighting.
+        return _marked_vlm_baseline()
 
     head_desc = describe_output_head(model)
     _ineligible = _cce_head_ineligibility(head_desc)
@@ -4357,7 +4361,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             hidden_flat = _rotate_head_input(lm_head, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
     else:
         if _skip_weight_grad:
@@ -4388,7 +4392,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             loss = rt_cce(model)(hidden_flat, w, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
 
     if token_ids_only:

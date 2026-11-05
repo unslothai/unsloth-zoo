@@ -1229,10 +1229,10 @@ def _resolve_sft_loss_type(args, *, fused):
         )
     if loss_type == "dft" and not fused:
         raise ValueError(
-            "Unsloth MLX: loss_type='dft' is implemented on the fused CCE text "
-            "loss only; this run uses a vision-language, GKD, label-smoothed or "
-            "standard cross-entropy loss. Use loss_type='nll' or a text model "
-            "with use_cce=True."
+            "Unsloth MLX: loss_type='dft' is implemented on the fused CCE loss "
+            "only; this run uses a GKD, label-smoothed or standard cross-entropy "
+            "loss, or a vision-language model whose text stack takes token ids "
+            "only. Use loss_type='nll', or use_cce=True on a supported model."
         )
     return loss_type
 
@@ -5623,7 +5623,7 @@ class MLXTrainer:
             getattr(args, "label_smoothing_factor", 0.0), is_vlm,
         )
         sft_loss_type = "nll" if preference_kind else _resolve_sft_loss_type(
-            args, fused=use_cce and not is_vlm and label_smoothing == 0.0
+            args, fused=use_cce and label_smoothing == 0.0
             and not getattr(args, "teacher_model_name_or_path", None),
         )
         _vlm_ignore_token_ids = None
@@ -5690,8 +5690,11 @@ class MLXTrainer:
                     model,
                     assistant_token_id=_atid,
                     ignore_token_ids=_vlm_ignore_token_ids,
+                    loss_type=sft_loss_type,
                 )
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
+                if sft_loss_type == "dft" and cce_backend != "runtime-cce":
+                    _resolve_sft_loss_type(args, fused=False)
                 if cce_backend == "baseline-fallback":
                     use_cce = False
                     _main_print(
