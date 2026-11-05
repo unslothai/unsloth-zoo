@@ -155,6 +155,14 @@ def _cpu_compile_unavailable():
             pass
 
 
+def _non_reentrant_checkpointing_on(model):
+    # Re-enabling would drop an every_n_layers selection; reentrant or unknown funcs still get switched.
+    if not getattr(model, "is_gradient_checkpointing", False):
+        return False
+    funcs = [m.__dict__["_gradient_checkpointing_func"] for m in model.modules() if "_gradient_checkpointing_func" in m.__dict__]
+    return bool(funcs) and all(isinstance(getattr(f, "keywords", None), dict) and f.keywords.get("use_reentrant", True) is False for f in funcs)
+
+
 def _disable_bnb_cpu_weight_packing(model):
     """bitsandbytes (0.50) repacks a Linear4bit weight in place for its AVX512-BF16 kernel on the first
     eval forward without grad, and never unpacks it: backward through the packed weight is then wrong,
@@ -352,7 +360,7 @@ class FastCPUModel:
 
     @staticmethod
     def _prepare(model, use_gradient_checkpointing):
-        if use_gradient_checkpointing in (True, "unsloth"):
+        if use_gradient_checkpointing in (True, "unsloth") and not _non_reentrant_checkpointing_on(model):
             # "unsloth" offloads activations to host RAM on GPUs; on CPU they already live there,
             # so it is plain recomputation.
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
@@ -449,7 +457,8 @@ class FastCPUModel:
         # None keeps whatever from_pretrained / get_peft_model set up; an explicit value switches it.
         if use_gradient_checkpointing is not None and hasattr(model, "gradient_checkpointing_enable"):
             if use_gradient_checkpointing:
-                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+                if not _non_reentrant_checkpointing_on(model):
+                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
             elif getattr(model, "is_gradient_checkpointing", False):
                 model.gradient_checkpointing_disable()
         return model
