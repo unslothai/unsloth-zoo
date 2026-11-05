@@ -4413,13 +4413,17 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
 
 def _get_vlm_image_size(config, processor):
     """Target size for uniform resizing, from vision_config.image_size then processor.image_processor.size, else 512;
-    area-style size dicts (Qwen2.5-VL min/max pixels) are skipped: as dimensions they upsample to 3136x3136 and OOM."""
+    None for a processor that sizes images to its own token budget; area-style size dicts (Qwen2.5-VL min/max pixels)
+    are skipped: as dimensions they upsample to 3136x3136 and OOM."""
     vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
     if vc is not None:
         sz = vc.get("image_size") if isinstance(vc, dict) else getattr(vc, "image_size", None)
         if isinstance(sz, int) and sz > 0:
             return sz
     ip = getattr(processor, "image_processor", None)
+    # Gemma 4 resizes every image to its soft-token budget itself; its `size` (224) is nominal, not an input limit.
+    if getattr(ip, "max_soft_tokens", None) is not None:
+        return None
     if ip is not None:
         sz = getattr(ip, "size", None)
         if isinstance(sz, dict):
