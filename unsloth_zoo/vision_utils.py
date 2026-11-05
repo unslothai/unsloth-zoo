@@ -873,7 +873,7 @@ def _read_video_decord(
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
     idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
     video = vr.get_batch(idx).asnumpy()
-    video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
+    video = torch.from_numpy(video).permute(0, 3, 1, 2)  # asnumpy() is a fresh array; TCHW view, no copy
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: decord:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
     sample_fps = nframes / max(total_frames, 1e-6) * video_fps
@@ -2662,7 +2662,8 @@ class UnslothVisionDataCollator:
                 c = self._clean_none_keys(c)
                 pc_txt = self._render_chat(prompt_messages=p, completion_messages=c, example=ex)
                 # Some models append common template items, so split prompt and completion at their shared prefix; see trl/data_utils.py.
-                p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
+                if not pc_txt.startswith(p_txt):
+                    p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
                 c_txt = pc_txt[len(p_txt):]
             else:
                 c_txt = str(c)
