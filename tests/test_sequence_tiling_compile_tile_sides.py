@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_TILED_COMPILE=compile_tile (what Unsloth's block compile uses for MoE and other modules the opaque op does not
-take): a tile body is one compiled graph or runs eagerly, never partly compiled, and a checkpointed tile recomputes on
-the side its forward took. A partly compiled body ran its forward through compiled pieces and its recompute without
-them (qwen3_moe with a LoRA router under Unsloth's block compile: CheckpointError, "Recomputed values ... have different
-metadata")."""
+"""compile_tile: a tile body is fully compiled or eager, and its recompute takes its forward's side (qwen3_moe CheckpointError)."""
 
 import copy
 import os
@@ -34,7 +30,7 @@ from unsloth_zoo import sequence_tiling as ST  # noqa: E402
 
 
 class _BreakingMLP(GatedMLP):
-    """A body Dynamo cannot trace as one graph (a graph break in the middle, as a PEFT ParamWrapper's forward has)."""
+    """Graph break mid-body, like a PEFT ParamWrapper."""
 
     def forward(self, x):
         torch._dynamo.graph_break()
@@ -42,7 +38,7 @@ class _BreakingMLP(GatedMLP):
 
 
 def _trace_saves(monkeypatch):
-    """Per checkpoint frame: forward packs and recompute packs, each marked compiled (packed by an AOT graph) or not."""
+    """Per checkpoint frame: (frame, forward packs, recompute packs), each True if packed by an AOT graph."""
     import traceback
     frames = []
 
@@ -118,10 +114,10 @@ def _run(monkeypatch, cls):
 
 def test_a_body_that_does_not_trace_whole_runs_eager_in_forward_and_recompute(monkeypatch):
     frames = _run(monkeypatch, _BreakingMLP)
-    assert len(frames) == 8, len(frames)  # 2 layers x 4 tiles
+    assert len(frames) == 8, len(frames)
     for _, fwd, rec in frames:
-        assert fwd == rec, (fwd, rec)  # the recompute saves on the side its forward did
-        assert not any(fwd), fwd  # no partly compiled tile: the graph break makes the whole body eager
+        assert fwd == rec, (fwd, rec)
+        assert not any(fwd), fwd
 
 
 def test_a_body_that_traces_whole_stays_one_compiled_graph(monkeypatch):
@@ -133,8 +129,7 @@ def test_a_body_that_traces_whole_stays_one_compiled_graph(monkeypatch):
 
 
 def test_a_checkpointed_tile_keeps_its_side_when_the_body_falls_back_later(monkeypatch):
-    # A later tile's failed compile (a new shape past the recompile limit) turns the body eager; tiles whose forward
-    # already ran compiled still recompute compiled.
+    # A later compile failure turns the body eager; already-compiled forwards still recompute compiled.
     monkeypatch.setenv("UNSLOTH_TILED_COMPILE", "compile_tile")
     torch._dynamo.reset()
     ST._COMPILED_TILES.clear()
@@ -145,14 +140,13 @@ def test_a_checkpointed_tile_keeps_its_side_when_the_body_falls_back_later(monke
     ref = copy.deepcopy(mlp)
     x = torch.randn(1, 37, H, requires_grad = True)
     y = ST._tiled_call_eager(mlp, x, n_tiles = 4, needs_rng = False, output_contract = None, compile_tile = True)
-    ST._EAGER_TILES.update(ST._COMPILED_TILES)  # the body fell back after these forwards
+    ST._EAGER_TILES.update(ST._COMPILED_TILES)
     y.pow(2).sum().backward()
     xr = x.detach().clone().requires_grad_()
     ref(xr).pow(2).sum().backward()
     torch.testing.assert_close(x.grad, xr.grad)
     for _, fwd, rec in frames:
         assert fwd == rec and all(fwd), (fwd, rec)
-    # and a new forward now runs eager, forward and recompute alike
     frames.clear()
     y = ST._tiled_call_eager(mlp, x, n_tiles = 4, needs_rng = False, output_contract = None, compile_tile = True)
     y.sum().backward()
@@ -161,7 +155,7 @@ def test_a_checkpointed_tile_keeps_its_side_when_the_body_falls_back_later(monke
 
 
 class _InlineFlagMLP(GatedMLP):
-    """Branches on UNSLOTH_DECODE_COMPILE as the bnb 4-bit expert forwards do: the two sides save different tensors."""
+    """Branches on UNSLOTH_DECODE_COMPILE like the bnb 4-bit expert forwards."""
 
     def forward(self, x):
         from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
@@ -171,8 +165,7 @@ class _InlineFlagMLP(GatedMLP):
 
 
 def test_a_tile_checkpointed_inside_a_block_recomputes_with_the_blocks_inline_flag():
-    # Unsloth's block compile sets UNSLOTH_DECODE_COMPILE while a block runs; the tile recomputes in backward, after the
-    # block returned. Unpinned, the recompute took the other branch: CheckpointError (OLMoE-1B-7B 4-bit, T4).
+    # Recompute runs after the block reset the flag; unpinned it took the other branch (OLMoE-1B-7B 4-bit CheckpointError).
     from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
     torch.manual_seed(0)
     mlp = _InlineFlagMLP()

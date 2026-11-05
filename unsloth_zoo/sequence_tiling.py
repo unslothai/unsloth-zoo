@@ -67,9 +67,7 @@ pass
 
 
 def _block_inline_flag():
-    """UNSLOTH_DECODE_COMPILE: Unsloth's block compile sets it while a block runs, and the MoE expert forwards (bnb 4-bit
-    experts) read it to choose between tracing inline and a torch.compiler.disable'd call. A tile checkpointed inside a
-    block recomputes in backward, outside it, so the recompute must see the forward's value."""
+    """UNSLOTH_DECODE_COMPILE, set by block compile and read by MoE expert forwards; recomputes run outside the block."""
     try:
         from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
         return UNSLOTH_DECODE_COMPILE
@@ -97,9 +95,7 @@ pass
 def _replay_tile(fn, gc_flag, *args, choice = None, inline = None):
     """One eager tile whose forward and recompute read the same in_gradient_checkpoint_recompute() value: Unsloth's
     MoE kernels save a different tensor count per value, which raised CheckpointError (OLMoE: 29 vs 27). `choice`
-    pins a compiled tile body's side (compiled or eager, see _TileBody) for the recompute, `inline` the forward's
-    UNSLOTH_DECODE_COMPILE value (_block_inline_flag; OLMoE-1B-7B 4-bit under block compile saved a dequantized
-    expert weight in forward and the LoRA expert stacks in the recompute)."""
+    pins a _TileBody's side and `inline` the forward's UNSLOTH_DECODE_COMPILE for the recompute."""
     tls = _gc_tls() if gc_flag is not None else None
     previous = getattr(tls, "active", False) if tls is not None else None
     if tls is not None:
@@ -111,7 +107,7 @@ def _replay_tile(fn, gc_flag, *args, choice = None, inline = None):
     try:
         body = fn.args[0] if isinstance(fn, functools.partial) and fn.func is _owned and fn.args else None
         if isinstance(body, _TileBody):
-            return body.run(choice, args[0].clone(), *args[1:])  # _owned(body, *args), with the pinned side
+            return body.run(choice, args[0].clone(), *args[1:])  # _owned with the pinned side
         if _is_dynamic_body(fn):
             return fn(*args)
         return _dynamic_inner_compiles(fn, *args)
@@ -336,8 +332,8 @@ def _outside_graph_mode():
     """"unroll", "op", "compile_tile" or "break" (UNSLOTH_TILED_COMPILE forces one). Unrolling costs ~1.1 s compile per
     tile and lets Inductor overlap the tiles' recomputes (most of the saving is lost), so Unsloth's blocks use "op":
     the tile loop as one opaque graph node (registry modules that qualify; others fall back to "compile_tile", one
-    fullgraph compiled frame per tile outside the block graph, eager when the body does not trace whole). A user's
-    compile may be fullgraph=True, so it unrolls."""
+    fullgraph compiled frame per tile outside the block graph, else eager). A user's compile may be fullgraph=True, so
+    it unrolls."""
     mode = os.environ.get(_ENV_COMPILE, "auto").strip().lower()
     if mode in ("unroll", "op", "compile_tile", "break"):
         return mode
@@ -415,7 +411,7 @@ pass
 
 
 _COMPILED_TILES = {}
-# Tile frames Dynamo cannot compile as one graph (graph break, disabled call, recompile limit): eager from then on.
+# Tile frames Dynamo cannot compile whole; eager from then on.
 _EAGER_TILES = set()
 _TRACE_ERRORS = (torch._dynamo.exc.TorchDynamoException,)
 
@@ -432,11 +428,8 @@ pass
 
 
 class _TileBody:
-    """A tile body run as one compiled graph, else eagerly. A partly compiled body (graph breaks, calls into disabled
-    code) can run its forward through compiled pieces and its checkpoint recompute without them, which saves other
-    tensors (CheckpointError: "Recomputed values ... have different metadata"; qwen3_moe LoRA router under Unsloth's
-    block compile). So the frame is fullgraph, a body Dynamo cannot trace whole runs eagerly, and a checkpointed tile
-    keeps the side its forward took (_replay_tile's choice) for its recompute."""
+    """Fullgraph-compiled or eager, never partly compiled: a partial body's recompute saves other tensors than its
+    forward (qwen3_moe LoRA router CheckpointError). A checkpointed tile recomputes on its forward's side."""
     _unsloth_dynamic_body = True
     __slots__ = ("key", "compiled", "eager")
 
@@ -447,7 +440,6 @@ class _TileBody:
         return self.run(None, *tile_args)
 
     def run(self, cell, *tile_args):
-        """cell: a checkpointed tile's [side], None until its forward picks one; None for an unpinned call."""
         side = cell[0] if cell is not None else None
         if side is None:
             side = "eager" if self.key in _EAGER_TILES else "compiled"
