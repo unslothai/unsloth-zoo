@@ -17,6 +17,7 @@
 """patch_trl_push_to_hub_token must never break TrainingArguments -> SFTConfig."""
 
 import copy
+import importlib.metadata
 import json
 import pickle
 
@@ -32,13 +33,30 @@ from unsloth_zoo.utils import Version  # noqa: E402
 from unsloth_zoo.temporary_patches import misc  # noqa: E402
 
 TF5 = Version(transformers.__version__) >= Version("5.0.0")
+TRL_BARE_POP = Version(trl.__version__) < Version("0.27.2")
+# Importing unsloth_zoo may already have patched to_dict for the installed TRL.
+UNPATCHED_TO_DICT = getattr(TrainingArguments.to_dict, "__wrapped__", TrainingArguments.to_dict)
 
 
 @pytest.fixture
 def patched(monkeypatch):
-    monkeypatch.setattr(TrainingArguments, "to_dict", TrainingArguments.to_dict)
+    monkeypatch.setattr(TrainingArguments, "to_dict", UNPATCHED_TO_DICT)
     misc.patch_trl_push_to_hub_token()
     yield
+
+
+@pytest.fixture(params = ["0.27.1", "0.27.2"])
+def patched_as_trl(request, monkeypatch):
+    # The patch reads the TRL version from package metadata; pretend another one is installed.
+    real_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: request.param if name == "trl" else real_version(name),
+    )
+    monkeypatch.setattr(TrainingArguments, "to_dict", UNPATCHED_TO_DICT)
+    misc.patch_trl_push_to_hub_token()
+    yield Version(request.param) < Version("0.27.2")
 
 
 def _args(tmp_path):
@@ -76,55 +94,48 @@ def _tiny_model_and_tokenizer():
     return LlamaForCausalLM(cfg), tok
 
 
-def test_patch_marks_to_dict_only_on_transformers_5(patched):
+def test_patch_only_on_transformers_5_with_bare_pop_trl(patched_as_trl):
     marked = getattr(TrainingArguments.to_dict, "_unsloth_patched", False)
-    assert marked == TF5
+    assert marked == (TF5 and patched_as_trl)
 
 
-def test_to_dict_does_not_gain_push_to_hub_token(patched, tmp_path):
+def test_bare_pop_trl_finds_push_to_hub_token(patched_as_trl, tmp_path):
     d = _args(tmp_path).to_dict()
-    if TF5:
+    if TF5 and not patched_as_trl:
         assert "push_to_hub_token" not in d
     else:
-        assert "push_to_hub_token" in d
+        # What TRL 0.22-0.27.1 do in SFTTrainer / IterativeSFTTrainer __init__.
+        d.pop("push_to_hub_token")
 
 
-def test_bare_pop_is_safe(patched, tmp_path):
-    # What TRL 0.22-0.27 do in SFTTrainer / IterativeSFTTrainer __init__.
-    d = _args(tmp_path).to_dict()
-    d.pop("push_to_hub_token")
-    assert "push_to_hub_token" not in d
-    with pytest.raises(KeyError):
-        d.pop("definitely_not_a_field")
-    assert d.pop("definitely_not_a_field", 7) == 7
-
-
-def test_to_dict_result_still_serialises(patched, tmp_path):
+def test_to_dict_result_still_serialises(patched_as_trl, tmp_path):
     a = _args(tmp_path)
     d = a.to_dict()
-    assert isinstance(d, dict)
-    plain = {**d}
-    assert type(plain) is dict
-    assert json.loads(json.dumps(d)) == json.loads(json.dumps(plain))
+    assert type(d) is dict
+    assert json.loads(json.dumps(d)) == d
     assert pickle.loads(pickle.dumps(d)) == d
     assert copy.deepcopy(d) == d
+    path = tmp_path / "args.pt"
+    torch.save(d, path)
+    assert torch.load(path, weights_only = True) == d
     json.loads(a.to_json_string())
     a.to_sanitized_dict()
 
 
-def test_patch_is_idempotent(patched):
+def test_patch_is_idempotent(patched_as_trl):
     first = TrainingArguments.to_dict
     misc.patch_trl_push_to_hub_token()
     assert TrainingArguments.to_dict is first
 
 
 def test_sft_config_from_to_dict(patched, tmp_path):
+    # The installed TRL's own conversion (SFTTrainer.__init__).
     from trl import SFTConfig
 
     a = _args(tmp_path)
     d = a.to_dict()
     d["hub_token"] = a.hub_token
-    if not TF5:
+    if not TF5 or TRL_BARE_POP:
         d.pop("push_to_hub_token")
     assert isinstance(SFTConfig(**d), SFTConfig)
 
