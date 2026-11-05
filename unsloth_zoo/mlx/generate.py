@@ -3982,6 +3982,8 @@ class _VLMBatchSession:
             return
         best = min(live, key = lambda batch: (parks(batch) < cap, left[id(batch)]), default = None)
         queued = generator._unprocessed_sequences
+        # mlx-vlm 0.7.12 queues in arrival order (earlier releases sorted by length), and admits queued[0].
+        queued.sort(key = _queued_tokens_left)
         # mlx-vlm admits by the rows decoding alone, so parked rows must still fit.
         room = cap - len(generator._generation_batch) - len(live)
         if queued and room > 0 and (

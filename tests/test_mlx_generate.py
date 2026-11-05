@@ -1696,6 +1696,12 @@ def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
     assert not _schedules_prefill(gen, GenerationDefaults(prefill_batch_size = 2))
     session._schedule_prefill()
     assert (gen._prompt_batch, session._parked) == (None, [long])  # mlx-vlm admits the short row
+    # mlx-vlm 0.7.12 queues rows as they arrive; the shortest still goes first.
+    gen._prompt_batch, session._parked = None, []
+    gen._unprocessed_sequences = [queued(4, 5000), queued(5, 20, columns = 300), queued(1, 100)]
+    session._schedule_prefill()
+    assert [sequence[0] for sequence in gen._unprocessed_sequences] == [1, 5, 4]
+    gen._prompt_batch, session._parked, gen._unprocessed_sequences = None, [long], [queued(1, 100)]
     gen._prompt_batch, gen._unprocessed_sequences = short, []
     session._schedule_prefill()
     assert gen._prompt_batch is short
