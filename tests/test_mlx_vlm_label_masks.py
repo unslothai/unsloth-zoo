@@ -3849,7 +3849,6 @@ def test_phi4mm_position_resize_matches_the_installed_release():
         grad = mx.grad(lambda t: patched(t, shapes, 20, training=True).sum())(table.astype(mx.float32))
         assert float(mx.abs(grad).sum()) > 0
     else:
-        # An earlier release's resize has no training path, so the keyword changes nothing.
         assert mx.array_equal(patched(table, shapes, 20, training=True), patched(table, shapes, 20)).item()
 
 
