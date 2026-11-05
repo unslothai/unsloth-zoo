@@ -3688,6 +3688,38 @@ def test_grpo_cce_compaction_matches_the_full_head(monkeypatch, loss_type, beta,
     assert all(np.allclose(got, want, rtol=1e-6) for got, want in zip(compacted(compact), score(full)))  # noqa: E501
 
 
+@pytest.mark.parametrize("loss_type", ["grpo", "dr_grpo", "dapo"])
+@pytest.mark.parametrize("spg", [2, 4])
+def test_grpo_length_grouping_keeps_every_window_gradient(monkeypatch, loss_type, spg):
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOObjective, grpo_layout_options
+    objective = GRPOObjective(loss_type, 0.0, max_completion_length=60)
+    (random, score, _), (grouped, regrouped, _) = (_grpo_window(monkeypatch, objective, [0.0, 1.0, 3.0, 1.0, 2.0, 0.5, 1.0, 4.0], iterations=2, steps_per_generation=spg, group_by_length=flag) for flag in (False, True))  # noqa: E501
+    for start in range(0, spg, 2):
+        assert all(np.allclose(got, want, rtol=1e-6) for got, want in zip(regrouped(grouped[start:start + 2])[:2], score(random[start:start + 2])[:2]))  # noqa: E501
+    widths = [[batch[0].shape[1] for batch in batches] for batches in (random, grouped)]
+    assert sum(widths[1]) < sum(widths[0]) if spg == 4 else sum(widths[1]) <= sum(widths[0])
+    assert [grpo_layout_options(GRPOObjective(name))["group_by_length"] for name in ("grpo", "bnpo", "dr_grpo", "dapo")] == [True, False, True, True]  # noqa: E501
+
+
+@pytest.mark.parametrize("loss_type", ["grpo", "dr_grpo", "dapo"])
+@pytest.mark.parametrize("iterations", [1, 2])
+def test_grpo_skips_only_micro_steps_without_gradient(monkeypatch, loss_type, iterations):
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOObjective, grpo_layout_options
+    tiny = float(np.nextafter(np.float32(0.01), np.float32(1)))  # zero std to TRL, yet a nonzero advantage
+    run = lambda skip: _grpo_window(monkeypatch, GRPOObjective(loss_type, 0.0, max_completion_length=60), [1.0, 1.0, 0.01, tiny], iterations=iterations, group_by_length=True, skip_zero_advantage=skip)  # noqa: E501, E731
+    (skipping, rescore, plan), (full, score, _) = run(True), run(False)
+    skipped = [index for index in range(len(skipping)) if plan.skipped_stats(index) is not None]
+    assert skipped == [1, 3][:iterations] and plan.pop_metrics()["frac_rows_skipped"] == 0.5
+    for start in range(0, len(skipping), 2):
+        got = rescore([batch for index, batch in enumerate(skipping) if start <= index < start + 2 and index not in skipped])
+        assert all(np.allclose(a, b, rtol=1e-6, atol=0) for a, b in zip(got[:2], score(full[start:start + 2])[:2]))
+        assert np.array_equal(plan.skipped_stats(start + 1), rescore([skipping[start + 1]])[2]) and np.abs(got[1]) > 0
+    options = [grpo_layout_options(GRPOObjective(name, beta), distributed=name == "dr_grpo")["skip_zero_advantage"] for name, beta in (("grpo", 0.0), ("bnpo", 0.0), ("dapo", 0.04), ("grpo", 0.04), ("dapo", 0.0), ("dr_grpo", 0.0))]  # noqa: E501
+    assert options == [True, False, False, False, True, False]
+
+
 def test_grpo_reward_models_are_scored_as_trl_scores_them(monkeypatch):
     import numpy as np
     import torch
@@ -4241,8 +4273,8 @@ def test_the_grpo_trainer_trains_logs_and_syncs_as_trl(tmp_path, monkeypatch, ca
     assert logged[0]["reward"] == 2.0 and plans[0]["sampling"].top_k == 7
     # TRL samples at generation_kwargs' temperature but scores at args.temperature.
     assert (plans[0]["sampling"].temperature, plans[0]["score_temperature"]) == (0.5, 1.0)
-    assert (plans[0]["scale_rewards"], plans[0]["shuffle"], plans[0]["seed"], plans[0]["with_reference"]) == (
-        "batch", False, 5, beta != 0)
+    assert (plans[0]["scale_rewards"], plans[0]["shuffle"], plans[0]["seed"], plans[0]["with_reference"], plans[0]["group_by_length"]) == (  # noqa: E501
+        "batch", False, 5, beta != 0, False)  # bnpo keeps its random grouping
 
 
 def test_a_grpo_run_resumes_by_generating_afresh_and_refuses_another_objective(tmp_path, monkeypatch):

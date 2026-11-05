@@ -634,6 +634,7 @@ from .grpo import (
     create_grpo_batch_plan,
     create_grpo_eval_plan,
     format_completions,
+    grpo_layout_options,
     grpo_objective,
     grpo_reward_funcs,
     grpo_sampling,
@@ -6508,6 +6509,19 @@ class MLXTrainer:
             toks_f = toks_f + 0  # see _local_grad_step
             return lvalue, toks, stats, (grad, toks_f), None
 
+        def _skipped_grpo_step(stats, prev_state, do_update):
+            """step_fn for a GRPO micro-step whose gradient is exactly zero: it still counts its one micro-step."""
+            toks = mx.array(1, dtype=mx.int32)
+            if prev_state is None:
+                grad, toks_f = tree_map(mx.zeros_like, model.trainable_parameters()), toks.astype(mx.float32)
+            else:
+                grad, toks_f = prev_state[0], prev_state[1] + 1
+            loss, stats = mx.array(0.0, dtype=mx.float32), mx.array(stats)
+            if not do_update:
+                return loss, toks, stats, (grad, toks_f), None
+            update = _apply_update_direct if _direct_single_step_update else _apply_update
+            return loss, toks, stats, None, update(grad, toks_f)
+
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = (
             compile_policy.mode != "eager"
@@ -8143,6 +8157,7 @@ class MLXTrainer:
 
             batch_error = None
             batch_data = None
+            _grpo_skip = None
             _stream_eager_batch = False
             try:
                 if batch_iter is not None:
@@ -8180,6 +8195,8 @@ class MLXTrainer:
                         batch_data = batches.prepare_cce_batch(
                             scheduled_index, batch_data,
                         )
+                    elif isinstance(batches, GRPOBatchPlan):
+                        _grpo_skip = batches.skipped_stats(scheduled_index)
                     batch_idx += 1
             except BaseException as e:
                 batch_error = e
@@ -8335,7 +8352,11 @@ class MLXTrainer:
                 _fire("on_pre_optimizer_step")
                 self._distributed_should_stop()
 
-            if _ddp_update_outside_step:
+            if _grpo_skip is not None:
+                lvalue, toks, stats, grad_accum_state, grad_norm = _skipped_grpo_step(
+                    _grpo_skip, grad_accum_state, do_update,
+                )
+            elif _ddp_update_outside_step:
                 lvalue, toks, stats, grad_accum_state, grad_norm = _run_ddp_local_step(
                     batch_data, grad_accum_state, do_update,
                 )
@@ -9798,7 +9819,9 @@ class MLXGRPOTrainer(MLXTrainer):
             with_reference=self._uses_reference(args),
             max_prompt_length=args.max_prompt_length, shuffle=args.shuffle_dataset,
             seed=args.seed, num_batches=num_batches, num_epochs=num_epochs,
-            **self._grpo_vision_options(),
+            **self._grpo_vision_options(), **grpo_layout_options(
+                grpo_objective(args), distributed=getattr(self, "distributed_world_size", 1) > 1,
+            ),
         )
         # A resumed run generates at once, so its widths are planned from there.
         resume = getattr(self, "_resume_from_checkpoint", None)

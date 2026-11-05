@@ -2021,6 +2021,45 @@ def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
 
 
 @metal_only
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_grpo_skipped_micro_step_opens_a_window_as_a_zero_gradient(tmp_path, monkeypatch, compiled):
+    """Skipped zero-advantage micro-steps, opening a window that live ones close and filling the next, update the model
+    as their real, exactly zero, gradients do."""
+    import types
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
+    from unsloth_zoo.mlx import generate as generate_module, grpo
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig, MLXGRPOTrainer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(snapshot_download("Qwen/Qwen3-0.6B", allow_patterns=["*.json", "*.txt"], local_files_only=True))  # noqa: E501
+    except Exception:
+        pytest.skip("Qwen/Qwen3-0.6B's tokenizer is not cached")
+    Qwen3ForCausalLM(Qwen3Config(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=16, vocab_size=len(tokenizer), tie_word_embeddings=True)).save_pretrained(tmp_path / "tiny")  # noqa: E501
+    tokenizer.save_pretrained(tmp_path / "tiny")
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, defaults=None: [
+        types.SimpleNamespace(token_ids=[100 + row % 3, 7], finish_reason="stop") for row in range(len(requests))])
+    skips, skipped_stats = [], grpo.GRPOBatchPlan.skipped_stats
+    def train(skip):
+        rewarded = []  # only the second generation has unequal rewards: the second window is skipped whole
+        reward = lambda completion_ids, **_: rewarded.append(1) or [float(c[0]) * (len(rewarded) == 2) for c in completion_ids]  # noqa: E731
+        monkeypatch.setattr(grpo.GRPOBatchPlan, "skipped_stats", skip)
+        model, tok = FastMLXModel.from_pretrained(str(tmp_path / "tiny"), load_in_4bit=False, max_seq_length=64)
+        model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, lora_dropout=0, max_seq_length=64)
+        trainer = MLXGRPOTrainer(model, tok, [{"prompt": f"Count apples {i}."} for i in range(4)], reward_funcs=reward, args=MLXGRPOConfig(  # noqa: E501
+            output_dir=str(tmp_path / f"run{len(skips)}"), max_steps=2, per_device_train_batch_size=2, num_generations=2, steps_per_generation=2, gradient_accumulation_steps=4,  # noqa: E501
+            max_completion_length=2, max_seq_length=64, loss_type="dapo", beta=0.0, learning_rate=1e-3, lr_scheduler_type="constant", warmup_steps=0,  # noqa: E501
+            logging_steps=1, seed=0, compile=compiled, shuffle_dataset=False))
+        trainer.train()
+        assert trainer._global_step == 2
+        return trainer, dict(tree_flatten(model.parameters()))
+    skipped = train(lambda self, index: skips.append(skipped_stats(self, index)) or skips[-1])
+    trained = train(lambda self, index: None)
+    assert [stats is not None for stats in skips] == [True, True, False, False, True, True, True, True]
+    assert any(mx.any(value != 0).item() for key, value in trained[1].items() if "lora_b" in key)
+    assert all(mx.array_equal(value, trained[1][key]).item() for key, value in skipped[1].items())
+
+
+@metal_only
 @pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
 def test_grpo_cce_scores_like_the_logits(head):
     from unsloth_zoo.mlx import grpo as g

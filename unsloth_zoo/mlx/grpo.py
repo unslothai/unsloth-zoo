@@ -18,6 +18,7 @@
 patches it on CUDA (unsloth_zoo.rl_replacements.grpo_compute_loss)."""
 
 import copy
+import math
 import sys
 import warnings
 from collections.abc import Mapping
@@ -627,6 +628,14 @@ class _RepeatSamplerOrder:
         return self._orders[epoch]
 
 
+def grpo_row_layout(order, block, key):
+    """order with each run of block rows stably sorted by key; a block is the rows of micro-steps that always share an
+    optimizer step, so every step trains the same rows."""
+    return np.concatenate([
+        sorted(order[start:start + block], key=key) for start in range(0, len(order), block)
+    ]).astype(order.dtype)
+
+
 @dataclass
 class _Generation:
     visit: int
@@ -638,6 +647,7 @@ class _Generation:
     ref: list | None
     generation_tokens: int
     media: list | None = None  # (prompt text, images) per row
+    skipped: dict | None = None
 
 
 class GRPOBatchPlan:
@@ -650,7 +660,8 @@ class GRPOBatchPlan:
         num_generations, batch_size, steps_per_generation, num_iterations,
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
-        processor=None, model_config=None, vision=False,
+        processor=None, model_config=None, vision=False, group_by_length=False, layout_block=1,
+        skip_zero_advantage=False,
     ):
         self._dataset = dataset
         self._tokenizer = tokenizer
@@ -674,6 +685,9 @@ class GRPOBatchPlan:
         self.max_seq_length = max_seq_length
         self.seed = seed
         self.counts_tokens = counts_tokens
+        self.group_by_length = group_by_length
+        self.skip_zero_advantage = skip_zero_advantage
+        self._layout_rows = batch_size * layout_block
         self.eos_id = int(tokenizer.eos_token_id)
         pad_id = getattr(tokenizer, "pad_token_id", None)
         self.pad_id = self.eos_id if pad_id is None else int(pad_id)
@@ -780,10 +794,13 @@ class GRPOBatchPlan:
         capacity = grpo_cce_capacity(len(lengths), width, *self._cce_bounds)
         return None if capacity is None else mx.array(grpo_cce_indices(lengths, width, capacity))
 
-    def _score(self, scorer, sequences, prompt_lengths, media):
+    def _score(self, scorer, sequences, prompt_lengths, media, skipped=()):
         values = []
         for start in range(0, len(sequences), self.batch_size):
             chunk = sequences[start:start + self.batch_size]
+            if start // self.batch_size in skipped:
+                values.extend(np.zeros(len(sequence) - 1, dtype=np.float32) for sequence in chunk)
+                continue
             width = self._planned(self._width(max(len(sequence) for sequence in chunk)))
             batch, lengths = self._pack(chunk, prompt_lengths[start:start + self.batch_size], width)
             inputs = self._inputs(batch, lengths, None if media is None else media[start:start + self.batch_size])
@@ -869,6 +886,20 @@ class GRPOBatchPlan:
         kept = ~truncated if self.mask_truncated_completions else np.ones_like(truncated)
         # Shuffled before scoring so each old/reference chunk is one micro-batch at its own width, and a first iteration's ratio is exactly 1 when eager.
         order = np.random.default_rng(_derived_seed(self.seed, visit, 1)).permutation(len(prompts))
+        # Exactly zero, not TRL's zero std: a rounded group mean leaves a tiny advantage that still has gradient.
+        dead = (advantages == 0) & self.skip_zero_advantage
+        if self.group_by_length or self.skip_zero_advantage:
+            order = grpo_row_layout(order, self._layout_rows, lambda row: (
+                dead[row], prompt_lengths[row] + lengths[row] if self.group_by_length else 0,
+            ))
+        skipped = {}
+        if self.skip_zero_advantage:
+            # The loss's stats for such rows: no KL, no clipping, and their masked completion lengths.
+            skipped = {
+                slot: np.array([0.0, (lengths * kept)[rows].mean(), 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                for slot, rows in enumerate(np.split(order, len(order) // self.batch_size)) if dead[rows].all()
+            }
+            self._record("frac_rows_skipped", len(skipped) * self.batch_size / len(order))
         sequences = [
             tuple(self._prompt_ids[prompts[row]]) + tuple(completion_ids[row]) for row in order
         ]
@@ -878,7 +909,7 @@ class GRPOBatchPlan:
         if self.with_old_logps:
             old = self._score(
                 lambda batch, lengths, indices: mx.stop_gradient(self._logps(self._model, batch, lengths, indices)),
-                sequences, prompt_lengths, media,
+                sequences, prompt_lengths, media, skipped,
             )
         if self.with_reference:
             ref = self._score(
@@ -891,7 +922,7 @@ class GRPOBatchPlan:
         return _Generation(
             visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
-            generation_tokens=int(lengths.sum()), media=media,
+            generation_tokens=int(lengths.sum()), media=media, skipped=skipped,
         )
 
     def _reencode(self, prompt, row):
@@ -971,6 +1002,13 @@ class GRPOBatchPlan:
         indices = self._cce_indices(lengths, width)
         return materialized if indices is None else (*materialized, indices)
 
+    def skipped_stats(self, index):
+        """Stats of a materialized micro-step whose rows all have advantage exactly 0, which the trainer counts unrun."""
+        generation = self._current
+        if generation is None or generation.visit != self._generation_start(index):
+            return None
+        return generation.skipped.get((index - generation.visit) % self.steps_per_generation)
+
     def __getitem__(self, index):
         return self.materialize(index)
 
@@ -1044,10 +1082,12 @@ def create_grpo_batch_plan(
     num_iterations, grad_accum, sampling, max_seq_length, score_temperature=None, scale_rewards="group",
     mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
     shuffle=True, seed=None, num_batches=None, num_epochs=None, processor=None, model_config=None,
+    group_by_length=False, skip_zero_advantage=False,
 ):
     """Encode prompts once and lay out TRL's RepeatSampler schedule; batch_size counts completions, a generation samples
     batch_size * steps_per_generation of them, num_generations per prompt; score_temperature defaults to the sampling
-    temperature; a VLM processor replaces tokenizer."""
+    temperature; a VLM processor replaces tokenizer; within each optimizer step group_by_length sorts rows by length and
+    skip_zero_advantage puts zero-advantage rows last."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
     prompt_ids, max_tokens, vision = _encode_grpo_prompts(
@@ -1090,6 +1130,8 @@ def create_grpo_batch_plan(
         with_old_logps=grad_accum % repeats != 0, with_reference=with_reference,
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
         processor=processor, model_config=model_config, vision=vision,
+        group_by_length=group_by_length, layout_block=math.gcd(steps_per_generation, grad_accum),
+        skip_zero_advantage=skip_zero_advantage,
     )
 
 
@@ -1156,6 +1198,17 @@ def grpo_objective(config):
         importance_sampling_level=config.importance_sampling_level,
         temperature=config.temperature, max_completion_length=config.max_completion_length,
     )
+
+
+def grpo_layout_options(objective, *, distributed=False):
+    """Layouts keeping the window gradient: bnpo normalizes per micro-batch, so it is not regrouped; a zero-advantage row
+    has no gradient only without a KL term, and a micro-step of such rows has loss 0 under every other normalizer."""
+    return {
+        "group_by_length": objective.loss_type != "bnpo",
+        "skip_zero_advantage": (
+            not distributed and objective.beta == 0 and objective.loss_type in ("grpo", "dapo", "dr_grpo")
+        ),
+    }
 
 
 def _is_torch_module(func):
