@@ -47,6 +47,7 @@ from .utils import (
     _finite_batch_schedule,
     _finite_text_pad_width,
     _get_processor_tokenizer,
+    _is_vlm_model,
     _mlx_rng_key,
     _normalize_mlx_messages,
     _normalize_seed,
@@ -231,16 +232,26 @@ def completion_logps(model, batch, temperature):
 
 
 def _shared_prefix_hidden(model, batch, prefix):
-    """_preference_hidden's states, zero over prefix: each group's leading tokens, run once for its consecutive rows."""
-    from .utils import _PrefixKVSlot, _get_text_backbone
+    """_preference_hidden's states, zero over prefix: each group's leading tokens (a vision batch, images included, for
+    a vision model), run once for its consecutive rows, whose own batch then needs only ids."""
+    from .utils import _forward_text_hidden_states, _get_text_backbone, _prefix_cache, _vlm_hidden_states
 
     backbone = _get_text_backbone(model)
     ids = _preference_ids(batch)
-    groups, shared = prefix.shape
-    recorded = [_PrefixKVSlot() for _ in backbone.layers]
-    backbone(prefix, cache=recorded)
-    extended = [_PrefixKVSlot(slot.recorded(), ids.shape[0] // groups, interleaved=True) for slot in recorded]
-    hidden = backbone(ids[:, shared:-1], cache=extended)
+    groups, shared = _preference_ids(prefix).shape
+    recorded = _prefix_cache(backbone)
+    if isinstance(prefix, Mapping):
+        _vlm_hidden_states(model, prefix, cache=recorded)
+    else:
+        backbone(prefix, cache=recorded)
+    extended = _prefix_cache(backbone, recorded, ids.shape[0] // groups, interleaved=True)
+    positions = {}
+    if isinstance(prefix, Mapping) and prefix.get("_unsloth_collated_position_ids"):
+        # The suffix is text, so MRoPE continues past the prompt's largest position on all axes, the image's included.
+        start = prefix["position_ids"].max(axis=-1, keepdims=True).max(axis=0, keepdims=True) + 1
+        steps = mx.repeat(start, ids.shape[0] // groups, axis=1) + mx.arange(ids.shape[1] - 1 - shared)
+        positions["position_ids"] = mx.broadcast_to(steps, (prefix["position_ids"].shape[0], *steps.shape[1:]))
+    hidden = _forward_text_hidden_states(model, ids[:, shared:-1], cache=extended, **positions)
     return mx.concatenate([mx.zeros((ids.shape[0], shared, hidden.shape[-1]), hidden.dtype), hidden], axis=1)
 
 
@@ -912,7 +923,8 @@ class GRPOBatchPlan:
         False when a family cannot be planned."""
         if self._families is not None:
             return True
-        if self._processor is None:
+        # An engaged shared prompt lays out whole groups per micro-step, which the surveyed families do not plan.
+        if self._processor is None or self._prefix:
             return False
         surveyed, entries = {}, []
         with _preserved_preprocessing_rng():
@@ -972,9 +984,12 @@ class GRPOBatchPlan:
             lengths[row] = (prompt_length, len(sequence))
         return batch, lengths
 
-    def _inputs(self, batch, lengths, media):
+    def _inputs(self, batch, lengths, media, ids_only=False):
         if self._processor is None:
             return mx.array(batch)
+        if ids_only:
+            mask = (np.arange(batch.shape[1])[None] < lengths[:, 1:]).astype(np.int32)
+            return {"input_ids": mx.array(batch), "attention_mask": mx.array(mask)}
         return _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
 
     def configure_cce_compaction(self, enabled=True):
@@ -990,19 +1005,32 @@ class GRPOBatchPlan:
         capacity = grpo_cce_capacity(len(lengths), width, *self._cce_bounds)
         return None if capacity is None else mx.array(grpo_cce_indices(lengths, width, capacity))
 
-    def _prefix_ids(self, batch, lengths):
+    def _prefix_ids(self, batch, lengths, media=None):
         """[groups, shared] leading prompt tokens each group's rows share, or None unless that cuts padded tokens by
-        _prefix_tokr; shared, a multiple of 32, stops short of the last prompt token, which predicts the completion."""
+        _prefix_tokr; shared, a multiple of 32, stops short of the last prompt token, which predicts the completion.
+        A vision model gets a vision batch of them with each group's images, which must all lie within them."""
         if not self._prefix:
             return None
+        size = self.num_generations
         rows, width = batch.shape
-        groups, shared = rows // self.num_generations, (int(lengths[:, 0].min()) - 1) // 32 * 32
-        if shared <= 0 or rows % self.num_generations or (
-            batch.reshape(groups, -1, width)[:, :, :shared] != batch[::self.num_generations, None, :shared]
+        groups, shared = rows // size, (int(lengths[:, 0].min()) - 1) // 32 * 32
+        if shared <= 0 or rows % size or (
+            batch.reshape(groups, -1, width)[:, :, :shared] != batch[::size, None, :shared]
         ).any():
             return None
         full, split = rows * (width - 1), groups * shared + rows * (width - 1 - shared)
-        return mx.array(batch[::self.num_generations, :shared]) if full >= self._prefix_tokr * split else None
+        if full < self._prefix_tokr * split:
+            return None
+        if self._processor is None:
+            return mx.array(batch[::size, :shared])
+        media = None if media is None else media[::size]
+        if media is not None and any(images for _, images in media):
+            # A media token past shared would leave its features without a place in the prompt that runs once.
+            tokens = generate_module._media_token_ids(self._model_config)
+            prompt = np.arange(shared, width)[None] < lengths[::size, :1]
+            if not tokens or np.isin(batch[::size, shared:], list(tokens))[prompt].any():
+                return None
+        return self._inputs(batch[::size, :shared], np.full((groups, 2), shared, dtype=np.int32), media)
 
     def _score(self, scorer, visit, sequences, prompt_lengths, media, skipped=()):
         values = []
@@ -1022,7 +1050,8 @@ class GRPOBatchPlan:
         width = self._planned(self._width(max(len(sequence) for sequence in chunk)), visit + start // self.batch_size)
         batch, lengths = self._pack(chunk, prompt_lengths[start:start + self.batch_size], width)
         media = None if media is None else media[start:start + self.batch_size]
-        return self._inputs(batch, lengths, media), lengths, width, self._prefix_ids(batch, lengths)
+        prefix = self._prefix_ids(batch, lengths, media)
+        return self._inputs(batch, lengths, media, ids_only=prefix is not None), lengths, width, prefix
 
     def _generation_family_drift(self, visit, sequences, prompt_lengths, media):
         """The first micro-batch of a generation whose vision family left its survey, found before any is scored."""
@@ -1262,8 +1291,10 @@ class GRPOBatchPlan:
             return mx.array(table)
 
         media = None if generation.media is None else generation.media[position:position + self.batch_size]
+        # The shared prompt carries each group's images, so the rows' own batch skips the processor.
+        prefix = self._prefix_ids(batch, lengths, media)
         materialized = (
-            self._inputs(batch, lengths, media), mx.array(lengths),
+            self._inputs(batch, lengths, media, ids_only=prefix is not None), mx.array(lengths),
             mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),
@@ -1277,7 +1308,7 @@ class GRPOBatchPlan:
         weights = generation.weights
         weights = None if weights is None else mx.array(weights[position:position + self.batch_size])
         if self._prefix:
-            return (*materialized, indices, weights, self._prefix_ids(batch, lengths))
+            return (*materialized, indices, weights, prefix)
         if weights is not None:
             return (*materialized, indices, weights)
         return materialized if indices is None else (*materialized, indices)
@@ -1521,7 +1552,8 @@ def grpo_prefix_grouping(config, *, distributed=False, model=None, announced=Non
     if config.prefix_grouper:
         message = problem and f"Unsloth MLX GRPO: prefix_grouper is off, since {problem}."
     else:
-        message = None if problem or not hint else _PREFIX_HINT.format(size)
+        text = _PREFIX_VLM_HINT if _is_vlm_model(model) else _PREFIX_HINT
+        message = None if problem or not hint else text.format(size)
     if message and message not in (announced or ()):
         if not config.prefix_grouper:
             print(message)
@@ -1543,8 +1575,15 @@ _PREFIX_HINT = (
     "prompts share enough tokens; measured at num_generations=8 on Qwen3 text: 19% (short prompts) to 59% (long "
     "prompts) less GRPO training time."
 )
+_PREFIX_VLM_HINT = (
+    "Unsloth: prefix_grouper=True would run each shared prompt and its images once for its {} completions, in "
+    "micro-batches whose prompts share enough tokens; measured at num_generations=8: 12% (Qwen3.5) to 47% (Gemma 4) "
+    "less GRPO training time on image prompts."
+)
 # mlx-lm stacks whose attention applies RoPE at cache.offset and masks through cache.make_mask on every layer.
 _PREFIX_MODEL_TYPES = ("llama", "qwen2", "qwen3")
+# mlx-vlm stacks whose caches the shared-prompt forward covers: qwen3_5's linear attention, gemma4's windows, K/V.
+_PREFIX_VLM_MODEL_TYPES = ("qwen3_5", "gemma4")
 
 
 def grpo_prefix_problem(model, scorer, max_seq_length, *, dropout_disabled=False):
@@ -1554,14 +1593,23 @@ def grpo_prefix_problem(model, scorer, max_seq_length, *, dropout_disabled=False
     if scorer is None:
         return "it scores through the runtime CCE head, which use_cce=False or this model's head rules out"
     backbone = utils._get_text_backbone(model)
-    model_type = getattr(model, "model_type", None)
-    if model_type not in _PREFIX_MODEL_TYPES or backbone is None:
-        return f"model_type={model_type!r} is not one of {', '.join(_PREFIX_MODEL_TYPES)}"
-    if utils._is_vlm_model(model) or getattr(model, "_unsloth_text_only_vlm", False):
-        return "it is a vision model or a text-only load of one, which this forward does not cover"
+    # mlx-vlm's qwen3_5 wrapper keeps its type only on its config.
+    model_type = getattr(model, "model_type", None) or utils._config_get(getattr(model, "config", None), "model_type")
+    types = _PREFIX_VLM_MODEL_TYPES if utils._is_vlm_model(model) else _PREFIX_MODEL_TYPES
+    if model_type not in types or backbone is None:
+        return (
+            f"model_type={model_type!r} is not one of {', '.join(_PREFIX_MODEL_TYPES)}, "
+            f"or {', '.join(_PREFIX_VLM_MODEL_TYPES)} as a vision model"
+        )
+    if getattr(model, "_unsloth_text_only_vlm", False):
+        return "it is a text-only load of a vision model, which this forward does not cover"
     ropes = utils._length_dependent_ropes(backbone)
     if ropes:
         return f"its RoPE ({', '.join(ropes)}) may depend on the forward's length, not only the position"
+    if utils._shared_kv_slot_count(model):
+        return "this mlx-vlm leaves its K/V sharing to Unsloth's own slots, which cannot hold a shared prompt"
+    if any(getattr(layer, "enable_moe", False) for layer in backbone.layers):
+        return "its mixture-of-experts layers are not covered"
     window = getattr(backbone, "sliding_window", None)
     if any(getattr(layer, "use_sliding", False) for layer in backbone.layers) and (window or 0) < max_seq_length:
         return f"its {window}-token sliding window is shorter than max_seq_length={max_seq_length}"

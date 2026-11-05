@@ -2129,11 +2129,14 @@ def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, v
 
 
 @metal_only
-def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch):
+@pytest.mark.parametrize("refused", [False, True])
+def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch, recwarn, refused):
     """Old log-probs score an image batch as the compiled step does: with a clip range of 1e-7, any other ratio clips."""
     import random, shutil, types, PIL.Image, mlx_vlm.utils, mlx_vlm.models.qwen3_5 as qwen3_5
     from huggingface_hub import snapshot_download
     from unsloth_zoo.mlx import generate as generate_module, trainer as mlx_trainer
+    if refused:
+        monkeypatch.setattr("unsloth_zoo.mlx.grpo._PREFIX_VLM_MODEL_TYPES", ())
     try:  # a tiny random Qwen3.5 from the real config and processor; the weights are never fetched
         source = snapshot_download("mlx-community/Qwen3.5-0.8B-4bit", allow_patterns=["*.json", "*.jinja"], local_files_only=True)
     except Exception:
@@ -2154,9 +2157,11 @@ def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch):
     model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
     trainer = mlx_trainer.MLXGRPOTrainer(FastMLXModel.get_peft_model(model, r=8, lora_alpha=8, lora_dropout=0, max_seq_length=1024), processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
         output_dir=str(tmp_path / "out"), max_steps=1, per_device_train_batch_size=4, gradient_accumulation_steps=2, num_generations=4, num_iterations=2, max_completion_length=8, max_seq_length=1024, loss_type="dapo",  # noqa: E501
-        beta=0.0, logging_steps=1, seed=3, compile=True, gradient_checkpointing=False, epsilon=1e-7, epsilon_high=1e-7),
+        beta=0.0, logging_steps=1, seed=3, compile=True, gradient_checkpointing=False, epsilon=1e-7, epsilon_high=1e-7, prefix_grouper=refused),  # noqa: E501
         reward_funcs=lambda completion_ids, **_: [float(len(c) + sum(c) % 7) for c in completion_ids])
     assert trainer.train()["compile_scope"] == "full_step"
+    # A refused model keeps compiled vision steps under prefix_grouper.
+    assert any("prefix_grouper is off, since model_type" in str(w.message) for w in recwarn) == refused
     assert [entry["clip_ratio/region_mean"] for entry in trainer.state.log_history if "clip_ratio/region_mean" in entry] == [0.0]
 
 
@@ -2275,7 +2280,7 @@ def test_grpo_shared_prefix_matches_each_row_alone(monkeypatch, family, checkpoi
     packed = np.zeros((len(rows), 128), dtype=np.int32)
     for index, row in enumerate(rows):
         packed[index, :len(row)] = row
-    prefix = g.GRPOBatchPlan._prefix_ids(SimpleNamespace(_prefix=True, num_generations=size, _prefix_tokr=1.0), packed, lengths)  # noqa: E501
+    prefix = g.GRPOBatchPlan._prefix_ids(SimpleNamespace(_prefix=True, num_generations=size, _prefix_tokr=1.0, _processor=None), packed, lengths)  # noqa: E501
     assert prefix.shape == (2, 32)
     logps, weights = g.grpo_logps(0.7, _make_preference_cce_scorer(model, temperature=0.7)), mx.array(rng.normal(size=(len(rows), 127)).astype(np.float32))  # noqa: E501
 
@@ -2305,6 +2310,114 @@ def test_grpo_shared_prefix_matches_each_row_alone(monkeypatch, family, checkpoi
         assert mx.allclose(values[index, :value.shape[0]], value, atol=1e-5).item() and not values[index, value.shape[0]:].any().item()  # noqa: E501
     for (name, want), (_, got) in zip(tree_flatten(alone[1]), tree_flatten(grads)):
         assert mx.abs(want).max().item() > 0 and mx.allclose(got, want, atol=1e-5, rtol=1e-4).item(), name
+
+
+def _undo_gated_delta_patches_after(monkeypatch):
+    """Restore the attributes the trainer's gated-delta patches rebind on every loaded mlx-lm / mlx-vlm model module."""
+    import importlib, sys
+    importlib.import_module("mlx_lm.models.gated_delta")
+    for key, module in list(sys.modules.items()):
+        if key.startswith(("mlx_lm.models", "mlx_vlm.models")):
+            for name in ("gated_delta_update", "_unsloth_gated_delta_original", "_unsloth_gated_delta_patched"):
+                absent = name not in vars(module)
+                monkeypatch.setattr(module, name, vars(module).get(name), raising=False)
+                if absent:  # teardown undoes both in reverse, leaving it absent again
+                    monkeypatch.delattr(module, name)
+
+
+_SHRUNK_VLM_STACKS = {
+    "qwen3_5": (dict(hidden_size=64, intermediate_size=128, num_hidden_layers=4, full_attention_interval=2, layer_types=["linear_attention", "full_attention"] * 2, num_attention_heads=2, num_key_value_heads=1, linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=32, linear_value_head_dim=32), dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=64)),  # noqa: E501
+    # A 24-token window bites on both sides of the prompt; layers 2 and 3 read layers 0 and 1's K/V.
+    "gemma4": (dict(hidden_size=64, intermediate_size=128, num_hidden_layers=4, layer_types=["sliding_attention", "full_attention"] * 2, num_kv_shared_layers=2, num_attention_heads=2, head_dim=32, global_head_dim=64, hidden_size_per_layer_input=16, sliding_window=24), dict(num_hidden_layers=1, hidden_size=32, intermediate_size=64, num_attention_heads=2, num_key_value_heads=2, head_dim=16, global_head_dim=16)),  # noqa: E501
+}
+
+
+@metal_only
+@pytest.mark.parametrize("repo,image,checkpointed", [("mlx-community/Qwen3.5-0.8B-4bit", False, True), ("mlx-community/Qwen3.5-0.8B-4bit", True, False), ("mlx-community/gemma-4-e2b-it-4bit", False, False), ("mlx-community/gemma-4-e2b-it-4bit", True, True)])  # noqa: E501
+def test_vision_grpo_shared_prefix_matches_each_row_alone(monkeypatch, tmp_path, repo, image, checkpointed):
+    # Catches rows missing their prompt's conv window or recurrent state, MRoPE read off the cache, windows or shared
+    # K/V misread across the prompt boundary, and image or prompt gradients that never reach the adapters.
+    import importlib, shutil, numpy as np, PIL.Image, mlx_vlm.utils
+    from types import SimpleNamespace
+    from huggingface_hub import snapshot_download
+    from unsloth_zoo.mlx import grpo as g
+    from unsloth_zoo.mlx.compile import model_has_gated_delta_layers
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm, patch_gated_delta_vlm_shared
+    from unsloth_zoo.mlx.preference import _make_preference_cce_scorer
+    try:  # the real config and processor, shrunk; the weights are never read
+        source = snapshot_download(repo, allow_patterns=["*.json", "*.jinja", "*.txt"], local_files_only=True)
+    except Exception:
+        pytest.skip(f"{repo}'s processor files are not cached")
+    shutil.copytree(source, checkpoint := tmp_path / "tiny", ignore=shutil.ignore_patterns("*.index.json", "*.safetensors", "README.md"))  # noqa: E501
+    config = {key: value for key, value in json.loads((checkpoint / "config.json").read_text()).items() if key not in ("quantization", "quantization_config", "audio_config")}  # noqa: E501
+    for part, shrunk in zip(("text_config", "vision_config"), _SHRUNK_VLM_STACKS[config["model_type"]]):
+        config[part].update(shrunk)
+    (checkpoint / "config.json").write_text(json.dumps(config))
+    module = importlib.import_module(f"mlx_vlm.models.{config['model_type']}")
+    mx.random.seed(3)
+    tiny = module.Model(mlx_vlm.utils.update_module_configs(module.ModelConfig.from_dict(params := dict(config)), module, params, ["text", "vision"]))  # noqa: E501
+    # A zero-initialized gate or norm would cut the path under test.
+    weights = {name: mx.random.normal(value.shape) * 0.02 if mx.issubdtype(value.dtype, mx.floating) and not value.any().item() else value for name, value in tree_flatten(tiny.parameters())}  # noqa: E501
+    mx.save_safetensors(str(checkpoint / "model.safetensors"), weights, {"format": "mlx"})
+    model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=512)
+    # The trainer's gated-delta kernels: rows given the prompt's state take the ops VJP.
+    _undo_gated_delta_patches_after(monkeypatch)
+    patch_gated_delta_vlm(), patch_gated_delta_vlm_shared(), patch_gated_delta()
+    model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=512, finetune_vision_layers=image, use_gradient_checkpointing=False)  # noqa: E501
+    for _, adapter in mlx_utils.iter_mlx_lora_modules(model):
+        adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.05
+    model.set_dtype(mx.float32)
+    model.train()
+    mx.eval(model.parameters())
+    rng, size, words = np.random.default_rng(5), 3, "the quick brown fox jumps over a lazy dog by the river bank".split()
+    prompts = [
+        (list(encoded[0]), encoded[1:3]) for encoded in (
+            g._encode_grpo_prompt(getattr(processor, "tokenizer", processor), {"prompt": [{"role": "user", "content": " ".join(rng.choice(words, count))}], "image": PIL.Image.new("RGB", (64, 64), (count * 3, 90, 160))}, processor, vision=True)  # noqa: E501
+            for count in (36, 47))
+    ] if image else [(rng.integers(3, 5000, count).tolist(), None) for count in (64, 77)]
+    rows = [prompt + rng.integers(3, 5000, n).tolist() for prompt, _ in prompts for n in rng.integers(5, 40, size)]
+    lengths = np.array([[len(prompts[index // size][0]), len(row)] for index, row in enumerate(rows)], dtype=np.int32)
+    media = [prompts[index // size][1] for index in range(len(rows))] if image else None
+    width = -(-max(map(len, rows)) // 32) * 32
+    packed = np.zeros((len(rows), width), dtype=np.int32)
+    for index, row in enumerate(rows):
+        packed[index, :len(row)] = row
+    vision = lambda batch, lengths, media: g._grpo_vision_batch(processor, model._config, batch, lengths, media)  # noqa: E731
+    plan = SimpleNamespace(_prefix=True, num_generations=size, _prefix_tokr=1.0, _processor=processor, _model_config=model._config, _inputs=vision)  # noqa: E501
+    prefix = g.GRPOBatchPlan._prefix_ids(plan, packed, lengths, media)
+    assert prefix is not None and prefix["input_ids"].shape[0] == 2 and ("pixel_values" in prefix) == image
+    temperature = 1.0 if config["model_type"] == "gemma4" else 0.7  # a softcapped head scores at temperature 1 only
+    scorer = _make_preference_cce_scorer(model, temperature=temperature)
+    logps, weights = g.grpo_logps(temperature, scorer), mx.array(rng.normal(size=(len(rows), width - 1)).astype(np.float32))  # noqa: E501
+    assert scorer is not None and g.grpo_prefix_problem(model, scorer, 512) is None
+
+    def each_row(model):
+        values = [logps(model, vision(np.array([row], dtype=np.int32), lengths[index:index + 1], media and media[index:index + 1]), mx.array(lengths[index:index + 1]))[0] for index, row in enumerate(rows)]  # noqa: E501
+        return sum((value * weights[index, :value.shape[0]]).sum() for index, value in enumerate(values)), values
+
+    def shared(model, batch, lengths, indices, prefix, weights):
+        values = logps(model, batch, lengths, indices, prefix)
+        return (values * weights).sum(), values
+
+    mx.eval(alone := nn.value_and_grad(model, each_row)(model))
+    if checkpointed:
+        mlx_utils.apply_gradient_checkpointing(model)
+    try:
+        batch = (g.GRPOBatchPlan._inputs(plan, packed, lengths, media, ids_only=True), mx.array(lengths), mx.array(g.grpo_cce_indices(lengths.tolist(), width, 1024)), prefix)  # noqa: E501
+        mx.eval(together := nn.value_and_grad(model, shared)(model, *batch, weights), scored := g._scored_as_step(logps, lambda: False)(model, *batch))  # noqa: E501
+    finally:
+        mlx_utils.remove_gradient_checkpointing(model)
+    (total, values), grads = together
+    assert mx.array_equal(scored, values).item()
+    assert abs(total.item() - alone[0][0].item()) < 1e-4
+    for index, value in enumerate(alone[0][1]):
+        assert mx.allclose(values[index, :value.shape[0]], value, atol=1e-5).item() and not values[index, value.shape[0]:].any().item()  # noqa: E501
+    # Relative to the largest entry (fp32 noise); worst seen 1.0e-4, and 3.2e-4 from the gated-delta kernel vs ops VJPs.
+    moved, bound = {}, 5e-4 if model_has_gated_delta_layers(model) else 3e-4
+    for (name, want), (_, got) in zip(tree_flatten(alone[1]), tree_flatten(grads)):
+        assert mx.abs(got - want).max().item() <= bound * mx.abs(want).max().item() + 1e-5, name
+        moved[name] = mx.abs(want).max().item() > 0
+    assert all(value for name, value in moved.items() if name.startswith("language_model")) and any(value for name, value in moved.items() if "vision" in name) == image  # noqa: E501
 
 
 @metal_only

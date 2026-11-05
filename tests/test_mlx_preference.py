@@ -3823,10 +3823,10 @@ def test_grpo_prefix_grouping_keeps_whole_groups_and_every_window_gradient(monke
     assert all(batch[9] is None for batch in run(True)[0])
 
 
-def test_grpo_prefix_grouping_gates_layouts_and_models(monkeypatch):
+def test_grpo_prefix_grouping_gates_layouts_and_models(monkeypatch, capsys):
     # Catches layouts moving rows across steps, uncovered models or RoPEs, LoRA dropout, and the environment default.
     from types import SimpleNamespace
-    from unsloth_zoo.mlx import grpo
+    from unsloth_zoo.mlx import grpo, utils as mlx_utils
     from unsloth_zoo.mlx.grpo import grpo_prefix_grouping, grpo_prefix_problem
     from unsloth_zoo.mlx.trainer import MLXGRPOConfig
     monkeypatch.delenv("UNSLOTH_GRPO_PREFIX_GROUPER", raising=False)
@@ -3851,6 +3851,17 @@ def test_grpo_prefix_grouping_gates_layouts_and_models(monkeypatch):
     assert grpo_prefix_grouping(config(disable_dropout=True), model=model("qwen2", keep=0.95))
     with pytest.warns(UserWarning, match="prefix_grouper is off, since model_type='gemma3'"):
         assert not grpo_prefix_grouping(config(), model=model("gemma3"))
+    vlm = lambda kind, moe=False, rope="ProportionalRoPE": SimpleNamespace(model_type=kind, language_model=SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(enable_moe=moe)] * 2, named_modules=ropes("RoPE", rope))), vision_tower=None, named_modules=lambda: lora(1.0))  # noqa: E501, E731
+    assert grpo_prefix_problem(vlm("qwen3_5", rope="Qwen3_5RotaryEmbedding"), print, 512) is None
+    assert grpo_prefix_problem(vlm("gemma4"), print, 512) is None
+    assert all(grpo_prefix_problem(m, print, 512) for m in (vlm("qwen2_5_vl"), vlm("gemma4", moe=True), vlm("gemma4", rope="SuScaledRoPE"), model("qwen3_5"), model("gemma4")))  # noqa: E501
+    capsys.readouterr()
+    assert not grpo_prefix_grouping(config(prefix_grouper=False), model=vlm("gemma4"))
+    assert "each shared prompt and its images once" in capsys.readouterr().out
+    assert not grpo_prefix_grouping(config(prefix_grouper=False), model=vlm("gemma4", moe=True))
+    assert capsys.readouterr().out == ""
+    monkeypatch.setattr(mlx_utils, "_shared_kv_slot_count", lambda model: 2)
+    assert "own slots" in grpo_prefix_problem(vlm("gemma4"), print, 512)
 
 
 def test_grpo_prefix_grouper_hints_when_admitted_and_gives_each_message_once_per_trainer(monkeypatch, capsys):
@@ -3915,6 +3926,67 @@ def test_grpo_bind_refuses_an_engaged_plan_without_a_scorer():
 
     with pytest.raises(ValueError, match="shared-prompt plan needs"):
         GRPOBatchPlan.bind(SimpleNamespace(with_reference=False, _prefix=True), None, [], trainer_state=None)
+
+
+def test_grpo_shared_prefix_vision_batches_hold_each_groups_images():
+    # Catches a prefix cutting an image or built from every row, completion tokens read as prompt, a compiled survey.
+    from types import SimpleNamespace
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOBatchPlan
+    calls = []
+    plan = SimpleNamespace(_prefix=True, num_generations=2, _prefix_tokr=1.0, _processor=object(), _model_config={"image_token_id": 9}, _inputs=lambda *args: calls.append(args) or "vision")  # noqa: E501
+    batch, lengths = np.repeat(np.arange(256, dtype=np.int32).reshape(2, 128) + 10, 2, axis=0), np.array([[70, 100]] * 4, dtype=np.int32)  # noqa: E501
+    batch[:, 3], batch[:, 90] = 9, 9
+    media = [("a", ("cat",)), ("a", ("cat",)), ("b", ("dog",)), ("b", ("dog",))]
+    assert GRPOBatchPlan._prefix_ids(plan, batch, lengths, media) == "vision"
+    (prefix, sizes, held), = calls
+    assert (prefix == batch[::2, :64]).all() and (sizes == 64).all() and sizes.shape == (2, 2) and held == media[::2]
+    batch[2:, 69] = 9
+    assert GRPOBatchPlan._prefix_ids(plan, batch, lengths, media) is None
+    batch[2:, 69] = 0
+    assert GRPOBatchPlan._prefix_ids(SimpleNamespace(**{**vars(plan), "_model_config": {}}), batch, lengths, media) is None  # noqa: E501
+    assert len(calls) == 1 and not GRPOBatchPlan.ensure_descriptors(SimpleNamespace(_families=None, _processor=object(), _prefix=True))  # noqa: E501
+
+
+def test_grpo_shared_prompt_rows_skip_the_processor():
+    # Catches rows' batches still processed (training or scoring) once the prefix carries images, or a fallback without.
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOBatchPlan, _Generation
+
+    calls = []
+
+    def inputs(batch, lengths, media, ids_only=False):
+        calls.append((batch.shape[1], None if ids_only else media))
+        return "batch"
+
+    plan = object.__new__(GRPOBatchPlan)
+    vars(plan).update(
+        _prefix=True, num_generations=2, _prefix_tokr=1.0, _processor=object(), _model_config={"image_token_id": 9},
+        batch_size=4, steps_per_generation=1, _anchor=0, _repeats=1, _families=None, _shape_plan=None,
+        _cce_bounds=None, max_seq_length=512, pad_id=0, _inputs=inputs,
+    )
+    # Two groups of two rows: 70 prompt tokens each, then 3 to 6 completion tokens.
+    sequences = [tuple(range(10 + 100 * (row // 2), 80 + 100 * (row // 2))) + (5,) * (3 + row) for row in range(4)]
+    media, lengths = [("a", ("cat",))] * 2 + [("b", ("dog",))] * 2, np.full(4, 70)
+    plan._current = _Generation(
+        visit=0, sequences=sequences, prompt_lengths=lengths, advantages=np.ones(4, np.float32),
+        kept=np.ones(4, np.int32), old=None, ref=None, generation_tokens=18, media=media,
+    )
+    width = plan._width(76)
+
+    def scorer(inputs, lengths, indices, prefix):
+        return np.zeros((4, width - 1), np.float32)
+
+    # The prefix carries each group's images once; the rows' batches are ids only, for training and for scoring.
+    assert plan.materialize(0)[-1] == "batch"
+    assert len(plan._score(scorer, 0, sequences, lengths, media)) == 4
+    assert calls == [(64, media[::2]), (width, None)] * 2
+    # An image token past the shared 64 tokens: no prefix, and the rows keep their images.
+    calls.clear()
+    plan._current.sequences = sequences = [s[:66] + (9,) + s[67:] for s in sequences]
+    assert plan.materialize(0)[-1] is None
+    assert len(plan._score(scorer, 0, sequences, lengths, media)) == 4
+    assert calls == [(width, media)] * 2
 
 
 def test_the_grpo_trainer_warns_each_refusal_once_on_every_rank_and_hints_on_main(tmp_path, monkeypatch, capsys):
