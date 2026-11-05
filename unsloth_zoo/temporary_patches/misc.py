@@ -2805,17 +2805,22 @@ def patch_trl_push_to_hub_token():
 
     TRL 0.22.x-0.27.1 bare-pop "push_to_hub_token" in SFTTrainer /
     IterativeSFTTrainer __init__, but transformers 5.0+ drops it from
-    to_dict(), so the pop raises KeyError.
+    to_dict(), so the pop raises KeyError. TRL 0.27.2+ pops it only below
+    transformers 5 and SFTConfig rejects the key, so skip the patch there.
     """
     try:
         from unsloth_zoo.utils import Version
+        import importlib.metadata
         import transformers
         if Version(transformers.__version__) < Version("5.0.0"):
             return  # Not needed pre-5.0, to_dict() already includes it
+        if Version(importlib.metadata.version("trl")) >= Version("0.27.2"):
+            return
         from transformers import TrainingArguments
         _original_to_dict = TrainingArguments.to_dict
         if getattr(_original_to_dict, "_unsloth_patched", False):
             return
+        @functools.wraps(_original_to_dict)
         def _patched_to_dict(self):
             d = _original_to_dict(self)
             if "push_to_hub_token" not in d:
