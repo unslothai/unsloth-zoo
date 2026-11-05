@@ -539,6 +539,30 @@ def test_for_training_and_get_peft_model_keep_every_n_layers():
     assert flags() == [True, True, True, True]
 
 
+def test_for_training_and_get_peft_model_switch_reentrant_checkpointing():
+    # transformers < 5 enables reentrant checkpointing by default: an explicit True still means Unsloth's non-reentrant
+    # setup, or a LoRA model whose inputs do not require grad fails in backward.
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    def reentrant():
+        return [
+            m._gradient_checkpointing_func.keywords.get("use_reentrant")
+            for m in model.modules() if "_gradient_checkpointing_func" in m.__dict__
+        ]
+    for step in ("for_training", "prepare"):
+        torch.manual_seed(0)
+        model = LlamaForCausalLM(LlamaConfig(vocab_size = 64, hidden_size = 32, intermediate_size = 64,
+                                             num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 4,
+                                             max_position_embeddings = 32))
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        assert set(reentrant()) == {True}
+        if step == "for_training":
+            FastCPUModel.for_training(model, use_gradient_checkpointing = True)
+        else:
+            FastCPUModel._prepare(model, "unsloth")
+        assert set(reentrant()) == {False}, step
+
+
 def test_zero_item_batch_gives_zero_gradients_not_nan():
     from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
     hidden = torch.randn(2, 4, 8, requires_grad = True)
