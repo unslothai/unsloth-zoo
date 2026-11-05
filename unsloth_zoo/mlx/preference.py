@@ -3298,8 +3298,12 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
                 prefix=None):
     """Score one DPO batch; ``reference`` holds precomputed reference log probabilities; ``prefix`` holds each pair's
     shared prompt tokens, run once for both rows by policy and reference alike."""
-    if reference is None and not objective.reference_free and _shares_image_features(model, batch, reference_policy):
-        batch = _with_image_features(model, batch, stop_gradient=True)
+    if reference is None and not objective.reference_free:
+        # Under a prefix the rows are ids only and the images ride in the prefix's vision batch.
+        if _shares_image_features(model, batch, reference_policy):
+            batch = _with_image_features(model, batch, stop_gradient=True)
+        elif _shares_image_features(model, prefix, reference_policy):
+            prefix = _with_image_features(model, prefix, stop_gradient=True)
     pairs = lengths.shape[0] // 2
     logits = logit_totals = None
     mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)

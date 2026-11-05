@@ -2115,19 +2115,24 @@ def _shrunk_vlm(path, family, train_tower):
 
 
 @metal_only
-@pytest.mark.parametrize("kind,family,checkpointed,compiled", [(kind, *case) for kind in ("dpo", "orpo", "cpo") for case in (("llama", False, True), ("llama", True, False), ("qwen2", True, True), ("qwen3", False, False), ("qwen3_5", True, False), ("gemma4", False, True))] + [("dpo", "qwen3_5:image", False, True), ("dpo", "gemma4:image", True, False)])  # noqa: E501
+@pytest.mark.parametrize("kind,family,checkpointed,compiled", [(kind, *case) for kind in ("dpo", "orpo", "cpo") for case in (("llama", False, True), ("llama", True, False), ("qwen2", True, True), ("qwen3", False, False), ("qwen3_5", True, False), ("gemma4", False, True))] + [("dpo", "qwen3_5:image:trained", False, True), ("dpo", "gemma4:image:trained", True, False), ("dpo", "qwen3_5:image:frozen", True, False), ("dpo", "gemma4:image:frozen", False, True), ("dpo", "gemma4:image:unfrozen", False, True), ("dpo", "qwen3_5:image:held", False, False), ("dpo", "qwen3_5:image:trained", False, False), ("dpo", "gemma4:image:ref-model", True, False)])  # noqa: E501
 def test_preference_shared_prompt_matches_each_row_alone(tmp_path, monkeypatch, kind, family, checkpointed, compiled):
     import importlib
     import numpy as np
     import PIL.Image
     from mlx_lm.tuner.lora import LoRALinear
     from unsloth_zoo.mlx import preference as p
-    (family, image), rng = (family.partition(":")[0], family.endswith(":image")), np.random.default_rng(11)
+    (family, image, tower), rng = (family.partition(":")[0], ":image" in family, family.rpartition(":")[2]), np.random.default_rng(11)  # noqa: E501
     mx.random.seed(11)
     if family == "qwen3_5" and nax.nax_available():
         pytest.skip("Qwen3.5's split term is capped at a fixed 3e-4 of each value, not measured on this device")
     if family in _SHRUNK_VLM_STACKS:
-        model, processor = _shrunk_vlm(tmp_path / "tiny", family, image)
+        model, processor = _shrunk_vlm(tmp_path / "tiny", family, train_tower=tower in ("trained", "held"))
+        # Each tower other than "frozen" trips exactly one rule against sharing its run, "trained" both.
+        if tower == "unfrozen":
+            model.vision_tower.unfreeze(keys=["weight"])
+        elif tower == "held":
+            [getattr(model, name).freeze() for name in ("vision_tower", "embed_vision") if hasattr(model, name)]
         words = "the quick brown fox jumps over a lazy dog by the river bank".split()
         rows = [{"prompt": [{"role": "user", "content": [{"type": "image"}] * image + [{"type": "text", "text": " ".join(words * k)}]}], "chosen": [{"role": "assistant", "content": " ".join(words[k:])}], "rejected": [{"role": "assistant", "content": " ".join(words[:k])}], "images": [PIL.Image.new("RGB", (64, 64), (k * 30, 90, 160))] * image} for k in (3, 4, 6)]  # noqa: E501
         plans = [p.create_preference_batch_plan(rows[::order], None, batch_size=3, length_policy=p.PreferenceLengthPolicy(kind, 512, None, None, "keep_end", 512), num_batches=1, grad_accum=1, dataset_order="sequential", processor=processor, model_config=model._config, shared_prompt_ratio=ratio) for order, ratio in ((1, None), (1, 1.0), (1, 1.0), (-1, None))]  # noqa: E501
@@ -2149,7 +2154,8 @@ def test_preference_shared_prompt_matches_each_row_alone(tmp_path, monkeypatch, 
     monkeypatch.setattr(type(plans[2]), "shared_prompt_length", lambda self, index: split - 16 if self is plans[2] else length(self, index))  # noqa: E501
     for plan in plans:
         plan.configure_cce_compaction(kind=kind)
-    policy = p.ReferencePolicy(scales=[(adapter, 0.0) for adapter in adapters]) if kind == "dpo" else None
+    reference = {"model": _shrunk_vlm(tmp_path / "ref", family, train_tower=False)[0]} if tower == "ref-model" else {"scales": [(adapter, 0.0) for adapter in adapters]}  # noqa: E501
+    policy = p.ReferencePolicy(**reference) if kind == "dpo" else None
     objective = p.resolve_preference_objective(kind, beta=0.2, **{"dpo": {"loss_type": ["sigmoid", "ipo"]}, "cpo": {"loss_type": "simpo", "alpha": 0.1}}.get(kind, {}))  # noqa: E501
     loss = getattr(p, f"make_{kind}_cce_loss_fn")(model, objective, **({"reference_policy": policy} if policy else {}))
     shared, run_shared = [], p._shared_prompt_hidden
@@ -2160,7 +2166,11 @@ def test_preference_shared_prompt_matches_each_row_alone(tmp_path, monkeypatch, 
         mlx_utils.apply_gradient_checkpointing(model)
     try:
         run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state) if compiled else (lambda *b: grad(model, *b))  # noqa: E501
+        towers, vision = [], type(getattr(model, "vision_tower", None))
+        if image:
+            monkeypatch.setattr(vision, "__call__", lambda self, *a, call=vision.__call__, **k: towers.append(1) or call(self, *a, **k))  # noqa: E501
         mx.eval(together := run(*plans[1].prepare_cce_batch(0, plans[1][0])))
+        assert len(towers) == image * (1 if tower == "frozen" else 2)
         mx.eval(moved := run(*plans[0].prepare_cce_batch(0, plans[0][0])))  # the per-row path in this run's mode
     finally:
         mlx_utils.remove_gradient_checkpointing(model)
