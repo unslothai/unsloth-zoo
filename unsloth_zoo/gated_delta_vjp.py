@@ -231,11 +231,12 @@ _WARNED_FOREIGN_GATED_DELTA: set[str] = set()
 
 def _is_training_call(state, use_kernel):
     """An empty cache does not mark a training call (prefill has one too); callers pass use_kernel=not self.training,
-    but GLM-5.x passes neither, so an open training window decides."""
-    if state is not None:
-        return False
-    if not use_kernel:
+    but GLM-5.x passes neither, so an open training window decides. A given state trains only in a training-mode
+    layer inside the window: a shared-prompt forward continuing from the prompt's recorded state."""
+    if state is None and not use_kernel:
         return True
+    if state is not None and use_kernel:
+        return False
     # Absolute import (enforced by test_relative_imports_resolve.py): custom_object_save copies this file beside a
     # checkpoint, where mlx.utils.py does not exist; lazy since it runs once per layer per decode step, so pure
     # inference skips unsloth_zoo.mlx.utils unless a call site is ambiguous.
@@ -427,11 +428,11 @@ def patch_gated_delta_vlm():
             )
         beta = mx.sigmoid(b)
         g = gated_delta.compute_g(A_log, a, dt_bias)
-        B, _, Hk, Dk = q.shape
-        Hv, Dv = v.shape[-2:]
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
         if gated_delta_kernel_supported(q, g, mask, v, k):
             return gated_delta_kernel_efficient(q, k, v, g, beta, state, mask)
+        if state is not None:
+            return original_update(q, k, v, a, b, A_log, dt_bias,
+                                   state=state, mask=mask, use_kernel=use_kernel, **kwargs)
         return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
     vlm_gated_delta.gated_delta_update = patched_vlm_gated_delta_update
@@ -473,11 +474,11 @@ def patch_gated_delta_vlm_shared():
         beta = mx.sigmoid(b)
         g = (vlm_gated_delta.compute_g(A_log, a, dt_bias) if lower_bound is None
              else vlm_gated_delta.compute_g_safe(A_log, a, dt_bias, lower_bound))
-        B, Dk = q.shape[0], q.shape[-1]
-        Hv, Dv = v.shape[-2:]
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
         if gated_delta_kernel_supported(q, g, mask, v, k):
             return gated_delta_kernel_efficient(q, k, v, g, beta, state, mask)
+        if state is not None:
+            return original_update(q, k, v, a, b, A_log, dt_bias,
+                                   state=state, mask=mask, use_kernel=use_kernel, **kwargs)
         return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
     vlm_gated_delta.gated_delta_update = patched_shared_gated_delta_update
