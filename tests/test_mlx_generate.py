@@ -1541,7 +1541,6 @@ _STEP = "class GenerationBatch:\n    def _step(self):\n        return {}\n"
 
 @pytest.mark.parametrize("source, draws", [
     (_DRAW + _STEP.format("_sample_with_positions(self.sampler, None, row_ids=[0], positions=[1])"), True),
-    # mlx-vlm 0.7.12 draws through a helper; it counts only while both forward the positions.
     (_DRAW + _HELPER.format("positions") + _STEP.format("_sample_batch_tokens(None, self.sampler, positions=[1])"), True),
     (_DRAW + _HELPER.format("None") + _STEP.format("_sample_batch_tokens(None, self.sampler, positions=[1])"), False),
     (_DRAW + _HELPER.format("positions") + _STEP.format("_sample_batch_tokens(None, self.sampler, positions=None)"), False),
@@ -1566,7 +1565,6 @@ _ADMIT = (
 
 @pytest.mark.parametrize("method, override, open_", [
     ("_next", "_generate_module_override", True),
-    # mlx-vlm 0.7.12 admits prompts in `_prefill_step` and has no `_next`.
     ("_prefill_step", "_generate_module_override", True),
     ("_prefill_step", "getattr", False),
 ])
@@ -1651,7 +1649,6 @@ class BatchKVCache:
         cache.offset = cache.keys.shape[2]
         return cache
 """
-# mlx-vlm 0.7.12 bounds-checks the row and returns an empty cache before the first write; rows slice alike.
 _EXTRACT_0712 = _EXTRACT_0711.replace("        padding =", """\
         batch_size = self.offset.size
         if idx < 0:

@@ -2572,8 +2572,7 @@ def _row_prefill_batch_class(base):
             step = getattr(self, "prefill_step_size", None)
             done, crossed = self._unsloth_done, ()
             if row is not None and step:
-                # mlx-vlm 0.7.12 resizes chunks every step (256 while peers decode), so a chunk can step over a
-                # checkpoint. A chunk already ending on one is left whole: dense policies would go token by token.
+                # mlx-vlm 0.7.12 resizes chunks per step; split only a chunk ending on no checkpoint (dense policies stay whole).
                 embeds = getattr(self, "_inputs_embeds", None)
                 end = done + (step if embeds is None else min(step, embeds.shape[1] - 1))
                 if end not in row.lengths:

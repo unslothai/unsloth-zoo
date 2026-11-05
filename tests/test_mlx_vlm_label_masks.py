@@ -3841,7 +3841,6 @@ def test_phi4mm_position_resize_matches_the_installed_release():
     patched = vision.VisionEmbeddings.resize_positional_embeddings
     table = mx.random.normal((8, 8, 4), key=mx.random.key(0)).astype(mx.bfloat16)
     shapes = [(3, 5), (6, 2)]
-    # mlx-vlm 0.7.12 passes `training` and resizes with differentiable ops under it.
     trains = "training" in inspect.signature(native).parameters
     for options in ({"training": False}, {"training": True}) if trains else ({},):
         expected = native(table, mx.array(shapes), 20, **options)

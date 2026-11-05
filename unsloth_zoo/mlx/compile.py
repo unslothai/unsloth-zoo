@@ -2855,7 +2855,7 @@ def _qwen3_mixed_prompt_batch_adapter(original):
                 (*sequence[:3], row_kwargs, *sequence[4:])
                 for sequence, row_kwargs in zip(sequences, padded_rows)
             ]
-        # mlx-vlm 0.7.12 also passes the rows' APC picks, one per sequence in order.
+        # mlx-vlm 0.7.12 also passes `picks=`.
         batch = original(self, sequences, *args, **kwargs)
         prompt_kwargs = getattr(batch, "_prompt_kwargs", None)
         if prompt_kwargs is not None:

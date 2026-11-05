@@ -3464,7 +3464,6 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
         object(),
         [(None, None, None, visual_row), (None, None, None, text_row)],
     )._prompt_kwargs["_unsloth_qwen3_visual_width"].tolist() == [9, 9]
-    # mlx-vlm 0.7.12 hands over the rows' APC picks.
     apc(object(), [(None, None, None, text_row)], picks=["pick"])
     assert built == [None, ["pick"]]
     apc_masks, apc_embeds = mc._qwen3_visual_window(

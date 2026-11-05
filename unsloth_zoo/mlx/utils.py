@@ -969,8 +969,7 @@ def _patch_layer_class_for_gc(layer_cls):
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
                     args, kwargs["shared_kv"])
             outer = (args, kwargs)
-            # A layer may write into a dict it shares with later layers (Mistral Large 4's shared K/V); the
-            # checkpoint hands it a copy, so those writes return as traced results and land in the caller's dict.
+            # Mistral Large 4 writes K/V into a dict later layers read; the checkpoint copies it, so return the writes.
             shared = [i for i, a in enumerate(args) if isinstance(a, dict)]
             wrote = False
 
