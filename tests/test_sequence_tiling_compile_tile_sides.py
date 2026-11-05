@@ -198,8 +198,7 @@ class _GuardChurnMLP(GatedMLP):
 
 @pytest.mark.parametrize("train", [True, False])
 def test_a_tile_frame_past_the_recompile_limit_runs_eager(monkeypatch, train):
-    # fullgraph=True turns the recompile limit into FailOnRecompileLimitHit, which is not a TorchDynamoException;
-    # without fullgraph Dynamo ran the frame eagerly. The tile must fall back to eager, not raise.
+    # fullgraph=True raises FailOnRecompileLimitHit (not a TorchDynamoException); the tile must run eagerly.
     monkeypatch.setenv("UNSLOTH_TILED_COMPILE", "compile_tile")
     limit = "recompile_limit" if "recompile_limit" in torch._dynamo.config._config else "cache_size_limit"  # torch 2.6
     with torch._dynamo.config.patch(**{limit: 2}):
@@ -246,8 +245,7 @@ class _RefuseTemporaryPatches:
 
 
 def test_a_tile_does_not_import_temporary_patches(monkeypatch):
-    # The CPU backend never loads temporary_patches. Importing it from inside the first tile's forward applied its
-    # patches between that forward and its recompute: CheckpointError (unsloth's tiled Qwen3 MLP on CPU, 54 vs 53).
+    # Importing temporary_patches mid-tile patches between forward and recompute: CheckpointError on CPU.
     for name in [m for m in sys.modules if m.startswith("unsloth_zoo.temporary_patches")]:
         monkeypatch.delitem(sys.modules, name)
     finder = _RefuseTemporaryPatches()

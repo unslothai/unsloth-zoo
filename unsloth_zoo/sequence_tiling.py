@@ -67,9 +67,7 @@ pass
 
 
 def _block_inline_flag():
-    """UNSLOTH_DECODE_COMPILE, set by block compile and read by MoE expert forwards; recomputes run outside the block.
-    Looked up, never imported: importing temporary_patches inside a tile's forward patches its recompute (CPU backend
-    tiled Qwen3 MLP CheckpointError). The block compile imports it before setting the flag."""
+    """Looked up, never imported: importing temporary_patches mid-tile patches its recompute (CheckpointError)."""
     return getattr(sys.modules.get("unsloth_zoo.temporary_patches.utils"), "UNSLOTH_DECODE_COMPILE", None)
 pass
 
