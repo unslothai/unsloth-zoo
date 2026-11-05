@@ -1236,32 +1236,39 @@ def _patch_padding_free_mixer(mixer_cls):
     return True
 
 
-def install_padding_free(model):
-    """Route each decoder layer's token mixer through per-row padding inside padding-free forwards; returns the patched
-    classes for remove_padding_free. Outside a padding-free batch the patched mixers run unchanged."""
+def padding_free_mixer_classes(model):
+    """(token-mixer classes, None) for a model padding-free supports, else (None, the reason it does not)."""
     config = getattr(model, "_config", None) or getattr(model, "config", None)
     model_type = _config_get(config, "model_type") if config is not None else None
     model_type = model_type or getattr(model, "model_type", None)
     layers = _get_transformer_layers(model)
     vlm = _is_vlm_model(model)
     if model_type not in (_PADDING_FREE_VLM_MODEL_TYPES if vlm else _PADDING_FREE_MODEL_TYPES) or not layers:
-        raise NotImplementedError(
-            f"Unsloth MLX: padding_free=True is not supported for model_type={model_type!r}; supported text "
-            f"families: {', '.join(sorted(_PADDING_FREE_MODEL_TYPES))}; vision families: "
-            f"{', '.join(sorted(_PADDING_FREE_VLM_MODEL_TYPES))}. Set padding_free=False.")
+        return None, (
+            f"model_type={model_type!r} is not supported; supported text families: "
+            f"{', '.join(sorted(_PADDING_FREE_MODEL_TYPES))}; vision families: "
+            f"{', '.join(sorted(_PADDING_FREE_VLM_MODEL_TYPES))}")
     if vlm and _shared_kv_slot_count(model):
         # Cache slots would carry K/V across the flat and padded layouts.
-        raise NotImplementedError(
-            "Unsloth MLX: padding_free=True needs an mlx-vlm that threads Gemma 4 shared K/V itself (0.5.0+).")
+        return None, "it needs an mlx-vlm that threads Gemma 4 shared K/V itself (0.5.0+)"
     mixer_classes = []
     for layer in layers:
         mixers = [getattr(layer, name) for name in _PADDING_FREE_MIXERS
                   if isinstance(getattr(layer, name, None), nn.Module)]
         if len(mixers) != 1:
-            raise NotImplementedError(
-                f"Unsloth MLX: padding_free=True cannot find the token mixer of {type(layer).__name__}.")
+            return None, f"it cannot find the token mixer of {type(layer).__name__}"
         if type(mixers[0]) not in mixer_classes:
             mixer_classes.append(type(mixers[0]))
+    return mixer_classes, None
+
+
+def install_padding_free(model):
+    """Route each decoder layer's token mixer through per-row padding inside padding-free forwards; returns the patched
+    classes for remove_padding_free. Outside a padding-free batch the patched mixers run unchanged.
+    The patches are process-global and assume one training run at a time; nested and sequential runs are safe."""
+    mixer_classes, reason = padding_free_mixer_classes(model)
+    if reason is not None:
+        raise NotImplementedError(f"Unsloth MLX: padding_free=True: {reason}.")
     return [cls for cls in mixer_classes if _patch_padding_free_mixer(cls)]
 
 
@@ -6694,15 +6701,15 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
             if capacity * 2 <= tokens:
                 self._cce_capacities[family, width] = capacity
 
-    def configure_padding_free(self, enabled=True):
+    def configure_padding_free(self, enabled=True, indices=None):
         """Fix one flat-token capacity per admitted (family, width), like CCE compaction, so padding-free adds no
-        compiled variants; returns (padding-free shapes, all shapes)."""
+        compiled variants; returns (padding-free shapes, all shapes). `indices` limits it to those batches."""
         self._padding_free_capacities = {}
         if not enabled:
             return 0, 0
         counts = {}
-        for index, batch_indices in enumerate(self._schedule):
-            family = self.batch_family(index)
+        for index in range(len(self._schedule)) if indices is None else indices:
+            batch_indices, family = self._schedule[index], self.batch_family(index)
             widths = {self.batch_width(index)}
             if self._shape_plan is not None:
                 widths.add(self._shape_plan.endpoint_for(family, min(widths)))
@@ -11033,17 +11040,17 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._shape_plan = replace(plan, raw_catalog=raw, planned_catalog=planned, report=report)
         return report
 
-    def configure_padding_free(self, enabled=True):
+    def configure_padding_free(self, enabled=True, indices=None):
         """Fix one flat-token capacity per (family, width) from the surveyed real-token counts, as FiniteTextBatchPlan
-        does; returns (padding-free shapes, all shapes)."""
+        does; returns (padding-free shapes, all shapes). `indices` limits it to those batches."""
         self._padding_free_capacities = {}
         self._padding_free_dense.clear()
         if not enabled:
             return 0, 0
         self.ensure_descriptors()
         counts = {}
-        for index, batch_rows in enumerate(self._schedule):
-            family, tokens = self.batch_family(index), self._real_tokens[index]
+        for index in range(len(self._schedule)) if indices is None else indices:
+            batch_rows, family, tokens = self._schedule[index], self.batch_family(index), self._real_tokens[index]
             widths = {self._widths[index]}
             if self._shape_plan is not None:
                 widths.add(self._shape_plan.endpoint_for(family, self._planned_widths[index]))

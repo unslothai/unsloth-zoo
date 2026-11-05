@@ -3,10 +3,13 @@ gradient-driven progress and adapter saving across grad-clip paths, decoupled we
 baseline losses."""
 
 import contextlib
+import dataclasses
 import glob
 import importlib
 import json
 import os
+import types
+import warnings
 
 import numpy as np
 import pytest
@@ -3973,6 +3976,133 @@ def test_rows_stay_independent_in_the_flat_stream(family, monkeypatch):
         assert leak(0, slice(39, 74)) < 1e-6 and leak(1, slice(0, 39)) < 1e-6
         monkeypatch.setattr(mlx_utils, "_padding_free_mixer_forward", lambda orig, m, x, _, a, k: orig(m, x, *a, **k))
         assert leak(0, slice(39, 74)) > 1e-3
+
+
+def _pf_text_plan(lengths, schedule=None):
+    rows = [mlx_utils._FiniteTextRow((1,) * n, 0, None) for n in lengths]
+    return mlx_utils.FiniteTextBatchPlan(rows, schedule or [tuple(range(len(rows)))], max_seq_length=256, pad_id=0)
+
+
+def _pf_configure(trainer, model, batches, enabled, loss, teacher=None, world_size=1, vlm=False, main=True):
+    # The stub trainer's rank state, as _ensure_distributed caches it, so a rank check in the code under test sees it.
+    trainer._distributed_initialized, trainer._distributed_world = True, None
+    trainer._distributed_rank, trainer._distributed_world_size = (0 if main else 1), world_size
+    trainer._distributed_is_main_process = main
+    args = types.SimpleNamespace(padding_free=enabled, teacher_model_name_or_path=teacher)
+    return trainer._configure_padding_free(args=args, model=model, batches=batches, loss_fn=loss, is_vlm=vlm,
+                                           world_size=world_size, main_print=print if main else lambda *args: None)
+
+
+@dataclasses.dataclass
+class _PFCase:
+    enabled: bool
+    packs: bool = False
+    warns: str = None
+    prints: str = None
+    family: str = "llama"
+    lengths: tuple = tuple(_PF_LENGTHS)
+    kind: str = None
+    teacher: str = None
+    world_size: int = 1
+    vlm: bool = False
+    stream: bool = False
+    main: bool = True
+    patches: tuple = ()  # (attribute of unsloth_zoo.mlx.utils, value)
+
+
+_PF_FILLED = (40,) * 4  # every row fills its span: nothing to pack
+_PF_CASES = [
+    pytest.param(_PFCase(True, packs=True, prints="padding-free SFT runs 1 of 1"), id="packs"),
+    pytest.param(_PFCase(True, lengths=_PF_FILLED, prints="no batch shape would save"), id="nothing-packs"),
+    pytest.param(_PFCase(True, family="phi3", warns="model_type='phi3'"), id="refused-model"),
+    pytest.param(_PFCase(True, family="gemma4", warns="shared K/V",
+                       patches=(("_shared_kv_slot_count", lambda model: 1),)), id="refused-old-mlx-vlm"),
+    pytest.param(_PFCase(True, warns="cannot find the token mixer", patches=(("_PADDING_FREE_MIXERS", ()),)),
+                 id="refused-no-mixer"),
+    pytest.param(_PFCase(True, kind="dpo", warns="implemented for SFT only"), id="refused-preference"),
+    pytest.param(_PFCase(True, teacher="t", warns="GKD and distributed"), id="refused-gkd"),
+    pytest.param(_PFCase(True, world_size=2, warns="GKD and distributed"), id="refused-distributed"),
+    pytest.param(_PFCase(True, world_size=2, main=False, warns="GKD and distributed"),
+                 id="refused-distributed-other-rank"),
+    pytest.param(_PFCase(True, vlm=True, warns="fused CCE"), id="refused-vlm-without-cce"),
+    pytest.param(_PFCase(True, stream=True, warns="sized dataset"), id="refused-stream"),
+    pytest.param(_PFCase(False, prints="padding_free=True would pack"), id="off-hint"),
+    pytest.param(_PFCase(False, family="phi3"), id="off-unsupported"),
+    pytest.param(_PFCase(False, kind="dpo"), id="off-preference"),
+    pytest.param(_PFCase(False, lengths=_PF_FILLED), id="off-nothing-packs"),
+]
+
+
+@metal_only
+@pytest.mark.parametrize("case", _PF_CASES)
+def test_padding_free_applies_or_says_once_why_not(case, capsys, monkeypatch):
+    for name, value in case.patches:
+        monkeypatch.setattr(mlx_utils, name, value)
+    model = _pf_vlm("gemma4") if case.family == "gemma4" else _pf_model(case.family)
+    trainer = object.__new__(MLXTrainer)
+    trainer.preference_kind = case.kind
+    plan = _pf_text_plan(case.lengths)
+    plan.configure_padding_free()  # packed, as a plan reused from an earlier run may be
+    batches = [plan[0]] if case.stream else plan
+    loss = lambda *args: args
+    kwargs = dict(teacher=case.teacher, world_size=case.world_size, vlm=case.vlm, main=case.main)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.resetwarnings()  # no filters: Python's default action, once per location and registry
+        returned = _pf_configure(trainer, model, batches, case.enabled, loss, **kwargs)
+        mlx_utils.remove_padding_free(getattr(trainer, "_padding_free_classes", ()))
+        _pf_configure(trainer, model, batches, case.enabled, loss, **kwargs)
+        mlx_utils.remove_padding_free(getattr(trainer, "_padding_free_classes", ()))
+    refusals = [w for w in caught if w.category is UserWarning]
+    mixers = mlx_utils.padding_free_mixer_classes(model)[0] or ()
+    assert not any("_unsloth_padding_free_call" in vars(cls) for cls in mixers)
+    printed = capsys.readouterr().out
+    assert (returned is not loss) == case.packs
+    assert bool(getattr(batches, "_padding_free_capacities", None)) == case.packs
+    assert len(refusals) == (case.warns is not None)
+    if case.warns:
+        assert case.warns in str(refusals[0].message)
+    if case.prints:
+        assert printed.count(case.prints) == (2 if case.packs else 1), printed
+    else:
+        assert printed == "", printed
+
+
+@metal_only
+def test_padding_free_messages_do_not_hide_each_other(capsys):
+    model, plan, loss = _pf_model("llama"), _pf_text_plan(_PF_LENGTHS), lambda *args: args
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.resetwarnings()
+        first, second = object.__new__(MLXTrainer), object.__new__(MLXTrainer)
+        # hint then refusal on one trainer, refusal then hint on another
+        _pf_configure(first, model, plan, False, loss)
+        _pf_configure(first, model, plan, True, loss, teacher="t")
+        _pf_configure(second, model, plan, True, loss, teacher="t")
+        _pf_configure(second, model, plan, False, loss)
+    assert capsys.readouterr().out.count("padding_free=True would pack") == 2
+    assert len([w for w in caught if w.category is UserWarning]) == 2
+
+
+@metal_only
+def test_padding_free_refusal_raises_on_every_run_and_rank_under_the_error_filter():
+    trainer, model, loss = object.__new__(MLXTrainer), _pf_model("phi3"), lambda *args: args
+    with warnings.catch_warnings():
+        # UserWarning only: a SWIG DeprecationWarning raised inside a lazy import breaks that module, and the
+        # interpreter then crashes at exit.
+        warnings.simplefilter("error", UserWarning)
+        for _ in range(2):  # a refusal raised as an error was not delivered, so the next run raises again
+            with pytest.raises(UserWarning, match="has no effect"):
+                _pf_configure(trainer, model, _pf_text_plan(_PF_LENGTHS), True, loss)
+        with pytest.raises(UserWarning, match="has no effect"):  # a non-main rank too, so no rank is left waiting
+            _pf_configure(object.__new__(MLXTrainer), model, _pf_text_plan(_PF_LENGTHS), True, loss,
+                          world_size=2, main=False)
+
+
+@metal_only
+def test_padding_free_hint_reads_a_bounded_sample(monkeypatch):
+    plan, seen = _pf_text_plan(_PF_LENGTHS, [(0, 1, 2, 3)] * 1000), set()
+    family = mlx_utils.FiniteTextBatchPlan.batch_family
+    monkeypatch.setattr(mlx_utils.FiniteTextBatchPlan, "batch_family", lambda self, i: seen.add(i) or family(self, i))
+    assert importlib.import_module("unsloth_zoo.mlx.trainer")._padding_free_sample_packs(plan) and 1 < len(seen) <= 64
 
 
 # Built from main's _vision_decoder and _TEXT/_VISION test helpers: editing those changes this test's coverage.
