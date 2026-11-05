@@ -4000,6 +4000,11 @@ _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
 _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256 = (
     "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576",
     "ae6c02d68719bee0ce97ab68458eed1f092aa2ab0398f0b903d5a9bf68cfc7ab",
+    "a36cb4f00a865d1d141b6bcfe6fe4f87b40dcb798d2ba00d80f709b1c2d8c10a",
+)
+# mlx-vlm 0.7.12 keeps CanvasRoPE's rope_deltas, which subtract each row's valid length instead of the padded width.
+_MINICPMV4_7_VALID_LENGTH_DELTAS_TOKEN_SHA256 = (
+    "a36cb4f00a865d1d141b6bcfe6fe4f87b40dcb798d2ba00d80f709b1c2d8c10a",
 )
 _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256 = (
     "f995c993dd959cc55a43f70f8f87c115d18833179e464426d63153022f4770ec"
@@ -4451,10 +4456,10 @@ def _minicpmv4_7_text_positions_adapter(cls):
 
     original = cls.__dict__.get("get_input_embeddings")
     rope = getattr(sys.modules.get(cls.__module__), "CanvasRoPE", None)
+    source_sha256 = _source_token_sha256(_safe_getsource(original))
     if (
         getattr(original, "_unsloth_minicpmv4_7_text_positions", False)
-        or _source_token_sha256(_safe_getsource(original))
-        not in _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
+        or source_sha256 not in _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
         or _source_token_sha256(_safe_getsource(getattr(rope, "get_rope_index", None)))
         != _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256
     ):
@@ -4462,6 +4467,7 @@ def _minicpmv4_7_text_positions_adapter(cls):
     import mlx.core as mx
 
     features_cls = original.__globals__["InputEmbeddingsFeatures"]
+    valid_length_deltas = source_sha256 in _MINICPMV4_7_VALID_LENGTH_DELTAS_TOKEN_SHA256
 
     @wraps(original)
     def patched(self, input_ids, pixel_values=None, **kwargs):
@@ -4484,6 +4490,7 @@ def _minicpmv4_7_text_positions_adapter(cls):
             input_ids, pixel_values=None, **kwargs
         )
         batch, width = input_ids.shape
+        lengths = width
         if mask is None:
             positions = mx.arange(width, dtype=mx.int32)
         else:
@@ -4491,8 +4498,10 @@ def _minicpmv4_7_text_positions_adapter(cls):
             positions = mx.where(
                 valid, mx.cumsum(valid.astype(mx.int32), axis=-1) - 1, 0
             )
+            if valid_length_deltas:
+                lengths = valid.astype(mx.int32).sum(axis=-1)[:, None]
         positions = mx.broadcast_to(positions, (3, batch, width))
-        deltas = positions.max(axis=(0, 2))[:, None] + 1 - width
+        deltas = positions.max(axis=(0, 2))[:, None] + 1 - lengths
         self.language_model._position_ids = positions
         self.language_model._rope_deltas = deltas
         return features_cls(
