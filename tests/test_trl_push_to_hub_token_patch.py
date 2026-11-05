@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_trl_push_to_hub_token must never break TrainingArguments -> SFTConfig.
-
-transformers 5 dropped push_to_hub_token from TrainingArguments. TRL 0.22-0.27
-bare-pop it from to_dict() (KeyError on transformers 5), while TRL 1.x pops it
-only below transformers 5 and passes everything else to SFTConfig(**d), so a
-to_dict() that carries the key raises TypeError there.
-"""
+"""patch_trl_push_to_hub_token must never break TrainingArguments -> SFTConfig."""
 
 import copy
 import json
@@ -42,7 +36,6 @@ TF5 = Version(transformers.__version__) >= Version("5.0.0")
 
 @pytest.fixture
 def patched(monkeypatch):
-    # Restore the real to_dict after each test, whatever the patch did.
     monkeypatch.setattr(TrainingArguments, "to_dict", TrainingArguments.to_dict)
     misc.patch_trl_push_to_hub_token()
     yield

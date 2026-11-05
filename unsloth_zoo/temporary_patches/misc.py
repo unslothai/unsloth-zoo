@@ -2801,11 +2801,7 @@ pass
 TEMPORARY_PATCHES.append(patch_peft_dispatch_bnb_4bit)
 
 class _PushToHubTokenPopSafeDict(dict):
-    """TrainingArguments.to_dict() result whose pop("push_to_hub_token") never raises.
-
-    The key itself is NOT added, so SFTConfig(**d) still works on TRL versions
-    that no longer pop it (TRL 1.x pops only below transformers 5.0).
-    """
+    """pop("push_to_hub_token") defaults to None; the key is NOT added (TRL 1.x SFTConfig(**d) rejects it)."""
     __slots__ = ()
 
     def pop(self, key, *default):
@@ -2816,16 +2812,7 @@ pass
 
 
 def patch_trl_push_to_hub_token():
-    """Make a bare pop("push_to_hub_token") on TrainingArguments.to_dict() safe.
-
-    transformers 5.0+ dropped push_to_hub_token, so it is gone from to_dict().
-    TRL 0.22.x-0.26.x bare-pop it unconditionally and TRL 0.27.x bare-pops it
-    on transformers 5.0+ in SFTTrainer / IterativeSFTTrainer __init__, which
-    raises KeyError. TRL 1.x pops it only below transformers 5.0 and passes the
-    rest to SFTConfig(**d), so inserting the key would raise TypeError there.
-    Return a dict whose pop of that key defaults to None instead, without
-    adding the key, which works for every TRL version.
-    """
+    """TRL 0.22-0.27 bare-pop push_to_hub_token, which transformers 5.0+ dropped from to_dict()."""
     try:
         from unsloth_zoo.utils import Version
         import transformers
