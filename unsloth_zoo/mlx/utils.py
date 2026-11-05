@@ -1175,6 +1175,8 @@ def remove_gradient_checkpointing(model):
 # Families whose decoder layers mix tokens only inside one of these children, with no position-dependent backbone input.
 _PADDING_FREE_MODEL_TYPES = frozenset((
     "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", "gemma3_text", "qwen3_next"))
+# mlx-vlm families whose embedder output is per token, besides positions and masks that only the mixers read.
+_PADDING_FREE_VLM_MODEL_TYPES = frozenset(("qwen3_5", "qwen3_5_moe", "gemma4"))
 _PADDING_FREE_MIXERS = ("self_attn", "linear_attn")
 
 
@@ -1189,8 +1191,15 @@ def _padding_free_mask(mask, layout):
     return "causal" if window is not None and layout.span <= window else mask
 
 
+def _is_padding_free_mixer_arg(value):
+    """Masks, positions, offsets and borrowed K/V already sit in the per-row layout; a cache would not."""
+    if isinstance(value, (tuple, list)):
+        return all(isinstance(v, mx.array) for v in value)
+    return value is None or isinstance(value, (str, int, mx.array))
+
+
 def _padding_free_mixer_forward(original, module, x, layout, args, kwargs):
-    if any(v is not None and not isinstance(v, (str, mx.array)) for v in (*args, *kwargs.values())):
+    if not all(_is_padding_free_mixer_arg(v) for v in (*args, *kwargs.values())):
         raise NotImplementedError("Unsloth MLX: padding-free token mixers run without a cache.")
     num_rows, span = layout.num_rows, layout.span
     if args:
@@ -1200,10 +1209,13 @@ def _padding_free_mixer_forward(original, module, x, layout, args, kwargs):
     # Right padding: pad slots follow every real token of their row, so causal mixers never read them.
     padded = mx.zeros((num_rows * span, x.shape[-1]), dtype=x.dtype).at[layout.slots].add(x[0])
     out = original(module, padded.reshape(num_rows, span, -1), *args, **kwargs)
-    if not isinstance(out, mx.array):
+    head = out[0] if isinstance(out, tuple) else out
+    if not isinstance(head, mx.array):
         raise NotImplementedError(
-            f"Unsloth MLX: padding-free cannot map {type(module).__name__}'s {type(out).__name__} output.")
-    return mx.take(out.reshape(num_rows * span, -1), layout.slots, axis=0)[None]
+            f"Unsloth MLX: padding-free cannot map {type(module).__name__}'s {type(head).__name__} output.")
+    head = mx.take(head.reshape(num_rows * span, -1), layout.slots, axis=0)[None]
+    # Gemma 4 hands its K/V to later layers' mixers, which read them in the same per-row layout.
+    return (head, *out[1:]) if isinstance(out, tuple) else head
 
 
 def _patch_padding_free_mixer(mixer_cls):
@@ -1227,14 +1239,20 @@ def _patch_padding_free_mixer(mixer_cls):
 def install_padding_free(model):
     """Route each decoder layer's token mixer through per-row padding inside padding-free forwards; returns the patched
     classes for remove_padding_free. Outside a padding-free batch the patched mixers run unchanged."""
-    config = getattr(model, "_config", None)
+    config = getattr(model, "_config", None) or getattr(model, "config", None)
     model_type = _config_get(config, "model_type") if config is not None else None
     model_type = model_type or getattr(model, "model_type", None)
     layers = _get_transformer_layers(model)
-    if model_type not in _PADDING_FREE_MODEL_TYPES or not layers:
+    vlm = _is_vlm_model(model)
+    if model_type not in (_PADDING_FREE_VLM_MODEL_TYPES if vlm else _PADDING_FREE_MODEL_TYPES) or not layers:
         raise NotImplementedError(
             f"Unsloth MLX: padding_free=True is not supported for model_type={model_type!r}; supported text "
-            f"families: {', '.join(sorted(_PADDING_FREE_MODEL_TYPES))}. Set padding_free=False.")
+            f"families: {', '.join(sorted(_PADDING_FREE_MODEL_TYPES))}; vision families: "
+            f"{', '.join(sorted(_PADDING_FREE_VLM_MODEL_TYPES))}. Set padding_free=False.")
+    if vlm and _shared_kv_slot_count(model):
+        # Cache slots would carry K/V across the flat and padded layouts.
+        raise NotImplementedError(
+            "Unsloth MLX: padding_free=True needs an mlx-vlm that threads Gemma 4 shared K/V itself (0.5.0+).")
     mixer_classes = []
     for layer in layers:
         mixers = [getattr(layer, name) for name in _PADDING_FREE_MIXERS
@@ -1256,11 +1274,16 @@ def remove_padding_free(mixer_classes):
 
 
 def make_padding_free_loss_fn(loss_fn):
-    """Accept padding-free text batches, whose last element is (slots, row_mask), besides padded ones."""
+    """Accept padding-free batches besides padded ones: text tuples end with (slots, row_mask), VLM dicts carry
+    slots over their attention_mask's rows."""
     def padding_free_loss_fn(model, *args, **kwargs):
         if args and isinstance(args[-1], (tuple, list)):
             *args, layout = args
             with _padding_free_scope(_padding_free_layout(*layout)):
+                return loss_fn(model, *args, **kwargs)
+        if args and isinstance(args[0], dict) and "_unsloth_padding_free_slots" in args[0]:
+            batch = args[0]
+            with _padding_free_scope(_padding_free_layout(batch["_unsloth_padding_free_slots"], batch["attention_mask"])):
                 return loss_fn(model, *args, **kwargs)
         return loss_fn(model, *args, **kwargs)
 
@@ -3349,8 +3372,32 @@ def _filter_backbone_kwargs(backbone, kwargs):
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
+# Backbone inputs the per-row mixers or the mask builders read; they stay padded.
+_PADDING_FREE_VLM_ROW_KWARGS = frozenset(("position_ids", "attention_mask", "token_type_ids", "mm_token_type_ids"))
+
+
+def _padding_free_vlm_inputs(inputs, embeds, kwargs, layout):
+    """Move the merged embeddings, and the other per-token backbone inputs, onto the flat stream."""
+    shape = (layout.num_rows, layout.span)
+    if embeds is None or embeds.shape[:2] != shape or inputs.shape != shape:
+        raise NotImplementedError("Unsloth MLX: padding-free needs one merged embedding per input token.")
+
+    def flat(a):
+        return mx.take(a.reshape(shape[0] * shape[1], *a.shape[2:]), layout.slots, axis=0)[None]
+
+    kwargs = dict(kwargs)
+    if kwargs.get("per_layer_inputs") is not None:
+        kwargs["per_layer_inputs"] = flat(kwargs["per_layer_inputs"])
+    unknown = sorted(k for k, v in kwargs.items()
+                     if v is not None and k != "per_layer_inputs" and k not in _PADDING_FREE_VLM_ROW_KWARGS)
+    if unknown:
+        raise NotImplementedError(f"Unsloth MLX: padding-free cannot place the backbone inputs {unknown}.")
+    return flat(inputs), flat(embeds), kwargs
+
+
 def _vlm_hidden_states(model, batch_dict):
-    """Pre-lm_head hidden states for every position of a collated VLM batch dict."""
+    """Pre-lm_head hidden states for every position of a collated VLM batch dict; inside a padding-free scope, for
+    the flat stream's tokens, with the vision tower and the merge still run on the padded rows."""
     input_ids = batch_dict["input_ids"]
     pixel_values = batch_dict.get("pixel_values")
     attention_mask = batch_dict.get("attention_mask")
@@ -3411,6 +3458,10 @@ def _vlm_hidden_states(model, batch_dict):
     shared_kv = _build_shared_kv_caches(model)
     if shared_kv is not None:
         backbone_kwargs["cache"] = shared_kv
+    layout = _PADDING_FREE_LAYOUT.get()
+    if layout is not None:
+        inputs, merged_embeds, backbone_kwargs = _padding_free_vlm_inputs(
+            inputs, merged_embeds, backbone_kwargs, layout)
 
     return _forward_text_hidden_states(
         model,
@@ -3426,7 +3477,10 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     input_ids = batch_dict["input_ids"]
     attention_mask = batch_dict.get("attention_mask")
     labels = batch_dict.get("labels")
-    hidden = _vlm_hidden_states(model, batch_dict)[:, :-1, :]
+    layout = _PADDING_FREE_LAYOUT.get()
+    hidden = _vlm_hidden_states(model, batch_dict)
+    if layout is None:
+        hidden = hidden[:, :-1, :]
 
     if labels is not None:
         # Extra mask keeps externally supplied labels compatible.
@@ -3462,6 +3516,11 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
 
         ntoks = (masked_targets != -100).sum()
+
+    if layout is not None:
+        # Each flat token predicts its row's next token; a row's last token, pad and dummy slots carry -100.
+        masked_targets = mx.pad(masked_targets, ((0, 0), (0, 1)), constant_values=-100)
+        return hidden, mx.take(masked_targets.reshape(-1), layout.slots)[None], ntoks
 
     # Align sequence lengths (vision token injection changes seq len)
     h_seq, t_seq = hidden.shape[1], masked_targets.shape[1]
@@ -10723,24 +10782,60 @@ def _restore_vlm_row_image_handles(item, _depth=0):
     return item
 
 
+def _vlm_cce_indices(selected, tokens, small_capacity_limit):
+    """Fixed-capacity (row, column) CCE indices over tokens target positions, or None when the selection fills more
+    than half of them."""
+    capacity = tokens // 512 * 256
+    if capacity <= 0 or len(selected) > capacity:
+        return None
+    if 256 < capacity <= small_capacity_limit and len(selected) <= 256:
+        capacity = 256
+    indices = np.full((capacity, 2), -1, dtype=np.int32)
+    indices[:len(selected)] = selected
+    return mx.array(indices)
+
+
 def _compact_vlm_cce_batch(batch, small_capacity_limit=0):
     """Attach fixed-capacity CCE indices for a VLM batch's supervised targets; returns None when labels are not 2-D or
     supervised targets fill more than half the target positions."""
     labels = batch.get("labels")
     if labels is None or labels.ndim != 2:
         return None
-    tokens = labels.shape[0] * (labels.shape[1] - 1)
-    capacity = tokens // 512 * 256
-    if capacity <= 0:
-        return None
     selected = np.argwhere(np.asarray(labels)[:, 1:] != -100)
-    if len(selected) > capacity:
+    indices = _vlm_cce_indices(selected, labels.shape[0] * (labels.shape[1] - 1), small_capacity_limit)
+    return None if indices is None else {**batch, "_unsloth_cce_indices": indices}
+
+
+def _real_token_count(batch):
+    # A helper, so the survey keeps no reference to a batch's mask while it builds the next batch.
+    mask = batch.get("attention_mask")
+    return None if mask is None else int(np.asarray(mask).astype(bool).sum())
+
+
+def _padding_free_vlm_batch(batch, capacity, compact, small_capacity_limit=0):
+    """Add the flat-stream slots to a right-padded VLM batch: real tokens in row order, then a dummy tail on spare pad
+    slots; None when a row is left-padded or the batch outgrows capacity."""
+    ids, mask = batch.get("input_ids"), batch.get("attention_mask")
+    if ids is None or mask is None or ids.ndim != 2:
         return None
-    if 256 < capacity <= small_capacity_limit and len(selected) <= 256:
-        capacity = 256
-    indices = np.full((capacity, 2), -1, dtype=np.int32)
-    indices[:len(selected)] = selected
-    return {**batch, "_unsloth_cce_indices": mx.array(indices)}
+    num_rows, width = ids.shape
+    real = np.asarray(mask).astype(bool)
+    lengths = real.sum(axis=-1)
+    total = int(lengths.sum())
+    if real.shape != (num_rows, width) or total > capacity or (real != (np.arange(width) < lengths[:, None])).any():
+        return None
+    slots = np.concatenate([np.flatnonzero(real), np.flatnonzero(~real)[:capacity - total]]).astype(np.int32)
+    flat = {**batch, "_unsloth_padding_free_slots": mx.array(slots)}
+    labels = batch.get("labels")
+    if compact and labels is not None and labels.ndim == 2:
+        targets = np.full((num_rows, width), -100, dtype=np.int64)
+        targets[:, :-1] = np.asarray(labels)[:, 1:]
+        selected = np.flatnonzero(targets.reshape(-1)[slots] != -100)
+        indices = _vlm_cce_indices(
+            np.stack([np.zeros_like(selected), selected], axis=1), capacity, small_capacity_limit)
+        if indices is not None:
+            flat["_unsloth_cce_indices"] = indices
+    return flat
 
 
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
@@ -10774,6 +10869,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_cce_compaction",
         "_cce_dense_batches",
         "_cce_small_capacity_limit",
+        "_real_tokens",
+        "_padding_free_capacities",
+        "_padding_free_dense",
     )
 
     def __init__(
@@ -10826,6 +10924,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._cce_compaction = False
         self._cce_dense_batches = set()
         self._cce_small_capacity_limit = 0
+        self._real_tokens = None
+        self._padding_free_capacities = {}
+        self._padding_free_dense = set()
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -10932,7 +11033,40 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._shape_plan = replace(plan, raw_catalog=raw, planned_catalog=planned, report=report)
         return report
 
+    def configure_padding_free(self, enabled=True):
+        """Fix one flat-token capacity per (family, width) from the surveyed real-token counts, as FiniteTextBatchPlan
+        does; returns (padding-free shapes, all shapes)."""
+        self._padding_free_capacities = {}
+        self._padding_free_dense.clear()
+        if not enabled:
+            return 0, 0
+        self.ensure_descriptors()
+        counts = {}
+        for index, batch_rows in enumerate(self._schedule):
+            family, tokens = self.batch_family(index), self._real_tokens[index]
+            widths = {self._widths[index]}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, self._planned_widths[index]))
+            for width in widths:
+                if tokens is not None and width is not None:
+                    counts[family, width] = (max(counts.get((family, width), (0,))[0], tokens), len(batch_rows))
+        for (family, width), (tokens, num_rows) in counts.items():
+            capacity = _padding_free_capacity(tokens, num_rows, width)
+            if capacity is not None:
+                self._padding_free_capacities[family, width] = capacity
+        return len(self._padding_free_capacities), len(counts)
+
     def prepare_cce_batch(self, index, batch):
+        ids = batch.get("input_ids")
+        capacity = None
+        if self._padding_free_capacities and index not in self._padding_free_dense and getattr(ids, "ndim", 0) == 2:
+            capacity = self._padding_free_capacities.get((self.batch_family(index), ids.shape[1]))
+        if capacity is not None:
+            flat = _padding_free_vlm_batch(batch, capacity, self._cce_compaction, self._cce_small_capacity_limit)
+            if flat is not None:
+                return flat
+            # Keep left-padded or regrown slots padded on later visits too.
+            self._padding_free_dense.add(index)
         if not self._cce_compaction or index in self._cce_dense_batches:
             return batch
         compacted = _compact_vlm_cce_batch(batch, self._cce_small_capacity_limit)
@@ -11043,9 +11177,11 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         padable_flags = []
         forbidden_sets = []
         audio_flags = []
+        real_tokens = []
         with _preserved_preprocessing_rng():
             for index in range(len(self._schedule)):
                 batch = self._build_batch(index)
+                real_tokens.append(_real_token_count(batch))
                 width, axes, padable, forbidden = _vlm_width_survey(
                     batch,
                     disposable_keys=_vlm_pipeline_disposable_keys(self._config),
@@ -11062,6 +11198,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                 padable_flags.append(bool(padable))
                 forbidden_sets.append(forbidden)
         self._descriptors = tuple(families)
+        self._real_tokens = tuple(real_tokens)
         self._audio_flags = tuple(audio_flags)
         self._widths = tuple(widths)
         self._padable = tuple(padable_flags)

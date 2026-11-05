@@ -3869,7 +3869,7 @@ def test_xing4_0_checkpointed_layers_compile(monkeypatch, request):
         assert mx.allclose(a, b, atol=1e-5, rtol=1e-3).item(), name
 
 
-# Padding-free text SFT matches padded logits, losses and LoRA gradients (fp32, tiny models) and keeps rows apart.
+# Padding-free SFT matches padded logits, losses and gradients (fp32, tiny text and vision models) and keeps rows apart.
 _PF_COMMON = dict(  # from_dict keeps each family's own fields
     hidden_size=64, num_hidden_layers=2, intermediate_size=96, num_attention_heads=4, num_key_value_heads=2,
     head_dim=16, rms_norm_eps=1e-5, vocab_size=97, tie_word_embeddings=False, rope_theta=1e4,
@@ -3973,3 +3973,58 @@ def test_rows_stay_independent_in_the_flat_stream(family, monkeypatch):
         assert leak(0, slice(39, 74)) < 1e-6 and leak(1, slice(0, 39)) < 1e-6
         monkeypatch.setattr(mlx_utils, "_padding_free_mixer_forward", lambda orig, m, x, _, a, k: orig(m, x, *a, **k))
         assert leak(0, slice(39, 74)) > 1e-3
+
+
+# Built from main's _vision_decoder and _TEXT/_VISION test helpers: editing those changes this test's coverage.
+def _pf_vlm(family, bidirectional=None):
+    if family == "qwen3_5":
+        from test_mlx_decision_metal import _vision_decoder
+        return _vision_decoder()
+    mx.random.seed(0)
+    from mlx_vlm.models.gemma4 import gemma4
+    from mlx_vlm.models.gemma4.config import ModelConfig, TextConfig, VisionConfig
+    from test_mlx_gemma4_vision_fp16 import _TEXT, _VISION
+    text = {**_TEXT, "num_hidden_layers": 6, "num_kv_shared_layers": 2, "sliding_window": 8,
+            "use_bidirectional_attention": bidirectional,
+            "layer_types": ["sliding_attention", "sliding_attention", "full_attention"] * 2}
+    config = ModelConfig.from_dict({"model_type": "gemma4", "image_token_id": 1000, "audio_token_id": 1001,
+        "video_token_id": 1002, "boi_token_id": 1003, "eoi_token_id": 1004, "text_config": text,
+        "vision_config": _VISION, "audio_config": None})
+    config.text_config, config.vision_config = TextConfig.from_dict(text), VisionConfig.from_dict(_VISION)
+    return gemma4.Model(config)
+
+
+def _pf_vlm_batch(family, case):
+    # Rows 0 and 2 hold a 4-token image; "compact" needs a 512-token flat stream, "wide" fewer tokens than its width.
+    rng, qwen = np.random.default_rng(0), family == "qwen3_5"
+    tails, width, capacity, start = {"compact": ((290, 200, 140), 320, 704, 140), "base": ((10, 7, 8), 24, 64, 6),
+                                     "wide": ((10, 7, 8), 96, mlx_utils._padding_free_capacity(41, 3, 96), 6)}[case]
+    image = [501, *[500] * 4, 502] if qwen else [1003, *[1000] * 4, 1004]
+    rows = [[7, 8, 9, 10, *image, *rng.integers(3, 400, tails[0])], [*rng.integers(3, 400, tails[1])],
+            [*image, *rng.integers(3, 400, tails[2])]]
+    ids = np.array([row + [0] * (width - len(row)) for row in rows], np.int32)
+    mask = (np.arange(width) < np.array([len(row) for row in rows])[:, None]).astype(np.int32)
+    labels = np.where(mask.astype(bool) & (np.arange(width) >= start) & ~np.isin(ids, image), ids, -100)
+    media = ({"pixel_values": mx.array(rng.standard_normal((32, 1536)), mx.float32),
+              "image_grid_thw": mx.array([[1, 4, 4]] * 2)} if qwen else
+             {"pixel_values": mx.array(rng.standard_normal((2, 3, 96, 96)), mx.float32),
+              "mm_token_type_ids": mx.array(np.isin(ids, 1000).astype(np.int32))})
+    batch = {"input_ids": mx.array(ids), "attention_mask": mx.array(mask), "labels": mx.array(labels), **media}
+    return batch, mlx_utils._padding_free_vlm_batch(batch, capacity, case == "compact")
+
+
+@metal_only
+@pytest.mark.parametrize("family,bidirectional,case", [("qwen3_5", None, "base"), ("gemma4", None, "base"),
+    ("gemma4", "vision", "base"), ("qwen3_5", None, "compact"), ("gemma4", None, "wide"), ("gemma4", "vision", "wide")])
+def test_padding_free_vlm_matches_padded_loss_and_grads(family, bidirectional, case):
+    model, (padded, flat) = _pf_vlm(family, bidirectional).train(), _pf_vlm_batch(family, case)
+    importlib.import_module("unsloth_zoo.mlx.loader")._disable_fused_mrope(model)  # its kernel has no VJP
+    loss_fn = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert loss_fn._unsloth_cce_backend == "runtime-cce" and ("_unsloth_cce_indices" in flat) == (case == "compact")
+    step = nn.value_and_grad(model, mlx_utils.make_padding_free_loss_fn(loss_fn))
+    with _pf_training(model):
+        ((ref_loss, ref_n), ref_grads), ((loss, n), grads) = step(model, padded), step(model, flat)
+    assert n.item() == ref_n.item() > 0 and abs(loss.item() - ref_loss.item()) < 1e-5
+    ref_grads = dict(tree_flatten(ref_grads))
+    for name, grad in tree_flatten(grads):
+        assert mx.allclose(grad, ref_grads[name], rtol=1e-4, atol=1e-5).item(), name

@@ -1572,7 +1572,7 @@ class MLXTrainingConfig:
     # SFTConfig.loss_type: "nll" or "dft" (fused CCE text path only); preference and RL configs override its default
     # without kw_only, so the field keeps this positional slot in every subclass.
     loss_type: str = "nll"
-    # TRL SFTConfig.padding_free: text SFT runs per-token modules on the real tokens only; appended LAST.
+    # TRL SFTConfig.padding_free: SFT runs per-token modules on the real tokens only; appended LAST.
     padding_free: bool = False
 
     def __init__(self, *args, **kwargs):
@@ -2741,10 +2741,10 @@ class MLXTrainer:
             self.args.packing = False
         # TRL configs may carry None for "unset".
         self.args.padding_free = bool(getattr(self.args, "padding_free", False))
-        if self.args.padding_free and (self.preference_kind or self._is_vlm):
+        if self.args.padding_free and self.preference_kind:
             raise NotImplementedError(
-                "Unsloth MLX: padding_free=True is implemented for text SFT only; "
-                "VLM, audio and preference trainers need padding_free=False."
+                "Unsloth MLX: padding_free=True is implemented for SFT only; "
+                "preference trainers need padding_free=False."
             )
 
         if (
@@ -5861,11 +5861,13 @@ class MLXTrainer:
             )
         if getattr(args, "padding_free", False):
             # Preference trainers were refused in __init__.
-            if (is_vlm or getattr(args, "teacher_model_name_or_path", None)
-                    or distributed_world_size > 1 or not isinstance(batches, FiniteTextBatchPlan)):
+            if (getattr(args, "teacher_model_name_or_path", None)
+                    or distributed_world_size > 1
+                    or not isinstance(batches, FiniteVLMBatchPlan if is_vlm else FiniteTextBatchPlan)
+                    or (is_vlm and getattr(loss_fn, "_unsloth_cce_backend", None) != "runtime-cce")):
                 raise NotImplementedError(
-                    "Unsloth MLX: padding_free=True needs single-process text SFT on a sized "
-                    "dataset; VLM, GKD, distributed and streaming runs need padding_free=False."
+                    "Unsloth MLX: padding_free=True needs single-process SFT on a sized dataset, with the "
+                    "fused CCE loss for VLMs; GKD, distributed and streaming runs need padding_free=False."
                 )
             _flat_shapes, _all_shapes = batches.configure_padding_free()
             loss_fn = make_padding_free_loss_fn(loss_fn)
