@@ -39,8 +39,7 @@ from .cross_entropy_loss import unsloth_fsdp_unshard, unsloth_fused_ce_loss
 
 EMPTY_LOGITS = torch.empty(0)
 
-# What the fused CE reads; anything else (HF output controls such as output_attentions / output_hidden_states, which
-# Trainer and pipeline stages pass through the model forward) would make _use_chunked_ce refuse the fused-linear kernel.
+# Kwargs the fused CE reads; extras (HF output_attentions / output_hidden_states) make _use_chunked_ce refuse the kernel.
 _KERNEL_KWARGS = frozenset(_ce._FUSED_LINEAR_CE_KWARGS) | frozenset(("n_chunks",)) | frozenset(
     inspect.signature(_ce.unsloth_fused_ce_loss).parameters
 ) - frozenset(("trainer", "hidden_states", "lm_head_weight", "lm_head_bias", "labels", "n_items", "shift_labels",
@@ -101,7 +100,6 @@ def unsloth_fused_lm_head_loss(
     if kwargs.get("scaling", None) is None and accelerator_scaler is not None:
         kwargs["scaling"] = accelerator_scaler
 
-    # Extras the original loss_function ignored are dropped here, not forwarded.
     kwargs = {k: v for k, v in kwargs.items() if k in _KERNEL_KWARGS}
 
     unsloth_fsdp_unshard(lm_head)

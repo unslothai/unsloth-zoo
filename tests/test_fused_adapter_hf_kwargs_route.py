@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""The auto-installed fused lm_head CE forward must reach the chunked fused-linear CE kernel when the model forward
-also carries Hugging Face output controls (output_attentions / output_hidden_states). Pipeline stages and the
-Trainer pass them; forwarded into unsloth_fused_ce_loss they disqualified the kernel route (_use_chunked_ce), so every
-FastModel forward fell back to the torch.func path, which keeps more of each chunk's logits alive."""
+"""HF output kwargs (output_attentions / output_hidden_states) must not push the fused lm_head CE off the chunked
+kernel (_use_chunked_ce) onto the torch.func fallback."""
 
 import pytest
 
