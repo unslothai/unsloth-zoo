@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Auto MoE backend selection when torch._grouped_mm is unusable (torch 2.6/2.7 lack it, 2.8 is sm90 only): CUDA
-below sm80 takes the per-expert loop, not the Triton grouped GEMM measured 1.7x to 4x slower on T4. sm80+ and ROCm
-keep unsloth_triton; an explicit UNSLOTH_MOE_BACKEND still wins."""
+"""Without grouped_mm, auto MoE selection picks the loop on CUDA below sm80; sm80+ / ROCm keep unsloth_triton."""
 
 import importlib.util
 import itertools
@@ -38,7 +36,6 @@ def _patch(module, monkeypatch, platform, capability, grouped_mm, env):
         monkeypatch.setenv("UNSLOTH_MOE_BACKEND", env)
     on_gpu = platform in ("cuda", "hip")
     monkeypatch.setattr(module, "_check_torch_grouped_mm_supported", lambda *a, **k: grouped_mm)
-    # The Triton kernel requires torch.cuda (CUDA or ROCm), as _check_grouped_gemm_available does.
     monkeypatch.setattr(module, "_check_grouped_gemm_available", lambda: on_gpu)
     monkeypatch.setattr(torch.version, "hip", "6.3" if platform == "hip" else None)
 
@@ -81,7 +78,7 @@ def test_t4_without_grouped_mm_takes_loop(monkeypatch):
 
 
 def test_compiled_cache_copy_selects_the_same(monkeypatch):
-    # unsloth_compiled_cache/moe_utils.py is a byte copy with its own module globals (_SELECTED_MOE_BACKEND).
+    # unsloth_compiled_cache/moe_utils.py is a byte copy with its own globals.
     spec = importlib.util.spec_from_file_location("_moe_utils_cache_copy_under_test", M.__file__)
     copy = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(copy)

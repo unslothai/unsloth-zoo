@@ -2114,8 +2114,7 @@ def _select_moe_backend():
 
 
 def _unsloth_triton_beats_loop():
-    """Auto selection only: on CUDA below sm80 (T4 / V100) the Triton grouped GEMM ran 1.7x to 4x slower than the
-    per-expert cuBLAS loop, so a torch without grouped_mm there (2.8: sm90 only) takes the loop. ROCm unchanged."""
+    """Below sm80 (T4 / V100) the Triton grouped GEMM ran 1.7x to 4x slower than the per-expert loop."""
     if getattr(torch.version, "hip", None) is not None:
         return True
     try:
