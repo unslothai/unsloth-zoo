@@ -273,7 +273,7 @@ class GenerationRequest:
     checkpoint_lengths)``: the cache the row prefills into, whose ``offset`` tokens are
     reused rather than prefilled, and the prompt lengths at which ``checkpoint(
     token_count, cache)`` is called with the live cache. A checkpoint fires where a
-    prefill chunk ends; a chunk that would step over one ends at it. Rows decoding together merge
+    prefill chunk ends; a chunk that would step over one, without ending on another, ends at it. Rows decoding together merge
     by cache class, so every row of one batch needs a state building the same layout.
     Where ``row_retire_unavailable_reason()`` is None, an optional ``retire(take)`` is called
     as the row leaves decoding; ``take()``, valid only during the call, returns the row's own
@@ -2570,12 +2570,14 @@ def _row_prefill_batch_class(base):
         def prompt_step(self):
             row = self._unsloth_row
             step = getattr(self, "prefill_step_size", None)
-            # mlx-vlm 0.7.12 resizes chunks every step (256 while peers decode), so a chunk can step over a checkpoint.
-            crossed = [
-                length - self._unsloth_done
-                for length in (row.lengths if row is not None and step else ())
-                if self._unsloth_done < length < self._unsloth_done + step
-            ]
+            done, crossed = self._unsloth_done, ()
+            if row is not None and step:
+                # mlx-vlm 0.7.12 resizes chunks every step (256 while peers decode), so a chunk can step over a
+                # checkpoint. A chunk already ending on one is left whole: dense policies would go token by token.
+                embeds = getattr(self, "_inputs_embeds", None)
+                end = done + (step if embeds is None else min(step, embeds.shape[1] - 1))
+                if end not in row.lengths:
+                    crossed = [length - done for length in row.lengths if done < length < end]
             if not crossed:
                 processed = super().prompt_step()
             else:

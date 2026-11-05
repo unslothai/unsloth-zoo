@@ -1611,6 +1611,36 @@ def test_a_row_prefill_chunk_ends_at_a_checkpoint_it_would_step_over(steps, chun
     assert done == chunks and banked == [2048, 3000]
 
 
+@pytest.mark.parametrize("lengths, chunks", [
+    (range(1, 3001), [256, 2048, 695]),  # dense: every chunk end is a checkpoint, so none is split
+    ({2048, 2999}, [256, 1792, 951]),
+])
+def test_a_row_prefill_chunk_ending_on_a_checkpoint_is_left_whole(lengths, chunks):
+    from unsloth_zoo.mlx import generate
+
+    class Prompt:  # mlx-vlm's sizing: min(step, remaining - 1), the last token held back
+        def __init__(self, prompt_kwargs, uids, warm_cache=None):
+            self.prefill_step_size, self.prompt_cache = None, warm_cache
+            self._inputs_embeds = types.SimpleNamespace(shape=(1, 3000))
+
+        def prompt_step(self):
+            left = self._inputs_embeds.shape[1]
+            n = min(self.prefill_step_size, left - 1)
+            self._inputs_embeds = types.SimpleNamespace(shape=(1, left - n))
+            return n
+
+    banked = []
+    row = types.SimpleNamespace(reopen=None, cache="cache", prefix=0, lengths=lengths, quantize=None,
+                                checkpoint=lambda length, cache: banked.append(length))
+    batch = generate._row_prefill_batch_class(Prompt)(prompt_kwargs={generate._ROW_PREFILL_KEY: row}, uids=[0])
+    done = []
+    for step in (256, 2048, 2048):
+        batch.prefill_step_size = step
+        done.append(batch.prompt_step())
+    ends = [sum(chunks[:i + 1]) for i in range(len(chunks))]
+    assert done == chunks and banked == [end for end in ends if end in lengths]
+
+
 _EXTRACT_0711 = """\
 class BatchKVCache:
     def extract(self, idx):
