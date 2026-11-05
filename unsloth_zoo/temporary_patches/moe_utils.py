@@ -2107,10 +2107,21 @@ def _select_moe_backend():
     if _check_torch_grouped_mm_supported():
         _log_info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
-    if _check_grouped_gemm_available():
+    if _check_grouped_gemm_available() and _unsloth_triton_beats_loop():
         _log_info("Unsloth: Using MoE backend 'unsloth_triton'")
         return "unsloth_triton"
     return "native_torch"
+
+
+def _unsloth_triton_beats_loop():
+    """Auto selection only: on CUDA below sm80 (T4 / V100) the Triton grouped GEMM ran 1.7x to 4x slower than the
+    per-expert cuBLAS loop, so a torch without grouped_mm there (2.8: sm90 only) takes the loop. ROCm unchanged."""
+    if getattr(torch.version, "hip", None) is not None:
+        return True
+    try:
+        return torch.cuda.get_device_capability()[0] >= 8
+    except Exception:
+        return True
 
 
 def moe_compute_dtype(hidden_states):
