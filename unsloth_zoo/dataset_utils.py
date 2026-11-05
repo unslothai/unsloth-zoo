@@ -939,7 +939,7 @@ def train_on_responses_only(
                 assert(n == len(old_labels))
             n_minus_1 = n - 1
             j = 0
-            # Plain lists jump in C to the only positions where a step can act; other row types step one by one.
+            # Plain lists jump with list.index to the only ids a step acts on; other row types step.
             is_list = type(input_ids) is list
             stops = None
 
@@ -966,7 +966,7 @@ def train_on_responses_only(
 
                     j = assistant_k
                     if is_list and stops is None:
-                        # Sorted positions of every id the scan below reacts to; j can step back, so bisect, not a cursor.
+                        # j can step back, so bisect, not a cursor.
                         stops = []
                         for stop_id in inner_stop_ids:
                             i = -1

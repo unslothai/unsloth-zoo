@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""train_on_responses_only jumps over plain-list rows with list.index; labels must equal the one-token stepping walk it
-still runs for any other row type (a list subclass here), over seeded rows dense in marker pieces. CPU-only, stub tokenizer."""
+"""Plain-list rows take the list.index jump path; labels must equal the stepping path a list subclass takes."""
 
 import random
 
@@ -58,7 +57,7 @@ class _Tokenizer:
 
 
 class _Row(list):
-    """Same values, but not exactly a list, so the scan takes the stepping path."""
+    pass
 
 
 MARKERS = [
@@ -91,19 +90,16 @@ def _rows(seed, pieces, count = 300):
 @pytest.mark.parametrize("force_match", [True, False])
 def test_jump_scan_matches_stepping_scan(with_specials, markers, last_response_only, force_match):
     tok = _Tokenizer(with_specials)
-    try:
-        fn = train_on_responses_only(
-            None, markers[0], markers[1], tokenizer = tok, return_function = True,
-            force_match = force_match, last_response_only = last_response_only, mask_out_tokens = [":"],
-        )
-    except ValueError:
-        pytest.skip("marker does not resolve under this stub")
+    fn = train_on_responses_only(
+        None, markers[0], markers[1], tokenizer = tok, return_function = True,
+        force_match = force_match, last_response_only = last_response_only, mask_out_tokens = [":"],
+    )
     pieces = [tok(m).input_ids for m in markers] + [[BOS], [EOS], [START], [END]]
     rows = _rows(repr((with_specials, markers, last_response_only, force_match)), pieces)
     fast = fn({"input_ids": rows})["labels"]
     slow = fn({"input_ids": [_Row(r) for r in rows]})["labels"]
     assert fast == slow
-    assert any(v != -100 for row in fast for v in row)  # some response was actually kept
+    assert any(v != -100 for row in fast for v in row)
 
     old = [[v if i % 3 else -100 for i, v in enumerate(r)] for r in rows]
     assert fn({"input_ids": rows, "labels": old})["labels"] == fn({"input_ids": [_Row(r) for r in rows], "labels": old})["labels"]
