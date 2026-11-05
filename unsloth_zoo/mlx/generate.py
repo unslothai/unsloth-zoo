@@ -2505,6 +2505,7 @@ class _RowPrefill:
     lengths: frozenset[int]
     quantize: Callable[[list], None] | None = None
     reopen: Callable[[dict], dict] | None = None
+    step: int | None = None
 
 
 def _slice_row_inputs(batch_module, prompt_kwargs: dict, length: int, start: int) -> dict:
@@ -2569,22 +2570,25 @@ def _row_prefill_batch_class(base):
 
         def prompt_step(self):
             row = self._unsloth_row
-            step = getattr(self, "prefill_step_size", None)
-            done, crossed = self._unsloth_done, ()
+            given = step = getattr(self, "prefill_step_size", None)
             if row is not None and step:
-                # mlx-vlm 0.7.12 resizes chunks per step; split only a chunk ending on no checkpoint (dense policies stay whole).
+                # mlx-vlm 0.7.12 shrinks chunks to 256 while peers decode; a row's own cache keeps the configured
+                # chunks, so its checkpoints match a cold prefill bitwise.
+                step = row.step or step
+                done = self._unsloth_done
                 embeds = getattr(self, "_inputs_embeds", None)
                 end = done + (step if embeds is None else min(step, embeds.shape[1] - 1))
+                # Split only a chunk ending on no checkpoint: dense policies stay whole.
                 if end not in row.lengths:
-                    crossed = [length - done for length in row.lengths if done < length < end]
-            if not crossed:
+                    step = min([length - done for length in row.lengths if done < length < end], default=step)
+            if step == given:
                 processed = super().prompt_step()
             else:
-                self.prefill_step_size = min(crossed)
+                self.prefill_step_size = step
                 try:
                     processed = super().prompt_step()
                 finally:
-                    self.prefill_step_size = step
+                    self.prefill_step_size = given
             if processed and row is not None:
                 if row.quantize is not None:
                     row.quantize(self.prompt_cache)
@@ -3887,6 +3891,7 @@ class _VLMBatchSession:
             checkpoint = functools.partial(self._bank, state),
             lengths = frozenset(int(length) for length in lengths) if addressed else frozenset(),
             quantize = quantize,
+            step = getattr(self.generator, "prefill_step_size", None),
         )
 
     def _bank(self, state, token_count: int, cache: list) -> None:
