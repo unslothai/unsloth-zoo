@@ -58,7 +58,7 @@ def _checkpoint(fn, args, preserve_rng_state):
             body, *args, use_reentrant = False, preserve_rng_state = preserve_rng_state,
         )
     return _torch_checkpoint_fn()(
-        functools.partial(_replay_tile, body, _tile_gc_flag()), *args,
+        functools.partial(_replay_tile, body, _tile_gc_flag(), choice = [None]), *args,
         use_reentrant = False, preserve_rng_state = preserve_rng_state,
     )
 pass
@@ -80,14 +80,18 @@ def _tile_gc_flag():
 pass
 
 
-def _replay_tile(fn, gc_flag, *args):
+def _replay_tile(fn, gc_flag, *args, choice = None):
     """One eager tile whose forward and recompute read the same in_gradient_checkpoint_recompute() value: Unsloth's
-    MoE kernels save a different tensor count per value, which raised CheckpointError (OLMoE: 29 vs 27)."""
+    MoE kernels save a different tensor count per value, which raised CheckpointError (OLMoE: 29 vs 27). `choice`
+    pins a compiled tile body's side (compiled or eager, see _TileBody) for the recompute."""
     tls = _gc_tls() if gc_flag is not None else None
     previous = getattr(tls, "active", False) if tls is not None else None
     if tls is not None:
         tls.active = gc_flag
     try:
+        body = fn.args[0] if isinstance(fn, functools.partial) and fn.func is _owned and fn.args else None
+        if isinstance(body, _TileBody):
+            return body.run(choice, args[0].clone(), *args[1:])  # _owned(body, *args), with the pinned side
         if _is_dynamic_body(fn):
             return fn(*args)
         return _dynamic_inner_compiles(fn, *args)
@@ -310,7 +314,8 @@ def _outside_graph_mode():
     """"unroll", "op", "compile_tile" or "break" (UNSLOTH_TILED_COMPILE forces one). Unrolling costs ~1.1 s compile per
     tile and lets Inductor overlap the tiles' recomputes (most of the saving is lost), so Unsloth's blocks use "op":
     the tile loop as one opaque graph node (registry modules that qualify; others fall back to "compile_tile", one
-    compiled frame per tile outside the block graph). A user's compile may be fullgraph=True, so it unrolls."""
+    fullgraph compiled frame per tile outside the block graph, eager when the body does not trace whole). A user's
+    compile may be fullgraph=True, so it unrolls."""
     mode = os.environ.get(_ENV_COMPILE, "auto").strip().lower()
     if mode in ("unroll", "op", "compile_tile", "break"):
         return mode
@@ -388,6 +393,9 @@ pass
 
 
 _COMPILED_TILES = {}
+# Tile frames Dynamo cannot compile as one graph (graph break, disabled call, recompile limit): eager from then on.
+_EAGER_TILES = set()
+_TRACE_ERRORS = (torch._dynamo.exc.TorchDynamoException,)
 
 
 def _compiled_tile_for(key):
@@ -396,8 +404,45 @@ def _compiled_tile_for(key):
     if compiled is None:
         code = _call_tile.__code__.replace(co_name = f"_call_tile_{len(_COMPILED_TILES)}")
         frame = types.FunctionType(code, _call_tile.__globals__, code.co_name)
-        compiled = _COMPILED_TILES[key] = torch.compile(frame, dynamic = True)
+        compiled = _COMPILED_TILES[key] = torch.compile(frame, dynamic = True, fullgraph = True)
     return compiled
+pass
+
+
+class _TileBody:
+    """A tile body run as one compiled graph, else eagerly. A partly compiled body (graph breaks, calls into disabled
+    code) can run its forward through compiled pieces and its checkpoint recompute without them, which saves other
+    tensors (CheckpointError: "Recomputed values ... have different metadata"; qwen3_moe LoRA router under Unsloth's
+    block compile). So the frame is fullgraph, a body Dynamo cannot trace whole runs eagerly, and a checkpointed tile
+    keeps the side its forward took (_replay_tile's choice) for its recompute."""
+    _unsloth_dynamic_body = True
+    __slots__ = ("key", "compiled", "eager")
+
+    def __init__(self, key, compiled, eager):
+        self.key, self.compiled, self.eager = key, compiled, eager
+
+    def __call__(self, *tile_args):
+        return self.run(None, *tile_args)
+
+    def run(self, cell, *tile_args):
+        """cell: a checkpointed tile's [side], None until its forward picks one; None for an unpinned call."""
+        side = cell[0] if cell is not None else None
+        if side is None:
+            side = "eager" if self.key in _EAGER_TILES else "compiled"
+        if side == "compiled":
+            try:
+                out = self.compiled(*tile_args)
+            except _TRACE_ERRORS:
+                if cell is not None and cell[0] == "compiled":
+                    raise  # a recompute must not switch sides: its forward ran compiled
+                _EAGER_TILES.add(self.key)
+            else:
+                if cell is not None:
+                    cell[0] = "compiled"
+                return out
+        if cell is not None:
+            cell[0] = "eager"
+        return _dynamic_inner_compiles(self.eager, *tile_args)
 pass
 
 
@@ -405,13 +450,12 @@ def _compiled_tile_fn(fn):
     if isinstance(fn, functools.partial):
         func, bound, keywords = fn.func, fn.args, fn.keywords or {}
         owner = type(bound[0]) if bound else None
-        compiled = _compiled_tile_for((getattr(func, "__code__", func), owner))
-        body = lambda *tile_args: compiled(func, *bound, *tile_args, **keywords)
-    else:
-        compiled = _compiled_tile_for((getattr(fn, "__code__", fn), None))
-        body = lambda *tile_args: compiled(fn, *tile_args)
-    body._unsloth_dynamic_body = True
-    return body
+        key = (getattr(func, "__code__", func), owner)
+        compiled = _compiled_tile_for(key)
+        return _TileBody(key, lambda *tile_args: compiled(func, *bound, *tile_args, **keywords), fn)
+    key = (getattr(fn, "__code__", fn), None)
+    compiled = _compiled_tile_for(key)
+    return _TileBody(key, lambda *tile_args: compiled(fn, *tile_args), fn)
 pass
 
 
