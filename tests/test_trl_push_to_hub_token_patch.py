@@ -47,7 +47,7 @@ def patched(monkeypatch):
 
 @pytest.fixture(params = ["0.27.1", "0.27.2"])
 def patched_as_trl(request, monkeypatch):
-    # The patch reads the TRL version from package metadata; pretend another one is installed.
+    # Fake the installed TRL version the patch reads from package metadata.
     real_version = importlib.metadata.version
     monkeypatch.setattr(
         importlib.metadata,
@@ -129,7 +129,6 @@ def test_patch_is_idempotent(patched_as_trl):
 
 
 def test_sft_config_from_to_dict(patched, tmp_path):
-    # The installed TRL's own conversion (SFTTrainer.__init__).
     from trl import SFTConfig
 
     a = _args(tmp_path)
