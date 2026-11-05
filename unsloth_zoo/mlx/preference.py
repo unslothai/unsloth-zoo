@@ -2152,6 +2152,11 @@ class ReferencePolicy:
             for module, enabled in zip(self.neftune_modules, noise):
                 module._neftune_noise_enabled = enabled
 
+    def leaves_untouched(self, module_ids):
+        touched = {id(module) for module, _ in self.scales + self.targets}
+        touched.update(map(id, self.neftune_modules))
+        return touched.isdisjoint(module_ids)
+
     def forward(self, model, batch, lengths, *, response_scorer=None):
         scorer = _response_logps if response_scorer is None else response_scorer
         with self.activate(model) as reference:

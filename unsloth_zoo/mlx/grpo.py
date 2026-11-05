@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_flatten
 
 from . import generate as generate_module
 from .generate import GenerationDefaults, GenerationRequest, SamplingParams
@@ -60,6 +61,8 @@ from .utils import (
     _vlm_batch_family,
     _vlm_family_divergence,
     _vlm_family_is_plannable,
+    _vlm_image_encoder,
+    _vlm_image_features,
     _vlm_pipeline_disposable_keys,
     _vlm_token_aligned_sidecars,
     _vlm_width_survey,
@@ -773,6 +776,7 @@ class _Generation:
     skipped: dict | None = None
     weights: np.ndarray | None = None
     eager: bool = False
+    features: list | None = None
 
 
 class GRPOBatchPlan:
@@ -824,6 +828,7 @@ class GRPOBatchPlan:
         self.pad_id = self.eos_id if pad_id is None else int(pad_id)
         self._anchor = 0
         self._current = None
+        self._features = None
         self._model = None
         self._shape_plan = None
         self._cce_bounds = None
@@ -917,6 +922,8 @@ class GRPOBatchPlan:
         return np.random.default_rng(_derived_seed(self.seed, visit, 1)).permutation(rows)
 
     def _vision_family(self, inputs):
+        # Shared image features follow the images' shapes, which the survey already classes.
+        inputs = {key: value for key, value in inputs.items() if key != "cached_image_features"}
         _width, axes, padable, forbidden = _vlm_width_survey(
             inputs, disposable_keys=_vlm_pipeline_disposable_keys(self._model_config),
         )
@@ -989,13 +996,51 @@ class GRPOBatchPlan:
             lengths[row] = (prompt_length, len(sequence))
         return batch, lengths
 
-    def _inputs(self, batch, lengths, media, ids_only=False):
+    def _inputs(self, batch, lengths, media, ids_only=False, features=None):
         if self._processor is None:
             return mx.array(batch)
         if ids_only:
             mask = (np.arange(batch.shape[1])[None] < lengths[:, 1:]).astype(np.int32)
             return {"input_ids": mx.array(batch), "attention_mask": mx.array(mask)}
-        return _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
+        inputs = _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
+        held = [value for value in features or () if value is not None]
+        if held:
+            inputs["cached_image_features"] = mx.concatenate(held, axis=-2)
+        return inputs
+
+    def _shared_image_features(self, prompts, encoded, order):
+        """Per laid-out row, its prompt's image features, encoded once per generation for every pass to read; None
+        unless each pass would compute these: a frozen tower without active dropout that the reference leaves as is."""
+        distinct = [prompt for prompt in dict.fromkeys(prompts) if encoded and encoded[prompt][2]]
+        encoder = _vlm_image_encoder(self._model) if distinct else None
+        reference = self._reference_policy if self.with_reference else None
+        tokens = list(generate_module._media_token_ids(self._model_config))
+        if not tokens or encoder is None or any(
+            tree_flatten(module.trainable_parameters()) for module in encoder.modules
+        ) or reference is not None and (
+            reference.model is not None or not reference.leaves_untouched(encoder.module_ids)
+        ):
+            return None
+        features = {}
+        # A micro-batch of prompts per tower run, so no run holds more images than a training forward.
+        for start in range(0, len(distinct), self.batch_size):
+            chunk = distinct[start:start + self.batch_size]
+            ids = [self._prompt_ids[prompt] for prompt in chunk]
+            batch, lengths = self._pack(ids, np.array(list(map(len, ids))), self._width(max(map(len, ids))))
+            encoded_features = _vlm_image_features(self._model, _grpo_vision_batch(
+                self._processor, self._model_config, batch, lengths, [encoded[prompt][1:3] for prompt in chunk],
+            ))
+            counts = [int(np.isin(prompt_ids, tokens).sum()) for prompt_ids in ids]
+            # A tower may pad its output past the valid rows, which come first, prompt by prompt.
+            if encoded_features is None or encoded_features.shape[-2] < sum(counts):
+                return None
+            offsets = np.cumsum([0, *counts])
+            features.update(
+                (prompt, encoded_features[..., low:high, :])
+                for prompt, low, high in zip(chunk, offsets, offsets[1:])
+            )
+        mx.eval(list(features.values()))
+        return [features.get(prompts[row]) for row in order]
 
     def configure_cce_compaction(self, enabled=True):
         self._cce_bounds = (min(map(len, self._prompt_ids)), max(self._max_tokens)) if enabled else None
@@ -1010,7 +1055,7 @@ class GRPOBatchPlan:
         capacity = grpo_cce_capacity(len(lengths), width, *self._cce_bounds)
         return None if capacity is None else mx.array(grpo_cce_indices(lengths, width, capacity))
 
-    def _prefix_ids(self, batch, lengths, media=None):
+    def _prefix_ids(self, batch, lengths, media=None, features=None):
         """[groups, shared] leading prompt tokens each group's rows share, or None unless that cuts padded tokens by
         _prefix_tokr; shared, a multiple of 32, stops short of the last prompt token, which predicts the completion.
         A vision model gets a vision batch of them with each group's images, which must all lie within them."""
@@ -1035,7 +1080,10 @@ class GRPOBatchPlan:
             prompt = np.arange(shared, width)[None] < lengths[::size, :1]
             if not tokens or np.isin(batch[::size, shared:], list(tokens))[prompt].any():
                 return None
-        return self._inputs(batch[::size, :shared], np.full((groups, 2), shared, dtype=np.int32), media)
+        return self._inputs(
+            batch[::size, :shared], np.full((groups, 2), shared, dtype=np.int32), media,
+            features=None if features is None else features[::size],
+        )
 
     @property
     def needs_step_logps(self):
@@ -1077,8 +1125,9 @@ class GRPOBatchPlan:
         width = self._planned(self._width(max(len(sequence) for sequence in chunk)), visit + start // self.batch_size)
         batch, lengths = self._pack(chunk, prompt_lengths[start:start + self.batch_size], width)
         media = None if media is None else media[start:start + self.batch_size]
-        prefix = self._prefix_ids(batch, lengths, media)
-        return self._inputs(batch, lengths, media, ids_only=prefix is not None), lengths, width, prefix
+        features = None if self._features is None else self._features[start:start + self.batch_size]
+        prefix = self._prefix_ids(batch, lengths, media, features)
+        return self._inputs(batch, lengths, media, ids_only=prefix is not None, features=features), lengths, width, prefix
 
     def _generation_family_drift(self, visit, sequences, prompt_lengths, media):
         """The first micro-batch of a generation whose vision family left its survey, found before any is scored."""
@@ -1210,6 +1259,7 @@ class GRPOBatchPlan:
         ]
         prompt_lengths = prompt_lengths[order]
         media = [encoded[prompts[row]][1:3] for row in order] if encoded else None
+        self._features = self._shared_image_features(prompts, encoded, order)
         if self._families is not None:
             # A family that left its survey trains eagerly, so its old and reference log-probs are scored eagerly too.
             if not eager and self._step_compiled() and (self.with_old_logps or self.with_reference):
@@ -1242,7 +1292,7 @@ class GRPOBatchPlan:
             visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
             generation_tokens=int(lengths.sum()), media=media, skipped=skipped,
-            weights=None if weights is None else weights[order], eager=eager,
+            weights=None if weights is None else weights[order], eager=eager, features=self._features,
         )
 
     def _reencode(self, prompt, row):
@@ -1302,6 +1352,8 @@ class GRPOBatchPlan:
         """Micro-batch for schedule entry index at its planned width whatever the phase; refetching an entry reuses its generation instead of sampling again."""
         start = self._generation_start(index)
         if self._current is None or self._current.visit != start:
+            if self._current is not None:
+                self._current.features = self._features = None  # freed before the rollout
             self._current = self._generate(start)
         generation = self._current
         position = ((index - start) % self.steps_per_generation) * self.batch_size
@@ -1326,10 +1378,11 @@ class GRPOBatchPlan:
             old = (old, mx.array(generation.old[position] is not None))
 
         media = None if generation.media is None else generation.media[position:position + self.batch_size]
+        features = None if generation.features is None else generation.features[position:position + self.batch_size]
         # The shared prompt carries each group's images, so the rows' own batch skips the processor.
-        prefix = self._prefix_ids(batch, lengths, media)
+        prefix = self._prefix_ids(batch, lengths, media, features)
         materialized = (
-            self._inputs(batch, lengths, media, ids_only=prefix is not None), mx.array(lengths),
+            self._inputs(batch, lengths, media, ids_only=prefix is not None, features=features), mx.array(lengths),
             mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),

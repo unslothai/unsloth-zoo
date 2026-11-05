@@ -4016,7 +4016,7 @@ def test_grpo_shared_prefix_vision_batches_hold_each_groups_images():
     import numpy as np
     from unsloth_zoo.mlx.grpo import GRPOBatchPlan
     calls = []
-    plan = SimpleNamespace(_prefix=True, num_generations=2, _prefix_tokr=1.0, _processor=object(), _model_config={"image_token_id": 9}, _inputs=lambda *args: calls.append(args) or "vision")  # noqa: E501
+    plan = SimpleNamespace(_prefix=True, num_generations=2, _prefix_tokr=1.0, _processor=object(), _model_config={"image_token_id": 9}, _inputs=lambda *args, **_: calls.append(args) or "vision")  # noqa: E501
     batch, lengths = np.repeat(np.arange(256, dtype=np.int32).reshape(2, 128) + 10, 2, axis=0), np.array([[70, 100]] * 4, dtype=np.int32)  # noqa: E501
     batch[:, 3], batch[:, 90] = 9, 9
     media = [("a", ("cat",)), ("a", ("cat",)), ("b", ("dog",)), ("b", ("dog",))]
@@ -4037,7 +4037,7 @@ def test_grpo_shared_prompt_rows_skip_the_processor():
 
     calls = []
 
-    def inputs(batch, lengths, media, ids_only=False):
+    def inputs(batch, lengths, media, ids_only=False, features=None):
         calls.append((batch.shape[1], None if ids_only else media))
         return "batch"
 
@@ -4045,7 +4045,7 @@ def test_grpo_shared_prompt_rows_skip_the_processor():
     vars(plan).update(
         _prefix=True, num_generations=2, _prefix_tokr=1.0, _processor=object(), _model_config={"image_token_id": 9},
         batch_size=4, steps_per_generation=1, _anchor=0, _repeats=1, _families=None, _shape_plan=None,
-        _cce_bounds=None, max_seq_length=512, pad_id=0, _inputs=inputs,
+        _cce_bounds=None, max_seq_length=512, pad_id=0, _inputs=inputs, _features=None,
     )
     # Two groups of two rows: 70 prompt tokens each, then 3 to 6 completion tokens.
     sequences = [tuple(range(10 + 100 * (row // 2), 80 + 100 * (row // 2))) + (5,) * (3 + row) for row in range(4)]

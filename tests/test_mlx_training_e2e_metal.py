@@ -2137,11 +2137,15 @@ def test_grpo_cce_scores_like_the_logits(head):
 
 
 @metal_only
-@pytest.mark.parametrize("vision", [False, True])
-def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, vision):
+@pytest.mark.parametrize("tower,beta,prefix,scored_runs,kept_runs", [
+    ("frozen", 0.0, False, 1, 1), ("frozen", 0.04, False, 1, 1), ("frozen", 0.0, True, 1, 1),
+    # Per generation: two old scorings (none when kept) and two reference ones, each after a rollout forward, and four steps.
+    ("trained", 0.0, False, 8, 4), ("frozen-lora", 0.04, False, 12, 8),
+])
+def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, tower, beta, prefix, scored_runs, kept_runs):  # noqa: E501
     """Old log-probs of an image batch the rollout already ran equal the step's own, frozen tower or trained: Gemma 4's
     vision attention is an mx.compile helper that traced inputs bypass, so the scorer and the step must trace the same
-    arrays, the trainable parameters."""
+    arrays, the trainable parameters. A tower every pass runs alike runs once per generation, here padding its output."""
     import shutil, types, PIL.Image, mlx_vlm.utils, mlx_vlm.models.gemma4 as gemma4
     from huggingface_hub import snapshot_download
     from unsloth_zoo.mlx import generate as generate_module, grpo, trainer as mlx_trainer
@@ -2161,40 +2165,58 @@ def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, v
     mx.save_safetensors(str(checkpoint / "model.safetensors"), dict(tree_flatten(tiny.parameters())), {"format": "mlx"})
     monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: [
         types.SimpleNamespace(token_ids=[100 + row % 7] * (2 + row % 5), finish_reason="stop") for row in range(len(requests))])
-    scored, terms, pairs = grpo._scored_as_step, grpo.grpo_terms, []
+    scored, terms, pairs, gaps, calls, own, shared = grpo._scored_as_step, grpo.grpo_terms, [], [], [], [], grpo._shared_prefix_hidden
 
     def rolled_out(logps, step_compiled):
         score = scored(logps, step_compiled)
 
-        def run(model, batch, *rest):
+        def run(model, batch, lengths, indices, prefix):
             mx.eval(grpo.completion_logps(model, batch, 1.0))  # the rollout's forward of this batch, without gradients
-            return score(model, batch, *rest)
+            plain = lambda inputs: inputs and {k: v for k, v in inputs.items() if k != "cached_image_features"}  # noqa: E731
+            own.append(1)  # the batch's and its prefix's own tower runs, uncounted, against the shared features
+            gaps.append(mx.abs(logps(model, batch, lengths, indices, prefix) - logps(model, plain(batch), lengths, indices, plain(prefix))).max().item())  # noqa: E501
+            own.clear()
+            return score(model, batch, lengths, indices, prefix)
         return run
     monkeypatch.setattr(grpo, "_scored_as_step", rolled_out)
     monkeypatch.setattr(grpo, "grpo_terms", lambda objective, new, advantages, mask, *, old=None, ref=None: pairs.append(
         (mx.stop_gradient(new), old, mask)) or terms(objective, new, advantages, mask, old=old, ref=ref))
-    data = [{"prompt": [{"role": "user", "content": f"Describe picture {i}."}], "image": PIL.Image.new("RGB", (64, 64), (60 * i, 90, 160))} for i in range(2)]  # noqa: E501
+    monkeypatch.setattr(grpo, "_shared_prefix_hidden", lambda *args: calls.append("prefix") or shared(*args))
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER_TOKR", "0")
+    runs = []
+    data = [{"prompt": [{"role": "user", "content": f"Describe picture {i}." + " Look closely." * 16}], "image": PIL.Image.new("RGB", (64, 64), (60 * i, 90, 160))} for i in range(2)]  # noqa: E501
 
     def train():
         model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
-        model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=1024, finetune_vision_layers=vision)
-        assert any(key.startswith("vision_tower") for key, _ in tree_flatten(model.trainable_parameters())) is vision
+        if not runs:  # the tower as loading leaves it
+            run_tower = type(model.vision_tower).__call__
+            monkeypatch.setattr(type(model.vision_tower), "__call__", lambda *args, **kw: not own and calls.append("tower") or (
+                mx.concatenate([out := run_tower(*args, **kw), mx.zeros_like(out)], axis=-2)))
+        model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=1024, finetune_vision_layers=tower != "frozen")
+        if tower == "frozen-lora":
+            model.vision_tower.freeze()
+        assert any(key.startswith("vision_tower") for key, _ in tree_flatten(model.trainable_parameters())) is (tower == "trained")
         trainer = mlx_trainer.MLXGRPOTrainer(model, processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
             output_dir=str(tmp_path / "out"), max_steps=2, per_device_train_batch_size=2, num_generations=2, num_iterations=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
-            max_seq_length=1024, logging_steps=1, loss_type="dapo", beta=0.0, compile=False, shuffle_dataset=False), reward_funcs=lambda completion_ids, **_: [float(len(c)) for c in completion_ids])  # noqa: E501
+            max_seq_length=1024, logging_steps=1, loss_type="dapo", beta=beta, compile=False, shuffle_dataset=False, prefix_grouper=prefix), reward_funcs=lambda completion_ids, **_: [float(len(c)) for c in completion_ids])  # noqa: E501
+        calls.clear()
         trainer.train()
+        runs.append((calls.count("tower"), "prefix" in calls))
         return trainer
     assert _kept_old_logps_match_scored(monkeypatch, train) == [True, True, False, False]
+    assert runs == [(scored_runs, prefix), (kept_runs, prefix)]
     # The scored run's first pass: its own forward's log-probs.
     assert len(pairs) == 8 and all(old is not None for _, old, _ in pairs)
     for new, old, mask in pairs[:2]:
         assert mx.array_equal(mx.where(mask > 0, new, 0), mx.where(mask > 0, old, 0)).item()
+    assert max(gaps) <= 1e-4
 
 
 @metal_only
 @pytest.mark.parametrize("refused", [False, True])
 def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch, recwarn, refused):
-    """Old log-probs score an image batch as the compiled step does: with a clip range of 1e-7, any other ratio clips."""
+    """Old log-probs score an image batch as the compiled step does: with a clip range of 1e-7, any other ratio clips. The
+    frozen tower runs once per generation, ahead of every trace, which read its features as an input."""
     import random, shutil, types, PIL.Image, mlx_vlm.utils, mlx_vlm.models.qwen3_5 as qwen3_5
     from huggingface_hub import snapshot_download
     from unsloth_zoo.mlx import generate as generate_module, trainer as mlx_trainer
@@ -2217,22 +2239,27 @@ def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch, rec
         types.SimpleNamespace(token_ids=[100 + row % 7] * (2 + row % 5), finish_reason="stop") for row in range(len(requests))])
     rng = random.Random(0)
     data = [{"prompt": [{"role": "user", "content": " ".join(rng.choice(("apples", "orchard", "market")) for _ in range(3)) + f" Describe the picture in one sentence. Then say {i}."}], "image": PIL.Image.new("RGB", (224, 224), (rng.randint(0, 255), rng.randint(0, 255), 128))} for i in range(2)]  # noqa: E501
-    trainers = []
+    trainers, calls = [], []
 
     def train():
         model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
+        if not trainers:  # the tower as loading leaves it
+            run_tower = type(model.vision_tower).__call__
+            monkeypatch.setattr(type(model.vision_tower), "__call__", lambda *args, **kw: calls.append(1) or run_tower(*args, **kw))
         trainers.append(mlx_trainer.MLXGRPOTrainer(FastMLXModel.get_peft_model(model, r=8, lora_alpha=8, lora_dropout=0, max_seq_length=1024), processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
             output_dir=str(tmp_path / "out"), max_steps=2, per_device_train_batch_size=4, gradient_accumulation_steps=2, num_generations=4, num_iterations=2, max_completion_length=8, max_seq_length=1024, loss_type="dapo",  # noqa: E501
             beta=0.0, logging_steps=1, seed=3, compile=True, gradient_checkpointing=False, epsilon=1e-7, epsilon_high=1e-7, prefix_grouper=refused),  # noqa: E501
             reward_funcs=lambda completion_ids, **_: [float(len(c) + sum(c) % 7) for c in completion_ids]))
+        calls.clear()
         assert trainers[-1].train()["compile_scope"] == "full_step"
+        assert len(calls) == 1, len(calls)
         return trainers[-1]
     # Two runs scored alike already differ by ~1e-6 here, compiled.
     assert _kept_old_logps_match_scored(monkeypatch, train, rtol=1e-4, atol=1e-6) == [True, True, False, False]
     # A refused model keeps compiled vision steps under prefix_grouper.
     assert any("prefix_grouper is off, since model_type" in str(w.message) for w in recwarn) == refused
-    # The first pass of the run whose old log-probs a compiled forward scored.
-    assert [entry["clip_ratio/region_mean"] for entry in trainers[0].state.log_history if "clip_ratio/region_mean" in entry][0] == 0.0  # noqa: E501
+    # Each run's first pass, whose old log-probs a compiled forward scored or the compiled step kept.
+    assert [[entry["clip_ratio/region_mean"] for entry in trainer.state.log_history if "clip_ratio/region_mean" in entry][0] for trainer in trainers] == [0.0, 0.0]  # noqa: E501
 
 
 @metal_only
@@ -2453,7 +2480,7 @@ def test_vision_grpo_shared_prefix_matches_each_row_alone(monkeypatch, tmp_path,
     packed = np.zeros((len(rows), width), dtype=np.int32)
     for index, row in enumerate(rows):
         packed[index, :len(row)] = row
-    vision = lambda batch, lengths, media: g._grpo_vision_batch(processor, model._config, batch, lengths, media)  # noqa: E731
+    vision = lambda batch, lengths, media, features=None: g._grpo_vision_batch(processor, model._config, batch, lengths, media)  # noqa: E731
     plan = SimpleNamespace(_prefix=True, num_generations=size, _prefix_tokr=1.0, _processor=processor, _model_config=model._config, _inputs=vision)  # noqa: E501
     prefix = g.GRPOBatchPlan._prefix_ids(plan, packed, lengths, media)
     assert prefix is not None and prefix["input_ids"].shape[0] == 2 and ("pixel_values" in prefix) == image
