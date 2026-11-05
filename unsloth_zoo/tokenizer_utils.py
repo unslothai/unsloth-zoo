@@ -349,10 +349,25 @@ pass
 _COUNT_INPUT_IDS_BATCH_SIZE = 1000
 
 
+def _rows_lack_input_ids(train_dataset):
+    """True when no row of train_dataset can carry "input_ids": a datasets.Dataset without that column and
+    without a custom transform (one could add it). Such a dataset is still raw (fix_untrained_tokens runs before
+    TRL tokenizes), and fetching its rows would decode every column (images, audio) only to skip each one."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not isinstance(train_dataset, datasets.Dataset): return False
+    try:
+        if train_dataset.format.get("type") == "custom": return False
+        return "input_ids" not in train_dataset.column_names
+    except Exception:
+        return False
+pass
+
+
 def _count_input_ids(train_dataset, mapping):
     """Only .map is datasets specific; a plain list of rows gets this far. A row with no
     "input_ids" is skipped, as in the checks above."""
     # All Unsloth Zoo code licensed under LGPLv3
+    if _rows_lack_input_ids(train_dataset): return
     if hasattr(train_dataset, "map"):
         train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
         return
@@ -603,14 +618,15 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         # an indexable dataset
         return
 
-    # Check the first 250, last 250 input_ids
-    size_dataset = len(train_dataset)
+    # Check the first 250, last 250 input_ids. A dataset whose rows cannot carry "input_ids" skips every row in
+    # these scans, so read none of them (each fetch decodes all columns, media included); the flags are unchanged.
+    size_dataset = 0 if _rows_lack_input_ids(train_dataset) else len(train_dataset)
     size = min(size_dataset, 250)
     for j in range(size):
         input_ids = train_dataset[j]
         if "input_ids" in input_ids:
             input_ids = input_ids["input_ids"]
-            if_bad = any(item in where_untrained_set for item in input_ids)
+            if_bad = not where_untrained_set.isdisjoint(input_ids)
             if if_bad:
                 if_bad_second = True
                 break
@@ -625,7 +641,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             input_ids = train_dataset[j]
             if "input_ids" in input_ids:
                 input_ids = input_ids["input_ids"]
-                if_bad = any(item in where_untrained_set for item in input_ids)
+                if_bad = not where_untrained_set.isdisjoint(input_ids)
                 if if_bad:
                     if_bad_second = True
                     break
@@ -648,7 +664,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         which_locations = []
 
         # Re-check the first 250, last 250 input_ids
-        size_dataset = len(train_dataset)
+        size_dataset = 0 if _rows_lack_input_ids(train_dataset) else len(train_dataset)
         size = min(size_dataset, 250)
         for j in range(size):
             input_ids = train_dataset[j]
@@ -677,7 +693,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         # If no bad tokens, possibly chat template itself has issues?
         if len(final_bad_items) == 0:
             # Recheck 2000 and last 2000 items
-            size_dataset = len(train_dataset)
+            size_dataset = 0 if _rows_lack_input_ids(train_dataset) else len(train_dataset)
             size = min(size_dataset, 2000)
             for j in range(size):
                 input_ids = train_dataset[j]
