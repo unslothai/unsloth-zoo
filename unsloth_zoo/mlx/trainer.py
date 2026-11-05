@@ -2104,17 +2104,6 @@ def _plan_single_process_vlm_shapes(
         ), True, None
     # Strictness follows the resolved mode: an arch or backend override can select strict under a best_effort base policy, and that run must abort, not degrade.
     effective_mode = _effective_compile_mode(compile_policy, compile_decision)
-    max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
-    if (
-        distributed_world_size <= 1
-        and max_grad_norm > 0
-        and args.gradient_accumulation_steps > 1
-    ):
-        # Compilation is disabled later here, so skip the survey (it materializes every batch) for a plan that could never be compiled.
-        return None, _shape_guard_report(
-            "not_applicable", "compile_ineligible_global_norm", cap,
-            lazy_batches=lazy,
-        ), False, None
     compile_scope = (
         DDP_LOCAL_GRAD_SCOPE
         if distributed_world_size > 1 else FULL_STEP_SCOPE
@@ -2292,13 +2281,6 @@ def _plan_single_process_text_shapes(
         strict = _effective_compile_mode(
             compile_policy, vlm_compile_decision,
         ) == "strict"
-        if (
-            _resolve_mlx_grad_clipping(args)[0] > 0
-            and args.gradient_accumulation_steps > 1
-        ):
-            return None, _shape_guard_report(
-                "not_applicable", "compile_ineligible_global_norm", cap,
-            ), False, None
     elif is_vlm and isinstance(batches, GRPOBatchPlan):
         # Its vision inputs come only with each rollout, so no family is named ahead.
         return None, _shape_guard_report(

@@ -2317,10 +2317,11 @@ def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
 
 
 @metal_only
-def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
+@pytest.mark.parametrize("max_steps,grad_accum,max_grad_norm", [(4, 1, 0.0), (2, 2, 1.0)])
+def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path, max_steps, grad_accum, max_grad_norm):
     """Real-runtime contract for planned VLM training: with a qualified compile decision it installs a width plan and
     runs only planned widths, with losses and token counts matching the unplanned eager run exactly (padded tails are
-    inert); every compiled width is an admitted endpoint."""
+    inert); every compiled width is an admitted endpoint. Global-norm clipping with accumulation compiles too."""
     import os as _os
     import sys as _sys
     import types
@@ -2382,16 +2383,16 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
             max_seq_length=8,
         )
         args = MLXTrainingConfig(
-            max_steps=4,
-            gradient_accumulation_steps=1,
+            max_steps=max_steps,
+            gradient_accumulation_steps=grad_accum,
             compile=planned,
             use_cce=False,
             gradient_checkpointing=False,
             cast_norm_output_to_input_dtype=False,
-            max_grad_norm=0.0,
+            max_grad_norm=max_grad_norm,
             max_grad_leaf_norm=0.0,
             disable_memory_limits=True,
-            logging_steps=1000,
+            logging_steps=1,
             output_dir=str(tmp_path),
         )
         trainer = MLXTrainer(
@@ -2428,19 +2429,24 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
             )
         trainer.save_model = lambda *_a, **_k: None
         result = trainer.train()
-        return result, plan, list(seen_widths)
+        params = dict(tree_flatten(trainer.model.trainable_parameters()))
+        return result, plan, list(seen_widths), (params, list(trainer._grad_norm_history))
 
     monkeypatch.setattr(TinyVLM, "__call__", recording_call)
     monkeypatch.setattr(mx, "compile", counting_compile)
-    unplanned_result, _plan, unplanned_widths = run(planned=False)
+    unplanned_result, _plan, unplanned_widths, unplanned_state = run(planned=False)
     unplanned_compiled_calls = len(compiled_invocations)
-    planned_result, planned_plan, planned_widths = run(planned=True)
+    planned_result, planned_plan, planned_widths, planned_state = run(planned=True)
     planned_compiled_calls = len(compiled_invocations)
 
     assert unplanned_compiled_calls == 0
     assert planned_compiled_calls == 4
     assert planned_result["compile_enabled"] is True
     assert unplanned_result["compile_enabled"] is False
+    assert planned_state[1] == pytest.approx(unplanned_state[1], rel=1e-5)
+    assert bool(planned_state[1]) == (max_grad_norm > 0)
+    for name, value in unplanned_state[0].items():
+        assert mx.allclose(planned_state[0][name], value, atol=1e-6, rtol=1e-5).item(), name
     assert planned_result["trained_tokens"] == (
         unplanned_result["trained_tokens"]
     )
