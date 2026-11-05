@@ -1345,7 +1345,7 @@ def test_a_pair_plan_runs_each_shared_prompt_once_only_where_it_pays():
 
 def test_shared_prompt_forward_is_refused_where_it_is_not_exact(monkeypatch):
     from types import SimpleNamespace as NS
-    from unsloth_zoo.mlx import preference as p
+    from unsloth_zoo.mlx import preference as p, utils as mlx_utils
     from unsloth_zoo.mlx.trainer import MLXCPOConfig, MLXDPOConfig, MLXORPOConfig, MLXTrainer
     monkeypatch.setattr(p, "_make_preference_cce_scorer", lambda model: getattr(model, "head", print))
     model = lambda kind="qwen3", sliding=False, window=None, keep=1.0, rope="RoPE", **extra: NS(model_type=kind, model=NS(layers=[NS(use_sliding=sliding)], sliding_window=window, named_modules=lambda: [("layers.0.self_attn.rope", type(rope, (), {})())]), named_modules=lambda: [("q_proj", NS(lora_a=0, lora_b=0, dropout=NS(_p_1=keep)))], **extra)  # noqa: E501, E731
@@ -1358,9 +1358,34 @@ def test_shared_prompt_forward_is_refused_where_it_is_not_exact(monkeypatch):
     trainer = lambda **kw: NS(**{"_is_vlm": False, "model": model(), "ref_model": None, "preference_kind": "dpo", "distributed_world_size": 1, **kw})  # noqa: E501, E731
     ratio = lambda run=trainer(), options=args(): MLXTrainer._shared_prompt_ratio(run, options)  # noqa: E731
     assert ratio() == ratio(trainer(ref_model=model())) == 1.5 and ratio(options=args(shared_prompt_forward=False)) is None  # noqa: E501
-    for run in [(trainer(), args(use_cce=False)), (trainer(_is_vlm=True), args()), (trainer(distributed_world_size=2), args()), (trainer(), args(neftune_noise_alpha=5.0)), (trainer(model=model(keep=0.9)), args(disable_dropout=False)), (trainer(ref_model=model("gemma3")), args())]:  # noqa: E501
+    vlm = lambda kind, moe=False: NS(config=NS(model_type=kind), language_model=NS(model=NS(layers=[NS(enable_moe=moe)], named_modules=lambda: [])), vision_tower=None, named_modules=lambda: [])  # noqa: E501, E731
+    assert not any(p.shared_prompt_problem(vlm(kind), 512) for kind in ("qwen3_5", "gemma4")) and all(p.shared_prompt_problem(m, 512) for m in (vlm("qwen2_5_vl"), vlm("gemma4", moe=True), model("qwen3_5"), model("gemma4"))) and ratio(trainer(_is_vlm=True, model=vlm("gemma4"))) == 1.5  # noqa: E501
+    for run in [(trainer(), args(use_cce=False)), (trainer(distributed_world_size=2), args()), (trainer(), args(neftune_noise_alpha=5.0)), (trainer(model=model(keep=0.9)), args(disable_dropout=False)), (trainer(ref_model=model("gemma3")), args())]:  # noqa: E501
         with pytest.warns(UserWarning, match="shared_prompt_forward is off"):
             assert ratio(*run) is None
+    monkeypatch.setattr(mlx_utils, "_shared_kv_slot_count", lambda model: 2)
+    assert "own slots" in p.shared_prompt_problem(vlm("gemma4"), 512)
+
+
+def test_a_vision_pair_plan_keeps_every_image_in_its_shared_prompt(monkeypatch):
+    # An image token past the prefix, sidecars differing below it or unknown image tokens refuse; rows are not re-encoded.
+    from unsloth_zoo.mlx import preference as p
+    monkeypatch.setattr(p, "_vision_batch", lambda *args, **options: (*args, options))
+    row = lambda at=3, part=70: p.VisionPreferenceRow(ids := tuple(9 if i == at else 10 + i for i in range(70)), (1, 2), ids, (3, 4), images=("cat",), chosen_prompt_arrays=(("mm", ids),), rejected_prompt_arrays=(("mm", ids[:part] + (0,) * (70 - part)),))  # noqa: E501, E731
+    plan = lambda config={"image_token_id": 9}, **kw: p.FiniteVisionPreferenceBatchPlan([row(**kw)], [(0,)], normalizers=[(1, 1, 1)], cycle_length=1, max_seq_length=96, pad_id=0, shared_prompt_ratio=1.0, processor=None, model_config=config)  # noqa: E501, E731
+    assert [plan(**kw).shared_prompt_length(0) for kw in ({}, {"at": 66}, {"part": 5}, {"config": {}})] == [64, 0, 0, 0]
+    assert not isinstance((batch := plan().materialize(0))[0], tuple) and batch[-1][4].shape == (1, 64) and len(batch[-1][3][0]) == 1  # noqa: E501
+    # Two pairs, the second's rejected prompt alone holding an image past the prefix; the planner surveys the prefix.
+    pairs = lambda second: p.FiniteVisionPreferenceBatchPlan([row(), second], [(0, 1)], normalizers=[(1, 2, 1)], cycle_length=1, max_seq_length=96, pad_id=0, shared_prompt_ratio=1.0, processor=None, model_config={"image_token_id": 9})  # noqa: E501, E731
+    late = tuple(9 if i in (3, 66) else 10 + i for i in range(70))
+    assert pairs(p.VisionPreferenceRow(row().chosen_prompt_ids, (1, 2), late, (3, 4), images=("cat",), chosen_prompt_arrays=(("mm", row().chosen_prompt_ids),), rejected_prompt_arrays=(("mm", late),))).shared_prompt_length(0) == 0  # noqa: E501
+    surveyed = []
+    monkeypatch.setattr(p.FiniteVisionPreferenceBatchPlan, "_survey", lambda self, inputs: surveyed.append(inputs[4].shape) or (("family",), False, set()))  # noqa: E501
+    (both := pairs(row())).ensure_descriptors()
+    assert surveyed == [(2, 64)] and both.materialize(0)[-1][4].shape == (2, 64)
+    both._shape_plan = types.SimpleNamespace(allows=lambda *_: True, endpoint_for=lambda family, width: width)
+    both.set_reference_logps([[0.0, 0.0]] * 2)
+    assert both.materialize(0, phase="train")[-1][-1].get("same_pixels") and surveyed == [(2, 64)] * 2
 
 
 def test_the_trainer_hands_its_shared_prompt_ratio_to_every_pair_plan(tmp_path, monkeypatch):

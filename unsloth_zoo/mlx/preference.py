@@ -1194,7 +1194,8 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
             prompt = min(min(len(row.chosen_prompt_ids), len(row.rejected_prompt_ids)) for row in rows)
             shared, width = (min(common, prompt) - 1) // 32 * 32, self.batch_width(index)
             per_row, once = 2 * (width - 1), shared + 2 * (width - 1 - shared)
-            self._shared_lengths[index] = shared if shared > 0 and per_row >= self._shared_prompt_ratio * once else 0
+            engaged = shared > 0 and per_row >= self._shared_prompt_ratio * once
+            self._shared_lengths[index] = shared if engaged and self._prefix_holds_media(rows, shared) else 0
         return self._shared_lengths[index]
 
     def set_shape_plan(self, shape_plan):
@@ -1261,15 +1262,22 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         indices = self._schedule[index]
         rows = [self._rows[item] for item in indices]
         batch, lengths = self.pack(rows, self._materialized_width(index, phase))
+        shared = self.shared_prompt_length(index)
+        # The shared prompt carries a vision batch's images, so the rows' own batch skips the processor.
         materialized = (
-            self._inputs(rows, batch, lengths), mx.array(lengths),
+            mx.array(batch) if shared else self._inputs(rows, batch, lengths), mx.array(lengths),
             mx.array(self._normalizers[index], dtype=mx.int32),
         )
         reference = None if self._reference is None else self._held_reference(indices)
-        shared = self.shared_prompt_length(index)
         if shared:
-            return materialized + (None, reference, mx.array(batch[:len(rows), :shared]))
+            return materialized + (None, reference, self._prefix_inputs(rows, batch, shared))
         return materialized if reference is None else materialized + (None, reference)
+
+    def _prefix_holds_media(self, rows, shared):
+        return True
+
+    def _prefix_inputs(self, rows, batch, shared):
+        return mx.array(batch[:len(rows), :shared])
 
     def _held_reference(self, indices):
         branches = len(self._branches(self._rows[indices[0]]))
@@ -1304,8 +1312,27 @@ class VisionPreferenceBatches:
     def _prompt_arrays(self, row):
         return row.chosen_prompt_arrays, row.rejected_prompt_arrays
 
-    def shared_prompt_length(self, index):
-        return 0
+    def _prefix_holds_media(self, rows, shared):
+        from .generate import _media_token_ids
+
+        # A media token past shared would leave its features without a place in the prompt that runs once.
+        tokens = _media_token_ids(self._model_config)
+        if any(row.images for row in rows) and not tokens:
+            return False
+        return not any(
+            token < 0 or token in tokens for row in rows for values in (row.chosen, row.rejected)
+            for token in values[shared:]
+        ) and all(
+            tuple(values[:shared]) == tuple(other[:shared])
+            for row in rows for (_, values), (_, other) in zip(*self._prompt_arrays(row))
+        )
+
+    def _prefix_inputs(self, rows, batch, shared):
+        return _vision_batch(
+            self._processor, self._model_config, rows, [self._prompt_arrays(row)[:1] for row in rows],
+            batch[:len(rows), :shared], np.full((len(rows), 2), shared, dtype=np.int32),
+            same_pixels=self._reference is not None,
+        )
 
     def _inputs(self, rows, batch, lengths, *, reference=False):
         return _vision_batch(
@@ -1329,8 +1356,9 @@ class VisionPreferenceBatches:
         with _preserved_preprocessing_rng():
             for index, indices in enumerate(self._schedule):
                 rows = [self._rows[item] for item in indices]
-                packed = self.pack(rows, self._widths[index])
-                surveyed.append(self._survey(self._inputs(rows, *packed)))
+                packed, shared = self.pack(rows, self._widths[index]), self.shared_prompt_length(index)
+                inputs = self._prefix_inputs(rows, packed[0], shared) if shared else self._inputs(rows, *packed)
+                surveyed.append(self._survey(inputs))
         forbidden = set().union(*(extents for _family, _padable, extents in surveyed))
         widths = []
         for width, (_family, padable, _extents) in zip(self._widths, surveyed):
@@ -1360,7 +1388,7 @@ class VisionPreferenceBatches:
         materialized = super().materialize(index, phase=phase)
         if planned:
             divergence = _vlm_family_divergence(
-                self._families[index], self._survey(materialized[0])[0],
+                self._families[index], self._survey(materialized[-1 if self.shared_prompt_length(index) else 0])[0],
             )
             if divergence is not None:
                 raise RuntimeError(
@@ -1487,7 +1515,7 @@ def create_preference_batch_plan(
 ):
     """Builds the finite preference plan for every objective; prompt_sink receives each row's rendered prompt text; a
     processor gives a vision plan; image rows re-read images per batch when images_from (default dataset,
-    formatting_func) is a Hugging Face Dataset without formatting_func; shared_prompt_ratio, for a text plan, runs each
+    formatting_func) is a Hugging Face Dataset without formatting_func; shared_prompt_ratio runs each
     pair's prompt once in batches it cuts by that ratio (FinitePreferenceBatchPlan.shared_prompt_length)."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
@@ -1586,7 +1614,7 @@ def create_preference_batch_plan(
         cycle_length=cycle_length,
         max_seq_length=length_policy.max_seq_length,
         pad_id=0 if pad_id is None else pad_id,
-        shared_prompt_ratio=None if vision else shared_prompt_ratio,
+        shared_prompt_ratio=shared_prompt_ratio,
         **vision,
     )
 
@@ -2432,6 +2460,8 @@ def _preference_hidden(model, batch):
 
 # mlx-lm stacks whose attention applies RoPE at cache.offset and masks through cache.make_mask on every layer.
 _SHARED_PROMPT_MODEL_TYPES = ("llama", "qwen2", "qwen3")
+# mlx-vlm stacks whose caches it covers: qwen3_5's linear-attention state, gemma4's windows and shared K/V.
+_SHARED_PROMPT_VLM_MODEL_TYPES = ("qwen3_5", "gemma4")
 
 
 def shared_prompt_problem(model, max_seq_length, *, lora_dropout=True):
@@ -2440,12 +2470,19 @@ def shared_prompt_problem(model, max_seq_length, *, lora_dropout=True):
 
     if _make_preference_cce_scorer(model) is None:
         return "it scores through the runtime CCE head, which this model's head rules out"
-    backbone, model_type = utils._get_text_backbone(model), getattr(model, "model_type", None)
-    if (model_type not in _SHARED_PROMPT_MODEL_TYPES or backbone is None or utils._is_vlm_model(model)
-            or getattr(model, "_unsloth_text_only_vlm", False)):
-        return f"model_type={model_type!r} is not one of {', '.join(_SHARED_PROMPT_MODEL_TYPES)}"
+    backbone = utils._get_text_backbone(model)
+    model_type = getattr(model, "model_type", None) or utils._config_get(getattr(model, "config", None), "model_type")
+    types = _SHARED_PROMPT_VLM_MODEL_TYPES if utils._is_vlm_model(model) else _SHARED_PROMPT_MODEL_TYPES
+    # A text-only VLM's ids path restarts Qwen's MRoPE positions at the suffix.
+    if model_type not in types or backbone is None or getattr(model, "_unsloth_text_only_vlm", False):
+        return (f"model_type={model_type!r} is not one of {', '.join(_SHARED_PROMPT_MODEL_TYPES)}, or "
+                f"{', '.join(_SHARED_PROMPT_VLM_MODEL_TYPES)} as a vision model")
     if ropes := utils._length_dependent_ropes(backbone):
         return f"its RoPE ({', '.join(ropes)}) may depend on the forward's length, not only the position"
+    if utils._shared_kv_slot_count(model):
+        return "this mlx-vlm leaves its K/V sharing to Unsloth's own slots, which cannot hold a shared prompt"
+    if any(getattr(layer, "enable_moe", False) for layer in backbone.layers):
+        return "its mixture-of-experts layers are not covered"
     window = getattr(backbone, "sliding_window", None)
     if any(getattr(layer, "use_sliding", False) for layer in backbone.layers) and (window or 0) < max_seq_length:
         return f"its {window}-token sliding window is shorter than max_seq_length={max_seq_length}"
@@ -2458,18 +2495,25 @@ def shared_prompt_problem(model, max_seq_length, *, lora_dropout=True):
 
 
 def _shared_prompt_hidden(model, batch, prefix):
-    """_preference_hidden's hidden states with each pair's leading prompt tokens prefix [pairs, shared] run once: every
-    chosen row, then every rejected row, continues from its prompt's per-layer K/V; None without a prefix."""
+    """_preference_hidden's hidden states with each pair's prompt prefix [pairs, shared] (a vision batch for a vision
+    plan) run once: every chosen, then every rejected row continues from its prompt's caches; None without a prefix."""
     if prefix is None:
         return None
-    from .utils import _PrefixKVSlot, _get_text_backbone
+    from .utils import _get_text_backbone, _prefix_cache, _vlm_hidden_states
 
-    ids = _preference_ids(batch)
-    repeats, shared = ids.shape[0] // prefix.shape[0], prefix.shape[1]
-    recorded = [_PrefixKVSlot() for _ in _get_text_backbone(model).layers]
-    head = _forward_text_hidden_states(model, prefix, cache=recorded)
-    extended = [_PrefixKVSlot(slot.recorded(), repeats) for slot in recorded]
-    tail = _forward_text_hidden_states(model, ids[:, shared:-1], cache=extended)
+    backbone, ids = _get_text_backbone(model), _preference_ids(batch)
+    pairs, shared = _preference_ids(prefix).shape
+    repeats, recorded = ids.shape[0] // pairs, _prefix_cache(backbone)
+    vision = isinstance(prefix, Mapping)
+    head = (_vlm_hidden_states if vision else _forward_text_hidden_states)(model, prefix, cache=recorded)
+    positions = {}
+    if vision and prefix.get("_unsloth_collated_position_ids"):
+        # The suffix is text, so MRoPE continues past the prompt's largest position on all axes, the image's included.
+        start = mx.concatenate([prefix["position_ids"].max(axis=-1, keepdims=True).max(axis=0, keepdims=True) + 1] * repeats, axis=1)  # noqa: E501
+        steps = start + mx.arange(ids.shape[1] - 1 - shared)
+        positions["position_ids"] = mx.broadcast_to(steps, (prefix["position_ids"].shape[0], *steps.shape[1:]))
+    extended = _prefix_cache(backbone, recorded, repeats)
+    tail = _forward_text_hidden_states(model, ids[:, shared:-1], cache=extended, **positions)
     return mx.concatenate([mx.concatenate([head] * repeats), tail], axis=1)
 
 

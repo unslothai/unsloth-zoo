@@ -1685,8 +1685,8 @@ class MLXORPOConfig(MLXTrainingConfig):
     num_generation_prompts: int = field(default=8, kw_only=True)
     generation_max_tokens: int = field(default=128, kw_only=True)
     generation_temperature: float = field(default=0.0, kw_only=True)
-    # Run each pair's shared prompt once for both rows (llama, qwen2 and qwen3 text models on the CCE head), in the
-    # batches where that cuts the padded tokens by at least shared_prompt_min_token_ratio.
+    # Run each pair's shared prompt once for both rows (llama/qwen2/qwen3 text, Qwen3.5/Gemma 4 vision models, CCE head),
+    # in the batches where that cuts the padded tokens by at least shared_prompt_min_token_ratio.
     shared_prompt_forward: bool = field(default=False, kw_only=True)
     shared_prompt_min_token_ratio: float = field(default=1.3, kw_only=True)
 
@@ -2603,8 +2603,6 @@ class MLXTrainer:
             return None
         if not args.use_cce:
             problem = "use_cce=False scores through full logits"
-        elif self._is_vlm:
-            problem = "vision rows are not supported yet"
         elif getattr(self, "distributed_world_size", 1) > 1:
             problem = "distributed processes split each batch's rows"
         elif float(getattr(args, "neftune_noise_alpha", 0.0) or 0.0) > 0:
