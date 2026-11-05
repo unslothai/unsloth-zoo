@@ -2288,6 +2288,23 @@ def _maybe_install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, pri
         return None
 
 
+_CONVERTER_PYTHON_IMPORTS = ("gguf", "google.protobuf", "sentencepiece", "mistral_common")
+
+
+def _ensure_converter_python_deps(print_output = False):
+    """pip install the converter's Python deps only when one is missing (and auto install is allowed)."""
+    def _missing(name):
+        try:
+            return importlib.util.find_spec(name) is None
+        except (ImportError, ValueError):
+            return True
+    if not any(_missing(name) for name in _CONVERTER_PYTHON_IMPORTS): return
+    if not _auto_install_enabled(): return
+    pip = check_pip()
+    try_execute(f"{pip} install gguf protobuf sentencepiece mistral_common", print_output = print_output)
+pass
+
+
 def install_llama_cpp(
     llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR,
     llama_cpp_targets = LLAMA_CPP_TARGETS,
@@ -2349,6 +2366,15 @@ def install_llama_cpp(
                 print(f"Unsloth: llama.cpp found at `{llama_cpp_folder}` -- using existing install.")
                 return quantizer, converter
             except Exception:
+                # just_clone_repo only needs the checkout's Python converters (LoRA GGUF export):
+                # an intact one is already enough, so skip the build-tool / package-manager probes.
+                if (
+                    just_clone_repo
+                    and is_source_checkout
+                    and os.path.isfile(os.path.join(llama_cpp_folder, "convert_lora_to_gguf.py"))
+                ):
+                    _ensure_converter_python_deps(print_output = print_output)
+                    return llama_cpp_folder
                 print("Unsloth: llama.cpp folder exists but binaries not found - will build")
                 needs_build = True
     else:
