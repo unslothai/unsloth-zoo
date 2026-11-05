@@ -2088,6 +2088,51 @@ def test_a_reference_model_scores_through_its_own_cce_kernel(kind):
 
 
 @metal_only
+@pytest.mark.parametrize("kind", ["dpo", "orpo", "cpo"])
+@pytest.mark.parametrize("family,checkpointed,compiled", [("llama", False, True), ("llama", True, False), ("qwen2", True, True), ("qwen3", False, False)])  # noqa: E501
+def test_preference_shared_prompt_matches_each_row_alone(monkeypatch, kind, family, checkpointed, compiled):
+    # Each row matches its run alone: its pair's K/V and RoPE offset, gradients across checkpoints, one reference pass.
+    import importlib
+    import numpy as np
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import preference as p
+    mod, rng = importlib.import_module(f"mlx_lm.models.{family}"), np.random.default_rng(11)
+    mx.random.seed(11)
+    model = mod.Model(mod.ModelArgs.from_dict(dict(model_type=family, hidden_size=64, num_hidden_layers=2, intermediate_size=96, num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=301, rope_theta=10000.0, max_position_embeddings=512, head_dim=16, tie_word_embeddings=family == "qwen2")))  # noqa: E501
+    model.freeze()
+    for layer in model.model.layers:
+        for name in ("q_proj", "k_proj", "v_proj"):
+            setattr(layer.self_attn, name, adapter := LoRALinear.from_base(getattr(layer.self_attn, name), r=4, scale=2.0))  # noqa: E501
+            adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.05
+    adapters = [module for _, module in mlx_utils.iter_mlx_lora_modules(model)]
+    assert p.shared_prompt_problem(model, 128) is None
+    # 64 shared tokens: each row's 70th predicts its first response token.
+    rows = [p.TokenizedPreferenceRow(q := tuple(rng.integers(3, 301, size).tolist()), (1, *rng.integers(3, 301, rng.integers(5, 40)).tolist()), q, (2, *rng.integers(3, 301, rng.integers(5, 40)).tolist())) for size in (70, 75, 81)]  # noqa: E501
+    plans = [p.FinitePreferenceBatchPlan(rows, [(0, 1, 2)], normalizers=[(sum(len(r.chosen) - 1 for r in rows), 3, 1)], cycle_length=1, max_seq_length=128, pad_id=0, shared_prompt_ratio=ratio) for ratio in (None, 1.0)]  # noqa: E501
+    for plan in plans:
+        plan.configure_cce_compaction(kind=kind)
+    policy = p.ReferencePolicy(scales=[(adapter, 0.0) for adapter in adapters]) if kind == "dpo" else None
+    objective = p.resolve_preference_objective(kind, beta=0.2, **{"dpo": {"loss_type": ["sigmoid", "ipo"]}, "cpo": {"loss_type": "simpo", "alpha": 0.1}}.get(kind, {}))  # noqa: E501
+    loss = getattr(p, f"make_{kind}_cce_loss_fn")(model, objective, **({"reference_policy": policy} if policy else {}))
+    shared, run_shared = [], p._shared_prompt_hidden
+    monkeypatch.setattr(p, "_shared_prompt_hidden", lambda m, b, prefix: (shared.append(prefix is not None), run_shared(m, b, prefix))[1])  # noqa: E501
+    grad = nn.value_and_grad(model, loss)
+    mx.eval(alone := grad(model, *plans[0].prepare_cce_batch(0, plans[0][0])))
+    if checkpointed:
+        mlx_utils.apply_gradient_checkpointing(model)
+    try:
+        run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state) if compiled else (lambda *b: grad(model, *b))  # noqa: E501
+        mx.eval(together := run(*plans[1].prepare_cce_batch(0, plans[1][0])))
+    finally:
+        mlx_utils.remove_gradient_checkpointing(model)
+    # Off, then on: the policy, and the DPO reference with it, each run the prompts once.
+    assert shared == [False] * (1 + (kind == "dpo")) + [True] * (1 + (kind == "dpo"))
+    assert all(mx.allclose(want, got, atol=1e-5, rtol=1e-4).item() for (_, want), (_, got) in zip(tree_flatten(alone[0]), tree_flatten(together[0])))  # noqa: E501
+    for (name, want), (_, got) in zip(tree_flatten(alone[1]), tree_flatten(together[1])):
+        assert mx.abs(want).max().item() > 0 and mx.allclose(got, want, atol=1e-5, rtol=1e-4).item(), name
+
+
+@metal_only
 @pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
 def test_grpo_cce_scores_like_the_logits(monkeypatch, head):
     from types import SimpleNamespace

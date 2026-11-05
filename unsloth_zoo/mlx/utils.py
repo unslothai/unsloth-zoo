@@ -963,7 +963,9 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
-        slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
+        slot = next((a for a in args if isinstance(a, (_SharedKVSlot, _PrefixKVSlot))), None)
+        if slot is None and isinstance(kwargs.get("cache"), _PrefixKVSlot):
+            slot = kwargs["cache"]
         if slot is None:
             if "shared_kv" in kwargs:
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
@@ -1196,6 +1198,51 @@ class _SharedKVSlot:
 
     def recorded(self):
         return self.keys, self.values
+
+
+# RoPE class names whose mlx-lm/mlx-vlm implementations rotate by position alone. Others pick their frequencies from the
+# forward's length or the batch's largest offset (dynamic NTK, longrope's short/long switch). A name cannot vouch for an
+# arbitrary model's own class, so callers gate on model type first.
+_POSITION_ONLY_ROPES = frozenset((
+    "RoPE", "EagerRoPE", "Llama3RoPE", "YarnRoPE", "ProportionalRoPE", "MRoPERotaryEmbedding", "Qwen3_5RotaryEmbedding",
+))
+
+
+def _length_dependent_ropes(backbone):
+    """RoPE classes in backbone not known to rotate by position alone."""
+    names = {type(module).__name__ for _, module in backbone.named_modules()}
+    return sorted(name for name in names if ("RoPE" in name or "Rotary" in name) and name not in _POSITION_ONLY_ROPES)
+
+
+class _PrefixKVSlot:
+    """A layer's cache for a shared-prompt forward. Built without a prefix, it records the prompt's post-RoPE K/V; built
+    from them, it puts the prompt batch, repeated repeats times as a preference batch holds every chosen row before any
+    rejected one, ahead of its rows' own K/V at offset = prompt length, so attention applies RoPE there and a
+    bottom-right causal mask. Re-runnable under mx.checkpoint."""
+
+    __slots__ = ("keys", "values", "offset", "repeats", "recording")
+    borrow, install, recorded = _SharedKVSlot.borrow, _SharedKVSlot.install, _SharedKVSlot.recorded
+
+    def __init__(self, prefix=None, repeats=1):
+        self.keys, self.values = (None, None) if prefix is None else prefix
+        self.offset = 0 if prefix is None else prefix[0].shape[-2]
+        self.repeats, self.recording = repeats, prefix is None
+
+    def update_and_fetch(self, keys, values):
+        if self.recording:
+            self.keys, self.values = keys, values
+            return keys, values
+        return tuple(
+            mx.concatenate([mx.concatenate([prefix] * self.repeats), own], axis=-2)
+            for prefix, own in ((self.keys, keys), (self.values, values))
+        )
+
+    def make_mask(self, N, return_array=False, window_size=None):
+        if window_size is None and not return_array:
+            return "causal" if N > 1 else None
+        queries, keys = mx.arange(self.offset, self.offset + N)[:, None], mx.arange(self.offset + N)[None]
+        mask = queries >= keys
+        return mask if window_size is None else mask & (queries < keys + window_size)
 
 
 # Language models that scale token embeddings by sqrt(hidden_size) on the ids path only, so multimodal forwards lose the

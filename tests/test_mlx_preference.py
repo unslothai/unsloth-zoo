@@ -1328,6 +1328,51 @@ def test_a_precomputed_reference_scores_through_the_cce_scorer(monkeypatch):
         p.precompute_reference_logps(plan, TinyModel(), p.ReferencePolicy(), batch_size=2)
 
 
+def test_a_pair_plan_runs_each_shared_prompt_once_only_where_it_pays():
+    # The prefix: on the 32 rung, before each row's last prompt token and the chosen/rejected split, from the batch.
+    from unsloth_zoo.mlx import preference as p
+    row = lambda prompt, chosen, rejected, part=None: p.TokenizedPreferenceRow(ids := tuple(range(3, 3 + prompt)), tuple(range(500, 500 + chosen)), tuple(2 if i == part else t for i, t in enumerate(ids)), tuple(range(900, 900 + rejected)))  # noqa: E501, E731
+    pairs = [row(70, 30, 20), row(97, 10, 25), row(64, 60, 50), row(98, 60, 50), row(98, 60, 50, part=45), row(98, 60, 50, part=10)]  # noqa: E501
+    plan = lambda ratio: p.FinitePreferenceBatchPlan(pairs, [(0, 1), (2, 3), (4, 3), (5, 3)], normalizers=[(1, 2, 1)] * 4, cycle_length=4, max_seq_length=256, pad_id=0, shared_prompt_ratio=ratio)  # noqa: E501, E731
+    off, loose, on = plan(None), plan(1.0), plan(1.3)
+    assert [loose.shared_prompt_length(index) for index in range(4)] == [64, 32, 32, 0]
+    assert [loose.batch_family(index)[-1] for index in range(3)] == [("shared_prompt", 64)] + [("shared_prompt", 32)] * 2 and off.batch_family(3) == loose.batch_family(3) == off.batch_family(0) == loose.batch_family(0)[:-1]  # noqa: E501
+    assert [on.shared_prompt_length(index) for index in range(4)] == [64, 0, 0, 0]  # 2 * 127 padded positions against 64 + 2 * 63 pay 1.34; 32 of 159 do not  # noqa: E501
+    shared, plain = on.materialize(0), off.materialize(0)
+    assert len(plain) == 3 and len(shared) == 6 and shared[3] is None and shared[4] is None
+    assert shared[5].tolist() == plain[0][:2, :64].tolist() and len(on.materialize(3)) == 3
+
+
+def test_shared_prompt_forward_is_refused_where_it_is_not_exact(monkeypatch):
+    from types import SimpleNamespace as NS
+    from unsloth_zoo.mlx import preference as p
+    from unsloth_zoo.mlx.trainer import MLXCPOConfig, MLXDPOConfig, MLXORPOConfig, MLXTrainer
+    monkeypatch.setattr(p, "_make_preference_cce_scorer", lambda model: getattr(model, "head", print))
+    model = lambda kind="qwen3", sliding=False, window=None, keep=1.0, rope="RoPE", **extra: NS(model_type=kind, model=NS(layers=[NS(use_sliding=sliding)], sliding_window=window, named_modules=lambda: [("layers.0.self_attn.rope", type(rope, (), {})())]), named_modules=lambda: [("q_proj", NS(lora_a=0, lora_b=0, dropout=NS(_p_1=keep)))], **extra)  # noqa: E501, E731
+    assert not any(p.shared_prompt_problem(m, 512, lora_dropout=drop) for m, drop in ((model("qwen2"), True), (model("llama", True, 512), True), (model(keep=0.9), False)))  # noqa: E501
+    assert not any(p.shared_prompt_problem(model(rope=name), 512) for name in ("Llama3RoPE", "EagerRoPE", "YarnRoPE", "ProportionalRoPE", "MRoPERotaryEmbedding", "Qwen3_5RotaryEmbedding"))  # noqa: E501
+    assert "DynamicNTKScalingRoPE" in p.shared_prompt_problem(model(rope="DynamicNTKScalingRoPE"), 512) and p.shared_prompt_problem(model(rope="SuScaledRoPE"), 512)  # noqa: E501
+    assert "model_type='jina_vlm'" in p.shared_prompt_problem(model("jina_vlm", rope="RoPE"), 512)
+    assert all(p.shared_prompt_problem(m, 512) for m in (model(head=None), model("gemma3"), model("qwen3_5"), model("llama", True, 256), model(keep=0.9), model(_unsloth_text_only_vlm=True), model(_is_vlm_model=True))) and not any(config().shared_prompt_forward for config in (MLXORPOConfig, MLXDPOConfig, MLXCPOConfig))  # noqa: E501
+    args = lambda **kw: NS(**{"shared_prompt_forward": True, "use_cce": True, "max_seq_length": 512, "disable_dropout": True, "neftune_noise_alpha": 0.0, "shared_prompt_min_token_ratio": 1.5, **kw})  # noqa: E501, E731
+    trainer = lambda **kw: NS(**{"_is_vlm": False, "model": model(), "ref_model": None, "preference_kind": "dpo", "distributed_world_size": 1, **kw})  # noqa: E501, E731
+    ratio = lambda run=trainer(), options=args(): MLXTrainer._shared_prompt_ratio(run, options)  # noqa: E731
+    assert ratio() == ratio(trainer(ref_model=model())) == 1.5 and ratio(options=args(shared_prompt_forward=False)) is None  # noqa: E501
+    for run in [(trainer(), args(use_cce=False)), (trainer(_is_vlm=True), args()), (trainer(distributed_world_size=2), args()), (trainer(), args(neftune_noise_alpha=5.0)), (trainer(model=model(keep=0.9)), args(disable_dropout=False)), (trainer(ref_model=model("gemma3")), args())]:  # noqa: E501
+        with pytest.warns(UserWarning, match="shared_prompt_forward is off"):
+            assert ratio(*run) is None
+
+
+def test_the_trainer_hands_its_shared_prompt_ratio_to_every_pair_plan(tmp_path, monkeypatch):
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer, MLXTrainer
+    ratios, make = [], trainer_module.create_preference_batch_plan
+    monkeypatch.setattr(MLXTrainer, "_shared_prompt_ratio", lambda self, args: 1.25)
+    monkeypatch.setattr(trainer_module, "create_preference_batch_plan", lambda *a, **kw: ratios.append(kw["shared_prompt_ratio"]) or make(*a, **kw))  # noqa: E501
+    _run_generation_trainer(MLXDPOTrainer(_tiny_model(tail=True), Tokenizer(), rows(3), eval_dataset=rows(2), args=MLXDPOConfig(**_generation_common(tmp_path, generate_during_eval=False))), monkeypatch, [])  # noqa: E501
+    assert ratios == [1.25, 1.25]
+
+
 def test_a_reference_adapter_without_a_scale_scores_at_one(tmp_path):
     import json
     import mlx.core as mx
