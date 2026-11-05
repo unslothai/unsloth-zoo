@@ -1114,14 +1114,25 @@ class _WarpedLogits(_Delegate):
         return self._warp(self._target(*args, **kwargs))
 
 
-_PER_ROW_VERIFIED_MODEL_TYPES = frozenset(("gemma4",))
+# Model types verified per-row; True: prefill each prompt alone, since a pad in Qwen3.5's linear-attention state stays.
+_PREFILL_ALONE_BY_VERIFIED_TYPE = {"gemma4": False, "qwen3_5": True}
 
 
 class _LanguageModelLogits(_Delegate):
     _is_vlm_model = False
 
     def __call__(self, *args, **kwargs):
-        output = self._target(*args, **kwargs)
+        import mlx.core as mx
+
+        target, cache = self._target, kwargs.get("cache")
+        # Rows sit at their cache offsets; without position_ids MRoPE would reuse the deltas the last forward left.
+        if hasattr(target, "_rope_deltas") and "position_ids" not in kwargs:
+            rows, length = (args[0] if args else kwargs["inputs"]).shape
+            offset = cache[getattr(getattr(target, "model", None), "fa_idx", 0)].offset if cache else 0
+            start = offset[:, None] if isinstance(offset, mx.array) and offset.ndim else offset
+            positions = mx.broadcast_to(mx.arange(length)[None] + start, (rows, length)).astype(mx.int32)
+            kwargs["position_ids"] = mx.broadcast_to(positions[None], (3, rows, length))
+        output = target(*args, **kwargs)
         return getattr(output, "logits", output)
 
 
@@ -1134,9 +1145,11 @@ def text_engine_model(model):
     config = getattr(model, "config", None)
     model_type = config.get("model_type") if isinstance(config, Mapping) else getattr(config, "model_type", None)
     language = getattr(model, "language_model", None)
-    if language is None or model_type not in _PER_ROW_VERIFIED_MODEL_TYPES or _length_dependent_ropes(language):
+    if language is None or model_type not in _PREFILL_ALONE_BY_VERIFIED_TYPE or _length_dependent_ropes(language):
         return None
-    return _LanguageModelLogits(language)
+    engine = _LanguageModelLogits(language)
+    engine.prefill_alone = _PREFILL_ALONE_BY_VERIFIED_TYPE[model_type]
+    return engine
 
 
 class _PerRowSampler:
@@ -2140,9 +2153,9 @@ class _TextBatchSession:
         )
         return ids[-1:], ids[:-1], cache
 
-    def prefill_shared(self, requests) -> dict:
+    def prefill_prompts(self, requests, alone=False) -> dict:
         """``(last token, prompt before it, its cache)`` of every text prompt several requests share, prefilled once as
-        a one-row batch prefills it; rows only merge these caches into their batch, never update them."""
+        a one-row batch prefills it, or of every prompt when ``alone``; rows only merge these caches, never update them."""
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
 
@@ -2155,7 +2168,8 @@ class _TextBatchSession:
         shared = {}
         with mx.stream(importlib.import_module("mlx_lm.generate").generation_stream):
             for ids, count in counts.items():
-                if count < 2 or len(ids) < 2:
+                wanted = alone or count > 1
+                if not wanted or len(ids) < 2:
                     continue
                 fresh = make_prompt_cache(self.adapter.model, self.adapter.defaults.max_kv_size)
                 cache = [entry.merge([entry]) for entry in fresh]
@@ -2273,7 +2287,8 @@ class _TextBatchAdapter:
         session = _TextBatchSession(self)
         active_error = None
         try:
-            shared = session.prefill_shared(requests) if self.defaults.share_prompt_prefill else {}
+            alone = getattr(self.model, "prefill_alone", False)
+            shared = session.prefill_prompts(requests, alone) if self.defaults.share_prompt_prefill or alone else {}
             for request in requests:
                 key = tuple(_encode_prompt(self.tokenizer, request)) if shared and request.image is None else None
                 session.add(request, shared.get(key))

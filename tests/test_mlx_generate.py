@@ -592,7 +592,7 @@ def test_vision_text_engine_is_the_language_model_only_for_verified_types_with_p
     from unsloth_zoo.mlx import generate as engine
     assert engine._LanguageModelLogits(lambda *_, **__: types.SimpleNamespace(logits=7))() == 7
     for model_type, rope, routed in (("gemma4", "RoPE", True), ("gemma4", "ProportionalRoPE", True), ("jina_vlm", "RoPE", False),
-                                     ("qwen3_5", "Qwen3_5RotaryEmbedding", False), ("gemma4", "SuScaledRoPE", False),
+                                     ("qwen3_5", "Qwen3_5RotaryEmbedding", True), ("gemma4", "SuScaledRoPE", False),
                                      ("gemma4", "DynamicNTKScalingRoPE", False), ("gemma4", "DynamicRotaryEmbedding", False)):
         language = types.SimpleNamespace(named_modules=lambda rope=rope: [("rope", type(rope, (), {})())])
         config = {"model_type": model_type} if rope == "RoPE" else types.SimpleNamespace(model_type=model_type)

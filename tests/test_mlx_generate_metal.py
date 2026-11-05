@@ -371,6 +371,16 @@ def test_rows_sharing_a_prompt_prefill_it_once_and_decode_as_if_each_prefilled_i
     assert shared == alone and prefills == 2 and own
 
 
+@metal_only
+def test_qwen3_5_text_rows_decode_as_each_alone_on_a_fresh_model_despite_stale_mrope_state():
+    from mlx_vlm import load
+    from unsloth_zoo.mlx.generate import GenerationRequest, generate_batch, text_engine_model
+    model, processor = load(QWEN_VLM_MODEL)
+    engine, rows = text_engine_model(types.SimpleNamespace(_is_vlm_model=True, language_model=model.language_model, config=model.config)), [GenerationRequest(prompt_token_ids=processor.tokenizer.encode(p, add_special_tokens=False), max_tokens=8) for p in ("Hi", "Two plus two is", " ".join(["The quick brown fox jumps over the lazy dog."] * 30))]  # noqa: E501
+    assert getattr(engine, "prefill_alone", False) and (alone := [generate_batch(engine, processor.tokenizer, [row])[0].token_ids for row in rows])  # noqa: E501
+    assert not setattr(model.language_model, "_position_ids", mx.zeros((3, 1, 512), mx.int32)) and not setattr(model.language_model, "_rope_deltas", mx.array([[40]])) and [result.token_ids for result in generate_batch(engine, processor.tokenizer, rows)] == alone  # noqa: E501
+
+
 def _own_copy(value):
     if isinstance(value, mx.array):
         return value + 0
