@@ -51,7 +51,7 @@ def _impl_args(h, w, t, rows, need_h = True):
 @pytest.mark.parametrize("rows", [64, 100])
 def test_head_copied_to_fp32_once_per_call(dtype, rows):
     torch.manual_seed(0)
-    N, H, V = 512, 64, 1003  # not a multiple of 8: two GEMMs per chunk
+    N, H, V = 512, 64, 1003
     h = (torch.randn(N, H) * 0.5).to(dtype)
     w = (torch.randn(V, H) * 0.5).to(dtype)
     t = torch.randint(0, V, (N,))
