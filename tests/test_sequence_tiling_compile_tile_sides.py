@@ -184,3 +184,49 @@ def test_a_tile_checkpointed_inside_a_block_recomputes_with_the_blocks_inline_fl
     torch.testing.assert_close(x.grad, xr.grad)
     for a, b in zip(mlp.parameters(), ref.parameters()):
         torch.testing.assert_close(a.grad, b.grad)
+
+
+_CHURN = [0]
+
+
+class _GuardChurnMLP(GatedMLP):
+    """Reads a global Dynamo guards on: every new value recompiles the tile frame."""
+
+    def forward(self, x):
+        return super().forward(x) * (1.0 + 0.0 * _CHURN[0])
+
+
+@pytest.mark.parametrize("train", [True, False])
+def test_a_tile_frame_past_the_recompile_limit_runs_eager(monkeypatch, train):
+    # fullgraph=True turns the recompile limit into FailOnRecompileLimitHit, which is not a TorchDynamoException;
+    # without fullgraph Dynamo ran the frame eagerly. The tile must fall back to eager, not raise.
+    monkeypatch.setenv("UNSLOTH_TILED_COMPILE", "compile_tile")
+    limit = "recompile_limit" if "recompile_limit" in torch._dynamo.config._config else "cache_size_limit"  # torch 2.6
+    with torch._dynamo.config.patch(**{limit: 2}):
+        _past_the_recompile_limit(train)
+
+
+def _past_the_recompile_limit(train):
+    torch._dynamo.reset()
+    ST._COMPILED_TILES.clear()
+    ST._EAGER_TILES.clear()
+    torch.manual_seed(0)
+    mlp = _GuardChurnMLP()
+    ref = copy.deepcopy(mlp)
+    for i in range(4):
+        _CHURN[0] = i
+        x = torch.randn(1, 37, H, requires_grad = train)
+        if train:
+            y = ST._tiled_call_eager(mlp, x, n_tiles = 4, needs_rng = False, output_contract = None, compile_tile = True)
+            y.pow(2).sum().backward()
+            xr = x.detach().clone().requires_grad_()
+            ref(xr).pow(2).sum().backward()
+            torch.testing.assert_close(x.grad, xr.grad)
+        else:
+            with torch.no_grad():
+                y = ST._tiled_call_eager(mlp, x, n_tiles = 4, needs_rng = False, output_contract = None, compile_tile = True)
+                torch.testing.assert_close(y, ref(x))
+    assert ST._EAGER_TILES, "the frame past the limit should have turned eager"
+    if train:
+        for a, b in zip(mlp.parameters(), ref.parameters()):
+            torch.testing.assert_close(a.grad, b.grad)

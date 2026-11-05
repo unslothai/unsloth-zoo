@@ -413,7 +413,10 @@ pass
 _COMPILED_TILES = {}
 # Tile frames Dynamo cannot compile whole; eager from then on.
 _EAGER_TILES = set()
-_TRACE_ERRORS = (torch._dynamo.exc.TorchDynamoException,)
+# A fullgraph frame past the recompile limit raises FailOnRecompileLimitHit, a plain Exception (torch 2.6 to 2.15).
+_TRACE_ERRORS = (torch._dynamo.exc.TorchDynamoException,) + tuple(
+    e for e in (getattr(torch._dynamo.exc, "FailOnRecompileLimitHit", None),) if isinstance(e, type)
+)
 
 
 def _compiled_tile_for(key):
