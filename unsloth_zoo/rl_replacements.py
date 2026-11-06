@@ -1453,7 +1453,8 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
 
     TRL >= 1.10: the mean entropy over the tokens the policy term acts on, divided by the
     accumulation steps (1 in eval) for every loss_type. TRL 1.8 and 1.9 instead divided cispo /
-    dapo / vespo by the policy term's own global token normalizer, without the mean.
+    dapo / vespo by the policy term's own global token normalizer, without the mean; from 1.9.1
+    that normalizer is rescaled to one accumulation window (trl#6024).
     """
     weights = completion_mask.to(torch.float32)
     if entropy_mask is not None:
