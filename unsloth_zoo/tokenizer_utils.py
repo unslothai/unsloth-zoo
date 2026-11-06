@@ -61,7 +61,7 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    # Read-only below (reductions + index gather), so no full vocab x hidden clones.
+    # Read-only: no vocab x hidden clones.
     embedding_matrix = model.get_input_embeddings ().weight
     lm_head_matrix   = model.get_output_embeddings().weight
 

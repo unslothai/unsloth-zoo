@@ -873,7 +873,7 @@ def _read_video_decord(
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
     idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
     video = vr.get_batch(idx).asnumpy()
-    video = torch.from_numpy(video).permute(0, 3, 1, 2)  # asnumpy() is a fresh array; TCHW view, no copy
+    video = torch.from_numpy(video).permute(0, 3, 1, 2)  # asnumpy() returns a fresh array
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: decord:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
     sample_fps = nframes / max(total_frames, 1e-6) * video_fps
