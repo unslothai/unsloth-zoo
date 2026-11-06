@@ -1328,6 +1328,23 @@ def test_a_precomputed_reference_scores_through_the_cce_scorer(monkeypatch):
         p.precompute_reference_logps(plan, TinyModel(), p.ReferencePolicy(), batch_size=2)
 
 
+def test_repeated_prompt_layout_maps_repeats_to_their_pair_and_softcap_sums_keep_their_chunks(monkeypatch):
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx import preference as p
+    from unsloth_zoo.mlx.cce import runtime_cce
+    mx.random.seed(0)
+    once, positions = p._repeated_prompt_layout(4, 5, 2, 3)
+    grid = np.arange(20).reshape(4, 5)
+    assert np.asarray(once).tolist() == [i for i in range(20) if i < 10 or i % 5 >= 3]
+    assert np.asarray(once)[np.asarray(positions)].reshape(4, 5).tolist() == np.concatenate([grid[:2], np.concatenate([grid[:2, :3], grid[2:, 3:]], 1)]).tolist()  # noqa: E501
+    # Past this budget the vocabulary chunk follows the row count: 12 rows take 2048-entry chunks, 6 rows 4096.
+    monkeypatch.setattr(runtime_cce, "_CHUNK_BUDGET", 12 * 4 * 2048)
+    hidden, weight = mx.random.normal((12, 8)), mx.random.normal((65536, 8))
+    whole = p._head_logit_sums(hidden, weight, None, None, {}, 30.0)
+    assert mx.array_equal(p._head_logit_sums(hidden[:6], weight, None, None, {}, 30.0, chunk_rows=12), whole[:6])
+
+
 def test_a_pair_plan_runs_each_shared_prompt_once_only_where_it_pays():
     # The prefix: on the 32 rung, before each row's last prompt token and the chosen/rejected split, from the batch.
     from unsloth_zoo.mlx import preference as p

@@ -7,7 +7,7 @@ import warnings
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -2517,6 +2517,10 @@ def _shared_prompt_hidden(model, batch, prefix):
     return mx.concatenate([mx.concatenate([head] * repeats), tail], axis=1)
 
 
+def _repeated_prompt_span(prefix, pairs):
+    return None if prefix is None else (pairs, _preference_ids(prefix).shape[1])
+
+
 def _token_cross_entropy(logits, targets, mask):
     # An image token may lie past the output head (Mllama's does), so unscored labels are gathered as token 0, as TRL does.
     targets = mx.where(mask > 0, targets, 0)
@@ -2968,13 +2972,13 @@ def _scatter_rows(values, indices, size):
     return mx.zeros((size,), values.dtype).at[mx.maximum(indices, 0)].add(values)
 
 
-def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
+def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap, chunk_rows=None):
     """Per-row logit sums over the vocabulary, chunked; uncapped logits are linear in the head, so sums project onto
-    summed weight rows; a softcap needs the logits themselves."""
+    summed weight rows; a softcap needs the logits themselves, chunked as for chunk_rows rows (default hidden's)."""
     vocab = weight.shape[0]
     # Without a softcap a chunk holds weight rows, not a row of logits per token.
     step = _resolve_chunk_size(
-        0, hidden.shape[0] if softcap else hidden.shape[-1], vocab,
+        0, (hidden.shape[0] if chunk_rows is None else chunk_rows) if softcap else hidden.shape[-1], vocab,
     )
     total = 0.0
     for start in range(0, vocab, step):
@@ -2989,6 +2993,17 @@ def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
         else:
             total = total + chunk[0].astype(mx.float32).sum(axis=0)
     return total if softcap else hidden.astype(mx.float32) @ total
+
+
+@lru_cache(maxsize=64)
+def _repeated_prompt_layout(rows, width, pairs, length):
+    grid = np.arange(rows * width).reshape(rows, width)
+    source = grid.copy()
+    source[pairs:, :length] = grid[np.arange(pairs, rows) % pairs, :length]
+    unique = np.flatnonzero(source.reshape(-1) == grid.reshape(-1))
+    position = np.zeros(rows * width, dtype=np.int64)
+    position[unique] = np.arange(unique.size)
+    return mx.array(unique.astype(np.int32)), mx.array(position[source.reshape(-1)].astype(np.int32))
 
 
 def _make_preference_cce_scorer(model, *, temperature=1.0):
@@ -3022,11 +3037,12 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
     by_mode, loss_only = utils._runtime_cce_by_mode(**options), utils._get_runtime_cce(**options)
 
     def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True,
-              differentiated, hidden=None):
+              differentiated, hidden=None, shared=None):
         """Token cross entropy and logit sums per position as float32 grids; cross entropy is zero outside supervised;
         indices limit the rows, and the sums too unless every_position; without logit_sums the sums are None; every call
         states differentiated, False for a score no gradient reaches, since a training-mode kernel builds the hidden
-        gradient in its forward; hidden replaces the model's hidden states."""
+        gradient in its forward; hidden replaces the model's hidden states; shared=(pairs, length): rows past pairs
+        repeat those rows' first length positions, whose softcapped logit sums are then computed once."""
         kernel = by_mode(model) if differentiated else loss_only
         targets = _preference_ids(batch)[:, 1:]
         hidden = _preference_hidden(model, batch) if hidden is None else hidden
@@ -3054,7 +3070,12 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
         if not logit_sums:
             return ce.reshape(targets.shape), None
         summed = hidden if every_position or indices is None else rows
-        sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
+        if softcap and summed is hidden and shared is not None:
+            once, positions = _repeated_prompt_layout(*targets.shape, *shared)
+            sums = _head_logit_sums(mx.take(hidden, once, axis=0), weight, scales, biases, quantization, softcap,
+                                    chunk_rows=hidden.shape[0])[positions]
+        else:
+            sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
         if indices is not None and summed is rows:
             sums = _scatter_rows(sums, indices, targets.size)
         return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape))
@@ -3238,7 +3259,8 @@ def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None, 
         logits, ce = _preference_forward(model, batch, supervised)
     else:
         ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True,
-                          differentiated=differentiated, hidden=_shared_prompt_hidden(model, batch, prefix))
+                          differentiated=differentiated, hidden=_shared_prompt_hidden(model, batch, prefix),
+                          shared=_repeated_prompt_span(prefix, pairs))
         logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
         mask.sum(axis=1), mx.array(1.0),
@@ -3268,7 +3290,8 @@ def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=No
         logits, ce = _preference_forward(model, batch, mask)
     else:
         ce, sums = scorer(model, batch, mask > 0, cce_indices, every_position=True,
-                          differentiated=differentiated, hidden=_shared_prompt_hidden(model, batch, prefix))
+                          differentiated=differentiated, hidden=_shared_prompt_hidden(model, batch, prefix),
+                          shared=_repeated_prompt_span(prefix, pairs))
         logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
     if objective.length_normalized:

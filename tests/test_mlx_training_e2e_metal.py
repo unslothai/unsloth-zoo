@@ -2180,6 +2180,17 @@ def test_preference_shared_prompt_matches_each_row_alone(tmp_path, monkeypatch, 
     # repeats bit for bit, so compiling it is the regrouping that sizes its noise. Qwen3.5 adds a capped split term.
     mx.eval(at_split := grad(model, *plans[1].prepare_cce_batch(0, plans[1][0])), nearby := grad(model, *plans[2].prepare_cce_batch(0, plans[2][0])))  # noqa: E501
     mx.eval(reordered := grad(model, *plans[3].prepare_cce_batch(0, plans[3][0])))
+    laid = []
+    for compacted in (False, True) if kind != "dpo" else ():  # fixed-shape regression: repeats summed once match
+        plans[1].configure_cce_compaction(compacted, kind=kind)
+        with monkeypatch.context() as patched:
+            patched.setattr(p, "_repeated_prompt_layout", lambda *a, layout=p._repeated_prompt_layout: laid.append(1) or layout(*a))  # noqa: E501
+            mx.eval(once := grad(model, *plans[1].prepare_cce_batch(0, plans[1][0])))
+            engaged, laid[:] = bool(laid), []
+            patched.setattr(p, "_repeated_prompt_span", lambda *_: None)
+            mx.eval(each := grad(model, *plans[1].prepare_cce_batch(0, plans[1][0])))
+        differing = [n for (n, a), (_, b) in zip(tree_flatten(once), tree_flatten(each)) if not mx.array_equal(a, b).item()]  # noqa: E501
+        assert engaged == (family == "gemma4") and not laid and differing == []  # only Gemma 4's head is softcapped
     mx.eval(regrouped := moved if compiled else mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)(*plans[0].prepare_cce_batch(0, plans[0][0])))  # noqa: E501
     for (name, want), (_, got), (_, a), (_, b), (_, c), (_, r), (_, g) in zip(*map(tree_flatten, (alone, together, at_split, nearby, moved, reordered, regrouped))):  # noqa: E501
         noise = mx.maximum(mx.maximum(mx.abs(c - want), mx.abs(r - want)), mx.abs(g - want))
