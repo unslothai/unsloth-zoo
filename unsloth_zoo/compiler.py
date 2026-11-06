@@ -1333,7 +1333,7 @@ def higher_precision_sqrt_mean(source):
             f"{new_variable} = {mean}(({variable}).to(torch.float32)**{power}{rest})"
             f"{spaces}"
             f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32)"
-            f"{ending}.to(({variable}).dtype))\n"
+            f"{ending}).to(({variable}).dtype)\n"
         )
         source = source.replace(full_match, new)
     return source
