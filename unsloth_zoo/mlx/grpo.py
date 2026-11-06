@@ -47,10 +47,12 @@ from .utils import (
     _finite_batch_schedule,
     _finite_text_pad_width,
     _get_processor_tokenizer,
+    _mlx_rng_key,
     _normalize_mlx_messages,
     _normalize_seed,
     _prepare_vlm_batch_for_compile,
     _preserved_preprocessing_rng,
+    _restore_mlx_rng_key,
     _processor_vlm_inputs,
     _right_pad_vlm_rows,
     _to_mx_vlm_batch,
@@ -263,10 +265,10 @@ def grpo_cce_indices(lengths, width, capacity):
 def _scored_as_step(logps, step_compiled):
     """Score as the training step's forward, which MLX runs differently under its trace."""
 
-    toggles, compiled = {}, {}
+    toggles, compiled, failed = {}, {}, []
 
     def traced(model, batch, lengths, indices=None):
-        if step_compiled():
+        if step_compiled() and not failed:
             # Compiled like the step: its fused kernels differ from the eager ones in some vision towers (Qwen3.5's).
             # A trace keeps its model and the Python numbers it read, such as the adapter scales a reference turns
             # off, so each model and setting of them gets its own; the random state is threaded, as in the step.
@@ -277,11 +279,18 @@ def _scored_as_step(logps, step_compiled):
                     if isinstance(getattr(module, name, None), (bool, int, float))
                 ]
             key = (id(model), *(getattr(module, name) for module, name in toggles[id(model)]))
-            if key not in compiled:
-                run = lambda batch, lengths, indices: mx.value_and_grad(
-                    lambda anchor: (anchor, logps(model, batch, lengths, indices)))(mx.array(0.0))[0][1]
-                compiled[key] = mx.compile(run, inputs=[model.state, mx.random.state], outputs=[mx.random.state])
-            return compiled[key](batch, lengths, indices)
+            rng = _mlx_rng_key()
+            try:
+                if key not in compiled:
+                    run = lambda batch, lengths, indices: mx.value_and_grad(
+                        lambda anchor: (anchor, logps(model, batch, lengths, indices)))(mx.array(0.0))[0][1]
+                    compiled[key] = mx.compile(run, inputs=[model.state, mx.random.state], outputs=[mx.random.state])
+                return compiled[key](batch, lengths, indices)
+            except Exception as error:
+                # Scoring runs while a batch is fetched, outside the step's compile fallback: score eagerly instead.
+                failed.append(error)
+                _restore_mlx_rng_key(rng)
+                warnings.warn(f"Unsloth: compiling GRPO scoring failed ({error}); scoring eagerly.", RuntimeWarning)
         run = lambda: (mx.array(0.0), logps(model, batch, lengths, indices))
         return nn.value_and_grad(model, run)()[0][1]
 

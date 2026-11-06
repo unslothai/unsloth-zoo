@@ -2178,6 +2178,29 @@ def test_compiled_grpo_scorer_draws_fresh_noise_in_step_with_eager():
 
 
 @metal_only
+def test_compiled_grpo_scorer_falls_back_to_eager_when_compile_fails(monkeypatch):
+    """A scoring trace that fails, inside a batch fetch, scores eagerly from the same random state instead of aborting."""
+    from unsloth_zoo.mlx import grpo
+    model, batch = nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.5)), mx.ones((2, 8))
+    eager = grpo._scored_as_step(lambda model, batch, *_: model(batch), lambda: False)
+    mx.random.seed(0)
+    want = eager(model, batch, None)
+    mx.eval(want)
+
+    def broken(fn, **_):
+        def run(*args):
+            mx.random.uniform()  # a trace that drew from the stream before failing
+            raise RuntimeError("trace failed")
+        return run
+    monkeypatch.setattr(mx, "compile", broken)
+    scored = grpo._scored_as_step(lambda model, batch, *_: model(batch), lambda: True)
+    mx.random.seed(0)
+    with pytest.warns(RuntimeWarning, match="scoring eagerly"):
+        got = scored(model, batch, None)
+    assert mx.array_equal(got, want).item()
+
+
+@metal_only
 @pytest.mark.parametrize("beta,lora", [(0.0, True), (0.04, True), (0.04, False)])  # full fine-tune: arrays swap
 def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lora):
     import shutil, types, numpy as np, PIL.Image, mlx_vlm.utils, mlx_vlm.models.qwen2_5_vl as qwen2_5_vl
