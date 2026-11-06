@@ -5023,6 +5023,8 @@ def _dense_prefill_qmm(module, x, bindings):
         return None
     if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
         return None
+    if x.size == x.shape[-1]:  # one row: the staged and dense routes need 1024, the tiled tile pads past stock's
+        return None
     w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
     if not isinstance(w, mx.array) or w.ndim != 2 or not isinstance(scales, mx.array):
         return None
@@ -6016,12 +6018,31 @@ def _tree_attention(queries, keys, values, scale, tree):
 
 def _verify_gdn_fits(layer, inputs, mask, cache):
     """Whether the fused block can take this unmasked block, before its projections run."""
-    batch, length = inputs.shape[:2]
+    length = inputs.shape[1]
+    return (3 <= length <= _VERIFY_GDN_MAX_ROWS and cache is not None
+            and getattr(cache, "history_capacity", 0) == length and _gdn_block_fits(layer, inputs, mask, cache))
+
+
+def _decode_gdn_fits(layer, inputs, mask, cache):
+    """Whether the fused block can take this unmasked one-row step of a plain cache, before its projections run."""
+    arrays = sys.modules.get("mlx_vlm.models.cache")
+    arrays = getattr(arrays, "ArraysCache", None)
+    if (inputs.ndim != 3 or inputs.shape[1] != 1 or arrays is None or not isinstance(cache, arrays)
+            or getattr(cache, "history_capacity", 0)
+            or any(getattr(type(cache), name) is not getattr(arrays, name) for name in ("update_window", "update_recurrent"))
+            or not _gdn_block_fits(layer, inputs, mask, cache)):
+        return False
+    conv_state = cache[0]
+    return (conv_state is not None and cache[1] is not None and conv_state.dtype == inputs.dtype
+            and conv_state.shape == (inputs.shape[0], layer.conv_kernel_size - 1, layer.conv_dim))
+
+
+def _gdn_block_fits(layer, inputs, mask, cache):
+    batch = inputs.shape[0]
     K, Dk, Dv, Hv = layer.conv_kernel_size, layer.head_k_dim, layer.head_v_dim, layer.num_v_heads
     conv, norm = layer.conv1d, layer.norm
     if (mask is not None or cache is None or layer.training or mx.default_device() != mx.gpu
-            or not 3 <= length <= _VERIFY_GDN_MAX_ROWS
-            or getattr(cache, "history_capacity", 0) != length or Dk != 128 or Dv != 128 or not 2 <= K <= 8
+            or Dk != 128 or Dv != 128 or not 2 <= K <= 8
             or Hv % layer.num_k_heads or inputs.dtype not in (mx.bfloat16, mx.float16)):
         return False
     state = cache[1]
@@ -6145,6 +6166,61 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = Fal
         cache.advance(length)
         self._helpers()._qwen3_5_advance_lengths_info(cache, length)
     return self._linear(layer.out_proj, output.reshape(batch, length, -1))
+
+
+_DECODE_GDN_VERDICTS = {}
+_DECODE_GDN_CONTRACT = {"mlx_vlm.models.cache": {"ArraysCache.update_window": "5580299b90d3a0b1"}}
+
+
+def _decode_gdn(self, base, layer, inputs, mask, cache, qk_eps, l2):
+    """The forward's `_gated_delta` for a one-row decode step `_decode_gdn_fits` took: its convolution through gated
+    norm on the fused block kernel, once the first step of its layout matched the native method's output and state
+    bit for bit. Writes the cache as the native method does."""
+    batch, K, Dv = inputs.shape[0], layer.conv_kernel_size, layer.head_v_dim
+    sigmoid = getattr(layer.norm, "activation", None) == "sigmoid"
+    key = (batch, layer.num_k_heads, layer.num_v_heads, K, inputs.dtype, layer.A_log.dtype, layer.dt_bias.dtype,
+           qk_eps, layer.norm.eps, l2, sigmoid)
+    verdict = _DECODE_GDN_VERDICTS.get(key)
+    if verdict is False:
+        return base._gated_delta(self, layer, inputs, mask, cache)
+    initial = cache[1]
+    mixed_qkv, z, b, a = self._linears((layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a), inputs)
+    conv_input = mx.concatenate([cache[0], mixed_qkv], axis = 1)
+
+    def fused():
+        if not all(t.dtype == inputs.dtype for t in (z, a, b)):
+            return None
+        return _verify_gdn_block(
+            conv_input, layer.conv1d.weight.reshape(layer.conv_dim, K), a, b, layer.A_log, layer.dt_bias,
+            z.reshape(batch, 1, -1, Dv), layer.norm.weight, qk_eps, layer.norm.eps, initial, layer.num_k_heads,
+            l2 = l2, sigmoid = sigmoid)[:2]
+
+    if verdict is None:
+        output = base._gated_delta(self, layer, inputs, mask, cache)
+        candidate = fused()
+        try:
+            verdict = _settled(candidate is not None and all(
+                x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+                for x, y in zip((self._linear(layer.out_proj, candidate[0].reshape(batch, 1, -1)), candidate[1]),
+                                (output, cache[1]))))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return output  # inside a function transformation, which cannot evaluate; checked later
+        _DECODE_GDN_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("the fused gated-delta decode step differs from the forward's ops for %d rows, %d key heads, "
+                           "%d value heads, a %d-tap convolution and %s inputs; the forward's ops stay in use", *key[:5])
+        return output
+    served = fused()
+    if served is None:
+        return base._gated_delta(self, layer, inputs, mask, cache)
+    y, state = served
+    cache.update_window(0, conv_input, K - 1, lengths = cache.lengths)
+    cache.update_recurrent(1, 1, lambda entry, steps: (y, state))
+    if hasattr(cache, "advance"):
+        cache.advance(1)
+        self._helpers()._qwen3_5_advance_lengths_info(cache, 1)
+    return self._linear(layer.out_proj, y.reshape(batch, 1, -1))
 # MLX 0.32.3's sdpa_vector_2pass_1 and _2 over a causal block of rows, each row's arithmetic and
 # order the one-row call's: key i goes to block i % BLOCKS, and a row skips the keys past its own.
 # Each simdgroup carries two rows, so a K/V load serves both; the row pairs of a threadgroup share it through L1.
@@ -6591,6 +6667,9 @@ def _exact_verify_class(base, name, *cache_key):
         except (OSError, TypeError, SyntaxError, AttributeError):
             qk_eps_of = None
         fused_bindings = fused_bindings if qk_eps_of else None
+    # One-row steps only on a forward that also decodes (qwen4_exp); the tape contract pins the `_gated_delta` they mirror.
+    decode_bindings = (_resolved_bindings(_DECODE_GDN_CONTRACT)
+                       if fused_bindings is not None and entry == "__call__" and tape_bindings is not None else None)
 
     def verify(self, language_model, inputs, *, cache = None, **kwargs):
         outer, outer_tapes = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
@@ -6631,6 +6710,11 @@ def _exact_verify_class(base, name, *cache_key):
 
     def taped_gated_delta(self, layer, inputs, mask, cache):
         if getattr(_VERIFY_STATE, "tapes", None) is None:
+            if (decode_bindings is not None and getattr(_VERIFY_STATE, "serving", False)
+                    and _decode_gdn_fits(layer, inputs, mask, cache) and _bindings_intact(fused_bindings)
+                    and _bindings_intact(decode_bindings) and _bindings_intact(tape_bindings)
+                    and (qk_eps := qk_eps_of(layer)) is not None):
+                return _decode_gdn(self, base, layer, inputs, mask, cache, qk_eps, l2)
             return base._gated_delta(self, layer, inputs, mask, cache)
         if fused_bindings is not None and _verify_gdn_fits(layer, inputs, mask, cache) and _bindings_intact(fused_bindings):
             qk_eps = qk_eps_of(layer)
@@ -6643,11 +6727,16 @@ def _exact_verify_class(base, name, *cache_key):
     def projected(self, linear, x):
         return _verify_rows_alone(linear, x) if _verify_gathers(linear, x, eligible) else base._linear(self, linear, x)
 
+    # A one-row call (a decode step) is the native projection on every route below, so it skips their wrappers.
     def sliced_linear(self, linear, x):
+        if x.size == x.shape[-1]:
+            return base._linear(self, linear, x)
         project = lambda rows: projected(self, linear, rows)
         return _verify_qmv_rows(lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
 
     def sliced_linears(self, linears, x):
+        if x.size == x.shape[-1]:
+            return base._linears(self, linears, x)
         if all(isinstance(p, (nn.Linear, nn.QuantizedLinear)) for p in linears) and any(_verify_gathers(p, x, eligible) for p in linears):
             project = lambda rows: tuple(projected(self, p, rows) for p in linears)
         else:
@@ -6843,7 +6932,9 @@ def exact_batch_invariant_decode(model, *, _modules = None):
     eight rows run over balanced row slices and sparse blocks' routed experts run on the decode kernels, each once its
     first call of that shape matched the native call bit for bit; affine projections of multi-row blocks run their
     rows together as there. A speculative block's gated-delta layers are taped and fused as the Qwen3.5 verifier's
-    are, each cache replaying its retained prefix on its own commit. The forward already submits each layer. Only calls
+    are, each cache replaying its retained prefix on its own commit. A one-token step's gated-delta layers run their
+    convolution through gated norm in that fused launch, once a first step of each layout matched the native method
+    bit for bit (`UNSLOTH_MLX_FUSED_GDN_VERIFY=0` keeps both native). The forward already submits each layer. Only calls
     of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
     forward drifted, keep the native methods.
     """

@@ -1740,6 +1740,34 @@ def test_a_qwen4_verify_block_taped_and_fused_commits_what_stock_commits(qwen4, 
         assert not fits and verify() and len(fits) == linear
 
 
+def test_qwen4_decode_steps_run_gated_delta_on_the_fused_block_bit_for_bit(qwen4, monkeypatch, caplog):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    (model, ids), linear = qwen4, sum(layer.is_linear for layer in qwen4[0].language_model.layers)
+    lm, cache = model.language_model, make_prompt_cache(model.language_model)
+    lm(mx.array([ids[0][:24]]), cache = cache)
+    for entry in (entry for entry in cache if type(entry).__name__ == "ArraysCache"):
+        entry.left_padding = mx.array([0])  # a batch's padding bookkeeping, which each step must advance
+
+    def decoded():
+        run = _clone(cache)
+        logits = [lm(mx.array([[token]]), cache = run).logits for token in ids[0][24:28]]
+        return _state(SimpleNamespace(logits = logits, hidden_states = None), run)
+    native, block_fn, steps = decoded(), inference._verify_gdn_block, []
+    monkeypatch.setattr(inference, "_DECODE_GDN_VERDICTS", {})
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args, **variant: steps.append(args[0].shape) or block_fn(*args, **variant))
+    with inference.exact_batch_invariant_decode(model):
+        assert _same(native, decoded())
+    # The first layer checks the fused step against the native one, then every layer of every step runs it.
+    assert list(inference._DECODE_GDN_VERDICTS.values()) == [True] and len(steps) == 4 * linear and steps[0][1] == 4
+    # A fused step that differs keeps the native one for good.
+    monkeypatch.setattr(inference, "_DECODE_GDN_VERDICTS", {})
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args, **variant: (lambda y, *rest: (y + 1, *rest))(*block_fn(*args, **variant)))
+    with caplog.at_level("WARNING"), inference.exact_batch_invariant_decode(model):
+        assert _same(native, decoded())
+    assert list(inference._DECODE_GDN_VERDICTS.values()) == [False] and "fused gated-delta decode step differs" in caplog.text
+
+
 @pytest.mark.parametrize("flag, prompt", [("0", 40), ("0", 1200), ("1", 1200)])
 def test_a_qwen4_verify_block_attends_and_projects_as_its_decode_steps(qwen4, flag, prompt, monkeypatch):
     from mlx_vlm.models.cache import make_prompt_cache
