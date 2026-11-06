@@ -1843,8 +1843,9 @@ def test_qwen4_decode_steps_read_disk_ple_rows_after_the_forward_bit_for_bit(qwe
             offload._replace_module(model, path, module)
 
 
-@pytest.mark.parametrize("flag, prompt", [("0", 40), ("0", 1200), ("1", 1200)])
-def test_a_qwen4_verify_block_attends_and_projects_as_its_decode_steps(qwen4, flag, prompt, monkeypatch):
+@pytest.mark.parametrize("flag, prompt, batch", [("0", 40, False), ("0", 1200, False), ("1", 1200, False), ("0", 2100, False),
+                                                 ("0", 2100, True)])
+def test_a_qwen4_verify_block_attends_and_projects_as_its_decode_steps(qwen4, flag, prompt, batch, monkeypatch):
     from mlx_vlm.models.cache import make_prompt_cache
     from unsloth_zoo.mlx import inference, matmul
     if flag == "1" and not matmul.lane_qmm_available():
@@ -1853,21 +1854,30 @@ def test_a_qwen4_verify_block_attends_and_projects_as_its_decode_steps(qwen4, fl
     (model, _), served, lanes, lane_qmm = qwen4, _serving(monkeypatch), [], matmul.lane_qmm
     monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: lanes.append(args[0].shape[0]) or lane_qmm(*args, **kwargs))
     lm, tokens = model.language_model, [(7 * i + 3) % 1000 + 2 for i in range(prompt + 6)]
+    from mlx_vlm.models.qwen4_exp import qsa_kernel
+    sparse, kernel = [], qsa_kernel._qsa_sparse_attention_kernel
+    monkeypatch.setattr(qsa_kernel, "_qsa_sparse_attention_kernel", lambda *args: (lambda launch: lambda **kw: sparse.append(
+        dict(kw["template"])["Q_LEN"]) or launch(**kw))(kernel(*args)))
 
     def prefilled():
         cache = make_prompt_cache(lm)
         mx.eval(lm(mx.array([tokens[:prompt]]), cache = cache).logits)
-        return cache
+        return [type(entry).merge([entry]) for entry in cache] if batch else cache
     with inference.inference_scopes(model, ("speculative",)):
         cache = prefilled()
         steps = mx.concatenate([lm(mx.array([[token]]), cache = cache).logits for token in tokens[prompt:]], axis = 1)
         for _ in range(2):  # a plan's first block checks it, the next is served
-            lanes.clear()
-            *_, transaction, logits = lm.speculative_verify_logits(mx.array([tokens[prompt:]]), prefilled(), lambda x: x)
+            cache = prefilled()
+            lanes.clear(), sparse.clear()
+            *_, transaction, logits = lm.speculative_verify_logits(mx.array([tokens[prompt:]]), cache, lambda x: x)
             transaction.abort()
             assert _same([("logits", steps)], [("logits", logits)])
-    # Its dense-regime mask is the causal one, so its attention takes the exact route; the opt-in mode's rows the lanes.
-    assert any("causal" in str(part) for key in served for part in key)
+    # Its dense-regime mask is the causal one, so its attention takes the exact route; past the indexer's budget the
+    # block is selected and attended whole, the served block in one sparse call. The opt-in mode's rows take the lanes.
+    assert prompt > 2048 or any("causal" in str(part) for key in served for part in key)
+    # A batch cache keeps mlx-vlm's pairs.
+    assert any(key[0] == "qsa_block" and verdict for key, verdict in inference._VERIFY_VERDICTS.items()) == (prompt > 2048 and not batch)
+    assert set(sparse) == (set() if prompt < 2048 else {2} if batch else {6})
     assert (max(lanes, default = 0) == 6) == (flag == "1")
 
 

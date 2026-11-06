@@ -6931,7 +6931,65 @@ def _exact_verify_class(base, name, *cache_key):
         output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         return self._linear(attention.o_proj, output * mx.sigmoid(gate))
 
-    return type(f"_ScopedVerify{base.__name__}", (base,), {**methods, "_attention": block_attention})
+    language = sys.modules.get(family.language)
+    if f"{family.forward}._qsa_attention" not in pins.get(family.language, {}) or language is None:
+        return type(f"_ScopedVerify{base.__name__}", (base,), {**methods, "_attention": block_attention})
+
+    def block_qsa_attention(self, attention, x, cache, position_ids, mask):
+        # mlx-vlm verifies a sparse-regime block wider than two rows as ordered pairs. Its own selection branch takes the
+        # whole block, each row scored, selected and attended as its decode step (one geometry for any row count).
+        indexer, length = attention.indexer, x.shape[1] if x.ndim == 3 else 0
+        past = getattr(cache, "index_offset", getattr(cache, "offset", 0))
+        native = lambda c: base._qsa_attention(self, attention, x, c, position_ids, mask)
+        # A single unquantized cache only: the twin below copies its own state, and a quantized one attends densely.
+        if (length < 3 or not getattr(_VERIFY_STATE, "serving", False) or type(cache) is not language.QSAKVCache
+                or type(past) is not int or past + 1 < (indexer.block_topk + 1) * indexer.compress_ratio
+                or not _bindings_intact(attention_bindings)
+                or getattr(type(indexer).select_from_projected, "_unsloth_exact_route_of", None) is None
+                or not _QSA_VERDICTS.get((indexer.n_heads, indexer.head_dim, indexer.block_topk, False))):
+            return native(cache)
+
+        def block(c):
+            selection = indexer.select_from_projected(self._linear(indexer.index_qk_proj, x), c, position_ids)
+            if selection is None or selection.key_len // indexer.compress_ratio <= indexer.block_topk:
+                return self._attention(attention, x, mask, c, position_ids, None)
+            q_proj, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
+            queries, keys, values, gate, _ = attention._prepare_projected_qkv(q_proj, keys, values, c, position_ids,
+                                                                              None, None)
+            output = language.dispatch_qsa_attention(
+                queries, keys, values, selection.selected_blocks, selection.query_ends, cache = c, scale = attention.scale,
+                block_size = indexer.compress_ratio, causal = True, mask = mask,
+                mask_factory = lambda: indexer.build_mask(selection), allow_sparse_decode = True)
+            output = output.transpose(0, 2, 1, 3).reshape(*x.shape[:2], -1)
+            return self._linear(attention.o_proj, output * mx.sigmoid(gate))
+
+        key = ("qsa_block", x.shape[:2], x.dtype)
+        verdict = _VERIFY_VERDICTS.get(key)
+        if verdict:
+            return block(cache)
+        if verdict is False:
+            return native(cache)
+        # First use: the block on a twin of the cache, then the native pairs on the cache itself (both write the
+        # same key slots, the pairs last), compared bit for bit.
+        twin = copy.copy(cache)
+        for name, value in list(vars(cache).items()):
+            if isinstance(value, (list, dict)):
+                setattr(twin, name, copy.copy(value))
+        candidate, reference = block(twin), native(cache)
+        _staged_ready()
+        try:
+            verdict = _settled(candidate.dtype == reference.dtype and candidate.shape == reference.shape
+                               and mx.array_equal(candidate.view(mx.uint16), reference.view(mx.uint16)).item())
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return reference  # inside a function transformation, which cannot evaluate; checked later
+        _VERIFY_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("a QSA verify block differs from mlx-vlm's paired verify for %s; the pairs stay in use", key)
+        return reference
+
+    return type(f"_ScopedVerify{base.__name__}", (base,),
+                {**methods, "_attention": block_attention, "_qsa_attention": block_qsa_attention})
 
 
 @contextmanager
@@ -8946,7 +9004,7 @@ def fused_verify_attention(model, *, _modules = None):
                     module.__class__ = native
 
 
-# The selection route recomputes the indexer query and per-head scores exactly as this body does.
+# Admitted selection layouts reuse this pinned body's query, pooling and float32 scores.
 _QSA_SELECT_CONTRACT = {
     "mlx_vlm.models.qwen4_exp.language": {"Qwen4ExpQSAIndexer.select_from_projected": "379bb821075d65a8"},
 }
@@ -8955,8 +9013,42 @@ _QSA_SCOPES = {}
 _QSA_VERDICTS = {}
 
 
+@functools.cache
+def _qsa_direct_selection(native):
+    tree = copy.deepcopy(_function_ast(native))
+    scores = [i for i, node in enumerate(tree.body) if isinstance(node, ast.Assign)
+              and isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.MatMult)]
+    counts = [copy.deepcopy(node) for node in tree.body if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id in ("query_ends", "visible_counts", "complete_counts")
+                      for target in node.targets)]
+    if len(scores) != 1 or len(counts) != 3 or not isinstance(tree.body[-1], ast.Return):
+        return None
+    branch = ast.parse("if zero_padding and cache is not None and self.block_topk > 0 "
+                       "and pooled_keys.shape[2] > self.block_topk: pass").body[0]
+    branch.body = [*counts, *ast.parse("selected_blocks = _unsloth_qsa_attention.select_blocks("
+                                     "scores, complete_counts, self.block_topk, self.head_dim)").body,
+                   copy.deepcopy(tree.body[-1])]
+    tree.body.insert(scores[0] + 1, branch)
+    function = _function_from_ast(native, tree)
+    namespace = {**native.__globals__, "_unsloth_qsa_attention": attention}
+    routed = FunctionType(function.__code__, namespace, function.__name__, native.__defaults__, native.__closure__)
+    routed.__kwdefaults__ = native.__kwdefaults__
+    bindings = [(native.__globals__, name, native.__globals__[name])
+                for name in native.__code__.co_names if name in native.__globals__]
+    return routed, bindings
+
+
 def _qsa_select_route(native, bindings):
+    plan = _qsa_direct_selection(native)
+    direct_bindings = [*bindings, *plan[1]] if plan is not None else None
+
     def select_from_projected(self, qk, cache, position_ids):
+        if plan is not None:
+            if self.training or not _bindings_intact(direct_bindings):
+                return native(self, qk, cache, position_ids)
+            verdict = _QSA_VERDICTS.get((self.n_heads, self.head_dim, self.block_topk, qk.shape[1] == 1))
+            if verdict is not None:
+                return plan[0](self, qk, cache, position_ids) if verdict else native(self, qk, cache, position_ids)
         past = cache.offset if cache is not None else 0
         selection = native(self, qk, cache, position_ids)
         pooled = getattr(cache, "index_block_keys", None)
@@ -8991,6 +9083,76 @@ def _qsa_select_route(native, bindings):
 
     select_from_projected._unsloth_exact_route_of = native
     return select_from_projected
+
+
+_QSA_DECODE_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.qsa_kernel": {
+        "qsa_sparse_attention": "fba8493893421648",
+        "select_qsa_execution_plan": "73a34b78cc396c32",
+        "_qsa_sparse_attention_kernel": None,
+        "_qsa_sparse_attention_kernel.__wrapped__": "52e130d59444ce3e",
+        "_qsa_sparse_attention_scalars": None,
+        "_qsa_sparse_attention_scalars.__wrapped__": "ea56a58fb11effad",
+        "_QSA_SPARSE_ATTENTION_SOURCE": None,
+    },
+}
+_QSA_DECODE_SOURCE = "15388c560af7468e7c3c9641bdb454ec4991167b94496fec24a7d0685e3292aa"
+
+
+@functools.cache
+def _qsa_decode_kernel(source):
+    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+            or hashlib.sha256(source.encode()).hexdigest() != _QSA_DECODE_SOURCE):
+        return None
+    # Keep native arithmetic and geometry; only K/V integer addresses change. Feature views read their strides too.
+    for name, pointer in (("keys", "kptr"), ("values", "vptr")):
+        pattern = (rf"{name} \+ \(\(\(batch_idx \* NUM_KV_HEADS \+ kv_head_idx\) \* key_length \+"
+                   rf"\s*(key_pos|tail_pos)\) \* D_SIZE\) \+\s*int\(simd_lid\) \* (qk_per_thread|v_per_thread)")
+        source, count = re.subn(pattern, rf"{name} + (batch_idx * {name}_strides[0] + kv_head_idx * {name}_strides[1]"
+                               rf" + \1 * {name}_strides[2]) + int(simd_lid) * \2 * {name}_strides[3]", source)
+        if count != 2:
+            return None
+        source = source.replace(f"{pointer}[j]", f"{pointer}[j * {name}_strides[3]]")
+    contiguous = source
+    for name in ("keys", "values"):
+        contiguous = contiguous.replace(f" * {name}_strides[3]", "")
+    source = ("if (keys_strides[3] == 1 && values_strides[3] == 1) {\n" + contiguous
+              + "\n} else {\n" + source + "\n}")
+    try:
+        return mx.fast.metal_kernel(
+            name = "unsloth_qsa_decode_strides",
+            input_names = ["queries", "keys", "values", "block_indices", "query_ends", "scale", "k_size"],
+            output_names = ["out"], header = "#include <metal_simdgroup>\nusing namespace metal;\n",
+            source = source, ensure_row_contiguous = False)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _qsa_decode_route(native, bindings, kernel):
+    tree = copy.deepcopy(_function_ast(native))
+    tree.body = [statement for statement in tree.body if not (
+        isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id in ("keys", "values")
+        and _source_expression(statement.value) == f"mx.contiguous({statement.targets[0].id})")]
+    fused = _function_from_ast(native, tree)
+    fused = FunctionType(fused.__code__, {**fused.__globals__, "_qsa_sparse_attention_kernel": lambda *args: kernel},
+                         fused.__name__, fused.__defaults__)
+    fused.__kwdefaults__ = native.__kwdefaults__
+
+    def qsa_sparse_attention(queries, keys, values, block_indices, query_ends, *, scale, block_size,
+                             allow_sparse_decode = False, _plan = None):
+        from .utils import mlx_training_patches_active
+        args = queries, keys, values, block_indices, query_ends
+        kwargs = dict(scale = scale, block_size = block_size, allow_sparse_decode = allow_sparse_decode, _plan = _plan)
+        reference = lambda: native(*args, **kwargs)
+        if (mlx_training_patches_active() or not _bindings_intact(bindings) or not isinstance(queries, mx.array)
+                or queries.ndim != 4 or queries.shape[2] != 1):
+            return reference()
+        key = ("indexed decode strides", queries.dtype, queries.shape, keys.shape[:2], keys.shape[3], block_size, block_indices.shape)
+        return _qwen4_verified(key, lambda: fused(*args, **kwargs), reference, "indexed decode strides")
+
+    qsa_sparse_attention._unsloth_exact_route_of = native
+    return qsa_sparse_attention
 
 
 _QSA_PREFILL_CONTRACT = {
@@ -9051,16 +9213,22 @@ def _qsa_routes(model, modules, enter):
 
 
 def fused_qsa_attention(model, *, _modules = None):
-    """Speed up mlx-vlm's Qwen sparse attention (qwen4_exp) block selection during serialized inference.
+    """Speed up Qwen sparse block selection and exact one-row indexed attention during serialized inference.
 
-    Block selection runs on one kernel per query row that picks exactly `argpartition`'s blocks
-    from the native float32 scores, checked against the native selection at first use per layout.
-    `Qwen4ExpQSAIndexer.select_from_projected` is rebound process-wide while any scope is open.
-    `UNSLOTH_MLX_QSA_SELECT=0` turns the route off.
+    Block selection picks exactly `argpartition`'s blocks from native float32 scores. Indexed decode retains
+    native arithmetic while reading K/V cache strides directly. Both routes compare bits at first use per layout.
+    Their upstream methods are rebound process-wide while any scope is open. `UNSLOTH_MLX_QSA_SELECT=0` and
+    `UNSLOTH_MLX_QSA_DECODE=0` independently disable selection and indexed decode.
     """
     def enter(entered, language, indexer):
         if os.environ.get("UNSLOTH_MLX_QSA_SELECT", "1") != "0" and attention._select_kernel() is not None:
             _qsa_enter(entered, "select", _QSA_SELECT_CONTRACT, indexer, "select_from_projected", _qsa_select_route)
+        kernels = sys.modules.get("mlx_vlm.models.qwen4_exp.qsa_kernel")
+        source = getattr(kernels, "_QSA_SPARSE_ATTENTION_SOURCE", "")
+        if (os.environ.get("UNSLOTH_MLX_QSA_DECODE", "1") != "0" and kernels is not None
+                and (kernel := _qsa_decode_kernel(source)) is not None):
+            _qsa_enter(entered, "decode", _QSA_DECODE_CONTRACT, kernels, "qsa_sparse_attention",
+                       lambda native, bindings: _qsa_decode_route(native, bindings, kernel))
 
     return _qsa_routes(model, _modules, enter)
 

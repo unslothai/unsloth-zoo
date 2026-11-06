@@ -1047,10 +1047,13 @@ def _qsa_run(attention):
     return outs
 
 
-def test_qsa_scope_preserves_attention_and_restores(monkeypatch):
+@pytest.mark.parametrize("refusal", ["training", "binding"])
+def test_qsa_scope_preserves_attention_and_restores(monkeypatch, refusal):
     attention, native = _qsa_layer(), qwen4.Qwen4ExpQSAIndexer.select_from_projected
     expected, select, calls = _qsa_run(attention), mlx_attention.select_blocks, []
     monkeypatch.setattr(decode, "_QSA_VERDICTS", {})
+    partitions, partition = [], mx.argpartition
+    monkeypatch.setattr(mx, "argpartition", lambda *args, **kwargs: partitions.append(args[0].shape[1]) or partition(*args, **kwargs))
     monkeypatch.setattr(mlx_attention, "select_blocks", lambda *args: calls.append(args[0].shape[2]) or select(*args))
     with pytest.raises(RuntimeError, match = "cancel"):
         with decode.fused_qsa_attention(attention):
@@ -1060,6 +1063,15 @@ def test_qsa_scope_preserves_attention_and_restores(monkeypatch):
             for actual, out in zip(_qsa_run(attention), expected):
                 _equal(actual, out)
             assert calls == [30, 41, 1, 1, 1, 2] and all(decode._QSA_VERDICTS.values())
+            assert partitions == [20, 30, 1]
+            if refusal == "training":
+                attention.indexer.train()
+            else:
+                monkeypatch.setitem(native.__globals__, "_qwen3_5_left_padding_info", lambda cache, helper = native.__globals__["_qwen3_5_left_padding_info"]: helper(cache))
+            partitions[:], calls[:] = [], []
+            for actual, out in zip(_qsa_run(attention), expected):
+                _equal(actual, out)
+            assert partitions == [20, 30, 41, 1, 1, 1, 2] and calls == []
             raise RuntimeError("cancel")
     assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is native
 
@@ -1229,6 +1241,40 @@ def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
     native = qwen4.dispatch_qsa_attention
     with decode.inference_scopes(attention):
         assert qwen4.dispatch_qsa_attention is native
+
+
+@pytest.mark.skipif(qwen4 is None, reason = "mlx-vlm without qwen4_exp")
+@pytest.mark.parametrize("dtype, stride", [(mx.bfloat16, 1), (mx.bfloat16, 2), (mx.float16, -2)])
+def test_qsa_decode_reads_strided_cache_rows_and_features_bitwise(dtype, stride, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import qsa_kernel
+    queries = mx.random.normal((2, 4, 1, 64)).astype(dtype)
+    keys, values = [mx.random.normal((2, 2, 103, 64 * abs(stride))).astype(dtype)[:, :, ::stride, ::stride] for _ in range(2)]
+    blocks, ends = mx.array([[[0, 2, 5]], [[1, 3, 7]]], mx.int32), mx.array([[39], [45]], mx.int32)
+    args, kwargs = (queries, keys, values, blocks, ends), dict(scale = 0.125, block_size = 4, allow_sparse_decode = True)
+    native, calls, kernel = qsa_kernel.qsa_sparse_attention, [], decode._qsa_decode_kernel(qsa_kernel._QSA_SPARSE_ATTENTION_SOURCE)
+    monkeypatch.setattr(decode, "_qsa_decode_kernel", lambda source: lambda **kw: calls.append(kw) or kernel(**kw))
+    monkeypatch.setattr(decode, "_QWEN4_PREFILL_VERDICTS", {})
+    with decode.fused_qsa_attention(_qsa_layer()):
+        _equal(qsa_kernel.qsa_sparse_attention(*args, **kwargs), native(*args, **kwargs))
+        assert calls[-1]["inputs"][1] is keys and calls[-1]["inputs"][2] is values
+        short = queries, keys[:, :, :-1], values[:, :, :-1], blocks, ends
+        _equal(qsa_kernel.qsa_sparse_attention(*short, **kwargs), native(*short, **kwargs))
+    assert qsa_kernel.qsa_sparse_attention is native and len(calls) == 2
+    assert list(decode._QWEN4_PREFILL_VERDICTS.values()) == [True]
+
+
+@pytest.mark.skipif(qwen4 is None, reason = "mlx-vlm without qwen4_exp")
+@pytest.mark.parametrize("reason", ["switch", "source", "runtime"])
+def test_qsa_decode_stride_route_keeps_native_when_unsupported(reason, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import qsa_kernel
+    native = qsa_kernel.qsa_sparse_attention
+    monkeypatch.setenv("UNSLOTH_MLX_QSA_DECODE", "0" if reason == "switch" else "1")
+    monkeypatch.setattr(qsa_kernel, "_QSA_SPARSE_ATTENTION_SOURCE", qsa_kernel._QSA_SPARSE_ATTENTION_SOURCE + ("\n" if reason == "source" else ""))
+    monkeypatch.setattr(mx, "__version__", "0.32.3" if reason == "runtime" else mx.__version__)
+    monkeypatch.setattr(decode, "_qsa_decode_kernel", decode._qsa_decode_kernel.__wrapped__)
+    assert reason != "runtime" or decode._qwen4_ordered_down_kernel.__wrapped__() is None
+    with decode.fused_qsa_attention(_qsa_layer()):
+        assert qsa_kernel.qsa_sparse_attention is native
 
 
 def _qsa_attention():
