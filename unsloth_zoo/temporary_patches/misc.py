@@ -2263,7 +2263,12 @@ def patch_gradient_checkpointing_enable_inherit():
         from transformers import PreTrainedModel
     except Exception as e:
         return raise_error("transformers.PreTrainedModel", e)
-    original = PreTrainedModel.gradient_checkpointing_enable
+    # transformers >= 5.23: the Trainer's activation_checkpointing_enable skips a class-level patch of the old name.
+    name = next(
+        (n for n in ("_activation_checkpointing_enable", "activation_checkpointing_enable") if hasattr(PreTrainedModel, n)),
+        "gradient_checkpointing_enable",
+    )
+    original = getattr(PreTrainedModel, name)
     if getattr(original, "_unsloth_gc_inherit", False):
         return
 
@@ -2280,7 +2285,7 @@ def patch_gradient_checkpointing_enable_inherit():
         return original(self, *args, **kwargs)
     gradient_checkpointing_enable._unsloth_gc_inherit = True
     gradient_checkpointing_enable._unsloth_original = original
-    PreTrainedModel.gradient_checkpointing_enable = gradient_checkpointing_enable
+    setattr(PreTrainedModel, name, gradient_checkpointing_enable)
 pass
 TEMPORARY_PATCHES.append(patch_gradient_checkpointing_enable_inherit)
 
