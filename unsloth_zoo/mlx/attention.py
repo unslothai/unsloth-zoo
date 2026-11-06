@@ -22,6 +22,7 @@ import hashlib
 import math
 import os
 import re
+from typing import NamedTuple
 
 import mlx.core as mx
 
@@ -179,6 +180,18 @@ def fused_sdpa_over(stock):
     def sdpa(q, k, v, *, scale, mask=None, sinks=None, **kwargs):
         from .utils import mlx_training_patches_active
 
+        if isinstance(mask, WindowMask):
+            original, window = mask
+            if (native_window_supported(q, k, v) and not kwargs and sinks is None
+                    and not mlx_training_patches_active()):
+                try:
+                    return stock(q, k, v, scale=scale, mask="causal", window_size=window, force_fused=True)
+                except ValueError:   # mlx has no fused windowed backward, so a gradient trace refuses it
+                    pass
+            # The model slices only array masks to the queries it keeps, so a descriptor arrives untrimmed.
+            mask = original
+            if isinstance(mask, mx.array) and mask.shape[-2] != q.shape[-2]:
+                mask = mask[..., -q.shape[-2]:, :]
         if (sinks is None and not kwargs and q.dtype == k.dtype == v.dtype
                 and _forces_fused(q, k.shape[-2], k.shape[-1], v.shape[-1], q.dtype, mask)
                 and not mlx_training_patches_active()):
@@ -188,6 +201,27 @@ def fused_sdpa_over(stock):
             return out if value_dim == v.shape[-1] else out[..., :v.shape[-1]]
         return stock(q, k, v, scale=scale, mask=mask, sinks=sinks, **kwargs)
     return sdpa
+
+
+class WindowMask(NamedTuple):
+    """An internally built mask retained alongside its native causal-window equivalent."""
+    original: mx.array | str
+    window: int
+
+
+def native_window_available():
+    """Whether this runtime and device can run native-window attention."""
+    return (os.environ.get("UNSLOTH_MLX_NATIVE_WINDOW", "1") != "0"
+            and "window_size" in (mx.fast.scaled_dot_product_attention.__doc__ or "")
+            and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def native_window_supported(q, k, v):
+    """The large-row, head-dimension256 prefill cases qualified against FP32."""
+    return (native_window_available() and q.dtype == k.dtype == v.dtype
+            and q.dtype in (mx.bfloat16, mx.float16) and q.ndim == k.ndim == v.ndim == 4
+            and _SPLIT_MIN_QUERIES <= q.shape[-2] <= k.shape[-2]
+            and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256)
 
 
 def install_fused_attention():

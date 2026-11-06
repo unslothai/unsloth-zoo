@@ -1850,7 +1850,122 @@ def test_dense_prefill_linear_first_use_check_rejects_a_different_result(monkeyp
         for rows in (2048, 2048, 1536):   # the differing shape is not tried again at another row count
             assert _same_bits(model(x[:, :rows]), [out[:, :rows] for out in native])
     assert list(inference._DENSE_QMM_VERIFIED.values()) == [False, False]
-    assert "the native call stays in use" in caplog.text
+    assert "the dense route stays disabled" in caplog.text
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("bits", [4, 8])
+def test_rejected_dense_prefill_keeps_exact_tile_on_first_and_cached_calls(monkeypatch, bits):
+    from unsloth_zoo.mlx import inference
+
+    _skip_with_stock_nax()
+    model = nn.Sequential(nn.QuantizedLinear(512, 2048, bias = False, group_size = 64, bits = bits))
+    model.set_dtype(mx.bfloat16)
+    model.eval()
+    xs = [mx.random.normal((1, rows, 512), key = mx.random.key(rows)).astype(mx.bfloat16)
+          for rows in (2048, 1536)]
+    native = [model(x) for x in xs]
+    mx.eval(native)
+    tiled, tile = [], inference.tiled_qmm
+    monkeypatch.setattr(inference, "tiled_qmm", lambda x, *args: tiled.append(x.shape[0]) or tile(x, *args))
+    monkeypatch.setattr(inference, "_tiled_prefill_enabled", lambda: True)
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", {})
+    dequantize = mx.dequantize
+    monkeypatch.setattr(mx, "dequantize", lambda *a, **k: dequantize(*a, **k) * 1.5)
+    with inference.dense_prefill_linear(model):
+        for i in (0, 1, 0):
+            assert _same_bits([model(xs[i])], [native[i]])
+            assert inference.prefill_route(model.layers[0], xs[i].shape[-2]) == "tiled"
+        assert tiled == [2048, 1536, 2048]
+        del model.layers[0].__dict__["_unsloth_tiled_qmm"]
+        assert _same_bits([model(xs[1])], [native[1]])
+        assert inference.prefill_route(model.layers[0], 1536) == "stock"
+        assert tiled == [2048, 1536, 2048]
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("dtype,bits,group", [(mx.bfloat16, 4, 32), (mx.bfloat16, 8, 64), (mx.float16, 8, 128)])
+def test_staged_prefill_matches_native_rows_gradients_and_restores(monkeypatch, dtype, bits, group):
+    from unsloth_zoo.mlx import inference, matmul, nax
+
+    if not nax.nax_available() or mx.__version__ not in ("0.32.3", "0.32.4"):
+        pytest.skip("requires native NAX kernels")
+    assert matmul.staged_qmm_available()
+    model = nn.Sequential(nn.QuantizedLinear(2048, 2048, bias = True, group_size = group, bits = bits))
+    model.set_dtype(dtype)
+    model.eval()
+    layer = model.layers[0]
+    xs = [mx.random.normal((1, rows, 2048), key = mx.random.key(rows)).astype(dtype) for rows in (1024, 1057, 1)]
+    native = [model(x) for x in xs]
+    native_grad = mx.grad(lambda z: model(z).astype(mx.float32).sum())(xs[0])
+    mx.eval(native, native_grad)
+    monkeypatch.setattr(inference, "_STAGED_QMM_VERIFIED", {})
+    calls, raw = [], matmul.staged_qmm
+    monkeypatch.setattr(matmul, "staged_qmm", lambda x, *args: calls.append(x.shape[0]) or raw(x, *args))
+    with inference.dense_prefill_linear(model):
+        with inference.dense_prefill_linear(model):
+            for i in (0, 1, 0, 2):
+                assert _same_bits([model(xs[i])], [native[i]])
+                assert inference.prefill_route(layer, xs[i].shape[-2]) == ("stock" if i == 2 else "staged")
+        assert calls == [1024, 1057, 1024]
+        got_grad = mx.grad(lambda z: model(z).astype(mx.float32).sum())(xs[0])
+        assert _same_bits([got_grad], [native_grad])
+        primals = (xs[0].reshape(1024, 2048), layer.scales, layer.biases)
+        cotangent = mx.random.normal((1024, 2048), key = mx.random.key(23)).astype(dtype)
+        _, expected = mx.vjp(lambda z, s, b: mx.quantized_matmul(z, layer.weight, s, b, transpose = True,
+                              group_size = group, bits = bits), primals, (cotangent,))
+        _, got = mx.vjp(lambda z, s, b: matmul.differentiable_staged_qmm(group, bits)(z, layer.weight, s, b),
+                        primals, (cotangent,))
+        assert _same_bits(got, expected)
+    assert "_unsloth_staged_qmm" not in layer.__dict__ and type(layer) is nn.QuantizedLinear
+    assert _same_bits([model(xs[1])], [native[1]])
+    count = len(calls)
+    monkeypatch.setenv("UNSLOTH_MLX_STAGED_PREFILL", "0")
+    with inference.dense_prefill_linear(model):
+        assert inference.prefill_route(layer, 1024) != "staged"
+        assert _same_bits([model(xs[0])], [native[0]])
+    assert len(calls) == count
+
+
+@real_mlx_only
+@metal_only
+def test_staged_prefill_rejects_different_result_once_per_shape(monkeypatch):
+    from unsloth_zoo.mlx import inference, matmul, nax
+
+    if not nax.nax_available() or mx.__version__ not in ("0.32.3", "0.32.4"):
+        pytest.skip("requires native NAX kernels")
+    assert matmul.staged_qmm_available()
+    model = nn.Sequential(nn.QuantizedLinear(2048, 2048, bias = False, group_size = 64, bits = 8)).eval()
+    model.set_dtype(mx.bfloat16)
+    xs = [mx.random.normal((1, rows, 2048), key = mx.random.key(rows)).astype(mx.bfloat16) for rows in (1024, 1057)]
+    native = [model(x) for x in xs]
+    mx.eval(native)
+    monkeypatch.setattr(inference, "_STAGED_QMM_VERIFIED", {})
+    calls, raw = [], matmul.staged_qmm
+    monkeypatch.setattr(matmul, "staged_qmm", lambda x, *args: calls.append(x.shape[0]) or raw(x, *args) * 1.5)
+    with inference.dense_prefill_linear(model):
+        for i in (0, 1, 0):
+            assert _same_bits([model(xs[i])], [native[i]])
+            assert inference.prefill_route(model.layers[0], xs[i].shape[-2]) != "staged"
+    assert calls == [1024, 1057]
+    assert list(inference._STAGED_QMM_VERIFIED.values()) == [False, False]
+
+
+@real_mlx_only
+@metal_only
+def test_staged_prefill_probe_and_admission_boundaries(monkeypatch):
+    from unsloth_zoo.mlx import matmul, nax
+
+    if not nax.nax_available() or mx.__version__ not in ("0.32.3", "0.32.4"):
+        pytest.skip("requires native NAX kernels")
+    matmul.probe_staged_qmm()
+    assert matmul.staged_qmm_supported(4096, 16384, 16384, 64, 8, "affine")
+    assert not matmul.staged_qmm_supported(4097, 2048, 2048, 64, 8, "affine")
+    assert not matmul.staged_qmm_supported(1024, 16384, 16448, 64, 8, "affine")
+    monkeypatch.setenv("UNSLOTH_MLX_NAX", "0")
+    assert not matmul.staged_qmm_available()
 
 
 def _skip_with_stock_nax():

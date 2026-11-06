@@ -325,6 +325,46 @@ def test_training_attention_visits_only_the_window(monkeypatch, window, T, windo
 
 
 @metal_only
+def test_a_checkpointed_layer_hands_its_shared_dict_writes_to_later_layers():
+    # Mistral Large 4's layers pass K/V on through a dict the first owner writes and later layers read.
+    class Layer(nn.Module):
+        def __init__(self, idx):
+            super().__init__()
+            self.idx, self.proj = idx, nn.Linear(8, 8)
+
+        def __call__(self, x, shared, scale):
+            if self.idx == 0:
+                shared[0] = (self.proj(x),)
+            # The layer also hands on top-k indices, an output with no gradient.
+            topk = mx.stop_gradient(mx.argpartition(-x, 2, axis=-1)[..., :2])
+            return x + scale * self.proj(x) * shared[0][0], topk
+
+    mx.random.seed(0)
+    layers, x = [Layer(0), Layer(1)], mx.random.normal((2, 3, 8))
+
+    def loss(params, x):
+        for layer, p in zip(layers, params):
+            layer.update(p)
+        shared = {}
+        for layer in layers:
+            x, _ = layer(x, shared, 0.5)
+        return (x ** 2).sum()
+
+    params = [layer.trainable_parameters() for layer in layers]
+    expected = mx.value_and_grad(loss, argnums=(0, 1))(params, x)
+    mlx_utils._patch_layer_class_for_gc(Layer)
+    try:
+        got = mx.value_and_grad(loss, argnums=(0, 1))(params, x)
+    finally:
+        mlx_utils._unpatch_layer_class_gc(Layer)
+    (loss_got, (grads, dx)), (loss_ref, (ref_grads, ref_dx)) = got, expected
+    assert mx.allclose(loss_got, loss_ref).item() and mx.allclose(dx, ref_dx, atol=1e-5).item()
+    for layer_grads, layer_ref in zip(grads, ref_grads):
+        for key in ("weight", "bias"):
+            assert mx.allclose(layer_grads["proj"][key], layer_ref["proj"][key], atol=1e-5).item()
+
+
+@metal_only
 @pytest.mark.parametrize("heads, T, dim, pays", [
     (8, 1536, 256, False), (8, 2048, 256, True), (8, 2048, 512, False), (8, 4096, 512, True)])
 def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
