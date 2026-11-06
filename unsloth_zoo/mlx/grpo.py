@@ -875,8 +875,8 @@ class GRPOBatchPlan:
             logprob_arrays=self.rollout_old,
             token_ids_only=True,  # completions are decoded once, after the cut
             completion_batch_size=rows, share_prompt_prefill=share,
-            # Rows of a shared prompt start decoding at once, prefilled already.
-            prefill_batch_size=rows if text else GenerationDefaults.prefill_batch_size,
+            # Rows prefilled already start decoding at once; full prompts keep the ordinary prefill width.
+            prefill_batch_size=rows if text and share else GenerationDefaults.prefill_batch_size,
         )
         with self._rollout_context():
             results = generate_module.generate_batch(

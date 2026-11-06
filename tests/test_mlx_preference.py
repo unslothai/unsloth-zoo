@@ -3981,6 +3981,7 @@ def test_grpo_rollout_shares_prompt_prefill_only_in_one_wave_with_position_only_
     plan.bind(Model(), [lambda completions, **_: [0.0] * len(completions)], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
     plan.materialize(0)
     assert seen[0].share_prompt_prefill is shared
+    assert seen[0].prefill_batch_size == (rows if shared else generate_module.GenerationDefaults.prefill_batch_size)
 
 
 def test_grpo_plan_drops_the_previous_generation_before_generating_the_next(monkeypatch):
