@@ -45,6 +45,7 @@ from .utils import (
     _finite_batch_schedule,
     _finite_text_pad_width,
     _get_processor_tokenizer,
+    _length_dependent_ropes,
     _normalize_mlx_messages,
     _normalize_seed,
     _prepare_vlm_batch_for_compile,
@@ -851,12 +852,16 @@ class GRPOBatchPlan:
         ]
         rows = _rollout_rows(self._model, len(requests), max(
             len(request.prompt_token_ids) + request.max_tokens for request in requests))
+        # Shared prefixes are all held until the generation ends, so share only when it decodes in one wave; and a
+        # native text RoPE that picks frequencies from the batch's largest offset would rotate isolated prefills apart.
+        native = engine is self._model and isinstance(self._model, nn.Module)
+        share = rows >= len(requests) and not (native and _length_dependent_ropes(self._model))
         defaults = GenerationDefaults(
             max_tokens=self.sampling.max_tokens, stop_token_ids=(self.eos_id,),
             logits_warp=_rollout_sampling(self.sampling, (), self.rollout_old)[1], batched_draws=True,
             logprob_arrays=self.rollout_old,
             token_ids_only=True,  # completions are decoded once, after the cut
-            completion_batch_size=rows, share_prompt_prefill=True,
+            completion_batch_size=rows, share_prompt_prefill=share,
             # Rows of a shared prompt start decoding at once, prefilled already.
             prefill_batch_size=rows if text else GenerationDefaults.prefill_batch_size,
         )

@@ -3937,6 +3937,35 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     assert calls[0][1].completion_batch_size == 7
 
 
+@pytest.mark.parametrize("rows,rope,shared", [(4, "RoPE", True), (3, "RoPE", False), (4, "SuScaledRoPE", False)])
+def test_grpo_rollout_shares_prompt_prefill_only_in_one_wave_with_position_only_rope(monkeypatch, rows, rope, shared):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rope = type(rope, (nn.Module,), {})()
+
+        def __call__(self, ids):
+            return mx.zeros((*ids.shape, 16))
+
+    seen = []
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, *, defaults=None: seen.append(
+        defaults) or [types.SimpleNamespace(token_ids=[1], finish_reason="stop") for _ in requests])
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._rollout_rows", lambda model, count, tokens: rows)
+    plan = create_grpo_batch_plan(
+        [{"prompt": "a" * (index + 1)} for index in range(2)], DecodingTokenizer(), num_generations=2, batch_size=2,
+        steps_per_generation=2, num_iterations=1, grad_accum=1, sampling=GRPOSampling(max_tokens=3), score_temperature=1.0,
+        max_seq_length=6, shuffle=False, num_batches=2,
+    )
+    plan.bind(Model(), [lambda completions, **_: [0.0] * len(completions)], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
+    plan.materialize(0)
+    assert seen[0].share_prompt_prefill is shared
+
+
 def test_grpo_old_logps_come_from_the_rollout_only_when_asked_and_sampled_unfiltered_as_scored(monkeypatch, tmp_path):
     from unsloth_zoo.mlx import generate as generate_module, grpo
     seen, sampled = [], [-0.5, -0.25, -0.125]  # a stopped row also scores its EOS
