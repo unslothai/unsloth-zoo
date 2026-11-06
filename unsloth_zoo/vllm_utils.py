@@ -4777,8 +4777,9 @@ def load_vllm(
                 # Tesla T4 is 280 tok/s vs 330 tok/s
                 if major_version >= 8:
                     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
-                elif Version(vllm_version) >= Version("0.11.0"):
-                    # On 0.11.0, Flashinfer also works!
+                elif Version("0.11.0") <= Version(vllm_version) < Version("0.24.0"):
+                    # On 0.11.0, Flashinfer also works! vLLM 0.24+ raises at engine init
+                    # if this is "1" on sm_75, where FlashInfer is broken.
                     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
                 else:
                     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
