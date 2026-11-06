@@ -586,8 +586,20 @@ def _rollout_sampling(sampling, prompt_ids, always_float32=False):
     return (hf_logits_warper(sampling, prompt_ids),), None
 
 
+def _kv_element_bytes(model):
+    """Bytes of a cached K or V element: the embedding's output dtype, which attention keeps; bf16's when unknown."""
+    named = getattr(model, "named_modules", None)
+    for name, module in named() if callable(named) else ():
+        if name.endswith("embed_tokens"):
+            values = getattr(module, "scales", None)
+            values = getattr(module, "weight", None) if values is None else values
+            if values is not None:
+                return values.itemsize
+    return 2
+
+
 def _cache_bytes_per_row(model, tokens):
-    """Bytes a row's cache may hold at ``tokens`` tokens: every layer's bf16 K and V for every token, or more where the
+    """Bytes a row's cache may hold at ``tokens`` tokens: every layer's K and V for every token, or more where the
     caches the language model makes hold more (a linear-attention state, layers wider than ``head_dim``); a rotating
     cache counts its window at most. None when the text config does not say."""
     config = getattr(model, "args", None) or getattr(model, "config", None)
@@ -598,7 +610,8 @@ def _cache_bytes_per_row(model, tokens):
     head_dim = get("head_dim") or (get("hidden_size") // attention_heads if attention_heads else 0)
     if not (layers and heads and head_dim):
         return None
-    widest = 2 * 2 * max(heads, get("num_global_key_value_heads")) * max(head_dim, get("global_head_dim"))
+    element = _kv_element_bytes(model)
+    widest = 2 * element * max(heads, get("num_global_key_value_heads")) * max(head_dim, get("global_head_dim"))
     key_dim = get("linear_num_key_heads") * get("linear_key_head_dim")
     value_dim = get("linear_num_value_heads") * get("linear_value_head_dim")
     conv = max(get("linear_conv_kernel_dim") - 1, 0) * (2 * key_dim + value_dim)
@@ -607,7 +620,7 @@ def _cache_bytes_per_row(model, tokens):
     held = sum(widest * min(tokens, cache.max_size) if getattr(cache, "max_size", None)
                else state if state and hasattr(cache, "cache") else widest * tokens
                for cache in (make_cache() if callable(make_cache) else None) or ())
-    return max(2 * 2 * int(layers) * heads * head_dim * tokens, held)
+    return max(2 * element * int(layers) * heads * head_dim * tokens, held)
 
 
 def _rollout_rows(model, rows, tokens):

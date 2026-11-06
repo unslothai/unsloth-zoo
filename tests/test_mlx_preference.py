@@ -3791,6 +3791,23 @@ def test_grpo_rollout_rows_are_sized_by_every_layer_or_more_where_the_made_cache
     assert _cache_bytes_per_row(qwen3_5_0_8b, 256) == 6 * 2048 * 256 + 18 * 4 * (16 * 128 * 128 + 3 * 6144) and _cache_bytes_per_row(qwen3_5_0_8b, 2048) == 24 * 2048 * 2048  # noqa: E501
 
 
+@pytest.mark.parametrize("dtype,element", [("bfloat16", 2), ("float32", 4)])
+def test_grpo_rollout_rows_count_the_cache_dtype_the_embedding_gives(dtype, element):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.grpo import _cache_bytes_per_row
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.embed_tokens = nn.Embedding(8, 4)
+            self.model.embed_tokens.weight = self.model.embed_tokens.weight.astype(getattr(mx, dtype))
+            self.args = types.SimpleNamespace(num_hidden_layers=2, num_key_value_heads=2, num_attention_heads=4, hidden_size=16)  # noqa: E501
+
+    assert _cache_bytes_per_row(Model(), 10) == 2 * element * 2 * 2 * 4 * 10
+
+
 @pytest.mark.parametrize("bsz,spg,iterations,shuffle", [(4, 2, 1, True), (2, 3, 2, True), (6, 1, 1, False)])
 def test_grpo_plan_order_follows_trl_repeat_sampler(bsz, spg, iterations, shuffle):
     from trl.trainer.utils import RepeatSampler
