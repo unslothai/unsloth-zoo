@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""fix_untrained_tokens runs in UnslothSFTTrainer.__init__ before TRL tokenizes, so train_dataset is usually raw.
-Rows of a raw datasets.Dataset have no "input_ids", so the row scans must not fetch (and decode) them, and the
-token count must not index a column that does not exist."""
+"""fix_untrained_tokens runs in UnslothSFTTrainer.__init__ before TRL tokenizes, so train_dataset is usually raw."""
 
 import os
 import sys
@@ -61,8 +59,7 @@ def test_raw_media_dataset_is_not_decoded_by_the_scans(image_decodes):
 
 
 def test_raw_media_dataset_is_not_decoded_on_the_not_trainable_path(image_decodes):
-    """The chat template holds an untrained token and the embeddings are frozen: main re-scans 250+250+2000+2000 rows,
-    finds no input_ids, and returns. Head returns the same way without reading a row."""
+    """Untrained token in the template + frozen embeddings: main re-scanned 5000 rows to find nothing."""
     model = _frozen_untrained_model()
     before = model.get_input_embeddings().weight.clone()
     tokenizer_utils.fix_untrained_tokens(model, _Tokenizer(), _image_dataset())
@@ -71,14 +68,12 @@ def test_raw_media_dataset_is_not_decoded_on_the_not_trainable_path(image_decode
 
 
 def test_raw_text_dataset_with_trainable_embeddings_does_not_raise_keyerror():
-    """Chat template holds an untrained token and embed/lm_head are trainable (full finetune, modules_to_save):
-    main counted with examples["input_ids"] on a dataset without that column and raised KeyError."""
+    """Untrained token in the template + trainable embed/lm_head: main raised KeyError counting input_ids."""
     model = _untrained_model()
     tokenizer_utils.fix_untrained_tokens(
         model, _Tokenizer(), datasets.Dataset.from_list([{"text" : "hello"}, {"text" : "world"}]),
     )
     weight = model.get_input_embeddings().weight
-    # Same as a dataset whose rows never contain the untrained ids: unseen rows are set to zero.
     assert torch.all(weight[:4] == 1.0)
     assert torch.equal(weight[4:6], torch.zeros(2, 4))
 

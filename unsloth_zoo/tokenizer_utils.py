@@ -350,9 +350,8 @@ _COUNT_INPUT_IDS_BATCH_SIZE = 1000
 
 
 def _rows_lack_input_ids(train_dataset):
-    """True when no row of train_dataset can carry "input_ids": a datasets.Dataset without that column and
-    without a custom transform (one could add it). Such a dataset is still raw (fix_untrained_tokens runs before
-    TRL tokenizes), and fetching its rows would decode every column (images, audio) only to skip each one."""
+    """datasets.Dataset with no "input_ids" column and no custom transform (which could add one): still raw, and
+    fetching a row decodes every column (images, audio) only to skip it."""
     # All Unsloth Zoo code licensed under LGPLv3
     if not isinstance(train_dataset, datasets.Dataset): return False
     try:
@@ -618,8 +617,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         # an indexable dataset
         return
 
-    # Check the first 250, last 250 input_ids. A dataset whose rows cannot carry "input_ids" skips every row in
-    # these scans, so read none of them (each fetch decodes all columns, media included); the flags are unchanged.
+    # Check the first 250, last 250 input_ids; raw rows would all be skipped, so read none
     size_dataset = 0 if _rows_lack_input_ids(train_dataset) else len(train_dataset)
     size = min(size_dataset, 250)
     for j in range(size):
@@ -664,7 +662,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         which_locations = []
 
         # Re-check the first 250, last 250 input_ids
-        size_dataset = 0 if _rows_lack_input_ids(train_dataset) else len(train_dataset)
         size = min(size_dataset, 250)
         for j in range(size):
             input_ids = train_dataset[j]
@@ -693,7 +690,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         # If no bad tokens, possibly chat template itself has issues?
         if len(final_bad_items) == 0:
             # Recheck 2000 and last 2000 items
-            size_dataset = 0 if _rows_lack_input_ids(train_dataset) else len(train_dataset)
             size = min(size_dataset, 2000)
             for j in range(size):
                 input_ids = train_dataset[j]
