@@ -81,12 +81,7 @@ from .hf_utils import get_transformers_model_type
 from .utils import _class_source
 
 def _def_prefix_checker(full_source):
-    """Return f(name) == (re.search(r"\\bdef[\\s]{1,}" + re.escape(name), full_source) is not None).
-
-    The identifier after `def<whitespace>` at every `def` is read once (zero-width, so
-    `def def f` yields both); an all-\\w name then matches iff one of them starts with it,
-    instead of each name rescanning the whole file. Other names keep the regex.
-    """
+    # f(name) == bool(re.search(r"\bdef[\s]{1,}" + re.escape(name), full_source)), reading def names once.
     names = None
 
     def defined(function):

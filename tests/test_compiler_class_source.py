@@ -14,12 +14,13 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""compiler._class_source must equal inspect.getsource, and compiler._def_prefix_checker must
-equal the per-name `\\bdef[\\s]{1,}<name>` search it replaces. Lifted via ast: CPU only."""
+"""utils._class_source == inspect.getsource; compiler._def_prefix_checker == the old per-name regex."""
 
 import ast
 import importlib
 import inspect
+import linecache
+import os
 import re
 import sys
 from pathlib import Path
@@ -28,13 +29,13 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 _WANTED = {
-    ROOT / "utils.py": {"_CLASS_SOURCE_DECORATOR", "_indent_of", "_class_source"},
+    ROOT / "utils.py": {"_CLASS_LINES", "_class_lines", "_class_source"},
     ROOT / "compiler.py": {"_def_prefix_checker"},
 }
 
 
 def _lift():
-    namespace = {"ast": ast, "inspect": inspect, "re": re, "sys": sys}
+    namespace = {"ast": ast, "inspect": inspect, "linecache": linecache, "re": re, "sys": sys}
     for path, wanted in _WANTED.items():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         body = []
@@ -89,16 +90,17 @@ def _modeling_modules():
     return modules
 
 
-def _spy(monkeypatch):
+def _count_parses(monkeypatch):
     calls = []
-    real = inspect.getsource
+    real = _NS["_class_lines"]
 
-    def spy(obj):
-        calls.append(obj)
-        return real(obj)
+    def counted(lines):
+        calls.append(lines)
+        return real(lines)
 
-    monkeypatch.setattr(inspect, "getsource", spy)
-    return calls, real
+    _NS["_CLASS_LINES"].clear()
+    monkeypatch.setitem(_NS, "_class_lines", counted)
+    return calls
 
 
 def test_transformers_classes_match_getsource(monkeypatch):
@@ -111,42 +113,12 @@ def test_transformers_classes_match_getsource(monkeypatch):
                     expected[cls] = inspect.getsource(cls)
                 except (OSError, TypeError):
                     continue
-    calls, _ = _spy(monkeypatch)
+    parses = _count_parses(monkeypatch)
     for cls, source in expected.items():
         assert _class_source(cls) == source, f"{cls.__module__}.{cls.__qualname__}"
     if sys.version_info < (3, 13):
-        # The compiler reads nn.Module subclasses: most must take the fast path.
-        import torch
-
-        modules = [c for c in expected if issubclass(c, torch.nn.Module) and "forward" in vars(c)]
-        slow = [c.__qualname__ for c in modules if c in calls]
-        assert len(slow) < 0.1 * len(modules), (slow, len(modules))
-
-
-@pytest.mark.parametrize(
-    "module_name, class_name",
-    [
-        ("llama", "LlamaRMSNorm"),  # @use_kernel_forward_from_hub("RMSNorm") on transformers 4.5x
-        ("llama", "LlamaDecoderLayer"),
-        ("llama", "LlamaAttention"),
-        ("qwen2_5_vl", "Qwen2_5_VLVisionAttention"),
-        ("gemma3", "Gemma3MLP"),
-    ],
-)
-def test_common_modules_take_fast_path(monkeypatch, module_name, class_name):
-    pytest.importorskip("transformers")
-    try:
-        module = importlib.import_module(f"transformers.models.{module_name}.modeling_{module_name}")
-    except Exception:
-        pytest.skip(f"modeling_{module_name} not importable")
-    cls = getattr(module, class_name, None)
-    if cls is None:
-        pytest.skip(f"{class_name} not in this transformers")
-    expected = inspect.getsource(cls)
-    calls, _ = _spy(monkeypatch)
-    assert _class_source(cls) == expected
-    if sys.version_info < (3, 13):
-        assert calls == []
+        files = {inspect.getsourcefile(cls) for cls in expected}
+        assert 0 < len(parses) <= len(files) < len(expected)
 
 
 SYNTHETIC = '''
@@ -301,20 +273,14 @@ def synthetic(tmp_path_factory):
         sys.modules.pop("zoo_class_source_fixture", None)
 
 
-FAST = ("Plain", "Decorated", "StringDecorator", "AfterCall", "InTry", "InTryDecorated", "InTryFirst", "InTryFirst2")
-FALLBACK = (
-    "MultiLineDecorator",
-    "BlankAfterDecorator",
-    "CommentAfterDecorator",
-    "Duplicate",
-    "InString",
-    "NoMethods",
-    "InTryMultiLineDecorator",
-    "InTryDedentedTail",
+SYNTHETIC_NAMES = (
+    "Plain", "Decorated", "StringDecorator", "AfterCall", "InTry", "InTryDecorated", "InTryFirst",
+    "InTryFirst2", "MultiLineDecorator", "BlankAfterDecorator", "CommentAfterDecorator", "Duplicate",
+    "InString", "NoMethods", "InTryMultiLineDecorator", "InTryDedentedTail",
 )
 
 
-@pytest.mark.parametrize("name", FAST + FALLBACK)
+@pytest.mark.parametrize("name", SYNTHETIC_NAMES)
 def test_synthetic_matches_getsource(synthetic, name):
     cls = getattr(synthetic, name)
     assert _class_source(cls) == inspect.getsource(cls)
@@ -325,17 +291,20 @@ def test_synthetic_nested_and_first_duplicate(synthetic):
         assert _class_source(cls) == inspect.getsource(cls)
 
 
-@pytest.mark.skipif(sys.version_info >= (3, 13), reason="3.13+ delegates to inspect.getsource")
-def test_fast_and_fallback_paths(synthetic, monkeypatch):
-    calls, _ = _spy(monkeypatch)
-    for name in FAST:
-        calls.clear()
-        _class_source(getattr(synthetic, name))
-        assert calls == [], name
-    for cls in [getattr(synthetic, n) for n in FALLBACK] + [synthetic.Outer.Nested]:
-        calls.clear()
-        _class_source(cls)
-        assert len(calls) == 1, cls.__qualname__
+def test_edited_file_is_reread(tmp_path, monkeypatch):
+    path = tmp_path / "zoo_class_source_edit.py"
+    path.write_text("class A:\n    def f(self):\n        return 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    module = importlib.import_module("zoo_class_source_edit")
+    try:
+        assert _class_source(module.A) == inspect.getsource(module.A)
+        path.write_text("x = 1\n\nclass A:\n    def f(self):\n        return 22\n", encoding="utf-8")
+        os.utime(path, (1, 1))
+        assert _class_source(module.A) == inspect.getsource(module.A)
+        if sys.version_info < (3, 13):  # 3.13+ reads the stale __firstlineno__
+            assert "return 22" in _class_source(module.A)
+    finally:
+        sys.modules.pop("zoo_class_source_edit", None)
 
 
 def _old_defined(name, source):
@@ -380,18 +349,14 @@ def test_def_prefix_checker_matches_regex_on_modeling_files():
     assert checked > 1000
 
 
-def test_gpt_oss_config_classes(monkeypatch):
+def test_gpt_oss_config_classes():
     pytest.importorskip("transformers.models.gpt_oss.configuration_gpt_oss")
     try:
         gpt_oss = importlib.import_module("unsloth_zoo.temporary_patches.gpt_oss")
     except Exception as exception:
         pytest.skip(f"gpt_oss patches not importable: {exception}")
-    classes = [getattr(gpt_oss, n) for n in ("Old_GptOssConfig", "GptOssConfig") if hasattr(gpt_oss, n)]
     from transformers.models.gpt_oss import configuration_gpt_oss
 
+    classes = [getattr(gpt_oss, n) for n in ("Old_GptOssConfig", "GptOssConfig") if hasattr(gpt_oss, n)]
     classes.append(configuration_gpt_oss.GptOssConfig)
-    expected = [inspect.getsource(c) for c in classes]
-    calls, _ = _spy(monkeypatch)
-    assert [_class_source(c) for c in classes] == expected
-    if sys.version_info < (3, 13):
-        assert calls == []
+    assert [_class_source(c) for c in classes] == [inspect.getsource(c) for c in classes]
