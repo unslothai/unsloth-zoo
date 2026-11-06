@@ -113,7 +113,7 @@ def _class_source(cls):
                 return inspect.getsource(cls)
             region = [line[len(indent):] if line.startswith(indent) else line for line in lines[prev:start]]
             try:
-                compile("".join(region), "<unsloth_class_source>", "exec", ast.PyCF_ONLY_AST)
+                ast.parse("".join(region), "<unsloth_class_source>")
                 break
             except SyntaxError:
                 continue
