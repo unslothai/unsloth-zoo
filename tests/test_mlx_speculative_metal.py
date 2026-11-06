@@ -1768,6 +1768,81 @@ def test_qwen4_decode_steps_run_gated_delta_on_the_fused_block_bit_for_bit(qwen4
     assert list(inference._DECODE_GDN_VERDICTS.values()) == [False] and "fused gated-delta decode step differs" in caplog.text
 
 
+@pytest.mark.parametrize("experts", [False, True])  # experts on disk read their routes on the host mid-forward
+def test_qwen4_decode_steps_read_disk_ple_rows_after_the_forward_bit_for_bit(qwen4, tmp_path, monkeypatch, experts):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference, offload
+    model, ids = qwen4
+    lm, sites = model.language_model, list(offload.ple_sites(model))
+    glus = list(offload.expert_sites(model)) if experts else []
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {f"{path}.{name}": value for path, module in sites + glus
+                                                              for name, value in tree_flatten(module.parameters())})
+    staged, pending, stage = [], set(), offload.DiskEmbedding._staged
+
+    def tracked_stage(self, x):
+        out = stage(self, x)
+        if out is None:
+            return None
+        rows, fill = out
+        staged.append(x)
+        pending.add(id(fill))
+
+        def read():
+            fill()
+            pending.remove(id(fill))
+        read.abandon = fill.abandon
+        return rows, read
+    monkeypatch.setattr(offload.DiskEmbedding, "_staged", tracked_stage)
+    submits, submit = [], mx.async_eval
+
+    def is_ids(arrays):
+        return len(arrays) == 1 and arrays[0].dtype == mx.int64 and arrays[0].ndim == 1
+
+    def submitted(*arrays):
+        if not is_ids(arrays):
+            assert not pending, "layer submitted before its staged rows were read"
+        submits.append(arrays)
+        return submit(*arrays)
+    monkeypatch.setattr(mx, "async_eval", submitted)
+    try:
+        assert offload.offload_ple(model, str(tmp_path), 1.0)["tables"] == len(sites) == 1
+        if experts:
+            assert offload.offload_experts(model, str(tmp_path), 1.0)["layers"] == len(glus) > 1
+        cache = make_prompt_cache(lm)
+        lm(mx.array([ids[0][:24]]), cache = cache)
+
+        def decoded():
+            run = _clone(cache)
+            logits = [lm(mx.array([[token]]), cache = run).logits for token in ids[0][24:30]]
+            return _state(SimpleNamespace(logits = logits, hidden_states = None), run)
+        native = decoded()
+        with inference.exact_batch_invariant_decode(model):
+            monkeypatch.setattr(inference, "_STAGED_ROWS_OFF", [True])
+            assert _same(native, decoded())
+            submits.clear()
+            assert _same(native, decoded())  # past first-use work
+            unstaged, submits[:] = list(submits), []
+            staged.clear()
+            monkeypatch.setattr(inference, "_STAGED_ROWS_OFF", [])
+            assert _same(native, decoded())
+            roots = [arrays for arrays in submits if not is_ids(arrays)]
+            ids_submitted = [arrays[0] for arrays in submits if is_ids(arrays)]
+            # One ID submission per staged lookup; every layer root follows its row read, in native order.
+            assert len(staged) >= 4 and not pending
+            assert _same(tree_flatten(ids_submitted), tree_flatten([x.astype(mx.int64).reshape(-1) for x in staged]))
+            assert _same(tree_flatten(roots), tree_flatten(unstaged))
+        assert not inference._STAGED_ROWS_OFF
+        # A check settling while rows wait unread may have evaluated them unfilled: staging turns off for good.
+        offload.STAGED_FILLS.fills = [lambda: None]
+        inference._settled(True)
+        assert inference._STAGED_ROWS_OFF
+    finally:
+        offload.STAGED_FILLS.fills = None
+        for path, module in sites + glus:
+            offload._replace_module(model, path, module)
+
+
 @pytest.mark.parametrize("flag, prompt", [("0", 40), ("0", 1200), ("1", 1200)])
 def test_a_qwen4_verify_block_attends_and_projects_as_its_decode_steps(qwen4, flag, prompt, monkeypatch):
     from mlx_vlm.models.cache import make_prompt_cache

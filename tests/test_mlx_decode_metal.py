@@ -29,6 +29,16 @@ def _equal(a, b):
     assert np.array_equal(np.array(a.view(mx.uint8)), np.array(b.view(mx.uint8)))
 
 
+@pytest.mark.parametrize("after, pending", [(None, True), (0, True), (2, True), (2, False)])
+def test_staged_prefix_fills_before_releasing_every_root(monkeypatch, after, pending):
+    events = []
+    monkeypatch.setattr(decode.offload, "STAGED_FILLS", SimpleNamespace(fills = [lambda: events.append("fill")] if pending else [], held = [], **({"submit_after": after} if after is not None else {})))
+    monkeypatch.setattr(mx, "async_eval", lambda *roots: events.append(roots))
+    for i in range(3):
+        decode._submit(i, i + 10)
+        assert events == (["fill", *((j, j + 10) for j in range(i + 1))] if pending and after and i + 1 >= after else [] if pending else [(j, j + 10) for j in range(i + 1)])
+
+
 def _model(kernel = 4):
     model = native.Qwen3_5GatedDeltaNet(SimpleNamespace(
         hidden_size = 32, linear_num_value_heads = 2, linear_num_key_heads = 1,

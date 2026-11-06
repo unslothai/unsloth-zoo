@@ -61,6 +61,39 @@ _DTYPES = {
     "U8": (np.uint8, mx.uint8),
     "I32": (np.int32, mx.int32),
 }
+_TRANSPORT = {np.dtype(np.uint16): mx.uint16, np.dtype(np.float16): mx.float16, np.dtype(np.float32): mx.float32,
+              np.dtype(np.uint32): mx.uint32, np.dtype(np.uint8): mx.uint8, np.dtype(np.int32): mx.int32}
+# A forward that lists its fills here gets a lookup of at most this many rows staged instead of read at once, and
+# lists in `held` the submissions it defers until they are read.
+STAGED_FILLS = threading.local()
+_STAGED_ROWS = 64
+_STAGING = threading.local()
+
+
+def _staged_ids(x):
+    ids = x.astype(mx.int64)
+    ids = ids.reshape(-1)
+    # Evaluate IDs during the forward build; read_staged fills row buffers before submitting their consumers.
+    mx.async_eval(ids)
+    return ids
+
+
+def read_staged():
+    """Read the rows this thread's forward staged, then submit what it held back for them. Anything about to read
+    the forward's arrays on the host calls this first: they could read rows not yet filled."""
+    fills = getattr(STAGED_FILLS, "fills", None)
+    if not fills:
+        return
+    held, STAGED_FILLS.fills, STAGED_FILLS.held = getattr(STAGED_FILLS, "held", None), None, None
+    try:
+        for fill in fills:
+            fill()
+    except BaseException:
+        for fill in fills:
+            fill.abandon()
+        raise
+    for arrays in held or ():
+        mx.async_eval(*arrays)
 
 _READ_THREADS = 16
 # Below this many reads a pool round trip costs more than it overlaps.
@@ -192,7 +225,13 @@ class _Field:
         return self.fd, self.offset + index * self.row_bytes
 
     def to_mx(self, buffer):
-        array = mx.array(buffer.view(self.transport).reshape(-1, *self.shape))
+        return self._typed(mx.array(buffer.view(self.transport).reshape(-1, *self.shape)))
+
+    def staged(self, rows):
+        """What ``to_mx`` makes of the bytes ``rows`` (one uint8 row per table row) will hold, read lazily."""
+        return self._typed(rows.view(_TRANSPORT[np.dtype(self.transport)]).reshape(-1, *self.shape))
+
+    def _typed(self, array):
         if array.dtype != self.dtype:
             array = array.view(self.dtype)  # bf16 travels as uint16
         return array if self.cast is None else array.astype(self.cast)
@@ -215,6 +254,13 @@ def _in_core(mapped, rows, row_bytes):
             _mincore = False
     if not _mincore or not rows.size:
         return np.ones(rows.size, dtype = bool)
+    if rows.size == 1:  # the sampled rows: numpy's per-call overhead would dominate
+        start = mapped.ctypes.data + int(rows[0]) * row_bytes
+        first = start // mmap.PAGESIZE * mmap.PAGESIZE
+        pages = (ctypes.c_uint8 * ((start + row_bytes - 1 - first) // mmap.PAGESIZE + 1))()
+        if _mincore(first, len(pages) * mmap.PAGESIZE, pages) != 0:
+            return np.ones(1, dtype = bool)
+        return np.array([all(page & 1 for page in pages)])
     start = mapped.ctypes.data + rows * row_bytes
     end = start + row_bytes - 1
     first = int(start.min()) // mmap.PAGESIZE * mmap.PAGESIZE
@@ -260,6 +306,16 @@ class _RowTable:
     def fill(self, local, buffers, at, jobs):
         """Puts rows local (unique, past the held prefix) into buffers at at: rows read earlier and still in the page
         cache are copied now; the rest are queued on jobs and returned."""
+        if local.size == 1:
+            row, position = int(local[0]), int(at[0])
+            seen = (int(self.seen[row >> 3]) >> (row & 7)) & 1
+            if seen and all(_in_core(field.map, local, field.row_bytes)[0] for field in self.fields):
+                for field, buffer in zip(self.fields, buffers):
+                    buffer[position] = field.map[row]
+                return local[:0]
+            for field, buffer in zip(self.fields, buffers):
+                jobs.append((field.fd, field.offset + row * field.row_bytes, memoryview(buffer[position])))
+            return local
         seen = (self.seen[local >> 3] >> (local & 7).astype(np.uint8)) & 1 == 1
         if seen.any():
             # Through the map an evicted row is a page fault taken with the GIL held; a check walks every page its rows
@@ -306,6 +362,10 @@ class DiskEmbedding(nn.Module):
         self.normalize_zero = normalize_zero
 
     def __call__(self, x):
+        fills = getattr(STAGED_FILLS, "fills", None)
+        if fills is not None and (staged := self._staged(x)) is not None:
+            fills.append(staged[1])
+            return staged[0]
         ids = np.asarray(x.astype(mx.int64)).reshape(-1)
         if ids.size and (ids.min() < 0 or ids.max() >= self._offsets[-1]):
             raise IndexError("embedding index is outside the table")
@@ -313,10 +373,61 @@ class DiskEmbedding(nn.Module):
         values = self._lookup(unique)
         if unique.size != ids.size or not np.array_equal(unique, ids):
             values = values[mx.array(inverse.reshape(-1).astype(np.int32))]
+        return self._shaped(values, x)
+
+    def _shaped(self, values, x):
         if self.normalize_zero:
             # The stock sharded embedding scatter-adds rows into zeros, turning -0.0 into +0.0; adding zeros reproduces that bit for bit.
             values = mx.zeros(values.shape, dtype = values.dtype) + values
         return values.reshape(*x.shape, self.dims)
+
+    def _staged(self, x):
+        """``(lookup, fill)``: the lookup of ``x``'s rows as lazy reads of staging memory, and the call that reads ``x``
+        and fills that memory, which must run before anything reading the lookup is evaluated. None for a lookup
+        too large to stage, or one some row of which is held in memory."""
+        tables, offsets = self._tables, self._offsets
+        fields = tables[0].fields
+        if (x.size > _STAGED_ROWS or any(table.resident for table in tables)
+                or any(f.apart is not None for table in tables for f in table.fields)
+                or any([f.row_bytes for f in table.fields] != [f.row_bytes for f in fields] for table in tables)):
+            return None
+        # A thread's own slots: their last reader is a graph on that thread's stream.
+        slots = _STAGING.__dict__.setdefault("slots", {})
+        key = (id(self), x.size, tuple(field.row_bytes for field in fields))
+        slot = slots.get(key)
+        if slot is not None and slot[3]:
+            return None  # its rows await the fill of a lookup built earlier
+        if slot is None:
+            slot = slots[key] = [[mx.zeros((x.size, field.row_bytes), dtype = mx.uint8) for field in fields], None, None, False]
+        slot[3] = True
+        try:
+            if slot[1] is None:
+                mx.eval(slot[0])
+                slot[1] = [np.asarray(array) for array in slot[0]]
+            if slot[2] is not None:
+                mx.eval(slot[2])  # the graph that read these rows last has run before they change
+            # Dequantizing writes its own buffer; a bare table's lookup would alias the rows the next fill overwrites.
+            rows = slot[0] if self.quantization is not None else [array + 0 for array in slot[0]]
+            slot[2] = values = self._dequantized([field.staged(array) for field, array in zip(fields, rows)])
+            staged_ids = _staged_ids(x)
+        except BaseException:
+            slot[3] = False
+            raise
+
+        def fill():
+            ids = np.asarray(staged_ids)
+            if ids.size and (ids.min() < 0 or ids.max() >= offsets[-1]):
+                raise IndexError("embedding index is outside the table")
+            shard = np.searchsorted(offsets, ids, side = "right") - 1
+            jobs = []
+            for position, (index, row) in enumerate(zip(shard.tolist(), (ids - offsets[shard]).tolist())):
+                for field, view in zip(tables[index].fields, slot[1]):
+                    jobs.append((field.fd, field.offset + row * field.row_bytes, memoryview(view[position])))
+            read_ranges(jobs)
+            slot[3] = False
+
+        fill.abandon = lambda: slot.__setitem__(3, False)
+        return self._shaped(values, x), fill
 
     def _lookup(self, unique):
         tables, offsets = self._tables, self._offsets
@@ -346,6 +457,9 @@ class DiskEmbedding(nn.Module):
         if np.any(positions[1:] < positions[:-1]):
             order = mx.array(np.argsort(positions, kind = "stable").astype(np.int32))
             columns = [column[order] for column in columns]
+        return self._dequantized(columns)
+
+    def _dequantized(self, columns):
         if self.quantization is None:
             return columns[0]
         group_size, bits, mode = self.quantization
@@ -741,6 +855,7 @@ class OffloadSwitchGLU(nn.Module):
 
     def _routes(self, indices):
         object.__setattr__(self, "_spare", None)
+        read_staged()
         routes = np.asarray(indices).reshape(-1).astype(np.int64)
         return routes, np.unique(routes)
 

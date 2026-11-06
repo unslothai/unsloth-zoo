@@ -38,14 +38,14 @@ import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from threading import RLock, local
-from types import FunctionType
+from types import FunctionType, ModuleType
 from typing import Callable, NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import ane, attention, matmul, nax
+from . import ane, attention, matmul, nax, offload
 from .ane import ane_prefill_available, ane_prefill_checkpoint_available, ane_prefill_mlp, release_ane_prefill
 
 
@@ -164,9 +164,50 @@ def _settled(verdict):
     """`verdict`, after synchronizing on a mismatch: a failed command buffer's garbage reads as one, and MLX
     raises that error only at the next synchronize."""
     _FIRST_USE_WORK[0] += 1
+    if getattr(offload.STAGED_FILLS, "fills", None) and not _STAGED_ROWS_OFF:
+        _STAGED_ROWS_OFF.append(True)
+        logger.warning("a first-use check ran while disk PLE rows were staged; rows are read in the forward from now on")
     if not verdict:
         mx.synchronize()
     return verdict
+
+
+# Each first-use check calls this before it evaluates any of the forward's arrays.
+_staged_ready = offload.read_staged
+
+
+_STAGED_SUBMIT_ROOTS = 40
+
+
+@functools.cache
+def _staged_submit_window():
+    if mx.__version__ != "0.32.4":
+        return 0
+    if not mx.metal.is_available():
+        return 0
+    if mx.device_info().get("architecture") != "applegpu_g15s":
+        return 0
+    return _STAGED_SUBMIT_ROOTS
+
+
+def _submit(*arrays):
+    held = getattr(offload.STAGED_FILLS, "held", None)
+    if held is not None and getattr(offload.STAGED_FILLS, "fills", None):
+        held.append(arrays)
+        after = getattr(offload.STAGED_FILLS, "submit_after", 0)
+        if after and len(held) >= after:
+            _staged_ready()
+    else:
+        mx.async_eval(*arrays)
+
+
+class _HeldMx(ModuleType):
+    def __getattr__(self, name):
+        return getattr(mx, name)
+
+
+_HELD_MX = _HeldMx("mlx.core")
+_HELD_MX.async_eval = _submit
 
 
 def _unless_failed_buffer(error):
@@ -874,6 +915,7 @@ def _decode_step_route(language, bound, update, update_window, update_recurrent,
             out, new_state = update(q, k, v, a, b, self.A_log, self.dt_bias, state = state, use_kernel = True)
             out = self.norm(out, z)
             if fits and verdict is None:
+                _staged_ready()
                 try:
                     verdict = _settled(all(bool(mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item())
                                            for x, y in zip(fused(), (window, out, new_state))))
@@ -1145,6 +1187,7 @@ def _packed_gated_delta_route(native, bindings):
             return _packed_gated_delta(q, k, v, g, beta, state)
         stock = native(q, k, v, g, beta, state, mask)
         if verdict is None:
+            _staged_ready()
             try:
                 verdict = _settled(all(bool(mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item())
                                        for a, b in zip(_packed_gated_delta(q, k, v, g, beta, state), stock)))
@@ -1349,6 +1392,7 @@ def _qwen4_verified(key, fused, native, what):
     if verdict is None:
         candidate = fused()
         outputs = [out if isinstance(out, tuple) else (out,) for out in (reference, candidate)]
+        _staged_ready()
         try:
             verdict = _settled(len(outputs[0]) == len(outputs[1]) and all(
                 a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item()
@@ -2248,6 +2292,7 @@ _ADD_NORM_VERDICTS = {}
 
 
 def _add_norm_verified(dtype, axis):
+    _staged_ready()
     verdict = _ADD_NORM_VERDICTS.get((dtype, axis))
     if verdict is None:
         keys = mx.random.split(mx.random.key(axis), 3)
@@ -2671,6 +2716,7 @@ _MOE_ROUTER_NO_SCALE = mx.zeros((1,), dtype = mx.float32)
 
 @functools.cache
 def _moe_router_verified(dtype, scale_dtype, experts, top_k, mode, normalize):
+    _staged_ready()
     if mode == _QWEN_ROUTING:
         scale = _MOE_ROUTER_NO_SCALE
     else:
@@ -2705,6 +2751,7 @@ def _fused_moe_router(logits, scale, top_k, mode, normalize, run = True):
 
 @functools.cache
 def _moe_router_shared_verified(dtype, experts, top_k, normalize):
+    _staged_ready()
     for rows in (1, 9):
         logits = (mx.random.normal((rows, experts), key = mx.random.key(rows)) * 3).astype(dtype)
         gate = (mx.random.normal((rows, 1), key = mx.random.key(rows + 1)) * 8).astype(dtype)
@@ -3729,6 +3776,7 @@ _ROUTED_ROWS_WITHOUT_NAX = 8
 
 
 def _grouped_routed_faster(routed, grouped, clock = time.perf_counter):
+    _staged_ready()
     try:
         native, candidate = routed(), grouped()
         if native is None or candidate is None or not _settled(
@@ -3851,6 +3899,7 @@ class _RoutedExperts:
         return plan[1](*tensors[2], *common[2], activations, inds, scores, shared)
 
     def _fold_probe(self, block, tensors, common, dtype, top_k):
+        _staged_ready()
         gate = self.mlp.gate_proj
         experts, width = gate.weight.shape[0], gate.scales.shape[-1] * gate.group_size
         for rows in (1, _FOLD_ROWS):
@@ -3909,6 +3958,7 @@ class _RoutedExperts:
         return _MOE_ROUTED_VERDICTS[signature]
 
     def _probe(self, dtype, top_k):
+        _staged_ready()
         mlp = self.mlp
         tensors = tuple(map(_projection_tensors, (mlp.gate_proj, mlp.up_proj, mlp.down_proj)))
         experts, hidden = mlp.gate_proj.weight.shape[0], mlp.down_proj.weight.shape[1]
@@ -3986,6 +4036,7 @@ def _run_moe_combine(y, inv_order, scores):
 
 @functools.cache
 def _moe_combine_verified(dtype, top_k, width):
+    _staged_ready()
     for tokens in (1, 67):
         routes = tokens * top_k
         y = (mx.random.normal((routes, 1, width), key = mx.random.key(tokens)) * 3).astype(dtype)
@@ -4352,6 +4403,7 @@ def _nax_small_m_qmm(module, x, bindings, route = None, rows = None):
     flat = x.reshape(M, K)
     routed = route.call("", flat, w, scales, biases, group_size, bits)
     if verified is None:
+        _staged_ready()
         try:
             verified = _settled(_nax_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed,
                                                         route.code_offset))
@@ -4425,6 +4477,7 @@ def _nax_verified_int8_qmm(key, flat, w, scales, biases, group_size, bits, indic
         routed = nax.int8_gather_qmm(flat, w, scales, biases, indices, bits, token_rows)
     if verified is None:
         rows = flat if token_rows is None else flat[token_rows]
+        _staged_ready()
         try:
             verified = _settled(_nax_int8_qmm_matches_native(rows, w, scales, biases, group_size, bits, routed,
                                                              indices))
@@ -4508,6 +4561,7 @@ def _nax_sorted_gather(owner, x, w, scales, biases, indices, sorted_indices, gro
         return None
     routed = nax.sorted_gather_qmm(x.reshape(-1, K), w, scales, biases, indices, bits, token_rows).reshape(T, 1, N)
     if verified is None:
+        _staged_ready()
         try:
             native = mx.gather_qmm(x if token_rows is None else x[token_rows], w, scales, biases, rhs_indices = indices,
                                    transpose = True, group_size = group_size, bits = bits, sorted_indices = True)
@@ -5052,6 +5106,7 @@ def _dense_prefill_qmm(module, x, bindings):
     if verified is None:
         native = mx.quantized_matmul(x, w, scales = scales, biases = biases, transpose = True,
                                      group_size = group_size, bits = bits, mode = mode)
+        _staged_ready()
         try:
             verified = _settled(native.dtype == dense.dtype and bool(
                 mx.array_equal(native.view(mx.uint16), dense.view(mx.uint16)).item()))
@@ -5085,6 +5140,7 @@ def _staged_prefill_qmm(module, x, w, scales, biases, M, N, K):
     if verified is None:
         native = mx.quantized_matmul(x.reshape(M, K), w, scales, biases, transpose = True,
                                      group_size = group_size, bits = bits)
+        _staged_ready()
         try:
             verified = _settled(bool(mx.array_equal(routed.view(mx.uint16), native.view(mx.uint16)).item()))
         except (RuntimeError, ValueError) as error:
@@ -5498,6 +5554,7 @@ def _verify_admitted(key, native, fused):
     reference = native()
     if verdict is None and (candidate := fused()) is not None:
         pairs = zip(reference, candidate) if isinstance(reference, tuple) else ((reference, candidate),)
+        _staged_ready()
         try:
             verdict = _settled(all(a.dtype == b.dtype and a.shape == b.shape
                                    and mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item() for a, b in pairs))
@@ -5624,6 +5681,7 @@ def _taped_update(native, with_states):
                 stock = with_states(q, k, v, a, b, A_log, dt_bias, initial, mask, use_kernel = use_kernel,
                                     state_steps = steps)
                 if verdict is None:
+                    _staged_ready()
                     try:
                         verdict = _settled(_replay_matches(stock, replay, mask, initial))
                     except (RuntimeError, ValueError) as error:
@@ -6065,6 +6123,7 @@ def _verify_gdn_folded(key, folded, fused, entry):
         return folded()
     reference = (*fused(entry), entry)
     if verdict is None:
+        _staged_ready()
         try:
             verdict = _settled(all(x.dtype == y.dtype and x.shape == y.shape
                                    and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
@@ -6147,6 +6206,7 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = Fal
         tape_key = _tape_key(q, k, v, a, b, initial, None)
         taped = _TAPE_VERDICTS.get(tape_key)
         if fits and verdict is None and taped is not None:
+            _staged_ready()
             try:
                 verdict = _settled(taped and all(
                     x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
@@ -6170,6 +6230,9 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = Fal
 
 _DECODE_GDN_VERDICTS = {}
 _DECODE_GDN_CONTRACT = {"mlx_vlm.models.cache": {"ArraysCache.update_window": "5580299b90d3a0b1"}}
+# The qwen4_exp forward body that submits each layer as it builds it, rebound to hold those submissions back.
+_STAGED_ROWS_CONTRACT = {"mlx_vlm.models.qwen4_exp.language": {"Qwen4ExpBatchInvariantForward._model": "5148d15462bdbae0"}}
+_STAGED_ROWS_OFF = []
 
 
 def _decode_gdn(self, base, layer, inputs, mask, cache, qk_eps, l2):
@@ -6198,6 +6261,7 @@ def _decode_gdn(self, base, layer, inputs, mask, cache, qk_eps, l2):
     if verdict is None:
         output = base._gated_delta(self, layer, inputs, mask, cache)
         candidate = fused()
+        _staged_ready()
         try:
             verdict = _settled(candidate is not None and all(
                 x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
@@ -6378,6 +6442,7 @@ def _qmv_rows_kernel(p):
             and matmul.qmv_rows_probe_passed(p.scales.dtype, p.group_size, p.bits)):
         kernel = (p.scales.dtype, p.group_size, p.bits)
         layout = (*kernel, p.weight.shape)
+        _staged_ready()
         try:
             matmul.compile_qmv_rows(*kernel)
             if kernel not in _QMV_ROWS_COSTS:
@@ -6591,6 +6656,7 @@ def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
             lost[1] -= 1
             if lost[1] > 0 or lost[0] >= _EXACT_ATTENTION_TIMINGS:
                 return per_row()
+        _staged_ready()
         try:
             mx.eval(queries, keys, values)
         except (RuntimeError, ValueError) as error:
@@ -6670,6 +6736,14 @@ def _exact_verify_class(base, name, *cache_key):
     # One-row steps only on a forward that also decodes (qwen4_exp); the tape contract pins the `_gated_delta` they mirror.
     decode_bindings = (_resolved_bindings(_DECODE_GDN_CONTRACT)
                        if fused_bindings is not None and entry == "__call__" and tape_bindings is not None else None)
+    # A decode step reads its disk PLE rows after its forward is built, so the build overlaps the previous step's GPU
+    # work. Only after a step that ran no first-use check: a check evaluates arrays that would read the rows unfilled.
+    staged_bindings = (_resolved_bindings(_STAGED_ROWS_CONTRACT)
+                       if entry == "__call__" and os.environ.get("UNSLOTH_MLX_STAGED_PLE_ROWS") != "0" else None)
+    model_body, held_model, quiet = getattr(base, "_model", None), None, [False]
+    if staged_bindings is not None and model_body is not None and model_body.__globals__.get("mx") is mx:
+        held_model = FunctionType(model_body.__code__, {**model_body.__globals__, "mx": _HELD_MX}, model_body.__name__,
+                                  model_body.__defaults__, model_body.__closure__)
 
     def verify(self, language_model, inputs, *, cache = None, **kwargs):
         outer, outer_tapes = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
@@ -6696,8 +6770,19 @@ def _exact_verify_class(base, name, *cache_key):
         _VERIFY_STATE.tapes = ([] if _VERIFY_STATE.serving and taped is not None
                                and any(getattr(entry, "history_capacity", 0) for entry in kwargs.get("cache") or ())
                                and _bindings_intact(tape_bindings) else None)
+        outer_fills, outer_held, outer_after = (getattr(offload.STAGED_FILLS, name, None)
+                                                for name in ("fills", "held", "submit_after"))
+        staged = (held_model is not None and quiet[0] and not _STAGED_ROWS_OFF and _VERIFY_STATE.serving
+                  and _VERIFY_STATE.plain_decode and _VERIFY_STATE.tapes is None and _bindings_intact(staged_bindings))
+        offload.STAGED_FILLS.fills, offload.STAGED_FILLS.held = ([], []) if staged else (None, None)
+        inputs = args[0] if args else kwargs.get("inputs")
+        # Fill before releasing the prefix; later layers can then build while it runs.
+        offload.STAGED_FILLS.submit_after = (_staged_submit_window()
+                                            if staged and getattr(inputs, "shape", None) == (1, 1) else 0)
+        work = _FIRST_USE_WORK[0]
         try:
             output = native_entry(self, language_model, *args, **kwargs)
+            _staged_ready()
             caches = {}
             for tape in _VERIFY_STATE.tapes or ():
                 caches.setdefault(id(tape[0]), (tape[0], []))[1].append(tape)
@@ -6706,6 +6791,11 @@ def _exact_verify_class(base, name, *cache_key):
                 cache._unsloth_tapes = (cache._speculation, tapes)
             return output
         finally:
+            for fill in getattr(offload.STAGED_FILLS, "fills", None) or ():
+                fill.abandon()
+            quiet[0] = _FIRST_USE_WORK[0] == work
+            offload.STAGED_FILLS.fills, offload.STAGED_FILLS.held = outer_fills, outer_held
+            offload.STAGED_FILLS.submit_after = outer_after
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes, _VERIFY_STATE.plain_decode = outer, outer_tapes, outer_plain
 
     def taped_gated_delta(self, layer, inputs, mask, cache):
@@ -6786,6 +6876,8 @@ def _exact_verify_class(base, name, *cache_key):
                "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base}
     if family.submit_layers:
         methods["_layer"] = submitted_layer
+    if held_model is not None:
+        methods["_model"] = held_model
     if taped is not None:
         methods["_gated_delta"] = taped_gated_delta
     pins = family.capabilities.get("attention")
@@ -6934,7 +7026,9 @@ def exact_batch_invariant_decode(model, *, _modules = None):
     rows together as there. A speculative block's gated-delta layers are taped and fused as the Qwen3.5 verifier's
     are, each cache replaying its retained prefix on its own commit. A one-token step's gated-delta layers run their
     convolution through gated norm in that fused launch, once a first step of each layout matched the native method
-    bit for bit (`UNSLOTH_MLX_FUSED_GDN_VERIFY=0` keeps both native). The forward already submits each layer. Only calls
+    bit for bit (`UNSLOTH_MLX_FUSED_GDN_VERIFY=0` keeps both native). A one-token step's disk PLE rows are read once
+    its forward is built, so the build overlaps the previous step (`UNSLOTH_MLX_STAGED_PLE_ROWS=0` reads them inside
+    the forward). The forward already submits each layer. Only calls
     of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
     forward drifted, keep the native methods.
     """
@@ -8534,6 +8628,7 @@ def _wide_head_decode_attention(queries, keys, values, scale, mask):
     out = _vector_attention(queries, keys, values, scale, blocks)
     if verdict is None:
         with _WIDE_ATTENTION_LOCK:
+            _staged_ready()
             try:
                 native = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = scale, mask = mask)
                 verdict = _settled(mx.array_equal(out.view(mx.uint16), native.view(mx.uint16)).item())
@@ -8656,6 +8751,7 @@ def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache, fast_
         out = _vector_attention(*chunk, scale, blocks)
         if verdict is None:
             with _VERIFY_ATTENTION_LOCK:
+                _staged_ready()
                 try:
                     verdict = _settled(mx.array_equal(out.view(mx.uint16),
                                                       _decode_attention(*chunk, scale).view(mx.uint16)).item())
@@ -8879,6 +8975,7 @@ def _qsa_select_route(native, bindings):
         key = (self.n_heads, self.head_dim, self.block_topk, rows == 1)
         verdict = _QSA_VERDICTS.get(key)
         if verdict is None:
+            _staged_ready()
             try:
                 verdict = _settled(bool(mx.array_equal(mx.sort(selection.selected_blocks, axis = -1), picks).item()))
             except (RuntimeError, ValueError) as error:
@@ -9304,6 +9401,7 @@ def _depthwise_conv(x, weight, dilation):
 
 @functools.cache
 def _depthwise_conv_verified(dtype, channels, taps, dilation):
+    _staged_ready()
     keys = mx.random.split(mx.random.key(channels), 3)
     weight = mx.random.normal((channels, taps, 1), key = keys[0]).astype(dtype)
     for rows, scale, key in ((1, 1, keys[1]), (67, 64, keys[2])):

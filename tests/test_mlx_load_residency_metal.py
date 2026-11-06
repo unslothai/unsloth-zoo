@@ -375,6 +375,39 @@ def test_offloaded_table_matches_stock(tmp_path, kind, fraction):
     assert sorted(os.listdir(tmp_path)) == listing  # nothing is written next to the checkpoint
 
 
+@pytest.mark.parametrize("kind", ["dense", "quantized", "sharded_quantized"])
+def test_staged_rows_match_stock_once_filled(tmp_path, kind, monkeypatch):
+    name, module = _table(kind)
+    model = _lazy_copy(lambda: _holder(name, module), str(tmp_path))
+    steps = [mx.array([[7, 401, 7]]), mx.array([[3, 250, 470]])]  # a repeat, then other rows
+    expected = [_site(model, name)(ids) for ids in steps]
+    offload_ple(model, str(tmp_path), 1.0)
+    table, outs, rivals, evaluate = _site(model, name), [], [], mx.eval
+    monkeypatch.setattr(mx, "async_eval", lambda ids, queued = (queued := []): queued.append((ids.dtype, ids.ndim, ids.tolist())))
+    # Another forward asks for the slot while this one waits on the slot's last reader.
+    monkeypatch.setattr(mx, "eval", lambda *arrays: rivals.append(table._staged(steps[0])) or evaluate(*arrays))
+    zoo_offload.STAGED_FILLS.fills = fills = []
+    try:
+        for ids in steps:
+            outs.append(table(ids + 0))
+            assert len(fills) == 1
+            fills.pop()()  # the next lookup reuses these rows: the first result must not read the second's
+            # Another thread stages its own rows, never reading this thread's graph or buffers.
+            other = []
+            thread = threading.Thread(target = lambda: other.append(table._staged(steps[1])))
+            thread.start()
+            thread.join()
+            assert other and other[0] is not None
+            other[0][1].abandon()
+    finally:
+        zoo_offload.STAGED_FILLS.fills = None
+    assert rivals and all(rival is None for rival in rivals)
+    assert len(queued) == 4 and all(a == (mx.int64, 1, b.reshape(-1).tolist()) for a, b in zip(queued, (steps[0], steps[1], steps[1], steps[1])))
+    for actual, reference in zip(outs, expected):
+        assert actual.dtype == reference.dtype and actual.shape == reference.shape
+        np.testing.assert_array_equal(_bits(actual), _bits(reference))
+
+
 def test_offloaded_rows_the_page_cache_dropped_are_read_again(tmp_path, monkeypatch):
     name, module = _table("sharded_quantized")
     model = _lazy_copy(lambda: _holder(name, module), str(tmp_path))
@@ -390,6 +423,10 @@ def test_offloaded_rows_the_page_cache_dropped_are_read_again(tmp_path, monkeypa
             monkeypatch.setattr(zoo_offload, "_in_core", lambda mapped, rows, row_bytes: rows >= 10)
         np.testing.assert_array_equal(_bits(table(ids)), _bits(expected))
     assert reads == [4 * fields, 0, 2 * fields]
+    for resident in (False, True, False):
+        monkeypatch.setattr(zoo_offload, "_in_core", lambda mapped, rows, row_bytes: np.full(rows.size, resident or row_bytes > 8))
+        np.testing.assert_array_equal(_bits(table(mx.array([[143]]))), _bits(module(mx.array([[143]]))))
+        assert reads[-1] == fields * (not resident)
     # More seen rows than the sample: a spread sample of every field checked row by row, or all rows when one was evicted (here late rows of scales and biases).
     table(many)
     for evicted in (False, True):
@@ -405,6 +442,9 @@ def test_offloaded_rows_the_page_cache_dropped_are_read_again(tmp_path, monkeypa
     pages[[2 * mmap.PAGESIZE + 5, 3 * mmap.PAGESIZE, 5 * mmap.PAGESIZE]] = 1
     assert in_core(pages, np.array([0, 2, 3]), mmap.PAGESIZE).tolist() == [False, True, True]
     assert in_core(pages, np.array([0, 1]), 3 * mmap.PAGESIZE).tolist() == [False, False]
+    # One row at a time, as the sample is checked; the last two rows span a resident page and an evicted one.
+    rows = ((0, 1), (2, 1), (1, 2), (2, 1.5), (4, 0.875))
+    assert [in_core(pages, np.array([r]), int(n * mmap.PAGESIZE)).tolist() for r, n in rows] == [[False], [True], [True], [False], [False]]
 
 
 def test_offloaded_rows_are_never_loaded(tmp_path):
