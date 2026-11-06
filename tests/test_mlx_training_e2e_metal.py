@@ -791,8 +791,8 @@ def test_fused_vision_attention_falls_back_to_explicit_when_mlx_would_not_fuse(m
 
 @metal_only
 @pytest.mark.parametrize("dim, T, calls", [
-    (128, 2047, [(2047, mx.float32)]), (128, 2046, [(2046, mx.bfloat16)]), (64, 2047, [(2047, mx.float32)]),
-    (256, 2047, [(2047, mx.bfloat16)]), (512, 2047, [(511, mx.bfloat16)] + [(512, mx.bfloat16)] * 3)])
+    (128, 2047, [(2047, "float32")]), (128, 2046, [(2046, "bfloat16")]), (64, 2047, [(2047, "float32")]),
+    (256, 2047, [(2047, "bfloat16")]), (512, 2047, [(511, "bfloat16")] + [(512, "bfloat16")] * 3)])
 def test_training_attention_takes_exactly_one_route(monkeypatch, dim, T, calls):
     from unsloth_zoo.mlx import attention
 
@@ -811,7 +811,7 @@ def test_training_attention_takes_exactly_one_route(monkeypatch, dim, T, calls):
     finally:
         mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
     assert out.shape == q.shape and out.dtype == mx.bfloat16
-    assert seen == calls
+    assert seen == [(rows, getattr(mx, dtype)) for rows, dtype in calls]
 
 
 @metal_only
