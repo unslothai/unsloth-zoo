@@ -65,23 +65,18 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     embedding_matrix = model.get_input_embeddings ().weight
     lm_head_matrix   = model.get_output_embeddings().weight
 
-    # Get untrained tokens
     indicator_untrained = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
         (torch.amin(embedding_matrix, axis = 1) >= -eps)
     where_untrained = torch.where(indicator_untrained)[0]
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
-    # Untrained tokens are set to the mean of the trained tokens (the notice print is commented out).
 
-    # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
     sum_lm_head   = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)
 
-    # Remove bad tokens
     sum_embedding -= torch.sum(embedding_matrix[where_untrained], dtype = torch.float32, axis = 0)
     sum_lm_head   -= torch.sum(lm_head_matrix  [where_untrained], dtype = torch.float32, axis = 0)
 
-    # Find correct average by dividing by sum of trained tokens
     mean_embedding = (sum_embedding / n_trained)
     mean_lm_head   = (sum_lm_head   / n_trained)
 
