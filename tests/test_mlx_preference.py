@@ -4478,6 +4478,10 @@ def test_grpo_evaluation_follows_trl_eval_sampler(monkeypatch):
     list(plan)  # a second evaluation samples again, from the same seeds, none a training rollout's
     assert len(calls) == 6 and calls[3][0].sampling.seed == calls[0][0].sampling.seed != _derived_seed(7, 0, 0, 0)
     assert make_grpo_eval_fn(GRPOObjective(beta=0.0))(TinyModel(), *batches[2][:5])[1].item() == 2  # weighted by rows
+    weighted = create_grpo_eval_plan(dataset, DecodingTokenizer(), num_generations=2, batch_size=4, sample_weighting=(True, True),
+                                     sampling=GRPOSampling(max_tokens=3), max_seq_length=16, seed=7)
+    weighted.bind(TinyModel(), [lambda completions, **_: [float(len(c)) for c in completions]], trainer_state=state)
+    assert all(len(batch) > len(plain) and batch[-1].shape == (len(batch[0]),) for batch, plain in zip(weighted, batches))  # ScaleRL weights, as training
 
 
 def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, monkeypatch, capsys):

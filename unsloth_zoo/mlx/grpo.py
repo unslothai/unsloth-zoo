@@ -1374,10 +1374,10 @@ def create_grpo_batch_plan(
 def create_grpo_eval_plan(
     dataset, tokenizer, *, num_generations, batch_size, sampling, max_seq_length,
     score_temperature=None, scale_rewards="group", mask_truncated_completions=False,
-    with_reference=False, max_prompt_length=None, seed=None, processor=None, model_config=None,
+    with_reference=False, max_prompt_length=None, seed=None, processor=None, model_config=None, sample_weighting=None,
 ):
     """TRL's eval RepeatSampler order, one generation per batch_size completions (last batch may be short), on its own
-    seed stream without advancing num_input_tokens_seen."""
+    seed stream without advancing num_input_tokens_seen; sample_weighting is training's, so eval_loss scores it."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
     prompt_ids, max_tokens, vision, _ = _encode_grpo_prompts(
@@ -1395,7 +1395,7 @@ def create_grpo_eval_plan(
         score_temperature=sampling.temperature if score_temperature is None else score_temperature,
         scale_rewards=scale_rewards, mask_truncated_completions=mask_truncated_completions,
         with_old_logps=False, with_reference=with_reference, max_seq_length=max_seq_length,
-        seed=_derived_seed(seed, 1), counts_tokens=False,
+        seed=_derived_seed(seed, 1), counts_tokens=False, sample_weighting=sample_weighting,
         processor=processor, model_config=model_config, vision=vision,
     )
 

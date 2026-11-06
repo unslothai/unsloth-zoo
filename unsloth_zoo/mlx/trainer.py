@@ -6890,7 +6890,7 @@ class MLXTrainer:
                             mask_truncated_completions=args.mask_truncated_completions,
                             with_reference=self._uses_reference(args),
                             max_prompt_length=args.max_prompt_length, seed=args.seed,
-                            **self._grpo_vision_options(),
+                            sample_weighting=grpo_sample_weighting(args), **self._grpo_vision_options(),
                         )
                         plan.bind(
                             model, self.reward_funcs, trainer_state=self.state,
