@@ -1345,22 +1345,35 @@ def test_repeated_prompt_layout_maps_repeats_to_their_pair_and_softcap_sums_keep
     assert mx.array_equal(p._head_logit_sums(hidden[:6], weight, None, None, {}, 30.0, chunk_rows=12), whole[:6])
 
 
-def test_a_pair_plan_runs_each_shared_prompt_once_only_where_it_pays():
+@pytest.fixture
+def said():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        yield caught
+
+
+def test_a_pair_plan_runs_each_shared_prompt_once_where_it_pays_and_says_why_not(said):
     # The prefix: on the 32 rung, before each row's last prompt token and the chosen/rejected split, from the batch.
     from unsloth_zoo.mlx import preference as p
     row = lambda prompt, chosen, rejected, part=None: p.TokenizedPreferenceRow(ids := tuple(range(3, 3 + prompt)), tuple(range(500, 500 + chosen)), tuple(2 if i == part else t for i, t in enumerate(ids)), tuple(range(900, 900 + rejected)))  # noqa: E501, E731
     pairs = [row(70, 30, 20), row(97, 10, 25), row(64, 60, 50), row(98, 60, 50), row(98, 60, 50, part=45), row(98, 60, 50, part=10)]  # noqa: E501
-    plan = lambda ratio: p.FinitePreferenceBatchPlan(pairs, [(0, 1), (2, 3), (4, 3), (5, 3)], normalizers=[(1, 2, 1)] * 4, cycle_length=4, max_seq_length=256, pad_id=0, shared_prompt_ratio=ratio)  # noqa: E501, E731
-    off, loose, on = plan(None), plan(1.0), plan(1.3)
+    plan = lambda ratio, notices=None: p.FinitePreferenceBatchPlan(pairs, [(0, 1), (2, 3), (4, 3), (5, 3)], normalizers=[(1, 2, 1)] * 4, cycle_length=4, max_seq_length=256, pad_id=0, shared_prompt_ratio=ratio, shared_prompt_notices=notices)  # noqa: E501, E731
+    off, loose, on = plan(None), plan(1.0, notices := set()), plan(1.3, notices)
     assert [loose.shared_prompt_length(index) for index in range(4)] == [64, 32, 32, 0]
     assert [loose.batch_family(index)[-1] for index in range(3)] == [("shared_prompt", 64)] + [("shared_prompt", 32)] * 2 and off.batch_family(3) == loose.batch_family(3) == off.batch_family(0) == loose.batch_family(0)[:-1]  # noqa: E501
     assert [on.shared_prompt_length(index) for index in range(4)] == [64, 0, 0, 0]  # 2 * 127 padded positions against 64 + 2 * 63 pay 1.34; 32 of 159 do not  # noqa: E501
+    assert plan(1.3).shared_prompt_length(3) == 0 and [str(w.message) for w in said] == ["Unsloth MLX: shared_prompt_forward runs some batches per row, since its pairs share too short a prompt to cut the padded tokens by shared_prompt_min_token_ratio."] * 2  # noqa: E501
+    with warnings.catch_warnings():  # said only once delivered: an "error" filter raises on every try
+        warnings.simplefilter("error", UserWarning)
+        for raised in [plan(1.3)] * 2:
+            with pytest.raises(UserWarning, match="too short a prompt"):
+                raised.shared_prompt_length(3)
     shared, plain = on.materialize(0), off.materialize(0)
     assert len(plain) == 3 and len(shared) == 6 and shared[3] is None and shared[4] is None
     assert shared[5].tolist() == plain[0][:2, :64].tolist() and len(on.materialize(3)) == 3
 
 
-def test_shared_prompt_forward_is_refused_where_it_is_not_exact(monkeypatch):
+def test_the_shared_prompt_gate_refuses_inexact_models_and_hints_where_it_applies(monkeypatch, capsys, said):
     from types import SimpleNamespace as NS
     from unsloth_zoo.mlx import preference as p, utils as mlx_utils
     from unsloth_zoo.mlx.trainer import MLXCPOConfig, MLXDPOConfig, MLXORPOConfig, MLXTrainer
@@ -1372,25 +1385,57 @@ def test_shared_prompt_forward_is_refused_where_it_is_not_exact(monkeypatch):
     assert "model_type='jina_vlm'" in p.shared_prompt_problem(model("jina_vlm", rope="RoPE"), 512)
     assert all(p.shared_prompt_problem(m, 512) for m in (model(head=None), model("gemma3"), model("qwen3_5"), model("llama", True, 256), model(keep=0.9), model(_unsloth_text_only_vlm=True), model(_is_vlm_model=True))) and not any(config().shared_prompt_forward for config in (MLXORPOConfig, MLXDPOConfig, MLXCPOConfig))  # noqa: E501
     args = lambda **kw: NS(**{"shared_prompt_forward": True, "use_cce": True, "max_seq_length": 512, "disable_dropout": True, "neftune_noise_alpha": 0.0, "shared_prompt_min_token_ratio": 1.5, **kw})  # noqa: E501, E731
-    trainer = lambda **kw: NS(**{"_is_vlm": False, "model": model(), "ref_model": None, "preference_kind": "dpo", "distributed_world_size": 1, **kw})  # noqa: E501, E731
+    trainer = lambda **kw: NS(**{"_shared_prompt_notices": set(), "is_main_process": True, "_is_vlm": False, "model": model(), "ref_model": None, "preference_kind": "dpo", "distributed_world_size": 1, **kw})  # noqa: E501, E731
     ratio = lambda run=trainer(), options=args(): MLXTrainer._shared_prompt_ratio(run, options)  # noqa: E731
     assert ratio() == ratio(trainer(ref_model=model())) == 1.5 and ratio(options=args(shared_prompt_forward=False)) is None  # noqa: E501
     vlm = lambda kind, moe=False: NS(config=NS(model_type=kind), language_model=NS(model=NS(layers=[NS(enable_moe=moe)], named_modules=lambda: [])), vision_tower=None, named_modules=lambda: [])  # noqa: E501, E731
     assert not any(p.shared_prompt_problem(vlm(kind), 512) for kind in ("qwen3_5", "gemma4")) and all(p.shared_prompt_problem(m, 512) for m in (vlm("qwen2_5_vl"), vlm("gemma4", moe=True), model("qwen3_5"), model("gemma4"))) and ratio(trainer(_is_vlm=True, model=vlm("gemma4"))) == 1.5  # noqa: E501
-    for run in [(trainer(), args(use_cce=False)), (trainer(distributed_world_size=2), args()), (trainer(), args(neftune_noise_alpha=5.0)), (trainer(model=model(keep=0.9)), args(disable_dropout=False)), (trainer(ref_model=model("gemma3")), args())]:  # noqa: E501
-        with pytest.warns(UserWarning, match="shared_prompt_forward is off"):
-            assert ratio(*run) is None
+    with warnings.catch_warnings():  # said only once delivered: an "error" filter raises on every try
+        warnings.simplefilter("error", UserWarning)
+        for run in [trainer()] * 2:
+            with pytest.raises(UserWarning, match="is off, since use_cce=False"):
+                ratio(run, args(use_cce=False))
+    capsys.readouterr()
+    said.clear()
+    # The last run repeats the first on a fresh trainer: a plain warnings.warn would stay silent there.
+    for run, options, reason in [(trainer(), args(use_cce=False), "use_cce=False"), (trainer(distributed_world_size=2), args(), "distributed processes"), (trainer(), args(neftune_noise_alpha=5.0), "NEFTune"), (trainer(model=model(keep=0.9)), args(disable_dropout=False), "LoRA dropout"), (trainer(ref_model=model("gemma3")), args(), "model_type='gemma3'"), (trainer(), args(use_cce=False), "use_cce=False")]:  # noqa: E501
+        results = ratio(run, options), ratio(run, options)
+        messages = [(w.category, str(w.message)) for w in said]
+        said.clear()
+        assert results == (None, None) and len(messages) == 1 and messages[0][0] is UserWarning and messages[0][1].startswith(f"Unsloth MLX DPO: shared_prompt_forward is off, since {reason}")  # noqa: E501
+    for run, hint in ((trainer(), "0.63x step time on Qwen3 text DPO"), (trainer(_is_vlm=True, model=vlm("gemma4")), "0.57-0.71x step time on Qwen3.5-0.8B and Gemma 4 E2B DPO"), (trainer(model=model("gemma3")), None), (trainer(ref_model=model(keep=0.9)), None)):  # noqa: E501
+        results = ratio(run, off := args(shared_prompt_forward=False, disable_dropout=False)), ratio(run, off)
+        printed = capsys.readouterr().out
+        assert results == (None, None) and not said and (printed.count(hint) == 1 if hint else printed == "")
+    for first, then in ((args(shared_prompt_forward=False), args(use_cce=False)), (args(use_cce=False), args(shared_prompt_forward=False))):  # noqa: E501
+        ratio(run := trainer(), first), ratio(run, then)  # a hint and a refusal, in both orders, each said
+        printed, messages = capsys.readouterr().out, [str(w.message) for w in said]
+        said.clear()
+        assert printed.startswith("Unsloth: shared_prompt_forward=True would run") and len(messages) == 1
+
+    class Opaque:  # a model the gate cannot inspect: off, no hint and no error; on, the error
+        def __getattr__(self, name):
+            raise RuntimeError(name)
+    result = ratio(trainer(model=Opaque()), args(shared_prompt_forward=False))
+    assert result is None and capsys.readouterr().out == "" and not said
+    with pytest.raises(RuntimeError):
+        ratio(trainer(model=Opaque()), args())
+    run = trainer(is_main_process=False)  # every rank warns a refusal; only the main one prints the hint
+    results = ratio(run, args(shared_prompt_forward=False)), ratio(run, args(use_cce=False))
+    printed, messages = capsys.readouterr().out, [str(w.message) for w in said]
+    assert results == (None, None) and printed == "" and len(messages) == 1 and "since use_cce=False" in messages[0]
     monkeypatch.setattr(mlx_utils, "_shared_kv_slot_count", lambda model: 2)
     assert "own slots" in p.shared_prompt_problem(vlm("gemma4"), 512)
 
 
-def test_a_vision_pair_plan_keeps_every_image_in_its_shared_prompt(monkeypatch):
+def test_a_vision_pair_plan_keeps_every_image_in_its_shared_prompt(monkeypatch, said):
     # An image token past the prefix, sidecars differing below it or unknown image tokens refuse; rows are not re-encoded.
     from unsloth_zoo.mlx import preference as p
     monkeypatch.setattr(p, "_vision_batch", lambda *args, **options: (*args, options))
     row = lambda at=3, part=70: p.VisionPreferenceRow(ids := tuple(9 if i == at else 10 + i for i in range(70)), (1, 2), ids, (3, 4), images=("cat",), chosen_prompt_arrays=(("mm", ids),), rejected_prompt_arrays=(("mm", ids[:part] + (0,) * (70 - part)),))  # noqa: E501, E731
     plan = lambda config={"image_token_id": 9}, **kw: p.FiniteVisionPreferenceBatchPlan([row(**kw)], [(0,)], normalizers=[(1, 1, 1)], cycle_length=1, max_seq_length=96, pad_id=0, shared_prompt_ratio=1.0, processor=None, model_config=config)  # noqa: E501, E731
     assert [plan(**kw).shared_prompt_length(0) for kw in ({}, {"at": 66}, {"part": 5}, {"config": {}})] == [64, 0, 0, 0]
+    assert [str(w.message).partition(", since ")[2] for w in said] == ["an image's tokens reach past the shared prompt.", "a pair's chosen and rejected prompts carry different image inputs within the shared prompt.", "the model config names no image tokens to place inside the shared prompt."]  # noqa: E501
     assert not isinstance((batch := plan().materialize(0))[0], tuple) and batch[-1][4].shape == (1, 64) and len(batch[-1][3][0]) == 1  # noqa: E501
     # Two pairs, the second's rejected prompt alone holding an image past the prefix; the planner surveys the prefix.
     pairs = lambda second: p.FiniteVisionPreferenceBatchPlan([row(), second], [(0, 1)], normalizers=[(1, 2, 1)], cycle_length=1, max_seq_length=96, pad_id=0, shared_prompt_ratio=1.0, processor=None, model_config={"image_token_id": 9})  # noqa: E501, E731
@@ -1410,9 +1455,9 @@ def test_the_trainer_hands_its_shared_prompt_ratio_to_every_pair_plan(tmp_path, 
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer, MLXTrainer
     ratios, make = [], trainer_module.create_preference_batch_plan
     monkeypatch.setattr(MLXTrainer, "_shared_prompt_ratio", lambda self, args: 1.25)
-    monkeypatch.setattr(trainer_module, "create_preference_batch_plan", lambda *a, **kw: ratios.append(kw["shared_prompt_ratio"]) or make(*a, **kw))  # noqa: E501
-    _run_generation_trainer(MLXDPOTrainer(_tiny_model(tail=True), Tokenizer(), rows(3), eval_dataset=rows(2), args=MLXDPOConfig(**_generation_common(tmp_path, generate_during_eval=False))), monkeypatch, [])  # noqa: E501
-    assert ratios == [1.25, 1.25]
+    monkeypatch.setattr(trainer_module, "create_preference_batch_plan", lambda *a, **kw: ratios.append((kw["shared_prompt_ratio"], kw["shared_prompt_notices"])) or make(*a, **kw))  # noqa: E501
+    _run_generation_trainer(run := MLXDPOTrainer(_tiny_model(tail=True), Tokenizer(), rows(3), eval_dataset=rows(2), args=MLXDPOConfig(**_generation_common(tmp_path, generate_during_eval=False))), monkeypatch, [])  # noqa: E501
+    assert [ratio for ratio, _ in ratios] == [1.25, 1.25] and all(notices is run._shared_prompt_notices for _, notices in ratios)  # noqa: E501
 
 
 def test_a_reference_adapter_without_a_scale_scores_at_one(tmp_path):

@@ -3,6 +3,7 @@
 import json
 import os
 import math
+import sys
 import warnings
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -1075,11 +1076,12 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         "_rows", "_schedule", "_normalizers", "_widths", "_cycle_length",
         "max_seq_length", "pad_id", "_shape_plan", "_visit_policy",
         "_visit_seed", "_visit_epoch_cache", "_cce_capacities", "_cce_kind",
-        "_reference", "_shared_prompt_ratio", "_shared_lengths",
+        "_reference", "_shared_prompt_ratio", "_shared_lengths", "_shared_prompt_notices",
     )
 
     def __init__(
         self, rows, schedule, *, normalizers, cycle_length, max_seq_length, pad_id, shared_prompt_ratio=None,
+        shared_prompt_notices=None,
     ):
         self._rows = tuple(rows)
         self._schedule = tuple(tuple(batch) for batch in schedule)
@@ -1095,6 +1097,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         self._visit_epoch_cache = None
         self._reference = None
         self._shared_prompt_ratio, self._shared_lengths = shared_prompt_ratio, {}
+        self._shared_prompt_notices = set() if shared_prompt_notices is None else shared_prompt_notices
         self._widths = tuple(self._raw_width(batch) for batch in self._schedule)
 
     @property
@@ -1194,8 +1197,13 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
             prompt = min(min(len(row.chosen_prompt_ids), len(row.rejected_prompt_ids)) for row in rows)
             shared, width = (min(common, prompt) - 1) // 32 * 32, self.batch_width(index)
             per_row, once = 2 * (width - 1), shared + 2 * (width - 1 - shared)
-            engaged = shared > 0 and per_row >= self._shared_prompt_ratio * once
-            self._shared_lengths[index] = shared if engaged and self._prefix_holds_media(rows, shared) else 0
+            refusal = "its pairs share too short a prompt to cut the padded tokens by shared_prompt_min_token_ratio"
+            if shared > 0 and per_row >= self._shared_prompt_ratio * once:
+                refusal = self._prefix_refusal(rows, shared)
+            if refusal is not None and refusal not in self._shared_prompt_notices:
+                _warn_shared_prompt(f"Unsloth MLX: shared_prompt_forward runs some batches per row, since {refusal}.")
+                self._shared_prompt_notices.add(refusal)
+            self._shared_lengths[index] = 0 if refusal else shared
         return self._shared_lengths[index]
 
     def set_shape_plan(self, shape_plan):
@@ -1273,8 +1281,8 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
             return materialized + (None, reference, self._prefix_inputs(rows, batch, shared))
         return materialized if reference is None else materialized + (None, reference)
 
-    def _prefix_holds_media(self, rows, shared):
-        return True
+    def _prefix_refusal(self, rows, shared):
+        return None
 
     def _prefix_inputs(self, rows, batch, shared):
         return mx.array(batch[:len(rows), :shared])
@@ -1312,20 +1320,24 @@ class VisionPreferenceBatches:
     def _prompt_arrays(self, row):
         return row.chosen_prompt_arrays, row.rejected_prompt_arrays
 
-    def _prefix_holds_media(self, rows, shared):
+    def _prefix_refusal(self, rows, shared):
         from .generate import _media_token_ids
 
         # A media token past shared would leave its features without a place in the prompt that runs once.
         tokens = _media_token_ids(self._model_config)
         if any(row.images for row in rows) and not tokens:
-            return False
-        return not any(
+            return "the model config names no image tokens to place inside the shared prompt"
+        if any(
             token < 0 or token in tokens for row in rows for values in (row.chosen, row.rejected)
             for token in values[shared:]
-        ) and all(
+        ):
+            return "an image's tokens reach past the shared prompt"
+        if not all(
             tuple(values[:shared]) == tuple(other[:shared])
             for row in rows for (_, values), (_, other) in zip(*self._prompt_arrays(row))
-        )
+        ):
+            return "a pair's chosen and rejected prompts carry different image inputs within the shared prompt"
+        return None
 
     def _prefix_inputs(self, rows, batch, shared):
         return _vision_batch(
@@ -1512,6 +1524,7 @@ def create_preference_batch_plan(
     image_size=None,
     images_from=None,
     shared_prompt_ratio=None,
+    shared_prompt_notices=None,
 ):
     """Builds the finite preference plan for every objective; prompt_sink receives each row's rendered prompt text; a
     processor gives a vision plan; image rows re-read images per batch when images_from (default dataset,
@@ -1615,6 +1628,7 @@ def create_preference_batch_plan(
         max_seq_length=length_policy.max_seq_length,
         pad_id=0 if pad_id is None else pad_id,
         shared_prompt_ratio=shared_prompt_ratio,
+        shared_prompt_notices=shared_prompt_notices,
         **vision,
     )
 
@@ -2462,6 +2476,12 @@ def _preference_hidden(model, batch):
 _SHARED_PROMPT_MODEL_TYPES = ("llama", "qwen2", "qwen3")
 # mlx-vlm stacks whose caches it covers: qwen3_5's linear-attention state, gemma4's windows and shared K/V.
 _SHARED_PROMPT_VLM_MODEL_TYPES = ("qwen3_5", "gemma4")
+
+
+def _warn_shared_prompt(message):
+    """A UserWarning at the caller's line that a fresh registry keeps the default filter from deduplicating."""
+    f = sys._getframe(1)
+    warnings.warn_explicit(message, UserWarning, f.f_code.co_filename, f.f_lineno, f.f_globals["__name__"], {})
 
 
 def shared_prompt_problem(model, max_seq_length, *, lora_dropout=True):
