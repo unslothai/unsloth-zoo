@@ -448,6 +448,18 @@ def apply_xet_env(
         profile, throttled = throttled, fail_fast = fail_fast, cache_dir = cache_dir,
     )
 
+    # Primary AC variables shadow xet-core's fixed-concurrency alias. Stand down even with force=True, and remove
+    # unchanged values we seeded earlier (including those inherited by a child), while keeping explicit primaries.
+    if target.get("HF_XET_FIXED_DOWNLOAD_CONCURRENCY"):
+        for key in (
+            "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+            "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
+            "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
+        ):
+            overrides.pop(key, None)
+            if key in _SEEDED_INTO_ENVIRON and target.get(key) == _SEEDED_INTO_ENVIRON[key]:
+                target.pop(key, None)
+
     # A user's high-performance flag keeps the headroom, so our caps are dropped rather than left alongside it; read it
     # as xet-core does (configuration_utils.rs get_high_performance_flag): HF_XET_HIGH_PERFORMANCE wins if set at all,
     # HF_XET_HP only otherwise.
