@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""install_llama_cpp(just_clone_repo=True) on an intact, unbuilt source checkout (LoRA GGUF export) must reuse it:
-no build-tool / package-manager probes, no pip unless a converter dep is missing, and no refusal under UNSLOTH_AUTO_INSTALL=0."""
+"""install_llama_cpp(just_clone_repo=True) reuses an intact unbuilt checkout: no probes, pip only for a missing dep."""
 
 from __future__ import annotations
 
@@ -61,7 +60,7 @@ def probes(monkeypatch, tmp_path):
     monkeypatch.setattr(llama_cpp, "try_execute", rec("try_execute"))
     monkeypatch.setattr(llama_cpp, "try_execute_with_auto_install", rec("try_execute_with_auto_install"))
     monkeypatch.setattr(llama_cpp, "_maybe_install_llama_cpp_prebuilt", rec("prebuilt"))
-    # Converter deps all present, independent of this venv; a test can mark one missing.
+    # Converter deps present regardless of this venv.
     missing = set()
     calls.missing = missing
     calls.queried = queried = []
