@@ -112,6 +112,8 @@ _GAPS = {
     "sorted_gather_qmm": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
     # Without NAX, training-sized qmm runs 32x32 tiles; 64x64 ones (open PR 4826) or a dense GEMM run faster.
     "dense_train_qmm": Gap(open_in = ("0.32.4",), closed_on_main = False),
+    # On NAX, training-sized qmm_t loads each weight tile only after the last multiplied; staged loads (4682) overlap.
+    "staged_train_qmm": Gap(open_in = ("0.32.4",), closed_on_main = True),
 }
 
 

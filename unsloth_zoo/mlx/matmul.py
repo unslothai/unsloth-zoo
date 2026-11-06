@@ -15,8 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Affine `x @ W^T` on stock packed weights: small-row 4/8-bit qmm for Apple GPUs without stock NAX kernels,
-multi-row qmv whose rows match one-row stock calls bit for bit, row-invariant lane qmm, and the dense training route
-for frozen projections."""
+multi-row qmv whose rows match one-row stock calls bit for bit, row-invariant lane qmm, and the dense (or, on NAX,
+staged) training route for frozen projections."""
 
 import functools
 import hashlib
@@ -1947,13 +1947,45 @@ def probe_dense_train_qmm():
         assert mx.array_equal(got.view(mx.uint16), tile.view(mx.uint16)).item(), (dtype, bits, group_size)
 
 
+def staged_train_qmm_supported(M, N, K, group_size):
+    """For an affine 4/8-bit projection the caller has checked; `probe_staged_qmm` covers group sizes 32, 64 and 128."""
+    return (M >= 1024 and 2048 <= N <= 32768 and 2048 <= K <= 32768
+            and N * K <= 1 << 28 and N % 64 == K % 64 == K % group_size == 0)
+
+
+def staged_train_qmm_available():
+    return (nax.nax_available() and nax.gap_open("staged_train_qmm") and _staged_qmm_kernel() is not None
+            and nax.kernel_probe_passed(STAGED_QMM_PROBE_KEY, __name__, "probe_staged_qmm", nax.nax_available))
+
+
+@functools.cache
+def differentiable_staged_train_qmm(group_size, bits):
+    """The staged forward with stock's dx for a frozen packed weight, whose quantization parameters get zero
+    gradients."""
+    @mx.custom_function
+    def routed(x, w, scales, biases):
+        return staged_qmm(x, w, scales, biases, group_size, bits)
+
+    @routed.vjp
+    def vjp(primals, cotangent, output):
+        x, w, scales, biases = primals
+        with mx.stream(mx.gpu):
+            dx = mx.quantized_matmul(cotangent, w, scales, biases, transpose = False, group_size = group_size,
+                                     bits = bits)
+        return dx, mx.zeros_like(w), mx.zeros_like(scales), mx.zeros_like(biases)
+
+    return routed
+
+
 def available_train_qmm_routes():
-    """Training routes for this process; `UNSLOTH_MLX_DENSE_TRAIN_QMM=0` turns the dense route off."""
+    """Training routes for this process.
+    `UNSLOTH_MLX_DENSE_TRAIN_QMM=0` turns the dense route off, `UNSLOTH_MLX_STAGED_TRAIN_QMM=0` the staged NAX one."""
     dense = (os.environ.get("UNSLOTH_MLX_DENSE_TRAIN_QMM", "1") != "0" and nax.gap_open("dense_train_qmm")
              and simd_qmm_available() and _train_dequantize_kernel() is not None
              and nax.kernel_probe_passed(DENSE_TRAIN_QMM_PROBE_KEY, __name__, "probe_dense_train_qmm",
                                          simd_qmm_available))
-    return ("dense",) if dense else ()
+    staged = os.environ.get("UNSLOTH_MLX_STAGED_TRAIN_QMM", "1") != "0" and staged_train_qmm_available()
+    return ("dense",) * dense + ("staged",) * staged
 
 
 def _train_qmm_rows(module, x):
@@ -1975,7 +2007,7 @@ def _train_qmm_rows(module, x):
 
 
 def choose_train_qmm_route(module, x, routes):
-    """The training route ("dense") this call of `module` takes, or None for the native call."""
+    """The training route ("dense" or "staged") this call of `module` takes, or None for the native call."""
     rows = _train_qmm_rows(module, x) if routes else None
     if rows is None:
         return None
@@ -1983,6 +2015,8 @@ def choose_train_qmm_route(module, x, routes):
     if ("dense" in routes and rows >= _DENSE_TRAIN_QMM_MIN_ROWS and N >= _DENSE_TRAIN_QMM_MIN_OUTPUTS
             and N * x.shape[-1] <= _DENSE_TRAIN_QMM_MAX_WEIGHTS):
         return "dense"
+    if "staged" in routes and staged_train_qmm_supported(rows, N, x.shape[-1], module.group_size):
+        return "staged"
     return None
 
 
@@ -1992,6 +2026,6 @@ def call_train_qmm_route(module, x, routes):
     if route is None:
         return None
     K = x.shape[-1]
-    y = _dense_train_qmm(module.group_size, module.bits)(
+    y = (_dense_train_qmm if route == "dense" else differentiable_staged_train_qmm)(module.group_size, module.bits)(
         x.reshape(-1, K), module["weight"], module["scales"], module["biases"])
     return y.reshape(*x.shape[:-1], y.shape[-1])
