@@ -3780,6 +3780,17 @@ def test_grpo_rollouts_decode_the_whole_generation_when_its_cache_fits(monkeypat
     assert grpo._rollout_rows(types.SimpleNamespace(), rows, 10) == 32
 
 
+def test_grpo_rollout_rows_are_sized_by_every_layer_or_more_where_the_made_caches_hold_more():
+    from unsloth_zoo.mlx.grpo import _cache_bytes_per_row
+
+    full, linear, sliding = types.SimpleNamespace(keys=None), types.SimpleNamespace(cache=[None, None]), types.SimpleNamespace(keys=None, max_size=1024)  # noqa: E501
+    model = lambda caches, **config: types.SimpleNamespace(config={"text_config": config}, language_model=types.SimpleNamespace(make_cache=lambda: caches))  # noqa: E501, E731
+    gemma_4_31b = dict(num_hidden_layers=60, num_attention_heads=32, num_key_value_heads=16, num_global_key_value_heads=4, head_dim=256, global_head_dim=512)  # noqa: E501
+    qwen3_5_0_8b = model([linear if i % 4 < 3 else full for i in range(24)], num_hidden_layers=24, num_attention_heads=8, num_key_value_heads=2, head_dim=256, linear_num_key_heads=16, linear_key_head_dim=128, linear_num_value_heads=16, linear_value_head_dim=128, linear_conv_kernel_dim=4)  # noqa: E501
+    assert _cache_bytes_per_row(model([sliding if i % 6 < 5 else full for i in range(60)], **gemma_4_31b), 2048) == 32768 * (10 * 2048 + 50 * 1024)  # noqa: E501
+    assert _cache_bytes_per_row(qwen3_5_0_8b, 256) == 6 * 2048 * 256 + 18 * 4 * (16 * 128 * 128 + 3 * 6144) and _cache_bytes_per_row(qwen3_5_0_8b, 2048) == 24 * 2048 * 2048  # noqa: E501
+
+
 @pytest.mark.parametrize("bsz,spg,iterations,shuffle", [(4, 2, 1, True), (2, 3, 2, True), (6, 1, 1, False)])
 def test_grpo_plan_order_follows_trl_repeat_sampler(bsz, spg, iterations, shuffle):
     from trl.trainer.utils import RepeatSampler

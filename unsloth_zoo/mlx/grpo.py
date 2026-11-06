@@ -585,32 +585,42 @@ def _rollout_sampling(sampling, prompt_ids, always_float32=False):
     return (hf_logits_warper(sampling, prompt_ids),), None
 
 
-def _kv_bytes_per_token(model):
-    """Every layer's bf16 K and V for one token, from the text config; None when it does not say."""
+def _cache_bytes_per_row(model, tokens):
+    """Bytes a row's cache may hold at ``tokens`` tokens: every layer's bf16 K and V for every token, or more where the
+    caches the language model makes hold more (a linear-attention state, layers wider than ``head_dim``); a rotating
+    cache counts its window at most. None when the text config does not say."""
     config = getattr(model, "args", None) or getattr(model, "config", None)
     config = _config_get(config, "text_config", None) or config
-    layers = _config_get(config, "num_hidden_layers")
-    attention_heads = _config_get(config, "num_attention_heads")
-    heads = _config_get(config, "num_key_value_heads") or attention_heads
-    head_dim = _config_get(config, "head_dim") or (
-        _config_get(config, "hidden_size", 0) // attention_heads if attention_heads else None)
+    get = lambda key: _config_get(config, key, None) or 0  # noqa: E731
+    layers, attention_heads = get("num_hidden_layers"), get("num_attention_heads")
+    heads = get("num_key_value_heads") or attention_heads
+    head_dim = get("head_dim") or (get("hidden_size") // attention_heads if attention_heads else 0)
     if not (layers and heads and head_dim):
         return None
-    return 2 * 2 * int(layers) * int(heads) * int(head_dim)
+    widest = 2 * 2 * max(heads, get("num_global_key_value_heads")) * max(head_dim, get("global_head_dim"))
+    key_dim = get("linear_num_key_heads") * get("linear_key_head_dim")
+    value_dim = get("linear_num_value_heads") * get("linear_value_head_dim")
+    conv = max(get("linear_conv_kernel_dim") - 1, 0) * (2 * key_dim + value_dim)
+    state = 4 * (value_dim * get("linear_key_head_dim") + conv)
+    make_cache = getattr(getattr(model, "language_model", model), "make_cache", None)
+    held = sum(widest * min(tokens, cache.max_size) if getattr(cache, "max_size", None)
+               else state if state and hasattr(cache, "cache") else widest * tokens
+               for cache in (make_cache() if callable(make_cache) else None) or ())
+    return max(2 * 2 * int(layers) * heads * head_dim * tokens, held)
 
 
 def _rollout_rows(model, rows, tokens):
     """Rows decoded at once: the whole generation when its KV cache fits half the free working set, never fewer than
     the engine's default."""
     floor = GenerationDefaults.completion_batch_size
-    per_token = _kv_bytes_per_token(model) if rows > floor else None
-    if per_token is None:
+    per_row = _cache_bytes_per_row(model, tokens) if rows > floor else None
+    if per_row is None:
         return floor
     try:
         free = int(mx.device_info()["max_recommended_working_set_size"]) - int(mx.get_active_memory())
     except Exception:
         return floor
-    return max(floor, min(rows, free // 2 // (per_token * tokens)))
+    return max(floor, min(rows, free // 2 // per_row))
 
 
 def _derived_seed(*parts):
