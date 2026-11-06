@@ -29,6 +29,15 @@ def _equal(a, b):
     assert np.array_equal(np.array(a.view(mx.uint8)), np.array(b.view(mx.uint8)))
 
 
+@pytest.mark.parametrize("mode", ["plain", "off", "absent", "different", "dtype", "shape", "multi"])
+def test_qwen4_pending_tail_submits_each_parent_only_for_matching_plain_root(monkeypatch, mode):
+    x, branch, hidden, weights = [mx.zeros(shape, mx.bfloat16) for shape in ((1, 1, 8), (1, 1, 4), (1, 1, 8), (1, 1, 2))]; events = []; monkeypatch.setattr(decode, "_submit", lambda *roots: events.append(roots))
+    (monkeypatch.delattr(decode.offload.STAGED_FILLS, "submit_after", raising = False) if mode == "absent" else monkeypatch.setattr(decode.offload.STAGED_FILLS, "submit_after", 0 if mode == "off" else 40, raising = False))
+    monkeypatch.setattr(decode._QWEN4_LAST_INJECT, "slot", (x, branch.astype(mx.float32) if mode == "dtype" else branch, hidden, weights[..., :1] if mode == "shape" else weights), raising = False)
+    roots = (hidden,) if mode == "different" else (x, hidden) if mode == "multi" else (x,); decode._HELD_MX.async_eval(*roots)
+    assert events == [(branch, hidden, weights) if mode == "plain" else roots]
+
+
 @pytest.mark.parametrize("after, pending", [(None, True), (0, True), (2, True), (2, False)])
 def test_staged_prefix_fills_before_releasing_every_root(monkeypatch, after, pending):
     events = []
@@ -1244,12 +1253,12 @@ def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
 
 
 @pytest.mark.skipif(qwen4 is None, reason = "mlx-vlm without qwen4_exp")
-@pytest.mark.parametrize("dtype, stride", [(mx.bfloat16, 1), (mx.bfloat16, 2), (mx.float16, -2)])
-def test_qsa_decode_reads_strided_cache_rows_and_features_bitwise(dtype, stride, monkeypatch):
+@pytest.mark.parametrize("dtype, stride, rows", [(mx.bfloat16, 1, 1), (mx.bfloat16, 2, 3), (mx.float16, -2, 4)])
+def test_qsa_decode_reads_strided_cache_rows_and_features_bitwise(dtype, stride, rows, monkeypatch):
     from mlx_vlm.models.qwen4_exp import qsa_kernel
-    queries = mx.random.normal((2, 4, 1, 64)).astype(dtype)
+    queries = mx.random.normal((2, 4, rows, 64)).astype(dtype)
     keys, values = [mx.random.normal((2, 2, 103, 64 * abs(stride))).astype(dtype)[:, :, ::stride, ::stride] for _ in range(2)]
-    blocks, ends = mx.array([[[0, 2, 5]], [[1, 3, 7]]], mx.int32), mx.array([[39], [45]], mx.int32)
+    blocks, ends = mx.array([[[0, 2, 5]], [[1, 3, 7]]], mx.int32) + mx.arange(rows)[None, :, None], mx.array([[39], [45]], mx.int32) + mx.arange(rows)[None]
     args, kwargs = (queries, keys, values, blocks, ends), dict(scale = 0.125, block_size = 4, allow_sparse_decode = True)
     native, calls, kernel = qsa_kernel.qsa_sparse_attention, [], decode._qsa_decode_kernel(qsa_kernel._QSA_SPARSE_ATTENTION_SOURCE)
     monkeypatch.setattr(decode, "_qsa_decode_kernel", lambda source: lambda **kw: calls.append(kw) or kernel(**kw))
@@ -1610,46 +1619,206 @@ def _qwen4_rows(rows, dtype = mx.bfloat16):
     return (mx.random.normal((1, rows, 4 * 1280)) * mx.exp(2 * mx.random.normal((1, rows, 1)))).astype(dtype)
 
 
+_needs_stream = pytest.mark.skipif(decode._qwen4_stream_kernels() is None, reason = "requires the pinned stream plan")
+
+
+def _stream_read(dtype = mx.bfloat16, combine = True, lowrank = 160, hidden_size = 2560):
+    module = qwen4.Qwen4ExpGatedResidual(SimpleNamespace(hidden_size = hidden_size, hc_count = 4, hc_lowrank = lowrank, rms_norm_eps = 1e-6), use_combine = combine)
+    module.update(nn.utils.tree_map(lambda x: mx.random.normal(x.shape) * 0.1, module.parameters()))
+    module.set_dtype(dtype); nn.quantize(module, group_size = 32, bits = 4)
+    return module.eval()
+
+
+@_needs_qwen4
+@_needs_stream
+@pytest.mark.parametrize("dtype, fold, rows", [(mx.bfloat16, False, 3), (mx.bfloat16, True, 9), (mx.float16, False, 9), (mx.float16, True, 3)])
+def test_qwen4_stream_reads_keep_row_and_fold_arithmetic(dtype, fold, rows, monkeypatch):
+    mx.random.seed(82)
+    module = _stream_read(dtype); kernels = decode._qwen4_stream_kernels(); seen = []
+    monkeypatch.setattr(decode, "_QWEN4_STREAM_VERDICTS", {})
+    def observed(**kw):
+        out = kernels[0](**kw); seen.append(out); return out
+    monkeypatch.setattr(decode, "_qwen4_stream_kernels", lambda: (observed, kernels[1]))
+    x = mx.random.normal((1, rows, 10240)).astype(dtype)
+    branch, weights = (mx.random.normal((1, rows, 2560)) * 30).astype(dtype), (mx.random.normal((1, rows, 4)) * 2).astype(dtype)
+    plan = decode._qwen4_decode_plan(qwen4, module, fold)
+    if fold:
+        forward = qwen4._QWEN4_BATCH_INVARIANT_FORWARD
+        with decode.fused_qwen4_decode(module, _modules = [("mlp_hyper_connection", module)]):
+            injected = forward._inject(branch, x, weights)
+            actual = forward._hyper_connection(module, injected)
+        assert actual[1] is not injected
+    else:
+        actual = plan.bounded(module, x, None)
+    normed, parts, hidden = seen[0]
+    expected_hidden = qwen4.Qwen4ExpBatchInvariantForward._inject(branch, x, weights) if fold else x
+    _equal(normed, decode._qwen4_hc_norm(expected_hidden, module.hc_norm.weight, 2560, module.hc_norm.eps))
+    _equal(actual[1], expected_hidden)
+    assert decode._qwen4_stream_matches(module, normed, parts)
+    summed = parts[:, 0] + parts[:, 1] + parts[:, 2] + parts[:, 3]
+    activate, mix, gate = qwen4._qwen4_hyper_pointwise(4, 2560)
+    act = activate(summed[:, :160].astype(dtype))
+    up = mx.concatenate([module.input_mix_weight_up(act[i:i + 1]) for i in range(rows)]).reshape(x.shape)
+    _equal(actual[0], mix(up, normed))
+    _equal(actual[2], gate(summed[:, 160:].astype(dtype)).reshape(actual[2].shape))
+    singles = [plan.bounded(module, x[:, i:i + 1], (branch[:, i:i + 1], weights[:, i:i + 1], x[:, i:i + 1]) if fold else None) for i in range(rows)]
+    _assert_same(actual, tuple(mx.concatenate([out[j] for out in singles], axis = 1) for j in range(3)))
+
+
+@_needs_qwen4
+@_needs_stream
+def test_qwen4_stream_admission_caches_a_failed_bound(monkeypatch):
+    module = _stream_read(); calls = []
+    monkeypatch.setattr(decode, "_QWEN4_STREAM_VERDICTS", {})
+    monkeypatch.setattr(decode, "_qwen4_stream_matches", lambda *a: calls.append(1) or False)
+    plan = decode._qwen4_decode_plan(qwen4, module)
+    x = mx.zeros((1, 1, 10240), mx.bfloat16)
+    assert plan.bounded(module, x, None) is None and plan.bounded(module, x, None) is None
+    assert calls == [1]
+
+
+@_needs_qwen4
+def test_qwen4_stream_checks_every_projection(monkeypatch):
+    module = _stream_read(); calls = []
+    monkeypatch.setattr(decode, "_nax_qmm_matches_native", lambda *a: calls.append(a[1]) or a[1] is module.input_mix_weight_down.weight)
+    assert not decode._qwen4_stream_matches(module, mx.zeros((1, 1, 10240), mx.bfloat16), mx.zeros((1, 4, 164)))
+    assert calls == [module.input_mix_weight_down.weight, module.block_inject_weight.weight]
+
+
+@_needs_qwen4
+@_needs_stream
+def test_qwen4_stream_mixer_admits_exactly_enough_norm_strips(monkeypatch):
+    module = _stream_read(combine = False, lowrank = 96, hidden_size = 3072)
+    plan = decode._qwen4_decode_plan(qwen4, module)
+    monkeypatch.setattr(decode, "_QWEN4_STREAM_VERDICTS", {})
+    actual = plan.bounded(module, mx.zeros((1, 1, 12288), mx.bfloat16), None)
+    assert actual.shape == (1, 1, 3072) and actual.dtype == mx.bfloat16
+    _equal(actual, mx.zeros_like(actual))
+    insufficient = _stream_read(combine = False, lowrank = 64, hidden_size = 3072)
+    assert decode._qwen4_stream_plan(insufficient, (None, None, None), False) is None
+
+
+@_needs_qwen4
+@_needs_stream
+def test_qwen4_stream_scope_uses_admission_and_keeps_native_fallback(monkeypatch):
+    module, target = _stream_read(), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
+    x = mx.zeros((1, 1, 10240), mx.bfloat16); expected = target._hyper_connection(module, x)
+    monkeypatch.setattr(decode, "_QWEN4_PREFILL_VERDICTS", {})
+    with decode.fused_qwen4_decode(module):
+        plan = vars(module)["_unsloth_qwen4_decode_plan"]
+        for admitted in (True, False):
+            vars(module)["_unsloth_qwen4_decode_plan"] = plan._replace(bounded = lambda *a: expected if admitted else None)
+            actual = target._hyper_connection(module, x)
+            _assert_same(actual, expected)
+            assert (actual is expected) is admitted
+
+
+def _qwen4_spread_row(key, dtype, spread):
+    # Values over a wide range, so a projection summed in another order rounds differently (keys found by search).
+    k1, k2, k3 = mx.random.split(mx.random.key(key), 3)
+    scale = mx.exp(2 * mx.random.normal((1, 1, 1), key = k2) + spread * mx.random.normal((1, 1, 5120), key = k3))
+    return (mx.random.normal((1, 1, 5120), key = k1) * scale).astype(dtype)
+
+
 def _logged_decode_kernels(monkeypatch, log, shift = 0):
     kernels = decode._qwen4_decode_kernels()
+    ordered = decode._qwen4_ordered_down_kernel()
 
     def logged(kernel):
         return lambda **kw: log.append(kernel) or [out + shift if shift else out for out in kernel(**kw)]
     monkeypatch.setattr(decode, "_qwen4_decode_kernels", lambda: tuple(logged(k) for k in kernels))
+    monkeypatch.setattr(decode, "_qwen4_ordered_down_kernel", lambda: logged(ordered) if ordered is not None else None)
+    return ordered
 
 
 @_needs_qwen4
 @pytest.mark.parametrize("dtype, bits, group_size, lowrank, combine", [
-    (mx.bfloat16, 4, 32, 160, True), (mx.float16, 8, 64, 192, False)])
+    (mx.bfloat16, 4, 32, 160, True), (mx.float16, 8, 64, 192, True), (mx.float16, 8, 64, 192, False)])
 def test_qwen4_decode_read_matches_mlx_vlm_bitwise(dtype, bits, group_size, lowrank, combine, monkeypatch):
     mx.random.seed(0)
     module, forward = _qwen4_read(combine, lowrank, bits, group_size, dtype), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
-    # Enough one-row reads that a norm rounding off by one float32 ulp shows in some 16-bit result.
-    inputs = [_qwen4_rows(1, dtype) for _ in range(128)] + [_qwen4_rows(2, dtype)]
-    expected = [forward._hyper_connection(module, x) for x in inputs]
+    # Enough one-row reads that a norm rounding off by one float32 ulp shows in some 16-bit result, then verify
+    # blocks of 2..5 rows; a 32-row read is a prefill width. A spread row's inject projection rounds differently
+    # in qmv's order than in qmv_fast's, so a multi-row native read of it differs from its one-row read.
+    widths = [1] * 128 + [n for n in (2, 3, 4, 5) for _ in range(4)] + [32]
+    inputs = [_qwen4_rows(rows, dtype) for rows in widths]
+    spread = _qwen4_spread_row(*{mx.bfloat16: (1235, dtype, 3), mx.float16: (576, dtype, 1.5)}[dtype])
+    inputs[2], inputs[128], inputs[130] = spread, mx.concatenate([inputs[0], spread], 1), mx.concatenate([spread, inputs[0]], 1)
+    # Odd reads (an MLP read) take the residual inject that produced their input.
+    injects = [(mx.random.normal((1, rows, 1280)).astype(dtype), mx.random.normal((1, rows, 4)).astype(dtype))
+               if i % 2 else None for i, rows in enumerate(widths)]
+    native_inject = type(forward)._inject
+
+    def one_row_reads(x):   # verify rows read as decode steps; a prefill width reads natively
+        if x.shape[1] >= 32:
+            return forward._hyper_connection(module, x)
+        outs = [forward._hyper_connection(module, x[:, i:i + 1]) for i in range(x.shape[1])]
+        return tuple(mx.concatenate(o, 1) for o in zip(*outs)) if combine else mx.concatenate(outs, 1)
+    expected = [one_row_reads(native_inject(j[0], x, j[1]) if j else x) for x, j in zip(inputs, injects)]
     log = []
-    _logged_decode_kernels(monkeypatch, log)
+    ordered = _logged_decode_kernels(monkeypatch, log)
     monkeypatch.setattr(decode, "_QWEN4_PREFILL_VERDICTS", {})
+
+    folded = []
+
+    def read(x, inject):
+        branch, weights = inject or injects[1]
+        hidden = forward._inject(branch, x if inject else inputs[0], weights)
+        hidden = hidden if inject else x   # an inject the read does not take must not be folded in
+        out = forward._hyper_connection(module, hidden)
+        folded.append(combine and out[1] is not hidden)   # a folded read returns its own copy of the inject
+        return out
     # Generation also holds dense_prefill_linear, opened before or after this scope.
     outer, inner = ((decode.dense_prefill_linear, decode.fused_qwen4_decode) if combine
                     else (decode.fused_qwen4_decode, decode.dense_prefill_linear))
-    with outer(module), decode.fused_qwen4_decode(module):
-        with inner(module), decode.fused_qwen4_decode(module):
+    named = [("layers.0.attn_hyper_connection" if combine else "layers.0.mlp_hyper_connection", module)]
+    monkeypatch.setattr(decode.offload.STAGED_FILLS, "submit_after", 40, raising = False)
+    with outer(module), decode.fused_qwen4_decode(module, _modules = named):
+        with inner(module), decode.fused_qwen4_decode(module, _modules = named):
             assert type(module.input_mix_weight_down) is not nn.QuantizedLinear
-            for x, reference in zip(inputs[:64], expected):
-                _assert_same(forward._hyper_connection(module, x), reference)
-        for x, reference in zip(inputs[64:], expected[64:]):   # the outer scope still routes
-            _assert_same(forward._hyper_connection(module, x), reference)
-    # A first-use comparison and 127 served one-row reads, two launches each; the two-row read stays native.
-    assert len(log) == 256 and list(decode._QWEN4_PREFILL_VERDICTS.values()) == [True]
-    assert "_hyper_connection" not in vars(forward)
+            assert vars(module)["_unsloth_qwen4_decode_plan"].key[-1] == combine   # the inject tile
+            for x, inject, reference in zip(inputs[:64], injects, expected):
+                _assert_same(read(x, inject), reference)
+        for x, inject, reference in zip(inputs[64:], injects[64:], expected[64:]):   # the outer scope still routes
+            _assert_same(read(x, inject), reference)
+    # The projection and up/mix launches, including first-use comparisons; 32 rows stay native.
+    assert len(log) == 2 * 144 and list(decode._QWEN4_PREFILL_VERDICTS.values()) == [True] * 5 * (1 + combine)
+    assert log.count(ordered) == (140 if ordered is not None else 0)
+    # Every odd read below 32 rows but the first-use comparison of its width.
+    assert folded == [combine and i % 2 == 1 and i not in (1, 129, 133, 137, 141) and i < 144 for i in range(145)]
+    assert not {"_hyper_connection", "_inject"} & set(vars(forward))
+    assert decode._QWEN4_LAST_INJECT.slot is None
     assert not {"_unsloth_qwen4_decode_scopes", "_unsloth_qwen4_decode_plan"} & set(vars(module))
+
+
+@_needs_qwen4
+@pytest.mark.skipif(mx.__version__ != "0.32.4", reason = "the ordered route pins MLX 0.32.4")
+@pytest.mark.parametrize("dtype, bits, group_size", [(mx.bfloat16, 4, 32), (mx.float16, 8, 64)])
+def test_qwen4_ordered_decode_projects_each_row_and_partial_tile_bitwise(dtype, bits, group_size):
+    mx.random.seed(0)
+    streams, group, lowrank = 6, 1280, 192
+    module = _qwen4_hc(streams = streams, lowrank = lowrank, dtype = dtype)
+    nn.quantize(module, group_size = group_size, bits = bits)
+    normed = module.hc_norm(mx.random.normal((1, 2, streams * group)).astype(dtype))
+    down, inject = module.input_mix_weight_down, module.block_inject_weight
+    activate, _, gate = qwen4._qwen4_hyper_pointwise(streams, group)
+    rowwise = lambda linear: mx.concatenate([linear(mx.contiguous(normed[:, i:i + 1])) for i in range(2)], axis = 1)
+    expected = activate(rowwise(down)), gate(rowwise(inject))
+    assert (kernel := decode._qwen4_ordered_down_kernel()) is not None and not mx.array_equal(expected[1][:, 0], expected[1][:, 1]).item()
+    actual = kernel(
+        inputs = [normed, down.weight, down.scales, down.biases, decode._qwen4_table(activate, dtype),
+                  inject.weight, inject.scales, inject.biases, decode._qwen4_table(gate, dtype)],
+        template = [("T", dtype), ("STREAMS", streams), ("G", group), ("LR", lowrank), ("BITS", bits),
+                    ("GS", group_size), ("IBITS", bits), ("IGS", group_size), ("INJECT", True), ("NSG", 16)],
+        grid = (32 * 16 * (lowrank // 4 + 2), 2, 1), threadgroup = (32 * 16, 1, 1),
+        output_shapes = [(1, 2, lowrank), (1, 2, streams)], output_dtypes = [dtype] * 2)
+    _assert_same(tuple(actual), expected)
 
 
 @_needs_qwen4
 @pytest.mark.parametrize("reason", [
     "switch", "body", "patched", "outside", "differs", "aligned", "quad", "child", "override", "linear",
-    "foreign", "late", "rebound", "lora", "dtype", "verified", "relinear", "lane"])
+    "foreign", "late", "rebound", "lora", "dtype", "verified", "relinear", "lane", "dense", "ordered"])
 def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
     module = _qwen4_read(lowrank = {"aligned": 512, "quad": 128}.get(reason, 160))
     other, forward = _qwen4_read(), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
@@ -1673,6 +1842,11 @@ def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
         monkeypatch.setitem(vars(forward), "_linear", lambda linear, h: linear(h) * 2)
     elif reason == "lane":
         monkeypatch.setitem(vars(module.input_mix_weight_down), "_unsloth_lane_qmm", True)
+    elif reason == "dense":   # an unquantized inject projection keeps its own launch
+        module.block_inject_weight = nn.Linear(4 * 1280, 4, bias = False)
+        module.block_inject_weight.set_dtype(mx.bfloat16)
+    elif reason == "ordered":
+        monkeypatch.setattr(decode, "_qwen4_ordered_down_kernel", lambda: None)
     elif reason in ("verified", "relinear"):   # exact_batch_invariant_decode's class already over the forward
         native = type(forward)
         methods = (getattr(native, name, None) for name in decode._VERIFY_METHODS)
@@ -1707,8 +1881,8 @@ def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
             _assert_same(forward._hyper_connection(target, x), expected)
     left = vars(forward).pop("_hyper_connection", None) if reason == "late" else vars(forward).get("_hyper_connection")
     assert left is (foreign if reason in ("foreign", "late") else None)
-    assert hooked == (reason in ("outside", "differs", "late", "dtype", "verified", "lane"))
-    assert len(log) == {"differs": 2, "verified": 4}.get(reason, 0)
+    assert hooked == (reason in ("outside", "differs", "late", "dtype", "verified", "lane", "dense", "ordered"))
+    assert len(log) == {"differs": 2, "verified": 4, "dense": 4, "ordered": 4}.get(reason, 0)
     assert ("differs from the version" in caplog.text) == (reason in ("body", "patched", "rebound"))
     assert caplog.text.count("differs from mlx-vlm's") == (reason == "differs")
 

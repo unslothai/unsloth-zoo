@@ -1490,7 +1490,7 @@ def fused_qwen4_prefill(model, *, _modules = None):
                     module.__dict__.pop("_unsloth_qwen4_prefill_scopes", None)
 
 
-# Qwen4-Exp single-token decode: the batch-invariant forward's hyper-connection read in two launches, built from
+# Qwen4-Exp decode: the batch-invariant forward's hyper-connection read, built from
 # MLX's qmv_fast and qmv bodies (mlx/backend/metal/kernels/quantized.h, Copyright © 2023-2024 Apple Inc., MIT).
 _QWEN4_DECODE_CONTRACT = {
     "mlx_vlm.models.qwen4_exp.language": {
@@ -1499,6 +1499,7 @@ _QWEN4_DECODE_CONTRACT = {
         "Qwen4ExpGatedResidual": None,
         "Qwen4ExpRMSNorm": None,
         "Qwen4ExpBatchInvariantForward._hyper_connection": "0b22ede797c90e60",
+        "Qwen4ExpBatchInvariantForward._inject": "e05cbb2d38af4834",
         "Qwen4ExpRMSNorm.__call__": "b47a270c1b0eade5",
     },
     "mlx_vlm.models.qwen3_5.speculative_verifier": {
@@ -1531,11 +1532,27 @@ def _qwen4_decode_kernels():
         load_tg = load.replace("load_vector(const device T* x", "load_vector_tg(const threadgroup T* x")
         if load_tg == load:
             return None
-        # Norm in MLX's row reduction order (a simdgroup per 128 values), kept in threadgroup memory for qmv_fast.
+        # Norm in MLX's row reduction order (a simdgroup per 128 values), kept in threadgroup memory for qmv_fast; each
+        # grid row (y) is one token row, read as its own one-row call. FOLD reads `x + branch * weights` (the residual
+        # inject before this read) in mlx-vlm's two rounded ops and writes it out; INJECT adds a last threadgroup for
+        # the inject projection (MLX's qmv_fast with partial rows) and gate.
         norm_down = mx.fast.metal_kernel(
             name = "unsloth_qwen4_decode_norm_down",
-            input_names = ["x", "w", "inv_n", "eps", "wd", "sd", "bd", "activate"], output_names = ["normed", "act"],
+            input_names = ["x", "branch", "weights", "w", "inv_n", "eps", "wd", "sd", "bd", "activate", "w_inject",
+                           "s_inject", "b_inject", "gate"],
+            output_names = ["normed", "act", "inj", "hidden"],
             header = quantized + load_tg, compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            #define INPUT(e) (FOLD ? T(x[e] + T(branch[(e) % G] * weights[(e) / G])) : x[e])
+            const uint token = threadgroup_position_in_grid.y;
+            x += token * STREAMS * G;
+            normed += token * STREAMS * G;
+            act += token * LR;
+            if (FOLD) {
+                branch += token * G;
+                weights += token * STREAMS;
+                hidden += token * STREAMS * G;
+            }
+            if (INJECT) inj += token * STREAMS;
             const uint lane = thread_index_in_simdgroup;
             const uint sg = simdgroup_index_in_threadgroup;
             const uint tile = threadgroup_position_in_grid.x;
@@ -1551,7 +1568,7 @@ def _qwen4_decode_kernels():
                 const uint g = c / CHUNKS, v = c % CHUNKS;
                 float total = 0.0f;
                 for (uint i = 0; i < 4; ++i) {
-                    const float y = float(x[g * G + (v * 32 + lane) * 4 + i]);
+                    const float y = float(INPUT(g * G + (v * 32 + lane) * 4 + i));
                     total = y * y + total;
                 }
                 total = simd_sum(total);
@@ -1567,11 +1584,49 @@ def _qwen4_decode_kernels():
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const uint span = (STREAMS * G + threadgroups_per_grid.x - 1) / threadgroups_per_grid.x;
             for (uint e = t; e < STREAMS * G; e += THREADS) {
-                const T value = T((float(x[e]) * inverse[e / G]) * (1.0f + float(w[e])));
+                const T input = INPUT(e);
+                const T value = T((float(input) * inverse[e / G]) * (1.0f + float(w[e])));
                 normed_tg[e] = value;
-                if (e / span == tile) normed[e] = value;
+                if (e / span == tile) {
+                    normed[e] = value;
+                    if (FOLD) hidden[e] = input;
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (INJECT && tile == threadgroups_per_grid.x - 1) {
+                if (sg != 0) return;
+                constexpr int pack_factor = get_pack_factor<IBITS, 32>();
+                constexpr int bytes_per_pack = get_bytes_per_pack<IBITS, 32>();
+                constexpr int values_per_thread = pack_factor * 2;
+                constexpr int block_size = values_per_thread * 32;
+                constexpr int scale_step_per_thread = IGS / values_per_thread;
+                constexpr int in_vec_size = STREAMS * G;
+                constexpr int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+                constexpr int in_vec_size_g = in_vec_size / IGS;
+                thread float x_thread[values_per_thread];
+                thread float result[STREAMS] = {0};
+                const device uint8_t* ws = (const device uint8_t*)w_inject + lane * 2 * bytes_per_pack;
+                const device T* sc = s_inject + lane / scale_step_per_thread;
+                const device T* bs = b_inject + lane / scale_step_per_thread;
+                const threadgroup T* xp = normed_tg + lane * values_per_thread;
+                for (int k = 0; k < in_vec_size; k += block_size) {
+                    float sum = load_vector_tg<T, float, values_per_thread, IBITS>(xp, x_thread);
+                    for (int r = 0; r < STREAMS; r++) {
+                        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+                        result[r] += qdot<float, values_per_thread, IBITS>(
+                            wl, x_thread, float(sc[r * in_vec_size_g]), float(bs[r * in_vec_size_g]), sum);
+                    }
+                    ws += block_size * bytes_per_pack / pack_factor;
+                    sc += block_size / IGS;
+                    bs += block_size / IGS;
+                    xp += block_size;
+                }
+                for (int r = 0; r < STREAMS; r++) {
+                    result[r] = simd_sum(result[r]);
+                    if (lane == 0) inj[r] = gate[as_type<ushort>(static_cast<T>(result[r]))];
+                }
+                return;
+            }
 
             constexpr int results = 4;
             constexpr int pack_factor = get_pack_factor<BITS, 32>();
@@ -1609,6 +1664,10 @@ def _qwen4_decode_kernels():
         up_mix = mx.fast.metal_kernel(
             name = "unsloth_qwen4_decode_up_mix", input_names = ["act", "normed", "wu", "su", "bu", "sigmoid", "inv_n"],
             output_names = ["out"], header = quantized, compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            const uint token = threadgroup_position_in_grid.y;
+            act += token * K;
+            normed += token * STREAMS * G;
+            out += token * G;
             const uint lane = thread_index_in_simdgroup;
             const uint h = simdgroup_index_in_threadgroup;
             const uint i0 = threadgroup_position_in_grid.x * 4;
@@ -1691,10 +1750,381 @@ class _Qwen4DecodePlan(NamedTuple):
     width: int
     key: tuple
     launch: Callable
+    fold: bool
+    streams: int
+    bounded: Callable | None = None
 
 
-def _qwen4_decode_plan(language, module):
-    """The fused one-row read of `module`, settled when the scope opens; None keeps the native read."""
+def _qwen4_inject_qmv(linear, streams, width, dtype):
+    """Whether MLX runs `linear` on one row as the qmv_fast body (partial rows) the read's inject tile repeats."""
+    call = type(linear).__call__
+    if call is not nn.QuantizedLinear.__call__ and call not in _ONE_ROW_STOCK_CALLS:
+        return False
+    # 0.32.4 takes qmv_fast for K in whole fast blocks whatever N is; 0.32.3 only for whole 8-row tiles.
+    return (linear.mode == "affine" and linear.bits in (4, 8) and "bias" not in linear
+            and linear.scales.dtype == dtype and linear.biases.dtype == dtype
+            and linear.weight.shape == (streams, width * linear.bits // 32) and streams < 8
+            and linear.group_size in (32, 64, 128) and width % (32 // linear.bits * 64) == 0
+            and mx.__version__ == "0.32.4")
+
+
+@functools.cache
+def _qwen4_ordered_down_kernel():
+    if mx.__version__ != "0.32.4" or not mx.metal.is_available():
+        return None
+    try:
+        seen = set()
+        _inline("mlx/backend/metal/kernels/utils.h", seen)
+        quantized = _inline("mlx/backend/metal/kernels/quantized.h", seen, "get_pack_factor", "dequantize")
+        # Keep each lane's qdot terms, then add them in the native block order: summing K-slice partial sums
+        # instead would change rounding. The norm and up projection retain their existing arithmetic.
+        return mx.fast.metal_kernel(
+            name = "unsloth_qwen4_ordered_decode_down",
+            input_names = ["x", "wd", "sd", "bd", "activate", "wi", "si", "bi", "gate"],
+            output_names = ["act", "inj"], compile_options = _QWEN4_SAFE_MATH,
+            header = quantized + "\n#pragma clang fp contract(off) reassociate(off)\n" + """
+            template <typename T, int BITS, int GS, int K, int N>
+            METAL_FUNC void ordered_hc_qmv(
+                const device T* x, const device uint* w, const device T* s, const device T* b,
+                const device T* table, device T* out, int row0, uint lane, uint sg, uint nsg,
+                threadgroup float* parts) {
+                constexpr int PF = get_pack_factor<BITS, 32>();
+                constexpr int BP = get_bytes_per_pack<BITS, 32>();
+                constexpr int VPT = PF * 2;
+                constexpr int BLOCK = VPT * 32;
+                constexpr int BLOCKS = K / BLOCK;
+                constexpr int KW = K * BP / PF;
+                constexpr int KG = K / GS;
+                constexpr int STEP = GS / VPT;
+                for (uint block = sg; block < BLOCKS; block += nsg) {
+                    thread float xt[VPT];
+                    const float sum = load_vector<T, float, VPT, BITS>(x + block * BLOCK + lane * VPT, xt);
+                    for (int r = 0; r < 4; ++r) {
+                        if (row0 + r < N) {
+                            const device uint8_t* wp = (const device uint8_t*)w + (row0 + r) * KW
+                                + block * BLOCK * BP / PF + lane * 2 * BP;
+                            const int qi = (row0 + r) * KG + block * BLOCK / GS + lane / STEP;
+                            parts[(block * 4 + r) * 32 + lane] = qdot<float, VPT, BITS>(
+                                wp, xt, float(s[qi]), float(b[qi]), sum);
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == 0) {
+                    for (int r = 0; r < 4; ++r) {
+                        if (row0 + r < N) {
+                            float result = 0.0f;
+                            for (int block = 0; block < BLOCKS; ++block) result += parts[(block * 4 + r) * 32 + lane];
+                            result = simd_sum(result);
+                            if (lane == 0) out[row0 + r] = table[as_type<ushort>(static_cast<T>(result))];
+                        }
+                    }
+                }
+            }
+            """,
+            source = """
+            #pragma clang fp contract(off) reassociate(off)
+            const uint token = threadgroup_position_in_grid.y;
+            const uint tile = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            constexpr int K = STREAMS * G;
+            constexpr int DB = K / ((32 / BITS) * 64);
+            constexpr int IB = K / ((32 / IBITS) * 64);
+            constexpr int MB = DB > IB ? DB : IB;
+            threadgroup float parts[MB * 4 * 32];
+            x += token * K;
+            if (tile < LR / 4) {
+                ordered_hc_qmv<T, BITS, GS, K, LR>(x, wd, sd, bd, activate, act + token * LR,
+                    tile * 4, lane, sg, NSG, parts);
+            } else if (INJECT) {
+                ordered_hc_qmv<T, IBITS, IGS, K, STREAMS>(x, (const device uint*)wi, si, bi, gate, inj + token * STREAMS,
+                    (tile - LR / 4) * 4, lane, sg, NSG, parts);
+            }
+            """)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+_QWEN4_STREAM_VERDICTS = {}
+
+
+@functools.cache
+def _qwen4_stream_kernels():
+    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+            or mx.device_info().get("architecture") != "applegpu_g15s"):
+        return None
+    try:
+        seen = set()
+        _inline("mlx/backend/metal/kernels/utils.h", seen)
+        quantized = _inline("mlx/backend/metal/kernels/quantized.h", seen, "get_pack_factor", "dequantize")
+        signature = "template <typename T, typename U, int values_per_thread, int bits>\ninline U "
+        start = quantized.index(signature + "load_vector(")
+        stop = quantized.index(signature + "load_vector_safe(")
+        load = quantized[start:stop].replace("load_vector(const device T* x", "load_vector_tg(const threadgroup T* x")
+        end = quantized.index("\n}", stop) + 2
+        safe = quantized[stop:end].replace("load_vector_safe(const device T* x", "load_vector_safe_tg(const threadgroup T* x")
+        header = quantized + load + safe
+        pragma = "#pragma clang fp contract(off) reassociate(off)\n"
+        down = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_stream_norm_down",
+            input_names = ["x", "branch", "weights", "w", "inv_n", "eps", "wd", "sd", "bd", "wi", "si", "bi"],
+            output_names = ["normed", "parts", "hidden"], header = header, compile_options = _QWEN4_SAFE_MATH,
+            source = pragma + """
+    const uint row = threadgroup_position_in_grid.z;
+    const uint stream = threadgroup_position_in_grid.y % STREAMS;
+    const uint tile = threadgroup_position_in_grid.y / STREAMS;
+    const uint t = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    constexpr int K = STREAMS * G, PR = LR + STREAMS;
+    threadgroup T xs[G];
+    threadgroup float part[32];
+    x += row * K + stream * G;
+    w += stream * G;
+    for (uint i = t; i < 32; i += 256) part[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = sg; c < G / 128; c += 8) {
+        float s = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            const uint k = (c * 32 + lane) * 4 + i;
+            const T h = FOLD ? T(x[k] + T(branch[row * G + k] * weights[row * STREAMS + stream])) : x[k];
+            const float v = float(h);
+            s = v * v + s;
+        }
+        s = simd_sum(s);
+        if (lane == 0) part[c] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = simd_sum(part[lane]);
+    const float inv = metal::precise::rsqrt(total * inv_n + eps);
+    for (uint k = t; k < G; k += 256) {
+        const T h = FOLD ? T(x[k] + T(branch[row * G + k] * weights[row * STREAMS + stream])) : x[k];
+        xs[k] = T((float(h) * inv) * (1.0f + float(w[k])));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tile < LR / 8) {
+        constexpr int PF = get_pack_factor<BITS, 32>();
+        constexpr int BP = get_bytes_per_pack<BITS, 32>();
+        constexpr int VPT = PF * 2, BLOCK = VPT * 32;
+        const int n = tile * 8 + sg;
+        float result = 0.0f;
+        thread float xt[VPT];
+        for (int base = 0; base < G; base += BLOCK) {
+            const float sum = load_vector_tg<T, float, VPT, BITS>(xs + base + lane * VPT, xt);
+            const int e = stream * G + base;
+            const device uint8_t* wp = (const device uint8_t*)wd + n * K * BP / PF + (e + lane * VPT) * BP / PF;
+            const int qi = n * (K / GS) + e / GS + lane / (GS / VPT);
+            result += qdot<float, VPT, BITS>(wp, xt, float(sd[qi]), float(bd[qi]), sum);
+        }
+        result = simd_sum(result);
+        if (lane == 0) parts[(row * STREAMS + stream) * PR + n] = result;
+    } else if (INJECT && sg < STREAMS) {
+        constexpr int PF = get_pack_factor<IBITS, 32>();
+        constexpr int BP = get_bytes_per_pack<IBITS, 32>();
+        constexpr int VPT = PF * 2, BLOCK = VPT * 32;
+        float result = 0.0f;
+        thread float xt[VPT];
+        for (int base = 0; base < G; base += BLOCK) {
+            const float sum = load_vector_tg<T, float, VPT, IBITS>(xs + base + lane * VPT, xt);
+            const int e = stream * G + base;
+            const device uint8_t* wp = (const device uint8_t*)wi + sg * K * BP / PF + (e + lane * VPT) * BP / PF;
+            const int qi = sg * (K / IGS) + e / IGS + lane / (IGS / VPT);
+            result += qdot<float, VPT, IBITS>(wp, xt, float(si[qi]), float(bi[qi]), sum);
+        }
+        result = simd_sum(result);
+        if (lane == 0) parts[(row * STREAMS + stream) * PR + LR + sg] = result;
+    }
+    const uint k = tile * 256 + t;
+    if (k < G) {
+        normed[row * K + stream * G + k] = xs[k];
+        if (FOLD) hidden[row * K + stream * G + k] = T(x[k] + T(branch[row * G + k] * weights[row * STREAMS + stream]));
+    }
+""")
+        up = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_stream_up_mix",
+            input_names = ["parts", "normed", "wu", "su", "bu", "sigmoid", "inv_n", "activate", "gate"],
+            output_names = ["out", "inj"], header = header, compile_options = _QWEN4_SAFE_MATH,
+            source = pragma + """
+            const uint token = threadgroup_position_in_grid.y;
+
+            threadgroup T act[K];
+            constexpr int PR = K + STREAMS;
+            parts += token * STREAMS * PR;
+            const uint t = thread_index_in_threadgroup;
+            for (uint i = t; i < K; i += 32 * STREAMS) {
+                float sum = 0.0f;
+                for (int s = 0; s < STREAMS; ++s) sum += parts[s * PR + i];
+                act[i] = activate[as_type<ushort>(T(sum))];
+            }
+            if (INJECT && threadgroup_position_in_grid.x == 0 && t < STREAMS) {
+                float sum = 0.0f;
+                for (int s = 0; s < STREAMS; ++s) sum += parts[s * PR + K + t];
+                inj[token * STREAMS + t] = gate[as_type<ushort>(T(sum))];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            normed += token * STREAMS * G;
+            out += token * G;
+            const uint lane = thread_index_in_simdgroup;
+            const uint h = simdgroup_index_in_threadgroup;
+            const uint i0 = threadgroup_position_in_grid.x * 4;
+            threadgroup T up[STREAMS][4];
+            constexpr int results = 4;
+            constexpr int pack_factor = get_pack_factor<BITS, 32>();
+            constexpr int bytes_per_pack = get_bytes_per_pack<BITS, 32>();
+            constexpr int values_per_thread = pack_factor;
+            constexpr int block_size = values_per_thread * 32;
+            constexpr int scale_step_per_thread = GS / values_per_thread;
+            constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
+            constexpr int in_vec_size_g = K / GS;
+            thread float x_thread[values_per_thread];
+            thread float result[results] = {0};
+            const int out_row = h * G + i0;
+            const device uint8_t* ws = (const device uint8_t*)wu + out_row * in_vec_size_w + lane * bytes_per_pack;
+            const device T* sc = su + out_row * in_vec_size_g + lane / scale_step_per_thread;
+            const device T* bi = bu + out_row * in_vec_size_g + lane / scale_step_per_thread;
+            const threadgroup T* xp = act + lane * values_per_thread;
+            int k = 0;
+            for (; k < K - block_size; k += block_size) {
+                float sum = load_vector_tg<T, float, values_per_thread, BITS>(xp, x_thread);
+                for (int r = 0; r < results; r++) {
+                    auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+                    result[r] += qdot<float, values_per_thread, BITS>(
+                        wl, x_thread, float(sc[r * in_vec_size_g]), float(bi[r * in_vec_size_g]), sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                sc += block_size / GS;
+                bi += block_size / GS;
+                xp += block_size;
+            }
+            const int remaining = clamp(static_cast<int>(K - k - lane * values_per_thread), 0, values_per_thread);
+            if (remaining > 0) {
+                float sum = load_vector_safe_tg<T, float, values_per_thread, BITS>(xp, x_thread, remaining);
+                for (int r = 0; r < results; r++) {
+                    auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+                    result[r] += qdot_safe<float, values_per_thread, BITS>(
+                        wl, x_thread, float(sc[r * in_vec_size_g]), float(bi[r * in_vec_size_g]), sum, remaining);
+                }
+            }
+            for (int r = 0; r < results; r++) {
+                result[r] = simd_sum(result[r]);
+                if (lane == 0) up[h][r] = static_cast<T>(result[r]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (h == 0 && lane < 4) {
+                T total = T(0);
+                for (uint s = 0; s < STREAMS; ++s) {
+                    const T gate = sigmoid[as_type<ushort>(up[s][lane])];
+                    const T product = gate * normed[s * G + i0 + lane];
+                    const T partial = product + T(0);
+                    total = s == 0 ? partial : T(partial + total);
+                }
+                out[i0 + lane] = total * inv_n;
+            }
+            """)
+        return down, up
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return None
+
+
+def _qwen4_stream_matches(module, normed, parts):
+    projections = [module.input_mix_weight_down]
+    if "block_inject_weight" in module:
+        projections.append(module.block_inject_weight)
+    summed = mx.zeros_like(parts[:, 0])
+    for stream in range(module.hc_count):
+        summed = summed + parts[:, stream]
+    offset = 0
+    for projection in projections:
+        width = projection.weight.shape[0]
+        got = summed[:, offset:offset + width].astype(normed.dtype)
+        if not _nax_qmm_matches_native(normed.reshape(-1, normed.shape[-1]), projection.weight,
+                                       projection.scales, projection.biases, projection.group_size,
+                                       projection.bits, got):
+            return False
+        offset += width
+    return True
+
+
+def _qwen4_stream_plan(module, tables, inject):
+    norm, d, u = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
+    g, streams, lr, dtype = module.hidden_size, module.hc_count, d.weight.shape[0], d.scales.dtype
+    if (streams != 4 or g % 512 or lr % 8 or g // 256 > lr // 8 + inject
+            or inject != ("block_inject_weight" in module) or _qwen4_stream_kernels() is None):
+        return None
+    kernels = _qwen4_stream_kernels()
+    ip = module.block_inject_weight if inject else None
+    key = (dtype, g, streams, lr, d.bits, d.group_size, u.bits, u.group_size,
+           (ip.bits, ip.group_size) if inject else None, norm.weight.dtype, norm.eps)
+    template = [("T", dtype), ("G", g), ("STREAMS", streams), ("LR", lr), ("BITS", d.bits),
+                ("GS", d.group_size), ("INJECT", inject), ("IBITS", ip.bits if inject else 4),
+                ("IGS", ip.group_size if inject else 32)]
+    activate, gate, unused = tables
+    inv_n, epsilon = _qwen4_scalar(1.0 / g, mx.float32), _qwen4_scalar(norm.eps, mx.float32)
+    sigmoid, inv_streams = _qwen4_table(mx.sigmoid, dtype), _qwen4_scalar(1.0 / streams, dtype)
+    up_template = [("T", dtype), ("G", g), ("STREAMS", streams), ("K", lr), ("GS", u.group_size),
+                   ("BITS", u.bits), ("INJECT", inject)]
+
+    def launch(module, x, folded):
+        rows = x.size // x.shape[-1]
+        if not 0 < rows < _QWEN4_PREFILL_MIN_ROWS or _QWEN4_STREAM_VERDICTS.get(key) is False:
+            return None
+        n, d, u = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
+        branch, weights, h = folded or (unused, unused, x)
+        p = module.block_inject_weight if inject else None
+        normed, parts, hidden = kernels[0](
+            inputs = [h, branch, weights, n.weight, inv_n, epsilon, d.weight, d.scales, d.biases,
+                      *((p.weight, p.scales, p.biases) if inject else (unused,) * 3)],
+            template = [*template, ("FOLD", folded is not None)], grid = (256, streams * (lr // 8 + inject), rows),
+            threadgroup = (256, 1, 1), output_shapes = [x.shape, (rows, streams, lr + streams),
+                                                       x.shape if folded else (1,)],
+            output_dtypes = [dtype, mx.float32, dtype])
+        if key not in _QWEN4_STREAM_VERDICTS:
+            _staged_ready()
+            try:
+                good = _settled(_qwen4_stream_matches(module, normed, parts))
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                return None
+            _QWEN4_STREAM_VERDICTS[key] = good
+            if not good:
+                return None
+        mixed, injection = kernels[1](
+            inputs = [parts, normed, u.weight, u.scales, u.biases, sigmoid, inv_streams,
+                      activate, gate if inject else unused], template = up_template,
+            grid = (32 * streams * g // 4, rows, 1), threadgroup = (32 * streams, 1, 1),
+            output_shapes = [(*x.shape[:-1], g), (*x.shape[:-1], streams) if inject else (1,)],
+            output_dtypes = [dtype] * 2)
+        return (mixed, hidden if folded else x, injection) if inject else mixed
+
+    return launch
+
+
+def _qwen4_ordered_read(language, module, x, folded, kernel, template, tables, inject):
+    norm, down = module.hc_norm, module.input_mix_weight_down
+    streams, group, lowrank = module.hc_count, module.hidden_size, down.weight.shape[0]
+    rows, dtype = x.size // x.shape[-1], down.scales.dtype
+    activate, gate, unused = tables
+    branch, weights, hidden = folded or (unused, unused, x)
+    if folded is not None:
+        hidden = language.Qwen4ExpBatchInvariantForward._inject(branch, hidden, weights)
+    normed = _qwen4_hc_norm(hidden, norm.weight, group, norm.eps)
+    projection = module.block_inject_weight if inject else None
+    tiles = lowrank // 4 + ((streams + 3) // 4 if inject else 0)
+    act, injection = kernel(
+        inputs = [normed, down.weight, down.scales, down.biases, activate,
+                  *((projection.weight, projection.scales, projection.biases, gate) if inject else (unused,) * 4)],
+        template = template, grid = (32 * 16 * tiles, rows, 1), threadgroup = (32 * 16, 1, 1),
+        output_shapes = [(*x.shape[:-1], lowrank), (*x.shape[:-1], streams) if inject else (1,)],
+        output_dtypes = [dtype] * 2)
+    return normed, act, injection, hidden
+
+
+def _qwen4_decode_plan(language, module, fold = False):
+    """The fused decode/verify read of `module`, settled when the scope opens; None keeps the native read.
+
+    `fold` reads the residual inject that produced the input in the same launch (the MLP read of a layer)."""
     norm, down, up = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
     group, streams = module.hidden_size, module.hc_count
     # Same reduction bounds as prefill; the normalized streams must fit 32 KB of threadgroup memory.
@@ -1713,58 +2143,146 @@ def _qwen4_decode_plan(language, module):
     activate_table, sigmoid_table = _qwen4_table(activate, dtype), _qwen4_table(mx.sigmoid, dtype)
     inv_streams = _qwen4_scalar(1.0 / streams, dtype)
     norm_template = [("T", dtype), ("G", group), ("STREAMS", streams), ("GS", down.group_size),
-                     ("BITS", down.bits), ("NSG", simdgroups)]
+                     ("BITS", down.bits), ("NSG", simdgroups), ("LR", lowrank)]
     mix_template = [("T", dtype), ("G", group), ("STREAMS", streams), ("K", lowrank), ("GS", up.group_size),
                     ("BITS", up.bits)]
+    inject = combine and _qwen4_inject_qmv(module.block_inject_weight, streams, streams * group, dtype)
+    fold = fold and inject
+    gate_table = _qwen4_table(injection_gate, dtype) if inject else None
+    inject_template = ([("IGS", module.block_inject_weight.group_size), ("IBITS", module.block_inject_weight.bits)]
+                       if inject else [("IGS", 32), ("IBITS", 4)])
+    ordered = _qwen4_ordered_down_kernel()
+    ordered_template = ([(k, v) for k, v in (*norm_template, *inject_template) if k != "NSG"]
+                        + [("NSG", 16), ("INJECT", inject)])
+    unused = mx.zeros((8,), dtype)   # MLX binds a smaller input in the constant address space
+    tiles = lowrank // 4 // simdgroups + inject
 
-    def launch(module, x):
+    def launch(module, x, folded = None):
         norm, down, up = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
-        normed, act = norm_down(
-            inputs = [x, norm.weight, *norm_constants, down.weight, down.scales, down.biases, activate_table],
-            template = norm_template, grid = (32 * lowrank // 4, 1, 1), threadgroup = (32 * simdgroups, 1, 1),
-            output_shapes = [x.shape, (*x.shape[:-1], lowrank)], output_dtypes = [dtype, dtype])
+        rows = x.size // x.shape[-1]
+        branch, weights, h = folded or (unused, unused, x)
+        projection = module.block_inject_weight if inject else None
+        if 1 <= rows <= 4 and ordered is not None:
+            normed, act, injection, hidden = _qwen4_ordered_read(
+                language, module, x, folded, ordered, ordered_template, (activate_table, gate_table, unused), inject)
+        else:
+            normed, act, injection, hidden = norm_down(
+                inputs = [h, branch, weights, norm.weight, *norm_constants, down.weight, down.scales, down.biases,
+                          activate_table, *((projection.weight, projection.scales, projection.biases, gate_table)
+                                            if inject else (unused,) * 4)],
+                template = [*norm_template, *inject_template, ("FOLD", folded is not None), ("INJECT", inject)],
+                grid = (32 * simdgroups * tiles, rows, 1), threadgroup = (32 * simdgroups, 1, 1),
+                output_shapes = [x.shape, (*x.shape[:-1], lowrank), (*x.shape[:-1], streams) if inject else (1,),
+                                 x.shape if folded else (1,)],
+                output_dtypes = [dtype] * 4)
         mixed = up_mix(
             inputs = [act, normed, up.weight, up.scales, up.biases, sigmoid_table, inv_streams],
-            template = mix_template, grid = (32 * streams * group // 4, 1, 1), threadgroup = (32 * streams, 1, 1),
+            template = mix_template, grid = (32 * streams * group // 4, rows, 1), threadgroup = (32 * streams, 1, 1),
             output_shapes = [(*x.shape[:-1], group)], output_dtypes = [dtype])[0]
         if not combine:
             return mixed
-        return mixed, x, injection_gate(module.block_inject_weight(normed))
+        if not inject:
+            injection = injection_gate(module.block_inject_weight(normed))
+        return mixed, hidden if folded else x, injection
 
     key = ("decode hyper-connection read", streams, group, lowrank, dtype, norm.weight.dtype, down.bits,
-           down.group_size, up.bits, up.group_size, combine)
-    return _Qwen4DecodePlan(dtype, streams * group, key, launch)
+           down.group_size, up.bits, up.group_size, ordered is not None, combine, inject)
+    bounded = _qwen4_stream_plan(module, (activate_table, gate_table, unused), inject)
+    return _Qwen4DecodePlan(dtype, streams * group, key, launch, fold, streams, bounded)
+
+
+# The last residual inject each thread's decode forward built: (output, branch, hyper input, injection weights).
+_QWEN4_LAST_INJECT = local()
+
+
+def _qwen4_decode_inject(forward, branch, hyper_input, injection_weights):
+    out = type(forward)._inject(branch, hyper_input, injection_weights)
+    _QWEN4_LAST_INJECT.slot = (out, branch, hyper_input, injection_weights)
+    return out
+
+
+def _qwen4_pending_inject(x):
+    slot = getattr(_QWEN4_LAST_INJECT, "slot", None)
+    if slot is None or slot[0] is not x:
+        return None
+    _, branch, hidden, weights = slot
+    if (branch.dtype == weights.dtype == hidden.dtype == x.dtype and hidden.shape == x.shape
+            and branch.shape[:-1] == weights.shape[:-1] == x.shape[:-1]
+            and branch.shape[-1] * weights.shape[-1] == x.shape[-1]):
+        return branch, hidden, weights
+    return None
+
+
+def _qwen4_submit(*arrays):
+    if len(arrays) == 1 and getattr(offload.STAGED_FILLS, "submit_after", 0):
+        pending = _qwen4_pending_inject(arrays[0])
+        if pending is not None:
+            # The next read folds the tail; submit every producer without materializing the add.
+            return _submit(*pending)
+    return _submit(*arrays)
+
+
+_HELD_MX.async_eval = _qwen4_submit
 
 
 def _qwen4_decode_read(forward, module, x):
     native = type(forward)._hyper_connection
     plan = module.__dict__.get("_unsloth_qwen4_decode_plan")
     # Projections Fast Verify holds keep its arithmetic, which verify rows share.
-    if (plan is None or module.input_mix_weight_down.__dict__.get("_unsloth_lane_qmm") or x.ndim != 3
-            or x.size != x.shape[-1] or x.dtype != plan.dtype or x.shape[-1] != plan.width):
+    rows = x.size // x.shape[-1] if x.ndim == 3 and x.shape[-1] else 0
+    if (plan is None or module.input_mix_weight_down.__dict__.get("_unsloth_lane_qmm")
+            or not 0 < rows < _QWEN4_PREFILL_MIN_ROWS or x.dtype != plan.dtype or x.shape[-1] != plan.width):
         return native(forward, module, x)
-    return _qwen4_verified(plan.key, lambda: plan.launch(module, x), lambda: native(forward, module, x),
+    fold = plan.fold or (getattr(offload.STAGED_FILLS, "submit_after", 0) and "block_inject_weight" in module)
+    pending = _qwen4_pending_inject(x) if fold else None
+    _QWEN4_LAST_INJECT.slot = None
+    folded = ((pending[0], pending[2], pending[1])
+              if fold and pending is not None and pending[2].shape[-1] == plan.streams else None)
+    if plan.bounded is not None:
+        output = plan.bounded(module, x, folded)
+        if output is not None:
+            return output
+    return _qwen4_verified((*plan.key, folded is not None, rows), lambda: plan.launch(module, x, folded),
+                           lambda: _qwen4_row_reads(lambda row: native(forward, module, row), x),
                            "decode hyper-connection read")
+
+
+def _qwen4_row_reads(read, x):
+    # Each row's one-row read: a native multi-row read can take other MLX kernels (qmv_wide, or the guarded
+    # gather_qmv for the inject projection's few outputs) that round differently from a decode step's qmv_fast.
+    if x.size == x.shape[-1]:
+        return read(x)
+    flat = x.reshape(-1, 1, x.shape[-1])
+    outs = [read(flat[i:i + 1]) for i in range(flat.shape[0])]
+    join = lambda parts: mx.concatenate(parts).reshape(*x.shape[:-1], parts[0].shape[-1])
+    if isinstance(outs[0], tuple):   # (mixed, the input itself, injection)
+        return join([out[0] for out in outs]), x, join([out[2] for out in outs])
+    return join(outs)
 
 
 @contextmanager
 def fused_qwen4_decode(model, *, _modules = None):
-    """Run Qwen4-Exp's single-token decode hyper-connection reads as two fused launches.
+    """Run Qwen4-Exp's decode and verify-block hyper-connection reads on checked fused kernels.
 
-    mlx-vlm's batch-invariant decode forward reads each hyper-connection through a norm, two quantized projections
-    and a stream mix; a one-row read of this model's modules takes kernels bit-identical to it, each layout,
-    quantization and dtype compared on its first use. Eligibility is settled when the scope opens: modules,
-    projections and mlx-vlm methods replaced while it is open are not rechecked. Verify blocks, training and a
-    drifted mlx-vlm keep the native read. `UNSLOTH_MLX_QWEN4_DECODE=0` turns the route off.
+    mlx-vlm's batch-invariant forward reads each hyper-connection through a norm, two quantized projections and a
+    stream mix; a read of fewer than 32 rows of this model's modules takes kernels that read each row as a one-row
+    call. Projections may be reordered within the fp32-reordering bound of stock's per-row reference, checked on
+    first use per layout, quantization and dtype; everything else matches bit for bit. Routes requiring exact
+    projections are compared bit for bit with mlx-vlm's one-row reads on first use per row count as well.
+    Eligibility is settled when the scope opens: modules, projections and mlx-vlm methods replaced while it is open
+    are not rechecked. Fast Verify's projections, training and a drifted mlx-vlm keep the native read.
+    `UNSLOTH_MLX_QWEN4_DECODE=0` turns the route off.
     """
     changed, forward = [], None
     try:
         with _QWEN4_DECODE_LOCK:
             language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
             target = getattr(language, "_QWEN4_BATCH_INVARIANT_FORWARD", None)
-            hook = vars(target).get("_hyper_connection") if target is not None else None
+            hooks = [(vars(target).get(name), fn) for name, fn in (("_hyper_connection", _qwen4_decode_read),
+                                                                     ("_inject", _qwen4_decode_inject))
+                     ] if target is not None else ()
             if (target is not None and os.environ.get("UNSLOTH_MLX_QWEN4_DECODE", "1") != "0"
-                    and (hook is None or getattr(hook, "func", None) is _qwen4_decode_read)
+                    and all(hook is None or getattr(hook, "func", None) is fn for hook, fn in hooks)
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
                     and mx.default_device() == mx.gpu and _qwen4_decode_kernels() is not None):
                 if _QWEN4_DECODE_BINDINGS[0] is None or not _bindings_intact(_QWEN4_DECODE_BINDINGS[0]):
@@ -1777,16 +2295,17 @@ def fused_qwen4_decode(model, *, _modules = None):
                 stock = (_QWEN4_DECODE_BINDINGS[0] is not None and linear is not None
                          and getattr(type(target), "_hyper_connection", None)
                          is language.Qwen4ExpBatchInvariantForward._hyper_connection
+                         and getattr(type(target), "_inject", None) is language.Qwen4ExpBatchInvariantForward._inject
                          and getattr(native_class, "_linear", None) is language.Qwen3_5BatchInvariantForward._linear
                          and (linear is native_class._linear or getattr(linear, "__code__", None) is sliced))
                 seen = set()
-                for _, module in _fusion_modules(model, _modules) if stock else ():
+                for name, module in _fusion_modules(model, _modules) if stock else ():
                     if id(module) in seen or not isinstance(module, language.Qwen4ExpGatedResidual):
                         continue
                     seen.add(id(module))
                     scopes = module.__dict__.get("_unsloth_qwen4_decode_scopes", 0)
                     if not scopes:
-                        plan = _qwen4_decode_plan(language, module)
+                        plan = _qwen4_decode_plan(language, module, name.endswith("mlp_hyper_connection"))
                         if plan is None:
                             continue
                         vars(module)["_unsloth_qwen4_decode_plan"] = plan   # a tuple attribute would become a child
@@ -1795,6 +2314,7 @@ def fused_qwen4_decode(model, *, _modules = None):
                 if changed:
                     if not target.__dict__.get("_unsloth_qwen4_decode_scopes"):
                         target._hyper_connection = functools.partial(_qwen4_decode_read, target)
+                        target._inject = functools.partial(_qwen4_decode_inject, target)
                     target._unsloth_qwen4_decode_scopes = target.__dict__.get("_unsloth_qwen4_decode_scopes", 0) + 1
                     forward = target
         yield model
@@ -1805,9 +2325,11 @@ def fused_qwen4_decode(model, *, _modules = None):
                 if not owner._unsloth_qwen4_decode_scopes:
                     owner.__dict__.pop("_unsloth_qwen4_decode_scopes", None)
                     owner.__dict__.pop("_unsloth_qwen4_decode_plan", None)
-                    hook = owner.__dict__.get("_hyper_connection")
-                    if owner is forward and getattr(hook, "func", None) is _qwen4_decode_read:
-                        del owner.__dict__["_hyper_connection"]
+                    if owner is forward:
+                        _QWEN4_LAST_INJECT.slot = None
+                    for name, fn in (("_hyper_connection", _qwen4_decode_read), ("_inject", _qwen4_decode_inject)):
+                        if owner is forward and getattr(owner.__dict__.get(name), "func", None) is fn:
+                            del owner.__dict__[name]
 
 
 def _single_row(x):
@@ -9146,7 +9668,7 @@ def _qsa_decode_route(native, bindings, kernel):
         kwargs = dict(scale = scale, block_size = block_size, allow_sparse_decode = allow_sparse_decode, _plan = _plan)
         reference = lambda: native(*args, **kwargs)
         if (mlx_training_patches_active() or not _bindings_intact(bindings) or not isinstance(queries, mx.array)
-                or queries.ndim != 4 or queries.shape[2] != 1):
+                or queries.ndim != 4 or not 1 <= queries.shape[2] <= 4):
             return reference()
         key = ("indexed decode strides", queries.dtype, queries.shape, keys.shape[:2], keys.shape[3], block_size, block_indices.shape)
         return _qwen4_verified(key, lambda: fused(*args, **kwargs), reference, "indexed decode strides")
@@ -9213,9 +9735,9 @@ def _qsa_routes(model, modules, enter):
 
 
 def fused_qsa_attention(model, *, _modules = None):
-    """Speed up Qwen sparse block selection and exact one-row indexed attention during serialized inference.
+    """Speed up Qwen sparse block selection and exact small-block indexed attention during serialized inference.
 
-    Block selection picks exactly `argpartition`'s blocks from native float32 scores. Indexed decode retains
+    Block selection picks exactly `argpartition`'s blocks from native float32 scores. Indexed attention retains
     native arithmetic while reading K/V cache strides directly. Both routes compare bits at first use per layout.
     Their upstream methods are rebound process-wide while any scope is open. `UNSLOTH_MLX_QSA_SELECT=0` and
     `UNSLOTH_MLX_QSA_DECODE=0` independently disable selection and indexed decode.
