@@ -380,7 +380,7 @@ def _grouped_mm_eager(inputs, weight, offsets):
     # Triton is picked when the probe says no, yet the separated LoRA delta still routed here: torch 2.8 hard-raises
     # unless dprops->major == 9, 2.6/2.7 lack _grouped_mm, so LoRA MoE died off H100; 2.9 falls back internally; probe
     # is cached.
-    if not _grouped_mm_supported_on(inputs.device):
+    if not _grouped_mm_supported_on(inputs.device) or _native_backward_unaligned(inputs, weight):
         return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_safe_on(inputs.device):
         weight = weight.contiguous()   # view path unproven on this device -> safe copy
@@ -396,6 +396,16 @@ def _grouped_mm_eager(inputs, weight, offsets):
         if "strides should be multiple of 16 bytes" not in str(exc):
             raise
         return _manual_grouped_mm(inputs, weight, offsets)
+
+
+def _native_backward_unaligned(inputs, weight):
+    # torch._grouped_mm's own backward feeds grad [M, N] back into it: an N row not 16-byte aligned passes forward
+    # (transposed [E, N, K] stack) but raises in backward, so a trainable fp16 / bf16 stack with odd N died there.
+    return (
+        torch.is_grad_enabled()
+        and (inputs.requires_grad or weight.requires_grad)
+        and (weight.shape[-1] * weight.element_size()) % 16 != 0
+    )
 
 
 def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
