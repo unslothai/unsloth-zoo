@@ -542,10 +542,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     embedding_matrix = embedding_matrix[:min_size]
     lm_head_matrix   = lm_head_matrix  [:min_size]
     
-    # Get untrained tokens
     indicator_untrained1 = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
         (torch.amin(embedding_matrix, axis = 1) >= -eps)
-    # Check lm_head as well
 
     # Does NOT work for Llama 3.1!!
     indicator_untrained2 = (torch.amax(lm_head_matrix, axis = 1) <= eps) & \
@@ -568,10 +566,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     indicator_untrained2 = indicator_untrained2 | torch.zeros_like(indicator_untrained2)
     indicator_untrained2[final_bad_lm_head] = True
 
-    # Combine both checks
     indicator_untrained = indicator_untrained1.to("cpu") & indicator_untrained2.to("cpu")
 
-    # Remove pad token and other important token possibilities
     special_tokens = (
         "bos_token",
         "eos_token",
@@ -593,28 +589,21 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
 
-    # Get set and actual tokens
     where_untrained = where_untrained.tolist()
     if len(where_untrained) == 0: return
 
-    # Remove untrained indices where it's longer
     
     where_untrained_set = frozenset(where_untrained)
     actual_bad_tokens = tokenizer.convert_ids_to_tokens(where_untrained)
-    # Remove None items in actual_bad_tokens
     actual_bad_tokens = [x for x in actual_bad_tokens if x is not None]
 
-    # Check if tokenizer and training datasets have bad tokens
     if_bad_first  = False
     if_bad_second = False
-    # Check tokenizer's chat template for any untrained tokens
     if chat_template is not None:
         if_bad_first = any(x in chat_template for x in actual_bad_tokens)
     pass
 
     if isinstance(train_dataset, datasets.IterableDataset):
-        # Skip the check, since the code below assumes
-        # an indexable dataset
         return
 
     # Check the first 250, last 250 input_ids; raw rows would all be skipped, so read none
@@ -632,7 +621,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         pass
     pass
 
-    # Check last 250
     if not if_bad_second:
         left = max(size_dataset-250, 0)
         for j in range(left, size_dataset):
@@ -648,10 +636,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         pass
     pass
 
-    # Check if bad tokens exists!
     if not if_bad_first and not if_bad_second: return
 
-    # Check if lm_head / embed_token are trainable!
     bad_not_trainable = False
     if not embedding_matrix.requires_grad: bad_not_trainable = True
     if not lm_head_matrix  .requires_grad: bad_not_trainable = True
@@ -661,7 +647,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         final_bad_items = []
         which_locations = []
 
-        # Re-check the first 250, last 250 input_ids
         size = min(size_dataset, 250)
         for j in range(size):
             input_ids = train_dataset[j]
@@ -674,7 +659,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             pass
         pass
 
-        # Re-check last 250
         left = max(size_dataset-250, 0)
         for j in range(left, size_dataset):
             input_ids = train_dataset[j]
@@ -689,7 +673,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
 
         # If no bad tokens, possibly chat template itself has issues?
         if len(final_bad_items) == 0:
-            # Recheck 2000 and last 2000 items
             size = min(size_dataset, 2000)
             for j in range(size):
                 input_ids = train_dataset[j]
@@ -702,7 +685,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
                 pass
             pass
 
-            # Re-check last 2000
             left = max(size_dataset-2000, 0)
             for j in range(left, size_dataset):
                 input_ids = train_dataset[j]
@@ -730,7 +712,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         )
     pass
 
-    # Count all the possible bad tokens
     final_counts = np.zeros(max(len(tokenizer), embedding_matrix.shape[0]), dtype = np.int64)
     def mapping(examples):
         input_ids = examples["input_ids"]
@@ -739,15 +720,12 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     pass
     _count_input_ids(train_dataset, mapping)
 
-    # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
     sum_lm_head   = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)
 
-    # Remove bad tokens
     sum_embedding -= torch.sum(embedding_matrix[where_untrained], dtype = torch.float32, axis = 0)
     sum_lm_head   -= torch.sum(lm_head_matrix  [where_untrained], dtype = torch.float32, axis = 0)
 
-    # Find correct average by dividing by sum of trained tokens
     mean_embedding = (sum_embedding / n_trained)
     mean_lm_head   = (sum_lm_head   / n_trained)
 
@@ -760,7 +738,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     mean_embedding[where_null] = 0
     mean_lm_head  [where_null] = 0
 
-    # Set them to the mean
     print(
         "Unsloth: Setting embed_tokens & lm_head untrained tokens to "\
         "mean(trained) to counteract NaNs during training."
@@ -768,7 +745,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     embedding_matrix[where_untrained] = mean_embedding.to(embedding_matrix.dtype)
     lm_head_matrix  [where_untrained] = mean_lm_head  .to(lm_head_matrix  .dtype)
 
-    # Clean up
     collect_garbage(after = torch.cuda.empty_cache)
     pass
     return
