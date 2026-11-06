@@ -196,6 +196,32 @@ def test_bonus_weights_follow_trl_1_8_and_1_9_for_token_sum_losses(loss_type):
     )
 
 
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
+@pytest.mark.parametrize("ga, spg", [(2, 4), (4, 2), (1, 8)])
+@pytest.mark.parametrize("version", ["1.9.1", "1.9.2"])
+@pytest.mark.parametrize("excluded", [False, True])
+def test_bonus_weights_follow_trl_1_9_1_window_rescale(loss_type, ga, spg, version, excluded):
+    # TRL 1.9.1 / 1.9.2 (trl#6024) _compute_loss transcribed: the entropy sum is divided by the policy normalizer
+    # num_items_in_batch / num_processes * GA / steps_per_generation in train, without the rescale in eval.
+    gen = torch.Generator().manual_seed(11)
+    mask = (torch.rand(4, 6, generator = gen) > 0.3).long()
+    entropies = torch.rand(4, 6, generator = gen, dtype = torch.float64)
+    kwargs = dict(
+        loss_type = loss_type, num_items_in_batch = torch.tensor(40.0), num_processes = 2,
+        steps_per_generation = spg, current_gradient_accumulation_steps = ga,
+    )
+    kept = mask.double()
+    if excluded:
+        # Zero-variance exclusion: sample_weight = 1 / kept tokens of the generation batch, 0 on dropped rows.
+        kwargs["sample_weight"] = torch.tensor([1 / 40.0, 0.0, 1 / 40.0, 1 / 40.0])
+        kept = kept * (kwargs["sample_weight"] > 0).double().unsqueeze(-1)
+    weights = rr.grpo_entropy_bonus_weights(mask, None, 0.3, kwargs, trl_version = version)
+    torch.testing.assert_close((weights.double() * entropies).sum(), -0.3 * (entropies * kept).sum() / (40.0 / 2 * ga / spg))
+    kwargs["steps_per_generation"] = None  # what grpo_accumulated_loss passes outside training
+    weights = rr.grpo_entropy_bonus_weights(mask, None, 0.3, kwargs, trl_version = version, training = False)
+    torch.testing.assert_close((weights.double() * entropies).sum(), -0.3 * (entropies * kept).sum() / (40.0 / 2))
+
+
 def test_bonus_weights_do_not_divide_by_accumulation_in_eval():
     # TRL scales the bonus by current_gradient_accumulation_steps only when model.training.
     gen = torch.Generator().manual_seed(5)
