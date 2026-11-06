@@ -33,7 +33,8 @@ def _make_source_checkout(root, with_lora = True):
         os.makedirs(os.path.join(root, d), exist_ok = True)
     names = ["convert_hf_to_gguf.py"] + (["convert_lora_to_gguf.py"] if with_lora else [])
     for name in names:
-        with open(os.path.join(root, name), "w") as f: f.write("# stub\n")
+        with open(os.path.join(root, name), "w") as f:
+            f.write("# stub\n")
     return str(root)
 
 
@@ -81,7 +82,6 @@ def test_intact_unbuilt_checkout_runs_no_probes(probes, tmp_path, monkeypatch, i
     folder = _make_source_checkout(tmp_path / "llama.cpp-source")
     for _ in range(3):
         assert llama_cpp.install_llama_cpp(llama_cpp_folder = folder, just_clone_repo = True) == folder
-    # Converter deps present, so nothing at all runs.
     assert probes == []
     # Import names (protobuf imports as google.protobuf), not pip names.
     assert set(probes.queried) == {"gguf", "google.protobuf", "sentencepiece", "mistral_common"}
@@ -116,7 +116,6 @@ def test_checkout_without_lora_converter_keeps_old_path(probes, tmp_path):
 
 def test_full_build_unchanged(probes, tmp_path):
     folder = _make_source_checkout(tmp_path / "llama.cpp-source")
-    # just_clone_repo False still goes to the prebuilt / build path.
     with pytest.raises(Exception):
         llama_cpp.install_llama_cpp(llama_cpp_folder = folder, just_clone_repo = False)
     assert _kinds(probes)[:2] == ["prebuilt", "check_build_requirements"]
@@ -125,7 +124,8 @@ def test_full_build_unchanged(probes, tmp_path):
 def test_corrupted_checkout_still_repaired(probes, tmp_path, monkeypatch):
     folder = str(tmp_path / "llama.cpp-broken")
     os.makedirs(folder)
-    with open(os.path.join(folder, "convert_lora_to_gguf.py"), "w") as f: f.write("# stub\n")
+    with open(os.path.join(folder, "convert_lora_to_gguf.py"), "w") as f:
+        f.write("# stub\n")
     monkeypatch.setattr(llama_cpp, "_is_safe_to_delete", lambda p: True)
     assert llama_cpp.install_llama_cpp(llama_cpp_folder = folder, just_clone_repo = True) == folder
     assert not os.path.exists(folder)  # wiped, then (mocked) re-cloned
