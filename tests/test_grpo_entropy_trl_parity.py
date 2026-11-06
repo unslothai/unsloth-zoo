@@ -201,8 +201,7 @@ def test_bonus_weights_follow_trl_1_8_and_1_9_for_token_sum_losses(loss_type):
 @pytest.mark.parametrize("version", ["1.9.1", "1.9.2"])
 @pytest.mark.parametrize("excluded", [False, True])
 def test_bonus_weights_follow_trl_1_9_1_window_rescale(loss_type, ga, spg, version, excluded):
-    # TRL 1.9.1 / 1.9.2 (trl#6024) _compute_loss transcribed: the entropy sum is divided by the policy normalizer
-    # num_items_in_batch / num_processes * GA / steps_per_generation in train, without the rescale in eval.
+    # TRL 1.9.1 / 1.9.2 (trl#6024) _compute_loss transcribed: entropy sum / the window-rescaled policy normalizer.
     gen = torch.Generator().manual_seed(11)
     mask = (torch.rand(4, 6, generator = gen) > 0.3).long()
     entropies = torch.rand(4, 6, generator = gen, dtype = torch.float64)
@@ -212,7 +211,6 @@ def test_bonus_weights_follow_trl_1_9_1_window_rescale(loss_type, ga, spg, versi
     )
     kept = mask.double()
     if excluded:
-        # Zero-variance exclusion: sample_weight = 1 / kept tokens of the generation batch, 0 on dropped rows.
         kwargs["sample_weight"] = torch.tensor([1 / 40.0, 0.0, 1 / 40.0, 1 / 40.0])
         kept = kept * (kwargs["sample_weight"] > 0).double().unsqueeze(-1)
     weights = rr.grpo_entropy_bonus_weights(mask, None, 0.3, kwargs, trl_version = version)
