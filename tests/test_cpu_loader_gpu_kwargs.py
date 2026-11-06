@@ -70,3 +70,19 @@ def test_gpu_defaults_load_on_cpu():
 def test_gpu_only_feature_is_refused(key, value):
     with pytest.raises(NotImplementedError, match = key):
         _loader().FastCPUModel.from_pretrained(TINY, full_finetuning = True, load_in_4bit = False, **{key: value})
+
+
+def test_integer_zero_is_off_as_on_gpu():
+    # The GPU loader gates with `not in (None, False)`, so 0 means off there too.
+    model, _ = _loader().FastCPUModel.from_pretrained(
+        TINY, full_finetuning = True, load_in_4bit = False, float8_training = 0, load_in_fp8 = 0
+    )
+    assert type(model).__name__ == "Qwen3ForCausalLM"
+
+
+@pytest.mark.parametrize("return_logits", [False, True])
+def test_return_logits_keeps_the_full_logit_loss(return_logits):
+    model, _ = _loader().FastCPUModel.from_pretrained(
+        TINY, full_finetuning = True, load_in_4bit = False, return_logits = return_logits
+    )
+    assert getattr(model, "_unsloth_cpu_chunked_ce", False) is (not return_logits)

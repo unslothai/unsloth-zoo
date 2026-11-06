@@ -37,7 +37,7 @@ _GPU_LOADER_KWARGS_IGNORED = (
     "load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",
     "max_lora_rank", "gpu_memory_utilization", "float8_kv_cache", "random_state",
     "fix_tokenizer", "unsloth_tiled_mlp", "offload_embedding",
-    "device_map_planner_kwargs", "float32_mixed_precision", "disable_log_stats", "return_logits",
+    "device_map_planner_kwargs", "float32_mixed_precision", "disable_log_stats",
     "fullgraph", "unsloth_force_compile", "text_only", "whisper_language", "whisper_task",
 )
 # Features the CPU backend cannot run: dropped when off (None / False, the GPU defaults), refused when set,
@@ -57,7 +57,7 @@ _GPU_LOADER_KWARGS_REFUSED = {
 def _pop_gpu_loader_kwargs(kwargs):
     for key, reason in _GPU_LOADER_KWARGS_REFUSED.items():
         value = kwargs.pop(key, None)
-        if value is not None and value is not False:
+        if value not in (None, False):
             raise NotImplementedError(f"Unsloth (CPU): {reason}; got {key} = {value!r}. Unset it to train on CPU.")
     for key in _GPU_LOADER_KWARGS_IGNORED:
         kwargs.pop(key, None)
@@ -237,6 +237,8 @@ class FastCPUModel:
             raise NotImplementedError("Unsloth (CPU): fast_inference (vLLM) needs a GPU.")
         # Before anything downloads: a refused GPU-only feature fails fast.
         _pop_gpu_loader_kwargs(kwargs)
+        # Chunked CE returns logits = None in training steps; return_logits keeps the full-logit loss.
+        return_logits = kwargs.pop("return_logits", False)
         # A separate tokenizer repo, as FastLanguageModel accepts on GPU; never a model kwarg.
         tokenizer_name = kwargs.pop("tokenizer_name", None) or model_name
         if load_in_8bit:
@@ -366,7 +368,7 @@ class FastCPUModel:
             for param in model.parameters():
                 param.requires_grad_(True)
             FastCPUModel._prepare(model, use_gradient_checkpointing)
-        chunked = patch_chunked_causal_lm_loss(model)
+        chunked = False if return_logits else patch_chunked_causal_lm_loss(model)
         _print(
             f"{type(model).__name__} on {torch.get_num_threads()} CPU threads. "
             f"dtype = {dtype}, 4-bit = {use_4bit}, chunked CE = {chunked}."
