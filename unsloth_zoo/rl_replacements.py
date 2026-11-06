@@ -1453,7 +1453,8 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
 
     TRL >= 1.10: the mean entropy over the tokens the policy term acts on, divided by the
     accumulation steps (1 in eval) for every loss_type. TRL 1.8 and 1.9 instead divided cispo /
-    dapo / vespo by the policy term's own global token normalizer, without the mean.
+    dapo / vespo by the policy term's own global token normalizer, without the mean; from 1.9.1
+    that normalizer is rescaled to one accumulation window (trl#6024).
     """
     weights = completion_mask.to(torch.float32)
     if entropy_mask is not None:
@@ -1471,21 +1472,22 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
     from packaging.version import Version
     loss_type = loss_kwargs.get("loss_type", "grpo")
     if Version(trl_version) < Version("1.10.0") and loss_type in ("cispo", "dapo", "vespo"):
+        # TRL 1.9.1 / 1.9.2 (trl#6024) rescale the normalizer to one accumulation window; steps_per_generation is None in eval.
+        window = 1.0
+        spg = loss_kwargs.get("steps_per_generation", None)
+        if spg and Version(trl_version) >= Version("1.9.1"):
+            window = loss_kwargs.get("current_gradient_accumulation_steps", 1) / spg
         if sample_weight is not None:
-            # sample_weight is 1 / kept tokens of the generation batch, the kept-only num_items_in_batch,
-            # so excluded rows do not dilute the bonus. Like the branch below (TRL 1.8 / 1.9), no
-            # accumulation / steps_per_generation rescale: with every row kept the two are equal.
-            normalizer = 1.0 / loss_kwargs.get("num_processes", 1)
+            # sample_weight is 1 / kept tokens of the generation batch, so excluded rows do not dilute the bonus.
+            normalizer = window / loss_kwargs.get("num_processes", 1)
             row_weight = sample_weight.to(device = weights.device, dtype = weights.dtype).unsqueeze(-1)
             return weights * row_weight * (-entropy_coef / normalizer)
-        # TRL 1.8 / 1.9 used num_items_in_batch / num_processes as is, before 1.10 rescaled it to
-        # one accumulation window (grpo_compute_loss always rescales the policy term).
         num_items_in_batch = loss_kwargs.get("num_items_in_batch", None)
         if torch.is_tensor(num_items_in_batch):
             normalizer = num_items_in_batch.clamp(min = 1.0) / loss_kwargs.get("num_processes", 1)
         else:
             normalizer = max(float(num_items_in_batch), 1.0) / loss_kwargs.get("num_processes", 1)
-        return weights * (-entropy_coef / normalizer)
+        return weights * (-entropy_coef / (normalizer * window))
     # Unsloth before #11337 passes the training window's accumulation steps into eval too.
     accumulation_steps = loss_kwargs.get("current_gradient_accumulation_steps", 1) if training else 1
     return weights * (-entropy_coef / weights.sum().clamp(min = 1.0) / accumulation_steps)
