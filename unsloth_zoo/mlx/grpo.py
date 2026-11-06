@@ -1015,6 +1015,7 @@ class GRPOBatchPlan:
         """Micro-batch for schedule entry index at its planned width whatever the phase; refetching an entry reuses its generation instead of sampling again."""
         start = self._generation_start(index)
         if self._current is None or self._current.visit != start:
+            self._current = None  # its held vision inputs must not stay alive through the next rollout
             self._current = self._generate(start)
         generation = self._current
         position = ((index - start) % self.steps_per_generation) * self.batch_size
