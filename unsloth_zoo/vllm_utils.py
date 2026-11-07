@@ -4778,8 +4778,7 @@ def load_vllm(
                 if major_version >= 8:
                     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
                 elif Version(vllm_version) >= Version("0.21.0"):
-                    # vLLM 0.21+ turns it on by default where its capability check passes and
-                    # raises at engine init if it is forced where not (sm_75 from 0.24).
+                    # vLLM 0.21+ defaults it on where supported; forcing it raises on sm_75 from 0.24.
                     os.environ.pop("VLLM_USE_FLASHINFER_SAMPLER", None)
                 elif Version(vllm_version) >= Version("0.11.0"):
                     # On 0.11.0, Flashinfer also works!

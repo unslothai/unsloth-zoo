@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""load_vllm must not force VLLM_USE_FLASHINFER_SAMPLER=1 where vLLM's own capability check rejects FlashInfer
-(sm_75 from vLLM 0.24): vLLM then raises at engine init instead of falling back. AST-based, no GPU."""
+"""load_vllm must not force VLLM_USE_FLASHINFER_SAMPLER=1 where vLLM rejects the GPU: engine init then raises."""
 
 import ast
 import importlib
@@ -42,7 +41,6 @@ def _sets_sampler(stmt, value):
 
 
 def _sampler_env(major_version, vllm_version, inherited = None):
-    """Runs load_vllm's own sampler if-chain; returns the variable it leaves (None = unset)."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(vllm_utils.load_vllm)))
     chain = next(
         node
@@ -63,8 +61,7 @@ def _sampler_env(major_version, vllm_version, inherited = None):
 
 
 def _vllm_sampler_init(value, major_version, vllm_version):
-    """vLLM >= 0.21 TopKTopPSampler gate: default on, FlashInferBackend floor sm_75 before 0.24 and sm_80 after,
-    RuntimeError when the variable is set but the capability is rejected."""
+    """vLLM >= 0.21 flashinfer_sampler_supported: default on, sm_75 floor (sm_80 from 0.24), raises only if forced."""
     if value is not None and not int(value):
         return "native"
     floor = 8 if Version(vllm_version) >= Version("0.24.0") else 7
