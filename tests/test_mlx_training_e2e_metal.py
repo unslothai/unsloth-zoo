@@ -38,7 +38,7 @@ if _METAL:
     from unsloth_zoo.mlx import inference, matmul
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
-    from unsloth_zoo.mlx import utils as mlx_utils
+    from unsloth_zoo.mlx import nax, utils as mlx_utils
     from unsloth_zoo.mlx.utils import (
         FiniteTextBatchPlan, _FiniteTextRow, collect_mlx_lora_adapter_tensors,
         make_baseline_loss_fn,
@@ -2630,6 +2630,123 @@ def test_a_reference_model_scores_through_its_own_cce_kernel(kind):
     calls.clear()
     got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=loss._unsloth_cce_reference_scorer)
     assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
+
+
+# Gemma 4's 24-token window bites on both sides of the prompt; its layers 2 and 3 read layers 0 and 1's K/V.
+_SHRUNK_VLM_STACKS = {
+    "qwen3_5": ("mlx-community/Qwen3.5-0.8B-4bit", dict(hidden_size=64, intermediate_size=128, num_hidden_layers=4, full_attention_interval=2, layer_types=["linear_attention", "full_attention"] * 2, num_attention_heads=2, num_key_value_heads=1, linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=32, linear_value_head_dim=32), dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=64)),  # noqa: E501
+    "gemma4": ("mlx-community/gemma-4-e2b-it-4bit", dict(hidden_size=64, intermediate_size=128, num_hidden_layers=4, layer_types=["sliding_attention", "full_attention"] * 2, num_kv_shared_layers=2, num_attention_heads=2, head_dim=32, global_head_dim=64, hidden_size_per_layer_input=16, sliding_window=24), dict(num_hidden_layers=1, hidden_size=32, intermediate_size=64, num_attention_heads=2, num_key_value_heads=2, head_dim=16, global_head_dim=16)),  # noqa: E501
+}
+
+
+def _shrunk_vlm(path, family, train_tower):
+    import importlib, shutil, mlx_vlm.utils
+    from huggingface_hub import snapshot_download
+    repo, text, vision = _SHRUNK_VLM_STACKS[family]
+    try:
+        shutil.copytree(snapshot_download(repo, allow_patterns=["*.json", "*.jinja", "*.txt"], local_files_only=True), path, ignore=shutil.ignore_patterns("*.index.json", "README.md"))  # noqa: E501
+    except Exception:
+        pytest.skip(f"{repo}'s processor files are not cached")
+    config = {key: {**value, **text} if key == "text_config" else {**value, **vision} if key == "vision_config" else value for key, value in json.loads((path / "config.json").read_text()).items() if key not in ("quantization", "quantization_config", "audio_config")}  # noqa: E501
+    (path / "config.json").write_text(json.dumps(config))
+    module = importlib.import_module(f"mlx_vlm.models.{family}")
+    tiny = module.Model(mlx_vlm.utils.update_module_configs(module.ModelConfig.from_dict(params := dict(config)), module, params, ["text", "vision"]))  # noqa: E501
+    # A zero-initialized gate or norm would cut the path under test.
+    mx.save_safetensors(str(path / "model.safetensors"), {name: mx.random.normal(value.shape) * 0.02 if mx.issubdtype(value.dtype, mx.floating) and not value.any().item() else value for name, value in tree_flatten(tiny.parameters())}, {"format": "mlx"})  # noqa: E501
+    model, processor = FastMLXModel.from_pretrained(str(path), load_in_4bit=False, max_seq_length=512)
+    model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=512, finetune_vision_layers=train_tower, use_gradient_checkpointing=False)  # noqa: E501
+    model.set_dtype(mx.float32)
+    return model.train(), processor
+
+
+@metal_only
+@pytest.mark.parametrize("kind,family,checkpointed,compiled", [(kind, *case) for kind in ("dpo", "orpo", "cpo") for case in (("llama", False, True), ("llama", True, False), ("qwen2", True, True), ("qwen3", False, False), ("qwen3_5", True, False), ("gemma4", False, True))] + [("dpo", "qwen3_5:image:trained", False, True), ("dpo", "gemma4:image:trained", True, False), ("dpo", "qwen3_5:image:frozen", True, False), ("dpo", "gemma4:image:frozen", False, True), ("dpo", "gemma4:image:unfrozen", False, True), ("dpo", "qwen3_5:image:held", False, False), ("dpo", "qwen3_5:image:trained", False, False), ("dpo", "gemma4:image:ref-model", True, False)])  # noqa: E501
+def test_preference_shared_prompt_matches_each_row_alone(tmp_path, monkeypatch, kind, family, checkpointed, compiled):
+    import importlib
+    import numpy as np
+    import PIL.Image
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import preference as p
+    (family, image, tower), rng = (family.partition(":")[0], ":image" in family, family.rpartition(":")[2]), np.random.default_rng(11)  # noqa: E501
+    mx.random.seed(11)
+    if family == "qwen3_5" and nax.nax_available():
+        pytest.skip("Qwen3.5's split term is capped at a fixed 3e-4 of each value, not measured on this device")
+    if family in _SHRUNK_VLM_STACKS:
+        model, processor = _shrunk_vlm(tmp_path / "tiny", family, train_tower=tower in ("trained", "held"))
+        # Each tower other than "frozen" trips exactly one rule against sharing its run, "trained" both.
+        if tower == "unfrozen":
+            model.vision_tower.unfreeze(keys=["weight"])
+        elif tower == "held":
+            [getattr(model, name).freeze() for name in ("vision_tower", "embed_vision") if hasattr(model, name)]
+        words = "the quick brown fox jumps over a lazy dog by the river bank".split()
+        rows = [{"prompt": [{"role": "user", "content": [{"type": "image"}] * image + [{"type": "text", "text": " ".join(words * k)}]}], "chosen": [{"role": "assistant", "content": " ".join(words[k:])}], "rejected": [{"role": "assistant", "content": " ".join(words[:k])}], "images": [PIL.Image.new("RGB", (64, 64), (k * 30, 90, 160))] * image} for k in (3, 4, 6)]  # noqa: E501
+        plans = [p.create_preference_batch_plan(rows[::order], None, batch_size=3, length_policy=p.PreferenceLengthPolicy(kind, 512, None, None, "keep_end", 512), num_batches=1, grad_accum=1, dataset_order="sequential", processor=processor, model_config=model._config, shared_prompt_ratio=ratio) for order, ratio in ((1, None), (1, 1.0), (1, 1.0), (-1, None))]  # noqa: E501
+    else:
+        mod = importlib.import_module(f"mlx_lm.models.{family}")
+        model = mod.Model(mod.ModelArgs.from_dict(dict(model_type=family, hidden_size=64, num_hidden_layers=2, intermediate_size=96, num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=301, rope_theta=10000.0, max_position_embeddings=512, head_dim=16, tie_word_embeddings=family == "qwen2")))  # noqa: E501
+        model.freeze()
+        for layer in model.model.layers:
+            for name in ("q_proj", "k_proj", "v_proj"):
+                setattr(layer.self_attn, name, adapter := LoRALinear.from_base(getattr(layer.self_attn, name), r=4, scale=2.0))  # noqa: E501
+        rows = [p.TokenizedPreferenceRow(q := tuple(rng.integers(3, 301, size).tolist()), (1, *rng.integers(3, 301, rng.integers(5, 40)).tolist()), q, (2, *rng.integers(3, 301, rng.integers(5, 40)).tolist())) for size in (70, 75, 81)]  # noqa: E501
+        plans = [p.FinitePreferenceBatchPlan(rows[::order], [(0, 1, 2)], normalizers=[(sum(len(r.chosen) - 1 for r in rows), 3, 1)], cycle_length=1, max_seq_length=128, pad_id=0, shared_prompt_ratio=ratio) for order, ratio in ((1, None), (1, 1.0), (1, 1.0), (-1, None))]  # noqa: E501
+    adapters = [module for _, module in mlx_utils.iter_mlx_lora_modules(model)]
+    for adapter in adapters:
+        adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.05
+    assert p.shared_prompt_problem(model, 128) is None
+    split = plans[1].shared_prompt_length(0)
+    length = type(plans[2]).shared_prompt_length
+    monkeypatch.setattr(type(plans[2]), "shared_prompt_length", lambda self, index: split - 16 if self is plans[2] else length(self, index))  # noqa: E501
+    for plan in plans:
+        plan.configure_cce_compaction(kind=kind)
+    reference = {"model": _shrunk_vlm(tmp_path / "ref", family, train_tower=False)[0]} if tower == "ref-model" else {"scales": [(adapter, 0.0) for adapter in adapters]}  # noqa: E501
+    policy = p.ReferencePolicy(**reference) if kind == "dpo" else None
+    objective = p.resolve_preference_objective(kind, beta=0.2, **{"dpo": {"loss_type": ["sigmoid", "ipo"]}, "cpo": {"loss_type": "simpo", "alpha": 0.1}}.get(kind, {}))  # noqa: E501
+    loss = getattr(p, f"make_{kind}_cce_loss_fn")(model, objective, **({"reference_policy": policy} if policy else {}))
+    shared, run_shared = [], p._shared_prompt_hidden
+    monkeypatch.setattr(p, "_shared_prompt_hidden", lambda m, b, prefix: (shared.append(prefix is not None), run_shared(m, b, prefix))[1])  # noqa: E501
+    grad = nn.value_and_grad(model, loss)
+    mx.eval(alone := grad(model, *plans[0].prepare_cce_batch(0, plans[0][0])))
+    if checkpointed:
+        mlx_utils.apply_gradient_checkpointing(model)
+    try:
+        run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state) if compiled else (lambda *b: grad(model, *b))  # noqa: E501
+        towers, vision = [], type(getattr(model, "vision_tower", None))
+        if image:
+            monkeypatch.setattr(vision, "__call__", lambda self, *a, call=vision.__call__, **k: towers.append(1) or call(self, *a, **k))  # noqa: E501
+        mx.eval(together := run(*plans[1].prepare_cce_batch(0, plans[1][0])))
+        assert len(towers) == image * (1 if tower == "frozen" else 2)
+        mx.eval(moved := run(*plans[0].prepare_cce_batch(0, plans[0][0])))  # the per-row path in this run's mode
+    finally:
+        mlx_utils.remove_gradient_checkpointing(model)
+    passes = 1 + (kind == "dpo")
+    assert shared == [False] * passes + [True] * passes + [False] * passes
+    # Within each element's fp32 noise, measured per row (this mode, compiled, pairs reversed): an eager per-row run
+    # repeats bit for bit, so compiling it is the regrouping that sizes its noise. Qwen3.5 adds a capped split term.
+    mx.eval(at_split := grad(model, *plans[1].prepare_cce_batch(0, plans[1][0])), nearby := grad(model, *plans[2].prepare_cce_batch(0, plans[2][0])))  # noqa: E501
+    mx.eval(reordered := grad(model, *plans[3].prepare_cce_batch(0, plans[3][0])))
+    laid = []
+    for compacted in (False, True) if kind != "dpo" else ():  # fixed-shape regression: repeats summed once match
+        plans[1].configure_cce_compaction(compacted, kind=kind)
+        with monkeypatch.context() as patched:
+            patched.setattr(p, "_repeated_prompt_layout", lambda *a, layout=p._repeated_prompt_layout: laid.append(1) or layout(*a))  # noqa: E501
+            mx.eval(once := grad(model, *plans[1].prepare_cce_batch(0, plans[1][0])))
+            engaged, laid[:] = bool(laid), []
+            patched.setattr(p, "_repeated_prompt_span", lambda *_: None)
+            mx.eval(each := grad(model, *plans[1].prepare_cce_batch(0, plans[1][0])))
+        differing = [n for (n, a), (_, b) in zip(tree_flatten(once), tree_flatten(each)) if not mx.array_equal(a, b).item()]  # noqa: E501
+        assert engaged == (family == "gemma4") and not laid and differing == []  # only Gemma 4's head is softcapped
+    mx.eval(regrouped := moved if compiled else mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)(*plans[0].prepare_cce_batch(0, plans[0][0])))  # noqa: E501
+    for (name, want), (_, got), (_, a), (_, b), (_, c), (_, r), (_, g) in zip(*map(tree_flatten, (alone, together, at_split, nearby, moved, reordered, regrouped))):  # noqa: E501
+        noise = mx.maximum(mx.maximum(mx.abs(c - want), mx.abs(r - want)), mx.abs(g - want))
+        bound = 1e-5 + 1e-5 * mx.abs(want) + 16 * noise + noise.max()
+        if family == "qwen3_5":  # the GDN backward sums the rows' prompt cotangents first, which no per-row path does
+            bound = bound + 4 * mx.minimum(mx.abs(a - b), 3e-4 * mx.abs(want))
+        if name == "0.2" and family == "qwen3_5" and kind != "dpo":
+            # ORPO/CPO log logit means over padding too; only the per-row path masks padding out of the GDN scan.
+            padded = [p.PREFERENCE_EVAL_METRICS[kind].index(metric) for metric in ("logits/chosen", "logits/rejected")]
+            bound = mx.where(mx.array([index in padded for index in range(want.size)]), mx.inf, bound)
+        assert mx.abs(want).max().item() > 0 and (mx.abs(got - want) <= bound).all().item(), name
 
 
 @metal_only

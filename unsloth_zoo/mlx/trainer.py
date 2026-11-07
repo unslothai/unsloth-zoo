@@ -632,6 +632,8 @@ from .preference import (
     make_orpo_cce_loss_fn,
     make_preference_eval_fn,
     precompute_reference_logps,
+    shared_prompt_problem,
+    _warn_shared_prompt,
     resolve_preference_objective,
     resolve_preference_length_policy,
     warn_kto_weight_balance,
@@ -1674,6 +1676,8 @@ class MLXTrainingConfig:
             "cpo_alpha",
             "simpo_gamma",
             "alpha",
+            "shared_prompt_forward",
+            "shared_prompt_min_token_ratio",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1741,6 +1745,10 @@ class MLXORPOConfig(MLXTrainingConfig):
     num_generation_prompts: int = field(default=8, kw_only=True)
     generation_max_tokens: int = field(default=128, kw_only=True)
     generation_temperature: float = field(default=0.0, kw_only=True)
+    # Run each pair's shared prompt once for both rows (llama/qwen2/qwen3 text, Qwen3.5/Gemma 4 vision models, CCE head),
+    # in the batches where that cuts the padded tokens by at least shared_prompt_min_token_ratio.
+    shared_prompt_forward: bool = field(default=False, kw_only=True)
+    shared_prompt_min_token_ratio: float = field(default=1.3, kw_only=True)
 
 
 @dataclass(init=False)
@@ -1773,6 +1781,8 @@ class MLXDPOConfig(MLXTrainingConfig):
     num_generation_prompts: int = field(default=8, kw_only=True)
     generation_max_tokens: int = field(default=128, kw_only=True)
     generation_temperature: float = field(default=0.0, kw_only=True)
+    shared_prompt_forward: bool = field(default=False, kw_only=True)
+    shared_prompt_min_token_ratio: float = field(default=1.3, kw_only=True)
 
 
 @dataclass(init=False)
@@ -1864,6 +1874,8 @@ class MLXCPOConfig(MLXTrainingConfig):
     num_generation_prompts: int = field(default=8, kw_only=True)
     generation_max_tokens: int = field(default=128, kw_only=True)
     generation_temperature: float = field(default=0.0, kw_only=True)
+    shared_prompt_forward: bool = field(default=False, kw_only=True)
+    shared_prompt_min_token_ratio: float = field(default=1.3, kw_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2691,6 +2703,46 @@ class MLXTrainer:
             getattr(args, "ref_adapter_name", None),
         )
 
+    def _shared_prompt_ratio(self, args):
+        """A pair plan's shared_prompt_ratio: None unless shared_prompt_forward is on and every forward that scores the
+        pairs can run their prompts once exactly. Once per trainer it warns why not when the option is on, or prints
+        that it would apply when off; with the option off, a model the gate cannot inspect gets no hint, no error."""
+        notices, on = self._shared_prompt_notices, getattr(args, "shared_prompt_forward", False)
+        try:
+            if not args.use_cce:
+                problem = "use_cce=False scores through full logits"
+            elif getattr(self, "distributed_world_size", 1) > 1:
+                problem = "distributed processes split each batch's rows"
+            elif float(getattr(args, "neftune_noise_alpha", 0.0) or 0.0) > 0:
+                problem = "NEFTune draws its noise per row"
+            else:
+                reference = getattr(self, "ref_model", None)
+                dropout = not getattr(args, "disable_dropout", True)
+                problem = next(filter(None, (
+                    shared_prompt_problem(model, args.max_seq_length, lora_dropout=dropout)
+                    for model in (self.model, *(() if reference is None else (reference,)))
+                )), None)
+        except Exception:
+            if on:
+                raise
+            return None
+        if on:
+            if problem is None:
+                return float(args.shared_prompt_min_token_ratio)
+            # Every rank warns, so an "error" filter raises on all of them; noted once delivered; the hint is keyed None.
+            if problem not in notices:
+                kind = self.preference_kind.upper()
+                _warn_shared_prompt(f"Unsloth MLX {kind}: shared_prompt_forward is off, since {problem}.")
+                notices.add(problem)
+        elif problem is None and None not in notices and self.is_main_process:
+            measured = ("0.57-0.71x step time on Qwen3.5-0.8B and Gemma 4 E2B DPO, text and image rows" if self._is_vlm
+                        else "0.63x step time on Qwen3 text DPO")
+            print("Unsloth: shared_prompt_forward=True would run each pair's shared prompt once for both rows, in "
+                  f"batches whose pairs share enough prompt (shared_prompt_min_token_ratio); measured: {measured}, at "
+                  "batch size 4 with 600-word prompts and 40-160-word answers.")
+            notices.add(None)
+        return None
+
     def _preference_vision_options(self):
         """What a preference plan needs to encode rows for a vision-language model."""
         if not self._is_vlm:
@@ -2844,6 +2896,7 @@ class MLXTrainer:
         self._run_generation = 0
         self.stop_requested = False
         self._reset_run_state()
+        self._shared_prompt_notices = set()
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
@@ -7075,6 +7128,8 @@ class MLXTrainer:
                             formatting_func=None,
                             prompt_sink=prompt_sink,
                             images_from=(eval_dataset, self.formatting_func),
+                            shared_prompt_ratio=self._shared_prompt_ratio(args),
+                            shared_prompt_notices=self._shared_prompt_notices,
                             **self._preference_vision_options(),
                         )
                     if is_vlm:
@@ -9398,6 +9453,8 @@ class MLXTrainer:
                 seed=args.seed,
                 append_eos=bool(args.append_eos),
                 formatting_func=self.formatting_func,
+                shared_prompt_ratio=self._shared_prompt_ratio(args),
+                shared_prompt_notices=self._shared_prompt_notices,
                 length_sorted_windows=(
                     not self._is_vlm
                     and _should_length_sort_windows(

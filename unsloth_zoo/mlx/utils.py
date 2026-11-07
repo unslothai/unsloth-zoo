@@ -1133,7 +1133,9 @@ def _patch_layer_class_for_gc(layer_cls):
     def checkpointed_fn(self, *args, **kwargs):
         if _GC_BYPASS_DEPTH.get() and not self.training:
             return fn(self, *args, **kwargs)
-        slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
+        slot = next((a for a in args if isinstance(a, (_SharedKVSlot, _PrefixKVSlot, _PrefixStateSlot))), None)
+        if slot is None and isinstance(kwargs.get("cache"), (_PrefixKVSlot, _PrefixStateSlot)):
+            slot = kwargs["cache"]
         # The VJP recomputes the layer after the loss returned and cleared the padding-free scope.
         layout = _PADDING_FREE_LAYOUT.get()
         if slot is None:
@@ -1178,12 +1180,17 @@ def _patch_layer_class_for_gc(layer_cls):
             kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             with _padding_free_scope(layout):
                 out = fn(self, *args, **kwargs)
-            return out, slot.recorded()
+            # mx.vjp seeds a repeated output with its first cotangent only: K/V also in out (Gemma 4's) cross once.
+            leaves = {id(leaf): index for index, (_, leaf) in enumerate(mlx.utils.tree_flatten(out))}
+            repeated[:] = [leaves.get(id(state)) for state in slot.recorded()]
+            return out, tuple(None if index is not None else state for state, index in zip(slot.recorded(), repeated))
 
+        repeated = []
         args, borrowed = _tie_to_hidden_state(args, slot.borrow())
         out, recorded = mx.checkpoint(inner_fn)(
             self.trainable_parameters(), borrowed, *args, **kwargs)
-        slot.install(recorded)
+        leaves = [leaf for _, leaf in mlx.utils.tree_flatten(out)]
+        slot.install(tuple(state if index is None else leaves[index] for state, index in zip(recorded, repeated)))
         return out
 
     layer_cls.__call__ = checkpointed_fn
@@ -1513,6 +1520,83 @@ def _length_dependent_ropes(backbone):
     """RoPE classes in backbone not known to rotate by position alone."""
     names = {type(module).__name__ for _, module in backbone.named_modules()}
     return sorted(name for name in names if ("RoPE" in name or "Rotary" in name) and name not in _POSITION_ONLY_ROPES)
+
+
+class _PrefixKVSlot:
+    """A layer's cache for a shared-prompt forward. Built without a prefix, it records the prompt's post-RoPE K/V; built
+    from them, it puts the prompt batch, repeated repeats times as a preference batch holds every chosen row before any
+    rejected one, ahead of its rows' own K/V at offset = prompt length, so attention applies RoPE there and a
+    bottom-right causal mask. Re-runnable under mx.checkpoint."""
+
+    __slots__ = ("keys", "values", "offset", "repeats", "recording")
+    borrow, install, recorded = _SharedKVSlot.borrow, _SharedKVSlot.install, _SharedKVSlot.recorded
+
+    def __init__(self, prefix=None, repeats=1):
+        self.keys, self.values = (None, None) if prefix is None else prefix
+        self.offset = 0 if prefix is None else prefix[0].shape[-2]
+        self.repeats, self.recording = repeats, prefix is None
+
+    def update_and_fetch(self, keys, values):
+        if self.recording:
+            self.keys, self.values = keys, values
+            return keys, values
+        return tuple(
+            mx.concatenate([mx.concatenate([prefix] * self.repeats), own], axis=-2)
+            for prefix, own in ((self.keys, keys), (self.values, values))
+        )
+
+    def make_mask(self, N, return_array=False, window_size=None):
+        if window_size is None and not return_array:
+            return "causal" if N > 1 else None
+        queries, keys = mx.arange(self.offset, self.offset + N)[:, None], mx.arange(self.offset + N)[None]
+        mask = queries >= keys
+        return mask if window_size is None else mask & (queries < keys + window_size)
+
+
+class _PrefixStateSlot:
+    """_PrefixKVSlot for a linear-attention layer (mlx-vlm's ArraysCache protocol): it records the prompt's final conv
+    window and recurrent state, or starts every row from them. Unslotted, since mlx-vlm tags caches with metadata."""
+
+    lengths = None
+
+    def __init__(self, prefix=None, repeats=1):
+        self.cache = [None, None] if prefix is None else list(prefix)
+        self.repeats, self.recording = repeats, prefix is None
+
+    def borrow(self):
+        return None if self.cache[0] is None else tuple(self.cache)
+
+    def install(self, borrowed):
+        # A checkpoint recompute must not start the prompt's recording pass from the state it recorded.
+        self.cache = [None, None] if borrowed is None else list(borrowed)
+
+    def recorded(self):
+        return tuple(self.cache)
+
+    def __getitem__(self, index):
+        state = self.cache[index]
+        return state if self.recording or state is None else mx.concatenate([state] * self.repeats)
+
+    def update_window(self, index, source, width, *, lengths=None):
+        if self.recording:
+            self.cache[index] = source[:, source.shape[1] - width:]
+
+    def update_recurrent(self, index, length, update):
+        output, state = update(self[index], None)[:2]
+        if self.recording:
+            self.cache[index] = state
+        return output, state
+
+
+def _prefix_cache(backbone, recorded=None, repeats=1):
+    """Recording slots for backbone's layers, or slots extending recorded; None where gemma4 reads another layer's K/V."""
+    if recorded is not None:
+        return [None if slot is None else type(slot)(slot.recorded(), repeats) for slot in recorded]
+    sources = getattr(backbone, "previous_kvs", None) or range(len(backbone.layers))
+    return [
+        None if source != index else _PrefixStateSlot() if getattr(layer, "is_linear", False) else _PrefixKVSlot()
+        for index, (layer, source) in enumerate(zip(backbone.layers, sources))
+    ]
 
 
 # Language models that scale token embeddings by sqrt(hidden_size) on the ids path only, so multimodal forwards lose the
@@ -3463,7 +3547,7 @@ def _padding_free_vlm_inputs(inputs, embeds, kwargs, layout):
     return flat(inputs), flat(embeds), kwargs
 
 
-def _vlm_hidden_states(model, batch_dict):
+def _vlm_hidden_states(model, batch_dict, cache=None):
     """Pre-lm_head hidden states for every position of a collated VLM batch dict; inside a padding-free scope, for
     the flat stream's tokens, with the vision tower and the merge still run on the padded rows."""
     input_ids = batch_dict["input_ids"]
@@ -3523,7 +3607,7 @@ def _vlm_hidden_states(model, batch_dict):
     ):
         backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 
-    shared_kv = _build_shared_kv_caches(model)
+    shared_kv = _build_shared_kv_caches(model) if cache is None else cache
     if shared_kv is not None:
         backbone_kwargs["cache"] = shared_kv
     layout = _PADDING_FREE_LAYOUT.get()
