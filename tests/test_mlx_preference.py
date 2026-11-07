@@ -1303,7 +1303,7 @@ def test_a_precomputed_reference_scores_through_the_cce_scorer(monkeypatch):
     plan = build_plan(dataset=rows(5), num_batches=3)
     calls = []
 
-    def scorer(model, batch, supervised, indices=None):
+    def scorer(model, batch, supervised, indices=None, **_):
         calls.append(indices)
         ce = batch[:, 1:].astype(mx.float32) * supervised
         return ce, mx.zeros(ce.shape)
@@ -1693,6 +1693,99 @@ def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, s
         )
         with pytest.raises(ValueError, match=match):
             _run_generation_trainer(trainer, monkeypatch, [])
+
+
+def _owned_scorers(monkeypatch, value=lambda model: 0.0):
+    """Stand-in CCE scorers that remember the model they were built for and score ``value(model)`` per position."""
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference
+
+    def make(model, temperature=1.0):
+        def score(_model, batch, supervised, indices=None, *, differentiated=True, **_):
+            make.calls.append((model, differentiated))
+            ce = supervised.astype(mx.float32) * (value(model) * temperature)
+            return ce, ce * 0.0
+        score.owner, score.vocab, score.compaction = model, 64, False
+        return score
+
+    make.calls = []
+    monkeypatch.setattr(preference, "_make_preference_cce_scorer", make)
+    return make
+
+
+def test_the_trainer_precomputes_a_reference_model_through_its_own_scorer(tmp_path, monkeypatch):
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    _owned_scorers(monkeypatch)
+    owners, precompute = [], trainer_module.precompute_reference_logps
+    monkeypatch.setattr(trainer_module, "precompute_reference_logps", lambda plan, model, policy, **kwargs: (
+        owners.append(kwargs["scorer"].owner), precompute(plan, model, policy, **kwargs))[1])
+    reference = _tiny_model(tail=True)
+    trainer = MLXDPOTrainer(
+        _tiny_model(tail=True), Tokenizer(), rows(3), eval_dataset=rows(2), ref_model=reference,
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, precompute_ref_log_probs=True, generate_during_eval=False, force_use_ref_model=True)))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    # The training and the evaluation tables, each scored by the reference model's own scorer.
+    assert owners == [reference, reference]
+
+
+def test_grpo_scores_a_reference_model_through_its_own_scorer(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import grpo, preference
+
+    policy, reference = TinyModel(), TinyModel()
+    make = _owned_scorers(monkeypatch, lambda model: 1.0 if model is reference else 2.0)
+    plan = types.SimpleNamespace(with_reference=True, score_temperature=0.5)
+    held = preference.ReferencePolicy(model=reference)
+    grpo.GRPOBatchPlan.bind(plan, policy, [], trainer_state=None, reference_policy=held,
+                            scorer=make(policy, temperature=0.5))
+    tokens, lengths = mx.array([[1, 2, 3]]), mx.array([[1, 3]])
+    assert plan._logps(policy, tokens, lengths).tolist() == [[-1.0, -1.0]]
+    # The reference model's own scorer, at the scoring temperature.
+    assert held.forward(policy, tokens, lengths, response_scorer=plan._reference_logps).tolist() == [[-0.5, -0.5]]
+    # Neither pass is differentiated, so neither takes the training kernel.
+    assert make.calls == [(policy, False), (reference, False)]
+
+
+@pytest.mark.parametrize("kind", ["dpo", "kto", "grpo"])
+def test_a_reference_model_scores_live_through_its_own_scorer(tmp_path, monkeypatch, kind):
+    # GRPO's rollout and DPO/KTO evaluation score a separate ref_model through its own scorer, not the policy's or dense.
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer, MLXGRPOTrainer, MLXKTOConfig, MLXKTOTrainer
+
+    make, evaluated = _owned_scorers(monkeypatch), []
+    build = trainer_module.make_preference_eval_fn
+
+    def watched(*args, **kwargs):
+        fn = build(*args, **kwargs)
+
+        def eval_fn(*inner, **options):
+            start = len(make.calls)
+            out = fn(*inner, **options)
+            evaluated.extend(make.calls[start:])
+            return out
+        eval_fn.__dict__.update(fn.__dict__)
+        return eval_fn
+    monkeypatch.setattr(trainer_module, "make_preference_eval_fn", watched)
+    policy, reference = _tiny_model(tail=True), _tiny_model(tail=True)
+    common = dict(compile=False, generate_during_eval=False)
+    if kind == "grpo":
+        monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", make)
+        trainer = MLXGRPOTrainer(policy, DecodingTokenizer(), _grpo_rows(), args=_grpo_config(
+            tmp_path, compile=False, beta=0.04, use_cce=True), reward_funcs=lambda completions, **_: [0.0] * len(completions))
+        trainer.ref_model = reference  # GRPO reads it as an attribute; TRL's GRPOTrainer takes no ref_model
+    elif kind == "dpo":
+        trainer = MLXDPOTrainer(policy, Tokenizer(), rows(3), eval_dataset=rows(2), ref_model=reference,
+                                args=MLXDPOConfig(**_generation_common(tmp_path, force_use_ref_model=True, **common)))
+    else:
+        trainer = MLXKTOTrainer(policy, Tokenizer(), kto_rows(4), eval_dataset=kto_rows(4), ref_model=reference,
+                                args=MLXKTOConfig(**_generation_common(tmp_path, **common)))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    # GRPO scores its reference only in the rollout; evaluation scores it live, each through ref_model's own scorer.
+    scored = make.calls if kind == "grpo" else evaluated
+    assert (reference, False) in scored and all(owner is reference for owner, _ in scored if owner is not policy)
 
 
 @pytest.mark.parametrize("sampling", [False, True])
@@ -2870,6 +2963,36 @@ def test_a_kto_batch_holds_completions_then_kl_rows_and_their_reference(with_kl)
     assert plan[1][4].tolist() == [len(third.sequence)] + ([len(third.kl)] if with_kl else [])
 
 
+def test_kto_compaction_indexes_each_rows_completion_and_kl_positions():
+    from unsloth_zoo.mlx.preference import FiniteKTOBatchPlan, TokenizedKTORow
+
+    rows = [TokenizedKTORow((1,) * (100 + 7 * i), (2,) * (40 + 9 * i), True, (1,) * (90 - i), (3,) * (30 + i))
+            for i in range(2)] + [TokenizedKTORow((), (2,) * 20, False, (), (3,) * 25)]
+    plan = FiniteKTOBatchPlan(rows, [(0, 1, 2)], with_kl=True, normalizers=[(0, 3, 1)], cycle_length=1,
+                              max_seq_length=256, pad_id=0)
+    plan.configure_cce_compaction()
+    *head, reference, completion, kl = plan.prepare_cce_batch(0, plan[0])
+    width = head[0].shape[1]
+    # Each row's own prompt length, and each half's own grid; an empty prompt starts at the first next-token position.
+    steps = lambda spans, width=width: [
+        row * (width - 1) + step - 1 for row, span in enumerate(spans) for step in range(*span)]
+    spans = [(100, 140), (107, 156), (1, 20)], [(90, 120), (89, 120), (1, 25)]
+    assert len(head) == 4 and reference is None and completion.shape == kl.shape == (256,)
+    assert [[i for i in half.tolist() if i >= 0] for half in (completion, kl)] == [steps(half) for half in spans]
+    # The shape plan's endpoint width is planned too.
+    plan.set_shape_plan(types.SimpleNamespace(report=types.SimpleNamespace(action="bucket"),
+                                              endpoint_for=lambda family, raw: raw + 32))
+    plan.configure_cce_compaction()
+    padded = plan.prepare_cce_batch(0, plan.materialize(0, phase="train"))
+    assert padded[0].shape[1] == width + 32 and len(padded) == 7
+    assert [[i for i in half.tolist() if i >= 0] for half in padded[5:]] == [steps(half, width + 32) for half in spans]
+    # A grid with fewer positions than one capacity stays uncompacted.
+    small = FiniteKTOBatchPlan(rows[2:], [(0,)], with_kl=True, normalizers=[(0, 1, 1)], cycle_length=1,
+                               max_seq_length=256, pad_id=0)
+    small.configure_cce_compaction()
+    assert len(small.prepare_cce_batch(0, small[0])) == 4
+
+
 @pytest.mark.parametrize("labels,weights,warns", [
     ([True] * 3 + [False], (1.0, 1.0), True),
     ([True] * 3 + [False], (0.4, 1.0), False),
@@ -3198,7 +3321,7 @@ def test_a_vision_plan_repeats_the_pixels_for_both_branches():
     assert text.chosen == tokenize_preference_row(
         Tokenizer(), text_row, length_policy=policy()).chosen
     assert batch["input_ids"][1, :len(text.chosen)].tolist() == list(text.chosen)
-    assert batch["pixel_values"].tolist() == [[4.0], [4.0]]
+    assert batch["pixel_values"].tolist() == [[4.0], [4.0]] and batch["_unsloth_image_copies"] == 2
     types = batch["token_type_ids"].tolist()
     assert types[0][:21] == types[2][:21] == list(image.chosen_prompt_arrays[0][1])
     assert not any(types[1] + types[3])
@@ -3445,9 +3568,12 @@ def test_a_vision_kto_plan_follows_trls_vision_collator():
     # KL pairs roll within the batch, not within kl_batch_size chunks.
     assert [row.kl for row in made.rows] == [
         prompt + answers[2][:3], encode("q") + answers[0], prompt + answers[1][:3]]
-    batch, _, _, labels = made[0]
-    assert batch["pixel_values"].tolist() == [[4.0]] * 4 and labels.tolist() == [True, False, False]
-    assert [sum(row) for row in batch["token_type_ids"].tolist()] == [2, 0, 2, 2, 0, 2]
+    batch, _, _, labels, *_, kl = made[0]
+    # The KL rows share their row's prompt and images, in a dict of their own.
+    assert batch["pixel_values"].tolist() == kl["pixel_values"].tolist() == [[4.0]] * 2
+    assert labels.tolist() == [True, False, False]
+    assert [sum(row) for part in (batch, kl) for row in part["token_type_ids"].tolist()] == [2, 0, 2, 2, 0, 2]
+    assert [ids[:len(row.kl)] for ids, row in zip(kl["input_ids"].tolist(), made.rows)] == [list(row.kl) for row in made.rows]
     single = plan([{**text, "image": kto_vision_row("")["images"][0], "prompt": "<img>q"}], with_kl=False)
     assert single.rows[0].prompt_ids == (60, 61, *encode("q")) and single[0][0]["pixel_values"].size
     turns = plan([{**kto_vision_row("yes"), "prompt": [{"role": "user", "content": "hi"}, *tail]} for tail in (  # as TRL 1.13
@@ -3458,12 +3584,31 @@ def test_a_vision_kto_plan_follows_trls_vision_collator():
     parts = _with_trl_image_parts({**kto_vision_row("yes"), "prompt": [{"role": "system", "content": "s"}, *({"role": "user", "content": t} for t in ("hi", "u"))]})
     assert [m["content"] for m in parts["prompt"] + parts["completion"]] == [
         [text_part("s")], [{"type": "image"}, text_part("hi")], [text_part("u")], [text_part("yes")]]
-    scorer = types.SimpleNamespace(forward=lambda _, batch, n: mx.full(n.shape[:1], float("pixel_values" in batch)))
+    scorer = types.SimpleNamespace(forward=lambda _, batch, n: mx.full(batch["input_ids"].shape[:1], float("pixel_values" in batch)))
     assert precompute_reference_logps(made, None, scorer, batch_size=3).tolist() == [[1, 1]] * 3
     with pytest.raises(ValueError, match="row 0 .* no completion token"):
         plan([kto_vision_row("yes")], max_length=len(prompt))
     with pytest.raises(ValueError, match="row 1 .* decides from the first row"):
         plan([{key: value for key, value in text.items() if key != "images"}, kto_vision_row("yes")])
+
+
+def test_a_surveyed_vision_kto_plan_compacts_like_its_text_layout():
+    # KTO admission sizes a batch by its labels' row count, also once a vision plan appends its surveyed family.
+    from unsloth_zoo.mlx.preference import create_kto_batch_plan
+
+    def admitted(sizes):
+        made = create_kto_batch_plan(
+            [kto_vision_row("y" * size, label=size != 4) for size in sizes], None, batch_size=4, kl_batch_size=4,
+            num_epochs=1, grad_accum=1, length_policy=policy("kto", max_length=160, max_prompt_length=8, max_seq_length=162),  # noqa: E501
+            processor=VisionProcessor(), model_config={})
+        made.configure_cce_compaction()
+        text = list(made._cce_capacities.values())
+        made.ensure_descriptors()
+        made.configure_cce_compaction()
+        assert list(made._cce_capacities.values()) == text and all(len(family) == 6 for family, _ in made._cce_capacities)  # noqa: E501
+        return text
+    # 4 rows of 159 next-token positions: 512 slots per half are under that grid, 768 are not.
+    assert admitted((150, 100, 100, 4)) == [(512, 512)] and admitted((150, 150, 150, 150)) == []
 
 
 def test_a_vision_kto_row_keeps_the_whole_length_budget():
@@ -3486,7 +3631,7 @@ def test_a_vision_kto_row_keeps_the_whole_length_budget():
     assert build([{"prompt": "q", "completion": "a", "label": True}]).rows[0].completion_ids
 
 
-def test_a_vision_kto_batch_scores_its_kl_rows_in_the_same_forward():
+def test_a_vision_kto_batch_scores_its_kl_rows_in_their_own_forward():
     import numpy as np
     import mlx.core as mx
     from unsloth_zoo.mlx.preference import (
@@ -3501,30 +3646,42 @@ def test_a_vision_kto_batch_scores_its_kl_rows_in_the_same_forward():
         def __call__(self, tokens):
             return super().__call__(tokens) * self.scale
 
-    models = [(Scaled(), type("ScaledVision", (VisionModel, Scaled), {})()) for _ in range(2)]
+    sizes = []
+
+    class ScaledVision(VisionModel, Scaled):
+        def __call__(self, tokens, *args, **kwargs):
+            sizes.append(tokens.shape[0])
+            return super().__call__(tokens, *args, **kwargs)
+
+    models = [(Scaled(), ScaledVision()) for _ in range(2)]
     for text, vision in models:
         vision.embedding, vision.output = text.embedding, text.output
 
-    def run(side, batch):
+    def run(side, batch, *kl):
         policy, reference = (pair[side] for pair in models)
-        fn = make_kto_loss_fn(objective, reference_policy=ReferencePolicy(model=reference))
+        # Shifted so the clamp keeps the raw KL estimate in the stats.
+        fn = make_kto_loss_fn(objective, reference_policy=ReferencePolicy(model=reference), kl_mean=lambda kl: kl + 100)
 
         def loss(scale):
             policy.scale = scale
-            return fn(policy, batch, *rest)[0]
+            return fn(policy, batch, *rest, *kl)[0]
 
         # The KL rows add nothing to the gradient, as under TRL's no_grad.
         gradient = mx.grad(loss)(mx.array(1.5))
         policy.scale = 1.5
-        return [*fn(policy, batch, *rest)[::2], gradient]
+        return [*fn(policy, batch, *rest, *kl)[::2], gradient]
 
-    text, vision = run(0, ids), run(1, {"input_ids": ids, "pixel_values": "pixels"})
+    half = lambda rows: {"input_ids": rows, "pixel_values": "pixels"}
+    text, vision = run(0, ids), run(1, half(ids[:3]), None, None, None, half(ids[3:]))
+    # Policy and reference forwards alike see one half at a time.
+    assert sizes and set(sizes) == {3}
     for expected, got in zip(text, vision):
         assert np.allclose(np.asarray(got.tolist()), np.asarray(expected.tolist()), rtol=1e-5)
     assert float(text[-1]) != 0
 
 
-def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypatch, tmp_path):
+@pytest.mark.parametrize("mode, seen", [("all", 132), ("non_padding", 94)])
+def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypatch, tmp_path, mode, seen):
     from mlx_vlm import prompt_utils
     from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
     monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_a, **_k: None, raising=False)
@@ -3541,9 +3698,12 @@ def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
         Model(), VisionProcessor(), [kto_vision_row("yes"), kto_vision_row("no", False)],
         eval_dataset=split, args=MLXKTOConfig(**_generation_common(
             tmp_path, generate_during_eval=False, precompute_ref_log_probs=True)))
+    run.args.include_num_input_tokens_seen = mode
     assert _run_generation_trainer(run, monkeypatch, [])["train_steps"] == 1
-    # Training, evaluation, and the reference precomputed for each; the rest are probes.
-    assert sum(Model.pixels) == 4 and [reader is not None for reader in readers] == [False, True]
+    # Both halves' rows count, as when one dict held them: 2 x 2 x 33 positions, 94 of them not padding.
+    assert run.state.num_input_tokens_seen == seen
+    # Training, evaluation, and the reference precomputed for each, the KL rows in forwards of their own; the rest are probes.
+    assert sum(Model.pixels) == 8 and [reader is not None for reader in readers] == [False, True]
 
 
 def test_cpo_trains_and_evaluates_text_rows_on_a_vision_language_model(monkeypatch, tmp_path):
@@ -4378,7 +4538,7 @@ def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, 
     from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
 
     built = []  # a CCE scorer scoring 0: any log-prob taken off the logits instead makes kl nonzero
-    monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", lambda model, temperature: built.append(temperature) or (lambda model, batch, supervised, logit_sums: (supervised * 0.0, None)))  # noqa: E501
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", lambda model, temperature: built.append(temperature) or (lambda model, batch, supervised, logit_sums, **_: (supervised * 0.0, None)))  # noqa: E501
 
     modes = []
     monkeypatch.setattr("unsloth_zoo.mlx.grpo._scored_as_step", lambda logps, step_compiled, scored=grpo_module._scored_as_step: scored(logps, lambda: modes.append(step_compiled()) or modes[-1]))  # noqa: E501

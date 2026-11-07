@@ -1472,7 +1472,7 @@ def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch, pack
         assert mx.allclose(expected, actual, atol=1e-5, rtol=1e-3).item()
     score = preference._make_preference_cce_scorer(model)
     supervised = mx.arange(64)[None] < lengths[:, 1:] - 1
-    ce, _ = score(model, ids, supervised)
+    ce, _ = score(model, ids, supervised, differentiated=False)
     logits = model(ids[:, :-1]).astype(mx.float32)
     dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="none")
     assert mx.allclose(ce, dense * supervised, atol=1e-4, rtol=1e-4).item()
@@ -2259,12 +2259,19 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
     assert reloaded._unsloth_reloaded_parameter_keys == aux
 
 
-def _record_cce_rows(monkeypatch):
+def _record_cce_rows(monkeypatch, flags=None):
+    """Kernel rows per call; ``flags`` also gets whether that kernel builds the hidden gradient in its forward."""
     rows, original = [], mlx_utils._get_runtime_cce
 
     def factory(**kwargs):
-        runtime = original(**kwargs)
-        return lambda hidden, *args: (rows.append(hidden.shape[0]), runtime(hidden, *args))[1]
+        runtime, precomputes = original(**kwargs), kwargs.get("precompute_hidden_gradient", False)
+
+        def recorded(hidden, *args):
+            rows.append(hidden.shape[0])
+            if flags is not None:
+                flags.append(precomputes)
+            return runtime(hidden, *args)
+        return recorded
 
     monkeypatch.setattr(mlx_utils, "_get_runtime_cce", factory)
     return rows
@@ -2280,7 +2287,8 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
     from unsloth_zoo.mlx import preference as p
     from mlx_lm.tuner.lora import LoRAEmbedding
     mx.random.seed(937)
-    kernel_rows, calls = _record_cce_rows(monkeypatch), []
+    flags = []
+    kernel_rows, calls = _record_cce_rows(monkeypatch, flags), []
     model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
                             softcap=0.5 if head == "softcap" else 0.0)
     policy = None
@@ -2321,13 +2329,15 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
         expected = nn.value_and_grad(model, dense if dtype == "float32" else loss)(model, *batch)
         mx.eval(expected)
         calls.clear()
-        del kernel_rows[eager_rows:]
+        del kernel_rows[eager_rows:], flags[eager_rows:]
         actual = run(*compact)
         mx.eval(actual)
         assert "model" not in calls
         capacity = compact[3].shape[0]
         assert capacity < batch[0].shape[0] * (batch[0].shape[1] - 1)
         assert kernel_rows == [capacity] * (2 if reference and kind == "dpo" else 1)
+        # Only the policy pass builds the hidden gradient in the forward, and only for a frozen head.
+        assert flags == [reference or head == "quantized"] + [False] * (len(flags) - 1)
         for want, got in zip(expected[0], actual[0]):
             atol = 1e-4
             if dtype == "float32" and want.ndim:
@@ -2341,6 +2351,11 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
             assert mx.allclose(want, got, atol=2e-5, rtol=rtol).item()
         if reference:
             assert adapter.scale == 2.0
+    # Evaluation in training mode keeps every pass on the loss-only kernel.
+    del flags[:]
+    mx.eval(p.make_preference_eval_fn(objective, reference_policy=policy, model=model)(
+        model, *plan.prepare_cce_batch(0, plan[0])))
+    assert flags and not any(flags)
 
 
 @metal_only
@@ -2401,17 +2416,20 @@ def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
     seen, build = [], utils._get_runtime_cce
     monkeypatch.setattr(utils, "_get_runtime_cce", lambda **kw: seen.append(kw) or build(**kw))
     assert p._make_preference_cce_scorer(model) is not None
-    assert [kw["weight_is_frozen"] for kw in seen] == [frozen]
+    assert {kw["weight_is_frozen"] for kw in seen} == {frozen}
+    # A trainable head has no forward-built hidden gradient to select.
+    assert sum(kw.get("precompute_hidden_gradient", False) for kw in seen) == frozen
 
 
 @metal_only
 @pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
 @pytest.mark.parametrize("loss_type", ["kto", "apo_zero_unpaired"])
-def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
+def test_kto_cce_scores_hidden_states_like_the_logits(monkeypatch, head, loss_type):
     from unsloth_zoo.mlx import preference as p
     from mlx_lm.tuner.lora import LoRAEmbedding
     mx.random.seed(941)
-    calls = []
+    calls, flags = [], []
+    kernel_rows = _record_cce_rows(monkeypatch, flags)
     model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
                             softcap=0.5 if head == "softcap" else 0.0)
     adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
@@ -2427,14 +2445,20 @@ def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
     objective = p.resolve_preference_objective("kto", beta=0.2, loss_type=loss_type)
     plan = p.FiniteKTOBatchPlan(rows, [(0, 1, 2, 3)], with_kl=objective.with_kl,
                                 normalizers=[(0, 4, 1)], cycle_length=1, max_seq_length=128, pad_id=0)
+    plan.configure_cce_compaction()
+    compact = plan.prepare_cce_batch(0, plan[0])
     dense = nn.value_and_grad(model, p.make_kto_loss_fn(objective, reference_policy=reference))
     grad = nn.value_and_grad(model, p.make_kto_cce_loss_fn(model, objective, reference_policy=reference))
     mx.eval(expected := dense(model, *plan[0]))
     calls.clear()
     run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
-    mx.eval(actual := run(*plan[0]))
-    # The KL rows and the reference score through the kernel, not the logits.
+    mx.eval(actual := run(*compact))
+    # The KL rows and the reference score through the kernel, not the logits, each on its compacted rows.
     assert "model" not in calls and adapter.scale == 2.0
+    assert compact[0].shape == (4 * (1 + objective.with_kl), 97)
+    assert kernel_rows == [256, 256 * (1 + objective.with_kl)] + [256] * objective.with_kl
+    # The policy pass, then the reference and KL passes, which take no gradient.
+    assert flags == [True, False, False][:2 + objective.with_kl]
     for want, got in zip(expected[0], actual[0]):
         assert mx.allclose(want, got, atol=1e-4, rtol=1e-5).item()
     for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
@@ -2442,16 +2466,61 @@ def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
     scorer = p.make_kto_cce_loss_fn(model, objective, reference_policy=reference)._unsloth_cce_scorer
     want = p.precompute_reference_logps(plan, model, reference, batch_size=4)
     calls.clear()
+    flags.clear()
     got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=scorer)
     assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
+    evaluate = p.make_preference_eval_fn(objective, reference_policy=reference, model=model)
+    assert evaluate._unsloth_cce_compaction and evaluate._unsloth_cce_kind == "kto"
+    dense_eval = p.make_preference_eval_fn(objective, reference_policy=reference)(model, *plan[0])
+    assert all(mx.allclose(w, g, atol=1e-4, rtol=1e-5).item() for w, g in zip(dense_eval, evaluate(model, *compact)))
+    # Both run while the model trains.
+    assert flags and not any(flags)
 
+
+@metal_only
+@pytest.mark.parametrize("kind", ["dpo", "kto"])
+def test_a_reference_model_scores_through_its_own_cce_kernel(kind):
+    from unsloth_zoo.mlx import preference as p
+    mx.random.seed(953)
+    calls = []
+    # A dense reference head the policy's quantized kernel could not read.
+    model = _cce_text_model(2053, 64, quantized=True, calls=calls)
+    reference = p.ReferencePolicy(model=_cce_text_model(2053, 64, quantized=False, calls=calls))
+    rows = []
+    for i in range(4):
+        chosen = tuple((j * 7 + i) % 2053 for j in range(301 + i))
+        rejected = tuple((j * 11 + i) % 2053 for j in range(287 + i))
+        rows.append(p.TokenizedPreferenceRow(chosen[:250 + i], chosen[250 + i:], rejected[:251 - i], rejected[251 - i:]))
+    options = dict(normalizers=[(0, 4, 1)], cycle_length=1, max_seq_length=320, pad_id=0)
+    plan = p.FinitePreferenceBatchPlan(rows, [(0, 1, 2, 3)], **options) if kind == "dpo" else p.FiniteKTOBatchPlan([
+        p.TokenizedKTORow(r.chosen_prompt_ids, r.chosen_ids, i % 2 == 0, r.rejected_prompt_ids, r.rejected_ids)
+        for i, r in enumerate(rows)], [(0, 1, 2, 3)], with_kl=True, **options)
+    plan.configure_cce_compaction(kind=kind)
+    objective = p.resolve_preference_objective(kind, beta=0.2, loss_type="sigmoid" if kind == "dpo" else "kto")
+    loss = getattr(p, f"make_{kind}_cce_loss_fn")(model, objective, reference_policy=reference)
+    assert loss._unsloth_cce_reference_scorer not in (None, loss._unsloth_cce_scorer)
+    dense = getattr(p, f"make_{kind}_loss_fn")(objective, reference_policy=reference)
+    expected = nn.value_and_grad(model, dense)(model, *plan[0])
+    mx.eval(expected)
+    calls.clear()
+    actual = nn.value_and_grad(model, loss)(model, *plan.prepare_cce_batch(0, plan[0]))
+    mx.eval(actual)
+    assert "model" not in calls
+    flat = lambda out: [out[0][0], *(value for _, value in tree_flatten(out[1]))]
+    assert all(mx.allclose(want, got, atol=2e-5, rtol=2e-4).item() for want, got in zip(flat(expected), flat(actual)))
+    want = p.precompute_reference_logps(plan, model, reference, batch_size=4)
+    calls.clear()
+    got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=loss._unsloth_cce_reference_scorer)
+    assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
 
 
 @metal_only
 @pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
-def test_grpo_cce_scores_like_the_logits(head):
+def test_grpo_cce_scores_like_the_logits(monkeypatch, head):
+    from types import SimpleNamespace
     from unsloth_zoo.mlx import grpo as g
     mx.random.seed(947)
+    _record_cce_rows(monkeypatch, flags := [])
     calls, objective = [], g.GRPOObjective(beta=0.04, temperature=0.7, max_completion_length=40)
     model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls, softcap=0.5 if head == "softcap" else 0.0)
     tokens = (mx.arange(4 * 48).reshape(4, 48) * 7 + 3) % 2053
@@ -2464,6 +2533,15 @@ def test_grpo_cce_scores_like_the_logits(head):
     assert ("model" in calls) is (head == "softcap") is (cce._unsloth_grpo_scorer is None)  # a softcap keeps the logits
     flat = lambda out: [*out[0], *(value for _, value in tree_flatten(out[1]))]
     assert all(mx.allclose(want, got, atol=1e-4, rtol=2e-4).item() for want, got in zip(flat(expected), flat(actual)))
+    assert flags == [head == "quantized"] * (head != "softcap")
+    plan = SimpleNamespace(with_reference=False, score_temperature=0.7)
+    g.GRPOBatchPlan.bind(plan, model, [], trainer_state=None, scorer=cce._unsloth_grpo_scorer)
+    # Old-policy and evaluation scores, taken while the model trains, keep the loss-only kernel.
+    mx.eval(plan._logps(model, tokens, batch[1]), g.make_grpo_eval_fn(objective, scorer=cce._unsloth_grpo_scorer)(model, *batch))
+    assert not any(flags[1:])
+    # Equal to the step's log-probs bit for bit, so a first iteration's ratio is exactly 1.
+    step = g.grpo_logps(0.7, cce._unsloth_grpo_scorer, differentiated=True)(model, tokens, batch[1])
+    assert mx.array_equal(step, plan._logps(model, tokens, batch[1])).item()
 
 
 @metal_only

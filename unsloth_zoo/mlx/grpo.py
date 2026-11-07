@@ -33,7 +33,7 @@ from . import generate as generate_module
 from .generate import GenerationDefaults, GenerationRequest, SamplingParams
 from .preference import (
     _VLM_TOKEN_SPAN_KEYS, _chat_template, _make_preference_cce_scorer, _preference_ids,
-    _preference_logits, _response_mask, _supervised_tokens,
+    _preference_logits, _reference_scorer, _response_mask, _supervised_tokens,
 )
 from .utils import (
     _RAW_INPUT_IDS_FOR_LABELS,
@@ -207,14 +207,14 @@ def completion_logps(model, batch, temperature):
     return -_row_contiguous_cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
 
 
-def grpo_logps(temperature, scorer=None):
-    """(model, batch, lengths) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature; scores response positions only, zero elsewhere."""
+def grpo_logps(temperature, scorer=None, *, differentiated):
+    """(model, batch, lengths) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature; scores response positions only, zero elsewhere; differentiated=False keeps the scorer on its loss-only kernel."""
     if scorer is None:
         return lambda model, batch, _lengths: completion_logps(model, batch, temperature)
 
     def logps(model, batch, lengths):
         supervised = _response_mask(_preference_ids(batch)[:, 1:], lengths) > 0
-        return -scorer(model, batch, supervised, logit_sums=False)[0]
+        return -scorer(model, batch, supervised, logit_sums=False, differentiated=differentiated)[0]
 
     return logps
 
@@ -307,9 +307,9 @@ def grpo_metric_values(summed):
     return values
 
 
-def make_grpo_loss_fn(objective, *, scorer=None):
+def make_grpo_loss_fn(objective, *, scorer=None, differentiated=True):
     """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps); kept zeroes rows TRL masks as truncated."""
-    logps = grpo_logps(objective.temperature, scorer)
+    logps = grpo_logps(objective.temperature, scorer, differentiated=differentiated)
 
     def loss_fn(model, batch, lengths, normalizers, advantages, kept, old=None, ref=None):
         new = logps(model, batch, lengths)
@@ -339,7 +339,7 @@ def make_grpo_cce_loss_fn(model, objective):
 
 def make_grpo_eval_fn(objective, *, scorer=None):
     """The GRPO loss of one eval batch, weighted by its rows as HF's ``eval_loss``."""
-    loss_fn = make_grpo_loss_fn(objective, scorer=scorer)
+    loss_fn = make_grpo_loss_fn(objective, scorer=scorer, differentiated=False)
 
     def eval_fn(model, batch, *rest):
         loss, _, stats = loss_fn(model, batch, *rest)
@@ -771,9 +771,12 @@ class GRPOBatchPlan:
         self._trainer_state = trainer_state
         self._rollout_context = rollout_context or nullcontext
         self._keep_completions = keep_completions
-        self._logps = grpo_logps(self.score_temperature, scorer)
+        self._logps = grpo_logps(self.score_temperature, scorer, differentiated=False)
+        self._reference_logps = grpo_logps(self.score_temperature, _reference_scorer(
+            reference_policy, scorer, temperature=self.score_temperature), differentiated=False)
         if step_compiled is not None:
             self._logps = _scored_as_step(self._logps, step_compiled)
+            self._reference_logps = _scored_as_step(self._reference_logps, step_compiled)
 
     def start_at(self, visit):
         """Count generations from ``visit``, the first micro-step a run fetches."""
@@ -947,7 +950,7 @@ class GRPOBatchPlan:
         if self.with_reference:
             ref = self._score(
                 lambda batch, lengths: self._reference_policy.forward(
-                    self._model, batch, lengths, response_scorer=self._logps,
+                    self._model, batch, lengths, response_scorer=self._reference_logps,
                 ),
                 sequences, prompt_lengths, media, held,
             )

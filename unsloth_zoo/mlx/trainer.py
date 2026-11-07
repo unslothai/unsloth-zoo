@@ -1313,9 +1313,14 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
         attention_mask = batch_data.get("attention_mask")
     elif isinstance(batch_data, (tuple, list)) and batch_data:
         arr = batch_data[0]
+        lengths = batch_data[1] if len(batch_data) > 1 else None
+        if not (hasattr(lengths, "shape") and len(lengths.shape) == 2 and lengths.shape[1] == 2):
+            lengths = None
         if isinstance(arr, dict):
             arr = arr.get("input_ids")
-        lengths = batch_data[1] if len(batch_data) > 1 else None
+            # A vision preference dict may hold only some rows (vision KTO's KL rows come as a dict of their own).
+            if lengths is not None and mode != "non_padding" and hasattr(arr, "shape"):
+                return int(lengths.shape[0] * arr.shape[-1])
     else:
         arr = None
     if arr is None or not hasattr(arr, "shape"):
@@ -1324,12 +1329,7 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
         return int(math.prod(arr.shape))
     if attention_mask is not None and hasattr(attention_mask, "shape"):
         return int(attention_mask.sum().item())
-    if (
-        lengths is not None
-        and hasattr(lengths, "shape")
-        and len(lengths.shape) == 2
-        and lengths.shape[1] == 2
-    ):
+    if lengths is not None:
         return int(lengths[:, 1].sum().item())
     if pad_token_id is not None:
         return int((arr != pad_token_id).sum().item())
@@ -6903,7 +6903,7 @@ class MLXTrainer:
                     precompute_reference_logps(
                         plan, model, _sampling_reference,
                         batch_size=int(_precompute_chunk or eval_batch_size),
-                        scorer=getattr(preference_eval_fn, "_unsloth_cce_scorer", None),
+                        scorer=getattr(preference_eval_fn, "_unsloth_cce_reference_scorer", None),
                     )
             finally:
                 model.train(was_training)
@@ -7078,7 +7078,7 @@ class MLXTrainer:
             _train_chunk = int(_precompute_chunk or args.per_device_train_batch_size)
             precompute_reference_logps(
                 batches, model, _sampling_reference, batch_size=_train_chunk,
-                scorer=getattr(loss_fn, "_unsloth_cce_scorer", None),
+                scorer=getattr(loss_fn, "_unsloth_cce_reference_scorer", None),
             )
             if self.eval_dataset is None and not _samples_prompts:
                 _sampling_reference.release()

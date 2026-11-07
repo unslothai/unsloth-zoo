@@ -3308,6 +3308,69 @@ def _vlm_hidden_states(model, batch_dict):
     )
 
 
+def _qwen35_image_features(model, pixels, inputs):
+    tower = model.vision_tower
+    return tower(pixels.astype(tower.patch_embed.proj.weight.dtype), inputs["image_grid_thw"])[0]
+
+
+def _gemma4_image_features(model, pixels, inputs):
+    return model.embed_vision(model.vision_tower(pixels, inputs.get("image_position_ids")))
+
+
+# Families whose embedder takes cached_image_features in place of exactly what the encoder computes: the encoder, the
+# per-image inputs it reads beside the pixels, and the modules it runs. Qwen3-VL's cached path drops its deepstack.
+_VLM_IMAGE_ENCODERS = {
+    "qwen3_5": (_qwen35_image_features, ("image_grid_thw",), ("vision_tower",)),
+    "qwen3_5_moe": (_qwen35_image_features, ("image_grid_thw",), ("vision_tower",)),
+    "gemma4": (_gemma4_image_features, ("image_position_ids",), ("vision_tower", "embed_vision")),
+}
+
+
+_VLMImageEncoder = collections.namedtuple("_VLMImageEncoder", ("encode", "keys", "modules", "module_ids"))
+
+
+def _vlm_image_encoder(model):
+    entry = _VLM_IMAGE_ENCODERS.get(_mlx_vlm_canonical_model_type(
+        _config_get(getattr(model, "config", None), "model_type")
+    ))
+    if entry is None:
+        return None
+    modules = tuple(getattr(model, name, None) for name in entry[2])
+    if any(module is None for module in modules):
+        return None
+    children = [child for module in modules for _, child in module.named_modules()]
+    if any(
+        # Each copy and pass would draw its own mask.
+        child.training and type(child).__name__.endswith("Dropout") and _get_mlx_dropout_probability(child) > 0
+        for child in children
+    ):
+        return None
+    return _VLMImageEncoder(entry[0], entry[1], modules, frozenset(map(id, children)))
+
+
+def _vlm_image_features(model, batch_dict, copies=1):
+    """Features of a batch whose images repeat ``copies`` times, from one tower run over the first copy, laid out as
+    the embedder lays them; None when the family or batch has no cached path."""
+    encoder = _vlm_image_encoder(model)
+    pixels = batch_dict.get("pixel_values")
+    if encoder is None or pixels is None or batch_dict.get("pixel_values_videos") is not None:
+        return None
+    encode, keys = encoder.encode, encoder.keys
+    inputs = {k: v for k, v in batch_dict.items() if not k.startswith("_unsloth_") and v is not None}
+    _apply_static_vlm_metadata(model, batch_dict, inputs)
+
+    def first(value):
+        size = value.shape[0] if hasattr(value, "shape") else len(value)
+        return None if size % copies else value[:size // copies]
+
+    parts = {key: first(inputs[key]) for key in keys if key in inputs}
+    pixels = first(pixels)
+    if pixels is None or any(part is None for part in parts.values()):
+        return None
+    features = encode(model, pixels, parts)
+    return mx.concatenate([features] * copies, axis=-2) if copies > 1 else features
+
+
 def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
                      assistant_token_id=0):
     """Shared VLM CCE forward: embed -> backbone -> hidden + masked_targets + ntoks."""
