@@ -1883,7 +1883,7 @@ def test_grpo_scores_a_reference_model_through_its_own_scorer(monkeypatch):
 
     policy, reference = TinyModel(), TinyModel()
     make = _owned_scorers(monkeypatch, lambda model: 1.0 if model is reference else 2.0)
-    plan = types.SimpleNamespace(with_reference=True, score_temperature=0.5)
+    plan = types.SimpleNamespace(with_reference=True, score_temperature=0.5, _prefix=False)
     held = preference.ReferencePolicy(model=reference)
     grpo.GRPOBatchPlan.bind(plan, policy, [], trainer_state=None, reference_policy=held,
                             scorer=make(policy, temperature=0.5))
@@ -3946,7 +3946,7 @@ def test_grpo_loss_and_metrics_leave_out_truncated_rows():
     assert np.allclose(np.array(completion_logps(Model(), batch, 0.7)), expected, atol=1e-5)
 
 
-def _dense_scorer(model, batch, supervised, indices=None, *, logit_sums, differentiated):
+def _dense_scorer(model, batch, supervised, indices=None, *, logit_sums, differentiated, hidden=None):
     """The CCE scorer's contract on the logits: zero outside supervised, and outside indices when given."""
     import mlx.core as mx
     from unsloth_zoo.mlx.grpo import completion_logps
@@ -3957,8 +3957,9 @@ def _dense_scorer(model, batch, supervised, indices=None, *, logit_sums, differe
     return flat.reshape(supervised.shape), None
 
 
-def _grpo_window(monkeypatch, objective, rewards, *, iterations=1, compact=False, sizes=(4, 17, 30, 43), **plan):
-    """One generation's micro-step batches, the summed loss, gradient in the logit scale and stats of some, and the plan."""
+def _grpo_window(monkeypatch, objective, rewards, *, iterations=1, compact=False, sizes=(4, 17, 30, 43), keep=False, **plan):  # noqa: E501
+    """One generation's micro-step batches, the summed loss, gradient in the logit scale and stats of some, and the plan;
+    keep hands each run micro-step's log-probs back as the trainer does."""
     import numpy as np
     import mlx.core as mx
     from unsloth_zoo.mlx import generate as generate_module
@@ -3970,7 +3971,11 @@ def _grpo_window(monkeypatch, objective, rewards, *, iterations=1, compact=False
     plan.configure_cce_compaction(compact)
     _dense_scorer.calls = []
     plan.bind(model, [lambda completion_ids, **_: rewards[:len(completion_ids)]], reference_policy=reference, scorer=_dense_scorer, trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
-    batches, loss_fn = [plan[index] for index in range(plan._repeats)], make_grpo_loss_fn(objective, scorer=_dense_scorer)
+    batches, loss_fn = [], make_grpo_loss_fn(objective, scorer=_dense_scorer)
+    for index in range(plan._repeats):
+        batches.append(plan[index])
+        if keep and plan.skipped_stats(index) is None:
+            plan.keep_old_logps(index, make_grpo_loss_fn(objective, scorer=_dense_scorer, report_logps=True)(model, *batches[-1])[2][1])  # noqa: E501
 
     def score(chosen):
         window = lambda scale: setattr(model, "scale", scale) or sum(loss_fn(model, *batch)[0] for batch in chosen)  # noqa: E731
@@ -4024,6 +4029,83 @@ def test_grpo_skips_only_micro_steps_without_gradient(monkeypatch, loss_type, it
         assert np.array_equal(plan.skipped_stats(start + 1), rescore([skipping[start + 1]])[2]) and np.abs(got[1]) > 0
     options = [grpo_layout_options(GRPOObjective(name, beta), distributed=name == "dr_grpo")["skip_zero_advantage"] for name, beta in (("grpo", 0.0), ("bnpo", 0.0), ("dapo", 0.04), ("grpo", 0.04), ("dapo", 0.0), ("dr_grpo", 0.0))]  # noqa: E501
     assert options == [True, False, False, False, True, False]
+
+
+def test_grpo_first_passes_leave_old_log_probs_unknown_until_kept(monkeypatch):
+    from unsloth_zoo.mlx.grpo import GRPOObjective
+    objective = GRPOObjective("dapo", 0.0, max_completion_length=60)
+    batches, _, plan = _grpo_window(monkeypatch, objective, [0.0, 1.0, 3.0, 1.0], grad_accum=1, first_pass_old_logps=True)
+    assert plan.needs_step_logps is False and [batch[5][1].item() for batch in batches] == [False, True]
+    with pytest.raises(RuntimeError, match="were not kept"):
+        _grpo_window(monkeypatch, objective, [0.0, 1.0, 3.0, 1.0], iterations=2, first_pass_old_logps=True)
+    with pytest.raises(RuntimeError, match="not the current one"):
+        plan.keep_old_logps(2, batches[0][5][0])
+
+
+def test_grpo_skipped_first_pass_micro_steps_keep_their_zero_old_log_probs(monkeypatch):
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOObjective
+    run = lambda kept: _grpo_window(monkeypatch, GRPOObjective("dapo", 0.0, max_completion_length=60), [1.0, 1.0, 0.01, 3.0], iterations=2, group_by_length=True, skip_zero_advantage=True, first_pass_old_logps=kept, keep=kept)  # noqa: E501, E731
+    (kept, _, plan), (scored, _, _) = run(True), run(False)
+    assert plan.needs_step_logps and [index for index in range(4) if plan.skipped_stats(index) is not None] == [1, 3]
+    assert [batch[5][1].item() for batch in kept] == [False, True, True, True]
+    assert all(np.allclose(np.array(got[5][0]), np.array(want[5]), rtol=1e-6, atol=0) for got, want in zip(kept[2:], scored[2:]))  # noqa: E501
+    assert not np.array(kept[3][5][0]).any()
+
+
+@pytest.mark.parametrize("spg,iterations,accum", [(4, 2, 6), (3, 2, 4), (2, 2, 2), (4, 3, 2), (2, 1, 3), (2, 4, 12)])
+def test_grpo_first_pass_micro_steps_precede_every_update_the_trainer_applies(spg, iterations, accum):
+    # Updates as the trainer applies them: a full window, an epoch's or the run's last micro-step, resumed after any.
+    # Two slots precede an update when (3, 2, 4) opens a generation mid-window or (4, 2, 6) resumes before a flush.
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan
+    plan = create_grpo_batch_plan([{"prompt": "a" * 5}] * 6, DecodingTokenizer(), num_generations=2, batch_size=2, steps_per_generation=spg, num_iterations=iterations, grad_accum=accum, sampling=GRPOSampling(max_tokens=8), max_seq_length=64, shuffle=False, num_epochs=5, first_pass_old_logps=True)  # noqa: E501
+    epoch, total = plan.cycle_length, len(plan)
+
+    def updates(origin):  # the trainer's: a window fills, an epoch ends, or the run does
+        done, filled = [], 0
+        for step in range(origin, total):
+            filled += 1
+            if filled == accum or (step + 1) % epoch == 0 or step + 1 == total:
+                done.append(step)
+                filled = 0
+        return done
+
+    def slots_before_an_update(origin):
+        plan.start_at(origin)
+        after = updates(origin)
+        starts = sorted({plan._generation_start(step) for step in range(origin, total - spg + 1)})
+        return [min(spg, next(u for u in after if u >= start) - start + 1) for start in starts]
+
+    counts = [count for origin in [0] + [u + 1 for u in updates(0)[:-1]] for count in slots_before_an_update(origin)]
+    assert min(spg, plan._first_pass_slots) == min(counts) > 0
+
+
+def test_grpo_old_log_probs_not_yet_known_are_the_steps_own():
+    import math
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx.grpo import GRPOObjective, completion_logps, make_grpo_loss_fn
+
+    class Model:
+        scale = 1.0
+
+        def __call__(self, ids):
+            ids = ids.astype(mx.float32) * self.scale
+            return mx.stack([ids * 0.1, -ids * 0.3, ids * 0], axis=-1)
+
+    objective, model, unknown = GRPOObjective("dapo", beta=0.0, temperature=0.7), Model(), mx.full((2, 3), float("nan"))
+    loss_fn, reporting = make_grpo_loss_fn(objective), make_grpo_loss_fn(objective, report_logps=True)
+    batch = (mx.array([[1, 2, 0, 1], [2, 1, 1, 0]]), mx.array([[1, 4], [1, 3]]), mx.array([2.0, 5.0]), mx.array([1.0, -1.0]), mx.array([1, 1]))  # noqa: E501
+
+    def run(*old):
+        loss = lambda scale: setattr(model, "scale", scale) or loss_fn(model, *batch, *old)[0]  # noqa: E731
+        return loss(mx.array(1.3)).item(), mx.grad(loss)(mx.array(1.3)).item()
+
+    on_policy = run()
+    assert on_policy[1] != 0 and run((unknown, mx.array(False))) == on_policy
+    assert math.isnan(run((unknown, mx.array(True)))[0])  # a scored NaN surfaces
+    stats, logps = reporting(model, *batch)[2]
+    assert np.array_equal(stats, loss_fn(model, *batch)[2]) and np.allclose(logps, completion_logps(model, batch[0], 0.7), atol=1e-6)  # noqa: E501
 
 
 def test_grpo_scalerl_weights_follow_unsloth_cuda(monkeypatch):
@@ -4106,6 +4188,241 @@ def test_grpo_scalerl_options_read_unsloth_cuda_environment(monkeypatch):
     monkeypatch.setenv("UNSLOTH_GRPO_LOSS_AGGREGATION", "sequence")
     with pytest.raises(ValueError, match="UNSLOTH_GRPO_LOSS_AGGREGATION must be 'prompt'"):
         MLXGRPOConfig()
+
+
+@pytest.mark.parametrize("loss_type", ["grpo", "dr_grpo", "dapo"])
+def test_grpo_prefix_grouping_keeps_whole_groups_and_every_window_gradient(monkeypatch, loss_type):
+    # Catches split groups, a prefix off the 32 rung or past a prompt, old log-probs without it, and a tok_r gate.
+    import numpy as np
+    from unsloth_zoo.mlx import grpo
+    seen = []
+    monkeypatch.setattr(grpo, "_shared_prefix_hidden", lambda model, batch, prefix: seen.append(prefix))
+    objective, rewards = grpo.GRPOObjective(loss_type, 0.0, max_completion_length=60), [0.0, 1.0, 3.0, 1.0, 2.0, 0.5, 1.0, 4.0]  # noqa: E501
+    # Sorted by length alone, rows of the two prompts would interleave: totals 134, 190 and 200, 180.
+    run = lambda flag, **kw: _grpo_window(monkeypatch, objective, rewards, sizes=(4, 60, 30, 10), group_by_length=True, prefix_grouping=flag, **kw)  # noqa: E501, E731
+    (random, score, _), (grouped, regrouped, _) = run(False, iterations=2), run(True, iterations=2)
+    assert len(seen) == 2 and all(len(batch) == 10 and np.array_equal(np.array(seen[index % 2]), np.array(batch[9])) for index, batch in enumerate(grouped))  # noqa: E501
+    for ids, lengths, prefix in ((np.array(batch[0]), np.array(batch[1]), np.array(batch[9])) for batch in grouped):
+        assert (lengths[0::2, 0] == lengths[1::2, 0]).all() and np.array_equal(prefix, ids[::2, :prefix.shape[1]])
+        assert prefix.shape[1] % 32 == 0 and 0 < prefix.shape[1] < lengths[:, 0].min()
+    for start in (0, 2):  # loss and gradient; clip ratios are per-micro-batch means, so they follow the layout
+        # atol: grpo's loss nearly cancels, so fp32 reassociation of its terms shows as a relative error above 1e-6.
+        assert all(np.allclose(got, want, rtol=1e-6, atol=1e-7) for got, want in zip(regrouped(grouped[start:start + 2])[:2], score(random[start:start + 2])[:2]))  # noqa: E501
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER_TOKR", "2")
+    assert all(batch[9] is None for batch in run(True)[0])
+
+
+def test_grpo_prefix_grouping_gates_layouts_and_models(monkeypatch, capsys):
+    # Catches layouts moving rows across steps, uncovered models or RoPEs, LoRA dropout, and the environment default.
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import grpo, utils as mlx_utils
+    from unsloth_zoo.mlx.grpo import grpo_prefix_grouping, grpo_prefix_problem
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig
+    monkeypatch.delenv("UNSLOTH_GRPO_PREFIX_GROUPER", raising=False)
+    config = lambda **kw: MLXGRPOConfig(**{"loss_type": "dapo", "num_generations": 2, "per_device_train_batch_size": 2, "gradient_accumulation_steps": 2, "prefix_grouper": True, **kw})  # noqa: E501, E731
+    assert MLXGRPOConfig(loss_type="dapo").prefix_grouper is False and grpo_prefix_grouping(config()) and grpo_prefix_grouping(config(num_iterations=2))  # noqa: E501
+    refused = [config(loss_type="bnpo"), config(num_generations=4, steps_per_generation=2), config(steps_per_generation=4), config(neftune_noise_alpha=5.0)]  # noqa: E501
+    with pytest.warns(UserWarning, match="prefix_grouper is off"):
+        assert not any(grpo_prefix_grouping(c) for c in refused) and not grpo_prefix_grouping(config(), distributed=True)
+    assert not grpo_prefix_grouping(config(prefix_grouper=False))
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "1")
+    with pytest.warns(UserWarning, match="UNSLOTH_GRPO_PREFIX_GROUPER=1 sets"):
+        assert MLXGRPOConfig(loss_type="dapo").prefix_grouper is True
+    layers = lambda sliding: [SimpleNamespace(use_sliding=sliding)] * 2  # noqa: E731
+    lora = lambda keep: [("q_proj", SimpleNamespace(lora_a=0, lora_b=0, dropout=SimpleNamespace(_p_1=keep)))]  # noqa: E731
+    ropes = lambda *names: lambda: [(name, type(name, (), {})()) for name in names]  # noqa: E731
+    model = lambda kind, sliding=False, window=None, keep=1.0, rope="RoPE": SimpleNamespace(model_type=kind, model=SimpleNamespace(layers=layers(sliding), sliding_window=window, named_modules=ropes(rope)), named_modules=lambda: lora(keep))  # noqa: E501, E731
+    assert grpo_prefix_problem(model("qwen2"), print, 512) is None
+    assert grpo_prefix_problem(model("llama", True, 512, rope="Llama3RoPE"), print, 512) is None
+    assert grpo_prefix_problem(model("qwen2", keep=0.95), print, 512, dropout_disabled=True) is None
+    assert all(grpo_prefix_problem(m, scorer, 512) for m, scorer in ((model("qwen2"), None), (model("gemma3"), print), (model("qwen3_moe"), print), (model("llama", True, 256), print), (model("qwen2", keep=0.95), print), (model("llama", rope="DynamicNTKScalingRoPE"), print)))  # noqa: E501
+    monkeypatch.setattr(grpo, "_make_preference_cce_scorer", lambda *_, **__: print)
+    assert grpo_prefix_grouping(config(disable_dropout=True), model=model("qwen2", keep=0.95))
+    with pytest.warns(UserWarning, match="prefix_grouper is off, since model_type='gemma3'"):
+        assert not grpo_prefix_grouping(config(), model=model("gemma3"))
+    vlm = lambda kind, moe=False, rope="ProportionalRoPE": SimpleNamespace(model_type=kind, language_model=SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(enable_moe=moe)] * 2, named_modules=ropes("RoPE", rope))), vision_tower=None, named_modules=lambda: lora(1.0))  # noqa: E501, E731
+    assert grpo_prefix_problem(vlm("qwen3_5", rope="Qwen3_5RotaryEmbedding"), print, 512) is None
+    assert grpo_prefix_problem(vlm("gemma4"), print, 512) is None
+    assert all(grpo_prefix_problem(m, print, 512) for m in (vlm("qwen2_5_vl"), vlm("gemma4", moe=True), vlm("gemma4", rope="SuScaledRoPE"), model("qwen3_5"), model("gemma4")))  # noqa: E501
+    capsys.readouterr()
+    assert not grpo_prefix_grouping(config(prefix_grouper=False), model=vlm("gemma4"))
+    assert "each shared prompt and its images once" in capsys.readouterr().out
+    assert not grpo_prefix_grouping(config(prefix_grouper=False), model=vlm("gemma4", moe=True))
+    assert capsys.readouterr().out == ""
+    monkeypatch.setattr(mlx_utils, "_shared_kv_slot_count", lambda model: 2)
+    assert "own slots" in grpo_prefix_problem(vlm("gemma4"), print, 512)
+
+
+def test_grpo_prefix_grouper_hints_when_admitted_and_gives_each_message_once_per_trainer(monkeypatch, capsys):
+    # Catches a hint for a refused model or config, a hint or refusal suppressed by an earlier different message or by
+    # Python's once-per-line warning filter, a message repeated in one trainer, and, without hint, a hint printed or a
+    # refusal withheld.
+    import warnings
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import grpo
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig
+
+    monkeypatch.delenv("UNSLOTH_GRPO_PREFIX_GROUPER", raising=False)
+    monkeypatch.setattr(grpo, "_make_preference_cce_scorer", lambda *_, **__: print)
+    config = lambda **kw: MLXGRPOConfig(**{"loss_type": "dapo", "num_generations": 2, "per_device_train_batch_size": 2, "gradient_accumulation_steps": 2, **kw})  # noqa: E501, E731
+    backbone = SimpleNamespace(layers=[SimpleNamespace(use_sliding=False)] * 2, named_modules=lambda: [])
+    model = lambda kind: SimpleNamespace(model_type=kind, model=backbone, named_modules=lambda: [])  # noqa: E731
+    hint = "would run each shared prompt once for its 2 completions"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        refusals = lambda: [w.category for w in caught if "prefix_grouper is off" in str(w.message)]  # noqa: E731
+        assert not grpo.grpo_prefix_grouping(config(), model=model("gemma3"))
+        assert not grpo.grpo_prefix_grouping(config(loss_type="bnpo"), model=model("qwen3"))
+        assert capsys.readouterr().out == "" and refusals() == []
+        # One trainer, hint first: the later refusal still warns, and neither repeats.
+        announced = set()
+        for _ in range(2):
+            assert not grpo.grpo_prefix_grouping(config(), model=model("qwen3"), announced=announced)
+            assert not grpo.grpo_prefix_grouping(config(prefix_grouper=True, loss_type="bnpo"), model=model("qwen3"), announced=announced)  # noqa: E501
+        assert capsys.readouterr().out.count(hint) == 1 and refusals() == [UserWarning]
+        # Another trainer, refusal first: the later hint still prints.
+        announced = set()
+        assert not grpo.grpo_prefix_grouping(config(prefix_grouper=True, loss_type="bnpo"), model=model("qwen3"), announced=announced)  # noqa: E501
+        assert not grpo.grpo_prefix_grouping(config(), model=model("qwen3"), announced=announced)
+        assert capsys.readouterr().out.count(hint) == 1 and refusals() == [UserWarning] * 2
+        # Without a set, every call warns; hint=False (a non-main process) still warns but never hints.
+        for _ in range(2):
+            grpo.grpo_prefix_grouping(config(prefix_grouper=True), model=model("gemma3"))
+        assert refusals() == [UserWarning] * 4
+        assert not grpo.grpo_prefix_grouping(config(prefix_grouper=True), model=model("gemma3"), hint=False)
+        assert not grpo.grpo_prefix_grouping(config(), model=model("qwen3"), hint=False)
+        assert refusals() == [UserWarning] * 5 and capsys.readouterr().out == ""
+
+
+def test_grpo_prefix_problem_refuses_vision_loads_of_admitted_text_types():
+    # Catches a vision model, or a text-only load of one, admitted for carrying a text model_type.
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.grpo import grpo_prefix_problem
+
+    def qwen3(**flags):
+        backbone = SimpleNamespace(layers=[SimpleNamespace(use_sliding=False)] * 2, named_modules=lambda: [])
+        return SimpleNamespace(model_type="qwen3", model=backbone, named_modules=lambda: [], **flags)
+
+    assert grpo_prefix_problem(qwen3(), print, 512) is None
+    assert "vision model" in grpo_prefix_problem(qwen3(_is_vlm_model=True), print, 512)
+    assert "vision model" in grpo_prefix_problem(qwen3(_unsloth_text_only_vlm=True), print, 512)
+
+
+def test_grpo_bind_refuses_an_engaged_plan_without_a_scorer():
+    # Catches old, reference and policy log-probs scored without the shared prompt the plan laid out for.
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.grpo import GRPOBatchPlan
+
+    with pytest.raises(ValueError, match="shared-prompt plan needs"):
+        GRPOBatchPlan.bind(SimpleNamespace(with_reference=False, _prefix=True), None, [], trainer_state=None)
+
+
+def test_grpo_shared_prefix_vision_batches_hold_each_groups_images():
+    # Catches a prefix cutting an image or built from every row, completion tokens read as prompt, a compiled survey.
+    from types import SimpleNamespace
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOBatchPlan
+    calls = []
+    plan = SimpleNamespace(_prefix=True, num_generations=2, _prefix_tokr=1.0, _processor=object(), _model_config={"image_token_id": 9}, _inputs=lambda *args, **_: calls.append(args) or "vision")  # noqa: E501
+    batch, lengths = np.repeat(np.arange(256, dtype=np.int32).reshape(2, 128) + 10, 2, axis=0), np.array([[70, 100]] * 4, dtype=np.int32)  # noqa: E501
+    batch[:, 3], batch[:, 90] = 9, 9
+    media = [("a", ("cat",)), ("a", ("cat",)), ("b", ("dog",)), ("b", ("dog",))]
+    assert GRPOBatchPlan._prefix_ids(plan, batch, lengths, media) == "vision"
+    (prefix, sizes, held), = calls
+    assert (prefix == batch[::2, :64]).all() and (sizes == 64).all() and sizes.shape == (2, 2) and held == media[::2]
+    batch[2:, 69] = 9
+    assert GRPOBatchPlan._prefix_ids(plan, batch, lengths, media) is None
+    batch[2:, 69] = 0
+    assert GRPOBatchPlan._prefix_ids(SimpleNamespace(**{**vars(plan), "_model_config": {}}), batch, lengths, media) is None  # noqa: E501
+    assert len(calls) == 1 and not GRPOBatchPlan.ensure_descriptors(SimpleNamespace(_families=None, _processor=object(), _prefix=True))  # noqa: E501
+
+
+def test_grpo_shared_prompt_rows_skip_the_processor():
+    # Catches rows' batches still processed (training or scoring) once the prefix carries images, or a fallback without.
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOBatchPlan, _Generation
+
+    calls = []
+
+    def inputs(batch, lengths, media, ids_only=False, features=None, held=None, key=None):
+        calls.append((batch.shape[1], None if ids_only else media))
+        return "batch"
+
+    plan = object.__new__(GRPOBatchPlan)
+    vars(plan).update(
+        _prefix=True, num_generations=2, _prefix_tokr=1.0, _processor=object(), _model_config={"image_token_id": 9},
+        batch_size=4, steps_per_generation=1, _anchor=0, _repeats=1, _families=None, _shape_plan=None,
+        _cce_bounds=None, max_seq_length=512, pad_id=0, _inputs=inputs, _features=None,
+    )
+    # Two groups of two rows: 70 prompt tokens each, then 3 to 6 completion tokens.
+    sequences = [tuple(range(10 + 100 * (row // 2), 80 + 100 * (row // 2))) + (5,) * (3 + row) for row in range(4)]
+    media, lengths = [("a", ("cat",))] * 2 + [("b", ("dog",))] * 2, np.full(4, 70)
+    plan._current = _Generation(
+        visit=0, sequences=sequences, prompt_lengths=lengths, advantages=np.ones(4, np.float32),
+        kept=np.ones(4, np.int32), old=None, ref=None, generation_tokens=18, media=media,
+    )
+    width = plan._width(76)
+
+    def scorer(inputs, lengths, indices, prefix):
+        return np.zeros((4, width - 1), np.float32)
+
+    # The prefix carries each group's images once; the rows' batches are ids only, for training and for scoring.
+    assert plan.materialize(0)[-1] == "batch"
+    assert len(plan._score(scorer, 0, sequences, lengths, media)) == 4
+    assert calls == [(64, media[::2]), (width, None)] * 2
+    # An image token past the shared 64 tokens: no prefix, and the rows keep their images.
+    calls.clear()
+    plan._current.sequences = sequences = [s[:66] + (9,) + s[67:] for s in sequences]
+    assert plan.materialize(0)[-1] is None
+    assert len(plan._score(scorer, 0, sequences, lengths, media)) == 4
+    assert calls == [(width, media)] * 2
+
+
+def test_the_grpo_trainer_warns_each_refusal_once_on_every_rank_and_hints_on_main(tmp_path, monkeypatch, capsys):
+    # Catches a refusal swallowed after a silent plan, a raising "error" filter or on a non-main rank, one repeated in a
+    # trainer, a plan decided without the trainer's model, and a hint missing on the main rank or printed on another.
+    import warnings
+    from unsloth_zoo.mlx import grpo, trainer as mlx_trainer
+
+    monkeypatch.delenv("UNSLOTH_GRPO_PREFIX_GROUPER", raising=False)
+    reward = lambda completions, **_: [0.0] * len(completions)  # noqa: E731
+
+    def trainer_for(**overrides):
+        args = _grpo_config(tmp_path, beta=0.0, **overrides)
+        return mlx_trainer.MLXGRPOTrainer(_tiny_model(), DecodingTokenizer(), _grpo_rows(), args=args,
+                                          reward_funcs=reward)
+
+    def refusals(trainer, settings):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default")
+            for prefix_grouper in settings:
+                trainer.args.prefix_grouper = prefix_grouper
+                trainer._create_grpo_plan(trainer.train_dataset, None, 1)
+        return [str(w.message).split("since ")[1] for w in caught if "prefix_grouper is off" in str(w.message)]
+
+    bnpo = "loss_type='bnpo' normalizes each micro-batch by its own tokens."
+    assert refusals(trainer_for(loss_type="bnpo"), (False, True, True)) == [bnpo]
+    # The config admits it; only the model's own check finds the tiny model's head has no runtime CCE.
+    (reason,) = refusals(trainer_for(loss_type="dapo"), (True, True))
+    assert reason.startswith("it scores through the runtime CCE head")
+    main, other = (trainer_for(loss_type="bnpo", prefix_grouper=True) for _ in range(2))
+    other._distributed_is_main_process = False
+    assert other.is_main_process is False
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        for trainer in (main, other):
+            for _ in range(2):
+                with pytest.raises(UserWarning, match="prefix_grouper is off"):
+                    trainer._create_grpo_plan(trainer.train_dataset, None, 1)
+    for trainer in (main, other):
+        assert refusals(trainer, (True,)) == [bnpo] and refusals(trainer, (True,)) == []
+    monkeypatch.setattr(grpo, "grpo_prefix_problem", lambda *_, **__: None)
+    main, other = (trainer_for(loss_type="dapo") for _ in range(2))
+    other._distributed_is_main_process = False
+    assert other.is_main_process is False
+    for trainer in (main, main, other):
+        trainer._create_grpo_plan(trainer.train_dataset, None, 1)
+    assert capsys.readouterr().out.count("prefix_grouper=True would run") == 1
 
 
 def test_grpo_reward_models_are_scored_as_trl_scores_them(monkeypatch):
