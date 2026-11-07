@@ -382,6 +382,20 @@ def _grouped_mm_eager(inputs, weight, offsets):
     # is cached.
     if not _grouped_mm_supported_on(inputs.device):
         return _manual_grouped_mm(inputs, weight, offsets)
+    pad = _native_backward_pad(inputs, weight)
+    if pad:
+        if _is_transposed_stack(weight) and _transposed_view_safe_on(inputs.device):
+            # Pad the stored [E, N, K] rows and keep the view: padding the view itself copies the whole stack transposed,
+            # which made it slower than the per-expert loop on T4.
+            padded = F.pad(weight.transpose(-2, -1), (0, 0, 0, pad)).transpose(-2, -1)
+        else:
+            padded = F.pad(weight, (0, pad))
+        try:
+            return torch._grouped_mm(inputs, padded, offs=offsets)[:, :weight.shape[-1]]
+        except RuntimeError as exc:
+            if "strides should be multiple of 16 bytes" not in str(exc):
+                raise
+            return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_safe_on(inputs.device):
         weight = weight.contiguous()   # view path unproven on this device -> safe copy
     try:
@@ -396,6 +410,15 @@ def _grouped_mm_eager(inputs, weight, offsets):
         if "strides should be multiple of 16 bytes" not in str(exc):
             raise
         return _manual_grouped_mm(inputs, weight, offsets)
+
+
+def _native_backward_pad(inputs, weight):
+    """Zero columns that make N a 16-byte row when autograd records, else 0. torch._grouped_mm's own backward feeds
+    grad [M, N] back into it: an unaligned N passes forward (transposed [E, N, K] stack) but raises in backward, so a
+    trainable fp16 / bf16 stack with odd N died there. The padded columns are sliced off, so their grads are zero."""
+    if not (torch.is_grad_enabled() and (inputs.requires_grad or weight.requires_grad)):
+        return 0
+    return -weight.shape[-1] % (16 // weight.element_size())
 
 
 def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
