@@ -45,6 +45,7 @@ from .utils import (
     _preserved_preprocessing_rng,
     _processor_vlm_inputs,
     _render_vlm_messages,
+    _row_contiguous_cross_entropy,
     _row_has_images,
     _to_mx_vlm_batch,
     _torch_randperm_order,
@@ -2261,7 +2262,7 @@ def _preference_hidden(model, batch):
 def _token_cross_entropy(logits, targets, mask):
     # An image token may lie past the output head (Mllama's does), so unscored labels are gathered as token 0, as TRL does.
     targets = mx.where(mask > 0, targets, 0)
-    return nn.losses.cross_entropy(
+    return _row_contiguous_cross_entropy(
         logits, targets, reduction="none",
     ).reshape(targets.shape)
 

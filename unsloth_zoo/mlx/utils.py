@@ -543,11 +543,86 @@ def _windowing_pays(q, k, block):
     return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
 
 
+# mlx 0.32.4 trains head dims above 256 fused only on NAX; elsewhere its fallback builds all T x S scores at once.
+_FUSED_TRAINING_HEAD_DIM = 256
+_CHUNKED_ATTENTION_QUERIES = 512
+
+
+def _chunking_bounds_scores(q, v, mask):
+    from .attention import _stock_runs_nax
+
+    return (max(q.shape[-1], v.shape[-1]) > _FUSED_TRAINING_HEAD_DIM and q.shape[-2] > _CHUNKED_ATTENTION_QUERIES
+            and v.shape[-2] >= q.shape[-2] and (mask is None or isinstance(mask, mx.array) or mask == "causal") and not _stock_runs_nax())
+
+
+def _query_chunked_attention(sdpa, q, k, v, scale, mask, block):
+    # Peak grows with T rather than T^2; wrapping chunks in mx.checkpoint measured no lower.
+    T, S = q.shape[-2], k.shape[-2]
+    n = -(-T // block)
+    bounds = [T * i // n for i in range(n + 1)]
+    outputs = []
+    for start, stop in zip(bounds, bounds[1:]):
+        # Causal chunks keep keys only through their last row, where mlx's lower-right causal mask aligns.
+        keys = S - T + stop if isinstance(mask, str) else S
+        rows = mask
+        if isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] == T:
+            rows = mask[..., start:stop, :]
+        outputs.append(sdpa(q[..., start:stop, :], k[..., :keys, :], v[..., :keys, :], scale=scale, mask=rows))
+    return mx.concatenate(outputs, axis=2)
+
+
 def _as_array_mask(q, k, mask):
     T, S = q.shape[-2], k.shape[-2]
     if mask is None:
         return mx.ones((T, S), dtype=mx.bool_)
     return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
+
+
+# mlx 0.32.4's fused SDPA VJP keeps its S/P/dS tiles in the input dtype, so bf16/fp16 gradients lose to an explicit
+# fp32 softmax; given fp32 inputs, the same fused forward and blocked VJP run in fp32.
+# Below 2047 queries (a 2048-token sequence after the label shift) or above D128, the fp32 copies cost more than
+# mlx's unfused path, so those causal calls keep the stock kernels.
+_FP32_CAUSAL_HEAD_DIMS = frozenset((64, 128))
+_FP32_CAUSAL_MIN_QUERIES = 2047
+
+
+def _fp32_runs_stock_kernels():
+    # NAX GPUs run fp32 attention on their NAX kernels only under TF32; otherwise the fp32 forward and VJP GEMMs cost
+    # more than the unfused path at D128, and the forward no longer rounds like the stock one.
+    from .attention import _stock_runs_nax, _tf32_enabled
+
+    return _tf32_enabled() or not _stock_runs_nax()
+
+
+def _fp32_attention_routes(q, k, v, mask, head_dims):
+    D, T = k.shape[-1], q.shape[-2]
+    return (os.environ.get("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", "1") != "0"
+            and q.dtype == k.dtype == v.dtype and q.dtype in (mx.bfloat16, mx.float16) and T > 8
+            and D == v.shape[-1] and D in head_dims
+            and (mask is None or isinstance(mask, str) and mask == "causal" and T <= k.shape[-2])
+            and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def _fp32_attention(sdpa, q, k, v, scale, mask):
+    out = sdpa(q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32), scale=scale, mask=mask)
+    return out.astype(q.dtype)
+
+
+# Vision head dims of the Qwen3-VL family (Qwen3.5 64, Qwen3-VL 72 and 80), all fused by mlx from 9 queries.
+_FP32_VISION_HEAD_DIMS = frozenset((64, 72, 80))
+
+
+def fused_vision_attention(q, k, v, *, scale):
+    """Mask-free fused SDPA for a vision chunk whose fallback is an explicit fp32 softmax: fp32 inputs inside a
+    training step, the stock fused forward outside one. Returns None, so the caller keeps its explicit path, when mlx
+    would not fuse the call, off the GPU, and under UNSLOTH_MLX_FP32_TRAIN_ATTENTION=0."""
+    if not _fp32_attention_routes(q, k, v, None, _FP32_VISION_HEAD_DIMS):
+        return None
+    sdpa = mx.fast.scaled_dot_product_attention
+    sdpa = getattr(sdpa, "_unsloth_original", sdpa)
+    if mlx_training_patches_active():
+        return _fp32_attention(sdpa, q, k, v, scale, None)
+    return sdpa(q, k, v, scale=scale)
 
 
 def _wrap_training_sdpa(original):
@@ -565,6 +640,14 @@ def _wrap_training_sdpa(original):
                 block = max(_TRAINING_ATTENTION_BLOCK, window)
                 if _windowing_pays(q, k, block):
                     return _windowed_attention(original, q, k, v, scale, window, block)
+        # Disjoint by head dim, so each call takes at most one: D64/D128 fp32 route, D > 256 query chunks, else stock.
+        if (all(value is None for value in kwargs.values()) and isinstance(mask, str) and mask == "causal"
+                and T >= _FP32_CAUSAL_MIN_QUERIES and mlx_training_patches_active()
+                and _fp32_attention_routes(q, k, v, mask, _FP32_CAUSAL_HEAD_DIMS) and _fp32_runs_stock_kernels()):
+            return _fp32_attention(original, q, k, v, scale, mask)
+        if (all(value is None for value in kwargs.values()) and mlx_training_patches_active()
+                and _chunking_bounds_scores(q, v, mask)):
+            return _query_chunked_attention(original, q, k, v, scale, mask, _CHUNKED_ATTENTION_QUERIES)
         return original(q, k, v, scale=scale, mask=mask, **kwargs)
 
     wrapper._unsloth_original = original
@@ -680,9 +763,9 @@ def mlx_training_patches_active() -> bool:
     return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
 
 
-# Sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue 3887, open), rows
-# past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a probe measures corruption;
-# kill switch UNSLOTH_MLX_GATHER_QMM_GUARD=0.
+# Before mlx 0.32.3, sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue
+# 3887, fixed by 4009), rows past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a
+# probe measures corruption; UNSLOTH_MLX_GATHER_QMM_GUARD=0 or 1 overrides the version gate.
 _MLX_MAX_SORTED_ROWS = 32768
 _MLX_CANARY_ERROR_LIMIT = 1.0
 _MLX_K_REMAINDER = "k_remainder"
@@ -878,7 +961,8 @@ def is_gather_qmm_nax_guard_applied() -> bool:
 def apply_gather_qmm_nax_guard() -> bool:
     """Idempotent and thread-safe; installed under the index-stop wrapper, which removes itself by inspecting mx and would be stranded by anything on top."""
     global _MLX_GATHER_QMM_ORIGINAL
-    if os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD", "1") == "0":
+    setting = os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    if setting == "0" or (setting is None and _Version(mx.__version__) >= _Version("0.32.3")):
         return False
     with _MLX_INDEX_GRADIENT_LOCK:
         if is_gather_qmm_nax_guard_applied():
@@ -2384,6 +2468,13 @@ def _masked_correct(logits, targets, mask):
     return hits.astype(mx.float32).sum()
 
 
+def _row_contiguous_cross_entropy(logits, targets, **kwargs):
+    # mlx 0.32.4's fused cross-entropy VJP races on non-row-contiguous logits (ml-explore/mlx#4686). A flatten round
+    # trip copies sequence- or vocab-sliced logits and is free for row-contiguous ones; mx.contiguous would also copy a
+    # row-contiguous slice out of its larger buffer.
+    return nn.losses.cross_entropy(logits.reshape(-1).reshape(logits.shape), targets, **kwargs)
+
+
 def make_baseline_loss_fn(label_smoothing=0.0):
     """Standard cross-entropy over full LM-head logits, used when use_cce=False; returns (model, batch, lengths,
     labels=None) -> (loss, ntoks); with label_smoothing=0 the labels=None branch is byte-identical to
@@ -2996,7 +3087,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
-        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
+        ce = _row_contiguous_cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
         if return_correct:
