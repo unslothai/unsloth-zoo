@@ -233,6 +233,41 @@ def test_single_process_text_shape_guard_buckets_and_validates_before_materializ
         batches.materialize(0, phase="unknown")
 
 
+@pytest.mark.parametrize("widths, keeps_sorted, signatures, refuse_sorted", [
+    ((10, 30, 12, 30, 11, 30, 13, 30), False, 2, False),
+    ((30, 10, 10, 10, 10, 10, 30, 10), True, 2, False),
+    ((30, 10, 30, 30, 30, 10, 30, 30), True, 2, False),
+    ((30, 10, 10, 10, 10, 10, 30, 10), False, 4, True),
+])
+def test_length_sorted_windows_never_add_compiled_signatures(monkeypatch, widths, keeps_sorted, signatures, refuse_sorted):
+    # Equal signature counts keep the sorted cut; a sorted cut the planner refuses falls back to the original.
+    import unsloth_zoo.mlx.trainer as trainer_module
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig, _plan_single_process_text_shapes
+    from unsloth_zoo.mlx.utils import _length_sorted_windows
+
+    original = ((0, 1), (2, 3), (4, 5), (6, 7))
+    batches = _make_shape_guard_text_plan(widths, schedules=original)
+    cut = _length_sorted_windows(original, lambda i: widths[i], 2)
+    assert cut != original
+    batches.install_length_sorted_windows(cut)
+    if refuse_sorted:
+        plan_cut = trainer_module._plan_text_shapes_for_cut
+
+        def refusing(plan, *args, **kwargs):
+            if plan.schedule == cut:
+                raise RuntimeError("strict compile refused")
+            return plan_cut(plan, *args, **kwargs)
+        monkeypatch.setattr(trainer_module, "_plan_text_shapes_for_cut", refusing)
+    args = MLXTrainingConfig(max_steps=2, gradient_accumulation_steps=2, compile_max_variants=8)
+    _, report, allowed, _ = _plan_single_process_text_shapes(
+        batches, None, args=args, total_steps=2, is_vlm=False,
+        distributed_world_size=1, compile_policy=build_compile_policy(args=args),
+    )
+    assert allowed and report.planned_signatures == signatures and not batches.has_window_sort_choice
+    assert batches.schedule == (cut if keeps_sorted else original)
+
+
 def test_automatic_text_shape_guard_installs_deterministic_budgeted_plan():
     from unsloth_zoo.mlx.compile import build_compile_policy
     from unsloth_zoo.mlx.trainer import (
@@ -8147,6 +8182,7 @@ def test_new_scheduler_fields_do_not_shift_existing_positional_slots():
     gkd = {
         "teacher_model_name_or_path", "gkd_beta", "gkd_temperature", "gkd_lmbda",
         "gkd_chunk_size", "gkd_skip_memory_preflight", "group_by_length",
+        "length_sorted_microbatches", "loss_type",
     }
     assert set(current) - set(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS) - gkd == {
         "lr_scheduler_min_lr_rate",
@@ -8810,3 +8846,38 @@ def test_warmup_stable_decay_keeps_hf_step_windows(stable, decay):
             warmup_type="linear", decay_type="cosine", min_lr_ratio=0.1, num_cycles=0.5,
         )
         assert float(schedule(step)) == pytest.approx(expected, rel=1e-6, abs=1e-12), step
+
+
+def test_sft_dft_loss_is_refused_off_the_fused_text_path():
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig, _resolve_sft_loss_type as resolve
+
+    assert resolve(MLXTrainingConfig(), fused=False) == "nll"
+    assert resolve(MLXTrainingConfig(loss_type="dft"), fused=True) == "dft"
+    for loss_type, fused, match in (("dft", False, "fused CCE"), ("chunked_nll", True, "'nll' or 'dft'")):
+        with pytest.raises(ValueError, match=match):
+            resolve(MLXTrainingConfig(loss_type=loss_type), fused=fused)
+
+
+def test_train_refuses_dft_when_the_cce_head_falls_back(monkeypatch):
+    # The model has no lm_head to split, so CCE falls back to the full-logit loss, which has no dft reduction.
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"text": f"row {i}"} for i in range(4)],
+        args=MLXTrainingConfig(
+            max_steps=1, gradient_accumulation_steps=1, logging_steps=1, use_cce=True, loss_type="dft",
+            compile=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0, max_grad_leaf_norm=0.0, disable_memory_limits=True, output_dir=tempfile.mkdtemp(),
+        ),
+    )
+    ids = mx.array([list(range(1, 11))], dtype=mx.int32)
+    trainer._prepare_data = lambda _is_vlm: ([(ids, mx.array([[0, 9]], dtype=mx.int32), None)], None)
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+    with pytest.raises(ValueError, match="fused CCE"):
+        trainer.train()

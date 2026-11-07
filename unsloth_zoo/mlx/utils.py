@@ -543,11 +543,86 @@ def _windowing_pays(q, k, block):
     return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
 
 
+# mlx 0.32.4 trains head dims above 256 fused only on NAX; elsewhere its fallback builds all T x S scores at once.
+_FUSED_TRAINING_HEAD_DIM = 256
+_CHUNKED_ATTENTION_QUERIES = 512
+
+
+def _chunking_bounds_scores(q, v, mask):
+    from .attention import _stock_runs_nax
+
+    return (max(q.shape[-1], v.shape[-1]) > _FUSED_TRAINING_HEAD_DIM and q.shape[-2] > _CHUNKED_ATTENTION_QUERIES
+            and v.shape[-2] >= q.shape[-2] and (mask is None or isinstance(mask, mx.array) or mask == "causal") and not _stock_runs_nax())
+
+
+def _query_chunked_attention(sdpa, q, k, v, scale, mask, block):
+    # Peak grows with T rather than T^2; wrapping chunks in mx.checkpoint measured no lower.
+    T, S = q.shape[-2], k.shape[-2]
+    n = -(-T // block)
+    bounds = [T * i // n for i in range(n + 1)]
+    outputs = []
+    for start, stop in zip(bounds, bounds[1:]):
+        # Causal chunks keep keys only through their last row, where mlx's lower-right causal mask aligns.
+        keys = S - T + stop if isinstance(mask, str) else S
+        rows = mask
+        if isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] == T:
+            rows = mask[..., start:stop, :]
+        outputs.append(sdpa(q[..., start:stop, :], k[..., :keys, :], v[..., :keys, :], scale=scale, mask=rows))
+    return mx.concatenate(outputs, axis=2)
+
+
 def _as_array_mask(q, k, mask):
     T, S = q.shape[-2], k.shape[-2]
     if mask is None:
         return mx.ones((T, S), dtype=mx.bool_)
     return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
+
+
+# mlx 0.32.4's fused SDPA VJP keeps its S/P/dS tiles in the input dtype, so bf16/fp16 gradients lose to an explicit
+# fp32 softmax; given fp32 inputs, the same fused forward and blocked VJP run in fp32.
+# Below 2047 queries (a 2048-token sequence after the label shift) or above D128, the fp32 copies cost more than
+# mlx's unfused path, so those causal calls keep the stock kernels.
+_FP32_CAUSAL_HEAD_DIMS = frozenset((64, 128))
+_FP32_CAUSAL_MIN_QUERIES = 2047
+
+
+def _fp32_runs_stock_kernels():
+    # NAX GPUs run fp32 attention on their NAX kernels only under TF32; otherwise the fp32 forward and VJP GEMMs cost
+    # more than the unfused path at D128, and the forward no longer rounds like the stock one.
+    from .attention import _stock_runs_nax, _tf32_enabled
+
+    return _tf32_enabled() or not _stock_runs_nax()
+
+
+def _fp32_attention_routes(q, k, v, mask, head_dims):
+    D, T = k.shape[-1], q.shape[-2]
+    return (os.environ.get("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", "1") != "0"
+            and q.dtype == k.dtype == v.dtype and q.dtype in (mx.bfloat16, mx.float16) and T > 8
+            and D == v.shape[-1] and D in head_dims
+            and (mask is None or isinstance(mask, str) and mask == "causal" and T <= k.shape[-2])
+            and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def _fp32_attention(sdpa, q, k, v, scale, mask):
+    out = sdpa(q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32), scale=scale, mask=mask)
+    return out.astype(q.dtype)
+
+
+# Vision head dims of the Qwen3-VL family (Qwen3.5 64, Qwen3-VL 72 and 80), all fused by mlx from 9 queries.
+_FP32_VISION_HEAD_DIMS = frozenset((64, 72, 80))
+
+
+def fused_vision_attention(q, k, v, *, scale):
+    """Mask-free fused SDPA for a vision chunk whose fallback is an explicit fp32 softmax: fp32 inputs inside a
+    training step, the stock fused forward outside one. Returns None, so the caller keeps its explicit path, when mlx
+    would not fuse the call, off the GPU, and under UNSLOTH_MLX_FP32_TRAIN_ATTENTION=0."""
+    if not _fp32_attention_routes(q, k, v, None, _FP32_VISION_HEAD_DIMS):
+        return None
+    sdpa = mx.fast.scaled_dot_product_attention
+    sdpa = getattr(sdpa, "_unsloth_original", sdpa)
+    if mlx_training_patches_active():
+        return _fp32_attention(sdpa, q, k, v, scale, None)
+    return sdpa(q, k, v, scale=scale)
 
 
 def _wrap_training_sdpa(original):
@@ -565,6 +640,14 @@ def _wrap_training_sdpa(original):
                 block = max(_TRAINING_ATTENTION_BLOCK, window)
                 if _windowing_pays(q, k, block):
                     return _windowed_attention(original, q, k, v, scale, window, block)
+        # Disjoint by head dim, so each call takes at most one: D64/D128 fp32 route, D > 256 query chunks, else stock.
+        if (all(value is None for value in kwargs.values()) and isinstance(mask, str) and mask == "causal"
+                and T >= _FP32_CAUSAL_MIN_QUERIES and mlx_training_patches_active()
+                and _fp32_attention_routes(q, k, v, mask, _FP32_CAUSAL_HEAD_DIMS) and _fp32_runs_stock_kernels()):
+            return _fp32_attention(original, q, k, v, scale, mask)
+        if (all(value is None for value in kwargs.values()) and mlx_training_patches_active()
+                and _chunking_bounds_scores(q, v, mask)):
+            return _query_chunked_attention(original, q, k, v, scale, mask, _CHUNKED_ATTENTION_QUERIES)
         return original(q, k, v, scale=scale, mask=mask, **kwargs)
 
     wrapper._unsloth_original = original
@@ -650,9 +733,9 @@ def mlx_training_patches_active() -> bool:
     return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
 
 
-# Sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue 3887, open), rows
-# past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a probe measures corruption;
-# kill switch UNSLOTH_MLX_GATHER_QMM_GUARD=0.
+# Before mlx 0.32.3, sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue
+# 3887, fixed by 4009), rows past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a
+# probe measures corruption; UNSLOTH_MLX_GATHER_QMM_GUARD=0 or 1 overrides the version gate.
 _MLX_MAX_SORTED_ROWS = 32768
 _MLX_CANARY_ERROR_LIMIT = 1.0
 _MLX_K_REMAINDER = "k_remainder"
@@ -848,7 +931,8 @@ def is_gather_qmm_nax_guard_applied() -> bool:
 def apply_gather_qmm_nax_guard() -> bool:
     """Idempotent and thread-safe; installed under the index-stop wrapper, which removes itself by inspecting mx and would be stranded by anything on top."""
     global _MLX_GATHER_QMM_ORIGINAL
-    if os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD", "1") == "0":
+    setting = os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    if setting == "0" or (setting is None and _Version(mx.__version__) >= _Version("0.32.3")):
         return False
     with _MLX_INDEX_GRADIENT_LOCK:
         if is_gather_qmm_nax_guard_applied():
@@ -2243,11 +2327,20 @@ def _runtime_cce_by_mode(**kwargs):
     return lambda model: training if model.training else loss_only
 
 
-def make_cce_loss_fn(model, label_smoothing=0.0):
+def _reduce_token_losses(loss, ntoks, dft):
+    loss = loss.astype(mx.float32)
+    if dft:
+        # TRL's dft_loss: -p.detach() * log p per token, where p = exp(-loss); masked tokens carry loss 0.
+        loss = loss * mx.stop_gradient(mx.exp(-loss))
+    return loss.sum() / _safe_token_denominator(ntoks)
+
+
+def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
     """Chunked cross-entropy loss from hidden states and the LM head weight, avoiding full logit materialization;
     returns (model, batch, lengths, labels=None) -> (loss, ntoks), with targets labels[:,1:] masked by != -100; sets
-    _unsloth_cce_backend for logging."""
+    _unsloth_cce_backend for logging. loss_type="dft" applies only on the runtime-cce backend; fallbacks ignore it."""
     label_smoothing = _normalize_label_smoothing(label_smoothing)
+    dft = loss_type == "dft"
     # Checks topology first (mirrors the VLM factory), then head eligibility, then scale validation, so no positive CCE
     # notice precedes a fallback; backboneless models cannot yield pre-head hidden states, so the full forward is the
     # only faithful loss.
@@ -2370,7 +2463,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             )
             hidden_flat = _rotate_head_input(layer, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
     else:
         _skip_weight_grad = not _is_lm_head_trainable(model)
@@ -2414,7 +2507,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 hidden_flat, targets_flat, cce_indices,
             )
             loss = rt_cce(model)(hidden_flat, w, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
@@ -2450,6 +2543,13 @@ def _masked_correct(logits, targets, mask):
     """Supervised positions whose argmax is the target (eval token accuracy)."""
     hits = mx.logical_and(mx.argmax(logits, axis=-1) == targets, mask.astype(mx.bool_))
     return hits.astype(mx.float32).sum()
+
+
+def _row_contiguous_cross_entropy(logits, targets, **kwargs):
+    # mlx 0.32.4's fused cross-entropy VJP races on non-row-contiguous logits (ml-explore/mlx#4686). A flatten round
+    # trip copies sequence- or vocab-sliced logits and is free for row-contiguous ones; mx.contiguous would also copy a
+    # row-contiguous slice out of its larger buffer.
+    return nn.losses.cross_entropy(logits.reshape(-1).reshape(logits.shape), targets, **kwargs)
 
 
 def make_baseline_loss_fn(label_smoothing=0.0):
@@ -3064,7 +3164,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
-        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
+        ce = _row_contiguous_cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
         if return_correct:
@@ -4385,10 +4485,11 @@ def _vlm_positions_for_compile(batch_dict, config):
     return batch_dict
 
 
-def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
+def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, loss_type="nll"):
     """CCE loss over pre-lm_head hidden states from get_input_embeddings() merged embeddings, with baseline loss as
     fallback; assistant_token_id > 0 enables completion-only training, masking tokens before its first occurrence;
-    returns (model, batch_dict) -> (loss, ntoks)."""
+    returns (model, batch_dict) -> (loss, ntoks). loss_type="dft" applies only on the runtime-cce backend."""
+    dft = loss_type == "dft"
     def _marked_vlm_baseline():
         loss_fn = make_vlm_baseline_loss_fn(
             model,
@@ -4421,6 +4522,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         backbone is not None and _get_backbone_embed_kwarg(backbone) is None
         and _get_encoder_decoder_backbone(model) is None
     )
+    if dft and token_ids_only:
+        # Media batches on this backbone score through the baseline loss, which has no DFT weighting.
+        return _marked_vlm_baseline()
 
     head_desc = describe_output_head(model)
     _ineligible = _cce_head_ineligibility(head_desc)
@@ -4509,7 +4613,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             hidden_flat = _rotate_head_input(lm_head, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
     else:
         if _skip_weight_grad:
@@ -4540,7 +4644,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             loss = rt_cce(model)(hidden_flat, w, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
 
     if token_ids_only:
@@ -4574,13 +4678,17 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
 
 def _get_vlm_image_size(config, processor):
     """Target size for uniform resizing, from vision_config.image_size then processor.image_processor.size, else 512;
-    area-style size dicts (Qwen2.5-VL min/max pixels) are skipped: as dimensions they upsample to 3136x3136 and OOM."""
+    None for a processor that sizes images to its own token budget; area-style size dicts (Qwen2.5-VL min/max pixels)
+    are skipped: as dimensions they upsample to 3136x3136 and OOM."""
     vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
     if vc is not None:
         sz = vc.get("image_size") if isinstance(vc, dict) else getattr(vc, "image_size", None)
         if isinstance(sz, int) and sz > 0:
             return sz
     ip = getattr(processor, "image_processor", None)
+    # Gemma 4 resizes every image to its soft-token budget itself; its `size` (224) is nominal, not an input limit.
+    if getattr(ip, "max_soft_tokens", None) is not None:
+        return None
     if ip is not None:
         sz = getattr(ip, "size", None)
         if isinstance(sz, dict):
@@ -6336,6 +6444,27 @@ class _FiniteVisitMixin:
             int(index) for index in rng.permutation(len(self._schedule))
         )
 
+    # The original cut stays available until the shape planner settles on one, since sorting can add compiled shapes.
+    def install_length_sorted_windows(self, schedule, widths=None):
+        self._window_sort_layouts = {
+            False: (self._schedule, self._widths),
+            True: (
+                tuple(tuple(batch) for batch in schedule),
+                None if widths is None else tuple(int(x) for x in widths),
+            ),
+        }
+        self.use_length_sorted_windows(True)
+
+    @property
+    def has_window_sort_choice(self):
+        return getattr(self, "_window_sort_layouts", None) is not None
+
+    def use_length_sorted_windows(self, enabled):
+        self._schedule, self._widths = self._window_sort_layouts[bool(enabled)]
+
+    def settle_window_sort(self):
+        self._window_sort_layouts = None
+
 
 class FiniteTextBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite text schedule with on-demand MLX materialization."""
@@ -6355,6 +6484,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         "_visit_epoch_cache",
         "_cycle_length",
         "_cce_capacities",
+        "_window_sort_layouts",
     )
 
     def __init__(
@@ -6382,6 +6512,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self.label_dtype = np.dtype(label_dtype)
         self._shape_plan = None
         self._cce_capacities = {}
+        self._window_sort_layouts = None
         self._visit_policy = str(visit_policy)
         # Seed normalized eagerly so visits never depend on ambient RNG state; a plan rebuilt in a fresh process on resume derives identical visits.
         self._visit_seed = (
@@ -12273,6 +12404,30 @@ def _finite_batch_schedule(
     return tuple(schedule), cycle_length
 
 
+def _length_sorted_windows(schedule, row_length, grad_accum, cycle_length=None):
+    """Re-cut each accumulation window's rows longest first into micro-batches of the original sizes; windows restart
+    at every cycle_length boundary, as the trainer's epoch-final update does, so each optimizer step keeps its rows."""
+    schedule = tuple(tuple(batch) for batch in schedule)
+    accum = max(1, int(grad_accum or 1))
+    if accum == 1:
+        return schedule
+    block = max(1, int(cycle_length or len(schedule) or 1))
+    result = list(schedule)
+    for block_start in range(0, len(schedule), block):
+        block_end = min(block_start + block, len(schedule))
+        for start in range(block_start, block_end, accum):
+            window = schedule[start:min(start + accum, block_end)]
+            rows = sorted(
+                (row for batch in window for row in batch),
+                key=lambda row: (row is None, 0 if row is None else -row_length(row)),
+            )
+            offset = 0
+            for position, batch in enumerate(window):
+                result[start + position] = tuple(rows[offset:offset + len(batch)])
+                offset += len(batch)
+    return tuple(result)
+
+
 def _text_row_length(row):
     if isinstance(row, (tuple, list)) and row and isinstance(row[0], (tuple, list)):
         return len(row[0])
@@ -12333,6 +12488,7 @@ def _create_ordered_text_plan(
     completion_only_loss=None,
     assistant_only_loss=False,
     comm_group=None,
+    length_sorted_windows=False,
 ):
     """Build a text batch plan over an explicit dataset order, mirroring CUDA's sampler stream without changing mlx-lm
     batching; under DDP, comm_group expands to global micro-batches and returns this rank's slice."""
@@ -12453,7 +12609,7 @@ def _create_ordered_text_plan(
             for input_ids in tokenized
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
-    return FiniteTextBatchPlan(
+    plan = FiniteTextBatchPlan(
         rows,
         schedule,
         cycle_length=cycle_length,
@@ -12461,6 +12617,14 @@ def _create_ordered_text_plan(
         pad_id=0 if pad_id is None else int(pad_id),
         minimum_width=2,
     )
+    if length_sorted_windows:
+        plan.install_length_sorted_windows(_length_sorted_windows(
+            schedule,
+            lambda index: _text_row_length(tokenized[index]),
+            grad_accum,
+            cycle_length,
+        ))
+    return plan
 
 
 def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,

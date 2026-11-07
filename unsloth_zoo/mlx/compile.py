@@ -3499,9 +3499,15 @@ def _install_qwen3_family_compile_patches():
         split_indices = _split_points(cu_seqlens)
         splits = [mx.split(tensor, split_indices, axis=2) for tensor in (q, k, v)]
 
+        from .utils import fused_vision_attention
+
         attn_outputs = []
         for q_chunk, k_chunk, v_chunk in zip(*splits):
-            # MLX fused SDPA mismatches value_and_grad for Qwen3-VL vision; use explicit.
+            out = fused_vision_attention(q_chunk, k_chunk, v_chunk, scale=self.scale)
+            if out is not None:
+                attn_outputs.append(out)
+                continue
+            # Not routed (8 or fewer patches, an fp32 tower, another head dim, off the GPU, or the kill switch): fp32 scores.
             scores = (
                 q_chunk.astype(mx.float32)
                 @ mx.swapaxes(k_chunk.astype(mx.float32), -1, -2)

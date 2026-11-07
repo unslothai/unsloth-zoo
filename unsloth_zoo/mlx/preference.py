@@ -32,6 +32,7 @@ from .utils import (
     _extract_vlm_images,
     _finite_batch_schedule,
     _finite_row_schedule,
+    _length_sorted_windows,
     _finite_text_pad_width,
     _forward_text_hidden_states,
     _get_mlx_dropout_probability,
@@ -46,6 +47,7 @@ from .utils import (
     _preserved_preprocessing_rng,
     _processor_vlm_inputs,
     _render_vlm_messages,
+    _row_contiguous_cross_entropy,
     _row_has_images,
     _to_mx_vlm_batch,
     _torch_randperm_order,
@@ -1076,7 +1078,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         "_rows", "_schedule", "_normalizers", "_widths", "_cycle_length",
         "max_seq_length", "pad_id", "_shape_plan", "_visit_policy",
         "_visit_seed", "_visit_epoch_cache", "_cce_capacities", "_cce_kind",
-        "_reference", "_shared_prompt_ratio", "_shared_lengths", "_shared_prompt_notices",
+        "_reference", "_shared_prompt_ratio", "_shared_lengths", "_shared_prompt_notices", "_window_sort_layouts",
     )
 
     def __init__(
@@ -1098,6 +1100,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         self._reference = None
         self._shared_prompt_ratio, self._shared_lengths = shared_prompt_ratio, {}
         self._shared_prompt_notices = set() if shared_prompt_notices is None else shared_prompt_notices
+        self._window_sort_layouts = None
         self._widths = tuple(self._raw_width(batch) for batch in self._schedule)
 
     @property
@@ -1525,6 +1528,7 @@ def create_preference_batch_plan(
     images_from=None,
     shared_prompt_ratio=None,
     shared_prompt_notices=None,
+    length_sorted_windows=False,
 ):
     """Builds the finite preference plan for every objective; prompt_sink receives each row's rendered prompt text; a
     processor gives a vision plan; image rows re-read images per batch when images_from (default dataset,
@@ -1619,7 +1623,7 @@ def create_preference_batch_plan(
     vision = {} if processor is None else dict(
         processor=processor, model_config=model_config,
     )
-    return (FiniteVisionPreferenceBatchPlan if vision else FinitePreferenceBatchPlan)(
+    plan = (FiniteVisionPreferenceBatchPlan if vision else FinitePreferenceBatchPlan)(
         rows, schedule,
         normalizers=_window_normalizers(
             rows, schedule, cycle_length, grad_accum, length_policy.kind,
@@ -1631,6 +1635,18 @@ def create_preference_batch_plan(
         shared_prompt_notices=shared_prompt_notices,
         **vision,
     )
+    if length_sorted_windows:
+        # Normalizers are window totals, so they hold for the re-cut windows unchanged.
+        sorted_schedule = _length_sorted_windows(
+            schedule,
+            lambda index: max(len(rows[index].chosen), len(rows[index].rejected)),
+            grad_accum,
+            cycle_length,
+        )
+        plan.install_length_sorted_windows(
+            sorted_schedule, [plan._raw_width(batch) for batch in sorted_schedule],
+        )
+    return plan
 
 
 @dataclass(frozen=True)
@@ -2544,7 +2560,7 @@ def _repeated_prompt_span(prefix, pairs):
 def _token_cross_entropy(logits, targets, mask):
     # An image token may lie past the output head (Mllama's does), so unscored labels are gathered as token 0, as TRL does.
     targets = mx.where(mask > 0, targets, 0)
-    return nn.losses.cross_entropy(
+    return _row_contiguous_cross_entropy(
         logits, targets, reduction="none",
     ).reshape(targets.shape)
 

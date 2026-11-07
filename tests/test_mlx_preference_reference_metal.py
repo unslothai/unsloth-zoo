@@ -198,6 +198,12 @@ def test_a_qualified_vision_plan_is_surveyed_and_planned_for_compile():
     Plan.pixel_width = 16
     with pytest.raises(RuntimeError, match="drifted from its surveyed compile family"):
         plan.materialize(1, phase="single")
+    # Global-norm clipping with accumulation compiles through the shared update, so it still plans.
+    args = MLXDPOConfig(max_steps=1, gradient_accumulation_steps=2, max_grad_norm=1.0)
+    plan = Plan(
+        [row(20, False), row(50, True)], [[0], [1]], processor=None, model_config={},
+        normalizers=[(1, 1, 1)] * 2, cycle_length=2, max_seq_length=64, pad_id=0)
+    assert planned(SimpleNamespace(enabled=True))[1:3] == (plan._shape_plan.report, True)
 
 
 def _tiny_gemma4_vlm(seed):
