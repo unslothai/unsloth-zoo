@@ -3593,8 +3593,8 @@ class _VLMBatchAdapter:
                 RuntimeWarning,
                 stacklevel = self.audio_warn_stacklevel,
             )
-        if audio_rows and self.defaults.logits_warp is not None:
-            raise ValueError("Audio requests decode one at a time, which takes no logits_warp.")
+        if audio_rows and (self.defaults.logits_warp is not None or self.defaults.token_ids_only):
+            raise ValueError("Audio requests decode one at a time, which takes no logits_warp or token_ids_only.")
         for index in audio_rows:
             yield from self._stream_sequentially(index, requests[index])
         groups: dict[Any, list[int]] = {}
