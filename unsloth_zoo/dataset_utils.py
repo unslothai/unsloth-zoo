@@ -2697,7 +2697,7 @@ def standardize_data_formats(
         # ways (20k rows: 6.6 s over 8 workers vs 0.15 s in process). Stay in process for an
         # in-memory dataset unless a count was asked for, as Studio's own copy of this map does.
         if (
-            type(num_proc) is not int
+            num_proc is None
             and not getattr(dataset, "cache_files", None)
             and not environment_override()[0]
         ):
