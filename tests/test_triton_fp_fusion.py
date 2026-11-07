@@ -79,12 +79,21 @@ def _kwargs_dicts(tree):
             if isinstance(node, ast.Call):
                 splats = [k.value.id for k in node.keywords if k.arg is None and isinstance(k.value, ast.Name)]
                 values = [dicts[n] for n in splats if n in dicts]
-                out[id(node)] = [
-                    branch
-                    for value in values
-                    for branch in ((value.body, value.orelse) if isinstance(value, ast.IfExp) else (value,))
-                ]
+                out[id(node)] = [branch for value in values for branch in _compiled_branches(value)]
     return out
+
+
+def _compiled_branches(value):
+    """`a if cond else b`: both branches, except the one taken only under TRITON_INTERPRET."""
+    if not isinstance(value, ast.IfExp):
+        return (value,)
+    test = value.test
+    negated = isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+    if negated:
+        test = test.operand
+    if isinstance(test, ast.Name) and "INTERPRET" in test.id:
+        return (value.body,) if negated else (value.orelse,)
+    return (value.body, value.orelse)
 
 
 def _fp_fusion_values(node, splatted):
@@ -226,10 +235,34 @@ def test_every_launch_states_fp_fusion():
             missing.append(f"{rel}:{node.lineno}:{name}")
             continue
         want = f"{rel}:{name}" not in _DELIBERATE_FALSE
-        if not (isinstance(values[0], ast.Constant) and values[0].value is want):
+        if not all(isinstance(v, ast.Constant) and v.value is want for v in values):
             wrong.append(f"{rel}:{node.lineno}:{name} expected {want}")
     assert not missing, f"Triton launches without enable_fp_fusion: {missing}"
     assert not wrong, wrong
+
+
+@pytest.mark.parametrize("mutation, rejected", [
+    ('{"enable_fp_fusion": False} if _INTERPRET else {"enable_fp_fusion": True}', True),
+    ('{} if _INTERPRET else {"enable_fp_fusion": True}', True),
+    ('{"enable_fp_fusion": True} if not _INTERPRET else {"enable_fp_fusion": False}', True),
+    ('{"enable_fp_fusion": False} if not _INTERPRET else {"enable_fp_fusion": True}', False),
+])
+def test_guard_checks_every_compiled_branch(mutation, rejected, monkeypatch, tmp_path):
+    import shutil
+
+    copy = tmp_path / "unsloth_zoo"
+    shutil.copytree(ZOO, copy, ignore = shutil.ignore_patterns("__pycache__", "*.so", "*.json"))
+    target = copy / "gpt_oss_decode_fused.py"
+    src = target.read_text(encoding = "utf-8")
+    original = '_NO_FMA = {} if _INTERPRET else {"enable_fp_fusion": False}'
+    assert original in src
+    target.write_text(src.replace(original, "_NO_FMA = " + mutation), encoding = "utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "ZOO", copy)
+    if rejected:
+        with pytest.raises(AssertionError, match = "_add_rms_norm_kernel"):
+            test_every_launch_states_fp_fusion()
+    else:
+        test_every_launch_states_fp_fusion()
 
 
 
