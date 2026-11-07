@@ -381,11 +381,16 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from collections import OrderedDict
 from tqdm import tqdm as ProgressBar
-import os, shutil, re, functools
+import os, shutil, re, functools, threading
 
 # Flush the allocator only after a large-tensor merge (embed / lm_head / fused
 # experts); a per-key empty_cache/synchronize over every key is wasted GPU stall.
 _EMPTY_CACHE_BYTES_THRESHOLD = 256 * 1024 * 1024
+
+
+# Before torch 2.12 the CRC32 option is process-wide: two overlapping spools could each restore the
+# other's False and leave it off. Spools are serial anyway (one merge loop), so they take turns.
+_SPOOL_CRC32_LOCK = threading.Lock()
 
 
 def _torch_save_spool(tensor, path, pickle_module, pickle_protocol):
@@ -395,12 +400,13 @@ def _torch_save_spool(tensor, path, pickle_module, pickle_protocol):
     set_crc32 = getattr(torch.serialization, "set_crc32_options", None)
     if get_crc32 is None or set_crc32 is None:
         return torch.save(tensor, path, pickle_module = pickle_module, pickle_protocol = pickle_protocol)
-    previous = get_crc32()
-    set_crc32(False)
-    try:
-        return torch.save(tensor, path, pickle_module = pickle_module, pickle_protocol = pickle_protocol)
-    finally:
-        set_crc32(previous)
+    with _SPOOL_CRC32_LOCK:
+        previous = get_crc32()
+        set_crc32(False)
+        try:
+            return torch.save(tensor, path, pickle_module = pickle_module, pickle_protocol = pickle_protocol)
+        finally:
+            set_crc32(previous)
 
 
 @functools.lru_cache(maxsize = 1)

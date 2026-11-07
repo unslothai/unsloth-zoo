@@ -119,3 +119,52 @@ def test_torch_without_crc32_option_keeps_plain_save(tmp_path, monkeypatch):
     import pickle
     su._torch_save_spool(torch.ones(2), str(tmp_path / "x.pt"), pickle, pickle.HIGHEST_PROTOCOL)
     assert calls == [str(tmp_path / "x.pt")]
+
+
+
+@_needs_crc_api
+def test_overlapping_spools_take_turns_and_restore_a_process_wide_option(tmp_path, monkeypatch):
+    # Before torch 2.12 the option is process-wide: without turns, B saves A's False as its
+    # "previous" and restores it after A has already put True back.
+    import pickle
+    import threading
+
+    option = {"crc32": True}
+    monkeypatch.setattr(torch.serialization, "get_crc32_options", lambda: option["crc32"])
+    monkeypatch.setattr(
+        torch.serialization, "set_crc32_options", lambda value: option.__setitem__("crc32", value)
+    )
+    real_save = torch.save
+    entered = {"A": threading.Event(), "B": threading.Event()}
+    release = {"A": threading.Event(), "B": threading.Event()}
+    seen = {}
+
+    def gated(obj, path, **kwargs):
+        name = os.path.basename(path)
+        entered[name].set()
+        assert release[name].wait(10)
+        seen[name] = option["crc32"]
+        return real_save(obj, path, **kwargs)
+
+    monkeypatch.setattr(torch, "save", gated)
+    threads = {
+        name: threading.Thread(
+            target = su._torch_save_spool,
+            args = (torch.ones(4), str(tmp_path / name), pickle, 2),
+        )
+        for name in ("A", "B")
+    }
+    threads["A"].start()
+    assert entered["A"].wait(10)
+    threads["B"].start()
+    try:
+        assert not entered["B"].wait(0.3), "a second spool ran while the first held the option off"
+    finally:
+        release["A"].set()
+        assert entered["B"].wait(10)
+        release["B"].set()
+        for thread in threads.values():
+            thread.join(10)
+    assert seen == {"A": False, "B": False}
+    assert option["crc32"] is True
+    assert (tmp_path / "A").is_file() and (tmp_path / "B").is_file()
