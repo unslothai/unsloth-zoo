@@ -2433,7 +2433,7 @@ def test_shared_prefixes_live_only_while_their_rows_can_decode(monkeypatch, layo
     assert added == [(ids, ids) for ids in order] and peak[0] <= 2 * 4
 
 
-@pytest.mark.skipif(importlib.util.find_spec("mlx") is None, reason="needs real mlx.random")
+@pytest.mark.skipif(importlib.import_module("mlx_simulation").mlx_is_simulated(), reason="needs real mlx.random")
 @pytest.mark.parametrize("rows_reduce_alike", [True, False])
 def test_batched_draws_match_per_row_samplers_on_either_reduction_route(monkeypatch, rows_reduce_alike):
     import mlx.core as mx
