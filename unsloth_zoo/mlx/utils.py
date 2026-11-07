@@ -687,7 +687,8 @@ def _train_qmm_call(native, routes):
 def _set_mlx_train_qmm(enabled: bool) -> None:
     current = nn.QuantizedLinear.__call__
     original = getattr(current, "_unsloth_original", None)
-    if enabled and original is None:
+    # A __call__ someone else rebound keeps its behaviour: only mlx's own method takes the route.
+    if enabled and original is None and getattr(current, "__module__", "").startswith("mlx.nn."):
         from . import matmul
         routes = matmul.available_train_qmm_routes()
         if routes:

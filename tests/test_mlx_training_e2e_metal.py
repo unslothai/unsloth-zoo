@@ -645,6 +645,20 @@ def test_training_route_takes_large_frozen_projections(monkeypatch, case, shape,
 
 
 @metal_only
+def test_training_route_keeps_a_rebound_quantized_linear_call(monkeypatch):
+    monkeypatch.setattr(matmul, "available_train_qmm_routes", lambda: ("dense",))
+    native, custom = nn.QuantizedLinear.__call__, lambda self, x: native(self, x) * 2
+    for call, routed in ((custom, False), (native, True)):
+        monkeypatch.setattr(nn.QuantizedLinear, "__call__", call)
+        mlx_utils.acquire_mlx_training_patches()
+        try:
+            assert (nn.QuantizedLinear.__call__ is not call) is routed
+        finally:
+            mlx_utils.release_mlx_training_patches()
+        assert nn.QuantizedLinear.__call__ is call
+
+
+@metal_only
 @pytest.mark.parametrize("bits", [4, 8])
 def test_output_and_input_gradient_are_no_further_from_fp32_than_stock(bits):
     matmul.probe_dense_train_qmm()   # the GEMM operand is stock's tile, bit for bit
