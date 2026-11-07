@@ -650,9 +650,9 @@ def mlx_training_patches_active() -> bool:
     return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
 
 
-# Sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue 3887, open), rows
-# past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a probe measures corruption;
-# kill switch UNSLOTH_MLX_GATHER_QMM_GUARD=0.
+# Before mlx 0.32.3, sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue
+# 3887, fixed by 4009), rows past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a
+# probe measures corruption; UNSLOTH_MLX_GATHER_QMM_GUARD=0 or 1 overrides the version gate.
 _MLX_MAX_SORTED_ROWS = 32768
 _MLX_CANARY_ERROR_LIMIT = 1.0
 _MLX_K_REMAINDER = "k_remainder"
@@ -848,7 +848,8 @@ def is_gather_qmm_nax_guard_applied() -> bool:
 def apply_gather_qmm_nax_guard() -> bool:
     """Idempotent and thread-safe; installed under the index-stop wrapper, which removes itself by inspecting mx and would be stranded by anything on top."""
     global _MLX_GATHER_QMM_ORIGINAL
-    if os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD", "1") == "0":
+    setting = os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    if setting == "0" or (setting is None and _Version(mx.__version__) >= _Version("0.32.3")):
         return False
     with _MLX_INDEX_GRADIENT_LOCK:
         if is_gather_qmm_nax_guard_applied():
@@ -2354,6 +2355,13 @@ def _masked_correct(logits, targets, mask):
     return hits.astype(mx.float32).sum()
 
 
+def _row_contiguous_cross_entropy(logits, targets, **kwargs):
+    # mlx 0.32.4's fused cross-entropy VJP races on non-row-contiguous logits (ml-explore/mlx#4686). A flatten round
+    # trip copies sequence- or vocab-sliced logits and is free for row-contiguous ones; mx.contiguous would also copy a
+    # row-contiguous slice out of its larger buffer.
+    return nn.losses.cross_entropy(logits.reshape(-1).reshape(logits.shape), targets, **kwargs)
+
+
 def make_baseline_loss_fn(label_smoothing=0.0):
     """Standard cross-entropy over full LM-head logits, used when use_cce=False; returns (model, batch, lengths,
     labels=None) -> (loss, ntoks); with label_smoothing=0 the labels=None branch is byte-identical to
@@ -2966,7 +2974,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
-        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
+        ce = _row_contiguous_cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
         if return_correct:

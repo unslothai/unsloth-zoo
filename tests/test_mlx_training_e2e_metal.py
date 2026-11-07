@@ -2805,8 +2805,17 @@ def test_gather_qmm_reroutes_only_when_defective(defective, monkeypatch, raw_gat
 def test_gather_qmm_guard_install(monkeypatch, raw_gather_qmm):
     """The guard must end up beneath the index-stop wrapper, even mid-training."""
     monkeypatch.setenv("UNSLOTH_MLX_GATHER_QMM_GUARD", "0")
+    monkeypatch.setattr(mx, "__version__", "0.32.2")
     assert mlx_utils.apply_gather_qmm_nax_guard() is False
     monkeypatch.delenv("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    monkeypatch.setattr(mx, "__version__", "0.32.3")
+    assert mlx_utils.apply_gather_qmm_nax_guard() is False
+    assert mx.gather_qmm is raw_gather_qmm
+    monkeypatch.setenv("UNSLOTH_MLX_GATHER_QMM_GUARD", "1")
+    assert mlx_utils.apply_gather_qmm_nax_guard() is True
+    monkeypatch.setattr(mx, "gather_qmm", raw_gather_qmm)
+    monkeypatch.delenv("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    monkeypatch.setattr(mx, "__version__", "0.32.2")
     mlx_utils.acquire_mlx_training_patches()
     try:
         assert mlx_utils.apply_gather_qmm_nax_guard() is True
@@ -3152,6 +3161,59 @@ def test_encoder_decoder_cce_matches_full_forward_and_gradients(conditioning, re
         assert mx.allclose(actual, expected, atol=1e-5).item()
         for (name, a), (_, b) in zip(tree_flatten(g1), tree_flatten(g2)):
             assert mx.allclose(a, b, atol=2e-5, rtol=2e-3).item(), name
+
+
+@metal_only
+@pytest.mark.parametrize("head", ["full", "vocab_sliced"])
+@pytest.mark.parametrize("B", [32, 1])
+@pytest.mark.parametrize("site", ["vlm_baseline", "preference", "grpo"])
+def test_sliced_vlm_logits_differentiate_like_contiguous_ones(site, B, head, monkeypatch):
+    """mlx 0.32.4's fused cross-entropy VJP races on non-row-contiguous logits (ml-explore/mlx#4686): looped to catch
+    it. A vocabulary-sliced head (Inkling's unpadded_vocab_size) is strided even at one row; a one-row sequence slice of
+    a full head is not, and must not pay a copy."""
+    from unsloth_zoo.mlx import grpo, preference
+    L, V = 129 if B > 1 else 4097, 8192  # as many rows at B=1 as at B=32: a short VJP finishes before the race window
+    W = V - 64 if head == "vocab_sliced" else V
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logits = mx.random.normal((B, L, V))
+
+        def __call__(self, ids, **kwargs):
+            return self.logits[..., :W]
+
+    ids = mx.random.randint(0, W, (B, L))
+    batch = dict(input_ids=ids, attention_mask=mx.ones_like(ids))
+    score = {
+        "vlm_baseline": lambda m: mlx_utils.make_vlm_baseline_loss_fn(ignore_token_ids=[])(m, batch)[0],
+        "preference": lambda m: preference._response_logps(m, batch, mx.array([[1, L]] * B)).sum(),
+        "grpo": lambda m: grpo.completion_logps(m, batch, 1.0).sum(),
+    }[site]
+    model = Model()
+    grad = lambda: nn.value_and_grad(model, score)(model)[1]["logits"]
+    stock = nn.losses.cross_entropy
+    with monkeypatch.context() as patch:
+        patch.setattr(nn.losses, "cross_entropy", lambda x, *a, **kw: stock(mx.contiguous(x), *a, **kw))
+        expected = grad()
+        mx.eval(expected)
+    assert mx.abs(expected).max().item() > 0
+    for _ in range(400):
+        assert mx.array_equal(grad(), expected).item()
+    if B == 1 and head == "full":
+        def peak():
+            mx.eval(grad())
+            mx.synchronize()
+            mx.reset_peak_memory()
+            mx.eval(grad())
+            mx.synchronize()
+            return mx.get_peak_memory()
+
+        with monkeypatch.context() as patch:
+            for module in (mlx_utils, preference, grpo):
+                patch.setattr(module, "_row_contiguous_cross_entropy", lambda x, t, **kw: stock(x, t, **kw))
+            uncopied = peak()
+        assert peak() - uncopied < (L - 1) * V * 4 // 2
 
 
 @metal_only
