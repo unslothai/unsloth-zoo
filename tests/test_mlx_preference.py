@@ -1352,6 +1352,20 @@ def said():
         yield caught
 
 
+def test_a_pair_plan_recomputes_shared_prompts_when_the_window_sort_layout_switches():
+    from unsloth_zoo.mlx import preference as p
+    row = lambda prompt, chosen, rejected, part=None: p.TokenizedPreferenceRow(ids := tuple(range(3, 3 + prompt)), tuple(range(500, 500 + chosen)), tuple(2 if i == part else t for i, t in enumerate(ids)), tuple(range(900, 900 + rejected)))  # noqa: E501, E731
+    pairs = [row(70, 30, 20), row(97, 10, 25), row(64, 60, 50), row(98, 60, 50), row(98, 60, 50, part=45), row(98, 60, 50, part=10)]  # noqa: E501
+    plan = p.FinitePreferenceBatchPlan(pairs, [(0, 1), (2, 3), (4, 3), (5, 3)], normalizers=[(1, 2, 1)] * 4, cycle_length=4, max_seq_length=256, pad_id=0, shared_prompt_ratio=1.0, shared_prompt_notices=set())  # noqa: E501
+    flipped = [(5, 3), (4, 3), (2, 3), (0, 1)]
+    plan.install_length_sorted_windows(flipped, [plan._raw_width(batch) for batch in flipped])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        assert [plan.shared_prompt_length(index) for index in range(4)] == [0, 32, 32, 64]
+        plan.use_length_sorted_windows(False)
+        assert [plan.shared_prompt_length(index) for index in range(4)] == [64, 32, 32, 0]
+
+
 def test_a_pair_plan_runs_each_shared_prompt_once_where_it_pays_and_says_why_not(said):
     # The prefix: on the 32 rung, before each row's last prompt token and the chosen/rejected split, from the batch.
     from unsloth_zoo.mlx import preference as p

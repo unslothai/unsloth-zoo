@@ -1184,6 +1184,10 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         shared = self.shared_prompt_length(index)
         return family + ((("shared_prompt", shared),) if shared else ())
 
+    def use_length_sorted_windows(self, enabled):
+        super().use_length_sorted_windows(enabled)
+        self._shared_lengths.clear()  # keyed by batch position, which the switch reassigns
+
     def shared_prompt_length(self, index):
         """Leading tokens both rows of every pair in batch index share and run once, or 0: short of each row's last
         prompt token, whose hidden state predicts its first response token; a multiple of 32, to bound compiled shapes;
