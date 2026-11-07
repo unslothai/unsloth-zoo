@@ -173,7 +173,8 @@ if triton is not None:
         tl.store(counts + pid * 3 + 0, tl.sum(tl.sum(bad.to(tl.int32), 1), 0))
         tl.store(counts + pid * 3 + 1, tl.sum(tl.sum(k, 1), 0))
         tl.store(counts + pid * 3 + 2, tl.sum(tl.sum(esc.to(tl.int32), 1), 0))
-        tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, wb.to(tl.int64), 0), 1), 0))
+        # A tile's bit-pattern sum fits int32 (|sum| <= 32 * 128 * 32768 = 2^27): 64-bit math once per tile.
+        tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, wb, 0), 1), 0).to(tl.int64))
 
     @triton.jit
     def _fold_tile(
@@ -183,18 +184,17 @@ if triton is not None:
         TILE: tl.constexpr = BLOCK_N * BLOCK_K
         new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
         fk = tl.reshape(k, (TILE,))
-        kk = tl.maximum(fk, 1).to(tl.int64)
-        code = tl.reshape(c, (TILE,)).to(tl.int64) & ((1 << kk) - 1)
-        bitpos = tl.load(woff + pid).to(tl.int64) * 32 + (tl.cumsum(fk, 0) - fk).to(tl.int64)
-        word = bitpos >> 5
-        shift = bitpos & 31
+        # 32-bit math: a tile's stream is at most 32 * 128 * (MAX_GAP + 1) bits, its codes at most 8 bits wide.
+        code = (tl.reshape(c, (TILE,)) & ((1 << tl.maximum(fk, 1)) - 1)).to(tl.uint32)
+        local = tl.cumsum(fk, 0) - fk
+        base = words + tl.load(woff + pid)
+        word = local >> 5
+        shift = local & 31
         put = (fk > 0) & (code != 0)
-        lo = (code << shift) & 0xFFFFFFFF
-        hi = code >> (32 - shift)
-        lo = tl.where(lo >= 2147483648, lo - 4294967296, lo).to(tl.int32)
-        hi = tl.where(hi >= 2147483648, hi - 4294967296, hi).to(tl.int32)
-        tl.atomic_or(words + word, lo, mask = put, sem = "relaxed")
-        tl.atomic_or(words + word + 1, hi, mask = put & (shift + fk > 32), sem = "relaxed")
+        lo = (code << shift.to(tl.uint32)).to(tl.int32, bitcast = True)
+        hi = tl.where(shift > 0, code >> ((32 - shift) & 31).to(tl.uint32), 0).to(tl.int32, bitcast = True)
+        tl.atomic_or(base + word, lo, mask = put, sem = "relaxed")
+        tl.atomic_or(base + word + 1, hi, mask = put & (shift + fk > 32), sem = "relaxed")
         flat_esc = tl.reshape(esc.to(tl.int32), (TILE,))
         pos = tl.load(eoff + pid) + tl.cumsum(flat_esc, 0) - 1
         flat_idx = tl.reshape(
@@ -217,23 +217,29 @@ if triton is not None:
         nb = w.to(tl.int16, bitcast = True).to(tl.int32)
         bb = back.to(tl.int16, bitcast = True).to(tl.int32)
         k = tl.reshape(tl.where(mask, _width(nb, bb, MANT, EXPM, MAX_GAP), 0), (TILE,))
-        bitpos = tl.load(woff + pid).to(tl.int64) * 32 + (tl.cumsum(k, 0) - k).to(tl.int64)
-        word = bitpos >> 5
-        shift = bitpos & 31
+        # 32-bit math (as the fold): bit offsets inside this tile's stream; reads stay inside the stream.
+        start = tl.load(woff + pid)
+        limit = tl.minimum(n_words - start, 1 << 30).to(tl.int32)
+        base = words + start
+        local = tl.cumsum(k, 0) - k
+        word = local >> 5
+        shift = local & 31
         has = k > 0
-        lo = tl.load(words + word, mask = has & (word < n_words), other = 0).to(tl.int64) & 0xFFFFFFFF
-        hi = tl.load(words + word + 1, mask = has & (word + 1 < n_words), other = 0).to(tl.int64) & 0xFFFFFFFF
-        kk = tl.maximum(k, 1).to(tl.int64)
-        code = ((lo | (hi << 32)) >> shift) & ((1 << kk) - 1)
+        lo = tl.load(base + word, mask = has & (word < limit), other = 0).to(tl.uint32, bitcast = True)
+        hi = tl.load(base + word + 1, mask = has & (shift + k > 32) & (word + 1 < limit), other = 0)
+        hi = hi.to(tl.uint32, bitcast = True)
+        kk = tl.maximum(k, 1)
+        joined = (lo >> shift.to(tl.uint32)) | tl.where(shift > 0, hi << ((32 - shift) & 31).to(tl.uint32), 0)
+        code = (joined & ((1 << kk) - 1).to(tl.uint32)).to(tl.int32)
         half = 1 << (kk - 1)
         c = tl.where(code >= half, code - (1 << kk), code)
         # The escape code (-half) keeps back: the escape list overwrites it.
         ok = has & (c != -half)
         fb = tl.reshape(bb, (TILE,))
-        out = tl.where(ok, _ord(_ord(fb) + c.to(tl.int32)), fb)
-        out = tl.reshape(out, (BLOCK_N, BLOCK_K)).to(tl.int16)
-        tl.store(ptrs, out.to(w.dtype, bitcast = True), mask = mask)
-        tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, out.to(tl.int64), 0), 1), 0))
+        out = tl.where(ok, _ord(_ord(fb) + c), fb)
+        out = tl.reshape(out, (BLOCK_N, BLOCK_K))
+        tl.store(ptrs, out.to(tl.int16).to(w.dtype, bitcast = True), mask = mask)
+        tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, out, 0), 1), 0).to(tl.int64))
 pass
 
 
