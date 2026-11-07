@@ -2,6 +2,7 @@
 gradient-driven progress and adapter saving across grad-clip paths, decoupled weight decay, batching, CCE and
 baseline losses."""
 
+import contextvars
 import glob
 import json
 import os
@@ -27,6 +28,8 @@ if _METAL:
     import mlx.nn as nn
     import mlx.optimizers as optim
     from mlx.utils import tree_flatten, tree_map
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import inference, matmul
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     from unsloth_zoo.mlx import utils as mlx_utils
@@ -591,6 +594,115 @@ def test_training_attention_differentiates_short_queries_and_sinks(T, mask, sink
     finally:
         mlx_utils.release_mlx_training_patches()
     assert mx.allclose(got, mx.grad(reference)(q), atol=1e-4)
+
+
+STAGED = ("staged", "staged_below_floor", "staged_reference", "staged_off")
+
+
+@metal_only
+@pytest.mark.parametrize("case,shape,N,bits,route,value", [
+    ("8bit_batched", (2, 768, 256), 1024, 8, "dense", 1), ("bias", (1, 1536, 256), 1024, 4, "dense", 3),
+    ("below_floor", (1, 1535, 256), 1024, 4, None, 0), ("thin", (1, 1536, 256), 1016, 4, None, 0),
+    ("2bit", (1, 1536, 256), 1024, 2, None, 0), ("eval_policy", (1, 1536, 256), 1024, 4, "dense", 1),
+    ("eval_reference", (1, 1536, 256), 1024, 4, "dense", 1), ("trainable_scales", (1, 1536, 256), 1024, 4, None, 0),
+    ("at_cap", (1, 1536, 256), 1024, 4, "dense", 1), ("over_cap", (1, 1536, 256), 1024, 4, None, 0),
+    ("other_context", (1, 1536, 256), 1024, 4, None, 0), ("dense_off", (1, 1536, 2048), 2048, 4, None, 0),
+    ("staged", (1, 1024, 2048), 2048, 4, "staged", 1), ("staged_below_floor", (1, 1023, 2048), 2048, 4, None, 0),
+    ("staged_reference", (1, 1024, 2048), 2048, 4, "staged", 1), ("staged_off", (1, 1024, 2048), 2048, 4, None, 0)])
+def test_training_route_takes_large_frozen_projections(monkeypatch, case, shape, N, bits, route, value):
+    (*rows, K), calls, native, x = shape, [], nn.QuantizedLinear.__call__, mx.zeros(shape, mx.bfloat16)
+    for target, name in ((matmul, "simd_qmm_available"), (matmul, "_train_dequantize_kernel"),
+                         (matmul.nax, "kernel_probe_passed")):
+        monkeypatch.setattr(target, name, lambda *args: True)
+    # "dense_off" is staged-eligible but has no staged route
+    monkeypatch.setattr(matmul, "staged_train_qmm_available", lambda: case in STAGED)
+    for name in ("UNSLOTH_MLX_DENSE_TRAIN_QMM", "UNSLOTH_MLX_STAGED_TRAIN_QMM"):   # the defaults must route
+        monkeypatch.delenv(name, raising = False)
+    if case == "dense_off" or case in STAGED:
+        monkeypatch.setenv("UNSLOTH_MLX_DENSE_TRAIN_QMM", "0")
+    if case == "staged_off":
+        monkeypatch.setenv("UNSLOTH_MLX_STAGED_TRAIN_QMM", "0")
+    monkeypatch.setattr(matmul, "_DENSE_TRAIN_QMM_MAX_WEIGHTS", K * N + {"at_cap": 0, "over_cap": -1}.get(case, 1))
+    for owner, attr, kind in ((matmul, "_dense_train_qmm", "dense"),
+                              (matmul, "differentiable_staged_train_qmm", "staged")):
+        monkeypatch.setattr(owner, attr, lambda group_size, bits, kind = kind: lambda x, w, s, b: (
+            calls.append((kind, x.shape, bits)) or mx.ones((x.shape[0], w.shape[0]), x.dtype)))
+    base = nn.QuantizedLinear(K, N, bias = case == "bias", bits = bits)
+    base.set_dtype(mx.bfloat16)
+    base.update({"bias": mx.full((N,), 2, mx.bfloat16)} if case == "bias" else {})
+    base.unfreeze(keys = ["scales"] if case == "trainable_scales" else [])
+    layer = base if case in ("eval_reference", "staged_reference") else LoRALinear.from_base(base, r = 8)
+    layer.train(case not in ("eval_policy", "eval_reference", "staged_reference"))
+    mlx_utils.acquire_mlx_training_patches()
+    try:   # inference contracts on the native call hold while the route is installed
+        assert inference._resolved_bindings(inference._DENSE_QMM_CONTRACT) is not None
+        y = contextvars.Context().run(layer, x) if case == "other_context" else layer(x)
+    finally:
+        mlx_utils.release_mlx_training_patches()
+    assert calls == ([(route, (rows[0] * rows[1], K), bits)] if route else [])
+    assert mx.array_equal(y, mx.full((*rows, N), value, mx.bfloat16)).item()
+    assert nn.QuantizedLinear.__call__ is native
+
+
+@metal_only
+def test_training_route_keeps_a_rebound_quantized_linear_call(monkeypatch):
+    monkeypatch.setattr(matmul, "available_train_qmm_routes", lambda: ("dense",))
+    native, custom = nn.QuantizedLinear.__call__, lambda self, x: native(self, x) * 2
+    for call, routed in ((custom, False), (native, True)):
+        monkeypatch.setattr(nn.QuantizedLinear, "__call__", call)
+        mlx_utils.acquire_mlx_training_patches()
+        try:
+            assert (nn.QuantizedLinear.__call__ is not call) is routed
+        finally:
+            mlx_utils.release_mlx_training_patches()
+        assert nn.QuantizedLinear.__call__ is call
+
+
+@metal_only
+@pytest.mark.parametrize("bits", [4, 8])
+def test_output_and_input_gradient_are_no_further_from_fp32_than_stock(bits):
+    matmul.probe_dense_train_qmm()   # the GEMM operand is stock's tile, bit for bit
+    w, scales, biases = mx.quantize((mx.random.normal((1536, 1024), key = mx.random.key(bits)) * 0.02).astype(
+        mx.bfloat16), group_size = 64, bits = bits)
+    x, r = (mx.random.normal((640, n), key = mx.random.key(k)).astype(mx.bfloat16) for k, n in ((1, 1024), (2, 1536)))
+    exact = mx.dequantize(w, scales.astype(mx.float32), biases.astype(mx.float32), group_size = 64, bits = bits)
+    want = mx.vjp(lambda x: x @ exact.T, [x.astype(mx.float32)], [r.astype(mx.float32)])
+    errors = {}
+    for name, f in (("stock", lambda x: mx.quantized_matmul(x, w, scales, biases, group_size = 64, bits = bits)),
+                    ("dense", lambda x: matmul._dense_train_qmm(64, bits)(x, w, scales, biases))):
+        (y,), (dx,) = mx.vjp(f, [x], [r])
+        gaps = [mx.abs(got.astype(mx.float32) - ref) for got, ref in zip((y, dx), (want[0][0], want[1][0]))]
+        errors[name] = [value.item() for gap in gaps for value in (gap.max(), gap.mean())]
+    assert all(d <= 1.1 * s for d, s in zip(errors["dense"], errors["stock"])), errors
+
+
+@metal_only
+@pytest.mark.parametrize("M,N,K,group_size,ok", [
+    (1024, 2048, 2048, 64, True), (1023, 2048, 2048, 64, False), (1024, 1984, 2048, 64, False),
+    (1024, 2048, 1984, 64, False), (1024, 32768, 2048, 64, True), (1024, 32832, 2048, 64, False),
+    (1024, 2048, 32768, 64, True), (1024, 2048, 32832, 64, False), (1024, 16384, 16384, 64, True),
+    (1024, 16384, 16448, 64, False), (1024, 2080, 2048, 64, False), (1024, 2048, 2080, 32, False),
+    (1024, 2048, 2112, 128, False)])
+def test_staged_route_shape_limits(M, N, K, group_size, ok):
+    assert matmul.staged_train_qmm_supported(M, N, K, group_size) is ok
+
+
+@metal_only
+def test_staged_route_is_available_only_on_nax():
+    assert bool(matmul.staged_train_qmm_available()) is (
+        matmul.nax.nax_available() and matmul.nax.gap_open("staged_train_qmm"))
+
+
+@pytest.mark.skipif(not (_METAL and matmul.nax.nax_available()), reason = "needs NAX")
+def test_staged_forward_and_dx_are_stock_bit_for_bit():
+    matmul.probe_staged_qmm()
+    w, scales, biases = mx.quantize((mx.random.normal((4096, 2048), key = mx.random.key(3)) * 0.02).astype(
+        mx.bfloat16), group_size = 64, bits = 4)
+    x, r = (mx.random.normal((1024, n), key = mx.random.key(k)).astype(mx.bfloat16) for k, n in ((1, 2048), (2, 4096)))
+    stock, staged = (mx.vjp(f, [x], [r]) for f in (
+        lambda x: mx.quantized_matmul(x, w, scales, biases, group_size = 64, bits = 4),
+        lambda x: matmul.differentiable_staged_train_qmm(64, 4)(x, w, scales, biases)))
+    assert all(mx.array_equal(a, b).item() for a, b in zip(stock[0] + stock[1], staged[0] + staged[1]))
 
 
 def _causal(T, S):

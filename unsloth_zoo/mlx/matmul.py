@@ -15,7 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Affine `x @ W^T` on stock packed weights: small-row 4/8-bit qmm for Apple GPUs without stock NAX kernels,
-multi-row qmv whose rows match one-row stock calls bit for bit, and row-invariant lane qmm."""
+multi-row qmv whose rows match one-row stock calls bit for bit, row-invariant lane qmm, and the dense (or, on NAX,
+staged) training route for frozen projections."""
 
 import functools
 import hashlib
@@ -1876,3 +1877,155 @@ def probe_staged_qmm():
             got = staged_qmm(x, w, s, b, group, bits)
             native = mx.quantized_matmul(x, w, s, b, transpose = True, group_size = group, bits = bits)
             assert mx.array_equal(got.view(mx.uint16), native.view(mx.uint16)).item(), (dtype, bits, group, M)
+
+
+# Dense training route: the kernel writes stock qmm's fp32-rounded `s * q + b` tile; the vjp re-dequantizes for dx.
+_TRAIN_QMM_BITS = (4, 8)
+_TRAIN_QMM_GROUP_SIZES = (32, 64, 128)
+_DENSE_TRAIN_QMM_MIN_ROWS = 1536   # M3 Max, 4 and 8 bit: 5-8% faster fwd+bwd from 1536 rows, mixed at 1024
+_DENSE_TRAIN_QMM_MIN_OUTPUTS = 1024   # a 32-wide output (Gated DeltaNet's a/b) runs 10-30% slower dense
+_DENSE_TRAIN_QMM_MAX_WEIGHTS = 1 << 27   # the transient is the bf16 layer; this keeps vocabulary heads native
+_TRAIN_DEQUANTIZE_SOURCE = """
+    constexpr uint CODES = 32 / BITS, WORDS = K / CODES;
+    const uint word = thread_position_in_grid.x;
+    if (word >= WORDS) return;
+    const ulong n = thread_position_in_grid.y;
+    const uint packed = w[n * WORDS + word];
+    const ulong group = n * (K / GS) + word * CODES / GS;
+    const float s = float(scales[group]), b = float(biases[group]);
+    for (uint i = 0; i < CODES; ++i)
+        out[n * K + word * CODES + i] = static_cast<T>(s * float((packed >> (BITS * i)) & ((1u << BITS) - 1u)) + b);
+"""
+DENSE_TRAIN_QMM_PROBE_KEY = "dense_train_qmm:" + hashlib.sha256(_TRAIN_DEQUANTIZE_SOURCE.encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _train_dequantize_kernel():
+    try:
+        return mx.fast.metal_kernel(name = "unsloth_train_dequantize", input_names = ["w", "scales", "biases"],
+                                    output_names = ["out"], source = _TRAIN_DEQUANTIZE_SOURCE)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def train_dequantize(w, scales, biases, group_size, bits):
+    """The `[N, K]` affine weight in the scales' dtype, as stock's quantized matmul loads it."""
+    N, words = w.shape
+    K = words * 32 // bits
+    return _train_dequantize_kernel()(
+        inputs = [w, scales, biases], template = [("T", scales.dtype), ("K", K), ("GS", group_size), ("BITS", bits)],
+        grid = (words, N, 1), threadgroup = (min(256, words), 1, 1),
+        output_shapes = [(N, K)], output_dtypes = [scales.dtype])[0]
+
+
+@functools.cache
+def _dense_train_qmm(group_size, bits):
+    """`x @ W^T` for a 2-D x and a frozen packed weight, whose quantization parameters get zero gradients."""
+    @mx.custom_function
+    def routed(x, w, scales, biases):
+        return x @ train_dequantize(w, scales, biases, group_size, bits).T
+
+    @routed.vjp
+    def routed_vjp(primals, cotangent, output):
+        x, w, scales, biases = primals
+        with mx.stream(mx.gpu):
+            dx = cotangent @ train_dequantize(w, scales, biases, group_size, bits)
+        return dx, mx.zeros_like(w), mx.zeros_like(scales), mx.zeros_like(biases)
+
+    return routed
+
+
+def probe_dense_train_qmm():
+    """Subprocess probe: the dequantized weight is bitwise the tile stock's qmm multiplies, read via an identity x."""
+    for dtype, bits, group_size in itertools.product((mx.bfloat16, mx.float16), _TRAIN_QMM_BITS,
+                                                     _TRAIN_QMM_GROUP_SIZES):
+        w = mx.random.normal((384, 512), key = mx.random.key(group_size)) * 0.05
+        w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
+        tile = mx.quantized_matmul(mx.eye(512, dtype = dtype), w, scales, biases, transpose = True,
+                                   group_size = group_size, bits = bits).T
+        got = train_dequantize(w, scales, biases, group_size, bits)
+        assert mx.array_equal(got.view(mx.uint16), tile.view(mx.uint16)).item(), (dtype, bits, group_size)
+
+
+def staged_train_qmm_supported(M, N, K, group_size):
+    """For an affine 4/8-bit projection the caller has checked; `probe_staged_qmm` covers group sizes 32, 64 and 128."""
+    return (M >= 1024 and 2048 <= N <= 32768 and 2048 <= K <= 32768
+            and N * K <= 1 << 28 and N % 64 == K % 64 == K % group_size == 0)
+
+
+def staged_train_qmm_available():
+    return (nax.nax_available() and nax.gap_open("staged_train_qmm") and _staged_qmm_kernel() is not None
+            and nax.kernel_probe_passed(STAGED_QMM_PROBE_KEY, __name__, "probe_staged_qmm", nax.nax_available))
+
+
+@functools.cache
+def differentiable_staged_train_qmm(group_size, bits):
+    """The staged forward with stock's dx for a frozen packed weight, whose quantization parameters get zero
+    gradients."""
+    @mx.custom_function
+    def routed(x, w, scales, biases):
+        return staged_qmm(x, w, scales, biases, group_size, bits)
+
+    @routed.vjp
+    def vjp(primals, cotangent, output):
+        x, w, scales, biases = primals
+        with mx.stream(mx.gpu):
+            dx = mx.quantized_matmul(cotangent, w, scales, biases, transpose = False, group_size = group_size,
+                                     bits = bits)
+        return dx, mx.zeros_like(w), mx.zeros_like(scales), mx.zeros_like(biases)
+
+    return routed
+
+
+def available_train_qmm_routes():
+    """Training routes for this process.
+    `UNSLOTH_MLX_DENSE_TRAIN_QMM=0` turns the dense route off, `UNSLOTH_MLX_STAGED_TRAIN_QMM=0` the staged NAX one."""
+    dense = (os.environ.get("UNSLOTH_MLX_DENSE_TRAIN_QMM", "1") != "0" and nax.gap_open("dense_train_qmm")
+             and simd_qmm_available() and _train_dequantize_kernel() is not None
+             and nax.kernel_probe_passed(DENSE_TRAIN_QMM_PROBE_KEY, __name__, "probe_dense_train_qmm",
+                                         simd_qmm_available))
+    staged = os.environ.get("UNSLOTH_MLX_STAGED_TRAIN_QMM", "1") != "0" and staged_train_qmm_available()
+    return ("dense",) * dense + ("staged",) * staged
+
+
+def _train_qmm_rows(module, x):
+    """The rows of `x` for a frozen affine projection, else None. Not `module.training`: an eval-mode reference
+    model scores on the kernel its training policy does."""
+    w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
+    if (getattr(module, "mode", "affine") != "affine" or not isinstance(x, mx.array)
+            or not x.ndim or not all(isinstance(a, mx.array) for a in (w, scales, biases))
+            or w.ndim != 2 or w.dtype != mx.uint32 or x.dtype not in (mx.bfloat16, mx.float16)
+            or not x.dtype == scales.dtype == biases.dtype or mx.default_device() != mx.gpu
+            # a trainable packed weight must reach stock's vjp, which refuses it
+            or not {"weight", "scales", "biases"} <= getattr(module, "_no_grad", set())):
+        return None
+    N, K, bits, group_size = w.shape[0], x.shape[-1], module.bits, module.group_size
+    if (bits not in _TRAIN_QMM_BITS or group_size not in _TRAIN_QMM_GROUP_SIZES or w.shape[1] * 32 != K * bits
+            or K % group_size or scales.shape != (N, K // group_size) or biases.shape != scales.shape):
+        return None
+    return x.size // K
+
+
+def choose_train_qmm_route(module, x, routes):
+    """The training route ("dense" or "staged") this call of `module` takes, or None for the native call."""
+    rows = _train_qmm_rows(module, x) if routes else None
+    if rows is None:
+        return None
+    N = module["weight"].shape[0]
+    if ("dense" in routes and rows >= _DENSE_TRAIN_QMM_MIN_ROWS and N >= _DENSE_TRAIN_QMM_MIN_OUTPUTS
+            and N * x.shape[-1] <= _DENSE_TRAIN_QMM_MAX_WEIGHTS):
+        return "dense"
+    if "staged" in routes and staged_train_qmm_supported(rows, N, x.shape[-1], module.group_size):
+        return "staged"
+    return None
+
+
+def call_train_qmm_route(module, x, routes):
+    """`module(x)` without its bias on the training route this call takes, or None where the native call serves."""
+    route = choose_train_qmm_route(module, x, routes)
+    if route is None:
+        return None
+    K = x.shape[-1]
+    y = (_dense_train_qmm if route == "dense" else differentiable_staged_train_qmm)(module.group_size, module.bits)(
+        x.reshape(-1, K), module["weight"], module["scales"], module["biases"])
+    return y.reshape(*x.shape[:-1], y.shape[-1])
