@@ -43,6 +43,7 @@ import copy
 import concurrent.futures
 import contextlib
 import hashlib
+import inspect
 import json
 import math
 import numbers
@@ -54,6 +55,7 @@ import socket
 import time
 import types
 import unicodedata
+import warnings
 import weakref
 
 import mlx.core as mx
@@ -552,6 +554,7 @@ from .utils import (
     _compact_token_row,
     _create_text_batch_plan,
     _create_ordered_text_plan,
+    _length_sorted_windows,
     _normalize_label_smoothing,
     create_batches,
     iterate_training_batches,
@@ -587,6 +590,10 @@ from .utils import (
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    install_padding_free,
+    padding_free_mixer_classes,
+    remove_padding_free,
+    make_padding_free_loss_fn,
     _get_transformer_layers,
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
@@ -1223,6 +1230,22 @@ def _validate_label_smoothing(value, is_vlm):
     return eps
 
 
+def _resolve_sft_loss_type(args, *, fused):
+    loss_type = getattr(args, "loss_type", "nll")
+    if loss_type not in ("nll", "dft"):
+        raise ValueError(
+            f"Unsloth MLX: SFT loss_type must be 'nll' or 'dft' (got {loss_type!r})."
+        )
+    if loss_type == "dft" and not fused:
+        raise ValueError(
+            "Unsloth MLX: loss_type='dft' is implemented on the fused CCE loss "
+            "only; this run uses a GKD, label-smoothed or standard cross-entropy "
+            "loss, or a vision-language model whose text stack takes token ids "
+            "only. Use loss_type='nll', or use_cce=True on a supported model."
+        )
+    return loss_type
+
+
 def _require_complete_resume_checkpoint(resume_from):
     """Reject an incomplete resume dir (a saved adapter dir has only adapters.safetensors) and name the warm-start
     route; every resume read calls it, so the streaming-prefetch early read raises this instead of a raw
@@ -1299,9 +1322,14 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
         attention_mask = batch_data.get("attention_mask")
     elif isinstance(batch_data, (tuple, list)) and batch_data:
         arr = batch_data[0]
+        lengths = batch_data[1] if len(batch_data) > 1 else None
+        if not (hasattr(lengths, "shape") and len(lengths.shape) == 2 and lengths.shape[1] == 2):
+            lengths = None
         if isinstance(arr, dict):
             arr = arr.get("input_ids")
-        lengths = batch_data[1] if len(batch_data) > 1 else None
+            # A vision preference dict may hold only some rows (vision KTO's KL rows come as a dict of their own).
+            if lengths is not None and mode != "non_padding" and hasattr(arr, "shape"):
+                return int(lengths.shape[0] * arr.shape[-1])
     else:
         arr = None
     if arr is None or not hasattr(arr, "shape"):
@@ -1310,12 +1338,7 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
         return int(math.prod(arr.shape))
     if attention_mask is not None and hasattr(attention_mask, "shape"):
         return int(attention_mask.sum().item())
-    if (
-        lengths is not None
-        and hasattr(lengths, "shape")
-        and len(lengths.shape) == 2
-        and lengths.shape[1] == 2
-    ):
+    if lengths is not None:
         return int(lengths[:, 1].sum().item())
     if pad_token_id is not None:
         return int((arr != pad_token_id).sum().item())
@@ -1371,6 +1394,30 @@ def _resolve_text_dataset_order(args, *, for_training=True):
     return "sequential" if preserve else dataset_order
 
 
+# DPO variants that sort scores across the micro-batch, so moving a row between micro-batches changes its loss.
+_MICROBATCH_DEPENDENT_DPO_LOSSES = frozenset({"aot", "aot_pair"})
+
+
+def _should_length_sort_windows(args, *, world_size=1, preference_kind=None):
+    """Whether a finite plan re-cuts its accumulation windows by length: exact only where the step gradient is a
+    token- or window-weighted sum over rows, so KTO (neighbor KL pairs), GRPO and microbatch-dependent DPO losses keep
+    their cut, as do sequential order, streaming, and DDP."""
+    if not getattr(args, "length_sorted_microbatches", True):
+        return False
+    if int(args.gradient_accumulation_steps) <= 1 or world_size > 1:
+        return False
+    if getattr(args, "streaming", False) or preference_kind in ("kto", "grpo"):
+        return False
+    if _resolve_text_dataset_order(args) == "sequential":
+        return False
+    if preference_kind == "dpo":
+        loss_types = args.loss_type
+        loss_types = [loss_types] if isinstance(loss_types, str) else list(loss_types or ())
+        if _MICROBATCH_DEPENDENT_DPO_LOSSES.intersection(loss_types):
+            return False
+    return True
+
+
 # Fields added after the original MLXTrainingConfig surface: keep them a suffix of the declaration order (append new
 # ones at the end and list them in this tuple) so positional copies from older configs keep mapping correctly.
 _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
@@ -1392,6 +1439,9 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "gkd_chunk_size",
     "gkd_skip_memory_preflight",
     "group_by_length",
+    "length_sorted_microbatches",
+    "loss_type",
+    "padding_free",
 )
 
 
@@ -1522,6 +1572,14 @@ class MLXTrainingConfig:
     gkd_skip_memory_preflight: bool = False
     # HF TrainingArguments.group_by_length; appended LAST (positional binding).
     group_by_length: bool = False
+    # Reorders rows only within each accumulation window, longest first, before cutting it into micro-batches; every
+    # optimizer step keeps its rows (unlike group_by_length, which reorders the dataset).
+    length_sorted_microbatches: bool = True
+    # SFTConfig.loss_type: "nll" or "dft" (fused CCE text path only); preference and RL configs override its default
+    # without kw_only, so the field keeps this positional slot in every subclass.
+    loss_type: str = "nll"
+    # TRL SFTConfig.padding_free: SFT runs per-token modules on the real tokens only; appended LAST.
+    padding_free: bool = False
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -1618,6 +1676,7 @@ class MLXTrainingConfig:
             "zero_variance_exclude",
             "loss_aggregation",
             "prefix_grouper",
+            "rollout_logprobs_as_old",
             "cpo_alpha",
             "simpo_gamma",
             "alpha",
@@ -1698,7 +1757,7 @@ class MLXDPOConfig(MLXTrainingConfig):
     reference_free: bool = field(default=False, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
     # A DPOConfig collapses a one-entry list back to a string, so both arrive.
-    loss_type: str | list[str] = field(default="sigmoid", kw_only=True)
+    loss_type: str | list[str] = "sigmoid"
     loss_weights: list[float] | None = field(default=None, kw_only=True)
     discopop_tau: float = field(default=0.05, kw_only=True)
     # ref_adapter_name is a saved adapter directory: an MLX model has one unnamed adapter set.
@@ -1728,7 +1787,7 @@ class MLXKTOConfig(MLXTrainingConfig):
     neighbor's completion in the batch; dataset_order="torch_randperm" reorders whole batches."""
 
     beta: float = field(default=0.1, kw_only=True)
-    loss_type: str = field(default="kto", kw_only=True)
+    loss_type: str = "kto"
     desirable_weight: float = field(default=1.0, kw_only=True)
     undesirable_weight: float = field(default=1.0, kw_only=True)
     precompute_ref_log_probs: bool = field(default=False, kw_only=True)
@@ -1748,7 +1807,9 @@ class MLXKTOConfig(MLXTrainingConfig):
 class MLXGRPOConfig(MLXTrainingConfig):
     """GRPO config: TRL 0.24's GRPOConfig fields with CUDA Unsloth's GRPO defaults, resolved at construction; top_k and
     min_p None switch those filters off rather than using the model's generation config; max_prompt_length only
-    warns, prompts are never truncated."""
+    warns, prompts are never truncated. rollout_logprobs_as_old (off unless UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1)
+    replaces the old-policy forward with the rollout's log-probs, at decode precision (first ratio near, not exactly, 1),
+    for rollouts without a VLM processor at the scoring temperature, with no top-k, top-p, min-p or repetition penalty."""
 
     num_generations: int = field(default=8, kw_only=True)
     max_prompt_length: int | None = field(default=None, kw_only=True)
@@ -1764,7 +1825,7 @@ class MLXGRPOConfig(MLXTrainingConfig):
     repetition_penalty: float = field(default=1.0, kw_only=True)
     generation_kwargs: dict | None = field(default=None, kw_only=True)
     beta: float | None = field(default=None, kw_only=True)
-    loss_type: str | None = field(default=None, kw_only=True)
+    loss_type: str | None = None
     epsilon: float = field(default=0.2, kw_only=True)
     epsilon_high: float | None = field(default=None, kw_only=True)
     delta: float | None = field(default=None, kw_only=True)
@@ -1786,6 +1847,7 @@ class MLXGRPOConfig(MLXTrainingConfig):
     loss_aggregation: str | None = field(default=None, kw_only=True)
     # Shared-prompt training forward (CUDA Unsloth's PrefixGrouper); None reads UNSLOTH_GRPO_PREFIX_GROUPER, off if unset.
     prefix_grouper: bool | None = field(default=None, kw_only=True)
+    rollout_logprobs_as_old: bool | None = field(default=None, kw_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1799,7 +1861,7 @@ class MLXCPOConfig(MLXTrainingConfig):
 
     beta: float = field(default=0.1, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
-    loss_type: str = field(default="sigmoid", kw_only=True)
+    loss_type: str = "sigmoid"
     disable_dropout: bool = field(default=True, kw_only=True)
     cpo_alpha: float = field(default=1.0, kw_only=True)
     simpo_gamma: float = field(default=0.5, kw_only=True)
@@ -2115,17 +2177,6 @@ def _plan_single_process_vlm_shapes(
         ), True, None
     # Strictness follows the resolved mode: an arch or backend override can select strict under a best_effort base policy, and that run must abort, not degrade.
     effective_mode = _effective_compile_mode(compile_policy, compile_decision)
-    max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
-    if (
-        distributed_world_size <= 1
-        and max_grad_norm > 0
-        and args.gradient_accumulation_steps > 1
-    ):
-        # Compilation is disabled later here, so skip the survey (it materializes every batch) for a plan that could never be compiled.
-        return None, _shape_guard_report(
-            "not_applicable", "compile_ineligible_global_norm", cap,
-            lazy_batches=lazy,
-        ), False, None
     compile_scope = (
         DDP_LOCAL_GRAD_SCOPE
         if distributed_world_size > 1 else FULL_STEP_SCOPE
@@ -2270,7 +2321,43 @@ def _plan_single_process_vlm_shapes(
     return shape_plan, shape_plan.report, True, frontier
 
 
-def _plan_single_process_text_shapes(
+def _plan_single_process_text_shapes(batches, batch_iter, *, install_plan=True, **kwargs):
+    """Plan finite text shapes before optimizer or compiled-callable setup; a plan offering length-sorted windows keeps
+    them only when they plan no more compiled signatures than its original cut."""
+    if not getattr(batches, "has_window_sort_choice", False):
+        return _plan_text_shapes_for_cut(
+            batches, batch_iter, install_plan=install_plan, **kwargs,
+        )
+    try:
+        chosen = _plan_text_shapes_for_cut(
+            batches, batch_iter, install_plan=False, **kwargs,
+        )
+    except RuntimeError:
+        # Strict compile refused the sorted cut; the original decides, as without sorting.
+        chosen = None
+    batches.use_length_sorted_windows(False)
+    original = _plan_text_shapes_for_cut(
+        batches, batch_iter, install_plan=False, **kwargs,
+    )
+    # A not-applicable report (compile off, streaming) plans no signatures for either cut.
+    keep_sorted = chosen is not None and (
+        not original[2]
+        or (
+            chosen[2]
+            and (chosen[1].planned_signatures or 0)
+            <= (original[1].planned_signatures or 0)
+        )
+    )
+    batches.use_length_sorted_windows(keep_sorted)
+    batches.settle_window_sort()
+    chosen = chosen if keep_sorted else original
+    shape_plan = chosen[0]
+    if install_plan and chosen[2] and shape_plan is not None:
+        batches.set_shape_plan(shape_plan)
+    return chosen
+
+
+def _plan_text_shapes_for_cut(
     batches,
     batch_iter,
     *,
@@ -2283,8 +2370,6 @@ def _plan_single_process_text_shapes(
     includes_epochs=False,
     vlm_compile_decision=None,
 ):
-    """Plan finite text shapes before optimizer or compiled-callable setup."""
-
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
@@ -2304,13 +2389,6 @@ def _plan_single_process_text_shapes(
         strict = _effective_compile_mode(
             compile_policy, vlm_compile_decision,
         ) == "strict"
-        if (
-            _resolve_mlx_grad_clipping(args)[0] > 0
-            and args.gradient_accumulation_steps > 1
-        ):
-            return None, _shape_guard_report(
-                "not_applicable", "compile_ineligible_global_norm", cap,
-            ), False, None
     elif vision_grpo:
         # A qualified arch on one process, its micro-steps' vision families surveyed ahead of the rollouts; a family that
         # drifts at runtime falls back to eager rather than aborting, so strict never raises here.
@@ -2559,6 +2637,34 @@ def _warn_resume_adapter_mismatch(model, adapter_file):
     )
 
 
+def _padding_free_path_refusal(args, batches, loss_fn, is_vlm, world_size, preference_kind):
+    if preference_kind:
+        return "it is implemented for SFT only"
+    if getattr(args, "teacher_model_name_or_path", None) or world_size > 1:
+        return "GKD and distributed runs are not supported"
+    if is_vlm and getattr(loss_fn, "_unsloth_cce_backend", None) != "runtime-cce":
+        return "vision SFT needs the fused CCE loss"
+    if not isinstance(batches, FiniteVLMBatchPlan if is_vlm else FiniteTextBatchPlan):
+        return "it needs a sized dataset, not a stream or prebuilt batches"
+    return None
+
+
+_PADDING_FREE_HINT_SAMPLE = 64
+
+
+def _padding_free_sample_packs(batches):
+    """Whether padding-free would pack a strided sample of at most _PADDING_FREE_HINT_SAMPLE scheduled batches; an
+    unsurveyed VLM plan answers no, so the hint never builds batches."""
+    if isinstance(batches, FiniteVLMBatchPlan) and batches._descriptors is None:
+        return False
+    total = len(batches._schedule)
+    stride = max(1, -(-total // _PADDING_FREE_HINT_SAMPLE))
+    try:
+        return batches.configure_padding_free(indices=range(0, total, stride))[0] > 0
+    finally:
+        batches.configure_padding_free(False)
+
+
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
 
@@ -2688,6 +2794,8 @@ class MLXTrainer:
                 "Falling back to packing=False (standard padding)."
             )
             self.args.packing = False
+        # TRL configs may carry None for "unset".
+        self.args.padding_free = bool(getattr(self.args, "padding_free", False))
 
         if (
             not self._is_vlm
@@ -5533,6 +5641,8 @@ class MLXTrainer:
                     release_mlx_training_patches()
             except Exception:
                 pass
+            remove_padding_free(getattr(self, "_padding_free_classes", ()))
+            self._padding_free_classes = ()
             for _module in _unfused_projection_modules:
                 try:
                     _module.fuse_in = True
@@ -5555,6 +5665,49 @@ class MLXTrainer:
             # stale, while any later request belongs to the next run.
             self._run_generation = getattr(self, "_run_generation", 0) + 1
 
+    def _configure_padding_free(self, args, model, batches, loss_fn, is_vlm, world_size, main_print):
+        """The loss for this run's padding-free setting, which is decided only here. A refusal warns on every rank;
+        the nothing-packs note and off-hint print on the main process. Each is given once per trainer and kind,
+        counted only once delivered (a warning raised as an error is not)."""
+        refusal = padding_free_mixer_classes(model)[1] or _padding_free_path_refusal(
+            args, batches, loss_fn, is_vlm, world_size, self.preference_kind)
+        said = getattr(self, "_padding_free_said", None)
+        if said is None:
+            said = self._padding_free_said = set()
+        # A reused plan may still hold an earlier run's packing.
+        if callable(getattr(batches, "configure_padding_free", None)):
+            batches.configure_padding_free(False)
+        enabled = bool(getattr(args, "padding_free", False))
+        key = message = None
+        if enabled and refusal is not None:
+            if refusal not in said:
+                # Every rank warns, so an error filter raises on all of them rather than leaving the others to hang
+                # in a collective; a fresh registry leaves `said`, not Python's per-line filter, to dedup.
+                caller = inspect.currentframe().f_back
+                warnings.warn_explicit(
+                    f"Unsloth: padding_free=True has no effect: {refusal}. Training runs padded.", UserWarning,
+                    caller.f_code.co_filename, caller.f_lineno, module=caller.f_globals.get("__name__"), registry={})
+                said.add(refusal)
+        elif enabled:
+            flat_shapes, all_shapes = batches.configure_padding_free()
+            if not flat_shapes:
+                key, message = "no_pack", ("Unsloth: padding_free=True is supported here, but no batch shape would "
+                                           "save an eighth of its tokens, so every batch stays padded.")
+            else:
+                self._padding_free_classes = install_padding_free(model)
+                loss_fn = make_padding_free_loss_fn(loss_fn)
+                main_print(f"Unsloth: padding-free SFT runs {flat_shapes} of {all_shapes} batch shapes on real "
+                           "tokens only; the rest stay padded.")
+        elif refusal is None and "hint" not in said and _padding_free_sample_packs(batches):
+            key, message = "hint", (
+                "Unsloth: padding_free=True would pack some batches of this SFT run (judged from a sample of the "
+                "schedule). On ragged text SFT with Gemma 3 1B and Qwen3 1.7B at batch sizes 2-8 it gave "
+                "1.14-1.54x tokens/s; the gain depends on how much padding the batches carry.")
+        if key is not None and key not in said:
+            main_print(message)
+            said.add(key)
+        return loss_fn
+
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
         args = self.args
@@ -5576,6 +5729,10 @@ class MLXTrainer:
             use_cce = False
         label_smoothing = 0.0 if preference_kind else _validate_label_smoothing(
             getattr(args, "label_smoothing_factor", 0.0), is_vlm,
+        )
+        sft_loss_type = "nll" if preference_kind else _resolve_sft_loss_type(
+            args, fused=use_cce and label_smoothing == 0.0
+            and not getattr(args, "teacher_model_name_or_path", None),
         )
         _vlm_ignore_token_ids = None
 
@@ -5641,8 +5798,11 @@ class MLXTrainer:
                     model,
                     assistant_token_id=_atid,
                     ignore_token_ids=_vlm_ignore_token_ids,
+                    loss_type=sft_loss_type,
                 )
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
+                if sft_loss_type == "dft" and cce_backend != "runtime-cce":
+                    _resolve_sft_loss_type(args, fused=False)
                 if cce_backend == "baseline-fallback":
                     use_cce = False
                     _main_print(
@@ -5662,8 +5822,12 @@ class MLXTrainer:
                 _main_print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
             if use_cce:
-                loss_fn = make_cce_loss_fn(model, label_smoothing=label_smoothing)
+                loss_fn = make_cce_loss_fn(
+                    model, label_smoothing=label_smoothing, loss_type=sft_loss_type,
+                )
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
+                if sft_loss_type == "dft" and cce_backend != "runtime-cce":
+                    _resolve_sft_loss_type(args, fused=False)
                 if hasattr(loss_fn, "_unsloth_compiled_loss_fn"):
                     _main_print(
                         "Unsloth: LoRA head CCE is available for compiled steps; "
@@ -5788,6 +5952,8 @@ class MLXTrainer:
             batches.configure_cce_compaction(
                 getattr(loss_fn, "_unsloth_cce_compaction", False),
             )
+        loss_fn = self._configure_padding_free(
+            args, model, batches, loss_fn, is_vlm, distributed_world_size, _main_print)
         if isinstance(batches, FiniteVLMBatchPlan):
             compaction_report = batches.configure_cce_compaction(
                 getattr(loss_fn, "_unsloth_cce_compaction", False) and distributed_world_size == 1,
@@ -6858,7 +7024,7 @@ class MLXTrainer:
                     precompute_reference_logps(
                         plan, model, _sampling_reference,
                         batch_size=int(_precompute_chunk or eval_batch_size),
-                        scorer=getattr(preference_eval_fn, "_unsloth_cce_scorer", None),
+                        scorer=getattr(preference_eval_fn, "_unsloth_cce_reference_scorer", None),
                     )
             finally:
                 model.train(was_training)
@@ -7033,7 +7199,7 @@ class MLXTrainer:
             _train_chunk = int(_precompute_chunk or args.per_device_train_batch_size)
             precompute_reference_logps(
                 batches, model, _sampling_reference, batch_size=_train_chunk,
-                scorer=getattr(loss_fn, "_unsloth_cce_scorer", None),
+                scorer=getattr(loss_fn, "_unsloth_cce_reference_scorer", None),
             )
             if self.eval_dataset is None and not _samples_prompts:
                 _sampling_reference.release()
@@ -9298,6 +9464,14 @@ class MLXTrainer:
                 seed=args.seed,
                 append_eos=bool(args.append_eos),
                 formatting_func=self.formatting_func,
+                length_sorted_windows=(
+                    not self._is_vlm
+                    and _should_length_sort_windows(
+                        args,
+                        world_size=self.distributed_world_size,
+                        preference_kind=self.preference_kind,
+                    )
+                ),
                 **self._preference_vision_options(),
             ), None
 
@@ -9606,6 +9780,9 @@ class MLXTrainer:
                         batch_kwargs["num_epochs"] = args.num_train_epochs
                         self._prepared_batches_include_epochs = True
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
+                    batch_kwargs["length_sorted_windows"] = _should_length_sort_windows(
+                        args, world_size=self.distributed_world_size,
+                    )
                     batches = _create_ordered_text_plan(**batch_kwargs)
                 else:
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
@@ -9862,6 +10039,7 @@ class MLXGRPOTrainer(MLXTrainer):
             with_reference=self._uses_reference(args),
             max_prompt_length=args.max_prompt_length, shuffle=args.shuffle_dataset,
             seed=args.seed, num_batches=num_batches, num_epochs=num_epochs,
+            rollout_logprobs_as_old=args.rollout_logprobs_as_old,
             **self._grpo_vision_options(), **grpo_layout_options(
                 grpo_objective(args), distributed=getattr(self, "distributed_world_size", 1) > 1,
             ),
@@ -9904,7 +10082,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             preserve_dataset_order=False,
                             num_epochs=None, return_dataset=False,
                             comm_group=None, distributed_pad_mode="cycle",
-                            return_plan=False, grad_accum=None):
+                            return_plan=False, grad_accum=None,
+                            length_sorted_windows=False):
     """Tokenized, sorted by length and right-padded into (batch, lengths, labels) mx.arrays; batch and labels are (BS,
     padded_len) padded with pad_token_id and -100; lengths is (BS, 2) of [1, actual_len], half-open like the loss
     masks."""
@@ -10041,6 +10220,19 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     # Seed None is canonicalized so it is deterministic rather than entropy-derived; explicit seeds are unchanged, and
     # visits stay identity since epoch blocks are materialized.
     rng = random.Random(_normalize_seed(seed))
+
+    def _padded_len(batch_indices):
+        max_len = max(
+            (len(all_items[i][0]) for i in batch_indices if i is not None),
+            default=2,
+        )
+        # +1 for autoregressive shift (mlx-lm iterate_batches parity).
+        return _finite_text_pad_width(
+            max_len,
+            pad_to_multiple=_PAD_MULTIPLE,
+            max_seq_length=max_seq_length,
+        )
+
     schedule = []
     widths = []
     cycle_length = None
@@ -10059,18 +10251,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             )
             if not batch_indices:
                 continue
-            valid_indices = [i for i in batch_indices if i is not None]
-            max_len = max(
-                (len(all_items[i][0]) for i in valid_indices),
-                default=2,
-            )
-            # +1 for autoregressive shift (mlx-lm iterate_batches parity).
-            padded_len = _finite_text_pad_width(
-                max_len,
-                pad_to_multiple=_PAD_MULTIPLE,
-                max_seq_length=max_seq_length,
-            )
-            epoch_schedule.append((tuple(batch_indices), padded_len))
+            epoch_schedule.append((tuple(batch_indices), _padded_len(batch_indices)))
 
         # 4. Legacy length-sort: shuffle batches so adjacent steps differ.
         if not _order_requested:
@@ -10115,6 +10296,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         widths=widths,
         label_dtype="int32",
     )
+    if length_sorted_windows:
+        sorted_schedule = _length_sorted_windows(
+            schedule, lambda i: len(all_items[i][0]), grad_accum, cycle_length,
+        )
+        plan.install_length_sorted_windows(
+            sorted_schedule, [_padded_len(batch) for batch in sorted_schedule],
+        )
     batches = plan if return_plan else plan.materialize_all()
 
     if return_dataset:
@@ -10496,6 +10684,9 @@ def train_on_responses_only(
             comm_group=comm_group,
             return_plan=True,
             grad_accum=args.gradient_accumulation_steps,
+            length_sorted_windows=_should_length_sort_windows(
+                args, world_size=getattr(trainer, "distributed_world_size", 1),
+            ),
         )
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset

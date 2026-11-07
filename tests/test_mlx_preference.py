@@ -1303,7 +1303,7 @@ def test_a_precomputed_reference_scores_through_the_cce_scorer(monkeypatch):
     plan = build_plan(dataset=rows(5), num_batches=3)
     calls = []
 
-    def scorer(model, batch, supervised, indices=None):
+    def scorer(model, batch, supervised, indices=None, **_):
         calls.append(indices)
         ce = batch[:, 1:].astype(mx.float32) * supervised
         return ce, mx.zeros(ce.shape)
@@ -1693,6 +1693,99 @@ def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, s
         )
         with pytest.raises(ValueError, match=match):
             _run_generation_trainer(trainer, monkeypatch, [])
+
+
+def _owned_scorers(monkeypatch, value=lambda model: 0.0):
+    """Stand-in CCE scorers that remember the model they were built for and score ``value(model)`` per position."""
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference
+
+    def make(model, temperature=1.0):
+        def score(_model, batch, supervised, indices=None, *, differentiated=True, **_):
+            make.calls.append((model, differentiated))
+            ce = supervised.astype(mx.float32) * (value(model) * temperature)
+            return ce, ce * 0.0
+        score.owner, score.vocab, score.compaction = model, 64, False
+        return score
+
+    make.calls = []
+    monkeypatch.setattr(preference, "_make_preference_cce_scorer", make)
+    return make
+
+
+def test_the_trainer_precomputes_a_reference_model_through_its_own_scorer(tmp_path, monkeypatch):
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    _owned_scorers(monkeypatch)
+    owners, precompute = [], trainer_module.precompute_reference_logps
+    monkeypatch.setattr(trainer_module, "precompute_reference_logps", lambda plan, model, policy, **kwargs: (
+        owners.append(kwargs["scorer"].owner), precompute(plan, model, policy, **kwargs))[1])
+    reference = _tiny_model(tail=True)
+    trainer = MLXDPOTrainer(
+        _tiny_model(tail=True), Tokenizer(), rows(3), eval_dataset=rows(2), ref_model=reference,
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, precompute_ref_log_probs=True, generate_during_eval=False, force_use_ref_model=True)))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    # The training and the evaluation tables, each scored by the reference model's own scorer.
+    assert owners == [reference, reference]
+
+
+def test_grpo_scores_a_reference_model_through_its_own_scorer(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import grpo, preference
+
+    policy, reference = TinyModel(), TinyModel()
+    make = _owned_scorers(monkeypatch, lambda model: 1.0 if model is reference else 2.0)
+    plan = types.SimpleNamespace(with_reference=True, score_temperature=0.5)
+    held = preference.ReferencePolicy(model=reference)
+    grpo.GRPOBatchPlan.bind(plan, policy, [], trainer_state=None, reference_policy=held,
+                            scorer=make(policy, temperature=0.5))
+    tokens, lengths = mx.array([[1, 2, 3]]), mx.array([[1, 3]])
+    assert plan._logps(policy, tokens, lengths).tolist() == [[-1.0, -1.0]]
+    # The reference model's own scorer, at the scoring temperature.
+    assert held.forward(policy, tokens, lengths, response_scorer=plan._reference_logps).tolist() == [[-0.5, -0.5]]
+    # Neither pass is differentiated, so neither takes the training kernel.
+    assert make.calls == [(policy, False), (reference, False)]
+
+
+@pytest.mark.parametrize("kind", ["dpo", "kto", "grpo"])
+def test_a_reference_model_scores_live_through_its_own_scorer(tmp_path, monkeypatch, kind):
+    # GRPO's rollout and DPO/KTO evaluation score a separate ref_model through its own scorer, not the policy's or dense.
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer, MLXGRPOTrainer, MLXKTOConfig, MLXKTOTrainer
+
+    make, evaluated = _owned_scorers(monkeypatch), []
+    build = trainer_module.make_preference_eval_fn
+
+    def watched(*args, **kwargs):
+        fn = build(*args, **kwargs)
+
+        def eval_fn(*inner, **options):
+            start = len(make.calls)
+            out = fn(*inner, **options)
+            evaluated.extend(make.calls[start:])
+            return out
+        eval_fn.__dict__.update(fn.__dict__)
+        return eval_fn
+    monkeypatch.setattr(trainer_module, "make_preference_eval_fn", watched)
+    policy, reference = _tiny_model(tail=True), _tiny_model(tail=True)
+    common = dict(compile=False, generate_during_eval=False)
+    if kind == "grpo":
+        monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", make)
+        trainer = MLXGRPOTrainer(policy, DecodingTokenizer(), _grpo_rows(), args=_grpo_config(
+            tmp_path, compile=False, beta=0.04, use_cce=True), reward_funcs=lambda completions, **_: [0.0] * len(completions))
+        trainer.ref_model = reference  # GRPO reads it as an attribute; TRL's GRPOTrainer takes no ref_model
+    elif kind == "dpo":
+        trainer = MLXDPOTrainer(policy, Tokenizer(), rows(3), eval_dataset=rows(2), ref_model=reference,
+                                args=MLXDPOConfig(**_generation_common(tmp_path, force_use_ref_model=True, **common)))
+    else:
+        trainer = MLXKTOTrainer(policy, Tokenizer(), kto_rows(4), eval_dataset=kto_rows(4), ref_model=reference,
+                                args=MLXKTOConfig(**_generation_common(tmp_path, **common)))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    # GRPO scores its reference only in the rollout; evaluation scores it live, each through ref_model's own scorer.
+    scored = make.calls if kind == "grpo" else evaluated
+    assert (reference, False) in scored and all(owner is reference for owner, _ in scored if owner is not policy)
 
 
 @pytest.mark.parametrize("sampling", [False, True])
@@ -2870,6 +2963,36 @@ def test_a_kto_batch_holds_completions_then_kl_rows_and_their_reference(with_kl)
     assert plan[1][4].tolist() == [len(third.sequence)] + ([len(third.kl)] if with_kl else [])
 
 
+def test_kto_compaction_indexes_each_rows_completion_and_kl_positions():
+    from unsloth_zoo.mlx.preference import FiniteKTOBatchPlan, TokenizedKTORow
+
+    rows = [TokenizedKTORow((1,) * (100 + 7 * i), (2,) * (40 + 9 * i), True, (1,) * (90 - i), (3,) * (30 + i))
+            for i in range(2)] + [TokenizedKTORow((), (2,) * 20, False, (), (3,) * 25)]
+    plan = FiniteKTOBatchPlan(rows, [(0, 1, 2)], with_kl=True, normalizers=[(0, 3, 1)], cycle_length=1,
+                              max_seq_length=256, pad_id=0)
+    plan.configure_cce_compaction()
+    *head, reference, completion, kl = plan.prepare_cce_batch(0, plan[0])
+    width = head[0].shape[1]
+    # Each row's own prompt length, and each half's own grid; an empty prompt starts at the first next-token position.
+    steps = lambda spans, width=width: [
+        row * (width - 1) + step - 1 for row, span in enumerate(spans) for step in range(*span)]
+    spans = [(100, 140), (107, 156), (1, 20)], [(90, 120), (89, 120), (1, 25)]
+    assert len(head) == 4 and reference is None and completion.shape == kl.shape == (256,)
+    assert [[i for i in half.tolist() if i >= 0] for half in (completion, kl)] == [steps(half) for half in spans]
+    # The shape plan's endpoint width is planned too.
+    plan.set_shape_plan(types.SimpleNamespace(report=types.SimpleNamespace(action="bucket"),
+                                              endpoint_for=lambda family, raw: raw + 32))
+    plan.configure_cce_compaction()
+    padded = plan.prepare_cce_batch(0, plan.materialize(0, phase="train"))
+    assert padded[0].shape[1] == width + 32 and len(padded) == 7
+    assert [[i for i in half.tolist() if i >= 0] for half in padded[5:]] == [steps(half, width + 32) for half in spans]
+    # A grid with fewer positions than one capacity stays uncompacted.
+    small = FiniteKTOBatchPlan(rows[2:], [(0,)], with_kl=True, normalizers=[(0, 1, 1)], cycle_length=1,
+                               max_seq_length=256, pad_id=0)
+    small.configure_cce_compaction()
+    assert len(small.prepare_cce_batch(0, small[0])) == 4
+
+
 @pytest.mark.parametrize("labels,weights,warns", [
     ([True] * 3 + [False], (1.0, 1.0), True),
     ([True] * 3 + [False], (0.4, 1.0), False),
@@ -3198,7 +3321,7 @@ def test_a_vision_plan_repeats_the_pixels_for_both_branches():
     assert text.chosen == tokenize_preference_row(
         Tokenizer(), text_row, length_policy=policy()).chosen
     assert batch["input_ids"][1, :len(text.chosen)].tolist() == list(text.chosen)
-    assert batch["pixel_values"].tolist() == [[4.0], [4.0]]
+    assert batch["pixel_values"].tolist() == [[4.0], [4.0]] and batch["_unsloth_image_copies"] == 2
     types = batch["token_type_ids"].tolist()
     assert types[0][:21] == types[2][:21] == list(image.chosen_prompt_arrays[0][1])
     assert not any(types[1] + types[3])
@@ -3445,9 +3568,12 @@ def test_a_vision_kto_plan_follows_trls_vision_collator():
     # KL pairs roll within the batch, not within kl_batch_size chunks.
     assert [row.kl for row in made.rows] == [
         prompt + answers[2][:3], encode("q") + answers[0], prompt + answers[1][:3]]
-    batch, _, _, labels = made[0]
-    assert batch["pixel_values"].tolist() == [[4.0]] * 4 and labels.tolist() == [True, False, False]
-    assert [sum(row) for row in batch["token_type_ids"].tolist()] == [2, 0, 2, 2, 0, 2]
+    batch, _, _, labels, *_, kl = made[0]
+    # The KL rows share their row's prompt and images, in a dict of their own.
+    assert batch["pixel_values"].tolist() == kl["pixel_values"].tolist() == [[4.0]] * 2
+    assert labels.tolist() == [True, False, False]
+    assert [sum(row) for part in (batch, kl) for row in part["token_type_ids"].tolist()] == [2, 0, 2, 2, 0, 2]
+    assert [ids[:len(row.kl)] for ids, row in zip(kl["input_ids"].tolist(), made.rows)] == [list(row.kl) for row in made.rows]
     single = plan([{**text, "image": kto_vision_row("")["images"][0], "prompt": "<img>q"}], with_kl=False)
     assert single.rows[0].prompt_ids == (60, 61, *encode("q")) and single[0][0]["pixel_values"].size
     turns = plan([{**kto_vision_row("yes"), "prompt": [{"role": "user", "content": "hi"}, *tail]} for tail in (  # as TRL 1.13
@@ -3458,12 +3584,31 @@ def test_a_vision_kto_plan_follows_trls_vision_collator():
     parts = _with_trl_image_parts({**kto_vision_row("yes"), "prompt": [{"role": "system", "content": "s"}, *({"role": "user", "content": t} for t in ("hi", "u"))]})
     assert [m["content"] for m in parts["prompt"] + parts["completion"]] == [
         [text_part("s")], [{"type": "image"}, text_part("hi")], [text_part("u")], [text_part("yes")]]
-    scorer = types.SimpleNamespace(forward=lambda _, batch, n: mx.full(n.shape[:1], float("pixel_values" in batch)))
+    scorer = types.SimpleNamespace(forward=lambda _, batch, n: mx.full(batch["input_ids"].shape[:1], float("pixel_values" in batch)))
     assert precompute_reference_logps(made, None, scorer, batch_size=3).tolist() == [[1, 1]] * 3
     with pytest.raises(ValueError, match="row 0 .* no completion token"):
         plan([kto_vision_row("yes")], max_length=len(prompt))
     with pytest.raises(ValueError, match="row 1 .* decides from the first row"):
         plan([{key: value for key, value in text.items() if key != "images"}, kto_vision_row("yes")])
+
+
+def test_a_surveyed_vision_kto_plan_compacts_like_its_text_layout():
+    # KTO admission sizes a batch by its labels' row count, also once a vision plan appends its surveyed family.
+    from unsloth_zoo.mlx.preference import create_kto_batch_plan
+
+    def admitted(sizes):
+        made = create_kto_batch_plan(
+            [kto_vision_row("y" * size, label=size != 4) for size in sizes], None, batch_size=4, kl_batch_size=4,
+            num_epochs=1, grad_accum=1, length_policy=policy("kto", max_length=160, max_prompt_length=8, max_seq_length=162),  # noqa: E501
+            processor=VisionProcessor(), model_config={})
+        made.configure_cce_compaction()
+        text = list(made._cce_capacities.values())
+        made.ensure_descriptors()
+        made.configure_cce_compaction()
+        assert list(made._cce_capacities.values()) == text and all(len(family) == 6 for family, _ in made._cce_capacities)  # noqa: E501
+        return text
+    # 4 rows of 159 next-token positions: 512 slots per half are under that grid, 768 are not.
+    assert admitted((150, 100, 100, 4)) == [(512, 512)] and admitted((150, 150, 150, 150)) == []
 
 
 def test_a_vision_kto_row_keeps_the_whole_length_budget():
@@ -3486,7 +3631,7 @@ def test_a_vision_kto_row_keeps_the_whole_length_budget():
     assert build([{"prompt": "q", "completion": "a", "label": True}]).rows[0].completion_ids
 
 
-def test_a_vision_kto_batch_scores_its_kl_rows_in_the_same_forward():
+def test_a_vision_kto_batch_scores_its_kl_rows_in_their_own_forward():
     import numpy as np
     import mlx.core as mx
     from unsloth_zoo.mlx.preference import (
@@ -3501,30 +3646,42 @@ def test_a_vision_kto_batch_scores_its_kl_rows_in_the_same_forward():
         def __call__(self, tokens):
             return super().__call__(tokens) * self.scale
 
-    models = [(Scaled(), type("ScaledVision", (VisionModel, Scaled), {})()) for _ in range(2)]
+    sizes = []
+
+    class ScaledVision(VisionModel, Scaled):
+        def __call__(self, tokens, *args, **kwargs):
+            sizes.append(tokens.shape[0])
+            return super().__call__(tokens, *args, **kwargs)
+
+    models = [(Scaled(), ScaledVision()) for _ in range(2)]
     for text, vision in models:
         vision.embedding, vision.output = text.embedding, text.output
 
-    def run(side, batch):
+    def run(side, batch, *kl):
         policy, reference = (pair[side] for pair in models)
-        fn = make_kto_loss_fn(objective, reference_policy=ReferencePolicy(model=reference))
+        # Shifted so the clamp keeps the raw KL estimate in the stats.
+        fn = make_kto_loss_fn(objective, reference_policy=ReferencePolicy(model=reference), kl_mean=lambda kl: kl + 100)
 
         def loss(scale):
             policy.scale = scale
-            return fn(policy, batch, *rest)[0]
+            return fn(policy, batch, *rest, *kl)[0]
 
         # The KL rows add nothing to the gradient, as under TRL's no_grad.
         gradient = mx.grad(loss)(mx.array(1.5))
         policy.scale = 1.5
-        return [*fn(policy, batch, *rest)[::2], gradient]
+        return [*fn(policy, batch, *rest, *kl)[::2], gradient]
 
-    text, vision = run(0, ids), run(1, {"input_ids": ids, "pixel_values": "pixels"})
+    half = lambda rows: {"input_ids": rows, "pixel_values": "pixels"}
+    text, vision = run(0, ids), run(1, half(ids[:3]), None, None, None, half(ids[3:]))
+    # Policy and reference forwards alike see one half at a time.
+    assert sizes and set(sizes) == {3}
     for expected, got in zip(text, vision):
         assert np.allclose(np.asarray(got.tolist()), np.asarray(expected.tolist()), rtol=1e-5)
     assert float(text[-1]) != 0
 
 
-def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypatch, tmp_path):
+@pytest.mark.parametrize("mode, seen", [("all", 132), ("non_padding", 94)])
+def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypatch, tmp_path, mode, seen):
     from mlx_vlm import prompt_utils
     from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
     monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_a, **_k: None, raising=False)
@@ -3541,9 +3698,12 @@ def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
         Model(), VisionProcessor(), [kto_vision_row("yes"), kto_vision_row("no", False)],
         eval_dataset=split, args=MLXKTOConfig(**_generation_common(
             tmp_path, generate_during_eval=False, precompute_ref_log_probs=True)))
+    run.args.include_num_input_tokens_seen = mode
     assert _run_generation_trainer(run, monkeypatch, [])["train_steps"] == 1
-    # Training, evaluation, and the reference precomputed for each; the rest are probes.
-    assert sum(Model.pixels) == 4 and [reader is not None for reader in readers] == [False, True]
+    # Both halves' rows count, as when one dict held them: 2 x 2 x 33 positions, 94 of them not padding.
+    assert run.state.num_input_tokens_seen == seen
+    # Training, evaluation, and the reference precomputed for each, the KL rows in forwards of their own; the rest are probes.
+    assert sum(Model.pixels) == 8 and [reader is not None for reader in readers] == [False, True]
 
 
 def test_cpo_trains_and_evaluates_text_rows_on_a_vision_language_model(monkeypatch, tmp_path):
@@ -3640,7 +3800,7 @@ def test_grpo_loss_and_metrics_leave_out_truncated_rows():
     assert np.allclose(np.array(completion_logps(Model(), batch, 0.7)), expected, atol=1e-5)
 
 
-def _dense_scorer(model, batch, supervised, indices=None, *, logit_sums, hidden=None):
+def _dense_scorer(model, batch, supervised, indices=None, *, logit_sums, differentiated, hidden=None):
     """The CCE scorer's contract on the logits: zero outside supervised, and outside indices when given."""
     import mlx.core as mx
     from unsloth_zoo.mlx.grpo import completion_logps
@@ -4222,7 +4382,7 @@ def test_grpo_rewards_advantages_and_reward_inputs_follow_trl():
 def test_grpo_rollout_warper_matches_hf_sampling_processors(settings):
     import torch
     from transformers.generation import logits_process as hf
-    from unsloth_zoo.mlx.grpo import GRPOSampling, hf_logits_warper
+    from unsloth_zoo.mlx.grpo import GRPOSampling, _rollout_sampling, hf_logits_warper
 
     sampling = GRPOSampling(**settings)
     prompt, generated = [5, 1, 5, 7], [2, 9]
@@ -4243,6 +4403,48 @@ def test_grpo_rollout_warper_matches_hf_sampling_processors(settings):
         assert torch.equal(hf_logits_warper(penalized, [placeholder, 1, placeholder])(torch.tensor([placeholder, 2]), scores.clone()), plain)
     tied =hf_logits_warper(GRPOSampling(top_p=0.5), [1])(torch.tensor([1]), torch.tensor([[0.0, 1.0, 1.0, 1.0]]))
     assert torch.isfinite(tied).sum() == 2  # HF keeps two of the three tied logits
+    plain, rows = GRPOSampling(**{**settings, "repetition_penalty": 1.0}), torch.randn(3, 12) * 3
+    batched = _rollout_sampling(plain, ())[1](rows[:, None])[:, 0]  # every row at once, shaped as decode logits
+    assert torch.allclose(batched, torch.cat([hf_logits_warper(plain, [1])(torch.tensor([1]), row[None]) for row in rows]))
+
+
+@pytest.mark.parametrize("rows,active,expected", [(16, 0, 32), (64, 0, 48), (64, 16384 * 2 * 40, 32), (40, 0, 40)])
+def test_grpo_rollouts_decode_the_whole_generation_when_its_cache_fits(monkeypatch, rows, active, expected):
+    from unsloth_zoo.mlx import grpo
+
+    monkeypatch.setattr(grpo.mx, "device_info", lambda: {"max_recommended_working_set_size": 16384 * 2 * 48}, raising=False)
+    monkeypatch.setattr(grpo.mx, "get_active_memory", lambda: active, raising=False)
+    config = types.SimpleNamespace(num_hidden_layers=2, num_key_value_heads=2, num_attention_heads=4, hidden_size=16)
+    assert grpo._rollout_rows(types.SimpleNamespace(args=config), rows, 10) == expected  # one 256-position block, 16384 bytes
+    assert grpo._rollout_rows(types.SimpleNamespace(), rows, 10) == 32
+
+
+def test_grpo_rollout_rows_are_sized_by_every_layer_or_more_where_the_made_caches_hold_more():
+    from unsloth_zoo.mlx.grpo import _cache_bytes_per_row
+
+    full, linear, sliding = types.SimpleNamespace(keys=None), types.SimpleNamespace(cache=[None, None]), types.SimpleNamespace(keys=None, max_size=1024)  # noqa: E501
+    model = lambda caches, **config: types.SimpleNamespace(config={"text_config": config}, language_model=types.SimpleNamespace(make_cache=lambda: caches))  # noqa: E501, E731
+    gemma_4_31b = dict(num_hidden_layers=60, num_attention_heads=32, num_key_value_heads=16, num_global_key_value_heads=4, head_dim=256, global_head_dim=512)  # noqa: E501
+    qwen3_5_0_8b = model([linear if i % 4 < 3 else full for i in range(24)], num_hidden_layers=24, num_attention_heads=8, num_key_value_heads=2, head_dim=256, linear_num_key_heads=16, linear_key_head_dim=128, linear_num_value_heads=16, linear_value_head_dim=128, linear_conv_kernel_dim=4)  # noqa: E501
+    assert _cache_bytes_per_row(model([sliding if i % 6 < 5 else full for i in range(60)], **gemma_4_31b), 2048) == 32768 * (10 * 2048 + 50 * 1024)  # noqa: E501
+    assert _cache_bytes_per_row(qwen3_5_0_8b, 256) == 6 * 2048 * 256 + 18 * 4 * (16 * 128 * 128 + 3 * 6144) and _cache_bytes_per_row(qwen3_5_0_8b, 2048) == 24 * 2048 * 2048  # noqa: E501
+
+
+@pytest.mark.parametrize("dtype,element", [("bfloat16", 2), ("float32", 4)])
+def test_grpo_rollout_rows_count_the_cache_dtype_the_embedding_gives(dtype, element):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.grpo import _cache_bytes_per_row
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.embed_tokens = nn.Embedding(8, 4)
+            self.model.embed_tokens.weight = self.model.embed_tokens.weight.astype(getattr(mx, dtype))
+            self.args = types.SimpleNamespace(num_hidden_layers=2, num_key_value_heads=2, num_attention_heads=4, hidden_size=16)  # noqa: E501
+
+    assert _cache_bytes_per_row(Model(), 10) == _cache_bytes_per_row(Model(), 256) == 2 * element * 2 * 2 * 4 * 256
 
 
 @pytest.mark.parametrize("bsz,spg,iterations,shuffle", [(4, 2, 1, True), (2, 3, 2, True), (6, 1, 1, False)])
@@ -4346,6 +4548,7 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
         return [float(ids[-1] == 2) for ids in completion_ids]
 
     monkeypatch.setattr(generate_module, "generate_batch", fake_generate_batch)
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._rollout_rows", lambda model, rows, tokens: 7)
     dataset = [{"prompt": "a" * (index + 1), "answer": index} for index in range(4)]
     with pytest.warns(UserWarning, match="1 prompt"):
         plan = create_grpo_batch_plan(
@@ -4359,8 +4562,9 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     replayed = [plan[index][0].tolist() for index in (1, 2, 3)]
     assert replayed[1:] == [first[0].tolist(), replayed[0]] != [replayed[0]] * 2 and len(calls) == 1
     requests, defaults = calls[0]
-    assert defaults.stop_token_ids == (2,) and [r.max_tokens for r in requests] == [3] * 4
-    assert len({r.sampling.seed for r in requests}) == 4 and requests[0].logits_processors and not GRPOSampling().warps
+    assert defaults.stop_token_ids == (2,) and defaults.token_ids_only and defaults.share_prompt_prefill and defaults.prefill_batch_size == 7 and [r.max_tokens for r in requests] == [3] * 4
+    assert len({r.sampling.seed for r in requests}) == 4 and not GRPOSampling().warps
+    assert defaults.batched_draws and defaults.logits_warp is not None and requests[0].logits_processors is None
     assert [r.prompt_token_ids for r in requests] == [(14,), (14,), (14, 14), (14, 14)]
     assert seen["ids"] == [[1, 2], [1, 1, 1]] * 2 and seen["completions"][:2] == ["b", "bbb"] and seen["answer"] == [0, 0, 1, 1]  # noqa: E501
     tokens, lengths, normalizers, advantages, kept, old, ref = first
@@ -4386,6 +4590,77 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     planned = plan[6]  # an eager fetch, as after a compile fallback
     assert len(calls) == 3 and calls[2][0][0].sampling.seed != calls[1][0][0].sampling.seed and plan.width_rungs(6) == (6,)
     assert planned[0].shape == (2, 8) and planned[5].shape == planned[6].shape == (2, 7) and seen["width"] == 8
+    assert calls[0][1].completion_batch_size == 7
+
+
+@pytest.mark.parametrize("rows,rope,shared", [(4, "RoPE", True), (3, "RoPE", False), (4, "SuScaledRoPE", False)])
+def test_grpo_rollout_shares_prompt_prefill_only_in_one_wave_with_position_only_rope(monkeypatch, rows, rope, shared):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rope = type(rope, (nn.Module,), {})()
+
+        def __call__(self, ids):
+            return mx.zeros((*ids.shape, 16))
+
+    seen = []
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, *, defaults=None: seen.append(
+        defaults) or [types.SimpleNamespace(token_ids=[1], finish_reason="stop") for _ in requests])
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._rollout_rows", lambda model, count, tokens: rows)
+    plan = create_grpo_batch_plan(
+        [{"prompt": "a" * (index + 1)} for index in range(2)], DecodingTokenizer(), num_generations=2, batch_size=2,
+        steps_per_generation=2, num_iterations=1, grad_accum=1, sampling=GRPOSampling(max_tokens=3), score_temperature=1.0,
+        max_seq_length=6, shuffle=False, num_batches=2,
+    )
+    plan.bind(Model(), [lambda completions, **_: [0.0] * len(completions)], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
+    plan.materialize(0)
+    assert seen[0].share_prompt_prefill is shared
+    assert seen[0].prefill_batch_size == (rows if shared else generate_module.GenerationDefaults.prefill_batch_size)
+
+
+def test_grpo_plan_drops_the_previous_generation_before_generating_the_next(monkeypatch):
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan
+
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, *, defaults=None: [
+        types.SimpleNamespace(token_ids=[1], finish_reason="stop") for _ in requests])
+    plan = create_grpo_batch_plan(
+        [{"prompt": "a" * (index + 1)} for index in range(2)], DecodingTokenizer(), num_generations=2, batch_size=2,
+        steps_per_generation=1, num_iterations=1, grad_accum=1, sampling=GRPOSampling(max_tokens=3), score_temperature=1.0,
+        max_seq_length=6, shuffle=False, num_batches=2,
+    )
+    plan.bind(TinyModel(), [lambda completions, **_: [0.0] * len(completions)], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
+    generate, held = plan._generate, []
+    monkeypatch.setattr(plan, "_generate", lambda start: held.append(plan._current) or generate(start))
+    plan.materialize(0)
+    plan.materialize(1)
+    assert len(held) == 2 and held == [None, None]
+
+
+def test_grpo_old_logps_come_from_the_rollout_only_when_asked_and_sampled_unfiltered_as_scored(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx import generate as generate_module, grpo
+    seen, sampled = [], [-0.5, -0.25, -0.125]  # a stopped row also scores its EOS
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, defaults=None: seen.append(defaults) or [
+        types.SimpleNamespace(token_ids=[1, 1], finish_reason="stop" if row % 2 else "length",
+                              logprob_array=grpo.mx.array(sampled[:2 + row % 2])) for row in range(len(requests))])
+    build = lambda sampling={}, **kwargs: grpo.create_grpo_batch_plan(
+        [{"prompt": "a" * (index + 1)} for index in range(2)], DecodingTokenizer(), num_generations=2, batch_size=2,
+        steps_per_generation=2, num_iterations=2, grad_accum=1, sampling=grpo.GRPOSampling(max_tokens=3, **sampling), max_seq_length=8,
+        shuffle=False, num_batches=4, rollout_logprobs_as_old=True, **kwargs)
+    for case in ({"score_temperature": 0.7}, {"processor": _grpo_vision_processor()}, *({"sampling": dict([filter])} for filter in (("top_k", 1), ("top_p", 0.9), ("min_p", 0.1), ("repetition_penalty", 1.1)))):
+        with pytest.warns(UserWarning, match="scoring temperature"): assert build(**case).rollout_old is False  # noqa: E701
+    (plan := build()).bind(lambda ids: pytest.fail("scored by a forward"), [lambda completions, **_: [0.0] * len(completions)], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))  # noqa: E501
+    for tokens, lengths, *_, old, _ in (plan[0], plan[1]):
+        for row, (start, end) in zip(old.tolist(), lengths.tolist()):
+            assert row[start - 1:end - 1] == sampled[:end - start] and not any(row[:start - 1])
+    assert seen[0].logprob_arrays and seen[0].logits_warp is not None
+    monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", "1")
+    assert _grpo_config(tmp_path).rollout_logprobs_as_old and not _grpo_config(tmp_path, rollout_logprobs_as_old=False).rollout_logprobs_as_old
 
 
 def _grpo_vision_processor():
@@ -4422,7 +4697,7 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
 
     calls, seen, reads = [], {}, []
     monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: calls.append(
-        (processor, requests)) or [types.SimpleNamespace(token_ids=[1] * (1 + row % 3), finish_reason="stop") for row in range(len(requests))])
+        (processor, requests, model, defaults)) or [types.SimpleNamespace(token_ids=[1] * (1 + row % 3), finish_reason="stop") for row in range(len(requests))])
     Rows = type("Rows", (list,), {"__getitem__": lambda self, index: reads.append(index) or list.__getitem__(self, index)})
     user = lambda text: [{"role": "user", "content": text}]
     image = lambda width: Image.new("RGB", (width, 4))
@@ -4433,12 +4708,14 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
         rows, None, num_generations=2, batch_size=2, steps_per_generation=3, num_iterations=1, grad_accum=1,
         sampling=GRPOSampling(max_tokens=3), max_seq_length=64, shuffle=False, num_batches=3, processor=processor, model_config={})
     plan, model = build(data), _VisionLanguageModel()
+    model.language_model, model.config = types.SimpleNamespace(named_modules=lambda: []), {"model_type": "gemma4"}
     assert plan._prompt_ids[:2] == [tuple(encode("<user>") + [60, 61] + encode("hi<assistant>")), tuple(encode("<user>yo<assistant>"))]
     plan.bind(model, [lambda prompts, completions, **_: seen.update(prompts=prompts) or [float(len(c)) for c in completions]],
               trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))
     reads.clear()
     micros = [plan.materialize(index) for index in range(3)]
     assert reads == [0, 1, 2] and calls[0][0] is processor  # one read per prompt, none retained
+    assert calls[0][3].token_ids_only and calls[0][3].batched_draws and calls[0][3].share_prompt_prefill
     assert [None if r.vision_inputs is None else r.vision_inputs["pixel_values"].tolist() for r in calls[0][1][::2]] == [[[4.0]], None, [[6.0], [8.0]]]
     parts = lambda count, text: [{"role": "user", "content": [{"type": "image"}] * count + [{"type": "text", "text": text}]}]
     assert seen["prompts"][::2] == [parts(1, "hi"), parts(0, "yo"), parts(2, "ok")]  # TRL's placeholders reach rewards
@@ -4452,13 +4729,20 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
         scored = np.arange(ids.shape[1] - 1)[None, :] < np.array(lengths[:, 1:]) - 1
         assert np.allclose(np.array(rest[3])[scored], np.array(mx.stop_gradient(completion_logps(model, batch, 1.0)))[scored], atol=1e-6)
         assert make_grpo_loss_fn(GRPOObjective(beta=0.0))(model, batch, lengths, *rest[:4])[2][4].item() == 0  # ratio 1
+    held = next(index for index, micro in enumerate(micros) if micro[0].get("pixel_values") is not None)
+    again = plan.materialize(held)[0]
+    assert again is not micros[held][0] and again["pixel_values"] is micros[held][0]["pixel_values"]
     text = plan._inputs(np.array(micros[0][0]["input_ids"]), np.array(micros[0][1]), [("yo", ())] * 2)
     assert text.get("pixel_values") is None and completion_logps(model, text, 1.0).shape[0] == 2  # bare ids fail the stub
+    media = plan._current.media
     data[2]["prompt"] = user("changed")
     with pytest.raises(ValueError, match="row 2 encodes to a different prompt"):
         plan.materialize(3)
     blank = build([{"prompt": user("yo"), "images": []}] * 3)
     assert blank.vision is False and blank._prompt_ids[0] == tuple(encode("<user>!yo<assistant>"))
+    blank.bind(model, [lambda completions, **_: [0.0] * len(completions)], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))
+    blank.materialize(0)
+    assert calls[-1][2]._target is model.language_model and calls[-1][0] is processor.tokenizer and calls[-1][3].token_ids_only and calls[0][2] is model
     assert completion_logps(model, {"input_ids": mx.array([[1, 64, 2]])}, 1.0).shape == (1, 2)  # a placeholder past the head
     # Phi-3 Vision's processor places images as negative ids, which a tokenizer cannot decode.
     phi3 = _grpo_vision_processor()
@@ -4498,7 +4782,7 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
     shifted = np.array(micros[index][0]["input_ids"])
     shifted[1] += 1  # only the second row
     with pytest.raises(ValueError, match="differently beside others"):
-        _grpo_vision_batch(processor, {}, shifted, np.array(micros[index][1]), plan._current.media[2 * index:2 * index + 2])
+        _grpo_vision_batch(processor, {}, shifted, np.array(micros[index][1]), media[2 * index:2 * index + 2])
 
 
 def test_grpo_trains_and_evaluates_image_prompts_on_a_vision_language_model(tmp_path, monkeypatch):
@@ -4740,7 +5024,7 @@ def test_the_grpo_trainer_trains_logs_and_syncs_as_trl(tmp_path, monkeypatch, ca
     assert report.action in ("exact", "bucket") and report.raw_widths == 2  # rungs 32 and 64
     assert logged[0]["reward"] == 2.0 and plans[0]["sampling"].top_k == 7
     # TRL samples at generation_kwargs' temperature but scores at args.temperature.
-    assert (plans[0]["sampling"].temperature, plans[0]["score_temperature"]) == (0.5, 1.0)
+    assert (plans[0]["sampling"].temperature, plans[0]["score_temperature"], plans[0]["rollout_logprobs_as_old"]) == (0.5, 1.0, False)  # noqa: E501
     assert (plans[0]["scale_rewards"], plans[0]["shuffle"], plans[0]["seed"], plans[0]["with_reference"], plans[0]["group_by_length"]) == (  # noqa: E501
         "batch", False, 5, beta != 0, False)  # bnpo keeps its random grouping
 
@@ -4806,7 +5090,7 @@ def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, 
     from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
 
     built = []  # a CCE scorer scoring 0: any log-prob taken off the logits instead makes kl nonzero
-    monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", lambda model, temperature: built.append(temperature) or (lambda model, batch, supervised, logit_sums: (supervised * 0.0, None)))  # noqa: E501
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", lambda model, temperature: built.append(temperature) or (lambda model, batch, supervised, indices=None, *, logit_sums, **_: (supervised * 0.0, None)))  # noqa: E501
 
     modes = []
     monkeypatch.setattr("unsloth_zoo.mlx.grpo._scored_as_step", lambda logps, step_compiled, scored=grpo_module._scored_as_step: scored(logps, lambda: modes.append(step_compiled()) or modes[-1]))  # noqa: E501
