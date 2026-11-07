@@ -27,6 +27,12 @@ from unsloth_zoo.fused_losses import fused_linear as fl
 
 V, H = 97, 16
 
+requires_hook_inspection = pytest.mark.skipif(
+    fl._KEEP_GRAPH is None or fl._TOP_SAVED_HOOKS is None
+    or not hasattr(torch._C._autograd.SavedTensor, "unpack_hook"),
+    reason = "in-place adoption requires saved-tensor hook inspection",
+)
+
 
 def _inputs(seed, n = 40, dtype = torch.bfloat16):
     g = torch.Generator().manual_seed(seed)
@@ -58,6 +64,7 @@ def stored_head_grad(monkeypatch):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@requires_hook_inspection
 def test_head_grad_buffer_becomes_param_grad(stored_head_grad, dtype):
     hidden, weight, targets = _inputs(0, dtype = dtype)
     h = hidden.clone().requires_grad_()
@@ -67,6 +74,7 @@ def test_head_grad_buffer_becomes_param_grad(stored_head_grad, dtype):
     assert w.grad.data_ptr() == stored_head_grad[0]
 
 
+@requires_hook_inspection
 def test_jsd_student_head_grad_buffer_becomes_param_grad(monkeypatch):
     ptrs = []
     impl = fl._OPS["jsd_impl"]
@@ -89,6 +97,7 @@ def test_jsd_student_head_grad_buffer_becomes_param_grad(monkeypatch):
     assert torch.equal(ws[0].grad, ws[1].grad)
 
 
+@requires_hook_inspection
 def test_grpo_head_grad_buffer_becomes_param_grad(monkeypatch):
     from unsloth_zoo.fused_losses import fused_grpo as fg
 
@@ -324,3 +333,49 @@ def test_hook_shared_buffers_across_two_losses_are_not_scaled_twice(keep_origina
         return w.grad
 
     torch.testing.assert_close(run(True), run(False))
+
+
+@pytest.mark.parametrize("op", ["ce", "grpo", "jsd"])
+@pytest.mark.parametrize("hook_kind", ["per_tensor", "default_without_query"])
+@pytest.mark.parametrize("separate_backward", [False, True])
+def test_shared_stored_grads_with_late_or_uninspectable_hooks(monkeypatch, op, hook_kind, separate_backward):
+    from unsloth_zoo.fused_losses import fused_grpo as fg
+
+    hidden, weight, targets = _inputs(10, n = 10, dtype = torch.float32)
+    targets = targets.clamp_min(0)
+    old = (hidden @ weight.t()).log_softmax(-1).gather(-1, targets[:, None]).reshape(2, 5)
+
+    def loss(w):
+        if op == "grpo":
+            return fg.fused_linear_grpo_loss(
+                hidden.reshape(2, 5, H), w, targets.reshape(2, 5),
+                mask = torch.ones(2, 5, dtype = torch.bool), advantages = torch.tensor([0.6, -0.4]),
+                old_logps = old,
+            )[0]
+        if op == "jsd":
+            return fl.fused_linear_jsd(hidden, w, hidden, weight * 0.9)
+        return _loss(hidden, w, targets)
+
+    ref = weight.clone().requires_grad_()
+    loss(ref).backward()
+    expected = ref.grad.clone()
+    assert expected.any()
+    w = weight.clone().requires_grad_()
+    if hook_kind == "default_without_query":
+        monkeypatch.setattr(fl, "_TOP_SAVED_HOOKS", None)
+        with _value_dedup_hooks(keep_original = True):
+            a, b = loss(w), loss(w)
+    else:
+        a, b = loss(w), loss(w)
+        ga, gb = a.grad_fn.saved_tensors[1], b.grad_fn.saved_tensors[1]
+        assert torch.equal(ga, gb)
+        shared = gb.detach()
+        # Registered after setup: no default hook was active when ctx.owned was recorded.
+        for node in (a.grad_fn, b.grad_fn):
+            node._raw_saved_tensors[1].register_hooks(lambda t: shared, lambda t: t)
+    if separate_backward:
+        (a * 0.75).backward()
+        (b * 0.25).backward()
+    else:
+        (a * 0.75 + b * 0.25).backward()
+    torch.testing.assert_close(w.grad, expected, rtol = 2e-5, atol = 1e-7)
