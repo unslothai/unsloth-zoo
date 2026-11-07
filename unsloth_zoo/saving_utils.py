@@ -7346,12 +7346,16 @@ def _unresolved_lora_targets(lora_weights, disk_keys, disk_module_shapes, model_
 pass
 
 
-_TOWER_WORDS = ("vision", "visual", "image", "audio", "speech", "encoder", "tower", "projector")
+_TOWER_WORDS = frozenset((
+    "vision", "visual", "vit", "clip", "siglip", "image", "img", "audio", "speech", "whisper",
+    "encoder", "tower", "projector", "mm", "multimodal", "merger", "patch",
+))
 
 
 def _tower_words(prefix_parts):
-    joined = ".".join(prefix_parts).lower()
-    return frozenset(word for word in _TOWER_WORDS if word in joined)
+    # Whole name components (`model.vit`, `vision_tower`): a substring test misses `vit` / `clip` towers.
+    tokens = re.split(r"[._]", ".".join(prefix_parts).lower())
+    return frozenset(token for token in tokens if token in _TOWER_WORDS)
 pass
 
 
