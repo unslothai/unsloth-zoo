@@ -35,9 +35,9 @@ def native(monkeypatch):
     return calls
 
 
-def _case(dtype, N, requires_grad = True):
+def _case(dtype, N, requires_grad = True, K = 64):
     torch.manual_seed(0)
-    E, K, M_rows = 3, 64, 24
+    E, M_rows = 3, 24
     inputs = torch.randn(M_rows, K, dtype = dtype, requires_grad = requires_grad)
     # HF stores expert stacks as [E, out, in]; the MoE forward passes the [E, in, out] view.
     leaf = (torch.randn(E, N, K, dtype = dtype) * 0.1).requires_grad_(requires_grad)
@@ -58,9 +58,37 @@ def _reference(inputs, leaf, offsets, grad):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_trainable_stack_with_unaligned_rows_trains(native, dtype):
-    # 2 * I = 20 columns: 40 bytes per row in 16-bit, which torch._grouped_mm's own backward rejects.
+@pytest.mark.parametrize("layout", ["hf_view", "contiguous", "view_unproven"])
+def test_trainable_stack_with_unaligned_rows_trains(native, monkeypatch, dtype, layout):
+    # 2 * I = 20 columns: 40 bytes per row in 16-bit, which torch._grouped_mm's own backward rejects unpadded.
     inputs, leaf, offsets = _case(dtype, N = 20)
+    if layout == "view_unproven":
+        monkeypatch.setattr(M, "_transposed_view_safe_on", lambda device: False)
+    if layout == "contiguous":
+        leaf = leaf.detach().transpose(-2, -1).contiguous().requires_grad_()  # [E, K, N]
+        weight, ref_leaf = leaf, leaf.detach().transpose(-2, -1)
+    else:
+        weight, ref_leaf = leaf.transpose(-2, -1), leaf.detach()
+    y = M._grouped_mm_with_backward_fix(inputs, weight, offsets)
+    grad = torch.randn_like(y)
+    y.backward(grad)
+    ref_y, ref_dx, ref_dw = _reference(inputs, ref_leaf, offsets, grad)
+    if layout == "contiguous":
+        ref_dw = ref_dw.transpose(-2, -1)
+    tol = dict(atol = 3e-2, rtol = 3e-2)
+    torch.testing.assert_close(y.double(), ref_y, **tol)
+    torch.testing.assert_close(inputs.grad.double(), ref_dx, **tol)
+    torch.testing.assert_close(leaf.grad.double(), ref_dw, **tol)
+    assert leaf.grad.shape == leaf.shape
+    assert leaf.grad.abs().amax(dim = (-2, -1))[1] == 0  # the empty expert
+    assert len(native) >= 1  # still the native kernel, on zero-padded columns
+
+
+def test_unaligned_rows_and_inner_dim_fall_back_per_expert(native, monkeypatch):
+    # K = 10 as well (down_proj of a 10-wide expert): even the padded forward is rejected, so the per-expert loop runs.
+    manual, loops = M._manual_grouped_mm, []
+    monkeypatch.setattr(M, "_manual_grouped_mm", lambda *a: loops.append(1) or manual(*a))
+    inputs, leaf, offsets = _case(torch.float16, N = 20, K = 10)
     y = M._grouped_mm_with_backward_fix(inputs, leaf.transpose(-2, -1), offsets)
     grad = torch.randn_like(y)
     y.backward(grad)
@@ -69,8 +97,17 @@ def test_trainable_stack_with_unaligned_rows_trains(native, dtype):
     torch.testing.assert_close(y.double(), ref_y, **tol)
     torch.testing.assert_close(inputs.grad.double(), ref_dx, **tol)
     torch.testing.assert_close(leaf.grad.double(), ref_dw, **tol)
-    assert leaf.grad[1].abs().max() == 0  # the empty expert
-    assert not native  # the per-expert fallback, not the op whose backward raises
+    assert loops == [1]
+
+
+def test_padding_is_exact(native):
+    # Padded columns are zeros and sliced off: the same values as running the op on the aligned stack's first N columns.
+    inputs, leaf, offsets = _case(torch.bfloat16, N = 20)
+    y = M._grouped_mm_with_backward_fix(inputs, leaf.transpose(-2, -1), offsets)
+    wide = torch.cat([leaf.detach(), torch.randn(3, 4, 64, dtype = torch.bfloat16)], dim = 1)
+    with torch.no_grad():
+        ref = torch._grouped_mm(inputs.detach(), wide.transpose(-2, -1), offs = offsets)[:, :20]
+    torch.testing.assert_close(y.detach(), ref, atol = 0, rtol = 0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
