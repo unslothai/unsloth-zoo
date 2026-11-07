@@ -788,6 +788,23 @@ def test_vlm_resize_int_downscales_large_images_like_cuda_collator():
     assert resized[0].size == (512, 256)
 
 
+def test_vlm_gemma4_images_reach_the_processor_unshrunk():
+    """Gemma 4's processor resizes to its soft-token budget (about 768 px square); its nominal 224 `size` used to
+    pre-shrink every training image to 224 px before that upsampling."""
+    from types import SimpleNamespace
+
+    processing = pytest.importorskip("mlx_vlm.models.gemma4.processing_gemma4")
+    from unsloth_zoo.mlx.utils import _resize_vlm_images, _resolve_vlm_image_size
+
+    gemma4 = SimpleNamespace(image_processor=processing.Gemma4ImageProcessor())
+    assert gemma4.image_processor.size == {"height": 224, "width": 224}
+    size = _resolve_vlm_image_size(None, {"vision_config": {}}, gemma4)
+    assert size is None
+    assert _resize_vlm_images([Image.new("RGB", (1024, 768))], size)[0].size == (1024, 768)
+    sized = SimpleNamespace(image_processor=SimpleNamespace(size={"height": 448, "width": 448}))
+    assert _resolve_vlm_image_size(None, {"vision_config": {}}, sized) == 448
+
+
 def test_vlm_processor_inputs_retries_duplicate_add_special_tokens():
     from unsloth_zoo.mlx.utils import _processor_vlm_inputs
 

@@ -48,6 +48,7 @@ from .utils import (
     _finite_text_pad_width,
     _get_processor_tokenizer,
     _mlx_rng_key,
+    _length_dependent_ropes,
     _normalize_mlx_messages,
     _normalize_seed,
     _prepare_vlm_batch_for_compile,
@@ -55,6 +56,7 @@ from .utils import (
     _restore_mlx_rng_key,
     _processor_vlm_inputs,
     _right_pad_vlm_rows,
+    _row_contiguous_cross_entropy,
     _to_mx_vlm_batch,
     _vlm_batch_family,
     _vlm_family_divergence,
@@ -227,7 +229,7 @@ def completion_logps(model, batch, temperature):
     targets = _preference_ids(batch)[:, 1:]
     # An image placeholder may lie outside the head (Mllama's) or be negative (Phi-3 Vision); none is scored.
     targets = mx.where((targets >= 0) & (targets < logits.shape[-1]), targets, 0)
-    return -nn.losses.cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
+    return -_row_contiguous_cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
 
 
 def grpo_logps(temperature, scorer=None):
@@ -617,29 +619,97 @@ def hf_logits_warper(sampling, prompt_ids):
             picked = logits[:, seen]
             logits[:, seen] = mx.where(picked < 0, picked * penalty, picked / penalty)
             logits = logits[:, :vocab]
-        if sampling.temperature != 1.0:
-            logits = logits / sampling.temperature
-        removed = mx.array(-float("inf"), mx.float32)
-        vocab = logits.shape[-1]
-        if sampling.top_k:
-            kept = vocab - min(int(sampling.top_k), vocab)
-            cutoff = mx.sort(logits, axis=-1)[:, kept:kept + 1]
-            logits = mx.where(logits < cutoff, removed, logits)
-        if sampling.top_p < 1.0:
-            # Drops by sorted position as HF does, since a value cutoff keeps every tie; the most likely token always survives, as HF's min_tokens_to_keep=1.
-            order = mx.argsort(logits, axis=-1)
-            ordered = mx.take_along_axis(logits, order, axis=-1)
-            below = mx.cumsum(mx.softmax(ordered, axis=-1), axis=-1) <= 1 - sampling.top_p
-            below = mx.logical_and(below, mx.arange(vocab) < vocab - 1)
-            dropped = mx.take_along_axis(below, mx.argsort(order, axis=-1), axis=-1)
-            logits = mx.where(dropped, removed, logits)
-        if sampling.min_p:
-            probs = mx.softmax(logits, axis=-1)
-            floor = sampling.min_p * mx.max(probs, axis=-1, keepdims=True)
-            logits = mx.where(probs < floor, removed, logits)
-        return logits
+        return hf_logits_filter(sampling, logits)
 
     return warp
+
+
+def hf_logits_filter(sampling, logits):
+    """HF's temperature, top-k, top-p and min-p over the last axis of float32 logits, each row on its own."""
+    if sampling.temperature != 1.0:
+        logits = logits / sampling.temperature
+    removed = mx.array(-float("inf"), mx.float32)
+    vocab = logits.shape[-1]
+    if sampling.top_k:
+        kept = vocab - min(int(sampling.top_k), vocab)
+        cutoff = mx.sort(logits, axis=-1)[..., kept:kept + 1]
+        logits = mx.where(logits < cutoff, removed, logits)
+    if sampling.top_p < 1.0:
+        # Drops by sorted position as HF does, since a value cutoff keeps every tie; the most likely token always survives, as HF's min_tokens_to_keep=1.
+        order = mx.argsort(logits, axis=-1)
+        ordered = mx.take_along_axis(logits, order, axis=-1)
+        below = mx.cumsum(mx.softmax(ordered, axis=-1), axis=-1) <= 1 - sampling.top_p
+        below = mx.logical_and(below, mx.arange(vocab) < vocab - 1)
+        dropped = mx.take_along_axis(below, mx.argsort(order, axis=-1), axis=-1)
+        logits = mx.where(dropped, removed, logits)
+    if sampling.min_p:
+        probs = mx.softmax(logits, axis=-1)
+        floor = sampling.min_p * mx.max(probs, axis=-1, keepdims=True)
+        logits = mx.where(probs < floor, removed, logits)
+    return logits
+
+
+def _rollout_sampling(sampling, prompt_ids, always_float32=False):
+    """``(logits processors, logits warp)``: a repetition penalty reads each row's own history, so only a batch
+    without one warps every row at once; always_float32 casts unwarped logits to float32 too."""
+    if sampling.repetition_penalty == 1.0:
+        if sampling.warps:
+            return None, lambda logits: hf_logits_filter(sampling, logits.astype(mx.float32))
+        return None, (lambda logits: logits.astype(mx.float32)) if always_float32 else None
+    return (hf_logits_warper(sampling, prompt_ids),), None
+
+
+def _kv_element_bytes(model):
+    """Bytes of a cached K or V element: the embedding's output dtype, which attention keeps; bf16's when unknown."""
+    named = getattr(model, "named_modules", None)
+    for name, module in named() if callable(named) else ():
+        if name.endswith("embed_tokens"):
+            values = getattr(module, "scales", None)
+            values = getattr(module, "weight", None) if values is None else values
+            if values is not None:
+                return values.itemsize
+    return 2
+
+
+def _cache_bytes_per_row(model, tokens):
+    """Bytes a row's cache may hold at ``tokens`` tokens: every layer's K and V for every token, or more where the
+    caches the language model makes hold more (a linear-attention state, layers wider than ``head_dim``); a rotating
+    cache counts its window at most. mlx-lm grows K/V in 256-position blocks, so tokens round up to one. None when
+    the text config does not say."""
+    tokens = -(-int(tokens) // 256) * 256
+    config = getattr(model, "args", None) or getattr(model, "config", None)
+    config = _config_get(config, "text_config", None) or config
+    get = lambda key: _config_get(config, key, None) or 0  # noqa: E731
+    layers, attention_heads = get("num_hidden_layers"), get("num_attention_heads")
+    heads = get("num_key_value_heads") or attention_heads
+    head_dim = get("head_dim") or (get("hidden_size") // attention_heads if attention_heads else 0)
+    if not (layers and heads and head_dim):
+        return None
+    element = _kv_element_bytes(model)
+    widest = 2 * element * max(heads, get("num_global_key_value_heads")) * max(head_dim, get("global_head_dim"))
+    key_dim = get("linear_num_key_heads") * get("linear_key_head_dim")
+    value_dim = get("linear_num_value_heads") * get("linear_value_head_dim")
+    conv = max(get("linear_conv_kernel_dim") - 1, 0) * (2 * key_dim + value_dim)
+    state = 4 * (value_dim * get("linear_key_head_dim") + conv)
+    make_cache = getattr(getattr(model, "language_model", model), "make_cache", None)
+    held = sum(widest * min(tokens, cache.max_size) if getattr(cache, "max_size", None)
+               else state if state and hasattr(cache, "cache") else widest * tokens
+               for cache in (make_cache() if callable(make_cache) else None) or ())
+    return max(2 * element * int(layers) * heads * head_dim * tokens, held)
+
+
+def _rollout_rows(model, rows, tokens):
+    """Rows decoded at once: the whole generation when its KV cache fits half the free working set, never fewer than
+    the engine's default."""
+    floor = GenerationDefaults.completion_batch_size
+    per_row = _cache_bytes_per_row(model, tokens) if rows > floor else None
+    if per_row is None:
+        return floor
+    try:
+        free = int(mx.device_info()["max_recommended_working_set_size"]) - int(mx.get_active_memory())
+    except Exception:
+        return floor
+    return max(floor, min(rows, free // 2 // per_row))
 
 
 def _derived_seed(*parts):
@@ -742,6 +812,7 @@ class _Generation:
     skipped: dict | None = None
     weights: np.ndarray | None = None
     eager: bool = False
+    vision_inputs: dict | None = None  # (first row, width) -> that micro-batch's vision inputs
 
 
 class GRPOBatchPlan:
@@ -754,7 +825,7 @@ class GRPOBatchPlan:
         num_generations, batch_size, steps_per_generation, num_iterations,
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
-        processor=None, model_config=None, vision=False, group_by_length=False, layout_block=1,
+        processor=None, model_config=None, vision=False, rollout_old=False, group_by_length=False, layout_block=1,
         skip_zero_advantage=False, sample_weighting=None, media_signatures=None,
     ):
         self._dataset = dataset
@@ -776,6 +847,7 @@ class GRPOBatchPlan:
         self.scale_rewards = scale_rewards
         self.mask_truncated_completions = mask_truncated_completions
         self.with_old_logps = with_old_logps
+        self.rollout_old = rollout_old
         self.with_reference = with_reference
         self.max_seq_length = max_seq_length
         self.seed = seed
@@ -951,10 +1023,16 @@ class GRPOBatchPlan:
             lengths[row] = (prompt_length, len(sequence))
         return batch, lengths
 
-    def _inputs(self, batch, lengths, media):
+    def _inputs(self, batch, lengths, media, held=None, key=None):
         if self._processor is None:
             return mx.array(batch)
-        return _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
+        # A micro-batch's processor outputs serve its old and reference scores and every iteration over it.
+        if held is None or key not in held:
+            inputs = _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
+            if held is None:
+                return inputs
+            held[key] = inputs
+        return dict(held[key])
 
     def configure_cce_compaction(self, enabled=True):
         self._cce_bounds = (min(map(len, self._prompt_ids)), max(self._max_tokens)) if enabled else None
@@ -969,23 +1047,23 @@ class GRPOBatchPlan:
         capacity = grpo_cce_capacity(len(lengths), width, *self._cce_bounds)
         return None if capacity is None else mx.array(grpo_cce_indices(lengths, width, capacity))
 
-    def _score(self, scorer, visit, sequences, prompt_lengths, media, skipped=()):
+    def _score(self, scorer, visit, sequences, prompt_lengths, media, skipped=(), held=None):
         values = []
         for start in range(0, len(sequences), self.batch_size):
             chunk = sequences[start:start + self.batch_size]
             if start // self.batch_size in skipped:
                 values.extend(np.zeros(len(sequence) - 1, dtype=np.float32) for sequence in chunk)
                 continue
-            inputs, lengths, width = self._slot_inputs(visit, start, chunk, prompt_lengths, media)
+            inputs, lengths, width = self._slot_inputs(visit, start, chunk, prompt_lengths, media, held)
             logps = np.array(scorer(inputs, mx.array(lengths), self._cce_indices(lengths, width)), dtype=np.float32)
             values.extend(logps[row, :len(sequence) - 1] for row, sequence in enumerate(chunk))
         return values
 
-    def _slot_inputs(self, visit, start, chunk, prompt_lengths, media):
+    def _slot_inputs(self, visit, start, chunk, prompt_lengths, media, held=None):
         width = self._planned(self._width(max(len(sequence) for sequence in chunk)), visit + start // self.batch_size)
         batch, lengths = self._pack(chunk, prompt_lengths[start:start + self.batch_size], width)
         media = None if media is None else media[start:start + self.batch_size]
-        return self._inputs(batch, lengths, media), lengths, width
+        return self._inputs(batch, lengths, media, held, (start, width)), lengths, width
 
     def _generation_family_drift(self, visit, sequences, prompt_lengths, media):
         """The first micro-batch of a generation whose vision family left its survey, found before any is scored."""
@@ -1012,31 +1090,46 @@ class GRPOBatchPlan:
         read = {prompt: self._dataset[prompt] for prompt in dict.fromkeys(prompts)}
         # Read again each generation and held only for it: the plan keeps no pixels.
         encoded = {prompt: self._reencode(prompt, row) for prompt, row in read.items()} if self.vision else {}
+        images = any(inputs is not None for *_, inputs in encoded.values())
+        engine = None if images else generate_module.text_engine_model(self._model)
+        text = engine is not None
         requests = [
             GenerationRequest(
                 prompt_token_ids=self._prompt_ids[prompt],
                 vision_inputs=encoded[prompt][3] if encoded else None,
                 max_tokens=self._max_tokens[prompt],
                 sampling=SamplingParams(temperature=1.0, seed=_derived_seed(self.seed, visit, 0, row)),
-                logits_processors=(
-                    (hf_logits_warper(self.sampling, self._prompt_ids[prompt]),)
-                    if self.sampling.warps else None
-                ),
+                logits_processors=_rollout_sampling(self.sampling, self._prompt_ids[prompt])[0],
             )
             for row, prompt in enumerate(prompts)
         ]
+        rows = _rollout_rows(self._model, len(requests), max(
+            len(request.prompt_token_ids) + request.max_tokens for request in requests))
+        # Shared prefixes are all held until the generation ends, so share only when it decodes in one wave; and a
+        # native text RoPE that picks frequencies from the batch's largest offset would rotate isolated prefills apart.
+        native = engine is self._model and isinstance(self._model, nn.Module)
+        share = rows >= len(requests) and not (native and _length_dependent_ropes(self._model))
         defaults = GenerationDefaults(
             max_tokens=self.sampling.max_tokens, stop_token_ids=(self.eos_id,),
+            logits_warp=_rollout_sampling(self.sampling, (), self.rollout_old)[1], batched_draws=True,
+            logprob_arrays=self.rollout_old,
+            token_ids_only=True,  # completions are decoded once, after the cut
+            completion_batch_size=rows, share_prompt_prefill=share,
+            # Rows prefilled already start decoding at once; full prompts keep the ordinary prefill width.
+            prefill_batch_size=rows if text and share else GenerationDefaults.prefill_batch_size,
         )
         with self._rollout_context():
             results = generate_module.generate_batch(
-                self._model, self._processor or self._tokenizer, requests, defaults=defaults,
+                engine or self._model,
+                (getattr(self._processor, "tokenizer", self._processor) if text else self._processor) or self._tokenizer,
+                requests, defaults=defaults,
             )
         cut = [
             cut_completion(result.token_ids, result.finish_reason, eos_id=self.eos_id, pad_id=self.pad_id)
             for result in results
         ]
         completion_ids = [ids for ids, _ in cut]
+        rollout = self._rollout_logps(prompts, results, completion_ids) if self.rollout_old else None
         truncated = np.array([flag for _, flag in cut], dtype=bool)
         rows = [read[prompt] for prompt in prompts]
         texts = [self._decode(ids) for ids in completion_ids]
@@ -1117,13 +1210,16 @@ class GRPOBatchPlan:
                 )
                 eager = self._family_drift is not None
             self._record("frac_generations_eager", eager)
+        held = {} if encoded else None
         old = ref = None
         self._eager_generation = eager
         try:
-            if self.with_old_logps:
+            if rollout is not None:
+                old = [rollout[row] for row in order]
+            elif self.with_old_logps:
                 old = self._score(
                     lambda batch, lengths, indices: mx.stop_gradient(self._logps(self._model, batch, lengths, indices)),
-                    visit, sequences, prompt_lengths, media, skipped,
+                    visit, sequences, prompt_lengths, media, skipped, held,
                 )
             if self.with_reference:
                 ref = self._score(
@@ -1131,7 +1227,7 @@ class GRPOBatchPlan:
                         self._model, batch, lengths,
                         response_scorer=lambda model, batch, lengths: self._logps(model, batch, lengths, indices),
                     ),
-                    visit, sequences, prompt_lengths, media,
+                    visit, sequences, prompt_lengths, media, held=held,
                 )
         finally:
             self._eager_generation = False
@@ -1139,8 +1235,19 @@ class GRPOBatchPlan:
             visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
             generation_tokens=int(lengths.sum()), media=media, skipped=skipped,
-            weights=None if weights is None else weights[order], eager=eager,
+            weights=None if weights is None else weights[order], eager=eager, vision_inputs=held,
         )
+
+    def _rollout_logps(self, prompts, results, completion_ids):
+        """Old log-probs as the rollout sampled each completion id, zero over the prompt, as scoring lays them out."""
+        mx.eval([result.logprob_array for result in results])
+        rows = []
+        for prompt, result, ids in zip(prompts, results, completion_ids):
+            sampled = np.array(result.logprob_array.astype(mx.float32))
+            if len(sampled) != len(ids):
+                raise RuntimeError("Unsloth MLX GRPO: the rollout's log-probs do not line up with its completion.")
+            rows.append(np.concatenate([np.zeros(len(self._prompt_ids[prompt]) - 1, np.float32), sampled]))
+        return rows
 
     def _reencode(self, prompt, row):
         encoded = _encode_grpo_prompt(self._tokenizer, row, self._processor, vision=True)
@@ -1198,6 +1305,7 @@ class GRPOBatchPlan:
         """Micro-batch for schedule entry index at its planned width whatever the phase; refetching an entry reuses its generation instead of sampling again."""
         start = self._generation_start(index)
         if self._current is None or self._current.visit != start:
+            self._current = None  # its held vision inputs must not stay alive through the next rollout
             self._current = self._generate(start)
         generation = self._current
         position = ((index - start) % self.steps_per_generation) * self.batch_size
@@ -1216,7 +1324,7 @@ class GRPOBatchPlan:
 
         media = None if generation.media is None else generation.media[position:position + self.batch_size]
         materialized = (
-            self._inputs(batch, lengths, media), mx.array(lengths),
+            self._inputs(batch, lengths, media, generation.vision_inputs, (position, width)), mx.array(lengths),
             mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),
@@ -1318,11 +1426,14 @@ def create_grpo_batch_plan(
     mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
     shuffle=True, seed=None, num_batches=None, num_epochs=None, processor=None, model_config=None,
     group_by_length=False, skip_zero_advantage=False, sample_weighting=None,
+    rollout_logprobs_as_old=False,
 ):
     """Encode prompts once and lay out TRL's RepeatSampler schedule; batch_size counts completions, a generation samples
     batch_size * steps_per_generation of them, num_generations per prompt; score_temperature defaults to the sampling
     temperature; a VLM processor replaces tokenizer; within each optimizer step group_by_length sorts rows by length and
-    skip_zero_advantage puts zero-advantage rows last; sample_weighting is grpo_sample_weighting's."""
+    skip_zero_advantage puts zero-advantage rows last; sample_weighting is grpo_sample_weighting's;
+    rollout_logprobs_as_old takes old log-probs from tokenizer-only rollouts sampled unfiltered at the scoring
+    temperature instead of a forward."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
     prompt_ids, max_tokens, vision, signatures = _encode_grpo_prompts(
@@ -1349,6 +1460,17 @@ def create_grpo_batch_plan(
         batches_for_epoch, num_batches=num_batches, num_epochs=num_epochs,
         grad_accum=grad_accum,
     )
+    score_temperature = sampling.temperature if score_temperature is None else score_temperature
+    with_old_logps = grad_accum % repeats != 0
+    rollout_old = bool(rollout_logprobs_as_old) and with_old_logps
+    filtered = sampling.top_p < 1.0 or bool(sampling.top_k) or bool(sampling.min_p) or sampling.repetition_penalty != 1.0
+    if rollout_old and (processor is not None or filtered or sampling.temperature != score_temperature):
+        warnings.warn(
+            "Unsloth MLX GRPO: rollout_logprobs_as_old needs tokenizer-only rollouts sampled at the scoring temperature "
+            "with no top-k, top-p, min-p or repetition penalty; old log-probs are scored by a forward instead.",
+            stacklevel=2,
+        )
+        rollout_old = False
     if not cycle_length:
         raise ValueError(
             f"Unsloth MLX GRPO: the dataset has {len(prompt_ids)} prompt(s), fewer "
@@ -1359,12 +1481,11 @@ def create_grpo_batch_plan(
         cycle_length=cycle_length, num_generations=num_generations,
         batch_size=batch_size, steps_per_generation=steps_per_generation,
         num_iterations=num_iterations, sampling=sampling,
-        score_temperature=sampling.temperature if score_temperature is None else score_temperature,
-        scale_rewards=scale_rewards,
+        score_temperature=score_temperature, scale_rewards=scale_rewards,
         mask_truncated_completions=mask_truncated_completions,
-        with_old_logps=grad_accum % repeats != 0, with_reference=with_reference,
+        with_old_logps=with_old_logps, with_reference=with_reference,
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
-        processor=processor, model_config=model_config, vision=vision,
+        processor=processor, model_config=model_config, vision=vision, rollout_old=rollout_old,
         group_by_length=group_by_length, layout_block=math.gcd(steps_per_generation, grad_accum),
         skip_zero_advantage=skip_zero_advantage, sample_weighting=sample_weighting, media_signatures=signatures,
     )
@@ -1622,6 +1743,8 @@ def resolve_grpo_config(config):
             )
     if config.mask_truncated_completions is None:
         config.mask_truncated_completions = False
+    if getattr(config, "rollout_logprobs_as_old", None) is None:
+        config.rollout_logprobs_as_old = os.environ.get("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", "0") == "1"
     if not 0 < config.temperature < 10:
         raise ValueError(
             f"Unsloth MLX GRPO: temperature={config.temperature} must lie between 0 "

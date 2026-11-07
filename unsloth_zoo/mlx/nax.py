@@ -1067,7 +1067,7 @@ def _sorted_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_ro
 _SORTED_GATHER_ROWS_BY_GPU = {17: {4: (4, 128), 8: (4, 128)}}
 # Below these rows per expert and per call MLX runs per-row kernels, which round differently.
 _SORTED_GATHER_STOCK_MIN_ROWS, _SORTED_GATHER_STOCK_MIN_CALL = 4, 16
-# Past this the stock reference drops `sorted_indices` (ml-explore/mlx#3856): first-use checks would not cover it.
+# Stock sorted gather_qmm was wrong past this before mlx 0.32.3 (ml-explore/mlx#3856); unmeasured beyond it.
 _SORTED_GATHER_MAX_CALL = 32768
 
 
