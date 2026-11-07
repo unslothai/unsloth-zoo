@@ -450,6 +450,9 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
         divisor = torch.where(count == 0, torch.full_like(count, float("nan")), count)
     elif torch.is_tensor(num_items_in_batch):
         divisor = num_items_in_batch.detach().to(device = hidden.device, dtype = torch.float32).reshape(())
+    elif torch.compiler.is_compiling():
+        # A Python count becomes symbolic once it changes between steps; float()/math.isnan on it cannot be traced.
+        divisor = torch.full((), num_items_in_batch, dtype = torch.float32, device = hidden.device)
     else:
         divisor = float(num_items_in_batch)
     # Skip ignored rows' LM head work. Eager only: the sync breaks compile; chunk loop zeroes them anyway.
