@@ -173,6 +173,92 @@ def test_qwen3_vl_pos_embed_interpolation_with_quantized_table():
 
 
 @metal_only
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_qwen3_vl_vision_attention_trains_on_fp32_fused_attention(monkeypatch, dtype):
+    import numpy as np
+    from mlx_vlm.models.qwen3_vl.vision import Attention
+    from unsloth_zoo.mlx import compile as mc
+
+    mc._install_qwen3_family_compile_patches()
+    lengths, heads, dim = [200, 8, 9, 176], 4, 72   # 8 patches is the largest chunk mlx would not fuse
+    mx.random.seed(0)
+    layer = Attention(heads * dim, num_heads=heads)
+    layer.qkv.weight = layer.qkv.weight * 4   # peaked scores
+    dt = getattr(mx, dtype)
+    layer.set_dtype(dt)   # the float32 reference starts from the same rounded weights and inputs
+    x, cot = (mx.random.normal((sum(lengths), heads * dim)).astype(dt) for _ in range(2))
+    cu_seqlens, freqs = mx.array(np.cumsum([0, *lengths])), mx.zeros((sum(lengths), dim // 2))
+
+    def dx(dt, training=False):
+        layer.set_dtype(dt)
+        if training:
+            mlx_utils.acquire_mlx_training_patches()
+        try:
+            grad = mx.grad(lambda x: (layer(x, cu_seqlens, freqs) * cot.astype(dt)).astype(mx.float32).sum())(
+                x.astype(dt))
+            mx.eval(grad)
+        finally:
+            if training:
+                mlx_utils.release_mlx_training_patches()
+        return _f64(grad)
+
+    def explicit(q, k, v, *, scale, mask=None, **kwargs):   # the formula this patch used for every chunk
+        return _explicit_fp32_softmax(q, k, v, scale, mask)
+
+    monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    stock, seen = mx.fast.scaled_dot_product_attention, []
+    ref = dx(mx.float32)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", explicit)
+    old = dx(dt)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention",
+                        lambda q, *a, **kw: seen.append(q.dtype) or stock(q, *a, **kw))
+    new = dx(dt, training=True)
+    assert seen == [mx.float32] * 3   # the 8-patch chunk stays explicit
+    assert _rel(new, ref) <= 1.1 * _rel(old, ref)
+    monkeypatch.setenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", "0")
+    killed = dx(dt, training=True)
+    assert seen == [mx.float32] * 3   # the kill switch keeps every chunk on the explicit path
+    assert _rel(killed, ref) <= 1.1 * _rel(old, ref)
+
+
+@metal_only
+def test_qwen3_vl_vision_forward_does_not_depend_on_freeze_state(monkeypatch):
+    # A separately loaded reference is frozen while the policy tower trains; equal weights must score equally.
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models.qwen3_vl.config import VisionConfig
+    from mlx_vlm.models.qwen3_vl.vision import VisionModel
+    from unsloth_zoo.mlx import compile as mc
+
+    mc._install_qwen3_family_compile_patches()
+    mx.random.seed(0)
+    config = VisionConfig(depth=2, hidden_size=288, intermediate_size=576, out_hidden_size=64, num_heads=4,
+                          num_position_embeddings=64)
+    policy, reference = VisionModel(config), VisionModel(config)
+    reference.update(policy.parameters())
+    for tower in (policy, reference):
+        tower.set_dtype(mx.bfloat16)
+        tower.freeze()
+    policy.blocks[0].attn.qkv.unfreeze()
+    assert tree_flatten(policy.trainable_parameters()) and not tree_flatten(reference.trainable_parameters())
+    pixels, grid = mx.random.normal((256, 3 * 2 * 14 * 14)).astype(mx.bfloat16), mx.array([[1, 16, 16]])
+    stock, seen = mx.fast.scaled_dot_product_attention, []
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention",
+                        lambda q, *a, **kw: seen[-1].append(q.dtype) or stock(q, *a, **kw))
+    out = []
+    mlx_utils.acquire_mlx_training_patches()
+    try:
+        for tower in (policy, reference):
+            seen.append([])
+            out.append(tower(pixels, grid)[0])
+        mx.eval(out)
+    finally:
+        mlx_utils.release_mlx_training_patches()
+    # Same kernels, not just equal outputs: stock and fp32-input forwards can round alike on one GPU and not another.
+    assert seen[0] == seen[1] == [mx.float32] * 2
+    assert mx.array_equal(out[0], out[1]).item()
+
+
+@metal_only
 @pytest.mark.parametrize("static", [False, True])
 def test_native_vlm_names_preserve_source_remaps_and_transforms(monkeypatch, static):
     import inspect
@@ -372,6 +458,97 @@ def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
     assert mlx_utils._windowing_pays(q, k, 512) is pays
 
 
+def _wide_attention_inputs(T, S, dtype=None):
+    mx.random.seed(0)
+    q = mx.random.normal((1, 4, T, 512))
+    k, v = (mx.random.normal((1, 2, S, 512)) for _ in range(2))
+    return tuple(t.astype(dtype) for t in (q, k, v)) if dtype else (q, k, v)
+
+
+def _unfused_attention(q, k, v, *, scale, mask=None):
+    # mlx's own fallback math, with causal aligned to the lower right; kept device-independent (no TF32, no NAX).
+    T, S = q.shape[-2], k.shape[-2]
+    k, v = (mx.repeat(t, q.shape[1] // t.shape[1], axis=1) for t in (k, v))
+    scores = (q * scale) @ k.swapaxes(-1, -2)
+    if isinstance(mask, str):
+        mask = mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
+    if mask is not None:
+        scores = mx.where(mask, scores, -mx.inf) if mask.dtype == mx.bool_ else scores + mask
+    return mx.softmax(scores, axis=-1, precise=True) @ v
+
+
+@metal_only
+@pytest.mark.parametrize("T, S, mask, keys", [
+    (200, 200, "causal", [50, 100, 150, 200]), (200, 224, "causal", [74, 124, 174, 224]),
+    (200, 200, None, [200] * 4), (200, 200, "bool", [200] * 4), (200, 200, "additive", [200] * 4)])
+def test_query_chunked_attention_matches_unfused(T, S, mask, keys):
+    q, k, v = _wide_attention_inputs(T, S)
+    if mask in ("bool", "additive"):
+        keep = (mx.random.uniform(shape=(1, 1, T, S)) > 0.3) | (mx.eye(T, S) > 0)
+        mask = keep if mask == "bool" else mx.where(keep, 0.0, -mx.inf)
+    calls, cot = [], mx.random.normal(q.shape)
+    counted = lambda *a, **kw: calls.append(a[1].shape[-2]) or _unfused_attention(*a, **kw)
+    ref = mx.vjp(lambda q, k, v: _unfused_attention(q, k, v, scale=0.05, mask=mask), [q, k, v], [cot])
+    got = mx.vjp(lambda q, k, v: mlx_utils._query_chunked_attention(counted, q, k, v, 0.05, mask, 64),
+                 [q, k, v], [cot])
+    mx.eval(ref, got)
+    assert calls == keys
+    for a, b in zip((*got[0], *got[1]), (*ref[0], *ref[1])):
+        assert mx.allclose(a, b, atol=2e-5, rtol=1e-4)
+
+
+@metal_only
+@pytest.mark.parametrize("dim, T, S, mask, nax, chunked", [
+    (512, 1024, 1024, "causal", False, True), (512, 1024, 1024, None, False, True),
+    (512, 512, 512, "causal", False, False), (256, 4096, 4096, "causal", False, False),
+    (512, 1024, 1024, "causal", True, False), (512, 1024, 768, "causal", False, False)])
+def test_training_attention_chunks_only_wide_heads_without_nax(monkeypatch, dim, T, S, mask, nax, chunked):
+    from unsloth_zoo.mlx import attention
+
+    monkeypatch.setattr(attention, "_stock_runs_nax", lambda: nax)
+    seen = []
+    sdpa = mlx_utils._wrap_training_sdpa(lambda q, k, v, *, scale, mask=None, **kwargs: seen.append(q.shape[-2]) or q)
+    q, k = mx.zeros((1, 2, T, dim)), mx.zeros((1, 2, S, dim))
+    sdpa(q, k, k, scale=1.0, mask=mask)
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+    try:
+        sdpa(q, k, k, scale=1.0, mask=mask)
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert seen[0] == T and (seen[1:] == [T // 2, T // 2] if chunked else seen[1:] == [T])
+
+
+@metal_only
+def test_query_chunked_attention_bounds_training_memory():
+    from unsloth_zoo.mlx import nax
+
+    if nax.nax_available():
+        pytest.skip("NAX trains head dim 512 fused; the unfused baseline does not exist here")
+    # Short sequences are dominated by the O(T) terms both paths share; at 8k the T^2 scores dominate.
+    q, k, v = _wide_attention_inputs(8192, 8192, mx.bfloat16)
+    mx.eval(q, k, v)
+
+    def run():
+        mx.synchronize()
+        mx.reset_peak_memory()
+        base = mx.get_active_memory()
+        g = mx.grad(lambda q, k, v: mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=0.05, mask="causal").astype(mx.float32).sum(), argnums=(0, 1, 2))(q, k, v)
+        mx.eval(g)
+        return mx.get_peak_memory() - base, g
+
+    unfused, ref = run()
+    mlx_utils.acquire_mlx_training_patches()
+    try:
+        chunked, got = run()
+    finally:
+        mlx_utils.release_mlx_training_patches()
+    assert chunked < 0.65 * unfused, (chunked, unfused)   # measured 0.56 on M3 Max; unchunked is 1.0
+    for a, b in zip(got, ref):
+        a, b = a.astype(mx.float32), b.astype(mx.float32)
+        assert (mx.linalg.norm(a - b) / mx.linalg.norm(b)).item() < 1e-2
+
+
 @metal_only
 def test_training_attention_keeps_the_fused_mask_outside_a_training_context():
     seen = []
@@ -414,6 +591,227 @@ def test_training_attention_differentiates_short_queries_and_sinks(T, mask, sink
     finally:
         mlx_utils.release_mlx_training_patches()
     assert mx.allclose(got, mx.grad(reference)(q), atol=1e-4)
+
+
+def _causal(T, S):
+    return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
+
+
+def _attention_f64(q, k, v, do, scale, causal):
+    """float64 attention and its analytic backward from the rounded inputs; kv heads serve their query group."""
+    import numpy as np
+    G = q.shape[1] // k.shape[1]
+    k, v = np.repeat(k, G, axis=1), np.repeat(v, G, axis=1)
+    s = scale * q @ k.swapaxes(-1, -2)
+    if causal:
+        s = np.where(np.array(_causal(*s.shape[-2:])), s, -np.inf)
+    p = np.exp(s - s.max(-1, keepdims=True))
+    p /= p.sum(-1, keepdims=True)
+    dp = do @ v.swapaxes(-1, -2)
+    ds = p * (dp - (dp * p).sum(-1, keepdims=True))
+    fold = lambda g: g.reshape(g.shape[0], -1, G, *g.shape[2:]).sum(2)
+    return [p @ v, scale * ds @ k, fold(scale * ds.swapaxes(-1, -2) @ q), fold(p.swapaxes(-1, -2) @ do)]
+
+
+def _explicit_fp32_softmax(q, k, v, scale, mask):
+    G = q.shape[1] // k.shape[1]
+    k, v = mx.repeat(k, G, axis=1), mx.repeat(v, G, axis=1)
+    scores = (q.astype(mx.float32) @ k.astype(mx.float32).swapaxes(-1, -2)) * scale
+    if mask == "causal":
+        scores = mx.where(_causal(*scores.shape[-2:]), scores, -mx.inf)
+    return mx.softmax(scores, axis=-1).astype(q.dtype) @ v
+
+
+def _f64(t):
+    import numpy as np
+    return np.array(t.astype(mx.float32)).astype(np.float64)
+
+
+def _attention_vjp(attend, q, k, v, do, training=False):
+    if training:
+        mlx_utils.acquire_mlx_training_patches()
+    try:
+        (out,), grads = mx.vjp(attend, [q, k, v], [do])
+        mx.eval(out, grads)
+    finally:
+        if training:
+            mlx_utils.release_mlx_training_patches()
+    return [_f64(t) for t in (out, *grads)]
+
+
+def _rel(x, ref):
+    import numpy as np
+    return np.linalg.norm(x - ref) / np.linalg.norm(ref)
+
+
+def _attention_inputs(dtype, T, S, dim, heads, peak, seed):
+    import numpy as np
+    rng, dt = np.random.default_rng(seed), getattr(mx, dtype)
+    shapes = (((1, heads, T, dim), peak), ((1, heads // 2, S, dim), peak), ((1, heads // 2, S, dim), 1.0),
+              ((1, heads, T, dim), 1.0))
+    return [mx.array(rng.standard_normal(shape) * spread, mx.float32).astype(dt) for shape, spread in shapes]
+
+
+@metal_only
+@pytest.mark.parametrize("peak", [1.0, 4.0])
+@pytest.mark.parametrize("dim, mask", [(64, "causal"), (128, "causal"), (72, None)])   # 72: a vision chunk
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_fp32_training_attention_matches_explicit_softmax_against_float64(dtype, dim, mask, peak):
+    from unsloth_zoo.mlx import attention
+
+    # Under TF32, NAX GEMMs truncate fp32 operands to fp16's 10 mantissa bits, twice the error of explicit's rounding.
+    bound = 1.5 if dtype == "float16" and attention._stock_runs_nax() and attention._tf32_enabled() else 1.1
+    scale = dim ** -0.5
+    q, k, v, do = _attention_inputs(dtype, 160, 160, dim, 4, peak, dim)
+    ref = _attention_f64(*map(_f64, (q, k, v, do)), scale, mask == "causal")
+    explicit = _attention_vjp(lambda *a: _explicit_fp32_softmax(*a, scale, mask), q, k, v, do)
+    attend = lambda *a: mlx_utils._fp32_attention(mx.fast.scaled_dot_product_attention, *a, scale, mask)
+    routed = _attention_vjp(attend, q, k, v, do, training=True)
+    for name, got, want, base in zip(("out", "dq", "dk", "dv"), routed, ref, explicit):
+        assert _rel(got, want) <= bound * _rel(base, want), name
+
+
+@metal_only
+@pytest.mark.parametrize("prefix", [0, 40])
+def test_fp32_training_attention_matches_float64_past_the_first_vjp_tile(prefix):
+    # mlx's blocked VJP tiles queries and keys by 1024; a key prefix moves the causal diagonal off the tile corners.
+    T, S, scale, mask = 2100, 2100 + prefix, 0.125, "causal"
+    q, k, v, do = _attention_inputs("bfloat16", T, S, 64, 2, 4.0, prefix)
+    ref = _attention_f64(*map(_f64, (q, k, v, do)), scale, mask == "causal")
+    explicit = _attention_vjp(lambda *a: _explicit_fp32_softmax(*a, scale, mask), q, k, v, do)
+    attend = lambda *a: mlx_utils._fp32_attention(mx.fast.scaled_dot_product_attention, *a, scale, mask)
+    routed = _attention_vjp(attend, q, k, v, do, training=True)
+    for name, got, want, base in zip(("out", "dq", "dk", "dv"), routed, ref, explicit):
+        for rows in (slice(0, 1024), slice(1024, 2048), slice(2048, None)):
+            assert _rel(got[..., rows, :], want[..., rows, :]) <= 1.1 * _rel(base[..., rows, :], want[..., rows, :]), (
+                name, rows)
+
+
+@metal_only
+@pytest.mark.parametrize("peak", [1.0, 8.0])
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_fp32_training_attention_forward_is_bitwise_stock(monkeypatch, dtype, dim, peak):
+    # Stored references are scored at whatever width they were packed to, so the route may differ from the policy's;
+    # only the backward may change across the 2047-query floor. Without TF32 a NAX GPU runs fp32 attention on other
+    # kernels, which round differently, so the route is off there.
+    from unsloth_zoo.mlx import attention
+
+    monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    sdpa = mx.fast.scaled_dot_product_attention
+    sdpa = getattr(sdpa, "_unsloth_original", sdpa)
+    seen = []
+
+    def original(q, k, v, **kwargs):
+        seen.append(q.dtype)
+        return sdpa(q, k, v, **kwargs)
+
+    q, k, v, _ = _attention_inputs(dtype, 2047, 2047, dim, 4, peak, dim)
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+    try:
+        routed = mlx_utils._wrap_training_sdpa(original)(q, k, v, scale=dim ** -0.5, mask="causal")
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    stock = sdpa(q, k, v, scale=dim ** -0.5, mask="causal")
+    assert seen == [mx.float32 if attention._tf32_enabled() or not attention._stock_runs_nax() else q.dtype]
+    assert routed.dtype == stock.dtype and mx.array_equal(routed, stock).item()
+
+
+@metal_only
+@pytest.mark.parametrize("case, routed", [
+    ({}, True), ({"dim": 64, "dtype": "float16", "T": 2047, "S": 2047}, True), ({"T": 2046, "S": 2046}, False),
+    ({"dim": 256}, False),
+    ({"mask": None}, False), ({"value_dim": 64}, False),
+    ({"dtype": "float32"}, False), ({"S": 2000}, False), ({"S": 2100}, True), ({"mask": "array"}, False),
+    ({"sinks": True}, False), ({"training": False}, False), ({"env": "0"}, False),
+    ({"nax": True}, True), ({"tf32": False}, True), ({"nax": True, "tf32": False}, False)])
+def test_fp32_training_attention_routes_only_fused_training_calls(monkeypatch, case, routed):
+    from unsloth_zoo.mlx import attention
+
+    spec = {"T": 2048, "S": 2048, "dim": 128, "value_dim": None, "dtype": "bfloat16", "mask": "causal",
+            "sinks": False, "training": True, "env": None, "nax": False, "tf32": True, **case}
+    monkeypatch.setattr(attention, "_stock_runs_nax", lambda: spec["nax"])
+    monkeypatch.setattr(attention, "_tf32_enabled", lambda: spec["tf32"])
+    if spec["env"] is None:
+        monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    else:
+        monkeypatch.setenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", spec["env"])
+    seen = []
+
+    def original(q, k, v, *, scale, mask=None, **kwargs):
+        seen.append((q.dtype, k.dtype, v.dtype))
+        return mx.zeros((*q.shape[:-1], v.shape[-1]), q.dtype)
+
+    dt, T, S = getattr(mx, spec["dtype"]), spec["T"], spec["S"]
+    q, k = mx.zeros((1, 4, T, spec["dim"]), dt), mx.zeros((1, 2, S, spec["dim"]), dt)
+    v = mx.zeros((1, 2, S, spec["value_dim"] or spec["dim"]), dt)
+    mask = mx.ones((T, S), mx.bool_) if spec["mask"] == "array" else spec["mask"]
+    extra = {"sinks": mx.zeros((4,), dt)} if spec["sinks"] else {}
+    attend = mlx_utils._wrap_training_sdpa(original)
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(int(spec["training"]))
+    try:
+        out = attend(q, k, v, scale=0.1, mask=mask, **extra)
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert out.dtype == dt
+    assert seen == [(mx.float32 if routed else dt,) * 3]
+
+
+@metal_only
+@pytest.mark.parametrize("case, route", [
+    ({}, "fp32"), ({"dim": 64}, "fp32"), ({"dim": 80, "dtype": "float16"}, "fp32"), ({"T": 9}, "fp32"),
+    ({"T": 8}, None), ({"dim": 128}, None), ({"dtype": "float32"}, None), ({"env": "0"}, None),
+    ({"device": "cpu"}, None), ({"training": False}, "stock")])
+def test_fused_vision_attention_falls_back_to_explicit_when_mlx_would_not_fuse(monkeypatch, case, route):
+    spec = {"T": 128, "dim": 72, "dtype": "bfloat16", "env": None, "device": "gpu", "training": True, **case}
+    if spec["env"] is None:
+        monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    else:
+        monkeypatch.setenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", spec["env"])
+    seen = []
+
+    def original(q, k, v, *, scale, mask=None, **kwargs):
+        seen.append(q.dtype)
+        return mx.zeros(q.shape, q.dtype)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", original)
+    dt = getattr(mx, spec["dtype"])
+    q = mx.zeros((4, spec["T"], spec["dim"]), dt)[None]
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(int(spec["training"]))
+    device = mx.default_device()
+    mx.set_default_device(getattr(mx, spec["device"]))
+    try:
+        out = mlx_utils.fused_vision_attention(q, q, q, scale=0.1)
+    finally:
+        mx.set_default_device(device)
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert seen == {"fp32": [mx.float32], "stock": [dt], None: []}[route]
+    assert out is None if route is None else out.dtype == dt
+
+
+@metal_only
+@pytest.mark.parametrize("dim, T, calls", [
+    (128, 2047, [(2047, "float32")]), (128, 2046, [(2046, "bfloat16")]), (64, 2047, [(2047, "float32")]),
+    (256, 2047, [(2047, "bfloat16")]), (512, 2047, [(511, "bfloat16")] + [(512, "bfloat16")] * 3)])
+def test_training_attention_takes_exactly_one_route(monkeypatch, dim, T, calls):
+    from unsloth_zoo.mlx import attention
+
+    monkeypatch.delenv("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", raising=False)
+    monkeypatch.setattr(attention, "_stock_runs_nax", lambda: False)
+    seen = []
+
+    def original(q, k, v, *, scale, mask=None, **kwargs):
+        seen.append((q.shape[-2], q.dtype))
+        return mx.zeros((*q.shape[:-1], v.shape[-1]), q.dtype)
+
+    q, k = mx.zeros((1, 4, T, dim), mx.bfloat16), mx.zeros((1, 2, T, dim), mx.bfloat16)
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+    try:
+        out = mlx_utils._wrap_training_sdpa(original)(q, k, k, scale=0.1, mask="causal")
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert out.shape == q.shape and out.dtype == mx.bfloat16
+    assert seen == [(rows, getattr(mx, dtype)) for rows, dtype in calls]
 
 
 @metal_only
@@ -1011,6 +1409,35 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
             assert mx.allclose(expected, got, atol=2e-5, rtol=2e-4).item()
     plan.configure_cce_compaction(False)
     assert plan.prepare_cce_batch(1, batch) is batch
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_dft_cce_loss_matches_trl_and_leaves_nll_alone(quantized):
+    def trl_dft(model, ids, lengths):
+        steps = mx.arange(1, ids.shape[1])
+        mask = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
+        logps = -nn.losses.cross_entropy(model(ids[:, :-1]).astype(mx.float32), ids[:, 1:], reduction="none")
+        return (-mx.stop_gradient(mx.exp(logps)) * logps * mask).sum() / mask.sum(), mask.sum()
+
+    mx.random.seed(331)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    ids, lengths = mx.random.randint(0, 2053, (2, 65)), mx.array([[0, 65], [3, 40]], dtype=mx.int32)
+    dft = mlx_utils.make_cce_loss_fn(model, loss_type="dft")
+    results = [nn.value_and_grad(model, fn)(model, ids, lengths) for fn in (
+        trl_dft, dft, mlx_utils.make_cce_loss_fn(model), make_baseline_loss_fn(),
+    )]
+    mx.eval(results)
+    (want, want_grad), (got, got_grad), (nll, nll_grad), (dense, dense_grad) = results
+    assert dft._unsloth_cce_backend == "runtime-cce" and got[1].item() == want[1].item()
+    assert got[0].item() == pytest.approx(want[0].item(), rel=1e-4)
+    assert nll[0].item() == pytest.approx(dense[0].item(), rel=1e-4)
+    assert abs(nll[0].item() - got[0].item()) > 1e-3
+    for expected, actual in ((want_grad, got_grad), (dense_grad, nll_grad)):
+        for (name, a), (_, b) in zip(tree_flatten(expected), tree_flatten(actual)):
+            # dft gradients are ~p = 1/V of nll's, so an absolute tolerance must scale with them.
+            scale = mx.abs(a).max().item()
+            assert scale > 0 and mx.allclose(a, b, atol=1e-3 * scale, rtol=1e-3).item(), name
 
 
 # Ternary Bonsai 2 packs, from mlx-vlm and (0.32+) mlx-lm.
@@ -2291,6 +2718,11 @@ def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
     assert actual[0][0].item() == pytest.approx(expected[0][0].item(), abs=2e-5)
     for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
         assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+    # dft reduction on the runtime vision CCE path.
+    hidden, target, n = forward(model, batch)
+    token = nn.losses.cross_entropy(model.lm_head(hidden).astype(mx.float32), mx.maximum(target, 0), reduction="none") * (target != -100)
+    dft = mlx_utils.make_vlm_cce_loss_fn(model, loss_type="dft")(model, batch)[0]
+    assert dft.item() == pytest.approx((token * mx.exp(-token)).sum().item() / n.item(), rel=1e-4)
 
 
 @metal_only
@@ -2395,10 +2827,11 @@ def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
 
 
 @metal_only
-def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
+@pytest.mark.parametrize("max_steps,grad_accum,max_grad_norm", [(4, 1, 0.0), (2, 2, 1.0)])
+def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path, max_steps, grad_accum, max_grad_norm):
     """Real-runtime contract for planned VLM training: with a qualified compile decision it installs a width plan and
     runs only planned widths, with losses and token counts matching the unplanned eager run exactly (padded tails are
-    inert); every compiled width is an admitted endpoint."""
+    inert); every compiled width is an admitted endpoint. Global-norm clipping with accumulation compiles too."""
     import os as _os
     import sys as _sys
     import types
@@ -2460,16 +2893,16 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
             max_seq_length=8,
         )
         args = MLXTrainingConfig(
-            max_steps=4,
-            gradient_accumulation_steps=1,
+            max_steps=max_steps,
+            gradient_accumulation_steps=grad_accum,
             compile=planned,
             use_cce=False,
             gradient_checkpointing=False,
             cast_norm_output_to_input_dtype=False,
-            max_grad_norm=0.0,
+            max_grad_norm=max_grad_norm,
             max_grad_leaf_norm=0.0,
             disable_memory_limits=True,
-            logging_steps=1000,
+            logging_steps=1,
             output_dir=str(tmp_path),
         )
         trainer = MLXTrainer(
@@ -2506,19 +2939,24 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
             )
         trainer.save_model = lambda *_a, **_k: None
         result = trainer.train()
-        return result, plan, list(seen_widths)
+        params = dict(tree_flatten(trainer.model.trainable_parameters()))
+        return result, plan, list(seen_widths), (params, list(trainer._grad_norm_history))
 
     monkeypatch.setattr(TinyVLM, "__call__", recording_call)
     monkeypatch.setattr(mx, "compile", counting_compile)
-    unplanned_result, _plan, unplanned_widths = run(planned=False)
+    unplanned_result, _plan, unplanned_widths, unplanned_state = run(planned=False)
     unplanned_compiled_calls = len(compiled_invocations)
-    planned_result, planned_plan, planned_widths = run(planned=True)
+    planned_result, planned_plan, planned_widths, planned_state = run(planned=True)
     planned_compiled_calls = len(compiled_invocations)
 
     assert unplanned_compiled_calls == 0
     assert planned_compiled_calls == 4
     assert planned_result["compile_enabled"] is True
     assert unplanned_result["compile_enabled"] is False
+    assert planned_state[1] == pytest.approx(unplanned_state[1], rel=1e-5)
+    assert bool(planned_state[1]) == (max_grad_norm > 0)
+    for name, value in unplanned_state[0].items():
+        assert mx.allclose(planned_state[0][name], value, atol=1e-6, rtol=1e-5).item(), name
     assert planned_result["trained_tokens"] == (
         unplanned_result["trained_tokens"]
     )
@@ -2883,8 +3321,17 @@ def test_gather_qmm_reroutes_only_when_defective(defective, monkeypatch, raw_gat
 def test_gather_qmm_guard_install(monkeypatch, raw_gather_qmm):
     """The guard must end up beneath the index-stop wrapper, even mid-training."""
     monkeypatch.setenv("UNSLOTH_MLX_GATHER_QMM_GUARD", "0")
+    monkeypatch.setattr(mx, "__version__", "0.32.2")
     assert mlx_utils.apply_gather_qmm_nax_guard() is False
     monkeypatch.delenv("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    monkeypatch.setattr(mx, "__version__", "0.32.3")
+    assert mlx_utils.apply_gather_qmm_nax_guard() is False
+    assert mx.gather_qmm is raw_gather_qmm
+    monkeypatch.setenv("UNSLOTH_MLX_GATHER_QMM_GUARD", "1")
+    assert mlx_utils.apply_gather_qmm_nax_guard() is True
+    monkeypatch.setattr(mx, "gather_qmm", raw_gather_qmm)
+    monkeypatch.delenv("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    monkeypatch.setattr(mx, "__version__", "0.32.2")
     mlx_utils.acquire_mlx_training_patches()
     try:
         assert mlx_utils.apply_gather_qmm_nax_guard() is True
@@ -3176,6 +3623,7 @@ def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatc
     assert mlx_utils._get_backbone_embed_kwarg(model.model) is None
     loss = mlx_utils.make_vlm_cce_loss_fn(model)
     assert loss._unsloth_cce_backend == "runtime-cce"
+    assert mlx_utils.make_vlm_cce_loss_fn(model, loss_type="dft")._unsloth_cce_backend == "baseline-fallback"
     baseline = mlx_utils.make_vlm_baseline_loss_fn(model)
     for pixels in (None, mx.ones((2, 3, 64)), None):
         batch = dict(input_ids=mx.array([[2, 3, 4], [7, 6, 5]]), **{media_key: pixels})
@@ -3230,6 +3678,59 @@ def test_encoder_decoder_cce_matches_full_forward_and_gradients(conditioning, re
         assert mx.allclose(actual, expected, atol=1e-5).item()
         for (name, a), (_, b) in zip(tree_flatten(g1), tree_flatten(g2)):
             assert mx.allclose(a, b, atol=2e-5, rtol=2e-3).item(), name
+
+
+@metal_only
+@pytest.mark.parametrize("head", ["full", "vocab_sliced"])
+@pytest.mark.parametrize("B", [32, 1])
+@pytest.mark.parametrize("site", ["vlm_baseline", "preference", "grpo"])
+def test_sliced_vlm_logits_differentiate_like_contiguous_ones(site, B, head, monkeypatch):
+    """mlx 0.32.4's fused cross-entropy VJP races on non-row-contiguous logits (ml-explore/mlx#4686): looped to catch
+    it. A vocabulary-sliced head (Inkling's unpadded_vocab_size) is strided even at one row; a one-row sequence slice of
+    a full head is not, and must not pay a copy."""
+    from unsloth_zoo.mlx import grpo, preference
+    L, V = 129 if B > 1 else 4097, 8192  # as many rows at B=1 as at B=32: a short VJP finishes before the race window
+    W = V - 64 if head == "vocab_sliced" else V
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logits = mx.random.normal((B, L, V))
+
+        def __call__(self, ids, **kwargs):
+            return self.logits[..., :W]
+
+    ids = mx.random.randint(0, W, (B, L))
+    batch = dict(input_ids=ids, attention_mask=mx.ones_like(ids))
+    score = {
+        "vlm_baseline": lambda m: mlx_utils.make_vlm_baseline_loss_fn(ignore_token_ids=[])(m, batch)[0],
+        "preference": lambda m: preference._response_logps(m, batch, mx.array([[1, L]] * B)).sum(),
+        "grpo": lambda m: grpo.completion_logps(m, batch, 1.0).sum(),
+    }[site]
+    model = Model()
+    grad = lambda: nn.value_and_grad(model, score)(model)[1]["logits"]
+    stock = nn.losses.cross_entropy
+    with monkeypatch.context() as patch:
+        patch.setattr(nn.losses, "cross_entropy", lambda x, *a, **kw: stock(mx.contiguous(x), *a, **kw))
+        expected = grad()
+        mx.eval(expected)
+    assert mx.abs(expected).max().item() > 0
+    for _ in range(400):
+        assert mx.array_equal(grad(), expected).item()
+    if B == 1 and head == "full":
+        def peak():
+            mx.eval(grad())
+            mx.synchronize()
+            mx.reset_peak_memory()
+            mx.eval(grad())
+            mx.synchronize()
+            return mx.get_peak_memory()
+
+        with monkeypatch.context() as patch:
+            for module in (mlx_utils, preference, grpo):
+                patch.setattr(module, "_row_contiguous_cross_entropy", lambda x, t, **kw: stock(x, t, **kw))
+            uncopied = peak()
+        assert peak() - uncopied < (L - 1) * V * 4 // 2
 
 
 @metal_only
