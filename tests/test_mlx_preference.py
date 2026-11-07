@@ -3900,7 +3900,8 @@ def test_grpo_prefix_grouping_keeps_whole_groups_and_every_window_gradient(monke
         assert (lengths[0::2, 0] == lengths[1::2, 0]).all() and np.array_equal(prefix, ids[::2, :prefix.shape[1]])
         assert prefix.shape[1] % 32 == 0 and 0 < prefix.shape[1] < lengths[:, 0].min()
     for start in (0, 2):  # loss and gradient; clip ratios are per-micro-batch means, so they follow the layout
-        assert all(np.allclose(got, want, rtol=1e-6) for got, want in zip(regrouped(grouped[start:start + 2])[:2], score(random[start:start + 2])[:2]))  # noqa: E501
+        # atol: grpo's loss nearly cancels, so fp32 reassociation of its terms shows as a relative error above 1e-6.
+        assert all(np.allclose(got, want, rtol=1e-6, atol=1e-7) for got, want in zip(regrouped(grouped[start:start + 2])[:2], score(random[start:start + 2])[:2]))  # noqa: E501
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER_TOKR", "2")
     assert all(batch[9] is None for batch in run(True)[0])
 
