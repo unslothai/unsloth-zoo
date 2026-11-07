@@ -601,7 +601,9 @@ def _kv_element_bytes(model):
 def _cache_bytes_per_row(model, tokens):
     """Bytes a row's cache may hold at ``tokens`` tokens: every layer's K and V for every token, or more where the
     caches the language model makes hold more (a linear-attention state, layers wider than ``head_dim``); a rotating
-    cache counts its window at most. None when the text config does not say."""
+    cache counts its window at most. mlx-lm grows K/V in 256-position blocks, so tokens round up to one. None when
+    the text config does not say."""
+    tokens = -(-int(tokens) // 256) * 256
     config = getattr(model, "args", None) or getattr(model, "config", None)
     config = _config_get(config, "text_config", None) or config
     get = lambda key: _config_get(config, key, None) or 0  # noqa: E731

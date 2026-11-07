@@ -3769,14 +3769,14 @@ def test_grpo_rollout_warper_matches_hf_sampling_processors(settings):
     assert torch.allclose(batched, torch.cat([hf_logits_warper(plain, [1])(torch.tensor([1]), row[None]) for row in rows]))
 
 
-@pytest.mark.parametrize("rows,active,expected", [(16, 0, 32), (64, 0, 48), (64, 640 * 2 * 40, 32), (40, 0, 40)])
+@pytest.mark.parametrize("rows,active,expected", [(16, 0, 32), (64, 0, 48), (64, 16384 * 2 * 40, 32), (40, 0, 40)])
 def test_grpo_rollouts_decode_the_whole_generation_when_its_cache_fits(monkeypatch, rows, active, expected):
     from unsloth_zoo.mlx import grpo
 
-    monkeypatch.setattr(grpo.mx, "device_info", lambda: {"max_recommended_working_set_size": 640 * 2 * 48}, raising=False)
+    monkeypatch.setattr(grpo.mx, "device_info", lambda: {"max_recommended_working_set_size": 16384 * 2 * 48}, raising=False)
     monkeypatch.setattr(grpo.mx, "get_active_memory", lambda: active, raising=False)
     config = types.SimpleNamespace(num_hidden_layers=2, num_key_value_heads=2, num_attention_heads=4, hidden_size=16)
-    assert grpo._rollout_rows(types.SimpleNamespace(args=config), rows, 10) == expected  # 640 bytes a row
+    assert grpo._rollout_rows(types.SimpleNamespace(args=config), rows, 10) == expected  # one 256-position block, 16384 bytes
     assert grpo._rollout_rows(types.SimpleNamespace(), rows, 10) == 32
 
 
@@ -3805,7 +3805,7 @@ def test_grpo_rollout_rows_count_the_cache_dtype_the_embedding_gives(dtype, elem
             self.model.embed_tokens.weight = self.model.embed_tokens.weight.astype(getattr(mx, dtype))
             self.args = types.SimpleNamespace(num_hidden_layers=2, num_key_value_heads=2, num_attention_heads=4, hidden_size=16)  # noqa: E501
 
-    assert _cache_bytes_per_row(Model(), 10) == 2 * element * 2 * 2 * 4 * 10
+    assert _cache_bytes_per_row(Model(), 10) == _cache_bytes_per_row(Model(), 256) == 2 * element * 2 * 2 * 4 * 256
 
 
 @pytest.mark.parametrize("bsz,spg,iterations,shuffle", [(4, 2, 1, True), (2, 3, 2, True), (6, 1, 1, False)])
