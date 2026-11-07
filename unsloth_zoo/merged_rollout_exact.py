@@ -141,71 +141,99 @@ if triton is not None:
 
         ptrs = W + e * sWe + rn[:, None] * sWn + rk[None, :] * sWk
         w = tl.load(ptrs, mask = mask, other = 0.0)
-        TILE: tl.constexpr = BLOCK_N * BLOCK_K
+        # Each mode lives in its own helper: a runtime branch must not leave differently typed names behind.
         if mode == 2:
-            # w is the folded value: back = round(w - d), plus the stored correction where the stream has one.
-            back = (w.to(tl.float32) - d).to(w.dtype)
-            nb = w.to(tl.int16, bitcast = True).to(tl.int32)
-            bb = back.to(tl.int16, bitcast = True).to(tl.int32)
-            k = tl.reshape(tl.where(mask, _width(nb, bb, MANT, EXPM, MAX_GAP), 0), (TILE,))
-            bitpos = tl.load(woff + pid).to(tl.int64) * 32 + (tl.cumsum(k, 0) - k).to(tl.int64)
-            word = bitpos >> 5
-            shift = bitpos & 31
-            has = k > 0
-            lo = tl.load(words + word, mask = has & (word < n_words), other = 0).to(tl.int64) & 0xFFFFFFFF
-            hi = tl.load(words + word + 1, mask = has & (word + 1 < n_words), other = 0).to(tl.int64) & 0xFFFFFFFF
-            kk = tl.maximum(k, 1).to(tl.int64)
-            code = ((lo | (hi << 32)) >> shift) & ((1 << kk) - 1)
-            half = 1 << (kk - 1)
-            c = tl.where(code >= half, code - (1 << kk), code)
-            # The escape code (-half) keeps back: the escape list overwrites it.
-            ok = has & (c != -half)
-            fb = tl.reshape(bb, (TILE,))
-            out = tl.where(ok, _ord(_ord(fb) + c.to(tl.int32)), fb)
-            out = tl.reshape(out, (BLOCK_N, BLOCK_K)).to(tl.int16)
-            tl.store(ptrs, out.to(w.dtype, bitcast = True), mask = mask)
-            tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, out.to(tl.int64), 0), 1), 0))
+            _unfold_tile(w, d, ptrs, mask, pid, woff, words, checksum, n_words, BLOCK_N, BLOCK_K, MANT, EXPM, MAX_GAP)
+        elif mode == 0:
+            _count_tile(w, d, mask, pid, counts, checksum, MANT, EXPM, MAX_GAP)
         else:
-            new = (w.to(tl.float32) + d).to(w.dtype)
-            back = (new.to(tl.float32) - d).to(w.dtype)
-            wb = w.to(tl.int16, bitcast = True).to(tl.int32)
-            nb = new.to(tl.int16, bitcast = True).to(tl.int32)
-            bb = back.to(tl.int16, bitcast = True).to(tl.int32)
-            bad = (bb != wb) & mask
-            k = tl.where(mask, _width(nb, bb, MANT, EXPM, MAX_GAP), 0)
-            c = _ord(wb) - _ord(bb)
-            half = 1 << (tl.maximum(k, 1) - 1)
-            esc = bad & ((k == 0) | (c <= -half) | (c >= half))
-            if mode == 0:
-                tl.store(counts + pid * 3 + 0, tl.sum(tl.sum(bad.to(tl.int32), 1), 0))
-                tl.store(counts + pid * 3 + 1, tl.sum(tl.sum(k, 1), 0))
-                tl.store(counts + pid * 3 + 2, tl.sum(tl.sum(esc.to(tl.int32), 1), 0))
-                tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, wb.to(tl.int64), 0), 1), 0))
-            else:
-                fk = tl.reshape(k, (TILE,))
-                kk = tl.maximum(fk, 1).to(tl.int64)
-                fc = tl.reshape(tl.where(esc, -half, c), (TILE,)).to(tl.int64)
-                code = fc & ((1 << kk) - 1)
-                bitpos = tl.load(woff + pid).to(tl.int64) * 32 + (tl.cumsum(fk, 0) - fk).to(tl.int64)
-                word = bitpos >> 5
-                shift = bitpos & 31
-                put = (fk > 0) & (code != 0)
-                lo = (code << shift) & 0xFFFFFFFF
-                hi = code >> (32 - shift)
-                lo = tl.where(lo >= 2147483648, lo - 4294967296, lo).to(tl.int32)
-                hi = tl.where(hi >= 2147483648, hi - 4294967296, hi).to(tl.int32)
-                tl.atomic_or(words + word, lo, mask = put, sem = "relaxed")
-                tl.atomic_or(words + word + 1, hi, mask = put & (shift + fk > 32), sem = "relaxed")
-                flat_esc = tl.reshape(esc.to(tl.int32), (TILE,))
-                pos = tl.load(eoff + pid) + tl.cumsum(flat_esc, 0) - 1
-                flat_idx = tl.reshape(
-                    (e.to(tl.int64) * N + rn[:, None].to(tl.int64)) * K + rk[None, :].to(tl.int64),
-                    (TILE,),
-                )
-                keep = flat_esc != 0
-                tl.store(idx_out + pos, flat_idx, mask = keep)
-                tl.store(val_out + pos, tl.reshape(w, (TILE,)), mask = keep)
-                tl.store(ptrs, new, mask = mask)
+            _fold_tile(
+                w, d, ptrs, mask, pid, e, rn, rk, N, K, woff, words, idx_out, val_out, eoff,
+                BLOCK_N, BLOCK_K, MANT, EXPM, MAX_GAP,
+            )
+
+    @triton.jit
+    def _classify(w, d, mask, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr):
+        # (folded value, original bits, code width, correction, inexact, escape) of each element.
+        new = (w.to(tl.float32) + d).to(w.dtype)
+        back = (new.to(tl.float32) - d).to(w.dtype)
+        wb = w.to(tl.int16, bitcast = True).to(tl.int32)
+        nb = new.to(tl.int16, bitcast = True).to(tl.int32)
+        bb = back.to(tl.int16, bitcast = True).to(tl.int32)
+        bad = (bb != wb) & mask
+        k = tl.where(mask, _width(nb, bb, MANT, EXPM, MAX_GAP), 0)
+        c = _ord(wb) - _ord(bb)
+        half = 1 << (tl.maximum(k, 1) - 1)
+        esc = bad & ((k == 0) | (c <= -half) | (c >= half))
+        return new, wb, k, tl.where(esc, -half, c), bad, esc
+
+    @triton.jit
+    def _count_tile(w, d, mask, pid, counts, checksum, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr):
+        new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
+        tl.store(counts + pid * 3 + 0, tl.sum(tl.sum(bad.to(tl.int32), 1), 0))
+        tl.store(counts + pid * 3 + 1, tl.sum(tl.sum(k, 1), 0))
+        tl.store(counts + pid * 3 + 2, tl.sum(tl.sum(esc.to(tl.int32), 1), 0))
+        tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, wb.to(tl.int64), 0), 1), 0))
+
+    @triton.jit
+    def _fold_tile(
+        w, d, ptrs, mask, pid, e, rn, rk, N, K, woff, words, idx_out, val_out, eoff,
+        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
+    ):
+        TILE: tl.constexpr = BLOCK_N * BLOCK_K
+        new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
+        fk = tl.reshape(k, (TILE,))
+        kk = tl.maximum(fk, 1).to(tl.int64)
+        code = tl.reshape(c, (TILE,)).to(tl.int64) & ((1 << kk) - 1)
+        bitpos = tl.load(woff + pid).to(tl.int64) * 32 + (tl.cumsum(fk, 0) - fk).to(tl.int64)
+        word = bitpos >> 5
+        shift = bitpos & 31
+        put = (fk > 0) & (code != 0)
+        lo = (code << shift) & 0xFFFFFFFF
+        hi = code >> (32 - shift)
+        lo = tl.where(lo >= 2147483648, lo - 4294967296, lo).to(tl.int32)
+        hi = tl.where(hi >= 2147483648, hi - 4294967296, hi).to(tl.int32)
+        tl.atomic_or(words + word, lo, mask = put, sem = "relaxed")
+        tl.atomic_or(words + word + 1, hi, mask = put & (shift + fk > 32), sem = "relaxed")
+        flat_esc = tl.reshape(esc.to(tl.int32), (TILE,))
+        pos = tl.load(eoff + pid) + tl.cumsum(flat_esc, 0) - 1
+        flat_idx = tl.reshape(
+            (e.to(tl.int64) * N + rn[:, None].to(tl.int64)) * K + rk[None, :].to(tl.int64),
+            (TILE,),
+        )
+        keep = flat_esc != 0
+        tl.store(idx_out + pos, flat_idx, mask = keep)
+        tl.store(val_out + pos, tl.reshape(w, (TILE,)), mask = keep)
+        tl.store(ptrs, new, mask = mask)
+
+    @triton.jit
+    def _unfold_tile(
+        w, d, ptrs, mask, pid, woff, words, checksum, n_words,
+        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
+    ):
+        # w is the folded value: back = round(w - d), plus the stored correction where the stream has one.
+        TILE: tl.constexpr = BLOCK_N * BLOCK_K
+        back = (w.to(tl.float32) - d).to(w.dtype)
+        nb = w.to(tl.int16, bitcast = True).to(tl.int32)
+        bb = back.to(tl.int16, bitcast = True).to(tl.int32)
+        k = tl.reshape(tl.where(mask, _width(nb, bb, MANT, EXPM, MAX_GAP), 0), (TILE,))
+        bitpos = tl.load(woff + pid).to(tl.int64) * 32 + (tl.cumsum(k, 0) - k).to(tl.int64)
+        word = bitpos >> 5
+        shift = bitpos & 31
+        has = k > 0
+        lo = tl.load(words + word, mask = has & (word < n_words), other = 0).to(tl.int64) & 0xFFFFFFFF
+        hi = tl.load(words + word + 1, mask = has & (word + 1 < n_words), other = 0).to(tl.int64) & 0xFFFFFFFF
+        kk = tl.maximum(k, 1).to(tl.int64)
+        code = ((lo | (hi << 32)) >> shift) & ((1 << kk) - 1)
+        half = 1 << (kk - 1)
+        c = tl.where(code >= half, code - (1 << kk), code)
+        # The escape code (-half) keeps back: the escape list overwrites it.
+        ok = has & (c != -half)
+        fb = tl.reshape(bb, (TILE,))
+        out = tl.where(ok, _ord(_ord(fb) + c.to(tl.int32)), fb)
+        out = tl.reshape(out, (BLOCK_N, BLOCK_K)).to(tl.int16)
+        tl.store(ptrs, out.to(w.dtype, bitcast = True), mask = mask)
+        tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, out.to(tl.int64), 0), 1), 0))
 pass
 
 
@@ -258,13 +286,18 @@ class ExactFoldTarget:
     def launch(self, mode, woff = None, words = None, idx = None, val = None, eoff = None):
         E, N, K = self.w.shape
         w, a, b = self.w, self.a, self.b
-        dummy = self.checksum
+        # Unused buffers get stand-ins of the same dtypes: all three modes share one compiled specialization.
+        idx_type = torch.int32 if w.numel() < 2**31 else torch.int64
         fp16 = w.dtype == torch.float16
         _exact_merge_kernel[self.grid()](
-            w, a, b, self.counts if self.counts is not None else dummy,
-            woff if woff is not None else dummy, words if words is not None else dummy,
-            idx if idx is not None else dummy, val if val is not None else dummy,
-            eoff if eoff is not None else dummy, self.checksum,
+            w, a, b,
+            self.counts if self.counts is not None else _dummy(w.device, torch.int32),
+            woff if woff is not None else _dummy(w.device, torch.int64),
+            words if words is not None else _dummy(w.device, torch.int32),
+            idx if idx is not None else _dummy(w.device, idx_type),
+            val if val is not None else _dummy(w.device, w.dtype),
+            eoff if eoff is not None else _dummy(w.device, torch.int64),
+            self.checksum,
             words.numel() if words is not None else 0,
             N, K,
             w.stride(0), w.stride(1), w.stride(2),
@@ -275,6 +308,16 @@ class ExactFoldTarget:
             MANT = 10 if fp16 else 7, EXPM = 31 if fp16 else 255, MAX_GAP = _MAX_GAP,
             num_warps = 4, enable_fp_fusion = False,
         )
+pass
+
+
+_DUMMIES = {}
+
+
+def _dummy(device, dtype):
+    key = (str(device), dtype)
+    if key not in _DUMMIES: _DUMMIES[key] = torch.zeros(1, dtype = dtype, device = device)
+    return _DUMMIES[key]
 pass
 
 
