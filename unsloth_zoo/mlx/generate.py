@@ -25,6 +25,7 @@ import copy
 import functools
 import importlib
 import inspect
+import itertools
 import textwrap
 import math
 import os
@@ -2308,24 +2309,26 @@ class _TextBatchAdapter:
         active_error = None
         try:
             alone = getattr(self.model, "prefill_alone", False)
-            left = session.prefix_counts(requests, alone) if self.defaults.share_prompt_prefill or alone else {}
-            # Prefixes are prefilled as their first row joins and dropped after their last, so only rows the decode
-            # batch can hold keep one alive.
-            window = max(1, int(self.defaults.completion_batch_size)) if left else len(requests)
-            pending, prefixes = collections.deque(requests), {}
+            sharing = session.prefix_counts(requests, alone) if self.defaults.share_prompt_prefill or alone else {}
+            # Rows join while the decode batch has room; a prefix is kept only while a row within the next window
+            # reuses it, else prefilled again, so retained prefixes stay bounded by the window.
+            window = max(1, int(self.defaults.completion_batch_size)) if sharing else len(requests)
+            pending = collections.deque(
+                (request, tuple(_encode_prompt(self.tokenizer, request)) if sharing and request.image is None else None)
+                for request in requests
+            )
+            prefixes = {}
 
             def admit():
                 while pending and session.rows_in_flight < window:
-                    request = pending.popleft()
-                    key = tuple(_encode_prompt(self.tokenizer, request)) if left and request.image is None else None
-                    if key not in left:
+                    request, key = pending.popleft()
+                    if key not in sharing:
                         session.add(request)
                         continue
                     if key not in prefixes:
                         prefixes[key] = session.prefill_prompt(key)
                     session.add(request, prefixes[key])
-                    left[key] -= 1
-                    if not left[key]:
+                    if all(key != upcoming for _, upcoming in itertools.islice(pending, window)):
                         del prefixes[key]
 
             admit()

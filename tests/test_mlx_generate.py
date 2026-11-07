@@ -2387,10 +2387,16 @@ def test_stop_string_trims_device_logprobs_with_the_tokens():
     assert pending.token_ids == [1] and pending.logprob_values == ["a"]
 
 
-def test_shared_prefixes_live_only_while_their_rows_can_decode(monkeypatch):
+@pytest.mark.parametrize("layout", ["adjacent", "nonadjacent"])
+def test_shared_prefixes_live_only_while_their_rows_can_decode(monkeypatch, layout):
+    import weakref
     from unsloth_zoo.mlx import generate as engine
 
-    unfinished, peak, added = {}, [0], []
+    class Prefix:
+        def __init__(self, ids):
+            self.ids = ids
+
+    alive, peak, added = weakref.WeakSet(), [0], []
 
     class Session:
         prefix_counts = engine._TextBatchSession.prefix_counts
@@ -2401,19 +2407,17 @@ def test_shared_prefixes_live_only_while_their_rows_can_decode(monkeypatch):
         rows_in_flight = property(lambda self: len(self.rows))
 
         def prefill_prompt(self, ids):
-            unfinished[ids] = 2
-            peak[0] = max(peak[0], len(unfinished))
-            return ids
+            prefix = Prefix(ids)
+            alive.add(prefix)
+            peak[0] = max(peak[0], len(alive))
+            return prefix
 
         def add(self, request, prefix=None):
-            added.append((tuple(request.prompt_token_ids), prefix))
+            added.append((tuple(request.prompt_token_ids), prefix and prefix.ids))
             self.rows.append(prefix)
 
         def step(self):
-            done = self.rows.pop(0)
-            unfinished[done] -= 1
-            if not unfinished[done]:
-                del unfinished[done]
+            self.rows.pop(0)
             return iter(())
 
         def close(self):
@@ -2423,9 +2427,10 @@ def test_shared_prefixes_live_only_while_their_rows_can_decode(monkeypatch):
     adapter = _TextBatchAdapter.__new__(_TextBatchAdapter)
     adapter.model, adapter.tokenizer = types.SimpleNamespace(), _CharTokenizer()
     adapter.defaults = GenerationDefaults(share_prompt_prefill=True, completion_batch_size=4, prefill_batch_size=1)
-    requests = [GenerationRequest(prompt_token_ids=(p, p + 1)) for p in range(10, 26) for _ in range(2)]
-    list(adapter.stream(requests))
-    assert added == [(tuple(r.prompt_token_ids),) * 2 for r in requests] and not unfinished and peak[0] <= 3
+    prompts = [(p, p + 1) for p in range(10, 26)]
+    order = [ids for ids in prompts for _ in range(2)] if layout == "adjacent" else prompts * 2
+    list(adapter.stream([GenerationRequest(prompt_token_ids=ids) for ids in order]))
+    assert added == [(ids, ids) for ids in order] and peak[0] <= 2 * 4
 
 
 @pytest.mark.skipif(importlib.util.find_spec("mlx") is None, reason="needs real mlx.random")
