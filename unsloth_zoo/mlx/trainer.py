@@ -1661,6 +1661,7 @@ class MLXTrainingConfig:
             "num_completions_to_print",
             "use_vllm",
             "use_liger_loss",
+            "rollout_logprobs_as_old",
             "cpo_alpha",
             "simpo_gamma",
             "alpha",
@@ -1791,7 +1792,9 @@ class MLXKTOConfig(MLXTrainingConfig):
 class MLXGRPOConfig(MLXTrainingConfig):
     """GRPO config: TRL 0.24's GRPOConfig fields with CUDA Unsloth's GRPO defaults, resolved at construction; top_k and
     min_p None switch those filters off rather than using the model's generation config; max_prompt_length only
-    warns, prompts are never truncated."""
+    warns, prompts are never truncated. rollout_logprobs_as_old (off unless UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1)
+    replaces the old-policy forward with the rollout's log-probs, at decode precision (first ratio near, not exactly, 1),
+    for rollouts without a VLM processor at the scoring temperature, with no top-k, top-p, min-p or repetition penalty."""
 
     num_generations: int = field(default=8, kw_only=True)
     max_prompt_length: int | None = field(default=None, kw_only=True)
@@ -1824,6 +1827,7 @@ class MLXGRPOConfig(MLXTrainingConfig):
     num_completions_to_print: int | None = field(default=None, kw_only=True)
     use_vllm: bool = field(default=False, kw_only=True)
     use_liger_loss: bool = field(default=False, kw_only=True)
+    rollout_logprobs_as_old: bool | None = field(default=None, kw_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -9883,6 +9887,7 @@ class MLXGRPOTrainer(MLXTrainer):
             with_reference=self._uses_reference(args),
             max_prompt_length=args.max_prompt_length, shuffle=args.shuffle_dataset,
             seed=args.seed, num_batches=num_batches, num_epochs=num_epochs,
+            rollout_logprobs_as_old=args.rollout_logprobs_as_old,
             **self._grpo_vision_options(),
         )
         # A resumed run generates at once, so its widths are planned from there.
