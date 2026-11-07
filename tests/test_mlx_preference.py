@@ -1341,8 +1341,23 @@ def test_repeated_prompt_layout_maps_repeats_to_their_pair_and_softcap_sums_keep
     # Past this budget the vocabulary chunk follows the row count: 12 rows take 2048-entry chunks, 6 rows 4096.
     monkeypatch.setattr(runtime_cce, "_CHUNK_BUDGET", 12 * 4 * 2048)
     hidden, weight = mx.random.normal((12, 8)), mx.random.normal((65536, 8))
+    widths = []
+    real_chunk_matmul = p._chunk_matmul
+
+    def recording_chunk_matmul(rows, chunk, **kwargs):
+        widths.append(int(chunk.shape[0]))
+        return real_chunk_matmul(rows, chunk, **kwargs)
+
+    monkeypatch.setattr(p, "_chunk_matmul", recording_chunk_matmul)
     whole = p._head_logit_sums(hidden, weight, None, None, {}, 30.0)
-    assert mx.array_equal(p._head_logit_sums(hidden[:6], weight, None, None, {}, 30.0, chunk_rows=12), whole[:6])
+    whole_widths, widths[:] = list(widths), []
+    part = p._head_logit_sums(hidden[:6], weight, None, None, {}, 30.0, chunk_rows=12)
+    # The chunks themselves are the contract; a CPU BLAS may round a 6-row product differently from a 12-row one.
+    assert widths == whole_widths == [2048] * 32
+    assert np.allclose(np.asarray(part), np.asarray(whole[:6]), rtol=1e-6, atol=0)
+    widths[:] = []
+    p._head_logit_sums(hidden[:6], weight, None, None, {}, 30.0)
+    assert widths == [4096] * 16
 
 
 @pytest.fixture
