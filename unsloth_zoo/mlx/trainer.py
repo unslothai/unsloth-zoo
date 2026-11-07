@@ -43,6 +43,7 @@ import copy
 import concurrent.futures
 import contextlib
 import hashlib
+import inspect
 import json
 import math
 import numbers
@@ -54,6 +55,7 @@ import socket
 import time
 import types
 import unicodedata
+import warnings
 import weakref
 
 import mlx.core as mx
@@ -588,6 +590,10 @@ from .utils import (
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    install_padding_free,
+    padding_free_mixer_classes,
+    remove_padding_free,
+    make_padding_free_loss_fn,
     _get_transformer_layers,
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
@@ -1434,6 +1440,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "group_by_length",
     "length_sorted_microbatches",
     "loss_type",
+    "padding_free",
 )
 
 
@@ -1570,6 +1577,8 @@ class MLXTrainingConfig:
     # SFTConfig.loss_type: "nll" or "dft" (fused CCE text path only); preference and RL configs override its default
     # without kw_only, so the field keeps this positional slot in every subclass.
     loss_type: str = "nll"
+    # TRL SFTConfig.padding_free: SFT runs per-token modules on the real tokens only; appended LAST.
+    padding_free: bool = False
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -2620,6 +2629,34 @@ def _warn_resume_adapter_mismatch(model, adapter_file):
     )
 
 
+def _padding_free_path_refusal(args, batches, loss_fn, is_vlm, world_size, preference_kind):
+    if preference_kind:
+        return "it is implemented for SFT only"
+    if getattr(args, "teacher_model_name_or_path", None) or world_size > 1:
+        return "GKD and distributed runs are not supported"
+    if is_vlm and getattr(loss_fn, "_unsloth_cce_backend", None) != "runtime-cce":
+        return "vision SFT needs the fused CCE loss"
+    if not isinstance(batches, FiniteVLMBatchPlan if is_vlm else FiniteTextBatchPlan):
+        return "it needs a sized dataset, not a stream or prebuilt batches"
+    return None
+
+
+_PADDING_FREE_HINT_SAMPLE = 64
+
+
+def _padding_free_sample_packs(batches):
+    """Whether padding-free would pack a strided sample of at most _PADDING_FREE_HINT_SAMPLE scheduled batches; an
+    unsurveyed VLM plan answers no, so the hint never builds batches."""
+    if isinstance(batches, FiniteVLMBatchPlan) and batches._descriptors is None:
+        return False
+    total = len(batches._schedule)
+    stride = max(1, -(-total // _PADDING_FREE_HINT_SAMPLE))
+    try:
+        return batches.configure_padding_free(indices=range(0, total, stride))[0] > 0
+    finally:
+        batches.configure_padding_free(False)
+
+
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
 
@@ -2789,6 +2826,8 @@ class MLXTrainer:
                 "Falling back to packing=False (standard padding)."
             )
             self.args.packing = False
+        # TRL configs may carry None for "unset".
+        self.args.padding_free = bool(getattr(self.args, "padding_free", False))
 
         if (
             not self._is_vlm
@@ -5635,6 +5674,8 @@ class MLXTrainer:
                     release_mlx_training_patches()
             except Exception:
                 pass
+            remove_padding_free(getattr(self, "_padding_free_classes", ()))
+            self._padding_free_classes = ()
             for _module in _unfused_projection_modules:
                 try:
                     _module.fuse_in = True
@@ -5656,6 +5697,49 @@ class MLXTrainer:
             # Close this run's generation: a stop still latched from it is now
             # stale, while any later request belongs to the next run.
             self._run_generation = getattr(self, "_run_generation", 0) + 1
+
+    def _configure_padding_free(self, args, model, batches, loss_fn, is_vlm, world_size, main_print):
+        """The loss for this run's padding-free setting, which is decided only here. A refusal warns on every rank;
+        the nothing-packs note and off-hint print on the main process. Each is given once per trainer and kind,
+        counted only once delivered (a warning raised as an error is not)."""
+        refusal = padding_free_mixer_classes(model)[1] or _padding_free_path_refusal(
+            args, batches, loss_fn, is_vlm, world_size, self.preference_kind)
+        said = getattr(self, "_padding_free_said", None)
+        if said is None:
+            said = self._padding_free_said = set()
+        # A reused plan may still hold an earlier run's packing.
+        if callable(getattr(batches, "configure_padding_free", None)):
+            batches.configure_padding_free(False)
+        enabled = bool(getattr(args, "padding_free", False))
+        key = message = None
+        if enabled and refusal is not None:
+            if refusal not in said:
+                # Every rank warns, so an error filter raises on all of them rather than leaving the others to hang
+                # in a collective; a fresh registry leaves `said`, not Python's per-line filter, to dedup.
+                caller = inspect.currentframe().f_back
+                warnings.warn_explicit(
+                    f"Unsloth: padding_free=True has no effect: {refusal}. Training runs padded.", UserWarning,
+                    caller.f_code.co_filename, caller.f_lineno, module=caller.f_globals.get("__name__"), registry={})
+                said.add(refusal)
+        elif enabled:
+            flat_shapes, all_shapes = batches.configure_padding_free()
+            if not flat_shapes:
+                key, message = "no_pack", ("Unsloth: padding_free=True is supported here, but no batch shape would "
+                                           "save an eighth of its tokens, so every batch stays padded.")
+            else:
+                self._padding_free_classes = install_padding_free(model)
+                loss_fn = make_padding_free_loss_fn(loss_fn)
+                main_print(f"Unsloth: padding-free SFT runs {flat_shapes} of {all_shapes} batch shapes on real "
+                           "tokens only; the rest stay padded.")
+        elif refusal is None and "hint" not in said and _padding_free_sample_packs(batches):
+            key, message = "hint", (
+                "Unsloth: padding_free=True would pack some batches of this SFT run (judged from a sample of the "
+                "schedule). On ragged text SFT with Gemma 3 1B and Qwen3 1.7B at batch sizes 2-8 it gave "
+                "1.14-1.54x tokens/s; the gain depends on how much padding the batches carry.")
+        if key is not None and key not in said:
+            main_print(message)
+            said.add(key)
+        return loss_fn
 
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
@@ -5899,6 +5983,8 @@ class MLXTrainer:
             batches.configure_cce_compaction(
                 getattr(loss_fn, "_unsloth_cce_compaction", False),
             )
+        loss_fn = self._configure_padding_free(
+            args, model, batches, loss_fn, is_vlm, distributed_world_size, _main_print)
         if isinstance(batches, FiniteVLMBatchPlan):
             compaction_report = batches.configure_cce_compaction(
                 getattr(loss_fn, "_unsloth_cce_compaction", False) and distributed_world_size == 1,

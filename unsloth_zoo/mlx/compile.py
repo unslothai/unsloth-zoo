@@ -6085,11 +6085,12 @@ def _install_gemma4_compile_patches():
         text_model_cls, "_apply_blockwise_bidirectional_overlay"
     ):
         return
-    from .utils import _SharedKVSlot
+    from .utils import _PADDING_FREE_LAYOUT, _SharedKVSlot
 
     def patched_make_masks(self, h, cache, mm_token_type_ids=None):
         masks = original_make_masks(self, h, cache, None)
-        n = h.shape[1]
+        layout = _PADDING_FREE_LAYOUT.get()  # a flat stream's mixers still attend over padded rows
+        n = h.shape[1] if layout is None else layout.span
         if (
             getattr(self.config, "use_bidirectional_attention", None) != "vision"
             or mm_token_type_ids is None
