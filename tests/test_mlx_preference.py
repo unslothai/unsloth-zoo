@@ -1883,7 +1883,7 @@ def test_grpo_scores_a_reference_model_through_its_own_scorer(monkeypatch):
 
     policy, reference = TinyModel(), TinyModel()
     make = _owned_scorers(monkeypatch, lambda model: 1.0 if model is reference else 2.0)
-    plan = types.SimpleNamespace(with_reference=True, score_temperature=0.5)
+    plan = types.SimpleNamespace(with_reference=True, score_temperature=0.5, _prefix=False)
     held = preference.ReferencePolicy(model=reference)
     grpo.GRPOBatchPlan.bind(plan, policy, [], trainer_state=None, reference_policy=held,
                             scorer=make(policy, temperature=0.5))
@@ -4344,7 +4344,7 @@ def test_grpo_shared_prompt_rows_skip_the_processor():
 
     calls = []
 
-    def inputs(batch, lengths, media, ids_only=False, features=None):
+    def inputs(batch, lengths, media, ids_only=False, features=None, held=None, key=None):
         calls.append((batch.shape[1], None if ids_only else media))
         return "batch"
 
