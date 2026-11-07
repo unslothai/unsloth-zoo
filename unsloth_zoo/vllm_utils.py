@@ -6507,7 +6507,7 @@ class _MergedRolloutState(_MergedRolloutVerdict):
         self.folded = frozenset()  # module names folded; their LoRA tensors never go to vLLM
         self.rest = False        # other LoRA layers exist and are served by vLLM LoRA (attention mode)
         self.exact_targets = None  # exact mode (P is None): the folded targets until the unfold
-        self.fixup = None        # exact mode: {"bad", "elements"} of the last fold
+        self.fixup = None        # exact mode: {"bad", "elements", "store_bytes"} of the last fold
         self.depth = 0
         self.poisoned = None     # set when the restore failed twice
         self.model_ref = weakref.ref(model)
@@ -7010,8 +7010,9 @@ def _merged_rollout_exact_fold(state, adapter):
     state.exact_targets = targets
     state.fixup = exact_fold(targets, stream = state.stream)
     _merged_rollout_log_once(
-        f"Unsloth: exact merged rollout keeps {state.fixup['bad']:,} of {state.fixup['elements']:,} weights "
-        f"({100 * state.fixup['bad'] / max(state.fixup['elements'], 1):.2f}%) for the restore."
+        f"Unsloth: exact merged rollout restores {state.fixup['bad']:,} of {state.fixup['elements']:,} weights "
+        f"({100 * state.fixup['bad'] / max(state.fixup['elements'], 1):.2f}%) from a "
+        f"{state.fixup.get('store_bytes', 0) / 2**20:.1f} MB host store."
     )
 pass
 

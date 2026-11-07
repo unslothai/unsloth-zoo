@@ -140,12 +140,29 @@ def test_fixup_store_is_small_for_small_deltas():
     assert stats["bad"] / stats["elements"] < 0.01
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_store_needs_no_positions(dtype):
+    # Trained-size adapter (|d| about 10% of |W|): the old store took 6 B per inexact element; the stream takes a few bits.
+    W, A, B, scale = _dense(1024, 4096, 16, 1e-1, dtype)
+    W0 = W.clone()
+    t = _target(W, A, B, scale)
+    stats = ex.exact_fold([t])
+    report = ex.fixup_report([t], stats)
+    assert stats["bad"] > 0.01 * stats["elements"]
+    assert report["host_store_bytes"] == stats["store_bytes"] == t.host_store_bytes()
+    assert report["host_store_bytes"] < 0.25 * 6 * stats["bad"]
+    assert report["escapes"] < 0.01 * stats["bad"]
+    ex.exact_unfold([t])
+    assert torch.equal(_bits(W), _bits(W0))
+
+
 def test_corrupted_fixup_store_is_caught():
     W, A, B, scale = _dense(256, 1024, 16, 1e-2)
     t = _target(W, A, B, scale)
     stats = ex.exact_fold([t])
     assert stats["bad"] > 0
-    t.host_val[0] = t.host_val[0] + 1   # flip: a wrong original value must not pass silently
+    nz = (t.host_words != 0).nonzero()
+    t.host_words[nz[0, 0]] ^= 1 << 2   # flip: a wrong correction must not pass silently
     with pytest.raises(RuntimeError, match = "checksum mismatch"):
         ex.exact_unfold([t])
 
@@ -178,7 +195,7 @@ def test_disable_pinned_memory_uses_pageable_stores(monkeypatch):
     W0 = W.clone()
     t = _target(W, A, B, scale)
     ex.exact_fold([t], stream = torch.cuda.Stream())
-    assert t.host_val.numel() > 0 and not t.host_val.is_pinned() and not t.host_idx.is_pinned()
+    assert t.host_words.numel() > 0 and not t.host_words.is_pinned() and not t.host_wcnt.is_pinned()
     ex.exact_unfold([t], stream = torch.cuda.Stream())
     assert torch.equal(_bits(W), _bits(W0))
 
@@ -194,7 +211,7 @@ def test_pinning_failure_falls_back_to_pageable(monkeypatch):
     W0 = W.clone()
     t = _target(W, A, B, scale)
     ex.exact_fold([t], stream = torch.cuda.Stream())
-    assert not t.host_val.is_pinned()
+    assert not t.host_words.is_pinned()
     ex.exact_unfold([t], stream = torch.cuda.Stream())
     assert torch.equal(_bits(W), _bits(W0))
 
