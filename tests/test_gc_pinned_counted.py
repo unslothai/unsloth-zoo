@@ -267,3 +267,19 @@ def test_counted_path_reads_the_allocator_on_every_reservation(monkeypatch, gc_m
     blocks = [pin(gc_module, fake, 3 * MIB) for _ in range(3)]
     assert all(blocks) and len(reads) == 3
     assert pin(gc_module, fake, 3 * MIB) is None and len(reads) >= 4
+
+
+def test_unrelated_settings_update_keeps_counting_against_the_cap(monkeypatch, gc_module, allocator):
+    # torch keeps the pinned threshold when a later settings call names other keys; only the reported string changes.
+    fake = allocator("pinned_max_round_threshold_mb:1", cap_bytes = 10 * MIB)
+    foreign = fake.allocate(6 * MIB)
+    assert foreign and pin(gc_module, fake, MIB) is not None
+    monkeypatch.setattr(torch._C, "_accelerator_getAllocatorSettings", lambda: "max_split_size_mb:128", raising = False)
+    assert pin(gc_module, fake, 4 * MIB) is None
+    assert fake.held() <= 10 * MIB
+
+
+def test_settings_replaced_before_the_first_read_still_see_the_environment(monkeypatch, gc_module, allocator):
+    allocator("max_split_size_mb:128", cap_bytes = 10 * MIB)
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "pinned_max_round_threshold_mb:1")
+    assert gc_module._host_alloc_policy() == (MIB, float("inf"))
