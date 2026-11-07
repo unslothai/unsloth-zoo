@@ -1663,10 +1663,10 @@ def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit
         assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is not native
     with inference.inference_scopes(model, ("speculative",)):
         assert _same(expected, _decoded(*args))
+        assert all(layer.mlp._unsloth_moe_routed.verify_plans.get(5) is None for layer in lm.layers)
     assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is native and "_unsloth_verify_scopes" not in vars(lm)
-    # The first decode step and the verify block each matched on their first layer, then served every other one.
     admitted = [key for key, verdict in inference._VERIFY_VERDICTS.items() if verdict]
-    assert {key[0] for key in admitted} == {(1, 1), (1, 5), "rows alone", "causal chunks"}
+    assert {key[0] for key in admitted} == {(1, 1), "rows alone", "causal chunks"}
     assert any(key[0] == "rows alone" and key[2][0] == 1 for key in admitted)
     assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted if key[0] in ((1, 1), (1, 5)))
     # A drafted target settles its projections' multi-row kernels at load, through the batch-invariant forward too.

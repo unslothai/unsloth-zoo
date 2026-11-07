@@ -87,6 +87,11 @@ def _resolve_dotted(module, path):
     return target
 
 
+@functools.cache
+def _class_namespace(cls):
+    return vars(cls)
+
+
 def _resolved_bindings(contract):
     """Resolve a `{module: {dotted name: fingerprint}}` contract, None pinning the name not the body.
 
@@ -121,8 +126,9 @@ def _resolved_bindings(contract):
                 matches = False
             if matches:
                 # A static method's class entry is its descriptor, which is what a rebinding replaces.
-                raw = vars(holder).get(name)
-                found[id(holder), name] = (vars(holder), name, raw if isinstance(raw, staticmethod) else target)
+                namespace = _class_namespace(holder) if isinstance(holder, type) else vars(holder)
+                raw = namespace.get(name)
+                found[id(holder), name] = (namespace, name, raw if isinstance(raw, staticmethod) else target)
                 for alias, mod in (_ALIASES if expected is not None else ()):
                     if alias in source.__globals__:
                         found[id(source.__globals__), alias] = (source.__globals__, alias, mod)
@@ -145,7 +151,7 @@ def _exact_route_native(function):
 def _bindings_intact(bindings):
     for namespace, name, target in bindings:
         current = namespace.get(name)
-        if current is not target and _exact_route_native(current) is not target:
+        if current is not target and (target is None or _exact_route_native(current) is not target):
             return False
     return True
 
@@ -223,7 +229,26 @@ _MOE_PACK_ROW_MULTIPLE = 8
 
 
 _MOE_GATE_UP_CLASSES = {}
+_MOE_GENERATED_CALLS = {}
+_MOE_GENERATED_BINDINGS = {}
 _MOE_GATE_UP_LOCK = RLock()
+
+
+def _moe_contract_bindings(*contracts):
+    found = {}
+    for bindings in contracts:
+        if bindings is None or not _bindings_intact(bindings):
+            return None
+        for space, name, value in bindings:
+            found.setdefault((id(space), name), (space, name, value))
+    return list(found.values())
+
+
+def _moe_generated_bindings(cls):
+    expected = _MOE_GENERATED_CALLS.get(cls)
+    if expected is None or cls.__call__ is not expected[0] or cls.__mro__ != expected[1]:
+        return None
+    return _moe_contract_bindings(_MOE_GENERATED_BINDINGS.get(cls))
 
 
 # Bodies the fused expert call reimplements. The two switch layer packages no longer share a
@@ -410,7 +435,10 @@ def _fused_moe_gate_up_class(original_class, projection_type, scatter_unsort, de
             f"_FusedMoEGateUp{original_class.__name__}", (original_class,),
             {"__call__": fused_call, "sorted_experts": sorted_experts},
         )
-    return _MOE_GATE_UP_CLASSES[key]
+        _MOE_GENERATED_CALLS[_MOE_GATE_UP_CLASSES[key]] = (fused_call, _MOE_GATE_UP_CLASSES[key].__mro__)
+        _MOE_GENERATED_BINDINGS[_MOE_GATE_UP_CLASSES[key]] = tuple(bindings)
+    fused = _MOE_GATE_UP_CLASSES[key]
+    return fused if _moe_generated_bindings(fused) is not None else None
 
 
 @contextmanager
@@ -449,6 +477,8 @@ def fused_moe_gate_up(model, *, _modules = None):
                             continue
                         packed = _PackedMoEGateUp(module)
                         fused = _fused_moe_gate_up_class(original, *spec)
+                        if fused is None:
+                            continue
                     packed.active_scopes += 1
                     patched.append((module, original, fused, packed))
                     if type(module) is not fused:
@@ -4345,6 +4375,640 @@ def _switch_base(cls, specs):
     return None
 
 
+_PLAIN_MOE_ROUTING = r"""
+template <typename T, int E, int TOP>
+METAL_FUNC uint plain_routes(const device T* logits, uint lane, int stop, bool write,
+                            device uint* inds, device T* scores) {
+    constexpr int R = E / 32;
+    float values[R];
+    float maximum = -INFINITY;
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < R; ++r) {
+        values[r] = float(logits[128 * (r / 4) + 4 * lane + r % 4]);
+        maximum = max(maximum, values[r]);
+    }
+    maximum = simd_max(maximum);
+    float total = 0;
+    #pragma clang loop unroll(full)
+    for (int g = 0; g < R / 4; ++g) {
+        float partial = 0;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; ++i) {
+            values[4 * g + i] = fast::exp(values[4 * g + i] - maximum);
+            partial += values[4 * g + i];
+        }
+        float group = simd_sum(partial);
+        if (lane == uint(g)) total = group;
+    }
+    total = simd_sum(total);
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < R; ++r) values[r] = float(T(values[r] * (1 / total)));
+    uint used = 0, selected = 0, ranked = 0;
+    T probability = T(0);
+    for (int k = TOP - 1; k >= stop; --k) {
+        float best = -INFINITY;
+        int at = -1;
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < R; ++r) {
+            if (!(used & (1u << r)) && values[r] >= best) { best = values[r]; at = r; }
+        }
+        float winner = simd_max(best);
+        uint index = (at >= 0 && best == winner) ? uint(128 * (at / 4) + 4 * lane + at % 4) : 0;
+        index = simd_max(index);
+        if ((index / 4) % 32 == lane) used |= 1u << (4 * (index / 128) + index % 4);
+        if (k == stop) selected = index;
+        if (lane == uint(k)) { ranked = index; probability = T(winner); }
+    }
+    if (write) {
+        T denominator = simd_shuffle(probability, 0);
+        for (int k = 1; k < TOP; ++k) denominator = T(float(denominator) + float(simd_shuffle(probability, k)));
+        if (lane < TOP) { inds[lane] = ranked; scores[lane] = T(float(probability) / float(denominator)); }
+    }
+    return selected;
+}
+"""
+
+_PLAIN_MOE_DOT = r"""
+template <typename T, int BITS, int GS, int K, int N, bool FAST, int ROWS>
+METAL_FUNC void plain_qmv(const device T* x, const device uint* w, const device T* scales,
+                         const device T* biases, int row, uint lane, thread float* result) {
+    constexpr int PF = get_pack_factor<BITS, 32>();
+    constexpr int BP = get_bytes_per_pack<BITS, 32>();
+    constexpr int VPT = PF * ((FAST && BITS != 2) ? 2 : 1);
+    constexpr int BLOCK = 32 * VPT;
+    constexpr int STEP = GS / VPT;
+    const device uint8_t* packed = (const device uint8_t*)w;
+    #pragma clang loop unroll(disable)
+    for (int block = 0; block < K; block += BLOCK) {
+        int remaining = min(VPT, max(0, K - block - int(lane) * VPT));
+        if (!remaining) continue;
+        // Generic qmv uses safe arithmetic for its final block, including lanes with a full pack.
+        bool tail = !FAST && block + BLOCK >= K;
+        thread float xt[VPT];
+        float sum = tail ? load_vector_safe<T, float, VPT, BITS>(x + block + lane * VPT, xt, remaining)
+                         : load_vector<T, float, VPT, BITS>(x + block + lane * VPT, xt);
+        for (int r = 0; r < ROWS; ++r) {
+            if (row + r >= N) continue;
+            const device uint8_t* wp = packed + (row + r) * (K * BP / PF) + (block / PF + lane * (VPT / PF)) * BP;
+            int q = (row + r) * (K / GS) + block / GS + lane / STEP;
+            result[r] += tail ? qdot_safe<float, VPT, BITS>(wp, xt, float(scales[q]), float(biases[q]), sum, remaining)
+                              : qdot<float, VPT, BITS>(wp, xt, float(scales[q]), float(biases[q]), sum);
+        }
+    }
+    for (int r = 0; r < ROWS; ++r) result[r] = simd_sum(result[r]);
+}
+"""
+
+
+@functools.cache
+def _plain_moe_kernels(rows = False):
+    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+            or mx.device_info().get("architecture") != "applegpu_g15s"):
+        return None
+    try:
+        seen = set()
+        _inline("mlx/backend/metal/kernels/utils.h", seen)
+        header = _inline("mlx/backend/metal/kernels/quantized.h", seen, "get_pack_factor", "dequantize")
+        header += _inline("mlx/backend/metal/kernels/unary_ops.h", seen, "Sigmoid", "Sign")
+        header += "#define UNSLOTH_AFFINE 1\n" + _QDOT + _ROUTED + _PLAIN_MOE_ROUTING + _PLAIN_MOE_DOT + _SLOTS
+        gate_offset = r"""
+            uint batch = threadgroup_position_in_grid.z;
+            x += batch * H; logits += batch * E;
+            h += batch * (TOP + 1) * I;
+            indices += batch * TOP; scores += batch * TOP; shared_scale += batch;
+            """ if rows else ""
+        down_offset = r"""
+            uint batch = threadgroup_position_in_grid.z;
+            h += batch * (TOP + 1) * I; indices += batch * TOP; scores += batch * TOP;
+            shared_scale += batch; y += batch * H;
+            """ if rows else ""
+        gate_up = mx.fast.metal_kernel(
+            name = "unsloth_verify_moe_route_gate_up" if rows else "unsloth_plain_moe_route_gate_up", ensure_row_contiguous = False,
+            input_names = ["x", "logits", "wg", "sg", "bg", "wu", "su", "bu", "cg", "csg", "cbg", "cu", "csu", "cbu", "gw", "gs", "gb"],
+            output_names = ["h", "indices", "scores", "shared_scale"], header = header,
+            compile_options = {"math_mode": "safe"}, source = "#pragma clang fp contract(off) reassociate(off)\n" + gate_offset + r"""
+            uint lane = thread_index_in_simdgroup;
+            uint simd = simdgroup_index_in_threadgroup;
+            uint row = threadgroup_position_in_grid.x * 16 + simd * 4;
+            uint slot = threadgroup_position_in_grid.y;
+            bool common = slot == TOP;
+            uint expert = 0;
+            if (!common) {
+                expert = plain_routes<T, E, TOP>(logits, lane, slot, row == 0 && slot == 0, indices, scores);
+            }
+            const device uint* gate_w = common ? cg : wg + expert * wg_strides[0];
+            const device T* gate_s = common ? csg : sg + expert * sg_strides[0];
+            const device T* gate_b = common ? cbg : bg + expert * bg_strides[0];
+            const device uint* up_w = common ? cu : wu + expert * wu_strides[0];
+            const device T* up_s = common ? csu : su + expert * su_strides[0];
+            const device T* up_b = common ? cbu : bu + expert * bu_strides[0];
+            typedef Dots<T, GS, BITS, 4, true> dots;
+            thread float values[8] = {};
+            thread typename dots::Proj projections[2] = {
+                dots::proj((const device uint8_t*)gate_w, (const device uint8_t*)gate_s, (const device uint8_t*)gate_b, H, row, lane),
+                dots::proj((const device uint8_t*)up_w, (const device uint8_t*)up_s, (const device uint8_t*)up_b, H, row, lane)};
+            dots::template run<2>(projections, x, H, lane, values);
+            if (lane == 0) {
+                for (int r = 0; r < 4; ++r) {
+                    T g = T(values[r]), u = T(values[4 + r]);
+                    T activated = g * Sigmoid{}(g);
+                    h[slot * I + row + r] = activated * u;
+                }
+            }
+            if (common && row == 0) {
+                thread float value[1] = {};
+                plain_qmv<T, GBITS, GGS, H, 1, true, 1>(x, gw, gs, gb, 0, lane, value);
+                if (lane == 0) shared_scale[0] = Sigmoid{}(T(value[0]));
+            }
+            """)
+        down = mx.fast.metal_kernel(
+            name = "unsloth_verify_moe_down_combine" if rows else "unsloth_plain_moe_down_combine", ensure_row_contiguous = False,
+            input_names = ["h", "indices", "scores", "shared_scale", "w", "s", "b", "cw", "cs", "cb"],
+            output_names = ["y"], header = header, compile_options = {"math_mode": "safe"}, source = "#pragma clang fp contract(off) reassociate(off)\n" + down_offset + r"""
+            uint lane = thread_index_in_simdgroup;
+            uint simd = simdgroup_index_in_threadgroup;
+            uint row = threadgroup_position_in_grid.x * 4;
+            threadgroup T products[(TOP + 1) * 4];
+            uint slot = simd;
+                bool common = slot == TOP;
+                uint expert = common ? 0 : indices[slot];
+                thread float value[4] = {};
+                typedef Dots<T, GS, BITS, 4, DFAST> dots;
+                thread typename dots::Proj projection = dots::proj(
+                    (const device uint8_t*)(common ? cw : w + expert * w_strides[0]),
+                    (const device uint8_t*)(common ? cs : s + expert * s_strides[0]),
+                    (const device uint8_t*)(common ? cb : b + expert * b_strides[0]), I, row, lane);
+                dots::template run<1>(&projection, h + slot * I, I, lane, value);
+                if (lane == 0) {
+                    for (int r = 0; r < 4; ++r) products[slot * 4 + r] = common ? T(value[r]) : T(value[r]) * scores[slot];
+                }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd == 0 && lane < 4) {
+                y[row + lane] = shared_add(slot_sum<T>(products + lane, 4, TOP), shared_scale[0], products[TOP * 4 + lane]);
+            }
+            """)
+        return gate_up, down
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+_PLAIN_MOE_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.language": {
+        "Qwen4ExpSparseMoeBlock._shared_expert_scale": "ebaed577eec4a7ae",
+        "_row_invariant_quantized_projection": "75dc4975ef847716",
+    },
+}
+
+
+def _moe_dispatch_bindings(objects, roots = ("__call__", "__getattribute__", "__getattr__", "__getitem__", "__contains__"), *, follow = True):
+    """Bind instance and full-MRO entries reached by native dispatch bodies.
+    Attribute discovery is conservative and follows Python helpers and property getters.
+    Child mappings contribute stored fields; methods resolve through instance/class dictionaries.
+    """
+    records, found, seen = [], {}, set()
+    for obj in objects:
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        hierarchy = obj.__mro__ if isinstance(obj, type) else type(obj).__mro__
+        spaces = [(id(cls), _class_namespace(cls)) for cls in hierarchy]
+        if not isinstance(obj, type):
+            spaces.append((id(obj), vars(obj)))
+            if isinstance(obj, dict):
+                spaces.append(((id(obj), "items"), obj))
+        records.append((obj, spaces))
+    pending = [(i, name) for i in range(len(records)) for name in roots]
+    seen.clear()
+    while pending:
+        i, name = pending.pop()
+        if (i, name) in seen:
+            continue
+        seen.add((i, name))
+        for key, space in records[i][1]:
+            if isinstance(key, tuple) and name not in space:
+                continue
+            value = space.get(name)
+            found[key, name] = (space, name, value)
+            function = value.fget if isinstance(value, property) else getattr(value, "__func__", value)
+            code = getattr(function, "__code__", None)
+            if follow and code is not None:
+                pending.extend((j, attr) for attr in code.co_names for j, (obj, _) in enumerate(records)
+                               if (j, attr) not in seen and hasattr(obj, attr))
+    return tuple(found.values())
+
+
+class _PlainMoEShared:
+    def __init__(self):
+        self.entries, self.hierarchies = {}, {}
+        self.bindings, self.version = (), 0
+
+    def add(self, bindings, classes):
+        size = len(self.entries), len(self.hierarchies)
+        for space, name, value in bindings:
+            self.entries.setdefault((id(space), name), (space, name, value))
+        for cls, hierarchy in classes:
+            self.hierarchies.setdefault(cls, hierarchy)
+        if size != (len(self.entries), len(self.hierarchies)):
+            self.bindings = tuple(self.entries.values())
+            self.version += 1
+
+    def check(self):
+        return (_bindings_intact(self.bindings)
+                and all(cls.__mro__ == hierarchy for cls, hierarchy in self.hierarchies.items()))
+
+    def matches(self):
+        step = getattr(_VERIFY_STATE, "plain_moe", None)
+        if step is None or step[0] is not self:
+            return self.check()
+        if step[1] != self.version:
+            step[1:] = self.version, self.check()
+        return step[2]
+
+
+@functools.cache
+def _moe_module_codes(module):
+    path = sys.modules[module].__file__
+    pending, codes = [compile(Path(path).read_text(), path, "exec", dont_inherit = True)], {}
+    while pending:
+        code = pending.pop()
+        codes.setdefault(code.co_qualname, set()).add(code)
+        pending.extend(c for c in code.co_consts if inspect.iscode(c))
+    return codes
+
+
+_MOE_VERIFY_DISPATCH = {}
+_MOE_VERIFY_METHODS = {}
+
+
+class _MoEVerifyDispatch:
+    """The native feed-forward dispatch that a row plan bypasses, pinned before serving."""
+
+    def __init__(self, cls, native, contracts):
+        self.cls, self.names, self.methods = cls, set(), set()
+        self.functions, self.cells, self.objects = [], [], []
+        classes, bindings, pending, seen = {cls}, list(contracts), [native._feed_forward], set()
+        receivers = {id(native._feed_forward): cls}
+        allowed = {id(getattr(v, "__func__", v)) for _, _, v in contracts}
+        allowed.add(id(object.__getattribute__))
+        for parent in cls.__mro__:
+            allowed.update(_MOE_VERIFY_METHODS.get(parent, ()))
+
+        def visit(value, receiver = None):
+            if isinstance(value, (staticmethod, classmethod)):
+                value = value.__func__
+            bound = getattr(value, "__self__", None)
+            if bound is not None:
+                receiver = bound
+            value = getattr(value, "__func__", value)
+            if receiver is not None:
+                receivers[id(value)] = receiver
+            if isinstance(value, FunctionType):
+                pending.append(value)
+            elif callable(value) and isinstance(getattr(value, "__wrapped__", None), FunctionType):
+                bindings.append((vars(value), "__wrapped__", value.__wrapped__))
+                pending.append(value.__wrapped__)
+
+        for name in ("__getattribute__", "__getattr__"):
+            value = getattr(cls, name, None)
+            if value is not None and id(getattr(value, "__func__", value)) not in allowed:
+                raise ValueError("the verifier attribute dispatch is not pinned")
+            visit(value, cls)
+        while pending:
+            fn = pending.pop()
+            if id(fn) in seen:
+                continue
+            seen.add(id(fn))
+            module = fn.__globals__.get("__name__", "")
+            owner = sys.modules.get(module)
+            if owner is None or fn.__globals__ is not vars(owner):
+                raise ValueError("the verifier helper has an unverified namespace")
+            self.functions.append((fn, fn.__code__, fn.__defaults__, fn.__kwdefaults__))
+            if fn.__kwdefaults__:
+                bindings.extend((fn.__kwdefaults__, n, v) for n, v in fn.__kwdefaults__.items())
+            values = [*(fn.__defaults__ or ()), *(fn.__kwdefaults__ or {}).values()]
+            environment = dict(fn.__globals__)
+            for name, cell in zip(fn.__code__.co_freevars, fn.__closure__ or ()):
+                value = cell.cell_contents
+                self.cells.append((cell, value))
+                environment[name] = value
+                values.append(value)
+            for value in values:
+                visit(value)
+            trusted = module.startswith(("mlx.", "mlx_vlm.", "unsloth_zoo.mlx."))
+            if not trusted and module.split(".")[0] not in sys.stdlib_module_names:
+                raise ValueError("the verifier helper is outside the verified runtime")
+            if not fn.__code__.co_filename.startswith("<frozen "):
+                if fn.__code__ not in _moe_module_codes(module).get(fn.__code__.co_qualname, ()):
+                    raise ValueError("the verifier helper differs from its installed body")
+            if not trusted:
+                continue
+            codes, names = [fn.__code__], set()
+            while codes:
+                code = codes.pop()
+                names.update(code.co_names)
+                codes.extend(c for c in code.co_consts if inspect.iscode(c))
+            for name in names & fn.__globals__.keys():
+                value = fn.__globals__[name]
+                bindings.append((fn.__globals__, name, value))
+                visit(value)
+            if id(fn) in receivers:
+                environment["self"] = receivers[id(fn)]
+
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn.__code__)))
+            called = {n.func.attr for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+
+            def resolve(node):
+                if isinstance(node, ast.Name):
+                    return environment.get(node.id)
+                if not isinstance(node, ast.Attribute) or node.attr not in names:
+                    return None
+                obj = resolve(node.value)
+                if isinstance(obj, type):
+                    classes.add(obj)
+                    bindings.extend(_moe_dispatch_bindings((obj,), (node.attr,), follow = False))
+                elif isinstance(obj, ModuleType):
+                    bindings.append((vars(obj), node.attr, vars(obj).get(node.attr)))
+                elif hasattr(obj, "__dict__") and callable(getattr(obj, node.attr, None)):
+                    classes.add(type(obj))
+                    self.objects.append((obj, type(obj)))
+                    bindings.extend(_moe_dispatch_bindings((obj,), (node.attr, "__getattribute__", "__getattr__"), follow = False))
+                else:
+                    return None
+                value = getattr(obj, node.attr, None)
+                parent = obj is not object and any(obj is c for c in cls.__mro__)
+                if parent and (callable(value) or node.attr in called):
+                    if id(getattr(value, "__func__", value)) not in allowed:
+                        raise ValueError(f"the verifier method {obj.__name__}.{node.attr} is not a pinned or generated body")
+                if obj is cls and isinstance(node.value, ast.Name) and node.value.id == "self":
+                    self.names.add(node.attr)
+                    if callable(value):
+                        self.methods.add(node.attr)
+                # Recursive shared-expert calls use this same native body, not the fusion being guarded.
+                visit(native._feed_forward if node.attr == "_feed_forward" else value, cls if parent else obj)
+                return value
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute):
+                    resolve(node)
+        bindings.extend(_moe_dispatch_bindings((cls,), ("__getattribute__", "__getattr__")))
+        self.shared = _PlainMoEShared()
+        self.shared.add(bindings, tuple((c, c.__mro__) for c in classes))
+        self.names, self.methods = frozenset(self.names), frozenset(self.methods)
+
+    def check(self):
+        return (self.shared.check()
+                and all(f.__code__ is code and f.__defaults__ is defaults and f.__kwdefaults__ is kw
+                        for f, code, defaults, kw in self.functions)
+                and all(cell.cell_contents is value for cell, value in self.cells)
+                and all(type(obj) is cls for obj, cls in self.objects))
+
+
+def _moe_verifier_class(cls):
+    _MOE_VERIFY_METHODS[cls] = tuple(id(getattr(v, "__func__", v)) for v in vars(cls).values()
+                                   if isinstance(getattr(v, "__func__", v), FunctionType))
+    native = _verifier_native(cls)
+    target = getattr(sys.modules.get("mlx_vlm.models.qwen4_exp.language"), "Qwen4ExpBatchInvariantForward", None)
+    if target is not None and issubclass(native, target):
+        try:
+            contracts = _resolved_bindings(_QWEN4_FORWARD_CONTRACT)
+            _MOE_VERIFY_DISPATCH[cls] = _MoEVerifyDispatch(cls, native, contracts) if contracts is not None else None
+        except (AttributeError, OSError, RuntimeError, SyntaxError, TypeError, ValueError):
+            _MOE_VERIFY_DISPATCH[cls] = None
+    return cls
+
+
+def _moe_verifier_context(verifier):
+    state = vars(verifier)
+    context = state.get("_unsloth_moe_verify_context")
+    if context is None:
+        dispatch = _MOE_VERIFY_DISPATCH.get(type(verifier))
+        if dispatch is None or not dispatch.methods.isdisjoint(state):
+            return None
+        local_bindings = tuple((state, name, state.get(name)) for name in dispatch.names)
+        context = verifier, dispatch, local_bindings
+        state["_unsloth_moe_verify_context"] = context
+    return context
+
+
+def _moe_verifier_matches(verifier, experts = None):
+    step = getattr(_VERIFY_STATE, "moe_verifier", None)
+    if experts is None or step is None or step[0] is not verifier:
+        context = _moe_verifier_context(verifier)
+        valid = (context is not None and type(verifier) is context[1].cls
+                 and context[1].check())
+    else:
+        _, context, valid = step
+    if experts is None:
+        return context, valid
+    if experts.verify_context is None:
+        experts.verify_context = context
+    return (valid and context is experts.verify_context and type(verifier) is context[1].cls
+            and _bindings_intact(context[2]))
+
+
+class _PlainMoE:
+    def __init__(self, block, experts, bindings, rows = 1):
+        self.block, self.mlp = block, experts.mlp
+        common = block.shared_expert
+        self.projections = (self.mlp.gate_proj, self.mlp.up_proj, self.mlp.down_proj,
+                            common.gate_proj, common.up_proj, common.down_proj, block.shared_expert_gate)
+        self.parents = (block, self.mlp, common, self.mlp.activation, getattr(self.mlp, "_unsloth_moe_gate_up", None))
+        self.parents = tuple(parent for parent in self.parents if parent is not None)
+        self.classes = tuple((type(p), type(p).__mro__) for p in (*self.projections, *self.parents))
+        self.router = block.gate
+        self.weights_router = _projection_tensors(self.router)
+        self.router_class = (type(self.router), type(self.router).__mro__)
+        self.objects = (*self.projections, *self.parents, self.router)
+        self.class_ids = tuple(id(type(obj)) for obj in self.objects)
+        self.shared = experts.shared or _PlainMoEShared()
+        self.weights = tuple(_projection_tensors(p) for p in self.projections)
+        self.bindings = _moe_dispatch_bindings((*self.projections, *self.parents, self.router,
+                                                getattr(type(block), "_unsloth_router_native", type(block))))
+        self.bindings += tuple(bindings)
+        self.bindings += tuple(
+            (p, name, tensor) for p in self.projections for name, tensor in zip(("weight", "scales", "biases"), _projection_tensors(p)))
+        self.bindings += ((self.mlp if "activation" in self.mlp else vars(self.mlp), "activation", self.mlp.activation),)
+        self.bindings += tuple((vars(block), name, getattr(block, name)) for name in ("top_k", "num_experts", "norm_topk_prob"))
+        self.bindings += tuple((p, "bias", None) for p in (*self.projections, self.router))
+        for projection in (*self.projections, self.router):
+            self.bindings += tuple((vars(projection), name, getattr(projection, name)) for name in ("bits", "group_size", "mode"))
+        self.bindings += tuple((self.router, name, tensor) for name, tensor in zip(("weight", "scales", "biases"), _projection_tensors(self.router)))
+        self.bindings += tuple((parent, name, projection) for parent, names in ((self.mlp, ("gate_proj", "up_proj", "down_proj")),
+                                                                              (common, ("gate_proj", "up_proj", "down_proj")))
+                               for name in names for projection in (parent[name],))
+        self.bindings = tuple({(id(space), name): (space, name, value) for space, name, value in self.bindings}.values())
+        local = {id(space) for obj in self.objects for space in (vars(obj), obj)}
+        self.shared_bindings = tuple(binding for binding in self.bindings if id(binding[0]) not in local)
+        self.bindings = tuple(binding for binding in self.bindings if id(binding[0]) in local)
+        absent = {}
+        for binding in self.bindings:
+            space, name, value = binding
+            if value is None:
+                absent.setdefault(id(space), (space, []))[1].append(binding)
+        groups = {}
+        for space, bindings in absent.values():
+            names = frozenset(name for _, name, _ in bindings)
+            spaces, entries = groups.setdefault(names, ([], []))
+            spaces.append(dict.keys(space))
+            entries.extend(bindings)
+        self.absent = tuple((names.isdisjoint, tuple(spaces), tuple(entries))
+                            for names, (spaces, entries) in groups.items())
+        self.bindings = tuple(binding for binding in self.bindings if binding[2] is not None)
+        self.share(self.shared)
+        self.verdict = None
+        self.dtype = self.weights[0][1].dtype
+        self.hidden = self.mlp.down_proj.weight.shape[1]
+        self.width = self.mlp.gate_proj.weight.shape[1]
+        self.top_k = block.top_k
+        gate = self.projections[0]
+        shared_gate = self.projections[-1]
+        self.template = [("T", self.dtype), ("BITS", gate.bits), ("GS", gate.group_size),
+                         ("GBITS", shared_gate.bits), ("GGS", shared_gate.group_size), ("H", self.hidden),
+                         ("I", self.width), ("E", block.num_experts), ("TOP", self.top_k), ("DFAST", self.width % 512 == 0)]
+        self.first = dict(template = self.template, grid = (32 * (self.width // 16), 4 * 11, 1), threadgroup = (32, 4, 1),
+                          output_shapes = [(11, self.width), (1, 1, 10), (1, 1, 10), (1, 1, 1)],
+                          output_dtypes = [self.dtype, mx.uint32, self.dtype, self.dtype])
+        self.last = dict(template = self.template, grid = (32 * (self.hidden // 4), 11, 1), threadgroup = (32, 11, 1),
+                         output_shapes = [(1, 1, self.hidden)], output_dtypes = [self.dtype])
+        routed = tuple(tuple(t[:self.top_k] for t in group) for group in self.weights[:3])
+        mx.eval(routed)
+        self.first_weights = (*routed[0], *routed[1], *self.weights[3], *self.weights[4], *self.weights[6])
+        self.last_weights = (*routed[2], *self.weights[5])
+        self.configure_rows(rows)
+
+    def for_rows(self, rows):
+        # Constants and bindings are shared; launch dictionaries and real-input verdicts belong to each width.
+        plan = copy.copy(self)
+        plan.first, plan.last = dict(self.first), dict(self.last)
+        plan.verdict = None
+        plan.configure_rows(rows)
+        return plan
+
+    def configure_rows(self, rows):
+        self.shape = (1, rows, self.hidden)
+        self.gate_up, self.down = _plain_moe_kernels(rows > 1)
+        self.router_kernel = mx.quantized_matmul if rows > 1 else None
+        self.router_shape = (rows, 1, self.hidden)
+        self.router_output_shape = (1, rows, self.block.num_experts)
+        self.router_args = dict(transpose = True, group_size = self.router.group_size,
+                                bits = self.router.bits, mode = self.router.mode)
+        self.first.update(grid = (*self.first["grid"][:2], rows),
+                          output_shapes = [(11, self.width) if rows == 1 else (rows, 11, self.width),
+                                           (1, rows, 10), (1, rows, 10), (1, rows, 1)])
+        self.last.update(grid = (*self.last["grid"][:2], rows), output_shapes = [self.shape])
+
+    def share(self, shared):
+        self.shared = shared
+        shared.add(self.shared_bindings, (*self.classes, self.router_class))
+
+    def run(self, x):
+        x = mx.contiguous(x)
+        # Fresh weight batches avoid qmv_wide and stale views after parameter writes.
+        logits = (self.router_kernel(x.reshape(self.router_shape), *(w[None] for w in self.weights_router), **self.router_args)
+                  .reshape(self.router_output_shape)
+                  if self.router_kernel is not None else self.router(x))
+        h, inds, scores, scale = self.gate_up(inputs = [x, logits, *self.first_weights], **self.first)
+        return self.down(inputs = [h, inds, scores, scale, *self.last_weights], **self.last)[0]
+
+    def __call__(self, block, x, native):
+        if (x.shape != self.shape or x.dtype != self.dtype or self.verdict is False
+                or block is not self.block or tuple(map(id, map(type, self.objects))) != self.class_ids
+                or not self.shared.matches() or not _bindings_intact(self.bindings)):
+            return None
+        for disjoint, spaces, bindings in self.absent:
+            if not all(map(disjoint, spaces)) and not _bindings_intact(bindings):
+                return None
+        if self.verdict is None:
+            _staged_ready()
+        try:
+            candidate = self.run(x)
+            if self.verdict is None:
+                reference = native()
+                self.verdict = _settled(candidate.dtype == reference.dtype and bool(mx.array_equal(candidate.view(mx.uint16), reference.view(mx.uint16))))
+                if not self.verdict:
+                    logger.warning("the MoE plan differs from native; the native graph stays in use")
+                    return reference
+        except (RuntimeError, ValueError, TypeError) as error:
+            _unless_failed_buffer(error)
+            self.verdict = False
+            logger.warning("the MoE plan cannot run; the native graph stays in use: %s", error)
+            return native()
+        return candidate
+
+
+def _plain_moe_plan(block, experts, rows = 1):
+    if (os.environ.get("UNSLOTH_MLX_PLAIN_MOE", "1") == "0" or _plain_moe_kernels() is None
+            or getattr(type(block), "_unsloth_router_native", type(block)).__module__ != "mlx_vlm.models.qwen4_exp.language"
+            or block.top_k != 10 or block.num_experts != 512 or not block.norm_topk_prob):
+        return None
+    language = sys.modules["mlx_vlm.models.qwen4_exp.language"]
+    native = getattr(type(block), "_unsloth_router_native", type(block))
+    common = getattr(block, "shared_expert", None)
+    router = _moe_router_class(native)
+    if common is None or router is None:
+        return None
+    contracts = [_resolved_bindings({**_PLAIN_MOE_CONTRACT, **_DENSE_QMM_CONTRACT}),
+                 _shared_expert_bindings(type(common)), experts.bindings, _MOE_PACK_BINDINGS,
+                 _moe_generated_bindings(router[0])]
+    for obj, base in ((block, native), (experts.mlp, experts.base)):
+        if type(obj) is not base:
+            contracts.append(_moe_generated_bindings(type(obj)))
+    bindings = _moe_contract_bindings(*contracts)
+    if bindings is None:
+        return None
+    scale = type(block)._shared_expert_scale
+    if (scale is not language.Qwen4ExpSparseMoeBlock._shared_expert_scale
+            or scale.__globals__.get("_row_invariant_quantized_projection") is not language._row_invariant_quantized_projection):
+        return None
+    bindings.append((scale.__globals__, "_row_invariant_quantized_projection", language._row_invariant_quantized_projection))
+    pack = getattr(experts.mlp, "_unsloth_moe_gate_up", None)
+    if pack is not None and (type(pack) is not _PackedMoEGateUp or type(pack).__mro__ != _MOE_PACK_MRO):
+        return None
+    if type(experts.mlp.activation) is not experts.activation_type:
+        return None
+    projections = (experts.mlp.gate_proj, experts.mlp.up_proj, experts.mlp.down_proj,
+                   common.gate_proj, common.up_proj, common.down_proj)
+    dense = (*projections[3:], block.shared_expert_gate, block.gate)
+    if (any(type(p) is not experts.projection_type for p in projections[:3])
+            or any(not isinstance(p, nn.QuantizedLinear) or (type(p).__call__ is not nn.QuantizedLinear.__call__
+                   and type(p).__call__ not in _ONE_ROW_STOCK_CALLS) for p in dense)):
+        return None
+    if any(p.training or getattr(p, "bits", None) != 4 or p.group_size != 32 or p.mode != "affine" or "bias" in p
+           or len(_projection_tensors(p)) != 3 or p.scales.dtype != mx.bfloat16 or p.biases.dtype != mx.bfloat16 for p in projections):
+        return None
+    if (projections[0].scales.dtype != mx.bfloat16 or projections[0].weight.shape[1] % 16
+            or projections[2].weight.shape[1] % 512 or any(not _expert_rows_packed(t) for p in projections[:3] for t in _projection_tensors(p))
+            or any(not _rows_packed(t) for p in projections[3:] for t in _projection_tensors(p))):
+        return None
+    hidden, width = projections[2].weight.shape[1], projections[0].weight.shape[1]
+    # The shared linear uses native qmv_quad at these widths; routed gathers use ordinary qmv.
+    if width in (64, 128):
+        return None
+    dimensions = ((hidden, width), (hidden, width), (width, hidden))
+    for p, (k, n) in zip(projections[:3], dimensions):
+        if p.weight.shape[0] != 512 or _projection(_projection_tensors(p), "affine", 32, 4, mx.bfloat16, k) != (n, int(k % 512 == 0)):
+            return None
+    for p, (k, n) in zip(projections[3:], dimensions):
+        if _one_row_kernel("affine", 32, 4, mx.bfloat16, k, n, *_projection_tensors(p)) != int(k % 512 == 0):
+            return None
+    gate = block.shared_expert_gate
+    if (gate.training or gate.bits != 8 or gate.group_size != 64 or gate.mode != "affine" or "bias" in gate
+            or len(_projection_tensors(gate)) != 3 or not all(_rows_packed(t) for t in _projection_tensors(gate))
+            or not _qwen4_inject_qmv(gate, 1, hidden, mx.bfloat16) or "_shared_expert_scale" in block.__dict__
+            or not isinstance(block.gate, nn.QuantizedLinear) or block.gate.weight.shape[0] != 512
+            or block.gate.training or "bias" in block.gate or len(_projection_tensors(block.gate)) != 3
+            or block.gate.scales.dtype != mx.bfloat16 or block.gate.biases.dtype != mx.bfloat16):
+        return None
+    router = block.gate
+    if rows > 1 and (router.bits != 8 or router.group_size != 64 or router.mode != "affine"
+                     or not all(_rows_packed(t) for t in _projection_tensors(router))
+                     or router.weight.dtype != mx.uint32 or router.weight.shape != (block.num_experts, hidden // 4)
+                     or router.scales.shape != (block.num_experts, hidden // 64)
+                     or router.biases.shape != router.scales.shape):
+        return None
+    return _PlainMoE(block, experts, bindings, rows)
+
+
 class _RoutedExperts:
     """A sparse block's routed experts on the decode kernels, for unsorted routes outside the short-block band."""
 
@@ -4354,10 +5018,56 @@ class _RoutedExperts:
         self.decode_block, self.bindings = decode_block, bindings
         self.verdicts = {}
         self.layout = (None, False)
+        self.plain_plan = None
+        self.plain_built = False
+        self.plain_enabled = False
+        self.verify_enabled = False
+        self.verify_plans = {}
+        self.verify_context = None
+        self.shared = None
+
+    def plain(self, block, x, native):
+        if (x.ndim != 3 or x.shape[:2] != (1, 1) or block.training
+                or "_unsloth_speculative_call" in block.__dict__):
+            return None
+        if not self.plain_built:
+            self.plain_built = True
+            try:
+                self.plain_plan = _plain_moe_plan(block, self)
+            except (RuntimeError, ValueError, TypeError) as error:
+                _unless_failed_buffer(error)
+                logger.warning("the plain MoE plan cannot be built; the native graph stays in use: %s", error)
+        if self.plain_plan is None:
+            return None
+        output = self.plain_plan(block, x, native)
+        return native() if output is None else output
+
+    def verify(self, block, x, native, verifier = None):
+        if x.ndim != 3 or x.shape[0] != 1 or not 1 < x.shape[1] <= _VERIFY_FUSED_ROWS or block.training:
+            return None
+        if verifier is not None and not _moe_verifier_matches(verifier, self):
+            return native()
+        rows = x.shape[1]
+        if rows not in self.verify_plans:
+            try:
+                existing = next((plan for plan in self.verify_plans.values() if plan is not None), None)
+                self.verify_plans[rows] = (existing.for_rows(rows) if existing is not None else
+                                           _plain_moe_plan(block, self, rows))
+            except (RuntimeError, ValueError, TypeError) as error:
+                _unless_failed_buffer(error)
+                self.verify_plans[rows] = None
+        plan = self.verify_plans[rows]
+        if plan is None:
+            return native()
+        output = plan(block, x, native)
+        return native() if output is None else output
 
     def _tensors(self, block, x):
         mlp = block.switch_mlp
+        pack = getattr(mlp, "_unsloth_moe_gate_up", None)
         if (mlp is not self.mlp or mlp.training or (x.ndim == 3 and 1 < x.shape[1] <= self.decode_block)
+                or (self.plain_enabled and pack is not None and (type(pack) is not _PackedMoEGateUp or type(pack).__mro__ != _MOE_PACK_MRO))
+                or (type(mlp) in _MOE_GENERATED_CALLS and (type(mlp).__call__, type(mlp).__mro__) != _MOE_GENERATED_CALLS[type(mlp)])
                 or not _bindings_intact(self.bindings)):
             return None
         if type(mlp) not in self.classes:
@@ -4518,22 +5228,35 @@ def _moe_routed_experts(block):
         functions[f"{base.__name__}._combine"] = "fe6e29351fdc9b1e"
     routed_bindings = _resolved_bindings({base.__module__: functions, **_CONV_SILU_CONTRACT})
     native = sys.modules[base.__module__]
-    if routed_bindings is None or type(getattr(mlp, "activation", None)) is not native.SwiGLU:
+    family = getattr(type(block), "_unsloth_router_native", type(block))
+    router = _moe_router_class(family)
+    plain = family.__module__ == "mlx_vlm.models.qwen4_exp.language"
+    bindings = _moe_contract_bindings(bindings, routed_bindings,
+                                     _moe_generated_bindings(router[0]) if router is not None else None,
+                                     _MOE_PACK_BINDINGS if plain else ())
+    if bindings is None or type(getattr(mlp, "activation", None)) is not native.SwiGLU:
         return None
-    return _RoutedExperts(mlp, base, projection_type, native.SwiGLU, decode_block, bindings + routed_bindings)
+    routed = _RoutedExperts(mlp, base, projection_type, native.SwiGLU, decode_block, bindings)
+    routed.plain_enabled = plain
+    routed.verify_enabled = routed.plain_enabled and os.environ.get("UNSLOTH_MLX_VERIFY_MOE", "1") != "0"
+    return routed
 
 
-# MLX multiplies and sums in the array dtype, in route order; the kernel rounds at the same two places.
-# Single precision is left native: its sum does not round like a sequential one.
+# MLX multiplies in the array dtype, then sums the routes in the array dtype over eight lanes (route k into lane k % 8,
+# in order), adding the lanes in order; the kernel rounds at the same places. Single precision is left native.
 _MOE_COMBINE_DTYPES = (mx.bfloat16, mx.float16)
 _MOE_COMBINE_MAX_ELEMENTS = 1 << 32
 _MOE_COMBINE_SOURCE = """
     uint token = thread_position_in_grid.y;
     uint d = thread_position_in_grid.x;
-    T acc = T(0);
+    T lanes[8] = {T(0), T(0), T(0), T(0), T(0), T(0), T(0), T(0)};
     for (uint k = 0; k < K; ++k) {
         uint route = token * K + k;
-        acc = T(float(acc) + float(T(float(y[rows[route] * D + d]) * float(scores[route]))));
+        lanes[k % 8] = T(float(lanes[k % 8]) + float(T(float(y[rows[route] * D + d]) * float(scores[route]))));
+    }
+    T acc = T(0);
+    for (uint lane = 0; lane < 8; ++lane) {
+        acc = T(float(acc) + float(lanes[lane]));
     }
     out[token * D + d] = acc;
 """
@@ -4602,6 +5325,11 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
         if target_verify or self.training or getattr(self, "sharding_group", None) is not None:
             return native(self, x, target_verify) if target_verify else native(self, x)
         normalize = bool(self.norm_topk_prob) if top_k_norm else True
+        experts = getattr(self, "_unsloth_moe_routed", None)
+        if experts is not None and experts.plain_enabled:
+            out = experts.plain(self, x, lambda: native(self, x))
+            if out is not None:
+                return out
         logits = self.gate(x)
         experts = getattr(self, "_unsloth_moe_routed", None)
         # Fold the shared-gate sigmoid into the routing launch only where the routed kernel consumes it.
@@ -4696,9 +5424,16 @@ def _moe_router_class(base):
         return None
     if spec is None or call.__globals__.get("mx") is not mx:
         return None
+    owner = next(cls for cls in base.__mro__ if "__call__" in vars(cls))
+    bindings = _resolved_bindings({owner.__module__: {f"{owner.__name__}.__call__": tuple(_MOE_ROUTER_BODIES)}})
+    if bindings is None or not _bindings_intact(bindings):
+        return None
+    bindings += list(_moe_dispatch_bindings((base,), ("__call__",), follow = False))
     build, mode, experts_path, top_k_path = spec
     patched = type(f"_FusedMoERouter{base.__name__}", (base,),
                    {"__call__": build(call), "_unsloth_router_native": base})
+    _MOE_GENERATED_CALLS[patched] = (patched.__call__, patched.__mro__)
+    _MOE_GENERATED_BINDINGS[patched] = tuple(bindings)
     return patched, mode, experts_path, top_k_path
 
 
@@ -4742,7 +5477,7 @@ def fused_moe_router(model, *, _modules = None):
                             changed.append(module)
                         continue
                     spec = _moe_router_class(base)
-                    if spec is None:
+                    if spec is None or _moe_generated_bindings(spec[0]) is None:
                         continue
                     patched, mode, experts_path, top_k_path = spec
                     experts = _resolve_dotted(module, experts_path)
@@ -7298,6 +8033,20 @@ def _exact_verify_class(base, name, *cache_key):
                   and _VERIFY_STATE.plain_decode and _VERIFY_STATE.tapes is None and _bindings_intact(staged_bindings))
         offload.STAGED_FILLS.fills, offload.STAGED_FILLS.held = ([], []) if staged else (None, None)
         inputs = args[0] if args else kwargs.get("inputs")
+        outer_moe = getattr(_VERIFY_STATE, "plain_moe", None)
+        outer_verifier = getattr(_VERIFY_STATE, "moe_verifier", None)
+        context, valid = (_moe_verifier_matches(self) if _VERIFY_STATE.serving and not _VERIFY_STATE.plain_decode
+                          and os.environ.get("UNSLOTH_MLX_VERIFY_MOE", "1") != "0"
+                          and getattr(inputs, "ndim", 0) == 2 and inputs.shape[0] == 1
+                          and 1 < inputs.shape[1] <= _VERIFY_FUSED_ROWS else (None, False))
+        _VERIFY_STATE.moe_verifier = (self, context, valid)
+        shared = vars(language_model).get("_unsloth_plain_moe_shared")
+        # Shared identities are stable during a forward, and rechecked on every token entry.
+        _VERIFY_STATE.plain_moe = ([shared, shared.version, shared.check()]
+                                  if shared is not None and _VERIFY_STATE.serving and (
+                                      _VERIFY_STATE.plain_decode and getattr(inputs, "shape", None) == (1, 1)
+                                      or os.environ.get("UNSLOTH_MLX_VERIFY_MOE", "1") != "0" and getattr(inputs, "ndim", 0) == 2
+                                      and inputs.shape[0] == 1 and 1 < inputs.shape[1] <= _VERIFY_FUSED_ROWS) else None)
         # Fill before releasing the prefix; later layers can then build while it runs.
         offload.STAGED_FILLS.submit_after = (_staged_submit_window()
                                             if staged and getattr(inputs, "shape", None) == (1, 1) else 0)
@@ -7319,6 +8068,8 @@ def _exact_verify_class(base, name, *cache_key):
             offload.STAGED_FILLS.fills, offload.STAGED_FILLS.held = outer_fills, outer_held
             offload.STAGED_FILLS.submit_after = outer_after
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes, _VERIFY_STATE.plain_decode = outer, outer_tapes, outer_plain
+            _VERIFY_STATE.plain_moe = outer_moe
+            _VERIFY_STATE.moe_verifier = outer_verifier
 
     def taped_gated_delta(self, layer, inputs, mask, cache):
         if getattr(_VERIFY_STATE, "tapes", None) is None:
@@ -7366,6 +8117,16 @@ def _exact_verify_class(base, name, *cache_key):
 
     def routed_feed_forward(self, feed_forward, x):
         experts, mlp = getattr(feed_forward, "_unsloth_moe_routed", None), getattr(feed_forward, "switch_mlp", None)
+        if (experts is not None and experts.plain_enabled and getattr(_VERIFY_STATE, "serving", False)
+                and getattr(_VERIFY_STATE, "plain_decode", False)):
+            out = experts.plain(feed_forward, x, lambda: base._feed_forward(self, feed_forward, x))
+            if out is not None:
+                return out
+        if (experts is not None and experts.verify_enabled and getattr(_VERIFY_STATE, "serving", False)
+                and not getattr(_VERIFY_STATE, "plain_decode", False)):
+            out = experts.verify(feed_forward, x, lambda: base._feed_forward(self, feed_forward, x), self)
+            if out is not None:
+                return out
         projections = [getattr(mlp, name, None) for name in ("gate_proj", "up_proj", "down_proj")]
         # The routed object refuses projections it was not built for; only quantized, frozen ones reach it.
         if (experts is None or x.ndim != 3 or not getattr(_VERIFY_STATE, "serving", False)
@@ -7406,7 +8167,7 @@ def _exact_verify_class(base, name, *cache_key):
     attention_bindings = None if pins is None else _resolved_bindings(pins)
     module = sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier")
     if attention_bindings is None or module is None:
-        return type(f"_ScopedVerify{base.__name__}", (base,), methods)
+        return _moe_verifier_class(type(f"_ScopedVerify{base.__name__}", (base,), methods))
 
     def block_attention(self, attention, x, mask, cache, position_ids, position_embeddings):
         # The native two-row call launches for both rows' keys, so pairs the rows below can mask come here.
@@ -7510,8 +8271,8 @@ def _exact_verify_class(base, name, *cache_key):
             logger.warning("a QSA verify block differs from mlx-vlm's paired verify for %s; the pairs stay in use", key)
         return reference
 
-    return type(f"_ScopedVerify{base.__name__}", (base,),
-                {**methods, "_attention": block_attention, "_qsa_attention": block_qsa_attention})
+    return _moe_verifier_class(type(f"_ScopedVerify{base.__name__}", (base,),
+                {**methods, "_attention": block_attention, "_qsa_attention": block_qsa_attention}))
 
 
 @contextmanager
@@ -7541,6 +8302,14 @@ def _exact_forwards(model, forwards, modules):
                     verifiers.append(target)
                     for module in found.values():
                         module._unsloth_verify_scopes = getattr(module, "_unsloth_verify_scopes", 0) + 1
+                        if family.entry == "__call__":
+                            shared = vars(module).setdefault("_unsloth_plain_moe_shared", _PlainMoEShared())
+                            for _, child in module.named_modules():
+                                experts = vars(child).get("_unsloth_moe_routed")
+                                if experts is not None:
+                                    experts.shared = shared
+                                    if experts.plain_plan is not None:
+                                        experts.plain_plan.share(shared)
                         owners.append(module)
         yield model
     finally:
@@ -7549,7 +8318,9 @@ def _exact_forwards(model, forwards, modules):
                 owner._unsloth_verify_scopes -= 1
                 if not owner._unsloth_verify_scopes:
                     owner.__dict__.pop("_unsloth_verify_scopes", None)
+                    owner.__dict__.pop("_unsloth_plain_moe_shared", None)
                     if any(owner is verifier for verifier in verifiers):
+                        owner.__dict__.pop("_unsloth_moe_verify_context", None)
                         owner.__dict__.pop("_unsloth_verify_layer", None)
                         _layer_verifier(owner, _verifier_native(type(owner)))
 
@@ -8202,10 +8973,10 @@ def _lane_verify_class(base):
     def can_quantized_head(self, linear):
         return not linear.__dict__.get("_unsloth_lane_qmm") and base.can_quantized_head(self, linear)
 
-    return type(f"_LaneVerify{base.__name__}", (base,), {
+    return _moe_verifier_class(type(f"_LaneVerify{base.__name__}", (base,), {
         entry: verify, "_linear": linear, "_linears": linears, "_embedding_as_linear": embedding_as_linear,
         "quantized_linear": quantized_linear, "quantized_argmax": quantized_argmax,
-        "can_quantized_head": can_quantized_head, "_unsloth_lane_verify_native": base})
+        "can_quantized_head": can_quantized_head, "_unsloth_lane_verify_native": base}))
 
 
 _FAST_VERIFY_ENV = "UNSLOTH_MLX_FAST_VERIFY"
@@ -10318,6 +11089,46 @@ def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = N
 _WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17 rows)
 
 
+def _warm_verify_moe(model):
+    """Compile pipelines without caching a plan or settling any real-input verdict."""
+    if (os.environ.get("UNSLOTH_MLX_VERIFY_MOE", "1") == "0"
+            or not getattr(model, "_unsloth_speculates", False)):
+        return
+    language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+    target = getattr(language, "_QWEN4_BATCH_INVARIANT_FORWARD", None)
+    if target is None:
+        return
+    from .generate import generation_mode
+
+    with generation_mode(model, call = ("batch", "speculative")):
+        base = getattr(type(target), "_unsloth_verify_native", None)
+        if base is None:
+            return
+        outer = (getattr(_VERIFY_STATE, "serving", False),
+                 getattr(_VERIFY_STATE, "plain_decode", False))
+        try:
+            _VERIFY_STATE.serving, _VERIFY_STATE.plain_decode = True, False
+            for _, block in model.named_modules():
+                experts = vars(block).get("_unsloth_moe_routed")
+                if experts is None or not experts.verify_enabled:
+                    continue
+                try:
+                    plan = _plain_moe_plan(block, experts, 2)
+                    if plan is None:
+                        continue
+                    for rows in range(2, _VERIFY_FUSED_ROWS + 1):
+                        variant = plan.for_rows(rows)
+                        x = mx.zeros(variant.shape, variant.dtype)
+                        mx.eval(variant.run(x))
+                        mx.eval(base._feed_forward(target, block, x))
+                except (RuntimeError, ValueError, TypeError) as error:
+                    _unless_failed_buffer(error)
+                # Other layer geometries, if any, keep their normal first-use compilation and checks.
+                break
+        finally:
+            _VERIFY_STATE.serving, _VERIFY_STATE.plain_decode = outer
+
+
 def warm_inference(model, int8_prefill = None, ane_prefill = None, fast_verify = None):
     """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
     first-use checks; checks keyed by a request's row count still run then."""
@@ -10327,6 +11138,7 @@ def warm_inference(model, int8_prefill = None, ane_prefill = None, fast_verify =
         model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
                        int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify)
     _warm_qmv_rows(model)
+    _warm_verify_moe(model)
     _warm_verify_gdn(model)
     if speculates:
         from .speculative import warm_speculative_rounds
@@ -10423,3 +11235,13 @@ def _warm_qmv_rows(model):
         for p in {id(p): p for language in served for _, p in language.named_modules()
                   if isinstance(p, nn.QuantizedLinear)}.values():
             _qmv_rows_kernel(p)
+
+
+_MOE_PACK_MRO = _PackedMoEGateUp.__mro__
+_MOE_PACK_METHODS = {name: fn for name, fn in vars(_PackedMoEGateUp).items() if isinstance(fn, FunctionType)}
+_MOE_PACK_BINDINGS = _moe_dispatch_bindings((_PackedMoEGateUp,),
+    (*_moe_dispatch_bindings.__defaults__[0], *_MOE_PACK_METHODS,
+     *(name for fn in _MOE_PACK_METHODS.values() for name in fn.__code__.co_names)))
+_MOE_PACK_BINDINGS += tuple({(id(fn.__globals__), name): (fn.__globals__, name, fn.__globals__[name])
+                            for fn in _MOE_PACK_METHODS.values() for name in fn.__code__.co_names
+                            if name in fn.__globals__}.values())
