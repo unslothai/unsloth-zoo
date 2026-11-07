@@ -19,7 +19,6 @@ streams per mixer site); MODULE_FORWARD_EAGER_REWRITES routes input_norm and the
 unsloth_mhc_projection, which reruns them in backward."""
 
 import importlib
-import inspect
 import textwrap
 
 import pytest
@@ -32,7 +31,6 @@ from unsloth_zoo.compiler import (
     module_forward_source_rewrites,
 )
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
-    MHC_PROJECTION_SOURCE,
     MHC_SINKHORN_SOURCE,
     unsloth_mhc_projection,
 )
@@ -56,8 +54,8 @@ def _mixer(model_type, cls_name, config_type):
 
     modeling = _modeling(model_type)
     cls = getattr(modeling, cls_name, None)
-    if cls is None or MHC_PROJECTION_SOURCE not in inspect.getsource(cls.forward):
-        pytest.skip(f"{cls_name} has a different forward in this transformers")
+    if cls is None:
+        pytest.skip(f"transformers has no {cls_name}")
     config = transformers.AutoConfig.for_model(config_type, hidden_size = 64, hc_mult = 4, hc_sinkhorn_iters = 20)
     torch.manual_seed(0)
     mixer = cls(config)
@@ -93,10 +91,11 @@ def test_registry_rewrite_applies_and_keeps_the_sinkhorn_rewrite(model_type, cls
     modeling = _modeling(model_type)
     if cls_name not in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}):
         pytest.fail(f"{cls_name} missing from MODULE_FORWARD_EAGER_REWRITES")
-    cls = getattr(modeling, cls_name, None)
-    if cls is None or MHC_PROJECTION_SOURCE not in inspect.getsource(cls.forward):
-        pytest.skip(f"{cls_name} has a different forward in this transformers")
-    source = module_forward_eager_rewrites(modeling, model_type)[cls_name]
+    if getattr(modeling, cls_name, None) is None:
+        pytest.skip(f"transformers has no {cls_name}")
+    # A transformers layout no rewrite matches must fail here, not skip.
+    source = module_forward_eager_rewrites(modeling, model_type).get(cls_name)
+    assert source is not None, f"no MHC_PROJECTION_REWRITES layout matches {cls_name}.forward"
     assert "unsloth_mhc_projection(" in source and "self.fn.float()" not in source
     assert source.count(MHC_SINKHORN_SOURCE) == 1
     assert modeling.unsloth_mhc_projection is unsloth_mhc_projection
