@@ -24,6 +24,8 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 _WORKER = """
@@ -63,9 +65,11 @@ full = {k: v.detach().clone() for k, v in model.state_dict().items() if ".lora_"
 # Checked before the Trainer shards the model: that False must not stick.
 early_sharded = vu._lora_is_sharded(model) if hasattr(vu, "_lora_is_sharded") else None
 mesh = init_device_mesh("cpu", (2,))
+# "mixed": the first adapter is left out of FSDP2 (ignored_params), so it stays plain beside DTensors.
+kw = {"ignored_params": {model.layers[0].lora_A.default.weight}} if sys.argv[2] == "mixed" else {}
 for layer in model.layers:
-    fully_shard(layer, mesh = mesh)
-fully_shard(model, mesh = mesh)
+    fully_shard(layer, mesh = mesh, **kw)
+fully_shard(model, mesh = mesh, **kw)
 res = {"helper": hasattr(vu, "_lora_state_dict"), "early_sharded": early_sharded}
 try:
     vu.save_lora(model, os.path.join(out_dir, "lora"))
@@ -101,13 +105,14 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path):
+@pytest.mark.parametrize("layout", ["sharded", "mixed"])
+def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path, layout):
     script = tmp_path / "worker.py"
     script.write_text(textwrap.dedent(_WORKER))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_ALLOW_CPU = "1",
                PYTHONPATH = os.pathsep.join([str(_ROOT), os.environ.get("PYTHONPATH", "")]))
     cmd = [sys.executable, "-m", "torch.distributed.run", "--nnodes", "1", "--nproc-per-node", "2",
-           "--master-addr", "127.0.0.1", "--master-port", str(_free_port()), str(script), str(tmp_path)]
+           "--master-addr", "127.0.0.1", "--master-port", str(_free_port()), str(script), str(tmp_path), layout]
     r = subprocess.run(cmd, env = env, capture_output = True, text = True, timeout = 300, cwd = tmp_path)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     for rank in range(2):
