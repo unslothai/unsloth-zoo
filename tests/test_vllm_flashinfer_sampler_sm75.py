@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""load_vllm must not set VLLM_USE_FLASHINFER_SAMPLER=1 on sm_75 from vLLM 0.24: it raises at engine init when the
-variable is explicitly set and FlashInfer rejects the GPU (T4 is sm_75); AST-based, no GPU."""
+"""load_vllm must not force VLLM_USE_FLASHINFER_SAMPLER=1 where vLLM's own capability check rejects FlashInfer
+(sm_75 from vLLM 0.24): vLLM then raises at engine init instead of falling back. AST-based, no GPU."""
 
 import ast
 import importlib
@@ -41,15 +41,15 @@ def _sets_sampler(stmt, value):
     )
 
 
-def _sampler_env(major_version, vllm_version):
-    """Runs load_vllm's own sampler if-chain with the given GPU major and vLLM version and returns what it sets."""
+def _sampler_env(major_version, vllm_version, inherited = None):
+    """Runs load_vllm's own sampler if-chain; returns the variable it leaves (None = unset)."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(vllm_utils.load_vllm)))
     chain = next(
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.If) and any(_sets_sampler(stmt, "1") for stmt in node.body)
     )
-    env = {}
+    env = {} if inherited is None else {"VLLM_USE_FLASHINFER_SAMPLER": inherited}
     exec(
         compile(ast.Module(body = [chain], type_ignores = []), "<sampler chain>", "exec"),
         {
@@ -59,20 +59,47 @@ def _sampler_env(major_version, vllm_version):
             "vllm_version": vllm_version,
         },
     )
-    return env["VLLM_USE_FLASHINFER_SAMPLER"]
+    return env.get("VLLM_USE_FLASHINFER_SAMPLER")
 
 
-@pytest.mark.parametrize("vllm_version", ["0.10.0", "0.24.0", "0.26.0", "0.33.0"])
-def test_sampler_stays_off_on_sm75_where_flashinfer_rejects_it(vllm_version):
-    assert _sampler_env(7, vllm_version) == "0"
+def _vllm_sampler_init(value, major_version, vllm_version):
+    """vLLM >= 0.21 TopKTopPSampler gate: default on, FlashInferBackend floor sm_75 before 0.24 and sm_80 after,
+    RuntimeError when the variable is set but the capability is rejected."""
+    if value is not None and not int(value):
+        return "native"
+    floor = 8 if Version(vllm_version) >= Version("0.24.0") else 7
+    if major_version >= floor:
+        return "flashinfer"
+    if value is not None:
+        raise RuntimeError("FlashInfer top-p/top-k sampling unavailable: unsupported compute capability")
+    return "native"
 
 
-@pytest.mark.parametrize("vllm_version", ["0.11.0", "0.20.0", "0.23.2"])
-def test_sampler_is_still_on_for_sm75_before_vllm_0_24(vllm_version):
+@pytest.mark.parametrize("inherited", [None, "1", "0"])
+@pytest.mark.parametrize("vllm_version", ["0.21.0", "0.23.0", "0.24.0", "0.26.0", "0.33.0", "0.26.0+cu130"])
+@pytest.mark.parametrize("major_version", [7, 8, 9, 10, 12])
+def test_engine_init_never_raises_from_vllm_0_21(major_version, vllm_version, inherited):
+    value = _sampler_env(major_version, vllm_version, inherited)
+    used = _vllm_sampler_init(value, major_version, vllm_version)
+    floor = 8 if Version(vllm_version) >= Version("0.24.0") else 7
+    assert used == ("flashinfer" if major_version >= floor else "native")
+
+
+@pytest.mark.parametrize("vllm_version", ["0.24.0", "0.26.0", "0.33.0"])
+def test_sm75_leaves_the_choice_to_vllm(vllm_version):
+    assert _sampler_env(7, vllm_version, inherited = "1") is None
+
+
+@pytest.mark.parametrize("vllm_version", ["0.11.0", "0.15.0", "0.20.0"])
+def test_sm75_still_opts_in_before_vllm_default_on(vllm_version):
     assert _sampler_env(7, vllm_version) == "1"
 
 
+def test_sm75_before_0_11_stays_off():
+    assert _sampler_env(7, "0.10.2") == "0"
+
+
 @pytest.mark.parametrize("major_version", [8, 9, 10, 12])
-@pytest.mark.parametrize("vllm_version", ["0.10.0", "0.26.0"])
-def test_sampler_is_on_from_sm80(major_version, vllm_version):
+@pytest.mark.parametrize("vllm_version", ["0.10.0", "0.20.0", "0.26.0"])
+def test_sm80_plus_unchanged(major_version, vllm_version):
     assert _sampler_env(major_version, vllm_version) == "1"
