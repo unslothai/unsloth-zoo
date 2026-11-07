@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import collections
 import copy
 import functools
 import importlib
@@ -1009,12 +1010,34 @@ def _draw_rows(keys, logprobs, temperature):
     import mlx.core as mx
 
     pairs = mx.vmap(mx.random.split)(keys)
+    if not _row_reductions_match(*logprobs.shape):
+        drawn = [mx.random.categorical(logprobs[row:row + 1] * (1 / temperature), key=pairs[row, 1])
+                 for row in range(logprobs.shape[0])]
+        return pairs[:, 0], mx.concatenate(drawn).astype(mx.uint32)
     logits = (logprobs * (1 / temperature)).astype(mx.float32)
     top = logits.max(axis=-1, keepdims=True)
     weights = mx.where(mx.isinf(top), (logits == top).astype(mx.float32), mx.exp(logits - top))
     noise = mx.vmap(lambda key: mx.random.uniform(shape=(1,), key=key))(pairs[:, 1])
     below = mx.cumsum(weights, axis=-1, inclusive=False) <= noise * weights.sum(axis=-1, keepdims=True)
     return pairs[:, 0], (below.sum(axis=-1) - 1).astype(mx.uint32)
+
+
+@functools.cache
+def _row_reductions_match(rows: int, n: int) -> bool:
+    """Whether the device reduces each row of a ``[rows, n]`` array bitwise as one-row categorical reduces it alone:
+    Metal can pick another summation order per shape, and at vocab scale that moves sampled tokens."""
+    import mlx.core as mx
+
+    x = mx.random.normal((rows, n), key=mx.random.key(0))
+    weights = mx.exp(x - x.max(axis=-1, keepdims=True))
+    together = (x.max(axis=-1), weights.sum(axis=-1), mx.cumsum(weights, axis=-1, inclusive=False))
+    for row in range(rows):
+        alone = (x[row:row + 1] * 1.0).reshape(-1)
+        alone_weights = mx.exp(alone - alone.max())
+        for batched, single in zip(together, (alone.max(), alone_weights.sum(), mx.cumsum(alone_weights, 0, inclusive=False))):
+            if not mx.array_equal(batched[row], single).item():
+                return False
+    return True
 
 
 @functools.cache
@@ -1867,6 +1890,7 @@ class _PendingResult:
                 break
         del self.token_ids[keep:]
         del self.logprobs[keep:]
+        del self.logprob_values[keep:]
         self.text = _replay_stream_text(self.detokenizer, self.token_ids)
         self.released = min(self.released, len(self.text))
         self.finish_reason = "stop_string"
@@ -2153,31 +2177,27 @@ class _TextBatchSession:
         )
         return ids[-1:], ids[:-1], cache
 
-    def prefill_prompts(self, requests, alone=False) -> dict:
-        """``(last token, prompt before it, its cache)`` of every text prompt several requests share, prefilled once as
-        a one-row batch prefills it, or of every prompt when ``alone``; rows only merge these caches, never update them."""
-        import mlx.core as mx
-        from mlx_lm.models.cache import make_prompt_cache
-
+    def prefix_counts(self, requests, alone=False) -> dict:
+        """Rows per text prompt worth prefilling once: shared by several rows, or every prompt when ``alone``."""
         counts = {}
         for request in requests:
             if request.image is None:
                 key = tuple(_encode_prompt(self.adapter.tokenizer, request))
                 counts[key] = counts.get(key, 0) + 1
+        return {ids: count for ids, count in counts.items() if (alone or count > 1) and len(ids) >= 2}
+
+    def prefill_prompt(self, ids) -> tuple:
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+
         step = getattr(self.generator, "prefill_step_size", None) or 2048
-        shared = {}
         with mx.stream(importlib.import_module("mlx_lm.generate").generation_stream):
-            for ids, count in counts.items():
-                wanted = alone or count > 1
-                if not wanted or len(ids) < 2:
-                    continue
-                fresh = make_prompt_cache(self.adapter.model, self.adapter.defaults.max_kv_size)
-                cache = [entry.merge([entry]) for entry in fresh]
-                for start in range(0, len(ids) - 1, step):
-                    self.adapter.model(mx.array([ids[start:min(start + step, len(ids) - 1)]]), cache=cache)
-                    mx.eval([entry.state for entry in cache])
-                shared[ids] = (list(ids[-1:]), list(ids[:-1]), [entry.extract(0) for entry in cache])
-        return shared
+            fresh = make_prompt_cache(self.adapter.model, self.adapter.defaults.max_kv_size)
+            cache = [entry.merge([entry]) for entry in fresh]
+            for start in range(0, len(ids) - 1, step):
+                self.adapter.model(mx.array([ids[start:min(start + step, len(ids) - 1)]]), cache=cache)
+                mx.eval([entry.state for entry in cache])
+            return list(ids[-1:]), list(ids[:-1]), [entry.extract(0) for entry in cache]
 
     def cancel(self, row: int) -> bool:
         return self._take_back(row) is not None
@@ -2288,12 +2308,30 @@ class _TextBatchAdapter:
         active_error = None
         try:
             alone = getattr(self.model, "prefill_alone", False)
-            shared = session.prefill_prompts(requests, alone) if self.defaults.share_prompt_prefill or alone else {}
-            for request in requests:
-                key = tuple(_encode_prompt(self.tokenizer, request)) if shared and request.image is None else None
-                session.add(request, shared.get(key))
+            left = session.prefix_counts(requests, alone) if self.defaults.share_prompt_prefill or alone else {}
+            # Prefixes are prefilled as their first row joins and dropped after their last, so only rows the decode
+            # batch can hold keep one alive.
+            window = max(1, int(self.defaults.completion_batch_size)) if left else len(requests)
+            pending, prefixes = collections.deque(requests), {}
+
+            def admit():
+                while pending and session.rows_in_flight < window:
+                    request = pending.popleft()
+                    key = tuple(_encode_prompt(self.tokenizer, request)) if left and request.image is None else None
+                    if key not in left:
+                        session.add(request)
+                        continue
+                    if key not in prefixes:
+                        prefixes[key] = session.prefill_prompt(key)
+                    session.add(request, prefixes[key])
+                    left[key] -= 1
+                    if not left[key]:
+                        del prefixes[key]
+
+            admit()
             while session.rows_in_flight:
                 yield from session.step()
+                admit()
         except BaseException as exc:
             active_error = exc
             raise

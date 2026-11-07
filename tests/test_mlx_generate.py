@@ -2377,3 +2377,68 @@ def test_target_head_runs_more_rows_than_one_lane_launch_in_fp32_launches(monkey
     del head.__dict__["_unsloth_lane_qmm_ready"][(1, 8, 64)]
     launches.clear()
     assert fp32(x).dtype == mx.bfloat16 and launches == [32]
+
+
+def test_stop_string_trims_device_logprobs_with_the_tokens():
+    tokenizer = _CharTokenizer()
+    pending = _PendingResult(_new_detokenizer(tokenizer), _StopStringScanner(("<STOP>",)))
+    for token, value in ((1, "a"), (2, "b"), (3, "c")):
+        pending.append(tokenizer, token, -0.1, value)
+    assert pending.token_ids == [1] and pending.logprob_values == ["a"]
+
+
+def test_shared_prefixes_live_only_while_their_rows_can_decode(monkeypatch):
+    from unsloth_zoo.mlx import generate as engine
+
+    unfinished, peak, added = {}, [0], []
+
+    class Session:
+        prefix_counts = engine._TextBatchSession.prefix_counts
+
+        def __init__(self, adapter):
+            self.adapter, self.rows = adapter, []
+
+        rows_in_flight = property(lambda self: len(self.rows))
+
+        def prefill_prompt(self, ids):
+            unfinished[ids] = 2
+            peak[0] = max(peak[0], len(unfinished))
+            return ids
+
+        def add(self, request, prefix=None):
+            added.append((tuple(request.prompt_token_ids), prefix))
+            self.rows.append(prefix)
+
+        def step(self):
+            done = self.rows.pop(0)
+            unfinished[done] -= 1
+            if not unfinished[done]:
+                del unfinished[done]
+            return iter(())
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(engine, "_TextBatchSession", Session)
+    adapter = _TextBatchAdapter.__new__(_TextBatchAdapter)
+    adapter.model, adapter.tokenizer = types.SimpleNamespace(), _CharTokenizer()
+    adapter.defaults = GenerationDefaults(share_prompt_prefill=True, completion_batch_size=4, prefill_batch_size=1)
+    requests = [GenerationRequest(prompt_token_ids=(p, p + 1)) for p in range(10, 26) for _ in range(2)]
+    list(adapter.stream(requests))
+    assert added == [(tuple(r.prompt_token_ids),) * 2 for r in requests] and not unfinished and peak[0] <= 3
+
+
+@pytest.mark.skipif(importlib.util.find_spec("mlx") is None, reason="needs real mlx.random")
+@pytest.mark.parametrize("rows_reduce_alike", [True, False])
+def test_batched_draws_match_per_row_samplers_on_either_reduction_route(monkeypatch, rows_reduce_alike):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import generate as engine
+
+    monkeypatch.setattr(engine, "_row_reductions_match", lambda rows, n: rows_reduce_alike)
+    logprobs = mx.random.normal((3, 4096), key=mx.random.key(1)) * 3
+    params = [SamplingParams(temperature=0.9, seed=seed) for seed in (2, 5, 9)]
+    alone = [engine._seeded_sampler(None, row) for row in params]
+    keys = mx.stack([mx.random.key(row.seed) for row in params])
+    for _ in range(20):
+        keys, drawn = engine._draw_rows(keys, logprobs, 0.9)
+        assert drawn.tolist() == [alone[row](logprobs[row:row + 1]).item() for row in range(3)]
