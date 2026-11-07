@@ -1238,15 +1238,21 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
     )
     trainer._is_vlm = True
 
-    def fake_value_and_grad(model, _loss_fn):
+    def fake_value_and_grad(model, loss_fn):
         params = model.trainable_parameters()
 
-        def wrapped(_model, batch_data, *_rest):
-            consumed.append(batch_data["input_ids"].tolist())
-            return (mx.array(1.0), mx.array(4)), tree_map(mx.zeros_like, params)
+        def wrapped(*args):
+            training.append(True)
+            try:
+                return loss_fn(*args), tree_map(mx.zeros_like, params)
+            finally:
+                training.pop()
 
         return wrapped
 
+    training = []  # a training step's loss, not an evaluation's
+    monkeypatch.setattr(trainer_mod, "make_vlm_baseline_loss_fn", lambda *_a, **_k: lambda _model, batch_data, *_rest: (
+        training and consumed.append(batch_data["input_ids"].tolist())) or (mx.array(1.0), mx.array(4)))
     monkeypatch.setattr(nn, "value_and_grad", fake_value_and_grad)
     monkeypatch.setattr(trainer_mod.nn, "value_and_grad", fake_value_and_grad)
 

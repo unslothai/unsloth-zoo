@@ -777,11 +777,14 @@ def test_text_trainer_bounds_compiled_signatures_and_unpads_fallback(
         from mlx.utils import tree_map
 
         def wrapped(*args):
-            executed_widths.add(int(args[1].shape[-1]))
             return fn(*args), tree_map(mx.zeros_like, model.trainable_parameters())
 
         return wrapped
 
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    baseline = trainer_mod.make_baseline_loss_fn
+    monkeypatch.setattr(trainer_mod, "make_baseline_loss_fn", lambda *a, **k: (lambda loss: lambda model, batch, *rest: (
+        executed_widths.add(int(batch.shape[-1])) or loss(model, batch, *rest)))(baseline(*a, **k)))
     monkeypatch.setattr(mx, "compile", compile_spy)
     monkeypatch.setattr(nn, "value_and_grad", value_and_grad_with_aux)
     args = MLXTrainingConfig(

@@ -3135,7 +3135,7 @@ def _logit_totals(sums, mask, vocab):
 def _reference_scorer(reference_policy, scorer, **options):
     """The reference forward's scorer: the policy's own under adapter overrides, else one built for ref_model, whose
     head need not match; None without a policy scorer."""
-    if scorer is None or reference_policy is None or reference_policy.model is None:
+    if scorer is None or getattr(reference_policy, "model", None) is None:
         return scorer
     return _make_preference_cce_scorer(reference_policy.model, **options)
 

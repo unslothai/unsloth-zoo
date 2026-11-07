@@ -643,8 +643,10 @@ from .grpo import (
     create_grpo_batch_plan,
     create_grpo_eval_plan,
     format_completions,
+    grpo_layout_options,
     grpo_objective,
     grpo_reward_funcs,
+    grpo_sample_weighting,
     grpo_sampling,
     make_grpo_cce_loss_fn,
     make_grpo_eval_fn,
@@ -1672,6 +1674,8 @@ class MLXTrainingConfig:
             "num_completions_to_print",
             "use_vllm",
             "use_liger_loss",
+            "zero_variance_exclude",
+            "loss_aggregation",
             "rollout_logprobs_as_old",
             "cpo_alpha",
             "simpo_gamma",
@@ -1846,6 +1850,9 @@ class MLXGRPOConfig(MLXTrainingConfig):
     num_completions_to_print: int | None = field(default=None, kw_only=True)
     use_vllm: bool = field(default=False, kw_only=True)
     use_liger_loss: bool = field(default=False, kw_only=True)
+    # ScaleRL options; None reads CUDA Unsloth's UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE / UNSLOTH_GRPO_LOSS_AGGREGATION.
+    zero_variance_exclude: bool | None = field(default=None, kw_only=True)
+    loss_aggregation: str | None = field(default=None, kw_only=True)
     rollout_logprobs_as_old: bool | None = field(default=None, kw_only=True)
 
     def __init__(self, *args, **kwargs):
@@ -2375,6 +2382,7 @@ def _plan_text_shapes_for_cut(
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
     vision_preference = isinstance(batches, VisionPreferenceBatches)
+    vision_grpo = is_vlm and isinstance(batches, GRPOBatchPlan)
     strict = compile_policy.mode == "strict"
     if vision_preference:
         # The vision SFT planner's gates; the trainer reports an unqualified arch.
@@ -2389,11 +2397,19 @@ def _plan_text_shapes_for_cut(
         strict = _effective_compile_mode(
             compile_policy, vlm_compile_decision,
         ) == "strict"
-    elif is_vlm and isinstance(batches, GRPOBatchPlan):
-        # Its vision inputs come only with each rollout, so no family is named ahead.
-        return None, _shape_guard_report(
-            "not_applicable", "grpo_vision_eager", cap,
-        ), False, None
+    elif vision_grpo:
+        # A qualified arch on one process, its micro-steps' vision families surveyed ahead of the rollouts; a family that
+        # drifts at runtime falls back to eager rather than aborting, so strict never raises here.
+        if not (
+            compile_policy.mode != "eager"
+            and getattr(vlm_compile_decision, "enabled", False)
+            and distributed_world_size <= 1
+            and batches.ensure_descriptors()
+        ):
+            return None, _shape_guard_report(
+                "not_applicable", "grpo_vision_eager", cap,
+            ), False, None
+        strict = False
     elif is_vlm:
         return _plan_single_process_vlm_shapes(
             batches,
@@ -2501,7 +2517,7 @@ def _plan_text_shapes_for_cut(
             frontier,
             # Media families keep their own endpoints, so padding buys no reuse.
             exact_signature_threshold=(
-                AUTOMATIC_TEXT_COMPILE_CEILING if vision_preference else None
+                AUTOMATIC_TEXT_COMPILE_CEILING if vision_preference or vision_grpo else None
             ),
         )
     else:
@@ -5979,6 +5995,8 @@ class MLXTrainer:
                 ),
                 vlm_compile_decision=getattr(self, "_compile_decision", None),
             )
+            if isinstance(batches, GRPOBatchPlan):
+                batches.release_unplanned_descriptors()
         if isinstance(batches, FiniteTextBatchPlan):
             batches.configure_cce_compaction(
                 getattr(loss_fn, "_unsloth_cce_compaction", False),
@@ -6362,6 +6380,8 @@ class MLXTrainer:
                 batches.configure_cce_compaction(
                     getattr(loss_fn, "_unsloth_cce_compaction", False), kind=preference_kind,
                 )
+            elif isinstance(batches, GRPOBatchPlan):
+                batches.configure_cce_compaction(getattr(loss_fn, "_unsloth_cce_compaction", False))
         # GRPO scores its reference when it generates, outside the compiled step.
         _reference_compile_state = (
             [] if _sampling_reference is None or preference_kind == "grpo"
@@ -6388,13 +6408,7 @@ class MLXTrainer:
                 step_compiled=lambda: _use_compile,
             )
 
-        # Build loss+grad function — returns ((loss, ntoks), grads)
-        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
         _compiled_loss_fn = getattr(loss_fn, "_unsloth_compiled_loss_fn", None)
-        _compiled_loss_and_grad_fn = (
-            nn.value_and_grad(model, _compiled_loss_fn)
-            if _compiled_loss_fn is not None else None
-        )
 
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
@@ -6658,13 +6672,15 @@ class MLXTrainer:
 
         def _loss_and_grad(batch_data):
             compute = (
-                _compiled_loss_and_grad_fn
-                if _use_compile and _compiled_loss_and_grad_fn is not None
-                else loss_and_grad_fn
+                _compiled_loss_fn
+                if _use_compile and _compiled_loss_fn is not None
+                else loss_fn
             )
-            if isinstance(batch_data, dict):
-                return compute(model, batch_data)
-            return compute(model, *batch_data)
+            batch = (batch_data,) if isinstance(batch_data, dict) else batch_data
+            # Only trainable parameters are traced: any array argument, the model's frozen weights or the batch, would
+            # make mx.compile helpers in a frozen vision tower (Gemma 4's attention) skip their cached graphs, unlike
+            # GRPO's old log-probs.
+            return nn.value_and_grad(model, lambda: compute(model, *batch))()
 
         def _accumulate_weighted_grad(grad, toks_f, prev_state):
             """Accumulate token-weighted grads without distributed collectives."""
@@ -6724,6 +6740,19 @@ class MLXTrainer:
             grad = tree_map(mx.stop_gradient, grad)
             toks_f = toks_f + 0  # see _local_grad_step
             return lvalue, toks, stats, (grad, toks_f), None
+
+        def _skipped_grpo_step(stats, prev_state, do_update):
+            """step_fn for a GRPO micro-step whose gradient is exactly zero: it still counts its one micro-step."""
+            toks = mx.array(1, dtype=mx.int32)
+            if prev_state is None:
+                grad, toks_f = tree_map(mx.zeros_like, model.trainable_parameters()), toks.astype(mx.float32)
+            else:
+                grad, toks_f = prev_state[0], prev_state[1] + 1
+            loss, stats = mx.array(0.0, dtype=mx.float32), mx.array(stats)
+            if not do_update:
+                return loss, toks, stats, (grad, toks_f), None
+            update = _apply_update_direct if _direct_single_step_update else _apply_update
+            return loss, toks, stats, None, update(grad, toks_f)
 
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = (
@@ -7080,7 +7109,7 @@ class MLXTrainer:
                             mask_truncated_completions=args.mask_truncated_completions,
                             with_reference=self._uses_reference(args),
                             max_prompt_length=args.max_prompt_length, seed=args.seed,
-                            **self._grpo_vision_options(),
+                            sample_weighting=grpo_sample_weighting(args), **self._grpo_vision_options(),
                         )
                         plan.bind(
                             model, self.reward_funcs, trainer_state=self.state,
@@ -8362,6 +8391,7 @@ class MLXTrainer:
 
             batch_error = None
             batch_data = None
+            _grpo_skip = None
             _stream_eager_batch = False
             try:
                 if batch_iter is not None:
@@ -8399,6 +8429,9 @@ class MLXTrainer:
                         batch_data = batches.prepare_cce_batch(
                             scheduled_index, batch_data,
                         )
+                    elif isinstance(batches, GRPOBatchPlan):
+                        _grpo_skip = batches.skipped_stats(scheduled_index)
+                        _stream_eager_batch = _use_compile and batches.runs_eager(scheduled_index)
                     batch_idx += 1
             except BaseException as e:
                 batch_error = e
@@ -8410,6 +8443,21 @@ class MLXTrainer:
                 )
             elif batch_error is not None:
                 raise batch_error
+            _drift = batches.pop_family_drift() if isinstance(batches, GRPOBatchPlan) else None
+            if _drift is not None and _use_compile:
+                # Single process only (the planner admits no other); the batch in hand is already at its planned width.
+                _main_print(
+                    f"Unsloth: a GRPO vision batch left its surveyed compile family ({_drift}); "
+                    "training continues eagerly."
+                )
+                step_fn = _uncompiled_step_fn
+                _use_compile = False
+                _compile_scope = "fallback_eager"
+                _compile_fallback_reason = "grpo_vision_family_drift"
+                state = [
+                    model.state, optimizer.state, mx.random.state,
+                    *_reference_compile_state,
+                ]
 
             # A stream is surveyed only by the one batch the peek looked at, so
             # audio appearing later must be caught here rather than at the
@@ -8554,7 +8602,11 @@ class MLXTrainer:
                 _fire("on_pre_optimizer_step")
                 self._distributed_should_stop()
 
-            if _ddp_update_outside_step:
+            if _grpo_skip is not None:
+                lvalue, toks, stats, grad_accum_state, grad_norm = _skipped_grpo_step(
+                    _grpo_skip, grad_accum_state, do_update,
+                )
+            elif _ddp_update_outside_step:
                 lvalue, toks, stats, grad_accum_state, grad_norm = _run_ddp_local_step(
                     batch_data, grad_accum_state, do_update,
                 )
@@ -10031,7 +10083,10 @@ class MLXGRPOTrainer(MLXTrainer):
             max_prompt_length=args.max_prompt_length, shuffle=args.shuffle_dataset,
             seed=args.seed, num_batches=num_batches, num_epochs=num_epochs,
             rollout_logprobs_as_old=args.rollout_logprobs_as_old,
-            **self._grpo_vision_options(),
+            **self._grpo_vision_options(), **grpo_layout_options(
+                grpo_objective(args), distributed=getattr(self, "distributed_world_size", 1) > 1,
+            ),
+            sample_weighting=grpo_sample_weighting(args),
         )
         # A resumed run generates at once, so its widths are planned from there.
         resume = getattr(self, "_resume_from_checkpoint", None)

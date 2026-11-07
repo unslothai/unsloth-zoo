@@ -18,6 +18,8 @@
 patches it on CUDA (unsloth_zoo.rl_replacements.grpo_compute_loss)."""
 
 import copy
+import hashlib
+import math
 import os
 import sys
 import warnings
@@ -45,15 +47,23 @@ from .utils import (
     _finite_batch_schedule,
     _finite_text_pad_width,
     _get_processor_tokenizer,
+    _mlx_rng_key,
     _length_dependent_ropes,
     _normalize_mlx_messages,
     _normalize_seed,
     _prepare_vlm_batch_for_compile,
+    _preserved_preprocessing_rng,
+    _restore_mlx_rng_key,
     _processor_vlm_inputs,
     _right_pad_vlm_rows,
     _row_contiguous_cross_entropy,
     _to_mx_vlm_batch,
+    _vlm_batch_family,
+    _vlm_family_divergence,
+    _vlm_family_is_plannable,
+    _vlm_pipeline_disposable_keys,
     _vlm_token_aligned_sidecars,
+    _vlm_width_survey,
     encode_mlx_text,
 )
 
@@ -196,6 +206,21 @@ def group_advantages(rewards_per_func, reward_weights, num_generations, scale_re
     }
 
 
+def scalerl_sample_weights(rewards, num_generations, lengths, exclude, prompt_level):
+    """Unsloth's ScaleRL per-completion loss weights for one generation, and the fraction of groups excluded: zero-variance
+    exclusion drops groups of equal rewards from the loss and its token count; prompt-level aggregation averages tokens
+    within each group, then over groups."""
+    groups = rewards.reshape(-1, num_generations)
+    keep = ~np.isclose(groups.std(axis=1, ddof=1), 0.0) if exclude else np.ones(len(groups), dtype=bool)
+    rows = np.repeat(keep, num_generations).astype(np.float64)
+    tokens = (lengths * rows).reshape(-1, num_generations).sum(axis=1)
+    if prompt_level:
+        weights = rows / (np.repeat(np.maximum(tokens, 1.0), num_generations) * max(int(keep.sum()), 1))
+    else:
+        weights = rows / max(float(tokens.sum()), 1.0)
+    return weights.astype(np.float32), float(1.0 - keep.mean())
+
+
 def completion_logps(model, batch, temperature):
     """Per-token log probabilities of the batch's ids after the first, on logits divided by the sampling temperature as TRL scores them."""
     logits = _preference_logits(model, batch).astype(mx.float32)
@@ -208,25 +233,65 @@ def completion_logps(model, batch, temperature):
 
 
 def grpo_logps(temperature, scorer=None, *, differentiated):
-    """(model, batch, lengths) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature; scores response positions only, zero elsewhere; differentiated=False keeps the scorer on its loss-only kernel."""
+    """(model, batch, lengths, indices=None) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature over the flat positions in indices; zero outside the response; differentiated=False keeps the scorer on its loss-only kernel."""
     if scorer is None:
-        return lambda model, batch, _lengths: completion_logps(model, batch, temperature)
+        return lambda model, batch, _lengths, _indices=None: completion_logps(model, batch, temperature)
 
-    def logps(model, batch, lengths):
+    def logps(model, batch, lengths, indices=None):
         supervised = _response_mask(_preference_ids(batch)[:, 1:], lengths) > 0
-        return -scorer(model, batch, supervised, logit_sums=False, differentiated=differentiated)[0]
+        return -scorer(model, batch, supervised, indices, logit_sums=False, differentiated=differentiated)[0]
 
     return logps
+
+
+def grpo_cce_capacity(rows, width, min_prompt, max_completion):
+    """Most completion positions a micro-batch at width holds, rounded up to 256 (a pure function of the shape, so no new compile key); None when that saves nothing."""
+    count = rows * max(0, min(width - min_prompt, max_completion))
+    capacity = max(256, -(-count // 256) * 256)
+    return capacity if capacity < rows * (width - 1) else None
+
+
+def grpo_cce_indices(lengths, width, capacity):
+    """Flat ``rows * (width - 1)`` positions predicting completion tokens, padded with -1."""
+    selected = [
+        row * (width - 1) + step - 1
+        for row, (prompt, end) in enumerate(lengths) for step in range(max(1, int(prompt)), int(end))
+    ]
+    indices = np.full(capacity, -1, dtype=np.int32)
+    indices[:len(selected)] = selected
+    return indices
 
 
 def _scored_as_step(logps, step_compiled):
     """Score as the training step's forward, which MLX runs differently under its trace."""
 
-    def traced(model, batch, lengths):
-        if step_compiled():
-            run = lambda anchor: (anchor, logps(model, batch, lengths))
-            return mx.value_and_grad(run)(mx.array(0.0))[0][1]
-        run = lambda: (mx.array(0.0), logps(model, batch, lengths))
+    toggles, compiled, failed = {}, {}, []
+
+    def traced(model, batch, lengths, indices=None):
+        if step_compiled() and not failed:
+            # Compiled like the step: its fused kernels differ from the eager ones in some vision towers (Qwen3.5's).
+            # A trace keeps its model and the Python numbers it read, such as the adapter scales a reference turns
+            # off, so each model and setting of them gets its own; the random state is threaded, as in the step.
+            if id(model) not in toggles:
+                toggles[id(model)] = [
+                    (module, name) for _, module in model.named_modules()
+                    for name in ("scale", "_neftune_noise_enabled")
+                    if isinstance(getattr(module, name, None), (bool, int, float))
+                ]
+            key = (id(model), *(getattr(module, name) for module, name in toggles[id(model)]))
+            rng = _mlx_rng_key()
+            try:
+                if key not in compiled:
+                    run = lambda batch, lengths, indices: mx.value_and_grad(
+                        lambda anchor: (anchor, logps(model, batch, lengths, indices)))(mx.array(0.0))[0][1]
+                    compiled[key] = mx.compile(run, inputs=[model.state, mx.random.state], outputs=[mx.random.state])
+                return compiled[key](batch, lengths, indices)
+            except Exception as error:
+                # Scoring runs while a batch is fetched, outside the step's compile fallback: score eagerly instead.
+                failed.append(error)
+                _restore_mlx_rng_key(rng)
+                warnings.warn(f"Unsloth: compiling GRPO scoring failed ({error}); scoring eagerly.", RuntimeWarning)
+        run = lambda: (mx.array(0.0), logps(model, batch, lengths, indices))
         return nn.value_and_grad(model, run)()[0][1]
 
     return traced
@@ -262,10 +327,13 @@ def grpo_terms(objective, new, advantages, mask, *, old=None, ref=None):
     return per_token, kl, coef_1
 
 
-def _reduce(objective, per_token, mask, normalizers):
-    """k times Unsloth's micro-step loss, k the window's micro-step count (it cancels); the trainer averages micro-step gradients while TRL sums them."""
+def _reduce(objective, per_token, mask, normalizers, weights=None):
+    """k times Unsloth's micro-step loss, k the window's micro-step count (it cancels); the trainer averages micro-step
+    gradients while TRL sums them; sample weights replace every loss type's normalizer, as Unsloth's do."""
     steps_per_generation, generation_tokens = normalizers[0], normalizers[1]
     masked = per_token * mask
+    if weights is not None:
+        return steps_per_generation * (masked * weights[:, None]).sum()
     if objective.loss_type == "grpo":
         return (masked.sum(-1) / mx.maximum(mask.sum(-1), mx.array(1.0))).mean()
     if objective.loss_type == "dr_grpo":
@@ -308,21 +376,23 @@ def grpo_metric_values(summed):
 
 
 def make_grpo_loss_fn(objective, *, scorer=None, differentiated=True):
-    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps); kept zeroes rows TRL masks as truncated."""
+    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps, cce_indices, sample weights); kept zeroes rows TRL masks as truncated."""
     logps = grpo_logps(objective.temperature, scorer, differentiated=differentiated)
 
-    def loss_fn(model, batch, lengths, normalizers, advantages, kept, old=None, ref=None):
-        new = logps(model, batch, lengths)
+    def loss_fn(
+        model, batch, lengths, normalizers, advantages, kept, old=None, ref=None, cce_indices=None, weights=None,
+    ):
+        new = logps(model, batch, lengths, cce_indices)
         mask = _response_mask(_preference_ids(batch)[:, 1:], lengths) * kept[:, None].astype(mx.float32)
         per_token, kl, coef_1 = grpo_terms(objective, new, advantages, mask, old=old, ref=ref)
-        loss = _reduce(objective, per_token, mask, normalizers)
+        loss = _reduce(objective, per_token, mask, normalizers, weights)
         return loss, mx.array(1, dtype=mx.int32), grpo_stats(objective, kl, coef_1, advantages, mask)
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
     loss_fn._unsloth_preference_metrics = GRPO_LOSS_METRICS
     loss_fn._unsloth_preference_stats_width = GRPO_STATS_WIDTH
     loss_fn._unsloth_preference_report = grpo_metric_values
-    loss_fn._unsloth_cce_compaction = False
+    loss_fn._unsloth_cce_compaction = bool(getattr(scorer, "compaction", False))
     loss_fn._unsloth_grpo_scorer = scorer
     if scorer is not None:
         loss_fn._unsloth_cce_backend = "runtime-cce"
@@ -678,6 +748,54 @@ class _RepeatSamplerOrder:
         return self._orders[epoch]
 
 
+def grpo_row_layout(order, block, key, classes=None):
+    """order with each run of block rows stably sorted by key; a block is the rows of micro-steps that always share an
+    optimizer step, so every step trains the same rows."""
+    if classes is None:
+        return np.concatenate([
+            sorted(order[start:start + block], key=key) for start in range(0, len(order), block)
+        ]).astype(order.dtype)
+    laid = order.copy()
+    for start in range(0, len(order), block):
+        chunk = order[start:start + block]
+        for kind in dict.fromkeys(classes[row] for row in chunk):
+            positions = [start + i for i, row in enumerate(chunk) if classes[row] == kind]
+            laid[positions] = sorted(order[positions], key=key)
+    return laid
+
+
+def _image_class(prompt, images):
+    # Images alike in type, size and mode come out of the processor in the same shapes; others stay with their prompt.
+    shapes = tuple((type(image).__name__, getattr(image, "shape", None) or getattr(image, "size", None),
+                    getattr(image, "mode", None)) for image in images)
+    return ("prompt", prompt) if any(shape is None for _, shape, _ in shapes) else shapes
+
+
+def _media_signature(inputs, length):
+    """One prompt's processor outputs as a batch's compile family sees them: array shapes and dtypes, integer values
+    (grids, sizes) and other metadata, without token-aligned outputs, which batches rebuild; None if unkeyable."""
+    def key(value):
+        if isinstance(value, (list, tuple)):
+            return tuple(key(item) for item in value)
+        if isinstance(value, Mapping):
+            return tuple(sorted((name, key(item)) for name, item in value.items()))
+        if not hasattr(value, "shape"):
+            return value
+        shape, dtype = tuple(int(size) for size in value.shape), str(value.dtype)
+        exact = "int" in dtype or "bool" in dtype
+        return shape, dtype, hashlib.blake2b(np.asarray(value).tobytes(), digest_size=8).digest() if exact else None
+    skipped = {"labels", *_VLM_RELOCATABLE_SIDECAR_KEYS, *_VLM_WIDTH_GENERATED_KEYS}
+    try:
+        signature = tuple(sorted(
+            (name, key(value)) for name, value in inputs.items()
+            if name not in skipped and tuple(getattr(value, "shape", ())) != (1, length)
+        ))
+        hash(signature)
+    except TypeError:
+        return None
+    return signature
+
+
 @dataclass
 class _Generation:
     visit: int
@@ -689,6 +807,9 @@ class _Generation:
     ref: list | None
     generation_tokens: int
     media: list | None = None  # (prompt text, images) per row
+    skipped: dict | None = None
+    weights: np.ndarray | None = None
+    eager: bool = False
     vision_inputs: dict | None = None  # (first row, width) -> that micro-batch's vision inputs
 
 
@@ -702,9 +823,11 @@ class GRPOBatchPlan:
         num_generations, batch_size, steps_per_generation, num_iterations,
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
-        processor=None, model_config=None, vision=False, rollout_old=False,
+        processor=None, model_config=None, vision=False, rollout_old=False, group_by_length=False, layout_block=1,
+        skip_zero_advantage=False, sample_weighting=None, media_signatures=None,
     ):
         self._dataset = dataset
+        self._media_signatures = media_signatures
         self._tokenizer = tokenizer
         self._processor = processor
         self._model_config = model_config
@@ -727,6 +850,10 @@ class GRPOBatchPlan:
         self.max_seq_length = max_seq_length
         self.seed = seed
         self.counts_tokens = counts_tokens
+        self.group_by_length = group_by_length
+        self.skip_zero_advantage = skip_zero_advantage
+        self.sample_weighting = sample_weighting
+        self._layout_rows = batch_size * layout_block
         self.eos_id = int(tokenizer.eos_token_id)
         pad_id = getattr(tokenizer, "pad_token_id", None)
         self.pad_id = self.eos_id if pad_id is None else int(pad_id)
@@ -734,6 +861,11 @@ class GRPOBatchPlan:
         self._current = None
         self._model = None
         self._shape_plan = None
+        self._cce_bounds = None
+        self._families = None  # per schedule entry, once a compiled vision run surveys them
+        self._forbidden = frozenset()
+        self._family_drift = None
+        self._eager_generation = False
         self._metrics = {}
         self.completions = None
 
@@ -774,9 +906,10 @@ class GRPOBatchPlan:
         self._logps = grpo_logps(self.score_temperature, scorer, differentiated=False)
         self._reference_logps = grpo_logps(self.score_temperature, _reference_scorer(
             reference_policy, scorer, temperature=self.score_temperature), differentiated=False)
+        self._step_compiled = step_compiled or (lambda: False)
         if step_compiled is not None:
-            self._logps = _scored_as_step(self._logps, step_compiled)
-            self._reference_logps = _scored_as_step(self._reference_logps, step_compiled)
+            self._logps = _scored_as_step(self._logps, lambda: step_compiled() and not self._eager_generation)
+            self._reference_logps = _scored_as_step(self._reference_logps, lambda: step_compiled() and not self._eager_generation)
 
     def start_at(self, visit):
         """Count generations from ``visit``, the first micro-step a run fetches."""
@@ -798,7 +931,81 @@ class GRPOBatchPlan:
         high = self._width(max(
             len(self._prompt_ids[prompt]) + self._max_tokens[prompt] for prompt in chunk
         ))
-        return tuple(sorted({*range(low, high, 32), high}))
+        return tuple(sorted({self._clear_of_vision_extents(width) for width in (*range(low, high, 32), high)}))
+
+    def _clear_of_vision_extents(self, width):
+        # A width equal to an unpadded vision extent would reclassify the batch's family.
+        while self._families is not None and width in self._forbidden:
+            width += 1
+        return width
+
+    def _media_class(self, prompt, images):
+        # Equal output signatures give a batch's family its same per-row shapes, unless batches record image token positions.
+        if _config_get(self._model_config, "model_type") == "phi3_v":
+            return ("prompt", prompt)
+        signature = None if self._media_signatures is None else self._media_signatures[prompt]
+        return _image_class(prompt, images) if signature is None else ("outputs", signature)
+
+    def _generation_prompts(self, visit):
+        return [prompt for prompt in self._schedule[visit % len(self._schedule)] for _ in range(self.num_generations)]
+
+    def _shuffled(self, visit, rows):
+        return np.random.default_rng(_derived_seed(self.seed, visit, 1)).permutation(rows)
+
+    def _vision_family(self, inputs):
+        _width, axes, padable, forbidden = _vlm_width_survey(
+            inputs, disposable_keys=_vlm_pipeline_disposable_keys(self._model_config),
+        )
+        return _vlm_batch_family(inputs, symbolic_axes=axes if padable else None), padable, forbidden
+
+    def ensure_descriptors(self):
+        """Survey every entry's vision family for a compiled run, one processor call per micro-step at a prompt-only
+        placeholder width over the seeded rows, which layouts later exchange only for rows with matching images.
+        False when a family cannot be planned."""
+        if self._families is not None:
+            return True
+        if self._processor is None:
+            return False
+        surveyed, entries = {}, []
+        with _preserved_preprocessing_rng():
+            for index in range(len(self._schedule)):
+                start = self._generation_start(index)
+                slot = (index - start) % self.steps_per_generation
+                if (start, slot) not in surveyed:
+                    surveyed[start, slot] = self._survey_slot(start, slot)
+                entries.append(surveyed[start, slot])
+        if not all(padable and _vlm_family_is_plannable(family) for family, padable, _ in entries):
+            return False
+        self._forbidden = frozenset().union(*(extents for _, _, extents in entries))
+        self._families = tuple(family for family, _, _ in entries)
+        return True
+
+    def _survey_slot(self, start, slot):
+        prompts = self._generation_prompts(start)
+        chosen = [prompts[row] for row in self._shuffled(start, len(prompts))[slot * self.batch_size:][:self.batch_size]]
+        media = {prompt: self._reencode(prompt, self._dataset[prompt])[1:3] for prompt in dict.fromkeys(chosen)} if self.vision else None
+        width = max(self.width_rungs(start))
+        while True:
+            batch, lengths = self._pack(
+                [self._prompt_ids[prompt] for prompt in chosen], np.array([len(self._prompt_ids[prompt]) for prompt in chosen]),
+                width,
+            )
+            family, padable, forbidden = self._vision_family(_grpo_vision_batch(
+                self._processor, self._model_config, batch, lengths, media and [media[prompt] for prompt in chosen],
+            ))
+            # A placeholder width that equals a vision extent cannot tell the two apart.
+            if padable or width not in forbidden:
+                return family, padable, forbidden
+            width += 1
+
+    def release_unplanned_descriptors(self):
+        """Back to eager's layout and widths when the surveyed families were not compiled after all."""
+        if self._shape_plan is None:
+            self._families, self._forbidden = None, frozenset()
+
+    def pop_family_drift(self):
+        drift, self._family_drift = self._family_drift, None
+        return drift
 
     def pop_metrics(self):
         """Generation-side metrics recorded since the last call, each averaged."""
@@ -828,17 +1035,48 @@ class GRPOBatchPlan:
             held[key] = inputs
         return dict(held[key])
 
-    def _score(self, scorer, sequences, prompt_lengths, media, held=None):
+    def configure_cce_compaction(self, enabled=True):
+        self._cce_bounds = (min(map(len, self._prompt_ids)), max(self._max_tokens)) if enabled else None
+
+    def prepare_cce_batch(self, index, batch):
+        """Every fetch, an eager refetch included, already carries the indices old and reference log-probs were scored with."""
+        return batch
+
+    def _cce_indices(self, lengths, width):
+        if self._cce_bounds is None:
+            return None
+        capacity = grpo_cce_capacity(len(lengths), width, *self._cce_bounds)
+        return None if capacity is None else mx.array(grpo_cce_indices(lengths, width, capacity))
+
+    def _score(self, scorer, visit, sequences, prompt_lengths, media, skipped=(), held=None):
         values = []
         for start in range(0, len(sequences), self.batch_size):
             chunk = sequences[start:start + self.batch_size]
-            width = self._planned(self._width(max(len(sequence) for sequence in chunk)))
-            batch, lengths = self._pack(chunk, prompt_lengths[start:start + self.batch_size], width)
-            inputs = self._inputs(
-                batch, lengths, None if media is None else media[start:start + self.batch_size], held, (start, width))
-            logps = np.array(scorer(inputs, mx.array(lengths)), dtype=np.float32)
+            if start // self.batch_size in skipped:
+                values.extend(np.zeros(len(sequence) - 1, dtype=np.float32) for sequence in chunk)
+                continue
+            inputs, lengths, width = self._slot_inputs(visit, start, chunk, prompt_lengths, media, held)
+            logps = np.array(scorer(inputs, mx.array(lengths), self._cce_indices(lengths, width)), dtype=np.float32)
             values.extend(logps[row, :len(sequence) - 1] for row, sequence in enumerate(chunk))
         return values
+
+    def _slot_inputs(self, visit, start, chunk, prompt_lengths, media, held=None):
+        width = self._planned(self._width(max(len(sequence) for sequence in chunk)), visit + start // self.batch_size)
+        batch, lengths = self._pack(chunk, prompt_lengths[start:start + self.batch_size], width)
+        media = None if media is None else media[start:start + self.batch_size]
+        return self._inputs(batch, lengths, media, held, (start, width)), lengths, width
+
+    def _generation_family_drift(self, visit, sequences, prompt_lengths, media):
+        """The first micro-batch of a generation whose vision family left its survey, found before any is scored."""
+        for start in range(0, len(sequences), self.batch_size):
+            index = visit + start // self.batch_size
+            if index >= len(self._families):
+                continue
+            inputs = self._slot_inputs(visit, start, sequences[start:start + self.batch_size], prompt_lengths, media)[0]
+            divergence = _vlm_family_divergence(self._families[index], self._vision_family(inputs)[0])
+            if divergence is not None:
+                return f"batch {index}: {divergence}"
+        return None
 
     def _decode(self, ids):
         try:
@@ -849,10 +1087,7 @@ class GRPOBatchPlan:
     def _generate(self, visit):
         if self._model is None:
             raise RuntimeError("Unsloth MLX GRPO: bind the plan before fetching batches.")
-        prompts = [
-            prompt for prompt in self._schedule[visit % len(self._schedule)]
-            for _ in range(self.num_generations)
-        ]
+        prompts = self._generation_prompts(visit)
         read = {prompt: self._dataset[prompt] for prompt in dict.fromkeys(prompts)}
         # Read again each generation and held only for it: the plan keeps no pixels.
         encoded = {prompt: self._reencode(prompt, row) for prompt, row in read.items()} if self.vision else {}
@@ -919,6 +1154,14 @@ class GRPOBatchPlan:
             rewards, self._reward_weights, self.num_generations, self.scale_rewards,
         )
         self._record_generation(lengths, truncated, rewards, reward_stats)
+        kept = ~truncated if self.mask_truncated_completions else np.ones_like(truncated)
+        weights = None
+        if self.sample_weighting is not None:
+            combined = np.nansum(rewards * np.asarray(self._reward_weights, dtype=np.float32)[None, :], axis=1)
+            weights, excluded = scalerl_sample_weights(
+                combined.astype(np.float32), self.num_generations, lengths * kept, *self.sample_weighting,
+            )
+            self._record("frac_reward_zero_std_excluded", excluded)
         if self._keep_completions:
             self.completions = {
                 # Phi-3 Vision's negative placeholder ids do not decode.
@@ -930,34 +1173,70 @@ class GRPOBatchPlan:
                 },
                 "advantage": advantages.tolist(),
             }
-        kept = ~truncated if self.mask_truncated_completions else np.ones_like(truncated)
         # Shuffled before scoring so each old/reference chunk is one micro-batch at its own width, and a first iteration's ratio is exactly 1 when eager.
-        order = np.random.default_rng(_derived_seed(self.seed, visit, 1)).permutation(len(prompts))
+        order = self._shuffled(visit, len(prompts))
+        # Exactly zero, not TRL's zero std: a rounded group mean leaves a tiny advantage that still has gradient.
+        dead = (advantages == 0) & self.skip_zero_advantage
+        eager = False
+        if self.group_by_length or self.skip_zero_advantage:
+            key = lambda row: (dead[row], prompt_lengths[row] + lengths[row] if self.group_by_length else 0)  # noqa: E731
+            free = grpo_row_layout(order, self._layout_rows, key)
+            if self._families is None:
+                order = free
+            else:
+                # Rows move only between alike images, so families hold; a generation that skips less this way trains eagerly.
+                classes = [self._media_class(prompt, encoded[prompt][2] if encoded else ()) for prompt in prompts]
+                by_class = grpo_row_layout(order, self._layout_rows, key, classes)
+                dead_steps = lambda rows: dead[rows].reshape(-1, self.batch_size).all(axis=1).sum()  # noqa: E731
+                eager = bool(dead_steps(free) > dead_steps(by_class))
+                order = free if eager else by_class
+        skipped = {}
+        if self.skip_zero_advantage:
+            # The loss's stats for such rows: no KL, no clipping, and their masked completion lengths.
+            skipped = {
+                slot: np.array([0.0, (lengths * kept)[rows].mean(), 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                for slot, rows in enumerate(np.split(order, len(order) // self.batch_size)) if dead[rows].all()
+            }
+            self._record("frac_rows_skipped", len(skipped) * self.batch_size / len(order))
         sequences = [
             tuple(self._prompt_ids[prompts[row]]) + tuple(completion_ids[row]) for row in order
         ]
         prompt_lengths = prompt_lengths[order]
         media = [encoded[prompts[row]][1:3] for row in order] if encoded else None
+        if self._families is not None:
+            # A family that left its survey trains eagerly, so its old and reference log-probs are scored eagerly too.
+            if not eager and self._step_compiled() and (self.with_old_logps or self.with_reference):
+                self._family_drift = self._family_drift or self._generation_family_drift(
+                    visit, sequences, prompt_lengths, media,
+                )
+                eager = self._family_drift is not None
+            self._record("frac_generations_eager", eager)
         held = {} if encoded else None
         old = ref = None
-        if rollout is not None:
-            old = [rollout[row] for row in order]
-        elif self.with_old_logps:
-            old = self._score(
-                lambda batch, lengths: mx.stop_gradient(self._logps(self._model, batch, lengths)),
-                sequences, prompt_lengths, media, held,
-            )
-        if self.with_reference:
-            ref = self._score(
-                lambda batch, lengths: self._reference_policy.forward(
-                    self._model, batch, lengths, response_scorer=self._reference_logps,
-                ),
-                sequences, prompt_lengths, media, held,
-            )
+        self._eager_generation = eager
+        try:
+            if rollout is not None:
+                old = [rollout[row] for row in order]
+            elif self.with_old_logps:
+                old = self._score(
+                    lambda batch, lengths, indices: mx.stop_gradient(self._logps(self._model, batch, lengths, indices)),
+                    visit, sequences, prompt_lengths, media, skipped, held,
+                )
+            if self.with_reference:
+                ref = self._score(
+                    lambda batch, lengths, indices: self._reference_policy.forward(
+                        self._model, batch, lengths,
+                        response_scorer=lambda model, batch, lengths: self._reference_logps(model, batch, lengths, indices),
+                    ),
+                    visit, sequences, prompt_lengths, media, held=held,
+                )
+        finally:
+            self._eager_generation = False
         return _Generation(
             visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
-            generation_tokens=int(lengths.sum()), media=media, vision_inputs=held,
+            generation_tokens=int(lengths.sum()), media=media, skipped=skipped,
+            weights=None if weights is None else weights[order], eager=eager, vision_inputs=held,
         )
 
     def _rollout_logps(self, prompts, results, completion_ids):
@@ -999,23 +1278,29 @@ class GRPOBatchPlan:
     def batch_family(self, index):
         rows = self.batch_size
         held = ((rows, "sequence-1"), "float32")
-        return (
-            "grpo_tuple_7", ((rows, "sequence"), "int32"), ((rows, 2), "int32"),
+        # CCE indices are a function of the width, so they name no family of their own.
+        family = (
+            "grpo_tuple", ((rows, "sequence"), "int32"), ((rows, 2), "int32"),
             ((2,), "float32"), ((rows,), "float32"), ((rows,), "int32"),
             held if self.with_old_logps else None, held if self.with_reference else None,
         )
+        if self.sample_weighting is not None:
+            family = (*family, ((rows,), "float32"))
+        return family if self._families is None else (*family, self._families[index])
 
     def set_shape_plan(self, shape_plan):
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
             raise ValueError("only exact or bucket shape plans can be installed")
         self._shape_plan = shape_plan
 
-    def _planned(self, width):
+    def _planned(self, width, index):
         # Old and reference log-probs are scored at the width the micro-batch trains at, so a first iteration's ratio
         # stays exactly 1, including after a compile fallback.
-        if self._shape_plan is None:
+        width = self._clear_of_vision_extents(width)
+        # A truncated schedule's last generation scores slots it never trains.
+        if self._shape_plan is None or self._families is not None and index >= len(self._families):
             return width
-        return self._shape_plan.endpoint_for(self.batch_family(0), width)
+        return self._shape_plan.endpoint_for(self.batch_family(index), width)
 
     def materialize(self, index, *, phase=None):
         """Micro-batch for schedule entry index at its planned width whatever the phase; refetching an entry reuses its generation instead of sampling again."""
@@ -1027,7 +1312,7 @@ class GRPOBatchPlan:
         position = ((index - start) % self.steps_per_generation) * self.batch_size
         rows = range(position, min(position + self.batch_size, len(generation.sequences)))
         sequences = [generation.sequences[row] for row in rows]
-        width = self._planned(self._width(max(len(sequence) for sequence in sequences)))
+        width = self._planned(self._width(max(len(sequence) for sequence in sequences)), index)
         batch, lengths = self._pack(sequences, generation.prompt_lengths[position:position + self.batch_size], width)
 
         def held(values):
@@ -1039,13 +1324,33 @@ class GRPOBatchPlan:
             return mx.array(table)
 
         media = None if generation.media is None else generation.media[position:position + self.batch_size]
-        return (
+        materialized = (
             self._inputs(batch, lengths, media, generation.vision_inputs, (position, width)), mx.array(lengths),
             mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),
             held(generation.old), held(generation.ref),
         )
+        if self._families is not None and phase is not None and self._family_drift is None and not generation.eager:
+            divergence = _vlm_family_divergence(self._families[index], self._vision_family(materialized[0])[0])
+            if divergence is not None:
+                self._family_drift = f"batch {index}: {divergence}"
+        indices = self._cce_indices(lengths, width)
+        if generation.weights is not None:
+            return (*materialized, indices, mx.array(generation.weights[position:position + self.batch_size]))
+        return materialized if indices is None else (*materialized, indices)
+
+    def runs_eager(self, index):
+        """Whether a compiled run trains this micro-step eagerly: its generation laid out freely or drifted."""
+        generation = self._current
+        return generation is not None and generation.visit == self._generation_start(index) and generation.eager
+
+    def skipped_stats(self, index):
+        """Stats of a materialized micro-step whose rows all have advantage exactly 0, which the trainer counts unrun."""
+        generation = self._current
+        if generation is None or generation.visit != self._generation_start(index):
+            return None
+        return generation.skipped.get((index - generation.visit) % self.steps_per_generation)
 
     def __getitem__(self, index):
         return self.materialize(index)
@@ -1065,7 +1370,7 @@ def _encode_grpo_prompts(
     if vision is None:
         first = dataset[0] if len(dataset) else None
         vision = processor is not None and isinstance(first, Mapping) and bool({"image", "images"} & set(first))
-    prompt_ids, max_tokens = [], []
+    prompt_ids, max_tokens, signatures = [], [], []
     long_prompts = capped = 0
     holds_images = False
     for index in range(len(dataset)):
@@ -1081,7 +1386,8 @@ def _encode_grpo_prompts(
                 "Give the first row an `images` field, empty if it has none."
             )
         # TRL tokenizes prompts with add_special_tokens=False: a chat template supplies its own BOS.
-        ids, _, images, _ = _encode_grpo_prompt(tokenizer, row, processor, vision)
+        ids, _, images, inputs = _encode_grpo_prompt(tokenizer, row, processor, vision)
+        signatures.append(None if inputs is None else _media_signature(inputs, len(ids)))
         holds_images = holds_images or bool(images)
         if not ids or len(ids) >= max_seq_length:
             raise ValueError(
@@ -1112,7 +1418,7 @@ def _encode_grpo_prompts(
             "their completions are capped to the room left.",
             stacklevel=3,
         )
-    return prompt_ids, max_tokens, vision
+    return prompt_ids, max_tokens, vision, signatures
 
 
 def create_grpo_batch_plan(
@@ -1120,15 +1426,18 @@ def create_grpo_batch_plan(
     num_iterations, grad_accum, sampling, max_seq_length, score_temperature=None, scale_rewards="group",
     mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
     shuffle=True, seed=None, num_batches=None, num_epochs=None, processor=None, model_config=None,
+    group_by_length=False, skip_zero_advantage=False, sample_weighting=None,
     rollout_logprobs_as_old=False,
 ):
     """Encode prompts once and lay out TRL's RepeatSampler schedule; batch_size counts completions, a generation samples
     batch_size * steps_per_generation of them, num_generations per prompt; score_temperature defaults to the sampling
-    temperature; a VLM processor replaces tokenizer; rollout_logprobs_as_old takes old log-probs from tokenizer-only
-    rollouts sampled unfiltered at the scoring temperature instead of a forward."""
+    temperature; a VLM processor replaces tokenizer; within each optimizer step group_by_length sorts rows by length and
+    skip_zero_advantage puts zero-advantage rows last; sample_weighting is grpo_sample_weighting's;
+    rollout_logprobs_as_old takes old log-probs from tokenizer-only rollouts sampled unfiltered at the scoring
+    temperature instead of a forward."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
-    prompt_ids, max_tokens, vision = _encode_grpo_prompts(
+    prompt_ids, max_tokens, vision, signatures = _encode_grpo_prompts(
         dataset, tokenizer, sampling, max_seq_length, max_prompt_length, processor,
     )
     if batch_size * steps_per_generation % num_generations:
@@ -1178,6 +1487,8 @@ def create_grpo_batch_plan(
         with_old_logps=with_old_logps, with_reference=with_reference,
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
         processor=processor, model_config=model_config, vision=vision, rollout_old=rollout_old,
+        group_by_length=group_by_length, layout_block=math.gcd(steps_per_generation, grad_accum),
+        skip_zero_advantage=skip_zero_advantage, sample_weighting=sample_weighting, media_signatures=signatures,
     )
 
 
@@ -1185,13 +1496,13 @@ def create_grpo_batch_plan(
 def create_grpo_eval_plan(
     dataset, tokenizer, *, num_generations, batch_size, sampling, max_seq_length,
     score_temperature=None, scale_rewards="group", mask_truncated_completions=False,
-    with_reference=False, max_prompt_length=None, seed=None, processor=None, model_config=None,
+    with_reference=False, max_prompt_length=None, seed=None, processor=None, model_config=None, sample_weighting=None,
 ):
     """TRL's eval RepeatSampler order, one generation per batch_size completions (last batch may be short), on its own
-    seed stream without advancing num_input_tokens_seen."""
+    seed stream without advancing num_input_tokens_seen; sample_weighting is training's, so eval_loss scores it."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
-    prompt_ids, max_tokens, vision = _encode_grpo_prompts(
+    prompt_ids, max_tokens, vision, _ = _encode_grpo_prompts(
         dataset, tokenizer, sampling, max_seq_length, max_prompt_length, processor,
     )
     seed = _normalize_seed(seed)
@@ -1206,7 +1517,7 @@ def create_grpo_eval_plan(
         score_temperature=sampling.temperature if score_temperature is None else score_temperature,
         scale_rewards=scale_rewards, mask_truncated_completions=mask_truncated_completions,
         with_old_logps=False, with_reference=with_reference, max_seq_length=max_seq_length,
-        seed=_derived_seed(seed, 1), counts_tokens=False,
+        seed=_derived_seed(seed, 1), counts_tokens=False, sample_weighting=sample_weighting,
         processor=processor, model_config=model_config, vision=vision,
     )
 
@@ -1244,6 +1555,17 @@ def grpo_objective(config):
         importance_sampling_level=config.importance_sampling_level,
         temperature=config.temperature, max_completion_length=config.max_completion_length,
     )
+
+
+def grpo_layout_options(objective, *, distributed=False):
+    """Layouts keeping the window gradient: bnpo normalizes per micro-batch, so it is not regrouped; a zero-advantage row
+    has no gradient only without a KL term, and a micro-step of such rows has loss 0 under every other normalizer."""
+    return {
+        "group_by_length": objective.loss_type != "bnpo",
+        "skip_zero_advantage": (
+            not distributed and objective.beta == 0 and objective.loss_type in ("grpo", "dapo", "dr_grpo")
+        ),
+    }
 
 
 def _is_torch_module(func):
@@ -1323,6 +1645,56 @@ def grpo_reward_funcs(reward_funcs, reward_processing_classes=None):
                 "reward per completion."
             )
     return funcs
+
+
+_SCALERL_LOSS_TYPES = ("bnpo", "dapo")  # token-normalized, so exclusion alone is defined
+
+
+def grpo_sample_weighting(config):
+    """(exclude, prompt_level) for scalerl_sample_weights, or None when the config trains TRL's objective."""
+    prompt_level = config.loss_aggregation == "prompt"
+    return (bool(config.zero_variance_exclude), prompt_level) if config.zero_variance_exclude or prompt_level else None
+
+
+def _resolve_scalerl_options(config):
+    """CUDA Unsloth's ScaleRL environment variables are the fields' defaults; the GRPO flags it reads for vLLM rollouts
+    have no MLX counterpart."""
+    if config.zero_variance_exclude is None:
+        config.zero_variance_exclude = os.environ.get("UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE", "0") == "1"
+        if config.zero_variance_exclude:
+            warnings.warn(
+                "Unsloth MLX GRPO: UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE=1 sets zero_variance_exclude=True, as on CUDA "
+                "Unsloth; set the field to choose explicitly.",
+                stacklevel=4,
+            )
+    if config.loss_aggregation is None:
+        value = os.environ.get("UNSLOTH_GRPO_LOSS_AGGREGATION", "").strip().lower()
+        if value not in ("", "prompt"):
+            raise ValueError(
+                f"Unsloth MLX GRPO: UNSLOTH_GRPO_LOSS_AGGREGATION must be 'prompt' or unset, got {value!r}."
+            )
+        config.loss_aggregation = value or "token"
+        if value:
+            warnings.warn(
+                "Unsloth MLX GRPO: UNSLOTH_GRPO_LOSS_AGGREGATION=prompt sets loss_aggregation='prompt', as on CUDA "
+                "Unsloth; set the field to choose explicitly.",
+                stacklevel=4,
+            )
+    if config.loss_aggregation not in ("token", "prompt"):
+        raise ValueError(
+            f"Unsloth MLX GRPO: loss_aggregation must be 'token' or 'prompt', got {config.loss_aggregation!r}."
+        )
+    alone = config.zero_variance_exclude and config.loss_aggregation == "token"
+    if alone and config.loss_type not in _SCALERL_LOSS_TYPES:
+        warnings.warn(
+            "Unsloth MLX GRPO: zero_variance_exclude alone needs a token-normalized loss_type (bnpo, dapo), as on "
+            f"CUDA Unsloth; it is ignored for loss_type={config.loss_type!r}.",
+            stacklevel=4,
+        )
+        config.zero_variance_exclude = False
+    for name in ("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "UNSLOTH_GRPO_VLLM_IS_MODE"):
+        if os.environ.get(name, "").strip() not in ("", "0"):
+            warnings.warn(f"Unsloth MLX GRPO: {name} is not supported on MLX and is ignored.", stacklevel=4)
 
 
 def resolve_grpo_config(config):
@@ -1426,6 +1798,7 @@ def resolve_grpo_config(config):
             "Unsloth MLX GRPO: top_entropy_quantile < 1 is ignored, as on CUDA Unsloth.",
             stacklevel=3,
         )
+    _resolve_scalerl_options(config)
     grpo_objective(config)
     grpo_sampling(config)
 
