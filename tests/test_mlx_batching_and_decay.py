@@ -2895,6 +2895,9 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
                 assert arrays(patched(stack("vision", training), h, loss_cache, types)) == want
             traced = mx.compile(lambda h, t: patched(stack("vision"), h, loss_cache, t)[0])
             assert traced(h, types).tolist() == want[0]
+    from unsloth_zoo.mlx.utils import _PaddingFreeLayout, _padding_free_scope
+    with _padding_free_scope(_PaddingFreeLayout(mx.arange(12), 2, 6)):  # a flat stream keeps the row-width overlay
+        assert arrays(patched(stack("vision"), mx.zeros((1, 12, 1)), [None, None], ids))[0] == reference(ids)
     want = arrays(upstream(stack(None), h, [None, None], ids))
     traced = mx.compile(lambda h, t: [
         m for m in patched(stack(None), h, [None, None], t) if isinstance(m, mx.array)])
