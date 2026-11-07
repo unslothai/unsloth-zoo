@@ -375,6 +375,32 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
             _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
     assert Generator.instances[-1].closed is True
 
+@pytest.mark.parametrize("finish", ["stop", "length"])
+def test_token_ids_only_rows_skip_text_and_host_reads_and_keep_logprobs_on_device(monkeypatch, finish):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import generate as engine
+    class Generator(_OpenBatchGenerator):
+        def next_generated(self):
+            events = super().next_generated()
+            for event in events:
+                event.token, event.logprobs = self.steps, mx.array([-9.0, -0.1, -0.2, -0.3]) * (event.uid - 100)
+                event.finish_reason = event.finish_reason and finish
+            return events
+    def rows(**defaults):
+        adapter = object.__new__(_TextBatchAdapter)
+        adapter.model, adapter.tokenizer, adapter.batch_generator_type = object(), _CharTokenizer(), Generator
+        adapter.defaults, adapter.make_sampler = GenerationDefaults(**defaults), lambda **_kwargs: None
+        return _results(adapter.stream([GenerationRequest(prompt_token_ids=[9], max_tokens=3)] * 3))
+
+    plain = rows()
+    monkeypatch.setattr(engine, "_sampled_logprob", lambda _: pytest.fail("read on the host"))
+    monkeypatch.setattr(_CharTokenizer, "detokenizer", property(lambda _: pytest.fail("detokenized")))
+    ids_only = rows(token_ids_only=True, logprob_arrays=True)
+    for scale, (ids, text) in enumerate(zip(ids_only, plain), 1):  # each row its own log-probs, a stopping id's too
+        assert (ids.token_ids, ids.text, ids.logprobs, len(text.logprobs), ids.logprob_array.tolist()) == (text.token_ids, "", [], 3 - (finish == "stop"), pytest.approx([-0.1 * scale, -0.2 * scale, -0.3 * scale]))  # noqa: E501
+    with pytest.raises(ValueError, match="token_ids_only"): GenerationDefaults(token_ids_only=True, stop_strings=("x",))  # noqa: E701
+
+
 def test_generation_mode_releases_lock_when_limit_restore_raises(monkeypatch):
     model = types.SimpleNamespace(training=True)
     model.named_modules = lambda: [("", model)]
@@ -562,6 +588,17 @@ def test_a_prompt_cache_state_is_taken_only_by_a_vision_stream_row():
         list(_stream_batch(vlm, object(), [GenerationRequest(prompt="a", prompt_cache_state=state)]))
 
 
+def test_vision_text_engine_is_the_language_model_only_for_verified_types_with_position_only_ropes():
+    from unsloth_zoo.mlx import generate as engine
+    assert engine._LanguageModelLogits(lambda *_, **__: types.SimpleNamespace(logits=7))() == 7
+    for model_type, rope, routed in (("gemma4", "RoPE", True), ("gemma4", "ProportionalRoPE", True), ("jina_vlm", "RoPE", False),
+                                     ("qwen3_5", "Qwen3_5RotaryEmbedding", True), ("gemma4", "SuScaledRoPE", False),
+                                     ("gemma4", "DynamicNTKScalingRoPE", False), ("gemma4", "DynamicRotaryEmbedding", False)):
+        language = types.SimpleNamespace(named_modules=lambda rope=rope: [("rope", type(rope, (), {})())])
+        config = {"model_type": model_type} if rope == "RoPE" else types.SimpleNamespace(model_type=model_type)
+        assert (engine.text_engine_model(types.SimpleNamespace(_is_vlm_model=True, language_model=language, config=config)) is not None) == routed
+
+
 def test_prompt_kwargs_fallback_splits_mrope_on_the_batch_axis():
     # MRoPE position_ids are [3, batch, sequence], so splitting on axis 0 would hand every row the same rope section.
     from unsloth_zoo.mlx.generate import _split_prompt_kwargs_fallback
@@ -625,6 +662,36 @@ def test_vlm_adapter_isolates_detokenizers_and_reads_scalar_logprobs():
     assert [(r.token_ids, r.text) for r in results] == [
         ([1], "hello "), ([4], "tailSTOPsuffix")] and results[0].logprobs == [-0.5]
     assert [r.prompt_token_count for r in results] == [37, 37]
+    adapter.defaults = GenerationDefaults(token_ids_only=True)
+    stub = _vlm_stub(True, events=[[(0, 1, None)], [(0, 3, "stop")]])(object(), object())
+    assert [(r.token_ids, r.text, r.logprobs) for r in _results(adapter._drive(stub, [0], [0], {}))] == [([1], "", [])]
+
+
+def test_vlm_rows_given_one_prompt_embed_it_once_and_fan_it_out(monkeypatch):
+    import numpy as np
+    from unsloth_zoo.mlx import generate as engine
+    seen, warp = {}, lambda logprobs: logprobs + 1
+    monkeypatch.setattr(engine, "_batched_draws_match", lambda: True)
+    adapter = engine._VLMBatchAdapter.__new__(engine._VLMBatchAdapter)
+    adapter.defaults = GenerationDefaults(token_ids_only=True, batched_draws=True, share_prompt_prefill=True, logits_warp=warp)
+    adapter.per_row_prompt_kwargs, adapter.constructor_params = True, {"sampler", "compute_logprobs"}
+    adapter.processor, adapter.sample_utils, adapter.make_sampler = types.SimpleNamespace(tokenizer=_CriteriaTokenizer()), None, lambda **k: None
+    adapter._wired_limit, adapter._chunked_prefill_kwargs = contextlib.nullcontext, lambda **kw: {}
+    adapter._split_prompt_kwargs = lambda kw, n: [{"row": row} for row in range(n)]
+    adapter._drive = lambda generator, uids, indices, kw, sampler, **k: seen.update(sampler=sampler, counts=k) or iter(())
+    adapter.model = types.SimpleNamespace(config=None, language_model=None, get_input_embeddings=lambda ids, pixels, **k: (
+        seen.update(embed=(ids.tolist(), pixels.tolist())), types.SimpleNamespace(to_dict=dict))[1])
+    adapter.generator_type = lambda *a, **k: types.SimpleNamespace(insert=lambda ids, max_tokens, prompt_kwargs: (
+        seen.update(ctor=k, insert=(ids, prompt_kwargs)), list(range(len(ids))))[1])
+    shared, other = {"pixel_values": np.full((1, 2), 7)}, {"pixel_values": np.full((1, 2), 8)}
+    list(adapter._run_chunk([GenerationRequest(prompt_token_ids=(1, 2), vision_inputs=inputs, sampling=SamplingParams(
+        temperature=1.0, seed=seed)) for seed, inputs in enumerate((shared, other, shared))], [0, 1, 2]))
+    assert seen["embed"] == ([[1, 2], [1, 2]], [[7, 7], [8, 8]]) and seen["insert"][0] == [[1, 2]] * 3
+    assert seen["insert"][1] == [{"row": 0}, {"row": 1}, {"row": 0}] and seen["insert"][1][0] is not seen["insert"][1][2]
+    assert seen["ctor"]["compute_logprobs"] is False and seen["sampler"]._warp is warp and seen["sampler"]._keys is not None
+    seen["sampler"]._keys.draw = lambda uids, logprobs: (uids, logprobs)  # the keyed draw itself is covered on Metal
+    uids, drawn = seen["sampler"](np.zeros((3, 4)))
+    assert uids == [0, 1, 2] and (drawn == 1).all()
 
 
 def test_vlm_chunking_respects_release_capabilities():
@@ -2310,3 +2377,73 @@ def test_target_head_runs_more_rows_than_one_lane_launch_in_fp32_launches(monkey
     del head.__dict__["_unsloth_lane_qmm_ready"][(1, 8, 64)]
     launches.clear()
     assert fp32(x).dtype == mx.bfloat16 and launches == [32]
+
+
+def test_stop_string_trims_device_logprobs_with_the_tokens():
+    tokenizer = _CharTokenizer()
+    pending = _PendingResult(_new_detokenizer(tokenizer), _StopStringScanner(("<STOP>",)))
+    for token, value in ((1, "a"), (2, "b"), (3, "c")):
+        pending.append(tokenizer, token, -0.1, value)
+    assert pending.token_ids == [1] and pending.logprob_values == ["a"]
+
+
+@pytest.mark.parametrize("layout", ["adjacent", "nonadjacent"])
+def test_shared_prefixes_live_only_while_their_rows_can_decode(monkeypatch, layout):
+    import weakref
+    from unsloth_zoo.mlx import generate as engine
+
+    class Prefix:
+        def __init__(self, ids):
+            self.ids = ids
+
+    alive, peak, added = weakref.WeakSet(), [0], []
+
+    class Session:
+        prefix_counts = engine._TextBatchSession.prefix_counts
+
+        def __init__(self, adapter):
+            self.adapter, self.rows = adapter, []
+
+        rows_in_flight = property(lambda self: len(self.rows))
+
+        def prefill_prompt(self, ids):
+            prefix = Prefix(ids)
+            alive.add(prefix)
+            peak[0] = max(peak[0], len(alive))
+            return prefix
+
+        def add(self, request, prefix=None):
+            added.append((tuple(request.prompt_token_ids), prefix and prefix.ids))
+            self.rows.append(prefix)
+
+        def step(self):
+            self.rows.pop(0)
+            return iter(())
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(engine, "_TextBatchSession", Session)
+    adapter = _TextBatchAdapter.__new__(_TextBatchAdapter)
+    adapter.model, adapter.tokenizer = types.SimpleNamespace(), _CharTokenizer()
+    adapter.defaults = GenerationDefaults(share_prompt_prefill=True, completion_batch_size=4, prefill_batch_size=1)
+    prompts = [(p, p + 1) for p in range(10, 26)]
+    order = [ids for ids in prompts for _ in range(2)] if layout == "adjacent" else prompts * 2
+    list(adapter.stream([GenerationRequest(prompt_token_ids=ids) for ids in order]))
+    assert added == [(ids, ids) for ids in order] and peak[0] <= 2 * 4
+
+
+@pytest.mark.skipif(importlib.import_module("mlx_simulation").mlx_is_simulated(), reason="needs real mlx.random")
+@pytest.mark.parametrize("rows_reduce_alike", [True, False])
+def test_batched_draws_match_per_row_samplers_on_either_reduction_route(monkeypatch, rows_reduce_alike):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import generate as engine
+
+    monkeypatch.setattr(engine, "_row_reductions_match", lambda rows, n: rows_reduce_alike)
+    logprobs = mx.random.normal((3, 4096), key=mx.random.key(1)) * 3
+    params = [SamplingParams(temperature=0.9, seed=seed) for seed in (2, 5, 9)]
+    alone = [engine._seeded_sampler(None, row) for row in params]
+    keys = mx.stack([mx.random.key(row.seed) for row in params])
+    for _ in range(20):
+        keys, drawn = engine._draw_rows(keys, logprobs, 0.9)
+        assert drawn.tolist() == [alone[row](logprobs[row:row + 1]).item() for row in range(3)]

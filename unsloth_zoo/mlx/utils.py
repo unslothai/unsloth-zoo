@@ -709,6 +709,33 @@ def _set_mlx_windowed_attention(enabled: bool) -> None:
             setattr(module, attr, original)
 
 
+def _train_qmm_call(native, routes):
+    from . import matmul
+
+    def call(self, x):
+        routed = matmul.call_train_qmm_route(self, x, routes) if mlx_training_patches_active() else None
+        if routed is None:
+            return native(self, x)
+        return routed + self["bias"] if "bias" in self else routed
+
+    # Outside a training context every call is the native one, so contracts pinning the native still hold.
+    call._unsloth_original = call._unsloth_exact_route_of = native
+    return call
+
+
+def _set_mlx_train_qmm(enabled: bool) -> None:
+    current = nn.QuantizedLinear.__call__
+    original = getattr(current, "_unsloth_original", None)
+    # A __call__ someone else rebound keeps its behaviour: only mlx's own method takes the route.
+    if enabled and original is None and getattr(current, "__module__", "").startswith("mlx.nn."):
+        from . import matmul
+        routes = matmul.available_train_qmm_routes()
+        if routes:
+            nn.QuantizedLinear.__call__ = _train_qmm_call(current, routes)
+    elif not enabled and original is not None:
+        nn.QuantizedLinear.__call__ = original
+
+
 def acquire_mlx_training_patches() -> None:
     """Reference-counted because the mlx.core patches are process-wide while trainer runs are not, so an inner run must not unpatch an outer one."""
     global _MLX_TRAINING_PATCH_DEPTH
@@ -718,6 +745,7 @@ def acquire_mlx_training_patches() -> None:
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(True)
             _set_mlx_windowed_attention(True)
+            _set_mlx_train_qmm(True)
         _MLX_TRAINING_PATCH_DEPTH += 1
     _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
 
@@ -731,6 +759,7 @@ def release_mlx_training_patches() -> None:
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(False)
             _set_mlx_windowed_attention(False)
+            _set_mlx_train_qmm(False)
     _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
 
 
@@ -748,6 +777,7 @@ def pause_mlx_training_patches() -> bool:
         _MLX_TRAINING_PATCH_DEPTH = 0
         _set_mlx_index_gradient_stop(False)
         _set_mlx_windowed_attention(False)
+        _set_mlx_train_qmm(False)
         return True
 
 
@@ -761,6 +791,7 @@ def resume_mlx_training_patches(paused: bool) -> None:
             if _MLX_TRAINING_PATCH_DEPTH == 0:
                 _set_mlx_index_gradient_stop(True)
                 _set_mlx_windowed_attention(True)
+                _set_mlx_train_qmm(True)
             _MLX_TRAINING_PATCH_DEPTH += 1
     stack = _MLX_TRAINING_PAUSE_STACK.get()
     if stack:
@@ -1079,6 +1110,20 @@ def _tie_to_hidden_state(args, shared_kv):
     return (x, *args[1:]), shared_kv
 
 
+_GC_BYPASS_DEPTH = contextvars.ContextVar("unsloth_mlx_gc_bypass_depth", default=0)
+
+
+@contextlib.contextmanager
+def gradient_checkpointing_bypassed():
+    """Checkpointed layers out of training run their own __call__ inside this context; generation enters it."""
+    depth = _GC_BYPASS_DEPTH.get()
+    _GC_BYPASS_DEPTH.set(depth + 1)
+    try:
+        yield
+    finally:
+        _GC_BYPASS_DEPTH.set(depth)
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -1086,6 +1131,8 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
+        if _GC_BYPASS_DEPTH.get() and not self.training:
+            return fn(self, *args, **kwargs)
         slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
         # The VJP recomputes the layer after the loss returned and cleared the padding-free scope.
         layout = _PADDING_FREE_LAYOUT.get()
@@ -1452,6 +1499,20 @@ class _SharedKVSlot:
 
     def recorded(self):
         return self.keys, self.values
+
+
+# RoPE class names whose mlx-lm/mlx-vlm implementations rotate by position alone. Others pick their frequencies from the
+# forward's length or the batch's largest offset (dynamic NTK, longrope's short/long switch). A name cannot vouch for an
+# arbitrary model's own class, so callers gate on model type first.
+_POSITION_ONLY_ROPES = frozenset((
+    "RoPE", "EagerRoPE", "Llama3RoPE", "YarnRoPE", "ProportionalRoPE", "MRoPERotaryEmbedding", "Qwen3_5RotaryEmbedding",
+))
+
+
+def _length_dependent_ropes(backbone):
+    """RoPE classes in backbone not known to rotate by position alone."""
+    names = {type(module).__name__ for _, module in backbone.named_modules()}
+    return sorted(name for name in names if ("RoPE" in name or "Rotary" in name) and name not in _POSITION_ONLY_ROPES)
 
 
 # Language models that scale token embeddings by sqrt(hidden_size) on the ids path only, so multimodal forwards lose the
@@ -3476,6 +3537,69 @@ def _vlm_hidden_states(model, batch_dict):
         inputs_embeds=merged_embeds,
         **backbone_kwargs,
     )
+
+
+def _qwen35_image_features(model, pixels, inputs):
+    tower = model.vision_tower
+    return tower(pixels.astype(tower.patch_embed.proj.weight.dtype), inputs["image_grid_thw"])[0]
+
+
+def _gemma4_image_features(model, pixels, inputs):
+    return model.embed_vision(model.vision_tower(pixels, inputs.get("image_position_ids")))
+
+
+# Families whose embedder takes cached_image_features in place of exactly what the encoder computes: the encoder, the
+# per-image inputs it reads beside the pixels, and the modules it runs. Qwen3-VL's cached path drops its deepstack.
+_VLM_IMAGE_ENCODERS = {
+    "qwen3_5": (_qwen35_image_features, ("image_grid_thw",), ("vision_tower",)),
+    "qwen3_5_moe": (_qwen35_image_features, ("image_grid_thw",), ("vision_tower",)),
+    "gemma4": (_gemma4_image_features, ("image_position_ids",), ("vision_tower", "embed_vision")),
+}
+
+
+_VLMImageEncoder = collections.namedtuple("_VLMImageEncoder", ("encode", "keys", "modules", "module_ids"))
+
+
+def _vlm_image_encoder(model):
+    entry = _VLM_IMAGE_ENCODERS.get(_mlx_vlm_canonical_model_type(
+        _config_get(getattr(model, "config", None), "model_type")
+    ))
+    if entry is None:
+        return None
+    modules = tuple(getattr(model, name, None) for name in entry[2])
+    if any(module is None for module in modules):
+        return None
+    children = [child for module in modules for _, child in module.named_modules()]
+    if any(
+        # Each copy and pass would draw its own mask.
+        child.training and type(child).__name__.endswith("Dropout") and _get_mlx_dropout_probability(child) > 0
+        for child in children
+    ):
+        return None
+    return _VLMImageEncoder(entry[0], entry[1], modules, frozenset(map(id, children)))
+
+
+def _vlm_image_features(model, batch_dict, copies=1):
+    """Features of a batch whose images repeat ``copies`` times, from one tower run over the first copy, laid out as
+    the embedder lays them; None when the family or batch has no cached path."""
+    encoder = _vlm_image_encoder(model)
+    pixels = batch_dict.get("pixel_values")
+    if encoder is None or pixels is None or batch_dict.get("pixel_values_videos") is not None:
+        return None
+    encode, keys = encoder.encode, encoder.keys
+    inputs = {k: v for k, v in batch_dict.items() if not k.startswith("_unsloth_") and v is not None}
+    _apply_static_vlm_metadata(model, batch_dict, inputs)
+
+    def first(value):
+        size = value.shape[0] if hasattr(value, "shape") else len(value)
+        return None if size % copies else value[:size // copies]
+
+    parts = {key: first(inputs[key]) for key in keys if key in inputs}
+    pixels = first(pixels)
+    if pixels is None or any(part is None for part in parts.values()):
+        return None
+    features = encode(model, pixels, parts)
+    return mx.concatenate([features] * copies, axis=-2) if copies > 1 else features
 
 
 def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
