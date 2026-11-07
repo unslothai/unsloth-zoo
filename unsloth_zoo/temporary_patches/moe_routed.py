@@ -22,6 +22,9 @@ __all__ = [
     "NF4_SLOTS_PER_EXPERT",
     "nf4_slot_limit",
     "BF16_MAX_SLOTS",
+    "GRAPH_MAX_SLOTS",
+    "bf16_routes",
+    "nf4_routes",
     "ACT_GPTOSS",
     "ACT_SILU",
     "ACT_GELU_TANH",
@@ -92,6 +95,11 @@ NF4_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_MAX_SLOTS", -1)
 NF4_MAX_SLOTS = None if NF4_MAX_SLOTS < 0 else NF4_MAX_SLOTS
 NF4_SLOTS_PER_EXPERT = 1.0
 BF16_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_MAX_SLOTS", 32)
+# Under a CUDA-graph decode step below sm80 the other path (torch._grouped_mm over host-copied offsets) cannot be
+# captured, so the routed kernels serve every row up to this many slots there (16 rows x top_k 8). An explicit
+# UNSLOTH_MOE_ROUTED_MAX_SLOTS stays the cap.
+GRAPH_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_GRAPH_MAX_SLOTS", 128)
+_SLOTS_PINNED = "UNSLOTH_MOE_ROUTED_MAX_SLOTS" in os.environ
 
 
 def nf4_slot_limit(num_experts):
@@ -1572,6 +1580,30 @@ def routed_16bit_supported(device):
     return (device.index if device.index is not None else torch.cuda.current_device()) not in sub
 
 
+def _graph_decode_step():
+    """True inside a one-token decode step Unsloth plans for CUDA-graph replay (never while tracing)."""
+    if torch.compiler.is_compiling():
+        return False
+    from unsloth_zoo.decode_graph_state import in_graph_decode_step
+    return in_graph_decode_step()
+
+
+def bf16_routes(one_token_only, rows, slots, graph_step = False):
+    """Whether the 16-bit routed kernels take a call of rows tokens and slots (token, expert) pairs.
+    one_token_only: the device is below sm80, where eager grouped_mm wins from 2 rows up but cannot be captured."""
+    if graph_step and one_token_only and not _SLOTS_PINNED:
+        return slots <= max(BF16_MAX_SLOTS, GRAPH_MAX_SLOTS)
+    return slots <= BF16_MAX_SLOTS and not (one_token_only and rows > 1)
+
+
+def nf4_routes(num_experts, slots, sub_sm80 = False, graph_step = False):
+    """Whether the NF4 routed kernels take a call of slots (token, expert) pairs."""
+    limit = nf4_slot_limit(num_experts)
+    if graph_step and sub_sm80 and NF4_MAX_SLOTS is None:
+        limit = max(limit, GRAPH_MAX_SLOTS)
+    return slots <= limit
+
+
 def _bf16_plan(experts, gu, dn, hidden_dim):
     if gu.dim() != 3 or dn.dim() != 3:
         return None
@@ -1647,7 +1679,11 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
             state = _live_quant(experts, state) if ok else None
         else:
             state = prepare_stacked_nf4(experts, hidden_dim)
-        if not isinstance(state, dict) or top_k_index.numel() > nf4_slot_limit(state["E"]):
+        if not isinstance(state, dict):
+            return None
+        graph_step = _graph_decode_step()
+        sub = graph_step and not routed_16bit_supported(hidden_states.device)
+        if not nf4_routes(state["E"], top_k_index.numel(), sub, graph_step):
             return None
         if mode == "grouped":
             # torch._grouped_mm takes bf16 only (its fake impl rejects fp16 under compile).
@@ -1658,7 +1694,7 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
         if mode == "grouped":
             return None
         views = _bf16_views(experts, hidden_dim)
-        if views is None or top_k_index.numel() > BF16_MAX_SLOTS or (views[4] and top_k_index.shape[0] > 1):
+        if views is None or not bf16_routes(views[4], top_k_index.shape[0], top_k_index.numel(), _graph_decode_step()):
             return None
     lora = _stash_lora(experts)
     if lora is False:

@@ -128,6 +128,89 @@ def _gpt_oss_flex_inference(device):
     )
 
 
+def _gpt_oss_graph_decode_attention():
+    """One-token attention inside a generate() call Unsloth decodes through CUDA graphs:
+    "dense" (default) runs the sink attention over a dense mask, "flex" keeps flex_decoding on a BlockMask
+    whose tensors the graph refills (UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION, read per call)."""
+    mode = os.environ.get("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "dense").strip().lower()
+    return "flex" if mode == "flex" else "dense"
+
+
+def _gpt_oss_in_graph_generate():
+    if torch.compiler.is_compiling():
+        return False
+    from unsloth_zoo.decode_graph_state import in_graph_generate
+    return in_graph_generate()
+
+
+def _gpt_oss_dense_graph_decode(inputs_embeds):
+    """A one-token step of a graph-planned generate() with dense decode attention: its masks are built dense.
+    A full sliding window rolls by one slot per step and moves the mask offset, which a dense mask of fixed shape
+    carries as values while a BlockMask closure would bake it in."""
+    return (
+        isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.dim() >= 2 and inputs_embeds.shape[1] == 1
+        and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() == "dense"
+    )
+
+
+def _gpt_oss_dense_decode_mask_ok(attention_mask, n_heads):
+    """Masks the dense one-token attention reads: None, or [B or 1, 1 or H, 1, L]; anything else stays eager."""
+    return attention_mask is None or (
+        isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4
+        and attention_mask.shape[1] in (1, n_heads) and attention_mask.shape[2] == 1
+    )
+
+
+def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling):
+    """One-token sink attention, grouped over the KV heads instead of repeat_kv copies: the rounding points of
+    _eager_attention_rows (logits in the input dtype, fp32 softmax over keys + sink stored back in that dtype,
+    probabilities cast to the value dtype). query [B, H, 1, D], key / value [B, KVH, L, D]; returns [B, 1, H, D]."""
+    bsz, n_heads, q_len, head_dim = query.shape
+    kv_heads = key.shape[1]
+    groups = n_heads // kv_heads
+    kv_len = key.shape[-2]
+    if attention_mask is not None:
+        kv_len = min(kv_len, attention_mask.shape[-1])
+        key, value = key[:, :, :kv_len], value[:, :, :kv_len]
+        attention_mask = attention_mask[..., :kv_len]
+    out_dtype = torch.promote_types(query.dtype, key.dtype)
+    logits = key.new_empty((bsz, kv_heads, groups * q_len, kv_len + 1), dtype = out_dtype)
+    q = query.reshape(bsz, kv_heads, groups * q_len, head_dim)
+    weights = torch.matmul(q, key.transpose(2, 3), out = logits[..., :kv_len])
+    weights *= scaling
+    if attention_mask is not None:
+        # [B or 1, 1, 1, L] (one row per sequence, every head) or [B or 1, H, 1, L] (per head, grouped as the
+        # logits are: head h = kv head h // groups, row h % groups).
+        rows = 1 if attention_mask.shape[1] == 1 else kv_heads
+        weights += attention_mask.reshape(attention_mask.shape[0], rows, groups if rows > 1 else 1, kv_len)
+    logits[..., -1] = module.sinks.reshape(1, kv_heads, groups)
+    logits[:] = torch.nn.functional.softmax(logits, dim = -1, dtype = torch.float32)
+    probs = logits[..., :kv_len].to(value.dtype)
+    out = torch.matmul(probs, value)
+    return out.reshape(bsz, n_heads, q_len, head_dim).transpose(1, 2).contiguous(), None
+
+
+def _closure_holds_tensor(fn, depth = 4):
+    """True when fn (or a function it closes over, nested) captures a tensor: such a mask_mod cannot be rebuilt
+    over refilled graph buffers."""
+    if depth <= 0:
+        return True
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        if isinstance(value, torch.Tensor):
+            return True
+        items = value if isinstance(value, (list, tuple)) else (value,)
+        for item in items:
+            if isinstance(item, torch.Tensor):
+                return True
+            if callable(item) and _closure_holds_tensor(item, depth - 1):
+                return True
+    return False
+
+
 @functools.lru_cache(maxsize = 64)
 def _gpt_oss_decode_block_starts(n, block, device):
     """[min, block, 2 * block, ...]: bucketize(d, right = True) counts the starts <= d, so it is clamp(d // block + 1, 1, n)."""
@@ -173,19 +256,23 @@ def _gpt_oss_flex_mask(
     # Per-row blocks even without padding: packed documents make mask_function row dependent.
     bsz = batch_size
 
-    def build(device):
-        q_o, kv_o = (
-            x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
-            for x in (q_off, kv_off)
-        )
-        if padding is not None:
-            pad = padding.to(device)
+    def make_mask_mod(q_o, kv_o, pad = None):
+        if pad is not None:
             def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
                 kv_pos = kv_idx + kv_o
                 return mask_function(batch_idx, head_idx, q_idx + q_o, kv_pos) & pad[batch_idx, kv_pos]
         else:
             def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
                 return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o)
+        return mask_mod
+
+    def build(device):
+        q_o, kv_o = (
+            x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
+            for x in (q_off, kv_off)
+        )
+        pad = padding.to(device) if padding is not None else None
+        mask_mod = make_mask_mod(q_o, kv_o, pad)
         if q_length == 1:
             # Decode: blocks are partial and mask_mod decides per key; for causal, only blocks up to the query's own
             # slot can hold a visible key, so an unwritten static-cache tail is not listed (no host sync).
@@ -207,6 +294,14 @@ def _gpt_oss_flex_mask(
                 seq_lengths = (1, kv_length),
                 **({"compute_q_blocks": torch.is_grad_enabled()} if _HAS_COMPUTE_Q_BLOCKS else {}),
             )
+            if (
+                _gpt_oss_graph_decode_attention() == "flex" and _gpt_oss_in_graph_generate()
+                and not _closure_holds_tensor(mask_function)
+            ):
+                # CUDA-graph decode refills these tensors and rebuilds mask_mod over its own copies; every value
+                # mask_mod reads besides them is a constant of mask_function.
+                tensors = (q_o, kv_o) if pad is None else (q_o, kv_o, pad)
+                block_mask._unsloth_graph_closure = (tensors, lambda ts: make_mask_mod(*ts))
         else:
             block_mask = compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
         return block_mask
@@ -3427,6 +3522,15 @@ def patch_GptOssAttention():
                 attention_mask,
             )
             attn_weights = None
+        elif (
+            query_states.shape[-2] == 1
+            and _gpt_oss_dense_decode_mask_ok(attention_mask, query_states.shape[1])
+            and _gpt_oss_dense_graph_decode(hidden_states)
+        ):
+            # One-token step of a CUDA-graph decode: the dense mask is a graph input, no BlockMask closure.
+            attn_output, attn_weights = _gpt_oss_decode_attention(
+                self, query_states, key_states, value_states, attention_mask, self.scaling,
+            )
         else:
             # Dense mask: UNSLOTH_GPT_OSS_EAGER_INFERENCE=1, CPU, or a caller-built 4D mask.
             attn_output, attn_weights = eager_attention_forward(
@@ -3612,7 +3716,8 @@ def patch_GptOssModel():
                     and _gpt_oss_flex_inference(input_embeds.device)
                     and _register_gpt_oss_flex_mask()
                 ):
-                    target = _GPT_OSS_FLEX_MASK
+                    # CUDA-graph decode steps take dense masks (_gpt_oss_dense_graph_decode).
+                    target = "eager" if _gpt_oss_dense_graph_decode(input_embeds) else _GPT_OSS_FLEX_MASK
                 elif _is_flex:
                     target = "eager"
                 if target is not None and target != _config._attn_implementation:
@@ -3875,7 +3980,7 @@ def patch_GptOssModel():
             _swap_target = None
             if not self.training:
                 if _gpt_oss_flex_inference(inputs_embeds.device) and _register_gpt_oss_flex_mask():
-                    _swap_target = _GPT_OSS_FLEX_MASK
+                    _swap_target = "eager" if _gpt_oss_dense_graph_decode(inputs_embeds) else _GPT_OSS_FLEX_MASK
                 elif _orig_attn_impl == "flex_attention":
                     _swap_target = "eager"
             _swap_attn_impl = _swap_target is not None and _swap_target != _orig_attn_impl
