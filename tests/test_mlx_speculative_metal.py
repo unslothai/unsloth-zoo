@@ -1322,6 +1322,26 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         assert set(inference._VERIFY_GDN_VERDICTS.values()) == {False}
 
 
+@pytest.mark.parametrize("field", ["", "_training", "_unsloth_verify_scopes", "speculative_verify_logits", "_speculative_verify", "_bindings_intact"])
+def test_qwen4_prefix_keeps_other_states_and_leaves_replay_lazy(qwen4, monkeypatch, field):
+    from unittest.mock import Mock
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx import inference, speculative
+    lm, arrays = qwen4[0].language_model, [mx.ones((2,)) for _ in range(5)]
+    cache = [SimpleNamespace(state = arrays[:2], _unsloth_pending = (arrays[1],)),
+             SimpleNamespace(state = arrays[2:4], _unsloth_pending = (arrays[2],)), SimpleNamespace(state = arrays[4])]
+    if field != "_unsloth_verify_scopes": monkeypatch.setattr(lm, "_unsloth_verify_scopes", 1, raising = False)
+    native = getattr(lm, field, None)
+    value = (lambda *args, **kw: native(*args, **kw)) if callable(native) else (lambda _: False) if field == "_bindings_intact" else field == "_training"
+    if field and field != "_unsloth_verify_scopes":
+        monkeypatch.setattr(inference if field == "_bindings_intact" else lm, field, value)
+    monkeypatch.setattr(mx, "async_eval", submitted := Mock(side_effect = RuntimeError("prefix roots")))
+    with pytest.raises(RuntimeError, match = "prefix roots"):
+        speculative.SpeculativeEngine._verify(SimpleNamespace(_exact = False, _invariant = True, _mrope = False, lm = lm, cache = cache), mx.array([[2, 3, 4]]))
+    seen, expected = [array for _, array in tree_flatten(submitted.call_args.args)], arrays if field else [arrays[0], arrays[3], arrays[4]]
+    assert len(seen) == len(expected) and all(a is b for a, b in zip(seen, expected))
+
+
 @pytest.mark.parametrize("width", [3, 5, 16])
 def test_a_fused_block_after_a_partly_retained_one_folds_its_replay_and_matches_unfolded(qwen_4bit, monkeypatch, width):
     from mlx_vlm.models.cache import make_prompt_cache
@@ -1769,35 +1789,39 @@ def test_qwen4_decode_steps_run_gated_delta_on_the_fused_block_bit_for_bit(qwen4
 
 
 @pytest.mark.parametrize("experts", [False, True])  # experts on disk read their routes on the host mid-forward
-def test_qwen4_decode_steps_read_disk_ple_rows_after_the_forward_bit_for_bit(qwen4, tmp_path, monkeypatch, experts):
+@pytest.mark.parametrize("verify, after", [(0, 0), (0, 40), (3, 0), (3, 40), (5, 40)])
+def test_qwen4_decode_steps_read_disk_ple_rows_after_the_forward_bit_for_bit(qwen4, tmp_path, monkeypatch, experts, verify, after):
     from mlx.utils import tree_flatten
     from mlx_vlm.models.cache import make_prompt_cache
     from unsloth_zoo.mlx import inference, offload
+    monkeypatch.setattr(inference, "_staged_submit_window", lambda: after)
     model, ids = qwen4
     lm, sites = model.language_model, list(offload.ple_sites(model))
     glus = list(offload.expert_sites(model)) if experts else []
     mx.save_safetensors(str(tmp_path / "model.safetensors"), {f"{path}.{name}": value for path, module in sites + glus
                                                               for name, value in tree_flatten(module.parameters())})
-    staged, pending, stage = [], set(), offload.DiskEmbedding._staged
+    staged, early, pending, stage = [], [], set(), offload.DiskEmbedding._staged
 
     def tracked_stage(self, x):
         out = stage(self, x)
         if out is None:
             return None
-        rows, fill = out
+        held, (rows, fill) = offload.STAGED_FILLS.held, out
         staged.append(x)
         pending.add(id(fill))
 
         def read():
+            assert not after or len(held) <= (1 if verify else after)
             fill()
             pending.remove(id(fill))
+            if held and hasattr(read, "ready"): early.append(read.ready)
         read.abandon = fill.abandon
         return rows, read
     monkeypatch.setattr(offload.DiskEmbedding, "_staged", tracked_stage)
     submits, submit = [], mx.async_eval
 
     def is_ids(arrays):
-        return len(arrays) == 1 and arrays[0].dtype == mx.int64 and arrays[0].ndim == 1
+        return len(arrays) == 1 and isinstance(arrays[0], mx.array) and arrays[0].dtype == mx.int64 and arrays[0].ndim == 1
 
     def submitted(*arrays):
         if not is_ids(arrays):
@@ -1813,23 +1837,27 @@ def test_qwen4_decode_steps_read_disk_ple_rows_after_the_forward_bit_for_bit(qwe
         lm(mx.array([ids[0][:24]]), cache = cache)
 
         def decoded():
+            if verify:
+                return _decoded(lm, ids[0][:24], ids[0][24:30], ids[0][30:30 + verify])
             run = _clone(cache)
             logits = [lm(mx.array([[token]]), cache = run).logits for token in ids[0][24:30]]
             return _state(SimpleNamespace(logits = logits, hidden_states = None), run)
         native = decoded()
-        with inference.exact_batch_invariant_decode(model):
+        with inference.exact_batch_invariant_decode(model), (inference.speculative_call(model) if verify else contextlib.nullcontext()):
             monkeypatch.setattr(inference, "_STAGED_ROWS_OFF", [True])
             assert _same(native, decoded())
             submits.clear()
             assert _same(native, decoded())  # past first-use work
             unstaged, submits[:] = list(submits), []
-            staged.clear()
+            staged.clear(); early.clear()
             monkeypatch.setattr(inference, "_STAGED_ROWS_OFF", [])
             assert _same(native, decoded())
-            roots = [arrays for arrays in submits if not is_ids(arrays)]
+            assert (experts or bool(early) == bool(staged)) and all(any(len(a) == 1 and a[0] is r for a in submits) for r in early)
+            roots = [arrays for arrays in submits if not is_ids(arrays) and not any(len(arrays) == 1 and arrays[0] is r for r in early)]
             ids_submitted = [arrays[0] for arrays in submits if is_ids(arrays)]
             # One ID submission per staged lookup; every layer root follows its row read, in native order.
-            assert len(staged) >= 4 and not pending
+            assert (len(staged) >= 4 if not verify or after else not staged) and not pending
+            assert any(x.shape[1] == verify for x in staged) == (0 < verify <= 4 and bool(after))
             assert _same(tree_flatten(ids_submitted), tree_flatten([x.astype(mx.int64).reshape(-1) for x in staged]))
             assert _same(tree_flatten(roots), tree_flatten(unstaged))
         assert not inference._STAGED_ROWS_OFF
@@ -2435,27 +2463,48 @@ def test_other_mtp_heads_match_a_head_that_never_drafted_even_in_a_wrapping_wind
     assert _probe_matches_a_started_row(model, HeadDrafter(head, model), prompt, lambda started: started[0].head._cache)
 
 
-def test_a_qwen4_head_primes_a_long_tail_in_max_lag_pieces_and_holds_only_verified_pairs(qwen4, monkeypatch):
+@pytest.mark.parametrize("accept_all", [False, True])
+def test_a_qwen4_head_primes_a_long_tail_in_max_lag_pieces_and_holds_only_verified_pairs(qwen4, monkeypatch, accept_all):
     import copy
+    from mlx import nn
     from mlx.utils import tree_map
     from mlx_vlm.speculative.drafters.qwen4_exp_mtp.config import Qwen4ExpMTPConfig
     from mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp import Qwen4ExpMTPDraftModel
     from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.inference import exact_qsa_trim
     from unsloth_zoo.mlx.speculative import HeadDrafter, MTPDrafter, SpeculativeDraft, _head_drafter
     model, ids = qwen4
     head = Qwen4ExpMTPDraftModel(Qwen4ExpMTPConfig(text_config = model.language_model.args))
     head.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05 if mx.issubdtype(a.dtype, mx.floating) else a, head.parameters()))
     head.set_dtype(mx.bfloat16)
     monkeypatch.setattr(model, "_unsloth_speculates", False, raising = False)
+    if accept_all: monkeypatch.setattr(model.language_model, "lm_head", nn.Linear(512, 1024, bias = False).update({"weight": mx.zeros((1024, 512), mx.bfloat16)}))
     drafter = _head_drafter(head, model, max_lag = 4)
     # The prefill keeps the hidden states of SpeculativeDraft.prompt_tail positions.
     assert SpeculativeDraft(None, drafter).prompt_tail == MTPDrafter.prompt_tail and HeadDrafter(head, model, max_lag = 4).prompt_tail == 4
+    with exact_qsa_trim(head): _assert_head_early_replay(kept := type(drafter)(head, model), ids, accept_all)
+    verdicts = dict(kept._replay_verdicts)
+    _assert_head_early_replay(kept, ids, accept_all)  # the same drafter, now with the native trim, which drops the pooled indexer blocks
+    assert not any(kept._replay_verdicts.values())
+    lane = Qwen4ExpMTPDraftModel(Qwen4ExpMTPConfig(text_config = model.language_model.args)).update(head.parameters())
+    nn.quantize(lane, group_size = 32, bits = 4, class_predicate = lambda path, m: hasattr(m, "to_quantized") and not path.endswith("mlp.gate"))
+    stock = lane.fc_hidden
+    lane.fc_hidden = lambda x: stock(x) + (x.shape[1] == 4) * 0.25  # as a matmul whose kernel changes at 4 tokens' stream rows
+    with exact_qsa_trim(lane):
+        _assert_head_early_replay(lane := _head_drafter(lane, model), ids, accept_all)
+    assert verdicts == lane._replay_verdicts == {(3, 1): True, (4, 1): True, (4, 2): True}
     chunks, compared, started, start, push, catch_up, draft = [[]], [], [], drafter.start, drafter.push, drafter.catch_up, drafter.draft
     drafter.start = lambda *args: (start(*args), started.append(len(chunks)))[0]
     drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
     drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
     state = lambda h: [h._seed_hidden, *(a for entry in h._cache for a in entry.state if isinstance(a, mx.array))]
+    prefetched, prefetch = [], drafter.prefetch
+    def ahead(rows):
+        prefetch(rows)
+        prefetched.append([(row, row.replay) for row in rows if getattr(row, "replay", None) is not None])
+    drafter.prefetch = ahead
     def against_replay(cache, rows, depth, target):
+        assert all(row.head is p[2] for row, p in (prefetched[-1] if prefetched else []) if tuple(map(id, p[1])) == tuple(id(h) for _, h in chunks[-2]))
         (fresh := copy.copy(head)).reset(model)
         for chunk in filter(None, chunks):
             tokens, hidden = sum((t for t, _ in chunk), []), mx.concatenate([h for _, h in chunk])[None]
@@ -2467,7 +2516,64 @@ def test_a_qwen4_head_primes_a_long_tail_in_max_lag_pieces_and_holds_only_verifi
     # The prompt went in max_lag pieces, all of it, and every draft started from a cache of verified pairs alone.
     priming = [len(tokens) for chunk in chunks[: started[0]] for tokens, _ in chunk]
     assert sum(priming) == len(ids[0]) and max(priming) == 4
-    assert len(compared) > 4 and all(compared)
+    assert len(compared) > 4 and all(compared) and any(prefetched)
+
+
+def test_a_qwen4_head_drafts_from_the_target_tables_shortlist(qwen4, monkeypatch):
+    from mlx.utils import tree_map
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.config import Qwen4ExpMTPConfig
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp import Qwen4ExpMTPDraftModel
+    from unsloth_zoo.mlx import speculative as S
+    from unsloth_zoo.mlx.generate import SamplingParams
+    [monkeypatch.setattr(S, name, value) for name, value in (("_SHORTLIST_KEEP", 2), ("_SHORTLIST_COLUMNS", 128))]
+    model, ids = qwen4
+    head = Qwen4ExpMTPDraftModel(Qwen4ExpMTPConfig(text_config = model.language_model.args))
+    head.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05 if mx.issubdtype(a.dtype, mx.floating) else a, head.parameters()))
+    head.set_dtype(mx.bfloat16)
+    monkeypatch.setattr(model, "_unsloth_speculates", False, raising = False)
+    drafter, table = S._head_drafter(head, model, max_lag = 4), model.language_model.lm_head
+    assert S.HeadDrafter(head, model)._shortlist is None and drafter._shortlist.table is table
+    (full_head := S._head_drafter(head, model, max_lag = 4))._shortlist = None
+    native = _run(model, ids, 48, _script(("draft", 3), ("copy", 4)), SamplingParams(), drafter = full_head)
+    calls, logits = [], S._ShortlistHead.logits
+    monkeypatch.setattr(S._ShortlistHead, "logits", lambda self, hidden: calls.append((hidden, logits(self, hidden))) or calls[-1][1])
+    out, drafted, _ = _run(model, ids, 48, _script(("draft", 3), ("copy", 4)), SamplingParams(), drafter = drafter)
+    # Verification alone decides the output; only the proposals differ.
+    assert out == native[0] and all(n for n, _ in drafted.values())
+    hidden, sparse = (mx.concatenate([c[i].reshape(-1, c[i].shape[-1]) for c in calls]) for i in (0, 1))
+    full, kept = table(hidden), mx.isfinite(sparse)
+    assert (kept.sum(-1) == 2).all().item() and mx.allclose(mx.where(kept, sparse, 0), mx.where(kept, full, 0), atol = 0.05).item()
+    picks = mx.argmax(sparse, axis = -1)
+    assert mx.array_equal(picks, drafter._shortlist(hidden)).item() and not mx.array_equal(picks, mx.argmax(full, axis = -1)).item()
+
+
+def _assert_head_early_replay(drafter, ids, cancel):
+    import copy
+    from unsloth_zoo.mlx import speculative as S
+    dims = drafter.model.args.hidden_size * drafter.model.args.hc_count
+    for width in (2, 3, 4, 5):
+        for accepted in range(width):
+            row, _ = drafter.start(ids[0][:8], mx.random.normal((1, 8, dims)).astype(mx.bfloat16), ids[0][8])
+            drafter.draft([], [row], width - 1, [])
+            native = copy.copy(row)
+            native.head, native.tokens, native.hidden = copy.copy(row.head), [], []
+            native.head._cache = copy.deepcopy(row.head._cache)
+            hidden, tokens = mx.random.normal((width, dims)).astype(mx.bfloat16), mx.array(ids[0][9:9 + width])
+            early = drafter.prepare_replay(row, hidden, tokens, mx.array(accepted))
+            assert (early is not None) == (width <= 4)
+            for current in (row, native):
+                drafter.settle([], [current], width - 2, [0])
+                drafter.push(current, tokens.tolist()[:accepted + 1], hidden[:accepted + 1])
+            S.HeadDrafter.catch_up(drafter, [], [native])
+            if early is not None:
+                assert early(accepted) == (accepted == width - 1 or accepted > 0 and drafter._replay_verdicts[width, accepted])
+                if cancel:
+                    early(None)
+                    assert getattr(row, "replay", None) is None
+            drafter.catch_up([], [row])
+            state = lambda h: _state(SimpleNamespace(logits = h._seed_token, hidden_states = h._seed_hidden), h._cache)
+            assert row.head._next_position == native.head._next_position and _same(state(row.head), state(native.head))
+            assert mx.array_equal(drafter.draft([], [row], 3, []), drafter.draft([], [native], 3, [])).item()
 
 
 def test_eagle3_narrower_than_its_target_drafts_from_the_concatenated_layers_row_by_row(qwen):

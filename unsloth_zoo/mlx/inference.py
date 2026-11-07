@@ -185,6 +185,17 @@ _staged_ready = offload.read_staged
 _STAGED_SUBMIT_ROOTS = 40
 
 
+def _staged_forward_rows(inputs):
+    """Bound the forward; each disk table also bounds its expanded row IDs before staging."""
+    if not isinstance(inputs, mx.array) or inputs.ndim != 2:
+        return 0
+    batch, rows = inputs.shape
+
+    if batch != 1 or not 0 < rows <= offload._STAGED_ROWS:
+        return 0
+    return rows
+
+
 @functools.cache
 def _staged_submit_window():
     if mx.__version__ != "0.32.4":
@@ -2244,7 +2255,8 @@ def _qwen4_pending_inject(x):
 
 
 def _qwen4_submit(*arrays):
-    if len(arrays) == 1 and getattr(offload.STAGED_FILLS, "submit_after", 0):
+    if (len(arrays) == 1 and getattr(offload.STAGED_FILLS, "plain_step", True)
+            and getattr(offload.STAGED_FILLS, "submit_after", 0)):
         pending = _qwen4_pending_inject(arrays[0])
         if pending is not None:
             # The next read folds the tail; submit every producer without materializing the add.
@@ -2263,7 +2275,8 @@ def _qwen4_decode_read(forward, module, x):
     if (plan is None or module.input_mix_weight_down.__dict__.get("_unsloth_lane_qmm")
             or not 0 < rows < _QWEN4_PREFILL_MIN_ROWS or x.dtype != plan.dtype or x.shape[-1] != plan.width):
         return native(forward, module, x)
-    fold = plan.fold or (getattr(offload.STAGED_FILLS, "submit_after", 0) and "block_inject_weight" in module)
+    fold = plan.fold or (getattr(offload.STAGED_FILLS, "plain_step", True)
+                         and getattr(offload.STAGED_FILLS, "submit_after", 0) and "block_inject_weight" in module)
     pending = _qwen4_pending_inject(x) if fold else None
     _QWEN4_LAST_INJECT.slot = None
     folded = ((pending[0], pending[2], pending[1])
@@ -6751,6 +6764,53 @@ _QWEN4_FORWARD_CONTRACT = {
 }
 
 
+_LAZY_REPLAY_CONTRACT = {"mlx_vlm.models.qwen4_exp.language": {
+    "LanguageModel._speculative_verify": "9ea85a31b8caa1b4",
+    "LanguageModel.speculative_verify_logits": "34737ce85732b150",
+}}
+
+
+@functools.cache
+def _lazy_replay_verifier(verify, body):
+    if verify is None or body is None:
+        return None
+    bindings = _resolved_bindings(_LAZY_REPLAY_CONTRACT)
+    if (bindings is None or not any(name == "_speculative_verify" and target is body for _, name, target in bindings)
+            or not any(name == "speculative_verify_logits" and target is verify for _, name, target in bindings)):
+        return None
+    tree = copy.deepcopy(_function_ast(body))
+    submissions = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                   and _source_expression(node) == "mx.async_eval([entry.state for entry in cache])"]
+    if len(submissions) != 1:
+        return None
+    submission = submissions[0]
+    submission.args[0].elt = ast.Call(func = ast.Name(id = "_unsloth_prefix_state", ctx = ast.Load()),
+                                    args = [ast.Name(id = "entry", ctx = ast.Load())], keywords = [])
+    function = _function_from_ast(body, tree)
+    from .speculative import _committed_eval_state
+    namespace = {**body.__globals__, "_unsloth_prefix_state": _committed_eval_state}
+    bindings += [(body.__globals__, name, body.__globals__[name])
+                 for name in body.__code__.co_names if name in body.__globals__]
+    routed = FunctionType(function.__code__, namespace, function.__name__, body.__defaults__, body.__closure__)
+    routed.__kwdefaults__ = body.__kwdefaults__
+    return routed, bindings
+
+
+def _verify_with_lazy_replay(model, inputs, cache, sampler):
+    verify = model.speculative_verify_logits
+    if not any("_unsloth_pending" in vars(entry) for entry in cache):
+        return verify(inputs, cache, sampler)
+    body = getattr(model, "_speculative_verify", None)
+    bound = getattr(verify, "__self__", None) is model and getattr(body, "__self__", None) is model
+    plan = (_lazy_replay_verifier(getattr(verify, "__func__", None), getattr(body, "__func__", None))
+            if bound else None)
+    if (plan is not None and not model.training and getattr(model, "_unsloth_verify_scopes", 0)
+            and _bindings_intact(plan[1])):
+        # The next fused block consumes the replay inputs instead of its materialized state.
+        return plan[0](model, inputs, cache, sampler)
+    return verify(inputs, cache, sampler)
+
+
 class SpeculativeFamily(NamedTuple):
     """`language`'s forward object `target`, a `module.forward` entered at `entry` ("verify", or "__call__" when it also
     decodes), served once `contract` holds. The fused gated-delta block takes `gdn_layer`s with a `gdn_norm` once
@@ -7993,7 +8053,7 @@ def _exact_verify_class(base, name, *cache_key):
     # One-row steps only on a forward that also decodes (qwen4_exp); the tape contract pins the `_gated_delta` they mirror.
     decode_bindings = (_resolved_bindings(_DECODE_GDN_CONTRACT)
                        if fused_bindings is not None and entry == "__call__" and tape_bindings is not None else None)
-    # A decode step reads its disk PLE rows after its forward is built, so the build overlaps the previous step's GPU
+    # A forward reads its disk PLE rows after its prefix is built, so the build overlaps the previous step's GPU
     # work. Only after a step that ran no first-use check: a check evaluates arrays that would read the rows unfilled.
     staged_bindings = (_resolved_bindings(_STAGED_ROWS_CONTRACT)
                        if entry == "__call__" and os.environ.get("UNSLOTH_MLX_STAGED_PLE_ROWS") != "0" else None)
@@ -8001,6 +8061,13 @@ def _exact_verify_class(base, name, *cache_key):
     if staged_bindings is not None and model_body is not None and model_body.__globals__.get("mx") is mx:
         held_model = FunctionType(model_body.__code__, {**model_body.__globals__, "mx": _HELD_MX}, model_body.__name__,
                                   model_body.__defaults__, model_body.__closure__)
+
+    def staged_ple(self, *args, **kwargs):
+        output = base._ple(self, *args, **kwargs)
+        fills = getattr(offload.STAGED_FILLS, "fills", None)
+        if fills and isinstance(output, mx.array):
+            fills[-1].ready = output
+        return output
 
     def verify(self, language_model, inputs, *, cache = None, **kwargs):
         outer, outer_tapes = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
@@ -8027,12 +8094,18 @@ def _exact_verify_class(base, name, *cache_key):
         _VERIFY_STATE.tapes = ([] if _VERIFY_STATE.serving and taped is not None
                                and any(getattr(entry, "history_capacity", 0) for entry in kwargs.get("cache") or ())
                                and _bindings_intact(tape_bindings) else None)
-        outer_fills, outer_held, outer_after = (getattr(offload.STAGED_FILLS, name, None)
-                                                for name in ("fills", "held", "submit_after"))
-        staged = (held_model is not None and quiet[0] and not _STAGED_ROWS_OFF and _VERIFY_STATE.serving
-                  and _VERIFY_STATE.plain_decode and _VERIFY_STATE.tapes is None and _bindings_intact(staged_bindings))
-        offload.STAGED_FILLS.fills, offload.STAGED_FILLS.held = ([], []) if staged else (None, None)
+        outer_fills, outer_held, outer_after, outer_step = (getattr(offload.STAGED_FILLS, name, True if name == "plain_step" else None)
+                                                          for name in ("fills", "held", "submit_after", "plain_step"))
         inputs = args[0] if args else kwargs.get("inputs")
+        staged_rows = _staged_forward_rows(inputs)
+        submit_after = _staged_submit_window()
+        if _VERIFY_STATE.plain_decode:
+            submit_after = submit_after if staged_rows == 1 else 0
+        else:
+            submit_after = min(1, submit_after)
+        staged = (held_model is not None and quiet[0] and not _STAGED_ROWS_OFF and _VERIFY_STATE.serving
+                  and staged_rows and (_VERIFY_STATE.plain_decode or submit_after) and _bindings_intact(staged_bindings))
+        offload.STAGED_FILLS.fills, offload.STAGED_FILLS.held = ([], []) if staged else (None, None)
         outer_moe = getattr(_VERIFY_STATE, "plain_moe", None)
         outer_verifier = getattr(_VERIFY_STATE, "moe_verifier", None)
         context, valid = (_moe_verifier_matches(self) if _VERIFY_STATE.serving and not _VERIFY_STATE.plain_decode
@@ -8048,8 +8121,8 @@ def _exact_verify_class(base, name, *cache_key):
                                       or os.environ.get("UNSLOTH_MLX_VERIFY_MOE", "1") != "0" and getattr(inputs, "ndim", 0) == 2
                                       and inputs.shape[0] == 1 and 1 < inputs.shape[1] <= _VERIFY_FUSED_ROWS) else None)
         # Fill before releasing the prefix; later layers can then build while it runs.
-        offload.STAGED_FILLS.submit_after = (_staged_submit_window()
-                                            if staged and getattr(inputs, "shape", None) == (1, 1) else 0)
+        offload.STAGED_FILLS.submit_after = submit_after if staged else 0
+        offload.STAGED_FILLS.plain_step = _VERIFY_STATE.plain_decode and staged_rows == 1
         work = _FIRST_USE_WORK[0]
         try:
             output = native_entry(self, language_model, *args, **kwargs)
@@ -8067,6 +8140,7 @@ def _exact_verify_class(base, name, *cache_key):
             quiet[0] = _FIRST_USE_WORK[0] == work
             offload.STAGED_FILLS.fills, offload.STAGED_FILLS.held = outer_fills, outer_held
             offload.STAGED_FILLS.submit_after = outer_after
+            offload.STAGED_FILLS.plain_step = outer_step
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes, _VERIFY_STATE.plain_decode = outer, outer_tapes, outer_plain
             _VERIFY_STATE.plain_moe = outer_moe
             _VERIFY_STATE.moe_verifier = outer_verifier
@@ -8161,6 +8235,8 @@ def _exact_verify_class(base, name, *cache_key):
         methods["_layer"] = submitted_layer
     if held_model is not None:
         methods["_model"] = held_model
+        if name == "qwen4_exp":
+            methods["_ple"] = staged_ple
     if taped is not None:
         methods["_gated_delta"] = taped_gated_delta
     pins = family.capabilities.get("attention")

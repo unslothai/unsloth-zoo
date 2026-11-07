@@ -92,6 +92,15 @@ def read_staged():
         for fill in fills:
             fill.abandon()
         raise
+    # Start PLE while the host encodes the held layers that consume it.
+    if held:
+        ready = []
+        for fill in fills:
+            output = getattr(fill, "ready", None)
+            if output is not None:
+                ready.append(output)
+        if ready:
+            mx.async_eval(*ready)
     for arrays in held or ():
         mx.async_eval(*arrays)
 
