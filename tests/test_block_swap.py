@@ -907,7 +907,6 @@ class _PleModel(nn.Module):
 
 
 def _cpu_block(layer, monkeypatch):
-    # Real _Block with CPU as the card; only the CUDA event is faked.
     monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: object())
     cpu = torch.device("cpu")
     return _mod._Block(layer, {cpu: None}, cpu)
