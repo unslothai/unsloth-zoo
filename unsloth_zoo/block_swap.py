@@ -680,13 +680,12 @@ def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = No
 
 
 def _mark_host_kept(model):
-    # `_no_placement_params` (Qwen4Exp's ~95 GiB n-gram table) stay in host RAM: never pack them into a slot.
     names = getattr(model, "_no_placement_params", None)
     if not names or os.environ.get("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "0") == "1":
         return
     params = list(model.named_parameters(remove_duplicate = False))
-    # The whole owning module, as the loader keeps it: FP8Embedding's weight_scale sits beside the table.
-    # Marked on the module, not the Parameter: a load to host replaces the Parameter as its weight lands.
+    # Whole owner module (FP8Embedding's weight_scale sits beside the table), tagged on the module
+    # because a load to host replaces the Parameter.
     for owner in {n.rsplit(".", 1)[0] for n, _ in params if any(n == x or n.endswith("." + x) for x in names)}:
         model.get_submodule(owner)._unsloth_host_kept = True
 

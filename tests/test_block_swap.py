@@ -888,7 +888,6 @@ def test_pin_budget_is_split_across_the_ranks_on_this_host(monkeypatch):
 
 
 class _Ple(nn.Module):
-    """Decoder layer with a Qwen4Exp-style n-gram table the loader keeps in host RAM."""
 
     def __init__(self, table):
         super().__init__()
@@ -908,7 +907,7 @@ class _PleModel(nn.Module):
 
 
 def _cpu_block(layer, monkeypatch):
-    # The real _Block, with CPU standing in for the card: only the CUDA event needs faking.
+    # Real _Block with CPU as the card; only the CUDA event is faked.
     monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: object())
     cpu = torch.device("cpu")
     return _mod._Block(layer, {cpu: None}, cpu)
@@ -927,7 +926,7 @@ def test_no_placement_table_is_never_packed_into_a_slot(monkeypatch):
 
 
 def test_no_placement_table_stays_out_after_the_load_replaces_its_parameter(monkeypatch):
-    # from_pretrained(offload_layers = N) finds the layers on meta; each weight then lands as a new Parameter.
+    # A load to host replaces each Parameter after find_decoder_layers ran.
     monkeypatch.delenv("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", raising = False)
     model = _PleModel()
     layers = find_decoder_layers(model)
@@ -957,6 +956,6 @@ def test_auto_swap_indices_does_not_count_a_host_kept_table():
     layers = find_decoder_layers(model)
     dev = layers[0].mlp.weight.device
     layer = 64 * 64 * 4
-    # Same signature as its neighbours, so it shares their pool: four layers (two pool slots) free two.
+    # Same signature as its neighbours, so it shares their pool.
     idx, left = auto_swap_indices(layers, 2 * layer, 1, free_bytes = {dev: 0})
     assert idx == [1, 3, 5, 7] and left == 0
