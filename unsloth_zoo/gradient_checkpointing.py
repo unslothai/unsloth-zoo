@@ -212,6 +212,11 @@ _PINNED_CACHED = {}         # rounded block bytes -> count released but still ca
 _PINNED_LIVE = {}           # requested bytes -> blocks charged at allocation, still live
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
 _PINNED_RELEASED = 0        # settings mode: blocks released since the last flush (may wait on events)
+# Cap mode keeps a cached block whose last copy is still in flight and pins one more, but only
+# while the pinned total stays within this many times the most bytes we ever had live at once:
+# one extra generation of blocks behind the in-flight copies, not one per step the CPU runs ahead.
+_PENDING_KEEP_FACTOR = 2
+_PINNED_LIVE_PEAK = 0       # most pinned bytes in use at once (charged and not cached)
 
 
 # torch 2.13+ (c10/core/AllocatorConfig.h): above the round threshold / max cached size blocks are exact;
@@ -302,7 +307,8 @@ def _host_cache_reuses_block(block):
     """A pinned block freed after a non_blocking copy waits in torch's event queue, which only an
     allocation drains (host_memory_stats does not), so it reads as not free. Allocate and drop a
     block of that size to drain it: True if the allocator reused a cached block, False if it had
-    to pin a new one, which is released again so the probe never holds pinned memory past the cap."""
+    to pin a new one. That new block is left free in the allocator for the caller's next pin of this
+    size; the caller either charges it under the cap or flushes it (_reserve_pinned)."""
     held = _host_allocator_held_bytes()
     if held is None: return False
     try:
@@ -312,9 +318,7 @@ def _host_cache_reuses_block(block):
         return False
     after = _host_allocator_held_bytes()
     del probe
-    if after is not None and after <= held: return True
-    _empty_host_cache()
-    return False
+    return after is not None and after <= held
 
 
 def _compute_pinned_cap(held = None):
@@ -395,9 +399,17 @@ def _release_pool_pinned(start = 0):
 
 
 def _reset_pinned_cap():
-    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP
+    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _PINNED_LIVE_PEAK
     GC_PINNED_CAP = None
     _WARNED_ABOUT_PINNED_CAP = False
+    _PINNED_LIVE_PEAK = 0  # a new model's live set sets its own bound, not the last one's
+
+
+def _note_pinned_live():
+    """Track the high water mark of our live pinned bytes (cap mode only)."""
+    global _PINNED_LIVE_PEAK
+    live = GC_PINNED_BYTES - sum(k * v for k, v in _PINNED_CACHED.items())
+    if live > _PINNED_LIVE_PEAK: _PINNED_LIVE_PEAK = live
 
 
 def _reserve_pinned_unlocked(nbytes):
@@ -412,11 +424,30 @@ def _reserve_pinned_unlocked(nbytes):
         free = _host_allocator_free_bytes()
         # Under a fixed cap a refusal here is sticky (pageable copies never drain the queue), so
         # check the event queue; the per block mode re-checks host RAM below instead.
-        if free is None or free >= block or (
-            GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0 and _host_cache_reuses_block(block)
-        ):
+        if free is None or free >= block:
             _charge_live(nbytes, block)
+            if GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0: _note_pinned_live()
             return True  # the allocator hands back the cached block, already charged
+        if GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0:
+            _note_pinned_live()
+            held = _host_allocator_held_bytes()
+            if _host_cache_reuses_block(block):
+                _charge_live(nbytes, block)
+                return True
+            # The probe pinned a new block, now free in the allocator. Usually our cached block is
+            # only still queued behind the last backward's copies: keep it ours and charge the new
+            # one, instead of flushing every cached block (a device sync) and pinning them all
+            # again, while the allocator's real total stays under both the cap and
+            # _PENDING_KEEP_FACTOR live sets. Otherwise flush as before.
+            if held is not None and _HOST_HELD_BASELINE is not None and (
+                max(GC_PINNED_BYTES, held - _HOST_HELD_BASELINE) + block
+                <= min(GC_PINNED_CAP, _PENDING_KEEP_FACTOR * _PINNED_LIVE_PEAK)
+            ):
+                _PINNED_CACHED[block] += 1
+                GC_PINNED_BYTES += block
+                _charge_live(nbytes, block)
+                return True
+            _empty_host_cache()
         # Another pinned user took the block: it is no longer ours, and this request is new.
         GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
     held = _host_allocator_held_bytes()
@@ -447,6 +478,7 @@ def _reserve_pinned_unlocked(nbytes):
         return False
     GC_PINNED_BYTES += block
     _charge_live(nbytes, block)
+    if GC_PINNED_CAP >= 0: _note_pinned_live()
     return True
 
 
