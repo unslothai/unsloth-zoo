@@ -24,6 +24,7 @@ values per ``r``. Rows of ``x`` are sorted by expert (``counts[e]`` rows each, l
 (no expert schedule), e.g. a packed MXFP4 Linear."""
 
 import torch
+from .triton_specialize import jit_any_alignment as _jit_any_alignment
 
 __all__ = [
     "mxfp4_grouped_mm",
@@ -202,7 +203,8 @@ if _HAS_TRITON:
         hi = tl.reshape(tl.reshape(hi, (ROWS, BYTES // 16, 16)) * f1 * f2, (ROWS, BYTES))
         return lo, hi
 
-    @triton.jit
+    # M: rows per call; == 1 kept, no % 16 binary.
+    @_jit_any_alignment("M")
     def _mxfp4_grouped_mm_kernel(
         x_ptr, blocks_ptr, scales_ptr, out_ptr, counts_ptr, bias_ptr,
         E, R, G, K, N, M,
