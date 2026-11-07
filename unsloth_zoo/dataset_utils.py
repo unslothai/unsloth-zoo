@@ -2692,8 +2692,18 @@ def standardize_data_formats(
         # multiprocessing's start method while datasets uses multiprocess, and it
         # fell back to num_proc = 1 under memory pressure -- which is a Pool(1)
         # on datasets >= 4.1, the pool this exists to avoid.
-        from .dataset_num_proc import get_dataset_num_proc
-        dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
+        from .dataset_num_proc import environment_override, get_dataset_num_proc
+        # The per-row work is a dict per message, so a pool spends its time pickling shards both
+        # ways (20k rows: 6.6 s over 8 workers vs 0.15 s in process). Stay in process for an
+        # in-memory dataset unless a count was asked for, as Studio's own copy of this map does.
+        if (
+            num_proc is None
+            and not getattr(dataset, "cache_files", None)
+            and not environment_override()[0]
+        ):
+            dataset_map_kwargs['num_proc'] = None
+        else:
+            dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
     return dataset.map(
